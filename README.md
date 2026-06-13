@@ -14,7 +14,7 @@
 
 </div>
 
-Fluxon is a communication and caching substrate for world models and other AI-native training and inference systems. It uses a single Rust-based integrated storage-and-transport foundation to provide unified `KV/RPC`, `MQ`, and `FS` interfaces, focusing on three classes of problems: cross-process and cross-node reuse of inference-side `KVCache` and `latent cache`, decoupling `producer / consumer` stages across heterogeneous resource pools, and remote access, `S3` forwarding, cache acceleration, and large-scale cross-cluster data migration for AI data and model files. As GPU performance keeps increasing, bottlenecks and wasted resources on CPU and IO paths become more visible. This increasingly calls for more efficient infrastructure to handle this high-performance work and reuse it across different business scenarios. Fluxon addresses this by first consolidating the complexity of low-level storage and transport in Rust, then exposing scenario-oriented `KV/RPC`, `MQ`, and `FS` interfaces on top.
+Fluxon is a high-performance distributed communication and caching substrate for world models and other AI-native training and inference systems. It uses a single Rust-based integrated storage-and-transport foundation to provide unified `KV/RPC`, `MQ`, and `FS` interfaces, focusing on three classes of problems: cross-process and cross-node reuse of inference-side `KVCache` and `latent cache`, decoupled elastic message transport across heterogeneous resource pools, and remote access, `S3` forwarding, cache acceleration, and large-scale cross-cluster data migration for AI data and model files. As GPU performance keeps increasing, bottlenecks and wasted resources on CPU and IO paths become more visible. This increasingly calls for more efficient infrastructure to handle this high-performance work and reuse it across different business scenarios. Fluxon addresses this by first consolidating the complexity of low-level storage and transport in Rust, then exposing scenario-oriented `KV/RPC`, `MQ`, and `FS` interfaces on top.
 
 ## Foundation Capabilities
 
@@ -113,7 +113,7 @@ Quick Start is the shortest path to try Fluxon. For formal installation, deploym
 
 ```bash
 docker run --rm -it --network host \
-  fluxon_quick_start:0.2.1 \
+  hanbaoaaa/fluxon_quick_start:0.2.1 \
   --mode kv \
   --etcd-client-port 12379 \
   --master-p2p-port 31000 \
@@ -146,7 +146,7 @@ Related interface docs:
 
 ```bash
 docker run --rm -it --network host \
-  fluxon_quick_start:0.2.1 \
+  hanbaoaaa/fluxon_quick_start:0.2.1 \
   --mode mq \
   --etcd-client-port 37379 \
   --kv-master-port 34200 \
@@ -177,7 +177,7 @@ Related interface docs:
 
 ```bash
 docker run --rm -it --network host \
-  fluxon_quick_start:0.2.1 \
+  hanbaoaaa/fluxon_quick_start:0.2.1 \
   --mode fs \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \

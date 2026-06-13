@@ -3,7 +3,7 @@
 ![](./pics/fluxon架构图20260423.png)
 
 
-Fluxon 是一套面向世界模型与其他 AI-native 场景训推系统的通信与缓存基座，用同一套 Rust 实现的存传一体底座统一提供 `KV/RPC`、`MQ`、`FS` 三类接口，重点解决三类问题：推理侧 `KVCache`、`latent cache` 的跨进程、跨节点复用，异构资源池之间的 `producer / consumer` 解耦，以及面向 AI 数据、模型文件的远端访问、`S3` 转发、缓存加速和跨集群大规模数据搬迁。随着 GPU 性能越来越强，CPU 和 IO 链路的性能瓶颈和资源浪费被逐渐放大，越来越需要沉淀出更高效的基础设施来负责这部分高性能工作，并且复用到不同的业务场景中。Fluxon 的做法是先用 Rust 收束底层“存”和“传”的复杂度，再向上提供面向场景的 `KV/RPC`、`MQ`、`FS` 接口。
+Fluxon 是一套面向世界模型与其他 AI-native 场景训推系统的高性能分布式通信与缓存基座，用同一套 Rust 实现的存传一体底座统一提供 `KV/RPC`、`MQ`、`FS` 三类接口，重点解决三类问题：推理侧 `KVCache`、`latent cache` 的跨进程、跨节点复用，异构资源池之间的解耦弹性消息传输，以及面向 AI 数据、模型文件的远端访问、`S3` 转发、缓存加速和跨集群大规模数据搬迁。随着 GPU 性能越来越强，CPU 和 IO 链路的性能瓶颈和资源浪费被逐渐放大，越来越需要沉淀出更高效的基础设施来负责这部分高性能工作，并且复用到不同的业务场景中。Fluxon 的做法是先用 Rust 收束底层“存”和“传”的复杂度，再向上提供面向场景的 `KV/RPC`、`MQ`、`FS` 接口。
 
 
 <div align="center">
@@ -115,7 +115,7 @@ Quick Start 用于最短路径体验；正式安装、部署和运维入口见 [
 
 ```bash
 docker run --rm -it --network host \
-  fluxon_quick_start:0.2.1 \
+  hanbaoaaa/fluxon_quick_start:0.2.1 \
   --mode kv \
   --etcd-client-port 12379 \
   --master-p2p-port 31000 \
@@ -148,7 +148,7 @@ del demo:hello
 
 ```bash
 docker run --rm -it --network host \
-  fluxon_quick_start:0.2.1 \
+  hanbaoaaa/fluxon_quick_start:0.2.1 \
   --mode mq \
   --etcd-client-port 37379 \
   --kv-master-port 34200 \
@@ -179,7 +179,7 @@ exit
 
 ```bash
 docker run --rm -it --network host \
-  fluxon_quick_start:0.2.1 \
+  hanbaoaaa/fluxon_quick_start:0.2.1 \
   --mode fs \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \

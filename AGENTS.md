@@ -3,6 +3,7 @@ Keep this document concise.
 - teststack has two steps: start testbed and testrunner
 - teststack has UI support; testrunner should own the UI, and the UI should reuse the ops interfaces underneath
 - YAML files in this project are examples by default. Do not edit them directly; create a YAML file for your specific development environment
+- Git operations are limited to basic `stage`, `unstage`, `commit`, and `push`. Do not use other Git operations.
 
 ## Public API Contract
 - Public APIs must use strong contracts. Do not expose "maybe this type, maybe that type" behavior.
