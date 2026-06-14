@@ -6,10 +6,12 @@ on:
       - opened
       - synchronize
       - reopened
+    # Rebuild when doc or homepage inputs change.
     paths:
       - ".github/workflows/all_test.yml"
       - ".github/workflows/docs-pages.yml"
       - "fluxon_doc/**"
+      - "README.md"
       - "README_CN.md"
       - "pics/**"
       - "LICENSE"
