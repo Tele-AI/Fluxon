@@ -2,6 +2,7 @@ Keep this document concise.
 - Core user, developer, and design docs are in /mnt/ceph/zyc/fluxon_for_doc/fluxon_doc
 - teststack has two steps: start testbed and testrunner
 - teststack has UI support; testrunner should own the UI, and the UI should reuse the ops interfaces underneath
+- All Python code in this project must be compatible with Python >=3.10
 - YAML files in this project are examples by default. Do not edit them directly; create a YAML file for your specific development environment
 - Git operations are limited to basic `stage`, `unstage`, `commit`, and `push`. Do not use other Git operations.
 

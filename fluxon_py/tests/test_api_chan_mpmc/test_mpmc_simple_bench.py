@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from enum import StrEnum
+from enum import Enum
 import json
 import os
 import signal
@@ -111,10 +111,13 @@ FLATDICT6_DLPACK_FIELD_PREFIX = "payload_"
 FLATDICT6_DLPACK_FIELD_COUNT = 6
 
 
-class PayloadKind(StrEnum):
+class PayloadKind(str, Enum):
     BYTES = "bytes"
     DLPACK = "dlpack"
     FLATDICT6_DLPACK = "flatdict6_dlpack"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 PAYLOAD_KIND_CHOICES = tuple(kind.value for kind in PayloadKind)
