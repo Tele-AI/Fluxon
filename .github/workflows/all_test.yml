@@ -1,12 +1,13 @@
-name: Deploy Fluxon Docs to GitHub Pages
+name: all_test
 
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-      - master
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
     paths:
+      - ".github/workflows/all_test.yml"
       - ".github/workflows/docs-pages.yml"
       - "fluxon_doc/**"
       - "README_CN.md"
@@ -17,15 +18,9 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: github-pages
-  cancel-in-progress: true
 
 jobs:
-  build:
+  build-doc-site:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -59,9 +54,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-doc-site-plugins-
 
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
-
       - name: Set doc site base URL
         shell: bash
         run: |
@@ -79,19 +71,3 @@ jobs:
 
       - name: Build doc site
         run: python3 scripts/build_doc_site.py build
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: fluxon_release/doc_site
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
