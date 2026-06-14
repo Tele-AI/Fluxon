@@ -32,14 +32,14 @@ PROJECT_ROOT = (
     / f"fluxon_doc_site_{hashlib.sha256(str(REPO_ROOT).encode('utf-8')).hexdigest()[:12]}"
 )
 STAGE_DOCS_ROOT = PROJECT_ROOT / "content"
-HOMEPAGE_MARKDOWN_SOURCE = REPO_ROOT / "README_CN.md"
+# Publish the repo-root README as the doc-site homepage.
+HOMEPAGE_MARKDOWN_SOURCE = REPO_ROOT / "README.md"
 HOMEPAGE_ROOT_PICS_DIR = REPO_ROOT / "pics"
 HOMEPAGE_SUPPORT_FILE_PATHS = (
     REPO_ROOT / "LICENSE",
     REPO_ROOT / "fluxon_rs" / "rust-toolchain.toml",
 )
-# Quartz is treated as ephemeral build tooling under .cached rather than a repo module.
-# We intentionally do not route it through rather_no_git_submodule.py.
+# Keep Quartz as cached build tooling instead of a repo module.
 TOOLCHAIN_ROOT = CACHE_ROOT / "toolchain" / "quartz"
 NPM_CACHE_ROOT = CACHE_ROOT / "npm-cache"
 RUNTIME_CONFIG_PATH = TOOLCHAIN_ROOT / "quartz.config.yaml"
@@ -65,6 +65,86 @@ EXPLORER_FORCE_EXPANDED_CSS = dedent(
 EXPLORER_ADD_HOME_LINK_JS = dedent(
     """\
     ;(() => {
+      // Return the project-site base path, for example "/Fluxon".
+      function resolveFluxonSiteBasePath() {
+        const homeHref = document.querySelector(".left.sidebar .page-title a")?.href
+        if (!homeHref) return ""
+        try {
+          const pathname = new URL(homeHref, window.location.href).pathname.replace(/\/$/, "")
+          return pathname === "/" ? "" : pathname
+        } catch {
+          return ""
+        }
+      }
+
+      // Rewrite root-absolute internal links so they stay inside the project site.
+      function rewriteFluxonRootInternalLinks() {
+        const siteBasePath = resolveFluxonSiteBasePath()
+        if (!siteBasePath) return
+
+        document.querySelectorAll("a[href^='/']").forEach((link) => {
+          const href = link.getAttribute("href") || ""
+          const rewrittenHref = rewriteFluxonRootInternalHref(href, siteBasePath)
+          if (rewrittenHref && rewrittenHref !== href) {
+            link.setAttribute("href", rewrittenHref)
+          }
+        })
+      }
+
+      // Add the project-site base path to one href when needed.
+      function rewriteFluxonRootInternalHref(href, siteBasePath) {
+        if (!href || !siteBasePath) return href
+        if (href.startsWith("//")) return href
+        if (href === siteBasePath || href.startsWith(siteBasePath + "/")) return href
+        if (!href.startsWith("/")) return href
+        return siteBasePath + href
+      }
+
+      // Patch a link right before navigation in case Quartz rendered it late.
+      function installFluxonRootInternalClickGuard() {
+        if (window.__fluxonRootInternalClickGuardInstalled) return
+        window.__fluxonRootInternalClickGuardInstalled = true
+
+        document.addEventListener(
+          "click",
+          (event) => {
+            const target = event.target
+            if (!(target instanceof Element)) return
+            const link = target.closest("a[href]")
+            if (!(link instanceof HTMLAnchorElement)) return
+
+            const siteBasePath = resolveFluxonSiteBasePath()
+            if (!siteBasePath) return
+
+            const href = link.getAttribute("href") || ""
+            const rewrittenHref = rewriteFluxonRootInternalHref(href, siteBasePath)
+            if (rewrittenHref && rewrittenHref !== href) {
+              link.setAttribute("href", rewrittenHref)
+            }
+          },
+          true,
+        )
+      }
+
+      // Re-run link rewriting after Quartz mutates the page tree.
+      function installFluxonRootInternalMutationObserver() {
+        if (window.__fluxonRootInternalMutationObserverInstalled) return
+        const target = document.body
+        if (!target) return
+
+        const observer = new MutationObserver(() => {
+          rewriteFluxonRootInternalLinks()
+        })
+        observer.observe(target, {
+          subtree: true,
+          childList: true,
+          attributes: true,
+          attributeFilter: ["href"],
+        })
+        window.__fluxonRootInternalMutationObserverInstalled = true
+      }
+
+      // Insert a stable "Home" entry at the top of the explorer tree.
       function insertFluxonExplorerHomeLink() {
         const homeHref = document.querySelector(".left.sidebar .page-title a")?.getAttribute("href")
         if (!homeHref) return
@@ -100,9 +180,11 @@ EXPLORER_ADD_HOME_LINK_JS = dedent(
         })
       }
 
+      // Retry explorer patching because Quartz fills the tree asynchronously.
       function scheduleFluxonExplorerHomeLink(attempt = 0) {
         const delayMs = attempt === 0 ? 0 : 120
         window.setTimeout(() => {
+          rewriteFluxonRootInternalLinks()
           insertFluxonExplorerHomeLink()
           const needsRetry = Array.from(document.querySelectorAll(".explorer-ul")).some(
             (list) => list.children.length <= 1,
@@ -116,6 +198,8 @@ EXPLORER_ADD_HOME_LINK_JS = dedent(
       document.addEventListener("DOMContentLoaded", () => scheduleFluxonExplorerHomeLink())
       document.addEventListener("render", () => scheduleFluxonExplorerHomeLink())
       document.addEventListener("nav", () => scheduleFluxonExplorerHomeLink())
+      installFluxonRootInternalClickGuard()
+      installFluxonRootInternalMutationObserver()
       scheduleFluxonExplorerHomeLink()
     })();
     """
@@ -794,11 +878,26 @@ def run_quartz_build() -> None:
 
 
 def apply_output_overrides() -> None:
+    # Apply post-build fixes for GitHub Pages routing and Quartz navigation.
+    create_pretty_route_indexes()
     force_expand_explorer()
     add_explorer_home_link()
 
 
+def create_pretty_route_indexes() -> None:
+    # Duplicate foo.html to foo/index.html so GitHub Pages can serve /foo/.
+    for html_path in sorted(OUTPUT_ROOT.rglob("*.html")):
+        if html_path.name in {"index.html", "404.html"}:
+            continue
+
+        pretty_dir = html_path.with_suffix("")
+        pretty_index_path = pretty_dir / "index.html"
+        ensure_dir(pretty_dir)
+        shutil.copy2(html_path, pretty_index_path)
+
+
 def force_expand_explorer() -> None:
+    # Append CSS that keeps the left explorer fully expanded.
     index_css_path = OUTPUT_ROOT / "index.css"
     if not index_css_path.is_file():
         raise SystemExit(f"ERROR: missing built Quartz stylesheet: {index_css_path}")
@@ -810,6 +909,7 @@ def force_expand_explorer() -> None:
 
 
 def add_explorer_home_link() -> None:
+    # Append JavaScript that adds the explorer home link and fixes internal links.
     postscript_path = OUTPUT_ROOT / "postscript.js"
     if not postscript_path.is_file():
         raise SystemExit(f"ERROR: missing built Quartz script bundle: {postscript_path}")

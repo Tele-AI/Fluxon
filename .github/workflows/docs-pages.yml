@@ -6,9 +6,11 @@ on:
     branches:
       - main
       - master
+    # Republish when doc or homepage inputs change.
     paths:
       - ".github/workflows/docs-pages.yml"
       - "fluxon_doc/**"
+      - "README.md"
       - "README_CN.md"
       - "pics/**"
       - "LICENSE"

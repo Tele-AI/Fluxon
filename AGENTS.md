@@ -6,6 +6,19 @@ Keep this document concise.
 - YAML files in this project are examples by default. Do not edit them directly; create a YAML file for your specific development environment
 - Git operations are limited to basic `stage`, `unstage`, `commit`, and `push`. Do not use other Git operations.
 
+## Doc Site
+- Use Quartz for the doc site. Treat Quartz as cached build tooling under `.cached`; do not vendor it as a git submodule.
+- Publish the repo-root `README.md` as the doc-site homepage.
+- Do not add index `README.md` files under `fluxon_doc/**`; use real content pages and generated navigation instead.
+- GitHub Pages output must work under a project subpath such as `/Fluxon/`; avoid root-only internal links.
+- In the doc explorer, keep the left tree expanded, include `首页`, and place `roadmap` immediately after `首页`.
+
+## Code Comments
+- Write code comments in English.
+- Prefer short comments that explain what a function or block does.
+- Keep comments easy to scan; use bullets only when structure materially helps.
+- Avoid long causal essays in comments unless the logic would otherwise be hard to follow.
+
 ## Public API Contract
 - Public APIs must use strong contracts. Do not expose "maybe this type, maybe that type" behavior.
 - User-facing examples, quick starts, READMEs, and user docs must call the stable public contract directly.
