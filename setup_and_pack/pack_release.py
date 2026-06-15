@@ -188,6 +188,8 @@ def _run_pack_steps(
             release_dir=release_dir,
             rdma_backend=rdma_backend,
         )
+    with script_utils.stage("Verifying Rust PyO3 wheel"):
+        _require_pyo3_wheel_import_probe(selected_pyo3_wheel)
 
     _remove_release_wheels(
         release_dir=release_dir,
@@ -207,11 +209,13 @@ def _run_pack_steps(
 
     wheel_py = _find_single(release_dir, "fluxon-*.whl", "pure python wheel")
     with script_utils.stage("Assembling unified release wheel"):
-        _assemble_unified_release_wheel(
+        merged_wheel = _assemble_unified_release_wheel(
             release_dir=release_dir,
             pure_python_wheel=wheel_py,
             pyo3_wheel=selected_pyo3_wheel,
         )
+    with script_utils.stage("Verifying unified release wheel"):
+        _require_release_wheel_import_probe(merged_wheel)
 
 
 def _remove_release_test_stack_runtime_residues(*, release_dir: Path) -> None:
@@ -330,8 +334,6 @@ def _assemble_unified_release_wheel(
         pure_python_wheel_path=str(pure_python_wheel),
         runtime_wheel_path=str(pyo3_wheel),
     )
-    if not _release_wheel_import_probe_ok(merged_wheel_path):
-        raise RuntimeError(f"merged release wheel failed import probe: {merged_wheel_path}")
     pure_python_wheel.unlink(missing_ok=True)
     pyo3_wheel.unlink(missing_ok=True)
     return merged_wheel_path
@@ -403,6 +405,11 @@ def _release_wheel_import_probe_ok(wheel_path: Path) -> bool:
         if probe_completed.stderr.strip():
             print(probe_completed.stderr.rstrip())
         return False
+
+
+def _require_release_wheel_import_probe(wheel_path: Path) -> None:
+    if not _release_wheel_import_probe_ok(wheel_path):
+        raise RuntimeError(f"merged release wheel failed import probe: {wheel_path}")
 
 
 def _release_wheel_import_probe_code() -> str:
@@ -544,7 +551,7 @@ def _pack_rust_pyo3_wheel_via_nix(
             manylinux_version=manylinux_version,
             what="pyo3 wheel",
         )
-        if _wheel_import_probe_ok(reused_release_wheel, cwd=repo_root):
+        if _wheel_import_probe_ok(reused_release_wheel):
             return reused_release_wheel
         print(
             "Cached release-dir PyO3 wheel failed local import probe; forcing rebuild: "
@@ -573,7 +580,7 @@ def _pack_rust_pyo3_wheel_via_nix(
         current_checksum = pack_state.current_checksum()
         if (
             cached_instance_checksum == current_checksum
-            and _wheel_import_probe_ok(cached_instance_wheel, cwd=repo_root)
+            and _wheel_import_probe_ok(cached_instance_wheel)
         ):
             print(f"Reusing NIX layout PyO3 wheel without rebuild: {cached_instance_wheel}")
             copied_wheel = _copy_release_artifacts(
@@ -653,12 +660,10 @@ def _pack_rust_pyo3_wheel_via_nix(
         pattern="fluxon_pyo3-*.whl",
         what="pyo3 wheel",
     )
-    if not _wheel_import_probe_ok(built_wheel, cwd=repo_root):
-        raise RuntimeError(f"built PyO3 wheel failed local import probe: {built_wheel}")
     return built_wheel
 
 
-def _wheel_import_probe_ok(wheel_path: Path, *, cwd: Path) -> bool:
+def _wheel_import_probe_ok(wheel_path: Path) -> bool:
     wheel_path = wheel_path.resolve()
     if not wheel_path.is_file():
         print(f"PyO3 wheel import probe skipped; file is missing: {wheel_path}")
@@ -726,6 +731,13 @@ def _wheel_import_probe_ok(wheel_path: Path, *, cwd: Path) -> bool:
         if probe_completed.stderr.strip():
             print(probe_completed.stderr.rstrip())
         return False
+
+
+def _require_pyo3_wheel_import_probe(wheel_path: Path) -> None:
+    if not _wheel_import_probe_ok(wheel_path):
+        raise RuntimeError(f"built PyO3 wheel failed local import probe: {wheel_path}")
+
+
 def _render_nix_pack_config(
     *,
     template_path: Path,

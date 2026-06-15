@@ -1893,7 +1893,8 @@ def _render_container_wheel_finalize_python(*, selected_backend_plan: dict) -> s
         "_validate_vendor_runtime_wheel_layout = packmod._validate_vendor_runtime_wheel_layout",
         "_stage_vendor_runtime_closure = packmod._stage_vendor_runtime_closure",
         "_extract_wheel_runtime_tree = packmod._extract_wheel_runtime_tree",
-        "_prune_unused_vendor_runtime_aliases = packmod._prune_unused_vendor_runtime_aliases",
+        "_ensure_vendor_runtime_soname_aliases = packmod._ensure_vendor_runtime_soname_aliases",
+        "_validate_wheel_bundled_soname_aliases = packmod._validate_wheel_bundled_soname_aliases",
         "",
         "if not helper_path.is_file():",
         "    raise RuntimeError(f'wheel helper is missing: {helper_path}')",
@@ -1916,10 +1917,16 @@ def _render_container_wheel_finalize_python(*, selected_backend_plan: dict) -> s
             lines.extend(
                 [
                     f"rdma_runtime_libs = resolve_offline_rdma_runtime(target_root, {json.dumps(step['native_dir_name'])})",
-                    "wau.add_shared_libraries(",
-                    "    str(wheel_path),",
-                    "    rdma_runtime_libs,",
-                    ")",
+                    "with tempfile.TemporaryDirectory(prefix='fluxon_offline_rdma_alias_') as tmp_dir:",
+                    "    rdma_runtime_stage_dir = Path(tmp_dir)",
+                    "    rdma_runtime_stage_paths = _ensure_vendor_runtime_soname_aliases(",
+                    "        staged_paths=[Path(path) for path in rdma_runtime_libs],",
+                    "        dest_dir=rdma_runtime_stage_dir,",
+                    "    )",
+                    "    wau.add_shared_libraries(",
+                    "        str(wheel_path),",
+                    "        [str(path) for path in rdma_runtime_stage_paths],",
+                    "    )",
                 ]
             )
             continue
@@ -2000,9 +2007,13 @@ def _render_container_wheel_finalize_python(*, selected_backend_plan: dict) -> s
                     "            packaged_file_names=set(bundled_name_map),",
                     "            vendor_lib_paths=vendor_lib_paths,",
                     "        )",
+                    "        bundled_runtime_libs = _ensure_vendor_runtime_soname_aliases(",
+                    "            staged_paths=[*vendor_lib_paths, *extra_runtime_libs],",
+                    "            dest_dir=runtime_stage_dir,",
+                    "        )",
                     "        wau.add_shared_libraries(",
                     "            str(wheel_path),",
-                    "            [str(path) for path in [*vendor_lib_paths, *extra_runtime_libs]],",
+                    "            [str(path) for path in bundled_runtime_libs],",
                     "            packaged_lib_replacements=packaged_replacements,",
                     "        )",
                     "vendor_driver_config_dir = _resolve_ibverbs_driver_config_dir(",
@@ -2010,7 +2021,7 @@ def _render_container_wheel_finalize_python(*, selected_backend_plan: dict) -> s
                     "    runtime_label='vendor runtime install-root',",
                     ")",
                     "wau.add_plugins(str(wheel_path), str(vendor_driver_config_dir), 'libibverbs.d')",
-                    "_prune_unused_vendor_runtime_aliases(wheel_path)",
+                    "_validate_wheel_bundled_soname_aliases(wheel_path)",
                     "_validate_vendor_runtime_wheel_layout(wheel_path)",
                     "print(f'wheel finalize: packaged vendor runtime from {vendor_runtime_root}')",
                 ]
@@ -2870,9 +2881,8 @@ def _extract_wheel_runtime_tree(wheel_path: Path):
         yield candidates[0], wheel_bundled_lib_dirs
 
 
-def _prune_unused_vendor_runtime_aliases(wheel_path: Path) -> None:
-    alias_names = ("libibverbs.so.1", "libmlx5.so.1")
-    with tempfile.TemporaryDirectory(prefix="fluxon_vendor_runtime_alias_prune_") as temp_dir_str:
+def _validate_wheel_bundled_soname_aliases(wheel_path: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="fluxon_vendor_runtime_alias_validate_") as temp_dir_str:
         temp_dir = Path(temp_dir_str)
         with zipfile.ZipFile(wheel_path, "r") as zip_ref:
             zip_ref.extractall(temp_dir)
@@ -2880,20 +2890,20 @@ def _prune_unused_vendor_runtime_aliases(wheel_path: Path) -> None:
         libs_dir = temp_dir / f"{pkg_name}.libs"
         if not libs_dir.is_dir():
             return
-        removed_any = False
-        for alias_name in alias_names:
-            alias_path = libs_dir / alias_name
-            if not alias_path.exists():
+        missing_aliases: list[str] = []
+        for lib_path in sorted(path for path in libs_dir.iterdir() if path.is_file() and ".so" in path.name):
+            try:
+                soname = _read_elf_soname(lib_path)
+            except subprocess.CalledProcessError:
                 continue
-            alias_path.unlink()
-            removed_any = True
-        if not removed_any:
-            return
-        with zipfile.ZipFile(wheel_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_out:
-            for path in sorted(temp_dir.rglob("*")):
-                if path.is_dir():
-                    continue
-                zip_out.write(path, path.relative_to(temp_dir).as_posix())
+            if soname is None or soname == lib_path.name:
+                continue
+            if not (libs_dir / soname).is_file():
+                missing_aliases.append(soname)
+        if missing_aliases:
+            raise RuntimeError(
+                f"wheel is missing bundled SONAME aliases: {wheel_path}: {sorted(set(missing_aliases))}"
+            )
 
 
 def _read_elf_needed_names(path: Path) -> list[str]:

@@ -33,6 +33,30 @@ def _load_module(module_path: Path, module_name: str):
 
 
 class VendorRuntimeLayoutTest(unittest.TestCase):
+    def test_ensure_vendor_runtime_soname_aliases_materializes_missing_alias_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            staged_dir = root / "stage"
+            staged_dir.mkdir(parents=True)
+            lib_path = staged_dir / "libfabric.so"
+            lib_path.write_text("binary", encoding="utf-8")
+
+            for module_path in PACKER_MODULE_PATHS:
+                mod = _load_module(
+                    module_path=module_path,
+                    module_name=f"vendor_runtime_alias_materialize_{module_path.stem}",
+                )
+                mod._read_elf_soname = lambda _path: "libfabric.so.1"  # type: ignore[attr-defined]
+                aliased_paths = mod._ensure_vendor_runtime_soname_aliases(  # type: ignore[attr-defined]
+                    staged_paths=[lib_path],
+                    dest_dir=staged_dir,
+                )
+                self.assertEqual(
+                    [path.name for path in aliased_paths],
+                    ["libfabric.so", "libfabric.so.1"],
+                )
+                self.assertTrue((staged_dir / "libfabric.so.1").is_file())
+
     def test_resolve_install_root_accepts_provider_only_mlx5_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cargo_target_root = Path(tmpdir)

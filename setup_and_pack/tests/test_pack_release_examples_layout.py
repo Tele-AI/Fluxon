@@ -83,6 +83,54 @@ class PackReleaseExamplesLayoutTest(unittest.TestCase):
 
         self.assertEqual(merged, "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl")
 
+    def test_run_pack_steps_verifies_built_and_merged_wheels_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            release_dir = repo_root / "fluxon_release"
+            pack_script = repo_root / "setup_and_pack" / "pack_fluxon_pylib.py"
+            release_dir.mkdir(parents=True)
+            pack_script.parent.mkdir(parents=True, exist_ok=True)
+            pack_script.write_text("print('stub')\n", encoding="utf-8")
+            built_pyo3_wheel = release_dir / "fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            pure_python_wheel = release_dir / "fluxon-0.2.1-py3-none-any.whl"
+            merged_wheel = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+
+            built_pyo3_wheel.write_text("", encoding="utf-8")
+            pure_python_wheel.write_text("", encoding="utf-8")
+            merged_wheel.write_text("", encoding="utf-8")
+
+            with (
+                mock.patch.object(
+                    _PACK_RELEASE,
+                    "_pack_rust_pyo3_wheel_via_nix",
+                    return_value=built_pyo3_wheel,
+                ) as pack_pyo3,
+                mock.patch.object(_PACK_RELEASE, "_require_pyo3_wheel_import_probe") as verify_pyo3,
+                mock.patch.object(_PACK_RELEASE, "_remove_release_wheels") as remove_wheels,
+                mock.patch.object(_PACK_RELEASE.subprocess, "check_call") as check_call,
+                mock.patch.object(_PACK_RELEASE, "_find_single", return_value=pure_python_wheel) as find_single,
+                mock.patch.object(
+                    _PACK_RELEASE,
+                    "_assemble_unified_release_wheel",
+                    return_value=merged_wheel,
+                ) as assemble_wheel,
+                mock.patch.object(_PACK_RELEASE, "_require_release_wheel_import_probe") as verify_release,
+            ):
+                _PACK_RELEASE._run_pack_steps(
+                    repo_root=repo_root,
+                    release_dir=release_dir,
+                    rdma_backend="closed_sdk",
+                    with_tikv_runtime=True,
+                )
+
+            pack_pyo3.assert_called_once()
+            verify_pyo3.assert_called_once_with(built_pyo3_wheel)
+            remove_wheels.assert_called_once()
+            check_call.assert_called_once()
+            find_single.assert_called_once()
+            assemble_wheel.assert_called_once()
+            verify_release.assert_called_once_with(merged_wheel)
+
     def test_release_wheel_import_probe_code_avoids_fluxon_py_package_init(self) -> None:
         probe_code = _PACK_RELEASE._release_wheel_import_probe_code()
 
