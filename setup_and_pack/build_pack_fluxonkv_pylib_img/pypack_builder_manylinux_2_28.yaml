@@ -26,14 +26,6 @@ heavy_setup:
     - bash -lc 'toolroot=/opt/rh/gcc-toolset-14/root/usr/bin && ln -sf "$toolroot/gcc" /usr/local/bin/gcc && ln -sf "$toolroot/gcc" /usr/local/bin/cc && ln -sf "$toolroot/g++" /usr/local/bin/g++ && ln -sf "$toolroot/g++" /usr/local/bin/c++ && for tool in cpp ar nm ranlib strip ld; do if [ -x "$toolroot/$tool" ]; then ln -sf "$toolroot/$tool" "/usr/local/bin/$tool"; fi; done'
     - /usr/local/bin/gcc --version | head -n 1
     - /usr/local/bin/g++ --version | head -n 1
-  - name: install_maturin_cp38
-    commands:
-    - /opt/python/cp38-cp38/bin/pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple
-      --trusted-host mirrors.aliyun.com -U pip setuptools wheel maturin setuptools-rust pybind11
-  - name: install_maturin_cp39
-    commands:
-    - /opt/python/cp39-cp39/bin/pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple
-      --trusted-host mirrors.aliyun.com -U pip setuptools wheel maturin setuptools-rust pybind11
   - name: install_maturin_cp310
     commands:
     - /opt/python/cp310-cp310/bin/pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple
@@ -41,6 +33,10 @@ heavy_setup:
   - name: install_maturin_cp311
     commands:
     - /opt/python/cp311-cp311/bin/pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple
+      --trusted-host mirrors.aliyun.com -U pip setuptools wheel maturin setuptools-rust pybind11
+  - name: install_maturin_cp312
+    commands:
+    - /opt/python/cp312-cp312/bin/pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple
       --trusted-host mirrors.aliyun.com -U pip setuptools wheel maturin setuptools-rust pybind11
   - name: link_maturin_symlink
     commands:
