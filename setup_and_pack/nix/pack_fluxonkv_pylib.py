@@ -2502,6 +2502,7 @@ def _resolve_external_mounts(
                 spec=spec,
                 profile_dir=profile_dir,
                 manylinux_cfg=manylinux_cfg,
+                selected_backend_plan=selected_backend_plan,
                 rdma_backend=selected_backend_plan["rdma_backend"],
                 mount_spec=mount_spec,
             )
@@ -2514,6 +2515,7 @@ def _resolve_external_mount(
     spec,
     profile_dir: Path,
     manylinux_cfg: dict,
+    selected_backend_plan: dict,
     rdma_backend: str,
     mount_spec: dict,
 ) -> dict:
