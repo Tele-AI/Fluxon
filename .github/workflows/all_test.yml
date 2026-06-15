@@ -85,6 +85,15 @@ jobs:
       - name: Run pack_release
         run: python3 setup_and_pack/pack_release.py --release-dir fluxon_release
 
+      - name: Normalize pack_release debug artifact permissions
+        if: ${{ always() }}
+        run: |
+          chmod -R a+rX fluxon_release || true
+          chmod -R a+rX setup_and_pack/nix/runs || true
+          find "$RUNNER_TEMP/fluxon-pack-release/project-data" \
+            \( -path '*/instances/*/logs' -o -path '*/instances/*/release' -o -path '*/assemblies/*/profile' \) \
+            -exec chmod -R a+rX {} + || true
+
       - name: Upload pack_release debug artifacts
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -95,7 +104,9 @@ jobs:
           path: |
             fluxon_release/**
             setup_and_pack/nix/runs/**
-            ${{ runner.temp }}/fluxon-pack-release/project-data/**
+            ${{ runner.temp }}/fluxon-pack-release/project-data/**/instances/**/logs/**
+            ${{ runner.temp }}/fluxon-pack-release/project-data/**/instances/**/release/**
+            ${{ runner.temp }}/fluxon-pack-release/project-data/**/assemblies/**/profile/**
 
   build-doc-site:
     runs-on: ubuntu-latest
