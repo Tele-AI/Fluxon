@@ -72,23 +72,27 @@ def _set_rpath(path: Path, rpath: str) -> None:
     )
 
 
+def _normalize_extracted_wheel_lib_rpaths(*, source_root: Path, pkg_name: str) -> None:
+    pkg_dir = source_root / pkg_name
+    libs_dir = source_root / f"{pkg_name}.libs"
+
+    for ext_path in sorted(pkg_dir.glob("*.so")):
+        _set_rpath(ext_path, "$ORIGIN:$ORIGIN/../fluxon_pyo3.libs")
+
+    if libs_dir.is_dir():
+        for lib_path in sorted(libs_dir.glob("*.so*")):
+            if not lib_path.is_file():
+                continue
+            _set_rpath(lib_path, "$ORIGIN")
+
+
 def normalize_wheel_lib_rpaths(wheel_path: str) -> None:
     with tempfile.TemporaryDirectory(prefix="fluxon_wheel_rpath_") as temp_dir_str:
         temp_dir = Path(temp_dir_str)
         with zipfile.ZipFile(wheel_path, "r") as zip_ref:
             zip_ref.extractall(temp_dir)
         pkg_name = Path(wheel_path).name.split("-", 1)[0]
-        pkg_dir = temp_dir / pkg_name
-        libs_dir = temp_dir / f"{pkg_name}.libs"
-
-        for ext_path in sorted(pkg_dir.glob("*.so")):
-            _set_rpath(ext_path, "$ORIGIN:$ORIGIN/../fluxon_pyo3.libs")
-
-        if libs_dir.is_dir():
-            for lib_path in sorted(libs_dir.glob("*.so*")):
-                if not lib_path.is_file():
-                    continue
-                _set_rpath(lib_path, "$ORIGIN")
+        _normalize_extracted_wheel_lib_rpaths(source_root=temp_dir, pkg_name=pkg_name)
 
         create_wheel(wheel_path, str(temp_dir))
 
@@ -131,6 +135,7 @@ def add_shared_libraries(
                 raise RuntimeError(f"replacement shared library is missing: {source_path}")
             shutil.copy2(source_path, libs_dir / base_name)
 
+        _normalize_extracted_wheel_lib_rpaths(source_root=temp_dir, pkg_name=pkg_name)
         create_wheel(wheel_path, str(temp_dir))
 
 
@@ -152,6 +157,7 @@ def install_shared_libraries(
                 raise RuntimeError(f"shared library is missing: {source_path}")
             shutil.copy2(source_path, libs_dir / dest_name)
 
+        _normalize_extracted_wheel_lib_rpaths(source_root=temp_dir, pkg_name=pkg_name)
         create_wheel(wheel_path, str(temp_dir))
 
 
