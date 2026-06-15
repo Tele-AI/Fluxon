@@ -45,7 +45,6 @@ from setup_and_pack.closed_sdk_contract import (
 )
 from utils.sudo_prefix_utils import host_sudo_prefix
 import utils as script_utils
-CONTAINER_LIBPYTHON_PLACEHOLDER_PATH = "/opt/_internal/cpython-3.10.19/lib/libpython3.10.a"
 ABI3_SMOKE_TEST_INTERPRETERS = (
     "/opt/python/cp310-cp310/bin/python",
     "/opt/python/cp311-cp311/bin/python",
@@ -129,7 +128,6 @@ GENERATED_RELEASE_RELATIVE_ROOT = Path("fluxon_release") / "generated"
 GENERATED_TOOLCHAIN_DIR_NAME = "toolchain"
 PREPARE_BUILD_GENERATED_DIR_NAME = "prepare_build"
 PREPARE_BUILD_RESOURCE_STORE_DIR_NAME = "resource_store"
-LIBPYTHON_PLACEHOLDER_FILE_NAME = "libpython3.10.a"
 PUBLIC_CLOSED_SDK_REPO_RELATIVE_ROOT = Path("fluxon_release") / "closed_sdk"
 PUBLIC_WHEEL_RUNTIME_HELPER_REPO_RELATIVE_PATH = Path("setup_and_pack") / "utils" / "wheel_runtime_helper.py"
 WHEEL_FINALIZE_STEP_KIND_ADD_OFFLINE_RDMA_SHARED_LIBRARIES = "add_offline_rdma_shared_libraries"
@@ -770,10 +768,6 @@ def main() -> int:
                 selected_backend_plan=selected_backend_plan,
             )
         workspace_mount_dir = _resolve_workspace_mount_dir(profile_dir=profile_dir)
-        libpython_placeholder_path = _ensure_generated_libpython_placeholder(
-            spec=spec,
-            runtime_target=runtime_target,
-        )
         if args.run:
             _clear_directory(release_dir)
             cargo_registry_dir.mkdir(parents=True, exist_ok=True)
@@ -796,7 +790,6 @@ def main() -> int:
                 published_profile_dir=published_profile_dir,
                 selected_backend_plan=selected_backend_plan,
             ),
-            libpython_placeholder_path=libpython_placeholder_path,
             cargo_registry_dir=cargo_registry_dir,
             cargo_git_dir=cargo_git_dir,
         )
@@ -1417,24 +1410,6 @@ def _ensure_generated_prepare_build_resource_store(*, generated_system_dir: Path
     return resource_store_dir.resolve()
 
 
-def _ensure_generated_libpython_placeholder(*, spec, runtime_target) -> Path:
-    generated_system_dir = _ensure_generated_system_dir(
-        spec=spec,
-        runtime_target=runtime_target,
-    )
-    toolchain_dir = _ensure_generated_dir(generated_system_dir / GENERATED_TOOLCHAIN_DIR_NAME)
-    placeholder_path = toolchain_dir / LIBPYTHON_PLACEHOLDER_FILE_NAME
-    if placeholder_path.exists():
-        if not placeholder_path.is_file():
-            raise RuntimeError(f"generated libpython placeholder must be a file: {placeholder_path}")
-        return placeholder_path.resolve()
-    subprocess.run(
-        ["ar", "rcs", str(placeholder_path)],
-        check=True,
-    )
-    return placeholder_path.resolve()
-
-
 def _build_docker_argv(
     *,
     spec,
@@ -1448,7 +1423,6 @@ def _build_docker_argv(
     profile_dir: Path,
     external_mounts: tuple[dict, ...],
     extra_host_mount_paths: tuple[Path, ...],
-    libpython_placeholder_path: Path,
     cargo_registry_dir: Path,
     cargo_git_dir: Path,
 ) -> list[str]:
@@ -1597,8 +1571,6 @@ def _build_docker_argv(
         f"{release_dir}:/release",
         "-v",
         f"{profile_dir}:{CONTAINER_PROFILE_PATH}",
-        "-v",
-        f"{libpython_placeholder_path}:{CONTAINER_LIBPYTHON_PLACEHOLDER_PATH}",
         "-v",
         f"{cargo_registry_dir}:/root/.cargo/registry",
         "-v",

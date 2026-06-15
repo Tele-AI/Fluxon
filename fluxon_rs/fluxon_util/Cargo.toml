@@ -6,8 +6,9 @@ authors = ["Your Name <your.email@example.com>"]
 description = "Utility crate with macros and helper functions"
 license = "MIT OR Apache-2.0"
 
-#[features]
-# Python types (pyo3) are now always available; no conditional compilation.
+[features]
+default = []
+python = ["dep:pyo3"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -32,7 +33,7 @@ libc = { workspace = true }
 serde_yaml = { workspace = true }
 dashmap = { workspace = true }
 etcd-client = { workspace = true }
-pyo3 = { version = "0.22", features = ["abi3-py38"] }
+pyo3 = { version = "0.22", features = ["abi3-py38"], optional = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
