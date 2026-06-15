@@ -35,6 +35,8 @@ from .stage_timing_utils import print_stage_summary, reset_stage_summary, stage
 from .sudo_prefix_utils import host_sudo_prefix, sudo_prefix
 from .transport_backend_utils import (
     RDMA_BACKENDS,
+    PUBLIC_TRANSPORT_BACKEND,
+    PUBLIC_TRANSPORT_PROFILE_ID,
     TRANSPORT_BACKENDS,
     TRANSPORT_PROFILE_IDS,
 )
@@ -43,6 +45,8 @@ __all__ = [
     "PIGZ_JOBS",
     "TRANSPORT_BACKENDS",
     "RDMA_BACKENDS",
+    "PUBLIC_TRANSPORT_BACKEND",
+    "PUBLIC_TRANSPORT_PROFILE_ID",
     "TRANSPORT_PROFILE_IDS",
     "stage",
     "print_stage_summary",

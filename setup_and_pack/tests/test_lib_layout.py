@@ -87,6 +87,7 @@ class ApplyLayoutTest(unittest.TestCase):
             self.assertTrue((workspace_seed_dir / "setup_and_pack/nix/pack_fluxonkv_pylib.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/utils/__init__.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/utils/sudo_prefix_utils.py").is_file())
+            self.assertTrue((workspace_seed_dir / "setup_and_pack/utils/wheel_runtime_helper.py").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/fluxon_kv/Cargo.toml").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/Cargo.lock").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/moka/Cargo.toml").is_file())

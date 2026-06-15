@@ -34,18 +34,17 @@ impl PyEtcdLock {
             ));
         }
         if ttl_seconds <= 0 {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("EtcdLock ttl_seconds must be > 0, got {}", ttl_seconds),
-            ));
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "EtcdLock ttl_seconds must be > 0, got {}",
+                ttl_seconds
+            )));
         }
         let timeout_seconds = timeout_seconds.unwrap_or(10.0);
         if !(timeout_seconds.is_finite() && timeout_seconds > 0.0) {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!(
-                    "EtcdLock timeout_seconds must be finite and > 0, got {}",
-                    timeout_seconds
-                ),
-            ));
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "EtcdLock timeout_seconds must be finite and > 0, got {}",
+                timeout_seconds
+            )));
         }
 
         Ok(Self {
@@ -77,12 +76,10 @@ impl PyEtcdLock {
 
         let timeout_seconds = timeout_seconds.unwrap_or(self.timeout_seconds);
         if !(timeout_seconds.is_finite() && timeout_seconds > 0.0) {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!(
-                    "EtcdLock timeout_seconds must be finite and > 0, got {}",
-                    timeout_seconds
-                ),
-            ));
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "EtcdLock timeout_seconds must be finite and > 0, got {}",
+                timeout_seconds
+            )));
         }
 
         let endpoints = self.endpoints.clone();
@@ -139,8 +136,8 @@ impl PyEtcdLock {
             .map_err(|e| anyhow::anyhow!("runtime bridge failed in EtcdLock.acquire: {}", e))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        let acquire_outcome = outer
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let acquire_outcome =
+            outer.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         match acquire_outcome {
             Some((lease_id, lock_key)) => {
@@ -240,12 +237,10 @@ impl PyEtcdLock {
         py: Python<'py>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         if !slf.acquire(py, None)? {
-            return Err(PyErr::new::<pyo3::exceptions::PyTimeoutError, _>(
-                format!(
-                    "timed out acquiring EtcdLock name={} timeout_seconds={}",
-                    slf.name, slf.timeout_seconds
-                ),
-            ));
+            return Err(PyErr::new::<pyo3::exceptions::PyTimeoutError, _>(format!(
+                "timed out acquiring EtcdLock name={} timeout_seconds={}",
+                slf.name, slf.timeout_seconds
+            )));
         }
         Ok(slf)
     }

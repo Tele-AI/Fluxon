@@ -1,5 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
 use axum::Router;
 use axum::body::HttpBody as _;
 use axum::body::{Body, boxed};
@@ -23,8 +21,8 @@ use fluxon_fs_core::config::{
 use fluxon_fs_core::path::{safe_abs_dirpath, safe_relpath};
 use fluxon_fs_core::s3_gateway as fs_s3;
 use fluxon_observability::keys::{
-    PROM_LABEL_TRANSFER_DST_EXPORT, PROM_LABEL_TRANSFER_JOB_ID,
-    PROM_LABEL_TRANSFER_SRC_EXPORT, PROM_METRIC_TRANSFER_JOB_BANDWIDTH_BYTES_PER_SEC,
+    PROM_LABEL_TRANSFER_DST_EXPORT, PROM_LABEL_TRANSFER_JOB_ID, PROM_LABEL_TRANSFER_SRC_EXPORT,
+    PROM_METRIC_TRANSFER_JOB_BANDWIDTH_BYTES_PER_SEC,
     PROM_METRIC_TRANSFER_JOB_RUNNING_WORKER_COUNT, PROM_METRIC_TRANSFER_JOB_TOTAL_WRITTEN_BYTES,
     PROM_METRIC_TRANSFER_JOB_WRITING_BATCH_COUNT,
 };
@@ -36,17 +34,21 @@ use hmac::{Hmac, Mac as _};
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 use tower::ServiceExt as _;
 use uuid::Uuid;
 
 mod transfer;
 
+#[cfg(test)]
+use transfer::encode_transfer_manifest_blob;
 pub use transfer::{
-    FsTransferBatchCollectInfoRecord, FsTransferBatchFileIssueRecord, FsTransferBatchRecord, FsTransferCreateJobArg,
-    FsTransferDirectFilesCompleteRecord, FsTransferFailureScope, FsTransferJobLiveDetailSnapshot, FsTransferJobRecord,
-    FsTransferJobSnapshot, FsTransferReadyBatchClass, FsTransferRecentFailureSnapshot,
-    FsTransferSchedulerJobSnapshot,
-    DEFAULT_TRANSFER_JOB_DESIRED_SCAN_CONCURRENCY,
+    DEFAULT_TRANSFER_JOB_DESIRED_SCAN_CONCURRENCY, FsTransferBatchCollectInfoRecord,
+    FsTransferBatchFileIssueRecord, FsTransferBatchRecord, FsTransferCreateJobArg,
+    FsTransferDirectFilesCompleteRecord, FsTransferFailureScope, FsTransferJobLiveDetailSnapshot,
+    FsTransferJobRecord, FsTransferJobSnapshot, FsTransferReadyBatchClass,
+    FsTransferRecentFailureSnapshot, FsTransferSchedulerJobSnapshot,
 };
 use transfer::{
     FsTransferScanLiveDetailSnapshot, FsTransferWorkerAggregateLiveDetailSnapshot,
@@ -54,8 +56,6 @@ use transfer::{
     FsTransferWorkerLiveSnapshot, TiKvTransferReconcileHandle, TiKvTransferStateStore,
     TransferScanSchedulerHandle, TransferStateStore, TransferWorkerSchedulerHandle,
 };
-#[cfg(test)]
-use transfer::encode_transfer_manifest_blob;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -470,13 +470,16 @@ struct TransferPromData {
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
 enum TransferPromResultSample {
-    Range {
-        values: Vec<(f64, String)>,
-    },
+    Range { values: Vec<(f64, String)> },
 }
 
 impl TransferWorkerLiveDetailState {
-    fn new(job_batch_id: &str, worker_id: &str, worker_task_id: &str, lease_expire_unix_ms: i64) -> Self {
+    fn new(
+        job_batch_id: &str,
+        worker_id: &str,
+        worker_task_id: &str,
+        lease_expire_unix_ms: i64,
+    ) -> Self {
         Self {
             worker_id: worker_id.to_string(),
             worker_task_id: worker_task_id.to_string(),
@@ -539,12 +542,13 @@ impl TransferJobLiveDetailState {
     fn push_failure(&mut self, unix_ms: i64, scope: FsTransferFailureScope, message: String) {
         let failure_index = self.next_failure_index;
         self.next_failure_index = self.next_failure_index.saturating_add(1);
-        self.recent_failures.push_front(FsTransferRecentFailureSnapshot {
-            failure_index,
-            unix_ms,
-            scope,
-            message,
-        });
+        self.recent_failures
+            .push_front(FsTransferRecentFailureSnapshot {
+                failure_index,
+                unix_ms,
+                scope,
+                message,
+            });
         while self.recent_failures.len() > TRANSFER_RECENT_FAILURE_LIMIT {
             self.recent_failures.pop_back();
         }
@@ -591,12 +595,11 @@ impl TransferJobLiveDetailState {
             }
             aggregate_visible_file_count =
                 aggregate_visible_file_count.saturating_add(worker.visible_file_count);
-            aggregate_visible_bytes =
-                aggregate_visible_bytes.saturating_add(worker.visible_bytes);
+            aggregate_visible_bytes = aggregate_visible_bytes.saturating_add(worker.visible_bytes);
             aggregate_live_bandwidth_bytes_per_sec = aggregate_live_bandwidth_bytes_per_sec
                 .saturating_add(worker.current_bandwidth_bytes_per_sec.max(0));
-            aggregate_total_written_bytes = aggregate_total_written_bytes
-                .saturating_add(worker.total_written_bytes.max(0));
+            aggregate_total_written_bytes =
+                aggregate_total_written_bytes.saturating_add(worker.total_written_bytes.max(0));
         }
         FsTransferJobLiveDetailSnapshot {
             scan: FsTransferScanLiveDetailSnapshot {
@@ -655,9 +658,11 @@ impl GatewayState {
             match access.transfer_state_store.clone() {
                 Some(cfg) => (
                     Some(build_transfer_state_store(cfg.clone())?),
-                    Some(Arc::new(TiKvTransferReconcileHandle::new(&match cfg.kind {
-                        FluxonFsTransferStateStoreKind::TiKv(ref tikv) => tikv.clone(),
-                    })?)),
+                    Some(Arc::new(TiKvTransferReconcileHandle::new(
+                        &match cfg.kind {
+                            FluxonFsTransferStateStoreKind::TiKv(ref tikv) => tikv.clone(),
+                        },
+                    )?)),
                 ),
                 None => (None, None),
             };
@@ -690,12 +695,7 @@ impl GatewayState {
         })
     }
 
-    fn transfer_history_record_job_meta(
-        &self,
-        job_id: &str,
-        src_export: &str,
-        dst_export: &str,
-    ) {
+    fn transfer_history_record_job_meta(&self, job_id: &str, src_export: &str, dst_export: &str) {
         let Some(history) = self.transfer_history.as_ref() else {
             return;
         };
@@ -730,15 +730,22 @@ impl GatewayState {
             return;
         };
         if meta.last_emit_unix_ms > 0
-            && now_unix_ms.saturating_sub(meta.last_emit_unix_ms) < TRANSFER_HISTORY_EMIT_INTERVAL_MS
+            && now_unix_ms.saturating_sub(meta.last_emit_unix_ms)
+                < TRANSFER_HISTORY_EMIT_INTERVAL_MS
         {
             return;
         }
         meta.last_emit_unix_ms = now_unix_ms;
         let base_labels = vec![
             (PROM_LABEL_TRANSFER_JOB_ID.to_string(), job_id.to_string()),
-            (PROM_LABEL_TRANSFER_SRC_EXPORT.to_string(), meta.src_export.clone()),
-            (PROM_LABEL_TRANSFER_DST_EXPORT.to_string(), meta.dst_export.clone()),
+            (
+                PROM_LABEL_TRANSFER_SRC_EXPORT.to_string(),
+                meta.src_export.clone(),
+            ),
+            (
+                PROM_LABEL_TRANSFER_DST_EXPORT.to_string(),
+                meta.dst_export.clone(),
+            ),
         ];
         let series = vec![
             build_transfer_job_timeseries(
@@ -800,10 +807,9 @@ impl GatewayState {
         start_unix_ms: i64,
         end_unix_ms: i64,
     ) -> Result<TransferJobHistorySnapshot, String> {
-        let history = self
-            .transfer_history
-            .as_ref()
-            .ok_or_else(|| "transfer history is unavailable because observability is not configured".to_string())?;
+        let history = self.transfer_history.as_ref().ok_or_else(|| {
+            "transfer history is unavailable because observability is not configured".to_string()
+        })?;
         let start_unix_ms = start_unix_ms.max(0);
         let end_unix_ms = end_unix_ms.max(start_unix_ms);
         let start_s = (start_unix_ms as f64) / 1000.0;
@@ -819,8 +825,7 @@ impl GatewayState {
                 history,
                 &format!(
                     "{}{{{}}}",
-                    PROM_METRIC_TRANSFER_JOB_BANDWIDTH_BYTES_PER_SEC,
-                    selector
+                    PROM_METRIC_TRANSFER_JOB_BANDWIDTH_BYTES_PER_SEC, selector
                 ),
                 start_s,
                 end_s,
@@ -832,8 +837,7 @@ impl GatewayState {
                 history,
                 &format!(
                     "{}{{{}}}",
-                    PROM_METRIC_TRANSFER_JOB_RUNNING_WORKER_COUNT,
-                    selector
+                    PROM_METRIC_TRANSFER_JOB_RUNNING_WORKER_COUNT, selector
                 ),
                 start_s,
                 end_s,
@@ -845,8 +849,7 @@ impl GatewayState {
                 history,
                 &format!(
                     "{}{{{}}}",
-                    PROM_METRIC_TRANSFER_JOB_WRITING_BATCH_COUNT,
-                    selector
+                    PROM_METRIC_TRANSFER_JOB_WRITING_BATCH_COUNT, selector
                 ),
                 start_s,
                 end_s,
@@ -858,8 +861,7 @@ impl GatewayState {
                 history,
                 &format!(
                     "{}{{{}}}",
-                    PROM_METRIC_TRANSFER_JOB_TOTAL_WRITTEN_BYTES,
-                    selector
+                    PROM_METRIC_TRANSFER_JOB_TOTAL_WRITTEN_BYTES, selector
                 ),
                 start_s,
                 end_s,
@@ -975,9 +977,7 @@ impl GatewayState {
         &self,
         export_name: &str,
     ) -> Result<Option<FluxonFsExport>, String> {
-        let export = self
-            .load_effective_fs_exports()?
-            .remove(export_name);
+        let export = self.load_effective_fs_exports()?.remove(export_name);
         let Some(export) = export else {
             return Ok(None);
         };
@@ -1033,13 +1033,20 @@ impl GatewayState {
         let mut guard = self.transfer_live_detail.lock();
         let entry = guard.entry(job_id.to_string()).or_default();
         let prev_unix_ms = entry.scan.last_scan_result_unix_ms;
-        entry.scan.completed_scan_unit_count = entry.scan.completed_scan_unit_count.saturating_add(1);
-        entry.scan.discovered_batch_count =
-            entry.scan.discovered_batch_count.saturating_add(discovered_batch_count.max(0));
-        entry.scan.discovered_file_count =
-            entry.scan.discovered_file_count.saturating_add(discovered_file_count.max(0));
-        entry.scan.discovered_bytes =
-            entry.scan.discovered_bytes.saturating_add(discovered_bytes.max(0));
+        entry.scan.completed_scan_unit_count =
+            entry.scan.completed_scan_unit_count.saturating_add(1);
+        entry.scan.discovered_batch_count = entry
+            .scan
+            .discovered_batch_count
+            .saturating_add(discovered_batch_count.max(0));
+        entry.scan.discovered_file_count = entry
+            .scan
+            .discovered_file_count
+            .saturating_add(discovered_file_count.max(0));
+        entry.scan.discovered_bytes = entry
+            .scan
+            .discovered_bytes
+            .saturating_add(discovered_bytes.max(0));
         if prev_unix_ms > 0 && result_unix_ms > prev_unix_ms {
             let elapsed_ms = result_unix_ms.saturating_sub(prev_unix_ms).max(1);
             entry.scan.scan_rate_files_per_sec = discovered_file_count
@@ -1107,11 +1114,7 @@ impl GatewayState {
         );
     }
 
-    pub fn note_transfer_worker_launch_acknowledged(
-        &self,
-        job_id: &str,
-        worker_task_id: &str,
-    ) {
+    pub fn note_transfer_worker_launch_acknowledged(&self, job_id: &str, worker_task_id: &str) {
         let mut guard = self.transfer_live_detail.lock();
         let entry = guard.entry(job_id.to_string()).or_default();
         if let Some(worker) = entry.workers.get_mut(worker_task_id) {
@@ -1135,7 +1138,8 @@ impl GatewayState {
             worker.last_heartbeat_unix_ms = heartbeat_received_unix_ms;
             worker.lease_expire_unix_ms = lease_expire_unix_ms;
             if let Some(telemetry) = telemetry {
-                worker.current_bandwidth_bytes_per_sec = telemetry.window_goodput_bytes_per_sec.max(0);
+                worker.current_bandwidth_bytes_per_sec =
+                    telemetry.window_goodput_bytes_per_sec.max(0);
                 worker.total_written_bytes = telemetry.total_written_bytes.max(0);
                 worker.desired_file_lanes = telemetry.desired_file_lanes.max(0);
             }
@@ -1207,8 +1211,7 @@ impl GatewayState {
                     .total_written_bytes
                     .max(telemetry.total_written_bytes.max(0));
                 worker.desired_file_lanes = telemetry.desired_file_lanes.max(0);
-                emit_final_bandwidth_bytes_per_sec =
-                    telemetry.window_goodput_bytes_per_sec.max(0);
+                emit_final_bandwidth_bytes_per_sec = telemetry.window_goodput_bytes_per_sec.max(0);
             }
             // Emit the last goodput sample once, but clear live bandwidth in
             // state so finished workers do not inflate later history points.
@@ -2879,7 +2882,10 @@ pub fn build_router(st: Arc<GatewayState>) -> Router {
             "/ui/api/transfer_prescans/:job_id/import",
             post(ui_transfer_prescan_import),
         )
-        .route("/ui/api/transfer_jobs", get(ui_transfer_job_list).post(ui_transfer_job_create))
+        .route(
+            "/ui/api/transfer_jobs",
+            get(ui_transfer_job_list).post(ui_transfer_job_create),
+        )
         .route("/ui/api/transfer_job/:job_id", get(ui_transfer_job_detail))
         .route(
             "/ui/api/transfer_job/:job_id/history",
@@ -2977,7 +2983,10 @@ pub fn build_router(st: Arc<GatewayState>) -> Router {
         .route("/ui/:bucket/api/upload", post(ui_bucket_api_upload))
         .route("/ui/:bucket/api/mkdir", post(ui_bucket_api_mkdir))
         .route("/ui/:bucket/api/delete", post(ui_bucket_api_delete))
-        .route("/ui/:bucket/api/delete_folder", post(ui_bucket_api_delete_folder))
+        .route(
+            "/ui/:bucket/api/delete_folder",
+            post(ui_bucket_api_delete_folder),
+        )
         .route("/ui/:bucket/api/copy", post(ui_bucket_api_copy))
         .route("/ui/:bucket/api/move", post(ui_bucket_api_move))
         .route("/ui/:bucket/upload", post(ui_bucket_upload))
@@ -5330,25 +5339,23 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::{
-        FS_RPC_CHUNK_BYTES, FsMasterAdminBackend, FsS3Backend, GatewayAccessConfig, GatewayState,
-        S3Error, encode_transfer_manifest_blob, FsTransferCreateJobArg,
+        FS_RPC_CHUNK_BYTES, FsMasterAdminBackend, FsS3Backend, FsTransferCreateJobArg,
+        GatewayAccessConfig, GatewayState, S3Error, encode_transfer_manifest_blob,
     };
     use crate::transfer::encode_transfer_manifest_blob_with_empty_dirs;
     use fluxon_fs_core::config::{
+        FLUXON_FS_LOCAL_TRANSFER_CHECK_DST_EXPORT, FLUXON_FS_LOCAL_TRANSFER_CHECK_SRC_EXPORT,
         FluxonFsAccessModel, FluxonFsAccessUser, FluxonFsExport, FluxonFsExportRoutingMode,
-        FluxonFsGlobalConfig,
-        FluxonFsLocalTransferCheckJobSpecWire,
-        FluxonFsRequestIdentity, FluxonFsS3GatewayConfig, FluxonFsS3KvMissPolicy,
-        FluxonFsS3PermissionAccount, FluxonFsS3PermissionAction,
-        FluxonFsTransferBatchCollectInfoWire, FluxonFsTransferBatchKind,
-        FluxonFsTransferBatchState, FluxonFsTransferCollectInfoKind, FluxonFsTransferJobState,
-        FluxonFsTransferManifestEntryWire, FluxonFsTransferManifestWire, FluxonFsTransferScanBatchWire,
-        FluxonFsTransferScanFrontier, FluxonFsTransferScanResultWire,
-        FluxonFsTransferStateStoreConfig, FluxonFsTransferStateStoreKind,
-        FluxonFsTransferStateStoreTiKvConfig,
+        FluxonFsGlobalConfig, FluxonFsLocalTransferCheckJobSpecWire, FluxonFsRequestIdentity,
+        FluxonFsS3GatewayConfig, FluxonFsS3KvMissPolicy, FluxonFsS3PermissionAccount,
+        FluxonFsS3PermissionAction, FluxonFsTransferBatchCollectInfoWire,
+        FluxonFsTransferBatchKind, FluxonFsTransferBatchState, FluxonFsTransferCollectInfoKind,
+        FluxonFsTransferJobState, FluxonFsTransferManifestEntryWire, FluxonFsTransferManifestWire,
+        FluxonFsTransferScanBatchWire, FluxonFsTransferScanFrontier,
+        FluxonFsTransferScanResultWire, FluxonFsTransferStateStoreConfig,
+        FluxonFsTransferStateStoreKind, FluxonFsTransferStateStoreTiKvConfig,
         FluxonFsTransferSymlinkNoticeEntryWire, FluxonFsTransferWorkerCollectInfoResultWire,
         FluxonFsTransferWorkerFileResultWire, FluxonFsTransferWorkerResultWire,
-        FLUXON_FS_LOCAL_TRANSFER_CHECK_DST_EXPORT, FLUXON_FS_LOCAL_TRANSFER_CHECK_SRC_EXPORT,
         export_rpc_paths_for_export_name_v1, transfer_collect_info_output_relpath,
     };
     use std::sync::OnceLock;
@@ -5646,18 +5653,14 @@ mod tests {
                 return true;
             }
             let dir_prefix = format!("{}/", key);
-            if self
-                .directories
-                .lock()
-                .iter()
-                .any(|(dir_bucket, dir_key)| dir_bucket == bucket && dir_key.starts_with(dir_prefix.as_str()))
-            {
+            if self.directories.lock().iter().any(|(dir_bucket, dir_key)| {
+                dir_bucket == bucket && dir_key.starts_with(dir_prefix.as_str())
+            }) {
                 return true;
             }
-            self.objects
-                .lock()
-                .keys()
-                .any(|(obj_bucket, obj_key)| obj_bucket == bucket && obj_key.starts_with(dir_prefix.as_str()))
+            self.objects.lock().keys().any(|(obj_bucket, obj_key)| {
+                obj_bucket == bucket && obj_key.starts_with(dir_prefix.as_str())
+            })
         }
     }
 
@@ -6259,10 +6262,7 @@ mod tests {
     fn test_access_db_path() -> String {
         let root = test_tikv_work_root().join("access_db");
         fs::create_dir_all(&root).unwrap();
-        cleanup_stale_test_access_db_files(
-            root.as_path(),
-            "fluxon_fs_s3_gateway_access_test",
-        );
+        cleanup_stale_test_access_db_files(root.as_path(), "fluxon_fs_s3_gateway_access_test");
         root.join(format!(
             "fluxon_fs_s3_gateway_access_test_pid{}_{}.db",
             process::id(),
@@ -6282,10 +6282,15 @@ mod tests {
         let db_path = root.join("nested").join("access.db");
         let db_path_str = db_path.to_string_lossy().into_owned();
 
-        let conn = open_access_db(&db_path_str).expect("open_access_db should create missing parent dir");
+        let conn =
+            open_access_db(&db_path_str).expect("open_access_db should create missing parent dir");
         drop(conn);
 
-        assert!(db_path.is_file(), "access db should exist after open: {}", db_path.display());
+        assert!(
+            db_path.is_file(),
+            "access db should exist after open: {}",
+            db_path.display()
+        );
         std::fs::remove_file(&db_path).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -6311,7 +6316,9 @@ mod tests {
         }
     }
 
-    fn build_test_gateway_access_config_without_transfer(access_db_path: String) -> GatewayAccessConfig {
+    fn build_test_gateway_access_config_without_transfer(
+        access_db_path: String,
+    ) -> GatewayAccessConfig {
         GatewayAccessConfig {
             access_db_path,
             bootstrap_access_model: test_bootstrap_access_model(),
@@ -6340,7 +6347,10 @@ mod tests {
     }
 
     fn tikv_ext_dir() -> PathBuf {
-        repo_root().join("fluxon_release").join("ext_images").join("tikv")
+        repo_root()
+            .join("fluxon_release")
+            .join("ext_images")
+            .join("tikv")
     }
 
     fn require_tikv_runtime_path(relname: &str) -> PathBuf {
@@ -6444,7 +6454,12 @@ mod tests {
         fn new(prefix: &str) -> Self {
             let root = test_tikv_work_root();
             cleanup_stale_test_temp_dirs(root.as_path(), prefix);
-            let path = root.join(format!("{}_pid{}_{}", prefix, process::id(), Uuid::new_v4()));
+            let path = root.join(format!(
+                "{}_pid{}_{}",
+                prefix,
+                process::id(),
+                Uuid::new_v4()
+            ));
             fs::create_dir_all(&path).unwrap();
             Self { path }
         }
@@ -6664,7 +6679,12 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             wait_for_tcp_ready("tikv-server", tikv_port, &mut tikv_proc, &tikv_log_path);
 
             let access_config = build_test_tikv_gateway_access_config(
-                runtime_dir.path().join("access.db").to_str().unwrap().to_string(),
+                runtime_dir
+                    .path()
+                    .join("access.db")
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
                 vec![pd_endpoint.clone()],
                 format!("/fluxon_fs_transfer_gateway_test/{}/", Uuid::new_v4()),
             );
@@ -6704,7 +6724,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         build_test_tikv_gateway_access_config(
             test_access_db_path(),
             vec![pd_endpoint],
-            format!("/fluxon_fs_transfer_gateway_test/shared/{}/", Uuid::new_v4()),
+            format!(
+                "/fluxon_fs_transfer_gateway_test/shared/{}/",
+                Uuid::new_v4()
+            ),
         )
     }
 
@@ -7169,7 +7192,9 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         .unwrap()
     }
 
-    fn test_symlink_collect_infos(entries: &[(&str, &str)]) -> Vec<FluxonFsTransferBatchCollectInfoWire> {
+    fn test_symlink_collect_infos(
+        entries: &[(&str, &str)],
+    ) -> Vec<FluxonFsTransferBatchCollectInfoWire> {
         let mut blob = Vec::new();
         for (relpath, link_target) in entries {
             let line = serde_json::to_string(&FluxonFsTransferSymlinkNoticeEntryWire {
@@ -7231,9 +7256,13 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         };
         st.apply_transfer_scan_result(&result).unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.desired_worker_count, 0);
         assert_eq!(snapshot.open_batches, 1);
         assert_eq!(snapshot.scan_epoch, scan_epoch);
@@ -7273,10 +7302,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
                 batch_id: "batch-1".to_string(),
                 root_relpath: "root".to_string(),
                 batch_kind: FluxonFsTransferBatchKind::DirectFilesOnly,
-                manifest_blob: test_manifest_blob(&[
-                    ("root/a.bin", 3),
-                    ("root/b.bin", 5),
-                ]),
+                manifest_blob: test_manifest_blob(&[("root/a.bin", 3), ("root/b.bin", 5)]),
                 collect_infos: Vec::new(),
                 generation: 1,
             }],
@@ -7285,18 +7311,20 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
                 batch_id: "batch-2".to_string(),
                 root_relpath: "root/subtree".to_string(),
                 batch_kind: FluxonFsTransferBatchKind::FullDir,
-                manifest_blob: test_manifest_blob(&[
-                    ("root/subtree/c.bin", 7),
-                ]),
+                manifest_blob: test_manifest_blob(&[("root/subtree/c.bin", 7)]),
                 collect_infos: Vec::new(),
                 generation: 2,
             }],
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         let live_detail = snapshot.live_detail.unwrap();
         assert_eq!(live_detail.scan.discovered_batch_count, 2);
         assert_eq!(live_detail.scan.discovered_file_count, 3);
@@ -7359,7 +7387,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             .filter(|batch| batch.state == FluxonFsTransferBatchState::Ready)
             .collect::<Vec<_>>();
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].batch_kind, FluxonFsTransferBatchKind::SubtreeSlice);
+        assert_eq!(
+            batches[0].batch_kind,
+            FluxonFsTransferBatchKind::SubtreeSlice
+        );
         let manifest =
             FluxonFsTransferManifestWire::decode_from_blob(batches[0].manifest_blob.as_slice())
                 .unwrap();
@@ -7394,7 +7425,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         let scan_epoch_2 = st.begin_transfer_scan_epoch(job.job_id.as_str()).unwrap();
         assert!(scan_epoch_2 > 1);
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         let live_detail = snapshot.live_detail.unwrap();
         assert_eq!(live_detail.scan.queued_scan_unit_count, 0);
         assert_eq!(live_detail.scan.inflight_scan_unit_count, 0);
@@ -7437,10 +7471,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
                 batch_id: "batch-1".to_string(),
                 root_relpath: "root".to_string(),
                 batch_kind: FluxonFsTransferBatchKind::DirectFilesOnly,
-                manifest_blob: test_manifest_blob(&[
-                    ("root/a.bin", 3),
-                    ("root/b.bin", 5),
-                ]),
+                manifest_blob: test_manifest_blob(&[("root/a.bin", 3), ("root/b.bin", 5)]),
                 collect_infos: Vec::new(),
                 generation: 1,
             }],
@@ -7451,7 +7482,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         st.apply_transfer_scan_result(&result).unwrap();
         st.apply_transfer_scan_result(&result).unwrap();
 
-        let snapshot_epoch_1 = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot_epoch_1 = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot_epoch_1.job.scan_discovered_batch_count, 1);
         assert_eq!(snapshot_epoch_1.job.scan_discovered_file_count, 2);
         assert_eq!(snapshot_epoch_1.job.scan_discovered_bytes, 8);
@@ -7468,7 +7502,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         })
         .unwrap();
 
-        let snapshot_epoch_2 = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot_epoch_2 = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot_epoch_2.job.scan_discovered_batch_count, 1);
         assert_eq!(snapshot_epoch_2.job.scan_discovered_file_count, 2);
         assert_eq!(snapshot_epoch_2.job.scan_discovered_bytes, 8);
@@ -7537,9 +7574,11 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             .collect::<Vec<_>>();
         assert_eq!(batches.len(), 2);
         assert!(batches.iter().all(|batch| batch.root_relpath == "root"));
-        assert!(batches
-            .iter()
-            .all(|batch| batch.batch_kind == FluxonFsTransferBatchKind::DirectFilesOnly));
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.batch_kind == FluxonFsTransferBatchKind::DirectFilesOnly)
+        );
     }
 
     #[test]
@@ -7663,7 +7702,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
                 batch_id: "batch-1".to_string(),
                 root_relpath: "root".to_string(),
                 batch_kind: FluxonFsTransferBatchKind::DirectFilesOnly,
-                manifest_blob: test_manifest_blob_with_empty_dirs(&[], &["root/empty-a", "root/empty-b"]),
+                manifest_blob: test_manifest_blob_with_empty_dirs(
+                    &[],
+                    &["root/empty-a", "root/empty-b"],
+                ),
                 collect_infos: Vec::new(),
                 generation: 1,
             }],
@@ -7688,7 +7730,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
                 batch_id: "batch-2".to_string(),
                 root_relpath: "root".to_string(),
                 batch_kind: FluxonFsTransferBatchKind::DirectFilesOnly,
-                manifest_blob: test_manifest_blob_with_empty_dirs(&[], &["root/empty-b", "root/empty-c"]),
+                manifest_blob: test_manifest_blob_with_empty_dirs(
+                    &[],
+                    &["root/empty-b", "root/empty-c"],
+                ),
                 collect_infos: Vec::new(),
                 generation: 2,
             }],
@@ -7712,7 +7757,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             FluxonFsTransferManifestWire::decode_from_blob(filtered_batch.manifest_blob.as_slice())
                 .unwrap();
         assert!(manifest.entries.is_empty());
-        assert_eq!(manifest.empty_dir_relpaths, vec!["root/empty-c".to_string()]);
+        assert_eq!(
+            manifest.empty_dir_relpaths,
+            vec!["root/empty-c".to_string()]
+        );
     }
 
     #[test]
@@ -7832,13 +7880,14 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: false,
         })
         .unwrap();
-        assert!(st
-            .list_transfer_direct_files_complete_records()
-            .unwrap()
-            .into_iter()
-            .filter(|row| row.job_id == job.job_id)
-            .collect::<Vec<_>>()
-            .is_empty());
+        assert!(
+            st.list_transfer_direct_files_complete_records()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.job_id == job.job_id)
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
         st.apply_transfer_scan_result(&FluxonFsTransferScanResultWire {
             job_id: job.job_id.clone(),
             scan_epoch,
@@ -7907,10 +7956,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
                 batch_id: "batch-1".to_string(),
                 root_relpath: "root".to_string(),
                 batch_kind: FluxonFsTransferBatchKind::DirectFilesOnly,
-                manifest_blob: test_manifest_blob(&[
-                    ("root/a.bin", 3),
-                    ("root/b.bin", 5),
-                ]),
+                manifest_blob: test_manifest_blob(&[("root/a.bin", 3), ("root/b.bin", 5)]),
                 collect_infos: Vec::new(),
                 generation: 1,
             }],
@@ -7919,9 +7965,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
                 batch_id: "batch-2".to_string(),
                 root_relpath: "root/subtree".to_string(),
                 batch_kind: FluxonFsTransferBatchKind::FullDir,
-                manifest_blob: test_manifest_blob(&[
-                    ("root/subtree/c.bin", 7),
-                ]),
+                manifest_blob: test_manifest_blob(&[("root/subtree/c.bin", 7)]),
                 collect_infos: Vec::new(),
                 generation: 2,
             }],
@@ -7929,7 +7973,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         })
         .unwrap();
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.scan_discovered_batch_count, 2);
         assert_eq!(snapshot.job.scan_discovered_file_count, 3);
         assert_eq!(snapshot.job.scan_discovered_bytes, 15);
@@ -7981,7 +8028,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
 
         let imported = st
             .import_transfer_prescan_job(
@@ -8000,7 +8048,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert_eq!(imported.dst_root_relpath, "ingest/run-1");
         assert_eq!(imported.desired_worker_count, 4);
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.open_batches, 1);
         assert!(snapshot.scan_finished);
         assert_eq!(snapshot.job.src_export, "src-export");
@@ -8071,11 +8122,15 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
         st.reconcile_transfer_scheduler_state(Utc::now().timestamp_millis())
             .unwrap();
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.state, FluxonFsTransferJobState::Completed);
         assert_eq!(snapshot.open_batches, 0);
         assert!(snapshot.scan_finished);
@@ -8095,7 +8150,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             "dst-exporter-1",
             Utc::now().timestamp_millis() + 60_000,
         )
-            .unwrap();
+        .unwrap();
         st.apply_transfer_worker_result(&FluxonFsTransferWorkerResultWire {
             job_id: job.job_id.clone(),
             batch_id: "batch-1".to_string(),
@@ -8114,7 +8169,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         })
         .unwrap();
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.state, FluxonFsTransferJobState::Running);
         assert_eq!(snapshot.open_batches, 1);
         assert_eq!(snapshot.failed_file_count, 1);
@@ -8169,7 +8227,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch_1).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch_1)
+            .unwrap();
 
         let scan_epoch_2 = st.begin_transfer_scan_epoch(job.job_id.as_str()).unwrap();
         st.apply_transfer_scan_result(&FluxonFsTransferScanResultWire {
@@ -8197,7 +8256,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch_2).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch_2)
+            .unwrap();
 
         let batches = st
             .list_transfer_batches()
@@ -8289,7 +8349,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
 
         st.assign_transfer_batch_to_worker(
             job.job_id.as_str(),
@@ -8382,7 +8443,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
 
         let worker_id = test_transfer_worker_id(job.job_id.as_str(), "batch-1");
         st.assign_transfer_batch_to_worker(
@@ -8423,7 +8485,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert!(batch.owner_worker_task_id.is_empty());
         assert_eq!(batch.lease_expire_unix_ms, 0);
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.open_batches, 1);
         assert!(snapshot.running_batches.is_empty());
         assert_eq!(snapshot.done_batches, 1);
@@ -8479,7 +8544,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
 
         let worker_id = test_transfer_worker_id(job.job_id.as_str(), "batch-1");
         let lease_expire_unix_ms = Utc::now().timestamp_millis() + 60_000;
@@ -8549,7 +8615,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
 
         let worker_id = test_transfer_worker_id(job.job_id.as_str(), "batch-1");
         st.assign_transfer_batch_to_worker(
@@ -8637,7 +8704,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
 
         let worker_id = test_transfer_worker_id(job.job_id.as_str(), "batch-1");
         st.assign_transfer_batch_to_worker(
@@ -8728,7 +8796,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
 
         let worker_id = test_transfer_worker_id(job.job_id.as_str(), "batch-1");
         st.assign_transfer_batch_to_worker(
@@ -8771,7 +8840,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert!(batch.owner_worker_task_id.is_empty());
         assert_eq!(batch.lease_expire_unix_ms, 0);
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.state, FluxonFsTransferJobState::Completed);
         assert_eq!(snapshot.open_batches, 0);
         assert!(snapshot.scan_finished);
@@ -8782,7 +8854,12 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         let backend = ObjectBackend::default();
         backend.insert("dst", "a.bin", b"payload-1234");
         let st = test_state_with_buckets(Arc::new(backend), &["src", "dst"]);
-        let job = create_single_batch_transfer_job(&st, "dst", &[("a.bin", 12), ("b.bin", 34)], Vec::new());
+        let job = create_single_batch_transfer_job(
+            &st,
+            "dst",
+            &[("a.bin", 12), ("b.bin", 34)],
+            Vec::new(),
+        );
 
         let worker_id = test_transfer_worker_id(job.job_id.as_str(), "batch-1");
         st.assign_transfer_batch_to_worker(
@@ -8828,7 +8905,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             .unwrap();
         assert_eq!(batch.state, FluxonFsTransferBatchState::Finished);
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.state, FluxonFsTransferJobState::Completed);
         assert_eq!(snapshot.failed_file_count, 1);
         assert_eq!(snapshot.open_batches, 0);
@@ -8888,7 +8968,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
 
         let worker_id = test_transfer_worker_id(job.job_id.as_str(), "batch-1");
         st.assign_transfer_batch_to_worker(
@@ -8981,7 +9062,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
 
         st.assign_transfer_batch_to_worker(
             job.job_id.as_str(),
@@ -9007,7 +9089,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert!(batch.owner_worker_task_id.is_empty());
         assert_eq!(batch.lease_expire_unix_ms, 0);
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.state, FluxonFsTransferJobState::Running);
         assert_eq!(snapshot.open_batches, 1);
     }
@@ -9115,7 +9200,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert!(batch.owner_worker_task_id.is_empty());
         assert_eq!(batch.lease_expire_unix_ms, 0);
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.open_batches, 1);
         assert!(snapshot.running_batches.is_empty());
         assert_eq!(snapshot.done_batches, 1);
@@ -9123,7 +9211,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
 
     #[test]
     #[ignore = "requires fluxon_release/ext_images/tikv prepared by setup_and_pack/pack_release_ext.py"]
-    fn test_transfer_reconcile_ready_after_worker_result_when_target_incomplete_with_tikv_state_store() {
+    fn test_transfer_reconcile_ready_after_worker_result_when_target_incomplete_with_tikv_state_store()
+     {
         let tikv = LocalTiKvHarness::new();
         let st = test_transfer_state_with_access_config(tikv.access_config.clone());
         let job = create_single_batch_transfer_job(&st, "dst", &[("a.bin", 123)], Vec::new());
@@ -9172,7 +9261,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
 
     #[test]
     #[ignore = "requires fluxon_release/ext_images/tikv prepared by setup_and_pack/pack_release_ext.py"]
-    fn test_transfer_reconcile_finishes_batch_and_completes_job_after_target_visible_with_tikv_state_store() {
+    fn test_transfer_reconcile_finishes_batch_and_completes_job_after_target_visible_with_tikv_state_store()
+     {
         let tikv = LocalTiKvHarness::new();
         let backend = Arc::new(ObjectBackend::default());
         backend.insert("dst", "a.bin", b"payload-1234");
@@ -9221,7 +9311,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert!(batch.owner_worker_task_id.is_empty());
         assert_eq!(batch.lease_expire_unix_ms, 0);
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.state, FluxonFsTransferJobState::Completed);
         assert_eq!(snapshot.open_batches, 0);
         assert!(snapshot.scan_finished);
@@ -9283,7 +9376,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             .unwrap();
         assert_eq!(batch.state, FluxonFsTransferBatchState::Ready);
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.state, FluxonFsTransferJobState::Running);
         assert_eq!(snapshot.open_batches, 1);
     }
@@ -9345,7 +9441,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             .unwrap();
         assert_eq!(batch.state, FluxonFsTransferBatchState::Finished);
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.state, FluxonFsTransferJobState::Completed);
         assert_eq!(snapshot.open_batches, 0);
     }
@@ -9371,12 +9470,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             Arc::new(backend.clone()),
             tikv.access_config.clone(),
         );
-        let job = create_single_batch_transfer_job(
-            &st,
-            "dst",
-            &[("a.bin", 12)],
-            collect_infos.clone(),
-        );
+        let job =
+            create_single_batch_transfer_job(&st, "dst", &[("a.bin", 12)], collect_infos.clone());
 
         let worker_id = test_transfer_worker_id(job.job_id.as_str(), "batch-1");
         st.assign_transfer_batch_to_worker(
@@ -9446,19 +9541,20 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         )
         .unwrap();
 
-        let heartbeat_result = st.apply_transfer_worker_heartbeat(
-            &fluxon_fs_core::config::FluxonFsTransferWorkerHeartbeatWire {
-                job_id: job.job_id.clone(),
-                worker_id: test_transfer_worker_id(job.job_id.as_str(), "batch-1"),
-                assigned_batch_id: "batch-1".to_string(),
-                worker_task_id: "worker-task-1".to_string(),
-                heartbeat_unix_ms: 90,
-                telemetry: None,
-            },
-            90,
-            100,
-        )
-        .unwrap();
+        let heartbeat_result = st
+            .apply_transfer_worker_heartbeat(
+                &fluxon_fs_core::config::FluxonFsTransferWorkerHeartbeatWire {
+                    job_id: job.job_id.clone(),
+                    worker_id: test_transfer_worker_id(job.job_id.as_str(), "batch-1"),
+                    assigned_batch_id: "batch-1".to_string(),
+                    worker_task_id: "worker-task-1".to_string(),
+                    heartbeat_unix_ms: 90,
+                    telemetry: None,
+                },
+                90,
+                100,
+            )
+            .unwrap();
         assert_eq!(heartbeat_result.lease_expire_unix_ms, 190);
 
         let batch = st
@@ -9469,7 +9565,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             .unwrap();
         assert_eq!(batch.state, FluxonFsTransferBatchState::Running);
         assert_eq!(batch.owner_worker_task_id, "worker-task-1");
-        assert_eq!(batch.lease_expire_unix_ms, heartbeat_result.lease_expire_unix_ms);
+        assert_eq!(
+            batch.lease_expire_unix_ms,
+            heartbeat_result.lease_expire_unix_ms
+        );
     }
 
     #[test]
@@ -9503,7 +9602,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert!(batch.owner_worker_task_id.is_empty());
         assert_eq!(batch.lease_expire_unix_ms, 0);
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.state, FluxonFsTransferJobState::Running);
         assert_eq!(snapshot.open_batches, 1);
     }
@@ -9549,7 +9651,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             finished: true,
         })
         .unwrap();
-        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch).unwrap();
+        st.finish_transfer_scan_epoch(job.job_id.as_str(), scan_epoch)
+            .unwrap();
         st.assign_transfer_batch_to_worker(
             job.job_id.as_str(),
             "batch-1",
@@ -9561,19 +9664,20 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         )
         .unwrap();
 
-        let heartbeat_result = st.apply_transfer_worker_heartbeat(
-            &fluxon_fs_core::config::FluxonFsTransferWorkerHeartbeatWire {
-                job_id: job.job_id.clone(),
-                worker_id: test_transfer_worker_id(job.job_id.as_str(), "batch-1"),
-                assigned_batch_id: "batch-1".to_string(),
-                worker_task_id: "worker-task-1".to_string(),
-                heartbeat_unix_ms: 90,
-                telemetry: None,
-            },
-            90,
-            100,
-        )
-        .unwrap();
+        let heartbeat_result = st
+            .apply_transfer_worker_heartbeat(
+                &fluxon_fs_core::config::FluxonFsTransferWorkerHeartbeatWire {
+                    job_id: job.job_id.clone(),
+                    worker_id: test_transfer_worker_id(job.job_id.as_str(), "batch-1"),
+                    assigned_batch_id: "batch-1".to_string(),
+                    worker_task_id: "worker-task-1".to_string(),
+                    heartbeat_unix_ms: 90,
+                    telemetry: None,
+                },
+                90,
+                100,
+            )
+            .unwrap();
         assert_eq!(heartbeat_result.lease_expire_unix_ms, 190);
 
         let batch = st
@@ -9584,7 +9688,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             .unwrap();
         assert_eq!(batch.state, FluxonFsTransferBatchState::Running);
         assert_eq!(batch.owner_worker_task_id, "worker-task-1");
-        assert_eq!(batch.lease_expire_unix_ms, heartbeat_result.lease_expire_unix_ms);
+        assert_eq!(
+            batch.lease_expire_unix_ms,
+            heartbeat_result.lease_expire_unix_ms
+        );
     }
 
     #[test]
@@ -9650,7 +9757,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
 
         st.cancel_transfer_job(job.job_id.as_str()).unwrap();
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.state, FluxonFsTransferJobState::Stopping);
         assert!(snapshot.job.scan_finished);
         assert_eq!(snapshot.job.desired_worker_count, 0);
@@ -9660,7 +9770,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
 
         st.reconcile_transfer_scheduler_state(101).unwrap();
 
-        let snapshot = st.transfer_job_snapshot(job.job_id.as_str()).unwrap().unwrap();
+        let snapshot = st
+            .transfer_job_snapshot(job.job_id.as_str())
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.job.state, FluxonFsTransferJobState::Cancelled);
         assert_eq!(snapshot.open_batches, 0);
         assert!(snapshot.running_batches.is_empty());
@@ -10351,7 +10464,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
 
     #[tokio::test]
     async fn test_ui_bucket_browse_marks_transfer_disabled_when_backend_missing() {
-        let st = test_state_with_buckets_without_transfer(Arc::new(ObjectBackend::default()), &["demo"]);
+        let st =
+            test_state_with_buckets_without_transfer(Arc::new(ObjectBackend::default()), &["demo"]);
         let auth = basic_auth_headers("a", "b")
             .get(axum::http::header::AUTHORIZATION)
             .unwrap()

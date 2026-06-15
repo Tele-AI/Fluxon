@@ -4,15 +4,14 @@ use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use fluxon_fs_core::config::{
-    FluxonFsGlobalConfig, FluxonFsTransferBatchCollectInfoWire, FluxonFsTransferBatchKind, FluxonFsTransferBatchState,
-    FluxonFsTransferCollectInfoKind, FluxonFsTransferJobState,
-    FluxonFsTransferStateStoreTiKvConfig, FluxonFsTransferManifestWire,
-    FluxonFsTransferScanBatchWire,
-    FluxonFsTransferScanResultWire, FluxonFsTransferSymlinkNoticeEntryWire, FluxonFsTransferWorkerHeartbeatResultWire,
-    FluxonFsTransferWorkerHeartbeatWire, FluxonFsTransferWorkerResultAckWire,
-    FluxonFsTransferWorkerResultWire, FluxonFsTransferWorkerStopReasonWire,
-    transfer_collect_info_output_relpath, FLUXON_FS_LOCAL_TRANSFER_CHECK_DST_EXPORT,
-    FLUXON_FS_LOCAL_TRANSFER_CHECK_SRC_EXPORT,
+    FLUXON_FS_LOCAL_TRANSFER_CHECK_DST_EXPORT, FLUXON_FS_LOCAL_TRANSFER_CHECK_SRC_EXPORT,
+    FluxonFsGlobalConfig, FluxonFsTransferBatchCollectInfoWire, FluxonFsTransferBatchKind,
+    FluxonFsTransferBatchState, FluxonFsTransferCollectInfoKind, FluxonFsTransferJobState,
+    FluxonFsTransferManifestWire, FluxonFsTransferScanBatchWire, FluxonFsTransferScanResultWire,
+    FluxonFsTransferStateStoreTiKvConfig, FluxonFsTransferSymlinkNoticeEntryWire,
+    FluxonFsTransferWorkerHeartbeatResultWire, FluxonFsTransferWorkerHeartbeatWire,
+    FluxonFsTransferWorkerResultAckWire, FluxonFsTransferWorkerResultWire,
+    FluxonFsTransferWorkerStopReasonWire, transfer_collect_info_output_relpath,
 };
 use fluxon_util::prefix_scan::{
     PrefixScanAction, prefix_scan_key_after, prefix_scan_range_end_exclusive,
@@ -27,11 +26,10 @@ use crate::FsS3Backend;
 use super::db::{decode_transfer_manifest_blob, normalize_transfer_root_relpath};
 use super::types::{
     FsTransferBatchCollectInfoRecord, FsTransferBatchFileIssueRecord, FsTransferBatchRecord,
-    FsTransferDirectFilesCompleteRecord,
-    FsTransferJobRecord, FsTransferJobSnapshot, FsTransferJobSummarySnapshot,
-    FsTransferReadyBatchClass, FsTransferReadyBatchDispatch,
-    FsTransferRunningBatchOwnerSnapshot, FsTransferWorkerAttemptRecord,
-    FsTransferSchedulerJobSnapshot, FsTransferWorkerAttemptState, FsTransferWorkerLeaseRecord,
+    FsTransferDirectFilesCompleteRecord, FsTransferJobRecord, FsTransferJobSnapshot,
+    FsTransferJobSummarySnapshot, FsTransferReadyBatchClass, FsTransferReadyBatchDispatch,
+    FsTransferRunningBatchOwnerSnapshot, FsTransferSchedulerJobSnapshot,
+    FsTransferWorkerAttemptRecord, FsTransferWorkerAttemptState, FsTransferWorkerLeaseRecord,
     TransferStateStore,
 };
 
@@ -114,9 +112,7 @@ fn transfer_manifest_is_empty_dirs_only(
     manifest: &FluxonFsTransferManifestWire,
     has_collect_infos: bool,
 ) -> bool {
-    manifest.entries.is_empty()
-        && !has_collect_infos
-        && !manifest.empty_dir_relpaths.is_empty()
+    manifest.entries.is_empty() && !has_collect_infos && !manifest.empty_dir_relpaths.is_empty()
 }
 
 fn transfer_batch_manifest_dispatch_class(
@@ -189,7 +185,10 @@ impl TiKvTransferStateStore {
         })
     }
 
-    fn send_slow_command<T>(&self, build: impl FnOnce(ResponseSender<T>) -> StoreCommand) -> Result<T, String> {
+    fn send_slow_command<T>(
+        &self,
+        build: impl FnOnce(ResponseSender<T>) -> StoreCommand,
+    ) -> Result<T, String> {
         let (resp_tx, resp_rx) = bounded(1);
         self.slow_command_tx
             .send(build(resp_tx))
@@ -199,7 +198,10 @@ impl TiKvTransferStateStore {
             .map_err(|_| "transfer tikv store response channel closed".to_string())?
     }
 
-    fn send_fast_command<T>(&self, build: impl FnOnce(ResponseSender<T>) -> StoreCommand) -> Result<T, String> {
+    fn send_fast_command<T>(
+        &self,
+        build: impl FnOnce(ResponseSender<T>) -> StoreCommand,
+    ) -> Result<T, String> {
         let (resp_tx, resp_rx) = bounded(1);
         self.fast_command_tx
             .send(build(resp_tx))
@@ -313,7 +315,10 @@ impl TransferStateStore for TiKvTransferStateStore {
         })
     }
 
-    fn load_transfer_job_record(&self, job_id: &str) -> Result<Option<FsTransferJobRecord>, String> {
+    fn load_transfer_job_record(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<FsTransferJobRecord>, String> {
         self.send_fast_command(|resp| StoreCommand::LoadTransferJobRecord {
             job_id: job_id.to_string(),
             resp,
@@ -340,7 +345,10 @@ impl TransferStateStore for TiKvTransferStateStore {
         })
     }
 
-    fn load_transfer_job_snapshot(&self, job_id: &str) -> Result<Option<FsTransferJobSnapshot>, String> {
+    fn load_transfer_job_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<FsTransferJobSnapshot>, String> {
         self.send_slow_command(|resp| StoreCommand::LoadTransferJobSnapshot {
             job_id: job_id.to_string(),
             resp,
@@ -387,13 +395,17 @@ impl TransferStateStore for TiKvTransferStateStore {
         &self,
         job_id: &str,
     ) -> Result<Vec<FsTransferDirectFilesCompleteRecord>, String> {
-        self.send_slow_command(|resp| StoreCommand::LoadTransferDirectFilesCompleteRecordsForJob {
-            job_id: job_id.to_string(),
-            resp,
-        })
+        self.send_slow_command(
+            |resp| StoreCommand::LoadTransferDirectFilesCompleteRecordsForJob {
+                job_id: job_id.to_string(),
+                resp,
+            },
+        )
     }
 
-    fn load_transfer_worker_attempt_records(&self) -> Result<Vec<FsTransferWorkerAttemptRecord>, String> {
+    fn load_transfer_worker_attempt_records(
+        &self,
+    ) -> Result<Vec<FsTransferWorkerAttemptRecord>, String> {
         self.send_slow_command(StoreCommand::LoadTransferWorkerAttemptRecords)
     }
 
@@ -581,7 +593,6 @@ impl TransferStateStore for TiKvTransferStateStore {
             resp,
         })
     }
-
 }
 
 type ResponseSender<T> = Sender<Result<T, String>>;
@@ -655,7 +666,9 @@ enum StoreCommand {
         job_id: String,
         resp: ResponseSender<Vec<FsTransferBatchRecord>>,
     },
-    LoadTransferDirectFilesCompleteRecords(ResponseSender<Vec<FsTransferDirectFilesCompleteRecord>>),
+    LoadTransferDirectFilesCompleteRecords(
+        ResponseSender<Vec<FsTransferDirectFilesCompleteRecord>>,
+    ),
     LoadTransferDirectFilesCompleteRecordsForJob {
         job_id: String,
         resp: ResponseSender<Vec<FsTransferDirectFilesCompleteRecord>>,
@@ -756,10 +769,8 @@ fn execute_store_command(
             now_unix_ms,
             resp,
         } => {
-            let _ = resp.send(runtime.block_on(core.cancel_transfer_job(
-                job_id.as_str(),
-                now_unix_ms,
-            )));
+            let _ =
+                resp.send(runtime.block_on(core.cancel_transfer_job(job_id.as_str(), now_unix_ms)));
         }
         StoreCommand::UpdateTransferJobDesiredConcurrency {
             job_id,
@@ -767,13 +778,13 @@ fn execute_store_command(
             desired_worker_count,
             resp,
         } => {
-            let _ = resp.send(runtime.block_on(
-                core.update_transfer_job_desired_concurrency(
+            let _ = resp.send(
+                runtime.block_on(core.update_transfer_job_desired_concurrency(
                     job_id.as_str(),
                     desired_scan_concurrency,
                     desired_worker_count,
-                ),
-            ));
+                )),
+            );
         }
         StoreCommand::UpdateTransferJobDesiredWorkerCount {
             job_id,
@@ -781,7 +792,10 @@ fn execute_store_command(
             resp,
         } => {
             let _ = resp.send(runtime.block_on(
-                core.update_transfer_job_desired_worker_count(job_id.as_str(), desired_worker_count),
+                core.update_transfer_job_desired_worker_count(
+                    job_id.as_str(),
+                    desired_worker_count,
+                ),
             ));
         }
         StoreCommand::ImportTransferPrescanJob {
@@ -814,9 +828,8 @@ fn execute_store_command(
             let _ = resp.send(runtime.block_on(core.load_transfer_job_summary_snapshots()));
         }
         StoreCommand::LoadTransferSchedulerJobSnapshot { job_id, resp } => {
-            let _ = resp.send(runtime.block_on(
-                core.load_transfer_scheduler_job_snapshot(job_id.as_str()),
-            ));
+            let _ = resp
+                .send(runtime.block_on(core.load_transfer_scheduler_job_snapshot(job_id.as_str())));
         }
         StoreCommand::LoadTransferJobSnapshot { job_id, resp } => {
             let _ = resp.send(runtime.block_on(core.load_transfer_job_snapshot(job_id.as_str())));
@@ -826,9 +839,10 @@ fn execute_store_command(
             batch_id,
             resp,
         } => {
-            let _ = resp.send(runtime.block_on(
-                core.load_transfer_batch_record(job_id.as_str(), batch_id.as_str()),
-            ));
+            let _ = resp.send(
+                runtime
+                    .block_on(core.load_transfer_batch_record(job_id.as_str(), batch_id.as_str())),
+            );
         }
         StoreCommand::LoadTransferJobSnapshots(resp) => {
             let _ = resp.send(runtime.block_on(core.load_transfer_job_snapshots()));
@@ -837,7 +851,8 @@ fn execute_store_command(
             let _ = resp.send(runtime.block_on(core.load_transfer_batches()));
         }
         StoreCommand::LoadTransferBatchesForJob { job_id, resp } => {
-            let _ = resp.send(runtime.block_on(core.load_transfer_batches_for_job(job_id.as_str())));
+            let _ =
+                resp.send(runtime.block_on(core.load_transfer_batches_for_job(job_id.as_str())));
         }
         StoreCommand::LoadTransferDirectFilesCompleteRecords(resp) => {
             let _ = resp.send(runtime.block_on(core.load_transfer_direct_files_complete_records()));
@@ -861,15 +876,13 @@ fn execute_store_command(
             batch_class,
             resp,
         } => {
-            let _ = resp.send(runtime.block_on(core.load_next_ready_transfer_batch_for_job(
-                job_id.as_str(),
-                batch_class,
-            )));
+            let _ = resp.send(runtime.block_on(
+                core.load_next_ready_transfer_batch_for_job(job_id.as_str(), batch_class),
+            ));
         }
         StoreCommand::LoadReadyTransferBatchesForJob { job_id, resp } => {
-            let _ = resp.send(runtime.block_on(core.load_ready_transfer_batches_for_job(
-                job_id.as_str(),
-            )));
+            let _ = resp
+                .send(runtime.block_on(core.load_ready_transfer_batches_for_job(job_id.as_str())));
         }
         StoreCommand::BeginTransferScanEpoch { job_id, resp } => {
             let _ = resp.send(runtime.block_on(core.begin_transfer_scan_epoch(job_id.as_str())));
@@ -879,10 +892,9 @@ fn execute_store_command(
             scan_epoch,
             resp,
         } => {
-            let _ = resp.send(runtime.block_on(core.finish_transfer_scan_epoch(
-                job_id.as_str(),
-                scan_epoch,
-            )));
+            let _ = resp.send(
+                runtime.block_on(core.finish_transfer_scan_epoch(job_id.as_str(), scan_epoch)),
+            );
         }
         StoreCommand::ApplyTransferScanAppend { result, resp } => {
             let _ = resp.send(runtime.block_on(core.apply_transfer_scan_append(&result)));
@@ -939,13 +951,15 @@ fn execute_store_command(
             now_unix_ms,
             resp,
         } => {
-            let _ = resp.send(runtime.block_on(core.mark_transfer_worker_launch_acknowledged(
-                job_id.as_str(),
-                batch_id.as_str(),
-                worker_id.as_str(),
-                worker_task_id.as_str(),
-                now_unix_ms,
-            )));
+            let _ = resp.send(
+                runtime.block_on(core.mark_transfer_worker_launch_acknowledged(
+                    job_id.as_str(),
+                    batch_id.as_str(),
+                    worker_id.as_str(),
+                    worker_task_id.as_str(),
+                    now_unix_ms,
+                )),
+            );
         }
         StoreCommand::MarkTransferWorkerAttemptStopped {
             job_id,
@@ -997,17 +1011,11 @@ fn run_tikv_store_thread(
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(v) => v,
         Err(e) => {
-            let _ = init_tx.send(Err(format!(
-                "create transfer tikv runtime failed: {}",
-                e
-            )));
+            let _ = init_tx.send(Err(format!("create transfer tikv runtime failed: {}", e)));
             return;
         }
     };
-    let core = match runtime.block_on(TiKvTransferStateStoreCore::new(
-        pd_endpoints,
-        key_prefix,
-    )) {
+    let core = match runtime.block_on(TiKvTransferStateStoreCore::new(pd_endpoints, key_prefix)) {
         Ok(v) => v,
         Err(e) => {
             let _ = init_tx.send(Err(e));
@@ -1038,10 +1046,7 @@ fn run_tikv_reconcile_thread(
             return;
         }
     };
-    let core = match runtime.block_on(TiKvTransferStateStoreCore::new(
-        pd_endpoints,
-        key_prefix,
-    )) {
+    let core = match runtime.block_on(TiKvTransferStateStoreCore::new(pd_endpoints, key_prefix)) {
         Ok(v) => v,
         Err(e) => {
             let _ = init_tx.send(Err(e));
@@ -1212,12 +1217,9 @@ impl TiKvTransferStateStoreCore {
             )
             .await
         );
-        tx.commit().await.map_err(|e| {
-            format!(
-                "commit cancel transfer job job_id={} failed: {}",
-                job_id, e
-            )
-        })?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("commit cancel transfer job job_id={} failed: {}", job_id, e))?;
         Ok(())
     }
 
@@ -1354,7 +1356,10 @@ impl TiKvTransferStateStoreCore {
         Ok(jobs)
     }
 
-    async fn load_transfer_job_record(&self, job_id: &str) -> Result<Option<FsTransferJobRecord>, String> {
+    async fn load_transfer_job_record(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<FsTransferJobRecord>, String> {
         let mut tx = self
             .client
             .begin_optimistic()
@@ -1379,11 +1384,10 @@ impl TiKvTransferStateStoreCore {
         job_id: &str,
         batch_id: &str,
     ) -> Result<Option<FsTransferBatchRecord>, String> {
-        let mut tx = self
-            .client
-            .begin_optimistic()
-            .await
-            .map_err(|e| format!("begin load transfer batch record transaction failed: {}", e))?;
+        let mut tx =
+            self.client.begin_optimistic().await.map_err(|e| {
+                format!("begin load transfer batch record transaction failed: {}", e)
+            })?;
         let batch = match get_record::<FsTransferBatchRecord>(
             &mut tx,
             self.batch_key(job_id, batch_id),
@@ -1401,11 +1405,10 @@ impl TiKvTransferStateStoreCore {
     async fn load_transfer_job_summary_snapshots(
         &self,
     ) -> Result<Vec<FsTransferJobSummarySnapshot>, String> {
-        let mut tx = self
-            .client
-            .begin_optimistic()
-            .await
-            .map_err(|e| format!("begin load transfer job summary transaction failed: {}", e))?;
+        let mut tx =
+            self.client.begin_optimistic().await.map_err(|e| {
+                format!("begin load transfer job summary transaction failed: {}", e)
+            })?;
         let mut jobs = match self.load_jobs_from_tx(&mut tx).await {
             Ok(v) => v,
             Err(err) => return Err(rollback_with_error(&mut tx, err).await),
@@ -1417,11 +1420,13 @@ impl TiKvTransferStateStoreCore {
         });
         let mut out = Vec::with_capacity(jobs.len());
         for job in jobs {
-            let running_batch_owners =
-                match self.load_running_batch_owner_snapshots_for_job_from_tx(&mut tx, job.job_id.as_str()).await {
-                    Ok(v) => v,
-                    Err(err) => return Err(rollback_with_error(&mut tx, err).await),
-                };
+            let running_batch_owners = match self
+                .load_running_batch_owner_snapshots_for_job_from_tx(&mut tx, job.job_id.as_str())
+                .await
+            {
+                Ok(v) => v,
+                Err(err) => return Err(rollback_with_error(&mut tx, err).await),
+            };
             let open_batches = Self::transfer_job_open_batch_count(&job);
             let pending_batches = Self::transfer_job_pending_batch_count(&job);
             out.push(FsTransferJobSummarySnapshot {
@@ -1444,16 +1449,12 @@ impl TiKvTransferStateStoreCore {
         &self,
         job_id: &str,
     ) -> Result<Option<FsTransferSchedulerJobSnapshot>, String> {
-        let mut tx = self
-            .client
-            .begin_optimistic()
-            .await
-            .map_err(|e| {
-                format!(
-                    "begin load transfer scheduler job snapshot transaction failed: {}",
-                    e
-                )
-            })?;
+        let mut tx = self.client.begin_optimistic().await.map_err(|e| {
+            format!(
+                "begin load transfer scheduler job snapshot transaction failed: {}",
+                e
+            )
+        })?;
         let job = match get_record::<FsTransferJobRecord>(
             &mut tx,
             self.job_key(job_id),
@@ -1503,12 +1504,14 @@ impl TiKvTransferStateStoreCore {
         }))
     }
 
-    async fn load_transfer_job_snapshot(&self, job_id: &str) -> Result<Option<FsTransferJobSnapshot>, String> {
-        let mut tx = self
-            .client
-            .begin_optimistic()
-            .await
-            .map_err(|e| format!("begin load transfer job snapshot transaction failed: {}", e))?;
+    async fn load_transfer_job_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<FsTransferJobSnapshot>, String> {
+        let mut tx =
+            self.client.begin_optimistic().await.map_err(|e| {
+                format!("begin load transfer job snapshot transaction failed: {}", e)
+            })?;
         let Some(job) = (match get_record::<FsTransferJobRecord>(
             &mut tx,
             self.job_key(job_id),
@@ -1533,7 +1536,10 @@ impl TiKvTransferStateStoreCore {
             Ok(v) => v,
             Err(err) => return Err(rollback_with_error(&mut tx, err).await),
         };
-        let worker_attempts = match self.load_worker_attempts_for_job_from_tx(&mut tx, job_id).await {
+        let worker_attempts = match self
+            .load_worker_attempts_for_job_from_tx(&mut tx, job_id)
+            .await
+        {
             Ok(v) => v,
             Err(err) => return Err(rollback_with_error(&mut tx, err).await),
         };
@@ -1583,7 +1589,9 @@ impl TiKvTransferStateStoreCore {
                     | FluxonFsTransferBatchState::Expired
                     | FluxonFsTransferBatchState::Done
             ) {
-                *open_batch_count_by_job.entry(batch.job_id.clone()).or_insert(0) += 1;
+                *open_batch_count_by_job
+                    .entry(batch.job_id.clone())
+                    .or_insert(0) += 1;
             }
             if batch.state == FluxonFsTransferBatchState::Running {
                 running_batches_by_job
@@ -1594,7 +1602,9 @@ impl TiKvTransferStateStoreCore {
                 batch.state,
                 FluxonFsTransferBatchState::Done | FluxonFsTransferBatchState::Finished
             ) {
-                *done_batch_count_by_job.entry(batch.job_id.clone()).or_insert(0) += 1;
+                *done_batch_count_by_job
+                    .entry(batch.job_id.clone())
+                    .or_insert(0) += 1;
             }
         }
         for attempt in worker_attempts {
@@ -1614,8 +1624,12 @@ impl TiKvTransferStateStoreCore {
         }
         let mut out = Vec::with_capacity(jobs.len());
         for job in jobs {
-            let running_batches = running_batches_by_job.remove(&job.job_id).unwrap_or_default();
-            let worker_attempts = worker_attempts_by_job.remove(&job.job_id).unwrap_or_default();
+            let running_batches = running_batches_by_job
+                .remove(&job.job_id)
+                .unwrap_or_default();
+            let worker_attempts = worker_attempts_by_job
+                .remove(&job.job_id)
+                .unwrap_or_default();
             let failed_files = failed_files_by_job.remove(&job.job_id).unwrap_or_default();
             out.push(FsTransferJobSnapshot {
                 scan_epoch: job.scan_epoch,
@@ -1660,11 +1674,10 @@ impl TiKvTransferStateStoreCore {
         &self,
         job_id: &str,
     ) -> Result<Vec<FsTransferBatchRecord>, String> {
-        let mut tx = self
-            .client
-            .begin_optimistic()
-            .await
-            .map_err(|e| format!("begin load transfer batch by job transaction failed: {}", e))?;
+        let mut tx =
+            self.client.begin_optimistic().await.map_err(|e| {
+                format!("begin load transfer batch by job transaction failed: {}", e)
+            })?;
         let batches = match self.load_batches_for_job_from_tx(&mut tx, job_id).await {
             Ok(v) => v,
             Err(err) => return Err(rollback_with_error(&mut tx, err).await),
@@ -1676,21 +1689,24 @@ impl TiKvTransferStateStoreCore {
     async fn load_transfer_direct_files_complete_records(
         &self,
     ) -> Result<Vec<FsTransferDirectFilesCompleteRecord>, String> {
-        let mut tx = self
-            .client
-            .begin_optimistic()
+        let mut tx = self.client.begin_optimistic().await.map_err(|e| {
+            format!(
+                "begin load transfer direct files complete transaction failed: {}",
+                e
+            )
+        })?;
+        let mut rows = match self
+            .load_direct_files_complete_records_from_tx(&mut tx)
             .await
-            .map_err(|e| {
-                format!(
-                    "begin load transfer direct files complete transaction failed: {}",
-                    e
-                )
-            })?;
-        let mut rows = match self.load_direct_files_complete_records_from_tx(&mut tx).await {
+        {
             Ok(v) => v,
             Err(err) => return Err(rollback_with_error(&mut tx, err).await),
         };
-        rows.sort_by(|a, b| a.job_id.cmp(&b.job_id).then(a.root_relpath.cmp(&b.root_relpath)));
+        rows.sort_by(|a, b| {
+            a.job_id
+                .cmp(&b.job_id)
+                .then(a.root_relpath.cmp(&b.root_relpath))
+        });
         let _ = tx.rollback().await;
         Ok(rows)
     }
@@ -1719,11 +1735,12 @@ impl TiKvTransferStateStoreCore {
     async fn load_transfer_worker_attempt_records(
         &self,
     ) -> Result<Vec<FsTransferWorkerAttemptRecord>, String> {
-        let mut tx = self
-            .client
-            .begin_optimistic()
-            .await
-            .map_err(|e| format!("begin load transfer worker attempt transaction failed: {}", e))?;
+        let mut tx = self.client.begin_optimistic().await.map_err(|e| {
+            format!(
+                "begin load transfer worker attempt transaction failed: {}",
+                e
+            )
+        })?;
         let mut rows = match self.load_worker_attempts_from_tx(&mut tx).await {
             Ok(v) => v,
             Err(err) => return Err(rollback_with_error(&mut tx, err).await),
@@ -1742,11 +1759,10 @@ impl TiKvTransferStateStoreCore {
     async fn load_transfer_batch_collect_info_records(
         &self,
     ) -> Result<Vec<FsTransferBatchCollectInfoRecord>, String> {
-        let mut tx = self
-            .client
-            .begin_optimistic()
-            .await
-            .map_err(|e| format!("begin load transfer collect info transaction failed: {}", e))?;
+        let mut tx =
+            self.client.begin_optimistic().await.map_err(|e| {
+                format!("begin load transfer collect info transaction failed: {}", e)
+            })?;
         let mut rows = match self.load_collect_infos_from_tx(&mut tx).await {
             Ok(v) => v,
             Err(err) => return Err(rollback_with_error(&mut tx, err).await),
@@ -1788,16 +1804,12 @@ impl TiKvTransferStateStoreCore {
         job_id: &str,
         batch_class: FsTransferReadyBatchClass,
     ) -> Result<Option<FsTransferReadyBatchDispatch>, String> {
-        let mut tx = self
-            .client
-            .begin_optimistic()
-            .await
-            .map_err(|e| {
-                format!(
-                    "begin load next ready transfer batch transaction failed: {}",
-                    e
-                )
-            })?;
+        let mut tx = self.client.begin_optimistic().await.map_err(|e| {
+            format!(
+                "begin load next ready transfer batch transaction failed: {}",
+                e
+            )
+        })?;
         let state_prefix = self.batch_state_prefix(job_id, FluxonFsTransferBatchState::Ready);
         let state_keys = match scan_all_keys(&mut tx, state_prefix.clone()).await {
             Ok(v) => v,
@@ -1834,17 +1846,21 @@ impl TiKvTransferStateStoreCore {
                 Ok(v) => v,
                 Err(err) => return Err(rollback_with_error(&mut tx, err).await),
             };
-            let effective_dispatch_class =
-                match decode_transfer_batch_manifest_dispatch_class(&batch, !collect_infos.is_empty())
-                {
-                    Ok(v) => v,
-                    Err(err) => return Err(rollback_with_error(&mut tx, err).await),
-                };
+            let effective_dispatch_class = match decode_transfer_batch_manifest_dispatch_class(
+                &batch,
+                !collect_infos.is_empty(),
+            ) {
+                Ok(v) => v,
+                Err(err) => return Err(rollback_with_error(&mut tx, err).await),
+            };
             if effective_dispatch_class != batch_class {
                 continue;
             }
             let _ = tx.rollback().await;
-            return Ok(Some(FsTransferReadyBatchDispatch { batch, collect_infos }));
+            return Ok(Some(FsTransferReadyBatchDispatch {
+                batch,
+                collect_infos,
+            }));
         }
         let _ = tx.rollback().await;
         Ok(None)
@@ -1854,11 +1870,10 @@ impl TiKvTransferStateStoreCore {
         &self,
         job_id: &str,
     ) -> Result<Vec<FsTransferBatchRecord>, String> {
-        let mut tx = self
-            .client
-            .begin_optimistic()
-            .await
-            .map_err(|e| format!("begin load ready transfer batch transaction failed: {}", e))?;
+        let mut tx =
+            self.client.begin_optimistic().await.map_err(|e| {
+                format!("begin load ready transfer batch transaction failed: {}", e)
+            })?;
         let state_prefix = self.batch_state_prefix(job_id, FluxonFsTransferBatchState::Ready);
         let state_keys = match scan_all_keys(&mut tx, state_prefix.clone()).await {
             Ok(v) => v,
@@ -1909,7 +1924,13 @@ impl TiKvTransferStateStoreCore {
         job.updated_at_unix_ms = chrono::Utc::now().timestamp_millis();
         tx_try!(
             tx,
-            put_record(&mut tx, self.job_key(job_id), &job, "begin transfer scan epoch").await
+            put_record(
+                &mut tx,
+                self.job_key(job_id),
+                &job,
+                "begin transfer scan epoch"
+            )
+            .await
         );
         tx.commit().await.map_err(|e| {
             format!(
@@ -1920,7 +1941,11 @@ impl TiKvTransferStateStoreCore {
         Ok(next_epoch)
     }
 
-    async fn finish_transfer_scan_epoch(&self, job_id: &str, scan_epoch: i64) -> Result<(), String> {
+    async fn finish_transfer_scan_epoch(
+        &self,
+        job_id: &str,
+        scan_epoch: i64,
+    ) -> Result<(), String> {
         let (mut tx, mut job) = self.begin_locked_job_tx(job_id).await?;
         if job.state != FluxonFsTransferJobState::Running || job.scan_epoch != scan_epoch {
             let err = format!(
@@ -1933,7 +1958,13 @@ impl TiKvTransferStateStoreCore {
         job.updated_at_unix_ms = chrono::Utc::now().timestamp_millis();
         tx_try!(
             tx,
-            put_record(&mut tx, self.job_key(job_id), &job, "finish transfer scan epoch").await
+            put_record(
+                &mut tx,
+                self.job_key(job_id),
+                &job,
+                "finish transfer scan epoch"
+            )
+            .await
         );
         tx.commit().await.map_err(|e| {
             format!(
@@ -2162,10 +2193,7 @@ impl TiKvTransferStateStoreCore {
         } else if batch.assigned_src_exporter_id != src_exporter_id {
             let err = format!(
                 "transfer batch source exporter binding mismatch: job_id={} batch_id={} assigned_src_exporter_id={} requested_src_exporter_id={}",
-                job_id,
-                batch_id,
-                batch.assigned_src_exporter_id,
-                src_exporter_id
+                job_id, batch_id, batch.assigned_src_exporter_id, src_exporter_id
             );
             return Err(rollback_with_error(&mut tx, err).await);
         }
@@ -2181,10 +2209,7 @@ impl TiKvTransferStateStoreCore {
         } else if batch.assigned_dst_exporter_id != dst_exporter_id {
             let err = format!(
                 "transfer batch target exporter binding mismatch: job_id={} batch_id={} assigned_dst_exporter_id={} requested_dst_exporter_id={}",
-                job_id,
-                batch_id,
-                batch.assigned_dst_exporter_id,
-                dst_exporter_id
+                job_id, batch_id, batch.assigned_dst_exporter_id, dst_exporter_id
             );
             return Err(rollback_with_error(&mut tx, err).await);
         }
@@ -2204,8 +2229,13 @@ impl TiKvTransferStateStoreCore {
         batch.lease_expire_unix_ms = lease_expire_unix_ms;
         tx_try!(
             tx,
-            put_record(&mut tx, self.batch_key(job_id, batch_id), &batch, "assign transfer batch")
-                .await
+            put_record(
+                &mut tx,
+                self.batch_key(job_id, batch_id),
+                &batch,
+                "assign transfer batch"
+            )
+            .await
         );
         tx_try!(
             tx,
@@ -2525,9 +2555,7 @@ impl TiKvTransferStateStoreCore {
                     result.job_id, result.batch_id, result.worker_id, e
                 )
             })?;
-            return Ok(FluxonFsTransferWorkerResultAckWire::stop(
-                stop_reason,
-            ));
+            return Ok(FluxonFsTransferWorkerResultAckWire::stop(stop_reason));
         }
         // Result acceptance only proves that the current owner attempt finished
         // local work. The batch stays Running-without-owner until reconcile
@@ -2585,9 +2613,7 @@ impl TiKvTransferStateStoreCore {
             } else {
                 let _ = tx.rollback().await;
             }
-            return Ok(FluxonFsTransferWorkerResultAckWire::stop(
-                stop_reason,
-            ));
+            return Ok(FluxonFsTransferWorkerResultAckWire::stop(stop_reason));
         };
         if batch.state != FluxonFsTransferBatchState::Running
             || batch.owner_worker_id != result.worker_id
@@ -2637,9 +2663,7 @@ impl TiKvTransferStateStoreCore {
             } else {
                 let _ = tx.rollback().await;
             }
-            return Ok(FluxonFsTransferWorkerResultAckWire::stop(
-                stop_reason,
-            ));
+            return Ok(FluxonFsTransferWorkerResultAckWire::stop(stop_reason));
         }
         let Some(worker_lease) = tx_try!(
             tx,
@@ -2694,9 +2718,7 @@ impl TiKvTransferStateStoreCore {
             } else {
                 let _ = tx.rollback().await;
             }
-            return Ok(FluxonFsTransferWorkerResultAckWire::stop(
-                stop_reason,
-            ));
+            return Ok(FluxonFsTransferWorkerResultAckWire::stop(stop_reason));
         };
         if worker_lease.worker_id != result.worker_id
             || worker_lease.assigned_batch_id != result.batch_id
@@ -2745,9 +2767,7 @@ impl TiKvTransferStateStoreCore {
             } else {
                 let _ = tx.rollback().await;
             }
-            return Ok(FluxonFsTransferWorkerResultAckWire::stop(
-                stop_reason,
-            ));
+            return Ok(FluxonFsTransferWorkerResultAckWire::stop(stop_reason));
         }
         tx_try!(
             tx,
@@ -3023,7 +3043,10 @@ impl TiKvTransferStateStoreCore {
                 tx,
                 delete_key(
                     &mut tx,
-                    self.worker_lease_key(heartbeat.job_id.as_str(), heartbeat.worker_task_id.as_str()),
+                    self.worker_lease_key(
+                        heartbeat.job_id.as_str(),
+                        heartbeat.worker_task_id.as_str()
+                    ),
                     "delete transfer worker lease for non-running job heartbeat",
                 )
                 .await
@@ -3049,9 +3072,7 @@ impl TiKvTransferStateStoreCore {
                     heartbeat.job_id, heartbeat.assigned_batch_id, heartbeat.worker_id, e
                 )
             })?;
-            return Ok(FluxonFsTransferWorkerHeartbeatResultWire::stop(
-                stop_reason,
-            ));
+            return Ok(FluxonFsTransferWorkerHeartbeatResultWire::stop(stop_reason));
         }
         // Heartbeat only extends the durable lease for the current owner
         // attempt. Any ownership mismatch is treated as a stop immediately.
@@ -3059,13 +3080,16 @@ impl TiKvTransferStateStoreCore {
             tx,
             get_record_for_update::<FsTransferBatchRecord>(
                 &mut tx,
-                self.batch_key(heartbeat.job_id.as_str(), heartbeat.assigned_batch_id.as_str()),
+                self.batch_key(
+                    heartbeat.job_id.as_str(),
+                    heartbeat.assigned_batch_id.as_str()
+                ),
                 "worker heartbeat batch lookup",
             )
             .await
         ) else {
-            let worker_attempt_key =
-                self.worker_attempt_key(heartbeat.job_id.as_str(), heartbeat.worker_task_id.as_str());
+            let worker_attempt_key = self
+                .worker_attempt_key(heartbeat.job_id.as_str(), heartbeat.worker_task_id.as_str());
             if let Some(mut attempt) = tx_try!(
                 tx,
                 get_record_for_update::<FsTransferWorkerAttemptRecord>(
@@ -3108,16 +3132,14 @@ impl TiKvTransferStateStoreCore {
             } else {
                 let _ = tx.rollback().await;
             }
-            return Ok(FluxonFsTransferWorkerHeartbeatResultWire::stop(
-                stop_reason,
-            ));
+            return Ok(FluxonFsTransferWorkerHeartbeatResultWire::stop(stop_reason));
         };
         if batch.state != FluxonFsTransferBatchState::Running
             || batch.owner_worker_id != heartbeat.worker_id
             || batch.owner_worker_task_id != heartbeat.worker_task_id
         {
-            let worker_attempt_key =
-                self.worker_attempt_key(heartbeat.job_id.as_str(), heartbeat.worker_task_id.as_str());
+            let worker_attempt_key = self
+                .worker_attempt_key(heartbeat.job_id.as_str(), heartbeat.worker_task_id.as_str());
             if let Some(mut attempt) = tx_try!(
                 tx,
                 get_record_for_update::<FsTransferWorkerAttemptRecord>(
@@ -3160,9 +3182,7 @@ impl TiKvTransferStateStoreCore {
             } else {
                 let _ = tx.rollback().await;
             }
-            return Ok(FluxonFsTransferWorkerHeartbeatResultWire::stop(
-                stop_reason,
-            ));
+            return Ok(FluxonFsTransferWorkerHeartbeatResultWire::stop(stop_reason));
         }
         let Some(mut worker_lease) = tx_try!(
             tx,
@@ -3173,8 +3193,8 @@ impl TiKvTransferStateStoreCore {
             )
             .await
         ) else {
-            let worker_attempt_key =
-                self.worker_attempt_key(heartbeat.job_id.as_str(), heartbeat.worker_task_id.as_str());
+            let worker_attempt_key = self
+                .worker_attempt_key(heartbeat.job_id.as_str(), heartbeat.worker_task_id.as_str());
             if let Some(mut attempt) = tx_try!(
                 tx,
                 get_record_for_update::<FsTransferWorkerAttemptRecord>(
@@ -3217,15 +3237,13 @@ impl TiKvTransferStateStoreCore {
             } else {
                 let _ = tx.rollback().await;
             }
-            return Ok(FluxonFsTransferWorkerHeartbeatResultWire::stop(
-                stop_reason,
-            ));
+            return Ok(FluxonFsTransferWorkerHeartbeatResultWire::stop(stop_reason));
         };
         if worker_lease.worker_id != heartbeat.worker_id
             || worker_lease.assigned_batch_id != heartbeat.assigned_batch_id
         {
-            let worker_attempt_key =
-                self.worker_attempt_key(heartbeat.job_id.as_str(), heartbeat.worker_task_id.as_str());
+            let worker_attempt_key = self
+                .worker_attempt_key(heartbeat.job_id.as_str(), heartbeat.worker_task_id.as_str());
             if let Some(mut attempt) = tx_try!(
                 tx,
                 get_record_for_update::<FsTransferWorkerAttemptRecord>(
@@ -3268,9 +3286,7 @@ impl TiKvTransferStateStoreCore {
             } else {
                 let _ = tx.rollback().await;
             }
-            return Ok(FluxonFsTransferWorkerHeartbeatResultWire::stop(
-                stop_reason,
-            ));
+            return Ok(FluxonFsTransferWorkerHeartbeatResultWire::stop(stop_reason));
         }
         worker_lease.lease_expire_unix_ms = lease_expire_unix_ms;
         batch.lease_expire_unix_ms = lease_expire_unix_ms;
@@ -3278,7 +3294,10 @@ impl TiKvTransferStateStoreCore {
             tx,
             put_record(
                 &mut tx,
-                self.batch_key(heartbeat.job_id.as_str(), heartbeat.assigned_batch_id.as_str()),
+                self.batch_key(
+                    heartbeat.job_id.as_str(),
+                    heartbeat.assigned_batch_id.as_str()
+                ),
                 &batch,
                 "apply transfer worker heartbeat batch lease update",
             )
@@ -3400,7 +3419,13 @@ impl TiKvTransferStateStoreCore {
         job: &FsTransferJobRecord,
         snapshot: &ReconcileDoneBatchSnapshot,
         backend: Arc<dyn FsS3Backend>,
-    ) -> Result<(ReconcileDoneBatchTargetState, Vec<FsTransferBatchCollectInfoRecord>), String> {
+    ) -> Result<
+        (
+            ReconcileDoneBatchTargetState,
+            Vec<FsTransferBatchCollectInfoRecord>,
+        ),
+        String,
+    > {
         if snapshot.batch.assigned_dst_exporter_id.trim().is_empty() {
             return Err(format!(
                 "done batch target reconcile requires assigned_dst_exporter_id: job_id={} batch_id={}",
@@ -3409,7 +3434,10 @@ impl TiKvTransferStateStoreCore {
         }
         let mut target_complete = true;
         for entry in &snapshot.manifest.entries {
-            if snapshot.file_issue_relpaths.contains(entry.relpath.as_str()) {
+            if snapshot
+                .file_issue_relpaths
+                .contains(entry.relpath.as_str())
+            {
                 continue;
             }
             let final_relpath =
@@ -3495,9 +3523,8 @@ impl TiKvTransferStateStoreCore {
                         e
                     )
                 })?;
-            let exists = stat.exists
-                && stat.is_file
-                && stat.size == collect_info.collect_blob.len() as i64;
+            let exists =
+                stat.exists && stat.is_file && stat.size == collect_info.collect_blob.len() as i64;
             collect_info.materialized = exists;
             if !exists {
                 collect_info_complete = false;
@@ -3543,11 +3570,12 @@ impl TiKvTransferStateStoreCore {
         let mut job_dirty = false;
         let worker_leases_by_task = tx_try!(
             tx,
-            self.load_worker_leases_for_job_from_tx(&mut tx, job_id).await
+            self.load_worker_leases_for_job_from_tx(&mut tx, job_id)
+                .await
         )
-            .into_iter()
-            .map(|row| (row.worker_task_id.clone(), row))
-            .collect::<std::collections::BTreeMap<String, FsTransferWorkerLeaseRecord>>();
+        .into_iter()
+        .map(|row| (row.worker_task_id.clone(), row))
+        .collect::<std::collections::BTreeMap<String, FsTransferWorkerLeaseRecord>>();
         let batches = tx_try!(tx, self.load_batches_for_job_from_tx(&mut tx, job_id).await);
         let mut deferred_done_batches: Vec<FsTransferBatchRecord> = Vec::new();
         for mut batch in batches {
@@ -3556,12 +3584,20 @@ impl TiKvTransferStateStoreCore {
                     tx,
                     delete_key(
                         &mut tx,
-                        self.batch_state_key(job_id, FluxonFsTransferBatchState::Expired, batch.batch_id.as_str()),
+                        self.batch_state_key(
+                            job_id,
+                            FluxonFsTransferBatchState::Expired,
+                            batch.batch_id.as_str()
+                        ),
                         "delete running batch state index during reconcile requeue",
                     )
                     .await
                 );
-                Self::adjust_job_batch_state_count(&mut job, FluxonFsTransferBatchState::Expired, -1);
+                Self::adjust_job_batch_state_count(
+                    &mut job,
+                    FluxonFsTransferBatchState::Expired,
+                    -1,
+                );
                 batch.state = FluxonFsTransferBatchState::Ready;
                 batch.owner_worker_id.clear();
                 batch.owner_worker_task_id.clear();
@@ -3580,7 +3616,11 @@ impl TiKvTransferStateStoreCore {
                     tx,
                     put_marker(
                         &mut tx,
-                        self.batch_state_key(job_id, FluxonFsTransferBatchState::Ready, batch.batch_id.as_str()),
+                        self.batch_state_key(
+                            job_id,
+                            FluxonFsTransferBatchState::Ready,
+                            batch.batch_id.as_str()
+                        ),
                         "insert ready batch state index during reconcile requeue",
                     )
                     .await
@@ -3603,12 +3643,20 @@ impl TiKvTransferStateStoreCore {
                         tx,
                         delete_key(
                             &mut tx,
-                            self.batch_state_key(job_id, FluxonFsTransferBatchState::Running, batch.batch_id.as_str()),
+                            self.batch_state_key(
+                                job_id,
+                                FluxonFsTransferBatchState::Running,
+                                batch.batch_id.as_str()
+                            ),
                             "delete running batch state index during inconsistent-owner requeue",
                         )
                         .await
                     );
-                    Self::adjust_job_batch_state_count(&mut job, FluxonFsTransferBatchState::Running, -1);
+                    Self::adjust_job_batch_state_count(
+                        &mut job,
+                        FluxonFsTransferBatchState::Running,
+                        -1,
+                    );
                     batch.state = FluxonFsTransferBatchState::Ready;
                     batch.owner_worker_id.clear();
                     batch.owner_worker_task_id.clear();
@@ -3627,12 +3675,20 @@ impl TiKvTransferStateStoreCore {
                         tx,
                         put_marker(
                             &mut tx,
-                            self.batch_state_key(job_id, FluxonFsTransferBatchState::Ready, batch.batch_id.as_str()),
+                            self.batch_state_key(
+                                job_id,
+                                FluxonFsTransferBatchState::Ready,
+                                batch.batch_id.as_str()
+                            ),
                             "insert ready batch state index during inconsistent-owner reconcile",
                         )
                         .await
                     );
-                    Self::adjust_job_batch_state_count(&mut job, FluxonFsTransferBatchState::Ready, 1);
+                    Self::adjust_job_batch_state_count(
+                        &mut job,
+                        FluxonFsTransferBatchState::Ready,
+                        1,
+                    );
                     tx_dirty = true;
                     job_dirty = true;
                     continue;
@@ -3660,12 +3716,20 @@ impl TiKvTransferStateStoreCore {
                         tx,
                         delete_key(
                             &mut tx,
-                            self.batch_state_key(job_id, FluxonFsTransferBatchState::Running, batch.batch_id.as_str()),
+                            self.batch_state_key(
+                                job_id,
+                                FluxonFsTransferBatchState::Running,
+                                batch.batch_id.as_str()
+                            ),
                             "delete running batch state index during stale-worker requeue",
                         )
                         .await
                     );
-                    Self::adjust_job_batch_state_count(&mut job, FluxonFsTransferBatchState::Running, -1);
+                    Self::adjust_job_batch_state_count(
+                        &mut job,
+                        FluxonFsTransferBatchState::Running,
+                        -1,
+                    );
                     if lease.is_some() {
                         tx_try!(
                             tx,
@@ -3702,7 +3766,10 @@ impl TiKvTransferStateStoreCore {
                                 tx,
                                 put_record(
                                     &mut tx,
-                                    self.worker_attempt_key(job_id, old_owner_worker_task_id.as_str()),
+                                    self.worker_attempt_key(
+                                        job_id,
+                                        old_owner_worker_task_id.as_str()
+                                    ),
                                     &attempt,
                                     "reconcile stale-worker worker attempt stop update",
                                 )
@@ -3728,12 +3795,20 @@ impl TiKvTransferStateStoreCore {
                         tx,
                         put_marker(
                             &mut tx,
-                            self.batch_state_key(job_id, FluxonFsTransferBatchState::Ready, batch.batch_id.as_str()),
+                            self.batch_state_key(
+                                job_id,
+                                FluxonFsTransferBatchState::Ready,
+                                batch.batch_id.as_str()
+                            ),
                             "insert ready batch state index during stale-worker reconcile",
                         )
                         .await
                     );
-                    Self::adjust_job_batch_state_count(&mut job, FluxonFsTransferBatchState::Ready, 1);
+                    Self::adjust_job_batch_state_count(
+                        &mut job,
+                        FluxonFsTransferBatchState::Ready,
+                        1,
+                    );
                     tx_dirty = true;
                     job_dirty = true;
                     continue;
@@ -3784,7 +3859,12 @@ impl TiKvTransferStateStoreCore {
             let current_job = self
                 .load_transfer_job_record(job_id)
                 .await?
-                .ok_or_else(|| format!("no transfer job found during reconcile done phase: job_id={}", job_id))?;
+                .ok_or_else(|| {
+                    format!(
+                        "no transfer job found during reconcile done phase: job_id={}",
+                        job_id
+                    )
+                })?;
             if current_job.state != FluxonFsTransferJobState::Running {
                 continue;
             }
@@ -3846,7 +3926,11 @@ impl TiKvTransferStateStoreCore {
                 tx,
                 delete_key(
                     &mut tx,
-                    self.batch_state_key(job_id, FluxonFsTransferBatchState::Done, current_batch.batch_id.as_str()),
+                    self.batch_state_key(
+                        job_id,
+                        FluxonFsTransferBatchState::Done,
+                        current_batch.batch_id.as_str()
+                    ),
                     "delete done batch state index during reconcile finish",
                 )
                 .await
@@ -3873,7 +3957,11 @@ impl TiKvTransferStateStoreCore {
                 tx,
                 put_marker(
                     &mut tx,
-                    self.batch_state_key(job_id, current_batch.state, current_batch.batch_id.as_str()),
+                    self.batch_state_key(
+                        job_id,
+                        current_batch.state,
+                        current_batch.batch_id.as_str()
+                    ),
                     "insert reconciled batch state index",
                 )
                 .await
@@ -3965,7 +4053,8 @@ impl TiKvTransferStateStoreCore {
                 "equivalent transfer batch lookup",
             )
             .await?;
-            let existing_manifest = decode_transfer_manifest_blob(existing_batch.manifest_blob.as_slice())?;
+            let existing_manifest =
+                decode_transfer_manifest_blob(existing_batch.manifest_blob.as_slice())?;
             validate_equivalent_manifests(
                 job.job_id.as_str(),
                 existing_batch_id.as_str(),
@@ -4043,7 +4132,11 @@ impl TiKvTransferStateStoreCore {
                         &batch.collect_infos,
                     )
                     .await?;
-                (incoming_manifest.clone(), batch.collect_infos.clone(), claims)
+                (
+                    incoming_manifest.clone(),
+                    batch.collect_infos.clone(),
+                    claims,
+                )
             }
         };
         let batch_stats = transfer_manifest_stats(&manifest_to_store);
@@ -4187,9 +4280,7 @@ impl TiKvTransferStateStoreCore {
             if existing_claim.path_kind != TransferCoveragePathKind::File {
                 return Err(format!(
                     "transfer coverage claim kind mismatch for direct file: job_id={} relpath={} existing_kind={:?}",
-                    job.job_id,
-                    entry.relpath,
-                    existing_claim.path_kind
+                    job.job_id, entry.relpath, existing_claim.path_kind
                 ));
             }
             if existing_claim.batch_kind != expected_batch_kind
@@ -4223,9 +4314,7 @@ impl TiKvTransferStateStoreCore {
             if existing_claim.path_kind != TransferCoveragePathKind::SymlinkNotice {
                 return Err(format!(
                     "transfer coverage claim kind mismatch for symlink notice: job_id={} relpath={} existing_kind={:?}",
-                    job.job_id,
-                    notice.relpath,
-                    existing_claim.path_kind
+                    job.job_id, notice.relpath, existing_claim.path_kind
                 ));
             }
             if existing_claim.batch_kind != expected_batch_kind
@@ -4259,9 +4348,7 @@ impl TiKvTransferStateStoreCore {
             if existing_claim.path_kind != TransferCoveragePathKind::EmptyDir {
                 return Err(format!(
                     "transfer coverage claim kind mismatch for empty dir: job_id={} relpath={} existing_kind={:?}",
-                    job.job_id,
-                    empty_dir_relpath,
-                    existing_claim.path_kind
+                    job.job_id, empty_dir_relpath, existing_claim.path_kind
                 ));
             }
             if existing_claim.batch_kind != expected_batch_kind
@@ -4433,8 +4520,9 @@ impl TiKvTransferStateStoreCore {
         batch_id: &str,
         incoming_collect_infos: &[fluxon_fs_core::config::FluxonFsTransferBatchCollectInfoWire],
     ) -> Result<(), String> {
-        let existing_collect_infos =
-            self.load_collect_infos_for_batch_from_tx(tx, job_id, batch_id).await?;
+        let existing_collect_infos = self
+            .load_collect_infos_for_batch_from_tx(tx, job_id, batch_id)
+            .await?;
         if existing_collect_infos.len() != incoming_collect_infos.len() {
             return Err(format!(
                 "equivalent transfer batch collect info count mismatch: job_id={} batch_id={} existing={} incoming={}",
@@ -4444,7 +4532,10 @@ impl TiKvTransferStateStoreCore {
                 incoming_collect_infos.len()
             ));
         }
-        for (existing, incoming) in existing_collect_infos.iter().zip(incoming_collect_infos.iter()) {
+        for (existing, incoming) in existing_collect_infos
+            .iter()
+            .zip(incoming_collect_infos.iter())
+        {
             if existing.collect_kind != incoming.collect_kind
                 || existing.collect_blob.as_slice() != incoming.collect_blob.as_slice()
             {
@@ -4689,7 +4780,12 @@ impl TiKvTransferStateStoreCore {
                 break;
             }
             let batch_ids = self
-                .load_some_batch_ids_in_state_from_tx(tx, job_id.as_str(), state, remaining_batch_budget)
+                .load_some_batch_ids_in_state_from_tx(
+                    tx,
+                    job_id.as_str(),
+                    state,
+                    remaining_batch_budget,
+                )
                 .await?;
             for batch_id in batch_ids {
                 let Some(mut batch) = get_record::<FsTransferBatchRecord>(
@@ -4733,7 +4829,11 @@ impl TiKvTransferStateStoreCore {
         }
 
         for lease in self
-            .load_some_worker_leases_for_job_from_tx(tx, job_id.as_str(), TRANSFER_STOP_LEASE_CLEANUP_LIMIT)
+            .load_some_worker_leases_for_job_from_tx(
+                tx,
+                job_id.as_str(),
+                TRANSFER_STOP_LEASE_CLEANUP_LIMIT,
+            )
             .await?
         {
             delete_key(
@@ -4782,7 +4882,10 @@ impl TiKvTransferStateStoreCore {
         .await
     }
 
-    async fn load_jobs_from_tx(&self, tx: &mut Transaction) -> Result<Vec<FsTransferJobRecord>, String> {
+    async fn load_jobs_from_tx(
+        &self,
+        tx: &mut Transaction,
+    ) -> Result<Vec<FsTransferJobRecord>, String> {
         let pairs = scan_all_pairs(tx, self.namespace_prefix(KEY_NS_JOB)).await?;
         let mut jobs = Vec::with_capacity(pairs.len());
         for (_key, value) in pairs {
@@ -5063,7 +5166,11 @@ impl TiKvTransferStateStoreCore {
     }
 
     fn batch_prefix(&self, job_id: &str) -> Vec<u8> {
-        compose_key(self.key_prefix.as_slice(), KEY_NS_BATCH, &[job_id.as_bytes()])
+        compose_key(
+            self.key_prefix.as_slice(),
+            KEY_NS_BATCH,
+            &[job_id.as_bytes()],
+        )
     }
 
     fn batch_key(&self, job_id: &str, batch_id: &str) -> Vec<u8> {
@@ -5130,7 +5237,11 @@ impl TiKvTransferStateStoreCore {
         compose_key(
             self.key_prefix.as_slice(),
             KEY_NS_BATCH_STATE,
-            &[job_id.as_bytes(), state.as_db_str().as_bytes(), batch_id.as_bytes()],
+            &[
+                job_id.as_bytes(),
+                state.as_db_str().as_bytes(),
+                batch_id.as_bytes(),
+            ],
         )
     }
 
@@ -5168,7 +5279,11 @@ impl TiKvTransferStateStoreCore {
     }
 
     fn file_issue_job_prefix(&self, job_id: &str) -> Vec<u8> {
-        compose_key(self.key_prefix.as_slice(), KEY_NS_FILE_ISSUE, &[job_id.as_bytes()])
+        compose_key(
+            self.key_prefix.as_slice(),
+            KEY_NS_FILE_ISSUE,
+            &[job_id.as_bytes()],
+        )
     }
 
     fn file_issue_key(&self, job_id: &str, batch_id: &str, relpath: &str) -> Vec<u8> {
@@ -5238,9 +5353,7 @@ impl TiKvTransferStateStoreCore {
 
 fn compose_key(prefix: &[u8], namespace: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        prefix.len()
-            + namespace.len()
-            + parts.iter().map(|part| part.len() + 1).sum::<usize>(),
+        prefix.len() + namespace.len() + parts.iter().map(|part| part.len() + 1).sum::<usize>(),
     );
     out.extend_from_slice(prefix);
     out.extend_from_slice(namespace);
@@ -5257,8 +5370,8 @@ async fn put_record<T: serde::Serialize>(
     value: &T,
     context: &str,
 ) -> Result<(), String> {
-    let encoded = postcard_to_stdvec(value)
-        .map_err(|e| format!("encode {} failed: {}", context, e))?;
+    let encoded =
+        postcard_to_stdvec(value).map_err(|e| format!("encode {} failed: {}", context, e))?;
     tx.put(key, encoded)
         .await
         .map_err(|e| format!("write {} failed: {}", context, e))
@@ -5579,11 +5692,7 @@ fn build_symlink_collect_infos(
 }
 
 fn transfer_manifest_stats(manifest: &FluxonFsTransferManifestWire) -> (i64, i64, i64) {
-    (
-        1,
-        manifest.entry_count.max(0),
-        manifest.total_bytes.max(0),
-    )
+    (1, manifest.entry_count.max(0), manifest.total_bytes.max(0))
 }
 
 fn validate_equivalent_manifests(
@@ -5621,16 +5730,15 @@ fn validate_equivalent_manifests(
             batch_kind.as_db_str()
         ));
     }
-    for (existing, incoming) in existing_manifest.entries.iter().zip(incoming_manifest.entries.iter()) {
+    for (existing, incoming) in existing_manifest
+        .entries
+        .iter()
+        .zip(incoming_manifest.entries.iter())
+    {
         if existing.relpath != incoming.relpath || existing.size != incoming.size {
             return Err(format!(
                 "equivalent transfer batch entry mismatch: job_id={} batch_id={} existing_relpath={} incoming_relpath={} existing_size={} incoming_size={}",
-                job_id,
-                batch_id,
-                existing.relpath,
-                incoming.relpath,
-                existing.size,
-                incoming.size
+                job_id, batch_id, existing.relpath, incoming.relpath, existing.size, incoming.size
             ));
         }
     }
@@ -5660,9 +5768,7 @@ fn validate_equivalent_manifests(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        transfer_batch_manifest_dispatch_class, transfer_manifest_is_empty_dirs_only,
-    };
+    use super::{transfer_batch_manifest_dispatch_class, transfer_manifest_is_empty_dirs_only};
     use crate::FsTransferReadyBatchClass;
     use fluxon_fs_core::config::{
         FluxonFsTransferBatchCollectInfoWire, FluxonFsTransferCollectInfoKind,

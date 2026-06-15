@@ -31,6 +31,10 @@ import yaml
 from flask import Flask, Response, jsonify, request
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent.parent
+REPO_ROOT_STR = str(REPO_ROOT)
+if REPO_ROOT_STR not in sys.path:
+    sys.path.insert(0, REPO_ROOT_STR)
 
 from fluxon_py._api_ext_chan.mq_config_check import MIN_TTL as MQ_MIN_TTL_SECONDS
 from fluxon_py.api_error import (
@@ -529,16 +533,19 @@ def _gen_kv_config(etcd_ep: str, cluster: str, master_port: int, kv_http_port: i
     shm = str(workdir / "sharemem")
     shared_file_path = str(workdir / "sharefile")
     log_dir = str(workdir / "log" / "master")
+    master_cfg: Dict[str, Any] = {
+        "etcd_endpoints": [etcd_ep],
+        "cluster_name": cluster,
+        "instance_key": "qs_master",
+        "port": master_port,
+        "p2p_listen_port": master_port,
+        "log_dir": log_dir,
+        "monitoring": _monitoring_block(greptime_http_port),
+    }
+    if panel_port:
+        master_cfg["master_ui"] = {"http_listen_addr": f"0.0.0.0:{panel_port}"}
     cfg: Dict[str, Any] = {
-        "master": {
-            "etcd_endpoints": [etcd_ep],
-            "cluster_name": cluster,
-            "instance_key": "qs_master",
-            "port": master_port,
-            "p2p_listen_port": master_port,
-            "log_dir": log_dir,
-            "monitoring": _monitoring_block(greptime_http_port),
-        },
+        "master": master_cfg,
         "kvclient": {
             "instance_key": "qs_kvclient",
             "contribute_to_cluster_pool_size": {"dram": 1073741824, "vram": {}},
@@ -564,10 +571,6 @@ def _gen_kv_config(etcd_ep: str, cluster: str, master_port: int, kv_http_port: i
             },
         },
     }
-    if panel_port:
-        cfg["master"]["master_ui"] = {
-            "http_listen_addr": f"0.0.0.0:{panel_port}",
-        }
     return cfg
 
 
@@ -576,16 +579,19 @@ def _gen_mq_config(etcd_ep: str, cluster: str, master_port: int, greptime_http_p
     shm = str(workdir / "sharemem")
     shared_file_path = str(workdir / "sharefile")
     log_dir = str(workdir / "log" / "master")
+    master_cfg: Dict[str, Any] = {
+        "etcd_endpoints": [etcd_ep],
+        "cluster_name": cluster,
+        "instance_key": "qs_master",
+        "port": master_port,
+        "p2p_listen_port": master_port,
+        "log_dir": log_dir,
+        "monitoring": _monitoring_block(greptime_http_port),
+    }
+    if panel_port:
+        master_cfg["master_ui"] = {"http_listen_addr": f"0.0.0.0:{panel_port}"}
     cfg: Dict[str, Any] = {
-        "master": {
-            "etcd_endpoints": [etcd_ep],
-            "cluster_name": cluster,
-            "instance_key": "qs_master",
-            "port": master_port,
-            "p2p_listen_port": master_port,
-            "log_dir": log_dir,
-            "monitoring": _monitoring_block(greptime_http_port),
-        },
+        "master": master_cfg,
         "kvclient": {
             "instance_key": "qs_kvclient",
             "contribute_to_cluster_pool_size": {"dram": 1073741824, "vram": {}},
@@ -620,10 +626,6 @@ def _gen_mq_config(etcd_ep: str, cluster: str, master_port: int, greptime_http_p
             },
         },
     }
-    if panel_port:
-        cfg["master"]["master_ui"] = {
-            "http_listen_addr": f"0.0.0.0:{panel_port}",
-        }
     return cfg
 
 
@@ -1302,6 +1304,7 @@ def mode_mq(args) -> None:
     etcd_ep = f"127.0.0.1:{args.etcd_client_port}"
     greptime_port = args.greptime_http_port
     cfg = _mq_start_infra(args, workdir, etcd_ep, greptime_port)
+    cfg["quickstart_monitor"] = {"panel_port": args.panel_port}
     _run_mq_shell(cfg, workdir)
 
 
@@ -1341,13 +1344,11 @@ def _run_mq_shell(cfg: Dict[str, Any], workdir: Path) -> None:
 
     logger = init_logger("qs_mq_shell")
     panel_port = 0
-    master_cfg = cfg.get("master")
-    if isinstance(master_cfg, dict):
-        master_ui_cfg = master_cfg.get("master_ui")
-        if isinstance(master_ui_cfg, dict):
-            listen_addr = master_ui_cfg.get("http_listen_addr")
-            if isinstance(listen_addr, str) and ":" in listen_addr:
-                panel_port = int(listen_addr.rsplit(":", 1)[1])
+    quickstart_monitor_cfg = cfg.get("quickstart_monitor")
+    if isinstance(quickstart_monitor_cfg, dict):
+        raw_panel_port = quickstart_monitor_cfg.get("panel_port")
+        if isinstance(raw_panel_port, int):
+            panel_port = raw_panel_port
     demo_cfg = cfg["mpmc_demo"]
     chan_key = str(demo_cfg["key"])
     chan_cfg = {"capacity": int(demo_cfg["capacity"]), "ttl_seconds": int(demo_cfg["ttl_seconds"])}
@@ -1675,48 +1676,6 @@ def _run_fs_interactive(fs_root: Path) -> None:
     finally:
         print("\nBye.")
 
-
-def _release_wheel_paths() -> list[Path]:
-    release_dir = SCRIPT_DIR.parent.parent / "fluxon_release"
-    release_wheels = sorted(release_dir.glob("*.whl"))
-    if release_wheels:
-        return release_wheels
-    return sorted((SCRIPT_DIR / "bin").glob("*.whl"))
-
-
-def _ensure_fluxon_py() -> None:
-    """Install fluxon_py and fluxon_pyo3 if not available. Creates a venv if needed."""
-    try:
-        import fluxon_py  # noqa: F401
-        import fluxon_pyo3  # noqa: F401
-        return
-    except ModuleNotFoundError:
-        pass
-    except ImportError as e:
-        raise SystemExit(f"[quick_start] fluxon runtime import failed: {e}") from e
-
-    venv_dir = SCRIPT_DIR / ".venv"
-    venv_python = venv_dir / "bin" / "python3"
-
-    if not venv_python.exists():
-        print(f"[quick_start] creating venv at {venv_dir} ...")
-        import venv
-        venv.create(str(venv_dir), with_pip=True)
-
-    wheel_paths = _release_wheel_paths()
-    if not wheel_paths:
-        raise SystemExit(
-            "[quick_start] missing release wheels. Build a release first and place wheels under "
-            "fluxon_release/ or examples/fluxon_quick_start/bin/."
-        )
-
-    print("[quick_start] installing release wheels into venv ...")
-    subprocess.check_call([str(venv_python), "-m", "pip", "install", "flask", *[str(path) for path in wheel_paths]])
-
-    print("[quick_start] dependencies installed. Re-launching with venv python...")
-    os.execv(str(venv_python), [str(venv_python)] + sys.argv)
-
-
 # main
 
 def main() -> None:
@@ -1765,8 +1724,6 @@ def main() -> None:
         args.workdir = SCRIPT_DIR / "fluxon_work" / f"qs_{args.mode}"
     args.workdir = args.workdir.resolve()
     args.workdir.mkdir(parents=True, exist_ok=True)
-
-    _ensure_fluxon_py()
 
     print(f"[quick_start] mode={args.mode} workdir={args.workdir}")
 

@@ -564,10 +564,8 @@ pub const FS_MASTER_TRANSFER_SCHEDULER_RESULT_RPC_PATH: &str =
     "/fluxon_fs/v1/master_transfer_scheduler_result";
 pub const FS_AGENT_TRANSFER_SCAN_RPC_PATH: &str = "/fluxon_fs/v1/agent_transfer_scan";
 pub const FS_AGENT_TRANSFER_READ_RPC_PATH: &str = "/fluxon_fs/v1/agent_transfer_read";
-pub const FS_AGENT_TRANSFER_STREAM_OPEN_RPC_PATH: &str =
-    "/fluxon_fs/v1/agent_transfer_stream_open";
-pub const FS_AGENT_TRANSFER_STREAM_NEXT_RPC_PATH: &str =
-    "/fluxon_fs/v1/agent_transfer_stream_next";
+pub const FS_AGENT_TRANSFER_STREAM_OPEN_RPC_PATH: &str = "/fluxon_fs/v1/agent_transfer_stream_open";
+pub const FS_AGENT_TRANSFER_STREAM_NEXT_RPC_PATH: &str = "/fluxon_fs/v1/agent_transfer_stream_next";
 pub const FS_AGENT_TRANSFER_STREAM_CLOSE_RPC_PATH: &str =
     "/fluxon_fs/v1/agent_transfer_stream_close";
 pub const FS_AGENT_TRANSFER_WORKER_RPC_PATH: &str = "/fluxon_fs/v1/agent_transfer_worker";
@@ -883,8 +881,7 @@ impl FluxonFsTransferManifestWire {
 
     pub fn encode_to_blob(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
-        postcard_to_stdvec(self)
-            .map_err(|e| format!("encode transfer manifest blob failed: {}", e))
+        postcard_to_stdvec(self).map_err(|e| format!("encode transfer manifest blob failed: {}", e))
     }
 
     pub fn decode_from_blob(blob: &[u8]) -> Result<Self, String> {
@@ -896,11 +893,11 @@ impl FluxonFsTransferManifestWire {
             Err(primary_err) => {
                 let legacy_manifest = postcard_from_bytes::<FluxonFsTransferManifestWireV1>(blob)
                     .map_err(|legacy_err| {
-                        format!(
-                            "decode transfer manifest blob failed: current={} legacy={}",
-                            primary_err, legacy_err
-                        )
-                    })?;
+                    format!(
+                        "decode transfer manifest blob failed: current={} legacy={}",
+                        primary_err, legacy_err
+                    )
+                })?;
                 if legacy_manifest.version != FLUXON_FS_TRANSFER_MANIFEST_VERSION_V1 {
                     return Err(format!(
                         "unsupported legacy transfer manifest version: {}",
@@ -1140,8 +1137,7 @@ pub fn normalize_transfer_skip_relpath(raw: &str) -> Result<String, String> {
             }
         }
     }
-    safe_relpath(trimmed)
-        .map_err(|e| format!("invalid skip relpath: input={} err={}", raw, e))
+    safe_relpath(trimmed).map_err(|e| format!("invalid skip relpath: input={} err={}", raw, e))
 }
 
 pub fn normalize_transfer_skip_entries(
@@ -1155,19 +1151,17 @@ pub fn normalize_transfer_skip_entries(
         });
     }
     normalized.sort_by(|a, b| {
-        a.relpath
-            .cmp(&b.relpath)
-            .then_with(|| {
-                let ak = match a.kind {
-                    FluxonFsTransferSkipEntryKind::Dir => 0_u8,
-                    FluxonFsTransferSkipEntryKind::File => 1_u8,
-                };
-                let bk = match b.kind {
-                    FluxonFsTransferSkipEntryKind::Dir => 0_u8,
-                    FluxonFsTransferSkipEntryKind::File => 1_u8,
-                };
-                ak.cmp(&bk)
-            })
+        a.relpath.cmp(&b.relpath).then_with(|| {
+            let ak = match a.kind {
+                FluxonFsTransferSkipEntryKind::Dir => 0_u8,
+                FluxonFsTransferSkipEntryKind::File => 1_u8,
+            };
+            let bk = match b.kind {
+                FluxonFsTransferSkipEntryKind::Dir => 0_u8,
+                FluxonFsTransferSkipEntryKind::File => 1_u8,
+            };
+            ak.cmp(&bk)
+        })
     });
     for pair in normalized.windows(2) {
         let prev = &pair[0];
@@ -2510,8 +2504,7 @@ pub fn parse_master_panel_config_from_yaml_text(
         .ok_or_else(|| {
             panel_invalid("fluxon_fs.master_panel.prometheus_base_url must be non-empty string")
         })?;
-    if !(prometheus_base_url.starts_with("http://")
-        || prometheus_base_url.starts_with("https://"))
+    if !(prometheus_base_url.starts_with("http://") || prometheus_base_url.starts_with("https://"))
     {
         return Err(panel_invalid(
             "fluxon_fs.master_panel.prometheus_base_url must include scheme (http(s)://..)",
@@ -2641,9 +2634,9 @@ pub fn parse_master_panel_config_from_yaml_text(
 fn parse_optional_transfer_state_store_config(
     panel_map: &serde_yaml::Mapping,
 ) -> Result<Option<FluxonFsTransferStateStoreConfig>, FluxonFsMasterPanelConfigError> {
-    let Some(transfer_state_store_v) = panel_map
-        .get(&serde_yaml::Value::String("transfer_state_store".to_string()))
-    else {
+    let Some(transfer_state_store_v) = panel_map.get(&serde_yaml::Value::String(
+        "transfer_state_store".to_string(),
+    )) else {
         return Ok(None);
     };
     let transfer_state_store_map = match transfer_state_store_v {
@@ -2674,8 +2667,8 @@ fn parse_bootstrap_access_model_config(
 ) -> Result<FluxonFsAccessModel, FluxonFsMasterPanelConfigError> {
     let raw = panel_map
         .get(&serde_yaml::Value::String(
-        "bootstrap_access_model".to_string(),
-    ))
+            "bootstrap_access_model".to_string(),
+        ))
         .ok_or_else(|| {
             panel_invalid("fluxon_fs.master_panel.bootstrap_access_model is required")
         })?;

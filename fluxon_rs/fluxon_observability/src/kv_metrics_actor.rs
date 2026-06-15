@@ -21,26 +21,25 @@ use crate::keys::{
     PROM_LABEL_STAT, PROM_LABEL_TCP_THREAD_LANE, PROM_METRIC_CONTAINER_MEMORY_LIMIT_BYTES,
     PROM_METRIC_CONTAINER_MEMORY_USAGE_BYTES, PROM_METRIC_FS_IO_OPS_TOTAL,
     PROM_METRIC_FS_MOUNT_FS_TOTAL_BYTES, PROM_METRIC_FS_MOUNT_FS_USED_BYTES,
-    PROM_METRIC_KV_PEER_NETWORK_BYTES_TOTAL, PROM_METRIC_PROCESS_CPU_USAGE_PERCENT,
-    PROM_METRIC_RDMA_PORT_ACTIVE_MTU_BYTES, PROM_METRIC_RDMA_PORT_GID_COUNT,
-    PROM_METRIC_RDMA_PORT_NUMA_NODE, PROM_METRIC_RDMA_PORT_SPEED_GBPS,
-    PROM_METRIC_RDMA_PORT_USABLE, PROM_METRIC_RDMA_PROBE_ERROR, PROM_METRIC_RDMA_PROBE_PORT_COUNT,
-    PROM_METRIC_RDMA_PROBE_USABLE_PORT_COUNT, PROM_METRIC_RDMA_TRANSFER_ENGINE_START_FAILURES,
-    PROM_METRIC_RDMA_TRANSFER_ENGINE_STATE, PROM_METRIC_TCP_THREAD_LATENCY_SAMPLE_COUNT,
-    PROM_METRIC_TCP_THREAD_LATENCY_STAT_US, PROM_METRIC_TCP_THREAD_TRANSPORT_BYTES_TOTAL,
-    PROM_METRIC_TCP_THREAD_TRANSPORT_MESSAGES_TOTAL, PROM_METRIC_P2P_RECV_TRANSPORT_BYTES_TOTAL,
-    PROM_METRIC_P2P_RECV_TRANSPORT_MESSAGES_TOTAL,
-    PROM_METRIC_P2P_RPC_COMPLETION_BYTES_TOTAL,
+    PROM_METRIC_KV_PEER_NETWORK_BYTES_TOTAL, PROM_METRIC_P2P_RECV_TRANSPORT_BYTES_TOTAL,
+    PROM_METRIC_P2P_RECV_TRANSPORT_MESSAGES_TOTAL, PROM_METRIC_P2P_RPC_COMPLETION_BYTES_TOTAL,
     PROM_METRIC_P2P_RPC_COMPLETION_LATENCY_SAMPLE_COUNT,
-    PROM_METRIC_P2P_RPC_COMPLETION_LATENCY_STAT_US,
-    PROM_METRIC_P2P_RPC_COMPLETION_MESSAGES_TOTAL, PROM_METRIC_TOKIO_ALIVE_TASKS,
-    PROM_METRIC_TOKIO_BUSY_PERCENT, PROM_METRIC_TOKIO_GLOBAL_QUEUE_DEPTH,
-    PROM_METRIC_TOKIO_MAX_WORKER_BUSY_PERCENT, PROM_METRIC_TOKIO_NUM_WORKERS,
-    PROM_METRIC_TOKIO_PARK_UNPARK_RATE_HZ, PROM_METRIC_SHM_FILE_ALLOCATED_BYTES,
-    PROM_METRIC_SHM_FILE_SIZE_BYTES, PROM_VALUE_KV_COMPONENT_LOCAL_IPC,
-    PROM_VALUE_KV_COMPONENT_RPC_TRANSPORT, PROM_VALUE_KV_COMPONENT_TRANSFER_ENGINE,
-    PROM_VALUE_P2P_RPC_COMPLETION_METRIC_RESPONSE_SUBMITTED,
+    PROM_METRIC_P2P_RPC_COMPLETION_LATENCY_STAT_US, PROM_METRIC_P2P_RPC_COMPLETION_MESSAGES_TOTAL,
+    PROM_METRIC_PROCESS_CPU_USAGE_PERCENT, PROM_METRIC_RDMA_PORT_ACTIVE_MTU_BYTES,
+    PROM_METRIC_RDMA_PORT_GID_COUNT, PROM_METRIC_RDMA_PORT_NUMA_NODE,
+    PROM_METRIC_RDMA_PORT_SPEED_GBPS, PROM_METRIC_RDMA_PORT_USABLE, PROM_METRIC_RDMA_PROBE_ERROR,
+    PROM_METRIC_RDMA_PROBE_PORT_COUNT, PROM_METRIC_RDMA_PROBE_USABLE_PORT_COUNT,
+    PROM_METRIC_RDMA_TRANSFER_ENGINE_START_FAILURES, PROM_METRIC_RDMA_TRANSFER_ENGINE_STATE,
+    PROM_METRIC_SHM_FILE_ALLOCATED_BYTES, PROM_METRIC_SHM_FILE_SIZE_BYTES,
+    PROM_METRIC_TCP_THREAD_LATENCY_SAMPLE_COUNT, PROM_METRIC_TCP_THREAD_LATENCY_STAT_US,
+    PROM_METRIC_TCP_THREAD_TRANSPORT_BYTES_TOTAL, PROM_METRIC_TCP_THREAD_TRANSPORT_MESSAGES_TOTAL,
+    PROM_METRIC_TOKIO_ALIVE_TASKS, PROM_METRIC_TOKIO_BUSY_PERCENT,
+    PROM_METRIC_TOKIO_GLOBAL_QUEUE_DEPTH, PROM_METRIC_TOKIO_MAX_WORKER_BUSY_PERCENT,
+    PROM_METRIC_TOKIO_NUM_WORKERS, PROM_METRIC_TOKIO_PARK_UNPARK_RATE_HZ,
+    PROM_VALUE_KV_COMPONENT_LOCAL_IPC, PROM_VALUE_KV_COMPONENT_RPC_TRANSPORT,
+    PROM_VALUE_KV_COMPONENT_TRANSFER_ENGINE,
     PROM_VALUE_P2P_RPC_COMPLETION_METRIC_RESPONSE_SUBMIT_FAILED,
+    PROM_VALUE_P2P_RPC_COMPLETION_METRIC_RESPONSE_SUBMITTED,
     PROM_VALUE_P2P_RPC_COMPLETION_METRIC_USER_RPC_REQUEST_FAST_PATH_BYPASS_BACKEND_EPOCH_MISSING,
     PROM_VALUE_P2P_RPC_COMPLETION_METRIC_USER_RPC_REQUEST_FAST_PATH_BYPASS_LANE_NOT_DIRECT,
     PROM_VALUE_P2P_RPC_COMPLETION_METRIC_USER_RPC_REQUEST_FAST_PATH_BYPASS_PEER_NOT_READY,
@@ -457,7 +456,9 @@ impl ObserveP2pRpcCompletionMetricKind {
 
     fn from_label(label: &'static str) -> Option<Self> {
         match label {
-            PROM_VALUE_P2P_RPC_COMPLETION_METRIC_RESPONSE_SUBMITTED => Some(Self::ResponseSubmitted),
+            PROM_VALUE_P2P_RPC_COMPLETION_METRIC_RESPONSE_SUBMITTED => {
+                Some(Self::ResponseSubmitted)
+            }
             PROM_VALUE_P2P_RPC_COMPLETION_METRIC_RESPONSE_SUBMIT_FAILED => {
                 Some(Self::ResponseSubmitFailed)
             }
@@ -1006,7 +1007,10 @@ impl ObserveHandle {
         self.tcp_thread_transport_accumulator
             .dirty
             .store(true, Ordering::Release);
-        if let Err(e) = self.tx.try_send(ObserveOp::FlushTcpThreadTransportAccumulator) {
+        if let Err(e) = self
+            .tx
+            .try_send(ObserveOp::FlushTcpThreadTransportAccumulator)
+        {
             debug!(
                 "observe actor dropped FlushTcpThreadTransportAccumulator hint: {}",
                 e
@@ -1029,7 +1033,10 @@ impl ObserveHandle {
         self.p2p_receive_transport_accumulator
             .dirty
             .store(true, Ordering::Release);
-        if let Err(e) = self.tx.try_send(ObserveOp::FlushP2pReceiveTransportAccumulator) {
+        if let Err(e) = self
+            .tx
+            .try_send(ObserveOp::FlushP2pReceiveTransportAccumulator)
+        {
             debug!(
                 "observe actor dropped FlushP2pReceiveTransportAccumulator hint: {}",
                 e
@@ -1071,7 +1078,10 @@ impl ObserveHandle {
         self.p2p_rpc_completion_accumulator
             .dirty
             .store(true, Ordering::Release);
-        if let Err(e) = self.tx.try_send(ObserveOp::FlushP2pRpcCompletionAccumulator) {
+        if let Err(e) = self
+            .tx
+            .try_send(ObserveOp::FlushP2pRpcCompletionAccumulator)
+        {
             debug!(
                 "observe actor dropped FlushP2pRpcCompletionAccumulator hint: {}",
                 e
@@ -1219,8 +1229,7 @@ impl KvMetricsActorOwned {
             Arc::new(ObserveTcpThreadTransportAccumulator::new());
         let p2p_receive_transport_accumulator =
             Arc::new(ObserveP2pReceiveTransportAccumulator::new());
-        let p2p_rpc_completion_accumulator =
-            Arc::new(ObserveP2pRpcCompletionAccumulator::new());
+        let p2p_rpc_completion_accumulator = Arc::new(ObserveP2pRpcCompletionAccumulator::new());
         let handle = ObserveHandle {
             tx,
             tcp_thread_transport_accumulator: tcp_thread_transport_accumulator.clone(),
@@ -1353,7 +1362,12 @@ impl KvMetricsActorOwned {
                 PROM_METRIC_P2P_RPC_COMPLETION_LATENCY_STAT_US,
                 "Windowed p2p rpc completion latency stats in microseconds",
             ),
-            &[PROM_LABEL_NODE, PROM_LABEL_ROLE, PROM_LABEL_METRIC, PROM_LABEL_STAT],
+            &[
+                PROM_LABEL_NODE,
+                PROM_LABEL_ROLE,
+                PROM_LABEL_METRIC,
+                PROM_LABEL_STAT,
+            ],
         )
         .expect("p2p rpc completion latency stat gauge");
 
@@ -1545,7 +1559,12 @@ impl KvMetricsActorOwned {
                 PROM_METRIC_SHM_FILE_SIZE_BYTES,
                 "Logical file size in bytes for files under the shared memory root",
             ),
-            &[PROM_LABEL_NODE, PROM_LABEL_ROLE, "shm_dir_abs", "file_path_abs"],
+            &[
+                PROM_LABEL_NODE,
+                PROM_LABEL_ROLE,
+                "shm_dir_abs",
+                "file_path_abs",
+            ],
         )
         .expect("shm file size bytes gauge");
 
@@ -1554,7 +1573,12 @@ impl KvMetricsActorOwned {
                 PROM_METRIC_SHM_FILE_ALLOCATED_BYTES,
                 "Allocated bytes (st_blocks * 512) for files under the shared memory root",
             ),
-            &[PROM_LABEL_NODE, PROM_LABEL_ROLE, "shm_dir_abs", "file_path_abs"],
+            &[
+                PROM_LABEL_NODE,
+                PROM_LABEL_ROLE,
+                "shm_dir_abs",
+                "file_path_abs",
+            ],
         )
         .expect("shm file allocated bytes gauge");
 
@@ -2744,11 +2768,13 @@ impl KvMetricsActorOwned {
         }
         let mut out = summaries
             .into_iter()
-            .map(|(metric, (bytes, messages))| P2pRpcCompletionCounterWindowSummary {
-                metric,
-                bytes,
-                messages,
-            })
+            .map(
+                |(metric, (bytes, messages))| P2pRpcCompletionCounterWindowSummary {
+                    metric,
+                    bytes,
+                    messages,
+                },
+            )
             .collect::<Vec<_>>();
         out.sort_unstable_by(|lhs, rhs| lhs.metric.cmp(rhs.metric));
         out
@@ -3218,9 +3244,10 @@ fn read_cgroup_v1_memory_sample(
         Some(v) => v,
         None => return Ok(None),
     };
-    let mount = match mountinfo.iter().find(|m| {
-        m.fs_type == "cgroup" && m.super_options.iter().any(|opt| opt == "memory")
-    }) {
+    let mount = match mountinfo
+        .iter()
+        .find(|m| m.fs_type == "cgroup" && m.super_options.iter().any(|opt| opt == "memory"))
+    {
         Some(v) => v,
         None => return Ok(None),
     };

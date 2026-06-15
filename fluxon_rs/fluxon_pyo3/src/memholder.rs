@@ -33,7 +33,9 @@ impl MemHolder {
             }
 
             let data_owner = match &holder.holder {
-                MemHolderInner::Seg(seg_holder) => FlatDictDataOwner::UserMemHolder(seg_holder.clone()),
+                MemHolderInner::Seg(seg_holder) => {
+                    FlatDictDataOwner::UserMemHolder(seg_holder.clone())
+                }
                 MemHolderInner::Owned(bytes) => FlatDictDataOwner::OwnedBytes(bytes.clone()),
             };
             match decode_flat_dict_to_wrapped_py_object(py, data_owner) {

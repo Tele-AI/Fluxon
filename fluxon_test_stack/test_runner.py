@@ -6991,10 +6991,10 @@ def _parse_artifact_set(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
     release_artifacts = _require_dict(item.get("release_artifacts"), f"{ctx}.release_artifacts")
     _forbid_unknown_keys(
         release_artifacts,
-        {"python_wheel", "pyo3_wheel"},
+        {"wheel"},
         f"{ctx}.release_artifacts",
     )
-    for field_name in ("python_wheel", "pyo3_wheel"):
+    for field_name in ("wheel",):
         _ = _require_str(release_artifacts.get(field_name), f"{ctx}.release_artifacts.{field_name}")
     test_rsc_source = _require_dict(item.get("test_rsc_source"), f"{ctx}.test_rsc_source")
     _parse_artifact_source(test_rsc_source, f"{ctx}.test_rsc_source")
@@ -12541,11 +12541,9 @@ def _prepare_test_stack_runtime(
         ctx="TEST_STACK source release",
     )
     release_artifacts = _artifact_set_release_artifacts(resolved_case)
-    wheel_py_name = release_artifacts["python_wheel"]
-    wheel_pyo3_name = release_artifacts["pyo3_wheel"]
-    for name in (wheel_py_name, wheel_pyo3_name):
-        if name not in manifest:
-            raise ValueError(f"TEST_STACK source release manifest missing artifact declared by artifact_set: {name}")
+    wheel_name = release_artifacts["wheel"]
+    if wheel_name not in manifest:
+        raise ValueError(f"TEST_STACK source release manifest missing artifact declared by artifact_set: {wheel_name}")
 
     profile = _require_dict(resolved_case.get("profile"), "resolved_case.profile")
     profile_ts = _require_dict(profile.get("test_stack"), "resolved_case.profile.test_stack")
@@ -12567,12 +12565,9 @@ def _prepare_test_stack_runtime(
     if not test_stack_src.exists() or not test_stack_src.is_dir():
         raise ValueError(f"missing fluxon_test_stack source directory: {test_stack_src}")
 
-    wheel_py_src = (release_root / wheel_py_name).resolve()
-    wheel_pyo3_src = (release_root / wheel_pyo3_name).resolve()
-    if not wheel_py_src.exists():
-        raise ValueError(f"missing TEST_STACK wheel artifact: {wheel_py_src}")
-    if not wheel_pyo3_src.exists():
-        raise ValueError(f"missing TEST_STACK wheel artifact: {wheel_pyo3_src}")
+    wheel_src = (release_root / wheel_name).resolve()
+    if not wheel_src.exists():
+        raise ValueError(f"missing TEST_STACK wheel artifact: {wheel_src}")
     wheelhouse_root_src = _test_stack_runtime_wheelhouse_root(
         test_rsc_root=test_rsc_root,
         python_abi=_TEST_STACK_DEFAULT_PYTHON_ABI,
@@ -12622,10 +12617,8 @@ def _prepare_test_stack_runtime(
             dirs_exist_ok=False,
             ignore=shutil.ignore_patterns(*_TEST_STACK_RUNTIME_SOURCE_IGNORE_NAMES),
         )
-        wheel_py_dest = (wheels_root / wheel_py_src.name).resolve()
-        wheel_pyo3_dest = (wheels_root / wheel_pyo3_src.name).resolve()
-        shutil.copy2(wheel_py_src, wheel_py_dest)
-        shutil.copy2(wheel_pyo3_src, wheel_pyo3_dest)
+        wheel_dest = (wheels_root / wheel_src.name).resolve()
+        shutil.copy2(wheel_src, wheel_dest)
         if mooncake_wheel_src is not None:
             mooncake_wheel_dest = (wheels_root / mooncake_wheel_src.name).resolve()
             shutil.copy2(mooncake_wheel_src, mooncake_wheel_dest)
@@ -12699,12 +12692,9 @@ def _prepare_test_stack_runtime(
             backend_root.mkdir(parents=True, exist_ok=False)
         elif not backend_root.is_dir():
             raise ValueError(f"TEST_STACK runtime backend root must be a directory: {backend_root}")
-        wheel_py_dest = (wheels_root / wheel_py_src.name).resolve()
-        wheel_pyo3_dest = (wheels_root / wheel_pyo3_src.name).resolve()
-        if not wheel_py_dest.exists():
-            raise ValueError(f"TEST_STACK runtime missing wheel_py: {wheel_py_dest}")
-        if not wheel_pyo3_dest.exists():
-            raise ValueError(f"TEST_STACK runtime missing wheel_pyo3: {wheel_pyo3_dest}")
+        wheel_dest = (wheels_root / wheel_src.name).resolve()
+        if not wheel_dest.exists():
+            raise ValueError(f"TEST_STACK runtime missing wheel: {wheel_dest}")
         if mooncake_wheel_src is not None:
             mooncake_wheel_dest = (wheels_root / mooncake_wheel_src.name).resolve()
             if not mooncake_wheel_dest.exists():
@@ -13015,21 +13005,15 @@ def _test_stack_target_host_venv_python(
     return _test_stack_host_venv_python_path(hostworkdir=hostworkdir, python_abi=python_abi)
 
 
-def _test_stack_runtime_wheel_paths(*, run_dir: Path) -> Tuple[Path, Path]:
+def _test_stack_runtime_wheel_paths(*, run_dir: Path) -> Tuple[Path]:
     wheels_root = (run_dir / _TEST_STACK_RUNTIME_DIRNAME / _TEST_STACK_RUNTIME_WHEEL_DIRNAME).resolve()
-    pure_python_wheels = sorted(
-        path for path in wheels_root.glob("fluxon-*.whl") if "pyo3" not in path.name
-    )
-    if len(pure_python_wheels) != 1:
+    wheel_candidates = sorted(path for path in wheels_root.glob("fluxon-*.whl") if path.is_file())
+    if len(wheel_candidates) != 1:
         raise ValueError(
-            "TEST_STACK runtime must contain exactly one pure-python Fluxon wheel: "
-            f"wheels_root={wheels_root} matches={[path.name for path in pure_python_wheels]}"
+            "TEST_STACK runtime must contain exactly one Fluxon wheel: "
+            f"wheels_root={wheels_root} matches={[path.name for path in wheel_candidates]}"
         )
-    pyo3_candidates = sorted(wheels_root.glob("fluxon_pyo3-*.whl"))
-    if not pyo3_candidates:
-        raise ValueError(f"TEST_STACK runtime is missing a fluxon_pyo3 wheel: wheels_root={wheels_root}")
-    preferred_pyo3 = [path for path in pyo3_candidates if "manylinux" in path.name]
-    return pure_python_wheels[0], (preferred_pyo3[0] if preferred_pyo3 else pyo3_candidates[0])
+    return (wheel_candidates[0],)
 
 
 def _test_stack_normalize_python_abi(raw_python_abi: str) -> str:
@@ -13140,7 +13124,7 @@ def _test_stack_runtime_env_prepare_command(
     run_dir: Path,
     offline_dependency_requirements: Tuple[str, ...],
 ) -> str:
-    wheel_py, wheel_pyo3 = _test_stack_runtime_wheel_paths(run_dir=run_dir)
+    (wheel,) = _test_stack_runtime_wheel_paths(run_dir=run_dir)
     mooncake_wheel = _test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir)
     wheelhouse_root = (
         run_dir
@@ -13160,9 +13144,7 @@ def _test_stack_runtime_env_prepare_command(
     )
     python_bin_name = "python" + required_python_abi.removeprefix("cpython")
     venv_root = venv_python.parent.parent
-    expected_sha256_inputs = (
-        _shell_quote(str(wheel_py)) + " " + _shell_quote(str(wheel_pyo3))
-    )
+    expected_sha256_inputs = _shell_quote(str(wheel))
     mooncake_install_suffix = ""
     if mooncake_wheel is not None:
         expected_sha256_inputs += " " + _shell_quote(str(mooncake_wheel))
@@ -13257,9 +13239,7 @@ def _test_stack_runtime_env_prepare_command(
         + "  "
         + _shell_quote(str(venv_python))
         + " -m pip install --force-reinstall --no-deps "
-        + _shell_quote(str(wheel_py))
-        + " "
-        + _shell_quote(str(wheel_pyo3))
+        + _shell_quote(str(wheel))
         + mooncake_install_suffix
         + "\n"
         + "  printf '%s\\n' \"$expected_wheel_pair_sha256\" > "
@@ -13464,7 +13444,7 @@ def _artifact_set_release_artifacts(resolved_case: Dict[str, Any]) -> Dict[str, 
             release_artifacts.get(field_name),
             f"resolved_case.artifact_set.release_artifacts.{field_name}",
         )
-        for field_name in ("python_wheel", "pyo3_wheel")
+        for field_name in ("wheel",)
     }
 
 
@@ -14085,8 +14065,7 @@ def _ci_prepare_run_inputs(
         raise ValueError(f"materialized release manifest is missing: {manifest_path}")
     manifest = _parse_sha256_manifest(manifest_path.read_text(encoding="utf-8", errors="replace"))
     release_artifacts = _artifact_set_release_artifacts(resolved_case)
-    wheel_py_name = release_artifacts["python_wheel"]
-    wheel_pyo3_name = release_artifacts["pyo3_wheel"]
+    wheel_name = release_artifacts["wheel"]
     test_rsc_manifest_path = test_rsc_root / _TEST_RSC_MANIFEST_FILENAME
     if not test_rsc_manifest_path.exists():
         raise ValueError(f"materialized test_rsc manifest is missing: {test_rsc_manifest_path}")
@@ -14094,23 +14073,21 @@ def _ci_prepare_run_inputs(
     test_rsc_artifacts = _artifact_set_test_rsc_artifacts(resolved_case)
     ci_src_archive = test_rsc_artifacts["ci_src_archive"]
 
-    for name in (wheel_py_name, wheel_pyo3_name):
-        if name not in manifest:
-            raise ValueError(f"missing required release artifact in sha256 manifest: {name}")
+    if wheel_name not in manifest:
+        raise ValueError(f"missing required release artifact in sha256 manifest: {wheel_name}")
 
     if ci_src_archive not in test_rsc_manifest:
         raise ValueError(f"missing required test_rsc artifact in sha256 manifest: {ci_src_archive}")
 
-    for name in (wheel_py_name, wheel_pyo3_name):
-        out_path = release_root / name
-        if not out_path.exists():
-            raise ValueError(f"materialized release artifact is missing: {out_path}")
-        got_sha256 = _sha256_file(out_path)
-        if got_sha256 != manifest[name]:
-            raise ValueError(
-                f"materialized release artifact sha256 mismatch: file={out_path} "
-                f"expected={manifest[name]} got={got_sha256}"
-            )
+    out_path = release_root / wheel_name
+    if not out_path.exists():
+        raise ValueError(f"materialized release artifact is missing: {out_path}")
+    got_sha256 = _sha256_file(out_path)
+    if got_sha256 != manifest[wheel_name]:
+        raise ValueError(
+            f"materialized release artifact sha256 mismatch: file={out_path} "
+            f"expected={manifest[wheel_name]} got={got_sha256}"
+        )
 
     ci_src_archive_path = test_rsc_root / ci_src_archive
     if not ci_src_archive_path.exists():
@@ -14139,8 +14116,7 @@ def _ci_prepare_run_inputs(
         raise ValueError(f"src runtime test_rsc path already exists (no overwrite): {test_rsc_link_path}")
     os.symlink(str(test_rsc_root), str(test_rsc_link_path), target_is_directory=True)
 
-    wheel_py = release_root / wheel_py_name
-    wheel_pyo3 = release_root / wheel_pyo3_name
+    wheel = release_root / wheel_name
     _run_subprocess(
         [
             str(venv_python),
@@ -14148,8 +14124,7 @@ def _ci_prepare_run_inputs(
             "pip",
             "install",
             "--force-reinstall",
-            str(wheel_py),
-            str(wheel_pyo3),
+            str(wheel),
         ],
         cwd=str(src_root),
     )

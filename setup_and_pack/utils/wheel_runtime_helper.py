@@ -3,8 +3,8 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
-import subprocess
 import shutil
+import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
@@ -176,6 +176,86 @@ def add_plugins(wheel_path: str, plugins_dir: str, bundle_name: str) -> None:
         create_wheel(wheel_path, str(temp_dir))
 
 
+def merge_binary_wheel(
+    *,
+    output_wheel_path: str,
+    pure_python_wheel_path: str,
+    runtime_wheel_path: str,
+    runtime_package_name: str = "fluxon_pyo3",
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="fluxon_wheel_merge_") as temp_dir_str:
+        temp_dir = Path(temp_dir_str)
+        with zipfile.ZipFile(pure_python_wheel_path, "r") as zip_ref:
+            zip_ref.extractall(temp_dir)
+
+        runtime_root = Path(extract_wheel(runtime_wheel_path))
+        try:
+            runtime_pkg_dir = runtime_root / runtime_package_name
+            if not runtime_pkg_dir.is_dir():
+                raise RuntimeError(f"missing runtime package dir in wheel: {runtime_pkg_dir}")
+            shutil.copytree(runtime_pkg_dir, temp_dir / runtime_package_name, dirs_exist_ok=True)
+
+            runtime_libs_dir = runtime_root / f"{runtime_package_name}.libs"
+            if runtime_libs_dir.is_dir():
+                shutil.copytree(runtime_libs_dir, temp_dir / f"{runtime_package_name}.libs", dirs_exist_ok=True)
+
+            pure_dist_info = _wheel_dist_info_dir(temp_dir)
+            runtime_dist_info = _wheel_dist_info_dir(runtime_root)
+            runtime_wheel_text = _read_wheel_file(runtime_dist_info / "WHEEL")
+            pure_wheel_path = pure_dist_info / "WHEEL"
+            pure_wheel_path.write_text(
+                _merge_wheel_file_text(
+                    pure_wheel_path.read_text(encoding="utf-8"),
+                    runtime_wheel_text,
+                ),
+                encoding="utf-8",
+            )
+            create_wheel(output_wheel_path, str(temp_dir))
+        finally:
+            shutil.rmtree(runtime_root)
+
+
+def _wheel_dist_info_dir(source_root: Path) -> Path:
+    dist_info_dirs = sorted(path for path in source_root.glob("*.dist-info") if path.is_dir())
+    if not dist_info_dirs:
+        raise RuntimeError(f"expected exactly one dist-info directory, found none in {source_root}")
+    if len(dist_info_dirs) != 1:
+        raise RuntimeError(f"expected exactly one dist-info directory, found {len(dist_info_dirs)} in {source_root}")
+    return dist_info_dirs[0]
+
+
+def _read_wheel_file(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _merge_wheel_file_text(pure_wheel_text: str, runtime_wheel_text: str) -> str:
+    pure_lines = pure_wheel_text.splitlines()
+    runtime_lines = runtime_wheel_text.splitlines()
+    tag_lines = [line for line in runtime_lines if line.startswith("Tag: ")]
+    if not tag_lines:
+        raise RuntimeError("runtime wheel WHEEL file missing Tag lines")
+
+    out_lines: list[str] = []
+    seen_root_line = False
+    seen_tag_line = False
+    for line in pure_lines:
+        if line.startswith("Root-Is-Purelib:"):
+            out_lines.append("Root-Is-Purelib: false")
+            seen_root_line = True
+            continue
+        if line.startswith("Tag: "):
+            if not seen_tag_line:
+                out_lines.extend(tag_lines)
+                seen_tag_line = True
+            continue
+        out_lines.append(line)
+    if not seen_root_line:
+        out_lines.append("Root-Is-Purelib: false")
+    if not seen_tag_line:
+        out_lines.extend(tag_lines)
+    return "\n".join(out_lines) + "\n"
+
+
 __all__ = [
     "extract_wheel",
     "create_wheel",
@@ -184,4 +264,5 @@ __all__ = [
     "add_shared_libraries",
     "install_shared_libraries",
     "add_plugins",
+    "merge_binary_wheel",
 ]

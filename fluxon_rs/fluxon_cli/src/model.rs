@@ -1328,8 +1328,7 @@ pub fn pills_for_node_resource(n: &NodeSnapshot) -> Vec<UiPill> {
     let (mem_used, mem_used_status) = fmt_bytes_auto(n.node_memory_usage_bytes, false);
     let (mem_total, mem_total_status) = fmt_bytes_auto(n.node_memory_total_bytes, false);
     let (ct_mem_used, ct_mem_used_status) = fmt_bytes_auto(n.container_memory_usage_bytes, false);
-    let (ct_mem_limit, ct_mem_limit_status) =
-        fmt_bytes_auto(n.container_memory_limit_bytes, false);
+    let (ct_mem_limit, ct_mem_limit_status) = fmt_bytes_auto(n.container_memory_limit_bytes, false);
     vec![
         UiPill {
             label: "cpu",

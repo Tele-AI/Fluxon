@@ -92,6 +92,7 @@ fluxon_commu = { package = "fluxon_commu", path = "../fluxon_commu", default-fea
 fluxon_framework = { path = "../fluxon_framework" }
 fluxon_framework_compiled = { path = "../fluxon_framework_compiled" }
 limit_thirdparty = { path = "../limit_thirdparty" }
+fluxon_cli = { path = "../fluxon_cli" }
 fluxon_util = { path = "../fluxon_util" }
 fluxon_observability = { path = "../fluxon_observability" }
 [build-dependencies]

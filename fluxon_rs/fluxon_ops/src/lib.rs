@@ -1228,7 +1228,9 @@ print(child.pid)
     }
 }
 
-fn parse_selection_supervisor_state_json(raw_state_json: &str) -> anyhow::Result<SelectionSupervisorLaunchState> {
+fn parse_selection_supervisor_state_json(
+    raw_state_json: &str,
+) -> anyhow::Result<SelectionSupervisorLaunchState> {
     serde_json::from_str::<SelectionSupervisorLaunchState>(raw_state_json)
         .context("decode running selection supervisor state-json")
 }
@@ -1252,10 +1254,8 @@ fn read_process_info_observation(pid: u32) -> anyhow::Result<Option<ProcessInfoO
             if e.kind() == std::io::ErrorKind::NotFound {
                 return Ok(None);
             }
-            return Err(
-                anyhow::Error::new(e)
-                    .context(format!("read process stat failed: {}", stat_path.display())),
-            );
+            return Err(anyhow::Error::new(e)
+                .context(format!("read process stat failed: {}", stat_path.display())));
         }
     };
     let rparen = raw
@@ -1281,8 +1281,12 @@ fn read_process_info_observation(pid: u32) -> anyhow::Result<Option<ProcessInfoO
         .ok_or_else(|| anyhow::anyhow!("unexpected /proc/<pid>/stat format: missing state"))?;
     Ok(Some(ProcessInfoObservation {
         pid: pid_from_head,
-        ppid: fields[1].parse::<u32>().context("parse /proc/<pid>/stat ppid")?,
-        pgid: fields[2].parse::<u32>().context("parse /proc/<pid>/stat pgid")?,
+        ppid: fields[1]
+            .parse::<u32>()
+            .context("parse /proc/<pid>/stat ppid")?,
+        pgid: fields[2]
+            .parse::<u32>()
+            .context("parse /proc/<pid>/stat pgid")?,
         state,
         start_time_ticks: fields[19]
             .parse::<u64>()
@@ -1298,10 +1302,10 @@ fn read_process_cmdline(pid: u32) -> anyhow::Result<Option<Vec<String>>> {
             if e.kind() == std::io::ErrorKind::NotFound {
                 return Ok(None);
             }
-            return Err(
-                anyhow::Error::new(e)
-                    .context(format!("read process cmdline failed: {}", cmdline_path.display())),
-            );
+            return Err(anyhow::Error::new(e).context(format!(
+                "read process cmdline failed: {}",
+                cmdline_path.display()
+            )));
         }
     };
     if raw.is_empty() {
@@ -1362,7 +1366,10 @@ fn selection_supervisor_proc_snapshot() -> anyhow::Result<SelectionSupervisorPro
             zombie_infos.push(info);
             continue;
         }
-        children_by_ppid.entry(info.ppid).or_default().push(info.pid);
+        children_by_ppid
+            .entry(info.ppid)
+            .or_default()
+            .push(info.pid);
         infos_by_pid.insert(info.pid, info);
         if let Some(args) = read_process_cmdline(pid)? {
             cmdlines.push((pid, args));
@@ -1400,9 +1407,13 @@ fn live_selection_supervisors(
             }
         }
         let strict_match = label_filter.is_some();
-        let Some(owner_ts_ms_raw) = selection_supervisor_cmd_arg_value(args.as_slice(), "--owner-ts-ms") else {
+        let Some(owner_ts_ms_raw) =
+            selection_supervisor_cmd_arg_value(args.as_slice(), "--owner-ts-ms")
+        else {
             if strict_match {
-                anyhow::bail!("running selection supervisor is missing --owner-ts-ms pid={pid} label={label}");
+                anyhow::bail!(
+                    "running selection supervisor is missing --owner-ts-ms pid={pid} label={label}"
+                );
             }
             continue;
         };
@@ -1417,7 +1428,10 @@ fn live_selection_supervisors(
                 continue;
             }
         };
-        let runtime_state = match selection_supervisor_cmd_arg_value(args.as_slice(), "--state-json") {
+        let runtime_state = match selection_supervisor_cmd_arg_value(
+            args.as_slice(),
+            "--state-json",
+        ) {
             Some(raw) => match parse_selection_supervisor_state_json(raw) {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -1445,16 +1459,16 @@ fn selection_supervisor_sort_key(supervisor: &LiveSelectionSupervisor) -> u64 {
     supervisor.owner_ts_ms
 }
 
-fn workload_identity_from_selection_label(
-    label: &str,
-) -> anyhow::Result<(WorkloadKind, String)> {
-    let (raw_kind, raw_name) = label
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("selection supervisor label must be Kind/name: label={label}"))?;
+fn workload_identity_from_selection_label(label: &str) -> anyhow::Result<(WorkloadKind, String)> {
+    let (raw_kind, raw_name) = label.split_once('/').ok_or_else(|| {
+        anyhow::anyhow!("selection supervisor label must be Kind/name: label={label}")
+    })?;
     let kind = match raw_kind {
         "Deployment" => WorkloadKind::Deployment,
         "DaemonSet" => WorkloadKind::DaemonSet,
-        other => anyhow::bail!("selection supervisor label has unsupported kind: label={label} kind={other}"),
+        other => anyhow::bail!(
+            "selection supervisor label has unsupported kind: label={label} kind={other}"
+        ),
     };
     let name = validate_workload_name_for_file(raw_name)?;
     Ok((kind, name))
@@ -1484,7 +1498,13 @@ fn selection_owner_supervisor(
     if matching.len() > 1 {
         let pid_list = matching
             .iter()
-            .map(|supervisor| format!("pid={} runtime_state={}", supervisor.pid(), supervisor.runtime_state.is_some()))
+            .map(|supervisor| {
+                format!(
+                    "pid={} runtime_state={}",
+                    supervisor.pid(),
+                    supervisor.runtime_state.is_some()
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         anyhow::bail!(
@@ -1494,7 +1514,9 @@ fn selection_owner_supervisor(
             pid_list
         );
     }
-    Ok(owners.into_iter().find(|supervisor| supervisor.owner_ts_ms == owner_ts_ms))
+    Ok(owners
+        .into_iter()
+        .find(|supervisor| supervisor.owner_ts_ms == owner_ts_ms))
 }
 
 fn pid_tree_members(snapshot: &SelectionSupervisorProcSnapshot, root_pid: u32) -> Vec<u32> {
@@ -1589,7 +1611,11 @@ fn selection_status_from_live_supervisor(
     let child_process_count = process_count.saturating_sub(1);
     let runtime_state = supervisor.runtime_state.clone();
     let container_orphan_zombie_pids = container_orphan_zombie_pids(snapshot);
-    let status_hint = selection_status_hint(true, child_process_count > 0, container_orphan_zombie_pids.as_slice());
+    let status_hint = selection_status_hint(
+        true,
+        child_process_count > 0,
+        container_orphan_zombie_pids.as_slice(),
+    );
     SelectionSupervisorStatus {
         label: supervisor.label.clone(),
         pid: Some(supervisor.pid()),
@@ -1626,7 +1652,8 @@ fn observe_selection_status(
     let owner = selection_owner_supervisor(&snapshot, label.as_str(), None)?;
     let Some(owner) = owner else {
         let container_orphan_zombie_pids = container_orphan_zombie_pids(&snapshot);
-        let status_hint = selection_status_hint(false, false, container_orphan_zombie_pids.as_slice());
+        let status_hint =
+            selection_status_hint(false, false, container_orphan_zombie_pids.as_slice());
         return Ok(SelectionSupervisorStatus {
             label,
             pid: None,
@@ -1656,7 +1683,8 @@ fn observe_selection_status(
         .as_ref()
         .map(|v| v.name.clone())
         .unwrap_or_else(|| name.to_string());
-    let mut status = selection_status_from_live_supervisor(&snapshot, &owner, resolved_kind, resolved_name);
+    let mut status =
+        selection_status_from_live_supervisor(&snapshot, &owner, resolved_kind, resolved_name);
     status.label = label;
     if status.authority.is_none() {
         status.authority = Some(authority);
@@ -1682,7 +1710,9 @@ fn observe_all_selection_statuses_for_snapshot(
                     supervisor.pid()
                 );
             }
-            Some(current) => selection_supervisor_sort_key(current) < selection_supervisor_sort_key(&supervisor),
+            Some(current) => {
+                selection_supervisor_sort_key(current) < selection_supervisor_sort_key(&supervisor)
+            }
             None => true,
         };
         if replace {
@@ -1695,12 +1725,7 @@ fn observe_all_selection_statuses_for_snapshot(
             Some(v) => (v.kind, v.name.clone()),
             None => workload_identity_from_selection_label(&supervisor.label)?,
         };
-        let mut status = selection_status_from_live_supervisor(
-            snapshot,
-            &supervisor,
-            kind,
-            name,
-        );
+        let mut status = selection_status_from_live_supervisor(snapshot, &supervisor, kind, name);
         if status.authority.is_none() {
             let (_, authority) = workload_identity_from_selection_label(&supervisor.label)?;
             status.authority = Some(authority);
@@ -1768,13 +1793,20 @@ fn observe_apply_runtime_statuses_for_snapshot(
     Ok(out)
 }
 
-fn observe_apply_runtime_statuses(apply_id: &str) -> anyhow::Result<Vec<SelectionSupervisorStatus>> {
+fn observe_apply_runtime_statuses(
+    apply_id: &str,
+) -> anyhow::Result<Vec<SelectionSupervisorStatus>> {
     let snapshot = selection_supervisor_proc_snapshot()?;
     observe_apply_runtime_statuses_for_snapshot(apply_id, &snapshot)
 }
 
-fn wait_for_selection_present(kind: WorkloadKind, name: &str, authority: &str) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(OPS_SELECTION_SUPERVISOR_WAIT_PRESENT_TIMEOUT_SECONDS);
+fn wait_for_selection_present(
+    kind: WorkloadKind,
+    name: &str,
+    authority: &str,
+) -> anyhow::Result<()> {
+    let deadline =
+        Instant::now() + Duration::from_secs(OPS_SELECTION_SUPERVISOR_WAIT_PRESENT_TIMEOUT_SECONDS);
     let mut stable_started_at: Option<Instant> = None;
     while Instant::now() < deadline {
         let status = observe_selection_status(kind, name, authority)?;
@@ -1809,7 +1841,8 @@ fn wait_for_selection_attached(
     argv: &[String],
     cwd: Option<&str>,
 ) -> anyhow::Result<SelectionSupervisorStatus> {
-    let deadline = Instant::now() + Duration::from_secs(OPS_SELECTION_SUPERVISOR_WAIT_PRESENT_TIMEOUT_SECONDS);
+    let deadline =
+        Instant::now() + Duration::from_secs(OPS_SELECTION_SUPERVISOR_WAIT_PRESENT_TIMEOUT_SECONDS);
     while Instant::now() < deadline {
         let status = observe_selection_status(kind, name, authority)?;
         if selection_status_matches_attached(&status, apply_id, owner_ts_ms, argv, cwd) {
@@ -1834,7 +1867,8 @@ fn wait_for_selection_attached_without_present(
     argv: &[String],
     cwd: Option<&str>,
 ) -> anyhow::Result<SelectionSupervisorStatus> {
-    let deadline = Instant::now() + Duration::from_secs(OPS_SELECTION_SUPERVISOR_WAIT_PRESENT_TIMEOUT_SECONDS);
+    let deadline =
+        Instant::now() + Duration::from_secs(OPS_SELECTION_SUPERVISOR_WAIT_PRESENT_TIMEOUT_SECONDS);
     while Instant::now() < deadline {
         let status = observe_selection_status(kind, name, authority)?;
         if selection_status_matches_attached(&status, apply_id, owner_ts_ms, argv, cwd)
@@ -1862,18 +1896,19 @@ fn wait_for_selection_absent(
     while Instant::now() < deadline {
         let snapshot = selection_supervisor_proc_snapshot()?;
         let label = selection_supervisor_label_from_workload_name(kind, name)?;
-        let remaining: Vec<LiveSelectionSupervisor> = live_selection_supervisors(&snapshot, Some(label.as_str()))?
-            .into_iter()
-            .filter(|supervisor| match require_apply_id {
-                Some(apply_id) => supervisor
-                    .runtime_state
-                    .as_ref()
-                    .and_then(|v| v.apply_id.as_deref())
-                    .map(|running_apply_id| running_apply_id == apply_id)
-                    .unwrap_or(false),
-                None => true,
-            })
-            .collect();
+        let remaining: Vec<LiveSelectionSupervisor> =
+            live_selection_supervisors(&snapshot, Some(label.as_str()))?
+                .into_iter()
+                .filter(|supervisor| match require_apply_id {
+                    Some(apply_id) => supervisor
+                        .runtime_state
+                        .as_ref()
+                        .and_then(|v| v.apply_id.as_deref())
+                        .map(|running_apply_id| running_apply_id == apply_id)
+                        .unwrap_or(false),
+                    None => true,
+                })
+                .collect();
         if remaining.is_empty() {
             return Ok(());
         }
@@ -1888,7 +1923,8 @@ fn wait_for_selection_absent(
 }
 
 fn wait_for_process_identity_absent(pid: u32, start_time_ticks: u64) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(OPS_SELECTION_SUPERVISOR_WAIT_PRESENT_TIMEOUT_SECONDS);
+    let deadline =
+        Instant::now() + Duration::from_secs(OPS_SELECTION_SUPERVISOR_WAIT_PRESENT_TIMEOUT_SECONDS);
     while Instant::now() < deadline {
         match read_process_info_observation(pid)? {
             None => return Ok(()),
@@ -2283,9 +2319,7 @@ impl SupervisorBackedWorkloads {
         //   kill itself and break monotonic reconcile/apply_wait convergence.
         eprintln!(
             "[ops_agent:start] wait attached label={} apply_id={} detached_pid={}",
-            label,
-            apply_id,
-            detached_pid
+            label, apply_id, detached_pid
         );
         let attached_status = match wait_for_selection_attached(
             kind,
@@ -2485,10 +2519,7 @@ impl SupervisorBackedWorkloads {
             out.push(WorkloadStatusSummary {
                 kind,
                 name: name.clone(),
-                authority: status
-                    .authority
-                    .clone()
-                    .unwrap_or_else(|| name.clone()),
+                authority: status.authority.clone().unwrap_or_else(|| name.clone()),
                 running: status.running,
                 present: Some(status.present),
                 apply_id: status.apply_id,
@@ -2521,10 +2552,7 @@ impl SupervisorBackedWorkloads {
             out.push(WorkloadStatusSummary {
                 kind,
                 name: name.clone(),
-                authority: status
-                    .authority
-                    .clone()
-                    .unwrap_or_else(|| name.clone()),
+                authority: status.authority.clone().unwrap_or_else(|| name.clone()),
                 running: status.running,
                 present: Some(status.present),
                 apply_id: status.apply_id,
@@ -2648,9 +2676,11 @@ impl UserRpcHandler for StatusHandler {
             }));
         }
 
-        let resp = self
-            .workloads
-            .get_status(&WorkloadId::new(req.kind, name.to_string(), authority.to_string()));
+        let resp = self.workloads.get_status(&WorkloadId::new(
+            req.kind,
+            name.to_string(),
+            authority.to_string(),
+        ));
         Ok(serde_json::to_vec(&resp).unwrap())
     }
 }
@@ -2668,14 +2698,12 @@ impl UserRpcHandler for DeleteGenerationHandler {
             })
         })?;
 
-        let resp = self
-            .workloads
-            .delete_generation(
-                req.kind,
-                &req.name,
-                &req.authority,
-                req.require_apply_id.as_deref(),
-            );
+        let resp = self.workloads.delete_generation(
+            req.kind,
+            &req.name,
+            &req.authority,
+            req.require_apply_id.as_deref(),
+        );
         Ok(serde_json::to_vec(&resp).unwrap())
     }
 }
@@ -3328,9 +3356,8 @@ fn controller_agent_desired_snapshot_from_apply_phases(
             WorkloadId::new(
                 desired_workload.kind,
                 desired_workload.name.clone(),
-                desired_workload_authority(desired_workload).unwrap_or_else(|_| {
-                    desired_workload.name.clone()
-                }),
+                desired_workload_authority(desired_workload)
+                    .unwrap_or_else(|_| desired_workload.name.clone()),
             ),
         );
 
@@ -3603,7 +3630,8 @@ fn desired_workload_matches_running(
     desired: &AgentDesiredWorkload,
 ) -> bool {
     let _ = workloads;
-    let Ok(status) = observe_selection_status(desired.kind, &desired.name, &desired.authority) else {
+    let Ok(status) = observe_selection_status(desired.kind, &desired.name, &desired.authority)
+    else {
         return false;
     };
     desired_workload_status_matches_goal(&status, desired)
@@ -3814,8 +3842,9 @@ async fn agent_pull_reconcile_tick(
     let tick_started_at = Instant::now();
     let fetch_started_at = Instant::now();
     let desired = fetch_agent_desired(fw, controller_instance_key, instance_key).await?;
-    let should_log_tick =
-        !desired.desired_keys.is_empty() || !desired.workloads.is_empty() || !desired.delete_workloads.is_empty();
+    let should_log_tick = !desired.desired_keys.is_empty()
+        || !desired.workloads.is_empty()
+        || !desired.delete_workloads.is_empty();
     if should_log_tick {
         eprintln!(
             "[ops_agent:pull_repair] tick fetched desired instance_key={} controller_instance_key={} desired_keys={} workloads={} delete_workloads={} elapsed_ms={}",
@@ -3887,8 +3916,8 @@ async fn agent_pull_reconcile_tick(
                     );
                     continue;
                 };
-                let notify_deadline_ts_ms =
-                    phase_updated_ts_ms.saturating_add(DELETE_APPLY_NO_WAIT_DELAY_SECONDS.saturating_mul(1000));
+                let notify_deadline_ts_ms = phase_updated_ts_ms
+                    .saturating_add(DELETE_APPLY_NO_WAIT_DELAY_SECONDS.saturating_mul(1000));
                 if now_ts_ms() < notify_deadline_ts_ms {
                     continue;
                 }
@@ -4244,15 +4273,16 @@ spec:
     };
     parse_k8s_deployment_subset_documents(daemonset_contract_yaml("smoke-contract-owner").as_str())
         .context("smoke parse valid daemonset naming contract")?;
-    let invalid_daemonset_err =
-        match parse_k8s_deployment_subset_documents(daemonset_contract_yaml("owner").as_str()) {
-            Ok(_) => {
-                anyhow::bail!(
-                    "smoke parse daemonset naming contract must reject plain desired name without prefix"
-                )
-            }
-            Err(err) => err,
-        };
+    let invalid_daemonset_err = match parse_k8s_deployment_subset_documents(
+        daemonset_contract_yaml("owner").as_str(),
+    ) {
+        Ok(_) => {
+            anyhow::bail!(
+                "smoke parse daemonset naming contract must reject plain desired name without prefix"
+            )
+        }
+        Err(err) => err,
+    };
     let invalid_daemonset_err_text = format!("{:#}", invalid_daemonset_err);
     if !invalid_daemonset_err_text.contains("shared naming contract") {
         anyhow::bail!(
@@ -4368,7 +4398,13 @@ spec:
         None,
     )?;
     wait_for_selection_present(WorkloadKind::Deployment, &name, &name)?;
-    if !selection_status_matches_attached(&replaced_status, "smoke-apply-2", 2, argv.as_slice(), None) {
+    if !selection_status_matches_attached(
+        &replaced_status,
+        "smoke-apply-2",
+        2,
+        argv.as_slice(),
+        None,
+    ) {
         anyhow::bail!(
             "supervisor smoke attached status mismatch after replace: running={} present={} apply_id={:?} replaced_pid={}",
             replaced_status.running,
@@ -4393,7 +4429,8 @@ spec:
     //   new visible owner once replacement has happened.
     let _ = runtime.stop(WorkloadKind::Deployment, &name, true, Some("smoke-apply"));
     let after_replace = observe_selection_status(WorkloadKind::Deployment, &name, &name)?;
-    if !selection_status_matches_present(&after_replace, "smoke-apply-2", 2, argv.as_slice(), None) {
+    if !selection_status_matches_present(&after_replace, "smoke-apply-2", 2, argv.as_slice(), None)
+    {
         anyhow::bail!(
             "supervisor smoke status mismatch after old apply_id stop post-replace: running={} present={} apply_id={:?}",
             after_replace.running,
@@ -4403,7 +4440,12 @@ spec:
     }
 
     runtime.stop(WorkloadKind::Deployment, &name, true, Some("smoke-apply-2"))?;
-    wait_for_selection_absent(WorkloadKind::Deployment, &name, &name, Some("smoke-apply-2"))?;
+    wait_for_selection_absent(
+        WorkloadKind::Deployment,
+        &name,
+        &name,
+        Some("smoke-apply-2"),
+    )?;
     let relaunched_pid = runtime.launch_detached(
         WorkloadKind::Deployment,
         &name,
@@ -4425,7 +4467,8 @@ spec:
         None,
     )?;
     wait_for_selection_present(WorkloadKind::Deployment, &name, &name)?;
-    let relaunched_present_status = observe_selection_status(WorkloadKind::Deployment, &name, &name)?;
+    let relaunched_present_status =
+        observe_selection_status(WorkloadKind::Deployment, &name, &name)?;
     if !selection_status_matches_present(
         &relaunched_present_status,
         "smoke-apply-2",
@@ -4469,8 +4512,13 @@ spec:
         None,
     )?;
     wait_for_selection_present(WorkloadKind::Deployment, &name, &name)?;
-    if !selection_status_matches_attached(&replaced_status_2, "smoke-apply-3", 3, argv.as_slice(), None)
-    {
+    if !selection_status_matches_attached(
+        &replaced_status_2,
+        "smoke-apply-3",
+        3,
+        argv.as_slice(),
+        None,
+    ) {
         anyhow::bail!(
             "supervisor smoke attached status mismatch after second replace: running={} present={} apply_id={:?} replaced_pid={}",
             replaced_status_2.running,
@@ -4501,18 +4549,21 @@ spec:
         );
     }
 
-    runtime.stop(
+    runtime.stop(WorkloadKind::Deployment, &name, true, Some("smoke-apply-3"))?;
+    wait_for_selection_absent(
         WorkloadKind::Deployment,
         &name,
-        true,
+        &name,
         Some("smoke-apply-3"),
     )?;
-    wait_for_selection_absent(WorkloadKind::Deployment, &name, &name, Some("smoke-apply-3"))?;
     drain_selection_generations(WorkloadKind::Deployment, &name, &name)?;
 
     let stopped = observe_selection_status(WorkloadKind::Deployment, &name, &name)?;
     if stopped.running {
-        anyhow::bail!("supervisor smoke status mismatch after stop: running={}", stopped.running);
+        anyhow::bail!(
+            "supervisor smoke status mismatch after stop: running={}",
+            stopped.running
+        );
     }
     if stopped.apply_id.is_some() {
         anyhow::bail!(
@@ -4644,7 +4695,9 @@ spec:
     })?;
     let bare_takeover_supervisor_start_time_ticks = bare_takeover_present_status
         .supervisor_start_time_ticks
-        .ok_or_else(|| anyhow::anyhow!("supervisor smoke bare-mode takeover missing start_time_ticks"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("supervisor smoke bare-mode takeover missing start_time_ticks")
+        })?;
 
     runtime.launch_detached(
         WorkloadKind::Deployment,
@@ -4658,7 +4711,8 @@ spec:
         &bare_log_path,
     )?;
     std::thread::sleep(Duration::from_secs(2));
-    let after_same_apply_bare_replace = observe_selection_status(WorkloadKind::Deployment, &bare_name, &bare_name)?;
+    let after_same_apply_bare_replace =
+        observe_selection_status(WorkloadKind::Deployment, &bare_name, &bare_name)?;
     if !selection_status_matches_present(
         &after_same_apply_bare_replace,
         "smoke-bare-takeover",
@@ -4739,7 +4793,8 @@ spec:
         &bare_log_path,
     )?;
     wait_for_selection_present(WorkloadKind::Deployment, &bare_name, &bare_name)?;
-    let after_other_apply_bare_replace = observe_selection_status(WorkloadKind::Deployment, &bare_name, &bare_name)?;
+    let after_other_apply_bare_replace =
+        observe_selection_status(WorkloadKind::Deployment, &bare_name, &bare_name)?;
     if !selection_status_matches_present(
         &after_other_apply_bare_replace,
         "smoke-bare-stale-other",
@@ -4820,7 +4875,11 @@ spec:
     ];
     workloads_bare_command.extend(argv.iter().cloned());
     runtime.spawn_detached_command(&workloads_bare_log_path, workloads_bare_command.as_slice())?;
-    wait_for_selection_present(WorkloadKind::Deployment, &workloads_bare_name, &workloads_bare_name)?;
+    wait_for_selection_present(
+        WorkloadKind::Deployment,
+        &workloads_bare_name,
+        &workloads_bare_name,
+    )?;
 
     let workloads_takeover = workloads.start(StartReq {
         kind: WorkloadKind::Deployment,
@@ -4842,8 +4901,11 @@ spec:
                 .unwrap_or_else(|| "unknown".to_string())
         );
     }
-    let workloads_takeover_status =
-        observe_selection_status(WorkloadKind::Deployment, &workloads_bare_name, &workloads_bare_name)?;
+    let workloads_takeover_status = observe_selection_status(
+        WorkloadKind::Deployment,
+        &workloads_bare_name,
+        &workloads_bare_name,
+    )?;
     if !selection_status_matches_present(
         &workloads_takeover_status,
         "smoke-workloads-bare-takeover",
@@ -4906,8 +4968,11 @@ spec:
                 .unwrap_or_else(|| "unknown".to_string())
         );
     }
-    let workloads_generation_first_status =
-        observe_selection_status(WorkloadKind::Deployment, &workloads_generation_name, &workloads_generation_name)?;
+    let workloads_generation_first_status = observe_selection_status(
+        WorkloadKind::Deployment,
+        &workloads_generation_name,
+        &workloads_generation_name,
+    )?;
     if !selection_status_matches_present(
         &workloads_generation_first_status,
         workloads_generation_apply_1.as_str(),
@@ -4930,7 +4995,9 @@ spec:
     }
     let workloads_generation_first_pid =
         workloads_generation_first_status.pid.ok_or_else(|| {
-            anyhow::anyhow!("supervisor-backed generation smoke initial start missing supervisor pid")
+            anyhow::anyhow!(
+                "supervisor-backed generation smoke initial start missing supervisor pid"
+            )
         })?;
     let workloads_generation_first_start_time_ticks = workloads_generation_first_status
         .supervisor_start_time_ticks
@@ -4960,8 +5027,11 @@ spec:
                 .unwrap_or_else(|| "unknown".to_string())
         );
     }
-    let workloads_generation_second_status =
-        observe_selection_status(WorkloadKind::Deployment, &workloads_generation_name, &workloads_generation_name)?;
+    let workloads_generation_second_status = observe_selection_status(
+        WorkloadKind::Deployment,
+        &workloads_generation_name,
+        &workloads_generation_name,
+    )?;
     if !selection_status_matches_present(
         &workloads_generation_second_status,
         workloads_generation_apply_2.as_str(),
@@ -5018,8 +5088,11 @@ spec:
             stale_generation_err
         );
     }
-    let after_stale_generation_recovery =
-        observe_selection_status(WorkloadKind::Deployment, &workloads_generation_name, &workloads_generation_name)?;
+    let after_stale_generation_recovery = observe_selection_status(
+        WorkloadKind::Deployment,
+        &workloads_generation_name,
+        &workloads_generation_name,
+    )?;
     if !selection_status_matches_present(
         &after_stale_generation_recovery,
         workloads_generation_apply_2.as_str(),
@@ -5102,9 +5175,9 @@ spec:
         backoff_argv.as_slice(),
         None,
     )?;
-    let workloads_backoff_supervisor_pid = workloads_backoff_absent_status.pid.ok_or_else(|| {
-        anyhow::anyhow!("supervisor-backed backoff smoke missing supervisor pid")
-    })?;
+    let workloads_backoff_supervisor_pid = workloads_backoff_absent_status
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("supervisor-backed backoff smoke missing supervisor pid"))?;
     if workloads_backoff_absent_status.present {
         anyhow::bail!("supervisor-backed backoff smoke expected present=false during restart gap");
     }
@@ -5129,8 +5202,11 @@ spec:
                 .unwrap_or_else(|| "unknown".to_string())
         );
     }
-    let after_backoff_reconcile =
-        observe_selection_status(WorkloadKind::Deployment, &workloads_backoff_name, &workloads_backoff_name)?;
+    let after_backoff_reconcile = observe_selection_status(
+        WorkloadKind::Deployment,
+        &workloads_backoff_name,
+        &workloads_backoff_name,
+    )?;
     if !selection_status_matches_attached(
         &after_backoff_reconcile,
         workloads_backoff_apply.as_str(),
@@ -5224,10 +5300,9 @@ spec:
             "supervisor-backed wait-present failure smoke expected present=false after failed start"
         );
     }
-    let wait_present_failure_supervisor_pid =
-        after_wait_present_failure.pid.ok_or_else(|| {
-            anyhow::anyhow!("supervisor-backed wait-present failure smoke missing supervisor pid")
-        })?;
+    let wait_present_failure_supervisor_pid = after_wait_present_failure.pid.ok_or_else(|| {
+        anyhow::anyhow!("supervisor-backed wait-present failure smoke missing supervisor pid")
+    })?;
     let wait_present_failure_reconcile = workloads.start(StartReq {
         kind: WorkloadKind::Deployment,
         name: wait_present_failure_name.clone(),
@@ -9037,9 +9112,7 @@ async fn handle_controller_req(
                 handle_delete_workload_on_agent(state, req).await
             }
             (Method::GET, "/api/status") => handle_status(state, req).await,
-            (Method::POST, "/api/delete_generation") => {
-                handle_delete_generation(state, req).await
-            }
+            (Method::POST, "/api/delete_generation") => handle_delete_generation(state, req).await,
             (Method::POST, "/api/wait_delete_generation") => {
                 handle_wait_delete_generation(state, req).await
             }
@@ -9372,7 +9445,8 @@ async fn controller_reconcile_apply_delete_lifecycle(
                 &apply_rec.id,
                 desired_workloads.as_slice(),
             )
-            .await {
+            .await
+            {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!(
@@ -9619,8 +9693,7 @@ async fn controller_finalize_history_records(
                     &StatusReq {
                         kind: w.kind,
                         name: w.name.clone(),
-                        authority: desired_workload_authority(w)
-                            .unwrap_or_else(|_| w.name.clone()),
+                        authority: desired_workload_authority(w).unwrap_or_else(|_| w.name.clone()),
                     },
                 )
                 .await;
@@ -9863,10 +9936,7 @@ async fn collect_agent_workload_summaries(
                     agent_workloads.push(WorkloadStatusSummaryHttp {
                         kind: desired.kind,
                         name: desired.name.clone(),
-                        authority: v
-                            .authority
-                            .clone()
-                            .unwrap_or_else(|| desired.name.clone()),
+                        authority: v.authority.clone().unwrap_or_else(|| desired.name.clone()),
                         namespace,
                         running: v.running,
                         present: v.present,
@@ -10348,9 +10418,7 @@ fn build_single_workload_map(
     workloads_by_instance
 }
 
-fn parse_target_workload_query(
-    req: &Request<Body>,
-) -> Result<TargetWorkloadQuery, String> {
+fn parse_target_workload_query(req: &Request<Body>) -> Result<TargetWorkloadQuery, String> {
     let Some(target) = query_param(req.uri(), "target") else {
         return Err("missing query param: target".to_string());
     };
@@ -11187,7 +11255,12 @@ async fn controller_collect_runtime_apply_workloads_by_instance(
             },
         )
         .await
-        .with_context(|| format!("list_apply_runtime rpc failed: instance_key={}", instance_key))?;
+        .with_context(|| {
+            format!(
+                "list_apply_runtime rpc failed: instance_key={}",
+                instance_key
+            )
+        })?;
 
         if !resp.ok {
             anyhow::bail!(
@@ -11357,7 +11430,8 @@ async fn handle_delete_apply_inner(
                 &apply_id,
                 desired_snapshot.as_slice(),
             )
-            .await {
+            .await
+            {
                 Ok(v) => v,
                 Err(e) => {
                     let resp = DeleteApplyResp {
@@ -13144,7 +13218,9 @@ mod tests {
             {
                 return false;
             }
-            if self.visible_owner_kind == HandoverVisibleOwnerKind::Applied && !self.visible_apply_present {
+            if self.visible_owner_kind == HandoverVisibleOwnerKind::Applied
+                && !self.visible_apply_present
+            {
                 return false;
             }
             if self.rollback_policy == HandoverRollbackPolicy::NoDestructiveRollback
@@ -13297,9 +13373,9 @@ mod tests {
         };
         let next_states = initial.next_states();
         assert!(
-            next_states.iter().all(|state| {
-                state.wait_failure.is_none() || state.requested_apply_alive
-            }),
+            next_states
+                .iter()
+                .all(|state| { state.wait_failure.is_none() || state.requested_apply_alive }),
             "safe rollback policy must not kill the requested apply on wait failure"
         );
     }
@@ -13307,7 +13383,10 @@ mod tests {
     impl WaitFailureCleanupModelState {
         fn initial_states() -> Vec<Self> {
             let mut out = Vec::new();
-            for visible_phase in [HandoverVisiblePhase::Attached, HandoverVisiblePhase::Present] {
+            for visible_phase in [
+                HandoverVisiblePhase::Attached,
+                HandoverVisiblePhase::Present,
+            ] {
                 for cleanup_policy in [
                     HandoverRollbackPolicy::NoDestructiveRollback,
                     HandoverRollbackPolicy::StopRequestedApply,
@@ -13642,7 +13721,11 @@ mod tests {
 
         let strict = live_selection_supervisors(&snapshot, Some("Deployment/target")).unwrap();
         assert_eq!(strict.len(), 2);
-        assert!(strict.iter().any(|entry| entry.owner_ts_ms == 2 && entry.runtime_state.is_none()));
+        assert!(
+            strict
+                .iter()
+                .any(|entry| entry.owner_ts_ms == 2 && entry.runtime_state.is_none())
+        );
     }
 
     #[test]
@@ -13902,8 +13985,7 @@ mod tests {
             zombie_infos: Vec::new(),
         };
 
-        let listed =
-            observe_apply_runtime_statuses_for_snapshot("apply-1", &snapshot).unwrap();
+        let listed = observe_apply_runtime_statuses_for_snapshot("apply-1", &snapshot).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name.as_deref(), Some("target-present"));
         assert!(listed[0].present);
@@ -14056,12 +14138,18 @@ mod tests {
         let desired = AgentDesiredWorkload {
             kind: WorkloadKind::DaemonSet,
             name: "fluxon-self-host-bastion-fluxon_core_controller__ops_controller".to_string(),
-            authority: "fluxon-self-host-bastion-fluxon_core_controller__ops_controller".to_string(),
+            authority: "fluxon-self-host-bastion-fluxon_core_controller__ops_controller"
+                .to_string(),
             logical_selection: "fluxon_core_controller".to_string(),
             service_name: "ops_controller".to_string(),
             apply_id: "apply-1".to_string(),
             updated_ts_ms: 11,
-            argv: vec!["/usr/bin/env".to_string(), "bash".to_string(), "-lc".to_string(), "sleep 30".to_string()],
+            argv: vec![
+                "/usr/bin/env".to_string(),
+                "bash".to_string(),
+                "-lc".to_string(),
+                "sleep 30".to_string(),
+            ],
             cwd: Some("/tmp/ops_controller".to_string()),
             atomic_group: Some(AtomicGroupMeta {
                 selection_name: "fluxon_core_controller".to_string(),
@@ -14070,7 +14158,8 @@ mod tests {
             }),
         };
         let status = SelectionSupervisorStatus {
-            label: "DaemonSet/fluxon-self-host-bastion-fluxon_core_controller__ops_controller".to_string(),
+            label: "DaemonSet/fluxon-self-host-bastion-fluxon_core_controller__ops_controller"
+                .to_string(),
             pid: Some(123),
             pgid: Some(123),
             running: true,
@@ -14078,8 +14167,12 @@ mod tests {
             process_count: 1,
             child_process_count: 0,
             kind: Some(WorkloadKind::DaemonSet),
-            name: Some("fluxon-self-host-bastion-fluxon_core_controller__ops_controller".to_string()),
-            authority: Some("fluxon-self-host-bastion-fluxon_core_controller__ops_controller".to_string()),
+            name: Some(
+                "fluxon-self-host-bastion-fluxon_core_controller__ops_controller".to_string(),
+            ),
+            authority: Some(
+                "fluxon-self-host-bastion-fluxon_core_controller__ops_controller".to_string(),
+            ),
             service_name: Some("ops_controller".to_string()),
             apply_id: Some("apply-1".to_string()),
             argv: Some(desired.argv.clone()),
@@ -14098,7 +14191,10 @@ mod tests {
         present_status.present = true;
         present_status.process_count = 2;
         present_status.child_process_count = 1;
-        assert!(desired_workload_status_matches_goal(&present_status, &desired));
+        assert!(desired_workload_status_matches_goal(
+            &present_status,
+            &desired
+        ));
     }
 
     #[test]
@@ -14111,7 +14207,12 @@ mod tests {
             service_name: OPS_AGENT_WORKLOAD_SERVICE_NAME.to_string(),
             apply_id: "apply-1".to_string(),
             updated_ts_ms: 11,
-            argv: vec!["/usr/bin/env".to_string(), "bash".to_string(), "-lc".to_string(), "sleep 30".to_string()],
+            argv: vec![
+                "/usr/bin/env".to_string(),
+                "bash".to_string(),
+                "-lc".to_string(),
+                "sleep 30".to_string(),
+            ],
             cwd: Some("/tmp/ops_agent".to_string()),
             atomic_group: Some(AtomicGroupMeta {
                 selection_name: "fluxon_core_controller".to_string(),
@@ -14120,7 +14221,8 @@ mod tests {
             }),
         };
         let status = SelectionSupervisorStatus {
-            label: "DaemonSet/fluxon-self-host-bastion-fluxon_core_controller__ops_agent".to_string(),
+            label: "DaemonSet/fluxon-self-host-bastion-fluxon_core_controller__ops_agent"
+                .to_string(),
             pid: Some(456),
             pgid: Some(456),
             running: true,
@@ -14129,7 +14231,9 @@ mod tests {
             child_process_count: 0,
             kind: Some(WorkloadKind::DaemonSet),
             name: Some("fluxon-self-host-bastion-fluxon_core_controller__ops_agent".to_string()),
-            authority: Some("fluxon-self-host-bastion-fluxon_core_controller__ops_agent".to_string()),
+            authority: Some(
+                "fluxon-self-host-bastion-fluxon_core_controller__ops_agent".to_string(),
+            ),
             service_name: Some(OPS_AGENT_WORKLOAD_SERVICE_NAME.to_string()),
             apply_id: Some("apply-1".to_string()),
             argv: Some(desired.argv.clone()),
@@ -14155,7 +14259,12 @@ mod tests {
             service_name: "owner".to_string(),
             apply_id: "apply-1".to_string(),
             updated_ts_ms: 11,
-            argv: vec!["/usr/bin/env".to_string(), "bash".to_string(), "-lc".to_string(), "sleep 30".to_string()],
+            argv: vec![
+                "/usr/bin/env".to_string(),
+                "bash".to_string(),
+                "-lc".to_string(),
+                "sleep 30".to_string(),
+            ],
             cwd: Some("/tmp/owner".to_string()),
             atomic_group: Some(AtomicGroupMeta {
                 selection_name: "fluxon_core_controller".to_string(),
@@ -14198,7 +14307,12 @@ mod tests {
             service_name: "owner".to_string(),
             apply_id: "apply-1".to_string(),
             updated_ts_ms: 11,
-            argv: vec!["/usr/bin/env".to_string(), "bash".to_string(), "-lc".to_string(), "sleep 30".to_string()],
+            argv: vec![
+                "/usr/bin/env".to_string(),
+                "bash".to_string(),
+                "-lc".to_string(),
+                "sleep 30".to_string(),
+            ],
             cwd: Some("/tmp/owner".to_string()),
             atomic_group: Some(AtomicGroupMeta {
                 selection_name: "fluxon_core_controller".to_string(),
@@ -14230,5 +14344,4 @@ mod tests {
         };
         assert!(!phase1_overlap_with_applyless_owner(&status, &desired));
     }
-
 }

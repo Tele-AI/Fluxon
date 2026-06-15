@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use bitcode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 #[serde(rename_all = "snake_case")]

@@ -980,8 +980,8 @@ impl MpscConsumerHandle {
         let kv_framework = self.kv_framework.clone();
         let kv_runtime = self.kv_runtime.clone();
 
-        let bridge_cb: fluxon_mq::consumer::PayloadCallback =
-            Arc::new(move |producer_id: String, key: String| {
+        let bridge_cb: fluxon_mq::consumer::PayloadCallback = Arc::new(
+            move |producer_id: String, key: String| {
                 let kv_framework_for_call = kv_framework.clone();
                 let kv_runtime_for_call = kv_runtime.clone();
                 let chan_id_for_msg_str_for_call = chan_id_for_msg_str.clone();
@@ -1134,8 +1134,8 @@ impl MpscConsumerHandle {
                     };
                     let pyobj_res: Result<PyObject, String> = Python::with_gil(|py| {
                         stage_for_py.store(4, Ordering::Relaxed);
-                        let payload_obj =
-                            decode_flat_dict_to_wrapped_py_object(py, payload_owner).map_err(|e| {
+                        let payload_obj = decode_flat_dict_to_wrapped_py_object(py, payload_owner)
+                            .map_err(|e| {
                                 format!("flat dict decode failed for key={}: {}", key, e)
                             })?;
                         if acting_as_submodule {
@@ -1182,7 +1182,8 @@ impl MpscConsumerHandle {
                         ),
                     }
                 })
-            });
+            },
+        );
 
         match self.inner.as_mut() {
             Some(inner) => {
@@ -1692,8 +1693,8 @@ cnt={} recv_calls={} recv_timeouts={} last_prefetch_target={} last_timeout_ms={:
         let kv_framework = self.kv_framework.clone();
         let kv_runtime = self.kv_runtime.clone();
 
-        let bridge_cb: fluxon_mq::consumer::DeleteCallback =
-            std::sync::Arc::new(move |key: String| {
+        let bridge_cb: fluxon_mq::consumer::DeleteCallback = std::sync::Arc::new(
+            move |key: String| {
                 let kv_framework_for_call = kv_framework.clone();
                 let kv_runtime_for_call = kv_runtime.clone();
                 Box::pin(async move {
@@ -1772,7 +1773,8 @@ cnt={} recv_calls={} recv_timeouts={} last_prefetch_target={} last_timeout_ms={:
                         }
                     }
                 })
-            });
+            },
+        );
 
         match self.inner.as_mut() {
             Some(inner) => {

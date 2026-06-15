@@ -30,14 +30,13 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use crate::closed_sdk::{
-    construct_p2p_module_handle, drop_runtime_handle, p2p_call_raw_observed, p2p_register_dispatch,
-    is_live_dependent_drop_error,
-    p2p_register_rpc_response_msg_id, p2p_register_user_rpc_bytes_handler,
-    p2p_register_user_rpc_bytes_handler_async, p2p_send_response_raw,
-    spawn_deferred_drop_runtime_handle,
+    construct_p2p_module_handle, drop_runtime_handle, is_live_dependent_drop_error,
+    p2p_call_raw_observed, p2p_register_dispatch, p2p_register_rpc_response_msg_id,
+    p2p_register_user_rpc_bytes_handler, p2p_register_user_rpc_bytes_handler_async,
+    p2p_send_response_raw, spawn_deferred_drop_runtime_handle,
 };
-use fluxon_commu_closed_sdk_consumer::p2p_module_call;
 use fluxon_commu_closed_sdk_consumer::ClosedRuntimeDispatchRequestRef;
+use fluxon_commu_closed_sdk_consumer::p2p_module_call;
 
 #[doc(hidden)]
 pub trait P2pModuleAccessTrait: Send + Sync {
@@ -524,9 +523,7 @@ impl P2pModule {
     }
 
     pub fn tier_snapshot(&self) -> Arc<CommuTierSnapshot> {
-        {
-            self.cached_tier_snapshot()
-        }
+        { self.cached_tier_snapshot() }
     }
 
     pub async fn attach_transfer_engine(
@@ -657,9 +654,11 @@ impl P2pModule {
                 let Ok(handle) = view.p2p_module().ensure_closed_runtime_handle().await else {
                     return;
                 };
-                let _ =
-                    closed_p2p_unit_call(handle, ClosedRuntimeP2pCall::NotifyTransferRpcBackendReady)
-                        .await;
+                let _ = closed_p2p_unit_call(
+                    handle,
+                    ClosedRuntimeP2pCall::NotifyTransferRpcBackendReady,
+                )
+                .await;
             });
         }
     }
@@ -738,10 +737,11 @@ impl P2pModule {
                 let _ = p2p_register_dispatch(
                     handle,
                     msg_id,
-                    Arc::new(move |request: ClosedRuntimeDispatchRequestRef<'_>,
-                                    body: bytes::Bytes| {
-                        f(request.reply_next_hop, view.p2p_module(), request, &body).map(|_| ())
-                    }),
+                    Arc::new(
+                        move |request: ClosedRuntimeDispatchRequestRef<'_>, body: bytes::Bytes| {
+                            f(request.reply_next_hop, view.p2p_module(), request, &body).map(|_| ())
+                        },
+                    ),
                 )
                 .await;
             });
@@ -1238,35 +1238,31 @@ pub mod rpc {
     {
         let msg_id = m.msg_id();
         let view = p2p.module_view();
-        p2p.regist_dispatch_raw(
-            msg_id,
-            move |reply_next_hop, _p2p, request_view, data| {
-                let raw_lengths = request_view.body_raw_bytes_lengths;
-                let value: MsgPack<M> = MsgPack::decode_from_body_view(
-                    request_view.body_serialize_part_len,
-                    raw_lengths,
-                    data,
-                )?;
-                let logical_source: NodeID = request_view.logical_source_peer_id.to_string().into();
-                f(
-                    Responser {
-                        task_id: request_view.task_id,
-                        node_id: logical_source,
-                        reply_next_hop: reply_next_hop.to_string().into(),
-                        incoming_local_observe: crate::p2p::WireTransportLocalObserve {
-                            frame_recv_done_ts_us: request_view.incoming_frame_recv_done_ts_us,
-                            dispatch_enqueued_ts_us: request_view
-                                .incoming_dispatch_enqueued_ts_us,
-                            dispatch_started_ts_us: request_view.incoming_dispatch_started_ts_us,
-                            complete_pending_call_ts_us: request_view
-                                .incoming_complete_pending_call_ts_us,
-                        },
-                        view: view.clone(),
+        p2p.regist_dispatch_raw(msg_id, move |reply_next_hop, _p2p, request_view, data| {
+            let raw_lengths = request_view.body_raw_bytes_lengths;
+            let value: MsgPack<M> = MsgPack::decode_from_body_view(
+                request_view.body_serialize_part_len,
+                raw_lengths,
+                data,
+            )?;
+            let logical_source: NodeID = request_view.logical_source_peer_id.to_string().into();
+            f(
+                Responser {
+                    task_id: request_view.task_id,
+                    node_id: logical_source,
+                    reply_next_hop: reply_next_hop.to_string().into(),
+                    incoming_local_observe: crate::p2p::WireTransportLocalObserve {
+                        frame_recv_done_ts_us: request_view.incoming_frame_recv_done_ts_us,
+                        dispatch_enqueued_ts_us: request_view.incoming_dispatch_enqueued_ts_us,
+                        dispatch_started_ts_us: request_view.incoming_dispatch_started_ts_us,
+                        complete_pending_call_ts_us: request_view
+                            .incoming_complete_pending_call_ts_us,
                     },
-                    value,
-                )
-            },
-        );
+                    view: view.clone(),
+                },
+                value,
+            )
+        });
     }
 
     pub fn regist_rpc_send<REQ>(p2p: &P2pModule)

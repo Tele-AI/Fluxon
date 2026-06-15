@@ -216,11 +216,11 @@ impl<E: MsgPackSerializePart> MsgPack<E> {
         let mut raw_bytes = Vec::with_capacity(raw_bytes_lengths.len());
         let mut current_pos = serialize_part_length;
         for &raw_len in raw_bytes_lengths {
-            let raw_end = current_pos
-                .checked_add(raw_len as usize)
-                .ok_or_else(|| P2pError::InvalidMessage {
+            let raw_end = current_pos.checked_add(raw_len as usize).ok_or_else(|| {
+                P2pError::InvalidMessage {
                     detail: "raw bytes length overflow".to_string(),
-                })?;
+                }
+            })?;
             if body_bytes.len() < raw_end {
                 return Err(P2pError::InvalidMessage {
                     detail: "Insufficient bytes for raw bytes".to_string(),

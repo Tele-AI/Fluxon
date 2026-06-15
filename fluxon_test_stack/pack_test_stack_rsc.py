@@ -115,7 +115,7 @@ DEFAULT_REDIS_VERSION = "7.2.5"
 DEFAULT_TEST_STACK_PYTHON_ABI = "cpython3.10"
 DEFAULT_TEST_STACK_WHEEL_PLATFORM = "manylinux2014_x86_64"
 DEFAULT_TEST_STACK_CONFIG_RELPATH = Path("fluxon_test_stack/ci_test_list.yaml")
-DEFAULT_TOP_LEVEL_TRANSPORT_BACKEND = "fastws"
+DEFAULT_TOP_LEVEL_TRANSPORT_BACKEND = script_utils.PUBLIC_TRANSPORT_BACKEND
 BASELINE_BUNDLE_SPECS: tuple[dict[str, str], ...] = (
     {
         "id": "redis",
@@ -657,6 +657,11 @@ def _build_release_step(
     reuse_existing_release: bool,
     profile_id: Optional[str] = None,
 ) -> dict[str, Any]:
+    if transport_backend != script_utils.PUBLIC_TRANSPORT_BACKEND:
+        raise ValueError(
+            "public pack_release.py only supports the fixed closed_sdk transport backend "
+            f"{script_utils.PUBLIC_TRANSPORT_BACKEND!r}, got {transport_backend!r}"
+        )
     if reuse_existing_release:
         step: dict[str, Any] = {
             "action": "validate_release",
@@ -670,8 +675,6 @@ def _build_release_step(
     command = [
         sys.executable,
         str((REPO_ROOT / "setup_and_pack" / "pack_release.py").resolve()),
-        "--transport-backend",
-        transport_backend,
         "--rdma-backend",
         rdma_backend,
         "--release-dir",
@@ -828,10 +831,7 @@ def _validate_existing_release_dir(*, release_dir: Path) -> None:
     if not release_dir.exists() or not release_dir.is_dir():
         raise RuntimeError(f"pack_test_stack_rsc requires an existing release dir: {release_dir}")
 
-    required_file_globs = (
-        "fluxon-*.whl",
-        "fluxon_pyo3-*.whl",
-    )
+    required_file_globs = ("fluxon-*.whl",)
     required_relpaths = (
         "install.py",
         RELEASE_MANIFEST_FILENAME,

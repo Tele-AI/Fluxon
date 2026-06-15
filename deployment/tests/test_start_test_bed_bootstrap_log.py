@@ -407,8 +407,7 @@ global_envs:
   FLUXON_CLUSTER_NAME: fluxon_testbed
   FLUXON_RELEASE_SHA256_FILE: fluxon_release.sha256
   FLUXON_RELEASE_PYLIB_SRC_TAR: pylib_src.tar.gz
-  FLUXON_RELEASE_WHEEL_PY: fluxon-0.2.1-py3-none-any.whl
-  FLUXON_RELEASE_WHEEL_PYO3: fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
+  FLUXON_RELEASE_WHEEL: fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
 cluster_nodes:
   - hostname: infra44-ThinkStation-PX
     ip: 127.0.0.1
@@ -637,8 +636,7 @@ global_envs:
   FLUXON_CLUSTER_NAME: fluxon_testbed
   FLUXON_RELEASE_SHA256_FILE: fluxon_release.sha256
   FLUXON_RELEASE_PYLIB_SRC_TAR: pylib_src.tar.gz
-  FLUXON_RELEASE_WHEEL_PY: fluxon-0.2.1-py3-none-any.whl
-  FLUXON_RELEASE_WHEEL_PYO3: fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
+  FLUXON_RELEASE_WHEEL: fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
 cluster_nodes:
   - hostname: infra44-ThinkStation-PX
     ip: 127.0.0.1

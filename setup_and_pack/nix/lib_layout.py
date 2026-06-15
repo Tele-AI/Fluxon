@@ -48,7 +48,7 @@ BRIDGE_PREBUILT_WORKSPACE_SEED_EXTRA_RELATIVE_PATHS = (
     "setup_and_pack/public_workspace_contract.py",
     "setup_and_pack/pub_prepare_build.py",
     "setup_and_pack/pub_prepare_build.yaml",
-    "setup_and_pack/wheel_runtime_helper.py",
+    "setup_and_pack/utils/wheel_runtime_helper.py",
     "setup_and_pack/utils",
     "deployment/utils/placeholder_utils.py",
     "deployment/utils/proc_lifecycle_codegen.py",

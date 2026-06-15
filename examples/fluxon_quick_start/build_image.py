@@ -29,8 +29,7 @@ def main() -> None:
         default="existing_release",
         help="existing_release: reuse local fluxon_release; url_download: download wheels from URL",
     )
-    parser.add_argument("--fluxon-wheel-url", help="URL for fluxon wheel (url_download mode)")
-    parser.add_argument("--fluxon-pyo3-wheel-url", help="URL for fluxon_pyo3 wheel (url_download mode)")
+    parser.add_argument("--fluxon-wheel-url", help="URL for unified fluxon wheel (url_download mode)")
     parser.add_argument("--pylib-src-url", help="URL for pylib_src tarball (url_download mode)")
     parser.add_argument(
         "--release-dir",
@@ -46,14 +45,11 @@ def main() -> None:
     if args.mode == "existing_release":
         _validate_existing_release(release_dir=release_dir)
     else:
-        if not all([args.fluxon_wheel_url, args.fluxon_pyo3_wheel_url, args.pylib_src_url]):
-            parser.error(
-                "url_download mode requires --fluxon-wheel-url, --fluxon-pyo3-wheel-url, --pylib-src-url"
-            )
+        if not all([args.fluxon_wheel_url, args.pylib_src_url]):
+            parser.error("url_download mode requires --fluxon-wheel-url and --pylib-src-url")
         _url_download(
             release_dir=release_dir,
             fluxon_wheel_url=args.fluxon_wheel_url,
-            fluxon_pyo3_wheel_url=args.fluxon_pyo3_wheel_url,
             pylib_src_url=args.pylib_src_url,
         )
 
@@ -66,7 +62,7 @@ def _run(cmd: list[str]) -> None:
 
 
 def _validate_existing_release(*, release_dir: Path) -> None:
-    required_globs = ("fluxon-*.whl", "fluxon_pyo3-*.whl")
+    required_globs = ("fluxon-*.whl",)
     required_relpaths = ("ext_images/etcd/etcd", "ext_images/etcd/etcdctl", "ext_images/greptime/greptime")
     if not release_dir.is_dir():
         raise FileNotFoundError(f"missing quick_start release directory: {release_dir}")
@@ -94,13 +90,12 @@ def _url_download(
     *,
     release_dir: Path,
     fluxon_wheel_url: str,
-    fluxon_pyo3_wheel_url: str,
     pylib_src_url: str,
 ) -> None:
     import urllib.request
 
     release_dir.mkdir(parents=True, exist_ok=True)
-    for url in (fluxon_wheel_url, fluxon_pyo3_wheel_url, pylib_src_url):
+    for url in (fluxon_wheel_url, pylib_src_url):
         name = url.rsplit("/", 1)[-1]
         dst = release_dir / name
         print(f"  downloading {url} -> {dst}")

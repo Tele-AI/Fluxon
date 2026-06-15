@@ -2149,8 +2149,7 @@ def _validate_release_generation_prerequisites(
         "install.py",
         _require_str(global_envs.get("FLUXON_RELEASE_SHA256_FILE"), "global_envs.FLUXON_RELEASE_SHA256_FILE"),
         _require_str(global_envs.get("FLUXON_RELEASE_PYLIB_SRC_TAR"), "global_envs.FLUXON_RELEASE_PYLIB_SRC_TAR"),
-        _require_str(global_envs.get("FLUXON_RELEASE_WHEEL_PY"), "global_envs.FLUXON_RELEASE_WHEEL_PY"),
-        _require_str(global_envs.get("FLUXON_RELEASE_WHEEL_PYO3"), "global_envs.FLUXON_RELEASE_WHEEL_PYO3"),
+        _require_str(global_envs.get("FLUXON_RELEASE_WHEEL"), "global_envs.FLUXON_RELEASE_WHEEL"),
     ]
     local_hostworkdir = _require_str(local_node_cfg.get("hostworkdir"), "local_node_cfg.hostworkdir")
     local_release_dir = Path(local_hostworkdir) / "fluxon_release"
