@@ -9,7 +9,7 @@ Keep this document concise.
 ## Doc Site
 - Use Quartz for the doc site. Treat Quartz as cached build tooling under `.cached`; do not vendor it as a git submodule.
 - Publish the repo-root `README.md` as the doc-site homepage.
-- Do not add index `README.md` files under `fluxon_doc/**`; use real content pages and generated navigation instead.
+- Do not add index `README.md` files under `fluxon_doc_cn/**` or `fluxon_doc_en/**`; use real content pages and generated navigation instead.
 - GitHub Pages output must work under a project subpath such as `/Fluxon/`; avoid root-only internal links.
 - In the doc explorer, keep the left tree expanded, include `首页`, and place `roadmap` immediately after `首页`.
 

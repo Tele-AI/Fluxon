@@ -12,7 +12,7 @@ Python 业务代码优先直接在代码里写 Python dict，并传给 `FluxonKv
 
 在写 `put_blocking/get_blocking/rpc_call` 这些 Python 业务代码之前，需要先把 KV 依赖的服务平面拉起来。共性的角色关系、启动顺序和 runtime 边界，统一见 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md)。
 
-![](../pics/deploy_arch_1.png)
+![](../../pics/deploy_arch_1.png)
 
 直接接触的服务平面对象主要有：
 
