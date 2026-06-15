@@ -85,6 +85,18 @@ jobs:
       - name: Run pack_release
         run: python3 setup_and_pack/pack_release.py --release-dir fluxon_release
 
+      - name: Upload pack_release debug artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-test-pack-release-debug-${{ github.sha }}
+          if-no-files-found: warn
+          compression-level: 1
+          path: |
+            fluxon_release/**
+            setup_and_pack/nix/runs/**
+            ${{ runner.temp }}/fluxon-pack-release/project-data/**
+
   build-doc-site:
     runs-on: ubuntu-latest
     steps:
