@@ -45,12 +45,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            docker.io \
             git \
             pigz \
             protobuf-compiler \
             python3-venv \
             rsync
+
+      - name: Verify Docker availability
+        run: |
+          command -v docker >/dev/null
+          if ! docker info >/dev/null 2>&1; then
+            sudo systemctl start docker
+            docker info >/dev/null
+          fi
+          docker version
 
       - name: Install Python dependencies
         run: python3 -m pip install PyYAML
