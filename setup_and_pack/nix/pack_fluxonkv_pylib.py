@@ -888,6 +888,14 @@ def _backend_prepare_build_scenario(*, selected_backend_plan: dict) -> str | Non
     return NATIVE_RUNTIME_PREPARE_SCENARIOS[native_object_kind]
 
 
+def _bridge_prebuilt_dynamic_target_support_dir_names(*, spec, selected_backend_plan: dict) -> tuple[str, ...]:
+    if spec.profile_source.source_kind != "bridge_prebuilt":
+        return ()
+    if _backend_prepare_build_scenario(selected_backend_plan=selected_backend_plan) is None:
+        return ()
+    return tuple(spec.profile_layout.target_support_dir_names)
+
+
 def _initialize_prepare_target_placeholder_dir(*, target_root: Path, dir_name: str) -> None:
     target_dir = target_root / dir_name
     if target_dir.is_symlink() or target_dir.is_file():
@@ -924,6 +932,14 @@ def _initialize_prepare_target_placeholder_dir(*, target_root: Path, dir_name: s
         return
 
 
+def _initialize_target_support_placeholder_dir(*, target_root: Path, dir_name: str) -> None:
+    target_dir = target_root / dir_name
+    if target_dir.is_symlink() or target_dir.is_file():
+        target_dir.unlink()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir.chmod(0o777)
+
+
 def _materialize_bridge_prebuilt_external_mount_authorities(
     *,
     spec,
@@ -942,11 +958,13 @@ def _materialize_bridge_prebuilt_external_mount_authorities(
     if prepare_build_scenario is None:
         return
     build_root = Path(build_root_path).resolve()
-    generated_system_dir = _ensure_generated_system_dir(
-        spec=spec,
-        runtime_target=runtime_target,
-    )
     prepare_target_dir_names = _load_prepare_target_dir_names(build_root, prepare_build_scenario)
+    dynamic_target_support_dir_names = set(
+        _bridge_prebuilt_dynamic_target_support_dir_names(
+            spec=spec,
+            selected_backend_plan=selected_backend_plan,
+        )
+    )
     target_root = build_root / "fluxon_rs" / "target"
     missing_mount_names: list[str] = []
     for mount_spec in selected_backend_plan["external_mounts"]:
@@ -975,6 +993,8 @@ def _materialize_bridge_prebuilt_external_mount_authorities(
         if not missing_entries:
             continue
         missing_prepare_dir_names.append(dir_name)
+        if dir_name in prepare_target_dir_names:
+            _initialize_prepare_target_placeholder_dir(target_root=target_root, dir_name=dir_name)
     missing_target_support_dir_names: list[str] = []
     target_root = build_root / "fluxon_rs" / "target"
     for dir_name in spec.profile_layout.target_support_dir_names:
@@ -982,18 +1002,10 @@ def _materialize_bridge_prebuilt_external_mount_authorities(
         if candidate_root.is_dir():
             continue
         missing_target_support_dir_names.append(dir_name)
+        if dir_name in dynamic_target_support_dir_names:
+            _initialize_target_support_placeholder_dir(target_root=target_root, dir_name=dir_name)
     if not missing_mount_names and not missing_prepare_dir_names and not missing_target_support_dir_names:
         return
-    if not missing_prepare_dir_names:
-        _seed_bridge_prebuilt_native_runtime_store_from_published_profile(
-            spec=spec,
-            runtime_target=runtime_target,
-            transport_backend=transport_backend,
-            selected_backend_plan=selected_backend_plan,
-            build_root=build_root,
-            generated_system_dir=generated_system_dir,
-            writable_native_dir_name=writable_native_dir_name,
-        )
     unresolved_mount_errors: list[str] = []
     for mount_spec in selected_backend_plan["external_mounts"]:
         candidate_root = (build_root / mount_spec["project_relative_path"]).resolve()
@@ -1001,65 +1013,12 @@ def _materialize_bridge_prebuilt_external_mount_authorities(
             mount_name=mount_spec["name"],
             candidate_root=candidate_root,
         )
-        if not missing_entries:
+        if (
+            missing_entries
+            and mount_spec["name"] in prepare_target_dir_names
+            and candidate_root.is_dir()
+        ):
             continue
-        unresolved_mount_errors.append(
-            f"mount={mount_spec['name']} path={candidate_root} missing={', '.join(missing_entries)}"
-        )
-    if not unresolved_mount_errors:
-        unresolved_prepare_dir_errors: list[str] = []
-        for dir_name in _required_native_dir_names(selected_backend_plan=selected_backend_plan):
-            if dir_name == writable_native_dir_name:
-                continue
-            candidate_root = build_root / "fluxon_rs" / "target" / dir_name
-            missing_entries = _bridge_prebuilt_seed_native_dir_missing_entries(
-                dir_name=dir_name,
-                candidate_dir=candidate_root,
-            )
-            if not missing_entries:
-                continue
-            unresolved_prepare_dir_errors.append(
-                f"dir={dir_name} path={candidate_root} missing={', '.join(missing_entries)}"
-            )
-        unresolved_target_support_errors = [
-            f"dir={dir_name} path={build_root / 'fluxon_rs' / 'target' / dir_name}"
-            for dir_name in spec.profile_layout.target_support_dir_names
-            if not (build_root / "fluxon_rs" / "target" / dir_name).is_dir()
-        ]
-        if not unresolved_prepare_dir_errors and not unresolved_target_support_errors:
-            return
-    prepare_build_path = _require_prepare_build_authority_path(repo_root=build_root)
-    if not prepare_build_path.is_file():
-        raise RuntimeError(f"bridge_prebuilt prepare_build.py is missing: {prepare_build_path}")
-    prepare_build_resource_store = _ensure_generated_prepare_build_resource_store(
-        generated_system_dir=generated_system_dir,
-    )
-    prepare_build_env = os.environ.copy()
-    prepare_build_env["FLUXON_PREPARE_BUILD_PROJECT_ROOT"] = str(build_root)
-    prepare_build_env["FLUXON_PREPARE_BUILD_RESOURCE_STORE"] = str(prepare_build_resource_store)
-    prepare_build_env["CARGO_TARGET_DIR"] = str(build_root / "fluxon_rs" / "target")
-    if selected_backend_plan["rdma_backend"] == "closed_sdk":
-        authoritative_closed_sdk_root = _discover_authoritative_vendor_runtime_sdk_root(
-            build_root=build_root,
-            base_system=spec.base_system,
-            runtime_abi_key=runtime_target.runtime_abi_key,
-            closed_sdk_search_roots=spec.profile_source.closed_sdk_search_roots,
-        )
-        if authoritative_closed_sdk_root is not None:
-            prepare_build_env["FLUXON_COMMU_CLOSED_SDK_ROOT"] = str(authoritative_closed_sdk_root)
-    subprocess.run(
-        ["python3", str(prepare_build_path), "--scenario", prepare_build_scenario],
-        cwd=str(prepare_build_path.parent.parent),
-        env=prepare_build_env,
-        check=True,
-    )
-    unresolved_mount_errors: list[str] = []
-    for mount_spec in selected_backend_plan["external_mounts"]:
-        candidate_root = (build_root / mount_spec["project_relative_path"]).resolve()
-        missing_entries = _validate_external_mount_candidate(
-            mount_name=mount_spec["name"],
-            candidate_root=candidate_root,
-        )
         if not missing_entries:
             continue
         unresolved_mount_errors.append(
@@ -1074,6 +1033,12 @@ def _materialize_bridge_prebuilt_external_mount_authorities(
             dir_name=dir_name,
             candidate_dir=candidate_root,
         )
+        if (
+            missing_entries
+            and dir_name in prepare_target_dir_names
+            and candidate_root.is_dir()
+        ):
+            continue
         if not missing_entries:
             continue
         unresolved_prepare_dir_errors.append(
@@ -1086,7 +1051,7 @@ def _materialize_bridge_prebuilt_external_mount_authorities(
     ]
     if unresolved_mount_errors or unresolved_prepare_dir_errors or unresolved_target_support_errors:
         raise RuntimeError(
-            "bridge_prebuilt prepare_build authority remained incomplete after prepare_build: "
+            "bridge_prebuilt authority placeholders remained incomplete: "
             + "; ".join(
                 [
                     *unresolved_mount_errors,
@@ -1108,12 +1073,16 @@ def _seed_bridge_prebuilt_native_runtime_store_from_published_profile(
     writable_native_dir_name: str | None,
 ) -> None:
     native_target_dir = build_root / "fluxon_rs" / "target"
-    seed_cxxpacked_dir = _resolve_bridge_prebuilt_seed_native_dir(
+    # This optional host-side seed is only a reuse optimization for bridge_prebuilt.
+    # The required cxxpacked payload is still materialized inside the manylinux container
+    # by pub_prepare_build.py before the Rust build runs.
+    reusable_cxxpacked_seed_dir = _resolve_bridge_prebuilt_seed_native_dir(
         spec=spec,
         runtime_target=runtime_target,
         transport_backend=transport_backend,
         dir_name=CXXPACKED_DIR_NAME,
         build_root=build_root,
+        allow_missing=True,
     )
     for dir_name in _required_native_dir_names(selected_backend_plan=selected_backend_plan):
         if writable_native_dir_name is not None and dir_name == writable_native_dir_name:
@@ -1134,7 +1103,7 @@ def _seed_bridge_prebuilt_native_runtime_store_from_published_profile(
                 generated_system_dir=generated_system_dir,
                 runtime_target=runtime_target,
                 seed_vendor_runtime_dir=seed_vendor_runtime_dir,
-                seed_cxxpacked_dir=seed_cxxpacked_dir,
+                reusable_cxxpacked_seed_dir=reusable_cxxpacked_seed_dir,
             )
             _replace_workspace_entry(
                 link_path=link_path,
@@ -1147,7 +1116,10 @@ def _seed_bridge_prebuilt_native_runtime_store_from_published_profile(
             transport_backend=transport_backend,
             dir_name=dir_name,
             build_root=build_root,
+            allow_missing=True,
         )
+        if seed_dir is None:
+            continue
         _replace_workspace_entry(
             link_path=link_path,
             target_path=str(seed_dir),
@@ -1353,7 +1325,7 @@ def _materialize_bridge_prebuilt_vendor_runtime_seed(
     generated_system_dir: Path,
     runtime_target,
     seed_vendor_runtime_dir: Path,
-    seed_cxxpacked_dir: Path,
+    reusable_cxxpacked_seed_dir: Path | None,
 ) -> Path:
     stage_parent = _ensure_generated_dir(
         generated_system_dir / "bridge_prebuilt_external_mounts" / runtime_target.runtime_abi_key
@@ -1370,20 +1342,27 @@ def _materialize_bridge_prebuilt_vendor_runtime_seed(
             target_path=staged_root,
         )
     driver_config_source_dir = None
-    for candidate_dir in (
+    candidate_driver_config_dirs = [
         seed_vendor_runtime_dir / "etc" / "libibverbs.d",
-        seed_cxxpacked_dir / "etc" / "libibverbs.d",
-    ):
+    ]
+    if reusable_cxxpacked_seed_dir is not None:
+        candidate_driver_config_dirs.append(reusable_cxxpacked_seed_dir / "etc" / "libibverbs.d")
+    for candidate_dir in candidate_driver_config_dirs:
         if candidate_dir.is_dir() and any(
             path.is_file() and path.name.endswith(".driver") for path in candidate_dir.iterdir()
         ):
             driver_config_source_dir = candidate_dir
             break
     if driver_config_source_dir is None:
+        cxxpacked_driver_hint = (
+            str(reusable_cxxpacked_seed_dir / "etc" / "libibverbs.d")
+            if reusable_cxxpacked_seed_dir is not None
+            else "<missing cxxpacked seed>"
+        )
         raise RuntimeError(
             "vendor runtime driver config dir is missing from both vendor_runtime and cxxpacked seeds: "
             f"{seed_vendor_runtime_dir / 'etc' / 'libibverbs.d'}, "
-            f"{seed_cxxpacked_dir / 'etc' / 'libibverbs.d'}"
+            f"{cxxpacked_driver_hint}"
         )
     staged_driver_config_dir = staged_root / "etc" / "libibverbs.d"
     if staged_driver_config_dir.exists() and staged_driver_config_dir.resolve() == driver_config_source_dir.resolve():
@@ -1744,7 +1723,15 @@ def _bridge_prebuilt_direct_mount_paths(
         if dir_name in prepare_target_dir_names:
             continue
         mount_paths.append((native_runtime_dir / dir_name).resolve())
+    dynamic_target_support_dir_names = set(
+        _bridge_prebuilt_dynamic_target_support_dir_names(
+            spec=spec,
+            selected_backend_plan=selected_backend_plan,
+        )
+    )
     for dir_name in spec.profile_layout.target_support_dir_names:
+        if dir_name in dynamic_target_support_dir_names:
+            continue
         mount_paths.append((target_support_dir / dir_name).resolve())
 
     seen: set[Path] = set()
@@ -2265,6 +2252,12 @@ def _prepare_target_cache_view(
         if prepare_build_scenario is not None
         else set()
     )
+    dynamic_target_support_dir_names = set(
+        _bridge_prebuilt_dynamic_target_support_dir_names(
+            spec=spec,
+            selected_backend_plan=selected_backend_plan,
+        )
+    )
     if native_object_id is not None:
         authoritative_native_export_dir = _require_authoritative_fluxon_native_export_dir(
             spec=spec,
@@ -2294,6 +2287,12 @@ def _prepare_target_cache_view(
             target_path=f"{CONTAINER_NATIVE_RUNTIME_PATH}/{dir_name}",
         )
     for dir_name in spec.profile_layout.target_support_dir_names:
+        if dir_name in dynamic_target_support_dir_names:
+            _prepare_writable_target_cache_support_dir(
+                target_cache_dir=target_cache_dir,
+                dir_name=dir_name,
+            )
+            continue
         source_dir = target_support_dir / dir_name
         if not source_dir.is_dir():
             raise RuntimeError(f"profile target support store is missing required dir: {source_dir}")
@@ -2349,6 +2348,18 @@ def _prepare_writable_target_cache_native_dir(
         dir_name=dir_name,
         authoritative_export_dir=authoritative_export_dir,
     )
+
+
+def _prepare_writable_target_cache_support_dir(*, target_cache_dir: Path, dir_name: str) -> None:
+    staged_dir = target_cache_dir / dir_name
+    if staged_dir.is_dir() and not staged_dir.is_symlink():
+        return
+    if staged_dir.is_symlink() or staged_dir.is_file():
+        staged_dir.unlink()
+    elif staged_dir.exists():
+        _sudo_remove_tree(staged_dir)
+    staged_dir.mkdir(parents=True, exist_ok=True)
+    staged_dir.chmod(0o777)
 
 
 def _writable_target_cache_native_dir_is_reusable(
