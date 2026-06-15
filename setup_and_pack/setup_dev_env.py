@@ -24,7 +24,7 @@ SUPPORTED_DEFAULT_CONFIGS_BY_HOST = {
     ("ubuntu", "22.04"): CONFIG_DIR / "ubuntu22.yaml",
     ("ubuntu", "24.04"): CONFIG_DIR / "ubuntu24.yaml",
 }
-DEFAULT_NIX_PACK_CONFIG_PATH = REPO_ROOT / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib.yaml"
+DEFAULT_NIX_PACK_CONFIG_PATH = REPO_ROOT / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_static.yaml"
 NIX_DIR = REPO_ROOT / "setup_and_pack" / "nix"
 NIX_LAYOUT_MODULE_PATH = NIX_DIR / "lib_layout.py"
 RUST_TOOLCHAIN_TOML = REPO_ROOT / "fluxon_rs" / "rust-toolchain.toml"

@@ -1226,6 +1226,7 @@ dependencies = [
  "dashmap 6.1.0",
  "downcast-rs",
  "etcd-client",
+ "fluxon_cli",
  "fluxon_commu",
  "fluxon_framework",
  "fluxon_framework_compiled",

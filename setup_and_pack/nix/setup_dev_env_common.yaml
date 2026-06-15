@@ -1,7 +1,7 @@
 schema_version: 1
 
 nix_pack:
-  config_path: setup_and_pack/nix/pack_fluxonkv_pylib.yaml
+  config_path: setup_and_pack/nix/pack_fluxonkv_pylib_static.yaml
   store_root: /nix
   require_store_root_mountpoint: true
   prepare_project_data_root: true

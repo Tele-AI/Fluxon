@@ -1,0 +1,80 @@
+name: manual_release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pack-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git \
+            pigz \
+            protobuf-compiler \
+            python3-venv \
+            rsync
+
+      - name: Verify Docker availability
+        run: |
+          command -v docker >/dev/null
+          if ! docker info >/dev/null 2>&1; then
+            sudo systemctl start docker
+            docker info >/dev/null
+          fi
+          docker version
+
+      - name: Install Python dependencies
+        run: python3 -m pip install PyYAML
+
+      - name: Prepare CI directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data"
+          mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data/manylinux-release"
+          mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data/manylinux-cache/cargo-registry"
+          mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data/manylinux-cache/cargo-git"
+
+      - name: Build manylinux builder image
+        run: python3 setup_and_pack/build_pack_fluxonkv_pylib_img.py
+
+      - name: Generate CI pack_release config
+        run: |
+          python3 setup_and_pack/ci/gen_pack_release_ci_config.py \
+            --out-dir setup_and_pack \
+            --project-data-root "$RUNNER_TEMP/fluxon-pack-release/project-data" \
+            --runtime-image-ref pypack-builder-nix-experiment:latest
+
+      - name: Run pack_release
+        run: python3 setup_and_pack/pack_release.py --release-dir fluxon_release
+
+      - name: Build quickstart image
+        run: python3 examples/fluxon_quick_start/build_image.py --mode existing_release --release-dir fluxon_release
+
+      - name: Archive quickstart image
+        run: docker save fluxon_quick_start:0.2.1 | gzip -1 > fluxon_quick_start_0.2.1_docker_image.tar.gz
+
+      - name: Archive release directory
+        run: tar czf fluxon_release.tar.gz fluxon_release
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: manual-release-artifacts-${{ github.sha }}
+          path: |
+            fluxon_release.tar.gz
+            fluxon_quick_start_0.2.1_docker_image.tar.gz

@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use etcd_client as etcd;
-use fluxon_commu::{EtcdPrefixScanAction, EtcdPrefixScanError, scan_etcd_prefix_paginated};
+use fluxon_commu::{scan_etcd_prefix_paginated, EtcdPrefixScanAction, EtcdPrefixScanError};
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::{Future, poll_fn};
+use std::future::{poll_fn, Future};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,8 +29,8 @@ use fluxon_observability::keys::{
 };
 use fluxon_observability::metrics_actor::MetricsHandle as ObserveMetricsHandle;
 use fluxon_util::etcd::{
-    ETCD_PREFIX_WATCH_RESTART_SLEEP, EtcdPrefixWatchLoopControl, OwnedEtcdWatchEvent,
-    OwnedEtcdWatchEventKind, run_prefix_watch_loop,
+    run_prefix_watch_loop, EtcdPrefixWatchLoopControl, OwnedEtcdWatchEvent,
+    OwnedEtcdWatchEventKind, ETCD_PREFIX_WATCH_RESTART_SLEEP,
 };
 use fluxon_util::lease_manager::LeaseManager;
 use fluxon_util::prom_remote_write::{Label, Sample, TimeSeries, LABEL_NAME as RW_LABEL_NAME};
@@ -280,9 +280,7 @@ impl CommitSequencer {
         }
         debug!(
             "[CommitSequencer instance_id={}] advance: prev_next_seq={} new_next_seq={}",
-            self.instance_id,
-            prev,
-            new_next_seq,
+            self.instance_id, prev, new_next_seq,
         );
         self.notify.notify_waiters();
     }
@@ -415,9 +413,7 @@ impl CommitSequencer {
             }
         }
 
-        let summary = if latency_ns
-            >= COMMIT_WAIT_BREAKDOWN_SUMMARY_THRESHOLD.as_nanos()
-        {
+        let summary = if latency_ns >= COMMIT_WAIT_BREAKDOWN_SUMMARY_THRESHOLD.as_nanos() {
             dominant_blocker.map(|dominant| {
                 format!(
                     "blockers={} dominant_blocker_seq={} dominant_producer_id={} dominant_consume_offset={} dominant_stage_at_wait_begin={} dominant_segment_ms={} dominant_payload_ms={} dominant_wait_turn_ms={} dominant_commit_ms={} dominant_ready_queue_ms={} dominant_popped_to_advance_ms={} total_payload_ms={} total_wait_turn_ms={} total_commit_ms={} total_ready_queue_ms={} total_popped_to_advance_ms={} total_notify_gap_ms={} total_accounted_ms={}",
@@ -486,30 +482,54 @@ impl CommitSeqProgress {
     }
 
     fn segment_breakdown(&self, begin_at: Instant, end_at: Instant) -> CommitWaitBreakdownNs {
-        let wait_turn_begin_at = self
-            .wait_turn_begin_at
-            .unwrap_or_else(|| panic!("missing wait_turn_begin_at for producer_id={}", self.producer_id));
-        let commit_begin_at = self
-            .commit_begin_at
-            .unwrap_or_else(|| panic!("missing commit_begin_at for producer_id={}", self.producer_id));
+        let wait_turn_begin_at = self.wait_turn_begin_at.unwrap_or_else(|| {
+            panic!(
+                "missing wait_turn_begin_at for producer_id={}",
+                self.producer_id
+            )
+        });
+        let commit_begin_at = self.commit_begin_at.unwrap_or_else(|| {
+            panic!(
+                "missing commit_begin_at for producer_id={}",
+                self.producer_id
+            )
+        });
         let ready_to_advance_at = self.ready_to_advance_at.unwrap_or_else(|| {
             panic!(
                 "missing ready_to_advance_at for producer_id={}",
                 self.producer_id
             )
         });
-        let advanced_at = self.advanced_at.unwrap_or_else(|| {
-            panic!("missing advanced_at for producer_id={}", self.producer_id)
-        });
-        let segment_effective_end = if advanced_at < end_at { advanced_at } else { end_at };
-        let payload_ns =
-            overlap_interval_ns(self.payload_begin_at, wait_turn_begin_at, begin_at, segment_effective_end);
-        let wait_turn_ns =
-            overlap_interval_ns(wait_turn_begin_at, commit_begin_at, begin_at, segment_effective_end);
-        let commit_ns =
-            overlap_interval_ns(commit_begin_at, ready_to_advance_at, begin_at, segment_effective_end);
+        let advanced_at = self
+            .advanced_at
+            .unwrap_or_else(|| panic!("missing advanced_at for producer_id={}", self.producer_id));
+        let segment_effective_end = if advanced_at < end_at {
+            advanced_at
+        } else {
+            end_at
+        };
+        let payload_ns = overlap_interval_ns(
+            self.payload_begin_at,
+            wait_turn_begin_at,
+            begin_at,
+            segment_effective_end,
+        );
+        let wait_turn_ns = overlap_interval_ns(
+            wait_turn_begin_at,
+            commit_begin_at,
+            begin_at,
+            segment_effective_end,
+        );
+        let commit_ns = overlap_interval_ns(
+            commit_begin_at,
+            ready_to_advance_at,
+            begin_at,
+            segment_effective_end,
+        );
         let ready_queue_end = match self.popped_at {
-            Some(popped_at) if popped_at > ready_to_advance_at && popped_at < advanced_at => popped_at,
+            Some(popped_at) if popped_at > ready_to_advance_at && popped_at < advanced_at => {
+                popped_at
+            }
             _ => ready_to_advance_at,
         };
         let ready_queue_ns = overlap_interval_ns(
@@ -1120,16 +1140,10 @@ impl MpscConsumer {
                 .avg_ns()
                 .unwrap()
                 / 1_000_000;
-            let avg_ready_select_to_pop_ms = self
-                .ready_path_select_to_pop_window
-                .avg_ns()
-                .unwrap()
-                / 1_000_000;
-            let avg_ready_actor_update_to_pop_ms = self
-                .ready_path_actor_update_to_pop_window
-                .avg_ns()
-                .unwrap()
-                / 1_000_000;
+            let avg_ready_select_to_pop_ms =
+                self.ready_path_select_to_pop_window.avg_ns().unwrap() / 1_000_000;
+            let avg_ready_actor_update_to_pop_ms =
+                self.ready_path_actor_update_to_pop_window.avg_ns().unwrap() / 1_000_000;
             let avg_ready_watch_observed_to_pop_ms = self
                 .ready_path_watch_observed_to_pop_window
                 .avg_ns()
@@ -1438,7 +1452,8 @@ impl MpscConsumer {
             prefetch_latency_commit_wait_blocked_wait_turn_window: SlidingWindowAvgNs::new(),
             prefetch_latency_commit_wait_blocked_commit_window: SlidingWindowAvgNs::new(),
             prefetch_latency_commit_wait_blocked_ready_queue_window: SlidingWindowAvgNs::new(),
-            prefetch_latency_commit_wait_blocked_popped_to_advance_window: SlidingWindowAvgNs::new(),
+            prefetch_latency_commit_wait_blocked_popped_to_advance_window: SlidingWindowAvgNs::new(
+            ),
             prefetch_latency_commit_wait_blocked_notify_gap_window: SlidingWindowAvgNs::new(),
             prefetch_latency_etcd_put_window: SlidingWindowAvgNs::new(),
             prefetch_latency_etcd_put_first_poll_delay_window: SlidingWindowAvgNs::new(),
@@ -1631,7 +1646,9 @@ impl MpscConsumer {
                     .selected_at
                     .duration_since(ready_path_trace.actor_update_at)
                     .as_nanos(),
-                select_to_pop_ns: popped_at.duration_since(ready_path_trace.selected_at).as_nanos(),
+                select_to_pop_ns: popped_at
+                    .duration_since(ready_path_trace.selected_at)
+                    .as_nanos(),
                 actor_update_to_pop_ns: popped_at
                     .duration_since(ready_path_trace.actor_update_at)
                     .as_nanos(),
@@ -1729,7 +1746,11 @@ impl MpscConsumer {
         self.prefetch_latency_commit_wait_blocked_ready_queue_window
             .push(fetched.commit_wait_breakdown.blocked_on_ready_queue_ns);
         self.prefetch_latency_commit_wait_blocked_popped_to_advance_window
-            .push(fetched.commit_wait_breakdown.blocked_on_popped_to_advance_ns);
+            .push(
+                fetched
+                    .commit_wait_breakdown
+                    .blocked_on_popped_to_advance_ns,
+            );
         self.prefetch_latency_commit_wait_blocked_notify_gap_window
             .push(fetched.commit_wait_breakdown.blocked_on_notify_gap_ns);
         debug!(
@@ -2605,7 +2626,8 @@ impl ConsumerActor {
             return ready_before || stale_before;
         }
 
-        let has_room = self.cached_produce_offset(producer_id) >= self.cached_next_hint(producer_id);
+        let has_room =
+            self.cached_produce_offset(producer_id) >= self.cached_next_hint(producer_id);
         if has_room {
             self.ready_producers.insert(producer_id.to_string());
             self.stale_no_room_producers.remove(producer_id);
@@ -2614,8 +2636,7 @@ impl ConsumerActor {
             if self.producer_meta_cache.contains(producer_id) {
                 self.stale_no_room_producers.remove(producer_id);
             } else {
-                self.stale_no_room_producers
-                    .insert(producer_id.to_string());
+                self.stale_no_room_producers.insert(producer_id.to_string());
             }
         }
 
@@ -2676,8 +2697,7 @@ impl ConsumerActor {
         let latest_select_ns = self.select_next_message_stats.latest_total_ns;
         let latest_refresh_ns = self.select_next_message_stats.latest_refresh_ns;
         let latest_probe_ns = self.select_next_message_stats.latest_probe_ns;
-        let latest_local_ns =
-            latest_select_ns.saturating_sub(latest_refresh_ns + latest_probe_ns);
+        let latest_local_ns = latest_select_ns.saturating_sub(latest_refresh_ns + latest_probe_ns);
         let avg_select_ms = avg_select_ns / 1_000_000;
         let avg_refresh_ms = avg_refresh_ns / 1_000_000;
         let avg_probe_ms = avg_probe_ns / 1_000_000;
@@ -3027,7 +3047,10 @@ impl ConsumerActor {
     ) {
         spawn_named(
             &lifecycle,
-            format!("fluxon_mq:consumer:produce_offset_watch:chan_id={}", chan_id),
+            format!(
+                "fluxon_mq:consumer:produce_offset_watch:chan_id={}",
+                chan_id
+            ),
             async move {
                 let prefix = keys::etcd_produce_offset_all_producer_prefix(chan_id);
                 let opts = etcd::WatchOptions::new().with_prefix();
@@ -3124,7 +3147,7 @@ impl ConsumerActor {
                 produce_offset_rx,
                 Duration::from_millis(10),
             )
-                .await;
+            .await;
             return;
         }
 
@@ -3136,7 +3159,7 @@ impl ConsumerActor {
                 produce_offset_rx,
                 Duration::from_millis(50),
             )
-                .await;
+            .await;
             return;
         }
 
@@ -3179,11 +3202,9 @@ impl ConsumerActor {
                     self.prefetch_no_message_next_warn_at =
                         tokio::time::Instant::now() + NO_MESSAGE_WARN_INTERVAL;
                     warn!(
-	                        "[ConsumerActor instance_id={} chan_id={}] try_prefetch_one error: {:?}",
-	                        self.instance_id,
-	                            self.chan_id,
-                            other
-                        );
+                        "[ConsumerActor instance_id={} chan_id={}] try_prefetch_one error: {:?}",
+                        self.instance_id, self.chan_id, other
+                    );
                     self.maybe_log_select_next_message_stats(false);
                     self.wait_actor_inputs_or_timeout(
                         rx,
@@ -3191,7 +3212,7 @@ impl ConsumerActor {
                         produce_offset_rx,
                         Duration::from_millis(100),
                     )
-                        .await;
+                    .await;
                 }
             }
         }
@@ -3316,8 +3337,11 @@ impl ConsumerActor {
         }
 
         let result = self.select_next_message_from_cache(&mut trace).await;
-        self.select_next_message_stats
-            .record_attempt(select_begin.elapsed().as_nanos(), &trace, &result);
+        self.select_next_message_stats.record_attempt(
+            select_begin.elapsed().as_nanos(),
+            &trace,
+            &result,
+        );
         result
     }
 
@@ -3501,14 +3525,8 @@ impl ConsumerActor {
                 "consume_offset_of_all_producer",
             ),
         )?;
-        let produce_offset = merge_monotonic_offset(
-            cached_produce_offset,
-            produce_offset_opt,
-        );
-        let consume_offset = merge_monotonic_offset(
-            cached_consume_offset,
-            consume_offset_opt,
-        );
+        let produce_offset = merge_monotonic_offset(cached_produce_offset, produce_offset_opt);
+        let consume_offset = merge_monotonic_offset(cached_consume_offset, consume_offset_opt);
         Ok((
             producer_id,
             SingleProducerOffsets {

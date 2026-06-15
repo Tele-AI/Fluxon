@@ -40,6 +40,14 @@ DEFAULT_ASSEMBLY_NAME = "cold_start"
 DEFAULT_INSTANCE_ID = "cold_start"
 PACK_CONFIG_STATIC_STEM_SUFFIX = "_static"
 PACK_CONFIG_ENV_STEM_SUFFIX = "_env"
+DEFAULT_PACK_CONFIG_ENV_DIR_NAME = "setup_and_pack"
+HOST_PATHS_ROOT_KEY = "root_path"
+DEFAULT_HOST_PATH_SUFFIXES = {
+    ("store", "project_data_root"): "",
+    ("assembly", "baseline_path"): "manylinux-release",
+    ("manylinux", "cargo_registry_dir"): "manylinux-cache/cargo-registry",
+    ("manylinux", "cargo_git_dir"): "manylinux-cache/cargo-git",
+}
 BRIDGE_PREBUILT_WORKSPACE_SEED_EXTRA_RELATIVE_PATHS = (
     "setup_and_pack/nix",
     "setup_and_pack/lib_tool.py",
@@ -48,7 +56,7 @@ BRIDGE_PREBUILT_WORKSPACE_SEED_EXTRA_RELATIVE_PATHS = (
     "setup_and_pack/public_workspace_contract.py",
     "setup_and_pack/pub_prepare_build.py",
     "setup_and_pack/pub_prepare_build.yaml",
-    "setup_and_pack/wheel_runtime_helper.py",
+    "setup_and_pack/utils/wheel_runtime_helper.py",
     "setup_and_pack/utils",
     "deployment/utils/placeholder_utils.py",
     "deployment/utils/proc_lifecycle_codegen.py",
@@ -166,10 +174,8 @@ def load_experiment_config_root(*, config_path: Path) -> dict:
     config_path = config_path.resolve()
     raw_config = _load_yaml_mapping_file(config_path)
     if config_path.stem.endswith(PACK_CONFIG_STATIC_STEM_SUFFIX):
-        env_path = config_path.with_name(
-            config_path.stem[: -len(PACK_CONFIG_STATIC_STEM_SUFFIX)]
-            + PACK_CONFIG_ENV_STEM_SUFFIX
-            + config_path.suffix
+        env_path = _resolve_split_experiment_env_path(
+            config_path=config_path,
         )
         template_path = env_path.with_name(env_path.name + ".template")
         if not env_path.is_file():
@@ -188,7 +194,51 @@ def load_experiment_config_root(*, config_path: Path) -> dict:
                 f"static_schema={static_schema!r} env_schema={env_schema!r}"
             )
         raw_config = _deep_merge_mappings(base=raw_config, overlay=env_config)
+    _expand_host_path_root_aliases(raw_config)
     return raw_config
+
+
+def _resolve_split_experiment_env_path(*, config_path: Path) -> Path:
+    project_root = _detect_project_root(config_path=config_path)
+    return (
+        project_root
+        / DEFAULT_PACK_CONFIG_ENV_DIR_NAME
+        / (
+            config_path.stem[: -len(PACK_CONFIG_STATIC_STEM_SUFFIX)]
+            + PACK_CONFIG_ENV_STEM_SUFFIX
+            + config_path.suffix
+        )
+    )
+
+
+def _expand_host_path_root_aliases(raw_config: dict) -> None:
+    host_paths = raw_config.get("host_paths")
+    if host_paths is None:
+        return
+    if not isinstance(host_paths, dict):
+        raise RuntimeError("config.host_paths must be a mapping when present")
+    root_value = host_paths.get(HOST_PATHS_ROOT_KEY)
+    if root_value is None:
+        return
+    if not isinstance(root_value, str) or not root_value.strip():
+        raise RuntimeError("config.host_paths.root_path must be a non-empty string when present")
+    root_path = Path(root_value.strip())
+    if not root_path.is_absolute():
+        raise RuntimeError(f"config.host_paths.root_path must be an absolute path: {root_value}")
+    resolved_root = root_path.resolve()
+
+    for key_path, suffix in DEFAULT_HOST_PATH_SUFFIXES.items():
+        section_name, field_name = key_path
+        section = raw_config.get(section_name)
+        if section is None:
+            section = {}
+            raw_config[section_name] = section
+        if not isinstance(section, dict):
+            raise RuntimeError(f"config.{section_name} must be a mapping when present")
+        if field_name in section:
+            continue
+        derived_path = resolved_root if not suffix else (resolved_root / suffix)
+        section[field_name] = str(derived_path)
 
 
 def load_experiment_spec(*, config_path: Path) -> ExperimentSpec:

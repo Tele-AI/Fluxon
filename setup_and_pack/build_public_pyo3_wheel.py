@@ -17,7 +17,7 @@ repo_root_str = str(REPO_ROOT)
 if repo_root_str not in sys.path:
     sys.path.insert(0, repo_root_str)
 
-from setup_and_pack import wheel_runtime_helper as wheel_helper
+from setup_and_pack.utils import wheel_runtime_helper as wheel_helper
 
 
 CLOSED_SDK_LIB_DIR = REPO_ROOT / "fluxon_release" / "closed_sdk" / "lib"

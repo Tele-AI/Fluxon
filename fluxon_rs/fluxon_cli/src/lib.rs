@@ -637,7 +637,10 @@ async fn build_mq_snapshot(
                 ));
                 return Ok::<EtcdPrefixScanAction, anyhow::Error>(EtcdPrefixScanAction::Continue);
             }
-            let ctx = format!("mq produce_offset: chan_id={} producer_idx={}", chan_id, pid);
+            let ctx = format!(
+                "mq produce_offset: chan_id={} producer_idx={}",
+                chan_id, pid
+            );
             if let Some(v) = parse_mq_offset_value_i64(warnings, &ctx, value) {
                 produce_offset_by_pid.insert(pid.to_string(), v);
             }
@@ -669,7 +672,10 @@ async fn build_mq_snapshot(
                 ));
                 return Ok::<EtcdPrefixScanAction, anyhow::Error>(EtcdPrefixScanAction::Continue);
             }
-            let ctx = format!("mq consume_offset: chan_id={} producer_idx={}", chan_id, pid);
+            let ctx = format!(
+                "mq consume_offset: chan_id={} producer_idx={}",
+                chan_id, pid
+            );
             if let Some(v) = parse_mq_offset_value_i64(warnings, &ctx, value) {
                 consume_offset_by_pid.insert(pid.to_string(), v);
             }

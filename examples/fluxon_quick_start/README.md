@@ -14,6 +14,19 @@ It does not replace the formal service-plane, KV, MQ, or FS interface docs.
 - `fluxon_quick_start:0.2.1`
   - quick-start Docker image
 
+## Runtime Modes
+
+Quick start supports two runtime modes:
+
+- image-first mode
+  - primary path
+  - build the image from release artifacts, then run the container
+- repo-run mode
+  - development-only path
+  - runs `examples/fluxon_quick_start/start.py` from the checkout
+  - requires the current Python environment to already have a working Fluxon runtime installed
+  - quick start does not create a venv or install wheels at runtime
+
 ## What Quick Start Launches
 
 Quick start launches the minimum runnable environment for each mode:
@@ -65,6 +78,10 @@ python3 examples/fluxon_quick_start/build_image.py --mode existing_release
 The image consumes release artifacts only. It installs `fluxon` and `fluxon_pyo3`
 from `fluxon_release/*.whl` and does not use editable source installs.
 
+Repo-run mode is also supported for development, but it is not self-bootstrapping.
+Before running `python3 examples/fluxon_quick_start/start.py`, make sure the current
+Python environment can already import both `fluxon_py` and `fluxon_pyo3`.
+
 ## KV Quick Start
 
 ```bash
@@ -105,7 +122,9 @@ docker run --rm -it --network host \
   fluxon_quick_start:0.2.1 \
   --mode mq \
   --etcd-client-port 37379 \
-  --kv-master-port 34200
+  --kv-master-port 34200 \
+  --greptime-http-port 14000 \
+  --panel-port 18080
 ```
 
 Run directly from the repo:
@@ -114,7 +133,9 @@ Run directly from the repo:
 python3 examples/fluxon_quick_start/start.py \
   --mode mq \
   --etcd-client-port 37379 \
-  --kv-master-port 34200
+  --kv-master-port 34200 \
+  --greptime-http-port 14000 \
+  --panel-port 18080
 ```
 
 Inside the shell:
@@ -126,6 +147,8 @@ status
 exit
 ```
 
+`status` prints the current producer/consumer binding info.
+
 The background consumer keeps printing received messages.
 
 ## FS Quick Start
@@ -136,6 +159,7 @@ docker run --rm -it --network host \
   --mode fs \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \
+  --greptime-http-port 14000 \
   --panel-port 34180
 ```
 
@@ -146,6 +170,7 @@ python3 examples/fluxon_quick_start/start.py \
   --mode fs \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \
+  --greptime-http-port 14000 \
   --panel-port 34180
 ```
 

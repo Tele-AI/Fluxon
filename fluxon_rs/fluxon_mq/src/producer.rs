@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use etcd_client as etcd;
-use fluxon_commu::{EtcdPrefixScanAction, EtcdPrefixScanError, scan_etcd_prefix_paginated};
+use fluxon_commu::{scan_etcd_prefix_paginated, EtcdPrefixScanAction, EtcdPrefixScanError};
 use serde::{Deserialize, Serialize};
 
 use std::sync::Arc;
@@ -13,8 +13,8 @@ use fluxon_observability::keys::{
 };
 use fluxon_observability::metrics_actor::MetricsHandle as ObserveMetricsHandle;
 use fluxon_util::etcd::{
-    DistributeIdAllocator, ETCD_PREFIX_WATCH_RESTART_SLEEP, EtcdPrefixWatchLoopControl,
-    run_prefix_watch_loop,
+    run_prefix_watch_loop, DistributeIdAllocator, EtcdPrefixWatchLoopControl,
+    ETCD_PREFIX_WATCH_RESTART_SLEEP,
 };
 use fluxon_util::lease_manager::LeaseManager;
 use fluxon_util::prom_remote_write::{Label, Sample, TimeSeries, LABEL_NAME as RW_LABEL_NAME};
@@ -343,8 +343,18 @@ impl MpscProducer {
     pub fn observe_put_window(&self, window_calls: u64, window_bytes: u64) {
         let ts_ms = Self::now_ms();
         let series: Vec<TimeSeries> = vec![
-            self.ts_one(PROM_METRIC_MQ_PUT_WINDOW_CALLS, &[], window_calls as f64, ts_ms),
-            self.ts_one(PROM_METRIC_MQ_PUT_WINDOW_BYTES, &[], window_bytes as f64, ts_ms),
+            self.ts_one(
+                PROM_METRIC_MQ_PUT_WINDOW_CALLS,
+                &[],
+                window_calls as f64,
+                ts_ms,
+            ),
+            self.ts_one(
+                PROM_METRIC_MQ_PUT_WINDOW_BYTES,
+                &[],
+                window_bytes as f64,
+                ts_ms,
+            ),
         ];
         self.observe.try_submit_timeseries(series);
     }
@@ -488,13 +498,9 @@ fn spawn_consumer_meta_watch(
         let opts = etcd::WatchOptions::new().with_prefix();
         let mut initial_refresh_client = client.clone();
 
-        let _ = refresh_consumer_bind_state(
-            &mut initial_refresh_client,
-            chan_id,
-            &prefix,
-            &state_tx,
-        )
-        .await;
+        let _ =
+            refresh_consumer_bind_state(&mut initial_refresh_client, chan_id, &prefix, &state_tx)
+                .await;
 
         let watch_label = format!("[MpscProducer chan_id={}] consumer meta watch", chan_id);
         let stop = shutdown;
@@ -589,9 +595,7 @@ async fn load_consumer_bind_state_snapshot(
         return Ok(ConsumerBindState::Invalid {
             reason: format!(
                 "expected at most 1 consumer binding under prefix {}, got {} keys={:?}",
-                prefix,
-                binding_count,
-                keys_dbg
+                prefix, binding_count, keys_dbg
             ),
         });
     }

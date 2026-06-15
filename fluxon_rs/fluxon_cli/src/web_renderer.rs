@@ -1747,15 +1747,16 @@ fn build_kv_topology_view(snapshot: &ClusterSnapshot) -> Option<TopologyView> {
         }
         if let Some(used) = meta.container_memory_usage_bytes {
             if used.is_finite() && used > 0.0 {
-                entry.container_mem_used_bytes = Some(
-                    entry.container_mem_used_bytes.map_or(used, |p| p.max(used)),
-                );
+                entry.container_mem_used_bytes =
+                    Some(entry.container_mem_used_bytes.map_or(used, |p| p.max(used)));
             }
         }
         if let Some(limit) = meta.container_memory_limit_bytes {
             if limit.is_finite() && limit > 0.0 {
                 entry.container_mem_limit_bytes = Some(
-                    entry.container_mem_limit_bytes.map_or(limit, |p| p.max(limit)),
+                    entry
+                        .container_mem_limit_bytes
+                        .map_or(limit, |p| p.max(limit)),
                 );
             }
         }

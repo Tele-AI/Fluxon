@@ -82,6 +82,9 @@ use config::{
     TestSpecTransportMode, TransferEngineType, normalize_etcd_addresses,
 };
 use external_client_api::{ExternalClientApi, ExternalClientApiNewArg};
+use fluxon_cli::config::{
+    MemberKind as MonitorMemberKind, MonitorConfig, MonitorConfigYaml, OutputFormat,
+};
 use fluxon_commu::TransferBackendActivationMode;
 use fluxon_framework::LogicalModule;
 use fluxon_framework::{AnyResult, define_framework};
@@ -98,6 +101,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs::File;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -169,6 +173,37 @@ fn test_spec_config_transfer_backend_activation_mode(
         }
         None => None,
     }
+}
+
+fn build_master_ui_monitor_config(
+    config: &MasterConfig,
+) -> Result<Option<(MonitorConfig, SocketAddr)>> {
+    let Some(master_ui) = config.master_ui.as_ref() else {
+        return Ok(None);
+    };
+    let monitoring = config
+        .monitoring
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("master_ui requires monitoring config on master"))?;
+    let listen_addr: SocketAddr = master_ui.http_listen_addr.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid master_ui.http_listen_addr (expected host:port): {} err={}",
+            master_ui.http_listen_addr,
+            e
+        )
+    })?;
+    let monitor_cfg = MonitorConfigYaml {
+        etcd_endpoints: config.etcd_endpoints.clone(),
+        prometheus_base_url: monitoring.prometheus_base_url.clone(),
+        cluster_name: config.cluster_name.clone(),
+        member_kind: MonitorMemberKind::Kv,
+        output: OutputFormat::Web,
+        mq_unique_key_prefixes: None,
+        http_listen_addr: Some(master_ui.http_listen_addr.clone()),
+        greptime_sql: None,
+    }
+    .verify()?;
+    Ok(Some((monitor_cfg, listen_addr)))
 }
 
 #[derive(Clone, Debug)]
@@ -1520,6 +1555,40 @@ async fn run_master_impl(
         config.instance_key.clone(),
         shutdown_waiter,
     );
+
+    if let Some((ui_cfg, listen_addr)) = build_master_ui_monitor_config(&config)? {
+        let listener = std::net::TcpListener::bind(listen_addr)
+            .map_err(|e| anyhow::anyhow!("Failed to bind master_ui at {}: {}", listen_addr, e))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| anyhow::anyhow!("Failed to set master_ui listener nonblocking: {}", e))?;
+
+        let framework_for_task = Arc::new(framework);
+        let framework_for_shutdown = framework_for_task.clone();
+        let cluster_view = framework_for_task.cluster_manager_view().clone();
+        let cluster_view_for_shutdown = cluster_view.clone();
+        let _ = cluster_view.spawn("master_ui_http_server", async move {
+            let mut shutdown_waiter = cluster_view_for_shutdown.register_shutdown_waiter();
+            let shutdown = async move {
+                shutdown_waiter.wait().await;
+            };
+            if let Err(err) = fluxon_cli::server::serve_http_with_shutdown_from_tcp(
+                ui_cfg, listener, shutdown, None,
+            )
+            .await
+            {
+                warn!(
+                    err = %err,
+                    listen_addr = %listen_addr,
+                    "master_ui http server exited with error; requesting framework shutdown"
+                );
+                framework_for_shutdown.request_shutdown();
+            }
+        });
+
+        info!("master_ui http server started at {}", listen_addr);
+        return Ok((framework_for_task, config));
+    }
 
     Ok((Arc::new(framework), config))
 }

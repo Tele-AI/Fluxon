@@ -4,16 +4,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use fluxon_observability::keys::{
-    PROM_LABEL_MQ_CATEGORY, PROM_LABEL_MQ_CHAN_ID, PROM_LABEL_MQ_CONSUMER_IDX, PROM_LABEL_MQ_METRIC,
-    PROM_LABEL_MQ_PRODUCER_IDX, PROM_LABEL_NODE, PROM_LABEL_ROLE,
+    PROM_LABEL_MQ_CATEGORY, PROM_LABEL_MQ_CHAN_ID, PROM_LABEL_MQ_CONSUMER_IDX,
+    PROM_LABEL_MQ_METRIC, PROM_LABEL_MQ_PRODUCER_IDX, PROM_LABEL_NODE, PROM_LABEL_ROLE,
     PROM_METRIC_MQ_CONSUMER_NONBLOCKING_LATEST_INTERVAL_UNIX_MS,
     PROM_METRIC_MQ_CONSUMER_NONBLOCKING_LATEST_PHASE_CALLS,
     PROM_METRIC_MQ_CONSUMER_NONBLOCKING_LATEST_PHASE_RPS,
     PROM_METRIC_MQ_PRODUCER_NONBLOCKING_LATEST_INTERVAL_UNIX_MS,
     PROM_METRIC_MQ_PRODUCER_NONBLOCKING_LATEST_PHASE_CALLS,
-    PROM_METRIC_MQ_PRODUCER_NONBLOCKING_LATEST_PHASE_RPS,
-    PROM_VALUE_MQ_CATEGORY_MPMC_SUB, PROM_VALUE_MQ_CATEGORY_MPSC, PROM_VALUE_MQ_INTERVAL_BEGIN,
-    PROM_VALUE_MQ_INTERVAL_END,
+    PROM_METRIC_MQ_PRODUCER_NONBLOCKING_LATEST_PHASE_RPS, PROM_VALUE_MQ_CATEGORY_MPMC_SUB,
+    PROM_VALUE_MQ_CATEGORY_MPSC, PROM_VALUE_MQ_INTERVAL_BEGIN, PROM_VALUE_MQ_INTERVAL_END,
 };
 use fluxon_observability::metrics_actor::MetricsHandle as ObserveMetricsHandle;
 use fluxon_util::prom_remote_write::{Label, Sample, TimeSeries, LABEL_NAME as RW_LABEL_NAME};
@@ -79,8 +78,7 @@ impl ActivePhase {
     fn record_call(&mut self, end_unix_ms: i64) {
         self.latest_end_unix_ms = end_unix_ms;
 
-        let bucket_start_unix_ms =
-            end_unix_ms - end_unix_ms.rem_euclid(LATEST_RATE_BUCKET_MS);
+        let bucket_start_unix_ms = end_unix_ms - end_unix_ms.rem_euclid(LATEST_RATE_BUCKET_MS);
         match self.recent_call_buckets.back_mut() {
             Some(bucket) if bucket.start_unix_ms == bucket_start_unix_ms => {
                 bucket.calls += 1;
@@ -222,7 +220,8 @@ impl NonblockingMonitorActor {
         let end_unix_ms = phase.latest_end_unix_ms.min(blocking_unix_ms);
         let duration_ms = (end_unix_ms - phase.begin_unix_ms).max(1);
         let latest_rate_window_ms = duration_ms.min(LATEST_RATE_WINDOW_MAX_MS);
-        let latest_rate_window_calls = phase.latest_window_calls(end_unix_ms, latest_rate_window_ms);
+        let latest_rate_window_calls =
+            phase.latest_window_calls(end_unix_ms, latest_rate_window_ms);
         let duration_s = (latest_rate_window_ms as f64) / 1000.0;
         let rps = (latest_rate_window_calls as f64) / duration_s;
         let ts_ms = Self::now_ms();
@@ -230,7 +229,11 @@ impl NonblockingMonitorActor {
         let series = vec![
             self.ts_one_latest_phase_calls(latest_rate_window_calls as f64, ts_ms),
             self.ts_one_latest_phase_rps(rps, ts_ms),
-            self.ts_one_latest_interval(PROM_VALUE_MQ_INTERVAL_BEGIN, phase.begin_unix_ms as f64, ts_ms),
+            self.ts_one_latest_interval(
+                PROM_VALUE_MQ_INTERVAL_BEGIN,
+                phase.begin_unix_ms as f64,
+                ts_ms,
+            ),
             self.ts_one_latest_interval(PROM_VALUE_MQ_INTERVAL_END, end_unix_ms as f64, ts_ms),
         ];
         self.observe.try_submit_timeseries(series);
@@ -250,7 +253,11 @@ impl NonblockingMonitorActor {
         }
     }
 
-    fn labels(&self, metric_name: &'static str, extra_labels: &[(&'static str, String)]) -> Vec<Label> {
+    fn labels(
+        &self,
+        metric_name: &'static str,
+        extra_labels: &[(&'static str, String)],
+    ) -> Vec<Label> {
         let mut labels: Vec<Label> = Vec::with_capacity(8 + extra_labels.len());
         labels.push(Label {
             name: RW_LABEL_NAME.to_string(),
@@ -313,23 +320,35 @@ impl NonblockingMonitorActor {
 
     fn ts_one_latest_phase_calls(&self, value: f64, ts_ms: i64) -> TimeSeries {
         match self.kind {
-            NonblockingMonitorKind::Producer { .. } => {
-                self.ts_one(PROM_METRIC_MQ_PRODUCER_NONBLOCKING_LATEST_PHASE_CALLS, &[], value, ts_ms)
-            }
-            NonblockingMonitorKind::Consumer { .. } => {
-                self.ts_one(PROM_METRIC_MQ_CONSUMER_NONBLOCKING_LATEST_PHASE_CALLS, &[], value, ts_ms)
-            }
+            NonblockingMonitorKind::Producer { .. } => self.ts_one(
+                PROM_METRIC_MQ_PRODUCER_NONBLOCKING_LATEST_PHASE_CALLS,
+                &[],
+                value,
+                ts_ms,
+            ),
+            NonblockingMonitorKind::Consumer { .. } => self.ts_one(
+                PROM_METRIC_MQ_CONSUMER_NONBLOCKING_LATEST_PHASE_CALLS,
+                &[],
+                value,
+                ts_ms,
+            ),
         }
     }
 
     fn ts_one_latest_phase_rps(&self, value: f64, ts_ms: i64) -> TimeSeries {
         match self.kind {
-            NonblockingMonitorKind::Producer { .. } => {
-                self.ts_one(PROM_METRIC_MQ_PRODUCER_NONBLOCKING_LATEST_PHASE_RPS, &[], value, ts_ms)
-            }
-            NonblockingMonitorKind::Consumer { .. } => {
-                self.ts_one(PROM_METRIC_MQ_CONSUMER_NONBLOCKING_LATEST_PHASE_RPS, &[], value, ts_ms)
-            }
+            NonblockingMonitorKind::Producer { .. } => self.ts_one(
+                PROM_METRIC_MQ_PRODUCER_NONBLOCKING_LATEST_PHASE_RPS,
+                &[],
+                value,
+                ts_ms,
+            ),
+            NonblockingMonitorKind::Consumer { .. } => self.ts_one(
+                PROM_METRIC_MQ_CONSUMER_NONBLOCKING_LATEST_PHASE_RPS,
+                &[],
+                value,
+                ts_ms,
+            ),
         }
     }
 

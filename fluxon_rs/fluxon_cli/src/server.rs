@@ -13,17 +13,16 @@ use axum::routing::{any, get, post};
 use etcd_client::Client as EtcdClient;
 use fluxon_commu::{
     ClusterMember, ETCD_PREFIX_CLUSTER_MEMBER_BASE, EtcdPrefixScanAction, MemberRdmaControl,
-    NodeRole, cluster_member_base_key, cluster_owner_rdma_control_key,
-    scan_etcd_prefix_paginated,
+    NodeRole, cluster_member_base_key, cluster_owner_rdma_control_key, scan_etcd_prefix_paginated,
 };
 use hyper::Uri;
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnectorBuilder;
+use serde::Serialize;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{RwLock, watch};
-use serde::Serialize;
 
 use fluxon_util::{
     FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
@@ -684,10 +683,7 @@ fn parse_member_roles_list(raw: Option<&Vec<String>>) -> Result<Option<Vec<Membe
     Ok(Some(out))
 }
 
-fn kv_metric_promql_for_member(
-    spec: KvMetricSpec,
-    member_id: &str,
-) -> String {
+fn kv_metric_promql_for_member(spec: KvMetricSpec, member_id: &str) -> String {
     match spec.field {
         KvMetricValueField::PutRps => format!(
             "sum_over_time(kv_op_end_event{{node={member_id:?},op=\"put\",status=\"success\"}}[1s])"
@@ -753,8 +749,7 @@ fn prom_regex_escape_literal_local(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for ch in s.chars() {
         match ch {
-            '\\' | '.' | '+' | '*' | '?' | '|' | '{' | '}' | '(' | ')' | '[' | ']' | '^'
-            | '$' => {
+            '\\' | '.' | '+' | '*' | '?' | '|' | '{' | '}' | '(' | ')' | '[' | ']' | '^' | '$' => {
                 out.push('\\');
                 out.push(ch);
             }
@@ -892,10 +887,7 @@ async fn kv_metric_panel(
         let range = match prom.query_range(&promql, start_s, end_s, &step).await {
             Ok(v) => v,
             Err(e) => {
-                warnings.push(format!(
-                    "metric {} query_range failed: {}",
-                    spec.key, e
-                ));
+                warnings.push(format!("metric {} query_range failed: {}", spec.key, e));
                 cards.push(KvAggregateMetricCardWire {
                     metric: kv_metric_meta(spec),
                     latest: None,
@@ -907,9 +899,10 @@ async fn kv_metric_panel(
         let aggregate_series = range
             .into_iter()
             .flat_map(|series| {
-                series.values.into_iter().filter_map(|(ts, value)| {
-                    value.parse::<f64>().ok().map(|v| (ts, v))
-                })
+                series
+                    .values
+                    .into_iter()
+                    .filter_map(|(ts, value)| value.parse::<f64>().ok().map(|v| (ts, v)))
             })
             .collect::<Vec<_>>();
         let latest = aggregate_series.last().map(|(_, v)| *v);
@@ -1021,9 +1014,10 @@ async fn kv_metric_members(
         let series = range
             .into_iter()
             .flat_map(|series| {
-                series.values.into_iter().filter_map(|(ts, value)| {
-                    value.parse::<f64>().ok().map(|v| (ts, v))
-                })
+                series
+                    .values
+                    .into_iter()
+                    .filter_map(|(ts, value)| value.parse::<f64>().ok().map(|v| (ts, v)))
             })
             .collect::<Vec<_>>();
         rows.push(KvMemberSeriesWire {

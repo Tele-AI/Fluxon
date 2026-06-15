@@ -1,10 +1,5 @@
 schema_version: 1
 
-# store controls only the persistent experiment data location.
-# project_root is detected from the config path by walking upward to a repo-like root.
-store:
-  project_data_root: /mnt/disk_c/fluxon-store-experiment-yxrxy
-
 # runtime selects the manylinux OS baseline, target architectures, and Python ABI.
 # The script derives execution_substrate, base_system_key, and runtime_abi_key from these fields.
 runtime:
@@ -32,7 +27,6 @@ profile:
 # assembly is the authority object graph for the published profile view.
 # objects stay flat on purpose: each node has a kind, deps, and authority_ref.
 assembly:
-  baseline_path: /mnt/disk_c/fluxon-store-experiment-yxrxy/manylinux-release
   root_object: manylinuxProfileClosedSdk
   export_roots:
     published_profile_nix: manylinuxProfileClosedSdk
@@ -111,7 +105,6 @@ assembly:
 # manylinux contains runtime parameters for the actual wheel pack container run.
 # The manylinux version is derived from runtime.base_system and is not configured here.
 manylinux:
-  runtime_image_ref: pypack-builder-nix-experiment:latest
   transport_backend: tcp_thread
   rdma_backend: closed_sdk
   backend_plans:
@@ -136,5 +129,3 @@ manylinux:
           project_relative_path: fluxon_rs/target/vendor_runtime
       wheel_finalize_steps:
         - kind: add_vendor_runtime
-  cargo_registry_dir: /mnt/disk_c/fluxon-store-experiment-yxrxy/manylinux-cache/cargo-registry
-  cargo_git_dir: /mnt/disk_c/fluxon-store-experiment-yxrxy/manylinux-cache/cargo-git

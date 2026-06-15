@@ -8,6 +8,7 @@ import re
 import sys
 import tempfile
 import shutil
+import textwrap
 import uuid
 from pathlib import Path
 import subprocess
@@ -19,18 +20,63 @@ import yaml
 from utils.manylinux_version_utils import load_manylinux_version_static
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+DEFAULT_NIX_PACK_CONFIG_PATH = REPO_ROOT / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_static.yaml"
+repo_root_str = str(REPO_ROOT)
+if repo_root_str not in sys.path:
+    sys.path.insert(0, repo_root_str)
+
+from setup_and_pack.utils import wheel_runtime_helper
+
+
 PYO3_CHECKSUM_FILE_NAME = ".fluxon_pyo3_inputs.sha256"
+_FIXED_TRANSPORT_BACKEND = script_utils.PUBLIC_TRANSPORT_BACKEND
+_FIXED_TRANSPORT_PROFILE_ID = script_utils.PUBLIC_TRANSPORT_PROFILE_ID
 
 
-def _top_level_release_manifest_relpaths(*, wheel_py_name: str, wheel_pyo3_name: str) -> list[str]:
+def _top_level_release_manifest_relpaths(*, wheel_name: str) -> list[str]:
     relpaths = [
         "pylib_src.tar.gz",
-        wheel_py_name,
-        wheel_pyo3_name,
+        wheel_name,
         "ext_images.tar.gz",
         "ext_images/ext_images.sha256",
+        "closed_sdk/manifest.json",
+        "closed_sdk/lib/libfluxon_commu_core.so",
+        "closed_sdk/lib/libfluxon_rdma_probe.so",
+        "closed_sdk/native/native_runtime/include/rdma_probe_c.h",
+        "closed_sdk/native/native_runtime/lib/libfluxon_rdma_probe.so",
     ]
     return sorted(dict.fromkeys(relpaths))
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Pack release artifacts into a release directory")
+    parser.add_argument(
+        "--rdma-backend",
+        choices=script_utils.RDMA_BACKENDS,
+        default="closed_sdk",
+        help="Rust PyO3 RDMA transfer backend variant to build",
+    )
+    parser.add_argument(
+        "--release-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Release directory root; if relative, resolve against the repo root inferred from "
+            "this script path; defaults to <repo_root>/fluxon_release"
+        ),
+    )
+    parser.add_argument(
+        "--with-tikv-runtime",
+        choices=("true", "false"),
+        default="true",
+        help=(
+            "Whether ext_images in this release includes TiKV runtime binaries. "
+            "Set false for KV benchmark-only releases that do not run transfer/TiKV flows."
+        ),
+    )
+    return parser
 
 
 def main() -> int:
@@ -44,37 +90,7 @@ def main() -> int:
         #   executable outputs still use explicit per-file chmod at their authority write sites.
         os.umask(0)
         repo_root = Path(__file__).resolve().parent.parent
-        parser = argparse.ArgumentParser(description="Pack release artifacts into a release directory")
-        parser.add_argument(
-            "--transport-backend",
-            choices=script_utils.TRANSPORT_BACKENDS,
-            default="tcp_thread",
-            help="Rust PyO3 transport backend variant to build",
-        )
-        parser.add_argument(
-            "--rdma-backend",
-            choices=script_utils.RDMA_BACKENDS,
-            default="closed_sdk",
-            help="Rust PyO3 RDMA transfer backend variant to build",
-        )
-        parser.add_argument(
-            "--release-dir",
-            type=Path,
-            default=None,
-            help=(
-                "Release directory root; if relative, resolve against the repo root inferred from "
-                "this script path; defaults to <repo_root>/fluxon_release"
-            ),
-        )
-        parser.add_argument(
-            "--with-tikv-runtime",
-            choices=("true", "false"),
-            default="true",
-            help=(
-                "Whether ext_images in this release includes TiKV runtime binaries. "
-                "Set false for KV benchmark-only releases that do not run transfer/TiKV flows."
-            ),
-        )
+        parser = _build_arg_parser()
         args = parser.parse_args()
         release_dir = (
             _resolve_repo_root_cli_path(repo_root=repo_root, raw_path=args.release_dir, field_name="release-dir")
@@ -84,7 +100,6 @@ def main() -> int:
         _run_pack_steps(
             repo_root,
             release_dir=release_dir,
-            transport_backend=args.transport_backend,
             rdma_backend=args.rdma_backend,
             with_tikv_runtime=args.with_tikv_runtime == "true",
         )
@@ -100,18 +115,15 @@ def main() -> int:
             )
 
         with script_utils.stage("Seeding profile cache compatibility entries"):
-            _seed_profile_cache_compat_entries(
-                release_dir=release_dir,
-                transport_backend=args.transport_backend,
-            )
+            _seed_profile_cache_compat_entries(release_dir=release_dir)
 
-        wheel_py = _find_single(release_dir, "fluxon-*.whl", "pure python wheel")
+        wheel = _find_single(release_dir, "fluxon-*.whl", "release wheel")
         try:
             manylinux_version = load_manylinux_version_static(repo_root=repo_root)
         except Exception as e:
             print(f"ERROR: {e}", flush=True)
             raise SystemExit(1)
-        wheel_pyo3 = _find_pyo3_wheel(release_dir, manylinux_version=manylinux_version, what="pyo3 wheel")
+        _assert_no_top_level_pyo3_wheel(release_dir=release_dir, manylinux_version=manylinux_version)
 
         pylib_tar = release_dir / "pylib_src.tar.gz"
         with script_utils.stage("Packing pylib source tarball"):
@@ -130,8 +142,7 @@ def main() -> int:
 
         sha_manifest = release_dir / "fluxon_release.sha256"
         release_manifest_relpaths = _top_level_release_manifest_relpaths(
-            wheel_py_name=wheel_py.name,
-            wheel_pyo3_name=wheel_pyo3.name,
+            wheel_name=wheel.name,
         )
         with script_utils.stage("Writing sha256 manifest"):
             _write_sha256_manifest(
@@ -144,8 +155,7 @@ def main() -> int:
             _verify_sha256_manifest(manifest_path=sha_manifest)
 
         print(f"Packed release wheels into: {release_dir}")
-        print(f"- {wheel_py.name}")
-        print(f"- {wheel_pyo3.name}")
+        print(f"- {wheel.name}")
         print(f"Packed pylib source tarball into: {pylib_tar}")
         print(f"Packed ext_images tarball into: {ext_images_tar}")
         print(f"Wrote release sha256 manifest: {sha_manifest}")
@@ -167,7 +177,6 @@ def _run_pack_steps(
     repo_root: Path,
     *,
     release_dir: Path,
-    transport_backend: str,
     rdma_backend: str,
     with_tikv_runtime: bool,
 ) -> None:
@@ -177,14 +186,8 @@ def _run_pack_steps(
         selected_pyo3_wheel = _pack_rust_pyo3_wheel_via_nix(
             repo_root=repo_root,
             release_dir=release_dir,
-            transport_backend=transport_backend,
             rdma_backend=rdma_backend,
         )
-    _prune_release_wheels_except(
-        release_dir=release_dir,
-        pattern="fluxon_pyo3-*.whl",
-        keep_path=selected_pyo3_wheel,
-    )
 
     _remove_release_wheels(
         release_dir=release_dir,
@@ -200,6 +203,14 @@ def _run_pack_steps(
         subprocess.check_call(
             [sys.executable, str(pack_py), "--release-dir", str(release_dir)],
             cwd=str(repo_root),
+        )
+
+    wheel_py = _find_single(release_dir, "fluxon-*.whl", "pure python wheel")
+    with script_utils.stage("Assembling unified release wheel"):
+        _assemble_unified_release_wheel(
+            release_dir=release_dir,
+            pure_python_wheel=wheel_py,
+            pyo3_wheel=selected_pyo3_wheel,
         )
 
 
@@ -254,16 +265,26 @@ def _seed_invariant_release_runtime(
         cwd=str(repo_root),
     )
 
+    closed_sdk_src = (repo_root / "fluxon_release" / "closed_sdk").resolve()
+    if not closed_sdk_src.exists() or not closed_sdk_src.is_dir():
+        print(f"Missing tracked closed_sdk runtime seed for release: {closed_sdk_src}")
+        raise SystemExit(1)
+    closed_sdk_dst = release_dir / "closed_sdk"
+    if closed_sdk_dst.resolve() == closed_sdk_src:
+        return
+    if closed_sdk_dst.exists():
+        if closed_sdk_dst.is_dir() and not closed_sdk_dst.is_symlink():
+            shutil.rmtree(closed_sdk_dst)
+        else:
+            closed_sdk_dst.unlink()
+    shutil.copytree(closed_sdk_src, closed_sdk_dst, dirs_exist_ok=False)
 
-def _seed_profile_cache_compat_entries(*, release_dir: Path, transport_backend: str) -> None:
-    profile_id = script_utils.TRANSPORT_PROFILE_IDS.get(str(transport_backend).strip())
-    if not profile_id:
-        raise ValueError(f"unsupported transport backend for profile cache compatibility: {transport_backend}")
 
+def _seed_profile_cache_compat_entries(*, release_dir: Path) -> None:
     profiles_dir = release_dir / "profiles"
     profiles_dir.mkdir(parents=True, exist_ok=True)
 
-    profile_link = profiles_dir / profile_id
+    profile_link = profiles_dir / _FIXED_TRANSPORT_PROFILE_ID
     expected_target = Path("..")
     if profile_link.is_symlink():
         if Path(os.readlink(profile_link)) == expected_target:
@@ -286,6 +307,134 @@ def _remove_release_wheels(
             continue
         if path.is_file() or path.is_symlink():
             path.unlink()
+
+
+def _assemble_unified_release_wheel(
+    *,
+    release_dir: Path,
+    pure_python_wheel: Path,
+    pyo3_wheel: Path,
+) -> Path:
+    release_dir = release_dir.resolve()
+    pure_python_wheel = pure_python_wheel.resolve()
+    pyo3_wheel = pyo3_wheel.resolve()
+    merged_wheel_name = _merged_fluxon_wheel_name(
+        pure_python_wheel_name=pure_python_wheel.name,
+        pyo3_wheel_name=pyo3_wheel.name,
+    )
+    merged_wheel_path = release_dir / merged_wheel_name
+    if merged_wheel_path.exists():
+        merged_wheel_path.unlink()
+    wheel_runtime_helper.merge_binary_wheel(
+        output_wheel_path=str(merged_wheel_path),
+        pure_python_wheel_path=str(pure_python_wheel),
+        runtime_wheel_path=str(pyo3_wheel),
+    )
+    if not _release_wheel_import_probe_ok(merged_wheel_path):
+        raise RuntimeError(f"merged release wheel failed import probe: {merged_wheel_path}")
+    pure_python_wheel.unlink(missing_ok=True)
+    pyo3_wheel.unlink(missing_ok=True)
+    return merged_wheel_path
+
+
+def _merged_fluxon_wheel_name(*, pure_python_wheel_name: str, pyo3_wheel_name: str) -> str:
+    pure_parts = pure_python_wheel_name.split("-")
+    pyo3_parts = pyo3_wheel_name.split("-")
+    if len(pure_parts) < 2:
+        raise RuntimeError(f"invalid pure-python wheel filename: {pure_python_wheel_name}")
+    if len(pyo3_parts) < 5:
+        raise RuntimeError(f"invalid pyo3 wheel filename: {pyo3_wheel_name}")
+    version = pure_parts[1]
+    tag_parts = pyo3_parts[-3:]
+    return "-".join(["fluxon", version, *tag_parts])
+
+
+def _assert_no_top_level_pyo3_wheel(*, release_dir: Path, manylinux_version: str) -> None:
+    lingering = _maybe_find_pyo3_wheel(release_dir, manylinux_version=manylinux_version)
+    if lingering is not None:
+        raise RuntimeError(f"release dir still contains top-level fluxon_pyo3 wheel after merge: {lingering}")
+
+
+def _release_wheel_import_probe_ok(wheel_path: Path) -> bool:
+    wheel_path = wheel_path.resolve()
+    if not wheel_path.is_file():
+        print(f"Release wheel import probe skipped; file is missing: {wheel_path}")
+        return False
+    with tempfile.TemporaryDirectory(prefix="fluxon_pack_release_unified_probe_") as temp_dir_str:
+        temp_dir = Path(temp_dir_str)
+        venv_dir = temp_dir / "venv"
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(venv_dir)],
+            check=True,
+            cwd=str(temp_dir),
+        )
+        probe_python = venv_dir / "bin" / "python"
+        probe_pip = venv_dir / "bin" / "pip"
+        install_completed = subprocess.run(
+            [str(probe_pip), "install", "--no-deps", "--no-cache-dir", str(wheel_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(temp_dir),
+        )
+        if install_completed.returncode != 0:
+            print(f"Release wheel import probe install failed for {wheel_path}: rc={install_completed.returncode}")
+            if install_completed.stdout.strip():
+                print(install_completed.stdout.rstrip())
+            if install_completed.stderr.strip():
+                print(install_completed.stderr.rstrip())
+            return False
+        probe_completed = subprocess.run(
+            [
+                str(probe_python),
+                "-c",
+                _release_wheel_import_probe_code(),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(temp_dir),
+        )
+        if probe_completed.returncode == 0:
+            return True
+        print(f"Release wheel import probe failed for {wheel_path}: rc={probe_completed.returncode}")
+        if probe_completed.stdout.strip():
+            print(probe_completed.stdout.rstrip())
+        if probe_completed.stderr.strip():
+            print(probe_completed.stderr.rstrip())
+        return False
+
+
+def _release_wheel_import_probe_code() -> str:
+    return textwrap.dedent(
+        """
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        probe_path = None
+        for raw_path in sys.path:
+            if not raw_path:
+                continue
+            candidate = Path(raw_path) / "fluxon_py" / "tool" / "pyo3.py"
+            if candidate.is_file():
+                probe_path = candidate
+                break
+        if probe_path is None:
+            raise RuntimeError("missing fluxon_py/tool/pyo3.py in installed wheel")
+
+        spec = importlib.util.spec_from_file_location("_fluxon_release_probe_tool_pyo3", probe_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"failed to load release probe helper from {probe_path}")
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        imported_module = module.import_fluxon_pyo3_local()
+        if getattr(imported_module, "__file__", None) is None:
+            raise RuntimeError("fluxon_pyo3 loaded but __file__ is missing")
+        print("IMPORT_OK")
+        """
+    )
 
 
 def _load_nix_module(repo_root: Path):
@@ -330,6 +479,11 @@ def _load_nix_layout_module(repo_root: Path):
     return module
 
 
+def _load_nix_config_root(*, repo_root: Path, config_path: Path) -> dict:
+    nix_layout_module = _load_nix_layout_module(repo_root)
+    return nix_layout_module.load_experiment_config_root(config_path=config_path)
+
+
 def _nix_release_layout_paths(
     repo_root: Path,
     *,
@@ -338,7 +492,7 @@ def _nix_release_layout_paths(
     instance_id: str,
     target_cache_namespace: str,
 ) -> tuple[Path, Path]:
-    config_path = repo_root / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib.yaml"
+    config_path = DEFAULT_NIX_PACK_CONFIG_PATH.resolve()
     if not config_path.exists():
         print(f"Missing NIX pack config: {config_path}")
         raise SystemExit(1)
@@ -362,7 +516,8 @@ def _nix_release_layout_paths(
     runtime_targets = nix_layout_module.build_runtime_targets(spec=spec)
     if len(runtime_targets) != 1:
         raise RuntimeError(
-            "pack_release.py expects exactly one runtime target in setup_and_pack/nix/pack_fluxonkv_pylib.yaml"
+            "pack_release.py expects exactly one runtime target in nix pack config: "
+            + str(config_path)
         )
     layout = nix_layout_module.build_layout(spec=spec, runtime_target=runtime_targets[0])
     return config_path, layout.instance_release_dir.resolve()
@@ -372,7 +527,6 @@ def _pack_rust_pyo3_wheel_via_nix(
     *,
     repo_root: Path,
     release_dir: Path,
-    transport_backend: str,
     rdma_backend: str,
 ) -> Path:
     manylinux_version = load_manylinux_version_static(repo_root=repo_root)
@@ -380,7 +534,7 @@ def _pack_rust_pyo3_wheel_via_nix(
     pack_state = nix_module.PyO3PackState(
         repo_root=repo_root,
         manylinux_version=manylinux_version,
-        transport_backend=transport_backend,
+        transport_backend=_FIXED_TRANSPORT_BACKEND,
         rdma_backend=rdma_backend,
         release_dir=release_dir,
     )
@@ -399,10 +553,10 @@ def _pack_rust_pyo3_wheel_via_nix(
         reused_release_wheel.unlink(missing_ok=True)
 
     run_id = uuid.uuid4().hex
-    profile_name = f"pack_release_{transport_backend}_{rdma_backend}_{run_id}"
+    profile_name = f"pack_release_{_FIXED_TRANSPORT_BACKEND}_{rdma_backend}_{run_id}"
     assembly_name = profile_name
     instance_id = profile_name
-    target_cache_namespace = f"pack_release_{transport_backend}_{rdma_backend}"
+    target_cache_namespace = f"pack_release_{_FIXED_TRANSPORT_BACKEND}_{rdma_backend}"
     config_template_path, instance_release_dir = _nix_release_layout_paths(
         repo_root,
         profile_name=profile_name,
@@ -456,7 +610,7 @@ def _pack_rust_pyo3_wheel_via_nix(
     nix_runs_dir.mkdir(parents=True, exist_ok=True)
 
     with tempfile.NamedTemporaryFile(
-        prefix=f"fluxon_pack_release_nix_{transport_backend}_",
+        prefix=f"fluxon_pack_release_nix_{_FIXED_TRANSPORT_BACKEND}_",
         suffix=".yaml",
         delete=False,
         dir=str(nix_runs_dir),
@@ -468,7 +622,6 @@ def _pack_rust_pyo3_wheel_via_nix(
             _render_nix_pack_config(
                 template_path=config_template_path,
                 repo_root=repo_root,
-                transport_backend=transport_backend,
                 rdma_backend=rdma_backend,
                 profile_name=profile_name,
                 assembly_name=assembly_name,
@@ -577,20 +730,19 @@ def _render_nix_pack_config(
     *,
     template_path: Path,
     repo_root: Path,
-    transport_backend: str,
     rdma_backend: str,
     profile_name: str,
     assembly_name: str,
     instance_id: str,
     target_cache_namespace: str,
 ) -> str:
-    cfg = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+    cfg = _load_nix_config_root(repo_root=repo_root, config_path=template_path)
     if not isinstance(cfg, dict):
         raise RuntimeError(f"NIX pack config must be a mapping: {template_path}")
     manylinux_cfg = cfg.get("manylinux")
     if not isinstance(manylinux_cfg, dict):
         raise RuntimeError(f"NIX pack config is missing mapping field manylinux: {template_path}")
-    manylinux_cfg["transport_backend"] = transport_backend
+    manylinux_cfg["transport_backend"] = _FIXED_TRANSPORT_BACKEND
     manylinux_cfg["rdma_backend"] = rdma_backend
 
     runtime_cfg = cfg.get("runtime")

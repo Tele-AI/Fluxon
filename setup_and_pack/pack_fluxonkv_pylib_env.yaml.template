@@ -1,0 +1,21 @@
+schema_version: 1
+
+# Copy this file to ../pack_fluxonkv_pylib_env.yaml and adjust the local paths.
+# The real setup_and_pack/pack_fluxonkv_pylib_env.yaml is gitignored on purpose.
+
+# host_paths.root_path is the single host-specific root used to derive:
+# - store.project_data_root
+# - assembly.baseline_path
+# - manylinux.cargo_registry_dir
+# - manylinux.cargo_git_dir
+#
+# Derived defaults:
+# - project_data_root = <root_path>
+# - baseline_path = <root_path>/manylinux-release
+# - cargo_registry_dir = <root_path>/manylinux-cache/cargo-registry
+# - cargo_git_dir = <root_path>/manylinux-cache/cargo-git
+host_paths:
+  root_path: /opt/example/fluxon-store-experiment
+
+manylinux:
+  runtime_image_ref: example-manylinux-builder:latest

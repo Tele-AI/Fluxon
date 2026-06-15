@@ -117,9 +117,7 @@ impl ClientTransferEngineCore {
 
     #[inline]
     pub fn is_running(&self) -> bool {
-        {
-            self.closed.running.load(Ordering::Relaxed)
-        }
+        { self.closed.running.load(Ordering::Relaxed) }
     }
 
     pub async fn current_runtime_config(&self) -> ClientTransferEngineRuntimeConfig {
@@ -417,7 +415,7 @@ impl ClientTransferEngineCore {
         }
     }
 
-pub async fn transfer_data_no_copy<R>(
+    pub async fn transfer_data_no_copy<R>(
         &self,
         runtime: R,
         peer_node: Option<NodeIDString>,

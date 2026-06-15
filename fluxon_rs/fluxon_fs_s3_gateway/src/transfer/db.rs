@@ -1,6 +1,6 @@
-use fluxon_fs_core::config::FluxonFsTransferManifestWire;
 #[cfg(test)]
 use fluxon_fs_core::config::FluxonFsTransferManifestEntryWire;
+use fluxon_fs_core::config::FluxonFsTransferManifestWire;
 use fluxon_fs_core::path::safe_relpath;
 
 pub(crate) fn normalize_transfer_root_relpath(raw: &str) -> Result<String, String> {
@@ -11,11 +11,7 @@ pub(crate) fn normalize_transfer_root_relpath(raw: &str) -> Result<String, Strin
     safe_relpath(trimmed)
         .map(|v| {
             let s = v.to_string();
-            if s.is_empty() {
-                ".".to_string()
-            } else {
-                s
-            }
+            if s.is_empty() { ".".to_string() } else { s }
         })
         .map_err(|e| format!("invalid transfer root relpath: input={} err={}", raw, e))
 }

@@ -91,15 +91,13 @@ pub const PROM_METRIC_TCP_THREAD_TRANSPORT_BYTES_TOTAL: &str = "tcp_thread_trans
 pub const PROM_METRIC_TCP_THREAD_TRANSPORT_MESSAGES_TOTAL: &str =
     "tcp_thread_transport_messages_total";
 pub const PROM_METRIC_P2P_RECV_TRANSPORT_BYTES_TOTAL: &str = "p2p_recv_transport_bytes_total";
-pub const PROM_METRIC_P2P_RECV_TRANSPORT_MESSAGES_TOTAL: &str =
-    "p2p_recv_transport_messages_total";
+pub const PROM_METRIC_P2P_RECV_TRANSPORT_MESSAGES_TOTAL: &str = "p2p_recv_transport_messages_total";
 pub const PROM_METRIC_P2P_RPC_COMPLETION_LATENCY_STAT_US: &str =
     "p2p_rpc_completion_latency_stat_microseconds";
 pub const PROM_METRIC_P2P_RPC_COMPLETION_LATENCY_SAMPLE_COUNT: &str =
     "p2p_rpc_completion_latency_sample_count";
 pub const PROM_METRIC_P2P_RPC_COMPLETION_BYTES_TOTAL: &str = "p2p_rpc_completion_bytes_total";
-pub const PROM_METRIC_P2P_RPC_COMPLETION_MESSAGES_TOTAL: &str =
-    "p2p_rpc_completion_messages_total";
+pub const PROM_METRIC_P2P_RPC_COMPLETION_MESSAGES_TOTAL: &str = "p2p_rpc_completion_messages_total";
 pub const PROM_VALUE_P2P_RPC_COMPLETION_METRIC_RESPONSE_SUBMITTED: &str = "response_submitted";
 pub const PROM_VALUE_P2P_RPC_COMPLETION_METRIC_RESPONSE_SUBMIT_FAILED: &str =
     "response_submit_failed";

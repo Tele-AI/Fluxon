@@ -1,16 +1,14 @@
-use std::sync::Arc;
-use std::collections::BTreeSet;
 use fluxon_fs_core::config::{
-    FluxonFsTransferBatchKind, FluxonFsTransferBatchState,
-    FluxonFsTransferCollectInfoKind, FluxonFsTransferFailedFileReasonKindWire,
-    FluxonFsTransferJobState, FluxonFsTransferScanResultWire,
-    FluxonFsTransferWorkerHeartbeatResultWire, FluxonFsTransferWorkerHeartbeatWire,
-    FluxonFsTransferWorkerHeartbeatTelemetryWire,
-    FluxonFsTransferWorkerResultAckWire,
+    FluxonFsTransferBatchKind, FluxonFsTransferBatchState, FluxonFsTransferCollectInfoKind,
+    FluxonFsTransferFailedFileReasonKindWire, FluxonFsTransferJobState,
+    FluxonFsTransferScanResultWire, FluxonFsTransferWorkerHeartbeatResultWire,
+    FluxonFsTransferWorkerHeartbeatTelemetryWire, FluxonFsTransferWorkerHeartbeatWire,
+    FluxonFsTransferWorkerResultAckWire, FluxonFsTransferWorkerResultWire,
     FluxonFsTransferWorkerStopReasonWire,
-    FluxonFsTransferWorkerResultWire,
 };
 use parking_lot::Mutex;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub const DEFAULT_TRANSFER_JOB_DESIRED_SCAN_CONCURRENCY: i64 = 10;
 
@@ -320,9 +318,7 @@ pub(crate) struct FsTransferWorkerHeartbeatLiveTelemetry {
 }
 
 impl FsTransferWorkerHeartbeatLiveTelemetry {
-    pub(crate) fn from_wire(
-        wire: &FluxonFsTransferWorkerHeartbeatTelemetryWire,
-    ) -> Self {
+    pub(crate) fn from_wire(wire: &FluxonFsTransferWorkerHeartbeatTelemetryWire) -> Self {
         Self {
             total_written_bytes: wire.total_written_bytes,
             window_started_unix_ms: wire.window_started_unix_ms,
@@ -362,7 +358,8 @@ pub trait TransferStateStore: Send + Sync {
         desired_scan_concurrency: i64,
         desired_worker_count: i64,
     ) -> Result<FsTransferJobRecord, String>;
-    fn load_transfer_job_record(&self, job_id: &str) -> Result<Option<FsTransferJobRecord>, String>;
+    fn load_transfer_job_record(&self, job_id: &str)
+    -> Result<Option<FsTransferJobRecord>, String>;
     fn load_transfer_job_records(&self) -> Result<Vec<FsTransferJobRecord>, String>;
     fn load_transfer_job_summary_snapshots(
         &self,
@@ -371,7 +368,10 @@ pub trait TransferStateStore: Send + Sync {
         &self,
         job_id: &str,
     ) -> Result<Option<FsTransferSchedulerJobSnapshot>, String>;
-    fn load_transfer_job_snapshot(&self, job_id: &str) -> Result<Option<FsTransferJobSnapshot>, String>;
+    fn load_transfer_job_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<FsTransferJobSnapshot>, String>;
     fn load_transfer_batch_record(
         &self,
         job_id: &str,
@@ -390,7 +390,9 @@ pub trait TransferStateStore: Send + Sync {
         &self,
         job_id: &str,
     ) -> Result<Vec<FsTransferDirectFilesCompleteRecord>, String>;
-    fn load_transfer_worker_attempt_records(&self) -> Result<Vec<FsTransferWorkerAttemptRecord>, String>;
+    fn load_transfer_worker_attempt_records(
+        &self,
+    ) -> Result<Vec<FsTransferWorkerAttemptRecord>, String>;
     fn load_transfer_batch_collect_info_records(
         &self,
     ) -> Result<Vec<FsTransferBatchCollectInfoRecord>, String>;

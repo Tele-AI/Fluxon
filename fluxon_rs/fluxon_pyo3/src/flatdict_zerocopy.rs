@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use fluxon_kv::memholder::kvclient_encode::{
     BorrowedFlatKvValueRange, FLAT_KV_TYPE_BOOL, FLAT_KV_TYPE_BYTES, FLAT_KV_TYPE_FLOAT64,
-    FLAT_KV_TYPE_INT64, FLAT_KV_TYPE_STRING, calc_flat_dict_encoded_len,
-    flat_kv_decode_borrowed, write_flat_dict_ptrs_to_ptr,
+    FLAT_KV_TYPE_INT64, FLAT_KV_TYPE_STRING, calc_flat_dict_encoded_len, flat_kv_decode_borrowed,
+    write_flat_dict_ptrs_to_ptr,
 };
 use fluxon_kv::memholder::{
     ExternalMemHolder as RustExternalMemHolder, UserMemHolder as RustMemHolder,
@@ -16,7 +16,9 @@ use fluxon_kv::rpcresp_kvresult_convert::msg_and_error::{
 use pyo3::exceptions::PyValueError;
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBool, PyBytes, PyCapsule, PyCapsuleMethods, PyDict, PyFloat, PyInt, PyString};
+use pyo3::types::{
+    PyAny, PyBool, PyBytes, PyCapsule, PyCapsuleMethods, PyDict, PyFloat, PyInt, PyString,
+};
 
 pub(crate) const INTERNAL_DLPACK_META_KEY: &str = "__fluxon_internal_dlpack_meta__";
 pub(crate) const DLPACK_CAPSULE_NAME: &[u8] = b"dltensor";
@@ -171,7 +173,8 @@ impl FlatDictEncodePlan {
 
     pub(crate) fn encode(mut self) -> Result<Vec<u8>, CoreKvError> {
         if !self.dlpack_meta_entries.is_empty() {
-            let dlpack_meta_payload = encode_dlpack_meta_entries(self.dlpack_meta_entries.as_slice())?;
+            let dlpack_meta_payload =
+                encode_dlpack_meta_entries(self.dlpack_meta_entries.as_slice())?;
             self.push_owned_bytes_entry(
                 FLAT_KV_TYPE_BYTES,
                 INTERNAL_DLPACK_META_KEY.as_bytes().to_vec(),
@@ -320,7 +323,9 @@ unsafe extern "C" fn flatdict_dlpack_capsule_destructor(capsule: *mut ffi::PyObj
     if capsule.is_null() {
         return;
     }
-    if unsafe { ffi::PyCapsule_IsValid(capsule, DLPACK_USED_CAPSULE_NAME_CSTR.as_ptr().cast()) } == 1 {
+    if unsafe { ffi::PyCapsule_IsValid(capsule, DLPACK_USED_CAPSULE_NAME_CSTR.as_ptr().cast()) }
+        == 1
+    {
         return;
     }
     if unsafe { ffi::PyCapsule_IsValid(capsule, DLPACK_CAPSULE_NAME_CSTR.as_ptr().cast()) } != 1 {
@@ -339,7 +344,8 @@ unsafe extern "C" fn flatdict_dlpack_capsule_destructor(capsule: *mut ffi::PyObj
     if deleter_ptr.is_null() {
         return;
     }
-    let deleter: unsafe extern "C" fn(*mut DlManagedTensor) = unsafe { std::mem::transmute(deleter_ptr) };
+    let deleter: unsafe extern "C" fn(*mut DlManagedTensor) =
+        unsafe { std::mem::transmute(deleter_ptr) };
     unsafe { deleter(managed) };
 }
 
@@ -362,7 +368,8 @@ fn new_dlpack_capsule(
             "DLPack data range exceeds payload bounds",
         ));
     }
-    let ndim = i32::try_from(shape.len()).map_err(|_| PyValueError::new_err("DLPack ndim too large"))?;
+    let ndim =
+        i32::try_from(shape.len()).map_err(|_| PyValueError::new_err("DLPack ndim too large"))?;
     let data_ptr = unsafe { owner_bytes.as_ptr().add(data_offset) } as *mut c_void;
     let shape_ptr = if shape.is_empty() {
         std::ptr::null()
@@ -411,11 +418,11 @@ fn new_dlpack_capsule(
 }
 
 fn range_slice<'a>(data: &'a [u8], start: usize, len: usize) -> Result<&'a [u8], CoreKvError> {
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| CoreKvError::Api(CoreApiError::InvalidArgument {
+    let end = start.checked_add(len).ok_or_else(|| {
+        CoreKvError::Api(CoreApiError::InvalidArgument {
             detail: "flat dict bytes range overflow".to_string(),
-        }))?;
+        })
+    })?;
     if end > data.len() {
         return Err(CoreKvError::Api(CoreApiError::InvalidArgument {
             detail: "flat dict bytes range out of bounds".to_string(),
@@ -442,9 +449,11 @@ fn calc_dlpack_nbytes(bits: u8, lanes: u16, shape: &[i64]) -> Result<usize, Core
                 detail: "dlpack shape contains negative dimension".to_string(),
             }));
         }
-        let dim_u64 = u64::try_from(*dim).map_err(|_| CoreKvError::Api(CoreApiError::InvalidArgument {
-            detail: "dlpack dimension out of range".to_string(),
-        }))?;
+        let dim_u64 = u64::try_from(*dim).map_err(|_| {
+            CoreKvError::Api(CoreApiError::InvalidArgument {
+                detail: "dlpack dimension out of range".to_string(),
+            })
+        })?;
         numel = numel.checked_mul(dim_u64).ok_or_else(|| {
             CoreKvError::Api(CoreApiError::InvalidArgument {
                 detail: "dlpack element count overflow".to_string(),
@@ -453,17 +462,21 @@ fn calc_dlpack_nbytes(bits: u8, lanes: u16, shape: &[i64]) -> Result<usize, Core
     }
     let itemsize = u64::from(bits / 8)
         .checked_mul(u64::from(lanes))
-        .ok_or_else(|| CoreKvError::Api(CoreApiError::InvalidArgument {
-            detail: "dlpack itemsize overflow".to_string(),
-        }))?;
+        .ok_or_else(|| {
+            CoreKvError::Api(CoreApiError::InvalidArgument {
+                detail: "dlpack itemsize overflow".to_string(),
+            })
+        })?;
     let nbytes = numel.checked_mul(itemsize).ok_or_else(|| {
         CoreKvError::Api(CoreApiError::InvalidArgument {
             detail: "dlpack nbytes overflow".to_string(),
         })
     })?;
-    usize::try_from(nbytes).map_err(|_| CoreKvError::Api(CoreApiError::InvalidArgument {
-        detail: "dlpack nbytes out of range".to_string(),
-    }))
+    usize::try_from(nbytes).map_err(|_| {
+        CoreKvError::Api(CoreApiError::InvalidArgument {
+            detail: "dlpack nbytes out of range".to_string(),
+        })
+    })
 }
 
 fn decode_dlpack_meta(data: &[u8]) -> Result<BTreeMap<String, DecodedDlpackMeta>, CoreKvError> {
@@ -544,7 +557,9 @@ fn decode_dlpack_meta(data: &[u8]) -> Result<BTreeMap<String, DecodedDlpackMeta>
     Ok(out)
 }
 
-pub(crate) fn encode_dlpack_meta_entries(entries: &[DlpackMetaEntry]) -> Result<Vec<u8>, CoreKvError> {
+pub(crate) fn encode_dlpack_meta_entries(
+    entries: &[DlpackMetaEntry],
+) -> Result<Vec<u8>, CoreKvError> {
     let mut out = Vec::<u8>::new();
     let count = u32::try_from(entries.len()).map_err(|_| {
         CoreKvError::Api(CoreApiError::Unknown {
@@ -684,7 +699,9 @@ fn extract_py_dlpack_encode_field(
             let dim = unsafe { *tensor.shape.add(idx) };
             if dim < 0 {
                 return Err(CoreKvError::Api(CoreApiError::Unknown {
-                    detail: format!("rpc handler field {key:?} dlpack shape contains negative dimension"),
+                    detail: format!(
+                        "rpc handler field {key:?} dlpack shape contains negative dimension"
+                    ),
                 }));
             }
             let dim_u64 = u64::try_from(dim).map_err(|_| {
@@ -837,9 +854,11 @@ pub(crate) fn build_py_flat_dict_encode_plan(
         if let Ok(py_string) = value_obj.downcast::<PyString>() {
             let value_utf8 = py_string
                 .extract::<String>()
-                .map_err(|err| CoreKvError::Api(CoreApiError::Unknown {
-                    detail: format!("rpc handler string field {key:?} extract failed: {err}"),
-                }))?
+                .map_err(|err| {
+                    CoreKvError::Api(CoreApiError::Unknown {
+                        detail: format!("rpc handler string field {key:?} extract failed: {err}"),
+                    })
+                })?
                 .into_bytes();
             plan.push_owned_bytes_entry(FLAT_KV_TYPE_STRING, key_utf8, value_utf8, "string")?;
             continue;
@@ -890,11 +909,13 @@ pub(crate) fn decode_flat_dict_to_wrapped_py_object(
     data_owner: FlatDictDataOwner,
 ) -> Result<PyObject, CoreKvError> {
     let data = data_owner.bytes();
-    let items = py.allow_threads(|| flat_kv_decode_borrowed(data)).map_err(|err| {
-        CoreKvError::Api(CoreApiError::InvalidArgument {
-            detail: format!("flat dict decode failed: {}", err),
-        })
-    })?;
+    let items = py
+        .allow_threads(|| flat_kv_decode_borrowed(data))
+        .map_err(|err| {
+            CoreKvError::Api(CoreApiError::InvalidArgument {
+                detail: format!("flat dict decode failed: {}", err),
+            })
+        })?;
     let mut dlpack_meta = None::<BTreeMap<String, DecodedDlpackMeta>>;
     for item in &items {
         if item.key != INTERNAL_DLPACK_META_KEY {
@@ -954,9 +975,11 @@ pub(crate) fn decode_flat_dict_to_wrapped_py_object(
                         ),
                     )
                     .map(|obj| obj.into_py(py))
-                    .map_err(|err| CoreKvError::Api(CoreApiError::Unknown {
-                        detail: format!("build dlpack view failed: {err}"),
-                    }))?
+                    .map_err(|err| {
+                        CoreKvError::Api(CoreApiError::Unknown {
+                            detail: format!("build dlpack view failed: {err}"),
+                        })
+                    })?
                 } else {
                     PyBytes::new_bound(py, range_slice(data, start, len)?).into()
                 }

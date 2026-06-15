@@ -55,3 +55,4 @@ fluxon_release_*
 bench_suite.lock
 .bench-venv
 deployment/local/
+setup_and_pack/pack_fluxonkv_pylib_env.yaml

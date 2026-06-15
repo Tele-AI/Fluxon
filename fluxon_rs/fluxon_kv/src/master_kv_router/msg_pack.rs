@@ -311,6 +311,8 @@ impl MsgPackSerializePart for DeleteReq {
 }
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct DeleteResp {
+    pub deleted_put_time_ms: u64,
+    pub deleted_put_version: u32,
     pub error_code: ErrorCode,
     pub error_json: String,
 }

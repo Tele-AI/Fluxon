@@ -4,9 +4,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use fluxon_fs_core::config::{
     FluxonFsTransferJobState, FluxonFsTransferScanResultWire,
-    FluxonFsTransferWorkerStopReasonWire,
     FluxonFsTransferWorkerHeartbeatResultWire, FluxonFsTransferWorkerResultAckWire,
-    FluxonFsTransferWorkerResultWire,
+    FluxonFsTransferWorkerResultWire, FluxonFsTransferWorkerStopReasonWire,
 };
 
 use crate::GatewayState;
@@ -15,8 +14,8 @@ use super::db::normalize_transfer_root_relpath;
 use super::types::{
     FsTransferBatchCollectInfoRecord, FsTransferBatchFileIssueRecord, FsTransferCreateJobArg,
     FsTransferJobRecord, FsTransferJobSnapshot, FsTransferJobSummarySnapshot,
-    FsTransferReadyBatchClass, FsTransferReadyBatchDispatch,
-    FsTransferRecentFailureSnapshot, FsTransferSchedulerJobSnapshot,
+    FsTransferReadyBatchClass, FsTransferReadyBatchDispatch, FsTransferRecentFailureSnapshot,
+    FsTransferSchedulerJobSnapshot,
 };
 
 // Large scan events can monopolize the durable store actor long enough to
@@ -106,10 +105,13 @@ fn split_scan_store_apply_chunks(
 // arguments, forwards durable mutations into TransferStateStore, and wakes the
 // local scheduler actor. It is not the durable authority by itself.
 impl GatewayState {
-    fn transfer_state_store_enabled(&self) -> Result<&Arc<dyn super::types::TransferStateStore>, String> {
-        self.transfer_state_store
-            .as_ref()
-            .ok_or_else(|| "transfer feature is disabled because transfer_state_store is not configured".to_string())
+    fn transfer_state_store_enabled(
+        &self,
+    ) -> Result<&Arc<dyn super::types::TransferStateStore>, String> {
+        self.transfer_state_store.as_ref().ok_or_else(|| {
+            "transfer feature is disabled because transfer_state_store is not configured"
+                .to_string()
+        })
     }
 
     pub fn create_transfer_job(
@@ -222,15 +224,17 @@ impl GatewayState {
         if desired_scan_concurrency <= 0 {
             return Err("desired_scan_concurrency must be > 0".to_string());
         }
-        let job = self.transfer_state_store_enabled()?.import_transfer_prescan_job(
-            job_id,
-            src_export,
-            src_root_relpath,
-            dst_export,
-            dst_root_relpath,
-            desired_scan_concurrency,
-            desired_worker_count,
-        )?;
+        let job = self
+            .transfer_state_store_enabled()?
+            .import_transfer_prescan_job(
+                job_id,
+                src_export,
+                src_root_relpath,
+                dst_export,
+                dst_root_relpath,
+                desired_scan_concurrency,
+                desired_worker_count,
+            )?;
         self.transfer_history_record_job_meta(
             job.job_id.as_str(),
             job.src_export.as_str(),
@@ -242,7 +246,9 @@ impl GatewayState {
     }
 
     pub fn list_transfer_job_snapshots(&self) -> Result<Vec<FsTransferJobSnapshot>, String> {
-        let mut snapshots = self.transfer_state_store_enabled()?.load_transfer_job_snapshots()?;
+        let mut snapshots = self
+            .transfer_state_store_enabled()?
+            .load_transfer_job_snapshots()?;
         for snapshot in &mut snapshots {
             self.transfer_history_record_job_meta(
                 snapshot.job.job_id.as_str(),
@@ -256,9 +262,9 @@ impl GatewayState {
                 .collect::<BTreeMap<_, _>>();
             let mut live_detail = self
                 .transfer_job_live_detail_snapshot(
-                snapshot.job.job_id.as_str(),
-                &current_running_batch_owner_by_batch_id,
-            )
+                    snapshot.job.job_id.as_str(),
+                    &current_running_batch_owner_by_batch_id,
+                )
                 .unwrap_or(super::types::FsTransferJobLiveDetailSnapshot {
                     scan: super::types::FsTransferScanLiveDetailSnapshot {
                         queued_scan_unit_count: 0,
@@ -287,16 +293,17 @@ impl GatewayState {
                 });
             live_detail.scan.discovered_batch_count =
                 snapshot.job.scan_discovered_batch_count.max(0);
-            live_detail.scan.discovered_file_count =
-                snapshot.job.scan_discovered_file_count.max(0);
-            live_detail.scan.discovered_bytes =
-                snapshot.job.scan_discovered_bytes.max(0);
+            live_detail.scan.discovered_file_count = snapshot.job.scan_discovered_file_count.max(0);
+            live_detail.scan.discovered_bytes = snapshot.job.scan_discovered_bytes.max(0);
             snapshot.live_detail = Some(live_detail);
         }
         Ok(snapshots)
     }
 
-    pub fn transfer_job_snapshot(&self, job_id: &str) -> Result<Option<FsTransferJobSnapshot>, String> {
+    pub fn transfer_job_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<FsTransferJobSnapshot>, String> {
         let Some(mut snapshot) = self
             .transfer_state_store_enabled()?
             .load_transfer_job_snapshot(job_id)?
@@ -344,12 +351,9 @@ impl GatewayState {
                 recent_failures: Vec::new(),
                 active_workers: Vec::new(),
             });
-        live_detail.scan.discovered_batch_count =
-            snapshot.job.scan_discovered_batch_count.max(0);
-        live_detail.scan.discovered_file_count =
-            snapshot.job.scan_discovered_file_count.max(0);
-        live_detail.scan.discovered_bytes =
-            snapshot.job.scan_discovered_bytes.max(0);
+        live_detail.scan.discovered_batch_count = snapshot.job.scan_discovered_batch_count.max(0);
+        live_detail.scan.discovered_file_count = snapshot.job.scan_discovered_file_count.max(0);
+        live_detail.scan.discovered_bytes = snapshot.job.scan_discovered_bytes.max(0);
         snapshot.live_detail = Some(live_detail);
         Ok(Some(snapshot))
     }
@@ -372,7 +376,8 @@ impl GatewayState {
     }
 
     pub fn transfer_job_record(&self, job_id: &str) -> Result<Option<FsTransferJobRecord>, String> {
-        self.transfer_state_store_enabled()?.load_transfer_job_record(job_id)
+        self.transfer_state_store_enabled()?
+            .load_transfer_job_record(job_id)
     }
 
     pub fn list_transfer_job_summaries(&self) -> Result<Vec<FsTransferJobSummarySnapshot>, String> {
@@ -418,10 +423,8 @@ impl GatewayState {
                 });
             live_detail.scan.discovered_batch_count =
                 summary.job.scan_discovered_batch_count.max(0);
-            live_detail.scan.discovered_file_count =
-                summary.job.scan_discovered_file_count.max(0);
-            live_detail.scan.discovered_bytes =
-                summary.job.scan_discovered_bytes.max(0);
+            live_detail.scan.discovered_file_count = summary.job.scan_discovered_file_count.max(0);
+            live_detail.scan.discovered_bytes = summary.job.scan_discovered_bytes.max(0);
             summary.live_detail = Some(live_detail);
         }
         Ok(summaries)
@@ -435,14 +438,12 @@ impl GatewayState {
         let Some(snapshot) = self.transfer_job_snapshot(job_id)? else {
             return Ok(None);
         };
-        Ok(snapshot
-            .live_detail
-            .and_then(|detail| {
-                detail
-                    .recent_failures
-                    .into_iter()
-                    .find(|failure| failure.failure_index == failure_index)
-            }))
+        Ok(snapshot.live_detail.and_then(|detail| {
+            detail
+                .recent_failures
+                .into_iter()
+                .find(|failure| failure.failure_index == failure_index)
+        }))
     }
 
     pub fn transfer_job_file_issues(
@@ -492,12 +493,16 @@ impl GatewayState {
     }
 
     pub fn list_running_transfer_jobs(&self) -> Result<Vec<FsTransferJobRecord>, String> {
-        let mut jobs = self.transfer_state_store_enabled()?.load_transfer_job_records()?;
+        let mut jobs = self
+            .transfer_state_store_enabled()?
+            .load_transfer_job_records()?;
         jobs.retain(|job| job.state == FluxonFsTransferJobState::Running);
         Ok(jobs)
     }
 
-    pub fn list_transfer_batches(&self) -> Result<Vec<super::types::FsTransferBatchRecord>, String> {
+    pub fn list_transfer_batches(
+        &self,
+    ) -> Result<Vec<super::types::FsTransferBatchRecord>, String> {
         self.transfer_state_store_enabled()?.load_transfer_batches()
     }
 
@@ -527,7 +532,8 @@ impl GatewayState {
     pub fn list_transfer_worker_attempt_records(
         &self,
     ) -> Result<Vec<super::types::FsTransferWorkerAttemptRecord>, String> {
-        self.transfer_state_store_enabled()?.load_transfer_worker_attempt_records()
+        self.transfer_state_store_enabled()?
+            .load_transfer_worker_attempt_records()
     }
 
     pub fn list_transfer_batch_collect_infos(
@@ -599,7 +605,9 @@ impl GatewayState {
     }
 
     pub fn begin_transfer_scan_epoch(&self, job_id: &str) -> Result<i64, String> {
-        let epoch = self.transfer_state_store_enabled()?.begin_transfer_scan_epoch(job_id)?;
+        let epoch = self
+            .transfer_state_store_enabled()?
+            .begin_transfer_scan_epoch(job_id)?;
         self.note_transfer_scan_epoch_started(job_id);
         self.transfer_scan_scheduler.notify();
         Ok(epoch)
@@ -623,15 +631,16 @@ impl GatewayState {
         dst_exporter_id: &str,
         lease_expire_unix_ms: i64,
     ) -> Result<(), String> {
-        self.transfer_state_store_enabled()?.assign_transfer_batch_to_worker(
-            job_id,
-            batch_id,
-            src_exporter_id,
-            worker_id,
-            worker_task_id,
-            dst_exporter_id,
-            lease_expire_unix_ms,
-        )?;
+        self.transfer_state_store_enabled()?
+            .assign_transfer_batch_to_worker(
+                job_id,
+                batch_id,
+                src_exporter_id,
+                worker_id,
+                worker_task_id,
+                dst_exporter_id,
+                lease_expire_unix_ms,
+            )?;
         self.note_transfer_batch_assigned(
             job_id,
             batch_id,
@@ -652,14 +661,15 @@ impl GatewayState {
         err_text: &str,
         now_unix_ms: i64,
     ) -> Result<(), String> {
-        self.transfer_state_store_enabled()?.record_transfer_worker_launch_retry(
-            job_id,
-            batch_id,
-            worker_id,
-            worker_task_id,
-            err_text,
-            now_unix_ms,
-        )?;
+        self.transfer_state_store_enabled()?
+            .record_transfer_worker_launch_retry(
+                job_id,
+                batch_id,
+                worker_id,
+                worker_task_id,
+                err_text,
+                now_unix_ms,
+            )?;
         self.note_transfer_worker_launch_retry(job_id, worker_task_id, now_unix_ms, err_text);
         self.transfer_worker_scheduler.notify();
         Ok(())
@@ -673,13 +683,14 @@ impl GatewayState {
         worker_task_id: &str,
         now_unix_ms: i64,
     ) -> Result<(), String> {
-        self.transfer_state_store_enabled()?.mark_transfer_worker_launch_acknowledged(
-            job_id,
-            batch_id,
-            worker_id,
-            worker_task_id,
-            now_unix_ms,
-        )?;
+        self.transfer_state_store_enabled()?
+            .mark_transfer_worker_launch_acknowledged(
+                job_id,
+                batch_id,
+                worker_id,
+                worker_task_id,
+                now_unix_ms,
+            )?;
         self.note_transfer_worker_launch_acknowledged(job_id, worker_task_id);
         self.transfer_worker_scheduler.notify();
         Ok(())
@@ -695,15 +706,16 @@ impl GatewayState {
         err_text: &str,
         now_unix_ms: i64,
     ) -> Result<(), String> {
-        self.transfer_state_store_enabled()?.mark_transfer_worker_attempt_stopped(
-            job_id,
-            batch_id,
-            worker_id,
-            worker_task_id,
-            stop_reason,
-            err_text,
-            now_unix_ms,
-        )?;
+        self.transfer_state_store_enabled()?
+            .mark_transfer_worker_attempt_stopped(
+                job_id,
+                batch_id,
+                worker_id,
+                worker_task_id,
+                stop_reason,
+                err_text,
+                now_unix_ms,
+            )?;
         self.note_transfer_worker_stopped(
             job_id,
             worker_task_id,
@@ -785,13 +797,10 @@ impl GatewayState {
     }
 
     pub fn reconcile_transfer_scheduler_state(&self, now_unix_ms: i64) -> Result<(), String> {
-        let handle = self
-            .transfer_reconcile_handle
-            .as_ref()
-            .ok_or_else(|| {
-                "transfer feature is disabled because transfer_state_store is not configured"
-                    .to_string()
-            })?;
+        let handle = self.transfer_reconcile_handle.as_ref().ok_or_else(|| {
+            "transfer feature is disabled because transfer_state_store is not configured"
+                .to_string()
+        })?;
         handle.reconcile_transfer_scheduler_state_blocking(
             self.backend.clone(),
             self.fs_cache.clone(),

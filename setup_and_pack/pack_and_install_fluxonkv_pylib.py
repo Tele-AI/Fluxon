@@ -26,12 +26,12 @@ def _release_dir(root: Path) -> Path:
         sys.path.insert(0, str(nix_dir))
     import lib_layout
 
-    config_path = root / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib.yaml"
+    config_path = root / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_static.yaml"
     spec = lib_layout.load_experiment_spec(config_path=config_path)
     runtime_targets = lib_layout.build_runtime_targets(spec=spec)
     if len(runtime_targets) != 1:
         raise RuntimeError(
-            "pack_and_install_fluxonkv_pylib.py expects exactly one runtime target in setup_and_pack/nix/pack_fluxonkv_pylib.yaml"
+            "pack_and_install_fluxonkv_pylib.py expects exactly one runtime target in setup_and_pack/nix/pack_fluxonkv_pylib_static.yaml"
         )
     layout = lib_layout.build_layout(spec=spec, runtime_target=runtime_targets[0])
     return layout.instance_release_dir.resolve()
@@ -50,7 +50,7 @@ def _select_wheel(dirpath: Path) -> Path:
 def main() -> int:
     root = _repo_root()
     pack_script = root / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib.py"
-    config_path = root / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib.yaml"
+    config_path = root / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_static.yaml"
     wheels_dir = _release_dir(root)
 
     if not pack_script.exists() or not config_path.exists():

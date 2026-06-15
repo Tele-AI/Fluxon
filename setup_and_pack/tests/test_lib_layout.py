@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LIB_LAYOUT_PATH = REPO_ROOT / "setup_and_pack" / "nix" / "lib_layout.py"
@@ -87,6 +89,7 @@ class ApplyLayoutTest(unittest.TestCase):
             self.assertTrue((workspace_seed_dir / "setup_and_pack/nix/pack_fluxonkv_pylib.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/utils/__init__.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/utils/sudo_prefix_utils.py").is_file())
+            self.assertTrue((workspace_seed_dir / "setup_and_pack/utils/wheel_runtime_helper.py").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/fluxon_kv/Cargo.toml").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/Cargo.lock").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/moka/Cargo.toml").is_file())
@@ -100,7 +103,7 @@ class ApplyLayoutTest(unittest.TestCase):
             closed_sdk_root.mkdir()
 
             spec = _LIB_LAYOUT.load_experiment_spec_from_root(
-                config_path=(REPO_ROOT / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib.yaml").resolve(),
+                config_path=(REPO_ROOT / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_static.yaml").resolve(),
                 config_root={
                     "store": {
                         "project_data_root": str((root / "project_data").resolve()),
@@ -126,6 +129,69 @@ class ApplyLayoutTest(unittest.TestCase):
             self.assertEqual(
                 spec.profile_source.closed_sdk_search_roots,
                 (str(closed_sdk_root.resolve()),),
+            )
+
+    def test_load_experiment_config_root_expands_host_root_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            project_root = root / "repo"
+            static_path = project_root / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_static.yaml"
+            env_path = project_root / "setup_and_pack" / "pack_fluxonkv_pylib_env.yaml"
+            host_root = root / "host-root"
+            (project_root / ".git").mkdir(parents=True, exist_ok=True)
+            static_path.parent.mkdir(parents=True, exist_ok=True)
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+
+            static_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "schema_version": 1,
+                        "runtime": {
+                            "base_system": "manylinux_2_28",
+                            "architectures": ["x86_64"],
+                            "python_abi": "cpython3.10",
+                        },
+                        "profile": {
+                            "source_kind": "bridge_prebuilt",
+                            "native_runtime_dir_names": ["cxxpacked"],
+                            "target_support_dir_names": ["meson-0.64.0"],
+                            "ext_bundle_dir_name": "cxxpacked",
+                        },
+                        "assembly": {},
+                        "manylinux": {
+                            "runtime_image_ref": "builder:latest",
+                            "transport_backend": "tcp_thread",
+                            "rdma_backend": "closed_sdk",
+                        },
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            env_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "schema_version": 1,
+                        "host_paths": {
+                            "root_path": str(host_root.resolve()),
+                        },
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+
+            cfg = _LIB_LAYOUT.load_experiment_config_root(config_path=static_path)
+
+            self.assertEqual(cfg["store"]["project_data_root"], str(host_root.resolve()))
+            self.assertEqual(cfg["assembly"]["baseline_path"], str((host_root / "manylinux-release").resolve()))
+            self.assertEqual(
+                cfg["manylinux"]["cargo_registry_dir"],
+                str((host_root / "manylinux-cache" / "cargo-registry").resolve()),
+            )
+            self.assertEqual(
+                cfg["manylinux"]["cargo_git_dir"],
+                str((host_root / "manylinux-cache" / "cargo-git").resolve()),
             )
 
 

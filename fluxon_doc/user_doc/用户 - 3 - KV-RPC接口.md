@@ -190,7 +190,7 @@ python3 examples/start_master_owner.py --without-master
 
 默认命令会启动本机 `master + owner`。`--without-master` 只启动本机 `owner`，要求同一个 `cluster_name` 对应的 `master` 已经在别处运行。
 
-上面的 `build_master_config(...)` 里，`master_ui` 是可缺省配置块。配置后，`start_kv_master_process(...)` 会在 `master` 旁边额外拉起一份 KV Web UI：
+上面的 `build_master_config(...)` 里，`master_ui` 是可缺省配置块。配置后，`start_kv_master_process(...)` 会让 KV Web UI 直接作为 `master` 内的 HTTP 服务一起启动：
 
 ```yaml
 master_ui:

@@ -1,6 +1,9 @@
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
+pub use fluxon_commu_closed_sdk_consumer::rdma_probe::{
+    capture_rdma_runtime_snapshot, probe_rdma_snapshot,
+};
 pub use fluxon_commu_closed_sdk_consumer::{
     ClosedSdkConsumerError, ClosedSdkRuntimeAnchor, ClosedSdkVersionInfo,
     FLUXON_COMMU_CLOSED_ABI_VERSION, FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION, abi_version,
@@ -20,9 +23,6 @@ pub use fluxon_commu_closed_sdk_consumer::{
     transfer_engine_try_send_wire_direct, transfer_engine_unregister_local_segment,
     transfer_engine_update_enabled_rdma_devices, transfer_engine_update_runtime_config,
     watch_cluster_manager_self_rdma_resolved_config,
-};
-pub use fluxon_commu_closed_sdk_consumer::rdma_probe::{
-    capture_rdma_runtime_snapshot, probe_rdma_snapshot,
 };
 use fluxon_commu_contract::ClosedRuntimeError;
 pub use fluxon_commu_contract::{ClosedRuntimeHandle, RdmaProbeSnapshot, RdmaRuntimeSnapshot};

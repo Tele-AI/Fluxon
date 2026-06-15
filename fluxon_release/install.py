@@ -42,8 +42,7 @@ def main() -> None:
     )
     parser.add_argument("--sha256-file", required=True, help="Release sha256 manifest filename")
     parser.add_argument("--tar-name", required=True, help="Python source tarball filename")
-    parser.add_argument("--wheel-py", required=True, help="Pure python wheel filename")
-    parser.add_argument("--wheel-pyo3", required=True, help="Pyo3 wheel filename")
+    parser.add_argument("--wheel", required=True, help="Unified Fluxon wheel filename")
     args = parser.parse_args()
 
     release_dir = args.release_dir
@@ -55,14 +54,13 @@ def main() -> None:
         release_dir=release_dir,
         sha256_file=args.sha256_file,
         tar_name=args.tar_name,
-        wheel_py=args.wheel_py,
-        wheel_pyo3=args.wheel_pyo3,
+        wheel=args.wheel,
     )
     if _is_src_ready(src_root=src_root, fingerprint=fp) and _is_pip_ready(
         release_dir=release_dir,
         venv_dir=args.venv_dir,
         fingerprint=fp,
-        wheel_pyo3=args.wheel_pyo3,
+        wheel=args.wheel,
     ):
         print(f"[fluxon_release] fast-path ok: release_dir={release_dir} src_root={src_root}")
         return
@@ -73,7 +71,7 @@ def main() -> None:
             release_dir=release_dir,
             venv_dir=args.venv_dir,
             fingerprint=fp,
-            wheel_pyo3=args.wheel_pyo3,
+            wheel=args.wheel,
         ):
             print(f"[fluxon_release] fast-path ok (under lock): release_dir={release_dir} src_root={src_root}")
             return
@@ -83,8 +81,7 @@ def main() -> None:
             venv_dir=args.venv_dir,
             sha256_file=args.sha256_file,
             tar_name=args.tar_name,
-            wheel_py=args.wheel_py,
-            wheel_pyo3=args.wheel_pyo3,
+            wheel=args.wheel,
         )
 
 
@@ -112,15 +109,14 @@ def _bootstrap_under_lock(
     venv_dir: Path | None,
     sha256_file: str,
     tar_name: str,
-    wheel_py: str,
-    wheel_pyo3: str,
+    wheel: str,
 ) -> None:
     sha_path = release_dir / sha256_file
     if not sha_path.exists():
         raise RuntimeError(f"Missing sha256 manifest in release-dir: path={sha_path}")
     sha_bytes = sha_path.read_bytes()
 
-    need = [tar_name, wheel_py, wheel_pyo3]
+    need = [tar_name, wheel]
     expected = _parse_sha256_manifest(sha_bytes, need=need)
     missing = [n for n in need if n not in expected]
     if missing:
@@ -128,18 +124,14 @@ def _bootstrap_under_lock(
 
     tar_path = release_dir / tar_name
     expected_tar_hash = expected[tar_name]
-    wheel_py_path = release_dir / wheel_py
-    expected_wheel_py_hash = expected[wheel_py]
-    wheel_pyo3_path = release_dir / wheel_pyo3
-    expected_wheel_pyo3_hash = expected[wheel_pyo3]
+    wheel_path = release_dir / wheel
+    expected_wheel_hash = expected[wheel]
 
     fingerprint = _fingerprint_text(
         tar_name=tar_name,
         tar_hash=expected_tar_hash,
-        wheel_py=wheel_py,
-        wheel_py_hash=expected_wheel_py_hash,
-        wheel_pyo3=wheel_pyo3,
-        wheel_pyo3_hash=expected_wheel_pyo3_hash,
+        wheel=wheel,
+        wheel_hash=expected_wheel_hash,
     )
 
     def _verify_tar() -> None:
@@ -158,11 +150,8 @@ def _bootstrap_under_lock(
         if got != expected_hash:
             raise RuntimeError(f"Checksum mismatch for {name}: got={got} expected={expected_hash}")
 
-    _verify_wheel(wheel_py, wheel_py_path, expected_wheel_py_hash)
-    print(f"[fluxon_release] wheel verified: {wheel_py} sha256={expected_wheel_py_hash}")
-
-    _verify_wheel(wheel_pyo3, wheel_pyo3_path, expected_wheel_pyo3_hash)
-    print(f"[fluxon_release] wheel verified: {wheel_pyo3} sha256={expected_wheel_pyo3_hash}")
+    _verify_wheel(wheel, wheel_path, expected_wheel_hash)
+    print(f"[fluxon_release] wheel verified: {wheel} sha256={expected_wheel_hash}")
 
     if not _is_src_ready(src_root=src_root, fingerprint=fingerprint):
         if src_root.exists():
@@ -187,17 +176,14 @@ def _bootstrap_under_lock(
         release_dir=release_dir,
         venv_dir=venv_dir,
         fingerprint=fingerprint,
-        wheel_pyo3=wheel_pyo3,
+        wheel=wheel,
     ):
         print(f"[fluxon_release] pip up to date: marker={pip_fp_path}", flush=True)
         return
 
     pip_install_argv = [python_for_pip, "-m", "pip", "install", "--force-reinstall", "--no-deps"]
-    print("[fluxon_release] Installing pyo3 wheel via pip", flush=True)
-    subprocess.check_call([*pip_install_argv, str(wheel_pyo3_path)])
-
-    print("[fluxon_release] Installing pure-python wheel via pip", flush=True)
-    subprocess.check_call([*pip_install_argv, str(wheel_py_path)])
+    print("[fluxon_release] Installing unified wheel via pip", flush=True)
+    subprocess.check_call([*pip_install_argv, str(wheel_path)])
     pip_fp_path.parent.mkdir(parents=True, exist_ok=True)
     pip_fp_path.write_text(fingerprint, encoding="utf-8")
 
@@ -289,12 +275,10 @@ def _fingerprint_text(
     *,
     tar_name: str,
     tar_hash: str,
-    wheel_py: str,
-    wheel_py_hash: str,
-    wheel_pyo3: str,
-    wheel_pyo3_hash: str,
+    wheel: str,
+    wheel_hash: str,
 ) -> str:
-    return f"{tar_name} {tar_hash}\n{wheel_py} {wheel_py_hash}\n{wheel_pyo3} {wheel_pyo3_hash}\n"
+    return f"{tar_name} {tar_hash}\n{wheel} {wheel_hash}\n"
 
 
 def _compute_fingerprint_from_manifest(
@@ -302,15 +286,14 @@ def _compute_fingerprint_from_manifest(
     release_dir: Path,
     sha256_file: str,
     tar_name: str,
-    wheel_py: str,
-    wheel_pyo3: str,
+    wheel: str,
 ) -> str:
     sha_path = release_dir / sha256_file
     if not sha_path.exists():
         raise RuntimeError(f"Missing sha256 manifest in release-dir: path={sha_path}")
     sha_bytes = sha_path.read_bytes()
 
-    need = [tar_name, wheel_py, wheel_pyo3]
+    need = [tar_name, wheel]
     expected = _parse_sha256_manifest(sha_bytes, need=need)
     missing = [n for n in need if n not in expected]
     if missing:
@@ -319,10 +302,8 @@ def _compute_fingerprint_from_manifest(
     return _fingerprint_text(
         tar_name=tar_name,
         tar_hash=expected[tar_name],
-        wheel_py=wheel_py,
-        wheel_py_hash=expected[wheel_py],
-        wheel_pyo3=wheel_pyo3,
-        wheel_pyo3_hash=expected[wheel_pyo3],
+        wheel=wheel,
+        wheel_hash=expected[wheel],
     )
 
 
@@ -379,10 +360,10 @@ def _extract_fluxon_pyo3_build_info_from_bytes(*, payload: bytes, ctx: str) -> d
     raise RuntimeError(f"{ctx} missing embedded fluxon_pyo3 build info")
 
 
-def _read_release_fluxon_pyo3_build_info(*, release_dir: Path, wheel_pyo3: str) -> dict[str, str]:
-    wheel_path = release_dir / wheel_pyo3
+def _read_release_fluxon_pyo3_build_info(*, release_dir: Path, wheel: str) -> dict[str, str]:
+    wheel_path = release_dir / wheel
     if not wheel_path.exists():
-        raise RuntimeError(f"Missing pyo3 wheel in release-dir: path={wheel_path}")
+        raise RuntimeError(f"Missing release wheel in release-dir: path={wheel_path}")
     with zipfile.ZipFile(wheel_path) as zf:
         shared_object_names = [
             name
@@ -414,7 +395,7 @@ def _read_installed_fluxon_pyo3_build_info(*, venv_dir: Path) -> dict[str, str] 
     )
 
 
-def _is_pip_ready(*, release_dir: Path, venv_dir: Path | None, fingerprint: str, wheel_pyo3: str) -> bool:
+def _is_pip_ready(*, release_dir: Path, venv_dir: Path | None, fingerprint: str, wheel: str) -> bool:
     marker = _pip_fingerprint_path(release_dir=release_dir, venv_dir=venv_dir)
     if not marker.exists():
         return False
@@ -425,7 +406,7 @@ def _is_pip_ready(*, release_dir: Path, venv_dir: Path | None, fingerprint: str,
             return False
         release_build_info = _read_release_fluxon_pyo3_build_info(
             release_dir=release_dir,
-            wheel_pyo3=wheel_pyo3,
+            wheel=wheel,
         )
         installed_build_info = _read_installed_fluxon_pyo3_build_info(venv_dir=venv_dir)
         if installed_build_info is None:

@@ -2,26 +2,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use bytes::Bytes;
 use fluxon_cli::config::MonitorConfigYaml as MonitorCliConfigYaml;
 use fluxon_fs::config::{
-    FluxonFsRequestIdentity, FluxonFsS3KvMissPolicy, FsAgentDeclaredExportWire,
     FLUXON_FS_CONTROL_SCHEMA_VERSION, FS_AGENT_DECLARED_EXPORT_JSON_KEY,
     FS_AGENT_EXPORT_PUBLISH_RPC_PATH, FS_AGENT_EXPORT_UNPUBLISH_RPC_PATH,
-    FS_MASTER_CONFIG_RPC_PATH,
+    FS_MASTER_CONFIG_RPC_PATH, FluxonFsRequestIdentity, FluxonFsS3KvMissPolicy,
+    FsAgentDeclaredExportWire,
 };
 use fluxon_kv::client_kv_api::ClientKvApiViewTrait;
-use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use fluxon_kv::cluster_manager::ClusterManagerViewTrait;
+use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use fluxon_kv::config::{ClientConfigYaml, MasterConfigYaml};
 use fluxon_kv::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
-use fluxon_kv::p2p::msg_pack::{call_rpc, MsgPack, RPCCaller};
+use fluxon_kv::p2p::msg_pack::{MsgPack, RPCCaller, call_rpc};
 use fluxon_kv::p2p::p2p_module::P2pModuleViewTrait;
-use fluxon_kv::p2p::p2p_module::{user_rpc_register_handler, UserRpcHandler};
+use fluxon_kv::p2p::p2p_module::{UserRpcHandler, user_rpc_register_handler};
 use fluxon_kv::rpcresp_kvresult_convert::msg_and_error::{
     ApiError as CoreApiError, KvError as CoreKvError, KvResult, OK,
 };
@@ -29,14 +29,15 @@ use fluxon_kv::user_api::FlatDict;
 use fluxon_kv::user_api::FlatValue;
 use fluxon_kv::user_api::FluxonUserApi;
 use fluxon_kv::{
+    ConfigArg, Framework, KvClientTrait, KvGetResult,
     config::{ClientConfig, MasterConfig},
-    run_client, run_master, ConfigArg, Framework, KvClientTrait, KvGetResult,
+    run_client, run_master,
 };
 use fluxon_ops;
 use fluxon_proxy;
-use fluxon_util::run_async_from_sync::{borrow_stable_owner, SyncAsyncBridge};
+use fluxon_util::run_async_from_sync::{SyncAsyncBridge, borrow_stable_owner};
 use fluxon_util::{
-    fluxon_cli_proxy_desc_etcd_key_v2, FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2,
+    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
 };
 use futures::Future;
 use pyo3::exceptions::{PyOSError, PyPermissionError, PyRuntimeError, PyValueError};
@@ -54,8 +55,8 @@ pub use memholder::{ExternalMemHolder, MemHolder};
 mod flatdict_zerocopy;
 mod kvfuture;
 pub use kvfuture::KvFuture;
-mod etcd;
 mod error;
+mod etcd;
 mod mpsc; // Python ApiError constructors and MPSC error mapping
 pub use etcd::PyEtcdLock;
 pub use mpsc::{MpscConsumerHandle, MpscContext, MpscProducerHandle};
@@ -222,9 +223,9 @@ fn discover_bundled_ibverbs_driver_config(libs_dir: &Path) -> BundledIbverbsDriv
         let provider_matches = bundled_provider_library_paths_for_driver(libs_dir, &driver_name);
         match provider_matches.as_slice() {
             [] => {
-                discovery
-                    .outcomes
-                    .push(format!("provider_missing:{path_text}=>driver={driver_name}"));
+                discovery.outcomes.push(format!(
+                    "provider_missing:{path_text}=>driver={driver_name}"
+                ));
             }
             [provider_path] => {
                 discovery.outcomes.push(format!(
@@ -2507,15 +2508,13 @@ fn init_dynamic_libraries() -> PyResult<()> {
             {
                 return vec![soname_candidate];
             }
-            libibverbs_candidates
-                .first()
-                .cloned()
-                .into_iter()
-                .collect()
+            libibverbs_candidates.first().cloned().into_iter().collect()
         }
 
         let libs_dir = module_libs_dir().ok_or_else(|| {
-            PyRuntimeError::new_err("fluxon_pyo3 wheel bootstrap could not locate module-local fluxon_pyo3.libs")
+            PyRuntimeError::new_err(
+                "fluxon_pyo3 wheel bootstrap could not locate module-local fluxon_pyo3.libs",
+            )
         })?;
         if !libs_dir.is_dir() {
             return Err(PyRuntimeError::new_err(format!(
@@ -2964,9 +2963,7 @@ impl KvClient {
                     o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::LeaseId(id));
                 }
                 if reject_if_inflight_same_key {
-                    o.0.push(
-                        fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey,
-                    );
+                    o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
                 }
                 o
             };
@@ -4163,10 +4160,10 @@ fn fluxon_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::{
         bundled_driver_names_from_entries, configure_bundled_rdmav_driver_env,
-        discover_bundled_ibverbs_driver_config, extract_fluxon_pyo3_libs_root_from_loaded_library_line,
-        loaded_fluxon_pyo3_libs_roots, parse_bundled_ibverbs_driver_name,
-        sanitize_bundled_ld_library_path_entries, set_authoritative_bundled_ld_library_path,
-        validate_single_fluxon_pyo3_libs_root,
+        discover_bundled_ibverbs_driver_config,
+        extract_fluxon_pyo3_libs_root_from_loaded_library_line, loaded_fluxon_pyo3_libs_roots,
+        parse_bundled_ibverbs_driver_name, sanitize_bundled_ld_library_path_entries,
+        set_authoritative_bundled_ld_library_path, validate_single_fluxon_pyo3_libs_root,
     };
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -4243,11 +4240,8 @@ mod tests {
             std::env::set_var("IBV_DRIVERS", "legacy-ibv");
         }
 
-        let update = configure_bundled_rdmav_driver_env(&[
-            "efa".to_string(),
-            "mlx5".to_string(),
-        ])
-        .unwrap();
+        let update =
+            configure_bundled_rdmav_driver_env(&["efa".to_string(), "mlx5".to_string()]).unwrap();
 
         assert_eq!(
             update.previous_rdmav_drivers.as_deref(),
@@ -4266,10 +4260,7 @@ mod tests {
             Some("mlx5")
         );
         assert_eq!(parse_bundled_ibverbs_driver_name("mlx5"), None);
-        assert_eq!(
-            parse_bundled_ibverbs_driver_name("driver mlx5 extra"),
-            None
-        );
+        assert_eq!(parse_bundled_ibverbs_driver_name("driver mlx5 extra"), None);
     }
 
     #[test]
@@ -4297,13 +4288,17 @@ mod tests {
             discovery.entries[0].provider_path,
             libs_dir.join("libmlx5-rdmav34.so")
         );
-        assert!(discovery.outcomes.iter().any(|outcome| {
-            outcome.contains("config_ok:") && outcome.contains("driver=mlx5")
-        }));
-        assert!(discovery
-            .outcomes
-            .iter()
-            .any(|outcome| outcome.contains("config_parse_fail:")));
+        assert!(
+            discovery.outcomes.iter().any(|outcome| {
+                outcome.contains("config_ok:") && outcome.contains("driver=mlx5")
+            })
+        );
+        assert!(
+            discovery
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.contains("config_parse_fail:"))
+        );
     }
 
     #[test]
@@ -4354,11 +4349,8 @@ mod tests {
             std::env::set_var("LD_LIBRARY_PATH", &previous_ld_library_path);
         }
 
-        let (
-            recorded_previous_ld_library_path,
-            sanitized_entries,
-            removed_entries,
-        ) = set_authoritative_bundled_ld_library_path(&libs_dir);
+        let (recorded_previous_ld_library_path, sanitized_entries, removed_entries) =
+            set_authoritative_bundled_ld_library_path(&libs_dir);
 
         assert_eq!(
             recorded_previous_ld_library_path.as_deref(),

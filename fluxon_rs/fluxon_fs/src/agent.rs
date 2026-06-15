@@ -59,9 +59,7 @@ use crate::write_session_rpc::{
     self, FsAbortWriteSessionReq, FsCloseWriteSessionReq, FsOpenWriteSessionReq,
     FsWriteSessionChunkReq, FsWriteSessionDataAck, FsWriteSessionDataFrame,
 };
-use fluxon_util::run_async_from_sync::{
-    SyncAsyncBridge, spawn_blocking_allow_sync_async_bridge,
-};
+use fluxon_util::run_async_from_sync::{SyncAsyncBridge, spawn_blocking_allow_sync_async_bridge};
 
 // Keep the chunk size consistent with the shared FS contract (S3 gateway piece size).
 pub const REMOTE_CHUNK_BYTES: usize = fluxon_fs_core::s3_gateway::FS_S3_OBJECT_PIECE_BYTES;

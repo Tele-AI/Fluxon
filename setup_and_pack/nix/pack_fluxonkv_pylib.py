@@ -17,8 +17,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 PARENT_SCRIPTS_DIR = SCRIPT_DIR.parent
@@ -31,10 +29,13 @@ if parent_scripts_dir_str in sys.path:
     sys.path.remove(parent_scripts_dir_str)
 sys.path.insert(0, parent_scripts_dir_str)
 
+import yaml
+
 from lib_layout import (
     apply_layout,
     build_layout,
     build_runtime_targets,
+    load_experiment_config_root,
     load_experiment_spec,
     render_layout_summary,
 )
@@ -130,7 +131,7 @@ PREPARE_BUILD_GENERATED_DIR_NAME = "prepare_build"
 PREPARE_BUILD_RESOURCE_STORE_DIR_NAME = "resource_store"
 LIBPYTHON_PLACEHOLDER_FILE_NAME = "libpython3.10.a"
 PUBLIC_CLOSED_SDK_REPO_RELATIVE_ROOT = Path("fluxon_release") / "closed_sdk"
-PUBLIC_WHEEL_RUNTIME_HELPER_REPO_RELATIVE_PATH = Path("setup_and_pack") / "wheel_runtime_helper.py"
+PUBLIC_WHEEL_RUNTIME_HELPER_REPO_RELATIVE_PATH = Path("setup_and_pack") / "utils" / "wheel_runtime_helper.py"
 WHEEL_FINALIZE_STEP_KIND_ADD_OFFLINE_RDMA_SHARED_LIBRARIES = "add_offline_rdma_shared_libraries"
 WHEEL_FINALIZE_STEP_KIND_ADD_NATIVE_PLUGINS = "add_native_plugins"
 WHEEL_FINALIZE_STEP_KIND_ADD_VENDOR_RUNTIME = "add_vendor_runtime"
@@ -171,7 +172,7 @@ PYO3_WORKSPACE_HELPER_RELATIVE_PATHS = (
     "setup_and_pack/public_workspace_contract.py",
     "setup_and_pack/pub_prepare_build.py",
     "setup_and_pack/pub_prepare_build.yaml",
-    "setup_and_pack/wheel_runtime_helper.py",
+    "setup_and_pack/utils/wheel_runtime_helper.py",
     "setup_and_pack/nix/lib_layout.py",
 )
 PYO3_INPUT_RELATIVE_PATHS_COMMON = (
@@ -684,7 +685,7 @@ def main() -> int:
     args = parser.parse_args()
 
     config_path = args.config.resolve()
-    cfg = _load_yaml_mapping(config_path)
+    cfg = load_experiment_config_root(config_path=config_path)
     spec = load_experiment_spec(config_path=config_path)
     runtime_targets = build_runtime_targets(spec=spec)
     manylinux_cfg = _require_mapping(cfg, "manylinux")
