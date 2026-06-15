@@ -229,6 +229,52 @@ Thank you for your contribution. Start with the local developer docs:
 - [Developer - 1 - Package core install artifacts](<./fluxon_doc_en/dev_doc/Developer - 1 - Package Core Install Artifacts.md>)
 - [Developer - 2 - Package middleware and images](<./fluxon_doc_en/dev_doc/Developer - 2 - Package Middleware and Images.md>)
 
+## Contributors
+
+<a href="https://github.com/Tele-AI/fluxon/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Tele-AI/fluxon" />
+</a>
+
+Some earlier contribution records are no longer fully reflected in the current commit history. Historical highlights:
+
+<div>
+  <a href="https://github.com/yxrxy" title="yxrxy - FluxonFS implementation and optimization" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/yxrxy.png?size=64" width="64" height="64" alt="yxrxy" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">yxrxy</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">FluxonFS implementation and optimization</div>
+  </a>
+  <a href="https://github.com/zTz01" title="zTz01 - KVCache optimization" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/zTz01.png?size=64" width="64" height="64" alt="zTz01" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">zTz01</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">KVCache optimization</div>
+  </a>
+  <a href="https://github.com/pakkah" title="pakkah - RDMA support, VLM exploration" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/pakkah.png?size=64" width="64" height="64" alt="pakkah" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">pakkah</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">RDMA support, VLM exploration</div>
+  </a>
+  <a href="https://github.com/mumupika" title="mumupika - Initial MQ implementation" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/mumupika.png?size=64" width="64" height="64" alt="mumupika" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">mumupika</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">Initial MQ implementation</div>
+  </a>
+  <a href="https://github.com/maplestarplayl" title="maplestarplayl - IPC integration, SPDK integration" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/maplestarplayl.png?size=64" width="64" height="64" alt="maplestarplayl" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">maplestarplayl</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">IPC integration, SPDK integration</div>
+  </a>
+  <a href="https://github.com/RuileLu" title="RuileLu - KV lease support" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/RuileLu.png?size=64" width="64" height="64" alt="RuileLu" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">RuileLu</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">KV lease support</div>
+  </a>
+  <a href="https://github.com/Summage" title="Summage - Initial KV architecture optimization" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/Summage.png?size=64" width="64" height="64" alt="Summage" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">Summage</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">Initial KV architecture optimization</div>
+  </a>
+</div>
+
 ## License
 
 Fluxon is open-sourced under Apache License 2.0, see [LICENSE](./LICENSE).
