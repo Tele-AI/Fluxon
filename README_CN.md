@@ -14,7 +14,7 @@ Fluxon 是一套面向世界模型与其他 AI-native 场景训推系统的高�
 [![Latest](https://img.shields.io/badge/Latest-v0.2.1-f28500)](./fluxon_release)
 [![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#接口能力)
 
-[中文](./README_CN.md) | [English](./README.md) | [用户文档](./README_CN.md) | [English Docs](./README.md)
+[中文](./README_CN.md) | [English](./README.md) | [用户文档](./README_CN.md) | [English Docs](./README.md) | <a href="https://github.com/Tele-AI/fluxon" title="GitHub 仓库"><svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-label="GitHub repository"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.66 7.66 0 0 1 8 4.84c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg></a>
 
 </div>
 
@@ -239,43 +239,25 @@ FS Quick Start 会额外打印：
 
 部分更早期的贡献记录已经无法从当前 commit 历史里完整反映，这里补充说明：
 
-<div>
-  <a href="https://github.com/yxrxy" title="yxrxy - FluxonFS 实现和优化" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
-    <img src="https://github.com/yxrxy.png?size=64" width="64" height="64" alt="yxrxy" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
-    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">yxrxy</div>
-    <div style="font-size: 0.8rem; line-height: 1.35;">FluxonFS 实现和优化</div>
-  </a>
-  <a href="https://github.com/zTz01" title="zTz01 - KVCache 优化" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
-    <img src="https://github.com/zTz01.png?size=64" width="64" height="64" alt="zTz01" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
-    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">zTz01</div>
-    <div style="font-size: 0.8rem; line-height: 1.35;">KVCache 优化</div>
-  </a>
-  <a href="https://github.com/pakkah" title="pakkah - RDMA 支持、VLM 探索" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
-    <img src="https://github.com/pakkah.png?size=64" width="64" height="64" alt="pakkah" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
-    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">pakkah</div>
-    <div style="font-size: 0.8rem; line-height: 1.35;">RDMA 支持、VLM 探索</div>
-  </a>
-  <a href="https://github.com/mumupika" title="mumupika - 初始 MQ 版本实现" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
-    <img src="https://github.com/mumupika.png?size=64" width="64" height="64" alt="mumupika" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
-    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">mumupika</div>
-    <div style="font-size: 0.8rem; line-height: 1.35;">初始 MQ 版本实现</div>
-  </a>
-  <a href="https://github.com/maplestarplayl" title="maplestarplayl - IPC 接入、SPDK 接入" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
-    <img src="https://github.com/maplestarplayl.png?size=64" width="64" height="64" alt="maplestarplayl" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
-    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">maplestarplayl</div>
-    <div style="font-size: 0.8rem; line-height: 1.35;">IPC 接入、SPDK 接入</div>
-  </a>
-  <a href="https://github.com/RuileLu" title="RuileLu - KV lease 功能支持" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
-    <img src="https://github.com/RuileLu.png?size=64" width="64" height="64" alt="RuileLu" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
-    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">RuileLu</div>
-    <div style="font-size: 0.8rem; line-height: 1.35;">KV lease 功能支持</div>
-  </a>
-  <a href="https://github.com/Summage" title="Summage - 初始 KV 架构设计优化" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
-    <img src="https://github.com/Summage.png?size=64" width="64" height="64" alt="Summage" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
-    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">Summage</div>
-    <div style="font-size: 0.8rem; line-height: 1.35;">初始 KV 架构设计优化</div>
-  </a>
-</div>
+<p>
+  <a href="https://github.com/yxrxy"><img src="https://wsrv.nl/?url=github.com/yxrxy.png%3Fsize%3D64&amp;mask=circle&amp;w=64&amp;h=64&amp;fit=cover&amp;output=png" width="64" height="64" alt="yxrxy" /></a>
+  <a href="https://github.com/zTz01"><img src="https://wsrv.nl/?url=github.com/zTz01.png%3Fsize%3D64&amp;mask=circle&amp;w=64&amp;h=64&amp;fit=cover&amp;output=png" width="64" height="64" alt="zTz01" /></a>
+  <a href="https://github.com/pakkah"><img src="https://wsrv.nl/?url=github.com/pakkah.png%3Fsize%3D64&amp;mask=circle&amp;w=64&amp;h=64&amp;fit=cover&amp;output=png" width="64" height="64" alt="pakkah" /></a>
+  <a href="https://github.com/unity1263"><img src="https://wsrv.nl/?url=github.com/unity1263.png%3Fsize%3D64&amp;mask=circle&amp;w=64&amp;h=64&amp;fit=cover&amp;output=png" width="64" height="64" alt="unity1263" /></a>
+  <a href="https://github.com/mumupika"><img src="https://wsrv.nl/?url=github.com/mumupika.png%3Fsize%3D64&amp;mask=circle&amp;w=64&amp;h=64&amp;fit=cover&amp;output=png" width="64" height="64" alt="mumupika" /></a>
+  <a href="https://github.com/maplestarplayl"><img src="https://wsrv.nl/?url=github.com/maplestarplayl.png%3Fsize%3D64&amp;mask=circle&amp;w=64&amp;h=64&amp;fit=cover&amp;output=png" width="64" height="64" alt="maplestarplayl" /></a>
+  <a href="https://github.com/RuileLu"><img src="https://wsrv.nl/?url=github.com/RuileLu.png%3Fsize%3D64&amp;mask=circle&amp;w=64&amp;h=64&amp;fit=cover&amp;output=png" width="64" height="64" alt="RuileLu" /></a>
+  <a href="https://github.com/Summage"><img src="https://wsrv.nl/?url=github.com/Summage.png%3Fsize%3D64&amp;mask=circle&amp;w=64&amp;h=64&amp;fit=cover&amp;output=png" width="64" height="64" alt="Summage" /></a>
+</p>
+
+- `yxrxy`: FluxonFS 实现和优化
+- `zTz01`: KVCache 优化
+- `pakkah`: RDMA 支持、VLM 探索
+- `unity1263`: KV共享内存设计接入、benchmark工具链
+- `mumupika`: 初始 MQ 版本实现
+- `maplestarplayl`: IPC 接入、SPDK 接入
+- `RuileLu`: KV lease 功能支持
+- `Summage`: 初始 KV 架构设计优化
 
 ## 许可证
 
