@@ -3,8 +3,6 @@ PREPARE_TARGETS:
     kind: 'system_resource'
     dir_name: 'vendor_runtime'
     url: 'system://vendor_runtime'
-    binary_install:
-      - protoc
   cxxpacked:
     kind: 'remote_archive'
     dir_name: 'cxxpacked'

@@ -870,8 +870,6 @@ def populate_authoritative_vendor_runtime_install_root(packed_dir: Path) -> None
     copy_vendor_runtime_headers(packed_dir)
     copy_vendor_runtime_libraries(packed_dir)
     copy_vendor_runtime_driver_configs(packed_dir)
-    copy_binary_from_path("protoc", packed_dir / "bin")
-    copy_binary_runtime_dependencies(packed_dir / "bin" / "protoc", packed_dir)
     symlink_lib64_if_needed(packed_dir)
 
 
@@ -888,11 +886,6 @@ def populate_system_resource(resource_url: str, packed_dir: Path) -> None:
 
 
 def vendor_runtime_install_root_ready(packed_dir: Path) -> bool:
-    required_files = (
-        packed_dir / "bin" / "protoc",
-    )
-    if not all(path.is_file() for path in required_files):
-        return False
     driver_config_dir = packed_dir / "etc" / "libibverbs.d"
     if not driver_config_dir.is_dir():
         return False

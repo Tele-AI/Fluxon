@@ -113,11 +113,8 @@ class VendorRuntimeLayoutTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             vendor_root = Path(tmpdir) / "vendor_runtime"
-            (vendor_root / "bin").mkdir(parents=True)
             (vendor_root / "etc" / "libibverbs.d").mkdir(parents=True)
             (vendor_root / "lib").mkdir(parents=True)
-            (vendor_root / "bin" / "protoc").write_text("", encoding="utf-8")
-            os.chmod(vendor_root / "bin" / "protoc", 0o755)
             (vendor_root / "etc" / "libibverbs.d" / "mlx5.driver").write_text("", encoding="utf-8")
             for lib_name in (
                 "libfabric.so.1",
@@ -136,6 +133,31 @@ class VendorRuntimeLayoutTest(unittest.TestCase):
 
             mod.read_runtime_dependency_entries = fake_read_runtime_dependency_entries  # type: ignore[attr-defined]
             self.assertFalse(mod.vendor_runtime_install_root_ready(vendor_root))
+
+    def test_pub_prepare_vendor_runtime_readiness_does_not_require_protoc(self) -> None:
+        module_path = REPO_ROOT / "setup_and_pack" / "pub_prepare_build.py"
+        mod = _load_module(
+            module_path=module_path,
+            module_name="pub_prepare_vendor_runtime_no_protoc_test",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vendor_root = Path(tmpdir) / "vendor_runtime"
+            (vendor_root / "etc" / "libibverbs.d").mkdir(parents=True)
+            (vendor_root / "lib").mkdir(parents=True)
+            (vendor_root / "etc" / "libibverbs.d" / "mlx5.driver").write_text("", encoding="utf-8")
+            for lib_name in (
+                "libfabric.so.1",
+                "libibverbs.so.1",
+                "libmlx5.so.1",
+                "libmlx5-rdmav34.so",
+                "libpsm_infinipath.so.1",
+                "libpsm2.so.2",
+                "libinfinipath.so.4",
+            ):
+                (vendor_root / "lib" / lib_name).write_text("", encoding="utf-8")
+
+            mod.read_runtime_dependency_entries = lambda _path, *, ld_library_paths: []  # type: ignore[attr-defined]
+            self.assertTrue(mod.vendor_runtime_install_root_ready(vendor_root))
 
 
 if __name__ == "__main__":
