@@ -86,6 +86,31 @@ EXPLORER_FORCE_EXPANDED_CSS = dedent(
       border-color: var(--secondary);
       color: var(--light);
     }
+
+    /* Keep the inline GitHub repository icon aligned with text in the homepage link row. */
+    a[href="https://github.com/Tele-AI/fluxon"] {
+      display: inline-flex;
+      align-items: center;
+      vertical-align: middle;
+    }
+
+    a[href="https://github.com/Tele-AI/fluxon"] > img[alt="GitHub repository"] {
+      display: inline-block;
+      margin: 0 !important;
+      border-radius: 0;
+      vertical-align: middle;
+    }
+
+    a[href="https://github.com/Tele-AI/fluxon"] > svg[aria-label="GitHub repository"] {
+      display: inline-block;
+      position: relative;
+      top: -2px;
+      vertical-align: middle;
+    }
+
+    a[href="https://github.com/Tele-AI/fluxon"] > .external-icon {
+      display: none;
+    }
     """
 )
 QUARTZ_REPO_URL = "https://github.com/jackyzha0/quartz.git"
