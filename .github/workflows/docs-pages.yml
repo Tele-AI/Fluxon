@@ -1,0 +1,100 @@
+name: Deploy Fluxon Docs to GitHub Pages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    # Republish when doc or homepage inputs change.
+    paths:
+      - ".github/workflows/docs-pages.yml"
+      - "fluxon_doc_cn/**"
+      - "fluxon_doc_en/**"
+      - "README.md"
+      - "README_CN.md"
+      - "pics/**"
+      - "LICENSE"
+      - "fluxon_rs/rust-toolchain.toml"
+      - "scripts/build_doc_site.py"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: .cached/fluxon_doc_site/npm-cache
+          key: ${{ runner.os }}-doc-site-npm-${{ hashFiles('scripts/build_doc_site.py') }}
+          restore-keys: |
+            ${{ runner.os }}-doc-site-npm-
+
+      - name: Cache Quartz plugins
+        uses: actions/cache@v4
+        with:
+          path: .cached/fluxon_doc_site/toolchain/quartz/.quartz/plugins
+          key: ${{ runner.os }}-doc-site-plugins-${{ hashFiles('scripts/build_doc_site.py') }}
+          restore-keys: |
+            ${{ runner.os }}-doc-site-plugins-
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Set doc site base URL
+        shell: bash
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          if [[ "$repo" == *.github.io ]]; then
+            base_url="${repo,,}"
+          else
+            base_url="${owner}.github.io/${repo}"
+          fi
+          echo "FLUXON_DOC_SITE_BASE_URL=$base_url" >> "$GITHUB_ENV"
+
+      - name: Bootstrap doc site toolchain
+        run: python3 scripts/build_doc_site.py bootstrap
+
+      - name: Build doc site
+        run: python3 scripts/build_doc_site.py build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: fluxon_release/doc_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
