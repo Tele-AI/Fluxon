@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -10,280 +13,721 @@ import shutil
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
+from dataclasses import dataclass
 from http.server import SimpleHTTPRequestHandler
 from pathlib import Path
-
-import yaml
+from textwrap import dedent
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DOC_ROOT = REPO_ROOT / "fluxon_doc_linked" / "fluxon_doc"
-DOC_SITE_CONFIG_PATH = REPO_ROOT / "scripts" / "build_doc_site_config.yaml"
+DEFAULT_DOC_EN_ROOT = REPO_ROOT / "fluxon_doc_linked" / "fluxon_doc_en"
+FALLBACK_DOC_EN_ROOT = REPO_ROOT / "fluxon_doc_en"
+DEFAULT_DOC_CN_ROOT = REPO_ROOT / "fluxon_doc_linked" / "fluxon_doc_cn"
+FALLBACK_DOC_CN_ROOT = REPO_ROOT / "fluxon_doc_cn"
 OUTPUT_ROOT = REPO_ROOT / "fluxon_release" / "doc_site"
 CACHE_ROOT = REPO_ROOT / ".cached" / "fluxon_doc_site"
-PROJECT_ROOT = CACHE_ROOT / "project"
-STAGE_DOCS_ROOT = PROJECT_ROOT / "docs"
-TOOLCHAIN_ROOT = CACHE_ROOT / "toolchain"
+PROJECT_ROOT = (
+    Path(tempfile.gettempdir())
+    / f"fluxon_doc_site_{hashlib.sha256(str(REPO_ROOT).encode('utf-8')).hexdigest()[:12]}"
+)
+STAGE_DOCS_ROOT = PROJECT_ROOT / "content"
+# Publish the repo-root README as the doc-site homepage.
+HOMEPAGE_MARKDOWN_SOURCE = REPO_ROOT / "README.md"
+HOMEPAGE_CN_MARKDOWN_SOURCE = REPO_ROOT / "README_CN.md"
+HOMEPAGE_ROOT_PICS_DIR = REPO_ROOT / "pics"
+HOMEPAGE_SUPPORT_FILE_PATHS = (
+    REPO_ROOT / "LICENSE",
+    REPO_ROOT / "fluxon_rs" / "rust-toolchain.toml",
+)
+# Keep Quartz as cached build tooling instead of a repo module.
+TOOLCHAIN_ROOT = CACHE_ROOT / "toolchain" / "quartz"
 NPM_CACHE_ROOT = CACHE_ROOT / "npm-cache"
-TOOLCHAIN_PACKAGE_JSON_PATH = TOOLCHAIN_ROOT / "package.json"
-VITEPRESS_ROOT = STAGE_DOCS_ROOT
-VITEPRESS_CONFIG_DIR = VITEPRESS_ROOT / ".vitepress"
-VITEPRESS_THEME_DIR = VITEPRESS_CONFIG_DIR / "theme"
-VITEPRESS_CONFIG_PATH = VITEPRESS_CONFIG_DIR / "config.mts"
-THEME_ENTRY_PATH = VITEPRESS_THEME_DIR / "index.ts"
-CUSTOM_CSS_PATH = VITEPRESS_THEME_DIR / "custom.css"
-VITEPRESS_ENTRY_PATH = TOOLCHAIN_ROOT / "node_modules" / "vitepress" / "bin" / "vitepress.js"
+RUNTIME_CONFIG_PATH = TOOLCHAIN_ROOT / "quartz.config.yaml"
+RUNTIME_LOCKFILE_PATH = TOOLCHAIN_ROOT / "quartz.lock.json"
+NPM_STAMP_PATH = TOOLCHAIN_ROOT / ".fluxon-npm-stamp"
+PLUGIN_STAMP_PATH = TOOLCHAIN_ROOT / ".fluxon-plugin-stamp"
 DEFAULT_SERVE_ADDR = "127.0.0.1:18081"
 DEFAULT_TRACK_POLL_SECONDS = 1.0
-VITEPRESS_VERSION = "1.6.4"
-LOCAL_SEARCH_TRANSLATIONS = {
-    "button": {
-        "buttonText": "搜索",
-        "buttonAriaLabel": "搜索文档",
-    },
-    "modal": {
-        "displayDetails": "显示详情",
-        "resetButtonTitle": "清空搜索",
-        "backButtonTitle": "返回",
-        "noResultsText": "未找到结果",
-        "footer": {
-            "selectText": "选择",
-            "selectKeyAriaLabel": "Enter 键",
-            "navigateText": "切换",
-            "navigateUpKeyAriaLabel": "上方向键",
-            "navigateDownKeyAriaLabel": "下方向键",
-            "closeText": "关闭",
-            "closeKeyAriaLabel": "Esc 键",
-        },
-    },
-}
-
-MARKDOWN_LINK_RE = re.compile(r"(!?\[[^\]]*\]\()([^)]+)(\))")
-
-
-def load_site_config() -> dict:
-    if not DOC_SITE_CONFIG_PATH.is_file():
-        raise SystemExit(f"ERROR: doc site config not found: {DOC_SITE_CONFIG_PATH}")
-
-    raw = yaml.safe_load(DOC_SITE_CONFIG_PATH.read_text(encoding="utf-8"))
-    config = require_dict(raw, "build_doc_site_config")
-    require_allowed_keys(
-        config,
-        "build_doc_site_config",
-        {"site", "root_nav", "page_overrides"},
-    )
-
-    site = require_dict(config.get("site"), "build_doc_site_config.site")
-    require_allowed_keys(site, "build_doc_site_config.site", {"title", "description"})
-
-    root_nav = parse_root_nav_entries(
-        require_list(config.get("root_nav"), "build_doc_site_config.root_nav"),
-    )
-    page_overrides = parse_page_overrides(
-        require_dict(config.get("page_overrides"), "build_doc_site_config.page_overrides"),
-    )
-
-    root_nav_dirs: dict[str, dict] = {}
-    root_nav_pages: dict[str, dict] = {}
-    for entry in root_nav:
-        if entry["kind"] == "dir":
-            if entry["path"] in root_nav_dirs:
-                raise SystemExit(
-                    "ERROR: duplicate root_nav dir path in "
-                    f"{DOC_SITE_CONFIG_PATH}: {entry['path']}"
-                )
-            root_nav_dirs[entry["path"]] = entry
-            continue
-        if entry["path"] in root_nav_pages:
-            raise SystemExit(
-                "ERROR: duplicate root_nav page path in "
-                f"{DOC_SITE_CONFIG_PATH}: {entry['path']}"
-            )
-        root_nav_pages[entry["path"]] = entry
-
-    return {
-        "site": {
-            "title": require_str(site.get("title"), "build_doc_site_config.site.title"),
-            "description": require_str(
-                site.get("description"),
-                "build_doc_site_config.site.description",
-            ),
-        },
-        "root_nav": root_nav,
-        "root_nav_dirs": root_nav_dirs,
-        "root_nav_pages": root_nav_pages,
-        "page_overrides": page_overrides,
+EXPLORER_FORCE_EXPANDED_CSS = dedent(
+    """\
+    /* Fluxon doc-site override: keep the left explorer fully expanded. */
+    .explorer .folder-outer,
+    .explorer .folder-outer.open {
+      visibility: visible !important;
+      grid-template-rows: 1fr !important;
     }
 
+    .explorer li:has(> .folder-outer:not(.open)) > .folder-container > svg {
+      transform: none !important;
+    }
 
-def parse_root_nav_entries(raw_entries: list) -> list[dict]:
-    entries: list[dict] = []
-    for idx, raw_entry in enumerate(raw_entries):
-        field_name = f"build_doc_site_config.root_nav[{idx}]"
-        entry = require_dict(raw_entry, field_name)
-        kind = require_str(entry.get("kind"), f"{field_name}.kind")
-        if kind == "dir":
-            require_allowed_keys(
-                entry,
-                field_name,
-                {"kind", "path", "title", "nav_link_mode"},
+    .fluxon-lang-switcher {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin: 0.75rem 0 1rem;
+    }
+
+    .fluxon-lang-switcher a {
+      border: 1px solid var(--lightgray);
+      border-radius: 999px;
+      color: var(--dark);
+      font-size: 0.85rem;
+      padding: 0.25rem 0.7rem;
+      text-decoration: none;
+    }
+
+    .fluxon-lang-switcher a.active {
+      background: var(--secondary);
+      border-color: var(--secondary);
+      color: var(--light);
+    }
+
+    /* Keep the inline GitHub repository icon aligned with text in the homepage link row. */
+    a[href="https://github.com/Tele-AI/fluxon"] {
+      display: inline-flex;
+      align-items: center;
+      vertical-align: middle;
+    }
+
+    a[href="https://github.com/Tele-AI/fluxon"] > img[alt="GitHub repository"] {
+      display: inline-block;
+      margin: 0 !important;
+      border-radius: 0;
+      vertical-align: middle;
+    }
+
+    a[href="https://github.com/Tele-AI/fluxon"] > .external-icon {
+      display: none;
+    }
+    """
+)
+QUARTZ_REPO_URL = "https://github.com/jackyzha0/quartz.git"
+QUARTZ_REF = "v5.0.0"
+QUARTZ_COMMIT = "ab346fa66a895e12d63a308e70ce330ba795822a"
+SPARSE_CHECKOUT_PATHS = (
+    ".npmrc",
+    "globals.d.ts",
+    "index.d.ts",
+    "package-lock.json",
+    "package.json",
+    "quartz",
+    "quartz.ts",
+    "tsconfig.json",
+)
+MARKDOWN_LINK_RE = re.compile(r"(!?\[[^\]]*\]\()([^)]+)(\))")
+HTML_URL_ATTR_RE = re.compile(r"""(?P<prefix>\b(?:href|src)=["'])(?P<url>[^"']+)(?P<suffix>["'])""")
+HTML_FETCH_URL_RE = re.compile(
+    r"""(?P<prefix>\bfetch\((?P<quote>["']))(?P<url>[^"']+)(?P<suffix>(?P=quote)\))"""
+)
+LEADING_FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*(?:\n|$)", re.DOTALL)
+LEADING_H1_RE = re.compile(r"^#\s+(?P<title>.+?)\s*$")
+SKIP_DIR_NAMES = {"states"}
+PLUGIN_COMMITS = {
+    "created-modified-date": "c003199fb842969d43ee9e0f54120a85e588260e",
+    "syntax-highlighting": "5bfdc2c3f42d3d0326c4e777eb575f3fb68d51fb",
+    "obsidian-flavored-markdown": "07eaca7b31a537c7c4a0fd2848b1f00014c940af",
+    "github-flavored-markdown": "3eabbaa252ce175665ab3f62e1af25948a83e8b6",
+    "table-of-contents": "6984305e5dae0830c025450e160f12610406f7a4",
+    "crawl-links": "43edc6d5182e79bf1b63fed7eb3ba0c7624a1526",
+    "description": "56dc546614d905ad07dd0da8dd5820e25e5ea97b",
+    "alias-redirects": "73a98dda7e4f55239310833299d91daf8611349f",
+    "content-index": "c3d4f5c85311712c3355cd71da46b28e2d8eba71",
+    "favicon": "85842d5c15f937a3d1a02c45accee27118146d73",
+    "og-image": "31343c612d02c5fd22ff27a1e6035b2486be75f5",
+    "content-page": "d22fae357ae74a3e97a2f450862f23f5227842c4",
+    "folder-page": "93304d22e1d7f09f93a33658ec273f7cb8d17793",
+    "explorer": "a2dfd1373abe58ace461ebea0b4e94cb287f894e",
+    "search": "0f4c1a233cd03a0f562e13636b89b7708f8e2698",
+    "backlinks": "7490f921b7bd974c3f2f985ad3744b06160827d6",
+    "article-title": "e608ca815e137e22b598094f735bcd8a481dafaa",
+    "content-meta": "dd6e94b5ca1cb195104a2b5e624a43ee6aa0a324",
+    "page-title": "a1c1fe0a9c6a5ce1acf6efa01d473a7d9850e2a3",
+    "darkmode": "c6484f72ebc6ea89339be7cf86ad14b40c47dcc7",
+    "breadcrumbs": "cf2e161425165e1ac713f1feb7250b07fe0250ae",
+    "footer": "6ed61928d3c0178d7cef972ebcbca6a206a2f065",
+}
+
+
+@dataclass(frozen=True)
+class DocVariant:
+    language: str
+    doc_root_env: str
+    default_doc_root: Path
+    fallback_doc_root: Path
+    output_prefix: Path
+    homepage_source: Path
+
+
+DOC_VARIANTS: tuple[DocVariant, ...] = (
+    DocVariant(
+        language="en",
+        doc_root_env="FLUXON_DOC_EN_ROOT",
+        default_doc_root=DEFAULT_DOC_EN_ROOT,
+        fallback_doc_root=FALLBACK_DOC_EN_ROOT,
+        output_prefix=Path("."),
+        homepage_source=HOMEPAGE_MARKDOWN_SOURCE,
+    ),
+    DocVariant(
+        language="cn",
+        doc_root_env="FLUXON_DOC_CN_ROOT",
+        default_doc_root=DEFAULT_DOC_CN_ROOT,
+        fallback_doc_root=FALLBACK_DOC_CN_ROOT,
+        output_prefix=Path("cn"),
+        homepage_source=HOMEPAGE_CN_MARKDOWN_SOURCE,
+    ),
+)
+
+LANGUAGE_ROUTE_PAIRS = (
+    {"en": "/", "cn": "/cn"},
+    {"en": "/roadmap", "cn": "/cn/roadmap"},
+    {"en": "/user_doc", "cn": "/cn/user_doc"},
+    {"en": "/user_doc/User---0---Installation", "cn": "/cn/user_doc/用户---0---安装"},
+    {"en": "/user_doc/User---1---Architecture-and-Concepts", "cn": "/cn/user_doc/用户---1---架构和概念"},
+    {"en": "/user_doc/User---2---Service-Plane", "cn": "/cn/user_doc/用户---2---服务平面"},
+    {"en": "/user_doc/User---3---KV-and-RPC-Interface", "cn": "/cn/user_doc/用户---3---KV-RPC接口"},
+    {"en": "/user_doc/User---4---MQ-Interface", "cn": "/cn/user_doc/用户---4---MQ接口"},
+    {"en": "/user_doc/User---5---FS-Interface", "cn": "/cn/user_doc/用户---5---FS接口"},
+    {"en": "/dev_doc", "cn": "/cn/dev_doc"},
+    {
+        "en": "/dev_doc/Developer---1---Package-Core-Install-Artifacts",
+        "cn": "/cn/dev_doc/开发者---1---打包核心安装包",
+    },
+    {
+        "en": "/dev_doc/Developer---2---Package-Middleware-and-Images",
+        "cn": "/cn/dev_doc/开发者---2---打包中间件和镜像",
+    },
+)
+
+
+def build_language_counterpart_routes() -> dict[str, str]:
+    routes: dict[str, str] = {}
+    for pair in LANGUAGE_ROUTE_PAIRS:
+        en_route = pair["en"]
+        cn_route = pair["cn"]
+        routes[en_route] = cn_route
+        routes[cn_route] = en_route
+    return routes
+
+
+LANGUAGE_COUNTERPART_ROUTES = build_language_counterpart_routes()
+DOC_SITE_POSTSCRIPT_JS = dedent(
+    f"""\
+    ;(() => {{
+      const FLUXON_LANGUAGE_COUNTERPART_ROUTES = {json.dumps(LANGUAGE_COUNTERPART_ROUTES, ensure_ascii=False, sort_keys=True)}
+
+      function decodeFluxonPathname(pathname) {{
+        return (pathname || "/")
+          .split("/")
+          .map((segment, index) => {{
+            if (index === 0) return ""
+            try {{
+              return decodeURIComponent(segment)
+            }} catch {{
+              return segment
+            }}
+          }})
+          .join("/")
+      }}
+
+      function normalizeFluxonPathname(pathname) {{
+        let normalizedPath = decodeFluxonPathname(pathname)
+        normalizedPath = normalizedPath.replace(/\/index\.html$/, "/")
+        normalizedPath = normalizedPath.replace(/\.html$/, "")
+        normalizedPath = normalizedPath.replace(/\/index$/, "/")
+        normalizedPath = normalizedPath.replace(/\/+$/, "")
+        if (!normalizedPath.startsWith("/")) {{
+          normalizedPath = "/" + normalizedPath
+        }}
+        return normalizedPath === "" ? "/" : normalizedPath || "/"
+      }}
+
+      function routeFromFluxonSlug(slug) {{
+        const normalizedSlug = (slug || "").replace(/^\/+|\/+$/g, "")
+        if (!normalizedSlug) return null
+
+        let route = "/" + normalizedSlug
+        route = route.replace(/\/index$/, "")
+        return route === "" ? "/" : route || "/"
+      }}
+
+      function resolveFluxonCurrentRouteFromSlug() {{
+        return routeFromFluxonSlug(document.body?.dataset?.slug || "")
+      }}
+
+      // Return the project-site base path, for example "/Fluxon".
+      function resolveFluxonSiteBasePath() {{
+        const route = resolveFluxonCurrentRouteFromSlug()
+        if (!route) return ""
+
+        const normalizedPath = normalizeFluxonPathname(window.location.pathname)
+        if (route === "/") {{
+          return normalizedPath === "/" ? "" : normalizedPath
+        }}
+        if (normalizedPath === route) {{
+          return ""
+        }}
+        if (!normalizedPath.endsWith(route)) {{
+          return ""
+        }}
+
+        try {{
+          const siteBasePath = normalizedPath.slice(0, normalizedPath.length - route.length)
+          return siteBasePath.replace(/\/$/, "")
+        }} catch {{
+          return ""
+        }}
+      }}
+
+      function normalizeFluxonRoute(pathname, siteBasePath) {{
+        let route = normalizeFluxonPathname(pathname)
+        if (siteBasePath && route === siteBasePath) {{
+          return "/"
+        }}
+        if (siteBasePath && route.startsWith(siteBasePath + "/")) {{
+          route = route.slice(siteBasePath.length) || "/"
+        }}
+        return route === "" ? "/" : route || "/"
+      }}
+
+      function currentFluxonRoute() {{
+        return resolveFluxonCurrentRouteFromSlug() || normalizeFluxonRoute(window.location.pathname, resolveFluxonSiteBasePath())
+      }}
+
+      function buildFluxonSiteHref(route, siteBasePath) {{
+        const normalizedBase = siteBasePath || ""
+        const normalizedRoute = route === "/" ? "/" : route + "/"
+        return normalizedBase + normalizedRoute
+      }}
+
+      function currentFluxonLanguage(route) {{
+        return route === "/cn" || route.startsWith("/cn/") ? "cn" : "en"
+      }}
+
+      // Rewrite root-absolute internal links so they stay inside the project site.
+      function rewriteFluxonRootInternalLinks() {{
+        const siteBasePath = resolveFluxonSiteBasePath()
+        if (!siteBasePath) return
+
+        document.querySelectorAll("a[href^='/']").forEach((link) => {{
+          const href = link.getAttribute("href") || ""
+          const rewrittenHref = rewriteFluxonRootInternalHref(href, siteBasePath)
+          if (rewrittenHref && rewrittenHref !== href) {{
+            link.setAttribute("href", rewrittenHref)
+          }}
+        }})
+      }}
+
+      // Add the project-site base path to one href when needed.
+      function rewriteFluxonRootInternalHref(href, siteBasePath) {{
+        if (!href || !siteBasePath) return href
+        if (href.startsWith("//")) return href
+        if (href === siteBasePath || href.startsWith(siteBasePath + "/")) return href
+        if (!href.startsWith("/")) return href
+        return siteBasePath + href
+      }}
+
+      function isFluxonElement(node, tagName = null) {{
+        if (!node || node.nodeType !== 1) return false
+        if (!tagName) return true
+        return node.tagName === tagName
+      }}
+
+      function insertFluxonLanguageSwitcher() {{
+        const sidebar = document.querySelector(".left.sidebar")
+        if (!isFluxonElement(sidebar, "DIV")) return
+        sidebar.querySelector(".fluxon-lang-switcher")?.remove()
+
+        const siteBasePath = resolveFluxonSiteBasePath()
+        const route = currentFluxonRoute()
+        const language = currentFluxonLanguage(route)
+        const counterpart = FLUXON_LANGUAGE_COUNTERPART_ROUTES[route]
+        const englishRoute = language === "en" ? route : counterpart || "/"
+        const chineseRoute = language === "cn" ? route : counterpart || "/cn"
+
+        const switcher = document.createElement("div")
+        switcher.className = "fluxon-lang-switcher"
+
+        const englishLink = document.createElement("a")
+        englishLink.href = buildFluxonSiteHref(englishRoute, siteBasePath)
+        englishLink.textContent = "English"
+        if (language === "en") {{
+          englishLink.classList.add("active")
+        }}
+        switcher.appendChild(englishLink)
+
+        const chineseLink = document.createElement("a")
+        chineseLink.href = buildFluxonSiteHref(chineseRoute, siteBasePath)
+        chineseLink.textContent = "中文"
+        if (language === "cn") {{
+          chineseLink.classList.add("active")
+        }}
+        switcher.appendChild(chineseLink)
+
+        const title = sidebar.querySelector(".page-title")
+        sidebar.insertBefore(switcher, title?.nextSibling || sidebar.firstChild)
+      }}
+
+      function makeFluxonExplorerLink(route, text, siteBasePath, active, kind) {{
+        const item = document.createElement("li")
+        item.className = kind === "home" ? "fluxon-home-link" : "fluxon-roadmap-link"
+
+        const link = document.createElement("a")
+        link.href = buildFluxonSiteHref(route, siteBasePath)
+        link.className = "nav-file-title tree-item-self"
+        link.textContent = text
+        if (active) {{
+          link.classList.add("active", "is-active")
+        }}
+
+        item.appendChild(link)
+        return item
+      }}
+
+      function matchesFluxonRoute(href, route, siteBasePath) {{
+        if (!href) return false
+        try {{
+          const pathname = new URL(href, window.location.href).pathname
+          return normalizeFluxonRoute(pathname, siteBasePath) === route
+        }} catch {{
+          return false
+        }}
+      }}
+
+      function fluxonExplorerFolderPath(item) {{
+        const folderContainer = item.querySelector(":scope > .folder-container")
+        if (!isFluxonElement(folderContainer, "DIV")) return ""
+        return folderContainer.dataset.folderpath || ""
+      }}
+
+      function fluxonExplorerDirectHref(item) {{
+        const directLink = item.querySelector(":scope > a[href]")
+        if (!isFluxonElement(directLink, "A")) return ""
+        return directLink.getAttribute("href") || ""
+      }}
+
+      function isFluxonExplorerCustomItem(item) {{
+        return (
+          item.classList.contains("fluxon-home-link") ||
+          item.classList.contains("fluxon-roadmap-link") ||
+          item.classList.contains("overflow-end")
+        )
+      }}
+
+      function isFluxonChineseExplorerItem(item, siteBasePath) {{
+        const folderPath = fluxonExplorerFolderPath(item)
+        if (folderPath) {{
+          return folderPath === "cn/index" || folderPath.startsWith("cn/")
+        }}
+        const href = fluxonExplorerDirectHref(item)
+        if (!href) return false
+        return matchesFluxonRoute(href, "/cn", siteBasePath) || matchesFluxonRoute(href, "/cn/roadmap", siteBasePath)
+      }}
+
+      function explorerItemMatchesRoute(item, route, siteBasePath) {{
+        const href = fluxonExplorerDirectHref(item)
+        return !!href && matchesFluxonRoute(href, route, siteBasePath)
+      }}
+
+      function explorerItemsEquivalent(leftItem, rightItem, siteBasePath) {{
+        const leftFolderPath = fluxonExplorerFolderPath(leftItem)
+        const rightFolderPath = fluxonExplorerFolderPath(rightItem)
+        if (leftFolderPath || rightFolderPath) {{
+          return leftFolderPath !== "" && leftFolderPath === rightFolderPath
+        }}
+
+        const leftHref = fluxonExplorerDirectHref(leftItem)
+        const rightHref = fluxonExplorerDirectHref(rightItem)
+        if (!leftHref || !rightHref) return false
+        return normalizeFluxonRoute(leftHref, siteBasePath) === normalizeFluxonRoute(rightHref, siteBasePath)
+      }}
+
+      function filterFluxonExplorerTreeForLanguage() {{
+        const siteBasePath = resolveFluxonSiteBasePath()
+        const route = currentFluxonRoute()
+        const language = currentFluxonLanguage(route)
+
+        document.querySelectorAll(".explorer-ul").forEach((list) => {{
+          if (!isFluxonElement(list, "UL")) return
+
+          Array.from(list.children).forEach((child) => {{
+            if (!isFluxonElement(child, "LI")) return
+            if (isFluxonExplorerCustomItem(child)) return
+
+            if (language === "en") {{
+              if (isFluxonChineseExplorerItem(child, siteBasePath)) {{
+                child.remove()
+              }}
+              return
+            }}
+
+            const folderPath = fluxonExplorerFolderPath(child)
+            if (folderPath && !(folderPath === "cn/index" || folderPath.startsWith("cn/"))) {{
+              child.remove()
+              return
+            }}
+
+            const href = fluxonExplorerDirectHref(child)
+            if (href && !matchesFluxonRoute(href, "/cn", siteBasePath) && !normalizeFluxonRoute(href, siteBasePath).startsWith("/cn/")) {{
+              child.remove()
+            }}
+          }})
+
+          if (language !== "cn") return
+
+          const cnRootFolder = Array.from(list.children).find((child) => {{
+            if (!isFluxonElement(child, "LI")) return false
+            return fluxonExplorerFolderPath(child) === "cn/index"
+          }})
+          if (!isFluxonElement(cnRootFolder, "LI")) return
+
+          const nestedList = cnRootFolder.querySelector(":scope > .folder-outer > ul")
+          if (!isFluxonElement(nestedList, "UL")) {{
+            cnRootFolder.remove()
+            return
+          }}
+
+          const overflowEnd = list.querySelector("li.overflow-end")
+          Array.from(nestedList.children).forEach((nestedChild) => {{
+            if (!isFluxonElement(nestedChild, "LI")) return
+            if (explorerItemMatchesRoute(nestedChild, "/cn/roadmap", siteBasePath)) return
+
+            const alreadyPresent = Array.from(list.children).some((rootChild) => {{
+              if (!isFluxonElement(rootChild, "LI")) return false
+              if (rootChild === cnRootFolder) return false
+              return explorerItemsEquivalent(rootChild, nestedChild, siteBasePath)
+            }})
+            if (!alreadyPresent) {{
+              list.insertBefore(nestedChild, overflowEnd || null)
+            }}
+          }})
+
+          cnRootFolder.remove()
+        }})
+      }}
+
+      function explorerNeedsFluxonLanguageFilter(siteBasePath, language) {{
+        return Array.from(document.querySelectorAll(".explorer-ul")).some((list) => {{
+          if (!isFluxonElement(list, "UL")) return false
+
+          if (language === "en") {{
+            return Array.from(list.children).some((child) => {{
+              if (!isFluxonElement(child, "LI")) return false
+              if (isFluxonExplorerCustomItem(child)) return false
+              return isFluxonChineseExplorerItem(child, siteBasePath)
+            }})
+          }}
+
+          const hasChineseRootFolder = Array.from(list.children).some((child) => {{
+            if (!isFluxonElement(child, "LI")) return false
+            return fluxonExplorerFolderPath(child) === "cn/index"
+          }})
+          if (hasChineseRootFolder) return true
+
+          return Array.from(list.children).some((child) => {{
+            if (!isFluxonElement(child, "LI")) return false
+            if (isFluxonExplorerCustomItem(child)) return false
+            const folderPath = fluxonExplorerFolderPath(child)
+            if (folderPath) {{
+              return !(folderPath === "cn/index" || folderPath.startsWith("cn/"))
+            }}
+            const href = fluxonExplorerDirectHref(child)
+            if (!href) return false
+            const normalizedRoute = normalizeFluxonRoute(href, siteBasePath)
+            return normalizedRoute !== "/cn" && !normalizedRoute.startsWith("/cn/")
+          }})
+        }})
+      }}
+
+      // Insert stable localized home and roadmap entries at the top of the explorer tree.
+      function insertFluxonExplorerHomeLink() {{
+        const siteBasePath = resolveFluxonSiteBasePath()
+        const route = currentFluxonRoute()
+        const language = currentFluxonLanguage(route)
+        const homeLabel = language === "cn" ? "首页" : "Home"
+        const homeRoute = language === "cn" ? "/cn" : "/"
+        const roadmapRoute = language === "cn" ? "/cn/roadmap" : "/roadmap"
+
+        document.querySelectorAll(".explorer-ul").forEach((list) => {{
+          list.querySelector("li.fluxon-home-link")?.remove()
+          list.querySelector("li.fluxon-roadmap-link")?.remove()
+
+          const overflowEnd = list.querySelector("li.overflow-end")
+          const homeItem = makeFluxonExplorerLink(
+            homeRoute,
+            homeLabel,
+            siteBasePath,
+            route === homeRoute,
+            "home",
+          )
+          list.insertBefore(homeItem, overflowEnd || list.firstChild)
+
+          let roadmapItem = null
+          if (language === "en") {{
+            roadmapItem = Array.from(list.children).find((child) => {{
+              if (!isFluxonElement(child, "LI")) return false
+              if (child === homeItem) return false
+              const firstElement = child.firstElementChild
+              if (!isFluxonElement(firstElement, "A")) return false
+              return matchesFluxonRoute(firstElement.href, roadmapRoute, siteBasePath)
+            }})
+          }}
+          if (roadmapItem) {{
+            const roadmapLink = roadmapItem.firstElementChild
+            if (isFluxonElement(roadmapLink, "A")) {{
+              roadmapLink.href = buildFluxonSiteHref(roadmapRoute, siteBasePath)
+            }}
+            if (roadmapItem !== homeItem.nextSibling) {{
+              list.insertBefore(roadmapItem, homeItem.nextSibling || overflowEnd || null)
+            }}
+          }} else {{
+            const customRoadmap = makeFluxonExplorerLink(
+              roadmapRoute,
+              "roadmap",
+              siteBasePath,
+              route === roadmapRoute,
+              "roadmap",
             )
-            entries.append(
-                {
-                    "kind": "dir",
-                    "path": require_root_dir_path(entry.get("path"), f"{field_name}.path"),
-                    "title": require_str(entry.get("title"), f"{field_name}.title"),
-                    "nav_link_mode": require_enum(
-                        entry.get("nav_link_mode"),
-                        f"{field_name}.nav_link_mode",
-                        {"index", "first_page", "first_sidebar_link"},
-                    ),
-                }
+            list.insertBefore(customRoadmap, homeItem.nextSibling || overflowEnd || null)
+          }}
+        }})
+
+        filterFluxonExplorerTreeForLanguage()
+      }}
+
+      // Patch a link right before navigation in case Quartz rendered it late.
+      function installFluxonRootInternalClickGuard() {{
+        if (window.__fluxonRootInternalClickGuardInstalled) return
+        window.__fluxonRootInternalClickGuardInstalled = true
+
+        document.addEventListener(
+          "click",
+          (event) => {{
+            const target = event.target
+            if (!isFluxonElement(target)) return
+            const link = target.closest("a[href]")
+            if (!isFluxonElement(link, "A")) return
+
+            const siteBasePath = resolveFluxonSiteBasePath()
+            if (!siteBasePath) return
+
+            const href = link.getAttribute("href") || ""
+            const rewrittenHref = rewriteFluxonRootInternalHref(href, siteBasePath)
+            if (rewrittenHref && rewrittenHref !== href) {{
+              link.setAttribute("href", rewrittenHref)
+            }}
+          }},
+          true,
+        )
+      }}
+
+      // Re-run link rewriting after Quartz mutates the page tree.
+      function installFluxonRootInternalMutationObserver() {{
+        if (window.__fluxonRootInternalMutationObserverInstalled) return
+        const target = document.body
+        if (!target) return
+
+        const observer = new MutationObserver(() => {{
+          rewriteFluxonRootInternalLinks()
+          const needsLanguageSwitcher = !document.querySelector(".fluxon-lang-switcher")
+          const siteBasePath = resolveFluxonSiteBasePath()
+          const language = currentFluxonLanguage(currentFluxonRoute())
+          const needsExplorerPatch = Array.from(document.querySelectorAll(".explorer-ul")).some(
+            (list) => !list.querySelector("li.fluxon-home-link"),
+          )
+          const needsLanguageFilter = explorerNeedsFluxonLanguageFilter(siteBasePath, language)
+          if (needsLanguageSwitcher || needsExplorerPatch || needsLanguageFilter) {{
+            window.requestAnimationFrame(() => {{
+              if (needsLanguageSwitcher) {{
+                insertFluxonLanguageSwitcher()
+              }}
+              if (needsExplorerPatch || needsLanguageFilter) {{
+                insertFluxonExplorerHomeLink()
+              }}
+            }})
+          }}
+        }})
+        observer.observe(target, {{
+          subtree: true,
+          childList: true,
+          attributes: true,
+          attributeFilter: ["href"],
+        }})
+        window.__fluxonRootInternalMutationObserverInstalled = true
+      }}
+
+      // Retry explorer patching because Quartz fills the tree asynchronously.
+      function scheduleFluxonExplorerHomeLink(attempt = 0) {{
+        const delayMs = attempt === 0 ? 0 : 120
+        window.setTimeout(() => {{
+          rewriteFluxonRootInternalLinks()
+          insertFluxonLanguageSwitcher()
+          insertFluxonExplorerHomeLink()
+          const siteBasePath = resolveFluxonSiteBasePath()
+          const language = currentFluxonLanguage(currentFluxonRoute())
+          const needsRetry =
+            !document.querySelector(".fluxon-lang-switcher") ||
+            Array.from(document.querySelectorAll(".explorer-ul")).some(
+              (list) => list.children.length <= 1 || !list.querySelector("li.fluxon-home-link"),
             )
-            continue
-        if kind == "page":
-            require_allowed_keys(entry, field_name, {"kind", "path", "title"})
-            entries.append(
-                {
-                    "kind": "page",
-                    "path": require_root_page_path(entry.get("path"), f"{field_name}.path"),
-                    "title": require_str(entry.get("title"), f"{field_name}.title"),
-                }
-            )
-            continue
-        raise SystemExit(
-            f"ERROR: unsupported {field_name}.kind in {DOC_SITE_CONFIG_PATH}: {kind}"
-        )
-    return entries
+            || explorerNeedsFluxonLanguageFilter(siteBasePath, language)
+          if (needsRetry && attempt < 8) {{
+            scheduleFluxonExplorerHomeLink(attempt + 1)
+          }}
+        }}, delayMs)
+      }}
 
-
-def parse_page_overrides(raw_overrides: dict) -> dict[str, dict]:
-    overrides: dict[str, dict] = {}
-    for raw_source_rel, raw_override in raw_overrides.items():
-        if not isinstance(raw_source_rel, str):
-            raise SystemExit(
-                "ERROR: build_doc_site_config.page_overrides keys must be strings in "
-                f"{DOC_SITE_CONFIG_PATH}"
-            )
-        field_name = f"build_doc_site_config.page_overrides[{raw_source_rel!r}]"
-        source_rel = require_markdown_rel_path(raw_source_rel, field_name)
-        override = require_dict(raw_override, field_name)
-        require_allowed_keys(override, field_name, {"publish", "title", "staged_rel"})
-        staged_rel = override.get("staged_rel")
-        normalized_staged_rel: str | None = None
-        if staged_rel is not None:
-            normalized_staged_rel = require_markdown_rel_path(
-                staged_rel,
-                f"{field_name}.staged_rel",
-            ).as_posix()
-        overrides[source_rel.as_posix()] = {
-            "publish": require_bool(override.get("publish"), f"{field_name}.publish"),
-            "title": require_optional_str(override.get("title"), f"{field_name}.title"),
-            "staged_rel": normalized_staged_rel,
-        }
-    return overrides
-
-
-def require_allowed_keys(raw_dict: dict, field_name: str, allowed_keys: set[str]) -> None:
-    unexpected = sorted(key for key in raw_dict if key not in allowed_keys)
-    if unexpected:
-        raise SystemExit(
-            f"ERROR: unsupported keys in {field_name} from {DOC_SITE_CONFIG_PATH}: {unexpected}"
-        )
-
-
-def require_dict(value: object, field_name: str) -> dict:
-    if not isinstance(value, dict):
-        raise SystemExit(f"ERROR: {field_name} must be a mapping in {DOC_SITE_CONFIG_PATH}")
-    return value
-
-
-def require_list(value: object, field_name: str) -> list:
-    if not isinstance(value, list):
-        raise SystemExit(f"ERROR: {field_name} must be a list in {DOC_SITE_CONFIG_PATH}")
-    return value
-
-
-def require_str(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise SystemExit(
-            f"ERROR: {field_name} must be a non-empty string in {DOC_SITE_CONFIG_PATH}"
-        )
-    return value.strip()
-
-
-def require_optional_str(value: object, field_name: str) -> str | None:
-    if value is None:
-        return None
-    return require_str(value, field_name)
-
-
-def require_bool(value: object, field_name: str) -> bool:
-    if not isinstance(value, bool):
-        raise SystemExit(f"ERROR: {field_name} must be a bool in {DOC_SITE_CONFIG_PATH}")
-    return value
-
-
-def require_enum(value: object, field_name: str, allowed_values: set[str]) -> str:
-    text = require_str(value, field_name)
-    if text not in allowed_values:
-        raise SystemExit(
-            f"ERROR: {field_name} must be one of {sorted(allowed_values)} in {DOC_SITE_CONFIG_PATH}"
-        )
-    return text
-
-
-def require_root_dir_path(value: object, field_name: str) -> str:
-    rel = require_rel_path(value, field_name)
-    if len(rel.parts) != 1 or rel.suffix:
-        raise SystemExit(
-            f"ERROR: {field_name} must point to a root directory in {DOC_SITE_CONFIG_PATH}"
-        )
-    return rel.as_posix()
-
-
-def require_root_page_path(value: object, field_name: str) -> str:
-    rel = require_markdown_rel_path(value, field_name)
-    if len(rel.parts) != 1:
-        raise SystemExit(
-            f"ERROR: {field_name} must point to a root markdown page in {DOC_SITE_CONFIG_PATH}"
-        )
-    return rel.as_posix()
-
-
-def require_markdown_rel_path(value: object, field_name: str) -> Path:
-    rel = require_rel_path(value, field_name)
-    if rel.suffix != ".md":
-        raise SystemExit(
-            f"ERROR: {field_name} must point to a markdown path in {DOC_SITE_CONFIG_PATH}"
-        )
-    return rel
-
-
-def require_rel_path(value: object, field_name: str) -> Path:
-    path_text = require_str(value, field_name)
-    path = Path(path_text)
-    if path.is_absolute() or path_text.startswith("/"):
-        raise SystemExit(
-            f"ERROR: {field_name} must be a relative path in {DOC_SITE_CONFIG_PATH}"
-        )
-    rel = normalize_rel_path(path)
-    if rel == Path("."):
-        raise SystemExit(f"ERROR: {field_name} must not be '.' in {DOC_SITE_CONFIG_PATH}")
-    return rel
+      document.addEventListener("DOMContentLoaded", () => scheduleFluxonExplorerHomeLink())
+      document.addEventListener("render", () => scheduleFluxonExplorerHomeLink())
+      document.addEventListener("nav", () => scheduleFluxonExplorerHomeLink())
+      installFluxonRootInternalClickGuard()
+      installFluxonRootInternalMutationObserver()
+      scheduleFluxonExplorerHomeLink()
+    }})();
+    """
+)
 
 
 class OutputHTTPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
 
+class OutputHTTPRequestHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(OUTPUT_ROOT), **kwargs)
+
+    def send_head(self):
+        original_path = self.path
+        self.path = self.resolve_output_path(original_path)
+        try:
+            return super().send_head()
+        finally:
+            self.path = original_path
+
+    @staticmethod
+    def resolve_output_path(raw_path: str) -> str:
+        split = urllib.parse.urlsplit(raw_path)
+        request_path = urllib.parse.unquote(split.path) or "/"
+        if request_path.endswith("/") or Path(request_path).suffix:
+            return raw_path
+
+        html_rel_path = request_path.lstrip("/") + ".html"
+        if not (OUTPUT_ROOT / html_rel_path).is_file():
+            return raw_path
+
+        resolved_path = "/" + urllib.parse.quote(html_rel_path, safe="/")
+        if split.query:
+            resolved_path += f"?{split.query}"
+        return resolved_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
-
     subparsers.add_parser("bootstrap")
     subparsers.add_parser("build")
     serve_parser = subparsers.add_parser("serve")
@@ -309,37 +753,28 @@ def main() -> int:
 
 
 def bootstrap_toolchain() -> int:
-    npm_path = require_binary("npm")
-    require_binary("node")
+    ensure_dir(CACHE_ROOT)
+    ensure_dir(PROJECT_ROOT)
+    ensure_dir(NPM_CACHE_ROOT)
+    require_binary("git")
+    require_supported_node_runtime()
 
-    ensure_dir_777(CACHE_ROOT)
-    ensure_dir_777(TOOLCHAIN_ROOT)
-    ensure_dir_777(NPM_CACHE_ROOT)
-    write_toolchain_package_json()
-
-    cmd = [
-        npm_path,
-        "--cache",
-        str(NPM_CACHE_ROOT),
-        "install",
-        "--prefix",
-        str(TOOLCHAIN_ROOT),
-        "--no-fund",
-        "--no-audit",
-    ]
-    run_cmd(cmd, cwd=REPO_ROOT)
+    ensure_quartz_runtime_checkout()
+    write_runtime_quartz_config()
+    write_runtime_quartz_lockfile()
+    ensure_node_modules()
+    ensure_quartz_plugins()
     return 0
 
 
 def build_site() -> int:
-    vitepress_cmd = require_vitepress_toolchain()
-    reset_site_project()
-    sync_stage_site_project()
+    bootstrap_toolchain()
+    reset_staged_docs()
+    stage_source_docs()
     if OUTPUT_ROOT.exists():
         shutil.rmtree(OUTPUT_ROOT)
-    ensure_dir_777(OUTPUT_ROOT)
-    run_vitepress_build(vitepress_cmd)
-    chmod_tree_777(OUTPUT_ROOT)
+    ensure_dir(OUTPUT_ROOT)
+    run_quartz_build()
     return 0
 
 
@@ -354,11 +789,7 @@ def track_site(addr: str, poll_seconds: float) -> int:
         print("ERROR: --poll-seconds must be > 0.", file=sys.stderr)
         return 2
 
-    vitepress_cmd = require_vitepress_toolchain()
-    reset_site_project()
-    sync_stage_site_project()
-    run_vitepress_build(vitepress_cmd)
-    chmod_tree_777(OUTPUT_ROOT)
+    build_site()
     source_state = compute_source_state()
     httpd, server_thread = start_output_http_server(addr)
 
@@ -370,9 +801,7 @@ def track_site(addr: str, poll_seconds: float) -> int:
                 continue
 
             print("doc_site track: source change detected, rebuilding output site...", flush=True)
-            sync_stage_site_project()
-            run_vitepress_build(vitepress_cmd)
-            chmod_tree_777(OUTPUT_ROOT)
+            build_site()
             source_state = next_state
     except KeyboardInterrupt:
         print("doc_site track: stopping HTTP server.", flush=True)
@@ -381,14 +810,931 @@ def track_site(addr: str, poll_seconds: float) -> int:
     return 0
 
 
-def require_vitepress_toolchain() -> list[str]:
-    if not VITEPRESS_ENTRY_PATH.is_file():
-        print(
-            "ERROR: VitePress toolchain not bootstrapped. Run `python3 scripts/build_doc_site.py bootstrap` first.",
-            file=sys.stderr,
+def ensure_quartz_runtime_checkout() -> None:
+    if quartz_runtime_is_ready():
+        return
+
+    if TOOLCHAIN_ROOT.exists():
+        shutil.rmtree(TOOLCHAIN_ROOT)
+    ensure_dir(TOOLCHAIN_ROOT.parent)
+
+    run_cmd(
+        [
+            "git",
+            "clone",
+            "--branch",
+            QUARTZ_REF,
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            "--sparse",
+            QUARTZ_REPO_URL,
+            str(TOOLCHAIN_ROOT),
+        ],
+        cwd=REPO_ROOT,
+    )
+    run_cmd(
+        [
+            "git",
+            "-C",
+            str(TOOLCHAIN_ROOT),
+            "sparse-checkout",
+            "set",
+            "--skip-checks",
+            *SPARSE_CHECKOUT_PATHS,
+        ],
+        cwd=REPO_ROOT,
+    )
+
+    current_commit = git_capture(["rev-parse", "HEAD"], cwd=TOOLCHAIN_ROOT).strip()
+    if current_commit != QUARTZ_COMMIT:
+        raise SystemExit(
+            "ERROR: unexpected Quartz checkout commit after clone: "
+            f"expected={QUARTZ_COMMIT} actual={current_commit}"
         )
-        raise SystemExit(2)
-    return [require_binary("node"), str(VITEPRESS_ENTRY_PATH)]
+
+
+def quartz_runtime_is_ready() -> bool:
+    if not (TOOLCHAIN_ROOT / ".git").exists():
+        return False
+    if not (TOOLCHAIN_ROOT / "package.json").is_file():
+        return False
+    if not (TOOLCHAIN_ROOT / "quartz" / "bootstrap-cli.mjs").is_file():
+        return False
+
+    try:
+        remote_url = git_capture(["remote", "get-url", "origin"], cwd=TOOLCHAIN_ROOT).strip()
+        current_commit = git_capture(["rev-parse", "HEAD"], cwd=TOOLCHAIN_ROOT).strip()
+    except RuntimeError:
+        return False
+
+    if remote_url != QUARTZ_REPO_URL:
+        return False
+    return current_commit == QUARTZ_COMMIT
+
+
+def write_runtime_quartz_config() -> None:
+    ensure_dir(TOOLCHAIN_ROOT)
+    write_text_if_changed(RUNTIME_CONFIG_PATH, build_quartz_config_text())
+
+
+def write_runtime_quartz_lockfile() -> None:
+    ensure_dir(TOOLCHAIN_ROOT)
+    write_text_if_changed(RUNTIME_LOCKFILE_PATH, build_quartz_lockfile_text())
+
+
+def build_quartz_config_text() -> str:
+    base_url = resolve_site_base_url()
+    return dedent(
+        f"""\
+        # yaml-language-server: $schema=./quartz/plugins/quartz-plugins.schema.json
+        configuration:
+          pageTitle: Fluxon Docs
+          pageTitleSuffix: ""
+          enableSPA: true
+          enablePopovers: true
+          analytics: null
+          locale: en-US
+          baseUrl: {base_url}
+          ignorePatterns:
+            - private
+            - templates
+            - .obsidian
+          theme:
+            fontOrigin: local
+            cdnCaching: true
+            typography:
+              header: Noto Sans SC
+              body: Noto Sans SC
+              code: JetBrains Mono
+            colors:
+              lightMode:
+                light: "#f7f4ee"
+                lightgray: "#e2dbcf"
+                gray: "#b2aa9f"
+                darkgray: "#5b564f"
+                dark: "#1e1c19"
+                secondary: "#35633b"
+                tertiary: "#8b6f47"
+                highlight: rgba(101, 130, 101, 0.14)
+                textHighlight: "#fff23688"
+              darkMode:
+                light: "#171613"
+                lightgray: "#35322d"
+                gray: "#70695f"
+                darkgray: "#ddd5c9"
+                dark: "#f6efe4"
+                secondary: "#8ec792"
+                tertiary: "#d3ad79"
+                highlight: rgba(140, 174, 146, 0.12)
+                textHighlight: "#b3aa0288"
+
+        plugins:
+          - source: "{plugin_source('note-properties')}"
+            enabled: true
+            options:
+              includeAll: false
+              includedProperties: []
+              excludedProperties: []
+              hidePropertiesView: true
+              delimiters: "---"
+              language: yaml
+            order: 5
+          - source: "{plugin_source('created-modified-date')}"
+            enabled: true
+            options:
+              defaultDateType: modified
+              priority:
+                - filesystem
+            order: 10
+          - source: "{plugin_source('syntax-highlighting')}"
+            enabled: true
+            options:
+              theme:
+                light: github-light
+                dark: github-dark
+              keepBackground: false
+            order: 20
+          - source: "{plugin_source('obsidian-flavored-markdown')}"
+            enabled: true
+            options:
+              enableInHtmlEmbed: false
+              enableCheckbox: true
+            order: 30
+          - source: "{plugin_source('github-flavored-markdown')}"
+            enabled: true
+            order: 40
+          - source: "{plugin_source('table-of-contents')}"
+            enabled: true
+            order: 50
+            layout:
+              position: right
+              priority: 20
+          - source: "{plugin_source('crawl-links')}"
+            enabled: true
+            options:
+              markdownLinkResolution: shortest
+            order: 60
+          - source: "{plugin_source('description')}"
+            enabled: true
+            order: 70
+          - source: "{plugin_source('alias-redirects')}"
+            enabled: true
+          - source: "{plugin_source('content-index')}"
+            enabled: true
+            options:
+              enableSiteMap: true
+              enableRSS: false
+          - source: "{plugin_source('favicon')}"
+            enabled: true
+          - source: "{plugin_source('og-image')}"
+            enabled: false
+          - source: "{plugin_source('content-page')}"
+            enabled: true
+          - source: "{plugin_source('folder-page')}"
+            enabled: true
+          - source: "{plugin_source('explorer')}"
+            enabled: true
+            options:
+              folderDefaultState: open
+              folderClickBehavior: link
+              useSavedState: false
+            layout:
+              position: left
+              priority: 40
+          - source: "{plugin_source('search')}"
+            enabled: true
+            layout:
+              position: left
+              priority: 20
+          - source: "{plugin_source('backlinks')}"
+            enabled: true
+            layout:
+              position: right
+              priority: 40
+          - source: "{plugin_source('article-title')}"
+            enabled: true
+            layout:
+              position: beforeBody
+              priority: 10
+          - source: "{plugin_source('content-meta')}"
+            enabled: true
+            layout:
+              position: beforeBody
+              priority: 20
+          - source: "{plugin_source('page-title')}"
+            enabled: true
+            layout:
+              position: left
+              priority: 10
+          - source: "{plugin_source('darkmode')}"
+            enabled: true
+            layout:
+              position: left
+              priority: 30
+          - source: "{plugin_source('breadcrumbs')}"
+            enabled: true
+            layout:
+              position: beforeBody
+              priority: 5
+              condition: not-index
+          - source: "{plugin_source('footer')}"
+            enabled: true
+            options:
+              links: {{}}
+        """
+    )
+
+
+def plugin_source(name: str) -> str:
+    return f"github:quartz-community/{name}"
+
+
+def build_quartz_lockfile_text() -> str:
+    plugins: dict[str, dict[str, str]] = {}
+    for name, commit in sorted(PLUGIN_COMMITS.items()):
+        source = plugin_source(name)
+        plugins[name] = {
+            "source": source,
+            "resolved": f"https://github.com/quartz-community/{name}.git",
+            "commit": commit,
+        }
+
+    for name, entry in sorted(read_existing_runtime_lock_plugins().items()):
+        if name in plugins:
+            continue
+        source = entry.get("source")
+        resolved = entry.get("resolved")
+        commit = entry.get("commit")
+        if not all(isinstance(value, str) for value in (source, resolved, commit)):
+            continue
+        plugins[name] = {
+            "source": source,
+            "resolved": resolved,
+            "commit": commit,
+        }
+
+    return json.dumps({"version": "1.0.0", "plugins": plugins}, indent=2) + "\n"
+
+
+def read_existing_runtime_lock_plugins() -> dict[str, dict[str, object]]:
+    if not RUNTIME_LOCKFILE_PATH.is_file():
+        return {}
+
+    try:
+        raw_data = json.loads(RUNTIME_LOCKFILE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    raw_plugins = raw_data.get("plugins")
+    if not isinstance(raw_plugins, dict):
+        return {}
+
+    plugins: dict[str, dict[str, object]] = {}
+    for name, entry in raw_plugins.items():
+        if isinstance(name, str) and isinstance(entry, dict):
+            plugins[name] = entry
+    return plugins
+
+
+def ensure_node_modules() -> None:
+    package_lock_path = TOOLCHAIN_ROOT / "package-lock.json"
+    if not package_lock_path.is_file():
+        raise SystemExit(f"ERROR: missing Quartz package-lock.json: {package_lock_path}")
+
+    expected_stamp = hash_text(QUARTZ_COMMIT + "\n" + package_lock_path.read_text(encoding="utf-8"))
+    if NPM_STAMP_PATH.is_file() and NPM_STAMP_PATH.read_text(encoding="utf-8") == expected_stamp:
+        if (TOOLCHAIN_ROOT / "node_modules").is_dir():
+            return
+
+    run_cmd(
+        [
+            require_binary("npm"),
+            "--cache",
+            str(NPM_CACHE_ROOT),
+            "ci",
+            "--no-fund",
+            "--no-audit",
+        ],
+        cwd=TOOLCHAIN_ROOT,
+    )
+    NPM_STAMP_PATH.write_text(expected_stamp, encoding="utf-8")
+
+
+def ensure_quartz_plugins() -> None:
+    config_text = RUNTIME_CONFIG_PATH.read_text(encoding="utf-8")
+    lockfile_text = RUNTIME_LOCKFILE_PATH.read_text(encoding="utf-8")
+    expected_stamp = hash_text(QUARTZ_COMMIT + "\n" + config_text + "\n" + lockfile_text)
+    plugins_root = TOOLCHAIN_ROOT / ".quartz" / "plugins"
+    if (
+        PLUGIN_STAMP_PATH.is_file()
+        and PLUGIN_STAMP_PATH.read_text(encoding="utf-8") == expected_stamp
+        and plugins_root.is_dir()
+    ):
+        return
+
+    run_cmd(
+        [
+            require_binary("node"),
+            "quartz/bootstrap-cli.mjs",
+            "plugin",
+            "resolve",
+        ],
+        cwd=TOOLCHAIN_ROOT,
+    )
+    lockfile_text = RUNTIME_LOCKFILE_PATH.read_text(encoding="utf-8")
+    expected_stamp = hash_text(QUARTZ_COMMIT + "\n" + config_text + "\n" + lockfile_text)
+
+    run_cmd(
+        [
+            require_binary("node"),
+            "quartz/bootstrap-cli.mjs",
+            "plugin",
+            "install",
+        ],
+        cwd=TOOLCHAIN_ROOT,
+    )
+    PLUGIN_STAMP_PATH.write_text(expected_stamp, encoding="utf-8")
+
+
+def reset_staged_docs() -> None:
+    if PROJECT_ROOT.exists():
+        shutil.rmtree(PROJECT_ROOT)
+    ensure_dir(STAGE_DOCS_ROOT)
+
+
+def stage_source_docs() -> None:
+    for variant in DOC_VARIANTS:
+        stage_doc_variant(variant)
+
+    stage_homepage(variant=resolve_doc_variant("en"))
+    stage_homepage(variant=resolve_doc_variant("cn"))
+    stage_repo_asset_tree(HOMEPAGE_ROOT_PICS_DIR)
+    for source_path in HOMEPAGE_SUPPORT_FILE_PATHS:
+        stage_repo_file(source_path)
+
+
+def stage_doc_variant(variant: DocVariant) -> None:
+    doc_root = resolve_doc_root(variant.language)
+    if not doc_root.is_dir():
+        raise SystemExit(f"ERROR: doc root not found: {doc_root}")
+
+    for source_path in sorted(doc_root.rglob("*")):
+        rel = source_path.relative_to(doc_root)
+        if should_skip_rel_path(rel):
+            continue
+
+        dst_rel = variant.output_prefix / rel
+        if source_path.is_dir():
+            ensure_dir(STAGE_DOCS_ROOT / dst_rel)
+            continue
+
+        if source_path.suffix == ".md":
+            write_staged_markdown(source_path, rel, dst_rel, language=variant.language)
+            continue
+
+        dst_path = STAGE_DOCS_ROOT / dst_rel
+        ensure_dir(dst_path.parent)
+        shutil.copy2(source_path, dst_path)
+
+
+def should_skip_rel_path(rel: Path) -> bool:
+    for part in rel.parts:
+        if part.startswith("."):
+            return True
+        if part in SKIP_DIR_NAMES:
+            return True
+    rel_str = rel.as_posix()
+    return rel_str.endswith(".canvas") or rel_str.endswith(".canvas.ext")
+
+
+def write_staged_markdown(source_path: Path, source_rel: Path, dst_rel: Path, *, language: str) -> None:
+    if is_nested_doc_readme(source_rel):
+        return
+
+    dst_rel = dst_rel.with_name("index.md") if source_rel.name == "README.md" else dst_rel
+    dst_path = STAGE_DOCS_ROOT / dst_rel
+    ensure_dir(dst_path.parent)
+    raw_md = source_path.read_text(encoding="utf-8")
+    staged_md = build_staged_markdown(
+        raw_md,
+        title_fallback=source_path.stem,
+        target_rewriter=lambda raw_target: rewrite_variant_target_path(raw_target, language=language),
+    )
+    dst_path.write_text(staged_md, encoding="utf-8")
+
+
+def stage_homepage(*, variant: DocVariant) -> None:
+    if not variant.homepage_source.is_file():
+        return
+
+    raw_md = variant.homepage_source.read_text(encoding="utf-8")
+    staged_md = build_staged_markdown(
+        raw_md,
+        title_fallback="Fluxon",
+        target_rewriter=lambda raw_target: rewrite_homepage_target_path(raw_target, language=variant.language),
+    )
+    dst_path = STAGE_DOCS_ROOT / variant.output_prefix / "index.md"
+    ensure_dir(dst_path.parent)
+    write_text_if_changed(dst_path, staged_md)
+
+
+def stage_repo_asset_tree(source_root: Path) -> None:
+    if not source_root.is_dir():
+        return
+
+    for source_path in sorted(source_root.rglob("*")):
+        rel = source_path.relative_to(REPO_ROOT)
+        dst_path = STAGE_DOCS_ROOT / rel
+        if source_path.is_dir():
+            ensure_dir(dst_path)
+            continue
+        ensure_dir(dst_path.parent)
+        shutil.copy2(source_path, dst_path)
+
+
+def stage_repo_file(source_path: Path) -> None:
+    if not source_path.is_file():
+        return
+
+    rel = source_path.relative_to(REPO_ROOT)
+    dst_path = STAGE_DOCS_ROOT / rel
+    ensure_dir(dst_path.parent)
+    shutil.copy2(source_path, dst_path)
+
+
+def rewrite_markdown_links(raw_md: str, *, target_rewriter=None) -> str:
+    if target_rewriter is None:
+        target_rewriter = rewrite_target_path
+
+    lines = raw_md.splitlines(keepends=True)
+    out_lines: list[str] = []
+    in_fence = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out_lines.append(line)
+            continue
+        if in_fence:
+            out_lines.append(line)
+            continue
+        out_lines.append(
+            MARKDOWN_LINK_RE.sub(
+                lambda match: rewrite_markdown_match(match, target_rewriter),
+                line,
+            )
+        )
+    return "".join(out_lines)
+
+
+def build_staged_markdown(raw_md: str, *, title_fallback: str | None, target_rewriter) -> str:
+    if has_yaml_frontmatter(raw_md):
+        return rewrite_markdown_links(raw_md, target_rewriter=target_rewriter)
+
+    title, body_md = extract_leading_h1_title(raw_md)
+    staged_body_md = rewrite_markdown_links(body_md, target_rewriter=target_rewriter)
+    resolved_title = title or title_fallback
+    if not resolved_title:
+        return staged_body_md
+
+    return (
+        f"---\n"
+        f"title: {json.dumps(resolved_title, ensure_ascii=False)}\n"
+        f"---\n\n"
+        f"{staged_body_md.lstrip()}"
+    )
+
+
+def has_yaml_frontmatter(raw_md: str) -> bool:
+    return LEADING_FRONTMATTER_RE.match(raw_md) is not None
+
+
+def extract_leading_h1_title(raw_md: str) -> tuple[str | None, str]:
+    lines = raw_md.splitlines(keepends=True)
+    idx = 0
+    while idx < len(lines) and not lines[idx].strip():
+        idx += 1
+
+    if idx >= len(lines):
+        return None, raw_md
+
+    heading_line = lines[idx].rstrip("\r\n")
+    match = LEADING_H1_RE.match(heading_line)
+    if match is None:
+        return None, raw_md
+
+    title = match.group("title").strip()
+    body_start = idx + 1
+    while body_start < len(lines) and not lines[body_start].strip():
+        body_start += 1
+    body_md = "".join(lines[:idx] + lines[body_start:])
+    return title, body_md
+
+
+def rewrite_markdown_match(match: re.Match[str], target_rewriter) -> str:
+    prefix = match.group(1)
+    raw_target = match.group(2).strip()
+    suffix = match.group(3)
+    return f"{prefix}{target_rewriter(raw_target)}{suffix}"
+
+
+def rewrite_target_path(raw_target: str) -> str:
+    unescaped_target = decode_markdown_target(raw_target)
+    if (
+        not unescaped_target
+        or unescaped_target.startswith("#")
+        or unescaped_target.startswith("http://")
+        or unescaped_target.startswith("https://")
+        or unescaped_target.startswith("mailto:")
+        or unescaped_target.startswith("tel:")
+        or unescaped_target.startswith("data:")
+    ):
+        return raw_target
+
+    split = urllib.parse.urlsplit(unescaped_target)
+    path_part = urllib.parse.unquote(split.path)
+    normalized_path = normalize_readme_target_path(path_part)
+    if normalized_path is None:
+        return raw_target
+
+    rebuilt = urllib.parse.quote(normalized_path, safe="/")
+    if split.query:
+        rebuilt += f"?{split.query}"
+    if split.fragment:
+        rebuilt += f"#{split.fragment}"
+    return rebuilt
+
+
+def rewrite_variant_target_path(raw_target: str, *, language: str) -> str:
+    if language != "cn":
+        return rewrite_target_path(raw_target)
+
+    unescaped_target = decode_markdown_target(raw_target)
+    if (
+        not unescaped_target
+        or unescaped_target.startswith("#")
+        or unescaped_target.startswith("http://")
+        or unescaped_target.startswith("https://")
+        or unescaped_target.startswith("mailto:")
+        or unescaped_target.startswith("tel:")
+        or unescaped_target.startswith("data:")
+    ):
+        return raw_target
+
+    split = urllib.parse.urlsplit(unescaped_target)
+    path_part = urllib.parse.unquote(split.path)
+    if path_part.endswith("README_CN.md"):
+        normalized_path = normalize_readme_target_path(path_part)
+        if normalized_path is not None:
+            rebuilt = urllib.parse.quote(append_relative_path_segment(normalized_path, "cn"), safe="/.")
+            if split.query:
+                rebuilt += f"?{split.query}"
+            if split.fragment:
+                rebuilt += f"#{split.fragment}"
+            return rebuilt
+
+    return rewrite_target_path(raw_target)
+
+
+def rewrite_homepage_target_path(raw_target: str, *, language: str) -> str:
+    unescaped_target = decode_markdown_target(raw_target)
+    if (
+        not unescaped_target
+        or unescaped_target.startswith("#")
+        or unescaped_target.startswith("http://")
+        or unescaped_target.startswith("https://")
+        or unescaped_target.startswith("mailto:")
+        or unescaped_target.startswith("tel:")
+        or unescaped_target.startswith("data:")
+    ):
+        return raw_target
+
+    split = urllib.parse.urlsplit(unescaped_target)
+    path_part = urllib.parse.unquote(split.path)
+    mapped_path = remap_homepage_repo_path(path_part, language=language)
+    rebuilt = urllib.parse.quote(mapped_path, safe="/.")
+    if split.query:
+        rebuilt += f"?{split.query}"
+    if split.fragment:
+        rebuilt += f"#{split.fragment}"
+    return rewrite_target_path(rebuilt)
+
+
+def remap_homepage_repo_path(path_part: str, *, language: str) -> str:
+    if language == "en":
+        if path_part in {"./README.md", "README.md"}:
+            return "./"
+        if path_part in {"./README_CN.md", "README_CN.md"}:
+            return "./cn/"
+        if path_part.startswith("./fluxon_doc_en/"):
+            return "./" + path_part[len("./fluxon_doc_en/") :]
+        if path_part.startswith("fluxon_doc_en/"):
+            return path_part[len("fluxon_doc_en/") :]
+        if path_part.startswith("./fluxon_doc_cn/"):
+            return "./cn/" + path_part[len("./fluxon_doc_cn/") :]
+        if path_part.startswith("fluxon_doc_cn/"):
+            return "cn/" + path_part[len("fluxon_doc_cn/") :]
+        return path_part
+
+    if language == "cn":
+        if path_part in {"./README_CN.md", "README_CN.md"}:
+            return "../cn/"
+        if path_part in {"./README.md", "README.md"}:
+            return "../"
+        if path_part.startswith("./fluxon_doc_cn/"):
+            return "../cn/" + path_part[len("./fluxon_doc_cn/") :]
+        if path_part.startswith("fluxon_doc_cn/"):
+            return "../cn/" + path_part[len("fluxon_doc_cn/") :]
+        if path_part.startswith("./fluxon_doc_en/"):
+            return "../" + path_part[len("./fluxon_doc_en/") :]
+        if path_part.startswith("fluxon_doc_en/"):
+            return "../" + path_part[len("fluxon_doc_en/") :]
+        if path_part.startswith("./"):
+            return "../" + path_part[len("./") :]
+        return path_part
+
+    return path_part
+
+
+def is_nested_doc_readme(rel: Path) -> bool:
+    return rel.name == "README.md" and rel.parent != Path(".")
+
+
+def normalize_readme_target_path(path_part: str) -> str | None:
+    for readme_name in ("README_CN.md", "README.md"):
+        if not path_part.endswith(readme_name):
+            continue
+
+        directory_path = path_part[: -len(readme_name)]
+        if directory_path in {"", "."}:
+            return "./"
+        if directory_path.endswith("/"):
+            return directory_path
+        return directory_path + "/"
+    return None
+
+
+def append_relative_path_segment(base_path: str, segment: str) -> str:
+    if base_path in {"", "."}:
+        return f"{segment}/"
+    if not base_path.endswith("/"):
+        base_path += "/"
+    return f"{base_path}{segment}/"
+
+
+def decode_markdown_target(raw_target: str) -> str:
+    unescaped = html.unescape(raw_target).strip()
+    if unescaped.startswith("<") and unescaped.endswith(">"):
+        return unescaped[1:-1].strip()
+    return unescaped
+
+
+def run_quartz_build() -> None:
+    run_cmd(
+        [
+            require_binary("node"),
+            "quartz/bootstrap-cli.mjs",
+            "build",
+            "-d",
+            str(STAGE_DOCS_ROOT),
+            "-o",
+            str(OUTPUT_ROOT),
+        ],
+        cwd=TOOLCHAIN_ROOT,
+    )
+    apply_output_overrides()
+
+
+def apply_output_overrides() -> None:
+    # Apply post-build fixes for GitHub Pages routing and Quartz navigation.
+    create_pretty_route_indexes()
+    force_expand_explorer()
+    add_explorer_home_link()
+
+
+def create_pretty_route_indexes() -> None:
+    # Duplicate foo.html to foo/index.html so GitHub Pages can serve /foo/.
+    for html_path in sorted(OUTPUT_ROOT.rglob("*.html")):
+        if html_path.name in {"index.html", "404.html"}:
+            continue
+
+        pretty_dir = html_path.with_suffix("")
+        pretty_index_path = pretty_dir / "index.html"
+        ensure_dir(pretty_dir)
+        html_text = html_path.read_text(encoding="utf-8")
+        pretty_index_path.write_text(rewrite_pretty_route_html(html_text), encoding="utf-8")
+
+
+def rewrite_pretty_route_html(html_text: str) -> str:
+    # Moving foo.html to foo/index.html adds one path segment to every relative URL.
+    rewritten_html = HTML_URL_ATTR_RE.sub(rewrite_pretty_route_html_match, html_text)
+    return HTML_FETCH_URL_RE.sub(rewrite_pretty_route_html_match, rewritten_html)
+
+
+def rewrite_pretty_route_html_match(match: re.Match[str]) -> str:
+    relative_url = match.group("url")
+    return f"{match.group('prefix')}{rewrite_pretty_route_relative_url(relative_url)}{match.group('suffix')}"
+
+
+def rewrite_pretty_route_relative_url(relative_url: str) -> str:
+    parsed_url = urllib.parse.urlsplit(relative_url)
+    if parsed_url.scheme or parsed_url.netloc:
+        return relative_url
+    if relative_url.startswith(("/", "#", "?")):
+        return relative_url
+    return "../" + relative_url
+
+
+def force_expand_explorer() -> None:
+    # Append CSS that keeps the left explorer fully expanded.
+    index_css_path = OUTPUT_ROOT / "index.css"
+    if not index_css_path.is_file():
+        raise SystemExit(f"ERROR: missing built Quartz stylesheet: {index_css_path}")
+
+    css_text = index_css_path.read_text(encoding="utf-8")
+    if EXPLORER_FORCE_EXPANDED_CSS in css_text:
+        return
+    index_css_path.write_text(css_text + "\n" + EXPLORER_FORCE_EXPANDED_CSS, encoding="utf-8")
+
+
+def add_explorer_home_link() -> None:
+    # Append JavaScript that adds the explorer home link and fixes internal links.
+    postscript_path = OUTPUT_ROOT / "postscript.js"
+    if not postscript_path.is_file():
+        raise SystemExit(f"ERROR: missing built Quartz script bundle: {postscript_path}")
+
+    script_text = postscript_path.read_text(encoding="utf-8")
+    if DOC_SITE_POSTSCRIPT_JS in script_text:
+        return
+    postscript_path.write_text(script_text + "\n" + DOC_SITE_POSTSCRIPT_JS, encoding="utf-8")
+
+
+def resolve_doc_variant(language: str) -> DocVariant:
+    for variant in DOC_VARIANTS:
+        if variant.language == language:
+            return variant
+    raise KeyError(f"unsupported doc language: {language}")
+
+
+def resolve_doc_root(language: str) -> Path:
+    variant = resolve_doc_variant(language)
+    raw_doc_root = os.environ.get(variant.doc_root_env)
+    if raw_doc_root and raw_doc_root.strip():
+        doc_root = Path(raw_doc_root.strip())
+        if not doc_root.is_absolute():
+            doc_root = REPO_ROOT / doc_root
+        return doc_root
+
+    if language == "en":
+        legacy_doc_root = os.environ.get("FLUXON_DOC_ROOT")
+        if legacy_doc_root and legacy_doc_root.strip():
+            doc_root = Path(legacy_doc_root.strip())
+            if not doc_root.is_absolute():
+                doc_root = REPO_ROOT / doc_root
+            return doc_root
+
+    if variant.default_doc_root.is_dir():
+        return variant.default_doc_root
+    return variant.fallback_doc_root
+
+
+def resolve_site_base_url() -> str:
+    raw_base = os.environ.get("FLUXON_DOC_SITE_BASE_URL")
+    if raw_base is None or not raw_base.strip():
+        return "example.com"
+
+    base = raw_base.strip()
+    if base.startswith("http://") or base.startswith("https://"):
+        split = urllib.parse.urlsplit(base)
+        if not split.netloc:
+            raise SystemExit(
+                f"ERROR: FLUXON_DOC_SITE_BASE_URL must include a hostname when using a scheme: {raw_base!r}"
+            )
+        base = split.netloc + split.path
+
+    base = base.strip("/")
+    if not base:
+        raise SystemExit("ERROR: FLUXON_DOC_SITE_BASE_URL must not be empty")
+    if base.startswith("/"):
+        raise SystemExit(
+            "ERROR: FLUXON_DOC_SITE_BASE_URL must be host[/path] without a leading slash: "
+            f"{raw_base!r}"
+        )
+    return base
+
+
+def compute_source_state() -> tuple[tuple[str, int, int], ...]:
+    rows: list[tuple[str, int, int]] = []
+    for variant in DOC_VARIANTS:
+        doc_root = resolve_doc_root(variant.language)
+        for path in sorted(doc_root.rglob("*")):
+            rel = path.relative_to(doc_root)
+            if should_skip_rel_path(rel) or not path.is_file():
+                continue
+            stat = path.stat()
+            rows.append((f"doc:{variant.language}:{rel.as_posix()}", stat.st_mtime_ns, stat.st_size))
+
+    for path in (
+        Path(__file__),
+        REPO_ROOT / ".github" / "workflows" / "docs-pages.yml",
+        HOMEPAGE_MARKDOWN_SOURCE,
+        HOMEPAGE_CN_MARKDOWN_SOURCE,
+        *HOMEPAGE_SUPPORT_FILE_PATHS,
+    ):
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        rows.append((f"meta:{path.relative_to(REPO_ROOT).as_posix()}", stat.st_mtime_ns, stat.st_size))
+
+    if HOMEPAGE_ROOT_PICS_DIR.is_dir():
+        for path in sorted(HOMEPAGE_ROOT_PICS_DIR.rglob("*")):
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            rows.append((f"meta:{path.relative_to(REPO_ROOT).as_posix()}", stat.st_mtime_ns, stat.st_size))
+    return tuple(rows)
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def write_text_if_changed(path: Path, content: str) -> None:
+    if path.is_file() and path.read_text(encoding="utf-8") == content:
+        return
+    path.write_text(content, encoding="utf-8")
+
+
+def hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def require_binary(name: str) -> str:
+    path = shutil.which(name)
+    if path is None:
+        raise SystemExit(f"ERROR: `{name}` not found in PATH.")
+    return path
+
+
+def require_supported_node_runtime() -> None:
+    node_path = require_binary("node")
+    npm_path = require_binary("npm")
+
+    node_major = int(
+        subprocess.run(
+            [node_path, "-p", "process.versions.node.split('.')[0]"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+    )
+    npm_version_text = subprocess.run(
+        [npm_path, "--version"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    npm_version = tuple(int(part) for part in npm_version_text.split(".") if part.isdigit())
+
+    if node_major < 22:
+        raise SystemExit(
+            "ERROR: Quartz requires Node.js >= 22. "
+            f"Found node={subprocess.run([node_path, '--version'], check=False, stdout=subprocess.PIPE, text=True).stdout.strip()} "
+            f"npm={npm_version_text}"
+        )
+    if npm_version < (10, 9, 2):
+        raise SystemExit(
+            "ERROR: Quartz requires npm >= 10.9.2. "
+            f"Found npm={npm_version_text}"
+        )
+
+
+def run_cmd(cmd: list[str], *, cwd: Path) -> None:
+    print("+ " + " ".join(shlex.quote(v) for v in cmd), flush=True)
+    rc = subprocess.run(cmd, cwd=str(cwd), check=False).returncode
+    if rc != 0:
+        raise SystemExit(rc)
+
+
+def git_capture(args: list[str], *, cwd: Path) -> str:
+    cmd = ["git", "-C", str(cwd), *args]
+    completed = subprocess.run(
+        cmd,
+        cwd=str(REPO_ROOT),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if completed.returncode != 0:
+        output = completed.stdout or ""
+        raise RuntimeError(
+            f"command failed (rc={completed.returncode}): {shlex.join(cmd)}\n{output}"
+        )
+    return completed.stdout or ""
 
 
 def serve_output_root(addr: str) -> None:
@@ -403,12 +1749,7 @@ def serve_output_root(addr: str) -> None:
 
 def start_output_http_server(addr: str) -> tuple[OutputHTTPServer, threading.Thread]:
     host, port = parse_serve_addr(addr)
-    handler = lambda *args, **kwargs: SimpleHTTPRequestHandler(
-        *args,
-        directory=str(OUTPUT_ROOT),
-        **kwargs,
-    )
-    httpd = OutputHTTPServer((host, port), handler)
+    httpd = OutputHTTPServer((host, port), OutputHTTPRequestHandler)
     httpd.daemon_threads = True
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=False)
     server_thread.start()
@@ -435,904 +1776,6 @@ def parse_serve_addr(addr: str) -> tuple[str, int]:
     if port <= 0 or port > 65535:
         raise SystemExit(f"ERROR: invalid --addr port: {addr}")
     return host, port
-
-
-def reset_site_project() -> None:
-    if not DOC_ROOT.is_dir():
-        raise SystemExit(f"ERROR: doc root not found: {DOC_ROOT}")
-
-    if PROJECT_ROOT.exists():
-        shutil.rmtree(PROJECT_ROOT)
-    ensure_dir_777(STAGE_DOCS_ROOT)
-
-
-def sync_stage_site_project() -> None:
-    if not DOC_ROOT.is_dir():
-        raise SystemExit(f"ERROR: doc root not found: {DOC_ROOT}")
-
-    site_config = load_site_config()
-    ensure_dir_777(STAGE_DOCS_ROOT)
-    ensure_project_toolchain_link()
-
-    docs_map, asset_paths = collect_source_files(site_config)
-    validate_docs_map(docs_map)
-    prune_staged_files(docs_map, asset_paths)
-    write_staged_docs(docs_map)
-    copy_assets(asset_paths)
-    doc_meta = collect_doc_meta(docs_map, site_config)
-    write_theme_entry()
-    write_custom_css()
-    write_vitepress_config(doc_meta, site_config)
-
-
-def collect_source_files(site_config: dict) -> tuple[dict[Path, Path], list[Path]]:
-    docs_map: dict[Path, Path] = {}
-    asset_paths: list[Path] = []
-    seen_markdown_paths: set[str] = set()
-    staged_rel_owners: dict[Path, Path] = {}
-    page_overrides = site_config["page_overrides"]
-
-    for src_path in sorted(DOC_ROOT.rglob("*")):
-        rel = src_path.relative_to(DOC_ROOT)
-        if should_skip_rel_path(rel):
-            continue
-        if src_path.is_dir():
-            continue
-        if src_path.suffix == ".md":
-            seen_markdown_paths.add(rel.as_posix())
-            page_override = page_overrides.get(rel.as_posix())
-            if page_override is not None and not page_override["publish"]:
-                continue
-            staged_rel = doc_stage_rel_path(rel, page_overrides)
-            existing_source_rel = staged_rel_owners.get(staged_rel)
-            if existing_source_rel is not None:
-                raise SystemExit(
-                    "ERROR: duplicate staged markdown path after page_overrides: "
-                    f"{existing_source_rel} and {rel} -> {staged_rel}"
-                )
-            staged_rel_owners[staged_rel] = rel
-            docs_map[rel] = staged_rel
-        else:
-            asset_paths.append(rel)
-
-    unused_page_overrides = sorted(set(page_overrides) - seen_markdown_paths)
-    if unused_page_overrides:
-        raise SystemExit(
-            "ERROR: page_overrides point to markdown files that do not exist under "
-            f"{DOC_ROOT}: {unused_page_overrides}"
-        )
-    if not docs_map:
-        raise SystemExit(f"ERROR: no markdown documents found under {DOC_ROOT}")
-    return docs_map, asset_paths
-
-
-def should_skip_rel_path(rel: Path) -> bool:
-    for part in rel.parts:
-        if part.startswith("."):
-            return True
-        if part == "states":
-            return True
-    rel_str = rel.as_posix()
-    if rel_str.endswith(".canvas") or rel_str.endswith(".canvas.ext"):
-        return True
-    return False
-
-
-def doc_stage_rel_path(source_rel: Path, page_overrides: dict[str, dict]) -> Path:
-    page_override = page_overrides.get(source_rel.as_posix())
-    if page_override is not None and page_override["staged_rel"] is not None:
-        return Path(page_override["staged_rel"])
-    if source_rel.name == "README.md":
-        parent = source_rel.parent
-        if str(parent) == ".":
-            return Path("index.md")
-        return parent / "index.md"
-    return source_rel
-
-
-def write_staged_docs(docs_map: dict[Path, Path]) -> None:
-    for source_rel, staged_rel in docs_map.items():
-        src_path = DOC_ROOT / source_rel
-        dst_path = STAGE_DOCS_ROOT / staged_rel
-        ensure_dir_777(dst_path.parent)
-        raw_md = src_path.read_text(encoding="utf-8")
-        staged_md = rewrite_markdown_links(raw_md, source_rel, staged_rel, docs_map)
-        if not markdown_has_h1(raw_md):
-            staged_md = ensure_markdown_title_frontmatter(
-                staged_md,
-                derive_title_from_path(staged_rel),
-            )
-        write_text_777(dst_path, staged_md)
-
-
-def copy_assets(asset_paths: list[Path]) -> None:
-    for rel in asset_paths:
-        src_path = DOC_ROOT / rel
-        dst_path = STAGE_DOCS_ROOT / rel
-        ensure_dir_777(dst_path.parent)
-        shutil.copy2(src_path, dst_path)
-        os.chmod(dst_path, 0o777)
-
-
-def prune_staged_files(docs_map: dict[Path, Path], asset_paths: list[Path]) -> None:
-    wanted = {STAGE_DOCS_ROOT / rel for rel in docs_map.values()}
-    wanted.update(STAGE_DOCS_ROOT / rel for rel in asset_paths)
-    wanted.add(VITEPRESS_CONFIG_PATH)
-    wanted.add(THEME_ENTRY_PATH)
-    wanted.add(CUSTOM_CSS_PATH)
-
-    if not STAGE_DOCS_ROOT.exists():
-        return
-
-    existing_files = sorted(
-        path for path in STAGE_DOCS_ROOT.rglob("*") if path.is_file()
-    )
-    for path in existing_files:
-        if path in wanted:
-            continue
-        path.unlink()
-
-    existing_dirs = sorted(
-        (path for path in STAGE_DOCS_ROOT.rglob("*") if path.is_dir()),
-        key=lambda path: len(path.parts),
-        reverse=True,
-    )
-    for path in existing_dirs:
-        if path == STAGE_DOCS_ROOT:
-            continue
-        if any(path.iterdir()):
-            continue
-        path.rmdir()
-
-
-def ensure_project_toolchain_link() -> None:
-    ensure_dir_777(PROJECT_ROOT)
-    node_modules_link = PROJECT_ROOT / "node_modules"
-    target = TOOLCHAIN_ROOT / "node_modules"
-    if node_modules_link.is_symlink() or node_modules_link.exists():
-        if node_modules_link.resolve() == target.resolve():
-            return
-        if node_modules_link.is_dir() and not node_modules_link.is_symlink():
-            shutil.rmtree(node_modules_link)
-        else:
-            node_modules_link.unlink()
-    os.symlink(target, node_modules_link)
-
-
-def write_theme_entry() -> None:
-    ensure_dir_777(THEME_ENTRY_PATH.parent)
-    write_text_777(
-        THEME_ENTRY_PATH,
-        """\
-import DefaultTheme from 'vitepress/theme'
-import mediumZoom from 'medium-zoom'
-import { nextTick } from 'vue'
-import './custom.css'
-
-let zoom = null
-
-function applyImageZoom() {
-  if (typeof document === 'undefined') {
-    return
-  }
-  if (zoom !== null) {
-    zoom.detach()
-  }
-  zoom = mediumZoom('.vp-doc img', {
-    background: 'rgba(24, 30, 24, 0.82)',
-    margin: 24,
-  })
-}
-
-export default {
-  ...DefaultTheme,
-  enhanceApp(ctx) {
-    if (typeof DefaultTheme.enhanceApp === 'function') {
-      DefaultTheme.enhanceApp(ctx)
-    }
-    if (typeof window === 'undefined') {
-      return
-    }
-    ctx.router.onAfterRouteChanged = async () => {
-      await nextTick()
-      applyImageZoom()
-    }
-    window.requestAnimationFrame(() => {
-      applyImageZoom()
-    })
-  },
-}
-""",
-    )
-
-
-def write_custom_css() -> None:
-    ensure_dir_777(CUSTOM_CSS_PATH.parent)
-    write_text_777(
-        CUSTOM_CSS_PATH,
-        """\
-:root {
-  --vp-c-brand-1: #3f5f3f;
-  --vp-c-brand-2: #507450;
-  --vp-c-brand-3: #2f4b2f;
-  --vp-c-brand-soft: rgba(63, 95, 63, 0.14);
-  --vp-c-bg: #fbf7ef;
-  --vp-c-bg-soft: #f5f0e7;
-  --vp-c-bg-alt: #efe7da;
-  --vp-c-divider: rgba(63, 95, 63, 0.14);
-  --vp-c-text-1: #283324;
-}
-
-body {
-  background:
-    radial-gradient(circle at top left, rgba(181, 106, 47, 0.08), transparent 26%),
-    linear-gradient(180deg, #fbf7ef 0%, #f5f0e7 100%);
-}
-
-.VPNavBar {
-  backdrop-filter: blur(10px);
-  background: rgba(63, 95, 63, 0.92) !important;
-  border-bottom: 1px solid rgba(63, 95, 63, 0.18);
-}
-
-.VPNavBar .wrapper,
-.VPNavBar .container,
-.VPNavBar .content,
-.VPNavBar .content-body {
-  background: rgba(63, 95, 63, 0.92) !important;
-}
-
-.VPNavBar .VPNavBarSearch .DocSearch-Button {
-  background: rgba(255, 255, 255, 0.1) !important;
-  border: 1px solid rgba(255, 255, 255, 0.16) !important;
-}
-
-.VPNavBar .VPNavBarSearch .DocSearch-Button:hover,
-.VPNavBar .VPNavBarSearch .DocSearch-Button:focus,
-.VPNavBar .VPNavBarSearch .DocSearch-Button:active {
-  background: rgba(255, 255, 255, 0.16) !important;
-}
-
-.VPNavBar .VPNavBarMenu,
-.VPNavBar .VPNavBarHamburger {
-  display: none !important;
-}
-
-.VPNavBar .VPNavBarSearch {
-  flex-grow: 0 !important;
-  margin-left: auto !important;
-  padding-left: 0 !important;
-  justify-content: flex-end;
-}
-
-.VPNavBar .title,
-.VPNavBar .VPNavBarMenuLink,
-.VPNavBar .VPNavBarSearch .DocSearch-Button {
-  color: rgba(255, 255, 255, 0.92);
-}
-
-.VPNavBar .VPNavBarSearch .DocSearch-Button-Placeholder,
-.VPNavBar .VPNavBarSearch .DocSearch-Search-Icon,
-.VPNavBar .VPNavBarSearch .DocSearch-Button-Key {
-  color: rgba(255, 255, 255, 0.92) !important;
-}
-
-.VPSidebar {
-  background:
-    radial-gradient(circle at top left, rgba(181, 106, 47, 0.08), transparent 28%),
-    #fbf7ef !important;
-}
-
-.vp-doc h1,
-.vp-doc h2,
-.vp-doc h3 {
-  letter-spacing: -0.02em;
-}
-
-.vp-doc img {
-  border-radius: 14px;
-  border: 1px solid rgba(63, 95, 63, 0.12);
-  background: white;
-  box-shadow: 0 12px 30px rgba(41, 53, 34, 0.08);
-  cursor: zoom-in;
-}
-
-.medium-zoom-overlay {
-  z-index: 200;
-}
-
-.medium-zoom-image--opened {
-  z-index: 201;
-}
-
-.vp-doc :not(pre) > code {
-  border-radius: 0.35rem;
-}
-""",
-    )
-
-
-def write_vitepress_config(doc_meta: dict[Path, dict[str, str]], site_config: dict) -> None:
-    validate_root_nav_contract(doc_meta, site_config)
-    tree = build_doc_tree(doc_meta)
-    sidebar_items = build_root_sidebar_items(tree, site_config)
-    out_dir = os.path.relpath(OUTPUT_ROOT, VITEPRESS_ROOT).replace(os.sep, "/")
-    config_payload = {
-        "title": site_config["site"]["title"],
-        "description": site_config["site"]["description"],
-        "lang": "zh-CN",
-        "cleanUrls": False,
-        "ignoreDeadLinks": True,
-        "outDir": out_dir,
-        "appearance": False,
-        "themeConfig": {
-            "search": {
-                "provider": "local",
-                "options": {
-                    "translations": LOCAL_SEARCH_TRANSLATIONS,
-                },
-            },
-            "nav": [],
-            "sidebar": sidebar_items,
-            "outline": {
-                "label": "本页目录",
-                "level": "deep",
-            },
-            "docFooter": {
-                "prev": "上一页",
-                "next": "下一页",
-            },
-            "sidebarMenuLabel": "导航菜单",
-            "returnToTopLabel": "返回顶部",
-            "skipToContentLabel": "跳到正文",
-        },
-    }
-    config_text = (
-        "import { defineConfig } from 'vitepress'\n\n"
-        + "export default defineConfig("
-        + json.dumps(config_payload, ensure_ascii=False, indent=2)
-        + ")\n"
-    )
-    ensure_dir_777(VITEPRESS_CONFIG_PATH.parent)
-    write_text_777(VITEPRESS_CONFIG_PATH, config_text)
-
-
-def collect_doc_meta(docs_map: dict[Path, Path], site_config: dict) -> dict[Path, dict[str, str]]:
-    meta: dict[Path, dict[str, str]] = {}
-    for source_rel, staged_rel in docs_map.items():
-        page_override = site_config["page_overrides"].get(source_rel.as_posix())
-        title_override = None if page_override is None else page_override["title"]
-        meta[staged_rel] = {
-            "source_rel": source_rel.as_posix(),
-            "staged_rel": staged_rel.as_posix(),
-            "title": title_override if title_override is not None else derive_title_from_path(staged_rel),
-            "route": route_for_staged_rel(staged_rel),
-        }
-    return meta
-
-
-def derive_title_from_path(staged_rel: Path) -> str:
-    if staged_rel == Path("index.md"):
-        return "首页"
-    if staged_rel.name == "index.md":
-        return staged_rel.parent.name
-    return staged_rel.stem
-
-
-def route_for_staged_rel(staged_rel: Path) -> str:
-    if staged_rel == Path("index.md"):
-        return "/"
-    if staged_rel.name == "index.md":
-        return f"/{staged_rel.parent.as_posix()}/"
-    return f"/{staged_rel.with_suffix('').as_posix()}"
-
-
-def build_doc_tree(doc_meta: dict[Path, dict[str, str]]) -> dict:
-    root = new_tree_node("", "根")
-    for staged_rel in sorted(doc_meta):
-        info = doc_meta[staged_rel]
-        parent_node = ensure_tree_node(root, staged_rel.parent)
-        if staged_rel.name == "index.md":
-            parent_node["index"] = info
-        else:
-            parent_node["pages"].append(info)
-    return root
-
-
-def new_tree_node(name: str, title: str) -> dict:
-    return {
-        "name": name,
-        "title": title,
-        "index": None,
-        "pages": [],
-        "dirs": {},
-    }
-
-
-def ensure_tree_node(root: dict, rel_dir: Path) -> dict:
-    node = root
-    if str(rel_dir) == ".":
-        return node
-    for part in rel_dir.parts:
-        dirs = node["dirs"]
-        if part not in dirs:
-            dirs[part] = new_tree_node(part, part)
-        node = dirs[part]
-    return node
-
-
-def build_root_sidebar_items(root: dict, site_config: dict) -> list[dict]:
-    items: list[dict] = []
-    for entry in site_config["root_nav"]:
-        if entry["kind"] == "dir":
-            child_group = build_root_dir_sidebar_group(root["dirs"][entry["path"]], entry)
-            if child_group is not None:
-                items.append(child_group)
-            continue
-        page = find_root_nav_page(root, entry["path"])
-        if page is None:
-            raise SystemExit(
-                "ERROR: configured root_nav page not found after validation: "
-                + entry["path"]
-            )
-        items.append({"text": entry["title"], "link": page["route"]})
-    return items
-
-
-def build_root_dir_sidebar_group(node: dict, nav_entry: dict) -> dict | None:
-    route = resolve_dir_link(node, nav_entry)
-    child_items = build_tree_sidebar_items(node, include_index=False)
-    if not child_items:
-        return {"text": nav_entry["title"], "link": route}
-    return {
-        "text": nav_entry["title"],
-        "collapsed": False,
-        "items": child_items,
-    }
-
-
-def build_tree_sidebar_items(node: dict, include_index: bool) -> list[dict]:
-    items: list[dict] = []
-    if include_index and node["index"] is not None:
-        items.append({"text": node["index"]["title"], "link": node["index"]["route"]})
-    for page in node["pages"]:
-        items.append({"text": page["title"], "link": page["route"]})
-    for name in sorted(node["dirs"]):
-        child_group = build_tree_sidebar_group(node["dirs"][name])
-        if child_group is not None:
-            items.append(child_group)
-    return items
-
-
-def build_tree_sidebar_group(node: dict) -> dict | None:
-    route = first_route_in_node(node)
-    if route is None:
-        return None
-    child_items = build_tree_sidebar_items(node, include_index=True)
-    if not child_items:
-        return {"text": node_display_title(node), "link": route}
-    return {
-        "text": node_display_title(node),
-        "collapsed": False,
-        "items": child_items,
-    }
-
-
-def node_display_title(node: dict) -> str:
-    if node["index"] is not None:
-        return node["index"]["title"]
-    return node["title"]
-
-
-def find_root_page(pages: list[dict[str, str]], staged_rel: str) -> dict[str, str] | None:
-    for page in pages:
-        if page["staged_rel"] == staged_rel:
-            return page
-    return None
-
-
-def find_root_nav_page(root: dict, staged_rel: str) -> dict[str, str] | None:
-    if staged_rel == "index.md":
-        return root["index"]
-    return find_root_page(root["pages"], staged_rel)
-
-
-def iter_markdown_content_lines(raw_md: str) -> list[str]:
-    lines: list[str] = []
-    in_fence = False
-    for line in raw_md.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence or not stripped:
-            continue
-        lines.append(stripped)
-    return lines
-
-
-def markdown_has_h1(raw_md: str) -> bool:
-    for stripped in iter_markdown_content_lines(raw_md):
-        if stripped.startswith("# "):
-            return True
-    return False
-
-
-def ensure_markdown_title_frontmatter(raw_md: str, title: str) -> str:
-    if raw_md.startswith("---\n") or raw_md.startswith("---\r\n"):
-        return raw_md
-    return f"---\ntitle: {json.dumps(title, ensure_ascii=False)}\n---\n\n{raw_md}"
-
-
-def first_route_in_node(node: dict) -> str | None:
-    if node["index"] is not None:
-        return node["index"]["route"]
-    if node["pages"]:
-        return node["pages"][0]["route"]
-    for name in sorted(node["dirs"]):
-        route = first_route_in_node(node["dirs"][name])
-        if route is not None:
-            return route
-    return None
-
-
-def resolve_dir_link(node: dict, nav_entry: dict) -> str:
-    nav_link_mode = nav_entry["nav_link_mode"]
-    section_name = nav_entry["path"]
-    if nav_link_mode == "index":
-        if node["index"] is None:
-            raise SystemExit(
-                "ERROR: root_nav dir with nav_link_mode=index is missing README.md: "
-                + section_name
-            )
-        return node["index"]["route"]
-    if nav_link_mode == "first_sidebar_link":
-        route = first_sidebar_link_in_root_dir(node)
-        if route is None:
-            raise SystemExit(
-                "ERROR: root_nav dir with nav_link_mode=first_sidebar_link has no visible sidebar links: "
-                + section_name
-            )
-        return route
-    route = first_route_in_node(node)
-    if route is None:
-        raise SystemExit(
-            "ERROR: root_nav dir with nav_link_mode=first_page has no published pages: "
-            + section_name
-        )
-    return route
-
-
-def first_sidebar_link_in_root_dir(node: dict) -> str | None:
-    return first_tree_sidebar_link(node, include_index=False)
-
-
-def first_tree_sidebar_link(node: dict, include_index: bool) -> str | None:
-    if include_index and node["index"] is not None:
-        return node["index"]["route"]
-    if node["pages"]:
-        return node["pages"][0]["route"]
-    for name in sorted(node["dirs"]):
-        route = first_tree_sidebar_link(node["dirs"][name], include_index=True)
-        if route is not None:
-            return route
-    return None
-
-
-def validate_root_nav_contract(doc_meta: dict[Path, dict[str, str]], site_config: dict) -> None:
-    root_pages: set[str] = set()
-    root_dirs: set[str] = set()
-
-    for staged_rel in doc_meta:
-        if len(staged_rel.parts) == 1:
-            root_pages.add(staged_rel.as_posix())
-            continue
-        root_dirs.add(staged_rel.parts[0])
-
-    configured_root_pages = set(site_config["root_nav_pages"])
-    configured_root_dirs = set(site_config["root_nav_dirs"])
-    missing_root_pages = sorted(page for page in root_pages if page not in configured_root_pages)
-    missing_root_dirs = sorted(name for name in root_dirs if name not in configured_root_dirs)
-    missing_config_pages = sorted(page for page in configured_root_pages if page not in root_pages)
-    missing_config_dirs = sorted(name for name in configured_root_dirs if name not in root_dirs)
-    missing_required_indexes = sorted(
-        entry["path"]
-        for entry in site_config["root_nav"]
-        if entry["kind"] == "dir"
-        and entry["nav_link_mode"] == "index"
-        and Path(entry["path"]) / "index.md" not in doc_meta
-    )
-    if (
-        not missing_root_pages
-        and not missing_root_dirs
-        and not missing_config_pages
-        and not missing_config_dirs
-        and not missing_required_indexes
-    ):
-        return
-
-    errors: list[str] = []
-    for page in missing_root_pages:
-        errors.append(
-            "ERROR: published root markdown page missing from build_doc_site_config.root_nav: "
-            f"{page}"
-        )
-    for name in missing_root_dirs:
-        errors.append(
-            "ERROR: published root markdown directory missing from build_doc_site_config.root_nav: "
-            f"{name}"
-        )
-    for page in missing_config_pages:
-        errors.append(
-            "ERROR: build_doc_site_config.root_nav page does not exist in published docs: "
-            f"{page}"
-        )
-    for name in missing_config_dirs:
-        errors.append(
-            "ERROR: build_doc_site_config.root_nav dir does not exist in published docs: "
-            f"{name}"
-        )
-    for name in missing_required_indexes:
-        errors.append(
-            "ERROR: build_doc_site_config root dir requires README.md for nav/sidebar but none was published: "
-            f"{name}"
-        )
-    raise SystemExit("\n".join(errors))
-
-
-def write_toolchain_package_json() -> None:
-    ensure_dir_777(TOOLCHAIN_PACKAGE_JSON_PATH.parent)
-    payload = {
-        "private": True,
-        "devDependencies": {
-            "medium-zoom": "1.1.0",
-            "vitepress": VITEPRESS_VERSION,
-        },
-    }
-    write_text_777(
-        TOOLCHAIN_PACKAGE_JSON_PATH,
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-    )
-
-
-def rewrite_markdown_links(
-    raw_md: str,
-    source_rel: Path,
-    staged_rel: Path,
-    docs_map: dict[Path, Path],
-) -> str:
-    lines = raw_md.splitlines(keepends=True)
-    out_lines: list[str] = []
-    in_fence = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
-            out_lines.append(line)
-            continue
-        if in_fence:
-            out_lines.append(line)
-            continue
-        out_lines.append(rewrite_markdown_links_in_line(line, source_rel, staged_rel, docs_map))
-    return "".join(out_lines)
-
-
-def rewrite_markdown_links_in_line(
-    line: str,
-    source_rel: Path,
-    staged_rel: Path,
-    docs_map: dict[Path, Path],
-) -> str:
-    def replace(match: re.Match[str]) -> str:
-        prefix = match.group(1)
-        raw_target = match.group(2).strip()
-        suffix = match.group(3)
-        new_target = rewrite_target_path(raw_target, source_rel, staged_rel, docs_map)
-        return f"{prefix}{new_target}{suffix}"
-
-    return MARKDOWN_LINK_RE.sub(replace, line)
-
-
-def rewrite_target_path(
-    raw_target: str,
-    source_rel: Path,
-    staged_rel: Path,
-    docs_map: dict[Path, Path],
-) -> str:
-    unescaped_target = decode_markdown_target(raw_target)
-    if (
-        not unescaped_target
-        or unescaped_target.startswith("#")
-        or unescaped_target.startswith("http://")
-        or unescaped_target.startswith("https://")
-        or unescaped_target.startswith("mailto:")
-        or unescaped_target.startswith("tel:")
-        or unescaped_target.startswith("data:")
-    ):
-        return raw_target
-
-    split = urllib.parse.urlsplit(unescaped_target)
-    path_part = urllib.parse.unquote(split.path)
-    fragment = f"#{split.fragment}" if split.fragment else ""
-
-    if not path_part.endswith(".md"):
-        return raw_target
-
-    source_target_rel = normalize_rel_path(source_rel.parent / path_part)
-    if source_target_rel not in docs_map:
-        raise SystemExit(
-            f"ERROR: markdown link target not found: source={source_rel} target={raw_target}"
-        )
-    staged_target_rel = docs_map[source_target_rel]
-    rel_path = os.path.relpath(staged_target_rel, staged_rel.parent).replace(os.sep, "/")
-    return urllib.parse.quote(rel_path, safe="/") + fragment
-
-
-def decode_markdown_target(raw_target: str) -> str:
-    unescaped = html.unescape(raw_target).strip()
-    if unescaped.startswith("<") and unescaped.endswith(">"):
-        return unescaped[1:-1].strip()
-    return unescaped
-
-
-def normalize_rel_path(path: Path) -> Path:
-    parts: list[str] = []
-    for part in path.parts:
-        if part in ("", "."):
-            continue
-        if part == "..":
-            if not parts:
-                raise SystemExit(f"ERROR: path escapes doc root: {path}")
-            parts.pop()
-            continue
-        parts.append(part)
-    return Path(*parts) if parts else Path(".")
-
-
-def validate_source_markdown(raw_md: str, source_rel: Path) -> None:
-    in_fence = False
-    for line_idx, line in enumerate(raw_md.splitlines(), start=1):
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        in_inline_code = False
-        i = 0
-        while i < len(line):
-            if line[i] == "`":
-                in_inline_code = not in_inline_code
-                i += 1
-                continue
-            if not in_inline_code and line[i : i + 3] == "![[":
-                raise SystemExit(
-                    f"ERROR: unsupported Obsidian embed syntax remains: source={source_rel} line={line_idx}"
-                )
-            if not in_inline_code and line[i : i + 2] == "[[":
-                raise SystemExit(
-                    f"ERROR: unsupported Obsidian link syntax remains: source={source_rel} line={line_idx}"
-                )
-            i += 1
-
-def validate_docs_map(docs_map: dict[Path, Path]) -> None:
-    errors: list[str] = []
-    for source_rel in docs_map:
-        raw_md = (DOC_ROOT / source_rel).read_text(encoding="utf-8")
-        validate_source_markdown(raw_md, source_rel)
-        errors.extend(collect_markdown_link_errors(raw_md, source_rel, docs_map))
-    if errors:
-        joined = "\n".join(errors)
-        raise SystemExit(f"ERROR: markdown link validation failed:\n{joined}")
-
-
-def collect_markdown_link_errors(
-    raw_md: str,
-    source_rel: Path,
-    docs_map: dict[Path, Path],
-) -> list[str]:
-    errors: list[str] = []
-    lines = raw_md.splitlines()
-    in_fence = False
-    for line_idx, line in enumerate(lines, start=1):
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        for match in MARKDOWN_LINK_RE.finditer(line):
-            raw_target = match.group(2).strip()
-            error = validate_markdown_target(raw_target, source_rel, docs_map)
-            if error is not None:
-                errors.append(f"{error} line={line_idx}")
-    return errors
-
-
-def validate_markdown_target(
-    raw_target: str,
-    source_rel: Path,
-    docs_map: dict[Path, Path],
-) -> str | None:
-    unescaped_target = decode_markdown_target(raw_target)
-    if (
-        not unescaped_target
-        or unescaped_target.startswith("#")
-        or unescaped_target.startswith("http://")
-        or unescaped_target.startswith("https://")
-        or unescaped_target.startswith("mailto:")
-        or unescaped_target.startswith("tel:")
-        or unescaped_target.startswith("data:")
-    ):
-        return None
-
-    split = urllib.parse.urlsplit(unescaped_target)
-    path_part = urllib.parse.unquote(split.path)
-    if not path_part.endswith(".md"):
-        return None
-
-    source_target_rel = normalize_rel_path(source_rel.parent / path_part)
-    if source_target_rel in docs_map:
-        return None
-    return f"ERROR: markdown link target not found: source={source_rel} target={raw_target}"
-
-
-def compute_source_state() -> tuple[tuple[str, int, int], ...]:
-    rows: list[tuple[str, int, int]] = []
-    for path in sorted(DOC_ROOT.rglob("*")):
-        rel = path.relative_to(DOC_ROOT)
-        if should_skip_rel_path(rel) or not path.is_file():
-            continue
-        stat = path.stat()
-        rows.append((rel.as_posix(), stat.st_mtime_ns, stat.st_size))
-    if not DOC_SITE_CONFIG_PATH.is_file():
-        raise SystemExit(f"ERROR: doc site config not found: {DOC_SITE_CONFIG_PATH}")
-    config_stat = DOC_SITE_CONFIG_PATH.stat()
-    rows.append(
-        (
-            f"@config:{DOC_SITE_CONFIG_PATH.relative_to(REPO_ROOT).as_posix()}",
-            config_stat.st_mtime_ns,
-            config_stat.st_size,
-        )
-    )
-    return tuple(rows)
-
-
-def require_binary(name: str) -> str:
-    path = shutil.which(name)
-    if path is None:
-        raise SystemExit(f"ERROR: `{name}` not found in PATH.")
-    return path
-
-
-def ensure_dir_777(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    os.chmod(path, 0o777)
-
-
-def write_text_777(path: Path, content: str) -> None:
-    path.write_text(content, encoding="utf-8")
-    os.chmod(path, 0o777)
-
-
-def chmod_tree_777(root: Path) -> None:
-    if not root.exists():
-        return
-    for path in sorted(root.rglob("*")):
-        os.chmod(path, 0o777)
-    os.chmod(root, 0o777)
-
-
-def run_cmd(cmd: list[str], cwd: Path) -> None:
-    print("+ " + " ".join(shlex.quote(v) for v in cmd), flush=True)
-    rc = subprocess.run(cmd, cwd=str(cwd)).returncode
-    if rc != 0:
-        raise SystemExit(rc)
-
-
-def run_vitepress_build(vitepress_cmd: list[str]) -> None:
-    cmd = vitepress_cmd + ["build", str(VITEPRESS_ROOT)]
-    run_cmd(cmd, cwd=PROJECT_ROOT)
 
 
 if __name__ == "__main__":
