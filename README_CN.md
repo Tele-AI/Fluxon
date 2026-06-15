@@ -14,7 +14,7 @@ Fluxon 是一套面向世界模型与其他 AI-native 场景训推系统的高�
 [![Latest](https://img.shields.io/badge/Latest-v0.2.1-f28500)](./fluxon_release)
 [![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#接口能力)
 
-[中文](./README_CN.md) | [English](./README.md) | [用户文档](https://tele-ai.github.io/Fluxon/user_doc/)
+[中文](./README_CN.md) | [English](./README.md) | [用户文档](./README_CN.md) | [English Docs](./README.md)
 
 </div>
 
@@ -35,7 +35,7 @@ Fluxon 是一套面向世界模型与其他 AI-native 场景训推系统的高�
 
 ![](./pics/topology_ui.png)
 
-更多使用说明见 [用户文档](./fluxon_doc/user_doc/)。
+更多使用说明见 [用户文档](./fluxon_doc_cn/user_doc/)。
 
 ## 接口能力
 
@@ -109,7 +109,7 @@ benchmark 显示，小文件读和大文件写已显著领先 `Alluxio`，大文
 
 ## 快速开始
 
-Quick Start 用于最短路径体验；正式安装、部署和运维入口见 [用户文档](./fluxon_doc/user_doc/)。
+Quick Start 用于最短路径体验；正式安装、部署和运维入口见 [用户文档](./fluxon_doc_cn/user_doc/)。
 
 ### KV 快速开始
 
@@ -134,15 +134,15 @@ del demo:hello
 
 运行效果：
 
-![](./fluxon_doc/pics/quickstart_kv.png)
+![](./pics/quickstart_kv.png)
 
 点开提示链接可以查看 KV Web UI：
 
-![](./fluxon_doc/pics/quickstart_kvui.gif)
+![](./pics/quickstart_kvui.gif)
 
 对应接口文档：
 
-- [KV 和 RPC 接口](<./fluxon_doc/user_doc/用户 - 3 - KV-RPC接口.md>)
+- [KV 和 RPC 接口](<./fluxon_doc_cn/user_doc/用户 - 3 - KV-RPC接口.md>)
 
 ### MQ 快速开始
 
@@ -169,11 +169,11 @@ exit
 
 运行效果：
 
-![](./fluxon_doc/pics/quickstart_mq.png)
+![](./pics/quickstart_mq.png)
 
 对应接口文档：
 
-- [MQ 接口](<./fluxon_doc/user_doc/用户 - 4 - MQ接口.md>)
+- [MQ 接口](<./fluxon_doc_cn/user_doc/用户 - 4 - MQ接口.md>)
 
 ### FS 快速开始
 
@@ -203,15 +203,15 @@ FS Quick Start 会额外打印：
 
 运行效果：
 
-![](./fluxon_doc/pics/quickstart_fs.png)
+![](./pics/quickstart_fs.png)
 
 点开提示链接可以查看 FS Web UI：
 
-![](./fluxon_doc/pics/quickstart_fsui.gif)
+![](./pics/quickstart_fsui.gif)
 
 对应接口文档：
 
-- [FS 接口](<./fluxon_doc/user_doc/用户 - 5 - FS接口.md>)
+- [FS 接口](<./fluxon_doc_cn/user_doc/用户 - 5 - FS接口.md>)
 
 ## 项目结构
 
@@ -227,9 +227,55 @@ FS Quick Start 会额外打印：
 
 感谢你的贡献。建议先阅读本地开发者文档：
 
-- [开发者文档总入口](./fluxon_doc/dev_doc/)
-- [开发者 - 1 - 打包核心安装包](<./fluxon_doc/dev_doc/开发者 - 1 - 打包核心安装包.md>)
-- [开发者 - 2 - 打包中间件和镜像](<./fluxon_doc/dev_doc/开发者 - 2 - 打包中间件和镜像.md>)
+- [开发者文档总入口](./fluxon_doc_cn/dev_doc/)
+- [开发者 - 1 - 打包核心安装包](<./fluxon_doc_cn/dev_doc/开发者 - 1 - 打包核心安装包.md>)
+- [开发者 - 2 - 打包中间件和镜像](<./fluxon_doc_cn/dev_doc/开发者 - 2 - 打包中间件和镜像.md>)
+
+## Contributors
+
+<a href="https://github.com/Tele-AI/fluxon/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Tele-AI/fluxon" />
+</a>
+
+部分更早期的贡献记录已经无法从当前 commit 历史里完整反映，这里补充说明：
+
+<div>
+  <a href="https://github.com/yxrxy" title="yxrxy - FluxonFS 实现和优化" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/yxrxy.png?size=64" width="64" height="64" alt="yxrxy" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">yxrxy</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">FluxonFS 实现和优化</div>
+  </a>
+  <a href="https://github.com/zTz01" title="zTz01 - KVCache 优化" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/zTz01.png?size=64" width="64" height="64" alt="zTz01" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">zTz01</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">KVCache 优化</div>
+  </a>
+  <a href="https://github.com/pakkah" title="pakkah - RDMA 支持、VLM 探索" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/pakkah.png?size=64" width="64" height="64" alt="pakkah" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">pakkah</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">RDMA 支持、VLM 探索</div>
+  </a>
+  <a href="https://github.com/mumupika" title="mumupika - 初始 MQ 版本实现" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/mumupika.png?size=64" width="64" height="64" alt="mumupika" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">mumupika</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">初始 MQ 版本实现</div>
+  </a>
+  <a href="https://github.com/maplestarplayl" title="maplestarplayl - IPC 接入、SPDK 接入" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/maplestarplayl.png?size=64" width="64" height="64" alt="maplestarplayl" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">maplestarplayl</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">IPC 接入、SPDK 接入</div>
+  </a>
+  <a href="https://github.com/RuileLu" title="RuileLu - KV lease 功能支持" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/RuileLu.png?size=64" width="64" height="64" alt="RuileLu" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">RuileLu</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">KV lease 功能支持</div>
+  </a>
+  <a href="https://github.com/Summage" title="Summage - 初始 KV 架构设计优化" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/Summage.png?size=64" width="64" height="64" alt="Summage" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">Summage</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">初始 KV 架构设计优化</div>
+  </a>
+</div>
 
 ## 许可证
 

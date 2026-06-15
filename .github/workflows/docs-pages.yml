@@ -9,7 +9,8 @@ on:
     # Republish when doc or homepage inputs change.
     paths:
       - ".github/workflows/docs-pages.yml"
-      - "fluxon_doc/**"
+      - "fluxon_doc_cn/**"
+      - "fluxon_doc_en/**"
       - "README.md"
       - "README_CN.md"
       - "pics/**"
