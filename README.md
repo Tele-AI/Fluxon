@@ -10,7 +10,7 @@
 [![Latest](https://img.shields.io/badge/Latest-v0.2.1-f28500)](./fluxon_release)
 [![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#interface-capabilities)
 
-[English](./README.md) | [中文](./README_CN.md) | [User Docs](https://tele-ai.github.io/Fluxon/user_doc/)
+[English](./README.md) | [中文](./README_CN.md) | [Docs](./README.md) | [中文文档](./README_CN.md)
 
 </div>
 
@@ -33,7 +33,7 @@ Fluxon is a high-performance distributed communication and caching substrate for
 
 ![](./pics/topology_ui.png)
 
-For more usage details, see [User Docs](./fluxon_doc/user_doc/).
+For more usage details, see [User Docs](./fluxon_doc_en/user_doc/).
 
 ## Interface Capabilities
 
@@ -107,7 +107,7 @@ The benchmark results show that small-file reads and large-file writes are alrea
 
 ## Quick Start
 
-Quick Start is the shortest path to try Fluxon. For formal installation, deployment, and operations, see [User Docs](./fluxon_doc/user_doc/).
+Quick Start is the shortest path to try Fluxon. For formal installation, deployment, and operations, see [User Docs](./fluxon_doc_en/user_doc/).
 
 ### KV Quick Start
 
@@ -132,15 +132,15 @@ del demo:hello
 
 Runtime view:
 
-![](./fluxon_doc/pics/quickstart_kv.png)
+![](./pics/quickstart_kv.png)
 
 Open the printed link to view the KV Web UI:
 
-![](./fluxon_doc/pics/quickstart_kvui.gif)
+![](./pics/quickstart_kvui.gif)
 
 Related interface docs:
 
-- [KV and RPC Interface](<./fluxon_doc/user_doc/用户 - 3 - KV-RPC接口.md>)
+- [KV and RPC Interface](<./fluxon_doc_en/user_doc/User - 3 - KV and RPC Interface.md>)
 
 ### MQ Quick Start
 
@@ -167,11 +167,11 @@ Startup also prints the `MQ Web UI` address.
 
 Runtime view:
 
-![](./fluxon_doc/pics/quickstart_mq.png)
+![](./pics/quickstart_mq.png)
 
 Related interface docs:
 
-- [MQ Interface](<./fluxon_doc/user_doc/用户 - 4 - MQ接口.md>)
+- [MQ Interface](<./fluxon_doc_en/user_doc/User - 4 - MQ Interface.md>)
 
 ### FS Quick Start
 
@@ -201,15 +201,15 @@ FS Quick Start additionally prints:
 
 Runtime view:
 
-![](./fluxon_doc/pics/quickstart_fs.png)
+![](./pics/quickstart_fs.png)
 
 Open the printed link to view the FS Web UI:
 
-![](./fluxon_doc/pics/quickstart_fsui.gif)
+![](./pics/quickstart_fsui.gif)
 
 Related interface docs:
 
-- [FS Interface](<./fluxon_doc/user_doc/用户 - 5 - FS接口.md>)
+- [FS Interface](<./fluxon_doc_en/user_doc/User - 5 - FS Interface.md>)
 
 ## Repository Structure
 
@@ -225,9 +225,55 @@ Related interface docs:
 
 Thank you for your contribution. Start with the local developer docs:
 
-- [Developer Docs](./fluxon_doc/dev_doc/)
-- [Developer - 1 - Package core install artifacts](<./fluxon_doc/dev_doc/开发者 - 1 - 打包核心安装包.md>)
-- [Developer - 2 - Package middleware and images](<./fluxon_doc/dev_doc/开发者 - 2 - 打包中间件和镜像.md>)
+- [Developer Docs](./fluxon_doc_en/dev_doc/)
+- [Developer - 1 - Package core install artifacts](<./fluxon_doc_en/dev_doc/Developer - 1 - Package Core Install Artifacts.md>)
+- [Developer - 2 - Package middleware and images](<./fluxon_doc_en/dev_doc/Developer - 2 - Package Middleware and Images.md>)
+
+## Contributors
+
+<a href="https://github.com/Tele-AI/fluxon/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Tele-AI/fluxon" />
+</a>
+
+Some earlier contribution records are no longer fully reflected in the current commit history. Historical highlights:
+
+<div>
+  <a href="https://github.com/yxrxy" title="yxrxy - FluxonFS implementation and optimization" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/yxrxy.png?size=64" width="64" height="64" alt="yxrxy" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">yxrxy</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">FluxonFS implementation and optimization</div>
+  </a>
+  <a href="https://github.com/zTz01" title="zTz01 - KVCache optimization" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/zTz01.png?size=64" width="64" height="64" alt="zTz01" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">zTz01</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">KVCache optimization</div>
+  </a>
+  <a href="https://github.com/pakkah" title="pakkah - RDMA support, VLM exploration" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/pakkah.png?size=64" width="64" height="64" alt="pakkah" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">pakkah</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">RDMA support, VLM exploration</div>
+  </a>
+  <a href="https://github.com/mumupika" title="mumupika - Initial MQ implementation" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/mumupika.png?size=64" width="64" height="64" alt="mumupika" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">mumupika</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">Initial MQ implementation</div>
+  </a>
+  <a href="https://github.com/maplestarplayl" title="maplestarplayl - IPC integration, SPDK integration" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/maplestarplayl.png?size=64" width="64" height="64" alt="maplestarplayl" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">maplestarplayl</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">IPC integration, SPDK integration</div>
+  </a>
+  <a href="https://github.com/RuileLu" title="RuileLu - KV lease support" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/RuileLu.png?size=64" width="64" height="64" alt="RuileLu" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">RuileLu</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">KV lease support</div>
+  </a>
+  <a href="https://github.com/Summage" title="Summage - Initial KV architecture optimization" style="display: inline-block; width: 128px; margin: 0 10px 14px 0; vertical-align: top; text-align: center; text-decoration: none; color: inherit; font-size: 0;">
+    <img src="https://github.com/Summage.png?size=64" width="64" height="64" alt="Summage" style="display: block; margin: 0 auto 8px; border-radius: 50%;" />
+    <div style="font-size: 0.95rem; font-weight: 600; line-height: 1.25;">Summage</div>
+    <div style="font-size: 0.8rem; line-height: 1.35;">Initial KV architecture optimization</div>
+  </a>
+</div>
 
 ## License
 

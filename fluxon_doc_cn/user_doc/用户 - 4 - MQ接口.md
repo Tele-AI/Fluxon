@@ -38,7 +38,7 @@ etcd + greptime + fluxonkv master
 
 在进入 producer / consumer 代码之前，需要先把 MQ 依赖的服务平面拉起来。共性的角色关系、启动顺序和 runtime 边界，统一见 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md)。
 
-![](../pics/deploy_arch_1.png)
+![](../../pics/deploy_arch_1.png)
 
 MQ 直接复用 KV 服务平面，没有自己独立的一套底座。直接接触的服务平面对象主要有：
 

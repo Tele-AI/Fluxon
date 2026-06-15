@@ -59,7 +59,7 @@ Quick start launches the minimum runnable environment for each mode:
 Quick start is only for fast bring-up and interaction:
 
 - Formal service-plane docs:
-  - `fluxon_doc/user_doc/用户 - 2 - 服务平面.md`
+  - `fluxon_doc_en/user_doc/User - 2 - Service Plane.md`
 - Formal business interface docs:
   - KV, MQ, and FS user docs
 
@@ -201,10 +201,10 @@ Go back to the formal service-plane and interface paths if you need to:
 Document entrypoints:
 
 - Service plane:
-  - `fluxon_doc/user_doc/用户 - 2 - 服务平面.md`
+  - `fluxon_doc_en/user_doc/User - 2 - Service Plane.md`
 - KV and node-to-node RPC:
-  - `fluxon_doc/user_doc/用户 - 3 - KV-RPC接口.md`
+  - `fluxon_doc_en/user_doc/User - 3 - KV and RPC Interface.md`
 - MQ:
-  - `fluxon_doc/user_doc/用户 - 4 - MQ接口.md`
+  - `fluxon_doc_en/user_doc/User - 4 - MQ Interface.md`
 - FS:
-  - `fluxon_doc/user_doc/用户 - 5 - FS接口.md`
+  - `fluxon_doc_en/user_doc/User - 5 - FS Interface.md`
