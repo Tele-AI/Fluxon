@@ -9,6 +9,14 @@ on:
     paths:
       - ".github/workflows/all_test.yml"
       - ".github/workflows/docs-pages.yml"
+      - "setup.py"
+      - "fluxon_py/**"
+      - "fluxon_rs/**"
+      - "setup_and_pack/**"
+      - "deployment/**"
+      - "examples/**"
+      - "fluxon_release/install.py"
+      - "fluxon_release/closed_sdk/**"
       - "fluxon_doc/**"
       - "README_CN.md"
       - "pics/**"
@@ -20,6 +28,53 @@ permissions:
   contents: read
 
 jobs:
+  pack-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            docker.io \
+            git \
+            pigz \
+            protobuf-compiler \
+            python3-venv \
+            rsync
+
+      - name: Install Python dependencies
+        run: python3 -m pip install PyYAML
+
+      - name: Prepare CI directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data"
+          mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data/manylinux-release"
+          mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data/manylinux-cache/cargo-registry"
+          mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data/manylinux-cache/cargo-git"
+
+      - name: Build manylinux builder image
+        run: python3 setup_and_pack/build_pack_fluxonkv_pylib_img.py
+
+      - name: Generate CI pack_release config
+        run: |
+          python3 setup_and_pack/ci/gen_pack_release_ci_config.py \
+            --out-dir setup_and_pack \
+            --project-data-root "$RUNNER_TEMP/fluxon-pack-release/project-data" \
+            --runtime-image-ref pypack-builder-nix-experiment:latest
+
+      - name: Run pack_release
+        run: python3 setup_and_pack/pack_release.py --release-dir fluxon_release
+
   build-doc-site:
     runs-on: ubuntu-latest
     steps:

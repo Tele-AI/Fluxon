@@ -30,10 +30,11 @@ use std::{sync::Arc, time::Duration};
 pub fn do_delete_one_kv_all_replicas(
     view: &MasterKvRouterView,
     key: String,
-) -> Result<(), msg_and_error::ErrorCode> {
+) -> Result<PutIDForAKey, msg_and_error::ErrorCode> {
     if let Some((_removed_key, kv_route_info)) =
         view.master_kv_router().inner().kv_routes.remove(&key)
     {
+        let deleted_put_id = kv_route_info.put_id;
         tracing::info!("Deleted kv_routes entry for key: {}", key);
 
         // Spawn async follow-up: broadcast + per-node cache cleanup
@@ -77,7 +78,7 @@ pub fn do_delete_one_kv_all_replicas(
             }
         });
 
-        Ok(())
+        Ok(deleted_put_id)
     } else {
         Err(kv::KeyNotFound::CODE)
     }
@@ -221,8 +222,10 @@ pub async fn handle_delete(
     let key = req.serialize_part.key.clone();
 
     match do_delete_one_kv_all_replicas(&view, key.clone()) {
-        Ok(()) => MsgPack {
+        Ok((deleted_put_time_ms, deleted_put_version)) => MsgPack {
             serialize_part: DeleteResp {
+                deleted_put_time_ms,
+                deleted_put_version,
                 error_code: msg_and_error::OK,
                 error_json: String::new(),
             },

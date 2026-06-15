@@ -3,6 +3,7 @@ use crate::client_kv_api::ClientKvApiView;
 use crate::cluster_manager::NodeID;
 use crate::master_kv_router::msg_pack::BatchDeleteClientKvMetaCacheReq;
 use crate::master_kv_router::msg_pack::BatchDeleteClientKvMetaCacheResp;
+use crate::master_kv_router::msg_pack::DeleteClientKvMetaCacheItem;
 use crate::memholder::{
     EnsureMemholderMgmtDeleteActorOwned, OwnerDeleteAckItem, OwnerDeleteAckMemMgr,
     OwnerExternalMemMgr,
@@ -14,6 +15,21 @@ use crate::{
     rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, OK},
 };
 use limit_thirdparty::tokio;
+
+fn remove_local_cached_info_for_delete(
+    client_inner: &ClientKvApiInner,
+    delete_item: &DeleteClientKvMetaCacheItem,
+) {
+    client_inner
+        .get_cached_info
+        .remove_if(&delete_item.key, |_, v| {
+            if v.put_time_ms == delete_item.put_time_ms {
+                v.put_version <= delete_item.put_version
+            } else {
+                v.put_time_ms <= delete_item.put_time_ms
+            }
+        });
+}
 
 impl ClientKvApiInner {
     pub async fn delete(&self, key: &str) -> KvResult<()> {
@@ -47,6 +63,15 @@ impl ClientKvApiInner {
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
         )?;
+
+        remove_local_cached_info_for_delete(
+            self,
+            &DeleteClientKvMetaCacheItem {
+                key: key.to_string(),
+                put_time_ms: resp.serialize_part.deleted_put_time_ms,
+                put_version: resp.serialize_part.deleted_put_version,
+            },
+        );
 
         Ok(())
     }
@@ -99,28 +124,7 @@ pub async fn handle_batch_delete_client_kv_meta_cache(
             delete_item.put_version
         );
 
-        client_inner
-            .get_cached_info
-            .remove_if(&delete_item.key, |_, v| {
-                let res = if v.put_time_ms == delete_item.put_time_ms {
-                    v.put_version <= delete_item.put_version
-                } else {
-                    v.put_time_ms <= delete_item.put_time_ms
-                };
-                if res {
-                    tracing::debug!("do remove local cache for key: {}", delete_item.key,);
-                } else {
-                    tracing::debug!(
-                        "skip remove local cache for key: {}, request ({},{}), local ({},{})",
-                        delete_item.key,
-                        delete_item.put_time_ms,
-                        delete_item.put_version,
-                        v.put_time_ms,
-                        v.put_version
-                    );
-                }
-                res
-            });
+        remove_local_cached_info_for_delete(client_inner, delete_item);
         deleted_count += 1;
 
         if let Err(err) = client_inner

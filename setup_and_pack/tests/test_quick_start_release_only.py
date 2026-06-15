@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from fluxon_py.api_error import OK_NONE, Result
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 QUICK_START_BUILD_IMAGE_PATH = REPO_ROOT / "examples" / "fluxon_quick_start" / "build_image.py"
 QUICK_START_START_PATH = REPO_ROOT / "examples" / "fluxon_quick_start" / "start.py"
+PACK_FLUXON_PYLIB_PATH = REPO_ROOT / "setup_and_pack" / "pack_fluxon_pylib.py"
 
 
 def _load_module(module_name: str, path: Path):
@@ -23,6 +28,7 @@ def _load_module(module_name: str, path: Path):
 
 _BUILD_IMAGE = _load_module("fluxon_quick_start_build_image_test", QUICK_START_BUILD_IMAGE_PATH)
 _START = _load_module("fluxon_quick_start_start_test", QUICK_START_START_PATH)
+_PACK_FLUXON_PYLIB = _load_module("pack_fluxon_pylib_test", PACK_FLUXON_PYLIB_PATH)
 
 
 class QuickStartReleaseOnlyTest(unittest.TestCase):
@@ -59,6 +65,83 @@ class QuickStartReleaseOnlyTest(unittest.TestCase):
             )
             self.assertFalse((context_root / "fluxon_py").exists())
             self.assertFalse((context_root / "setup.py").exists())
+
+    def test_kv_http_delete_route_uses_store_remove_contract(self) -> None:
+        class _FakeStore:
+            def __init__(self) -> None:
+                self.remove_calls: list[str] = []
+
+            def remove(self, key: str):
+                self.remove_calls.append(key)
+                return Result.new_ok(OK_NONE)
+
+        fake_store = _FakeStore()
+        previous_store = _START._kv_http_store
+        _START._kv_http_store = fake_store
+        try:
+            with _START._KV_HTTP_APP.test_client() as client:
+                resp = client.delete("/api/kv/demo")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.get_json()["key"], "demo")
+            self.assertEqual(fake_store.remove_calls, ["demo"])
+        finally:
+            _START._kv_http_store = previous_store
+
+    def test_handle_mq_shell_line_treats_status_as_command_not_message(self) -> None:
+        source = QUICK_START_START_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('if cmd == "status":', source)
+        self.assertIn('print("Commands:  put <message>  |  status  |  exit")', source)
+
+        namespace: dict[str, object] = {}
+        helper_source = """
+def _handle_mq_shell_line(line, shutdown_requested, status_lines):
+    parts = line.split(None, 1)
+    cmd = parts[0].lower()
+    if cmd in ("exit", "quit", "q"):
+        shutdown_requested.set()
+        return True, None
+    if cmd == "help":
+        print("Commands:  put <message>  |  status  |  exit")
+        return True, None
+    if cmd == "status":
+        for status_line in status_lines():
+            print(status_line)
+        return True, None
+
+    msg = parts[1] if cmd == "put" and len(parts) >= 2 else line
+    return False, msg
+"""
+        exec(helper_source, namespace)
+        helper = namespace["_handle_mq_shell_line"]
+
+        shutdown_requested = mock.Mock()
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            handled, msg = helper("status", shutdown_requested, lambda: ["MQ shell status:", "  ok"])
+        self.assertEqual((handled, msg), (True, None))
+        self.assertIn("MQ shell status:", stdout.getvalue())
+        shutdown_requested.set.assert_not_called()
+
+    def test_pack_fluxon_pylib_cleans_stale_build_artifacts_before_bdist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            release_dir = repo_root / "fluxon_release"
+            build_file = repo_root / "build" / "lib" / "fluxon_py" / "runtime" / "start_monitor_web.py"
+            dist_dir = repo_root / "dist"
+            egg_info = repo_root / "fluxon.egg-info"
+            build_file.parent.mkdir(parents=True)
+            build_file.write_text("stale", encoding="utf-8")
+            dist_dir.mkdir()
+            egg_info.mkdir()
+            release_dir.mkdir()
+
+            _PACK_FLUXON_PYLIB._clean_python_build_artifacts(repo_root=repo_root, release_dir=release_dir)
+
+            self.assertFalse((repo_root / "build").exists())
+            self.assertFalse(dist_dir.exists())
+            self.assertFalse(egg_info.exists())
+            self.assertTrue(release_dir.exists())
 
 if __name__ == "__main__":
     unittest.main()

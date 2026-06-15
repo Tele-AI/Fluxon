@@ -22,6 +22,7 @@ from utils.manylinux_version_utils import load_manylinux_version_static
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
+DEFAULT_NIX_PACK_CONFIG_PATH = REPO_ROOT / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_static.yaml"
 repo_root_str = str(REPO_ROOT)
 if repo_root_str not in sys.path:
     sys.path.insert(0, repo_root_str)
@@ -478,6 +479,11 @@ def _load_nix_layout_module(repo_root: Path):
     return module
 
 
+def _load_nix_config_root(*, repo_root: Path, config_path: Path) -> dict:
+    nix_layout_module = _load_nix_layout_module(repo_root)
+    return nix_layout_module.load_experiment_config_root(config_path=config_path)
+
+
 def _nix_release_layout_paths(
     repo_root: Path,
     *,
@@ -486,7 +492,7 @@ def _nix_release_layout_paths(
     instance_id: str,
     target_cache_namespace: str,
 ) -> tuple[Path, Path]:
-    config_path = repo_root / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib.yaml"
+    config_path = DEFAULT_NIX_PACK_CONFIG_PATH.resolve()
     if not config_path.exists():
         print(f"Missing NIX pack config: {config_path}")
         raise SystemExit(1)
@@ -510,7 +516,8 @@ def _nix_release_layout_paths(
     runtime_targets = nix_layout_module.build_runtime_targets(spec=spec)
     if len(runtime_targets) != 1:
         raise RuntimeError(
-            "pack_release.py expects exactly one runtime target in setup_and_pack/nix/pack_fluxonkv_pylib.yaml"
+            "pack_release.py expects exactly one runtime target in nix pack config: "
+            + str(config_path)
         )
     layout = nix_layout_module.build_layout(spec=spec, runtime_target=runtime_targets[0])
     return config_path, layout.instance_release_dir.resolve()
@@ -729,7 +736,7 @@ def _render_nix_pack_config(
     instance_id: str,
     target_cache_namespace: str,
 ) -> str:
-    cfg = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+    cfg = _load_nix_config_root(repo_root=repo_root, config_path=template_path)
     if not isinstance(cfg, dict):
         raise RuntimeError(f"NIX pack config must be a mapping: {template_path}")
     manylinux_cfg = cfg.get("manylinux")

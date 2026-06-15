@@ -17,8 +17,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 PARENT_SCRIPTS_DIR = SCRIPT_DIR.parent
@@ -31,10 +29,13 @@ if parent_scripts_dir_str in sys.path:
     sys.path.remove(parent_scripts_dir_str)
 sys.path.insert(0, parent_scripts_dir_str)
 
+import yaml
+
 from lib_layout import (
     apply_layout,
     build_layout,
     build_runtime_targets,
+    load_experiment_config_root,
     load_experiment_spec,
     render_layout_summary,
 )
@@ -684,7 +685,7 @@ def main() -> int:
     args = parser.parse_args()
 
     config_path = args.config.resolve()
-    cfg = _load_yaml_mapping(config_path)
+    cfg = load_experiment_config_root(config_path=config_path)
     spec = load_experiment_spec(config_path=config_path)
     runtime_targets = build_runtime_targets(spec=spec)
     manylinux_cfg = _require_mapping(cfg, "manylinux")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,24 @@ def _resolve_repo_root_cli_path(*, raw_path: Path, field_name: str) -> Path:
     if not resolved:
         raise RuntimeError(f"failed to resolve {field_name} against repo root: raw={raw_path}")
     return resolved
+
+
+def _remove_build_artifact(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+        return
+    path.unlink()
+
+
+def _clean_python_build_artifacts(*, repo_root: Path, release_dir: Path) -> None:
+    for artifact in (repo_root / "build", repo_root / "dist"):
+        if artifact.resolve() == release_dir.resolve():
+            continue
+        _remove_build_artifact(artifact)
+    for artifact in repo_root.glob("*.egg-info"):
+        _remove_build_artifact(artifact)
 
 
 def main() -> int:
@@ -42,6 +61,7 @@ def main() -> int:
         else (REPO_ROOT / "fluxon_release")
     )
     release_dir.mkdir(parents=True, exist_ok=True)
+    _clean_python_build_artifacts(repo_root=REPO_ROOT, release_dir=release_dir)
 
     subprocess.check_call(
         [sys.executable, "setup.py", "bdist_wheel", "-d", str(release_dir)],

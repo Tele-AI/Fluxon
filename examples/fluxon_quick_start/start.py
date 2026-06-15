@@ -1373,6 +1373,35 @@ def _run_mq_shell(cfg: Dict[str, Any], workdir: Path) -> None:
         with prompt_delay_lock:
             return max(0.0, next_prompt_allowed_at - time.monotonic())
 
+    def _mq_status_lines() -> list[str]:
+        return [
+            "MQ shell status:",
+            f"  channel_key={chan_key}",
+            f"  producer_chan_id={producer.get_chan_id()}",
+            f"  producer_id={producer.get_producer_id()}",
+            f"  consumer_chan_id={consumer.get_chan_id()}",
+            f"  consumer_id={consumer.get_consumer_id()}",
+            f"  shutdown_requested={shutdown_requested.is_set()}",
+            f"  consumer_done={consumer_done.is_set()}",
+        ]
+
+    def _handle_mq_shell_line(line: str) -> tuple[bool, str | None]:
+        parts = line.split(None, 1)
+        cmd = parts[0].lower()
+        if cmd in ("exit", "quit", "q"):
+            shutdown_requested.set()
+            return True, None
+        if cmd == "help":
+            print("Commands:  put <message>  |  status  |  exit")
+            return True, None
+        if cmd == "status":
+            for status_line in _mq_status_lines():
+                print(status_line)
+            return True, None
+
+        msg = parts[1] if cmd == "put" and len(parts) >= 2 else line
+        return False, msg
+
     def _close_handles_once(*, reason: str) -> None:
         nonlocal handles_closed
         with close_lock:
@@ -1455,7 +1484,7 @@ def _run_mq_shell(cfg: Dict[str, Any], workdir: Path) -> None:
             path="/view?cluster_name=qs_mq_cluster&member_kind=mq",
         )
         _print_panel_urls(label="MQ Web UI", urls=mq_ui_urls)
-        print("Commands:  put <message>  |  exit\n")
+        print("Commands:  put <message>  |  status  |  exit\n")
         time.sleep(1.0)
 
         prompt_visible = False
@@ -1482,13 +1511,13 @@ def _run_mq_shell(cfg: Dict[str, Any], workdir: Path) -> None:
             if not line:
                 continue
 
-            parts = line.split(None, 1)
-            cmd = parts[0].lower()
-            if cmd in ("exit", "quit", "q"):
-                shutdown_requested.set()
-                break
+            handled, msg = _handle_mq_shell_line(line)
+            if handled:
+                if shutdown_requested.is_set():
+                    break
+                continue
 
-            msg = parts[1] if cmd == "put" and len(parts) >= 2 else line
+            assert msg is not None
             ts_ms = int(time.time() * 1000)
             put_res = producer.put_data({"payload": msg.encode("utf-8"), "ts_ms": ts_ms})
             if put_res.is_ok():

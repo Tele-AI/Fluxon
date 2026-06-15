@@ -1506,13 +1506,11 @@ async fn key_meta_cache_check(
         }
     }
 
-    // Step 4: Give owner/master-side metadata caches enough time to observe the delete before we
-    // assert that a subsequent GET returns None. This is intentionally a long wait because this
-    // test is validating cache invalidation semantics under concurrent transfer activity.
-    info!("⏳ Waiting 60 seconds for cache metadata to clear before post-delete GET...");
-    sleep(Duration::from_secs(60)).await;
+    // Step 4: The same requester owner should immediately invalidate its local cached metadata
+    // once delete succeeds, without waiting for the master broadcast round-trip.
+    info!("🔍 Verifying immediate post-delete GET visibility...");
 
-    // Step 5: GET the key again, should return None
+    // Step 5: GET the key again, should return None immediately
     match api.inner().get(parallel_unique_key).await {
         Ok(None) => {
             info!(

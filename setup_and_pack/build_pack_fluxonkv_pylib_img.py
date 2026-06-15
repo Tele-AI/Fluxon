@@ -265,7 +265,7 @@ def build_image(config: dict) -> None:
     print("  # Run the build script:")
     print(
         f"  docker run --rm -v $(pwd):/workspace {demo_ref} "
-        "python3 setup_and_pack/nix/pack_fluxonkv_pylib.py --config setup_and_pack/nix/pack_fluxonkv_pylib.yaml --apply-layout --run"
+        "python3 setup_and_pack/nix/pack_fluxonkv_pylib.py --config setup_and_pack/nix/pack_fluxonkv_pylib_static.yaml --apply-layout --run"
     )
     print("  ")
     print("  # Manual build:")

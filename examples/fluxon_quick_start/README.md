@@ -147,6 +147,8 @@ status
 exit
 ```
 
+`status` prints the current producer/consumer binding info.
+
 The background consumer keeps printing received messages.
 
 ## FS Quick Start
