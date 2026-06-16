@@ -1,6 +1,0 @@
-interface:
-  display_name: "Canvas DAG Organizer v1"
-  short_description: "Canvas DAG Organizer v1"
-  default_prompt: "Use $canvas-dag_organizer-v1."
-policy:
-  allow_implicit_invocation: false

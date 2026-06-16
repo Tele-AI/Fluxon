@@ -1,6 +1,0 @@
-interface:
-  display_name: "Patch 式改动审阅"
-  short_description: "Patch 式改动审阅"
-  default_prompt: "Use $prompt-144929a0-ae69-404b-9f58-a8696378e4e3."
-policy:
-  allow_implicit_invocation: false

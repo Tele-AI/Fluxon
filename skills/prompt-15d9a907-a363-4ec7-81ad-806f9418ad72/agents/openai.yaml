@@ -1,6 +1,0 @@
-interface:
-  display_name: "pua严肃设计"
-  short_description: "pua严肃设计"
-  default_prompt: "Use $prompt-15d9a907-a363-4ec7-81ad-806f9418ad72."
-policy:
-  allow_implicit_invocation: false
