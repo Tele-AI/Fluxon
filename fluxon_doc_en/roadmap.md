@@ -1,11 +1,19 @@
 # Roadmap
 
+## TODO
+
+- [CI] Cover all tests with GitHub Actions and fix existing bugs
+- [KV] Adapt and optimize `sglang` `KVCache`
+- [OPS] Consolidate GitHub Actions integration tests into `FluxonOps` so internal clusters can reuse them directly later
+
 ## Release Notes
 
 ### 0.2.1
 
-- [RELEASE] Unified Python / Rust package versions and release artifact naming to `0.2.1`
-- [DOC] Updated Quick Start, installation, deployment docs, and the repository homepage to the `0.2.1` version line
+- [PERF] Optimize `RPC`, `KV`, and `FS` performance
+- [MQ] Fix MQ control-plane scalability issues
+- [ETCD] Fix the gRPC size limit issue when listing etcd prefixes
+- [OSS] Improve open-source readiness and related workflows
 
 ### 0.1.7
 

@@ -63,9 +63,9 @@ Designed for heterogeneous training, data-processing pipelines, and intermediate
 
 ### Fluxon FS
 
-Designed for file IO acceleration, remote access, `S3` forwarding, cache hits, and large-scale cross-cluster migration for AI data and model files. When dealing with high-resolution video, trajectory samples, checkpoints, and other large file objects, Fluxon FS puts access acceleration, cache reuse, and migration progress into one unified file data plane.
+Fluxon FS is an S3-compatible file and object cache for AI data and model files. It supports read/write acceleration, remote access, `S3` forwarding, cache hits, and large-scale cross-cluster migration. In workloads with high-resolution video, trajectory samples, checkpoints, and other large file objects, these capabilities are unified in one file data plane.
 
-- Unified caching system: directly reuses `FluxonKV/RPC` caching and communication capabilities, splitting files into `KeyValue` shards for sharded caching
+- Unified caching system: directly reuses `FluxonKV/RPC` caching and communication capabilities, splits files into `KeyValue` shards, and lets one system support accelerated reads and writes for key-value, file, and object caching
 - `S3` forwarding access: supports object-storage access and forwarding for AI data and model files
 - Transparent Python file semantics: preserves the upper-layer `open() / read() / write()` experience as much as possible while reducing system-call and cross-process overhead
 - Specialized optimization for small-file / large-file reads and writes: optimizes concurrency and transport paths by file granularity and read / write path to improve bandwidth utilization and overall throughput
