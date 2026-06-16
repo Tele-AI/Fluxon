@@ -105,6 +105,7 @@ assembly:
 # manylinux contains runtime parameters for the actual wheel pack container run.
 # The manylinux version is derived from runtime.base_system and is not configured here.
 manylinux:
+  runtime_image_ref: pypack-builder-nix-experiment:latest
   transport_backend: tcp_thread
   rdma_backend: closed_sdk
   backend_plans:

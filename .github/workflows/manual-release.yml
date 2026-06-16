@@ -56,8 +56,7 @@ jobs:
         run: |
           python3 setup_and_pack/ci/gen_pack_release_ci_config.py \
             --out-dir setup_and_pack \
-            --project-data-root "$RUNNER_TEMP/fluxon-pack-release/project-data" \
-            --runtime-image-ref pypack-builder-nix-experiment:latest
+            --project-data-root "$RUNNER_TEMP/fluxon-pack-release/project-data"
 
       - name: Run pack_release
         run: python3 setup_and_pack/pack_release.py --release-dir fluxon_release

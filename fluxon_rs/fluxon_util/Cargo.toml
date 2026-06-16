@@ -29,7 +29,7 @@ libc = { workspace = true }
 serde_yaml = { workspace = true }
 dashmap = { workspace = true }
 etcd-client = { workspace = true }
-pyo3 = { version = "0.22", features = ["abi3-py38"] }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
 uuid = { workspace = true }
 
 [dev-dependencies]

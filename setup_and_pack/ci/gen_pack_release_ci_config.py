@@ -32,11 +32,6 @@ def _parse_args() -> argparse.Namespace:
         required=True,
         help="Absolute project_data_root for CI runtime state",
     )
-    parser.add_argument(
-        "--runtime-image-ref",
-        required=True,
-        help="Manylinux builder image ref to use in CI",
-    )
     return parser.parse_args()
 
 
@@ -57,15 +52,11 @@ def main() -> int:
         raise RuntimeError(f"template config must be a mapping: {env_template_path}")
 
     host_paths_cfg = cfg.get("host_paths")
-    manylinux_cfg = cfg.get("manylinux")
     if not isinstance(host_paths_cfg, dict):
         raise RuntimeError(f"template config missing host_paths mapping: {env_template_path}")
-    if not isinstance(manylinux_cfg, dict):
-        raise RuntimeError(f"template config missing manylinux mapping: {env_template_path}")
 
     host_root = args.project_data_root.resolve()
     host_paths_cfg["root_path"] = str(host_root)
-    manylinux_cfg["runtime_image_ref"] = args.runtime_image_ref
 
     out_dir.mkdir(parents=True, exist_ok=True)
     env_out_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")

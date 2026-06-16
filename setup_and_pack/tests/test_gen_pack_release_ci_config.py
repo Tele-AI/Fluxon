@@ -38,9 +38,6 @@ class GenPackReleaseCiConfigTest(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "host_paths": {"root_path": "/tmp/original-store"},
-                        "manylinux": {
-                            "runtime_image_ref": "original:latest",
-                        },
                     },
                     sort_keys=False,
                 ),
@@ -55,8 +52,6 @@ class GenPackReleaseCiConfigTest(unittest.TestCase):
                 str(output_dir),
                 "--project-data-root",
                 str(project_data_root),
-                "--runtime-image-ref",
-                "pypack-builder-nix-experiment:ci",
             ]
             old_argv = sys.argv
             try:
@@ -68,7 +63,7 @@ class GenPackReleaseCiConfigTest(unittest.TestCase):
             self.assertEqual(rc, 0)
             cfg = yaml.safe_load((output_dir / "pack_fluxonkv_pylib_env.yaml").read_text(encoding="utf-8"))
             self.assertEqual(cfg["host_paths"]["root_path"], str(project_data_root.resolve()))
-            self.assertEqual(cfg["manylinux"]["runtime_image_ref"], "pypack-builder-nix-experiment:ci")
+            self.assertNotIn("manylinux", cfg)
 
 
 if __name__ == "__main__":

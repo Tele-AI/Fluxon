@@ -39,6 +39,7 @@ def _refresh_wheel_record(source_root: Path) -> None:
 
     record_path.parent.mkdir(parents=True, exist_ok=True)
     rows: list[list[str]] = []
+    # Rebuild RECORD from the extracted tree so hashes stay in sync after edits.
     for path in sorted(source_root.rglob("*")):
         if path.is_dir() or path == record_path:
             continue
@@ -77,12 +78,14 @@ def _normalize_extracted_wheel_lib_rpaths(*, source_root: Path, pkg_name: str) -
     libs_dir = source_root / f"{pkg_name}.libs"
 
     for ext_path in sorted(pkg_dir.glob("*.so")):
+        # Extension modules should resolve bundled runtime libs from the wheel.
         _set_rpath(ext_path, "$ORIGIN:$ORIGIN/../fluxon_pyo3.libs")
 
     if libs_dir.is_dir():
         for lib_path in sorted(libs_dir.glob("*.so*")):
             if not lib_path.is_file():
                 continue
+            # Bundled shared libraries only need to reference siblings in .libs.
             _set_rpath(lib_path, "$ORIGIN")
 
 
@@ -175,6 +178,7 @@ def add_plugins(wheel_path: str, plugins_dir: str, bundle_name: str) -> None:
         for path in sorted(source_root.rglob("*")):
             if path.is_dir():
                 continue
+            # Preserve the plugin tree layout inside the bundle directory.
             relpath = path.relative_to(source_root)
             dst_path = dst_root / relpath
             dst_path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,6 +200,7 @@ def merge_binary_wheel(
 
         runtime_root = Path(extract_wheel(runtime_wheel_path))
         try:
+            # Copy the binary runtime payload into the pure wheel before repacking.
             runtime_pkg_dir = runtime_root / runtime_package_name
             if not runtime_pkg_dir.is_dir():
                 raise RuntimeError(f"missing runtime package dir in wheel: {runtime_pkg_dir}")
@@ -244,6 +249,7 @@ def _merge_wheel_file_text(pure_wheel_text: str, runtime_wheel_text: str) -> str
     out_lines: list[str] = []
     seen_root_line = False
     seen_tag_line = False
+    # The merged wheel stops being purelib and must inherit the runtime wheel tags.
     for line in pure_lines:
         if line.startswith("Root-Is-Purelib:"):
             out_lines.append("Root-Is-Purelib: false")
