@@ -76,7 +76,7 @@ fn new_master_config_with_cluster(
     let conf = MasterConfig {
         instance_key: instance_key.to_string(),
         cluster_name: cluster_name.to_string(),
-        port,
+        port: Some(port),
         etcd_endpoints: vec![etcd.clone()],
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
@@ -84,7 +84,6 @@ fn new_master_config_with_cluster(
         },
         transfer_engine: TransferEngineType::P2p,
         enable_transfer_rpc_fast_path: false,
-        p2p_listen_port: None,
         monitoring: Some(MonitoringConfig {
             prometheus_base_url,
             prom_remote_write_url: Some(vec![prom_remote_write_url]),

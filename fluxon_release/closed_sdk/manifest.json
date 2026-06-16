@@ -1,14 +1,14 @@
 {
   "object_kind": "FluxonCommuClosedSdk",
   "schema_version": 5,
-  "abi_version": 6,
+  "abi_version": 8,
   "sdk_version": "0.2.0",
   "required_open_surface_version": "0.2.0",
   "feature_contract": {
     "boundary_mode": "closed-sdk-consumer",
     "runtime_authority_crate": "fluxon_commu_private_impl"
   },
-  "public_workspace_input_sha256": "9fe2359f2fb30f4986433336050d3db34a628cbeeb7d1f6e7a2a02866465cbd9",
+  "public_workspace_input_sha256": "235c73283f8bb34a60121d079838e40d9b557fcf31f2d23d0702a5aa70305b71",
   "layout": {
     "native": "native",
     "lib": "lib"

@@ -30,6 +30,8 @@ etcd + greptime + fluxonkv master
 
 See [Architecture and Concepts](<./User - 1 - Architecture and Concepts.md>) for `owner`, `external client`, and shared-memory terminology, and [User - 3 - KV and RPC Interface](<./User - 3 - KV and RPC Interface.md>) for `new_store(...) -> KvClient`.
 
+MQ user processes have one fixed role constraint: producer / consumer processes must run as zero-contribution `external_client` attachments. Their lifecycles are expected to be dynamic, so they must not change cluster capacity; the long-lived capacity provider remains the local `owner`.
+
 ## Service Plane
 
 MQ reuses the KV service plane directly. Start the shared chain first:

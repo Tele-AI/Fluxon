@@ -538,7 +538,6 @@ def _gen_kv_config(etcd_ep: str, cluster: str, master_port: int, kv_http_port: i
         "cluster_name": cluster,
         "instance_key": "qs_master",
         "port": master_port,
-        "p2p_listen_port": master_port,
         "log_dir": log_dir,
         "monitoring": _monitoring_block(greptime_http_port),
     }
@@ -584,7 +583,6 @@ def _gen_mq_config(etcd_ep: str, cluster: str, master_port: int, greptime_http_p
         "cluster_name": cluster,
         "instance_key": "qs_master",
         "port": master_port,
-        "p2p_listen_port": master_port,
         "log_dir": log_dir,
         "monitoring": _monitoring_block(greptime_http_port),
     }
@@ -647,7 +645,6 @@ def _gen_fs_config(etcd_ep: str, cluster: str, master_port: int, panel_port: int
             "cluster_name": cluster,
             "instance_key": "qs_master",
             "port": master_port,
-            "p2p_listen_port": master_port,
             "log_dir": log_dir,
             "monitoring": _monitoring_block(greptime_http_port),
         },

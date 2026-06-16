@@ -4,6 +4,7 @@ Keep this document concise.
 - teststack has UI support; testrunner should own the UI, and the UI should reuse the ops interfaces underneath
 - All Python code in this project must be compatible with Python >=3.10
 - YAML files in this project are examples by default. Do not edit them directly; create a YAML file for your specific development environment
+- Start long-running commands in `tmux`. Do not run long-lived services directly in the foreground.
 - Git operations are limited to basic `stage`, `unstage`, `commit`, and `push`. Do not use other Git operations.
 
 ## Doc Site

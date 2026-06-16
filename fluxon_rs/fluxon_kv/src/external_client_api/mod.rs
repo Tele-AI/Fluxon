@@ -519,6 +519,14 @@ impl ExternalClientApi {
                         break;
                     }
 
+                    let Some(view_guard) = view_task.try_upgrade() else {
+                        tracing::info!(
+                            "external owner remap actor stopped because view was dropped"
+                        );
+                        break;
+                    };
+                    let _keep_view_alive = view_guard;
+
                     if let Err(err) = view_task
                         .external_client_api()
                         .inner()

@@ -224,6 +224,7 @@ impl ClientKvApiInner {
         }
 
         self.put_end(key, put_id, lease_id).await?;
+        self.cache_metadata_only_after_put(key, put_id);
         if let Some(tag) = info_complete_tag {
             info!("{tag} complete key={} bytes={}", key, payload_len);
         }

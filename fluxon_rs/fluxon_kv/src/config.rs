@@ -498,12 +498,11 @@ fn verify_otlp_log_api(cfg: &mut GreptimeOtlpLogConfigYaml) -> KvResult<Greptime
 pub struct MasterConfigYaml {
     pub instance_key: String,
     pub cluster_name: String,
-    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     pub etcd_endpoints: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<ProtocolConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub p2p_listen_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitoring: Option<MonitoringConfigYaml>, // monitoring config (prometheus base url, optional remote write, optional otlp_log_api)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -522,12 +521,11 @@ pub struct MasterConfigYaml {
 pub struct MasterConfig {
     pub instance_key: String,
     pub cluster_name: String,
-    pub port: u16,
+    pub port: Option<u16>,
     pub etcd_endpoints: Vec<String>,
     pub protocol: ProtocolConfig,
     pub transfer_engine: TransferEngineType,
     pub enable_transfer_rpc_fast_path: bool,
-    pub p2p_listen_port: Option<u16>,
     pub monitoring: Option<MonitoringConfig>, // monitoring config (prometheus base url, optional remote write, optional otlp_log_api)
     pub network: Option<NetworkConfig>,
     pub pprof_duration_seconds: Option<u64>,
@@ -1150,12 +1148,7 @@ impl MasterConfigYaml {
             .into_kverror());
         }
 
-        // Validate port
-        if self.port == 0 {
-            return Err(ConfigError::InvalidPort { port: self.port }.into_kverror());
-        }
-
-        if let Some(p) = self.p2p_listen_port {
+        if let Some(p) = self.port {
             if p == 0 {
                 return Err(ConfigError::InvalidPort { port: p }.into_kverror());
             }
@@ -1406,7 +1399,6 @@ impl MasterConfigYaml {
                 transfer_engine_supports_rpc_fast_path(transfer_engine),
                 Some(&test_spec_config),
             ),
-            p2p_listen_port: self.p2p_listen_port,
             pprof_duration_seconds,
             monitoring: Some(monitoring),
             network,
@@ -2022,5 +2014,24 @@ test_spec_config:
             Some("mlx5_0,mlx5_4".to_string())
         );
         assert!(verified.enable_transfer_rpc_fast_path);
+    }
+
+    #[test]
+    fn master_config_accepts_missing_port_for_auto_discovery() {
+        let cfg = MasterConfigYaml::from_str(
+            r#"
+instance_key: test_master
+cluster_name: test_cluster
+etcd_endpoints: ["127.0.0.1:2379"]
+network:
+  subnet_whitelist: ["127.0.0.0/8"]
+monitoring:
+  prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
+log_dir: /tmp/test_master_logs
+"#,
+        )
+        .unwrap();
+        let verified = cfg.verify().unwrap();
+        assert_eq!(verified.port, None);
     }
 }

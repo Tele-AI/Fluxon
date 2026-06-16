@@ -6,10 +6,6 @@ authors = ["Your Name <your.email@example.com>"]
 description = "Utility crate with macros and helper functions"
 license = "MIT OR Apache-2.0"
 
-[features]
-default = []
-python = ["dep:pyo3"]
-
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -33,7 +29,7 @@ libc = { workspace = true }
 serde_yaml = { workspace = true }
 dashmap = { workspace = true }
 etcd-client = { workspace = true }
-pyo3 = { version = "0.22", features = ["abi3-py38"], optional = true }
+pyo3 = { version = "0.22", features = ["abi3-py38"] }
 uuid = { workspace = true }
 
 [dev-dependencies]

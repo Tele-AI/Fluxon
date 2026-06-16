@@ -36,7 +36,7 @@ fn new_master_config(instance_key: &str, port: u16, cluster: &str, etcd: &str) -
     MasterConfig {
         instance_key: instance_key.to_string(),
         cluster_name: cluster.to_string(),
-        port,
+        port: Some(port),
         etcd_endpoints: vec![etcd.to_string()],
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
@@ -44,7 +44,6 @@ fn new_master_config(instance_key: &str, port: u16, cluster: &str, etcd: &str) -
         },
         transfer_engine: TransferEngineType::P2p,
         enable_transfer_rpc_fast_path: false,
-        p2p_listen_port: None,
         monitoring: Some(MonitoringConfig {
             prometheus_base_url,
             prom_remote_write_url: Some(vec![prom_remote_write_url]),

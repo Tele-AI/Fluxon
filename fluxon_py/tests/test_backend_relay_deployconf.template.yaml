@@ -58,7 +58,6 @@ service:
           prom_remote_write_url:
             - "http://__ETCD_CONTAINER_NAME__:2379/v1/prometheus/write"
         port: __MASTER_PORT__
-        p2p_listen_port: __MASTER_PORT__
         log_dir: "__RUNTIME_ROOT__/logs/master"
       YAML
       exec python3 -m fluxon_py.runtime.start_master -c all_config.yaml -w "__RUNTIME_ROOT__/work/master"

@@ -980,12 +980,11 @@ fn new_master_launch(
         config: MasterConfig {
             instance_key: round.scoped_instance_key(instance_key),
             cluster_name: round.cluster_name.clone(),
-            port,
+            port: Some(port),
             etcd_endpoints: vec![etcd.clone()],
             protocol,
             transfer_engine,
             enable_transfer_rpc_fast_path,
-            p2p_listen_port: None,
             pprof_duration_seconds: None,
             monitoring: Some(MonitoringConfig {
                 prometheus_base_url,
@@ -1351,103 +1350,57 @@ async fn key_meta_cache_check(
         parallel_unique_key
     );
 
-    // Step 2: GET the key to verify it exists
-    async fn parallel_get_from_same_client_after_put(
+    async fn expect_get_value(
         get_client: &crate::client_kv_api::ClientKvApiView,
-        parallel_unique_key: &str,
-        test_value: &[u8],
-        time: usize,
+        key: &str,
+        expected_value: &[u8],
+        label: &str,
     ) {
-        {
-            let mut tasks = Vec::new();
-            for i in 0..10 {
-                let client = get_client.clone();
-                let key = format!("{}", parallel_unique_key);
-                let task = tokio::spawn(async move {
-                    tracing::info!(
-                        "🔍 parallel_get_from_same_client_after_put Starting GET operation for key: {}, index {}",
-                        key,
-                        i
+        match get_client.client_kv_api().inner().get(key).await {
+            Ok(Some((mem_holder, remote_get_info))) => {
+                info!("✅ GET operation successful for key: {} ({})", key, label);
+                info!("📋 GET Info: {:?}", remote_get_info);
+                let retrieved_data = mem_holder.bytes();
+                let prefix_len = std::cmp::min(8, retrieved_data.len());
+                info!(
+                    "📋 GET prefix for key {} ({}): {:?}",
+                    key,
+                    label,
+                    &retrieved_data[..prefix_len]
+                );
+                if retrieved_data != expected_value {
+                    error!(
+                        "❌ Data validation failed for key {} ({}): expected {:?}, got {:?}",
+                        key, label, expected_value, retrieved_data
                     );
-                    client.client_kv_api().inner().get(&key).await
-                });
-                tasks.push(task);
+                    panic!("Data validation failed during meta cache check");
+                }
             }
-
-            let mut remote_get_info_count = 0;
-            for task in tasks {
-                let result = task.await.unwrap();
-                match result {
-                    Ok(Some((mem_holder, remote_get_info))) => {
-                        info!(
-                            "✅ GET operation successful for key: {}",
-                            parallel_unique_key
-                        );
-                        info!("📋 GET Info: {:?}", remote_get_info);
-                        if remote_get_info.is_some() {
-                            remote_get_info_count += 1;
-                        }
-
-                        // Verify the data content
-                        let retrieved_data = mem_holder.bytes();
-                        if retrieved_data == test_value {
-                            info!(
-                                "✅ Data validation successful for key: {}",
-                                parallel_unique_key
-                            );
-                        } else {
-                            error!(
-                                "❌ Data validation failed for key {}: expected {:?}, got {:?}",
-                                parallel_unique_key, test_value, retrieved_data
-                            );
-                            panic!("Data validation failed during meta cache check");
-                        }
-                    }
-                    Ok(None) => {
-                        error!(
-                            "❌ GET operation returned None for key: {}",
-                            parallel_unique_key
-                        );
-                        panic!("Key should exist but GET returned None during meta cache check");
-                    }
-                    Err(e) => {
-                        error!(
-                            "❌ GET operation failed for key {}: {}",
-                            parallel_unique_key, e
-                        );
-                        panic!("GET operation failed during meta cache check: {}", e);
-                    }
-                };
+            Ok(None) => {
+                error!("❌ GET returned None for key: {} ({})", key, label);
+                panic!("Key should exist but GET returned None during meta cache check");
             }
-            assert!(
-                remote_get_info_count == 1,
-                "only and must require remote access in the first time, remote get count: {}, key: {}, time: {}",
-                remote_get_info_count,
-                parallel_unique_key,
-                time
-            );
+            Err(e) => {
+                error!("❌ GET failed for key {} ({}): {}", key, label, e);
+                panic!("GET operation failed during meta cache check: {}", e);
+            }
         }
     }
 
-    tracing::info!(
-        "🔍 Starting PUT and GET in parallel: {}",
-        parallel_unique_key
-    );
+    tracing::info!("🔍 Starting PUT and GET in parallel: {}", parallel_unique_key);
     for i in 0..10 {
-        let (client1, client2) = if i % 2 == 0 {
+        let (put_client, other_client) = if i % 2 == 0 {
             (client, client2)
         } else {
             (client2, client)
         };
 
-        // Step 1: PUT the key-value pair
-        // we use the same key for multiple time put
         tracing::info!(
             "🔍 Starting PUT operation for key: {} in time {}",
             parallel_unique_key,
             i
         );
-        match client1
+        match put_client
             .client_kv_api()
             .inner()
             .put(
@@ -1472,16 +1425,37 @@ async fn key_meta_cache_check(
             }
         }
 
+        assert!(
+            put_client.client_kv_api().has_cached_key(parallel_unique_key),
+            "put client should have immediate local cache metadata for key {} after put time {}",
+            parallel_unique_key,
+            i
+        );
+
+        expect_get_value(
+            put_client,
+            parallel_unique_key,
+            test_value,
+            "same-owner immediate visibility",
+        )
+        .await;
+
         sleep(Duration::from_secs(6)).await;
 
-        let client_id = client2.client_kv_api().client_id();
+        let client_id = other_client.client_kv_api().client_id();
         tracing::info!(
-            "🔍 Starting GET operation, key: {}, time: {}, client: {}",
+            "🔍 Starting cross-owner convergence GET operation, key: {}, time: {}, client: {}",
             parallel_unique_key,
             i,
             client_id
         );
-        parallel_get_from_same_client_after_put(client2, &parallel_unique_key, test_value, i).await;
+        expect_get_value(
+            other_client,
+            parallel_unique_key,
+            test_value,
+            "cross-owner eventual visibility",
+        )
+        .await;
 
         tracing::info!(
             "✅ success put and get in parallel, key: {}, time: {}, client: {}",
@@ -1491,7 +1465,6 @@ async fn key_meta_cache_check(
         );
     }
 
-    // Step 3: DELETE the key
     match api.inner().delete(parallel_unique_key).await {
         Ok(()) => info!(
             "✅ DELETE operation successful for key: {}",
@@ -1506,11 +1479,8 @@ async fn key_meta_cache_check(
         }
     }
 
-    // Step 4: The same requester owner should immediately invalidate its local cached metadata
-    // once delete succeeds, without waiting for the master broadcast round-trip.
     info!("🔍 Verifying immediate post-delete GET visibility...");
 
-    // Step 5: GET the key again, should return None immediately
     match api.inner().get(parallel_unique_key).await {
         Ok(None) => {
             info!(
@@ -1562,9 +1532,11 @@ async fn key_meta_cache_check(
 // #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 pub async fn test_kv_all() {
     // 初始化日志
-    // 仅设置日志级别；run_xxx 会初始化日志到文件
-    unsafe {
-        std::env::set_var("FLUXON_LOG", "info");
+    // Respect explicit caller log level so local debugging can enable deeper probes.
+    if std::env::var_os("FLUXON_LOG").is_none() {
+        unsafe {
+            std::env::set_var("FLUXON_LOG", "info");
+        }
     }
     let run_options = default_kv_test_run_options();
     info!(

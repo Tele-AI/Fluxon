@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -25,6 +26,7 @@ struct ClosedTransferEngineRuntime {
     handle: OnceLock<ClosedRuntimeHandle>,
     construct_lock: AsyncMutex<()>,
     current_config: RwLock<ClientTransferEngineRuntimeConfig>,
+    local_segment_leases: Arc<ClosedLocalSegmentLeaseRegistry>,
     running: AtomicBool,
 }
 
@@ -40,8 +42,53 @@ impl ClosedTransferEngineRuntime {
             construct_arg: arg,
             handle: OnceLock::new(),
             construct_lock: AsyncMutex::new(()),
+            local_segment_leases: Arc::new(ClosedLocalSegmentLeaseRegistry::new()),
             running: AtomicBool::new(true),
         }
+    }
+}
+
+struct ClosedLocalSegmentLeaseRegistry {
+    next_handle: AtomicU64,
+    guards: AsyncMutex<HashMap<u64, Box<dyn Any + Send + Sync>>>,
+}
+
+impl ClosedLocalSegmentLeaseRegistry {
+    fn new() -> Self {
+        Self {
+            next_handle: AtomicU64::new(1),
+            guards: AsyncMutex::new(HashMap::new()),
+        }
+    }
+
+    async fn insert<G>(&self, guard: G) -> u64
+    where
+        G: Send + Sync + 'static,
+    {
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.guards.lock().await.insert(handle, Box::new(guard));
+        handle
+    }
+
+    async fn take<G>(&self, handle: u64) -> Result<G, String>
+    where
+        G: Send + Sync + 'static,
+    {
+        let boxed = self
+            .guards
+            .lock()
+            .await
+            .remove(&handle)
+            .ok_or_else(|| format!("closed sdk local segment lease handle {handle} not found"))?;
+        boxed.downcast::<G>().map(|guard| *guard).map_err(|_| {
+            format!(
+                "closed sdk local segment lease handle {handle} has unexpected runtime guard type"
+            )
+        })
+    }
+
+    async fn drop_handle(&self, handle: u64) {
+        self.guards.lock().await.remove(&handle);
     }
 }
 
@@ -206,15 +253,13 @@ impl ClientTransferEngineCore {
     {
         {
             let handle = self.ensure_closed_runtime_handle(&runtime).await?;
-            let guards = Arc::new(AsyncMutex::new(HashMap::<u64, R::LocalSegmentGuard>::new()));
-            let next_guard_handle = Arc::new(AtomicU64::new(1));
+            let local_segment_leases = Arc::clone(&self.closed.local_segment_leases);
             transfer_engine_init2_for_init_dag(
                 handle,
                 runtime.supports_local_segment_transfer(),
                 move |request| {
                     let runtime = runtime.clone();
-                    let guards = Arc::clone(&guards);
-                    let next_guard_handle = Arc::clone(&next_guard_handle);
+                    let local_segment_leases = Arc::clone(&local_segment_leases);
                     async move {
                         match request {
                             ClosedRuntimeTransferEngineOpenRuntimeRequest::SupportsLocalSegmentTransfer => {
@@ -231,16 +276,18 @@ impl ClientTransferEngineCore {
                                 previous_guard_handle,
                             } => {
                                 let previous = if let Some(handle) = previous_guard_handle {
-                                    guards.lock().await.remove(&handle)
+                                    Some(
+                                        local_segment_leases
+                                            .take::<R::LocalSegmentGuard>(handle)
+                                            .await?,
+                                    )
                                 } else {
                                     None
                                 };
                                 let guard = runtime
                                     .ensure_local_segment_guard(local_addr, previous)
                                     .await?;
-                                let guard_handle =
-                                    next_guard_handle.fetch_add(1, Ordering::Relaxed);
-                                guards.lock().await.insert(guard_handle, guard);
+                                let guard_handle = local_segment_leases.insert(guard).await;
                                 Ok(
                                     ClosedRuntimeTransferEngineOpenRuntimeResponse::GuardHandleValue(
                                         guard_handle,
@@ -250,7 +297,7 @@ impl ClientTransferEngineCore {
                             ClosedRuntimeTransferEngineOpenRuntimeRequest::DropLocalSegmentGuard {
                                 guard_handle,
                             } => {
-                                guards.lock().await.remove(&guard_handle);
+                                local_segment_leases.drop_handle(guard_handle).await;
                                 Ok(ClosedRuntimeTransferEngineOpenRuntimeResponse::Unit)
                             }
                             ClosedRuntimeTransferEngineOpenRuntimeRequest::P2pReadToLocal {
@@ -260,14 +307,12 @@ impl ClientTransferEngineCore {
                                 len,
                                 guard_handle,
                             } => {
-                                let guard = guards
-                                    .lock()
+                                let guard = local_segment_leases
+                                    .take::<R::LocalSegmentGuard>(guard_handle)
                                     .await
-                                    .remove(&guard_handle)
-                                    .ok_or_else(|| {
+                                    .map_err(|detail| {
                                         format!(
-                                            "closed sdk transfer-engine guard handle {} not found for p2p_read_to_local",
-                                            guard_handle
+                                            "{detail} for p2p_read_to_local"
                                         )
                                     })?;
                                 runtime
@@ -282,14 +327,12 @@ impl ClientTransferEngineCore {
                                 len,
                                 guard_handle,
                             } => {
-                                let guard = guards
-                                    .lock()
+                                let guard = local_segment_leases
+                                    .take::<R::LocalSegmentGuard>(guard_handle)
                                     .await
-                                    .remove(&guard_handle)
-                                    .ok_or_else(|| {
+                                    .map_err(|detail| {
                                         format!(
-                                            "closed sdk transfer-engine guard handle {} not found for p2p_write_from_local",
-                                            guard_handle
+                                            "{detail} for p2p_write_from_local"
                                         )
                                     })?;
                                 runtime
@@ -384,7 +427,6 @@ impl ClientTransferEngineCore {
         R: ClientTransferEngineRuntime,
     {
         {
-            let _ = seg_guard;
             let len = data.get_ref().len() as u64;
             if do_copy && len > 0 {
                 unsafe {
@@ -410,7 +452,15 @@ impl ClientTransferEngineCore {
                     ..TransferBreakdown::default()
                 });
             }
-            self.transfer_data_no_copy(runtime, peer_id, false, src_addr, target_addr, len, None)
+            self.transfer_data_no_copy(
+                runtime,
+                peer_id,
+                false,
+                src_addr,
+                target_addr,
+                len,
+                seg_guard,
+            )
                 .await
         }
     }
@@ -429,20 +479,43 @@ impl ClientTransferEngineCore {
         R: ClientTransferEngineRuntime,
     {
         {
-            let _ = seg_guard;
+            let initial_local_segment_guard = match seg_guard {
+                Some(guard) => Some(guard),
+                None if runtime.supports_local_segment_transfer() => {
+                    let local_addr = if peer_src_or_target { target_addr } else { src_addr };
+                    match runtime.ensure_local_segment_guard(local_addr, None).await {
+                        Ok(guard) => Some(guard),
+                        Err(_) => None,
+                    }
+                }
+                None => None,
+            };
+            let initial_local_segment_guard_handle = match initial_local_segment_guard {
+                Some(guard) => Some(self.closed.local_segment_leases.insert(guard).await),
+                None => None,
+            };
             let handle = self.ensure_closed_runtime_handle(&runtime).await?;
             let _ = runtime;
-            transfer_engine_transfer_data_no_copy(
+            let result = transfer_engine_transfer_data_no_copy(
                 handle,
                 peer_node.map(|value| value.to_string()),
                 peer_src_or_target,
                 src_addr,
                 target_addr,
                 len,
-                None,
+                initial_local_segment_guard_handle,
             )
             .await
-            .map_err(transfer_engine_closed_sdk_error)
+            .map_err(transfer_engine_closed_sdk_error);
+            if result.is_err() {
+                if let Some(guard_handle) = initial_local_segment_guard_handle {
+                    self.closed
+                        .local_segment_leases
+                        .drop_handle(guard_handle)
+                        .await;
+                }
+            }
+            result
         }
     }
 }

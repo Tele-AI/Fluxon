@@ -1558,6 +1558,8 @@ def _build_docker_argv(
         "docker",
         "run",
         "--rm",
+        "--entrypoint",
+        "/bin/bash",
         "--ulimit",
         f"nofile={DOCKER_NOFILE_LIMIT}:{DOCKER_NOFILE_LIMIT}",
         *docker_env_args,
@@ -1578,7 +1580,6 @@ def _build_docker_argv(
         "-w",
         "/workspace",
         runtime_image_ref,
-        "bash",
         "-lc",
         container_cmd,
     ]

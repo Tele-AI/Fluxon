@@ -474,7 +474,6 @@ def _build_example_config(
             "cluster_name": cluster_name,
             "instance_key": f"example_ctrlc_master_{unique_suffix}",
             "port": master_port,
-            "p2p_listen_port": master_port,
             "log_dir": str((Path(shared_memory_path).parent / "log" / "master").resolve()),
             "monitoring": _monitoring_block(greptime_http_port=greptime_http_port),
         },

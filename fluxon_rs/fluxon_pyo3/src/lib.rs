@@ -4083,7 +4083,10 @@ fn run_master_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyObjec
         println!("✅ KV Master started successfully");
         println!("📊 Instance: {}", final_config.instance_key);
         println!("🏷️  Cluster: {}", final_config.cluster_name);
-        println!("🔌 Port: {}", final_config.port);
+        match final_config.port {
+            Some(port) => println!("🔌 Port: {}", port),
+            None => println!("🔌 Port: auto"),
+        }
         println!("🚀 Master is running... Press Ctrl+C to stop");
 
         // Block until Ctrl+C signal without holding GIL

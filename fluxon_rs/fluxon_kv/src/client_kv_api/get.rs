@@ -1,5 +1,5 @@
 use super::ClientKvApiInner;
-use crate::client_kv_api::GetCachedInfo;
+use crate::client_kv_api::CachedValue;
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::memholder::{MemoryInfo, UserMemHolder, UserMemHolderExposeKind};
 // no StageScope; timestamps-based metrics only
@@ -63,27 +63,27 @@ impl ClientKvApiInner {
         let node_role = self.node_role();
 
         if let Some(cached_info) = self.get_cached_info.get(key) {
-            // exist, directly return
-            tracing::debug!(
-                "cache hit for key: {} with putid({},{}), directly return",
-                key,
-                cached_info.put_time_ms,
-                cached_info.put_version
-            );
-            // Build a fresh UserMemHolder from cached MemoryInfo
-            let user_mem_holder = Arc::new(UserMemHolder::new(
-                cached_info.mem_holder.clone(),
-                self.get_or_init_all_memholder_refcount(),
-                UserMemHolderExposeKind::SegPtr,
-            ));
-            obe_get_cache_hit(
-                &metrics,
-                &client_id,
-                &node_role,
-                key,
-                cached_info.mem_holder.len as u64,
-            );
-            return Ok(Some((user_mem_holder, None)));
+            if let CachedValue::LocalReplica(memory_info) = &cached_info.value {
+                tracing::debug!(
+                    "cache hit for key: {} with putid({},{}), directly return",
+                    key,
+                    cached_info.put_time_ms,
+                    cached_info.put_version
+                );
+                let user_mem_holder = Arc::new(UserMemHolder::new(
+                    memory_info.clone(),
+                    self.get_or_init_all_memholder_refcount(),
+                    UserMemHolderExposeKind::SegPtr,
+                ));
+                obe_get_cache_hit(
+                    &metrics,
+                    &client_id,
+                    &node_role,
+                    key,
+                    memory_info.len as u64,
+                );
+                return Ok(Some((user_mem_holder, None)));
+            }
         }
 
         let lock = self.get_remote_kv_lock.get_lock(key.to_owned());
@@ -92,25 +92,27 @@ impl ClientKvApiInner {
         // Recheck after acquiring the miss lock so concurrent cache-fillers can collapse here
         // without forcing every cache hit through the async lock path.
         if let Some(cached_info) = self.get_cached_info.get(key) {
-            tracing::debug!(
-                "cache hit after miss-lock for key: {} with putid({},{}), directly return",
-                key,
-                cached_info.put_time_ms,
-                cached_info.put_version
-            );
-            let user_mem_holder = Arc::new(UserMemHolder::new(
-                cached_info.mem_holder.clone(),
-                self.get_or_init_all_memholder_refcount(),
-                UserMemHolderExposeKind::SegPtr,
-            ));
-            obe_get_cache_hit(
-                &metrics,
-                &client_id,
-                &node_role,
-                key,
-                cached_info.mem_holder.len as u64,
-            );
-            return Ok(Some((user_mem_holder, None)));
+            if let CachedValue::LocalReplica(memory_info) = &cached_info.value {
+                tracing::debug!(
+                    "cache hit after miss-lock for key: {} with putid({},{}), directly return",
+                    key,
+                    cached_info.put_time_ms,
+                    cached_info.put_version
+                );
+                let user_mem_holder = Arc::new(UserMemHolder::new(
+                    memory_info.clone(),
+                    self.get_or_init_all_memholder_refcount(),
+                    UserMemHolderExposeKind::SegPtr,
+                ));
+                obe_get_cache_hit(
+                    &metrics,
+                    &client_id,
+                    &node_role,
+                    key,
+                    memory_info.len as u64,
+                );
+                return Ok(Some((user_mem_holder, None)));
+            }
         }
 
         obe_get_cache_miss(&metrics, &client_id, &node_role, key);
@@ -331,14 +333,7 @@ impl ClientKvApiInner {
         };
 
         if done_resp.allocation_mode != GetAllocationMode::Temporary {
-            self.get_cached_info.insert(
-                key.to_string(),
-                GetCachedInfo {
-                    put_time_ms: put_id.0,
-                    put_version: put_id.1,
-                    mem_holder: memory_info.clone(),
-                },
-            );
+            self.cache_local_replica_after_get(key, put_id, memory_info.clone());
             metrics.observe_cache_value_size(&client_id, node_role.as_str(), data_len as u64);
         }
         let user_mem_holder = Arc::new(UserMemHolder::new(

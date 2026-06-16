@@ -9069,7 +9069,7 @@ def _build_test_stack_external_kv_owner_instances(
     shared_memory_root = _require_str(stack_identity.get("shared_memory_path"), "runtime.stack_identity.shared_memory_path")
     shared_file_root = _require_str(stack_identity.get("shared_file_path"), "runtime.stack_identity.shared_file_path")
     etcd_endpoints = _test_stack_etcd_addresses(resolved_case)
-    master_port_offset = 1 if needs_kv_master else 0
+    master_port_offset = 0
     owner_instances: List[Dict[str, Any]] = []
     for owner_ordinal, target in enumerate(owner_targets):
         target_slug, instance_id = _test_stack_kv_owner_instance_id(
@@ -9604,9 +9604,9 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         # English note:
         # - Port allocation must be stable across resume within the same run_dir.
         # - Allocate a disjoint KV P2P listen port for every KV process in the case:
-        #   benchmark nodes + (optional) master + (optional) dedicated KV owners.
+        #   benchmark nodes + (optional) dedicated KV owners.
         owner_total = len(owner_targets) if uses_dedicated_kv_owners else 0
-        p2p_ports_per_slot = node_total + (1 if needs_kv_master else 0) + owner_total
+        p2p_ports_per_slot = node_total + owner_total
         if kv_p2p_port_stride < p2p_ports_per_slot:
             raise ValueError(
                 "profile.test_stack.port_alloc.kv_p2p_port_stride too small for this case: "
@@ -9987,15 +9987,6 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         assert kv_p2p_port_base is not None
         assert kv_p2p_port_stride is not None
         assert kv_master_port is not None
-        master_p2p_listen_port = (
-            int(kv_p2p_port_base)
-            + int(kv_p2p_port_stride) * int(run_index - 1)
-            + int(kv_p2p_slot_offset) * int(p2p_ports_per_slot)
-            + int(node_total)
-        )
-        if master_p2p_listen_port <= 0 or master_p2p_listen_port > 65535:
-            raise ValueError(f"computed master_p2p_listen_port out of range: {master_p2p_listen_port}")
-
         services_dir = run_dir / "services"
         services_dir.mkdir(parents=True, exist_ok=True)
         master_services_dir = (services_dir / "master").resolve()
@@ -10013,7 +10004,6 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                 "runtime.stack_identity.cluster_name",
             ),
             "port": int(kv_master_port),
-            "p2p_listen_port": int(master_p2p_listen_port),
             "etcd_endpoints": list(etcd_endpoints),
             "network": {
                 "subnet_whitelist": _test_stack_master_network_subnet_whitelist(

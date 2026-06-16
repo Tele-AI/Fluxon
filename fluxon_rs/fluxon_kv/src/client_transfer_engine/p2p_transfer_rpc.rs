@@ -9,24 +9,10 @@ use fluxon_commu::{
 };
 use prost::bytes::Bytes;
 use std::pin::Pin;
-use std::slice;
 use std::time::Instant;
 
 fn duration_to_i64_us(duration: std::time::Duration) -> i64 {
     duration.as_micros().min(i64::MAX as u128) as i64
-}
-
-struct SharedSegmentBytesOwner {
-    seg_guard: ClientCpuMemReadGuard,
-    addr: usize,
-    len: usize,
-}
-
-impl AsRef<[u8]> for SharedSegmentBytesOwner {
-    fn as_ref(&self) -> &[u8] {
-        let _ = &self.seg_guard;
-        unsafe { slice::from_raw_parts(self.addr as *const u8, self.len) }
-    }
 }
 
 pub fn register_transfer_rpc(view: &ClientTransferEngineView) {
@@ -83,7 +69,7 @@ pub async fn p2p_read_to_local(
 
     let bytes = call_raw_mem_read(
         view,
-        peer,
+        peer.clone(),
         RawMemReadReq {
             src_addr: remote_src,
             len,
@@ -118,6 +104,15 @@ pub async fn p2p_read_to_local(
             bytes.len(),
         );
     }
+    let copied_prefix_len = std::cmp::min(8, bytes.len());
+    tracing::info!(
+        "p2p_read_to_local copied: peer={} remote_src={:#x} local_target={:#x} len={} prefix={:?}",
+        peer,
+        remote_src,
+        local_target,
+        len,
+        &bytes[..copied_prefix_len]
+    );
     Ok(())
 }
 
@@ -147,11 +142,12 @@ pub async fn p2p_write_from_local(
                 segment_ranges(&seg_guard)?
             ));
         }
-        Bytes::from_owner(SharedSegmentBytesOwner {
-            seg_guard,
-            addr: local_src as usize,
-            len: len_usize,
-        })
+        // Snapshot the current payload before issuing the async RPC send. The
+        // shared segment is aggressively reused by concurrent put/get traffic,
+        // so borrowing it as a zero-copy network buffer can race with later
+        // writes and corrupt the remote value.
+        let bytes = unsafe { std::slice::from_raw_parts(local_src as *const u8, len_usize) };
+        Bytes::copy_from_slice(bytes)
     };
 
     call_raw_mem_write(
@@ -378,9 +374,18 @@ async fn handle_raw_mem_read(
         return Err("len must be > 0".to_string());
     }
     let len = u64_to_usize(req.len)?;
-    view.client_seg_pool()
+    let bytes = view
+        .client_seg_pool()
         .read_from_segment(req.src_addr, len)
-        .await
+        .await?;
+    let prefix_len = std::cmp::min(8, bytes.len());
+    tracing::info!(
+        "p2p_raw_read snapshot: src_addr={:#x} len={} prefix={:?}",
+        req.src_addr,
+        len,
+        &bytes[..prefix_len]
+    );
+    Ok(bytes)
 }
 
 async fn handle_raw_mem_write(

@@ -99,8 +99,3 @@ Cross-machine transport:
 - `chan_id` is the bound existing channel instance id
 
 See [User - 4 - MQ Interface](<./User - 4 - MQ Interface.md>) for details.
-
-`external` mode
-
-- MQ user processes must run as `external_client`
-- Producer / consumer lifecycles should not change cluster capacity

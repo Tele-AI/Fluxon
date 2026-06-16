@@ -34,6 +34,8 @@ etcd + greptime + fluxonkv master
 
 `owner`、`external client`、`shared memory` 这些前置概念见 [架构和概念](./用户%20-%201%20-%20架构和概念.md)；`new_store(...) -> KvClient` 的配置和基础语义见 [KV 和 RPC 接口](./用户%20-%203%20-%20KV-RPC接口.md)。
 
+MQ 用户侧有一个固定角色约束：producer / consumer 必须以 `external_client` 模式运行，也就是 zero-contribution 模式。原因很直接：producer / consumer 会动态加入和离开，这些业务侧进程不应改变集群容量；容量提供者应当始终是常驻的 `owner`。
+
 ## 服务平面
 
 在进入 producer / consumer 代码之前，需要先把 MQ 依赖的服务平面拉起来。共性的角色关系、启动顺序和 runtime 边界，统一见 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md)。

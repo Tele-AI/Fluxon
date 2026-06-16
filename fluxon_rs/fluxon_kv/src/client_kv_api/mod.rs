@@ -57,6 +57,21 @@ pub mod external_api;
 pub use external_api::HandlerForExternalClient;
 pub type TestObservePutPhaseSink = Arc<Mutex<Option<TestPutPhaseTrace>>>;
 
+#[derive(Debug, Clone)]
+enum CachedValue {
+    MetadataOnly,
+    LocalReplica(Arc<MemoryInfo>),
+}
+
+impl CachedValue {
+    fn rank(&self) -> u8 {
+        match self {
+            Self::MetadataOnly => 0,
+            Self::LocalReplica(_) => 1,
+        }
+    }
+}
+
 /// Optional arguments for put operations
 #[derive(Clone, Debug)]
 pub enum PutOptionalArg {
@@ -722,7 +737,7 @@ pub struct ClientKvApi(ClientKvApiInner);
 pub struct GetCachedInfo {
     put_time_ms: u64,
     put_version: u32,
-    mem_holder: Arc<MemoryInfo>,
+    value: CachedValue,
 }
 
 struct ClientKvApiViewHolder {
@@ -814,6 +829,70 @@ pub struct ClientKvApiInner {
 }
 
 impl ClientKvApiInner {
+    fn should_replace_cached_info(
+        current: &GetCachedInfo,
+        put_time_ms: u64,
+        put_version: u32,
+        new_value_rank: u8,
+    ) -> bool {
+        if current.put_time_ms != put_time_ms {
+            return current.put_time_ms <= put_time_ms;
+        }
+        if current.put_version != put_version {
+            return current.put_version <= put_version;
+        }
+        current.value.rank() < new_value_rank
+    }
+
+    fn upsert_cached_info(&self, key: &str, candidate: GetCachedInfo) {
+        match self.get_cached_info.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if Self::should_replace_cached_info(
+                    entry.get(),
+                    candidate.put_time_ms,
+                    candidate.put_version,
+                    candidate.value.rank(),
+                ) {
+                    entry.insert(candidate);
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+        }
+    }
+
+    pub(crate) fn cache_metadata_only_after_put(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+    ) {
+        self.upsert_cached_info(
+            key,
+            GetCachedInfo {
+                put_time_ms: put_id.0,
+                put_version: put_id.1,
+                value: CachedValue::MetadataOnly,
+            },
+        );
+    }
+
+    pub(crate) fn cache_local_replica_after_get(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        memory_info: Arc<MemoryInfo>,
+    ) {
+        self.upsert_cached_info(
+            key,
+            GetCachedInfo {
+                put_time_ms: put_id.0,
+                put_version: put_id.1,
+                value: CachedValue::LocalReplica(memory_info),
+            },
+        );
+    }
+
     pub(crate) fn short_circuit_put_payload_path_enabled(&self) -> bool {
         self.test_spec_config.short_circuit_put_payload_path
     }
@@ -1836,6 +1915,11 @@ impl ClientKvApi {
             tracing::info!("- cached meta: {:?}", entry.value());
         }
         tracing::info!("------------------------------------------------------------");
+    }
+
+    #[cfg(any(test, feature = "test_bins"))]
+    pub fn has_cached_key(&self, key: &str) -> bool {
+        self.inner().get_cached_info.contains_key(key)
     }
 
     // Removed is_client_mode(): ClientKvApi is owner-only and always constructed.

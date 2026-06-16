@@ -41,7 +41,7 @@ fluxon_commu = { path = "../fluxon_commu", default-features = false }
 fluxon_kv = { path = "../fluxon_kv", default-features = false }
 fluxon_framework = { path = "../fluxon_framework" } 
 fluxon_framework_compiled = { path = "../fluxon_framework_compiled" }
-fluxon_util = { path = "../fluxon_util", features = ["python"] }
+fluxon_util = { path = "../fluxon_util" }
 fluxon_mq = { path = "../fluxon_mq" }
 fluxon_cli = { path = "../fluxon_cli" }
 fluxon_ops = { path = "../fluxon_ops" }
