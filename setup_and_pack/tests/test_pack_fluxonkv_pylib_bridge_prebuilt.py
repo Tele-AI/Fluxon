@@ -193,6 +193,72 @@ class BridgePrebuiltAuthorityMaterializationTest(unittest.TestCase):
             self.assertIn(str(workspace_seed_dir.resolve()), mount_path_strings)
             self.assertIn(str(baseline_dir.resolve()), mount_path_strings)
 
+    def test_build_docker_argv_invokes_container_finalize_script_file(self) -> None:
+        selected_backend_plan = {
+            "rdma_backend": "closed_sdk",
+            "shared_native_input_object_ids": ("cxxpacked",),
+            "native_object_id": "nativeRuntime",
+            "protoc_object_id": "cxxpacked",
+            "path_object_ids": ("cxxpacked",),
+            "ld_library_object_ids": ("cxxpacked",),
+            "extra_path_dir_names": (),
+            "extra_ld_library_dir_names": (),
+            "wheel_finalize_steps": (
+                {
+                    "kind": "add_vendor_runtime",
+                    "native_object_id": None,
+                    "native_dir_name": None,
+                    "relative_subdir": None,
+                    "plugin_bundle_name": None,
+                    "extra_library_file_names": (),
+                },
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workspace_mount_dir = root / "workspace"
+            target_cache_dir = root / "target-cache"
+            release_dir = root / "release"
+            profile_dir = root / "profile"
+            cargo_registry_dir = root / "cargo-registry"
+            cargo_git_dir = root / "cargo-git"
+            for path in (
+                workspace_mount_dir,
+                target_cache_dir,
+                release_dir,
+                profile_dir,
+                cargo_registry_dir,
+                cargo_git_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+
+            with mock.patch.object(
+                _PACKMOD,
+                "_container_rust_toolchain_bin_path",
+                return_value="/root/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin",
+            ):
+                docker_argv = _PACKMOD._build_docker_argv(
+                    spec=types.SimpleNamespace(),
+                    runtime_image_ref="builder:latest",
+                    manylinux_version="2_28",
+                    transport_backend="tcp_thread",
+                    selected_backend_plan=selected_backend_plan,
+                    workspace_mount_dir=workspace_mount_dir,
+                    target_cache_dir=target_cache_dir,
+                    release_dir=release_dir,
+                    profile_dir=profile_dir,
+                    external_mounts=(),
+                    extra_host_mount_paths=(),
+                    cargo_registry_dir=cargo_registry_dir,
+                    cargo_git_dir=cargo_git_dir,
+                )
+
+        container_cmd = docker_argv[-1]
+        self.assertIn("pack_release_in_container.py", container_cmd)
+        self.assertIn("--wheel-finalize-steps-json", container_cmd)
+        self.assertNotIn("python3 - <<'PY'", container_cmd)
+
 
 if __name__ == "__main__":
     unittest.main()

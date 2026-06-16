@@ -130,6 +130,7 @@ PREPARE_BUILD_GENERATED_DIR_NAME = "prepare_build"
 PREPARE_BUILD_RESOURCE_STORE_DIR_NAME = "resource_store"
 PUBLIC_CLOSED_SDK_REPO_RELATIVE_ROOT = Path("fluxon_release") / "closed_sdk"
 PUBLIC_WHEEL_RUNTIME_HELPER_REPO_RELATIVE_PATH = Path("setup_and_pack") / "utils" / "wheel_runtime_helper.py"
+PACK_RELEASE_IN_CONTAINER_REPO_RELATIVE_PATH = Path("setup_and_pack") / "nix" / "pack_release_in_container.py"
 WHEEL_FINALIZE_STEP_KIND_ADD_OFFLINE_RDMA_SHARED_LIBRARIES = "add_offline_rdma_shared_libraries"
 WHEEL_FINALIZE_STEP_KIND_ADD_NATIVE_PLUGINS = "add_native_plugins"
 WHEEL_FINALIZE_STEP_KIND_ADD_VENDOR_RUNTIME = "add_vendor_runtime"
@@ -170,6 +171,7 @@ PYO3_WORKSPACE_HELPER_RELATIVE_PATHS = (
     "setup_and_pack/public_workspace_contract.py",
     "setup_and_pack/pub_prepare_build.py",
     "setup_and_pack/pub_prepare_build.yaml",
+    "setup_and_pack/nix/pack_release_in_container.py",
     "setup_and_pack/utils/wheel_runtime_helper.py",
     "setup_and_pack/nix/lib_layout.py",
 )
@@ -1432,6 +1434,7 @@ def _build_docker_argv(
     protoc_root = f"{CONTAINER_INSTANCE_TARGET_PATH}/{_native_object_dir_name(object_id=protoc_object_id)}"
     protoc_path = f"{protoc_root}/bin/protoc"
     prepare_build_scenario = _backend_prepare_build_scenario(selected_backend_plan=selected_backend_plan)
+    finalize_script_path = Path("/workspace") / PACK_RELEASE_IN_CONTAINER_REPO_RELATIVE_PATH
     container_lines = [
         "set -euo pipefail",
         "cleanup_nix_profile() { chmod -R 777 /nix_profile >/dev/null 2>&1 || true; }",
@@ -1548,9 +1551,16 @@ def _build_docker_argv(
             f"--out {shlex.quote(CONTAINER_RELEASE_PATH)} "
             "--no-default-features "
             f"--features {shlex.quote(_transport_backend_feature_csv(transport_backend, rdma_backend))}",
-            "python3 - <<'PY'",
-            _render_container_wheel_finalize_python(selected_backend_plan=selected_backend_plan),
-            "PY",
+            "python3 "
+            + shlex.quote(str(finalize_script_path))
+            + " --release-dir "
+            + shlex.quote(CONTAINER_RELEASE_PATH)
+            + " --target-root "
+            + shlex.quote(CONTAINER_INSTANCE_TARGET_PATH)
+            + " --closed-sdk-root "
+            + shlex.quote(CONTAINER_CLOSED_SDK_RUNTIME_ROOT_PATH)
+            + " --wheel-finalize-steps-json "
+            + shlex.quote(json.dumps(list(selected_backend_plan["wheel_finalize_steps"]))),
         ]
     )
     container_cmd = "\n".join(container_lines)
@@ -1715,330 +1725,6 @@ def _bridge_prebuilt_direct_mount_paths(
             deduped_mount_paths.append(path)
     return tuple(deduped_mount_paths)
 
-
-def _render_container_wheel_finalize_python(*, selected_backend_plan: dict) -> str:
-    rdma_backend = selected_backend_plan["rdma_backend"]
-    helper_path = (
-        Path("/workspace")
-        / PUBLIC_WHEEL_RUNTIME_HELPER_REPO_RELATIVE_PATH
-    )
-    lines = [
-        "import importlib.util",
-        "import os",
-        "import shutil",
-        "import subprocess",
-        "import sys",
-        "import tempfile",
-        "import zipfile",
-        "from pathlib import Path",
-        "",
-        f"abi3_interpreters = {repr(ABI3_SMOKE_TEST_INTERPRETERS)}",
-        f"release_dir = Path({json.dumps(CONTAINER_RELEASE_PATH)})",
-        f"target_root = Path({json.dumps(CONTAINER_INSTANCE_TARGET_PATH)})",
-        (
-            "closed_sdk_root = Path("
-            f"os.environ.get('FLUXON_COMMU_CLOSED_SDK_ROOT', {CONTAINER_CLOSED_SDK_RUNTIME_ROOT_PATH!r})"
-            ")"
-        ),
-        f"helper_path = Path({json.dumps(str(helper_path))})",
-        f"pack_helper_path = Path({json.dumps(str(Path('/workspace') / 'setup_and_pack' / 'nix' / 'pack_fluxonkv_pylib.py'))})",
-        "",
-        "def validate_zip_archive(path: Path) -> None:",
-        "    with zipfile.ZipFile(path, 'r') as zip_ref:",
-        "        bad_member = zip_ref.testzip()",
-        "    if bad_member is not None:",
-        "        raise RuntimeError(f'invalid zip member in {path}: {bad_member}')",
-        "",
-        "def first_existing(paths: list[Path], label: str) -> Path:",
-        "    for path in paths:",
-        "        if path.exists():",
-        "            return path",
-        "    raise RuntimeError(",
-        "        'missing offline RDMA wheel dependency '",
-        "        + label",
-        "        + ': '",
-        "        + ', '.join(str(path) for path in paths)",
-        "    )",
-        "",
-        "def resolve_native_runtime_root(dir_name: str) -> Path:",
-        "    candidates = [",
-        "        closed_sdk_root / 'native' / dir_name,",
-        "        closed_sdk_root / dir_name,",
-        "        target_root / dir_name,",
-        "        Path('/nix_profile/native') / dir_name,",
-        "    ]",
-        "    for path in candidates:",
-        "        if path.is_dir():",
-        "            return path",
-        "    raise RuntimeError(",
-        "        'missing native runtime dir '",
-        "        + dir_name",
-        "        + ': '",
-        "        + ', '.join(str(path) for path in candidates)",
-        "    )",
-        "",
-        "def resolve_native_lib_roots(dir_name: str) -> list[Path]:",
-        "    native_root = resolve_native_runtime_root(dir_name)",
-        "    lib_roots: list[Path] = []",
-        "    seen: set[str] = set()",
-        "    for path in (",
-        "        native_root / 'lib' / 'x86_64-linux-gnu',",
-        "        native_root / 'lib64',",
-        "        native_root / 'lib',",
-        "    ):",
-        "        if not path.is_dir():",
-        "            continue",
-        "        path_key = str(path.resolve())",
-        "        if path_key in seen:",
-        "            continue",
-        "        seen.add(path_key)",
-        "        lib_roots.append(path)",
-        "    if not lib_roots:",
-        "        raise RuntimeError(f'native runtime contains no library dirs: {native_root}')",
-        "    return lib_roots",
-        "",
-        "def resolve_offline_rdma_runtime(target_root: Path, packed_dir_name: str) -> list[str]:",
-        "    packed_lib_roots = resolve_native_lib_roots(packed_dir_name)",
-        "    scan_roots = [closed_sdk_root / 'lib']",
-        "    scan_roots.extend(packed_lib_roots)",
-        "    scan_roots.extend(lib_root / 'libibverbs' for lib_root in packed_lib_roots)",
-        "    runtime_libs: list[str] = []",
-        "    seen_runtime_libs: set[str] = set()",
-        "    for root in scan_roots:",
-        "        if not root.is_dir():",
-            "            continue",
-        "        for path in sorted(root.glob('*.so*')):",
-        "            if not path.is_file():",
-        "                continue",
-        "            path_key = str(path)",
-        "            if path_key in seen_runtime_libs:",
-        "                continue",
-        "            seen_runtime_libs.add(path_key)",
-        "            runtime_libs.append(str(path))",
-        "    if not runtime_libs:",
-        "        raise RuntimeError(f'no offline RDMA runtime shared libraries discovered under {scan_roots}')",
-        "    print(f'wheel finalize: discovered offline RDMA shared libs count={len(runtime_libs)}')",
-        "    return runtime_libs",
-        "",
-        "def smoke_test_abi3_wheel(wheel_path: Path) -> None:",
-        "    for interp in abi3_interpreters:",
-        "        if not Path(interp).exists():",
-        "            raise RuntimeError(f'abi3 interpreter is missing: {interp}')",
-        "    clean_env = os.environ.copy()",
-        "    clean_env.pop('LD_LIBRARY_PATH', None)",
-        "    with tempfile.TemporaryDirectory(prefix='fluxon_pyo3_smoke_') as tmp_dir:",
-        "        tmp_root = Path(tmp_dir)",
-        "        for interp in abi3_interpreters:",
-        "            tag = Path(interp).parents[1].name",
-        "            venv_dir = tmp_root / f'venv_{tag}'",
-        "            subprocess.run([interp, '-m', 'venv', str(venv_dir)], check=True, cwd='/workspace', env=clean_env)",
-        "            venv_python = venv_dir / 'bin' / 'python'",
-        "            try:",
-        "                subprocess.run(",
-        "                    [str(venv_python), '-m', 'pip', 'install', '--no-deps', '--no-cache-dir', str(wheel_path)],",
-        "                    check=True,",
-        "                    cwd='/workspace',",
-        "                    env=clean_env,",
-        "                )",
-        "                subprocess.run(",
-        "                    [str(venv_python), '-c', 'import fluxon_pyo3; print(fluxon_pyo3.__file__)'],",
-        "                    check=True,",
-        "                    cwd='/workspace',",
-        "                    env=clean_env,",
-        "                    capture_output=True,",
-        "                    text=True,",
-        "                )",
-        "                print(f'wheel finalize: abi3 import OK {tag}')",
-        "            except subprocess.CalledProcessError as exc:",
-        "                print(",
-        "                    'wheel finalize: abi3 import warning '\n"
-        "                    + tag\n"
-        "                    + ' exit='\n"
-        "                    + str(exc.returncode)\n"
-        "                    + ' stdout='\n"
-        "                    + exc.stdout.strip()\n"
-        "                    + ' stderr='\n"
-        "                    + exc.stderr.strip()",
-        "                )",
-        "",
-        "def rewrite_wheel_python_init(wheel_path: Path, wau_module) -> None:",
-        "    temp_dir = wau_module.extract_wheel(str(wheel_path))",
-        "    pkg_name = wheel_path.name.split('-', 1)[0]",
-        "    pkg_dir = Path(temp_dir) / pkg_name",
-        "    pkg_dir.mkdir(parents=True, exist_ok=True)",
-        "    init_path = pkg_dir / '__init__.py'",
-        "    init_path.write_text(",
-        "        \"from .fluxon_pyo3 import *\\n\\n\"",
-        "        \"__doc__ = fluxon_pyo3.__doc__\\n\"",
-        "        \"if hasattr(fluxon_pyo3, '__all__'):\\n\"",
-        "        \"    __all__ = fluxon_pyo3.__all__\\n\",",
-        "        encoding='utf-8',",
-        "    )",
-        "    wau_module.create_wheel(str(wheel_path), temp_dir)",
-        "    shutil.rmtree(temp_dir)",
-        "",
-        "if not pack_helper_path.is_file():",
-        "    raise RuntimeError(f'pack helper is missing: {pack_helper_path}')",
-        "pack_helper_dir = str(pack_helper_path.parent)",
-        "if pack_helper_dir not in sys.path:",
-        "    sys.path.insert(0, pack_helper_dir)",
-        "pack_spec = importlib.util.spec_from_file_location('pack_fluxonkv_pylib_helper', pack_helper_path)",
-        "if pack_spec is None or pack_spec.loader is None:",
-        "    raise RuntimeError(f'failed to load pack helper: {pack_helper_path}')",
-        "packmod = importlib.util.module_from_spec(pack_spec)",
-        "sys.modules[pack_spec.name] = packmod",
-        "pack_spec.loader.exec_module(packmod)",
-        "_resolve_vendor_runtime_install_root = packmod._resolve_vendor_runtime_install_root",
-        "_select_vendor_runtime_packaged_replacements = packmod._select_vendor_runtime_packaged_replacements",
-        "_resolve_ibverbs_driver_config_dir = packmod._resolve_ibverbs_driver_config_dir",
-        "_validate_vendor_runtime_wheel_layout = packmod._validate_vendor_runtime_wheel_layout",
-        "_stage_vendor_runtime_closure = packmod._stage_vendor_runtime_closure",
-        "_extract_wheel_runtime_tree = packmod._extract_wheel_runtime_tree",
-        "_ensure_vendor_runtime_soname_aliases = packmod._ensure_vendor_runtime_soname_aliases",
-        "_validate_wheel_bundled_soname_aliases = packmod._validate_wheel_bundled_soname_aliases",
-        "",
-        "if not helper_path.is_file():",
-        "    raise RuntimeError(f'wheel helper is missing: {helper_path}')",
-        "spec = importlib.util.spec_from_file_location('wheel_runtime_helper_module', helper_path)",
-        "if spec is None or spec.loader is None:",
-        "    raise RuntimeError(f'failed to load wheel helper: {helper_path}')",
-        "wau = importlib.util.module_from_spec(spec)",
-        "sys.modules[spec.name] = wau",
-        "spec.loader.exec_module(wau)",
-        "wheels = sorted(release_dir.glob('fluxon_pyo3-*.whl'))",
-        "if not wheels:",
-        "    raise RuntimeError(f'no fluxon_pyo3 wheel found in release dir: {release_dir}')",
-        "wheel_path = wheels[-1]",
-        "validate_zip_archive(wheel_path)",
-        "wau.normalize_wheel_lib_rpaths(str(wheel_path))",
-    ]
-    for step in selected_backend_plan["wheel_finalize_steps"]:
-        step_kind = step["kind"]
-        if step_kind == WHEEL_FINALIZE_STEP_KIND_ADD_OFFLINE_RDMA_SHARED_LIBRARIES:
-            lines.extend(
-                [
-                    f"rdma_runtime_libs = resolve_offline_rdma_runtime(target_root, {json.dumps(step['native_dir_name'])})",
-                    "with tempfile.TemporaryDirectory(prefix='fluxon_offline_rdma_alias_') as tmp_dir:",
-                    "    rdma_runtime_stage_dir = Path(tmp_dir)",
-                    "    rdma_runtime_stage_paths = _ensure_vendor_runtime_soname_aliases(",
-                    "        staged_paths=[Path(path) for path in rdma_runtime_libs],",
-                    "        dest_dir=rdma_runtime_stage_dir,",
-                    "    )",
-                    "    wau.add_shared_libraries(",
-                    "        str(wheel_path),",
-                    "        [str(path) for path in rdma_runtime_stage_paths],",
-                    "    )",
-                ]
-            )
-            continue
-        if step_kind == WHEEL_FINALIZE_STEP_KIND_ADD_NATIVE_PLUGINS:
-            native_object_id = step["native_object_id"]
-            if native_object_id is None:
-                raise RuntimeError(f"wheel finalize step requires native_object_id: {rdma_backend}.{step_kind}")
-            native_dir_name = _native_object_dir_name(object_id=native_object_id)
-            relative_subdir = step["relative_subdir"]
-            if relative_subdir is None:
-                raise RuntimeError(f"wheel finalize step requires relative_subdir: {rdma_backend}.{step_kind}")
-            lines.extend(
-                [
-                    f"native_root = resolve_native_runtime_root({json.dumps(native_dir_name)})",
-                    f"native_lib_roots = resolve_native_lib_roots({json.dumps(native_dir_name)})",
-                ]
-            )
-            plugin_bundle_name = step["plugin_bundle_name"]
-            if plugin_bundle_name is None:
-                raise RuntimeError(
-                    f"wheel finalize native plugins step requires plugin_bundle_name: {rdma_backend}"
-                )
-            lines.extend(
-                [
-                    f"plugins_candidates = [lib_root / {json.dumps(relative_subdir)} for lib_root in native_lib_roots]",
-                    "plugins_dir = next((path for path in plugins_candidates if path.is_dir()), None)",
-                    "if plugins_dir is not None:",
-                    "    extra_lib_candidates = [",
-                ]
-            )
-            for file_name in step["extra_library_file_names"]:
-                lines.append(f"        plugins_dir.parent / {json.dumps(file_name)},")
-            lines.extend(
-                [
-                    "    ]",
-                    "    extra_libs = [path for path in extra_lib_candidates if path.exists()]",
-                    "    with tempfile.TemporaryDirectory(prefix='fluxon_native_plugin_stage_') as tmp_dir:",
-                    f"        stage_dir = Path(tmp_dir) / {json.dumps(plugin_bundle_name)}",
-                    "        shutil.copytree(plugins_dir, stage_dir, symlinks=True)",
-                    "        for lib in extra_libs:",
-                    "            shutil.copy2(lib, stage_dir / lib.name)",
-                    f"        wau.add_plugins(str(wheel_path), str(stage_dir), {json.dumps(plugin_bundle_name)})",
-                    "    print(f'wheel finalize: packaged native plugins from {plugins_dir}')",
-                    "else:",
-                    "    print(",
-                    "        'wheel finalize: native plugin dir is absent, skipped plugins packaging: '",
-                    "        + ', '.join(str(path) for path in plugins_candidates)",
-                    "    )",
-                ]
-            )
-            continue
-        if step_kind == WHEEL_FINALIZE_STEP_KIND_ADD_VENDOR_RUNTIME:
-            lines.extend(
-                [
-                    "vendor_runtime_root, vendor_lib_paths = _resolve_vendor_runtime_install_root(",
-                    "    cargo_target_root=target_root,",
-                    ")",
-                    "with _extract_wheel_runtime_tree(wheel_path) as (wheel_extension_path, wheel_bundled_lib_dirs):",
-                    "    bundled_name_map = {}",
-                    "    for bundled_lib_dir in wheel_bundled_lib_dirs:",
-                    "        bundled_name_map.update(wau.get_repaired_lib_name_map(str(bundled_lib_dir)))",
-                    "    with tempfile.TemporaryDirectory(prefix='fluxon_vendor_runtime_stage_') as tmp_dir:",
-                    "        runtime_stage_dir = Path(tmp_dir)",
-                    "        extra_runtime_libs = _stage_vendor_runtime_closure(",
-                    "            wheel_extension_path=wheel_extension_path,",
-                    "            wheel_bundled_lib_dirs=wheel_bundled_lib_dirs,",
-                    "            vendor_root=vendor_runtime_root,",
-                    "            vendor_lib_paths=vendor_lib_paths,",
-                    "            stage_dir=runtime_stage_dir,",
-                    "            extra_ld_library_roots=[",
-                    f"                Path({CONTAINER_CLOSED_SDK_LIB_PATH!r}),",
-                    "                target_root / 'native_runtime' / 'lib64',",
-                    "                target_root / 'native_runtime' / 'lib',",
-                    "                target_root / 'native_runtime' / 'lib' / 'x86_64-linux-gnu',",
-                    "            ],",
-                    "        )",
-                    "        packaged_replacements = _select_vendor_runtime_packaged_replacements(",
-                    "            packaged_file_names=set(bundled_name_map),",
-                    "            vendor_lib_paths=vendor_lib_paths,",
-                    "        )",
-                    "        bundled_runtime_libs = _ensure_vendor_runtime_soname_aliases(",
-                    "            staged_paths=[*vendor_lib_paths, *extra_runtime_libs],",
-                    "            dest_dir=runtime_stage_dir,",
-                    "        )",
-                    "        wau.add_shared_libraries(",
-                    "            str(wheel_path),",
-                    "            [str(path) for path in bundled_runtime_libs],",
-                    "            packaged_lib_replacements=packaged_replacements,",
-                    "        )",
-                    "vendor_driver_config_dir = _resolve_ibverbs_driver_config_dir(",
-                    "    runtime_root=vendor_runtime_root,",
-                    "    runtime_label='vendor runtime install-root',",
-                    ")",
-                    "wau.add_plugins(str(wheel_path), str(vendor_driver_config_dir), 'libibverbs.d')",
-                    "_validate_wheel_bundled_soname_aliases(wheel_path)",
-                    "_validate_vendor_runtime_wheel_layout(wheel_path)",
-                    "print(f'wheel finalize: packaged vendor runtime from {vendor_runtime_root}')",
-                ]
-            )
-            continue
-        raise RuntimeError(f"unsupported wheel finalize step in rendered plan: {step_kind}")
-    lines.extend(
-        [
-            "rewrite_wheel_python_init(wheel_path, wau)",
-            "validate_zip_archive(wheel_path)",
-            "smoke_test_abi3_wheel(wheel_path)",
-            "validate_zip_archive(wheel_path)",
-            "print(f'wheel finalize: completed {wheel_path}')",
-        ]
-    )
-    return "\n".join(lines)
 def _build_target_cache_descriptor(
     *,
     spec,
