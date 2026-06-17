@@ -328,6 +328,73 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/build_doc_site.py"],
             )
 
+    def test_collect_ci_source_relpaths_includes_rather_no_git_submodule_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            tracked_root = repo_root / "scripts"
+            tracked_root.mkdir(parents=True, exist_ok=True)
+            (tracked_root / "build_doc_site.py").write_text("tracked\n", encoding="utf-8")
+            module_root = repo_root / "fluxon_rs" / "moka"
+            (module_root / "src").mkdir(parents=True, exist_ok=True)
+            (module_root / "Cargo.toml").write_text("module\n", encoding="utf-8")
+            (module_root / "src" / "lib.rs").write_text("pub fn x() {}\n", encoding="utf-8")
+            cfg_path = repo_root / "setup_and_pack" / "rather_no_git_submodule.yaml"
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_path.write_text(
+                "modules:\n"
+                "  - path: fluxon_rs/moka\n"
+                "    repo: https://example.com/moka.git\n"
+                "    checkout: main\n",
+                encoding="utf-8",
+            )
+
+            def fake_check_output(argv, cwd=None):
+                del argv
+                cwd_path = Path(cwd).resolve()
+                if cwd_path == repo_root.resolve():
+                    return b"scripts/build_doc_site.py\0"
+                if cwd_path == module_root.resolve():
+                    return b"Cargo.toml\0src/lib.rs\0"
+                raise AssertionError(f"unexpected git ls-files cwd: {cwd_path}")
+
+            with mock.patch.object(_PACK.subprocess, "check_output", side_effect=fake_check_output):
+                relpaths = _PACK._collect_ci_source_relpaths(repo_root=repo_root)
+
+            self.assertEqual(
+                relpaths,
+                [
+                    "fluxon_rs/moka/Cargo.toml",
+                    "fluxon_rs/moka/src/lib.rs",
+                    "scripts/build_doc_site.py",
+                ],
+            )
+
+    def test_collect_ci_source_relpaths_requires_rather_no_git_submodule_root_to_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            cfg_path = repo_root / "setup_and_pack" / "rather_no_git_submodule.yaml"
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_path.write_text(
+                "modules:\n"
+                "  - path: fluxon_rs/moka\n"
+                "    repo: https://example.com/moka.git\n"
+                "    checkout: main\n",
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(
+                    _PACK,
+                    "_collect_git_listed_source_relpaths",
+                    return_value=["scripts/build_doc_site.py"],
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "requires configured rather_no_git_submodule path to exist",
+                ),
+            ):
+                _PACK._collect_ci_source_relpaths(repo_root=repo_root)
+
     def test_compute_ci_source_digest_uses_selected_git_paths_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

@@ -121,6 +121,9 @@ PROFILE_ID_TO_TRANSPORT_BACKEND = {
     profile_id: transport_backend
     for transport_backend, profile_id in script_utils.TRANSPORT_PROFILE_IDS.items()
 }
+DEFAULT_RATHER_NO_GIT_SUBMODULE_CONFIG_RELPATH = Path(
+    "setup_and_pack/rather_no_git_submodule.yaml"
+)
 
 
 def main() -> int:
@@ -930,7 +933,12 @@ def _git_stage_ci_source_tree(*, repo_root: Path, stage_root: Path) -> list[str]
     return selected
 
 
-def _collect_ci_source_relpaths(*, repo_root: Path) -> list[str]:
+def _collect_git_listed_source_relpaths(
+    *,
+    repo_root: Path,
+    git_root: Path,
+    rel_prefix: str = "",
+) -> list[str]:
     script_utils.require_cmd("git")
     argv = [
         "git",
@@ -940,18 +948,107 @@ def _collect_ci_source_relpaths(*, repo_root: Path) -> list[str]:
         "--exclude-standard",
         "-z",
     ]
-    raw = subprocess.check_output(argv, cwd=str(repo_root))
+    raw = subprocess.check_output(argv, cwd=str(git_root))
     selected: list[str] = []
+    rel_prefix = rel_prefix.strip("/")
     for entry in raw.split(b"\0"):
         if not entry:
             continue
         rel = entry.decode("utf-8").strip()
-        if not rel or _ci_source_relpath_excluded(rel):
+        if not rel:
             continue
-        src_path = (repo_root / rel).resolve()
+        repo_rel = rel if not rel_prefix else f"{rel_prefix}/{rel}"
+        if _ci_source_relpath_excluded(repo_rel):
+            continue
+        src_path = (repo_root / repo_rel).resolve()
         if not src_path.exists():
             continue
-        selected.append(rel)
+        selected.append(repo_rel)
+    return selected
+
+
+def _load_rather_no_git_submodule_source_roots(
+    *,
+    repo_root: Path,
+) -> tuple[tuple[str, Path], ...]:
+    config_path = (repo_root / DEFAULT_RATHER_NO_GIT_SUBMODULE_CONFIG_RELPATH).resolve()
+    if not config_path.exists():
+        return ()
+    raw_cfg = _load_yaml_file(config_path)
+    if raw_cfg is None:
+        return ()
+    if not isinstance(raw_cfg, dict):
+        raise RuntimeError(
+            "rather_no_git_submodule config must be a YAML mapping: "
+            f"{config_path}"
+        )
+    raw_modules = raw_cfg.get("modules")
+    if raw_modules is None:
+        return ()
+    if not isinstance(raw_modules, list):
+        raise RuntimeError(
+            "rather_no_git_submodule config `modules` must be a list: "
+            f"{config_path}"
+        )
+
+    repo_root = repo_root.resolve()
+    selected: list[tuple[str, Path]] = []
+    seen_relpaths: set[str] = set()
+    for index, raw_item in enumerate(raw_modules):
+        if not isinstance(raw_item, dict):
+            raise RuntimeError(
+                "rather_no_git_submodule config entries must be mappings: "
+                f"{config_path} modules[{index}]"
+            )
+        raw_path = raw_item.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise RuntimeError(
+                "rather_no_git_submodule config path must be a non-empty string: "
+                f"{config_path} modules[{index}].path"
+            )
+        rel_path = Path(raw_path.strip())
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise RuntimeError(
+                "rather_no_git_submodule config path must stay within the repo root: "
+                f"{config_path} modules[{index}].path={raw_path!r}"
+            )
+        relpath = rel_path.as_posix()
+        if relpath in seen_relpaths:
+            continue
+        seen_relpaths.add(relpath)
+        module_root = (repo_root / rel_path).resolve()
+        if module_root != repo_root and repo_root not in module_root.parents:
+            raise RuntimeError(
+                "rather_no_git_submodule config path escapes the repo root: "
+                f"{config_path} modules[{index}].path={raw_path!r}"
+            )
+        if not module_root.is_dir():
+            raise RuntimeError(
+                "CI source pack requires configured rather_no_git_submodule path to exist as a directory: "
+                f"path={relpath} resolved={module_root}"
+            )
+        selected.append((relpath, module_root))
+    return tuple(selected)
+
+
+def _collect_ci_source_relpaths(*, repo_root: Path) -> list[str]:
+    repo_root = repo_root.resolve()
+    selected = set(
+        _collect_git_listed_source_relpaths(
+            repo_root=repo_root,
+            git_root=repo_root,
+        )
+    )
+    for relpath, module_root in _load_rather_no_git_submodule_source_roots(
+        repo_root=repo_root
+    ):
+        selected.update(
+            _collect_git_listed_source_relpaths(
+                repo_root=repo_root,
+                git_root=module_root,
+                rel_prefix=relpath,
+            )
+        )
     if not selected:
         raise RuntimeError("git-based CI source selection produced no files")
     return sorted(selected)
