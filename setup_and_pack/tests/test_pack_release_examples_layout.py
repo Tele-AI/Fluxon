@@ -56,6 +56,54 @@ class PackReleaseExamplesLayoutTest(unittest.TestCase):
         self.assertEqual(_PACK_RELEASE._FIXED_TRANSPORT_BACKEND, "tcp_thread")
         self.assertEqual(_PACK_RELEASE._FIXED_TRANSPORT_PROFILE_ID, "fluxon_tcp_thread")
 
+    def test_main_syncs_external_source_repos_before_packing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            release_dir = repo_root / "fluxon_release"
+            sync_script = repo_root / "fluxon_rs" / "scripts" / "rather_no_git_submodule.py"
+            sync_script.parent.mkdir(parents=True, exist_ok=True)
+            sync_script.write_text("print('stub')\n", encoding="utf-8")
+
+            with mock.patch.multiple(
+                _PACK_RELEASE,
+                REPO_ROOT=repo_root,
+                RATHER_NO_GIT_SUBMODULE_PATH=sync_script,
+            ):
+                with (
+                    mock.patch.object(_PACK_RELEASE.script_utils, "reset_stage_summary"),
+                    mock.patch.object(_PACK_RELEASE.script_utils, "print_stage_summary"),
+                    mock.patch.object(_PACK_RELEASE.script_utils, "stage") as stage,
+                    mock.patch.object(_PACK_RELEASE.os, "umask"),
+                    mock.patch.object(_PACK_RELEASE, "_build_arg_parser") as build_parser,
+                    mock.patch.object(_PACK_RELEASE, "__file__", str(repo_root / "setup_and_pack" / "pack_release.py")),
+                    mock.patch.object(_PACK_RELEASE, "_run_pack_steps") as run_pack_steps,
+                    mock.patch.object(_PACK_RELEASE, "_seed_invariant_release_runtime"),
+                    mock.patch.object(_PACK_RELEASE, "_seed_profile_cache_compat_entries"),
+                    mock.patch.object(_PACK_RELEASE, "_find_single") as find_single,
+                    mock.patch.object(_PACK_RELEASE, "load_manylinux_version_static", return_value="manylinux_2_28"),
+                    mock.patch.object(_PACK_RELEASE, "_assert_no_top_level_pyo3_wheel"),
+                    mock.patch.object(_PACK_RELEASE, "_pack_pylib_src"),
+                    mock.patch.object(_PACK_RELEASE, "_pack_ext_images"),
+                    mock.patch.object(_PACK_RELEASE, "_remove_release_test_stack_runtime_residues"),
+                    mock.patch.object(_PACK_RELEASE, "_write_sha256_manifest"),
+                    mock.patch.object(_PACK_RELEASE, "_verify_sha256_manifest"),
+                    mock.patch.object(_PACK_RELEASE.subprocess, "check_call") as check_call,
+                ):
+                    stage.return_value.__enter__.return_value = None
+                    stage.return_value.__exit__.return_value = False
+                    args = mock.Mock(release_dir=None, rdma_backend="closed_sdk", with_tikv_runtime="true")
+                    build_parser.return_value.parse_args.return_value = args
+                    release_dir.mkdir(parents=True, exist_ok=True)
+                    wheel = release_dir / "fluxon-0.2.1.whl"
+                    wheel.write_text("", encoding="utf-8")
+                    find_single.return_value = wheel
+
+                    rc = _PACK_RELEASE.main()
+
+                self.assertEqual(rc, 0)
+                check_call.assert_any_call([sys.executable, str(sync_script)], cwd=str(repo_root))
+                run_pack_steps.assert_called_once()
+
     def test_resolve_examples_dir_prefers_app_examples(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
