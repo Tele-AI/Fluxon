@@ -190,6 +190,14 @@ def test_failed_status_includes_bootstrap_and_service_log_tails() -> None:
         print("PASS: test_failed_status_includes_bootstrap_and_service_log_tails")
 
 
+def test_testbed_template_tikv_uses_low_fd_limits_for_ci_runner() -> None:
+    deployconf = yaml.safe_load((REPO_ROOT / "fluxon_test_stack" / "deployconf_testbed.yml").read_text(encoding="utf-8"))
+    tikv_cfg = deployconf["service"]["tikv"]["entrypoint"]
+    assert "max-open-files = 4096" in tikv_cfg, tikv_cfg
+    assert "max-open-files = 2048" in tikv_cfg, tikv_cfg
+    print("PASS: test_testbed_template_tikv_uses_low_fd_limits_for_ci_runner")
+
+
 def test_direct_supervisor_status_path_is_rejected() -> None:
     module = _load_start_test_bed_module()
     try:
