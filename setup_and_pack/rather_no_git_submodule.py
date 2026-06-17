@@ -9,7 +9,6 @@ so the user can handle their workspace explicitly.
 CLI:
   -c/--config: YAML config path (optional; defaults to
                 setup_and_pack/rather_no_git_submodule.local.yaml when present,
-                otherwise setup_and_pack/rather_no_git_submodule.local.yaml.template,
                 otherwise setup_and_pack/rather_no_git_submodule.yaml)
   -w/--workdir: repo root (optional; defaults to the repo root inferred from this script path)
 
@@ -34,7 +33,6 @@ import yaml
 # Default workdir is inferred from this script path to keep invocation simple and deterministic.
 DEFAULT_WORKDIR: Path = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_REL_PATH: str = "setup_and_pack/rather_no_git_submodule.local.yaml"
-DEFAULT_TEMPLATE_CONFIG_REL_PATH: str = "setup_and_pack/rather_no_git_submodule.local.yaml.template"
 DEFAULT_FALLBACK_CONFIG_REL_PATH: str = "setup_and_pack/rather_no_git_submodule.yaml"
 
 # Keep SSH host key handling non-interactive for CI automation.
@@ -62,11 +60,7 @@ def _git_cmd(cmd: list[str]) -> list[str]:
 
 
 def _resolve_default_config_path(*, workdir: Path) -> Path:
-    for rel_path in (
-        DEFAULT_CONFIG_REL_PATH,
-        DEFAULT_TEMPLATE_CONFIG_REL_PATH,
-        DEFAULT_FALLBACK_CONFIG_REL_PATH,
-    ):
+    for rel_path in (DEFAULT_CONFIG_REL_PATH, DEFAULT_FALLBACK_CONFIG_REL_PATH):
         candidate = (workdir / rel_path).resolve()
         if candidate.exists():
             return candidate
@@ -85,7 +79,6 @@ def main() -> int:
         help=(
             "YAML config path (optional; defaults to "
             f"{DEFAULT_CONFIG_REL_PATH} under workdir when present, otherwise "
-            f"{DEFAULT_TEMPLATE_CONFIG_REL_PATH}, otherwise "
             f"{DEFAULT_FALLBACK_CONFIG_REL_PATH})"
         ),
     )

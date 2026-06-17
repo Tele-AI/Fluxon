@@ -9,7 +9,6 @@ from pathlib import Path
 
 DEFAULT_WORKDIR: Path = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_REL_PATH: str = "setup_and_pack/rather_no_git_submodule.local.yaml"
-DEFAULT_TEMPLATE_CONFIG_REL_PATH: str = "setup_and_pack/rather_no_git_submodule.local.yaml.template"
 DEFAULT_FALLBACK_CONFIG_REL_PATH: str = "setup_and_pack/rather_no_git_submodule.yaml"
 
 
@@ -38,7 +37,6 @@ def main() -> int:
         help=(
             "YAML config path (optional; defaults to "
             f"{DEFAULT_CONFIG_REL_PATH} under workdir when present, otherwise "
-            f"{DEFAULT_TEMPLATE_CONFIG_REL_PATH}, otherwise "
             f"{DEFAULT_FALLBACK_CONFIG_REL_PATH})"
         ),
     )
