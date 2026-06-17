@@ -188,6 +188,12 @@ def _detect_local_ipv4() -> str:
     return "127.0.0.1"
 
 
+def _same_host_local_testbed_host_ip() -> str:
+    # Same-host dual logical nodes must use loopback for every advertised endpoint.
+    # External / bridge addresses are not guaranteed to route back into the runner itself.
+    return "127.0.0.1"
+
+
 def _detect_local_hostname() -> str:
     try:
         return subprocess.check_output(["bash", "-lc", "hostname -s"], text=True).strip()
@@ -767,7 +773,7 @@ def main() -> int:
     start_test_bed_template = _load_yaml_mapping(DEFAULT_START_TEST_BED_TEMPLATE, ctx="start_test_bed template")
 
     host_name = _detect_local_hostname()
-    host_ip = _detect_local_ipv4()
+    host_ip = _same_host_local_testbed_host_ip()
     primary_node_name, secondary_node_name = _local_logical_node_names(host_name)
     primary_hostworkdir, secondary_hostworkdir = _local_logical_hostworkdirs(hostworkdir)
     release_dir = _resolve_repo_root_cli_path(args.release_dir)
