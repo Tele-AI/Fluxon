@@ -699,7 +699,9 @@ pub async fn handle_put_done(
             // Reuse the saturated weight computed above for moka insertion
             let cap_bytes_u32 = saturated_weight_u32;
             let _ = view.spawn("post_put_done_maintenance", async move {
-                // 1) Update prefix-counting index
+                // 1) Update the derived prefix-counting index asynchronously.
+                //    This keeps PutDone lean, but also means CountPrefix visibility
+                //    is not an immediate strong-consistency signal for this put.
                 if do_prefix_index_update {
                     let inner = view_task.master_kv_router().inner();
                     let mut tree = inner.prefix_index.write().await;

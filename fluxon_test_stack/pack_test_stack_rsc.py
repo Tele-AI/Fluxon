@@ -26,15 +26,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 import utils as script_utils
 
 
-CI_SOURCE_ROOT_NAMES: tuple[str, ...] = (
-    "setup_and_pack",
-    "fluxon_py",
-    "fluxon_rs",
-    "deployment",
-    "examples",
-    "fluxon_test_stack",
-    "setup.py",
-)
+CI_SOURCE_ROOT_NAMES: tuple[str, ...] = (".",)
 CI_SOURCE_COMMON_EXCLUDE_REL_PATHS: tuple[str, ...] = (
     "__pycache__/",
     ".pytest_cache/",
@@ -42,18 +34,15 @@ CI_SOURCE_COMMON_EXCLUDE_REL_PATHS: tuple[str, ...] = (
     ".ruff_cache/",
     "*.swp",
 )
-SCRIPTS_EXCLUDE_REL_PATHS: tuple[str, ...] = (
-    *CI_SOURCE_COMMON_EXCLUDE_REL_PATHS,
+CI_SOURCE_STAGE_EXCLUDE_PREFIXES: tuple[str, ...] = (
+    ".dever/",
+    "fluxon_release/",
+    "skills/",
 )
-FLUXON_PY_EXCLUDE_REL_PATHS: tuple[str, ...] = (
-    *CI_SOURCE_COMMON_EXCLUDE_REL_PATHS,
-    "tests/.tmp_fluxon_fs/",
-    "tests/test_api_chan_mpmc/logs/",
-)
-FLUXON_RS_EXCLUDE_REL_PATHS: tuple[str, ...] = (
-    *CI_SOURCE_COMMON_EXCLUDE_REL_PATHS,
-    "target/",
-    ".fluxon_pyo3_inputs.sha256",
+CI_SOURCE_STAGE_EXCLUDE_NAMES: frozenset[str] = frozenset(
+    {
+        ".DS_Store",
+    }
 )
 PACKED_RUNTIME_ROOT_NAMES: tuple[str, ...] = (
     "bin",
@@ -694,6 +683,13 @@ def _build_release_step(
     return step
 
 
+def _profile_release_authority_dir(*, release_dir: Path, profile_id: str) -> Path:
+    # The public tcp_thread profile is a compatibility alias for the top-level release.
+    if profile_id == script_utils.PUBLIC_TRANSPORT_PROFILE_ID:
+        return release_dir.resolve()
+    return (release_dir / "profiles" / profile_id).resolve()
+
+
 def _build_all_profiles_plan(
     *,
     release_dir: Path,
@@ -717,8 +713,10 @@ def _build_all_profiles_plan(
 ) -> list[dict[str, Any]]:
     with_tikv_runtime_value = "true" if with_tikv_runtime else "false"
     plan: list[dict[str, Any]] = []
+    planned_release_dirs: set[Path] = set()
 
     if not skip_top_level_release:
+        planned_release_dirs.add(release_dir.resolve())
         plan.append(
             _build_release_step(
                 scope="top_level_release",
@@ -734,18 +732,23 @@ def _build_all_profiles_plan(
         profile_id = script_utils.TRANSPORT_PROFILE_IDS.get(transport_backend)
         if profile_id is None:
             raise ValueError(f"unsupported transport backend: {transport_backend}")
-        profile_release_dir = (release_dir / "profiles" / profile_id).resolve()
-        plan.append(
-            _build_release_step(
-                scope="profile_release",
-                release_dir=profile_release_dir,
-                transport_backend=transport_backend,
-                rdma_backend=rdma_backend,
-                with_tikv_runtime_value=with_tikv_runtime_value,
-                reuse_existing_release=reuse_existing_release,
-                profile_id=profile_id,
-            )
+        profile_release_dir = _profile_release_authority_dir(
+            release_dir=release_dir,
+            profile_id=profile_id,
         )
+        if profile_release_dir not in planned_release_dirs:
+            planned_release_dirs.add(profile_release_dir)
+            plan.append(
+                _build_release_step(
+                    scope="profile_release",
+                    release_dir=profile_release_dir,
+                    transport_backend=transport_backend,
+                    rdma_backend=rdma_backend,
+                    with_tikv_runtime_value=with_tikv_runtime_value,
+                    reuse_existing_release=reuse_existing_release,
+                    profile_id=profile_id,
+                )
+            )
         command = [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -859,53 +862,31 @@ def _validate_existing_release_dir(*, release_dir: Path) -> None:
 
 
 def _pack_ci_src(*, repo_root: Path, out_path: Path) -> None:
-    scripts_dir = repo_root / "setup_and_pack"
-    fluxon_py = repo_root / "fluxon_py"
-    fluxon_rs = repo_root / "fluxon_rs"
-    setup_py = repo_root / "setup.py"
-    for path in (scripts_dir, fluxon_py, fluxon_rs, setup_py):
+    required_repo_paths = (
+        repo_root / "setup_and_pack",
+        repo_root / "fluxon_py",
+        repo_root / "fluxon_rs",
+        repo_root / "deployment",
+        repo_root / "examples",
+        repo_root / "fluxon_test_stack",
+        repo_root / "setup.py",
+        repo_root / "scripts" / "build_doc_site.py",
+        repo_root / "README.md",
+    )
+    for path in required_repo_paths:
         if not path.exists():
             print(f"Missing required CI source input: {path}")
             raise SystemExit(1)
 
     def build_tarball() -> None:
-        with script_utils.stage("Staging CI sources (rsync + gitignore)"):
+        with script_utils.stage("Staging CI sources (git ls-files)"):
             with tempfile.TemporaryDirectory(prefix="fluxon_pack_test_src_", dir=str(out_path.parent)) as td:
                 stage_root = Path(td)
-                _rsync_stage_filtered(
-                    repo_root=repo_root,
-                    src=scripts_dir,
-                    dst=stage_root / "setup_and_pack",
-                    honor_gitignore=True,
-                    exclude_rel_paths=SCRIPTS_EXCLUDE_REL_PATHS,
-                )
-                _prune_stage_paths(stage_root / "setup_and_pack", SCRIPTS_EXCLUDE_REL_PATHS)
-                _rsync_stage_filtered(
-                    repo_root=repo_root,
-                    src=fluxon_py,
-                    dst=stage_root / "fluxon_py",
-                    honor_gitignore=True,
-                    exclude_rel_paths=FLUXON_PY_EXCLUDE_REL_PATHS,
-                )
-                _prune_stage_paths(stage_root / "fluxon_py", FLUXON_PY_EXCLUDE_REL_PATHS)
-                _rsync_stage_filtered(
-                    repo_root=repo_root,
-                    src=fluxon_rs,
-                    dst=stage_root / "fluxon_rs",
-                    honor_gitignore=True,
-                    exclude_rel_paths=FLUXON_RS_EXCLUDE_REL_PATHS,
-                )
-                _prune_stage_paths(stage_root / "fluxon_rs", FLUXON_RS_EXCLUDE_REL_PATHS)
-                _rsync_stage_filtered(
-                    repo_root=repo_root,
-                    src=setup_py,
-                    dst=stage_root / "setup.py",
-                    honor_gitignore=True,
-                )
+                staged_relpaths = _git_stage_ci_source_tree(repo_root=repo_root, stage_root=stage_root)
                 script_utils.tar_gz(
                     cwd=stage_root,
                     out_path=out_path,
-                    inputs=list(CI_SOURCE_ROOT_NAMES),
+                    inputs=staged_relpaths,
                     honor_vcs_ignores=False,
                 )
 
@@ -913,20 +894,85 @@ def _pack_ci_src(*, repo_root: Path, out_path: Path) -> None:
         rule=script_utils.ArtifactRule(
             name="ci source tarball",
             stamp_path=out_path.parent / f"{out_path.name}.input.sha256",
-            compute_digest=lambda: script_utils.compute_paths_digest(
-                [scripts_dir, fluxon_py, fluxon_rs, setup_py],
-                relative_to=repo_root,
-                mode=script_utils.PathDigestMode.PACK_INPUTS,
-                algorithm=script_utils.PathHashAlgorithm.SHA256,
-                ignored_dir_names=CI_SOURCE_DIGEST_IGNORED_DIR_NAMES,
-                ignored_file_names=CI_SOURCE_DIGEST_IGNORED_FILE_NAMES,
-                ignored_file_suffixes=CI_SOURCE_DIGEST_IGNORED_FILE_SUFFIXES,
-            ),
+            compute_digest=lambda: _compute_ci_source_digest(repo_root=repo_root),
             outputs_ready=out_path.exists,
         ),
         out_path=out_path,
         build_tarball=build_tarball,
     )
+
+
+def _git_stage_ci_source_tree(*, repo_root: Path, stage_root: Path) -> list[str]:
+    selected: list[str] = []
+    seen_dirs: set[str] = set()
+    for rel in _collect_ci_source_relpaths(repo_root=repo_root):
+        src_path = (repo_root / rel).resolve()
+        dst_path = (stage_root / rel).resolve()
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        if src_path.is_symlink():
+            os.symlink(os.readlink(src_path), dst_path)
+        elif src_path.is_file():
+            shutil.copy2(src_path, dst_path)
+        elif src_path.is_dir():
+            dst_path.mkdir(parents=True, exist_ok=True)
+        else:
+            continue
+        selected.append(rel)
+        parent = Path(rel).parent
+        while str(parent) not in (".", ""):
+            parent_str = parent.as_posix()
+            if parent_str not in seen_dirs:
+                seen_dirs.add(parent_str)
+                (stage_root / parent_str).mkdir(parents=True, exist_ok=True)
+            parent = parent.parent
+    if not selected:
+        raise RuntimeError("git-based CI source staging produced no files")
+    return selected
+
+
+def _collect_ci_source_relpaths(*, repo_root: Path) -> list[str]:
+    script_utils.require_cmd("git")
+    argv = [
+        "git",
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ]
+    raw = subprocess.check_output(argv, cwd=str(repo_root))
+    selected: list[str] = []
+    for entry in raw.split(b"\0"):
+        if not entry:
+            continue
+        rel = entry.decode("utf-8").strip()
+        if not rel or _ci_source_relpath_excluded(rel):
+            continue
+        src_path = (repo_root / rel).resolve()
+        if not src_path.exists():
+            continue
+        selected.append(rel)
+    if not selected:
+        raise RuntimeError("git-based CI source selection produced no files")
+    return sorted(selected)
+
+
+def _compute_ci_source_digest(*, repo_root: Path) -> str:
+    return script_utils.compute_paths_digest(
+        [(repo_root / rel).resolve() for rel in _collect_ci_source_relpaths(repo_root=repo_root)],
+        relative_to=repo_root,
+        mode=script_utils.PathDigestMode.PACK_INPUTS,
+        algorithm=script_utils.PathHashAlgorithm.SHA256,
+        ignored_dir_names=CI_SOURCE_DIGEST_IGNORED_DIR_NAMES,
+        ignored_file_names=CI_SOURCE_DIGEST_IGNORED_FILE_NAMES,
+        ignored_file_suffixes=CI_SOURCE_DIGEST_IGNORED_FILE_SUFFIXES,
+    )
+
+
+def _ci_source_relpath_excluded(relpath: str) -> bool:
+    if relpath in CI_SOURCE_STAGE_EXCLUDE_NAMES:
+        return True
+    return any(relpath == prefix.rstrip("/") or relpath.startswith(prefix) for prefix in CI_SOURCE_STAGE_EXCLUDE_PREFIXES)
 
 
 def _pack_ci_ext_rsc(*, repo_root: Path, out_path: Path) -> None:

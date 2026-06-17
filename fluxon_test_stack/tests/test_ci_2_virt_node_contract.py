@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MODULE_PATH = REPO_ROOT / "fluxon_test_stack" / "ci_2_virt_node.py"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("fluxon_test_stack_ci_2_virt_node_contract", MODULE_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_ENTRY = _load_module()
+
+
+class TestCi2VirtNodeContract(unittest.TestCase):
+    def test_generated_suite_is_public_dual_local_nodes_ci_only(self) -> None:
+        suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
+        generated = _ENTRY._rewrite_suite_for_local_dual_nodes(
+            suite_cfg=suite_cfg,
+            scene_ids=["ci_kv", "ci_rust"],
+            primary_node_name="local-node-a",
+            secondary_node_name="local-node-b",
+            host_ip="127.0.0.1",
+            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            controller_port=19080,
+        )
+
+        self.assertEqual(generated["run"]["selectors"]["profile_ids"], ["fluxon_tcp_thread"])
+        self.assertEqual(set(generated["scenes"].keys()), {"ci_kv", "ci_rust"})
+        self.assertEqual(generated["profiles"]["fluxon_tcp_thread"]["artifact_set"], "fluxon_tcp_thread")
+        self.assertEqual(
+            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["command_tokens"]["KV_TRANSPORT_FEATURE"],
+            "tcp_thread_transport",
+        )
+        self.assertEqual(
+            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["deploy"]["target_ip_map"],
+            {"local-node-a": "127.0.0.1", "local-node-b": "127.0.0.1"},
+        )
+        self.assertEqual(
+            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["runtime_contracts"]["cluster_kv_owner"][
+                "base_runtime"
+            ]["etcd"]["endpoint"]["host_port"],
+            19180,
+        )
+        self.assertEqual(
+            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["runtime_contracts"]["cluster_kv_owner"][
+                "base_runtime"
+            ]["greptime"]["endpoint"]["host_port"],
+            19190,
+        )
+        self.assertEqual(
+            generated["artifact_sets"]["fluxon_tcp_thread"]["release_source"]["key_prefix"],
+            "profiles/fluxon_tcp_thread",
+        )
+        self.assertEqual(
+            generated["artifact_sets"]["fluxon_tcp_thread"]["release_artifacts"],
+            {"wheel": "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"},
+        )
+        self.assertEqual(set(generated["artifact_sets"].keys()), {"fluxon_tcp_thread"})
+        self.assertEqual(
+            generated["artifact_sets"]["fluxon_tcp_thread"]["test_rsc_source"]["key_prefix"],
+            "test_rsc/fluxon_tcp_thread",
+        )
+        self.assertEqual(
+            generated["scales"]["n2_kvowner_dram_3gib"]["targets"]["hosts"],
+            ["local-node-a", "local-node-b"],
+        )
+        self.assertEqual(
+            generated["scales"]["n2_kvowner_dram_3gib"]["targets"]["primary"],
+            "local-node-a",
+        )
+        self.assertEqual(
+            generated["scales"]["n2_kvowner_dram_3gib"]["targets"]["secondary"],
+            "local-node-b",
+        )
+        self.assertEqual(
+            generated["scenes"]["ci_kv"]["select"]["scales"],
+            ["n1_kvowner_dram_3gib"],
+        )
+        self.assertEqual(
+            generated["scenes"]["ci_rust"]["select"]["scales"],
+            ["n1_kvowner_dram_20gib"],
+        )
+
+    def test_generated_suite_supports_doc_page_ci_scene(self) -> None:
+        suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
+        generated = _ENTRY._rewrite_suite_for_local_dual_nodes(
+            suite_cfg=suite_cfg,
+            scene_ids=["ci_doc_page"],
+            primary_node_name="local-node-a",
+            secondary_node_name="local-node-b",
+            host_ip="127.0.0.1",
+            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            controller_port=19080,
+        )
+
+        self.assertEqual(set(generated["scenes"].keys()), {"ci_doc_page"})
+        self.assertEqual(
+            generated["scenes"]["ci_doc_page"]["ci"]["runtime_contract"],
+            "rust_self_managed",
+        )
+        prepare = generated["scenes"]["ci_doc_page"]["ci"]["prepare"]
+        self.assertEqual(len(prepare), 1)
+        self.assertEqual(prepare[0]["kind"], "setup_dev_env")
+        self.assertEqual(
+            prepare[0]["config"],
+            "setup_and_pack/setup_dev_env/doc_page_ci.yaml",
+        )
+        commands = generated["scenes"]["ci_doc_page"]["ci"]["commands"]
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["id"], "doc_page_build")
+        self.assertIn("_doc_page_build.py", commands[0]["command"])
+        self.assertEqual(
+            generated["scenes"]["ci_doc_page"]["select"]["scales"],
+            ["n1_kvowner_dram_3gib"],
+        )
+
+    def test_generated_deployconf_rewrites_to_dual_local_nodes(self) -> None:
+        deployconf_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_DEPLOYCONF_TEMPLATE, ctx="deployconf")
+        generated = _ENTRY._rewrite_deployconf_for_local_dual_nodes(
+            deployconf_cfg=deployconf_cfg,
+            primary_node_name="local-node-a",
+            secondary_node_name="local-node-b",
+            host_ip="127.0.0.1",
+            primary_hostworkdir=Path("/tmp/fluxon_testbed/a"),
+            secondary_hostworkdir=Path("/tmp/fluxon_testbed/b"),
+            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            controller_port=19180,
+        )
+
+        self.assertEqual(len(generated["cluster_nodes"]), 2)
+        self.assertEqual(
+            [node["hostname"] for node in generated["cluster_nodes"]],
+            ["local-node-a", "local-node-b"],
+        )
+        self.assertEqual(
+            [node["hostworkdir"] for node in generated["cluster_nodes"]],
+            ["/tmp/fluxon_testbed/a", "/tmp/fluxon_testbed/b"],
+        )
+        self.assertEqual(
+            [node["execution_mode"] for node in generated["cluster_nodes"]],
+            ["local", "local"],
+        )
+        self.assertEqual(generated["global_envs"]["FLUXON_CLUSTER_NODE_IDS"], "local-node-a local-node-b")
+        self.assertEqual(
+            generated["global_envs"]["FLUXON_RELEASE_WHEEL"],
+            "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+        )
+        self.assertEqual(
+            generated["global_envs"]["FLUXON_RELEASE_WHEEL_PY"],
+            "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+        )
+        self.assertEqual(generated["global_envs"]["MASTER__PORT"], "19180")
+        self.assertEqual(
+            generated["global_envs"]["FLUXON_OPS_UI_BASE_URL"],
+            "http://${OPS_CONTROLLER__NODE_ID__IP}:19180",
+        )
+        self.assertIn('--wheel "$FLUXON_RELEASE_WHEEL"', generated["global_envs"]["FLUXON_RELEASE_WHEEL_FETCH_CMD"])
+        self.assertEqual(generated["atomic_groups"]["fluxon_core_controller"]["nodes"], ["local-node-a", "local-node-b"])
+        self.assertEqual(generated["service"]["owner"]["node_bind"]["node"], ["local-node-a", "local-node-b"])
+        self.assertEqual(generated["service"]["ops_controller"]["port"], 19180)
+        self.assertIn("local-node-a", generated["service"]["ops_agent"]["entrypoint"])
+        self.assertIn("local-node-b", generated["service"]["ops_agent"]["entrypoint"])
+
+    def test_generated_start_test_bed_config_points_to_local_authorities(self) -> None:
+        start_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_START_TEST_BED_TEMPLATE, ctx="start_test_bed")
+        generated = _ENTRY._rewrite_start_test_bed_for_local_dual_nodes(
+            start_cfg=start_cfg,
+            generated_deployconf_path=Path("/tmp/deployconf.yaml"),
+            primary_node_name="local-node-a",
+            host_ip="127.0.0.1",
+            controller_port=19080,
+            ui_port=18080,
+            ui_workdir=Path("/tmp/ui"),
+        )
+
+        self.assertEqual(generated["deployconf_path"], "/tmp/deployconf.yaml")
+        self.assertEqual(generated["controller_url"], "http://127.0.0.1:19080/r/ops/fluxon_testbed")
+        self.assertEqual(generated["controller_basic_auth"]["username"], "ops_admin")
+        self.assertEqual(generated["controller_basic_auth"]["password"], "ops_password")
+        self.assertEqual(generated["test_runner_ui"]["workdir"], "/tmp/ui")
+        self.assertIsNone(generated["test_runner_ui"]["gitops_config_path"])
+        self.assertEqual(generated["bootstrap_phases"][0]["node"], "local-node-a")
+
+    def test_generated_apply_check_config_excludes_control_plane_reapply(self) -> None:
+        start_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_START_TEST_BED_TEMPLATE, ctx="start_test_bed")
+        local_cfg = _ENTRY._rewrite_start_test_bed_for_local_dual_nodes(
+            start_cfg=start_cfg,
+            generated_deployconf_path=Path("/tmp/deployconf.yaml"),
+            primary_node_name="local-node-a",
+            host_ip="127.0.0.1",
+            controller_port=19080,
+            ui_port=18080,
+            ui_workdir=Path("/tmp/ui"),
+        )
+
+        generated = _ENTRY._rewrite_start_test_bed_for_apply_check(
+            start_cfg=local_cfg,
+        )
+
+        self.assertEqual(
+            generated["deploy_workloads"],
+            ["fluxon_fs_master", "fluxon_fs_agent"],
+        )
+
+    def test_write_yaml_emits_ascii_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "sample.yaml"
+            _ENTRY._write_yaml(path, {"a": 1, "b": "x"})
+            self.assertTrue(path.is_file())
+            self.assertIn("a: 1", path.read_text(encoding="utf-8"))
+
+    def test_find_single_wheel_prefers_non_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / _ENTRY.PLACEHOLDER_WHEEL_NAME).write_text("", encoding="utf-8")
+            (root / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl").write_text("", encoding="utf-8")
+
+            wheel_name = _ENTRY._find_single_wheel(root, pattern="fluxon-*.whl", ctx="wheel")
+
+            self.assertEqual(wheel_name, "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl")
+
+    def test_ensure_ci_pack_release_env_generates_explicit_companion_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            env_path = root / "generated" / "setup_and_pack" / "pack_fluxonkv_pylib_env.yaml"
+            env_template_path = root / "setup_and_pack" / "pack_fluxonkv_pylib_env.yaml.template"
+            generator_script_path = root / "setup_and_pack" / "ci" / "gen_pack_release_ci_config.py"
+            env_template_path.parent.mkdir(parents=True, exist_ok=True)
+            generator_script_path.parent.mkdir(parents=True, exist_ok=True)
+            env_template_path.write_text("schema_version: 1\n", encoding="utf-8")
+            generator_script_path.write_text("# placeholder\n", encoding="utf-8")
+
+            calls: list[list[str]] = []
+
+            def fake_run(argv: list[str], *, env=None) -> None:
+                del env
+                calls.append(list(argv))
+                env_path.parent.mkdir(parents=True, exist_ok=True)
+                env_path.write_text("schema_version: 1\n", encoding="utf-8")
+
+            with mock.patch.object(_ENTRY, "_run", side_effect=fake_run):
+                generated = _ENTRY._ensure_ci_pack_release_env(
+                    project_data_root=root / "pack_release_runtime",
+                    env_out_path=env_path,
+                    env_template_path=env_template_path,
+                    generator_script_path=generator_script_path,
+                )
+
+            self.assertEqual(generated, env_path.resolve())
+            self.assertEqual(len(calls), 1)
+            self.assertIn(str(generator_script_path.resolve()), calls[0])
+            self.assertIn("--out-path", calls[0])
+            self.assertIn(str(env_path.resolve()), calls[0])
+            self.assertIn(str((root / "pack_release_runtime").resolve()), calls[0])
+
+    def test_prepare_pack_release_runtime_dirs_creates_expected_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "pack_release_runtime"
+
+            _ENTRY._prepare_pack_release_runtime_dirs(project_data_root=root)
+
+            self.assertTrue((root / "manylinux-release").is_dir())
+            self.assertTrue((root / "manylinux-cache" / "cargo-registry").is_dir())
+            self.assertTrue((root / "manylinux-cache" / "cargo-git").is_dir())
+
+    def test_doc_build_env_sets_base_url(self) -> None:
+        env = _ENTRY._doc_build_env(base_url="tele-ai.github.io/Fluxon")
+        self.assertEqual(env["FLUXON_DOC_SITE_BASE_URL"], "tele-ai.github.io/Fluxon")
+
+    def test_doc_build_env_reuses_inherited_base_url(self) -> None:
+        with mock.patch.dict("os.environ", {"FLUXON_DOC_SITE_BASE_URL": "tele-ai.github.io/Fluxon"}, clear=True):
+            env = _ENTRY._doc_build_env(base_url=None)
+        self.assertEqual(env["FLUXON_DOC_SITE_BASE_URL"], "tele-ai.github.io/Fluxon")
+
+    def test_main_passes_generated_start_test_bed_config_to_runner_env(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workdir = root / "ci_2_virt_node_workdir"
+            hostworkdir = root / "hostworkdir"
+            release_dir = REPO_ROOT / "fluxon_release"
+            release_dir.mkdir(parents=True, exist_ok=True)
+            wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path.write_text("", encoding="utf-8")
+            calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+            def fake_run(argv: list[str], *, env=None) -> None:
+                calls.append((list(argv), None if env is None else dict(env)))
+
+            argv = [
+                "ci_2_virt_node.py",
+                "--workdir",
+                str(workdir),
+                "--hostworkdir",
+                str(hostworkdir),
+                "--scene-id",
+                "ci_kv",
+                "--skip-builder-image",
+                "--skip-pack",
+                "--skip-dispatch",
+                "--skip-start-testbed",
+                "--skip-doc-build",
+            ]
+            original_argv = sys.argv[:]
+            try:
+                with mock.patch.object(_ENTRY, "_run", side_effect=fake_run):
+                    with mock.patch.object(_ENTRY, "_detect_local_hostname", return_value="runner-host"):
+                        with mock.patch.object(_ENTRY, "_detect_local_ipv4", return_value="127.0.0.1"):
+                            sys.argv = argv
+                            rc = _ENTRY.main()
+            finally:
+                sys.argv = original_argv
+                wheel_path.unlink(missing_ok=True)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(calls)
+            runner_argv, runner_env = calls[-1]
+            self.assertIsNotNone(runner_env)
+            self.assertEqual(runner_argv[1], str((REPO_ROOT / "fluxon_test_stack" / "test_runner.py").resolve()))
+            self.assertEqual(
+                runner_env[_ENTRY.TEST_STACK_START_TEST_BED_CONFIG_ENV],
+                str((workdir / "generated" / "start_test_bed.local.yaml").resolve()),
+            )
+            self.assertEqual(
+                runner_env["FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT"],
+                str((REPO_ROOT / "fluxon_release").resolve()),
+            )
+
+    def test_main_uses_apply_check_config_for_explicit_apply_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workdir = root / "ci_2_virt_node_workdir"
+            hostworkdir = root / "hostworkdir"
+            release_dir = REPO_ROOT / "fluxon_release"
+            release_dir.mkdir(parents=True, exist_ok=True)
+            wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path.write_text("", encoding="utf-8")
+            calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+            def fake_run(argv: list[str], *, env=None) -> None:
+                calls.append((list(argv), None if env is None else dict(env)))
+
+            argv = [
+                "ci_2_virt_node.py",
+                "--workdir",
+                str(workdir),
+                "--hostworkdir",
+                str(hostworkdir),
+                "--scene-id",
+                "ci_kv",
+                "--skip-builder-image",
+                "--skip-pack",
+                "--skip-dispatch",
+                "--skip-runner",
+                "--skip-doc-build",
+            ]
+            original_argv = sys.argv[:]
+            try:
+                with mock.patch.object(_ENTRY, "_run", side_effect=fake_run):
+                    with mock.patch.object(_ENTRY, "_detect_local_hostname", return_value="runner-host"):
+                        with mock.patch.object(_ENTRY, "_detect_local_ipv4", return_value="127.0.0.1"):
+                            sys.argv = argv
+                            rc = _ENTRY.main()
+            finally:
+                sys.argv = original_argv
+                wheel_path.unlink(missing_ok=True)
+
+            self.assertEqual(rc, 0)
+            start_bed_calls = [
+                call_argv for (call_argv, _) in calls if call_argv[1] == str((REPO_ROOT / "fluxon_test_stack" / "start_test_bed.py").resolve())
+            ]
+            self.assertEqual(len(start_bed_calls), 2)
+            self.assertEqual(
+                start_bed_calls[0][start_bed_calls[0].index("-c") + 1],
+                str((workdir / "generated" / "start_test_bed.local.yaml").resolve()),
+            )
+            self.assertEqual(
+                start_bed_calls[1][start_bed_calls[1].index("-c") + 1],
+                str((workdir / "generated" / "start_test_bed.apply_check.local.yaml").resolve()),
+            )
+
+
+if __name__ == "__main__":
+    raise SystemExit(unittest.main())

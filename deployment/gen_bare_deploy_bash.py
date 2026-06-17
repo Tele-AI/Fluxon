@@ -399,7 +399,7 @@ def _render_standalone_stop_script(
         + "# - Automation must not depend on this path for handover or rollout convergence.\n"
         + "# - The command only asks the shared selection supervisor to retire the concrete selection\n"
         + "#   identity identified by label on this node.\n"
-        + 'if ! python3 "$SELECTION_SUPERVISOR" stop --label "$SUPERVISOR_LABEL" --missing-ok >/dev/null; then\n'
+        + 'if ! python3 "$SELECTION_SUPERVISOR" stop --label "$SUPERVISOR_LABEL" --scope-key "$HOSTWORKDIR" --missing-ok >/dev/null; then\n'
         + '  echo "[bare] stop failed svc=$SERVICE label=$SUPERVISOR_LABEL hostworkdir=$HOSTWORKDIR"\n'
         + "  exit 1\n"
         + "fi\n"
@@ -602,20 +602,21 @@ def _render_proc_lifecycle_pid_tree_helpers() -> str:
 def _render_selection_present_probe_fn() -> str:
     return (
         "selection_present() {\n"
-        + "  python3 - \"$SELECTION_SUPERVISOR\" \"$SUPERVISOR_LABEL\" <<'__FLUXON_SELECTION_PRESENT__'\n"
+        + "  python3 - \"$SELECTION_SUPERVISOR\" \"$SUPERVISOR_LABEL\" \"$HOSTWORKDIR\" <<'__FLUXON_SELECTION_PRESENT__'\n"
         + "import importlib.util\n"
         + "import sys\n"
         + "from pathlib import Path\n"
         + "\n"
         + "supervisor_path = Path(sys.argv[1])\n"
         + "label = sys.argv[2]\n"
+        + "scope_key = sys.argv[3]\n"
         + 'spec = importlib.util.spec_from_file_location("fluxon_selection_supervisor_probe", supervisor_path)\n'
         + "if spec is None or spec.loader is None:\n"
         + '    raise RuntimeError(f"failed to load selection supervisor module: {supervisor_path}")\n'
         + "module = importlib.util.module_from_spec(spec)\n"
         + "sys.modules[spec.name] = module\n"
         + "spec.loader.exec_module(module)\n"
-        + "raise SystemExit(0 if module._selection_present(label) else 1)\n"
+        + "raise SystemExit(0 if module._selection_present(label, scope_key=scope_key) else 1)\n"
         + "__FLUXON_SELECTION_PRESENT__\n"
         + "}\n\n"
     )
@@ -822,7 +823,7 @@ def _render_atomic_group_stop_fn(*, runtime_specs: List[Dict[str, str]]) -> str:
     for spec in runtime_specs:
         supervisor_label = _require_str(spec.get("supervisor_label"), "runtime_specs[].supervisor_label")
         out += f'  SUPERVISOR_LABEL={_sh_quote(supervisor_label)}\n'
-        out += '  if ! python3 "$SELECTION_SUPERVISOR" stop --label "$SUPERVISOR_LABEL" --missing-ok >/dev/null; then\n'
+        out += '  if ! python3 "$SELECTION_SUPERVISOR" stop --label "$SUPERVISOR_LABEL" --scope-key "$HOSTWORKDIR" --missing-ok >/dev/null; then\n'
         out += '    echo "[atomic-group] stop failed group=$GROUP node=$NODE_ID label=$SUPERVISOR_LABEL"\n'
         out += "    STOP_FAILED=1\n"
         out += "  fi\n"
@@ -855,6 +856,7 @@ def _render_selection_supervisor_run_shell(
     return (
         f'python3 {supervisor_expr} {subcommand}'
         + f' --label {label_expr}'
+        + ' --scope-key "$HOSTWORKDIR"'
         + f' --state-json {state_json_expr}'
         + ' --owner-ts-ms "$OWNER_TS_MS"'
         + f" --restart-policy {restart_policy}"

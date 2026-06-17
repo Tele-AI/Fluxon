@@ -3,6 +3,7 @@
 import argparse
 import base64
 import binascii
+import copy
 import fcntl
 import json
 import os
@@ -72,6 +73,17 @@ TEST_RUNNER_UI_DEFAULT_WORKDIR_NAME = "test_runner_ui"
 TEST_RUNNER_UI_LOG_FILENAME = "test_runner_ui.log"
 TEST_RUNNER_UI_HEALTH_POLL_SECONDS = 0.5
 TEST_RUNNER_UI_HEALTH_TIMEOUT_SECONDS = 30.0
+SAME_HOST_LOCAL_MULTI_NODE_MASTER_PORT_OFFSET = 10
+SAME_HOST_LOCAL_MULTI_NODE_FS_MASTER_PANEL_PORT_OFFSET = 20
+SAME_HOST_LOCAL_MULTI_NODE_OPS_CONTROLLER_KV_P2P_PORT_OFFSET = 30
+SAME_HOST_LOCAL_MULTI_NODE_OPS_AGENT_P2P_PORT_BASE_OFFSET = 40
+SAME_HOST_LOCAL_MULTI_NODE_ETCD_CLIENT_PORT_OFFSET = 100
+SAME_HOST_LOCAL_MULTI_NODE_ETCD_PEER_PORT_OFFSET = 101
+SAME_HOST_LOCAL_MULTI_NODE_GREPTIME_PORT_OFFSET = 110
+SAME_HOST_LOCAL_MULTI_NODE_TIKV_PD_PORT_OFFSET = 120
+SAME_HOST_LOCAL_MULTI_NODE_TIKV_PD_PEER_PORT_OFFSET = 121
+SAME_HOST_LOCAL_MULTI_NODE_TIKV_PORT_OFFSET = 130
+SAME_HOST_LOCAL_MULTI_NODE_TIKV_STATUS_PORT_OFFSET = 131
 
 
 class HttpJsonResponseError(ValueError):
@@ -145,7 +157,15 @@ def main() -> None:
         _require_str(config.get("deployconf_path"), "deployconf_path"),
         "deployconf_path",
     )
-    deployconf = _load_yaml_mapping(deployconf_path, "deployconf")
+    deployconf_raw = _load_yaml_mapping(deployconf_path, "deployconf")
+    deployconf, deployconf_normalization_notes = _normalize_bootstrap_deployconf(
+        deployconf=deployconf_raw,
+    )
+    if deployconf_normalization_notes:
+        print(
+            "[startbare.deployconf_normalized] "
+            + json.dumps(deployconf_normalization_notes, sort_keys=True)
+        )
     cluster_nodes = _parse_cluster_nodes(deployconf)
     cluster_name = _parse_cluster_name(deployconf)
     local_node_cfg = _resolve_local_node_cfg(cluster_nodes)
@@ -224,30 +244,13 @@ def main() -> None:
         deployconf=deployconf,
         local_node_cfg=local_node_cfg,
     )
-    if bootstrap_mode in (BOOTSTRAP_MODE_BARE_THEN_APPLY, BOOTSTRAP_MODE_BARE_ONLY):
-        _validate_bare_bootstrap_prerequisites(
-            deployconf=deployconf,
-            cluster_nodes=cluster_nodes,
-            local_node_cfg=local_node_cfg,
-            fixed_bootstrap_batches=fixed_bootstrap_batches,
-            coverage_bootstrap_services=coverage_bootstrap_services,
-        )
-        _validate_ops_agent_snapshot_prerequisites(
-            deployconf=deployconf,
-            cluster_nodes=cluster_nodes,
-            local_node_cfg=local_node_cfg,
-            fixed_bootstrap_batches=fixed_bootstrap_batches,
-            coverage_bootstrap_services=coverage_bootstrap_services,
-        )
-        _validate_local_inotify_capacity(
-            required_inotify_max_user_watches=required_inotify_max_user_watches,
-            required_inotify_max_user_instances=required_inotify_max_user_instances,
-        )
 
     # English note:
     # - This entry is intentionally post-dispatch only.
     # - `pack_release.py`, `fluxon_test_stack/pack_test_stack_rsc.py`, and `manual_dispatch_release.py`
-    #   must already have prepared release artifacts plus generated bare scripts on every target host.
+    #   must already have prepared release artifacts on every target host.
+    # - `start_test_bed.py` regenerates bare scripts from the current normalized deployconf and
+    #   refreshes `${HOSTWORKDIR}/gen_bare_deploy_bash` before any bare bootstrap wave starts.
     # - Runtime ownership has two explicit modes:
     #   `bare_then_apply`: start config-derived bare launch waves -> apply controller workloads -> wait apply ->
     #   apply remaining workloads -> wait apply.
@@ -280,6 +283,31 @@ def main() -> None:
         deployconf_path=deployconf_generation_path,
         daemonset_dir=daemonset_dir,
     )
+    if bootstrap_mode in (BOOTSTRAP_MODE_BARE_THEN_APPLY, BOOTSTRAP_MODE_BARE_ONLY):
+        bare_scripts_dir = workdir / "gen_bare_deploy_bash"
+        _refresh_cluster_bare_deploy_scripts(
+            deployconf_path=deployconf_generation_path,
+            cluster_nodes=cluster_nodes,
+            bare_scripts_dir=bare_scripts_dir,
+        )
+        _validate_bare_bootstrap_prerequisites(
+            deployconf=deployconf,
+            cluster_nodes=cluster_nodes,
+            local_node_cfg=local_node_cfg,
+            fixed_bootstrap_batches=fixed_bootstrap_batches,
+            coverage_bootstrap_services=coverage_bootstrap_services,
+        )
+        _validate_ops_agent_snapshot_prerequisites(
+            deployconf=deployconf,
+            cluster_nodes=cluster_nodes,
+            local_node_cfg=local_node_cfg,
+            fixed_bootstrap_batches=fixed_bootstrap_batches,
+            coverage_bootstrap_services=coverage_bootstrap_services,
+        )
+        _validate_local_inotify_capacity(
+            required_inotify_max_user_watches=required_inotify_max_user_watches,
+            required_inotify_max_user_instances=required_inotify_max_user_instances,
+        )
 
     coverage_bootstrap_excluded_targets: list[dict[str, Any]] = []
     apply_wait_atomic: dict[str, Any] | None = None
@@ -362,19 +390,25 @@ def main() -> None:
                     ctx="initial_delete ordinary",
                 )
             )
-        if controller_handover_selection_names and _selection_has_attached_current_deployment_groups(
-            controller_url=controller_url,
-            deployconf=deployconf,
-            selection_names=controller_handover_selection_names,
-            ctx="initial_delete controller_handover",
-        ):
-            deleted_target_apply_ids.extend(
-                _delete_selection_current_deployment_groups_no_wait(
-                    controller_url=controller_url,
-                    deployconf=deployconf,
-                    selection_names=controller_handover_selection_names,
-                    ctx="initial_delete controller_handover",
+        if controller_handover_selection_names:
+            if _selection_has_attached_current_deployment_groups(
+                controller_url=controller_url,
+                deployconf=deployconf,
+                selection_names=controller_handover_selection_names,
+                ctx="initial_delete controller_handover",
+            ):
+                deleted_target_apply_ids.extend(
+                    _delete_selection_current_deployment_groups_no_wait(
+                        controller_url=controller_url,
+                        deployconf=deployconf,
+                        selection_names=controller_handover_selection_names,
+                        ctx="initial_delete controller_handover",
+                    )
                 )
+            _stop_local_controller_handover_selections(
+                deployconf=deployconf,
+                local_node_cfg=local_node_cfg,
+                selection_names=controller_handover_selection_names,
             )
             _wait_controller_unreachable(
                 controller_url=controller_url,
@@ -583,6 +617,52 @@ def _selection_owns_local_controller_endpoint(
     )
     return "ops_controller" in service_names
 
+
+def _stop_local_controller_handover_selections(
+    *,
+    deployconf: dict[str, Any],
+    local_node_cfg: dict[str, Any],
+    selection_names: list[str],
+) -> list[str]:
+    local_node_name = _require_str(local_node_cfg.get("hostname"), "local_node_cfg.hostname")
+    stopped_service_names: list[str] = []
+    seen_service_names: set[str] = set()
+    for selection_name in _dedup_str_list(selection_names):
+        if not _selection_owns_local_controller_endpoint(
+            deployconf=deployconf,
+            selection_name=selection_name,
+            local_node_name=local_node_name,
+        ):
+            continue
+        service_names = _selection_service_names_for_target_node(
+            deployconf=deployconf,
+            selection_name=selection_name,
+            node_name=local_node_name,
+        )
+        for service_name in service_names:
+            if service_name not in CONTROL_PLANE_HANDOVER_SERVICE_NAMES:
+                continue
+            if service_name in seen_service_names:
+                continue
+            seen_service_names.add(service_name)
+            print(
+                "[startbare.local_controller_handover_stop] "
+                f"node={local_node_name} selection={selection_name} service={service_name}",
+                flush=True,
+            )
+            try:
+                _run_local_stop(
+                    local_node_cfg=local_node_cfg,
+                    service_name=service_name,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "local controller handover stop failed via generated bare stop script: "
+                    f"node={local_node_name} selection={selection_name} service={service_name}"
+                ) from exc
+            stopped_service_names.append(service_name)
+    return stopped_service_names
+
 def _generate_daemonset_artifacts(
     *,
     deployconf_path: Path,
@@ -599,6 +679,442 @@ def _generate_daemonset_artifacts(
         ],
         cwd=REPO_ROOT,
     )
+
+
+def _generate_bare_deploy_scripts(
+    *,
+    deployconf_path: Path,
+    bare_scripts_dir: Path,
+) -> None:
+    _run_subprocess(
+        [
+            sys.executable,
+            str(REPO_ROOT / "deployment" / "gen_bare_deploy_bash.py"),
+            "-c",
+            str(deployconf_path),
+            "-w",
+            str(bare_scripts_dir),
+        ],
+        cwd=REPO_ROOT,
+    )
+
+
+def _refresh_cluster_bare_deploy_scripts(
+    *,
+    deployconf_path: Path,
+    cluster_nodes: dict[str, dict[str, Any]],
+    bare_scripts_dir: Path,
+) -> None:
+    _generate_bare_deploy_scripts(
+        deployconf_path=deployconf_path,
+        bare_scripts_dir=bare_scripts_dir,
+    )
+    for node_name, node_cfg in cluster_nodes.items():
+        hostworkdir = _require_str(node_cfg.get("hostworkdir"), f"cluster_nodes[{node_name}].hostworkdir")
+        ssh_user = _require_str(node_cfg.get("ssh_user"), f"cluster_nodes[{node_name}].ssh_user")
+        dst_dir_s = str(Path(hostworkdir) / "gen_bare_deploy_bash")
+        dst_owner = f"{ssh_user}:{ssh_user}"
+        execution_mode = _require_str(
+            node_cfg.get("execution_mode", "ssh"),
+            f"cluster_nodes[{node_name}].execution_mode",
+        )
+        print(
+            "[startbare.refresh_bare_scripts] "
+            f"node={node_name} execution_mode={execution_mode} dst={dst_dir_s}"
+        )
+        if _cluster_node_is_local(node_cfg):
+            manual_dispatch_release._copy_local_artifact(
+                src_dir=bare_scripts_dir,
+                dst_dir_s=dst_dir_s,
+                dst_owner=dst_owner,
+            )
+            continue
+        ssh_port = _require_int(node_cfg.get("ssh_port"), f"cluster_nodes[{node_name}].ssh_port", min_value=1)
+        ssh_password_raw = node_cfg.get("ssh_password")
+        ssh_password = None if ssh_password_raw is None else _require_str(
+            ssh_password_raw,
+            f"cluster_nodes[{node_name}].ssh_password",
+        )
+        manual_dispatch_release._copy_remote_artifact(
+            src_dir=bare_scripts_dir,
+            dst_dir_s=dst_dir_s,
+            ssh_user=ssh_user,
+            ip=_cluster_node_ssh_host(node_cfg, node_name=node_name),
+            ssh_port=ssh_port,
+            ssh_password=ssh_password,
+            dst_owner=dst_owner,
+        )
+
+
+def _normalize_bootstrap_deployconf(
+    *,
+    deployconf: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    normalized = copy.deepcopy(deployconf)
+    notes: list[str] = []
+    same_host_notes = _rewrite_same_host_local_multi_node_fixed_ports(
+        deployconf=normalized,
+    )
+    notes.extend(same_host_notes)
+    services = normalized.get("service")
+    if not isinstance(services, dict):
+        return normalized, notes
+
+    master_cfg = services.get("master")
+    if isinstance(master_cfg, dict):
+        entrypoint = master_cfg.get("entrypoint")
+        if isinstance(entrypoint, str):
+            normalized_entrypoint, removed = _strip_legacy_master_p2p_listen_port(entrypoint=entrypoint)
+            if removed:
+                master_cfg["entrypoint"] = normalized_entrypoint
+                notes.append("service.master.entrypoint: removed legacy master field p2p_listen_port")
+
+    fluxon_fs_master_cfg = services.get("fluxon_fs_master")
+    if isinstance(fluxon_fs_master_cfg, dict):
+        entrypoint = fluxon_fs_master_cfg.get("entrypoint")
+        if isinstance(entrypoint, str):
+            _require_fluxon_fs_master_panel_prometheus_base_url(
+                entrypoint=entrypoint,
+            )
+
+    greptime_cfg = services.get("greptime")
+    if isinstance(greptime_cfg, dict):
+        entrypoint = greptime_cfg.get("entrypoint")
+        if isinstance(entrypoint, str):
+            _require_greptime_loopback_bind_addrs(
+                entrypoint=entrypoint,
+            )
+    return normalized, notes
+
+
+def _rewrite_same_host_local_multi_node_fixed_ports(
+    *,
+    deployconf: dict[str, Any],
+) -> list[str]:
+    cluster_nodes = deployconf.get("cluster_nodes")
+    if not isinstance(cluster_nodes, list) or len(cluster_nodes) < 2:
+        return []
+    for idx, raw_node in enumerate(cluster_nodes):
+        if not isinstance(raw_node, dict):
+            raise ValueError(f"deployconf.cluster_nodes[{idx}] must be a mapping")
+        execution_mode = _require_str(
+            raw_node.get("execution_mode", "ssh"),
+            f"deployconf.cluster_nodes[{idx}].execution_mode",
+        )
+        if execution_mode != "local":
+            return []
+
+    global_envs = deployconf.get("global_envs")
+    if not isinstance(global_envs, dict):
+        raise ValueError("deployconf.global_envs must be a mapping")
+    services = deployconf.get("service")
+    if not isinstance(services, dict):
+        raise ValueError("deployconf.service must be a mapping")
+
+    controller_port = _require_port_number(
+        global_envs.get("MASTER__PORT"),
+        "deployconf.global_envs.MASTER__PORT",
+    )
+    plan = _build_same_host_local_multi_node_port_plan(
+        controller_port=controller_port,
+        node_count=len(cluster_nodes),
+    )
+
+    etcd_cfg = _require_mapping(services.get("etcd"), "deployconf.service.etcd")
+    greptime_cfg = _require_mapping(services.get("greptime"), "deployconf.service.greptime")
+    tikv_pd_cfg = _require_mapping(services.get("tikv_pd"), "deployconf.service.tikv_pd")
+    tikv_cfg = _require_mapping(services.get("tikv"), "deployconf.service.tikv")
+    master_cfg = _require_mapping(services.get("master"), "deployconf.service.master")
+    ops_agent_cfg = _require_mapping(services.get("ops_agent"), "deployconf.service.ops_agent")
+    ops_controller_cfg = _require_mapping(services.get("ops_controller"), "deployconf.service.ops_controller")
+
+    global_envs["TIKV_PD_PEER_PORT"] = str(plan["tikv_pd_peer_port"])
+    global_envs["TIKV_STATUS_FULL_ADDRESS"] = (
+        "${${TIKV__NODE_ID}__IP}:" + str(plan["tikv_status_port"])
+    )
+    global_envs["FLUXON_FS_MASTER_PANEL_BASE_URL"] = (
+        f"http://${{FLUXON_FS_MASTER__NODE_ID__IP}}:{plan['fs_master_panel_port']}"
+    )
+    global_envs["FLUXON_FS_MASTER_PANEL_LISTEN_ADDR"] = (
+        f"0.0.0.0:{plan['fs_master_panel_port']}"
+    )
+
+    _set_service_port(etcd_cfg, port=plan["etcd_client_port"])
+    _set_service_port(greptime_cfg, port=plan["greptime_port"])
+    _set_service_port(tikv_pd_cfg, port=plan["tikv_pd_port"])
+    _set_service_port(tikv_cfg, port=plan["tikv_port"])
+
+    etcd_entrypoint = _require_str(etcd_cfg.get("entrypoint"), "deployconf.service.etcd.entrypoint")
+    etcd_entrypoint = _replace_expected_substring(
+        value=etcd_entrypoint,
+        old="http://0.0.0.0:33579",
+        new=f"http://0.0.0.0:{plan['etcd_client_port']}",
+        ctx="deployconf.service.etcd.entrypoint client port",
+    )
+    etcd_entrypoint = _replace_expected_substring(
+        value=etcd_entrypoint,
+        old="http://0.0.0.0:2480",
+        new=f"http://0.0.0.0:{plan['etcd_peer_port']}",
+        ctx="deployconf.service.etcd.entrypoint peer port",
+    )
+    etcd_cfg["entrypoint"] = etcd_entrypoint
+
+    greptime_entrypoint = _require_str(
+        greptime_cfg.get("entrypoint"),
+        "deployconf.service.greptime.entrypoint",
+    )
+    greptime_cfg["entrypoint"] = _replace_expected_substring(
+        value=greptime_entrypoint,
+        old="--http-addr 0.0.0.0:35030",
+        new=f"--http-addr 0.0.0.0:{plan['greptime_port']}",
+        ctx="deployconf.service.greptime.entrypoint http addr",
+    )
+
+    master_entrypoint = _require_str(master_cfg.get("entrypoint"), "deployconf.service.master.entrypoint")
+    master_cfg["entrypoint"] = _replace_expected_substring(
+        value=master_entrypoint,
+        old="port: 51051",
+        new=f"port: {plan['master_port']}",
+        ctx="deployconf.service.master.entrypoint port",
+    )
+
+    ops_controller_entrypoint = _require_str(
+        ops_controller_cfg.get("entrypoint"),
+        "deployconf.service.ops_controller.entrypoint",
+    )
+    ops_controller_cfg["entrypoint"] = _replace_expected_substring(
+        value=ops_controller_entrypoint,
+        old="p2p_listen_port: 12102",
+        new=f"p2p_listen_port: {plan['ops_controller_kv_p2p_port']}",
+        ctx="deployconf.service.ops_controller.entrypoint kv p2p_listen_port",
+    )
+
+    ops_agent_entrypoint = _require_str(
+        ops_agent_cfg.get("entrypoint"),
+        "deployconf.service.ops_agent.entrypoint",
+    )
+    ops_agent_cfg["entrypoint"] = _rewrite_ops_agent_case_ports(
+        entrypoint=ops_agent_entrypoint,
+        replacement_ports=plan["ops_agent_ports"],
+    )
+
+    return [
+        "same_host_local_multi_node: rewrote fixed host-listen ports from controller anchor "
+        f"{controller_port}"
+    ]
+
+
+def _build_same_host_local_multi_node_port_plan(
+    *,
+    controller_port: int,
+    node_count: int,
+) -> dict[str, Any]:
+    if node_count < 2:
+        raise ValueError("same-host local multi-node port plan requires at least two nodes")
+
+    ops_agent_ports = [
+        controller_port + SAME_HOST_LOCAL_MULTI_NODE_OPS_AGENT_P2P_PORT_BASE_OFFSET + idx
+        for idx in range(node_count)
+    ]
+    plan = {
+        "master_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_MASTER_PORT_OFFSET,
+        "fs_master_panel_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_FS_MASTER_PANEL_PORT_OFFSET,
+        "ops_controller_kv_p2p_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_OPS_CONTROLLER_KV_P2P_PORT_OFFSET,
+        "ops_agent_ports": ops_agent_ports,
+        "etcd_client_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_ETCD_CLIENT_PORT_OFFSET,
+        "etcd_peer_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_ETCD_PEER_PORT_OFFSET,
+        "greptime_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_GREPTIME_PORT_OFFSET,
+        "tikv_pd_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_TIKV_PD_PORT_OFFSET,
+        "tikv_pd_peer_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_TIKV_PD_PEER_PORT_OFFSET,
+        "tikv_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_TIKV_PORT_OFFSET,
+        "tikv_status_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_TIKV_STATUS_PORT_OFFSET,
+    }
+    max_port = max(
+        int(plan["master_port"]),
+        int(plan["fs_master_panel_port"]),
+        int(plan["ops_controller_kv_p2p_port"]),
+        int(plan["etcd_client_port"]),
+        int(plan["etcd_peer_port"]),
+        int(plan["greptime_port"]),
+        int(plan["tikv_pd_port"]),
+        int(plan["tikv_pd_peer_port"]),
+        int(plan["tikv_port"]),
+        int(plan["tikv_status_port"]),
+        *(int(port) for port in ops_agent_ports),
+    )
+    if max_port > 65535:
+        raise ValueError(
+            "same-host local multi-node port plan exceeds 65535; "
+            f"controller_port={controller_port} max_port={max_port}"
+        )
+    return plan
+
+
+def _require_port_number(value: Any, field_name: str) -> int:
+    port: int
+    if isinstance(value, int):
+        port = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            port = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be a valid integer port") from exc
+    else:
+        raise ValueError(f"{field_name} must be a valid integer port")
+    if not (1 <= port <= 65535):
+        raise ValueError(f"{field_name} must be in range 1..65535")
+    return port
+
+
+def _set_service_port(service_cfg: dict[str, Any], *, port: int) -> None:
+    service_cfg["port"] = int(port)
+    if "in_container_port" in service_cfg:
+        service_cfg["in_container_port"] = int(port)
+
+
+def _replace_expected_substring(*, value: str, old: str, new: str, ctx: str) -> str:
+    if old in value:
+        return value.replace(old, new)
+    if new in value:
+        return value
+    raise ValueError(f"{ctx} missing expected fragment: {old!r}")
+
+
+def _rewrite_ops_agent_case_ports(
+    *,
+    entrypoint: str,
+    replacement_ports: list[int],
+) -> str:
+    lines = entrypoint.splitlines(keepends=True)
+    matched_indexes: list[int] = []
+    next_port_idx = 0
+    for idx, line in enumerate(lines):
+        if "OPS_AGENT_P2P_LISTEN_PORT=" not in line:
+            continue
+        matched_indexes.append(idx)
+        if next_port_idx >= len(replacement_ports):
+            raise ValueError(
+                "deployconf.service.ops_agent.entrypoint has more fixed p2p port assignments "
+                f"than local nodes: line_count={len(matched_indexes)} node_count={len(replacement_ports)}"
+            )
+        prefix, _, suffix = line.partition("OPS_AGENT_P2P_LISTEN_PORT=")
+        if not suffix:
+            raise ValueError("deployconf.service.ops_agent.entrypoint contains an empty p2p assignment")
+        trailing = ""
+        stripped_suffix = suffix.rstrip("\n")
+        if suffix.endswith("\n"):
+            trailing = "\n"
+        lines[idx] = (
+            f"{prefix}OPS_AGENT_P2P_LISTEN_PORT={replacement_ports[next_port_idx]}{trailing}"
+        )
+        next_port_idx += 1
+    if not matched_indexes:
+        raise ValueError("deployconf.service.ops_agent.entrypoint is missing fixed p2p port assignments")
+    if next_port_idx != len(replacement_ports):
+        raise ValueError(
+            "deployconf.service.ops_agent.entrypoint fixed p2p port assignments do not match local node count: "
+            f"line_count={next_port_idx} node_count={len(replacement_ports)}"
+        )
+    return "".join(lines)
+
+
+def _require_mapping(value: Any, field_name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be a mapping")
+    return value
+
+
+def _strip_legacy_master_p2p_listen_port(*, entrypoint: str) -> tuple[str, bool]:
+    lines = entrypoint.splitlines(keepends=True)
+    out_lines: list[str] = []
+    in_yaml_heredoc = False
+    removed = False
+    for line in lines:
+        stripped = line.strip()
+        if in_yaml_heredoc:
+            if stripped == "YAML":
+                in_yaml_heredoc = False
+                out_lines.append(line)
+                continue
+            if stripped.startswith("p2p_listen_port:"):
+                removed = True
+                continue
+            out_lines.append(line)
+            continue
+        out_lines.append(line)
+        if stripped.startswith("cat >") and "<<YAML" in stripped:
+            in_yaml_heredoc = True
+    return "".join(out_lines), removed
+
+
+def _require_fluxon_fs_master_panel_prometheus_base_url(*, entrypoint: str) -> None:
+    lines = entrypoint.splitlines(keepends=True)
+    in_yaml_heredoc = False
+    in_master_panel_block = False
+    master_panel_indent = 0
+    has_prometheus_base_url = False
+
+    for line in lines:
+        stripped = line.strip()
+        current_indent = len(line) - len(line.lstrip(" "))
+
+        if in_yaml_heredoc and in_master_panel_block:
+            if stripped == "YAML" or (
+                stripped
+                and not line.lstrip(" ").startswith("#")
+                and current_indent <= master_panel_indent
+            ):
+                if not has_prometheus_base_url:
+                    raise ValueError(
+                        "deployconf.service.fluxon_fs_master.entrypoint is missing "
+                        "fluxon_fs.master_panel.prometheus_base_url"
+                    )
+                in_master_panel_block = False
+                has_prometheus_base_url = False
+
+        if in_yaml_heredoc:
+            if stripped == "YAML":
+                in_yaml_heredoc = False
+                continue
+            if stripped == "master_panel:":
+                in_master_panel_block = True
+                master_panel_indent = current_indent
+                has_prometheus_base_url = False
+                continue
+            if in_master_panel_block:
+                if stripped.startswith("prometheus_base_url:"):
+                    has_prometheus_base_url = True
+            continue
+
+        if stripped.startswith("cat >") and "<<YAML" in stripped:
+            in_yaml_heredoc = True
+
+    if in_master_panel_block and not has_prometheus_base_url:
+        raise ValueError(
+            "deployconf.service.fluxon_fs_master.entrypoint is missing "
+            "fluxon_fs.master_panel.prometheus_base_url"
+        )
+
+
+def _require_greptime_loopback_bind_addrs(*, entrypoint: str) -> None:
+    if "greptime standalone start" not in entrypoint:
+        return
+
+    has_rpc_bind_addr = "--rpc-bind-addr" in entrypoint
+    has_mysql_addr = "--mysql-addr" in entrypoint
+    has_postgres_addr = "--postgres-addr" in entrypoint
+    missing: list[str] = []
+    if not has_rpc_bind_addr:
+        missing.append("--rpc-bind-addr 127.0.0.1:$((GREPTIME__PORT + 1))")
+    if not has_mysql_addr:
+        missing.append("--mysql-addr 127.0.0.1:$((GREPTIME__PORT + 2))")
+    if not has_postgres_addr:
+        missing.append("--postgres-addr 127.0.0.1:$((GREPTIME__PORT + 3))")
+    if missing:
+        raise ValueError(
+            "deployconf.service.greptime.entrypoint is missing required loopback bind flags: "
+            + ", ".join(missing)
+        )
 
 
 def _read_local_release_manifest_sha256(
@@ -1167,6 +1683,9 @@ def _parse_cluster_nodes(deployconf: dict[str, Any]) -> dict[str, dict[str, Any]
         hostname = _require_str(raw_node.get("hostname"), "cluster_nodes[].hostname")
         _require_str(raw_node.get("ip"), f"cluster_nodes[{hostname}].ip")
         _require_str(raw_node.get("hostworkdir"), f"cluster_nodes[{hostname}].hostworkdir")
+        execution_mode = raw_node.get("execution_mode", "ssh")
+        if not isinstance(execution_mode, str) or execution_mode.strip() not in {"ssh", "local"}:
+            raise ValueError(f"cluster_nodes[{hostname}].execution_mode must be 'ssh' or 'local'")
         _require_str(raw_node.get("ssh_user"), f"cluster_nodes[{hostname}].ssh_user")
         _require_int(raw_node.get("ssh_port"), f"cluster_nodes[{hostname}].ssh_port", min_value=1)
         ssh_password = raw_node.get("ssh_password")
@@ -1174,7 +1693,9 @@ def _parse_cluster_nodes(deployconf: dict[str, Any]) -> dict[str, dict[str, Any]
             raise ValueError(f"cluster_nodes[{hostname}].ssh_password must be a non-empty string when present")
         if hostname in out:
             raise ValueError(f"Duplicate cluster_nodes hostname: {hostname}")
-        out[hostname] = raw_node
+        node_cfg = dict(raw_node)
+        node_cfg["execution_mode"] = execution_mode.strip()
+        out[hostname] = node_cfg
     return out
 
 
@@ -1264,11 +1785,38 @@ def _parse_name_list(raw: Any, *, field_name: str) -> list[str]:
 
 
 def _resolve_local_node_cfg(cluster_nodes: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    local_nodes = [node_cfg for node_cfg in cluster_nodes.values() if _cluster_node_is_local(node_cfg)]
+    if local_nodes:
+        local_hostname = subprocess.check_output(["hostname"], text=True).strip()
+        local_controller_nodes = [
+            node_cfg
+            for node_cfg in local_nodes
+            if _require_str(node_cfg.get("hostname"), "cluster_nodes[].hostname") == local_hostname
+        ]
+        if local_controller_nodes:
+            return local_controller_nodes[0]
+        return local_nodes[0]
     local_hostname = subprocess.check_output(["hostname"], text=True).strip()
     node_cfg = cluster_nodes.get(local_hostname)
     if node_cfg is None:
         raise ValueError(f"Current hostname is not present in deployconf.cluster_nodes: {local_hostname}")
     return node_cfg
+
+
+def _cluster_node_is_local(node_cfg: dict[str, Any]) -> bool:
+    execution_mode = _require_str(node_cfg.get("execution_mode", "ssh"), "cluster_nodes[].execution_mode")
+    return execution_mode == "local"
+
+
+def _cluster_node_is_local_name(
+    cluster_nodes: dict[str, dict[str, Any]],
+    *,
+    node_name: str,
+) -> bool:
+    node_cfg = cluster_nodes.get(node_name)
+    if node_cfg is None:
+        raise ValueError(f"unknown cluster node: {node_name}")
+    return _cluster_node_is_local(node_cfg)
 
 
 def _validate_fixed_bootstrap_batches(
@@ -2179,7 +2727,7 @@ def _validate_bare_bootstrap_prerequisites(
         coverage_bootstrap_services=coverage_bootstrap_services,
     )
     for node_name, node_cfg in cluster_nodes.items():
-        if node_name != local_node_name:
+        if not _cluster_node_is_local(node_cfg):
             continue
         hostworkdir = _require_str(node_cfg.get("hostworkdir"), f"cluster_nodes[{node_name}].hostworkdir")
         services = sorted(bare_target_services.get(node_name, set()))
@@ -2223,7 +2771,7 @@ def _validate_ops_agent_snapshot_prerequisites(
                 validated_targets.add(target_key)
                 hostworkdir = _require_str(node_cfg.get("hostworkdir"), f"cluster_nodes[{node_name}].hostworkdir")
                 snapshot_path = _ops_agent_desired_snapshot_path(hostworkdir=hostworkdir, node_name=node_name)
-                if node_name == local_node_name:
+                if _cluster_node_is_local(node_cfg):
                     raw_bytes = _read_local_file_bytes_if_exists(snapshot_path)
                 else:
                     raw_bytes = _read_remote_file_bytes_if_exists(
@@ -2980,15 +3528,15 @@ def _run_bare_waves(
             )
             print(
                 "[startbare.run_bare_wave] "
-                f"mode={'local' if node_name == local_node_name else 'remote'} "
+                f"mode={'local' if _cluster_node_is_local(node_cfg) else 'remote'} "
                 f"node={node_name} selection={selection_name} script={bare_script_name} "
                 f"bootstrap_log={bootstrap_log_path}"
             )
-            if node_name == local_node_name:
+            if _cluster_node_is_local(node_cfg):
                 allow_already_present = selection_name in bootstrap_bare_services
                 launched_results.append(
                     _spawn_local_start(
-                        local_node_cfg=local_node_cfg,
+                        local_node_cfg=node_cfg,
                         selection_name=selection_name,
                         bare_script_name=bare_script_name,
                         bootstrap_log_path=bootstrap_log_path,

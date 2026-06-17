@@ -741,12 +741,14 @@ struct SelectionSupervisorLaunchState {
 
 struct SelectionSupervisorTarget {
     label: String,
+    scope_key: String,
 }
 
 #[derive(Clone)]
 struct SelectionSupervisorRuntime {
     python_exe: PathBuf,
     script_path: PathBuf,
+    scope_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -802,6 +804,7 @@ struct SupervisorBackedWorkloads {
     op_guard: std::sync::Mutex<()>,
     log_dir: PathBuf,
     supervisor_runtime: SelectionSupervisorRuntime,
+    scope_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1033,6 +1036,7 @@ impl SelectionSupervisorRuntime {
         Ok(Self {
             python_exe,
             script_path,
+            scope_key: hostworkdir.display().to_string(),
         })
     }
 
@@ -1043,6 +1047,7 @@ impl SelectionSupervisorRuntime {
     ) -> anyhow::Result<SelectionSupervisorTarget> {
         Ok(SelectionSupervisorTarget {
             label: selection_supervisor_label_from_workload_name(kind, workload_name)?,
+            scope_key: self.scope_key.clone(),
         })
     }
 
@@ -1059,6 +1064,7 @@ impl SelectionSupervisorRuntime {
     ) -> std::process::Command {
         let mut cmd = self.command_base(subcommand);
         cmd.arg("--label").arg(&target.label);
+        cmd.arg("--scope-key").arg(&target.scope_key);
         cmd
     }
 
@@ -1155,6 +1161,8 @@ impl SelectionSupervisorRuntime {
             "run".to_string(),
             "--label".to_string(),
             target.label.clone(),
+            "--scope-key".to_string(),
+            target.scope_key.clone(),
             "--state-json".to_string(),
             state_json,
             "--owner-ts-ms".to_string(),
@@ -1389,6 +1397,7 @@ fn selection_supervisor_proc_snapshot() -> anyhow::Result<SelectionSupervisorPro
 fn live_selection_supervisors(
     snapshot: &SelectionSupervisorProcSnapshot,
     label_filter: Option<&str>,
+    scope_key_filter: Option<&str>,
 ) -> anyhow::Result<Vec<LiveSelectionSupervisor>> {
     let mut out: Vec<LiveSelectionSupervisor> = Vec::new();
     for (pid, args) in snapshot.cmdlines.iter() {
@@ -1403,6 +1412,12 @@ fn live_selection_supervisors(
         };
         if let Some(expected) = label_filter {
             if label != expected {
+                continue;
+            }
+        }
+        let runtime_scope_key = selection_supervisor_cmd_arg_value(args.as_slice(), "--scope-key");
+        if let Some(expected_scope_key) = scope_key_filter {
+            if runtime_scope_key != Some(expected_scope_key) {
                 continue;
             }
         }
@@ -1477,9 +1492,10 @@ fn workload_identity_from_selection_label(label: &str) -> anyhow::Result<(Worklo
 fn selection_owner_supervisor(
     snapshot: &SelectionSupervisorProcSnapshot,
     label: &str,
+    scope_key: Option<&str>,
     exclude_pid: Option<u32>,
 ) -> anyhow::Result<Option<LiveSelectionSupervisor>> {
-    let owners: Vec<LiveSelectionSupervisor> = live_selection_supervisors(snapshot, Some(label))?
+    let owners: Vec<LiveSelectionSupervisor> = live_selection_supervisors(snapshot, Some(label), scope_key)?
         .into_iter()
         .filter(|supervisor| exclude_pid != Some(supervisor.pid()))
         .collect();
@@ -1640,16 +1656,17 @@ fn selection_status_from_live_supervisor(
     }
 }
 
-fn observe_selection_status(
+fn observe_selection_status_for_scope(
     kind: WorkloadKind,
     name: &str,
     authority: &str,
+    scope_key: Option<&str>,
 ) -> anyhow::Result<SelectionSupervisorStatus> {
     let name = validate_workload_name_for_file(name)?;
     let authority = validate_workload_name_for_file(authority)?;
     let label = selection_supervisor_label_from_workload_name(kind, name.as_str())?;
     let snapshot = selection_supervisor_proc_snapshot()?;
-    let owner = selection_owner_supervisor(&snapshot, label.as_str(), None)?;
+    let owner = selection_owner_supervisor(&snapshot, label.as_str(), scope_key, None)?;
     let Some(owner) = owner else {
         let container_orphan_zombie_pids = container_orphan_zombie_pids(&snapshot);
         let status_hint =
@@ -1692,14 +1709,23 @@ fn observe_selection_status(
     Ok(status)
 }
 
+fn observe_selection_status(
+    kind: WorkloadKind,
+    name: &str,
+    authority: &str,
+) -> anyhow::Result<SelectionSupervisorStatus> {
+    observe_selection_status_for_scope(kind, name, authority, None)
+}
+
 fn observe_all_selection_statuses_for_snapshot(
     snapshot: &SelectionSupervisorProcSnapshot,
+    scope_key: Option<&str>,
 ) -> anyhow::Result<Vec<SelectionSupervisorStatus>> {
     // English note: list_workloads/wait_delete_apply must derive owner and identity from one
     // snapshot. Re-snapshotting between "pick owner" and "read status" lets a newer supervisor
     // win owner_ts_ms while still lacking runtime_state, which falsely poisons teardown.
     let mut owners_by_label: BTreeMap<String, LiveSelectionSupervisor> = BTreeMap::new();
-    for supervisor in live_selection_supervisors(snapshot, None)? {
+    for supervisor in live_selection_supervisors(snapshot, None, scope_key)? {
         let replace = match owners_by_label.get(supervisor.label.as_str()) {
             Some(current) if current.owner_ts_ms == supervisor.owner_ts_ms => {
                 anyhow::bail!(
@@ -1743,19 +1769,20 @@ fn observe_all_selection_statuses_for_snapshot(
 
 fn observe_all_selection_statuses() -> anyhow::Result<Vec<SelectionSupervisorStatus>> {
     let snapshot = selection_supervisor_proc_snapshot()?;
-    observe_all_selection_statuses_for_snapshot(&snapshot)
+    observe_all_selection_statuses_for_snapshot(&snapshot, None)
 }
 
 fn observe_apply_runtime_statuses_for_snapshot(
     apply_id: &str,
     snapshot: &SelectionSupervisorProcSnapshot,
+    scope_key: Option<&str>,
 ) -> anyhow::Result<Vec<SelectionSupervisorStatus>> {
     let apply_id = apply_id.trim();
     if apply_id.is_empty() {
         anyhow::bail!("apply_id must be non-empty");
     }
     let mut out: Vec<SelectionSupervisorStatus> = Vec::new();
-    for supervisor in live_selection_supervisors(snapshot, None)? {
+    for supervisor in live_selection_supervisors(snapshot, None, scope_key)? {
         let Some(runtime_state) = supervisor.runtime_state.as_ref() else {
             continue;
         };
@@ -1797,19 +1824,20 @@ fn observe_apply_runtime_statuses(
     apply_id: &str,
 ) -> anyhow::Result<Vec<SelectionSupervisorStatus>> {
     let snapshot = selection_supervisor_proc_snapshot()?;
-    observe_apply_runtime_statuses_for_snapshot(apply_id, &snapshot)
+    observe_apply_runtime_statuses_for_snapshot(apply_id, &snapshot, None)
 }
 
-fn wait_for_selection_present(
+fn wait_for_selection_present_for_scope(
     kind: WorkloadKind,
     name: &str,
     authority: &str,
+    scope_key: Option<&str>,
 ) -> anyhow::Result<()> {
     let deadline =
         Instant::now() + Duration::from_secs(OPS_SELECTION_SUPERVISOR_WAIT_PRESENT_TIMEOUT_SECONDS);
     let mut stable_started_at: Option<Instant> = None;
     while Instant::now() < deadline {
-        let status = observe_selection_status(kind, name, authority)?;
+        let status = observe_selection_status_for_scope(kind, name, authority, scope_key)?;
         if status.present {
             if stable_started_at.is_none() {
                 stable_started_at = Some(Instant::now());
@@ -1824,9 +1852,44 @@ fn wait_for_selection_present(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let status = observe_selection_status(kind, name, authority)?;
+    let status = observe_selection_status_for_scope(kind, name, authority, scope_key)?;
     anyhow::bail!(
         "wait for selection present failed: label={} {}",
+        selection_supervisor_label_from_workload_name(kind, name)?,
+        format_selection_status_debug(&status)
+    );
+}
+
+fn wait_for_selection_present(
+    kind: WorkloadKind,
+    name: &str,
+    authority: &str,
+) -> anyhow::Result<()> {
+    wait_for_selection_present_for_scope(kind, name, authority, None)
+}
+
+fn wait_for_selection_attached_for_scope(
+    kind: WorkloadKind,
+    name: &str,
+    authority: &str,
+    scope_key: Option<&str>,
+    apply_id: &str,
+    owner_ts_ms: u64,
+    argv: &[String],
+    cwd: Option<&str>,
+) -> anyhow::Result<SelectionSupervisorStatus> {
+    let deadline =
+        Instant::now() + Duration::from_secs(OPS_SELECTION_SUPERVISOR_WAIT_PRESENT_TIMEOUT_SECONDS);
+    while Instant::now() < deadline {
+        let status = observe_selection_status_for_scope(kind, name, authority, scope_key)?;
+        if selection_status_matches_attached(&status, apply_id, owner_ts_ms, argv, cwd) {
+            return Ok(status);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let status = observe_selection_status_for_scope(kind, name, authority, scope_key)?;
+    anyhow::bail!(
+        "wait for selection attached failed: label={} {}",
         selection_supervisor_label_from_workload_name(kind, name)?,
         format_selection_status_debug(&status)
     );
@@ -1841,18 +1904,33 @@ fn wait_for_selection_attached(
     argv: &[String],
     cwd: Option<&str>,
 ) -> anyhow::Result<SelectionSupervisorStatus> {
+    wait_for_selection_attached_for_scope(kind, name, authority, None, apply_id, owner_ts_ms, argv, cwd)
+}
+
+fn wait_for_selection_attached_without_present_for_scope(
+    kind: WorkloadKind,
+    name: &str,
+    authority: &str,
+    scope_key: Option<&str>,
+    apply_id: &str,
+    owner_ts_ms: u64,
+    argv: &[String],
+    cwd: Option<&str>,
+) -> anyhow::Result<SelectionSupervisorStatus> {
     let deadline =
         Instant::now() + Duration::from_secs(OPS_SELECTION_SUPERVISOR_WAIT_PRESENT_TIMEOUT_SECONDS);
     while Instant::now() < deadline {
-        let status = observe_selection_status(kind, name, authority)?;
-        if selection_status_matches_attached(&status, apply_id, owner_ts_ms, argv, cwd) {
+        let status = observe_selection_status_for_scope(kind, name, authority, scope_key)?;
+        if selection_status_matches_attached(&status, apply_id, owner_ts_ms, argv, cwd)
+            && !status.present
+        {
             return Ok(status);
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let status = observe_selection_status(kind, name, authority)?;
+    let status = observe_selection_status_for_scope(kind, name, authority, scope_key)?;
     anyhow::bail!(
-        "wait for selection attached failed: label={} {}",
+        "wait for selection attached without present failed: label={} {}",
         selection_supervisor_label_from_workload_name(kind, name)?,
         format_selection_status_debug(&status)
     );
@@ -1867,29 +1945,23 @@ fn wait_for_selection_attached_without_present(
     argv: &[String],
     cwd: Option<&str>,
 ) -> anyhow::Result<SelectionSupervisorStatus> {
-    let deadline =
-        Instant::now() + Duration::from_secs(OPS_SELECTION_SUPERVISOR_WAIT_PRESENT_TIMEOUT_SECONDS);
-    while Instant::now() < deadline {
-        let status = observe_selection_status(kind, name, authority)?;
-        if selection_status_matches_attached(&status, apply_id, owner_ts_ms, argv, cwd)
-            && !status.present
-        {
-            return Ok(status);
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    let status = observe_selection_status(kind, name, authority)?;
-    anyhow::bail!(
-        "wait for selection attached without present failed: label={} {}",
-        selection_supervisor_label_from_workload_name(kind, name)?,
-        format_selection_status_debug(&status)
-    );
+    wait_for_selection_attached_without_present_for_scope(
+        kind,
+        name,
+        authority,
+        None,
+        apply_id,
+        owner_ts_ms,
+        argv,
+        cwd,
+    )
 }
 
-fn wait_for_selection_absent(
+fn wait_for_selection_absent_for_scope(
     kind: WorkloadKind,
     name: &str,
     authority: &str,
+    scope_key: Option<&str>,
     require_apply_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1897,7 +1969,7 @@ fn wait_for_selection_absent(
         let snapshot = selection_supervisor_proc_snapshot()?;
         let label = selection_supervisor_label_from_workload_name(kind, name)?;
         let remaining: Vec<LiveSelectionSupervisor> =
-            live_selection_supervisors(&snapshot, Some(label.as_str()))?
+            live_selection_supervisors(&snapshot, Some(label.as_str()), scope_key)?
                 .into_iter()
                 .filter(|supervisor| match require_apply_id {
                     Some(apply_id) => supervisor
@@ -1914,12 +1986,21 @@ fn wait_for_selection_absent(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let status = observe_selection_status(kind, name, authority)?;
+    let status = observe_selection_status_for_scope(kind, name, authority, scope_key)?;
     anyhow::bail!(
         "wait for selection absent failed: label={} {}",
         selection_supervisor_label_from_workload_name(kind, name)?,
         format_selection_status_debug(&status)
     );
+}
+
+fn wait_for_selection_absent(
+    kind: WorkloadKind,
+    name: &str,
+    authority: &str,
+    require_apply_id: Option<&str>,
+) -> anyhow::Result<()> {
+    wait_for_selection_absent_for_scope(kind, name, authority, None, require_apply_id)
 }
 
 fn wait_for_process_identity_absent(pid: u32, start_time_ticks: u64) -> anyhow::Result<()> {
@@ -1980,6 +2061,7 @@ impl SupervisorBackedWorkloads {
             op_guard: std::sync::Mutex::new(()),
             log_dir,
             supervisor_runtime,
+            scope_key: _hostworkdir.display().to_string(),
         })
     }
 
@@ -2000,7 +2082,12 @@ impl SupervisorBackedWorkloads {
                 status_hint: None,
             };
         }
-        match observe_selection_status(workload.kind, &workload.name, authority) {
+        match observe_selection_status_for_scope(
+            workload.kind,
+            &workload.name,
+            authority,
+            Some(self.scope_key.as_str()),
+        ) {
             Ok(status) => StatusResp {
                 ok: true,
                 err: None,
@@ -2115,7 +2202,12 @@ impl SupervisorBackedWorkloads {
         let label = selection_supervisor_label_from_workload_name(kind, &name)
             .unwrap_or_else(|_| format!("{}/{}", kind.as_str(), name));
 
-        let current = match observe_selection_status(kind, &name, &authority) {
+        let current = match observe_selection_status_for_scope(
+            kind,
+            &name,
+            &authority,
+            Some(self.scope_key.as_str()),
+        ) {
             Ok(v) => v,
             Err(e) => {
                 return StartResp {
@@ -2175,14 +2267,24 @@ impl SupervisorBackedWorkloads {
             req.cwd.as_deref(),
         ) {
             let final_status = if wait_for_present && !current.present {
-                if let Err(e) = wait_for_selection_present(kind, &name, &authority) {
+                if let Err(e) = wait_for_selection_present_for_scope(
+                    kind,
+                    &name,
+                    &authority,
+                    Some(self.scope_key.as_str()),
+                ) {
                     return StartResp {
                         ok: false,
                         err: Some(format!("selection supervisor wait-present failed: {}", e)),
                         pid: current.pid,
                     };
                 }
-                match observe_selection_status(kind, &name, &authority) {
+                match observe_selection_status_for_scope(
+                    kind,
+                    &name,
+                    &authority,
+                    Some(self.scope_key.as_str()),
+                ) {
                     Ok(v) => v,
                     Err(e) => {
                         return StartResp {
@@ -2321,10 +2423,11 @@ impl SupervisorBackedWorkloads {
             "[ops_agent:start] wait attached label={} apply_id={} detached_pid={}",
             label, apply_id, detached_pid
         );
-        let attached_status = match wait_for_selection_attached(
+        let attached_status = match wait_for_selection_attached_for_scope(
             kind,
             &name,
             &authority,
+            Some(self.scope_key.as_str()),
             &apply_id,
             owner_ts_ms,
             &req.argv,
@@ -2348,7 +2451,12 @@ impl SupervisorBackedWorkloads {
             }
         };
         if wait_for_present {
-            if let Err(e) = wait_for_selection_present(kind, &name, &authority) {
+            if let Err(e) = wait_for_selection_present_for_scope(
+                kind,
+                &name,
+                &authority,
+                Some(self.scope_key.as_str()),
+            ) {
                 eprintln!(
                     "[ops_agent:start] wait present failed label={} apply_id={} detached_pid={} elapsed_ms={} err={}",
                     label,
@@ -2365,7 +2473,12 @@ impl SupervisorBackedWorkloads {
             }
         }
         let status = if wait_for_present {
-            match observe_selection_status(kind, &name, &authority) {
+            match observe_selection_status_for_scope(
+                kind,
+                &name,
+                &authority,
+                Some(self.scope_key.as_str()),
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     return StartResp {
@@ -2460,7 +2573,12 @@ impl SupervisorBackedWorkloads {
 
         let current = {
             let _op_guard = self.op_guard.lock().unwrap();
-            match observe_selection_status(kind, &name, &authority) {
+            match observe_selection_status_for_scope(
+                kind,
+                &name,
+                &authority,
+                Some(self.scope_key.as_str()),
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     return DeleteGenerationResp {
@@ -2473,7 +2591,18 @@ impl SupervisorBackedWorkloads {
                 }
             }
         };
-        let require_apply_id = require_apply_id.map(str::trim).filter(|v| !v.is_empty());
+        let require_apply_id = require_apply_id
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                current
+                    .apply_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            });
         if !current.running {
             return DeleteGenerationResp {
                 ok: true,
@@ -2482,14 +2611,20 @@ impl SupervisorBackedWorkloads {
         }
         if let Err(e) = self
             .supervisor_runtime
-            .stop(kind, &name, true, require_apply_id)
+            .stop(kind, &name, true, require_apply_id.as_deref())
         {
             return DeleteGenerationResp {
                 ok: false,
                 err: Some(format!("selection supervisor stop failed: {}", e)),
             };
         }
-        if let Err(e) = wait_for_selection_absent(kind, &name, &authority, require_apply_id) {
+        if let Err(e) = wait_for_selection_absent_for_scope(
+            kind,
+            &name,
+            &authority,
+            Some(self.scope_key.as_str()),
+            require_apply_id.as_deref(),
+        ) {
             return DeleteGenerationResp {
                 ok: false,
                 err: Some(format!("wait for selection absence failed: {}", e)),
@@ -2503,7 +2638,11 @@ impl SupervisorBackedWorkloads {
 
     fn list_workloads(&self) -> anyhow::Result<Vec<WorkloadStatusSummary>> {
         let mut out: Vec<WorkloadStatusSummary> = Vec::new();
-        for status in observe_all_selection_statuses()? {
+        let snapshot = selection_supervisor_proc_snapshot()?;
+        for status in observe_all_selection_statuses_for_snapshot(
+            &snapshot,
+            Some(self.scope_key.as_str()),
+        )? {
             let kind = status.kind.with_context(|| {
                 format!(
                     "selection supervisor list item missing kind: label={}",
@@ -2536,7 +2675,12 @@ impl SupervisorBackedWorkloads {
 
     fn list_apply_runtime(&self, apply_id: &str) -> anyhow::Result<Vec<WorkloadStatusSummary>> {
         let mut out: Vec<WorkloadStatusSummary> = Vec::new();
-        for status in observe_apply_runtime_statuses(apply_id)? {
+        let snapshot = selection_supervisor_proc_snapshot()?;
+        for status in observe_apply_runtime_statuses_for_snapshot(
+            apply_id,
+            &snapshot,
+            Some(self.scope_key.as_str()),
+        )? {
             let kind = status.kind.with_context(|| {
                 format!(
                     "apply runtime status missing kind: label={} apply_id={}",
@@ -9560,7 +9704,12 @@ async fn controller_gc_stale_workloads(
                 kind: w.kind,
                 name: w.name.clone(),
                 authority: w.authority.clone(),
-                require_apply_id: None,
+                require_apply_id: w
+                    .apply_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string),
             };
             let st = user_rpc_call_json::<DeleteGenerationReq, DeleteGenerationResp>(
                 state.fw.as_ref(),
@@ -13632,7 +13781,7 @@ mod tests {
             zombie_infos: Vec::new(),
         };
 
-        let supervisors = live_selection_supervisors(&snapshot, None).unwrap();
+        let supervisors = live_selection_supervisors(&snapshot, None, None).unwrap();
         assert_eq!(supervisors.len(), 1);
         assert_eq!(supervisors[0].label, "Deployment/target");
         assert_eq!(supervisors[0].owner_ts_ms, 1);
@@ -13712,14 +13861,15 @@ mod tests {
             zombie_infos: Vec::new(),
         };
 
-        let listed = observe_all_selection_statuses_for_snapshot(&snapshot).unwrap();
+        let listed = observe_all_selection_statuses_for_snapshot(&snapshot, None).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].kind, Some(WorkloadKind::Deployment));
         assert_eq!(listed[0].name.as_deref(), Some("target"));
         assert_eq!(listed[0].apply_id.as_deref(), None);
         assert_eq!(listed[0].owner_ts_ms, Some(2));
 
-        let strict = live_selection_supervisors(&snapshot, Some("Deployment/target")).unwrap();
+        let strict =
+            live_selection_supervisors(&snapshot, Some("Deployment/target"), None).unwrap();
         assert_eq!(strict.len(), 2);
         assert!(
             strict
@@ -13783,7 +13933,7 @@ mod tests {
             zombie_infos: Vec::new(),
         };
 
-        let err = observe_all_selection_statuses_for_snapshot(&snapshot).unwrap_err();
+        let err = observe_all_selection_statuses_for_snapshot(&snapshot, None).unwrap_err();
         let err_text = format!("{:#}", err);
         assert!(err_text.contains("owner_ts_ms collision"), "{err_text}");
     }
@@ -13817,7 +13967,8 @@ mod tests {
             zombie_infos: Vec::new(),
         };
 
-        let err = live_selection_supervisors(&snapshot, Some("Deployment/legacy")).unwrap_err();
+        let err =
+            live_selection_supervisors(&snapshot, Some("Deployment/legacy"), None).unwrap_err();
         let err_text = format!("{:#}", err);
         assert!(err_text.contains("missing --owner-ts-ms"), "{err_text}");
     }
@@ -13888,7 +14039,7 @@ mod tests {
             zombie_infos: Vec::new(),
         };
 
-        let listed = observe_all_selection_statuses_for_snapshot(&snapshot).unwrap();
+        let listed = observe_all_selection_statuses_for_snapshot(&snapshot, None).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].kind, Some(WorkloadKind::Deployment));
         assert_eq!(listed[0].name.as_deref(), Some("target"));
@@ -13985,7 +14136,8 @@ mod tests {
             zombie_infos: Vec::new(),
         };
 
-        let listed = observe_apply_runtime_statuses_for_snapshot("apply-1", &snapshot).unwrap();
+        let listed = observe_apply_runtime_statuses_for_snapshot("apply-1", &snapshot, None)
+            .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name.as_deref(), Some("target-present"));
         assert!(listed[0].present);
@@ -14131,6 +14283,126 @@ mod tests {
             status_hint: None,
         };
         assert!(!stale_gc_should_delete_workload(&desired_keys, &workload));
+    }
+
+    #[test]
+    fn supervisor_backed_delete_generation_without_explicit_apply_id_binds_current_generation() {
+        let python_exe = PathBuf::from("/usr/bin/python3");
+        assert!(
+            python_exe.is_file(),
+            "python executable does not exist: {}",
+            python_exe.display()
+        );
+
+        let workdir = std::env::temp_dir().join(format!(
+            "selection_supervisor_delete_bind_{}_{}",
+            std::process::id(),
+            now_ts_ms()
+        ));
+        std::fs::create_dir_all(&workdir).unwrap();
+        let runtime =
+            SelectionSupervisorRuntime::materialize(&workdir, &workdir, python_exe.as_path())
+                .unwrap();
+        let log_dir = workdir.join(OPS_LOG_DIR_NAME);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let workloads =
+            SupervisorBackedWorkloads::new(workdir.clone(), log_dir.clone(), runtime.clone())
+                .unwrap();
+
+        let name = format!("bind_current_generation_{}", now_ts_ms());
+        let argv = vec![
+            python_exe.display().to_string(),
+            "-c".to_string(),
+            "import time; time.sleep(30)".to_string(),
+        ];
+
+        let first = workloads.start(StartReq {
+            kind: WorkloadKind::Deployment,
+            name: name.clone(),
+            authority: name.clone(),
+            service_name: name.clone(),
+            apply_id: "apply-1".to_string(),
+            owner_ts_ms: 1,
+            argv: argv.clone(),
+            cwd: None,
+            wait_for_attached: true,
+            wait_for_present: false,
+        });
+        assert!(first.ok, "{first:?}");
+
+        let second = workloads.start(StartReq {
+            kind: WorkloadKind::Deployment,
+            name: name.clone(),
+            authority: name.clone(),
+            service_name: name.clone(),
+            apply_id: "apply-2".to_string(),
+            owner_ts_ms: 2,
+            argv: argv.clone(),
+            cwd: None,
+            wait_for_attached: true,
+            wait_for_present: false,
+        });
+        assert!(second.ok, "{second:?}");
+
+        let status = wait_for_selection_attached_without_present(
+            WorkloadKind::Deployment,
+            &name,
+            &name,
+            "apply-2",
+            2,
+            argv.as_slice(),
+            None,
+        )
+        .unwrap();
+        assert!(selection_status_matches_attached(
+            &status,
+            "apply-2",
+            2,
+            argv.as_slice(),
+            None
+        ));
+
+        let delete_old = workloads.delete_generation(
+            WorkloadKind::Deployment,
+            &name,
+            &name,
+            Some("apply-1"),
+        );
+        if !delete_old.ok {
+            let err = delete_old.err.as_deref().unwrap_or_default();
+            assert!(
+                err.contains("apply_id target is absent")
+                    || err.contains("wait for selection absence failed"),
+                "unexpected stale guarded delete result: {delete_old:?}"
+            );
+        }
+
+        let after_old = wait_for_selection_attached_without_present(
+            WorkloadKind::Deployment,
+            &name,
+            &name,
+            "apply-2",
+            2,
+            argv.as_slice(),
+            None,
+        )
+        .unwrap();
+        assert!(selection_status_matches_attached(
+            &after_old,
+            "apply-2",
+            2,
+            argv.as_slice(),
+            None
+        ));
+
+        let delete_current =
+            workloads.delete_generation(WorkloadKind::Deployment, &name, &name, None);
+        assert!(
+            delete_current.ok,
+            "unguarded delete should bind and retire the current visible generation: {delete_current:?}"
+        );
+        wait_for_selection_absent(WorkloadKind::Deployment, &name, &name, Some("apply-2"))
+            .unwrap();
     }
 
     #[test]

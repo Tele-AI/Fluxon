@@ -22,6 +22,7 @@ except ModuleNotFoundError:
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOP_ATTENTION_INDEX_DIR = REPO_ROOT / "fluxon_test_stack" / "top_attention_test_index"
 QUICK_ENTRY_NAMES: tuple[str, ...] = (
+    "_doc_page_build.py",
     "_config_kv.py",
     "_config_fs.py",
     "_py_runtime.py",

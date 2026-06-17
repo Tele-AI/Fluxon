@@ -362,7 +362,12 @@ pub struct MasterKvRouterInner {
     /// Latest version of key-value replicas
     pub kv_routes: DashMap<String, Arc<OneKvNodesRoutes>>,
 
-    /// Prefix-counting index for keys, used by CountPrefix RPC.
+    /// Prefix-counting index derived from `kv_routes`.
+    ///
+    /// It is updated through async follow-up maintenance, so it does not guarantee
+    /// immediate strong-consistency visibility for a freshly committed put.
+    /// The generic surface is `CountPrefix` RPC; the current primary use case is
+    /// MQ capacity backpressure / prefix counting.
     pub prefix_index: ARwLock<PrefixRadixTree>,
 
     /// Support replicas: node_id -> key -> route_info

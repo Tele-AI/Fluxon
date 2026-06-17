@@ -1,9 +1,9 @@
 # Roadmap
 
-## TODO
+## Coming soon
 
 - [CI] 用 GitHub Actions 覆盖所有测试，并修复现有 bug
-- [KV] 适配并优化 `sglang` `KVCache`
+- [KV] 适配并优化 `sglang` `KVCache`，补充 `BatchKV` 接口，以及带 `write back` 模式的本地侧弹性预分配内存 `put` 接口
 - [OPS] 统一 GitHub Actions 集成测试到 `FluxonOps`，以便后续内部集群也直接复用
 
 ## Release Notes

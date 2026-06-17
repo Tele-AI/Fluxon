@@ -98,6 +98,22 @@ scenes:
       scales: [n1_kvowner_dram_20gib]
       profiles: [fluxon_fastws, fluxon_tquic, fluxon_sockudo_ws, fluxon_tcp]
 
+  ci_doc_page:
+    ci:
+      subject: doc_page
+      runtime_contract: rust_self_managed
+      prepare:
+        - kind: setup_dev_env
+          config: setup_and_pack/setup_dev_env/doc_page_ci.yaml
+          cache_relpath: .cached/fluxon_doc_site/toolchain
+      commands:
+        - id: doc_page_build
+          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_doc_page_build.py
+          timeout_seconds: 10800
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
   kv_read_heavy_zipf:
     test_stack:
       mode: KVSTORE

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import os
 import shlex
@@ -10,6 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+import urllib.request
 
 SCRIPT_PATH = Path(__file__).resolve()
 if str(SCRIPT_PATH.parent) not in sys.path:
@@ -62,6 +64,8 @@ def main() -> int:
         _run_pip_install(config=config, dry_run=args.dry_run, env=command_env)
     with script_utils.stage("Running setup commands"):
         _run_command_steps(config=config, workdir=workdir, dry_run=args.dry_run, env=command_env)
+    with script_utils.stage("Running builtin setup steps"):
+        _run_builtin_steps(config=config, workdir=workdir, dry_run=args.dry_run, env=command_env)
     with script_utils.stage("Preparing nix pack host environment"):
         _prepare_nix_pack_host_environment(config=config, dry_run=args.dry_run)
     with script_utils.stage("Verifying nix pack host commands"):
@@ -225,10 +229,7 @@ def _merge_config(base: Any, overlay: Any) -> Any:
 
 def _replace_rust_toolchain_placeholder(config: dict[str, Any]) -> None:
     channel = _read_rust_toolchain_channel()
-    replaced = _replace_placeholder_recursive(config, placeholder=RUST_TOOLCHAIN_PLACEHOLDER, value=channel)
-    if not replaced:
-        print(f"Missing Rust toolchain placeholder in setup config: {RUST_TOOLCHAIN_PLACEHOLDER}")
-        raise SystemExit(1)
+    _replace_placeholder_recursive(config, placeholder=RUST_TOOLCHAIN_PLACEHOLDER, value=channel)
 
 
 def _read_rust_toolchain_channel() -> str:
@@ -322,6 +323,28 @@ def _validate_config(*, config: dict[str, Any], config_path: Path, host_info: di
         if cwd is not None and (not isinstance(cwd, str) or not cwd):
             print(f"commands[{index}].cwd must be a non-empty string when present: {config_path}")
             raise SystemExit(1)
+
+    builtin_steps = config.get("builtin_steps", [])
+    if not isinstance(builtin_steps, list):
+        print(f"builtin_steps must be a list: {config_path}")
+        raise SystemExit(1)
+    for index, raw_step in enumerate(builtin_steps):
+        if not isinstance(raw_step, dict):
+            print(f"builtin_steps[{index}] must be a mapping: {config_path}")
+            raise SystemExit(1)
+        step_kind = raw_step.get("kind")
+        if step_kind != "install_node_runtime":
+            print(f"builtin_steps[{index}].kind unsupported: {step_kind!r} in {config_path}")
+            raise SystemExit(1)
+        node_cfg = raw_step.get("node")
+        if not isinstance(node_cfg, dict):
+            print(f"builtin_steps[{index}].node must be a mapping: {config_path}")
+            raise SystemExit(1)
+        for field_name in ("version", "platform", "arch", "install_root_relpath", "sha256"):
+            value = node_cfg.get(field_name)
+            if not isinstance(value, str) or not value:
+                print(f"builtin_steps[{index}].node.{field_name} must be a non-empty string: {config_path}")
+                raise SystemExit(1)
 
 
 def _validate_nix_pack_section(*, section: Any, config_path: Path) -> None:
@@ -585,6 +608,109 @@ def _run_command_steps(
         step_cwd = workdir if "cwd" not in step else (workdir / step["cwd"]).resolve()
         with script_utils.stage(f"Command step: {step_name}"):
             _run_shell(step["shell"], cwd=step_cwd, dry_run=dry_run, env=env)
+
+
+def _run_builtin_steps(
+    *,
+    config: dict[str, Any],
+    workdir: Path,
+    dry_run: bool,
+    env: dict[str, str],
+) -> None:
+    builtin_steps = config.get("builtin_steps", [])
+    if not builtin_steps:
+        print("No builtin setup steps declared.")
+        return
+    for index, raw_step in enumerate(builtin_steps):
+        step = raw_step
+        step_kind = step["kind"]
+        if step_kind == "install_node_runtime":
+            with script_utils.stage(f"Builtin step: install_node_runtime[{index}]"):
+                _run_builtin_install_node_runtime(step=step, workdir=workdir, dry_run=dry_run, env=env)
+            continue
+        raise SystemExit(f"Unsupported builtin step kind: {step_kind!r}")
+
+
+def _run_builtin_install_node_runtime(
+    *,
+    step: dict[str, Any],
+    workdir: Path,
+    dry_run: bool,
+    env: dict[str, str],
+) -> None:
+    del env
+    node_cfg = step["node"]
+    version = node_cfg["version"]
+    platform = node_cfg["platform"]
+    arch = node_cfg["arch"]
+    install_root = (workdir / node_cfg["install_root_relpath"]).resolve()
+    expected_sha256 = node_cfg["sha256"].strip().lower()
+    if not expected_sha256:
+        raise SystemExit("install_node_runtime requires non-empty sha256")
+
+    artifact_name = f"node-{version}-{platform}-{arch}.tar.xz"
+    base_url = f"https://nodejs.org/dist/{version}"
+    tarball_url = f"{base_url}/{artifact_name}"
+    install_dir = install_root / "node"
+    bin_dir = install_dir / "bin"
+    node_binary = bin_dir / "node"
+    npm_binary = bin_dir / "npm"
+    if install_dir.is_dir() and node_binary.is_file() and npm_binary.is_file():
+        print(f"node_runtime_cached={install_dir}")
+        return
+
+    tmp_root = install_root / ".tmp"
+    archive_path = tmp_root / artifact_name
+    extract_root = tmp_root / "extract"
+    if dry_run:
+        print(f"ensure_dir={install_root}")
+        print(f"download={tarball_url}")
+        print(f"install_node_runtime={install_dir}")
+        return
+
+    install_root.mkdir(parents=True, exist_ok=True)
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    if archive_path.exists():
+        archive_path.unlink()
+    _download_file(url=tarball_url, out_path=archive_path)
+    got_sha256 = _sha256_file(archive_path)
+    if got_sha256 != expected_sha256:
+        raise SystemExit(
+            f"node runtime sha256 mismatch: url={tarball_url} expected={expected_sha256} got={got_sha256}"
+        )
+    if extract_root.exists():
+        shutil.rmtree(extract_root)
+    extract_root.mkdir(parents=True, exist_ok=False)
+    _run_argv(
+        ["tar", "-xJf", str(archive_path), "-C", str(extract_root)],
+        dry_run=False,
+    )
+    extracted_dir = extract_root / f"node-{version}-{platform}-{arch}"
+    if not extracted_dir.is_dir():
+        raise SystemExit(f"node runtime archive did not contain expected root: {extracted_dir}")
+    if install_dir.exists():
+        shutil.rmtree(install_dir)
+    shutil.move(str(extracted_dir), str(install_dir))
+    if not node_binary.is_file() or not npm_binary.is_file():
+        raise SystemExit(f"node runtime install missing binaries: {install_dir}")
+    print(f"installed_node_runtime={install_dir}")
+
+
+def _download_file(*, url: str, out_path: Path) -> None:
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    with urllib.request.urlopen(url, timeout=60) as resp, tmp_path.open("wb") as out_fp:
+        shutil.copyfileobj(resp, out_fp)
+    tmp_path.replace(out_path)
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fp:
+        for chunk in iter(lambda: fp.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _run_argv(

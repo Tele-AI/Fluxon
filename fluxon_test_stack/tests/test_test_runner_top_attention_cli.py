@@ -64,6 +64,13 @@ class TestTestRunnerTopAttentionCli(unittest.TestCase):
         self.assertIn("fluxon_test_stack/top_attention_test_index/_test_requirements.py", completed.stdout)
         self.assertIn("fluxon_test_stack/top_attention_test_index/test_test_requirements.py", completed.stdout)
 
+    def test_top_attention_list_json_contains_doc_page_entry(self) -> None:
+        completed = self.run_runner("--action", "top_attention_list", "--top-attention-json", "--top-attention-prefix", "doc_page")
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload["entry_count"], 1)
+        self.assertEqual(payload["entries"][0]["name"], "_doc_page_build.py")
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

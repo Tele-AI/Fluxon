@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -64,14 +66,14 @@ class TestPackTestStackRscCli(unittest.TestCase):
         self.assertEqual(plan[0]["action"], "validate_release")
         self.assertEqual(plan[0]["scope"], "top_level_release")
         self.assertEqual(plan[0]["transport_backend"], "tcp_thread")
-        self.assertEqual(plan[1]["action"], "validate_release")
+        self.assertEqual(len(plan), 2)
+        self.assertEqual(plan[1]["action"], "prepare_test_rsc")
         self.assertEqual(plan[1]["profile_id"], "fluxon_tcp_thread")
-        self.assertEqual(plan[2]["action"], "prepare_test_rsc")
-        self.assertIn("--out-dir", plan[2]["command"])
-        self.assertIn(str((release_dir / "test_rsc" / "fluxon_tcp_thread").resolve()), plan[2]["command"])
+        self.assertIn("--out-dir", plan[1]["command"])
+        self.assertIn(str((release_dir / "test_rsc" / "fluxon_tcp_thread").resolve()), plan[1]["command"])
         self.assertNotIn("--transport-backend", plan[0]["command"] if "command" in plan[0] else [])
 
-    def test_build_plan_packs_profile_release_under_profiles_dir(self) -> None:
+    def test_build_plan_deduplicates_public_profile_release(self) -> None:
         release_dir = (REPO_ROOT / ".tmp_test_pack_test_stack_rsc_release").resolve()
         plan = _PACK._build_all_profiles_plan(
             release_dir=release_dir,
@@ -97,11 +99,18 @@ class TestPackTestStackRscCli(unittest.TestCase):
         self.assertEqual(plan[0]["release_dir"], str(release_dir))
         self.assertEqual(plan[0]["transport_backend"], "tcp_thread")
         self.assertNotIn("--transport-backend", plan[0]["command"])
-        self.assertEqual(plan[1]["action"], "pack_release")
-        self.assertEqual(plan[1]["release_dir"], str((release_dir / "profiles" / "fluxon_tcp_thread").resolve()))
-        self.assertNotIn("--transport-backend", plan[1]["command"])
-        self.assertEqual(plan[2]["action"], "prepare_test_rsc")
-        self.assertEqual(plan[2]["out_dir"], str((release_dir / "test_rsc" / "fluxon_tcp_thread").resolve()))
+        self.assertEqual(len(plan), 2)
+        self.assertEqual(plan[1]["action"], "prepare_test_rsc")
+        self.assertEqual(plan[1]["profile_id"], "fluxon_tcp_thread")
+        self.assertEqual(plan[1]["out_dir"], str((release_dir / "test_rsc" / "fluxon_tcp_thread").resolve()))
+
+    def test_profile_release_authority_dir_uses_profiles_subdir_for_nonpublic_profile(self) -> None:
+        release_dir = (REPO_ROOT / ".tmp_test_pack_test_stack_rsc_release").resolve()
+        authority_dir = _PACK._profile_release_authority_dir(
+            release_dir=release_dir,
+            profile_id="fluxon_fastws",
+        )
+        self.assertEqual(authority_dir, (release_dir / "profiles" / "fluxon_fastws").resolve())
 
     def test_build_plan_rejects_nonpublic_transport_release(self) -> None:
         release_dir = (REPO_ROOT / ".tmp_test_pack_test_stack_rsc_release").resolve()
@@ -130,6 +139,221 @@ class TestPackTestStackRscCli(unittest.TestCase):
 
     def test_default_top_level_transport_backend_is_tcp_thread(self) -> None:
         self.assertEqual(_PACK.DEFAULT_TOP_LEVEL_TRANSPORT_BACKEND, "tcp_thread")
+
+    def test_pack_ci_src_stages_all_declared_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            for relpath in (
+                "setup_and_pack/tool.py",
+                "fluxon_py/__init__.py",
+                "fluxon_rs/Cargo.toml",
+                "deployment/dispatch.py",
+                "examples/demo.py",
+                "fluxon_test_stack/case.yaml",
+                "scripts/build_doc_site.py",
+                "fluxon_doc_cn/roadmap.md",
+                "fluxon_doc_en/roadmap.md",
+                "README.md",
+                ".github/workflows/all_test.yml",
+                "fluxon_release/install.py",
+                "fluxon_release/closed_sdk/manifest.json",
+                "fluxon_release/test_rsc/source/prepare.yaml",
+                ".dever/tmp.log",
+                "skills/demo/SKILL.md",
+            ):
+                path = repo_root / relpath
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("x\n", encoding="utf-8")
+            (repo_root / "setup.py").write_text("x\n", encoding="utf-8")
+            (repo_root / ".gitignore").write_text(
+                "\n".join(
+                    [
+                        "fluxon_release/*",
+                        "!fluxon_release/install.py",
+                        "!fluxon_release/closed_sdk/",
+                        "!fluxon_release/closed_sdk/**",
+                        "!fluxon_release/test_rsc/",
+                        "fluxon_release/test_rsc/*",
+                        "!fluxon_release/test_rsc/source/",
+                        "!fluxon_release/test_rsc/source/**",
+                        ".dever",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            out_path = repo_root / "out" / "src_ci.tar.gz"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            tar_invocations: list[tuple[Path, list[str]]] = []
+            git_relpaths = [
+                "setup_and_pack/tool.py",
+                "fluxon_py/__init__.py",
+                "fluxon_rs/Cargo.toml",
+                "deployment/dispatch.py",
+                "examples/demo.py",
+                "fluxon_test_stack/case.yaml",
+                "scripts/build_doc_site.py",
+                "fluxon_doc_cn/roadmap.md",
+                "fluxon_doc_en/roadmap.md",
+                "README.md",
+                ".github/workflows/all_test.yml",
+            ]
+
+            def fake_git_stage_ci_source_tree(*, repo_root, stage_root):
+                for relpath in git_relpaths:
+                    src = repo_root / relpath
+                    dst = stage_root / relpath
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+                return list(git_relpaths)
+
+            def fake_tar_gz(*, cwd, out_path, inputs, honor_vcs_ignores):
+                del honor_vcs_ignores
+                tar_invocations.append((cwd, list(inputs)))
+                for name in inputs:
+                    assert (cwd / name).exists(), f"missing staged input {name}"
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text("stub\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(
+                    _PACK,
+                    "_collect_ci_source_relpaths",
+                    return_value=list(git_relpaths),
+                ),
+                mock.patch.object(_PACK, "_git_stage_ci_source_tree", side_effect=fake_git_stage_ci_source_tree),
+                mock.patch.object(_PACK.script_utils, "tar_gz", side_effect=fake_tar_gz),
+            ):
+                _PACK._pack_ci_src(repo_root=repo_root, out_path=out_path)
+
+            self.assertTrue(out_path.is_file())
+            self.assertEqual(len(tar_invocations), 1)
+            staged_inputs = set(tar_invocations[0][1])
+            for relpath in (
+                "setup_and_pack/tool.py",
+                "fluxon_py/__init__.py",
+                "fluxon_rs/Cargo.toml",
+                "deployment/dispatch.py",
+                "examples/demo.py",
+                "fluxon_test_stack/case.yaml",
+                "scripts/build_doc_site.py",
+                "fluxon_doc_cn/roadmap.md",
+                "fluxon_doc_en/roadmap.md",
+                "README.md",
+                ".github/workflows/all_test.yml",
+            ):
+                self.assertIn(relpath, staged_inputs)
+            for relpath in (
+                "fluxon_release/install.py",
+                "fluxon_release/closed_sdk/manifest.json",
+                "fluxon_release/test_rsc/source/prepare.yaml",
+                ".dever/tmp.log",
+                "skills/demo/SKILL.md",
+            ):
+                self.assertNotIn(relpath, staged_inputs)
+
+    def test_git_stage_ci_source_tree_excludes_runtime_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            stage_root = repo_root / "stage"
+            for relpath in (
+                "scripts/build_doc_site.py",
+                "fluxon_doc_cn/roadmap.md",
+                "README.md",
+                "fluxon_release/install.py",
+                ".dever/run.log",
+                "skills/demo/SKILL.md",
+            ):
+                path = repo_root / relpath
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("x\n", encoding="utf-8")
+
+            raw = b"\0".join(
+                [
+                    b"scripts/build_doc_site.py",
+                    b"fluxon_doc_cn/roadmap.md",
+                    b"README.md",
+                    b"fluxon_release/install.py",
+                    b".dever/run.log",
+                    b"skills/demo/SKILL.md",
+                ]
+            ) + b"\0"
+
+            with mock.patch.object(_PACK.subprocess, "check_output", return_value=raw):
+                relpaths = _PACK._git_stage_ci_source_tree(repo_root=repo_root, stage_root=stage_root)
+
+            self.assertEqual(
+                relpaths,
+                ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/build_doc_site.py"],
+            )
+            self.assertTrue((stage_root / "README.md").is_file())
+            self.assertTrue((stage_root / "fluxon_doc_cn" / "roadmap.md").is_file())
+            self.assertTrue((stage_root / "scripts" / "build_doc_site.py").is_file())
+            self.assertFalse((stage_root / "fluxon_release").exists())
+            self.assertFalse((stage_root / ".dever").exists())
+            self.assertFalse((stage_root / "skills").exists())
+
+    def test_collect_ci_source_relpaths_excludes_runtime_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            for relpath in (
+                "scripts/build_doc_site.py",
+                "fluxon_doc_cn/roadmap.md",
+                "README.md",
+                "fluxon_release/install.py",
+                ".dever/run.log",
+                "skills/demo/SKILL.md",
+            ):
+                path = repo_root / relpath
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("x\n", encoding="utf-8")
+
+            raw = b"\0".join(
+                [
+                    b"scripts/build_doc_site.py",
+                    b"fluxon_doc_cn/roadmap.md",
+                    b"README.md",
+                    b"fluxon_release/install.py",
+                    b".dever/run.log",
+                    b"skills/demo/SKILL.md",
+                ]
+            ) + b"\0"
+
+            with mock.patch.object(_PACK.subprocess, "check_output", return_value=raw):
+                relpaths = _PACK._collect_ci_source_relpaths(repo_root=repo_root)
+
+            self.assertEqual(
+                relpaths,
+                ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/build_doc_site.py"],
+            )
+
+    def test_compute_ci_source_digest_uses_selected_git_paths_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            tracked = repo_root / "README.md"
+            tracked.write_text("tracked\n", encoding="utf-8")
+            blocked = repo_root / ".dever" / "blocked.txt"
+            blocked.parent.mkdir(parents=True, exist_ok=True)
+            blocked.write_text("blocked\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(
+                    _PACK,
+                    "_collect_ci_source_relpaths",
+                    return_value=["README.md"],
+                ),
+                mock.patch.object(
+                    _PACK.script_utils,
+                    "compute_paths_digest",
+                    wraps=_PACK.script_utils.compute_paths_digest,
+                ) as digest_mock,
+            ):
+                digest = _PACK._compute_ci_source_digest(repo_root=repo_root)
+
+            self.assertTrue(digest)
+            digest_roots = digest_mock.call_args.args[0]
+            self.assertEqual(digest_roots, [tracked.resolve()])
 
 
 if __name__ == "__main__":

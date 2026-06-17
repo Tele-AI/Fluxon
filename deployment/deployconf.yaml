@@ -159,7 +159,10 @@ service:
       mkdir -p "${DATA_DIR}"
       exec greptime standalone start \
         --data-home "${DATA_DIR}" \
-        --http-addr 0.0.0.0:34030
+        --http-addr 0.0.0.0:34030 \
+        --rpc-bind-addr 127.0.0.1:$((GREPTIME__PORT + 1)) \
+        --mysql-addr 127.0.0.1:$((GREPTIME__PORT + 2)) \
+        --postgres-addr 127.0.0.1:$((GREPTIME__PORT + 3))
   grafana:
     image: grafana/grafana:10.0.0
     port: 33031
@@ -410,6 +413,7 @@ service:
         master_panel:
           listen_addr: "0.0.0.0:8091"
           public_base_url: "http://127.0.0.1:8091"
+          prometheus_base_url: "${FLUXON_PROMETHEUS_BASE_URL}"
           auto_refresh_interval_secs: 10
           # English note:
           # - access_db_path is the single source of truth for UI/S3 auth state.

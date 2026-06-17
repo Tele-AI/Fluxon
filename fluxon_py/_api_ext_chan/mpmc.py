@@ -2091,7 +2091,10 @@ class MPMCChanProducer(ChannelProducer):
             prefix = f"/mpmc/{self.mpmc_channel.mpmc_id}/mpsc_{mpsc_id}/"
 
             count_res: Optional[Result[int, ApiError]] = None
-            for _ in range(3):
+            for _ in range(10):
+                # Capacity gating here uses the master-side derived prefix index.
+                # It is suitable for aggregate backpressure, but it is not an
+                # immediate strong-consistency visibility probe for a fresh put.
                 count_res = self.api.count_prefix(prefix)
                 if count_res.is_ok():
                     break
@@ -2099,6 +2102,13 @@ class MPMCChanProducer(ChannelProducer):
                 if not isinstance(err, NetworkError):
                     return Result[bool, ApiError].new_error(err)
                 time.sleep(0.1)
+                # // Warning
+                logging.warning("MPMCChanProducer mpmc_id=%s producer_idx=%s count_prefix failed for prefix %s: %s; retrying for %d times...",
+                    self.mpmc_id,
+                    producer_id,
+                    prefix,
+                    err,
+                )
             assert count_res is not None
             if not count_res.is_ok():
                 return Result[bool, ApiError].new_error(count_res.unwrap_error())

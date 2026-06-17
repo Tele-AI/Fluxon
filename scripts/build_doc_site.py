@@ -51,7 +51,7 @@ RUNTIME_LOCKFILE_PATH = TOOLCHAIN_ROOT / "quartz.lock.json"
 NPM_STAMP_PATH = TOOLCHAIN_ROOT / ".fluxon-npm-stamp"
 PLUGIN_STAMP_PATH = TOOLCHAIN_ROOT / ".fluxon-plugin-stamp"
 DEFAULT_SERVE_ADDR = "127.0.0.1:18081"
-DEFAULT_TRACK_POLL_SECONDS = 1.0
+DEFAULT_TRACK_POLL_SECONDS = 30.0
 EXPLORER_FORCE_EXPANDED_CSS = dedent(
     """\
     /* Fluxon doc-site override: keep the left explorer fully expanded. */
@@ -201,7 +201,18 @@ LANGUAGE_ROUTE_PAIRS = (
         "en": "/dev_doc/Developer---2---Package-Middleware-and-Images",
         "cn": "/cn/dev_doc/开发者---2---打包中间件和镜像",
     },
+    {"en": "/design", "cn": "/cn/design"},
 )
+
+EXPLORER_PRIORITY_ROOT_ROUTES = {
+    "en": ("/dev_doc", "/user_doc"),
+    "cn": ("/cn/dev_doc", "/cn/user_doc", "/cn/design"),
+}
+
+EXPLORER_HIDDEN_ROUTE_PREFIXES = {
+    "en": ("/design",),
+    "cn": (),
+}
 
 
 def build_language_counterpart_routes() -> dict[str, str]:
@@ -214,11 +225,56 @@ def build_language_counterpart_routes() -> dict[str, str]:
     return routes
 
 
-LANGUAGE_COUNTERPART_ROUTES = build_language_counterpart_routes()
+def slugify_quartz_path_segment(segment: str) -> str:
+    return (
+        segment.replace(" ", "-")
+        .replace("&", "-and-")
+        .replace("%", "-percent")
+        .replace("?", "")
+        .replace("#", "")
+    )
+
+
+def build_quartz_markdown_route_suffix(source_rel: Path) -> str:
+    if source_rel.name == "README.md":
+        if source_rel.parent == Path("."):
+            return ""
+        slug_parts = [slugify_quartz_path_segment(part) for part in source_rel.parent.parts]
+        return "/" + "/".join(part for part in slug_parts if part)
+
+    slug_parts = [slugify_quartz_path_segment(part) for part in source_rel.with_suffix("").parts]
+    slug = "/".join(part for part in slug_parts if part)
+    if slug.endswith("/_index"):
+        slug = slug[: -len("/_index")] + "/index"
+    elif slug == "_index":
+        slug = "index"
+    return "/" + slug if slug else ""
+
+
+def extend_language_counterpart_routes_for_cn_only_design() -> dict[str, str]:
+    routes = build_language_counterpart_routes()
+    en_design_root = FALLBACK_DOC_EN_ROOT / "design"
+    cn_design_root = FALLBACK_DOC_CN_ROOT / "design"
+    if en_design_root.exists() or not cn_design_root.is_dir():
+        return routes
+
+    for source_path in sorted(cn_design_root.rglob("*.md")):
+        rel = source_path.relative_to(cn_design_root)
+        route_suffix = build_quartz_markdown_route_suffix(rel)
+        en_route = "/design" + route_suffix
+        cn_route = "/cn/design" + route_suffix
+        routes[en_route] = cn_route
+        routes[cn_route] = en_route
+    return routes
+
+
+LANGUAGE_COUNTERPART_ROUTES = extend_language_counterpart_routes_for_cn_only_design()
 DOC_SITE_POSTSCRIPT_JS = dedent(
     f"""\
     ;(() => {{
       const FLUXON_LANGUAGE_COUNTERPART_ROUTES = {json.dumps(LANGUAGE_COUNTERPART_ROUTES, ensure_ascii=False, sort_keys=True)}
+      const FLUXON_EXPLORER_PRIORITY_ROOT_ROUTES = {json.dumps(EXPLORER_PRIORITY_ROOT_ROUTES, ensure_ascii=False, sort_keys=True)}
+      const FLUXON_HIDDEN_ROUTE_PREFIXES = {json.dumps(EXPLORER_HIDDEN_ROUTE_PREFIXES, ensure_ascii=False, sort_keys=True)}
 
       function decodeFluxonPathname(pathname) {{
         return (pathname || "/")
@@ -398,6 +454,10 @@ DOC_SITE_POSTSCRIPT_JS = dedent(
         }}
       }}
 
+      function fluxonRouteHasPrefix(route, prefix) {{
+        return !!route && !!prefix && (route === prefix || route.startsWith(prefix + "/"))
+      }}
+
       function fluxonExplorerFolderPath(item) {{
         const folderContainer = item.querySelector(":scope > .folder-container")
         if (!isFluxonElement(folderContainer, "DIV")) return ""
@@ -406,8 +466,24 @@ DOC_SITE_POSTSCRIPT_JS = dedent(
 
       function fluxonExplorerDirectHref(item) {{
         const directLink = item.querySelector(":scope > a[href]")
-        if (!isFluxonElement(directLink, "A")) return ""
-        return directLink.getAttribute("href") || ""
+        if (isFluxonElement(directLink, "A")) {{
+          return directLink.getAttribute("href") || ""
+        }}
+
+        const folderLink = item.querySelector(":scope > .folder-container a[href]")
+        if (!isFluxonElement(folderLink, "A")) return ""
+        return folderLink.getAttribute("href") || ""
+      }}
+
+      function fluxonExplorerItemRoute(item, siteBasePath) {{
+        const href = fluxonExplorerDirectHref(item)
+        if (!href) return ""
+        try {{
+          const pathname = new URL(href, window.location.href).pathname
+          return normalizeFluxonRoute(pathname, siteBasePath)
+        }} catch {{
+          return ""
+        }}
       }}
 
       function isFluxonExplorerCustomItem(item) {{
@@ -429,8 +505,7 @@ DOC_SITE_POSTSCRIPT_JS = dedent(
       }}
 
       function explorerItemMatchesRoute(item, route, siteBasePath) {{
-        const href = fluxonExplorerDirectHref(item)
-        return !!href && matchesFluxonRoute(href, route, siteBasePath)
+        return fluxonExplorerItemRoute(item, siteBasePath) === route
       }}
 
       function explorerItemsEquivalent(leftItem, rightItem, siteBasePath) {{
@@ -446,6 +521,40 @@ DOC_SITE_POSTSCRIPT_JS = dedent(
         return normalizeFluxonRoute(leftHref, siteBasePath) === normalizeFluxonRoute(rightHref, siteBasePath)
       }}
 
+      function isFluxonHiddenExplorerItem(item, siteBasePath, language) {{
+        const route = fluxonExplorerItemRoute(item, siteBasePath)
+        if (!route) return false
+        const hiddenPrefixes = FLUXON_HIDDEN_ROUTE_PREFIXES[language] || []
+        return hiddenPrefixes.some((prefix) => fluxonRouteHasPrefix(route, prefix))
+      }}
+
+      function isFluxonRootExplorerList(list) {{
+        return isFluxonElement(list, "UL") && !list.closest("li")
+      }}
+
+      function reorderFluxonRootExplorerItems(list, siteBasePath, language) {{
+        if (!isFluxonRootExplorerList(list)) return
+
+        const orderedRoutes = FLUXON_EXPLORER_PRIORITY_ROOT_ROUTES[language] || []
+        const overflowEnd = list.querySelector("li.overflow-end")
+        let insertAfter = list.querySelector("li.fluxon-roadmap-link") || list.querySelector("li.fluxon-home-link")
+
+        orderedRoutes.forEach((route) => {{
+          const item = Array.from(list.children).find((child) => {{
+            if (!isFluxonElement(child, "LI")) return false
+            if (isFluxonExplorerCustomItem(child)) return false
+            return explorerItemMatchesRoute(child, route, siteBasePath)
+          }})
+          if (!isFluxonElement(item, "LI")) return
+
+          const referenceNode = insertAfter ? insertAfter.nextSibling : (overflowEnd || list.firstChild)
+          if (item !== referenceNode) {{
+            list.insertBefore(item, referenceNode || null)
+          }}
+          insertAfter = item
+        }})
+      }}
+
       function filterFluxonExplorerTreeForLanguage() {{
         const siteBasePath = resolveFluxonSiteBasePath()
         const route = currentFluxonRoute()
@@ -457,6 +566,11 @@ DOC_SITE_POSTSCRIPT_JS = dedent(
           Array.from(list.children).forEach((child) => {{
             if (!isFluxonElement(child, "LI")) return
             if (isFluxonExplorerCustomItem(child)) return
+
+            if (isFluxonHiddenExplorerItem(child, siteBasePath, language)) {{
+              child.remove()
+              return
+            }}
 
             if (language === "en") {{
               if (isFluxonChineseExplorerItem(child, siteBasePath)) {{
@@ -518,7 +632,10 @@ DOC_SITE_POSTSCRIPT_JS = dedent(
             return Array.from(list.children).some((child) => {{
               if (!isFluxonElement(child, "LI")) return false
               if (isFluxonExplorerCustomItem(child)) return false
-              return isFluxonChineseExplorerItem(child, siteBasePath)
+              return (
+                isFluxonChineseExplorerItem(child, siteBasePath) ||
+                isFluxonHiddenExplorerItem(child, siteBasePath, language)
+              )
             }})
           }}
 
@@ -538,7 +655,10 @@ DOC_SITE_POSTSCRIPT_JS = dedent(
             const href = fluxonExplorerDirectHref(child)
             if (!href) return false
             const normalizedRoute = normalizeFluxonRoute(href, siteBasePath)
-            return normalizedRoute !== "/cn" && !normalizedRoute.startsWith("/cn/")
+            return (
+              isFluxonHiddenExplorerItem(child, siteBasePath, language) ||
+              (normalizedRoute !== "/cn" && !normalizedRoute.startsWith("/cn/"))
+            )
           }})
         }})
       }}
@@ -597,6 +717,10 @@ DOC_SITE_POSTSCRIPT_JS = dedent(
         }})
 
         filterFluxonExplorerTreeForLanguage()
+
+        document.querySelectorAll(".explorer-ul").forEach((list) => {{
+          reorderFluxonRootExplorerItems(list, siteBasePath, language)
+        }})
       }}
 
       // Patch a link right before navigation in case Quartz rendered it late.
@@ -737,7 +861,10 @@ def main() -> int:
     track_parser.add_argument("--poll-seconds", type=float, default=DEFAULT_TRACK_POLL_SECONDS)
 
     args = parser.parse_args()
-    command = args.command or "build"
+    command = args.command or "track"
+    if args.command is None:
+        args.addr = DEFAULT_SERVE_ADDR
+        args.poll_seconds = DEFAULT_TRACK_POLL_SECONDS
 
     if command == "bootstrap":
         return bootstrap_toolchain()
@@ -771,8 +898,8 @@ def build_site() -> int:
     bootstrap_toolchain()
     reset_staged_docs()
     stage_source_docs()
-    if OUTPUT_ROOT.exists():
-        shutil.rmtree(OUTPUT_ROOT)
+    if OUTPUT_ROOT.exists() or OUTPUT_ROOT.is_symlink():
+        remove_path(OUTPUT_ROOT)
     ensure_dir(OUTPUT_ROOT)
     run_quartz_build()
     return 0
@@ -1133,6 +1260,13 @@ def ensure_quartz_plugins() -> None:
     ):
         return
 
+    # Quartz plugin install mutates existing plugin git worktrees in place. If a previous run
+    # crashed mid-install, partially materialized plugin directories can remain and later fail
+    # with `git rev-parse HEAD` errors. Rebuild the plugin tree from scratch whenever the stamp
+    # no longer matches the desired Quartz/config/lockfile state.
+    if plugins_root.exists() or plugins_root.is_symlink():
+        remove_path(plugins_root)
+
     run_cmd(
         [
             require_binary("node"),
@@ -1167,6 +1301,7 @@ def stage_source_docs() -> None:
     for variant in DOC_VARIANTS:
         stage_doc_variant(variant)
 
+    stage_cn_only_design_into_en_root()
     stage_homepage(variant=resolve_doc_variant("en"))
     stage_homepage(variant=resolve_doc_variant("cn"))
     stage_repo_asset_tree(HOMEPAGE_ROOT_PICS_DIR)
@@ -1206,6 +1341,34 @@ def should_skip_rel_path(rel: Path) -> bool:
             return True
     rel_str = rel.as_posix()
     return rel_str.endswith(".canvas") or rel_str.endswith(".canvas.ext")
+
+
+def stage_cn_only_design_into_en_root() -> None:
+    en_design_root = resolve_doc_root("en") / "design"
+    if en_design_root.exists():
+        return
+
+    cn_design_root = resolve_doc_root("cn") / "design"
+    if not cn_design_root.is_dir():
+        return
+
+    for source_path in sorted(cn_design_root.rglob("*")):
+        rel = source_path.relative_to(cn_design_root)
+        if should_skip_rel_path(rel):
+            continue
+
+        dst_rel = Path("design") / rel
+        if source_path.is_dir():
+            ensure_dir(STAGE_DOCS_ROOT / dst_rel)
+            continue
+
+        if source_path.suffix == ".md":
+            write_staged_markdown(source_path, rel, dst_rel, language="cn")
+            continue
+
+        dst_path = STAGE_DOCS_ROOT / dst_rel
+        ensure_dir(dst_path.parent)
+        shutil.copy2(source_path, dst_path)
 
 
 def write_staged_markdown(source_path: Path, source_rel: Path, dst_rel: Path, *, language: str) -> None:
@@ -1439,13 +1602,13 @@ def remap_homepage_repo_path(path_part: str, *, language: str) -> str:
 
     if language == "cn":
         if path_part in {"./README_CN.md", "README_CN.md"}:
-            return "../cn/"
+            return "./"
         if path_part in {"./README.md", "README.md"}:
             return "../"
         if path_part.startswith("./fluxon_doc_cn/"):
-            return "../cn/" + path_part[len("./fluxon_doc_cn/") :]
+            return "./" + path_part[len("./fluxon_doc_cn/") :]
         if path_part.startswith("fluxon_doc_cn/"):
-            return "../cn/" + path_part[len("fluxon_doc_cn/") :]
+            return "./" + path_part[len("fluxon_doc_cn/") :]
         if path_part.startswith("./fluxon_doc_en/"):
             return "../" + path_part[len("./fluxon_doc_en/") :]
         if path_part.startswith("fluxon_doc_en/"):
@@ -1658,6 +1821,16 @@ def compute_source_state() -> tuple[tuple[str, int, int], ...]:
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def remove_path(path: Path) -> None:
+    # Python 3.12 rejects shutil.rmtree() on symlinks; CI materialized release views may
+    # expose doc_site as a symlink, so deletion must handle all three path kinds explicitly.
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return
+    if path.exists():
+        shutil.rmtree(path)
 
 
 def write_text_if_changed(path: Path, content: str) -> None:

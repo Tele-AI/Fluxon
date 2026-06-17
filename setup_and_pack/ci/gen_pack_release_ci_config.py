@@ -23,8 +23,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out-dir",
         type=Path,
-        required=True,
+        default=None,
         help="Output directory for the generated pack_fluxonkv_pylib_env.yaml",
+    )
+    parser.add_argument(
+        "--out-path",
+        type=Path,
+        default=None,
+        help="Explicit output path for the generated pack_fluxonkv_pylib_env.yaml",
     )
     parser.add_argument(
         "--project-data-root",
@@ -44,8 +50,16 @@ def _resolve_repo_path(path: Path) -> Path:
 def main() -> int:
     args = _parse_args()
     env_template_path = _resolve_repo_path(args.env_template)
-    out_dir = args.out_dir.resolve()
-    env_out_path = out_dir / "pack_fluxonkv_pylib_env.yaml"
+    if args.out_path is not None and args.out_dir is not None:
+        raise RuntimeError("--out-dir and --out-path are mutually exclusive")
+    if args.out_path is None and args.out_dir is None:
+        raise RuntimeError("one of --out-dir or --out-path is required")
+    if args.out_path is not None:
+        env_out_path = args.out_path.resolve()
+        out_dir = env_out_path.parent
+    else:
+        out_dir = args.out_dir.resolve()
+        env_out_path = out_dir / "pack_fluxonkv_pylib_env.yaml"
 
     cfg = yaml.safe_load(env_template_path.read_text(encoding="utf-8"))
     if not isinstance(cfg, dict):

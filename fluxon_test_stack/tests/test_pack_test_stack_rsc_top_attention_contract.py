@@ -25,13 +25,8 @@ _PACK = _load_module()
 
 
 class TestPackTestStackRscTopAttentionContract(unittest.TestCase):
-    def test_ci_source_roots_cover_top_attention_code_paths(self) -> None:
-        self.assertIn("setup_and_pack", _PACK.CI_SOURCE_ROOT_NAMES)
-        self.assertIn("fluxon_py", _PACK.CI_SOURCE_ROOT_NAMES)
-        self.assertIn("fluxon_rs", _PACK.CI_SOURCE_ROOT_NAMES)
-        self.assertIn("deployment", _PACK.CI_SOURCE_ROOT_NAMES)
-        self.assertIn("examples", _PACK.CI_SOURCE_ROOT_NAMES)
-        self.assertIn("fluxon_test_stack", _PACK.CI_SOURCE_ROOT_NAMES)
+    def test_ci_source_tarball_is_repo_root_scoped(self) -> None:
+        self.assertEqual(_PACK.CI_SOURCE_ROOT_NAMES, (".",))
 
 
 if __name__ == "__main__":

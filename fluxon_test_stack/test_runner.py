@@ -107,6 +107,7 @@ CI_CLUSTER_RUNTIME_REMOTE_STAGE_VERIFY_RELPATHS = (
 )
 CI_RUNNER_REMOTE_STAGE_INCLUDE_RELPATHS = (
     "ci_runner.sh",
+    "ci_prepare_env.sh",
     "configs",
     "services/share_mem",
     "src",
@@ -308,12 +309,14 @@ SCENE_SUBJECT_KV = "kv"
 SCENE_SUBJECT_MQ = "mq"
 SCENE_SUBJECT_FS = "fs"
 SCENE_SUBJECT_RUST = "rust"
+SCENE_SUBJECT_DOC_PAGE = "doc_page"
 SCENE_SUBJECT_INFER = "infer"
 SCENE_SUBJECTS_ALLOWED = {
     SCENE_SUBJECT_KV,
     SCENE_SUBJECT_MQ,
     SCENE_SUBJECT_FS,
     SCENE_SUBJECT_RUST,
+    SCENE_SUBJECT_DOC_PAGE,
     SCENE_SUBJECT_INFER,
 }
 TEST_STACK_REQUEST_DISTRIBUTION_UNIFORM = "uniform"
@@ -338,6 +341,7 @@ SCENE_ENUMS_ALLOWED = {
     "ci_mq",
     "ci_fs",
     "ci_rust",
+    "ci_doc_page",
     "ci_fs_s3",
 }
 
@@ -866,6 +870,7 @@ def main() -> None:
                 workdir_root=str(workdir_root),
                 run_dir=str(run_dir),
                 ci_commands=planned_case.ci_commands,
+                ci_prepare_steps=planned_case.ci_prepare_steps,
                 execution_label=planned_case.label,
                 command_id=planned_case.command_id,
                 test_id=planned_case.test_id,
@@ -1125,6 +1130,7 @@ class _RunSlot:
 class _PlannedCase:
     case: _ResolvedCase
     ci_commands: Optional[List[Dict[str, Any]]]
+    ci_prepare_steps: Optional[List[Dict[str, Any]]]
     label: str
     command_id: Optional[str]
     test_id: Optional[str]
@@ -1283,6 +1289,71 @@ def _resolve_stack_contract_path(
     raise ValueError(f"{field_name} must stay under {prefix}/: {raw_path!r}")
 
 
+def _source_deployconf_primary_controller_target_opt(source_deployconf: Dict[str, Any]) -> Optional[str]:
+    services = source_deployconf.get("service")
+    if not isinstance(services, dict):
+        return None
+    ops_controller = services.get("ops_controller")
+    if not isinstance(ops_controller, dict):
+        return None
+    node_bind = ops_controller.get("node_bind")
+    if not isinstance(node_bind, dict):
+        return None
+    raw_nodes = node_bind.get("node")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        return None
+    first_node = raw_nodes[0]
+    if not isinstance(first_node, str) or not first_node.strip():
+        return None
+    return first_node.strip()
+
+
+def _source_deployconf_contract_hostworkdir(
+    source_deployconf: Dict[str, Any],
+    cluster_nodes: List[Any],
+) -> str:
+    hostworkdir_by_hostname: Dict[str, str] = {}
+    ordered_hostworkdirs: List[str] = []
+    seen_hostworkdirs: set[str] = set()
+    node_ips: set[str] = set()
+    all_local = True
+    for index, raw in enumerate(cluster_nodes):
+        node = _require_dict(raw, f"bootstrap source deployconf.cluster_nodes[{index}]")
+        hostname = _require_str(node.get("hostname"), f"bootstrap source deployconf.cluster_nodes[{index}].hostname")
+        hostworkdir = _require_str(node.get("hostworkdir"), f"bootstrap source deployconf.cluster_nodes[{index}].hostworkdir")
+        hostworkdir_by_hostname[hostname] = hostworkdir
+        if hostworkdir not in seen_hostworkdirs:
+            seen_hostworkdirs.add(hostworkdir)
+            ordered_hostworkdirs.append(hostworkdir)
+        node_ips.add(_require_str(node.get("ip"), f"bootstrap source deployconf.cluster_nodes[{index}].ip"))
+        execution_mode_raw = node.get("execution_mode", "ssh")
+        execution_mode = (
+            execution_mode_raw.strip()
+            if isinstance(execution_mode_raw, str)
+            else ""
+        )
+        if execution_mode != "local":
+            all_local = False
+    if len(ordered_hostworkdirs) == 1:
+        return ordered_hostworkdirs[0]
+
+    # Same-host logical nodes intentionally use per-node hostworkdirs to isolate local runtime state.
+    # The runner still needs one authority root to resolve `${HOSTWORKDIR}/...` stack contract paths.
+    # In that topology, anchor contract paths on the primary controller node.
+    if all_local and len(node_ips) == 1:
+        controller_target = _source_deployconf_primary_controller_target_opt(source_deployconf)
+        if controller_target is not None:
+            controller_hostworkdir = hostworkdir_by_hostname.get(controller_target)
+            if controller_hostworkdir is not None:
+                return controller_hostworkdir
+        return ordered_hostworkdirs[0]
+
+    raise ValueError(
+        "bootstrap source deployconf must use one shared hostworkdir across nodes for profile-scoped self-host stacks, "
+        "except for same-host local logical-node layouts"
+    )
+
+
 def _load_source_stack_contract() -> Dict[str, Any]:
     source_deployconf_path = _load_test_bed_deployconf_path()
     source_deployconf = _require_dict(
@@ -1290,14 +1361,7 @@ def _load_source_stack_contract() -> Dict[str, Any]:
         f"bootstrap source deployconf {source_deployconf_path}",
     )
     cluster_nodes = _require_list(source_deployconf.get("cluster_nodes"), "bootstrap source deployconf.cluster_nodes")
-    hostworkdirs: set[str] = set()
-    for index, raw in enumerate(cluster_nodes):
-        node = _require_dict(raw, f"bootstrap source deployconf.cluster_nodes[{index}]")
-        hostworkdirs.add(_require_str(node.get("hostworkdir"), f"bootstrap source deployconf.cluster_nodes[{index}].hostworkdir"))
-    if len(hostworkdirs) != 1:
-        raise ValueError(
-            "bootstrap source deployconf must use one shared hostworkdir across nodes for profile-scoped self-host stacks"
-        )
+    contract_hostworkdir = _source_deployconf_contract_hostworkdir(source_deployconf, cluster_nodes)
 
     global_envs = _require_dict(source_deployconf.get("global_envs"), "bootstrap source deployconf.global_envs")
     cluster_name = _require_str(
@@ -1313,13 +1377,13 @@ def _load_source_stack_contract() -> Dict[str, Any]:
         "bootstrap source deployconf.global_envs.FLUXON_SHARED_MEM2",
     )
     _resolve_stack_contract_path(
-        next(iter(hostworkdirs)),
+        contract_hostworkdir,
         shared_memory_hostworkdir,
         field_name="bootstrap source deployconf.global_envs.FLUXON_SHARED_MEM",
         allow_absolute=True,
     )
     _resolve_stack_contract_path(
-        next(iter(hostworkdirs)),
+        contract_hostworkdir,
         shared_file_hostworkdir,
         field_name="bootstrap source deployconf.global_envs.FLUXON_SHARED_MEM2",
         allow_absolute=False,
@@ -1348,7 +1412,7 @@ def _load_source_stack_contract() -> Dict[str, Any]:
         )
 
     return {
-        "hostworkdir": next(iter(hostworkdirs)),
+        "hostworkdir": contract_hostworkdir,
         # "cluster_name" here is the ops bed cluster name (from deployconf). The runner must not
         # reuse it for test workloads, otherwise we lose isolation and benchmarks collide with
         # long-lived ops members.
@@ -3525,6 +3589,14 @@ def _prepare_ci_case(
         overlay_live_checkout=True,
     )
 
+    prepare_env_exports = _run_ci_prepare_steps(
+        resolved_case=resolved_case,
+        run_dir=run_dir,
+        src_root=src_root,
+    )
+    if prepare_env_exports:
+        _write_ci_prepare_env_script(run_dir=run_dir, exports=prepare_env_exports)
+
     _write_ci_build_config_ext(
         resolved_case,
         out_dir=src_root,
@@ -4190,10 +4262,26 @@ def _ci_base_runtime_service_target_name(resolved_case: Dict[str, Any], *, servi
     return _require_str(svc.get("target"), f"resolved_case.profile.ci.runtime.base_runtime[{service_id!r}].target")
 
 
+def _target_uses_local_loopback(
+    resolved_case: Dict[str, Any],
+    *,
+    target_name: str,
+) -> bool:
+    cluster_nodes, _ = _load_test_stack_cluster_nodes_and_dispatch(resolved_case)
+    node_cfg = _require_dict(cluster_nodes.get(target_name), f"cluster_nodes[{target_name}]")
+    return _cluster_node_is_local_host(
+        node_cfg,
+        target_name=target_name,
+        local_ipv4_addrs=_local_ipv4_addresses(),
+    )
+
+
 def _ci_base_runtime_service_target_ip(resolved_case: Dict[str, Any], *, service_id: str) -> str:
+    target_name = _ci_base_runtime_service_target_name(resolved_case, service_id=service_id)
+    if _target_uses_local_loopback(resolved_case, target_name=target_name):
+        return "127.0.0.1"
     deploy = _require_dict(resolved_case.get("deploy"), "resolved_case.deploy")
     target_ip_map = _require_dict(deploy.get("target_ip_map"), "resolved_case.deploy.target_ip_map")
-    target_name = _ci_base_runtime_service_target_name(resolved_case, service_id=service_id)
     return _require_str(target_ip_map.get(target_name), f"deploy.target_ip_map[{service_id}]")
 
 
@@ -5723,7 +5811,10 @@ def _normalize_test_stack_target_hosts(
             exclude_hosts.append(_require_str(raw_host, f"{ctx}.exclude_hosts[{idx}]"))
 
     if "hosts" in targets:
-        _forbid_unknown_keys(targets, {"hosts", "exclude_hosts"}, ctx)
+        allowed_target_keys = {"hosts", "exclude_hosts"}
+        ordered_anchor_keys = ["primary"] if machine_count == 1 else ["primary", "secondary"] if machine_count == 2 else []
+        allowed_target_keys.update(ordered_anchor_keys)
+        _forbid_unknown_keys(targets, allowed_target_keys, ctx)
         if exclude_hosts:
             raise ValueError(f"{ctx}.exclude_hosts must not be combined with explicit hosts")
         hosts = _require_list(targets.get("hosts"), f"{ctx}.hosts")
@@ -5739,6 +5830,17 @@ def _normalize_test_stack_target_hosts(
                 raise ValueError(f"{ctx}.hosts contains duplicate target: {host!r}")
             seen.add(host)
             out_hosts.append(host)
+        for idx, key in enumerate(ordered_anchor_keys):
+            raw_anchor = targets.get(key)
+            if raw_anchor is None:
+                continue
+            anchor = _require_str(raw_anchor, f"{ctx}.{key}")
+            expected = out_hosts[idx]
+            if anchor != expected:
+                raise ValueError(
+                    f"{ctx}.{key} must match {ctx}.hosts[{idx}] when both are present: "
+                    f"expected {expected!r}, got {anchor!r}"
+                )
         return out_hosts
 
     if exclude_hosts is not None:
@@ -6002,6 +6104,31 @@ def _parse_ci_commands(raw_commands: Any, ctx: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _parse_ci_prepare_steps(raw_steps: Any, ctx: str) -> List[Dict[str, Any]]:
+    steps = _require_list(raw_steps, ctx)
+    if not steps:
+        raise ValueError(f"{ctx} must be non-empty")
+    out: List[Dict[str, Any]] = []
+    for i, raw_step in enumerate(steps):
+        step = _require_dict(raw_step, f"{ctx}[{i}]")
+        _forbid_unknown_keys(step, {"kind", "config", "cache_relpath"}, f"{ctx}[{i}]")
+        kind = _require_str(step.get("kind"), f"{ctx}[{i}].kind").strip()
+        if kind != "setup_dev_env":
+            raise ValueError(f"{ctx}[{i}].kind unsupported: {kind!r}")
+        rec: Dict[str, Any] = {
+            "kind": kind,
+            "config": _require_clean_relpath(step.get("config"), f"{ctx}[{i}].config"),
+        }
+        raw_cache_relpath = step.get("cache_relpath")
+        if raw_cache_relpath is not None:
+            rec["cache_relpath"] = _require_clean_relpath(
+                raw_cache_relpath,
+                f"{ctx}[{i}].cache_relpath",
+            )
+        out.append(rec)
+    return out
+
+
 def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
     kind = _scene_kind_from_item(item, ctx)
     _parse_scene_select(item, ctx)
@@ -6018,11 +6145,11 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
     if kind == SCENE_KIND_CI:
         _forbid_unknown_keys(item, {"ci", "select"}, ctx)
         ci = _require_dict(item.get("ci"), f"{ctx}.ci")
-        _forbid_unknown_keys(ci, {"subject", "commands", "runtime_contract"}, f"{ctx}.ci")
+        _forbid_unknown_keys(ci, {"subject", "commands", "runtime_contract", "prepare"}, f"{ctx}.ci")
         subject = _require_scene_subject(ci.get("subject"), f"{ctx}.ci.subject")
         if subject == SCENE_SUBJECT_INFER:
             raise ValueError(f"{ctx}.ci.subject must not be {SCENE_SUBJECT_INFER!r}")
-        item["ci"] = {
+        parsed_ci = {
             "subject": subject,
             "runtime_contract": _require_ci_runtime_contract(
                 ci.get("runtime_contract"),
@@ -6030,6 +6157,10 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
             ),
             "commands": _parse_ci_commands(ci.get("commands"), f"{ctx}.ci.commands"),
         }
+        raw_prepare = ci.get("prepare")
+        if raw_prepare is not None:
+            parsed_ci["prepare"] = _parse_ci_prepare_steps(raw_prepare, f"{ctx}.ci.prepare")
+        item["ci"] = parsed_ci
         return item
 
     _forbid_unknown_keys(item, {"test_stack", "select"}, ctx)
@@ -7497,6 +7628,11 @@ def _build_ci_execution_plan(case: _ResolvedCase, suite: _Suite) -> List[_Planne
     scene_ci = _require_dict(suite.scenes[case.scene_id].get("ci"), f"scene[{case.scene_id}].ci")
     raw_commands = _require_list(scene_ci.get("commands"), f"scene[{case.scene_id}].ci.commands")
     commands = [_require_dict(raw, f"scene[{case.scene_id}].ci.commands[]") for raw in raw_commands]
+    raw_prepare = scene_ci.get("prepare")
+    ci_prepare_steps = None if raw_prepare is None else _parse_ci_prepare_steps(
+        copy.deepcopy(raw_prepare),
+        f"scene[{case.scene_id}].ci.prepare",
+    )
 
     selected_commands: List[Dict[str, Any]] = []
     if selectors.command_ids is None:
@@ -7528,7 +7664,17 @@ def _build_ci_execution_plan(case: _ResolvedCase, suite: _Suite) -> List[_Planne
         for command in selected_commands:
             steps = _materialize_selected_ci_steps(case, command, selectors)
             for step in steps:
-                planned.append(_PlannedCase(case=case, ci_commands=[step], label=f"{case.case_id}::{_command_step_label(step)}", command_id=step["id"], test_id=step.get("test_id"), counted=False))
+                planned.append(
+                    _PlannedCase(
+                        case=case,
+                        ci_commands=[step],
+                        ci_prepare_steps=ci_prepare_steps,
+                        label=f"{case.case_id}::{_command_step_label(step)}",
+                        command_id=step["id"],
+                        test_id=step.get("test_id"),
+                        counted=False,
+                    )
+                )
         return planned
 
     grouped_steps: List[Dict[str, str]] = []
@@ -7536,7 +7682,7 @@ def _build_ci_execution_plan(case: _ResolvedCase, suite: _Suite) -> List[_Planne
         grouped_steps.extend(_materialize_selected_ci_steps(case, command, selectors))
     if not grouped_steps:
         return []
-    return [_PlannedCase(case=case, ci_commands=grouped_steps, label=case.case_id if selectors.command_ids is None and selectors.test_ids is None else f"{case.case_id}::selected", command_id=None, test_id=None, counted=selectors.command_ids is None and selectors.test_ids is None)]
+    return [_PlannedCase(case=case, ci_commands=grouped_steps, ci_prepare_steps=ci_prepare_steps, label=case.case_id if selectors.command_ids is None and selectors.test_ids is None else f"{case.case_id}::selected", command_id=None, test_id=None, counted=selectors.command_ids is None and selectors.test_ids is None)]
 
 
 def _build_execution_plan(suite: _Suite, cases: List[_ResolvedCase]) -> List[_PlannedCase]:
@@ -7568,7 +7714,7 @@ def _build_execution_plan(suite: _Suite, cases: List[_ResolvedCase]) -> List[_Pl
 
         if suite.run_selectors.command_ids is not None or suite.run_selectors.test_ids is not None:
             continue
-        planned.append(_PlannedCase(case=case, ci_commands=None, label=case.case_id, command_id=None, test_id=None, counted=suite.run_mode == RUN_MODE_FULL_ONCE))
+        planned.append(_PlannedCase(case=case, ci_commands=None, ci_prepare_steps=None, label=case.case_id, command_id=None, test_id=None, counted=suite.run_mode == RUN_MODE_FULL_ONCE))
 
     if suite.run_selectors.command_ids is not None:
         missing_command_ids = [command_id for command_id in suite.run_selectors.command_ids if command_id not in matched_command_ids]
@@ -8162,6 +8308,7 @@ def _build_resolved_case_yaml(
     workdir_root: str,
     run_dir: str,
     ci_commands: Optional[List[Dict[str, str]]],
+    ci_prepare_steps: Optional[List[Dict[str, Any]]],
     execution_label: str,
     command_id: Optional[str],
     test_id: Optional[str],
@@ -8249,10 +8396,6 @@ def _build_resolved_case_yaml(
             "resolved_case.scene_source.ci.runtime_contract",
         )
         topology = _require_test_stack_machine_count(scale_src.get("topology"), "resolved_case.scale_source.topology")
-        if runtime_contract == CI_RUNTIME_CONTRACT_CLUSTER_KV_OWNER and topology != 2:
-            raise ValueError(
-                f"CI runtime_contract={runtime_contract!r} requires topology=2, got: {topology!r}"
-            )
         targets = copy.deepcopy(_require_dict(scale_src.get("targets"), "resolved_case.scale_source.targets"))
         scale_out: Dict[str, Any] = {
             "duration_seconds": _require_int(scale_src.get("duration_seconds"), "scale.duration_seconds", min_v=1),
@@ -8288,6 +8431,8 @@ def _build_resolved_case_yaml(
                 "commands": copy.deepcopy(ci_commands),
             }
         }
+        if ci_prepare_steps is not None:
+            scene["ci"]["prepare"] = copy.deepcopy(ci_prepare_steps)
         scale = scale_out
         profile = {
             "deploy": deploy_out,
@@ -10792,6 +10937,36 @@ def _ensure_path_symlink(*, link_path: Path, target_path: Path) -> None:
         else:
             link_path.unlink()
     os.symlink(str(target_path), str(link_path), target_is_directory=target_path.is_dir())
+
+
+def _materialize_ci_runtime_release_view(
+    *,
+    release_root: Path,
+    test_rsc_root: Path,
+    release_view_root: Path,
+) -> None:
+    """Build the repo-visible runtime release view expected by CI commands.
+
+    The case-local `test_rsc_root` is the authority for `fluxon_release/test_rsc` inside
+    the run workspace. The source release may already carry a top-level `test_rsc/`
+    container (for example local cache reuse from the repo's release root), so the
+    runtime view must reconstruct top-level entries explicitly instead of symlinking the
+    entire release root wholesale.
+    """
+    if release_view_root.exists():
+        raise ValueError(f"src runtime release path already exists (no overwrite): {release_view_root}")
+    release_view_root.mkdir(parents=True, exist_ok=False)
+    for child in sorted(release_root.iterdir(), key=lambda p: p.name):
+        if child.name == "test_rsc":
+            continue
+        _ensure_path_symlink(
+            link_path=release_view_root / child.name,
+            target_path=child,
+        )
+    _ensure_path_symlink(
+        link_path=release_view_root / "test_rsc",
+        target_path=test_rsc_root,
+    )
 
 
 def _release_manifest_relpaths(manifest_path: Path) -> List[str]:
@@ -14098,13 +14273,11 @@ def _ci_prepare_run_inputs(
     if not build_config_ext_path.exists():
         build_config_ext_path.write_text("", encoding="utf-8")
     release_link_path = src_root / "fluxon_release"
-    if release_link_path.exists():
-        raise ValueError(f"src runtime release path already exists (no overwrite): {release_link_path}")
-    os.symlink(str(release_root), str(release_link_path), target_is_directory=True)
-    test_rsc_link_path = release_link_path / "test_rsc"
-    if test_rsc_link_path.exists():
-        raise ValueError(f"src runtime test_rsc path already exists (no overwrite): {test_rsc_link_path}")
-    os.symlink(str(test_rsc_root), str(test_rsc_link_path), target_is_directory=True)
+    _materialize_ci_runtime_release_view(
+        release_root=release_root,
+        test_rsc_root=test_rsc_root,
+        release_view_root=release_link_path,
+    )
 
     wheel = release_root / wheel_name
     _run_subprocess(
@@ -14220,6 +14393,7 @@ def _ci_cluster_member_target_ips(resolved_case: Dict[str, Any]) -> List[str]:
 def _resolved_ci_command_list(resolved_case: Dict[str, Any]) -> List[Dict[str, str]]:
     scene = _require_dict(resolved_case.get("scene"), "resolved_case.scene")
     ci = _require_dict(scene.get("ci"), "resolved_case.scene.ci")
+    _forbid_unknown_keys(ci, {"subject", "commands", "runtime_contract", "prepare"}, "resolved_case.scene.ci")
     raw_commands = _require_list(ci.get("commands"), "resolved_case.scene.ci.commands")
     if not raw_commands:
         raise ValueError("resolved_case.scene.ci.commands must be non-empty")
@@ -14238,6 +14412,39 @@ def _resolved_ci_command_list(resolved_case: Dict[str, Any]) -> List[Dict[str, s
             )
         commands.append(rec)
     return commands
+
+
+def _resolved_ci_prepare_steps(resolved_case: Dict[str, Any]) -> List[Dict[str, Any]]:
+    scene = _require_dict(resolved_case.get("scene"), "resolved_case.scene")
+    ci = _require_dict(scene.get("ci"), "resolved_case.scene.ci")
+    raw_prepare = ci.get("prepare")
+    if raw_prepare is None:
+        return []
+    steps = _require_list(raw_prepare, "resolved_case.scene.ci.prepare")
+    if not steps:
+        raise ValueError("resolved_case.scene.ci.prepare must be non-empty when present")
+    out: List[Dict[str, Any]] = []
+    for i, raw_step in enumerate(steps):
+        step = _require_dict(raw_step, f"resolved_case.scene.ci.prepare[{i}]")
+        _forbid_unknown_keys(step, {"kind", "config", "cache_relpath"}, f"resolved_case.scene.ci.prepare[{i}]")
+        kind = _require_str(step.get("kind"), f"resolved_case.scene.ci.prepare[{i}].kind")
+        if kind != "setup_dev_env":
+            raise ValueError(f"resolved_case.scene.ci.prepare[{i}].kind unsupported: {kind!r}")
+        rec: Dict[str, Any] = {
+            "kind": kind,
+            "config": _require_clean_relpath(
+                step.get("config"),
+                f"resolved_case.scene.ci.prepare[{i}].config",
+            ),
+        }
+        raw_cache_relpath = step.get("cache_relpath")
+        if raw_cache_relpath is not None:
+            rec["cache_relpath"] = _require_clean_relpath(
+                raw_cache_relpath,
+                f"resolved_case.scene.ci.prepare[{i}].cache_relpath",
+            )
+        out.append(rec)
+    return out
 
 
 def _ci_command_contract_from_planned(ci_commands: Optional[List[Dict[str, Any]]], *, ctx: str) -> List[Dict[str, Any]]:
@@ -14280,6 +14487,78 @@ def _ci_command_contract_from_resolved_case(resolved_case: Dict[str, Any]) -> Li
             )
         contract.append(rec)
     return contract
+
+
+def _ci_prepare_env_path(*, run_dir: Path) -> Path:
+    return (run_dir / "ci_prepare_env.sh").resolve()
+
+
+def _write_ci_prepare_env_script(*, run_dir: Path, exports: Dict[str, str]) -> Path:
+    out_path = _ci_prepare_env_path(run_dir=run_dir)
+    lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
+    for name, value in sorted(exports.items()):
+        lines.append(f"export {name}={_shell_quote(value)}")
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(out_path, 0o755)
+    return out_path
+
+
+def _run_ci_prepare_steps(*, resolved_case: Dict[str, Any], run_dir: Path, src_root: Path) -> Dict[str, str]:
+    prepare_steps = _resolved_ci_prepare_steps(resolved_case)
+    if not prepare_steps:
+        return {}
+
+    exports: Dict[str, str] = {}
+    for index, step in enumerate(prepare_steps):
+        kind = _require_str(step.get("kind"), f"resolved_case.scene.ci.prepare[{index}].kind")
+        if kind != "setup_dev_env":
+            raise ValueError(f"unsupported CI prepare step kind: {kind!r}")
+        step_exports = _run_ci_prepare_setup_dev_env_step(
+            step=step,
+            run_dir=run_dir,
+            src_root=src_root,
+            step_index=index,
+        )
+        for key, value in step_exports.items():
+            exports[key] = value
+    return exports
+
+
+def _run_ci_prepare_setup_dev_env_step(
+    *,
+    step: Dict[str, Any],
+    run_dir: Path,
+    src_root: Path,
+    step_index: int,
+) -> Dict[str, str]:
+    config_relpath = _require_clean_relpath(
+        step.get("config"),
+        f"resolved_case.scene.ci.prepare[{step_index}].config",
+    )
+    setup_script = (_runner_repo_root() / "setup_and_pack" / "setup_dev_env.py").resolve()
+    setup_workdir = src_root
+    argv = [
+        sys.executable,
+        str(setup_script),
+        "--workdir",
+        str(setup_workdir),
+        "--config",
+        config_relpath,
+    ]
+    _run_subprocess(argv, cwd=str(src_root))
+
+    cache_relpath = step.get("cache_relpath")
+    if cache_relpath is None:
+        return {}
+    cache_root = (src_root / _require_clean_relpath(cache_relpath, f"resolved_case.scene.ci.prepare[{step_index}].cache_relpath")).resolve()
+    node_bin = (cache_root / "node" / "bin").resolve()
+    if not node_bin.is_dir():
+        raise ValueError(f"CI prepare step did not materialize node bin directory: {node_bin}")
+    current_path = os.environ.get("PATH", "")
+    return {
+        "FLUXON_CI_PREPARE_NODE_BIN": str(node_bin),
+        "PATH": f"{node_bin}:{current_path}" if current_path else str(node_bin),
+    }
 
 
 def _ci_runner_exit_code_timeout_seconds(resolved_case: Dict[str, Any]) -> int:
@@ -14459,6 +14738,12 @@ fi
 	  done
 	}}
 exec >"$log_dir/stdout.log" 2>&1
+
+prepare_env_path="{_ci_prepare_env_path(run_dir=run_dir).as_posix()}"
+if [ -f "$prepare_env_path" ]; then
+  # CI case prepare writes explicit environment exports here.
+  . "$prepare_env_path"
+fi
 
 # Run from src_root so repo-local test commands execute inside the prepared runtime source tree.
 cd {src_root.as_posix()}
