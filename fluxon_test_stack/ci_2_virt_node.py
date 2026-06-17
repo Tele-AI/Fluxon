@@ -22,6 +22,9 @@ DEFAULT_START_TEST_BED_TEMPLATE = REPO_ROOT / "fluxon_test_stack" / "start_test_
 DEFAULT_PACK_RELEASE_ENV_TEMPLATE = REPO_ROOT / "setup_and_pack" / "pack_fluxonkv_pylib_env.yaml.template"
 DEFAULT_PACK_RELEASE_ENV_GEN_SCRIPT = REPO_ROOT / "setup_and_pack" / "ci" / "gen_pack_release_ci_config.py"
 DEFAULT_PACK_RELEASE_STATIC_CONFIG = REPO_ROOT / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_static.yaml"
+DEFAULT_RATHER_NO_GIT_SUBMODULE_SCRIPT = (
+    REPO_ROOT / "fluxon_rs" / "scripts" / "rather_no_git_submodule.py"
+)
 DEFAULT_CI_2_VIRT_NODE_WORKDIR = REPO_ROOT / ".dever" / "ci_2_virt_node"
 DEFAULT_RELEASE_DIR = REPO_ROOT / "fluxon_release"
 DOC_SITE_BASE_URL_ENV = "FLUXON_DOC_SITE_BASE_URL"
@@ -614,6 +617,15 @@ def _ensure_ci_pack_release_env(
     return resolved_env_path
 
 
+def _sync_rather_no_git_submodule(
+    script_path: Path = DEFAULT_RATHER_NO_GIT_SUBMODULE_SCRIPT,
+) -> None:
+    resolved_script_path = script_path.resolve()
+    if not resolved_script_path.is_file():
+        raise RuntimeError(f"missing rather_no_git_submodule entrypoint: {resolved_script_path}")
+    _run([sys.executable, str(resolved_script_path)])
+
+
 def _render_ci_nix_pack_config(
     *,
     static_config_path: Path,
@@ -781,10 +793,10 @@ def main() -> int:
     ci_pack_env_path = (generated_dir / "setup_and_pack" / "pack_fluxonkv_pylib_env.yaml").resolve()
     ci_nix_pack_config_path = (generated_dir / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_ci.yaml").resolve()
 
-    if not args.skip_builder_image:
-        _run([sys.executable, str((REPO_ROOT / "setup_and_pack" / "build_pack_fluxonkv_pylib_img.py").resolve())])
-
     if not args.skip_pack:
+        _sync_rather_no_git_submodule()
+        if not args.skip_builder_image:
+            _run([sys.executable, str((REPO_ROOT / "setup_and_pack" / "build_pack_fluxonkv_pylib_img.py").resolve())])
         _prepare_pack_release_runtime_dirs(project_data_root=pack_release_runtime_root)
         _ensure_ci_pack_release_env(
             project_data_root=pack_release_runtime_root,

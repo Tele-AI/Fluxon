@@ -278,6 +278,20 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             self.assertTrue((root / "manylinux-cache" / "cargo-registry").is_dir())
             self.assertTrue((root / "manylinux-cache" / "cargo-git").is_dir())
 
+    def test_sync_rather_no_git_submodule_uses_canonical_entrypoint(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], *, env=None) -> None:
+            del env
+            calls.append(list(argv))
+
+        with mock.patch.object(_ENTRY, "_run", side_effect=fake_run):
+            _ENTRY._sync_rather_no_git_submodule()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], sys.executable)
+        self.assertEqual(calls[0][1], str(_ENTRY.DEFAULT_RATHER_NO_GIT_SUBMODULE_SCRIPT.resolve()))
+
     def test_doc_build_env_sets_base_url(self) -> None:
         env = _ENTRY._doc_build_env(base_url="tele-ai.github.io/Fluxon")
         self.assertEqual(env["FLUXON_DOC_SITE_BASE_URL"], "tele-ai.github.io/Fluxon")
@@ -338,6 +352,58 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             self.assertEqual(
                 runner_env["FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT"],
                 str((REPO_ROOT / "fluxon_release").resolve()),
+            )
+
+    def test_main_syncs_rather_no_git_submodule_before_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workdir = root / "ci_2_virt_node_workdir"
+            hostworkdir = root / "hostworkdir"
+            release_dir = REPO_ROOT / "fluxon_release"
+            release_dir.mkdir(parents=True, exist_ok=True)
+            wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path.write_text("", encoding="utf-8")
+            calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+            def fake_run(argv: list[str], *, env=None) -> None:
+                calls.append((list(argv), None if env is None else dict(env)))
+
+            argv = [
+                "ci_2_virt_node.py",
+                "--workdir",
+                str(workdir),
+                "--hostworkdir",
+                str(hostworkdir),
+                "--scene-id",
+                "ci_kv",
+                "--skip-builder-image",
+                "--skip-dispatch",
+                "--skip-start-testbed",
+                "--skip-runner",
+                "--skip-doc-build",
+            ]
+            original_argv = sys.argv[:]
+            try:
+                with mock.patch.object(_ENTRY, "_run", side_effect=fake_run):
+                    with mock.patch.object(_ENTRY, "_detect_local_hostname", return_value="runner-host"):
+                        with mock.patch.object(_ENTRY, "_detect_local_ipv4", return_value="127.0.0.1"):
+                            with mock.patch.object(_ENTRY, "_ensure_ci_pack_release_env", return_value=Path("/tmp/env.yaml")):
+                                with mock.patch.object(_ENTRY, "_render_ci_nix_pack_config", return_value=Path("/tmp/cfg.yaml")):
+                                    sys.argv = argv
+                                    rc = _ENTRY.main()
+            finally:
+                sys.argv = original_argv
+                wheel_path.unlink(missing_ok=True)
+
+            self.assertEqual(rc, 0)
+            self.assertGreaterEqual(len(calls), 1)
+            self.assertEqual(
+                calls[0][0],
+                [sys.executable, str(_ENTRY.DEFAULT_RATHER_NO_GIT_SUBMODULE_SCRIPT.resolve())],
+            )
+            self.assertEqual(
+                calls[1][0][1],
+                str((REPO_ROOT / "fluxon_test_stack" / "pack_test_stack_rsc.py").resolve()),
             )
 
     def test_main_uses_apply_check_config_for_explicit_apply_validation(self) -> None:

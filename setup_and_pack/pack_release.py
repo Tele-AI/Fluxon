@@ -34,6 +34,7 @@ from setup_and_pack.utils import wheel_runtime_helper
 PYO3_CHECKSUM_FILE_NAME = ".fluxon_pyo3_inputs.sha256"
 _FIXED_TRANSPORT_BACKEND = script_utils.PUBLIC_TRANSPORT_BACKEND
 _FIXED_TRANSPORT_PROFILE_ID = script_utils.PUBLIC_TRANSPORT_PROFILE_ID
+RATHER_NO_GIT_SUBMODULE_PATH = REPO_ROOT / "fluxon_rs" / "scripts" / "rather_no_git_submodule.py"
 
 
 def _top_level_release_manifest_relpaths(*, wheel_name: str) -> list[str]:
@@ -117,6 +118,8 @@ def main() -> int:
             if args.release_dir is not None
             else (repo_root / "fluxon_release")
         )
+        with script_utils.stage("Syncing external source repos"):
+            _sync_external_source_repos(repo_root=repo_root)
         _run_pack_steps(
             repo_root,
             release_dir=release_dir,
@@ -192,6 +195,14 @@ def _resolve_repo_root_cli_path(*, repo_root: Path, raw_path: Path, field_name: 
     if not resolved:
         raise RuntimeError(f"failed to resolve {field_name} against repo root: raw={raw_path}")
     return resolved
+
+
+def _sync_external_source_repos(*, repo_root: Path) -> None:
+    sync_script = RATHER_NO_GIT_SUBMODULE_PATH.resolve()
+    if not sync_script.exists() or not sync_script.is_file():
+        print(f"Missing external source sync script: {sync_script}")
+        raise SystemExit(1)
+    subprocess.check_call([sys.executable, str(sync_script)], cwd=str(repo_root))
 
 
 def _run_pack_steps(

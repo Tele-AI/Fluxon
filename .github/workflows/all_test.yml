@@ -1,6 +1,7 @@
 name: ci_2_virt_node
 
 on:
+  push:
   pull_request:
     types:
       - opened
@@ -65,6 +66,9 @@ jobs:
 
       - name: Install Python dependencies
         run: python3 -m pip install PyYAML
+
+      - name: Sync rather_no_git_submodule workspace inputs
+        run: python3 fluxon_rs/scripts/rather_no_git_submodule.py
 
       - name: Run ci_2_virt_node full flow
         env:

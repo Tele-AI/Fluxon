@@ -1,4 +1,4 @@
 modules:
   - path: fluxon_rs/moka
-    repo: https://github.com/AI-Infra-Team/moka/
-    checkout: origin/main
+    repo: https://github.com/ActivePeter/moka
+    checkout: main
