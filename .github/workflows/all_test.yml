@@ -1,30 +1,12 @@
 name: all_test
 
 on:
+  push:
   pull_request:
     types:
       - opened
       - synchronize
       - reopened
-    # Rebuild when doc or homepage inputs change.
-    paths:
-      - ".github/workflows/all_test.yml"
-      - ".github/workflows/docs-pages.yml"
-      - "setup.py"
-      - "fluxon_py/**"
-      - "fluxon_rs/**"
-      - "setup_and_pack/**"
-      - "deployment/**"
-      - "examples/**"
-      - "fluxon_release/install.py"
-      - "fluxon_release/closed_sdk/**"
-      - "fluxon_doc/**"
-      - "README.md"
-      - "README_CN.md"
-      - "pics/**"
-      - "LICENSE"
-      - "fluxon_rs/rust-toolchain.toml"
-      - "scripts/build_doc_site.py"
 
 permissions:
   contents: read
