@@ -7,7 +7,8 @@ configured ref. If any existing module has local modifications, it fails fast an
 so the user can handle their workspace explicitly.
 
 CLI:
-  -c/--config: YAML config path (optional; defaults to setup_and_pack/rather_no_git_submodule.yaml under workdir)
+  -c/--config: YAML config path (optional; defaults to
+                setup_and_pack/rather_no_git_submodule.yaml)
   -w/--workdir: repo root (optional; defaults to the repo root inferred from this script path)
 
 Config schema (YAML):
