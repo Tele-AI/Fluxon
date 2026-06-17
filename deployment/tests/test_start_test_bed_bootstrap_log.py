@@ -151,6 +151,45 @@ def test_rc255_recovers_from_atomic_ready_marker() -> None:
         print("PASS: test_rc255_recovers_from_atomic_ready_marker")
 
 
+def test_failed_status_includes_bootstrap_and_service_log_tails() -> None:
+    module = _load_start_test_bed_module()
+    with tempfile.TemporaryDirectory(prefix="test_start_test_bed_failure_tails_") as td:
+        root = Path(td)
+        bootstrap_log = root / "tikv.bootstrap.log"
+        bootstrap_log.write_text("[bare] probable-ready failed svc=tikv\n", encoding="utf-8")
+        service_log = root / "monitor" / "tikv" / "store" / "tikv.log"
+        service_log.parent.mkdir(parents=True, exist_ok=True)
+        service_log.write_text("FATAL: connect to PD failed\n", encoding="utf-8")
+        local_node_cfg = {
+            "hostname": "node-a",
+            "hostworkdir": str(root),
+        }
+        result = _build_result(
+            bootstrap_log_path=bootstrap_log,
+            launcher_rc=1,
+            selection_name="tikv",
+            bare_script_name="tikv",
+            node_name="node-a",
+            expected_service_names=["tikv"],
+        )
+        statuses = module._collect_bare_runtime_statuses(
+            deployconf={},
+            cluster_nodes={},
+            local_node_cfg=local_node_cfg,
+            result=result,
+        )
+        assert len(statuses) == 1, statuses
+        status = statuses[0]
+        assert status["present"] is False, status
+        assert status["running"] is False, status
+        assert status["log_path"] == str(service_log), status
+        err = status["status_error"]
+        assert isinstance(err, str) and "bootstrap_log_tail=" in err, err
+        assert "service_log_tail=" in err, err
+        assert "connect to PD failed" in err, err
+        print("PASS: test_failed_status_includes_bootstrap_and_service_log_tails")
+
+
 def test_direct_supervisor_status_path_is_rejected() -> None:
     module = _load_start_test_bed_module()
     try:

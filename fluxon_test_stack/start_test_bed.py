@@ -1484,6 +1484,18 @@ def _read_text_tail(path: Path, *, max_bytes: int = 8192) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _bare_service_runtime_log_path(*, local_node_cfg: dict[str, Any], service_name: str) -> Path | None:
+    hostworkdir = local_node_cfg.get("hostworkdir")
+    if not isinstance(hostworkdir, str) or not hostworkdir.strip():
+        return None
+    root = Path(hostworkdir)
+    if service_name == "tikv":
+        return root / "monitor" / "tikv" / "store" / "tikv.log"
+    if service_name == "tikv_pd":
+        return root / "monitor" / "tikv" / "pd" / "pd.log"
+    return root / "log" / f"{service_name}.log"
+
+
 def _test_runner_ui_health_payload(*, probe_url: str, timeout_seconds: float) -> dict[str, Any] | None:
     req = urllib.request.Request(probe_url.rstrip("/") + "/health", method="GET")
     try:
@@ -3371,13 +3383,30 @@ def _collect_bare_runtime_statuses(
         raise ValueError("bare_launch_result.bootstrap_log_path must be a Path")
     statuses: list[dict[str, Any]] = []
     for service_name in expected_service_names:
+        runtime_log_path = _bare_service_runtime_log_path(
+            local_node_cfg=local_node_cfg,
+            service_name=service_name,
+        )
+        status_error = None if confirmed_ready else ready_error
+        if not confirmed_ready:
+            detail_parts: list[str] = []
+            if isinstance(ready_error, str) and ready_error:
+                detail_parts.append(ready_error)
+            bootstrap_tail = _read_text_tail(bootstrap_log_path)
+            if bootstrap_tail:
+                detail_parts.append(f"bootstrap_log_tail={bootstrap_tail!r}")
+            if runtime_log_path is not None:
+                runtime_tail = _read_text_tail(runtime_log_path)
+                if runtime_tail:
+                    detail_parts.append(f"service_log_tail={runtime_tail!r}")
+            status_error = " | ".join(detail_parts) if detail_parts else ready_error
         statuses.append({
             "service_name": service_name,
             "present": confirmed_ready,
             "running": confirmed_ready,
-            "log_path": str(bootstrap_log_path),
+            "log_path": str(runtime_log_path if runtime_log_path is not None else bootstrap_log_path),
             "status_source": ready_source,
-            "status_error": None if confirmed_ready else ready_error,
+            "status_error": status_error,
         })
     return statuses
 

@@ -49,6 +49,8 @@ STANDALONE_STARTUP_DEADLINE_SECONDS = 60
 ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS = 10 * 60
 HOSTWORKDIR_RUNTIME_TOKEN = "${HOSTWORKDIR}"
 REPO_ROOT = SCRIPT_DIR.parent
+TCP_READY_STABLE_SECONDS = 2
+TCP_READY_POLL_INTERVAL_SECONDS = 0.2
 
 
 def _resolve_repo_root_cli_path(*, raw_path: Path, field_name: str) -> Path:
@@ -365,6 +367,7 @@ def _render_standalone_start_script(
         + _render_common_node_resolution_tail(service_name=service_name)
         + _render_selection_supervisor_path_from_script_dir()
         + _render_proc_lifecycle_pid_tree_helpers()
+        + _render_tcp_ready_helpers()
         + _render_selection_present_probe_fn()
         + _render_start_lock_block()
         + _render_global_env_exports(global_envs)
@@ -435,6 +438,7 @@ def _render_atomic_group_start_script(
         + _render_atomic_group_node_resolution_tail(group_cfg["nodes"])
         + _render_selection_supervisor_path_from_script_dir()
         + _render_proc_lifecycle_pid_tree_helpers()
+        + _render_tcp_ready_helpers()
         + _render_global_env_exports(global_envs)
         + f"GROUP_STARTUP_DEADLINE_TS=$(( $(date +%s) + {ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS} ))\n"
         + "".join(service_blocks)
@@ -599,6 +603,69 @@ def _render_proc_lifecycle_pid_tree_helpers() -> str:
     return render_bash_proc_lifecycle_funcs_pid_tree(timeouts=STOP_TIMEOUTS) + "\n\n"
 
 
+def _render_tcp_ready_helpers() -> str:
+    return (
+        "wait_service_tcp_ready() {\n"
+        + '  svc="$1"\n'
+        + '  host="$2"\n'
+        + '  port="$3"\n'
+        + '  stable_seconds="$4"\n'
+        + '  deadline_ts="$5"\n'
+        + '  context="$6"\n'
+        + '  if [[ ! "$port" =~ ^[0-9]+$ ]]; then\n'
+        + '    echo "$context tcp-ready: invalid port svc=$svc port=$port"\n'
+        + "    return 1\n"
+        + "  fi\n"
+        + '  if [[ ! "$stable_seconds" =~ ^[0-9]+$ ]] || [ "$stable_seconds" -le 0 ]; then\n'
+        + '    echo "$context tcp-ready: invalid stable_seconds svc=$svc stable_seconds=$stable_seconds"\n'
+        + "    return 1\n"
+        + "  fi\n"
+        + f"  poll_interval_seconds={TCP_READY_POLL_INTERVAL_SECONDS}\n"
+        + '  stable_checks=$(python3 - "$stable_seconds" "$poll_interval_seconds" <<\'__FLUXON_TCP_READY_CHECKS__\'\n'
+        + "import math\n"
+        + "import sys\n"
+        + "stable_seconds = float(sys.argv[1])\n"
+        + "poll_interval_seconds = float(sys.argv[2])\n"
+        + "print(max(1, int(math.ceil(stable_seconds / poll_interval_seconds))))\n"
+        + "__FLUXON_TCP_READY_CHECKS__\n"
+        + ")\n"
+        + '  if [[ ! "$stable_checks" =~ ^[0-9]+$ ]] || [ "$stable_checks" -le 0 ]; then\n'
+        + '    echo "$context tcp-ready: failed to compute stable_checks svc=$svc"\n'
+        + "    return 1\n"
+        + "  fi\n"
+        + "  ok_checks=0\n"
+        + "  while true; do\n"
+        + '    now=$(date +%s)\n'
+        + '    if [ "$now" -ge "$deadline_ts" ]; then\n'
+        + '      echo "$context tcp-ready: deadline exceeded svc=$svc host=$host port=$port"\n'
+        + "      return 1\n"
+        + "    fi\n"
+        + '    if python3 - "$host" "$port" <<\'__FLUXON_TCP_READY_PROBE__\'\n'
+        + "import socket\n"
+        + "import sys\n"
+        + "host = sys.argv[1]\n"
+        + "port = int(sys.argv[2])\n"
+        + "with socket.create_connection((host, port), timeout=1.0):\n"
+        + "    pass\n"
+        + "__FLUXON_TCP_READY_PROBE__\n"
+        + "    then\n"
+        + "      ok_checks=$((ok_checks+1))\n"
+        + '      if [ "$ok_checks" -ge "$stable_checks" ]; then\n'
+        + '        echo "$context tcp-ready: ok svc=$svc host=$host port=$port stable_checks=$stable_checks"\n'
+        + "        return 0\n"
+        + "      fi\n"
+        + "    else\n"
+        + '      if [ "$ok_checks" -ne 0 ]; then\n'
+        + '        echo "$context tcp-ready: reset svc=$svc ok_checks=$ok_checks host=$host port=$port"\n'
+        + "      fi\n"
+        + "      ok_checks=0\n"
+        + "    fi\n"
+        + '    sleep "$poll_interval_seconds"\n'
+        + "  done\n"
+        + "}\n\n"
+    )
+
+
 def _render_selection_present_probe_fn() -> str:
     return (
         "selection_present() {\n"
@@ -645,6 +712,17 @@ def _render_selection_supervisor_launch_wait_block(
         + f' "{context}"; then\n'
         + f'  echo "{context} probable-ready failed svc=$SERVICE label=$SUPERVISOR_LABEL supervisor_pid=$SUPERVISOR_PID"\n'
         + "  exit 1\n"
+        + "fi\n"
+    )
+
+
+def _render_tcp_ready_wait_block(*, context: str) -> str:
+    return (
+        'if [[ "${SERVICE_PORT:-}" =~ ^[0-9]+$ ]]; then\n'
+        + f'  if ! wait_service_tcp_ready "$SERVICE" "$HOST_IP" "$SERVICE_PORT" {TCP_READY_STABLE_SECONDS} "$STARTUP_DEADLINE_TS" "{context}"; then\n'
+        + f'    echo "{context} tcp-ready failed svc=$SERVICE host=$HOST_IP port=$SERVICE_PORT"\n'
+        + "    exit 1\n"
+        + "  fi\n"
         + "fi\n"
     )
 
@@ -715,6 +793,7 @@ def _render_standalone_start_body(*, name_prefix: str, service_name: str) -> str
             deadline_ts_expr='"$STARTUP_DEADLINE_TS"',
             context="[bare]",
         )
+        + _render_tcp_ready_wait_block(context="[bare]")
         + 'echo "Started $SERVICE (label: $SUPERVISOR_LABEL)"\n'
         + 'echo "Logs: $LOGFILE"\n'
     )
@@ -810,6 +889,11 @@ def _render_atomic_group_service_block(
                 deadline_ts_expr='"$GROUP_STARTUP_DEADLINE_TS"',
                 context="[rollout]",
             ).rstrip() + "\n",
+            prefix="  ",
+        ).rstrip()
+        + "\n"
+        + _indent_script_block(
+            script=_render_tcp_ready_wait_block(context="[rollout]"),
             prefix="  ",
         ).rstrip()
         + "\n"
