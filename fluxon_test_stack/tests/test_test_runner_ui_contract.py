@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import socket
@@ -40,6 +41,58 @@ _RUNNER = _load_module()
 
 
 class TestTestRunnerUiContract(unittest.TestCase):
+    def test_ci_wait_progress_tail_reads_incremental_remote_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            with mock.patch.object(
+                _RUNNER,
+                "_instance_read_text_if_present",
+                return_value="line1\nline2\nline3\n",
+            ):
+                offset, chunk = _RUNNER._ci_wait_progress_tail(
+                    {},
+                    run_dir=run_dir,
+                    last_offset=6,
+                )
+        self.assertEqual(offset, len("line1\nline2\nline3\n"))
+        self.assertEqual(chunk, "line2\nline3\n")
+
+    def test_print_ci_wait_progress_emits_heartbeat_when_no_new_tail(self) -> None:
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            with mock.patch.object(_RUNNER, "_ci_wait_progress_tail", return_value=(0, "")):
+                with mock.patch.object(_RUNNER.time, "time", return_value=100.0):
+                    with mock.patch.object(_RUNNER.sys, "stdout", buf):
+                        offset, next_heartbeat = _RUNNER._print_ci_wait_progress(
+                            {},
+                            run_dir=run_dir,
+                            last_offset=0,
+                            next_heartbeat_at=90.0,
+                            deadline=160.0,
+                        )
+        self.assertEqual(offset, 0)
+        self.assertEqual(next_heartbeat, 115.0)
+        self.assertIn("[CI wait exit_code] waiting for ci_runner progress...", buf.getvalue())
+
+    def test_print_ci_wait_progress_emits_new_tail(self) -> None:
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            with mock.patch.object(_RUNNER, "_ci_wait_progress_tail", return_value=(12, "a\nb\n")):
+                with mock.patch.object(_RUNNER.time, "time", return_value=100.0):
+                    with mock.patch.object(_RUNNER.sys, "stdout", buf):
+                        offset, next_heartbeat = _RUNNER._print_ci_wait_progress(
+                            {},
+                            run_dir=run_dir,
+                            last_offset=0,
+                            next_heartbeat_at=999.0,
+                            deadline=160.0,
+                        )
+        self.assertEqual(offset, 12)
+        self.assertEqual(next_heartbeat, 115.0)
+        self.assertEqual(buf.getvalue(), "a\nb\n")
+
     def test_runner_stdio_mirror_enabled_only_for_github_actions(self) -> None:
         with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=True):
             self.assertTrue(_RUNNER._runner_stdio_mirror_enabled())

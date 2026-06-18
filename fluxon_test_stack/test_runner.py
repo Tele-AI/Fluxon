@@ -392,6 +392,8 @@ _LOADED_PY_MODULES: Dict[str, Any] = {}
 _RUNNER_STDIO_LOG_FP: Optional[Any] = None
 _RUNNER_STDIO_KEEPALIVE_FDS: Optional[Tuple[int, int]] = None
 _RUNNER_STDIO_MIRROR_THREAD: Optional[threading.Thread] = None
+_CI_WAIT_HEARTBEAT_INTERVAL_SECONDS = 15.0
+_CI_WAIT_TAIL_MAX_CHARS = 8000
 _TEST_RUNNER_UI_MAX_LOG_CHUNK_BYTES = 1024 * 1024
 _TEST_RUNNER_UI_HISTORY_SCHEMA_VERSION = 1
 _TEST_RUNNER_UI_DEFAULT_LOOKBACK_DAYS = 30
@@ -15200,6 +15202,57 @@ def _instance_read_text_if_present(
     return output[len(sentinel) + 1 :]
 
 
+def _ci_wait_progress_tail(
+    resolved_case: Dict[str, Any],
+    *,
+    run_dir: Path,
+    last_offset: int,
+    max_chars: int = _CI_WAIT_TAIL_MAX_CHARS,
+) -> tuple[int, str]:
+    log_path = (run_dir / "logs" / "ci_runner" / "stdout.log").resolve()
+    raw = _instance_read_text_if_present(resolved_case, instance_id="ci_runner", path=log_path)
+    if raw is None:
+        return last_offset, ""
+    text = str(raw)
+    next_offset = len(text)
+    if next_offset <= last_offset:
+        return next_offset, ""
+    chunk = text[last_offset:next_offset]
+    if len(chunk) > int(max_chars):
+        chunk = chunk[-int(max_chars):]
+    return next_offset, chunk
+
+
+def _print_ci_wait_progress(
+    resolved_case: Dict[str, Any],
+    *,
+    run_dir: Path,
+    last_offset: int,
+    next_heartbeat_at: float,
+    deadline: float,
+) -> tuple[int, float]:
+    now = time.time()
+    next_offset, chunk = _ci_wait_progress_tail(
+        resolved_case,
+        run_dir=run_dir,
+        last_offset=last_offset,
+    )
+    if chunk:
+        text = chunk.rstrip("\n")
+        if text:
+            print(text, flush=True)
+        return next_offset, now + _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS
+    if now >= next_heartbeat_at:
+        remaining_s = max(0, int(deadline - now))
+        print(
+            f"[CI wait exit_code] waiting for ci_runner progress... remaining_s={remaining_s} "
+            f"log={str((run_dir / 'logs' / 'ci_runner' / 'stdout.log').resolve())}",
+            flush=True,
+        )
+        return next_offset, now + _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS
+    return next_offset, next_heartbeat_at
+
+
 def _instance_file_exists(
     resolved_case: Dict[str, Any], *, instance_id: str, path: Path
 ) -> bool:
@@ -15656,7 +15709,16 @@ def _wait_ci_runner_exit_code(
     exit_code_path = (run_dir / "logs" / "ci_runner" / "exit_code.txt").resolve()
     deadline = time.time() + float(timeout_s)
     last_status_err: str | None = None
+    log_offset = 0
+    next_heartbeat_at = 0.0
     while True:
+        log_offset, next_heartbeat_at = _print_ci_wait_progress(
+            resolved_case,
+            run_dir=run_dir,
+            last_offset=log_offset,
+            next_heartbeat_at=next_heartbeat_at,
+            deadline=deadline,
+        )
         current_state = _observe_file_state(exit_code_path)
         if _has_new_file_state(before=baseline_state, after=current_state):
             raw = exit_code_path.read_text(encoding="utf-8").strip()
