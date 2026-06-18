@@ -391,6 +391,7 @@ _TEST_BED_AUTODISCOVERY_CANDIDATE_RELPATHS = (
 _LOADED_PY_MODULES: Dict[str, Any] = {}
 _RUNNER_STDIO_LOG_FP: Optional[Any] = None
 _RUNNER_STDIO_KEEPALIVE_FDS: Optional[Tuple[int, int]] = None
+_RUNNER_STDIO_MIRROR_THREAD: Optional[threading.Thread] = None
 _TEST_RUNNER_UI_MAX_LOG_CHUNK_BYTES = 1024 * 1024
 _TEST_RUNNER_UI_HISTORY_SCHEMA_VERSION = 1
 _TEST_RUNNER_UI_DEFAULT_LOOKBACK_DAYS = 30
@@ -399,6 +400,47 @@ _TEST_RUNNER_UI_ACTIVE_RESERVED_GRACE_SECONDS = 7 * 86400
 _TEST_RUNNER_UI_HISTORY_CACHE_LOCK = threading.Lock()
 _TEST_RUNNER_UI_HISTORY_CACHE: Dict[str, Any] = {}
 _TEST_RUNNER_UI_LOCK_FILENAME = ".test_runner_ui.lock"
+
+
+def _runner_stdio_mirror_enabled() -> bool:
+    return os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
+
+
+def _start_runner_stdio_log_mirror(*, log_path: Path, stdout_fd: int, stderr_fd: int) -> None:
+    def _mirror_loop() -> None:
+        offset = 0
+        while True:
+            try:
+                if log_path.exists():
+                    size = log_path.stat().st_size
+                    if size < offset:
+                        offset = 0
+                    if size > offset:
+                        with log_path.open("r", encoding="utf-8", errors="replace") as fp:
+                            fp.seek(offset)
+                            chunk = fp.read()
+                            offset = fp.tell()
+                        if chunk:
+                            data = chunk.encode("utf-8", errors="replace")
+                            for fd in (stdout_fd, stderr_fd):
+                                if fd < 0:
+                                    continue
+                                try:
+                                    os.write(fd, data)
+                                except OSError:
+                                    pass
+                time.sleep(0.2)
+            except Exception:
+                time.sleep(0.5)
+
+    mirror = threading.Thread(
+        target=_mirror_loop,
+        name="test-runner-stdio-log-mirror",
+        daemon=True,
+    )
+    mirror.start()
+    global _RUNNER_STDIO_MIRROR_THREAD
+    _RUNNER_STDIO_MIRROR_THREAD = mirror
 
 
 def _redirect_process_stdio_to_log(workdir_root: Path) -> None:
@@ -461,6 +503,13 @@ def _redirect_process_stdio_to_log(workdir_root: Path) -> None:
     sys.stdout = os.fdopen(sys.stdout.fileno(), "w", encoding="utf-8", buffering=1, closefd=False)
     sys.stderr = os.fdopen(sys.stderr.fileno(), "w", encoding="utf-8", buffering=1, closefd=False)
     _RUNNER_STDIO_LOG_FP = log_fp
+    if _runner_stdio_mirror_enabled():
+        keepalive = _RUNNER_STDIO_KEEPALIVE_FDS or (-1, -1)
+        _start_runner_stdio_log_mirror(
+            log_path=log_path,
+            stdout_fd=int(keepalive[0]),
+            stderr_fd=int(keepalive[1]),
+        )
 
 
 def _resolve_history_roots_cli_paths(raw_paths: List[str]) -> List[Path]:
