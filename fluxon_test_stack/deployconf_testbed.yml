@@ -188,7 +188,10 @@ service:
       mkdir -p "${DATA_DIR}"
       exec ${HOSTWORKDIR}/fluxon_release/ext_images/greptime/greptime standalone start \
         --data-home "${DATA_DIR}" \
-        --http-addr 0.0.0.0:35030
+        --http-addr 0.0.0.0:35030 \
+        --rpc-bind-addr 127.0.0.1:$((GREPTIME__PORT + 1)) \
+        --mysql-addr 127.0.0.1:$((GREPTIME__PORT + 2)) \
+        --postgres-addr 127.0.0.1:$((GREPTIME__PORT + 3))
 
   tikv_pd:
     image: pingcap/pd:v7.5.1
@@ -258,9 +261,11 @@ service:
 
       [rocksdb]
       max-background-jobs = 2
+      max-open-files = 4096
 
       [raftdb]
       max-background-jobs = 2
+      max-open-files = 2048
       YAML
       cat > "${WORKDIR}/tikv_args.sh" <<EOF
       declare -a TIKV_ARGS=(
@@ -382,6 +387,7 @@ service:
         master_panel:
           listen_addr: "${FLUXON_FS_MASTER_PANEL_LISTEN_ADDR}"
           public_base_url: "${FLUXON_FS_MASTER_PANEL_BASE_URL}"
+          prometheus_base_url: "${FLUXON_PROMETHEUS_BASE_URL}"
           auto_refresh_interval_secs: 10
           # English note:
           # - access_db_path is the single source of truth for UI/S3 auth state.

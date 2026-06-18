@@ -368,15 +368,12 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             reject_if_inflight_same_key = (
                 bool(opts.reject_if_inflight_same_key) if opts is not None else False
             )
-            if lease_id is None and not reject_if_inflight_same_key:
-                inner_res = self._client.put(key, ptrs)
-            else:
-                inner_res = self._client.put(
-                    key,
-                    ptrs,
-                    lease_id=lease_id,
-                    reject_if_inflight_same_key=reject_if_inflight_same_key,
-                )
+            inner_res = self._client.put(
+                key,
+                ptrs,
+                lease_id=lease_id,
+                reject_if_inflight_same_key=reject_if_inflight_same_key,
+            )
             if not inner_res.is_ok():
                 err = inner_res.unwrap_error()
                 mapped = _map_nospace_to_storagefull(err)

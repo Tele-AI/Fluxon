@@ -144,6 +144,9 @@ pub fn parse_etcd_produce_offset_key(key: &str) -> Option<String> {
 ///   aggregates ALL messages for the same underlying MPSC channel
 ///   across ALL MPMC producers. This enables capacity gating by
 ///   `(mpsc_id)` in 1 RTT without any extra index table.
+///   The count comes from the master-side derived prefix index, so it is
+///   intended for aggregate backpressure rather than immediate visibility
+///   confirmation for a just-written message.
 /// - In standalone MPSC mode we keep the historical layout for
 ///   backward compatibility.
 ///
@@ -168,6 +171,8 @@ pub fn backend_message_key_with_category(
             //   `/mpmc/{mpmc_id}/mpsc_{chan_id}/` can be used with `count_prefix`
             //   to gate capacity (1 RTT) for the underlying MPSC channel across
             //   all MPMC producers.
+            // - This is a backpressure-oriented aggregate count, not an immediate
+            //   visibility probe for a just-committed KV write.
             // Example: /mpmc/{mpmc_id}/mpsc_{chan_id}/producer/{member_id}/msg_{msg_id}
             format!(
                 "/mpmc/{}/mpsc_{}/producer/{}/msg_{}",

@@ -117,7 +117,7 @@ def test_preserves_hostworkdir_runtime_token() -> None:
         entrypoint_script = (outdir / "entrypoint__fluxon-testbed-svc_plain.sh").read_text(encoding="utf-8")
         assert 'export FLUXON_SHARED_MEM="${HOSTWORKDIR}/shm1"' in script, script
         assert '${HOSTWORKDIR}/gen_bare_deploy_bash/entrypoint__fluxon-testbed-svc_plain.sh' in script, script
-        assert 'run --label "$SUPERVISOR_LABEL"' in script, script
+        assert 'run --label "$SUPERVISOR_LABEL" --scope-key "$HOSTWORKDIR"' in script, script
         assert ' -- /usr/bin/env bash "${HOSTWORKDIR}/gen_bare_deploy_bash/entrypoint__fluxon-testbed-svc_plain.sh"' in script, script
         assert "selection_present()" in script, script
         assert 'if [ "${FLUXON_BARE_ALLOW_ALREADY_PRESENT:-false}" = "true" ]; then' in script, script
@@ -127,8 +127,9 @@ def test_preserves_hostworkdir_runtime_token() -> None:
         assert "wait-present" not in script, script
         assert "launch_only_start_gate" not in script, script
         assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID"' in script, script
+        assert 'wait_service_tcp_ready "$SERVICE" "$HOST_IP" "$SERVICE_PORT"' in script, script
         assert 'SUPERVISOR_PID=$( setsid ' not in script, script
-        assert 'python3 "$SELECTION_SUPERVISOR" stop --label "$SUPERVISOR_LABEL" --missing-ok' in stop_script, stop_script
+        assert 'python3 "$SELECTION_SUPERVISOR" stop --label "$SUPERVISOR_LABEL" --scope-key "$HOSTWORKDIR" --missing-ok' in stop_script, stop_script
         assert "retire-runtime" not in stop_script, stop_script
         print("PASS: test_preserves_hostworkdir_runtime_token")
 
@@ -178,6 +179,7 @@ def test_atomic_group_start_does_not_auto_stop_on_failure() -> None:
         assert 'SUPERVISOR_PID=$( setsid ' not in script, script
         assert 'echo "[rollout] probable-ready failed svc=$SERVICE label=$SUPERVISOR_LABEL supervisor_pid=$SUPERVISOR_PID"' in script, script
         assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID"' in script, script
+        assert 'wait_service_tcp_ready "$SERVICE" "$HOST_IP" "$SERVICE_PORT"' in script, script
         print("PASS: test_atomic_group_start_does_not_auto_stop_on_failure")
 
 

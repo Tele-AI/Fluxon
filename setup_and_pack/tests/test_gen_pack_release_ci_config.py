@@ -65,6 +65,44 @@ class GenPackReleaseCiConfigTest(unittest.TestCase):
             self.assertEqual(cfg["host_paths"]["root_path"], str(project_data_root.resolve()))
             self.assertNotIn("manylinux", cfg)
 
+    def test_generated_config_supports_explicit_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            env_template = root / "pack_fluxonkv_pylib_env.yaml.template"
+            output_path = root / "nested" / "pack_fluxonkv_pylib_env.yaml"
+            project_data_root = root / "project-data"
+
+            env_template.write_text(
+                yaml.safe_dump(
+                    {
+                        "schema_version": 1,
+                        "host_paths": {"root_path": "/tmp/original-store"},
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+
+            argv = [
+                "gen_pack_release_ci_config.py",
+                "--env-template",
+                str(env_template),
+                "--out-path",
+                str(output_path),
+                "--project-data-root",
+                str(project_data_root),
+            ]
+            old_argv = sys.argv
+            try:
+                sys.argv = argv
+                rc = _SCRIPT.main()
+            finally:
+                sys.argv = old_argv
+
+            self.assertEqual(rc, 0)
+            cfg = yaml.safe_load(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(cfg["host_paths"]["root_path"], str(project_data_root.resolve()))
+
 
 if __name__ == "__main__":
     unittest.main()

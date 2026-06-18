@@ -23,6 +23,7 @@ from utils.manylinux_version_utils import load_manylinux_version_static
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_NIX_PACK_CONFIG_PATH = REPO_ROOT / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_static.yaml"
+PACK_RELEASE_NIX_CONFIG_ENV = "FLUXON_PACK_RELEASE_NIX_CONFIG"
 repo_root_str = str(REPO_ROOT)
 if repo_root_str not in sys.path:
     sys.path.insert(0, repo_root_str)
@@ -53,6 +54,15 @@ def _top_level_release_manifest_relpaths(*, wheel_name: str) -> list[str]:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Pack release artifacts into a release directory")
+    parser.add_argument(
+        "--nix-pack-config",
+        type=Path,
+        default=None,
+        help=(
+            "Optional explicit NIX pack config path. If omitted, use the canonical "
+            "setup_and_pack/nix/pack_fluxonkv_pylib_static.yaml authority."
+        ),
+    )
     parser.add_argument(
         "--rdma-backend",
         choices=script_utils.RDMA_BACKENDS,
@@ -93,6 +103,16 @@ def main() -> int:
         repo_root = Path(__file__).resolve().parent.parent
         parser = _build_arg_parser()
         args = parser.parse_args()
+        raw_nix_pack_config = args.nix_pack_config
+        if raw_nix_pack_config is None:
+            env_nix_pack_config = os.environ.get(PACK_RELEASE_NIX_CONFIG_ENV)
+            if env_nix_pack_config is not None and env_nix_pack_config.strip():
+                raw_nix_pack_config = Path(env_nix_pack_config.strip())
+        nix_pack_config_path = (
+            _resolve_repo_root_cli_path(repo_root=repo_root, raw_path=raw_nix_pack_config, field_name="nix-pack-config")
+            if raw_nix_pack_config is not None
+            else DEFAULT_NIX_PACK_CONFIG_PATH.resolve()
+        )
         release_dir = (
             _resolve_repo_root_cli_path(repo_root=repo_root, raw_path=args.release_dir, field_name="release-dir")
             if args.release_dir is not None
@@ -105,6 +125,7 @@ def main() -> int:
             release_dir=release_dir,
             rdma_backend=args.rdma_backend,
             with_tikv_runtime=args.with_tikv_runtime == "true",
+            nix_pack_config_path=nix_pack_config_path,
         )
         if not release_dir.exists():
             print(f"Missing release dir after pack steps: {release_dir}")
@@ -190,6 +211,7 @@ def _run_pack_steps(
     release_dir: Path,
     rdma_backend: str,
     with_tikv_runtime: bool,
+    nix_pack_config_path: Path,
 ) -> None:
     release_dir.mkdir(parents=True, exist_ok=True)
 
@@ -198,6 +220,7 @@ def _run_pack_steps(
             repo_root=repo_root,
             release_dir=release_dir,
             rdma_backend=rdma_backend,
+            nix_pack_config_path=nix_pack_config_path,
         )
     with script_utils.stage("Verifying Rust PyO3 wheel"):
         _require_pyo3_wheel_import_probe(selected_pyo3_wheel)
@@ -505,12 +528,13 @@ def _load_nix_config_root(*, repo_root: Path, config_path: Path) -> dict:
 def _nix_release_layout_paths(
     repo_root: Path,
     *,
+    config_path: Path,
     profile_name: str,
     assembly_name: str,
     instance_id: str,
     target_cache_namespace: str,
 ) -> tuple[Path, Path]:
-    config_path = DEFAULT_NIX_PACK_CONFIG_PATH.resolve()
+    config_path = config_path.resolve()
     if not config_path.exists():
         print(f"Missing NIX pack config: {config_path}")
         raise SystemExit(1)
@@ -546,6 +570,7 @@ def _pack_rust_pyo3_wheel_via_nix(
     repo_root: Path,
     release_dir: Path,
     rdma_backend: str,
+    nix_pack_config_path: Path,
 ) -> Path:
     manylinux_version = load_manylinux_version_static(repo_root=repo_root)
     nix_module = _load_nix_module(repo_root)
@@ -577,6 +602,7 @@ def _pack_rust_pyo3_wheel_via_nix(
     target_cache_namespace = f"pack_release_{_FIXED_TRANSPORT_BACKEND}_{rdma_backend}"
     config_template_path, instance_release_dir = _nix_release_layout_paths(
         repo_root,
+        config_path=nix_pack_config_path,
         profile_name=profile_name,
         assembly_name=assembly_name,
         instance_id=instance_id,

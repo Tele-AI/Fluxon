@@ -10,7 +10,11 @@ use crate::rpcresp_kvresult_convert::msg_and_error::{KvError, KvResult};
 /// Helper for counting keys by prefix via master node.
 ///
 /// This is shared by client/external roles and uses the master-side
-/// radix index maintained in `MasterKvRouter`.
+/// prefix index maintained in `MasterKvRouter`.
+///
+/// The index is derived asynchronously from `kv_routes`, so CountPrefix is
+/// intended for aggregate prefix counting rather than as an immediate
+/// strong-consistency visibility probe for a just-committed put.
 pub async fn count_prefix_for_framework(fw: &crate::Framework, prefix: &str) -> KvResult<u64> {
     // Locate master
     let master_node_id = fw

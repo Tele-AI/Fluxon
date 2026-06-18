@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
@@ -25,6 +26,50 @@ DISPATCH_RELEASE_SCOPES = (
     DISPATCH_RELEASE_SCOPE_DEPLOY_AND_PROFILES,
     DISPATCH_RELEASE_SCOPE_START_TEST_BED,
 )
+
+
+@dataclass(frozen=True)
+class DispatchReleaseScopeSpec:
+    # Keep scope-level dispatch rules centralized here.
+    # The final relpath list is still expanded dynamically from manifests and optional subtrees.
+    required_base_relpaths: tuple[str, ...]
+    strict_file_relpaths: tuple[str, ...]
+    extra_manifest_relpaths: tuple[str, ...]
+    include_manifest_ext_runtime_payloads: bool
+    needs_ext_images_materialization: bool
+    dispatch_profiles: bool
+    dispatch_test_rsc: bool
+
+
+DISPATCH_RELEASE_SCOPE_SPECS = {
+    DISPATCH_RELEASE_SCOPE_DEPLOY_ONLY: DispatchReleaseScopeSpec(
+        required_base_relpaths=("fluxon_release.sha256", "install.py"),
+        strict_file_relpaths=STRICT_RELEASE_FILE_REL_PATHS,
+        extra_manifest_relpaths=(),
+        include_manifest_ext_runtime_payloads=False,
+        needs_ext_images_materialization=True,
+        dispatch_profiles=False,
+        dispatch_test_rsc=False,
+    ),
+    DISPATCH_RELEASE_SCOPE_DEPLOY_AND_PROFILES: DispatchReleaseScopeSpec(
+        required_base_relpaths=("fluxon_release.sha256", "install.py"),
+        strict_file_relpaths=STRICT_RELEASE_FILE_REL_PATHS,
+        extra_manifest_relpaths=(),
+        include_manifest_ext_runtime_payloads=False,
+        needs_ext_images_materialization=True,
+        dispatch_profiles=True,
+        dispatch_test_rsc=True,
+    ),
+    DISPATCH_RELEASE_SCOPE_START_TEST_BED: DispatchReleaseScopeSpec(
+        required_base_relpaths=("fluxon_release.sha256", "install.py"),
+        strict_file_relpaths=STRICT_RELEASE_FILE_REL_PATHS + ("ext_images/ext_images.sha256",),
+        extra_manifest_relpaths=START_TEST_BED_RELEASE_EXTRA_REL_PATHS,
+        include_manifest_ext_runtime_payloads=True,
+        needs_ext_images_materialization=False,
+        dispatch_profiles=False,
+        dispatch_test_rsc=False,
+    ),
+}
 
 # English note:
 # - This script must not block on interactive SSH prompts (host key / password), because it is
@@ -118,6 +163,13 @@ def _parse_sha256_manifest(text: str) -> dict[str, str]:
     return out
 
 
+def _dispatch_release_scope_spec(dispatch_release_scope: str) -> DispatchReleaseScopeSpec:
+    spec = DISPATCH_RELEASE_SCOPE_SPECS.get(dispatch_release_scope)
+    if spec is None:
+        raise RuntimeError(f"unsupported dispatch_release_scope: {dispatch_release_scope}")
+    return spec
+
+
 
 def _write_askpass_script(*, password: str) -> tuple[tempfile.TemporaryDirectory, Path]:
     td = tempfile.TemporaryDirectory(prefix="fluxon_ssh_askpass_")
@@ -199,54 +251,39 @@ def _release_manifest_required_relpaths(manifest_text: str) -> list[str]:
 
 
 def _release_scope_required_relpaths(*, manifest_text: str, dispatch_release_scope: str) -> list[str]:
-    if dispatch_release_scope == DISPATCH_RELEASE_SCOPE_START_TEST_BED:
-        manifest_relpaths = list(_parse_sha256_manifest(manifest_text).keys())
-        ext_manifest_relpaths = _start_test_bed_ext_manifest_relpaths_from_release_manifest_text(
-            manifest_text=manifest_text
-        )
-        out = ["fluxon_release.sha256", "install.py"]
-        for relpath in manifest_relpaths:
-            if relpath == "ext_images.tar.gz":
-                continue
-            out.append(relpath)
-        out.extend(START_TEST_BED_RELEASE_EXTRA_REL_PATHS)
-        out.extend(ext_manifest_relpaths)
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for relpath in out:
-            if relpath in seen:
-                continue
-            seen.add(relpath)
-            deduped.append(relpath)
-        return deduped
-    if dispatch_release_scope in (
-        DISPATCH_RELEASE_SCOPE_DEPLOY_ONLY,
-        DISPATCH_RELEASE_SCOPE_DEPLOY_AND_PROFILES,
-    ):
+    spec = _dispatch_release_scope_spec(dispatch_release_scope)
+    if not spec.include_manifest_ext_runtime_payloads:
         return _release_manifest_required_relpaths(manifest_text)
-    raise RuntimeError(f"unsupported dispatch_release_scope: {dispatch_release_scope}")
+
+    # start_test_bed dispatches the manifest-defined release surface except ext_images.tar.gz,
+    # then materializes the ext runtime tree explicitly from ext_images/ext_images.sha256.
+    manifest_relpaths = list(_parse_sha256_manifest(manifest_text).keys())
+    ext_manifest_relpaths = _start_test_bed_ext_manifest_relpaths_from_release_manifest_text(
+        manifest_text=manifest_text
+    )
+    out = list(spec.required_base_relpaths)
+    for relpath in manifest_relpaths:
+        if relpath == "ext_images.tar.gz":
+            continue
+        out.append(relpath)
+    out.extend(spec.extra_manifest_relpaths)
+    out.extend(ext_manifest_relpaths)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for relpath in out:
+        if relpath in seen:
+            continue
+        seen.add(relpath)
+        deduped.append(relpath)
+    return deduped
 
 
 def _release_scope_strict_file_relpaths(dispatch_release_scope: str) -> tuple[str, ...]:
-    if dispatch_release_scope == DISPATCH_RELEASE_SCOPE_START_TEST_BED:
-        return STRICT_RELEASE_FILE_REL_PATHS + ("ext_images/ext_images.sha256",)
-    if dispatch_release_scope in (
-        DISPATCH_RELEASE_SCOPE_DEPLOY_ONLY,
-        DISPATCH_RELEASE_SCOPE_DEPLOY_AND_PROFILES,
-    ):
-        return STRICT_RELEASE_FILE_REL_PATHS
-    raise RuntimeError(f"unsupported dispatch_release_scope: {dispatch_release_scope}")
+    return _dispatch_release_scope_spec(dispatch_release_scope).strict_file_relpaths
 
 
 def _release_scope_needs_ext_images_materialization(dispatch_release_scope: str) -> bool:
-    if dispatch_release_scope == DISPATCH_RELEASE_SCOPE_START_TEST_BED:
-        return False
-    if dispatch_release_scope in (
-        DISPATCH_RELEASE_SCOPE_DEPLOY_ONLY,
-        DISPATCH_RELEASE_SCOPE_DEPLOY_AND_PROFILES,
-    ):
-        return True
-    raise RuntimeError(f"unsupported dispatch_release_scope: {dispatch_release_scope}")
+    return _dispatch_release_scope_spec(dispatch_release_scope).needs_ext_images_materialization
 
 
 def _start_test_bed_ext_manifest_relpaths_from_release_manifest_text(*, manifest_text: str) -> list[str]:
@@ -257,6 +294,13 @@ def _start_test_bed_ext_manifest_relpaths_from_release_manifest_text(*, manifest
             "start_test_bed release scope requires ext_images/ext_images.sha256 to enumerate runtime files"
         )
     return [ext_manifest_relpath]
+
+
+def _cluster_node_execution_mode(raw_node: dict[str, object], *, hostname: str) -> str:
+    execution_mode = raw_node.get("execution_mode", "ssh")
+    if not isinstance(execution_mode, str) or execution_mode.strip() not in {"ssh", "local"}:
+        raise RuntimeError(f"cluster_nodes[{hostname}].execution_mode must be 'ssh' or 'local'")
+    return execution_mode.strip()
 
 
 def _start_test_bed_ext_runtime_relpaths_from_src_release_dir(*, src_release_dir: Path) -> list[str]:
@@ -300,7 +344,15 @@ def _materialize_local_ext_images_from_tarball(*, dst_release_dir_s: str, dst_ow
     if ext_dir.exists():
         if not ext_dir.is_dir():
             raise RuntimeError(f"release invariant path must be a directory: {ext_dir}")
-        return
+        ext_manifest = ext_dir / "ext_images.sha256"
+        if ext_manifest.exists():
+            try:
+                manifest = _parse_sha256_manifest(ext_manifest.read_text(encoding="utf-8"))
+            except RuntimeError:
+                manifest = {}
+            if manifest and all((ext_dir / relpath).exists() for relpath in manifest.keys()):
+                return
+        subprocess.check_call(["bash", "-lc", "rm -rf " + sh_quote(str(ext_dir))])
     if not tarball.exists():
         raise RuntimeError(f"missing ext_images.tar.gz in dispatched release dir: {tarball}")
     subprocess.check_call(
@@ -339,7 +391,30 @@ def _materialize_remote_ext_images_from_tarball(
                 + "cd "
                 + sh_quote(dst_release_dir_s)
                 + "; "
-                + "if [ ! -d ext_images ]; then tar -xzf ext_images.tar.gz; fi; "
+                + "need_extract=1; "
+                + "if [ -d ext_images ] && [ -f ext_images/ext_images.sha256 ]; then "
+                + "python3 - <<'PY'\n"
+                + "from pathlib import Path\n"
+                + "root = Path('ext_images')\n"
+                + "manifest = root / 'ext_images.sha256'\n"
+                + "ok = True\n"
+                + "for raw in manifest.read_text(encoding='utf-8').splitlines():\n"
+                + "    line = raw.strip()\n"
+                + "    if not line:\n"
+                + "        continue\n"
+                + "    parts = line.split()\n"
+                + "    if len(parts) != 2:\n"
+                + "        ok = False\n"
+                + "        break\n"
+                + "    relpath = parts[1]\n"
+                + "    if not (root / relpath).exists():\n"
+                + "        ok = False\n"
+                + "        break\n"
+                + "raise SystemExit(0 if ok else 1)\n"
+                + "PY\n"
+                + " && need_extract=0; "
+                + "fi; "
+                + "if [ \"$need_extract\" = 1 ]; then rm -rf ext_images && tar -xzf ext_images.tar.gz; fi; "
                 + "true"
             )
         ),
@@ -347,19 +422,21 @@ def _materialize_remote_ext_images_from_tarball(
 
 
 def _should_dispatch_profiles(*, dispatch_release_scope: str) -> bool:
-    if dispatch_release_scope == DISPATCH_RELEASE_SCOPE_DEPLOY_ONLY:
-        return False
-    if dispatch_release_scope == DISPATCH_RELEASE_SCOPE_DEPLOY_AND_PROFILES:
-        return True
-    if dispatch_release_scope == DISPATCH_RELEASE_SCOPE_START_TEST_BED:
-        return False
-    raise RuntimeError(f"unsupported dispatch_release_scope: {dispatch_release_scope}")
+    return _dispatch_release_scope_spec(dispatch_release_scope).dispatch_profiles
+
+
+def _should_dispatch_test_rsc(*, dispatch_release_scope: str) -> bool:
+    return _dispatch_release_scope_spec(dispatch_release_scope).dispatch_test_rsc
 
 
 def _release_dispatch_relpaths(*, src_release_dir: Path, dispatch_release_scope: str) -> list[str]:
     manifest_path = src_release_dir / "fluxon_release.sha256"
     if not manifest_path.exists():
         raise RuntimeError(f"Missing fluxon_release.sha256 in {src_release_dir}")
+    # Build the dispatch surface from:
+    # - scope-level static rules
+    # - the release manifest
+    # - optional runtime/profile/test_rsc subtrees present in this release dir
     relpaths = _release_scope_required_relpaths(
         manifest_text=manifest_path.read_text(encoding="utf-8"),
         dispatch_release_scope=dispatch_release_scope,
@@ -377,6 +454,15 @@ def _release_dispatch_relpaths(*, src_release_dir: Path, dispatch_release_scope:
         profiles_dir = src_release_dir / "profiles"
         if profiles_dir.exists() and profiles_dir.is_dir():
             relpaths.append("profiles")
+    if _should_dispatch_test_rsc(dispatch_release_scope=dispatch_release_scope):
+        # English note:
+        # - CI / TEST_STACK runtime resources are exported under fluxon_release/test_rsc/<profile_id>/.
+        # - test_runner materializes them through artifact_sets[*].test_rsc_source.key_prefix.
+        # - They are not part of the top-level fluxon_release.sha256, so dispatch must carry them
+        #   explicitly together with profiles/*.
+        test_rsc_dir = src_release_dir / "test_rsc"
+        if test_rsc_dir.exists() and test_rsc_dir.is_dir():
+            relpaths.append("test_rsc")
     seen: set[str] = set()
     out: list[str] = []
     for relpath in relpaths:
@@ -401,6 +487,23 @@ def _profile_manifest_relpaths(*, src_release_dir: Path, dispatch_release_scope:
         if not manifest_path.exists():
             continue
         out.append(f"profiles/{child.name}/fluxon_release.sha256")
+    return out
+
+
+def _test_rsc_manifest_relpaths(*, src_release_dir: Path, dispatch_release_scope: str) -> list[str]:
+    if not _should_dispatch_test_rsc(dispatch_release_scope=dispatch_release_scope):
+        return []
+    test_rsc_dir = src_release_dir / "test_rsc"
+    if not test_rsc_dir.exists() or not test_rsc_dir.is_dir():
+        return []
+    out: list[str] = []
+    for child in sorted(test_rsc_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        manifest_path = child / "fluxon_test_rsc.sha256"
+        if not manifest_path.exists():
+            continue
+        out.append(f"test_rsc/{child.name}/fluxon_test_rsc.sha256")
     return out
 
 
@@ -510,6 +613,35 @@ def _validate_release_manifest_integrity(*, src_release_dir: Path, dispatch_rele
                     f"expected_sha256={expected_sha}\n"
                     f"actual_sha256={got_sha}\n"
                     "Regenerate the corresponding release profile before dispatch."
+                )
+
+    for rel_manifest_path in _test_rsc_manifest_relpaths(
+        src_release_dir=src_release_dir,
+        dispatch_release_scope=dispatch_release_scope,
+    ):
+        test_rsc_manifest_path = src_release_dir / rel_manifest_path
+        test_rsc_root = test_rsc_manifest_path.parent
+        test_rsc_manifest = _parse_sha256_manifest(test_rsc_manifest_path.read_text(encoding="utf-8"))
+        for relpath, expected_sha in test_rsc_manifest.items():
+            file_path = test_rsc_root / relpath
+            if not file_path.exists():
+                raise RuntimeError(
+                    "Profile test_rsc manifest references missing file.\n"
+                    f"release_dir={src_release_dir}\n"
+                    f"test_rsc_manifest={rel_manifest_path}\n"
+                    f"file={relpath}\n"
+                    f"missing={file_path}"
+                )
+            got_sha = _sha256_file(file_path)
+            if got_sha != expected_sha:
+                raise RuntimeError(
+                    "Profile test_rsc manifest drift detected.\n"
+                    f"release_dir={src_release_dir}\n"
+                    f"test_rsc_manifest={rel_manifest_path}\n"
+                    f"file={relpath}\n"
+                    f"expected_sha256={expected_sha}\n"
+                    f"actual_sha256={got_sha}\n"
+                    "Regenerate the corresponding test_rsc subtree before dispatch."
                 )
 
 
@@ -751,6 +883,75 @@ def _remote_release_is_current(
                 cmd=remote_sha_cmd,
             ).strip()
             if remote_sha != local_sha:
+                return False
+    for rel_manifest_path in _test_rsc_manifest_relpaths(
+        src_release_dir=src_release_dir,
+        dispatch_release_scope=dispatch_release_scope,
+    ):
+        local_manifest_text = (src_release_dir / rel_manifest_path).read_text(encoding="utf-8")
+        remote_manifest_cmd = (
+            "ssh "
+            + SSH_COMMON_OPTS
+            + " -p "
+            + sh_quote(str(ssh_port))
+            + " "
+            + sh_quote(f"{ssh_user}@{ip}")
+            + " "
+            + sh_quote(
+                "if [ -f "
+                + sh_quote(dst_release_dir + "/" + rel_manifest_path)
+                + " ]; then cat "
+                + sh_quote(dst_release_dir + "/" + rel_manifest_path)
+                + "; fi"
+            )
+        )
+        remote_text = _check_output_bash_with_optional_password(
+            password=ssh_password,
+            cmd=remote_manifest_cmd,
+        )
+        if remote_text != local_manifest_text:
+            return False
+        test_rsc_prefix = rel_manifest_path.rsplit("/", 1)[0]
+        test_rsc_manifest = _parse_sha256_manifest(local_manifest_text)
+        required_checks = " && ".join(
+            "test -e " + sh_quote(dst_release_dir + "/" + test_rsc_prefix + "/" + relpath)
+            for relpath in test_rsc_manifest.keys()
+        )
+        if required_checks:
+            test_rsc_validate_cmd = (
+                "ssh "
+                + SSH_COMMON_OPTS
+                + " -p "
+                + sh_quote(str(ssh_port))
+                + " "
+                + sh_quote(f"{ssh_user}@{ip}")
+                + " "
+                + sh_quote(required_checks)
+            )
+            try:
+                _check_call_bash_with_optional_password(password=ssh_password, cmd=test_rsc_validate_cmd)
+            except subprocess.CalledProcessError:
+                return False
+        for relpath, expected_sha in test_rsc_manifest.items():
+            remote_sha_cmd = (
+                "ssh "
+                + SSH_COMMON_OPTS
+                + " -p "
+                + sh_quote(str(ssh_port))
+                + " "
+                + sh_quote(f"{ssh_user}@{ip}")
+                + " "
+                + sh_quote(
+                    "sha256sum "
+                    + sh_quote(dst_release_dir + "/" + test_rsc_prefix + "/" + relpath)
+                    + " | awk '{print $1}'"
+                )
+            )
+            remote_sha = _check_output_bash_with_optional_password(
+                password=ssh_password,
+                cmd=remote_sha_cmd,
+            ).strip()
+            if remote_sha != expected_sha:
                 return False
     return True
 
@@ -1270,13 +1471,14 @@ def main() -> None:
             if ssh_password is not None and (not isinstance(ssh_password, str) or not ssh_password):
                 print(f"cluster_nodes[{hostname}].ssh_password must be a non-empty string when present", file=sys.stderr)
                 raise SystemExit(1)
+            execution_mode = _cluster_node_execution_mode(raw, hostname=hostname)
 
             dst_owner = f"{ssh_user}:{ssh_user}"
 
             print("")
-            print(f"[dispatch] node={hostname} ip={ip} hostworkdir={hostworkdir}")
+            print(f"[dispatch] node={hostname} ip={ip} hostworkdir={hostworkdir} execution_mode={execution_mode}")
 
-            if hostname == local_host:
+            if execution_mode == "local" or hostname == local_host:
                 # Ensure hostworkdir itself is writable so bare scripts can create run/log dirs.
                 subprocess.check_call(["bash", "-lc", f"mkdir -p {sh_quote(hostworkdir)}"])
                 for artifact_name, src_dir, dst_subdir in artifacts:

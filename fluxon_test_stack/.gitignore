@@ -1,2 +1,3 @@
 test_runner/locks
 test_runner_ui_runtime/
+test_runner/ui_history.yaml

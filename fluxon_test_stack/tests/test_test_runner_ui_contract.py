@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import socket
@@ -40,6 +41,121 @@ _RUNNER = _load_module()
 
 
 class TestTestRunnerUiContract(unittest.TestCase):
+    def test_ci_log_prefix_lines_prefixes_each_nonempty_line(self) -> None:
+        text = _RUNNER._ci_log_prefix_lines("a\n\nb\n", now=0.0)
+        self.assertEqual(
+            text,
+            "[1970-01-01 00:00:00 UTC] a\n\n[1970-01-01 00:00:00 UTC] b\n",
+        )
+
+    def test_ci_wait_progress_tail_reads_incremental_remote_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            with mock.patch.object(
+                _RUNNER,
+                "_instance_read_text_if_present",
+                return_value="line1\nline2\nline3\n",
+            ):
+                offset, chunk = _RUNNER._ci_wait_progress_tail(
+                    {},
+                    run_dir=run_dir,
+                    last_offset=6,
+                )
+        self.assertEqual(offset, len("line1\nline2\nline3\n"))
+        self.assertEqual(chunk, "line2\nline3\n")
+
+    def test_print_ci_wait_progress_emits_heartbeat_when_no_new_tail(self) -> None:
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            with mock.patch.object(_RUNNER, "_ci_wait_progress_tail", return_value=(0, "")):
+                with mock.patch.object(_RUNNER.time, "time", return_value=100.0):
+                    with mock.patch.object(_RUNNER.sys, "stdout", buf):
+                        offset, next_heartbeat = _RUNNER._print_ci_wait_progress(
+                            {},
+                            run_dir=run_dir,
+                            last_offset=0,
+                            next_heartbeat_at=90.0,
+                            deadline=160.0,
+                        )
+        self.assertEqual(offset, 0)
+        self.assertEqual(next_heartbeat, 115.0)
+        self.assertIn(
+            "[1970-01-01 00:01:40 UTC] [CI wait exit_code] waiting for ci_runner progress...",
+            buf.getvalue(),
+        )
+
+    def test_print_ci_wait_progress_emits_new_tail(self) -> None:
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            with mock.patch.object(_RUNNER, "_ci_wait_progress_tail", return_value=(12, "a\nb\n")):
+                with mock.patch.object(_RUNNER.time, "time", return_value=100.0):
+                    with mock.patch.object(_RUNNER.sys, "stdout", buf):
+                        offset, next_heartbeat = _RUNNER._print_ci_wait_progress(
+                            {},
+                            run_dir=run_dir,
+                            last_offset=0,
+                            next_heartbeat_at=999.0,
+                            deadline=160.0,
+                        )
+        self.assertEqual(offset, 12)
+        self.assertEqual(next_heartbeat, 115.0)
+        self.assertEqual(
+            buf.getvalue(),
+            "[1970-01-01 00:01:40 UTC] a\n[1970-01-01 00:01:40 UTC] b\n",
+        )
+
+    def test_runner_stdio_mirror_enabled_only_for_github_actions(self) -> None:
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=True):
+            self.assertTrue(_RUNNER._runner_stdio_mirror_enabled())
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}, clear=True):
+            self.assertFalse(_RUNNER._runner_stdio_mirror_enabled())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(_RUNNER._runner_stdio_mirror_enabled())
+
+    def test_redirect_process_stdio_starts_mirror_on_github_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workdir = Path(td)
+            original_log_fp = _RUNNER._RUNNER_STDIO_LOG_FP
+            original_keepalive = _RUNNER._RUNNER_STDIO_KEEPALIVE_FDS
+            with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=False):
+                _RUNNER._RUNNER_STDIO_LOG_FP = None
+                _RUNNER._RUNNER_STDIO_KEEPALIVE_FDS = (11, 12)
+                with mock.patch.object(_RUNNER, "_start_runner_stdio_log_mirror") as start_mirror:
+                    with mock.patch.object(_RUNNER.os, "dup2") as dup2_mock:
+                        with mock.patch.object(_RUNNER.os, "fdopen", side_effect=lambda *args, **kwargs: sys.__stdout__):
+                            _RUNNER._redirect_process_stdio_to_log(workdir)
+            self.assertEqual(dup2_mock.call_count, 2)
+            start_mirror.assert_called_once()
+            kwargs = start_mirror.call_args.kwargs
+            self.assertEqual(kwargs["log_path"], (workdir / _RUNNER.RUNNER_STDIO_LOG_FILENAME).resolve())
+            self.assertEqual(kwargs["stdout_fd"], 11)
+            self.assertNotIn("stderr_fd", kwargs)
+            if _RUNNER._RUNNER_STDIO_LOG_FP is not None:
+                _RUNNER._RUNNER_STDIO_LOG_FP.close()
+            _RUNNER._RUNNER_STDIO_LOG_FP = original_log_fp
+            _RUNNER._RUNNER_STDIO_KEEPALIVE_FDS = original_keepalive
+
+    def test_redirect_process_stdio_skips_mirror_outside_github_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workdir = Path(td)
+            original_log_fp = _RUNNER._RUNNER_STDIO_LOG_FP
+            original_keepalive = _RUNNER._RUNNER_STDIO_KEEPALIVE_FDS
+            with mock.patch.dict(os.environ, {}, clear=True):
+                _RUNNER._RUNNER_STDIO_LOG_FP = None
+                _RUNNER._RUNNER_STDIO_KEEPALIVE_FDS = (11, 12)
+                with mock.patch.object(_RUNNER, "_start_runner_stdio_log_mirror") as start_mirror:
+                    with mock.patch.object(_RUNNER.os, "dup2") as dup2_mock:
+                        with mock.patch.object(_RUNNER.os, "fdopen", side_effect=lambda *args, **kwargs: sys.__stdout__):
+                            _RUNNER._redirect_process_stdio_to_log(workdir)
+            self.assertEqual(dup2_mock.call_count, 2)
+            start_mirror.assert_not_called()
+            if _RUNNER._RUNNER_STDIO_LOG_FP is not None:
+                _RUNNER._RUNNER_STDIO_LOG_FP.close()
+            _RUNNER._RUNNER_STDIO_LOG_FP = original_log_fp
+            _RUNNER._RUNNER_STDIO_KEEPALIVE_FDS = original_keepalive
+
     def test_collect_suite_overview_reads_case_runs_and_run_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             workdir = Path(td)
@@ -273,8 +389,9 @@ class TestTestRunnerUiContract(unittest.TestCase):
             runner_log.write_text("hello\n", encoding="utf-8")
             now = 2_000_000
             with mock.patch.object(_RUNNER.time, "time", return_value=now):
-                with mock.patch.object(_RUNNER, "_ui_default_external_history_roots", return_value=[]):
-                    paths = _RUNNER._ui_discover_recent_workdirs(service_root, lookback_days=30)
+                with mock.patch.object(_RUNNER, "_runner_repo_root", return_value=service_root):
+                    with mock.patch.object(_RUNNER, "_ui_default_external_history_roots", return_value=[]):
+                        paths = _RUNNER._ui_discover_recent_workdirs(service_root, lookback_days=30)
             self.assertEqual(paths, [suite.resolve()])
 
     def test_suite_overview_marks_incomplete_when_no_live_running_cases(self) -> None:

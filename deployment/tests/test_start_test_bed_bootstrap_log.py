@@ -151,6 +151,53 @@ def test_rc255_recovers_from_atomic_ready_marker() -> None:
         print("PASS: test_rc255_recovers_from_atomic_ready_marker")
 
 
+def test_failed_status_includes_bootstrap_and_service_log_tails() -> None:
+    module = _load_start_test_bed_module()
+    with tempfile.TemporaryDirectory(prefix="test_start_test_bed_failure_tails_") as td:
+        root = Path(td)
+        bootstrap_log = root / "tikv.bootstrap.log"
+        bootstrap_log.write_text("[bare] probable-ready failed svc=tikv\n", encoding="utf-8")
+        service_log = root / "monitor" / "tikv" / "store" / "tikv.log"
+        service_log.parent.mkdir(parents=True, exist_ok=True)
+        service_log.write_text("FATAL: connect to PD failed\n", encoding="utf-8")
+        local_node_cfg = {
+            "hostname": "node-a",
+            "hostworkdir": str(root),
+        }
+        result = _build_result(
+            bootstrap_log_path=bootstrap_log,
+            launcher_rc=1,
+            selection_name="tikv",
+            bare_script_name="tikv",
+            node_name="node-a",
+            expected_service_names=["tikv"],
+        )
+        statuses = module._collect_bare_runtime_statuses(
+            deployconf={},
+            cluster_nodes={},
+            local_node_cfg=local_node_cfg,
+            result=result,
+        )
+        assert len(statuses) == 1, statuses
+        status = statuses[0]
+        assert status["present"] is False, status
+        assert status["running"] is False, status
+        assert status["log_path"] == str(service_log), status
+        err = status["status_error"]
+        assert isinstance(err, str) and "bootstrap_log_tail=" in err, err
+        assert "service_log_tail=" in err, err
+        assert "connect to PD failed" in err, err
+        print("PASS: test_failed_status_includes_bootstrap_and_service_log_tails")
+
+
+def test_testbed_template_tikv_uses_low_fd_limits_for_ci_runner() -> None:
+    deployconf = yaml.safe_load((REPO_ROOT / "fluxon_test_stack" / "deployconf_testbed.yml").read_text(encoding="utf-8"))
+    tikv_cfg = deployconf["service"]["tikv"]["entrypoint"]
+    assert "max-open-files = 4096" in tikv_cfg, tikv_cfg
+    assert "max-open-files = 2048" in tikv_cfg, tikv_cfg
+    print("PASS: test_testbed_template_tikv_uses_low_fd_limits_for_ci_runner")
+
+
 def test_direct_supervisor_status_path_is_rejected() -> None:
     module = _load_start_test_bed_module()
     try:
@@ -212,6 +259,7 @@ def test_ops_agent_snapshot_prereq_allows_missing_file() -> None:
             "hostname": "node-a",
             "ip": "127.0.0.1",
             "hostworkdir": "/tmp/hostworkdir",
+            "execution_mode": "local",
             "ssh_user": "tester",
             "ssh_port": 22,
         }
@@ -234,6 +282,176 @@ def test_ops_agent_snapshot_prereq_allows_missing_file() -> None:
         coverage_bootstrap_services=[],
     )
     print("PASS: test_ops_agent_snapshot_prereq_allows_missing_file")
+
+
+def test_parse_cluster_nodes_accepts_local_execution_mode() -> None:
+    module = _load_start_test_bed_module()
+    cluster_nodes = module._parse_cluster_nodes(
+        {
+            "cluster_nodes": [
+                {
+                    "hostname": "logic-a",
+                    "ip": "127.0.0.1",
+                    "hostworkdir": "/tmp/logic-a",
+                    "execution_mode": "local",
+                    "ssh_user": "tester",
+                    "ssh_port": 22,
+                },
+                {
+                    "hostname": "logic-b",
+                    "ip": "127.0.0.1",
+                    "hostworkdir": "/tmp/logic-b",
+                    "ssh_user": "tester",
+                    "ssh_port": 22,
+                },
+            ]
+        }
+    )
+    assert module._cluster_node_is_local(cluster_nodes["logic-a"]) is True
+    assert module._cluster_node_is_local(cluster_nodes["logic-b"]) is False
+    print("PASS: test_parse_cluster_nodes_accepts_local_execution_mode")
+
+
+def test_run_bare_waves_treats_local_execution_mode_node_as_local() -> None:
+    module = _load_start_test_bed_module()
+    cluster_nodes = {
+        "logic-a": {
+            "hostname": "logic-a",
+            "ip": "127.0.0.1",
+            "hostworkdir": "/tmp/logic-a",
+            "execution_mode": "local",
+            "ssh_user": "tester",
+            "ssh_port": 22,
+        },
+        "logic-b": {
+            "hostname": "logic-b",
+            "ip": "127.0.0.1",
+            "hostworkdir": "/tmp/logic-b",
+            "execution_mode": "local",
+            "ssh_user": "tester",
+            "ssh_port": 22,
+        },
+    }
+    deployconf = {
+        "service": {
+            "ops_agent": {"node_bind": {"node": ["logic-a", "logic-b"]}},
+        },
+        "atomic_groups": {},
+    }
+    calls: list[tuple[str, str]] = []
+    original_spawn_local = module._spawn_local_start
+    original_spawn_remote = module._spawn_remote_start
+    original_join = module._join_bare_launch
+    original_collect = module._collect_bare_runtime_statuses
+    original_bare_script_name = module._selection_bare_script_name
+    original_service_names = module._selection_service_names_for_target_node
+    original_log_path = module._bare_wave_bootstrap_log_path
+    try:
+        module._spawn_local_start = lambda **kwargs: calls.append(("local", kwargs["local_node_cfg"]["hostname"])) or {
+            "mode": "local",
+            "node_name": kwargs["local_node_cfg"]["hostname"],
+            "selection_name": kwargs["selection_name"],
+            "bare_script_name": kwargs["bare_script_name"],
+            "bootstrap_log_path": kwargs["bootstrap_log_path"],
+            "expected_service_names": kwargs["expected_service_names"],
+            "launch_error": None,
+            "launcher_rc": 0,
+            "runtime_statuses": [],
+        }
+        module._spawn_remote_start = lambda **kwargs: calls.append(("remote", kwargs["node_name"])) or {
+            "mode": "remote",
+            "node_name": kwargs["node_name"],
+            "selection_name": kwargs["selection_name"],
+            "bare_script_name": kwargs["bare_script_name"],
+            "bootstrap_log_path": kwargs["bootstrap_log_path"],
+            "expected_service_names": kwargs["expected_service_names"],
+            "launch_error": None,
+            "launcher_rc": 0,
+            "runtime_statuses": [],
+        }
+        module._join_bare_launch = lambda result: None
+        module._collect_bare_runtime_statuses = lambda **kwargs: []
+        module._selection_bare_script_name = lambda **kwargs: "ops_agent"
+        module._selection_service_names_for_target_node = lambda **kwargs: ["ops_agent"]
+        module._bare_wave_bootstrap_log_path = (
+            lambda **kwargs: Path("/tmp") / f"{kwargs['node_name']}_{kwargs['selection_name']}.log"
+        )
+        module._run_bare_waves(
+            workdir=Path("/tmp"),
+            deployconf=deployconf,
+            cluster_nodes=cluster_nodes,
+            local_node_cfg=cluster_nodes["logic-a"],
+            waves=[
+                {
+                    "launches": [
+                        {"node": "logic-a", "selection_name": "ops_agent"},
+                        {"node": "logic-b", "selection_name": "ops_agent"},
+                    ]
+                }
+            ],
+            bootstrap_bare_services=set(),
+        )
+    finally:
+        module._spawn_local_start = original_spawn_local
+        module._spawn_remote_start = original_spawn_remote
+        module._join_bare_launch = original_join
+        module._collect_bare_runtime_statuses = original_collect
+        module._selection_bare_script_name = original_bare_script_name
+        module._selection_service_names_for_target_node = original_service_names
+        module._bare_wave_bootstrap_log_path = original_log_path
+    assert calls == [("local", "logic-a"), ("local", "logic-b")], calls
+    print("PASS: test_run_bare_waves_treats_local_execution_mode_node_as_local")
+
+
+def test_local_coverage_bootstrap_excludes_duplicate_local_control_plane_selection() -> None:
+    module = _load_start_test_bed_module()
+    deployconf = {
+        "service": {
+            "master": {"node_bind": {"node": ["logic-a"]}},
+            "owner": {"node_bind": {"node": ["logic-a", "logic-b"]}},
+            "ops_controller": {"node_bind": {"node": ["logic-a"]}},
+            "ops_agent": {"node_bind": {"node": ["logic-a", "logic-b"]}},
+            "fluxon_fs_master": {"node_bind": {"node": ["logic-a"]}},
+        },
+        "atomic_groups": {
+            "fluxon_core_controller": {
+                "phase": 1,
+                "nodes": ["logic-a", "logic-b"],
+                "services": ["master", "owner", "ops_controller", "ops_agent"],
+            }
+        },
+    }
+    excluded_targets = module._local_control_plane_coverage_excluded_targets(
+        deployconf=deployconf,
+        fixed_bootstrap_batches=[{"node": "logic-a", "services": ["fluxon_core_controller"]}],
+        local_node_name="logic-a",
+        coverage_bootstrap_services=["owner", "ops_controller", "fluxon_fs_master"],
+    )
+    assert excluded_targets == [
+        {
+            "node": "logic-a",
+            "selection_name": "fluxon_core_controller",
+            "service_names": ["master", "owner", "ops_controller", "ops_agent"],
+            "reason": "local_fixed_bare_already_started_same_control_plane_service",
+        }
+    ], excluded_targets
+
+    coverage_batches = module._build_coverage_bootstrap_batches(
+        deployconf=deployconf,
+        coverage_bootstrap_services=["owner", "ops_controller", "fluxon_fs_master"],
+        excluded_targets={
+            (
+                item["node"],
+                item["selection_name"],
+            )
+            for item in excluded_targets
+        },
+    )
+    assert coverage_batches == [
+        {"node": "logic-b", "services": ["fluxon_core_controller"]},
+        {"node": "logic-a", "services": ["fluxon_fs_master"]},
+    ], coverage_batches
+    print("PASS: test_local_coverage_bootstrap_excludes_duplicate_local_control_plane_selection")
 
 
 def test_start_test_bed_release_scope_rejects_missing_ext_images_manifest_reference() -> None:
@@ -357,6 +575,359 @@ def test_parse_test_runner_ui_config_resolves_paths() -> None:
     print("PASS: test_parse_test_runner_ui_config_resolves_paths")
 
 
+def test_normalize_bootstrap_deployconf_strips_legacy_master_p2p_listen_port() -> None:
+    module = _load_start_test_bed_module()
+    deployconf = {
+        "service": {
+            "master": {
+                "entrypoint": (
+                    'cat > "${CONFIG_PATH}" <<YAML\n'
+                    'instance_key: "unified_master"\n'
+                    "p2p_listen_port: 31100\n"
+                    "port: 51051\n"
+                    "YAML\n"
+                )
+            },
+            "ops_agent": {
+                "entrypoint": (
+                    'cat > "${WORKDIR}/ops_agent.yaml" <<YAML\n'
+                    "kv_client:\n"
+                    "  fluxonkv_spec:\n"
+                    "    p2p_listen_port: 12102\n"
+                    "YAML\n"
+                )
+            },
+        }
+    }
+    normalized, notes = module._normalize_bootstrap_deployconf(deployconf=deployconf)
+    master_entrypoint = normalized["service"]["master"]["entrypoint"]
+    ops_agent_entrypoint = normalized["service"]["ops_agent"]["entrypoint"]
+    assert "p2p_listen_port: 31100" not in master_entrypoint, master_entrypoint
+    assert "p2p_listen_port: 12102" in ops_agent_entrypoint, ops_agent_entrypoint
+    assert notes == ["service.master.entrypoint: removed legacy master field p2p_listen_port"], notes
+    assert "p2p_listen_port: 31100" in deployconf["service"]["master"]["entrypoint"], deployconf
+    print("PASS: test_normalize_bootstrap_deployconf_strips_legacy_master_p2p_listen_port")
+
+
+def test_normalize_bootstrap_deployconf_rejects_missing_fluxon_fs_master_prometheus_base_url() -> None:
+    module = _load_start_test_bed_module()
+    deployconf = {
+        "service": {
+            "fluxon_fs_master": {
+                "entrypoint": (
+                    'cat > "${WORKDIR}/all_config.yaml" <<YAML\n'
+                    "fluxon_fs:\n"
+                    "  master_panel:\n"
+                    '    listen_addr: "${FLUXON_FS_MASTER_PANEL_LISTEN_ADDR}"\n'
+                    '    public_base_url: "${FLUXON_FS_MASTER_PANEL_BASE_URL}"\n'
+                    "    auto_refresh_interval_secs: 10\n"
+                    "YAML\n"
+                )
+            },
+        }
+    }
+    try:
+        module._normalize_bootstrap_deployconf(deployconf=deployconf)
+    except ValueError as exc:
+        assert (
+            str(exc)
+            == "deployconf.service.fluxon_fs_master.entrypoint is missing fluxon_fs.master_panel.prometheus_base_url"
+        ), exc
+    else:
+        raise AssertionError("expected ValueError for missing fluxon_fs.master_panel.prometheus_base_url")
+    print("PASS: test_normalize_bootstrap_deployconf_rejects_missing_fluxon_fs_master_prometheus_base_url")
+
+
+def test_normalize_bootstrap_deployconf_rejects_missing_greptime_loopback_bind_addrs() -> None:
+    module = _load_start_test_bed_module()
+    deployconf = {
+        "service": {
+            "greptime": {
+                "entrypoint": (
+                    "set -euo pipefail\n"
+                    'exec greptime standalone start \\\n'
+                    '  --data-home "${DATA_DIR}" \\\n'
+                    '  --http-addr 0.0.0.0:41555\n'
+                )
+            }
+        }
+    }
+    try:
+        module._normalize_bootstrap_deployconf(deployconf=deployconf)
+    except ValueError as exc:
+        assert (
+            str(exc)
+            == "deployconf.service.greptime.entrypoint is missing required loopback bind flags: "
+            "--rpc-bind-addr 127.0.0.1:$((GREPTIME__PORT + 1)), "
+            "--mysql-addr 127.0.0.1:$((GREPTIME__PORT + 2)), "
+            "--postgres-addr 127.0.0.1:$((GREPTIME__PORT + 3))"
+        ), exc
+    else:
+        raise AssertionError("expected ValueError for missing greptime loopback bind flags")
+    print("PASS: test_normalize_bootstrap_deployconf_rejects_missing_greptime_loopback_bind_addrs")
+
+
+def test_normalize_bootstrap_deployconf_rewrites_same_host_local_multi_node_fixed_ports() -> None:
+    module = _load_start_test_bed_module()
+    deployconf = {
+        "cluster_nodes": [
+            {
+                "hostname": "logic-a",
+                "ip": "127.0.0.1",
+                "hostworkdir": "/tmp/logic-a",
+                "execution_mode": "local",
+                "ssh_user": "tester",
+                "ssh_port": 22,
+            },
+            {
+                "hostname": "logic-b",
+                "ip": "127.0.0.1",
+                "hostworkdir": "/tmp/logic-b",
+                "execution_mode": "local",
+                "ssh_user": "tester",
+                "ssh_port": 22,
+            },
+        ],
+        "global_envs": {
+            "MASTER__PORT": "19280",
+            "TIKV_PD_PEER_PORT": "33680",
+            "TIKV_STATUS_FULL_ADDRESS": "${${TIKV__NODE_ID}__IP}:34180",
+            "FLUXON_FS_MASTER_PANEL_BASE_URL": "http://${FLUXON_FS_MASTER__NODE_ID__IP}:25080",
+            "FLUXON_FS_MASTER_PANEL_LISTEN_ADDR": "0.0.0.0:25080",
+        },
+        "service": {
+            "etcd": {
+                "port": 33579,
+                "in_container_port": 33579,
+                "entrypoint": (
+                    "${HOSTWORKDIR}/fluxon_release/ext_images/etcd/etcd \\\n"
+                    '  --advertise-client-urls "http://0.0.0.0:33579" \\\n'
+                    '  --listen-client-urls "http://0.0.0.0:33579" \\\n'
+                    '  --listen-peer-urls "http://0.0.0.0:2480" \\\n'
+                    '  --initial-advertise-peer-urls "http://0.0.0.0:2480" \\\n'
+                    '  --initial-cluster "etcd0=http://0.0.0.0:2480"\n'
+                ),
+            },
+            "greptime": {
+                "port": 35030,
+                "in_container_port": 35030,
+                "entrypoint": (
+                    "set -euo pipefail\n"
+                    'exec greptime standalone start \\\n'
+                    '  --data-home "${DATA_DIR}" \\\n'
+                    '  --http-addr 0.0.0.0:35030 \\\n'
+                    '  --rpc-bind-addr 127.0.0.1:$((GREPTIME__PORT + 1)) \\\n'
+                    '  --mysql-addr 127.0.0.1:$((GREPTIME__PORT + 2)) \\\n'
+                    '  --postgres-addr 127.0.0.1:$((GREPTIME__PORT + 3))\n'
+                ),
+            },
+            "tikv_pd": {
+                "port": 33679,
+                "entrypoint": "exec pd\n",
+            },
+            "tikv": {
+                "port": 34160,
+                "entrypoint": "exec tikv\n",
+            },
+            "master": {
+                "entrypoint": (
+                    'cat > "${CONFIG_PATH}" <<YAML\n'
+                    'instance_key: "unified_master"\n'
+                    "port: 51051\n"
+                    "p2p_listen_port: 31100\n"
+                    "YAML\n"
+                )
+            },
+            "ops_agent": {
+                "entrypoint": (
+                    'case "${NODE_ID}" in\n'
+                    "  logic-a)\n"
+                    "    OPS_AGENT_P2P_LISTEN_PORT=12112\n"
+                    "    ;;\n"
+                    "  logic-b)\n"
+                    "    OPS_AGENT_P2P_LISTEN_PORT=12113\n"
+                    "    ;;\n"
+                    "esac\n"
+                )
+            },
+            "ops_controller": {
+                "entrypoint": (
+                    'cat > "${WORKDIR}/ops_controller.yaml" <<YAML\n'
+                    "ops_controller:\n"
+                    "  kv_client:\n"
+                    "    fluxonkv_spec:\n"
+                    "      p2p_listen_port: 12102\n"
+                    "YAML\n"
+                )
+            },
+            "fluxon_fs_master": {
+                "entrypoint": (
+                    'cat > "${WORKDIR}/all_config.yaml" <<YAML\n'
+                    "fluxon_fs:\n"
+                    "  master_panel:\n"
+                    '    listen_addr: "${FLUXON_FS_MASTER_PANEL_LISTEN_ADDR}"\n'
+                    '    prometheus_base_url: "${FLUXON_PROMETHEUS_BASE_URL}"\n'
+                    "YAML\n"
+                )
+            },
+        },
+    }
+    normalized, notes = module._normalize_bootstrap_deployconf(deployconf=deployconf)
+    assert normalized["global_envs"]["TIKV_PD_PEER_PORT"] == "19401", normalized["global_envs"]
+    assert normalized["global_envs"]["TIKV_STATUS_FULL_ADDRESS"] == "${${TIKV__NODE_ID}__IP}:19411", normalized["global_envs"]
+    assert (
+        normalized["global_envs"]["FLUXON_FS_MASTER_PANEL_BASE_URL"]
+        == "http://${FLUXON_FS_MASTER__NODE_ID__IP}:19300"
+    ), normalized["global_envs"]
+    assert normalized["global_envs"]["FLUXON_FS_MASTER_PANEL_LISTEN_ADDR"] == "0.0.0.0:19300", normalized["global_envs"]
+    assert normalized["service"]["etcd"]["port"] == 19380, normalized["service"]["etcd"]
+    assert normalized["service"]["etcd"]["in_container_port"] == 19380, normalized["service"]["etcd"]
+    assert 'http://0.0.0.0:19380' in normalized["service"]["etcd"]["entrypoint"], normalized["service"]["etcd"]["entrypoint"]
+    assert 'http://0.0.0.0:19381' in normalized["service"]["etcd"]["entrypoint"], normalized["service"]["etcd"]["entrypoint"]
+    assert normalized["service"]["greptime"]["port"] == 19390, normalized["service"]["greptime"]
+    assert normalized["service"]["greptime"]["in_container_port"] == 19390, normalized["service"]["greptime"]
+    assert "--http-addr 0.0.0.0:19390" in normalized["service"]["greptime"]["entrypoint"], normalized["service"]["greptime"]["entrypoint"]
+    assert normalized["service"]["tikv_pd"]["port"] == 19400, normalized["service"]["tikv_pd"]
+    assert normalized["service"]["tikv"]["port"] == 19410, normalized["service"]["tikv"]
+    assert "port: 19290" in normalized["service"]["master"]["entrypoint"], normalized["service"]["master"]["entrypoint"]
+    assert "OPS_AGENT_P2P_LISTEN_PORT=19320" in normalized["service"]["ops_agent"]["entrypoint"], normalized["service"]["ops_agent"]["entrypoint"]
+    assert "OPS_AGENT_P2P_LISTEN_PORT=19321" in normalized["service"]["ops_agent"]["entrypoint"], normalized["service"]["ops_agent"]["entrypoint"]
+    assert "p2p_listen_port: 19310" in normalized["service"]["ops_controller"]["entrypoint"], normalized["service"]["ops_controller"]["entrypoint"]
+    assert notes[0] == "same_host_local_multi_node: rewrote fixed host-listen ports from controller anchor 19280", notes
+    assert deployconf["service"]["etcd"]["port"] == 33579, deployconf
+    assert deployconf["service"]["master"]["entrypoint"].count("51051") == 1, deployconf
+    print("PASS: test_normalize_bootstrap_deployconf_rewrites_same_host_local_multi_node_fixed_ports")
+
+
+def test_normalize_bootstrap_deployconf_keeps_non_local_or_single_node_ports_unchanged() -> None:
+    module = _load_start_test_bed_module()
+    deployconf = {
+        "cluster_nodes": [
+            {
+                "hostname": "logic-a",
+                "ip": "127.0.0.1",
+                "hostworkdir": "/tmp/logic-a",
+                "execution_mode": "local",
+                "ssh_user": "tester",
+                "ssh_port": 22,
+            },
+            {
+                "hostname": "logic-b",
+                "ip": "198.51.100.10",
+                "hostworkdir": "/opt/logic-b",
+                "execution_mode": "ssh",
+                "ssh_user": "tester",
+                "ssh_port": 22,
+            },
+        ],
+        "global_envs": {
+            "MASTER__PORT": "19080",
+            "TIKV_PD_PEER_PORT": "33680",
+            "TIKV_STATUS_FULL_ADDRESS": "${${TIKV__NODE_ID}__IP}:34180",
+            "FLUXON_FS_MASTER_PANEL_BASE_URL": "http://${FLUXON_FS_MASTER__NODE_ID__IP}:25080",
+            "FLUXON_FS_MASTER_PANEL_LISTEN_ADDR": "0.0.0.0:25080",
+        },
+        "service": {
+            "etcd": {
+                "port": 33579,
+                "entrypoint": 'exec etcd --listen-client-urls "http://0.0.0.0:33579"\n',
+            },
+            "greptime": {
+                "port": 35030,
+                "entrypoint": 'exec greptime --http-addr 0.0.0.0:35030\n',
+            },
+            "tikv_pd": {"port": 33679, "entrypoint": "exec pd\n"},
+            "tikv": {"port": 34160, "entrypoint": "exec tikv\n"},
+            "master": {"entrypoint": "port: 51051\n"},
+            "ops_agent": {"entrypoint": "OPS_AGENT_P2P_LISTEN_PORT=12112\n"},
+            "ops_controller": {"entrypoint": "p2p_listen_port: 12102\n"},
+            "fluxon_fs_master": {"entrypoint": 'listen_addr: "${FLUXON_FS_MASTER_PANEL_LISTEN_ADDR}"\n'},
+        },
+    }
+    normalized, notes = module._normalize_bootstrap_deployconf(deployconf=deployconf)
+    assert normalized == deployconf, normalized
+    assert notes == [], notes
+    print("PASS: test_normalize_bootstrap_deployconf_keeps_non_local_or_single_node_ports_unchanged")
+
+
+def test_refresh_cluster_bare_deploy_scripts_copies_local_and_remote_nodes() -> None:
+    module = _load_start_test_bed_module()
+    with tempfile.TemporaryDirectory(prefix="test_start_test_bed_refresh_bare_") as td:
+        root = Path(td)
+        deployconf_path = root / "deployconf.yaml"
+        deployconf_path.write_text("service: {}\n", encoding="utf-8")
+        bare_scripts_dir = root / "gen_bare_deploy_bash"
+        bare_scripts_dir.mkdir(parents=True, exist_ok=True)
+        cluster_nodes = {
+            "logic-a": {
+                "hostname": "logic-a",
+                "ip": "127.0.0.1",
+                "hostworkdir": "/tmp/logic-a",
+                "execution_mode": "local",
+                "ssh_user": "tester",
+                "ssh_port": 22,
+                "ssh_password": None,
+            },
+            "logic-b": {
+                "hostname": "logic-b",
+                "ip": "198.51.100.10",
+                "ssh_host": "198.51.100.11",
+                "hostworkdir": "/opt/logic-b",
+                "execution_mode": "ssh",
+                "ssh_user": "tester",
+                "ssh_port": 2202,
+                "ssh_password": "secret",
+            },
+        }
+        original_generate_bare_deploy_scripts = module._generate_bare_deploy_scripts
+        original_copy_local_artifact = module.manual_dispatch_release._copy_local_artifact
+        original_copy_remote_artifact = module.manual_dispatch_release._copy_remote_artifact
+        calls: list[tuple[str, dict[str, object]]] = []
+        try:
+            module._generate_bare_deploy_scripts = (
+                lambda **kwargs: calls.append(("generate", kwargs))
+            )
+            module.manual_dispatch_release._copy_local_artifact = (
+                lambda **kwargs: calls.append(("local_copy", kwargs))
+            )
+            module.manual_dispatch_release._copy_remote_artifact = (
+                lambda **kwargs: calls.append(("remote_copy", kwargs))
+            )
+            module._refresh_cluster_bare_deploy_scripts(
+                deployconf_path=deployconf_path,
+                cluster_nodes=cluster_nodes,
+                bare_scripts_dir=bare_scripts_dir,
+            )
+        finally:
+            module._generate_bare_deploy_scripts = original_generate_bare_deploy_scripts
+            module.manual_dispatch_release._copy_local_artifact = original_copy_local_artifact
+            module.manual_dispatch_release._copy_remote_artifact = original_copy_remote_artifact
+        assert calls[0][0] == "generate", calls
+        assert calls[0][1]["deployconf_path"] == deployconf_path, calls
+        assert calls[0][1]["bare_scripts_dir"] == bare_scripts_dir, calls
+        assert calls[1] == (
+            "local_copy",
+            {
+                "src_dir": bare_scripts_dir,
+                "dst_dir_s": "/tmp/logic-a/gen_bare_deploy_bash",
+                "dst_owner": "tester:tester",
+            },
+        ), calls
+        assert calls[2] == (
+            "remote_copy",
+            {
+                "src_dir": bare_scripts_dir,
+                "dst_dir_s": "/opt/logic-b/gen_bare_deploy_bash",
+                "ssh_user": "tester",
+                "ip": "198.51.100.11",
+                "ssh_port": 2202,
+                "ssh_password": "secret",
+                "dst_owner": "tester:tester",
+            },
+        ), calls
+    print("PASS: test_refresh_cluster_bare_deploy_scripts_copies_local_and_remote_nodes")
+
+
 def test_bare_then_apply_success_path_does_not_run_post_apply_stop() -> None:
     module = _load_start_test_bed_module()
     with tempfile.TemporaryDirectory(prefix="test_start_test_bed_no_post_apply_stop_") as td:
@@ -459,9 +1030,11 @@ service:
         original_read_local_release_manifest_sha256 = module._read_local_release_manifest_sha256
         original_with_release_manifest_sha256_env = module._with_release_manifest_sha256_env
         original_generate_daemonset_artifacts = module._generate_daemonset_artifacts
+        original_refresh_cluster_bare_deploy_scripts = module._refresh_cluster_bare_deploy_scripts
         original_is_controller_initially_reachable = module._is_controller_initially_reachable
         original_run_bare_waves = module._run_bare_waves
         original_wait_controller_ready_stable = module._wait_controller_ready_stable
+        original_wait_controller_agents_ready = module._wait_controller_agents_ready
         original_load_deploy_payload = module._load_deploy_payload
         original_acquire_bootstrap_target_lock = module._acquire_bootstrap_target_lock
         original_validate_release_generation_prerequisites = module._validate_release_generation_prerequisites
@@ -483,9 +1056,11 @@ service:
             module._read_local_release_manifest_sha256 = lambda **_: "sha256"
             module._with_release_manifest_sha256_env = lambda **kwargs: kwargs["deployconf"]
             module._generate_daemonset_artifacts = lambda **_: None
+            module._refresh_cluster_bare_deploy_scripts = lambda **_: None
             module._is_controller_initially_reachable = lambda **_: False
             module._run_bare_waves = lambda **_: None
             module._wait_controller_ready_stable = lambda **_: call_sequence.append("wait")
+            module._wait_controller_agents_ready = lambda **_: call_sequence.append("agents_ready")
             module._load_deploy_payload = (
                 lambda **kwargs: "\n".join(kwargs["deploy_workloads"])
             )
@@ -555,9 +1130,11 @@ service:
             module._read_local_release_manifest_sha256 = original_read_local_release_manifest_sha256
             module._with_release_manifest_sha256_env = original_with_release_manifest_sha256_env
             module._generate_daemonset_artifacts = original_generate_daemonset_artifacts
+            module._refresh_cluster_bare_deploy_scripts = original_refresh_cluster_bare_deploy_scripts
             module._is_controller_initially_reachable = original_is_controller_initially_reachable
             module._run_bare_waves = original_run_bare_waves
             module._wait_controller_ready_stable = original_wait_controller_ready_stable
+            module._wait_controller_agents_ready = original_wait_controller_agents_ready
             module._load_deploy_payload = original_load_deploy_payload
             module._acquire_bootstrap_target_lock = original_acquire_bootstrap_target_lock
             module._validate_release_generation_prerequisites = original_validate_release_generation_prerequisites
@@ -576,7 +1153,7 @@ service:
             "apply-fluxon_core_controller",
             "apply-fluxon_fs_agent",
         ], f"unexpected wait calls: {wait_calls!r}"
-        assert call_sequence[:3] == ["wait", "ui", "deploy"], call_sequence
+        assert call_sequence[:4] == ["wait", "ui", "agents_ready", "deploy"], call_sequence
         assert stop_calls == [], f"success path must not invoke post-apply stop: {stop_calls!r}"
         assert len(ops_agent_snapshot_validation_calls) == 1, ops_agent_snapshot_validation_calls
         print("PASS: test_bare_then_apply_success_path_does_not_run_post_apply_stop")
@@ -680,6 +1257,7 @@ service:
         original_read_local_release_manifest_sha256 = module._read_local_release_manifest_sha256
         original_with_release_manifest_sha256_env = module._with_release_manifest_sha256_env
         original_generate_daemonset_artifacts = module._generate_daemonset_artifacts
+        original_refresh_cluster_bare_deploy_scripts = module._refresh_cluster_bare_deploy_scripts
         original_is_controller_initially_reachable = module._is_controller_initially_reachable
         original_run_bare_waves = module._run_bare_waves
         original_wait_controller_ready_stable = module._wait_controller_ready_stable
@@ -697,6 +1275,7 @@ service:
             module._read_local_release_manifest_sha256 = lambda **_: "sha256"
             module._with_release_manifest_sha256_env = lambda **kwargs: kwargs["deployconf"]
             module._generate_daemonset_artifacts = lambda **_: run_calls.append(("generate", None))
+            module._refresh_cluster_bare_deploy_scripts = lambda **_: run_calls.append(("refresh_bare", None))
             module._is_controller_initially_reachable = lambda **_: False
             module._run_bare_waves = lambda **kwargs: run_calls.append(("bare", kwargs["waves"]))
             module._wait_controller_ready_stable = lambda **kwargs: run_calls.append(("wait", kwargs["controller_url"]))
@@ -747,6 +1326,7 @@ service:
             module._read_local_release_manifest_sha256 = original_read_local_release_manifest_sha256
             module._with_release_manifest_sha256_env = original_with_release_manifest_sha256_env
             module._generate_daemonset_artifacts = original_generate_daemonset_artifacts
+            module._refresh_cluster_bare_deploy_scripts = original_refresh_cluster_bare_deploy_scripts
             module._is_controller_initially_reachable = original_is_controller_initially_reachable
             module._run_bare_waves = original_run_bare_waves
             module._wait_controller_ready_stable = original_wait_controller_ready_stable
@@ -762,8 +1342,8 @@ service:
         summary = yaml.safe_load(summary_text)
         assert "bootstrap_mode: bare_only" in summary_text, summary_text
         assert "deploy_response_atomic: null" in summary_text, summary_text
-        assert [item[0] for item in run_calls] == ["generate", "bare", "wait", "ui"], run_calls
-        assert run_calls[1][1] == [
+        assert [item[0] for item in run_calls] == ["generate", "refresh_bare", "bare", "wait", "ui"], run_calls
+        assert run_calls[2][1] == [
             {
                 "launches": [
                     {
@@ -786,6 +1366,59 @@ service:
         assert summary["test_runner_ui_url"] == "http://0.0.0.0:18080", summary
         assert summary["test_runner_ui_pid"] == 23456, summary
         print("PASS: test_bare_only_stops_after_controller_ready")
+
+
+def test_initial_controller_handover_uses_local_bare_stop() -> None:
+    module = _load_start_test_bed_module()
+    with tempfile.TemporaryDirectory(prefix="test_start_test_bed_controller_handover_stop_") as td:
+        workdir = Path(td)
+        local_node_cfg = {
+            "hostname": "infra44-ThinkStation-PX-a",
+            "ip": "127.0.0.1",
+            "hostworkdir": str(workdir / "hostworkdir"),
+            "execution_mode": "local",
+            "ssh_user": "tester",
+            "ssh_port": 22,
+        }
+        deployconf = {
+            "name_prefix": "fluxon_testbed",
+            "atomic_groups": {
+                "fluxon_core_controller": {
+                    "phase": 1,
+                    "nodes": ["infra44-ThinkStation-PX-a"],
+                    "services": ["master", "owner", "ops_controller", "ops_agent"],
+                }
+            },
+            "service": {
+                "master": {"node_bind": {"node": ["infra44-ThinkStation-PX-a"]}},
+                "owner": {"node_bind": {"node": ["infra44-ThinkStation-PX-a"]}},
+                "ops_controller": {"node_bind": {"node": ["infra44-ThinkStation-PX-a"]}},
+                "ops_agent": {"node_bind": {"node": ["infra44-ThinkStation-PX-a"]}},
+            },
+        }
+        stop_calls: list[str] = []
+        original_run_local_stop = module._run_local_stop
+        try:
+            module._run_local_stop = (
+                lambda *, local_node_cfg, service_name: stop_calls.append(
+                    f"{local_node_cfg['hostname']}:{service_name}"
+                )
+            )
+            stopped = module._stop_local_controller_handover_selections(
+                deployconf=deployconf,
+                local_node_cfg=local_node_cfg,
+                selection_names=["fluxon_core_controller", "fluxon_core_controller"],
+            )
+        finally:
+            module._run_local_stop = original_run_local_stop
+        assert stopped == ["master", "owner", "ops_controller", "ops_agent"], stopped
+        assert stop_calls == [
+            "infra44-ThinkStation-PX-a:master",
+            "infra44-ThinkStation-PX-a:owner",
+            "infra44-ThinkStation-PX-a:ops_controller",
+            "infra44-ThinkStation-PX-a:ops_agent",
+        ], stop_calls
+    print("PASS: test_initial_controller_handover_uses_local_bare_stop")
 
 
 def main() -> int:
@@ -813,7 +1446,44 @@ def main() -> int:
             "start_test_bed_release_scope_dispatches_ext_runtime_files_from_manifest",
             test_start_test_bed_release_scope_dispatches_ext_runtime_files_from_manifest,
         ),
+        ("parse_cluster_nodes_accepts_local_execution_mode", test_parse_cluster_nodes_accepts_local_execution_mode),
+        (
+            "run_bare_waves_treats_local_execution_mode_node_as_local",
+            test_run_bare_waves_treats_local_execution_mode_node_as_local,
+        ),
+        (
+            "local_coverage_bootstrap_excludes_duplicate_local_control_plane_selection",
+            test_local_coverage_bootstrap_excludes_duplicate_local_control_plane_selection,
+        ),
         ("parse_test_runner_ui_config_resolves_paths", test_parse_test_runner_ui_config_resolves_paths),
+        (
+            "normalize_bootstrap_deployconf_strips_legacy_master_p2p_listen_port",
+            test_normalize_bootstrap_deployconf_strips_legacy_master_p2p_listen_port,
+        ),
+        (
+            "normalize_bootstrap_deployconf_rejects_missing_fluxon_fs_master_prometheus_base_url",
+            test_normalize_bootstrap_deployconf_rejects_missing_fluxon_fs_master_prometheus_base_url,
+        ),
+        (
+            "normalize_bootstrap_deployconf_rejects_missing_greptime_loopback_bind_addrs",
+            test_normalize_bootstrap_deployconf_rejects_missing_greptime_loopback_bind_addrs,
+        ),
+        (
+            "normalize_bootstrap_deployconf_rewrites_same_host_local_multi_node_fixed_ports",
+            test_normalize_bootstrap_deployconf_rewrites_same_host_local_multi_node_fixed_ports,
+        ),
+        (
+            "normalize_bootstrap_deployconf_keeps_non_local_or_single_node_ports_unchanged",
+            test_normalize_bootstrap_deployconf_keeps_non_local_or_single_node_ports_unchanged,
+        ),
+        (
+            "refresh_cluster_bare_deploy_scripts_copies_local_and_remote_nodes",
+            test_refresh_cluster_bare_deploy_scripts_copies_local_and_remote_nodes,
+        ),
+        (
+            "initial_controller_handover_uses_local_bare_stop",
+            test_initial_controller_handover_uses_local_bare_stop,
+        ),
         ("no_post_apply_stop", test_bare_then_apply_success_path_does_not_run_post_apply_stop),
         ("bare_only_stops_after_controller_ready", test_bare_only_stops_after_controller_ready),
     ]

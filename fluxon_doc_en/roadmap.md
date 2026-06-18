@@ -1,9 +1,9 @@
 # Roadmap
 
-## TODO
+## Coming soon
 
 - [CI] Cover all tests with GitHub Actions and fix existing bugs
-- [KV] Adapt and optimize `sglang` `KVCache`
+- [KV] Adapt and optimize `sglang` `KVCache`, and add a `BatchKV` interface plus a local-side elastic preallocated-memory `put` interface with `write-back` mode
 - [OPS] Consolidate GitHub Actions integration tests into `FluxonOps` so internal clusters can reuse them directly later
 
 ## Release Notes

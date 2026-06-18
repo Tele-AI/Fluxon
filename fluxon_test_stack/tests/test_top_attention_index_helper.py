@@ -34,6 +34,11 @@ class TestTopAttentionIndexHelper(unittest.TestCase):
         self.assertIn("_relay_mq.py", names)
         self.assertNotIn("_config_kv.py", names)
 
+    def test_select_entries_matches_doc_page_prefix(self) -> None:
+        matched = select_top_attention_entries(["doc_page"])
+        names = {path.name for path in matched}
+        self.assertEqual(names, {"_doc_page_build.py"})
+
     def test_collect_payload_reports_requirements(self) -> None:
         payload = collect_top_attention_payload(["_config_kv"])
         self.assertEqual(payload["entry_count"], 1)

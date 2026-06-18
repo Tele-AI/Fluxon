@@ -74,6 +74,7 @@ def main() -> int:
         help="Publish one supervisor generation for a selection",
     )
     run_parser.add_argument("--label", required=True)
+    run_parser.add_argument("--scope-key", required=False)
     run_parser.add_argument(
         "--restart-policy",
         required=True,
@@ -90,6 +91,7 @@ def main() -> int:
 
     stop_parser = subparsers.add_parser("stop", help="Stop a selection by label")
     stop_parser.add_argument("--label", required=True)
+    stop_parser.add_argument("--scope-key", required=False)
     stop_parser.add_argument("--require-apply-id", required=False)
     stop_parser.add_argument("--missing-ok", action="store_true")
 
@@ -145,6 +147,7 @@ class SelectionRuntimeState:
 @dataclass(frozen=True)
 class RunCommandSpec:
     label: str
+    scope_key: Optional[str]
     owner_ts_ms: int
     restart_policy: RestartPolicy
     restart_delay_seconds: int
@@ -184,22 +187,24 @@ class LiveSupervisor:
 
 def _run_command(args: argparse.Namespace) -> int:
     spec = _parse_run_command_spec(args)
-    selection_lock_fp = _acquire_selection_operation_lock(spec.label)
+    selection_lock_fp = _acquire_selection_operation_lock(spec.label, spec.scope_key)
     return _run_supervisor(spec, selection_lock_fp=selection_lock_fp)
 
 
 def _stop_command(args: argparse.Namespace) -> int:
     label = _require_non_empty_str(args.label, "label")
+    scope_key = _require_optional_scope_key(args.scope_key)
     require_apply_id = (
         _require_non_empty_str(args.require_apply_id, "require-apply-id")
         if args.require_apply_id is not None
         else None
     )
     missing_ok = bool(args.missing_ok)
-    selection_lock_fp = _acquire_selection_operation_lock(label)
+    selection_lock_fp = _acquire_selection_operation_lock(label, scope_key)
     try:
         _retire_selection(
             label=label,
+            scope_key=scope_key,
             require_apply_id=require_apply_id,
             missing_ok=missing_ok,
         )
@@ -272,15 +277,21 @@ def _sleep_with_shutdown(seconds: int) -> None:
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
-def _selection_operation_lock_path(label: str) -> Path:
+def _scope_lock_suffix(scope_key: Optional[str]) -> str:
+    if scope_key is None:
+        return "global"
+    return scope_key
+
+
+def _selection_operation_lock_path(label: str, scope_key: Optional[str]) -> Path:
     lock_root = Path("/tmp/fluxon_selection_supervisor_locks")
     lock_root.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha256(label.encode("utf-8")).hexdigest()[:24]
+    digest = hashlib.sha256(f"{label}\\n{_scope_lock_suffix(scope_key)}".encode("utf-8")).hexdigest()[:24]
     return lock_root / f"{digest}.op.lock"
 
 
-def _acquire_selection_operation_lock(label: str):
-    lock_path = _selection_operation_lock_path(label)
+def _acquire_selection_operation_lock(label: str, scope_key: Optional[str]):
+    lock_path = _selection_operation_lock_path(label, scope_key)
     lock_fp = lock_path.open("a+", encoding="utf-8")
     fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
     return lock_fp
@@ -298,6 +309,7 @@ def _parse_run_command_spec(args: argparse.Namespace) -> RunCommandSpec:
             f"run-command spec only supports long-running commands: {supervisor_command}"
         )
     label = _require_non_empty_str(args.label, "label")
+    scope_key = _require_optional_scope_key(args.scope_key)
     owner_ts_ms = _require_positive_int(int(args.owner_ts_ms), "owner-ts-ms")
     restart_policy = RestartPolicy(str(args.restart_policy))
     restart_delay_seconds = _require_non_negative_int(args.restart_delay_seconds, "restart-delay-seconds")
@@ -327,6 +339,7 @@ def _parse_run_command_spec(args: argparse.Namespace) -> RunCommandSpec:
 
     return RunCommandSpec(
         label=label,
+        scope_key=scope_key,
         owner_ts_ms=owner_ts_ms,
         restart_policy=restart_policy,
         restart_delay_seconds=restart_delay_seconds,
@@ -378,7 +391,11 @@ def _run_supervisor(spec: RunCommandSpec, selection_lock_fp=None) -> int:
             owner_ts_ms=spec.owner_ts_ms,
         )
         current_owner_ts_ms = spec.owner_ts_ms
-        current_owner = _selection_owner_supervisor(spec.label, exclude_pid=os.getpid())
+        current_owner = _selection_owner_supervisor(
+            spec.label,
+            scope_key=spec.scope_key,
+            exclude_pid=os.getpid(),
+        )
         if current_owner is not None:
             phase1_overlap_with_applyless_owner = _requested_phase1_overlap_with_applyless_owner(
                 current_owner=current_owner,
@@ -428,7 +445,7 @@ def _run_supervisor(spec: RunCommandSpec, selection_lock_fp=None) -> int:
             reason="loop",
             reaped=_reap_terminated_children(),
         )
-        latest_owner_ts_ms = _latest_owner_ts_ms(spec.label)
+        latest_owner_ts_ms = _latest_owner_ts_ms(spec.label, scope_key=spec.scope_key)
         superseded = latest_owner_ts_ms is not None and latest_owner_ts_ms > current_owner_ts_ms
         if superseded:
             if supersede_started_at is None:
@@ -455,6 +472,7 @@ def _run_supervisor(spec: RunCommandSpec, selection_lock_fp=None) -> int:
         rc, exited_due_to_supersede = _wait_child(
             child,
             label=spec.label,
+            scope_key=spec.scope_key,
             current_owner_ts_ms=current_owner_ts_ms,
         )
         _retire_adopted_children(spec.label)
@@ -523,15 +541,18 @@ def _ensure_isolated_process_group(label: str) -> None:
 def _retire_selection(
     *,
     label: str,
+    scope_key: Optional[str],
     require_apply_id: Optional[str],
     missing_ok: bool,
 ) -> bool:
     label_live_supervisors = _matching_live_supervisors_for_stop(
         label=label,
+        scope_key=scope_key,
         require_apply_id=None,
     )
     matching = _matching_live_supervisors_for_stop(
         label=label,
+        scope_key=scope_key,
         require_apply_id=require_apply_id,
     )
     if not matching:
@@ -577,6 +598,7 @@ def _retire_selection(
     _stop_pid_tree_batch(sorted(set(root_pids)), label)
     _wait_supervisors_absent(
         label=label,
+        scope_key=scope_key,
         require_apply_id=require_apply_id,
         retired_pgids=retired_pgids,
     )
@@ -608,8 +630,8 @@ def _bind_runtime_state_owner_ts(
     )
 
 
-def _latest_owner_ts_ms(label: str) -> Optional[int]:
-    owners = _iter_live_supervisors(label)
+def _latest_owner_ts_ms(label: str, *, scope_key: Optional[str] = None) -> Optional[int]:
+    owners = _iter_live_supervisors(label, scope_key=scope_key)
     if not owners:
         return None
     return max(supervisor.owner_ts_ms for supervisor in owners)
@@ -704,11 +726,12 @@ def _wait_child(
     child: subprocess.Popen[bytes],
     *,
     label: str,
+    scope_key: Optional[str],
     current_owner_ts_ms: int,
 ) -> Tuple[int, bool]:
     supersede_started_at: Optional[float] = None
     while True:
-        latest_owner_ts_ms = _latest_owner_ts_ms(label)
+        latest_owner_ts_ms = _latest_owner_ts_ms(label, scope_key=scope_key)
         superseded = latest_owner_ts_ms is not None and latest_owner_ts_ms > current_owner_ts_ms
         rc = child.poll()
         if rc is not None:
@@ -826,6 +849,12 @@ def _require_optional_non_empty_str(value: object, field_name: str) -> Optional[
     if value is None:
         return None
     return _require_non_empty_str(value, field_name)
+
+
+def _require_optional_scope_key(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    return _require_non_empty_str(value, "scope-key")
 
 
 def _require_non_empty_str_list(value: object, field_name: str) -> List[str]:
@@ -952,11 +981,12 @@ def _live_runtime_state_from_command(
 def _matching_live_supervisors_for_stop(
     *,
     label: str,
+    scope_key: Optional[str],
     require_apply_id: Optional[str],
 ) -> List[LiveSupervisor]:
     if require_apply_id is not None:
         out: List[LiveSupervisor] = []
-        for supervisor in _iter_live_supervisors(label):
+        for supervisor in _iter_live_supervisors(label, scope_key=scope_key):
             runtime_state = supervisor.runtime_state
             if runtime_state is None or runtime_state.apply_id != require_apply_id:
                 continue
@@ -965,7 +995,7 @@ def _matching_live_supervisors_for_stop(
         return out
 
     out: List[LiveSupervisor] = []
-    for supervisor in _iter_live_supervisors(label):
+    for supervisor in _iter_live_supervisors(label, scope_key=scope_key):
         out.append(supervisor)
     out.sort(key=_supervisor_sort_key, reverse=True)
     return out
@@ -974,6 +1004,7 @@ def _matching_live_supervisors_for_stop(
 def _wait_supervisors_absent(
     *,
     label: str,
+    scope_key: Optional[str],
     require_apply_id: Optional[str],
     retired_pgids: set[int],
 ) -> None:
@@ -981,6 +1012,7 @@ def _wait_supervisors_absent(
     while True:
         remaining = _matching_live_supervisors_for_stop(
             label=label,
+            scope_key=scope_key,
             require_apply_id=require_apply_id,
         )
         lingering = [
@@ -1034,7 +1066,7 @@ def _iter_process_infos() -> List[ProcessInfo]:
     return infos
 
 
-def _iter_live_supervisors(label: Optional[str] = None) -> List[LiveSupervisor]:
+def _iter_live_supervisors(label: Optional[str] = None, *, scope_key: Optional[str] = None) -> List[LiveSupervisor]:
     out: List[LiveSupervisor] = []
     for pid, args in _iter_process_cmdlines():
         supervisor_command = _find_selection_supervisor_command(args)
@@ -1047,6 +1079,9 @@ def _iter_live_supervisors(label: Optional[str] = None) -> List[LiveSupervisor]:
         if runtime_label is None:
             raise RuntimeError(f"running selection supervisor is missing --label pid={pid}")
         if label is not None and runtime_label != label:
+            continue
+        runtime_scope_key = _arg_value(args, "--scope-key")
+        if scope_key is not None and runtime_scope_key != scope_key:
             continue
         owner_ts_ms_raw = _arg_value(args, "--owner-ts-ms")
         if owner_ts_ms_raw is None:
@@ -1079,10 +1114,15 @@ def _supervisor_sort_key(supervisor: LiveSupervisor) -> Tuple[int, int, int, int
     return (supervisor.owner_ts_ms, 0, 0, 0)
 
 
-def _selection_owner_supervisor(label: str, exclude_pid: Optional[int] = None) -> Optional[LiveSupervisor]:
+def _selection_owner_supervisor(
+    label: str,
+    *,
+    scope_key: Optional[str] = None,
+    exclude_pid: Optional[int] = None,
+) -> Optional[LiveSupervisor]:
     owners = [
         supervisor
-        for supervisor in _iter_live_supervisors(label)
+        for supervisor in _iter_live_supervisors(label, scope_key=scope_key)
         if exclude_pid is None or supervisor.pid != exclude_pid
     ]
     if not owners:
@@ -1100,8 +1140,8 @@ def _selection_owner_supervisor(label: str, exclude_pid: Optional[int] = None) -
     return matching[0]
 
 
-def _selection_present(label: str) -> bool:
-    for supervisor in _iter_live_supervisors(label):
+def _selection_present(label: str, scope_key: Optional[str] = None) -> bool:
+    for supervisor in _iter_live_supervisors(label, scope_key=scope_key):
         if _count_pid_tree_members(supervisor.pid) > 1:
             return True
     return False

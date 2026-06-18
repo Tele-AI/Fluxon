@@ -169,6 +169,7 @@ class PackReleaseExamplesLayoutTest(unittest.TestCase):
                     release_dir=release_dir,
                     rdma_backend="closed_sdk",
                     with_tikv_runtime=True,
+                    nix_pack_config_path=repo_root / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_static.yaml",
                 )
 
             pack_pyo3.assert_called_once()

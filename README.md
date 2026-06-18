@@ -10,11 +10,24 @@
 [![Latest](https://img.shields.io/badge/Latest-v0.2.1-f28500)](./fluxon_release)
 [![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#interface-capabilities)
 
-[English](./README.md) | [中文](./README_CN.md) | [Docs](./README.md) | [中文文档](./README_CN.md) | <a href="https://github.com/Tele-AI/fluxon" title="GitHub Repository"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
+[English](./README.md) | [中文](./README_CN.md) | [Docs](https://tele-ai.github.io/fluxon/) | [中文文档](https://tele-ai.github.io/fluxon/cn/) | <a href="https://github.com/Tele-AI/fluxon" title="GitHub Repository"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
 
 </div>
 
-Fluxon is a high-performance distributed communication and caching substrate for world models and other AI-native training and inference systems. It uses a single Rust-based integrated storage-and-transport foundation to provide unified `KV/RPC`, `MQ`, and `FS` interfaces, focusing on three classes of problems: cross-process and cross-node reuse of inference-side `KVCache` and `latent cache`, decoupled elastic message transport across heterogeneous resource pools, and remote access, `S3` forwarding, cache acceleration, and large-scale cross-cluster data migration for AI data and model files. As GPU performance keeps increasing, bottlenecks and wasted resources on CPU and IO paths become more visible. This increasingly calls for more efficient infrastructure to handle this high-performance work and reuse it across different business scenarios. Fluxon addresses this by first consolidating the complexity of low-level storage and transport in Rust, then exposing scenario-oriented `KV/RPC`, `MQ`, and `FS` interfaces on top.
+Fluxon is a high-performance distributed communication and caching substrate for world models and other AI-native training and inference systems. It uses a single Rust-based integrated storage-and-transport foundation to provide unified key-value caching and remote procedure call (`KV/RPC`), message queue (`MQ`), and S3-compatible file and object caching (`FS`) interfaces, focusing on three classes of problems: cross-process and cross-node reuse of inference-side `KVCache` and `latent cache`, decoupled elastic message transport across heterogeneous resource pools, and remote access, `S3` forwarding, cache acceleration, and large-scale cross-cluster data migration for AI data and model files. As GPU performance keeps increasing, bottlenecks and wasted resources on CPU and IO paths become more visible. This increasingly calls for more efficient infrastructure to handle this high-performance work and reuse it across different business scenarios. Fluxon addresses this by first consolidating the complexity of low-level storage and transport in Rust, then exposing scenario-oriented `KV/RPC`, `MQ`, and `FS` interfaces on top.
+
+## Contents
+
+- [Foundation Capabilities](#foundation-capabilities)
+- [Interface Capabilities](#interface-capabilities)
+- [Benchmark](#benchmark)
+- [Runtime Requirements](#runtime-requirements)
+- [Quick Start](#quick-start)
+- [Repository Structure](#repository-structure)
+- [Contributing](#contributing)
+- [Contributors](#contributors)
+- [License](#license)
+- [Stargazers over time](#stargazers-over-time)
 
 ## Foundation Capabilities
 
@@ -32,8 +45,6 @@ Fluxon is a high-performance distributed communication and caching substrate for
 ![](./pics/fluxon_commu.png)
 
 ![](./pics/topology_ui.png)
-
-For more usage details, see [User Docs](./fluxon_doc_en/user_doc/).
 
 ## Interface Capabilities
 
@@ -107,7 +118,7 @@ The benchmark results show that small-file reads and large-file writes are alrea
 
 ## Quick Start
 
-Quick Start is the shortest path to try Fluxon. For formal installation, deployment, and operations, see [User Docs](./fluxon_doc_en/user_doc/).
+Quick Start is the shortest path to try Fluxon. For formal installation, deployment, and operations, see [User Docs](https://tele-ai.github.io/fluxon/user_doc/).
 
 ### KV Quick Start
 
@@ -140,7 +151,7 @@ Open the printed link to view the KV Web UI:
 
 Related interface docs:
 
-- [KV and RPC Interface](<./fluxon_doc_en/user_doc/User - 3 - KV and RPC Interface.md>)
+- [KV and RPC Interface](https://tele-ai.github.io/fluxon/user_doc/User---3---KV-and-RPC-Interface/)
 
 ### MQ Quick Start
 
@@ -171,7 +182,7 @@ Runtime view:
 
 Related interface docs:
 
-- [MQ Interface](<./fluxon_doc_en/user_doc/User - 4 - MQ Interface.md>)
+- [MQ Interface](https://tele-ai.github.io/fluxon/user_doc/User---4---MQ-Interface/)
 
 ### FS Quick Start
 
@@ -209,7 +220,7 @@ Open the printed link to view the FS Web UI:
 
 Related interface docs:
 
-- [FS Interface](<./fluxon_doc_en/user_doc/User - 5 - FS Interface.md>)
+- [FS Interface](https://tele-ai.github.io/fluxon/user_doc/User---5---FS-Interface/)
 
 ## Repository Structure
 
@@ -223,11 +234,11 @@ Related interface docs:
 
 ## Contributing
 
-Thank you for your contribution. Start with the local developer docs:
+Contributions are welcome. Before you start, please read the developer docs on GitHub Pages:
 
-- [Developer Docs](./fluxon_doc_en/dev_doc/)
-- [Developer - 1 - Package core install artifacts](<./fluxon_doc_en/dev_doc/Developer - 1 - Package Core Install Artifacts.md>)
-- [Developer - 2 - Package middleware and images](<./fluxon_doc_en/dev_doc/Developer - 2 - Package Middleware and Images.md>)
+- [Developer Docs](https://tele-ai.github.io/fluxon/dev_doc/)
+- [Developer - 1 - Package core install artifacts](https://tele-ai.github.io/fluxon/dev_doc/Developer---1---Package-Core-Install-Artifacts/)
+- [Developer - 2 - Package middleware and images](https://tele-ai.github.io/fluxon/dev_doc/Developer---2---Package-Middleware-and-Images/)
 
 ## Contributors
 

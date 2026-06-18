@@ -49,6 +49,7 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("apply_stop_targets_matching_generation", test_apply_stop_targets_matching_generation),
         ("replace_supersedes_old_generation", test_replace_supersedes_old_generation),
         ("replace_supersede_retires_grandchild_process", test_replace_supersede_retires_grandchild_process),
+        ("same_label_different_scope_can_coexist", test_same_label_different_scope_can_coexist),
         ("newer_apply_owned_overlap_with_applyless_owner_defers_retire", test_newer_apply_owned_overlap_with_applyless_owner_defers_retire),
         ("stale_apply_owned_takeover_of_applyless_owner_is_rejected", test_stale_apply_owned_takeover_of_applyless_owner_is_rejected),
         ("shutdown_escalates_to_sigkill", test_shutdown_escalates_to_sigkill),
@@ -130,14 +131,19 @@ def _run_supervisor_command(
     state_json: str,
     child_argv: List[str],
     cwd: Path,
+    scope_key: Optional[str] = None,
 ) -> subprocess.Popen[str]:
-    return subprocess.Popen(
+    command = [
+        sys.executable,
+        str(supervisor_path),
+        "run",
+        "--label",
+        label,
+    ]
+    if scope_key is not None:
+        command.extend(["--scope-key", scope_key])
+    command.extend(
         [
-            sys.executable,
-            str(supervisor_path),
-            "run",
-            "--label",
-            label,
             "--state-json",
             state_json,
             "--owner-ts-ms",
@@ -154,7 +160,10 @@ def _run_supervisor_command(
             "0",
             "--",
             *child_argv,
-        ],
+        ]
+    )
+    return subprocess.Popen(
+        command,
         cwd=str(cwd),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -270,6 +279,7 @@ def _wait_until_absent(module, label: str, *, require_apply_id: Optional[str] = 
     while time.time() < deadline:
         supervisors = module._matching_live_supervisors_for_stop(
             label=label,
+            scope_key=None,
             require_apply_id=require_apply_id,
         )
         if not supervisors:
@@ -277,7 +287,7 @@ def _wait_until_absent(module, label: str, *, require_apply_id: Optional[str] = 
         time.sleep(0.2)
     raise RuntimeError(
         f"timeout waiting absent: label={label} require_apply_id={require_apply_id} "
-        f"remaining={module._matching_live_supervisors_for_stop(label=label, require_apply_id=require_apply_id)!r}"
+        f"remaining={module._matching_live_supervisors_for_stop(label=label, scope_key=None, require_apply_id=require_apply_id)!r}"
     )
 
 
@@ -288,6 +298,38 @@ def _run_stop(supervisor_path: Path, cwd: Path, *, label: str, require_apply_id:
         "stop",
         "--label",
         label,
+    ]
+    if require_apply_id is not None:
+        command.extend(["--require-apply-id", require_apply_id])
+    if missing_ok:
+        command.append("--missing-ok")
+    return subprocess.run(
+        command,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+
+def _run_stop_with_scope(
+    supervisor_path: Path,
+    cwd: Path,
+    *,
+    label: str,
+    scope_key: str,
+    require_apply_id: Optional[str] = None,
+    missing_ok: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    command = [
+        sys.executable,
+        str(supervisor_path),
+        "stop",
+        "--label",
+        label,
+        "--scope-key",
+        scope_key,
     ]
     if require_apply_id is not None:
         command.extend(["--require-apply-id", require_apply_id])
@@ -857,6 +899,67 @@ def test_replace_supersede_retires_grandchild_process() -> None:
         finally:
             _terminate_process(new_supervisor)
             _terminate_process(old_supervisor)
+
+
+def test_same_label_different_scope_can_coexist() -> None:
+    module = _load_runtime_module()
+    with tempfile.TemporaryDirectory(prefix="test_selection_supervisor_scope_isolation_") as td:
+        root = Path(td)
+        supervisor_path = _write_runtime_script(root)
+        child_path = _write_sleep_child(root, "child.py")
+        label = "DaemonSet/test-scope-isolation"
+        child_argv = [sys.executable, str(child_path)]
+        proc_a = _run_supervisor_command(
+            supervisor_path=supervisor_path,
+            label=label,
+            scope_key="/tmp/scope-a",
+            owner_ts_ms=1,
+            state_json=_runtime_state_json(
+                name="test-scope-isolation",
+                service_name="test-scope-isolation",
+                child_argv=child_argv,
+                root=root,
+                apply_id="apply-a",
+            ),
+            child_argv=child_argv,
+            cwd=root,
+        )
+        proc_b: Optional[subprocess.Popen[str]] = None
+        try:
+            _wait_until_present(module, label)
+            proc_b = _run_supervisor_command(
+                supervisor_path=supervisor_path,
+                label=label,
+                scope_key="/tmp/scope-b",
+                owner_ts_ms=2,
+                state_json=_runtime_state_json(
+                    name="test-scope-isolation",
+                    service_name="test-scope-isolation",
+                    child_argv=child_argv,
+                    root=root,
+                    apply_id="apply-b",
+                ),
+                child_argv=child_argv,
+                cwd=root,
+            )
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                owners_a = module._iter_live_supervisors(label, scope_key="/tmp/scope-a")
+                owners_b = module._iter_live_supervisors(label, scope_key="/tmp/scope-b")
+                if owners_a and owners_b:
+                    break
+                time.sleep(0.2)
+            else:
+                raise RuntimeError("expected both scope-local supervisors to exist")
+            assert proc_a.poll() is None, "scope-a supervisor should not be superseded by scope-b"
+            assert proc_b.poll() is None, "scope-b supervisor should stay alive"
+            stop_a = _run_stop_with_scope(supervisor_path, root, label=label, scope_key="/tmp/scope-a")
+            assert stop_a.returncode == 0, stop_a.stderr
+            proc_a.wait(timeout=20)
+            assert proc_b.poll() is None, "stopping scope-a must not stop scope-b"
+        finally:
+            _terminate_process(proc_b)
+            _terminate_process(proc_a)
 
 
 def test_newer_apply_owned_overlap_with_applyless_owner_defers_retire() -> None:
