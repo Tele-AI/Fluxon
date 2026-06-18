@@ -6,6 +6,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -174,6 +175,15 @@ def _load_yaml_mapping(path: Path, *, ctx: str) -> dict[str, Any]:
 
 def _detect_local_ipv4() -> str:
     try:
+        output = subprocess.check_output(
+            ["bash", "-lc", "ip -4 route get 1.1.1.1 | sed -n 's/.* src \\([0-9.]*\\).*/\\1/p' | head -n1"],
+            text=True,
+        ).strip()
+        if output and "." in output and not output.startswith("127."):
+            return output
+    except Exception:
+        pass
+    try:
         output = subprocess.check_output(["bash", "-lc", "hostname -I"], text=True).strip()
         for token in output.split():
             if "." in token and not token.startswith("127."):
@@ -189,9 +199,31 @@ def _detect_local_ipv4() -> str:
 
 
 def _same_host_local_testbed_host_ip() -> str:
-    # Same-host dual logical nodes must use loopback for every advertised endpoint.
-    # External / bridge addresses are not guaranteed to route back into the runner itself.
-    return "127.0.0.1"
+    ip = _detect_local_ipv4()
+    if ip.startswith("127."):
+        raise RuntimeError(
+            "ci_2_virt_node requires a non-loopback IPv4 address for same-host local node identity"
+        )
+    return ip
+
+
+def _same_host_local_controller_access_ip(*, node_ip: str) -> str:
+    return node_ip
+
+
+def _cidr32_list_for_ips(*, ips: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for ip in ips:
+        text = _require_nonempty_str(ip, "ips[]")
+        cidr = f"{text}/32"
+        if cidr in seen:
+            continue
+        seen.add(cidr)
+        out.append(cidr)
+    if not out:
+        raise ValueError("ips must be non-empty")
+    return out
 
 
 def _detect_local_hostname() -> str:
@@ -511,6 +543,23 @@ def _rewrite_deployconf_for_local_dual_nodes(
     if not isinstance(ops_controller_cfg, dict):
         raise ValueError("deployconf.service.ops_controller must be a mapping")
     ops_controller_cfg["port"] = int(controller_port)
+    master_cfg = service_cfg.get("master")
+    if not isinstance(master_cfg, dict):
+        raise ValueError("deployconf.service.master must be a mapping")
+    entrypoint = master_cfg.get("entrypoint")
+    if not isinstance(entrypoint, str):
+        raise ValueError("deployconf.service.master.entrypoint must be a string")
+    new_cidr_lines = "".join(f'    - "{cidr}"\n' for cidr in _cidr32_list_for_ips(ips=[host_ip]))
+    new_block = "network:\n  subnet_whitelist:\n" + new_cidr_lines
+    entrypoint_updated, replaced = re.subn(
+        r'network:\n  subnet_whitelist:\n(?:    - ".*"\n)+',
+        new_block,
+        entrypoint,
+        count=1,
+    )
+    if replaced != 1:
+        raise ValueError("deployconf.service.master.entrypoint missing expected subnet_whitelist block")
+    master_cfg["entrypoint"] = entrypoint_updated
     return cfg
 
 
@@ -519,14 +568,14 @@ def _rewrite_start_test_bed_for_local_dual_nodes(
     start_cfg: dict[str, Any],
     generated_deployconf_path: Path,
     primary_node_name: str,
-    host_ip: str,
+    controller_access_ip: str,
     controller_port: int,
     ui_port: int,
     ui_workdir: Path,
 ) -> dict[str, Any]:
     cfg = copy.deepcopy(start_cfg)
     cfg["deployconf_path"] = str(generated_deployconf_path)
-    cfg["controller_url"] = f"http://{host_ip}:{controller_port}/r/ops/fluxon_testbed"
+    cfg["controller_url"] = f"http://{controller_access_ip}:{controller_port}/r/ops/fluxon_testbed"
     cfg["controller_basic_auth"] = {"username": "ops_admin", "password": "ops_password"}
     ui_cfg = cfg.get("test_runner_ui")
     if not isinstance(ui_cfg, dict):
@@ -664,6 +713,7 @@ def _build_generated_configs(
     start_test_bed_template: dict[str, Any],
     host_name: str,
     host_ip: str,
+    controller_access_ip: str,
     primary_node_name: str,
     secondary_node_name: str,
     primary_hostworkdir: Path,
@@ -694,7 +744,7 @@ def _build_generated_configs(
         start_cfg=start_test_bed_template,
         generated_deployconf_path=generated_dir / "deployconf_testbed.local.yaml",
         primary_node_name=primary_node_name,
-        host_ip=host_ip,
+        controller_access_ip=controller_access_ip,
         controller_port=int(args.controller_port),
         ui_port=int(args.ui_port),
         ui_workdir=workdir / "test_runner_ui_runtime",
@@ -725,6 +775,7 @@ def _build_generated_configs(
         "runner_workdir": runner_workdir,
         "host_name": host_name,
         "host_ip": host_ip,
+        "controller_access_ip": controller_access_ip,
         "primary_node_name": primary_node_name,
         "secondary_node_name": secondary_node_name,
         "primary_hostworkdir": str(primary_hostworkdir),
@@ -774,6 +825,7 @@ def main() -> int:
 
     host_name = _detect_local_hostname()
     host_ip = _same_host_local_testbed_host_ip()
+    controller_access_ip = _same_host_local_controller_access_ip(node_ip=host_ip)
     primary_node_name, secondary_node_name = _local_logical_node_names(host_name)
     primary_hostworkdir, secondary_hostworkdir = _local_logical_hostworkdirs(hostworkdir)
     release_dir = _resolve_repo_root_cli_path(args.release_dir)
@@ -788,6 +840,7 @@ def main() -> int:
         start_test_bed_template=start_test_bed_template,
         host_name=host_name,
         host_ip=host_ip,
+        controller_access_ip=controller_access_ip,
         primary_node_name=primary_node_name,
         secondary_node_name=secondary_node_name,
         primary_hostworkdir=primary_hostworkdir,
@@ -837,6 +890,7 @@ def main() -> int:
         start_test_bed_template=start_test_bed_template,
         host_name=host_name,
         host_ip=host_ip,
+        controller_access_ip=controller_access_ip,
         primary_node_name=primary_node_name,
         secondary_node_name=secondary_node_name,
         primary_hostworkdir=primary_hostworkdir,

@@ -34,7 +34,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             scene_ids=["ci_kv", "ci_rust"],
             primary_node_name="local-node-a",
             secondary_node_name="local-node-b",
-            host_ip="127.0.0.1",
+            host_ip="10.1.1.119",
             wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
             controller_port=19080,
         )
@@ -48,7 +48,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         )
         self.assertEqual(
             generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["deploy"]["target_ip_map"],
-            {"local-node-a": "127.0.0.1", "local-node-b": "127.0.0.1"},
+            {"local-node-a": "10.1.1.119", "local-node-b": "10.1.1.119"},
         )
         self.assertEqual(
             generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["runtime_contracts"]["cluster_kv_owner"][
@@ -103,7 +103,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             scene_ids=["ci_doc_page"],
             primary_node_name="local-node-a",
             secondary_node_name="local-node-b",
-            host_ip="127.0.0.1",
+            host_ip="10.1.1.119",
             wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
             controller_port=19080,
         )
@@ -135,7 +135,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             deployconf_cfg=deployconf_cfg,
             primary_node_name="local-node-a",
             secondary_node_name="local-node-b",
-            host_ip="127.0.0.1",
+            host_ip="10.1.1.119",
             primary_hostworkdir=Path("/tmp/fluxon_testbed/a"),
             secondary_hostworkdir=Path("/tmp/fluxon_testbed/b"),
             wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
@@ -154,6 +154,10 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         self.assertEqual(
             [node["execution_mode"] for node in generated["cluster_nodes"]],
             ["local", "local"],
+        )
+        self.assertEqual(
+            [node["ip"] for node in generated["cluster_nodes"]],
+            ["10.1.1.119", "10.1.1.119"],
         )
         self.assertEqual(generated["global_envs"]["FLUXON_CLUSTER_NODE_IDS"], "local-node-a local-node-b")
         self.assertEqual(
@@ -175,6 +179,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         self.assertEqual(generated["service"]["ops_controller"]["port"], 19180)
         self.assertIn("local-node-a", generated["service"]["ops_agent"]["entrypoint"])
         self.assertIn("local-node-b", generated["service"]["ops_agent"]["entrypoint"])
+        self.assertIn('    - "10.1.1.119/32"', generated["service"]["master"]["entrypoint"])
 
     def test_generated_start_test_bed_config_points_to_local_authorities(self) -> None:
         start_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_START_TEST_BED_TEMPLATE, ctx="start_test_bed")
@@ -182,14 +187,14 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             start_cfg=start_cfg,
             generated_deployconf_path=Path("/tmp/deployconf.yaml"),
             primary_node_name="local-node-a",
-            host_ip="127.0.0.1",
+            controller_access_ip="10.1.1.119",
             controller_port=19080,
             ui_port=18080,
             ui_workdir=Path("/tmp/ui"),
         )
 
         self.assertEqual(generated["deployconf_path"], "/tmp/deployconf.yaml")
-        self.assertEqual(generated["controller_url"], "http://127.0.0.1:19080/r/ops/fluxon_testbed")
+        self.assertEqual(generated["controller_url"], "http://10.1.1.119:19080/r/ops/fluxon_testbed")
         self.assertEqual(generated["controller_basic_auth"]["username"], "ops_admin")
         self.assertEqual(generated["controller_basic_auth"]["password"], "ops_password")
         self.assertEqual(generated["test_runner_ui"]["workdir"], "/tmp/ui")
@@ -202,7 +207,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             start_cfg=start_cfg,
             generated_deployconf_path=Path("/tmp/deployconf.yaml"),
             primary_node_name="local-node-a",
-            host_ip="127.0.0.1",
+            controller_access_ip="10.1.1.119",
             controller_port=19080,
             ui_port=18080,
             ui_workdir=Path("/tmp/ui"),
@@ -301,8 +306,12 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             env = _ENTRY._doc_build_env(base_url=None)
         self.assertEqual(env["FLUXON_DOC_SITE_BASE_URL"], "tele-ai.github.io/Fluxon")
 
-    def test_same_host_local_testbed_host_ip_uses_loopback(self) -> None:
-        self.assertEqual(_ENTRY._same_host_local_testbed_host_ip(), "127.0.0.1")
+    def test_same_host_local_testbed_host_ip_requires_non_loopback(self) -> None:
+        with mock.patch.object(_ENTRY, "_detect_local_ipv4", return_value="10.1.1.119"):
+            self.assertEqual(_ENTRY._same_host_local_testbed_host_ip(), "10.1.1.119")
+        with mock.patch.object(_ENTRY, "_detect_local_ipv4", return_value="127.0.0.1"):
+            with self.assertRaisesRegex(RuntimeError, "requires a non-loopback IPv4 address"):
+                _ENTRY._same_host_local_testbed_host_ip()
 
     def test_main_passes_generated_start_test_bed_config_to_runner_env(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -336,7 +345,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             try:
                 with mock.patch.object(_ENTRY, "_run", side_effect=fake_run):
                     with mock.patch.object(_ENTRY, "_detect_local_hostname", return_value="runner-host"):
-                        with mock.patch.object(_ENTRY, "_detect_local_ipv4", return_value="127.0.0.1"):
+                        with mock.patch.object(_ENTRY, "_detect_local_ipv4", return_value="10.1.1.119"):
                             sys.argv = argv
                             rc = _ENTRY.main()
             finally:
@@ -357,7 +366,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 str((REPO_ROOT / "fluxon_release").resolve()),
             )
 
-    def test_main_same_host_generated_configs_use_loopback_even_if_external_ip_is_detected(self) -> None:
+    def test_main_same_host_generated_configs_use_non_loopback_host_ip(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             workdir = root / "ci_2_virt_node_workdir"
@@ -403,12 +412,13 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             )
             self.assertEqual(
                 [node["ip"] for node in generated_deployconf["cluster_nodes"]],
-                ["127.0.0.1", "127.0.0.1"],
+                ["10.1.1.119", "10.1.1.119"],
             )
             self.assertEqual(
                 generated_start["controller_url"],
-                "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                "http://10.1.1.119:19080/r/ops/fluxon_testbed",
             )
+            self.assertIn('    - "10.1.1.119/32"', generated_deployconf["service"]["master"]["entrypoint"])
 
     def test_main_syncs_rather_no_git_submodule_before_pack(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -442,7 +452,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             try:
                 with mock.patch.object(_ENTRY, "_run", side_effect=fake_run):
                     with mock.patch.object(_ENTRY, "_detect_local_hostname", return_value="runner-host"):
-                        with mock.patch.object(_ENTRY, "_detect_local_ipv4", return_value="127.0.0.1"):
+                        with mock.patch.object(_ENTRY, "_detect_local_ipv4", return_value="10.1.1.119"):
                             with mock.patch.object(_ENTRY, "_ensure_ci_pack_release_env", return_value=Path("/tmp/env.yaml")):
                                 with mock.patch.object(_ENTRY, "_render_ci_nix_pack_config", return_value=Path("/tmp/cfg.yaml")):
                                     sys.argv = argv
@@ -494,7 +504,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             try:
                 with mock.patch.object(_ENTRY, "_run", side_effect=fake_run):
                     with mock.patch.object(_ENTRY, "_detect_local_hostname", return_value="runner-host"):
-                        with mock.patch.object(_ENTRY, "_detect_local_ipv4", return_value="127.0.0.1"):
+                        with mock.patch.object(_ENTRY, "_detect_local_ipv4", return_value="10.1.1.119"):
                             sys.argv = argv
                             rc = _ENTRY.main()
             finally:
