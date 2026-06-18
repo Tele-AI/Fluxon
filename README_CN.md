@@ -236,7 +236,7 @@ FS Quick Start 会额外打印：
 
 ## 贡献
 
-感谢你的贡献。建议先阅读 GitHub Pages 上的开发者文档：
+欢迎参与贡献。开始之前，建议先阅读 GitHub Pages 上的开发者文档：
 
 - [开发者文档总入口](https://tele-ai.github.io/fluxon/cn/dev_doc/)
 - [开发者 - 1 - 打包核心安装包](https://tele-ai.github.io/fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---1---%E6%89%93%E5%8C%85%E6%A0%B8%E5%BF%83%E5%AE%89%E8%A3%85%E5%8C%85/)

@@ -234,7 +234,7 @@ Related interface docs:
 
 ## Contributing
 
-Thank you for your contribution. Start with the developer docs on GitHub Pages:
+Contributions are welcome. Before you start, please read the developer docs on GitHub Pages:
 
 - [Developer Docs](https://tele-ai.github.io/fluxon/dev_doc/)
 - [Developer - 1 - Package core install artifacts](https://tele-ai.github.io/fluxon/dev_doc/Developer---1---Package-Core-Install-Artifacts/)

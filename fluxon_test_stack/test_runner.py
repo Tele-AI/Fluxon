@@ -408,7 +408,23 @@ def _runner_stdio_mirror_enabled() -> bool:
     return os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
 
 
-def _start_runner_stdio_log_mirror(*, log_path: Path, stdout_fd: int, stderr_fd: int) -> None:
+def _ci_log_timestamp_prefix(now: Optional[float] = None) -> str:
+    ts = datetime.datetime.fromtimestamp(
+        time.time() if now is None else float(now),
+        tz=datetime.timezone.utc,
+    )
+    return ts.strftime("[%Y-%m-%d %H:%M:%S UTC]")
+
+
+def _ci_log_prefix_lines(text: str, *, now: Optional[float] = None) -> str:
+    if not text:
+        return ""
+    prefix = _ci_log_timestamp_prefix(now)
+    lines = text.splitlines(keepends=True)
+    return "".join(f"{prefix} {line}" if line.strip() else line for line in lines)
+
+
+def _start_runner_stdio_log_mirror(*, log_path: Path, stdout_fd: int) -> None:
     def _mirror_loop() -> None:
         offset = 0
         while True:
@@ -423,12 +439,10 @@ def _start_runner_stdio_log_mirror(*, log_path: Path, stdout_fd: int, stderr_fd:
                             chunk = fp.read()
                             offset = fp.tell()
                         if chunk:
-                            data = chunk.encode("utf-8", errors="replace")
-                            for fd in (stdout_fd, stderr_fd):
-                                if fd < 0:
-                                    continue
+                            data = _ci_log_prefix_lines(chunk).encode("utf-8", errors="replace")
+                            if stdout_fd >= 0:
                                 try:
-                                    os.write(fd, data)
+                                    os.write(stdout_fd, data)
                                 except OSError:
                                     pass
                 time.sleep(0.2)
@@ -463,16 +477,11 @@ def _redirect_process_stdio_to_log(workdir_root: Path) -> None:
     log_path = (workdir_root / RUNNER_STDIO_LOG_FILENAME).resolve()
     log_fp = log_path.open("a", encoding="utf-8", buffering=1)
     banner = (
-        f"[test_runner] redirecting process stdio to stable log: {log_path}\n"
+        f"{_ci_log_timestamp_prefix()} [test_runner] redirecting process stdio to stable log: {log_path}\n"
     )
     try:
         sys.stdout.write(banner)
         sys.stdout.flush()
-    except OSError:
-        pass
-    try:
-        sys.stderr.write(banner)
-        sys.stderr.flush()
     except OSError:
         pass
 
@@ -510,7 +519,6 @@ def _redirect_process_stdio_to_log(workdir_root: Path) -> None:
         _start_runner_stdio_log_mirror(
             log_path=log_path,
             stdout_fd=int(keepalive[0]),
-            stderr_fd=int(keepalive[1]),
         )
 
 
@@ -15240,11 +15248,13 @@ def _print_ci_wait_progress(
     if chunk:
         text = chunk.rstrip("\n")
         if text:
-            print(text, flush=True)
+            sys.stdout.write(_ci_log_prefix_lines(text + "\n", now=now))
+            sys.stdout.flush()
         return next_offset, now + _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS
     if now >= next_heartbeat_at:
         remaining_s = max(0, int(deadline - now))
         print(
+            f"{_ci_log_timestamp_prefix(now)} "
             f"[CI wait exit_code] waiting for ci_runner progress... remaining_s={remaining_s} "
             f"log={str((run_dir / 'logs' / 'ci_runner' / 'stdout.log').resolve())}",
             flush=True,

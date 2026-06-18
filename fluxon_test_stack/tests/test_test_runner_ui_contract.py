@@ -41,6 +41,13 @@ _RUNNER = _load_module()
 
 
 class TestTestRunnerUiContract(unittest.TestCase):
+    def test_ci_log_prefix_lines_prefixes_each_nonempty_line(self) -> None:
+        text = _RUNNER._ci_log_prefix_lines("a\n\nb\n", now=0.0)
+        self.assertEqual(
+            text,
+            "[1970-01-01 00:00:00 UTC] a\n\n[1970-01-01 00:00:00 UTC] b\n",
+        )
+
     def test_ci_wait_progress_tail_reads_incremental_remote_stdout(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
@@ -73,7 +80,10 @@ class TestTestRunnerUiContract(unittest.TestCase):
                         )
         self.assertEqual(offset, 0)
         self.assertEqual(next_heartbeat, 115.0)
-        self.assertIn("[CI wait exit_code] waiting for ci_runner progress...", buf.getvalue())
+        self.assertIn(
+            "[1970-01-01 00:01:40 UTC] [CI wait exit_code] waiting for ci_runner progress...",
+            buf.getvalue(),
+        )
 
     def test_print_ci_wait_progress_emits_new_tail(self) -> None:
         buf = io.StringIO()
@@ -91,7 +101,10 @@ class TestTestRunnerUiContract(unittest.TestCase):
                         )
         self.assertEqual(offset, 12)
         self.assertEqual(next_heartbeat, 115.0)
-        self.assertEqual(buf.getvalue(), "a\nb\n")
+        self.assertEqual(
+            buf.getvalue(),
+            "[1970-01-01 00:01:40 UTC] a\n[1970-01-01 00:01:40 UTC] b\n",
+        )
 
     def test_runner_stdio_mirror_enabled_only_for_github_actions(self) -> None:
         with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=True):
@@ -118,7 +131,7 @@ class TestTestRunnerUiContract(unittest.TestCase):
             kwargs = start_mirror.call_args.kwargs
             self.assertEqual(kwargs["log_path"], (workdir / _RUNNER.RUNNER_STDIO_LOG_FILENAME).resolve())
             self.assertEqual(kwargs["stdout_fd"], 11)
-            self.assertEqual(kwargs["stderr_fd"], 12)
+            self.assertNotIn("stderr_fd", kwargs)
             if _RUNNER._RUNNER_STDIO_LOG_FP is not None:
                 _RUNNER._RUNNER_STDIO_LOG_FP.close()
             _RUNNER._RUNNER_STDIO_LOG_FP = original_log_fp
