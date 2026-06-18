@@ -2,7 +2,7 @@
 - 核心用户文档、开发文档和设计文档都在仓库内的 `fluxon_doc_cn/` 和 `fluxon_doc_en/` 下
 - 详细的中英文文档写作规约索引见 `fluxon_doc_cn/dev_doc/开发者 - 3 - 文档写作规约.md` 和 `fluxon_doc_en/dev_doc/Developer - 3 - Documentation Writing Rules.md`
 - `teststack` 有两个步骤：`start testbed` 和 `testrunner`
-- `teststack` 支持 UI；`testrunner` 应负责 UI，UI 应复用下层的 ops 接口
+- `teststack` 支持 UI；`testrunner` 应负责 UI 的 authority 和 API surface，但 UI 应作为常驻服务运行，并复用下层的 ops 接口
 - 本项目所有 Python 代码都必须兼容 Python `>= 3.10`
 - 本项目中的 YAML 文件默认都是示例。不要直接修改它们；请为你的具体开发环境创建单独的 YAML 文件
 - 长时间运行的命令请放到 `tmux` 里启动。不要直接在前台运行长生命周期服务

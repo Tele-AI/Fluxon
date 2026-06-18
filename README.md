@@ -16,7 +16,9 @@
 
 Fluxon is a high-performance distributed communication and caching substrate for world models and other AI-native training and inference systems. It uses a single Rust-based integrated storage-and-transport foundation to provide unified key-value caching and remote procedure call (`KV/RPC`), message queue (`MQ`), and S3-compatible file and object caching (`FS`) interfaces, focusing on three classes of problems: cross-process and cross-node reuse of inference-side `KVCache` and `latent cache`, decoupled elastic message transport across heterogeneous resource pools, and remote access, `S3` forwarding, cache acceleration, and large-scale cross-cluster data migration for AI data and model files. As GPU performance keeps increasing, bottlenecks and wasted resources on CPU and IO paths become more visible. This increasingly calls for more efficient infrastructure to handle this high-performance work and reuse it across different business scenarios. Fluxon addresses this by first consolidating the complexity of low-level storage and transport in Rust, then exposing scenario-oriented `KV/RPC`, `MQ`, and `FS` interfaces on top.
 
-## Contents
+<a id="contents"></a>
+
+## 🧭 Contents
 
 - [Foundation Capabilities](#foundation-capabilities)
 - [Interface Capabilities](#interface-capabilities)
@@ -29,7 +31,9 @@ Fluxon is a high-performance distributed communication and caching substrate for
 - [License](#license)
 - [Stargazers over time](#stargazers-over-time)
 
-## Foundation Capabilities
+<a id="foundation-capabilities"></a>
+
+## 🧱 Foundation Capabilities
 
 - End-to-end Rust: moves connection handling, protocol encoding/decoding, state-machine progression, shared-memory management, and observability collection into Rust hot paths
 - Integrated storage and transport: prioritizes the cross-process shared-memory fast path and optimizes storage and transport within one unified data plane
@@ -46,7 +50,9 @@ Fluxon is a high-performance distributed communication and caching substrate for
 
 ![](./pics/topology_ui.png)
 
-## Interface Capabilities
+<a id="interface-capabilities"></a>
+
+## 🔌 Interface Capabilities
 
 ### Fluxon KV/RPC
 
@@ -82,7 +88,9 @@ Fluxon FS is an S3-compatible file and object cache for AI data and model files.
 - Specialized optimization for small-file / large-file reads and writes: optimizes concurrency and transport paths by file granularity and read / write path to improve bandwidth utilization and overall throughput
 - Large-scale cross-cluster migration: supports `PB`-scale data migration and keeps caching, transport, and failure recovery in one unified path
 
-## Benchmark
+<a id="benchmark"></a>
+
+## 📊 Benchmark
 
 The benchmark section mainly covers the `RPC`, `KV`, and `FS` data planes, and the related scripts and configurations are primarily under `fluxon_test_stack/`.
 
@@ -108,7 +116,9 @@ The benchmark results show that small-file reads and large-file writes are alrea
 
 `MQ` currently focuses mainly on scenario problems and data-plane design. The automated runtime entrypoints are `test_runner.py` and `fluxon_test_stack/`.
 
-## Runtime Requirements
+<a id="runtime-requirements"></a>
+
+## 🧰 Runtime Requirements
 
 - Linux only
 - Python `>= 3.10`
@@ -116,7 +126,9 @@ The benchmark results show that small-file reads and large-file writes are alrea
 - External middleware dependencies: the minimum service plane requires `etcd` and `greptime`; `FluxonFS` features such as directory transfer and pre-scan that persist task state also require `TiKV PD` and `TiKV`
 - Quick Start and runtime packaging workflows depend on Docker
 
-## Quick Start
+<a id="quick-start"></a>
+
+## 🚀 Quick Start
 
 Quick Start is the shortest path to try Fluxon. For formal installation, deployment, and operations, see [User Docs](https://tele-ai.github.io/fluxon/user_doc/).
 
@@ -222,7 +234,9 @@ Related interface docs:
 
 - [FS Interface](https://tele-ai.github.io/fluxon/user_doc/User---5---FS-Interface/)
 
-## Repository Structure
+<a id="repository-structure"></a>
+
+## 🗂️ Repository Structure
 
 - `fluxon_rs/`: Rust core implementation and low-level capabilities
 - `fluxon_py/`: Python interfaces, runtime, and bindings
@@ -232,15 +246,20 @@ Related interface docs:
 - `examples/fluxon_quick_start/`: minimal runnable environment entrypoint
 - `fluxon_test_stack/`: test stack, benchmarks, and gitops entrypoint
 
-## Contributing
+<a id="contributing"></a>
+
+## 🤝 Contributing
 
 Contributions are welcome. Before you start, please read the developer docs on GitHub Pages:
 
 - [Developer Docs](https://tele-ai.github.io/fluxon/dev_doc/)
 - [Developer - 1 - Package core install artifacts](https://tele-ai.github.io/fluxon/dev_doc/Developer---1---Package-Core-Install-Artifacts/)
 - [Developer - 2 - Package middleware and images](https://tele-ai.github.io/fluxon/dev_doc/Developer---2---Package-Middleware-and-Images/)
+- [Developer - 4 - Publish a release](https://tele-ai.github.io/fluxon/dev_doc/Developer---4---Publish-a-Release/)
 
-## Contributors
+<a id="contributors"></a>
+
+## 👥 Contributors
 
 <a href="https://github.com/Tele-AI/fluxon/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=Tele-AI/fluxon" />
@@ -268,10 +287,14 @@ Some earlier contribution records are no longer fully reflected in the current c
 - `RuileLu`: KV lease support
 - `Summage`: Initial KV architecture optimization
 
-## License
+<a id="license"></a>
+
+## 📄 License
 
 Fluxon is open-sourced under Apache License 2.0, see [LICENSE](./LICENSE).
 
-## Stargazers over time
+<a id="stargazers-over-time"></a>
+
+## ⭐ Stargazers over time
 
 [![Stargazers over time](https://starchart.cc/Tele-AI/fluxon.svg)](https://starchart.cc/Tele-AI/fluxon)
