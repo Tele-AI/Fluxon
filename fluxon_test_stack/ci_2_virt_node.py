@@ -28,12 +28,9 @@ DEFAULT_RATHER_NO_GIT_SUBMODULE_SCRIPT = (
 )
 DEFAULT_CI_2_VIRT_NODE_WORKDIR = REPO_ROOT / ".dever" / "ci_2_virt_node"
 DEFAULT_RELEASE_DIR = REPO_ROOT / "fluxon_release"
-DOC_SITE_BASE_URL_ENV = "FLUXON_DOC_SITE_BASE_URL"
-DEFAULT_DOC_SITE_BASE_URL = "example.com"
 PUBLIC_PROFILE_ID = "fluxon_tcp_thread"
 PUBLIC_ARTIFACT_SET_ID = "fluxon_tcp_thread"
 PUBLIC_TRANSPORT_FEATURE = "tcp_thread_transport"
-DEFAULT_CI_RUST_KV_TEST_ROUNDS = "all"
 DEFAULT_TESTBED_BOOTSTRAP_MODE = "bare_then_apply"
 DEFAULT_TESTBED_UI_PORT = 18080
 DEFAULT_TESTBED_CONTROLLER_PORT = 19080
@@ -151,25 +148,9 @@ def _parse_args() -> argparse.Namespace:
         help="Fluxon Ops controller HTTP port for the generated testbed configs.",
     )
     parser.add_argument(
-        "--doc-site-base-url",
-        default=None,
-        help=(
-            "Optional explicit base URL forwarded to scripts/build_doc_site.py. If omitted, "
-            f"reuse {DOC_SITE_BASE_URL_ENV} when present, otherwise fall back to {DEFAULT_DOC_SITE_BASE_URL!r}."
-        ),
-    )
-    parser.add_argument(
         "--print-generated",
         action="store_true",
         help="Print generated config paths before executing commands.",
-    )
-    parser.add_argument(
-        "--ci-rust-kv-test-rounds",
-        default=DEFAULT_CI_RUST_KV_TEST_ROUNDS,
-        help=(
-            "Deprecated override for ci_rust kv_test rounds. Prefer declaring KV_TEST_ROUNDS "
-            "in the suite profile command_tokens and passing that suite via --suite-path."
-        ),
     )
     return parser.parse_args()
 
@@ -318,23 +299,6 @@ def _selected_scene_ids(args: argparse.Namespace, suite_cfg: dict[str, Any]) -> 
     return _default_scene_ids(suite_cfg)
 
 
-def _normalize_ci_rust_kv_test_rounds(raw: str) -> str:
-    text = _require_nonempty_str(raw, "ci_rust_kv_test_rounds")
-    if text == "all":
-        return text
-    allowed = {"p2p_only", "rdma_transfer_only", "rdma_transfer_with_rpc"}
-    rounds = [item.strip() for item in text.split(",") if item.strip()]
-    if not rounds:
-        raise ValueError("ci_rust_kv_test_rounds must contain at least one round name")
-    invalid = [item for item in rounds if item not in allowed]
-    if invalid:
-        expected = ", ".join(sorted(allowed))
-        raise ValueError(
-            f"unsupported ci_rust_kv_test_rounds entries {invalid!r}; expected one or more of: {expected}, or 'all'"
-        )
-    return ",".join(rounds)
-
-
 def _rewrite_suite_for_local_dual_nodes(
     *,
     suite_cfg: dict[str, Any],
@@ -344,11 +308,7 @@ def _rewrite_suite_for_local_dual_nodes(
     host_ip: str,
     wheel_name: str,
     controller_port: int,
-    ci_rust_kv_test_rounds: str | None = None,
 ) -> dict[str, Any]:
-    normalized_rounds_override = None
-    if ci_rust_kv_test_rounds is not None:
-        normalized_rounds_override = _normalize_ci_rust_kv_test_rounds(ci_rust_kv_test_rounds)
     suite = copy.deepcopy(suite_cfg)
     scenes = suite.get("scenes")
     if not isinstance(scenes, dict):
@@ -451,18 +411,18 @@ def _rewrite_suite_for_local_dual_nodes(
     ci_runtime = runtime.get("ci")
     if not isinstance(ci_runtime, dict):
         raise ValueError("generated public profile must define runtime.ci")
-    command_tokens = ci_runtime.get("command_tokens")
-    if not isinstance(command_tokens, dict):
-        raise ValueError("generated public profile runtime.ci.command_tokens must be a mapping")
-    command_tokens["KV_TRANSPORT_FEATURE"] = PUBLIC_TRANSPORT_FEATURE
-    command_tokens["KV_TEST_ROUNDS"] = _normalize_ci_rust_kv_test_rounds(
-        normalized_rounds_override
-        or str(command_tokens.get("KV_TEST_ROUNDS", DEFAULT_CI_RUST_KV_TEST_ROUNDS))
-    )
-    command_tokens["DOC_SITE_BASE_URL"] = _require_nonempty_str(
-        str(command_tokens.get("DOC_SITE_BASE_URL", DEFAULT_DOC_SITE_BASE_URL)),
-        "runtime.ci.command_tokens.DOC_SITE_BASE_URL",
-    )
+    scene_configs = ci_runtime.get("scene_configs")
+    if scene_configs is not None:
+        if not isinstance(scene_configs, dict):
+            raise ValueError("generated public profile runtime.ci.scene_configs must be a mapping")
+        kv_scene_config = scene_configs.get("ci_top_attention_bin_kvtest")
+        if kv_scene_config is not None:
+            if not isinstance(kv_scene_config, dict):
+                raise ValueError(
+                    "generated public profile runtime.ci.scene_configs['ci_top_attention_bin_kvtest'] must be a mapping"
+                )
+            # The generated public profile is fixed to the tcp-thread transport branch.
+            kv_scene_config["kv_transport_feature"] = PUBLIC_TRANSPORT_FEATURE
     for runtime_key in ("ci", "test_stack"):
         runtime_block = runtime.get(runtime_key)
         if not isinstance(runtime_block, dict):
@@ -787,9 +747,6 @@ def _build_generated_configs(
         host_ip=host_ip,
         wheel_name=wheel_name,
         controller_port=int(args.controller_port),
-        ci_rust_kv_test_rounds=(
-            None if str(args.ci_rust_kv_test_rounds) == DEFAULT_CI_RUST_KV_TEST_ROUNDS else str(args.ci_rust_kv_test_rounds)
-        ),
     )
     generated_deployconf = _rewrite_deployconf_for_local_dual_nodes(
         deployconf_cfg=deployconf_template,

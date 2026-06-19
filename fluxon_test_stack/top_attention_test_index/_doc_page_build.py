@@ -5,10 +5,11 @@ import argparse
 import os
 import sys
 
-from _common import REPO_ROOT, call
+from _common import REPO_ROOT, call, load_case_config
 
 
 TEST_REQUIREMENTS = ["ops"]
+SCENE_ID = "ci_top_attention_doc_page_build"
 
 
 def main() -> int:
@@ -21,15 +22,17 @@ def main() -> int:
         help="Python executable used for the delegated command.",
     )
     parser.add_argument(
-        "--base-url",
-        default=os.environ.get("FLUXON_DOC_SITE_BASE_URL"),
-        help="Doc site base URL forwarded through FLUXON_DOC_SITE_BASE_URL.",
+        "--case-config",
+        required=True,
+        help="Canonical CI case config YAML emitted by test_runner.",
     )
     args, passthrough = parser.parse_known_args()
-    env = None
-    if args.base_url is not None:
-        env = os.environ.copy()
-        env["FLUXON_DOC_SITE_BASE_URL"] = args.base_url
+    scene_config = load_case_config(args.case_config, expected_scene_id=SCENE_ID)
+    base_url = str(scene_config.get("doc_site_base_url") or "").strip()
+    if not base_url:
+        raise ValueError("scene_config.doc_site_base_url must be set")
+    env = os.environ.copy()
+    env["FLUXON_DOC_SITE_BASE_URL"] = base_url
     return call(
         [
             args.python,

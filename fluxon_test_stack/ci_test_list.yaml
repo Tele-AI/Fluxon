@@ -9,111 +9,6 @@ run:
     test_ids: ALL
 
 scenes:
-  ci_kv:
-    ci:
-      subject: kv
-      runtime_contract: cluster_kv_owner
-      commands:
-        - id: backend
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_py/tests/test_backend.py
-          timeout_seconds: 10800
-          test_id_arg: --test-id
-          test_ids:
-            - dlpack_codec_roundtrip
-            - basic_put_and_get
-            - put_and_get_flat_dict
-            - key_not_found
-        - id: relay_docker_connectivity
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_py/tests/test_backend_relay_docker.py
-          timeout_seconds: 10800
-        - id: config
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_py/tests/test_config.py
-          timeout_seconds: 10800
-          test_id_arg: --test-id
-          test_ids:
-            - verification
-            - load_from_dict
-            - load_from_file
-            - to_yaml_str_roundtrip
-            - fluxonkv_sub_cluster_config
-            - fluxonkv_p2p_relay_removed
-            - fluxon_client_config_yaml_shape
-            - fluxonkv_runtime_defaults_are_internal
-            - fluxonkv_removed_rdma_config_keys
-    select:
-      scales: [n1_kvowner_dram_3gib]
-      profiles: [fluxon_fastws, fluxon_tquic, fluxon_sockudo_ws, fluxon_tcp]
-
-  ci_mq:
-    ci:
-      subject: mq
-      runtime_contract: cluster_kv_owner
-      commands:
-        - id: mpmc_quick_weighted
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_py/tests/test_api_chan_mpmc/test_api_chan_mpmc_quick_and_weighted_consume.py
-          timeout_seconds: 10800
-        - id: ready_channels_access
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_py/tests/test_api_chan_mpmc/test_ready_channels_access.py
-          timeout_seconds: 10800
-        - id: mpsc_base
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_py/tests/test_api_chan_mpsc/test_api_chan_mpsc_base.py
-          timeout_seconds: 10800
-        - id: mq_capacity_auto_clean
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_py/tests/test_mq/test_capacity_and_auto_clean.py
-          timeout_seconds: 10800
-        - id: mq_payload_lease_error
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_py/tests/test_mq/test_payload_lease_error.py
-          timeout_seconds: 10800
-    select:
-      scales: [n1_kvowner_dram_3gib]
-      profiles: [fluxon_fastws, fluxon_tquic, fluxon_sockudo_ws, fluxon_tcp]
-
-  ci_fs:
-    ci:
-      subject: fs
-      runtime_contract: cluster_kv_owner
-      commands:
-        - id: fs_config_types
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_py/tests/test_fluxon_fs_config_types.py
-          timeout_seconds: 10800
-        - id: fs_patcher
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_py/tests/test_fluxon_fs_patcher.py
-          timeout_seconds: 10800
-        - id: fs_remote_mount
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_py/tests/test_fluxon_fs_remote_mount.py
-          timeout_seconds: 10800
-    select:
-      scales: [n1_kvowner_dram_3gib]
-      profiles: [fluxon_fastws, fluxon_tquic, fluxon_sockudo_ws, fluxon_tcp]
-
-  ci_rust:
-    ci:
-      subject: rust
-      runtime_contract: rust_self_managed
-      commands:
-        - id: kv_test
-          command: cargo run --manifest-path __RUN_DIR__/src/fluxon_rs/fluxon_kv/Cargo.toml --bin kv_test --no-default-features --features test_bins,p2p_transfer,__KV_TRANSPORT_FEATURE__
-          timeout_seconds: 21600
-    select:
-      scales: [n1_kvowner_dram_20gib]
-      profiles: [fluxon_fastws, fluxon_tquic, fluxon_sockudo_ws, fluxon_tcp]
-
-  ci_doc_page:
-    ci:
-      subject: doc_page
-      runtime_contract: rust_self_managed
-      prepare:
-        - kind: setup_dev_env
-          config: setup_and_pack/setup_dev_env/doc_page_ci.yaml
-          cache_relpath: .cached/fluxon_doc_site/toolchain
-      commands:
-        - id: doc_page_build
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_doc_page_build.py
-          timeout_seconds: 10800
-    select:
-      scales: [n1_kvowner_dram_3gib]
-      profiles: [fluxon_tcp]
-
   ci_top_attention_doc_page_build:
     ci:
       subject: doc_page
@@ -122,10 +17,6 @@ scenes:
         - kind: setup_dev_env
           config: setup_and_pack/setup_dev_env/doc_page_ci.yaml
           cache_relpath: .cached/fluxon_doc_site/toolchain
-      commands:
-        - id: top_attention_doc_page_build
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_doc_page_build.py --base-url __DOC_SITE_BASE_URL__
-          timeout_seconds: 10800
     select:
       scales: [n1_kvowner_dram_3gib]
       profiles: [fluxon_tcp]
@@ -134,10 +25,6 @@ scenes:
     ci:
       subject: rust
       runtime_contract: rust_self_managed
-      commands:
-        - id: top_attention_bin_kvtest
-          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_bin_kvtest.py --feature __KV_TRANSPORT_FEATURE__ --rounds __KV_TEST_ROUNDS__
-          timeout_seconds: 21600
     select:
       scales: [n1_kvowner_dram_20gib]
       profiles: [fluxon_tcp]
@@ -423,9 +310,11 @@ profiles:
             infra44-ThinkStation-PX: 192.168.151.44
             infra46-ThinkStation-PX: 192.168.151.46
           bootstrap_ready_timeout_seconds: 300
-        command_tokens:
-          KV_TRANSPORT_FEATURE: fastws_transport
-          DOC_SITE_BASE_URL: example.com
+        scene_configs:
+          ci_top_attention_doc_page_build:
+            doc_site_base_url: example.com
+          ci_top_attention_bin_kvtest:
+            kv_test_rounds: all
         runtime_contracts:
           cluster_kv_owner: &cluster_kv_owner_runtime
             base_runtime:
@@ -566,9 +455,11 @@ profiles:
     runtime:
       ci:
         <<: *common_ci_runtime
-        command_tokens:
-          KV_TRANSPORT_FEATURE: tquic_transport
-          DOC_SITE_BASE_URL: example.com
+        scene_configs:
+          ci_top_attention_doc_page_build:
+            doc_site_base_url: example.com
+          ci_top_attention_bin_kvtest:
+            kv_test_rounds: all
       test_stack:
         <<: *common_test_stack_runtime
   fluxon_sockudo_ws:
@@ -576,9 +467,11 @@ profiles:
     runtime:
       ci:
         <<: *common_ci_runtime
-        command_tokens:
-          KV_TRANSPORT_FEATURE: sockudo_ws_transport
-          DOC_SITE_BASE_URL: example.com
+        scene_configs:
+          ci_top_attention_doc_page_build:
+            doc_site_base_url: example.com
+          ci_top_attention_bin_kvtest:
+            kv_test_rounds: all
       test_stack:
         <<: *common_test_stack_runtime
   fluxon_tcp:
@@ -586,9 +479,11 @@ profiles:
     runtime:
       ci:
         <<: *common_ci_runtime
-        command_tokens:
-          KV_TRANSPORT_FEATURE: tcp_transport
-          DOC_SITE_BASE_URL: example.com
+        scene_configs:
+          ci_top_attention_doc_page_build:
+            doc_site_base_url: example.com
+          ci_top_attention_bin_kvtest:
+            kv_test_rounds: all
       test_stack:
         <<: *common_test_stack_runtime
   redis_sharded:

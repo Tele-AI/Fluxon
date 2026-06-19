@@ -12,6 +12,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER_PATH = REPO_ROOT / "fluxon_test_stack" / "test_runner.py"
@@ -36,6 +38,55 @@ _RUNNER = _load_module()
 
 
 class TestTestRunnerTestbedContract(unittest.TestCase):
+    def test_write_ci_scene_config_yaml_emits_structured_scene_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            resolved_case = {
+                "case": {
+                    "scene_id": "ci_top_attention_doc_page_build",
+                    "scale_id": "n1_kvowner_dram_3gib",
+                    "profile_id": "fluxon_tcp_thread",
+                    "case_id": "ci_top_attention_doc_page_build__n1_kvowner_dram_3gib__fluxon_tcp_thread",
+                },
+                "profile": {
+                    "ci": {
+                        "scene_config": {
+                            "doc_site_base_url": "tele-ai.github.io/Fluxon",
+                        }
+                    }
+                },
+            }
+
+            path = _RUNNER._write_ci_scene_config_yaml(resolved_case, run_dir=run_dir)
+
+            self.assertEqual(path, (run_dir / "configs" / "ci_scene_config.yaml").resolve())
+            payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["case"]["scene_id"], "ci_top_attention_doc_page_build")
+            self.assertEqual(payload["scene_config"]["doc_site_base_url"], "tele-ai.github.io/Fluxon")
+
+    def test_ci_source_overlay_includes_fluxon_test_stack(self) -> None:
+        self.assertIn("fluxon_test_stack", _RUNNER._CI_SOURCE_OVERLAY_ROOTS)
+
+    def test_top_attention_ci_execution_plan_is_runner_native(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        artifact_sets = suite_cfg.get("artifact_sets")
+        if isinstance(artifact_sets, dict):
+            for artifact_set in artifact_sets.values():
+                if not isinstance(artifact_set, dict):
+                    continue
+                release_artifacts = artifact_set.get("release_artifacts")
+                if isinstance(release_artifacts, dict):
+                    python_wheel = release_artifacts.get("python_wheel")
+                    if isinstance(python_wheel, str) and python_wheel.strip():
+                        artifact_set["release_artifacts"] = {"wheel": python_wheel}
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        case = next(item for item in cases if item.scene_id == "ci_top_attention_bin_kvtest" and item.profile_id == "fluxon_tcp")
+        planned = _RUNNER._build_ci_execution_plan(case, suite)
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_bin_kvtest")
+        self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
+
     def test_ci_prepare_run_inputs_rebuilds_release_view_without_reusing_source_test_rsc(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -127,7 +178,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             resolved_case = {
                 "case": {
                     "family": "ci",
-                    "case_id": "ci_doc_page__n1_kvowner_dram_3gib__fluxon_tcp",
+                    "case_id": "ci_top_attention_doc_page_build__n1_kvowner_dram_3gib__fluxon_tcp",
                 },
                 "artifact_set": {
                     "release_artifacts": {"wheel": "fluxon-0.2.1-py3-none-any.whl"},
@@ -143,7 +194,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         "commands": [
                             {
                                 "id": "doc_page_build",
-                                "command": "__RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_doc_page_build.py",
+                                "command": "__RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_doc_page_build.py --case-config __RUN_DIR__/configs/ci_scene_config.yaml",
                                 "timeout_seconds": 10,
                             }
                         ],

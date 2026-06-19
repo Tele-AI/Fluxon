@@ -338,17 +338,22 @@ SCENE_ENUMS_ALLOWED = {
     "kv_write_heavy_large_value",
     "rpc_echo_small_payload",
     "rpc_echo_small_payload_zerorpc",
-    "ci_kv",
-    "ci_mq",
-    "ci_fs",
-    "ci_rust",
-    "ci_doc_page",
-    "ci_fs_s3",
 }
 
 
 def _scene_id_is_allowed(scene_id: str) -> bool:
     return scene_id in SCENE_ENUMS_ALLOWED or scene_id.startswith(TOP_ATTENTION_SCENE_ID_PREFIX)
+
+
+def _runner_native_ci_scene_ids() -> Tuple[str, ...]:
+    return (
+        "ci_top_attention_doc_page_build",
+        "ci_top_attention_bin_kvtest",
+    )
+
+
+def _scene_id_uses_runner_native_ci_commands(scene_id: str) -> bool:
+    return scene_id in _runner_native_ci_scene_ids()
 
 TEST_STACK_RPC_BACKEND_FLUXON = "FLUXON"
 TEST_STACK_RPC_BACKEND_ZERORPC = "ZERORPC"
@@ -2381,6 +2386,10 @@ def _is_runtime_token_placeholder(raw: str) -> bool:
     return raw.startswith("__") and raw.endswith("__") and len(raw) >= 4
 
 
+def _find_unresolved_runtime_tokens(raw: str) -> List[str]:
+    return sorted(set(re.findall(r"__[A-Z0-9_]+__", raw)))
+
+
 def _resolved_case_runtime_token_mapping(resolved_case: Dict[str, Any]) -> Dict[str, str]:
     runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
     workdir_root = _require_str(runtime.get("workdir_root"), "resolved_case.runtime.workdir_root")
@@ -2390,21 +2399,6 @@ def _resolved_case_runtime_token_mapping(resolved_case: Dict[str, Any]) -> Dict[
     artifact_set = _require_dict(resolved_case.get("artifact_set"), "resolved_case.artifact_set")
     release_root = _require_str(artifact_set.get("release_root"), "resolved_case.artifact_set.release_root")
     test_rsc_root = _require_str(artifact_set.get("test_rsc_root"), "resolved_case.artifact_set.test_rsc_root")
-    extra_tokens: Dict[str, str] = {}
-    profile = _require_dict(resolved_case.get("profile"), "resolved_case.profile")
-    ci = profile.get("ci")
-    if isinstance(ci, dict):
-        command_tokens = ci.get("command_tokens")
-        if isinstance(command_tokens, dict):
-            for raw_token_name, raw_token_value in command_tokens.items():
-                token_name = _require_str(
-                    raw_token_name,
-                    "resolved_case.profile.ci.command_tokens key",
-                ).strip()
-                extra_tokens[token_name] = _require_str(
-                    raw_token_value,
-                    f"resolved_case.profile.ci.command_tokens[{token_name!r}]",
-                )
     return _build_runtime_token_mapping(
         workdir_root=workdir_root,
         run_dir=run_dir,
@@ -2413,7 +2407,6 @@ def _resolved_case_runtime_token_mapping(resolved_case: Dict[str, Any]) -> Dict[
         case_id=_require_str(case.get("case_id"), "resolved_case.case.case_id"),
         profile_id=_require_str(case.get("profile_id"), "resolved_case.case.profile_id"),
         stack_identity=stack_identity,
-        extra_tokens=extra_tokens,
     )
 
 
@@ -2448,6 +2441,12 @@ def _subst_runtime_tokens(resolved_case: Dict[str, Any], s: str) -> str:
             raise ValueError("deploy.release_root must be an absolute path")
     for token, value in mapping.items():
         out = out.replace(token, value)
+    unresolved_tokens = _find_unresolved_runtime_tokens(out)
+    if unresolved_tokens:
+        case_id = _resolved_case_case_id(resolved_case)
+        raise ValueError(
+            f"resolved_case {case_id!r} contains unresolved runtime tokens {unresolved_tokens!r}: {s!r}"
+        )
     return out
 
 
@@ -3665,6 +3664,13 @@ def _prepare_ci_case(
         resolved_case,
         out_dir=src_root,
     )
+    profile = _require_dict(resolved_case.get("profile"), "resolved_case.profile")
+    profile_ci = _require_dict(profile.get("ci"), "resolved_case.profile.ci")
+    if profile_ci.get("scene_config") is not None:
+        _write_ci_scene_config_yaml(
+            resolved_case,
+            run_dir=run_dir,
+        )
     if _ci_cluster_runtime_instance_ids(resolved_case):
         _write_ci_master_owner_configs(
             resolved_case,
@@ -6209,7 +6215,7 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
     if kind == SCENE_KIND_CI:
         _forbid_unknown_keys(item, {"ci", "select"}, ctx)
         ci = _require_dict(item.get("ci"), f"{ctx}.ci")
-        _forbid_unknown_keys(ci, {"subject", "commands", "runtime_contract", "prepare"}, f"{ctx}.ci")
+        _forbid_unknown_keys(ci, {"subject", "runtime_contract", "prepare"}, f"{ctx}.ci")
         subject = _require_scene_subject(ci.get("subject"), f"{ctx}.ci.subject")
         if subject == SCENE_SUBJECT_INFER:
             raise ValueError(f"{ctx}.ci.subject must not be {SCENE_SUBJECT_INFER!r}")
@@ -6219,7 +6225,6 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
                 ci.get("runtime_contract"),
                 f"{ctx}.ci.runtime_contract",
             ),
-            "commands": _parse_ci_commands(ci.get("commands"), f"{ctx}.ci.commands"),
         }
         raw_prepare = ci.get("prepare")
         if raw_prepare is not None:
@@ -7240,7 +7245,7 @@ def _parse_profile(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
 
     if runtime.get("ci") is not None:
         ci = _require_dict(runtime.get("ci"), f"{ctx}.runtime.ci")
-        _forbid_unknown_keys(ci, {"deploy", "runtime_contracts", "command_tokens"}, f"{ctx}.runtime.ci")
+        _forbid_unknown_keys(ci, {"deploy", "runtime_contracts", "scene_configs"}, f"{ctx}.runtime.ci")
         deploy = _require_dict(ci.get("deploy"), f"{ctx}.runtime.ci.deploy")
         _validate_profile_deploy_block(
             deploy,
@@ -7259,16 +7264,14 @@ def _parse_profile(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
                 f"{ctx}.runtime.ci.runtime_contracts[{contract_id!r}]",
                 target_ip_map,
             )
-        command_tokens = ci.get("command_tokens")
-        if command_tokens is not None:
-            command_tokens = _require_dict(command_tokens, f"{ctx}.runtime.ci.command_tokens")
-            for raw_token_name, raw_token_value in command_tokens.items():
-                token_name = _require_str(raw_token_name, f"{ctx}.runtime.ci.command_tokens key").strip()
-                if re.fullmatch(r"[A-Z0-9_]+", token_name) is None:
-                    raise ValueError(
-                        f"{ctx}.runtime.ci.command_tokens keys must match [A-Z0-9_]+, got: {token_name!r}"
-                    )
-                _ = _require_str(raw_token_value, f"{ctx}.runtime.ci.command_tokens[{token_name!r}]")
+        scene_configs = ci.get("scene_configs")
+        if scene_configs is not None:
+            scene_configs = _require_dict(scene_configs, f"{ctx}.runtime.ci.scene_configs")
+            for raw_scene_id, raw_scene_cfg in scene_configs.items():
+                scene_id = _require_str(raw_scene_id, f"{ctx}.runtime.ci.scene_configs key").strip()
+                if not scene_id:
+                    raise ValueError(f"{ctx}.runtime.ci.scene_configs keys must be non-empty")
+                _ = _require_dict(raw_scene_cfg, f"{ctx}.runtime.ci.scene_configs[{scene_id!r}]")
 
     if runtime.get("test_stack") is not None:
         ts = _require_dict(runtime.get("test_stack"), f"{ctx}.runtime.test_stack")
@@ -7645,6 +7648,35 @@ def _command_step_label(command: Dict[str, Any]) -> str:
     return f"{command_id}[{test_id}]"
 
 
+def _runner_native_ci_commands_for_case(case: _ResolvedCase, *, ctx: str) -> List[Dict[str, Any]]:
+    scene_id = _require_str(case.scene_id, f"{ctx}.scene_id")
+    if scene_id == "ci_top_attention_doc_page_build":
+        return [
+            {
+                "id": "top_attention_doc_page_build",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_doc_page_build.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 10800,
+            }
+        ]
+    if scene_id == "ci_top_attention_bin_kvtest":
+        return [
+            {
+                "id": "top_attention_bin_kvtest",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_bin_kvtest.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    raise ValueError(f"{ctx} unsupported runner-native CI scene: {scene_id!r}")
+
+
 def _materialize_selected_ci_steps(
     case: _ResolvedCase,
     command: Dict[str, Any],
@@ -7690,8 +7722,9 @@ def _materialize_selected_ci_steps(
 def _build_ci_execution_plan(case: _ResolvedCase, suite: _Suite) -> List[_PlannedCase]:
     selectors = suite.run_selectors
     scene_ci = _require_dict(suite.scenes[case.scene_id].get("ci"), f"scene[{case.scene_id}].ci")
-    raw_commands = _require_list(scene_ci.get("commands"), f"scene[{case.scene_id}].ci.commands")
-    commands = [_require_dict(raw, f"scene[{case.scene_id}].ci.commands[]") for raw in raw_commands]
+    if not _scene_id_uses_runner_native_ci_commands(case.scene_id):
+        raise ValueError(f"scene[{case.scene_id}] does not declare a runner-native CI command branch")
+    commands = _runner_native_ci_commands_for_case(case, ctx=f"scene[{case.scene_id}].ci")
     raw_prepare = scene_ci.get("prepare")
     ci_prepare_steps = None if raw_prepare is None else _parse_ci_prepare_steps(
         copy.deepcopy(raw_prepare),
@@ -8482,11 +8515,18 @@ def _build_resolved_case_yaml(
                 f"resolved_case.profile_source.ci.runtime_contracts[{runtime_contract!r}]",
             )
         )
-        command_tokens = profile_ci.get("command_tokens")
-        if command_tokens is not None:
-            command_tokens = copy.deepcopy(
-                _require_dict(command_tokens, "resolved_case.profile_source.ci.command_tokens")
-            )
+        scene_configs = profile_ci.get("scene_configs")
+        selected_scene_config = None
+        if scene_configs is not None:
+            scene_configs = _require_dict(scene_configs, "resolved_case.profile_source.ci.scene_configs")
+            raw_scene_config = scene_configs.get(case.scene_id)
+            if raw_scene_config is not None:
+                selected_scene_config = copy.deepcopy(
+                    _require_dict(
+                        raw_scene_config,
+                        f"resolved_case.profile_source.ci.scene_configs[{case.scene_id!r}]",
+                    )
+                )
 
         scene = {
             "ci": {
@@ -8505,8 +8545,8 @@ def _build_resolved_case_yaml(
                 "runtime": selected_runtime,
             },
         }
-        if command_tokens is not None:
-            profile["ci"]["command_tokens"] = command_tokens
+        if selected_scene_config is not None:
+            profile["ci"]["scene_config"] = selected_scene_config
     elif case_family == CASE_FAMILY_BENCH:
         scene_ts = _require_dict(scene_src.get("test_stack"), "resolved_case.scene_source.test_stack")
         benchmark = copy.deepcopy(_require_dict(scale_src.get("benchmark"), "resolved_case.scale_source.benchmark"))
@@ -8608,6 +8648,8 @@ def _build_resolved_case_yaml(
     case_out: Dict[str, Any] = {
         "case_id": case.case_id,
         "case_key": case.case_key,
+        "scene_id": case.scene_id,
+        "scale_id": case.scale_id,
         "profile_id": case.profile_id,
         "family": case_family,
         "artifact_set": artifact_set_id,
@@ -12524,7 +12566,7 @@ def _safe_extract_tar_gz(*, archive_path: Path, dest_dir: Path) -> None:
 
 
 
-_CI_SOURCE_OVERLAY_ROOTS: Tuple[str, ...] = ("setup_and_pack", "fluxon_py")
+_CI_SOURCE_OVERLAY_ROOTS: Tuple[str, ...] = ("setup_and_pack", "fluxon_py", "fluxon_test_stack")
 _CI_SOURCE_OVERLAY_IGNORE_NAMES: Tuple[str, ...] = (
     "target",
     ".git",
@@ -14371,6 +14413,34 @@ def _write_ci_build_config_ext(
 
     out_path = out_dir / "build_config_ext.yml"
     _write_yaml_file(out_path, cfg)
+
+
+def _write_ci_scene_config_yaml(
+    resolved_case: Dict[str, Any], *, run_dir: Path
+) -> Path:
+    profile = _require_dict(resolved_case.get("profile"), "resolved_case.profile")
+    profile_ci = _require_dict(profile.get("ci"), "resolved_case.profile.ci")
+    scene_config = copy.deepcopy(_require_dict(profile_ci.get("scene_config"), "resolved_case.profile.ci.scene_config"))
+    case = _require_dict(resolved_case.get("case"), "resolved_case.case")
+    cfg_dir = (run_dir / "configs").resolve()
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    out_path = cfg_dir / "ci_scene_config.yaml"
+    if out_path.exists():
+        raise ValueError(f"ci_scene_config.yaml already exists (no overwrite): {out_path}")
+    _write_yaml_file(
+        out_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "case": {
+                "scene_id": _require_str(case.get("scene_id"), "resolved_case.case.scene_id"),
+                "scale_id": _require_str(case.get("scale_id"), "resolved_case.case.scale_id"),
+                "profile_id": _require_str(case.get("profile_id"), "resolved_case.case.profile_id"),
+                "case_id": _require_str(case.get("case_id"), "resolved_case.case.case_id"),
+            },
+            "scene_config": scene_config,
+        },
+    )
+    return out_path
 
 
 def _write_ci_master_owner_configs(

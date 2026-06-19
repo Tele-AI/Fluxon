@@ -102,9 +102,9 @@ jobs:
 
           # Scene-local workload config:
           # - Restrict kv_test to one round in CI for runtime control.
-          # - Keep the doc-site base URL in the same profile.command_tokens path instead of using workflow env.
-          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["command_tokens"]["KV_TEST_ROUNDS"] = "p2p_only"
-          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["command_tokens"]["DOC_SITE_BASE_URL"] = (
+          # - Keep the doc-site base URL in scene_configs instead of workflow env.
+          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"]["ci_top_attention_bin_kvtest"]["kv_test_rounds"] = "p2p_only"
+          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"]["ci_top_attention_doc_page_build"]["doc_site_base_url"] = (
               "${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
           )
 

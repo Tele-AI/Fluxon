@@ -56,10 +56,6 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
             test_suite_requires_benchmark_bundle_only_for_bench_cases,
         ),
         (
-            "ci_cluster_kv_owner_allows_single_node_topology",
-            test_ci_cluster_kv_owner_allows_single_node_topology,
-        ),
-        (
             "ci_top_attention_doc_page_build_declares_setup_dev_env_prepare",
             test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare,
         ),
@@ -201,121 +197,6 @@ def test_suite_requires_benchmark_bundle_only_for_bench_cases() -> None:
         )
         return
     print("PASS: test_suite_requires_benchmark_bundle_only_for_bench_cases")
-
-
-def test_ci_cluster_kv_owner_allows_single_node_topology() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
-    suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
-    if not isinstance(suite_cfg, dict):
-        print("FAIL: test_ci_cluster_kv_owner_allows_single_node_topology - suite config is not a mapping")
-        return
-
-    artifact_sets = suite_cfg.get("artifact_sets")
-    if not isinstance(artifact_sets, dict):
-        print("FAIL: test_ci_cluster_kv_owner_allows_single_node_topology - artifact_sets is not a mapping")
-        return
-    for artifact_set in artifact_sets.values():
-        if not isinstance(artifact_set, dict):
-            continue
-        release_artifacts = artifact_set.get("release_artifacts")
-        if isinstance(release_artifacts, dict):
-            python_wheel = release_artifacts.get("python_wheel")
-            if isinstance(python_wheel, str) and python_wheel.strip():
-                artifact_set["release_artifacts"] = {"wheel": python_wheel}
-
-    suite_cfg["scenes"] = {
-        "ci_kv": copy.deepcopy(_TEST_RUNNER._require_dict(suite_cfg.get("scenes"), "suite.scenes").get("ci_kv"))
-    }
-    if not isinstance(suite_cfg["scenes"]["ci_kv"], dict):
-        print("FAIL: test_ci_cluster_kv_owner_allows_single_node_topology - ci_kv scene missing")
-        return
-    suite_cfg["scenes"]["ci_kv"]["select"]["profiles"] = ["fluxon_tcp"]
-    scales = suite_cfg.get("scales")
-    if not isinstance(scales, dict):
-        print("FAIL: test_ci_cluster_kv_owner_allows_single_node_topology - scales is not a mapping")
-        return
-    n1_scale = scales.get("n1_kvowner_dram_3gib")
-    if not isinstance(n1_scale, dict):
-        print("FAIL: test_ci_cluster_kv_owner_allows_single_node_topology - n1 scale missing")
-        return
-    targets = n1_scale.get("targets")
-    if not isinstance(targets, dict):
-        print("FAIL: test_ci_cluster_kv_owner_allows_single_node_topology - n1 scale targets missing")
-        return
-    targets["primary"] = "infra44-ThinkStation-PX"
-
-    suite = _TEST_RUNNER._parse_suite_config(copy.deepcopy(suite_cfg))
-    cases = _TEST_RUNNER._expand_cases(suite)
-    if len(cases) != 1:
-        print(
-            "FAIL: test_ci_cluster_kv_owner_allows_single_node_topology - "
-            f"expected exactly 1 case, got {len(cases)}"
-        )
-        return
-
-    ci_scene = _TEST_RUNNER._require_dict(
-        _TEST_RUNNER._require_dict(suite.scenes["ci_kv"], "suite.scenes[ci_kv]").get("ci"),
-        "suite.scenes[ci_kv].ci",
-    )
-    planned_commands = copy.deepcopy(
-        _TEST_RUNNER._parse_ci_commands(ci_scene.get("commands"), "suite.scenes[ci_kv].ci.commands")
-    )
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
-        stack_identity = {
-            "ops_cluster_name": "fluxon_testbed",
-            "cluster_name": "fluxon_benchmark",
-            "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
-            "shared_memory_path": "/tmp/fluxon_test_stack_shm",
-            "shared_file_path": "/tmp/fluxon_test_stack_shm_files",
-        }
-        resolved_case = _TEST_RUNNER._build_resolved_case_yaml(
-            cases[0],
-            suite,
-            config_root=str(root / "config_root"),
-            workdir_root=str(root / "workdir_root"),
-            run_dir=str(root / "run_dir"),
-            ci_commands=planned_commands,
-            ci_prepare_steps=None,
-            execution_label=cases[0].case_id,
-            command_id=None,
-            test_id=None,
-            stack_identity=stack_identity,
-        )
-        _TEST_RUNNER._compile_ci_case(resolved_case)
-
-        instances = _TEST_RUNNER._require_list(
-            _TEST_RUNNER._require_dict(resolved_case.get("deploy"), "resolved_case.deploy").get("instances"),
-            "resolved_case.deploy.instances",
-        )
-        placements = {
-            _TEST_RUNNER._require_str(inst.get("id"), "deploy.instances[].id"): _TEST_RUNNER._require_str(
-                _TEST_RUNNER._require_dict(inst.get("deployer"), "deploy.instances[].deployer").get("target"),
-                "deploy.instances[].deployer.target",
-            )
-            for inst in instances
-        }
-        expected_target = "infra44-ThinkStation-PX"
-        if placements.get("master") != expected_target:
-            print(
-                "FAIL: test_ci_cluster_kv_owner_allows_single_node_topology - "
-                f"master target mismatch: {placements.get('master')!r}"
-            )
-            return
-        if placements.get("owner_0") != expected_target:
-            print(
-                "FAIL: test_ci_cluster_kv_owner_allows_single_node_topology - "
-                f"owner_0 target mismatch: {placements.get('owner_0')!r}"
-            )
-            return
-        if placements.get("ci_runner") != expected_target:
-            print(
-                "FAIL: test_ci_cluster_kv_owner_allows_single_node_topology - "
-                f"ci_runner target mismatch: {placements.get('ci_runner')!r}"
-            )
-            return
-    print("PASS: test_ci_cluster_kv_owner_allows_single_node_topology")
 
 
 def test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare() -> None:
