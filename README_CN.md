@@ -3,7 +3,13 @@
 ![](./pics/fluxon架构图20260423.png)
 
 
-Fluxon 是一套面向世界模型与其他 AI-native 场景训推系统的高性能分布式通信与缓存基座，用同一套 Rust 实现的存传一体底座统一提供键值缓存与远程过程调用（`KV/RPC`）、消息队列（`MQ`）和 S3 兼容的文件与对象缓存（`FS`）三类接口，重点解决三类问题：推理侧 `KVCache`、`latent cache` 的跨进程、跨节点复用，异构资源池之间的解耦弹性消息传输，以及面向 AI 数据、模型文件的远端访问、`S3` 转发、缓存加速和跨集群大规模数据搬迁。随着 GPU 性能越来越强，CPU 和 IO 链路的性能瓶颈和资源浪费被逐渐放大，越来越需要沉淀出更高效的基础设施来负责这部分高性能工作，并且复用到不同的业务场景中。Fluxon 的做法是先用 Rust 收束底层“存”和“传”的复杂度，再向上提供面向场景的 `KV/RPC`、`MQ`、`FS` 接口。
+当 GPU 算力持续提升，CPU 与 I/O 链路正越来越多地成为拖慢 AI 训练与推理效率的隐性瓶颈。Fluxon 的目标就是把底层“存”和“传”的复杂度尽量收束起来，让系统资源更多用于模型本身，而不是耗散在数据面的拼装与搬运上。
+
+基于统一的 Rust 存传一体底座，Fluxon 向上提供三大标准化接口，直接面向 AI 系统里的核心瓶颈：
+
+- **KV/RPC（统一键值与 RPC）**：打破数据孤岛，实现推理侧 `KVCache` 与 `latent cache` 的跨节点、跨进程高效复用
+- **MQ（弹性消息队列）**：解耦系统依赖，支撑异构资源池之间的弹性消息传输
+- **FS（兼容 `S3` 的文件、对象与缓存加速系统）**：统一键值、文件、对象三类缓存能力，并支持 AI 数据与模型文件的远端访问、`S3` 转发和跨集群大规模迁移
 
 
 <div align="center">
@@ -122,11 +128,20 @@ benchmark 显示，小文件读和大文件写已显著领先 `Alluxio`，大文
 
 ## 🧰 运行要求
 
-- Linux only
-- Python `>= 3.10`
-- 从源码构建时，Rust 工具链以 [fluxon_rs/rust-toolchain.toml](./fluxon_rs/rust-toolchain.toml) 为准，当前固定为 `1.93.0`
-- 依赖的外部中间件：最小服务平面需要 `etcd`、`greptime`；启用 `FluxonFS` 的目录传输、预扫描等持久任务状态能力时还需要 `TiKV PD`、`TiKV`
-- Quick Start 或运行时打包链路会依赖 Docker
+**用于 Quick Start（`Docker`）：**
+
+- 已安装 Docker
+- Quick Start 镜像已经内置 demo 流程所需的中间件
+
+**用于生产部署或源码构建：**
+
+- **操作系统**：仅支持 Linux
+- **Python**：`>= 3.10`
+- **Rust**：工具链固定为 `1.93.0`，见 [fluxon_rs/rust-toolchain.toml](./fluxon_rs/rust-toolchain.toml)
+- **外部中间件**：
+  - 最小服务平面需要 `etcd` 和 `Greptime`
+  - `FluxonFS` 的目录传输、预扫描等持久任务状态能力还需要 `TiKV PD` 和 `TiKV`
+- **Docker**：Quick Start 镜像链路和运行时打包链路都需要 Docker
 
 <a id="快速开始"></a>
 

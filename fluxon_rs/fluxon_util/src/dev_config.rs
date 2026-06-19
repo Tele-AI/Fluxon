@@ -20,34 +20,63 @@ pub fn find_file_upwards<P: AsRef<Path>>(start: P, filename: &str) -> Option<Pat
     None
 }
 
-/// Best-effort root anchor for config discovery from this crate context.
-/// Starts from this crate's manifest dir and prefers the VCS root (.git),
-/// then the nearest Cargo workspace root, otherwise falls back to the manifest dir.
-pub fn repo_root() -> Result<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+fn is_fluxon_repo_root(path: &Path) -> bool {
+    path.join("fluxon_rs").join("Cargo.toml").is_file()
+        && path.join("fluxon_test_stack").is_dir()
+}
 
-    // Prefer the VCS root when available.
-    if let Some(git_root) = find_file_upwards(&manifest_dir, ".git") {
-        if let Some(parent) = git_root.parent() {
-            return Ok(parent.to_path_buf());
+fn find_fluxon_repo_root_upwards(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        if is_fluxon_repo_root(&dir) {
+            return Some(dir);
         }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn repo_root_from_manifest_dir(manifest_dir: &Path) -> PathBuf {
+    // Prefer the nearest Fluxon repo root. Nested CI run workspaces can live under an outer
+    // checkout that also contains `.git`; using the nearest Fluxon source tree keeps runtime
+    // config discovery anchored to the active case workspace instead of the outer checkout.
+    if let Some(repo_root) = find_fluxon_repo_root_upwards(manifest_dir) {
+        return repo_root;
     }
 
     // Otherwise use the nearest workspace root.
-    let mut dir = manifest_dir.clone();
+    let mut dir = manifest_dir.to_path_buf();
     while dir.parent().is_some() {
         let cargo_toml = dir.join("Cargo.toml");
         if cargo_toml.exists() {
             if let Ok(content) = fs::read_to_string(&cargo_toml) {
                 if content.contains("[workspace]") {
-                    return Ok(dir);
+                    return dir;
                 }
             }
         }
         dir.pop();
     }
 
-    Ok(manifest_dir)
+    // Fall back to the VCS root when available.
+    if let Some(git_root) = find_file_upwards(manifest_dir, ".git") {
+        if let Some(parent) = git_root.parent() {
+            return parent.to_path_buf();
+        }
+    }
+
+    manifest_dir.to_path_buf()
+}
+
+/// Best-effort root anchor for config discovery from this crate context.
+/// Starts from this crate's manifest dir and first prefers the nearest Fluxon repo root,
+/// then the nearest Cargo workspace root, then the VCS root (.git), otherwise falls back
+/// to the manifest dir.
+pub fn repo_root() -> Result<PathBuf> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    Ok(repo_root_from_manifest_dir(&manifest_dir))
 }
 
 /// Locate `build_config_ext.yml` by walking upwards from the repo/workspace anchor.
@@ -227,4 +256,57 @@ pub fn load_tsdb_host_port() -> Result<(String, u16)> {
 /// Wraps read_prom_remote_write_url_from_build_config for compatibility with Python tooling.
 pub fn load_tsdb_remote_write_url() -> Result<String> {
     read_prom_remote_write_url_from_build_config()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_fluxon_repo_root_upwards, repo_root_from_manifest_dir};
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn find_fluxon_repo_root_prefers_nearest_nested_fluxon_tree() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let outer_root = temp_dir.path().join("outer_checkout");
+        let nested_root = outer_root.join("runner_run").join("results").join("case_1").join("run_1").join("src");
+
+        fs::create_dir_all(outer_root.join(".git")).expect("create outer .git");
+        fs::create_dir_all(outer_root.join("fluxon_rs")).expect("create outer fluxon_rs dir");
+        fs::create_dir_all(outer_root.join("fluxon_test_stack")).expect("create outer fluxon_test_stack dir");
+        fs::write(outer_root.join("fluxon_rs").join("Cargo.toml"), "[workspace]\n").expect("write outer cargo toml");
+
+        fs::create_dir_all(nested_root.join("fluxon_rs")).expect("create nested fluxon_rs dir");
+        fs::create_dir_all(nested_root.join("fluxon_test_stack")).expect("create nested fluxon_test_stack dir");
+        fs::write(nested_root.join("fluxon_rs").join("Cargo.toml"), "[workspace]\n").expect("write nested cargo toml");
+        fs::write(nested_root.join("build_config_ext.yml"), "etcd: 127.0.0.1:2379\n").expect("write nested build_config_ext");
+
+        let nested_manifest_dir = nested_root.join("fluxon_rs").join("fluxon_kv");
+        fs::create_dir_all(&nested_manifest_dir).expect("create nested manifest dir");
+
+        let repo_root = find_fluxon_repo_root_upwards(&nested_manifest_dir).expect("repo root");
+        assert_eq!(repo_root, nested_root);
+    }
+
+    #[test]
+    fn repo_root_from_manifest_dir_uses_nearest_fluxon_repo_root() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let outer_root = temp_dir.path().join("outer_checkout");
+        let nested_root = outer_root.join("runner_run").join("results").join("case_1").join("run_1").join("src");
+
+        fs::create_dir_all(outer_root.join(".git")).expect("create outer .git");
+        fs::create_dir_all(outer_root.join("fluxon_rs")).expect("create outer fluxon_rs dir");
+        fs::create_dir_all(outer_root.join("fluxon_test_stack")).expect("create outer fluxon_test_stack dir");
+        fs::write(outer_root.join("fluxon_rs").join("Cargo.toml"), "[workspace]\n").expect("write outer cargo toml");
+        fs::write(outer_root.join("build_config_ext.yml"), "etcd: 10.0.0.1:2379\n").expect("write outer build_config_ext");
+
+        fs::create_dir_all(nested_root.join("fluxon_rs")).expect("create nested fluxon_rs dir");
+        fs::create_dir_all(nested_root.join("fluxon_test_stack")).expect("create nested fluxon_test_stack dir");
+        fs::write(nested_root.join("fluxon_rs").join("Cargo.toml"), "[workspace]\n").expect("write nested cargo toml");
+        fs::write(nested_root.join("build_config_ext.yml"), "etcd: 127.0.0.1:2379\n").expect("write nested build_config_ext");
+
+        let nested_manifest_dir = nested_root.join("fluxon_rs").join("fluxon_util");
+        fs::create_dir_all(&nested_manifest_dir).expect("create nested fluxon_util dir");
+        let repo_root = repo_root_from_manifest_dir(&nested_manifest_dir);
+        assert_eq!(repo_root, nested_root);
+    }
 }

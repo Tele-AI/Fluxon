@@ -3660,10 +3660,6 @@ def _prepare_ci_case(
     if prepare_env_exports:
         _write_ci_prepare_env_script(run_dir=run_dir, exports=prepare_env_exports)
 
-    _write_ci_build_config_ext(
-        resolved_case,
-        out_dir=src_root,
-    )
     profile = _require_dict(resolved_case.get("profile"), "resolved_case.profile")
     profile_ci = _require_dict(profile.get("ci"), "resolved_case.profile.ci")
     if profile_ci.get("scene_config") is not None:
@@ -14397,24 +14393,6 @@ def _ci_prepare_run_inputs(
         ],
         cwd=str(src_root),
     )
-def _write_ci_build_config_ext(
-    resolved_case: Dict[str, Any], *, out_dir: Path
-) -> None:
-    etcd_ip = _ci_base_runtime_service_target_ip(resolved_case, service_id="etcd")
-    etcd_port = _ci_base_runtime_service_port(resolved_case, service_id="etcd")
-    greptime_ip = _ci_base_runtime_service_target_ip(resolved_case, service_id="greptime")
-    greptime_port = _ci_base_runtime_service_port(resolved_case, service_id="greptime")
-
-    cfg = {
-        "etcd": f"{etcd_ip}:{etcd_port}",
-        "prom": f"http://{greptime_ip}:{greptime_port}/v1/prometheus",
-        "prom_remote_write_url": f"http://{greptime_ip}:{greptime_port}/v1/prometheus/write",
-    }
-
-    out_path = out_dir / "build_config_ext.yml"
-    _write_yaml_file(out_path, cfg)
-
-
 def _write_ci_scene_config_yaml(
     resolved_case: Dict[str, Any], *, run_dir: Path
 ) -> Path:
@@ -14438,6 +14416,16 @@ def _write_ci_scene_config_yaml(
                 "case_id": _require_str(case.get("case_id"), "resolved_case.case.case_id"),
             },
             "scene_config": scene_config,
+            "scene_runtime": {
+                "etcd": {
+                    "ip": _ci_base_runtime_service_target_ip(resolved_case, service_id="etcd"),
+                    "port": _ci_base_runtime_service_port(resolved_case, service_id="etcd"),
+                },
+                "greptime": {
+                    "ip": _ci_base_runtime_service_target_ip(resolved_case, service_id="greptime"),
+                    "port": _ci_base_runtime_service_port(resolved_case, service_id="greptime"),
+                },
+            },
         },
     )
     return out_path

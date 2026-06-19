@@ -50,19 +50,35 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 },
                 "profile": {
                     "ci": {
+                        "runtime": {
+                            "base_runtime": {
+                                "etcd": {
+                                    "target": "local-node-a",
+                                    "endpoint": {"host_port": 2379, "scheme": "http"},
+                                },
+                                "greptime": {
+                                    "target": "local-node-a",
+                                    "endpoint": {"host_port": 4000, "scheme": "http"},
+                                },
+                            },
+                            "deploy": {"target_ip_map": {"local-node-a": "127.0.0.1"}},
+                        },
                         "scene_config": {
                             "doc_site_base_url": "tele-ai.github.io/Fluxon",
                         }
                     }
                 },
             }
-
-            path = _RUNNER._write_ci_scene_config_yaml(resolved_case, run_dir=run_dir)
+            with mock.patch.object(_RUNNER, "_ci_base_runtime_service_target_ip", side_effect=["127.0.0.1", "127.0.0.1"]):
+                with mock.patch.object(_RUNNER, "_ci_base_runtime_service_port", side_effect=[2379, 4000]):
+                    path = _RUNNER._write_ci_scene_config_yaml(resolved_case, run_dir=run_dir)
 
             self.assertEqual(path, (run_dir / "configs" / "ci_scene_config.yaml").resolve())
             payload = yaml.safe_load(path.read_text(encoding="utf-8"))
             self.assertEqual(payload["case"]["scene_id"], "ci_top_attention_doc_page_build")
             self.assertEqual(payload["scene_config"]["doc_site_base_url"], "tele-ai.github.io/Fluxon")
+            self.assertEqual(payload["scene_runtime"]["etcd"], {"ip": "127.0.0.1", "port": 2379})
+            self.assertEqual(payload["scene_runtime"]["greptime"], {"ip": "127.0.0.1", "port": 4000})
 
     def test_ci_source_overlay_includes_fluxon_test_stack(self) -> None:
         self.assertIn("fluxon_test_stack", _RUNNER._CI_SOURCE_OVERLAY_ROOTS)

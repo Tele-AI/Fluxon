@@ -14,7 +14,13 @@
 
 </div>
 
-Fluxon is a high-performance distributed communication and caching substrate for world models and other AI-native training and inference systems. It uses a single Rust-based integrated storage-and-transport foundation to provide unified key-value caching and remote procedure call (`KV/RPC`), message queue (`MQ`), and S3-compatible file and object caching (`FS`) interfaces, focusing on three classes of problems: cross-process and cross-node reuse of inference-side `KVCache` and `latent cache`, decoupled elastic message transport across heterogeneous resource pools, and remote access, `S3` forwarding, cache acceleration, and large-scale cross-cluster data migration for AI data and model files. As GPU performance keeps increasing, bottlenecks and wasted resources on CPU and IO paths become more visible. This increasingly calls for more efficient infrastructure to handle this high-performance work and reuse it across different business scenarios. Fluxon addresses this by first consolidating the complexity of low-level storage and transport in Rust, then exposing scenario-oriented `KV/RPC`, `MQ`, and `FS` interfaces on top.
+As GPU throughput keeps climbing, CPU and I/O paths increasingly become the hidden bottlenecks that drag down AI training and inference efficiency. Fluxon is built to aggressively consolidate the complexity of low-level storage and transport so more of the system budget can be spent on model work instead of data-plane plumbing.
+
+Built on a unified Rust-based storage-and-transport foundation, Fluxon exposes three standardized interfaces that target the core bottlenecks in AI systems:
+
+- **KV/RPC (Unified key-value and RPC)**: Breaks data silos and enables efficient cross-process, cross-node reuse of inference-side `KVCache` and `latent cache`
+- **MQ (Elastic message queue)**: Decouples system dependencies and supports elastic message transport across heterogeneous resource pools
+- **FS (`S3`-compatible file, object, and cache acceleration system)**: Unifies multi-form storage so one system can cache key-value, file, and object data, while supporting remote access, `S3` forwarding, and large-scale cross-cluster migration for AI data and model files
 
 <a id="contents"></a>
 
@@ -120,11 +126,20 @@ The benchmark results show that small-file reads and large-file writes are alrea
 
 ## 🧰 Runtime Requirements
 
-- Linux only
-- Python `>= 3.10`
-- When building from source, the Rust toolchain follows [fluxon_rs/rust-toolchain.toml](./fluxon_rs/rust-toolchain.toml), currently pinned to `1.93.0`
-- External middleware dependencies: the minimum service plane requires `etcd` and `greptime`; `FluxonFS` features such as directory transfer and pre-scan that persist task state also require `TiKV PD` and `TiKV`
-- Quick Start and runtime packaging workflows depend on Docker
+**For Quick Start (`Docker`):**
+
+- Docker installed
+- The Quick Start image bundles the middleware required by the demo flows
+
+**For production deployment or building from source:**
+
+- **OS**: Linux only
+- **Python**: `>= 3.10`
+- **Rust**: Toolchain pinned to `1.93.0`; see [fluxon_rs/rust-toolchain.toml](./fluxon_rs/rust-toolchain.toml)
+- **External middleware**:
+  - The minimum service plane requires `etcd` and `Greptime`
+  - `FluxonFS` features such as directory transfer and pre-scan that persist task state also require `TiKV PD` and `TiKV`
+- **Docker**: Required for Quick Start image workflows and runtime packaging workflows
 
 <a id="quick-start"></a>
 

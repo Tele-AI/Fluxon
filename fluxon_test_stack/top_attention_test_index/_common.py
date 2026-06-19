@@ -68,6 +68,23 @@ def load_case_config(path: str | Path, *, expected_scene_id: str) -> dict:
     return scene_config
 
 
+def load_case_config_payload(path: str | Path, *, expected_scene_id: str) -> dict:
+    cfg_path = Path(path).resolve()
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"case config must be a YAML mapping: {cfg_path}")
+    case = raw.get("case")
+    if not isinstance(case, dict):
+        raise ValueError(f"case config must define case mapping: {cfg_path}")
+    scene_id = str(case.get("scene_id") or "").strip()
+    if scene_id != expected_scene_id:
+        raise ValueError(f"case config scene_id mismatch: expected {expected_scene_id!r}, got {scene_id!r}")
+    scene_config = raw.get("scene_config")
+    if not isinstance(scene_config, dict):
+        raise ValueError(f"case config must define scene_config mapping: {cfg_path}")
+    return raw
+
+
 def _path_contains_fluxon_pyo3_libs_dir(path: Path) -> bool:
     return "fluxon_pyo3.libs" in path.parts
 
