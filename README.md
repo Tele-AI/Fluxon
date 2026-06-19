@@ -312,4 +312,4 @@ Fluxon is open-sourced under Apache License 2.0, see [LICENSE](./LICENSE).
 
 ## ⭐ Stargazers over time
 
-[![Stargazers over time](https://starchart.cc/Tele-AI/fluxon.svg)](https://starchart.cc/Tele-AI/fluxon)
+[![Star History Chart](https://api.star-history.com/chart?repos=Tele-AI/fluxon&type=date&legend=top-left)](https://www.star-history.com/?repos=Tele-AI%2Ffluxon&type=date&legend=top-left)
