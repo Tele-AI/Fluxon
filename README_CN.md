@@ -314,4 +314,4 @@ Fluxon 基于 Apache License 2.0 开源，见 [LICENSE](./LICENSE)。
 
 ## ⭐ Star 增长趋势
 
-[![Stargazers over time](https://starchart.cc/Tele-AI/fluxon.svg)](https://starchart.cc/Tele-AI/fluxon)
+[![Star History Chart](https://api.star-history.com/chart?repos=Tele-AI/fluxon&type=date&legend=top-left)](https://www.star-history.com/?repos=Tele-AI%2Ffluxon&type=date&legend=top-left)
