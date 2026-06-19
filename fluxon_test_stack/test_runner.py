@@ -44,6 +44,7 @@ from benchmark_role_names import (
 )
 from gitops import gitops_lib
 from top_attention_index_helper import (
+    TOP_ATTENTION_SCENE_ID_PREFIX,
     collect_top_attention_payload,
     iter_quick_entry_paths,
     print_top_attention_payload,
@@ -344,6 +345,10 @@ SCENE_ENUMS_ALLOWED = {
     "ci_doc_page",
     "ci_fs_s3",
 }
+
+
+def _scene_id_is_allowed(scene_id: str) -> bool:
+    return scene_id in SCENE_ENUMS_ALLOWED or scene_id.startswith(TOP_ATTENTION_SCENE_ID_PREFIX)
 
 TEST_STACK_RPC_BACKEND_FLUXON = "FLUXON"
 TEST_STACK_RPC_BACKEND_ZERORPC = "ZERORPC"
@@ -5392,7 +5397,7 @@ def _parse_suite_config(cfg: Any) -> _Suite:
 
     scenes_raw = _require_dict(d.get("scenes"), "config.scenes")
     scenes = _index_by_enum(scenes_raw, "scenes", _parse_scene)
-    bad_scenes = [k for k in scenes.keys() if k not in SCENE_ENUMS_ALLOWED]
+    bad_scenes = [k for k in scenes.keys() if not _scene_id_is_allowed(k)]
     if bad_scenes:
         raise ValueError(f"config.scenes contains unsupported scene enums in v{SUITE_SCHEMA_VERSION}: {sorted(bad_scenes)}")
 

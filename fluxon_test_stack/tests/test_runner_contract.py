@@ -60,8 +60,8 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
             test_ci_cluster_kv_owner_allows_single_node_topology,
         ),
         (
-            "ci_doc_page_declares_setup_dev_env_prepare",
-            test_ci_doc_page_declares_setup_dev_env_prepare,
+            "ci_top_attention_doc_page_build_declares_setup_dev_env_prepare",
+            test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare,
         ),
     ]
     if selected_test_id is None:
@@ -318,18 +318,18 @@ def test_ci_cluster_kv_owner_allows_single_node_topology() -> None:
     print("PASS: test_ci_cluster_kv_owner_allows_single_node_topology")
 
 
-def test_ci_doc_page_declares_setup_dev_env_prepare() -> None:
+def test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
     suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
     if not isinstance(suite_cfg, dict):
-        print("FAIL: test_ci_doc_page_declares_setup_dev_env_prepare - suite config is not a mapping")
+        print("FAIL: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare - suite config is not a mapping")
         return
 
     suite_for_contract = copy.deepcopy(suite_cfg)
     artifact_sets = suite_for_contract.get("artifact_sets")
     if not isinstance(artifact_sets, dict):
-        print("FAIL: test_ci_doc_page_declares_setup_dev_env_prepare - artifact_sets is not a mapping")
+        print("FAIL: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare - artifact_sets is not a mapping")
         return
     for artifact_set in artifact_sets.values():
         if not isinstance(artifact_set, dict):
@@ -341,13 +341,13 @@ def test_ci_doc_page_declares_setup_dev_env_prepare() -> None:
                 artifact_set["release_artifacts"] = {"wheel": python_wheel}
 
     suite = _TEST_RUNNER._parse_suite_config(suite_for_contract)
-    scene = suite.scenes.get("ci_doc_page")
+    scene = suite.scenes.get("ci_top_attention_doc_page_build")
     if not isinstance(scene, dict):
-        print("FAIL: test_ci_doc_page_declares_setup_dev_env_prepare - missing ci_doc_page scene")
+        print("FAIL: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare - missing scene")
         return
     ci = scene.get("ci")
     if not isinstance(ci, dict):
-        print("FAIL: test_ci_doc_page_declares_setup_dev_env_prepare - ci_doc_page.ci missing")
+        print("FAIL: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare - scene.ci missing")
         return
     prepare = ci.get("prepare")
     expected = [
@@ -359,11 +359,11 @@ def test_ci_doc_page_declares_setup_dev_env_prepare() -> None:
     ]
     if prepare != expected:
         print(
-            "FAIL: test_ci_doc_page_declares_setup_dev_env_prepare - "
+            "FAIL: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare - "
             f"expected {expected!r}, got {prepare!r}"
         )
         return
-    print("PASS: test_ci_doc_page_declares_setup_dev_env_prepare")
+    print("PASS: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare")
 
 
 if __name__ == "__main__":

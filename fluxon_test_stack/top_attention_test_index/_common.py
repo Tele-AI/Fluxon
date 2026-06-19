@@ -47,5 +47,5 @@ def run_python_files(description: str, paths: Iterable[str]) -> int:
     return 0
 
 
-def run_cargo(args: Iterable[str]) -> int:
-    return call(["cargo", *args])
+def run_cargo(args: Iterable[str], *, env: dict[str, str] | None = None) -> int:
+    return call(["cargo", *args], env=env)

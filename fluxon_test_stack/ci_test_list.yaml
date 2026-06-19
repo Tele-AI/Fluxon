@@ -114,6 +114,34 @@ scenes:
       scales: [n1_kvowner_dram_3gib]
       profiles: [fluxon_tcp]
 
+  ci_top_attention_doc_page_build:
+    ci:
+      subject: doc_page
+      runtime_contract: rust_self_managed
+      prepare:
+        - kind: setup_dev_env
+          config: setup_and_pack/setup_dev_env/doc_page_ci.yaml
+          cache_relpath: .cached/fluxon_doc_site/toolchain
+      commands:
+        - id: top_attention_doc_page_build
+          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_doc_page_build.py --base-url __DOC_SITE_BASE_URL__
+          timeout_seconds: 10800
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_bin_kvtest:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+      commands:
+        - id: top_attention_bin_kvtest
+          command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_bin_kvtest.py --feature __KV_TRANSPORT_FEATURE__ --rounds __KV_TEST_ROUNDS__
+          timeout_seconds: 21600
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
   kv_read_heavy_zipf:
     test_stack:
       mode: KVSTORE
@@ -397,6 +425,7 @@ profiles:
           bootstrap_ready_timeout_seconds: 300
         command_tokens:
           KV_TRANSPORT_FEATURE: fastws_transport
+          DOC_SITE_BASE_URL: example.com
         runtime_contracts:
           cluster_kv_owner: &cluster_kv_owner_runtime
             base_runtime:
@@ -539,6 +568,7 @@ profiles:
         <<: *common_ci_runtime
         command_tokens:
           KV_TRANSPORT_FEATURE: tquic_transport
+          DOC_SITE_BASE_URL: example.com
       test_stack:
         <<: *common_test_stack_runtime
   fluxon_sockudo_ws:
@@ -548,6 +578,7 @@ profiles:
         <<: *common_ci_runtime
         command_tokens:
           KV_TRANSPORT_FEATURE: sockudo_ws_transport
+          DOC_SITE_BASE_URL: example.com
       test_stack:
         <<: *common_test_stack_runtime
   fluxon_tcp:
@@ -557,6 +588,7 @@ profiles:
         <<: *common_ci_runtime
         command_tokens:
           KV_TRANSPORT_FEATURE: tcp_transport
+          DOC_SITE_BASE_URL: example.com
       test_stack:
         <<: *common_test_stack_runtime
   redis_sharded:

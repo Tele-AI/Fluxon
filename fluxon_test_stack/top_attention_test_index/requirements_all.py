@@ -6,6 +6,7 @@ from pathlib import Path
 
 TEST_REQUIREMENTS: list[str] = ["ops"]
 TEST_DIR = Path(__file__).resolve().parent
+IGNORED_INDEX_ENTRY_NAMES = frozenset({"_common.py"})
 
 
 ALL_TEST_REQUIREMENTS: tuple[str, ...] = (
@@ -46,7 +47,11 @@ def iter_test_python_paths() -> tuple[Path, ...]:
 
 
 def iter_index_entry_paths() -> tuple[Path, ...]:
-    return tuple(path for path in iter_test_python_paths() if path.name.startswith("_"))
+    return tuple(
+        path
+        for path in iter_test_python_paths()
+        if path.name.startswith("_") and path.name not in IGNORED_INDEX_ENTRY_NAMES
+    )
 
 
 def extract_test_requirements(path: Path) -> list[str]:

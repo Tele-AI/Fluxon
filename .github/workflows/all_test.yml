@@ -14,6 +14,7 @@ on:
       - "setup.py"
       - "fluxon_py/**"
       - "fluxon_rs/**"
+      - "fluxon_test_stack/**"
       - "setup_and_pack/**"
       - "deployment/**"
       - "examples/**"
@@ -70,15 +71,61 @@ jobs:
       - name: Sync rather_no_git_submodule workspace inputs
         run: python3 fluxon_rs/scripts/rather_no_git_submodule.py
 
+      - name: Write ci_2_virt_node suite
+        run: |
+          python3 - <<'PY'
+          import copy
+          from pathlib import Path
+          import yaml
+
+          repo_root = Path.cwd()
+          src_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
+          out_path = Path("${{ runner.temp }}") / "ci_test_list.ci.yaml"
+          suite = yaml.safe_load(src_path.read_text(encoding="utf-8"))
+
+          # Scene selection:
+          # - ci_top_attention_doc_page_build keeps the doc-site build as a CI scene workload.
+          # - ci_top_attention_bin_kvtest keeps the Rust kv_test entry under the same CI scene contract.
+          suite["scenes"] = {
+              key: value
+              for key, value in suite["scenes"].items()
+              if key in ("ci_top_attention_doc_page_build", "ci_top_attention_bin_kvtest")
+          }
+
+          # Profile selection:
+          # - Keep one Fluxon transport profile in this workflow to constrain matrix size.
+          # - ci_2_virt_node will still rewrite the selected public profile into the local same-host CI profile.
+          suite["profiles"] = {
+              "fluxon_tcp": copy.deepcopy(suite["profiles"]["fluxon_tcp"])
+          }
+          suite["run"]["selectors"]["profile_ids"] = ["fluxon_tcp"]
+
+          # Scene-local workload config:
+          # - Restrict kv_test to one round in CI for runtime control.
+          # - Keep the doc-site base URL in the same profile.command_tokens path instead of using workflow env.
+          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["command_tokens"]["KV_TEST_ROUNDS"] = "p2p_only"
+          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["command_tokens"]["DOC_SITE_BASE_URL"] = (
+              "${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          )
+
+          # Scale selection:
+          # - Keep the original per-scene scales from ci_test_list.yaml.
+          # - ci_top_attention_doc_page_build stays on n1_kvowner_dram_3gib.
+          # - ci_top_attention_bin_kvtest stays on n1_kvowner_dram_20gib.
+
+          out_path.write_text(
+              yaml.safe_dump(suite, sort_keys=False, allow_unicode=False),
+              encoding="utf-8",
+          )
+          print(out_path)
+          PY
+
       - name: Run ci_2_virt_node full flow
-        env:
-          FLUXON_DOC_SITE_BASE_URL: ${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
         run: |
           python3 fluxon_test_stack/ci_2_virt_node.py \
+            --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
             --print-generated \
-            --hostworkdir "$RUNNER_TEMP/fluxon_deploy" \
-            --scene-id ci_doc_page \
-            --skip-doc-build
+            --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy"
 
       - name: Normalize ci_2_virt_node debug artifact permissions
         if: ${{ always() }}

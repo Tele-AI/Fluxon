@@ -17,7 +17,9 @@ from fluxon_test_stack.top_attention_index_helper import (
     iter_quick_entry_paths,
     match_top_attention_prefix,
     select_top_attention_entries,
+    top_attention_scene_id,
 )
+from fluxon_test_stack.top_attention_test_index.requirements_all import iter_index_entry_paths
 
 
 class TestTopAttentionIndexHelper(unittest.TestCase):
@@ -49,6 +51,16 @@ class TestTopAttentionIndexHelper(unittest.TestCase):
     def test_quick_entries_exist_and_match_declared_order(self) -> None:
         names = [path.name for path in iter_quick_entry_paths()]
         self.assertEqual(names, list(QUICK_ENTRY_NAMES))
+
+    def test_index_entries_exclude_common_helper(self) -> None:
+        names = {path.name for path in iter_index_entry_paths()}
+        self.assertNotIn("_common.py", names)
+
+    def test_top_attention_scene_id_uses_stable_prefix(self) -> None:
+        self.assertEqual(
+            top_attention_scene_id(Path("_bin_kvtest.py")),
+            "ci_top_attention_bin_kvtest",
+        )
 
 
 if __name__ == "__main__":

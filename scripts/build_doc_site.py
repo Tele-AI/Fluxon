@@ -201,6 +201,10 @@ LANGUAGE_ROUTE_PAIRS = (
         "en": "/dev_doc/Developer---2---Package-Middleware-and-Images",
         "cn": "/cn/dev_doc/开发者---2---打包中间件和镜像",
     },
+    {
+        "en": "/dev_doc/Developer---4---Publish-a-Release",
+        "cn": "/cn/dev_doc/开发者---4---发布-Release",
+    },
     {"en": "/design", "cn": "/cn/design"},
 )
 

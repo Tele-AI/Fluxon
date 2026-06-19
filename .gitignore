@@ -39,8 +39,11 @@ fluxon_doc_rt
 .pack*
 fluxon_release/*
 !fluxon_release/install.py
+!fluxon_release/resolve_release_meta.py
 !fluxon_release/closed_sdk/
 !fluxon_release/closed_sdk/**
+!fluxon_release/release_notes/
+!fluxon_release/release_notes/**
 !fluxon_release/test_rsc/
 fluxon_release/test_rsc/*
 !fluxon_release/test_rsc/source/

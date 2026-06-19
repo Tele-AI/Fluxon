@@ -21,6 +21,7 @@ except ModuleNotFoundError:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOP_ATTENTION_INDEX_DIR = REPO_ROOT / "fluxon_test_stack" / "top_attention_test_index"
+TOP_ATTENTION_SCENE_ID_PREFIX = "ci_top_attention_"
 QUICK_ENTRY_NAMES: tuple[str, ...] = (
     "_doc_page_build.py",
     "_config_kv.py",
@@ -39,6 +40,10 @@ def display_top_attention_relpath(path: Path) -> str:
         return str(path.resolve().relative_to(REPO_ROOT))
     except ValueError:
         return str(path.resolve())
+
+
+def top_attention_scene_id(path: Path) -> str:
+    return TOP_ATTENTION_SCENE_ID_PREFIX + path.stem.lstrip("_")
 
 
 def match_top_attention_prefix(path: Path, raw_prefix: str) -> bool:
@@ -141,6 +146,7 @@ def print_top_attention_payload(payload: dict[str, Any], *, requirements_only: b
 
 __all__ = [
     "QUICK_ENTRY_NAMES",
+    "TOP_ATTENTION_SCENE_ID_PREFIX",
     "collect_top_attention_payload",
     "collect_top_attention_requirements",
     "display_top_attention_relpath",
@@ -149,4 +155,5 @@ __all__ = [
     "print_top_attention_payload",
     "run_top_attention_entries",
     "select_top_attention_entries",
+    "top_attention_scene_id",
 ]

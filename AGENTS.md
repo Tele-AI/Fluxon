@@ -7,6 +7,12 @@ Keep this document concise.
 - YAML files in this project are examples by default. Do not edit them directly; create a YAML file for your specific development environment
 - Start long-running commands in `tmux`. Do not run long-lived services directly in the foreground.
 - Git operations are limited to basic `stage`, `unstage`, `commit`, and `push`. Do not use other Git operations.
+- Prefer contraction over compatibility by default. Do not add compatibility layers, deprecated paths, or aliases unless the task explicitly requires them.
+- Prefer one canonical name for one concept. Avoid synonym parameters, duplicated entrypoints, and parallel config surfaces.
+- Control branching deliberately. Prefer a small, explicit, enumerated set of supported branches in the style of a Rust enum over open-ended proliferation of near-duplicate cases.
+- When extending a surface, prefer folding the new case into an existing finite branch set. If a new branch is unavoidable, make it explicit, bounded, and easy to list exhaustively.
+- Names for testbed-scoped concepts should say `testbed` explicitly. Avoid generic names for testbed-only modes, ports, roots, workdirs, and other testbed-scoped settings.
+- Keep `AGENTS.md` and `AGENTS_CN.md` aligned. Update both promptly when changing repo-level agent rules unless the task explicitly says otherwise.
 
 ## Doc Site
 - Use Quartz for the doc site. Treat Quartz as cached build tooling under `.cached`; do not vendor it as a git submodule.

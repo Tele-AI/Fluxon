@@ -1,19 +1,45 @@
-name: manual_release
+name: publish_release
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing git tag to rebuild, for example v0.2.1"
+        required: true
+        type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   pack-release:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve release ref
+        id: workflow_ref
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            release_tag="${{ inputs.release_tag }}"
+            if [[ -z "$release_tag" ]]; then
+              echo "workflow_dispatch requires release_tag" >&2
+              exit 1
+            fi
+            echo "checkout_ref=$release_tag" >> "$GITHUB_OUTPUT"
+            echo "release_ref=refs/tags/$release_tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "checkout_ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+            echo "release_ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check out repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ steps.workflow_ref.outputs.checkout_ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,6 +68,24 @@ jobs:
       - name: Install Python dependencies
         run: python3 -m pip install PyYAML
 
+      - name: Resolve release metadata
+        id: release_meta
+        run: |
+          python3 fluxon_release/resolve_release_meta.py \
+            --git-ref "${{ steps.workflow_ref.outputs.release_ref }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify release notes file
+        env:
+          RELEASE_NOTES_FILE: ${{ steps.release_meta.outputs.release_notes_file }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+        shell: bash
+        run: |
+          if [[ ! -f "$RELEASE_NOTES_FILE" ]]; then
+            echo "Missing release notes for $RELEASE_TAG: $RELEASE_NOTES_FILE" >&2
+            exit 1
+          fi
+
       - name: Prepare CI directories
         run: |
           mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data"
@@ -65,7 +109,8 @@ jobs:
         run: python3 examples/fluxon_quick_start/build_image.py --mode existing_release --release-dir fluxon_release
 
       - name: Archive quickstart image
-        run: docker save fluxon_quick_start:0.2.1 | gzip -1 > fluxon_quick_start_0.2.1_docker_image.tar.gz
+        run: |
+          docker save "${{ steps.release_meta.outputs.quickstart_image }}" | gzip -1 > "${{ steps.release_meta.outputs.quickstart_archive }}"
 
       - name: Archive release directory
         run: tar czf fluxon_release.tar.gz fluxon_release
@@ -73,7 +118,48 @@ jobs:
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: manual-release-artifacts-${{ github.sha }}
+          name: release-artifacts-${{ steps.release_meta.outputs.release_tag }}
           path: |
             fluxon_release.tar.gz
-            fluxon_quick_start_0.2.1_docker_image.tar.gz
+            ${{ steps.release_meta.outputs.quickstart_archive }}
+
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+          RELEASE_TITLE: ${{ steps.release_meta.outputs.release_title }}
+          RELEASE_NOTES_FILE: ${{ steps.release_meta.outputs.release_notes_file }}
+          QUICKSTART_ARCHIVE: ${{ steps.release_meta.outputs.quickstart_archive }}
+          PRERELEASE: ${{ steps.release_meta.outputs.prerelease }}
+        shell: bash
+        run: |
+          release_files=(
+            "fluxon_release.tar.gz"
+            "$QUICKSTART_ARCHIVE"
+          )
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            edit_args=(
+              release edit "$RELEASE_TAG"
+              --title "$RELEASE_TITLE"
+              --notes-file "$RELEASE_NOTES_FILE"
+            )
+            if [[ "$PRERELEASE" == "true" ]]; then
+              edit_args+=(--prerelease)
+            fi
+            gh "${edit_args[@]}"
+            gh release upload "$RELEASE_TAG" "${release_files[@]}" --clobber
+            exit 0
+          fi
+
+          args=(
+            release create "$RELEASE_TAG"
+            "${release_files[@]}"
+            --title "$RELEASE_TITLE"
+            --notes-file "$RELEASE_NOTES_FILE"
+            --verify-tag
+          )
+          if [[ "$PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          gh "${args[@]}"
