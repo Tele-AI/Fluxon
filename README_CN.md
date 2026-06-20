@@ -20,7 +20,7 @@
 [![Latest](https://img.shields.io/badge/Latest-v0.2.1-f28500)](./fluxon_release)
 [![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#接口能力)
 
-[中文](./README_CN.md) | [English](./README.md) | [用户文档](https://tele-ai.github.io/fluxon/cn/) | [English Docs](https://tele-ai.github.io/fluxon/) | <a href="https://github.com/Tele-AI/fluxon" title="GitHub 仓库"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
+[中文](./README_CN.md) | [English](./README.md) | [用户文档](https://tele-ai.github.io/Fluxon/cn/) | [English Docs](https://tele-ai.github.io/Fluxon/) | <a href="https://github.com/Tele-AI/Fluxon" title="GitHub 仓库"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
 
 </div>
 
@@ -147,7 +147,7 @@ benchmark 显示，小文件读和大文件写已显著领先 `Alluxio`，大文
 
 ## 🚀 快速开始
 
-Quick Start 用于最短路径体验；正式安装、部署和运维入口见 [用户文档](https://tele-ai.github.io/fluxon/cn/user_doc/)。
+Quick Start 用于最短路径体验；正式安装、部署和运维入口见 [用户文档](https://tele-ai.github.io/Fluxon/cn/user_doc/)。
 
 ### KV 快速开始
 
@@ -180,7 +180,7 @@ del demo:hello
 
 对应接口文档：
 
-- [KV 和 RPC 接口](https://tele-ai.github.io/fluxon/cn/user_doc/%E7%94%A8%E6%88%B7---3---KV-RPC%E6%8E%A5%E5%8F%A3/)
+- [KV 和 RPC 接口](https://tele-ai.github.io/Fluxon/cn/user_doc/%E7%94%A8%E6%88%B7---3---KV-RPC%E6%8E%A5%E5%8F%A3/)
 
 ### MQ 快速开始
 
@@ -211,7 +211,7 @@ exit
 
 对应接口文档：
 
-- [MQ 接口](https://tele-ai.github.io/fluxon/cn/user_doc/%E7%94%A8%E6%88%B7---4---MQ%E6%8E%A5%E5%8F%A3/)
+- [MQ 接口](https://tele-ai.github.io/Fluxon/cn/user_doc/%E7%94%A8%E6%88%B7---4---MQ%E6%8E%A5%E5%8F%A3/)
 
 ### FS 快速开始
 
@@ -249,7 +249,7 @@ FS Quick Start 会额外打印：
 
 对应接口文档：
 
-- [FS 接口](https://tele-ai.github.io/fluxon/cn/user_doc/%E7%94%A8%E6%88%B7---5---FS%E6%8E%A5%E5%8F%A3/)
+- [FS 接口](https://tele-ai.github.io/Fluxon/cn/user_doc/%E7%94%A8%E6%88%B7---5---FS%E6%8E%A5%E5%8F%A3/)
 
 <a id="项目结构"></a>
 
@@ -269,17 +269,18 @@ FS Quick Start 会额外打印：
 
 欢迎参与贡献。开始之前，建议先阅读 GitHub Pages 上的开发者文档：
 
-- [开发者文档总入口](https://tele-ai.github.io/fluxon/cn/dev_doc/)
-- [开发者 - 1 - 打包核心安装包](https://tele-ai.github.io/fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---1---%E6%89%93%E5%8C%85%E6%A0%B8%E5%BF%83%E5%AE%89%E8%A3%85%E5%8C%85/)
-- [开发者 - 2 - 打包中间件和镜像](https://tele-ai.github.io/fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---2---%E6%89%93%E5%8C%85%E4%B8%AD%E9%97%B4%E4%BB%B6%E5%92%8C%E9%95%9C%E5%83%8F/)
-- [开发者 - 4 - 发布 Release](https://tele-ai.github.io/fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---4---%E5%8F%91%E5%B8%83-Release/)
+- [开发者文档总入口](https://tele-ai.github.io/Fluxon/cn/dev_doc/)
+- [开发者 - 1 - 打包核心安装包](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---1---%E6%89%93%E5%8C%85%E6%A0%B8%E5%BF%83%E5%AE%89%E8%A3%85%E5%8C%85/)
+- [开发者 - 2 - 打包中间件和镜像](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---2---%E6%89%93%E5%8C%85%E4%B8%AD%E9%97%B4%E4%BB%B6%E5%92%8C%E9%95%9C%E5%83%8F/)
+- [开发者 - 3 - 文档写作规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---3---%E6%96%87%E6%A1%A3%E5%86%99%E4%BD%9C%E8%A7%84%E7%BA%A6/)
+- [开发者 - 4 - 发布 Release](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---4---%E5%8F%91%E5%B8%83-Release/)
 
 <a id="contributors"></a>
 
 ## 👥 Contributors
 
-<a href="https://github.com/Tele-AI/fluxon/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=Tele-AI/fluxon" />
+<a href="https://github.com/Tele-AI/Fluxon/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Tele-AI/Fluxon" />
 </a>
 
 部分更早期的贡献记录已经无法从当前 commit 历史里完整反映，这里补充说明：
@@ -314,4 +315,4 @@ Fluxon 基于 Apache License 2.0 开源，见 [LICENSE](./LICENSE)。
 
 ## ⭐ Star 增长趋势
 
-[![Star History Chart](https://api.star-history.com/chart?repos=Tele-AI/fluxon&type=date&legend=top-left)](https://www.star-history.com/?repos=Tele-AI%2Ffluxon&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/chart?repos=Tele-AI/Fluxon&type=date&legend=top-left)](https://www.star-history.com/?repos=Tele-AI%2FFluxon&type=date&legend=top-left)

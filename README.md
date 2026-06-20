@@ -10,7 +10,7 @@
 [![Latest](https://img.shields.io/badge/Latest-v0.2.1-f28500)](./fluxon_release)
 [![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#interface-capabilities)
 
-[English](./README.md) | [中文](./README_CN.md) | [Docs](https://tele-ai.github.io/fluxon/) | [中文文档](https://tele-ai.github.io/fluxon/cn/) | <a href="https://github.com/Tele-AI/fluxon" title="GitHub Repository"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
+[English](./README.md) | [中文](./README_CN.md) | [Docs](https://tele-ai.github.io/Fluxon/) | [中文文档](https://tele-ai.github.io/Fluxon/cn/) | <a href="https://github.com/Tele-AI/Fluxon" title="GitHub Repository"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
 
 </div>
 
@@ -145,7 +145,7 @@ The benchmark results show that small-file reads and large-file writes are alrea
 
 ## 🚀 Quick Start
 
-Quick Start is the shortest path to try Fluxon. For formal installation, deployment, and operations, see [User Docs](https://tele-ai.github.io/fluxon/user_doc/).
+Quick Start is the shortest path to try Fluxon. For formal installation, deployment, and operations, see [User Docs](https://tele-ai.github.io/Fluxon/user_doc/).
 
 ### KV Quick Start
 
@@ -178,7 +178,7 @@ Open the printed link to view the KV Web UI:
 
 Related interface docs:
 
-- [KV and RPC Interface](https://tele-ai.github.io/fluxon/user_doc/User---3---KV-and-RPC-Interface/)
+- [KV and RPC Interface](https://tele-ai.github.io/Fluxon/user_doc/User---3---KV-and-RPC-Interface/)
 
 ### MQ Quick Start
 
@@ -209,7 +209,7 @@ Runtime view:
 
 Related interface docs:
 
-- [MQ Interface](https://tele-ai.github.io/fluxon/user_doc/User---4---MQ-Interface/)
+- [MQ Interface](https://tele-ai.github.io/Fluxon/user_doc/User---4---MQ-Interface/)
 
 ### FS Quick Start
 
@@ -247,7 +247,7 @@ Open the printed link to view the FS Web UI:
 
 Related interface docs:
 
-- [FS Interface](https://tele-ai.github.io/fluxon/user_doc/User---5---FS-Interface/)
+- [FS Interface](https://tele-ai.github.io/Fluxon/user_doc/User---5---FS-Interface/)
 
 <a id="repository-structure"></a>
 
@@ -267,17 +267,18 @@ Related interface docs:
 
 Contributions are welcome. Before you start, please read the developer docs on GitHub Pages:
 
-- [Developer Docs](https://tele-ai.github.io/fluxon/dev_doc/)
-- [Developer - 1 - Package core install artifacts](https://tele-ai.github.io/fluxon/dev_doc/Developer---1---Package-Core-Install-Artifacts/)
-- [Developer - 2 - Package middleware and images](https://tele-ai.github.io/fluxon/dev_doc/Developer---2---Package-Middleware-and-Images/)
-- [Developer - 4 - Publish a release](https://tele-ai.github.io/fluxon/dev_doc/Developer---4---Publish-a-Release/)
+- [Developer Docs](https://tele-ai.github.io/Fluxon/dev_doc/)
+- [Developer - 1 - Package core install artifacts](https://tele-ai.github.io/Fluxon/dev_doc/Developer---1---Package-Core-Install-Artifacts/)
+- [Developer - 2 - Package middleware and images](https://tele-ai.github.io/Fluxon/dev_doc/Developer---2---Package-Middleware-and-Images/)
+- [Developer - 3 - Documentation Writing Rules](https://tele-ai.github.io/Fluxon/dev_doc/Developer---3---Documentation-Writing-Rules/)
+- [Developer - 4 - Publish a release](https://tele-ai.github.io/Fluxon/dev_doc/Developer---4---Publish-a-Release/)
 
 <a id="contributors"></a>
 
 ## 👥 Contributors
 
-<a href="https://github.com/Tele-AI/fluxon/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=Tele-AI/fluxon" />
+<a href="https://github.com/Tele-AI/Fluxon/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Tele-AI/Fluxon" />
 </a>
 
 Some earlier contribution records are no longer fully reflected in the current commit history. Historical highlights:
@@ -312,4 +313,4 @@ Fluxon is open-sourced under Apache License 2.0, see [LICENSE](./LICENSE).
 
 ## ⭐ Stargazers over time
 
-[![Star History Chart](https://api.star-history.com/chart?repos=Tele-AI/fluxon&type=date&legend=top-left)](https://www.star-history.com/?repos=Tele-AI%2Ffluxon&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/chart?repos=Tele-AI/Fluxon&type=date&legend=top-left)](https://www.star-history.com/?repos=Tele-AI%2FFluxon&type=date&legend=top-left)
