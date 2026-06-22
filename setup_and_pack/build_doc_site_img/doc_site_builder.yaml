@@ -1,0 +1,29 @@
+user: root
+sudo: false
+base_image: quay.io/pypa/manylinux_2_28_x86_64
+image_name: fluxon-doc-site-builder
+image_tag: quartz-v5.0.0-node-v24.16.0
+inherit_proxy: true
+inherit_timezone: true
+heavy_setup:
+  script_installs:
+    - name: setup_python_symlinks
+      commands:
+        - ln -sf /opt/python/cp310-cp310/bin/python /usr/local/bin/python3
+        - ln -sf /opt/python/cp310-cp310/bin/pip /usr/local/bin/pip3
+    - name: prewarm_quartz_doc_site
+      copies:
+        - kind: path
+          src: ../../scripts/build_doc_site.py
+          dst: /opt/fluxon_doc_site/scripts/build_doc_site.py
+      commands:
+        - mkdir -p /opt/fluxon_doc_site_cache /opt/fluxon_node /tmp/fluxon_doc_site_node
+        - curl -fL https://nodejs.org/dist/v24.16.0/node-v24.16.0-linux-x64.tar.xz -o /tmp/fluxon_doc_site_node/node.tar.xz
+        - echo "d804845d34eddc21dc1092b519d643ef40b1f58ec5dec5c22b1f4bd8fabde6c9  /tmp/fluxon_doc_site_node/node.tar.xz" | sha256sum -c -
+        - tar -xJf /tmp/fluxon_doc_site_node/node.tar.xz -C /opt/fluxon_node --strip-components=1
+        - ln -sf /opt/fluxon_node/bin/node /usr/local/bin/node
+        - ln -sf /opt/fluxon_node/bin/npm /usr/local/bin/npm
+        - FLUXON_DOC_SITE_CACHE_ROOT=/opt/fluxon_doc_site_cache /usr/local/bin/python3 /opt/fluxon_doc_site/scripts/build_doc_site.py bootstrap
+        - find /opt/fluxon_doc_site_cache/toolchain/quartz/.quartz/plugins -mindepth 2 -maxdepth 2 -name node_modules -prune -exec rm -rf {} +
+        - chmod -R a+rX /opt/fluxon_doc_site_cache /opt/fluxon_node
+        - rm -rf /tmp/fluxon_doc_site_node

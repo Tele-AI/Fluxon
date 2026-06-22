@@ -33,6 +33,19 @@ def main() -> int:
         raise ValueError("scene_config.doc_site_base_url must be set")
     env = os.environ.copy()
     env["FLUXON_DOC_SITE_BASE_URL"] = base_url
+    image_ref = env.get("FLUXON_DOC_SITE_DOCKER_IMAGE_REF", "").strip()
+    if image_ref:
+        command = [
+            args.python,
+            str(REPO_ROOT / "setup_and_pack" / "nix" / "build_doc_site_in_container.py"),
+            "--repo-root",
+            str(REPO_ROOT),
+            "--base-url",
+            base_url,
+            "--image-ref",
+            image_ref,
+        ]
+        return call(command, env=env)
     return call(
         [
             args.python,

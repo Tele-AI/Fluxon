@@ -369,6 +369,26 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 ],
             )
 
+    def test_test_rsc_manifest_file_list_ignores_unstaged_extra_archive_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "out"
+            prepared_root = Path(tmpdir) / "prepared"
+            out_dir.mkdir()
+            prepared_root.mkdir()
+            (out_dir / "src_ci.tar.gz").write_text("src\n", encoding="utf-8")
+            (out_dir / "fluxon_ci_ext_rsc.tar.gz").write_text("ext\n", encoding="utf-8")
+            (out_dir / "extra_image.tar").write_text("image\n", encoding="utf-8")
+
+            files = _PACK._test_rsc_manifest_file_list(
+                out_dir=out_dir,
+                prepared_root=prepared_root,
+            )
+
+            self.assertEqual(
+                [path.name for path in files],
+                ["src_ci.tar.gz", "fluxon_ci_ext_rsc.tar.gz"],
+            )
+
     def test_collect_ci_source_relpaths_requires_rather_no_git_submodule_root_to_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

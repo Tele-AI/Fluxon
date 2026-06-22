@@ -151,6 +151,48 @@ class TestBuildDocSiteContract(unittest.TestCase):
             _DOC_SITE.OUTPUT_ROOT = old_output_root
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    def test_quartz_runtime_ready_accepts_prewarmed_runtime_without_git(self) -> None:
+        tmpdir = Path(tempfile.mkdtemp(prefix="fluxon_doc_site_runtime_"))
+        old_toolchain_root = _DOC_SITE.TOOLCHAIN_ROOT
+        old_runtime_stamp_path = _DOC_SITE.RUNTIME_STAMP_PATH
+        try:
+            _DOC_SITE.TOOLCHAIN_ROOT = tmpdir / "toolchain" / "quartz"
+            _DOC_SITE.RUNTIME_STAMP_PATH = _DOC_SITE.TOOLCHAIN_ROOT / ".fluxon-runtime-stamp"
+            (_DOC_SITE.TOOLCHAIN_ROOT / "quartz").mkdir(parents=True)
+            (_DOC_SITE.TOOLCHAIN_ROOT / "package.json").write_text("{}", encoding="utf-8")
+            (_DOC_SITE.TOOLCHAIN_ROOT / "quartz" / "bootstrap-cli.mjs").write_text(
+                "x\n",
+                encoding="utf-8",
+            )
+            _DOC_SITE.RUNTIME_STAMP_PATH.write_text(
+                _DOC_SITE.build_runtime_quartz_stamp(),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(_DOC_SITE.quartz_runtime_is_ready())
+
+            _DOC_SITE.RUNTIME_STAMP_PATH.write_text("stale", encoding="utf-8")
+            self.assertFalse(_DOC_SITE.quartz_runtime_is_ready())
+        finally:
+            _DOC_SITE.TOOLCHAIN_ROOT = old_toolchain_root
+            _DOC_SITE.RUNTIME_STAMP_PATH = old_runtime_stamp_path
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_quartz_plugin_stamp_ignores_base_url_only(self) -> None:
+        lockfile_text = '{"version": "1.0.0"}\n'
+        config_a = "configuration:\n  baseUrl: tele-ai.github.io/Fluxon\nplugins:\n  - source: search\n"
+        config_b = "configuration:\n  baseUrl: localhost:8080\nplugins:\n  - source: search\n"
+        config_c = "configuration:\n  baseUrl: localhost:8080\nplugins:\n  - source: backlinks\n"
+
+        self.assertEqual(
+            _DOC_SITE.build_quartz_plugin_stamp(config_a, lockfile_text),
+            _DOC_SITE.build_quartz_plugin_stamp(config_b, lockfile_text),
+        )
+        self.assertNotEqual(
+            _DOC_SITE.build_quartz_plugin_stamp(config_a, lockfile_text),
+            _DOC_SITE.build_quartz_plugin_stamp(config_c, lockfile_text),
+        )
+
     def test_ensure_quartz_plugins_rebuilds_stale_plugin_tree(self) -> None:
         tmpdir = Path(tempfile.mkdtemp(prefix="fluxon_doc_site_plugins_"))
         old_toolchain_root = _DOC_SITE.TOOLCHAIN_ROOT

@@ -6,17 +6,6 @@ on:
     branches:
       - main
       - master
-    # Republish when doc or homepage inputs change.
-    paths:
-      - ".github/workflows/docs-pages.yml"
-      - "fluxon_doc_cn/**"
-      - "fluxon_doc_en/**"
-      - "README.md"
-      - "README_CN.md"
-      - "pics/**"
-      - "LICENSE"
-      - "fluxon_rs/rust-toolchain.toml"
-      - "scripts/build_doc_site.py"
 
 permissions:
   contents: read

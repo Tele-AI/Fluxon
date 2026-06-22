@@ -56,8 +56,8 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
             test_suite_requires_benchmark_bundle_only_for_bench_cases,
         ),
         (
-            "ci_top_attention_doc_page_build_declares_setup_dev_env_prepare",
-            test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare,
+            "ci_top_attention_doc_page_build_uses_online_docker_image",
+            test_ci_top_attention_doc_page_build_uses_online_docker_image,
         ),
     ]
     if selected_test_id is None:
@@ -199,18 +199,18 @@ def test_suite_requires_benchmark_bundle_only_for_bench_cases() -> None:
     print("PASS: test_suite_requires_benchmark_bundle_only_for_bench_cases")
 
 
-def test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare() -> None:
+def test_ci_top_attention_doc_page_build_uses_online_docker_image() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
     suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
     if not isinstance(suite_cfg, dict):
-        print("FAIL: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare - suite config is not a mapping")
+        print("FAIL: test_ci_top_attention_doc_page_build_uses_online_docker_image - suite config is not a mapping")
         return
 
     suite_for_contract = copy.deepcopy(suite_cfg)
     artifact_sets = suite_for_contract.get("artifact_sets")
     if not isinstance(artifact_sets, dict):
-        print("FAIL: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare - artifact_sets is not a mapping")
+        print("FAIL: test_ci_top_attention_doc_page_build_uses_online_docker_image - artifact_sets is not a mapping")
         return
     for artifact_set in artifact_sets.values():
         if not isinstance(artifact_set, dict):
@@ -222,29 +222,41 @@ def test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare() -> Non
                 artifact_set["release_artifacts"] = {"wheel": python_wheel}
 
     suite = _TEST_RUNNER._parse_suite_config(suite_for_contract)
-    scene = suite.scenes.get("ci_top_attention_doc_page_build")
-    if not isinstance(scene, dict):
-        print("FAIL: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare - missing scene")
+    cases = _TEST_RUNNER._expand_cases(suite)
+    case = next(
+        (
+            item
+            for item in cases
+            if item.scene_id == "ci_top_attention_doc_page_build"
+            and item.profile_id == "fluxon_tcp"
+        ),
+        None,
+    )
+    if case is None:
+        print("FAIL: test_ci_top_attention_doc_page_build_uses_online_docker_image - missing doc page case")
         return
-    ci = scene.get("ci")
-    if not isinstance(ci, dict):
-        print("FAIL: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare - scene.ci missing")
+    planned = _TEST_RUNNER._build_ci_execution_plan(case, suite)
+    if len(planned) != 1:
+        print(
+            "FAIL: test_ci_top_attention_doc_page_build_uses_online_docker_image - "
+            f"expected one planned case, got {len(planned)}"
+        )
         return
-    prepare = ci.get("prepare")
+    prepare = planned[0].ci_prepare_steps
     expected = [
         {
-            "kind": "setup_dev_env",
-            "config": "setup_and_pack/setup_dev_env/doc_page_ci.yaml",
-            "cache_relpath": ".cached/fluxon_doc_site/toolchain",
+            "kind": "online_docker_image",
+            "image_ref": "hanbaoaaa/fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0",
+            "env": "FLUXON_DOC_SITE_DOCKER_IMAGE_REF",
         }
     ]
     if prepare != expected:
         print(
-            "FAIL: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare - "
+            "FAIL: test_ci_top_attention_doc_page_build_uses_online_docker_image - "
             f"expected {expected!r}, got {prepare!r}"
         )
         return
-    print("PASS: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare")
+    print("PASS: test_ci_top_attention_doc_page_build_uses_online_docker_image")
 
 
 if __name__ == "__main__":
