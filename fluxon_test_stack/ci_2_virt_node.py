@@ -879,6 +879,8 @@ def main() -> int:
             sys.executable,
             str((REPO_ROOT / "fluxon_test_stack" / "pack_test_stack_rsc.py").resolve()),
             "--all-profiles",
+            "--release-dir",
+            str(release_dir),
             "-c",
             str(pack_metadata["suite_path"]),
         ]

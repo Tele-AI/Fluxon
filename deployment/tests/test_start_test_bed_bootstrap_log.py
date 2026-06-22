@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import io
 import sys
@@ -604,6 +605,7 @@ def test_normalize_bootstrap_deployconf_strips_legacy_master_p2p_listen_port() -
     ops_agent_entrypoint = normalized["service"]["ops_agent"]["entrypoint"]
     assert "p2p_listen_port: 31100" not in master_entrypoint, master_entrypoint
     assert "p2p_listen_port: 12102" in ops_agent_entrypoint, ops_agent_entrypoint
+    assert normalized["service"]["master"]["port"] == 51051, normalized["service"]["master"]
     assert notes == ["service.master.entrypoint: removed legacy master field p2p_listen_port"], notes
     assert "p2p_listen_port: 31100" in deployconf["service"]["master"]["entrypoint"], deployconf
     print("PASS: test_normalize_bootstrap_deployconf_strips_legacy_master_p2p_listen_port")
@@ -789,6 +791,7 @@ def test_normalize_bootstrap_deployconf_rewrites_same_host_local_multi_node_fixe
     assert "--http-addr 0.0.0.0:19390" in normalized["service"]["greptime"]["entrypoint"], normalized["service"]["greptime"]["entrypoint"]
     assert normalized["service"]["tikv_pd"]["port"] == 19400, normalized["service"]["tikv_pd"]
     assert normalized["service"]["tikv"]["port"] == 19410, normalized["service"]["tikv"]
+    assert normalized["service"]["master"]["port"] == 19290, normalized["service"]["master"]
     assert "port: 19290" in normalized["service"]["master"]["entrypoint"], normalized["service"]["master"]["entrypoint"]
     assert "OPS_AGENT_P2P_LISTEN_PORT=19320" in normalized["service"]["ops_agent"]["entrypoint"], normalized["service"]["ops_agent"]["entrypoint"]
     assert "OPS_AGENT_P2P_LISTEN_PORT=19321" in normalized["service"]["ops_agent"]["entrypoint"], normalized["service"]["ops_agent"]["entrypoint"]
@@ -845,9 +848,33 @@ def test_normalize_bootstrap_deployconf_keeps_non_local_or_single_node_ports_unc
         },
     }
     normalized, notes = module._normalize_bootstrap_deployconf(deployconf=deployconf)
-    assert normalized == deployconf, normalized
+    assert normalized["service"]["master"]["port"] == 51051, normalized["service"]["master"]
+    expected = copy.deepcopy(deployconf)
+    expected["service"]["master"]["port"] = 51051
+    assert normalized == expected, normalized
     assert notes == [], notes
     print("PASS: test_normalize_bootstrap_deployconf_keeps_non_local_or_single_node_ports_unchanged")
+
+
+def test_normalize_bootstrap_deployconf_promotes_master_port_from_entrypoint() -> None:
+    module = _load_start_test_bed_module()
+    deployconf = {
+        "service": {
+            "master": {
+                "entrypoint": (
+                    'cat > "${CONFIG_PATH}" <<YAML\n'
+                    'instance_key: "unified_master"\n'
+                    "port: 51051\n"
+                    "YAML\n"
+                )
+            }
+        }
+    }
+    normalized, notes = module._normalize_bootstrap_deployconf(deployconf=deployconf)
+    assert normalized["service"]["master"]["port"] == 51051, normalized["service"]["master"]
+    assert notes == [], notes
+    assert "port" not in deployconf["service"]["master"], deployconf
+    print("PASS: test_normalize_bootstrap_deployconf_promotes_master_port_from_entrypoint")
 
 
 def test_refresh_cluster_bare_deploy_scripts_copies_local_and_remote_nodes() -> None:
@@ -1475,6 +1502,10 @@ def main() -> int:
         (
             "normalize_bootstrap_deployconf_keeps_non_local_or_single_node_ports_unchanged",
             test_normalize_bootstrap_deployconf_keeps_non_local_or_single_node_ports_unchanged,
+        ),
+        (
+            "normalize_bootstrap_deployconf_promotes_master_port_from_entrypoint",
+            test_normalize_bootstrap_deployconf_promotes_master_port_from_entrypoint,
         ),
         (
             "refresh_cluster_bare_deploy_scripts_copies_local_and_remote_nodes",

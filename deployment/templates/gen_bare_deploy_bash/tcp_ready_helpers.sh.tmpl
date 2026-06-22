@@ -1,0 +1,120 @@
+wait_service_tcp_ready() {
+  svc="$1"
+  host="$2"
+  port="$3"
+  stable_seconds="$4"
+  deadline_ts="$5"
+  context="$6"
+  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+    echo "$context tcp-ready: invalid port svc=$svc port=$port"
+    return 1
+  fi
+  if [[ ! "$stable_seconds" =~ ^[0-9]+$ ]] || [ "$stable_seconds" -le 0 ]; then
+    echo "$context tcp-ready: invalid stable_seconds svc=$svc stable_seconds=$stable_seconds"
+    return 1
+  fi
+  poll_interval_seconds={{TCP_READY_POLL_INTERVAL_SECONDS}}
+  stable_checks=$(python3 - "$stable_seconds" "$poll_interval_seconds" <<'__FLUXON_TCP_READY_CHECKS__'
+import math
+import sys
+stable_seconds = float(sys.argv[1])
+poll_interval_seconds = float(sys.argv[2])
+print(max(1, int(math.ceil(stable_seconds / poll_interval_seconds))))
+__FLUXON_TCP_READY_CHECKS__
+)
+  if [[ ! "$stable_checks" =~ ^[0-9]+$ ]] || [ "$stable_checks" -le 0 ]; then
+    echo "$context tcp-ready: failed to compute stable_checks svc=$svc"
+    return 1
+  fi
+  ok_checks=0
+  while true; do
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline_ts" ]; then
+      echo "$context tcp-ready: deadline exceeded svc=$svc host=$host port=$port"
+      return 1
+    fi
+    if python3 - "$host" "$port" <<'__FLUXON_TCP_READY_PROBE__'
+import socket
+import sys
+host = sys.argv[1]
+port = int(sys.argv[2])
+with socket.create_connection((host, port), timeout=1.0):
+    pass
+__FLUXON_TCP_READY_PROBE__
+    then
+      ok_checks=$((ok_checks+1))
+      if [ "$ok_checks" -ge "$stable_checks" ]; then
+        echo "$context tcp-ready: ok svc=$svc host=$host port=$port stable_checks=$stable_checks"
+        return 0
+      fi
+    else
+      if [ "$ok_checks" -ne 0 ]; then
+        echo "$context tcp-ready: reset svc=$svc ok_checks=$ok_checks host=$host port=$port"
+      fi
+      ok_checks=0
+    fi
+    sleep "$poll_interval_seconds"
+  done
+}
+
+wait_service_etcd_endpoint_healthy() {
+  svc="$1"
+  etcdctl_bin="$2"
+  endpoint="$3"
+  stable_seconds="$4"
+  deadline_ts="$5"
+  context="$6"
+  if [ ! -x "$etcdctl_bin" ]; then
+    echo "$context etcd-health: missing etcdctl svc=$svc path=$etcdctl_bin"
+    return 1
+  fi
+  if [ -z "$endpoint" ]; then
+    echo "$context etcd-health: missing endpoint svc=$svc"
+    return 1
+  fi
+  if [[ ! "$stable_seconds" =~ ^[0-9]+$ ]] || [ "$stable_seconds" -le 0 ]; then
+    echo "$context etcd-health: invalid stable_seconds svc=$svc stable_seconds=$stable_seconds"
+    return 1
+  fi
+  poll_interval_seconds={{ETCD_HEALTH_POLL_INTERVAL_SECONDS}}
+  stable_checks=$(python3 - "$stable_seconds" "$poll_interval_seconds" <<'__FLUXON_ETCD_HEALTH_CHECKS__'
+import math
+import sys
+stable_seconds = float(sys.argv[1])
+poll_interval_seconds = float(sys.argv[2])
+print(max(1, int(math.ceil(stable_seconds / poll_interval_seconds))))
+__FLUXON_ETCD_HEALTH_CHECKS__
+)
+  if [[ ! "$stable_checks" =~ ^[0-9]+$ ]] || [ "$stable_checks" -le 0 ]; then
+    echo "$context etcd-health: failed to compute stable_checks svc=$svc"
+    return 1
+  fi
+  ok_checks=0
+  last_output=""
+  while true; do
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline_ts" ]; then
+      if [ -n "$last_output" ]; then
+        last_output="${last_output//$'\n'/ }"
+        echo "$context etcd-health: deadline exceeded svc=$svc endpoint=$endpoint last_output=$last_output"
+      else
+        echo "$context etcd-health: deadline exceeded svc=$svc endpoint=$endpoint"
+      fi
+      return 1
+    fi
+    if probe_output=$(ETCDCTL_API=3 "$etcdctl_bin" --endpoints "$endpoint" --dial-timeout "{{ETCD_HEALTH_PROBE_TIMEOUT_MS}}ms" --command-timeout "{{ETCD_HEALTH_PROBE_TIMEOUT_MS}}ms" endpoint health 2>&1); then
+      ok_checks=$((ok_checks+1))
+      if [ "$ok_checks" -ge "$stable_checks" ]; then
+        echo "$context etcd-health: ok svc=$svc endpoint=$endpoint stable_checks=$stable_checks"
+        return 0
+      fi
+    else
+      last_output="$probe_output"
+      if [ "$ok_checks" -ne 0 ]; then
+        echo "$context etcd-health: reset svc=$svc ok_checks=$ok_checks endpoint=$endpoint"
+      fi
+      ok_checks=0
+    fi
+    sleep "$poll_interval_seconds"
+  done
+}

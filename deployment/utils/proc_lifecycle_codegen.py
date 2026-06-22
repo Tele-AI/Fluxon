@@ -150,22 +150,19 @@ _pid_tree_has_child_process() {{
 }}
 
 wait_service_probably_ready_pid_tree() {{
-  # "Probably ready" contract:
-  # - A service is considered probably-ready iff for N consecutive seconds:
-  #   - the supervisor PID exists, and
-  #   - the supervisor PID subtree has at least one other PID besides the supervisor.
-  # - If the child process restarts during the window, we reset the counter and keep waiting,
-  #   until the provided deadline is reached.
-  #
-  # This is used by atomic-group runners to enforce strict start ordering.
+  # Startup gate contract:
+  # - Success means the supervisor PID stays alive across the fixed startup window.
+  # - During this startup window we do not probe service ports or readiness endpoints.
+  # - We intentionally do not require the child to expose ports, endpoints, or even finish
+  #   spawning before the window ends.
   svc="$1"
   root_pid="$2"
-  stable_seconds="$3"
+  startup_window_seconds="$3"
   deadline_ts="$4"
   context="$5"
 
-  if [[ ! "$stable_seconds" =~ ^[0-9]+$ ]] || [ "$stable_seconds" -le 0 ]; then
-    echo "$context probable-ready: invalid stable_seconds=$stable_seconds svc=$svc"
+  if [[ ! "$startup_window_seconds" =~ ^[0-9]+$ ]] || [ "$startup_window_seconds" -le 0 ]; then
+    echo "$context probable-ready: invalid startup_window_seconds=$startup_window_seconds svc=$svc"
     return 1
   fi
   if [[ ! "$deadline_ts" =~ ^[0-9]+$ ]] || [ "$deadline_ts" -le 0 ]; then
@@ -173,30 +170,16 @@ wait_service_probably_ready_pid_tree() {{
     return 1
   fi
 
-  ok_s=0
   while true; do
-    now=$(date +%s)
-    if [ "$now" -ge "$deadline_ts" ]; then
-      echo "$context probable-ready: deadline exceeded svc=$svc stable_seconds=$stable_seconds pid=$root_pid"
-      return 1
-    fi
-
     if ! _pid_exists "$root_pid"; then
       echo "$context probable-ready: supervisor pid exited svc=$svc pid=$root_pid"
       return 1
     fi
 
-    if _pid_tree_has_child_process "$root_pid"; then
-      ok_s=$((ok_s+1))
-      if [ "$ok_s" -ge "$stable_seconds" ]; then
-        echo "$context probable-ready: ok svc=$svc stable_seconds=$stable_seconds pid=$root_pid"
-        return 0
-      fi
-    else
-      if [ "$ok_s" -ne 0 ]; then
-        echo "$context probable-ready: reset svc=$svc ok_s=$ok_s missing_child=true"
-      fi
-      ok_s=0
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline_ts" ]; then
+      echo "$context probable-ready: ok svc=$svc startup_window_seconds=$startup_window_seconds pid=$root_pid"
+      return 0
     fi
 
     sleep 1

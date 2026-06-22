@@ -248,7 +248,7 @@ def test_ops_entrypoints_use_direct_scripts() -> None:
                         cluster_name: "${FLUXON_CLUSTER_NAME}"
                         member_kind: kv
                         output: web
-                        http_listen_addr: "0.0.0.0:${MASTER__PORT}"
+                        http_listen_addr: "0.0.0.0:${OPS_CONTROLLER__PORT}"
                       YAML
                       ${HOSTWORKDIR}/venv/bin/python -m fluxon_py.runtime.start_ops_controller -c "${WORKDIR}/ops_controller.yaml" -w "${WORKDIR}"
                     node_bind:

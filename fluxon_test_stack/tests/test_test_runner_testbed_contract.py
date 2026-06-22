@@ -103,6 +103,30 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_bin_kvtest")
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
 
+    def test_top_attention_log_mgmt_ci_execution_plan_is_runner_native(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        artifact_sets = suite_cfg.get("artifact_sets")
+        if isinstance(artifact_sets, dict):
+            for artifact_set in artifact_sets.values():
+                if not isinstance(artifact_set, dict):
+                    continue
+                release_artifacts = artifact_set.get("release_artifacts")
+                if isinstance(release_artifacts, dict):
+                    python_wheel = release_artifacts.get("python_wheel")
+                    if isinstance(python_wheel, str) and python_wheel.strip():
+                        artifact_set["release_artifacts"] = {"wheel": python_wheel}
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        case = next(item for item in cases if item.scene_id == "ci_top_attention_log_mgmt" and item.profile_id == "fluxon_tcp")
+        planned = _RUNNER._build_ci_execution_plan(case, suite)
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_log_mgmt")
+        self.assertIn(
+            "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_log_mgmt.py",
+            planned[0].ci_commands[0]["command"],
+        )
+        self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
+
     def test_ci_prepare_run_inputs_rebuilds_release_view_without_reusing_source_test_rsc(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -519,6 +543,81 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     _RUNNER._ci_base_runtime_service_target_ip(resolved_case, service_id="greptime"),
                     "127.0.0.1",
                 )
+
+    def test_write_deployer_manifests_renders_payload_wrapper_from_template(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            resolved_case = {
+                "case": {
+                    "case_id": "bench_case",
+                    "profile_id": "bench_profile",
+                },
+                "scene": {
+                    "bench": {
+                        "subject": "kv",
+                    }
+                },
+                "deploy": {
+                    "instances": [
+                        {
+                            "id": "worker_0",
+                            "k8s_ref": "deployment/test-worker",
+                            "lifecycle": "service",
+                            "deployer": {
+                                "target": "logic-a",
+                                "payload_file": "wheelhouse/pkg.whl",
+                                "payload_dest_path": "/tmp/run/pkg.whl",
+                                "command": ["/bin/sh", "-lc", "python3 /tmp/run/pkg.whl"],
+                            },
+                        }
+                    ],
+                    "payload_delivery": {
+                        "kind": _RUNNER.PAYLOAD_DELIVERY_KIND_FLUXON_FS_S3,
+                        "s3_base_url": "http://127.0.0.1:19080/fs_s3",
+                        "bucket": "bench-bucket",
+                        "access_key": "bench-ak",
+                        "secret_key": "bench-sk",
+                        "region": "bench-region",
+                        "key_prefix": "case-prefix",
+                    },
+                },
+                "runtime": {
+                    "workdir_root": str(run_dir.parent),
+                    "run_dir": str(run_dir),
+                    "stack_identity": {
+                        "cluster_name": "fluxon_testbed",
+                        "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                        "shared_memory_path": "/tmp/shm",
+                        "shared_file_path": "/tmp/share",
+                    },
+                },
+                "artifact_set": {
+                    "release_root": str(run_dir / "fluxon_release"),
+                    "test_rsc_root": str(run_dir / "test_rsc"),
+                },
+            }
+
+            template_path = (
+                _RUNNER.RUNNER_TEMPLATE_DIR / "payload_fluxon_fs_s3_download_and_exec.sh.template"
+            ).resolve()
+            self.assertTrue(template_path.is_file())
+
+            _RUNNER._write_deployer_manifests(resolved_case, run_dir, allow_overwrite=False)
+
+            manifest_docs = list(
+                yaml.safe_load_all((run_dir / "deployer_deploy.yaml").read_text(encoding="utf-8"))
+            )
+            self.assertEqual(len(manifest_docs), 1)
+            container = manifest_docs[0]["spec"]["template"]["spec"]["containers"][0]
+            self.assertEqual(container["command"], ["/bin/bash", "-lc"])
+            self.assertEqual(len(container["args"]), 1)
+            script_text = container["args"][0]
+            self.assertIn("python3 - <<'PY'", script_text)
+            self.assertIn('BASE_URL = "http://127.0.0.1:19080/fs_s3"', script_text)
+            self.assertIn('OBJECT_KEY = "case-prefix/wheelhouse/pkg.whl"', script_text)
+            self.assertIn('DEST_PATH = "/tmp/run/pkg.whl"', script_text)
+            self.assertIn('exec /bin/sh -lc', script_text)
+            self.assertNotIn("__FLUXON_TMPL_", script_text)
 
 
 if __name__ == "__main__":

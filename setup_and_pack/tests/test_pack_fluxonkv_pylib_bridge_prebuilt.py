@@ -38,6 +38,39 @@ _PACKMOD = _load_module()
 
 
 class BridgePrebuiltAuthorityMaterializationTest(unittest.TestCase):
+    def test_pyo3_workspace_inputs_follow_dynamic_public_workspace_selection(self) -> None:
+        relpaths = _PACKMOD.pyo3_workspace_copy_relative_paths(
+            transport_backend="tcp_thread",
+            rdma_backend="closed_sdk",
+        )
+
+        self.assertIn("README.md", relpaths)
+        self.assertIn("deployment/utils/log_shard.py", relpaths)
+        self.assertIn("fluxon_rs/fluxon_ops/build.rs", relpaths)
+        self.assertIn("fluxon_rs/moka/examples/append_value_async.rs", relpaths)
+        self.assertIn("fluxon_rs/fluxon_cli/templates/landing.html", relpaths)
+        self.assertNotIn("skills/browser-helm/SKILL.md", relpaths)
+        self.assertNotIn("fluxon_doc_cn/roadmap.md", relpaths)
+
+    def test_pyo3_workspace_digest_tracks_selected_template_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            landing_path = repo_root / "fluxon_rs" / "fluxon_cli" / "templates" / "landing.html"
+            landing_path.parent.mkdir(parents=True, exist_ok=True)
+            landing_path.write_text("v1\n", encoding="utf-8")
+
+            digest_before = _PACKMOD._compute_inputs_digest(
+                repo_root,
+                ("fluxon_rs/fluxon_cli/templates/landing.html",),
+            )
+            landing_path.write_text("v2\n", encoding="utf-8")
+            digest_after = _PACKMOD._compute_inputs_digest(
+                repo_root,
+                ("fluxon_rs/fluxon_cli/templates/landing.html",),
+            )
+
+            self.assertNotEqual(digest_before, digest_after)
+
     def test_host_side_materialization_only_creates_placeholders(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             build_root = Path(tmpdir)

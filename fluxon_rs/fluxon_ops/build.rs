@@ -58,14 +58,23 @@ print(
     String::from_utf8(output.stdout).expect("selection supervisor output must be utf-8")
 }
 
+fn render_log_shard_helper(repo_root: &Path) -> String {
+    let helper_path = repo_root.join("deployment").join("utils").join("log_shard.py");
+    fs::read_to_string(&helper_path)
+        .unwrap_or_else(|e| panic!("read log shard helper failed: {} ({})", helper_path.display(), e))
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let repo_root = repo_root(&manifest_dir);
     let source = render_selection_supervisor(&repo_root);
+    let log_shard_source = render_log_shard_helper(&repo_root);
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let out_path = out_dir.join("selection_supervisor.py");
     fs::write(&out_path, source).expect("write embedded selection supervisor source");
+    let helper_out_path = out_dir.join("log_shard.py");
+    fs::write(&helper_out_path, log_shard_source).expect("write embedded log shard helper");
 
     println!("cargo:rerun-if-changed=build.rs");
     println!(
@@ -75,5 +84,9 @@ fn main() {
             .join("utils")
             .join("selection_supervisor_codegen.py")
             .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        repo_root.join("deployment").join("utils").join("log_shard.py").display()
     );
 }

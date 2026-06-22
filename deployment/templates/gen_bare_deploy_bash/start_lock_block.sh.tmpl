@@ -1,0 +1,14 @@
+PID_DIR="$HOSTWORKDIR/run"
+mkdir -p "$PID_DIR"
+START_LOCKFILE="$PID_DIR/${SERVICE}.start.lock"
+if ! command -v flock >/dev/null 2>&1; then
+  echo "Missing required command: flock"
+  exit 1
+fi
+exec 9>"$START_LOCKFILE"
+if ! flock -xn 9; then
+  echo "[bare] start skipped svc=$SERVICE reason=another start is already running lockfile=$START_LOCKFILE"
+  exit 0
+fi
+exec 9>&-
+

@@ -1,0 +1,6 @@
+interface:
+  display_name: "使用 agent-browser 排查运行时状态"
+  short_description: "使用 agent-browser 排查运行时状态"
+  default_prompt: "Use $prompt-193dd3cd-2722-413b-b88c-12c2af645f80."
+policy:
+  allow_implicit_invocation: false

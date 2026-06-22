@@ -86,10 +86,15 @@ jobs:
           # Scene selection:
           # - ci_top_attention_doc_page_build keeps the doc-site build as a CI scene workload.
           # - ci_top_attention_bin_kvtest keeps the Rust kv_test entry under the same CI scene contract.
+          # - ci_top_attention_log_mgmt keeps log rolling/sharding coverage under the same CI scene contract.
           suite["scenes"] = {
               key: value
               for key, value in suite["scenes"].items()
-              if key in ("ci_top_attention_doc_page_build", "ci_top_attention_bin_kvtest")
+              if key in (
+                  "ci_top_attention_doc_page_build",
+                  "ci_top_attention_bin_kvtest",
+                  "ci_top_attention_log_mgmt",
+              )
           }
 
           # Profile selection:
@@ -107,11 +112,13 @@ jobs:
           suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"]["ci_top_attention_doc_page_build"]["doc_site_base_url"] = (
               "${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
           )
+          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"]["ci_top_attention_log_mgmt"]["enabled"] = True
 
           # Scale selection:
           # - Keep the original per-scene scales from ci_test_list.yaml.
           # - ci_top_attention_doc_page_build stays on n1_kvowner_dram_3gib.
           # - ci_top_attention_bin_kvtest stays on n1_kvowner_dram_20gib.
+          # - ci_top_attention_log_mgmt stays on n1_kvowner_dram_20gib.
 
           out_path.write_text(
               yaml.safe_dump(suite, sort_keys=False, allow_unicode=False),

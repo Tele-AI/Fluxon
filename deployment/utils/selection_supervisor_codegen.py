@@ -13,6 +13,7 @@ import textwrap
 
 
 PYTHON_SELECTION_SUPERVISOR_FILENAME = "selection_supervisor.py"
+LOG_SHARD_HELPER_FILENAME = "log_shard.py"
 
 
 def render_python_selection_supervisor_module(*, timeouts) -> str:
@@ -42,11 +43,13 @@ import ctypes
 import enum
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +65,37 @@ LONG_RUNNING_SELECTION_SUPERVISOR_COMMANDS = ("run", "replace")
 SANITIZED_CHILD_ENV_KEYS = ("RDMAV_DRIVERS", "IBV_DRIVERS")
 
 _shutdown_requested = False
+_STDIO_ROUTER_THREAD = None
+_STDIO_ROUTER_KEEPALIVE_FP = None
+
+
+def _load_log_shard_helper():
+    candidates = []
+    raw_file = globals().get("__file__")
+    if isinstance(raw_file, str) and raw_file:
+        candidates.append(Path(raw_file).resolve().with_name("__LOG_SHARD_HELPER_FILENAME__"))
+    cwd = Path.cwd().resolve()
+    candidates.append(cwd / "__LOG_SHARD_HELPER_FILENAME__")
+    candidates.append(cwd / "deployment" / "utils" / "__LOG_SHARD_HELPER_FILENAME__")
+    for entry in sys.path:
+        if not isinstance(entry, str) or not entry:
+            continue
+        candidates.append(Path(entry).resolve() / "__LOG_SHARD_HELPER_FILENAME__")
+    helper_path = candidates[0]
+    for candidate in candidates:
+        if candidate.is_file():
+            helper_path = candidate
+            break
+    spec = importlib.util.spec_from_file_location("_fluxon_selection_log_shard", helper_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load log shard helper: {helper_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_LOG_SHARD = _load_log_shard_helper()
 
 
 def main() -> int:
@@ -96,6 +130,8 @@ def main() -> int:
     stop_parser.add_argument("--missing-ok", action="store_true")
 
     args = parser.parse_args()
+    runtime_state_for_stdio = _runtime_state_for_startup_stdio(args)
+    _redirect_process_stdio_to_runtime_log(runtime_state_for_stdio)
     # English note:
     # - The supervisor module is invoked both as a long-running `run` daemon and as a short-lived
     #   `stop` helper from ops-managed reconcile loops.
@@ -356,6 +392,16 @@ def _parse_run_command_spec(args: argparse.Namespace) -> RunCommandSpec:
     )
 
 
+def _runtime_state_for_startup_stdio(args: argparse.Namespace) -> Optional[SelectionRuntimeState]:
+    if str(args.command) != "run":
+        return None
+    label = _require_non_empty_str(args.label, "label")
+    state_json = args.state_json
+    if state_json is None:
+        return None
+    return _build_runtime_state(label=label, state_json=state_json)
+
+
 def _requested_phase1_overlap_with_applyless_owner(
     current_owner: Optional[LiveSupervisor],
     requested_runtime_state: Optional[SelectionRuntimeState],
@@ -438,6 +484,7 @@ def _run_supervisor(spec: RunCommandSpec, selection_lock_fp=None) -> int:
 
     restart_timestamps: List[float] = []
     backoff_seconds = spec.restart_delay_seconds
+    _redirect_process_stdio_to_runtime_log(runtime_state)
 
     while True:
         _log_reaped_children(
@@ -661,6 +708,10 @@ def _sanitize_child_ld_library_path(raw_value: Optional[str]) -> Optional[str]:
     return ":".join(sanitized_entries)
 
 
+def _expand_runtime_state_path(value: str) -> str:
+    return os.path.expandvars(value)
+
+
 def _spawn_child(command: List[str], workdir: Optional[Path]) -> subprocess.Popen[bytes]:
     def _set_pdeathsig_sigterm() -> None:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -687,6 +738,40 @@ def _spawn_child(command: List[str], workdir: Optional[Path]) -> subprocess.Pope
     )
 
 
+def _redirect_process_stdio_to_runtime_log(runtime_state: Optional[SelectionRuntimeState]) -> None:
+    global _STDIO_ROUTER_THREAD
+    global _STDIO_ROUTER_KEEPALIVE_FP
+    if runtime_state is None:
+        return
+    if _STDIO_ROUTER_THREAD is not None:
+        return
+    base_log_path = _require_non_empty_str(runtime_state.log_path, "state.log_path")
+    read_fd, write_fd = os.pipe()
+    router_keepalive = os.dup(write_fd)
+
+    def _router_loop() -> None:
+        _LOG_SHARD.relay_fd_to_daily_sharded_logs(
+            base_log_path=base_log_path,
+            read_fd=read_fd,
+            retention_days=_LOG_SHARD.DEFAULT_DAILY_LOG_RETENTION_DAYS,
+        )
+
+    router = threading.Thread(
+        target=_router_loop,
+        name="selection-supervisor-stdio-log-router",
+        daemon=True,
+    )
+    router.start()
+    os.dup2(write_fd, sys.stdout.fileno())
+    os.dup2(write_fd, sys.stderr.fileno())
+    sys.stdout = os.fdopen(sys.stdout.fileno(), "w", encoding="utf-8", buffering=1, closefd=False)
+    sys.stderr = os.fdopen(sys.stderr.fileno(), "w", encoding="utf-8", buffering=1, closefd=False)
+    try:
+        os.close(write_fd)
+    except OSError:
+        pass
+    _STDIO_ROUTER_KEEPALIVE_FP = os.fdopen(router_keepalive, "w", encoding="utf-8", buffering=1)
+    _STDIO_ROUTER_THREAD = router
 def _retired_and_preserved_adopted_roots(root_pid: int) -> Tuple[List[int], List[int]]:
     adopted_roots = _direct_live_child_pids(root_pid)
     if not adopted_roots:
@@ -788,7 +873,9 @@ def _selection_runtime_state_from_raw(
         apply_id=_require_optional_non_empty_str(raw.get("apply_id"), "state.apply_id"),
         argv=_require_non_empty_str_list(raw.get("argv"), "state.argv"),
         cwd=_require_optional_non_empty_str(raw.get("cwd"), "state.cwd"),
-        log_path=_require_non_empty_str(raw.get("log_path"), "state.log_path"),
+        log_path=_expand_runtime_state_path(
+            _require_non_empty_str(raw.get("log_path"), "state.log_path")
+        ),
         owner_ts_ms=owner_ts_ms,
         started_ts_ms=started_ts_ms,
     )
@@ -1337,6 +1424,7 @@ if __name__ == "__main__":
 """
     return (
         textwrap.dedent(template)
+        .replace("__LOG_SHARD_HELPER_FILENAME__", LOG_SHARD_HELPER_FILENAME)
         .replace("__TERM_S__", str(term_s))
         .replace("__KILL_S__", str(kill_s))
         .replace("__SUPERSEDE_S__", str(supersede_s))

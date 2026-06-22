@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+import yaml
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEPLOYMENT_DIR = SCRIPT_DIR.parent
@@ -50,6 +52,12 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("preserves_hostworkdir_runtime_token", test_preserves_hostworkdir_runtime_token),
         ("generated_scripts_do_not_embed_pidfile_authority", test_generated_scripts_do_not_embed_pidfile_authority),
         ("ops_entrypoints_use_direct_scripts", test_ops_entrypoints_use_direct_scripts),
+        ("bare_start_uses_no_exit_startup_gate", test_bare_start_uses_no_exit_startup_gate),
+        (
+            "normalized_testbed_master_exports_service_port_for_atomic_group",
+            test_normalized_testbed_master_exports_service_port_for_atomic_group,
+        ),
+        ("normalized_testbed_owner_emits_large_file_paths", test_normalized_testbed_owner_emits_large_file_paths),
         ("bare_child_command_preserves_runtime_hostworkdir_expansion", test_bare_child_command_preserves_runtime_hostworkdir_expansion),
         ("supervisor_label_uses_stable_selection_suffix", test_supervisor_label_uses_stable_selection_suffix),
         ("bootstrap_start_reuses_already_present_selection", test_bootstrap_start_reuses_already_present_selection),
@@ -93,6 +101,7 @@ def test_preserves_hostworkdir_runtime_token() -> None:
                   FLUXON_SHARED_MEM: "${HOSTWORKDIR}/shm1"
                 service:
                   svc_plain:
+                    port: 12345
                     entrypoint: |
                       WORKDIR="${HOSTWORKDIR}/svc_${NODE_ID}"
                       EXPORT_TABLE=$(cat <<EOF
@@ -127,8 +136,14 @@ def test_preserves_hostworkdir_runtime_token() -> None:
         assert "wait-present" not in script, script
         assert "launch_only_start_gate" not in script, script
         assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID"' in script, script
-        assert 'wait_service_tcp_ready "$SERVICE" "$HOST_IP" "$SERVICE_PORT"' in script, script
+        assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_TS" "[bare]"' in script, script
+        assert "export SERVICE_PORT=12345" in script, script
+        assert 'STARTUP_DEADLINE_TS=$(( $(date +%s) + 10 ))' in script, script
+        assert "wait_service_tcp_ready" not in script, script
+        assert "wait_service_etcd_endpoint_healthy" not in script, script
         assert 'SUPERVISOR_PID=$( setsid ' not in script, script
+        assert '>>"$LOGFILE" 2>&1' not in script, script
+        assert 'touch "$LOGFILE"' not in script, script
         assert 'python3 "$SELECTION_SUPERVISOR" stop --label "$SUPERVISOR_LABEL" --scope-key "$HOSTWORKDIR" --missing-ok' in stop_script, stop_script
         assert "retire-runtime" not in stop_script, stop_script
         print("PASS: test_preserves_hostworkdir_runtime_token")
@@ -149,6 +164,7 @@ def test_atomic_group_start_does_not_auto_stop_on_failure() -> None:
                     hostworkdir: /tmp/hostworkdir
                 service:
                   svc_a:
+                    port: 23456
                     entrypoint: |
                       echo svc_a
                     node_bind:
@@ -179,7 +195,12 @@ def test_atomic_group_start_does_not_auto_stop_on_failure() -> None:
         assert 'SUPERVISOR_PID=$( setsid ' not in script, script
         assert 'echo "[rollout] probable-ready failed svc=$SERVICE label=$SUPERVISOR_LABEL supervisor_pid=$SUPERVISOR_PID"' in script, script
         assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID"' in script, script
-        assert 'wait_service_tcp_ready "$SERVICE" "$HOST_IP" "$SERVICE_PORT"' in script, script
+        assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$GROUP_STARTUP_DEADLINE_TS" "[rollout]"' in script, script
+        assert 'GROUP_STARTUP_DEADLINE_TS=$(( $(date +%s) + 10 ))' in script, script
+        assert "export SERVICE_PORT=23456" in script, script
+        assert "unset SERVICE_PORT" in script, script
+        assert "wait_service_tcp_ready" not in script, script
+        assert "wait_service_etcd_endpoint_healthy" not in script, script
         print("PASS: test_atomic_group_start_does_not_auto_stop_on_failure")
 
 
@@ -251,9 +272,127 @@ def test_ops_entrypoints_use_direct_scripts() -> None:
 
         assert "-m fluxon_py.runtime.start_ops_controller" in controller_entrypoint, controller_entrypoint
         assert "examples/fluxon_ops/start_controller.py" not in controller_entrypoint, controller_entrypoint
+        assert 'http_listen_addr: "0.0.0.0:19080"' in controller_entrypoint, controller_entrypoint
+        assert 'http_listen_addr: "0.0.0.0:${MASTER__PORT}"' not in controller_entrypoint, controller_entrypoint
         assert "-m fluxon_py.runtime.start_ops_agent" in agent_entrypoint, agent_entrypoint
         assert "examples/fluxon_ops/start_agent.py" not in agent_entrypoint, agent_entrypoint
         print("PASS: test_ops_entrypoints_use_direct_scripts")
+
+
+def test_bare_start_uses_no_exit_startup_gate() -> None:
+    with tempfile.TemporaryDirectory(prefix="test_gen_bare_deploy_bash_no_exit_gate_") as td:
+        tmpdir = Path(td)
+        config_path = tmpdir / "deployconf.yaml"
+        outdir = tmpdir / "out"
+        config_path.write_text(
+            textwrap.dedent(
+                """
+                name_prefix: fluxon-testbed
+                cluster_nodes:
+                  - hostname: node-a
+                    ip: 127.0.0.1
+                    hostworkdir: /tmp/hostworkdir
+                service:
+                  etcd:
+                    port: 2379
+                    entrypoint: |
+                      echo etcd
+                    node_bind:
+                      node: ["node-a"]
+                  tikv:
+                    port: 20160
+                    entrypoint: |
+                      echo tikv
+                    node_bind:
+                      node: ["node-a"]
+                  svc_plain:
+                    port: 12345
+                    entrypoint: |
+                      echo plain
+                    node_bind:
+                      node: ["node-a"]
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = _run_generator(config_path=config_path, outdir=outdir)
+        assert result.returncode == 0, f"generator failed: stdout={result.stdout} stderr={result.stderr}"
+
+        etcd_script = (outdir / "start_etcd.sh").read_text(encoding="utf-8")
+        tikv_script = (outdir / "start_tikv.sh").read_text(encoding="utf-8")
+        plain_script = (outdir / "start_svc_plain.sh").read_text(encoding="utf-8")
+
+        for script in (etcd_script, tikv_script, plain_script):
+            assert 'STARTUP_DEADLINE_TS=$(( $(date +%s) + 10 ))' in script, script
+            assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_TS" "[bare]"' in script, script
+            assert "wait_service_tcp_ready" not in script, script
+            assert "wait_service_etcd_endpoint_healthy" not in script, script
+        print("PASS: test_bare_start_uses_no_exit_startup_gate")
+
+
+def test_normalized_testbed_master_exports_service_port_for_atomic_group() -> None:
+    with tempfile.TemporaryDirectory(prefix="test_gen_bare_deploy_bash_normalized_testbed_") as td:
+        tmpdir = Path(td)
+        config_path = tmpdir / "deployconf.normalized.yaml"
+        outdir = tmpdir / "out"
+
+        start_test_bed = _load_python_module(
+            module_name="start_test_bed_for_gen_bare_tests",
+            path=DEPLOYMENT_DIR.parent / "fluxon_test_stack" / "start_test_bed.py",
+        )
+        base_cfg = yaml.safe_load(
+            (DEPLOYMENT_DIR.parent / "fluxon_test_stack" / "deployconf_testbed.yml").read_text(encoding="utf-8")
+        )
+        normalized, _ = start_test_bed._normalize_bootstrap_deployconf(deployconf=base_cfg)
+        config_path.write_text(
+            yaml.safe_dump(normalized, sort_keys=False, allow_unicode=False),
+            encoding="utf-8",
+        )
+
+        result = _run_generator(config_path=config_path, outdir=outdir)
+        assert result.returncode == 0, f"generator failed: stdout={result.stdout} stderr={result.stderr}"
+
+        script = (outdir / "start_fluxon_core_controller.sh").read_text(encoding="utf-8")
+        master_block_start = script.index("export SERVICE=master")
+        owner_block_start = script.index("export SERVICE=owner")
+        master_block = script[master_block_start:owner_block_start]
+        assert "export MASTER__PORT=51051" in master_block, master_block
+        assert "export SERVICE_PORT=51051" in master_block, master_block
+        assert "unset SERVICE_PORT" not in master_block, master_block
+        assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$GROUP_STARTUP_DEADLINE_TS" "[rollout]"' in master_block, master_block
+        assert "wait_service_tcp_ready" not in master_block, master_block
+        print("PASS: test_normalized_testbed_master_exports_service_port_for_atomic_group")
+
+
+def test_normalized_testbed_owner_emits_large_file_paths() -> None:
+    with tempfile.TemporaryDirectory(prefix="test_gen_bare_deploy_bash_testbed_owner_large_paths_") as td:
+        tmpdir = Path(td)
+        config_path = tmpdir / "deployconf.normalized.yaml"
+        outdir = tmpdir / "out"
+
+        start_test_bed = _load_python_module(
+            module_name="start_test_bed_for_owner_large_paths_tests",
+            path=DEPLOYMENT_DIR.parent / "fluxon_test_stack" / "start_test_bed.py",
+        )
+        base_cfg = yaml.safe_load(
+            (DEPLOYMENT_DIR.parent / "fluxon_test_stack" / "deployconf_testbed.yml").read_text(encoding="utf-8")
+        )
+        normalized, _ = start_test_bed._normalize_bootstrap_deployconf(deployconf=base_cfg)
+        config_path.write_text(
+            yaml.safe_dump(normalized, sort_keys=False, allow_unicode=False),
+            encoding="utf-8",
+        )
+
+        result = _run_generator(config_path=config_path, outdir=outdir)
+        assert result.returncode == 0, f"generator failed: stdout={result.stdout} stderr={result.stderr}"
+
+        script = (outdir / "entrypoint__fluxon-self-host2-fluxon_core_controller__owner.sh").read_text(encoding="utf-8")
+        assert 'large_file_paths:' in script, script
+        assert 'log_root_path: "${HOSTWORKDIR}/large/log/owner_${NODE_ID}"' in script, script
+        assert 'cache_root_path: "${HOSTWORKDIR}/large/cache/owner_${NODE_ID}"' in script, script
+        print("PASS: test_normalized_testbed_owner_emits_large_file_paths")
 
 
 def test_bare_child_command_preserves_runtime_hostworkdir_expansion() -> None:
@@ -594,6 +733,16 @@ def _load_generated_supervisor_module(supervisor_path: Path):
     spec = importlib.util.spec_from_file_location(module_name, supervisor_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"failed to load generated selection supervisor: {supervisor_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_python_module(*, module_name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load module: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)

@@ -1,0 +1,15 @@
+if [ ${#ALLOWED_NODES[@]} -gt 0 ]; then
+  _ok=false
+  for n in "${ALLOWED_NODES[@]}"; do
+    if [ "$n" = "$NODE_ID" ]; then _ok=true; fi
+  done
+  if [ "$_ok" != true ]; then
+    echo "Service {{SERVICE_NAME}} not scheduled on this node ($NODE_ID). Allowed: ${ALLOWED_NODES[*]}"
+    exit 0
+  fi
+fi
+
+export NODE_ID="$NODE_ID"
+export HOST_IP="$HOST_IP"
+export HOSTWORKDIR="$HOSTWORKDIR"
+

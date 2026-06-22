@@ -37,6 +37,11 @@ import urllib.request
 
 import yaml
 
+RUNNER_REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNNER_DEPLOYMENT_DIR = RUNNER_REPO_ROOT / "deployment"
+RUNNER_TEMPLATE_DIR = (RUNNER_REPO_ROOT / "fluxon_test_stack" / "test_runner_templates").resolve()
+sys.path.insert(0, str(RUNNER_DEPLOYMENT_DIR))
+
 from benchmark_role_names import (
     KV_NODE_ROLE_SEED,
     KV_NODE_ROLE_WORKER,
@@ -51,6 +56,7 @@ from top_attention_index_helper import (
     run_top_attention_entries,
     select_top_attention_entries,
 )
+from utils import log_shard
 
 
 # NOTE: This project uses multiple schemas:
@@ -277,10 +283,10 @@ _DELETE_APPLY_RETRYABLE_ERRS = (
     "workloads may still be stopping",
 )
 _WAIT_DELETE_APPLY_REQUIRES_DELETE_ERR = "wait_delete_apply requires delete_apply first"
-RUNNER_REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNNER_SHARED_RUNTIME_DIR = (RUNNER_REPO_ROOT / "fluxon_test_stack" / "test_runner").resolve()
 RUNNER_SHARED_LOCK_DIR = (RUNNER_SHARED_RUNTIME_DIR / "locks").resolve()
 RUNNER_STDIO_LOG_FILENAME = "test_runner.log"
+_SERVICE_LOG_RETENTION_DAYS = log_shard.DEFAULT_DAILY_LOG_RETENTION_DAYS
 _ACTIVE_TEST_BED_SELECTION_SUPERVISOR_CHECK_CACHE_KEY: Optional[str] = None
 
 # TEST_STACK coordinator uses a stable workload name across cases; if a previous run crashed
@@ -349,6 +355,7 @@ def _runner_native_ci_scene_ids() -> Tuple[str, ...]:
     return (
         "ci_top_attention_doc_page_build",
         "ci_top_attention_bin_kvtest",
+        "ci_top_attention_log_mgmt",
     )
 
 
@@ -402,6 +409,7 @@ _LOADED_PY_MODULES: Dict[str, Any] = {}
 _RUNNER_STDIO_LOG_FP: Optional[Any] = None
 _RUNNER_STDIO_KEEPALIVE_FDS: Optional[Tuple[int, int]] = None
 _RUNNER_STDIO_MIRROR_THREAD: Optional[threading.Thread] = None
+_RUNNER_STDIO_ROUTER_THREAD: Optional[threading.Thread] = None
 _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS = 15.0
 _CI_WAIT_TAIL_MAX_CHARS = 8000
 _TEST_RUNNER_UI_MAX_LOG_CHUNK_BYTES = 1024 * 1024
@@ -434,17 +442,65 @@ def _ci_log_prefix_lines(text: str, *, now: Optional[float] = None) -> str:
     return "".join(f"{prefix} {line}" if line.strip() else line for line in lines)
 
 
+def _service_log_base_path(workdir_root: Path, *, filename: str) -> Path:
+    return (workdir_root / filename).resolve()
+
+
+def _service_log_daily_path(base_path: Path, *, now: Optional[datetime.datetime] = None) -> Path:
+    return log_shard.daily_sharded_log_path(base_path, now=now)
+
+
+def _service_log_latest_path(base_path: Path) -> Optional[Path]:
+    return log_shard.latest_existing_daily_sharded_log_path(base_path)
+
+
+def _service_log_resolve_read_path(workdir_root: Path, *, filename: str) -> Optional[Path]:
+    base_path = _service_log_base_path(workdir_root, filename=filename)
+    return _service_log_resolve_read_path_from_base(base_path)
+
+
+def _service_log_resolve_read_path_from_base(base_path: Path) -> Optional[Path]:
+    return log_shard.resolve_readable_log_path(base_path)
+
+
+def _cleanup_old_service_logs(base_path: Path, *, retention_days: int = _SERVICE_LOG_RETENTION_DAYS) -> None:
+    log_shard.cleanup_old_daily_sharded_logs(base_path, retention_days=retention_days)
+
+
+def _start_runner_stdio_log_router(*, base_log_path: Path, read_fd: int) -> None:
+    def _router_loop() -> None:
+        log_shard.relay_fd_to_daily_sharded_logs(
+            base_log_path=str(base_log_path),
+            read_fd=read_fd,
+            retention_days=_SERVICE_LOG_RETENTION_DAYS,
+        )
+
+    router = threading.Thread(
+        target=_router_loop,
+        name="test-runner-stdio-log-router",
+        daemon=True,
+    )
+    router.start()
+    global _RUNNER_STDIO_ROUTER_THREAD
+    _RUNNER_STDIO_ROUTER_THREAD = router
+
+
 def _start_runner_stdio_log_mirror(*, log_path: Path, stdout_fd: int) -> None:
     def _mirror_loop() -> None:
         offset = 0
+        current_path: Optional[Path] = None
         while True:
             try:
-                if log_path.exists():
-                    size = log_path.stat().st_size
+                resolved_path = _service_log_resolve_read_path_from_base(log_path)
+                if isinstance(resolved_path, Path) and resolved_path.exists():
+                    if current_path != resolved_path:
+                        current_path = resolved_path
+                        offset = 0
+                    size = resolved_path.stat().st_size
                     if size < offset:
                         offset = 0
                     if size > offset:
-                        with log_path.open("r", encoding="utf-8", errors="replace") as fp:
+                        with resolved_path.open("r", encoding="utf-8", errors="replace") as fp:
                             fp.seek(offset)
                             chunk = fp.read()
                             offset = fp.tell()
@@ -469,7 +525,11 @@ def _start_runner_stdio_log_mirror(*, log_path: Path, stdout_fd: int) -> None:
     _RUNNER_STDIO_MIRROR_THREAD = mirror
 
 
-def _redirect_process_stdio_to_log(workdir_root: Path) -> None:
+def _redirect_process_stdio_to_log(
+    workdir_root: Path,
+    *,
+    filename: str = RUNNER_STDIO_LOG_FILENAME,
+) -> None:
     """Route runner stdio to a stable workdir log so long suites survive PTY loss.
 
     English note:
@@ -481,10 +541,13 @@ def _redirect_process_stdio_to_log(workdir_root: Path) -> None:
     """
     global _RUNNER_STDIO_LOG_FP
     global _RUNNER_STDIO_KEEPALIVE_FDS
+    global _RUNNER_STDIO_ROUTER_THREAD
     if _RUNNER_STDIO_LOG_FP is not None:
         return
 
-    log_path = (workdir_root / RUNNER_STDIO_LOG_FILENAME).resolve()
+    base_log_path = _service_log_base_path(workdir_root, filename=filename)
+    _cleanup_old_service_logs(base_log_path)
+    log_path = _service_log_daily_path(base_log_path)
     log_fp = log_path.open("a", encoding="utf-8", buffering=1)
     banner = (
         f"{_ci_log_timestamp_prefix()} [test_runner] redirecting process stdio to stable log: {log_path}\n"
@@ -519,15 +582,26 @@ def _redirect_process_stdio_to_log(workdir_root: Path) -> None:
         except OSError:
             _RUNNER_STDIO_KEEPALIVE_FDS = (-1, -1)
 
-    os.dup2(log_fp.fileno(), sys.stdout.fileno())
-    os.dup2(log_fp.fileno(), sys.stderr.fileno())
+    read_fd, write_fd = os.pipe()
+    router_keepalive = os.dup(write_fd)
+    _start_runner_stdio_log_router(base_log_path=base_log_path, read_fd=read_fd)
+    os.dup2(write_fd, sys.stdout.fileno())
+    os.dup2(write_fd, sys.stderr.fileno())
     sys.stdout = os.fdopen(sys.stdout.fileno(), "w", encoding="utf-8", buffering=1, closefd=False)
     sys.stderr = os.fdopen(sys.stderr.fileno(), "w", encoding="utf-8", buffering=1, closefd=False)
-    _RUNNER_STDIO_LOG_FP = log_fp
+    try:
+        os.close(write_fd)
+    except OSError:
+        pass
+    try:
+        log_fp.close()
+    except OSError:
+        pass
+    _RUNNER_STDIO_LOG_FP = os.fdopen(router_keepalive, "w", encoding="utf-8", buffering=1)
     if _runner_stdio_mirror_enabled():
         keepalive = _RUNNER_STDIO_KEEPALIVE_FDS or (-1, -1)
         _start_runner_stdio_log_mirror(
-            log_path=log_path,
+            log_path=base_log_path,
             stdout_fd=int(keepalive[0]),
         )
 
@@ -2919,105 +2993,17 @@ def _write_deployer_manifests(resolved_case: Dict[str, Any], run_dir: Path, *, a
             orig_argv = [cmd0] + args
             exec_cmd = " ".join(_shell_quote(x) for x in orig_argv)
 
-            # Generate a self-contained SigV4 GET downloader (Fluxon FS S3 gateway) and then exec the original argv.
-            bash_script = (
-                "set -euo pipefail\n"
-                "python3 - <<'PY'\n"
-                "import datetime\n"
-                "import hashlib\n"
-                "import hmac\n"
-                "import os\n"
-                "import urllib.parse\n"
-                "import urllib.request\n"
-                "from pathlib import Path\n"
-                "\n"
-                f"BASE_URL = {s3_base_url!r}\n"
-                f"BUCKET = {s3_bucket!r}\n"
-                f"OBJECT_KEY = {object_key!r}\n"
-                f"DEST_PATH = {payload_dest_path_s!r}\n"
-                f"ACCESS_KEY = {s3_access_key!r}\n"
-                f"SECRET_KEY = {s3_secret_key!r}\n"
-                f"REGION = {s3_region!r}\n"
-                "\n"
-                "ALG = 'AWS4-HMAC-SHA256'\n"
-                "SERVICE = 's3'\n"
-                "TERM = 'aws4_request'\n"
-                "UNSIGNED = 'UNSIGNED-PAYLOAD'\n"
-                "\n"
-                "def _hmac_sha256(key: bytes, msg: bytes) -> bytes:\n"
-                "    return hmac.new(key, msg, hashlib.sha256).digest()\n"
-                "\n"
-                "def _sha256_hex(msg: bytes) -> str:\n"
-                "    return hashlib.sha256(msg).hexdigest()\n"
-                "\n"
-                "def _derive_signing_key(secret_key: str, scope_date: str, region: str) -> bytes:\n"
-                "    k_date = _hmac_sha256(('AWS4' + secret_key).encode('utf-8'), scope_date.encode('utf-8'))\n"
-                "    k_region = _hmac_sha256(k_date, region.encode('utf-8'))\n"
-                "    k_service = _hmac_sha256(k_region, SERVICE.encode('utf-8'))\n"
-                "    return _hmac_sha256(k_service, TERM.encode('utf-8'))\n"
-                "\n"
-                "def _sigv4_headers(*, method: str, signing_path: str, query: str, host: str, scope_date: str, amz_date: str, payload_hash: str) -> dict:\n"
-                "    signed_headers = 'host;x-amz-content-sha256;x-amz-date'\n"
-                "    canonical_headers = ''\n"
-                "    canonical_headers += f'host:{host}\\n'\n"
-                "    canonical_headers += f'x-amz-content-sha256:{payload_hash}\\n'\n"
-                "    canonical_headers += f'x-amz-date:{amz_date}\\n'\n"
-                "    canonical_request = '\\n'.join([method, signing_path, query, canonical_headers, signed_headers, payload_hash])\n"
-                "    cr_hash = _sha256_hex(canonical_request.encode('utf-8'))\n"
-                "    scope = f'{scope_date}/{REGION}/{SERVICE}/{TERM}'\n"
-                "    string_to_sign = '\\n'.join([ALG, amz_date, scope, cr_hash])\n"
-                "    signing_key = _derive_signing_key(SECRET_KEY, scope_date, REGION)\n"
-                "    sig = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()\n"
-                "    auth = f\"{ALG} Credential={ACCESS_KEY}/{scope}, SignedHeaders={signed_headers}, Signature={sig}\"\n"
-                "    return {\n"
-                "        'Authorization': auth,\n"
-                "        'x-amz-date': amz_date,\n"
-                "        'x-amz-content-sha256': payload_hash,\n"
-                "        'Host': host,\n"
-                "    }\n"
-                "\n"
-                "u = urllib.parse.urlparse(BASE_URL)\n"
-                "if u.scheme not in ('http', 'https'):\n"
-                "    raise ValueError('BASE_URL must be http(s)')\n"
-                "if not u.netloc:\n"
-                "    raise ValueError('BASE_URL missing host')\n"
-                "base_path = u.path.rstrip('/')\n"
-                "if base_path == '':\n"
-                "    raise ValueError('BASE_URL must include a non-root path prefix (e.g. /fs_s3)')\n"
-                "\n"
-                "bucket_enc = urllib.parse.quote(BUCKET, safe='-_.~')\n"
-                "key_enc = urllib.parse.quote(OBJECT_KEY, safe='/-_.~')\n"
-                "full_path = base_path + '/' + bucket_enc + '/' + key_enc\n"
-                # Sign the *actual* client-visible request path (including s3_base_url path prefix, e.g. "/fs_s3").
-                "signing_path = full_path\n"
-                "url = f'{u.scheme}://{u.netloc}{full_path}'\n"
-                "\n"
-                "now = datetime.datetime.utcnow()\n"
-                "amz_date = now.strftime('%Y%m%dT%H%M%SZ')\n"
-                "scope_date = now.strftime('%Y%m%d')\n"
-                "hdrs = _sigv4_headers(method='GET', signing_path=signing_path, query='', host=u.netloc, scope_date=scope_date, amz_date=amz_date, payload_hash=UNSIGNED)\n"
-                "\n"
-                "dest = Path(DEST_PATH)\n"
-                "dest.parent.mkdir(parents=True, exist_ok=True)\n"
-                "tmp = Path(str(dest) + '.tmp')\n"
-                "if tmp.exists():\n"
-                "    tmp.unlink()\n"
-                "req = urllib.request.Request(url, method='GET')\n"
-                "for k, v in hdrs.items():\n"
-                "    req.add_header(k, v)\n"
-                "with urllib.request.urlopen(req, timeout=60) as resp:\n"
-                "    if getattr(resp, 'status', None) != 200:\n"
-                "        body = resp.read(4096)\n"
-                "        raise RuntimeError(f'download failed: status={getattr(resp, \"status\", None)} body={body!r}')\n"
-                "    with tmp.open('wb') as f:\n"
-                "        while True:\n"
-                "            b = resp.read(1024 * 1024)\n"
-                "            if not b:\n"
-                "                break\n"
-                "            f.write(b)\n"
-                "tmp.replace(dest)\n"
-                "PY\n"
-                f"exec {exec_cmd}\n"
+            # Keep the remote wrapper self-contained, but store it as a standalone template
+            # instead of hardcoding a long inline script in this Python source file.
+            bash_script = _render_fluxon_fs_s3_payload_wrapper(
+                s3_base_url=s3_base_url,
+                s3_bucket=s3_bucket,
+                object_key=object_key,
+                payload_dest_path=payload_dest_path_s,
+                s3_access_key=s3_access_key,
+                s3_secret_key=s3_secret_key,
+                s3_region=s3_region,
+                exec_cmd=exec_cmd,
             )
 
             # Deployer only consumes argv/cwd; container image is required by the YAML subset parser
@@ -7670,6 +7656,18 @@ def _runner_native_ci_commands_for_case(case: _ResolvedCase, *, ctx: str) -> Lis
                 "timeout_seconds": 21600,
             }
         ]
+    if scene_id == "ci_top_attention_log_mgmt":
+        return [
+            {
+                "id": "top_attention_log_mgmt",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_log_mgmt.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
     raise ValueError(f"{ctx} unsupported runner-native CI scene: {scene_id!r}")
 
 
@@ -12251,6 +12249,51 @@ def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+def _json_string_literal(value: str) -> str:
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _render_runner_template(*, template_name: str, replacements: Dict[str, str]) -> str:
+    template_path = (RUNNER_TEMPLATE_DIR / template_name).resolve()
+    if template_path.parent != RUNNER_TEMPLATE_DIR:
+        raise ValueError(f"template must stay under {RUNNER_TEMPLATE_DIR}: {template_path}")
+    if not template_path.is_file():
+        raise ValueError(f"missing runner template: {template_path}")
+    rendered = template_path.read_text(encoding="utf-8")
+    for token, value in replacements.items():
+        rendered = rendered.replace(token, value)
+    unresolved = sorted(set(re.findall(r"__FLUXON_TMPL_[A-Z0-9_]+__", rendered)))
+    if unresolved:
+        raise ValueError(f"unresolved runner template tokens: {unresolved} template={template_path}")
+    return rendered
+
+
+def _render_fluxon_fs_s3_payload_wrapper(
+    *,
+    s3_base_url: str,
+    s3_bucket: str,
+    object_key: str,
+    payload_dest_path: str,
+    s3_access_key: str,
+    s3_secret_key: str,
+    s3_region: str,
+    exec_cmd: str,
+) -> str:
+    return _render_runner_template(
+        template_name="payload_fluxon_fs_s3_download_and_exec.sh.template",
+        replacements={
+            "__FLUXON_TMPL_BASE_URL_JSON__": _json_string_literal(s3_base_url),
+            "__FLUXON_TMPL_BUCKET_JSON__": _json_string_literal(s3_bucket),
+            "__FLUXON_TMPL_OBJECT_KEY_JSON__": _json_string_literal(object_key),
+            "__FLUXON_TMPL_DEST_PATH_JSON__": _json_string_literal(payload_dest_path),
+            "__FLUXON_TMPL_ACCESS_KEY_JSON__": _json_string_literal(s3_access_key),
+            "__FLUXON_TMPL_SECRET_KEY_JSON__": _json_string_literal(s3_secret_key),
+            "__FLUXON_TMPL_REGION_JSON__": _json_string_literal(s3_region),
+            "__FLUXON_TMPL_EXEC_CMD__": exec_cmd,
+        },
+    )
+
+
 
 def _find_deploy_instance_opt(resolved_case: Dict[str, Any], *, instance_id: str) -> Optional[Dict[str, Any]]:
     deploy = _require_dict(resolved_case.get("deploy"), "resolved_case.deploy")
@@ -16220,7 +16263,9 @@ def _ui_case_reserved_activity_unix_s(
             return
 
     _consume_path((workdir_root / "case_runs.yaml").resolve())
-    _consume_path((workdir_root / RUNNER_STDIO_LOG_FILENAME).resolve())
+    runner_log_path = _service_log_resolve_read_path(workdir_root, filename=RUNNER_STDIO_LOG_FILENAME)
+    if isinstance(runner_log_path, Path):
+        _consume_path(runner_log_path)
 
     run_dir = (_ui_case_result_root(workdir_root, case_id) / _ui_run_dir_name(run_index)).resolve()
     _consume_path(run_dir)
@@ -16327,7 +16372,7 @@ def _ui_case_overview(workdir_root: Path, *, case_id: str) -> Dict[str, Any]:
 def _ui_collect_suite_overview(workdir_root: Path) -> Dict[str, Any]:
     case_ids = _ui_collect_case_ids(workdir_root)
     cases = [_ui_case_overview(workdir_root, case_id=case_id) for case_id in case_ids]
-    runner_log_path = (workdir_root / RUNNER_STDIO_LOG_FILENAME).resolve()
+    runner_log_path = _service_log_resolve_read_path(workdir_root, filename=RUNNER_STDIO_LOG_FILENAME)
     running_cases = [case for case in cases if case.get("status") == "RUNNING"]
     incomplete_cases = [case for case in cases if case.get("status") in {"INCOMPLETE", "RESERVED"}]
     last_updated_unix_s = 0
@@ -16350,7 +16395,7 @@ def _ui_collect_suite_overview(workdir_root: Path) -> Dict[str, Any]:
     return {
         "workdir_root": workdir_root.resolve(),
         "case_runs_path": (workdir_root / "case_runs.yaml").resolve(),
-        "runner_log_path": runner_log_path if runner_log_path.exists() else None,
+        "runner_log_path": runner_log_path if isinstance(runner_log_path, Path) and runner_log_path.exists() else None,
         "running_case_count": len(running_cases),
         "status": "RUNNING" if running_cases else ("INCOMPLETE" if incomplete_cases else ("IDLE" if cases else "EMPTY")),
         "last_updated_unix_s": int(last_updated_unix_s),
@@ -16451,7 +16496,7 @@ def _ui_workdir_id(workdir_root: Path) -> str:
 
 def _ui_workdir_touch_unix_s(workdir_root: Path) -> int:
     touched = 0
-    for name in ("case_runs.yaml", RUNNER_STDIO_LOG_FILENAME):
+    for name in ("case_runs.yaml",):
         path = (workdir_root / name).resolve()
         if not path.exists():
             continue
@@ -16459,6 +16504,12 @@ def _ui_workdir_touch_unix_s(workdir_root: Path) -> int:
             touched = max(touched, int(path.stat().st_mtime))
         except Exception:
             continue
+    runner_log_path = _service_log_resolve_read_path(workdir_root, filename=RUNNER_STDIO_LOG_FILENAME)
+    if isinstance(runner_log_path, Path) and runner_log_path.exists():
+        try:
+            touched = max(touched, int(runner_log_path.stat().st_mtime))
+        except Exception:
+            pass
     return int(touched)
 
 
@@ -17897,8 +17948,11 @@ pre{background:#0b1020;color:#e5e7eb;padding:10px;border-radius:8px;overflow:aut
                         self._send_json(400, {"error": "missing workdir_id"})
                         return
                     suite_workdir = _ui_workdir_by_id(workdir_root, workdir_id, extra_history_roots)
-                    path = (suite_workdir / RUNNER_STDIO_LOG_FILENAME).resolve()
-                    if not path.exists():
+                    path = _service_log_resolve_read_path(
+                        suite_workdir,
+                        filename=RUNNER_STDIO_LOG_FILENAME,
+                    )
+                    if not isinstance(path, Path) or not path.exists():
                         raise FileNotFoundError(f"runner log not found: {path}")
                 elif kind == "run":
                     workdir_id = (qs.get("workdir_id") or [""])[0]

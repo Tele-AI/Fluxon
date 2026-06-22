@@ -10,7 +10,7 @@ from pathlib import Path
 import yaml
 
 from setup_and_pack.public_workspace_contract import (
-    PUBLIC_WORKSPACE_INPUT_RELATIVE_PATHS,
+    collect_public_workspace_input_relative_paths,
     _copy_public_workspace_input_path,
     _sanitize_public_workspace_input,
 )
@@ -48,35 +48,6 @@ DEFAULT_HOST_PATH_SUFFIXES = {
     ("manylinux", "cargo_registry_dir"): "manylinux-cache/cargo-registry",
     ("manylinux", "cargo_git_dir"): "manylinux-cache/cargo-git",
 }
-BRIDGE_PREBUILT_WORKSPACE_SEED_EXTRA_RELATIVE_PATHS = (
-    "setup_and_pack/nix",
-    "setup_and_pack/lib_tool.py",
-    "setup_and_pack/pyscript_util.py",
-    "setup_and_pack/closed_sdk_contract.py",
-    "setup_and_pack/public_workspace_contract.py",
-    "setup_and_pack/pub_prepare_build.py",
-    "setup_and_pack/pub_prepare_build.yaml",
-    "setup_and_pack/utils/wheel_runtime_helper.py",
-    "setup_and_pack/utils",
-    "deployment/utils/placeholder_utils.py",
-    "deployment/utils/proc_lifecycle_codegen.py",
-    "deployment/utils/selection_supervisor_codegen.py",
-    "fluxon_release/closed_sdk",
-    "fluxon_rs/fluxon_commu_contract",
-    "fluxon_rs/fluxon_commu",
-    "fluxon_rs/fluxon_commu_closed_sdk_consumer",
-    "fluxon_rs/Cargo.lock",
-)
-BRIDGE_PREBUILT_WORKSPACE_SEED_RELATIVE_PATHS = tuple(
-    dict.fromkeys(
-        (
-            *PUBLIC_WORKSPACE_INPUT_RELATIVE_PATHS,
-            *BRIDGE_PREBUILT_WORKSPACE_SEED_EXTRA_RELATIVE_PATHS,
-        )
-    )
-)
-
-
 @dataclass(frozen=True)
 class AssemblyRefs:
     baseline_path: str
@@ -757,7 +728,9 @@ def _materialize_bridge_prebuilt_workspace_seed(*, source_root: Path, target_roo
     _remove_stale_derived_entry(path=target_root)
     target_root.mkdir(parents=True, exist_ok=True)
     target_root.chmod(0o777)
-    for relative_path in BRIDGE_PREBUILT_WORKSPACE_SEED_RELATIVE_PATHS:
+    for relative_path in collect_public_workspace_input_relative_paths(
+        repo_root=source_root
+    ):
         source_path = source_root / relative_path
         if not source_path.exists():
             raise RuntimeError(

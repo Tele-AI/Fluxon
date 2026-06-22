@@ -19,6 +19,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 UTILS_DIR = SCRIPT_DIR.parent / "utils"
 sys.path.insert(0, str(UTILS_DIR))
 
+from log_shard import render_module_source as render_log_shard_module_source  # type: ignore
 from selection_supervisor_codegen import render_python_selection_supervisor_module  # type: ignore
 
 
@@ -41,6 +42,9 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("install_subreaper_uses_prctl", test_install_subreaper_uses_prctl),
         ("spawn_child_sanitizes_rdma_driver_env", test_spawn_child_sanitizes_rdma_driver_env),
         ("selection_present_requires_live_child_process", test_selection_present_requires_live_child_process),
+        ("runtime_log_path_uses_daily_shard_files", test_runtime_log_path_uses_daily_shard_files),
+        ("runtime_log_path_expands_hostworkdir_env", test_runtime_log_path_expands_hostworkdir_env),
+        ("runtime_log_shards_roll_and_preserve_content_boundaries", test_runtime_log_shards_roll_and_preserve_content_boundaries),
         ("selection_present_checks_all_live_supervisors", test_selection_present_checks_all_live_supervisors),
         ("zombie_supervisor_is_treated_as_stopped", test_zombie_supervisor_is_treated_as_stopped),
         ("legacy_replace_process_is_observed_as_live_owner", test_legacy_replace_process_is_observed_as_live_owner),
@@ -97,6 +101,10 @@ def _write_runtime_script(root: Path, *, term_seconds: int = 5, kill_seconds: in
                 supersede_seconds=supersede_seconds,
             ),
         ),
+        encoding="utf-8",
+    )
+    (root / "log_shard.py").write_text(
+        render_log_shard_module_source(),
         encoding="utf-8",
     )
     return supervisor_path
@@ -561,6 +569,181 @@ def test_selection_present_requires_live_child_process() -> None:
             _terminate_process(supervisor)
 
 
+def test_runtime_log_path_uses_daily_shard_files() -> None:
+    module = _load_runtime_module()
+    with tempfile.TemporaryDirectory(prefix="test_selection_supervisor_log_shard_") as td:
+        root = Path(td)
+        supervisor_path = _write_runtime_script(root)
+        child_path = root / "child.py"
+        child_path.write_text(
+            "import sys, time\n"
+            "print('hello-log-shard', flush=True)\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        label = "DaemonSet/test-log-shard"
+        child_argv = [sys.executable, str(child_path)]
+        base_log_path = root / "test-log-shard.log"
+        supervisor = _run_supervisor_command(
+            supervisor_path=supervisor_path,
+            label=label,
+            owner_ts_ms=1,
+            state_json=json.dumps(
+                {
+                    "kind": "DaemonSet",
+                    "name": "test-log-shard",
+                    "service_name": "test-log-shard",
+                    "argv": child_argv,
+                    "cwd": str(root),
+                    "log_path": str(base_log_path),
+                },
+                sort_keys=True,
+            ),
+            child_argv=child_argv,
+            cwd=root,
+        )
+        try:
+            _wait_until_present(module, label)
+            deadline = time.time() + 5.0
+            shard_path = root / f"test-log-shard.{time.strftime('%Y-%m-%d', time.gmtime())}.log"
+            while time.time() < deadline and not shard_path.exists():
+                time.sleep(0.1)
+            assert shard_path.exists(), shard_path
+            assert not base_log_path.exists(), base_log_path
+            assert "hello-log-shard" in shard_path.read_text(encoding="utf-8", errors="replace")
+        finally:
+            _terminate_process(supervisor)
+
+
+def test_runtime_log_path_expands_hostworkdir_env() -> None:
+    module = _load_runtime_module()
+    with tempfile.TemporaryDirectory(prefix="test_selection_supervisor_expand_hostworkdir_") as td:
+        root = Path(td)
+        hostworkdir = root / "hostworkdir"
+        hostworkdir.mkdir(parents=True, exist_ok=True)
+        supervisor_path = _write_runtime_script(root)
+        child_path = root / "child.py"
+        child_path.write_text(
+            "import time\n"
+            "print('expanded-hostworkdir-log', flush=True)\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        label = "DaemonSet/test-expand-hostworkdir"
+        child_argv = [sys.executable, str(child_path)]
+        saved_hostworkdir = os.environ.get("HOSTWORKDIR")
+        os.environ["HOSTWORKDIR"] = str(hostworkdir)
+        supervisor = _run_supervisor_command(
+            supervisor_path=supervisor_path,
+            label=label,
+            owner_ts_ms=1,
+            state_json=json.dumps(
+                {
+                    "kind": "DaemonSet",
+                    "name": "test-expand-hostworkdir",
+                    "service_name": "test-expand-hostworkdir",
+                    "argv": child_argv,
+                    "cwd": str(root),
+                    "log_path": "${HOSTWORKDIR}/log/test-expand-hostworkdir.log",
+                },
+                sort_keys=True,
+            ),
+            child_argv=child_argv,
+            cwd=root,
+        )
+        try:
+            _wait_until_present(module, label)
+            deadline = time.time() + 5.0
+            shard_path = hostworkdir / "log" / f"test-expand-hostworkdir.{time.strftime('%Y-%m-%d', time.gmtime())}.log"
+            while time.time() < deadline and not shard_path.exists():
+                time.sleep(0.1)
+            assert shard_path.exists(), shard_path
+            assert "expanded-hostworkdir-log" in shard_path.read_text(encoding="utf-8", errors="replace")
+        finally:
+            _terminate_process(supervisor)
+            if saved_hostworkdir is None:
+                os.environ.pop("HOSTWORKDIR", None)
+            else:
+                os.environ["HOSTWORKDIR"] = saved_hostworkdir
+
+
+def test_runtime_log_shards_roll_and_preserve_content_boundaries() -> None:
+    module = _load_runtime_module()
+    saved_window = os.environ.get("FLUXON_TEST_LOG_SHARD_WINDOW_SECONDS")
+    saved_anchor = os.environ.get("FLUXON_TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS")
+    with tempfile.TemporaryDirectory(prefix="test_selection_supervisor_log_roll_") as td:
+        root = Path(td)
+        supervisor_path = _write_runtime_script(root)
+        child_path = root / "child.py"
+        child_path.write_text(
+            "import sys, time\n"
+            "print('[ops-log-mgmt][phase=before] ts=' + str(int(time.time())), flush=True)\n"
+            "time.sleep(11)\n"
+            "print('[ops-log-mgmt][phase=after] ts=' + str(int(time.time())), flush=True)\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        anchor = str(int(time.time()) - 2)
+        os.environ["FLUXON_TEST_LOG_SHARD_WINDOW_SECONDS"] = "10"
+        os.environ["FLUXON_TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS"] = anchor
+        label = "DaemonSet/test-log-roll"
+        child_argv = [sys.executable, str(child_path)]
+        base_log_path = root / "test-log-roll.log"
+        stale_shard = root / "test-log-roll.2025-12-01.log"
+        stale_shard.write_text("stale\n", encoding="utf-8")
+        supervisor = _run_supervisor_command(
+            supervisor_path=supervisor_path,
+            label=label,
+            owner_ts_ms=1,
+            state_json=json.dumps(
+                {
+                    "kind": "DaemonSet",
+                    "name": "test-log-roll",
+                    "service_name": "test-log-roll",
+                    "argv": child_argv,
+                    "cwd": str(root),
+                    "log_path": str(base_log_path),
+                },
+                sort_keys=True,
+            ),
+            child_argv=child_argv,
+            cwd=root,
+        )
+        try:
+            _wait_until_present(module, label)
+            first_shard = root / "test-log-roll.2026-01-01.log"
+            second_shard = root / "test-log-roll.2026-01-02.log"
+            deadline = time.time() + 20.0
+            while time.time() < deadline:
+                if first_shard.exists() and second_shard.exists():
+                    first_text = first_shard.read_text(encoding="utf-8", errors="replace")
+                    second_text = second_shard.read_text(encoding="utf-8", errors="replace")
+                    if "[ops-log-mgmt][phase=before]" in first_text and "[ops-log-mgmt][phase=after]" in second_text:
+                        break
+                time.sleep(0.2)
+            assert first_shard.exists(), first_shard
+            assert second_shard.exists(), second_shard
+            assert not stale_shard.exists(), stale_shard
+            shard_names = sorted(path.name for path in root.glob("test-log-roll.*.log"))
+            assert shard_names == ["test-log-roll.2026-01-01.log", "test-log-roll.2026-01-02.log"], shard_names
+            first_text = first_shard.read_text(encoding="utf-8", errors="replace")
+            second_text = second_shard.read_text(encoding="utf-8", errors="replace")
+            assert "[ops-log-mgmt][phase=before]" in first_text, first_text
+            assert "[ops-log-mgmt][phase=after]" not in first_text, first_text
+            assert "[ops-log-mgmt][phase=after]" in second_text, second_text
+            assert "[ops-log-mgmt][phase=before]" not in second_text, second_text
+        finally:
+            _terminate_process(supervisor)
+            if saved_window is None:
+                os.environ.pop("FLUXON_TEST_LOG_SHARD_WINDOW_SECONDS", None)
+            else:
+                os.environ["FLUXON_TEST_LOG_SHARD_WINDOW_SECONDS"] = saved_window
+            if saved_anchor is None:
+                os.environ.pop("FLUXON_TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS", None)
+            else:
+                os.environ["FLUXON_TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS"] = saved_anchor
+
+
 def test_selection_present_checks_all_live_supervisors() -> None:
     module = _load_runtime_module()
     label = "DaemonSet/test-present-any-live-child"
@@ -569,7 +752,9 @@ def test_selection_present_checks_all_live_supervisors() -> None:
     original_iter_live_supervisors = module._iter_live_supervisors
     original_count_pid_tree_members = module._count_pid_tree_members
     try:
-        module._iter_live_supervisors = lambda current_label=None: [stale_new, old_live] if current_label == label else []
+        module._iter_live_supervisors = (
+            lambda current_label=None, scope_key=None: [stale_new, old_live] if current_label == label else []
+        )
         module._count_pid_tree_members = lambda pid: {11: 1, 22: 2}[pid]
         assert module._selection_present(label) is True
     finally:
@@ -1135,7 +1320,7 @@ def test_retire_adopted_children_stops_live_roots() -> None:
     calls: List[tuple[str, object]] = []
     try:
         module._direct_live_child_pids = lambda pid: [41, 42] if pid == module.os.getpid() else []
-        module._iter_live_supervisors = lambda label=None: []
+        module._iter_live_supervisors = lambda label=None, scope_key=None: []
         module._stop_pid_tree_batch = lambda roots, label: calls.append(("stop", (list(roots), label)))
         module._reap_terminated_children = lambda: [(41, 0), (42, 0)]
         module._log_reaped_children = lambda **kwargs: calls.append(("reap", kwargs))
@@ -1160,7 +1345,7 @@ def test_retire_adopted_children_preserves_live_supervisor_roots() -> None:
     calls: List[tuple[str, object]] = []
     try:
         module._direct_live_child_pids = lambda pid: [41, 42] if pid == module.os.getpid() else []
-        module._iter_live_supervisors = lambda label=None: [
+        module._iter_live_supervisors = lambda label=None, scope_key=None: [
             module.LiveSupervisor(
                 process_info=module.ProcessInfo(pid=42, ppid=module.os.getpid(), pgid=42, state="S", start_time_ticks=1),
                 owner_ts_ms=7,

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Canvas Tidy Selection v1"
+  short_description: "Canvas Tidy Selection v1"
+  default_prompt: "Use $canvas-tidy_selection-v1."
+policy:
+  allow_implicit_invocation: false

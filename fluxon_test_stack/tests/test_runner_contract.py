@@ -59,6 +59,10 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
             "ci_top_attention_doc_page_build_declares_setup_dev_env_prepare",
             test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare,
         ),
+        (
+            "ci_top_attention_log_mgmt_scene_exists",
+            test_ci_top_attention_log_mgmt_scene_exists,
+        ),
     ]
     if selected_test_id is None:
         return checks
@@ -245,6 +249,52 @@ def test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare() -> Non
         )
         return
     print("PASS: test_ci_top_attention_doc_page_build_declares_setup_dev_env_prepare")
+
+
+def test_ci_top_attention_log_mgmt_scene_exists() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
+    suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(suite_cfg, dict):
+        print("FAIL: test_ci_top_attention_log_mgmt_scene_exists - suite config is not a mapping")
+        return
+
+    suite_for_contract = copy.deepcopy(suite_cfg)
+    artifact_sets = suite_for_contract.get("artifact_sets")
+    if not isinstance(artifact_sets, dict):
+        print("FAIL: test_ci_top_attention_log_mgmt_scene_exists - artifact_sets is not a mapping")
+        return
+    for artifact_set in artifact_sets.values():
+        if not isinstance(artifact_set, dict):
+            continue
+        release_artifacts = artifact_set.get("release_artifacts")
+        if isinstance(release_artifacts, dict):
+            python_wheel = release_artifacts.get("python_wheel")
+            if isinstance(python_wheel, str) and python_wheel.strip():
+                artifact_set["release_artifacts"] = {"wheel": python_wheel}
+
+    suite = _TEST_RUNNER._parse_suite_config(suite_for_contract)
+    scene = suite.scenes.get("ci_top_attention_log_mgmt")
+    if not isinstance(scene, dict):
+        print("FAIL: test_ci_top_attention_log_mgmt_scene_exists - missing scene")
+        return
+    ci = scene.get("ci")
+    if not isinstance(ci, dict):
+        print("FAIL: test_ci_top_attention_log_mgmt_scene_exists - scene.ci missing")
+        return
+    if ci.get("subject") != "rust":
+        print(
+            "FAIL: test_ci_top_attention_log_mgmt_scene_exists - "
+            f"expected subject 'rust', got {ci.get('subject')!r}"
+        )
+        return
+    if ci.get("runtime_contract") != "rust_self_managed":
+        print(
+            "FAIL: test_ci_top_attention_log_mgmt_scene_exists - "
+            f"expected runtime_contract 'rust_self_managed', got {ci.get('runtime_contract')!r}"
+        )
+        return
+    print("PASS: test_ci_top_attention_log_mgmt_scene_exists")
 
 
 if __name__ == "__main__":

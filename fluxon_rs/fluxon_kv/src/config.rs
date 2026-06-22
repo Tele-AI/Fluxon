@@ -379,6 +379,17 @@ fn cluster_scoped_shared_path(root: &str, cluster_name: &str) -> KvResult<String
     Ok(scoped.to_string_lossy().into_owned())
 }
 
+fn verify_non_empty_root_path(root: &str, field_name: &str) -> KvResult<String> {
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: format!("{field_name} cannot be empty"),
+        }
+        .into_kverror());
+    }
+    Ok(trimmed.to_string())
+}
+
 fn resolve_compiled_rdma_transfer_engine() -> KvResult<TransferEngineType> {
     Ok(TransferEngineType::Closed)
 }
@@ -552,11 +563,20 @@ pub struct FluxonKvSpecYaml {
     pub shared_memory_path: String,
     pub shared_file_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub large_file_paths: Option<LargeFilePathsYaml>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub p2p_listen_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redis_compat: Option<YamlNullable<RedisCompatConfigYaml>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub_cluster: Option<YamlNullable<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LargeFilePathsYaml {
+    pub log_root_path: String,
+    pub cache_root_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -608,6 +628,12 @@ pub struct FluxonKvSpec {
     pub sub_cluster: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LargeFilePaths {
+    pub log_root_path: String,
+    pub cache_root_path: String,
+}
+
 /// KV client backend types supported by the system
 #[derive(Debug, Clone, PartialEq)]
 pub enum KvClientType {
@@ -627,6 +653,7 @@ pub struct ClientConfig {
     pub fluxonkv_spec: FluxonKvSpec,
     pub shared_memory_path: String, // Mandatory shared memory path
     pub shared_file_path: String,   // Mandatory shared file path
+    pub large_file_paths: LargeFilePaths, // Mandatory large-file roots for logs and caches
     pub test_spec_config: TestSpecConfig,
 }
 
@@ -893,7 +920,7 @@ impl ClientConfigYaml {
             .into_kverror());
         }
 
-        // External (zero-contribution) mode forbids additional knobs to keep the schema minimal.
+        // External (zero-contribution) mode forbids additional owner-derived knobs to keep the schema minimal.
         if is_external {
             if self.fluxonkv_spec.redis_compat.is_some() {
                 return Err(ConfigError::InvalidClientConfig {
@@ -911,6 +938,12 @@ impl ClientConfigYaml {
             if self.fluxonkv_spec.etcd_addresses.is_some() {
                 return Err(ConfigError::InvalidClientConfig {
                     detail: "fluxonkv_spec.etcd_addresses is forbidden in zero-contribution mode (it is bootstrapped from owner shared.json)".to_string(),
+                }
+                .into_kverror());
+            }
+            if self.fluxonkv_spec.large_file_paths.is_some() {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode (it is inherited from owner shared.json)".to_string(),
                 }
                 .into_kverror());
             }
@@ -1053,6 +1086,32 @@ impl ClientConfigYaml {
             }
             .into_kverror());
         }
+        let large_file_paths = if is_external {
+            LargeFilePaths {
+                log_root_path: String::new(),
+                cache_root_path: String::new(),
+            }
+        } else {
+            let Some(large_file_paths_yaml) = self.fluxonkv_spec.large_file_paths.as_ref() else {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "fluxonkv_spec.large_file_paths is required for owner mode"
+                        .to_string(),
+                }
+                .into_kverror());
+            };
+            let log_root_path = verify_non_empty_root_path(
+                &large_file_paths_yaml.log_root_path,
+                "large_file_paths.log_root_path",
+            )?;
+            let cache_root_path = verify_non_empty_root_path(
+                &large_file_paths_yaml.cache_root_path,
+                "large_file_paths.cache_root_path",
+            )?;
+            LargeFilePaths {
+                log_root_path,
+                cache_root_path,
+            }
+        };
 
         let shared_memory_path = cluster_scoped_shared_path(
             &self.fluxonkv_spec.shared_memory_path,
@@ -1062,7 +1121,6 @@ impl ClientConfigYaml {
             &self.fluxonkv_spec.shared_file_path,
             &fluxonkv_spec.cluster_name,
         )?;
-
         let redis_compat_listen_addr = match self.fluxonkv_spec.redis_compat.as_ref() {
             None | Some(YamlNullable::Null) => None,
             Some(YamlNullable::Value(rc)) => {
@@ -1094,6 +1152,7 @@ impl ClientConfigYaml {
             fluxonkv_spec,
             shared_memory_path,
             shared_file_path,
+            large_file_paths,
             test_spec_config,
         })
     }
@@ -1434,6 +1493,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   sub_cluster: rack-a
 test_spec_config:
   disable_observability: true
@@ -1480,6 +1542,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   sub_cluster: rack-a
 "#,
         )
@@ -1490,6 +1555,45 @@ fluxonkv_spec:
             Some(TestSpecTransportMode::TransferWithRpc)
         );
         assert!(verified.fluxonkv_spec.enable_transfer_rpc_fast_path);
+    }
+
+    #[test]
+    fn client_config_zero_contribution_allows_owner_bootstrapped_large_file_paths() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_external
+fluxonkv_spec:
+  cluster_name: test_cluster
+  shared_memory_path: /tmp/test_external
+  shared_file_path: /tmp/test_external_files
+"#,
+        )
+        .unwrap();
+        let verified = cfg.verify().unwrap();
+        assert_eq!(verified.large_file_paths.log_root_path, "");
+        assert_eq!(verified.large_file_paths.cache_root_path, "");
+        assert_eq!(verified.fluxonkv_spec.etcd_addresses, Vec::<String>::new());
+        assert_eq!(verified.fluxonkv_spec.sub_cluster, None);
+    }
+
+    #[test]
+    fn client_config_zero_contribution_rejects_large_file_paths_in_yaml() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_external
+fluxonkv_spec:
+  cluster_name: test_cluster
+  shared_memory_path: /tmp/test_external
+  shared_file_path: /tmp/test_external_files
+  large_file_paths:
+    log_root_path: /tmp/test_external_logs
+    cache_root_path: /tmp/test_external_cache
+"#,
+        )
+        .unwrap();
+        let err = cfg.verify().unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode"));
     }
 
     #[test]
@@ -1505,6 +1609,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc
@@ -1558,6 +1665,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   sub_cluster: rack-a
 test_spec_config:
   rdma_device_names: ["mlx5_0"]
@@ -1593,6 +1703,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc
@@ -1624,6 +1737,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   sub_cluster: rack-a
 test_spec_config:
   require_transfer_rpc_fast_path_ready_timeout_seconds: 45
@@ -1649,6 +1765,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   sub_cluster: rack-a
 test_spec_config:
   tcp_thread_control_lane_count: 0
@@ -1675,6 +1794,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc
@@ -1706,6 +1828,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc
@@ -1730,6 +1855,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   sub_cluster: rack-a
 test_spec_config:
   rdma_device_names: ["mlx5_0"]
@@ -1784,6 +1912,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_side_worker
   shared_file_path: /tmp/test_side_worker_files
+  large_file_paths:
+    log_root_path: /tmp/test_side_worker_logs
+    cache_root_path: /tmp/test_side_worker_cache
   p2p_listen_port: 18081
 test_spec_config:
   enable_side_transfer: true
@@ -1823,6 +1954,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_side_worker
   shared_file_path: /tmp/test_side_worker_files
+  large_file_paths:
+    log_root_path: /tmp/test_side_worker_logs
+    cache_root_path: /tmp/test_side_worker_cache
 test_spec_config:
   enable_side_transfer: true
   side_transfer_role: worker
@@ -1854,6 +1988,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_side_worker
   shared_file_path: /tmp/test_side_worker_files
+  large_file_paths:
+    log_root_path: /tmp/test_side_worker_logs
+    cache_root_path: /tmp/test_side_worker_cache
 test_spec_config:
   enable_side_transfer: true
   side_transfer_role: worker
@@ -1883,6 +2020,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   p2p_listen_port: 18081
   sub_cluster: rack-a
 test_spec_config:
@@ -1915,6 +2055,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   sub_cluster: rack-a
 "#,
         )
@@ -1940,6 +2083,9 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
+  large_file_paths:
+    log_root_path: /tmp/test_owner_logs
+    cache_root_path: /tmp/test_owner_cache
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc

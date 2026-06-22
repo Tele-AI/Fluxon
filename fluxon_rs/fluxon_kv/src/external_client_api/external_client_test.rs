@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::cluster_manager::NodeID;
 use crate::config::{
-    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig, MonitoringConfig,
-    ProtocolConfig, ProtocolType, TestSpecConfig, TransferEngineType,
+    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, LargeFilePaths, MasterConfig,
+    MonitoringConfig, ProtocolConfig, ProtocolType, TestSpecConfig, TransferEngineType,
 };
 use crate::master_kv_router::MasterKvRouterView;
 use crate::{ConfigArg, run_client, run_master};
@@ -82,6 +82,10 @@ fn new_client_config(
         },
         shared_memory_path: shm_path.to_string(),
         shared_file_path: format!("{}_files", shm_path),
+        large_file_paths: LargeFilePaths {
+            log_root_path: format!("{}_logs", shm_path),
+            cache_root_path: format!("{}_cache", shm_path),
+        },
         test_spec_config: TestSpecConfig::default(),
     }
 }
@@ -124,6 +128,10 @@ fn new_zero_contribution_client_config(
         },
         shared_memory_path: shm_path.to_string(),
         shared_file_path: format!("{}_files", shm_path),
+        large_file_paths: LargeFilePaths {
+            log_root_path: String::new(),
+            cache_root_path: String::new(),
+        },
         test_spec_config: TestSpecConfig::default(),
     }
 }

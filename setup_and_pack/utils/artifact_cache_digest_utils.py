@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import enum
+import fnmatch
 import hashlib
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Collection, Iterator, Sequence
@@ -19,6 +21,7 @@ __all__ = [
     "ArtifactCheck",
     "ArtifactRule",
     "tarball_rule",
+    "prune_stage_paths",
     "build_cached_tarball",
     "rsync_stage",
     "tar_gz",
@@ -114,7 +117,14 @@ def build_cached_tarball(*, rule: ArtifactRule, out_path: Path, build_tarball: C
     rule.write_stamp(check.digest)
 
 
-def rsync_stage(*, repo_root: Path, src: Path, dst: Path, honor_gitignore: bool) -> None:
+def rsync_stage(
+    *,
+    repo_root: Path,
+    src: Path,
+    dst: Path,
+    honor_gitignore: bool,
+    exclude_rel_paths: tuple[str, ...] = (),
+) -> None:
     if not src.exists():
         print(f"Missing required source path for staging: {src}")
         raise SystemExit(1)
@@ -132,11 +142,28 @@ def rsync_stage(*, repo_root: Path, src: Path, dst: Path, honor_gitignore: bool)
             "--exclude-from=.gitignore",
             "--filter=:- .gitignore",
         ]
+    for pattern in exclude_rel_paths:
+        argv.append(f"--exclude={pattern}")
     if src.is_dir():
         argv += [str(src) + "/", str(dst) + "/"]
     else:
         argv += [str(src), str(dst)]
     run_cmd_argv(argv, cwd=repo_root)
+
+
+def prune_stage_paths(stage_root: Path, exclude_rel_paths: tuple[str, ...]) -> None:
+    if not stage_root.exists():
+        return
+    for path in sorted(stage_root.rglob("*"), reverse=True):
+        rel_path = path.relative_to(stage_root).as_posix()
+        for pattern in exclude_rel_paths:
+            normalized_pattern = pattern.rstrip("/")
+            if fnmatch.fnmatch(rel_path, normalized_pattern) or fnmatch.fnmatch(path.name, normalized_pattern):
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+                break
 
 
 def tar_gz(

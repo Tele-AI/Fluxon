@@ -53,6 +53,10 @@ def main() -> None:
         raw_path=Path(args.workdir),
         field_name="workdir",
     )
+    test_runner._redirect_process_stdio_to_log(
+        workdir_root,
+        filename="test_runner_ui.log",
+    )
     gitops_cfg_path = None
     if args.gitops_config:
         gitops_cfg_path = test_runner._resolve_repo_root_cli_path(

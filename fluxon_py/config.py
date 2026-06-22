@@ -110,6 +110,9 @@ fluxonkv_spec:                        # fluxon kv specific config (dict(optional
   cluster_name:                       # Cluster name (str)
   shared_memory_path:                 # Shared memory path (str)
   shared_file_path:                   # Shared file path for shared.json/logs/profiles (str)
+  large_file_paths:                   # Owner-mode large file roots (dict(optional))
+    log_root_path:                    # Log root path for owner/client large-file outputs (str)
+    cache_root_path:                  # Cache root path for owner/client large-file outputs (str)
   p2p_listen_port:                    # P2P QUIC listen port override (int(optional))
   redis_compat:                       # Enable Redis protocol shim (dict(optional))
     listen_addr:                      # TCP listen addr, e.g. "127.0.0.1:16379" (str)
@@ -583,6 +586,18 @@ class FluxonKvClientConfig():
                     raise ValueError(f"fluxonkv_spec.{k} is forbidden in zero-contribution mode")
 
             return yaml.safe_dump(cfg, sort_keys=False)
+
+        if "large_file_paths" not in spec:
+            raise ValueError("fluxonkv_spec.large_file_paths is required for owner mode")
+        large_file_paths = spec.get("large_file_paths")
+        if not isinstance(large_file_paths, dict):
+            raise ValueError("fluxonkv_spec.large_file_paths must be a mapping in owner mode")
+        for field_name in ("log_root_path", "cache_root_path"):
+            field_value = large_file_paths.get(field_name)
+            if not isinstance(field_value, str) or not field_value.strip():
+                raise ValueError(
+                    f"fluxonkv_spec.large_file_paths.{field_name} must be a non-empty string in owner mode"
+                )
 
         return yaml.safe_dump(cfg, sort_keys=False)
     

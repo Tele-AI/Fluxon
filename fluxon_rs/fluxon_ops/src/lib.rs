@@ -28,7 +28,8 @@ use fluxon_kv::{ConfigArg, Framework, run_client};
 
 use fluxon_proxy::{HeaderKv, PanelProxyMethod, PanelProxyResp};
 use fluxon_util::{
-    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
+    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, display_runtime_log_path,
+    fluxon_cli_proxy_desc_etcd_key_v2, resolve_readable_log_path,
 };
 
 pub const OPS_SERVICE_NAME: &str = "ops";
@@ -57,6 +58,7 @@ const OPS_ATOMIC_GROUP_ANNOTATION_KEY: &str = "fluxon.io/atomic_group";
 const OPS_ATOMIC_GROUP_PHASE_ANNOTATION_KEY: &str = "fluxon.io/atomic_group_phase";
 const OPS_ATOMIC_GROUP_ORDER_ANNOTATION_KEY: &str = "fluxon.io/atomic_group_order";
 const OPS_SELECTION_SUPERVISOR_FILENAME: &str = "selection_supervisor.py";
+const OPS_LOG_SHARD_HELPER_FILENAME: &str = "log_shard.py";
 const OPS_SELECTION_SUPERVISOR_DIR_NAME: &str = "selection_supervisor";
 const OPS_SELECTION_SUPERVISOR_RUN_RESTART_DELAY_SECONDS: u64 = 5;
 const OPS_SELECTION_SUPERVISOR_RUN_MAX_BACKOFF_SECONDS: u64 = 30;
@@ -78,6 +80,7 @@ const DELETE_APPLY_NO_WAIT_DELAY_SECONDS: u64 = 30;
 
 const EMBEDDED_SELECTION_SUPERVISOR_SOURCE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/selection_supervisor.py"));
+const EMBEDDED_LOG_SHARD_HELPER_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/log_shard.py"));
 
 // Ops controller uses Fluxon user-RPC to talk to ops agents.
 // Keep the timeout as a fixed constant to avoid config surface area.
@@ -970,7 +973,7 @@ fn resolve_python_host_executable(python_exe: &Path) -> anyhow::Result<PathBuf> 
     Ok(resolved)
 }
 
-fn ensure_embedded_selection_supervisor(workdir: &Path) -> anyhow::Result<PathBuf> {
+fn ensure_embedded_selection_supervisor_runtime(workdir: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     let runtime_dir = workdir.join(OPS_SELECTION_SUPERVISOR_DIR_NAME);
     std::fs::create_dir_all(&runtime_dir).with_context(|| {
         format!(
@@ -979,6 +982,7 @@ fn ensure_embedded_selection_supervisor(workdir: &Path) -> anyhow::Result<PathBu
         )
     })?;
     let script_path = runtime_dir.join(OPS_SELECTION_SUPERVISOR_FILENAME);
+    let helper_path = runtime_dir.join(OPS_LOG_SHARD_HELPER_FILENAME);
     let should_write = match std::fs::read_to_string(&script_path) {
         Ok(existing) => existing != EMBEDDED_SELECTION_SUPERVISOR_SOURCE,
         Err(e) => {
@@ -988,6 +992,19 @@ fn ensure_embedded_selection_supervisor(workdir: &Path) -> anyhow::Result<PathBu
                 return Err(anyhow::Error::new(e).context(format!(
                     "read embedded selection supervisor failed: {}",
                     script_path.display()
+                )));
+            }
+        }
+    };
+    let should_write_helper = match std::fs::read_to_string(&helper_path) {
+        Ok(existing) => existing != EMBEDDED_LOG_SHARD_HELPER_SOURCE,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                true
+            } else {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "read embedded log shard helper failed: {}",
+                    helper_path.display()
                 )));
             }
         }
@@ -1019,13 +1036,21 @@ fn ensure_embedded_selection_supervisor(workdir: &Path) -> anyhow::Result<PathBu
             })?;
         }
     }
-    Ok(script_path)
+    if should_write_helper {
+        std::fs::write(&helper_path, EMBEDDED_LOG_SHARD_HELPER_SOURCE).with_context(|| {
+            format!(
+                "write embedded log shard helper failed: {}",
+                helper_path.display()
+            )
+        })?;
+    }
+    Ok((script_path, helper_path))
 }
 
 impl SelectionSupervisorRuntime {
     fn materialize(workdir: &Path, hostworkdir: &Path, python_exe: &Path) -> anyhow::Result<Self> {
         let python_exe = resolve_python_host_executable(python_exe)?;
-        let script_path = ensure_embedded_selection_supervisor(workdir)?;
+        let (script_path, _helper_path) = ensure_embedded_selection_supervisor_runtime(workdir)?;
         if !hostworkdir.is_absolute() {
             anyhow::bail!(
                 "hostworkdir must be absolute for shared selection supervisor runtime: {}",
@@ -1647,7 +1672,9 @@ fn selection_status_from_live_supervisor(
         apply_id: runtime_state.as_ref().and_then(|v| v.apply_id.clone()),
         argv: runtime_state.as_ref().map(|v| v.argv.clone()),
         cwd: runtime_state.as_ref().and_then(|v| v.cwd.clone()),
-        log_path: runtime_state.as_ref().map(|v| v.log_path.clone()),
+        log_path: runtime_state
+            .as_ref()
+            .map(|v| display_runtime_log_path(v.log_path.as_str())),
         started_ts_ms: None,
         owner_ts_ms: Some(supervisor.owner_ts_ms),
         supervisor_start_time_ticks: Some(supervisor.start_time_ticks()),
@@ -2970,7 +2997,8 @@ impl UserRpcHandler for ReadWorkloadLogChunkHandler {
             }
         };
 
-        let path = self.log_dir.join(log_filename);
+        let logical_path = self.log_dir.join(log_filename);
+        let path = resolve_readable_log_path(&logical_path).unwrap_or(logical_path.clone());
         let meta = match std::fs::metadata(&path) {
             Ok(v) => v,
             Err(e) => {
@@ -3773,8 +3801,12 @@ fn desired_workload_matches_running(
     workloads: &SupervisorBackedWorkloads,
     desired: &AgentDesiredWorkload,
 ) -> bool {
-    let _ = workloads;
-    let Ok(status) = observe_selection_status(desired.kind, &desired.name, &desired.authority)
+    let Ok(status) = observe_selection_status_for_scope(
+        desired.kind,
+        &desired.name,
+        &desired.authority,
+        Some(workloads.scope_key.as_str()),
+    )
     else {
         return false;
     };
@@ -3854,7 +3886,6 @@ fn desired_workload_recovery_superseded(
     workloads: &SupervisorBackedWorkloads,
     desired: &AgentDesiredWorkload,
 ) -> anyhow::Result<bool> {
-    let _ = workloads;
     // English note:
     // - A newer apply-owned generation overlapping an older applyless bare owner is the expected
     //   phase-1 state of the self-host two-phase handover.
@@ -3863,7 +3894,12 @@ fn desired_workload_recovery_superseded(
     //   phase 2 has a chance to cut over.
     // - Only an owner_ts that is newer than the requested workload and is not this intentional
     //   phase-1 overlap is treated as a hard superseding fact.
-    let status = observe_selection_status(desired.kind, &desired.name, &desired.authority)?;
+    let status = observe_selection_status_for_scope(
+        desired.kind,
+        &desired.name,
+        &desired.authority,
+        Some(workloads.scope_key.as_str()),
+    )?;
     if phase1_overlap_with_applyless_owner(&status, desired) {
         return Ok(false);
     }
@@ -13939,6 +13975,90 @@ mod tests {
     }
 
     #[test]
+    fn live_selection_supervisors_isolate_same_label_collision_by_scope_key() {
+        let snapshot = SelectionSupervisorProcSnapshot {
+            infos_by_pid: std::collections::HashMap::from([
+                (
+                    11,
+                    ProcessInfoObservation {
+                        pid: 11,
+                        ppid: 1,
+                        pgid: 11,
+                        state: 'S',
+                        start_time_ticks: 100,
+                    },
+                ),
+                (
+                    22,
+                    ProcessInfoObservation {
+                        pid: 22,
+                        ppid: 1,
+                        pgid: 22,
+                        state: 'S',
+                        start_time_ticks: 200,
+                    },
+                ),
+            ]),
+            children_by_ppid: std::collections::HashMap::new(),
+            cmdlines: vec![
+                (
+                    11,
+                    vec![
+                        "/usr/bin/python3".to_string(),
+                        "selection_supervisor.py".to_string(),
+                        "run".to_string(),
+                        "--label".to_string(),
+                        "DaemonSet/target".to_string(),
+                        "--scope-key".to_string(),
+                        "/tmp/scope-a".to_string(),
+                        "--owner-ts-ms".to_string(),
+                        "2".to_string(),
+                    ],
+                ),
+                (
+                    22,
+                    vec![
+                        "/usr/bin/python3".to_string(),
+                        "selection_supervisor.py".to_string(),
+                        "run".to_string(),
+                        "--label".to_string(),
+                        "DaemonSet/target".to_string(),
+                        "--scope-key".to_string(),
+                        "/tmp/scope-b".to_string(),
+                        "--owner-ts-ms".to_string(),
+                        "2".to_string(),
+                    ],
+                ),
+            ],
+            zombie_infos: Vec::new(),
+        };
+
+        let scoped_a =
+            live_selection_supervisors(&snapshot, Some("DaemonSet/target"), Some("/tmp/scope-a"))
+                .unwrap();
+        assert_eq!(scoped_a.len(), 1);
+        assert_eq!(scoped_a[0].pid(), 11);
+
+        let scoped_b =
+            live_selection_supervisors(&snapshot, Some("DaemonSet/target"), Some("/tmp/scope-b"))
+                .unwrap();
+        assert_eq!(scoped_b.len(), 1);
+        assert_eq!(scoped_b[0].pid(), 22);
+
+        let listed_a = observe_all_selection_statuses_for_snapshot(&snapshot, Some("/tmp/scope-a"))
+            .unwrap();
+        assert_eq!(listed_a.len(), 1);
+        assert_eq!(listed_a[0].label, "DaemonSet/target");
+        assert_eq!(listed_a[0].pid, Some(11));
+
+        let listed_b = observe_all_selection_statuses_for_snapshot(&snapshot, Some("/tmp/scope-b"))
+            .unwrap();
+        assert_eq!(listed_b.len(), 1);
+        assert_eq!(listed_b[0].label, "DaemonSet/target");
+        assert_eq!(listed_b[0].pid, Some(22));
+    }
+
+    #[test]
     fn live_selection_supervisors_reject_matching_legacy_entry_without_owner_ts_ms() {
         let snapshot = SelectionSupervisorProcSnapshot {
             infos_by_pid: std::collections::HashMap::from([(
@@ -14406,6 +14526,95 @@ mod tests {
     }
 
     #[test]
+    fn materialize_selection_supervisor_runtime_writes_log_shard_helper() {
+        let python_exe = PathBuf::from("/usr/bin/python3");
+        assert!(
+            python_exe.is_file(),
+            "python executable does not exist: {}",
+            python_exe.display()
+        );
+        let workdir = tempfile::tempdir().unwrap();
+        let runtime =
+            SelectionSupervisorRuntime::materialize(workdir.path(), workdir.path(), python_exe.as_path())
+                .unwrap();
+        assert!(runtime.script_path.exists());
+        assert!(
+            runtime
+                .script_path
+                .parent()
+                .unwrap()
+                .join(OPS_LOG_SHARD_HELPER_FILENAME)
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn detached_selection_supervisor_preserves_early_startup_logs() {
+        let python_exe = PathBuf::from("/usr/bin/python3");
+        assert!(
+            python_exe.is_file(),
+            "python executable does not exist: {}",
+            python_exe.display()
+        );
+        let workdir = tempfile::tempdir().unwrap();
+        let runtime =
+            SelectionSupervisorRuntime::materialize(workdir.path(), workdir.path(), python_exe.as_path())
+                .unwrap();
+        let log_path = workdir.path().join("startup.log");
+        let command = vec![
+            python_exe.display().to_string(),
+            runtime.script_path.display().to_string(),
+            "run".to_string(),
+            "--label".to_string(),
+            "Deployment/startup_demo".to_string(),
+            "--scope-key".to_string(),
+            workdir.path().display().to_string(),
+            "--owner-ts-ms".to_string(),
+            "0".to_string(),
+            "--restart-policy".to_string(),
+            "always".to_string(),
+            "--restart-delay-seconds".to_string(),
+            "5".to_string(),
+            "--max-backoff-seconds".to_string(),
+            "30".to_string(),
+            "--crashloop-consecutive-restarts".to_string(),
+            "0".to_string(),
+            "--crashloop-interval-lt-seconds".to_string(),
+            "0".to_string(),
+            "--".to_string(),
+            "/bin/true".to_string(),
+        ];
+        let pid = runtime.spawn_detached_command(&log_path, command.as_slice()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let expected = "owner-ts-ms must be positive";
+        let mut saw_expected = false;
+        while Instant::now() < deadline {
+            if let Some(path) = resolve_readable_log_path(&log_path) {
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                if text.contains(expected) {
+                    saw_expected = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if let Some(path) = resolve_readable_log_path(&log_path) {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            assert!(
+                text.contains(expected),
+                "expected detached supervisor startup logs to reach runtime log, got: {text:?}"
+            );
+        } else {
+            panic!("runtime log path did not materialize");
+        }
+        assert!(saw_expected, "startup log was not observed before timeout");
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+    }
+
+    #[test]
     fn atomic_group_non_agent_requires_present_before_running_match() {
         let desired = AgentDesiredWorkload {
             kind: WorkloadKind::DaemonSet,
@@ -14615,5 +14824,26 @@ mod tests {
             status_hint: None,
         };
         assert!(!phase1_overlap_with_applyless_owner(&status, &desired));
+    }
+
+    #[test]
+    fn resolve_readable_log_path_prefers_latest_daily_shard() {
+        let td = tempfile::tempdir().unwrap();
+        let base_path = td.path().join("workload__Deployment__demo.log");
+        std::fs::write(
+            td.path().join("workload__Deployment__demo.2026-06-19.log"),
+            "old\n",
+        )
+        .unwrap();
+        std::fs::write(
+            td.path().join("workload__Deployment__demo.2026-06-20.log"),
+            "new\n",
+        )
+        .unwrap();
+        let resolved = resolve_readable_log_path(&base_path).unwrap();
+        assert_eq!(
+            resolved.file_name().and_then(|v| v.to_str()),
+            Some("workload__Deployment__demo.2026-06-20.log")
+        );
     }
 }

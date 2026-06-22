@@ -14,6 +14,10 @@ LIB_LAYOUT_PATH = REPO_ROOT / "setup_and_pack" / "nix" / "lib_layout.py"
 
 
 def _load_lib_layout():
+    repo_root_str = str(REPO_ROOT)
+    if repo_root_str in sys.path:
+        sys.path.remove(repo_root_str)
+    sys.path.insert(0, repo_root_str)
     spec = importlib.util.spec_from_file_location("setup_and_pack_nix_lib_layout_test", LIB_LAYOUT_PATH)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -83,14 +87,17 @@ class ApplyLayoutTest(unittest.TestCase):
             self.assertTrue(workspace_seed_dir.is_dir())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/closed_sdk_contract.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/public_workspace_contract.py").is_file())
+            self.assertTrue((workspace_seed_dir / "README.md").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/fluxon_commu_contract/Cargo.toml").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/fluxon_commu/Cargo.toml").is_file())
+            self.assertTrue((workspace_seed_dir / "fluxon_rs/fluxon_ops/build.rs").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_release/closed_sdk/manifest.json").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/nix/pack_fluxonkv_pylib.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/nix/pack_release_in_container.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/utils/__init__.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/utils/sudo_prefix_utils.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/utils/wheel_runtime_helper.py").is_file())
+            self.assertTrue((workspace_seed_dir / "deployment/utils/log_shard.py").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/fluxon_kv/Cargo.toml").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/Cargo.lock").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/moka/Cargo.toml").is_file())

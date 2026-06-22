@@ -36,7 +36,12 @@ pub mod limitrate;
 // PyO3 helpers: run long-time Python call without holding GIL in caller thread.
 pub mod pyo3;
 // Re-export for stable public API: existing call sites can keep using `fluxon_util::init_log`.
-pub use log::{current_log_file_path, init_log, init_log_test, init_log_with_extra_layer};
+pub use log::{
+    current_daily_sharded_log_path, current_log_file_path, daily_sharded_log_path,
+    display_runtime_log_path, init_log, init_log_test, init_log_with_extra_layer,
+    latest_existing_daily_sharded_log_path, resolve_readable_log_path,
+    DEFAULT_DAILY_LOG_RETENTION_DAYS,
+};
 #[cfg(test)]
 mod test_util_test;
 

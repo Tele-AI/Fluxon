@@ -1,0 +1,57 @@
+{{ALL_NODES_BLOCK}}
+LOCAL_HOSTNAME=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)
+LOCAL_FQDN=$(hostname -f 2>/dev/null || echo "$LOCAL_HOSTNAME")
+NODE_ID="${NODE_ID:-}"
+if [ -n "$NODE_ID" ]; then
+  _node_id_known=false
+  for n in "${ALL_NODES[@]}"; do
+    if [ "$n" = "$NODE_ID" ]; then
+      _node_id_known=true
+      break
+    fi
+  done
+  if [ "$_node_id_known" != true ]; then
+    echo "Unknown preset NODE_ID: $NODE_ID"
+    echo "Known nodes: {{KNOWN_NODES}}"
+    exit 1
+  fi
+fi
+if [ -z "$NODE_ID" ]; then
+for n in "${ALL_NODES[@]}"; do
+  if [ "$n" = "$LOCAL_HOSTNAME" ] || [ "$n" = "$LOCAL_FQDN" ]; then
+    NODE_ID="$n"
+    break
+  fi
+done
+fi
+if [ -z "$NODE_ID" ] && [ ${#ALL_NODES[@]} -eq 1 ]; then
+  NODE_ID="${ALL_NODES[0]}"
+fi
+if [ -z "$NODE_ID" ]; then
+  for ip in $(hostname -I 2>/dev/null); do
+    for n in "${ALL_NODES[@]}"; do
+      _ip_n=""
+      case "$n" in
+{{IP_CASE_LINES}}
+        *) _ip_n="";;
+      esac
+      if [ "$_ip_n" = "$ip" ]; then
+        NODE_ID="$n"
+        break
+      fi
+    done
+    [ -n "$NODE_ID" ] && break
+  done
+fi
+if [ -z "$NODE_ID" ]; then
+  echo "Cannot map host to a configured node. Hostname=$LOCAL_HOSTNAME FQDN=$LOCAL_FQDN IPs=$(hostname -I 2>/dev/null)"
+  echo "Known nodes: {{KNOWN_NODES}}"
+  exit 1
+fi
+
+HOST_IP=""
+HOSTWORKDIR=""
+case "$NODE_ID" in
+{{HOST_CASE_LINES}}
+  *) echo "Unknown NODE_ID: $NODE_ID"; exit 1;;
+esac

@@ -47,6 +47,7 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("to_yaml_str_roundtrip", _run_test_to_yaml_str_roundtrip),
         ("fluxonkv_sub_cluster_config", test_fluxonkv_sub_cluster_config),
         ("fluxonkv_owner_requires_sub_cluster", test_fluxonkv_owner_requires_sub_cluster),
+        ("fluxonkv_owner_requires_large_file_paths", test_fluxonkv_owner_requires_large_file_paths),
         ("fluxonkv_p2p_relay_removed", test_fluxonkv_p2p_relay_removed),
         ("fluxon_client_config_yaml_shape", test_fluxon_client_config_yaml_shape),
         ("fluxonkv_protocol_field", test_fluxonkv_protocol_field),
@@ -268,6 +269,54 @@ def test_fluxonkv_owner_requires_sub_cluster():
         print("✅ PASS: test_fluxonkv_owner_requires_sub_cluster")
     except Exception as e:
         print(f"❌ FAIL: test_fluxonkv_owner_requires_sub_cluster - {e}")
+
+
+def test_fluxonkv_owner_requires_large_file_paths():
+    """Ensure owner mode requires explicit large_file_paths roots."""
+    try:
+        base = {
+            "instance_key": "test_instance",
+            "contribute_to_cluster_pool_size": {"dram": 16777216, "vram": {}},
+            "fluxonkv_spec": {
+                "etcd_addresses": ["localhost:2379"],
+                "cluster_name": "test_cluster",
+                "shared_memory_path": "/tmp/kvcache_shared_memory/test",
+                "shared_file_path": "/tmp/kvcache_shared_files/test",
+                "sub_cluster": "rack-a",
+            },
+        }
+
+        try:
+            FluxonKvClientConfig(copy.deepcopy(base)).to_fluxon_kv_client_config_yaml_str()
+            print("❌ FAIL: test_fluxonkv_owner_requires_large_file_paths - missing large_file_paths should be rejected")
+            return
+        except ValueError:
+            pass
+
+        invalid_blank = copy.deepcopy(base)
+        invalid_blank["fluxonkv_spec"]["large_file_paths"] = {
+            "log_root_path": "   ",
+            "cache_root_path": "/tmp/kvcache_large_cache/test",
+        }
+        try:
+            FluxonKvClientConfig(invalid_blank).to_fluxon_kv_client_config_yaml_str()
+            print("❌ FAIL: test_fluxonkv_owner_requires_large_file_paths - blank log_root_path should be rejected")
+            return
+        except ValueError:
+            pass
+
+        valid = copy.deepcopy(base)
+        valid["fluxonkv_spec"]["large_file_paths"] = {
+            "log_root_path": "/tmp/kvcache_large_logs/test",
+            "cache_root_path": "/tmp/kvcache_large_cache/test",
+        }
+        rendered = FluxonKvClientConfig(valid).to_fluxon_kv_client_config_yaml_str()
+        assert "large_file_paths:" in rendered
+        assert "log_root_path: /tmp/kvcache_large_logs/test" in rendered
+        assert "cache_root_path: /tmp/kvcache_large_cache/test" in rendered
+        print("✅ PASS: test_fluxonkv_owner_requires_large_file_paths")
+    except Exception as e:
+        print(f"❌ FAIL: test_fluxonkv_owner_requires_large_file_paths - {e}")
 
 
 def test_fluxonkv_p2p_relay_removed():

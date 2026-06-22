@@ -47,6 +47,7 @@ Entries:
 - `_fs_remote_mount.py`: heavier Fluxon FS remote mount integration coverage
 - `_test_stack_contract.py`: test-stack runner contract coverage
 - `_deployment_codegen.py`: deployment code generation coverage
+- `_log_mgmt.py`: shared-supervisor ops log rolling plus Rust KV log sharding coverage. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_log_mgmt` scene, and `test_runner.py` dispatches to it from the runner-native `top_attention` CI execution model.
 - `_script_tools.py`: script utility coverage
 - `_cargo_fs_core.py`: cargo tests for the Rust FS core crate
 - `_cargo_util.py`: cargo tests for the Rust util crate

@@ -1,0 +1,4 @@
+if ! wait_service_etcd_endpoint_healthy "$SERVICE" "$HOSTWORKDIR/fluxon_release/ext_images/etcd/etcdctl" "http://$HOST_IP:$SERVICE_PORT" {{ETCD_HEALTH_STABLE_SECONDS}} {{ETCD_HEALTH_DEADLINE_TS}} "{{CONTEXT}}"; then
+  echo "{{CONTEXT}} etcd-health failed svc=$SERVICE endpoint=http://$HOST_IP:$SERVICE_PORT"
+  exit 1
+fi

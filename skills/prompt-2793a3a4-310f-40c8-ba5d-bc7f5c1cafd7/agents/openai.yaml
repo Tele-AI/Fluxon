@@ -1,0 +1,6 @@
+interface:
+  display_name: "状态机正确性"
+  short_description: "状态机正确性"
+  default_prompt: "Use $prompt-2793a3a4-310f-40c8-ba5d-bc7f5c1cafd7."
+policy:
+  allow_implicit_invocation: false
