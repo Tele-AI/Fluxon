@@ -32,6 +32,22 @@ def parse_python_passthrough(description: str) -> tuple[str, list[str]]:
     return args.python, passthrough
 
 
+def strip_passthrough_case_config(passthrough: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    idx = 0
+    while idx < len(passthrough):
+        token = passthrough[idx]
+        if token == "--case-config":
+            idx += 2
+            continue
+        if token.startswith("--case-config="):
+            idx += 1
+            continue
+        out.append(token)
+        idx += 1
+    return out
+
+
 def run_pytest(description: str, paths: Iterable[str]) -> int:
     python, passthrough = parse_python_passthrough(description)
     return call([python, "-m", "pytest", *paths, *passthrough])

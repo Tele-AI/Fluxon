@@ -3,7 +3,13 @@ from __future__ import annotations
 
 import argparse
 
-from _common import REPO_ROOT, load_case_config, run_cargo, run_python_file
+from _common import (
+    REPO_ROOT,
+    load_case_config,
+    run_cargo,
+    run_python_file,
+    strip_passthrough_case_config,
+)
 
 
 TEST_REQUIREMENTS = ["cargo", "etcd", "ops", "submodules"]
@@ -21,11 +27,12 @@ def main() -> int:
     args, passthrough = parser.parse_known_args()
     if args.case_config:
         _ = load_case_config(args.case_config, expected_scene_id=SCENE_ID)
+    child_passthrough = tuple(strip_passthrough_case_config(passthrough))
 
     rc = run_python_file(
         "Flat index entry for ops/shared-supervisor log shard helper coverage.",
         "deployment/tests/test_log_shard.py",
-        extra_args=tuple(passthrough),
+        extra_args=child_passthrough,
     )
     if rc != 0:
         return rc
@@ -36,7 +43,7 @@ def main() -> int:
         rc = run_python_file(
             "Flat index entry for ops/shared-supervisor log routing coverage.",
             "deployment/tests/test_selection_supervisor_codegen.py",
-            extra_args=("--test-id", test_id, *passthrough),
+            extra_args=("--test-id", test_id, *child_passthrough),
         )
         if rc != 0:
             return rc
@@ -46,7 +53,7 @@ def main() -> int:
         str(REPO_ROOT / "fluxon_rs" / "fluxon_util" / "Cargo.toml"),
         "--test",
         "log_mgmt",
-        *passthrough,
+        *child_passthrough,
     ])
 
 

@@ -107,6 +107,63 @@ class TestTopAttentionLogMgmtContract(unittest.TestCase):
                 ],
             )
 
+    def test_main_strips_passthrough_case_config_before_delegating(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            cfg_dir = run_dir / "configs"
+            cfg_dir.mkdir(parents=True)
+            case_cfg = cfg_dir / "ci_scene_config.yaml"
+            case_cfg.write_text(
+                yaml.safe_dump(
+                    {
+                        "case": {
+                            "scene_id": "ci_top_attention_log_mgmt",
+                            "scale_id": "n1_kvowner_dram_20gib",
+                            "profile_id": "fluxon_tcp_thread",
+                            "case_id": "ci_top_attention_log_mgmt__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+                        },
+                        "scene_config": {"enabled": True},
+                        "scene_runtime": {
+                            "etcd": {"ip": "127.0.0.1", "port": 19180},
+                            "greptime": {"ip": "127.0.0.1", "port": 19190},
+                        },
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+
+            python_calls: list[tuple[str, tuple[str, ...]]] = []
+
+            def fake_run_python_file(description: str, path: str, extra_args=()):
+                del description
+                python_calls.append((path, tuple(extra_args)))
+                return 0
+
+            with mock.patch.object(_ENTRY, "run_python_file", side_effect=fake_run_python_file):
+                with mock.patch.object(_ENTRY, "run_cargo", return_value=0) as run_cargo:
+                    with mock.patch.object(
+                        sys,
+                        "argv",
+                        [
+                            str(MODULE_PATH),
+                            "--case-config",
+                            str(case_cfg),
+                            "--",
+                            "--case-config",
+                            str(case_cfg),
+                            "--nocapture",
+                        ],
+                    ):
+                        rc = _ENTRY.main()
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                python_calls[0],
+                ("deployment/tests/test_log_shard.py", ("--", "--nocapture")),
+            )
+            self.assertNotIn("--case-config", run_cargo.call_args.args[0])
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

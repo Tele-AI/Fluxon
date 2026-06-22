@@ -11,7 +11,7 @@
 
 use crate::cluster_manager::ClusterManagerRdmaControlInit;
 use crate::config::{
-    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig, MonitoringConfig,
+    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, LargeFilePaths, MasterConfig, MonitoringConfig,
     ProtocolConfig, ProtocolType, TestSpecConfig, TestSpecTransportMode, TransferEngineType,
 };
 use crate::run_master_with_test_overrides;
@@ -850,6 +850,24 @@ fn default_external_contribute_to_cluster_pool_size() -> ContributeToClusterPool
     }
 }
 
+fn default_client_large_file_paths(
+    instance_key: &str,
+    contribute_to_cluster_pool_size: &ContributeToClusterPoolSize,
+) -> LargeFilePaths {
+    if contribute_to_cluster_pool_size.dram == 0
+        && contribute_to_cluster_pool_size.vram.is_empty()
+    {
+        return LargeFilePaths {
+            log_root_path: String::new(),
+            cache_root_path: String::new(),
+        };
+    }
+    LargeFilePaths {
+        log_root_path: format!("/tmp/kvcache_large/log/{}", instance_key),
+        cache_root_path: format!("/tmp/kvcache_large/cache/{}", instance_key),
+    }
+}
+
 fn default_owner_test_client_options(round_profile: KvTestRoundProfile) -> KvTestClientOptions {
     KvTestClientOptions {
         protocol_config: Some(round_profile.protocol_config()),
@@ -1020,6 +1038,9 @@ fn build_client_launch(
         .rdma_control_init
         .expect("kv_test requires rdma_control_init to be set explicitly");
     let transfer_backend_activation_mode = options.transfer_backend_activation_mode;
+    let contribute_to_cluster_pool_size = options
+        .contribute_to_cluster_pool_size
+        .unwrap_or(default_owner_contribute_to_cluster_pool_size());
     let shared_memory_path = options
         .shared_memory_path
         .unwrap_or_else(|| format!("/tmp/kvcache_shared_memory/{}", instance_key));
@@ -1030,9 +1051,7 @@ fn build_client_launch(
         cluster_name: round.cluster_name.clone(),
         etcd_addresses_raw,
         instance_key: instance_key.clone(),
-        contribute_to_cluster_pool_size: options
-            .contribute_to_cluster_pool_size
-            .unwrap_or(default_owner_contribute_to_cluster_pool_size()),
+        contribute_to_cluster_pool_size: contribute_to_cluster_pool_size.clone(),
         protocol: options.protocol_config.unwrap_or_else(tcp_protocol_config),
         pprof_duration_seconds: None,
         redis_compat_listen_addr: None,
@@ -1054,6 +1073,10 @@ fn build_client_launch(
         // binds multiple roles to the same owner path.
         shared_memory_path,
         shared_file_path,
+        large_file_paths: default_client_large_file_paths(
+            &instance_key,
+            &contribute_to_cluster_pool_size,
+        ),
         // Mirror round intent into the generated config so logs and runtime behavior
         // agree on whether this launch is transfer_only vs transfer_with_rpc.
         test_spec_config: kv_test_round_test_spec_config(round.round_profile),
