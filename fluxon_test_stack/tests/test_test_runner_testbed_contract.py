@@ -162,6 +162,21 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             source_root = root / "source_root"
             source_root.mkdir()
             (source_root / "README.md").write_text("repo\n", encoding="utf-8")
+            source_test_cfg = source_root / "fluxon_py" / "tests" / "test_config.yaml"
+            source_test_cfg.parent.mkdir(parents=True, exist_ok=True)
+            source_test_cfg.write_text(
+                "\n".join(
+                    [
+                        "kv_svc_type: fluxon",
+                        "etcd_address: 127.0.0.1:2379",
+                        "cluster_name: fluxon-example-cluster",
+                        "shared_memory_path: /tmp/fluxon-example-cluster/shm",
+                        "shared_file_path: /tmp/fluxon-example-cluster/share",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
 
             release_root = root / "release_root"
             release_root.mkdir()
@@ -204,6 +219,45 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             venv_python = run_dir / "venv" / "bin" / "python3"
             venv_python.parent.mkdir(parents=True, exist_ok=True)
             venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+            testbed_bundle_root = root / "testbed_bundle"
+            testbed_bundle_root.mkdir()
+            start_cfg = testbed_bundle_root / "start_test_bed.runner.yaml"
+            deployconf_path = testbed_bundle_root / "deployconf.yaml"
+            start_cfg.write_text(
+                "\n".join(
+                    [
+                        "schema_version: 6",
+                        "deployconf_path: ./deployconf.yaml",
+                        "controller_url: http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                        "controller_basic_auth:",
+                        "  username: ops_admin",
+                        "  password: ops_password",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            deployconf_path.write_text(
+                "\n".join(
+                    [
+                        "global_envs:",
+                        "  FLUXON_CLUSTER_NAME: fluxon_testbed",
+                        "  FLUXON_SHARED_MEM: ${HOSTWORKDIR}/shm1",
+                        "  FLUXON_SHARED_MEM2: ${HOSTWORKDIR}/shm2_files",
+                        "cluster_nodes:",
+                        "  - hostname: logic-a",
+                        "    ip: 127.0.0.1",
+                        "    hostworkdir: /tmp/fluxon_testbed/a",
+                        "    execution_mode: local",
+                        "service:",
+                        "  ops_controller:",
+                        "    node_bind:",
+                        "      node: [logic-a]",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
 
             resolved_case = {
                 "artifact_set": {
@@ -215,17 +269,23 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 }
             }
 
-            with mock.patch.object(_RUNNER, "_run_subprocess") as run_subprocess_mock:
-                _RUNNER._ci_prepare_run_inputs(
-                    resolved_case=resolved_case,
-                    source_root=source_root,
-                    release_root=release_root,
-                    test_rsc_root=test_rsc_root,
-                    src_root=src_root,
-                    venv_python=venv_python,
-                    ci_commands=None,
-                    overlay_live_checkout=False,
-                )
+            env = {**os.environ, _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg)}
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch.object(_RUNNER, "_run_subprocess") as run_subprocess_mock:
+                    _RUNNER._ci_prepare_run_inputs(
+                        resolved_case=resolved_case,
+                        source_root=source_root,
+                        release_root=release_root,
+                        test_rsc_root=test_rsc_root,
+                        src_root=src_root,
+                        venv_python=venv_python,
+                        ci_commands=None,
+                        overlay_live_checkout=False,
+                        etcd_address="127.0.0.1:32579",
+                        cluster_name="ci_case_cluster",
+                        shared_memory_path="/tmp/ci_case_cluster/shm",
+                        shared_file_path="/tmp/ci_case_cluster/share",
+                    )
 
             release_view_root = src_root / "fluxon_release"
             self.assertTrue(release_view_root.is_dir())
@@ -236,6 +296,17 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertFalse((release_view_root / "from_release.txt").exists())
             self.assertTrue((release_view_root / "test_rsc" / "from_case.txt").exists())
             self.assertTrue((src_root / "payload.txt").is_file())
+            rendered_test_cfg = yaml.safe_load((src_root / "fluxon_py" / "tests" / "test_config.yaml").read_text(encoding="utf-8"))
+            self.assertEqual(
+                rendered_test_cfg,
+                {
+                    "kv_svc_type": "fluxon",
+                    "etcd_address": "127.0.0.1:32579",
+                    "cluster_name": "ci_case_cluster",
+                    "shared_memory_path": "/tmp/ci_case_cluster/shm",
+                    "shared_file_path": "/tmp/ci_case_cluster/share",
+                },
+            )
             run_subprocess_mock.assert_called_once()
 
     def test_ci_runner_script_sources_prepare_env_when_present(self) -> None:

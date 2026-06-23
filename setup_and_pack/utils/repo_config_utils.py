@@ -32,8 +32,11 @@ __all__ = [
     "load_tsdb_remote_write_url",
     "_load_yaml_mapping",
     "load_test_config_mapping",
-    "load_test_deployconf_path",
     "load_test_kv_svc_type_from_test_config",
+    "load_test_etcd_address_from_test_config",
+    "load_test_fluxon_cluster_name_from_test_config",
+    "load_test_fluxon_shared_memory_path_from_test_config",
+    "load_test_fluxon_shared_file_path_from_test_config",
     "load_deployconf_mapping",
     "load_deployconf_resolved_global_envs",
     "load_deployconf_etcd_address",
@@ -338,22 +341,6 @@ def load_test_config_mapping(*, config_path: Optional[Path] = None) -> Dict[str,
     return _load_yaml_mapping(Path(config_path), label="test_config.yaml")
 
 
-def load_test_deployconf_path(*, config_path: Optional[Path] = None) -> Path:
-    """Load the shared deployconf path referenced by fluxon_py test_config.yaml."""
-    test_cfg_path = Path(config_path) if config_path is not None else None
-    test_cfg = load_test_config_mapping(config_path=test_cfg_path)
-    raw = test_cfg.get("deployconf_path")
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("test_config.yaml must define non-empty deployconf_path")
-    deployconf_path = Path(raw.strip())
-    base_dir = test_cfg_path.parent if test_cfg_path is not None else (Path(__file__).resolve().parents[2] / "fluxon_py" / "tests")
-    if not deployconf_path.is_absolute():
-        deployconf_path = (base_dir / deployconf_path).resolve()
-    if not deployconf_path.exists():
-        raise FileNotFoundError(f"deployconf_path from test_config.yaml does not exist: {deployconf_path}")
-    return deployconf_path
-
-
 def load_test_kv_svc_type_from_test_config(*, config_path: Optional[Path] = None) -> str:
     """Load kv_svc_type from test_config.yaml and validate it against KvClientType."""
     test_cfg = load_test_config_mapping(config_path=config_path)
@@ -367,3 +354,40 @@ def load_test_kv_svc_type_from_test_config(*, config_path: Optional[Path] = None
     if value not in allowed:
         raise ValueError(f"test_config.yaml kv_svc_type must be one of {sorted(allowed)}")
     return value
+
+
+def load_test_etcd_address_from_test_config(*, config_path: Optional[Path] = None) -> str:
+    """Load etcd address from test_config.yaml as the single test authority."""
+    test_cfg = load_test_config_mapping(config_path=config_path)
+    raw = test_cfg.get("etcd_address")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("test_config.yaml must define non-empty etcd_address")
+    host, port = _verify_host_port(raw.strip(), field="test_config.yaml.etcd_address")
+    return f"{host}:{port}"
+
+
+def load_test_fluxon_cluster_name_from_test_config(*, config_path: Optional[Path] = None) -> str:
+    """Load Fluxon cluster name from test_config.yaml as the single test authority."""
+    test_cfg = load_test_config_mapping(config_path=config_path)
+    raw = test_cfg.get("cluster_name")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("test_config.yaml must define non-empty cluster_name")
+    return raw.strip()
+
+
+def load_test_fluxon_shared_memory_path_from_test_config(*, config_path: Optional[Path] = None) -> str:
+    """Load Fluxon shared-memory root from test_config.yaml as the single test authority."""
+    test_cfg = load_test_config_mapping(config_path=config_path)
+    raw = test_cfg.get("shared_memory_path")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("test_config.yaml must define non-empty shared_memory_path")
+    return raw.strip()
+
+
+def load_test_fluxon_shared_file_path_from_test_config(*, config_path: Optional[Path] = None) -> str:
+    """Load Fluxon shared-file root from test_config.yaml as the single test authority."""
+    test_cfg = load_test_config_mapping(config_path=config_path)
+    raw = test_cfg.get("shared_file_path")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("test_config.yaml must define non-empty shared_file_path")
+    return raw.strip()

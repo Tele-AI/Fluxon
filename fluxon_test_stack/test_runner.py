@@ -1504,6 +1504,38 @@ def _load_source_stack_contract() -> Dict[str, Any]:
     }
 
 
+def _write_ci_runtime_test_config(
+    *,
+    src_root: Path,
+    etcd_address: str,
+    cluster_name: str,
+    shared_memory_path: str,
+    shared_file_path: str,
+) -> Path:
+    """Materialize the single CI test authority consumed by fluxon_py integration tests.
+
+    English note:
+    - CI cases under cluster_kv_owner start their own master/owner instances from test_runner.
+    - The test layer therefore must not read repo example deployconf or testbed deployconf as an
+      indirect authority for case-local runtime wiring.
+    - Keep one explicit contract only: write the case-scoped etcd/cluster/shared-bundle values that
+      the downstream tests actually need.
+    """
+    test_cfg_path = (src_root / "fluxon_py" / "tests" / "test_config.yaml").resolve()
+    test_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_yaml_file(
+        test_cfg_path,
+        {
+            "kv_svc_type": "fluxon",
+            "etcd_address": str(etcd_address),
+            "cluster_name": str(cluster_name),
+            "shared_memory_path": str(shared_memory_path),
+            "shared_file_path": str(shared_file_path),
+        },
+    )
+    return test_cfg_path
+
+
 def _discover_test_bed_bootstrap_config_override_opt(*, anchor_paths: Tuple[Path, ...]) -> Optional[Path]:
     seen_roots: set[Path] = set()
     for anchor_path in anchor_paths:
@@ -3658,6 +3690,10 @@ def _prepare_ci_case(
         venv_python=venv_python,
         ci_commands=planned_case.ci_commands,
         overlay_live_checkout=True,
+        etcd_address=f"{_ci_base_runtime_service_target_ip(resolved_case, service_id='etcd')}:{_ci_base_runtime_service_port(resolved_case, service_id='etcd')}",
+        cluster_name=out_cluster_name,
+        shared_memory_path=share_mem_path,
+        shared_file_path=share_file_path,
     )
 
     prepare_env_exports = _run_ci_prepare_steps(
@@ -14346,6 +14382,10 @@ def _ci_prepare_run_inputs(
     venv_python: Path,
     ci_commands: Optional[List[Dict[str, str]]],
     overlay_live_checkout: bool,
+    etcd_address: str,
+    cluster_name: str,
+    shared_memory_path: str,
+    shared_file_path: str,
 ) -> None:
     """Materialize CI run inputs from the case release into an isolated run_dir.
 
@@ -14416,6 +14456,13 @@ def _ci_prepare_run_inputs(
     build_config_ext_path = src_root / "build_config_ext.yml"
     if not build_config_ext_path.exists():
         build_config_ext_path.write_text("", encoding="utf-8")
+    _write_ci_runtime_test_config(
+        src_root=src_root,
+        etcd_address=etcd_address,
+        cluster_name=cluster_name,
+        shared_memory_path=shared_memory_path,
+        shared_file_path=shared_file_path,
+    )
     release_link_path = src_root / "fluxon_release"
     _materialize_ci_runtime_release_view(
         release_root=release_root,
