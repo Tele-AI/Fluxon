@@ -1,0 +1,6 @@
+interface:
+  display_name: "变更简洁重设计"
+  short_description: "变更简洁重设计"
+  default_prompt: "Use $prompt-5e80deb4-c278-4424-a0f4-a3df4f3443d8."
+policy:
+  allow_implicit_invocation: false

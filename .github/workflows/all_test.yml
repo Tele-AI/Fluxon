@@ -65,10 +65,15 @@ jobs:
           # Scene selection:
           # - ci_top_attention_doc_page_build validates doc build through the prebuilt Docker image.
           # - ci_top_attention_bin_kvtest keeps the Rust kv_test entry under the testbed scene contract.
+          # - ci_top_attention_mq_core keeps MQ correctness coverage inside the same CI testbed contract.
           suite["scenes"] = {
               key: value
               for key, value in suite["scenes"].items()
-              if key in ("ci_top_attention_doc_page_build", "ci_top_attention_bin_kvtest")
+              if key in (
+                  "ci_top_attention_doc_page_build",
+                  "ci_top_attention_bin_kvtest",
+                  "ci_top_attention_mq_core",
+              )
           }
 
           # Profile selection:
@@ -91,6 +96,7 @@ jobs:
           # - Keep the original per-scene scales from ci_test_list.yaml.
           # - ci_top_attention_doc_page_build stays on n1_kvowner_dram_3gib.
           # - ci_top_attention_bin_kvtest stays on n1_kvowner_dram_20gib.
+          # - ci_top_attention_mq_core stays on n1_kvowner_dram_20gib.
 
           out_path.write_text(
               yaml.safe_dump(suite, sort_keys=False, allow_unicode=False),

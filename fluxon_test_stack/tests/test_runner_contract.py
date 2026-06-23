@@ -59,6 +59,10 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
             "ci_top_attention_doc_page_build_uses_online_docker_image",
             test_ci_top_attention_doc_page_build_uses_online_docker_image,
         ),
+        (
+            "ci_top_attention_mq_core_uses_cluster_kv_owner_runtime",
+            test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime,
+        ),
     ]
     if selected_test_id is None:
         return checks
@@ -257,6 +261,73 @@ def test_ci_top_attention_doc_page_build_uses_online_docker_image() -> None:
         )
         return
     print("PASS: test_ci_top_attention_doc_page_build_uses_online_docker_image")
+
+
+def test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
+    suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(suite_cfg, dict):
+        print("FAIL: test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime - suite config is not a mapping")
+        return
+
+    suite_for_contract = copy.deepcopy(suite_cfg)
+    artifact_sets = suite_for_contract.get("artifact_sets")
+    if not isinstance(artifact_sets, dict):
+        print("FAIL: test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime - artifact_sets is not a mapping")
+        return
+    for artifact_set in artifact_sets.values():
+        if not isinstance(artifact_set, dict):
+            continue
+        release_artifacts = artifact_set.get("release_artifacts")
+        if isinstance(release_artifacts, dict):
+            python_wheel = release_artifacts.get("python_wheel")
+            if isinstance(python_wheel, str) and python_wheel.strip():
+                artifact_set["release_artifacts"] = {"wheel": python_wheel}
+
+    suite = _TEST_RUNNER._parse_suite_config(suite_for_contract)
+    cases = _TEST_RUNNER._expand_cases(suite)
+    case = next(
+        (
+            item
+            for item in cases
+            if item.scene_id == "ci_top_attention_mq_core"
+            and item.profile_id == "fluxon_tcp"
+        ),
+        None,
+    )
+    if case is None:
+        print("FAIL: test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime - missing mq core case")
+        return
+    planned = _TEST_RUNNER._build_ci_execution_plan(case, suite)
+    if len(planned) != 1:
+        print(
+            "FAIL: test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime - "
+            f"expected one planned case, got {len(planned)}"
+        )
+        return
+    commands = planned[0].ci_commands
+    if len(commands) != 1:
+        print(
+            "FAIL: test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime - "
+            f"expected one command, got {len(commands)}"
+        )
+        return
+    command = commands[0]
+    if command.get("id") != "top_attention_mq_core":
+        print(
+            "FAIL: test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime - "
+            f"unexpected command id: {command.get('id')!r}"
+        )
+        return
+    command_text = command.get("command")
+    if not isinstance(command_text, str) or "_mq_core.py --case-config __RUN_DIR__/configs/ci_scene_config.yaml" not in command_text:
+        print(
+            "FAIL: test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime - "
+            f"unexpected command: {command_text!r}"
+        )
+        return
+    print("PASS: test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime")
 
 
 if __name__ == "__main__":

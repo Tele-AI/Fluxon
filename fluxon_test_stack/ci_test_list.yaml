@@ -29,6 +29,14 @@ scenes:
       scales: [n1_kvowner_dram_20gib]
       profiles: [fluxon_tcp]
 
+  ci_top_attention_mq_core:
+    ci:
+      subject: mq
+      runtime_contract: cluster_kv_owner
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
   kv_read_heavy_zipf:
     test_stack:
       mode: KVSTORE
@@ -315,6 +323,7 @@ profiles:
             doc_site_base_url: example.com
           ci_top_attention_bin_kvtest:
             kv_test_rounds: all
+          ci_top_attention_mq_core: {}
         runtime_contracts:
           cluster_kv_owner: &cluster_kv_owner_runtime
             base_runtime:
@@ -460,6 +469,7 @@ profiles:
             doc_site_base_url: example.com
           ci_top_attention_bin_kvtest:
             kv_test_rounds: all
+          ci_top_attention_mq_core: {}
       test_stack:
         <<: *common_test_stack_runtime
   fluxon_sockudo_ws:
@@ -472,6 +482,7 @@ profiles:
             doc_site_base_url: example.com
           ci_top_attention_bin_kvtest:
             kv_test_rounds: all
+          ci_top_attention_mq_core: {}
       test_stack:
         <<: *common_test_stack_runtime
   fluxon_tcp:
@@ -484,6 +495,7 @@ profiles:
             doc_site_base_url: example.com
           ci_top_attention_bin_kvtest:
             kv_test_rounds: all
+          ci_top_attention_mq_core: {}
       test_stack:
         <<: *common_test_stack_runtime
   redis_sharded:

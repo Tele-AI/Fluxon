@@ -37,13 +37,17 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertNotIn("ci_2_virt_node.py", workflow_text)
         self.assertNotIn("fluxon_test_stack/", workflow_text)
 
-    def test_main_testbed_workflow_does_not_select_doc_page_scene(self) -> None:
+    def test_main_testbed_workflow_keeps_suite_generation_in_workflow(self) -> None:
         workflow_text = ALL_TEST_WORKFLOW_PATH.read_text(encoding="utf-8")
         yaml.load(workflow_text, Loader=yaml.BaseLoader)
 
+        self.assertIn("fluxon_test_stack/ci_2_virt_node.py", workflow_text)
+        self.assertIn("Write ci_2_virt_node suite", workflow_text)
         self.assertIn("ci_top_attention_bin_kvtest", workflow_text)
         self.assertIn("ci_top_attention_doc_page_build", workflow_text)
+        self.assertIn("ci_top_attention_mq_core", workflow_text)
         self.assertIn("doc_site_base_url", workflow_text)
+        self.assertIn("rather_no_git_submodule.py", workflow_text)
 
     def test_docs_pages_uses_container_entrypoint(self) -> None:
         workflow_text = DOCS_PAGES_WORKFLOW_PATH.read_text(encoding="utf-8")

@@ -104,6 +104,30 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_bin_kvtest")
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
 
+    def test_top_attention_mq_core_ci_execution_plan_is_runner_native(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        artifact_sets = suite_cfg.get("artifact_sets")
+        if isinstance(artifact_sets, dict):
+            for artifact_set in artifact_sets.values():
+                if not isinstance(artifact_set, dict):
+                    continue
+                release_artifacts = artifact_set.get("release_artifacts")
+                if isinstance(release_artifacts, dict):
+                    python_wheel = release_artifacts.get("python_wheel")
+                    if isinstance(python_wheel, str) and python_wheel.strip():
+                        artifact_set["release_artifacts"] = {"wheel": python_wheel}
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        case = next(item for item in cases if item.scene_id == "ci_top_attention_mq_core" and item.profile_id == "fluxon_tcp")
+        planned = _RUNNER._build_ci_execution_plan(case, suite)
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_mq_core")
+        self.assertIn(
+            "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_core.py",
+            planned[0].ci_commands[0]["command"],
+        )
+        self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
+
     def test_doc_page_ci_execution_plan_uses_online_docker_image(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
         artifact_sets = suite_cfg.get("artifact_sets")

@@ -1,0 +1,6 @@
+interface:
+  display_name: "mvp"
+  short_description: "mvp"
+  default_prompt: "Use $prompt-ae9ff67b-09d8-4848-bbde-aac1fb6e1315."
+policy:
+  allow_implicit_invocation: false

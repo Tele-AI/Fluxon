@@ -1,0 +1,6 @@
+interface:
+  display_name: "提示词模板位置"
+  short_description: "提示词模板位置"
+  default_prompt: "Use $prompt-2eaed145-d789-4b27-93b9-8ea990830b3a."
+policy:
+  allow_implicit_invocation: false
