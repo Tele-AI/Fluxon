@@ -1086,6 +1086,10 @@ impl ClientConfigYaml {
             }
             .into_kverror());
         }
+        // Owner mode always needs explicit large-file roots for logs and caches.
+        // The listen port stays optional at this contract layer: deterministic
+        // callers may pin it, while shared testbed owners can leave it unset
+        // and let the runtime bind a free port.
         let large_file_paths = if is_external {
             LargeFilePaths {
                 log_root_path: String::new(),

@@ -835,7 +835,6 @@ def _rewrite_same_host_local_multi_node_fixed_ports(
     master_cfg = _require_mapping(services.get("master"), "deployconf.service.master")
     ops_agent_cfg = _require_mapping(services.get("ops_agent"), "deployconf.service.ops_agent")
     ops_controller_cfg = _require_mapping(services.get("ops_controller"), "deployconf.service.ops_controller")
-
     global_envs["TIKV_PD_PEER_PORT"] = str(plan["tikv_pd_peer_port"])
     global_envs["TIKV_STATUS_FULL_ADDRESS"] = (
         "${${TIKV__NODE_ID}__IP}:" + str(plan["tikv_status_port"])

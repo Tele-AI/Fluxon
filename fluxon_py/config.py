@@ -587,6 +587,10 @@ class FluxonKvClientConfig():
 
             return yaml.safe_dump(cfg, sort_keys=False)
 
+        # Owner mode must always declare large-file roots for logs and caches.
+        # p2p_listen_port remains optional here: deterministic case-local
+        # topologies may pin it, while shared testbed flows can leave it unset
+        # and let runtime choose an available port.
         if "large_file_paths" not in spec:
             raise ValueError("fluxonkv_spec.large_file_paths is required for owner mode")
         large_file_paths = spec.get("large_file_paths")

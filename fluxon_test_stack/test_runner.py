@@ -9296,6 +9296,16 @@ def _test_stack_kv_owner_runtime_instance_key(*, runtime_instance_prefix: str, o
     return f"{runtime_instance_prefix}__kv_owner__{target_slug}"
 
 
+def _fluxon_kv_owner_large_file_paths(*, owner_work_root: Path) -> Dict[str, str]:
+    # Owner mode always needs explicit large-file roots for logs and caches,
+    # even on surfaces that intentionally leave p2p_listen_port implicit.
+    root = owner_work_root.resolve()
+    return {
+        "log_root_path": str((root / "large" / "log").resolve()),
+        "cache_root_path": str((root / "large" / "cache").resolve()),
+    }
+
+
 def _build_test_stack_external_kv_owner_instances(
     *,
     scene_mode: str,
@@ -9350,6 +9360,8 @@ def _build_test_stack_external_kv_owner_instances(
             owner_target=target,
             ctx="external kv owner",
         )
+        # TEST_STACK case-local owners use the compiled slot-based port plan so
+        # node runtimes in the same case can resolve stable owner peers.
         owner_p2p_listen_port = (
             int(kv_p2p_port_base)
             + int(kv_p2p_port_stride) * int(run_index - 1)
@@ -9371,6 +9383,8 @@ def _build_test_stack_external_kv_owner_instances(
                 owner_target=target,
                 ctx="runtime.stack_identity owner bundle roots",
             )
+        owner_services_dir = run_dir / "services" / "kv_owner" / target_slug
+        owner_large_file_paths = _fluxon_kv_owner_large_file_paths(owner_work_root=owner_services_dir)
         owner_cfg = {
             "instance_key": _test_stack_kv_owner_runtime_instance_key(
                 runtime_instance_prefix=runtime_instance_prefix,
@@ -9383,6 +9397,7 @@ def _build_test_stack_external_kv_owner_instances(
                 "cluster_name": cluster_name,
                 "shared_memory_path": owner_shared_memory_path,
                 "shared_file_path": owner_shared_file_path,
+                "large_file_paths": owner_large_file_paths,
                 "sub_cluster": FLUXON_KV_OWNER_SUB_CLUSTER,
                 "p2p_listen_port": int(owner_p2p_listen_port),
             },
@@ -9405,7 +9420,6 @@ def _build_test_stack_external_kv_owner_instances(
             raise ValueError(f"test_stack owner config already exists (no overwrite): {owner_cfg_path}")
         _write_yaml_file(owner_cfg_path, owner_cfg)
 
-        owner_services_dir = run_dir / "services" / "kv_owner" / target_slug
         owner_services_dir.mkdir(parents=True, exist_ok=True)
         owner_inst = copy.deepcopy(coord_tpl)
         owner_inst["id"] = instance_id
@@ -14506,6 +14520,7 @@ def _write_ci_scene_config_yaml(
 def _write_ci_master_owner_configs(
     resolved_case: Dict[str, Any], *, run_dir: Path, cluster_name: str, share_mem_path: str, share_file_path: str, owner_dram_bytes: int
 ) -> tuple[Path, Path]:
+    owner_work_root = run_dir / "services" / "owner_0"
     master_cfg = {
         "etcd_endpoints": ["__ETCD__"],
         "cluster_name": cluster_name,
@@ -14534,6 +14549,10 @@ def _write_ci_master_owner_configs(
             "cluster_name": cluster_name,
             "shared_memory_path": share_mem_path,
             "shared_file_path": share_file_path,
+            # Shared testbed / CI owners keep p2p_listen_port implicit so the
+            # runtime can bind a free host port, but owner mode still requires
+            # explicit large-file roots.
+            "large_file_paths": _fluxon_kv_owner_large_file_paths(owner_work_root=owner_work_root),
             "sub_cluster": FLUXON_KV_OWNER_SUB_CLUSTER,
         },
     }

@@ -38,6 +38,39 @@ _RUNNER = _load_module()
 
 
 class TestTestRunnerTestbedContract(unittest.TestCase):
+    def test_write_ci_master_owner_configs_emits_owner_large_file_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            resolved_case = {
+                "deploy": {
+                    "instances": [
+                        {"id": "master", "deployer": {"target": "local-node-a"}},
+                        {"id": "owner_0", "deployer": {"target": "local-node-a"}},
+                    ],
+                    "target_ip_map": {"local-node-a": "127.0.0.1"},
+                }
+            }
+
+            with mock.patch.object(_RUNNER, "_ci_base_runtime_service_target_ip", side_effect=["127.0.0.1", "127.0.0.1"]):
+                with mock.patch.object(_RUNNER, "_ci_base_runtime_service_port", side_effect=[19180, 19190]):
+                    _, owner_path = _RUNNER._write_ci_master_owner_configs(
+                        resolved_case,
+                        run_dir=run_dir,
+                        cluster_name="ci_cluster",
+                        share_mem_path="/tmp/ci_shm",
+                        share_file_path="/tmp/ci_share",
+                        owner_dram_bytes=1073741824,
+                    )
+
+            owner_cfg = yaml.safe_load(owner_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                owner_cfg["fluxonkv_spec"]["large_file_paths"],
+                {
+                    "log_root_path": str((run_dir / "services" / "owner_0" / "large" / "log").resolve()),
+                    "cache_root_path": str((run_dir / "services" / "owner_0" / "large" / "cache").resolve()),
+                },
+            )
+
     def test_write_ci_scene_config_yaml_emits_structured_scene_config(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
@@ -79,6 +112,69 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertEqual(payload["scene_config"]["doc_site_base_url"], "tele-ai.github.io/Fluxon")
             self.assertEqual(payload["scene_runtime"]["etcd"], {"ip": "127.0.0.1", "port": 2379})
             self.assertEqual(payload["scene_runtime"]["greptime"], {"ip": "127.0.0.1", "port": 4000})
+
+    def test_generated_test_stack_owner_config_emits_large_file_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            cfg_dir = run_dir / "configs"
+            cfg_dir.mkdir(parents=True)
+            owner_target = "local-node-a"
+            target_slug = "local-node-a"
+            runtime_instance_prefix = "case1"
+            coord_tpl = {"deployer": {"target": ""}}
+            cluster_nodes = {"local-node-a": {"python_abi": "cpython3.10"}}
+            resolved_case = {
+                "runtime": {
+                    "run_dir": str(run_dir),
+                    "stack_identity": {
+                        "cluster_name": "bench_cluster",
+                        "shared_memory_path": "/tmp/bench_shm",
+                        "shared_file_path": "/tmp/bench_share",
+                    },
+                }
+            }
+
+            with mock.patch.object(_RUNNER, "_test_stack_runtime_required_python_abi", return_value="cpython3.10"):
+                with mock.patch.object(_RUNNER, "_test_stack_etcd_addresses", return_value=["127.0.0.1:19180"]):
+                    with mock.patch.object(_RUNNER, "_test_stack_target_host_venv_python", return_value="/tmp/venv/bin/python3"):
+                        with mock.patch.object(_RUNNER, "_test_stack_runtime_module_command", return_value="owner-cmd"):
+                            owner_instances = _RUNNER._build_test_stack_external_kv_owner_instances(
+                                scene_mode="bench",
+                                resolved_case=resolved_case,
+                                scale={"owner": {"owner_count": 1, "owner_dram_bytes": 1073741824}},
+                                runtime=resolved_case["runtime"],
+                                run_dir=run_dir,
+                                cfg_dir=cfg_dir,
+                                coord_tpl=coord_tpl,
+                                test_stack_runtime={},
+                                cluster_nodes=cluster_nodes,
+                                owner_targets=[owner_target],
+                                needs_kv_master=True,
+                                kv_p2p_port_base=31000,
+                                kv_p2p_port_stride=100,
+                                kv_p2p_slot_offset=0,
+                                p2p_ports_per_slot=10,
+                                node_total=1,
+                                run_index=1,
+                                runtime_instance_prefix=runtime_instance_prefix,
+                                kv_base={},
+                                test_spec_config={},
+                                perf_config=None,
+                                runtime_env={},
+                                owner_group_processes=None,
+                                owner_cpu_core_by_target={},
+                            )
+
+            self.assertEqual(len(owner_instances), 1)
+            owner_cfg_path = cfg_dir / f"test_stack_kv_owner__{target_slug}.yaml"
+            owner_cfg = yaml.safe_load(owner_cfg_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                owner_cfg["fluxonkv_spec"]["large_file_paths"],
+                {
+                    "log_root_path": str((run_dir / "services" / "kv_owner" / target_slug / "large" / "log").resolve()),
+                    "cache_root_path": str((run_dir / "services" / "kv_owner" / target_slug / "large" / "cache").resolve()),
+                },
+            )
 
     def test_ci_source_overlay_includes_fluxon_test_stack(self) -> None:
         self.assertIn("fluxon_test_stack", _RUNNER._CI_SOURCE_OVERLAY_ROOTS)
