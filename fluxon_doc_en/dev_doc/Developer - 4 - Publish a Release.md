@@ -98,7 +98,7 @@ If a change only edits the GitHub Release text, update `fluxon_release/release_n
 
 The doc-site release is a separate pipeline from the binary release. The current doc-site workflow is `.github/workflows/docs-pages.yml`:
 
-- It triggers automatically on pushes to `main` / `master` when `README.md`, `README_CN.md`, `fluxon_doc_cn/**`, `fluxon_doc_en/**`, or `scripts/build_doc_site.py` changes.
+- It triggers automatically on pushes to `main` / `master` when README, doc content, or doc-site build code changes.
 - It can also be run manually from GitHub Actions.
 - It builds `fluxon_release/doc_site/` and deploys that output to GitHub Pages.
 - It does not upload wheels, `fluxon_release.tar.gz`, or Docker images.

@@ -81,6 +81,13 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             "test_rsc/fluxon_tcp_thread",
         )
         self.assertEqual(
+            generated["artifact_sets"]["fluxon_tcp_thread"]["test_rsc_artifacts"],
+            {
+                "ci_src_archive": "src_ci.tar.gz",
+                "ci_ext_rsc_archive": "fluxon_ci_ext_rsc.tar.gz",
+            },
+        )
+        self.assertEqual(
             generated["scales"]["n1_kvowner_dram_3gib"]["targets"]["hosts"],
             ["local-node-a"],
         )
@@ -151,11 +158,15 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             "rust_self_managed",
         )
         prepare = generated["scenes"][self._DOC_SCENE_ID]["ci"]["prepare"]
-        self.assertEqual(len(prepare), 1)
-        self.assertEqual(prepare[0]["kind"], "setup_dev_env")
         self.assertEqual(
-            prepare[0]["config"],
-            "setup_and_pack/setup_dev_env/doc_page_ci.yaml",
+            prepare,
+            [
+                {
+                    "kind": "online_docker_image",
+                    "image_ref": "hanbaoaaa/fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0",
+                    "env": "FLUXON_DOC_SITE_DOCKER_IMAGE_REF",
+                }
+            ],
         )
         self.assertNotIn("commands", generated["scenes"][self._DOC_SCENE_ID]["ci"])
         self.assertEqual(

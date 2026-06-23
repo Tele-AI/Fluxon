@@ -6,17 +6,6 @@ on:
     branches:
       - main
       - master
-    # Republish when doc or homepage inputs change.
-    paths:
-      - ".github/workflows/docs-pages.yml"
-      - "fluxon_doc_cn/**"
-      - "fluxon_doc_en/**"
-      - "README.md"
-      - "README_CN.md"
-      - "pics/**"
-      - "LICENSE"
-      - "fluxon_rs/rust-toolchain.toml"
-      - "scripts/build_doc_site.py"
 
 permissions:
   contents: read
@@ -26,6 +15,9 @@ permissions:
 concurrency:
   group: github-pages
   cancel-in-progress: true
+
+env:
+  DOC_SITE_IMAGE_REF: hanbaoaaa/fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0
 
 jobs:
   build:
@@ -40,27 +32,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-
-      - name: Cache npm
-        uses: actions/cache@v4
-        with:
-          path: .cached/fluxon_doc_site/npm-cache
-          key: ${{ runner.os }}-doc-site-npm-${{ hashFiles('scripts/build_doc_site.py') }}
-          restore-keys: |
-            ${{ runner.os }}-doc-site-npm-
-
-      - name: Cache Quartz plugins
-        uses: actions/cache@v4
-        with:
-          path: .cached/fluxon_doc_site/toolchain/quartz/.quartz/plugins
-          key: ${{ runner.os }}-doc-site-plugins-${{ hashFiles('scripts/build_doc_site.py') }}
-          restore-keys: |
-            ${{ runner.os }}-doc-site-plugins-
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
@@ -77,11 +48,12 @@ jobs:
           fi
           echo "FLUXON_DOC_SITE_BASE_URL=$base_url" >> "$GITHUB_ENV"
 
-      - name: Bootstrap doc site toolchain
-        run: python3 scripts/build_doc_site.py bootstrap
-
       - name: Build doc site
-        run: python3 scripts/build_doc_site.py build
+        run: |
+          python3 scripts/build_doc_site_in_container.py \
+            --repo-root "$PWD" \
+            --image-ref "$DOC_SITE_IMAGE_REF" \
+            --base-url "$FLUXON_DOC_SITE_BASE_URL"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

@@ -29,7 +29,19 @@ FALLBACK_DOC_EN_ROOT = REPO_ROOT / "fluxon_doc_en"
 DEFAULT_DOC_CN_ROOT = REPO_ROOT / "fluxon_doc_linked" / "fluxon_doc_cn"
 FALLBACK_DOC_CN_ROOT = REPO_ROOT / "fluxon_doc_cn"
 OUTPUT_ROOT = REPO_ROOT / "fluxon_release" / "doc_site"
-CACHE_ROOT = REPO_ROOT / ".cached" / "fluxon_doc_site"
+
+
+def _resolve_cache_root() -> Path:
+    raw_cache_root = os.environ.get("FLUXON_DOC_SITE_CACHE_ROOT")
+    if raw_cache_root is None or not raw_cache_root.strip():
+        return REPO_ROOT / ".cached" / "fluxon_doc_site"
+    cache_root = Path(raw_cache_root.strip())
+    if not cache_root.is_absolute():
+        cache_root = REPO_ROOT / cache_root
+    return cache_root.resolve()
+
+
+CACHE_ROOT = _resolve_cache_root()
 PROJECT_ROOT = (
     Path(tempfile.gettempdir())
     / f"fluxon_doc_site_{hashlib.sha256(str(REPO_ROOT).encode('utf-8')).hexdigest()[:12]}"
@@ -48,6 +60,7 @@ TOOLCHAIN_ROOT = CACHE_ROOT / "toolchain" / "quartz"
 NPM_CACHE_ROOT = CACHE_ROOT / "npm-cache"
 RUNTIME_CONFIG_PATH = TOOLCHAIN_ROOT / "quartz.config.yaml"
 RUNTIME_LOCKFILE_PATH = TOOLCHAIN_ROOT / "quartz.lock.json"
+RUNTIME_STAMP_PATH = TOOLCHAIN_ROOT / ".fluxon-runtime-stamp"
 NPM_STAMP_PATH = TOOLCHAIN_ROOT / ".fluxon-npm-stamp"
 PLUGIN_STAMP_PATH = TOOLCHAIN_ROOT / ".fluxon-plugin-stamp"
 DEFAULT_SERVE_ADDR = "127.0.0.1:18081"
@@ -274,7 +287,7 @@ def extend_language_counterpart_routes_for_cn_only_design() -> dict[str, str]:
 
 LANGUAGE_COUNTERPART_ROUTES = extend_language_counterpart_routes_for_cn_only_design()
 DOC_SITE_POSTSCRIPT_JS = dedent(
-    f"""\
+    rf"""
     ;(() => {{
       const FLUXON_LANGUAGE_COUNTERPART_ROUTES = {json.dumps(LANGUAGE_COUNTERPART_ROUTES, ensure_ascii=False, sort_keys=True)}
       const FLUXON_EXPLORER_PRIORITY_ROOT_ROUTES = {json.dumps(EXPLORER_PRIORITY_ROOT_ROUTES, ensure_ascii=False, sort_keys=True)}
@@ -817,7 +830,7 @@ DOC_SITE_POSTSCRIPT_JS = dedent(
       scheduleFluxonExplorerHomeLink()
     }})();
     """
-)
+).lstrip()
 
 
 class OutputHTTPServer(socketserver.ThreadingTCPServer):
@@ -983,15 +996,20 @@ def ensure_quartz_runtime_checkout() -> None:
             "ERROR: unexpected Quartz checkout commit after clone: "
             f"expected={QUARTZ_COMMIT} actual={current_commit}"
         )
+    write_runtime_quartz_stamp()
 
 
 def quartz_runtime_is_ready() -> bool:
-    if not (TOOLCHAIN_ROOT / ".git").exists():
-        return False
     if not (TOOLCHAIN_ROOT / "package.json").is_file():
         return False
     if not (TOOLCHAIN_ROOT / "quartz" / "bootstrap-cli.mjs").is_file():
         return False
+
+    if not (TOOLCHAIN_ROOT / ".git").exists():
+        return (
+            RUNTIME_STAMP_PATH.is_file()
+            and RUNTIME_STAMP_PATH.read_text(encoding="utf-8") == build_runtime_quartz_stamp()
+        )
 
     try:
         remote_url = git_capture(["remote", "get-url", "origin"], cwd=TOOLCHAIN_ROOT).strip()
@@ -1001,7 +1019,26 @@ def quartz_runtime_is_ready() -> bool:
 
     if remote_url != QUARTZ_REPO_URL:
         return False
-    return current_commit == QUARTZ_COMMIT
+    if current_commit != QUARTZ_COMMIT:
+        return False
+    write_runtime_quartz_stamp()
+    return True
+
+
+def build_runtime_quartz_stamp() -> str:
+    return hash_text(
+        QUARTZ_REPO_URL
+        + "\n"
+        + QUARTZ_REF
+        + "\n"
+        + QUARTZ_COMMIT
+        + "\n"
+        + "\n".join(SPARSE_CHECKOUT_PATHS)
+    )
+
+
+def write_runtime_quartz_stamp() -> None:
+    RUNTIME_STAMP_PATH.write_text(build_runtime_quartz_stamp(), encoding="utf-8")
 
 
 def write_runtime_quartz_config() -> None:
@@ -1177,6 +1214,27 @@ def build_quartz_config_text() -> str:
     )
 
 
+def normalize_quartz_plugin_stamp_config_text(config_text: str) -> str:
+    lines = []
+    for line in config_text.splitlines():
+        if line.lstrip().startswith("baseUrl:"):
+            indent = line[: len(line) - len(line.lstrip())]
+            lines.append(f"{indent}baseUrl: <runtime>")
+            continue
+        lines.append(line)
+    return "\n".join(lines) + ("\n" if config_text.endswith("\n") else "")
+
+
+def build_quartz_plugin_stamp(config_text: str, lockfile_text: str) -> str:
+    return hash_text(
+        QUARTZ_COMMIT
+        + "\n"
+        + normalize_quartz_plugin_stamp_config_text(config_text)
+        + "\n"
+        + lockfile_text
+    )
+
+
 def plugin_source(name: str) -> str:
     return f"github:quartz-community/{name}"
 
@@ -1255,7 +1313,7 @@ def ensure_node_modules() -> None:
 def ensure_quartz_plugins() -> None:
     config_text = RUNTIME_CONFIG_PATH.read_text(encoding="utf-8")
     lockfile_text = RUNTIME_LOCKFILE_PATH.read_text(encoding="utf-8")
-    expected_stamp = hash_text(QUARTZ_COMMIT + "\n" + config_text + "\n" + lockfile_text)
+    expected_stamp = build_quartz_plugin_stamp(config_text, lockfile_text)
     plugins_root = TOOLCHAIN_ROOT / ".quartz" / "plugins"
     if (
         PLUGIN_STAMP_PATH.is_file()
@@ -1280,8 +1338,9 @@ def ensure_quartz_plugins() -> None:
         ],
         cwd=TOOLCHAIN_ROOT,
     )
+    config_text = RUNTIME_CONFIG_PATH.read_text(encoding="utf-8")
     lockfile_text = RUNTIME_LOCKFILE_PATH.read_text(encoding="utf-8")
-    expected_stamp = hash_text(QUARTZ_COMMIT + "\n" + config_text + "\n" + lockfile_text)
+    expected_stamp = build_quartz_plugin_stamp(config_text, lockfile_text)
 
     run_cmd(
         [

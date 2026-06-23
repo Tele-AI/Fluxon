@@ -84,6 +84,12 @@ CI_RUNTIME_CONTRACT_IDS = (
     CI_RUNTIME_CONTRACT_CLUSTER_KV_OWNER,
     CI_RUNTIME_CONTRACT_RUST_SELF_MANAGED,
 )
+CI_PREPARE_KIND_SETUP_DEV_ENV = "setup_dev_env"
+CI_PREPARE_KIND_ONLINE_DOCKER_IMAGE = "online_docker_image"
+CI_PREPARE_KIND_IDS = (
+    CI_PREPARE_KIND_SETUP_DEV_ENV,
+    CI_PREPARE_KIND_ONLINE_DOCKER_IMAGE,
+)
 RUNTIME_LAYER_TEST_BED = "test_bed"
 RUNTIME_LAYER_BASE = "base_runtime"
 RUNTIME_LAYER_CASE = "case_runtime"
@@ -267,6 +273,7 @@ OPS_NAMESPACE_TEST_STACK_ENV = "FLUXON_TEST_STACK_OPS_NAMESPACE"
 _FILE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _MANIFEST_RELPATH_RE = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$")
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CASE_ID_RE = re.compile(
     r"^[a-z0-9][a-z0-9_.-]{0,63}(?:__[a-z0-9][a-z0-9_.-]{0,63}){2}$"
 )
@@ -4807,6 +4814,13 @@ def _require_str(v: Any, ctx: str) -> str:
     return v
 
 
+def _require_env_name(v: Any, ctx: str) -> str:
+    name = _require_str(v, ctx).strip()
+    if _ENV_NAME_RE.fullmatch(name) is None:
+        raise ValueError(f"{ctx} must be a valid environment variable name")
+    return name
+
+
 def _require_basic_auth_username(v: Any, ctx: str) -> str:
     if not isinstance(v, str) or not v:
         raise ValueError(f"{ctx} must be a non-empty string")
@@ -6176,23 +6190,38 @@ def _parse_ci_prepare_steps(raw_steps: Any, ctx: str) -> List[Dict[str, Any]]:
         raise ValueError(f"{ctx} must be non-empty")
     out: List[Dict[str, Any]] = []
     for i, raw_step in enumerate(steps):
-        step = _require_dict(raw_step, f"{ctx}[{i}]")
-        _forbid_unknown_keys(step, {"kind", "config", "cache_relpath"}, f"{ctx}[{i}]")
-        kind = _require_str(step.get("kind"), f"{ctx}[{i}].kind").strip()
-        if kind != "setup_dev_env":
-            raise ValueError(f"{ctx}[{i}].kind unsupported: {kind!r}")
+        out.append(_parse_ci_prepare_step(raw_step, f"{ctx}[{i}]"))
+    return out
+
+
+def _parse_ci_prepare_step(raw_step: Any, ctx: str) -> Dict[str, Any]:
+    step = _require_dict(raw_step, ctx)
+    kind = _require_str(step.get("kind"), f"{ctx}.kind").strip()
+    if kind == CI_PREPARE_KIND_SETUP_DEV_ENV:
+        _forbid_unknown_keys(step, {"kind", "config", "cache_relpath"}, ctx)
         rec: Dict[str, Any] = {
             "kind": kind,
-            "config": _require_clean_relpath(step.get("config"), f"{ctx}[{i}].config"),
+            "config": _require_clean_relpath(step.get("config"), f"{ctx}.config"),
         }
         raw_cache_relpath = step.get("cache_relpath")
         if raw_cache_relpath is not None:
             rec["cache_relpath"] = _require_clean_relpath(
                 raw_cache_relpath,
-                f"{ctx}[{i}].cache_relpath",
+                f"{ctx}.cache_relpath",
             )
-        out.append(rec)
-    return out
+        return rec
+    if kind == CI_PREPARE_KIND_ONLINE_DOCKER_IMAGE:
+        _forbid_unknown_keys(step, {"kind", "image_ref", "env"}, ctx)
+        image_ref = _require_str(step.get("image_ref"), f"{ctx}.image_ref").strip()
+        if not image_ref:
+            raise ValueError(f"{ctx}.image_ref must be non-empty")
+        rec = {
+            "kind": kind,
+            "image_ref": image_ref,
+            "env": _require_env_name(step.get("env"), f"{ctx}.env"),
+        }
+        return rec
+    raise ValueError(f"{ctx}.kind unsupported: {kind!r}")
 
 
 def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
@@ -14547,25 +14576,7 @@ def _resolved_ci_prepare_steps(resolved_case: Dict[str, Any]) -> List[Dict[str, 
         raise ValueError("resolved_case.scene.ci.prepare must be non-empty when present")
     out: List[Dict[str, Any]] = []
     for i, raw_step in enumerate(steps):
-        step = _require_dict(raw_step, f"resolved_case.scene.ci.prepare[{i}]")
-        _forbid_unknown_keys(step, {"kind", "config", "cache_relpath"}, f"resolved_case.scene.ci.prepare[{i}]")
-        kind = _require_str(step.get("kind"), f"resolved_case.scene.ci.prepare[{i}].kind")
-        if kind != "setup_dev_env":
-            raise ValueError(f"resolved_case.scene.ci.prepare[{i}].kind unsupported: {kind!r}")
-        rec: Dict[str, Any] = {
-            "kind": kind,
-            "config": _require_clean_relpath(
-                step.get("config"),
-                f"resolved_case.scene.ci.prepare[{i}].config",
-            ),
-        }
-        raw_cache_relpath = step.get("cache_relpath")
-        if raw_cache_relpath is not None:
-            rec["cache_relpath"] = _require_clean_relpath(
-                raw_cache_relpath,
-                f"resolved_case.scene.ci.prepare[{i}].cache_relpath",
-            )
-        out.append(rec)
+        out.append(_parse_ci_prepare_step(raw_step, f"resolved_case.scene.ci.prepare[{i}]"))
     return out
 
 
@@ -14633,16 +14644,27 @@ def _run_ci_prepare_steps(*, resolved_case: Dict[str, Any], run_dir: Path, src_r
     exports: Dict[str, str] = {}
     for index, step in enumerate(prepare_steps):
         kind = _require_str(step.get("kind"), f"resolved_case.scene.ci.prepare[{index}].kind")
-        if kind != "setup_dev_env":
+        if kind == CI_PREPARE_KIND_SETUP_DEV_ENV:
+            step_exports = _run_ci_prepare_setup_dev_env_step(
+                step=step,
+                run_dir=run_dir,
+                src_root=src_root,
+                step_index=index,
+            )
+            for key, value in step_exports.items():
+                exports[key] = value
+            continue
+        if kind == CI_PREPARE_KIND_ONLINE_DOCKER_IMAGE:
+            step_exports = _run_ci_prepare_online_docker_image_step(
+                step=step,
+                src_root=src_root,
+                step_index=index,
+            )
+            for key, value in step_exports.items():
+                exports[key] = value
+            continue
+        else:
             raise ValueError(f"unsupported CI prepare step kind: {kind!r}")
-        step_exports = _run_ci_prepare_setup_dev_env_step(
-            step=step,
-            run_dir=run_dir,
-            src_root=src_root,
-            step_index=index,
-        )
-        for key, value in step_exports.items():
-            exports[key] = value
     return exports
 
 
@@ -14681,6 +14703,26 @@ def _run_ci_prepare_setup_dev_env_step(
         "FLUXON_CI_PREPARE_NODE_BIN": str(node_bin),
         "PATH": f"{node_bin}:{current_path}" if current_path else str(node_bin),
     }
+
+
+def _run_ci_prepare_online_docker_image_step(
+    *,
+    step: Dict[str, Any],
+    src_root: Path,
+    step_index: int,
+) -> Dict[str, str]:
+    image_ref = _require_str(
+        step.get("image_ref"),
+        f"resolved_case.scene.ci.prepare[{step_index}].image_ref",
+    ).strip()
+    if not image_ref:
+        raise ValueError(f"resolved_case.scene.ci.prepare[{step_index}].image_ref must be non-empty")
+    env_name = _require_env_name(
+        step.get("env"),
+        f"resolved_case.scene.ci.prepare[{step_index}].env",
+    )
+    _run_subprocess(["docker", "pull", image_ref], cwd=str(src_root))
+    return {env_name: image_ref}
 
 
 def _ci_runner_exit_code_timeout_seconds(resolved_case: Dict[str, Any]) -> int:

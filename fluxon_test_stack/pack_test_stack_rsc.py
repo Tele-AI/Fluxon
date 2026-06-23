@@ -873,7 +873,7 @@ def _pack_ci_src(*, repo_root: Path, out_path: Path) -> None:
         repo_root / "examples",
         repo_root / "fluxon_test_stack",
         repo_root / "setup.py",
-        repo_root / "scripts" / "build_doc_site.py",
+        repo_root / "scripts" / "_build_doc_site_in_container_inner.py",
         repo_root / "README.md",
     )
     for path in required_repo_paths:
@@ -1069,7 +1069,24 @@ def _compute_ci_source_digest(*, repo_root: Path) -> str:
 def _ci_source_relpath_excluded(relpath: str) -> bool:
     if relpath in CI_SOURCE_STAGE_EXCLUDE_NAMES:
         return True
+    if _relpath_matches_exclude_patterns(relpath, CI_SOURCE_COMMON_EXCLUDE_REL_PATHS):
+        return True
     return any(relpath == prefix.rstrip("/") or relpath.startswith(prefix) for prefix in CI_SOURCE_STAGE_EXCLUDE_PREFIXES)
+
+
+def _relpath_matches_exclude_patterns(relpath: str, patterns: tuple[str, ...]) -> bool:
+    relpath = relpath.strip("/")
+    rel_parts = Path(relpath).parts
+    rel_name = rel_parts[-1] if rel_parts else relpath
+    for pattern in patterns:
+        if pattern.endswith("/"):
+            dir_name = pattern.rstrip("/")
+            if dir_name in rel_parts:
+                return True
+            continue
+        if fnmatch.fnmatch(relpath, pattern) or fnmatch.fnmatch(rel_name, pattern):
+            return True
+    return False
 
 
 def _pack_ci_ext_rsc(*, repo_root: Path, out_path: Path) -> None:
