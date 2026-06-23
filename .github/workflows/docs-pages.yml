@@ -48,6 +48,9 @@ jobs:
           fi
           echo "FLUXON_DOC_SITE_BASE_URL=$base_url" >> "$GITHUB_ENV"
 
+      - name: Install Python dependencies
+        run: python3 -m pip install PyYAML
+
       - name: Build doc site
         run: |
           python3 scripts/build_doc_site_in_container.py \
