@@ -16,8 +16,8 @@ else
   LOGFILE="{{LOGFILE_PATH}}"
   echo "[rollout] start {{SERVICE_NAME}} node=$NODE_ID hostworkdir=$HOSTWORKDIR"
   # English note:
-  # - Atomic-group order still depends on a readiness gate, but that gate now observes only the
-  #   detached supervisor process subtree on this host.
+  # - Atomic-group order still depends on a startup gate, but that gate now checks only whether
+  #   one supervised child PID stays alive without restart on this host.
   # - Ownership stays inside the shared selection supervisor big loop; the group runner only waits
   #   through the fixed startup observation window before advancing to the next service.
 {{INDENTED_SELECTION_SUPERVISOR_LAUNCH_WAIT_BLOCK}}

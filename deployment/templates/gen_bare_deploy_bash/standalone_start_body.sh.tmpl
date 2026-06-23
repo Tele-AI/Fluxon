@@ -21,7 +21,7 @@ fi
 # English note:
 # - Bare start must not depend on extra supervisor observation subcommands because the shared
 #   runtime surface is intentionally reduced to run/stop.
-# - We therefore launch the detached supervisor and wait until its pid subtree keeps a live child
-#   process alive across the fixed startup observation window.
+# - We therefore launch the detached supervisor and wait until one supervised child PID stays
+#   alive without restart across the fixed startup observation window.
 {{SELECTION_SUPERVISOR_LAUNCH_WAIT_BLOCK}}echo "Started $SERVICE (label: $SUPERVISOR_LABEL)"
 echo "Logs: $LOGFILE"

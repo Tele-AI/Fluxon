@@ -61,6 +61,7 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("bare_child_command_preserves_runtime_hostworkdir_expansion", test_bare_child_command_preserves_runtime_hostworkdir_expansion),
         ("supervisor_label_uses_stable_selection_suffix", test_supervisor_label_uses_stable_selection_suffix),
         ("bootstrap_start_reuses_already_present_selection", test_bootstrap_start_reuses_already_present_selection),
+        ("bare_start_fails_when_child_exits_within_startup_window", test_bare_start_fails_when_child_exits_within_startup_window),
         ("atomic_group_start_does_not_auto_stop_on_failure", test_atomic_group_start_does_not_auto_stop_on_failure),
         ("atomic_group_preserves_nested_heredoc_terminator", test_atomic_group_preserves_nested_heredoc_terminator),
         ("atomic_group_stop_script_is_shell_valid", test_atomic_group_stop_script_is_shell_valid),
@@ -577,7 +578,7 @@ def test_bootstrap_start_reuses_already_present_selection() -> None:
             assert first.returncode == 0, (
                 f"first start failed rc={first.returncode} stdout={first.stdout!r} stderr={first.stderr!r}"
             )
-            _wait_until_selection_present(supervisor_module, label=label)
+            _wait_until_selection_present(supervisor_module, label=label, scope_key=str(hostworkdir))
 
             second_env = base_env.copy()
             second_env["FLUXON_BARE_ALLOW_ALREADY_PRESENT"] = "true"
@@ -594,7 +595,7 @@ def test_bootstrap_start_reuses_already_present_selection() -> None:
                 f"reuse start failed rc={second.returncode} stdout={second.stdout!r} stderr={second.stderr!r}"
             )
             assert "[bare] already present svc=svc_plain" in second.stdout, second.stdout
-            live_supervisors = supervisor_module._iter_live_supervisors(label)
+            live_supervisors = supervisor_module._iter_live_supervisors(label, scope_key=str(hostworkdir))
             assert len(live_supervisors) == 1, live_supervisors
         finally:
             subprocess.run(
@@ -606,8 +607,88 @@ def test_bootstrap_start_reuses_already_present_selection() -> None:
                 env=base_env,
                 timeout=20,
             )
-            _wait_until_selection_absent(supervisor_module, label=label)
+            _wait_until_selection_absent(supervisor_module, label=label, scope_key=str(hostworkdir))
         print("PASS: test_bootstrap_start_reuses_already_present_selection")
+
+
+def test_bare_start_fails_when_child_exits_within_startup_window() -> None:
+    with tempfile.TemporaryDirectory(prefix="test_gen_bare_deploy_bash_child_exit_") as td:
+        tmpdir = Path(td)
+        hostworkdir = tmpdir / "hostworkdir"
+        outdir = hostworkdir / "gen_bare_deploy_bash"
+        config_path = tmpdir / "deployconf.yaml"
+        hostworkdir.mkdir(parents=True, exist_ok=True)
+        (hostworkdir / "exit_after_delay.py").write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import time
+
+                time.sleep(1.5)
+                raise SystemExit(17)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        config_path.write_text(
+            textwrap.dedent(
+                f"""
+                name_prefix: fluxon-testbed
+                cluster_nodes:
+                  - hostname: node-a
+                    ip: 127.0.0.1
+                    hostworkdir: {hostworkdir}
+                service:
+                  svc_plain:
+                    entrypoint: |
+                      exec python3 "${{HOSTWORKDIR}}/exit_after_delay.py"
+                    node_bind:
+                      node: ["node-a"]
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = _run_generator(config_path=config_path, outdir=outdir)
+        assert result.returncode == 0, f"generator failed: stdout={result.stdout} stderr={result.stderr}"
+
+        start_script = outdir / "start_svc_plain.sh"
+        stop_script = outdir / "stop_svc_plain.sh"
+        supervisor_module = _load_generated_supervisor_module(outdir / "selection_supervisor.py")
+        label = "DaemonSet/fluxon-testbed-svc_plain"
+        repo_root = DEPLOYMENT_DIR.parent
+        env = os.environ.copy()
+        env["NODE_ID"] = "node-a"
+
+        try:
+            start = subprocess.run(
+                [str(start_script)],
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=str(repo_root),
+                env=env,
+                timeout=20,
+            )
+            assert start.returncode != 0, (
+                f"expected startup gate failure rc={start.returncode} stdout={start.stdout!r} stderr={start.stderr!r}"
+            )
+            assert "[bare] probable-ready failed svc=svc_plain" in start.stdout, start.stdout
+            assert "child pid exited" in start.stdout or "child pid changed" in start.stdout, start.stdout
+        finally:
+            subprocess.run(
+                [str(stop_script)],
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=str(repo_root),
+                env=env,
+                timeout=20,
+            )
+            _wait_until_selection_absent(supervisor_module, label=label, scope_key=str(hostworkdir))
+        print("PASS: test_bare_start_fails_when_child_exits_within_startup_window")
 
 
 def test_atomic_group_preserves_nested_heredoc_terminator() -> None:
@@ -749,22 +830,34 @@ def _load_python_module(*, module_name: str, path: Path):
     return module
 
 
-def _wait_until_selection_present(module, *, label: str, timeout_seconds: int = 15) -> None:
+def _wait_until_selection_present(
+    module,
+    *,
+    label: str,
+    scope_key: Optional[str] = None,
+    timeout_seconds: int = 15,
+) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
-        if module._selection_present(label):
+        if module._selection_present(label, scope_key=scope_key):
             return
         time.sleep(0.2)
-    raise RuntimeError(f"timeout waiting selection present: label={label}")
+    raise RuntimeError(f"timeout waiting selection present: label={label} scope_key={scope_key}")
 
 
-def _wait_until_selection_absent(module, *, label: str, timeout_seconds: int = 15) -> None:
+def _wait_until_selection_absent(
+    module,
+    *,
+    label: str,
+    scope_key: Optional[str] = None,
+    timeout_seconds: int = 15,
+) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
-        if not module._iter_live_supervisors(label):
+        if not module._iter_live_supervisors(label, scope_key=scope_key):
             return
         time.sleep(0.2)
-    raise RuntimeError(f"timeout waiting selection absent: label={label}")
+    raise RuntimeError(f"timeout waiting selection absent: label={label} scope_key={scope_key}")
 
 
 if __name__ == "__main__":

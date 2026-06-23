@@ -107,29 +107,75 @@ TestStack 的配置已经单独有设计文档，这里只收口成一句话：
 
 ### 5.1 KV
 
-KV 的入口在 `fluxon_kv/src/config.rs`，对外分成 master 和 client 两个稳定 YAML：
+KV 的入口在 `fluxon_kv/src/config.rs`。稳定结论是：`master` 单独使用 `MasterConfigYaml`；`owner` 和 `external` 共用 `ClientConfigYaml`，再由 `verify()` 按内存贡献收敛成 owner / external / side-transfer worker 三个运行时分支。
 
 | 类型 | 作用 |
 | --- | --- |
 | `MasterConfigYaml` | master 节点输入 |
 | `ClientConfigYaml` | owner / external 输入 |
+| `FluxonKvSpecYaml` | client 侧 `fluxonkv_spec` 子块 |
 | `TestSpecConfig` | 测试和实验分支开关 |
 | `MonitoringConfigYaml` | master 监控块 |
 | `NetworkConfig` | 网络白名单和 IP 映射，共享自 `fluxon_commu_contract` |
 
-核心分流规则：
+`master` 的 YAML 结构：
 
-- `contribute_to_cluster_pool_size` 缺失或全零时，进入 external。
-- `contribute_to_cluster_pool_size.dram > 0` 时，进入 owner。
-- `test_spec_config.side_transfer_role = worker` 时，走 side-transfer worker 分支，强制 `TransferEngineType::P2p`。
+| 字段 | 规则 | 作用 |
+| --- | --- | --- |
+| `instance_key` | 必填 | master 实例标识 |
+| `cluster_name` | 必填 | 集群名 |
+| `etcd_endpoints` | 必填，输入用 raw `host:port` | master 控制面 etcd 地址；校验后归一化成 `http://host:port` |
+| `log_dir` | 必填 | master 日志 / profile 根目录 |
+| `port` | 可选，给出时 `> 0` | master 监听端口 |
+| `protocol` | 可选 | 协议选择；缺省走编译期默认协议 |
+| `monitoring` | 逻辑必填 | Prometheus / remote write / OTLP log 配置块 |
+| `network` | 可选 | 网络白名单和主 IP 扩展映射 |
+| `pprof_duration_seconds` | 可选，给出时 `> 0` | profile 导出时长 |
+| `master_ui` | 可选，但依赖 `monitoring` | 嵌入式 monitor HTTP 服务；当前只暴露 `http_listen_addr` |
+| `test_spec_config` | 可选 | test / fast-path / side-transfer 实验开关 |
+
+`owner` 和 `external` 共用同一套 `ClientConfigYaml` 骨架：
+
+| 顶层字段 | 规则 | 说明 |
+| --- | --- | --- |
+| `instance_key` | 必填 | client 实例标识 |
+| `protocol` | 可选 | 协议选择 |
+| `contribute_to_cluster_pool_size` | 用来分流 owner / external | 缺失或全零是 external；`dram > 0` 是 owner |
+| `pprof_duration_seconds` | 可选，给出时 `> 0` | profile 导出时长 |
+| `fluxonkv_spec` | 必填 | KV 业务配置子块 |
+| `test_spec_config` | 可选 | 测试和 side-transfer 分支开关 |
+
+`fluxonkv_spec` 里，owner / external 共享的基础字段只有这几项：
+
+| 字段 | 作用 |
+| --- | --- |
+| `cluster_name` | 目标集群名 |
+| `shared_memory_path` | 本机共享内存 authority；运行时会拼成 `cluster_name` 作用域路径 |
+| `shared_file_path` | 本机共享文件 authority；运行时会拼成 `cluster_name` 作用域路径 |
+| `p2p_listen_port` | 可选的 P2P 监听端口 |
+
+只有 `owner` 能声明的字段：
+
+| 字段 | 作用 |
+| --- | --- |
+| `etcd_addresses` | owner 连接 etcd 的 raw `host:port` 列表；运行时同时保留 raw 和归一化 `http://host:port` 两份视图 |
+| `sub_cluster` | owner 所属子集群标签 |
+| `large_file_paths.log_root_path` | owner 日志大文件根目录 |
+| `large_file_paths.cache_root_path` | owner cache 大文件根目录 |
+| `redis_compat` | Redis 兼容监听配置 |
+
+`external` 的结构更小：它不声明 `etcd_addresses`、`sub_cluster`、`large_file_paths`、`redis_compat`，这些 owner 侧字段都从 owner 发布的 `shared.json` 继承。本地 YAML 只保留 attach owner 所需的共享 bundle 锚点和本进程参数。
 
 主要约束：
 
 - `monitoring` 在 master 上必填。
 - `master_ui` 依赖 `monitoring`，并作为嵌入式 monitor HTTP 服务启动。
+- `contribute_to_cluster_pool_size` 里的容量都按 16 MiB 对齐；`dram = 0` 但 `vram` 非 0 会被拒绝，避免半 owner 半 external 的模糊状态。
+- owner 模式要求 `contribute_to_cluster_pool_size.dram > 0`，并且必须显式提供 `etcd_addresses`、`sub_cluster`、`large_file_paths`。
+- zero-contribution `external` 模式禁止再写 owner 专属字段；运行时会从 owner `shared.json` 补齐这部分信息。
 - `shared_memory_path` / `shared_file_path` 会拼成 `cluster_name` 作用域路径。
-- `etcd_addresses` 在 client 侧保留 raw `host:port` 和归一化 `http://host:port` 两份视图。
-- zero-contribution `external` / side worker 的 `etcd_addresses`、`sub_cluster`、`large_file_paths` 由 owner 发布的 `shared.json` 继承；本地配置面只保留 attach owner 所需的共享 bundle 锚点和本进程参数。
+- `test_spec_config.side_transfer_role = worker` 不是第三套 YAML，而是 zero-contribution client 的子分支；它强制 `TransferEngineType::P2p`，并关闭 transfer RPC fast path。
+- `test_spec_config.side_transfer_worker_count` 只允许出现在 owner 配置里，用来控制 owner 拉起的 worker 数量。
 
 更细的调用时序、持有生命周期和并发规则分别在 `kv_1_概览与分层.md`、`kv_2_调用时序.md`、`kv_3_参数与并发.md`、`kv_4_allocation_segment_holder生命周期.md` 里展开。
 

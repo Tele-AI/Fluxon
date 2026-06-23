@@ -528,6 +528,13 @@ def _monitoring_block(greptime_http_port: int) -> Dict[str, Any]:
     }
 
 
+def _owner_large_file_paths(workdir: Path) -> Dict[str, str]:
+    return {
+        "log_root_path": str(workdir / "large" / "log" / "owner"),
+        "cache_root_path": str(workdir / "large" / "cache" / "owner"),
+    }
+
+
 def _gen_kv_config(etcd_ep: str, cluster: str, master_port: int, kv_http_port: int,
                     panel_port: int, greptime_http_port: int, workdir: Path) -> Dict[str, Any]:
     shm = str(workdir / "sharemem")
@@ -554,6 +561,7 @@ def _gen_kv_config(etcd_ep: str, cluster: str, master_port: int, kv_http_port: i
                 "shared_memory_path": shm,
                 "shared_file_path": shared_file_path,
                 "sub_cluster": "default",
+                "large_file_paths": _owner_large_file_paths(workdir),
             },
         },
         "kvexternal_rexport_httpserver_http": {
@@ -599,6 +607,7 @@ def _gen_mq_config(etcd_ep: str, cluster: str, master_port: int, greptime_http_p
                 "shared_memory_path": shm,
                 "shared_file_path": shared_file_path,
                 "sub_cluster": "default",
+                "large_file_paths": _owner_large_file_paths(workdir),
             },
         },
         "kvexternal": {
@@ -657,6 +666,7 @@ def _gen_fs_config(etcd_ep: str, cluster: str, master_port: int, panel_port: int
                 "shared_memory_path": shm,
                 "shared_file_path": shared_file_path,
                 "sub_cluster": "default",
+                "large_file_paths": _owner_large_file_paths(workdir),
             },
         },
         "fs_master": {

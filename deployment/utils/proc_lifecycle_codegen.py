@@ -135,26 +135,42 @@ _pid_tree_list() {{
   '
 }}
 
-_pid_tree_has_child_process() {{
+_pid_tree_direct_child_pids() {{
   root_pid="$1"
-  pids="$(_pid_tree_list "$root_pid" 2>/dev/null || true)"
-  if [ -z "$pids" ]; then
+  if [[ ! "$root_pid" =~ ^[0-9]+$ ]]; then
     return 1
   fi
-  # More than one PID means the supervisor has a live child process.
-  set -- $pids
-  if [ "$#" -ge 2 ]; then
-    return 0
+  if ! _pid_exists "$root_pid"; then
+    return 1
   fi
-  return 1
+
+  ps -eo pid=,ppid=,stat= 2>/dev/null | awk -v root="$root_pid" '
+    {{
+      pid=$1;
+      ppid=$2;
+      state=$3;
+      if (ppid != root) {{
+        next;
+      }}
+      if (state ~ /^Z/) {{
+        next;
+      }}
+      out=out " " pid;
+    }}
+    END {{
+      sub(/^ /, "", out);
+      print out;
+    }}
+  '
 }}
 
 wait_service_probably_ready_pid_tree() {{
   # Startup gate contract:
-  # - Success means the supervisor PID stays alive across the fixed startup window.
+  # - Success means one supervised direct child PID becomes visible and stays unchanged across the
+  #   fixed startup window.
   # - During this startup window we do not probe service ports or readiness endpoints.
-  # - We intentionally do not require the child to expose ports, endpoints, or even finish
-  #   spawning before the window ends.
+  # - A child exit or restart inside the window is treated as startup failure even if the
+  #   supervisor process itself stays alive and restarts again later.
   svc="$1"
   root_pid="$2"
   startup_window_seconds="$3"
@@ -170,19 +186,47 @@ wait_service_probably_ready_pid_tree() {{
     return 1
   fi
 
+  observed_child_pid=""
   while true; do
     if ! _pid_exists "$root_pid"; then
       echo "$context probable-ready: supervisor pid exited svc=$svc pid=$root_pid"
       return 1
     fi
 
+    current_child_pids="$(_pid_tree_direct_child_pids "$root_pid" 2>/dev/null || true)"
+    current_child_pid=""
+    if [ -n "$current_child_pids" ]; then
+      set -- $current_child_pids
+      if [ "$#" -ne 1 ]; then
+        echo "$context probable-ready: multiple direct child pids svc=$svc supervisor_pid=$root_pid child_pids=$current_child_pids"
+        return 1
+      fi
+      current_child_pid="$1"
+    fi
+
+    if [ -z "$current_child_pid" ]; then
+      if [ -n "$observed_child_pid" ]; then
+        echo "$context probable-ready: child pid exited svc=$svc supervisor_pid=$root_pid child_pid=$observed_child_pid"
+        return 1
+      fi
+    elif [ -z "$observed_child_pid" ]; then
+      observed_child_pid="$current_child_pid"
+    elif [ "$current_child_pid" != "$observed_child_pid" ]; then
+      echo "$context probable-ready: child pid changed svc=$svc supervisor_pid=$root_pid child_pid=$observed_child_pid replacement_child_pid=$current_child_pid"
+      return 1
+    fi
+
     now=$(date +%s)
     if [ "$now" -ge "$deadline_ts" ]; then
-      echo "$context probable-ready: ok svc=$svc startup_window_seconds=$startup_window_seconds pid=$root_pid"
+      if [ -z "$observed_child_pid" ]; then
+        echo "$context probable-ready: no child pid observed svc=$svc supervisor_pid=$root_pid startup_window_seconds=$startup_window_seconds"
+        return 1
+      fi
+      echo "$context probable-ready: ok svc=$svc startup_window_seconds=$startup_window_seconds supervisor_pid=$root_pid child_pid=$observed_child_pid"
       return 0
     fi
 
-    sleep 1
+    sleep 0.2
   done
 }}
 

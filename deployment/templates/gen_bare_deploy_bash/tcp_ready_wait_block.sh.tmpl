@@ -1,6 +1,0 @@
-if [[ "${SERVICE_PORT:-}" =~ ^[0-9]+$ ]]; then
-  if ! wait_service_tcp_ready "$SERVICE" "$HOST_IP" "$SERVICE_PORT" {{TCP_READY_STABLE_SECONDS}} {{TCP_READY_DEADLINE_TS}} "{{CONTEXT}}"; then
-    echo "{{CONTEXT}} tcp-ready failed svc=$SERVICE host=$HOST_IP port=$SERVICE_PORT"
-    exit 1
-  fi
-fi
