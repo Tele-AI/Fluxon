@@ -4,8 +4,6 @@ from __future__ import annotations
 from _common import REPO_ROOT, call, parse_python_passthrough
 
 
-TEST_REQUIREMENTS = ["ops", "python-wheel-build", "submodules"]
-
 
 def main() -> int:
     python, passthrough = parse_python_passthrough(

@@ -59,7 +59,7 @@ from top_attention_index_helper import (
 #
 # Keep them decoupled to avoid accidental "schema bumps" across unrelated layers.
 SCHEMA_VERSION = 1
-SUITE_SCHEMA_VERSION = 9
+SUITE_SCHEMA_VERSION = 10
 
 # Enums (case-sensitive strings; internal routing only - not part of suite config schema)
 SCENE_KIND_INFER = "INFER"
@@ -78,12 +78,6 @@ _RUN_SUMMARY_INCOMPLETE_ERROR = "INCOMPLETE: run started but did not reach final
 _RUN_EXCEPTION_FILENAME = "exception.txt"
 CI_PRESERVED_APPLY_IDS_SCHEMA_VERSION = 1
 CI_PRESERVED_APPLY_IDS_FILENAME = "ci_preserved_apply_ids.yaml"
-CI_RUNTIME_CONTRACT_CLUSTER_KV_OWNER = "cluster_kv_owner"
-CI_RUNTIME_CONTRACT_RUST_SELF_MANAGED = "rust_self_managed"
-CI_RUNTIME_CONTRACT_IDS = (
-    CI_RUNTIME_CONTRACT_CLUSTER_KV_OWNER,
-    CI_RUNTIME_CONTRACT_RUST_SELF_MANAGED,
-)
 CI_PREPARE_KIND_SETUP_DEV_ENV = "setup_dev_env"
 CI_PREPARE_KIND_ONLINE_DOCKER_IMAGE = "online_docker_image"
 CI_PREPARE_KIND_IDS = (
@@ -98,7 +92,28 @@ RUNTIME_LAYER_ORDER = (
     RUNTIME_LAYER_BASE,
     RUNTIME_LAYER_CASE,
 )
+CI_REQUIREMENT_TESTBED_ETCD = "testbed_etcd"
+CI_REQUIREMENT_TESTBED_GREPTIME = "testbed_greptime"
+CI_REQUIREMENT_MASTER = "master"
+CI_REQUIREMENT_OWNER_0 = "owner_0"
+CI_REQUIREMENT_CI_RUNNER = "ci_runner"
+CI_REQUIREMENT_IDS = (
+    CI_REQUIREMENT_TESTBED_ETCD,
+    CI_REQUIREMENT_TESTBED_GREPTIME,
+    CI_REQUIREMENT_MASTER,
+    CI_REQUIREMENT_OWNER_0,
+    CI_REQUIREMENT_CI_RUNNER,
+)
 CI_BASE_RUNTIME_SERVICE_IDS = ("etcd", "greptime")
+CI_BASE_RUNTIME_REQUIREMENT_IDS = {
+    "etcd": CI_REQUIREMENT_TESTBED_ETCD,
+    "greptime": CI_REQUIREMENT_TESTBED_GREPTIME,
+}
+CI_REQUIREMENTS_WITH_PROFILE_CONFIG = (
+    CI_REQUIREMENT_MASTER,
+    CI_REQUIREMENT_OWNER_0,
+    CI_REQUIREMENT_CI_RUNNER,
+)
 CI_CLUSTER_MEMBER_INSTANCE_IDS = ("master", "owner_0")
 CI_CLUSTER_RUNTIME_INSTANCE_IDS = ("master", "owner_0")
 CI_CASE_RUNTIME_INSTANCE_IDS = ("master", "owner_0", "ci_runner")
@@ -312,21 +327,6 @@ def _test_stack_ops_namespace() -> str:
         )
     return raw
 
-# Suite schema keeps scene as purpose+subject and pushes concrete sizing/topology into scale.
-SCENE_SUBJECT_KV = "kv"
-SCENE_SUBJECT_MQ = "mq"
-SCENE_SUBJECT_FS = "fs"
-SCENE_SUBJECT_RUST = "rust"
-SCENE_SUBJECT_DOC_PAGE = "doc_page"
-SCENE_SUBJECT_INFER = "infer"
-SCENE_SUBJECTS_ALLOWED = {
-    SCENE_SUBJECT_KV,
-    SCENE_SUBJECT_MQ,
-    SCENE_SUBJECT_FS,
-    SCENE_SUBJECT_RUST,
-    SCENE_SUBJECT_DOC_PAGE,
-    SCENE_SUBJECT_INFER,
-}
 TEST_STACK_REQUEST_DISTRIBUTION_UNIFORM = "uniform"
 TEST_STACK_REQUEST_DISTRIBUTION_ZIPFIAN = "zipfian"
 TEST_STACK_REQUEST_DISTRIBUTIONS_ALLOWED = {
@@ -356,6 +356,11 @@ def _runner_native_ci_scene_ids() -> Tuple[str, ...]:
     return (
         "ci_top_attention_doc_page_build",
         "ci_top_attention_bin_kvtest",
+        "ci_top_attention_config_kv",
+        "ci_top_attention_config_fs",
+        "ci_top_attention_config_mq",
+        "ci_top_attention_ctrl_c_kv",
+        "ci_top_attention_ctrl_c_mq",
     )
 
 
@@ -2580,13 +2585,28 @@ def _ci_has_instance(resolved_case: Dict[str, Any], *, instance_id: str) -> bool
     return instance_id in set(_ci_case_instance_ids(resolved_case))
 
 
-def _ci_runtime_contract_id(resolved_case: Dict[str, Any]) -> str:
+def _ci_requirement_ids(resolved_case: Dict[str, Any]) -> Tuple[str, ...]:
     scene = _require_dict(resolved_case.get("scene"), "resolved_case.scene")
     ci = _require_dict(scene.get("ci"), "resolved_case.scene.ci")
-    return _require_ci_runtime_contract(
-        ci.get("runtime_contract"),
-        "resolved_case.scene.ci.runtime_contract",
+    return tuple(
+        _parse_ci_requirements(
+            ci.get("requirements"),
+            "resolved_case.scene.ci.requirements",
+        )
     )
+
+
+def _ci_has_requirement(resolved_case: Dict[str, Any], *, requirement_id: str) -> bool:
+    return requirement_id in set(_ci_requirement_ids(resolved_case))
+
+
+def _selected_ci_requirement_configs(resolved_case: Dict[str, Any]) -> Dict[str, Any]:
+    profile = _require_dict(resolved_case.get("profile"), "resolved_case.profile")
+    ci = _require_dict(profile.get("ci"), "resolved_case.profile.ci")
+    raw_requirement_configs = ci.get("requirements")
+    if raw_requirement_configs is None:
+        return {}
+    return _require_dict(raw_requirement_configs, "resolved_case.profile.ci.requirements")
 
 
 def _case_family_id(case_kind: str) -> str:
@@ -2630,9 +2650,14 @@ def _close_case_runtime_locks(runtime_tracking: _CaseRuntimeTracking) -> None:
         runtime_tracking.controller_lock_fp = None
 
 
-def _build_runtime_model(case_family: str) -> Dict[str, Any]:
+def _build_runtime_model(case_family: str, *, ci_requirement_ids: Optional[Tuple[str, ...]] = None) -> Dict[str, Any]:
     if case_family == CASE_FAMILY_CI:
-        case_instance_ids = list(CI_RUNTIME_LAYER_INSTANCE_IDS[RUNTIME_LAYER_CASE])
+        requirement_ids = set(ci_requirement_ids or ())
+        case_instance_ids = [
+            instance_id
+            for instance_id in CI_CASE_RUNTIME_INSTANCE_IDS
+            if instance_id in requirement_ids
+        ]
     elif case_family in (CASE_FAMILY_INFER, CASE_FAMILY_BENCH):
         case_instance_ids = []
     else:
@@ -2643,7 +2668,12 @@ def _build_runtime_model(case_family: str) -> Dict[str, Any]:
         RUNTIME_LAYER_CASE: {"instance_ids": case_instance_ids},
     }
     if case_family == CASE_FAMILY_CI:
-        model[RUNTIME_LAYER_BASE]["service_ids"] = list(CI_BASE_RUNTIME_SERVICE_IDS)
+        requirement_ids = set(ci_requirement_ids or ())
+        model[RUNTIME_LAYER_BASE]["service_ids"] = [
+            service_id
+            for service_id in CI_BASE_RUNTIME_SERVICE_IDS
+            if CI_BASE_RUNTIME_REQUIREMENT_IDS[service_id] in requirement_ids
+        ]
     return model
 
 
@@ -3302,7 +3332,7 @@ def _ci_runner_runtime_stage(resolved_case: Dict[str, Any]) -> _RemoteRunDirStag
     if _ci_has_instance(resolved_case, instance_id="master"):
         verify_relpaths.append("configs/ci_master.yaml")
     include_relpaths = list(CI_RUNNER_REMOTE_STAGE_INCLUDE_RELPATHS)
-    if _ci_runtime_contract_id(resolved_case) == CI_RUNTIME_CONTRACT_CLUSTER_KV_OWNER:
+    if _ci_has_requirement(resolved_case, requirement_id=CI_REQUIREMENT_MASTER):
         for relpath in ("fluxon_release", "test_rsc"):
             if relpath not in include_relpaths:
                 include_relpaths.append(relpath)
@@ -3667,9 +3697,12 @@ def _prepare_ci_case(
     if prepare_env_exports:
         _write_ci_prepare_env_script(run_dir=run_dir, exports=prepare_env_exports)
 
-    profile = _require_dict(resolved_case.get("profile"), "resolved_case.profile")
-    profile_ci = _require_dict(profile.get("ci"), "resolved_case.profile.ci")
-    if profile_ci.get("scene_config") is not None:
+    if _scene_id_uses_runner_native_ci_commands(
+        _require_str(
+            _require_dict(resolved_case.get("case"), "resolved_case.case").get("scene_id"),
+            "resolved_case.case.scene_id",
+        )
+    ):
         _write_ci_scene_config_yaml(
             resolved_case,
             run_dir=run_dir,
@@ -4331,8 +4364,8 @@ def _ci_base_runtime_service(resolved_case: Dict[str, Any], *, service_id: str) 
 
 
 def _ci_base_runtime_service_target_name(resolved_case: Dict[str, Any], *, service_id: str) -> str:
-    svc = _ci_base_runtime_service(resolved_case, service_id=service_id)
-    return _require_str(svc.get("target"), f"resolved_case.profile.ci.runtime.base_runtime[{service_id!r}].target")
+    _ = resolved_case
+    return _testbed_service_target_name(service_id)
 
 
 def _target_uses_local_loopback(
@@ -4359,28 +4392,13 @@ def _ci_base_runtime_service_target_ip(resolved_case: Dict[str, Any], *, service
 
 
 def _ci_base_runtime_service_port(resolved_case: Dict[str, Any], *, service_id: str) -> int:
-    svc = _ci_base_runtime_service(resolved_case, service_id=service_id)
-    endpoint = _require_dict(
-        svc.get("endpoint"),
-        f"resolved_case.profile.ci.runtime.base_runtime[{service_id!r}].endpoint",
-    )
-    return _require_int(
-        endpoint.get("host_port"),
-        f"resolved_case.profile.ci.runtime.base_runtime[{service_id!r}].endpoint.host_port",
-        min_v=1,
-    )
+    _, port = _testbed_service_host_port(service_id, ctx=f"CI {service_id} service")
+    return port
 
 
 def _ci_base_runtime_service_url(resolved_case: Dict[str, Any], *, service_id: str) -> str:
-    svc = _ci_base_runtime_service(resolved_case, service_id=service_id)
-    endpoint = _require_dict(
-        svc.get("endpoint"),
-        f"resolved_case.profile.ci.runtime.base_runtime[{service_id!r}].endpoint",
-    )
-    scheme = _require_str(
-        endpoint.get("scheme"),
-        f"resolved_case.profile.ci.runtime.base_runtime[{service_id!r}].endpoint.scheme",
-    )
+    _ = resolved_case
+    scheme = _ENDPOINT_SCHEME_HTTP
     host = _ci_base_runtime_service_target_ip(resolved_case, service_id=service_id)
     port = _ci_base_runtime_service_port(resolved_case, service_id=service_id)
     if scheme == _ENDPOINT_SCHEME_HTTP:
@@ -5651,23 +5669,6 @@ def _require_id_list(raw: Any, ctx: str) -> List[str]:
     return out
 
 
-def _require_scene_subject(raw: Any, ctx: str) -> str:
-    subject = _require_str(raw, ctx).strip()
-    if subject not in SCENE_SUBJECTS_ALLOWED:
-        raise ValueError(f"{ctx} invalid subject: {subject!r}")
-    return subject
-
-
-def _infer_test_stack_subject_from_mode(mode: str) -> str:
-    if mode == TEST_STACK_MODE_MPMC:
-        return SCENE_SUBJECT_MQ
-    if mode in (TEST_STACK_MODE_KVSTORE, TEST_STACK_MODE_KVSTORE_WITH_LOCAL_CACHE, TEST_STACK_MODE_RPC):
-        return SCENE_SUBJECT_KV
-    if mode == TEST_STACK_MODE_PY_FS:
-        return SCENE_SUBJECT_FS
-    raise ValueError(f"unsupported test_stack mode for subject inference: {mode!r}")
-
-
 def _require_test_stack_backend_kind(raw: Any, ctx: str) -> str:
     if raw is None:
         return TEST_STACK_BACKEND_FLUXON
@@ -5679,23 +5680,37 @@ def _require_test_stack_backend_kind(raw: Any, ctx: str) -> str:
     return kind
 
 
-def _test_stack_backend_supports_subject(*, backend_kind: str, subject: str) -> bool:
+def _test_stack_backend_supports_mode(*, backend_kind: str, mode: str) -> bool:
     if backend_kind == TEST_STACK_BACKEND_FLUXON:
-        return subject in {SCENE_SUBJECT_KV, SCENE_SUBJECT_MQ, SCENE_SUBJECT_FS}
+        return mode in (
+            TEST_STACK_MODE_MPMC,
+            TEST_STACK_MODE_KVSTORE,
+            TEST_STACK_MODE_KVSTORE_WITH_LOCAL_CACHE,
+            TEST_STACK_MODE_PY_FS,
+            TEST_STACK_MODE_RPC,
+        )
     if backend_kind == TEST_STACK_BACKEND_REDIS:
-        return subject == SCENE_SUBJECT_KV
+        return mode in (
+            TEST_STACK_MODE_KVSTORE,
+            TEST_STACK_MODE_KVSTORE_WITH_LOCAL_CACHE,
+            TEST_STACK_MODE_RPC,
+        )
     if backend_kind == TEST_STACK_BACKEND_MOONCAKE:
-        return subject == SCENE_SUBJECT_KV
+        return mode in (
+            TEST_STACK_MODE_KVSTORE,
+            TEST_STACK_MODE_KVSTORE_WITH_LOCAL_CACHE,
+            TEST_STACK_MODE_RPC,
+        )
     if backend_kind == TEST_STACK_BACKEND_ALLUXIO:
-        return subject == SCENE_SUBJECT_FS
+        return mode == TEST_STACK_MODE_PY_FS
     raise ValueError(f"unsupported test_stack backend_kind: {backend_kind!r}")
 
 
-def _validate_test_stack_backend_subject(*, backend_kind: str, subject: str, ctx: str) -> None:
-    if _test_stack_backend_supports_subject(backend_kind=backend_kind, subject=subject):
+def _validate_test_stack_backend_mode(*, backend_kind: str, mode: str, ctx: str) -> None:
+    if _test_stack_backend_supports_mode(backend_kind=backend_kind, mode=mode):
         return
     raise ValueError(
-        f"{ctx} backend_kind={backend_kind!r} does not support subject={subject!r}"
+        f"{ctx} backend_kind={backend_kind!r} does not support mode={mode!r}"
     )
 
 
@@ -5729,27 +5744,30 @@ def _test_stack_backend_uses_dedicated_kv_owners(*, backend_kind: str, mode: str
     return False
 
 
-def _require_ci_runtime_contract(raw: Any, ctx: str) -> str:
-    runtime_contract = _require_str(raw, ctx).strip()
-    if runtime_contract not in CI_RUNTIME_CONTRACT_IDS:
-        raise ValueError(f"{ctx} invalid ci runtime_contract: {runtime_contract!r}")
-    return runtime_contract
+def _require_ci_requirement_id(raw: Any, ctx: str) -> str:
+    requirement_id = _require_str(raw, ctx).strip()
+    if requirement_id not in CI_REQUIREMENT_IDS:
+        raise ValueError(f"{ctx} invalid ci requirement: {requirement_id!r}")
+    return requirement_id
 
 
-def _validate_test_stack_subject_mode(*, subject: str, mode: str, ctx: str) -> None:
-    if subject == SCENE_SUBJECT_MQ:
-        if mode != TEST_STACK_MODE_MPMC:
-            raise ValueError(f"{ctx} subject={subject!r} requires mode={TEST_STACK_MODE_MPMC!r}")
-        return
-    if subject == SCENE_SUBJECT_KV:
-        if mode not in (TEST_STACK_MODE_KVSTORE, TEST_STACK_MODE_KVSTORE_WITH_LOCAL_CACHE, TEST_STACK_MODE_RPC):
-            raise ValueError(f"{ctx} subject={subject!r} requires a KV-family mode")
-        return
-    if subject == SCENE_SUBJECT_FS:
-        if mode != TEST_STACK_MODE_PY_FS:
-            raise ValueError(f"{ctx} subject={subject!r} requires mode={TEST_STACK_MODE_PY_FS!r}")
-        return
-    raise ValueError(f"{ctx} unsupported test_stack subject: {subject!r}")
+def _parse_ci_requirements(raw_requirements: Any, ctx: str) -> List[str]:
+    requirements = _require_list(raw_requirements, ctx)
+    if not requirements:
+        raise ValueError(f"{ctx} must be non-empty")
+    out: List[str] = []
+    seen: set[str] = set()
+    for index, raw_requirement in enumerate(requirements):
+        requirement_id = _require_ci_requirement_id(raw_requirement, f"{ctx}[{index}]")
+        if requirement_id in seen:
+            raise ValueError(f"{ctx} contains duplicate requirement: {requirement_id!r}")
+        seen.add(requirement_id)
+        out.append(requirement_id)
+    if CI_REQUIREMENT_CI_RUNNER not in seen:
+        raise ValueError(f"{ctx} must include {CI_REQUIREMENT_CI_RUNNER!r}")
+    if CI_REQUIREMENT_OWNER_0 in seen and CI_REQUIREMENT_MASTER not in seen:
+        raise ValueError(f"{ctx} cannot include {CI_REQUIREMENT_OWNER_0!r} without {CI_REQUIREMENT_MASTER!r}")
+    return out
 
 
 def _parse_scene_value_size_weighted_set(raw_val: Any, *, ctx: str) -> List[Dict[str, Any]]:
@@ -6240,15 +6258,11 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
     if kind == SCENE_KIND_CI:
         _forbid_unknown_keys(item, {"ci", "select"}, ctx)
         ci = _require_dict(item.get("ci"), f"{ctx}.ci")
-        _forbid_unknown_keys(ci, {"subject", "runtime_contract", "prepare"}, f"{ctx}.ci")
-        subject = _require_scene_subject(ci.get("subject"), f"{ctx}.ci.subject")
-        if subject == SCENE_SUBJECT_INFER:
-            raise ValueError(f"{ctx}.ci.subject must not be {SCENE_SUBJECT_INFER!r}")
+        _forbid_unknown_keys(ci, {"requirements", "prepare"}, f"{ctx}.ci")
         parsed_ci = {
-            "subject": subject,
-            "runtime_contract": _require_ci_runtime_contract(
-                ci.get("runtime_contract"),
-                f"{ctx}.ci.runtime_contract",
+            "requirements": _parse_ci_requirements(
+                ci.get("requirements"),
+                f"{ctx}.ci.requirements",
             ),
         }
         raw_prepare = ci.get("prepare")
@@ -6262,7 +6276,6 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
     _forbid_unknown_keys(
         ts,
         {
-            "subject",
             "mode",
             "role_weights",
             "read_ratio",
@@ -6281,13 +6294,7 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
         f"{ctx}.test_stack",
     )
     mode = _require_str(ts.get("mode"), f"{ctx}.test_stack.mode")
-    subject_raw = ts.get("subject")
-    subject = _infer_test_stack_subject_from_mode(mode)
-    if subject_raw is not None:
-        subject = _require_scene_subject(subject_raw, f"{ctx}.test_stack.subject")
-        _validate_test_stack_subject_mode(subject=subject, mode=mode, ctx=f"{ctx}.test_stack")
-
-    out_ts: Dict[str, Any] = {"subject": subject, "mode": mode}
+    out_ts: Dict[str, Any] = {"mode": mode}
     role_weights = ts.get("role_weights")
     if mode == TEST_STACK_MODE_MPMC:
         rw = _require_dict(role_weights, f"{ctx}.test_stack.role_weights")
@@ -6841,6 +6848,36 @@ def _validate_profile_ci_runtime_block(runtime: Dict[str, Any], ctx: str, target
             raise ValueError(f"{tpl_ctx}.endpoint must be omitted")
 
 
+def _validate_profile_ci_requirement_configs(
+    requirement_configs: Dict[str, Any],
+    *,
+    ctx: str,
+    target_ip_map: Dict[str, Any],
+) -> None:
+    _forbid_unknown_keys(requirement_configs, set(CI_REQUIREMENTS_WITH_PROFILE_CONFIG), ctx)
+
+    case_runtime: Dict[str, Any] = {}
+    for instance_id in (CI_REQUIREMENT_MASTER, CI_REQUIREMENT_OWNER_0, CI_REQUIREMENT_CI_RUNNER):
+        raw_cfg = requirement_configs.get(instance_id)
+        if raw_cfg is None:
+            continue
+        case_runtime[instance_id] = _require_dict(raw_cfg, f"{ctx}[{instance_id!r}]")
+    if case_runtime:
+        _validate_profile_ci_runtime_block(
+            {
+                RUNTIME_LAYER_BASE: {
+                    service_id: {
+                        "target": next(iter(target_ip_map.keys())),
+                        "endpoint": {"scheme": _ENDPOINT_SCHEME_HTTP, "host_port": 1},
+                    }
+                    for service_id in CI_BASE_RUNTIME_SERVICE_IDS
+                },
+                RUNTIME_LAYER_CASE: case_runtime,
+            },
+            f"{ctx}.__case_runtime_validation__",
+            target_ip_map,
+        )
+
 def _require_clean_relpath(raw: Any, ctx: str) -> str:
     relpath = _require_str(raw, ctx).strip()
     if not relpath:
@@ -7270,7 +7307,7 @@ def _parse_profile(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
 
     if runtime.get("ci") is not None:
         ci = _require_dict(runtime.get("ci"), f"{ctx}.runtime.ci")
-        _forbid_unknown_keys(ci, {"deploy", "runtime_contracts", "scene_configs"}, f"{ctx}.runtime.ci")
+        _forbid_unknown_keys(ci, {"deploy", "requirements", "scene_configs"}, f"{ctx}.runtime.ci")
         deploy = _require_dict(ci.get("deploy"), f"{ctx}.runtime.ci.deploy")
         _validate_profile_deploy_block(
             deploy,
@@ -7279,16 +7316,16 @@ def _parse_profile(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
             allow_target_tokens=False,
         )
         target_ip_map = _require_dict(deploy.get("target_ip_map"), f"{ctx}.runtime.ci.deploy.target_ip_map")
-        runtime_contracts = _require_dict(ci.get("runtime_contracts"), f"{ctx}.runtime.ci.runtime_contracts")
-        if not runtime_contracts:
-            raise ValueError(f"{ctx}.runtime.ci.runtime_contracts must be non-empty")
-        for contract_id, raw_runtime in runtime_contracts.items():
-            _ = _require_ci_runtime_contract(contract_id, f"{ctx}.runtime.ci.runtime_contracts key")
-            _validate_profile_ci_runtime_block(
-                _require_dict(raw_runtime, f"{ctx}.runtime.ci.runtime_contracts[{contract_id!r}]"),
-                f"{ctx}.runtime.ci.runtime_contracts[{contract_id!r}]",
-                target_ip_map,
-            )
+        raw_requirement_configs = ci.get("requirements")
+        if raw_requirement_configs is None:
+            requirement_configs = {}
+        else:
+            requirement_configs = _require_dict(raw_requirement_configs, f"{ctx}.runtime.ci.requirements")
+        _validate_profile_ci_requirement_configs(
+            requirement_configs,
+            ctx=f"{ctx}.runtime.ci.requirements",
+            target_ip_map=target_ip_map,
+        )
         scene_configs = ci.get("scene_configs")
         if scene_configs is not None:
             scene_configs = _require_dict(scene_configs, f"{ctx}.runtime.ci.scene_configs")
@@ -7441,24 +7478,44 @@ def _expand_cases(suite: _Suite) -> List[_ResolvedCase]:
                     if profile_runtime.get("ci") is None:
                         raise ValueError(f"scene[{scene_id}] kind={scene_kind} selects profile[{profile_id}] without ci block")
                     scene_ci = _require_dict(scene.get("ci"), f"scene[{scene_id}].ci")
-                    runtime_contract = _require_ci_runtime_contract(
-                        scene_ci.get("runtime_contract"),
-                        f"scene[{scene_id}].ci.runtime_contract",
+                    requirement_ids = _parse_ci_requirements(
+                        scene_ci.get("requirements"),
+                        f"scene[{scene_id}].ci.requirements",
                     )
                     profile_ci = _require_dict(profile_runtime.get("ci"), f"profile[{profile_id}].runtime.ci")
-                    runtime_contracts = _require_dict(
-                        profile_ci.get("runtime_contracts"),
-                        f"profile[{profile_id}].runtime.ci.runtime_contracts",
-                    )
-                    if runtime_contract not in runtime_contracts:
+                    raw_requirement_configs = profile_ci.get("requirements")
+                    if raw_requirement_configs is None:
+                        requirement_configs = {}
+                    else:
+                        requirement_configs = _require_dict(
+                            raw_requirement_configs,
+                            f"profile[{profile_id}].runtime.ci.requirements",
+                        )
+                    missing_requirements = [
+                        requirement_id
+                        for requirement_id in requirement_ids
+                        if requirement_id in CI_REQUIREMENTS_WITH_PROFILE_CONFIG and requirement_id not in requirement_configs
+                    ]
+                    if missing_requirements:
                         raise ValueError(
-                            f"scene[{scene_id}] runtime_contract={runtime_contract!r} is missing from profile[{profile_id}].runtime.ci.runtime_contracts"
+                            f"scene[{scene_id}] requirements {missing_requirements!r} are missing from "
+                            f"profile[{profile_id}].runtime.ci.requirements"
                         )
                 elif scene_kind == SCENE_KIND_TEST_STACK:
                     profile_ts = _require_dict(profile_runtime.get("test_stack"), f"profile[{profile_id}].runtime.test_stack")
+                    scene_ts = _require_dict(scene.get("test_stack"), f"scene[{scene_id}].test_stack")
+                    mode = _require_str(scene_ts.get("mode"), f"scene[{scene_id}].test_stack.mode")
+                    backend_kind = _require_test_stack_backend_kind(
+                        profile_ts.get("kind"),
+                        f"profile[{profile_id}].runtime.test_stack.kind",
+                    )
+                    _validate_test_stack_backend_mode(
+                        backend_kind=backend_kind,
+                        mode=mode,
+                        ctx=f"profile[{profile_id}].runtime.test_stack.kind",
+                    )
                     deploy = _require_dict(profile_ts.get("deploy"), f"profile[{profile_id}].runtime.test_stack.deploy")
                     target_ip_map = _require_dict(deploy.get("target_ip_map"), f"profile[{profile_id}].runtime.test_stack.deploy.target_ip_map")
-                    scene_ts = _require_dict(scene.get("test_stack"), f"scene[{scene_id}].test_stack")
                     role_plan = _build_test_stack_role_plan(
                         scene_ts,
                         scale,
@@ -7697,6 +7754,66 @@ def _runner_native_ci_commands_for_case(case: _ResolvedCase, *, ctx: str) -> Lis
                     "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
                 ),
                 "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_config_kv":
+        return [
+            {
+                "id": "top_attention_config_kv",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_config_kv.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 3600,
+            }
+        ]
+    if scene_id == "ci_top_attention_config_fs":
+        return [
+            {
+                "id": "top_attention_config_fs",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_config_fs.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 3600,
+            }
+        ]
+    if scene_id == "ci_top_attention_config_mq":
+        return [
+            {
+                "id": "top_attention_config_mq",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_config_mq.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 7200,
+            }
+        ]
+    if scene_id == "ci_top_attention_ctrl_c_kv":
+        return [
+            {
+                "id": "top_attention_ctrl_c_kv",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_ctrl_c_kv.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 3600,
+            }
+        ]
+    if scene_id == "ci_top_attention_ctrl_c_mq":
+        return [
+            {
+                "id": "top_attention_ctrl_c_mq",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_ctrl_c_mq.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 7200,
             }
         ]
     raise ValueError(f"{ctx} unsupported runner-native CI scene: {scene_id!r}")
@@ -8513,9 +8630,9 @@ def _build_resolved_case_yaml(
             raise ValueError(f"ci_commands must be provided for CI case: {case.case_id}")
 
         scene_ci = _require_dict(scene_src.get("ci"), "resolved_case.scene_source.ci")
-        runtime_contract = _require_ci_runtime_contract(
-            scene_ci.get("runtime_contract"),
-            "resolved_case.scene_source.ci.runtime_contract",
+        requirement_ids = _parse_ci_requirements(
+            scene_ci.get("requirements"),
+            "resolved_case.scene_source.ci.requirements",
         )
         topology = _require_test_stack_machine_count(scale_src.get("topology"), "resolved_case.scale_source.topology")
         targets = copy.deepcopy(_require_dict(scale_src.get("targets"), "resolved_case.scale_source.targets"))
@@ -8530,16 +8647,32 @@ def _build_resolved_case_yaml(
         deploy_out = copy.deepcopy(_require_dict(profile_ci.get("deploy"), "resolved_case.profile_source.ci.deploy"))
         deploy_out["release_root"] = materialized_release_root
         deploy_out["test_rsc_root"] = materialized_test_rsc_root
-        runtime_contracts = _require_dict(
-            profile_ci.get("runtime_contracts"),
-            "resolved_case.profile_source.ci.runtime_contracts",
-        )
-        selected_runtime = copy.deepcopy(
-            _require_dict(
-                runtime_contracts.get(runtime_contract),
-                f"resolved_case.profile_source.ci.runtime_contracts[{runtime_contract!r}]",
+        raw_requirement_configs = profile_ci.get("requirements")
+        if raw_requirement_configs is None:
+            requirement_configs = {}
+        else:
+            requirement_configs = _require_dict(
+                raw_requirement_configs,
+                "resolved_case.profile_source.ci.requirements",
             )
-        )
+        selected_requirement_configs: Dict[str, Any] = {}
+        selected_base_runtime: Dict[str, Any] = {}
+        selected_case_runtime: Dict[str, Any] = {}
+        for requirement_id in requirement_ids:
+            for service_id, service_requirement_id in CI_BASE_RUNTIME_REQUIREMENT_IDS.items():
+                if requirement_id == service_requirement_id:
+                    selected_base_runtime[service_id] = {}
+            if requirement_id not in CI_REQUIREMENTS_WITH_PROFILE_CONFIG:
+                continue
+            requirement_cfg = copy.deepcopy(
+                _require_dict(
+                    requirement_configs.get(requirement_id),
+                    f"resolved_case.profile_source.ci.requirements[{requirement_id!r}]",
+                )
+            )
+            selected_requirement_configs[requirement_id] = requirement_cfg
+            if requirement_id in CI_CASE_RUNTIME_INSTANCE_IDS:
+                selected_case_runtime[requirement_id] = requirement_cfg
         scene_configs = profile_ci.get("scene_configs")
         selected_scene_config = None
         if scene_configs is not None:
@@ -8555,8 +8688,7 @@ def _build_resolved_case_yaml(
 
         scene = {
             "ci": {
-                "subject": _require_scene_subject(scene_ci.get("subject"), "resolved_case.scene_source.ci.subject"),
-                "runtime_contract": runtime_contract,
+                "requirements": list(requirement_ids),
                 "commands": copy.deepcopy(ci_commands),
             }
         }
@@ -8566,8 +8698,11 @@ def _build_resolved_case_yaml(
         profile = {
             "deploy": deploy_out,
             "ci": {
-                "runtime_contract": runtime_contract,
-                "runtime": selected_runtime,
+                "requirements": selected_requirement_configs,
+                "runtime": {
+                    RUNTIME_LAYER_BASE: selected_base_runtime,
+                    RUNTIME_LAYER_CASE: selected_case_runtime,
+                },
             },
         }
         if selected_scene_config is not None:
@@ -8578,16 +8713,15 @@ def _build_resolved_case_yaml(
         duration_seconds = _require_int(scale_src.get("duration_seconds"), "scale.duration_seconds", min_v=1)
         topology = copy.deepcopy(scale_src.get("topology"))
         mode = _require_str(scene_ts.get("mode"), "scene.test_stack.mode")
-        subject = _require_scene_subject(scene_ts.get("subject"), "scene.test_stack.subject")
 
         profile_ts = _require_dict(profile_runtime_src.get("test_stack"), "resolved_case.profile_source.runtime.test_stack")
         backend_kind = _require_test_stack_backend_kind(
             profile_ts.get("kind"),
             "resolved_case.profile_source.test_stack.kind",
         )
-        _validate_test_stack_backend_subject(
+        _validate_test_stack_backend_mode(
             backend_kind=backend_kind,
-            subject=subject,
+            mode=mode,
             ctx="resolved_case.profile_source.test_stack.kind",
         )
         deploy_out = copy.deepcopy(_require_dict(profile_ts.get("deploy"), "resolved_case.profile_source.test_stack.deploy"))
@@ -8694,7 +8828,10 @@ def _build_resolved_case_yaml(
             "run_dir": run_dir,
             "stack_identity": stack_identity,
         },
-        "runtime_model": _build_runtime_model(case_family),
+        "runtime_model": _build_runtime_model(
+            case_family,
+            ci_requirement_ids=tuple(requirement_ids) if case_family == CASE_FAMILY_CI else None,
+        ),
         "artifact_set": {
             "id": artifact_set_id,
             "release_source": artifact_release_source,
@@ -9687,10 +9824,9 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         ts_profile.get("runtime_env"),
         "resolved_case.profile.test_stack.runtime_env",
     )
-    scene_subject = _require_scene_subject(ts_scene.get("subject"), "resolved_case.scene.test_stack.subject")
-    _validate_test_stack_backend_subject(
+    _validate_test_stack_backend_mode(
         backend_kind=backend_kind,
-        subject=scene_subject,
+        mode=scene_mode,
         ctx="resolved_case.profile.test_stack.kind",
     )
     port_alloc = _require_dict(ts_profile.get("port_alloc"), "profile.test_stack.port_alloc")
@@ -11313,6 +11449,34 @@ def _active_test_stack_target_ip_map(*, ctx: str) -> Dict[str, str]:
     if not out:
         raise ValueError(f"{ctx} active TEST_STACK deployconf has no cluster nodes")
     return out
+
+
+def _testbed_service_host_port(service_id: str, *, ctx: str) -> Tuple[str, int]:
+    deployconf_path = _load_test_bed_deployconf_path()
+    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"deployconf {deployconf_path}")
+    services = _require_dict(deployconf.get("service"), "deployconf.service")
+    service = _require_dict(services.get(service_id), f"deployconf.service.{service_id}")
+    port = _require_int(service.get("port"), f"deployconf.service.{service_id}.port", min_v=1)
+    node_bind = _require_dict(service.get("node_bind"), f"deployconf.service.{service_id}.node_bind")
+    nodes = _require_list(node_bind.get("node"), f"deployconf.service.{service_id}.node_bind.node")
+    if not nodes:
+        raise ValueError(f"deployconf.service.{service_id}.node_bind.node must be non-empty")
+    hostname = _require_str(nodes[0], f"deployconf.service.{service_id}.node_bind.node[0]")
+    target_ip_map = _active_test_stack_target_ip_map(ctx=ctx)
+    ip = _require_str(target_ip_map.get(hostname), f"{ctx}.target_ip_map[{hostname!r}]")
+    return ip, int(port)
+
+
+def _testbed_service_target_name(service_id: str) -> str:
+    deployconf_path = _load_test_bed_deployconf_path()
+    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"deployconf {deployconf_path}")
+    services = _require_dict(deployconf.get("service"), "deployconf.service")
+    service = _require_dict(services.get(service_id), f"deployconf.service.{service_id}")
+    node_bind = _require_dict(service.get("node_bind"), f"deployconf.service.{service_id}.node_bind")
+    nodes = _require_list(node_bind.get("node"), f"deployconf.service.{service_id}.node_bind.node")
+    if not nodes:
+        raise ValueError(f"deployconf.service.{service_id}.node_bind.node must be non-empty")
+    return _require_str(nodes[0], f"deployconf.service.{service_id}.node_bind.node[0]")
 
 
 def _test_stack_greptime_host_port(resolved_case: Dict[str, Any]) -> Tuple[str, int]:
@@ -14544,7 +14708,7 @@ def _ci_cluster_member_target_ips(resolved_case: Dict[str, Any]) -> List[str]:
 def _resolved_ci_command_list(resolved_case: Dict[str, Any]) -> List[Dict[str, str]]:
     scene = _require_dict(resolved_case.get("scene"), "resolved_case.scene")
     ci = _require_dict(scene.get("ci"), "resolved_case.scene.ci")
-    _forbid_unknown_keys(ci, {"subject", "commands", "runtime_contract", "prepare"}, "resolved_case.scene.ci")
+    _forbid_unknown_keys(ci, {"commands", "requirements", "prepare"}, "resolved_case.scene.ci")
     raw_commands = _require_list(ci.get("commands"), "resolved_case.scene.ci.commands")
     if not raw_commands:
         raise ValueError("resolved_case.scene.ci.commands must be non-empty")
@@ -14735,11 +14899,12 @@ def _ci_runner_exit_code_timeout_seconds(resolved_case: Dict[str, Any]) -> int:
     - Keep one causal source of truth: sum the explicit per-command timeouts and add the bounded pre-command phases
       that are also encoded in the generated script.
     """
-    timeout_seconds = (
-        CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S
-        + CI_RUNNER_READINESS_PROBE_DEADLINE_S
-        + CI_RUNNER_EXIT_CODE_GRACE_TIMEOUT_S
-    )
+    timeout_seconds = CI_RUNNER_EXIT_CODE_GRACE_TIMEOUT_S
+    if _ci_has_instance(resolved_case, instance_id="owner_0"):
+        timeout_seconds += (
+            CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S
+            + CI_RUNNER_READINESS_PROBE_DEADLINE_S
+        )
     commands = _resolved_ci_command_list(resolved_case)
     for index, command in enumerate(commands):
         raw_timeout = command.get("timeout_seconds")
@@ -14766,7 +14931,7 @@ def _write_ci_runner_script(
     commands = _resolved_ci_command_list(resolved_case)
     venv_python = run_dir / "venv" / "bin" / "python3"
     test_backend = (src_root / "fluxon_py" / "tests" / "test_backend.py").resolve()
-    requires_owner_shared_bundle = _ci_has_instance(resolved_case, instance_id="owner_0")
+    requires_owner_runtime = _ci_has_instance(resolved_case, instance_id="owner_0")
 
     out_path = run_dir / "ci_runner.sh"
     if out_path.exists():
@@ -14800,7 +14965,7 @@ def _write_ci_runner_script(
 
     shared_bundle_block = ""
     readiness_probe_block = ""
-    if requires_owner_shared_bundle:
+    if requires_owner_runtime:
         bundle_cluster_name = _ci_cluster_name(resolved_case)
         bundle_shared_memory_dir = str(
             _cluster_scoped_shared_dir(root_path=share_mem_path, cluster_name=bundle_cluster_name)
@@ -14829,6 +14994,9 @@ if [ ! -f "$shared_file/shared.json" ] || [ ! -f "$shm/mmap.file" ]; then
   fail_and_exit 2
 fi
 """
+    if requires_owner_runtime:
+        readiness_test_id = "basic_put_and_get"
+        readiness_instance_suffix = "readiness_probe"
         readiness_probe_block = f"""
 echo "[ci_runner] running backend readiness probe..."
 readiness_rc=1
@@ -14836,11 +15004,11 @@ readiness_attempt=0
 readiness_deadline=$(( $(date +%s) + {CI_RUNNER_READINESS_PROBE_DEADLINE_S} ))
 while [ $(date +%s) -lt "$readiness_deadline" ]; do
   readiness_attempt=$((readiness_attempt + 1))
-  echo "[CI readiness_probe] attempt=$readiness_attempt argv={venv_python.as_posix()} -u {test_backend.as_posix()} --test-id basic_put_and_get --instance-suffix readiness_probe"
-  timeout --preserve-status --signal=KILL 60 {venv_python.as_posix()} -u {test_backend.as_posix()} --test-id basic_put_and_get --instance-suffix readiness_probe
+  echo "[CI readiness_probe] attempt=$readiness_attempt argv={venv_python.as_posix()} -u {test_backend.as_posix()} --test-id {readiness_test_id} --instance-suffix {readiness_instance_suffix}"
+  timeout --preserve-status --signal=KILL 60 {venv_python.as_posix()} -u {test_backend.as_posix()} --test-id {readiness_test_id} --instance-suffix {readiness_instance_suffix}
   readiness_rc=$?
   if [ "$readiness_rc" -eq 0 ]; then
-    echo "[CI readiness_probe] basic_put_and_get passed on attempt=$readiness_attempt"
+    echo "[CI readiness_probe] {readiness_test_id} passed on attempt=$readiness_attempt"
     break
   fi
   echo "[CI readiness_probe] failed rc=$readiness_rc attempt=$readiness_attempt"

@@ -7,8 +7,6 @@ import os
 from _common import REPO_ROOT, run_cargo
 
 
-TEST_REQUIREMENTS = ["cargo", "etcd", "ops", "submodules"]
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(

@@ -1,0 +1,6 @@
+interface:
+  display_name: "完美主义"
+  short_description: "完美主义"
+  default_prompt: "Use $prompt-f118ab91-390b-48e2-a962-3abe4d54211e."
+policy:
+  allow_implicit_invocation: false

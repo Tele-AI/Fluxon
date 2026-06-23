@@ -5,23 +5,14 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-try:
-    from fluxon_test_stack.top_attention_test_index.requirements_all import (
-        TEST_REQUIREMENT_DESCRIPTIONS,
-        extract_test_requirements,
-        iter_index_entry_paths,
-    )
-except ModuleNotFoundError:
-    from top_attention_test_index.requirements_all import (  # type: ignore[no-redef]
-        TEST_REQUIREMENT_DESCRIPTIONS,
-        extract_test_requirements,
-        iter_index_entry_paths,
-    )
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOP_ATTENTION_INDEX_DIR = REPO_ROOT / "fluxon_test_stack" / "top_attention_test_index"
+TOP_ATTENTION_SUITE_PATH = REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml"
 TOP_ATTENTION_SCENE_ID_PREFIX = "ci_top_attention_"
+IGNORED_INDEX_ENTRY_NAMES: frozenset[str] = frozenset({"_common.py"})
 QUICK_ENTRY_NAMES: tuple[str, ...] = (
     "_doc_page_build.py",
     "_config_kv.py",
@@ -33,6 +24,33 @@ QUICK_ENTRY_NAMES: tuple[str, ...] = (
     "_script_tools.py",
     "_cargo_fs_core.py",
 )
+TEST_REQUIREMENT_DESCRIPTIONS: dict[str, str] = {
+    "cargo": "Rust cargo toolchain is required.",
+    "docker": "A working Docker daemon is required.",
+    "fluxon-pyo3": "The compiled fluxon_pyo3 Python extension must be available.",
+    "fluxon-release": "The local fluxon_release runtime/artifact tree must be populated.",
+    "kv-cluster": "A configured KV backend runtime from the repo test config must be reachable.",
+    "ops": "A reachable Fluxon Ops control plane is required by the test-stack execution flow.",
+    "python-wheel-build": "Python wheel build dependencies must be available.",
+    "submodules": "Required git submodules must be initialized for build-using tests.",
+    "test-stack-targets": "A TEST_STACK config with reachable target hosts is required.",
+    "tikv": "A TiKV/PD runtime is required, either external or started by the test.",
+    "testbed_etcd": "The shared testbed etcd service must already be running.",
+    "testbed_greptime": "The shared testbed Greptime service must already be running.",
+    "master": "The runner must start a Fluxon master instance for the case.",
+    "owner_0": "The runner must start owner_0 for the case.",
+    "ci_runner": "The runner must start the ci_runner workload for the case.",
+    "owner_shared_bundle": "The runner must wait for owner shared bundle files before executing the case.",
+    "fluxon_kv_readiness_probe": "The runner must pass the configured Fluxon KV readiness probe before executing the case.",
+}
+
+
+def iter_index_entry_paths() -> tuple[Path, ...]:
+    return tuple(
+        path
+        for path in sorted(TOP_ATTENTION_INDEX_DIR.glob("*.py"))
+        if path.name.startswith("_") and path.name not in IGNORED_INDEX_ENTRY_NAMES
+    )
 
 
 def display_top_attention_relpath(path: Path) -> str:
@@ -44,6 +62,36 @@ def display_top_attention_relpath(path: Path) -> str:
 
 def top_attention_scene_id(path: Path) -> str:
     return TOP_ATTENTION_SCENE_ID_PREFIX + path.stem.lstrip("_")
+
+
+def _load_top_attention_suite_scenes() -> dict[str, Any]:
+    raw = yaml.safe_load(TOP_ATTENTION_SUITE_PATH.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"top-attention suite must be a YAML mapping: {TOP_ATTENTION_SUITE_PATH}")
+    scenes = raw.get("scenes")
+    if not isinstance(scenes, dict):
+        raise ValueError(f"top-attention suite scenes must be a mapping: {TOP_ATTENTION_SUITE_PATH}")
+    return scenes
+
+
+def _scene_requirements_for_path(path: Path) -> list[str]:
+    scene_id = top_attention_scene_id(path)
+    scenes = _load_top_attention_suite_scenes()
+    scene = scenes.get(scene_id)
+    if not isinstance(scene, dict):
+        return []
+    ci = scene.get("ci")
+    if not isinstance(ci, dict):
+        return []
+    requirements = ci.get("requirements")
+    if not isinstance(requirements, list):
+        return []
+    out: list[str] = []
+    for index, raw_requirement in enumerate(requirements):
+        if not isinstance(raw_requirement, str) or not raw_requirement.strip():
+            raise ValueError(f"scene[{scene_id}].ci.requirements[{index}] must be a non-empty string")
+        out.append(raw_requirement.strip())
+    return sorted(set(out))
 
 
 def match_top_attention_prefix(path: Path, raw_prefix: str) -> bool:
@@ -82,7 +130,7 @@ def select_top_attention_entries(prefixes: Sequence[str]) -> list[Path]:
 def collect_top_attention_requirements(paths: Iterable[Path]) -> list[str]:
     requirements: set[str] = set()
     for path in paths:
-        requirements.update(extract_test_requirements(path))
+        requirements.update(_scene_requirements_for_path(path))
     return sorted(requirements)
 
 
@@ -95,7 +143,7 @@ def collect_top_attention_payload(prefixes: Sequence[str] | None = None) -> dict
                 "id": path.stem,
                 "name": path.name,
                 "path": display_top_attention_relpath(path),
-                "requirements": sorted(extract_test_requirements(path)),
+                "requirements": _scene_requirements_for_path(path),
             }
         )
     return {
@@ -145,11 +193,13 @@ def print_top_attention_payload(payload: dict[str, Any], *, requirements_only: b
 
 
 __all__ = [
+    "IGNORED_INDEX_ENTRY_NAMES",
     "QUICK_ENTRY_NAMES",
     "TOP_ATTENTION_SCENE_ID_PREFIX",
     "collect_top_attention_payload",
     "collect_top_attention_requirements",
     "display_top_attention_relpath",
+    "iter_index_entry_paths",
     "iter_quick_entry_paths",
     "match_top_attention_prefix",
     "print_top_attention_payload",

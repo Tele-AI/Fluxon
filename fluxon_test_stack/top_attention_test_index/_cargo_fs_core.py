@@ -4,8 +4,6 @@ from __future__ import annotations
 from _common import REPO_ROOT, run_cargo
 
 
-TEST_REQUIREMENTS = ["cargo", "ops", "submodules"]
-
 
 def main() -> int:
     return run_cargo([

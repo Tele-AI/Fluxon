@@ -65,7 +65,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         },
                         "scene_config": {
                             "doc_site_base_url": "tele-ai.github.io/Fluxon",
-                        }
+                        },
                     }
                 },
             }
@@ -103,6 +103,35 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         self.assertEqual(len(planned), 1)
         self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_bin_kvtest")
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
+
+    def test_top_attention_config_and_ctrl_c_ci_execution_plan_is_runner_native(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        artifact_sets = suite_cfg.get("artifact_sets")
+        if isinstance(artifact_sets, dict):
+            for artifact_set in artifact_sets.values():
+                if not isinstance(artifact_set, dict):
+                    continue
+                release_artifacts = artifact_set.get("release_artifacts")
+                if isinstance(release_artifacts, dict):
+                    python_wheel = release_artifacts.get("python_wheel")
+                    if isinstance(python_wheel, str) and python_wheel.strip():
+                        artifact_set["release_artifacts"] = {"wheel": python_wheel}
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        expected = {
+            "ci_top_attention_config_kv": "top_attention_config_kv",
+            "ci_top_attention_config_fs": "top_attention_config_fs",
+            "ci_top_attention_config_mq": "top_attention_config_mq",
+            "ci_top_attention_ctrl_c_kv": "top_attention_ctrl_c_kv",
+            "ci_top_attention_ctrl_c_mq": "top_attention_ctrl_c_mq",
+        }
+
+        for scene_id, command_id in expected.items():
+            case = next(item for item in cases if item.scene_id == scene_id and item.profile_id == "fluxon_tcp")
+            planned = _RUNNER._build_ci_execution_plan(case, suite)
+            self.assertEqual(len(planned), 1)
+            self.assertEqual(planned[0].ci_commands[0]["id"], command_id)
+            self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
 
     def test_doc_page_ci_execution_plan_uses_online_docker_image(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
@@ -234,8 +263,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 },
                 "scene": {
                     "ci": {
-                        "subject": "doc_page",
-                        "runtime_contract": "rust_self_managed",
+                        "requirements": ["ci_runner"],
                         "commands": [
                             {
                                 "id": "doc_page_build",
@@ -493,6 +521,10 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         "    ssh_user: tester",
                         "    ssh_port: 22",
                         "service:",
+                        "  greptime:",
+                        "    port: 19295",
+                        "    node_bind:",
+                        "      node: [logic-a]",
                         "  ops_controller:",
                         "    node_bind:",
                         "      node: [logic-a]",
@@ -605,6 +637,10 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         "    ssh_user: tester",
                         "    ssh_port: 22",
                         "service:",
+                        "  greptime:",
+                        "    port: 19295",
+                        "    node_bind:",
+                        "      node: [logic-a]",
                         "  ops_controller:",
                         "    node_bind:",
                         "      node: [logic-a]",
@@ -620,12 +656,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 "profile": {
                     "ci": {
                         "runtime": {
-                            "base_runtime": {
-                                "greptime": {
-                                    "target": "logic-a",
-                                    "endpoint": {"scheme": "http", "host_port": 19295},
-                                }
-                            }
+                            "base_runtime": {}
                         }
                     }
                 },

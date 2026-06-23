@@ -1,0 +1,6 @@
+interface:
+  display_name: "对话信息对接参考 codex 源码"
+  short_description: "对话信息对接参考 codex 源码"
+  default_prompt: "Use $prompt-a7fb4e43-d1eb-4739-93b3-646d7a1c072c."
+policy:
+  allow_implicit_invocation: false

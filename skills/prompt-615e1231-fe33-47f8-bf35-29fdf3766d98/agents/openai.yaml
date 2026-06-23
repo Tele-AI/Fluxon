@@ -1,0 +1,6 @@
+interface:
+  display_name: "悬浮菜单组件复用"
+  short_description: "悬浮菜单组件复用"
+  default_prompt: "Use $prompt-615e1231-fe33-47f8-bf35-29fdf3766d98."
+policy:
+  allow_implicit_invocation: false

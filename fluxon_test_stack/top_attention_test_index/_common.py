@@ -13,37 +13,73 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TEST_REQUIREMENTS: list[str] = ["ops"]
-
 
 def call(cmd: Sequence[str], *, env: dict[str, str] | None = None) -> int:
     print("+ " + " ".join(cmd), flush=True)
     return subprocess.call(list(cmd), cwd=str(REPO_ROOT), env=env)
 
 
-def parse_python_passthrough(description: str) -> tuple[str, list[str]]:
+def parse_python_passthrough(
+    description: str,
+    *,
+    expected_scene_id: str | None = None,
+) -> tuple[str, list[str], dict | None]:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--python",
         default=os.environ.get("PYTHON", sys.executable),
         help="Python executable used for the delegated command.",
     )
+    parser.add_argument(
+        "--case-config",
+        help="Canonical CI case config YAML emitted by test_runner.",
+    )
     args, passthrough = parser.parse_known_args()
-    return args.python, passthrough
+    scene_config = None
+    if args.case_config is not None:
+        if expected_scene_id is None:
+            raise ValueError("--case-config is only supported for CI-bound top-attention wrappers")
+        scene_config = load_case_config(args.case_config, expected_scene_id=expected_scene_id)
+    return args.python, passthrough, scene_config
 
 
-def run_pytest(description: str, paths: Iterable[str]) -> int:
-    python, passthrough = parse_python_passthrough(description)
+def run_pytest(
+    description: str,
+    paths: Iterable[str],
+    *,
+    expected_scene_id: str | None = None,
+) -> int:
+    python, passthrough, _scene_config = parse_python_passthrough(
+        description,
+        expected_scene_id=expected_scene_id,
+    )
     return call([python, "-m", "pytest", *paths, *passthrough])
 
 
-def run_python_file(description: str, path: str, extra_args: Iterable[str] = ()) -> int:
-    python, passthrough = parse_python_passthrough(description)
+def run_python_file(
+    description: str,
+    path: str,
+    extra_args: Iterable[str] = (),
+    *,
+    expected_scene_id: str | None = None,
+) -> int:
+    python, passthrough, _scene_config = parse_python_passthrough(
+        description,
+        expected_scene_id=expected_scene_id,
+    )
     return call([python, "-u", str(REPO_ROOT / path), *extra_args, *passthrough])
 
 
-def run_python_files(description: str, paths: Iterable[str]) -> int:
-    python, passthrough = parse_python_passthrough(description)
+def run_python_files(
+    description: str,
+    paths: Iterable[str],
+    *,
+    expected_scene_id: str | None = None,
+) -> int:
+    python, passthrough, _scene_config = parse_python_passthrough(
+        description,
+        expected_scene_id=expected_scene_id,
+    )
     for path in paths:
         rc = call([python, "-u", str(REPO_ROOT / path), *passthrough])
         if rc != 0:

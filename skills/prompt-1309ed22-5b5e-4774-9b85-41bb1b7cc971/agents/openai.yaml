@@ -1,0 +1,6 @@
+interface:
+  display_name: "始终批判自己"
+  short_description: "始终批判自己"
+  default_prompt: "Use $prompt-1309ed22-5b5e-4774-9b85-41bb1b7cc971."
+policy:
+  allow_implicit_invocation: false

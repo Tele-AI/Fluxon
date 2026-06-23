@@ -1,0 +1,6 @@
+interface:
+  display_name: "文档编辑"
+  short_description: "文档编辑"
+  default_prompt: "Use $prompt-0ca565e9-3d44-45f1-832d-caa438aceddb."
+policy:
+  allow_implicit_invocation: false

@@ -19,7 +19,7 @@ from fluxon_test_stack.top_attention_index_helper import (
     select_top_attention_entries,
     top_attention_scene_id,
 )
-from fluxon_test_stack.top_attention_test_index.requirements_all import iter_index_entry_paths
+from fluxon_test_stack.top_attention_test_index.test_test_requirements import iter_index_entry_paths
 
 
 class TestTopAttentionIndexHelper(unittest.TestCase):
@@ -45,8 +45,8 @@ class TestTopAttentionIndexHelper(unittest.TestCase):
         payload = collect_top_attention_payload(["_config_kv"])
         self.assertEqual(payload["entry_count"], 1)
         self.assertEqual(payload["entries"][0]["name"], "_config_kv.py")
-        self.assertEqual(payload["entries"][0]["requirements"], ["ops"])
-        self.assertEqual(payload["requirements"], ["ops"])
+        self.assertEqual(payload["entries"][0]["requirements"], ["ci_runner"])
+        self.assertEqual(payload["requirements"], ["ci_runner"])
 
     def test_quick_entries_exist_and_match_declared_order(self) -> None:
         names = [path.name for path in iter_quick_entry_paths()]
