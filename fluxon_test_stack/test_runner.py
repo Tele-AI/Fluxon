@@ -12710,58 +12710,53 @@ def _manifest_integrity_stat_fingerprint(
     return tuple(fingerprint)
 
 
-def _test_stack_runtime_offline_dependency_requirements_for_resolved_case(
-    resolved_case: Dict[str, Any],
+def _offline_dependency_requirements_from_test_rsc_root(
+    *,
+    test_rsc_root: Path,
+    dependency_set_ids: Tuple[str, ...],
+    ctx: str,
 ) -> Tuple[str, ...]:
-    dependency_set_ids = ["base"]
-    scene = _require_dict(resolved_case.get("scene"), "resolved_case.scene")
-    scene_ts_raw = scene.get("test_stack")
-    if isinstance(scene_ts_raw, dict):
-        rpc_backend_kind = str(scene_ts_raw.get("rpc_backend_kind", "")).strip().upper()
-        if rpc_backend_kind == TEST_STACK_RPC_BACKEND_ZERORPC:
-            dependency_set_ids.append("zerorpc")
-    test_rsc_root = _resolved_case_test_rsc_root(resolved_case)
     prepare_cfg_path = (test_rsc_root / _TEST_STACK_RUNTIME_PREPARE_CONFIG_NAME).resolve()
-    prepare_cfg = _require_dict(_load_yaml_file(prepare_cfg_path), f"TEST_STACK runtime prepare config {prepare_cfg_path}")
+    prepare_cfg = _require_dict(_load_yaml_file(prepare_cfg_path), f"{ctx} prepare config {prepare_cfg_path}")
     python_runtime_cfg = _require_dict(
         prepare_cfg.get("python_runtime"),
-        f"TEST_STACK runtime prepare config python_runtime {prepare_cfg_path}",
+        f"{ctx} prepare config python_runtime {prepare_cfg_path}",
     )
     dependency_sets_cfg = _require_dict(
         python_runtime_cfg.get("dependency_sets"),
-        f"TEST_STACK runtime prepare config python_runtime.dependency_sets {prepare_cfg_path}",
+        f"{ctx} prepare config python_runtime.dependency_sets {prepare_cfg_path}",
     )
     out: List[str] = []
     seen: set[str] = set()
     for set_id in dependency_set_ids:
         set_cfg = _require_dict(
             dependency_sets_cfg.get(set_id),
-            f"TEST_STACK runtime prepare config python_runtime.dependency_sets.{set_id} {prepare_cfg_path}",
+            f"{ctx} prepare config python_runtime.dependency_sets.{set_id} {prepare_cfg_path}",
         )
         requirements = set_cfg.get("requirements")
         if not isinstance(requirements, list):
             raise ValueError(
-                "TEST_STACK runtime prepare config dependency set requirements must be a list: "
+                f"{ctx} prepare config dependency set requirements must be a list: "
                 f"path={prepare_cfg_path} set_id={set_id}"
             )
         for index, raw_item in enumerate(requirements):
             requirement_cfg = _require_dict(
                 raw_item,
                 (
-                    "TEST_STACK runtime prepare config "
+                    f"{ctx} prepare config "
                     f"python_runtime.dependency_sets.{set_id}.requirements[{index}]"
                 ),
             )
             requirement = _require_str(
                 requirement_cfg.get("pinned"),
                 (
-                    "TEST_STACK runtime prepare config "
+                    f"{ctx} prepare config "
                     f"python_runtime.dependency_sets.{set_id}.requirements[{index}].pinned"
                 ),
             ).strip()
             if not requirement:
                 raise ValueError(
-                    "TEST_STACK runtime prepare config dependency requirement must be non-empty: "
+                    f"{ctx} prepare config dependency requirement must be non-empty: "
                     f"path={prepare_cfg_path} set_id={set_id} index={index}"
                 )
             if requirement in seen:
@@ -12769,6 +12764,32 @@ def _test_stack_runtime_offline_dependency_requirements_for_resolved_case(
             seen.add(requirement)
             out.append(requirement)
     return tuple(out)
+
+
+def _test_stack_runtime_offline_dependency_requirements_for_resolved_case(
+    resolved_case: Dict[str, Any],
+) -> Tuple[str, ...]:
+    dependency_set_ids: List[str] = ["base"]
+    scene = _require_dict(resolved_case.get("scene"), "resolved_case.scene")
+    scene_ts_raw = scene.get("test_stack")
+    if isinstance(scene_ts_raw, dict):
+        rpc_backend_kind = str(scene_ts_raw.get("rpc_backend_kind", "")).strip().upper()
+        if rpc_backend_kind == TEST_STACK_RPC_BACKEND_ZERORPC:
+            dependency_set_ids.append("zerorpc")
+    test_rsc_root = _resolved_case_test_rsc_root(resolved_case)
+    return _offline_dependency_requirements_from_test_rsc_root(
+        test_rsc_root=test_rsc_root,
+        dependency_set_ids=tuple(dependency_set_ids),
+        ctx="TEST_STACK runtime",
+    )
+
+
+def _ci_runtime_offline_dependency_requirements(*, test_rsc_root: Path) -> Tuple[str, ...]:
+    return _offline_dependency_requirements_from_test_rsc_root(
+        test_rsc_root=test_rsc_root,
+        dependency_set_ids=("base",),
+        ctx="CI runtime",
+    )
 
 
 def _test_stack_runtime_wheelhouse_root(
@@ -12782,6 +12803,45 @@ def _test_stack_runtime_wheelhouse_root(
         / python_abi
         / _TEST_STACK_RUNTIME_PYTHON_RUNTIME_WHEELHOUSE_DIRNAME
     ).resolve()
+
+
+def _ci_runtime_wheelhouse_root(*, test_rsc_root: Path) -> Path:
+    return _test_stack_runtime_wheelhouse_root(
+        test_rsc_root=test_rsc_root,
+        python_abi=_TEST_STACK_DEFAULT_PYTHON_ABI,
+    )
+
+
+def _prepare_ci_runtime_python_env(
+    *,
+    test_rsc_root: Path,
+    venv_python: Path,
+    src_root: Path,
+) -> None:
+    wheelhouse_root = _ci_runtime_wheelhouse_root(test_rsc_root=test_rsc_root)
+    if not wheelhouse_root.exists() or not wheelhouse_root.is_dir():
+        raise ValueError(
+            "CI runtime offline wheelhouse is missing from test_rsc: "
+            f"{wheelhouse_root}"
+        )
+    offline_dependency_requirements = _ci_runtime_offline_dependency_requirements(
+        test_rsc_root=test_rsc_root
+    )
+    if not offline_dependency_requirements:
+        raise ValueError("CI runtime offline dependency requirements must be non-empty")
+    _run_subprocess(
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--find-links",
+            str(wheelhouse_root),
+            *offline_dependency_requirements,
+        ],
+        cwd=str(src_root),
+    )
 _TEST_STACK_RUNTIME_BACKEND_DIRNAME = "backend"
 _TEST_STACK_RUNTIME_SOURCE_IGNORE_NAMES: Tuple[str, ...] = (
     ".dever",
@@ -14468,6 +14528,12 @@ def _ci_prepare_run_inputs(
         release_root=release_root,
         test_rsc_root=test_rsc_root,
         release_view_root=release_link_path,
+    )
+
+    _prepare_ci_runtime_python_env(
+        test_rsc_root=test_rsc_root,
+        venv_python=venv_python,
+        src_root=src_root,
     )
 
     wheel = release_root / wheel_name

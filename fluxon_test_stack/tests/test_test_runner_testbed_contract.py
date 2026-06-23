@@ -191,6 +191,23 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             test_rsc_root = root / "test_rsc_root"
             test_rsc_root.mkdir()
             (test_rsc_root / "from_case.txt").write_text("case\n", encoding="utf-8")
+            (test_rsc_root / "prepare.yaml").write_text(
+                "\n".join(
+                    [
+                        "python_runtime:",
+                        "  dependency_sets:",
+                        "    base:",
+                        "      requirements:",
+                        "        - pinned: pytest==8.3.5",
+                        "          source: wheel",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            wheelhouse_root = test_rsc_root / "python_runtime" / "cpython3.10" / "wheels"
+            wheelhouse_root.mkdir(parents=True, exist_ok=True)
+            (wheelhouse_root / "pytest-8.3.5-py3-none-any.whl").write_text("wheel\n", encoding="utf-8")
 
             ci_src_archive_path = test_rsc_root / "src_ci.tar.gz"
             with tarfile.open(ci_src_archive_path, "w:gz") as tf:
@@ -207,6 +224,10 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             )
             test_rsc_manifest = {
                 "src_ci.tar.gz": _RUNNER._sha256_file(ci_src_archive_path),
+                "prepare.yaml": _RUNNER._sha256_file(test_rsc_root / "prepare.yaml"),
+                "python_runtime/cpython3.10/wheels/pytest-8.3.5-py3-none-any.whl": _RUNNER._sha256_file(
+                    wheelhouse_root / "pytest-8.3.5-py3-none-any.whl"
+                ),
             }
             (test_rsc_root / "fluxon_test_rsc.sha256").write_text(
                 "".join(f"{digest}  {name}\n" for name, digest in test_rsc_manifest.items()),
@@ -307,7 +328,37 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     "shared_file_path": "/tmp/ci_case_cluster/share",
                 },
             )
-            run_subprocess_mock.assert_called_once()
+            self.assertEqual(run_subprocess_mock.call_count, 2)
+            first_call = run_subprocess_mock.call_args_list[0]
+            second_call = run_subprocess_mock.call_args_list[1]
+            self.assertEqual(
+                first_call.kwargs["cwd"],
+                str(src_root),
+            )
+            self.assertEqual(
+                first_call.args[0],
+                [
+                    str(venv_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-index",
+                    "--find-links",
+                    str(wheelhouse_root),
+                    "pytest==8.3.5",
+                ],
+            )
+            self.assertEqual(
+                second_call.args[0],
+                [
+                    str(venv_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--force-reinstall",
+                    str(release_root / wheel_name),
+                ],
+            )
 
     def test_ci_runner_script_sources_prepare_env_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as td:
