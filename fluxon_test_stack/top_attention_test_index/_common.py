@@ -32,22 +32,6 @@ def parse_python_passthrough(description: str) -> tuple[str, list[str]]:
     return args.python, passthrough
 
 
-def strip_passthrough_case_config(passthrough: Sequence[str]) -> list[str]:
-    out: list[str] = []
-    idx = 0
-    while idx < len(passthrough):
-        token = passthrough[idx]
-        if token == "--case-config":
-            idx += 2
-            continue
-        if token.startswith("--case-config="):
-            idx += 1
-            continue
-        out.append(token)
-        idx += 1
-    return out
-
-
 def run_pytest(description: str, paths: Iterable[str]) -> int:
     python, passthrough = parse_python_passthrough(description)
     return call([python, "-m", "pytest", *paths, *passthrough])
@@ -181,6 +165,5 @@ def run_cargo(
 ) -> int:
     # Rust test binaries launched via cargo run/load depend on the wheel-bundled native
     # runtime under the active venv. Keep one authoritative search root for all wrappers.
-    _, parsed_passthrough = parse_python_passthrough("cargo delegate")
-    effective_passthrough = parsed_passthrough if passthrough is None else list(passthrough)
+    effective_passthrough = [] if passthrough is None else list(passthrough)
     return call(["cargo", *args, *effective_passthrough], env=_prepare_cargo_env(env))

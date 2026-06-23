@@ -192,6 +192,42 @@ class TestTopAttentionLogMgmtContract(unittest.TestCase):
             ],
         )
 
+    def test_run_cargo_does_not_forward_parent_passthrough(self) -> None:
+        with mock.patch.object(_COMMON, "call", return_value=0) as call_mock:
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    str(COMMON_MODULE_PATH),
+                    "--case-config",
+                    "/tmp/should_not_leak.yaml",
+                    "--",
+                    "--nocapture",
+                ],
+            ):
+                rc = _COMMON.run_cargo(
+                    [
+                        "test",
+                        "--manifest-path",
+                        str(REPO_ROOT / "fluxon_rs" / "fluxon_util" / "Cargo.toml"),
+                        "--test",
+                        "log_mgmt",
+                    ],
+                )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            call_mock.call_args.args[0],
+            [
+                "cargo",
+                "test",
+                "--manifest-path",
+                str(REPO_ROOT / "fluxon_rs" / "fluxon_util" / "Cargo.toml"),
+                "--test",
+                "log_mgmt",
+            ],
+        )
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
