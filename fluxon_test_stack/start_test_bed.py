@@ -23,10 +23,12 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPLOYMENT_DIR = REPO_ROOT / "deployment"
+DEPLOYMENT_UTILS_DIR = DEPLOYMENT_DIR / "utils"
 sys.path.insert(0, str(DEPLOYMENT_DIR))
+sys.path.insert(0, str(DEPLOYMENT_UTILS_DIR))
 import manual_dispatch_release
 from utils import log_shard
-from utils.selection_runtime import (
+from selection_runtime import (
     atomic_group_member_authority_name as _selection_atomic_group_member_authority_name,
     atomic_group_member_selection_workload_name as _selection_atomic_group_member_selection_workload_name,
     daemonset_selection_supervisor_label as _selection_daemonset_supervisor_label,

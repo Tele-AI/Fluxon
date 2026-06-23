@@ -14,9 +14,9 @@ scenes:
       subject: doc_page
       runtime_contract: rust_self_managed
       prepare:
-        - kind: setup_dev_env
-          config: setup_and_pack/setup_dev_env/doc_page_ci.yaml
-          cache_relpath: .cached/fluxon_doc_site/toolchain
+        - kind: online_docker_image
+          image_ref: hanbaoaaa/fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0
+          env: FLUXON_DOC_SITE_DOCKER_IMAGE_REF
     select:
       scales: [n1_kvowner_dram_3gib]
       profiles: [fluxon_tcp]

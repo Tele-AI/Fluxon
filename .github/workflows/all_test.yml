@@ -7,27 +7,6 @@ on:
       - opened
       - synchronize
       - reopened
-    # Rebuild when doc or homepage inputs change.
-    paths:
-      - ".github/workflows/all_test.yml"
-      - ".github/workflows/docs-pages.yml"
-      - "setup.py"
-      - "fluxon_py/**"
-      - "fluxon_rs/**"
-      - "fluxon_test_stack/**"
-      - "setup_and_pack/**"
-      - "deployment/**"
-      - "examples/**"
-      - "fluxon_release/install.py"
-      - "fluxon_release/closed_sdk/**"
-      - "fluxon_doc_cn/**"
-      - "fluxon_doc_en/**"
-      - "README.md"
-      - "README_CN.md"
-      - "pics/**"
-      - "LICENSE"
-      - "fluxon_rs/rust-toolchain.toml"
-      - "scripts/build_doc_site.py"
 
 permissions:
   contents: read
@@ -84,7 +63,7 @@ jobs:
           suite = yaml.safe_load(src_path.read_text(encoding="utf-8"))
 
           # Scene selection:
-          # - ci_top_attention_doc_page_build keeps the doc-site build as a CI scene workload.
+          # - ci_top_attention_doc_page_build validates doc build through the prebuilt Docker image.
           # - ci_top_attention_bin_kvtest keeps the Rust kv_test entry under the same CI scene contract.
           # - ci_top_attention_log_mgmt keeps log rolling/sharding coverage under the same CI scene contract.
           suite["scenes"] = {

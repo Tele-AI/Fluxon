@@ -82,6 +82,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
     def test_ci_source_overlay_includes_fluxon_test_stack(self) -> None:
         self.assertIn("fluxon_test_stack", _RUNNER._CI_SOURCE_OVERLAY_ROOTS)
+        self.assertNotIn("quartz_prewarm", _RUNNER._CI_SOURCE_OVERLAY_ROOTS)
 
     def test_top_attention_ci_execution_plan_is_runner_native(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
@@ -126,6 +127,34 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             planned[0].ci_commands[0]["command"],
         )
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
+
+    def test_doc_page_ci_execution_plan_uses_online_docker_image(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        artifact_sets = suite_cfg.get("artifact_sets")
+        if isinstance(artifact_sets, dict):
+            for artifact_set in artifact_sets.values():
+                if not isinstance(artifact_set, dict):
+                    continue
+                release_artifacts = artifact_set.get("release_artifacts")
+                if isinstance(release_artifacts, dict):
+                    python_wheel = release_artifacts.get("python_wheel")
+                    if isinstance(python_wheel, str) and python_wheel.strip():
+                        artifact_set["release_artifacts"] = {"wheel": python_wheel}
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        case = next(item for item in cases if item.scene_id == "ci_top_attention_doc_page_build" and item.profile_id == "fluxon_tcp")
+        planned = _RUNNER._build_ci_execution_plan(case, suite)
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(
+            planned[0].ci_prepare_steps,
+            [
+                {
+                    "kind": "online_docker_image",
+                    "image_ref": "hanbaoaaa/fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0",
+                    "env": "FLUXON_DOC_SITE_DOCKER_IMAGE_REF",
+                }
+            ],
+        )
 
     def test_ci_prepare_run_inputs_rebuilds_release_view_without_reusing_source_test_rsc(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -241,8 +270,8 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         "prepare": [
                             {
                                 "kind": "setup_dev_env",
-                                "config": "setup_and_pack/setup_dev_env/doc_page_ci.yaml",
-                                "cache_relpath": ".cached/fluxon_doc_site/toolchain",
+                                "config": "setup_and_pack/setup_dev_env/ubuntu24.yaml",
+                                "cache_relpath": ".cached/fluxon_ci/toolchain",
                             }
                         ],
                     }
@@ -287,6 +316,95 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             script_text = script_path.read_text(encoding="utf-8")
             self.assertIn('prepare_env_path="', script_text)
             self.assertIn('. "$prepare_env_path"', script_text)
+
+    def test_parse_ci_prepare_steps_accepts_online_docker_image(self) -> None:
+        steps = _RUNNER._parse_ci_prepare_steps(
+            [
+                {
+                    "kind": "setup_dev_env",
+                    "config": "setup_and_pack/setup_dev_env/ubuntu24.yaml",
+                    "cache_relpath": ".cached/fluxon_ci/toolchain",
+                },
+                {
+                    "kind": "online_docker_image",
+                    "image_ref": "fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0",
+                    "env": "FLUXON_DOC_SITE_DOCKER_IMAGE_REF",
+                },
+            ],
+            "scene.ci.prepare",
+        )
+        self.assertEqual(
+            steps,
+            [
+                {
+                    "kind": "setup_dev_env",
+                    "config": "setup_and_pack/setup_dev_env/ubuntu24.yaml",
+                    "cache_relpath": ".cached/fluxon_ci/toolchain",
+                },
+                {
+                    "kind": "online_docker_image",
+                    "image_ref": "fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0",
+                    "env": "FLUXON_DOC_SITE_DOCKER_IMAGE_REF",
+                },
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "unknown keys"):
+            _RUNNER._parse_ci_prepare_steps(
+                [
+                    {
+                        "kind": "online_docker_image",
+                        "image_ref": "example/image:tag",
+                        "env": "IMAGE_REF",
+                        "config": "x",
+                    }
+                ],
+                "scene.ci.prepare",
+            )
+        with self.assertRaisesRegex(ValueError, "valid environment variable name"):
+            _RUNNER._parse_ci_prepare_steps(
+                [
+                    {
+                        "kind": "online_docker_image",
+                        "image_ref": "example/image:tag",
+                        "env": "invalid-name",
+                    }
+                ],
+                "scene.ci.prepare",
+            )
+
+    def test_run_ci_prepare_online_docker_image_pulls_and_exports_env(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src_root = root / "src"
+            src_root.mkdir()
+
+            with mock.patch.object(_RUNNER, "_run_subprocess") as run_subprocess_mock:
+                exports = _RUNNER._run_ci_prepare_online_docker_image_step(
+                    step={
+                        "kind": "online_docker_image",
+                        "image_ref": "hanbaoaaa/fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0",
+                        "env": "FLUXON_DOC_SITE_DOCKER_IMAGE_REF",
+                    },
+                    src_root=src_root,
+                    step_index=0,
+                )
+
+            self.assertEqual(
+                exports,
+                {
+                    "FLUXON_DOC_SITE_DOCKER_IMAGE_REF": (
+                        "hanbaoaaa/fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0"
+                    )
+                },
+            )
+            run_subprocess_mock.assert_called_once_with(
+                [
+                    "docker",
+                    "pull",
+                    "hanbaoaaa/fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0",
+                ],
+                cwd=str(src_root),
+            )
 
     def test_normalize_test_stack_targets_accepts_hosts_with_consistent_anchors(self) -> None:
         normalized = _RUNNER._normalize_test_stack_target_hosts(

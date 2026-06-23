@@ -26,7 +26,7 @@ Entries:
 
 - `_pack_whl.py`: forwards to `setup_and_pack/pack_fluxon_pylib.py`
 - `_pack_test_rsc.py`: forwards to `fluxon_test_stack/pack_test_stack_rsc.py`
-- `_doc_page_build.py`: forwards to `scripts/build_doc_site.py build`
+- `_doc_page_build.py`: builds the docs through the configured Docker builder image
 - `_bin_kvtest.py`: forwards to the Rust `kv_test` binary command. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_bin_kvtest` scene, and `test_runner.py` dispatches to it from the runner-native `top_attention` CI execution model.
 - `_bin_external_client.py`: forwards to the Rust `external_client_test` binary
 - `_ctrl_c_kv.py`: forwards to existing runtime Ctrl-C child-retirement coverage

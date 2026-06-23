@@ -853,7 +853,7 @@ def _pack_ci_src(*, repo_root: Path, out_path: Path) -> None:
         repo_root / "examples",
         repo_root / "fluxon_test_stack",
         repo_root / "setup.py",
-        repo_root / "scripts" / "build_doc_site.py",
+        repo_root / "scripts" / "_build_doc_site_in_container_inner.py",
         repo_root / "README.md",
     )
     for path in required_repo_paths:
@@ -939,6 +939,21 @@ def _ci_source_relpath_excluded(relpath: str) -> bool:
         profile=SOURCE_SELECTION_PROFILE_SOURCE_PACK,
         relpath=relpath,
     )
+
+
+def _relpath_matches_exclude_patterns(relpath: str, patterns: tuple[str, ...]) -> bool:
+    relpath = relpath.strip("/")
+    rel_parts = Path(relpath).parts
+    rel_name = rel_parts[-1] if rel_parts else relpath
+    for pattern in patterns:
+        if pattern.endswith("/"):
+            dir_name = pattern.rstrip("/")
+            if dir_name in rel_parts:
+                return True
+            continue
+        if fnmatch.fnmatch(relpath, pattern) or fnmatch.fnmatch(rel_name, pattern):
+            return True
+    return False
 
 
 def _pack_ci_ext_rsc(*, repo_root: Path, out_path: Path) -> None:

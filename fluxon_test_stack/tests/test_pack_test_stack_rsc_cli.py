@@ -150,7 +150,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 "deployment/dispatch.py",
                 "examples/demo.py",
                 "fluxon_test_stack/case.yaml",
-                "scripts/build_doc_site.py",
+                "scripts/_build_doc_site_in_container_inner.py",
                 "fluxon_doc_cn/roadmap.md",
                 "fluxon_doc_en/roadmap.md",
                 "README.md",
@@ -193,7 +193,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 "deployment/dispatch.py",
                 "examples/demo.py",
                 "fluxon_test_stack/case.yaml",
-                "scripts/build_doc_site.py",
+                "scripts/_build_doc_site_in_container_inner.py",
                 "fluxon_doc_cn/roadmap.md",
                 "fluxon_doc_en/roadmap.md",
                 "README.md",
@@ -237,7 +237,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 "deployment/dispatch.py",
                 "examples/demo.py",
                 "fluxon_test_stack/case.yaml",
-                "scripts/build_doc_site.py",
+                "scripts/_build_doc_site_in_container_inner.py",
                 "fluxon_doc_cn/roadmap.md",
                 "fluxon_doc_en/roadmap.md",
                 "README.md",
@@ -258,31 +258,34 @@ class TestPackTestStackRscCli(unittest.TestCase):
             repo_root = Path(tmpdir)
             stage_root = repo_root / "stage"
             for relpath in (
-                "scripts/build_doc_site.py",
+                "scripts/_build_doc_site_in_container_inner.py",
                 "fluxon_doc_cn/roadmap.md",
                 "README.md",
             ):
                 path = repo_root / relpath
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("x\n", encoding="utf-8")
-            with mock.patch.object(
-                _PACK,
-                "_collect_ci_source_relpaths",
-                return_value=[
-                    "README.md",
-                    "fluxon_doc_cn/roadmap.md",
-                    "scripts/build_doc_site.py",
-                ],
-            ):
+            raw = b"\0".join(
+                [
+                    b"scripts/_build_doc_site_in_container_inner.py",
+                    b"fluxon_doc_cn/roadmap.md",
+                    b"README.md",
+                    b"fluxon_release/install.py",
+                    b".dever/run.log",
+                    b"skills/demo/SKILL.md",
+                ]
+            ) + b"\0"
+
+            with mock.patch.object(_PACK.subprocess, "check_output", return_value=raw):
                 relpaths = _PACK._git_stage_ci_source_tree(repo_root=repo_root, stage_root=stage_root)
 
             self.assertEqual(
                 relpaths,
-                ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/build_doc_site.py"],
+                ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/_build_doc_site_in_container_inner.py"],
             )
             self.assertTrue((stage_root / "README.md").is_file())
             self.assertTrue((stage_root / "fluxon_doc_cn" / "roadmap.md").is_file())
-            self.assertTrue((stage_root / "scripts" / "build_doc_site.py").is_file())
+            self.assertTrue((stage_root / "scripts" / "_build_doc_site_in_container_inner.py").is_file())
             self.assertFalse((stage_root / "fluxon_release").exists())
             self.assertFalse((stage_root / ".dever").exists())
             self.assertFalse((stage_root / "skills").exists())
@@ -291,7 +294,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             for relpath in (
-                "scripts/build_doc_site.py",
+                "scripts/_build_doc_site_in_container_inner.py",
                 "fluxon_doc_cn/roadmap.md",
                 "README.md",
                 "fluxon_release/install.py",
@@ -314,23 +317,27 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def fake_check_output(argv, cwd=None):
-                del argv
-                cwd_path = Path(cwd).resolve()
-                if cwd_path == repo_root.resolve():
-                    return b"scripts/build_doc_site.py\0fluxon_doc_cn/roadmap.md\0README.md\0"
-                raise AssertionError(f"unexpected git ls-files cwd: {cwd_path}")
+            raw = b"\0".join(
+                [
+                    b"scripts/_build_doc_site_in_container_inner.py",
+                    b"fluxon_doc_cn/roadmap.md",
+                    b"README.md",
+                    b"fluxon_release/install.py",
+                    b".dever/run.log",
+                    b"skills/demo/SKILL.md",
+                ]
+            ) + b"\0"
 
             with mock.patch.object(
                 _PACK.collect_source_profile_relpaths.__globals__["git_source_selection_utils"].subprocess,
                 "check_output",
-                side_effect=fake_check_output,
+                return_value=raw,
             ):
                 relpaths = _PACK._collect_ci_source_relpaths(repo_root=repo_root)
 
             self.assertEqual(
                 relpaths,
-                ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/build_doc_site.py"],
+                ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/_build_doc_site_in_container_inner.py"],
             )
             self.assertNotIn("fluxon_release/install.py", relpaths)
             self.assertNotIn(".dever/run.log", relpaths)
@@ -341,8 +348,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
             repo_root = Path(tmpdir)
             tracked_root = repo_root / "scripts"
             tracked_root.mkdir(parents=True, exist_ok=True)
-            (tracked_root / "build_doc_site.py").write_text("tracked\n", encoding="utf-8")
-            (repo_root / ".gitignore").write_text("", encoding="utf-8")
+            (tracked_root / "_build_doc_site_in_container_inner.py").write_text("tracked\n", encoding="utf-8")
             module_root = repo_root / "fluxon_rs" / "moka"
             (module_root / "src").mkdir(parents=True, exist_ok=True)
             (module_root / "Cargo.toml").write_text("module\n", encoding="utf-8")
@@ -361,7 +367,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 del argv
                 cwd_path = Path(cwd).resolve()
                 if cwd_path == repo_root.resolve():
-                    return b"scripts/build_doc_site.py\0"
+                    return b"scripts/_build_doc_site_in_container_inner.py\0"
                 if cwd_path == module_root.resolve():
                     return b"Cargo.toml\0src/lib.rs\0"
                 raise AssertionError(f"unexpected git ls-files cwd: {cwd_path}")
@@ -378,8 +384,28 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 [
                     "fluxon_rs/moka/Cargo.toml",
                     "fluxon_rs/moka/src/lib.rs",
-                    "scripts/build_doc_site.py",
+                    "scripts/_build_doc_site_in_container_inner.py",
                 ],
+            )
+
+    def test_test_rsc_manifest_file_list_ignores_unstaged_extra_archive_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "out"
+            prepared_root = Path(tmpdir) / "prepared"
+            out_dir.mkdir()
+            prepared_root.mkdir()
+            (out_dir / "src_ci.tar.gz").write_text("src\n", encoding="utf-8")
+            (out_dir / "fluxon_ci_ext_rsc.tar.gz").write_text("ext\n", encoding="utf-8")
+            (out_dir / "extra_image.tar").write_text("image\n", encoding="utf-8")
+
+            files = _PACK._test_rsc_manifest_file_list(
+                out_dir=out_dir,
+                prepared_root=prepared_root,
+            )
+
+            self.assertEqual(
+                [path.name for path in files],
+                ["src_ci.tar.gz", "fluxon_ci_ext_rsc.tar.gz"],
             )
 
     def test_collect_ci_source_relpaths_requires_rather_no_git_submodule_root_to_exist(self) -> None:
@@ -397,13 +423,13 @@ class TestPackTestStackRscCli(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    _PACK.collect_source_profile_relpaths.__globals__["git_source_selection_utils"].subprocess,
-                    "check_output",
-                    return_value=b"scripts/build_doc_site.py\0",
+                    _PACK.collect_source_profile_relpaths.__globals__["git_source_selection_utils"],
+                    "collect_git_listed_source_relpaths",
+                    return_value=["scripts/_build_doc_site_in_container_inner.py"],
                 ),
                 self.assertRaisesRegex(
                     RuntimeError,
-                    "requires configured rather_no_git_submodule path to exist",
+                    "CI source pack requires configured rather_no_git_submodule path to exist",
                 ),
             ):
                 _PACK._collect_ci_source_relpaths(repo_root=repo_root)
