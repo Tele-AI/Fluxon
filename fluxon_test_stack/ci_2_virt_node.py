@@ -39,8 +39,6 @@ LOCAL_PRIMARY_NODE_SUFFIX = "a"
 LOCAL_SECONDARY_NODE_SUFFIX = "b"
 TEST_STACK_START_TEST_BED_CONFIG_ENV = "FLUXON_TEST_STACK_START_TEST_BED_CONFIG"
 PLACEHOLDER_WHEEL_NAME = "fluxon-0.0.0-ci-placeholder-cp38-abi3-manylinux_2_28_x86_64.whl"
-SAME_HOST_LOCAL_MULTI_NODE_ETCD_CLIENT_PORT_OFFSET = 100
-SAME_HOST_LOCAL_MULTI_NODE_GREPTIME_PORT_OFFSET = 110
 
 
 def _parse_args() -> argparse.Namespace:
@@ -404,10 +402,6 @@ def _rewrite_suite_for_local_dual_nodes(
     runtime = generated_profile.get("runtime")
     if not isinstance(runtime, dict):
         raise ValueError("generated public profile runtime must be a mapping")
-    ci_base_runtime_host_ports = {
-        "etcd": int(controller_port) + SAME_HOST_LOCAL_MULTI_NODE_ETCD_CLIENT_PORT_OFFSET,
-        "greptime": int(controller_port) + SAME_HOST_LOCAL_MULTI_NODE_GREPTIME_PORT_OFFSET,
-    }
     ci_runtime = runtime.get("ci")
     if not isinstance(ci_runtime, dict):
         raise ValueError("generated public profile must define runtime.ci")
@@ -435,28 +429,14 @@ def _rewrite_suite_for_local_dual_nodes(
             secondary_node_name: host_ip,
         }
         if runtime_key == "ci":
-            runtime_contracts = runtime_block.get("runtime_contracts")
-            if not isinstance(runtime_contracts, dict):
-                raise ValueError("generated public profile runtime.ci.runtime_contracts must be a mapping")
-            for contract in runtime_contracts.values():
-                if not isinstance(contract, dict):
-                    continue
-                base_runtime = contract.get("base_runtime")
-                if isinstance(base_runtime, dict):
-                    for svc_name in ("etcd", "greptime"):
-                        svc_cfg = base_runtime.get(svc_name)
-                        if isinstance(svc_cfg, dict):
-                            svc_cfg["target"] = primary_node_name
-                            endpoint_cfg = svc_cfg.get("endpoint")
-                            if isinstance(endpoint_cfg, dict):
-                                endpoint_cfg["host_port"] = int(ci_base_runtime_host_ports[svc_name])
-                case_runtime = contract.get("case_runtime")
-                if isinstance(case_runtime, dict):
-                    master_cfg = case_runtime.get("master")
-                    if isinstance(master_cfg, dict):
-                        deployer_cfg = master_cfg.get("deployer")
-                        if isinstance(deployer_cfg, dict):
-                            deployer_cfg["target"] = primary_node_name
+            requirement_configs = runtime_block.get("requirements")
+            if not isinstance(requirement_configs, dict):
+                raise ValueError("generated public profile runtime.ci.requirements must be a mapping")
+            master_cfg = requirement_configs.get("master")
+            if isinstance(master_cfg, dict):
+                deployer_cfg = master_cfg.get("deployer")
+                if isinstance(deployer_cfg, dict):
+                    deployer_cfg["target"] = primary_node_name
         if runtime_key == "test_stack":
             deploy_templates = runtime_block.get("deploy_templates")
             if isinstance(deploy_templates, dict):

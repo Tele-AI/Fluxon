@@ -4,8 +4,6 @@ from __future__ import annotations
 from _common import run_pytest
 
 
-TEST_REQUIREMENTS = ["docker", "etcd", "fluxon-release", "ops", "submodules"]
-
 
 def main() -> int:
     return run_pytest(

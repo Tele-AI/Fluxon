@@ -1,0 +1,6 @@
+interface:
+  display_name: Browser Helm
+  short_description: 通过 Browser Helm 操作 Browser Helm 受控标签页流程
+  default_prompt: Use $browser-helm to inspect and operate Browser Helm managed tabs.
+policy:
+  allow_implicit_invocation: false

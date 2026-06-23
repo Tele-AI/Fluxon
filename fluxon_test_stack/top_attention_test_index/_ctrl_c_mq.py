@@ -4,7 +4,6 @@ from __future__ import annotations
 from _common import run_python_file
 
 
-TEST_REQUIREMENTS = ["etcd", "fluxon-pyo3", "fluxon-release", "greptime", "ops", "submodules"]
 SCENE_ID = "ci_top_attention_ctrl_c_mq"
 
 

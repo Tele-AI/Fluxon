@@ -4,8 +4,6 @@ from __future__ import annotations
 from _common import run_python_files
 
 
-TEST_REQUIREMENTS = ["ops"]
-
 
 def main() -> int:
     return run_python_files(

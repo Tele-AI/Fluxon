@@ -13,8 +13,6 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TEST_REQUIREMENTS: list[str] = ["ops"]
-
 
 def call(cmd: Sequence[str], *, env: dict[str, str] | None = None) -> int:
     print("+ " + " ".join(cmd), flush=True)

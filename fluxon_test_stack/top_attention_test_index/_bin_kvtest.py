@@ -10,7 +10,6 @@ import yaml
 from _common import REPO_ROOT, load_case_config_payload, run_cargo
 
 
-TEST_REQUIREMENTS = ["cargo", "etcd", "ops", "submodules"]
 SCENE_ID = "ci_top_attention_bin_kvtest"
 KV_TEST_ROUND_NAMES = ("p2p_only", "rdma_transfer_only", "rdma_transfer_with_rpc")
 

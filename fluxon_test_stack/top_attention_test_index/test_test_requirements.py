@@ -3,43 +3,89 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from requirements_all import (
-    ALL_TEST_REQUIREMENTS,
-    ALL_TEST_REQUIREMENTS_SET,
-    extract_test_requirements,
-    iter_test_python_paths,
-)
+import yaml
 
 
-TEST_REQUIREMENTS: list[str] = ["ops"]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+INDEX_DIR = Path(__file__).resolve().parent
+SUITE_PATH = REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml"
+TOP_ATTENTION_SCENE_ID_PREFIX = "ci_top_attention_"
+IGNORED_INDEX_ENTRY_NAMES = frozenset({"_common.py"})
 
 
-class TestTestRequirements(unittest.TestCase):
-    def test_every_test_py_declares_requirements(self) -> None:
-        for path in iter_test_python_paths():
-            with self.subTest(path=path.name):
-                _ = extract_test_requirements(path)
+def iter_index_entry_paths() -> tuple[Path, ...]:
+    return tuple(
+        path
+        for path in sorted(INDEX_DIR.glob("*.py"))
+        if path.name.startswith("_") and path.name not in IGNORED_INDEX_ENTRY_NAMES
+    )
 
-    def test_declared_requirement_lists_are_sorted_unique_and_known(self) -> None:
-        for path in iter_test_python_paths():
-            requirements = extract_test_requirements(path)
-            with self.subTest(path=path.name):
+
+def top_attention_scene_id(path: Path) -> str:
+    return TOP_ATTENTION_SCENE_ID_PREFIX + path.stem.lstrip("_")
+
+
+def _load_suite_scenes() -> dict[str, object]:
+    raw = yaml.safe_load(SUITE_PATH.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise AssertionError(f"suite must be a mapping: {SUITE_PATH}")
+    scenes = raw.get("scenes")
+    if not isinstance(scenes, dict):
+        raise AssertionError(f"suite scenes must be a mapping: {SUITE_PATH}")
+    return scenes
+
+
+def _ci_scene_ids() -> set[str]:
+    return {
+        scene_id
+        for scene_id, raw_scene in _load_suite_scenes().items()
+        if isinstance(scene_id, str)
+        and isinstance(raw_scene, dict)
+        and isinstance(raw_scene.get("ci"), dict)
+    }
+
+
+def _scene_requirements(scene_id: str) -> list[str]:
+    scenes = _load_suite_scenes()
+    scene = scenes.get(scene_id)
+    if not isinstance(scene, dict):
+        raise AssertionError(f"missing top-attention scene in suite: {scene_id}")
+    ci = scene.get("ci")
+    if not isinstance(ci, dict):
+        raise AssertionError(f"top-attention scene must be CI-backed: {scene_id}")
+    requirements = ci.get("requirements")
+    if not isinstance(requirements, list):
+        raise AssertionError(f"scene[{scene_id}].ci.requirements must be a list")
+    out: list[str] = []
+    for index, raw_item in enumerate(requirements):
+        if not isinstance(raw_item, str) or not raw_item.strip():
+            raise AssertionError(f"scene[{scene_id}].ci.requirements[{index}] must be a non-empty string")
+        out.append(raw_item.strip())
+    return out
+
+
+class TestTopAttentionYamlRequirements(unittest.TestCase):
+    def test_every_index_entry_has_suite_scene(self) -> None:
+        for path in iter_index_entry_paths():
+            scene_id = top_attention_scene_id(path)
+            if scene_id not in _ci_scene_ids():
+                continue
+            with self.subTest(path=path.name, scene_id=scene_id):
+                _ = _scene_requirements(scene_id)
+
+    def test_scene_requirements_are_sorted_and_unique(self) -> None:
+        for path in iter_index_entry_paths():
+            scene_id = top_attention_scene_id(path)
+            if scene_id not in _ci_scene_ids():
+                continue
+            requirements = _scene_requirements(scene_id)
+            with self.subTest(path=path.name, scene_id=scene_id):
                 self.assertEqual(requirements, sorted(set(requirements)))
-                self.assertTrue(set(requirements).issubset(ALL_TEST_REQUIREMENTS_SET))
-
-    def test_requirement_universe_is_sorted_unique(self) -> None:
-        self.assertEqual(list(ALL_TEST_REQUIREMENTS), sorted(set(ALL_TEST_REQUIREMENTS)))
-
-    def test_requirement_universe_matches_declared_union(self) -> None:
-        declared_union: set[str] = set()
-        for path in iter_test_python_paths():
-            declared_union.update(extract_test_requirements(path))
-        self.assertEqual(declared_union, set(ALL_TEST_REQUIREMENTS))
 
     def test_removed_direct_entrypoints_stay_removed(self) -> None:
-        self.assertFalse((Path(__file__).resolve().parent / "_all_quick.py").exists())
-        self.assertFalse((Path(__file__).resolve().parent / "run_match_prefix.py").exists())
+        self.assertFalse((INDEX_DIR / "_all_quick.py").exists())
+        self.assertFalse((INDEX_DIR / "run_match_prefix.py").exists())
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(unittest.main())

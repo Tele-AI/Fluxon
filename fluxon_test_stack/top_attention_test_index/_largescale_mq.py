@@ -14,8 +14,6 @@ import yaml
 from _common import REPO_ROOT, call
 
 
-TEST_REQUIREMENTS = ["fluxon-release", "ops", "submodules", "test-stack-targets"]
-
 
 SCENE_ID = "bench_mq"
 DEFAULT_PROFILE_ID = "fluxon_tcp"

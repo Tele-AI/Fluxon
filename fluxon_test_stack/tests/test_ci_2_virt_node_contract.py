@@ -60,17 +60,13 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["deploy"]["target_ip_map"],
             {"local-node-a": "10.1.1.119", "local-node-b": "10.1.1.119"},
         )
-        self.assertEqual(
-            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["runtime_contracts"]["cluster_kv_owner"][
-                "base_runtime"
-            ]["etcd"]["endpoint"]["host_port"],
-            19180,
+        self.assertNotIn(
+            "testbed_etcd",
+            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["requirements"],
         )
-        self.assertEqual(
-            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["runtime_contracts"]["cluster_kv_owner"][
-                "base_runtime"
-            ]["greptime"]["endpoint"]["host_port"],
-            19190,
+        self.assertNotIn(
+            "testbed_greptime",
+            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["requirements"],
         )
         self.assertEqual(
             generated["artifact_sets"]["fluxon_tcp_thread"]["release_source"]["key_prefix"],
@@ -159,8 +155,8 @@ class TestCi2VirtNodeContract(unittest.TestCase):
 
         self.assertEqual(set(generated["scenes"].keys()), {self._DOC_SCENE_ID})
         self.assertEqual(
-            generated["scenes"][self._DOC_SCENE_ID]["ci"]["runtime_contract"],
-            "rust_self_managed",
+            generated["scenes"][self._DOC_SCENE_ID]["ci"]["requirements"],
+            ["ci_runner"],
         )
         prepare = generated["scenes"][self._DOC_SCENE_ID]["ci"]["prepare"]
         self.assertEqual(
@@ -211,12 +207,16 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             {},
         )
         self.assertEqual(
-            generated["scenes"][self._CONFIG_MQ_SCENE_ID]["ci"]["runtime_contract"],
-            "cluster_kv_owner",
+            generated["scenes"][self._CONFIG_MQ_SCENE_ID]["ci"]["requirements"],
+            ["ci_runner", "master", "owner_0", "testbed_etcd", "testbed_greptime"],
         )
         self.assertEqual(
-            generated["scenes"][self._CTRL_C_KV_SCENE_ID]["ci"]["runtime_contract"],
-            "rust_self_managed",
+            generated["scenes"][self._CTRL_C_KV_SCENE_ID]["ci"]["requirements"],
+            ["ci_runner"],
+        )
+        self.assertEqual(
+            generated["scenes"][self._CTRL_C_MQ_SCENE_ID]["ci"]["requirements"],
+            ["ci_runner", "testbed_etcd", "testbed_greptime"],
         )
 
     def test_generated_deployconf_rewrites_to_dual_local_nodes(self) -> None:

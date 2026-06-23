@@ -1,4 +1,4 @@
-schema_version: 9
+schema_version: 10
 
 run:
   mode: full_once
@@ -11,8 +11,7 @@ run:
 scenes:
   ci_top_attention_doc_page_build:
     ci:
-      subject: doc_page
-      runtime_contract: rust_self_managed
+      requirements: [ci_runner]
       prepare:
         - kind: online_docker_image
           image_ref: hanbaoaaa/fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0
@@ -23,48 +22,42 @@ scenes:
 
   ci_top_attention_bin_kvtest:
     ci:
-      subject: rust
-      runtime_contract: rust_self_managed
+      requirements: [ci_runner, testbed_etcd, testbed_greptime]
     select:
       scales: [n1_kvowner_dram_20gib]
       profiles: [fluxon_tcp]
 
   ci_top_attention_config_kv:
     ci:
-      subject: kv
-      runtime_contract: rust_self_managed
+      requirements: [ci_runner]
     select:
       scales: [n1_kvowner_dram_3gib]
       profiles: [fluxon_tcp]
 
   ci_top_attention_config_fs:
     ci:
-      subject: fs
-      runtime_contract: rust_self_managed
+      requirements: [ci_runner]
     select:
       scales: [n1_kvowner_dram_3gib]
       profiles: [fluxon_tcp]
 
   ci_top_attention_config_mq:
     ci:
-      subject: mq
-      runtime_contract: cluster_kv_owner
+      requirements: [ci_runner, master, owner_0, testbed_etcd, testbed_greptime]
     select:
       scales: [n1_kvowner_dram_3gib]
       profiles: [fluxon_tcp]
 
   ci_top_attention_ctrl_c_kv:
     ci:
-      subject: kv
-      runtime_contract: rust_self_managed
+      requirements: [ci_runner]
     select:
       scales: [n1_kvowner_dram_3gib]
       profiles: [fluxon_tcp]
 
   ci_top_attention_ctrl_c_mq:
     ci:
-      subject: mq
-      runtime_contract: cluster_kv_owner
+      requirements: [ci_runner, testbed_etcd, testbed_greptime]
     select:
       scales: [n1_kvowner_dram_3gib]
       profiles: [fluxon_tcp]
@@ -360,72 +353,43 @@ profiles:
           ci_top_attention_config_mq: {}
           ci_top_attention_ctrl_c_kv: {}
           ci_top_attention_ctrl_c_mq: {}
-        runtime_contracts:
-          cluster_kv_owner: &cluster_kv_owner_runtime
-            base_runtime:
-              etcd:
-                target: infra44-ThinkStation-PX
-                endpoint:
-                  scheme: HTTP
-                  host_port: 32579
-              greptime:
-                target: infra44-ThinkStation-PX
-                endpoint:
-                  scheme: HTTP
-                  host_port: 34030
-            case_runtime:
-              master:
-                lifecycle: service
-                k8s_ref: deployment/master
-                deployer:
-                  target: infra44-ThinkStation-PX
-                  command: [/bin/bash, -lc]
-                  args:
-                    - |
-                      set -euo pipefail
-                      cd __RUN_DIR__/src
-                      exec __RUN_DIR__/venv/bin/python3 -m fluxon_py.runtime.start_master \
-                        -c __RUN_DIR__/configs/ci_master.yaml \
-                        -w __RUN_DIR__/services/master
-              owner_0:
-                lifecycle: service
-                k8s_ref: deployment/owner_0
-                deployer:
-                  target: __TARGET__
-                  command: [/bin/bash, -lc]
-                  args:
-                    - |
-                      set -euo pipefail
-                      cd __RUN_DIR__/src
-                      exec __RUN_DIR__/venv/bin/python3 -m fluxon_py.runtime.start_owner_kvclient \
-                        -c __RUN_DIR__/configs/ci_owner_0.yaml \
-                        -w __RUN_DIR__/services/owner_0
-              ci_runner: &common_ci_runner_instance
-                lifecycle: job
-                k8s_ref: deployment/ci_runner
-                deployer:
-                  target: __TARGET__
-                  command: [/bin/bash, -lc]
-                  args:
-                    - |
-                      set -uo pipefail
-                      exec bash __RUN_DIR__/ci_runner.sh
-          rust_self_managed:
-            base_runtime:
-              etcd:
-                target: infra44-ThinkStation-PX
-                endpoint:
-                  scheme: HTTP
-                  host_port: 32579
-              greptime:
-                target: infra44-ThinkStation-PX
-                endpoint:
-                  scheme: HTTP
-                  host_port: 34030
-            case_runtime:
-              ci_runner:
-                <<: *common_ci_runner_instance
-
+        requirements:
+          master:
+            lifecycle: service
+            k8s_ref: deployment/master
+            deployer:
+              target: infra44-ThinkStation-PX
+              command: [/bin/bash, -lc]
+              args:
+                - |
+                  set -euo pipefail
+                  cd __RUN_DIR__/src
+                  exec __RUN_DIR__/venv/bin/python3 -m fluxon_py.runtime.start_master \
+                    -c __RUN_DIR__/configs/ci_master.yaml \
+                    -w __RUN_DIR__/services/master
+          owner_0:
+            lifecycle: service
+            k8s_ref: deployment/owner_0
+            deployer:
+              target: __TARGET__
+              command: [/bin/bash, -lc]
+              args:
+                - |
+                  set -euo pipefail
+                  cd __RUN_DIR__/src
+                  exec __RUN_DIR__/venv/bin/python3 -m fluxon_py.runtime.start_owner_kvclient \
+                    -c __RUN_DIR__/configs/ci_owner_0.yaml \
+                    -w __RUN_DIR__/services/owner_0
+          ci_runner: &common_ci_runner_instance
+            lifecycle: job
+            k8s_ref: deployment/ci_runner
+            deployer:
+              target: __TARGET__
+              command: [/bin/bash, -lc]
+              args:
+                - |
+                  set -uo pipefail
+                  exec bash __RUN_DIR__/ci_runner.sh
       test_stack: &common_test_stack_runtime
         kind: FLUXON
         # English note:

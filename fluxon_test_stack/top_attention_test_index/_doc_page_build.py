@@ -8,7 +8,6 @@ import sys
 from _common import REPO_ROOT, call, load_case_config
 
 
-TEST_REQUIREMENTS = ["ops"]
 SCENE_ID = "ci_top_attention_doc_page_build"
 
 

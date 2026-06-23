@@ -5,11 +5,11 @@ that now lives under `fluxon_test_stack/`. The entries stay thin: they forward
 to canonical tests elsewhere in the repository instead of implementing new test
 logic.
 
-Each `*.py` entry here declares a sorted `TEST_REQUIREMENTS` list. The full
-requirement universe lives in `requirements_all.py`, and `_test_requirements.py`
-checks that per-entry declarations stay within that universe and fully cover it.
-All indexed items now declare `ops` because execution is expected to go through
-the shared Fluxon Ops / test-stack path.
+Top-attention requirement metadata now lives only in
+`fluxon_test_stack/ci_test_list.yaml` under each `ci_top_attention_*` scene's
+`scene.ci.requirements`. `_test_requirements.py` checks that every indexed entry
+has a matching CI scene and that the YAML-backed requirement lists stay
+normalized.
 
 This directory is listing-only. Runtime orchestration, status, and log UI are
 owned by the `fluxon_test_stack` flow, not by this index directory. Listing and

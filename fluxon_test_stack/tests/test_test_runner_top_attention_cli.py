@@ -45,8 +45,8 @@ class TestTestRunnerTopAttentionCli(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, msg=completed.stderr)
         requirements = {line.strip() for line in completed.stdout.splitlines() if line.strip()}
-        self.assertIn("ops", requirements)
-        self.assertIn("kv-cluster", requirements)
+        self.assertIn("ci_runner", requirements)
+        self.assertIn("master", requirements)
 
     def test_top_attention_run_requires_selector(self) -> None:
         completed = self.run_runner("--action", "top_attention_run")

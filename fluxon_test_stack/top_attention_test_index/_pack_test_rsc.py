@@ -4,8 +4,6 @@ from __future__ import annotations
 from _common import run_python_file
 
 
-TEST_REQUIREMENTS = ["fluxon-release", "ops", "submodules"]
-
 
 def main() -> int:
     return run_python_file(

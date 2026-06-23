@@ -4,7 +4,6 @@ from __future__ import annotations
 from _common import run_pytest
 
 
-TEST_REQUIREMENTS = ["etcd", "fluxon-pyo3", "kv-cluster", "ops", "submodules"]
 SCENE_ID = "ci_top_attention_config_mq"
 
 

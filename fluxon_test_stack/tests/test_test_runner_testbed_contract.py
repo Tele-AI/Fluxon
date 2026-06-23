@@ -65,7 +65,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         },
                         "scene_config": {
                             "doc_site_base_url": "tele-ai.github.io/Fluxon",
-                        }
+                        },
                     }
                 },
             }
@@ -263,8 +263,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 },
                 "scene": {
                     "ci": {
-                        "subject": "doc_page",
-                        "runtime_contract": "rust_self_managed",
+                        "requirements": ["ci_runner"],
                         "commands": [
                             {
                                 "id": "doc_page_build",
@@ -522,6 +521,10 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         "    ssh_user: tester",
                         "    ssh_port: 22",
                         "service:",
+                        "  greptime:",
+                        "    port: 19295",
+                        "    node_bind:",
+                        "      node: [logic-a]",
                         "  ops_controller:",
                         "    node_bind:",
                         "      node: [logic-a]",
@@ -634,6 +637,10 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         "    ssh_user: tester",
                         "    ssh_port: 22",
                         "service:",
+                        "  greptime:",
+                        "    port: 19295",
+                        "    node_bind:",
+                        "      node: [logic-a]",
                         "  ops_controller:",
                         "    node_bind:",
                         "      node: [logic-a]",
@@ -649,12 +656,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 "profile": {
                     "ci": {
                         "runtime": {
-                            "base_runtime": {
-                                "greptime": {
-                                    "target": "logic-a",
-                                    "endpoint": {"scheme": "http", "host_port": 19295},
-                                }
-                            }
+                            "base_runtime": {}
                         }
                     }
                 },
