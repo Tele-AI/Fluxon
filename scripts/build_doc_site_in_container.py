@@ -8,9 +8,10 @@ import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent.parent
+REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_IMAGE_REF = "fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0"
 CONTAINER_CACHE_ROOT = "/opt/fluxon_doc_site_cache"
+INNER_BUILD_SCRIPT_RELPATH = Path("scripts/_build_doc_site_in_container_inner.py")
 
 repo_root_str = str(REPO_ROOT)
 if repo_root_str not in sys.path:
@@ -49,13 +50,13 @@ def _load_image_if_requested(*, image_tar: Path | None, repo_root: Path) -> None
 
 def _run_build(*, repo_root: Path, image_ref: str, base_url: str) -> None:
     repo_root = repo_root.resolve()
-    if not (repo_root / "scripts" / "build_doc_site.py").is_file():
-        raise RuntimeError(f"repo root is missing scripts/build_doc_site.py: {repo_root}")
+    if not (repo_root / INNER_BUILD_SCRIPT_RELPATH).is_file():
+        raise RuntimeError(f"repo root is missing {INNER_BUILD_SCRIPT_RELPATH.as_posix()}: {repo_root}")
     command = "\n".join(
         [
             "set -euo pipefail",
             "umask 000",
-            "python3 scripts/build_doc_site.py build",
+            f"python3 {INNER_BUILD_SCRIPT_RELPATH.as_posix()} build",
             "chmod -R a+rwX fluxon_release/doc_site",
         ]
     )

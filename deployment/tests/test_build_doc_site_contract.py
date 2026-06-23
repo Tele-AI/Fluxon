@@ -12,7 +12,7 @@ from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCRIPT_PATH = REPO_ROOT / "scripts" / "build_doc_site.py"
+SCRIPT_PATH = REPO_ROOT / "scripts" / "_build_doc_site_in_container_inner.py"
 
 
 def _load_module():

@@ -12,6 +12,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "build_doc_site_img" / "doc_site_builder.yaml"
 DEFAULT_OUT_PATH = REPO_ROOT / "fluxon_release" / "test_rsc" / "doc_site_builder_image.tar"
+INNER_BUILD_SCRIPT_PATH = REPO_ROOT / "scripts" / "_build_doc_site_in_container_inner.py"
 
 repo_root_str = str(REPO_ROOT)
 if repo_root_str not in sys.path:
@@ -64,9 +65,9 @@ def _input_digest(*, config_path: Path) -> str:
     for path in (
         config_path,
         Path(__file__).resolve(),
-        REPO_ROOT / "scripts" / "build_doc_site.py",
+        INNER_BUILD_SCRIPT_PATH,
         REPO_ROOT / "setup_and_pack" / "utils" / "docker_build_runtime_utils.py",
-        REPO_ROOT / "setup_and_pack" / "nix" / "build_doc_site_in_container.py",
+        REPO_ROOT / "scripts" / "build_doc_site_in_container.py",
     ):
         if not path.is_file():
             raise RuntimeError(f"missing doc-site image input: {path}")

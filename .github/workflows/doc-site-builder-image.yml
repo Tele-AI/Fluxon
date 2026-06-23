@@ -99,7 +99,7 @@ jobs:
       - name: Smoke build docs from exported image tar
         run: |
           docker image rm -f "$DOC_SITE_IMAGE_REF" || true
-          python3 setup_and_pack/nix/build_doc_site_in_container.py \
+          python3 scripts/build_doc_site_in_container.py \
             --repo-root "$PWD" \
             --image-tar "$DOC_SITE_IMAGE_TAR" \
             --base-url "$FLUXON_DOC_SITE_BASE_URL"

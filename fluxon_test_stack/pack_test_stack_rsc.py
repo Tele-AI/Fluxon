@@ -873,7 +873,7 @@ def _pack_ci_src(*, repo_root: Path, out_path: Path) -> None:
         repo_root / "examples",
         repo_root / "fluxon_test_stack",
         repo_root / "setup.py",
-        repo_root / "scripts" / "build_doc_site.py",
+        repo_root / "scripts" / "_build_doc_site_in_container_inner.py",
         repo_root / "README.md",
     )
     for path in required_repo_paths:

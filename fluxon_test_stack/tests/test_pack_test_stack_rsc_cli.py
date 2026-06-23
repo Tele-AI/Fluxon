@@ -150,7 +150,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 "deployment/dispatch.py",
                 "examples/demo.py",
                 "fluxon_test_stack/case.yaml",
-                "scripts/build_doc_site.py",
+                "scripts/_build_doc_site_in_container_inner.py",
                 "fluxon_doc_cn/roadmap.md",
                 "fluxon_doc_en/roadmap.md",
                 "README.md",
@@ -193,7 +193,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 "deployment/dispatch.py",
                 "examples/demo.py",
                 "fluxon_test_stack/case.yaml",
-                "scripts/build_doc_site.py",
+                "scripts/_build_doc_site_in_container_inner.py",
                 "fluxon_doc_cn/roadmap.md",
                 "fluxon_doc_en/roadmap.md",
                 "README.md",
@@ -237,7 +237,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 "deployment/dispatch.py",
                 "examples/demo.py",
                 "fluxon_test_stack/case.yaml",
-                "scripts/build_doc_site.py",
+                "scripts/_build_doc_site_in_container_inner.py",
                 "fluxon_doc_cn/roadmap.md",
                 "fluxon_doc_en/roadmap.md",
                 "README.md",
@@ -258,7 +258,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
             repo_root = Path(tmpdir)
             stage_root = repo_root / "stage"
             for relpath in (
-                "scripts/build_doc_site.py",
+                "scripts/_build_doc_site_in_container_inner.py",
                 "fluxon_doc_cn/roadmap.md",
                 "README.md",
                 "fluxon_release/install.py",
@@ -271,7 +271,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
 
             raw = b"\0".join(
                 [
-                    b"scripts/build_doc_site.py",
+                    b"scripts/_build_doc_site_in_container_inner.py",
                     b"fluxon_doc_cn/roadmap.md",
                     b"README.md",
                     b"fluxon_release/install.py",
@@ -285,11 +285,11 @@ class TestPackTestStackRscCli(unittest.TestCase):
 
             self.assertEqual(
                 relpaths,
-                ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/build_doc_site.py"],
+                ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/_build_doc_site_in_container_inner.py"],
             )
             self.assertTrue((stage_root / "README.md").is_file())
             self.assertTrue((stage_root / "fluxon_doc_cn" / "roadmap.md").is_file())
-            self.assertTrue((stage_root / "scripts" / "build_doc_site.py").is_file())
+            self.assertTrue((stage_root / "scripts" / "_build_doc_site_in_container_inner.py").is_file())
             self.assertFalse((stage_root / "fluxon_release").exists())
             self.assertFalse((stage_root / ".dever").exists())
             self.assertFalse((stage_root / "skills").exists())
@@ -298,7 +298,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             for relpath in (
-                "scripts/build_doc_site.py",
+                "scripts/_build_doc_site_in_container_inner.py",
                 "fluxon_doc_cn/roadmap.md",
                 "README.md",
                 "fluxon_release/install.py",
@@ -311,7 +311,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
 
             raw = b"\0".join(
                 [
-                    b"scripts/build_doc_site.py",
+                    b"scripts/_build_doc_site_in_container_inner.py",
                     b"fluxon_doc_cn/roadmap.md",
                     b"README.md",
                     b"fluxon_release/install.py",
@@ -325,7 +325,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
 
             self.assertEqual(
                 relpaths,
-                ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/build_doc_site.py"],
+                ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/_build_doc_site_in_container_inner.py"],
             )
 
     def test_collect_ci_source_relpaths_includes_rather_no_git_submodule_sources(self) -> None:
@@ -333,7 +333,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
             repo_root = Path(tmpdir)
             tracked_root = repo_root / "scripts"
             tracked_root.mkdir(parents=True, exist_ok=True)
-            (tracked_root / "build_doc_site.py").write_text("tracked\n", encoding="utf-8")
+            (tracked_root / "_build_doc_site_in_container_inner.py").write_text("tracked\n", encoding="utf-8")
             module_root = repo_root / "fluxon_rs" / "moka"
             (module_root / "src").mkdir(parents=True, exist_ok=True)
             (module_root / "Cargo.toml").write_text("module\n", encoding="utf-8")
@@ -352,7 +352,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 del argv
                 cwd_path = Path(cwd).resolve()
                 if cwd_path == repo_root.resolve():
-                    return b"scripts/build_doc_site.py\0"
+                    return b"scripts/_build_doc_site_in_container_inner.py\0"
                 if cwd_path == module_root.resolve():
                     return b"Cargo.toml\0src/lib.rs\0"
                 raise AssertionError(f"unexpected git ls-files cwd: {cwd_path}")
@@ -365,7 +365,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 [
                     "fluxon_rs/moka/Cargo.toml",
                     "fluxon_rs/moka/src/lib.rs",
-                    "scripts/build_doc_site.py",
+                    "scripts/_build_doc_site_in_container_inner.py",
                 ],
             )
 
@@ -406,7 +406,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 mock.patch.object(
                     _PACK,
                     "_collect_git_listed_source_relpaths",
-                    return_value=["scripts/build_doc_site.py"],
+                    return_value=["scripts/_build_doc_site_in_container_inner.py"],
                 ),
                 self.assertRaisesRegex(
                     RuntimeError,

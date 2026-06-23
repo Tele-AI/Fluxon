@@ -246,8 +246,8 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         "prepare": [
                             {
                                 "kind": "setup_dev_env",
-                                "config": "setup_and_pack/setup_dev_env/doc_page_ci.yaml",
-                                "cache_relpath": ".cached/fluxon_doc_site/toolchain",
+                                "config": "setup_and_pack/setup_dev_env/ubuntu24.yaml",
+                                "cache_relpath": ".cached/fluxon_ci/toolchain",
                             }
                         ],
                     }
@@ -298,8 +298,8 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             [
                 {
                     "kind": "setup_dev_env",
-                    "config": "setup_and_pack/setup_dev_env/doc_page_ci.yaml",
-                    "cache_relpath": ".cached/fluxon_doc_site/toolchain",
+                    "config": "setup_and_pack/setup_dev_env/ubuntu24.yaml",
+                    "cache_relpath": ".cached/fluxon_ci/toolchain",
                 },
                 {
                     "kind": "online_docker_image",
@@ -314,8 +314,8 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             [
                 {
                     "kind": "setup_dev_env",
-                    "config": "setup_and_pack/setup_dev_env/doc_page_ci.yaml",
-                    "cache_relpath": ".cached/fluxon_doc_site/toolchain",
+                    "config": "setup_and_pack/setup_dev_env/ubuntu24.yaml",
+                    "cache_relpath": ".cached/fluxon_ci/toolchain",
                 },
                 {
                     "kind": "online_docker_image",

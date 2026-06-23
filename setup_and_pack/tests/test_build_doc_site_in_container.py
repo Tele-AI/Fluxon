@@ -9,7 +9,7 @@ from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = REPO_ROOT / "setup_and_pack" / "nix" / "build_doc_site_in_container.py"
+MODULE_PATH = REPO_ROOT / "scripts" / "build_doc_site_in_container.py"
 
 
 def _load_module():
@@ -50,7 +50,7 @@ class BuildDocSiteInContainerTest(unittest.TestCase):
     def test_run_build_invokes_docker_run_with_repo_mount_and_cache_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
-            script_path = repo_root / "scripts" / "build_doc_site.py"
+            script_path = repo_root / _CONTAINER.INNER_BUILD_SCRIPT_RELPATH
             script_path.parent.mkdir(parents=True)
             script_path.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
 
@@ -76,12 +76,15 @@ class BuildDocSiteInContainerTest(unittest.TestCase):
             self.assertIn("/workspace", argv)
             self.assertIn("doc:latest", argv)
             command = argv[-1]
-            self.assertIn("python3 scripts/build_doc_site.py build", command)
+            self.assertIn(
+                f"python3 {_CONTAINER.INNER_BUILD_SCRIPT_RELPATH.as_posix()} build",
+                command,
+            )
             self.assertIn("chmod -R a+rwX fluxon_release/doc_site", command)
 
     def test_run_build_rejects_repo_without_doc_site_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            with self.assertRaisesRegex(RuntimeError, "missing scripts/build_doc_site.py"):
+            with self.assertRaisesRegex(RuntimeError, f"missing {_CONTAINER.INNER_BUILD_SCRIPT_RELPATH.as_posix()}"):
                 _CONTAINER._run_build(
                     repo_root=Path(tmpdir),
                     image_ref="doc:latest",

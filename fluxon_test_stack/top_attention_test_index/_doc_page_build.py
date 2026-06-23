@@ -26,7 +26,7 @@ def main() -> int:
         required=True,
         help="Canonical CI case config YAML emitted by test_runner.",
     )
-    args, passthrough = parser.parse_known_args()
+    args = parser.parse_args()
     scene_config = load_case_config(args.case_config, expected_scene_id=SCENE_ID)
     base_url = str(scene_config.get("doc_site_base_url") or "").strip()
     if not base_url:
@@ -34,24 +34,18 @@ def main() -> int:
     env = os.environ.copy()
     env["FLUXON_DOC_SITE_BASE_URL"] = base_url
     image_ref = env.get("FLUXON_DOC_SITE_DOCKER_IMAGE_REF", "").strip()
-    if image_ref:
-        command = [
+    if not image_ref:
+        raise ValueError("FLUXON_DOC_SITE_DOCKER_IMAGE_REF must be set for doc page CI builds")
+    return call(
+        [
             args.python,
-            str(REPO_ROOT / "setup_and_pack" / "nix" / "build_doc_site_in_container.py"),
+            str(REPO_ROOT / "scripts" / "build_doc_site_in_container.py"),
             "--repo-root",
             str(REPO_ROOT),
             "--base-url",
             base_url,
             "--image-ref",
             image_ref,
-        ]
-        return call(command, env=env)
-    return call(
-        [
-            args.python,
-            str(REPO_ROOT / "scripts" / "build_doc_site.py"),
-            "build",
-            *passthrough,
         ],
         env=env,
     )

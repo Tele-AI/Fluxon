@@ -32,7 +32,7 @@ class BuildDocSiteImgTest(unittest.TestCase):
         self.assertIn("image_name: fluxon-doc-site-builder", config_text)
         self.assertIn("image_tag: quartz-v5.0.0-node-v24.16.0", config_text)
         self.assertIn("FLUXON_DOC_SITE_CACHE_ROOT=/opt/fluxon_doc_site_cache", config_text)
-        self.assertIn("build_doc_site.py bootstrap", config_text)
+        self.assertIn("_build_doc_site_in_container_inner.py bootstrap", config_text)
         self.assertIn("-name node_modules", config_text)
         self.assertNotIn("-name .git", config_text)
 

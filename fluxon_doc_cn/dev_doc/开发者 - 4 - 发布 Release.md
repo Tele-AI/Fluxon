@@ -98,7 +98,7 @@ workflow 在 GitHub runner 上会自动完成这些步骤：
 
 文档站发布和二进制 release 是两条独立链路。当前文档站 workflow 是 `.github/workflows/docs-pages.yml`：
 
-- 当 `README.md`、`README_CN.md`、`fluxon_doc_cn/**`、`fluxon_doc_en/**` 或 `scripts/build_doc_site.py` 变更并推到 `main` / `master` 时，会自动触发。
+- 当 README、文档内容或文档站构建代码变更并推到 `main` / `master` 时，会自动触发。
 - 也可以在 GitHub Actions 页面手动触发 `docs-pages`。
 - 该 workflow 会构建 `fluxon_release/doc_site/`，然后部署到 GitHub Pages。
 - 该 workflow 不会上传 wheel、`fluxon_release.tar.gz` 或 Docker image。
