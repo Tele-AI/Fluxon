@@ -139,6 +139,41 @@ class ApplyLayoutTest(unittest.TestCase):
                 (str(closed_sdk_root.resolve()),),
             )
 
+    def test_load_experiment_spec_from_root_accepts_explicit_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            project_root = root / "repo"
+            generated_config_path = root / "generated" / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_ci.yaml"
+            (project_root / ".git").mkdir(parents=True, exist_ok=True)
+            (project_root / "setup_and_pack").mkdir(parents=True, exist_ok=True)
+            generated_config_path.parent.mkdir(parents=True, exist_ok=True)
+
+            spec = _LIB_LAYOUT.load_experiment_spec_from_root(
+                config_path=generated_config_path,
+                config_root={
+                    "project_root": str(project_root.resolve()),
+                    "store": {
+                        "project_data_root": str((root / "project_data").resolve()),
+                    },
+                    "runtime": {
+                        "base_system": "manylinux_2_28",
+                        "architectures": ["x86_64"],
+                        "python_abi": "cpython3.10",
+                    },
+                    "profile": {
+                        "source_kind": "bridge_prebuilt",
+                        "native_runtime_dir_names": ["cxxpacked"],
+                        "target_support_dir_names": ["meson-0.64.0"],
+                        "ext_bundle_dir_name": "cxxpacked",
+                    },
+                    "assembly": {
+                        "baseline_path": str((root / "baseline").resolve()),
+                    },
+                },
+            )
+
+            self.assertEqual(spec.project_root, project_root.resolve())
+
     def test_load_experiment_config_root_expands_host_root_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

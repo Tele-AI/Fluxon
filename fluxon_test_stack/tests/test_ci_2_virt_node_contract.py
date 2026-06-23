@@ -347,6 +347,54 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             self.assertIn(str(env_path.resolve()), calls[0])
             self.assertIn(str((root / "pack_release_runtime").resolve()), calls[0])
 
+    def test_render_ci_nix_pack_config_sets_explicit_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            static_config_path = root / "static.yaml"
+            env_companion_path = root / "env.yaml"
+            out_path = root / "generated" / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_ci.yaml"
+
+            _ENTRY._write_yaml(
+                static_config_path,
+                {
+                    "schema_version": 1,
+                    "runtime": {
+                        "base_system": "manylinux_2_28",
+                        "architectures": ["x86_64"],
+                        "python_abi": "cpython3.10",
+                    },
+                    "profile": {
+                        "source_kind": "bridge_prebuilt",
+                        "native_runtime_dir_names": ["cxxpacked"],
+                        "target_support_dir_names": ["meson-0.64.0"],
+                        "ext_bundle_dir_name": "cxxpacked",
+                    },
+                    "assembly": {
+                        "baseline_path": "/tmp/baseline",
+                    },
+                },
+            )
+            _ENTRY._write_yaml(
+                env_companion_path,
+                {
+                    "host_paths": {
+                        "root_path": "/tmp/project-data",
+                    },
+                },
+            )
+
+            rendered_path = _ENTRY._render_ci_nix_pack_config(
+                static_config_path=static_config_path,
+                env_companion_path=env_companion_path,
+                out_path=out_path,
+                repo_root=REPO_ROOT,
+            )
+
+            self.assertEqual(rendered_path, out_path.resolve())
+            rendered_cfg = _ENTRY._load_yaml_mapping(rendered_path, ctx="rendered nix pack config")
+            self.assertEqual(rendered_cfg["project_root"], str(REPO_ROOT.resolve()))
+            self.assertEqual(rendered_cfg["profile"]["build_root_path"], str(REPO_ROOT.resolve()))
+
     def test_prepare_pack_release_runtime_dirs_creates_expected_layout(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "pack_release_runtime"

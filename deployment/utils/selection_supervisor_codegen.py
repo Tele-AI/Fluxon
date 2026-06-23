@@ -1011,6 +1011,17 @@ def _iter_process_cmdlines() -> List[tuple[int, List[str]]]:
     return out
 
 
+def _iter_process_snapshots() -> List[tuple[ProcessInfo, List[str]]]:
+    infos_by_pid = {info.pid: info for info in _iter_process_infos()}
+    out: List[tuple[ProcessInfo, List[str]]] = []
+    for pid, args in _iter_process_cmdlines():
+        process_info = infos_by_pid.get(pid)
+        if process_info is None or process_info.is_zombie:
+            continue
+        out.append((process_info, args))
+    return out
+
+
 def _arg_value(args: List[str], flag: str) -> Optional[str]:
     for idx, arg in enumerate(args[:-1]):
         if arg == flag:
@@ -1155,13 +1166,11 @@ def _iter_process_infos() -> List[ProcessInfo]:
 
 def _iter_live_supervisors(label: Optional[str] = None, *, scope_key: Optional[str] = None) -> List[LiveSupervisor]:
     out: List[LiveSupervisor] = []
-    for pid, args in _iter_process_cmdlines():
+    for process_info, args in _iter_process_snapshots():
         supervisor_command = _find_selection_supervisor_command(args)
         if supervisor_command is None:
             continue
-        process_info = _find_process_info(pid)
-        if process_info is None or process_info.is_zombie:
-            continue
+        pid = process_info.pid
         runtime_label = _arg_value(args, "--label")
         if runtime_label is None:
             raise RuntimeError(f"running selection supervisor is missing --label pid={pid}")

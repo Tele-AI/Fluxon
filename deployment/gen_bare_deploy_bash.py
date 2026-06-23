@@ -619,7 +619,7 @@ def _render_standalone_start_body(*, name_prefix: str, service_name: str) -> str
             "SELECTION_SUPERVISOR_LAUNCH_WAIT_BLOCK": _render_selection_supervisor_launch_wait_block(
                 run_cmd=run_cmd,
                 stable_seconds_expr=str(STANDALONE_PROBABLE_READY_SECONDS),
-                deadline_ts_expr='"$STARTUP_DEADLINE_TS"',
+                deadline_ts_expr=f'$(( $(date +%s) + {STANDALONE_STARTUP_DEADLINE_SECONDS} ))',
                 context="[bare]",
             ),
         },
@@ -693,7 +693,7 @@ def _render_atomic_group_service_block(
                 script=_render_selection_supervisor_launch_wait_block(
                     run_cmd=run_cmd,
                     stable_seconds_expr=str(ATOMIC_GROUP_PROBABLE_READY_SECONDS),
-                    deadline_ts_expr='"$GROUP_STARTUP_DEADLINE_TS"',
+                    deadline_ts_expr=f'$(( $(date +%s) + {ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS} ))',
                     context="[rollout]",
                 ).rstrip()
                 + "\n",

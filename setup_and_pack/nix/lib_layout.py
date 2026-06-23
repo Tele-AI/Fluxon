@@ -41,6 +41,7 @@ DEFAULT_INSTANCE_ID = "cold_start"
 PACK_CONFIG_STATIC_STEM_SUFFIX = "_static"
 PACK_CONFIG_ENV_STEM_SUFFIX = "_env"
 DEFAULT_PACK_CONFIG_ENV_DIR_NAME = "setup_and_pack"
+PROJECT_ROOT_CONFIG_KEY = "project_root"
 HOST_PATHS_ROOT_KEY = "root_path"
 DEFAULT_HOST_PATH_SUFFIXES = {
     ("store", "project_data_root"): "",
@@ -224,7 +225,7 @@ def load_experiment_spec_from_root(*, config_path: Path, config_root: dict) -> E
     profile_config = _require_mapping(raw_config, "profile")
     assembly_config = _require_mapping(raw_config, "assembly")
 
-    project_root = _detect_project_root(config_path=config_path)
+    project_root = _resolve_project_root(config_path=config_path, raw_config=raw_config)
     project_data_root = _require_absolute_path(store_config, "project_data_root")
     base_system = _require_enum_string(runtime_config, "base_system", SUPPORTED_BASE_SYSTEMS)
     architectures = tuple(
@@ -545,6 +546,25 @@ def _detect_project_root(*, config_path: Path) -> Path:
         f"{PROJECT_ROOT_MARKER_FILE_NAMES + PROJECT_ROOT_MARKER_DIR_NAMES} "
         f"and child dirs {PROJECT_ROOT_REQUIRED_CHILD_DIR_NAMES}: {config_path}"
     )
+
+
+def _resolve_project_root(*, config_path: Path, raw_config: dict) -> Path:
+    configured_project_root = _optional_non_empty_string(raw_config, PROJECT_ROOT_CONFIG_KEY)
+    if configured_project_root is not None:
+        project_root = Path(configured_project_root)
+        if not project_root.is_absolute():
+            raise RuntimeError(
+                f"config.{PROJECT_ROOT_CONFIG_KEY} must be an absolute path: {configured_project_root}"
+            )
+        resolved_project_root = project_root.resolve()
+        if not _is_project_root_candidate(resolved_project_root):
+            raise RuntimeError(
+                "config.project_root must point at a project root containing one of "
+                f"{PROJECT_ROOT_MARKER_FILE_NAMES + PROJECT_ROOT_MARKER_DIR_NAMES} "
+                f"and child dirs {PROJECT_ROOT_REQUIRED_CHILD_DIR_NAMES}: {resolved_project_root}"
+            )
+        return resolved_project_root
+    return _detect_project_root(config_path=config_path)
 
 
 def _is_project_root_candidate(candidate_root: Path) -> bool:

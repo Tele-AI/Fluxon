@@ -136,10 +136,9 @@ def test_preserves_hostworkdir_runtime_token() -> None:
         assert "/hostworkdir/svc_" not in script, script
         assert "wait-present" not in script, script
         assert "launch_only_start_gate" not in script, script
-        assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID"' in script, script
+        _assert_standalone_deadline_after_launch(script)
         assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_TS" "[bare]"' in script, script
         assert "export SERVICE_PORT=12345" in script, script
-        assert 'STARTUP_DEADLINE_TS=$(( $(date +%s) + 10 ))' in script, script
         assert "wait_service_tcp_ready" not in script, script
         assert "wait_service_etcd_endpoint_healthy" not in script, script
         assert 'SUPERVISOR_PID=$( setsid ' not in script, script
@@ -196,8 +195,12 @@ def test_atomic_group_start_does_not_auto_stop_on_failure() -> None:
         assert 'SUPERVISOR_PID=$( setsid ' not in script, script
         assert 'echo "[rollout] probable-ready failed svc=$SERVICE label=$SUPERVISOR_LABEL supervisor_pid=$SUPERVISOR_PID"' in script, script
         assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID"' in script, script
-        assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$GROUP_STARTUP_DEADLINE_TS" "[rollout]"' in script, script
-        assert 'GROUP_STARTUP_DEADLINE_TS=$(( $(date +%s) + 10 ))' in script, script
+        assert 'GROUP_STARTUP_DEADLINE_TS=' not in script, script
+        assert script.count('STARTUP_DEADLINE_TS=$(( $(date +%s) + 10 ))') == 2, script
+        _assert_deadline_after_launch(
+            script=script,
+            wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_TS" "[rollout]"',
+        )
         assert "export SERVICE_PORT=23456" in script, script
         assert "unset SERVICE_PORT" in script, script
         assert "wait_service_tcp_ready" not in script, script
@@ -326,7 +329,7 @@ def test_bare_start_uses_no_exit_startup_gate() -> None:
         plain_script = (outdir / "start_svc_plain.sh").read_text(encoding="utf-8")
 
         for script in (etcd_script, tikv_script, plain_script):
-            assert 'STARTUP_DEADLINE_TS=$(( $(date +%s) + 10 ))' in script, script
+            _assert_standalone_deadline_after_launch(script)
             assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_TS" "[bare]"' in script, script
             assert "wait_service_tcp_ready" not in script, script
             assert "wait_service_etcd_endpoint_healthy" not in script, script
@@ -362,7 +365,11 @@ def test_normalized_testbed_master_exports_service_port_for_atomic_group() -> No
         assert "export MASTER__PORT=51051" in master_block, master_block
         assert "export SERVICE_PORT=51051" in master_block, master_block
         assert "unset SERVICE_PORT" not in master_block, master_block
-        assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$GROUP_STARTUP_DEADLINE_TS" "[rollout]"' in master_block, master_block
+        assert 'GROUP_STARTUP_DEADLINE_TS=' not in master_block, master_block
+        _assert_deadline_after_launch(
+            script=master_block,
+            wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_TS" "[rollout]"',
+        )
         assert "wait_service_tcp_ready" not in master_block, master_block
         print("PASS: test_normalized_testbed_master_exports_service_port_for_atomic_group")
 
@@ -858,6 +865,26 @@ def _wait_until_selection_absent(
             return
         time.sleep(0.2)
     raise RuntimeError(f"timeout waiting selection absent: label={label} scope_key={scope_key}")
+
+
+def _assert_deadline_after_launch(*, script: str, wait_call: str) -> None:
+    launch_check = 'if [[ ! "$SUPERVISOR_PID" =~ ^[0-9]+$ ]]; then'
+    deadline_assign = 'STARTUP_DEADLINE_TS=$(( $(date +%s) + 10 ))'
+    assert launch_check in script, script
+    assert deadline_assign in script, script
+    assert wait_call in script, script
+
+    launch_check_idx = script.index(launch_check)
+    deadline_idx = script.index(deadline_assign)
+    wait_idx = script.index(wait_call)
+    assert launch_check_idx < deadline_idx < wait_idx, script
+
+
+def _assert_standalone_deadline_after_launch(script: str) -> None:
+    _assert_deadline_after_launch(
+        script=script,
+        wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_TS" "[bare]"',
+    )
 
 
 if __name__ == "__main__":

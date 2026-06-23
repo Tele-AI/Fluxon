@@ -710,6 +710,7 @@ def _render_ci_nix_pack_config(
     env_cfg = _load_yaml_mapping(env_companion_path.resolve(), ctx="CI pack env companion")
     merged_cfg = copy.deepcopy(static_cfg)
     merged_cfg.update(copy.deepcopy(env_cfg))
+    merged_cfg["project_root"] = str(repo_root.resolve())
 
     profile_cfg = merged_cfg.get("profile")
     if not isinstance(profile_cfg, dict):

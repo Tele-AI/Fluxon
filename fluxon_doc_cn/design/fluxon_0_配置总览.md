@@ -55,31 +55,75 @@ flowchart TD
 
 这是仓库级开发环境配置，不是业务 runtime config。
 
-| 字段 | 规则 | 主要用途 |
-| --- | --- | --- |
-| `etcd` | 必填，`host:port` | 供 Rust / Python / 测试工具读取 etcd 地址 |
-| `prom` | 必填，`http(s)://.../v1` 或 `.../api/v1` | 供 Grafana / TSDB 查询 URL 使用 |
-| `prom_remote_write_url` | 必填，`http(s)://...` | 供 remote write 使用 |
+最小骨架：
+
+```yaml
+# Rust / Python / 测试工具共用的 etcd 地址
+# 输入要求 raw host:port
+etcd: 127.0.0.1:43579
+
+# Prometheus-compatible 查询入口
+prom: http://127.0.0.1:44030/v1/prometheus
+
+# remote write 入口
+prom_remote_write_url: http://127.0.0.1:44030/v1/prometheus/write
+```
+
+这里的重点不是字段多，而是格式严格分层：
+
+- `etcd` 用 raw `host:port`。
+- `prom` 用带 scheme 的 HTTP URL，并且路径通常是 `/v1/prometheus` 或 `/api/v1`。
+- `prom_remote_write_url` 也是完整 URL。
 
 `setup_and_pack/utils/repo_config_utils.py` 里保留了 `prometheus_remote_write_url` 的旧名兼容读取，但这是 build tooling 的过渡路径，不是推荐的新契约。
 
 ### 4.2 `build_config_ext_static.yml`
 
-当前只固定一个值：
+当前最小骨架只有一个稳定字段：
 
-| 字段 | 规则 |
-| --- | --- |
-| `manylinux_version` | 必填，当前只允许 `2_28` |
+```yaml
+manylinux_version: "2_28"
+```
+
+当前实现只接受 `2_28`。
 
 ### 4.3 `deployment/deployconf.yaml`
 
-这是部署和打包流水线的核心配置。当前稳定消费面主要有三块：
+这是部署和打包流水线的核心配置。先看最重要的骨架：
 
-| 区块 | 关键字段 | 作用 |
-| --- | --- | --- |
-| `cluster_nodes` | 节点列表 | 作为 placeholder 解析的基础 |
-| `service` | 服务节点映射 | 供部署脚本和测试脚本查 service ip:port |
-| `global_envs` | `ETCD_FULL_ADDRESS`、`FLUXON_PROMETHEUS_BASE_URL`、`MONITOR_GREPTIMEDB_WRITE_URL`、`FLUXON_CLUSTER_NAME`、`FLUXON_SHARED_MEM`、`FLUXON_SHARED_FILE` | 供部署/测试代码读取集群级 authority |
+```yaml
+namespace: fluxon-example
+name_prefix: fluxon-example
+image: fluxon_quick_start:0.2.1
+
+cluster_nodes:
+  - hostname: example-node-a
+    ip: 192.0.2.10
+    hostworkdir: /opt/example/fluxon/deployment/example_deploy
+    mounts:
+      - /opt/example/fluxon: /fluxon_mount
+      - /var/run/docker.sock: /var/run/docker.sock
+
+global_envs:
+  FLUXON_CLUSTER_NAME: "fluxon-example-cluster"
+  FLUXON_SHARED_MEM: "${HOSTWORKDIR}/shm1"
+  FLUXON_SHARED_FILE: "${HOSTWORKDIR}/shm1_files"
+  ETCD_FULL_ADDRESS: "${${ETCD__NODE_ID}__IP}:${ETCD__PORT}"
+  FLUXON_PROMETHEUS_BASE_URL: "http://${${GREPTIME__NODE_ID}__IP}:${GREPTIME__PORT}/v1/prometheus"
+  MONITOR_GREPTIMEDB_WRITE_URL: "http://${${GREPTIME__NODE_ID}__IP}:${GREPTIME__PORT}/v1/prometheus/write"
+
+release_ext_images:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.0
+  greptime:
+    image: greptime/greptimedb:v0.15.1
+```
+
+读这份配置时，先抓住三层：
+
+- `cluster_nodes` 提供节点清单，是 placeholder 解析的基础。
+- `global_envs` 提供集群级 authority，比如 etcd、Prometheus、cluster name、shared roots。
+- `release_ext_images` 和后续 service/workload 块把这些 authority 接进具体部署动作。
 
 `global_envs` 允许占位符解析，先由 `cluster_nodes` + `service` 构造映射，再把变量落成最终值。
 
@@ -87,84 +131,191 @@ flowchart TD
 
 这是一层测试入口配置，不是 runtime 部署配置。
 
-| 字段 | 规则 |
-| --- | --- |
-| `deployconf_path` | 必填，指向共享 deployconf |
-| `kv_svc_type` | 必填，当前测试助手只接受已知 backend 类型 |
+最小骨架：
+
+```yaml
+deployconf_path: ../../deployment/deployconf.yaml
+kv_svc_type: fluxon
+```
+
+这里没有复杂分支：
+
+- `deployconf_path` 指向共享 deployconf。
+- `kv_svc_type` 选择测试要接的 KV backend；当前 checked-in 样例用的是 `fluxon`。
 
 测试代码里还保留了 mooncake 相关读取函数，但 checked-in 的最小样例只使用上面两个字段。
 
 ### 4.5 `fluxon_test_stack/*`
 
-TestStack 的配置已经单独有设计文档，这里只收口成一句话：
+TestStack 有三份主配置，建议直接从 YAML 骨架理解：
 
-- `ci_test_list.yaml` 定义 suite 空间。
-- `start_test_bed.yaml` 定义共享 testbed 和 UI。
-- `gitops.yaml` 定义 GitOps 轮询和记录。
-- 生成的 `deployconf_testbed.yml` 是派生产物，不是手工主配置。
+`ci_test_list.yaml` 定义 suite / scene 空间：
+
+```yaml
+schema_version: 9
+
+run:
+  mode: full_once
+  selectors:
+    case_ids: ALL
+    profile_ids: [fluxon_fastws, fluxon_tquic, fluxon_sockudo_ws, fluxon_tcp]
+    command_ids: ALL
+    test_ids: ALL
+
+scenes:
+  kv_read_heavy_zipf:
+    test_stack:
+      mode: KVSTORE
+      read_ratio: 0.9
+      write_ratio: 0.1
+      request_distribution: zipfian
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+```
+
+`start_test_bed.yaml` 定义 testbed authority 和 UI：
+
+```yaml
+schema_version: 6
+
+deployconf_path: ./deployconf_testbed.yml
+controller_url: http://192.0.2.10:19080/r/ops/fluxon_testbed
+controller_basic_auth:
+  username: example_admin
+  password: example_password
+
+test_runner_ui:
+  enabled: true
+  host: 0.0.0.0
+  port: 18080
+  workdir: ./test_runner_ui_runtime
+  gitops_config_path: ./gitops/gitops.yaml
+
+bootstrap_phases:
+  - mode: fixed_bare
+    node: infra44-ThinkStation-PX
+    services: [etcd, greptime, tikv_pd, tikv]
+```
+
+`gitops/gitops.yaml` 定义 GitOps 轮询和触发命令：
+
+```yaml
+interval: 60
+
+retention:
+  max_age_days: 7
+
+repos:
+  - addr: git@github.com:Tele-AI/fluxon.git
+    follow:
+      - branch: big_step2
+        run:
+          name_prefix: fluxon_ci
+          commands:
+            - python3 fluxon_test_stack/pack_test_stack_rsc.py --all-profiles -c fluxon_test_stack/ci_test_list.yaml
+            - python3 fluxon_test_stack/test_runner.py -c fluxon_test_stack/ci_test_list.yaml -w .
+```
+
+生成的 `deployconf_testbed.yml` 是派生产物，不是手工主配置。
 
 ## 5. 运行时配置
 
 ### 5.1 KV
 
-KV 的入口在 `fluxon_kv/src/config.rs`。稳定结论是：`master` 单独使用 `MasterConfigYaml`；`owner` 和 `external` 共用 `ClientConfigYaml`，再由 `verify()` 按内存贡献收敛成 owner / external / side-transfer worker 三个运行时分支。
+KV 的入口在 `fluxon_kv/src/config.rs`。先记结论：`master` 单独使用 `MasterConfigYaml`；`owner` 和 `external` 共用 `ClientConfigYaml`；`verify()` 再按内存贡献把 client 配置收敛成 owner / external / side-transfer worker 三个运行时分支。
 
-| 类型 | 作用 |
-| --- | --- |
-| `MasterConfigYaml` | master 节点输入 |
-| `ClientConfigYaml` | owner / external 输入 |
-| `FluxonKvSpecYaml` | client 侧 `fluxonkv_spec` 子块 |
-| `TestSpecConfig` | 测试和实验分支开关 |
-| `MonitoringConfigYaml` | master 监控块 |
-| `NetworkConfig` | 网络白名单和 IP 映射，共享自 `fluxon_commu_contract` |
+`master` 的最小骨架：
 
-`master` 的 YAML 结构：
+```yaml
+instance_key: my-master-1
+cluster_name: demo-kv-cluster
 
-| 字段 | 规则 | 作用 |
-| --- | --- | --- |
-| `instance_key` | 必填 | master 实例标识 |
-| `cluster_name` | 必填 | 集群名 |
-| `etcd_endpoints` | 必填，输入用 raw `host:port` | master 控制面 etcd 地址；校验后归一化成 `http://host:port` |
-| `log_dir` | 必填 | master 日志 / profile 根目录 |
-| `port` | 可选，给出时 `> 0` | master 监听端口 |
-| `protocol` | 可选 | 协议选择；缺省走编译期默认协议 |
-| `monitoring` | 逻辑必填 | Prometheus / remote write / OTLP log 配置块 |
-| `network` | 可选 | 网络白名单和主 IP 扩展映射 |
-| `pprof_duration_seconds` | 可选，给出时 `> 0` | profile 导出时长 |
-| `master_ui` | 可选，但依赖 `monitoring` | 嵌入式 monitor HTTP 服务；当前只暴露 `http_listen_addr` |
-| `test_spec_config` | 可选 | test / fast-path / side-transfer 实验开关 |
+# master 控制面 etcd 地址；输入要求 raw host:port
+etcd_endpoints:
+  - 127.0.0.1:2379
 
-`owner` 和 `external` 共用同一套 `ClientConfigYaml` 骨架：
+# master 自己的日志 / profile 根目录
+log_dir: /var/lib/fluxon/master_logs
 
-| 顶层字段 | 规则 | 说明 |
-| --- | --- | --- |
-| `instance_key` | 必填 | client 实例标识 |
-| `protocol` | 可选 | 协议选择 |
-| `contribute_to_cluster_pool_size` | 用来分流 owner / external | 缺失或全零是 external；`dram > 0` 是 owner |
-| `pprof_duration_seconds` | 可选，给出时 `> 0` | profile 导出时长 |
-| `fluxonkv_spec` | 必填 | KV 业务配置子块 |
-| `test_spec_config` | 可选 | 测试和 side-transfer 分支开关 |
+# 可选；给出时必须 > 0
+port: 31000
 
-`fluxonkv_spec` 里，owner / external 共享的基础字段只有这几项：
+# 可选；当前 monitor 配置在 master 上是必填的
+monitoring:
+  prometheus_base_url: http://127.0.0.1:4000/v1/prometheus
+  prom_remote_write_url:
+    - http://127.0.0.1:4000/v1/prometheus/write
+  otlp_log_api:
+    otlp_endpoint: http://127.0.0.1:4000/v1/otlp/v1/logs
 
-| 字段 | 作用 |
-| --- | --- |
-| `cluster_name` | 目标集群名 |
-| `shared_memory_path` | 本机共享内存 authority；运行时会拼成 `cluster_name` 作用域路径 |
-| `shared_file_path` | 本机共享文件 authority；运行时会拼成 `cluster_name` 作用域路径 |
-| `p2p_listen_port` | 可选的 P2P 监听端口 |
+# 可选；配置后 KV Web UI 会作为 master 内嵌 HTTP 服务启动
+master_ui:
+  http_listen_addr: 0.0.0.0:31100
+```
 
-只有 `owner` 能声明的字段：
+`owner` 和 `external` 共用同一个 `ClientConfigYaml` 外壳，先看 `owner`：
 
-| 字段 | 作用 |
-| --- | --- |
-| `etcd_addresses` | owner 连接 etcd 的 raw `host:port` 列表；运行时同时保留 raw 和归一化 `http://host:port` 两份视图 |
-| `sub_cluster` | owner 所属子集群标签 |
-| `large_file_paths.log_root_path` | owner 日志大文件根目录 |
-| `large_file_paths.cache_root_path` | owner cache 大文件根目录 |
-| `redis_compat` | Redis 兼容监听配置 |
+```yaml
+instance_key: my-owner-1
 
-`external` 的结构更小：它不声明 `etcd_addresses`、`sub_cluster`、`large_file_paths`、`redis_compat`，这些 owner 侧字段都从 owner 发布的 `shared.json` 继承。本地 YAML 只保留 attach owner 所需的共享 bundle 锚点和本进程参数。
+# 只要 dram > 0，就进入 owner 分支
+contribute_to_cluster_pool_size:
+  # 容量按 16 MiB 对齐
+  dram: 1677721600
+  vram: {}
+
+fluxonkv_spec:
+  cluster_name: demo-kv-cluster
+
+  # 本机共享内存 authority；运行时会拼成 cluster_name 作用域路径
+  shared_memory_path: /dev/shm/fluxon
+
+  # 本机共享文件 authority；shared.json、profile、peer metadata 等在这条根下
+  # 运行时也会拼成 cluster_name 作用域路径
+  shared_file_path: /var/lib/fluxon/shared
+
+  # owner 必须自己连接 etcd；输入要求 raw host:port
+  etcd_addresses:
+    - 127.0.0.1:2379
+
+  # owner 必须声明自己属于哪个 sub-cluster
+  sub_cluster: default
+
+  # owner 必须声明大文件根目录；日志和 cache 都从这里派生
+  large_file_paths:
+    log_root_path: /var/lib/fluxon/log
+    cache_root_path: /var/lib/fluxon/cache
+
+  # 可选
+  p2p_listen_port: 31001
+
+  # 可选；Redis 兼容入口只允许 owner 配
+  # redis_compat:
+  #   listen_addr: 0.0.0.0:6379
+```
+
+`external` 用的还是 `ClientConfigYaml`，但结构会更小：
+
+```yaml
+instance_key: my-external-1
+
+fluxonkv_spec:
+  cluster_name: demo-kv-cluster
+
+  # external 只保留 attach owner 所需的本机共享锚点
+  shared_memory_path: /dev/shm/fluxon
+  shared_file_path: /var/lib/fluxon/shared
+
+  # 可选
+  p2p_listen_port: 31002
+```
+
+这里最重要的差异不是“多几个字段”，而是配置责任不同：
+
+- `owner` 负责提供共享内存池、连接 etcd、声明 `sub_cluster`、发布 `shared.json`、给出日志和 cache 的大文件根目录。
+- `external` 不再声明 `etcd_addresses`、`sub_cluster`、`large_file_paths`、`redis_compat`；这些 owner 侧字段都从 owner 发布的 `shared.json` 继承。
+- `etcd_addresses` 在 owner 侧会同时保留两份视图：对外契约还是 raw `host:port`，运行时内部会归一化成 `http://host:port`。
 
 主要约束：
 
@@ -183,31 +334,65 @@ KV 的入口在 `fluxon_kv/src/config.rs`。稳定结论是：`master` 单独使
 
 FS 的配置集中在 `fluxon_fs_core/src/config.rs`，上层 `fluxon_fs/src/config.rs` 只是重导出。
 
-| 配置块 | 入口 | 结果 |
-| --- | --- | --- |
-| cache | `fluxon_fs.cache` | `FluxonFsGlobalConfig` |
-| master | `fluxon_fs.master` | `FluxonFsMasterConfig` |
-| master_panel | `fluxon_fs.master_panel` | `FluxonFsMasterPanelConfig` |
+这块分成 `cache`、`master`、`master_panel` 三个稳定子块，直接看骨架更直观：
 
-`fluxon_fs.cache` 的核心字段：
+```yaml
+fluxon_fs:
+  master:
+    instance_key: fluxon_fs_master
+    pull_interval_ms: 1000
 
-- `stale_window_ms` 必须 `> 0`。
-- `write_session_target_inflight_bytes` 可缺省，默认 128 MiB。
-- `rules[*]` 需要绝对路径、合法 cache/write 模式、合法前缀和非零 cache 上限。
-- `exports[*]` 需要绝对路径；`nodes` 缺失时表示 `AgentRegistry`，给出时表示 `StaticNodes`。
+  master_panel:
+    listen_addr: 0.0.0.0:8091
+    public_base_url: http://127.0.0.1:8091
+    prometheus_base_url: http://127.0.0.1:4000/v1/prometheus
+    auto_refresh_interval_secs: 10
+    access_db_path: /var/lib/fluxon/fs_master_access.db
+    bootstrap_access_model:
+      users:
+        - username: admin
+          password: admin
+          can_manage_users: true
+      scope_access: []
+    transfer_state_store:
+      kind: tikv
+      tikv:
+        pd_endpoints:
+          - 127.0.0.1:2379
+        key_prefix: /fluxon_fs_transfer/
+    s3_gateway:
+      get_object_inflight_pieces: 8
+      kv_miss_policy: remote_read
 
-`fluxon_fs.master` 的核心字段：
+  cache:
+    stale_window_ms: 5000
+    write_session_target_inflight_bytes: 134217728
+    rules:
+      - dir_abs: /var/lib/fluxon/local_shared
+        cache_mode: read_through
+        write_mode: write_through
+        kv_key_prefix: /fluxon_fs_cache/local_shared/
+        bytes_field_key: bytes
+        max_cache_bytes: 1048576
+        on_refresh_error: apply_stale_window
+    exports:
+      demo:
+        remote_root_dir_abs: /var/lib/fluxon/export_root
+        nodes:
+          - fluxon_fs_writer
+        cache_max_bytes: 1048576
+```
 
-- `instance_key` 必填。
-- `pull_interval_ms` 可选，但如果给出必须 `> 0`。
-- 旧的 `fluxon_fs.rpc` 和 `rpc_timeout_ms` 已移除。
+读这段时抓三个点：
 
-`fluxon_fs.master_panel` 的核心字段：
+- `fluxon_fs.master` 很小，当前稳定字段只有 `instance_key` 和可选的 `pull_interval_ms`；旧的 `fluxon_fs.rpc` 和 `rpc_timeout_ms` 已移除。
+- `fluxon_fs.master_panel` 负责 UI/S3 授权和 transfer 状态；`listen_addr`、`public_base_url`、`prometheus_base_url`、`access_db_path`、`bootstrap_access_model`、`s3_gateway` 都是启动基线。
+- `fluxon_fs.cache` 负责目录级 cache / export 规则；`rules[*].dir_abs` 和 `exports[*].remote_root_dir_abs` 都必须是绝对路径。
 
-- `listen_addr`、`public_base_url`、`prometheus_base_url`、`access_db_path` 都是必需基线。
-- `bootstrap_access_model` 是面板的启动授权模型。
-- `transfer_state_store` 当前稳定实现是 `tikv`。
-- `s3_gateway` 负责对象请求和 KV miss 策略。
+还要记住两个分支规则：
+
+- `exports.<name>.nodes` 缺失时，路由模式是 `AgentRegistry`；给出时是 `StaticNodes`。
+- `write_session_target_inflight_bytes` 可缺省，默认 128 MiB；但给出时必须 `> 0`。
 
 FS 还把访问模型拆成两层：
 
@@ -218,10 +403,35 @@ FS 还把访问模型拆成两层：
 
 `fluxon_cli/src/config.rs` 定义统一监控页配置，KV 的 `master_ui` 和 TestStack 的 UI 都复用它。
 
-| 类型 | 关键字段 |
-| --- | --- |
-| `MonitorConfigYaml` | `etcd_endpoints`、`prometheus_base_url`、`cluster_name`、`member_kind`、`output` |
-| 可选项 | `mq_unique_key_prefixes`、`http_listen_addr`、`greptime_sql` |
+最小骨架：
+
+```yaml
+etcd_endpoints:
+  - http://127.0.0.1:2379
+
+prometheus_base_url: http://127.0.0.1:4000/v1/prometheus
+cluster_name: demo-kv-cluster
+
+# kv / mq / fs
+member_kind: kv
+
+# cli / web
+output: web
+
+# 可选；web 模式常用
+http_listen_addr: 0.0.0.0:18080
+
+# 可选；只有 MQ 页面需要扫描 unique key 时再给
+# mq_unique_key_prefixes:
+#   - /fluxon_mq_unique/
+
+# 可选；不写时，如果 prometheus_base_url 明确指向 Greptime /v1/prometheus，
+# 会自动派生默认 SQL 连接信息
+# greptime_sql:
+#   base_url: http://127.0.0.1:4000
+#   db: public
+#   log_table: fluxon_logs
+```
 
 主要约束：
 
@@ -234,12 +444,36 @@ FS 还把访问模型拆成两层：
 
 `fluxon_commu_contract` 提供多个被 KV / FS 共同复用的基础类型：
 
-| 类型 | 取值 | 作用 |
-| --- | --- | --- |
-| `ProtocolType` | `Tcp` / `Rdma` | 输入协议选择 |
-| `TransferEngineType` | `Closed` / `P2p` | 传输引擎分支 |
-| `TransferBackendActivationMode` | 三个显式分支 | 控制 backend 激活方式 |
-| `NetworkConfig` | `subnet_whitelist`、`primary_ip_to_extended_ips` | 网络白名单和 IP 扩展映射 |
+最常见的是 `NetworkConfig` 这块 YAML：
+
+```yaml
+network:
+  subnet_whitelist:
+    - 127.0.0.0/8
+    - 10.0.0.0/24
+  primary_ip_to_extended_ips:
+    10.0.0.10:
+      - 10.0.0.11
+      - 10.0.0.12
+```
+
+以及协议/传输分支这两个输入：
+
+```yaml
+protocol:
+  protocol_type: rdma
+```
+
+```yaml
+protocol:
+  protocol_type: tcp
+```
+
+这里对应的稳定枚举取值是：
+
+- `ProtocolType`: `tcp` / `rdma`
+- `TransferEngineType`: `Closed` / `P2p`
+- `TransferBackendActivationMode`: `RdmaControl` / `TcpTestBypassRdmaControl` / `TestForceEnableBypassRdmaControl`
 
 这些类型是共享契约，不属于某一个子系统的私有配置。
 
