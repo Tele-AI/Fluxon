@@ -29,6 +29,11 @@ _ENTRY = _load_module()
 class TestCi2VirtNodeContract(unittest.TestCase):
     _KVTEST_SCENE_ID = "ci_top_attention_bin_kvtest"
     _DOC_SCENE_ID = "ci_top_attention_doc_page_build"
+    _CONFIG_KV_SCENE_ID = "ci_top_attention_config_kv"
+    _CONFIG_FS_SCENE_ID = "ci_top_attention_config_fs"
+    _CONFIG_MQ_SCENE_ID = "ci_top_attention_config_mq"
+    _CTRL_C_KV_SCENE_ID = "ci_top_attention_ctrl_c_kv"
+    _CTRL_C_MQ_SCENE_ID = "ci_top_attention_ctrl_c_mq"
 
     def test_generated_suite_is_public_dual_local_nodes_ci_only(self) -> None:
         suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
@@ -174,6 +179,45 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             ["n1_kvowner_dram_3gib"],
         )
         self.assertEqual(set(generated["scales"].keys()), {"n1_kvowner_dram_3gib"})
+
+    def test_generated_suite_supports_top_attention_config_and_ctrl_c_ci_scenes(self) -> None:
+        suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
+        scene_ids = [
+            self._CONFIG_KV_SCENE_ID,
+            self._CONFIG_FS_SCENE_ID,
+            self._CONFIG_MQ_SCENE_ID,
+            self._CTRL_C_KV_SCENE_ID,
+            self._CTRL_C_MQ_SCENE_ID,
+        ]
+
+        generated = _ENTRY._rewrite_suite_for_local_dual_nodes(
+            suite_cfg=suite_cfg,
+            scene_ids=scene_ids,
+            primary_node_name="local-node-a",
+            secondary_node_name="local-node-b",
+            host_ip="10.1.1.119",
+            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            controller_port=19080,
+        )
+
+        self.assertEqual(set(generated["scenes"].keys()), set(scene_ids))
+        self.assertEqual(set(generated["scales"].keys()), {"n1_kvowner_dram_3gib"})
+        self.assertEqual(
+            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["scene_configs"][self._CONFIG_KV_SCENE_ID],
+            {},
+        )
+        self.assertEqual(
+            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["scene_configs"][self._CTRL_C_MQ_SCENE_ID],
+            {},
+        )
+        self.assertEqual(
+            generated["scenes"][self._CONFIG_MQ_SCENE_ID]["ci"]["runtime_contract"],
+            "cluster_kv_owner",
+        )
+        self.assertEqual(
+            generated["scenes"][self._CTRL_C_KV_SCENE_ID]["ci"]["runtime_contract"],
+            "rust_self_managed",
+        )
 
     def test_generated_deployconf_rewrites_to_dual_local_nodes(self) -> None:
         deployconf_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_DEPLOYCONF_TEMPLATE, ctx="deployconf")

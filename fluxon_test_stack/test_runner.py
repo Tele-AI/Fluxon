@@ -356,6 +356,11 @@ def _runner_native_ci_scene_ids() -> Tuple[str, ...]:
     return (
         "ci_top_attention_doc_page_build",
         "ci_top_attention_bin_kvtest",
+        "ci_top_attention_config_kv",
+        "ci_top_attention_config_fs",
+        "ci_top_attention_config_mq",
+        "ci_top_attention_ctrl_c_kv",
+        "ci_top_attention_ctrl_c_mq",
     )
 
 
@@ -3667,9 +3672,12 @@ def _prepare_ci_case(
     if prepare_env_exports:
         _write_ci_prepare_env_script(run_dir=run_dir, exports=prepare_env_exports)
 
-    profile = _require_dict(resolved_case.get("profile"), "resolved_case.profile")
-    profile_ci = _require_dict(profile.get("ci"), "resolved_case.profile.ci")
-    if profile_ci.get("scene_config") is not None:
+    if _scene_id_uses_runner_native_ci_commands(
+        _require_str(
+            _require_dict(resolved_case.get("case"), "resolved_case.case").get("scene_id"),
+            "resolved_case.case.scene_id",
+        )
+    ):
         _write_ci_scene_config_yaml(
             resolved_case,
             run_dir=run_dir,
@@ -7697,6 +7705,66 @@ def _runner_native_ci_commands_for_case(case: _ResolvedCase, *, ctx: str) -> Lis
                     "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
                 ),
                 "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_config_kv":
+        return [
+            {
+                "id": "top_attention_config_kv",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_config_kv.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 3600,
+            }
+        ]
+    if scene_id == "ci_top_attention_config_fs":
+        return [
+            {
+                "id": "top_attention_config_fs",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_config_fs.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 3600,
+            }
+        ]
+    if scene_id == "ci_top_attention_config_mq":
+        return [
+            {
+                "id": "top_attention_config_mq",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_config_mq.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 7200,
+            }
+        ]
+    if scene_id == "ci_top_attention_ctrl_c_kv":
+        return [
+            {
+                "id": "top_attention_ctrl_c_kv",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_ctrl_c_kv.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 3600,
+            }
+        ]
+    if scene_id == "ci_top_attention_ctrl_c_mq":
+        return [
+            {
+                "id": "top_attention_ctrl_c_mq",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_ctrl_c_mq.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 7200,
             }
         ]
     raise ValueError(f"{ctx} unsupported runner-native CI scene: {scene_id!r}")
