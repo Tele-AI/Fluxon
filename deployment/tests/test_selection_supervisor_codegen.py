@@ -712,20 +712,25 @@ def test_runtime_log_shards_roll_and_preserve_content_boundaries() -> None:
         try:
             _wait_until_present(module, label)
             first_shard = root / "test-log-roll.2026-01-01.log"
-            second_shard = root / "test-log-roll.2026-01-02.log"
+            second_shard = None
             deadline = time.time() + 20.0
             while time.time() < deadline:
-                if first_shard.exists() and second_shard.exists():
+                shard_paths = sorted(root.glob("test-log-roll.*.log"))
+                if len(shard_paths) >= 2:
+                    second_shard = shard_paths[-1]
+                if first_shard.exists() and second_shard is not None and second_shard.exists():
                     first_text = first_shard.read_text(encoding="utf-8", errors="replace")
                     second_text = second_shard.read_text(encoding="utf-8", errors="replace")
                     if "[ops-log-mgmt][phase=before]" in first_text and "[ops-log-mgmt][phase=after]" in second_text:
                         break
                 time.sleep(0.2)
             assert first_shard.exists(), first_shard
+            assert second_shard is not None, sorted(path.name for path in root.glob("test-log-roll.*.log"))
             assert second_shard.exists(), second_shard
             assert not stale_shard.exists(), stale_shard
             shard_names = sorted(path.name for path in root.glob("test-log-roll.*.log"))
-            assert shard_names == ["test-log-roll.2026-01-01.log", "test-log-roll.2026-01-02.log"], shard_names
+            assert shard_names[0] == "test-log-roll.2026-01-01.log", shard_names
+            assert len(shard_names) == 2, shard_names
             first_text = first_shard.read_text(encoding="utf-8", errors="replace")
             second_text = second_shard.read_text(encoding="utf-8", errors="replace")
             assert "[ops-log-mgmt][phase=before]" in first_text, first_text

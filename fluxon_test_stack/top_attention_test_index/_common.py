@@ -32,9 +32,15 @@ def parse_python_passthrough(description: str) -> tuple[str, list[str]]:
     return args.python, passthrough
 
 
-def run_pytest(description: str, paths: Iterable[str]) -> int:
-    python, passthrough = parse_python_passthrough(description)
-    return call([python, "-m", "pytest", *paths, *passthrough])
+def run_pytest(
+    description: str,
+    paths: Iterable[str],
+    *,
+    passthrough: Sequence[str] | None = None,
+) -> int:
+    python, _ = parse_python_passthrough(description)
+    effective_passthrough = [] if passthrough is None else list(passthrough)
+    return call([python, "-m", "pytest", *paths, *effective_passthrough])
 
 
 def run_python_file(
