@@ -767,8 +767,8 @@ struct KvTestRoundOptions {
     round_profile: KvTestRoundProfile,
     round_name: String,
     cluster_name: String,
-    master_port: u16,
-    step8_master_port: u16,
+    master_port: Option<u16>,
+    step8_master_port: Option<u16>,
     master_options: KvTestClientOptions,
     owner_client_options: KvTestClientOptions,
     external_client_options: KvTestClientOptions,
@@ -857,14 +857,10 @@ fn default_client_large_file_paths(
     if contribute_to_cluster_pool_size.dram == 0
         && contribute_to_cluster_pool_size.vram.is_empty()
     {
-        return LargeFilePaths {
-            log_root_path: String::new(),
-            cache_root_path: String::new(),
-        };
+        return LargeFilePaths { root_paths: Vec::new() };
     }
     LargeFilePaths {
-        log_root_path: format!("/tmp/kvcache_large/log/{}", instance_key),
-        cache_root_path: format!("/tmp/kvcache_large/cache/{}", instance_key),
+        root_paths: vec![format!("/tmp/kvcache_large/{}", instance_key)],
     }
 }
 
@@ -910,7 +906,7 @@ fn default_external_test_client_options() -> KvTestClientOptions {
     }
 }
 
-fn new_kv_test_round(round_profile: KvTestRoundProfile, master_port: u16) -> KvTestRoundOptions {
+fn new_kv_test_round(round_profile: KvTestRoundProfile) -> KvTestRoundOptions {
     let round_name = round_profile.round_name();
     KvTestRoundOptions {
         round_profile,
@@ -918,8 +914,8 @@ fn new_kv_test_round(round_profile: KvTestRoundProfile, master_port: u16) -> KvT
         // Keep each process run on its own cluster namespace so a crashed/aborted previous run
         // cannot poison the next rerun with stale members.
         cluster_name: format!("test_cluster_{}_{}", round_name, kv_test_run_scope()),
-        master_port,
-        step8_master_port: master_port + 10,
+        master_port: None,
+        step8_master_port: None,
         master_options: default_master_test_client_options(round_profile),
         owner_client_options: default_owner_test_client_options(round_profile),
         external_client_options: default_external_test_client_options(),
@@ -937,16 +933,16 @@ fn default_kv_test_run_options() -> KvTestRunOptions {
             .map(str::trim)
             .filter(|item| !item.is_empty())
         {
-            let (profile, port) = match round_name {
-                "p2p_only" => (KvTestRoundProfile::P2pOnly, 50220),
-                "rdma_transfer_only" => (KvTestRoundProfile::RdmaTransferOnly, 50240),
-                "rdma_transfer_with_rpc" => (KvTestRoundProfile::RdmaTransferWithRpc, 50260),
+            let profile = match round_name {
+                "p2p_only" => KvTestRoundProfile::P2pOnly,
+                "rdma_transfer_only" => KvTestRoundProfile::RdmaTransferOnly,
+                "rdma_transfer_with_rpc" => KvTestRoundProfile::RdmaTransferWithRpc,
                 other => panic!(
                     "unsupported FLUXON_KV_TEST_ROUNDS entry '{}'; expected one of: p2p_only, rdma_transfer_only, rdma_transfer_with_rpc",
                     other
                 ),
             };
-            rounds.push(new_kv_test_round(profile, port));
+            rounds.push(new_kv_test_round(profile));
         }
         if rounds.is_empty() {
             panic!("FLUXON_KV_TEST_ROUNDS was set but produced no valid rounds");
@@ -956,9 +952,9 @@ fn default_kv_test_run_options() -> KvTestRunOptions {
 
     KvTestRunOptions {
         rounds: vec![
-            new_kv_test_round(KvTestRoundProfile::P2pOnly, 50220),
-            new_kv_test_round(KvTestRoundProfile::RdmaTransferOnly, 50240),
-            new_kv_test_round(KvTestRoundProfile::RdmaTransferWithRpc, 50260),
+            new_kv_test_round(KvTestRoundProfile::P2pOnly),
+            new_kv_test_round(KvTestRoundProfile::RdmaTransferOnly),
+            new_kv_test_round(KvTestRoundProfile::RdmaTransferWithRpc),
         ],
     }
 }
@@ -967,7 +963,7 @@ fn default_kv_test_run_options() -> KvTestRunOptions {
 fn new_master_launch(
     round: &KvTestRoundOptions,
     instance_key: &str,
-    port: u16,
+    port: Option<u16>,
 ) -> KvTestMasterLaunch {
     // Read etcd endpoint from project root build_config_ext.yml
     let etcd = fluxon_util::dev_config::read_etcd_endpoint_from_build_config()
@@ -998,7 +994,7 @@ fn new_master_launch(
         config: MasterConfig {
             instance_key: round.scoped_instance_key(instance_key),
             cluster_name: round.cluster_name.clone(),
-            port: Some(port),
+            port,
             etcd_endpoints: vec![etcd.clone()],
             protocol,
             transfer_engine,
@@ -1879,7 +1875,7 @@ async fn run_kv_step8(round: &KvTestRoundOptions) {
 
 async fn run_kv_round(round: &KvTestRoundOptions) {
     info!(
-        "Round '{}' uses cluster '{}' and master ports {} / {}",
+        "Round '{}' uses cluster '{}' and master ports {:?} / {:?}",
         round.round_name, round.cluster_name, round.master_port, round.step8_master_port
     );
 

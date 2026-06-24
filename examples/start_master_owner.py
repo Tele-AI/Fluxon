@@ -23,6 +23,12 @@ OWNER_INSTANCE_KEY = "demo_kv_owner"
 OWNER_DRAM_BYTES = 1073741824
 
 
+def build_owner_large_file_paths() -> dict:
+    return {
+        "root_paths": [str((WORKDIR / "large" / "owner").resolve())],
+    }
+
+
 def main() -> None:
     args = parse_args()
     SHARED_FILE_PATH.mkdir(parents=True, exist_ok=True)
@@ -127,6 +133,7 @@ def build_owner_config() -> dict:
             "shared_memory_path": str(SHARED_MEMORY_PATH),
             "shared_file_path": str(SHARED_FILE_PATH),
             "sub_cluster": "default",
+            "large_file_paths": build_owner_large_file_paths(),
         },
     }
 

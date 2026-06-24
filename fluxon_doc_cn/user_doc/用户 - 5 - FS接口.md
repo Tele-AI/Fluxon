@@ -286,6 +286,9 @@ def build_owner_config() -> dict:
             "shared_memory_path": str(SHARED_MEMORY_PATH),
             "shared_file_path": str(SHARED_FILE_PATH),
             "sub_cluster": "default",
+            "large_file_paths": {
+                "root_paths": [str((WORKDIR / "large" / "owner").resolve())],
+            },
         },
     }
 

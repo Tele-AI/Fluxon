@@ -112,6 +112,13 @@ struct ExternalBootstrapBundle {
     etcd_endpoints: Vec<String>,
 }
 
+struct ExternalBootstrapMetadata {
+    meta: SharedJsonMeta,
+    shared_memory_path: String,
+    shared_file_path: String,
+    etcd_endpoints: Vec<String>,
+}
+
 fn cluster_manager_rdma_control_init_from_transfer_config(
     _transfer_engine: TransferEngineType,
     _protocol: &ProtocolConfig,
@@ -849,10 +856,10 @@ fn build_side_transfer_worker_config_yaml(
 }
 
 fn side_transfer_runtime_dir(owner_config: &ClientConfig) -> PathBuf {
-    Path::new(&owner_config.large_file_paths.log_root_path)
-        .join(format!("{}_cluster_kv_logs", owner_config.cluster_name))
-        .join("side_transfer_runtime")
-        .join(&owner_config.instance_key)
+    owner_config
+        .large_file_paths
+        .side_transfer_runtime_dir(&owner_config.cluster_name, &owner_config.instance_key)
+        .unwrap_or_else(|err| panic!("invalid owner large_file_paths: {}", err))
 }
 
 fn cluster_manager_local_ipc_root(
@@ -1592,44 +1599,34 @@ async fn bootstrap_zero_contribution_client_config(config: ClientConfig) -> KvRe
         return Ok(config);
     }
 
-    let bundle = wait_for_external_bootstrap_bundle(&config).await?;
+    let metadata = load_external_bootstrap_metadata(
+        &config.shared_memory_path,
+        &config.shared_file_path,
+        &config.cluster_name,
+    )
+    .await?;
     let mut final_config = config;
-    final_config.etcd_addresses_raw = bundle.meta.etcd_addresses.clone();
-    final_config.fluxonkv_spec.etcd_addresses = bundle.etcd_endpoints;
-    final_config.fluxonkv_spec.sub_cluster = bundle.meta.sub_cluster.clone();
-    final_config.shared_memory_path = bundle.shared_memory_path;
-    final_config.shared_file_path = bundle.shared_file_path;
-    final_config.large_file_paths = bundle.meta.large_file_paths;
+    final_config.etcd_addresses_raw = metadata.meta.etcd_addresses.clone();
+    final_config.fluxonkv_spec.etcd_addresses = metadata.etcd_endpoints;
+    final_config.fluxonkv_spec.sub_cluster = metadata.meta.sub_cluster.clone();
+    final_config.shared_memory_path = metadata.shared_memory_path;
+    final_config.shared_file_path = metadata.shared_file_path;
+    final_config.large_file_paths = metadata.meta.large_file_paths;
     Ok(final_config)
 }
 
-async fn wait_for_external_bootstrap_bundle(
-    config: &ClientConfig,
-) -> KvResult<ExternalBootstrapBundle> {
+async fn load_external_bootstrap_metadata(
+    shared_memory_path: &str,
+    shared_file_path: &str,
+    expected_cluster_name: &str,
+) -> KvResult<ExternalBootstrapMetadata> {
     let build_version = fluxon_util::git_version_build_record::get_current_git_commitid().unwrap();
-    let shared_memory_dir = Path::new(&config.shared_memory_path);
-    let shared_file_dir = Path::new(&config.shared_file_path);
+    let shared_memory_dir = Path::new(shared_memory_path);
+    let shared_file_dir = Path::new(shared_file_path);
     let shared_json_path = shared_file_dir.join("shared.json");
-    let mmap_file_path = shared_memory_dir.join("mmap.file");
 
     let mut waited_ticks: u64 = 0;
     loop {
-        if !shared_json_path.exists() || !mmap_file_path.exists() {
-            limit_thirdparty::tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            waited_ticks += 1;
-            if waited_ticks % 25 == 0 {
-                info!(
-                    "Waiting owner shared bundle to be ready... ({}s), shm_dir={} file_dir={} (shared.json={}, mmap.file={})",
-                    waited_ticks / 5,
-                    shared_memory_dir.to_string_lossy(),
-                    shared_file_dir.to_string_lossy(),
-                    shared_json_path.exists(),
-                    mmap_file_path.exists()
-                );
-            }
-            continue;
-        }
-
         let shared_json_buf = match std::fs::read_to_string(&shared_json_path) {
             Ok(v) => v,
             Err(e) => {
@@ -1680,7 +1677,7 @@ async fn wait_for_external_bootstrap_bundle(
             continue;
         }
 
-        if meta.cluster_name != config.cluster_name {
+        if meta.cluster_name != expected_cluster_name {
             limit_thirdparty::tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             waited_ticks += 1;
             if waited_ticks % 25 == 0 {
@@ -1689,14 +1686,14 @@ async fn wait_for_external_bootstrap_bundle(
                     waited_ticks / 5,
                     shared_memory_dir.to_string_lossy(),
                     shared_file_dir.to_string_lossy(),
-                    config.cluster_name,
+                    expected_cluster_name,
                     meta.cluster_name
                 );
             }
             continue;
         }
 
-        let shared_memory_path_canonical = match std::fs::canonicalize(&config.shared_memory_path) {
+        let shared_memory_path_canonical = match std::fs::canonicalize(shared_memory_path) {
             Ok(v) => v.to_string_lossy().into_owned(),
             Err(e) => {
                 limit_thirdparty::tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1706,7 +1703,7 @@ async fn wait_for_external_bootstrap_bundle(
                         "Waiting shared_memory_path canonicalizable... ({}s), shm_dir='{}', path='{}', err={}",
                         waited_ticks / 5,
                         shared_memory_dir.to_string_lossy(),
-                        config.shared_memory_path,
+                        shared_memory_path,
                         e
                     );
                 }
@@ -1732,7 +1729,7 @@ async fn wait_for_external_bootstrap_bundle(
             }
         };
 
-        let shared_file_path_canonical = match std::fs::canonicalize(&config.shared_file_path) {
+        let shared_file_path_canonical = match std::fs::canonicalize(shared_file_path) {
             Ok(v) => v.to_string_lossy().into_owned(),
             Err(e) => {
                 limit_thirdparty::tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1742,7 +1739,7 @@ async fn wait_for_external_bootstrap_bundle(
                         "Waiting shared_file_path canonicalizable... ({}s), file_dir='{}', path='{}', err={}",
                         waited_ticks / 5,
                         shared_file_dir.to_string_lossy(),
-                        config.shared_file_path,
+                        shared_file_path,
                         e
                     );
                 }
@@ -1830,11 +1827,51 @@ async fn wait_for_external_bootstrap_bundle(
             }
         };
 
-        return Ok(ExternalBootstrapBundle {
+        return Ok(ExternalBootstrapMetadata {
             meta,
             shared_memory_path: meta_shm_canonical,
             shared_file_path: meta_file_canonical,
             etcd_endpoints,
+        });
+    }
+}
+
+async fn wait_for_external_bootstrap_bundle(
+    config: &ClientConfig,
+) -> KvResult<ExternalBootstrapBundle> {
+    let metadata = load_external_bootstrap_metadata(
+        &config.shared_memory_path,
+        &config.shared_file_path,
+        &config.cluster_name,
+    )
+    .await?;
+    let shared_memory_dir = Path::new(&metadata.shared_memory_path);
+    let shared_file_dir = Path::new(&metadata.shared_file_path);
+    let shared_json_path = shared_file_dir.join("shared.json");
+    let mmap_file_path = shared_memory_dir.join("mmap.file");
+
+    let mut waited_ticks: u64 = 0;
+    loop {
+        if !shared_json_path.exists() || !mmap_file_path.exists() {
+            limit_thirdparty::tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            waited_ticks += 1;
+            if waited_ticks % 25 == 0 {
+                info!(
+                    "Waiting owner shared bundle to be ready... ({}s), shm_dir={} file_dir={} (shared.json={}, mmap.file={})",
+                    waited_ticks / 5,
+                    shared_memory_dir.to_string_lossy(),
+                    shared_file_dir.to_string_lossy(),
+                    shared_json_path.exists(),
+                    mmap_file_path.exists()
+                );
+            }
+            continue;
+        }
+        return Ok(ExternalBootstrapBundle {
+            meta: metadata.meta,
+            shared_memory_path: metadata.shared_memory_path,
+            shared_file_path: metadata.shared_file_path,
+            etcd_endpoints: metadata.etcd_endpoints,
         });
     }
 }
@@ -1869,8 +1906,10 @@ async fn run_client_impl(
     let source_sha256 = fluxon_util::build_info::SOURCE_SHA256;
 
     // Logs and other large files are isolated from shared.json/peer metadata.
-    let kv_logs_dir = Path::new(&config.large_file_paths.log_root_path)
-        .join(format!("{}_cluster_kv_logs", config.cluster_name));
+    let kv_logs_dir = config
+        .large_file_paths
+        .kv_logs_dir(&config.cluster_name)
+        .map_err(|e| anyhow::anyhow!("invalid large_file_paths for kv logs: {}", e))?;
     let observability_disabled = config.test_spec_config.disable_observability;
     let greptime_tracing_rx = if observability_disabled {
         fluxon_util::init_log(&kv_logs_dir, &config.instance_key);
@@ -1920,7 +1959,7 @@ async fn run_client_impl(
             config.test_spec_config.side_transfer_role,
             Some(SideTransferRole::Worker)
         );
-    let bootstrapped_shared_meta = if is_external {
+    let bootstrapped_shared_meta = if is_side_transfer_worker {
         Some(wait_for_external_bootstrap_bundle(&config).await?.meta)
     } else {
         None
@@ -2028,7 +2067,7 @@ async fn run_client_impl(
             external_client_api_arg: ExternalClientApiNewArg {
                 shared_memory_path: config.shared_memory_path.clone(),
                 shared_file_path: config.shared_file_path.clone(),
-                cache_root_path: config.large_file_paths.cache_root_path.clone(),
+                large_file_paths: config.large_file_paths.clone(),
                 expected_cluster_name: config.cluster_name.clone(),
                 expected_protocol_version: build_version.clone(),
                 enable_side_transfer: config.test_spec_config.enable_side_transfer,
@@ -2080,8 +2119,7 @@ async fn run_client_impl(
                 // Read shared memory path from config (must not be empty).
                 shared_memory_path: config.shared_memory_path.clone(),
                 shared_file_path: config.shared_file_path.clone(),
-                log_root_path: config.large_file_paths.log_root_path.clone(),
-                cache_root_path: config.large_file_paths.cache_root_path.clone(),
+                large_file_paths: config.large_file_paths.clone(),
                 cluster_name: config.cluster_name.clone(),
                 etcd_addresses: config.etcd_addresses_raw.clone(),
                 attach_existing_meta: if is_side_transfer_worker {
@@ -2424,8 +2462,10 @@ async fn run_client_impl(
     }
 
     let shutdown_waiter = framework.cluster_manager_view().register_shutdown_waiter();
-    let kv_profiles_dir = Path::new(&config.large_file_paths.log_root_path)
-        .join(format!("{}_cluster_kv_profiles", config.cluster_name));
+    let kv_profiles_dir = config
+        .large_file_paths
+        .kv_profiles_dir(&config.cluster_name)
+        .map_err(|e| anyhow::anyhow!("invalid large_file_paths for kv profiles: {}", e))?;
     profile::spawn_pprof_flamegraph_on_timeout_or_shutdown(
         config.pprof_duration_seconds,
         kv_profiles_dir,
@@ -2505,8 +2545,7 @@ mod tests {
             shared_memory_path: "/tmp/fluxon_side_transfer_test".to_string(),
             shared_file_path: "/tmp/fluxon_side_transfer_test_files".to_string(),
             large_file_paths: crate::config::LargeFilePaths {
-                log_root_path: "/tmp/fluxon_side_transfer_test_large/log".to_string(),
-                cache_root_path: "/tmp/fluxon_side_transfer_test_large/cache".to_string(),
+                root_paths: vec!["/tmp/fluxon_side_transfer_test_large".to_string()],
             },
             test_spec_config: TestSpecConfig {
                 enable_side_transfer: true,
@@ -2757,12 +2796,10 @@ mod tests {
         let tempdir = new_test_dir("fluxon_external_bootstrap_large_paths");
         let shared_memory_root = tempdir.join("shared_mem");
         let shared_file_root = tempdir.join("shared_file");
-        let owner_log_root = tempdir.join("owner_logs");
-        let owner_cache_root = tempdir.join("owner_cache");
+        let owner_large_root = tempdir.join("owner_large");
         std::fs::create_dir_all(&shared_memory_root).unwrap();
         std::fs::create_dir_all(&shared_file_root).unwrap();
-        std::fs::create_dir_all(&owner_log_root).unwrap();
-        std::fs::create_dir_all(&owner_cache_root).unwrap();
+        std::fs::create_dir_all(&owner_large_root).unwrap();
         std::fs::write(shared_memory_root.join("mmap.file"), vec![0u8; 4096]).unwrap();
 
         let shared_meta = SharedJsonMeta {
@@ -2782,8 +2819,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             large_file_paths: crate::config::LargeFilePaths {
-                log_root_path: owner_log_root.to_string_lossy().into_owned(),
-                cache_root_path: owner_cache_root.to_string_lossy().into_owned(),
+                root_paths: vec![owner_large_root.to_string_lossy().into_owned()],
             },
             protocol_version:
                 fluxon_util::git_version_build_record::get_current_git_commitid().unwrap(),
@@ -2819,10 +2855,7 @@ mod tests {
             },
             shared_memory_path: shared_memory_root.to_string_lossy().into_owned(),
             shared_file_path: shared_file_root.to_string_lossy().into_owned(),
-            large_file_paths: crate::config::LargeFilePaths {
-                log_root_path: String::new(),
-                cache_root_path: String::new(),
-            },
+            large_file_paths: crate::config::LargeFilePaths { root_paths: Vec::new() },
             test_spec_config: TestSpecConfig::default(),
         };
 
@@ -2830,12 +2863,8 @@ mod tests {
             .await
             .expect("bootstrap zero-contribution config");
         assert_eq!(
-            bootstrapped.large_file_paths.log_root_path,
-            owner_log_root.to_string_lossy()
-        );
-        assert_eq!(
-            bootstrapped.large_file_paths.cache_root_path,
-            owner_cache_root.to_string_lossy()
+            bootstrapped.large_file_paths.root_paths,
+            vec![owner_large_root.to_string_lossy().into_owned()]
         );
         assert_eq!(
             bootstrapped.fluxonkv_spec.sub_cluster,

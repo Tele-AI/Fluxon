@@ -118,3 +118,17 @@ fn resolve_readable_log_path_ignores_plain_base_log_when_daily_shards_exist() {
     let resolved = fluxon_util::resolve_readable_log_path(&base_path).expect("resolve readable log path");
     assert_eq!(resolved, shard_path);
 }
+
+#[test]
+fn latest_existing_daily_sharded_log_path_skips_invalid_candidates() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let base_path = temp_dir.path().join("demo.log");
+    let invalid_shard_path = temp_dir.path().join("demo.not-a-date.log");
+    let valid_shard_path = temp_dir.path().join("demo.2026-06-20.log");
+    fs::write(&invalid_shard_path, "invalid\n").expect("write invalid shard");
+    fs::write(&valid_shard_path, "valid\n").expect("write valid shard");
+
+    let resolved =
+        fluxon_util::latest_existing_daily_sharded_log_path(&base_path).expect("resolve latest shard");
+    assert_eq!(resolved, valid_shard_path);
+}

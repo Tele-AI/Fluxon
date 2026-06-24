@@ -1,6 +1,0 @@
-interface:
-  display_name: "关注收束"
-  short_description: "关注收束"
-  default_prompt: "Use $prompt-2d53cebd-afd4-4d35-94e9-74436da3148a."
-policy:
-  allow_implicit_invocation: false

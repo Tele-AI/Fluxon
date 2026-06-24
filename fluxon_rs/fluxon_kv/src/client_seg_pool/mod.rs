@@ -46,8 +46,7 @@ pub struct ClientSegPoolNewArg {
     pub contribute_size: ContributeToClusterPoolSize,
     pub shared_memory_path: String,
     pub shared_file_path: String,
-    pub log_root_path: String,
-    pub cache_root_path: String,
+    pub large_file_paths: crate::config::LargeFilePaths,
     pub cluster_name: String,
     pub etcd_addresses: Vec<String>,
     pub attach_existing_meta: Option<SharedJsonMeta>,
@@ -206,10 +205,8 @@ pub struct ClientSegPoolInner {
     shared_memory_path: String,
     /// Directory path for regular files (shared.json, side-transfer metadata).
     shared_file_path: String,
-    /// Base directory for runtime logs and profile outputs.
-    log_root_path: String,
-    /// Base directory for large cache files.
-    cache_root_path: String,
+    /// Ordered large-file roots; concrete subdirectories are derived by fixed relative layout.
+    large_file_paths: crate::config::LargeFilePaths,
     side_transfer_worker: bool,
     attach_owner_ref: Option<ShareGroupOwnerRef>,
 
@@ -269,8 +266,7 @@ impl ClientSegPool {
         let contribute_size = arg.contribute_size;
         let shared_memory_path = arg.shared_memory_path;
         let shared_file_path = arg.shared_file_path;
-        let log_root_path = arg.log_root_path;
-        let cache_root_path = arg.cache_root_path;
+        let large_file_paths = arg.large_file_paths;
         let cluster_name = arg.cluster_name;
         let etcd_addresses = arg.etcd_addresses;
         let attach_existing_meta = arg.attach_existing_meta;
@@ -365,8 +361,7 @@ impl ClientSegPool {
                 view: std::sync::OnceLock::new(),
                 shared_memory_path: shared_memory_path.clone(),
                 shared_file_path: shared_file_path.clone(),
-                log_root_path: log_root_path.clone(),
-                cache_root_path: cache_root_path.clone(),
+                large_file_paths: large_file_paths.clone(),
                 side_transfer_worker,
                 attach_owner_ref,
                 cluster_name: cluster_name.clone(),
@@ -383,8 +378,7 @@ impl ClientSegPool {
                 view: std::sync::OnceLock::new(),
                 shared_memory_path: shared_memory_path.clone(),
                 shared_file_path: shared_file_path.clone(),
-                log_root_path: log_root_path.clone(),
-                cache_root_path: cache_root_path.clone(),
+                large_file_paths: large_file_paths.clone(),
                 side_transfer_worker,
                 attach_owner_ref,
                 cluster_name: cluster_name.clone(),
@@ -548,8 +542,7 @@ impl ClientSegPool {
             view: std::sync::OnceLock::new(),
             shared_memory_path: base_path.to_string(),
             shared_file_path: shared_file_path.clone(),
-            log_root_path,
-            cache_root_path,
+            large_file_paths,
             side_transfer_worker,
             attach_owner_ref,
             cluster_name,
@@ -568,8 +561,8 @@ impl ClientSegPool {
         &self.inner().shared_file_path
     }
 
-    pub fn cache_root_path(&self) -> &str {
-        &self.inner().cache_root_path
+    pub fn large_file_paths(&self) -> &crate::config::LargeFilePaths {
+        &self.inner().large_file_paths
     }
 
     fn transfer_rpc_fast_path_eligible_members(&self) -> Vec<ClusterMember> {
@@ -1180,10 +1173,7 @@ impl ClientSegPool {
             etcd_addresses: inner.etcd_addresses.clone(),
             shared_memory_path: shared_memory_canonical,
             shared_file_path: shared_file_canonical,
-            large_file_paths: crate::config::LargeFilePaths {
-                log_root_path: inner.log_root_path.clone(),
-                cache_root_path: inner.cache_root_path.clone(),
-            },
+            large_file_paths: inner.large_file_paths.clone(),
 
             protocol_version,
 

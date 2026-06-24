@@ -389,16 +389,14 @@ pub fn disk_cache_max_bytes_from_env() -> u64 {
         .unwrap_or(REMOTE_DISK_CACHE_MAX_BYTES_DEFAULT)
 }
 
-pub fn resolve_disk_cache_root(shared_file_path: &Path, instance_key: &str) -> PathBuf {
+pub fn resolve_disk_cache_root(cache_root_base: &Path, instance_key: &str) -> PathBuf {
     if let Some(raw) = env::var_os(REMOTE_DISK_CACHE_ROOT_ENV) {
         let trimmed = raw.to_string_lossy().trim().to_string();
         if !trimmed.is_empty() {
             return PathBuf::from(trimmed);
         }
     }
-    shared_file_path
-        .join(REMOTE_DISK_CACHE_DIRNAME)
-        .join(safe_cache_component(instance_key))
+    cache_root_base.join(safe_cache_component(instance_key))
 }
 
 fn write_meta(path: &Path, meta: &RemoteDiskCacheIndexMeta) -> io::Result<()> {

@@ -1,6 +1,0 @@
-interface:
-  display_name: "逻辑收束到agent"
-  short_description: "逻辑收束到agent"
-  default_prompt: "Use $prompt-ac42abf9-6df8-4539-99c7-e402e905a03b."
-policy:
-  allow_implicit_invocation: false

@@ -1,6 +1,0 @@
-interface:
-  display_name: "长期主义"
-  short_description: "长期主义"
-  default_prompt: "Use $prompt-345530e6-2736-42c3-9d4e-da5f14b8b8cb."
-policy:
-  allow_implicit_invocation: false

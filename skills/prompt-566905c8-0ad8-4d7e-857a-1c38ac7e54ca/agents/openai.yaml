@@ -1,6 +1,0 @@
-interface:
-  display_name: "更改前需要用户 review"
-  short_description: "更改前需要用户 review"
-  default_prompt: "Use $prompt-566905c8-0ad8-4d7e-857a-1c38ac7e54ca."
-policy:
-  allow_implicit_invocation: false

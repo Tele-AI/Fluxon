@@ -342,13 +342,17 @@ pub fn latest_existing_daily_sharded_log_path(base_path: &Path) -> Option<PathBu
     let mut latest: Option<(chrono::NaiveDate, PathBuf)> = None;
     let entries = std::fs::read_dir(parent).ok()?;
     for entry in entries {
-        let entry = entry.ok()?;
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
         let entry_name = entry.file_name();
-        let entry_name = entry_name.to_str()?;
+        let Some(entry_name) = entry_name.to_str() else {
+            continue;
+        };
         if !entry_name.starts_with(prefix.as_str()) || !entry_name.ends_with(".log") {
             continue;
         }
@@ -356,7 +360,9 @@ pub fn latest_existing_daily_sharded_log_path(base_path: &Path) -> Option<PathBu
             continue;
         }
         let date_text = &entry_name[prefix.len()..entry_name.len() - ".log".len()];
-        let date = chrono::NaiveDate::parse_from_str(date_text, "%Y-%m-%d").ok()?;
+        let Ok(date) = chrono::NaiveDate::parse_from_str(date_text, "%Y-%m-%d") else {
+            continue;
+        };
         let replace = match latest.as_ref() {
             Some((prev, _)) => date > *prev,
             None => true,

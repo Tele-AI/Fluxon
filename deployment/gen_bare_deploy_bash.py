@@ -49,8 +49,8 @@ ATOMIC_GROUP_CRASHLOOP_CONSECUTIVE_RESTARTS = 10
 ATOMIC_GROUP_CRASHLOOP_INTERVAL_LT_SECONDS = 30
 ATOMIC_GROUP_PROBABLE_READY_SECONDS = 10
 STANDALONE_PROBABLE_READY_SECONDS = 10
-STANDALONE_STARTUP_DEADLINE_SECONDS = 10
-ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS = 10
+STANDALONE_STARTUP_DEADLINE_SECONDS = 20
+ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS = 20
 HOSTWORKDIR_RUNTIME_TOKEN = "${HOSTWORKDIR}"
 REPO_ROOT = SCRIPT_DIR.parent
 BARE_TEMPLATE_DIR = SCRIPT_DIR / "templates" / "gen_bare_deploy_bash"
@@ -552,7 +552,7 @@ def _render_selection_supervisor_launch_wait_block(
     *,
     run_cmd: str,
     stable_seconds_expr: str,
-    deadline_ts_expr: str,
+    deadline_seconds_expr: str,
     context: str,
 ) -> str:
     return _render_bare_template(
@@ -560,7 +560,7 @@ def _render_selection_supervisor_launch_wait_block(
         values={
             "RUN_CMD": run_cmd,
             "STABLE_SECONDS_EXPR": stable_seconds_expr,
-            "DEADLINE_TS_EXPR": deadline_ts_expr,
+            "DEADLINE_SECONDS_EXPR": deadline_seconds_expr,
             "CONTEXT": context,
         },
     )
@@ -619,7 +619,7 @@ def _render_standalone_start_body(*, name_prefix: str, service_name: str) -> str
             "SELECTION_SUPERVISOR_LAUNCH_WAIT_BLOCK": _render_selection_supervisor_launch_wait_block(
                 run_cmd=run_cmd,
                 stable_seconds_expr=str(STANDALONE_PROBABLE_READY_SECONDS),
-                deadline_ts_expr=f'$(( $(date +%s) + {STANDALONE_STARTUP_DEADLINE_SECONDS} ))',
+                deadline_seconds_expr=str(STANDALONE_STARTUP_DEADLINE_SECONDS),
                 context="[bare]",
             ),
         },
@@ -693,7 +693,7 @@ def _render_atomic_group_service_block(
                 script=_render_selection_supervisor_launch_wait_block(
                     run_cmd=run_cmd,
                     stable_seconds_expr=str(ATOMIC_GROUP_PROBABLE_READY_SECONDS),
-                    deadline_ts_expr=f'$(( $(date +%s) + {ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS} ))',
+                    deadline_seconds_expr=str(ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS),
                     context="[rollout]",
                 ).rstrip()
                 + "\n",

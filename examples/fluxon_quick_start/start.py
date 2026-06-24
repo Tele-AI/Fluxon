@@ -530,8 +530,7 @@ def _monitoring_block(greptime_http_port: int) -> Dict[str, Any]:
 
 def _owner_large_file_paths(workdir: Path) -> Dict[str, str]:
     return {
-        "log_root_path": str(workdir / "large" / "log" / "owner"),
-        "cache_root_path": str(workdir / "large" / "cache" / "owner"),
+        "root_paths": [str(workdir / "large" / "owner")],
     }
 
 

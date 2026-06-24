@@ -282,10 +282,11 @@ fluxonkv_spec:
   # owner 必须声明自己属于哪个 sub-cluster
   sub_cluster: default
 
-  # owner 必须声明大文件根目录；日志和 cache 都从这里派生
+  # owner 必须声明大文件根目录列表；运行时按数组顺序选择第一个可用 root，
+  # 日志和 cache 等子目录都从固定相对位置派生
   large_file_paths:
-    log_root_path: /var/lib/fluxon/log
-    cache_root_path: /var/lib/fluxon/cache
+    root_paths:
+      - /var/lib/fluxon/large
 
   # 可选
   p2p_listen_port: 31001

@@ -95,8 +95,7 @@ fn new_client_config_with_size(
         shared_memory_path: format!("/tmp/kvcache_shared_memory/{}", instance_key),
         shared_file_path: format!("/tmp/kvcache_shared_files/{}", instance_key),
         large_file_paths: crate::config::LargeFilePaths {
-            log_root_path: format!("/tmp/kvcache_large_logs/{}", instance_key),
-            cache_root_path: format!("/tmp/kvcache_large_cache/{}", instance_key),
+            root_paths: vec![format!("/tmp/kvcache_large/{}", instance_key)],
         },
         test_spec_config: TestSpecConfig::default(),
     }
@@ -131,10 +130,7 @@ fn new_zero_contribution_client_config(
         },
         shared_memory_path: format!("/tmp/kvcache_shared_memory/{}", owner_instance_key),
         shared_file_path: format!("/tmp/kvcache_shared_files/{}", owner_instance_key),
-        large_file_paths: crate::config::LargeFilePaths {
-            log_root_path: String::new(),
-            cache_root_path: String::new(),
-        },
+        large_file_paths: crate::config::LargeFilePaths { root_paths: Vec::new() },
         test_spec_config: TestSpecConfig::default(),
     }
 }

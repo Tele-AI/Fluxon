@@ -110,9 +110,8 @@ fluxonkv_spec:                        # fluxon kv specific config (dict(optional
   cluster_name:                       # Cluster name (str)
   shared_memory_path:                 # Shared memory path (str)
   shared_file_path:                   # Shared file path for shared.json/logs/profiles (str)
-  large_file_paths:                   # Owner-mode large file roots (dict(optional))
-    log_root_path:                    # Log root path for owner/client large-file outputs (str)
-    cache_root_path:                  # Cache root path for owner/client large-file outputs (str)
+  large_file_paths:                   # Owner-mode ordered large-file roots (dict(optional))
+    root_paths:                       # Ordered root directories; runtime uses the first usable root and derives fixed relative subdirectories under it (['{str}'])
   p2p_listen_port:                    # P2P QUIC listen port override (int(optional))
   redis_compat:                       # Enable Redis protocol shim (dict(optional))
     listen_addr:                      # TCP listen addr, e.g. "127.0.0.1:16379" (str)
@@ -298,6 +297,122 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
     return out
 
 
+def _is_zero_contribution_fluxonkv_config(cfg: Dict[str, Any]) -> bool:
+    """
+    Determine whether one Fluxon KV config uses zero-contribution mode.
+
+    Contract:
+    - Missing contribute_to_cluster_pool_size means zero-contribution.
+    - Explicit dram=0 with all vram entries=0 also means zero-contribution.
+    - Partial-zero configurations are rejected to keep the role contract explicit.
+    """
+    contrib_present = "contribute_to_cluster_pool_size" in cfg
+    contrib = cfg.get("contribute_to_cluster_pool_size")
+    if not contrib_present or contrib is None:
+        return True
+    if not isinstance(contrib, dict):
+        raise ValueError("contribute_to_cluster_pool_size must be a mapping when provided")
+
+    dram = int(contrib["dram"])
+    vram_raw = contrib.get("vram")
+    # Missing vram is normalized to "no GPU contribution".
+    if vram_raw is None:
+        vram: Dict[str, Any] = {}
+    elif not isinstance(vram_raw, dict):
+        raise ValueError("contribute_to_cluster_pool_size.vram must be a mapping")
+    else:
+        vram = vram_raw
+
+    vram_is_zero = True
+    for _, value in vram.items():
+        if int(value) != 0:
+            vram_is_zero = False
+            break
+    if dram == 0 and not vram_is_zero:
+        raise ValueError(
+            "contribute_to_cluster_pool_size is partially zero: dram=0 but vram has non-zero values"
+        )
+    return dram == 0 and vram_is_zero
+
+
+def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
+    """
+    Validate the shared Fluxon KV contract and then apply role-specific checks.
+
+    The contract must stay canonical across Python construction, YAML export, and
+    the Rust bridge, so owner/external differences live inside this one path.
+    """
+    if "fluxonkv_spec" not in cfg:
+        return
+
+    spec = cfg.get("fluxonkv_spec")
+    if not isinstance(spec, dict):
+        raise ValueError("fluxonkv_spec must be a mapping")
+
+    is_zero_contribution = _is_zero_contribution_fluxonkv_config(cfg)
+
+    shared_memory_path = spec.get("shared_memory_path")
+    if not isinstance(shared_memory_path, str) or not shared_memory_path.strip():
+        raise ValueError("fluxonkv_spec.shared_memory_path must be a non-empty string")
+    shared_file_path = spec.get("shared_file_path")
+    if not isinstance(shared_file_path, str) or not shared_file_path.strip():
+        raise ValueError("fluxonkv_spec.shared_file_path must be a non-empty string")
+
+    if "rdma_device_names" in cfg:
+        raise ValueError("rdma_device_names has been removed from Fluxon KV config")
+
+    if "transfer_engine" in spec:
+        raise ValueError("fluxonkv_spec.transfer_engine has been removed from Fluxon KV config")
+
+    if is_zero_contribution:
+        forbidden_spec_keys = [
+            "etcd_addresses",
+            "redis_compat",
+            "sub_cluster",
+            "large_file_paths",
+        ]
+        for key in forbidden_spec_keys:
+            if key in spec:
+                raise ValueError(f"fluxonkv_spec.{key} is forbidden in zero-contribution mode")
+        return
+
+    contrib = cfg.get("contribute_to_cluster_pool_size")
+    if not isinstance(contrib, dict):
+        raise ValueError(
+            "contribute_to_cluster_pool_size is required for owner mode (non-zero contribution)"
+        )
+    if int(contrib["dram"]) == 0:
+        raise ValueError("owner mode requires non-zero contribute_to_cluster_pool_size.dram")
+
+    if "etcd_addresses" not in spec:
+        raise ValueError("fluxonkv_spec.etcd_addresses is required for owner mode")
+    etcd_addresses = spec.get("etcd_addresses")
+    if not isinstance(etcd_addresses, list) or len(etcd_addresses) == 0:
+        raise ValueError("fluxonkv_spec.etcd_addresses must be a non-empty list")
+
+    if "sub_cluster" not in spec:
+        raise ValueError("fluxonkv_spec.sub_cluster is required for owner mode")
+    sub_cluster = spec.get("sub_cluster")
+    if not isinstance(sub_cluster, str) or not sub_cluster.strip():
+        raise ValueError("fluxonkv_spec.sub_cluster must be a non-empty string in owner mode")
+    if sub_cluster != sub_cluster.strip():
+        raise ValueError("fluxonkv_spec.sub_cluster must not have leading/trailing whitespace")
+
+    if "large_file_paths" not in spec:
+        raise ValueError("fluxonkv_spec.large_file_paths is required for owner mode")
+    large_file_paths = spec.get("large_file_paths")
+    if not isinstance(large_file_paths, dict):
+        raise ValueError("fluxonkv_spec.large_file_paths must be a mapping in owner mode")
+    root_paths = large_file_paths.get("root_paths")
+    if not isinstance(root_paths, list) or len(root_paths) == 0:
+        raise ValueError("fluxonkv_spec.large_file_paths.root_paths must be a non-empty list in owner mode")
+    for idx, field_value in enumerate(root_paths):
+        if not isinstance(field_value, str) or not field_value.strip():
+            raise ValueError(
+                f"fluxonkv_spec.large_file_paths.root_paths[{idx}] must be a non-empty string in owner mode"
+            )
+
+
 class FluxonKvClientConfig():
     """Configuration class for KV Cache stores that reads from YAML config files."""
 
@@ -337,80 +452,8 @@ class FluxonKvClientConfig():
                 raise ValueError("pprof_duration_seconds must be > 0")
             plain["pprof_duration_seconds"] = pprof_duration_seconds
 
-        # FluxonKV role selection contract:
-        # - Missing contribute_to_cluster_pool_size means "zero-contribution" mode.
-        # - Explicit contribute_to_cluster_pool_size with all zeros also means "zero-contribution" mode.
-        # - Any partial-zero contribution is rejected to avoid ambiguous behavior.
         if "fluxonkv_spec" in plain:
-            spec = plain.get("fluxonkv_spec")
-            if not isinstance(spec, dict):
-                raise ValueError("fluxonkv_spec must be a mapping")
-
-            contrib_present = "contribute_to_cluster_pool_size" in plain
-            contrib = plain.get("contribute_to_cluster_pool_size")
-
-            is_zero_contribution = False
-            if not contrib_present or contrib is None:
-                is_zero_contribution = True
-            elif isinstance(contrib, dict):
-                dram = int(contrib["dram"])
-                vram_raw = contrib.get("vram")
-                # English note:
-                # - Owner-mode often contributes DRAM only; forcing `vram: {}` everywhere is noise.
-                # - Missing vram means "no GPU contribution", which is equivalent to an empty dict.
-                # - This is a schema normalization rule (not a fallback): if callers want VRAM, they
-                #   must provide an explicit mapping with non-zero values.
-                if vram_raw is None:
-                    vram: Dict[str, Any] = {}
-                elif not isinstance(vram_raw, dict):
-                    raise ValueError("contribute_to_cluster_pool_size.vram must be a mapping")
-                else:
-                    vram = vram_raw
-                vram_is_zero = True
-                for _, v in vram.items():
-                    if int(v) != 0:
-                        vram_is_zero = False
-                        break
-                if dram == 0 and not vram_is_zero:
-                    raise ValueError(
-                        "contribute_to_cluster_pool_size is partially zero: dram=0 but vram has non-zero values"
-                    )
-                is_zero_contribution = dram == 0 and vram_is_zero
-            else:
-                raise ValueError("contribute_to_cluster_pool_size must be a mapping when provided")
-
-            if is_zero_contribution:
-                forbidden_spec_keys = [
-                    "etcd_addresses",
-                    "redis_compat",
-                    "sub_cluster",
-                ]
-                for k in forbidden_spec_keys:
-                    if k in spec:
-                        raise ValueError(f"fluxonkv_spec.{k} is forbidden in zero-contribution mode")
-            else:
-                if not contrib_present or not isinstance(contrib, dict):
-                    raise ValueError(
-                        "contribute_to_cluster_pool_size is required for owner mode (non-zero contribution)"
-                    )
-                if int(contrib["dram"]) == 0:
-                    raise ValueError("owner mode requires non-zero contribute_to_cluster_pool_size.dram")
-                if "etcd_addresses" not in spec:
-                    raise ValueError("fluxonkv_spec.etcd_addresses is required for owner mode")
-                etcd_addresses = spec.get("etcd_addresses")
-                if not isinstance(etcd_addresses, list) or len(etcd_addresses) == 0:
-                    raise ValueError("fluxonkv_spec.etcd_addresses must be a non-empty list")
-                if "sub_cluster" not in spec:
-                    raise ValueError("fluxonkv_spec.sub_cluster is required for owner mode")
-                sub_cluster = spec.get("sub_cluster")
-                if not isinstance(sub_cluster, str) or not sub_cluster.strip():
-                    raise ValueError(
-                        "fluxonkv_spec.sub_cluster must be a non-empty string in owner mode"
-                    )
-                if sub_cluster != sub_cluster.strip():
-                    raise ValueError(
-                        "fluxonkv_spec.sub_cluster must not have leading/trailing whitespace"
-                    )
+            _validate_fluxonkv_contract(plain)
 
         self.config_dict = plain
 
@@ -521,7 +564,9 @@ class FluxonKvClientConfig():
 
     def to_yaml_str(self) -> str:
         """Serialize the config dict into a YAML document string."""
-        return yaml.safe_dump(self.config_dict, sort_keys=False)
+        cfg = self.to_dict()
+        _validate_fluxonkv_contract(cfg)
+        return yaml.safe_dump(cfg, sort_keys=False)
 
     def to_fluxon_kv_client_config_yaml_str(self) -> str:
         """Build the YAML string expected by the Rust `ClientConfigYaml` schema."""
@@ -534,75 +579,7 @@ class FluxonKvClientConfig():
         spec = cfg.get("fluxonkv_spec")
         if not isinstance(spec, dict):
             raise ValueError("fluxonkv_spec is required for Fluxon KV client")
-
-        contrib_present = "contribute_to_cluster_pool_size" in cfg
-        contrib = cfg.get("contribute_to_cluster_pool_size")
-        is_zero_contribution = False
-        if not contrib_present or contrib is None:
-            is_zero_contribution = True
-        elif isinstance(contrib, dict):
-            dram = int(contrib["dram"])
-            vram_raw = contrib.get("vram")
-            if vram_raw is None:
-                vram = {}
-            elif not isinstance(vram_raw, dict):
-                raise ValueError("contribute_to_cluster_pool_size.vram must be a mapping")
-            else:
-                vram = vram_raw
-            vram_is_zero = True
-            for _, v in vram.items():
-                if int(v) != 0:
-                    vram_is_zero = False
-                    break
-            if dram == 0 and not vram_is_zero:
-                raise ValueError(
-                    "contribute_to_cluster_pool_size is partially zero: dram=0 but vram has non-zero values"
-                )
-            is_zero_contribution = dram == 0 and vram_is_zero
-        else:
-            raise ValueError("contribute_to_cluster_pool_size must be a mapping when provided")
-
-        shared_memory_path = spec.get("shared_memory_path")
-        if not isinstance(shared_memory_path, str) or not shared_memory_path.strip():
-            raise ValueError("fluxonkv_spec.shared_memory_path must be a non-empty string")
-        shared_file_path = spec.get("shared_file_path")
-        if not isinstance(shared_file_path, str) or not shared_file_path.strip():
-            raise ValueError("fluxonkv_spec.shared_file_path must be a non-empty string")
-
-        if "rdma_device_names" in cfg:
-            raise ValueError("rdma_device_names has been removed from Fluxon KV config")
-
-        if "transfer_engine" in spec:
-            raise ValueError("fluxonkv_spec.transfer_engine has been removed from Fluxon KV config")
-
-        if is_zero_contribution:
-            forbidden_spec_keys = [
-                "etcd_addresses",
-                "redis_compat",
-                "sub_cluster",
-            ]
-            for k in forbidden_spec_keys:
-                if k in spec:
-                    raise ValueError(f"fluxonkv_spec.{k} is forbidden in zero-contribution mode")
-
-            return yaml.safe_dump(cfg, sort_keys=False)
-
-        # Owner mode must always declare large-file roots for logs and caches.
-        # p2p_listen_port remains optional here: deterministic case-local
-        # topologies may pin it, while shared testbed flows can leave it unset
-        # and let runtime choose an available port.
-        if "large_file_paths" not in spec:
-            raise ValueError("fluxonkv_spec.large_file_paths is required for owner mode")
-        large_file_paths = spec.get("large_file_paths")
-        if not isinstance(large_file_paths, dict):
-            raise ValueError("fluxonkv_spec.large_file_paths must be a mapping in owner mode")
-        for field_name in ("log_root_path", "cache_root_path"):
-            field_value = large_file_paths.get(field_name)
-            if not isinstance(field_value, str) or not field_value.strip():
-                raise ValueError(
-                    f"fluxonkv_spec.large_file_paths.{field_name} must be a non-empty string in owner mode"
-                )
-
+        _validate_fluxonkv_contract(cfg)
         return yaml.safe_dump(cfg, sort_keys=False)
     
 

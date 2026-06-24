@@ -38,6 +38,12 @@ TRANSFER_STATE_STORE_KEY_PREFIX = f"/fluxon_fs_transfer/{CLUSTER_NAME}/"
 FS_MASTER_ACCESS_DB_PATH = (WORKDIR / "fs_master" / "access.db").resolve()
 
 
+def build_owner_large_file_paths() -> dict:
+    return {
+        "root_paths": [str((WORKDIR / "large" / "owner").resolve())],
+    }
+
+
 def main() -> None:
     args = parse_args()
     WORKDIR.mkdir(parents=True, exist_ok=True)
@@ -198,6 +204,7 @@ def build_owner_config() -> dict:
             "shared_memory_path": str(SHARED_MEMORY_PATH),
             "shared_file_path": str(SHARED_FILE_PATH),
             "sub_cluster": "default",
+            "large_file_paths": build_owner_large_file_paths(),
         },
     }
 

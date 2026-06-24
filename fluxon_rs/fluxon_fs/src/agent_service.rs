@@ -56,6 +56,8 @@ use crate::write_session_rpc::{
     FsWriteSessionChunkResp, FsWriteSessionDataFrame,
 };
 
+pub(crate) mod transfer_agent;
+
 pub const CHUNK_BYTES: usize = 1024 * 1024;
 pub const READ_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const WRITE_SESSION_CHUNK_BYTES: usize = crate::agent::REMOTE_WRITE_SESSION_CHUNK_BYTES;
@@ -65,6 +67,9 @@ const WRITE_SESSION_MAX_QUEUED_BYTES: usize =
 const WRITE_SESSION_IDLE_TIMEOUT_SECS: u64 = 180;
 const WRITE_SESSION_REAP_INTERVAL_SECS: u64 = 30;
 const WRITE_SESSION_CLOSE_WAIT_TIMEOUT_SECS: u64 = 30;
+pub(crate) const TRANSFER_HEARTBEAT_INTERVAL_MS: i64 = 5_000;
+pub(crate) const TRANSFER_STREAM_RPC_TIMEOUT_MS: u64 = 60_000;
+pub(crate) const TRANSFER_WORKER_COORDINATION_RPC_TIMEOUT_MS: u64 = 30_000;
 const AGENT_EXPORTS_SNAPSHOT_SCHEMA_VERSION_KEY: &str = "schema_version";
 const AGENT_EXPORTS_SNAPSHOT_EXPORTS_JSON_KEY: &str = "exports_json";
 const AGENT_EXPORT_NAME_KEY: &str = "export_name";
@@ -4950,6 +4955,7 @@ mod tests {
         FluxonFsRuntimeAccessModel {
             users: vec![FluxonFsRuntimeAccessUser {
                 username: "alice".to_string(),
+                can_manage_users: false,
                 rpc_token_secret_sha256_hex: hex::encode(sha2::Sha256::digest(b"pw")),
             }],
             scope_access: vec![FluxonFsScopeAccess {
@@ -4965,6 +4971,7 @@ mod tests {
         FluxonFsRuntimeAccessModel {
             users: vec![FluxonFsRuntimeAccessUser {
                 username: "alice".to_string(),
+                can_manage_users: false,
                 rpc_token_secret_sha256_hex: hex::encode(sha2::Sha256::digest(b"pw")),
             }],
             scope_access: vec![FluxonFsScopeAccess {

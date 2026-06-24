@@ -1,6 +1,0 @@
-interface:
-  display_name: "尽量减少确认项"
-  short_description: "尽量减少确认项"
-  default_prompt: "Use $prompt-1323c8c8-88a0-40d2-89df-14fc9533a122."
-policy:
-  allow_implicit_invocation: false

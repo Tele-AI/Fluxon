@@ -191,6 +191,46 @@ def test_failed_status_includes_bootstrap_and_service_log_tails() -> None:
         print("PASS: test_failed_status_includes_bootstrap_and_service_log_tails")
 
 
+def test_failed_status_resolves_daily_sharded_service_log_tail() -> None:
+    module = _load_start_test_bed_module()
+    with tempfile.TemporaryDirectory(prefix="test_start_test_bed_sharded_failure_tails_") as td:
+        root = Path(td)
+        bootstrap_log = root / "fluxon_core_controller.bootstrap.log"
+        bootstrap_log.write_text("[rollout] probable-ready failed svc=owner\n", encoding="utf-8")
+        base_service_log = root / "log" / "master.log"
+        base_service_log.parent.mkdir(parents=True, exist_ok=True)
+        sharded_service_log = root / "log" / "master.2026-06-23.log"
+        sharded_service_log.write_text("FATAL: owner bootstrap dependency failed\n", encoding="utf-8")
+        local_node_cfg = {
+            "hostname": "node-a",
+            "hostworkdir": str(root),
+        }
+        result = _build_result(
+            bootstrap_log_path=bootstrap_log,
+            launcher_rc=1,
+            selection_name="fluxon_core_controller",
+            bare_script_name="fluxon_core_controller",
+            node_name="node-a",
+            expected_service_names=["master"],
+        )
+        statuses = module._collect_bare_runtime_statuses(
+            deployconf={},
+            cluster_nodes={},
+            local_node_cfg=local_node_cfg,
+            result=result,
+        )
+        assert len(statuses) == 1, statuses
+        status = statuses[0]
+        assert status["present"] is False, status
+        assert status["running"] is False, status
+        assert status["log_path"] == str(sharded_service_log.resolve()), status
+        err = status["status_error"]
+        assert isinstance(err, str) and "bootstrap_log_tail=" in err, err
+        assert "service_log_tail=" in err, err
+        assert "owner bootstrap dependency failed" in err, err
+        print("PASS: test_failed_status_resolves_daily_sharded_service_log_tail")
+
+
 def test_testbed_template_tikv_uses_low_fd_limits_for_ci_runner() -> None:
     deployconf = yaml.safe_load((REPO_ROOT / "fluxon_test_stack" / "deployconf_testbed.yml").read_text(encoding="utf-8"))
     tikv_cfg = deployconf["service"]["tikv"]["entrypoint"]

@@ -83,8 +83,7 @@ fn new_client_config(
         shared_memory_path: shm_path.to_string(),
         shared_file_path: format!("{}_files", shm_path),
         large_file_paths: LargeFilePaths {
-            log_root_path: format!("{}_logs", shm_path),
-            cache_root_path: format!("{}_cache", shm_path),
+            root_paths: vec![format!("{}_large", shm_path)],
         },
         test_spec_config: TestSpecConfig::default(),
     }
@@ -128,10 +127,7 @@ fn new_zero_contribution_client_config(
         },
         shared_memory_path: shm_path.to_string(),
         shared_file_path: format!("{}_files", shm_path),
-        large_file_paths: LargeFilePaths {
-            log_root_path: String::new(),
-            cache_root_path: String::new(),
-        },
+        large_file_paths: LargeFilePaths { root_paths: Vec::new() },
         test_spec_config: TestSpecConfig::default(),
     }
 }

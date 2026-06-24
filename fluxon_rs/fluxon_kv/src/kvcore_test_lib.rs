@@ -148,8 +148,7 @@ fn new_client_config_with_cluster_and_dram(
         shared_memory_path,
         shared_file_path,
         large_file_paths: crate::config::LargeFilePaths {
-            log_root_path: format!("{}/large_logs/{}", base, instance_key),
-            cache_root_path: format!("{}/large_cache/{}", base, instance_key),
+            root_paths: vec![format!("{}/large/{}", base, instance_key)],
         },
         test_spec_config: TestSpecConfig::default(),
     };

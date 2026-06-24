@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -62,6 +63,7 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("supervisor_label_uses_stable_selection_suffix", test_supervisor_label_uses_stable_selection_suffix),
         ("bootstrap_start_reuses_already_present_selection", test_bootstrap_start_reuses_already_present_selection),
         ("bare_start_fails_when_child_exits_within_startup_window", test_bare_start_fails_when_child_exits_within_startup_window),
+        ("pid_ready_check_requires_full_stable_window_after_first_child_observation", test_pid_ready_check_requires_full_stable_window_after_first_child_observation),
         ("atomic_group_start_does_not_auto_stop_on_failure", test_atomic_group_start_does_not_auto_stop_on_failure),
         ("atomic_group_preserves_nested_heredoc_terminator", test_atomic_group_preserves_nested_heredoc_terminator),
         ("atomic_group_stop_script_is_shell_valid", test_atomic_group_stop_script_is_shell_valid),
@@ -137,7 +139,7 @@ def test_preserves_hostworkdir_runtime_token() -> None:
         assert "wait-present" not in script, script
         assert "launch_only_start_gate" not in script, script
         _assert_standalone_deadline_after_launch(script)
-        assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_TS" "[bare]"' in script, script
+        assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_SECONDS" "[bare]"' in script, script
         assert "export SERVICE_PORT=12345" in script, script
         assert "wait_service_tcp_ready" not in script, script
         assert "wait_service_etcd_endpoint_healthy" not in script, script
@@ -195,11 +197,11 @@ def test_atomic_group_start_does_not_auto_stop_on_failure() -> None:
         assert 'SUPERVISOR_PID=$( setsid ' not in script, script
         assert 'echo "[rollout] probable-ready failed svc=$SERVICE label=$SUPERVISOR_LABEL supervisor_pid=$SUPERVISOR_PID"' in script, script
         assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID"' in script, script
-        assert 'GROUP_STARTUP_DEADLINE_TS=' not in script, script
-        assert script.count('STARTUP_DEADLINE_TS=$(( $(date +%s) + 10 ))') == 2, script
+        assert 'GROUP_STARTUP_DEADLINE_SECONDS=' not in script, script
+        assert script.count('STARTUP_DEADLINE_SECONDS=20') == 2, script
         _assert_deadline_after_launch(
             script=script,
-            wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_TS" "[rollout]"',
+            wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_SECONDS" "[rollout]"',
         )
         assert "export SERVICE_PORT=23456" in script, script
         assert "unset SERVICE_PORT" in script, script
@@ -330,7 +332,7 @@ def test_bare_start_uses_no_exit_startup_gate() -> None:
 
         for script in (etcd_script, tikv_script, plain_script):
             _assert_standalone_deadline_after_launch(script)
-            assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_TS" "[bare]"' in script, script
+            assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_SECONDS" "[bare]"' in script, script
             assert "wait_service_tcp_ready" not in script, script
             assert "wait_service_etcd_endpoint_healthy" not in script, script
         print("PASS: test_bare_start_uses_no_exit_startup_gate")
@@ -365,10 +367,10 @@ def test_normalized_testbed_master_exports_service_port_for_atomic_group() -> No
         assert "export MASTER__PORT=51051" in master_block, master_block
         assert "export SERVICE_PORT=51051" in master_block, master_block
         assert "unset SERVICE_PORT" not in master_block, master_block
-        assert 'GROUP_STARTUP_DEADLINE_TS=' not in master_block, master_block
+        assert 'GROUP_STARTUP_DEADLINE_SECONDS=' not in master_block, master_block
         _assert_deadline_after_launch(
             script=master_block,
-            wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_TS" "[rollout]"',
+            wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_SECONDS" "[rollout]"',
         )
         assert "wait_service_tcp_ready" not in master_block, master_block
         print("PASS: test_normalized_testbed_master_exports_service_port_for_atomic_group")
@@ -698,6 +700,119 @@ def test_bare_start_fails_when_child_exits_within_startup_window() -> None:
         print("PASS: test_bare_start_fails_when_child_exits_within_startup_window")
 
 
+def test_pid_ready_check_requires_full_stable_window_after_first_child_observation() -> None:
+    proc_lifecycle = _load_python_module(
+        module_name="test_proc_lifecycle_codegen_runtime",
+        path=DEPLOYMENT_DIR / "utils" / "proc_lifecycle_codegen.py",
+    )
+    helpers = proc_lifecycle.render_bash_proc_lifecycle_funcs_pid_tree(
+        timeouts=proc_lifecycle.StopTimeouts(term_seconds=60, kill_seconds=10, supersede_seconds=30)
+    )
+    with tempfile.TemporaryDirectory(prefix="test_proc_lifecycle_late_child_") as td:
+        tmpdir = Path(td)
+        shell_script = tmpdir / "probe.sh"
+        supervisor_script = tmpdir / "delayed_child_supervisor.py"
+        child_script = tmpdir / "sleep_child.py"
+
+        child_script.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import signal
+                import time
+
+                def _handle_signal(_signum, _frame):
+                    raise SystemExit(0)
+
+                signal.signal(signal.SIGTERM, _handle_signal)
+                signal.signal(signal.SIGINT, _handle_signal)
+
+                while True:
+                    time.sleep(0.2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        supervisor_script.write_text(
+            textwrap.dedent(
+                f"""
+                #!/usr/bin/env python3
+                import signal
+                import subprocess
+                import sys
+                import time
+                from pathlib import Path
+
+                child = None
+
+                def _shutdown(_signum, _frame):
+                    global child
+                    if child is not None and child.poll() is None:
+                        child.terminate()
+                        try:
+                            child.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                    raise SystemExit(0)
+
+                signal.signal(signal.SIGTERM, _shutdown)
+                signal.signal(signal.SIGINT, _shutdown)
+
+                time.sleep(4)
+                child = subprocess.Popen([sys.executable, str(Path({str(child_script)!r}))])
+                while True:
+                    if child.poll() is not None:
+                        raise SystemExit(child.returncode or 0)
+                    time.sleep(0.2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        shell_script.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                {helpers}
+                python3 {shlex.quote(str(supervisor_script))} &
+                root_pid="$!"
+                startup_deadline_seconds=6
+                if wait_service_probably_ready_pid_tree "svc_plain" "$root_pid" 4 "$startup_deadline_seconds" "[test]"; then
+                  echo "unexpected success"
+                  kill "$root_pid" >/dev/null 2>&1 || true
+                  wait "$root_pid" >/dev/null 2>&1 || true
+                  exit 99
+                else
+                  wait_rc="$?"
+                fi
+                kill "$root_pid" >/dev/null 2>&1 || true
+                wait "$root_pid" >/dev/null 2>&1 || true
+                exit "$wait_rc"
+                """
+            ),
+            encoding="utf-8",
+        )
+        shell_script.chmod(0o755)
+
+        result = subprocess.run(
+            ["bash", str(shell_script)],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(DEPLOYMENT_DIR.parent),
+            timeout=20,
+        )
+        assert result.returncode != 0, (
+            f"expected startup gate failure rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert "unexpected success" not in result.stdout, result.stdout
+        assert "child pid not stable long enough" in result.stdout, result.stdout
+        print("PASS: test_pid_ready_check_requires_full_stable_window_after_first_child_observation")
+
+
 def test_atomic_group_preserves_nested_heredoc_terminator() -> None:
     with tempfile.TemporaryDirectory(prefix="test_gen_bare_deploy_bash_atomic_heredoc_") as td:
         tmpdir = Path(td)
@@ -869,7 +984,7 @@ def _wait_until_selection_absent(
 
 def _assert_deadline_after_launch(*, script: str, wait_call: str) -> None:
     launch_check = 'if [[ ! "$SUPERVISOR_PID" =~ ^[0-9]+$ ]]; then'
-    deadline_assign = 'STARTUP_DEADLINE_TS=$(( $(date +%s) + 10 ))'
+    deadline_assign = 'STARTUP_DEADLINE_SECONDS=20'
     assert launch_check in script, script
     assert deadline_assign in script, script
     assert wait_call in script, script
@@ -883,7 +998,7 @@ def _assert_deadline_after_launch(*, script: str, wait_call: str) -> None:
 def _assert_standalone_deadline_after_launch(script: str) -> None:
     _assert_deadline_after_launch(
         script=script,
-        wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_TS" "[bare]"',
+        wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_SECONDS" "[bare]"',
     )
 
 

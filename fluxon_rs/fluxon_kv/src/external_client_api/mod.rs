@@ -253,7 +253,7 @@ define_module!(
 pub struct ExternalClientApiNewArg {
     pub shared_memory_path: String,
     pub shared_file_path: String,
-    pub cache_root_path: String,
+    pub large_file_paths: crate::config::LargeFilePaths,
     pub expected_cluster_name: String,
     pub expected_protocol_version: String,
     pub enable_side_transfer: bool,
@@ -313,7 +313,7 @@ pub struct ExternalInner {
     expected_protocol_version: String,
     external_shared_memory_path: String,
     external_shared_file_path: String,
-    external_cache_root_path: String,
+    external_large_file_paths: crate::config::LargeFilePaths,
     _enable_side_transfer: bool,
     short_circuit_put_payload_path: bool,
     side_rr_next: AtomicUsize,
@@ -365,7 +365,7 @@ impl ExternalClientApi {
             expected_protocol_version: arg.expected_protocol_version,
             external_shared_memory_path: arg.shared_memory_path,
             external_shared_file_path: arg.shared_file_path,
-            external_cache_root_path: arg.cache_root_path,
+            external_large_file_paths: arg.large_file_paths,
             _enable_side_transfer: arg.enable_side_transfer,
             short_circuit_put_payload_path: arg.short_circuit_put_payload_path,
             side_rr_next: AtomicUsize::new(0),
@@ -1240,8 +1240,8 @@ impl ExternalInner {
         self.external_shared_file_path.clone()
     }
 
-    pub fn cache_root_path(&self) -> String {
-        self.external_cache_root_path.clone()
+    pub fn large_file_paths(&self) -> &crate::config::LargeFilePaths {
+        &self.external_large_file_paths
     }
 
     fn should_fallback_side_p2p_error(err: &crate::p2p::P2PError) -> bool {

@@ -1513,6 +1513,23 @@ def _bare_service_runtime_log_path(*, local_node_cfg: dict[str, Any], service_na
     return root / "log" / f"{service_name}.log"
 
 
+def _resolve_bare_service_readable_runtime_log_path(
+    *,
+    local_node_cfg: dict[str, Any],
+    service_name: str,
+) -> Path | None:
+    runtime_log_path = _bare_service_runtime_log_path(
+        local_node_cfg=local_node_cfg,
+        service_name=service_name,
+    )
+    if runtime_log_path is None:
+        return None
+    resolved_log_path = log_shard.resolve_readable_log_path(runtime_log_path)
+    if resolved_log_path is not None:
+        return resolved_log_path
+    return runtime_log_path
+
+
 def _test_runner_ui_health_payload(*, probe_url: str, timeout_seconds: float) -> dict[str, Any] | None:
     req = urllib.request.Request(probe_url.rstrip("/") + "/health", method="GET")
     try:
@@ -3400,7 +3417,7 @@ def _collect_bare_runtime_statuses(
         raise ValueError("bare_launch_result.bootstrap_log_path must be a Path")
     statuses: list[dict[str, Any]] = []
     for service_name in expected_service_names:
-        runtime_log_path = _bare_service_runtime_log_path(
+        runtime_log_path = _resolve_bare_service_readable_runtime_log_path(
             local_node_cfg=local_node_cfg,
             service_name=service_name,
         )
