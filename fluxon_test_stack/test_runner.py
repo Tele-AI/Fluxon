@@ -51,6 +51,52 @@ from top_attention_index_helper import (
     run_top_attention_entries,
     select_top_attention_entries,
 )
+from test_runner_ci_runtime import (
+    _assert_ci_runtime_python_abi as _assert_ci_runtime_python_abi_impl,
+    _ci_runtime_python_abi as _ci_runtime_python_abi_impl,
+    _ci_runtime_python_executable as _ci_runtime_python_executable_impl,
+    _create_ci_runtime_venv as _create_ci_runtime_venv_impl,
+)
+from test_runner_models import (
+    _CasePlan,
+    _CaseRuntimeTracking,
+    _ExecutedCase,
+    _ObservedFileState,
+    _PlannedCase,
+    _PreparedCase,
+    _RemoteRunDirStage,
+    _ResolvedCase,
+    _RetryableControllerStatusError,
+    _RunSelectors,
+    _RunSlot,
+    _RuntimePhase,
+    _Suite,
+)
+from test_runner_runtime_backend import (
+    _execute_ci_case as _execute_ci_case_impl,
+    _execute_test_stack_case as _execute_test_stack_case_impl,
+    _finalize_case_runtime as _finalize_case_runtime_impl,
+    _finalize_ci_case_runtime as _finalize_ci_case_runtime_impl,
+    _finalize_test_stack_case_runtime as _finalize_test_stack_case_runtime_impl,
+    _prepare_ci_case as _prepare_ci_case_impl,
+    _prepare_test_stack_case as _prepare_test_stack_case_impl,
+    _require_ci_runner_exit_code_baseline as _require_ci_runner_exit_code_baseline_impl,
+    _require_test_stack_result_path as _require_test_stack_result_path_impl,
+    _require_test_stack_result_timeout as _require_test_stack_result_timeout_impl,
+    _test_stack_result_timeout_seconds as _test_stack_result_timeout_seconds_impl,
+    _wait_and_load_test_stack_benchmark_result_json as _wait_and_load_test_stack_benchmark_result_json_impl,
+)
+from test_runner_ui_runtime import (
+    _ci_log_prefix_lines as _ci_log_prefix_lines_impl,
+    _ci_log_timestamp_prefix as _ci_log_timestamp_prefix_impl,
+    _load_gitops_ctx_for_ui as _load_gitops_ctx_for_ui_impl,
+    _redirect_process_stdio_to_log as _redirect_process_stdio_to_log_impl,
+    _resolve_history_roots_cli_paths as _resolve_history_roots_cli_paths_impl,
+    _resolve_repo_root_cli_path as _resolve_repo_root_cli_path_impl,
+    _runner_stdio_mirror_enabled as _runner_stdio_mirror_enabled_impl,
+    _start_runner_stdio_log_mirror as _start_runner_stdio_log_mirror_impl,
+    run_ui_service as run_ui_service_impl,
+)
 
 
 # NOTE: This project uses multiple schemas:
@@ -171,12 +217,11 @@ _CURRENT_DEPLOYMENTS_MISSING_APPLY_ERR = (
 
 
 def _resolve_repo_root_cli_path(*, raw_path: Path, field_name: str) -> Path:
-    if raw_path.is_absolute():
-        return raw_path.resolve()
-    resolved = (REPO_ROOT / raw_path).resolve()
-    if not resolved:
-        raise RuntimeError(f"failed to resolve {field_name} against repo root: raw={raw_path}")
-    return resolved
+    return _resolve_repo_root_cli_path_impl(
+        repo_root=REPO_ROOT,
+        raw_path=raw_path,
+        field_name=field_name,
+    )
 
 
 def _json_canonicalize(value: Any) -> Any:
@@ -423,58 +468,23 @@ _TEST_RUNNER_UI_LOCK_FILENAME = ".test_runner_ui.lock"
 
 
 def _runner_stdio_mirror_enabled() -> bool:
-    return os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
+    return _runner_stdio_mirror_enabled_impl()
 
 
 def _ci_log_timestamp_prefix(now: Optional[float] = None) -> str:
-    ts = datetime.datetime.fromtimestamp(
-        time.time() if now is None else float(now),
-        tz=datetime.timezone.utc,
-    )
-    return ts.strftime("[%Y-%m-%d %H:%M:%S UTC]")
+    return _ci_log_timestamp_prefix_impl(now)
 
 
 def _ci_log_prefix_lines(text: str, *, now: Optional[float] = None) -> str:
-    if not text:
-        return ""
-    prefix = _ci_log_timestamp_prefix(now)
-    lines = text.splitlines(keepends=True)
-    return "".join(f"{prefix} {line}" if line.strip() else line for line in lines)
+    return _ci_log_prefix_lines_impl(text, now=now)
 
 
 def _start_runner_stdio_log_mirror(*, log_path: Path, stdout_fd: int) -> None:
-    def _mirror_loop() -> None:
-        offset = 0
-        while True:
-            try:
-                if log_path.exists():
-                    size = log_path.stat().st_size
-                    if size < offset:
-                        offset = 0
-                    if size > offset:
-                        with log_path.open("r", encoding="utf-8", errors="replace") as fp:
-                            fp.seek(offset)
-                            chunk = fp.read()
-                            offset = fp.tell()
-                        if chunk:
-                            data = _ci_log_prefix_lines(chunk).encode("utf-8", errors="replace")
-                            if stdout_fd >= 0:
-                                try:
-                                    os.write(stdout_fd, data)
-                                except OSError:
-                                    pass
-                time.sleep(0.2)
-            except Exception:
-                time.sleep(0.5)
-
-    mirror = threading.Thread(
-        target=_mirror_loop,
-        name="test-runner-stdio-log-mirror",
-        daemon=True,
-    )
-    mirror.start()
     global _RUNNER_STDIO_MIRROR_THREAD
-    _RUNNER_STDIO_MIRROR_THREAD = mirror
+    _RUNNER_STDIO_MIRROR_THREAD = _start_runner_stdio_log_mirror_impl(
+        log_path=log_path,
+        stdout_fd=stdout_fd,
+    )
 
 
 def _redirect_process_stdio_to_log(workdir_root: Path) -> None:
@@ -489,62 +499,20 @@ def _redirect_process_stdio_to_log(workdir_root: Path) -> None:
     """
     global _RUNNER_STDIO_LOG_FP
     global _RUNNER_STDIO_KEEPALIVE_FDS
-    if _RUNNER_STDIO_LOG_FP is not None:
-        return
-
-    log_path = (workdir_root / RUNNER_STDIO_LOG_FILENAME).resolve()
-    log_fp = log_path.open("a", encoding="utf-8", buffering=1)
-    banner = (
-        f"{_ci_log_timestamp_prefix()} [test_runner] redirecting process stdio to stable log: {log_path}\n"
+    _RUNNER_STDIO_LOG_FP, _RUNNER_STDIO_KEEPALIVE_FDS = _redirect_process_stdio_to_log_impl(
+        workdir_root=workdir_root,
+        runner_stdio_log_filename=RUNNER_STDIO_LOG_FILENAME,
+        stdio_log_fp=_RUNNER_STDIO_LOG_FP,
+        stdio_keepalive_fds=_RUNNER_STDIO_KEEPALIVE_FDS,
+        start_mirror=_start_runner_stdio_log_mirror,
     )
-    try:
-        sys.stdout.write(banner)
-        sys.stdout.flush()
-    except OSError:
-        pass
-
-    try:
-        sys.stdout.flush()
-    except OSError:
-        pass
-    try:
-        sys.stderr.flush()
-    except OSError:
-        pass
-
-    # English note:
-    # - Some process supervisors (including CI harnesses) treat "stdout/stderr pipe closed" as a signal
-    #   to reap the whole process tree, even if the process is still alive.
-    # - `dup2(log_fp, stdout_fd)` closes the original stdout pipe. Keep an extra dup() of the original
-    #   pipe write end open so such harnesses do not mis-detect process exit.
-    if _RUNNER_STDIO_KEEPALIVE_FDS is None:
-        try:
-            out_fd = os.dup(sys.stdout.fileno())
-            err_fd = os.dup(sys.stderr.fileno())
-            os.set_inheritable(out_fd, False)
-            os.set_inheritable(err_fd, False)
-            _RUNNER_STDIO_KEEPALIVE_FDS = (out_fd, err_fd)
-        except OSError:
-            _RUNNER_STDIO_KEEPALIVE_FDS = (-1, -1)
-
-    os.dup2(log_fp.fileno(), sys.stdout.fileno())
-    os.dup2(log_fp.fileno(), sys.stderr.fileno())
-    sys.stdout = os.fdopen(sys.stdout.fileno(), "w", encoding="utf-8", buffering=1, closefd=False)
-    sys.stderr = os.fdopen(sys.stderr.fileno(), "w", encoding="utf-8", buffering=1, closefd=False)
-    _RUNNER_STDIO_LOG_FP = log_fp
-    if _runner_stdio_mirror_enabled():
-        keepalive = _RUNNER_STDIO_KEEPALIVE_FDS or (-1, -1)
-        _start_runner_stdio_log_mirror(
-            log_path=log_path,
-            stdout_fd=int(keepalive[0]),
-        )
 
 
 def _resolve_history_roots_cli_paths(raw_paths: List[str]) -> List[Path]:
-    return [
-        _resolve_repo_root_cli_path(raw_path=Path(path), field_name="history_root")
-        for path in raw_paths
-    ]
+    return _resolve_history_roots_cli_paths_impl(
+        repo_root=REPO_ROOT,
+        raw_paths=raw_paths,
+    )
 
 
 def _load_gitops_ctx_for_ui(
@@ -552,26 +520,10 @@ def _load_gitops_ctx_for_ui(
     workdir_root: Path,
     gitops_config_path: Optional[Path],
 ) -> Optional[gitops_lib.GitOpsContext]:
-    if gitops_config_path is None:
-        return None
-    gitops_workdir = gitops_lib.default_runtime_root(workdir_root)
-    gitops_ctx = gitops_lib.load_context(
-        config_path=gitops_config_path,
-        workdir=gitops_workdir,
+    return _load_gitops_ctx_for_ui_impl(
+        workdir_root=workdir_root,
+        gitops_config_path=gitops_config_path,
     )
-    gitops_desc = gitops_lib.describe_context(gitops_ctx)
-    print(
-        "INFO: test_runner GitOps integrated: "
-        f"config={gitops_desc['config_path']} workdir={gitops_desc['workdir']} interval={gitops_desc['interval']}s repos={gitops_desc['repo_count']}",
-        flush=True,
-    )
-    threading.Thread(
-        target=gitops_lib.poll_forever,
-        args=(gitops_ctx,),
-        kwargs={"stop_event": None},
-        daemon=True,
-    ).start()
-    return gitops_ctx
 
 
 def run_ui_service(
@@ -583,25 +535,15 @@ def run_ui_service(
     extra_history_roots: Optional[List[Path]],
     gitops_config_path: Optional[Path],
 ) -> None:
-    workdir_root = workdir_root.resolve()
-    if workdir_root.exists():
-        if not workdir_root.is_dir():
-            raise ValueError(f"ui workdir is not a directory: {workdir_root}")
-    else:
-        workdir_root.mkdir(parents=True, exist_ok=True)
-    ui_lock = _acquire_ui_service_lock(workdir_root=workdir_root)
-    _ = ui_lock
-    gitops_ctx = _load_gitops_ctx_for_ui(
+    run_ui_service_impl(
         workdir_root=workdir_root,
-        gitops_config_path=gitops_config_path,
-    )
-    _serve_test_runner_ui(
-        workdir_root=workdir_root,
-        host=str(host),
-        port=int(port),
-        lookback_days=int(lookback_days),
+        host=host,
+        port=port,
+        lookback_days=lookback_days,
         extra_history_roots=extra_history_roots,
-        gitops_ctx=gitops_ctx,
+        gitops_config_path=gitops_config_path,
+        acquire_ui_service_lock=_acquire_ui_service_lock,
+        serve_test_runner_ui=_serve_test_runner_ui,
     )
 
 
@@ -1166,116 +1108,6 @@ def main() -> None:
 
     if suite_failed:
         raise SystemExit(1)
-
-
-@dataclass(frozen=True)
-class _Suite:
-    run_mode: str
-    run_selectors: "_RunSelectors"
-    scenes: Dict[str, Dict[str, Any]]
-    scales: Dict[str, Dict[str, Any]]
-    artifact_sets: Dict[str, Dict[str, Any]]
-    profiles: Dict[str, Dict[str, Any]]
-
-
-@dataclass(frozen=True)
-class _RunSelectors:
-    case_ids: Optional[Tuple[str, ...]]
-    profile_ids: Tuple[str, ...]
-    command_ids: Optional[Tuple[str, ...]]
-    test_ids: Optional[Tuple[str, ...]]
-
-
-@dataclass(frozen=True)
-class _ResolvedCase:
-    scene_id: str
-    scale_id: str
-    profile_id: str
-    case_id: str
-    case_key: str
-
-
-@dataclass
-class _RunSlot:
-    case_key: str
-    case_id: str
-    run_index: int
-    rec: Dict[str, Any]
-
-
-@dataclass(frozen=True)
-class _PlannedCase:
-    case: _ResolvedCase
-    ci_commands: Optional[List[Dict[str, Any]]]
-    ci_prepare_steps: Optional[List[Dict[str, Any]]]
-    label: str
-    command_id: Optional[str]
-    test_id: Optional[str]
-    counted: bool
-
-
-@dataclass(frozen=True)
-class _ObservedFileState:
-    size: int
-    mtime_ns: int
-
-
-@dataclass(frozen=True)
-class _RemoteRunDirStage:
-    archive_prefix: str
-    stage_prefix: str
-    verify_relpaths: Tuple[str, ...]
-    ctx: str
-    sync_mode: str
-    include_relpaths: Optional[Tuple[str, ...]] = None
-
-
-@dataclass(frozen=True)
-class _RuntimePhase:
-    phase_id: str
-    layer: str
-    instance_ids: Tuple[str, ...]
-    write_ctx: str
-    stage_run_dir: Optional[_RemoteRunDirStage] = None
-
-
-class _RetryableControllerStatusError(RuntimeError):
-    pass
-
-
-@dataclass(frozen=True)
-class _CasePlan:
-    case_family: str
-    prepare_phases: Tuple[_RuntimePhase, ...]
-    execute_phases: Tuple[_RuntimePhase, ...]
-    collect_phases: Tuple[_RuntimePhase, ...]
-
-
-@dataclass(frozen=True)
-class _PreparedCase:
-    plan: _CasePlan
-    ci_runner_exit_code_baseline: Optional[_ObservedFileState] = None
-    test_stack_result_path: Optional[Path] = None
-    test_stack_coordinator_addr: Optional[str] = None
-    test_stack_result_timeout_s: Optional[int] = None
-
-
-@dataclass(frozen=True)
-class _ExecutedCase:
-    outcome: str
-    summary: Dict[str, Any]
-
-
-@dataclass
-class _CaseRuntimeTracking:
-    ci_lock_fp: Optional[Any] = None
-    controller_lock_fp: Optional[Any] = None
-    ci_attempted_instance_ids: List[str] = field(default_factory=list)
-    ci_apply_ids: Dict[str, str] = field(default_factory=dict)
-    ts_coord_deploy_attempted: bool = False
-    ts_nodes_deploy_attempted: bool = False
-    ts_coord_apply_id: Optional[str] = None
-    ts_nodes_apply_id: Optional[str] = None
 
 
 def _load_yaml_file(path: Path) -> Any:
@@ -3615,140 +3447,14 @@ def _prepare_ci_case(
     case_plan: _CasePlan,
     runtime_tracking: _CaseRuntimeTracking,
 ) -> _PreparedCase:
-    deploy = _require_dict(resolved_case.get("deploy"), "resolved_case.deploy")
-    ci_checkout_root = _runner_repo_root()
-    runtime_tracking.ci_lock_fp = _acquire_ci_lock()
-    _ensure_deployer_online(resolved_case)
-    out_cluster_name = _ci_cluster_name(resolved_case)
-
-    scale = _require_dict(resolved_case.get("scale"), "resolved_case.scale")
-    owner_scale = _require_dict(scale.get("owner"), "resolved_case.scale.owner")
-    owner_count = _require_int(owner_scale.get("owner_count"), "scale.owner.owner_count", min_v=1)
-    if owner_count != 1:
-        raise ValueError("CI currently supports only owner_count=1")
-    owner_dram_bytes = _require_int(
-        owner_scale.get("owner_dram_bytes"), "scale.owner.owner_dram_bytes", min_v=16777216
-    )
-    if owner_dram_bytes % 16777216 != 0:
-        raise ValueError("scale.owner.owner_dram_bytes must be 16MiB aligned")
-
-    release_root = _resolved_case_release_root(resolved_case)
-    if not release_root.exists():
-        raise ValueError(f"materialized case release_root is missing: {release_root}")
-
-    if _ci_has_instance(resolved_case, instance_id="owner_0"):
-        owner0 = _find_deploy_instance(resolved_case, instance_id="owner_0")
-        ci_runner = _find_deploy_instance(resolved_case, instance_id="ci_runner")
-        owner0_target = _require_str(
-            _require_dict(owner0.get("deployer"), "owner_0.deployer").get("target"),
-            "owner_0.target",
-        )
-        ci_target = _require_str(
-            _require_dict(ci_runner.get("deployer"), "ci_runner.deployer").get("target"),
-            "ci_runner.target",
-        )
-        if owner0_target != ci_target:
-            raise ValueError("ci_runner must run on the same target as owner_0")
-
-    _ci_cleanup_runtime(resolved_case, timeout_s=120)
-    _cleanup_previous_failed_ci_runtime(
-        resolved_case,
+    return _prepare_ci_case_impl(
+        ctx=sys.modules[__name__],
+        planned_case=planned_case,
+        resolved_case=resolved_case,
         run_dir=run_dir,
         run_index=run_index,
-    )
-    _ci_assert_ports_free(resolved_case)
-    _wait_ci_base_runtime_ready(resolved_case)
-
-    services_root = (run_dir / "services").resolve()
-    services_root.mkdir(parents=True, exist_ok=True)
-    # Keep this directory as a stable staging anchor for CI runtime bundles.
-    # The actual shared_memory_path used by iceoryx2 must NOT embed run_dir (path length limit risk).
-    (services_root / "share_mem").mkdir(parents=True, exist_ok=True)
-    share_mem_path = _ci_shared_memory_path(resolved_case, run_dir=run_dir)
-    share_file_path = _ci_shared_file_path(resolved_case, run_dir=run_dir)
-    # Create the directory on the local host to make the config deterministic for same-host runs.
-    # Remote targets (via deployer) run on their own host filesystem and will create the directory
-    # as needed when initializing the KV client.
-    Path(share_mem_path).mkdir(parents=True, exist_ok=True)
-    Path(share_file_path).mkdir(parents=True, exist_ok=True)
-
-    venv_dir = (run_dir / "venv").resolve()
-    if venv_dir.exists():
-        raise ValueError(f"venv dir already exists (no overwrite): {venv_dir}")
-    _run_subprocess([sys.executable, "-m", "venv", str(venv_dir)], cwd=str(run_dir))
-    venv_python = venv_dir / "bin" / "python3"
-    if not venv_python.exists():
-        raise ValueError(f"venv python not found after creation: {venv_python}")
-
-    src_root = (run_dir / "src").resolve()
-    _ci_prepare_run_inputs(
-        resolved_case=resolved_case,
-        source_root=ci_checkout_root,
-        release_root=release_root,
-        test_rsc_root=_resolved_case_test_rsc_root(resolved_case),
-        src_root=src_root,
-        venv_python=venv_python,
-        ci_commands=planned_case.ci_commands,
-        overlay_live_checkout=True,
-        etcd_address=f"{_ci_base_runtime_service_target_ip(resolved_case, service_id='etcd')}:{_ci_base_runtime_service_port(resolved_case, service_id='etcd')}",
-        cluster_name=out_cluster_name,
-        shared_memory_path=share_mem_path,
-        shared_file_path=share_file_path,
-    )
-
-    prepare_env_exports = _run_ci_prepare_steps(
-        resolved_case=resolved_case,
-        run_dir=run_dir,
-        src_root=src_root,
-    )
-    if prepare_env_exports:
-        _write_ci_prepare_env_script(run_dir=run_dir, exports=prepare_env_exports)
-
-    profile = _require_dict(resolved_case.get("profile"), "resolved_case.profile")
-    profile_ci = _require_dict(profile.get("ci"), "resolved_case.profile.ci")
-    if profile_ci.get("scene_config") is not None:
-        _write_ci_scene_config_yaml(
-            resolved_case,
-            run_dir=run_dir,
-        )
-    if _ci_cluster_runtime_instance_ids(resolved_case):
-        _write_ci_master_owner_configs(
-            resolved_case,
-            run_dir=run_dir,
-            cluster_name=out_cluster_name,
-            share_mem_path=share_mem_path,
-            share_file_path=share_file_path,
-            owner_dram_bytes=owner_dram_bytes,
-        )
-    _ = _write_ci_runner_script(
-        resolved_case,
-        run_dir=run_dir,
-        src_root=src_root,
-        share_mem_path=share_mem_path,
-        share_file_path=share_file_path,
-    )
-    ci_runner_exit_code_path = (run_dir / "logs" / "ci_runner" / "exit_code.txt").resolve()
-    ci_runner_exit_code_baseline = _observe_file_state(ci_runner_exit_code_path)
-
-    for cluster_runtime_phase in case_plan.prepare_phases:
-        cluster_runtime_deploy_result = _deploy_runtime_phase(
-            resolved_case,
-            run_dir=run_dir,
-            phase=cluster_runtime_phase,
-        )
-        for instance_id in cluster_runtime_phase.instance_ids:
-            _record_ci_apply_id(
-                runtime_tracking.ci_attempted_instance_ids,
-                runtime_tracking.ci_apply_ids,
-                instance_id=instance_id,
-                deploy_result=cluster_runtime_deploy_result,
-                ctx=f"CI cluster_runtime deploy_result[{instance_id}]",
-            )
-        for instance_id in cluster_runtime_phase.instance_ids:
-            _wait_ci_instance_ready(resolved_case, instance_id=instance_id)
-    return _PreparedCase(
-        plan=case_plan,
-        ci_runner_exit_code_baseline=ci_runner_exit_code_baseline,
+        case_plan=case_plan,
+        runtime_tracking=runtime_tracking,
     )
 
 
@@ -3760,204 +3466,13 @@ def _prepare_test_stack_case(
     test_stack_meta: Dict[str, Any],
     runtime_tracking: _CaseRuntimeTracking,
 ) -> _PreparedCase:
-    _ensure_deployer_online(resolved_case)
-    deploy = _require_dict(resolved_case.get("deploy"), "resolved_case.deploy")
-    controller_url = _require_str(deploy.get("controller_url"), "resolved_case.deploy.controller_url").rstrip("/")
-    case_obj = _require_dict(resolved_case.get("case"), "resolved_case.case")
-    case_id = _require_str(case_obj.get("case_id"), "resolved_case.case.case_id")
-    _cleanup_skipped_case_desired_applies(controller_url=controller_url, case_id=case_id)
-    _write_deployer_manifests(resolved_case, run_dir, allow_overwrite=False)
-
-    scale = _require_dict(resolved_case.get("scale"), "resolved_case.scale")
-    max_secs = _require_int(scale.get("duration_seconds"), "scale.duration_seconds", min_v=1)
-    benchmark_scale = _require_dict(
-        scale.get("benchmark"),
-        "resolved_case.scale.benchmark",
-    )
-    metric_warmup_seconds = _require_number(
-        benchmark_scale.get("metric_warmup_seconds"),
-        "resolved_case.scale.benchmark.metric_warmup_seconds",
-    )
-    profile = _require_dict(resolved_case.get("profile"), "resolved_case.profile")
-    profile_test_stack = _require_dict(profile.get("test_stack"), "resolved_case.profile.test_stack")
-    coordinator_ready_timeout_seconds = _require_int(
-        profile_test_stack.get("coordinator_ready_timeout_seconds"),
-        "resolved_case.profile.test_stack.coordinator_ready_timeout_seconds",
-        min_v=1,
-    )
-
-    coordinator_addr = _require_str(test_stack_meta.get("coordinator_addr"), "test_stack_meta.coordinator_addr")
-    if ":" not in coordinator_addr:
-        raise ValueError(f"invalid coordinator_addr: {coordinator_addr!r}")
-    coord_host, coord_port_s = coordinator_addr.rsplit(":", 1)
-    coord_port = int(coord_port_s)
-    coordinator_phase = _require_runtime_phase_by_id(
-        case_plan.prepare_phases,
-        phase_id="coordinator",
-        ctx="TEST_STACK prepare",
-    )
-    # Fluxon external benchmark nodes bootstrap from a local KV owner shared bundle on each host.
-    # Clean stale owner-published files before deploying the coordinator phase so owners cannot
-    # race the delete verification by recreating shared.json/mmap.file during startup.
-    scene = _require_dict(resolved_case.get("scene"), "resolved_case.scene")
-    ts_scene = _require_dict(scene.get("test_stack"), "resolved_case.scene.test_stack")
-    mode = _require_str(ts_scene.get("mode"), "scene.test_stack.mode")
-    backend_kind = _require_test_stack_backend_kind(
-        profile_test_stack.get("kind"),
-        "resolved_case.profile.test_stack.kind",
-    )
-    owner_instance_ids: List[str] = []
-    shared_memory_path: Optional[str] = None
-    shared_file_path: Optional[str] = None
-    stack_cluster_name: Optional[str] = None
-    if _test_stack_backend_uses_dedicated_kv_owners(backend_kind=backend_kind, mode=mode):
-        runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
-        owner_instance_ids = [
-            iid
-            for iid in coordinator_phase.instance_ids
-            if isinstance(iid, str) and iid.startswith(TEST_STACK_KV_OWNER_INSTANCE_ID_PREFIX)
-        ]
-        if not owner_instance_ids:
-            raise ValueError(
-                f"{mode} requires dedicated KV owner instances (missing kv_owner_* in prepare phase)"
-            )
-        if _test_stack_backend_uses_external_fluxon_kv(backend_kind=backend_kind, mode=mode):
-            stack_identity = _require_dict(runtime.get("stack_identity"), "resolved_case.runtime.stack_identity")
-            stack_cluster_name = _require_str(
-                stack_identity.get("cluster_name"),
-                "runtime.stack_identity.cluster_name",
-            )
-            shared_memory_path = _require_str(
-                stack_identity.get("shared_memory_path"),
-                "runtime.stack_identity.shared_memory_path",
-            )
-            shared_file_path = _require_str(
-                stack_identity.get("shared_file_path"),
-                "runtime.stack_identity.shared_file_path",
-            )
-            _converge_test_stack_external_owner_shared_bundle_cleanup(
-                resolved_case,
-                controller_url=controller_url,
-                owner_instance_ids=owner_instance_ids,
-            )
-    _stage_runtime_phase_run_dir(resolved_case, run_dir=run_dir, phase=coordinator_phase)
-    _ensure_test_stack_runtime_env_ready_for_instance_ids(
-        resolved_case,
+    return _prepare_test_stack_case_impl(
+        ctx=sys.modules[__name__],
+        resolved_case=resolved_case,
         run_dir=run_dir,
-        instance_ids=coordinator_phase.instance_ids,
-    )
-    runtime_tracking.ts_coord_deploy_attempted = True
-    coord_deploy_result = _deploy_runtime_phase_after_stage(
-        resolved_case,
-        run_dir=run_dir,
-        phase=coordinator_phase,
-    )
-    runtime_tracking.ts_coord_apply_id = _deploy_result_history_id(
-        coord_deploy_result,
-        ctx="TEST_STACK coordinator deploy_result",
-    )
-    _wait_instance_running(resolved_case, instance_id="coordinator", timeout_s=30)
-    _wait_instance_tcp_ready(
-        resolved_case,
-        instance_id="coordinator",
-        host=coord_host,
-        port=coord_port,
-        timeout_s=coordinator_ready_timeout_seconds,
-    )
-    if backend_kind == TEST_STACK_BACKEND_MOONCAKE:
-        bench_cfg = _load_test_stack_benchmark_config(run_dir)
-        run_kv_base = _require_dict(bench_cfg.get("kv_base"), "benchmark_config.CONFIG.kv_base")
-        run_mooncake_spec = _require_dict(
-            run_kv_base.get("mooncake_spec"),
-            "benchmark_config.CONFIG.kv_base.mooncake_spec",
-        )
-        metadata_server = _require_str(
-            run_mooncake_spec.get("metadata_server"),
-            "benchmark_config.CONFIG.kv_base.mooncake_spec.metadata_server",
-        )
-        master_server_address = _require_str(
-            run_mooncake_spec.get("master_server_address"),
-            "benchmark_config.CONFIG.kv_base.mooncake_spec.master_server_address",
-        )
-        metadata_host_port = urllib.parse.urlparse(metadata_server)
-        metadata_port = int(metadata_host_port.port or 0)
-        if metadata_port <= 0:
-            raise ValueError(f"invalid TEST_STACK Mooncake metadata_server port: {metadata_server!r}")
-        if ":" not in master_server_address:
-            raise ValueError(f"invalid TEST_STACK Mooncake master_server_address: {master_server_address!r}")
-        _, rpc_port_s = master_server_address.rsplit(":", 1)
-        rpc_port = int(rpc_port_s)
-        _wait_instance_running(
-            resolved_case,
-            instance_id=TEST_STACK_MOONCAKE_MASTER_INSTANCE_ID,
-            timeout_s=60,
-        )
-        _wait_instance_tcp_ready(
-            resolved_case,
-            instance_id=TEST_STACK_MOONCAKE_MASTER_INSTANCE_ID,
-            host=coord_host,
-            port=rpc_port,
-            timeout_s=coordinator_ready_timeout_seconds,
-        )
-        _wait_instance_tcp_ready(
-            resolved_case,
-            instance_id=TEST_STACK_MOONCAKE_MASTER_INSTANCE_ID,
-            host=coord_host,
-            port=metadata_port,
-            timeout_s=coordinator_ready_timeout_seconds,
-        )
-
-    node_runtime_phase = _require_runtime_phase_by_id(
-        case_plan.prepare_phases,
-        phase_id="node_runtime",
-        ctx="TEST_STACK prepare",
-    )
-    if _test_stack_backend_uses_external_fluxon_kv(backend_kind=backend_kind, mode=mode):
-        if shared_memory_path is None or shared_file_path is None or stack_cluster_name is None:
-            raise ValueError(
-                "internal error: TEST_STACK shared bundle identity is missing after pre-deploy cleanup"
-            )
-        if "master" in set(coordinator_phase.instance_ids):
-            _wait_instance_running(resolved_case, instance_id="master", timeout_s=60)
-        bench = _require_dict(_require_dict(resolved_case.get("scale"), "resolved_case.scale").get("benchmark"), "scale.benchmark")
-        cluster_ready_timeout_seconds = _require_int(
-            bench.get("cluster_ready_timeout_seconds"),
-            "scale.benchmark.cluster_ready_timeout_seconds",
-            min_v=1,
-        )
-        for owner_id in owner_instance_ids:
-            owner_target = _instance_target_name(resolved_case, instance_id=owner_id)
-            shared_bundle_paths = _test_stack_external_owner_shared_bundle_paths(
-                resolved_case,
-                owner_target=owner_target,
-            )
-            _wait_instance_running(resolved_case, instance_id=owner_id, timeout_s=60)
-            _wait_instance_files_present(
-                resolved_case,
-                instance_id=owner_id,
-                paths=shared_bundle_paths,
-                timeout_s=int(cluster_ready_timeout_seconds),
-                ctx="TEST_STACK owner shared bundle",
-            )
-    elif _test_stack_backend_uses_dedicated_kv_owners(backend_kind=backend_kind, mode=mode):
-        for owner_id in owner_instance_ids:
-            _wait_instance_running(resolved_case, instance_id=owner_id, timeout_s=60)
-    _stage_runtime_phase_run_dir(resolved_case, run_dir=run_dir, phase=node_runtime_phase)
-    _ensure_test_stack_runtime_env_ready_for_instance_ids(
-        resolved_case,
-        run_dir=run_dir,
-        instance_ids=node_runtime_phase.instance_ids,
-    )
-    return _PreparedCase(
-        plan=case_plan,
-        test_stack_result_path=Path(
-            _require_str(test_stack_meta.get("result_path"), "test_stack_meta.result_path")
-        ),
-        test_stack_coordinator_addr=coordinator_addr,
-        test_stack_result_timeout_s=_test_stack_result_timeout_seconds(
-            max_benchmark_seconds=int(max_secs),
-            metric_warmup_seconds=float(metric_warmup_seconds),
-        ),
+        case_plan=case_plan,
+        test_stack_meta=test_stack_meta,
+        runtime_tracking=runtime_tracking,
     )
 
 
@@ -3971,49 +3486,16 @@ def _execute_ci_case(
     prepared_case: _PreparedCase,
     runtime_tracking: _CaseRuntimeTracking,
 ) -> _ExecutedCase:
-    ci_runner_exit_timeout_s = _ci_runner_exit_code_timeout_seconds(resolved_case)
-    ci_runner_phase = prepared_case.plan.execute_phases[0]
-    ci_runner_deploy_result = _deploy_runtime_phase(
-        resolved_case,
-        run_dir=run_dir,
-        phase=ci_runner_phase,
-    )
-    _record_ci_apply_id(
-        runtime_tracking.ci_attempted_instance_ids,
-        runtime_tracking.ci_apply_ids,
-        instance_id="ci_runner",
-        deploy_result=ci_runner_deploy_result,
-        ctx="CI ci_runner deploy_result",
-    )
-    _wait_ci_instance_ready(resolved_case, instance_id="ci_runner")
-    rc = _wait_ci_runner_exit_code(
+    return _execute_ci_case_impl(
+        ctx=sys.modules[__name__],
+        planned_case=planned_case,
         resolved_case=resolved_case,
         run_dir=run_dir,
-        timeout_s=ci_runner_exit_timeout_s,
-        baseline_state=_require_ci_runner_exit_code_baseline(
-            prepared_case.ci_runner_exit_code_baseline,
-        ),
-    )
-    outcome = RUN_OUTCOME_SUCCESS if rc == 0 else RUN_OUTCOME_FAILED
-    if outcome == RUN_OUTCOME_SUCCESS and runtime_tracking.ci_apply_ids.get("ci_runner") is not None:
-        _delete_apply_id(
-            resolved_case,
-            apply_id=_require_str(runtime_tracking.ci_apply_ids.get("ci_runner"), "CI ci_runner apply_id"),
-            ctx="CI ci_runner apply",
-        )
-        del runtime_tracking.ci_apply_ids["ci_runner"]
-    summary = _build_ci_summary_yaml(
-        resolved_case,
         run_index=run_index,
-        started_at_unix_s=started_at,
-        finished_at_unix_s=int(time.time()),
-        outcome=outcome,
-        counted=False,
-        ci_out={"rc": rc},
+        started_at=started_at,
+        prepared_case=prepared_case,
+        runtime_tracking=runtime_tracking,
     )
-    for phase in prepared_case.plan.collect_phases:
-        _collect_runtime_phase(resolved_case, run_dir=run_dir, phase=phase)
-    return _ExecutedCase(outcome=outcome, summary=summary)
 
 
 def _execute_test_stack_case(
@@ -4025,81 +3507,15 @@ def _execute_test_stack_case(
     prepared_case: _PreparedCase,
     runtime_tracking: _CaseRuntimeTracking,
 ) -> _ExecutedCase:
-    case_obj = _require_dict(resolved_case.get("case"), "resolved_case.case")
-    case_id = _require_str(case_obj.get("case_id"), "case.case_id")
-
-    # Always return a summary (including FAIL), so every run_dir has a terminal artifact.
-    # This is required for FULL_ONCE resume and for postmortem without log spelunking.
-    outcome = RUN_OUTCOME_FAILED
-    error_detail: Optional[str] = None
-    collect_error_detail: Optional[str] = None
-    result_obj: Optional[Dict[str, Any]] = None
-
-    try:
-        node_phase = prepared_case.plan.execute_phases[0]
-        runtime_tracking.ts_nodes_deploy_attempted = True
-        node_deploy_result = _deploy_runtime_phase(
-            resolved_case,
-            run_dir=run_dir,
-            phase=node_phase,
-        )
-        runtime_tracking.ts_nodes_apply_id = _deploy_result_history_id(
-            node_deploy_result,
-            ctx="TEST_STACK node deploy_result",
-        )
-
-        result_path = _require_test_stack_result_path(prepared_case.test_stack_result_path)
-        timeout_s = _require_test_stack_result_timeout(prepared_case.test_stack_result_timeout_s)
-        result_obj = _wait_and_load_test_stack_benchmark_result_json(
-            resolved_case,
-            result_path,
-            timeout_s=timeout_s,
-            case_id=case_id,
-            writer_instance_id="coordinator",
-        )
-
-        # The result file is a terminal artifact even when the benchmark failed.
-        # Therefore:
-        # - wait for it to become readable/structurally complete (shared-fs races)
-        # - validate once to decide SUCCESS/FAILED deterministically (do not "wait for success")
-        _validate_test_stack_benchmark_result(result_obj, case_id=case_id)
-        outcome = RUN_OUTCOME_SUCCESS
-    except Exception as exc:  # noqa: BLE001
-        error_detail = f"{type(exc).__name__}: {exc}"
-    finally:
-        # Collect is best-effort: benchmark_result.json is the terminal artifact for pass/fail.
-        # If /api/status is flaky (e.g. 502), we still want deterministic case outcome and
-        # keep the collect error visible in summary.yaml.
-        try:
-            for phase in prepared_case.plan.collect_phases:
-                _collect_runtime_phase(resolved_case, run_dir=run_dir, phase=phase)
-        except Exception as exc:  # noqa: BLE001
-            collect_error_detail = f"{type(exc).__name__}: {exc}"
-
-    summary = {
-        "schema_version": SCHEMA_VERSION,
-        "case_id": case_id,
-        "case_key": _require_str(case_obj.get("case_key"), "case.case_key"),
-        "run_index": int(run_index),
-        "outcome": outcome,
-        "counted": False,
-        "timing": {
-            "started_at_unix_s": int(started_at),
-            "finished_at_unix_s": int(time.time()),
-        },
-        "test_stack": {
-            "coordinator_addr": _require_str(
-                prepared_case.test_stack_coordinator_addr,
-                "prepared_case.test_stack_coordinator_addr",
-            ),
-            "completion_signal": "benchmark_result_json",
-            "result_path": str(_require_test_stack_result_path(prepared_case.test_stack_result_path)),
-            "result": result_obj,
-            "error": error_detail,
-            "collect_error": collect_error_detail,
-        },
-    }
-    return _ExecutedCase(outcome=outcome, summary=summary)
+    return _execute_test_stack_case_impl(
+        ctx=sys.modules[__name__],
+        resolved_case=resolved_case,
+        run_dir=run_dir,
+        run_index=run_index,
+        started_at=started_at,
+        prepared_case=prepared_case,
+        runtime_tracking=runtime_tracking,
+    )
 
 
 def _wait_and_load_test_stack_benchmark_result_json(
@@ -4110,52 +3526,14 @@ def _wait_and_load_test_stack_benchmark_result_json(
     case_id: str,
     writer_instance_id: str,
 ) -> Dict[str, Any]:
-    """Wait until benchmark_result.json becomes readable and structurally complete.
-
-    English note:
-    - In the self-host test stack, the benchmark coordinator may run on a remote node and write
-      `benchmark_result.json` only to that host-local staged run_dir.
-    - Therefore the runner must observe the result through the coordinator instance, not only via
-      its own local filesystem view.
-    - Previous runs also observed transient partial reads right after the file appeared.
-    - Keep convergence deterministic:
-      - retry until the JSON parses AND the expected top-level structure exists
-      - do NOT retry waiting for a failed benchmark to "turn into" SUCCESS; validation happens once
-        in the caller and the run is finalized immediately.
-    """
-    deadline = time.time() + float(timeout_s)
-    last_err: Optional[str] = None
-    while True:
-        try:
-            raw = _instance_read_text_if_present(
-                resolved_case,
-                instance_id=writer_instance_id,
-                path=result_path,
-            )
-            if raw is None:
-                raise FileNotFoundError(
-                    f"result file is not present yet: instance_id={writer_instance_id} path={result_path}"
-                )
-            parsed = json.loads(raw)
-            result_obj = _require_dict(parsed, "test_stack.benchmark_result")
-            # Structural checks only (avoid waiting on stable FAIL status).
-            runs = _require_list(result_obj.get("runs"), "benchmark_result.runs")
-            if not runs:
-                raise ValueError("benchmark_result.runs is empty")
-            run0 = _require_dict(runs[0], "benchmark_result.runs[0]")
-            completion = _require_dict(run0.get("completion"), "benchmark_result.runs[0].completion")
-            _ = _require_str(completion.get("status"), "benchmark_result.runs[0].completion.status")
-            if not result_path.exists() or result_path.read_text(encoding="utf-8") != raw:
-                result_path.write_text(raw, encoding="utf-8")
-            return result_obj
-        except Exception as exc:  # noqa: BLE001
-            last_err = f"{type(exc).__name__}: {exc}"
-            if time.time() >= deadline:
-                raise ValueError(
-                    f"benchmark result json did not become readable/valid within timeout: "
-                    f"case_id={case_id} path={result_path} timeout_s={timeout_s} last_err={last_err}"
-                ) from exc
-            time.sleep(0.5)
+    return _wait_and_load_test_stack_benchmark_result_json_impl(
+        ctx=sys.modules[__name__],
+        resolved_case=resolved_case,
+        result_path=result_path,
+        timeout_s=timeout_s,
+        case_id=case_id,
+        writer_instance_id=writer_instance_id,
+    )
 
 
 def _finalize_case_runtime(
@@ -4166,22 +3544,14 @@ def _finalize_case_runtime(
     runtime_tracking: _CaseRuntimeTracking,
     outcome: str,
 ) -> None:
-    if case_plan.case_family == CASE_FAMILY_CI:
-        _finalize_ci_case_runtime(
-            resolved_case,
-            run_dir=run_dir,
-            runtime_tracking=runtime_tracking,
-            outcome=outcome,
-        )
-        return
-    if case_plan.case_family == CASE_FAMILY_BENCH:
-        _finalize_test_stack_case_runtime(
-            resolved_case,
-            runtime_tracking=runtime_tracking,
-            outcome=outcome,
-        )
-        return
-    raise ValueError(f"unsupported case family for finalize_case_runtime: {case_plan.case_family}")
+    _finalize_case_runtime_impl(
+        ctx=sys.modules[__name__],
+        resolved_case=resolved_case,
+        run_dir=run_dir,
+        case_plan=case_plan,
+        runtime_tracking=runtime_tracking,
+        outcome=outcome,
+    )
 
 
 def _finalize_ci_case_runtime(
@@ -4191,57 +3561,12 @@ def _finalize_ci_case_runtime(
     runtime_tracking: _CaseRuntimeTracking,
     outcome: str,
 ) -> None:
-    case = _require_dict(resolved_case.get("case"), "resolved_case.case")
-    run_mode = _require_str(case.get("run_mode"), "resolved_case.case.run_mode")
-    ci_preserved_apply_ids: list[dict[str, str]] = []
-    tracked_apply_entries = _ci_runtime_tracked_apply_entries(runtime_tracking)
-    for entry in tracked_apply_entries:
-        apply_id = _require_str(entry.get("apply_id"), "ci tracked apply entry.apply_id")
-        instance_ids = _require_list(entry.get("instance_ids"), "ci tracked apply entry.instance_ids")
-        if not instance_ids:
-            continue
-        ci_preserved_apply_ids.append(
-            {
-                "instance_id": ",".join(
-                    _require_str(raw_instance_id, "ci tracked apply entry.instance_ids[]")
-                    for raw_instance_id in instance_ids
-                ),
-                "apply_id": apply_id,
-            }
-        )
-    # In FULL_ONCE runs, always teardown to keep the shared test bed clean for the next case.
-    # Debug runs preserve failed runtime for interactive inspection.
-    should_teardown = outcome == RUN_OUTCOME_SUCCESS or run_mode == RUN_MODE_FULL_ONCE
-    if should_teardown:
-        (run_dir / CI_PRESERVED_APPLY_IDS_FILENAME).unlink(missing_ok=True)
-        for entry in reversed(tracked_apply_entries):
-            apply_id = _require_str(entry.get("apply_id"), "ci tracked apply entry.apply_id")
-            instance_ids = _require_list(entry.get("instance_ids"), "ci tracked apply entry.instance_ids")
-            instance_id_text = ",".join(
-                _require_str(raw_instance_id, "ci tracked apply entry.instance_ids[]")
-                for raw_instance_id in instance_ids
-            )
-            _delete_apply_id(
-                resolved_case,
-                apply_id=apply_id,
-                ctx=f"CI {instance_id_text} apply",
-            )
-        _ci_cleanup_runtime(resolved_case, timeout_s=120)
-        return
-    if not ci_preserved_apply_ids:
-        return
-    _write_yaml_file(
-        run_dir / CI_PRESERVED_APPLY_IDS_FILENAME,
-        {
-            "schema_version": CI_PRESERVED_APPLY_IDS_SCHEMA_VERSION,
-            "apply_ids": ci_preserved_apply_ids,
-        },
-    )
-    print(
-        "[CI preserve_runtime] "
-        "case_id="
-        f"{_resolved_case_case_id(resolved_case)} outcome={outcome} apply_ids="
-        + ", ".join(f"{entry['instance_id']}={entry['apply_id']}" for entry in ci_preserved_apply_ids)
+    _finalize_ci_case_runtime_impl(
+        ctx=sys.modules[__name__],
+        resolved_case=resolved_case,
+        run_dir=run_dir,
+        runtime_tracking=runtime_tracking,
+        outcome=outcome,
     )
 
 
@@ -4251,58 +3576,26 @@ def _finalize_test_stack_case_runtime(
     runtime_tracking: _CaseRuntimeTracking,
     outcome: str,
 ) -> None:
-    case = _require_dict(resolved_case.get("case"), "resolved_case.case")
-    run_mode = _require_str(case.get("run_mode"), "resolved_case.case.run_mode")
-    ts_preserved_apply_ids: list[str] = []
-    if runtime_tracking.ts_nodes_deploy_attempted and runtime_tracking.ts_nodes_apply_id is not None:
-        ts_preserved_apply_ids.append(
-            f"nodes={_require_str(runtime_tracking.ts_nodes_apply_id, 'TEST_STACK node apply_id')}"
-        )
-    if runtime_tracking.ts_coord_deploy_attempted and runtime_tracking.ts_coord_apply_id is not None:
-        ts_preserved_apply_ids.append(
-            f"coordinator={_require_str(runtime_tracking.ts_coord_apply_id, 'TEST_STACK coordinator apply_id')}"
-        )
-    # In FULL_ONCE runs, always teardown to keep the shared test bed clean for the next case.
-    # Debug runs preserve failed runtime for interactive inspection.
-    should_teardown = outcome == RUN_OUTCOME_SUCCESS or run_mode == RUN_MODE_FULL_ONCE
-    if should_teardown:
-        if runtime_tracking.ts_nodes_deploy_attempted and runtime_tracking.ts_nodes_apply_id is not None:
-            _delete_apply_id(
-                resolved_case,
-                apply_id=_require_str(runtime_tracking.ts_nodes_apply_id, "TEST_STACK node apply_id"),
-                ctx="TEST_STACK node apply",
-            )
-        if runtime_tracking.ts_coord_deploy_attempted and runtime_tracking.ts_coord_apply_id is not None:
-            _delete_apply_id(
-                resolved_case,
-                apply_id=_require_str(runtime_tracking.ts_coord_apply_id, "TEST_STACK coordinator apply_id"),
-                ctx="TEST_STACK coordinator apply",
-            )
-        return
-    if not ts_preserved_apply_ids:
-        return
-    print(
-        "[TEST_STACK preserve_runtime] "
-        f"case_id={_resolved_case_case_id(resolved_case)} outcome={outcome} apply_ids={', '.join(ts_preserved_apply_ids)}"
+    _finalize_test_stack_case_runtime_impl(
+        ctx=sys.modules[__name__],
+        resolved_case=resolved_case,
+        runtime_tracking=runtime_tracking,
+        outcome=outcome,
     )
 
 
 def _require_ci_runner_exit_code_baseline(
     baseline_state: Optional[_ObservedFileState],
 ) -> Optional[_ObservedFileState]:
-    return baseline_state
+    return _require_ci_runner_exit_code_baseline_impl(baseline_state)
 
 
 def _require_test_stack_result_path(result_path: Optional[Path]) -> Path:
-    if result_path is None:
-        raise ValueError("prepared_case.test_stack_result_path is missing")
-    return result_path
+    return _require_test_stack_result_path_impl(result_path)
 
 
 def _require_test_stack_result_timeout(timeout_s: Optional[int]) -> int:
-    if timeout_s is None or timeout_s < 1:
-        raise ValueError("prepared_case.test_stack_result_timeout_s must be positive")
-    return int(timeout_s)
+    return _require_test_stack_result_timeout_impl(timeout_s)
 
 
 def _test_stack_result_timeout_seconds(
@@ -4310,19 +3603,9 @@ def _test_stack_result_timeout_seconds(
     max_benchmark_seconds: int,
     metric_warmup_seconds: float,
 ) -> int:
-    """Keep runner-side result waiting aligned with coordinator semantics."""
-    if max_benchmark_seconds <= 0:
-        raise ValueError(
-            f"max_benchmark_seconds must be > 0, got: {max_benchmark_seconds}"
-        )
-    if metric_warmup_seconds < 0.0:
-        raise ValueError(
-            f"metric_warmup_seconds must be >= 0, got: {metric_warmup_seconds}"
-        )
-    return int(
-        float(max_benchmark_seconds)
-        + float(metric_warmup_seconds)
-        + 600.0
+    return _test_stack_result_timeout_seconds_impl(
+        max_benchmark_seconds=max_benchmark_seconds,
+        metric_warmup_seconds=metric_warmup_seconds,
     )
 
 
@@ -11776,18 +11059,22 @@ def _cleanup_previous_failed_ci_runtime(
         raw_apply_ids = _require_list(payload.get("apply_ids"), f"{preserved_path}.apply_ids")
         for index, raw in enumerate(raw_apply_ids):
             entry = _require_dict(raw, f"{preserved_path}.apply_ids[{index}]")
-            instance_id = _require_str(entry.get("instance_id"), f"{preserved_path}.apply_ids[{index}].instance_id")
+            instance_ids = _require_list(entry.get("instance_ids"), f"{preserved_path}.apply_ids[{index}].instance_ids")
+            instance_id_text = ",".join(
+                _require_str(raw_instance_id, f"{preserved_path}.apply_ids[{index}].instance_ids[]")
+                for raw_instance_id in instance_ids
+            )
             apply_id = _require_str(entry.get("apply_id"), f"{preserved_path}.apply_ids[{index}].apply_id")
             if apply_id in deleted_apply_ids:
                 continue
             print(
-                f"[CI cleanup_previous_failed_runtime] run_dir={previous_run_dir} instance_id={instance_id} apply_id={apply_id}",
+                f"[CI cleanup_previous_failed_runtime] run_dir={previous_run_dir} instance_ids={instance_id_text} apply_id={apply_id}",
                 flush=True,
             )
             _delete_apply_id(
                 previous_cleanup_case,
                 apply_id=apply_id,
-                ctx=f"CI cleanup previous failed runtime {previous_run_dir.name} {instance_id}",
+                ctx=f"CI cleanup previous failed runtime {previous_run_dir.name} {instance_id_text}",
             )
         preserved_path.unlink(missing_ok=True)
 
@@ -12838,12 +12125,39 @@ def _ci_runtime_wheelhouse_root(*, test_rsc_root: Path) -> Path:
     )
 
 
+def _ci_runtime_python_executable() -> str:
+    return _ci_runtime_python_executable_impl()
+
+
+def _ci_runtime_python_abi(*, venv_python: Path) -> str:
+    return _ci_runtime_python_abi_impl(
+        venv_python=venv_python,
+        normalize_python_abi=_test_stack_normalize_python_abi,
+    )
+
+
+def _assert_ci_runtime_python_abi(*, venv_python: Path) -> None:
+    _assert_ci_runtime_python_abi_impl(
+        venv_python=venv_python,
+        normalize_python_abi=_test_stack_normalize_python_abi,
+    )
+
+
+def _create_ci_runtime_venv(*, run_dir: Path) -> Path:
+    return _create_ci_runtime_venv_impl(
+        run_dir=run_dir,
+        run_subprocess=lambda argv: _run_subprocess(argv, cwd=str(run_dir)),
+        assert_python_abi=lambda venv_python: _assert_ci_runtime_python_abi(venv_python=venv_python),
+    )
+
+
 def _prepare_ci_runtime_python_env(
     *,
     test_rsc_root: Path,
     venv_python: Path,
     src_root: Path,
 ) -> None:
+    _assert_ci_runtime_python_abi(venv_python=venv_python)
     wheelhouse_root = _ci_runtime_wheelhouse_root(test_rsc_root=test_rsc_root)
     if not wheelhouse_root.exists() or not wheelhouse_root.is_dir():
         raise ValueError(

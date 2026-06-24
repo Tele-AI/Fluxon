@@ -38,6 +38,46 @@ _RUNNER = _load_module()
 
 
 class TestTestRunnerTestbedContract(unittest.TestCase):
+    def test_ci_runtime_python_executable_requires_python310_on_path(self) -> None:
+        with mock.patch.object(_RUNNER.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(ValueError, "requires python3.10 on PATH"):
+                _RUNNER._ci_runtime_python_executable()
+
+    def test_create_ci_runtime_venv_uses_python310(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            venv_dir = (run_dir / "venv").resolve()
+            expected_venv_python = (venv_dir / "bin" / "python3").resolve()
+
+            def _fake_create_venv(argv: list[str], *, cwd: str) -> None:
+                self.assertEqual(
+                    argv,
+                    ["/usr/bin/python3.10", "-m", "venv", str(venv_dir)],
+                )
+                self.assertEqual(cwd, str(run_dir))
+                expected_venv_python.parent.mkdir(parents=True, exist_ok=True)
+                expected_venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+
+            with mock.patch.object(_RUNNER.shutil, "which", return_value="/usr/bin/python3.10"):
+                with mock.patch.object(_RUNNER, "_run_subprocess", side_effect=_fake_create_venv) as run_subprocess_mock:
+                    with mock.patch.object(_RUNNER, "_assert_ci_runtime_python_abi") as assert_python_abi:
+                        venv_python = _RUNNER._create_ci_runtime_venv(run_dir=run_dir)
+
+            self.assertEqual(venv_python, expected_venv_python)
+            run_subprocess_mock.assert_called_once()
+            assert_python_abi.assert_called_once_with(venv_python=expected_venv_python)
+
+    def test_assert_ci_runtime_python_abi_accepts_python310_venv(self) -> None:
+        with mock.patch.object(_RUNNER.subprocess, "check_output", return_value="cpython3.10\n") as check_output_mock:
+            _RUNNER._assert_ci_runtime_python_abi(venv_python=Path("/tmp/venv/bin/python3"))
+
+        check_output_mock.assert_called_once()
+
+    def test_assert_ci_runtime_python_abi_rejects_non_python310_venv(self) -> None:
+        with mock.patch.object(_RUNNER.subprocess, "check_output", return_value="cpython3.11\n"):
+            with self.assertRaisesRegex(ValueError, "must match the prepared offline wheelhouse"):
+                _RUNNER._assert_ci_runtime_python_abi(venv_python=Path("/tmp/venv/bin/python3"))
+
     def test_ci_runtime_tracked_apply_entries_groups_shared_apply_id(self) -> None:
         tracking = _RUNNER._CaseRuntimeTracking(
             ci_attempted_instance_ids=["master", "owner_0", "ci_runner"],
@@ -91,6 +131,43 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             )
             cleanup_runtime.assert_called_once_with(resolved_case, timeout_s=120)
 
+    def test_finalize_ci_case_runtime_preserves_structured_instance_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            tracking = _RUNNER._CaseRuntimeTracking(
+                ci_attempted_instance_ids=["master", "owner_0", "ci_runner"],
+                ci_apply_ids={
+                    "master": "apply-cluster",
+                    "owner_0": "apply-cluster",
+                    "ci_runner": "apply-runner",
+                },
+            )
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_DEBUG_ONE_BY_ONE,
+                    "case_id": "ci_top_attention_mq_core__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+                }
+            }
+
+            _RUNNER._finalize_ci_case_runtime(
+                resolved_case,
+                run_dir=run_dir,
+                runtime_tracking=tracking,
+                outcome=_RUNNER.RUN_OUTCOME_FAILED,
+            )
+
+            payload = yaml.safe_load((run_dir / _RUNNER.CI_PRESERVED_APPLY_IDS_FILENAME).read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload,
+                {
+                    "schema_version": _RUNNER.CI_PRESERVED_APPLY_IDS_SCHEMA_VERSION,
+                    "apply_ids": [
+                        {"instance_ids": ["master", "owner_0"], "apply_id": "apply-cluster"},
+                        {"instance_ids": ["ci_runner"], "apply_id": "apply-runner"},
+                    ],
+                },
+            )
+
     def test_write_ci_scene_config_yaml_emits_structured_scene_config(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
@@ -139,16 +216,6 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
     def test_top_attention_ci_execution_plan_is_runner_native(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
-        artifact_sets = suite_cfg.get("artifact_sets")
-        if isinstance(artifact_sets, dict):
-            for artifact_set in artifact_sets.values():
-                if not isinstance(artifact_set, dict):
-                    continue
-                release_artifacts = artifact_set.get("release_artifacts")
-                if isinstance(release_artifacts, dict):
-                    python_wheel = release_artifacts.get("python_wheel")
-                    if isinstance(python_wheel, str) and python_wheel.strip():
-                        artifact_set["release_artifacts"] = {"wheel": python_wheel}
         suite = _RUNNER._parse_suite_config(suite_cfg)
         cases = _RUNNER._expand_cases(suite)
         case = next(item for item in cases if item.scene_id == "ci_top_attention_bin_kvtest" and item.profile_id == "fluxon_tcp")
@@ -159,16 +226,6 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
     def test_top_attention_mq_core_ci_execution_plan_is_runner_native(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
-        artifact_sets = suite_cfg.get("artifact_sets")
-        if isinstance(artifact_sets, dict):
-            for artifact_set in artifact_sets.values():
-                if not isinstance(artifact_set, dict):
-                    continue
-                release_artifacts = artifact_set.get("release_artifacts")
-                if isinstance(release_artifacts, dict):
-                    python_wheel = release_artifacts.get("python_wheel")
-                    if isinstance(python_wheel, str) and python_wheel.strip():
-                        artifact_set["release_artifacts"] = {"wheel": python_wheel}
         suite = _RUNNER._parse_suite_config(suite_cfg)
         cases = _RUNNER._expand_cases(suite)
         case = next(item for item in cases if item.scene_id == "ci_top_attention_mq_core" and item.profile_id == "fluxon_tcp")
@@ -183,16 +240,6 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
     def test_doc_page_ci_execution_plan_uses_online_docker_image(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
-        artifact_sets = suite_cfg.get("artifact_sets")
-        if isinstance(artifact_sets, dict):
-            for artifact_set in artifact_sets.values():
-                if not isinstance(artifact_set, dict):
-                    continue
-                release_artifacts = artifact_set.get("release_artifacts")
-                if isinstance(release_artifacts, dict):
-                    python_wheel = release_artifacts.get("python_wheel")
-                    if isinstance(python_wheel, str) and python_wheel.strip():
-                        artifact_set["release_artifacts"] = {"wheel": python_wheel}
         suite = _RUNNER._parse_suite_config(suite_cfg)
         cases = _RUNNER._expand_cases(suite)
         case = next(item for item in cases if item.scene_id == "ci_top_attention_doc_page_build" and item.profile_id == "fluxon_tcp")
@@ -345,21 +392,22 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
             env = {**os.environ, _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg)}
             with mock.patch.dict(os.environ, env, clear=True):
-                with mock.patch.object(_RUNNER, "_run_subprocess") as run_subprocess_mock:
-                    _RUNNER._ci_prepare_run_inputs(
-                        resolved_case=resolved_case,
-                        source_root=source_root,
-                        release_root=release_root,
-                        test_rsc_root=test_rsc_root,
-                        src_root=src_root,
-                        venv_python=venv_python,
-                        ci_commands=None,
-                        overlay_live_checkout=False,
-                        etcd_address="127.0.0.1:32579",
-                        cluster_name="ci_case_cluster",
-                        shared_memory_path="/tmp/ci_case_cluster/shm",
-                        shared_file_path="/tmp/ci_case_cluster/share",
-                    )
+                with mock.patch.object(_RUNNER, "_assert_ci_runtime_python_abi") as assert_python_abi:
+                    with mock.patch.object(_RUNNER, "_run_subprocess") as run_subprocess_mock:
+                        _RUNNER._ci_prepare_run_inputs(
+                            resolved_case=resolved_case,
+                            source_root=source_root,
+                            release_root=release_root,
+                            test_rsc_root=test_rsc_root,
+                            src_root=src_root,
+                            venv_python=venv_python,
+                            ci_commands=None,
+                            overlay_live_checkout=False,
+                            etcd_address="127.0.0.1:32579",
+                            cluster_name="ci_case_cluster",
+                            shared_memory_path="/tmp/ci_case_cluster/shm",
+                            shared_file_path="/tmp/ci_case_cluster/share",
+                        )
 
             release_view_root = src_root / "fluxon_release"
             self.assertTrue(release_view_root.is_dir())
@@ -381,6 +429,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     "shared_file_path": "/tmp/ci_case_cluster/share",
                 },
             )
+            assert_python_abi.assert_called_once_with(venv_python=venv_python)
             self.assertEqual(run_subprocess_mock.call_count, 2)
             first_call = run_subprocess_mock.call_args_list[0]
             second_call = run_subprocess_mock.call_args_list[1]

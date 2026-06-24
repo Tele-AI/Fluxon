@@ -154,19 +154,6 @@ def test_suite_requires_benchmark_bundle_only_for_bench_cases() -> None:
         return
 
     suite_for_contract = copy.deepcopy(suite_cfg)
-    artifact_sets = suite_for_contract.get("artifact_sets")
-    if not isinstance(artifact_sets, dict):
-        print("FAIL: test_suite_requires_benchmark_bundle_only_for_bench_cases - artifact_sets is not a mapping")
-        return
-    for artifact_set in artifact_sets.values():
-        if not isinstance(artifact_set, dict):
-            continue
-        release_artifacts = artifact_set.get("release_artifacts")
-        if isinstance(release_artifacts, dict):
-            python_wheel = release_artifacts.get("python_wheel")
-            if isinstance(python_wheel, str) and python_wheel.strip():
-                artifact_set["release_artifacts"] = {"wheel": python_wheel}
-
     suite_with_bench = _TEST_RUNNER._parse_suite_config(copy.deepcopy(suite_for_contract))
     resolved_with_bench = _TEST_RUNNER._expand_cases(suite_with_bench)
     if not _TEST_RUNNER._suite_requires_benchmark_bundle(
@@ -212,19 +199,6 @@ def test_ci_top_attention_doc_page_build_uses_online_docker_image() -> None:
         return
 
     suite_for_contract = copy.deepcopy(suite_cfg)
-    artifact_sets = suite_for_contract.get("artifact_sets")
-    if not isinstance(artifact_sets, dict):
-        print("FAIL: test_ci_top_attention_doc_page_build_uses_online_docker_image - artifact_sets is not a mapping")
-        return
-    for artifact_set in artifact_sets.values():
-        if not isinstance(artifact_set, dict):
-            continue
-        release_artifacts = artifact_set.get("release_artifacts")
-        if isinstance(release_artifacts, dict):
-            python_wheel = release_artifacts.get("python_wheel")
-            if isinstance(python_wheel, str) and python_wheel.strip():
-                artifact_set["release_artifacts"] = {"wheel": python_wheel}
-
     suite = _TEST_RUNNER._parse_suite_config(suite_for_contract)
     cases = _TEST_RUNNER._expand_cases(suite)
     case = next(
@@ -272,19 +246,6 @@ def test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime() -> None:
         return
 
     suite_for_contract = copy.deepcopy(suite_cfg)
-    artifact_sets = suite_for_contract.get("artifact_sets")
-    if not isinstance(artifact_sets, dict):
-        print("FAIL: test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime - artifact_sets is not a mapping")
-        return
-    for artifact_set in artifact_sets.values():
-        if not isinstance(artifact_set, dict):
-            continue
-        release_artifacts = artifact_set.get("release_artifacts")
-        if isinstance(release_artifacts, dict):
-            python_wheel = release_artifacts.get("python_wheel")
-            if isinstance(python_wheel, str) and python_wheel.strip():
-                artifact_set["release_artifacts"] = {"wheel": python_wheel}
-
     suite = _TEST_RUNNER._parse_suite_config(suite_for_contract)
     cases = _TEST_RUNNER._expand_cases(suite)
     case = next(

@@ -9,10 +9,11 @@
 **稳定结论：**
 
 - `teststack` 由三层组成：
-  - **suite 编译层**：将 `scene × scale × profile` 组合成可执行 case；
-  - **testbed 编排层**：拉起共享 testbed，保持 controller 在线，并基于 `fluxon_ops` / ops 接口调度部署 workload；
-  - **case 执行层**：处理每个 case 的 prepare、execute、collect、finalize。
+  - **上层：suite 编译层**：将 `scene × scale × profile` 组合成可执行 case；
+  - **中层：统一 case plan / dispatch 层**：把编译结果收敛成统一的 `prepare / execute / collect / finalize` 外壳，并按 runtime backend 分发；
+  - **下层：runtime backend 执行层**：分别承接 `CI` backend 和 `TEST_STACK` backend 的具体 prepare、execute、collect、finalize 实现。
 - `test_runner.py` 是统一执行器，覆盖 `CI` case、`TEST_STACK` benchmark case，以及 UI / GitOps 集成入口。
+- `test_runner.py` 当前主要承载上层和中层；`test_runner_runtime_backend.py` 承载下层 runtime backend 实现。
 - `start_test_bed.py` 只负责共享 testbed 的启动与 controller 侧 apply 编排，不承担通用测试执行职责。
 - `ci_2_virt_node.py` 是 GitHub Actions / 本地双逻辑节点 CI 的封装入口，负责串联打包、dispatch、拉起 testbed、运行 runner、构建文档等步骤。
 
@@ -54,6 +55,46 @@ flowchart TD
     B --> G[run_dir\nresolved_case.yaml\nsummary.yaml\ncase_runs.yaml]
     B --> H[remote executors / benchmark nodes]
     B --> I[test_runner UI + GitOps]
+```
+
+### 4.0 `test_runner` 内部的上中下分层
+
+这里要把“teststack 三层”与“`test_runner` 内部三层”区分开看。
+
+`teststack` 整体上仍然是：
+
+- suite 编译层
+- testbed 编排层
+- case 执行层
+
+但在 `test_runner` 自身内部，当前稳定实现已经进一步分成三层：
+
+| 层级 | 作用 | 当前主要落点 |
+| --- | --- | --- |
+| 上层 | 解析 suite、selector、`scene/scale/profile`，并 materialize `resolved_case` | `test_runner.py` |
+| 中层 | 将不同 case family 收敛成统一 `_CasePlan` 外壳，并负责统一 dispatch | `test_runner.py` |
+| 下层 | 按 runtime backend 执行具体 runtime 逻辑 | `test_runner_runtime_backend.py` |
+
+这里的关键点是：
+
+- **上层统一的是 schema 和 case 编译模型**；
+- **中层统一的是 `prepare / execute / collect / finalize` 的外壳**；
+- **下层不再按 `scene/scale/profile` 切分，而是按 runtime backend 切分**。
+
+这意味着：
+
+- `scene / scale / profile` 仍是一套统一输入模型；
+- `CI` 与 `TEST_STACK` 的差异，主要落在下层 runtime backend，而不是上层 schema。
+
+当前对应关系可以简化理解为：
+
+```text
+scene / scale / profile
+    -> resolved_case
+    -> _CasePlan
+    -> runtime backend dispatch
+       -> CI backend
+       -> TEST_STACK backend
 ```
 
 ### 4.1 suite 编译层
@@ -134,6 +175,25 @@ flowchart TD
 - `case_runs.yaml` 是 suite workdir 下的执行状态单一事实来源；
 - `summary.yaml` 是单次 run_dir 的终态摘要；
 - `resolved_case.yaml` / `resolved_case_full.yaml` 是单次 run 的编译产物。
+
+### 4.4 `test_runner.py` 与 `test_runner_runtime_backend.py` 的边界
+
+当前 repo 内已经开始把 `test_runner` 主体按“统一编译/分发”和“runtime backend 执行”拆开。
+
+稳定边界如下：
+
+| 文件 | 主要职责 | 不负责什么 |
+| --- | --- | --- |
+| `fluxon_test_stack/test_runner.py` | 上层 suite/schema/case 编译；中层 `_CasePlan` 编译与统一 dispatch；runner 入口、workdir 历史、通用 util | 不再直接承载大段 `CI` / `TEST_STACK` backend 细节 |
+| `fluxon_test_stack/test_runner_runtime_backend.py` | 下层 backend 运行逻辑：`_prepare_ci_case`、`_execute_ci_case`、`_prepare_test_stack_case`、`_execute_test_stack_case`、对应 finalize / result wait | 不解析 suite，不决定 `scene × scale × profile` 的组合空间 |
+
+这层拆分的目的不是制造第二套 case 模型，而是把：
+
+- **统一 case schema**
+- **统一 `_CasePlan` 外壳**
+- **不同 runtime backend 实现**
+
+三者分开，避免把所有逻辑继续堆在一个 `test_runner.py` 里。
 
 ## 5. teststack 的公共契约
 
@@ -406,6 +466,12 @@ sequenceDiagram
 ### 8.2 phase 规划
 
 `test_runner.py` 会先把每个 case 编译成 `_CasePlan`。这里有一个通用骨架：所有 case 都分成 `prepare_phases / execute_phases / collect_phases` 三段。不同场景的差异不在“三段结构本身”，而在于每段里放哪些 runtime phase、每个 phase 覆盖哪些 instance，以及 run_dir 怎样 staging。
+
+这里要明确：
+
+- `_CasePlan` 属于中层统一外壳；
+- `CI` 和 `TEST_STACK` 都要先落到 `_CasePlan`；
+- 真正的 backend 差异，延后到下层 runtime backend 才展开。
 
 通用语义如下：
 

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from pathlib import Path
 
-from _common import call, load_case_config_payload, parse_python_passthrough
+from _common import call, load_case_config_payload
 
 
 TEST_REQUIREMENTS = ["etcd", "fluxon-pyo3", "kv-cluster", "ops", "submodules"]
@@ -16,29 +18,23 @@ TEST_PATHS = [
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser(
+        description="Flat index entry for non-Ctrl-C MQ script tests."
+    )
+    parser.add_argument(
+        "--python",
+        default=os.environ.get("PYTHON", sys.executable),
+        help="Python executable used for the delegated command.",
+    )
     parser.add_argument(
         "--case-config",
         help="Canonical CI case config YAML emitted by test_runner.",
     )
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args()
     if args.case_config:
         load_case_config_payload(Path(args.case_config).resolve(), expected_scene_id=SCENE_ID)
-    python, passthrough = parse_python_passthrough("Flat index entry for non-Ctrl-C MQ tests.")
-    filtered_passthrough: list[str] = []
-    idx = 0
-    while idx < len(passthrough):
-        token = passthrough[idx]
-        if token == "--case-config":
-            idx += 2
-            continue
-        if token.startswith("--case-config="):
-            idx += 1
-            continue
-        filtered_passthrough.append(token)
-        idx += 1
     for test_path in TEST_PATHS:
-        rc = call([python, "-u", str((Path(__file__).resolve().parents[2] / test_path)), *filtered_passthrough])
+        rc = call([args.python, "-u", str((Path(__file__).resolve().parents[2] / test_path))])
         if rc != 0:
             return rc
     return 0

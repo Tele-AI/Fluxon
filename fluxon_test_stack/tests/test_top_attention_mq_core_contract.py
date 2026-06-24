@@ -60,17 +60,15 @@ class TestTopAttentionMqCoreContract(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with mock.patch.object(
-                _ENTRY,
-                "parse_python_passthrough",
-                return_value=("/tmp/venv/bin/python3", ["--case-config", str(case_cfg), "-k", "payload"]),
-            ) as parse_python_passthrough:
-                with mock.patch.object(_ENTRY, "call", side_effect=[0, 0]) as call:
-                    with mock.patch.object(sys, "argv", [str(MODULE_PATH), "--case-config", str(case_cfg)]):
-                        rc = _ENTRY.main()
+            with mock.patch.object(_ENTRY, "call", side_effect=[0, 0]) as call:
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [str(MODULE_PATH), "--python", "/tmp/venv/bin/python3", "--case-config", str(case_cfg)],
+                ):
+                    rc = _ENTRY.main()
 
             self.assertEqual(rc, 0)
-            parse_python_passthrough.assert_called_once_with("Flat index entry for non-Ctrl-C MQ tests.")
             self.assertEqual(call.call_count, 2)
             self.assertEqual(
                 call.call_args_list[0].args[0],
@@ -78,8 +76,6 @@ class TestTopAttentionMqCoreContract(unittest.TestCase):
                     "/tmp/venv/bin/python3",
                     "-u",
                     str(REPO_ROOT / "fluxon_py/tests/test_mq/test_capacity_and_auto_clean.py"),
-                    "-k",
-                    "payload",
                 ],
             )
             self.assertEqual(
@@ -88,53 +84,46 @@ class TestTopAttentionMqCoreContract(unittest.TestCase):
                     "/tmp/venv/bin/python3",
                     "-u",
                     str(REPO_ROOT / "fluxon_py/tests/test_mq/test_payload_lease_error.py"),
-                    "-k",
-                    "payload",
                 ],
             )
 
-    def test_main_without_case_config_keeps_passthrough(self) -> None:
-        with mock.patch.object(
-            _ENTRY,
-            "parse_python_passthrough",
-            return_value=("/tmp/venv/bin/python3", ["-q"]),
-        ):
-            with mock.patch.object(_ENTRY, "call", side_effect=[0, 0]) as call:
-                with mock.patch.object(sys, "argv", [str(MODULE_PATH)]):
-                    rc = _ENTRY.main()
+    def test_main_without_case_config_runs_scripts_without_extra_args(self) -> None:
+        with mock.patch.object(_ENTRY, "call", side_effect=[0, 0]) as call:
+            with mock.patch.object(sys, "argv", [str(MODULE_PATH), "--python", "/tmp/venv/bin/python3"]):
+                rc = _ENTRY.main()
 
-            self.assertEqual(
-                call.call_args_list[0].args[0],
-                [
-                    "/tmp/venv/bin/python3",
-                    "-u",
-                    str(REPO_ROOT / "fluxon_py/tests/test_mq/test_capacity_and_auto_clean.py"),
-                    "-q",
-                ],
-            )
-            self.assertEqual(
-                call.call_args_list[1].args[0],
-                [
-                    "/tmp/venv/bin/python3",
-                    "-u",
-                    str(REPO_ROOT / "fluxon_py/tests/test_mq/test_payload_lease_error.py"),
-                    "-q",
-                ],
-            )
-            self.assertEqual(rc, 0)
+        self.assertEqual(
+            call.call_args_list[0].args[0],
+            [
+                "/tmp/venv/bin/python3",
+                "-u",
+                str(REPO_ROOT / "fluxon_py/tests/test_mq/test_capacity_and_auto_clean.py"),
+            ],
+        )
+        self.assertEqual(
+            call.call_args_list[1].args[0],
+            [
+                "/tmp/venv/bin/python3",
+                "-u",
+                str(REPO_ROOT / "fluxon_py/tests/test_mq/test_payload_lease_error.py"),
+            ],
+        )
+        self.assertEqual(rc, 0)
 
     def test_main_returns_first_non_zero_script_exit_code(self) -> None:
-        with mock.patch.object(
-            _ENTRY,
-            "parse_python_passthrough",
-            return_value=("/tmp/venv/bin/python3", []),
-        ):
-            with mock.patch.object(_ENTRY, "call", side_effect=[7]) as call:
-                with mock.patch.object(sys, "argv", [str(MODULE_PATH)]):
-                    rc = _ENTRY.main()
+        with mock.patch.object(_ENTRY, "call", side_effect=[7]) as call:
+            with mock.patch.object(sys, "argv", [str(MODULE_PATH), "--python", "/tmp/venv/bin/python3"]):
+                rc = _ENTRY.main()
 
-            self.assertEqual(rc, 7)
-            self.assertEqual(call.call_count, 1)
+        self.assertEqual(rc, 7)
+        self.assertEqual(call.call_count, 1)
+
+    def test_main_rejects_pytest_style_passthrough_flags(self) -> None:
+        with mock.patch.object(sys, "argv", [str(MODULE_PATH), "--python", "/tmp/venv/bin/python3", "-k", "payload"]):
+            with self.assertRaises(SystemExit) as cm:
+                _ENTRY.main()
+
+        self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":
