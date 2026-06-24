@@ -37,7 +37,11 @@ def main() -> int:
             continue
         filtered_passthrough.append(token)
         idx += 1
-    return call([python, "-m", "pytest", *TEST_PATHS, *filtered_passthrough])
+    for test_path in TEST_PATHS:
+        rc = call([python, "-u", str((Path(__file__).resolve().parents[2] / test_path)), *filtered_passthrough])
+        if rc != 0:
+            return rc
+    return 0
 
 
 if __name__ == "__main__":
