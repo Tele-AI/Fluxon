@@ -85,6 +85,41 @@ def load_case_config_payload(path: str | Path, *, expected_scene_id: str) -> dic
     return raw
 
 
+def _require_scene_runtime_endpoint(scene_runtime: object, *, service_id: str) -> tuple[str, int]:
+    if not isinstance(scene_runtime, dict):
+        raise ValueError("case config scene_runtime must be a mapping")
+    raw_service = scene_runtime.get(service_id)
+    if not isinstance(raw_service, dict):
+        raise ValueError(f"case config scene_runtime.{service_id} must be a mapping")
+    ip = str(raw_service.get("ip") or "").strip()
+    if not ip:
+        raise ValueError(f"case config scene_runtime.{service_id}.ip must be set")
+    port = raw_service.get("port")
+    if not isinstance(port, int):
+        raise ValueError(f"case config scene_runtime.{service_id}.port must be an int")
+    return ip, port
+
+
+def write_build_config_ext(case_cfg_path: str | Path, *, scene_runtime: object) -> Path:
+    cfg_path = Path(case_cfg_path).resolve()
+    etcd_ip, etcd_port = _require_scene_runtime_endpoint(scene_runtime, service_id="etcd")
+    greptime_ip, greptime_port = _require_scene_runtime_endpoint(scene_runtime, service_id="greptime")
+    out_path = cfg_path.parents[1] / "src" / "build_config_ext.yml"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        yaml.safe_dump(
+            {
+                "etcd": f"{etcd_ip}:{etcd_port}",
+                "prom": f"http://{greptime_ip}:{greptime_port}/v1/prometheus",
+                "prom_remote_write_url": f"http://{greptime_ip}:{greptime_port}/v1/prometheus/write",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return out_path
+
+
 def _path_contains_fluxon_pyo3_libs_dir(path: Path) -> bool:
     return "fluxon_pyo3.libs" in path.parts
 

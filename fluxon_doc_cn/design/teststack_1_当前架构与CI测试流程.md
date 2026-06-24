@@ -661,12 +661,17 @@ GitHub Actions 主窗口中的许多日志并非本地直接打印，而是由 `
 - `test_runner.py` 会根据 `scene_id` 做 runner-native dispatch，把 case 转发到：
   - `__RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_bin_kvtest.py --case-config __RUN_DIR__/configs/ci_scene_config.yaml`
   - `__RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_doc_page_build.py --case-config __RUN_DIR__/configs/ci_scene_config.yaml`
+  - `__RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs_core.py`
+  - `__RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_util.py --case-config __RUN_DIR__/configs/ci_scene_config.yaml`
+  - `__RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_kv_unit.py --case-config __RUN_DIR__/configs/ci_scene_config.yaml`
 
 这样做的稳定语义是：
 
 - scene 粒度直接对齐 top-attention index 条目，不再并存第二层 `ci_rust` / `ci_doc_page` 划分；
 - 实际 CI 路径仍由单次 `ci_2_virt_node.py` 调用统一拥有，但它只重写部署目标与 public profile，不再改写 workload 运行语义；
 - GitHub Actions 里定义的 workload 配置会直接写入 suite profile 的 `runtime.ci.scene_configs`，随后由 `test_runner.py` 为每个 case 落一份 `configs/ci_scene_config.yaml`，再交给 `_bin_kvtest.py` / `_doc_page_build.py` 消费；
+- 纯 crate 级 direct-cargo wrapper 可以保持最薄脚本入口，例如 `_cargo_fs_core.py`；
+- 需要 runtime endpoint 或 feature 选择的 wrapper，则统一消费 `scene_config` / `scene_runtime`，例如 `_bin_kvtest.py`、`_cargo_util.py`、`_cargo_kv_unit.py`；
 - `_bin_kvtest.py` 继续保持 thin wrapper，只负责把参数转发到 `cargo run --bin kv_test`，并补齐 active venv 的 native runtime lib 搜索路径。
 
 因此，GitHub Actions 现在覆盖的是“由单一 `ci_2_virt_node.py` 入口启动，并通过 top-attention CI scene 执行 workload”这条真实 CI 路径，而不是在 suite 里再并存一层旧 scene。

@@ -401,6 +401,9 @@ def _runner_native_ci_scene_ids() -> Tuple[str, ...]:
     return (
         "ci_top_attention_doc_page_build",
         "ci_top_attention_bin_kvtest",
+        "ci_top_attention_cargo_fs_core",
+        "ci_top_attention_cargo_util",
+        "ci_top_attention_cargo_kv_unit",
         "ci_top_attention_mq_core",
     )
 
@@ -7022,6 +7025,41 @@ def _runner_native_ci_commands_for_case(case: _ResolvedCase, *, ctx: str) -> Lis
                 "command": (
                     "__RUN_DIR__/venv/bin/python3 -u "
                     "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_bin_kvtest.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_fs_core":
+        return [
+            {
+                "id": "top_attention_cargo_fs_core",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs_core.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_util":
+        return [
+            {
+                "id": "top_attention_cargo_util",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_util.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_kv_unit":
+        return [
+            {
+                "id": "top_attention_cargo_kv_unit",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_kv_unit.py "
                     "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
                 ),
                 "timeout_seconds": 21600,

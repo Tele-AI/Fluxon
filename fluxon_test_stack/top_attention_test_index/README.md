@@ -48,9 +48,9 @@ Entries:
 - `_test_stack_contract.py`: test-stack runner contract coverage
 - `_deployment_codegen.py`: deployment code generation coverage
 - `_script_tools.py`: script utility coverage
-- `_cargo_fs_core.py`: cargo tests for the Rust FS core crate
-- `_cargo_util.py`: cargo tests for the Rust util crate
-- `_cargo_kv_unit.py`: cargo tests for the Rust KV crate
+- `_cargo_fs_core.py`: cargo tests for the Rust FS core crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_fs_core` runner-native scene.
+- `_cargo_util.py`: cargo tests for the Rust util crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_util` runner-native scene, with runtime endpoints supplied through canonical `--case-config`.
+- `_cargo_kv_unit.py`: cargo tests for the Rust KV crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_kv_unit` runner-native scene, with transport feature selection bounded by `scene_config.kv_transport_feature`.
 
 Operational note:
 

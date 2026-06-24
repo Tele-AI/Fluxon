@@ -28,6 +28,7 @@ _ENTRY = _load_module()
 
 class TestCi2VirtNodeContract(unittest.TestCase):
     _KVTEST_SCENE_ID = "ci_top_attention_bin_kvtest"
+    _CARGO_KV_UNIT_SCENE_ID = "ci_top_attention_cargo_kv_unit"
     _DOC_SCENE_ID = "ci_top_attention_doc_page_build"
     _MQ_SCENE_ID = "ci_top_attention_mq_core"
 
@@ -167,6 +168,25 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 "kv_test_rounds"
             ],
             "p2p_only",
+        )
+
+    def test_generated_suite_injects_public_transport_feature_for_cargo_kv_unit(self) -> None:
+        suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
+        generated = _ENTRY._rewrite_suite_for_local_dual_nodes(
+            suite_cfg=suite_cfg,
+            scene_ids=[self._CARGO_KV_UNIT_SCENE_ID],
+            primary_node_name="local-node-a",
+            secondary_node_name="local-node-b",
+            host_ip="10.1.1.119",
+            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            controller_port=19080,
+        )
+
+        self.assertEqual(
+            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["scene_configs"][self._CARGO_KV_UNIT_SCENE_ID][
+                "kv_transport_feature"
+            ],
+            "tcp_thread_transport",
         )
 
     def test_generated_suite_supports_doc_page_ci_scene(self) -> None:
