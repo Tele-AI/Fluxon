@@ -27,7 +27,12 @@ fn read_etcd() -> String {
         .expect("read etcd endpoint from build_config_ext.yml")
 }
 
-fn new_master_config(instance_key: &str, port: u16, cluster: &str, etcd: &str) -> MasterConfig {
+fn new_master_config(
+    instance_key: &str,
+    port: Option<u16>,
+    cluster: &str,
+    etcd: &str,
+) -> MasterConfig {
     let prometheus_base_url = fluxon_util::dev_config::load_tsdb_base_url()
         .expect("read prometheus_base_url from build_config_ext.yml (key: prom)");
     let prom_remote_write_url =
@@ -36,7 +41,7 @@ fn new_master_config(instance_key: &str, port: u16, cluster: &str, etcd: &str) -
     MasterConfig {
         instance_key: instance_key.to_string(),
         cluster_name: cluster.to_string(),
-        port: Some(port),
+        port,
         etcd_endpoints: vec![etcd.to_string()],
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
@@ -92,8 +97,10 @@ fn new_client_config_with_size(
             enable_transfer_rpc_fast_path: true,
             sub_cluster: None,
         },
-        shared_memory_path: format!("/tmp/kvcache_shared_memory/{}", instance_key),
-        shared_file_path: format!("/tmp/kvcache_shared_files/{}", instance_key),
+        share_mem_path: format!("/tmp/kvcache_shared_memory/{}", instance_key),
+        large_file_paths: crate::config::LargeFilePaths {
+            paths: vec![format!("/tmp/kvcache_large/{}", instance_key)],
+        },
         test_spec_config: TestSpecConfig::default(),
     }
 }
@@ -125,8 +132,8 @@ fn new_zero_contribution_client_config(
             enable_transfer_rpc_fast_path: false,
             sub_cluster: None,
         },
-        shared_memory_path: format!("/tmp/kvcache_shared_memory/{}", owner_instance_key),
-        shared_file_path: format!("/tmp/kvcache_shared_files/{}", owner_instance_key),
+        share_mem_path: format!("/tmp/kvcache_shared_memory/{}", owner_instance_key),
+        large_file_paths: crate::config::LargeFilePaths { paths: Vec::new() },
         test_spec_config: TestSpecConfig::default(),
     }
 }
@@ -255,7 +262,7 @@ pub mod test_memholder {
         );
         let (master, _) = run_master(ConfigArg::Config(new_master_config(
             "mh_master",
-            50090,
+            None,
             &cluster,
             &etcd,
         )))
@@ -406,7 +413,7 @@ pub mod test_memholder {
         let cluster = unique_cluster_name("test_cluster_memholder_pin");
         let (master, _) = run_master(ConfigArg::Config(new_master_config(
             "pin_master",
-            50100,
+            None,
             &cluster,
             &etcd,
         )))
@@ -415,7 +422,7 @@ pub mod test_memholder {
         sleep(Duration::from_secs(2)).await;
 
         let owner_name = "pin_owner";
-        // 第二个 owner 必须使用不同的 member key（也会带来不同的 shared_memory_path）
+        // 第二个 owner 必须使用不同的 member key（也会带来不同的 share_mem_path）
         let owner2_name = "pin_owner2";
         let (owner, _) = run_client(ConfigArg::Config(new_client_config_with_size(
             owner_name,

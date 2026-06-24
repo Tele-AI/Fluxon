@@ -24,24 +24,24 @@ resources:
     publish_tags: [master, owner, external]
     published_by: ClusterManager.step.1.init2
     doc: |
-      - ClusterManager: member watch 已建立(具备持续观测能力)
-      - 提供: ClusterManager.listen() 可持续消费 ClusterEvent
+      - ClusterManager: member watch is established and continuous observation is available
+      - Provides: `ClusterManager.listen()` can continuously consume `ClusterEvent`
 
   - id: owner_shared_mem_bundle_ready
     tags: [external]
     publish_tags: []
     published_by: ExternalClientApi.step.1.prepare
     doc: |
-      - external: 等 shared.json+mmap.file -> mmap -> 等 owner member 可观测
-      - owner: shared.json 由 owner 的 segment registration 流程写入(不在 init DAG 内显式建模)
+      - external: wait until owner `shared.json` is readable and passes metadata validation, then wait for `mmap.file` -> mmap -> owner member observability
+      - owner: `shared.json` is written by the owner's segment-registration flow and is not modeled explicitly inside the init DAG
 
   - id: prom_remote_write_wait_ready
     tags: [owner, external]
     publish_tags: [master]
     published_by: MetricReporter.step.1.prepare
     doc: |
-      - master: 发布 prom remote_write urls(通过 cluster member state)
-      - owner/external: 等待直到可观测到 master prom remote_write urls(best-effort)
+      - master: publish Prometheus remote_write URLs through cluster member state
+      - owner/external: wait until the master's remote_write URLs become observable, best-effort
 
 # Init-step DAG source of truth.
 #
@@ -73,9 +73,9 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - 构造: ClusterManager(无PostView)
-      - 写 local_state: 保存连接参数/分配本地缓存；若提供 local_ipc_root，则在此处规范化后预填到 self member metadata(不启动任务)
-      - 依赖: 无
+      - Construct `ClusterManager` with no PostView
+      - Write local state: persist connection args and allocate local caches; if `local_ipc_root` is provided, normalize it here and prefill it into self-member metadata without starting tasks
+      - Depends on: none
     exec:
       kind: Construct
       call: "ClusterManager::construct"
@@ -87,9 +87,9 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - 构造: P2pModule(无PostView)
-      - 写 local_state: 分配 P2P 状态/缓存(不启动 transport)
-      - 依赖: 无
+      - Construct `P2pModule` with no PostView
+      - Write local state: allocate P2P state and caches without starting transport
+      - Depends on: none
     exec:
       kind: Construct
       call: "P2pModule::construct"
@@ -101,9 +101,9 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - 构造: MasterSegManager(无PostView)
-      - 写 local_state: 分配段管理器状态(不注册RPC)
-      - 依赖: 无
+      - Construct `MasterSegManager` with no PostView
+      - Write local state: allocate segment-manager state without registering RPCs
+      - Depends on: none
     exec:
       kind: Construct
       call: "MasterSegManager::construct"
@@ -115,9 +115,9 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - 构造: MasterKvRouter(无PostView)
-      - 写 local_state: 分配策略/缓存/通道(不注册RPC/不启动任务)
-      - 依赖: 无
+      - Construct `MasterKvRouter` with no PostView
+      - Write local state: allocate policy state, caches, and channels without registering RPCs or starting tasks
+      - Depends on: none
     exec:
       kind: Construct
       call: "MasterKvRouter::construct"
@@ -129,9 +129,9 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - 构造: MetricReporter(无PostView)
-      - 写 local_state: 准备 registry/缓冲区(不启动 loop)
-      - 依赖: 无
+      - Construct `MetricReporter` with no PostView
+      - Write local state: prepare registries and buffers without starting loops
+      - Depends on: none
     exec:
       kind: Construct
       call: "MetricReporter::construct"
@@ -143,9 +143,9 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - 构造: ClientKvApi(无PostView)
-      - 写 local_state: 分配 API 状态(不注册RPC)
-      - 依赖: 无
+      - Construct `ClientKvApi` with no PostView
+      - Write local state: allocate API state without registering RPCs
+      - Depends on: none
     exec:
       kind: Construct
       call: "ClientKvApi::construct"
@@ -157,9 +157,9 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - 构造: ClientSegPool(无PostView)
-      - 写 local_state: 准备共享内存相关状态(不写 cluster)
-      - 依赖: 无
+      - Construct `ClientSegPool` with no PostView
+      - Write local state: prepare shared-memory-related state without publishing cluster state
+      - Depends on: none
     exec:
       kind: Construct
       call: "ClientSegPool::construct"
@@ -171,9 +171,9 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - 构造: ClientTransferEngine(无PostView)
-      - 写 local_state: 准备 engine 状态(不启动后端)
-      - 依赖: 无
+      - Construct `ClientTransferEngine` with no PostView
+      - Write local state: prepare engine state without starting the backend
+      - Depends on: none
     exec:
       kind: Construct
       call: "ClientTransferEngine::construct"
@@ -185,9 +185,9 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - 构造: ExternalClientApi(无PostView)
-      - 写 local_state: 准备 external 状态(不做 owner discovery)
-      - 依赖: 无
+      - Construct `ExternalClientApi` with no PostView
+      - Write local state: prepare external-client state without doing owner discovery
+      - Depends on: none
     exec:
       kind: Construct
       call: "ExternalClientApi::construct"
@@ -199,9 +199,9 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - 构造: MasterLeaseManager(无PostView)
-      - 写 local_state: 分配 lease 表/cleanup 状态(不注册RPC)
-      - 依赖: 无
+      - Construct `MasterLeaseManager` with no PostView
+      - Write local state: allocate lease-table and cleanup state without registering RPCs
+      - Depends on: none
     exec:
       kind: Construct
       call: "MasterLeaseManager::construct"
@@ -213,9 +213,9 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - 加入: etcd cluster(lease + self member)
-      - 启动: watch members/metadata + event broadcast
-      - 产出: cluster_state 可读写 + cluster_event
+      - Join the etcd cluster with lease and self member registration
+      - Start member and metadata watches plus event broadcast
+      - Produces readable and writable `cluster_state` plus `cluster_event`
     exec:
       kind: Call
       call: "ClusterManager::init2_for_init_dag"
@@ -227,9 +227,9 @@ steps:
     deps:
       - res:cluster_member_watch_ready
     doc: |
-      - 启动: P2P transport + rpc core
-      - 启动: cluster_event listener
-      - 依赖: res:cluster_member_watch_ready(读成员变化)
+      - Start P2P transport and the RPC core
+      - Start the `cluster_event` listener
+      - Depends on: `res:cluster_member_watch_ready` to observe membership changes
     exec:
       kind: Call
       call: "P2pModule::init2_for_init_dag"
@@ -241,8 +241,8 @@ steps:
     deps:
       - P2pModule.step.1.init2
     doc: |
-      - 注册: seg RPC handler/caller
-      - 依赖: P2pModule.step.1.init2(rpc transport)
+      - Register segment RPC handlers and callers
+      - Depends on: `P2pModule.step.1.init2` for RPC transport
     exec:
       kind: Call
       call: "MasterSegManager::init2_for_init_dag"
@@ -255,9 +255,9 @@ steps:
       - ClusterManager.step.1.init2
       - P2pModule.step.1.init2
     doc: |
-      - 注册: master KV RPC handler/caller
-      - 启动: router tasks(delete broadcast + cluster listener)
-      - 依赖: ClusterManager.step.1.init2(监听成员) + P2pModule.step.1.init2(rpc)
+      - Register master KV RPC handlers and callers
+      - Start router tasks such as delete broadcast and cluster listener
+      - Depends on: `ClusterManager.step.1.init2` for membership observation and `P2pModule.step.1.init2` for RPC
     exec:
       kind: Call
       call: "MasterKvRouter::init2_for_init_dag"
@@ -269,9 +269,9 @@ steps:
     deps:
       - ClusterManager.step.1.init2
     doc: |
-      - 启动: monitoring config watcher(异步更新 monitoring_config)
-      - 注册: prom remote_write proxy RPC caller/handler
-      - 依赖: ClusterManager.step.1.init2(读广播)
+      - Start the monitoring-config watcher that updates `monitoring_config` asynchronously
+      - Register Prometheus remote_write proxy RPC handlers and callers
+      - Depends on: `ClusterManager.step.1.init2` to read broadcasts
     exec:
       kind: Call
       call: "MetricReporter::init2_prepare"
@@ -283,8 +283,8 @@ steps:
     deps:
       - res:prom_remote_write_wait_ready
     doc: |
-      - 启动: metric_reporter_loop
-      - 依赖: res:prom_remote_write_wait_ready(内部包含 publish/wait 逻辑) + 本模块 step.1(隐式顺序)
+      - Start `metric_reporter_loop`
+      - Depends on: `res:prom_remote_write_wait_ready`, which includes the internal publish-and-wait logic, plus the implicit ordering after this module's step 1
     exec:
       kind: Call
       call: "MetricReporter::init2_after_prom_remote_write_wait"
@@ -297,9 +297,9 @@ steps:
       - ClusterManager.step.1.init2
       - P2pModule.step.1.init2
     doc: |
-      - 注册: KV API RPC handler/caller
-      - 启动: client_cluster_listener
-      - 依赖: ClusterManager.step.1.init2(读cluster) + P2pModule.step.1.init2(rpc)
+      - Register KV API RPC handlers and callers
+      - Start `client_cluster_listener`
+      - Depends on: `ClusterManager.step.1.init2` to read cluster state and `P2pModule.step.1.init2` for RPC
     exec:
       kind: Call
       call: "ClientKvApi::init2_for_init_dag"
@@ -312,9 +312,9 @@ steps:
       - ClusterManager.step.1.init2
       - P2pModule.step.1.init2
     doc: |
-      - 注册: RequestSegmentRegistration RPC handler
-      - 写 cluster_state: share_group_binding(owner_id + owner_start_time)
-      - 依赖: ClusterManager.step.1.init2(写cluster) + P2pModule.step.1.init2(rpc)
+      - Register the `RequestSegmentRegistration` RPC handler
+      - Write cluster state: publish `share_group_binding(owner_id + owner_start_time)`
+      - Depends on: `ClusterManager.step.1.init2` to write cluster state and `P2pModule.step.1.init2` for RPC
     exec:
       kind: Call
       call: "ClientSegPool::init2_for_init_dag"
@@ -327,9 +327,9 @@ steps:
       - ClusterManager.step.1.init2
       - P2pModule.step.1.init2
     doc: |
-      - 等待: accessible_ip_ready(node_start_time)
-      - 构建: transfer engine backend + p2p transfer rpc
-      - 依赖: ClusterManager.step.1.init2(等ip/监听成员) + P2pModule.step.1.init2(rpc)
+      - Wait for `accessible_ip_ready(node_start_time)`
+      - Build the transfer-engine backend plus P2P transfer RPC
+      - Depends on: `ClusterManager.step.1.init2` to wait for IP visibility and observe members, and `P2pModule.step.1.init2` for RPC
     exec:
       kind: Call
       call: "ClientTransferEngine::init2_for_init_dag"
@@ -342,8 +342,8 @@ steps:
       - ClusterManager.step.1.init2
       - P2pModule.step.1.init2
     doc: |
-      - 准备: ExternalClientApi init(不等待 owner)
-      - 依赖: ClusterManager.step.1.init2(成员/广播) + P2pModule.step.1.init2(rpc)
+      - Prepare `ExternalClientApi` initialization without waiting for the owner
+      - Depends on: `ClusterManager.step.1.init2` for members and broadcasts, and `P2pModule.step.1.init2` for RPC
     exec:
       kind: Call
       call: "ExternalClientApi::init2_prepare"
@@ -355,8 +355,8 @@ steps:
     deps:
       - res:owner_shared_mem_bundle_ready
     doc: |
-      - external: 完成 owner generation / sub_cluster 绑定 + 注册 RPC
-      - 依赖: res:owner_shared_mem_bundle_ready + 本模块 step.1(隐式顺序)
+      - external: finish owner-generation and sub-cluster binding, then register RPCs
+      - Depends on: `res:owner_shared_mem_bundle_ready` plus the implicit ordering after this module's step 1
     exec:
       kind: Call
       call: "ExternalClientApi::init2_after_owner_shared_mem_bundle_ready"
@@ -368,9 +368,9 @@ steps:
     deps:
       - P2pModule.step.1.init2
     doc: |
-      - 注册: lease RPC
-      - 启动: cleanup loop
-      - 依赖: P2pModule.step.1.init2(rpc)
+      - Register lease RPCs
+      - Start the cleanup loop
+      - Depends on: `P2pModule.step.1.init2` for RPC
     exec:
       kind: Call
       call: "MasterLeaseManager::init2_for_init_dag"
@@ -381,8 +381,8 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - 注册: 额外 RPC(route-probe/user-rpc)
-      - 依赖: 本模块 step.1 已完成(隐式顺序)
+      - Register extra RPCs such as route-probe and user-rpc
+      - Depends on: the implicit ordering after this module's step 1
     exec:
       kind: Call
       call: "P2pModule::init3_for_init_dag"
@@ -394,9 +394,9 @@ steps:
     deps:
       - ClientTransferEngine.step.1.init2
     doc: |
-      - 调用 transfer_engine: register segments + open_self_segment
-      - 写 cluster_state: publish transfer_ready
-      - 依赖: ClientTransferEngine.step.1.init2(engine ready)
+      - Call the transfer engine to register segments and open the self segment
+      - Write cluster state: publish `transfer_ready`
+      - Depends on: `ClientTransferEngine.step.1.init2` with the engine ready
     exec:
       kind: Call
       call: "ClientSegPool::init3_for_init_dag"

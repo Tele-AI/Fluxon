@@ -67,7 +67,6 @@ from fluxon_py.tests.test_lib import (  # noqa: E402
     MOONCAKE_MASTER_SERVER_ADDRESS,
     MOONCAKE_METADATA_SERVER,
     load_test_fluxon_cluster_name,
-    load_test_fluxon_share_file_path,
     load_test_fluxon_share_mem_path,
     new_test_consumer,
     new_test_producer,
@@ -898,8 +897,7 @@ def _new_store_config(*, instance_key: str, backend_type: str) -> FluxonKvClient
     if backend_type == KvClientType.FLUXON.value:
         fluxon_spec: dict[str, Any] = {
             "cluster_name": load_test_fluxon_cluster_name(),
-            "shared_memory_path": load_test_fluxon_share_mem_path(),
-            "shared_file_path": load_test_fluxon_share_file_path(),
+            "share_mem_path": load_test_fluxon_share_mem_path(),
         }
         return FluxonKvClientConfig(
             {

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVICE={{SERVICE_ASSIGN}}
+NAME_PREFIX={{NAME_PREFIX_ASSIGN}}
+{{ALLOWED_NODES_BLOCK}}{{HOST_PRELUDE}}{{COMMON_NODE_RESOLUTION_TAIL}}{{SELECTION_SUPERVISOR_PATH_BLOCK}}SUPERVISOR_LABEL={{SUPERVISOR_LABEL_ASSIGN}}
+# English note:
+# - Generated bare stop is retained as a manual operator tool.
+# - Automation must not depend on this path for handover or rollout convergence.
+# - The command only asks the shared selection supervisor to retire the concrete selection
+#   identity identified by label on this node.
+if ! python3 "$SELECTION_SUPERVISOR" stop --label "$SUPERVISOR_LABEL" --scope-key "$HOSTWORKDIR" --missing-ok >/dev/null; then
+  echo "[bare] stop failed svc=$SERVICE label=$SUPERVISOR_LABEL hostworkdir=$HOSTWORKDIR"
+  exit 1
+fi

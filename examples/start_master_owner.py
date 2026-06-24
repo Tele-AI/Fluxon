@@ -14,8 +14,7 @@ ETCD_ENDPOINT = "127.0.0.1:2379"
 GREPTIME_HTTP_PORT = 34030
 GREPTIME_BASE_URL = f"http://127.0.0.1:{GREPTIME_HTTP_PORT}"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARED_MEMORY_PATH = Path("/dev/shm/fluxon_kv_demo").resolve()
-SHARED_FILE_PATH = Path("/tmp/fluxon_kv_demo/shared").resolve()
+SHARE_MEM_PATH = Path("/dev/shm/fluxon_kv_demo").resolve()
 WORKDIR = Path("/tmp/fluxon_kv_demo/runtime").resolve()
 MASTER_PORT = 31000
 MASTER_INSTANCE_KEY = "demo_kv_master"
@@ -23,9 +22,12 @@ OWNER_INSTANCE_KEY = "demo_kv_owner"
 OWNER_DRAM_BYTES = 1073741824
 
 
+def build_owner_large_file_paths() -> list[str]:
+    return [str((WORKDIR / "large" / "owner").resolve())]
+
+
 def main() -> None:
     args = parse_args()
-    SHARED_FILE_PATH.mkdir(parents=True, exist_ok=True)
     log_dir = (WORKDIR / "log").resolve()
 
     if args.with_master:
@@ -60,8 +62,7 @@ def main() -> None:
         )
     )
 
-    print(f"[fluxon_kv] shared memory path: {SHARED_MEMORY_PATH}")
-    print(f"[fluxon_kv] shared file path: {SHARED_FILE_PATH}")
+    print(f"[fluxon_kv] share_mem_path: {SHARE_MEM_PATH}")
     print(f"[fluxon_kv] etcd endpoint: {ETCD_ENDPOINT}")
     print(f"[fluxon_kv] greptime base url: {GREPTIME_BASE_URL}")
     print(f"[fluxon_kv] start master in this script: {args.with_master}")
@@ -124,9 +125,9 @@ def build_owner_config() -> dict:
         "fluxonkv_spec": {
             "etcd_addresses": [ETCD_ENDPOINT],
             "cluster_name": CLUSTER_NAME,
-            "shared_memory_path": str(SHARED_MEMORY_PATH),
-            "shared_file_path": str(SHARED_FILE_PATH),
+            "share_mem_path": str(SHARE_MEM_PATH),
             "sub_cluster": "default",
+            "large_file_paths": build_owner_large_file_paths(),
         },
     }
 

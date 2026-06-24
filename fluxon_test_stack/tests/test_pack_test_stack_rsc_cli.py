@@ -261,14 +261,10 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 "scripts/_build_doc_site_in_container_inner.py",
                 "fluxon_doc_cn/roadmap.md",
                 "README.md",
-                "fluxon_release/install.py",
-                ".dever/run.log",
-                "skills/demo/SKILL.md",
             ):
                 path = repo_root / relpath
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("x\n", encoding="utf-8")
-
             raw = b"\0".join(
                 [
                     b"scripts/_build_doc_site_in_container_inner.py",
@@ -308,6 +304,18 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 path = repo_root / relpath
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("x\n", encoding="utf-8")
+            (repo_root / ".gitignore").write_text(
+                "\n".join(
+                    [
+                        "fluxon_release/*",
+                        "!fluxon_release/install.py",
+                        ".dever",
+                        "skills/",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
             raw = b"\0".join(
                 [
@@ -320,13 +328,20 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 ]
             ) + b"\0"
 
-            with mock.patch.object(_PACK.subprocess, "check_output", return_value=raw):
+            with mock.patch.object(
+                _PACK.collect_source_profile_relpaths.__globals__["git_source_selection_utils"].subprocess,
+                "check_output",
+                return_value=raw,
+            ):
                 relpaths = _PACK._collect_ci_source_relpaths(repo_root=repo_root)
 
             self.assertEqual(
                 relpaths,
                 ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/_build_doc_site_in_container_inner.py"],
             )
+            self.assertNotIn("fluxon_release/install.py", relpaths)
+            self.assertNotIn(".dever/run.log", relpaths)
+            self.assertNotIn("skills/demo/SKILL.md", relpaths)
 
     def test_collect_ci_source_relpaths_includes_rather_no_git_submodule_sources(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -357,7 +372,11 @@ class TestPackTestStackRscCli(unittest.TestCase):
                     return b"Cargo.toml\0src/lib.rs\0"
                 raise AssertionError(f"unexpected git ls-files cwd: {cwd_path}")
 
-            with mock.patch.object(_PACK.subprocess, "check_output", side_effect=fake_check_output):
+            with mock.patch.object(
+                _PACK.collect_source_profile_relpaths.__globals__["git_source_selection_utils"].subprocess,
+                "check_output",
+                side_effect=fake_check_output,
+            ):
                 relpaths = _PACK._collect_ci_source_relpaths(repo_root=repo_root)
 
             self.assertEqual(
@@ -404,13 +423,13 @@ class TestPackTestStackRscCli(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    _PACK,
-                    "_collect_git_listed_source_relpaths",
+                    _PACK.collect_source_profile_relpaths.__globals__["git_source_selection_utils"],
+                    "collect_git_listed_source_relpaths",
                     return_value=["scripts/_build_doc_site_in_container_inner.py"],
                 ),
                 self.assertRaisesRegex(
                     RuntimeError,
-                    "requires configured rather_no_git_submodule path to exist",
+                    "CI source pack requires configured rather_no_git_submodule path to exist",
                 ),
             ):
                 _PACK._collect_ci_source_relpaths(repo_root=repo_root)
@@ -441,6 +460,54 @@ class TestPackTestStackRscCli(unittest.TestCase):
             self.assertTrue(digest)
             digest_roots = digest_mock.call_args.args[0]
             self.assertEqual(digest_roots, [tracked.resolve()])
+
+    def test_prune_stage_paths_applies_glob_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stage_root = Path(tmpdir)
+            keep_path = stage_root / "keep.txt"
+            pyc_path = stage_root / "pkg" / "drop.pyc"
+            baseline_file = stage_root / "baselines" / "manifest.txt"
+            pyc_path.parent.mkdir(parents=True, exist_ok=True)
+            baseline_file.parent.mkdir(parents=True, exist_ok=True)
+            keep_path.write_text("keep\n", encoding="utf-8")
+            pyc_path.write_text("drop\n", encoding="utf-8")
+            baseline_file.write_text("drop\n", encoding="utf-8")
+
+            _PACK.script_utils.prune_stage_paths(
+                stage_root,
+                ("*.pyc", "baselines/"),
+            )
+
+            self.assertTrue(keep_path.exists())
+            self.assertFalse(pyc_path.exists())
+            self.assertFalse(baseline_file.exists())
+
+    def test_shared_rsync_stage_accepts_exclude_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            src = repo_root / "src"
+            dst = repo_root / "dst"
+            (src / "keep").mkdir(parents=True, exist_ok=True)
+            (src / "drop").mkdir(parents=True, exist_ok=True)
+            (src / "keep" / "a.txt").write_text("keep\n", encoding="utf-8")
+            (src / "drop" / "b.txt").write_text("drop\n", encoding="utf-8")
+
+            run_mock = mock.Mock()
+            with mock.patch.dict(
+                _PACK.script_utils.rsync_stage.__globals__,
+                {"run_cmd_argv": run_mock},
+            ):
+                _PACK.script_utils.rsync_stage(
+                    repo_root=repo_root,
+                    src=src,
+                    dst=dst,
+                    honor_gitignore=False,
+                    exclude_rel_paths=("drop/", "*.tmp"),
+                )
+
+            argv = run_mock.call_args.args[0]
+            self.assertIn("--exclude=drop/", argv)
+            self.assertIn("--exclude=*.tmp", argv)
 
 
 if __name__ == "__main__":

@@ -97,10 +97,9 @@ def _build_store_config(*, config_path: Path, workdir: Path) -> FluxonKvClientCo
     producer_cfg = dict(loaded["mpmc_demo"]["producer"])
     kvexternal_cfg["instance_key"] = str(producer_cfg["instance_key"])
     spec = dict(kvexternal_cfg["fluxonkv_spec"])
-    for field_name in ("shared_memory_path", "shared_file_path"):
-        raw_path = spec.get(field_name)
-        if isinstance(raw_path, str) and raw_path and not Path(raw_path).is_absolute():
-            spec[field_name] = str((workdir / raw_path).resolve())
+    raw_path = spec.get("share_mem_path")
+    if isinstance(raw_path, str) and raw_path and not Path(raw_path).is_absolute():
+        spec["share_mem_path"] = str((workdir / raw_path).resolve())
     kvexternal_cfg["fluxonkv_spec"] = spec
     return FluxonKvClientConfig(kvexternal_cfg)
 
@@ -223,10 +222,9 @@ def _build_store_config(*, config_path: Path, workdir: Path) -> FluxonKvClientCo
     consumer_cfg = dict(loaded["mpmc_demo"]["consumer"])
     kvexternal_cfg["instance_key"] = str(consumer_cfg["instance_key"])
     spec = dict(kvexternal_cfg["fluxonkv_spec"])
-    for field_name in ("shared_memory_path", "shared_file_path"):
-        raw_path = spec.get(field_name)
-        if isinstance(raw_path, str) and raw_path and not Path(raw_path).is_absolute():
-            spec[field_name] = str((workdir / raw_path).resolve())
+    raw_path = spec.get("share_mem_path")
+    if isinstance(raw_path, str) and raw_path and not Path(raw_path).is_absolute():
+        spec["share_mem_path"] = str((workdir / raw_path).resolve())
     kvexternal_cfg["fluxonkv_spec"] = spec
     return FluxonKvClientConfig(kvexternal_cfg)
 
@@ -462,7 +460,7 @@ def _build_example_config(
     unique_suffix: str,
     cluster_name: str,
     etcd_endpoint: str,
-    shared_memory_path: str,
+    share_mem_path: str,
     greptime_http_port: int,
     master_port: int,
 ) -> dict[str, Any]:
@@ -474,7 +472,7 @@ def _build_example_config(
             "cluster_name": cluster_name,
             "instance_key": f"example_ctrlc_master_{unique_suffix}",
             "port": master_port,
-            "log_dir": str((Path(shared_memory_path).parent / "log" / "master").resolve()),
+            "log_dir": str((Path(share_mem_path).parent / "log" / "master").resolve()),
             "monitoring": _monitoring_block(greptime_http_port=greptime_http_port),
         },
         "kvclient": {
@@ -483,9 +481,9 @@ def _build_example_config(
             "fluxonkv_spec": {
                 "etcd_addresses": [etcd_endpoint],
                 "cluster_name": cluster_name,
-                "shared_memory_path": shared_memory_path,
-                "shared_file_path": str((Path(shared_memory_path).parent / "sharefile").resolve()),
+                "share_mem_path": share_mem_path,
                 "sub_cluster": "demo",
+                "large_file_paths": [str((Path(share_mem_path).parent / "large" / "owner").resolve())],
             },
         },
         "kvexternal": {
@@ -493,8 +491,7 @@ def _build_example_config(
             "contribute_to_cluster_pool_size": {"dram": 0, "vram": {}},
             "fluxonkv_spec": {
                 "cluster_name": cluster_name,
-                "shared_memory_path": shared_memory_path,
-                "shared_file_path": str((Path(shared_memory_path).parent / "sharefile").resolve()),
+                "share_mem_path": share_mem_path,
             },
         },
         "mpmc_demo": {
@@ -524,8 +521,8 @@ def _write_runtime_subconfig(*, path: Path, config: dict[str, Any], key: str) ->
     )
 
 
-def _kvclient_shared_json_target(*, shared_file_path: Path, cluster_name: str) -> Path:
-    return shared_file_path / cluster_name / "shared.json"
+def _kvclient_shared_json_target(*, share_mem_path: Path, cluster_name: str) -> Path:
+    return share_mem_path / cluster_name / "shared.json"
 
 
 def _start_local_stack(*, temp_root: Path, config_path: Path) -> list[tuple[subprocess.Popen[str], Path]]:
@@ -590,13 +587,13 @@ def _start_local_stack(*, temp_root: Path, config_path: Path) -> list[tuple[subp
 
     unique_suffix = uuid.uuid4().hex[:12]
     cluster_name = f"example_ctrlc_cluster_{unique_suffix}"
-    shared_memory_path = str((temp_root / "sharemem").resolve())
+    share_mem_path = str((temp_root / "sharemem").resolve())
     master_port = _pick_free_port()
     config = _build_example_config(
         unique_suffix=unique_suffix,
         cluster_name=cluster_name,
         etcd_endpoint=etcd_endpoint,
-        shared_memory_path=shared_memory_path,
+        share_mem_path=share_mem_path,
         greptime_http_port=greptime_http_port,
         master_port=master_port,
     )
@@ -637,7 +634,7 @@ def _start_local_stack(*, temp_root: Path, config_path: Path) -> list[tuple[subp
         env=env,
     )
     kvclient_shared_json = _kvclient_shared_json_target(
-        shared_file_path=Path(str(config["kvclient"]["fluxonkv_spec"]["shared_file_path"])).resolve(),
+        share_mem_path=Path(str(config["kvclient"]["fluxonkv_spec"]["share_mem_path"])).resolve(),
         cluster_name=cluster_name,
     )
     _wait_for_path(

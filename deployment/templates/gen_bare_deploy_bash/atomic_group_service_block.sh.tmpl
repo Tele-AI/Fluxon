@@ -1,0 +1,24 @@
+
+# rollout: {{SERVICE_NAME}}
+{{ALLOWED_NODES_BLOCK}}scheduled=false
+for n in "${ALLOWED_NODES[@]}"; do
+  if [ "$n" = "$NODE_ID" ]; then scheduled=true; fi
+done
+if [ "$scheduled" != true ]; then
+  echo "[rollout] skip {{SERVICE_NAME}}: not scheduled on node $NODE_ID"
+else
+  export SERVICE={{SERVICE_EXPORT}}
+{{PORT_EXPORT}}  LOG_DIR="$HOSTWORKDIR/log"
+  mkdir -p "$LOG_DIR"
+  SUPERVISOR_LABEL={{SUPERVISOR_LABEL_ASSIGN}}
+  RUNTIME_STATE_JSON={{RUNTIME_STATE_JSON_ASSIGN}}
+  OWNER_TS_MS=$(python3 -c 'import time; print(int(time.time() * 1000))')
+  LOGFILE="{{LOGFILE_PATH}}"
+  echo "[rollout] start {{SERVICE_NAME}} node=$NODE_ID hostworkdir=$HOSTWORKDIR"
+  # English note:
+  # - Atomic-group order still depends on a startup gate, but that gate now checks only whether
+  #   one supervised child PID stays alive without restart on this host.
+  # - Ownership stays inside the shared selection supervisor big loop; the group runner only waits
+  #   through the fixed startup observation window before advancing to the next service.
+{{INDENTED_SELECTION_SUPERVISOR_LAUNCH_WAIT_BLOCK}}
+fi

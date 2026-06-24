@@ -5,7 +5,13 @@ import argparse
 import os
 from pathlib import Path
 
-from _common import REPO_ROOT, load_case_config_payload, run_cargo, write_build_config_ext
+from _common import (
+    REPO_ROOT,
+    inject_build_config_ext_env,
+    load_case_config_payload,
+    run_cargo,
+    write_build_config_ext,
+)
 
 
 TEST_REQUIREMENTS = ["cargo", "etcd", "ops", "submodules"]
@@ -27,6 +33,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     feature = str(args.feature).strip()
+    env = None
     if args.case_config:
         case_cfg_path = Path(args.case_config).resolve()
         case_payload = load_case_config_payload(case_cfg_path, expected_scene_id=SCENE_ID)
@@ -41,7 +48,11 @@ def main() -> int:
         scene_runtime = case_payload.get("scene_runtime")
         if not isinstance(scene_runtime, dict):
             raise ValueError("case config must define scene_runtime mapping")
-        write_build_config_ext(case_cfg_path, scene_runtime=scene_runtime)
+        build_config_ext_path = write_build_config_ext(case_cfg_path, scene_runtime=scene_runtime)
+        env = inject_build_config_ext_env(
+            env,
+            build_config_ext_path=build_config_ext_path,
+        )
     return run_cargo([
         "test",
         "--manifest-path",
@@ -49,7 +60,7 @@ def main() -> int:
         "--no-default-features",
         "--features",
         f"p2p_transfer,{feature}",
-    ])
+    ], env=env)
 
 
 if __name__ == "__main__":

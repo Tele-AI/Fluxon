@@ -38,6 +38,36 @@ _RUNNER = _load_module()
 
 
 class TestTestRunnerTestbedContract(unittest.TestCase):
+    def test_write_ci_master_owner_configs_emits_owner_large_file_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            resolved_case = {
+                "deploy": {
+                    "instances": [
+                        {"id": "master", "deployer": {"target": "local-node-a"}},
+                        {"id": "owner_0", "deployer": {"target": "local-node-a"}},
+                    ],
+                    "target_ip_map": {"local-node-a": "127.0.0.1"},
+                }
+            }
+
+            with mock.patch.object(_RUNNER, "_ci_base_runtime_service_target_ip", side_effect=["127.0.0.1", "127.0.0.1"]):
+                with mock.patch.object(_RUNNER, "_ci_base_runtime_service_port", side_effect=[19180, 19190]):
+                    _, owner_path = _RUNNER._write_ci_master_owner_configs(
+                        resolved_case,
+                        run_dir=run_dir,
+                        cluster_name="ci_cluster",
+                        share_mem_path="/tmp/ci_shm",
+                        owner_dram_bytes=1073741824,
+                    )
+
+            owner_cfg = yaml.safe_load(owner_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                owner_cfg["fluxonkv_spec"]["large_file_paths"],
+                [str((run_dir / "services" / "owner_0" / "large").resolve())],
+            )
+            self.assertNotIn("shared_file_path", owner_cfg["fluxonkv_spec"])
+
     def test_ci_runtime_python_executable_requires_python310_on_path(self) -> None:
         with mock.patch.object(_RUNNER.shutil, "which", return_value=None):
             with self.assertRaisesRegex(ValueError, "requires python3.10 on PATH"):
@@ -210,6 +240,65 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertEqual(payload["scene_runtime"]["etcd"], {"ip": "127.0.0.1", "port": 2379})
             self.assertEqual(payload["scene_runtime"]["greptime"], {"ip": "127.0.0.1", "port": 4000})
 
+    def test_generated_test_stack_owner_config_emits_large_file_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            cfg_dir = run_dir / "configs"
+            cfg_dir.mkdir(parents=True)
+            owner_target = "local-node-a"
+            target_slug = "local-node-a"
+            runtime_instance_prefix = "case1"
+            coord_tpl = {"deployer": {"target": ""}}
+            cluster_nodes = {"local-node-a": {"python_abi": "cpython3.10"}}
+            resolved_case = {
+                "runtime": {
+                    "run_dir": str(run_dir),
+                    "stack_identity": {
+                        "cluster_name": "bench_cluster",
+                        "share_mem_path": "/tmp/bench_shm",
+                    },
+                }
+            }
+
+            with mock.patch.object(_RUNNER, "_test_stack_runtime_required_python_abi", return_value="cpython3.10"):
+                with mock.patch.object(_RUNNER, "_test_stack_etcd_addresses", return_value=["127.0.0.1:19180"]):
+                    with mock.patch.object(_RUNNER, "_test_stack_target_host_venv_python", return_value="/tmp/venv/bin/python3"):
+                        with mock.patch.object(_RUNNER, "_test_stack_runtime_module_command", return_value="owner-cmd"):
+                            owner_instances = _RUNNER._build_test_stack_external_kv_owner_instances(
+                                scene_mode="bench",
+                                resolved_case=resolved_case,
+                                scale={"owner": {"owner_count": 1, "owner_dram_bytes": 1073741824}},
+                                runtime=resolved_case["runtime"],
+                                run_dir=run_dir,
+                                cfg_dir=cfg_dir,
+                                coord_tpl=coord_tpl,
+                                test_stack_runtime={},
+                                cluster_nodes=cluster_nodes,
+                                owner_targets=[owner_target],
+                                needs_kv_master=True,
+                                kv_p2p_port_base=31000,
+                                kv_p2p_port_stride=100,
+                                kv_p2p_slot_offset=0,
+                                p2p_ports_per_slot=10,
+                                node_total=1,
+                                run_index=1,
+                                runtime_instance_prefix=runtime_instance_prefix,
+                                kv_base={},
+                                test_spec_config={},
+                                perf_config=None,
+                                runtime_env={},
+                                owner_group_processes=None,
+                                owner_cpu_core_by_target={},
+                            )
+
+            self.assertEqual(len(owner_instances), 1)
+            owner_cfg_path = cfg_dir / f"test_stack_kv_owner__{target_slug}.yaml"
+            owner_cfg = yaml.safe_load(owner_cfg_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                owner_cfg["fluxonkv_spec"]["large_file_paths"],
+                [str((run_dir / "services" / "kv_owner" / target_slug / "large").resolve())],
+            )
+
     def test_ci_source_overlay_includes_fluxon_test_stack(self) -> None:
         self.assertIn("fluxon_test_stack", _RUNNER._CI_SOURCE_OVERLAY_ROOTS)
         self.assertNotIn("quartz_prewarm", _RUNNER._CI_SOURCE_OVERLAY_ROOTS)
@@ -266,6 +355,59 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         )
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
 
+    def test_additional_top_attention_cargo_ci_execution_plans_are_runner_native(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        expected = {
+            "ci_top_attention_cargo_cli": ("top_attention_cargo_cli", "_cargo_cli.py"),
+            "ci_top_attention_cargo_commu": ("top_attention_cargo_commu", "_cargo_commu.py"),
+            "ci_top_attention_cargo_commu_contract": ("top_attention_cargo_commu_contract", "_cargo_commu_contract.py"),
+            "ci_top_attention_cargo_framework": ("top_attention_cargo_framework", "_cargo_framework.py"),
+            "ci_top_attention_cargo_fs": ("top_attention_cargo_fs", "_cargo_fs.py"),
+            "ci_top_attention_cargo_fs_s3_gateway": ("top_attention_cargo_fs_s3_gateway", "_cargo_fs_s3_gateway.py"),
+            "ci_top_attention_cargo_limit_thirdparty": ("top_attention_cargo_limit_thirdparty", "_cargo_limit_thirdparty.py"),
+            "ci_top_attention_cargo_mq": ("top_attention_cargo_mq", "_cargo_mq.py"),
+            "ci_top_attention_cargo_observability": ("top_attention_cargo_observability", "_cargo_observability.py"),
+            "ci_top_attention_cargo_ops": ("top_attention_cargo_ops", "_cargo_ops.py"),
+            "ci_top_attention_cargo_pyo3": ("top_attention_cargo_pyo3", "_cargo_pyo3.py"),
+        }
+        for scene_id, (command_id, script_name) in expected.items():
+            with self.subTest(scene_id=scene_id):
+                case = next(item for item in cases if item.scene_id == scene_id and item.profile_id == "fluxon_tcp")
+                planned = _RUNNER._build_ci_execution_plan(case, suite)
+                self.assertEqual(len(planned), 1)
+                self.assertEqual(planned[0].ci_commands[0]["id"], command_id)
+                self.assertIn(
+                    f"__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/{script_name}",
+                    planned[0].ci_commands[0]["command"],
+                )
+                self.assertNotIn("--case-config", planned[0].ci_commands[0]["command"])
+
+    def test_top_attention_log_mgmt_ci_execution_plan_is_runner_native(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        artifact_sets = suite_cfg.get("artifact_sets")
+        if isinstance(artifact_sets, dict):
+            for artifact_set in artifact_sets.values():
+                if not isinstance(artifact_set, dict):
+                    continue
+                release_artifacts = artifact_set.get("release_artifacts")
+                if isinstance(release_artifacts, dict):
+                    python_wheel = release_artifacts.get("python_wheel")
+                    if isinstance(python_wheel, str) and python_wheel.strip():
+                        artifact_set["release_artifacts"] = {"wheel": python_wheel}
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        case = next(item for item in cases if item.scene_id == "ci_top_attention_log_mgmt" and item.profile_id == "fluxon_tcp")
+        planned = _RUNNER._build_ci_execution_plan(case, suite)
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_log_mgmt")
+        self.assertIn(
+            "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_log_mgmt.py",
+            planned[0].ci_commands[0]["command"],
+        )
+        self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
+
     def test_top_attention_mq_core_ci_execution_plan_is_runner_native(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
         suite = _RUNNER._parse_suite_config(suite_cfg)
@@ -312,8 +454,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         "kv_svc_type: fluxon",
                         "etcd_address: 127.0.0.1:2379",
                         "cluster_name: fluxon-example-cluster",
-                        "shared_memory_path: /tmp/fluxon-example-cluster/shm",
-                        "shared_file_path: /tmp/fluxon-example-cluster/share",
+                        "share_mem_path: /tmp/fluxon-example-cluster/shm",
                         "",
                     ]
                 ),
@@ -447,8 +588,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                             overlay_live_checkout=False,
                             etcd_address="127.0.0.1:32579",
                             cluster_name="ci_case_cluster",
-                            shared_memory_path="/tmp/ci_case_cluster/shm",
-                            shared_file_path="/tmp/ci_case_cluster/share",
+                            share_mem_path="/tmp/ci_case_cluster/shm",
                         )
 
             release_view_root = src_root / "fluxon_release"
@@ -467,8 +607,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     "kv_svc_type": "fluxon",
                     "etcd_address": "127.0.0.1:32579",
                     "cluster_name": "ci_case_cluster",
-                    "shared_memory_path": "/tmp/ci_case_cluster/shm",
-                    "shared_file_path": "/tmp/ci_case_cluster/share",
+                    "share_mem_path": "/tmp/ci_case_cluster/shm",
                 },
             )
             assert_python_abi.assert_called_once_with(venv_python=venv_python)
@@ -552,8 +691,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         "ops_cluster_name": "fluxon_testbed",
                         "cluster_name": "fluxon_testbed",
                         "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
-                        "shared_memory_path": "/tmp/shm",
-                        "shared_file_path": "/tmp/share",
+                        "share_mem_path": "/tmp/shm",
                     },
                     "deploy_instances": {
                         "case_runtime": [
@@ -577,7 +715,6 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     run_dir=run_dir,
                     src_root=src_root,
                     share_mem_path="/tmp/shm",
-                    share_file_path="/tmp/share",
                 )
             script_text = script_path.read_text(encoding="utf-8")
             self.assertIn('prepare_env_path="', script_text)
@@ -802,8 +939,9 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 contract["ops_controller_url"],
                 "http://127.0.0.1:19080/r/ops/fluxon_testbed",
             )
-            self.assertEqual(contract["shared_memory_hostworkdir"], "${HOSTWORKDIR}/shm1")
-            self.assertEqual(contract["shared_file_hostworkdir"], "${HOSTWORKDIR}/shm2_files")
+            self.assertEqual(contract["share_mem_hostworkdir"], "${HOSTWORKDIR}/shm1")
+            self.assertNotIn("shared_memory_hostworkdir", contract)
+            self.assertNotIn("shared_file_hostworkdir", contract)
 
     def test_load_source_stack_contract_rejects_multi_hostworkdir_remote_layout(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -927,6 +1065,80 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     _RUNNER._ci_base_runtime_service_target_ip(resolved_case, service_id="greptime"),
                     "127.0.0.1",
                 )
+
+    def test_write_deployer_manifests_renders_payload_wrapper_from_template(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            resolved_case = {
+                "case": {
+                    "case_id": "bench_case",
+                    "profile_id": "bench_profile",
+                },
+                "scene": {
+                    "bench": {
+                        "subject": "kv",
+                    }
+                },
+                "deploy": {
+                    "instances": [
+                        {
+                            "id": "worker_0",
+                            "k8s_ref": "deployment/test-worker",
+                            "lifecycle": "service",
+                            "deployer": {
+                                "target": "logic-a",
+                                "payload_file": "wheelhouse/pkg.whl",
+                                "payload_dest_path": "/tmp/run/pkg.whl",
+                                "command": ["/bin/sh", "-lc", "python3 /tmp/run/pkg.whl"],
+                            },
+                        }
+                    ],
+                    "payload_delivery": {
+                        "kind": _RUNNER.PAYLOAD_DELIVERY_KIND_FLUXON_FS_S3,
+                        "s3_base_url": "http://127.0.0.1:19080/fs_s3",
+                        "bucket": "bench-bucket",
+                        "access_key": "bench-ak",
+                        "secret_key": "bench-sk",
+                        "region": "bench-region",
+                        "key_prefix": "case-prefix",
+                    },
+                },
+                "runtime": {
+                    "workdir_root": str(run_dir.parent),
+                    "run_dir": str(run_dir),
+                    "stack_identity": {
+                        "cluster_name": "fluxon_testbed",
+                        "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                        "share_mem_path": "/tmp/shm",
+                    },
+                },
+                "artifact_set": {
+                    "release_root": str(run_dir / "fluxon_release"),
+                    "test_rsc_root": str(run_dir / "test_rsc"),
+                },
+            }
+
+            template_path = (
+                _RUNNER.RUNNER_TEMPLATE_DIR / "payload_fluxon_fs_s3_download_and_exec.sh.template"
+            ).resolve()
+            self.assertTrue(template_path.is_file())
+
+            _RUNNER._write_deployer_manifests(resolved_case, run_dir, allow_overwrite=False)
+
+            manifest_docs = list(
+                yaml.safe_load_all((run_dir / "deployer_deploy.yaml").read_text(encoding="utf-8"))
+            )
+            self.assertEqual(len(manifest_docs), 1)
+            container = manifest_docs[0]["spec"]["template"]["spec"]["containers"][0]
+            self.assertEqual(container["command"], ["/bin/bash", "-lc"])
+            self.assertEqual(len(container["args"]), 1)
+            script_text = container["args"][0]
+            self.assertIn("python3 - <<'PY'", script_text)
+            self.assertIn('BASE_URL = "http://127.0.0.1:19080/fs_s3"', script_text)
+            self.assertIn('OBJECT_KEY = "case-prefix/wheelhouse/pkg.whl"', script_text)
+            self.assertIn('DEST_PATH = "/tmp/run/pkg.whl"', script_text)
+            self.assertIn('exec /bin/sh -lc', script_text)
+            self.assertNotIn("__FLUXON_TMPL_", script_text)
 
 
 if __name__ == "__main__":

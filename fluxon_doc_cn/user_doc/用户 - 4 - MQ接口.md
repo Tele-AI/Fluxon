@@ -86,8 +86,7 @@ ETCD_ENDPOINT = "127.0.0.1:2379"
 GREPTIME_HTTP_PORT = 34030
 GREPTIME_BASE_URL = f"http://127.0.0.1:{GREPTIME_HTTP_PORT}"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARED_MEMORY_PATH = Path("/dev/shm/fluxon_kv_demo").resolve()
-SHARED_FILE_PATH = Path("/tmp/fluxon_kv_demo/shared").resolve()
+SHARE_MEM_PATH = Path("/dev/shm/fluxon_kv_demo").resolve()
 WORKDIR = Path("/tmp/fluxon_kv_demo/runtime").resolve()
 MASTER_PORT = 31000
 MASTER_INSTANCE_KEY = "demo_kv_master"
@@ -97,7 +96,6 @@ OWNER_DRAM_BYTES = 1073741824
 
 def main() -> None:
     args = parse_args()
-    SHARED_FILE_PATH.mkdir(parents=True, exist_ok=True)
     log_dir = (WORKDIR / "log").resolve()
 
     if args.with_master:
@@ -132,8 +130,7 @@ def main() -> None:
         )
     )
 
-    print(f"[fluxon_kv] shared memory path: {SHARED_MEMORY_PATH}")
-    print(f"[fluxon_kv] shared file path: {SHARED_FILE_PATH}")
+    print(f"[fluxon_kv] share_mem_path: {SHARE_MEM_PATH}")
     print(f"[fluxon_kv] etcd endpoint: {ETCD_ENDPOINT}")
     print(f"[fluxon_kv] greptime base url: {GREPTIME_BASE_URL}")
     print(f"[fluxon_kv] start master in this script: {args.with_master}")
@@ -196,9 +193,9 @@ def build_owner_config() -> dict:
         "fluxonkv_spec": {
             "etcd_addresses": [ETCD_ENDPOINT],
             "cluster_name": CLUSTER_NAME,
-            "shared_memory_path": str(SHARED_MEMORY_PATH),
-            "shared_file_path": str(SHARED_FILE_PATH),
+            "share_mem_path": str(SHARE_MEM_PATH),
             "sub_cluster": "default",
+            "large_file_paths": [str((WORKDIR / "large" / "owner").resolve())],
         },
     }
 
@@ -299,8 +296,7 @@ from fluxon_py.runtime import register_ctrlc_callback
 
 # These constants are the only user-facing knobs in the minimal example.
 CLUSTER_NAME = "demo-kv-cluster"
-SHARED_MEMORY_PATH = "/dev/shm/fluxon_kv_demo"
-SHARED_FILE_PATH = "/tmp/fluxon_kv_demo/shared"
+SHARE_MEM_PATH = "/dev/shm/fluxon_kv_demo"
 CHANNEL_KEY = "demo_mq_channel_doc"
 CHANNEL_CAPACITY = 128
 CHANNEL_TTL_SECONDS = 300
@@ -335,8 +331,7 @@ def _build_store_config(*, role: str) -> FluxonKvClientConfig:
             "instance_key": f"demo_mq_{role}",
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
-                "shared_memory_path": SHARED_MEMORY_PATH,
-                "shared_file_path": SHARED_FILE_PATH,
+                "share_mem_path": SHARE_MEM_PATH,
             },
         }
     )
@@ -480,9 +475,7 @@ def main() -> None:
     parser.add_argument("--role", choices=["producer", "consumer"], required=True)
     args = parser.parse_args()
 
-    # The minimal example keeps shared file authority explicit and local.
-    Path(SHARED_FILE_PATH).mkdir(parents=True, exist_ok=True)
-
+    # The minimal example keeps share_mem_path explicit and local.
     # init_logger() reads FLUXON_LOG and sets the user-process console log level.
     logger = init_logger(f"mpmc_demo_{args.role}")
     shutdown_requested = threading.Event()
@@ -542,7 +535,7 @@ FLUXON_LOG=DEBUG python3 examples/start_mpmc_demo.py --role consumer
 
 ### 关键接口常见错误处理
 
-- `new_or_bind_with_unique_key(...)` 失败：直接把 `unwrap_error()` 打出来，先检查 cluster、shared memory/shared file 路径、`unique_id`、`chan_role` 是否和对端一致
+- `new_or_bind_with_unique_key(...)` 失败：直接把 `unwrap_error()` 打出来，先检查 `cluster_name`、`share_mem_path`、`unique_id`、`chan_role` 是否和对端一致
 - `producer.put_data(...)` 返回 `ProducerClosedError`：按正常关闭路径处理，直接退出主循环
 - `consumer.get_data(...)` 返回 `ChannelClosedError`：按正常关闭路径处理，直接退出主循环
 
@@ -552,7 +545,7 @@ FLUXON_LOG=DEBUG python3 examples/start_mpmc_demo.py --role consumer
 
 - MQ Python 部分：由 `init_logger(...)` 初始化，直接输出到当前终端，不默认落盘，门限由 `FLUXON_LOG` 控制
 - MQ Rust / KV 后台部分：和 KV 一起走服务平面的后台日志链路；`master` 本地日志目录由 `master_cfg["log_dir"]` 指定
-- `shared_file_path`：本机共享文件 authority，用来承载 `shared.json` 等共享文件
+- `share_mem_path`：KV 共享 bundle 根目录，只承载 `mmap.file`、`shared.json` 和 peer metadata；后端日志、profile、cache 从 owner 的 `large_file_paths` 派生
 
 如果服务平面的 `master.monitoring.otlp_log_api` 已经配置，MQ Rust / KV 后台部分的日志还会继续采集到 Greptime 的 `fluxon_logs` 表。
 

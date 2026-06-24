@@ -10,7 +10,7 @@ from pathlib import Path
 import yaml
 
 from setup_and_pack.public_workspace_contract import (
-    PUBLIC_WORKSPACE_INPUT_RELATIVE_PATHS,
+    collect_public_workspace_input_relative_paths,
     _copy_public_workspace_input_path,
     _sanitize_public_workspace_input,
 )
@@ -41,6 +41,7 @@ DEFAULT_INSTANCE_ID = "cold_start"
 PACK_CONFIG_STATIC_STEM_SUFFIX = "_static"
 PACK_CONFIG_ENV_STEM_SUFFIX = "_env"
 DEFAULT_PACK_CONFIG_ENV_DIR_NAME = "setup_and_pack"
+PROJECT_ROOT_CONFIG_KEY = "project_root"
 HOST_PATHS_ROOT_KEY = "root_path"
 DEFAULT_HOST_PATH_SUFFIXES = {
     ("store", "project_data_root"): "",
@@ -48,35 +49,6 @@ DEFAULT_HOST_PATH_SUFFIXES = {
     ("manylinux", "cargo_registry_dir"): "manylinux-cache/cargo-registry",
     ("manylinux", "cargo_git_dir"): "manylinux-cache/cargo-git",
 }
-BRIDGE_PREBUILT_WORKSPACE_SEED_EXTRA_RELATIVE_PATHS = (
-    "setup_and_pack/nix",
-    "setup_and_pack/lib_tool.py",
-    "setup_and_pack/pyscript_util.py",
-    "setup_and_pack/closed_sdk_contract.py",
-    "setup_and_pack/public_workspace_contract.py",
-    "setup_and_pack/pub_prepare_build.py",
-    "setup_and_pack/pub_prepare_build.yaml",
-    "setup_and_pack/utils/wheel_runtime_helper.py",
-    "setup_and_pack/utils",
-    "deployment/utils/placeholder_utils.py",
-    "deployment/utils/proc_lifecycle_codegen.py",
-    "deployment/utils/selection_supervisor_codegen.py",
-    "fluxon_release/closed_sdk",
-    "fluxon_rs/fluxon_commu_contract",
-    "fluxon_rs/fluxon_commu",
-    "fluxon_rs/fluxon_commu_closed_sdk_consumer",
-    "fluxon_rs/Cargo.lock",
-)
-BRIDGE_PREBUILT_WORKSPACE_SEED_RELATIVE_PATHS = tuple(
-    dict.fromkeys(
-        (
-            *PUBLIC_WORKSPACE_INPUT_RELATIVE_PATHS,
-            *BRIDGE_PREBUILT_WORKSPACE_SEED_EXTRA_RELATIVE_PATHS,
-        )
-    )
-)
-
-
 @dataclass(frozen=True)
 class AssemblyRefs:
     baseline_path: str
@@ -253,7 +225,7 @@ def load_experiment_spec_from_root(*, config_path: Path, config_root: dict) -> E
     profile_config = _require_mapping(raw_config, "profile")
     assembly_config = _require_mapping(raw_config, "assembly")
 
-    project_root = _detect_project_root(config_path=config_path)
+    project_root = _resolve_project_root(config_path=config_path, raw_config=raw_config)
     project_data_root = _require_absolute_path(store_config, "project_data_root")
     base_system = _require_enum_string(runtime_config, "base_system", SUPPORTED_BASE_SYSTEMS)
     architectures = tuple(
@@ -576,6 +548,25 @@ def _detect_project_root(*, config_path: Path) -> Path:
     )
 
 
+def _resolve_project_root(*, config_path: Path, raw_config: dict) -> Path:
+    configured_project_root = _optional_non_empty_string(raw_config, PROJECT_ROOT_CONFIG_KEY)
+    if configured_project_root is not None:
+        project_root = Path(configured_project_root)
+        if not project_root.is_absolute():
+            raise RuntimeError(
+                f"config.{PROJECT_ROOT_CONFIG_KEY} must be an absolute path: {configured_project_root}"
+            )
+        resolved_project_root = project_root.resolve()
+        if not _is_project_root_candidate(resolved_project_root):
+            raise RuntimeError(
+                "config.project_root must point at a project root containing one of "
+                f"{PROJECT_ROOT_MARKER_FILE_NAMES + PROJECT_ROOT_MARKER_DIR_NAMES} "
+                f"and child dirs {PROJECT_ROOT_REQUIRED_CHILD_DIR_NAMES}: {resolved_project_root}"
+            )
+        return resolved_project_root
+    return _detect_project_root(config_path=config_path)
+
+
 def _is_project_root_candidate(candidate_root: Path) -> bool:
     has_marker = any(
         (candidate_root / marker_name).exists()
@@ -757,7 +748,9 @@ def _materialize_bridge_prebuilt_workspace_seed(*, source_root: Path, target_roo
     _remove_stale_derived_entry(path=target_root)
     target_root.mkdir(parents=True, exist_ok=True)
     target_root.chmod(0o777)
-    for relative_path in BRIDGE_PREBUILT_WORKSPACE_SEED_RELATIVE_PATHS:
+    for relative_path in collect_public_workspace_input_relative_paths(
+        repo_root=source_root
+    ):
         source_path = source_root / relative_path
         if not source_path.exists():
             raise RuntimeError(

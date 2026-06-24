@@ -69,7 +69,6 @@ from fluxon_py.tests.test_lib import (  # noqa: E402
     MOONCAKE_MASTER_SERVER_ADDRESS,
     MOONCAKE_METADATA_SERVER,
     load_test_fluxon_cluster_name,
-    load_test_fluxon_share_file_path,
     load_test_fluxon_share_mem_path,
     new_test_consumer,
     new_test_producer,
@@ -103,7 +102,7 @@ SUMMARY_STOP_GRACE_SECONDS = 2.0
 WORKER_EXIT_TIMEOUT_SECONDS = 60.0
 STOP_KEY_PREFIX = "/test_mpmc_simple_bench/stop/"
 SUMMARY_KEY_PREFIX = "/test_mpmc_simple_bench/summary/"
-SharedBundle = tuple[str, str]
+SharedBundle = str
 PayloadFieldValue = bytes | DLPackBytesView
 PayloadFields = dict[str, PayloadFieldValue]
 SINGLE_FIELD_PAYLOAD_KEY = "payload"
@@ -159,8 +158,7 @@ def _build_parser() -> argparse.ArgumentParser:
     main_parser.add_argument("--batch-size", type=int, required=False, default=DEFAULT_BATCH_SIZE)
     main_parser.add_argument("--prefetch-num", type=int, required=False, default=DEFAULT_PREFETCH_NUM)
     main_parser.add_argument("--channel-capacity", type=int, required=False, default=DEFAULT_CHANNEL_CAPACITY)
-    main_parser.add_argument("--shared-memory-paths", type=str, required=False)
-    main_parser.add_argument("--shared-file-paths", type=str, required=False)
+    main_parser.add_argument("--share-mem-paths", type=str, required=False)
     producer_parser = subparsers.add_parser("run_producer", help="Run one producer worker")
     producer_parser.add_argument("--backend-type", required=True, type=str)
     producer_parser.add_argument("--ip", required=True, type=str)
@@ -170,8 +168,7 @@ def _build_parser() -> argparse.ArgumentParser:
     producer_parser.add_argument("--payload-bytes", required=True, type=int)
     producer_parser.add_argument("--payload-kind", required=True, type=str, choices=PAYLOAD_KIND_CHOICES)
     producer_parser.add_argument("--channel-capacity", required=True, type=int)
-    producer_parser.add_argument("--shared-memory-path", required=False, type=str)
-    producer_parser.add_argument("--shared-file-path", required=False, type=str)
+    producer_parser.add_argument("--share-mem-path", required=False, type=str)
     producer_parser.add_argument("--stop-key", required=True, type=str)
 
     consumer_parser = subparsers.add_parser("run_consumer", help="Run one consumer worker")
@@ -185,8 +182,7 @@ def _build_parser() -> argparse.ArgumentParser:
     consumer_parser.add_argument("--payload-kind", required=True, type=str, choices=PAYLOAD_KIND_CHOICES)
     consumer_parser.add_argument("--prefetch-num", required=True, type=int)
     consumer_parser.add_argument("--channel-capacity", required=True, type=int)
-    consumer_parser.add_argument("--shared-memory-path", required=False, type=str)
-    consumer_parser.add_argument("--shared-file-path", required=False, type=str)
+    consumer_parser.add_argument("--share-mem-path", required=False, type=str)
     consumer_parser.add_argument("--stop-key", required=True, type=str)
     consumer_parser.add_argument("--summary-key", required=True, type=str)
     return parser
@@ -209,8 +205,7 @@ def _run_main(args: argparse.Namespace) -> None:
     _validate_main_args(args)
     consumer_counts = _parse_consumer_counts(args.consumer_counts)
     shared_bundles = _parse_shared_bundles(
-        shared_memory_paths_raw=args.shared_memory_paths,
-        shared_file_paths_raw=args.shared_file_paths,
+        share_mem_paths_raw=args.share_mem_paths,
     )
     for consumer_count in consumer_counts:
         _run_one_case(
@@ -272,8 +267,7 @@ def _run_one_case(
     bootstrap_store = _new_channel_store(
         role_key=f"{bench_id}_bootstrap",
         backend_type=KV_SVC_TYPE,
-        shared_memory_path=bootstrap_bundle[0],
-        shared_file_path=bootstrap_bundle[1],
+        share_mem_path=bootstrap_bundle,
     )
     bootstrap_producer = None
     worker_processes: list[subprocess.Popen[str]] = []
@@ -305,8 +299,7 @@ def _run_one_case(
                     payload_bytes=payload_bytes,
                     payload_kind=payload_kind,
                     channel_capacity=channel_capacity,
-                    shared_memory_path=producer_bundle[0],
-                    shared_file_path=producer_bundle[1],
+                    share_mem_path=producer_bundle,
                     stop_key=stop_key,
                 )
             )
@@ -338,10 +331,8 @@ def _run_one_case(
                         str(prefetch_num),
                         "--channel-capacity",
                         str(channel_capacity),
-                        "--shared-memory-path",
-                        consumer_bundle[0],
-                        "--shared-file-path",
-                        consumer_bundle[1],
+                        "--share-mem-path",
+                        consumer_bundle,
                         "--stop-key",
                         stop_key,
                         "--summary-key",
@@ -418,8 +409,7 @@ def _run_producer(args: argparse.Namespace) -> None:
     store = _new_channel_store(
         role_key=f"{args.bench_id}_producer_{args.producer_id}",
         backend_type=args.backend_type,
-        shared_memory_path=args.shared_memory_path,
-        shared_file_path=args.shared_file_path,
+        share_mem_path=args.share_mem_path,
     )
     producer = None
     restore_signal_listener = None
@@ -500,8 +490,7 @@ def _run_consumer(args: argparse.Namespace) -> None:
     store = _new_channel_store(
         role_key=f"{args.bench_id}_consumer_{args.consumer_id}",
         backend_type=args.backend_type,
-        shared_memory_path=args.shared_memory_path,
-        shared_file_path=args.shared_file_path,
+        share_mem_path=args.share_mem_path,
     )
     consumer = None
     restore_signal_listener = None
@@ -669,8 +658,7 @@ def _validate_main_args(args: argparse.Namespace) -> None:
     _validate_non_negative_int("prefetch_num", args.prefetch_num)
     _validate_positive_int("channel_capacity", args.channel_capacity)
     _parse_shared_bundles(
-        shared_memory_paths_raw=args.shared_memory_paths,
-        shared_file_paths_raw=args.shared_file_paths,
+        share_mem_paths_raw=args.share_mem_paths,
     )
     _validate_sample_window(
         total_duration_seconds=int(args.duration_seconds),
@@ -732,14 +720,12 @@ def _new_channel_store(
     *,
     role_key: str,
     backend_type: str,
-    shared_memory_path: str | None,
-    shared_file_path: str | None,
+    share_mem_path: str | None,
 ):
     config = _new_store_config(
         instance_key=role_key,
         backend_type=backend_type,
-        shared_memory_path=shared_memory_path,
-        shared_file_path=shared_file_path,
+        share_mem_path=share_mem_path,
     )
     result = new_store(config)
     if not result.is_ok():
@@ -751,8 +737,7 @@ def _new_store_config(
     *,
     instance_key: str,
     backend_type: str,
-    shared_memory_path: str | None,
-    shared_file_path: str | None,
+    share_mem_path: str | None,
 ) -> FluxonKvClientConfig:
     if backend_type == KvClientType.MOONCAKE.value:
         return FluxonKvClientConfig(
@@ -772,14 +757,12 @@ def _new_store_config(
         )
 
     if backend_type == KvClientType.FLUXON.value:
-        resolved_shared_memory_path, resolved_shared_file_path = _resolve_fluxon_shared_bundle(
-            shared_memory_path=shared_memory_path,
-            shared_file_path=shared_file_path,
+        resolved_share_mem_path = _resolve_fluxon_shared_bundle(
+            share_mem_path=share_mem_path,
         )
         fluxon_spec: dict[str, Any] = {
             "cluster_name": load_test_fluxon_cluster_name(),
-            "shared_memory_path": resolved_shared_memory_path,
-            "shared_file_path": resolved_shared_file_path,
+            "share_mem_path": resolved_share_mem_path,
         }
         return FluxonKvClientConfig(
             {
@@ -813,8 +796,7 @@ def _spawn_producer(
     payload_bytes: int,
     payload_kind: PayloadKind,
     channel_capacity: int,
-    shared_memory_path: str,
-    shared_file_path: str,
+    share_mem_path: str,
     stop_key: str,
 ) -> subprocess.Popen[str]:
     return _spawn_worker(
@@ -838,10 +820,8 @@ def _spawn_producer(
             payload_kind.value,
             "--channel-capacity",
             str(channel_capacity),
-            "--shared-memory-path",
-            shared_memory_path,
-            "--shared-file-path",
-            shared_file_path,
+            "--share-mem-path",
+            share_mem_path,
             "--stop-key",
             stop_key,
         ]
@@ -850,21 +830,11 @@ def _spawn_producer(
 
 def _parse_shared_bundles(
     *,
-    shared_memory_paths_raw: str | None,
-    shared_file_paths_raw: str | None,
+    share_mem_paths_raw: str | None,
 ) -> tuple[SharedBundle, ...]:
-    if shared_memory_paths_raw is None and shared_file_paths_raw is None:
-        return ((load_test_fluxon_share_mem_path(), load_test_fluxon_share_file_path()),)
-    if shared_memory_paths_raw is None or shared_file_paths_raw is None:
-        raise ValueError("shared-memory-paths and shared-file-paths must be set together")
-    shared_memory_paths = _parse_csv_paths(raw=shared_memory_paths_raw, arg_name="shared-memory-paths")
-    shared_file_paths = _parse_csv_paths(raw=shared_file_paths_raw, arg_name="shared-file-paths")
-    if len(shared_memory_paths) != len(shared_file_paths):
-        raise ValueError(
-            "shared-memory-paths and shared-file-paths length mismatch: "
-            f"{len(shared_memory_paths)} != {len(shared_file_paths)}"
-        )
-    return tuple(zip(shared_memory_paths, shared_file_paths, strict=True))
+    if share_mem_paths_raw is None:
+        return (load_test_fluxon_share_mem_path(),)
+    return _parse_csv_paths(raw=share_mem_paths_raw, arg_name="share-mem-paths")
 
 
 def _parse_csv_paths(*, raw: str, arg_name: str) -> tuple[str, ...]:
@@ -887,18 +857,14 @@ def _select_shared_bundle(shared_bundles: tuple[SharedBundle, ...], worker_idx: 
 
 def _resolve_fluxon_shared_bundle(
     *,
-    shared_memory_path: str | None,
-    shared_file_path: str | None,
+    share_mem_path: str | None,
 ) -> SharedBundle:
-    if shared_memory_path is None or shared_file_path is None:
-        raise ValueError(
-            "fluxon backend requires explicit shared_memory_path/shared_file_path for each worker"
-        )
-    resolved_shared_memory_path = str(shared_memory_path).strip()
-    resolved_shared_file_path = str(shared_file_path).strip()
-    if resolved_shared_memory_path == "" or resolved_shared_file_path == "":
-        raise ValueError("shared_memory_path/shared_file_path must be non-empty strings")
-    return (resolved_shared_memory_path, resolved_shared_file_path)
+    if share_mem_path is None:
+        raise ValueError("fluxon backend requires explicit share_mem_path for each worker")
+    resolved_share_mem_path = str(share_mem_path).strip()
+    if resolved_share_mem_path == "":
+        raise ValueError("share_mem_path must be a non-empty string")
+    return resolved_share_mem_path
 
 
 def _terminate_processes(processes: list[subprocess.Popen[str]]) -> None:

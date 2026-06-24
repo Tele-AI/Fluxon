@@ -65,6 +65,7 @@ jobs:
           # Scene selection:
           # - ci_top_attention_doc_page_build validates doc build through the prebuilt Docker image.
           # - ci_top_attention_bin_kvtest keeps the Rust kv_test entry under the testbed scene contract.
+          # - ci_top_attention_log_mgmt keeps log rolling/sharding coverage under the same CI testbed contract.
           # - ci_top_attention_mq_core keeps MQ correctness coverage inside the same CI testbed contract.
           suite["scenes"] = {
               key: value
@@ -72,7 +73,9 @@ jobs:
               if key in (
                   "ci_top_attention_doc_page_build",
                   "ci_top_attention_bin_kvtest",
+                  "ci_top_attention_log_mgmt",
                   "ci_top_attention_mq_core",
+                  "ci_top_attention_log_mgmt",
               )
           }
 
@@ -91,11 +94,14 @@ jobs:
           suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"]["ci_top_attention_doc_page_build"]["doc_site_base_url"] = (
               "${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
           )
+          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"]["ci_top_attention_log_mgmt"]["enabled"] = True
+          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"]["ci_top_attention_mq_core"] = {}
 
           # Scale selection:
           # - Keep the original per-scene scales from ci_test_list.yaml.
           # - ci_top_attention_doc_page_build stays on n1_kvowner_dram_3gib.
           # - ci_top_attention_bin_kvtest stays on n1_kvowner_dram_20gib.
+          # - ci_top_attention_log_mgmt stays on n1_kvowner_dram_20gib.
           # - ci_top_attention_mq_core stays on n1_kvowner_dram_20gib.
 
           out_path.write_text(

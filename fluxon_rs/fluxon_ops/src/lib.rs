@@ -28,7 +28,8 @@ use fluxon_kv::{ConfigArg, Framework, run_client};
 
 use fluxon_proxy::{HeaderKv, PanelProxyMethod, PanelProxyResp};
 use fluxon_util::{
-    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
+    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, display_runtime_log_path,
+    fluxon_cli_proxy_desc_etcd_key_v2, resolve_readable_log_path,
 };
 
 pub const OPS_SERVICE_NAME: &str = "ops";
@@ -57,6 +58,7 @@ const OPS_ATOMIC_GROUP_ANNOTATION_KEY: &str = "fluxon.io/atomic_group";
 const OPS_ATOMIC_GROUP_PHASE_ANNOTATION_KEY: &str = "fluxon.io/atomic_group_phase";
 const OPS_ATOMIC_GROUP_ORDER_ANNOTATION_KEY: &str = "fluxon.io/atomic_group_order";
 const OPS_SELECTION_SUPERVISOR_FILENAME: &str = "selection_supervisor.py";
+const OPS_LOG_SHARD_HELPER_FILENAME: &str = "log_shard.py";
 const OPS_SELECTION_SUPERVISOR_DIR_NAME: &str = "selection_supervisor";
 const OPS_SELECTION_SUPERVISOR_RUN_RESTART_DELAY_SECONDS: u64 = 5;
 const OPS_SELECTION_SUPERVISOR_RUN_MAX_BACKOFF_SECONDS: u64 = 30;
@@ -78,6 +80,7 @@ const DELETE_APPLY_NO_WAIT_DELAY_SECONDS: u64 = 30;
 
 const EMBEDDED_SELECTION_SUPERVISOR_SOURCE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/selection_supervisor.py"));
+const EMBEDDED_LOG_SHARD_HELPER_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/log_shard.py"));
 
 // Ops controller uses Fluxon user-RPC to talk to ops agents.
 // Keep the timeout as a fixed constant to avoid config surface area.
@@ -223,6 +226,132 @@ fn workload_name_for_logfile(name: &str) -> anyhow::Result<String> {
 fn workload_log_filename(kind: WorkloadKind, name: &str) -> anyhow::Result<String> {
     let name = workload_name_for_logfile(name)?;
     Ok(format!("workload__{}__{}.log", kind.as_str(), name))
+}
+
+fn workload_log_shard_identity_from_path(
+    logical_path: &Path,
+    resolved_path: &Path,
+) -> anyhow::Result<String> {
+    let logical_name = logical_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| anyhow::anyhow!("logical log path must end with a utf-8 filename"))?;
+    let resolved_name = resolved_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| anyhow::anyhow!("resolved log path must end with a utf-8 filename"))?;
+    if resolved_name == logical_name {
+        return Ok("base".to_string());
+    }
+    let stem = logical_name
+        .strip_suffix(".log")
+        .ok_or_else(|| anyhow::anyhow!("logical log filename must end with .log"))?;
+    let prefix = format!("{stem}.");
+    let suffix = ".log";
+    if !resolved_name.starts_with(prefix.as_str()) || !resolved_name.ends_with(suffix) {
+        anyhow::bail!(
+            "resolved log path is not a recognized shard of logical log: logical={} resolved={}",
+            logical_name,
+            resolved_name
+        );
+    }
+    let shard = &resolved_name[prefix.len()..resolved_name.len() - suffix.len()];
+    if shard.is_empty() {
+        anyhow::bail!(
+            "resolved log shard identity is empty: logical={} resolved={}",
+            logical_name,
+            resolved_name
+        );
+    }
+    Ok(shard.to_string())
+}
+
+fn workload_log_path_for_shard(logical_path: &Path, shard: &str) -> anyhow::Result<PathBuf> {
+    if shard == "base" {
+        return Ok(logical_path.to_path_buf());
+    }
+    let date = chrono::NaiveDate::parse_from_str(shard, "%Y-%m-%d")
+        .map_err(|e| anyhow::anyhow!("invalid workload log shard identity '{}': {}", shard, e))?;
+    fluxon_util::daily_sharded_log_path(logical_path, date)
+}
+
+fn workload_log_existing_shards(logical_path: &Path) -> anyhow::Result<Vec<String>> {
+    let mut dated_shards = Vec::new();
+    let mut has_base = false;
+    let parent = logical_path.parent().unwrap_or_else(|| Path::new("."));
+    let logical_name = logical_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| anyhow::anyhow!("logical log path must end with a utf-8 filename"))?;
+    let stem = logical_name
+        .strip_suffix(".log")
+        .ok_or_else(|| anyhow::anyhow!("logical log filename must end with .log"))?;
+    let prefix = format!("{stem}.");
+    let suffix = ".log";
+    let entries = std::fs::read_dir(parent)?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let entry_name = entry.file_name();
+        let Some(entry_name) = entry_name.to_str() else {
+            continue;
+        };
+        if entry_name == logical_name {
+            has_base = true;
+            continue;
+        }
+        if !entry_name.starts_with(prefix.as_str()) || !entry_name.ends_with(suffix) {
+            continue;
+        }
+        if entry_name.len() <= prefix.len() + suffix.len() {
+            continue;
+        }
+        let shard = &entry_name[prefix.len()..entry_name.len() - suffix.len()];
+        if chrono::NaiveDate::parse_from_str(shard, "%Y-%m-%d").is_ok() {
+            dated_shards.push(shard.to_string());
+        }
+    }
+    dated_shards.sort();
+    dated_shards.dedup();
+    if !dated_shards.is_empty() {
+        return Ok(dated_shards);
+    }
+    if has_base {
+        return Ok(vec!["base".to_string()]);
+    }
+    Ok(Vec::new())
+}
+
+fn workload_log_previous_shard(logical_path: &Path, shard: &str) -> anyhow::Result<Option<String>> {
+    let shards = workload_log_existing_shards(logical_path)?;
+    let Some(idx) = shards.iter().position(|v| v == shard) else {
+        return Ok(None);
+    };
+    if idx == 0 {
+        return Ok(None);
+    }
+    Ok(Some(shards[idx - 1].clone()))
+}
+
+fn workload_log_next_shard(logical_path: &Path, shard: &str) -> anyhow::Result<Option<String>> {
+    let shards = workload_log_existing_shards(logical_path)?;
+    let Some(idx) = shards.iter().position(|v| v == shard) else {
+        return Ok(None);
+    };
+    if idx + 1 >= shards.len() {
+        return Ok(None);
+    }
+    Ok(Some(shards[idx + 1].clone()))
+}
+
+fn workload_log_latest_shard_identity(logical_path: &Path) -> anyhow::Result<Option<String>> {
+    let Some(path) = resolve_readable_log_path(logical_path) else {
+        return Ok(None);
+    };
+    Ok(Some(workload_log_shard_identity_from_path(logical_path, &path)?))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -577,7 +706,7 @@ struct ReadWorkloadLogReq {
     name: String,
     direction: LogReadDirection,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cursor: Option<u64>,
+    cursor: Option<WorkloadLogCursor>,
     // Contract:
     // - max_bytes may be omitted to mean "unlimited" (no byte cap).
     // - This supports ad-hoc debugging where the caller wants the full log without knowing file_size up-front.
@@ -599,7 +728,18 @@ struct ReadWorkloadLogResp {
     #[serde(skip_serializing_if = "Option::is_none")]
     end_offset: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    start_cursor: Option<WorkloadLogCursor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_cursor: Option<WorkloadLogCursor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkloadLogCursor {
+    shard: String,
+    offset: u64,
 }
 
 fn ensure_positive_u64(v: u64, field: &str) -> KvResult<u64> {
@@ -970,7 +1110,7 @@ fn resolve_python_host_executable(python_exe: &Path) -> anyhow::Result<PathBuf> 
     Ok(resolved)
 }
 
-fn ensure_embedded_selection_supervisor(workdir: &Path) -> anyhow::Result<PathBuf> {
+fn ensure_embedded_selection_supervisor_runtime(workdir: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     let runtime_dir = workdir.join(OPS_SELECTION_SUPERVISOR_DIR_NAME);
     std::fs::create_dir_all(&runtime_dir).with_context(|| {
         format!(
@@ -979,6 +1119,7 @@ fn ensure_embedded_selection_supervisor(workdir: &Path) -> anyhow::Result<PathBu
         )
     })?;
     let script_path = runtime_dir.join(OPS_SELECTION_SUPERVISOR_FILENAME);
+    let helper_path = runtime_dir.join(OPS_LOG_SHARD_HELPER_FILENAME);
     let should_write = match std::fs::read_to_string(&script_path) {
         Ok(existing) => existing != EMBEDDED_SELECTION_SUPERVISOR_SOURCE,
         Err(e) => {
@@ -988,6 +1129,19 @@ fn ensure_embedded_selection_supervisor(workdir: &Path) -> anyhow::Result<PathBu
                 return Err(anyhow::Error::new(e).context(format!(
                     "read embedded selection supervisor failed: {}",
                     script_path.display()
+                )));
+            }
+        }
+    };
+    let should_write_helper = match std::fs::read_to_string(&helper_path) {
+        Ok(existing) => existing != EMBEDDED_LOG_SHARD_HELPER_SOURCE,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                true
+            } else {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "read embedded log shard helper failed: {}",
+                    helper_path.display()
                 )));
             }
         }
@@ -1019,13 +1173,21 @@ fn ensure_embedded_selection_supervisor(workdir: &Path) -> anyhow::Result<PathBu
             })?;
         }
     }
-    Ok(script_path)
+    if should_write_helper {
+        std::fs::write(&helper_path, EMBEDDED_LOG_SHARD_HELPER_SOURCE).with_context(|| {
+            format!(
+                "write embedded log shard helper failed: {}",
+                helper_path.display()
+            )
+        })?;
+    }
+    Ok((script_path, helper_path))
 }
 
 impl SelectionSupervisorRuntime {
     fn materialize(workdir: &Path, hostworkdir: &Path, python_exe: &Path) -> anyhow::Result<Self> {
         let python_exe = resolve_python_host_executable(python_exe)?;
-        let script_path = ensure_embedded_selection_supervisor(workdir)?;
+        let (script_path, _helper_path) = ensure_embedded_selection_supervisor_runtime(workdir)?;
         if !hostworkdir.is_absolute() {
             anyhow::bail!(
                 "hostworkdir must be absolute for shared selection supervisor runtime: {}",
@@ -1647,7 +1809,9 @@ fn selection_status_from_live_supervisor(
         apply_id: runtime_state.as_ref().and_then(|v| v.apply_id.clone()),
         argv: runtime_state.as_ref().map(|v| v.argv.clone()),
         cwd: runtime_state.as_ref().and_then(|v| v.cwd.clone()),
-        log_path: runtime_state.as_ref().map(|v| v.log_path.clone()),
+        log_path: runtime_state
+            .as_ref()
+            .map(|v| display_runtime_log_path(v.log_path.as_str())),
         started_ts_ms: None,
         owner_ts_ms: Some(supervisor.owner_ts_ms),
         supervisor_start_time_ticks: Some(supervisor.start_time_ticks()),
@@ -2964,117 +3128,268 @@ impl UserRpcHandler for ReadWorkloadLogChunkHandler {
                     file_size: None,
                     start_offset: None,
                     end_offset: None,
+                    start_cursor: None,
+                    end_cursor: None,
                     text: None,
                 };
                 return Ok(serde_json::to_vec(&resp).unwrap());
             }
         };
 
-        let path = self.log_dir.join(log_filename);
+        let logical_path = self.log_dir.join(log_filename);
+        let make_err_resp = |err: String, file_size: Option<u64>| ReadWorkloadLogResp {
+            ok: false,
+            err: Some(err),
+            file_size,
+            start_offset: None,
+            end_offset: None,
+            start_cursor: None,
+            end_cursor: None,
+            text: None,
+        };
+
+        let (path, shard) = match req.cursor.as_ref() {
+            Some(cursor) => match workload_log_path_for_shard(&logical_path, &cursor.shard) {
+                Ok(path) => (path, cursor.shard.clone()),
+                Err(e) => {
+                    let resp = make_err_resp(format!("{}", e), None);
+                    return Ok(serde_json::to_vec(&resp).unwrap());
+                }
+            },
+            None => {
+                let Some(path) = resolve_readable_log_path(&logical_path) else {
+                    let resp = make_err_resp(
+                        format!("log file is not available yet: logical_path={}", logical_path.display()),
+                        None,
+                    );
+                    return Ok(serde_json::to_vec(&resp).unwrap());
+                };
+                let shard = match workload_log_shard_identity_from_path(&logical_path, &path) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let resp = make_err_resp(format!("{}", e), None);
+                        return Ok(serde_json::to_vec(&resp).unwrap());
+                    }
+                };
+                (path, shard)
+            }
+        };
         let meta = match std::fs::metadata(&path) {
             Ok(v) => v,
             Err(e) => {
-                let resp = ReadWorkloadLogResp {
-                    ok: false,
-                    err: Some(format!(
-                        "stat log failed: path={} err={}",
-                        path.display(),
-                        e
-                    )),
-                    file_size: None,
-                    start_offset: None,
-                    end_offset: None,
-                    text: None,
-                };
+                let resp = make_err_resp(
+                    format!("stat log failed: path={} err={}", path.display(), e),
+                    None,
+                );
                 return Ok(serde_json::to_vec(&resp).unwrap());
             }
         };
 
         let file_size = meta.len();
-        let (start, end) = match req.direction {
-            LogReadDirection::Forward => {
-                if let Some(cursor) = req.cursor {
-                    if cursor > file_size {
-                        let resp = ReadWorkloadLogResp {
-                            ok: false,
-                            err: Some(format!(
-                                "cursor out of range: cursor={} file_size={}",
-                                cursor, file_size
-                            )),
-                            file_size: Some(file_size),
-                            start_offset: None,
-                            end_offset: None,
-                            text: None,
+        let (start, end, start_cursor, end_cursor, effective_path, effective_file_size) =
+            match req.direction {
+                LogReadDirection::Forward => {
+                    if let Some(cursor) = req.cursor.as_ref() {
+                        if cursor.offset > file_size {
+                            let resp = make_err_resp(
+                                format!(
+                                    "cursor out of range: shard={} cursor={} file_size={}",
+                                    cursor.shard, cursor.offset, file_size
+                                ),
+                                Some(file_size),
+                            );
+                            return Ok(serde_json::to_vec(&resp).unwrap());
+                        }
+                        let mut effective_path = path.clone();
+                        let mut effective_shard = shard.clone();
+                        let mut effective_file_size = file_size;
+                        let mut start = cursor.offset;
+                        if cursor.offset == file_size {
+                            if let Ok(Some(next_shard)) =
+                                workload_log_next_shard(&logical_path, &cursor.shard)
+                            {
+                                let next_path = match workload_log_path_for_shard(&logical_path, &next_shard) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let resp = make_err_resp(format!("{}", e), Some(file_size));
+                                        return Ok(serde_json::to_vec(&resp).unwrap());
+                                    }
+                                };
+                                match std::fs::metadata(&next_path) {
+                                    Ok(next_meta) => {
+                                        effective_file_size = next_meta.len();
+                                        effective_path = next_path;
+                                        effective_shard = next_shard;
+                                        start = 0;
+                                    }
+                                    Err(e) => {
+                                        let resp = make_err_resp(
+                                            format!(
+                                                "stat next log shard failed: path={} err={}",
+                                                next_path.display(),
+                                                e
+                                            ),
+                                            Some(file_size),
+                                        );
+                                        return Ok(serde_json::to_vec(&resp).unwrap());
+                                    }
+                                }
+                            } else if let Ok(Some(latest_shard)) =
+                                workload_log_latest_shard_identity(&logical_path)
+                            {
+                                if latest_shard != cursor.shard {
+                                    let latest_path =
+                                        match workload_log_path_for_shard(&logical_path, &latest_shard) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                let resp = make_err_resp(format!("{}", e), Some(file_size));
+                                                return Ok(serde_json::to_vec(&resp).unwrap());
+                                            }
+                                        };
+                                    match std::fs::metadata(&latest_path) {
+                                        Ok(latest_meta) => {
+                                            effective_file_size = latest_meta.len();
+                                            effective_path = latest_path;
+                                            effective_shard = latest_shard;
+                                            start = 0;
+                                        }
+                                        Err(e) => {
+                                            let resp = make_err_resp(
+                                                format!(
+                                                    "stat latest log shard failed: path={} err={}",
+                                                    latest_path.display(),
+                                                    e
+                                                ),
+                                                Some(file_size),
+                                            );
+                                            return Ok(serde_json::to_vec(&resp).unwrap());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let end = match max_bytes {
+                            Some(max_bytes) => {
+                                std::cmp::min(effective_file_size, start.saturating_add(max_bytes))
+                            }
+                            None => effective_file_size,
                         };
+                        (
+                            start,
+                            end,
+                            Some(WorkloadLogCursor {
+                                shard: effective_shard.clone(),
+                                offset: start,
+                            }),
+                            Some(WorkloadLogCursor {
+                                shard: effective_shard.clone(),
+                                offset: end,
+                            }),
+                            effective_path,
+                            effective_file_size,
+                        )
+                    } else {
+                        let end = file_size;
+                        let start = match max_bytes {
+                            Some(max_bytes) => end.saturating_sub(max_bytes),
+                            None => 0,
+                        };
+                        (
+                            start,
+                            end,
+                            Some(WorkloadLogCursor {
+                                shard: shard.clone(),
+                                offset: start,
+                            }),
+                            Some(WorkloadLogCursor {
+                                shard: shard.clone(),
+                                offset: end,
+                            }),
+                            path.clone(),
+                            file_size,
+                        )
+                    }
+                }
+                LogReadDirection::Backward => {
+                    let Some(cursor) = req.cursor.as_ref() else {
+                        let resp = make_err_resp(
+                            "cursor is required for Backward reads".to_string(),
+                            Some(file_size),
+                        );
+                        return Ok(serde_json::to_vec(&resp).unwrap());
+                    };
+                    if cursor.offset > file_size {
+                        let resp = make_err_resp(
+                            format!(
+                                "cursor out of range: shard={} cursor={} file_size={}",
+                                cursor.shard, cursor.offset, file_size
+                            ),
+                            Some(file_size),
+                        );
                         return Ok(serde_json::to_vec(&resp).unwrap());
                     }
-                    let start = cursor;
-                    let end = match max_bytes {
-                        Some(max_bytes) => {
-                            std::cmp::min(file_size, start.saturating_add(max_bytes))
+                    let mut effective_path = path.clone();
+                    let mut effective_shard = shard.clone();
+                    let mut effective_file_size = file_size;
+                    let mut end = cursor.offset;
+                    if cursor.offset == 0 {
+                        if let Ok(Some(prev_shard)) =
+                            workload_log_previous_shard(&logical_path, &cursor.shard)
+                        {
+                            let prev_path = match workload_log_path_for_shard(&logical_path, &prev_shard) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let resp = make_err_resp(format!("{}", e), Some(file_size));
+                                    return Ok(serde_json::to_vec(&resp).unwrap());
+                                }
+                            };
+                            match std::fs::metadata(&prev_path) {
+                                Ok(prev_meta) => {
+                                    effective_file_size = prev_meta.len();
+                                    effective_path = prev_path;
+                                    effective_shard = prev_shard;
+                                    end = effective_file_size;
+                                }
+                                Err(e) => {
+                                    let resp = make_err_resp(
+                                        format!(
+                                            "stat previous log shard failed: path={} err={}",
+                                            prev_path.display(),
+                                            e
+                                        ),
+                                        Some(file_size),
+                                    );
+                                    return Ok(serde_json::to_vec(&resp).unwrap());
+                                }
+                            }
                         }
-                        None => file_size,
-                    };
-                    (start, end)
-                } else {
-                    // Tail:
-                    // - max_bytes=Some => return the last max_bytes bytes.
-                    // - max_bytes=None => return the whole file.
-                    let end = file_size;
+                    }
                     let start = match max_bytes {
                         Some(max_bytes) => end.saturating_sub(max_bytes),
                         None => 0,
                     };
-                    (start, end)
+                    (
+                        start,
+                        end,
+                        Some(WorkloadLogCursor {
+                            shard: effective_shard.clone(),
+                            offset: start,
+                        }),
+                        Some(WorkloadLogCursor {
+                            shard: effective_shard.clone(),
+                            offset: end,
+                        }),
+                        effective_path,
+                        effective_file_size,
+                    )
                 }
-            }
-            LogReadDirection::Backward => {
-                let Some(cursor) = req.cursor else {
-                    let resp = ReadWorkloadLogResp {
-                        ok: false,
-                        err: Some("cursor is required for Backward reads".to_string()),
-                        file_size: Some(file_size),
-                        start_offset: None,
-                        end_offset: None,
-                        text: None,
-                    };
-                    return Ok(serde_json::to_vec(&resp).unwrap());
-                };
-                if cursor > file_size {
-                    let resp = ReadWorkloadLogResp {
-                        ok: false,
-                        err: Some(format!(
-                            "cursor out of range: cursor={} file_size={}",
-                            cursor, file_size
-                        )),
-                        file_size: Some(file_size),
-                        start_offset: None,
-                        end_offset: None,
-                        text: None,
-                    };
-                    return Ok(serde_json::to_vec(&resp).unwrap());
-                }
-                let end = cursor;
-                let start = match max_bytes {
-                    Some(max_bytes) => end.saturating_sub(max_bytes),
-                    None => 0,
-                };
-                (start, end)
-            }
-        };
+            };
 
         if end < start {
-            let resp = ReadWorkloadLogResp {
-                ok: false,
-                err: Some(format!(
-                    "internal error: end < start: start={} end={}",
-                    start, end
-                )),
-                file_size: Some(file_size),
-                start_offset: None,
-                end_offset: None,
-                text: None,
-            };
+            let resp = make_err_resp(
+                format!("internal error: end < start: start={} end={}", start, end),
+                Some(effective_file_size),
+            );
             return Ok(serde_json::to_vec(&resp).unwrap());
         }
 
@@ -3086,70 +3401,42 @@ impl UserRpcHandler for ReadWorkloadLogChunkHandler {
         })?;
         if let Some(max_bytes_usize) = max_bytes_usize {
             if len > max_bytes_usize {
-                let resp = ReadWorkloadLogResp {
-                    ok: false,
-                    err: Some(format!(
+                let resp = make_err_resp(
+                    format!(
                         "internal error: computed read_len exceeds max_bytes: read_len={} max_bytes={}",
                         len, max_bytes_usize
-                    )),
-                    file_size: Some(file_size),
-                    start_offset: None,
-                    end_offset: None,
-                    text: None,
-                };
+                    ),
+                    Some(effective_file_size),
+                );
                 return Ok(serde_json::to_vec(&resp).unwrap());
             }
         }
 
-        let mut f = match std::fs::File::open(&path) {
+        let mut f = match std::fs::File::open(&effective_path) {
             Ok(v) => v,
             Err(e) => {
-                let resp = ReadWorkloadLogResp {
-                    ok: false,
-                    err: Some(format!(
-                        "open log failed: path={} err={}",
-                        path.display(),
-                        e
-                    )),
-                    file_size: Some(file_size),
-                    start_offset: None,
-                    end_offset: None,
-                    text: None,
-                };
+                let resp = make_err_resp(
+                    format!("open log failed: path={} err={}", effective_path.display(), e),
+                    Some(effective_file_size),
+                );
                 return Ok(serde_json::to_vec(&resp).unwrap());
             }
         };
 
         if let Err(e) = std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(start)) {
-            let resp = ReadWorkloadLogResp {
-                ok: false,
-                err: Some(format!(
-                    "seek log failed: path={} err={}",
-                    path.display(),
-                    e
-                )),
-                file_size: Some(file_size),
-                start_offset: None,
-                end_offset: None,
-                text: None,
-            };
+            let resp = make_err_resp(
+                format!("seek log failed: path={} err={}", effective_path.display(), e),
+                Some(effective_file_size),
+            );
             return Ok(serde_json::to_vec(&resp).unwrap());
         }
 
         let mut buf: Vec<u8> = vec![0; len];
         if let Err(e) = std::io::Read::read_exact(&mut f, &mut buf) {
-            let resp = ReadWorkloadLogResp {
-                ok: false,
-                err: Some(format!(
-                    "read log failed: path={} err={}",
-                    path.display(),
-                    e
-                )),
-                file_size: Some(file_size),
-                start_offset: None,
-                end_offset: None,
-                text: None,
-            };
+            let resp = make_err_resp(
+                format!("read log failed: path={} err={}", effective_path.display(), e),
+                Some(effective_file_size),
+            );
             return Ok(serde_json::to_vec(&resp).unwrap());
         }
 
@@ -3162,9 +3449,11 @@ impl UserRpcHandler for ReadWorkloadLogChunkHandler {
         let resp = ReadWorkloadLogResp {
             ok: true,
             err: None,
-            file_size: Some(file_size),
+            file_size: Some(effective_file_size),
             start_offset: Some(start),
             end_offset: Some(end),
+            start_cursor,
+            end_cursor,
             text: Some(text),
         };
         Ok(serde_json::to_vec(&resp).unwrap())
@@ -3773,8 +4062,12 @@ fn desired_workload_matches_running(
     workloads: &SupervisorBackedWorkloads,
     desired: &AgentDesiredWorkload,
 ) -> bool {
-    let _ = workloads;
-    let Ok(status) = observe_selection_status(desired.kind, &desired.name, &desired.authority)
+    let Ok(status) = observe_selection_status_for_scope(
+        desired.kind,
+        &desired.name,
+        &desired.authority,
+        Some(workloads.scope_key.as_str()),
+    )
     else {
         return false;
     };
@@ -3854,7 +4147,6 @@ fn desired_workload_recovery_superseded(
     workloads: &SupervisorBackedWorkloads,
     desired: &AgentDesiredWorkload,
 ) -> anyhow::Result<bool> {
-    let _ = workloads;
     // English note:
     // - A newer apply-owned generation overlapping an older applyless bare owner is the expected
     //   phase-1 state of the self-host two-phase handover.
@@ -3863,7 +4155,12 @@ fn desired_workload_recovery_superseded(
     //   phase 2 has a chance to cut over.
     // - Only an owner_ts that is newer than the requested workload and is not this intentional
     //   phase-1 overlap is treated as a hard superseding fact.
-    let status = observe_selection_status(desired.kind, &desired.name, &desired.authority)?;
+    let status = observe_selection_status_for_scope(
+        desired.kind,
+        &desired.name,
+        &desired.authority,
+        Some(workloads.scope_key.as_str()),
+    )?;
     if phase1_overlap_with_applyless_owner(&status, desired) {
         return Ok(false);
     }
@@ -8355,20 +8652,22 @@ async function deleteGenerationFromControl() {
 		const LOG_DIR_FORWARD = 'Forward';
 		const LOG_DIR_BACKWARD = 'Backward';
 
-		let workloadLogTimer = null;
-		let workloadLogSelection = { instanceKey: '', kind: '', name: '' };
-		let workloadLogStartOffset = 0;
-		let workloadLogEndOffset = 0;
-		let workloadLogLoadingOlder = false;
-		let workloadLogAnsiState = newAnsiSgrState();
+			let workloadLogTimer = null;
+			let workloadLogSelection = { instanceKey: '', kind: '', name: '' };
+			let workloadLogStartOffset = 0;
+			let workloadLogEndOffset = 0;
+			let workloadLogStartCursor = null;
+			let workloadLogEndCursor = null;
+			let workloadLogLoadingOlder = false;
+			let workloadLogAnsiState = newAnsiSgrState();
 
 		function isWorkloadLogFollowEnabled() {
 		  const cb = document.getElementById('workload_log_follow');
 		  return cb && cb.checked === true;
 		}
 
-		function setWorkloadLogHeader() {
-		  const h = document.getElementById('workload_log_header');
+			function setWorkloadLogHeader() {
+			  const h = document.getElementById('workload_log_header');
 		  const ik = workloadLogSelection.instanceKey || '';
 		  const kind = workloadLogSelection.kind || '';
 		  const name = workloadLogSelection.name || '';
@@ -8376,10 +8675,14 @@ async function deleteGenerationFromControl() {
 		  if (!ik || !kind || !name) {
 		    h.textContent = 'No log selected. Click "Logs" in the table.';
 		    return;
-		  }
-		  h.textContent = 'instance_key=' + ik + ' workload=' + kind + '/' + name
-		    + ' range=[' + String(workloadLogStartOffset) + ',' + String(workloadLogEndOffset) + ')';
-		}
+			  }
+			  const shardText = (workloadLogEndCursor && workloadLogEndCursor.shard)
+			    ? String(workloadLogEndCursor.shard)
+			    : ((workloadLogStartCursor && workloadLogStartCursor.shard) ? String(workloadLogStartCursor.shard) : '-');
+			  h.textContent = 'instance_key=' + ik + ' workload=' + kind + '/' + name
+			    + ' shard=' + shardText
+			    + ' range=[' + String(workloadLogStartOffset) + ',' + String(workloadLogEndOffset) + ')';
+			}
 
 		function stopWorkloadLogTail() {
 		  if (workloadLogTimer != null) {
@@ -8388,12 +8691,14 @@ async function deleteGenerationFromControl() {
 		  }
 		}
 
-		function clearWorkloadLogView() {
-		  stopWorkloadLogTail();
-		  workloadLogStartOffset = 0;
-		  workloadLogEndOffset = 0;
-		  workloadLogLoadingOlder = false;
-		  workloadLogAnsiState = newAnsiSgrState();
+			function clearWorkloadLogView() {
+			  stopWorkloadLogTail();
+			  workloadLogStartOffset = 0;
+			  workloadLogEndOffset = 0;
+			  workloadLogStartCursor = null;
+			  workloadLogEndCursor = null;
+			  workloadLogLoadingOlder = false;
+			  workloadLogAnsiState = newAnsiSgrState();
 		  setWorkloadLogHeader();
 		  const pre = document.getElementById('workload_log_out');
 		  if (pre) { pre.textContent = '(empty)'; }
@@ -8449,11 +8754,13 @@ async function deleteGenerationFromControl() {
 		    return;
 		  }
 
-		  const txt = (v.text != null) ? String(v.text) : '';
-		  workloadLogStartOffset = (v.start_offset != null) ? Number(v.start_offset) : 0;
-		  workloadLogEndOffset = (v.end_offset != null) ? Number(v.end_offset) : workloadLogStartOffset;
-		  workloadLogLoadingOlder = false;
-		  setWorkloadLogHeader();
+			  const txt = (v.text != null) ? String(v.text) : '';
+			  workloadLogStartOffset = (v.start_offset != null) ? Number(v.start_offset) : 0;
+			  workloadLogEndOffset = (v.end_offset != null) ? Number(v.end_offset) : workloadLogStartOffset;
+			  workloadLogStartCursor = (v.start_cursor != null) ? v.start_cursor : null;
+			  workloadLogEndCursor = (v.end_cursor != null) ? v.end_cursor : null;
+			  workloadLogLoadingOlder = false;
+			  setWorkloadLogHeader();
 
 		  if (pre) {
 		    const r = ansiSgrToHtmlChunkWithState(txt, workloadLogAnsiState);
@@ -8473,8 +8780,8 @@ async function deleteGenerationFromControl() {
 		      return;
 		    }
 
-		    const v2 = await fetchWorkloadLogChunk(LOG_DIR_FORWARD, workloadLogEndOffset);
-		    if (!v2 || v2.ok !== true) {
+			    const v2 = await fetchWorkloadLogChunk(LOG_DIR_FORWARD, workloadLogEndCursor);
+			    if (!v2 || v2.ok !== true) {
 		      // Keep the existing view; update the header so operators see the error.
 		      const h = document.getElementById('workload_log_header');
 		      if (h) {
@@ -8482,12 +8789,15 @@ async function deleteGenerationFromControl() {
 		        h.textContent = 'log tail ERROR: ' + err;
 		      }
 		      return;
-		    }
-		    const txt2 = (v2.text != null) ? String(v2.text) : '';
-		    const newEnd = (v2.end_offset != null) ? Number(v2.end_offset) : workloadLogEndOffset;
-		    if (newEnd < workloadLogEndOffset) {
-		      const h = document.getElementById('workload_log_header');
-		      if (h) {
+			    }
+			    const txt2 = (v2.text != null) ? String(v2.text) : '';
+			    const newEnd = (v2.end_offset != null) ? Number(v2.end_offset) : workloadLogEndOffset;
+			    const newEndCursor = (v2.end_cursor != null) ? v2.end_cursor : workloadLogEndCursor;
+			    const sameShard = workloadLogEndCursor && newEndCursor
+			      && workloadLogEndCursor.shard === newEndCursor.shard;
+			    if (sameShard && newEnd < workloadLogEndOffset) {
+			      const h = document.getElementById('workload_log_header');
+			      if (h) {
 		        h.textContent = 'log tail ERROR: end_offset moved backwards (file truncated/rotated?)'
 		          + ' old_end=' + String(workloadLogEndOffset)
 		          + ' new_end=' + String(newEnd);
@@ -8496,21 +8806,26 @@ async function deleteGenerationFromControl() {
 		      return;
 		    }
 
-		    if (txt2.length > 0) {
-		      const r2 = ansiSgrToHtmlChunkWithState(txt2, workloadLogAnsiState);
-		      workloadLogAnsiState = r2.state;
-		      pre2.insertAdjacentHTML('beforeend', r2.html);
-		      workloadLogEndOffset = newEnd;
-		      setWorkloadLogHeader();
+			    if (txt2.length > 0) {
+			      const r2 = ansiSgrToHtmlChunkWithState(txt2, workloadLogAnsiState);
+			      workloadLogAnsiState = r2.state;
+			      pre2.insertAdjacentHTML('beforeend', r2.html);
+			      workloadLogEndOffset = newEnd;
+			      workloadLogEndCursor = newEndCursor;
+			      if (v2.start_cursor != null && workloadLogStartCursor == null) {
+			        workloadLogStartCursor = v2.start_cursor;
+			      }
+			      setWorkloadLogHeader();
 		      if (follow || atBottom) {
 		        pre2.scrollTop = pre2.scrollHeight;
 		      }
-		    } else {
-		      workloadLogEndOffset = newEnd;
-		      setWorkloadLogHeader();
-		    }
-		  }, WORKLOAD_LOG_POLL_INTERVAL_MS);
-		}
+			    } else {
+			      workloadLogEndOffset = newEnd;
+			      workloadLogEndCursor = newEndCursor;
+			      setWorkloadLogHeader();
+			    }
+			  }, WORKLOAD_LOG_POLL_INTERVAL_MS);
+			}
 
 		async function loadOlderWorkloadLog() {
 		  if (workloadLogLoadingOlder) { return; }
@@ -8520,39 +8835,46 @@ async function deleteGenerationFromControl() {
 		    pre.textContent = 'ERROR: no log selected.';
 		    return;
 		  }
-		  if (workloadLogStartOffset <= 0) {
-		    return;
-		  }
-		  workloadLogLoadingOlder = true;
-		  const beforeHeight = pre.scrollHeight;
-		  const v = await fetchWorkloadLogChunk(LOG_DIR_BACKWARD, workloadLogStartOffset);
-		  if (!v || v.ok !== true) {
+			  if (workloadLogStartCursor == null) {
+			    return;
+			  }
+			  workloadLogLoadingOlder = true;
+			  const beforeHeight = pre.scrollHeight;
+			  const v = await fetchWorkloadLogChunk(LOG_DIR_BACKWARD, workloadLogStartCursor);
+			  if (!v || v.ok !== true) {
 		    const err = v && v.err ? String(v.err) : 'unknown error';
 		    pre.insertAdjacentText('afterbegin', 'ERROR: ' + err + '\n\n');
 		    workloadLogLoadingOlder = false;
 		    return;
-		  }
-		  const txt = (v.text != null) ? String(v.text) : '';
-		  const newStart = (v.start_offset != null) ? Number(v.start_offset) : workloadLogStartOffset;
-		  if (txt.length > 0) {
+			  }
+			  const txt = (v.text != null) ? String(v.text) : '';
+			  const newStart = (v.start_offset != null) ? Number(v.start_offset) : workloadLogStartOffset;
+			  const newStartCursor = (v.start_cursor != null) ? v.start_cursor : workloadLogStartCursor;
+			  if (txt.length > 0) {
 		    // English note: prepend is stateless; this is best-effort because boundary SGR state
 		    // cannot be re-applied to already-rendered newer content.
 		    pre.insertAdjacentHTML('afterbegin', ansiSgrToHtmlChunkStateless(txt));
-		  }
-		  workloadLogStartOffset = newStart;
-		  setWorkloadLogHeader();
+			  }
+			  workloadLogStartOffset = newStart;
+			  workloadLogStartCursor = newStartCursor;
+			  if (v.end_cursor != null) {
+			    workloadLogEndCursor = workloadLogEndCursor || v.end_cursor;
+			  }
+			  setWorkloadLogHeader();
 
 		  const afterHeight = pre.scrollHeight;
 		  pre.scrollTop = (afterHeight - beforeHeight) + pre.scrollTop;
 		  workloadLogLoadingOlder = false;
 		}
 
-		function openWorkloadLog(instanceKey, kind, name) {
-		  workloadLogSelection = { instanceKey: String(instanceKey || ''), kind: String(kind || ''), name: String(name || '') };
-		  workloadLogStartOffset = 0;
-		  workloadLogEndOffset = 0;
-		  workloadLogLoadingOlder = false;
-		  setWorkloadLogHeader();
+			function openWorkloadLog(instanceKey, kind, name) {
+			  workloadLogSelection = { instanceKey: String(instanceKey || ''), kind: String(kind || ''), name: String(name || '') };
+			  workloadLogStartOffset = 0;
+			  workloadLogEndOffset = 0;
+			  workloadLogStartCursor = null;
+			  workloadLogEndCursor = null;
+			  workloadLogLoadingOlder = false;
+			  setWorkloadLogHeader();
 		  const pre = document.getElementById('workload_log_out');
 		  if (pre) { pre.textContent = 'Selected. Click Tail to start.'; }
 		  startWorkloadLogTail();
@@ -10301,7 +10623,7 @@ struct WorkloadLogHttpReq {
     kind: WorkloadKind,
     name: String,
     direction: LogReadDirection,
-    cursor: Option<u64>,
+    cursor: Option<WorkloadLogCursor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_bytes: Option<u64>,
 }
@@ -10319,6 +10641,8 @@ async fn handle_workload_log(
             file_size: None,
             start_offset: None,
             end_offset: None,
+            start_cursor: None,
+            end_cursor: None,
             text: None,
         };
         return Ok(response_json(StatusCode::BAD_REQUEST, &resp));
@@ -10335,6 +10659,8 @@ async fn handle_workload_log(
             file_size: None,
             start_offset: None,
             end_offset: None,
+            start_cursor: None,
+            end_cursor: None,
             text: None,
         };
         return Ok(response_json(StatusCode::BAD_REQUEST, &resp));
@@ -10379,6 +10705,8 @@ async fn handle_workload_log(
                 file_size: None,
                 start_offset: None,
                 end_offset: None,
+                start_cursor: None,
+                end_cursor: None,
                 text: None,
             };
             Ok(response_json(StatusCode::BAD_GATEWAY, &resp))
@@ -13939,6 +14267,90 @@ mod tests {
     }
 
     #[test]
+    fn live_selection_supervisors_isolate_same_label_collision_by_scope_key() {
+        let snapshot = SelectionSupervisorProcSnapshot {
+            infos_by_pid: std::collections::HashMap::from([
+                (
+                    11,
+                    ProcessInfoObservation {
+                        pid: 11,
+                        ppid: 1,
+                        pgid: 11,
+                        state: 'S',
+                        start_time_ticks: 100,
+                    },
+                ),
+                (
+                    22,
+                    ProcessInfoObservation {
+                        pid: 22,
+                        ppid: 1,
+                        pgid: 22,
+                        state: 'S',
+                        start_time_ticks: 200,
+                    },
+                ),
+            ]),
+            children_by_ppid: std::collections::HashMap::new(),
+            cmdlines: vec![
+                (
+                    11,
+                    vec![
+                        "/usr/bin/python3".to_string(),
+                        "selection_supervisor.py".to_string(),
+                        "run".to_string(),
+                        "--label".to_string(),
+                        "DaemonSet/target".to_string(),
+                        "--scope-key".to_string(),
+                        "/tmp/scope-a".to_string(),
+                        "--owner-ts-ms".to_string(),
+                        "2".to_string(),
+                    ],
+                ),
+                (
+                    22,
+                    vec![
+                        "/usr/bin/python3".to_string(),
+                        "selection_supervisor.py".to_string(),
+                        "run".to_string(),
+                        "--label".to_string(),
+                        "DaemonSet/target".to_string(),
+                        "--scope-key".to_string(),
+                        "/tmp/scope-b".to_string(),
+                        "--owner-ts-ms".to_string(),
+                        "2".to_string(),
+                    ],
+                ),
+            ],
+            zombie_infos: Vec::new(),
+        };
+
+        let scoped_a =
+            live_selection_supervisors(&snapshot, Some("DaemonSet/target"), Some("/tmp/scope-a"))
+                .unwrap();
+        assert_eq!(scoped_a.len(), 1);
+        assert_eq!(scoped_a[0].pid(), 11);
+
+        let scoped_b =
+            live_selection_supervisors(&snapshot, Some("DaemonSet/target"), Some("/tmp/scope-b"))
+                .unwrap();
+        assert_eq!(scoped_b.len(), 1);
+        assert_eq!(scoped_b[0].pid(), 22);
+
+        let listed_a = observe_all_selection_statuses_for_snapshot(&snapshot, Some("/tmp/scope-a"))
+            .unwrap();
+        assert_eq!(listed_a.len(), 1);
+        assert_eq!(listed_a[0].label, "DaemonSet/target");
+        assert_eq!(listed_a[0].pid, Some(11));
+
+        let listed_b = observe_all_selection_statuses_for_snapshot(&snapshot, Some("/tmp/scope-b"))
+            .unwrap();
+        assert_eq!(listed_b.len(), 1);
+        assert_eq!(listed_b[0].label, "DaemonSet/target");
+        assert_eq!(listed_b[0].pid, Some(22));
+    }
+
+    #[test]
     fn live_selection_supervisors_reject_matching_legacy_entry_without_owner_ts_ms() {
         let snapshot = SelectionSupervisorProcSnapshot {
             infos_by_pid: std::collections::HashMap::from([(
@@ -14406,6 +14818,95 @@ mod tests {
     }
 
     #[test]
+    fn materialize_selection_supervisor_runtime_writes_log_shard_helper() {
+        let python_exe = PathBuf::from("/usr/bin/python3");
+        assert!(
+            python_exe.is_file(),
+            "python executable does not exist: {}",
+            python_exe.display()
+        );
+        let workdir = tempfile::tempdir().unwrap();
+        let runtime =
+            SelectionSupervisorRuntime::materialize(workdir.path(), workdir.path(), python_exe.as_path())
+                .unwrap();
+        assert!(runtime.script_path.exists());
+        assert!(
+            runtime
+                .script_path
+                .parent()
+                .unwrap()
+                .join(OPS_LOG_SHARD_HELPER_FILENAME)
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn detached_selection_supervisor_preserves_early_startup_logs() {
+        let python_exe = PathBuf::from("/usr/bin/python3");
+        assert!(
+            python_exe.is_file(),
+            "python executable does not exist: {}",
+            python_exe.display()
+        );
+        let workdir = tempfile::tempdir().unwrap();
+        let runtime =
+            SelectionSupervisorRuntime::materialize(workdir.path(), workdir.path(), python_exe.as_path())
+                .unwrap();
+        let log_path = workdir.path().join("startup.log");
+        let command = vec![
+            python_exe.display().to_string(),
+            runtime.script_path.display().to_string(),
+            "run".to_string(),
+            "--label".to_string(),
+            "Deployment/startup_demo".to_string(),
+            "--scope-key".to_string(),
+            workdir.path().display().to_string(),
+            "--owner-ts-ms".to_string(),
+            "0".to_string(),
+            "--restart-policy".to_string(),
+            "always".to_string(),
+            "--restart-delay-seconds".to_string(),
+            "5".to_string(),
+            "--max-backoff-seconds".to_string(),
+            "30".to_string(),
+            "--crashloop-consecutive-restarts".to_string(),
+            "0".to_string(),
+            "--crashloop-interval-lt-seconds".to_string(),
+            "0".to_string(),
+            "--".to_string(),
+            "/bin/true".to_string(),
+        ];
+        let pid = runtime.spawn_detached_command(&log_path, command.as_slice()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let expected = "owner-ts-ms must be positive";
+        let mut saw_expected = false;
+        while Instant::now() < deadline {
+            if let Some(path) = resolve_readable_log_path(&log_path) {
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                if text.contains(expected) {
+                    saw_expected = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if let Some(path) = resolve_readable_log_path(&log_path) {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            assert!(
+                text.contains(expected),
+                "expected detached supervisor startup logs to reach runtime log, got: {text:?}"
+            );
+        } else {
+            panic!("runtime log path did not materialize");
+        }
+        assert!(saw_expected, "startup log was not observed before timeout");
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+    }
+
+    #[test]
     fn atomic_group_non_agent_requires_present_before_running_match() {
         let desired = AgentDesiredWorkload {
             kind: WorkloadKind::DaemonSet,
@@ -14615,5 +15116,116 @@ mod tests {
             status_hint: None,
         };
         assert!(!phase1_overlap_with_applyless_owner(&status, &desired));
+    }
+
+    #[test]
+    fn resolve_readable_log_path_prefers_latest_daily_shard() {
+        let td = tempfile::tempdir().unwrap();
+        let base_path = td.path().join("workload__Deployment__demo.log");
+        std::fs::write(
+            td.path().join("workload__Deployment__demo.2026-06-19.log"),
+            "old\n",
+        )
+        .unwrap();
+        std::fs::write(
+            td.path().join("workload__Deployment__demo.2026-06-20.log"),
+            "new\n",
+        )
+        .unwrap();
+        let resolved = resolve_readable_log_path(&base_path).unwrap();
+        assert_eq!(
+            resolved.file_name().and_then(|v| v.to_str()),
+            Some("workload__Deployment__demo.2026-06-20.log")
+        );
+    }
+
+    #[test]
+    fn read_workload_log_forward_cursor_rolls_into_next_shard() {
+        let td = tempfile::tempdir().unwrap();
+        let log_dir = td.path().to_path_buf();
+        std::fs::write(
+            log_dir.join("workload__Deployment__demo.2026-06-19.log"),
+            "old\n",
+        )
+        .unwrap();
+        std::fs::write(
+            log_dir.join("workload__Deployment__demo.2026-06-20.log"),
+            "new\n",
+        )
+        .unwrap();
+        let handler = ReadWorkloadLogChunkHandler { log_dir };
+        let req = ReadWorkloadLogReq {
+            kind: WorkloadKind::Deployment,
+            name: "demo".to_string(),
+            direction: LogReadDirection::Forward,
+            cursor: Some(WorkloadLogCursor {
+                shard: "2026-06-19".to_string(),
+                offset: 4,
+            }),
+            max_bytes: Some(65536),
+        };
+        let raw = handler.handle("n1".into(), &serde_json::to_vec(&req).unwrap()).unwrap();
+        let resp: ReadWorkloadLogResp = serde_json::from_slice(&raw).unwrap();
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(resp.text.as_deref(), Some("new\n"));
+        assert_eq!(
+            resp.start_cursor,
+            Some(WorkloadLogCursor {
+                shard: "2026-06-20".to_string(),
+                offset: 0,
+            })
+        );
+        assert_eq!(
+            resp.end_cursor,
+            Some(WorkloadLogCursor {
+                shard: "2026-06-20".to_string(),
+                offset: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn read_workload_log_backward_cursor_rolls_into_previous_shard() {
+        let td = tempfile::tempdir().unwrap();
+        let log_dir = td.path().to_path_buf();
+        std::fs::write(
+            log_dir.join("workload__Deployment__demo.2026-06-19.log"),
+            "old\n",
+        )
+        .unwrap();
+        std::fs::write(
+            log_dir.join("workload__Deployment__demo.2026-06-20.log"),
+            "new\n",
+        )
+        .unwrap();
+        let handler = ReadWorkloadLogChunkHandler { log_dir };
+        let req = ReadWorkloadLogReq {
+            kind: WorkloadKind::Deployment,
+            name: "demo".to_string(),
+            direction: LogReadDirection::Backward,
+            cursor: Some(WorkloadLogCursor {
+                shard: "2026-06-20".to_string(),
+                offset: 0,
+            }),
+            max_bytes: Some(65536),
+        };
+        let raw = handler.handle("n1".into(), &serde_json::to_vec(&req).unwrap()).unwrap();
+        let resp: ReadWorkloadLogResp = serde_json::from_slice(&raw).unwrap();
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(resp.text.as_deref(), Some("old\n"));
+        assert_eq!(
+            resp.start_cursor,
+            Some(WorkloadLogCursor {
+                shard: "2026-06-19".to_string(),
+                offset: 0,
+            })
+        );
+        assert_eq!(
+            resp.end_cursor,
+            Some(WorkloadLogCursor {
+                shard: "2026-06-19".to_string(),
+                offset: 4,
+            })
+        );
     }
 }

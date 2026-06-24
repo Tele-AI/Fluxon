@@ -2,6 +2,7 @@ use crate::test_util::{is_etcd_running, start_test_etcd};
 use std::process::Command;
 
 #[test]
+#[serial_test::serial(build_config_ext)]
 fn test_etcd_only_starts_once() {
     start_test_etcd().expect("start local test etcd");
     assert!(is_etcd_running(), "etcd should be reachable after startup");

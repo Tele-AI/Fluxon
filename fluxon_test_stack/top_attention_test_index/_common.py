@@ -14,6 +14,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEST_REQUIREMENTS: list[str] = ["ops"]
+BUILD_CONFIG_EXT_PATH_ENV = "FLUXON_BUILD_CONFIG_EXT_PATH"
 
 
 def call(cmd: Sequence[str], *, env: dict[str, str] | None = None) -> int:
@@ -32,20 +33,33 @@ def parse_python_passthrough(description: str) -> tuple[str, list[str]]:
     return args.python, passthrough
 
 
-def run_pytest(description: str, paths: Iterable[str]) -> int:
-    python, passthrough = parse_python_passthrough(description)
-    return call([python, "-m", "pytest", *paths, *passthrough])
+def run_pytest(
+    description: str,
+    paths: Iterable[str],
+    *,
+    passthrough: Sequence[str] | None = None,
+) -> int:
+    python, _ = parse_python_passthrough(description)
+    effective_passthrough = [] if passthrough is None else list(passthrough)
+    return call([python, "-m", "pytest", *paths, *effective_passthrough])
 
 
-def run_python_file(description: str, path: str, extra_args: Iterable[str] = ()) -> int:
-    python, passthrough = parse_python_passthrough(description)
-    return call([python, "-u", str(REPO_ROOT / path), *extra_args, *passthrough])
+def run_python_file(
+    description: str,
+    path: str,
+    extra_args: Iterable[str] = (),
+) -> int:
+    python, _ = parse_python_passthrough(description)
+    return call([python, "-u", str(REPO_ROOT / path), *extra_args])
 
 
-def run_python_files(description: str, paths: Iterable[str]) -> int:
-    python, passthrough = parse_python_passthrough(description)
+def run_python_files(
+    description: str,
+    paths: Iterable[str],
+) -> int:
+    python, _ = parse_python_passthrough(description)
     for path in paths:
-        rc = call([python, "-u", str(REPO_ROOT / path), *passthrough])
+        rc = call([python, "-u", str(REPO_ROOT / path)])
         if rc != 0:
             return rc
     return 0
@@ -120,8 +134,14 @@ def write_build_config_ext(case_cfg_path: str | Path, *, scene_runtime: object) 
     return out_path
 
 
-def _path_contains_fluxon_pyo3_libs_dir(path: Path) -> bool:
-    return "fluxon_pyo3.libs" in path.parts
+def inject_build_config_ext_env(
+    env: dict[str, str] | None,
+    *,
+    build_config_ext_path: str | Path,
+) -> dict[str, str]:
+    prepared_env = os.environ.copy() if env is None else dict(env)
+    prepared_env[BUILD_CONFIG_EXT_PATH_ENV] = str(Path(build_config_ext_path).resolve())
+    return prepared_env
 
 
 def _iter_active_python_site_packages_roots() -> list[Path]:
@@ -158,34 +178,78 @@ def _resolve_authoritative_fluxon_pyo3_libs_dir() -> Path | None:
     return None
 
 
+def _prepend_env_path_list(
+    prepared_env: dict[str, str],
+    *,
+    key: str,
+    entries: Sequence[str],
+) -> None:
+    normalized_entries: list[str] = []
+    seen_entries: set[str] = set()
+    for raw_entry in entries:
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if entry in seen_entries:
+            continue
+        seen_entries.add(entry)
+        normalized_entries.append(entry)
+
+    current_value = prepared_env.get(key)
+    if current_value is None:
+        prepared_env[key] = ":".join(normalized_entries)
+        return
+
+    for raw_entry in current_value.split(":"):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if entry in seen_entries:
+            continue
+        seen_entries.add(entry)
+        normalized_entries.append(entry)
+    prepared_env[key] = ":".join(normalized_entries)
+
+
+def _resolve_repo_closed_sdk_root() -> Path | None:
+    closed_sdk_root = (REPO_ROOT / "fluxon_release" / "closed_sdk").resolve()
+    if not closed_sdk_root.is_dir():
+        return None
+    manifest_path = closed_sdk_root / "manifest.json"
+    lib_dir = closed_sdk_root / "lib"
+    if not manifest_path.is_file() or not lib_dir.is_dir():
+        return None
+    return closed_sdk_root
+
+
 def _prepare_cargo_env(env: dict[str, str] | None) -> dict[str, str] | None:
-    libs_dir = _resolve_authoritative_fluxon_pyo3_libs_dir()
-    if libs_dir is None:
-        return None if env is None else dict(env)
-
     prepared_env = os.environ.copy() if env is None else dict(env)
-    authoritative_entry = str(libs_dir)
-    prepared_env["FLUXON_PYO3_LIBS_DIR"] = authoritative_entry
 
-    sanitized_entries = [authoritative_entry]
-    seen_entries = {authoritative_entry}
-    current_ld_library_path = prepared_env.get("LD_LIBRARY_PATH")
-    if current_ld_library_path is not None:
-        for raw_entry in current_ld_library_path.split(":"):
-            entry = raw_entry.strip()
-            if not entry:
-                continue
-            if entry in seen_entries:
-                continue
-            if _path_contains_fluxon_pyo3_libs_dir(Path(entry)):
-                continue
-            seen_entries.add(entry)
-            sanitized_entries.append(entry)
-    prepared_env["LD_LIBRARY_PATH"] = ":".join(sanitized_entries)
+    libs_dir = _resolve_authoritative_fluxon_pyo3_libs_dir()
+    if libs_dir is not None:
+        prepared_env["FLUXON_PYO3_LIBS_DIR"] = str(libs_dir)
+
+    closed_sdk_root = _resolve_repo_closed_sdk_root()
+    if closed_sdk_root is not None:
+        prepared_env["FLUXON_COMMU_CLOSED_SDK_ROOT"] = str(closed_sdk_root)
+        _prepend_env_path_list(
+            prepared_env,
+            key="LD_LIBRARY_PATH",
+            entries=[str((closed_sdk_root / "lib").resolve())],
+        )
+
+    if env is None and libs_dir is None and closed_sdk_root is None:
+        return None
     return prepared_env
 
 
-def run_cargo(args: Iterable[str], *, env: dict[str, str] | None = None) -> int:
+def run_cargo(
+    args: Iterable[str],
+    *,
+    env: dict[str, str] | None = None,
+    passthrough: Sequence[str] | None = None,
+) -> int:
     # Rust test binaries launched via cargo run/load depend on the wheel-bundled native
     # runtime under the active venv. Keep one authoritative search root for all wrappers.
-    return call(["cargo", *args], env=_prepare_cargo_env(env))
+    effective_passthrough = [] if passthrough is None else list(passthrough)
+    return call(["cargo", *args, *effective_passthrough], env=_prepare_cargo_env(env))

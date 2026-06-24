@@ -1,45 +1,44 @@
 from __future__ import annotations
 
+import os
 import shutil
+import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+scripts_dir_str = str(SCRIPTS_DIR)
+if scripts_dir_str in sys.path:
+    sys.path.remove(scripts_dir_str)
+sys.path.insert(0, scripts_dir_str)
 
-PUBLIC_WORKSPACE_INPUT_RELATIVE_PATHS = (
-    "setup.py",
-    "fluxon_py",
-    "fluxon_release/closed_sdk",
-    "fluxon_rs/Cargo.toml",
-    "fluxon_rs/Cargo.lock",
-    "fluxon_rs/.cargo",
-    "fluxon_rs/rust-toolchain.toml",
-    "fluxon_rs/fluxon_commu_contract",
-    "fluxon_rs/fluxon_commu_closed_sdk_consumer",
-    "fluxon_rs/fluxon_commu",
-    "fluxon_rs/fluxon_pyo3",
-    "fluxon_rs/limit_thirdparty",
-    "fluxon_rs/fluxon_kv",
-    "fluxon_rs/fluxon_framework",
-    "fluxon_rs/fluxon_framework_compiled",
-    "fluxon_rs/fluxon_util",
-    "fluxon_rs/fluxon_mq",
-    "fluxon_rs/fluxon_cli",
-    "fluxon_rs/fluxon_ops",
-    "fluxon_rs/fluxon_proxy_proto",
-    "fluxon_rs/fluxon_proxy",
-    "fluxon_rs/fluxon_fs",
-    "fluxon_rs/fluxon_fs_core",
-    "fluxon_rs/fluxon_fs_s3_gateway",
-    "fluxon_rs/fluxon_observability",
-    "fluxon_rs/moka",
+from source_selection_profiles import (
+    SOURCE_SELECTION_PROFILE_BUILD_SEED,
+    collect_source_profile_relpaths,
 )
 
 
 def _copy_public_workspace_input_path(source_path: Path, target_path: Path) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
+    if source_path.is_symlink():
+        if target_path.exists() or target_path.is_symlink():
+            if target_path.is_dir() and not target_path.is_symlink():
+                shutil.rmtree(target_path)
+            else:
+                target_path.unlink()
+        os.symlink(os.readlink(source_path), target_path)
+        return
     if source_path.is_dir():
         shutil.copytree(source_path, target_path, symlinks=True, dirs_exist_ok=True)
         return
     shutil.copy2(source_path, target_path)
+
+
+def collect_public_workspace_input_relative_paths(*, repo_root: Path) -> tuple[str, ...]:
+    return collect_source_profile_relpaths(
+        repo_root=repo_root,
+        profile=SOURCE_SELECTION_PROFILE_BUILD_SEED,
+    )
 
 
 def _sanitize_public_workspace_input(*, workspace_root: Path) -> None:
@@ -51,9 +50,8 @@ def _sanitize_public_workspace_input(*, workspace_root: Path) -> None:
         except FileNotFoundError:
             pass
 
-
 __all__ = [
-    "PUBLIC_WORKSPACE_INPUT_RELATIVE_PATHS",
+    "collect_public_workspace_input_relative_paths",
     "_copy_public_workspace_input_path",
     "_sanitize_public_workspace_input",
 ]

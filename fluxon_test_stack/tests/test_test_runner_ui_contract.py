@@ -119,6 +119,8 @@ class TestTestRunnerUiContract(unittest.TestCase):
             workdir = Path(td)
             original_log_fp = _RUNNER._RUNNER_STDIO_LOG_FP
             original_keepalive = _RUNNER._RUNNER_STDIO_KEEPALIVE_FDS
+            saved_stdout = sys.stdout
+            saved_stderr = sys.stderr
             with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=False):
                 _RUNNER._RUNNER_STDIO_LOG_FP = None
                 _RUNNER._RUNNER_STDIO_KEEPALIVE_FDS = (11, 12)
@@ -129,10 +131,18 @@ class TestTestRunnerUiContract(unittest.TestCase):
             self.assertEqual(dup2_mock.call_count, 2)
             start_mirror.assert_called_once()
             kwargs = start_mirror.call_args.kwargs
-            self.assertEqual(kwargs["log_path"], (workdir / _RUNNER.RUNNER_STDIO_LOG_FILENAME).resolve())
+            expected_log_path = _RUNNER._service_log_base_path(
+                workdir, filename=_RUNNER.RUNNER_STDIO_LOG_FILENAME
+            )
+            self.assertEqual(kwargs["log_path"], expected_log_path)
             self.assertEqual(kwargs["stdout_fd"], 11)
             self.assertNotIn("stderr_fd", kwargs)
-            if _RUNNER._RUNNER_STDIO_LOG_FP is not None:
+            sys.stdout = saved_stdout
+            sys.stderr = saved_stderr
+            if _RUNNER._RUNNER_STDIO_LOG_FP is not None and _RUNNER._RUNNER_STDIO_LOG_FP not in (
+                sys.__stdout__,
+                sys.__stderr__,
+            ):
                 _RUNNER._RUNNER_STDIO_LOG_FP.close()
             _RUNNER._RUNNER_STDIO_LOG_FP = original_log_fp
             _RUNNER._RUNNER_STDIO_KEEPALIVE_FDS = original_keepalive
@@ -142,6 +152,8 @@ class TestTestRunnerUiContract(unittest.TestCase):
             workdir = Path(td)
             original_log_fp = _RUNNER._RUNNER_STDIO_LOG_FP
             original_keepalive = _RUNNER._RUNNER_STDIO_KEEPALIVE_FDS
+            saved_stdout = sys.stdout
+            saved_stderr = sys.stderr
             with mock.patch.dict(os.environ, {}, clear=True):
                 _RUNNER._RUNNER_STDIO_LOG_FP = None
                 _RUNNER._RUNNER_STDIO_KEEPALIVE_FDS = (11, 12)
@@ -151,7 +163,12 @@ class TestTestRunnerUiContract(unittest.TestCase):
                             _RUNNER._redirect_process_stdio_to_log(workdir)
             self.assertEqual(dup2_mock.call_count, 2)
             start_mirror.assert_not_called()
-            if _RUNNER._RUNNER_STDIO_LOG_FP is not None:
+            sys.stdout = saved_stdout
+            sys.stderr = saved_stderr
+            if _RUNNER._RUNNER_STDIO_LOG_FP is not None and _RUNNER._RUNNER_STDIO_LOG_FP not in (
+                sys.__stdout__,
+                sys.__stderr__,
+            ):
                 _RUNNER._RUNNER_STDIO_LOG_FP.close()
             _RUNNER._RUNNER_STDIO_LOG_FP = original_log_fp
             _RUNNER._RUNNER_STDIO_KEEPALIVE_FDS = original_keepalive
@@ -224,6 +241,20 @@ class TestTestRunnerUiContract(unittest.TestCase):
             older = _RUNNER._ui_log_chunk(path, from_offset=None, before_offset=6, max_bytes=4)
             self.assertEqual(older["text"], "2345")
             self.assertEqual(older["start"], 2)
+
+    def test_service_log_resolve_read_path_prefers_latest_daily_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workdir = Path(td)
+            (workdir / "test_runner.2026-06-19.log").write_text("old\n", encoding="utf-8")
+            (workdir / "test_runner.2026-06-20.log").write_text("new\n", encoding="utf-8")
+            resolved = _RUNNER._service_log_resolve_read_path(
+                workdir,
+                filename=_RUNNER.RUNNER_STDIO_LOG_FILENAME,
+            )
+            self.assertEqual(
+                resolved,
+                (workdir / "test_runner.2026-06-20.log").resolve(),
+            )
 
     def test_ops_logs_base_url_derives_from_controller_proxy(self) -> None:
         url = _RUNNER._ui_ops_logs_base_url("http://127.0.0.1:19080/r/ops/fluxon_testbed")

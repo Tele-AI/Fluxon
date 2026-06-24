@@ -56,6 +56,8 @@ use crate::write_session_rpc::{
     FsWriteSessionChunkResp, FsWriteSessionDataFrame,
 };
 
+pub(crate) mod transfer_agent;
+
 pub const CHUNK_BYTES: usize = 1024 * 1024;
 pub const READ_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const WRITE_SESSION_CHUNK_BYTES: usize = crate::agent::REMOTE_WRITE_SESSION_CHUNK_BYTES;
@@ -65,6 +67,9 @@ const WRITE_SESSION_MAX_QUEUED_BYTES: usize =
 const WRITE_SESSION_IDLE_TIMEOUT_SECS: u64 = 180;
 const WRITE_SESSION_REAP_INTERVAL_SECS: u64 = 30;
 const WRITE_SESSION_CLOSE_WAIT_TIMEOUT_SECS: u64 = 30;
+pub(crate) const TRANSFER_HEARTBEAT_INTERVAL_MS: i64 = 5_000;
+pub(crate) const TRANSFER_STREAM_RPC_TIMEOUT_MS: u64 = 60_000;
+pub(crate) const TRANSFER_WORKER_COORDINATION_RPC_TIMEOUT_MS: u64 = 30_000;
 const AGENT_EXPORTS_SNAPSHOT_SCHEMA_VERSION_KEY: &str = "schema_version";
 const AGENT_EXPORTS_SNAPSHOT_EXPORTS_JSON_KEY: &str = "exports_json";
 const AGENT_EXPORT_NAME_KEY: &str = "export_name";
@@ -4945,11 +4950,13 @@ mod tests {
         FluxonFsScopeAccessMode, agent_registry_export_for_name_and_root_v1, build_rpc_token,
     };
     use sha2::Digest;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn browse_only_access_model() -> FluxonFsRuntimeAccessModel {
         FluxonFsRuntimeAccessModel {
             users: vec![FluxonFsRuntimeAccessUser {
                 username: "alice".to_string(),
+                can_manage_users: false,
                 rpc_token_secret_sha256_hex: hex::encode(sha2::Sha256::digest(b"pw")),
             }],
             scope_access: vec![FluxonFsScopeAccess {
@@ -4965,6 +4972,7 @@ mod tests {
         FluxonFsRuntimeAccessModel {
             users: vec![FluxonFsRuntimeAccessUser {
                 username: "alice".to_string(),
+                can_manage_users: false,
                 rpc_token_secret_sha256_hex: hex::encode(sha2::Sha256::digest(b"pw")),
             }],
             scope_access: vec![FluxonFsScopeAccess {
@@ -4977,7 +4985,7 @@ mod tests {
     }
 
     fn payload_for(identity: &FluxonFsRequestIdentity) -> FlatDict {
-        let token = build_rpc_token(identity, 1_000).unwrap();
+        let token = build_rpc_token(identity, now_unix_ms_i64()).unwrap();
         FlatDict::from([(
             FLUXON_FS_RPC_TOKEN_PAYLOAD_KEY.to_string(),
             FlatValue::String(token),
@@ -4985,7 +4993,14 @@ mod tests {
     }
 
     fn rpc_token_for(identity: &FluxonFsRequestIdentity) -> String {
-        build_rpc_token(identity, 1_000).unwrap()
+        build_rpc_token(identity, now_unix_ms_i64()).unwrap()
+    }
+
+    fn now_unix_ms_i64() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
     }
 
     fn test_exports_handle(root_dir_abs: &str) -> AgentExportsHandle {
@@ -5089,11 +5104,8 @@ mod tests {
             password: "pw".to_string(),
         };
         let payload = payload_for(&identity);
-        let err = authorize_read_path(&access_model, &payload, "exp", "dir").unwrap_err();
-        match err.get("err") {
-            Some(FlatValue::String(s)) => assert!(s.contains("fs read denied")),
-            other => panic!("unexpected error payload: {:?}", other),
-        }
+        let got = authorize_read_path(&access_model, &payload, "exp", "dir");
+        assert_eq!(got, Ok(Some("alice".to_string())));
     }
 
     #[test]
@@ -5103,6 +5115,7 @@ mod tests {
             password: "pw".to_string(),
         };
         let root = test_temp_dir("fluxon_typed_open_write_session_token");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
         let exports = test_exports_handle(root.to_str().unwrap());
         let access_model = AgentAccessModelHandle::new(Some(read_write_access_model()));
         let write_sessions = AgentWriteSessionsHandle::new();

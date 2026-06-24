@@ -116,7 +116,7 @@ Parameter constraints:
 
 ### Common Error Handling
 
-- `new_or_bind_with_unique_key(...)` fails: first check cluster name, shared memory / shared file paths, `unique_id`, and that both ends use matching roles
+- `new_or_bind_with_unique_key(...)` fails: first check `cluster_name`, `share_mem_path`, `unique_id`, and that both ends use matching roles
 - `producer.put_data(...)` returns `ProducerClosedError`: treat it as a normal shutdown signal and exit the main loop
 - `consumer.get_data(...)` returns `ChannelClosedError`: treat it as a normal shutdown signal and exit the main loop
 
@@ -124,7 +124,8 @@ Parameter constraints:
 
 - Python-side MQ logs come from `init_logger(...)` and go to the current terminal by default; the threshold is controlled by `FLUXON_LOG`
 - Rust / KV background logs follow the shared service-plane pipeline, and the master's local log authority is `master_cfg["log_dir"]`
-- `shared_file_path` remains the local shared-file authority for `shared.json` and related files
+- `share_mem_path` is the shared bundle root for `mmap.file`, `shared.json`, and peer metadata
+- `large_file_paths` is the owner-only large-file authority for backend logs, profiles, caches, and other derived runtime assets
 
 If `master.monitoring.otlp_log_api` is configured, backend logs continue to flow into the Greptime `fluxon_logs` table.
 

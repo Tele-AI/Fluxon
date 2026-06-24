@@ -1546,10 +1546,8 @@ class FluxonFsRemoteWholeHarness:
         self._kv_master_port = _pick_free_port()
         self._ui_base_url = f"http://127.0.0.1:{self._ui_port}"
         self._fs_s3_base_url = f"{self._ui_base_url}/fs_s3"
-        self._shared_memory_root = self._work_root / "sm"
-        self._shared_file_root = self._work_root / "sf"
-        self._shared_memory_root.mkdir(parents=True, exist_ok=True)
-        self._shared_file_root.mkdir(parents=True, exist_ok=True)
+        self._share_mem_root = self._work_root / "sm"
+        self._share_mem_root.mkdir(parents=True, exist_ok=True)
         self._etcd: EtcdHarness | None = None
         self._tikv: TiKvHarness | None = None
         self._monitor: DummyMonitoringHarness | None = None
@@ -1573,8 +1571,8 @@ class FluxonFsRemoteWholeHarness:
             raise RuntimeError("store_config is unavailable before harness init")
         return self._store_config
 
-    def _cluster_scoped_shared_file_dir(self) -> Path:
-        return self._shared_file_root / self._cluster_name
+    def _cluster_scoped_share_mem_dir(self) -> Path:
+        return self._share_mem_root / self._cluster_name
 
     def _monitoring_block(self) -> dict[str, Any]:
         if self._monitor is None:
@@ -1595,9 +1593,9 @@ class FluxonFsRemoteWholeHarness:
             "fluxonkv_spec": {
                 "etcd_addresses": [self._etcd.endpoint],
                 "cluster_name": self._cluster_name,
-                "shared_memory_path": str(self._shared_memory_root),
-                "shared_file_path": str(self._shared_file_root),
+                "share_mem_path": str(self._share_mem_root),
                 "sub_cluster": "transfer_owner",
+                "large_file_paths": [str(self._work_root / "large" / "owner")],
             },
             "test_spec_config": {
                 "disable_observability": True,
@@ -1609,8 +1607,7 @@ class FluxonFsRemoteWholeHarness:
             "instance_key": instance_key,
             "fluxonkv_spec": {
                 "cluster_name": self._cluster_name,
-                "shared_memory_path": str(self._shared_memory_root),
-                "shared_file_path": str(self._shared_file_root),
+                "share_mem_path": str(self._share_mem_root),
             },
             "test_spec_config": {
                 "disable_observability": True,
@@ -1751,7 +1748,7 @@ class FluxonFsRemoteWholeHarness:
                 },
             },
         )
-        self._owner_shared_json_path = self._cluster_scoped_shared_file_dir() / "shared.json"
+        self._owner_shared_json_path = self._cluster_scoped_share_mem_dir() / "shared.json"
 
     def _start_logged_process(
         self,

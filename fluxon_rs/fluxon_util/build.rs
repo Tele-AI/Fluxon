@@ -88,12 +88,15 @@ fn collect_crates_for_runtime(ws: &CargoWorkspace) {
     println!("cargo:rerun-if-changed=Cargo.toml");
 }
 
-fn try_discover_git_dir(manifest_dir: &Path) -> Option<PathBuf> {
+fn try_discover_git_dir(manifest_dir: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    let workspace_search_ceiling = workspace_root.parent().unwrap_or(workspace_root);
     let mut cur = Some(manifest_dir);
     while let Some(dir) = cur {
         let candidate = dir.join(".git");
         if candidate.is_dir() {
-            return Some(candidate);
+            if candidate.join("HEAD").is_file() {
+                return Some(candidate);
+            }
         }
         if candidate.is_file() {
             // Worktree/submodule style: .git is a file containing `gitdir: <path>`
@@ -106,11 +109,17 @@ fn try_discover_git_dir(manifest_dir: &Path) -> Option<PathBuf> {
                 .unwrap_or_else(|| panic!("invalid .git file format: {}", candidate.display()))
                 .trim();
             let gitdir_path = Path::new(gitdir);
-            return Some(if gitdir_path.is_absolute() {
+            let resolved = if gitdir_path.is_absolute() {
                 gitdir_path.to_path_buf()
             } else {
                 dir.join(gitdir_path)
-            });
+            };
+            if resolved.join("HEAD").is_file() {
+                return Some(resolved);
+            }
+        }
+        if dir == workspace_search_ceiling {
+            break;
         }
         cur = dir.parent();
     }
@@ -309,7 +318,7 @@ fn main() {
             v
         }
         Err(_) => {
-            match try_discover_git_dir(&manifest_dir) {
+            match try_discover_git_dir(&manifest_dir, &ws.workspace_root) {
                 Some(git_dir) => {
                     emit_rerun_hints(&git_dir);
                     resolve_head_commit_id(&git_dir)

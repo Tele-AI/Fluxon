@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
+pub const BUILD_CONFIG_EXT_PATH_ENV: &str = "FLUXON_BUILD_CONFIG_EXT_PATH";
+
 /// Walk up from `start` to filesystem root, returning the first occurrence
 /// of `filename` if found.
 pub fn find_file_upwards<P: AsRef<Path>>(start: P, filename: &str) -> Option<PathBuf> {
@@ -81,6 +83,24 @@ pub fn repo_root() -> Result<PathBuf> {
 
 /// Locate `build_config_ext.yml` by walking upwards from the repo/workspace anchor.
 pub fn locate_build_ext_config() -> Result<PathBuf> {
+    if let Some(raw_path) = std::env::var_os(BUILD_CONFIG_EXT_PATH_ENV) {
+        let configured_path = PathBuf::from(raw_path);
+        if configured_path.as_os_str().is_empty() {
+            return Err(anyhow!(
+                "{} must not be empty when set",
+                BUILD_CONFIG_EXT_PATH_ENV
+            ));
+        }
+        if !configured_path.is_file() {
+            return Err(anyhow!(
+                "{} points to a missing build config file: {:?}",
+                BUILD_CONFIG_EXT_PATH_ENV,
+                configured_path
+            ));
+        }
+        return Ok(configured_path);
+    }
+
     let anchor = repo_root()?;
     if let Some(path) = find_file_upwards(&anchor, "build_config_ext.yml") {
         return Ok(path);
@@ -260,9 +280,18 @@ pub fn load_tsdb_remote_write_url() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_fluxon_repo_root_upwards, repo_root_from_manifest_dir};
+    use super::{
+        BUILD_CONFIG_EXT_PATH_ENV, find_fluxon_repo_root_upwards, locate_build_ext_config,
+        repo_root_from_manifest_dir,
+    };
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn build_config_env_guard() -> &'static Mutex<()> {
+        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_MUTEX.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn find_fluxon_repo_root_prefers_nearest_nested_fluxon_tree() {
@@ -308,5 +337,29 @@ mod tests {
         fs::create_dir_all(&nested_manifest_dir).expect("create nested fluxon_util dir");
         let repo_root = repo_root_from_manifest_dir(&nested_manifest_dir);
         assert_eq!(repo_root, nested_root);
+    }
+
+    #[test]
+    #[serial_test::serial(build_config_ext)]
+    fn locate_build_ext_config_prefers_env_override() {
+        let _env_guard = build_config_env_guard().lock().expect("lock env guard");
+        let temp_dir = TempDir::new().expect("temp dir");
+        let override_path = temp_dir.path().join("custom_build_config_ext.yml");
+        fs::write(&override_path, "etcd: 127.0.0.1:2379\n").expect("write override build config");
+        let previous = std::env::var_os(BUILD_CONFIG_EXT_PATH_ENV);
+
+        unsafe {
+            std::env::set_var(BUILD_CONFIG_EXT_PATH_ENV, &override_path);
+        }
+        let located = locate_build_ext_config().expect("locate build config via env override");
+        assert_eq!(located, override_path);
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var(BUILD_CONFIG_EXT_PATH_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(BUILD_CONFIG_EXT_PATH_ENV);
+            },
+        }
     }
 }

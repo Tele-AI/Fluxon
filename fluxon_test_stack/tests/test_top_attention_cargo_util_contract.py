@@ -85,6 +85,10 @@ class TestTopAttentionCargoUtilContract(unittest.TestCase):
                     str(REPO_ROOT / "fluxon_rs" / "fluxon_util" / "Cargo.toml"),
                 ],
             )
+            self.assertEqual(
+                run_cargo.call_args.kwargs["env"]["FLUXON_BUILD_CONFIG_EXT_PATH"],
+                str((src_dir / "build_config_ext.yml").resolve()),
+            )
 
     def test_main_rejects_pytest_style_passthrough_flags(self) -> None:
         with mock.patch.object(sys, "argv", [str(MODULE_PATH), "-k", "lease"]):

@@ -6024,45 +6024,13 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use fluxon_fs_core::config::{
-        FluxonFsExport, FluxonFsExportRoutingMode, FluxonFsExportRpcPaths, FluxonFsGlobalConfig,
-        FluxonFsTransferDispositionWire,
+        FluxonFsExport, FluxonFsGlobalConfig, FluxonFsTransferDispositionWire,
+        agent_registry_export_for_name_and_root_v1,
     };
     use tempfile::TempDir;
 
     fn test_export(root_dir_abs: &str) -> FluxonFsExport {
-        FluxonFsExport {
-            remote_root_dir_abs: root_dir_abs.to_string(),
-            routing_mode: FluxonFsExportRoutingMode::AgentRegistry,
-            nodes: Vec::new(),
-            cache_kv_key_prefix: "/test/cache/".to_string(),
-            cache_bytes_field_key: "bytes".to_string(),
-            cache_max_bytes: 1,
-            rpc_paths: FluxonFsExportRpcPaths {
-                stat: "/stat".to_string(),
-                lstat: "/lstat".to_string(),
-                list_dir: "/list_dir".to_string(),
-                readlink: "/readlink".to_string(),
-                setxattr: "/setxattr".to_string(),
-                getxattr: "/getxattr".to_string(),
-                listxattr: "/listxattr".to_string(),
-                removexattr: "/removexattr".to_string(),
-                read_chunk: "/read_chunk".to_string(),
-                write_chunk: "/write_chunk".to_string(),
-                truncate: "/truncate".to_string(),
-                mkdir: "/mkdir".to_string(),
-                mkfifo: "/mkfifo".to_string(),
-                mknod: "/mknod".to_string(),
-                rmdir: "/rmdir".to_string(),
-                unlink: "/unlink".to_string(),
-                link: "/link".to_string(),
-                symlink: "/symlink".to_string(),
-                rename: "/rename".to_string(),
-                chmod: "/chmod".to_string(),
-                chown: "/chown".to_string(),
-                lchown: "/lchown".to_string(),
-                utime: "/utime".to_string(),
-            },
-        }
+        agent_registry_export_for_name_and_root_v1("src", root_dir_abs)
     }
 
     fn test_exports_handle(root_dir_abs: &str) -> AgentExportsHandle {
@@ -6071,6 +6039,7 @@ mod tests {
         AgentExportsHandle::new_from_static_cfg(
             &FluxonFsGlobalConfig {
                 stale_window_ms: 1,
+                write_session_target_inflight_bytes: 64 * 1024 * 1024,
                 rules: Vec::new(),
                 exports,
             },

@@ -2759,18 +2759,30 @@ impl KvClient {
         inner_new(config_yaml, py).into_py_object(py)
     }
 
-    /// Return the logs directory for MQ-related components.
+    /// Return the logs directory for third-party Python components.
     ///
-    /// For the fluxon unified backend, this is derived from the
-    /// client's shared_memory_path and cluster_name:
-    ///   {shared_memory_path}/{cluster_name}_cluster_mq_logs
-    fn logs_dir(&self, py: Python) -> PyObject {
-        fn logs_dir_inner(client: &KvClient, py: Python) -> ApiResult<PyObject> {
-            let base = PathBuf::from(&client.config.shared_memory_path);
-            let dir = base.join(format!("{}_cluster_mq_logs", client.config.cluster_name));
+    /// For the fluxon unified backend, this is derived from owner
+    /// large_file_paths and cluster_name:
+    ///   {large_file_paths[0]}/{cluster_name}_cluster_third_party_logs
+    fn third_party_logs_dir(&self, py: Python) -> PyObject {
+        fn third_party_logs_dir_inner(client: &KvClient, py: Python) -> ApiResult<PyObject> {
+            let dir = match client
+                .config
+                .large_file_paths
+                .third_party_logs_dir(&client.config.cluster_name)
+            {
+                Ok(dir) => dir,
+                Err(e) => {
+                    return ApiResult::new_error(crate::error::py_error_from_kv_error(
+                        py,
+                        &e,
+                        "third_party_logs_dir failed",
+                    ));
+                }
+            };
             ApiResult::new_success(dir.to_string_lossy().into_owned().into_py(py))
         }
-        logs_dir_inner(self, py).into_py_object(py)
+        third_party_logs_dir_inner(self, py).into_py_object(py)
     }
 
     /// Return raw etcd addresses (host:port) used by this client.

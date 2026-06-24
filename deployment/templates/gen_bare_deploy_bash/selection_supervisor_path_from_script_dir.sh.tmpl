@@ -1,0 +1,7 @@
+DIR=$(cd "$(dirname "$0")" && pwd)
+SELECTION_SUPERVISOR="$DIR/{{SELECTION_SUPERVISOR_FILENAME}}"
+if [ ! -f "$SELECTION_SUPERVISOR" ]; then
+  echo "Missing selection supervisor: $SELECTION_SUPERVISOR"
+  exit 1
+fi
+

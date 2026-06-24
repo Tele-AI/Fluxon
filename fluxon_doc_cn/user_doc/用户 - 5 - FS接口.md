@@ -104,8 +104,7 @@ ETCD_ENDPOINT = "127.0.0.1:2379"
 GREPTIME_HTTP_PORT = 34030
 GREPTIME_BASE_URL = f"http://127.0.0.1:{GREPTIME_HTTP_PORT}"
 CLUSTER_NAME = "demo-fs-cluster"
-SHARED_MEMORY_PATH = Path("/dev/shm/fluxon_fs_demo").resolve()
-SHARED_FILE_PATH = Path("/tmp/fluxon_fs_demo/shared").resolve()
+SHARE_MEM_PATH = Path("/dev/shm/fluxon_fs_demo").resolve()
 WORKDIR = Path("/tmp/fluxon_fs_demo/runtime").resolve()
 REMOTE_ROOT_DIR = Path("/tmp/fluxon_fs_demo/remote_root").resolve()
 KV_MASTER_PORT = 34100
@@ -130,8 +129,6 @@ def main() -> None:
     args = parse_args()
     WORKDIR.mkdir(parents=True, exist_ok=True)
     REMOTE_ROOT_DIR.mkdir(parents=True, exist_ok=True)
-    SHARED_FILE_PATH.mkdir(parents=True, exist_ok=True)
-
     log_dir = (WORKDIR / "log").resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -201,8 +198,7 @@ def main() -> None:
     )
 
     print(f"[fluxon_fs] cluster name: {CLUSTER_NAME}")
-    print(f"[fluxon_fs] shared memory path: {SHARED_MEMORY_PATH}")
-    print(f"[fluxon_fs] shared file path: {SHARED_FILE_PATH}")
+    print(f"[fluxon_fs] share_mem_path: {SHARE_MEM_PATH}")
     print(f"[fluxon_fs] remote root dir: {REMOTE_ROOT_DIR}")
     print(f"[fluxon_fs] export name: {EXPORT_NAME}")
     print(f"[fluxon_fs] owner instance key: {OWNER_INSTANCE_KEY}")
@@ -283,9 +279,9 @@ def build_owner_config() -> dict:
         "fluxonkv_spec": {
             "etcd_addresses": [ETCD_ENDPOINT],
             "cluster_name": CLUSTER_NAME,
-            "shared_memory_path": str(SHARED_MEMORY_PATH),
-            "shared_file_path": str(SHARED_FILE_PATH),
+            "share_mem_path": str(SHARE_MEM_PATH),
             "sub_cluster": "default",
+            "large_file_paths": [str((WORKDIR / "large" / "owner").resolve())],
         },
     }
 
@@ -296,8 +292,7 @@ def build_fs_master_config() -> dict:
             "instance_key": FS_MASTER_INSTANCE_KEY,
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
-                "shared_memory_path": str(SHARED_MEMORY_PATH),
-                "shared_file_path": str(SHARED_FILE_PATH),
+                "share_mem_path": str(SHARE_MEM_PATH),
             },
         },
         "fluxon_fs": {
@@ -356,8 +351,7 @@ def build_fs_agent_config() -> dict:
             "instance_key": FS_AGENT_INSTANCE_KEY,
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
-                "shared_memory_path": str(SHARED_MEMORY_PATH),
-                "shared_file_path": str(SHARED_FILE_PATH),
+                "share_mem_path": str(SHARE_MEM_PATH),
             },
         },
         "fluxon_fs": {
@@ -402,8 +396,7 @@ python3 examples/start_kv_and_fs_svc.py --without-master
 脚本会持续运行，并打印：
 
 - `cluster name`
-- `shared memory path`
-- `shared file path`
+- `share_mem_path`
 - `remote root dir`
 - `export name`
 - `owner instance key`
@@ -446,8 +439,7 @@ python3 examples/start_kv_and_fs_svc.py --without-master
 这条最小成功路径默认对应本页的本地完整示例，也就是不带 `--without-master` 的启动方式。`--without-master` 用于把当前机器接到已经存在的 KV / FS 集群；如果继续运行 `start_fluxon_fs_writer.py` / `start_fluxon_fs_reader.py`，配置里的这些对象必须和现有集群一致：
 
 - `cluster_name`
-- `shared_memory_path`
-- `shared_file_path`
+- `share_mem_path`
 - `fluxon_fs.master.instance_key`
 - `export_name`
 - `remote_root_dir_abs`
@@ -727,8 +719,7 @@ FLUXON_LOG=DEBUG python3 examples/start_fluxon_fs_reader.py -c <reader-config.ya
 
 - `start_kv_and_fs_svc.py` 是否还在运行
 - `CLUSTER_NAME`
-- `SHARED_MEMORY_PATH`
-- `SHARED_FILE_PATH`
+- `SHARE_MEM_PATH`
 
 ### `fluxon_fs cache config is not loaded yet`
 

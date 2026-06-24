@@ -1,0 +1,108 @@
+set -euo pipefail
+python3 - <<'PY'
+import datetime
+import hashlib
+import hmac
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+BASE_URL = __FLUXON_TMPL_BASE_URL_JSON__
+BUCKET = __FLUXON_TMPL_BUCKET_JSON__
+OBJECT_KEY = __FLUXON_TMPL_OBJECT_KEY_JSON__
+DEST_PATH = __FLUXON_TMPL_DEST_PATH_JSON__
+ACCESS_KEY = __FLUXON_TMPL_ACCESS_KEY_JSON__
+SECRET_KEY = __FLUXON_TMPL_SECRET_KEY_JSON__
+REGION = __FLUXON_TMPL_REGION_JSON__
+
+ALG = "AWS4-HMAC-SHA256"
+SERVICE = "s3"
+TERM = "aws4_request"
+UNSIGNED = "UNSIGNED-PAYLOAD"
+
+
+def _hmac_sha256(key: bytes, msg: bytes) -> bytes:
+    return hmac.new(key, msg, hashlib.sha256).digest()
+
+
+def _sha256_hex(msg: bytes) -> str:
+    return hashlib.sha256(msg).hexdigest()
+
+
+def _derive_signing_key(secret_key: str, scope_date: str, region: str) -> bytes:
+    k_date = _hmac_sha256(("AWS4" + secret_key).encode("utf-8"), scope_date.encode("utf-8"))
+    k_region = _hmac_sha256(k_date, region.encode("utf-8"))
+    k_service = _hmac_sha256(k_region, SERVICE.encode("utf-8"))
+    return _hmac_sha256(k_service, TERM.encode("utf-8"))
+
+
+def _sigv4_headers(*, method: str, signing_path: str, query: str, host: str, scope_date: str, amz_date: str, payload_hash: str) -> dict:
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    canonical_headers = ""
+    canonical_headers += f"host:{host}\n"
+    canonical_headers += f"x-amz-content-sha256:{payload_hash}\n"
+    canonical_headers += f"x-amz-date:{amz_date}\n"
+    canonical_request = "\n".join([method, signing_path, query, canonical_headers, signed_headers, payload_hash])
+    cr_hash = _sha256_hex(canonical_request.encode("utf-8"))
+    scope = f"{scope_date}/{REGION}/{SERVICE}/{TERM}"
+    string_to_sign = "\n".join([ALG, amz_date, scope, cr_hash])
+    signing_key = _derive_signing_key(SECRET_KEY, scope_date, REGION)
+    sig = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    auth = f"{ALG} Credential={ACCESS_KEY}/{scope}, SignedHeaders={signed_headers}, Signature={sig}"
+    return {
+        "Authorization": auth,
+        "x-amz-date": amz_date,
+        "x-amz-content-sha256": payload_hash,
+        "Host": host,
+    }
+
+
+u = urllib.parse.urlparse(BASE_URL)
+if u.scheme not in ("http", "https"):
+    raise ValueError("BASE_URL must be http(s)")
+if not u.netloc:
+    raise ValueError("BASE_URL missing host")
+base_path = u.path.rstrip("/")
+if base_path == "":
+    raise ValueError("BASE_URL must include a non-root path prefix (e.g. /fs_s3)")
+
+bucket_enc = urllib.parse.quote(BUCKET, safe="-_.~")
+key_enc = urllib.parse.quote(OBJECT_KEY, safe="/-_.~")
+full_path = base_path + "/" + bucket_enc + "/" + key_enc
+signing_path = full_path
+url = f"{u.scheme}://{u.netloc}{full_path}"
+
+now = datetime.datetime.utcnow()
+amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+scope_date = now.strftime("%Y%m%d")
+hdrs = _sigv4_headers(
+    method="GET",
+    signing_path=signing_path,
+    query="",
+    host=u.netloc,
+    scope_date=scope_date,
+    amz_date=amz_date,
+    payload_hash=UNSIGNED,
+)
+
+dest = Path(DEST_PATH)
+dest.parent.mkdir(parents=True, exist_ok=True)
+tmp = Path(str(dest) + ".tmp")
+if tmp.exists():
+    tmp.unlink()
+req = urllib.request.Request(url, method="GET")
+for k, v in hdrs.items():
+    req.add_header(k, v)
+with urllib.request.urlopen(req, timeout=60) as resp:
+    if getattr(resp, "status", None) != 200:
+        body = resp.read(4096)
+        raise RuntimeError(f'download failed: status={getattr(resp, "status", None)} body={body!r}')
+    with tmp.open("wb") as f:
+        while True:
+            b = resp.read(1024 * 1024)
+            if not b:
+                break
+            f.write(b)
+tmp.replace(dest)
+PY
+exec __FLUXON_TMPL_EXEC_CMD__

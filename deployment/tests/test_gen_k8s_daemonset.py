@@ -190,7 +190,6 @@ def test_ops_entrypoints_use_direct_scripts() -> None:
                   FLUXON_PIP_CONF_CMD: "true"
                   FLUXON_RELEASE_WHEEL_FETCH_CMD: "true"
                   FLUXON_SHARED_MEM: "${HOSTWORKDIR}/shm1"
-                  FLUXON_SHARED_FILE: "${HOSTWORKDIR}/shm1_files"
                   ETCD_FULL_ADDRESS: "127.0.0.1:33579"
                   FLUXON_CLUSTER_NAME: "fluxon_testbed"
                   FLUXON_OPS_CONTROLLER_INSTANCE_KEY: "ops_controller_node-a"
@@ -201,15 +200,14 @@ def test_ops_entrypoints_use_direct_scripts() -> None:
                   ops_agent:
                     entrypoint: |
                       WORKDIR="${HOSTWORKDIR}/ops_agent/${NODE_ID}"
-                      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}" "${FLUXON_SHARED_FILE}"
+                      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}"
                       cat > "${WORKDIR}/ops_agent.yaml" <<YAML
                       kv_client:
                         instance_key: "fluxon_ops_${NODE_ID}"
                         pprof_duration_seconds: 60
                         fluxonkv_spec:
                           cluster_name: "${FLUXON_CLUSTER_NAME}"
-                          shared_memory_path: "${FLUXON_SHARED_MEM}"
-                          shared_file_path: "${FLUXON_SHARED_FILE}"
+                          share_mem_path: "${FLUXON_SHARED_MEM}"
                       controller_instance_key: "${FLUXON_OPS_CONTROLLER_INSTANCE_KEY}"
                       hostworkdir: "${HOSTWORKDIR}"
                       YAML
@@ -219,7 +217,7 @@ def test_ops_entrypoints_use_direct_scripts() -> None:
                   ops_controller:
                     entrypoint: |
                       WORKDIR="${HOSTWORKDIR}/ops_controller"
-                      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}" "${FLUXON_SHARED_FILE}"
+                      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}"
                       cat > "${WORKDIR}/ops_controller.yaml" <<YAML
                       ops_controller:
                         kv_client:
@@ -227,8 +225,7 @@ def test_ops_entrypoints_use_direct_scripts() -> None:
                           pprof_duration_seconds: 60
                           fluxonkv_spec:
                             cluster_name: "${FLUXON_CLUSTER_NAME}"
-                            shared_memory_path: "${FLUXON_SHARED_MEM}"
-                            shared_file_path: "${FLUXON_SHARED_FILE}"
+                            share_mem_path: "${FLUXON_SHARED_MEM}"
                             p2p_listen_port: 12102
                         panel:
                           max_body_bytes: 1073741824
@@ -248,7 +245,7 @@ def test_ops_entrypoints_use_direct_scripts() -> None:
                         cluster_name: "${FLUXON_CLUSTER_NAME}"
                         member_kind: kv
                         output: web
-                        http_listen_addr: "0.0.0.0:${MASTER__PORT}"
+                        http_listen_addr: "0.0.0.0:${OPS_CONTROLLER__PORT}"
                       YAML
                       ${HOSTWORKDIR}/venv/bin/python -m fluxon_py.runtime.start_ops_controller -c "${WORKDIR}/ops_controller.yaml" -w "${WORKDIR}"
                     node_bind:

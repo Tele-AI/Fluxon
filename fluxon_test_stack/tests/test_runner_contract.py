@@ -64,6 +64,14 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
             test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime,
         ),
         (
+            "ci_top_attention_additional_cargo_scenes_exist",
+            test_ci_top_attention_additional_cargo_scenes_exist,
+        ),
+        (
+            "ci_top_attention_log_mgmt_scene_exists",
+            test_ci_top_attention_log_mgmt_scene_exists,
+        ),
+        (
             "ci_top_attention_mq_core_uses_cluster_kv_owner_runtime",
             test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime,
         ),
@@ -240,6 +248,109 @@ def test_ci_top_attention_doc_page_build_uses_online_docker_image() -> None:
         return
     print("PASS: test_ci_top_attention_doc_page_build_uses_online_docker_image")
 
+def test_ci_top_attention_log_mgmt_scene_exists() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
+    suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(suite_cfg, dict):
+        print("FAIL: test_ci_top_attention_log_mgmt_scene_exists - suite config is not a mapping")
+        return
+
+    suite_for_contract = copy.deepcopy(suite_cfg)
+    artifact_sets = suite_for_contract.get("artifact_sets")
+    if not isinstance(artifact_sets, dict):
+        print("FAIL: test_ci_top_attention_log_mgmt_scene_exists - artifact_sets is not a mapping")
+        return
+    for artifact_set in artifact_sets.values():
+        if not isinstance(artifact_set, dict):
+            continue
+        release_artifacts = artifact_set.get("release_artifacts")
+        if isinstance(release_artifacts, dict):
+            python_wheel = release_artifacts.get("python_wheel")
+            if isinstance(python_wheel, str) and python_wheel.strip():
+                artifact_set["release_artifacts"] = {"wheel": python_wheel}
+
+    suite = _TEST_RUNNER._parse_suite_config(suite_for_contract)
+    scene = suite.scenes.get("ci_top_attention_log_mgmt")
+    if not isinstance(scene, dict):
+        print("FAIL: test_ci_top_attention_log_mgmt_scene_exists - missing scene")
+        return
+    ci = scene.get("ci")
+    if not isinstance(ci, dict):
+        print("FAIL: test_ci_top_attention_log_mgmt_scene_exists - scene.ci missing")
+        return
+    if ci.get("subject") != "rust":
+        print(
+            "FAIL: test_ci_top_attention_log_mgmt_scene_exists - "
+            f"expected subject 'rust', got {ci.get('subject')!r}"
+        )
+        return
+    if ci.get("runtime_contract") != "rust_self_managed":
+        print(
+            "FAIL: test_ci_top_attention_log_mgmt_scene_exists - "
+            f"expected runtime_contract 'rust_self_managed', got {ci.get('runtime_contract')!r}"
+        )
+        return
+    print("PASS: test_ci_top_attention_log_mgmt_scene_exists")
+
+
+def test_ci_top_attention_additional_cargo_scenes_exist() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
+    suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(suite_cfg, dict):
+        print("FAIL: test_ci_top_attention_additional_cargo_scenes_exist - suite config is not a mapping")
+        return
+
+    suite = _TEST_RUNNER._parse_suite_config(copy.deepcopy(suite_cfg))
+    expected_scene_ids = {
+        "ci_top_attention_cargo_cli",
+        "ci_top_attention_cargo_commu",
+        "ci_top_attention_cargo_commu_contract",
+        "ci_top_attention_cargo_framework",
+        "ci_top_attention_cargo_fs",
+        "ci_top_attention_cargo_fs_s3_gateway",
+        "ci_top_attention_cargo_limit_thirdparty",
+        "ci_top_attention_cargo_mq",
+        "ci_top_attention_cargo_observability",
+        "ci_top_attention_cargo_ops",
+        "ci_top_attention_cargo_pyo3",
+    }
+    missing = sorted(scene_id for scene_id in expected_scene_ids if scene_id not in suite.scenes)
+    if missing:
+        print(
+            "FAIL: test_ci_top_attention_additional_cargo_scenes_exist - "
+            f"missing scenes: {missing!r}"
+        )
+        return
+    for scene_id in sorted(expected_scene_ids):
+        scene = suite.scenes.get(scene_id)
+        if not isinstance(scene, dict):
+            print(
+                "FAIL: test_ci_top_attention_additional_cargo_scenes_exist - "
+                f"scene is not a mapping: {scene_id!r}"
+            )
+            return
+        ci = scene.get("ci")
+        if not isinstance(ci, dict):
+            print(
+                "FAIL: test_ci_top_attention_additional_cargo_scenes_exist - "
+                f"scene.ci missing: {scene_id!r}"
+            )
+            return
+        if ci.get("subject") != "rust":
+            print(
+                "FAIL: test_ci_top_attention_additional_cargo_scenes_exist - "
+                f"expected subject 'rust' for {scene_id!r}, got {ci.get('subject')!r}"
+            )
+            return
+        if ci.get("runtime_contract") != "rust_self_managed":
+            print(
+                "FAIL: test_ci_top_attention_additional_cargo_scenes_exist - "
+                f"expected runtime_contract 'rust_self_managed' for {scene_id!r}, got {ci.get('runtime_contract')!r}"
+            )
+            return
+    print("PASS: test_ci_top_attention_additional_cargo_scenes_exist")
 
 def test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime() -> None:
     repo_root = Path(__file__).resolve().parents[2]

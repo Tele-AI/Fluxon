@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use parking_lot::Mutex;
 use tracing_appender::non_blocking;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
@@ -20,6 +21,9 @@ mod generated_crates {
 // RPC fast-path traffic actually entered the closed transfer / verbs backend. Keep the scope explicit:
 // only these dependency targets are promoted to DEBUG alongside workspace crates.
 const RDMA_DEBUG_TARGETS: &[&str] = &["fabric_lib", "libfabric_sys", "libibverbs_sys"];
+const LOG_RETENTION_DAYS: usize = 31;
+const TEST_LOG_SHARD_WINDOW_SECONDS_ENV: &str = "FLUXON_TEST_LOG_SHARD_WINDOW_SECONDS";
+const TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS_ENV: &str = "FLUXON_TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS";
 
 // Simple UTC timer in RFC3339 seconds (no subsecond precision)
 struct UtcSecondTimer;
@@ -36,6 +40,191 @@ static GLOBAL_CONSOLE_LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 // Expose the current process log file path for sidecar collectors (e.g. OTLP tailer).
 static GLOBAL_LOG_FILE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+pub const DEFAULT_DAILY_LOG_RETENTION_DAYS: usize = LOG_RETENTION_DAYS;
+
+#[derive(Clone, Copy, Debug)]
+struct LogShardWindowConfig {
+    window_seconds: i64,
+    anchor_unix_seconds: i64,
+}
+
+fn read_test_log_shard_window_config() -> anyhow::Result<Option<LogShardWindowConfig>> {
+    let Some(raw_window) = std::env::var_os(TEST_LOG_SHARD_WINDOW_SECONDS_ENV) else {
+        return Ok(None);
+    };
+    let raw_window = raw_window
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{TEST_LOG_SHARD_WINDOW_SECONDS_ENV} must be valid utf-8"))?;
+    let window_text = raw_window.trim();
+    if window_text.is_empty() {
+        return Ok(None);
+    }
+    let window_seconds: i64 = window_text.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "{TEST_LOG_SHARD_WINDOW_SECONDS_ENV} must be a positive integer: {e}"
+        )
+    })?;
+    if window_seconds <= 0 {
+        anyhow::bail!("{TEST_LOG_SHARD_WINDOW_SECONDS_ENV} must be > 0");
+    }
+
+    let raw_anchor = std::env::var(TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS_ENV).map_err(|_| {
+        anyhow::anyhow!(
+            "{TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS_ENV} is required when {TEST_LOG_SHARD_WINDOW_SECONDS_ENV} is set"
+        )
+    })?;
+    let anchor_unix_seconds: i64 = raw_anchor.trim().parse().map_err(|e| {
+        anyhow::anyhow!(
+            "{TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS_ENV} must be an integer unix timestamp: {e}"
+        )
+    })?;
+    Ok(Some(LogShardWindowConfig {
+        window_seconds,
+        anchor_unix_seconds,
+    }))
+}
+
+fn resolve_shard_date_from_datetime(now: chrono::DateTime<chrono::Utc>) -> anyhow::Result<chrono::NaiveDate> {
+    let Some(config) = read_test_log_shard_window_config()? else {
+        return Ok(now.date_naive());
+    };
+    let unix_seconds = now.timestamp();
+    let delta_seconds = unix_seconds - config.anchor_unix_seconds;
+    if delta_seconds < 0 {
+        anyhow::bail!(
+            "test log shard anchor must not be in the future: anchor={}, ts={}",
+            config.anchor_unix_seconds,
+            unix_seconds
+        );
+    }
+    let bucket_index = delta_seconds / config.window_seconds;
+    let base_date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+        .expect("valid hard-coded synthetic base date");
+    Ok(base_date + chrono::Days::new(bucket_index as u64))
+}
+
+fn current_shard_date() -> anyhow::Result<chrono::NaiveDate> {
+    resolve_shard_date_from_datetime(chrono::Utc::now())
+}
+
+fn cleanup_old_daily_sharded_logs(
+    base_path: &Path,
+    retention_days: usize,
+) -> anyhow::Result<()> {
+    let parent = match base_path.parent() {
+        Some(parent) => parent,
+        None => return Ok(()),
+    };
+    let file_name = match base_path.file_name().and_then(|v| v.to_str()) {
+        Some(file_name) => file_name,
+        None => return Ok(()),
+    };
+    let Some(stem) = file_name.strip_suffix(".log") else {
+        return Ok(());
+    };
+    fs::create_dir_all(parent)?;
+    let keep_since = current_shard_date()? - chrono::Days::new(retention_days.saturating_sub(1) as u64);
+    let prefix = format!("{stem}.");
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let entry_name = entry.file_name();
+        let Some(entry_name) = entry_name.to_str() else {
+            continue;
+        };
+        if !entry_name.starts_with(prefix.as_str()) || !entry_name.ends_with(".log") {
+            continue;
+        }
+        let date_text = &entry_name[prefix.len()..entry_name.len() - ".log".len()];
+        let Ok(shard_date) = chrono::NaiveDate::parse_from_str(date_text, "%Y-%m-%d") else {
+            continue;
+        };
+        if shard_date < keep_since {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DailyShardedFileWriter {
+    base_path: PathBuf,
+    retention_days: usize,
+    state: Mutex<DailyShardedFileWriterState>,
+}
+
+#[derive(Debug, Default)]
+struct DailyShardedFileWriterState {
+    current_path: Option<PathBuf>,
+    current_file: Option<fs::File>,
+}
+
+impl DailyShardedFileWriter {
+    fn new(base_path: PathBuf, retention_days: usize) -> Self {
+        Self {
+            base_path,
+            retention_days,
+            state: Mutex::new(DailyShardedFileWriterState::default()),
+        }
+    }
+
+    fn current_path(&self) -> anyhow::Result<PathBuf> {
+        current_daily_sharded_log_path(&self.base_path)
+    }
+
+    fn rotate_if_needed(
+        &self,
+        state: &mut DailyShardedFileWriterState,
+    ) -> io::Result<()> {
+        let next_path = self
+            .current_path()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        if state.current_path.as_ref() == Some(&next_path) && state.current_file.is_some() {
+            return Ok(());
+        }
+        cleanup_old_daily_sharded_logs(&self.base_path, self.retention_days)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        if let Some(parent) = next_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&next_path)?;
+        state.current_path = Some(next_path);
+        state.current_file = Some(file);
+        Ok(())
+    }
+}
+
+impl io::Write for DailyShardedFileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut state = self.state.lock();
+        self.rotate_if_needed(&mut state)?;
+        state
+            .current_file
+            .as_mut()
+            .expect("log writer file must exist after rotation")
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut state = self.state.lock();
+        if let Some(file) = state.current_file.as_mut() {
+            file.flush()
+        } else {
+            Ok(())
+        }
+    }
+}
 
 fn setup_global_log_guards(file_guard: WorkerGuard, console_guard: WorkerGuard) {
     let _ = GLOBAL_FILE_LOG_GUARD.set(file_guard);
@@ -90,9 +279,9 @@ fn third_party_log_target_overrides(
     targets
 }
 
-/// Init log for production
+/// Init log for production.
 /// - `log_path`: directory to write log files
-/// - `instance_key`: used in file names to disambiguate instances
+/// - `instance_key`: used in daily file names to disambiguate instances
 pub fn init_log(log_path: &Path, instance_key: &str) {
     init_log_impl(log_path, instance_key, NoopLayer);
 }
@@ -112,6 +301,101 @@ where
 struct NoopLayer;
 
 impl<S> tracing_subscriber::Layer<S> for NoopLayer where S: tracing::Subscriber {}
+
+fn current_daily_log_file_path(log_path: &Path, instance_key: &str) -> PathBuf {
+    current_daily_sharded_log_path(&log_path.join(format!("fluxon-kv-{instance_key}.log")))
+        .unwrap_or_else(|_| {
+            let date = chrono::Utc::now().format("%Y-%m-%d");
+            log_path.join(format!("fluxon-kv-{instance_key}.{date}.log"))
+        })
+}
+
+pub fn daily_sharded_log_path(
+    base_path: &Path,
+    date: chrono::NaiveDate,
+) -> anyhow::Result<PathBuf> {
+    let file_name = base_path.file_name().and_then(|v| v.to_str()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "log path must end with a valid utf-8 filename: {}",
+            base_path.display()
+        )
+    })?;
+    let stem = file_name
+        .strip_suffix(".log")
+        .ok_or_else(|| anyhow::anyhow!("log path must end with .log: {}", base_path.display()))?;
+    Ok(base_path.with_file_name(format!(
+        "{}.{}.log",
+        stem,
+        date.format("%Y-%m-%d")
+    )))
+}
+
+pub fn current_daily_sharded_log_path(base_path: &Path) -> anyhow::Result<PathBuf> {
+    daily_sharded_log_path(base_path, current_shard_date()?)
+}
+
+pub fn latest_existing_daily_sharded_log_path(base_path: &Path) -> Option<PathBuf> {
+    let parent = base_path.parent()?;
+    let file_name = base_path.file_name()?.to_str()?;
+    let stem = file_name.strip_suffix(".log")?;
+    let prefix = format!("{}.", stem);
+    let mut latest: Option<(chrono::NaiveDate, PathBuf)> = None;
+    let entries = std::fs::read_dir(parent).ok()?;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let entry_name = entry.file_name();
+        let Some(entry_name) = entry_name.to_str() else {
+            continue;
+        };
+        if !entry_name.starts_with(prefix.as_str()) || !entry_name.ends_with(".log") {
+            continue;
+        }
+        if entry_name.len() <= prefix.len() + ".log".len() {
+            continue;
+        }
+        let date_text = &entry_name[prefix.len()..entry_name.len() - ".log".len()];
+        let Ok(date) = chrono::NaiveDate::parse_from_str(date_text, "%Y-%m-%d") else {
+            continue;
+        };
+        let replace = match latest.as_ref() {
+            Some((prev, _)) => date > *prev,
+            None => true,
+        };
+        if replace {
+            latest = Some((date, path));
+        }
+    }
+    latest.map(|(_, path)| path)
+}
+
+pub fn resolve_readable_log_path(base_path: &Path) -> Option<PathBuf> {
+    if let Ok(current) = current_daily_sharded_log_path(base_path) {
+        if current.exists() {
+            return Some(current);
+        }
+    }
+    if let Some(latest) = latest_existing_daily_sharded_log_path(base_path) {
+        return Some(latest);
+    }
+    if base_path.exists() {
+        return Some(base_path.to_path_buf());
+    }
+    None
+}
+
+pub fn display_runtime_log_path(base_path_text: &str) -> String {
+    let base_path = Path::new(base_path_text);
+    resolve_readable_log_path(base_path)
+        .unwrap_or_else(|| base_path.to_path_buf())
+        .display()
+        .to_string()
+}
 
 fn init_log_impl<L>(log_path: &Path, instance_key: &str, extra_layer: L)
 where
@@ -238,83 +522,9 @@ where
         }
     }
 
-    // Archive existing logs for the same instance into a sibling history directory.
-    // Scope is strictly within the provided `log_path` (cluster is implied by the dir path),
-    // and only files of the current `instance_key` are moved. This avoids any cross-instance
-    // interference and keeps behavior explicit and bounded.
-    {
-        let history_dir = log_path.join("history");
-        if let Err(e) = fs::create_dir_all(&history_dir) {
-            panic!(
-                "[fluxon] Create history directory failed: {:?}. Base log_path: {:?}. \
-This log_path is provided by the caller's configuration. \
-For Master mode it is derived from MasterConfigYaml.log_dir with a subdirectory '<cluster_name>_cluster_kv_logs'; \
-for Client mode it is derived from ClientConfigYaml.fluxonkv_spec.shared_memory_path with subdirectory '<cluster_name>_cluster_kv_logs'. \
-Please ensure the directory exists and is writable. Underlying OS error: {:?}",
-                history_dir, log_path, e
-            );
-        }
-
-        // Pattern: fluxon-kv-<instance_key>.<timestamp>.log
-        // No fallback patterns: keep rule strict and explicit.
-        let prefix = format!("fluxon-kv-{}.", instance_key);
-        let mut moved = 0usize;
-
-        let iter = fs::read_dir(log_path).unwrap_or_else(|e| {
-            panic!(
-                "[fluxon] Read log directory failed at {:?}. This directory is the configured log_path described above. OS error: {:?}",
-                log_path, e
-            )
-        });
-
-        for entry in iter {
-            let entry = entry.unwrap_or_else(|e| {
-                panic!(
-                    "[fluxon] Failed to read a directory entry under {:?}. OS error: {:?}",
-                    log_path, e
-                )
-            });
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let name_os = match path.file_name() {
-                Some(n) => n,
-                None => continue,
-            };
-            let name = match name_os.to_str() {
-                Some(s) => s,
-                None => continue,
-            };
-            let is_target = name.starts_with(&prefix) && name.ends_with(".log");
-            if !is_target {
-                continue;
-            }
-            let dst = history_dir.join(name);
-            if let Err(err) = fs::rename(&path, &dst) {
-                panic!(
-                    "[fluxon] Move old log failed: {:?} -> {:?}. Base log_path: {:?}. OS error: {:?}",
-                    path, dst, log_path, err
-                );
-            }
-            moved += 1;
-        }
-
-        if moved > 0 {
-            println!(
-                "[fluxon] Archived {moved} existing logs for instance_key='{instance_key}' into {:?}",
-                history_dir
-            );
-        }
-    }
-
-    // Files named with UTC timestamp once per process run
-    let ts = chrono::Utc::now().format("%Y-%m-%d_%H-%M-%S");
-
     // File log keeps workspace crates at DEBUG; non-workspace crates default to WARN.
     // This avoids dumping verbose dependency debug logs (e.g. h2/tower) into file output.
-    let file_name = format!("fluxon-kv-{instance_key}.{ts}.log");
-    let file_path = log_path.join(&file_name);
+    let file_path = current_daily_log_file_path(log_path, instance_key);
     // Keep a copy for the whole process lifetime; collectors can clone it.
     if let Some(prev) = GLOBAL_LOG_FILE_PATH.get() {
         if prev != &file_path {
@@ -326,18 +536,11 @@ Please ensure the directory exists and is writable. Underlying OS error: {:?}",
     } else {
         let _ = GLOBAL_LOG_FILE_PATH.set(file_path.clone());
     }
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&file_path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Failed to open log file {:?}, err: {:?}", file_path, e);
-            return;
-        }
-    };
-    let (file_writer, file_guard) = non_blocking(file);
+    let file_appender = DailyShardedFileWriter::new(
+        log_path.join(format!("fluxon-kv-{instance_key}.log")),
+        LOG_RETENTION_DAYS,
+    );
+    let (file_writer, file_guard) = non_blocking(file_appender);
     let enable_iceoryx_logs = matches!(
         std::env::var("FLUXON_ENABLE_ICEORYX_LOGS")
             .ok()
@@ -380,10 +583,9 @@ Please ensure the directory exists and is writable. Underlying OS error: {:?}",
     setup_global_log_guards(file_guard, console_guard);
 
     // Success notice: tell users where logs are written.
-    let history_dir_for_print = log_path.join("history");
     println!(
-        "[fluxon] Logging initialized. base_dir={:?}, history_dir={:?}, instance_key='{}'",
-        log_path, history_dir_for_print, instance_key
+        "[fluxon] Logging initialized. base_dir={:?}, retention_days={}, current_file={:?}, instance_key='{}'",
+        log_path, LOG_RETENTION_DAYS, file_path, instance_key
     );
 }
 

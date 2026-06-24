@@ -102,9 +102,7 @@ global_envs:
 
   FLUXON_CLUSTER_NAME: "fluxon_testbed"
   FLUXON_SHARED_MEM: "${HOSTWORKDIR}/shm1"
-  FLUXON_SHARED_FILE: "${HOSTWORKDIR}/shm1_files"
-  # Test-stack benchmark nodes use FLUXON_SHARED_MEM for mmap.file roots and
-  # FLUXON_SHARED_MEM2 as the shared-file/log root. Keep both under the current
+  # Test-stack benchmark nodes use explicit shared bundle roots under the current
   # hostworkdir so benchmarks do not bleed into fluxon4 paths.
   FLUXON_SHARED_MEM2: "${HOSTWORKDIR}/shm2_files"
   FLUXON_PPROF_DURATION_SECONDS: ""
@@ -335,7 +333,7 @@ service:
 
       WORKDIR="${FLUXON_SHARED_MEM}/owner_work_${NODE_ID}"
       CONFIG_PATH="${WORKDIR}/all_config.yaml"
-      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_FILE}"
+      mkdir -p "${WORKDIR}"
       cat > "${CONFIG_PATH}" <<YAML
       instance_key: "owner_${NODE_ID}"
       contribute_to_cluster_pool_size:
@@ -347,8 +345,9 @@ service:
         etcd_addresses:
         - "${ETCD_FULL_ADDRESS}"
         cluster_name: "${FLUXON_CLUSTER_NAME}"
-        shared_memory_path: "${FLUXON_SHARED_MEM}"
-        shared_file_path: "${FLUXON_SHARED_FILE}"
+        share_mem_path: "${FLUXON_SHARED_MEM}"
+        large_file_paths:
+        - "${HOSTWORKDIR}/large/owner_${NODE_ID}"
         sub_cluster: "owner"
       YAML
       ${HOSTWORKDIR}/venv/bin/python -m fluxon_py.runtime.start_owner_kvclient -c "${CONFIG_PATH}" -w "${WORKDIR}"
@@ -367,7 +366,7 @@ service:
 
       cd "${FLUXON_SRC_ROOT}/fluxon_py/fluxon_fs"
       WORKDIR="${HOSTWORKDIR}/fluxon_fs/master"
-      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}" "${FLUXON_SHARED_FILE}" "${HOSTWORKDIR}/fluxon_release"
+      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}" "${HOSTWORKDIR}/fluxon_release"
       # English note:
       # - fluxon_fs master CLI resolves relative --config / --workdir against the installed module path.
       # - Pass explicit WORKDIR-anchored absolute paths here so startup never depends on cwd.
@@ -378,8 +377,7 @@ service:
         instance_key: "fluxon_fs_master"
         fluxonkv_spec:
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM}"
-          shared_file_path: "${FLUXON_SHARED_FILE}"
+          share_mem_path: "${FLUXON_SHARED_MEM}"
       fluxon_fs:
         master:
           instance_key: "fluxon_fs_master"
@@ -446,7 +444,7 @@ service:
 
       cd "${FLUXON_SRC_ROOT}/fluxon_py/fluxon_fs"
       WORKDIR="${HOSTWORKDIR}/fluxon_fs/agent_${NODE_ID}"
-      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}" "${FLUXON_SHARED_FILE}" "${HOSTWORKDIR}/fluxon_release"
+      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}" "${HOSTWORKDIR}/fluxon_release"
       # English note:
       # - fluxon_fs agent passes --config as a relative path; keep YAML generation in WORKDIR
       #   so future chdir changes do not silently pick up stale configs.
@@ -479,8 +477,7 @@ service:
         instance_key: "fluxon_fs_agent_${NODE_ID}"
         fluxonkv_spec:
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM}"
-          shared_file_path: "${FLUXON_SHARED_FILE}"
+          share_mem_path: "${FLUXON_SHARED_MEM}"
       fluxon_fs:
         master:
           instance_key: "fluxon_fs_master"
@@ -513,7 +510,7 @@ service:
       eval "${FLUXON_RELEASE_WHEEL_FETCH_CMD}"
 
       WORKDIR="${HOSTWORKDIR}/ops_agent/${NODE_ID}"
-      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}" "${FLUXON_SHARED_FILE}"
+      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}"
 
       OPS_AGENT_INSTANCE_KEY="fluxon_ops_${NODE_ID}"
       case "${NODE_ID}" in
@@ -535,8 +532,7 @@ service:
         pprof_duration_seconds: 60
         fluxonkv_spec:
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM}"
-          shared_file_path: "${FLUXON_SHARED_FILE}"
+          share_mem_path: "${FLUXON_SHARED_MEM}"
           p2p_listen_port: ${OPS_AGENT_P2P_LISTEN_PORT}
       controller_instance_key: "${FLUXON_OPS_CONTROLLER_INSTANCE_KEY}"
       hostworkdir: "${HOSTWORKDIR}"
@@ -558,7 +554,7 @@ service:
       eval "${FLUXON_RELEASE_WHEEL_FETCH_CMD}"
 
       WORKDIR="${HOSTWORKDIR}/ops_controller"
-      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}" "${FLUXON_SHARED_FILE}"
+      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}"
 
       cat > "${WORKDIR}/ops_controller.yaml" <<YAML
       ops_controller:
@@ -567,8 +563,7 @@ service:
           pprof_duration_seconds: 60
           fluxonkv_spec:
             cluster_name: "${FLUXON_CLUSTER_NAME}"
-            shared_memory_path: "${FLUXON_SHARED_MEM}"
-            shared_file_path: "${FLUXON_SHARED_FILE}"
+            share_mem_path: "${FLUXON_SHARED_MEM}"
             p2p_listen_port: 12102
         panel:
           max_body_bytes: 1073741824
@@ -589,7 +584,7 @@ service:
         cluster_name: "${FLUXON_CLUSTER_NAME}"
         member_kind: kv
         output: web
-        http_listen_addr: "0.0.0.0:${MASTER__PORT}"
+        http_listen_addr: "0.0.0.0:${OPS_CONTROLLER__PORT}"
       YAML
 
       ${HOSTWORKDIR}/venv/bin/python -m fluxon_py.runtime.start_ops_controller -c "${WORKDIR}/ops_controller.yaml" -w "${WORKDIR}"
@@ -614,8 +609,7 @@ service:
         instance_key: mpmc_demo_producer_base
         fluxonkv_spec:
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM}"
-          shared_file_path: "${HOSTWORKDIR}/mpmc_demo/shared_file_producer_${NODE_ID}"
+          share_mem_path: "${FLUXON_SHARED_MEM}"
       mpmc_demo:
         key: demo_mpmc
         capacity: 20
@@ -683,8 +677,7 @@ service:
         instance_key: mpmc_demo_consumer_base
         fluxonkv_spec:
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM}"
-          shared_file_path: "${HOSTWORKDIR}/mpmc_demo/shared_file_consumer_${NODE_ID}"
+          share_mem_path: "${FLUXON_SHARED_MEM}"
       mpmc_demo:
         key: demo_mpmc
         capacity: 20

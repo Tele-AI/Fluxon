@@ -29,14 +29,26 @@ _ENTRY = _load_module()
 class TestCi2VirtNodeContract(unittest.TestCase):
     _KVTEST_SCENE_ID = "ci_top_attention_bin_kvtest"
     _CARGO_KV_UNIT_SCENE_ID = "ci_top_attention_cargo_kv_unit"
+    _CARGO_CLI_SCENE_ID = "ci_top_attention_cargo_cli"
+    _CARGO_COMMU_SCENE_ID = "ci_top_attention_cargo_commu"
+    _CARGO_COMMU_CONTRACT_SCENE_ID = "ci_top_attention_cargo_commu_contract"
+    _CARGO_FRAMEWORK_SCENE_ID = "ci_top_attention_cargo_framework"
+    _CARGO_FS_SCENE_ID = "ci_top_attention_cargo_fs"
+    _CARGO_FS_S3_GATEWAY_SCENE_ID = "ci_top_attention_cargo_fs_s3_gateway"
+    _CARGO_LIMIT_THIRDPARTY_SCENE_ID = "ci_top_attention_cargo_limit_thirdparty"
+    _CARGO_MQ_SCENE_ID = "ci_top_attention_cargo_mq"
+    _CARGO_OBSERVABILITY_SCENE_ID = "ci_top_attention_cargo_observability"
+    _CARGO_OPS_SCENE_ID = "ci_top_attention_cargo_ops"
+    _CARGO_PYO3_SCENE_ID = "ci_top_attention_cargo_pyo3"
     _DOC_SCENE_ID = "ci_top_attention_doc_page_build"
+    _LOG_MGMT_SCENE_ID = "ci_top_attention_log_mgmt"
     _MQ_SCENE_ID = "ci_top_attention_mq_core"
 
     def test_generated_suite_is_public_dual_local_nodes_ci_only(self) -> None:
         suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
         generated = _ENTRY._rewrite_suite_for_local_dual_nodes(
             suite_cfg=suite_cfg,
-            scene_ids=[self._DOC_SCENE_ID, self._KVTEST_SCENE_ID],
+            scene_ids=[self._DOC_SCENE_ID, self._KVTEST_SCENE_ID, self._LOG_MGMT_SCENE_ID, self._MQ_SCENE_ID],
             primary_node_name="local-node-a",
             secondary_node_name="local-node-b",
             host_ip="10.1.1.119",
@@ -45,13 +57,26 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         )
 
         self.assertEqual(generated["run"]["selectors"]["profile_ids"], ["fluxon_tcp_thread"])
-        self.assertEqual(set(generated["scenes"].keys()), {self._DOC_SCENE_ID, self._KVTEST_SCENE_ID})
+        self.assertEqual(
+            set(generated["scenes"].keys()),
+            {self._DOC_SCENE_ID, self._KVTEST_SCENE_ID, self._LOG_MGMT_SCENE_ID, self._MQ_SCENE_ID},
+        )
         self.assertEqual(generated["profiles"]["fluxon_tcp_thread"]["artifact_set"], "fluxon_tcp_thread")
         self.assertEqual(
             generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["scene_configs"][self._KVTEST_SCENE_ID][
                 "kv_transport_feature"
             ],
             "tcp_thread_transport",
+        )
+        self.assertEqual(
+            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["scene_configs"][self._LOG_MGMT_SCENE_ID][
+                "enabled"
+            ],
+            True,
+        )
+        self.assertEqual(
+            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["scene_configs"][self._MQ_SCENE_ID],
+            {},
         )
         self.assertEqual(
             generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["deploy"]["target_ip_map"],
@@ -116,10 +141,20 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             ["n1_kvowner_dram_20gib"],
         )
         self.assertEqual(
+            generated["scenes"][self._LOG_MGMT_SCENE_ID]["select"]["scales"],
+            ["n1_kvowner_dram_20gib"],
+        )
+        self.assertEqual(
+            generated["scenes"][self._MQ_SCENE_ID]["select"]["scales"],
+            ["n1_kvowner_dram_20gib"],
+        )
+        self.assertEqual(
             set(generated["scales"].keys()),
             {"n1_kvowner_dram_3gib", "n1_kvowner_dram_20gib"},
         )
         self.assertNotIn("commands", generated["scenes"][self._KVTEST_SCENE_ID]["ci"])
+        self.assertNotIn("commands", generated["scenes"][self._LOG_MGMT_SCENE_ID]["ci"])
+        self.assertNotIn("commands", generated["scenes"][self._MQ_SCENE_ID]["ci"])
 
     def test_generated_suite_supports_mq_core_ci_scene(self) -> None:
         suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
@@ -188,6 +223,43 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             ],
             "tcp_thread_transport",
         )
+
+    def test_generated_suite_supports_additional_runner_native_cargo_scenes(self) -> None:
+        scene_ids = [
+            self._CARGO_CLI_SCENE_ID,
+            self._CARGO_COMMU_SCENE_ID,
+            self._CARGO_COMMU_CONTRACT_SCENE_ID,
+            self._CARGO_FRAMEWORK_SCENE_ID,
+            self._CARGO_FS_SCENE_ID,
+            self._CARGO_FS_S3_GATEWAY_SCENE_ID,
+            self._CARGO_LIMIT_THIRDPARTY_SCENE_ID,
+            self._CARGO_MQ_SCENE_ID,
+            self._CARGO_OBSERVABILITY_SCENE_ID,
+            self._CARGO_OPS_SCENE_ID,
+            self._CARGO_PYO3_SCENE_ID,
+        ]
+        suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
+        generated = _ENTRY._rewrite_suite_for_local_dual_nodes(
+            suite_cfg=suite_cfg,
+            scene_ids=scene_ids,
+            primary_node_name="local-node-a",
+            secondary_node_name="local-node-b",
+            host_ip="10.1.1.119",
+            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            controller_port=19080,
+        )
+
+        self.assertEqual(set(generated["scenes"].keys()), set(scene_ids))
+        for scene_id in scene_ids:
+            self.assertEqual(
+                generated["scenes"][scene_id]["ci"]["runtime_contract"],
+                "rust_self_managed",
+            )
+            self.assertEqual(
+                generated["scenes"][scene_id]["ci"]["subject"],
+                "rust",
+            )
+            self.assertNotIn("commands", generated["scenes"][scene_id]["ci"])
 
     def test_generated_suite_supports_doc_page_ci_scene(self) -> None:
         suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
@@ -271,7 +343,23 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         self.assertIn('--wheel "$FLUXON_RELEASE_WHEEL"', generated["global_envs"]["FLUXON_RELEASE_WHEEL_FETCH_CMD"])
         self.assertEqual(generated["atomic_groups"]["fluxon_core_controller"]["nodes"], ["local-node-a", "local-node-b"])
         self.assertEqual(generated["service"]["owner"]["node_bind"]["node"], ["local-node-a", "local-node-b"])
+        self.assertIn(
+            'large_file_paths:',
+            generated["service"]["owner"]["entrypoint"],
+        )
+        self.assertIn(
+            '- "${HOSTWORKDIR}/large/owner_${NODE_ID}"',
+            generated["service"]["owner"]["entrypoint"],
+        )
         self.assertEqual(generated["service"]["ops_controller"]["port"], 19180)
+        self.assertIn(
+            'http_listen_addr: "0.0.0.0:${OPS_CONTROLLER__PORT}"',
+            generated["service"]["ops_controller"]["entrypoint"],
+        )
+        self.assertNotIn(
+            'http_listen_addr: "0.0.0.0:${MASTER__PORT}"',
+            generated["service"]["ops_controller"]["entrypoint"],
+        )
         self.assertIn("local-node-a", generated["service"]["ops_agent"]["entrypoint"])
         self.assertIn("local-node-b", generated["service"]["ops_agent"]["entrypoint"])
         self.assertIn('    - "10.1.1.119/32"', generated["service"]["master"]["entrypoint"])
@@ -368,6 +456,54 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             self.assertIn(str(env_path.resolve()), calls[0])
             self.assertIn(str((root / "pack_release_runtime").resolve()), calls[0])
 
+    def test_render_ci_nix_pack_config_sets_explicit_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            static_config_path = root / "static.yaml"
+            env_companion_path = root / "env.yaml"
+            out_path = root / "generated" / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_ci.yaml"
+
+            _ENTRY._write_yaml(
+                static_config_path,
+                {
+                    "schema_version": 1,
+                    "runtime": {
+                        "base_system": "manylinux_2_28",
+                        "architectures": ["x86_64"],
+                        "python_abi": "cpython3.10",
+                    },
+                    "profile": {
+                        "source_kind": "bridge_prebuilt",
+                        "native_runtime_dir_names": ["cxxpacked"],
+                        "target_support_dir_names": ["meson-0.64.0"],
+                        "ext_bundle_dir_name": "cxxpacked",
+                    },
+                    "assembly": {
+                        "baseline_path": "/tmp/baseline",
+                    },
+                },
+            )
+            _ENTRY._write_yaml(
+                env_companion_path,
+                {
+                    "host_paths": {
+                        "root_path": "/tmp/project-data",
+                    },
+                },
+            )
+
+            rendered_path = _ENTRY._render_ci_nix_pack_config(
+                static_config_path=static_config_path,
+                env_companion_path=env_companion_path,
+                out_path=out_path,
+                repo_root=REPO_ROOT,
+            )
+
+            self.assertEqual(rendered_path, out_path.resolve())
+            rendered_cfg = _ENTRY._load_yaml_mapping(rendered_path, ctx="rendered nix pack config")
+            self.assertEqual(rendered_cfg["project_root"], str(REPO_ROOT.resolve()))
+            self.assertEqual(rendered_cfg["profile"]["build_root_path"], str(REPO_ROOT.resolve()))
+
     def test_prepare_pack_release_runtime_dirs_creates_expected_layout(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "pack_release_runtime"
@@ -461,7 +597,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             suite_cfg["scenes"] = {
                 key: value
                 for key, value in suite_cfg["scenes"].items()
-                if key in (self._DOC_SCENE_ID, self._KVTEST_SCENE_ID, self._MQ_SCENE_ID)
+                if key in (self._DOC_SCENE_ID, self._KVTEST_SCENE_ID, self._LOG_MGMT_SCENE_ID, self._MQ_SCENE_ID)
             }
             suite_cfg["profiles"] = {"fluxon_tcp": suite_cfg["profiles"]["fluxon_tcp"]}
             suite_cfg["run"]["selectors"]["profile_ids"] = ["fluxon_tcp"]
@@ -469,6 +605,8 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             suite_cfg["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"][self._DOC_SCENE_ID]["doc_site_base_url"] = (
                 "tele-ai.github.io/Fluxon"
             )
+            suite_cfg["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"][self._LOG_MGMT_SCENE_ID]["enabled"] = True
+            suite_cfg["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"][self._MQ_SCENE_ID] = {}
             _ENTRY._write_yaml(suite_path, suite_cfg)
             release_dir = REPO_ROOT / "fluxon_release"
             release_dir.mkdir(parents=True, exist_ok=True)
@@ -507,7 +645,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             )
             self.assertEqual(
                 set(generated_suite["scenes"].keys()),
-                {self._DOC_SCENE_ID, self._KVTEST_SCENE_ID, self._MQ_SCENE_ID},
+                {self._DOC_SCENE_ID, self._KVTEST_SCENE_ID, self._LOG_MGMT_SCENE_ID, self._MQ_SCENE_ID},
             )
             self.assertEqual(
                 generated_suite["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["scene_configs"][self._KVTEST_SCENE_ID][
@@ -520,6 +658,12 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                     "doc_site_base_url"
                 ],
                 "tele-ai.github.io/Fluxon",
+            )
+            self.assertEqual(
+                generated_suite["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["scene_configs"][self._LOG_MGMT_SCENE_ID][
+                    "enabled"
+                ],
+                True,
             )
             self.assertEqual(
                 generated_suite["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["scene_configs"][self._MQ_SCENE_ID],
@@ -628,6 +772,60 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             self.assertEqual(
                 calls[1][0][1],
                 str((REPO_ROOT / "fluxon_test_stack" / "pack_test_stack_rsc.py").resolve()),
+            )
+
+    def test_main_passes_explicit_release_dir_to_pack_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workdir = root / "ci_2_virt_node_workdir"
+            hostworkdir = root / "hostworkdir"
+            release_dir = root / "custom_release"
+            release_dir.mkdir(parents=True, exist_ok=True)
+            wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path.write_text("", encoding="utf-8")
+            calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+            def fake_run(argv: list[str], *, env=None) -> None:
+                calls.append((list(argv), None if env is None else dict(env)))
+
+            argv = [
+                "ci_2_virt_node.py",
+                "--workdir",
+                str(workdir),
+                "--testbed-hostworkdir",
+                str(hostworkdir),
+                "--release-dir",
+                str(release_dir),
+                "--scene-id",
+                self._KVTEST_SCENE_ID,
+                "--skip-builder-image",
+                "--skip-dispatch",
+                "--skip-start-testbed",
+                "--skip-runner",
+            ]
+            original_argv = sys.argv[:]
+            try:
+                with mock.patch.object(_ENTRY, "_run", side_effect=fake_run):
+                    with mock.patch.object(_ENTRY, "_detect_local_hostname", return_value="runner-host"):
+                        with mock.patch.object(_ENTRY, "_detect_local_ipv4", return_value="10.1.1.119"):
+                            with mock.patch.object(_ENTRY, "_ensure_ci_pack_release_env", return_value=Path("/tmp/env.yaml")):
+                                with mock.patch.object(_ENTRY, "_render_ci_nix_pack_config", return_value=Path("/tmp/cfg.yaml")):
+                                    sys.argv = argv
+                                    rc = _ENTRY.main()
+            finally:
+                sys.argv = original_argv
+
+            self.assertEqual(rc, 0)
+            self.assertGreaterEqual(len(calls), 2)
+            pack_cmd = calls[1][0]
+            self.assertEqual(
+                pack_cmd[1],
+                str((REPO_ROOT / "fluxon_test_stack" / "pack_test_stack_rsc.py").resolve()),
+            )
+            self.assertIn("--release-dir", pack_cmd)
+            self.assertEqual(
+                pack_cmd[pack_cmd.index("--release-dir") + 1],
+                str(release_dir.resolve()),
             )
 
     def test_main_uses_apply_check_config_for_explicit_apply_validation(self) -> None:

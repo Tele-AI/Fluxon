@@ -44,8 +44,8 @@ define_module!(
 #[derive(Clone, Debug)]
 pub struct ClientSegPoolNewArg {
     pub contribute_size: ContributeToClusterPoolSize,
-    pub shared_memory_path: String,
-    pub shared_file_path: String,
+    pub share_mem_path: String,
+    pub large_file_paths: crate::config::LargeFilePaths,
     pub cluster_name: String,
     pub etcd_addresses: Vec<String>,
     pub attach_existing_meta: Option<SharedJsonMeta>,
@@ -62,8 +62,8 @@ pub struct SharedJsonMeta {
     pub sub_cluster: Option<String>,
     pub cluster_name: String,
     pub etcd_addresses: Vec<String>,
-    pub shared_memory_path: String,
-    pub shared_file_path: String,
+    pub share_mem_path: String,
+    pub large_file_paths: crate::config::LargeFilePaths,
     pub protocol_version: String,
     pub write_ts: Option<i64>,
 }
@@ -199,10 +199,10 @@ impl Deref for ClientCpuMemReadGuard {
 pub struct ClientSegPoolInner {
     cpu_allocated_mem: std::sync::Arc<ARwLock<Option<ClientMappedMem>>>,
     view: std::sync::OnceLock<ClientSegPoolView>,
-    /// Directory path for shared-memory backed files (mmap.file).
-    shared_memory_path: String,
-    /// Directory path for regular files (shared.json, side-transfer metadata).
-    shared_file_path: String,
+    /// Directory path for the local shared bundle (mmap.file, shared.json, peer metadata).
+    share_mem_path: String,
+    /// Ordered large-file roots; concrete subdirectories are derived by fixed relative layout.
+    large_file_paths: crate::config::LargeFilePaths,
     side_transfer_worker: bool,
     attach_owner_ref: Option<ShareGroupOwnerRef>,
 
@@ -233,15 +233,15 @@ impl ClientSegPoolInner {
 }
 
 impl ClientSegPool {
-    pub fn side_transfer_peers_dir(shared_file_path: &str) -> std::path::PathBuf {
-        std::path::Path::new(shared_file_path).join(SIDE_TRANSFER_PEERS_DIRNAME)
+    pub fn side_transfer_peers_dir(share_mem_path: &str) -> std::path::PathBuf {
+        std::path::Path::new(share_mem_path).join(SIDE_TRANSFER_PEERS_DIRNAME)
     }
 
     pub fn side_transfer_peer_file_path(
-        shared_file_path: &str,
+        share_mem_path: &str,
         side_id: &str,
     ) -> std::path::PathBuf {
-        Self::side_transfer_peers_dir(shared_file_path).join(format!("{side_id}.json"))
+        Self::side_transfer_peers_dir(share_mem_path).join(format!("{side_id}.json"))
     }
 
     pub fn attach_view(&self, view: ClientSegPoolView) {
@@ -255,13 +255,13 @@ impl ClientSegPool {
 
     pub async fn construct(arg: ClientSegPoolNewArg) -> Result<Self, KvError> {
         tracing::info!(
-            "Constructing ClientSegPool in Client mode with shared_memory_path: {}",
-            arg.shared_memory_path
+            "Constructing ClientSegPool in Client mode with share_mem_path: {}",
+            arg.share_mem_path
         );
 
         let contribute_size = arg.contribute_size;
-        let shared_memory_path = arg.shared_memory_path;
-        let shared_file_path = arg.shared_file_path;
+        let share_mem_path = arg.share_mem_path;
+        let large_file_paths = arg.large_file_paths;
         let cluster_name = arg.cluster_name;
         let etcd_addresses = arg.etcd_addresses;
         let attach_existing_meta = arg.attach_existing_meta;
@@ -278,7 +278,7 @@ impl ClientSegPool {
         if let Some(existing_meta) = attach_existing_meta {
             tracing::info!(
                 "Attaching existing shared memory for side-transfer worker: path={}, len={}",
-                shared_memory_path,
+                share_mem_path,
                 existing_meta.segment_len
             );
 
@@ -288,7 +288,7 @@ impl ClientSegPool {
             use std::ptr;
 
             let map_len = existing_meta.segment_len as usize;
-            let mmap_file_path = Path::new(&shared_memory_path).join("mmap.file");
+            let mmap_file_path = Path::new(&share_mem_path).join("mmap.file");
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -354,8 +354,8 @@ impl ClientSegPool {
                     layout_validated: AtomicBool::new(false),
                 }))),
                 view: std::sync::OnceLock::new(),
-                shared_memory_path: shared_memory_path.clone(),
-                shared_file_path: shared_file_path.clone(),
+                share_mem_path: share_mem_path.clone(),
+                large_file_paths: large_file_paths.clone(),
                 side_transfer_worker,
                 attach_owner_ref,
                 cluster_name: cluster_name.clone(),
@@ -370,8 +370,8 @@ impl ClientSegPool {
             let inner = ClientSegPoolInner {
                 cpu_allocated_mem: std::sync::Arc::new(ARwLock::new(None)),
                 view: std::sync::OnceLock::new(),
-                shared_memory_path: shared_memory_path.clone(),
-                shared_file_path: shared_file_path.clone(),
+                share_mem_path: share_mem_path.clone(),
+                large_file_paths: large_file_paths.clone(),
                 side_transfer_worker,
                 attach_owner_ref,
                 cluster_name: cluster_name.clone(),
@@ -394,29 +394,20 @@ impl ClientSegPool {
 
         let map_len = contribute_size.dram as usize;
 
-        if shared_memory_path.is_empty() {
+        if share_mem_path.is_empty() {
             return Err(KvError::SharedMem(
                 crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
                     path: String::new(),
                     len: map_len as u64,
-                    detail: "shared_memory_path is empty; explicit configuration required"
-                        .to_string(),
-                },
-            ));
-        }
-        if shared_file_path.is_empty() {
-            return Err(KvError::SharedMem(
-                crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MetaDataLoadError {
-                    path: String::new(),
-                    detail: "shared_file_path is empty; explicit configuration required"
+                    detail: "share_mem_path is empty; explicit configuration required"
                         .to_string(),
                 },
             ));
         }
 
-        let base_path = &shared_memory_path;
+        let base_path = &share_mem_path;
         tracing::info!(
-            "Using shared_memory_path: {} for memory-mapped file",
+            "Using share_mem_path: {} for memory-mapped file",
             base_path
         );
         std::fs::create_dir_all(base_path).map_err(|e| {
@@ -533,8 +524,8 @@ impl ClientSegPool {
                 layout_validated: AtomicBool::new(false),
             }))),
             view: std::sync::OnceLock::new(),
-            shared_memory_path: base_path.to_string(),
-            shared_file_path: shared_file_path.clone(),
+            share_mem_path: base_path.to_string(),
+            large_file_paths,
             side_transfer_worker,
             attach_owner_ref,
             cluster_name,
@@ -549,8 +540,12 @@ impl ClientSegPool {
         &self.0
     }
 
-    pub fn shared_file_path(&self) -> &str {
-        &self.inner().shared_file_path
+    pub fn share_mem_path(&self) -> &str {
+        &self.inner().share_mem_path
+    }
+
+    pub fn large_file_paths(&self) -> &crate::config::LargeFilePaths {
+        &self.inner().large_file_paths
     }
 
     fn transfer_rpc_fast_path_eligible_members(&self) -> Vec<ClusterMember> {
@@ -897,7 +892,7 @@ impl ClientSegPool {
                 },
             )
         })?;
-        let peers_dir = Self::side_transfer_peers_dir(&inner.shared_file_path);
+        let peers_dir = Self::side_transfer_peers_dir(&inner.share_mem_path);
         std::fs::create_dir_all(&peers_dir).map_err(|e| {
             KvError::SharedMem(
                 crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MetaDataLoadError {
@@ -907,7 +902,7 @@ impl ClientSegPool {
             )
         })?;
 
-        let peer_path = Self::side_transfer_peer_file_path(&inner.shared_file_path, &self_info.id);
+        let peer_path = Self::side_transfer_peer_file_path(&inner.share_mem_path, &self_info.id);
         let tmp_path = peer_path.with_file_name(format!(
             "{}.tmp.{}.{}",
             self_info.id,
@@ -950,7 +945,7 @@ impl ClientSegPool {
             return Ok(());
         }
         let self_id = inner.view().cluster_manager().get_self_info().id;
-        let peer_path = Self::side_transfer_peer_file_path(&inner.shared_file_path, &self_id);
+        let peer_path = Self::side_transfer_peer_file_path(&inner.share_mem_path, &self_id);
         match std::fs::remove_file(&peer_path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1111,35 +1106,24 @@ impl ClientSegPool {
         self.wait_required_transfer_rpc_fast_path_ready().await?;
 
         use std::path::Path;
-        let shared_json_path = Path::new(&inner.shared_file_path).join("shared.json");
+        let shared_json_path = Path::new(&inner.share_mem_path).join("shared.json");
         if let Some(parent) = shared_json_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 KvError::SharedMem(
                     crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MetaDataLoadError {
                         path: parent.to_string_lossy().to_string(),
-                        detail: format!("Failed to create shared_file_path: {}", e),
+                        detail: format!("Failed to create share_mem_path: {}", e),
                     },
                 )
             })?;
         }
 
-        let shared_memory_canonical = std::fs::canonicalize(&inner.shared_memory_path)
+        let share_mem_canonical = std::fs::canonicalize(&inner.share_mem_path)
             .map_err(|e| {
                 KvError::SharedMem(
                     crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MetaDataLoadError {
-                        path: inner.shared_memory_path.clone(),
-                        detail: format!("Failed to canonicalize shared_memory_path: {}", e),
-                    },
-                )
-            })?
-            .to_string_lossy()
-            .into_owned();
-        let shared_file_canonical = std::fs::canonicalize(&inner.shared_file_path)
-            .map_err(|e| {
-                KvError::SharedMem(
-                    crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MetaDataLoadError {
-                        path: inner.shared_file_path.clone(),
-                        detail: format!("Failed to canonicalize shared_file_path: {}", e),
+                        path: inner.share_mem_path.clone(),
+                        detail: format!("Failed to canonicalize share_mem_path: {}", e),
                     },
                 )
             })?
@@ -1159,8 +1143,8 @@ impl ClientSegPool {
 
             cluster_name: inner.cluster_name.clone(),
             etcd_addresses: inner.etcd_addresses.clone(),
-            shared_memory_path: shared_memory_canonical,
-            shared_file_path: shared_file_canonical,
+            share_mem_path: share_mem_canonical,
+            large_file_paths: inner.large_file_paths.clone(),
 
             protocol_version,
 
@@ -1226,8 +1210,8 @@ impl ClientSegPool {
             ));
         }
 
-        let shared_json_path = std::path::Path::new(&inner.shared_file_path).join("shared.json");
-        let mmap_file_path = std::path::Path::new(&inner.shared_memory_path).join("mmap.file");
+        let shared_json_path = std::path::Path::new(&inner.share_mem_path).join("shared.json");
+        let mmap_file_path = std::path::Path::new(&inner.share_mem_path).join("mmap.file");
 
         if !mmap_file_path.exists() {
             return Err(KvError::SharedMem(
@@ -1343,7 +1327,7 @@ async fn handle_resolve_side_transfer_lane_request(
 ) -> MsgPack<ResolveSideTransferLaneResp> {
     let self_info = view.cluster_manager().get_self_info();
     let peers_dir =
-        ClientSegPool::side_transfer_peers_dir(&view.client_seg_pool().inner().shared_file_path);
+        ClientSegPool::side_transfer_peers_dir(&view.client_seg_pool().inner().share_mem_path);
     tracing::info!(
         "handle_resolve_side_transfer_lane_request: owner={} lane_idx={} peers_dir={}",
         self_info.id,

@@ -1,0 +1,19 @@
+selection_present() {
+  python3 - "$SELECTION_SUPERVISOR" "$SUPERVISOR_LABEL" "$HOSTWORKDIR" <<'__FLUXON_SELECTION_PRESENT__'
+import importlib.util
+import sys
+from pathlib import Path
+
+supervisor_path = Path(sys.argv[1])
+label = sys.argv[2]
+scope_key = sys.argv[3]
+spec = importlib.util.spec_from_file_location("fluxon_selection_supervisor_probe", supervisor_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"failed to load selection supervisor module: {supervisor_path}")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+raise SystemExit(0 if module._selection_present(label, scope_key=scope_key) else 1)
+__FLUXON_SELECTION_PRESENT__
+}
+

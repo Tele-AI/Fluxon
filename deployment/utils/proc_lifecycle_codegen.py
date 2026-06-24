@@ -135,71 +135,117 @@ _pid_tree_list() {{
   '
 }}
 
-_pid_tree_has_child_process() {{
+_pid_tree_direct_child_pids() {{
   root_pid="$1"
-  pids="$(_pid_tree_list "$root_pid" 2>/dev/null || true)"
-  if [ -z "$pids" ]; then
+  if [[ ! "$root_pid" =~ ^[0-9]+$ ]]; then
     return 1
   fi
-  # More than one PID means the supervisor has a live child process.
-  set -- $pids
-  if [ "$#" -ge 2 ]; then
-    return 0
+  if ! _pid_exists "$root_pid"; then
+    return 1
   fi
-  return 1
+
+  ps -eo pid=,ppid=,stat= 2>/dev/null | awk -v root="$root_pid" '
+    {{
+      pid=$1;
+      ppid=$2;
+      state=$3;
+      if (ppid != root) {{
+        next;
+      }}
+      if (state ~ /^Z/) {{
+        next;
+      }}
+      out=out " " pid;
+    }}
+    END {{
+      sub(/^ /, "", out);
+      print out;
+    }}
+  '
+}}
+
+_now_monotonic_ms() {{
+  python3 - <<'__FLUXON_MONOTONIC_MS__'
+import time
+
+print(time.monotonic_ns() // 1_000_000)
+__FLUXON_MONOTONIC_MS__
 }}
 
 wait_service_probably_ready_pid_tree() {{
-  # "Probably ready" contract:
-  # - A service is considered probably-ready iff for N consecutive seconds:
-  #   - the supervisor PID exists, and
-  #   - the supervisor PID subtree has at least one other PID besides the supervisor.
-  # - If the child process restarts during the window, we reset the counter and keep waiting,
-  #   until the provided deadline is reached.
-  #
-  # This is used by atomic-group runners to enforce strict start ordering.
+  # Startup gate contract:
+  # - Success means one supervised direct child PID becomes visible, then stays unchanged for the
+  #   full startup_window_seconds before the overall startup deadline expires.
+  # - During this startup window we do not probe service ports or readiness endpoints.
+  # - A child exit or restart inside the window is treated as startup failure even if the
+  #   supervisor process itself stays alive and restarts again later.
   svc="$1"
   root_pid="$2"
-  stable_seconds="$3"
-  deadline_ts="$4"
+  startup_window_seconds="$3"
+  startup_deadline_seconds="$4"
   context="$5"
 
-  if [[ ! "$stable_seconds" =~ ^[0-9]+$ ]] || [ "$stable_seconds" -le 0 ]; then
-    echo "$context probable-ready: invalid stable_seconds=$stable_seconds svc=$svc"
+  if [[ ! "$startup_window_seconds" =~ ^[0-9]+$ ]] || [ "$startup_window_seconds" -le 0 ]; then
+    echo "$context probable-ready: invalid startup_window_seconds=$startup_window_seconds svc=$svc"
     return 1
   fi
-  if [[ ! "$deadline_ts" =~ ^[0-9]+$ ]] || [ "$deadline_ts" -le 0 ]; then
-    echo "$context probable-ready: invalid deadline_ts=$deadline_ts svc=$svc"
+  if [[ ! "$startup_deadline_seconds" =~ ^[0-9]+$ ]] || [ "$startup_deadline_seconds" -le 0 ]; then
+    echo "$context probable-ready: invalid startup_deadline_seconds=$startup_deadline_seconds svc=$svc"
     return 1
   fi
 
-  ok_s=0
+  startup_window_ms=$(( startup_window_seconds * 1000 ))
+  startup_deadline_ms=$(( startup_deadline_seconds * 1000 ))
+  started_at_monotonic_ms="$(_now_monotonic_ms)"
+  deadline_monotonic_ms=$(( started_at_monotonic_ms + startup_deadline_ms ))
+  observed_child_pid=""
+  observed_child_since_monotonic_ms=""
   while true; do
-    now=$(date +%s)
-    if [ "$now" -ge "$deadline_ts" ]; then
-      echo "$context probable-ready: deadline exceeded svc=$svc stable_seconds=$stable_seconds pid=$root_pid"
-      return 1
-    fi
-
     if ! _pid_exists "$root_pid"; then
       echo "$context probable-ready: supervisor pid exited svc=$svc pid=$root_pid"
       return 1
     fi
 
-    if _pid_tree_has_child_process "$root_pid"; then
-      ok_s=$((ok_s+1))
-      if [ "$ok_s" -ge "$stable_seconds" ]; then
-        echo "$context probable-ready: ok svc=$svc stable_seconds=$stable_seconds pid=$root_pid"
-        return 0
+    current_child_pids="$(_pid_tree_direct_child_pids "$root_pid" 2>/dev/null || true)"
+    current_child_pid=""
+    if [ -n "$current_child_pids" ]; then
+      set -- $current_child_pids
+      if [ "$#" -ne 1 ]; then
+        echo "$context probable-ready: multiple direct child pids svc=$svc supervisor_pid=$root_pid child_pids=$current_child_pids"
+        return 1
       fi
-    else
-      if [ "$ok_s" -ne 0 ]; then
-        echo "$context probable-ready: reset svc=$svc ok_s=$ok_s missing_child=true"
-      fi
-      ok_s=0
+      current_child_pid="$1"
     fi
 
-    sleep 1
+    now_monotonic_ms="$(_now_monotonic_ms)"
+    if [ -z "$current_child_pid" ]; then
+      if [ -n "$observed_child_pid" ]; then
+        echo "$context probable-ready: child pid exited svc=$svc supervisor_pid=$root_pid child_pid=$observed_child_pid"
+        return 1
+      fi
+    elif [ -z "$observed_child_pid" ]; then
+      observed_child_pid="$current_child_pid"
+      observed_child_since_monotonic_ms="$now_monotonic_ms"
+    elif [ "$current_child_pid" != "$observed_child_pid" ]; then
+      echo "$context probable-ready: child pid changed svc=$svc supervisor_pid=$root_pid child_pid=$observed_child_pid replacement_child_pid=$current_child_pid"
+      return 1
+    fi
+
+    if [ -n "$observed_child_since_monotonic_ms" ] && [ $(( now_monotonic_ms - observed_child_since_monotonic_ms )) -ge "$startup_window_ms" ]; then
+      echo "$context probable-ready: ok svc=$svc startup_window_seconds=$startup_window_seconds supervisor_pid=$root_pid child_pid=$observed_child_pid"
+      return 0
+    fi
+
+    if [ "$now_monotonic_ms" -ge "$deadline_monotonic_ms" ]; then
+      if [ -z "$observed_child_pid" ]; then
+        echo "$context probable-ready: no child pid observed svc=$svc supervisor_pid=$root_pid startup_window_seconds=$startup_window_seconds startup_deadline_seconds=$startup_deadline_seconds"
+        return 1
+      fi
+      echo "$context probable-ready: child pid not stable long enough svc=$svc supervisor_pid=$root_pid child_pid=$observed_child_pid observed_for_ms=$(( now_monotonic_ms - observed_child_since_monotonic_ms )) startup_window_seconds=$startup_window_seconds startup_deadline_seconds=$startup_deadline_seconds"
+      return 1
+    fi
+
+    sleep 0.2
   done
 }}
 

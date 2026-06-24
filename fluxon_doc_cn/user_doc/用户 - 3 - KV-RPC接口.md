@@ -52,8 +52,7 @@ ETCD_ENDPOINT = "127.0.0.1:2379"
 GREPTIME_HTTP_PORT = 34030
 GREPTIME_BASE_URL = f"http://127.0.0.1:{GREPTIME_HTTP_PORT}"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARED_MEMORY_PATH = Path("/dev/shm/fluxon_kv_demo").resolve()
-SHARED_FILE_PATH = Path("/tmp/fluxon_kv_demo/shared").resolve()
+SHARE_MEM_PATH = Path("/dev/shm/fluxon_kv_demo").resolve()
 WORKDIR = Path("/tmp/fluxon_kv_demo/runtime").resolve()
 MASTER_PORT = 31000
 MASTER_UI_PORT = 18080
@@ -64,7 +63,6 @@ OWNER_DRAM_BYTES = 1073741824
 
 def main() -> None:
     args = parse_args()
-    SHARED_FILE_PATH.mkdir(parents=True, exist_ok=True)
     log_dir = (WORKDIR / "log").resolve()
 
     if args.with_master:
@@ -99,8 +97,7 @@ def main() -> None:
         )
     )
 
-    print(f"[fluxon_kv] shared memory path: {SHARED_MEMORY_PATH}")
-    print(f"[fluxon_kv] shared file path: {SHARED_FILE_PATH}")
+    print(f"[fluxon_kv] share_mem_path: {SHARE_MEM_PATH}")
     print(f"[fluxon_kv] etcd endpoint: {ETCD_ENDPOINT}")
     print(f"[fluxon_kv] greptime base url: {GREPTIME_BASE_URL}")
     print(f"[fluxon_kv] start master in this script: {args.with_master}")
@@ -170,9 +167,9 @@ def build_owner_config() -> dict:
         "fluxonkv_spec": {
             "etcd_addresses": [ETCD_ENDPOINT],
             "cluster_name": CLUSTER_NAME,
-            "shared_memory_path": str(SHARED_MEMORY_PATH),
-            "shared_file_path": str(SHARED_FILE_PATH),
+            "share_mem_path": str(SHARE_MEM_PATH),
             "sub_cluster": "default",
+            "large_file_paths": [str((WORKDIR / "large" / "owner").resolve())],
         },
     }
 
@@ -237,6 +234,7 @@ api.close() -> Result[OkNone, ApiError]
 - `FluxonKvClientConfig`：配置对象，优先直接从 Python dict 创建，也支持从 YAML 文件加载。
 - `new_store(config: FluxonKvClientConfig) -> Result[KvClient, ApiError]`：创建 KV client 实例。
 - `KvClient`：统一入口，同时提供 KV 读写与节点间调用。
+- `KvClient.third_party_logs_dir() -> Result[str, ApiError]`：返回 Fluxon 分配给第三方 Python 组件的日志根目录。组件应在这个根目录下继续派生自己的子目录，例如 `mq/`。
 - `MemHolder`：`get_blocking(...)` 成功后的读取结果持有者，`access()` 取得 `FlatDict`。
 - `PutOptionalArgs`：`put_blocking(...)` 的可选参数对象，当前常用字段是 `lease_id`。
 - `test_spec_config.disable_observability`：最小 external client 示例里显式设为 `True`，避免把 OTLP / observe 后台任务引入“只验证 KV/RPC 基本链路”的示例生命周期。
@@ -264,8 +262,7 @@ from fluxon_py import FluxonKvClientConfig, new_store
 
 INSTANCE_KEY = "demo_kv_external"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARED_MEMORY_PATH = "/dev/shm/fluxon_kv_demo"
-SHARED_FILE_PATH = "/tmp/fluxon_kv_demo/shared"
+SHARE_MEM_PATH = "/dev/shm/fluxon_kv_demo"
 
 
 def main() -> None:
@@ -274,8 +271,7 @@ def main() -> None:
             "instance_key": INSTANCE_KEY,
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
-                "shared_memory_path": SHARED_MEMORY_PATH,
-                "shared_file_path": SHARED_FILE_PATH,
+                "share_mem_path": SHARE_MEM_PATH,
             },
             "test_spec_config": {
                 "disable_observability": True,
@@ -332,7 +328,9 @@ FLUXON_LOG=DEBUG python3 examples/external_put_get_del.py
 - `FLUXON_LOG`：控制当前 Python 业务进程 console logger 的输出门限
 - Fluxon Python 侧 logger 会读取 `FLUXON_LOG`；合法值是 `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`，默认 `INFO`
 - `log_dir`：`master` 本地日志 authority
-- `shared_file_path`：本机共享文件 authority，`shared.json`、日志、profile 等文件位于这里
+- `share_mem_path`：KV 共享 bundle 根目录，只承载 `mmap.file`、`shared.json` 和 peer metadata
+- `large_file_paths`：owner 侧大文件根目录，日志、profile、cache 等运行时资产都从这里派生
+- `store.third_party_logs_dir().unwrap(...)`：返回 `{large_file_paths[0]}/{cluster_name}_cluster_third_party_logs`。第三方 Python 组件应只在这个根目录下派生自己的子目录，这样目录使用更收束，Fluxon 观测平面也能统一感知和采集这些文件日志。
 
 如果服务平面的 `master.monitoring.otlp_log_api` 已经配置，后台服务日志还会继续采集到 Greptime 的 `fluxon_logs` 表。
 
@@ -411,8 +409,7 @@ from fluxon_py import FluxonKvClientConfig, new_store
 RPC_SERVER_INSTANCE_KEY = "demo_rpc_server"
 RPC_CLIENT_INSTANCE_KEY = "demo_rpc_client"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARED_MEMORY_PATH = "/dev/shm/fluxon_kv_demo"
-SHARED_FILE_PATH = "/tmp/fluxon_kv_demo/shared"
+SHARE_MEM_PATH = "/dev/shm/fluxon_kv_demo"
 
 
 def main() -> None:
@@ -446,8 +443,7 @@ def _build_config(*, instance_key: str) -> FluxonKvClientConfig:
             "instance_key": instance_key,
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
-                "shared_memory_path": SHARED_MEMORY_PATH,
-                "shared_file_path": SHARED_FILE_PATH,
+                "share_mem_path": SHARE_MEM_PATH,
             },
             "test_spec_config": {
                 "disable_observability": True,
@@ -548,8 +544,7 @@ cfg = FluxonKvClientConfig(
         "instance_key": "my-kv-client-1",
         "fluxonkv_spec": {
             "cluster_name": "demo-kv-cluster",
-            "shared_memory_path": "/dev/shm/fluxon",
-            "shared_file_path": "/var/lib/fluxon/shared",
+            "share_mem_path": "/dev/shm/fluxon",
         },
     }
 )
@@ -574,10 +569,8 @@ instance_key: my-kv-client-1
 fluxonkv_spec:
   # 目标集群名；必须和 master / owner 保持一致
   cluster_name: demo-kv-cluster
-  # 本机共享内存 authority；external 靠它附着到同机 owner 的内存池
-  shared_memory_path: /dev/shm/fluxon
-  # 本机共享文件 authority；shared.json、日志、profile 等文件位于这里
-  shared_file_path: /var/lib/fluxon/shared
+  # 共享 bundle 根目录；运行时会在其下拼接 cluster_name
+  share_mem_path: /dev/shm/fluxon
   # 可选：覆盖当前 client 的 P2P 监听端口
   p2p_listen_port: 31001
 ```
@@ -601,20 +594,18 @@ fluxonkv_spec:
     - 127.0.0.1:2379
   # 目标集群名；必须和 master / external 保持一致
   cluster_name: demo-kv-cluster
-  # 本机共享内存 authority；external 进程会附着到这里
-  shared_memory_path: /dev/shm/fluxon
-  # 本机共享文件 authority；shared.json、日志、profile 等文件位于这里
-  shared_file_path: /var/lib/fluxon/shared
+  # 共享 bundle 根目录；运行时会在其下拼接 cluster_name
+  share_mem_path: /dev/shm/fluxon
   # owner 自己的 P2P 监听端口
   p2p_listen_port: 31000
   # owner 所属子集群标签
   sub_cluster: default
 ```
 
-这里需要把两个本机 authority 分清楚：
+这里需要把共享 bundle 和大文件根目录分清楚：
 
-- `shared_memory_path`：共享内存 / mmap authority，同机进程靠它附着到同一块内存池
-- `shared_file_path`：共享文件 authority，`shared.json`、日志、profile 等文件位于这里
+- `share_mem_path`：共享 bundle 根目录；运行时拼接 `cluster_name` 后，同时承载 `mmap.file`、`shared.json` 和 peer metadata
+- `large_file_paths`：owner 独占的大文件 authority，日志、profile、cache 等运行时资产都从这里派生
 - `FLUXON_LOG`：用户 Python 进程 console log 的门限，不写时默认 `INFO`
 
-zero-contribution external 模式下有一个硬约束：`fluxonkv_spec.etcd_addresses`、`fluxonkv_spec.sub_cluster`、`fluxonkv_spec.redis_compat` 这类 owner 侧字段不应出现。
+zero-contribution external 模式下有一个硬约束：`fluxonkv_spec.etcd_addresses`、`fluxonkv_spec.sub_cluster`、`fluxonkv_spec.large_file_paths`、`fluxonkv_spec.redis_compat` 这类 owner 侧字段不应出现。

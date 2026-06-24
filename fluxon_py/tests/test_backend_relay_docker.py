@@ -43,30 +43,34 @@ RELAY_DOCKER_HELPER_SOURCE = textwrap.dedent(
         mode = sys.argv[1]
         if mode == "wait-store":
             if len(sys.argv) != 5:
-                raise RuntimeError("wait-store requires: cluster_name shared_memory_path timeout_seconds")
+                raise RuntimeError("wait-store requires: cluster_name share_mem_path timeout_seconds")
             _wait_store(sys.argv[2], sys.argv[3], float(sys.argv[4]))
             print("wait-store ok")
             return
         if mode == "put":
             if len(sys.argv) != 6:
-                raise RuntimeError("put requires: cluster_name shared_memory_path key payload_base64")
+                raise RuntimeError("put requires: cluster_name share_mem_path key payload_base64")
             _put(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
             print("put ok")
             return
         if mode == "get":
             if len(sys.argv) != 7:
-                raise RuntimeError("get requires: cluster_name shared_memory_path key expected_base64 timeout_seconds")
+                raise RuntimeError("get requires: cluster_name share_mem_path key expected_base64 timeout_seconds")
             _get(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]))
             print("get ok")
             return
         raise RuntimeError(f"unknown mode: {mode}")
 
 
-    def _wait_store(cluster_name: str, shared_memory_path: str, timeout_seconds: float) -> None:
+    def _wait_store(
+        cluster_name: str,
+        share_mem_path: str,
+        timeout_seconds: float,
+    ) -> None:
         deadline = time.time() + timeout_seconds
         last_error = ""
         while time.time() < deadline:
-            result = new_store(_new_config(cluster_name, shared_memory_path))
+            result = new_store(_new_config(cluster_name, share_mem_path))
             if result.is_ok():
                 store = result.unwrap()
                 _close_store(store)
@@ -76,9 +80,14 @@ RELAY_DOCKER_HELPER_SOURCE = textwrap.dedent(
         raise RuntimeError(f"wait-store timed out: {last_error}")
 
 
-    def _put(cluster_name: str, shared_memory_path: str, key: str, payload_base64: str) -> None:
+    def _put(
+        cluster_name: str,
+        share_mem_path: str,
+        key: str,
+        payload_base64: str,
+    ) -> None:
         payload = base64.b64decode(payload_base64.encode("ascii"))
-        store = _open_store(cluster_name, shared_memory_path)
+        store = _open_store(cluster_name, share_mem_path)
         try:
             put_result = store.put(key, {"payload": payload})
             if not put_result.is_ok():
@@ -93,14 +102,14 @@ RELAY_DOCKER_HELPER_SOURCE = textwrap.dedent(
 
     def _get(
         cluster_name: str,
-        shared_memory_path: str,
+        share_mem_path: str,
         key: str,
         expected_base64: str,
         timeout_seconds: float,
     ) -> None:
         expected = base64.b64decode(expected_base64.encode("ascii"))
         deadline = time.time() + timeout_seconds
-        store = _open_store(cluster_name, shared_memory_path)
+        store = _open_store(cluster_name, share_mem_path)
         try:
             last_error = ""
             while time.time() < deadline:
@@ -125,21 +134,24 @@ RELAY_DOCKER_HELPER_SOURCE = textwrap.dedent(
             _close_store(store)
 
 
-    def _new_config(cluster_name: str, shared_memory_path: str) -> FluxonKvClientConfig:
+    def _new_config(
+        cluster_name: str,
+        share_mem_path: str,
+    ) -> FluxonKvClientConfig:
         return FluxonKvClientConfig(
             {
                 "instance_key": f"relay_helper_{os.getpid()}_{int(time.time() * 1000)}",
                 "contribute_to_cluster_pool_size": {"dram": 0, "vram": {}},
                 "fluxonkv_spec": {
                     "cluster_name": cluster_name,
-                    "shared_memory_path": shared_memory_path,
+                    "share_mem_path": share_mem_path,
                 },
             }
         )
 
 
-    def _open_store(cluster_name: str, shared_memory_path: str):
-        result = new_store(_new_config(cluster_name, shared_memory_path))
+    def _open_store(cluster_name: str, share_mem_path: str):
+        result = new_store(_new_config(cluster_name, share_mem_path))
         if not result.is_ok():
             raise RuntimeError(f"new_store failed: {result.unwrap_error()}")
         return result.unwrap()
@@ -289,7 +301,7 @@ def _relay_wait_for_store(
     container_name: str,
     helper_path: str,
     cluster_name: str,
-    shared_memory_path: str,
+    share_mem_path: str,
 ) -> None:
     _relay_run(
         [
@@ -300,7 +312,7 @@ def _relay_wait_for_store(
             helper_path,
             "wait-store",
             cluster_name,
-            shared_memory_path,
+            share_mem_path,
             str(RELAY_DOCKER_WAIT_TIMEOUT_SECONDS),
         ],
         timeout_seconds=RELAY_DOCKER_WAIT_TIMEOUT_SECONDS + 30,
@@ -423,6 +435,10 @@ def test_relay_docker_connectivity() -> int:
             owner_name: f"{container_runtime_root}/shm/{owner_name}"
             for owner_name in ("owner1", "owner2", "owner3", "owner4")
         }
+        owner_large_root_paths = {
+            owner_name: f"{container_runtime_root}/large/{owner_name}"
+            for owner_name in ("owner1", "owner2", "owner3", "owner4")
+        }
         _relay_render_template(
             deployconf_template_path,
             rendered_deployconf_path,
@@ -448,6 +464,10 @@ def test_relay_docker_connectivity() -> int:
                 "__OWNER2_SHM__": owner_shm_paths["owner2"],
                 "__OWNER3_SHM__": owner_shm_paths["owner3"],
                 "__OWNER4_SHM__": owner_shm_paths["owner4"],
+                "__OWNER1_LARGE_ROOT__": owner_large_root_paths["owner1"],
+                "__OWNER2_LARGE_ROOT__": owner_large_root_paths["owner2"],
+                "__OWNER3_LARGE_ROOT__": owner_large_root_paths["owner3"],
+                "__OWNER4_LARGE_ROOT__": owner_large_root_paths["owner4"],
             },
         )
 
@@ -487,13 +507,13 @@ def test_relay_docker_connectivity() -> int:
             container_name=container_names["owner1"],
             helper_path=helper_container_path,
             cluster_name=cluster_name,
-            shared_memory_path=owner_shm_paths["owner1"],
+            share_mem_path=owner_shm_paths["owner1"],
         )
         _relay_wait_for_store(
             container_name=container_names["owner4"],
             helper_path=helper_container_path,
             cluster_name=cluster_name,
-            shared_memory_path=owner_shm_paths["owner4"],
+            share_mem_path=owner_shm_paths["owner4"],
         )
 
         key = f"/relay_docker/{run_suffix}/payload"

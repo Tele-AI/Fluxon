@@ -94,11 +94,7 @@ def init_logger(name: str = "fluxon") -> Logger:
 def init_mq_file_logger(name: str = "fluxon_mq") -> Logger:
     """Initialize an MQ-specific logger with an optional file handler.
 
-    Path rule aligned with Rust:
-        shared_file_path/{cluster_name}_cluster_mq_logs/
-
-    shared_file_path and cluster_name are provided by fluxon_pyo3.KvClient.logs_dir(),
-    to avoid scattering files under the shared-memory root directory.
+    Path rule aligned with Rust: third_party_logs_dir() is derived from owner large_file_paths.
 
     If fluxon_pyo3 is unavailable, falls back to console-only logging.
     """
@@ -112,20 +108,22 @@ def init_mq_file_logger(name: str = "fluxon_mq") -> Logger:
     ch.setFormatter(CustomFormatter())
     logger.addHandler(ch)
 
-    # If fluxon_pyo3 is available, try using KvClient.logs_dir() as file log directory.
+    # Keep third-party file logs under one Fluxon-owned root so observability can discover them.
     log_dir = None
     try:
         from .tool import import_fluxon_pyo3_local
 
         fp = import_fluxon_pyo3_local()
         client = fp.KvClient()
-        log_dir = client.logs_dir()
+        third_party_log_dir = client.third_party_logs_dir().unwrap("third_party_logs_dir failed")
+        if isinstance(third_party_log_dir, str) and third_party_log_dir:
+            log_dir = os.path.join(third_party_log_dir, "mq")
     except ImportError as exc:
         logger.warning("init_mq_file_logger: fluxon_pyo3 not available; MQ file logs disabled: %s", exc)
         log_dir = None
     except Exception as exc:  # noqa: BLE001
         # Keep usable in cases like invalid config or client init failure; use console-only logging.
-        logger.warning("init_mq_file_logger: KvClient/logs_dir failed: %s", exc)
+        logger.warning("init_mq_file_logger: KvClient/third_party_logs_dir failed: %s", exc)
         log_dir = None
 
     if isinstance(log_dir, str) and log_dir:

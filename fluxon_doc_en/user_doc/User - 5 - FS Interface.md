@@ -287,8 +287,7 @@ Usually means the external client did not attach to the local owner. Check:
 
 - whether `start_kv_and_fs_svc.py` is still running
 - `CLUSTER_NAME`
-- `SHARED_MEMORY_PATH`
-- `SHARED_FILE_PATH`
+- `SHARE_MEM_PATH`
 
 ### `fluxon_fs cache config is not loaded yet`
 

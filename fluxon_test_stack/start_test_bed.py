@@ -7,6 +7,7 @@ import copy
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ DEPLOYMENT_UTILS_DIR = DEPLOYMENT_DIR / "utils"
 sys.path.insert(0, str(DEPLOYMENT_DIR))
 sys.path.insert(0, str(DEPLOYMENT_UTILS_DIR))
 import manual_dispatch_release
+from utils import log_shard
 from selection_runtime import (
     atomic_group_member_authority_name as _selection_atomic_group_member_authority_name,
     atomic_group_member_selection_workload_name as _selection_atomic_group_member_selection_workload_name,
@@ -434,11 +436,12 @@ def main() -> None:
             waves=coverage_bootstrap_waves,
             bootstrap_bare_services=bootstrap_bare_services,
         )
-    _wait_controller_ready_stable(
-        controller_url=controller_url,
-        timeout_seconds=controller_ready_timeout_seconds,
-        stability_window_seconds=bootstrap_stability_window_seconds,
-    )
+    if bootstrap_mode in (BOOTSTRAP_MODE_BARE_THEN_APPLY, BOOTSTRAP_MODE_BARE_ONLY):
+        _wait_controller_ready_stable(
+            controller_url=controller_url,
+            timeout_seconds=controller_ready_timeout_seconds,
+            stability_window_seconds=bootstrap_stability_window_seconds,
+        )
     test_runner_ui_summary = _ensure_test_runner_ui_started(ui_cfg=test_runner_ui_cfg)
     if bootstrap_mode == BOOTSTRAP_MODE_BARE_THEN_APPLY:
         post_bootstrap_agent_instance_keys = _selection_agent_instance_keys(
@@ -766,6 +769,9 @@ def _normalize_bootstrap_deployconf(
     if isinstance(master_cfg, dict):
         entrypoint = master_cfg.get("entrypoint")
         if isinstance(entrypoint, str):
+            master_port = _extract_master_listen_port(entrypoint=entrypoint)
+            if master_port is not None:
+                _set_service_port(master_cfg, port=master_port)
             normalized_entrypoint, removed = _strip_legacy_master_p2p_listen_port(entrypoint=entrypoint)
             if removed:
                 master_cfg["entrypoint"] = normalized_entrypoint
@@ -829,7 +835,6 @@ def _rewrite_same_host_local_multi_node_fixed_ports(
     master_cfg = _require_mapping(services.get("master"), "deployconf.service.master")
     ops_agent_cfg = _require_mapping(services.get("ops_agent"), "deployconf.service.ops_agent")
     ops_controller_cfg = _require_mapping(services.get("ops_controller"), "deployconf.service.ops_controller")
-
     global_envs["TIKV_PD_PEER_PORT"] = str(plan["tikv_pd_peer_port"])
     global_envs["TIKV_STATUS_FULL_ADDRESS"] = (
         "${${TIKV__NODE_ID}__IP}:" + str(plan["tikv_status_port"])
@@ -845,6 +850,7 @@ def _rewrite_same_host_local_multi_node_fixed_ports(
     _set_service_port(greptime_cfg, port=plan["greptime_port"])
     _set_service_port(tikv_pd_cfg, port=plan["tikv_pd_port"])
     _set_service_port(tikv_cfg, port=plan["tikv_port"])
+    _set_service_port(master_cfg, port=plan["master_port"])
 
     etcd_entrypoint = _require_str(etcd_cfg.get("entrypoint"), "deployconf.service.etcd.entrypoint")
     etcd_entrypoint = _replace_expected_substring(
@@ -972,6 +978,13 @@ def _set_service_port(service_cfg: dict[str, Any], *, port: int) -> None:
     service_cfg["port"] = int(port)
     if "in_container_port" in service_cfg:
         service_cfg["in_container_port"] = int(port)
+
+
+def _extract_master_listen_port(*, entrypoint: str) -> int | None:
+    match = re.search(r"(?m)^[ \t]*port:\s*(\d+)\s*$", entrypoint)
+    if match is None:
+        return None
+    return _require_port_number(match.group(1), "deployconf.service.master.entrypoint port")
 
 
 def _replace_expected_substring(*, value: str, old: str, new: str, ctx: str) -> str:
@@ -1400,7 +1413,7 @@ def _test_runner_ui_summary_from_cfg(
         "url": ui_cfg["url"],
         "probe_url": ui_cfg["probe_url"],
         "workdir": str(ui_cfg["workdir"]),
-        "log_path": str(ui_cfg["log_path"]),
+        "log_path": str(ui_cfg["active_log_path"]),
         "history_lookback_days": int(ui_cfg["history_lookback_days"]),
         "history_roots": [str(path) for path in ui_cfg["history_roots"]],
         "gitops_config_path": (
@@ -1461,7 +1474,8 @@ def _parse_test_runner_ui_config(
             _require_str(ui_cfg.get("gitops_config_path"), "test_runner_ui.gitops_config_path"),
             "test_runner_ui.gitops_config_path",
         )
-    log_path = (workdir / TEST_RUNNER_UI_LOG_FILENAME).resolve()
+    log_path = (workdir.resolve() / TEST_RUNNER_UI_LOG_FILENAME).resolve()
+    active_log_path = log_shard.daily_sharded_log_path(log_path)
     return {
         "enabled": True,
         "host": host,
@@ -1470,6 +1484,7 @@ def _parse_test_runner_ui_config(
         "probe_url": _test_runner_ui_probe_url(host=host, port=port),
         "workdir": workdir.resolve(),
         "log_path": log_path,
+        "active_log_path": active_log_path,
         "history_lookback_days": int(history_lookback_days),
         "history_roots": [path.resolve() for path in history_roots],
         "gitops_config_path": gitops_config_path.resolve() if gitops_config_path is not None else None,
@@ -1496,6 +1511,23 @@ def _bare_service_runtime_log_path(*, local_node_cfg: dict[str, Any], service_na
     if service_name == "tikv_pd":
         return root / "monitor" / "tikv" / "pd" / "pd.log"
     return root / "log" / f"{service_name}.log"
+
+
+def _resolve_bare_service_readable_runtime_log_path(
+    *,
+    local_node_cfg: dict[str, Any],
+    service_name: str,
+) -> Path | None:
+    runtime_log_path = _bare_service_runtime_log_path(
+        local_node_cfg=local_node_cfg,
+        service_name=service_name,
+    )
+    if runtime_log_path is None:
+        return None
+    resolved_log_path = log_shard.resolve_readable_log_path(runtime_log_path)
+    if resolved_log_path is not None:
+        return resolved_log_path
+    return runtime_log_path
 
 
 def _test_runner_ui_health_payload(*, probe_url: str, timeout_seconds: float) -> dict[str, Any] | None:
@@ -1590,7 +1622,7 @@ def _ensure_test_runner_ui_started(*, ui_cfg: dict[str, Any]) -> dict[str, Any]:
     if ui_cfg["gitops_config_path"] is not None:
         argv.extend(["--gitops-config", str(ui_cfg["gitops_config_path"])])
 
-    log_path = Path(ui_cfg["log_path"]).resolve()
+    log_path = Path(ui_cfg["active_log_path"]).resolve()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("a", encoding="utf-8")
     try:
@@ -3385,7 +3417,7 @@ def _collect_bare_runtime_statuses(
         raise ValueError("bare_launch_result.bootstrap_log_path must be a Path")
     statuses: list[dict[str, Any]] = []
     for service_name in expected_service_names:
-        runtime_log_path = _bare_service_runtime_log_path(
+        runtime_log_path = _resolve_bare_service_readable_runtime_log_path(
             local_node_cfg=local_node_cfg,
             service_name=service_name,
         )

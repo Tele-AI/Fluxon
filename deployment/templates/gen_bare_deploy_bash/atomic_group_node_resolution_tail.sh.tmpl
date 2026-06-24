@@ -1,0 +1,14 @@
+{{GROUP_NODES_BLOCK}}scheduled=false
+for n in "${GROUP_NODES[@]}"; do
+  if [ "$n" = "$NODE_ID" ]; then scheduled=true; fi
+done
+if [ "$scheduled" != true ]; then
+  echo "[atomic-group] skip group=$GROUP node=$NODE_ID allowed=${GROUP_NODES[*]}"
+  exit 0
+fi
+
+export NODE_ID="$NODE_ID"
+export HOST_IP="$HOST_IP"
+export HOSTWORKDIR="$HOSTWORKDIR"
+echo "[atomic-group] group=$GROUP node=$NODE_ID hostworkdir=$HOSTWORKDIR"
+

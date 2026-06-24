@@ -47,6 +47,8 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("to_yaml_str_roundtrip", _run_test_to_yaml_str_roundtrip),
         ("fluxonkv_sub_cluster_config", test_fluxonkv_sub_cluster_config),
         ("fluxonkv_owner_requires_sub_cluster", test_fluxonkv_owner_requires_sub_cluster),
+        ("fluxonkv_owner_requires_large_file_paths", test_fluxonkv_owner_requires_large_file_paths),
+        ("fluxonkv_external_forbids_large_file_paths", test_fluxonkv_external_forbids_large_file_paths),
         ("fluxonkv_p2p_relay_removed", test_fluxonkv_p2p_relay_removed),
         ("fluxon_client_config_yaml_shape", test_fluxon_client_config_yaml_shape),
         ("fluxonkv_protocol_field", test_fluxonkv_protocol_field),
@@ -142,21 +144,36 @@ def _import_fluxon_pyo3_tool_without_package_init():
 _PYO3_TOOL = _import_fluxon_pyo3_tool_without_package_init()
 
 
+def _owner_large_file_paths(tag: str) -> list[str]:
+    return [f"/tmp/kvcache_large/{tag}"]
+
+
+def _owner_fluxonkv_base_config(
+    *,
+    instance_key: str = "test_instance",
+    cluster_name: str = "test_cluster",
+    share_mem_path: str = "/tmp/kvcache_shared_memory/test",
+    sub_cluster: str = "rack-a",
+    tag: str = "test",
+) -> dict:
+    return {
+        "instance_key": instance_key,
+        "contribute_to_cluster_pool_size": {"dram": 16777216, "vram": {}},
+        "fluxonkv_spec": {
+            "etcd_addresses": ["localhost:2379"],
+            "cluster_name": cluster_name,
+            "share_mem_path": share_mem_path,
+            "sub_cluster": sub_cluster,
+            "large_file_paths": _owner_large_file_paths(tag),
+        },
+    }
+
+
 def test_fluxonkv_sub_cluster_config():
     """Test fluxonkv_spec.sub_cluster is accepted and exposed."""
     try:
         config = FluxonKvClientConfig(
-            {
-                "instance_key": "test_instance",
-                "contribute_to_cluster_pool_size": {"dram": 16777216, "vram": {}},
-                "fluxonkv_spec": {
-                    "etcd_addresses": ["localhost:2379"],
-                    "cluster_name": "test_cluster",
-                    "shared_memory_path": "/tmp/kvcache_shared_memory/test",
-                    "shared_file_path": "/tmp/kvcache_shared_files/test",
-                    "sub_cluster": "producer_side",
-                },
-            }
+            _owner_fluxonkv_base_config(sub_cluster="producer_side", tag="sub_cluster")
         )
         assert config.fluxonkv_spec_sub_cluster == "producer_side"
         print("✅ PASS: test_fluxonkv_sub_cluster_config")
@@ -225,16 +242,8 @@ def test_fluxon_pyo3_import_authority():
 def test_fluxonkv_owner_requires_sub_cluster():
     """Ensure owner mode requires a clean non-empty fluxonkv_spec.sub_cluster."""
     try:
-        base = {
-            "instance_key": "test_instance",
-            "contribute_to_cluster_pool_size": {"dram": 16777216, "vram": {}},
-            "fluxonkv_spec": {
-                "etcd_addresses": ["localhost:2379"],
-                "cluster_name": "test_cluster",
-                "shared_memory_path": "/tmp/kvcache_shared_memory/test",
-                "shared_file_path": "/tmp/kvcache_shared_files/test",
-            },
-        }
+        base = _owner_fluxonkv_base_config(tag="owner_requires_sub_cluster")
+        del base["fluxonkv_spec"]["sub_cluster"]
 
         try:
             FluxonKvClientConfig(copy.deepcopy(base))
@@ -270,20 +279,64 @@ def test_fluxonkv_owner_requires_sub_cluster():
         print(f"❌ FAIL: test_fluxonkv_owner_requires_sub_cluster - {e}")
 
 
+def test_fluxonkv_owner_requires_large_file_paths():
+    """Ensure owner mode requires explicit large_file_paths roots."""
+    try:
+        base = _owner_fluxonkv_base_config(tag="owner_requires_large_file_paths")
+        del base["fluxonkv_spec"]["large_file_paths"]
+
+        try:
+            FluxonKvClientConfig(copy.deepcopy(base))
+            print("❌ FAIL: test_fluxonkv_owner_requires_large_file_paths - missing large_file_paths should be rejected")
+            return
+        except ValueError:
+            pass
+
+        invalid_blank = copy.deepcopy(base)
+        invalid_blank["fluxonkv_spec"]["large_file_paths"] = ["   "]
+        try:
+            FluxonKvClientConfig(invalid_blank)
+            print("❌ FAIL: test_fluxonkv_owner_requires_large_file_paths - blank large_file_paths entry should be rejected")
+            return
+        except ValueError:
+            pass
+
+        valid = _owner_fluxonkv_base_config(tag="owner_requires_large_file_paths_valid")
+        rendered = FluxonKvClientConfig(valid).to_fluxon_kv_client_config_yaml_str()
+        assert "large_file_paths:" in rendered
+        assert "- /tmp/kvcache_large/owner_requires_large_file_paths_valid" in rendered
+        print("✅ PASS: test_fluxonkv_owner_requires_large_file_paths")
+    except Exception as e:
+        print(f"❌ FAIL: test_fluxonkv_owner_requires_large_file_paths - {e}")
+
+
+def test_fluxonkv_external_forbids_large_file_paths():
+    """Ensure zero-contribution external config cannot declare owner-only large_file_paths."""
+    try:
+        external = {
+            "instance_key": "test_external",
+            "contribute_to_cluster_pool_size": {"dram": 0, "vram": {}},
+            "fluxonkv_spec": {
+                "cluster_name": "test_cluster",
+                "share_mem_path": "/tmp/kvcache_shared_memory/test",
+                "large_file_paths": _owner_large_file_paths("external_forbidden"),
+            },
+        }
+        try:
+            FluxonKvClientConfig(external)
+            print("❌ FAIL: test_fluxonkv_external_forbids_large_file_paths - external large_file_paths should be rejected")
+            return
+        except ValueError:
+            pass
+        print("✅ PASS: test_fluxonkv_external_forbids_large_file_paths")
+    except Exception as e:
+        print(f"❌ FAIL: test_fluxonkv_external_forbids_large_file_paths - {e}")
+
+
 def test_fluxonkv_p2p_relay_removed():
     """Ensure removed fluxonkv_spec.p2p_relay is rejected as an unknown key."""
     try:
-        base = {
-            "instance_key": "test_instance",
-            "contribute_to_cluster_pool_size": {"dram": 16777216, "vram": {}},
-            "fluxonkv_spec": {
-                "etcd_addresses": ["localhost:2379"],
-                "cluster_name": "test_cluster",
-                "shared_memory_path": "/tmp/kvcache_shared_memory/test",
-                "shared_file_path": "/tmp/kvcache_shared_files/test",
-                "sub_cluster": "rack-a",
-            },
-        }
+        base = _owner_fluxonkv_base_config(tag="p2p_relay_removed")
 
         _ = FluxonKvClientConfig(copy.deepcopy(base))
 
@@ -304,23 +357,13 @@ def test_fluxonkv_p2p_relay_removed():
 def test_fluxon_client_config_yaml_shape():
     """Test YAML shape required by Rust ClientConfigYaml."""
     try:
-        base = {
-            "instance_key": "test_instance",
-            "contribute_to_cluster_pool_size": {"dram": 16777216, "vram": {}},
-            "fluxonkv_spec": {
-                "etcd_addresses": ["localhost:2379"],
-                "cluster_name": "test_cluster",
-                "shared_memory_path": "/tmp/kvcache_shared_memory/test",
-                "shared_file_path": "/tmp/kvcache_shared_files/test",
-                "sub_cluster": "rack-a",
-            },
-        }
+        base = _owner_fluxonkv_base_config(tag="yaml_shape")
         config = FluxonKvClientConfig(copy.deepcopy(base))
         yaml_text = config.to_fluxon_kv_client_config_yaml_str()
         loaded = yaml.safe_load(yaml_text)
-        assert loaded["fluxonkv_spec"]["shared_memory_path"] == base["fluxonkv_spec"]["shared_memory_path"]
+        assert loaded["fluxonkv_spec"]["share_mem_path"] == base["fluxonkv_spec"]["share_mem_path"]
         assert loaded["fluxonkv_spec"]["sub_cluster"] == base["fluxonkv_spec"]["sub_cluster"]
-        assert "shared_memory_path" not in loaded
+        assert "share_mem_path" not in loaded
         assert "rdma_device_names" not in loaded
         assert "transfer_engine" not in loaded["fluxonkv_spec"]
         print("✅ PASS: test_fluxon_client_config_yaml_shape")
@@ -338,8 +381,7 @@ def test_fluxonkv_protocol_field():
             },
             "fluxonkv_spec": {
                 "cluster_name": "test_cluster",
-                "shared_memory_path": "/tmp/kvcache_shared_memory/test_side_worker",
-                "shared_file_path": "/tmp/kvcache_shared_files/test_side_worker",
+                "share_mem_path": "/tmp/kvcache_shared_memory/test_side_worker",
             },
             "test_spec_config": {
                 "enable_side_transfer": True,
@@ -361,17 +403,7 @@ def test_fluxonkv_protocol_field():
 def test_fluxonkv_runtime_defaults_are_internal():
     """Ensure Fluxon KV runtime defaults stay internal and are not serialized into YAML."""
     try:
-        base = {
-            "instance_key": "test_instance",
-            "contribute_to_cluster_pool_size": {"dram": 16777216, "vram": {}},
-            "fluxonkv_spec": {
-                "etcd_addresses": ["localhost:2379"],
-                "cluster_name": "test_cluster",
-                "shared_memory_path": "/tmp/kvcache_shared_memory/test",
-                "shared_file_path": "/tmp/kvcache_shared_files/test",
-                "sub_cluster": "rack-a",
-            },
-        }
+        base = _owner_fluxonkv_base_config(tag="runtime_defaults")
         config = FluxonKvClientConfig(copy.deepcopy(base))
         assert config.fluxonkv_spec_transfer_engine == "closed"
         assert config.protocol_rdma_device_names is None
@@ -387,17 +419,7 @@ def test_fluxonkv_runtime_defaults_are_internal():
 def test_fluxonkv_removed_rdma_config_keys():
     """Ensure removed Fluxon KV RDMA config keys are rejected."""
     try:
-        base = {
-            "instance_key": "test_instance",
-            "contribute_to_cluster_pool_size": {"dram": 16777216, "vram": {}},
-            "fluxonkv_spec": {
-                "etcd_addresses": ["localhost:2379"],
-                "cluster_name": "test_cluster",
-                "shared_memory_path": "/tmp/kvcache_shared_memory/test",
-                "shared_file_path": "/tmp/kvcache_shared_files/test",
-                "sub_cluster": "rack-a",
-            },
-        }
+        base = _owner_fluxonkv_base_config(tag="removed_rdma_keys")
 
         invalid_rdma = copy.deepcopy(base)
         invalid_rdma["rdma_device_names"] = "mlx5_0:1"
@@ -425,21 +447,11 @@ def test_fluxonkv_removed_rdma_config_keys():
 def test_fluxonkv_test_spec_config():
     """Ensure test_spec_config is accepted, normalized, and serialized."""
     try:
-        base = {
-            "instance_key": "test_instance",
-            "contribute_to_cluster_pool_size": {"dram": 16777216, "vram": {}},
-            "fluxonkv_spec": {
-                "etcd_addresses": ["localhost:2379"],
-                "cluster_name": "test_cluster",
-                "shared_memory_path": "/tmp/kvcache_shared_memory/test",
-                "shared_file_path": "/tmp/kvcache_shared_files/test",
-                "sub_cluster": "rack-a",
-            },
-            "test_spec_config": {
-                "disable_observability": True,
-                "enable_iceoryx_logs": True,
-                "transport_mode": "transfer_only",
-            },
+        base = _owner_fluxonkv_base_config(tag="test_spec_config")
+        base["test_spec_config"] = {
+            "disable_observability": True,
+            "enable_iceoryx_logs": True,
+            "transport_mode": "transfer_only",
         }
 
         try:

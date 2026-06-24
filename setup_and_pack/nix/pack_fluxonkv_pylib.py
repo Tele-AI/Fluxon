@@ -43,6 +43,9 @@ from setup_and_pack.closed_sdk_contract import (
     CLOSED_SDK_CONSUMER_BOUNDARY_MODE,
     rewrite_fluxon_native_export_bundle,
 )
+from setup_and_pack.public_workspace_contract import (
+    collect_public_workspace_input_relative_paths,
+)
 from utils.sudo_prefix_utils import host_sudo_prefix
 import utils as script_utils
 ABI3_SMOKE_TEST_INTERPRETERS = (
@@ -142,11 +145,6 @@ SUPPORTED_WHEEL_FINALIZE_STEP_KINDS = frozenset(
     )
 )
 SUPPORTED_TARGET_CACHE_GENERATOR_KINDS = frozenset()
-REQUIRED_DEPLOYMENT_UTIL_FILES_FOR_PYO3_BUILD = (
-    "placeholder_utils.py",
-    "proc_lifecycle_codegen.py",
-    "selection_supervisor_codegen.py",
-)
 TEMP_WORKSPACE_MOUNT_DIRS: list[Path] = []
 
 
@@ -160,54 +158,6 @@ def _cleanup_temp_workspace_mount_dirs() -> None:
 
 
 atexit.register(_cleanup_temp_workspace_mount_dirs)
-REQUIRED_DEPLOYMENT_UTIL_RELATIVE_PATHS_FOR_PYO3_BUILD = tuple(
-    f"deployment/utils/{name}" for name in REQUIRED_DEPLOYMENT_UTIL_FILES_FOR_PYO3_BUILD
-)
-PYO3_WORKSPACE_HELPER_RELATIVE_PATHS = (
-    "fluxon_rs/rust-toolchain.toml",
-    "setup_and_pack/lib_tool.py",
-    "setup_and_pack/pyscript_util.py",
-    "setup_and_pack/closed_sdk_contract.py",
-    "setup_and_pack/public_workspace_contract.py",
-    "setup_and_pack/pub_prepare_build.py",
-    "setup_and_pack/pub_prepare_build.yaml",
-    "setup_and_pack/nix/pack_release_in_container.py",
-    "setup_and_pack/utils/wheel_runtime_helper.py",
-    "setup_and_pack/nix/lib_layout.py",
-)
-PYO3_INPUT_RELATIVE_PATHS_COMMON = (
-    "fluxon_rs/Cargo.toml",
-    "fluxon_rs/Cargo.lock",
-    "fluxon_rs/.cargo",
-    "fluxon_rs/rust-toolchain.toml",
-    "fluxon_rs/fluxon_commu_contract",
-    "fluxon_rs/fluxon_commu_closed_sdk_consumer",
-    "fluxon_rs/fluxon_pyo3",
-    "fluxon_rs/limit_thirdparty",
-    "fluxon_rs/fluxon_commu",
-    "fluxon_rs/fluxon_kv",
-    "fluxon_rs/fluxon_framework",
-    "fluxon_rs/fluxon_framework_compiled",
-    "fluxon_rs/fluxon_util",
-    "fluxon_rs/fluxon_mq",
-    "fluxon_rs/fluxon_cli",
-    "fluxon_rs/fluxon_ops",
-    "fluxon_rs/fluxon_proxy_proto",
-    "fluxon_rs/fluxon_proxy",
-    "fluxon_rs/fluxon_fs",
-    "fluxon_rs/fluxon_fs_core",
-    "fluxon_rs/fluxon_fs_s3_gateway",
-    "fluxon_rs/fluxon_observability",
-    "fluxon_rs/moka",
-    "fluxon_py",
-    "fluxon_release/closed_sdk",
-    "setup_and_pack/nix/lib_layout.py",
-    "setup_and_pack/closed_sdk_contract.py",
-    "setup_and_pack/public_workspace_contract.py",
-    "setup_and_pack/lib_tool.py",
-    "setup_and_pack/pyscript_util.py",
-    *REQUIRED_DEPLOYMENT_UTIL_RELATIVE_PATHS_FOR_PYO3_BUILD,
-)
 PYO3_INPUT_RELATIVE_PATHS_BY_TRANSPORT_BACKEND = {
     "fastws": (),
     "tquic": (),
@@ -218,15 +168,6 @@ PYO3_INPUT_RELATIVE_PATHS_BY_TRANSPORT_BACKEND = {
 PYO3_INPUT_RELATIVE_PATHS_BY_RDMA_BACKEND = {
     "closed_sdk": ("fluxon_release/closed_sdk",),
 }
-PYO3_WORKSPACE_COPY_RELATIVE_PATHS_PUBLIC_NATIVE = ()
-PYO3_WORKSPACE_COPY_RELATIVE_PATHS_COMMON = tuple(
-    relative_path
-    for relative_path in (
-        *PYO3_INPUT_RELATIVE_PATHS_COMMON,
-        *PYO3_WORKSPACE_COPY_RELATIVE_PATHS_PUBLIC_NATIVE,
-        *PYO3_WORKSPACE_HELPER_RELATIVE_PATHS,
-    )
-)
 TRANSPORT_BACKEND_FEATURES = {
     "fastws": ["fastws_transport"],
     "tquic": ["tquic_transport"],
@@ -257,90 +198,6 @@ MANYLINUX_CXX_RUNTIME_LIBRARY_NAMES = (
     "libstdc++.so.6",
     "libgomp.so.1",
 )
-IGNORED_FILE_SUFFIXES = (
-    ".gitignore",
-    ".pkl",
-    ".pyc",
-    ".md",
-    ".rst",
-    ".html",
-    ".htm",
-    ".xml",
-    ".css",
-    ".js",
-    ".map",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".bmp",
-    ".svg",
-    ".ico",
-    ".pdf",
-    ".ppt",
-    ".pptx",
-    ".doc",
-    ".docx",
-    ".pem",
-    ".crt",
-    ".crl",
-    ".key",
-    ".csr",
-    ".p12",
-    ".der",
-    ".serial",
-    ".old",
-    ".orig",
-    ".rej",
-    ".tar",
-    ".tar.gz",
-    ".tgz",
-    ".tar.xz",
-    ".txz",
-    ".tar.bz2",
-    ".tbz2",
-    ".zip",
-    ".7z",
-    ".xz",
-    ".bz2",
-    ".gz",
-)
-IGNORED_DIR_NAMES = {
-    ".git",
-    "__pycache__",
-    "target",
-    "wheels",
-    "docs",
-    "doc",
-    "doxygen",
-    "examples",
-    "example",
-    "tests",
-    "test",
-    "testdata",
-    "bench",
-    "benches",
-    "benchmark",
-    "benchmarks",
-    "fuzz",
-    "fuzzers",
-    "packagecache",
-    "wycheproof_testvectors",
-    "tfprof",
-}
-IGNORED_FILE_NAMES = (
-    PYO3_CHECKSUM_FILE_NAME,
-    "configure~",
-)
-
-
-def _pyo3_input_relative_paths(transport_backend: str, rdma_backend: str) -> tuple[str, ...]:
-    return (
-        PYO3_INPUT_RELATIVE_PATHS_COMMON
-        + PYO3_INPUT_RELATIVE_PATHS_BY_TRANSPORT_BACKEND[transport_backend]
-        + PYO3_INPUT_RELATIVE_PATHS_BY_RDMA_BACKEND[rdma_backend]
-    )
-
 
 def _dedupe_relative_paths(relative_paths: tuple[str, ...]) -> tuple[str, ...]:
     ordered_relative_paths: list[str] = []
@@ -354,11 +211,13 @@ def _dedupe_relative_paths(relative_paths: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def pyo3_workspace_copy_relative_paths(transport_backend: str, rdma_backend: str) -> tuple[str, ...]:
-    return _dedupe_relative_paths(
-        PYO3_WORKSPACE_COPY_RELATIVE_PATHS_COMMON
-        + PYO3_INPUT_RELATIVE_PATHS_BY_TRANSPORT_BACKEND[transport_backend]
-        + PYO3_INPUT_RELATIVE_PATHS_BY_RDMA_BACKEND[rdma_backend]
-    )
+    del transport_backend
+    del rdma_backend
+    return collect_public_workspace_input_relative_paths(repo_root=REPO_ROOT)
+
+
+def _pyo3_input_relative_paths(transport_backend: str, rdma_backend: str) -> tuple[str, ...]:
+    return pyo3_workspace_copy_relative_paths(transport_backend, rdma_backend)
 
 
 def _wheel_variant_key(transport_backend: str, rdma_backend: str) -> str:
@@ -435,9 +294,9 @@ def _compute_inputs_digest(repo_root: Path, relative_paths: tuple[str, ...]) -> 
         relative_to=repo_root,
         mode=script_utils.PathDigestMode.CONTENTS_ONLY,
         algorithm=script_utils.PathHashAlgorithm.MD5,
-        ignored_dir_names=IGNORED_DIR_NAMES,
-        ignored_file_names=IGNORED_FILE_NAMES,
-        ignored_file_suffixes=IGNORED_FILE_SUFFIXES,
+        ignored_dir_names=(),
+        ignored_file_names=(),
+        ignored_file_suffixes=(),
     )
 
 
@@ -592,33 +451,6 @@ class PyO3PackState:
             self.repo_root,
             _pyo3_input_relative_paths(self.transport_backend, self.rdma_backend),
         ) + f"|transport_backend={self.transport_backend}|rdma_backend={self.rdma_backend}"
-
-    def _legacy_checksum_map(self) -> dict[str, str]:
-        file_hash: dict[str, str] = {}
-        for current_root, dirnames, filenames in os.walk(self.rs_root, topdown=True):
-            current_root_path = Path(current_root)
-            root_rel = current_root_path.relative_to(self.rs_root).as_posix()
-            root_text = current_root_path.as_posix()
-            if root_rel == "target" or root_rel.startswith("target/"):
-                dirnames[:] = []
-                continue
-            if root_rel == "wheels" or root_rel.startswith("wheels/"):
-                dirnames[:] = []
-                continue
-            if "/.git/" in root_text or root_text.endswith("/.git"):
-                dirnames[:] = []
-                continue
-            dirnames[:] = sorted(dir_name for dir_name in dirnames if dir_name != ".git")
-            for file_name in sorted(filenames):
-                if file_name in IGNORED_FILE_NAMES or file_name.endswith(IGNORED_FILE_SUFFIXES):
-                    continue
-                file_path = current_root_path / file_name
-                hash_md5 = hashlib.md5()
-                with open(file_path, "rb") as f:
-                    for chunk in iter(lambda: f.read(4096), b""):
-                        hash_md5.update(chunk)
-                file_hash[file_path.relative_to(self.rs_root).as_posix()] = hash_md5.hexdigest()
-        return file_hash
 
     def find_cached_wheel(self) -> Path | None:
         if not self.target_wheels_dir.exists():
@@ -2976,12 +2808,15 @@ def _build_published_profile_manifest(
     selected_backend_plan: dict,
     native_build_authority: dict | None,
 ) -> dict:
-    workspace_seed_digest = _compute_inputs_digest(
-        workspace_seed_dir,
-        _public_workspace_seed_relative_paths(
-            transport_backend,
-            rdma_backend=selected_backend_plan["rdma_backend"],
-        ),
+    del transport_backend
+    workspace_seed_digest = script_utils.compute_paths_digest(
+        [workspace_seed_dir],
+        relative_to=workspace_seed_dir,
+        mode=script_utils.PathDigestMode.CONTENTS_ONLY,
+        algorithm=script_utils.PathHashAlgorithm.MD5,
+        ignored_dir_names=(),
+        ignored_file_names=(),
+        ignored_file_suffixes=(),
     )
     manifest = {
         "object_kind": "FluxonManylinuxPublishedProfile",
@@ -3137,18 +2972,19 @@ def _copy_workspace_seed_subset(
     transport_backend: str,
     rdma_backend: str,
 ) -> None:
+    del transport_backend
+    del rdma_backend
     target_workspace_seed_dir.mkdir(parents=True, exist_ok=True)
     target_workspace_seed_dir.chmod(0o777)
-    for relative_path in _public_workspace_seed_relative_paths(
-        transport_backend,
-        rdma_backend=rdma_backend,
-    ):
-        source_path = source_workspace_seed_dir / relative_path
-        if not source_path.exists():
-            raise RuntimeError(
-                f"workspace seed path is missing required publish input: {source_path}"
-            )
+    for source_path in sorted(source_workspace_seed_dir.rglob("*")):
+        if source_path == source_workspace_seed_dir:
+            continue
+        relative_path = source_path.relative_to(source_workspace_seed_dir)
         target_path = target_workspace_seed_dir / relative_path
+        if source_path.is_dir() and not source_path.is_symlink():
+            target_path.mkdir(parents=True, exist_ok=True)
+            target_path.chmod(0o777)
+            continue
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.parent.chmod(0o777)
         _sudo_copy_path(source_path=source_path, target_path=target_path)
@@ -3248,10 +3084,6 @@ def _run_with_tee_log(*, argv: list[str], log_path: Path) -> None:
 
     if return_code != 0:
         raise RuntimeError(f"docker run failed with exit code {return_code}, log={log_path}")
-def _public_workspace_seed_relative_paths(transport_backend: str, *, rdma_backend: str) -> tuple[str, ...]:
-    return pyo3_workspace_copy_relative_paths(transport_backend, rdma_backend)
-
-
 def _require_workspace_seed_fluxon_commu_source_dir(*, workspace_seed_dir: Path, field_name: str) -> Path:
     source_dir = workspace_seed_dir / FLUXON_COMMU_AUTHORITY_RELATIVE_PATH
     cargo_toml_path = source_dir / "Cargo.toml"

@@ -821,6 +821,23 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             out.append(addr)
         return out
 
+    def third_party_logs_dir(self) -> Result[str, ApiError]:
+        if self._client is None:
+            return Result.new_error(GeneralError(message="Store not initialized"))
+        try:
+            res = self._client.third_party_logs_dir()
+            if not res.is_ok():
+                return Result.new_error(res.unwrap_error())
+            logs_dir = res.unwrap()
+            if not isinstance(logs_dir, str) or not logs_dir:
+                return Result.new_error(
+                    GeneralError(message=f"third_party_logs_dir must be non-empty str; got {logs_dir!r}")
+                )
+            return Result.new_ok(logs_dir)
+        except ApiError as e:
+            return Result.new_error(e)
+        except Exception as e:
+            return Result.new_error(GeneralError(message=f"third_party_logs_dir failed: {e}"))
 
     def ensure_zero_contribution_for_channel(self) -> None:
         self._config.ensure_zero_contribution_for_channel()

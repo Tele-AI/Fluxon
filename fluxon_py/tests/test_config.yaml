@@ -1,5 +1,4 @@
 kv_svc_type: fluxon
 etcd_address: 127.0.0.1:2379
 cluster_name: fluxon-example-cluster
-shared_memory_path: /tmp/fluxon-example-cluster/shm
-shared_file_path: /tmp/fluxon-example-cluster/share
+share_mem_path: /tmp/fluxon-example-cluster/shm

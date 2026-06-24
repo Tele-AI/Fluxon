@@ -85,8 +85,9 @@ service:
           etcd_addresses:
             - "__ETCD_CONTAINER_NAME__:2379"
           cluster_name: "__CLUSTER_NAME__"
-          shared_memory_path: "__OWNER1_SHM__"
+          share_mem_path: "__OWNER1_SHM__"
           sub_cluster: "owner1"
+          large_file_paths: ["__OWNER1_LARGE_ROOT__"]
           p2p_listen_port: 31011
       YAML
       exec python3 -m fluxon_py.runtime.start_owner_kvclient -c all_config.yaml -w "__RUNTIME_ROOT__/work/owner1"
@@ -114,8 +115,9 @@ service:
           etcd_addresses:
             - "__ETCD_CONTAINER_NAME__:2379"
           cluster_name: "__CLUSTER_NAME__"
-          shared_memory_path: "__OWNER2_SHM__"
+          share_mem_path: "__OWNER2_SHM__"
           sub_cluster: "owner2"
+          large_file_paths: ["__OWNER2_LARGE_ROOT__"]
           p2p_listen_port: 31012
       YAML
       exec python3 -m fluxon_py.runtime.start_owner_kvclient -c all_config.yaml -w "__RUNTIME_ROOT__/work/owner2"
@@ -143,8 +145,9 @@ service:
           etcd_addresses:
             - "__ETCD_CONTAINER_NAME__:2379"
           cluster_name: "__CLUSTER_NAME__"
-          shared_memory_path: "__OWNER3_SHM__"
+          share_mem_path: "__OWNER3_SHM__"
           sub_cluster: "owner3"
+          large_file_paths: ["__OWNER3_LARGE_ROOT__"]
           p2p_listen_port: 31013
       YAML
       exec python3 -m fluxon_py.runtime.start_owner_kvclient -c all_config.yaml -w "__RUNTIME_ROOT__/work/owner3"
@@ -172,8 +175,9 @@ service:
           etcd_addresses:
             - "__ETCD_CONTAINER_NAME__:2379"
           cluster_name: "__CLUSTER_NAME__"
-          shared_memory_path: "__OWNER4_SHM__"
+          share_mem_path: "__OWNER4_SHM__"
           sub_cluster: "owner4"
+          large_file_paths: ["__OWNER4_LARGE_ROOT__"]
           p2p_listen_port: 31014
       YAML
       exec python3 -m fluxon_py.runtime.start_owner_kvclient -c all_config.yaml -w "__RUNTIME_ROOT__/work/owner4"

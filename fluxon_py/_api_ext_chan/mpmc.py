@@ -243,12 +243,12 @@ def stable_delete_ready_keys_for_member(
 
 def _local_member_id_cache_path(kv_api: KvClient, mpmc_id: str, role: ChanRole) -> str:
     cfg = kv_api.config()
-    shared_memory_path = cfg.fluxonkv_spec_shared_memory_path
-    if not isinstance(shared_memory_path, str) or not shared_memory_path.strip():
-        raise ValueError("fluxonkv_spec.shared_memory_path must be a non-empty string for local member-id cache")
+    share_mem_path = cfg.fluxonkv_spec_share_mem_path
+    if not isinstance(share_mem_path, str) or not share_mem_path.strip():
+        raise ValueError("fluxonkv_spec.share_mem_path must be a non-empty string for local member-id cache")
     cluster_name = kv_api.get_cluster_name()
     role_name = role.value
-    cache_dir = os.path.join(shared_memory_path, cluster_name, "mq_member_id_cache")
+    cache_dir = os.path.join(share_mem_path, cluster_name, "mq_member_id_cache")
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, f"mpmc_{mpmc_id}_{role_name}.json")
 

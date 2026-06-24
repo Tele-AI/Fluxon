@@ -37,6 +37,11 @@ import urllib.request
 
 import yaml
 
+RUNNER_REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNNER_DEPLOYMENT_DIR = RUNNER_REPO_ROOT / "deployment"
+RUNNER_TEMPLATE_DIR = (RUNNER_REPO_ROOT / "fluxon_test_stack" / "test_runner_templates").resolve()
+sys.path.insert(0, str(RUNNER_DEPLOYMENT_DIR))
+
 from benchmark_role_names import (
     KV_NODE_ROLE_SEED,
     KV_NODE_ROLE_WORKER,
@@ -51,6 +56,7 @@ from top_attention_index_helper import (
     run_top_attention_entries,
     select_top_attention_entries,
 )
+from utils import log_shard
 from test_runner_ci_runtime import (
     _assert_ci_runtime_python_abi as _assert_ci_runtime_python_abi_impl,
     _ci_runtime_python_abi as _ci_runtime_python_abi_impl,
@@ -329,10 +335,10 @@ _DELETE_APPLY_RETRYABLE_ERRS = (
     "workloads may still be stopping",
 )
 _WAIT_DELETE_APPLY_REQUIRES_DELETE_ERR = "wait_delete_apply requires delete_apply first"
-RUNNER_REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNNER_SHARED_RUNTIME_DIR = (RUNNER_REPO_ROOT / "fluxon_test_stack" / "test_runner").resolve()
 RUNNER_SHARED_LOCK_DIR = (RUNNER_SHARED_RUNTIME_DIR / "locks").resolve()
 RUNNER_STDIO_LOG_FILENAME = "test_runner.log"
+_SERVICE_LOG_RETENTION_DAYS = log_shard.DEFAULT_DAILY_LOG_RETENTION_DAYS
 _ACTIVE_TEST_BED_SELECTION_SUPERVISOR_CHECK_CACHE_KEY: Optional[str] = None
 
 # TEST_STACK coordinator uses a stable workload name across cases; if a previous run crashed
@@ -404,6 +410,18 @@ def _runner_native_ci_scene_ids() -> Tuple[str, ...]:
         "ci_top_attention_cargo_fs_core",
         "ci_top_attention_cargo_util",
         "ci_top_attention_cargo_kv_unit",
+        "ci_top_attention_cargo_cli",
+        "ci_top_attention_cargo_commu",
+        "ci_top_attention_cargo_commu_contract",
+        "ci_top_attention_cargo_framework",
+        "ci_top_attention_cargo_fs",
+        "ci_top_attention_cargo_fs_s3_gateway",
+        "ci_top_attention_cargo_limit_thirdparty",
+        "ci_top_attention_cargo_mq",
+        "ci_top_attention_cargo_observability",
+        "ci_top_attention_cargo_ops",
+        "ci_top_attention_cargo_pyo3",
+        "ci_top_attention_log_mgmt",
         "ci_top_attention_mq_core",
     )
 
@@ -458,6 +476,7 @@ _LOADED_PY_MODULES: Dict[str, Any] = {}
 _RUNNER_STDIO_LOG_FP: Optional[Any] = None
 _RUNNER_STDIO_KEEPALIVE_FDS: Optional[Tuple[int, int]] = None
 _RUNNER_STDIO_MIRROR_THREAD: Optional[threading.Thread] = None
+_RUNNER_STDIO_ROUTER_THREAD: Optional[threading.Thread] = None
 _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS = 15.0
 _CI_WAIT_TAIL_MAX_CHARS = 8000
 _TEST_RUNNER_UI_MAX_LOG_CHUNK_BYTES = 1024 * 1024
@@ -482,6 +501,49 @@ def _ci_log_prefix_lines(text: str, *, now: Optional[float] = None) -> str:
     return _ci_log_prefix_lines_impl(text, now=now)
 
 
+def _service_log_base_path(workdir_root: Path, *, filename: str) -> Path:
+    return (workdir_root / filename).resolve()
+
+
+def _service_log_daily_path(base_path: Path, *, now: Optional[datetime.datetime] = None) -> Path:
+    return log_shard.daily_sharded_log_path(base_path, now=now)
+
+
+def _service_log_latest_path(base_path: Path) -> Optional[Path]:
+    return log_shard.latest_existing_daily_sharded_log_path(base_path)
+
+
+def _service_log_resolve_read_path(workdir_root: Path, *, filename: str) -> Optional[Path]:
+    base_path = _service_log_base_path(workdir_root, filename=filename)
+    return _service_log_resolve_read_path_from_base(base_path)
+
+
+def _service_log_resolve_read_path_from_base(base_path: Path) -> Optional[Path]:
+    return log_shard.resolve_readable_log_path(base_path)
+
+
+def _cleanup_old_service_logs(base_path: Path, *, retention_days: int = _SERVICE_LOG_RETENTION_DAYS) -> None:
+    log_shard.cleanup_old_daily_sharded_logs(base_path, retention_days=retention_days)
+
+
+def _start_runner_stdio_log_router(*, base_log_path: Path, read_fd: int) -> None:
+    def _router_loop() -> None:
+        log_shard.relay_fd_to_daily_sharded_logs(
+            base_log_path=str(base_log_path),
+            read_fd=read_fd,
+            retention_days=_SERVICE_LOG_RETENTION_DAYS,
+        )
+
+    router = threading.Thread(
+        target=_router_loop,
+        name="test-runner-stdio-log-router",
+        daemon=True,
+    )
+    router.start()
+    global _RUNNER_STDIO_ROUTER_THREAD
+    _RUNNER_STDIO_ROUTER_THREAD = router
+
+
 def _start_runner_stdio_log_mirror(*, log_path: Path, stdout_fd: int) -> None:
     global _RUNNER_STDIO_MIRROR_THREAD
     _RUNNER_STDIO_MIRROR_THREAD = _start_runner_stdio_log_mirror_impl(
@@ -490,7 +552,11 @@ def _start_runner_stdio_log_mirror(*, log_path: Path, stdout_fd: int) -> None:
     )
 
 
-def _redirect_process_stdio_to_log(workdir_root: Path) -> None:
+def _redirect_process_stdio_to_log(
+    workdir_root: Path,
+    *,
+    filename: str = RUNNER_STDIO_LOG_FILENAME,
+) -> None:
     """Route runner stdio to a stable workdir log so long suites survive PTY loss.
 
     English note:
@@ -504,7 +570,7 @@ def _redirect_process_stdio_to_log(workdir_root: Path) -> None:
     global _RUNNER_STDIO_KEEPALIVE_FDS
     _RUNNER_STDIO_LOG_FP, _RUNNER_STDIO_KEEPALIVE_FDS = _redirect_process_stdio_to_log_impl(
         workdir_root=workdir_root,
-        runner_stdio_log_filename=RUNNER_STDIO_LOG_FILENAME,
+        runner_stdio_log_filename=filename,
         stdio_log_fp=_RUNNER_STDIO_LOG_FP,
         stdio_keepalive_fds=_RUNNER_STDIO_KEEPALIVE_FDS,
         start_mirror=_start_runner_stdio_log_mirror,
@@ -1280,25 +1346,15 @@ def _load_source_stack_contract() -> Dict[str, Any]:
         global_envs.get("FLUXON_CLUSTER_NAME"),
         "bootstrap source deployconf.global_envs.FLUXON_CLUSTER_NAME",
     )
-    shared_memory_hostworkdir = _require_str(
+    share_mem_hostworkdir = _require_str(
         global_envs.get("FLUXON_SHARED_MEM"),
         "bootstrap source deployconf.global_envs.FLUXON_SHARED_MEM",
     )
-    shared_file_hostworkdir = _require_str(
-        global_envs.get("FLUXON_SHARED_MEM2"),
-        "bootstrap source deployconf.global_envs.FLUXON_SHARED_MEM2",
-    )
     _resolve_stack_contract_path(
         contract_hostworkdir,
-        shared_memory_hostworkdir,
+        share_mem_hostworkdir,
         field_name="bootstrap source deployconf.global_envs.FLUXON_SHARED_MEM",
         allow_absolute=True,
-    )
-    _resolve_stack_contract_path(
-        contract_hostworkdir,
-        shared_file_hostworkdir,
-        field_name="bootstrap source deployconf.global_envs.FLUXON_SHARED_MEM2",
-        allow_absolute=False,
     )
 
     source_bootstrap_cfg_path = _load_test_bed_bootstrap_config_path()
@@ -1334,8 +1390,7 @@ def _load_source_stack_contract() -> Dict[str, Any]:
         # - /r/fs_s3/* proxy for downloading release artifacts
         "ops_controller_url": controller_url,
         "controller_basic_auth": controller_basic_auth,
-        "shared_memory_hostworkdir": shared_memory_hostworkdir,
-        "shared_file_hostworkdir": shared_file_hostworkdir,
+        "share_mem_hostworkdir": share_mem_hostworkdir,
     }
 
 
@@ -1344,8 +1399,7 @@ def _write_ci_runtime_test_config(
     src_root: Path,
     etcd_address: str,
     cluster_name: str,
-    shared_memory_path: str,
-    shared_file_path: str,
+    share_mem_path: str,
 ) -> Path:
     """Materialize the single CI test authority consumed by fluxon_py integration tests.
 
@@ -1364,8 +1418,7 @@ def _write_ci_runtime_test_config(
             "kv_svc_type": "fluxon",
             "etcd_address": str(etcd_address),
             "cluster_name": str(cluster_name),
-            "shared_memory_path": str(shared_memory_path),
-            "shared_file_path": str(shared_file_path),
+            "share_mem_path": str(share_mem_path),
         },
     )
     return test_cfg_path
@@ -1995,21 +2048,16 @@ def _cluster_scoped_shared_dir(*, root_path: str, cluster_name: str) -> Path:
 
 def _shared_bundle_paths_for_cluster(
     *,
-    shared_memory_root: str,
-    shared_file_root: str,
+    share_mem_root: str,
     cluster_name: str,
 ) -> List[Path]:
-    shared_memory_dir = _cluster_scoped_shared_dir(
-        root_path=shared_memory_root,
-        cluster_name=cluster_name,
-    )
-    shared_file_dir = _cluster_scoped_shared_dir(
-        root_path=shared_file_root,
+    share_mem_dir = _cluster_scoped_shared_dir(
+        root_path=share_mem_root,
         cluster_name=cluster_name,
     )
     return [
-        shared_file_dir / "shared.json",
-        shared_memory_dir / "mmap.file",
+        share_mem_dir / "shared.json",
+        share_mem_dir / "mmap.file",
     ]
 
 
@@ -2023,35 +2071,28 @@ def _owner_target_slug(*, owner_target: str, ctx: str) -> str:
 
 def _owner_bundle_roots_for_target(
     *,
-    shared_memory_root: str,
-    shared_file_root: str,
+    share_mem_root: str,
     owner_target: str,
     ctx: str,
-) -> Tuple[str, str]:
+) -> str:
     owner_slug = _owner_target_slug(owner_target=owner_target, ctx=ctx)
-    return (
-        str((Path(shared_memory_root) / owner_slug).resolve()),
-        str((Path(shared_file_root) / owner_slug).resolve()),
-    )
+    return str((Path(share_mem_root) / owner_slug).resolve())
 
 
 def _owner_bundle_paths_for_target(
     *,
-    shared_memory_root: str,
-    shared_file_root: str,
+    share_mem_root: str,
     cluster_name: str,
     owner_target: str,
     ctx: str,
 ) -> List[Path]:
-    owner_shared_memory_root, owner_shared_file_root = _owner_bundle_roots_for_target(
-        shared_memory_root=shared_memory_root,
-        shared_file_root=shared_file_root,
+    owner_share_mem_root = _owner_bundle_roots_for_target(
+        share_mem_root=share_mem_root,
         owner_target=owner_target,
         ctx=ctx,
     )
     return _shared_bundle_paths_for_cluster(
-        shared_memory_root=owner_shared_memory_root,
-        shared_file_root=owner_shared_file_root,
+        share_mem_root=owner_share_mem_root,
         cluster_name=cluster_name,
     )
 
@@ -2167,7 +2208,7 @@ def _require_explicit_owner_group_processes_for_multi_owner_same_machine(
     raise ValueError(
         f"{ctx}.benchmark.owner_group_processes is required when external Fluxon KV owners share a machine: "
         f"machines={multi_owner_machines}. Without an explicit group size, benchmark nodes and owners "
-        "silently reuse the same shared_memory_path/shared_file_path roots, which invalidates owner binding."
+        "silently reuse the same share_mem_path roots, which invalidates owner binding."
     )
 
 
@@ -2180,13 +2221,9 @@ def _load_stack_identity(*, workdir_root: Path) -> Dict[str, Any]:
         contract.get("controller_basic_auth"),
         field_name="bootstrap_contract.controller_basic_auth",
     )
-    shared_mem_hostworkdir = _require_str(
-        contract.get("shared_memory_hostworkdir"),
-        "bootstrap_contract.shared_memory_hostworkdir",
-    )
-    shared_file_hostworkdir = _require_str(
-        contract.get("shared_file_hostworkdir"),
-        "bootstrap_contract.shared_file_hostworkdir",
+    share_mem_hostworkdir = _require_str(
+        contract.get("share_mem_hostworkdir"),
+        "bootstrap_contract.share_mem_hostworkdir",
     )
     cluster_name = _suite_cluster_name_for_workdir(workdir_root)
     if cluster_name == ops_cluster_name:
@@ -2201,17 +2238,11 @@ def _load_stack_identity(*, workdir_root: Path) -> Dict[str, Any]:
         "cluster_name": cluster_name,
         "controller_url": ops_controller_url,
         "controller_basic_auth": controller_basic_auth,
-        "shared_memory_path": _resolve_stack_contract_path(
+        "share_mem_path": _resolve_stack_contract_path(
             hostworkdir,
-            shared_mem_hostworkdir,
-            field_name="bootstrap_contract.shared_memory_hostworkdir",
+            share_mem_hostworkdir,
+            field_name="bootstrap_contract.share_mem_hostworkdir",
             allow_absolute=True,
-        ),
-        "shared_file_path": _resolve_stack_contract_path(
-            hostworkdir,
-            shared_file_hostworkdir,
-            field_name="bootstrap_contract.shared_file_hostworkdir",
-            allow_absolute=False,
         ),
     }
 
@@ -2242,13 +2273,9 @@ def _build_runtime_token_mapping(
             stack_identity.get("controller_url"),
             "stack_identity.controller_url",
         ),
-        "__STACK_SHARED_MEMORY_PATH__": _require_str(
-            stack_identity.get("shared_memory_path"),
-            "stack_identity.shared_memory_path",
-        ),
-        "__STACK_SHARED_FILE_PATH__": _require_str(
-            stack_identity.get("shared_file_path"),
-            "stack_identity.shared_file_path",
+        "__STACK_SHARE_MEM_PATH__": _require_str(
+            stack_identity.get("share_mem_path"),
+            "stack_identity.share_mem_path",
         ),
     }
     if extra_tokens is not None:
@@ -2794,105 +2821,17 @@ def _write_deployer_manifests(resolved_case: Dict[str, Any], run_dir: Path, *, a
             orig_argv = [cmd0] + args
             exec_cmd = " ".join(_shell_quote(x) for x in orig_argv)
 
-            # Generate a self-contained SigV4 GET downloader (Fluxon FS S3 gateway) and then exec the original argv.
-            bash_script = (
-                "set -euo pipefail\n"
-                "python3 - <<'PY'\n"
-                "import datetime\n"
-                "import hashlib\n"
-                "import hmac\n"
-                "import os\n"
-                "import urllib.parse\n"
-                "import urllib.request\n"
-                "from pathlib import Path\n"
-                "\n"
-                f"BASE_URL = {s3_base_url!r}\n"
-                f"BUCKET = {s3_bucket!r}\n"
-                f"OBJECT_KEY = {object_key!r}\n"
-                f"DEST_PATH = {payload_dest_path_s!r}\n"
-                f"ACCESS_KEY = {s3_access_key!r}\n"
-                f"SECRET_KEY = {s3_secret_key!r}\n"
-                f"REGION = {s3_region!r}\n"
-                "\n"
-                "ALG = 'AWS4-HMAC-SHA256'\n"
-                "SERVICE = 's3'\n"
-                "TERM = 'aws4_request'\n"
-                "UNSIGNED = 'UNSIGNED-PAYLOAD'\n"
-                "\n"
-                "def _hmac_sha256(key: bytes, msg: bytes) -> bytes:\n"
-                "    return hmac.new(key, msg, hashlib.sha256).digest()\n"
-                "\n"
-                "def _sha256_hex(msg: bytes) -> str:\n"
-                "    return hashlib.sha256(msg).hexdigest()\n"
-                "\n"
-                "def _derive_signing_key(secret_key: str, scope_date: str, region: str) -> bytes:\n"
-                "    k_date = _hmac_sha256(('AWS4' + secret_key).encode('utf-8'), scope_date.encode('utf-8'))\n"
-                "    k_region = _hmac_sha256(k_date, region.encode('utf-8'))\n"
-                "    k_service = _hmac_sha256(k_region, SERVICE.encode('utf-8'))\n"
-                "    return _hmac_sha256(k_service, TERM.encode('utf-8'))\n"
-                "\n"
-                "def _sigv4_headers(*, method: str, signing_path: str, query: str, host: str, scope_date: str, amz_date: str, payload_hash: str) -> dict:\n"
-                "    signed_headers = 'host;x-amz-content-sha256;x-amz-date'\n"
-                "    canonical_headers = ''\n"
-                "    canonical_headers += f'host:{host}\\n'\n"
-                "    canonical_headers += f'x-amz-content-sha256:{payload_hash}\\n'\n"
-                "    canonical_headers += f'x-amz-date:{amz_date}\\n'\n"
-                "    canonical_request = '\\n'.join([method, signing_path, query, canonical_headers, signed_headers, payload_hash])\n"
-                "    cr_hash = _sha256_hex(canonical_request.encode('utf-8'))\n"
-                "    scope = f'{scope_date}/{REGION}/{SERVICE}/{TERM}'\n"
-                "    string_to_sign = '\\n'.join([ALG, amz_date, scope, cr_hash])\n"
-                "    signing_key = _derive_signing_key(SECRET_KEY, scope_date, REGION)\n"
-                "    sig = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()\n"
-                "    auth = f\"{ALG} Credential={ACCESS_KEY}/{scope}, SignedHeaders={signed_headers}, Signature={sig}\"\n"
-                "    return {\n"
-                "        'Authorization': auth,\n"
-                "        'x-amz-date': amz_date,\n"
-                "        'x-amz-content-sha256': payload_hash,\n"
-                "        'Host': host,\n"
-                "    }\n"
-                "\n"
-                "u = urllib.parse.urlparse(BASE_URL)\n"
-                "if u.scheme not in ('http', 'https'):\n"
-                "    raise ValueError('BASE_URL must be http(s)')\n"
-                "if not u.netloc:\n"
-                "    raise ValueError('BASE_URL missing host')\n"
-                "base_path = u.path.rstrip('/')\n"
-                "if base_path == '':\n"
-                "    raise ValueError('BASE_URL must include a non-root path prefix (e.g. /fs_s3)')\n"
-                "\n"
-                "bucket_enc = urllib.parse.quote(BUCKET, safe='-_.~')\n"
-                "key_enc = urllib.parse.quote(OBJECT_KEY, safe='/-_.~')\n"
-                "full_path = base_path + '/' + bucket_enc + '/' + key_enc\n"
-                # Sign the *actual* client-visible request path (including s3_base_url path prefix, e.g. "/fs_s3").
-                "signing_path = full_path\n"
-                "url = f'{u.scheme}://{u.netloc}{full_path}'\n"
-                "\n"
-                "now = datetime.datetime.utcnow()\n"
-                "amz_date = now.strftime('%Y%m%dT%H%M%SZ')\n"
-                "scope_date = now.strftime('%Y%m%d')\n"
-                "hdrs = _sigv4_headers(method='GET', signing_path=signing_path, query='', host=u.netloc, scope_date=scope_date, amz_date=amz_date, payload_hash=UNSIGNED)\n"
-                "\n"
-                "dest = Path(DEST_PATH)\n"
-                "dest.parent.mkdir(parents=True, exist_ok=True)\n"
-                "tmp = Path(str(dest) + '.tmp')\n"
-                "if tmp.exists():\n"
-                "    tmp.unlink()\n"
-                "req = urllib.request.Request(url, method='GET')\n"
-                "for k, v in hdrs.items():\n"
-                "    req.add_header(k, v)\n"
-                "with urllib.request.urlopen(req, timeout=60) as resp:\n"
-                "    if getattr(resp, 'status', None) != 200:\n"
-                "        body = resp.read(4096)\n"
-                "        raise RuntimeError(f'download failed: status={getattr(resp, \"status\", None)} body={body!r}')\n"
-                "    with tmp.open('wb') as f:\n"
-                "        while True:\n"
-                "            b = resp.read(1024 * 1024)\n"
-                "            if not b:\n"
-                "                break\n"
-                "            f.write(b)\n"
-                "tmp.replace(dest)\n"
-                "PY\n"
-                f"exec {exec_cmd}\n"
+            # Keep the remote wrapper self-contained, but store it as a standalone template
+            # instead of hardcoding a long inline script in this Python source file.
+            bash_script = _render_fluxon_fs_s3_payload_wrapper(
+                s3_base_url=s3_base_url,
+                s3_bucket=s3_bucket,
+                object_key=object_key,
+                payload_dest_path=payload_dest_path_s,
+                s3_access_key=s3_access_key,
+                s3_secret_key=s3_secret_key,
+                s3_region=s3_region,
+                exec_cmd=exec_cmd,
             )
 
             # Deployer only consumes argv/cwd; container image is required by the YAML subset parser
@@ -3726,30 +3665,19 @@ def _resolved_run_dir_path(resolved_case: Dict[str, Any]) -> Path:
     return Path(_require_str(runtime.get("run_dir"), "runtime.run_dir")).resolve()
 
 
-def _ci_shared_memory_path(resolved_case: Dict[str, Any], *, run_dir: Path) -> str:
+def _ci_share_mem_path(resolved_case: Dict[str, Any], *, run_dir: Path) -> str:
     runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
     stack_identity = _require_dict(runtime.get("stack_identity"), "resolved_case.runtime.stack_identity")
-    shared_memory_root = _require_str(
-        stack_identity.get("shared_memory_path"),
-        "resolved_case.runtime.stack_identity.shared_memory_path",
+    share_mem_root = _require_str(
+        stack_identity.get("share_mem_path"),
+        "resolved_case.runtime.stack_identity.share_mem_path",
     )
     # English note:
-    # - iceoryx2 uses shared_memory_path as a base for per-node paths (e.g. .../nodes/<id>/iox2_<hash>/.service_tag).
+    # - iceoryx2 uses share_mem_path as a base for per-node paths (e.g. .../nodes/<id>/iox2_<hash>/.service_tag).
     # - The per-node suffix can be long, and some filesystems enforce a max path length of 255 bytes.
-    # - Therefore shared_memory_path must be short and must not embed run_dir (which can be deep under repo/workdir).
+    # - Therefore share_mem_path must be short and must not embed run_dir (which can be deep under repo/workdir).
     token = hashlib.sha256(str(run_dir.resolve()).encode("utf-8")).hexdigest()[:16]
-    return str((Path(shared_memory_root) / "ci" / token).resolve())
-
-
-def _ci_shared_file_path(resolved_case: Dict[str, Any], *, run_dir: Path) -> str:
-    runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
-    stack_identity = _require_dict(runtime.get("stack_identity"), "resolved_case.runtime.stack_identity")
-    shared_file_root = _require_str(
-        stack_identity.get("shared_file_path"),
-        "resolved_case.runtime.stack_identity.shared_file_path",
-    )
-    token = hashlib.sha256(str(run_dir.resolve()).encode("utf-8")).hexdigest()[:16]
-    return str((Path(shared_file_root) / "ci" / token).resolve())
+    return str((Path(share_mem_root) / "ci" / token).resolve())
 
 
 def _ci_owner_shared_bundle_paths(run_dir: Path, *, owner_config_path: Path) -> List[Path]:
@@ -3762,14 +3690,9 @@ def _ci_owner_shared_bundle_paths(run_dir: Path, *, owner_config_path: Path) -> 
         fluxonkv_spec.get("cluster_name"),
         "ci_owner_0.yaml.fluxonkv_spec.cluster_name",
     )
-    shm = _require_str(fluxonkv_spec.get("shared_memory_path"), "ci_owner_0.yaml.fluxonkv_spec.shared_memory_path")
-    shared_file = _require_str(
-        fluxonkv_spec.get("shared_file_path"),
-        "ci_owner_0.yaml.fluxonkv_spec.shared_file_path",
-    )
+    shm = _require_str(fluxonkv_spec.get("share_mem_path"), "ci_owner_0.yaml.fluxonkv_spec.share_mem_path")
     return _shared_bundle_paths_for_cluster(
-        shared_memory_root=shm,
-        shared_file_root=shared_file,
+        share_mem_root=shm,
         cluster_name=cluster_name,
     )
 
@@ -3784,7 +3707,7 @@ def _wait_ci_owner_shared_bundle_ready_and_stage_shared_json(
     timeout_s: int,
 ) -> None:
     # English note:
-    # - `shared_memory_path` is host-local. When owner_0 runs on a remote node, the runner host
+    # - `share_mem_path` is host-local. When owner_0 runs on a remote node, the runner host
     #   cannot see shared.json/mmap.file by filesystem path.
     # - CI execution already depends on the remote shared bundle being ready. Here we additionally
     #   fetch shared.json back to a stable local path for determinism and postmortem.
@@ -3805,8 +3728,7 @@ def _wait_ci_owner_shared_bundle_ready_and_stage_shared_json(
                     required_str_keys = (
                         "owner_id",
                         "cluster_name",
-                        "shared_memory_path",
-                        "shared_file_path",
+                        "share_mem_path",
                         "protocol_version",
                     )
                     for k in required_str_keys:
@@ -3826,16 +3748,10 @@ def _wait_ci_owner_shared_bundle_ready_and_stage_shared_json(
                             f"expected={_ci_cluster_name(resolved_case)!r}"
                         )
                     expected_shm_dir = str(mmap_file_path.parent.resolve())
-                    if meta.get("shared_memory_path") != expected_shm_dir:
+                    if meta.get("share_mem_path") != expected_shm_dir:
                         raise ValueError(
-                            f"shared.json shared_memory_path mismatch: shared={meta.get('shared_memory_path')!r} "
+                            f"shared.json share_mem_path mismatch: shared={meta.get('share_mem_path')!r} "
                             f"expected={expected_shm_dir!r}"
-                        )
-                    expected_file_dir = str(shared_json_path.parent.resolve())
-                    if meta.get("shared_file_path") != expected_file_dir:
-                        raise ValueError(
-                            f"shared.json shared_file_path mismatch: shared={meta.get('shared_file_path')!r} "
-                            f"expected={expected_file_dir!r}"
                         )
                 except Exception as exc:  # noqa: BLE001
                     last_err = f"{type(exc).__name__}: {exc}"
@@ -7065,6 +6981,139 @@ def _runner_native_ci_commands_for_case(case: _ResolvedCase, *, ctx: str) -> Lis
                 "timeout_seconds": 21600,
             }
         ]
+    if scene_id == "ci_top_attention_cargo_cli":
+        return [
+            {
+                "id": "top_attention_cargo_cli",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_cli.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_commu":
+        return [
+            {
+                "id": "top_attention_cargo_commu",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_commu.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_commu_contract":
+        return [
+            {
+                "id": "top_attention_cargo_commu_contract",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_commu_contract.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_framework":
+        return [
+            {
+                "id": "top_attention_cargo_framework",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_framework.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_fs":
+        return [
+            {
+                "id": "top_attention_cargo_fs",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_fs_s3_gateway":
+        return [
+            {
+                "id": "top_attention_cargo_fs_s3_gateway",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs_s3_gateway.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_limit_thirdparty":
+        return [
+            {
+                "id": "top_attention_cargo_limit_thirdparty",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_limit_thirdparty.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_mq":
+        return [
+            {
+                "id": "top_attention_cargo_mq",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_mq.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_observability":
+        return [
+            {
+                "id": "top_attention_cargo_observability",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_observability.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_ops":
+        return [
+            {
+                "id": "top_attention_cargo_ops",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_ops.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_pyo3":
+        return [
+            {
+                "id": "top_attention_cargo_pyo3",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_pyo3.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_log_mgmt":
+        return [
+            {
+                "id": "top_attention_log_mgmt",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_log_mgmt.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
     if scene_id == "ci_top_attention_mq_core":
         return [
             {
@@ -8676,6 +8725,13 @@ def _test_stack_kv_owner_runtime_instance_key(*, runtime_instance_prefix: str, o
     return f"{runtime_instance_prefix}__kv_owner__{target_slug}"
 
 
+def _fluxon_kv_owner_large_file_paths(*, owner_work_root: Path) -> List[str]:
+    # Owner mode always needs explicit large-file roots, even on surfaces that
+    # intentionally leave p2p_listen_port implicit.
+    root = owner_work_root.resolve()
+    return [str((root / "large").resolve())]
+
+
 def _build_test_stack_external_kv_owner_instances(
     *,
     scene_mode: str,
@@ -8720,8 +8776,7 @@ def _build_test_stack_external_kv_owner_instances(
 
     stack_identity = _require_dict(runtime.get("stack_identity"), "runtime.stack_identity")
     cluster_name = _require_str(stack_identity.get("cluster_name"), "runtime.stack_identity.cluster_name")
-    shared_memory_root = _require_str(stack_identity.get("shared_memory_path"), "runtime.stack_identity.shared_memory_path")
-    shared_file_root = _require_str(stack_identity.get("shared_file_path"), "runtime.stack_identity.shared_file_path")
+    share_mem_root = _require_str(stack_identity.get("share_mem_path"), "runtime.stack_identity.share_mem_path")
     etcd_endpoints = _test_stack_etcd_addresses(resolved_case)
     master_port_offset = 0
     owner_instances: List[Dict[str, Any]] = []
@@ -8730,6 +8785,8 @@ def _build_test_stack_external_kv_owner_instances(
             owner_target=target,
             ctx="external kv owner",
         )
+        # TEST_STACK case-local owners use the compiled slot-based port plan so
+        # node runtimes in the same case can resolve stable owner peers.
         owner_p2p_listen_port = (
             int(kv_p2p_port_base)
             + int(kv_p2p_port_stride) * int(run_index - 1)
@@ -8742,15 +8799,15 @@ def _build_test_stack_external_kv_owner_instances(
             raise ValueError(f"computed owner_p2p_listen_port out of range: {owner_p2p_listen_port}")
 
         if owner_group_processes is None:
-            owner_shared_memory_path = shared_memory_root
-            owner_shared_file_path = shared_file_root
+            owner_share_mem_path = share_mem_root
         else:
-            owner_shared_memory_path, owner_shared_file_path = _owner_bundle_roots_for_target(
-                shared_memory_root=shared_memory_root,
-                shared_file_root=shared_file_root,
+            owner_share_mem_path = _owner_bundle_roots_for_target(
+                share_mem_root=share_mem_root,
                 owner_target=target,
                 ctx="runtime.stack_identity owner bundle roots",
             )
+        owner_services_dir = run_dir / "services" / "kv_owner" / target_slug
+        owner_large_file_paths = _fluxon_kv_owner_large_file_paths(owner_work_root=owner_services_dir)
         owner_cfg = {
             "instance_key": _test_stack_kv_owner_runtime_instance_key(
                 runtime_instance_prefix=runtime_instance_prefix,
@@ -8761,8 +8818,8 @@ def _build_test_stack_external_kv_owner_instances(
             "fluxonkv_spec": {
                 "etcd_addresses": list(etcd_endpoints),
                 "cluster_name": cluster_name,
-                "shared_memory_path": owner_shared_memory_path,
-                "shared_file_path": owner_shared_file_path,
+                "share_mem_path": owner_share_mem_path,
+                "large_file_paths": owner_large_file_paths,
                 "sub_cluster": FLUXON_KV_OWNER_SUB_CLUSTER,
                 "p2p_listen_port": int(owner_p2p_listen_port),
             },
@@ -8785,7 +8842,6 @@ def _build_test_stack_external_kv_owner_instances(
             raise ValueError(f"test_stack owner config already exists (no overwrite): {owner_cfg_path}")
         _write_yaml_file(owner_cfg_path, owner_cfg)
 
-        owner_services_dir = run_dir / "services" / "kv_owner" / target_slug
         owner_services_dir.mkdir(parents=True, exist_ok=True)
         owner_inst = copy.deepcopy(coord_tpl)
         owner_inst["id"] = instance_id
@@ -9280,21 +9336,16 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
     node_roles: List[str] = []
     node_overrides: List[Dict[str, Any]] = []
     stack_cluster_name: Optional[str] = None
-    stack_shared_memory_path: Optional[str] = None
-    stack_shared_file_path: Optional[str] = None
+    stack_share_mem_path: Optional[str] = None
     if backend_kind == TEST_STACK_BACKEND_FLUXON:
         stack_identity = _require_dict(runtime.get("stack_identity"), "runtime.stack_identity")
         stack_cluster_name = _require_str(
             stack_identity.get("cluster_name"),
             "runtime.stack_identity.cluster_name",
         )
-        stack_shared_memory_path = _require_str(
-            stack_identity.get("shared_memory_path"),
-            "runtime.stack_identity.shared_memory_path",
-        )
-        stack_shared_file_path = _require_str(
-            stack_identity.get("shared_file_path"),
-            "runtime.stack_identity.shared_file_path",
+        stack_share_mem_path = _require_str(
+            stack_identity.get("share_mem_path"),
+            "runtime.stack_identity.share_mem_path",
         )
 
     rc = _require_dict(ts_profile.get("runtime_config"), "profile.test_stack.runtime_config")
@@ -9994,8 +10045,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                     # Benchmark nodes bootstrap from owner shared bundles. Strict dual-owner mode
                     # routes each process group to a different same-machine owner bundle root.
                     assert stack_cluster_name is not None
-                    assert stack_shared_memory_path is not None
-                    assert stack_shared_file_path is not None
+                    assert stack_share_mem_path is not None
                     selected_owner_target = _test_stack_owner_target_for_node_process(
                         target=target,
                         process_idx=process_idx,
@@ -10004,18 +10054,15 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                         owner_group_processes=owner_group_processes,
                     )
                     if selected_owner_target is None:
-                        selected_shared_memory_path = stack_shared_memory_path
-                        selected_shared_file_path = stack_shared_file_path
+                        selected_share_mem_path = stack_share_mem_path
                     else:
-                        selected_shared_memory_path, selected_shared_file_path = _owner_bundle_roots_for_target(
-                            shared_memory_root=stack_shared_memory_path,
-                            shared_file_root=stack_shared_file_path,
+                        selected_share_mem_path = _owner_bundle_roots_for_target(
+                            share_mem_root=stack_share_mem_path,
                             owner_target=selected_owner_target,
                             ctx=f"strict dual-owner routing target={target} process_idx={process_idx}",
                         )
                     fluxonkv_override["cluster_name"] = stack_cluster_name
-                    fluxonkv_override["shared_memory_path"] = selected_shared_memory_path
-                    fluxonkv_override["shared_file_path"] = selected_shared_file_path
+                    fluxonkv_override["share_mem_path"] = selected_share_mem_path
                     fluxonkv_override["p2p_listen_port"] = int(kv_p2p_listen_port)
                     kv["fluxonkv_spec"] = fluxonkv_override
                 elif backend_kind == TEST_STACK_BACKEND_ALLUXIO:
@@ -11678,6 +11725,51 @@ def _shell_quote(s: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_./:=@+-]+", s):
         return s
     return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _json_string_literal(value: str) -> str:
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _render_runner_template(*, template_name: str, replacements: Dict[str, str]) -> str:
+    template_path = (RUNNER_TEMPLATE_DIR / template_name).resolve()
+    if template_path.parent != RUNNER_TEMPLATE_DIR:
+        raise ValueError(f"template must stay under {RUNNER_TEMPLATE_DIR}: {template_path}")
+    if not template_path.is_file():
+        raise ValueError(f"missing runner template: {template_path}")
+    rendered = template_path.read_text(encoding="utf-8")
+    for token, value in replacements.items():
+        rendered = rendered.replace(token, value)
+    unresolved = sorted(set(re.findall(r"__FLUXON_TMPL_[A-Z0-9_]+__", rendered)))
+    if unresolved:
+        raise ValueError(f"unresolved runner template tokens: {unresolved} template={template_path}")
+    return rendered
+
+
+def _render_fluxon_fs_s3_payload_wrapper(
+    *,
+    s3_base_url: str,
+    s3_bucket: str,
+    object_key: str,
+    payload_dest_path: str,
+    s3_access_key: str,
+    s3_secret_key: str,
+    s3_region: str,
+    exec_cmd: str,
+) -> str:
+    return _render_runner_template(
+        template_name="payload_fluxon_fs_s3_download_and_exec.sh.template",
+        replacements={
+            "__FLUXON_TMPL_BASE_URL_JSON__": _json_string_literal(s3_base_url),
+            "__FLUXON_TMPL_BUCKET_JSON__": _json_string_literal(s3_bucket),
+            "__FLUXON_TMPL_OBJECT_KEY_JSON__": _json_string_literal(object_key),
+            "__FLUXON_TMPL_DEST_PATH_JSON__": _json_string_literal(payload_dest_path),
+            "__FLUXON_TMPL_ACCESS_KEY_JSON__": _json_string_literal(s3_access_key),
+            "__FLUXON_TMPL_SECRET_KEY_JSON__": _json_string_literal(s3_secret_key),
+            "__FLUXON_TMPL_REGION_JSON__": _json_string_literal(s3_region),
+            "__FLUXON_TMPL_EXEC_CMD__": exec_cmd,
+        },
+    )
 
 
 
@@ -13822,8 +13914,7 @@ def _ci_prepare_run_inputs(
     overlay_live_checkout: bool,
     etcd_address: str,
     cluster_name: str,
-    shared_memory_path: str,
-    shared_file_path: str,
+    share_mem_path: str,
 ) -> None:
     """Materialize CI run inputs from the case release into an isolated run_dir.
 
@@ -13898,8 +13989,7 @@ def _ci_prepare_run_inputs(
         src_root=src_root,
         etcd_address=etcd_address,
         cluster_name=cluster_name,
-        shared_memory_path=shared_memory_path,
-        shared_file_path=shared_file_path,
+        share_mem_path=share_mem_path,
     )
     release_link_path = src_root / "fluxon_release"
     _materialize_ci_runtime_release_view(
@@ -13965,8 +14055,14 @@ def _write_ci_scene_config_yaml(
 
 
 def _write_ci_master_owner_configs(
-    resolved_case: Dict[str, Any], *, run_dir: Path, cluster_name: str, share_mem_path: str, share_file_path: str, owner_dram_bytes: int
+    resolved_case: Dict[str, Any],
+    *,
+    run_dir: Path,
+    cluster_name: str,
+    share_mem_path: str,
+    owner_dram_bytes: int,
 ) -> tuple[Path, Path]:
+    owner_work_root = run_dir / "services" / "owner_0"
     master_cfg = {
         "etcd_endpoints": ["__ETCD__"],
         "cluster_name": cluster_name,
@@ -13993,8 +14089,11 @@ def _write_ci_master_owner_configs(
         "fluxonkv_spec": {
             "etcd_addresses": ["__ETCD__"],
             "cluster_name": cluster_name,
-            "shared_memory_path": share_mem_path,
-            "shared_file_path": share_file_path,
+            "share_mem_path": share_mem_path,
+            # Shared testbed / CI owners keep p2p_listen_port implicit so the
+            # runtime can bind a free host port, but owner mode still requires
+            # explicit large-file roots.
+            "large_file_paths": _fluxon_kv_owner_large_file_paths(owner_work_root=owner_work_root),
             "sub_cluster": FLUXON_KV_OWNER_SUB_CLUSTER,
         },
     }
@@ -14265,7 +14364,6 @@ def _write_ci_runner_script(
     run_dir: Path,
     src_root: Path,
     share_mem_path: str,
-    share_file_path: str,
 ) -> Path:
     commands = _resolved_ci_command_list(resolved_case)
     venv_python = run_dir / "venv" / "bin" / "python3"
@@ -14306,30 +14404,22 @@ def _write_ci_runner_script(
     readiness_probe_block = ""
     if requires_owner_shared_bundle:
         bundle_cluster_name = _ci_cluster_name(resolved_case)
-        bundle_shared_memory_dir = str(
-            _cluster_scoped_shared_dir(root_path=share_mem_path, cluster_name=bundle_cluster_name)
-        )
-        bundle_shared_file_dir = str(
-            _cluster_scoped_shared_dir(root_path=share_file_path, cluster_name=bundle_cluster_name)
-        )
+        bundle_dir = str(_cluster_scoped_shared_dir(root_path=share_mem_path, cluster_name=bundle_cluster_name))
         shared_bundle_block = f"""
 echo "[ci_runner] waiting for owner shared bundle..."
 deadline=$(( $(date +%s) + {CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S} ))
-shm={bundle_shared_memory_dir}
-shared_file={bundle_shared_file_dir}
+share_mem={bundle_dir}
 while [ $(date +%s) -lt "$deadline" ]; do
-  if [ -f "$shared_file/shared.json" ] && [ -f "$shm/mmap.file" ]; then
+  if [ -f "$share_mem/shared.json" ] && [ -f "$share_mem/mmap.file" ]; then
     echo "[ci_runner] owner shared bundle ready"
     break
   fi
   sleep 1
 done
-if [ ! -f "$shared_file/shared.json" ] || [ ! -f "$shm/mmap.file" ]; then
+if [ ! -f "$share_mem/shared.json" ] || [ ! -f "$share_mem/mmap.file" ]; then
   echo "[ci_runner] ERROR: owner shared bundle not ready in {CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S}s"
-  echo "[ci_runner] shm=$shm"
-  echo "[ci_runner] shared_file=$shared_file"
-  ls -la "$shm"
-  ls -la "$shared_file"
+  echo "[ci_runner] share_mem=$share_mem"
+  ls -la "$share_mem"
   fail_and_exit 2
 fi
 """
@@ -15040,13 +15130,9 @@ def _test_stack_external_owner_shared_bundle_paths(
         stack_identity.get("cluster_name"),
         "resolved_case.runtime.stack_identity.cluster_name",
     )
-    shared_memory_path = _require_str(
-        stack_identity.get("shared_memory_path"),
-        "resolved_case.runtime.stack_identity.shared_memory_path",
-    )
-    shared_file_path = _require_str(
-        stack_identity.get("shared_file_path"),
-        "resolved_case.runtime.stack_identity.shared_file_path",
+    share_mem_path = _require_str(
+        stack_identity.get("share_mem_path"),
+        "resolved_case.runtime.stack_identity.share_mem_path",
     )
     if owner_target is not None:
         scale = _require_dict(resolved_case.get("scale"), "resolved_case.scale")
@@ -15076,15 +15162,13 @@ def _test_stack_external_owner_shared_bundle_paths(
         )
         if owner_group_processes is not None:
             return _owner_bundle_paths_for_target(
-                shared_memory_root=shared_memory_path,
-                shared_file_root=shared_file_path,
+                share_mem_root=share_mem_path,
                 cluster_name=cluster_name,
                 owner_target=owner_target,
                 ctx="TEST_STACK owner shared bundle paths",
             )
     return _shared_bundle_paths_for_cluster(
-        shared_memory_root=shared_memory_path,
-        shared_file_root=shared_file_path,
+        share_mem_root=share_mem_path,
         cluster_name=cluster_name,
     )
 
@@ -15766,7 +15850,9 @@ def _ui_case_reserved_activity_unix_s(
             return
 
     _consume_path((workdir_root / "case_runs.yaml").resolve())
-    _consume_path((workdir_root / RUNNER_STDIO_LOG_FILENAME).resolve())
+    runner_log_path = _service_log_resolve_read_path(workdir_root, filename=RUNNER_STDIO_LOG_FILENAME)
+    if isinstance(runner_log_path, Path):
+        _consume_path(runner_log_path)
 
     run_dir = (_ui_case_result_root(workdir_root, case_id) / _ui_run_dir_name(run_index)).resolve()
     _consume_path(run_dir)
@@ -15873,7 +15959,7 @@ def _ui_case_overview(workdir_root: Path, *, case_id: str) -> Dict[str, Any]:
 def _ui_collect_suite_overview(workdir_root: Path) -> Dict[str, Any]:
     case_ids = _ui_collect_case_ids(workdir_root)
     cases = [_ui_case_overview(workdir_root, case_id=case_id) for case_id in case_ids]
-    runner_log_path = (workdir_root / RUNNER_STDIO_LOG_FILENAME).resolve()
+    runner_log_path = _service_log_resolve_read_path(workdir_root, filename=RUNNER_STDIO_LOG_FILENAME)
     running_cases = [case for case in cases if case.get("status") == "RUNNING"]
     incomplete_cases = [case for case in cases if case.get("status") in {"INCOMPLETE", "RESERVED"}]
     last_updated_unix_s = 0
@@ -15896,7 +15982,7 @@ def _ui_collect_suite_overview(workdir_root: Path) -> Dict[str, Any]:
     return {
         "workdir_root": workdir_root.resolve(),
         "case_runs_path": (workdir_root / "case_runs.yaml").resolve(),
-        "runner_log_path": runner_log_path if runner_log_path.exists() else None,
+        "runner_log_path": runner_log_path if isinstance(runner_log_path, Path) and runner_log_path.exists() else None,
         "running_case_count": len(running_cases),
         "status": "RUNNING" if running_cases else ("INCOMPLETE" if incomplete_cases else ("IDLE" if cases else "EMPTY")),
         "last_updated_unix_s": int(last_updated_unix_s),
@@ -15997,7 +16083,7 @@ def _ui_workdir_id(workdir_root: Path) -> str:
 
 def _ui_workdir_touch_unix_s(workdir_root: Path) -> int:
     touched = 0
-    for name in ("case_runs.yaml", RUNNER_STDIO_LOG_FILENAME):
+    for name in ("case_runs.yaml",):
         path = (workdir_root / name).resolve()
         if not path.exists():
             continue
@@ -16005,6 +16091,12 @@ def _ui_workdir_touch_unix_s(workdir_root: Path) -> int:
             touched = max(touched, int(path.stat().st_mtime))
         except Exception:
             continue
+    runner_log_path = _service_log_resolve_read_path(workdir_root, filename=RUNNER_STDIO_LOG_FILENAME)
+    if isinstance(runner_log_path, Path) and runner_log_path.exists():
+        try:
+            touched = max(touched, int(runner_log_path.stat().st_mtime))
+        except Exception:
+            pass
     return int(touched)
 
 
@@ -17443,8 +17535,11 @@ pre{background:#0b1020;color:#e5e7eb;padding:10px;border-radius:8px;overflow:aut
                         self._send_json(400, {"error": "missing workdir_id"})
                         return
                     suite_workdir = _ui_workdir_by_id(workdir_root, workdir_id, extra_history_roots)
-                    path = (suite_workdir / RUNNER_STDIO_LOG_FILENAME).resolve()
-                    if not path.exists():
+                    path = _service_log_resolve_read_path(
+                        suite_workdir,
+                        filename=RUNNER_STDIO_LOG_FILENAME,
+                    )
+                    if not isinstance(path, Path) or not path.exists():
                         raise FileNotFoundError(f"runner log not found: {path}")
                 elif kind == "run":
                     workdir_id = (qs.get("workdir_id") or [""])[0]

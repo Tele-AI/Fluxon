@@ -74,13 +74,9 @@ Cross-machine transport:
 - Metrics source queried by the panel
 - The panel only reads; it does not scrape by itself
 
-`shared_memory_path`
+`share_mem_path`
 
-- Shared-memory authority for local attachment to the same pool
-
-`shared_file_path`
-
-- Shared-file authority for `shared.json`, logs, profiles, and other local shared files
+- Shared bundle root. Runtime appends `cluster_name`, and that cluster-scoped directory holds `mmap.file`, `shared.json`, and peer metadata.
 
 `log_dir`
 

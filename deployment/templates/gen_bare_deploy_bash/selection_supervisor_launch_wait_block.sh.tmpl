@@ -1,0 +1,10 @@
+SUPERVISOR_PID=$( {{RUN_CMD}} < /dev/null & echo "$!" )
+if [[ ! "$SUPERVISOR_PID" =~ ^[0-9]+$ ]]; then
+  echo "{{CONTEXT}} launch failed svc=$SERVICE label=$SUPERVISOR_LABEL supervisor_pid=$SUPERVISOR_PID"
+  exit 1
+fi
+STARTUP_DEADLINE_SECONDS={{DEADLINE_SECONDS_EXPR}}
+if ! wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" {{STABLE_SECONDS_EXPR}} "$STARTUP_DEADLINE_SECONDS" "{{CONTEXT}}"; then
+  echo "{{CONTEXT}} probable-ready failed svc=$SERVICE label=$SUPERVISOR_LABEL supervisor_pid=$SUPERVISOR_PID"
+  exit 1
+fi

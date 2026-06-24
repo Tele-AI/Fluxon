@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::cluster_manager::NodeID;
 use crate::config::{
-    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig, MonitoringConfig,
-    ProtocolConfig, ProtocolType, TestSpecConfig, TransferEngineType,
+    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, LargeFilePaths, MasterConfig,
+    MonitoringConfig, ProtocolConfig, ProtocolType, TestSpecConfig, TransferEngineType,
 };
 use crate::master_kv_router::MasterKvRouterView;
 use crate::{ConfigArg, run_client, run_master};
@@ -11,7 +11,12 @@ use limit_thirdparty::tokio::{self};
 use std::time::{Duration, Instant};
 use tracing::info;
 
-fn new_master_config(instance_key: &str, port: u16, cluster: &str, etcd: &str) -> MasterConfig {
+fn new_master_config(
+    instance_key: &str,
+    port: Option<u16>,
+    cluster: &str,
+    etcd: &str,
+) -> MasterConfig {
     let prometheus_base_url = fluxon_util::dev_config::load_tsdb_base_url()
         .expect("read prometheus_base_url from build_config_ext.yml (key: prom)");
     let prom_remote_write_url =
@@ -24,7 +29,7 @@ fn new_master_config(instance_key: &str, port: u16, cluster: &str, etcd: &str) -
     MasterConfig {
         instance_key: instance_key.to_string(),
         cluster_name: cluster.to_string(),
-        port: Some(port),
+        port,
         etcd_endpoints: vec![etcd.to_string()],
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
@@ -80,8 +85,10 @@ fn new_client_config(
             enable_transfer_rpc_fast_path: true,
             sub_cluster: None,
         },
-        shared_memory_path: shm_path.to_string(),
-        shared_file_path: format!("{}_files", shm_path),
+        share_mem_path: shm_path.to_string(),
+        large_file_paths: LargeFilePaths {
+            paths: vec![format!("{}_large", shm_path)],
+        },
         test_spec_config: TestSpecConfig::default(),
     }
 }
@@ -92,8 +99,7 @@ fn new_zero_contribution_client_config(
     shm_path: &str,
 ) -> ClientConfig {
     // External instance_key MUST be different from owner.
-    // External bootstrap shares both owner bundle roots: shared_memory_path for mmap.file and
-    // shared_file_path for shared.json / peer metadata.
+    // External bootstrap shares the owner bundle root for mmap.file, shared.json, and peer metadata.
     let unique_suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -122,8 +128,8 @@ fn new_zero_contribution_client_config(
             enable_transfer_rpc_fast_path: false,
             sub_cluster: None,
         },
-        shared_memory_path: shm_path.to_string(),
-        shared_file_path: format!("{}_files", shm_path),
+        share_mem_path: shm_path.to_string(),
+        large_file_paths: LargeFilePaths { paths: Vec::new() },
         test_spec_config: TestSpecConfig::default(),
     }
 }
@@ -143,7 +149,7 @@ async fn test_external_client_basic_crud() {
     std::fs::create_dir_all(shm_path).unwrap();
 
     // Start master
-    let master_cfg = new_master_config("ext_test_master", 50120, cluster, &etcd);
+    let master_cfg = new_master_config("ext_test_master", None, cluster, &etcd);
     let (master_fw, _) = run_master(ConfigArg::Config(master_cfg))
         .await
         .expect("start master");
@@ -305,7 +311,7 @@ pub async fn test_external_client_lifetime() {
     info!("[ELT-SETUP] cluster='{}', shm_path='{}'", cluster, shm_path);
 
     // Start master
-    let master_cfg = new_master_config("ext_lt_master", 50130, cluster, &etcd);
+    let master_cfg = new_master_config("ext_lt_master", None, cluster, &etcd);
     let (master_fw, _) = run_master(ConfigArg::Config(master_cfg))
         .await
         .expect("start master");

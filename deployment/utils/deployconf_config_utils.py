@@ -18,8 +18,7 @@ __all__ = [
     "load_deployconf_prometheus_base_url",
     "load_deployconf_prom_remote_write_url",
     "load_deployconf_fluxon_cluster_name",
-    "load_deployconf_fluxon_shared_memory_path",
-    "load_deployconf_fluxon_shared_file_path",
+    "load_deployconf_fluxon_share_mem_path",
     "load_deployconf_service_ip_port",
 ]
 
@@ -140,19 +139,11 @@ def load_deployconf_fluxon_cluster_name(*, config_path: Path) -> str:
     return raw.strip()
 
 
-def load_deployconf_fluxon_shared_memory_path(*, config_path: Path) -> str:
+def load_deployconf_fluxon_share_mem_path(*, config_path: Path) -> str:
     global_envs = load_deployconf_resolved_global_envs(config_path=config_path)
     raw = global_envs.get("FLUXON_SHARED_MEM")
     if not isinstance(raw, str) or not raw.strip():
         raise ValueError("deployconf.global_envs.FLUXON_SHARED_MEM must resolve to a non-empty string")
-    return raw.strip()
-
-
-def load_deployconf_fluxon_shared_file_path(*, config_path: Path) -> str:
-    global_envs = load_deployconf_resolved_global_envs(config_path=config_path)
-    raw = global_envs.get("FLUXON_SHARED_FILE")
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("deployconf.global_envs.FLUXON_SHARED_FILE must resolve to a non-empty string")
     return raw.strip()
 
 

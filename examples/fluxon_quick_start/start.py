@@ -473,10 +473,9 @@ def _load_config_from_b64(config_b64: str) -> Dict[str, Any]:
 
 def _resolve_fluxonkv_spec_paths(*, spec: Dict[str, Any], workdir: Path) -> Dict[str, Any]:
     resolved = dict(spec)
-    for field_name in ("shared_memory_path", "shared_file_path"):
-        raw_path = resolved.get(field_name)
-        if isinstance(raw_path, str) and raw_path and not Path(raw_path).is_absolute():
-            resolved[field_name] = str((workdir / raw_path).resolve())
+    raw_path = resolved.get("share_mem_path")
+    if isinstance(raw_path, str) and raw_path and not Path(raw_path).is_absolute():
+        resolved["share_mem_path"] = str((workdir / raw_path).resolve())
     return resolved
 
 
@@ -528,10 +527,13 @@ def _monitoring_block(greptime_http_port: int) -> Dict[str, Any]:
     }
 
 
+def _owner_large_file_paths(workdir: Path) -> List[str]:
+    return [str(workdir / "large" / "owner")]
+
+
 def _gen_kv_config(etcd_ep: str, cluster: str, master_port: int, kv_http_port: int,
                     panel_port: int, greptime_http_port: int, workdir: Path) -> Dict[str, Any]:
     shm = str(workdir / "sharemem")
-    shared_file_path = str(workdir / "sharefile")
     log_dir = str(workdir / "log" / "master")
     master_cfg: Dict[str, Any] = {
         "etcd_endpoints": [etcd_ep],
@@ -551,9 +553,9 @@ def _gen_kv_config(etcd_ep: str, cluster: str, master_port: int, kv_http_port: i
             "fluxonkv_spec": {
                 "etcd_addresses": [etcd_ep],
                 "cluster_name": cluster,
-                "shared_memory_path": shm,
-                "shared_file_path": shared_file_path,
+                "share_mem_path": shm,
                 "sub_cluster": "default",
+                "large_file_paths": _owner_large_file_paths(workdir),
             },
         },
         "kvexternal_rexport_httpserver_http": {
@@ -565,8 +567,7 @@ def _gen_kv_config(etcd_ep: str, cluster: str, master_port: int, kv_http_port: i
             "instance_key": "qs_http_accessor",
             "fluxonkv_spec": {
                 "cluster_name": cluster,
-                "shared_memory_path": shm,
-                "shared_file_path": shared_file_path,
+                "share_mem_path": shm,
             },
         },
     }
@@ -576,7 +577,6 @@ def _gen_kv_config(etcd_ep: str, cluster: str, master_port: int, kv_http_port: i
 def _gen_mq_config(etcd_ep: str, cluster: str, master_port: int, greptime_http_port: int,
                     workdir: Path, panel_port: int = 0) -> Dict[str, Any]:
     shm = str(workdir / "sharemem")
-    shared_file_path = str(workdir / "sharefile")
     log_dir = str(workdir / "log" / "master")
     master_cfg: Dict[str, Any] = {
         "etcd_endpoints": [etcd_ep],
@@ -596,17 +596,16 @@ def _gen_mq_config(etcd_ep: str, cluster: str, master_port: int, greptime_http_p
             "fluxonkv_spec": {
                 "etcd_addresses": [etcd_ep],
                 "cluster_name": cluster,
-                "shared_memory_path": shm,
-                "shared_file_path": shared_file_path,
+                "share_mem_path": shm,
                 "sub_cluster": "default",
+                "large_file_paths": _owner_large_file_paths(workdir),
             },
         },
         "kvexternal": {
             "instance_key": "qs_mq_external",
             "fluxonkv_spec": {
                 "cluster_name": cluster,
-                "shared_memory_path": shm,
-                "shared_file_path": shared_file_path,
+                "share_mem_path": shm,
             },
         },
         "mpmc_demo": {
@@ -630,7 +629,6 @@ def _gen_mq_config(etcd_ep: str, cluster: str, master_port: int, greptime_http_p
 def _gen_fs_config(etcd_ep: str, cluster: str, master_port: int, panel_port: int,
                     greptime_http_port: int, workdir: Path) -> Dict[str, Any]:
     shm = str(workdir / "sharemem")
-    shared_file_path = str(workdir / "sharefile")
     log_dir = str(workdir / "log" / "master")
     remote_root_dir = str(workdir / "fs_remote_root")
     access_db_path = str(workdir / "fs_master" / "access.db")
@@ -654,9 +652,9 @@ def _gen_fs_config(etcd_ep: str, cluster: str, master_port: int, panel_port: int
             "fluxonkv_spec": {
                 "etcd_addresses": [etcd_ep],
                 "cluster_name": cluster,
-                "shared_memory_path": shm,
-                "shared_file_path": shared_file_path,
+                "share_mem_path": shm,
                 "sub_cluster": "default",
+                "large_file_paths": _owner_large_file_paths(workdir),
             },
         },
         "fs_master": {
@@ -664,8 +662,7 @@ def _gen_fs_config(etcd_ep: str, cluster: str, master_port: int, panel_port: int
                 "instance_key": "qs_fs_master",
                 "fluxonkv_spec": {
                     "cluster_name": cluster,
-                    "shared_memory_path": shm,
-                    "shared_file_path": shared_file_path,
+                    "share_mem_path": shm,
                 },
             },
             "fluxon_fs": {
@@ -711,8 +708,7 @@ def _gen_fs_config(etcd_ep: str, cluster: str, master_port: int, panel_port: int
                 "instance_key": "qs_fs_agent",
                 "fluxonkv_spec": {
                     "cluster_name": cluster,
-                    "shared_memory_path": shm,
-                    "shared_file_path": shared_file_path,
+                    "share_mem_path": shm,
                 },
             },
             "fluxon_fs": {
@@ -980,19 +976,19 @@ def _wait_for_process_tcp_ready_best_effort(
     return False
 
 
-def _kvclient_shared_json_target(shared_file_path: Path, cluster_name: str) -> Path:
-    return shared_file_path / cluster_name / "shared.json"
+def _kvclient_shared_json_target(share_mem_path: Path, cluster_name: str) -> Path:
+    return share_mem_path / cluster_name / "shared.json"
 
 
-def _clear_stale_shared_json(shared_file_path: Path, cluster_name: str) -> None:
-    target = _kvclient_shared_json_target(shared_file_path, cluster_name)
+def _clear_stale_shared_json(share_mem_path: Path, cluster_name: str) -> None:
+    target = _kvclient_shared_json_target(share_mem_path, cluster_name)
     if target.exists():
         print(f"[quick_start] removing stale shared.json: {target}")
         target.unlink()
 
 
 def _wait_for_shared_json(
-    shared_file_path: Path,
+    share_mem_path: Path,
     cluster_name: str,
     timeout: int = 180,
     *,
@@ -1001,7 +997,7 @@ def _wait_for_shared_json(
     log_path: Optional[Path] = None,
 ) -> None:
     """Block until shared.json appears (owner kvclient ready)."""
-    target = _kvclient_shared_json_target(shared_file_path, cluster_name)
+    target = _kvclient_shared_json_target(share_mem_path, cluster_name)
     target_dir = target.parent
     deadline = time.time() + timeout
     elapsed = 0
@@ -1036,7 +1032,7 @@ def _start_cluster_infra(
     etcd_log_path = workdir / "log" / "etcd.log"
     master_log_path = workdir / "log" / "master.log"
     kvclient_log_path = workdir / "log" / "kvclient.log"
-    shared_file_path = _kvclient_shared_file_path_from_cfg(cfg)
+    share_mem_path = _kvclient_share_mem_path_from_cfg(cfg)
     cluster_name = _kvclient_cluster_name_from_cfg(cfg)
     log_dir = workdir / "log"
 
@@ -1102,10 +1098,10 @@ def _start_cluster_infra(
         )
 
     print("[quick_start] starting kvclient...")
-    _clear_stale_shared_json(shared_file_path, cluster_name)
+    _clear_stale_shared_json(share_mem_path, cluster_name)
     kvclient_proc = _start_kvclient(cfg["kvclient"], workdir)
     _wait_for_shared_json(
-        shared_file_path,
+        share_mem_path,
         cluster_name,
         proc=kvclient_proc,
         label="kvclient",
@@ -1113,16 +1109,16 @@ def _start_cluster_infra(
     )
 
 
-def _kvclient_shared_file_path_from_cfg(cfg: Dict[str, Any]) -> Path:
+def _kvclient_share_mem_path_from_cfg(cfg: Dict[str, Any]) -> Path:
     kvclient_cfg = cfg.get("kvclient")
     if not isinstance(kvclient_cfg, dict):
         raise ValueError("missing kvclient config")
     spec = kvclient_cfg.get("fluxonkv_spec")
     if not isinstance(spec, dict):
         raise ValueError("missing kvclient.fluxonkv_spec config")
-    raw_path = spec.get("shared_file_path")
+    raw_path = spec.get("share_mem_path")
     if not isinstance(raw_path, str) or not raw_path:
-        raise ValueError("kvclient.fluxonkv_spec.shared_file_path must be a non-empty string")
+        raise ValueError("kvclient.fluxonkv_spec.share_mem_path must be a non-empty string")
     return Path(raw_path)
 
 

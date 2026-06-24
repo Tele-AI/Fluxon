@@ -1,0 +1,26 @@
+SUPERVISOR_LABEL={{SUPERVISOR_LABEL_ASSIGN}}
+RUNTIME_STATE_JSON={{RUNTIME_STATE_JSON_ASSIGN}}
+OWNER_TS_MS=$(python3 -c 'import time; print(int(time.time() * 1000))')
+LOG_DIR="$HOSTWORKDIR/log"
+LOGFILE="$LOG_DIR/${SERVICE}.log"
+mkdir -p "$LOG_DIR"
+echo "Starting $SERVICE on $NODE_ID (IP: $HOST_IP, workdir: $HOSTWORKDIR)"
+# English note:
+# - bootstrap bare start must be idempotent when the shared selection supervisor already owns
+#   a live child for the same label.
+# - start_test_bed enables this path only for deployconf.bootstrap_bare_services.
+if [ "${FLUXON_BARE_ALLOW_ALREADY_PRESENT:-false}" = "true" ]; then
+  if selection_present; then
+    echo "[bare] already present svc=$SERVICE label=$SUPERVISOR_LABEL"
+    echo "Started $SERVICE (label: $SUPERVISOR_LABEL)"
+    echo "Logs: $LOGFILE"
+    exit 0
+  fi
+fi
+# English note:
+# - Bare start must not depend on extra supervisor observation subcommands because the shared
+#   runtime surface is intentionally reduced to run/stop.
+# - We therefore launch the detached supervisor and wait until one supervised child PID stays
+#   alive without restart across the fixed startup observation window.
+{{SELECTION_SUPERVISOR_LAUNCH_WAIT_BLOCK}}echo "Started $SERVICE (label: $SUPERVISOR_LABEL)"
+echo "Logs: $LOGFILE"

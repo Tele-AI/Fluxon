@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import hashlib
 import json
 import os
@@ -19,30 +18,28 @@ import urllib.request
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = REPO_ROOT / "setup_and_pack"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+SETUP_AND_PACK_DIR = REPO_ROOT / "setup_and_pack"
+setup_and_pack_dir_str = str(SETUP_AND_PACK_DIR)
+if setup_and_pack_dir_str in sys.path:
+    sys.path.remove(setup_and_pack_dir_str)
+sys.path.insert(0, setup_and_pack_dir_str)
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+scripts_dir_str = str(SCRIPTS_DIR)
+if scripts_dir_str in sys.path:
+    sys.path.remove(scripts_dir_str)
+sys.path.insert(0, scripts_dir_str)
 
 import utils as script_utils
+from source_selection_profiles import (
+    SOURCE_SELECTION_PROFILE_SOURCE_PACK,
+    collect_source_profile_relpaths,
+    get_source_profile_source_roots,
+    source_profile_relpath_excluded,
+)
 
 
-CI_SOURCE_ROOT_NAMES: tuple[str, ...] = (".",)
-CI_SOURCE_COMMON_EXCLUDE_REL_PATHS: tuple[str, ...] = (
-    "__pycache__/",
-    ".pytest_cache/",
-    ".mypy_cache/",
-    ".ruff_cache/",
-    "*.swp",
-)
-CI_SOURCE_STAGE_EXCLUDE_PREFIXES: tuple[str, ...] = (
-    ".dever/",
-    "fluxon_release/",
-    "skills/",
-)
-CI_SOURCE_STAGE_EXCLUDE_NAMES: frozenset[str] = frozenset(
-    {
-        ".DS_Store",
-    }
+CI_SOURCE_ROOT_NAMES: tuple[str, ...] = get_source_profile_source_roots(
+    profile=SOURCE_SELECTION_PROFILE_SOURCE_PACK
 )
 PACKED_RUNTIME_ROOT_NAMES: tuple[str, ...] = (
     "bin",
@@ -86,18 +83,6 @@ TEST_RSC_PROFILE_PREPARED_RESOURCE_ROOT_NAMES: tuple[str, ...] = (
     "mooncake",
 )
 RELEASE_MANIFEST_FILENAME = "fluxon_release.sha256"
-CI_SOURCE_DIGEST_IGNORED_DIR_NAMES = frozenset(
-    {
-        ".git",
-        "__pycache__",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-        "target",
-    }
-)
-CI_SOURCE_DIGEST_IGNORED_FILE_NAMES = frozenset()
-CI_SOURCE_DIGEST_IGNORED_FILE_SUFFIXES = (".pyc", ".swp", ".gitignore")
 DEFAULT_REDIS_BUILD_IMAGE = "quay.io/pypa/manylinux_2_28_x86_64"
 DEFAULT_REDIS_DOWNLOAD_URL_TEMPLATE = "https://download.redis.io/releases/redis-{version}.tar.gz"
 DEFAULT_REDIS_VERSION = "7.2.5"
@@ -121,11 +106,6 @@ PROFILE_ID_TO_TRANSPORT_BACKEND = {
     profile_id: transport_backend
     for transport_backend, profile_id in script_utils.TRANSPORT_PROFILE_IDS.items()
 }
-DEFAULT_RATHER_NO_GIT_SUBMODULE_CONFIG_RELPATH = Path(
-    "setup_and_pack/rather_no_git_submodule.yaml"
-)
-
-
 def main() -> int:
     script_utils.reset_stage_summary()
     try:
@@ -933,125 +913,13 @@ def _git_stage_ci_source_tree(*, repo_root: Path, stage_root: Path) -> list[str]
     return selected
 
 
-def _collect_git_listed_source_relpaths(
-    *,
-    repo_root: Path,
-    git_root: Path,
-    rel_prefix: str = "",
-) -> list[str]:
-    script_utils.require_cmd("git")
-    argv = [
-        "git",
-        "ls-files",
-        "--cached",
-        "--others",
-        "--exclude-standard",
-        "-z",
-    ]
-    raw = subprocess.check_output(argv, cwd=str(git_root))
-    selected: list[str] = []
-    rel_prefix = rel_prefix.strip("/")
-    for entry in raw.split(b"\0"):
-        if not entry:
-            continue
-        rel = entry.decode("utf-8").strip()
-        if not rel:
-            continue
-        repo_rel = rel if not rel_prefix else f"{rel_prefix}/{rel}"
-        if _ci_source_relpath_excluded(repo_rel):
-            continue
-        src_path = (repo_root / repo_rel).resolve()
-        if not src_path.exists():
-            continue
-        selected.append(repo_rel)
-    return selected
-
-
-def _load_rather_no_git_submodule_source_roots(
-    *,
-    repo_root: Path,
-) -> tuple[tuple[str, Path], ...]:
-    config_path = (repo_root / DEFAULT_RATHER_NO_GIT_SUBMODULE_CONFIG_RELPATH).resolve()
-    if not config_path.exists():
-        return ()
-    raw_cfg = _load_yaml_file(config_path)
-    if raw_cfg is None:
-        return ()
-    if not isinstance(raw_cfg, dict):
-        raise RuntimeError(
-            "rather_no_git_submodule config must be a YAML mapping: "
-            f"{config_path}"
-        )
-    raw_modules = raw_cfg.get("modules")
-    if raw_modules is None:
-        return ()
-    if not isinstance(raw_modules, list):
-        raise RuntimeError(
-            "rather_no_git_submodule config `modules` must be a list: "
-            f"{config_path}"
-        )
-
-    repo_root = repo_root.resolve()
-    selected: list[tuple[str, Path]] = []
-    seen_relpaths: set[str] = set()
-    for index, raw_item in enumerate(raw_modules):
-        if not isinstance(raw_item, dict):
-            raise RuntimeError(
-                "rather_no_git_submodule config entries must be mappings: "
-                f"{config_path} modules[{index}]"
-            )
-        raw_path = raw_item.get("path")
-        if not isinstance(raw_path, str) or not raw_path.strip():
-            raise RuntimeError(
-                "rather_no_git_submodule config path must be a non-empty string: "
-                f"{config_path} modules[{index}].path"
-            )
-        rel_path = Path(raw_path.strip())
-        if rel_path.is_absolute() or ".." in rel_path.parts:
-            raise RuntimeError(
-                "rather_no_git_submodule config path must stay within the repo root: "
-                f"{config_path} modules[{index}].path={raw_path!r}"
-            )
-        relpath = rel_path.as_posix()
-        if relpath in seen_relpaths:
-            continue
-        seen_relpaths.add(relpath)
-        module_root = (repo_root / rel_path).resolve()
-        if module_root != repo_root and repo_root not in module_root.parents:
-            raise RuntimeError(
-                "rather_no_git_submodule config path escapes the repo root: "
-                f"{config_path} modules[{index}].path={raw_path!r}"
-            )
-        if not module_root.is_dir():
-            raise RuntimeError(
-                "CI source pack requires configured rather_no_git_submodule path to exist as a directory: "
-                f"path={relpath} resolved={module_root}"
-            )
-        selected.append((relpath, module_root))
-    return tuple(selected)
-
-
 def _collect_ci_source_relpaths(*, repo_root: Path) -> list[str]:
-    repo_root = repo_root.resolve()
-    selected = set(
-        _collect_git_listed_source_relpaths(
-            repo_root=repo_root,
-            git_root=repo_root,
+    return list(
+        collect_source_profile_relpaths(
+            repo_root=repo_root.resolve(),
+            profile=SOURCE_SELECTION_PROFILE_SOURCE_PACK,
         )
     )
-    for relpath, module_root in _load_rather_no_git_submodule_source_roots(
-        repo_root=repo_root
-    ):
-        selected.update(
-            _collect_git_listed_source_relpaths(
-                repo_root=repo_root,
-                git_root=module_root,
-                rel_prefix=relpath,
-            )
-        )
-    if not selected:
-        raise RuntimeError("git-based CI source selection produced no files")
-    return sorted(selected)
 
 
 def _compute_ci_source_digest(*, repo_root: Path) -> str:
@@ -1060,18 +928,17 @@ def _compute_ci_source_digest(*, repo_root: Path) -> str:
         relative_to=repo_root,
         mode=script_utils.PathDigestMode.PACK_INPUTS,
         algorithm=script_utils.PathHashAlgorithm.SHA256,
-        ignored_dir_names=CI_SOURCE_DIGEST_IGNORED_DIR_NAMES,
-        ignored_file_names=CI_SOURCE_DIGEST_IGNORED_FILE_NAMES,
-        ignored_file_suffixes=CI_SOURCE_DIGEST_IGNORED_FILE_SUFFIXES,
+        ignored_dir_names=(),
+        ignored_file_names=(),
+        ignored_file_suffixes=(),
     )
 
 
 def _ci_source_relpath_excluded(relpath: str) -> bool:
-    if relpath in CI_SOURCE_STAGE_EXCLUDE_NAMES:
-        return True
-    if _relpath_matches_exclude_patterns(relpath, CI_SOURCE_COMMON_EXCLUDE_REL_PATHS):
-        return True
-    return any(relpath == prefix.rstrip("/") or relpath.startswith(prefix) for prefix in CI_SOURCE_STAGE_EXCLUDE_PREFIXES)
+    return source_profile_relpath_excluded(
+        profile=SOURCE_SELECTION_PROFILE_SOURCE_PACK,
+        relpath=relpath,
+    )
 
 
 def _relpath_matches_exclude_patterns(relpath: str, patterns: tuple[str, ...]) -> bool:
@@ -1127,8 +994,8 @@ def _pack_ci_ext_rsc(*, repo_root: Path, out_path: Path) -> None:
                         src=src,
                         dst=packed_stage_root / rel_name,
                         honor_gitignore=False,
+                        exclude_rel_paths=PACKED_RUNTIME_EXCLUDE_REL_PATHS,
                     )
-                _prune_stage_paths(packed_stage_root, PACKED_RUNTIME_EXCLUDE_REL_PATHS)
                 script_utils.tar_gz(
                     cwd=stage_root,
                     out_path=out_path,
@@ -1165,7 +1032,7 @@ def _stage_repo_test_rsc_tree(*, repo_test_rsc_root: Path, out_dir: Path) -> Non
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
-    _prune_stage_paths(out_dir, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
+    script_utils.prune_stage_paths(out_dir, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
 
 
 def _release_shared_baselines_root(*, release_dir: Path) -> Path:
@@ -1196,7 +1063,7 @@ def _stage_release_shared_baselines_into_root(*, release_dir: Path, prepared_roo
     if baselines_dst.exists():
         raise RuntimeError(f"prepared test_rsc baselines path already exists before release authority stage: {baselines_dst}")
     shutil.copytree(shared_baselines_root, baselines_dst, dirs_exist_ok=False)
-    _prune_stage_paths(baselines_dst, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
+    script_utils.prune_stage_paths(baselines_dst, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
 
 
 def _stage_canonical_profile_prepared_resources_into_root(*, profile_id: str, prepared_root: Path) -> None:
@@ -1223,7 +1090,7 @@ def _stage_canonical_profile_prepared_resources_into_root(*, profile_id: str, pr
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
-        _prune_stage_paths(dst, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
+        script_utils.prune_stage_paths(dst, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
 
 
 def _stage_prepared_test_rsc(*, prepared_root: Path, out_dir: Path) -> None:
@@ -1237,7 +1104,7 @@ def _stage_prepared_test_rsc(*, prepared_root: Path, out_dir: Path) -> None:
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
-    _prune_stage_paths(out_dir, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
+    script_utils.prune_stage_paths(out_dir, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
 
 
 def _prepare_baselines_into_root(
@@ -1266,7 +1133,7 @@ def _prepare_baselines_into_root(
             dir_source=dir_source,
             archive_source=archive_source,
         )
-    _prune_stage_paths(prepared_root, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
+    script_utils.prune_stage_paths(prepared_root, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
 
 
 def _prepare_configured_test_rsc_resources_into_root(
@@ -1293,7 +1160,7 @@ def _prepare_configured_test_rsc_resources_into_root(
             scratch_root=scratch_root,
             mooncake_cfg=mooncake_cfg_raw,
         )
-    _prune_stage_paths(prepared_root, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
+    script_utils.prune_stage_paths(prepared_root, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
 
 
 def _prepare_python_runtime_wheelhouse_into_root(
@@ -1803,7 +1670,7 @@ def _sync_prepared_baselines_into_release_tree(*, prepared_root: Path, release_d
     release_shared_baselines_root.parent.mkdir(parents=True, exist_ok=True)
     _remove_path(release_shared_baselines_root)
     shutil.copytree(prepared_baselines_root, release_shared_baselines_root, dirs_exist_ok=False)
-    _prune_stage_paths(release_shared_baselines_root, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
+    script_utils.prune_stage_paths(release_shared_baselines_root, TEST_RSC_REPO_TREE_EXCLUDE_REL_PATHS)
 
 
 def _extract_bundle_archive(*, archive_path: Path, out_dir: Path, expected_root_name: str) -> None:
@@ -1829,62 +1696,6 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
         return
     path.unlink()
-
-
-def _rsync_stage_filtered(
-    *,
-    repo_root: Path,
-    src: Path,
-    dst: Path,
-    honor_gitignore: bool,
-    exclude_rel_paths: tuple[str, ...] = (),
-) -> None:
-    if not exclude_rel_paths:
-        script_utils.rsync_stage(
-            repo_root=repo_root,
-            src=src,
-            dst=dst,
-            honor_gitignore=honor_gitignore,
-        )
-        return
-
-    if not src.exists():
-        raise RuntimeError(f"missing required source path for staging: {src}")
-    if dst.exists():
-        raise RuntimeError(f"staging destination already exists (no overwrite): {dst}")
-    if shutil.which("rsync") is None:
-        raise RuntimeError("rsync is required for filtered staging, but was not found in PATH")
-
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    argv = ["rsync", "-a"]
-    if honor_gitignore:
-        argv += [
-            "--exclude=.git/",
-            "--exclude-from=.gitignore",
-            "--filter=:- .gitignore",
-        ]
-    for pattern in exclude_rel_paths:
-        argv.append(f"--exclude={pattern}")
-    if src.is_dir():
-        argv += [str(src) + "/", str(dst) + "/"]
-    else:
-        argv += [str(src), str(dst)]
-    subprocess.check_call(argv, cwd=str(repo_root))
-
-
-def _prune_stage_paths(stage_root: Path, exclude_rel_paths: tuple[str, ...]) -> None:
-    if not stage_root.exists():
-        return
-    for path in sorted(stage_root.rglob("*"), reverse=True):
-        rel_path = path.relative_to(stage_root).as_posix()
-        for pattern in exclude_rel_paths:
-            normalized_pattern = pattern.rstrip("/")
-            if fnmatch.fnmatch(rel_path, normalized_pattern) or fnmatch.fnmatch(path.name, normalized_pattern):
-                if path.is_dir():
-                    shutil.rmtree(path)
-                else:
-                    path.unlink(missing_ok=True)
-                break
 
 
 def _test_rsc_manifest_file_list(*, out_dir: Path, prepared_root: Path) -> list[Path]:

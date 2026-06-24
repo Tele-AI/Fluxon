@@ -1407,20 +1407,23 @@ impl FluxonFsAgent {
             .get_self_info()
             .id
             .to_string();
-        let shared_file_path = if self.kv_framework.is_external_mode() {
+        let cache_root_base = if self.kv_framework.is_external_mode() {
             self.kv_framework
                 .external_client_api_view()
                 .external_client_api()
                 .inner()
-                .shared_file_path()
+                .large_file_paths()
+                .fs_disk_cache_base_dir()
+                .map_err(|err| format!("invalid external large_file_paths: {}", err))?
         } else {
             self.kv_framework
                 .client_seg_pool_view()
                 .client_seg_pool()
-                .shared_file_path()
-                .to_string()
+                .large_file_paths()
+                .fs_disk_cache_base_dir()
+                .map_err(|err| format!("invalid owner large_file_paths: {}", err))?
         };
-        let cache_root = resolve_disk_cache_root(Path::new(&shared_file_path), &instance_key);
+        let cache_root = resolve_disk_cache_root(cache_root_base.as_path(), &instance_key);
         let cache =
             RemoteDiskCacheManager::new(cache_root.clone(), disk_cache_max_bytes_from_env())
                 .map_err(|err| {

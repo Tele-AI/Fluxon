@@ -16,8 +16,7 @@ ETCD_ENDPOINT = "127.0.0.1:2379"
 GREPTIME_HTTP_PORT = 34030
 GREPTIME_BASE_URL = f"http://127.0.0.1:{GREPTIME_HTTP_PORT}"
 CLUSTER_NAME = "demo-fs-cluster"
-SHARED_MEMORY_PATH = Path("/dev/shm/fluxon_fs_demo").resolve()
-SHARED_FILE_PATH = Path("/tmp/fluxon_fs_demo/shared").resolve()
+SHARE_MEM_PATH = Path("/dev/shm/fluxon_fs_demo").resolve()
 WORKDIR = Path("/tmp/fluxon_fs_demo/runtime").resolve()
 REMOTE_ROOT_DIR = Path("/tmp/fluxon_fs_demo/remote_root").resolve()
 KV_MASTER_PORT = 34100
@@ -38,11 +37,14 @@ TRANSFER_STATE_STORE_KEY_PREFIX = f"/fluxon_fs_transfer/{CLUSTER_NAME}/"
 FS_MASTER_ACCESS_DB_PATH = (WORKDIR / "fs_master" / "access.db").resolve()
 
 
+def build_owner_large_file_paths() -> list[str]:
+    return [str((WORKDIR / "large" / "owner").resolve())]
+
+
 def main() -> None:
     args = parse_args()
     WORKDIR.mkdir(parents=True, exist_ok=True)
     REMOTE_ROOT_DIR.mkdir(parents=True, exist_ok=True)
-    SHARED_FILE_PATH.mkdir(parents=True, exist_ok=True)
 
     log_dir = (WORKDIR / "log").resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -113,8 +115,7 @@ def main() -> None:
     )
 
     print(f"[fluxon_fs] cluster name: {CLUSTER_NAME}")
-    print(f"[fluxon_fs] shared memory path: {SHARED_MEMORY_PATH}")
-    print(f"[fluxon_fs] shared file path: {SHARED_FILE_PATH}")
+    print(f"[fluxon_fs] share_mem_path: {SHARE_MEM_PATH}")
     print(f"[fluxon_fs] remote root dir: {REMOTE_ROOT_DIR}")
     print(f"[fluxon_fs] export name: {EXPORT_NAME}")
     print(f"[fluxon_fs] owner instance key: {OWNER_INSTANCE_KEY}")
@@ -195,9 +196,9 @@ def build_owner_config() -> dict:
         "fluxonkv_spec": {
             "etcd_addresses": [ETCD_ENDPOINT],
             "cluster_name": CLUSTER_NAME,
-            "shared_memory_path": str(SHARED_MEMORY_PATH),
-            "shared_file_path": str(SHARED_FILE_PATH),
+            "share_mem_path": str(SHARE_MEM_PATH),
             "sub_cluster": "default",
+            "large_file_paths": build_owner_large_file_paths(),
         },
     }
 
@@ -208,8 +209,7 @@ def build_fs_master_config() -> dict:
             "instance_key": FS_MASTER_INSTANCE_KEY,
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
-                "shared_memory_path": str(SHARED_MEMORY_PATH),
-                "shared_file_path": str(SHARED_FILE_PATH),
+                "share_mem_path": str(SHARE_MEM_PATH),
             },
         },
         "fluxon_fs": {
@@ -268,8 +268,7 @@ def build_fs_agent_config() -> dict:
             "instance_key": FS_AGENT_INSTANCE_KEY,
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
-                "shared_memory_path": str(SHARED_MEMORY_PATH),
-                "shared_file_path": str(SHARED_FILE_PATH),
+                "share_mem_path": str(SHARE_MEM_PATH),
             },
         },
         "fluxon_fs": {

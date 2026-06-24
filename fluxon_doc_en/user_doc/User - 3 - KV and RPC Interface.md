@@ -47,8 +47,7 @@ ETCD_ENDPOINT = "127.0.0.1:2379"
 GREPTIME_HTTP_PORT = 34030
 GREPTIME_BASE_URL = f"http://127.0.0.1:{GREPTIME_HTTP_PORT}"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARED_MEMORY_PATH = Path("/dev/shm/fluxon_kv_demo").resolve()
-SHARED_FILE_PATH = Path("/tmp/fluxon_kv_demo/shared").resolve()
+SHARE_MEM_PATH = Path("/dev/shm/fluxon_kv_demo").resolve()
 WORKDIR = Path("/tmp/fluxon_kv_demo/runtime").resolve()
 MASTER_PORT = 31000
 MASTER_UI_PORT = 18080
@@ -59,7 +58,6 @@ OWNER_DRAM_BYTES = 1073741824
 
 def main() -> None:
     args = parse_args()
-    SHARED_FILE_PATH.mkdir(parents=True, exist_ok=True)
     log_dir = (WORKDIR / "log").resolve()
 
     if args.with_master:
@@ -84,8 +82,7 @@ def main() -> None:
         children.append(ManagedSubprocess(label="master", proc=master_proc))
     children.append(ManagedSubprocess(label="owner", proc=owner_proc))
 
-    print(f"[fluxon_kv] shared memory path: {SHARED_MEMORY_PATH}")
-    print(f"[fluxon_kv] shared file path: {SHARED_FILE_PATH}")
+    print(f"[fluxon_kv] share_mem_path: {SHARE_MEM_PATH}")
     print(f"[fluxon_kv] etcd endpoint: {ETCD_ENDPOINT}")
     print(f"[fluxon_kv] greptime base url: {GREPTIME_BASE_URL}")
     print(f"[fluxon_kv] start master in this script: {args.with_master}")
@@ -145,9 +142,9 @@ def build_owner_config() -> dict:
         "fluxonkv_spec": {
             "etcd_addresses": [ETCD_ENDPOINT],
             "cluster_name": CLUSTER_NAME,
-            "shared_memory_path": str(SHARED_MEMORY_PATH),
-            "shared_file_path": str(SHARED_FILE_PATH),
+            "share_mem_path": str(SHARE_MEM_PATH),
             "sub_cluster": "default",
+            "large_file_paths": [str((WORKDIR / "large" / "owner").resolve())],
         },
     }
 
@@ -186,6 +183,7 @@ close()
 - `FluxonKvClientConfig`: config object, usually built from a Python dict
 - `new_store(config: FluxonKvClientConfig) -> Result[KvClient, ApiError]`: create one KV client
 - `KvClient`: single entrypoint for both KV and RPC
+- `KvClient.third_party_logs_dir() -> Result[str, ApiError]`: return the Fluxon-assigned log root for third-party Python components. Components should derive their own subdirectories under this root, for example `mq/`.
 - `MemHolder`: successful result holder from `get_blocking(...)`
 - `PutOptionalArgs`: optional write controls, most commonly `lease_id`
 
@@ -212,8 +210,7 @@ from fluxon_py import FluxonKvClientConfig, new_store
 
 INSTANCE_KEY = "demo_kv_external"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARED_MEMORY_PATH = "/dev/shm/fluxon_kv_demo"
-SHARED_FILE_PATH = "/tmp/fluxon_kv_demo/shared"
+SHARE_MEM_PATH = "/dev/shm/fluxon_kv_demo"
 
 
 def main() -> None:
@@ -222,8 +219,7 @@ def main() -> None:
             "instance_key": INSTANCE_KEY,
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
-                "shared_memory_path": SHARED_MEMORY_PATH,
-                "shared_file_path": SHARED_FILE_PATH,
+                "share_mem_path": SHARE_MEM_PATH,
             },
             "test_spec_config": {
                 "disable_observability": True,
@@ -265,12 +261,15 @@ Useful calls:
 - `get_size(key)`: query payload size without reading the whole object
 - `is_exist(key)`: existence check
 - `remove(key)`: delete a key
+- `third_party_logs_dir()`: return `{large_file_paths[0]}/{cluster_name}_cluster_third_party_logs` as a `Result[str, ApiError]`
 
 To increase user-process logs:
 
 ```bash
 FLUXON_LOG=DEBUG python3 examples/external_put_get_del.py
 ```
+
+Third-party Python components should place file logs under `store.third_party_logs_dir().unwrap(...)` and then append a component subdirectory such as `mq/`. This keeps log directory usage bounded and lets the Fluxon observability plane discover and collect those file logs through one owner-derived root.
 
 ### Minimal Node-to-Node RPC Example
 
@@ -287,8 +286,7 @@ from fluxon_py import FluxonKvClientConfig, new_store
 RPC_SERVER_INSTANCE_KEY = "demo_rpc_server"
 RPC_CLIENT_INSTANCE_KEY = "demo_rpc_client"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARED_MEMORY_PATH = "/dev/shm/fluxon_kv_demo"
-SHARED_FILE_PATH = "/tmp/fluxon_kv_demo/shared"
+SHARE_MEM_PATH = "/dev/shm/fluxon_kv_demo"
 
 
 def _build_config(*, instance_key: str) -> FluxonKvClientConfig:
@@ -297,8 +295,7 @@ def _build_config(*, instance_key: str) -> FluxonKvClientConfig:
             "instance_key": instance_key,
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
-                "shared_memory_path": SHARED_MEMORY_PATH,
-                "shared_file_path": SHARED_FILE_PATH,
+                "share_mem_path": SHARE_MEM_PATH,
             },
             "test_spec_config": {
                 "disable_observability": True,
@@ -358,8 +355,7 @@ instance_key: my-kv-client-1
 
 fluxonkv_spec:
   cluster_name: demo-kv-cluster
-  shared_memory_path: /dev/shm/fluxon
-  shared_file_path: /var/lib/fluxon/shared
+  share_mem_path: /dev/shm/fluxon
   p2p_listen_port: 31001
 ```
 
@@ -376,16 +372,15 @@ fluxonkv_spec:
   etcd_addresses:
     - 127.0.0.1:2379
   cluster_name: demo-kv-cluster
-  shared_memory_path: /dev/shm/fluxon
-  shared_file_path: /var/lib/fluxon/shared
+  share_mem_path: /dev/shm/fluxon
   p2p_listen_port: 31000
   sub_cluster: default
 ```
 
-Keep these authorities separate:
+Keep these roots separate:
 
-- `shared_memory_path`: shared-memory / mmap authority
-- `shared_file_path`: shared-file authority for `shared.json`, logs, and profiles
+- `share_mem_path`: shared bundle root. Runtime appends `cluster_name`, and that directory holds `mmap.file`, `shared.json`, and peer metadata.
+- `large_file_paths`: owner-only large-file authority for logs, profiles, caches, and other derived runtime assets
 - `FLUXON_LOG`: console log threshold for the user process
 
-In zero-contribution external mode, owner-only fields such as `fluxonkv_spec.etcd_addresses`, `fluxonkv_spec.sub_cluster`, and `fluxonkv_spec.redis_compat` should not appear.
+In zero-contribution external mode, owner-only fields such as `fluxonkv_spec.etcd_addresses`, `fluxonkv_spec.sub_cluster`, `fluxonkv_spec.large_file_paths`, and `fluxonkv_spec.redis_compat` should not appear.

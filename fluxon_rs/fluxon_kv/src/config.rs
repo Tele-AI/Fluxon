@@ -379,6 +379,34 @@ fn cluster_scoped_shared_path(root: &str, cluster_name: &str) -> KvResult<String
     Ok(scoped.to_string_lossy().into_owned())
 }
 
+fn verify_non_empty_root_path(root: &str, field_name: &str) -> KvResult<String> {
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: format!("{field_name} cannot be empty"),
+        }
+        .into_kverror());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn verify_non_empty_root_path_list(paths: &[String], field_name: &str) -> KvResult<Vec<String>> {
+    if paths.is_empty() {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: format!("{field_name} must contain at least one path"),
+        }
+        .into_kverror());
+    }
+    let mut out = Vec::with_capacity(paths.len());
+    for (idx, root) in paths.iter().enumerate() {
+        out.push(verify_non_empty_root_path(
+            root,
+            &format!("{field_name}[{idx}]"),
+        )?);
+    }
+    Ok(out)
+}
+
 fn resolve_compiled_rdma_transfer_engine() -> KvResult<TransferEngineType> {
     Ok(TransferEngineType::Closed)
 }
@@ -549,8 +577,9 @@ pub struct FluxonKvSpecYaml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etcd_addresses: Option<YamlNullable<Vec<String>>>,
     pub cluster_name: String,
-    pub shared_memory_path: String,
-    pub shared_file_path: String,
+    pub share_mem_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub large_file_paths: Option<LargeFilePathsYaml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p2p_listen_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -558,6 +587,10 @@ pub struct FluxonKvSpecYaml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub_cluster: Option<YamlNullable<String>>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct LargeFilePathsYaml(pub Vec<String>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -608,6 +641,81 @@ pub struct FluxonKvSpec {
     pub sub_cluster: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct LargeFilePaths {
+    pub paths: Vec<String>,
+}
+
+impl LargeFilePaths {
+    fn require_configured_paths(&self) -> KvResult<()> {
+        if self.paths.is_empty() {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "large_file_paths must contain at least one path".to_string(),
+            }
+            .into_kverror());
+        }
+        Ok(())
+    }
+
+    fn resolve_preferred_root_subdir(
+        &self,
+        relative_dir: &Path,
+        target_name: &str,
+    ) -> KvResult<PathBuf> {
+        self.require_configured_paths()?;
+        let mut errors = Vec::new();
+        for root in &self.paths {
+            let candidate = Path::new(root).join(relative_dir);
+            match fs::create_dir_all(&candidate) {
+                Ok(()) => return Ok(candidate),
+                Err(err) => errors.push(format!("{} ({})", candidate.display(), err)),
+            }
+        }
+        Err(ConfigError::InvalidClientConfig {
+            detail: format!(
+                "large_file_paths contains no usable root for {}; tried: {}",
+                target_name,
+                errors.join(", ")
+            ),
+        }
+        .into_kverror())
+    }
+
+    pub fn kv_logs_dir(&self, cluster_name: &str) -> KvResult<PathBuf> {
+        let relative_dir = PathBuf::from(format!("{cluster_name}_cluster_kv_logs"));
+        self.resolve_preferred_root_subdir(&relative_dir, "kv logs")
+    }
+
+    pub fn third_party_logs_dir(&self, cluster_name: &str) -> KvResult<PathBuf> {
+        let relative_dir = PathBuf::from(format!("{cluster_name}_cluster_third_party_logs"));
+        self.resolve_preferred_root_subdir(&relative_dir, "third-party logs")
+    }
+
+    pub fn kv_profiles_dir(&self, cluster_name: &str) -> KvResult<PathBuf> {
+        let relative_dir = PathBuf::from(format!("{cluster_name}_cluster_kv_profiles"));
+        self.resolve_preferred_root_subdir(&relative_dir, "kv profiles")
+    }
+
+    pub fn side_transfer_runtime_dir(
+        &self,
+        cluster_name: &str,
+        instance_key: &str,
+    ) -> KvResult<PathBuf> {
+        let relative_dir = PathBuf::from(format!(
+            "{cluster_name}_cluster_kv_logs/side_transfer_runtime/{instance_key}"
+        ));
+        self.resolve_preferred_root_subdir(&relative_dir, "side-transfer runtime")
+    }
+
+    pub fn fs_disk_cache_base_dir(&self) -> KvResult<PathBuf> {
+        self.resolve_preferred_root_subdir(
+            Path::new("fluxon_fs_disk_cache"),
+            "fluxon fs disk cache",
+        )
+    }
+}
+
 /// KV client backend types supported by the system
 #[derive(Debug, Clone, PartialEq)]
 pub enum KvClientType {
@@ -625,8 +733,8 @@ pub struct ClientConfig {
     pub pprof_duration_seconds: Option<u64>,
     pub redis_compat_listen_addr: Option<std::net::SocketAddr>,
     pub fluxonkv_spec: FluxonKvSpec,
-    pub shared_memory_path: String, // Mandatory shared memory path
-    pub shared_file_path: String,   // Mandatory shared file path
+    pub share_mem_path: String, // Mandatory shared bundle path
+    pub large_file_paths: LargeFilePaths, // Mandatory large-file roots for logs and caches
     pub test_spec_config: TestSpecConfig,
 }
 
@@ -893,7 +1001,7 @@ impl ClientConfigYaml {
             .into_kverror());
         }
 
-        // External (zero-contribution) mode forbids additional knobs to keep the schema minimal.
+        // External (zero-contribution) mode forbids additional owner-derived knobs to keep the schema minimal.
         if is_external {
             if self.fluxonkv_spec.redis_compat.is_some() {
                 return Err(ConfigError::InvalidClientConfig {
@@ -911,6 +1019,12 @@ impl ClientConfigYaml {
             if self.fluxonkv_spec.etcd_addresses.is_some() {
                 return Err(ConfigError::InvalidClientConfig {
                     detail: "fluxonkv_spec.etcd_addresses is forbidden in zero-contribution mode (it is bootstrapped from owner shared.json)".to_string(),
+                }
+                .into_kverror());
+            }
+            if self.fluxonkv_spec.large_file_paths.is_some() {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode (it is inherited from owner shared.json)".to_string(),
                 }
                 .into_kverror());
             }
@@ -1040,29 +1154,36 @@ impl ClientConfigYaml {
             }
         }
 
-        // Validate shared_memory_path (mandatory and non-empty)
-        if self.fluxonkv_spec.shared_memory_path.trim().is_empty() {
+        // Validate share_mem_path (mandatory and non-empty)
+        if self.fluxonkv_spec.share_mem_path.trim().is_empty() {
             return Err(ConfigError::InvalidInstanceKey {
-                key: "shared_memory_path cannot be empty".to_string(),
+                key: "share_mem_path cannot be empty".to_string(),
             }
             .into_kverror());
         }
-        if self.fluxonkv_spec.shared_file_path.trim().is_empty() {
-            return Err(ConfigError::InvalidInstanceKey {
-                key: "shared_file_path cannot be empty".to_string(),
+        // Owner mode always needs explicit ordered large-file roots.
+        // The listen port stays optional at this contract layer: deterministic
+        // callers may pin it, while shared testbed owners can leave it unset
+        // and let the runtime bind a free port.
+        let large_file_paths = if is_external {
+            LargeFilePaths { paths: Vec::new() }
+        } else {
+            let Some(large_file_paths_yaml) = self.fluxonkv_spec.large_file_paths.as_ref() else {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "fluxonkv_spec.large_file_paths is required for owner mode"
+                        .to_string(),
+                }
+                .into_kverror());
+            };
+            LargeFilePaths {
+                paths: verify_non_empty_root_path_list(&large_file_paths_yaml.0, "large_file_paths")?,
             }
-            .into_kverror());
-        }
+        };
 
-        let shared_memory_path = cluster_scoped_shared_path(
-            &self.fluxonkv_spec.shared_memory_path,
+        let share_mem_path = cluster_scoped_shared_path(
+            &self.fluxonkv_spec.share_mem_path,
             &fluxonkv_spec.cluster_name,
         )?;
-        let shared_file_path = cluster_scoped_shared_path(
-            &self.fluxonkv_spec.shared_file_path,
-            &fluxonkv_spec.cluster_name,
-        )?;
-
         let redis_compat_listen_addr = match self.fluxonkv_spec.redis_compat.as_ref() {
             None | Some(YamlNullable::Null) => None,
             Some(YamlNullable::Value(rc)) => {
@@ -1092,8 +1213,8 @@ impl ClientConfigYaml {
             pprof_duration_seconds,
             redis_compat_listen_addr,
             fluxonkv_spec,
-            shared_memory_path,
-            shared_file_path,
+            share_mem_path,
+            large_file_paths,
             test_spec_config,
         })
     }
@@ -1414,6 +1535,13 @@ impl MasterConfigYaml {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    fn new_test_dir(prefix: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("{}_{}", prefix, Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn cluster_scoped_shared_path_appends_cluster_name() {
@@ -1432,8 +1560,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   disable_observability: true
@@ -1451,11 +1579,7 @@ test_spec_config:
         assert!(verified.test_spec_config.enable_iceoryx_logs);
         assert!(verified.test_spec_config.iceoryx_external_busy_poll);
         assert!(!verified.test_spec_config.iceoryx_owner_client_busy_poll);
-        assert_eq!(verified.shared_memory_path, "/tmp/test_owner/test_cluster");
-        assert_eq!(
-            verified.shared_file_path,
-            "/tmp/test_owner_files/test_cluster"
-        );
+        assert_eq!(verified.share_mem_path, "/tmp/test_owner/test_cluster");
         assert_eq!(
             verified.test_spec_config.transport_mode,
             Some(TestSpecTransportMode::TransferOnly)
@@ -1478,8 +1602,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 "#,
         )
@@ -1493,6 +1617,73 @@ fluxonkv_spec:
     }
 
     #[test]
+    fn client_config_zero_contribution_allows_owner_bootstrapped_large_file_paths() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_external
+fluxonkv_spec:
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_external
+"#,
+        )
+        .unwrap();
+        let verified = cfg.verify().unwrap();
+        assert_eq!(verified.large_file_paths.paths, Vec::<String>::new());
+        assert_eq!(verified.fluxonkv_spec.etcd_addresses, Vec::<String>::new());
+        assert_eq!(verified.fluxonkv_spec.sub_cluster, None);
+    }
+
+    #[test]
+    fn client_config_zero_contribution_rejects_large_file_paths_in_yaml() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_external
+fluxonkv_spec:
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_external
+  large_file_paths: [/tmp/test_external_large]
+"#,
+        )
+        .unwrap();
+        let err = cfg.verify().unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode"));
+    }
+
+    #[test]
+    fn large_file_paths_prefers_first_usable_root() {
+        let tempdir = new_test_dir("fluxon_large_paths_prefers_first_usable_root");
+        let first_root = tempdir.join("first_root");
+        let second_root = tempdir.join("second_root");
+        std::fs::create_dir_all(&second_root).unwrap();
+
+        let large_file_paths = LargeFilePaths {
+            paths: vec![
+                first_root.join("child").to_string_lossy().into_owned(),
+                second_root.to_string_lossy().into_owned(),
+            ],
+        };
+
+        let logs_dir = large_file_paths.kv_logs_dir("test_cluster").unwrap();
+        assert_eq!(
+            logs_dir,
+            first_root.join("child").join("test_cluster_cluster_kv_logs")
+        );
+        assert!(logs_dir.exists());
+
+        let third_party_logs_dir = large_file_paths
+            .third_party_logs_dir("test_cluster")
+            .unwrap();
+        assert_eq!(
+            third_party_logs_dir,
+            first_root
+                .join("child")
+                .join("test_cluster_cluster_third_party_logs")
+        );
+        assert!(third_party_logs_dir.exists());
+    }
+
+    #[test]
     fn client_test_spec_config_accepts_explicit_rdma_device_names() {
         let cfg = ClientConfigYaml::from_str(
             r#"
@@ -1503,8 +1694,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc
@@ -1556,8 +1747,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   rdma_device_names: ["mlx5_0"]
@@ -1591,8 +1782,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc
@@ -1622,8 +1813,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   require_transfer_rpc_fast_path_ready_timeout_seconds: 45
@@ -1647,8 +1838,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   tcp_thread_control_lane_count: 0
@@ -1673,8 +1864,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc
@@ -1704,8 +1895,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc
@@ -1728,8 +1919,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   rdma_device_names: ["mlx5_0"]
@@ -1762,8 +1953,7 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_only
@@ -1782,8 +1972,7 @@ protocol:
   protocol_type: tcp
 fluxonkv_spec:
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_side_worker
-  shared_file_path: /tmp/test_side_worker_files
+  share_mem_path: /tmp/test_side_worker
   p2p_listen_port: 18081
 test_spec_config:
   enable_side_transfer: true
@@ -1794,12 +1983,8 @@ test_spec_config:
         let verified = cfg.verify().unwrap();
         assert_eq!(verified.protocol.protocol_type, ProtocolType::Tcp);
         assert_eq!(
-            verified.shared_memory_path,
+            verified.share_mem_path,
             "/tmp/test_side_worker/test_cluster"
-        );
-        assert_eq!(
-            verified.shared_file_path,
-            "/tmp/test_side_worker_files/test_cluster"
         );
         assert_eq!(
             verified.fluxonkv_spec.transfer_engine,
@@ -1821,8 +2006,7 @@ protocol:
   protocol_type: tcp
 fluxonkv_spec:
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_side_worker
-  shared_file_path: /tmp/test_side_worker_files
+  share_mem_path: /tmp/test_side_worker
 test_spec_config:
   enable_side_transfer: true
   side_transfer_role: worker
@@ -1852,8 +2036,7 @@ protocol:
   protocol_type: tcp
 fluxonkv_spec:
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_side_worker
-  shared_file_path: /tmp/test_side_worker_files
+  share_mem_path: /tmp/test_side_worker
 test_spec_config:
   enable_side_transfer: true
   side_transfer_role: worker
@@ -1881,8 +2064,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   p2p_listen_port: 18081
   sub_cluster: rack-a
 test_spec_config:
@@ -1913,8 +2096,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 "#,
         )
@@ -1938,8 +2121,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
-  shared_memory_path: /tmp/test_owner
-  shared_file_path: /tmp/test_owner_files
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc

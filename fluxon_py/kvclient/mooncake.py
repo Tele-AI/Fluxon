@@ -836,6 +836,12 @@ class MooncakeStore(KvClient):
                 raise InvalidConfigurationError(message=f"etcd endpoint must be raw host:port (no scheme), got: {addr!r}")
         return endpoints
 
+    def third_party_logs_dir(self) -> Result[str, ApiError]:
+        return Result.new_error(
+            GeneralError(
+                message="third_party_logs_dir is only supported by the Fluxon backend"
+            )
+        )
 
     def ensure_zero_contribution_for_channel(self) -> None:
         self._config.ensure_zero_contribution_for_channel()

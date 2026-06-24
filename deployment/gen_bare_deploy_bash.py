@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -25,7 +27,9 @@ from proc_lifecycle_codegen import (  # type: ignore
     StopTimeouts,
     render_bash_proc_lifecycle_funcs_pid_tree,
 )
+from log_shard import render_module_source as render_log_shard_module_source  # type: ignore
 from selection_supervisor_codegen import (  # type: ignore
+    LOG_SHARD_HELPER_FILENAME,
     PYTHON_SELECTION_SUPERVISOR_FILENAME,
     render_python_selection_supervisor_module,
 )
@@ -44,13 +48,36 @@ ATOMIC_GROUP_BACKOFF_MAX_SECONDS = 25
 ATOMIC_GROUP_CRASHLOOP_CONSECUTIVE_RESTARTS = 10
 ATOMIC_GROUP_CRASHLOOP_INTERVAL_LT_SECONDS = 30
 ATOMIC_GROUP_PROBABLE_READY_SECONDS = 10
-STANDALONE_PROBABLE_READY_SECONDS = 3
-STANDALONE_STARTUP_DEADLINE_SECONDS = 60
-ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS = 10 * 60
+STANDALONE_PROBABLE_READY_SECONDS = 10
+STANDALONE_STARTUP_DEADLINE_SECONDS = 20
+ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS = 20
 HOSTWORKDIR_RUNTIME_TOKEN = "${HOSTWORKDIR}"
 REPO_ROOT = SCRIPT_DIR.parent
-TCP_READY_STABLE_SECONDS = 2
-TCP_READY_POLL_INTERVAL_SECONDS = 0.2
+BARE_TEMPLATE_DIR = SCRIPT_DIR / "templates" / "gen_bare_deploy_bash"
+_TEMPLATE_TOKEN_RE = re.compile(r"\{\{([A-Z0-9_]+)\}\}")
+
+
+@lru_cache(maxsize=None)
+def _load_bare_template(*, template_name: str) -> str:
+    template_path = BARE_TEMPLATE_DIR / template_name
+    if not template_path.is_file():
+        raise RuntimeError(f"missing bare deploy template: {template_path}")
+    return template_path.read_text(encoding="utf-8")
+
+
+def _render_bare_template(*, template_name: str, values: Dict[str, str]) -> str:
+    template = _load_bare_template(template_name=template_name)
+
+    def _replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in values:
+            raise RuntimeError(f"missing bare deploy template value: template={template_name} key={key}")
+        value = values[key]
+        if not isinstance(value, str):
+            raise ValueError(f"bare deploy template value must be a string: template={template_name} key={key}")
+        return value
+
+    return _TEMPLATE_TOKEN_RE.sub(_replace, template)
 
 
 def _resolve_repo_root_cli_path(*, raw_path: Path, field_name: str) -> Path:
@@ -88,6 +115,10 @@ def main() -> None:
     _write_script(
         outdir / PYTHON_SELECTION_SUPERVISOR_FILENAME,
         render_python_selection_supervisor_module(timeouts=STOP_TIMEOUTS),
+    )
+    (outdir / LOG_SHARD_HELPER_FILENAME).write_text(
+        render_log_shard_module_source(),
+        encoding="utf-8",
     )
 
     name_prefix = _require_str(cfg.get("name_prefix"), "name_prefix")
@@ -306,12 +337,12 @@ def _bare_entrypoint_script_name(*, workload_name: str) -> str:
 
 
 def _render_bare_entrypoint_script(*, service_name: str, entrypoint: str) -> str:
-    return (
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n\n"
-        f"export SERVICE={_sh_quote(service_name)}\n"
-        + entrypoint.strip()
-        + "\n"
+    return _render_bare_template(
+        template_name="bare_entrypoint.sh.tmpl",
+        values={
+            "SERVICE_EXPORT": _sh_quote(service_name),
+            "ENTRYPOINT": entrypoint.strip(),
+        },
     )
 
 
@@ -353,29 +384,25 @@ def _render_standalone_start_script(
     service_cfg: Dict[str, Any],
 ) -> str:
     allowed_nodes = _extract_nodes(service_cfg)
-    service_port = _extract_port(service_cfg)
-    port_export = ""
-    if service_port is not None:
-        port_export = f"export {service_name.upper()}__PORT={_sh_quote(str(service_port))}\n"
-    return (
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n\n"
-        f"SERVICE={_sh_quote(service_name)}\n"
-        f"NAME_PREFIX={_sh_quote(name_prefix)}\n"
-        + _render_nodes_bash(name="ALLOWED_NODES", nodes=allowed_nodes)
-        + _render_host_prelude(cluster_nodes=cluster_nodes)
-        + _render_common_node_resolution_tail(service_name=service_name)
-        + _render_selection_supervisor_path_from_script_dir()
-        + _render_proc_lifecycle_pid_tree_helpers()
-        + _render_tcp_ready_helpers()
-        + _render_selection_present_probe_fn()
-        + _render_start_lock_block()
-        + _render_global_env_exports(global_envs)
-        + port_export
-        + _render_standalone_start_body(
-            name_prefix=name_prefix,
-            service_name=service_name,
-        )
+    return _render_bare_template(
+        template_name="standalone_start.sh.tmpl",
+        values={
+            "SERVICE_ASSIGN": _sh_quote(service_name),
+            "NAME_PREFIX_ASSIGN": _sh_quote(name_prefix),
+            "ALLOWED_NODES_BLOCK": _render_nodes_bash(name="ALLOWED_NODES", nodes=allowed_nodes),
+            "HOST_PRELUDE": _render_host_prelude(cluster_nodes=cluster_nodes),
+            "COMMON_NODE_RESOLUTION_TAIL": _render_common_node_resolution_tail(service_name=service_name),
+            "SELECTION_SUPERVISOR_PATH_BLOCK": _render_selection_supervisor_path_from_script_dir(),
+            "PROC_LIFECYCLE_HELPERS": _render_proc_lifecycle_pid_tree_helpers(),
+            "SELECTION_PRESENT_PROBE_FN": _render_selection_present_probe_fn(),
+            "START_LOCK_BLOCK": _render_start_lock_block(),
+            "GLOBAL_ENV_EXPORTS": _render_global_env_exports(global_envs),
+            "PORT_EXPORT": _render_service_port_export(service_name=service_name, service_cfg=service_cfg),
+            "START_BODY": _render_standalone_start_body(
+                name_prefix=name_prefix,
+                service_name=service_name,
+            ),
+        },
     )
 
 
@@ -387,25 +414,19 @@ def _render_standalone_stop_script(
     service_cfg: Dict[str, Any],
 ) -> str:
     allowed_nodes = _extract_nodes(service_cfg)
-    return (
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n\n"
-        f"SERVICE={_sh_quote(service_name)}\n"
-        f"NAME_PREFIX={_sh_quote(name_prefix)}\n"
-        + _render_nodes_bash(name="ALLOWED_NODES", nodes=allowed_nodes)
-        + _render_host_prelude(cluster_nodes=cluster_nodes)
-        + _render_common_node_resolution_tail(service_name=service_name)
-        + _render_selection_supervisor_path_from_script_dir()
-        + f'SUPERVISOR_LABEL={_sh_quote(_bare_plain_selection_supervisor_label(name_prefix=name_prefix, service_name=service_name))}\n'
-        + "# English note:\n"
-        + "# - Generated bare stop is retained as a manual operator tool.\n"
-        + "# - Automation must not depend on this path for handover or rollout convergence.\n"
-        + "# - The command only asks the shared selection supervisor to retire the concrete selection\n"
-        + "#   identity identified by label on this node.\n"
-        + 'if ! python3 "$SELECTION_SUPERVISOR" stop --label "$SUPERVISOR_LABEL" --scope-key "$HOSTWORKDIR" --missing-ok >/dev/null; then\n'
-        + '  echo "[bare] stop failed svc=$SERVICE label=$SUPERVISOR_LABEL hostworkdir=$HOSTWORKDIR"\n'
-        + "  exit 1\n"
-        + "fi\n"
+    return _render_bare_template(
+        template_name="standalone_stop.sh.tmpl",
+        values={
+            "SERVICE_ASSIGN": _sh_quote(service_name),
+            "NAME_PREFIX_ASSIGN": _sh_quote(name_prefix),
+            "ALLOWED_NODES_BLOCK": _render_nodes_bash(name="ALLOWED_NODES", nodes=allowed_nodes),
+            "HOST_PRELUDE": _render_host_prelude(cluster_nodes=cluster_nodes),
+            "COMMON_NODE_RESOLUTION_TAIL": _render_common_node_resolution_tail(service_name=service_name),
+            "SELECTION_SUPERVISOR_PATH_BLOCK": _render_selection_supervisor_path_from_script_dir(),
+            "SUPERVISOR_LABEL_ASSIGN": _sh_quote(
+                _bare_plain_selection_supervisor_label(name_prefix=name_prefix, service_name=service_name)
+            ),
+        },
     )
 
 
@@ -429,20 +450,19 @@ def _render_atomic_group_start_script(
                 service_cfg=service_cfg,
             )
         )
-    return (
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n\n"
-        f"GROUP={_sh_quote(group_name)}\n"
-        f"NAME_PREFIX={_sh_quote(name_prefix)}\n"
-        + _render_host_prelude(cluster_nodes=cluster_nodes)
-        + _render_atomic_group_node_resolution_tail(group_cfg["nodes"])
-        + _render_selection_supervisor_path_from_script_dir()
-        + _render_proc_lifecycle_pid_tree_helpers()
-        + _render_tcp_ready_helpers()
-        + _render_global_env_exports(global_envs)
-        + f"GROUP_STARTUP_DEADLINE_TS=$(( $(date +%s) + {ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS} ))\n"
-        + "".join(service_blocks)
-        + 'echo "[atomic-group] ready group=$GROUP node=$NODE_ID"\n'
+    return _render_bare_template(
+        template_name="atomic_group_start.sh.tmpl",
+        values={
+            "GROUP_ASSIGN": _sh_quote(group_name),
+            "NAME_PREFIX_ASSIGN": _sh_quote(name_prefix),
+            "HOST_PRELUDE": _render_host_prelude(cluster_nodes=cluster_nodes),
+            "ATOMIC_GROUP_NODE_RESOLUTION_TAIL": _render_atomic_group_node_resolution_tail(group_cfg["nodes"]),
+            "SELECTION_SUPERVISOR_PATH_BLOCK": _render_selection_supervisor_path_from_script_dir(),
+            "PROC_LIFECYCLE_HELPERS": _render_proc_lifecycle_pid_tree_helpers(),
+            "GLOBAL_ENV_EXPORTS": _render_global_env_exports(global_envs),
+            "GROUP_STARTUP_DEADLINE_ASSIGN": str(ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS),
+            "SERVICE_BLOCKS": "".join(service_blocks),
+        },
     )
 
 
@@ -454,276 +474,105 @@ def _render_atomic_group_stop_script(
     group_cfg: Dict[str, Any],
 ) -> str:
     stop_services = list(reversed(group_cfg["services"]))
-    return (
-        "#!/usr/bin/env bash\n"
-        "set -u -o pipefail\n\n"
-        f"GROUP={_sh_quote(group_name)}\n"
-        f"NAME_PREFIX={_sh_quote(name_prefix)}\n"
-        + _render_host_prelude(cluster_nodes=cluster_nodes)
-        + _render_atomic_group_node_resolution_tail(group_cfg["nodes"])
-        + _render_selection_supervisor_path_from_script_dir()
-        + _render_atomic_group_stop_fn(
-            runtime_specs=[
-                {
-                    "service_name": service_name,
-                    "supervisor_label": _bare_atomic_group_member_selection_supervisor_label(
-                        name_prefix=name_prefix,
-                        group_name=group_name,
-                        service_name=service_name,
-                    ),
-                }
-                for service_name in stop_services
-            ],
-        )
-        + "stop_group\n"
+    return _render_bare_template(
+        template_name="atomic_group_stop.sh.tmpl",
+        values={
+            "GROUP_ASSIGN": _sh_quote(group_name),
+            "NAME_PREFIX_ASSIGN": _sh_quote(name_prefix),
+            "HOST_PRELUDE": _render_host_prelude(cluster_nodes=cluster_nodes),
+            "ATOMIC_GROUP_NODE_RESOLUTION_TAIL": _render_atomic_group_node_resolution_tail(group_cfg["nodes"]),
+            "SELECTION_SUPERVISOR_PATH_BLOCK": _render_selection_supervisor_path_from_script_dir(),
+            "ATOMIC_GROUP_STOP_FN": _render_atomic_group_stop_fn(
+                runtime_specs=[
+                    {
+                        "service_name": service_name,
+                        "supervisor_label": _bare_atomic_group_member_selection_supervisor_label(
+                            name_prefix=name_prefix,
+                            group_name=group_name,
+                            service_name=service_name,
+                        ),
+                    }
+                    for service_name in stop_services
+                ],
+            ),
+        },
     )
 
 
 def _render_host_prelude(*, cluster_nodes: List[Dict[str, Any]]) -> str:
     all_nodes = [_require_str(node.get("hostname"), "cluster_nodes[].hostname") for node in cluster_nodes]
-    out = _render_nodes_bash(name="ALL_NODES", nodes=all_nodes)
-    out += "\nLOCAL_HOSTNAME=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)\n"
-    out += 'LOCAL_FQDN=$(hostname -f 2>/dev/null || echo "$LOCAL_HOSTNAME")\n'
-    out += 'NODE_ID="${NODE_ID:-}"\n'
-    out += 'if [ -n "$NODE_ID" ]; then\n'
-    out += '  _node_id_known=false\n'
-    out += '  for n in "${ALL_NODES[@]}"; do\n'
-    out += '    if [ "$n" = "$NODE_ID" ]; then\n'
-    out += '      _node_id_known=true\n'
-    out += "      break\n"
-    out += "    fi\n"
-    out += "  done\n"
-    out += '  if [ "$_node_id_known" != true ]; then\n'
-    out += '    echo "Unknown preset NODE_ID: $NODE_ID"\n'
-    out += f'    echo "Known nodes: {" ".join(all_nodes)}"\n'
-    out += "    exit 1\n"
-    out += "  fi\n"
-    out += "fi\n"
-    out += 'if [ -z "$NODE_ID" ]; then\n'
-    out += 'for n in "${ALL_NODES[@]}"; do\n'
-    out += '  if [ "$n" = "$LOCAL_HOSTNAME" ] || [ "$n" = "$LOCAL_FQDN" ]; then\n'
-    out += '    NODE_ID="$n"\n'
-    out += "    break\n"
-    out += "  fi\n"
-    out += "done\n"
-    out += "fi\n"
-    out += 'if [ -z "$NODE_ID" ] && [ ${#ALL_NODES[@]} -eq 1 ]; then\n'
-    out += '  NODE_ID="${ALL_NODES[0]}"\n'
-    out += "fi\n"
-    out += 'if [ -z "$NODE_ID" ]; then\n'
-    out += '  for ip in $(hostname -I 2>/dev/null); do\n'
-    out += '    for n in "${ALL_NODES[@]}"; do\n'
-    out += '      _ip_n=""\n'
-    out += '      case "$n" in\n'
-    for node in cluster_nodes:
-        node_name = _require_str(node.get("hostname"), "cluster_nodes[].hostname")
-        node_ip = _require_str(node.get("ip"), f"cluster_nodes[{node_name}].ip")
-        out += f"        {_sh_quote(node_name)}) _ip_n={_sh_quote(node_ip)};;\n"
-    out += '        *) _ip_n="";;\n'
-    out += "      esac\n"
-    out += '      if [ "$_ip_n" = "$ip" ]; then\n'
-    out += '        NODE_ID="$n"\n'
-    out += "        break\n"
-    out += "      fi\n"
-    out += "    done\n"
-    out += '    [ -n "$NODE_ID" ] && break\n'
-    out += "  done\n"
-    out += "fi\n"
-    out += 'if [ -z "$NODE_ID" ]; then\n'
-    out += '  echo "Cannot map host to a configured node. Hostname=$LOCAL_HOSTNAME FQDN=$LOCAL_FQDN IPs=$(hostname -I 2>/dev/null)"\n'
-    out += f'  echo "Known nodes: {" ".join(all_nodes)}"\n'
-    out += "  exit 1\n"
-    out += "fi\n\n"
-    out += 'HOST_IP=""\nHOSTWORKDIR=""\ncase "$NODE_ID" in\n'
+    ip_case_lines: list[str] = []
+    host_case_lines: list[str] = []
     for node in cluster_nodes:
         node_name = _require_str(node.get("hostname"), "cluster_nodes[].hostname")
         node_ip = _require_str(node.get("ip"), f"cluster_nodes[{node_name}].ip")
         hostworkdir = _require_str(node.get("hostworkdir"), f"cluster_nodes[{node_name}].hostworkdir")
-        out += f"  {_sh_quote(node_name)}) HOST_IP={_sh_quote(node_ip)}; HOSTWORKDIR={_sh_quote(hostworkdir)};;\n"
-    out += '  *) echo "Unknown NODE_ID: $NODE_ID"; exit 1;;\n'
-    out += "esac\n"
-    return out
+        ip_case_lines.append(f"        {_sh_quote(node_name)}) _ip_n={_sh_quote(node_ip)};;")
+        host_case_lines.append(
+            f"  {_sh_quote(node_name)}) HOST_IP={_sh_quote(node_ip)}; HOSTWORKDIR={_sh_quote(hostworkdir)};;"
+        )
+    return _render_bare_template(
+        template_name="host_prelude.sh.tmpl",
+        values={
+            "ALL_NODES_BLOCK": _render_nodes_bash(name="ALL_NODES", nodes=all_nodes),
+            "KNOWN_NODES": " ".join(all_nodes),
+            "IP_CASE_LINES": "\n".join(ip_case_lines),
+            "HOST_CASE_LINES": "\n".join(host_case_lines),
+        },
+    )
 
 
 def _render_common_node_resolution_tail(*, service_name: str) -> str:
-    return (
-        'if [ ${#ALLOWED_NODES[@]} -gt 0 ]; then\n'
-        + '  _ok=false\n'
-        + '  for n in "${ALLOWED_NODES[@]}"; do\n'
-        + '    if [ "$n" = "$NODE_ID" ]; then _ok=true; fi\n'
-        + "  done\n"
-        + '  if [ "$_ok" != true ]; then\n'
-        + f'    echo "Service {service_name} not scheduled on this node ($NODE_ID). Allowed: ${{ALLOWED_NODES[*]}}"\n'
-        + "    exit 0\n"
-        + "  fi\n"
-        + "fi\n\n"
-        + 'export NODE_ID="$NODE_ID"\n'
-        + 'export HOST_IP="$HOST_IP"\n'
-        + 'export HOSTWORKDIR="$HOSTWORKDIR"\n\n'
+    return _render_bare_template(
+        template_name="common_node_resolution_tail.sh.tmpl",
+        values={"SERVICE_NAME": service_name},
     )
 
 
 def _render_atomic_group_node_resolution_tail(allowed_nodes: List[str]) -> str:
-    return (
-        _render_nodes_bash(name="GROUP_NODES", nodes=allowed_nodes)
-        + 'scheduled=false\n'
-        + 'for n in "${GROUP_NODES[@]}"; do\n'
-        + '  if [ "$n" = "$NODE_ID" ]; then scheduled=true; fi\n'
-        + "done\n"
-        + 'if [ "$scheduled" != true ]; then\n'
-        + '  echo "[atomic-group] skip group=$GROUP node=$NODE_ID allowed=${GROUP_NODES[*]}"\n'
-        + "  exit 0\n"
-        + "fi\n\n"
-        + 'export NODE_ID="$NODE_ID"\n'
-        + 'export HOST_IP="$HOST_IP"\n'
-        + 'export HOSTWORKDIR="$HOSTWORKDIR"\n'
-        + 'echo "[atomic-group] group=$GROUP node=$NODE_ID hostworkdir=$HOSTWORKDIR"\n\n'
+    return _render_bare_template(
+        template_name="atomic_group_node_resolution_tail.sh.tmpl",
+        values={"GROUP_NODES_BLOCK": _render_nodes_bash(name="GROUP_NODES", nodes=allowed_nodes)},
     )
 
 
 def _render_start_lock_block() -> str:
-    return (
-        'PID_DIR="$HOSTWORKDIR/run"\n'
-        + 'mkdir -p "$PID_DIR"\n'
-        + 'START_LOCKFILE="$PID_DIR/${SERVICE}.start.lock"\n'
-        + 'if ! command -v flock >/dev/null 2>&1; then\n'
-        + '  echo "Missing required command: flock"\n'
-        + "  exit 1\n"
-        + "fi\n"
-        + 'exec 9>"$START_LOCKFILE"\n'
-        + 'if ! flock -xn 9; then\n'
-        + '  echo "[bare] start skipped svc=$SERVICE reason=another start is already running lockfile=$START_LOCKFILE"\n'
-        + "  exit 0\n"
-        + "fi\n"
-        + 'exec 9>&-\n\n'
-    )
+    return _load_bare_template(template_name="start_lock_block.sh.tmpl")
 
 
 def _render_proc_lifecycle_pid_tree_helpers() -> str:
     return render_bash_proc_lifecycle_funcs_pid_tree(timeouts=STOP_TIMEOUTS) + "\n\n"
 
 
-def _render_tcp_ready_helpers() -> str:
-    return (
-        "wait_service_tcp_ready() {\n"
-        + '  svc="$1"\n'
-        + '  host="$2"\n'
-        + '  port="$3"\n'
-        + '  stable_seconds="$4"\n'
-        + '  deadline_ts="$5"\n'
-        + '  context="$6"\n'
-        + '  if [[ ! "$port" =~ ^[0-9]+$ ]]; then\n'
-        + '    echo "$context tcp-ready: invalid port svc=$svc port=$port"\n'
-        + "    return 1\n"
-        + "  fi\n"
-        + '  if [[ ! "$stable_seconds" =~ ^[0-9]+$ ]] || [ "$stable_seconds" -le 0 ]; then\n'
-        + '    echo "$context tcp-ready: invalid stable_seconds svc=$svc stable_seconds=$stable_seconds"\n'
-        + "    return 1\n"
-        + "  fi\n"
-        + f"  poll_interval_seconds={TCP_READY_POLL_INTERVAL_SECONDS}\n"
-        + '  stable_checks=$(python3 - "$stable_seconds" "$poll_interval_seconds" <<\'__FLUXON_TCP_READY_CHECKS__\'\n'
-        + "import math\n"
-        + "import sys\n"
-        + "stable_seconds = float(sys.argv[1])\n"
-        + "poll_interval_seconds = float(sys.argv[2])\n"
-        + "print(max(1, int(math.ceil(stable_seconds / poll_interval_seconds))))\n"
-        + "__FLUXON_TCP_READY_CHECKS__\n"
-        + ")\n"
-        + '  if [[ ! "$stable_checks" =~ ^[0-9]+$ ]] || [ "$stable_checks" -le 0 ]; then\n'
-        + '    echo "$context tcp-ready: failed to compute stable_checks svc=$svc"\n'
-        + "    return 1\n"
-        + "  fi\n"
-        + "  ok_checks=0\n"
-        + "  while true; do\n"
-        + '    now=$(date +%s)\n'
-        + '    if [ "$now" -ge "$deadline_ts" ]; then\n'
-        + '      echo "$context tcp-ready: deadline exceeded svc=$svc host=$host port=$port"\n'
-        + "      return 1\n"
-        + "    fi\n"
-        + '    if python3 - "$host" "$port" <<\'__FLUXON_TCP_READY_PROBE__\'\n'
-        + "import socket\n"
-        + "import sys\n"
-        + "host = sys.argv[1]\n"
-        + "port = int(sys.argv[2])\n"
-        + "with socket.create_connection((host, port), timeout=1.0):\n"
-        + "    pass\n"
-        + "__FLUXON_TCP_READY_PROBE__\n"
-        + "    then\n"
-        + "      ok_checks=$((ok_checks+1))\n"
-        + '      if [ "$ok_checks" -ge "$stable_checks" ]; then\n'
-        + '        echo "$context tcp-ready: ok svc=$svc host=$host port=$port stable_checks=$stable_checks"\n'
-        + "        return 0\n"
-        + "      fi\n"
-        + "    else\n"
-        + '      if [ "$ok_checks" -ne 0 ]; then\n'
-        + '        echo "$context tcp-ready: reset svc=$svc ok_checks=$ok_checks host=$host port=$port"\n'
-        + "      fi\n"
-        + "      ok_checks=0\n"
-        + "    fi\n"
-        + '    sleep "$poll_interval_seconds"\n'
-        + "  done\n"
-        + "}\n\n"
-    )
-
-
 def _render_selection_present_probe_fn() -> str:
-    return (
-        "selection_present() {\n"
-        + "  python3 - \"$SELECTION_SUPERVISOR\" \"$SUPERVISOR_LABEL\" \"$HOSTWORKDIR\" <<'__FLUXON_SELECTION_PRESENT__'\n"
-        + "import importlib.util\n"
-        + "import sys\n"
-        + "from pathlib import Path\n"
-        + "\n"
-        + "supervisor_path = Path(sys.argv[1])\n"
-        + "label = sys.argv[2]\n"
-        + "scope_key = sys.argv[3]\n"
-        + 'spec = importlib.util.spec_from_file_location("fluxon_selection_supervisor_probe", supervisor_path)\n'
-        + "if spec is None or spec.loader is None:\n"
-        + '    raise RuntimeError(f"failed to load selection supervisor module: {supervisor_path}")\n'
-        + "module = importlib.util.module_from_spec(spec)\n"
-        + "sys.modules[spec.name] = module\n"
-        + "spec.loader.exec_module(module)\n"
-        + "raise SystemExit(0 if module._selection_present(label, scope_key=scope_key) else 1)\n"
-        + "__FLUXON_SELECTION_PRESENT__\n"
-        + "}\n\n"
-    )
+    return _load_bare_template(template_name="selection_present_probe_fn.sh.tmpl")
 
 
 def _render_selection_supervisor_launch_wait_block(
     *,
     run_cmd: str,
-    logfile_expr: str,
     stable_seconds_expr: str,
-    deadline_ts_expr: str,
+    deadline_seconds_expr: str,
     context: str,
 ) -> str:
-    return (
-        'SUPERVISOR_PID=$( '
-        + run_cmd
-        + f' >>{logfile_expr} 2>&1 < /dev/null & echo "$!" )\n'
-        + 'if [[ ! "$SUPERVISOR_PID" =~ ^[0-9]+$ ]]; then\n'
-        + f'  echo "{context} launch failed svc=$SERVICE label=$SUPERVISOR_LABEL supervisor_pid=$SUPERVISOR_PID"\n'
-        + "  exit 1\n"
-        + "fi\n"
-        + 'if ! wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" '
-        + stable_seconds_expr
-        + " "
-        + deadline_ts_expr
-        + f' "{context}"; then\n'
-        + f'  echo "{context} probable-ready failed svc=$SERVICE label=$SUPERVISOR_LABEL supervisor_pid=$SUPERVISOR_PID"\n'
-        + "  exit 1\n"
-        + "fi\n"
+    return _render_bare_template(
+        template_name="selection_supervisor_launch_wait_block.sh.tmpl",
+        values={
+            "RUN_CMD": run_cmd,
+            "STABLE_SECONDS_EXPR": stable_seconds_expr,
+            "DEADLINE_SECONDS_EXPR": deadline_seconds_expr,
+            "CONTEXT": context,
+        },
     )
 
 
-def _render_tcp_ready_wait_block(*, context: str) -> str:
+def _render_service_port_export(*, service_name: str, service_cfg: Dict[str, Any], indent: str = "") -> str:
+    service_port = _extract_port(service_cfg)
+    if service_port is None:
+        return indent + "unset SERVICE_PORT\n"
     return (
-        'if [[ "${SERVICE_PORT:-}" =~ ^[0-9]+$ ]]; then\n'
-        + f'  if ! wait_service_tcp_ready "$SERVICE" "$HOST_IP" "$SERVICE_PORT" {TCP_READY_STABLE_SECONDS} "$STARTUP_DEADLINE_TS" "{context}"; then\n'
-        + f'    echo "{context} tcp-ready failed svc=$SERVICE host=$HOST_IP port=$SERVICE_PORT"\n'
-        + "    exit 1\n"
-        + "  fi\n"
-        + "fi\n"
+        indent + f"export {service_name.upper()}__PORT={_sh_quote(str(service_port))}\n"
+        + indent + f"export SERVICE_PORT={_sh_quote(str(service_port))}\n"
     )
 
 
@@ -759,54 +608,28 @@ def _render_standalone_start_body(*, name_prefix: str, service_name: str) -> str
         crashloop_interval_lt_seconds=0,
         child_command=child_command,
     )
-    return (
-        f'SUPERVISOR_LABEL={_sh_quote(_bare_plain_selection_supervisor_label(name_prefix=name_prefix, service_name=service_name))}\n'
-        + f'RUNTIME_STATE_JSON={_sh_quote(runtime_state_json)}\n'
-        + 'OWNER_TS_MS=$(python3 -c \'import time; print(int(time.time() * 1000))\')\n'
-        + f"STARTUP_DEADLINE_TS=$(( $(date +%s) + {STANDALONE_STARTUP_DEADLINE_SECONDS} ))\n"
-        + 'LOG_DIR="$HOSTWORKDIR/log"\n'
-        + 'LOGFILE="$LOG_DIR/${SERVICE}.log"\n'
-        + 'mkdir -p "$LOG_DIR"\n'
-        + 'touch "$LOGFILE"\n'
-        + 'echo "Starting $SERVICE on $NODE_ID (IP: $HOST_IP, workdir: $HOSTWORKDIR)"\n'
-        + "# English note:\n"
-        + "# - bootstrap bare start must be idempotent when the shared selection supervisor already owns\n"
-        + "#   a live child for the same label.\n"
-        + "# - start_test_bed enables this path only for deployconf.bootstrap_bare_services.\n"
-        + 'if [ "${FLUXON_BARE_ALLOW_ALREADY_PRESENT:-false}" = "true" ]; then\n'
-        + "  if selection_present; then\n"
-        + '    echo "[bare] already present svc=$SERVICE label=$SUPERVISOR_LABEL"\n'
-        + '    echo "Started $SERVICE (label: $SUPERVISOR_LABEL)"\n'
-        + '    echo "Logs: $LOGFILE"\n'
-        + "    exit 0\n"
-        + "  fi\n"
-        + "fi\n"
-        + "# English note:\n"
-        + "# - Bare start must not depend on extra supervisor observation subcommands because the shared\n"
-        + "#   runtime surface is intentionally reduced to run/stop.\n"
-        + "# - We therefore launch the detached supervisor and wait until its pid subtree keeps a live child\n"
-        + "#   process for a short stable window.\n"
-        + _render_selection_supervisor_launch_wait_block(
-            run_cmd=run_cmd,
-            logfile_expr='"$LOGFILE"',
-            stable_seconds_expr=str(STANDALONE_PROBABLE_READY_SECONDS),
-            deadline_ts_expr='"$STARTUP_DEADLINE_TS"',
-            context="[bare]",
-        )
-        + _render_tcp_ready_wait_block(context="[bare]")
-        + 'echo "Started $SERVICE (label: $SUPERVISOR_LABEL)"\n'
-        + 'echo "Logs: $LOGFILE"\n'
+    return _render_bare_template(
+        template_name="standalone_start_body.sh.tmpl",
+        values={
+            "SUPERVISOR_LABEL_ASSIGN": _sh_quote(
+                _bare_plain_selection_supervisor_label(name_prefix=name_prefix, service_name=service_name)
+            ),
+            "RUNTIME_STATE_JSON_ASSIGN": _sh_quote(runtime_state_json),
+            "STARTUP_DEADLINE_SECONDS": str(STANDALONE_STARTUP_DEADLINE_SECONDS),
+            "SELECTION_SUPERVISOR_LAUNCH_WAIT_BLOCK": _render_selection_supervisor_launch_wait_block(
+                run_cmd=run_cmd,
+                stable_seconds_expr=str(STANDALONE_PROBABLE_READY_SECONDS),
+                deadline_seconds_expr=str(STANDALONE_STARTUP_DEADLINE_SECONDS),
+                context="[bare]",
+            ),
+        },
     )
 
 
 def _render_selection_supervisor_path_from_script_dir() -> str:
-    return (
-        'DIR=$(cd "$(dirname "$0")" && pwd)\n'
-        + f'SELECTION_SUPERVISOR="$DIR/{PYTHON_SELECTION_SUPERVISOR_FILENAME}"\n'
-        + 'if [ ! -f "$SELECTION_SUPERVISOR" ]; then\n'
-        + '  echo "Missing selection supervisor: $SELECTION_SUPERVISOR"\n'
-        + "  exit 1\n"
-        + "fi\n\n"
+    return _render_bare_template(
+        template_name="selection_supervisor_path_from_script_dir.sh.tmpl",
+        values={"SELECTION_SUPERVISOR_FILENAME": PYTHON_SELECTION_SUPERVISOR_FILENAME},
     )
 
 
@@ -833,10 +656,6 @@ def _render_atomic_group_service_block(
         log_path=f"${{HOSTWORKDIR}}/log/{service_name}.log",
     )
     allowed_nodes = _extract_nodes(service_cfg)
-    service_port = _extract_port(service_cfg)
-    port_export = ""
-    if service_port is not None:
-        port_export = f"  export {service_name.upper()}__PORT={_sh_quote(str(service_port))}\n"
     run_cmd = _render_selection_supervisor_run_shell(
         subcommand="run",
         supervisor_expr='"$SELECTION_SUPERVISOR"',
@@ -850,54 +669,37 @@ def _render_atomic_group_service_block(
         crashloop_interval_lt_seconds=ATOMIC_GROUP_CRASHLOOP_INTERVAL_LT_SECONDS,
         child_command=child_command,
     )
-    return (
-        f"\n# rollout: {service_name}\n"
-        + _render_nodes_bash(name="ALLOWED_NODES", nodes=allowed_nodes)
-        + "scheduled=false\n"
-        + 'for n in "${ALLOWED_NODES[@]}"; do\n'
-        + '  if [ "$n" = "$NODE_ID" ]; then scheduled=true; fi\n'
-        + "done\n"
-        + 'if [ "$scheduled" != true ]; then\n'
-        + f'  echo "[rollout] skip {service_name}: not scheduled on node $NODE_ID"\n'
-        + "else\n"
-        + f"  export SERVICE={_sh_quote(service_name)}\n"
-        + port_export
-        + '  LOG_DIR="$HOSTWORKDIR/log"\n'
-        + '  mkdir -p "$LOG_DIR"\n'
-        + f'  SUPERVISOR_LABEL={_sh_quote(_bare_atomic_group_member_selection_supervisor_label(name_prefix=name_prefix, group_name=group_name, service_name=service_name))}\n'
-        + f'  RUNTIME_STATE_JSON={_sh_quote(runtime_state_json)}\n'
-        + '  OWNER_TS_MS=$(python3 -c \'import time; print(int(time.time() * 1000))\')\n'
-        + f'  LOGFILE="$HOSTWORKDIR/log/{service_name}.log"\n'
-        + '  touch "$LOGFILE"\n'
-        + f'  echo "[rollout] start {service_name} node=$NODE_ID hostworkdir=$HOSTWORKDIR"\n'
-        + "  # English note:\n"
-        + "  # - Atomic-group order still depends on a readiness gate, but that gate now observes only the\n"
-        + "  #   detached supervisor process subtree on this host.\n"
-        + "  # - Ownership stays inside the shared selection supervisor big loop; the group runner only waits\n"
-        + "  #   until that loop has a stable live child before advancing to the next service.\n"
-        # English note:
-        # - The embedded `run_cmd` contains a nested `bash -lc` payload, and that payload may contain
-        #   heredocs used by real service entrypoints.
-        # - A blind newline replacement would shift heredoc terminators away from column 0 inside the
-        #   child shell and silently turn valid entrypoints into immediate no-op exits.
-        # - Indent only the outer block lines while preserving each inner line start exactly.
-        + _indent_script_block(
-            script=_render_selection_supervisor_launch_wait_block(
-                run_cmd=run_cmd,
-                logfile_expr='"$LOGFILE"',
-                stable_seconds_expr=str(ATOMIC_GROUP_PROBABLE_READY_SECONDS),
-                deadline_ts_expr='"$GROUP_STARTUP_DEADLINE_TS"',
-                context="[rollout]",
-            ).rstrip() + "\n",
-            prefix="  ",
-        ).rstrip()
-        + "\n"
-        + _indent_script_block(
-            script=_render_tcp_ready_wait_block(context="[rollout]"),
-            prefix="  ",
-        ).rstrip()
-        + "\n"
-        + "fi\n"
+    return _render_bare_template(
+        template_name="atomic_group_service_block.sh.tmpl",
+        values={
+            "SERVICE_NAME": service_name,
+            "ALLOWED_NODES_BLOCK": _render_nodes_bash(name="ALLOWED_NODES", nodes=allowed_nodes),
+            "SERVICE_EXPORT": _sh_quote(service_name),
+            "PORT_EXPORT": _render_service_port_export(
+                service_name=service_name,
+                service_cfg=service_cfg,
+                indent="  ",
+            ),
+            "SUPERVISOR_LABEL_ASSIGN": _sh_quote(
+                _bare_atomic_group_member_selection_supervisor_label(
+                    name_prefix=name_prefix,
+                    group_name=group_name,
+                    service_name=service_name,
+                )
+            ),
+            "RUNTIME_STATE_JSON_ASSIGN": _sh_quote(runtime_state_json),
+            "LOGFILE_PATH": f"$HOSTWORKDIR/log/{service_name}.log",
+            "INDENTED_SELECTION_SUPERVISOR_LAUNCH_WAIT_BLOCK": _indent_script_block(
+                script=_render_selection_supervisor_launch_wait_block(
+                    run_cmd=run_cmd,
+                    stable_seconds_expr=str(ATOMIC_GROUP_PROBABLE_READY_SECONDS),
+                    deadline_seconds_expr=str(ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS),
+                    context="[rollout]",
+                ).rstrip()
+                + "\n",
+                prefix="  ",
+            ).rstrip(),
+        },
     )
 
 

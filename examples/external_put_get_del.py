@@ -4,8 +4,7 @@ from fluxon_py import FluxonKvClientConfig, new_store
 
 INSTANCE_KEY = "demo_kv_external"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARED_MEMORY_PATH = "/dev/shm/fluxon_kv_demo"
-SHARED_FILE_PATH = "/tmp/fluxon_kv_demo/shared"
+SHARE_MEM_PATH = "/dev/shm/fluxon_kv_demo"
 
 
 def main() -> None:
@@ -14,8 +13,7 @@ def main() -> None:
             "instance_key": INSTANCE_KEY,
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
-                "shared_memory_path": SHARED_MEMORY_PATH,
-                "shared_file_path": SHARED_FILE_PATH,
+                "share_mem_path": SHARE_MEM_PATH,
             },
             "test_spec_config": {
                 "disable_observability": True,

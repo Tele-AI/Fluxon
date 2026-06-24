@@ -53,6 +53,102 @@ scenes:
       scales: [n1_kvowner_dram_20gib]
       profiles: [fluxon_tcp]
 
+  ci_top_attention_cargo_cli:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_commu:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_commu_contract:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_framework:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_fs:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_fs_s3_gateway:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_limit_thirdparty:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_mq:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_observability:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_ops:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_pyo3:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_log_mgmt:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
   ci_top_attention_mq_core:
     ci:
       subject: mq
@@ -348,6 +444,8 @@ profiles:
           ci_top_attention_cargo_util: {}
           ci_top_attention_cargo_kv_unit:
             kv_transport_feature: tcp_thread_transport
+          ci_top_attention_log_mgmt:
+            enabled: true
           ci_top_attention_mq_core: {}
         runtime_contracts:
           cluster_kv_owner: &cluster_kv_owner_runtime
@@ -456,7 +554,7 @@ profiles:
               # Self-host benchmark nodes are launched by the host-side deployer, not inside a
               # container with /hostworkdir mounted. Use the real host path so both infra44/46
               # benchmark nodes can open the same self-host shared-memory root directly.
-              shared_memory_path: __STACK_SHARED_MEMORY_PATH__
+              share_mem_path: __STACK_SHARE_MEM_PATH__
           mq_base:
             capacity: 40
             ttl_seconds: 90
@@ -499,6 +597,8 @@ profiles:
           ci_top_attention_cargo_util: {}
           ci_top_attention_cargo_kv_unit:
             kv_transport_feature: tcp_thread_transport
+          ci_top_attention_log_mgmt:
+            enabled: true
           ci_top_attention_mq_core: {}
       test_stack:
         <<: *common_test_stack_runtime
@@ -517,6 +617,8 @@ profiles:
           ci_top_attention_cargo_util: {}
           ci_top_attention_cargo_kv_unit:
             kv_transport_feature: tcp_thread_transport
+          ci_top_attention_log_mgmt:
+            enabled: true
           ci_top_attention_mq_core: {}
       test_stack:
         <<: *common_test_stack_runtime
@@ -535,6 +637,8 @@ profiles:
           ci_top_attention_cargo_util: {}
           ci_top_attention_cargo_kv_unit:
             kv_transport_feature: tcp_thread_transport
+          ci_top_attention_log_mgmt:
+            enabled: true
           ci_top_attention_mq_core: {}
       test_stack:
         <<: *common_test_stack_runtime

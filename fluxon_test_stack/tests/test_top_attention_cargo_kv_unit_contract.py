@@ -94,6 +94,10 @@ class TestTopAttentionCargoKvUnitContract(unittest.TestCase):
                     "p2p_transfer,tcp_thread_transport",
                 ],
             )
+            self.assertEqual(
+                run_cargo.call_args.kwargs["env"]["FLUXON_BUILD_CONFIG_EXT_PATH"],
+                str((src_dir / "build_config_ext.yml").resolve()),
+            )
 
     def test_main_rejects_feature_mismatch_when_case_config_is_present(self) -> None:
         with tempfile.TemporaryDirectory() as td:

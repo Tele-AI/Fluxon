@@ -14,6 +14,10 @@ LIB_LAYOUT_PATH = REPO_ROOT / "setup_and_pack" / "nix" / "lib_layout.py"
 
 
 def _load_lib_layout():
+    repo_root_str = str(REPO_ROOT)
+    if repo_root_str in sys.path:
+        sys.path.remove(repo_root_str)
+    sys.path.insert(0, repo_root_str)
     spec = importlib.util.spec_from_file_location("setup_and_pack_nix_lib_layout_test", LIB_LAYOUT_PATH)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -83,14 +87,17 @@ class ApplyLayoutTest(unittest.TestCase):
             self.assertTrue(workspace_seed_dir.is_dir())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/closed_sdk_contract.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/public_workspace_contract.py").is_file())
+            self.assertTrue((workspace_seed_dir / "README.md").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/fluxon_commu_contract/Cargo.toml").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/fluxon_commu/Cargo.toml").is_file())
+            self.assertTrue((workspace_seed_dir / "fluxon_rs/fluxon_ops/build.rs").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_release/closed_sdk/manifest.json").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/nix/pack_fluxonkv_pylib.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/nix/pack_release_in_container.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/utils/__init__.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/utils/sudo_prefix_utils.py").is_file())
             self.assertTrue((workspace_seed_dir / "setup_and_pack/utils/wheel_runtime_helper.py").is_file())
+            self.assertTrue((workspace_seed_dir / "deployment/utils/log_shard.py").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/fluxon_kv/Cargo.toml").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/Cargo.lock").is_file())
             self.assertTrue((workspace_seed_dir / "fluxon_rs/moka/Cargo.toml").is_file())
@@ -131,6 +138,41 @@ class ApplyLayoutTest(unittest.TestCase):
                 spec.profile_source.closed_sdk_search_roots,
                 (str(closed_sdk_root.resolve()),),
             )
+
+    def test_load_experiment_spec_from_root_accepts_explicit_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            project_root = root / "repo"
+            generated_config_path = root / "generated" / "setup_and_pack" / "nix" / "pack_fluxonkv_pylib_ci.yaml"
+            (project_root / ".git").mkdir(parents=True, exist_ok=True)
+            (project_root / "setup_and_pack").mkdir(parents=True, exist_ok=True)
+            generated_config_path.parent.mkdir(parents=True, exist_ok=True)
+
+            spec = _LIB_LAYOUT.load_experiment_spec_from_root(
+                config_path=generated_config_path,
+                config_root={
+                    "project_root": str(project_root.resolve()),
+                    "store": {
+                        "project_data_root": str((root / "project_data").resolve()),
+                    },
+                    "runtime": {
+                        "base_system": "manylinux_2_28",
+                        "architectures": ["x86_64"],
+                        "python_abi": "cpython3.10",
+                    },
+                    "profile": {
+                        "source_kind": "bridge_prebuilt",
+                        "native_runtime_dir_names": ["cxxpacked"],
+                        "target_support_dir_names": ["meson-0.64.0"],
+                        "ext_bundle_dir_name": "cxxpacked",
+                    },
+                    "assembly": {
+                        "baseline_path": str((root / "baseline").resolve()),
+                    },
+                },
+            )
+
+            self.assertEqual(spec.project_root, project_root.resolve())
 
     def test_load_experiment_config_root_expands_host_root_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

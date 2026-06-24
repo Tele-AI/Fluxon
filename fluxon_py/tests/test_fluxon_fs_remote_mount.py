@@ -19,7 +19,6 @@ from fluxon_py.fluxon_fs.patcher import FluxonFsPatcher  # noqa: E402
 from fluxon_py.kvclient import new_store  # noqa: E402
 from fluxon_py.tests.test_lib import (  # noqa: E402
     load_test_fluxon_cluster_name,
-    load_test_fluxon_share_file_path,
     load_test_fluxon_share_mem_path,
 )
 
@@ -32,11 +31,10 @@ def _new_test_dir(tag: str) -> Path:
     return p
 
 
-def _load_ci_cluster() -> tuple[str, str, str]:
+def _load_ci_cluster() -> tuple[str, str]:
     return (
         load_test_fluxon_cluster_name(),
         load_test_fluxon_share_mem_path(),
-        load_test_fluxon_share_file_path(),
     )
 
 
@@ -45,7 +43,6 @@ def _new_fluxon_external_store_with_cluster(
     instance_key: str,
     cluster_name: str,
     share_mem_path: str,
-    share_file_path: str,
 ):
     cfg = FluxonKvClientConfig(
         {
@@ -53,8 +50,7 @@ def _new_fluxon_external_store_with_cluster(
             "contribute_to_cluster_pool_size": {"dram": 0, "vram": {}},
             "fluxonkv_spec": {
                 "cluster_name": cluster_name,
-                "shared_memory_path": share_mem_path,
-                "shared_file_path": share_file_path,
+                "share_mem_path": share_mem_path,
             },
         }
     )
@@ -79,7 +75,7 @@ class TestFluxonFsRemoteMount(unittest.TestCase):
         cls._remote_root = (cls._tmp / "remote_root").resolve()
         cls._remote_root.mkdir(parents=True, exist_ok=False)
 
-        cls._cluster_name, cls._share_mem_path, cls._share_file_path = _load_ci_cluster()
+        cls._cluster_name, cls._share_mem_path = _load_ci_cluster()
 
         # Keep the mountpoint under a writable temp directory to avoid relying on root paths.
         # The engine will create the mountpoint if it does not exist.
@@ -91,13 +87,11 @@ class TestFluxonFsRemoteMount(unittest.TestCase):
             instance_key=f"test_fluxon_fs_agent_{os.getpid()}",
             cluster_name=cls._cluster_name,
             share_mem_path=cls._share_mem_path,
-            share_file_path=cls._share_file_path,
         )
         cls._client_store = _new_fluxon_external_store_with_cluster(
             instance_key=f"test_fluxon_fs_client_{os.getpid()}",
             cluster_name=cls._cluster_name,
             share_mem_path=cls._share_mem_path,
-            share_file_path=cls._share_file_path,
         )
 
         agent_key_res = cls._agent_store.instance_key()

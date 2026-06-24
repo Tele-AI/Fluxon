@@ -251,8 +251,8 @@ define_module!(
 /// External Client configuration parameters
 #[derive(Clone, Debug)]
 pub struct ExternalClientApiNewArg {
-    pub shared_memory_path: String,
-    pub shared_file_path: String,
+    pub share_mem_path: String,
+    pub large_file_paths: crate::config::LargeFilePaths,
     pub expected_cluster_name: String,
     pub expected_protocol_version: String,
     pub enable_side_transfer: bool,
@@ -310,8 +310,8 @@ pub struct ExternalInner {
     initial_sub_cluster: OnceLock<Option<String>>,
     expected_cluster_name: String,
     expected_protocol_version: String,
-    external_shared_memory_path: String,
-    external_shared_file_path: String,
+    external_share_mem_path: String,
+    external_large_file_paths: crate::config::LargeFilePaths,
     _enable_side_transfer: bool,
     short_circuit_put_payload_path: bool,
     side_rr_next: AtomicUsize,
@@ -350,7 +350,7 @@ impl ExternalClientApi {
     pub async fn construct(arg: ExternalClientApiNewArg) -> Result<Self, KvError> {
         tracing::info!(
             "Constructing ExternalClientApi in ExternalClient mode (PreView): shm_dir={}",
-            arg.shared_memory_path
+            arg.share_mem_path
         );
 
         Ok(Self(ExternalInner {
@@ -361,8 +361,8 @@ impl ExternalClientApi {
             initial_sub_cluster: OnceLock::new(),
             expected_cluster_name: arg.expected_cluster_name,
             expected_protocol_version: arg.expected_protocol_version,
-            external_shared_memory_path: arg.shared_memory_path,
-            external_shared_file_path: arg.shared_file_path,
+            external_share_mem_path: arg.share_mem_path,
+            external_large_file_paths: arg.large_file_paths,
             _enable_side_transfer: arg.enable_side_transfer,
             short_circuit_put_payload_path: arg.short_circuit_put_payload_path,
             side_rr_next: AtomicUsize::new(0),
@@ -403,8 +403,7 @@ impl ExternalClientApi {
             let wait_start_ts = i64::MIN;
             let OwnerRestartPayload { meta, signature } = task_wait_owner_restart(
                 ext.view.clone_view(),
-                ext.external_shared_memory_path.clone(),
-                ext.external_shared_file_path.clone(),
+                ext.external_share_mem_path.clone(),
                 None,
                 wait_start_ts,
                 None,
@@ -414,7 +413,7 @@ impl ExternalClientApi {
             .await?;
 
             let shared_memory_ptr = ExternalInner::init_shared_memory_from_meta(
-                &ext.external_shared_memory_path,
+                &ext.external_share_mem_path,
                 &meta,
                 signature,
             )?;
@@ -843,13 +842,11 @@ impl ExternalInner {
             return Ok(false);
         };
 
-        let shared_memory_path = self.shared_memory_path();
-        let shared_file_path = self.shared_file_path();
-        let shared_meta_path = format!("{}/shared.json", shared_file_path);
+        let share_mem_path = self.share_mem_path();
+        let shared_meta_path = format!("{}/shared.json", share_mem_path);
         let probe = probe_owner_restart_payload(
             &self.view.clone_view(),
-            &shared_memory_path,
-            &shared_file_path,
+            &share_mem_path,
             &shared_meta_path,
             Some(&current_signature),
             i64::MIN,
@@ -868,7 +865,7 @@ impl ExternalInner {
             return Ok(false);
         }
 
-        self.finish_owner_recover(&shared_memory_path, payload)
+        self.finish_owner_recover(&share_mem_path, payload)
             .await?;
         Ok(true)
     }
@@ -921,7 +918,7 @@ impl ExternalInner {
         match self.base_ptr().await {
             Ok(addr) => Ok(addr),
             Err(_) => {
-                let path = self.shared_memory_path();
+                let path = self.share_mem_path();
                 let (st, addr) = self
                     .wait_owner_recover_only(&path, *prev_owner_start_time)
                     .await?;
@@ -935,10 +932,10 @@ impl ExternalInner {
 
     async fn finish_owner_recover(
         &self,
-        shared_memory_path: &str,
+        share_mem_path: &str,
         payload: OwnerRestartPayload,
     ) -> KvResult<(i64, usize)> {
-        self.remap_shared_memory_with_payload(shared_memory_path, &payload)
+        self.remap_shared_memory_with_payload(share_mem_path, &payload)
             .await?;
         self.view
             .cluster_manager()
@@ -960,10 +957,10 @@ impl ExternalInner {
 
     async fn wait_owner_recover_only(
         &self,
-        shared_memory_path: &str,
+        share_mem_path: &str,
         prev_owner_start_time: i64,
     ) -> KvResult<(i64, usize)> {
-        self.wait_owner_recover(shared_memory_path, prev_owner_start_time)
+        self.wait_owner_recover(share_mem_path, prev_owner_start_time)
             .await
     }
 
@@ -971,7 +968,7 @@ impl ExternalInner {
         &self,
         prev_owner_start_time: &mut i64,
     ) -> KvResult<usize> {
-        let path = self.shared_memory_path();
+        let path = self.share_mem_path();
         let (st, addr) = self
             .wait_owner_recover_only(&path, *prev_owner_start_time)
             .await?;
@@ -987,7 +984,7 @@ impl ExternalInner {
             return match self.base_ptr().await {
                 Ok(addr) => Ok(addr),
                 Err(_) => {
-                    let path = self.shared_memory_path();
+                    let path = self.share_mem_path();
                     let (st, addr) = self
                         .wait_owner_recover_only(&path, *prev_owner_start_time)
                         .await?;
@@ -997,7 +994,7 @@ impl ExternalInner {
             };
         }
 
-        let path = self.shared_memory_path();
+        let path = self.share_mem_path();
         let (st, addr) = self
             .wait_owner_recover_only(&path, *prev_owner_start_time)
             .await?;
@@ -1009,7 +1006,7 @@ impl ExternalInner {
     /// has advanced.
     async fn wait_owner_recover(
         &self,
-        _shared_memory_path: &str,
+        _share_mem_path: &str,
         prev_owner_start_time: i64,
     ) -> KvResult<(i64, usize)> {
         if let Some(res) = self
@@ -1090,11 +1087,11 @@ impl ExternalInner {
 
     async fn remap_shared_memory_with_payload(
         &self,
-        shared_memory_path: &str,
+        share_mem_path: &str,
         payload: &OwnerRestartPayload,
     ) -> KvResult<()> {
         let shared_memory = Self::init_shared_memory_from_meta(
-            shared_memory_path,
+            share_mem_path,
             &payload.meta,
             payload.signature.clone(),
         )?;
@@ -1212,11 +1209,11 @@ impl ExternalInner {
     }
 
     fn init_shared_memory_from_meta(
-        shared_memory_path: &str,
+        share_mem_path: &str,
         meta: &SharedJsonMeta,
         memory_signature: SharedMetaSignature,
     ) -> KvResult<Arc<SharedMemoryPtr>> {
-        let mmap_file_path = format!("{}/mmap.file", shared_memory_path);
+        let mmap_file_path = format!("{}/mmap.file", share_mem_path);
         Self::init_shared_memory(&mmap_file_path, meta.segment_len, memory_signature)
     }
     /// Get the shared storage node ID this client connects to
@@ -1227,14 +1224,12 @@ impl ExternalInner {
 
     /// Get the configured shared-memory base path (external mode).
     /// Non-external modes return empty string.
-    pub fn shared_memory_path(&self) -> String {
-        self.external_shared_memory_path.clone()
+    pub fn share_mem_path(&self) -> String {
+        self.external_share_mem_path.clone()
     }
 
-    /// Get the configured shared-file base path (external mode).
-    /// Non-external modes return empty string.
-    pub fn shared_file_path(&self) -> String {
-        self.external_shared_file_path.clone()
+    pub fn large_file_paths(&self) -> &crate::config::LargeFilePaths {
+        &self.external_large_file_paths
     }
 
     fn should_fallback_side_p2p_error(err: &crate::p2p::P2PError) -> bool {
@@ -1272,7 +1267,7 @@ impl ExternalInner {
         // require an extra enable flag once the owner has published ready lanes.
         let owner_id = self.shared_storage_node_id().await?;
         let owner_start_time = self.current_owner_start_time().await;
-        let peers_dir = ClientSegPool::side_transfer_peers_dir(&self.external_shared_file_path);
+        let peers_dir = ClientSegPool::side_transfer_peers_dir(&self.external_share_mem_path);
         let entries = std::fs::read_dir(&peers_dir).ok()?;
         let mut ready = Vec::new();
         for entry in entries.flatten() {
@@ -1534,7 +1529,7 @@ impl ExternalInner {
         let mut prev_owner_start_time = self.current_owner_start_time().await;
         let mut recover_attempts = 0usize;
         if self.base_ptr().await.is_err() {
-            let path = self.shared_memory_path();
+            let path = self.share_mem_path();
             tracing::info!("ExternalClientApi.is_exist waiting for owner at: {}", path);
             let _ = self.ensure_owner_ready(&mut prev_owner_start_time).await?;
         }
@@ -1625,7 +1620,7 @@ impl ExternalInner {
         // Ensure external mode configured; if not, block until owner is ready once
         let mut prev_owner_start_time = self.current_owner_start_time().await;
         if self.base_ptr().await.is_err() {
-            let path = self.shared_memory_path();
+            let path = self.share_mem_path();
             tracing::info!(
                 "ExternalClientApi.get detected unmapped shared memory; waiting at: {}",
                 path
@@ -1821,7 +1816,7 @@ key={}, attempt={}/{}, err={}",
         let mut base_addr: usize = match self.base_ptr().await {
             Ok(addr) => addr,
             Err(_) => {
-                let path = self.shared_memory_path();
+                let path = self.share_mem_path();
                 tracing::info!(
                     "ExternalClientApi.put detected unmapped shared memory; waiting for owner to be ready at path: {}",
                     path
@@ -1910,7 +1905,7 @@ key={}, attempt={}/{}, err={}",
         let mut base_addr: usize = match self.base_ptr().await {
             Ok(addr) => addr,
             Err(_) => {
-                let path = self.shared_memory_path();
+                let path = self.share_mem_path();
                 tracing::info!(
                     "ExternalClientApi.put_flat_dict_ptrs detected unmapped shared memory; waiting for owner to be ready at path: {}",
                     path
@@ -2300,7 +2295,7 @@ key={}, attempt={}/{}, err={}",
         let mut prev_owner_start_time = self.current_owner_start_time().await;
         let mut recover_attempts = 0usize;
         if self.base_ptr().await.is_err() {
-            let path = self.shared_memory_path();
+            let path = self.share_mem_path();
             tracing::info!("ExternalClientApi.delete waiting for owner at: {}", path);
             let _ = self.ensure_owner_ready(&mut prev_owner_start_time).await?;
         }
@@ -2664,8 +2659,7 @@ async fn handle_sync_kv_to_file_external(
 
 async fn task_wait_owner_restart(
     view: ExternalClientApiView,
-    shared_memory_path: String,
-    shared_file_path: String,
+    share_mem_path: String,
     current_sig_snapshot: Option<SharedMetaSignature>,
     wait_start_ts: i64,
     old_owner_id: Option<String>,
@@ -2674,7 +2668,7 @@ async fn task_wait_owner_restart(
 ) -> KvResult<OwnerRestartPayload> {
     let shutdown_poller = view.register_shutdown_poller();
     let mut cluster_rx = view.cluster_manager().listen();
-    let shared_meta_path = format!("{}/shared.json", &shared_file_path);
+    let shared_meta_path = format!("{}/shared.json", &share_mem_path);
     let mut waited = 0u64;
     loop {
         if !shutdown_poller.is_running() {
@@ -2685,8 +2679,7 @@ async fn task_wait_owner_restart(
 
         match probe_owner_restart_payload(
             &view,
-            &shared_memory_path,
-            &shared_file_path,
+            &share_mem_path,
             &shared_meta_path,
             current_sig_snapshot.as_ref(),
             wait_start_ts,
@@ -2735,8 +2728,7 @@ fn read_shared_json_snapshot(
 
 async fn probe_owner_restart_payload(
     view: &ExternalClientApiView,
-    shared_memory_path: &str,
-    shared_file_path: &str,
+    share_mem_path: &str,
     shared_meta_path: &str,
     current_sig_snapshot: Option<&SharedMetaSignature>,
     wait_start_ts: i64,
@@ -2744,16 +2736,16 @@ async fn probe_owner_restart_payload(
     expected_cluster_name: &str,
     expected_protocol_version: &str,
 ) -> KvResult<OwnerRestartProbe> {
-    if !fluxon_util::fs_watch::are_files_ready(shared_memory_path, &["mmap.file"]) {
+    if !fluxon_util::fs_watch::are_files_ready(share_mem_path, &["mmap.file"]) {
         return Ok(OwnerRestartProbe::Pending(format!(
             "shared memory mmap.file not ready yet: path={}",
-            shared_memory_path
+            share_mem_path
         )));
     }
-    if !fluxon_util::fs_watch::are_files_ready(shared_file_path, &["shared.json"]) {
+    if !fluxon_util::fs_watch::are_files_ready(share_mem_path, &["shared.json"]) {
         return Ok(OwnerRestartProbe::Pending(format!(
             "shared metadata shared.json not ready yet: path={}",
-            shared_file_path
+            share_mem_path
         )));
     }
 
@@ -2776,13 +2768,13 @@ async fn probe_owner_restart_payload(
     if meta.protocol_version != expected_protocol_version {
         return Ok(OwnerRestartProbe::Pending(format!(
             "shared.json protocol_version mismatch; waiting: shm_dir='{}' shared='{}' local='{}'",
-            shared_memory_path, meta.protocol_version, expected_protocol_version
+            share_mem_path, meta.protocol_version, expected_protocol_version
         )));
     }
     if meta.cluster_name != expected_cluster_name {
         return Ok(OwnerRestartProbe::Pending(format!(
             "shared.json cluster_name mismatch; waiting: shm_dir='{}' shared='{}' local='{}'",
-            shared_memory_path, meta.cluster_name, expected_cluster_name
+            share_mem_path, meta.cluster_name, expected_cluster_name
         )));
     }
     if let Some(old_owner_id) = old_owner_id {
@@ -2852,7 +2844,7 @@ impl LogicalModule for ExternalClientApi {
     async fn shutdown(&self) -> Result<(), Self::Error> {
         // 只在ExternalClient模式下清理共享内存映射
         let ext = &self.0;
-        if ext.shared_memory_path().is_empty() {
+        if ext.share_mem_path().is_empty() {
             tracing::info!("ExternalClientApi shutdown (no shared memory path configured)");
             return Ok(());
         }

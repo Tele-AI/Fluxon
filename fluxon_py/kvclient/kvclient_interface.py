@@ -207,6 +207,9 @@ class KvClient(FactoryOnly):
     def get_etcd_config(self) -> List[str]:
         """Return etcd endpoint list as raw host:port strings (no scheme)."""
 
+    @abstractmethod
+    def third_party_logs_dir(self) -> Result[str, ApiError]:
+        """Return the owner-derived log root for third-party Python components."""
 
     @abstractmethod
     def ensure_zero_contribution_for_channel(self) -> None:

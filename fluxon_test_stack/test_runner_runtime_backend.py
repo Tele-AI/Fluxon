@@ -64,10 +64,8 @@ def _prepare_ci_case(
     services_root = (run_dir / "services").resolve()
     services_root.mkdir(parents=True, exist_ok=True)
     (services_root / "share_mem").mkdir(parents=True, exist_ok=True)
-    share_mem_path = ctx._ci_shared_memory_path(resolved_case, run_dir=run_dir)
-    share_file_path = ctx._ci_shared_file_path(resolved_case, run_dir=run_dir)
+    share_mem_path = ctx._ci_share_mem_path(resolved_case, run_dir=run_dir)
     Path(share_mem_path).mkdir(parents=True, exist_ok=True)
-    Path(share_file_path).mkdir(parents=True, exist_ok=True)
 
     venv_python = ctx._create_ci_runtime_venv(run_dir=run_dir)
 
@@ -83,8 +81,7 @@ def _prepare_ci_case(
         overlay_live_checkout=True,
         etcd_address=f"{ctx._ci_base_runtime_service_target_ip(resolved_case, service_id='etcd')}:{ctx._ci_base_runtime_service_port(resolved_case, service_id='etcd')}",
         cluster_name=out_cluster_name,
-        shared_memory_path=share_mem_path,
-        shared_file_path=share_file_path,
+        share_mem_path=share_mem_path,
     )
 
     prepare_env_exports = ctx._run_ci_prepare_steps(
@@ -108,7 +105,6 @@ def _prepare_ci_case(
             run_dir=run_dir,
             cluster_name=out_cluster_name,
             share_mem_path=share_mem_path,
-            share_file_path=share_file_path,
             owner_dram_bytes=owner_dram_bytes,
         )
     _ = ctx._write_ci_runner_script(
@@ -116,7 +112,6 @@ def _prepare_ci_case(
         run_dir=run_dir,
         src_root=src_root,
         share_mem_path=share_mem_path,
-        share_file_path=share_file_path,
     )
     ci_runner_exit_code_path = (run_dir / "logs" / "ci_runner" / "exit_code.txt").resolve()
     ci_runner_exit_code_baseline = ctx._observe_file_state(ci_runner_exit_code_path)
@@ -196,8 +191,7 @@ def _prepare_test_stack_case(
         "resolved_case.profile.test_stack.kind",
     )
     owner_instance_ids: List[str] = []
-    shared_memory_path: Optional[str] = None
-    shared_file_path: Optional[str] = None
+    share_mem_path: Optional[str] = None
     stack_cluster_name: Optional[str] = None
     if ctx._test_stack_backend_uses_dedicated_kv_owners(backend_kind=backend_kind, mode=mode):
         runtime = ctx._require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
@@ -216,13 +210,9 @@ def _prepare_test_stack_case(
                 stack_identity.get("cluster_name"),
                 "runtime.stack_identity.cluster_name",
             )
-            shared_memory_path = ctx._require_str(
-                stack_identity.get("shared_memory_path"),
-                "runtime.stack_identity.shared_memory_path",
-            )
-            shared_file_path = ctx._require_str(
-                stack_identity.get("shared_file_path"),
-                "runtime.stack_identity.shared_file_path",
+            share_mem_path = ctx._require_str(
+                stack_identity.get("share_mem_path"),
+                "runtime.stack_identity.share_mem_path",
             )
             ctx._converge_test_stack_external_owner_shared_bundle_cleanup(
                 resolved_case,
@@ -302,7 +292,7 @@ def _prepare_test_stack_case(
         ctx="TEST_STACK prepare",
     )
     if ctx._test_stack_backend_uses_external_fluxon_kv(backend_kind=backend_kind, mode=mode):
-        if shared_memory_path is None or shared_file_path is None or stack_cluster_name is None:
+        if share_mem_path is None or stack_cluster_name is None:
             raise ValueError(
                 "internal error: TEST_STACK shared bundle identity is missing after pre-deploy cleanup"
             )

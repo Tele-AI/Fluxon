@@ -11,7 +11,7 @@
 
 use crate::cluster_manager::ClusterManagerRdmaControlInit;
 use crate::config::{
-    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig, MonitoringConfig,
+    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, LargeFilePaths, MasterConfig, MonitoringConfig,
     ProtocolConfig, ProtocolType, TestSpecConfig, TestSpecTransportMode, TransferEngineType,
 };
 use crate::run_master_with_test_overrides;
@@ -609,8 +609,7 @@ struct KvTestClientOptions {
     transfer_backend_activation_mode: Option<TransferBackendActivationMode>,
     enable_transfer_rpc_fast_path: Option<bool>,
     contribute_to_cluster_pool_size: Option<ContributeToClusterPoolSize>,
-    shared_memory_path: Option<String>,
-    shared_file_path: Option<String>,
+    share_mem_path: Option<String>,
     etcd_mode: Option<KvTestEtcdMode>,
 }
 
@@ -639,14 +638,10 @@ impl KvTestClientOptions {
                 .contribute_to_cluster_pool_size
                 .clone()
                 .or_else(|| self.contribute_to_cluster_pool_size.clone()),
-            shared_memory_path: overrides
-                .shared_memory_path
+            share_mem_path: overrides
+                .share_mem_path
                 .clone()
-                .or_else(|| self.shared_memory_path.clone()),
-            shared_file_path: overrides
-                .shared_file_path
-                .clone()
-                .or_else(|| self.shared_file_path.clone()),
+                .or_else(|| self.share_mem_path.clone()),
             etcd_mode: overrides
                 .etcd_mode
                 .clone()
@@ -767,8 +762,8 @@ struct KvTestRoundOptions {
     round_profile: KvTestRoundProfile,
     round_name: String,
     cluster_name: String,
-    master_port: u16,
-    step8_master_port: u16,
+    master_port: Option<u16>,
+    step8_master_port: Option<u16>,
     master_options: KvTestClientOptions,
     owner_client_options: KvTestClientOptions,
     external_client_options: KvTestClientOptions,
@@ -800,7 +795,7 @@ impl KvTestRoundOptions {
         )
     }
 
-    fn step8_shared_memory_path(&self) -> String {
+    fn step8_share_mem_path(&self) -> String {
         format!(
             "/tmp/kvcache_shared_memory_step8_{}_{}",
             self.round_name,
@@ -808,13 +803,6 @@ impl KvTestRoundOptions {
         )
     }
 
-    fn step8_shared_file_path(&self) -> String {
-        format!(
-            "/tmp/kvcache_shared_files_step8_{}_{}",
-            self.round_name,
-            kv_test_run_scope()
-        )
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -850,6 +838,20 @@ fn default_external_contribute_to_cluster_pool_size() -> ContributeToClusterPool
     }
 }
 
+fn default_client_large_file_paths(
+    instance_key: &str,
+    contribute_to_cluster_pool_size: &ContributeToClusterPoolSize,
+) -> LargeFilePaths {
+    if contribute_to_cluster_pool_size.dram == 0
+        && contribute_to_cluster_pool_size.vram.is_empty()
+    {
+        return LargeFilePaths { paths: Vec::new() };
+    }
+    LargeFilePaths {
+        paths: vec![format!("/tmp/kvcache_large/{}", instance_key)],
+    }
+}
+
 fn default_owner_test_client_options(round_profile: KvTestRoundProfile) -> KvTestClientOptions {
     KvTestClientOptions {
         protocol_config: Some(round_profile.protocol_config()),
@@ -858,8 +860,7 @@ fn default_owner_test_client_options(round_profile: KvTestRoundProfile) -> KvTes
         transfer_backend_activation_mode: round_profile.owner_transfer_backend_activation_mode(),
         enable_transfer_rpc_fast_path: Some(round_profile.enable_transfer_rpc_fast_path()),
         contribute_to_cluster_pool_size: Some(default_owner_contribute_to_cluster_pool_size()),
-        shared_memory_path: None,
-        shared_file_path: None,
+        share_mem_path: None,
         etcd_mode: Some(KvTestEtcdMode::Enabled),
     }
 }
@@ -872,8 +873,7 @@ fn default_master_test_client_options(round_profile: KvTestRoundProfile) -> KvTe
         transfer_backend_activation_mode: round_profile.master_transfer_backend_activation_mode(),
         enable_transfer_rpc_fast_path: Some(round_profile.enable_transfer_rpc_fast_path()),
         contribute_to_cluster_pool_size: None,
-        shared_memory_path: None,
-        shared_file_path: None,
+        share_mem_path: None,
         etcd_mode: None,
     }
 }
@@ -886,13 +886,12 @@ fn default_external_test_client_options() -> KvTestClientOptions {
         transfer_backend_activation_mode: None,
         enable_transfer_rpc_fast_path: Some(false),
         contribute_to_cluster_pool_size: Some(default_external_contribute_to_cluster_pool_size()),
-        shared_memory_path: None,
-        shared_file_path: None,
+        share_mem_path: None,
         etcd_mode: Some(KvTestEtcdMode::Disabled),
     }
 }
 
-fn new_kv_test_round(round_profile: KvTestRoundProfile, master_port: u16) -> KvTestRoundOptions {
+fn new_kv_test_round(round_profile: KvTestRoundProfile) -> KvTestRoundOptions {
     let round_name = round_profile.round_name();
     KvTestRoundOptions {
         round_profile,
@@ -900,8 +899,8 @@ fn new_kv_test_round(round_profile: KvTestRoundProfile, master_port: u16) -> KvT
         // Keep each process run on its own cluster namespace so a crashed/aborted previous run
         // cannot poison the next rerun with stale members.
         cluster_name: format!("test_cluster_{}_{}", round_name, kv_test_run_scope()),
-        master_port,
-        step8_master_port: master_port + 10,
+        master_port: None,
+        step8_master_port: None,
         master_options: default_master_test_client_options(round_profile),
         owner_client_options: default_owner_test_client_options(round_profile),
         external_client_options: default_external_test_client_options(),
@@ -919,16 +918,16 @@ fn default_kv_test_run_options() -> KvTestRunOptions {
             .map(str::trim)
             .filter(|item| !item.is_empty())
         {
-            let (profile, port) = match round_name {
-                "p2p_only" => (KvTestRoundProfile::P2pOnly, 50220),
-                "rdma_transfer_only" => (KvTestRoundProfile::RdmaTransferOnly, 50240),
-                "rdma_transfer_with_rpc" => (KvTestRoundProfile::RdmaTransferWithRpc, 50260),
+            let profile = match round_name {
+                "p2p_only" => KvTestRoundProfile::P2pOnly,
+                "rdma_transfer_only" => KvTestRoundProfile::RdmaTransferOnly,
+                "rdma_transfer_with_rpc" => KvTestRoundProfile::RdmaTransferWithRpc,
                 other => panic!(
                     "unsupported FLUXON_KV_TEST_ROUNDS entry '{}'; expected one of: p2p_only, rdma_transfer_only, rdma_transfer_with_rpc",
                     other
                 ),
             };
-            rounds.push(new_kv_test_round(profile, port));
+            rounds.push(new_kv_test_round(profile));
         }
         if rounds.is_empty() {
             panic!("FLUXON_KV_TEST_ROUNDS was set but produced no valid rounds");
@@ -938,9 +937,9 @@ fn default_kv_test_run_options() -> KvTestRunOptions {
 
     KvTestRunOptions {
         rounds: vec![
-            new_kv_test_round(KvTestRoundProfile::P2pOnly, 50220),
-            new_kv_test_round(KvTestRoundProfile::RdmaTransferOnly, 50240),
-            new_kv_test_round(KvTestRoundProfile::RdmaTransferWithRpc, 50260),
+            new_kv_test_round(KvTestRoundProfile::P2pOnly),
+            new_kv_test_round(KvTestRoundProfile::RdmaTransferOnly),
+            new_kv_test_round(KvTestRoundProfile::RdmaTransferWithRpc),
         ],
     }
 }
@@ -949,7 +948,7 @@ fn default_kv_test_run_options() -> KvTestRunOptions {
 fn new_master_launch(
     round: &KvTestRoundOptions,
     instance_key: &str,
-    port: u16,
+    port: Option<u16>,
 ) -> KvTestMasterLaunch {
     // Read etcd endpoint from project root build_config_ext.yml
     let etcd = fluxon_util::dev_config::read_etcd_endpoint_from_build_config()
@@ -980,7 +979,7 @@ fn new_master_launch(
         config: MasterConfig {
             instance_key: round.scoped_instance_key(instance_key),
             cluster_name: round.cluster_name.clone(),
-            port: Some(port),
+            port,
             etcd_endpoints: vec![etcd.clone()],
             protocol,
             transfer_engine,
@@ -1020,19 +1019,17 @@ fn build_client_launch(
         .rdma_control_init
         .expect("kv_test requires rdma_control_init to be set explicitly");
     let transfer_backend_activation_mode = options.transfer_backend_activation_mode;
-    let shared_memory_path = options
-        .shared_memory_path
+    let contribute_to_cluster_pool_size = options
+        .contribute_to_cluster_pool_size
+        .unwrap_or(default_owner_contribute_to_cluster_pool_size());
+    let share_mem_path = options
+        .share_mem_path
         .unwrap_or_else(|| format!("/tmp/kvcache_shared_memory/{}", instance_key));
-    let shared_file_path = options
-        .shared_file_path
-        .unwrap_or_else(|| format!("/tmp/kvcache_shared_files/{}", instance_key));
     let config = ClientConfig {
         cluster_name: round.cluster_name.clone(),
         etcd_addresses_raw,
         instance_key: instance_key.clone(),
-        contribute_to_cluster_pool_size: options
-            .contribute_to_cluster_pool_size
-            .unwrap_or(default_owner_contribute_to_cluster_pool_size()),
+        contribute_to_cluster_pool_size: contribute_to_cluster_pool_size.clone(),
         protocol: options.protocol_config.unwrap_or_else(tcp_protocol_config),
         pprof_duration_seconds: None,
         redis_compat_listen_addr: None,
@@ -1052,8 +1049,11 @@ fn build_client_launch(
         // kv_test uses a per-instance shared memory path by default so each owner/external share
         // group is explicit and test overrides only replace this when a scenario intentionally
         // binds multiple roles to the same owner path.
-        shared_memory_path,
-        shared_file_path,
+        share_mem_path,
+        large_file_paths: default_client_large_file_paths(
+            &instance_key,
+            &contribute_to_cluster_pool_size,
+        ),
         // Mirror round intent into the generated config so logs and runtime behavior
         // agree on whether this launch is transfer_only vs transfer_with_rpc.
         test_spec_config: kv_test_round_test_spec_config(round.round_profile),
@@ -1083,7 +1083,7 @@ fn new_client_launch(
 }
 
 /// 创建测试用的ExternalClient配置
-/// external 与 owner 的 instance_key 必须不同；仅共享 owner 的 shared_memory_path
+/// external 与 owner 的 instance_key 必须不同；仅共享 owner 的 share_mem_path
 fn new_external_client_launch(
     round: &KvTestRoundOptions,
     external_instance_key: &str,
@@ -1108,15 +1108,9 @@ fn new_external_client_launch(
     if external_options.enable_transfer_rpc_fast_path.is_none() {
         external_options.enable_transfer_rpc_fast_path = Some(false);
     }
-    if external_options.shared_memory_path.is_none() {
-        external_options.shared_memory_path = Some(format!(
+    if external_options.share_mem_path.is_none() {
+        external_options.share_mem_path = Some(format!(
             "/tmp/kvcache_shared_memory/{}",
-            round.scoped_instance_key(owner_instance_key)
-        ));
-    }
-    if external_options.shared_file_path.is_none() {
-        external_options.shared_file_path = Some(format!(
-            "/tmp/kvcache_shared_files/{}",
             round.scoped_instance_key(owner_instance_key)
         ));
     }
@@ -1586,30 +1580,17 @@ async fn shutdown_framework_with_timeout(label: &str, framework: &crate::Framewo
 async fn run_kv_step8(round: &KvTestRoundOptions) {
     info!("📋 Step 8: Verifying external client blocking and recovery behavior");
 
-    let step8_shared_memory_path = round.step8_shared_memory_path();
-    let step8_shared_file_path = round.step8_shared_file_path();
-    if let Err(e) = fs::remove_dir_all(&step8_shared_memory_path) {
+    let step8_share_mem_path = round.step8_share_mem_path();
+    if let Err(e) = fs::remove_dir_all(&step8_share_mem_path) {
         warn!(
             "Step 8: failed to remove existing shared memory dir {}: {}",
-            step8_shared_memory_path, e
+            step8_share_mem_path, e
         );
     }
-    if let Err(e) = fs::create_dir_all(&step8_shared_memory_path) {
+    if let Err(e) = fs::create_dir_all(&step8_share_mem_path) {
         warn!(
             "Step 8: failed to pre-create shared memory dir {}: {}",
-            step8_shared_memory_path, e
-        );
-    }
-    if let Err(e) = fs::remove_dir_all(&step8_shared_file_path) {
-        warn!(
-            "Step 8: failed to remove existing shared file dir {}: {}",
-            step8_shared_file_path, e
-        );
-    }
-    if let Err(e) = fs::create_dir_all(&step8_shared_file_path) {
-        warn!(
-            "Step 8: failed to pre-create shared file dir {}: {}",
-            step8_shared_file_path, e
+            step8_share_mem_path, e
         );
     }
 
@@ -1630,15 +1611,13 @@ async fn run_kv_step8(round: &KvTestRoundOptions) {
     let step8_owner_options = round
         .owner_client_options
         .merged_with(&KvTestClientOptions {
-            shared_memory_path: Some(step8_shared_memory_path.clone()),
-            shared_file_path: Some(step8_shared_file_path.clone()),
+            share_mem_path: Some(step8_share_mem_path.clone()),
             ..Default::default()
         });
     let step8_external_options = round
         .external_client_options
         .merged_with(&KvTestClientOptions {
-            shared_memory_path: Some(step8_shared_memory_path.clone()),
-            shared_file_path: Some(step8_shared_file_path.clone()),
+            share_mem_path: Some(step8_share_mem_path.clone()),
             ..Default::default()
         });
 
@@ -1840,23 +1819,17 @@ async fn run_kv_step8(round: &KvTestRoundOptions) {
         .await;
     shutdown_framework_with_timeout("step8 master", &master_framework_step8).await;
 
-    if let Err(e) = fs::remove_dir_all(&step8_shared_memory_path) {
+    if let Err(e) = fs::remove_dir_all(&step8_share_mem_path) {
         warn!(
             "Step 8: failed to clean shared memory dir {} on exit: {}",
-            step8_shared_memory_path, e
-        );
-    }
-    if let Err(e) = fs::remove_dir_all(&step8_shared_file_path) {
-        warn!(
-            "Step 8: failed to clean shared file dir {} on exit: {}",
-            step8_shared_file_path, e
+            step8_share_mem_path, e
         );
     }
 }
 
 async fn run_kv_round(round: &KvTestRoundOptions) {
     info!(
-        "Round '{}' uses cluster '{}' and master ports {} / {}",
+        "Round '{}' uses cluster '{}' and master ports {:?} / {:?}",
         round.round_name, round.cluster_name, round.master_port, round.step8_master_port
     );
 
@@ -2066,7 +2039,7 @@ async fn run_kv_round(round: &KvTestRoundOptions) {
 
         // 启动多个客户端节点
         let client1_launch = new_client_launch(round, "test_client_1", None);
-        // external 与 owner 使用不同的 instance_key，但共享 owner 的 shared_memory_path
+        // external 与 owner 使用不同的 instance_key，但共享 owner 的 share_mem_path
         let client2_launch =
             new_external_client_launch(round, "test_client_1_ext2", "test_client_1", None);
         let client3_launch =

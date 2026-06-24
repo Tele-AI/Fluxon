@@ -123,6 +123,41 @@ def _handle_mq_shell_line(line, shutdown_requested, status_lines):
         self.assertIn("MQ shell status:", stdout.getvalue())
         shutdown_requested.set.assert_not_called()
 
+    def test_quick_start_owner_configs_include_large_file_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir)
+
+            kv_cfg = _START._gen_kv_config(
+                "127.0.0.1:12379",
+                "qs_kv_cluster",
+                31000,
+                8083,
+                0,
+                14000,
+                workdir,
+            )
+            mq_cfg = _START._gen_mq_config(
+                "127.0.0.1:12379",
+                "qs_mq_cluster",
+                34200,
+                14000,
+                workdir,
+                panel_port=18080,
+            )
+            fs_cfg = _START._gen_fs_config(
+                "127.0.0.1:12379",
+                "qs_fs_cluster",
+                34100,
+                34180,
+                14000,
+                workdir,
+            )
+
+            expected = [str(workdir / "large" / "owner")]
+            self.assertEqual(kv_cfg["kvclient"]["fluxonkv_spec"]["large_file_paths"], expected)
+            self.assertEqual(mq_cfg["kvclient"]["fluxonkv_spec"]["large_file_paths"], expected)
+            self.assertEqual(fs_cfg["kvclient"]["fluxonkv_spec"]["large_file_paths"], expected)
+
     def test_pack_fluxon_pylib_cleans_stale_build_artifacts_before_bdist(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
