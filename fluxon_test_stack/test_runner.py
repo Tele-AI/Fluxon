@@ -11445,9 +11445,22 @@ def _run_adapter_action(
 
 def _run_subprocess(argv: List[str], *, cwd: str) -> None:
     print("RUN:", " ".join(_shell_quote(a) for a in argv), flush=True)
-    proc = subprocess.run(argv, cwd=cwd)
+    proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+    if proc.stdout:
+        sys.stdout.write(proc.stdout)
+        if not proc.stdout.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+        if not proc.stderr.endswith("\n"):
+            sys.stderr.write("\n")
+        sys.stderr.flush()
     if proc.returncode != 0:
-        raise RuntimeError(f"command failed: rc={proc.returncode}")
+        raise RuntimeError(
+            "command failed: "
+            f"rc={proc.returncode} cwd={cwd} argv={' '.join(_shell_quote(a) for a in argv)}"
+        )
 
 
 _SSH_TRANSPORT_TIMEOUT_SECONDS = 180.0

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -35,6 +36,7 @@ def _load_module():
 
 
 _RUNNER = _load_module()
+_CI_RUNTIME_MOD = sys.modules["test_runner_ci_runtime"]
 
 
 class TestTestRunnerTestbedContract(unittest.TestCase):
@@ -70,10 +72,23 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
     def test_ci_runtime_python_executable_requires_python310_on_path(self) -> None:
         with mock.patch.object(_RUNNER.shutil, "which", return_value=None):
-            with self.assertRaisesRegex(ValueError, "requires python3.10 on PATH"):
+            with self.assertRaisesRegex(ValueError, "requires a Python 3.10 interpreter on PATH"):
                 _RUNNER._ci_runtime_python_executable()
 
-    def test_create_ci_runtime_venv_uses_python310(self) -> None:
+    def test_ci_runtime_python_executable_accepts_python3_alias_when_it_is_python310(self) -> None:
+        with mock.patch.object(
+            _RUNNER.shutil,
+            "which",
+            side_effect=lambda name: {
+                "python3.10": None,
+                "python3": "/usr/bin/python3",
+                "python": "/usr/bin/python",
+            }.get(name),
+        ):
+            with mock.patch.object(_CI_RUNTIME_MOD, "_python_executable_abi", return_value="cpython3.10"):
+                self.assertEqual(_RUNNER._ci_runtime_python_executable(), "/usr/bin/python3")
+
+    def test_create_ci_runtime_venv_uses_python310_abi_without_ensurepip(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
             venv_dir = (run_dir / "venv").resolve()
@@ -82,20 +97,63 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             def _fake_create_venv(argv: list[str], *, cwd: str) -> None:
                 self.assertEqual(
                     argv,
-                    ["/usr/bin/python3.10", "-m", "venv", str(venv_dir)],
+                    [
+                        "/usr/bin/python3.10",
+                        "-m",
+                        "venv",
+                        "--system-site-packages",
+                        "--without-pip",
+                        str(venv_dir),
+                    ],
                 )
                 self.assertEqual(cwd, str(run_dir))
                 expected_venv_python.parent.mkdir(parents=True, exist_ok=True)
                 expected_venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
 
             with mock.patch.object(_RUNNER.shutil, "which", return_value="/usr/bin/python3.10"):
-                with mock.patch.object(_RUNNER, "_run_subprocess", side_effect=_fake_create_venv) as run_subprocess_mock:
-                    with mock.patch.object(_RUNNER, "_assert_ci_runtime_python_abi") as assert_python_abi:
-                        venv_python = _RUNNER._create_ci_runtime_venv(run_dir=run_dir)
+                with mock.patch.object(_CI_RUNTIME_MOD, "_python_executable_abi", return_value="cpython3.10"):
+                    with mock.patch.object(_RUNNER, "_run_subprocess", side_effect=_fake_create_venv) as run_subprocess_mock:
+                        with mock.patch.object(_RUNNER, "_assert_ci_runtime_python_abi") as assert_python_abi:
+                            venv_python = _RUNNER._create_ci_runtime_venv(run_dir=run_dir)
 
             self.assertEqual(venv_python, expected_venv_python)
             run_subprocess_mock.assert_called_once()
             assert_python_abi.assert_called_once_with(venv_python=expected_venv_python)
+
+    def test_runner_native_bin_kvtest_scene_stays_on_direct_wrapper_command(self) -> None:
+        suite = _RUNNER._parse_suite_config(
+            yaml.safe_load(
+                (REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8")
+            )
+        )
+        cases = _RUNNER._expand_cases(suite)
+        case = next(item for item in cases if item.scene_id == "ci_top_attention_bin_kvtest" and item.profile_id == "fluxon_tcp")
+
+        planned = _RUNNER._build_ci_execution_plan(case, suite)
+
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_bin_kvtest")
+        self.assertIn(
+            "fluxon_test_stack/top_attention_test_index/_bin_kvtest.py",
+            planned[0].ci_commands[0]["command"],
+        )
+
+    def test_run_subprocess_reports_cwd_and_argv_on_failure(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["/usr/bin/python3", "-c", "raise SystemExit(2)"],
+            returncode=2,
+            stdout="",
+            stderr="boom\n",
+        )
+        with mock.patch.object(_RUNNER.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"command failed: rc=2 cwd=/tmp argv=/usr/bin/python3 -c 'raise SystemExit\(2\)'",
+            ):
+                _RUNNER._run_subprocess(
+                    ["/usr/bin/python3", "-c", "raise SystemExit(2)"],
+                    cwd="/tmp",
+                )
 
     def test_assert_ci_runtime_python_abi_accepts_python310_venv(self) -> None:
         with mock.patch.object(_RUNNER.subprocess, "check_output", return_value="cpython3.10\n") as check_output_mock:
