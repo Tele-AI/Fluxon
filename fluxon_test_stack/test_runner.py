@@ -4194,14 +4194,19 @@ def _finalize_ci_case_runtime(
     case = _require_dict(resolved_case.get("case"), "resolved_case.case")
     run_mode = _require_str(case.get("run_mode"), "resolved_case.case.run_mode")
     ci_preserved_apply_ids: list[dict[str, str]] = []
-    for instance_id in runtime_tracking.ci_attempted_instance_ids:
-        apply_id = runtime_tracking.ci_apply_ids.get(instance_id)
-        if apply_id is None:
+    tracked_apply_entries = _ci_runtime_tracked_apply_entries(runtime_tracking)
+    for entry in tracked_apply_entries:
+        apply_id = _require_str(entry.get("apply_id"), "ci tracked apply entry.apply_id")
+        instance_ids = _require_list(entry.get("instance_ids"), "ci tracked apply entry.instance_ids")
+        if not instance_ids:
             continue
         ci_preserved_apply_ids.append(
             {
-                "instance_id": instance_id,
-                "apply_id": _require_str(apply_id, f"CI {instance_id} apply_id"),
+                "instance_id": ",".join(
+                    _require_str(raw_instance_id, "ci tracked apply entry.instance_ids[]")
+                    for raw_instance_id in instance_ids
+                ),
+                "apply_id": apply_id,
             }
         )
     # In FULL_ONCE runs, always teardown to keep the shared test bed clean for the next case.
@@ -4209,14 +4214,17 @@ def _finalize_ci_case_runtime(
     should_teardown = outcome == RUN_OUTCOME_SUCCESS or run_mode == RUN_MODE_FULL_ONCE
     if should_teardown:
         (run_dir / CI_PRESERVED_APPLY_IDS_FILENAME).unlink(missing_ok=True)
-        for instance_id in reversed(runtime_tracking.ci_attempted_instance_ids):
-            apply_id = runtime_tracking.ci_apply_ids.get(instance_id)
-            if apply_id is None:
-                continue
+        for entry in reversed(tracked_apply_entries):
+            apply_id = _require_str(entry.get("apply_id"), "ci tracked apply entry.apply_id")
+            instance_ids = _require_list(entry.get("instance_ids"), "ci tracked apply entry.instance_ids")
+            instance_id_text = ",".join(
+                _require_str(raw_instance_id, "ci tracked apply entry.instance_ids[]")
+                for raw_instance_id in instance_ids
+            )
             _delete_apply_id(
                 resolved_case,
-                apply_id=_require_str(apply_id, f"CI {instance_id} apply_id"),
-                ctx=f"CI {instance_id} apply",
+                apply_id=apply_id,
+                ctx=f"CI {instance_id_text} apply",
             )
         _ci_cleanup_runtime(resolved_case, timeout_s=120)
         return
@@ -11506,6 +11514,24 @@ def _record_ci_apply_id(
         raise ValueError(f"{ctx} unsupported CI instance_id: {instance_id}")
     ci_attempted_instance_ids.append(instance_id)
     ci_apply_ids[instance_id] = _deploy_result_history_id(deploy_result, ctx=ctx)
+
+
+def _ci_runtime_tracked_apply_entries(runtime_tracking: _CaseRuntimeTracking) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    by_apply_id: Dict[str, Dict[str, Any]] = {}
+    for instance_id in runtime_tracking.ci_attempted_instance_ids:
+        apply_id = runtime_tracking.ci_apply_ids.get(instance_id)
+        if apply_id is None:
+            continue
+        entry = by_apply_id.get(apply_id)
+        if entry is None:
+            entry = {"apply_id": apply_id, "instance_ids": []}
+            by_apply_id[apply_id] = entry
+            entries.append(entry)
+        instance_ids = _require_list(entry.get("instance_ids"), "ci tracked apply entry.instance_ids")
+        if instance_id not in instance_ids:
+            instance_ids.append(instance_id)
+    return entries
 
 
 def _delete_apply_id(resolved_case: Dict[str, Any], *, apply_id: str, ctx: str) -> None:

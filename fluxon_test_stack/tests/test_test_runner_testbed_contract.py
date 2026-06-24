@@ -38,6 +38,59 @@ _RUNNER = _load_module()
 
 
 class TestTestRunnerTestbedContract(unittest.TestCase):
+    def test_ci_runtime_tracked_apply_entries_groups_shared_apply_id(self) -> None:
+        tracking = _RUNNER._CaseRuntimeTracking(
+            ci_attempted_instance_ids=["master", "owner_0", "ci_runner"],
+            ci_apply_ids={
+                "master": "apply-cluster",
+                "owner_0": "apply-cluster",
+                "ci_runner": "apply-runner",
+            },
+        )
+
+        entries = _RUNNER._ci_runtime_tracked_apply_entries(tracking)
+
+        self.assertEqual(
+            entries,
+            [
+                {"apply_id": "apply-cluster", "instance_ids": ["master", "owner_0"]},
+                {"apply_id": "apply-runner", "instance_ids": ["ci_runner"]},
+            ],
+        )
+
+    def test_finalize_ci_case_runtime_deletes_each_apply_id_once(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            tracking = _RUNNER._CaseRuntimeTracking(
+                ci_attempted_instance_ids=["master", "owner_0", "ci_runner"],
+                ci_apply_ids={
+                    "master": "apply-cluster",
+                    "owner_0": "apply-cluster",
+                    "ci_runner": "apply-runner",
+                },
+            )
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_FULL_ONCE,
+                    "case_id": "ci_top_attention_mq_core__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+                }
+            }
+
+            with mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply:
+                with mock.patch.object(_RUNNER, "_ci_cleanup_runtime") as cleanup_runtime:
+                    _RUNNER._finalize_ci_case_runtime(
+                        resolved_case,
+                        run_dir=run_dir,
+                        runtime_tracking=tracking,
+                        outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+                    )
+
+            self.assertEqual(
+                [call.kwargs["apply_id"] for call in delete_apply.call_args_list],
+                ["apply-runner", "apply-cluster"],
+            )
+            cleanup_runtime.assert_called_once_with(resolved_case, timeout_s=120)
+
     def test_write_ci_scene_config_yaml_emits_structured_scene_config(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
