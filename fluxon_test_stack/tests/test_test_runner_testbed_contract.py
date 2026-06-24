@@ -68,6 +68,136 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 [str((run_dir / "services" / "owner_0" / "large").resolve())],
             )
 
+    def test_ci_runtime_python_executable_requires_python310_on_path(self) -> None:
+        with mock.patch.object(_RUNNER.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(ValueError, "requires python3.10 on PATH"):
+                _RUNNER._ci_runtime_python_executable()
+
+    def test_create_ci_runtime_venv_uses_python310(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            venv_dir = (run_dir / "venv").resolve()
+            expected_venv_python = (venv_dir / "bin" / "python3").resolve()
+
+            def _fake_create_venv(argv: list[str], *, cwd: str) -> None:
+                self.assertEqual(
+                    argv,
+                    ["/usr/bin/python3.10", "-m", "venv", str(venv_dir)],
+                )
+                self.assertEqual(cwd, str(run_dir))
+                expected_venv_python.parent.mkdir(parents=True, exist_ok=True)
+                expected_venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+
+            with mock.patch.object(_RUNNER.shutil, "which", return_value="/usr/bin/python3.10"):
+                with mock.patch.object(_RUNNER, "_run_subprocess", side_effect=_fake_create_venv) as run_subprocess_mock:
+                    with mock.patch.object(_RUNNER, "_assert_ci_runtime_python_abi") as assert_python_abi:
+                        venv_python = _RUNNER._create_ci_runtime_venv(run_dir=run_dir)
+
+            self.assertEqual(venv_python, expected_venv_python)
+            run_subprocess_mock.assert_called_once()
+            assert_python_abi.assert_called_once_with(venv_python=expected_venv_python)
+
+    def test_assert_ci_runtime_python_abi_accepts_python310_venv(self) -> None:
+        with mock.patch.object(_RUNNER.subprocess, "check_output", return_value="cpython3.10\n") as check_output_mock:
+            _RUNNER._assert_ci_runtime_python_abi(venv_python=Path("/tmp/venv/bin/python3"))
+
+        check_output_mock.assert_called_once()
+
+    def test_assert_ci_runtime_python_abi_rejects_non_python310_venv(self) -> None:
+        with mock.patch.object(_RUNNER.subprocess, "check_output", return_value="cpython3.11\n"):
+            with self.assertRaisesRegex(ValueError, "must match the prepared offline wheelhouse"):
+                _RUNNER._assert_ci_runtime_python_abi(venv_python=Path("/tmp/venv/bin/python3"))
+
+    def test_ci_runtime_tracked_apply_entries_groups_shared_apply_id(self) -> None:
+        tracking = _RUNNER._CaseRuntimeTracking(
+            ci_attempted_instance_ids=["master", "owner_0", "ci_runner"],
+            ci_apply_ids={
+                "master": "apply-cluster",
+                "owner_0": "apply-cluster",
+                "ci_runner": "apply-runner",
+            },
+        )
+
+        entries = _RUNNER._ci_runtime_tracked_apply_entries(tracking)
+
+        self.assertEqual(
+            entries,
+            [
+                {"apply_id": "apply-cluster", "instance_ids": ["master", "owner_0"]},
+                {"apply_id": "apply-runner", "instance_ids": ["ci_runner"]},
+            ],
+        )
+
+    def test_finalize_ci_case_runtime_deletes_each_apply_id_once(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            tracking = _RUNNER._CaseRuntimeTracking(
+                ci_attempted_instance_ids=["master", "owner_0", "ci_runner"],
+                ci_apply_ids={
+                    "master": "apply-cluster",
+                    "owner_0": "apply-cluster",
+                    "ci_runner": "apply-runner",
+                },
+            )
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_FULL_ONCE,
+                    "case_id": "ci_top_attention_mq_core__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+                }
+            }
+
+            with mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply:
+                with mock.patch.object(_RUNNER, "_ci_cleanup_runtime") as cleanup_runtime:
+                    _RUNNER._finalize_ci_case_runtime(
+                        resolved_case,
+                        run_dir=run_dir,
+                        runtime_tracking=tracking,
+                        outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+                    )
+
+            self.assertEqual(
+                [call.kwargs["apply_id"] for call in delete_apply.call_args_list],
+                ["apply-runner", "apply-cluster"],
+            )
+            cleanup_runtime.assert_called_once_with(resolved_case, timeout_s=120)
+
+    def test_finalize_ci_case_runtime_preserves_structured_instance_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            tracking = _RUNNER._CaseRuntimeTracking(
+                ci_attempted_instance_ids=["master", "owner_0", "ci_runner"],
+                ci_apply_ids={
+                    "master": "apply-cluster",
+                    "owner_0": "apply-cluster",
+                    "ci_runner": "apply-runner",
+                },
+            )
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_DEBUG_ONE_BY_ONE,
+                    "case_id": "ci_top_attention_mq_core__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+                }
+            }
+
+            _RUNNER._finalize_ci_case_runtime(
+                resolved_case,
+                run_dir=run_dir,
+                runtime_tracking=tracking,
+                outcome=_RUNNER.RUN_OUTCOME_FAILED,
+            )
+
+            payload = yaml.safe_load((run_dir / _RUNNER.CI_PRESERVED_APPLY_IDS_FILENAME).read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload,
+                {
+                    "schema_version": _RUNNER.CI_PRESERVED_APPLY_IDS_SCHEMA_VERSION,
+                    "apply_ids": [
+                        {"instance_ids": ["master", "owner_0"], "apply_id": "apply-cluster"},
+                        {"instance_ids": ["ci_runner"], "apply_id": "apply-runner"},
+                    ],
+                },
+            )
+
     def test_write_ci_scene_config_yaml_emits_structured_scene_config(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
@@ -176,16 +306,6 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
     def test_top_attention_ci_execution_plan_is_runner_native(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
-        artifact_sets = suite_cfg.get("artifact_sets")
-        if isinstance(artifact_sets, dict):
-            for artifact_set in artifact_sets.values():
-                if not isinstance(artifact_set, dict):
-                    continue
-                release_artifacts = artifact_set.get("release_artifacts")
-                if isinstance(release_artifacts, dict):
-                    python_wheel = release_artifacts.get("python_wheel")
-                    if isinstance(python_wheel, str) and python_wheel.strip():
-                        artifact_set["release_artifacts"] = {"wheel": python_wheel}
         suite = _RUNNER._parse_suite_config(suite_cfg)
         cases = _RUNNER._expand_cases(suite)
         case = next(item for item in cases if item.scene_id == "ci_top_attention_bin_kvtest" and item.profile_id == "fluxon_tcp")
@@ -214,22 +334,27 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_log_mgmt")
         self.assertIn(
             "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_log_mgmt.py",
+
+            planned[0].ci_commands[0]["command"],
+        )
+        self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
+
+    def test_top_attention_mq_core_ci_execution_plan_is_runner_native(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        case = next(item for item in cases if item.scene_id == "ci_top_attention_mq_core" and item.profile_id == "fluxon_tcp")
+        planned = _RUNNER._build_ci_execution_plan(case, suite)
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_mq_core")
+        self.assertIn(
+            "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_core.py",
             planned[0].ci_commands[0]["command"],
         )
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
 
     def test_doc_page_ci_execution_plan_uses_online_docker_image(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
-        artifact_sets = suite_cfg.get("artifact_sets")
-        if isinstance(artifact_sets, dict):
-            for artifact_set in artifact_sets.values():
-                if not isinstance(artifact_set, dict):
-                    continue
-                release_artifacts = artifact_set.get("release_artifacts")
-                if isinstance(release_artifacts, dict):
-                    python_wheel = release_artifacts.get("python_wheel")
-                    if isinstance(python_wheel, str) and python_wheel.strip():
-                        artifact_set["release_artifacts"] = {"wheel": python_wheel}
         suite = _RUNNER._parse_suite_config(suite_cfg)
         cases = _RUNNER._expand_cases(suite)
         case = next(item for item in cases if item.scene_id == "ci_top_attention_doc_page_build" and item.profile_id == "fluxon_tcp")
@@ -252,6 +377,21 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             source_root = root / "source_root"
             source_root.mkdir()
             (source_root / "README.md").write_text("repo\n", encoding="utf-8")
+            source_test_cfg = source_root / "fluxon_py" / "tests" / "test_config.yaml"
+            source_test_cfg.parent.mkdir(parents=True, exist_ok=True)
+            source_test_cfg.write_text(
+                "\n".join(
+                    [
+                        "kv_svc_type: fluxon",
+                        "etcd_address: 127.0.0.1:2379",
+                        "cluster_name: fluxon-example-cluster",
+                        "shared_memory_path: /tmp/fluxon-example-cluster/shm",
+                        "shared_file_path: /tmp/fluxon-example-cluster/share",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
 
             release_root = root / "release_root"
             release_root.mkdir()
@@ -266,6 +406,23 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             test_rsc_root = root / "test_rsc_root"
             test_rsc_root.mkdir()
             (test_rsc_root / "from_case.txt").write_text("case\n", encoding="utf-8")
+            (test_rsc_root / "prepare.yaml").write_text(
+                "\n".join(
+                    [
+                        "python_runtime:",
+                        "  dependency_sets:",
+                        "    base:",
+                        "      requirements:",
+                        "        - pinned: pytest==8.3.5",
+                        "          source: wheel",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            wheelhouse_root = test_rsc_root / "python_runtime" / "cpython3.10" / "wheels"
+            wheelhouse_root.mkdir(parents=True, exist_ok=True)
+            (wheelhouse_root / "pytest-8.3.5-py3-none-any.whl").write_text("wheel\n", encoding="utf-8")
 
             ci_src_archive_path = test_rsc_root / "src_ci.tar.gz"
             with tarfile.open(ci_src_archive_path, "w:gz") as tf:
@@ -282,6 +439,10 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             )
             test_rsc_manifest = {
                 "src_ci.tar.gz": _RUNNER._sha256_file(ci_src_archive_path),
+                "prepare.yaml": _RUNNER._sha256_file(test_rsc_root / "prepare.yaml"),
+                "python_runtime/cpython3.10/wheels/pytest-8.3.5-py3-none-any.whl": _RUNNER._sha256_file(
+                    wheelhouse_root / "pytest-8.3.5-py3-none-any.whl"
+                ),
             }
             (test_rsc_root / "fluxon_test_rsc.sha256").write_text(
                 "".join(f"{digest}  {name}\n" for name, digest in test_rsc_manifest.items()),
@@ -294,6 +455,45 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             venv_python = run_dir / "venv" / "bin" / "python3"
             venv_python.parent.mkdir(parents=True, exist_ok=True)
             venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+            testbed_bundle_root = root / "testbed_bundle"
+            testbed_bundle_root.mkdir()
+            start_cfg = testbed_bundle_root / "start_test_bed.runner.yaml"
+            deployconf_path = testbed_bundle_root / "deployconf.yaml"
+            start_cfg.write_text(
+                "\n".join(
+                    [
+                        "schema_version: 6",
+                        "deployconf_path: ./deployconf.yaml",
+                        "controller_url: http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                        "controller_basic_auth:",
+                        "  username: ops_admin",
+                        "  password: ops_password",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            deployconf_path.write_text(
+                "\n".join(
+                    [
+                        "global_envs:",
+                        "  FLUXON_CLUSTER_NAME: fluxon_testbed",
+                        "  FLUXON_SHARED_MEM: ${HOSTWORKDIR}/shm1",
+                        "  FLUXON_SHARED_MEM2: ${HOSTWORKDIR}/shm2_files",
+                        "cluster_nodes:",
+                        "  - hostname: logic-a",
+                        "    ip: 127.0.0.1",
+                        "    hostworkdir: /tmp/fluxon_testbed/a",
+                        "    execution_mode: local",
+                        "service:",
+                        "  ops_controller:",
+                        "    node_bind:",
+                        "      node: [logic-a]",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
 
             resolved_case = {
                 "artifact_set": {
@@ -305,17 +505,24 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 }
             }
 
-            with mock.patch.object(_RUNNER, "_run_subprocess") as run_subprocess_mock:
-                _RUNNER._ci_prepare_run_inputs(
-                    resolved_case=resolved_case,
-                    source_root=source_root,
-                    release_root=release_root,
-                    test_rsc_root=test_rsc_root,
-                    src_root=src_root,
-                    venv_python=venv_python,
-                    ci_commands=None,
-                    overlay_live_checkout=False,
-                )
+            env = {**os.environ, _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg)}
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch.object(_RUNNER, "_assert_ci_runtime_python_abi") as assert_python_abi:
+                    with mock.patch.object(_RUNNER, "_run_subprocess") as run_subprocess_mock:
+                        _RUNNER._ci_prepare_run_inputs(
+                            resolved_case=resolved_case,
+                            source_root=source_root,
+                            release_root=release_root,
+                            test_rsc_root=test_rsc_root,
+                            src_root=src_root,
+                            venv_python=venv_python,
+                            ci_commands=None,
+                            overlay_live_checkout=False,
+                            etcd_address="127.0.0.1:32579",
+                            cluster_name="ci_case_cluster",
+                            shared_memory_path="/tmp/ci_case_cluster/shm",
+                            shared_file_path="/tmp/ci_case_cluster/share",
+                        )
 
             release_view_root = src_root / "fluxon_release"
             self.assertTrue(release_view_root.is_dir())
@@ -326,7 +533,49 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertFalse((release_view_root / "from_release.txt").exists())
             self.assertTrue((release_view_root / "test_rsc" / "from_case.txt").exists())
             self.assertTrue((src_root / "payload.txt").is_file())
-            run_subprocess_mock.assert_called_once()
+            rendered_test_cfg = yaml.safe_load((src_root / "fluxon_py" / "tests" / "test_config.yaml").read_text(encoding="utf-8"))
+            self.assertEqual(
+                rendered_test_cfg,
+                {
+                    "kv_svc_type": "fluxon",
+                    "etcd_address": "127.0.0.1:32579",
+                    "cluster_name": "ci_case_cluster",
+                    "shared_memory_path": "/tmp/ci_case_cluster/shm",
+                    "shared_file_path": "/tmp/ci_case_cluster/share",
+                },
+            )
+            assert_python_abi.assert_called_once_with(venv_python=venv_python)
+            self.assertEqual(run_subprocess_mock.call_count, 2)
+            first_call = run_subprocess_mock.call_args_list[0]
+            second_call = run_subprocess_mock.call_args_list[1]
+            self.assertEqual(
+                first_call.kwargs["cwd"],
+                str(src_root),
+            )
+            self.assertEqual(
+                first_call.args[0],
+                [
+                    str(venv_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-index",
+                    "--find-links",
+                    str(wheelhouse_root),
+                    "pytest==8.3.5",
+                ],
+            )
+            self.assertEqual(
+                second_call.args[0],
+                [
+                    str(venv_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--force-reinstall",
+                    str(release_root / wheel_name),
+                ],
+            )
 
     def test_ci_runner_script_sources_prepare_env_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as td:

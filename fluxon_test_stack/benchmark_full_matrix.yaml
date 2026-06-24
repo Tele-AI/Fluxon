@@ -193,8 +193,7 @@ artifact_sets:
       region: us-east-1
       key_prefix: profiles/fluxon_fastws
     release_artifacts:
-      python_wheel: fluxon-0.2.1-py3-none-any.whl
-      pyo3_wheel: fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
+      wheel: fluxon-0.2.1-py3-none-any.whl
     test_rsc_source: &test_rsc_source_fastws
       kind: FLUXON_OPS_FS_S3
       bucket: fluxon-release
@@ -215,8 +214,7 @@ artifact_sets:
       region: us-east-1
       key_prefix: profiles/fluxon_tquic
     release_artifacts:
-      python_wheel: fluxon-0.2.1-py3-none-any.whl
-      pyo3_wheel: fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
+      wheel: fluxon-0.2.1-py3-none-any.whl
     test_rsc_source: &test_rsc_source_tquic
       kind: FLUXON_OPS_FS_S3
       bucket: fluxon-release
@@ -237,8 +235,7 @@ artifact_sets:
       region: us-east-1
       key_prefix: profiles/fluxon_sockudo_ws
     release_artifacts:
-      python_wheel: fluxon-0.2.1-py3-none-any.whl
-      pyo3_wheel: fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
+      wheel: fluxon-0.2.1-py3-none-any.whl
     test_rsc_source: &test_rsc_source_sockudo_ws
       kind: FLUXON_OPS_FS_S3
       bucket: fluxon-release
@@ -259,8 +256,7 @@ artifact_sets:
       region: us-east-1
       key_prefix: profiles/fluxon_tcp
     release_artifacts:
-      python_wheel: fluxon-0.2.1-py3-none-any.whl
-      pyo3_wheel: fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
+      wheel: fluxon-0.2.1-py3-none-any.whl
     test_rsc_source: &test_rsc_source_tcp
       kind: FLUXON_OPS_FS_S3
       bucket: fluxon-release

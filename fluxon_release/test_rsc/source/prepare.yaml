@@ -19,6 +19,8 @@ python_runtime:
           source: wheel
         - pinned: readerwriterlock==1.0.9
           source: wheel
+        - pinned: pytest==8.3.5
+          source: wheel
     zerorpc:
       requirements:
         - pinned: zerorpc==0.6.3

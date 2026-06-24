@@ -32,12 +32,11 @@ TEST_TIMEOUT_SECONDS = 30 * 60
 from setup_and_pack.utils.repo_config_utils import (
     _verify_host_port,
     _verify_url,
-    load_deployconf_etcd_address,
-    load_deployconf_fluxon_cluster_name,
-    load_deployconf_fluxon_shared_file_path,
-    load_deployconf_fluxon_shared_memory_path,
     load_test_config_mapping,
-    load_test_deployconf_path,
+    load_test_etcd_address_from_test_config,
+    load_test_fluxon_cluster_name_from_test_config,
+    load_test_fluxon_shared_file_path_from_test_config,
+    load_test_fluxon_shared_memory_path_from_test_config,
     load_test_kv_svc_type_from_test_config,
 )
 
@@ -50,10 +49,9 @@ def load_test_kv_svc_type(*, config_path: Optional[Path] = None) -> str:
 
 
 def load_test_kv_svc_ip(*, config_path: Optional[Path] = None) -> str:
-    """Load test backend host from the shared deployconf."""
-    deployconf_path = load_test_deployconf_path(config_path=config_path)
-    etcd_addr = load_deployconf_etcd_address(config_path=deployconf_path)
-    s, _port = _verify_host_port(etcd_addr, field="deployconf.global_envs.ETCD_FULL_ADDRESS")
+    """Load test backend host from test_config.yaml."""
+    etcd_addr = load_test_etcd_address_from_test_config(config_path=config_path)
+    s, _port = _verify_host_port(etcd_addr, field="test_config.yaml.etcd_address")
     if "://" in s or not s:
         raise ValueError("test backend host should be a host or IP without scheme, e.g. 127.0.0.1")
     return s
@@ -81,21 +79,18 @@ def load_test_mooncake_master_server_address(*, config_path: Optional[Path] = No
 
 
 def load_test_fluxon_cluster_name(*, config_path: Optional[Path] = None) -> str:
-    """Load required fluxon cluster name from the shared deployconf."""
-    deployconf_path = load_test_deployconf_path(config_path=config_path)
-    return load_deployconf_fluxon_cluster_name(config_path=deployconf_path)
+    """Load required Fluxon cluster name from test_config.yaml."""
+    return load_test_fluxon_cluster_name_from_test_config(config_path=config_path)
 
 
 def load_test_fluxon_share_mem_path(*, config_path: Optional[Path] = None) -> str:
-    """Load required fluxon shared memory path from the shared deployconf."""
-    deployconf_path = load_test_deployconf_path(config_path=config_path)
-    return load_deployconf_fluxon_shared_memory_path(config_path=deployconf_path)
+    """Load required Fluxon shared-memory path from test_config.yaml."""
+    return load_test_fluxon_shared_memory_path_from_test_config(config_path=config_path)
 
 
 def load_test_fluxon_share_file_path(*, config_path: Optional[Path] = None) -> str:
-    """Load required fluxon shared file path from the shared deployconf."""
-    deployconf_path = load_test_deployconf_path(config_path=config_path)
-    return load_deployconf_fluxon_shared_file_path(config_path=deployconf_path)
+    """Load required Fluxon shared-file path from test_config.yaml."""
+    return load_test_fluxon_shared_file_path_from_test_config(config_path=config_path)
 
 
 def load_test_chan_config(*, config_path: Optional[Path] = None) -> Dict[str, int]:
@@ -105,10 +100,9 @@ def load_test_chan_config(*, config_path: Optional[Path] = None) -> Dict[str, in
     """
     return {"capacity": 10, "ttl_seconds": 90, "weight": 1}
 
-# Resolve ETCD host/port and test configuration via config utils (no direct field access)
-_TEST_DEPLOYCONF_PATH = load_test_deployconf_path()
-_ETCD_ADDRESS = load_deployconf_etcd_address(config_path=_TEST_DEPLOYCONF_PATH)
-ETCD_HOST, _ETCD_PORT = _verify_host_port(_ETCD_ADDRESS, field="deployconf.global_envs.ETCD_FULL_ADDRESS")
+# Resolve ETCD host/port and test configuration via test_config.yaml (single explicit authority)
+_ETCD_ADDRESS = load_test_etcd_address_from_test_config()
+ETCD_HOST, _ETCD_PORT = _verify_host_port(_ETCD_ADDRESS, field="test_config.yaml.etcd_address")
 ETCD_PORT = int(_ETCD_PORT)
 KV_SVC_TYPE = load_test_kv_svc_type()
 KV_SVC_IP = load_test_kv_svc_ip()

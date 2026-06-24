@@ -9,6 +9,9 @@ Keep this document concise.
 - Git operations are limited to basic `stage`, `unstage`, `commit`, and `push`. Do not use other Git operations.
 - Prefer contraction over compatibility by default. Do not add compatibility layers, deprecated paths, or aliases unless the task explicitly requires them.
 - Prefer one canonical name for one concept. Avoid synonym parameters, duplicated entrypoints, and parallel config surfaces.
+- For test entrypoints, match the real execution model directly. If a test is a standalone script/process test, invoke it as a script/process; do not wrap it in `pytest` just for uniformity.
+- Do not forward pytest-style flags (`-k`, `-q`, node selectors, etc.) through direct-process test wrappers unless the wrapper explicitly implements and documents that selector surface.
+- For new integration or process-lifecycle tests, prefer direct process startup with explicit arguments and explicit exit-code checks over adding new pytest-only wrappers.
 - Control branching deliberately. Prefer a small, explicit, enumerated set of supported branches in the style of a Rust enum over open-ended proliferation of near-duplicate cases.
 - When extending a surface, prefer folding the new case into an existing finite branch set. If a new branch is unavoidable, make it explicit, bounded, and easy to list exhaustively.
 - Names for testbed-scoped concepts should say `testbed` explicitly. Avoid generic names for testbed-only modes, ports, roots, workdirs, and other testbed-scoped settings.
