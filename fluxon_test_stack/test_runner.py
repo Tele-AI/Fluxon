@@ -402,6 +402,11 @@ def _runner_native_ci_scene_ids() -> Tuple[str, ...]:
         "ci_top_attention_doc_page_build",
         "ci_top_attention_bin_kvtest",
         "ci_top_attention_mq_core",
+        "ci_top_attention_mq_mpsc",
+        "ci_top_attention_mq_mpmc",
+        "ci_top_attention_mq_mpmc_bench",
+        "ci_top_attention_ctrl_c_kv",
+        "ci_top_attention_ctrl_c_mq",
     )
 
 
@@ -7034,6 +7039,66 @@ def _runner_native_ci_commands_for_case(case: _ResolvedCase, *, ctx: str) -> Lis
                 "command": (
                     "__RUN_DIR__/venv/bin/python3 -u "
                     "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_core.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_mq_mpsc":
+        return [
+            {
+                "id": "top_attention_mq_mpsc",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_mpsc.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_mq_mpmc":
+        return [
+            {
+                "id": "top_attention_mq_mpmc",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_mpmc.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_mq_mpmc_bench":
+        return [
+            {
+                "id": "top_attention_mq_mpmc_bench",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_mpmc_bench.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_ctrl_c_kv":
+        return [
+            {
+                "id": "top_attention_ctrl_c_kv",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_ctrl_c_kv.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 10800,
+            }
+        ]
+    if scene_id == "ci_top_attention_ctrl_c_mq":
+        return [
+            {
+                "id": "top_attention_ctrl_c_mq",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_ctrl_c_mq.py "
                     "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
                 ),
                 "timeout_seconds": 21600,

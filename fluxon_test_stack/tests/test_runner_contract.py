@@ -63,6 +63,10 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
             "ci_top_attention_mq_core_uses_cluster_kv_owner_runtime",
             test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime,
         ),
+        (
+            "ci_top_attention_extra_runner_native_scenes_are_registered",
+            test_ci_top_attention_extra_runner_native_scenes_are_registered,
+        ),
     ]
     if selected_test_id is None:
         return checks
@@ -289,6 +293,25 @@ def test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime() -> None:
         )
         return
     print("PASS: test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime")
+
+
+def test_ci_top_attention_extra_runner_native_scenes_are_registered() -> None:
+    expected = {
+        "ci_top_attention_mq_mpsc",
+        "ci_top_attention_mq_mpmc",
+        "ci_top_attention_mq_mpmc_bench",
+        "ci_top_attention_ctrl_c_kv",
+        "ci_top_attention_ctrl_c_mq",
+    }
+    actual = set(_TEST_RUNNER._runner_native_ci_scene_ids())
+    missing = sorted(expected - actual)
+    if missing:
+        print(
+            "FAIL: test_ci_top_attention_extra_runner_native_scenes_are_registered - "
+            f"missing scenes: {missing!r}"
+        )
+        return
+    print("PASS: test_ci_top_attention_extra_runner_native_scenes_are_registered")
 
 
 if __name__ == "__main__":

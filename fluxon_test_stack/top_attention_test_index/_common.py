@@ -32,13 +32,28 @@ def parse_python_passthrough(description: str) -> tuple[str, list[str]]:
     return args.python, passthrough
 
 
-def run_pytest(description: str, paths: Iterable[str]) -> int:
-    python, passthrough = parse_python_passthrough(description)
+def run_pytest(
+    description: str,
+    paths: Iterable[str],
+    *,
+    passthrough: Iterable[str] = (),
+    python: str | None = None,
+) -> int:
+    if python is None:
+        python = parse_python_passthrough(description)[0]
     return call([python, "-m", "pytest", *paths, *passthrough])
 
 
-def run_python_file(description: str, path: str, extra_args: Iterable[str] = ()) -> int:
-    python, passthrough = parse_python_passthrough(description)
+def run_python_file(
+    description: str,
+    path: str,
+    extra_args: Iterable[str] = (),
+    *,
+    passthrough: Iterable[str] = (),
+    python: str | None = None,
+) -> int:
+    if python is None:
+        python = parse_python_passthrough(description)[0]
     return call([python, "-u", str(REPO_ROOT / path), *extra_args, *passthrough])
 
 

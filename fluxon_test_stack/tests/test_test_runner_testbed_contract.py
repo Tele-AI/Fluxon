@@ -238,6 +238,25 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         )
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
 
+    def test_top_attention_extra_ci_execution_plans_are_runner_native(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        expected = {
+            "ci_top_attention_mq_mpsc": ("top_attention_mq_mpsc", "_mq_mpsc.py"),
+            "ci_top_attention_mq_mpmc": ("top_attention_mq_mpmc", "_mq_mpmc.py"),
+            "ci_top_attention_mq_mpmc_bench": ("top_attention_mq_mpmc_bench", "_mq_mpmc_bench.py"),
+            "ci_top_attention_ctrl_c_kv": ("top_attention_ctrl_c_kv", "_ctrl_c_kv.py"),
+            "ci_top_attention_ctrl_c_mq": ("top_attention_ctrl_c_mq", "_ctrl_c_mq.py"),
+        }
+        for scene_id, (command_id, script_name) in expected.items():
+            case = next(item for item in cases if item.scene_id == scene_id and item.profile_id == "fluxon_tcp")
+            planned = _RUNNER._build_ci_execution_plan(case, suite)
+            self.assertEqual(len(planned), 1)
+            self.assertEqual(planned[0].ci_commands[0]["id"], command_id)
+            self.assertIn(script_name, planned[0].ci_commands[0]["command"])
+            self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
+
     def test_doc_page_ci_execution_plan_uses_online_docker_image(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
         suite = _RUNNER._parse_suite_config(suite_cfg)

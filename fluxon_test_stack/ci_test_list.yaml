@@ -37,6 +37,46 @@ scenes:
       scales: [n1_kvowner_dram_20gib]
       profiles: [fluxon_tcp]
 
+  ci_top_attention_mq_mpsc:
+    ci:
+      subject: mq
+      runtime_contract: cluster_kv_owner
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_mq_mpmc:
+    ci:
+      subject: mq
+      runtime_contract: cluster_kv_owner
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_mq_mpmc_bench:
+    ci:
+      subject: mq
+      runtime_contract: cluster_kv_owner
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_ctrl_c_kv:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_ctrl_c_mq:
+    ci:
+      subject: mq
+      runtime_contract: cluster_kv_owner
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
   kv_read_heavy_zipf:
     test_stack:
       mode: KVSTORE
@@ -320,6 +360,11 @@ profiles:
           ci_top_attention_bin_kvtest:
             kv_test_rounds: all
           ci_top_attention_mq_core: {}
+          ci_top_attention_mq_mpsc: {}
+          ci_top_attention_mq_mpmc: {}
+          ci_top_attention_mq_mpmc_bench: {}
+          ci_top_attention_ctrl_c_kv: {}
+          ci_top_attention_ctrl_c_mq: {}
         runtime_contracts:
           cluster_kv_owner: &cluster_kv_owner_runtime
             base_runtime:
@@ -466,6 +511,11 @@ profiles:
           ci_top_attention_bin_kvtest:
             kv_test_rounds: all
           ci_top_attention_mq_core: {}
+          ci_top_attention_mq_mpsc: {}
+          ci_top_attention_mq_mpmc: {}
+          ci_top_attention_mq_mpmc_bench: {}
+          ci_top_attention_ctrl_c_kv: {}
+          ci_top_attention_ctrl_c_mq: {}
       test_stack:
         <<: *common_test_stack_runtime
   fluxon_sockudo_ws:
@@ -479,6 +529,11 @@ profiles:
           ci_top_attention_bin_kvtest:
             kv_test_rounds: all
           ci_top_attention_mq_core: {}
+          ci_top_attention_mq_mpsc: {}
+          ci_top_attention_mq_mpmc: {}
+          ci_top_attention_mq_mpmc_bench: {}
+          ci_top_attention_ctrl_c_kv: {}
+          ci_top_attention_ctrl_c_mq: {}
       test_stack:
         <<: *common_test_stack_runtime
   fluxon_tcp:
@@ -492,6 +547,11 @@ profiles:
           ci_top_attention_bin_kvtest:
             kv_test_rounds: all
           ci_top_attention_mq_core: {}
+          ci_top_attention_mq_mpsc: {}
+          ci_top_attention_mq_mpmc: {}
+          ci_top_attention_mq_mpmc_bench: {}
+          ci_top_attention_ctrl_c_kv: {}
+          ci_top_attention_ctrl_c_mq: {}
       test_stack:
         <<: *common_test_stack_runtime
   redis_sharded:
