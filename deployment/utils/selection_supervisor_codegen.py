@@ -70,22 +70,12 @@ _STDIO_ROUTER_KEEPALIVE_FP = None
 
 
 def _load_log_shard_helper():
-    candidates = []
     raw_file = globals().get("__file__")
-    if isinstance(raw_file, str) and raw_file:
-        candidates.append(Path(raw_file).resolve().with_name("__LOG_SHARD_HELPER_FILENAME__"))
-    cwd = Path.cwd().resolve()
-    candidates.append(cwd / "__LOG_SHARD_HELPER_FILENAME__")
-    candidates.append(cwd / "deployment" / "utils" / "__LOG_SHARD_HELPER_FILENAME__")
-    for entry in sys.path:
-        if not isinstance(entry, str) or not entry:
-            continue
-        candidates.append(Path(entry).resolve() / "__LOG_SHARD_HELPER_FILENAME__")
-    helper_path = candidates[0]
-    for candidate in candidates:
-        if candidate.is_file():
-            helper_path = candidate
-            break
+    if not isinstance(raw_file, str) or not raw_file:
+        raise RuntimeError("selection_supervisor.py requires __file__ to resolve log shard helper")
+    helper_path = Path(raw_file).resolve().with_name("__LOG_SHARD_HELPER_FILENAME__")
+    if not helper_path.is_file():
+        raise RuntimeError(f"missing log shard helper next to selection_supervisor.py: {helper_path}")
     spec = importlib.util.spec_from_file_location("_fluxon_selection_log_shard", helper_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"failed to load log shard helper: {helper_path}")

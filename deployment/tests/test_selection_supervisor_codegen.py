@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
-import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
@@ -39,6 +39,7 @@ def main() -> int:
 def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[], None]]]:
     checks: List[Tuple[str, Callable[[], None]]] = [
         ("runtime_only_supports_run_stop", test_runtime_only_supports_run_stop),
+        ("runtime_requires_same_directory_log_shard_helper", test_runtime_requires_same_directory_log_shard_helper),
         ("install_subreaper_uses_prctl", test_install_subreaper_uses_prctl),
         ("spawn_child_sanitizes_rdma_driver_env", test_spawn_child_sanitizes_rdma_driver_env),
         ("selection_present_requires_live_child_process", test_selection_present_requires_live_child_process),
@@ -82,13 +83,20 @@ def _run_check(check: Callable[[], None]) -> bool:
 
 
 def _load_runtime_module():
-    module = types.ModuleType("test_selection_supervisor_runtime")
-    sys.modules[module.__name__] = module
-    code = render_python_selection_supervisor_module(
-        timeouts=SimpleNamespace(term_seconds=5, kill_seconds=5, supersede_seconds=2),
-    )
-    exec(code, module.__dict__)
-    return module
+    root = Path(tempfile.mkdtemp(prefix="test_selection_supervisor_runtime_module_"))
+    try:
+        supervisor_path = _write_runtime_script(root)
+        module_name = f"test_selection_supervisor_runtime_{os.getpid()}_{time.time_ns()}"
+        spec = importlib.util.spec_from_file_location(module_name, supervisor_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"failed to load runtime module spec: {supervisor_path}")
+        module = importlib.util.module_from_spec(spec)
+        module._test_runtime_root = root
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 def _write_runtime_script(root: Path, *, term_seconds: int = 5, kill_seconds: int = 5, supersede_seconds: int = 2) -> Path:
@@ -438,6 +446,16 @@ def _wait_pid_absent(pid: int, *, timeout_seconds: float = 10.0) -> None:
     raise RuntimeError(f"timeout waiting pid absent: pid={pid}")
 
 
+def _read_runtime_log(root: Path, service_name: str) -> str:
+    shard_path = root / f"{service_name}.{time.strftime('%Y-%m-%d', time.gmtime())}.log"
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if shard_path.exists():
+            return shard_path.read_text(encoding="utf-8", errors="replace")
+        time.sleep(0.1)
+    raise RuntimeError(f"runtime log shard missing: {shard_path}")
+
+
 def test_runtime_only_supports_run_stop() -> None:
     code = render_python_selection_supervisor_module(
         timeouts=SimpleNamespace(term_seconds=5, kill_seconds=5, supersede_seconds=2),
@@ -450,6 +468,28 @@ def test_runtime_only_supports_run_stop() -> None:
     assert 'add_parser("list"' not in code
     assert "--require-supervisor-pid" not in code
     assert "--require-supervisor-start-time-ticks" not in code
+
+
+def test_runtime_requires_same_directory_log_shard_helper() -> None:
+    with tempfile.TemporaryDirectory(prefix="test_selection_supervisor_missing_helper_") as td:
+        root = Path(td)
+        supervisor_path = root / "selection_supervisor.py"
+        supervisor_path.write_text(
+            render_python_selection_supervisor_module(
+                timeouts=SimpleNamespace(term_seconds=5, kill_seconds=5, supersede_seconds=2),
+            ),
+            encoding="utf-8",
+        )
+        proc = subprocess.run(
+            [sys.executable, str(supervisor_path), "stop", "--label", "DaemonSet/test-missing-helper", "--missing-ok"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert proc.returncode != 0, proc
+        assert "missing log shard helper next to selection_supervisor.py" in proc.stderr, proc.stderr
 
 
 def test_install_subreaper_uses_prctl() -> None:
@@ -1022,12 +1062,12 @@ def test_replace_supersedes_old_generation() -> None:
             assert status["apply_id"] == "apply-2", f"expected new apply to own selection, got {status!r}"
             assert status["owner_ts_ms"] == 2, f"expected owner_ts_ms=2 after replace, got {status!r}"
             old_supervisor.wait(timeout=10)
-            old_stderr = old_supervisor.stderr.read() if old_supervisor.stderr is not None else ""
+            runtime_log = _read_runtime_log(root, "test-supersede")
             assert (
-                "running generation superseded" in old_stderr
-                or "superseded child exited without restart" in old_stderr
+                "running generation superseded" in runtime_log
+                or "superseded child exited without restart" in runtime_log
             ), (
-                f"expected old supervisor supersede log, stderr={old_stderr!r}"
+                f"expected old supervisor supersede log, runtime_log={runtime_log!r}"
             )
         finally:
             _terminate_process(new_supervisor)
@@ -1200,11 +1240,11 @@ def test_newer_apply_owned_overlap_with_applyless_owner_defers_retire() -> None:
             assert bare_supervisor.poll() is None, "old bare supervisor retired before phase-2 cutover or fallback"
 
             bare_supervisor.wait(timeout=20)
-            old_stderr = bare_supervisor.stderr.read() if bare_supervisor.stderr is not None else ""
+            runtime_log = _read_runtime_log(root, "test-phase1-overlap-applyless")
             assert (
-                "running generation superseded" in old_stderr
-                or "superseded child exited without restart" in old_stderr
-            ), old_stderr
+                "running generation superseded" in runtime_log
+                or "superseded child exited without restart" in runtime_log
+            ), runtime_log
         finally:
             _terminate_process(takeover_supervisor)
             _terminate_process(bare_supervisor)
