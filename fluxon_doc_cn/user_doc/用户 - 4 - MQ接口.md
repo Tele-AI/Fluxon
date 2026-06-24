@@ -199,9 +199,7 @@ def build_owner_config() -> dict:
             "shared_memory_path": str(SHARED_MEMORY_PATH),
             "shared_file_path": str(SHARED_FILE_PATH),
             "sub_cluster": "default",
-            "large_file_paths": {
-                "root_paths": [str((WORKDIR / "large" / "owner").resolve())],
-            },
+            "large_file_paths": [str((WORKDIR / "large" / "owner").resolve())],
         },
     }
 
@@ -555,7 +553,7 @@ FLUXON_LOG=DEBUG python3 examples/start_mpmc_demo.py --role consumer
 
 - MQ Python 部分：由 `init_logger(...)` 初始化，直接输出到当前终端，不默认落盘，门限由 `FLUXON_LOG` 控制
 - MQ Rust / KV 后台部分：和 KV 一起走服务平面的后台日志链路；`master` 本地日志目录由 `master_cfg["log_dir"]` 指定
-- `shared_file_path`：本机共享文件 authority，用来承载 `shared.json` 等共享文件
+- `shared_file_path`：本机共享文件 authority，只承载 `shared.json` 等共享文件
 
 如果服务平面的 `master.monitoring.otlp_log_api` 已经配置，MQ Rust / KV 后台部分的日志还会继续采集到 Greptime 的 `fluxon_logs` 表。
 

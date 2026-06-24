@@ -285,8 +285,7 @@ fluxonkv_spec:
   # owner 必须声明大文件根目录列表；运行时按数组顺序选择第一个可用 root，
   # 日志和 cache 等子目录都从固定相对位置派生
   large_file_paths:
-    root_paths:
-      - /var/lib/fluxon/large
+    - /var/lib/fluxon/large
 
   # 可选
   p2p_listen_port: 31001

@@ -486,9 +486,7 @@ def _build_example_config(
                 "shared_memory_path": shared_memory_path,
                 "shared_file_path": str((Path(shared_memory_path).parent / "sharefile").resolve()),
                 "sub_cluster": "demo",
-                "large_file_paths": {
-                    "root_paths": [str((Path(shared_memory_path).parent / "large" / "owner").resolve())],
-                },
+                "large_file_paths": [str((Path(shared_memory_path).parent / "large" / "owner").resolve())],
             },
         },
         "kvexternal": {

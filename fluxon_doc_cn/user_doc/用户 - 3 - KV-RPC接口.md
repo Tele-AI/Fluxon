@@ -173,9 +173,7 @@ def build_owner_config() -> dict:
             "shared_memory_path": str(SHARED_MEMORY_PATH),
             "shared_file_path": str(SHARED_FILE_PATH),
             "sub_cluster": "default",
-            "large_file_paths": {
-                "root_paths": [str((WORKDIR / "large" / "owner").resolve())],
-            },
+            "large_file_paths": [str((WORKDIR / "large" / "owner").resolve())],
         },
     }
 
@@ -617,7 +615,8 @@ fluxonkv_spec:
 这里需要把两个本机 authority 分清楚：
 
 - `shared_memory_path`：共享内存 / mmap authority，同机进程靠它附着到同一块内存池
-- `shared_file_path`：共享文件 authority，`shared.json`、日志、profile 等文件位于这里
+- `shared_file_path`：共享文件 authority，只承载 `shared.json` 和 peer metadata 等共享文件
+- `large_file_paths`：owner 独占的大文件 authority，日志、profile、cache 等运行时资产都从这里派生
 - `FLUXON_LOG`：用户 Python 进程 console log 的门限，不写时默认 `INFO`
 
-zero-contribution external 模式下有一个硬约束：`fluxonkv_spec.etcd_addresses`、`fluxonkv_spec.sub_cluster`、`fluxonkv_spec.redis_compat` 这类 owner 侧字段不应出现。
+zero-contribution external 模式下有一个硬约束：`fluxonkv_spec.etcd_addresses`、`fluxonkv_spec.sub_cluster`、`fluxonkv_spec.large_file_paths`、`fluxonkv_spec.redis_compat` 这类 owner 侧字段不应出现。

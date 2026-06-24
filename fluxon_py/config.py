@@ -110,8 +110,7 @@ fluxonkv_spec:                        # fluxon kv specific config (dict(optional
   cluster_name:                       # Cluster name (str)
   shared_memory_path:                 # Shared memory path (str)
   shared_file_path:                   # Shared file path for shared.json/logs/profiles (str)
-  large_file_paths:                   # Owner-mode ordered large-file roots (dict(optional))
-    root_paths:                       # Ordered root directories; runtime uses the first usable root and derives fixed relative subdirectories under it (['{str}'])
+  large_file_paths:                   # Owner-mode ordered large-file roots (['{str}'](optional))
   p2p_listen_port:                    # P2P QUIC listen port override (int(optional))
   redis_compat:                       # Enable Redis protocol shim (dict(optional))
     listen_addr:                      # TCP listen addr, e.g. "127.0.0.1:16379" (str)
@@ -401,15 +400,12 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
     if "large_file_paths" not in spec:
         raise ValueError("fluxonkv_spec.large_file_paths is required for owner mode")
     large_file_paths = spec.get("large_file_paths")
-    if not isinstance(large_file_paths, dict):
-        raise ValueError("fluxonkv_spec.large_file_paths must be a mapping in owner mode")
-    root_paths = large_file_paths.get("root_paths")
-    if not isinstance(root_paths, list) or len(root_paths) == 0:
-        raise ValueError("fluxonkv_spec.large_file_paths.root_paths must be a non-empty list in owner mode")
-    for idx, field_value in enumerate(root_paths):
+    if not isinstance(large_file_paths, list) or len(large_file_paths) == 0:
+        raise ValueError("fluxonkv_spec.large_file_paths must be a non-empty list in owner mode")
+    for idx, field_value in enumerate(large_file_paths):
         if not isinstance(field_value, str) or not field_value.strip():
             raise ValueError(
-                f"fluxonkv_spec.large_file_paths.root_paths[{idx}] must be a non-empty string in owner mode"
+                f"fluxonkv_spec.large_file_paths[{idx}] must be a non-empty string in owner mode"
             )
 
 

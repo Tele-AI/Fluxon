@@ -153,10 +153,7 @@ def _handle_mq_shell_line(line, shutdown_requested, status_lines):
                 workdir,
             )
 
-            expected = {
-                "log_root_path": str(workdir / "large" / "log" / "owner"),
-                "cache_root_path": str(workdir / "large" / "cache" / "owner"),
-            }
+            expected = [str(workdir / "large" / "owner")]
             self.assertEqual(kv_cfg["kvclient"]["fluxonkv_spec"]["large_file_paths"], expected)
             self.assertEqual(mq_cfg["kvclient"]["fluxonkv_spec"]["large_file_paths"], expected)
             self.assertEqual(fs_cfg["kvclient"]["fluxonkv_spec"]["large_file_paths"], expected)

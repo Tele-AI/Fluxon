@@ -350,8 +350,7 @@ service:
         shared_memory_path: "${FLUXON_SHARED_MEM}"
         shared_file_path: "${FLUXON_SHARED_FILE}"
         large_file_paths:
-          log_root_path: "${HOSTWORKDIR}/large/log/owner_${NODE_ID}"
-          cache_root_path: "${HOSTWORKDIR}/large/cache/owner_${NODE_ID}"
+        - "${HOSTWORKDIR}/large/owner_${NODE_ID}"
         sub_cluster: "owner"
       YAML
       ${HOSTWORKDIR}/venv/bin/python -m fluxon_py.runtime.start_owner_kvclient -c "${CONFIG_PATH}" -w "${WORKDIR}"

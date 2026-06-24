@@ -144,10 +144,8 @@ def _import_fluxon_pyo3_tool_without_package_init():
 _PYO3_TOOL = _import_fluxon_pyo3_tool_without_package_init()
 
 
-def _owner_large_file_paths(tag: str) -> dict[str, list[str]]:
-    return {
-        "root_paths": [f"/tmp/kvcache_large/{tag}"],
-    }
+def _owner_large_file_paths(tag: str) -> list[str]:
+    return [f"/tmp/kvcache_large/{tag}"]
 
 
 def _owner_fluxonkv_base_config(
@@ -297,12 +295,10 @@ def test_fluxonkv_owner_requires_large_file_paths():
             pass
 
         invalid_blank = copy.deepcopy(base)
-        invalid_blank["fluxonkv_spec"]["large_file_paths"] = {
-            "root_paths": ["   "],
-        }
+        invalid_blank["fluxonkv_spec"]["large_file_paths"] = ["   "]
         try:
             FluxonKvClientConfig(invalid_blank)
-            print("❌ FAIL: test_fluxonkv_owner_requires_large_file_paths - blank root_paths entry should be rejected")
+            print("❌ FAIL: test_fluxonkv_owner_requires_large_file_paths - blank large_file_paths entry should be rejected")
             return
         except ValueError:
             pass
@@ -310,7 +306,6 @@ def test_fluxonkv_owner_requires_large_file_paths():
         valid = _owner_fluxonkv_base_config(tag="owner_requires_large_file_paths_valid")
         rendered = FluxonKvClientConfig(valid).to_fluxon_kv_client_config_yaml_str()
         assert "large_file_paths:" in rendered
-        assert "root_paths:" in rendered
         assert "- /tmp/kvcache_large/owner_requires_large_file_paths_valid" in rendered
         print("✅ PASS: test_fluxonkv_owner_requires_large_file_paths")
     except Exception as e:

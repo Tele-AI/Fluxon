@@ -9296,14 +9296,11 @@ def _test_stack_kv_owner_runtime_instance_key(*, runtime_instance_prefix: str, o
     return f"{runtime_instance_prefix}__kv_owner__{target_slug}"
 
 
-def _fluxon_kv_owner_large_file_paths(*, owner_work_root: Path) -> Dict[str, str]:
-    # Owner mode always needs explicit large-file roots for logs and caches,
-    # even on surfaces that intentionally leave p2p_listen_port implicit.
+def _fluxon_kv_owner_large_file_paths(*, owner_work_root: Path) -> List[str]:
+    # Owner mode always needs explicit large-file roots, even on surfaces that
+    # intentionally leave p2p_listen_port implicit.
     root = owner_work_root.resolve()
-    return {
-        "log_root_path": str((root / "large" / "log").resolve()),
-        "cache_root_path": str((root / "large" / "cache").resolve()),
-    }
+    return [str((root / "large").resolve())]
 
 
 def _build_test_stack_external_kv_owner_instances(

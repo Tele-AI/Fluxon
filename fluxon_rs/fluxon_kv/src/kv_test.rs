@@ -857,10 +857,10 @@ fn default_client_large_file_paths(
     if contribute_to_cluster_pool_size.dram == 0
         && contribute_to_cluster_pool_size.vram.is_empty()
     {
-        return LargeFilePaths { root_paths: Vec::new() };
+        return LargeFilePaths { paths: Vec::new() };
     }
     LargeFilePaths {
-        root_paths: vec![format!("/tmp/kvcache_large/{}", instance_key)],
+        paths: vec![format!("/tmp/kvcache_large/{}", instance_key)],
     }
 }
 

@@ -65,10 +65,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             owner_cfg = yaml.safe_load(owner_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 owner_cfg["fluxonkv_spec"]["large_file_paths"],
-                {
-                    "log_root_path": str((run_dir / "services" / "owner_0" / "large" / "log").resolve()),
-                    "cache_root_path": str((run_dir / "services" / "owner_0" / "large" / "cache").resolve()),
-                },
+                [str((run_dir / "services" / "owner_0" / "large").resolve())],
             )
 
     def test_write_ci_scene_config_yaml_emits_structured_scene_config(self) -> None:
@@ -170,10 +167,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             owner_cfg = yaml.safe_load(owner_cfg_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 owner_cfg["fluxonkv_spec"]["large_file_paths"],
-                {
-                    "log_root_path": str((run_dir / "services" / "kv_owner" / target_slug / "large" / "log").resolve()),
-                    "cache_root_path": str((run_dir / "services" / "kv_owner" / target_slug / "large" / "cache").resolve()),
-                },
+                [str((run_dir / "services" / "kv_owner" / target_slug / "large").resolve())],
             )
 
     def test_ci_source_overlay_includes_fluxon_test_stack(self) -> None:

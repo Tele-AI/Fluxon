@@ -400,8 +400,7 @@ def test_normalized_testbed_owner_emits_large_file_paths() -> None:
 
         script = (outdir / "entrypoint__fluxon-self-host2-fluxon_core_controller__owner.sh").read_text(encoding="utf-8")
         assert 'large_file_paths:' in script, script
-        assert 'log_root_path: "${HOSTWORKDIR}/large/log/owner_${NODE_ID}"' in script, script
-        assert 'cache_root_path: "${HOSTWORKDIR}/large/cache/owner_${NODE_ID}"' in script, script
+        assert '- "${HOSTWORKDIR}/large/owner_${NODE_ID}"' in script, script
         print("PASS: test_normalized_testbed_owner_emits_large_file_paths")
 
 

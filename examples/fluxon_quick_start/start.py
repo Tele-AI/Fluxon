@@ -528,10 +528,8 @@ def _monitoring_block(greptime_http_port: int) -> Dict[str, Any]:
     }
 
 
-def _owner_large_file_paths(workdir: Path) -> Dict[str, str]:
-    return {
-        "root_paths": [str(workdir / "large" / "owner")],
-    }
+def _owner_large_file_paths(workdir: Path) -> List[str]:
+    return [str(workdir / "large" / "owner")]
 
 
 def _gen_kv_config(etcd_ep: str, cluster: str, master_port: int, kv_http_port: int,

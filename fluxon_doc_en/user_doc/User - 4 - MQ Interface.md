@@ -125,6 +125,7 @@ Parameter constraints:
 - Python-side MQ logs come from `init_logger(...)` and go to the current terminal by default; the threshold is controlled by `FLUXON_LOG`
 - Rust / KV background logs follow the shared service-plane pipeline, and the master's local log authority is `master_cfg["log_dir"]`
 - `shared_file_path` remains the local shared-file authority for `shared.json` and related files
+- `large_file_paths` remains the owner-only large-file authority for backend logs, profiles, caches, and other derived runtime assets
 
 If `master.monitoring.otlp_log_api` is configured, backend logs continue to flow into the Greptime `fluxon_logs` table.
 

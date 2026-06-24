@@ -148,9 +148,7 @@ def build_owner_config() -> dict:
             "shared_memory_path": str(SHARED_MEMORY_PATH),
             "shared_file_path": str(SHARED_FILE_PATH),
             "sub_cluster": "default",
-            "large_file_paths": {
-                "root_paths": [str((WORKDIR / "large" / "owner").resolve())],
-            },
+            "large_file_paths": [str((WORKDIR / "large" / "owner").resolve())],
         },
     }
 
@@ -388,7 +386,8 @@ fluxonkv_spec:
 Keep these authorities separate:
 
 - `shared_memory_path`: shared-memory / mmap authority
-- `shared_file_path`: shared-file authority for `shared.json`, logs, and profiles
+- `shared_file_path`: shared-file authority for `shared.json` and peer metadata files
+- `large_file_paths`: owner-only large-file authority for logs, profiles, caches, and other derived runtime assets
 - `FLUXON_LOG`: console log threshold for the user process
 
-In zero-contribution external mode, owner-only fields such as `fluxonkv_spec.etcd_addresses`, `fluxonkv_spec.sub_cluster`, and `fluxonkv_spec.redis_compat` should not appear.
+In zero-contribution external mode, owner-only fields such as `fluxonkv_spec.etcd_addresses`, `fluxonkv_spec.sub_cluster`, `fluxonkv_spec.large_file_paths`, and `fluxonkv_spec.redis_compat` should not appear.

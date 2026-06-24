@@ -23,10 +23,8 @@ OWNER_INSTANCE_KEY = "demo_kv_owner"
 OWNER_DRAM_BYTES = 1073741824
 
 
-def build_owner_large_file_paths() -> dict:
-    return {
-        "root_paths": [str((WORKDIR / "large" / "owner").resolve())],
-    }
+def build_owner_large_file_paths() -> list[str]:
+    return [str((WORKDIR / "large" / "owner").resolve())]
 
 
 def main() -> None:

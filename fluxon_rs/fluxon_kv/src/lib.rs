@@ -2545,7 +2545,7 @@ mod tests {
             shared_memory_path: "/tmp/fluxon_side_transfer_test".to_string(),
             shared_file_path: "/tmp/fluxon_side_transfer_test_files".to_string(),
             large_file_paths: crate::config::LargeFilePaths {
-                root_paths: vec!["/tmp/fluxon_side_transfer_test_large".to_string()],
+                paths: vec!["/tmp/fluxon_side_transfer_test_large".to_string()],
             },
             test_spec_config: TestSpecConfig {
                 enable_side_transfer: true,
@@ -2819,15 +2819,18 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             large_file_paths: crate::config::LargeFilePaths {
-                root_paths: vec![owner_large_root.to_string_lossy().into_owned()],
+                paths: vec![owner_large_root.to_string_lossy().into_owned()],
             },
             protocol_version:
                 fluxon_util::git_version_build_record::get_current_git_commitid().unwrap(),
             write_ts: Some(chrono::Utc::now().timestamp_micros()),
         };
+        let shared_meta_json = serde_json::to_string(&shared_meta).unwrap();
+        assert!(shared_meta_json.contains("\"large_file_paths\":["));
+        assert!(!shared_meta_json.contains("root_paths"));
         std::fs::write(
             shared_file_root.join("shared.json"),
-            serde_json::to_vec(&shared_meta).unwrap(),
+            shared_meta_json.as_bytes(),
         )
         .unwrap();
 
@@ -2855,7 +2858,7 @@ mod tests {
             },
             shared_memory_path: shared_memory_root.to_string_lossy().into_owned(),
             shared_file_path: shared_file_root.to_string_lossy().into_owned(),
-            large_file_paths: crate::config::LargeFilePaths { root_paths: Vec::new() },
+            large_file_paths: crate::config::LargeFilePaths { paths: Vec::new() },
             test_spec_config: TestSpecConfig::default(),
         };
 
@@ -2863,7 +2866,7 @@ mod tests {
             .await
             .expect("bootstrap zero-contribution config");
         assert_eq!(
-            bootstrapped.large_file_paths.root_paths,
+            bootstrapped.large_file_paths.paths,
             vec![owner_large_root.to_string_lossy().into_owned()]
         );
         assert_eq!(

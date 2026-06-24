@@ -390,15 +390,15 @@ fn verify_non_empty_root_path(root: &str, field_name: &str) -> KvResult<String> 
     Ok(trimmed.to_string())
 }
 
-fn verify_non_empty_root_path_list(root_paths: &[String], field_name: &str) -> KvResult<Vec<String>> {
-    if root_paths.is_empty() {
+fn verify_non_empty_root_path_list(paths: &[String], field_name: &str) -> KvResult<Vec<String>> {
+    if paths.is_empty() {
         return Err(ConfigError::InvalidClientConfig {
             detail: format!("{field_name} must contain at least one path"),
         }
         .into_kverror());
     }
-    let mut out = Vec::with_capacity(root_paths.len());
-    for (idx, root) in root_paths.iter().enumerate() {
+    let mut out = Vec::with_capacity(paths.len());
+    for (idx, root) in paths.iter().enumerate() {
         out.push(verify_non_empty_root_path(
             root,
             &format!("{field_name}[{idx}]"),
@@ -590,10 +590,8 @@ pub struct FluxonKvSpecYaml {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct LargeFilePathsYaml {
-    pub root_paths: Vec<String>,
-}
+#[serde(transparent)]
+pub struct LargeFilePathsYaml(pub Vec<String>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -645,15 +643,16 @@ pub struct FluxonKvSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
 pub struct LargeFilePaths {
-    pub root_paths: Vec<String>,
+    pub paths: Vec<String>,
 }
 
 impl LargeFilePaths {
-    fn require_configured_root_paths(&self) -> KvResult<()> {
-        if self.root_paths.is_empty() {
+    fn require_configured_paths(&self) -> KvResult<()> {
+        if self.paths.is_empty() {
             return Err(ConfigError::InvalidClientConfig {
-                detail: "large_file_paths.root_paths must contain at least one path".to_string(),
+                detail: "large_file_paths must contain at least one path".to_string(),
             }
             .into_kverror());
         }
@@ -665,9 +664,9 @@ impl LargeFilePaths {
         relative_dir: &Path,
         target_name: &str,
     ) -> KvResult<PathBuf> {
-        self.require_configured_root_paths()?;
+        self.require_configured_paths()?;
         let mut errors = Vec::new();
-        for root in &self.root_paths {
+        for root in &self.paths {
             let candidate = Path::new(root).join(relative_dir);
             match fs::create_dir_all(&candidate) {
                 Ok(()) => return Ok(candidate),
@@ -676,7 +675,7 @@ impl LargeFilePaths {
         }
         Err(ConfigError::InvalidClientConfig {
             detail: format!(
-                "large_file_paths.root_paths contains no usable root for {}; tried: {}",
+                "large_file_paths contains no usable root for {}; tried: {}",
                 target_name,
                 errors.join(", ")
             ),
@@ -1170,7 +1169,7 @@ impl ClientConfigYaml {
         // callers may pin it, while shared testbed owners can leave it unset
         // and let the runtime bind a free port.
         let large_file_paths = if is_external {
-            LargeFilePaths { root_paths: Vec::new() }
+            LargeFilePaths { paths: Vec::new() }
         } else {
             let Some(large_file_paths_yaml) = self.fluxonkv_spec.large_file_paths.as_ref() else {
                 return Err(ConfigError::InvalidClientConfig {
@@ -1180,10 +1179,7 @@ impl ClientConfigYaml {
                 .into_kverror());
             };
             LargeFilePaths {
-                root_paths: verify_non_empty_root_path_list(
-                    &large_file_paths_yaml.root_paths,
-                    "large_file_paths.root_paths",
-                )?,
+                paths: verify_non_empty_root_path_list(&large_file_paths_yaml.0, "large_file_paths")?,
             }
         };
 
@@ -1574,8 +1570,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   disable_observability: true
@@ -1622,8 +1617,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 "#,
         )
@@ -1649,7 +1643,7 @@ fluxonkv_spec:
         )
         .unwrap();
         let verified = cfg.verify().unwrap();
-        assert_eq!(verified.large_file_paths.root_paths, Vec::<String>::new());
+        assert_eq!(verified.large_file_paths.paths, Vec::<String>::new());
         assert_eq!(verified.fluxonkv_spec.etcd_addresses, Vec::<String>::new());
         assert_eq!(verified.fluxonkv_spec.sub_cluster, None);
     }
@@ -1663,8 +1657,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_external
   shared_file_path: /tmp/test_external_files
-  large_file_paths:
-    root_paths: [/tmp/test_external_large]
+  large_file_paths: [/tmp/test_external_large]
 "#,
         )
         .unwrap();
@@ -1681,7 +1674,7 @@ fluxonkv_spec:
         std::fs::create_dir_all(&second_root).unwrap();
 
         let large_file_paths = LargeFilePaths {
-            root_paths: vec![
+            paths: vec![
                 first_root.join("child").to_string_lossy().into_owned(),
                 second_root.to_string_lossy().into_owned(),
             ],
@@ -1708,8 +1701,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc
@@ -1763,8 +1755,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   rdma_device_names: ["mlx5_0"]
@@ -1800,8 +1791,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc
@@ -1833,8 +1823,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   require_transfer_rpc_fast_path_ready_timeout_seconds: 45
@@ -1860,8 +1849,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   tcp_thread_control_lane_count: 0
@@ -1888,8 +1876,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc
@@ -1921,8 +1908,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc
@@ -1947,8 +1933,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   rdma_device_names: ["mlx5_0"]
@@ -2003,8 +1988,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_side_worker
   shared_file_path: /tmp/test_side_worker_files
-  large_file_paths:
-    root_paths: [/tmp/test_side_worker_large]
+  large_file_paths: [/tmp/test_side_worker_large]
   p2p_listen_port: 18081
 test_spec_config:
   enable_side_transfer: true
@@ -2044,8 +2028,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_side_worker
   shared_file_path: /tmp/test_side_worker_files
-  large_file_paths:
-    root_paths: [/tmp/test_side_worker_large]
+  large_file_paths: [/tmp/test_side_worker_large]
 test_spec_config:
   enable_side_transfer: true
   side_transfer_role: worker
@@ -2077,8 +2060,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_side_worker
   shared_file_path: /tmp/test_side_worker_files
-  large_file_paths:
-    root_paths: [/tmp/test_side_worker_large]
+  large_file_paths: [/tmp/test_side_worker_large]
 test_spec_config:
   enable_side_transfer: true
   side_transfer_role: worker
@@ -2108,8 +2090,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   p2p_listen_port: 18081
   sub_cluster: rack-a
 test_spec_config:
@@ -2142,8 +2123,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 "#,
         )
@@ -2169,8 +2149,7 @@ fluxonkv_spec:
   cluster_name: test_cluster
   shared_memory_path: /tmp/test_owner
   shared_file_path: /tmp/test_owner_files
-  large_file_paths:
-    root_paths: [/tmp/test_owner_large]
+  large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
 test_spec_config:
   transport_mode: transfer_with_rpc

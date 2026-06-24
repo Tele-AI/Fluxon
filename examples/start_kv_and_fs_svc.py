@@ -38,10 +38,8 @@ TRANSFER_STATE_STORE_KEY_PREFIX = f"/fluxon_fs_transfer/{CLUSTER_NAME}/"
 FS_MASTER_ACCESS_DB_PATH = (WORKDIR / "fs_master" / "access.db").resolve()
 
 
-def build_owner_large_file_paths() -> dict:
-    return {
-        "root_paths": [str((WORKDIR / "large" / "owner").resolve())],
-    }
+def build_owner_large_file_paths() -> list[str]:
+    return [str((WORKDIR / "large" / "owner").resolve())]
 
 
 def main() -> None:

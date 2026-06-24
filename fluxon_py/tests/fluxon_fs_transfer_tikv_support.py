@@ -1598,9 +1598,7 @@ class FluxonFsRemoteWholeHarness:
                 "shared_memory_path": str(self._shared_memory_root),
                 "shared_file_path": str(self._shared_file_root),
                 "sub_cluster": "transfer_owner",
-                "large_file_paths": {
-                    "root_paths": [str(self._work_root / "large" / "owner")],
-                },
+                "large_file_paths": [str(self._work_root / "large" / "owner")],
             },
             "test_spec_config": {
                 "disable_observability": True,

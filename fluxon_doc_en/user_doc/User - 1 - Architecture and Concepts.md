@@ -80,7 +80,7 @@ Cross-machine transport:
 
 `shared_file_path`
 
-- Shared-file authority for `shared.json`, logs, profiles, and other local shared files
+- Shared-file authority for `shared.json`, peer metadata, and other local shared files
 
 `log_dir`
 

@@ -235,11 +235,11 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         self.assertEqual(generated["atomic_groups"]["fluxon_core_controller"]["nodes"], ["local-node-a", "local-node-b"])
         self.assertEqual(generated["service"]["owner"]["node_bind"]["node"], ["local-node-a", "local-node-b"])
         self.assertIn(
-            'log_root_path: "${HOSTWORKDIR}/large/log/owner_${NODE_ID}"',
+            'large_file_paths:',
             generated["service"]["owner"]["entrypoint"],
         )
         self.assertIn(
-            'cache_root_path: "${HOSTWORKDIR}/large/cache/owner_${NODE_ID}"',
+            '- "${HOSTWORKDIR}/large/owner_${NODE_ID}"',
             generated["service"]["owner"]["entrypoint"],
         )
         self.assertEqual(generated["service"]["ops_controller"]["port"], 19180)
