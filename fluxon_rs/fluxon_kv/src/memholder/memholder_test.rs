@@ -92,8 +92,7 @@ fn new_client_config_with_size(
             enable_transfer_rpc_fast_path: true,
             sub_cluster: None,
         },
-        shared_memory_path: format!("/tmp/kvcache_shared_memory/{}", instance_key),
-        shared_file_path: format!("/tmp/kvcache_shared_files/{}", instance_key),
+        share_mem_path: format!("/tmp/kvcache_shared_memory/{}", instance_key),
         large_file_paths: crate::config::LargeFilePaths {
             paths: vec![format!("/tmp/kvcache_large/{}", instance_key)],
         },
@@ -128,8 +127,7 @@ fn new_zero_contribution_client_config(
             enable_transfer_rpc_fast_path: false,
             sub_cluster: None,
         },
-        shared_memory_path: format!("/tmp/kvcache_shared_memory/{}", owner_instance_key),
-        shared_file_path: format!("/tmp/kvcache_shared_files/{}", owner_instance_key),
+        share_mem_path: format!("/tmp/kvcache_shared_memory/{}", owner_instance_key),
         large_file_paths: crate::config::LargeFilePaths { paths: Vec::new() },
         test_spec_config: TestSpecConfig::default(),
     }
@@ -419,7 +417,7 @@ pub mod test_memholder {
         sleep(Duration::from_secs(2)).await;
 
         let owner_name = "pin_owner";
-        // 第二个 owner 必须使用不同的 member key（也会带来不同的 shared_memory_path）
+        // 第二个 owner 必须使用不同的 member key（也会带来不同的 share_mem_path）
         let owner2_name = "pin_owner2";
         let (owner, _) = run_client(ConfigArg::Config(new_client_config_with_size(
             owner_name,

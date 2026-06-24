@@ -108,8 +108,7 @@ mooncake_spec:                         # mooncake 特定配置 (dict(optional))
 fluxonkv_spec:                        # fluxon kv specific config (dict(optional))
   etcd_addresses:                     # Etcd address list ((None|['{str}:{int}']))
   cluster_name:                       # Cluster name (str)
-  shared_memory_path:                 # Shared memory path (str)
-  shared_file_path:                   # Shared file path for shared.json/logs/profiles (str)
+  share_mem_path:                     # Shared bundle path for mmap.file/shared.json/peer metadata (str)
   large_file_paths:                   # Owner-mode ordered large-file roots (['{str}'](optional))
   p2p_listen_port:                    # P2P QUIC listen port override (int(optional))
   redis_compat:                       # Enable Redis protocol shim (dict(optional))
@@ -350,12 +349,9 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
 
     is_zero_contribution = _is_zero_contribution_fluxonkv_config(cfg)
 
-    shared_memory_path = spec.get("shared_memory_path")
-    if not isinstance(shared_memory_path, str) or not shared_memory_path.strip():
-        raise ValueError("fluxonkv_spec.shared_memory_path must be a non-empty string")
-    shared_file_path = spec.get("shared_file_path")
-    if not isinstance(shared_file_path, str) or not shared_file_path.strip():
-        raise ValueError("fluxonkv_spec.shared_file_path must be a non-empty string")
+    share_mem_path = spec.get("share_mem_path")
+    if not isinstance(share_mem_path, str) or not share_mem_path.strip():
+        raise ValueError("fluxonkv_spec.share_mem_path must be a non-empty string")
 
     if "rdma_device_names" in cfg:
         raise ValueError("rdma_device_names has been removed from Fluxon KV config")
@@ -530,10 +526,10 @@ class FluxonKvClientConfig():
         return self.config_dict["fluxonkv_spec"]["cluster_name"]
     
     @property
-    def fluxonkv_spec_shared_memory_path(self):
+    def fluxonkv_spec_share_mem_path(self):
         if "fluxonkv_spec" not in self.config_dict:
             return None
-        return self.config_dict["fluxonkv_spec"]["shared_memory_path"]
+        return self.config_dict["fluxonkv_spec"]["share_mem_path"]
     
     @property
     def fluxonkv_spec_transfer_engine(self):

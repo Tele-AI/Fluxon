@@ -121,8 +121,7 @@ fn new_client_config_with_cluster_and_dram(
         .expect("read raw etcd endpoint from build_config_ext.yml");
     // Shared memory path lives under the same test workdir base used by master logs
     let base = test_workdir_base();
-    let shared_memory_path = format!("{}/sharemem/{}", base, instance_key);
-    let shared_file_path = format!("{}/sharefile/{}", base, instance_key);
+    let share_mem_path = format!("{}/sharemem/{}", base, instance_key);
     let conf = ClientConfig {
         cluster_name: cluster_name.to_string(),
         etcd_addresses_raw: vec![etcd_raw],
@@ -145,8 +144,7 @@ fn new_client_config_with_cluster_and_dram(
             enable_transfer_rpc_fast_path: true,
             sub_cluster: None,
         },
-        shared_memory_path,
-        shared_file_path,
+        share_mem_path,
         large_file_paths: crate::config::LargeFilePaths {
             paths: vec![format!("{}/large/{}", base, instance_key)],
         },

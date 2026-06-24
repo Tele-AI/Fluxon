@@ -9,7 +9,7 @@ fluxonkv_spec:
   etcd_addresses:
   - "127.0.0.1:2379"
   cluster_name: "cluster_001"
-  shared_memory_path: "/tmp/kvcache_shared_memory/client_node_001"
+  share_mem_path: "/tmp/kvcache_shared_memory/client_node_001"
 
 # Optional: Additional configurations can be added here
 # custom_field: "value"

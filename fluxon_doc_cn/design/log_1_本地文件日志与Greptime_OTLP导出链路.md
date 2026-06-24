@@ -17,7 +17,7 @@
 3. Rust / Python 之间哪些 contract 已经对齐，哪些还没有。
 4. 当前实现里哪些地方已经收口，哪些地方仍是未完全收口点。
 
-KV 里的 `external` 与 side worker 都只消费 owner 感知结果。当前稳定 contract 是：它们显式配置 `shared_memory_path` / `shared_file_path` 作为 attach owner 的共享 bundle 锚点，`large_file_paths` 则从 owner 发布的 `shared.json` 继承；日志和 cache 从启动起就直接落到 owner 派生出来的大文件目录，不再要求 zero-contribution 侧另配一份本地 large root。
+KV 里的 `external` 与 side worker 都只消费 owner 感知结果。当前稳定 contract 是：它们显式配置单一 `share_mem_path` 作为 attach owner 的共享 bundle 根目录，`mmap.file`、`shared.json` 和 peer metadata 都在运行时拼接出的 cluster-scoped 目录下；`large_file_paths` 则从 owner 发布的 `shared.json` 继承，日志和 cache 从启动起就直接落到 owner 派生出来的大文件目录。
 
 ## 1. 目录边界
 目录边界只管物理隔离，不管统一 root。统一的是命名、元数据、归档窗口和清理语义。
@@ -112,9 +112,9 @@ ${HOSTWORKDIR}/
 - 当前优先级不是先把 testbed 做到完美支持，而是先把 ops 长时服务日志 contract 讲清楚并收口；testbed 继续按“服务级日志”和“case artifact”分开讨论。
 
 ### 1.4 FS
-- `shared_file_path` 与 `export.remote_root_dir_abs` 分开使用。
-- 前者负责共享 attachment 边界。
-- 后者负责业务数据边界。
+- `share_mem_path` 与 `export.remote_root_dir_abs` 分开使用。
+- 前者负责 KV attachment 所需的共享 bundle 边界。
+- 后者负责 FS 业务数据边界。
 
 这里的目标很明确：目录可以不同，语义必须一致。`log`、`cache`、`shared attachment`、`workload data` 不能混在同一个边界里。
 
@@ -191,9 +191,9 @@ Greptime 侧的 retention / TTL 也按同一日期窗口收口，保证本地与
 ## 6. 当前还没有完全收口的点
 这一节只写未完全收口点，避免把“当前事实”和“目标态”混在一起。
 
-### 6.1 KV 目录边界还没有完全收口到单一 `share_path`
-- 预期 KV 最终收口为单一 `share_path`，统一承载 `mmap.file`、`shared.json` 和 side transfer metadata。
-- 当前 Rust 实现仍保留 `shared_memory_path` 与 `shared_file_path` 两条配置，并分别用于 `mmap.file` 与 `shared.json` / `peer metadata` 的就绪探测和发布。
+### 6.1 KV 共享 bundle 已收口到单一 `share_mem_path`
+- 当前 KV public contract 只保留 `share_mem_path`。
+- 运行时在 `share_mem_path` 下拼接 `cluster_name`，统一承载 `mmap.file`、`shared.json`、peer metadata 和 side transfer metadata。
 
 ### 6.2 side worker stdio 仍未收口到统一按天分片
 - zero-contribution bootstrap 已经在启动前继承 owner 的 `large_file_paths`，因此 KV runtime logger 不再依赖 attach 后热切换文件路径。

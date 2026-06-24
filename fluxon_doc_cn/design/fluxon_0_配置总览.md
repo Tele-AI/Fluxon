@@ -107,7 +107,6 @@ cluster_nodes:
 global_envs:
   FLUXON_CLUSTER_NAME: "fluxon-example-cluster"
   FLUXON_SHARED_MEM: "${HOSTWORKDIR}/shm1"
-  FLUXON_SHARED_FILE: "${HOSTWORKDIR}/shm1_files"
   ETCD_FULL_ADDRESS: "${${ETCD__NODE_ID}__IP}:${ETCD__PORT}"
   FLUXON_PROMETHEUS_BASE_URL: "http://${${GREPTIME__NODE_ID}__IP}:${GREPTIME__PORT}/v1/prometheus"
   MONITOR_GREPTIMEDB_WRITE_URL: "http://${${GREPTIME__NODE_ID}__IP}:${GREPTIME__PORT}/v1/prometheus/write"
@@ -268,12 +267,8 @@ contribute_to_cluster_pool_size:
 fluxonkv_spec:
   cluster_name: demo-kv-cluster
 
-  # 本机共享内存 authority；运行时会拼成 cluster_name 作用域路径
-  shared_memory_path: /dev/shm/fluxon
-
-  # 本机共享文件 authority；shared.json、profile、peer metadata 等在这条根下
-  # 运行时也会拼成 cluster_name 作用域路径
-  shared_file_path: /var/lib/fluxon/shared
+  # 共享 bundle 根目录；运行时会拼成 cluster_name 作用域路径
+  share_mem_path: /dev/shm/fluxon
 
   # owner 必须自己连接 etcd；输入要求 raw host:port
   etcd_addresses:
@@ -303,9 +298,8 @@ instance_key: my-external-1
 fluxonkv_spec:
   cluster_name: demo-kv-cluster
 
-  # external 只保留 attach owner 所需的本机共享锚点
-  shared_memory_path: /dev/shm/fluxon
-  shared_file_path: /var/lib/fluxon/shared
+  # external 只保留 attach owner 所需的共享 bundle 根目录
+  share_mem_path: /dev/shm/fluxon
 
   # 可选
   p2p_listen_port: 31002
@@ -324,7 +318,7 @@ fluxonkv_spec:
 - `contribute_to_cluster_pool_size` 里的容量都按 16 MiB 对齐；`dram = 0` 但 `vram` 非 0 会被拒绝，避免半 owner 半 external 的模糊状态。
 - owner 模式要求 `contribute_to_cluster_pool_size.dram > 0`，并且必须显式提供 `etcd_addresses`、`sub_cluster`、`large_file_paths`。
 - zero-contribution `external` 模式禁止再写 owner 专属字段；运行时会从 owner `shared.json` 补齐这部分信息。
-- `shared_memory_path` / `shared_file_path` 会拼成 `cluster_name` 作用域路径。
+- `share_mem_path` 会拼成 `cluster_name` 作用域路径；`mmap.file`、`shared.json` 和 peer metadata 都位于这个 cluster-scoped 目录下。
 - `test_spec_config.side_transfer_role = worker` 不是第三套 YAML，而是 zero-contribution client 的子分支；它强制 `TransferEngineType::P2p`，并关闭 transfer RPC fast path。
 - `test_spec_config.side_transfer_worker_count` 只允许出现在 owner 配置里，用来控制 owner 拉起的 worker 数量。
 

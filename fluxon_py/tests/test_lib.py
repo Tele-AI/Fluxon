@@ -35,8 +35,7 @@ from setup_and_pack.utils.repo_config_utils import (
     load_test_config_mapping,
     load_test_etcd_address_from_test_config,
     load_test_fluxon_cluster_name_from_test_config,
-    load_test_fluxon_shared_file_path_from_test_config,
-    load_test_fluxon_shared_memory_path_from_test_config,
+    load_test_fluxon_share_mem_path_from_test_config,
     load_test_kv_svc_type_from_test_config,
 )
 
@@ -85,12 +84,7 @@ def load_test_fluxon_cluster_name(*, config_path: Optional[Path] = None) -> str:
 
 def load_test_fluxon_share_mem_path(*, config_path: Optional[Path] = None) -> str:
     """Load required Fluxon shared-memory path from test_config.yaml."""
-    return load_test_fluxon_shared_memory_path_from_test_config(config_path=config_path)
-
-
-def load_test_fluxon_share_file_path(*, config_path: Optional[Path] = None) -> str:
-    """Load required Fluxon shared-file path from test_config.yaml."""
-    return load_test_fluxon_shared_file_path_from_test_config(config_path=config_path)
+    return load_test_fluxon_share_mem_path_from_test_config(config_path=config_path)
 
 
 def load_test_chan_config(*, config_path: Optional[Path] = None) -> Dict[str, int]:
@@ -283,12 +277,10 @@ def new_shared_stores(
             # Strictly require fluxon-specific fields from the shared test/example deployconf.
             cluster_name = load_test_fluxon_cluster_name()
             share_mem = load_test_fluxon_share_mem_path()
-            share_file = load_test_fluxon_share_file_path()
             spec = {
                 "fluxonkv_spec": {
                     "cluster_name": cluster_name,
-                    "shared_memory_path": share_mem,
-                    "shared_file_path": share_file,
+                    "share_mem_path": share_mem,
                 }
             }
 

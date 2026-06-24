@@ -80,8 +80,7 @@ fn new_client_config(
             enable_transfer_rpc_fast_path: true,
             sub_cluster: None,
         },
-        shared_memory_path: shm_path.to_string(),
-        shared_file_path: format!("{}_files", shm_path),
+        share_mem_path: shm_path.to_string(),
         large_file_paths: LargeFilePaths {
             paths: vec![format!("{}_large", shm_path)],
         },
@@ -95,8 +94,7 @@ fn new_zero_contribution_client_config(
     shm_path: &str,
 ) -> ClientConfig {
     // External instance_key MUST be different from owner.
-    // External bootstrap shares both owner bundle roots: shared_memory_path for mmap.file and
-    // shared_file_path for shared.json / peer metadata.
+    // External bootstrap shares the owner bundle root for mmap.file, shared.json, and peer metadata.
     let unique_suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -125,8 +123,7 @@ fn new_zero_contribution_client_config(
             enable_transfer_rpc_fast_path: false,
             sub_cluster: None,
         },
-        shared_memory_path: shm_path.to_string(),
-        shared_file_path: format!("{}_files", shm_path),
+        share_mem_path: shm_path.to_string(),
         large_file_paths: LargeFilePaths { paths: Vec::new() },
         test_spec_config: TestSpecConfig::default(),
     }

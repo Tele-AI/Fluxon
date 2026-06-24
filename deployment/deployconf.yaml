@@ -81,13 +81,9 @@ global_envs:
   #   printf "[global]\nindex-url = https://pypi.tuna.tsinghua.edu.cn/simple\n" > ~/.pip/pip.conf;
   FLUXON_CLUSTER_NAME: "fluxon-example-cluster"
   FLUXON_SHARED_MEM: "${HOSTWORKDIR}/shm1"
-  FLUXON_SHARED_FILE: "${HOSTWORKDIR}/shm1_files"
   FLUXON_SHARED_MEM2: "${HOSTWORKDIR}/shm2"
-  FLUXON_SHARED_FILE2: "${HOSTWORKDIR}/shm2_files"
   FLUXON_SHARED_MEM_RELAY: "${HOSTWORKDIR}/shm3"
-  FLUXON_SHARED_FILE_RELAY: "${HOSTWORKDIR}/shm3_files"
   FLUXON_SHARED_MEM_RELAY2: "${HOSTWORKDIR}/shm4"
-  FLUXON_SHARED_FILE_RELAY2: "${HOSTWORKDIR}/shm4_files"
   # Enable pprof by setting seconds > 0; empty means disabled.
   FLUXON_PPROF_DURATION_SECONDS: ""
 
@@ -328,8 +324,7 @@ service:
           etcd_addresses:
           - "${ETCD_FULL_ADDRESS}"
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM}"
-          shared_file_path: "${FLUXON_SHARED_FILE}"
+          share_mem_path: "${FLUXON_SHARED_MEM}"
           # redis_compat:
           #   listen_addr: "0.0.0.0:16379"
           sub_cluster: "producer_side"
@@ -375,8 +370,7 @@ service:
           etcd_addresses:
           - "${ETCD_FULL_ADDRESS}"
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM2}"
-          shared_file_path: "${FLUXON_SHARED_FILE2}"
+          share_mem_path: "${FLUXON_SHARED_MEM2}"
           sub_cluster: "consumer_side"
       YAML
       # export UCX_LOG_LEVEL=info
@@ -397,15 +391,14 @@ service:
 
       cd "${FLUXON_SRC_ROOT}/examples"
       WORKDIR="./fluxon_work/fluxon_fs_master_work"
-      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}" "${FLUXON_SHARED_FILE}"
+      mkdir -p "${WORKDIR}" "${FLUXON_SHARED_MEM}"
 
       cat > "all_config.yaml" <<YAML
       kvclient:
         instance_key: "fluxon_fs_master"
         fluxonkv_spec:
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM}"
-          shared_file_path: "${FLUXON_SHARED_FILE}"
+          share_mem_path: "${FLUXON_SHARED_MEM}"
       fluxon_fs:
         master:
           instance_key: "fluxon_fs_master"
@@ -459,15 +452,14 @@ service:
 
       cd "${FLUXON_SRC_ROOT}/examples"
       WORKDIR="./fluxon_work/fluxon_fs_writer_work"
-      mkdir -p "${WORKDIR}" "${HOSTWORKDIR}/fluxon_fs_export_root" "${HOSTWORKDIR}/fluxon_fs_local_shared" "${FLUXON_SHARED_MEM}" "${FLUXON_SHARED_FILE}"
+      mkdir -p "${WORKDIR}" "${HOSTWORKDIR}/fluxon_fs_export_root" "${HOSTWORKDIR}/fluxon_fs_local_shared" "${FLUXON_SHARED_MEM}"
 
       cat > "all_config.yaml" <<YAML
       kvclient:
         instance_key: "fluxon_fs_writer"
         fluxonkv_spec:
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM}"
-          shared_file_path: "${FLUXON_SHARED_FILE}"
+          share_mem_path: "${FLUXON_SHARED_MEM}"
       fluxon_fs:
         cache:
           stale_window_ms: 5000
@@ -512,15 +504,14 @@ service:
 
       cd "${FLUXON_SRC_ROOT}/examples"
       WORKDIR="./fluxon_work/fluxon_fs_reader_work"
-      mkdir -p "${WORKDIR}" "${HOSTWORKDIR}/fluxon_fs_local_shared" "${FLUXON_SHARED_MEM}" "${FLUXON_SHARED_FILE}"
+      mkdir -p "${WORKDIR}" "${HOSTWORKDIR}/fluxon_fs_local_shared" "${FLUXON_SHARED_MEM}"
 
       cat > "all_config.yaml" <<YAML
       kvclient:
         instance_key: "fluxon_fs_reader"
         fluxonkv_spec:
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM}"
-          shared_file_path: "${FLUXON_SHARED_FILE}"
+          share_mem_path: "${FLUXON_SHARED_MEM}"
       fluxon_fs:
         master:
           instance_key: "fluxon_fs_master"
@@ -584,8 +575,7 @@ service:
           etcd_addresses:
           - "${ETCD_FULL_ADDRESS}"
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM_RELAY}"
-          shared_file_path: "${FLUXON_SHARED_FILE_RELAY}"
+          share_mem_path: "${FLUXON_SHARED_MEM_RELAY}"
           p2p_listen_port: 31001
           sub_cluster: "relay"
       YAML
@@ -622,8 +612,7 @@ service:
           etcd_addresses:
           - "${ETCD_FULL_ADDRESS}"
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM_RELAY2}"
-          shared_file_path: "${FLUXON_SHARED_FILE_RELAY2}"
+          share_mem_path: "${FLUXON_SHARED_MEM_RELAY2}"
           p2p_listen_port: 31002
           sub_cluster: "relay"
       YAML
@@ -653,8 +642,7 @@ service:
         instance_key: mpmc_demo_producer_base
         fluxonkv_spec:
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM}"
-          shared_file_path: "${FLUXON_SHARED_FILE}"
+          share_mem_path: "${FLUXON_SHARED_MEM}"
       mpmc_demo:
         key: demo_mpmc
         capacity: 20
@@ -726,8 +714,7 @@ service:
         instance_key: mpmc_demo_consumer_base
         fluxonkv_spec:
           cluster_name: "${FLUXON_CLUSTER_NAME}"
-          shared_memory_path: "${FLUXON_SHARED_MEM2}"
-          shared_file_path: "${FLUXON_SHARED_FILE2}"
+          share_mem_path: "${FLUXON_SHARED_MEM2}"
       mpmc_demo:
         key: demo_mpmc
         capacity: 20
@@ -812,8 +799,7 @@ service:
         kvexternal:
           fluxonkv_spec:
             cluster_name: "${FLUXON_CLUSTER_NAME}"
-            shared_memory_path: "${FLUXON_SHARED_MEM}"
-            shared_file_path: "${FLUXON_SHARED_FILE}"
+            share_mem_path: "${FLUXON_SHARED_MEM}"
         db_path: ./xfer_panel.sqlite3
         bootstrap_admin:
           username: admin
@@ -859,8 +845,7 @@ service:
         kvexternal:
           fluxonkv_spec:
             cluster_name: "${FLUXON_CLUSTER_NAME}"
-            shared_memory_path: "${FLUXON_SHARED_MEM2}"
-            shared_file_path: "${FLUXON_SHARED_FILE2}"
+            share_mem_path: "${FLUXON_SHARED_MEM2}"
         http:
           listen_addr: 0.0.0.0
           port: ${XFER_WEBPANEL__PORT}
@@ -902,9 +887,7 @@ service:
       ETCD = os.environ['ETCD_FULL_ADDRESS']
       CLUSTER_NAME = os.environ['FLUXON_CLUSTER_NAME']
       SHARED_MEM = os.environ['FLUXON_SHARED_MEM']
-      SHARED_FILE = os.environ['FLUXON_SHARED_FILE']
       SHARED_MEM2 = os.environ['FLUXON_SHARED_MEM2']
-      SHARED_FILE2 = os.environ['FLUXON_SHARED_FILE2']
       # Addresses from injected env tokens (no hardcoding)
       METADATA_IP = os.environ.get('MOONCAKE_METADATA__NODE_ID__IP')
       MASTER_IP = os.environ.get('MASTER__NODE_ID__IP')
@@ -939,8 +922,7 @@ service:
           'contribute_to_cluster_pool_size': {'dram': 0, 'vram': {}},
           'fluxonkv_spec': {
               'cluster_name': CLUSTER_NAME,
-              'shared_memory_path': SHARED_MEM,
-              'shared_file_path': SHARED_FILE,
+              'share_mem_path': SHARED_MEM,
           },
               # 如果需要切 mooncake，可以在这里启用 mooncake_spec
               # 'mooncake_spec': {
@@ -967,7 +949,7 @@ service:
                   'kv': {'instance_key': 'bench2', 'fluxonkv_spec': {
                        'etcd_addresses': [ETCD],
                        'cluster_name': CLUSTER_NAME,
-                       'shared_memory_path': SHARED_MEM2,
+                       'share_mem_path': SHARED_MEM2,
                    }},
                   'mq_role': 'consumer',
                   # 'mq': {'weight': 1.0},
@@ -976,7 +958,7 @@ service:
               #     'kv': {'instance_key': 'bench3', 'fluxonkv_spec': {
               #         'etcd_addresses': [ETCD],
               #         'cluster_name': CLUSTER_NAME,
-              #         'shared_memory_path': SHARED_MEM2,
+              #         'share_mem_path': SHARED_MEM2,
               #     }},
               #     'mq_role': 'consumer',
               #     # 'mq': {'weight': 1.0},
@@ -989,7 +971,7 @@ service:
               #     'kv': {'instance_key': 'bench5', 'fluxonkv_spec': {
               #         'etcd_addresses': [ETCD],
               #         'cluster_name': CLUSTER_NAME,
-              #         'shared_memory_path': SHARED_MEM2,
+              #         'share_mem_path': SHARED_MEM2,
               #     }},
               #     'mq_role': 'consumer',
               # }

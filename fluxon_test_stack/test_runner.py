@@ -1333,25 +1333,15 @@ def _load_source_stack_contract() -> Dict[str, Any]:
         global_envs.get("FLUXON_CLUSTER_NAME"),
         "bootstrap source deployconf.global_envs.FLUXON_CLUSTER_NAME",
     )
-    shared_memory_hostworkdir = _require_str(
+    share_mem_hostworkdir = _require_str(
         global_envs.get("FLUXON_SHARED_MEM"),
         "bootstrap source deployconf.global_envs.FLUXON_SHARED_MEM",
     )
-    shared_file_hostworkdir = _require_str(
-        global_envs.get("FLUXON_SHARED_MEM2"),
-        "bootstrap source deployconf.global_envs.FLUXON_SHARED_MEM2",
-    )
     _resolve_stack_contract_path(
         contract_hostworkdir,
-        shared_memory_hostworkdir,
+        share_mem_hostworkdir,
         field_name="bootstrap source deployconf.global_envs.FLUXON_SHARED_MEM",
         allow_absolute=True,
-    )
-    _resolve_stack_contract_path(
-        contract_hostworkdir,
-        shared_file_hostworkdir,
-        field_name="bootstrap source deployconf.global_envs.FLUXON_SHARED_MEM2",
-        allow_absolute=False,
     )
 
     source_bootstrap_cfg_path = _load_test_bed_bootstrap_config_path()
@@ -1387,8 +1377,7 @@ def _load_source_stack_contract() -> Dict[str, Any]:
         # - /r/fs_s3/* proxy for downloading release artifacts
         "ops_controller_url": controller_url,
         "controller_basic_auth": controller_basic_auth,
-        "shared_memory_hostworkdir": shared_memory_hostworkdir,
-        "shared_file_hostworkdir": shared_file_hostworkdir,
+        "share_mem_hostworkdir": share_mem_hostworkdir,
     }
 
 
@@ -1397,8 +1386,7 @@ def _write_ci_runtime_test_config(
     src_root: Path,
     etcd_address: str,
     cluster_name: str,
-    shared_memory_path: str,
-    shared_file_path: str,
+    share_mem_path: str,
 ) -> Path:
     """Materialize the single CI test authority consumed by fluxon_py integration tests.
 
@@ -1417,8 +1405,7 @@ def _write_ci_runtime_test_config(
             "kv_svc_type": "fluxon",
             "etcd_address": str(etcd_address),
             "cluster_name": str(cluster_name),
-            "shared_memory_path": str(shared_memory_path),
-            "shared_file_path": str(shared_file_path),
+            "share_mem_path": str(share_mem_path),
         },
     )
     return test_cfg_path
@@ -2048,21 +2035,16 @@ def _cluster_scoped_shared_dir(*, root_path: str, cluster_name: str) -> Path:
 
 def _shared_bundle_paths_for_cluster(
     *,
-    shared_memory_root: str,
-    shared_file_root: str,
+    share_mem_root: str,
     cluster_name: str,
 ) -> List[Path]:
-    shared_memory_dir = _cluster_scoped_shared_dir(
-        root_path=shared_memory_root,
-        cluster_name=cluster_name,
-    )
-    shared_file_dir = _cluster_scoped_shared_dir(
-        root_path=shared_file_root,
+    share_mem_dir = _cluster_scoped_shared_dir(
+        root_path=share_mem_root,
         cluster_name=cluster_name,
     )
     return [
-        shared_file_dir / "shared.json",
-        shared_memory_dir / "mmap.file",
+        share_mem_dir / "shared.json",
+        share_mem_dir / "mmap.file",
     ]
 
 
@@ -2076,35 +2058,28 @@ def _owner_target_slug(*, owner_target: str, ctx: str) -> str:
 
 def _owner_bundle_roots_for_target(
     *,
-    shared_memory_root: str,
-    shared_file_root: str,
+    share_mem_root: str,
     owner_target: str,
     ctx: str,
-) -> Tuple[str, str]:
+) -> str:
     owner_slug = _owner_target_slug(owner_target=owner_target, ctx=ctx)
-    return (
-        str((Path(shared_memory_root) / owner_slug).resolve()),
-        str((Path(shared_file_root) / owner_slug).resolve()),
-    )
+    return str((Path(share_mem_root) / owner_slug).resolve())
 
 
 def _owner_bundle_paths_for_target(
     *,
-    shared_memory_root: str,
-    shared_file_root: str,
+    share_mem_root: str,
     cluster_name: str,
     owner_target: str,
     ctx: str,
 ) -> List[Path]:
-    owner_shared_memory_root, owner_shared_file_root = _owner_bundle_roots_for_target(
-        shared_memory_root=shared_memory_root,
-        shared_file_root=shared_file_root,
+    owner_share_mem_root = _owner_bundle_roots_for_target(
+        share_mem_root=share_mem_root,
         owner_target=owner_target,
         ctx=ctx,
     )
     return _shared_bundle_paths_for_cluster(
-        shared_memory_root=owner_shared_memory_root,
-        shared_file_root=owner_shared_file_root,
+        share_mem_root=owner_share_mem_root,
         cluster_name=cluster_name,
     )
 
@@ -2220,7 +2195,7 @@ def _require_explicit_owner_group_processes_for_multi_owner_same_machine(
     raise ValueError(
         f"{ctx}.benchmark.owner_group_processes is required when external Fluxon KV owners share a machine: "
         f"machines={multi_owner_machines}. Without an explicit group size, benchmark nodes and owners "
-        "silently reuse the same shared_memory_path/shared_file_path roots, which invalidates owner binding."
+        "silently reuse the same share_mem_path roots, which invalidates owner binding."
     )
 
 
@@ -2233,13 +2208,9 @@ def _load_stack_identity(*, workdir_root: Path) -> Dict[str, Any]:
         contract.get("controller_basic_auth"),
         field_name="bootstrap_contract.controller_basic_auth",
     )
-    shared_mem_hostworkdir = _require_str(
-        contract.get("shared_memory_hostworkdir"),
-        "bootstrap_contract.shared_memory_hostworkdir",
-    )
-    shared_file_hostworkdir = _require_str(
-        contract.get("shared_file_hostworkdir"),
-        "bootstrap_contract.shared_file_hostworkdir",
+    share_mem_hostworkdir = _require_str(
+        contract.get("share_mem_hostworkdir"),
+        "bootstrap_contract.share_mem_hostworkdir",
     )
     cluster_name = _suite_cluster_name_for_workdir(workdir_root)
     if cluster_name == ops_cluster_name:
@@ -2254,17 +2225,11 @@ def _load_stack_identity(*, workdir_root: Path) -> Dict[str, Any]:
         "cluster_name": cluster_name,
         "controller_url": ops_controller_url,
         "controller_basic_auth": controller_basic_auth,
-        "shared_memory_path": _resolve_stack_contract_path(
+        "share_mem_path": _resolve_stack_contract_path(
             hostworkdir,
-            shared_mem_hostworkdir,
-            field_name="bootstrap_contract.shared_memory_hostworkdir",
+            share_mem_hostworkdir,
+            field_name="bootstrap_contract.share_mem_hostworkdir",
             allow_absolute=True,
-        ),
-        "shared_file_path": _resolve_stack_contract_path(
-            hostworkdir,
-            shared_file_hostworkdir,
-            field_name="bootstrap_contract.shared_file_hostworkdir",
-            allow_absolute=False,
         ),
     }
 
@@ -2295,13 +2260,9 @@ def _build_runtime_token_mapping(
             stack_identity.get("controller_url"),
             "stack_identity.controller_url",
         ),
-        "__STACK_SHARED_MEMORY_PATH__": _require_str(
-            stack_identity.get("shared_memory_path"),
-            "stack_identity.shared_memory_path",
-        ),
-        "__STACK_SHARED_FILE_PATH__": _require_str(
-            stack_identity.get("shared_file_path"),
-            "stack_identity.shared_file_path",
+        "__STACK_SHARE_MEM_PATH__": _require_str(
+            stack_identity.get("share_mem_path"),
+            "stack_identity.share_mem_path",
         ),
     }
     if extra_tokens is not None:
@@ -3691,30 +3652,19 @@ def _resolved_run_dir_path(resolved_case: Dict[str, Any]) -> Path:
     return Path(_require_str(runtime.get("run_dir"), "runtime.run_dir")).resolve()
 
 
-def _ci_shared_memory_path(resolved_case: Dict[str, Any], *, run_dir: Path) -> str:
+def _ci_share_mem_path(resolved_case: Dict[str, Any], *, run_dir: Path) -> str:
     runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
     stack_identity = _require_dict(runtime.get("stack_identity"), "resolved_case.runtime.stack_identity")
-    shared_memory_root = _require_str(
-        stack_identity.get("shared_memory_path"),
-        "resolved_case.runtime.stack_identity.shared_memory_path",
+    share_mem_root = _require_str(
+        stack_identity.get("share_mem_path"),
+        "resolved_case.runtime.stack_identity.share_mem_path",
     )
     # English note:
-    # - iceoryx2 uses shared_memory_path as a base for per-node paths (e.g. .../nodes/<id>/iox2_<hash>/.service_tag).
+    # - iceoryx2 uses share_mem_path as a base for per-node paths (e.g. .../nodes/<id>/iox2_<hash>/.service_tag).
     # - The per-node suffix can be long, and some filesystems enforce a max path length of 255 bytes.
-    # - Therefore shared_memory_path must be short and must not embed run_dir (which can be deep under repo/workdir).
+    # - Therefore share_mem_path must be short and must not embed run_dir (which can be deep under repo/workdir).
     token = hashlib.sha256(str(run_dir.resolve()).encode("utf-8")).hexdigest()[:16]
-    return str((Path(shared_memory_root) / "ci" / token).resolve())
-
-
-def _ci_shared_file_path(resolved_case: Dict[str, Any], *, run_dir: Path) -> str:
-    runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
-    stack_identity = _require_dict(runtime.get("stack_identity"), "resolved_case.runtime.stack_identity")
-    shared_file_root = _require_str(
-        stack_identity.get("shared_file_path"),
-        "resolved_case.runtime.stack_identity.shared_file_path",
-    )
-    token = hashlib.sha256(str(run_dir.resolve()).encode("utf-8")).hexdigest()[:16]
-    return str((Path(shared_file_root) / "ci" / token).resolve())
+    return str((Path(share_mem_root) / "ci" / token).resolve())
 
 
 def _ci_owner_shared_bundle_paths(run_dir: Path, *, owner_config_path: Path) -> List[Path]:
@@ -3727,14 +3677,9 @@ def _ci_owner_shared_bundle_paths(run_dir: Path, *, owner_config_path: Path) -> 
         fluxonkv_spec.get("cluster_name"),
         "ci_owner_0.yaml.fluxonkv_spec.cluster_name",
     )
-    shm = _require_str(fluxonkv_spec.get("shared_memory_path"), "ci_owner_0.yaml.fluxonkv_spec.shared_memory_path")
-    shared_file = _require_str(
-        fluxonkv_spec.get("shared_file_path"),
-        "ci_owner_0.yaml.fluxonkv_spec.shared_file_path",
-    )
+    shm = _require_str(fluxonkv_spec.get("share_mem_path"), "ci_owner_0.yaml.fluxonkv_spec.share_mem_path")
     return _shared_bundle_paths_for_cluster(
-        shared_memory_root=shm,
-        shared_file_root=shared_file,
+        share_mem_root=shm,
         cluster_name=cluster_name,
     )
 
@@ -3749,7 +3694,7 @@ def _wait_ci_owner_shared_bundle_ready_and_stage_shared_json(
     timeout_s: int,
 ) -> None:
     # English note:
-    # - `shared_memory_path` is host-local. When owner_0 runs on a remote node, the runner host
+    # - `share_mem_path` is host-local. When owner_0 runs on a remote node, the runner host
     #   cannot see shared.json/mmap.file by filesystem path.
     # - CI execution already depends on the remote shared bundle being ready. Here we additionally
     #   fetch shared.json back to a stable local path for determinism and postmortem.
@@ -3770,8 +3715,7 @@ def _wait_ci_owner_shared_bundle_ready_and_stage_shared_json(
                     required_str_keys = (
                         "owner_id",
                         "cluster_name",
-                        "shared_memory_path",
-                        "shared_file_path",
+                        "share_mem_path",
                         "protocol_version",
                     )
                     for k in required_str_keys:
@@ -3791,16 +3735,10 @@ def _wait_ci_owner_shared_bundle_ready_and_stage_shared_json(
                             f"expected={_ci_cluster_name(resolved_case)!r}"
                         )
                     expected_shm_dir = str(mmap_file_path.parent.resolve())
-                    if meta.get("shared_memory_path") != expected_shm_dir:
+                    if meta.get("share_mem_path") != expected_shm_dir:
                         raise ValueError(
-                            f"shared.json shared_memory_path mismatch: shared={meta.get('shared_memory_path')!r} "
+                            f"shared.json share_mem_path mismatch: shared={meta.get('share_mem_path')!r} "
                             f"expected={expected_shm_dir!r}"
-                        )
-                    expected_file_dir = str(shared_json_path.parent.resolve())
-                    if meta.get("shared_file_path") != expected_file_dir:
-                        raise ValueError(
-                            f"shared.json shared_file_path mismatch: shared={meta.get('shared_file_path')!r} "
-                            f"expected={expected_file_dir!r}"
                         )
                 except Exception as exc:  # noqa: BLE001
                     last_err = f"{type(exc).__name__}: {exc}"
@@ -8669,8 +8607,7 @@ def _build_test_stack_external_kv_owner_instances(
 
     stack_identity = _require_dict(runtime.get("stack_identity"), "runtime.stack_identity")
     cluster_name = _require_str(stack_identity.get("cluster_name"), "runtime.stack_identity.cluster_name")
-    shared_memory_root = _require_str(stack_identity.get("shared_memory_path"), "runtime.stack_identity.shared_memory_path")
-    shared_file_root = _require_str(stack_identity.get("shared_file_path"), "runtime.stack_identity.shared_file_path")
+    share_mem_root = _require_str(stack_identity.get("share_mem_path"), "runtime.stack_identity.share_mem_path")
     etcd_endpoints = _test_stack_etcd_addresses(resolved_case)
     master_port_offset = 0
     owner_instances: List[Dict[str, Any]] = []
@@ -8693,12 +8630,10 @@ def _build_test_stack_external_kv_owner_instances(
             raise ValueError(f"computed owner_p2p_listen_port out of range: {owner_p2p_listen_port}")
 
         if owner_group_processes is None:
-            owner_shared_memory_path = shared_memory_root
-            owner_shared_file_path = shared_file_root
+            owner_share_mem_path = share_mem_root
         else:
-            owner_shared_memory_path, owner_shared_file_path = _owner_bundle_roots_for_target(
-                shared_memory_root=shared_memory_root,
-                shared_file_root=shared_file_root,
+            owner_share_mem_path = _owner_bundle_roots_for_target(
+                share_mem_root=share_mem_root,
                 owner_target=target,
                 ctx="runtime.stack_identity owner bundle roots",
             )
@@ -8714,8 +8649,7 @@ def _build_test_stack_external_kv_owner_instances(
             "fluxonkv_spec": {
                 "etcd_addresses": list(etcd_endpoints),
                 "cluster_name": cluster_name,
-                "shared_memory_path": owner_shared_memory_path,
-                "shared_file_path": owner_shared_file_path,
+                "share_mem_path": owner_share_mem_path,
                 "large_file_paths": owner_large_file_paths,
                 "sub_cluster": FLUXON_KV_OWNER_SUB_CLUSTER,
                 "p2p_listen_port": int(owner_p2p_listen_port),
@@ -9233,21 +9167,16 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
     node_roles: List[str] = []
     node_overrides: List[Dict[str, Any]] = []
     stack_cluster_name: Optional[str] = None
-    stack_shared_memory_path: Optional[str] = None
-    stack_shared_file_path: Optional[str] = None
+    stack_share_mem_path: Optional[str] = None
     if backend_kind == TEST_STACK_BACKEND_FLUXON:
         stack_identity = _require_dict(runtime.get("stack_identity"), "runtime.stack_identity")
         stack_cluster_name = _require_str(
             stack_identity.get("cluster_name"),
             "runtime.stack_identity.cluster_name",
         )
-        stack_shared_memory_path = _require_str(
-            stack_identity.get("shared_memory_path"),
-            "runtime.stack_identity.shared_memory_path",
-        )
-        stack_shared_file_path = _require_str(
-            stack_identity.get("shared_file_path"),
-            "runtime.stack_identity.shared_file_path",
+        stack_share_mem_path = _require_str(
+            stack_identity.get("share_mem_path"),
+            "runtime.stack_identity.share_mem_path",
         )
 
     rc = _require_dict(ts_profile.get("runtime_config"), "profile.test_stack.runtime_config")
@@ -9947,8 +9876,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                     # Benchmark nodes bootstrap from owner shared bundles. Strict dual-owner mode
                     # routes each process group to a different same-machine owner bundle root.
                     assert stack_cluster_name is not None
-                    assert stack_shared_memory_path is not None
-                    assert stack_shared_file_path is not None
+                    assert stack_share_mem_path is not None
                     selected_owner_target = _test_stack_owner_target_for_node_process(
                         target=target,
                         process_idx=process_idx,
@@ -9957,18 +9885,15 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                         owner_group_processes=owner_group_processes,
                     )
                     if selected_owner_target is None:
-                        selected_shared_memory_path = stack_shared_memory_path
-                        selected_shared_file_path = stack_shared_file_path
+                        selected_share_mem_path = stack_share_mem_path
                     else:
-                        selected_shared_memory_path, selected_shared_file_path = _owner_bundle_roots_for_target(
-                            shared_memory_root=stack_shared_memory_path,
-                            shared_file_root=stack_shared_file_path,
+                        selected_share_mem_path = _owner_bundle_roots_for_target(
+                            share_mem_root=stack_share_mem_path,
                             owner_target=selected_owner_target,
                             ctx=f"strict dual-owner routing target={target} process_idx={process_idx}",
                         )
                     fluxonkv_override["cluster_name"] = stack_cluster_name
-                    fluxonkv_override["shared_memory_path"] = selected_shared_memory_path
-                    fluxonkv_override["shared_file_path"] = selected_shared_file_path
+                    fluxonkv_override["share_mem_path"] = selected_share_mem_path
                     fluxonkv_override["p2p_listen_port"] = int(kv_p2p_listen_port)
                     kv["fluxonkv_spec"] = fluxonkv_override
                 elif backend_kind == TEST_STACK_BACKEND_ALLUXIO:
@@ -13820,8 +13745,7 @@ def _ci_prepare_run_inputs(
     overlay_live_checkout: bool,
     etcd_address: str,
     cluster_name: str,
-    shared_memory_path: str,
-    shared_file_path: str,
+    share_mem_path: str,
 ) -> None:
     """Materialize CI run inputs from the case release into an isolated run_dir.
 
@@ -13896,8 +13820,7 @@ def _ci_prepare_run_inputs(
         src_root=src_root,
         etcd_address=etcd_address,
         cluster_name=cluster_name,
-        shared_memory_path=shared_memory_path,
-        shared_file_path=shared_file_path,
+        share_mem_path=share_mem_path,
     )
     release_link_path = src_root / "fluxon_release"
     _materialize_ci_runtime_release_view(
@@ -13963,7 +13886,12 @@ def _write_ci_scene_config_yaml(
 
 
 def _write_ci_master_owner_configs(
-    resolved_case: Dict[str, Any], *, run_dir: Path, cluster_name: str, share_mem_path: str, share_file_path: str, owner_dram_bytes: int
+    resolved_case: Dict[str, Any],
+    *,
+    run_dir: Path,
+    cluster_name: str,
+    share_mem_path: str,
+    owner_dram_bytes: int,
 ) -> tuple[Path, Path]:
     owner_work_root = run_dir / "services" / "owner_0"
     master_cfg = {
@@ -13992,8 +13920,7 @@ def _write_ci_master_owner_configs(
         "fluxonkv_spec": {
             "etcd_addresses": ["__ETCD__"],
             "cluster_name": cluster_name,
-            "shared_memory_path": share_mem_path,
-            "shared_file_path": share_file_path,
+            "share_mem_path": share_mem_path,
             # Shared testbed / CI owners keep p2p_listen_port implicit so the
             # runtime can bind a free host port, but owner mode still requires
             # explicit large-file roots.
@@ -14268,7 +14195,6 @@ def _write_ci_runner_script(
     run_dir: Path,
     src_root: Path,
     share_mem_path: str,
-    share_file_path: str,
 ) -> Path:
     commands = _resolved_ci_command_list(resolved_case)
     venv_python = run_dir / "venv" / "bin" / "python3"
@@ -14309,30 +14235,22 @@ def _write_ci_runner_script(
     readiness_probe_block = ""
     if requires_owner_shared_bundle:
         bundle_cluster_name = _ci_cluster_name(resolved_case)
-        bundle_shared_memory_dir = str(
-            _cluster_scoped_shared_dir(root_path=share_mem_path, cluster_name=bundle_cluster_name)
-        )
-        bundle_shared_file_dir = str(
-            _cluster_scoped_shared_dir(root_path=share_file_path, cluster_name=bundle_cluster_name)
-        )
+        bundle_dir = str(_cluster_scoped_shared_dir(root_path=share_mem_path, cluster_name=bundle_cluster_name))
         shared_bundle_block = f"""
 echo "[ci_runner] waiting for owner shared bundle..."
 deadline=$(( $(date +%s) + {CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S} ))
-shm={bundle_shared_memory_dir}
-shared_file={bundle_shared_file_dir}
+share_mem={bundle_dir}
 while [ $(date +%s) -lt "$deadline" ]; do
-  if [ -f "$shared_file/shared.json" ] && [ -f "$shm/mmap.file" ]; then
+  if [ -f "$share_mem/shared.json" ] && [ -f "$share_mem/mmap.file" ]; then
     echo "[ci_runner] owner shared bundle ready"
     break
   fi
   sleep 1
 done
-if [ ! -f "$shared_file/shared.json" ] || [ ! -f "$shm/mmap.file" ]; then
+if [ ! -f "$share_mem/shared.json" ] || [ ! -f "$share_mem/mmap.file" ]; then
   echo "[ci_runner] ERROR: owner shared bundle not ready in {CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S}s"
-  echo "[ci_runner] shm=$shm"
-  echo "[ci_runner] shared_file=$shared_file"
-  ls -la "$shm"
-  ls -la "$shared_file"
+  echo "[ci_runner] share_mem=$share_mem"
+  ls -la "$share_mem"
   fail_and_exit 2
 fi
 """
@@ -15043,13 +14961,9 @@ def _test_stack_external_owner_shared_bundle_paths(
         stack_identity.get("cluster_name"),
         "resolved_case.runtime.stack_identity.cluster_name",
     )
-    shared_memory_path = _require_str(
-        stack_identity.get("shared_memory_path"),
-        "resolved_case.runtime.stack_identity.shared_memory_path",
-    )
-    shared_file_path = _require_str(
-        stack_identity.get("shared_file_path"),
-        "resolved_case.runtime.stack_identity.shared_file_path",
+    share_mem_path = _require_str(
+        stack_identity.get("share_mem_path"),
+        "resolved_case.runtime.stack_identity.share_mem_path",
     )
     if owner_target is not None:
         scale = _require_dict(resolved_case.get("scale"), "resolved_case.scale")
@@ -15079,15 +14993,13 @@ def _test_stack_external_owner_shared_bundle_paths(
         )
         if owner_group_processes is not None:
             return _owner_bundle_paths_for_target(
-                shared_memory_root=shared_memory_path,
-                shared_file_root=shared_file_path,
+                share_mem_root=share_mem_path,
                 cluster_name=cluster_name,
                 owner_target=owner_target,
                 ctx="TEST_STACK owner shared bundle paths",
             )
     return _shared_bundle_paths_for_cluster(
-        shared_memory_root=shared_memory_path,
-        shared_file_root=shared_file_path,
+        share_mem_root=share_mem_path,
         cluster_name=cluster_name,
     )
 

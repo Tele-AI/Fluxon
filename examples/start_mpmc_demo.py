@@ -17,8 +17,7 @@ from fluxon_py.runtime import register_ctrlc_callback
 
 # These constants are the only user-facing knobs in the minimal example.
 CLUSTER_NAME = "demo-kv-cluster"
-SHARED_MEMORY_PATH = "/dev/shm/fluxon_kv_demo"
-SHARED_FILE_PATH = "/tmp/fluxon_kv_demo/shared"
+SHARE_MEM_PATH = "/dev/shm/fluxon_kv_demo"
 CHANNEL_KEY = "demo_mq_channel_doc"
 CHANNEL_CAPACITY = 128
 CHANNEL_TTL_SECONDS = 300
@@ -53,8 +52,7 @@ def _build_store_config(*, role: str) -> FluxonKvClientConfig:
             "instance_key": f"demo_mq_{role}",
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
-                "shared_memory_path": SHARED_MEMORY_PATH,
-                "shared_file_path": SHARED_FILE_PATH,
+                "share_mem_path": SHARE_MEM_PATH,
             },
         }
     )
@@ -197,9 +195,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Start MQ minimal demo")
     parser.add_argument("--role", choices=["producer", "consumer"], required=True)
     args = parser.parse_args()
-
-    # The minimal example keeps shared file authority explicit and local.
-    Path(SHARED_FILE_PATH).mkdir(parents=True, exist_ok=True)
 
     # init_logger() reads FLUXON_LOG and sets the user-process console log level.
     logger = init_logger(f"mpmc_demo_{args.role}")

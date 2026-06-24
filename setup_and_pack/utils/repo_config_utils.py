@@ -9,8 +9,7 @@ import yaml
 from deployment.utils.deployconf_config_utils import (
     load_deployconf_etcd_address,
     load_deployconf_fluxon_cluster_name,
-    load_deployconf_fluxon_shared_file_path,
-    load_deployconf_fluxon_shared_memory_path,
+    load_deployconf_fluxon_share_mem_path,
     load_deployconf_mapping,
     load_deployconf_prom_remote_write_url,
     load_deployconf_prometheus_base_url,
@@ -35,16 +34,14 @@ __all__ = [
     "load_test_kv_svc_type_from_test_config",
     "load_test_etcd_address_from_test_config",
     "load_test_fluxon_cluster_name_from_test_config",
-    "load_test_fluxon_shared_memory_path_from_test_config",
-    "load_test_fluxon_shared_file_path_from_test_config",
+    "load_test_fluxon_share_mem_path_from_test_config",
     "load_deployconf_mapping",
     "load_deployconf_resolved_global_envs",
     "load_deployconf_etcd_address",
     "load_deployconf_prometheus_base_url",
     "load_deployconf_prom_remote_write_url",
     "load_deployconf_fluxon_cluster_name",
-    "load_deployconf_fluxon_shared_memory_path",
-    "load_deployconf_fluxon_shared_file_path",
+    "load_deployconf_fluxon_share_mem_path",
     "load_deployconf_service_ip_port",
 ]
 
@@ -375,19 +372,10 @@ def load_test_fluxon_cluster_name_from_test_config(*, config_path: Optional[Path
     return raw.strip()
 
 
-def load_test_fluxon_shared_memory_path_from_test_config(*, config_path: Optional[Path] = None) -> str:
-    """Load Fluxon shared-memory root from test_config.yaml as the single test authority."""
+def load_test_fluxon_share_mem_path_from_test_config(*, config_path: Optional[Path] = None) -> str:
+    """Load Fluxon shared bundle root from test_config.yaml as the single test authority."""
     test_cfg = load_test_config_mapping(config_path=config_path)
-    raw = test_cfg.get("shared_memory_path")
+    raw = test_cfg.get("share_mem_path")
     if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("test_config.yaml must define non-empty shared_memory_path")
-    return raw.strip()
-
-
-def load_test_fluxon_shared_file_path_from_test_config(*, config_path: Optional[Path] = None) -> str:
-    """Load Fluxon shared-file root from test_config.yaml as the single test authority."""
-    test_cfg = load_test_config_mapping(config_path=config_path)
-    raw = test_cfg.get("shared_file_path")
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("test_config.yaml must define non-empty shared_file_path")
+        raise ValueError("test_config.yaml must define non-empty share_mem_path")
     return raw.strip()

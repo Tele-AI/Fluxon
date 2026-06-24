@@ -93,6 +93,9 @@ class _MockStore(KvClient):
     def get_etcd_config(self):
         return []
 
+    def third_party_logs_dir(self):
+        return Result.new_ok("/tmp/fluxon_third_party_logs")
+
     def ensure_zero_contribution_for_channel(self):
         return None
 

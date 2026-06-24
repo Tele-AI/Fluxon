@@ -318,7 +318,7 @@ profiles:
               disable_prefix_index: true
             fluxonkv_spec:
               cluster_name: __STACK_CLUSTER_NAME__
-              shared_memory_path: __STACK_SHARED_MEMORY_PATH__
+              share_mem_path: __STACK_SHARE_MEM_PATH__
           mq_base:
             capacity: 40
             ttl_seconds: 90

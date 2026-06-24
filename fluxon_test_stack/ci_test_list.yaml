@@ -439,7 +439,7 @@ profiles:
               # Self-host benchmark nodes are launched by the host-side deployer, not inside a
               # container with /hostworkdir mounted. Use the real host path so both infra44/46
               # benchmark nodes can open the same self-host shared-memory root directly.
-              shared_memory_path: __STACK_SHARED_MEMORY_PATH__
+              share_mem_path: __STACK_SHARE_MEM_PATH__
           mq_base:
             capacity: 40
             ttl_seconds: 90

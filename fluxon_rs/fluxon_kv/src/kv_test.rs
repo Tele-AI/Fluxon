@@ -609,8 +609,7 @@ struct KvTestClientOptions {
     transfer_backend_activation_mode: Option<TransferBackendActivationMode>,
     enable_transfer_rpc_fast_path: Option<bool>,
     contribute_to_cluster_pool_size: Option<ContributeToClusterPoolSize>,
-    shared_memory_path: Option<String>,
-    shared_file_path: Option<String>,
+    share_mem_path: Option<String>,
     etcd_mode: Option<KvTestEtcdMode>,
 }
 
@@ -639,14 +638,10 @@ impl KvTestClientOptions {
                 .contribute_to_cluster_pool_size
                 .clone()
                 .or_else(|| self.contribute_to_cluster_pool_size.clone()),
-            shared_memory_path: overrides
-                .shared_memory_path
+            share_mem_path: overrides
+                .share_mem_path
                 .clone()
-                .or_else(|| self.shared_memory_path.clone()),
-            shared_file_path: overrides
-                .shared_file_path
-                .clone()
-                .or_else(|| self.shared_file_path.clone()),
+                .or_else(|| self.share_mem_path.clone()),
             etcd_mode: overrides
                 .etcd_mode
                 .clone()
@@ -800,7 +795,7 @@ impl KvTestRoundOptions {
         )
     }
 
-    fn step8_shared_memory_path(&self) -> String {
+    fn step8_share_mem_path(&self) -> String {
         format!(
             "/tmp/kvcache_shared_memory_step8_{}_{}",
             self.round_name,
@@ -808,13 +803,6 @@ impl KvTestRoundOptions {
         )
     }
 
-    fn step8_shared_file_path(&self) -> String {
-        format!(
-            "/tmp/kvcache_shared_files_step8_{}_{}",
-            self.round_name,
-            kv_test_run_scope()
-        )
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -872,8 +860,7 @@ fn default_owner_test_client_options(round_profile: KvTestRoundProfile) -> KvTes
         transfer_backend_activation_mode: round_profile.owner_transfer_backend_activation_mode(),
         enable_transfer_rpc_fast_path: Some(round_profile.enable_transfer_rpc_fast_path()),
         contribute_to_cluster_pool_size: Some(default_owner_contribute_to_cluster_pool_size()),
-        shared_memory_path: None,
-        shared_file_path: None,
+        share_mem_path: None,
         etcd_mode: Some(KvTestEtcdMode::Enabled),
     }
 }
@@ -886,8 +873,7 @@ fn default_master_test_client_options(round_profile: KvTestRoundProfile) -> KvTe
         transfer_backend_activation_mode: round_profile.master_transfer_backend_activation_mode(),
         enable_transfer_rpc_fast_path: Some(round_profile.enable_transfer_rpc_fast_path()),
         contribute_to_cluster_pool_size: None,
-        shared_memory_path: None,
-        shared_file_path: None,
+        share_mem_path: None,
         etcd_mode: None,
     }
 }
@@ -900,8 +886,7 @@ fn default_external_test_client_options() -> KvTestClientOptions {
         transfer_backend_activation_mode: None,
         enable_transfer_rpc_fast_path: Some(false),
         contribute_to_cluster_pool_size: Some(default_external_contribute_to_cluster_pool_size()),
-        shared_memory_path: None,
-        shared_file_path: None,
+        share_mem_path: None,
         etcd_mode: Some(KvTestEtcdMode::Disabled),
     }
 }
@@ -1037,12 +1022,9 @@ fn build_client_launch(
     let contribute_to_cluster_pool_size = options
         .contribute_to_cluster_pool_size
         .unwrap_or(default_owner_contribute_to_cluster_pool_size());
-    let shared_memory_path = options
-        .shared_memory_path
+    let share_mem_path = options
+        .share_mem_path
         .unwrap_or_else(|| format!("/tmp/kvcache_shared_memory/{}", instance_key));
-    let shared_file_path = options
-        .shared_file_path
-        .unwrap_or_else(|| format!("/tmp/kvcache_shared_files/{}", instance_key));
     let config = ClientConfig {
         cluster_name: round.cluster_name.clone(),
         etcd_addresses_raw,
@@ -1067,8 +1049,7 @@ fn build_client_launch(
         // kv_test uses a per-instance shared memory path by default so each owner/external share
         // group is explicit and test overrides only replace this when a scenario intentionally
         // binds multiple roles to the same owner path.
-        shared_memory_path,
-        shared_file_path,
+        share_mem_path,
         large_file_paths: default_client_large_file_paths(
             &instance_key,
             &contribute_to_cluster_pool_size,
@@ -1102,7 +1083,7 @@ fn new_client_launch(
 }
 
 /// 创建测试用的ExternalClient配置
-/// external 与 owner 的 instance_key 必须不同；仅共享 owner 的 shared_memory_path
+/// external 与 owner 的 instance_key 必须不同；仅共享 owner 的 share_mem_path
 fn new_external_client_launch(
     round: &KvTestRoundOptions,
     external_instance_key: &str,
@@ -1127,15 +1108,9 @@ fn new_external_client_launch(
     if external_options.enable_transfer_rpc_fast_path.is_none() {
         external_options.enable_transfer_rpc_fast_path = Some(false);
     }
-    if external_options.shared_memory_path.is_none() {
-        external_options.shared_memory_path = Some(format!(
+    if external_options.share_mem_path.is_none() {
+        external_options.share_mem_path = Some(format!(
             "/tmp/kvcache_shared_memory/{}",
-            round.scoped_instance_key(owner_instance_key)
-        ));
-    }
-    if external_options.shared_file_path.is_none() {
-        external_options.shared_file_path = Some(format!(
-            "/tmp/kvcache_shared_files/{}",
             round.scoped_instance_key(owner_instance_key)
         ));
     }
@@ -1605,30 +1580,17 @@ async fn shutdown_framework_with_timeout(label: &str, framework: &crate::Framewo
 async fn run_kv_step8(round: &KvTestRoundOptions) {
     info!("📋 Step 8: Verifying external client blocking and recovery behavior");
 
-    let step8_shared_memory_path = round.step8_shared_memory_path();
-    let step8_shared_file_path = round.step8_shared_file_path();
-    if let Err(e) = fs::remove_dir_all(&step8_shared_memory_path) {
+    let step8_share_mem_path = round.step8_share_mem_path();
+    if let Err(e) = fs::remove_dir_all(&step8_share_mem_path) {
         warn!(
             "Step 8: failed to remove existing shared memory dir {}: {}",
-            step8_shared_memory_path, e
+            step8_share_mem_path, e
         );
     }
-    if let Err(e) = fs::create_dir_all(&step8_shared_memory_path) {
+    if let Err(e) = fs::create_dir_all(&step8_share_mem_path) {
         warn!(
             "Step 8: failed to pre-create shared memory dir {}: {}",
-            step8_shared_memory_path, e
-        );
-    }
-    if let Err(e) = fs::remove_dir_all(&step8_shared_file_path) {
-        warn!(
-            "Step 8: failed to remove existing shared file dir {}: {}",
-            step8_shared_file_path, e
-        );
-    }
-    if let Err(e) = fs::create_dir_all(&step8_shared_file_path) {
-        warn!(
-            "Step 8: failed to pre-create shared file dir {}: {}",
-            step8_shared_file_path, e
+            step8_share_mem_path, e
         );
     }
 
@@ -1649,15 +1611,13 @@ async fn run_kv_step8(round: &KvTestRoundOptions) {
     let step8_owner_options = round
         .owner_client_options
         .merged_with(&KvTestClientOptions {
-            shared_memory_path: Some(step8_shared_memory_path.clone()),
-            shared_file_path: Some(step8_shared_file_path.clone()),
+            share_mem_path: Some(step8_share_mem_path.clone()),
             ..Default::default()
         });
     let step8_external_options = round
         .external_client_options
         .merged_with(&KvTestClientOptions {
-            shared_memory_path: Some(step8_shared_memory_path.clone()),
-            shared_file_path: Some(step8_shared_file_path.clone()),
+            share_mem_path: Some(step8_share_mem_path.clone()),
             ..Default::default()
         });
 
@@ -1859,16 +1819,10 @@ async fn run_kv_step8(round: &KvTestRoundOptions) {
         .await;
     shutdown_framework_with_timeout("step8 master", &master_framework_step8).await;
 
-    if let Err(e) = fs::remove_dir_all(&step8_shared_memory_path) {
+    if let Err(e) = fs::remove_dir_all(&step8_share_mem_path) {
         warn!(
             "Step 8: failed to clean shared memory dir {} on exit: {}",
-            step8_shared_memory_path, e
-        );
-    }
-    if let Err(e) = fs::remove_dir_all(&step8_shared_file_path) {
-        warn!(
-            "Step 8: failed to clean shared file dir {} on exit: {}",
-            step8_shared_file_path, e
+            step8_share_mem_path, e
         );
     }
 }
@@ -2085,7 +2039,7 @@ async fn run_kv_round(round: &KvTestRoundOptions) {
 
         // 启动多个客户端节点
         let client1_launch = new_client_launch(round, "test_client_1", None);
-        // external 与 owner 使用不同的 instance_key，但共享 owner 的 shared_memory_path
+        // external 与 owner 使用不同的 instance_key，但共享 owner 的 share_mem_path
         let client2_launch =
             new_external_client_launch(round, "test_client_1_ext2", "test_client_1", None);
         let client3_launch =

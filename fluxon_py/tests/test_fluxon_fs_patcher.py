@@ -23,7 +23,6 @@ from fluxon_py.kvclient import new_store  # noqa: E402
 from fluxon_py.api_error import KeyNotFoundError  # noqa: E402
 from fluxon_py.tests.test_lib import (  # noqa: E402
     load_test_fluxon_cluster_name,
-    load_test_fluxon_share_file_path,
     load_test_fluxon_share_mem_path,
 )
 
@@ -36,24 +35,22 @@ def _new_test_dir(tag: str) -> Path:
     return p
 
 
-def _load_ci_cluster() -> tuple[str, str, str]:
+def _load_ci_cluster() -> tuple[str, str]:
     return (
         load_test_fluxon_cluster_name(),
         load_test_fluxon_share_mem_path(),
-        load_test_fluxon_share_file_path(),
     )
 
 
 def _new_fluxon_external_store(*, instance_key: str):
-    cluster_name, share_mem_path, share_file_path = _load_ci_cluster()
+    cluster_name, share_mem_path = _load_ci_cluster()
     cfg = FluxonKvClientConfig(
         {
             "instance_key": instance_key,
             "contribute_to_cluster_pool_size": {"dram": 0, "vram": {}},
             "fluxonkv_spec": {
                 "cluster_name": cluster_name,
-                "shared_memory_path": share_mem_path,
-                "shared_file_path": share_file_path,
+                "share_mem_path": share_mem_path,
             },
         }
     )

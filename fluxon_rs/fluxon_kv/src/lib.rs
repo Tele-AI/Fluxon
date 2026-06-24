@@ -107,15 +107,11 @@ use tracing::{info, warn};
 
 struct ExternalBootstrapBundle {
     meta: SharedJsonMeta,
-    shared_memory_path: String,
-    shared_file_path: String,
-    etcd_endpoints: Vec<String>,
 }
 
 struct ExternalBootstrapMetadata {
     meta: SharedJsonMeta,
-    shared_memory_path: String,
-    shared_file_path: String,
+    share_mem_path: String,
     etcd_endpoints: Vec<String>,
 }
 
@@ -799,8 +795,7 @@ fn build_side_transfer_worker_config(
             enable_transfer_rpc_fast_path: false,
             sub_cluster: None,
         },
-        shared_memory_path: owner_config.shared_memory_path.clone(),
-        shared_file_path: owner_config.shared_file_path.clone(),
+        share_mem_path: owner_config.share_mem_path.clone(),
         large_file_paths: owner_config.large_file_paths.clone(),
         test_spec_config,
     })
@@ -844,8 +839,7 @@ fn build_side_transfer_worker_config_yaml(
         fluxonkv_spec: crate::config::FluxonKvSpecYaml {
             etcd_addresses: None,
             cluster_name: side_config.cluster_name,
-            shared_memory_path: side_config.shared_memory_path,
-            shared_file_path: side_config.shared_file_path,
+            share_mem_path: side_config.share_mem_path,
             large_file_paths: None,
             p2p_listen_port: side_config.fluxonkv_spec.p2p_listen_port,
             redis_compat: None,
@@ -863,7 +857,7 @@ fn side_transfer_runtime_dir(owner_config: &ClientConfig) -> PathBuf {
 }
 
 fn cluster_manager_local_ipc_root(
-    shared_memory_path: &str,
+    share_mem_path: &str,
     test_spec_config: &TestSpecConfig,
 ) -> Option<String> {
     // Test-only override:
@@ -881,35 +875,35 @@ fn cluster_manager_local_ipc_root(
     // they do not need to reuse the same literal filesystem path.
     //
     // Causal chain:
-    // - `shared_memory_path` is authoritative for mmap.file/shared.json coordination and can be long.
+    // - `share_mem_path` is authoritative for mmap.file/shared.json coordination and can be long.
     // - iceoryx2 event listeners materialize AF_UNIX socket files under `local_ipc_root`.
-    // - AF_UNIX paths are short; reusing a long `shared_memory_path` makes listener creation fail
+    // - AF_UNIX paths are short; reusing a long `share_mem_path` makes listener creation fail
     //   as `ResourceCreationFailed`, even on a clean start with no stale resources.
     // - Therefore we derive a short, stable alias from the canonical shared-memory root and publish
     //   only that alias as `local_ipc_root`.
     Some(
-        derive_short_local_ipc_root(shared_memory_path)
+        derive_short_local_ipc_root(share_mem_path)
             .unwrap_or_else(|err| panic!("failed to derive local_ipc_root: {}", err)),
     )
 }
 
-fn derive_short_local_ipc_root(shared_memory_path: &str) -> Result<String> {
-    if shared_memory_path.trim().is_empty() {
-        anyhow::bail!("shared_memory_path cannot be empty");
+fn derive_short_local_ipc_root(share_mem_path: &str) -> Result<String> {
+    if share_mem_path.trim().is_empty() {
+        anyhow::bail!("share_mem_path cannot be empty");
     }
 
-    std::fs::create_dir_all(shared_memory_path).map_err(|e| {
+    std::fs::create_dir_all(share_mem_path).map_err(|e| {
         anyhow::anyhow!(
-            "shared_memory_path must be creatable before deriving local_ipc_root: path='{}', err={}",
-            shared_memory_path,
+            "share_mem_path must be creatable before deriving local_ipc_root: path='{}', err={}",
+            share_mem_path,
             e
         )
     })?;
 
-    let canonical = std::fs::canonicalize(shared_memory_path).map_err(|e| {
+    let canonical = std::fs::canonicalize(share_mem_path).map_err(|e| {
         anyhow::anyhow!(
-            "shared_memory_path must be canonicalizable before deriving local_ipc_root: path='{}', err={}",
-            shared_memory_path,
+            "share_mem_path must be canonicalizable before deriving local_ipc_root: path='{}', err={}",
+            share_mem_path,
             e
         )
     })?;
@@ -1117,22 +1111,22 @@ fn format_side_transfer_worker_output_tails(worker: &SideTransferWorkerProcess) 
 }
 
 fn read_side_transfer_peer_file(
-    shared_file_path: &str,
+    share_mem_path: &str,
     side_id: &str,
 ) -> Option<crate::client_seg_pool::SideTransferPeerFileMeta> {
-    let peer_path = ClientSegPool::side_transfer_peer_file_path(shared_file_path, side_id);
+    let peer_path = ClientSegPool::side_transfer_peer_file_path(share_mem_path, side_id);
     let payload = std::fs::read_to_string(&peer_path).ok()?;
     serde_json::from_str::<crate::client_seg_pool::SideTransferPeerFileMeta>(&payload).ok()
 }
 
 fn is_side_transfer_worker_ready(
     _cluster_manager: &ClusterManager,
-    shared_file_path: &str,
+    share_mem_path: &str,
     owner_id: &str,
     owner_start_time: i64,
     side_id: &str,
 ) -> bool {
-    let Some(meta) = read_side_transfer_peer_file(shared_file_path, side_id) else {
+    let Some(meta) = read_side_transfer_peer_file(share_mem_path, side_id) else {
         return false;
     };
     // Peer files are written only after the worker has attached shared memory and finished
@@ -1162,8 +1156,8 @@ fn start_side_transfer_worker(
 }
 
 fn cleanup_stale_side_transfer_bootstrap_artifacts(owner_config: &ClientConfig) -> Result<()> {
-    let shared_file_path = Path::new(&owner_config.shared_file_path);
-    let shared_json_path = shared_file_path.join("shared.json");
+    let share_mem_path = Path::new(&owner_config.share_mem_path);
+    let shared_json_path = share_mem_path.join("shared.json");
     match std::fs::remove_file(&shared_json_path) {
         Ok(()) => {
             info!(
@@ -1182,7 +1176,7 @@ fn cleanup_stale_side_transfer_bootstrap_artifacts(owner_config: &ClientConfig) 
         }
     }
 
-    let peers_dir = ClientSegPool::side_transfer_peers_dir(&owner_config.shared_file_path);
+    let peers_dir = ClientSegPool::side_transfer_peers_dir(&owner_config.share_mem_path);
     match std::fs::remove_dir_all(&peers_dir) {
         Ok(()) => {
             info!(
@@ -1229,7 +1223,7 @@ async fn wait_for_side_transfer_workers_ready(
             }
             if is_side_transfer_worker_ready(
                 cluster_manager,
-                &owner_config.shared_file_path,
+                &owner_config.share_mem_path,
                 &owner_info.id,
                 owner_info.node_start_time,
                 &worker.side_id,
@@ -1599,31 +1593,24 @@ async fn bootstrap_zero_contribution_client_config(config: ClientConfig) -> KvRe
         return Ok(config);
     }
 
-    let metadata = load_external_bootstrap_metadata(
-        &config.shared_memory_path,
-        &config.shared_file_path,
-        &config.cluster_name,
-    )
-    .await?;
+    let metadata =
+        load_external_bootstrap_metadata(&config.share_mem_path, &config.cluster_name).await?;
     let mut final_config = config;
     final_config.etcd_addresses_raw = metadata.meta.etcd_addresses.clone();
     final_config.fluxonkv_spec.etcd_addresses = metadata.etcd_endpoints;
     final_config.fluxonkv_spec.sub_cluster = metadata.meta.sub_cluster.clone();
-    final_config.shared_memory_path = metadata.shared_memory_path;
-    final_config.shared_file_path = metadata.shared_file_path;
+    final_config.share_mem_path = metadata.share_mem_path;
     final_config.large_file_paths = metadata.meta.large_file_paths;
     Ok(final_config)
 }
 
 async fn load_external_bootstrap_metadata(
-    shared_memory_path: &str,
-    shared_file_path: &str,
+    share_mem_path: &str,
     expected_cluster_name: &str,
 ) -> KvResult<ExternalBootstrapMetadata> {
     let build_version = fluxon_util::git_version_build_record::get_current_git_commitid().unwrap();
-    let shared_memory_dir = Path::new(shared_memory_path);
-    let shared_file_dir = Path::new(shared_file_path);
-    let shared_json_path = shared_file_dir.join("shared.json");
+    let share_mem_dir = Path::new(share_mem_path);
+    let shared_json_path = share_mem_dir.join("shared.json");
 
     let mut waited_ticks: u64 = 0;
     loop {
@@ -1666,10 +1653,9 @@ async fn load_external_bootstrap_metadata(
             waited_ticks += 1;
             if waited_ticks % 25 == 0 {
                 warn!(
-                    "Waiting protocol_version match... ({}s), shm_dir='{}' file_dir='{}', shared='{}', local='{}'",
+                    "Waiting protocol_version match... ({}s), share_mem_dir='{}', shared='{}', local='{}'",
                     waited_ticks / 5,
-                    shared_memory_dir.to_string_lossy(),
-                    shared_file_dir.to_string_lossy(),
+                    share_mem_dir.to_string_lossy(),
                     meta.protocol_version,
                     build_version
                 );
@@ -1682,10 +1668,9 @@ async fn load_external_bootstrap_metadata(
             waited_ticks += 1;
             if waited_ticks % 25 == 0 {
                 warn!(
-                    "Waiting cluster_name match... ({}s), shm_dir='{}' file_dir='{}', config='{}', shared.json='{}'",
+                    "Waiting cluster_name match... ({}s), share_mem_dir='{}', config='{}', shared.json='{}'",
                     waited_ticks / 5,
-                    shared_memory_dir.to_string_lossy(),
-                    shared_file_dir.to_string_lossy(),
+                    share_mem_dir.to_string_lossy(),
                     expected_cluster_name,
                     meta.cluster_name
                 );
@@ -1693,17 +1678,17 @@ async fn load_external_bootstrap_metadata(
             continue;
         }
 
-        let shared_memory_path_canonical = match std::fs::canonicalize(shared_memory_path) {
+        let share_mem_path_canonical = match std::fs::canonicalize(share_mem_path) {
             Ok(v) => v.to_string_lossy().into_owned(),
             Err(e) => {
                 limit_thirdparty::tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 waited_ticks += 1;
                 if waited_ticks % 25 == 0 {
                     warn!(
-                        "Waiting shared_memory_path canonicalizable... ({}s), shm_dir='{}', path='{}', err={}",
+                        "Waiting share_mem_path canonicalizable... ({}s), share_mem_dir='{}', path='{}', err={}",
                         waited_ticks / 5,
-                        shared_memory_dir.to_string_lossy(),
-                        shared_memory_path,
+                        share_mem_dir.to_string_lossy(),
+                        share_mem_path,
                         e
                     );
                 }
@@ -1711,17 +1696,17 @@ async fn load_external_bootstrap_metadata(
             }
         };
 
-        let meta_shm_canonical = match std::fs::canonicalize(&meta.shared_memory_path) {
+        let meta_shm_canonical = match std::fs::canonicalize(&meta.share_mem_path) {
             Ok(v) => v.to_string_lossy().into_owned(),
             Err(e) => {
                 limit_thirdparty::tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 waited_ticks += 1;
                 if waited_ticks % 25 == 0 {
                     warn!(
-                        "Waiting shared.json shared_memory_path canonicalizable... ({}s), shm_dir='{}', path='{}', err={}",
+                        "Waiting shared.json share_mem_path canonicalizable... ({}s), share_mem_dir='{}', path='{}', err={}",
                         waited_ticks / 5,
-                        shared_memory_dir.to_string_lossy(),
-                        meta.shared_memory_path,
+                        share_mem_dir.to_string_lossy(),
+                        meta.share_mem_path,
                         e
                     );
                 }
@@ -1729,65 +1714,16 @@ async fn load_external_bootstrap_metadata(
             }
         };
 
-        let shared_file_path_canonical = match std::fs::canonicalize(shared_file_path) {
-            Ok(v) => v.to_string_lossy().into_owned(),
-            Err(e) => {
-                limit_thirdparty::tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                waited_ticks += 1;
-                if waited_ticks % 25 == 0 {
-                    warn!(
-                        "Waiting shared_file_path canonicalizable... ({}s), file_dir='{}', path='{}', err={}",
-                        waited_ticks / 5,
-                        shared_file_dir.to_string_lossy(),
-                        shared_file_path,
-                        e
-                    );
-                }
-                continue;
-            }
-        };
-        let meta_file_canonical = match std::fs::canonicalize(&meta.shared_file_path) {
-            Ok(v) => v.to_string_lossy().into_owned(),
-            Err(e) => {
-                limit_thirdparty::tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                waited_ticks += 1;
-                if waited_ticks % 25 == 0 {
-                    warn!(
-                        "Waiting shared.json shared_file_path canonicalizable... ({}s), file_dir='{}', path='{}', err={}",
-                        waited_ticks / 5,
-                        shared_file_dir.to_string_lossy(),
-                        meta.shared_file_path,
-                        e
-                    );
-                }
-                continue;
-            }
-        };
-
-        if meta_shm_canonical != shared_memory_path_canonical {
+        if meta_shm_canonical != share_mem_path_canonical {
             limit_thirdparty::tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             waited_ticks += 1;
             if waited_ticks % 25 == 0 {
                 warn!(
-                    "Waiting shared_memory_path match... ({}s), shm_dir='{}', config='{}', shared.json='{}'",
+                    "Waiting share_mem_path match... ({}s), share_mem_dir='{}', config='{}', shared.json='{}'",
                     waited_ticks / 5,
-                    shared_memory_dir.to_string_lossy(),
-                    shared_memory_path_canonical,
+                    share_mem_dir.to_string_lossy(),
+                    share_mem_path_canonical,
                     meta_shm_canonical
-                );
-            }
-            continue;
-        }
-        if meta_file_canonical != shared_file_path_canonical {
-            limit_thirdparty::tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            waited_ticks += 1;
-            if waited_ticks % 25 == 0 {
-                warn!(
-                    "Waiting shared_file_path match... ({}s), file_dir='{}', config='{}', shared.json='{}'",
-                    waited_ticks / 5,
-                    shared_file_dir.to_string_lossy(),
-                    shared_file_path_canonical,
-                    meta_file_canonical
                 );
             }
             continue;
@@ -1798,10 +1734,9 @@ async fn load_external_bootstrap_metadata(
             waited_ticks += 1;
             if waited_ticks % 25 == 0 {
                 warn!(
-                    "Waiting shared.json etcd_addresses non-empty... ({}s), shm_dir='{}' file_dir='{}', shared_memory_path='{}'",
+                    "Waiting shared.json etcd_addresses non-empty... ({}s), share_mem_dir='{}', share_mem_path='{}'",
                     waited_ticks / 5,
-                    shared_memory_dir.to_string_lossy(),
-                    shared_file_dir.to_string_lossy(),
+                    share_mem_dir.to_string_lossy(),
                     meta_shm_canonical
                 );
             }
@@ -1815,10 +1750,9 @@ async fn load_external_bootstrap_metadata(
                 waited_ticks += 1;
                 if waited_ticks % 25 == 0 {
                     warn!(
-                        "Waiting shared.json etcd_addresses valid... ({}s), shm_dir='{}' file_dir='{}', raw={:?}, err={}",
+                        "Waiting shared.json etcd_addresses valid... ({}s), share_mem_dir='{}', raw={:?}, err={}",
                         waited_ticks / 5,
-                        shared_memory_dir.to_string_lossy(),
-                        shared_file_dir.to_string_lossy(),
+                        share_mem_dir.to_string_lossy(),
                         meta.etcd_addresses,
                         e
                     );
@@ -1829,8 +1763,7 @@ async fn load_external_bootstrap_metadata(
 
         return Ok(ExternalBootstrapMetadata {
             meta,
-            shared_memory_path: meta_shm_canonical,
-            shared_file_path: meta_file_canonical,
+            share_mem_path: meta_shm_canonical,
             etcd_endpoints,
         });
     }
@@ -1839,16 +1772,11 @@ async fn load_external_bootstrap_metadata(
 async fn wait_for_external_bootstrap_bundle(
     config: &ClientConfig,
 ) -> KvResult<ExternalBootstrapBundle> {
-    let metadata = load_external_bootstrap_metadata(
-        &config.shared_memory_path,
-        &config.shared_file_path,
-        &config.cluster_name,
-    )
-    .await?;
-    let shared_memory_dir = Path::new(&metadata.shared_memory_path);
-    let shared_file_dir = Path::new(&metadata.shared_file_path);
-    let shared_json_path = shared_file_dir.join("shared.json");
-    let mmap_file_path = shared_memory_dir.join("mmap.file");
+    let metadata =
+        load_external_bootstrap_metadata(&config.share_mem_path, &config.cluster_name).await?;
+    let share_mem_dir = Path::new(&metadata.share_mem_path);
+    let shared_json_path = share_mem_dir.join("shared.json");
+    let mmap_file_path = share_mem_dir.join("mmap.file");
 
     let mut waited_ticks: u64 = 0;
     loop {
@@ -1857,10 +1785,9 @@ async fn wait_for_external_bootstrap_bundle(
             waited_ticks += 1;
             if waited_ticks % 25 == 0 {
                 info!(
-                    "Waiting owner shared bundle to be ready... ({}s), shm_dir={} file_dir={} (shared.json={}, mmap.file={})",
+                    "Waiting owner shared bundle to be ready... ({}s), share_mem_dir={} (shared.json={}, mmap.file={})",
                     waited_ticks / 5,
-                    shared_memory_dir.to_string_lossy(),
-                    shared_file_dir.to_string_lossy(),
+                    share_mem_dir.to_string_lossy(),
                     shared_json_path.exists(),
                     mmap_file_path.exists()
                 );
@@ -1869,9 +1796,6 @@ async fn wait_for_external_bootstrap_bundle(
         }
         return Ok(ExternalBootstrapBundle {
             meta: metadata.meta,
-            shared_memory_path: metadata.shared_memory_path,
-            shared_file_path: metadata.shared_file_path,
-            etcd_endpoints: metadata.etcd_endpoints,
         });
     }
 }
@@ -1934,14 +1858,14 @@ async fn run_client_impl(
 
     println!("Client config: {:?}", config);
     println!(
-        "Client shared_memory_path resolved to: {:?}",
-        config.shared_memory_path
+        "Client share_mem_path resolved to: {:?}",
+        config.share_mem_path
     );
 
     info!("Client config: {:?}", config);
     info!(
-        "Client shared_memory_path resolved to: {:?}",
-        config.shared_memory_path
+        "Client share_mem_path resolved to: {:?}",
+        config.share_mem_path
     );
     info!("Build version (git commit): {}", build_version);
     info!("Build version (source-sha256): {}", source_sha256);
@@ -2042,7 +1966,7 @@ async fn run_client_impl(
                 port: None,
                 metadata,
                 local_ipc_root: cluster_manager_local_ipc_root(
-                    &config.shared_memory_path,
+                    &config.share_mem_path,
                     &config.test_spec_config,
                 ),
                 rdma_control_init: rdma_control_init.clone(),
@@ -2065,8 +1989,7 @@ async fn run_client_impl(
                 test_spec_config: config.test_spec_config.clone(),
             },
             external_client_api_arg: ExternalClientApiNewArg {
-                shared_memory_path: config.shared_memory_path.clone(),
-                shared_file_path: config.shared_file_path.clone(),
+                share_mem_path: config.share_mem_path.clone(),
                 large_file_paths: config.large_file_paths.clone(),
                 expected_cluster_name: config.cluster_name.clone(),
                 expected_protocol_version: build_version.clone(),
@@ -2089,7 +2012,7 @@ async fn run_client_impl(
                 port: None,
                 metadata,
                 local_ipc_root: cluster_manager_local_ipc_root(
-                    &config.shared_memory_path,
+                    &config.share_mem_path,
                     &config.test_spec_config,
                 ),
                 rdma_control_init,
@@ -2117,8 +2040,7 @@ async fn run_client_impl(
             client_seg_pool_arg: ClientSegPoolNewArg {
                 contribute_size: config.contribute_to_cluster_pool_size.clone(),
                 // Read shared memory path from config (must not be empty).
-                shared_memory_path: config.shared_memory_path.clone(),
-                shared_file_path: config.shared_file_path.clone(),
+                share_mem_path: config.share_mem_path.clone(),
                 large_file_paths: config.large_file_paths.clone(),
                 cluster_name: config.cluster_name.clone(),
                 etcd_addresses: config.etcd_addresses_raw.clone(),
@@ -2271,7 +2193,7 @@ async fn run_client_impl(
                             Ok(None) => {
                                 if is_side_transfer_worker_ready(
                                     cluster_manager,
-                                    &reconcile_owner_config.shared_memory_path,
+                                    &reconcile_owner_config.share_mem_path,
                                     &reconcile_owner_info.id,
                                     reconcile_owner_info.node_start_time,
                                     &worker.side_id,
@@ -2542,8 +2464,7 @@ mod tests {
                 enable_transfer_rpc_fast_path: true,
                 sub_cluster: Some("owner-sub".to_string()),
             },
-            shared_memory_path: "/tmp/fluxon_side_transfer_test".to_string(),
-            shared_file_path: "/tmp/fluxon_side_transfer_test_files".to_string(),
+            share_mem_path: "/tmp/fluxon_side_transfer_test".to_string(),
             large_file_paths: crate::config::LargeFilePaths {
                 paths: vec!["/tmp/fluxon_side_transfer_test_large".to_string()],
             },
@@ -2612,11 +2533,11 @@ mod tests {
     #[test]
     fn derive_short_local_ipc_root_is_stable_for_canonical_path() {
         let tempdir = new_test_dir("fluxon_local_ipc_root_stable");
-        let shared_memory_root = tempdir.join("owner_shm");
-        std::fs::create_dir_all(&shared_memory_root).unwrap();
+        let share_mem_root = tempdir.join("owner_shm");
+        std::fs::create_dir_all(&share_mem_root).unwrap();
 
-        let canonical = std::fs::canonicalize(&shared_memory_root).unwrap();
-        let alias_a = derive_short_local_ipc_root(shared_memory_root.to_str().unwrap()).unwrap();
+        let canonical = std::fs::canonicalize(&share_mem_root).unwrap();
+        let alias_a = derive_short_local_ipc_root(share_mem_root.to_str().unwrap()).unwrap();
         let alias_b = derive_short_local_ipc_root(canonical.to_str().unwrap()).unwrap();
 
         assert_eq!(alias_a, alias_b);
@@ -2628,10 +2549,10 @@ mod tests {
     #[test]
     fn derive_short_local_ipc_root_keeps_iceoryx_event_path_short() {
         let tempdir = new_test_dir("fluxon_local_ipc_root_short");
-        let shared_memory_root = tempdir.join(
-            "this_is_a_deliberately_long_shared_memory_root_name_for_iceoryx_socket_length_checks",
+        let share_mem_root = tempdir.join(
+            "this_is_a_deliberately_long_share_mem_root_name_for_iceoryx_socket_length_checks",
         );
-        let alias = derive_short_local_ipc_root(shared_memory_root.to_str().unwrap()).unwrap();
+        let alias = derive_short_local_ipc_root(share_mem_root.to_str().unwrap()).unwrap();
         let example_event_path = format!("{}/iox2_254771654226413701181693419284.event", alias);
 
         assert!(Path::new(&alias).is_absolute());
@@ -2647,17 +2568,17 @@ mod tests {
     #[test]
     fn cluster_manager_local_ipc_root_respects_test_disable_switch() {
         let tempdir = new_test_dir("fluxon_local_ipc_root_disable_switch");
-        let shared_memory_root = tempdir.join("owner_shm");
-        std::fs::create_dir_all(&shared_memory_root).unwrap();
+        let share_mem_root = tempdir.join("owner_shm");
+        std::fs::create_dir_all(&share_mem_root).unwrap();
 
         let enabled = cluster_manager_local_ipc_root(
-            shared_memory_root.to_str().unwrap(),
+            share_mem_root.to_str().unwrap(),
             &TestSpecConfig::default(),
         );
         assert!(enabled.is_some());
 
         let disabled = cluster_manager_local_ipc_root(
-            shared_memory_root.to_str().unwrap(),
+            share_mem_root.to_str().unwrap(),
             &TestSpecConfig {
                 disable_local_ipc: true,
                 ..Default::default()
@@ -2794,13 +2715,11 @@ mod tests {
     #[tokio::test]
     async fn zero_contribution_bootstrap_inherits_large_file_paths_from_owner_shared_json() {
         let tempdir = new_test_dir("fluxon_external_bootstrap_large_paths");
-        let shared_memory_root = tempdir.join("shared_mem");
-        let shared_file_root = tempdir.join("shared_file");
+        let share_mem_root = tempdir.join("shared_mem");
         let owner_large_root = tempdir.join("owner_large");
-        std::fs::create_dir_all(&shared_memory_root).unwrap();
-        std::fs::create_dir_all(&shared_file_root).unwrap();
+        std::fs::create_dir_all(&share_mem_root).unwrap();
         std::fs::create_dir_all(&owner_large_root).unwrap();
-        std::fs::write(shared_memory_root.join("mmap.file"), vec![0u8; 4096]).unwrap();
+        std::fs::write(share_mem_root.join("mmap.file"), vec![0u8; 4096]).unwrap();
 
         let shared_meta = SharedJsonMeta {
             owner_id: "owner-a".to_string(),
@@ -2810,11 +2729,7 @@ mod tests {
             sub_cluster: Some("owner-sub".to_string()),
             cluster_name: "test_cluster".to_string(),
             etcd_addresses: vec!["127.0.0.1:2379".to_string()],
-            shared_memory_path: std::fs::canonicalize(&shared_memory_root)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            shared_file_path: std::fs::canonicalize(&shared_file_root)
+            share_mem_path: std::fs::canonicalize(&share_mem_root)
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
@@ -2829,7 +2744,7 @@ mod tests {
         assert!(shared_meta_json.contains("\"large_file_paths\":["));
         assert!(!shared_meta_json.contains("root_paths"));
         std::fs::write(
-            shared_file_root.join("shared.json"),
+            share_mem_root.join("shared.json"),
             shared_meta_json.as_bytes(),
         )
         .unwrap();
@@ -2856,8 +2771,7 @@ mod tests {
                 enable_transfer_rpc_fast_path: false,
                 sub_cluster: None,
             },
-            shared_memory_path: shared_memory_root.to_string_lossy().into_owned(),
-            shared_file_path: shared_file_root.to_string_lossy().into_owned(),
+            share_mem_path: share_mem_root.to_string_lossy().into_owned(),
             large_file_paths: crate::config::LargeFilePaths { paths: Vec::new() },
             test_spec_config: TestSpecConfig::default(),
         };

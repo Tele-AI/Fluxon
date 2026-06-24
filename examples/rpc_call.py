@@ -8,8 +8,7 @@ from fluxon_py import FluxonKvClientConfig, new_store
 RPC_SERVER_INSTANCE_KEY = "demo_rpc_server"
 RPC_CLIENT_INSTANCE_KEY = "demo_rpc_client"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARED_MEMORY_PATH = "/dev/shm/fluxon_kv_demo"
-SHARED_FILE_PATH = "/tmp/fluxon_kv_demo/shared"
+SHARE_MEM_PATH = "/dev/shm/fluxon_kv_demo"
 
 
 def main() -> None:
@@ -43,8 +42,7 @@ def _build_config(*, instance_key: str) -> FluxonKvClientConfig:
             "instance_key": instance_key,
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
-                "shared_memory_path": SHARED_MEMORY_PATH,
-                "shared_file_path": SHARED_FILE_PATH,
+                "share_mem_path": SHARE_MEM_PATH,
             },
             "test_spec_config": {
                 "disable_observability": True,

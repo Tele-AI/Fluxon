@@ -152,8 +152,7 @@ def _owner_fluxonkv_base_config(
     *,
     instance_key: str = "test_instance",
     cluster_name: str = "test_cluster",
-    shared_memory_path: str = "/tmp/kvcache_shared_memory/test",
-    shared_file_path: str = "/tmp/kvcache_shared_files/test",
+    share_mem_path: str = "/tmp/kvcache_shared_memory/test",
     sub_cluster: str = "rack-a",
     tag: str = "test",
 ) -> dict:
@@ -163,8 +162,7 @@ def _owner_fluxonkv_base_config(
         "fluxonkv_spec": {
             "etcd_addresses": ["localhost:2379"],
             "cluster_name": cluster_name,
-            "shared_memory_path": shared_memory_path,
-            "shared_file_path": shared_file_path,
+            "share_mem_path": share_mem_path,
             "sub_cluster": sub_cluster,
             "large_file_paths": _owner_large_file_paths(tag),
         },
@@ -320,8 +318,7 @@ def test_fluxonkv_external_forbids_large_file_paths():
             "contribute_to_cluster_pool_size": {"dram": 0, "vram": {}},
             "fluxonkv_spec": {
                 "cluster_name": "test_cluster",
-                "shared_memory_path": "/tmp/kvcache_shared_memory/test",
-                "shared_file_path": "/tmp/kvcache_shared_files/test",
+                "share_mem_path": "/tmp/kvcache_shared_memory/test",
                 "large_file_paths": _owner_large_file_paths("external_forbidden"),
             },
         }
@@ -364,9 +361,9 @@ def test_fluxon_client_config_yaml_shape():
         config = FluxonKvClientConfig(copy.deepcopy(base))
         yaml_text = config.to_fluxon_kv_client_config_yaml_str()
         loaded = yaml.safe_load(yaml_text)
-        assert loaded["fluxonkv_spec"]["shared_memory_path"] == base["fluxonkv_spec"]["shared_memory_path"]
+        assert loaded["fluxonkv_spec"]["share_mem_path"] == base["fluxonkv_spec"]["share_mem_path"]
         assert loaded["fluxonkv_spec"]["sub_cluster"] == base["fluxonkv_spec"]["sub_cluster"]
-        assert "shared_memory_path" not in loaded
+        assert "share_mem_path" not in loaded
         assert "rdma_device_names" not in loaded
         assert "transfer_engine" not in loaded["fluxonkv_spec"]
         print("✅ PASS: test_fluxon_client_config_yaml_shape")
@@ -384,8 +381,7 @@ def test_fluxonkv_protocol_field():
             },
             "fluxonkv_spec": {
                 "cluster_name": "test_cluster",
-                "shared_memory_path": "/tmp/kvcache_shared_memory/test_side_worker",
-                "shared_file_path": "/tmp/kvcache_shared_files/test_side_worker",
+                "share_mem_path": "/tmp/kvcache_shared_memory/test_side_worker",
             },
             "test_spec_config": {
                 "enable_side_transfer": True,

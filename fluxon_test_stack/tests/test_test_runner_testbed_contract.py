@@ -58,7 +58,6 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         run_dir=run_dir,
                         cluster_name="ci_cluster",
                         share_mem_path="/tmp/ci_shm",
-                        share_file_path="/tmp/ci_share",
                         owner_dram_bytes=1073741824,
                     )
 
@@ -67,6 +66,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 owner_cfg["fluxonkv_spec"]["large_file_paths"],
                 [str((run_dir / "services" / "owner_0" / "large").resolve())],
             )
+            self.assertNotIn("shared_file_path", owner_cfg["fluxonkv_spec"])
 
     def test_ci_runtime_python_executable_requires_python310_on_path(self) -> None:
         with mock.patch.object(_RUNNER.shutil, "which", return_value=None):
@@ -255,8 +255,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     "run_dir": str(run_dir),
                     "stack_identity": {
                         "cluster_name": "bench_cluster",
-                        "shared_memory_path": "/tmp/bench_shm",
-                        "shared_file_path": "/tmp/bench_share",
+                        "share_mem_path": "/tmp/bench_shm",
                     },
                 }
             }
@@ -385,8 +384,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         "kv_svc_type: fluxon",
                         "etcd_address: 127.0.0.1:2379",
                         "cluster_name: fluxon-example-cluster",
-                        "shared_memory_path: /tmp/fluxon-example-cluster/shm",
-                        "shared_file_path: /tmp/fluxon-example-cluster/share",
+                        "share_mem_path: /tmp/fluxon-example-cluster/shm",
                         "",
                     ]
                 ),
@@ -520,8 +518,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                             overlay_live_checkout=False,
                             etcd_address="127.0.0.1:32579",
                             cluster_name="ci_case_cluster",
-                            shared_memory_path="/tmp/ci_case_cluster/shm",
-                            shared_file_path="/tmp/ci_case_cluster/share",
+                            share_mem_path="/tmp/ci_case_cluster/shm",
                         )
 
             release_view_root = src_root / "fluxon_release"
@@ -540,8 +537,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     "kv_svc_type": "fluxon",
                     "etcd_address": "127.0.0.1:32579",
                     "cluster_name": "ci_case_cluster",
-                    "shared_memory_path": "/tmp/ci_case_cluster/shm",
-                    "shared_file_path": "/tmp/ci_case_cluster/share",
+                    "share_mem_path": "/tmp/ci_case_cluster/shm",
                 },
             )
             assert_python_abi.assert_called_once_with(venv_python=venv_python)
@@ -625,8 +621,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         "ops_cluster_name": "fluxon_testbed",
                         "cluster_name": "fluxon_testbed",
                         "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
-                        "shared_memory_path": "/tmp/shm",
-                        "shared_file_path": "/tmp/share",
+                        "share_mem_path": "/tmp/shm",
                     },
                     "deploy_instances": {
                         "case_runtime": [
@@ -650,7 +645,6 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     run_dir=run_dir,
                     src_root=src_root,
                     share_mem_path="/tmp/shm",
-                    share_file_path="/tmp/share",
                 )
             script_text = script_path.read_text(encoding="utf-8")
             self.assertIn('prepare_env_path="', script_text)
@@ -875,8 +869,9 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 contract["ops_controller_url"],
                 "http://127.0.0.1:19080/r/ops/fluxon_testbed",
             )
-            self.assertEqual(contract["shared_memory_hostworkdir"], "${HOSTWORKDIR}/shm1")
-            self.assertEqual(contract["shared_file_hostworkdir"], "${HOSTWORKDIR}/shm2_files")
+            self.assertEqual(contract["share_mem_hostworkdir"], "${HOSTWORKDIR}/shm1")
+            self.assertNotIn("shared_memory_hostworkdir", contract)
+            self.assertNotIn("shared_file_hostworkdir", contract)
 
     def test_load_source_stack_contract_rejects_multi_hostworkdir_remote_layout(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1044,8 +1039,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     "stack_identity": {
                         "cluster_name": "fluxon_testbed",
                         "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
-                        "shared_memory_path": "/tmp/shm",
-                        "shared_file_path": "/tmp/share",
+                        "share_mem_path": "/tmp/shm",
                     },
                 },
                 "artifact_set": {
