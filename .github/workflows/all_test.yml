@@ -66,6 +66,10 @@ jobs:
           # - ci_top_attention_doc_page_build validates doc build through the prebuilt Docker image.
           # - ci_top_attention_bin_kvtest keeps the Rust kv_test entry under the testbed scene contract.
           # - ci_top_attention_mq_core keeps MQ correctness coverage inside the same CI testbed contract.
+          # - ci_top_attention_mq_mpsc / ci_top_attention_mq_mpmc / ci_top_attention_mq_mpmc_bench
+          #   keep the API channel and heavier MPMC bench-style coverage in the same CI contract.
+          # - ci_top_attention_ctrl_c_kv / ci_top_attention_ctrl_c_mq keep signal-exit coverage
+          #   under the runner-native CI scene model instead of ad hoc side entrypoints.
           suite["scenes"] = {
               key: value
               for key, value in suite["scenes"].items()
@@ -73,6 +77,11 @@ jobs:
                   "ci_top_attention_doc_page_build",
                   "ci_top_attention_bin_kvtest",
                   "ci_top_attention_mq_core",
+                  "ci_top_attention_mq_mpsc",
+                  "ci_top_attention_mq_mpmc",
+                  "ci_top_attention_mq_mpmc_bench",
+                  "ci_top_attention_ctrl_c_kv",
+                  "ci_top_attention_ctrl_c_mq",
               )
           }
 
@@ -95,8 +104,10 @@ jobs:
           # Scale selection:
           # - Keep the original per-scene scales from ci_test_list.yaml.
           # - ci_top_attention_doc_page_build stays on n1_kvowner_dram_3gib.
+          # - ci_top_attention_ctrl_c_kv stays on n1_kvowner_dram_3gib.
           # - ci_top_attention_bin_kvtest stays on n1_kvowner_dram_20gib.
-          # - ci_top_attention_mq_core stays on n1_kvowner_dram_20gib.
+          # - ci_top_attention_mq_core / ci_top_attention_mq_mpsc / ci_top_attention_mq_mpmc /
+          #   ci_top_attention_mq_mpmc_bench / ci_top_attention_ctrl_c_mq stay on n1_kvowner_dram_20gib.
 
           out_path.write_text(
               yaml.safe_dump(suite, sort_keys=False, allow_unicode=False),

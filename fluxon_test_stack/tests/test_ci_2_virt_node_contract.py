@@ -30,6 +30,11 @@ class TestCi2VirtNodeContract(unittest.TestCase):
     _KVTEST_SCENE_ID = "ci_top_attention_bin_kvtest"
     _DOC_SCENE_ID = "ci_top_attention_doc_page_build"
     _MQ_SCENE_ID = "ci_top_attention_mq_core"
+    _MQ_MPSC_SCENE_ID = "ci_top_attention_mq_mpsc"
+    _MQ_MPMC_SCENE_ID = "ci_top_attention_mq_mpmc"
+    _MQ_MPMC_BENCH_SCENE_ID = "ci_top_attention_mq_mpmc_bench"
+    _CTRL_C_KV_SCENE_ID = "ci_top_attention_ctrl_c_kv"
+    _CTRL_C_MQ_SCENE_ID = "ci_top_attention_ctrl_c_mq"
 
     def test_generated_suite_is_public_dual_local_nodes_ci_only(self) -> None:
         suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
@@ -147,6 +152,51 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             ["n1_kvowner_dram_20gib"],
         )
         self.assertEqual(set(generated["scales"].keys()), {"n1_kvowner_dram_20gib"})
+
+    def test_generated_suite_supports_extra_ci_scenes(self) -> None:
+        suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
+        scene_ids = [
+            self._MQ_MPSC_SCENE_ID,
+            self._MQ_MPMC_SCENE_ID,
+            self._MQ_MPMC_BENCH_SCENE_ID,
+            self._CTRL_C_KV_SCENE_ID,
+            self._CTRL_C_MQ_SCENE_ID,
+        ]
+        generated = _ENTRY._rewrite_suite_for_local_dual_nodes(
+            suite_cfg=suite_cfg,
+            scene_ids=scene_ids,
+            primary_node_name="local-node-a",
+            secondary_node_name="local-node-b",
+            host_ip="10.1.1.119",
+            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            controller_port=19080,
+        )
+
+        self.assertEqual(set(generated["scenes"].keys()), set(scene_ids))
+        self.assertEqual(
+            generated["scenes"][self._CTRL_C_KV_SCENE_ID]["ci"]["runtime_contract"],
+            "rust_self_managed",
+        )
+        self.assertEqual(
+            generated["scenes"][self._CTRL_C_MQ_SCENE_ID]["ci"]["runtime_contract"],
+            "cluster_kv_owner",
+        )
+        self.assertEqual(
+            generated["scenes"][self._MQ_MPSC_SCENE_ID]["ci"]["subject"],
+            "mq",
+        )
+        self.assertEqual(
+            generated["scenes"][self._MQ_MPMC_SCENE_ID]["ci"]["subject"],
+            "mq",
+        )
+        self.assertEqual(
+            generated["scenes"][self._MQ_MPMC_BENCH_SCENE_ID]["ci"]["subject"],
+            "mq",
+        )
+        self.assertEqual(
+            set(generated["scales"].keys()),
+            {"n1_kvowner_dram_3gib", "n1_kvowner_dram_20gib"},
+        )
 
     def test_generated_suite_preserves_source_scene_configs(self) -> None:
         suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
