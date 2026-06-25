@@ -1002,6 +1002,21 @@ def _wait_running(
         time.sleep(1.0)
 
 
+def _http_status_allow_error(
+    controller_url: str,
+    target: str,
+    kind: str,
+    name: str,
+    authority: str,
+) -> tuple[int, Dict[str, Any]]:
+    qs = urllib.parse.urlencode(
+        {"target": target, "kind": kind, "name": name, "authority": authority}
+    )
+    url = controller_url + "/api/status?" + qs
+    req = _new_controller_request(url, method="GET")
+    return _http_json_allow_error_status(req)
+
+
 def _http_deploy(controller_url: str, yaml_text: str) -> Dict[str, Any]:
     url = controller_url + "/api/deploy"
     data = yaml_text.encode("utf-8")
