@@ -120,10 +120,6 @@ SCENE_KIND_TEST_STACK = "TEST_STACK"
 CASE_FAMILY_INFER = "infer"
 CASE_FAMILY_CI = "ci"
 CASE_FAMILY_BENCH = "bench"
-INFER_PATTERN_REPEAT = "REPEAT_PROMPTS"
-INFER_PATTERN_UNIQUE = "UNIQUE_PROMPTS"
-INFER_STACK_VLLM_LMCACHE = "VLLM_LMCACHE"
-INFER_STACK_SGLANG_HICACHE = "SGLANG_HICACHE"
 RUN_OUTCOME_SUCCESS = "SUCCESS"
 RUN_OUTCOME_FAILED = "FAILED"
 _RUN_SUMMARY_INCOMPLETE_ERROR = "INCOMPLETE: run started but did not reach finalize; runner likely exited abruptly."
@@ -972,7 +968,7 @@ def main() -> None:
             )
             if _case_family_uses_case_plan(case_family):
                 case_plan = _compile_case_plan(resolved_case)
-            if case_family in (CASE_FAMILY_INFER, CASE_FAMILY_CI, CASE_FAMILY_BENCH):
+            if case_family in (CASE_FAMILY_CI, CASE_FAMILY_BENCH):
                 _apply_stable_deploy_names(resolved_case)
                 _sync_case_runtime_model_from_deploy(resolved_case)
 
@@ -988,36 +984,7 @@ def main() -> None:
                     case_plan=case_plan,
                     runtime_tracking=runtime_tracking,
                 )
-            if case_family == CASE_FAMILY_INFER:
-                _ensure_deployer_online(resolved_case)
-                _write_deployer_manifests(resolved_case, run_dir, allow_overwrite=False)
-
-                infer_deploy_attempted = True
-                deploy_result = _run_adapter_action(
-                    resolved_case, run_dir=run_dir, action="deploy"
-                )
-                _validate_deploy_result(resolved_case, deploy_result)
-
-                endpoint_url = _resolved_endpoint_url(resolved_case, deploy_result)
-                _tcp_check_endpoint(endpoint_url)
-
-                infer_out = _run_infer_ai_perf(resolved_case, deploy_result, run_dir)
-                summary = _build_infer_summary_yaml(
-                    resolved_case,
-                    deploy_result,
-                    run_index=run_slot.run_index,
-                    started_at_unix_s=started_at,
-                    finished_at_unix_s=int(time.time()),
-                    outcome=RUN_OUTCOME_SUCCESS,
-                    counted=False,
-                    ai_perf_out=infer_out,
-                )
-                _write_yaml_file(run_dir / "summary.yaml", summary)
-
-                outcome = RUN_OUTCOME_SUCCESS
-
-
-            elif _case_family_uses_case_plan(case_family):
+            if _case_family_uses_case_plan(case_family):
                 if case_plan is None:
                     raise ValueError(f"internal error: case_plan is missing for case_family={case_family}")
                 prepared_case = _prepare_case(
@@ -1056,20 +1023,6 @@ def main() -> None:
             outcome = RUN_OUTCOME_FAILED
 
         finally:
-            if case_family == CASE_FAMILY_INFER and resolved_case is not None:
-                try:
-                    if infer_deploy_attempted:
-                        _run_adapter_action(
-                            resolved_case,
-                            run_dir=run_dir,
-                            action="teardown",
-                        )
-                except Exception as exc:
-                    print(
-                        "ERROR: teardown failed; stopping (no fallback). "
-                        f"case_id={case.case_id} err={type(exc).__name__}: {exc}"
-                    )
-                    raise SystemExit(1)
             if case_plan is not None and resolved_case is not None:
                 try:
                     _finalize_case_runtime(
@@ -2421,7 +2374,7 @@ def _resolved_case_ops_namespace(resolved_case: Dict[str, Any]) -> str:
 def _apply_stable_deploy_names(resolved_case: Dict[str, Any]) -> None:
     """Rewrite deploy.instances[].k8s_ref into a stable logical deployment name.
 
-    For CI/infer, replacement semantics follow the logical case identity and stay rerun-stable.
+    For CI cases, replacement semantics follow the logical case identity and stay rerun-stable.
     For TEST_STACK benchmark workloads, names are additionally scoped by run_dir hash so a stale
     controller/runtime from an older runner cannot collide with the current run.
     """
@@ -2448,8 +2401,6 @@ def _apply_stable_deploy_names(resolved_case: Dict[str, Any]) -> None:
 
 def _resolved_case_kind(resolved_case: Dict[str, Any]) -> str:
     scene = _require_dict(resolved_case.get("scene"), "resolved_case.scene")
-    if scene.get("infer") is not None:
-        return SCENE_KIND_INFER
     if scene.get("ci") is not None:
         return SCENE_KIND_CI
     if scene.get("test_stack") is not None:
@@ -2460,7 +2411,7 @@ def _resolved_case_kind(resolved_case: Dict[str, Any]) -> str:
 def _resolved_case_family(resolved_case: Dict[str, Any]) -> str:
     case = _require_dict(resolved_case.get("case"), "resolved_case.case")
     family = _require_str(case.get("family"), "resolved_case.case.family")
-    if family not in (CASE_FAMILY_INFER, CASE_FAMILY_CI, CASE_FAMILY_BENCH):
+    if family not in (CASE_FAMILY_CI, CASE_FAMILY_BENCH):
         raise ValueError(f"resolved_case.case.family unsupported: {family!r}")
     return family
 
@@ -2487,8 +2438,6 @@ def _ci_runtime_contract_id(resolved_case: Dict[str, Any]) -> str:
 
 
 def _case_family_id(case_kind: str) -> str:
-    if case_kind == SCENE_KIND_INFER:
-        return CASE_FAMILY_INFER
     if case_kind == SCENE_KIND_CI:
         return CASE_FAMILY_CI
     if case_kind == SCENE_KIND_TEST_STACK:
@@ -2530,7 +2479,7 @@ def _close_case_runtime_locks(runtime_tracking: _CaseRuntimeTracking) -> None:
 def _build_runtime_model(case_family: str) -> Dict[str, Any]:
     if case_family == CASE_FAMILY_CI:
         case_instance_ids = list(CI_RUNTIME_LAYER_INSTANCE_IDS[RUNTIME_LAYER_CASE])
-    elif case_family in (CASE_FAMILY_INFER, CASE_FAMILY_BENCH):
+    elif case_family == CASE_FAMILY_BENCH:
         case_instance_ids = []
     else:
         raise ValueError(f"unsupported runtime model case family: {case_family}")
@@ -2631,9 +2580,6 @@ def _compile_case_runtime_artifacts(
         test_stack_meta = _compile_test_stack_case(resolved_case, run_index=run_index)
         _sync_case_runtime_model_from_deploy(resolved_case)
         return test_stack_meta
-    if case_family == CASE_FAMILY_INFER:
-        _sync_case_runtime_model_from_deploy(resolved_case)
-        return None
     raise ValueError(f"unsupported case family for runtime artifact compilation: {case_family}")
 
 
@@ -3466,12 +3412,14 @@ def _finalize_ci_case_runtime(
 def _finalize_test_stack_case_runtime(
     resolved_case: Dict[str, Any],
     *,
+    run_dir: Path,
     runtime_tracking: _CaseRuntimeTracking,
     outcome: str,
 ) -> None:
     _finalize_test_stack_case_runtime_impl(
         ctx=sys.modules[__name__],
         resolved_case=resolved_case,
+        run_dir=run_dir,
         runtime_tracking=runtime_tracking,
         outcome=outcome,
     )

@@ -291,6 +291,84 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 },
             )
 
+    def test_finalize_test_stack_case_runtime_collects_status_and_records_collect_error(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            summary_path = run_dir / "summary.yaml"
+            _RUNNER._write_yaml_file(
+                summary_path,
+                {
+                    "schema_version": _RUNNER.SCHEMA_VERSION,
+                    "case_id": "bench_case",
+                    "case_key": "bench_case_key",
+                    "run_index": 1,
+                    "outcome": _RUNNER.RUN_OUTCOME_FAILED,
+                    "counted": False,
+                    "timing": {
+                        "started_at_unix_s": 100,
+                        "finished_at_unix_s": 200,
+                    },
+                    "test_stack": {
+                        "coordinator_addr": "127.0.0.1:19999",
+                        "completion_signal": "benchmark_result_json",
+                        "result_path": str((run_dir / "benchmark_result.json").resolve()),
+                        "result": None,
+                        "error": "RuntimeError: benchmark failed",
+                        "collect_error": None,
+                    },
+                },
+            )
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_DEBUG_ONE_BY_ONE,
+                    "case_id": "bench_case",
+                    "case_key": "bench_case_key",
+                },
+                "deploy": {
+                    "instances": [
+                        {"id": "coordinator", "deployer": {"target": "local-node-a"}},
+                        {"id": "node_0", "deployer": {"target": "local-node-b"}},
+                    ]
+                },
+            }
+            tracking = _RUNNER._CaseRuntimeTracking(
+                ts_coord_deploy_attempted=True,
+                ts_coord_apply_id="apply-coord",
+                ts_nodes_deploy_attempted=True,
+                ts_nodes_apply_id="apply-node",
+            )
+
+            def _fake_run_adapter_action(resolved_case, *, run_dir: Path, action: str):
+                self.assertEqual(action, "collect")
+                instances = _RUNNER._require_list(resolved_case["deploy"]["instances"], "resolved_case.deploy.instances")
+                for instance in instances:
+                    inst_id = _RUNNER._require_str(instance.get("id"), "deploy.instances[].id")
+                    inst_dir = (run_dir / "logs" / inst_id).resolve()
+                    inst_dir.mkdir(parents=True, exist_ok=True)
+                    _RUNNER._write_yaml_file(
+                        inst_dir / "status.yaml",
+                        {"status_code": 500, "status": {"ok": False, "instance_id": inst_id}},
+                    )
+                raise RuntimeError("collect boom")
+
+            with mock.patch.object(_RUNNER, "_run_adapter_action", side_effect=_fake_run_adapter_action):
+                with mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply:
+                    _RUNNER._finalize_test_stack_case_runtime(
+                        resolved_case,
+                        run_dir=run_dir,
+                        runtime_tracking=tracking,
+                        outcome=_RUNNER.RUN_OUTCOME_FAILED,
+                    )
+
+            delete_apply.assert_not_called()
+            self.assertTrue((run_dir / "logs" / "coordinator" / "status.yaml").exists())
+            self.assertTrue((run_dir / "logs" / "node_0" / "status.yaml").exists())
+            updated_summary = yaml.safe_load(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                updated_summary["test_stack"]["collect_error"],
+                "RuntimeError: collect boom",
+            )
+
     def test_finalize_error_preserves_success_for_ci_and_bench(self) -> None:
         self.assertTrue(
             _RUNNER._preserve_success_after_finalize_error(

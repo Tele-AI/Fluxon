@@ -388,7 +388,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fluxon deployer adapter (Deployment YAML subset; produces deploy_result.yaml)."
     )
-    parser.add_argument("--action", required=True, choices=["deploy", "teardown"])
+    parser.add_argument("--action", required=True, choices=["deploy", "collect", "teardown"])
     parser.add_argument(
         "--workdir",
         required=True,
@@ -451,6 +451,10 @@ def main() -> None:
             payload_delivery,
             ops_ready_timeout_seconds,
         )
+        return
+
+    if args.action == "collect":
+        _action_collect(run_dir, controller_url, instances)
         return
 
     if args.action == "teardown":
@@ -789,6 +793,29 @@ def _action_deploy(
     logs_dir.mkdir(parents=True, exist_ok=True)
     _write_yaml_file(logs_dir / "upload_results.yaml", upload_results)
     _write_yaml_file(logs_dir / "deploy_response.yaml", deploy_resp)
+
+
+def _action_collect(run_dir: Path, controller_url: str, instances: List[_InstanceReq]) -> None:
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    for inst in instances:
+        inst_dir = logs_dir / inst.id
+        inst_dir.mkdir(parents=True, exist_ok=True)
+
+        # English note:
+        # - /api/status is an observability endpoint. During transient runtime failures (e.g. P2P timeouts)
+        #   the controller may return a non-2xx HTTP status. Treat that as captured status, not as a
+        #   hard failure of the collect phase, so the runner can still finalize deterministically using
+        #   terminal artifacts (summary.yaml / benchmark_result.json).
+        status_code, status = _http_status_allow_error(
+            controller_url,
+            inst.controller_target,
+            inst.workload_kind,
+            inst.workload_name,
+            inst.authority,
+        )
+        _write_yaml_file(inst_dir / "status.yaml", {"status_code": int(status_code), "status": status})
 
 
 
