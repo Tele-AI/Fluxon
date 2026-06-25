@@ -88,27 +88,54 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             with mock.patch.object(_CI_RUNTIME_MOD, "_python_executable_abi", return_value="cpython3.10"):
                 self.assertEqual(_RUNNER._ci_runtime_python_executable(), "/usr/bin/python3")
 
-    def test_create_ci_runtime_venv_uses_python310_abi_without_ensurepip(self) -> None:
+    def test_create_ci_runtime_venv_uses_python310_abi_and_seeds_pip(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
             venv_dir = (run_dir / "venv").resolve()
             expected_venv_python = (venv_dir / "bin" / "python3").resolve()
+            observed_calls: list[list[str]] = []
 
             def _fake_create_venv(argv: list[str], *, cwd: str) -> None:
-                self.assertEqual(
-                    argv,
-                    [
-                        "/usr/bin/python3.10",
-                        "-m",
-                        "venv",
-                        "--system-site-packages",
-                        "--without-pip",
-                        str(venv_dir),
-                    ],
-                )
+                observed_calls.append(argv)
                 self.assertEqual(cwd, str(run_dir))
-                expected_venv_python.parent.mkdir(parents=True, exist_ok=True)
-                expected_venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+                if len(observed_calls) == 1:
+                    self.assertEqual(
+                        argv,
+                        [
+                            "/usr/bin/python3.10",
+                            "-m",
+                            "venv",
+                            "--without-pip",
+                            str(venv_dir),
+                        ],
+                    )
+                    expected_venv_python.parent.mkdir(parents=True, exist_ok=True)
+                    expected_venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+                    return
+                if len(observed_calls) == 2:
+                    self.assertEqual(
+                        argv,
+                        [
+                            str(expected_venv_python),
+                            "-m",
+                            "ensurepip",
+                            "--upgrade",
+                            "--default-pip",
+                        ],
+                    )
+                    return
+                if len(observed_calls) == 3:
+                    self.assertEqual(
+                        argv,
+                        [
+                            str(expected_venv_python),
+                            "-m",
+                            "pip",
+                            "--version",
+                        ],
+                    )
+                    return
+                self.fail(f"unexpected _run_subprocess call: argv={argv!r}")
 
             with mock.patch.object(_RUNNER.shutil, "which", return_value="/usr/bin/python3.10"):
                 with mock.patch.object(_CI_RUNTIME_MOD, "_python_executable_abi", return_value="cpython3.10"):
@@ -117,7 +144,15 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                             venv_python = _RUNNER._create_ci_runtime_venv(run_dir=run_dir)
 
             self.assertEqual(venv_python, expected_venv_python)
-            run_subprocess_mock.assert_called_once()
+            self.assertEqual(
+                observed_calls,
+                [
+                    ["/usr/bin/python3.10", "-m", "venv", "--without-pip", str(venv_dir)],
+                    [str(expected_venv_python), "-m", "ensurepip", "--upgrade", "--default-pip"],
+                    [str(expected_venv_python), "-m", "pip", "--version"],
+                ],
+            )
+            self.assertEqual(run_subprocess_mock.call_count, 3)
             assert_python_abi.assert_called_once_with(venv_python=expected_venv_python)
 
     def test_runner_native_bin_kvtest_scene_stays_on_direct_wrapper_command(self) -> None:
@@ -255,6 +290,32 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     ],
                 },
             )
+
+    def test_finalize_error_preserves_success_for_ci_and_bench(self) -> None:
+        self.assertTrue(
+            _RUNNER._preserve_success_after_finalize_error(
+                case_family=_RUNNER.CASE_FAMILY_CI,
+                outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+            )
+        )
+        self.assertTrue(
+            _RUNNER._preserve_success_after_finalize_error(
+                case_family=_RUNNER.CASE_FAMILY_BENCH,
+                outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+            )
+        )
+        self.assertFalse(
+            _RUNNER._preserve_success_after_finalize_error(
+                case_family=_RUNNER.CASE_FAMILY_CI,
+                outcome=_RUNNER.RUN_OUTCOME_FAILED,
+            )
+        )
+        self.assertFalse(
+            _RUNNER._preserve_success_after_finalize_error(
+                case_family=_RUNNER.CASE_FAMILY_INFER,
+                outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+            )
+        )
 
     def test_write_ci_scene_config_yaml_emits_structured_scene_config(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -506,10 +567,8 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             },
         }
         case_plan = _RUNNER._compile_case_plan(resolved_case)
-        self.assertEqual(
-            tuple(case_plan.__dataclass_fields__.keys()),
-            ("case_family", "prepare_phases", "execute_phases"),
-        )
+        self.assertEqual(tuple(phase.phase_id for phase in case_plan.prepare_phases), ("cluster_runtime",))
+        self.assertEqual(tuple(phase.phase_id for phase in case_plan.execute_phases), ("ci_runner",))
         self.assertEqual(case_plan.execute_phases[0].instance_ids, ("ci_runner",))
 
     def test_doc_page_ci_execution_plan_uses_online_docker_image(self) -> None:

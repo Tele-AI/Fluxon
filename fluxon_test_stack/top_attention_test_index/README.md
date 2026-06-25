@@ -51,7 +51,7 @@ Entries:
 - `_script_tools.py`: script utility coverage
 - `_cargo_fs_core.py`: cargo tests for the Rust FS core crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_fs_core` runner-native scene.
 - `_cargo_util.py`: cargo tests for the Rust util crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_util` runner-native scene, with runtime endpoints supplied through canonical `--case-config`.
-- `_cargo_kv_unit.py`: cargo tests for the Rust KV crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_kv_unit` runner-native scene, with transport feature selection bounded by `scene_config.kv_transport_feature`.
+- `_cargo_kv_unit.py`: cargo tests for the Rust KV crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_kv_unit` runner-native scene, with transport feature selection sourced only from canonical `--case-config` (`scene_config.kv_transport_feature`).
 - `_cargo_cli.py`: cargo tests for the Rust CLI crate
 - `_cargo_commu.py`: cargo tests for the Rust communication facade crate
 - `_cargo_commu_contract.py`: cargo tests for the Rust communication contract crate

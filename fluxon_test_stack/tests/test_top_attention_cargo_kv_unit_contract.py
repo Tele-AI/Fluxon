@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
@@ -35,7 +36,7 @@ _ENTRY = _load_module()
 
 
 class TestTopAttentionCargoKvUnitContract(unittest.TestCase):
-    def test_main_accepts_case_config_and_writes_build_config_ext(self) -> None:
+    def test_main_accepts_case_config_and_uses_scene_config_feature(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
             cfg_dir = run_dir / "configs"
@@ -65,13 +66,14 @@ class TestTopAttentionCargoKvUnitContract(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with mock.patch.object(_ENTRY, "run_cargo", return_value=0) as run_cargo:
-                with mock.patch.object(
-                    sys,
-                    "argv",
-                    [str(MODULE_PATH), "--case-config", str(case_cfg), "--feature", "tcp_thread_transport"],
-                ):
-                    rc = _ENTRY.main()
+            with mock.patch.dict(os.environ, {"FLUXON_KV_TEST_TRANSPORT_FEATURE": "fastws_transport"}, clear=False):
+                with mock.patch.object(_ENTRY, "run_cargo", return_value=0) as run_cargo:
+                    with mock.patch.object(
+                        sys,
+                        "argv",
+                        [str(MODULE_PATH), "--case-config", str(case_cfg)],
+                    ):
+                        rc = _ENTRY.main()
 
             self.assertEqual(rc, 0)
             build_cfg = yaml.safe_load((src_dir / "build_config_ext.yml").read_text(encoding="utf-8"))
@@ -99,7 +101,7 @@ class TestTopAttentionCargoKvUnitContract(unittest.TestCase):
                 str((src_dir / "build_config_ext.yml").resolve()),
             )
 
-    def test_main_rejects_feature_mismatch_when_case_config_is_present(self) -> None:
+    def test_main_rejects_feature_override_flag(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
             cfg_dir = run_dir / "configs"
@@ -124,8 +126,10 @@ class TestTopAttentionCargoKvUnitContract(unittest.TestCase):
                 "argv",
                 [str(MODULE_PATH), "--case-config", str(case_cfg), "--feature", "fastws_transport"],
             ):
-                with self.assertRaisesRegex(ValueError, "must match scene_config.kv_transport_feature"):
+                with self.assertRaises(SystemExit) as cm:
                     _ENTRY.main()
+
+        self.assertEqual(cm.exception.code, 2)
 
     def test_main_rejects_pytest_style_passthrough_flags(self) -> None:
         with mock.patch.object(sys, "argv", [str(MODULE_PATH), "-k", "lease"]):

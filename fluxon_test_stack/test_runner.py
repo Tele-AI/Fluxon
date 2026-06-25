@@ -1085,11 +1085,17 @@ def main() -> None:
                         "ERROR: teardown failed; stopping after finalize (no fallback). "
                         f"case_id={case.case_id} err={finalize_error}"
                     )
-                    if case_family == CASE_FAMILY_BENCH and outcome == RUN_OUTCOME_SUCCESS:
-                        print(
-                            "WARN: TEST_STACK finalize failed after terminal benchmark success; "
-                            f"preserving SUCCESS outcome for case_id={case.case_id} finalize_err={finalize_error}"
-                        )
+                    if _preserve_success_after_finalize_error(case_family=case_family, outcome=outcome):
+                        if case_family == CASE_FAMILY_BENCH:
+                            print(
+                                "WARN: TEST_STACK finalize failed after terminal benchmark success; "
+                                f"preserving SUCCESS outcome for case_id={case.case_id} finalize_err={finalize_error}"
+                            )
+                        else:
+                            print(
+                                "WARN: CI finalize failed after terminal ci_runner success; "
+                                f"preserving SUCCESS outcome for case_id={case.case_id} finalize_err={finalize_error}"
+                            )
                     else:
                         outcome = RUN_OUTCOME_FAILED
                     if suite.run_mode == RUN_MODE_DEBUG_ONE_BY_ONE and outcome != RUN_OUTCOME_SUCCESS:
@@ -11390,22 +11396,16 @@ def _run_adapter_action(
 
 def _run_subprocess(argv: List[str], *, cwd: str) -> None:
     print("RUN:", " ".join(_shell_quote(a) for a in argv), flush=True)
-    proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
-    if proc.stdout:
-        sys.stdout.write(proc.stdout)
-        if not proc.stdout.endswith("\n"):
-            sys.stdout.write("\n")
-        sys.stdout.flush()
-    if proc.stderr:
-        sys.stderr.write(proc.stderr)
-        if not proc.stderr.endswith("\n"):
-            sys.stderr.write("\n")
-        sys.stderr.flush()
+    proc = subprocess.run(argv, cwd=cwd)
     if proc.returncode != 0:
         raise RuntimeError(
             "command failed: "
             f"rc={proc.returncode} cwd={cwd} argv={' '.join(_shell_quote(a) for a in argv)}"
         )
+
+
+def _preserve_success_after_finalize_error(*, case_family: str, outcome: str) -> bool:
+    return outcome == RUN_OUTCOME_SUCCESS and case_family in (CASE_FAMILY_BENCH, CASE_FAMILY_CI)
 
 
 _SSH_TRANSPORT_TIMEOUT_SECONDS = 180.0

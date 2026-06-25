@@ -100,12 +100,13 @@ def _create_ci_runtime_venv(
     if venv_dir.exists():
         raise ValueError(f"venv dir already exists (no overwrite): {venv_dir}")
     python_bin = _ci_runtime_python_executable()
-    # Create the CI venv without ensurepip. GitHub-hosted Python 3.10 can fail inside
-    # venv's implicit ensurepip step even though the interpreter already exposes pip
-    # through system site-packages.
-    run_subprocess([python_bin, "-m", "venv", "--system-site-packages", "--without-pip", str(venv_dir)])
+    # Skip venv's implicit ensurepip step, then seed pip explicitly so the venv stays
+    # self-contained and does not depend on host site-packages.
+    run_subprocess([python_bin, "-m", "venv", "--without-pip", str(venv_dir)])
     venv_python = venv_dir / "bin" / "python3"
     if not venv_python.exists():
         raise ValueError(f"venv python not found after creation: {venv_python}")
+    run_subprocess([str(venv_python), "-m", "ensurepip", "--upgrade", "--default-pip"])
+    run_subprocess([str(venv_python), "-m", "pip", "--version"])
     assert_python_abi(venv_python)
     return venv_python

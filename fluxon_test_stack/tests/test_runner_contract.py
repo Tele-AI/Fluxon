@@ -450,11 +450,71 @@ def test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime() -> None
             f"unexpected command id: {command.get('id')!r}"
         )
         return
-    command_text = command.get("command")
-    if not isinstance(command_text, str) or "_cargo_kv_unit.py --case-config __RUN_DIR__/configs/ci_scene_config.yaml" not in command_text:
+    scene = suite.scenes.get("ci_top_attention_cargo_kv_unit")
+    if not isinstance(scene, dict):
         print(
             "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
-            f"unexpected command: {command_text!r}"
+            "missing cargo kv unit scene"
+        )
+        return
+    ci = scene.get("ci")
+    if not isinstance(ci, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "scene.ci missing"
+        )
+        return
+    if ci.get("subject") != "rust":
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            f"expected subject 'rust', got {ci.get('subject')!r}"
+        )
+        return
+    if ci.get("runtime_contract") != "rust_self_managed":
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            f"expected runtime_contract 'rust_self_managed', got {ci.get('runtime_contract')!r}"
+        )
+        return
+    profile = suite.profiles.get("fluxon_tcp")
+    if not isinstance(profile, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "missing fluxon_tcp profile"
+        )
+        return
+    runtime = profile.get("runtime")
+    if not isinstance(runtime, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "profile.runtime missing"
+        )
+        return
+    profile_ci = runtime.get("ci")
+    if not isinstance(profile_ci, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "profile.runtime.ci missing"
+        )
+        return
+    scene_configs = profile_ci.get("scene_configs")
+    if not isinstance(scene_configs, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "profile.runtime.ci.scene_configs missing"
+        )
+        return
+    cargo_scene_config = scene_configs.get("ci_top_attention_cargo_kv_unit")
+    if not isinstance(cargo_scene_config, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "missing ci_top_attention_cargo_kv_unit scene config"
+        )
+        return
+    if cargo_scene_config.get("kv_transport_feature") != "tcp_thread_transport":
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            f"unexpected kv_transport_feature: {cargo_scene_config.get('kv_transport_feature')!r}"
         )
         return
     print("PASS: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime")
