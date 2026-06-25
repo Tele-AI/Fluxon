@@ -480,6 +480,38 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         )
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
 
+    def test_top_attention_mq_core_ci_plan_has_no_collect_phase(self) -> None:
+        resolved_case = {
+            "case": {
+                "family": "ci",
+                "case_id": "ci_top_attention_mq_core__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+            },
+            "scene": {
+                "ci": {
+                    "runtime_contract": "cluster_kv_owner",
+                    "subject": "mq",
+                },
+            },
+            "deploy": {
+                "instances": [
+                    {"id": "master"},
+                    {"id": "owner_0"},
+                    {"id": "ci_runner"},
+                ],
+            },
+            "runtime_model": {
+                "test_bed": {"kind": "ops"},
+                "base_runtime": {},
+                "case_runtime": {"instance_ids": ["master", "owner_0", "ci_runner"]},
+            },
+        }
+        case_plan = _RUNNER._compile_case_plan(resolved_case)
+        self.assertEqual(
+            tuple(case_plan.__dataclass_fields__.keys()),
+            ("case_family", "prepare_phases", "execute_phases"),
+        )
+        self.assertEqual(case_plan.execute_phases[0].instance_ids, ("ci_runner",))
+
     def test_doc_page_ci_execution_plan_uses_online_docker_image(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
         suite = _RUNNER._parse_suite_config(suite_cfg)

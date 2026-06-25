@@ -394,8 +394,6 @@ def _execute_ci_case(
         counted=False,
         ci_out={"rc": rc},
     )
-    for phase in prepared_case.plan.collect_phases:
-        ctx._collect_runtime_phase(resolved_case, run_dir=run_dir, phase=phase)
     return ctx._ExecutedCase(outcome=outcome, summary=summary)
 
 
@@ -414,7 +412,6 @@ def _execute_test_stack_case(
 
     outcome = ctx.RUN_OUTCOME_FAILED
     error_detail: Optional[str] = None
-    collect_error_detail: Optional[str] = None
     result_obj: Optional[Dict[str, Any]] = None
 
     try:
@@ -445,12 +442,6 @@ def _execute_test_stack_case(
         outcome = ctx.RUN_OUTCOME_SUCCESS
     except Exception as exc:  # noqa: BLE001
         error_detail = f"{type(exc).__name__}: {exc}"
-    finally:
-        try:
-            for phase in prepared_case.plan.collect_phases:
-                ctx._collect_runtime_phase(resolved_case, run_dir=run_dir, phase=phase)
-        except Exception as exc:  # noqa: BLE001
-            collect_error_detail = f"{type(exc).__name__}: {exc}"
 
     summary = {
         "schema_version": ctx.SCHEMA_VERSION,
@@ -472,7 +463,6 @@ def _execute_test_stack_case(
             "result_path": str(_require_test_stack_result_path(prepared_case.test_stack_result_path)),
             "result": result_obj,
             "error": error_detail,
-            "collect_error": collect_error_detail,
         },
     }
     return ctx._ExecutedCase(outcome=outcome, summary=summary)

@@ -563,7 +563,7 @@ def _redirect_process_stdio_to_log(
     - test_runner can run for hours under terminal/session wrappers that may disappear while the
       suite is still executing.
     - A deleted PTY turns ordinary `print(..., flush=True)` into `OSError(EIO)`, which aborts the
-      runner in collect/finalize paths and leaves case_runs.yaml stuck at a reserved run.
+      runner in shutdown/finalize paths and leaves case_runs.yaml stuck at a reserved run.
     - Use a deterministic per-workdir log sink for the whole process, including child subprocesses.
     """
     global _RUNNER_STDIO_LOG_FP
@@ -1013,10 +1013,6 @@ def main() -> None:
                     ai_perf_out=infer_out,
                 )
                 _write_yaml_file(run_dir / "summary.yaml", summary)
-
-                _run_adapter_action(
-                    resolved_case, run_dir=run_dir, action="collect"
-                )
 
                 outcome = RUN_OUTCOME_SUCCESS
 
@@ -3076,16 +3072,6 @@ def _deploy_runtime_phase(
     return _deploy_runtime_phase_after_stage(resolved_case, run_dir=run_dir, phase=phase)
 
 
-def _collect_runtime_phase(
-    resolved_case: Dict[str, Any],
-    *,
-    run_dir: Path,
-    phase: _RuntimePhase,
-) -> None:
-    _write_runtime_phase_inputs(resolved_case, run_dir=run_dir, phase=phase)
-    _run_adapter_action(resolved_case, run_dir=run_dir, action="collect")
-
-
 def _ci_cluster_runtime_stage(resolved_case: Dict[str, Any]) -> _RemoteRunDirStage:
     verify_relpaths = list(CI_CLUSTER_RUNTIME_REMOTE_STAGE_VERIFY_RELPATHS)
     if _ci_has_instance(resolved_case, instance_id="owner_0"):
@@ -3139,12 +3125,6 @@ def _ci_runtime_phase(resolved_case: Dict[str, Any], phase_id: str) -> _RuntimeP
             write_ctx="CI",
             stage_run_dir=_ci_runner_runtime_stage(resolved_case),
         ),
-        "collect_all": _RuntimePhase(
-            phase_id="collect_all",
-            layer=RUNTIME_LAYER_CASE,
-            instance_ids=CI_RUNTIME_INSTANCE_IDS,
-            write_ctx="CI",
-        ),
     }
     try:
         return phases[phase_id]
@@ -3196,24 +3176,6 @@ def _test_stack_runtime_phase(
             write_ctx="TEST_STACK",
             stage_run_dir=stage_run_dir,
         )
-    if phase_id == "collect_nodes":
-        if node_ids is None or not node_ids:
-            raise ValueError("TEST_STACK collect_nodes phase requires non-empty node_ids")
-        return _RuntimePhase(
-            phase_id="collect_nodes",
-            layer=RUNTIME_LAYER_CASE,
-            instance_ids=node_ids,
-            write_ctx="TEST_STACK",
-        )
-    if phase_id == "collect_coordinator":
-        if node_ids is not None:
-            raise ValueError("TEST_STACK collect_coordinator phase does not accept node_ids")
-        return _RuntimePhase(
-            phase_id="collect_coordinator",
-            layer=RUNTIME_LAYER_CASE,
-            instance_ids=("coordinator",),
-            write_ctx="TEST_STACK",
-        )
     raise ValueError(f"unsupported TEST_STACK runtime phase: {phase_id}")
 
 
@@ -3240,14 +3202,6 @@ def _compile_case_plan(resolved_case: Dict[str, Any]) -> _CasePlan:
             prepare_phases=prepare_phases,
             execute_phases=(
                 _ci_runtime_phase(resolved_case, "ci_runner"),
-            ),
-            collect_phases=(
-                _RuntimePhase(
-                    phase_id="collect_all",
-                    layer=RUNTIME_LAYER_CASE,
-                    instance_ids=case_instance_ids,
-                    write_ctx="CI",
-                ),
             ),
         )
     if case_family == CASE_FAMILY_BENCH:
@@ -3303,15 +3257,6 @@ def _compile_case_plan(resolved_case: Dict[str, Any]) -> _CasePlan:
                     phase_id="nodes",
                     node_ids=node_ids_tuple,
                     include_stage_run_dir=False,
-                ),
-            ),
-            collect_phases=(
-                _test_stack_runtime_phase(phase_id="collect_nodes", node_ids=node_ids_tuple),
-                _RuntimePhase(
-                    phase_id="collect_coordinator",
-                    layer=RUNTIME_LAYER_CASE,
-                    instance_ids=prepare_ids_tuple,
-                    write_ctx="TEST_STACK",
                 ),
             ),
         )
@@ -11414,7 +11359,7 @@ def _run_adapter_action(
     run_dir: Path,
     action: str,
 ) -> Optional[Dict[str, Any]]:
-    if action not in ("deploy", "collect", "teardown"):
+    if action not in ("deploy", "teardown"):
         raise ValueError(f"invalid adapter action: {action}")
 
     deploy = _require_dict(resolved_case.get("deploy"), "resolved_case.deploy")

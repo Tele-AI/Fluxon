@@ -85,7 +85,6 @@ class _CasePlan:
     case_family: str
     prepare_phases: Tuple[_RuntimePhase, ...]
     execute_phases: Tuple[_RuntimePhase, ...]
-    collect_phases: Tuple[_RuntimePhase, ...]
 
 
 @dataclass(frozen=True)
