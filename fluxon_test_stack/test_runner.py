@@ -173,6 +173,7 @@ CI_OWNER_SHARED_BUNDLE_RELPATHS = ("services/share_mem/shared.json", "services/s
 CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S = 600
 CI_RUNNER_READINESS_PROBE_DEADLINE_S = 120
 CI_RUNNER_EXIT_CODE_GRACE_TIMEOUT_S = 300
+CI_RUNNER_TERMINAL_EXIT_CODE_FILE_GRACE_S = 15.0
 TEST_STACK_REMOTE_STAGE_SHARED_INCLUDE_RELPATHS = (
     "benchmark_config.py",
     "deployer_deploy.yaml",
@@ -15304,6 +15305,73 @@ def _wait_instance_exit(
         time.sleep(2.0)
 
 
+def _parse_ci_runner_exit_code_text(*, raw: str, path: Path, ctx: str) -> int:
+    try:
+        rc = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{ctx}: path={path} raw={raw!r}") from exc
+    return _require_int(rc, ctx, min_v=-255)
+
+
+def _read_ci_runner_exit_code_if_present(
+    *,
+    resolved_case: Dict[str, Any],
+    run_dir: Path,
+    baseline_state: Optional[_ObservedFileState],
+    local_ctx: str,
+    remote_ctx: str,
+) -> Optional[int]:
+    exit_code_path = (run_dir / "logs" / "ci_runner" / "exit_code.txt").resolve()
+    current_state = _observe_file_state(exit_code_path)
+    if _has_new_file_state(before=baseline_state, after=current_state):
+        return _parse_ci_runner_exit_code_text(
+            raw=exit_code_path.read_text(encoding="utf-8"),
+            path=exit_code_path,
+            ctx=local_ctx,
+        )
+    remote_raw = _instance_read_text_if_present(
+        resolved_case,
+        instance_id="ci_runner",
+        path=exit_code_path,
+    )
+    if remote_raw is None:
+        return None
+    return _parse_ci_runner_exit_code_text(
+        raw=remote_raw,
+        path=exit_code_path,
+        ctx=remote_ctx,
+    )
+
+
+def _wait_ci_runner_exit_code_file_after_terminal_status(
+    *,
+    resolved_case: Dict[str, Any],
+    run_dir: Path,
+    baseline_state: Optional[_ObservedFileState],
+    status_exit_code: int,
+) -> Optional[int]:
+    deadline = time.time() + float(CI_RUNNER_TERMINAL_EXIT_CODE_FILE_GRACE_S)
+    while True:
+        rc = _read_ci_runner_exit_code_if_present(
+            resolved_case=resolved_case,
+            run_dir=run_dir,
+            baseline_state=baseline_state,
+            local_ctx="ci_runner.exit_code",
+            remote_ctx="ci_runner.remote_exit_code",
+        )
+        if rc is not None:
+            if rc != int(status_exit_code):
+                print(
+                    "[CI wait exit_code] controller reported terminal process exit before exit_code.txt "
+                    f"became readable; preferring exit_code.txt rc={rc} controller_exit_code={status_exit_code}",
+                    flush=True,
+                )
+            return rc
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.5)
+
+
 def _wait_ci_runner_exit_code_resume(
     *,
     resolved_case: Dict[str, Any],
@@ -15327,19 +15395,15 @@ def _wait_ci_runner_exit_code_resume(
     deadline = time.time() + float(timeout_s)
     last_status_err: str | None = None
     while True:
-        raw = _instance_read_text_if_present(
-            resolved_case,
-            instance_id="ci_runner",
-            path=exit_code_path,
+        rc_from_file = _read_ci_runner_exit_code_if_present(
+            resolved_case=resolved_case,
+            run_dir=run_dir,
+            baseline_state=None,
+            local_ctx="ci_runner.resume_exit_code",
+            remote_ctx="ci_runner.resume_exit_code",
         )
-        if raw is not None:
-            try:
-                rc = int(raw.strip())
-            except ValueError as exc:
-                raise ValueError(
-                    f"ci_runner remote exit_code file is not an int: path={exit_code_path} raw={raw!r}"
-                ) from exc
-            return _require_int(rc, "ci_runner.resume_exit_code", min_v=-255)
+        if rc_from_file is not None:
+            return rc_from_file
 
         try:
             status = _instance_status(resolved_case, instance_id="ci_runner")
@@ -15356,7 +15420,16 @@ def _wait_ci_runner_exit_code_resume(
             continue
         status_exit_code = status.get("exit_code")
         if status.get("ok") is True and status.get("running") is False and isinstance(status_exit_code, int):
-            return _require_int(status_exit_code, "ci_runner.resume.status.exit_code", min_v=-255)
+            status_exit_code_i = _require_int(status_exit_code, "ci_runner.resume.status.exit_code", min_v=-255)
+            rc_after_grace = _wait_ci_runner_exit_code_file_after_terminal_status(
+                resolved_case=resolved_case,
+                run_dir=run_dir,
+                baseline_state=None,
+                status_exit_code=status_exit_code_i,
+            )
+            if rc_after_grace is not None:
+                return rc_after_grace
+            return status_exit_code_i
         if status.get("ok") is True and status.get("running") is False:
             # Deterministic behavior:
             # - If controller no longer reports desired workloads for this case, the CI runner cannot start.
@@ -15409,29 +15482,15 @@ def _wait_ci_runner_exit_code(
             deadline=deadline,
         )
         current_state = _observe_file_state(exit_code_path)
-        if _has_new_file_state(before=baseline_state, after=current_state):
-            raw = exit_code_path.read_text(encoding="utf-8").strip()
-            try:
-                rc = int(raw)
-            except ValueError as exc:
-                raise ValueError(
-                    f"ci_runner exit_code file is not an int: path={exit_code_path} raw={raw!r}"
-                ) from exc
-            return _require_int(rc, "ci_runner.exit_code", min_v=-255)
-        remote_raw = _instance_read_text_if_present(
-            resolved_case,
-            instance_id="ci_runner",
-            path=exit_code_path,
+        rc_from_file = _read_ci_runner_exit_code_if_present(
+            resolved_case=resolved_case,
+            run_dir=run_dir,
+            baseline_state=baseline_state,
+            local_ctx="ci_runner.exit_code",
+            remote_ctx="ci_runner.remote_exit_code",
         )
-        if remote_raw is not None:
-            raw = remote_raw.strip()
-            try:
-                rc = int(raw)
-            except ValueError as exc:
-                raise ValueError(
-                    f"ci_runner remote exit_code file is not an int: path={exit_code_path} raw={raw!r}"
-                ) from exc
-            return _require_int(rc, "ci_runner.remote_exit_code", min_v=-255)
+        if rc_from_file is not None:
+            return rc_from_file
         try:
             status = _instance_status(resolved_case, instance_id="ci_runner")
         except _HttpGetJsonTransientError as exc:
@@ -15445,7 +15504,16 @@ def _wait_ci_runner_exit_code(
             continue
         status_exit_code = status.get("exit_code")
         if status.get("ok") is True and status.get("running") is False and isinstance(status_exit_code, int):
-            return _require_int(status_exit_code, "ci_runner.status.exit_code", min_v=-255)
+            status_exit_code_i = _require_int(status_exit_code, "ci_runner.status.exit_code", min_v=-255)
+            rc_after_grace = _wait_ci_runner_exit_code_file_after_terminal_status(
+                resolved_case=resolved_case,
+                run_dir=run_dir,
+                baseline_state=baseline_state,
+                status_exit_code=status_exit_code_i,
+            )
+            if rc_after_grace is not None:
+                return rc_after_grace
+            return status_exit_code_i
         if status.get("ok") is True and status.get("running") is False:
             # Deterministic behavior:
             # - If controller no longer reports desired workloads for this case, the CI runner cannot start.

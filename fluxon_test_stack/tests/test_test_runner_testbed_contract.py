@@ -377,6 +377,111 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         delete_apply.assert_not_called()
         self.assertEqual(tracking.ci_apply_ids["ci_runner"], "apply-runner")
 
+    def test_wait_ci_runner_exit_code_prefers_exit_code_file_after_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            exit_code_path = run_dir / "logs" / "ci_runner" / "exit_code.txt"
+            exit_code_path.parent.mkdir(parents=True, exist_ok=True)
+            resolved_case = {
+                "deploy": {
+                    "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                    "target_ip_map": {"logic-a": "10.0.0.2"},
+                    "instances": [
+                        {
+                            "id": "ci_runner",
+                            "k8s_ref": "deployment/ci-runner",
+                            "deployer": {"target": "logic-a"},
+                        }
+                    ],
+                }
+            }
+            baseline_state = None
+            observe_states = [None, None, _RUNNER._ObservedFileState(size=2, mtime_ns=1)]
+            status_calls = [
+                {"ok": True, "running": False, "exit_code": 143},
+            ]
+            file_reads = iter([None, "0\n"])
+
+            def _fake_observe_file_state(path: Path):
+                self.assertEqual(path, exit_code_path.resolve())
+                if observe_states:
+                    return observe_states.pop(0)
+                return _RUNNER._ObservedFileState(size=2, mtime_ns=1)
+
+            def _fake_instance_read_text_if_present(*_args, **_kwargs):
+                return next(file_reads, "0\n")
+
+            def _fake_instance_status(*_args, **_kwargs):
+                return status_calls.pop(0)
+
+            with (
+                mock.patch.object(_RUNNER, "_print_ci_wait_progress", return_value=(0, 999999999.0)),
+                mock.patch.object(_RUNNER, "_observe_file_state", side_effect=_fake_observe_file_state),
+                mock.patch.object(_RUNNER, "_instance_read_text_if_present", side_effect=_fake_instance_read_text_if_present),
+                mock.patch.object(_RUNNER, "_instance_status", side_effect=_fake_instance_status),
+                mock.patch.object(_RUNNER.time, "sleep"),
+            ):
+                exit_code_path.write_text("0\n", encoding="utf-8")
+                rc = _RUNNER._wait_ci_runner_exit_code(
+                    resolved_case=resolved_case,
+                    run_dir=run_dir,
+                    timeout_s=60,
+                    baseline_state=baseline_state,
+                )
+
+            self.assertEqual(rc, 0)
+
+    def test_wait_ci_runner_exit_code_resume_prefers_exit_code_file_after_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            exit_code_path = run_dir / "logs" / "ci_runner" / "exit_code.txt"
+            exit_code_path.parent.mkdir(parents=True, exist_ok=True)
+            resolved_case = {
+                "deploy": {
+                    "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                    "target_ip_map": {"logic-a": "10.0.0.2"},
+                    "instances": [
+                        {
+                            "id": "ci_runner",
+                            "k8s_ref": "deployment/ci-runner",
+                            "deployer": {"target": "logic-a"},
+                        }
+                    ],
+                }
+            }
+            observe_states = [None, None, _RUNNER._ObservedFileState(size=2, mtime_ns=1)]
+            status_calls = [
+                {"ok": True, "running": False, "exit_code": 143},
+            ]
+            file_reads = iter([None, "0\n"])
+
+            def _fake_observe_file_state(path: Path):
+                self.assertEqual(path, exit_code_path.resolve())
+                if observe_states:
+                    return observe_states.pop(0)
+                return _RUNNER._ObservedFileState(size=2, mtime_ns=1)
+
+            def _fake_instance_read_text_if_present(*_args, **_kwargs):
+                return next(file_reads, "0\n")
+
+            def _fake_instance_status(*_args, **_kwargs):
+                return status_calls.pop(0)
+
+            with (
+                mock.patch.object(_RUNNER, "_observe_file_state", side_effect=_fake_observe_file_state),
+                mock.patch.object(_RUNNER, "_instance_read_text_if_present", side_effect=_fake_instance_read_text_if_present),
+                mock.patch.object(_RUNNER, "_instance_status", side_effect=_fake_instance_status),
+                mock.patch.object(_RUNNER.time, "sleep"),
+            ):
+                exit_code_path.write_text("0\n", encoding="utf-8")
+                rc = _RUNNER._wait_ci_runner_exit_code_resume(
+                    resolved_case=resolved_case,
+                    run_dir=run_dir,
+                    timeout_s=60,
+                )
+
+            self.assertEqual(rc, 0)
+
     def test_finalize_ci_case_runtime_preserves_structured_instance_ids(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
