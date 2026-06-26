@@ -1,6 +1,7 @@
 保持本文档简洁。
 - 核心用户文档、开发文档和设计文档都在仓库内的 `fluxon_doc_cn/` 和 `fluxon_doc_en/` 下
 - 详细的中英文文档写作规约索引见 `fluxon_doc_cn/dev_doc/开发者 - 3 - 文档写作规约.md` 和 `fluxon_doc_en/dev_doc/Developer - 3 - Documentation Writing Rules.md`
+- `teststack` 架构与测试入口 / helper 设计规则索引见 [fluxon_doc_cn/design/teststack_1_当前架构与CI测试流程.md](fluxon_doc_cn/design/teststack_1_当前架构与CI测试流程.md)
 - `teststack` 有两个步骤：`start testbed` 和 `testrunner`
 - `teststack` 支持 UI；`testrunner` 应负责 UI 的 authority 和 API surface，但 UI 应作为常驻服务运行，并复用下层的 ops 接口
 - 本项目所有 Python 代码都必须兼容 Python `>= 3.10`

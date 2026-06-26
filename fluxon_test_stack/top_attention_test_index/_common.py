@@ -52,18 +52,6 @@ def run_python_file(
     return call([python, "-u", str(REPO_ROOT / path), *extra_args])
 
 
-def run_python_files(
-    description: str,
-    paths: Iterable[str],
-) -> int:
-    python, _ = parse_python_passthrough(description)
-    for path in paths:
-        rc = call([python, "-u", str(REPO_ROOT / path)])
-        if rc != 0:
-            return rc
-    return 0
-
-
 def load_case_config(path: str | Path, *, expected_scene_id: str) -> dict:
     cfg_path = Path(path).resolve()
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))

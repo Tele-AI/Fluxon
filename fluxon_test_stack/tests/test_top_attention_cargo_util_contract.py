@@ -83,8 +83,6 @@ class TestTopAttentionCargoUtilContract(unittest.TestCase):
                     "test",
                     "--manifest-path",
                     str(REPO_ROOT / "fluxon_rs" / "fluxon_util" / "Cargo.toml"),
-                    "--",
-                    "--test-threads=1",
                 ],
             )
             self.assertNotIn("env", run_cargo.call_args.kwargs)

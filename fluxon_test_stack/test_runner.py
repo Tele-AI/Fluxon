@@ -3564,6 +3564,14 @@ def _resolved_run_dir_path(resolved_case: Dict[str, Any]) -> Path:
     return Path(_require_str(runtime.get("run_dir"), "runtime.run_dir")).resolve()
 
 
+def _resolved_case_run_index(resolved_case: Dict[str, Any]) -> int:
+    run_dir = _resolved_run_dir_path(resolved_case)
+    run_index = _ui_parse_run_index(run_dir.name)
+    if run_index is None:
+        raise ValueError(f"resolved_case.runtime.run_dir must end with run_<N>: {run_dir}")
+    return int(run_index)
+
+
 def _ci_share_mem_path(resolved_case: Dict[str, Any], *, run_dir: Path) -> str:
     runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
     stack_identity = _require_dict(runtime.get("stack_identity"), "resolved_case.runtime.stack_identity")
@@ -3805,10 +3813,62 @@ def _ci_local_runtime_targets(resolved_case: Dict[str, Any]) -> set[str]:
     return out
 
 
+def _ci_kv_master_port(resolved_case: Dict[str, Any]) -> Optional[int]:
+    profile = _require_dict(resolved_case.get("profile"), "resolved_case.profile")
+    profile_test_stack = profile.get("test_stack")
+    if profile_test_stack is None:
+        return None
+    profile_test_stack = _require_dict(profile_test_stack, "resolved_case.profile.test_stack")
+    backend_kind = _require_test_stack_backend_kind(
+        profile_test_stack.get("kind"),
+        "resolved_case.profile.test_stack.kind",
+    )
+    if backend_kind != TEST_STACK_BACKEND_FLUXON:
+        return None
+    port_alloc = _require_dict(profile_test_stack.get("port_alloc"), "profile.test_stack.port_alloc")
+    kv_master_port_base = _require_int(
+        port_alloc.get("kv_master_port_base"),
+        "profile.test_stack.port_alloc.kv_master_port_base",
+        min_v=1,
+    )
+    kv_master_port_stride = _require_int(
+        port_alloc.get("kv_master_port_stride"),
+        "profile.test_stack.port_alloc.kv_master_port_stride",
+        min_v=1,
+    )
+    run_index = _resolved_case_run_index(resolved_case)
+    runner_root = _test_stack_runner_root(_resolved_run_dir_path(resolved_case))
+    master_port_slot_offset = _test_stack_runner_port_slot(
+        runner_root=runner_root,
+        stride=kv_master_port_stride,
+    )
+    kv_master_port = (
+        int(kv_master_port_base)
+        + int(kv_master_port_stride) * int(run_index - 1)
+        + int(master_port_slot_offset)
+    )
+    if kv_master_port <= 0 or kv_master_port > 65535:
+        raise ValueError(f"computed kv_master_port out of range: {kv_master_port}")
+    return int(kv_master_port)
+
+
 def _ci_required_ports(resolved_case: Dict[str, Any]) -> List[Tuple[str, int]]:
     resolved_case = _ci_runtime_cleanup_case(resolved_case, ctx="CI required ports")
-    _ = _ci_local_runtime_targets(resolved_case)
-    return []
+    local_targets = _ci_local_runtime_targets(resolved_case)
+    if not local_targets:
+        return []
+    required_ports: List[Tuple[str, int]] = []
+    if "master" in set(_ci_case_instance_ids(resolved_case)):
+        master_instance = _find_deploy_instance(resolved_case, instance_id="master")
+        master_target = _require_str(
+            _require_dict(master_instance.get("deployer"), "master.deployer").get("target"),
+            "master.target",
+        )
+        if master_target in local_targets:
+            kv_master_port = _ci_kv_master_port(resolved_case)
+            if kv_master_port is not None:
+                required_ports.append(("ci master", int(kv_master_port)))
+    return required_ports
 
 
 def _ci_assert_ports_free(resolved_case: Dict[str, Any]) -> None:
@@ -7896,6 +7956,23 @@ def _build_resolved_case_yaml(
                 "runtime": selected_runtime,
             },
         }
+        profile_ts = profile_runtime_src.get("test_stack")
+        if profile_ts is not None:
+            profile_ts = _require_dict(profile_ts, "resolved_case.profile_source.runtime.test_stack")
+            backend_kind = _require_test_stack_backend_kind(
+                profile_ts.get("kind"),
+                "resolved_case.profile_source.test_stack.kind",
+            )
+            port_alloc = _resolve_test_stack_port_alloc(
+                profile_ts.get("port_alloc"),
+                topology=topology,
+                backend_kind=backend_kind,
+                ctx="resolved_case.profile_source.test_stack.port_alloc",
+            )
+            profile["test_stack"] = {
+                "kind": backend_kind,
+                "port_alloc": port_alloc,
+            }
         if selected_scene_config is not None:
             profile["ci"]["scene_config"] = selected_scene_config
     elif case_family == CASE_FAMILY_BENCH:
@@ -13969,11 +14046,14 @@ def _write_ci_master_owner_configs(
     owner_dram_bytes: int,
 ) -> tuple[Path, Path]:
     owner_work_root = run_dir / "services" / "owner_0"
+    kv_master_port = _ci_kv_master_port(resolved_case)
+    if kv_master_port is None:
+        raise ValueError("CI cluster runtime requires resolved_case.profile.test_stack port_alloc for ci_master")
     master_cfg = {
         "etcd_endpoints": ["__ETCD__"],
         "cluster_name": cluster_name,
         "instance_key": "ci_master",
-        "port": 50052,
+        "port": int(kv_master_port),
         "monitoring": {
             "prometheus_base_url": "__PROM_BASE__",
             "prom_remote_write_url": ["__PROM_WRITE__"],

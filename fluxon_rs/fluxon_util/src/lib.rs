@@ -187,14 +187,35 @@ mod tests {
     use tempfile::TempDir;
     use tracing::{debug, error, info, warn};
 
-    fn assert_logged_text(active_log_path: &Path, needles: &[&str]) {
-        let content = fs::read_to_string(active_log_path).expect("Failed to read active log file");
-        for needle in needles {
+    fn wait_for_log_file(active_log_path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if active_log_path.exists() {
+                return;
+            }
             assert!(
-                content.contains(needle),
-                "Log should contain {needle:?} in {}",
+                std::time::Instant::now() < deadline,
+                "active log file should exist: {}",
                 active_log_path.display()
             );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn assert_logged_text(active_log_path: &Path, needles: &[&str]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Ok(content) = fs::read_to_string(active_log_path) {
+                if needles.iter().all(|needle| content.contains(needle)) {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "log file did not contain all expected records in time: {}",
+                active_log_path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
@@ -234,11 +255,7 @@ mod tests {
                 "init_log should preserve the first active log file path within a process"
             );
         } else {
-            assert!(
-                active_log_path.exists(),
-                "active log file should exist: {}",
-                active_log_path.display()
-            );
+            wait_for_log_file(&active_log_path);
         }
         if previous_path.is_none() && active_log_path.starts_with(log_path) {
             let file_name = active_log_path
@@ -300,11 +317,7 @@ mod tests {
                 "init_log should preserve the first active log file path within a process"
             );
         } else {
-            assert!(
-                active_log_path.exists(),
-                "active log file should exist: {}",
-                active_log_path.display()
-            );
+            wait_for_log_file(&active_log_path);
             assert!(
                 active_log_path.starts_with(log_path),
                 "first init_log call should bind to the requested directory"

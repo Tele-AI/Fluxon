@@ -27,6 +27,141 @@ _PACK = _load_module()
 
 
 class TestPackTestStackRscCli(unittest.TestCase):
+    def test_download_python_runtime_wheels_uses_matching_python_abi_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "wheelhouse"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            expected_specs = (
+                {"name": "pytest", "version": "8.3.5", "source": "wheel"},
+                {"name": "etcd3", "version": "0.12.0", "source": "sdist"},
+            )
+
+            def fake_check_call(argv, cwd=None):
+                self.assertEqual(cwd, str(REPO_ROOT))
+                if argv[2:4] == ["pip", "download"]:
+                    self.assertEqual(argv[0], "/usr/bin/python3.10")
+                    self.assertIn("--python-version", argv)
+                    self.assertIn("3.10", argv)
+                    (out_dir / "pytest-8.3.5-py3-none-any.whl").write_text("wheel\n", encoding="utf-8")
+                    return 0
+                if argv[2:4] == ["pip", "wheel"]:
+                    self.assertEqual(argv[0], "/usr/bin/python3.10")
+                    (out_dir / "etcd3-0.12.0-py3-none-any.whl").write_text("wheel\n", encoding="utf-8")
+                    return 0
+                raise AssertionError(f"unexpected argv: {argv}")
+
+            with (
+                mock.patch.object(
+                    _PACK,
+                    "_python_executable_for_python_abi",
+                    return_value="/usr/bin/python3.10",
+                ) as python_exe_mock,
+                mock.patch.object(_PACK, "_wheelhouse_resolves_offline", return_value=True) as resolve_mock,
+                mock.patch.object(_PACK.subprocess, "check_call", side_effect=fake_check_call) as check_call_mock,
+            ):
+                _PACK._download_python_runtime_wheels(
+                    out_dir=out_dir,
+                    python_abi="cpython3.10",
+                    platform_tag="manylinux2014_x86_64",
+                    expected_specs=expected_specs,
+                )
+
+            python_exe_mock.assert_called_once_with(python_abi="cpython3.10")
+            resolve_mock.assert_called_once_with(
+                wheelhouse_root=out_dir,
+                python_abi="cpython3.10",
+                expected_specs=expected_specs,
+            )
+            self.assertEqual(check_call_mock.call_count, 2)
+
+    def test_python_executable_for_python_abi_requires_matching_interpreter(self) -> None:
+        with mock.patch.object(
+            _PACK.shutil,
+            "which",
+            side_effect=lambda name: {
+                "python3.10": None,
+                "python3": "/usr/bin/python3",
+                "python": "/usr/bin/python",
+            }.get(name),
+        ):
+            with mock.patch.object(
+                _PACK,
+                "_python_executable_abi",
+                side_effect=lambda path: {
+                    "/usr/bin/python3": "cpython3.12",
+                    "/usr/bin/python": "cpython3.12",
+                }[path],
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "requires a matching Python interpreter on PATH",
+                ):
+                    _PACK._python_executable_for_python_abi(python_abi="cpython3.10")
+
+    def test_wheelhouse_resolves_offline_uses_matching_python_abi_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wheelhouse_root = Path(tmpdir) / "wheelhouse"
+            wheelhouse_root.mkdir(parents=True, exist_ok=True)
+            expected_specs = ({"name": "pytest", "version": "8.3.5", "source": "wheel"},)
+
+            with (
+                mock.patch.object(
+                    _PACK,
+                    "_python_executable_for_python_abi",
+                    return_value="/usr/bin/python3.10",
+                ) as python_exe_mock,
+                mock.patch.object(_PACK.subprocess, "check_call", return_value=0) as check_call_mock,
+            ):
+                ok = _PACK._wheelhouse_resolves_offline(
+                    wheelhouse_root=wheelhouse_root,
+                    python_abi="cpython3.10",
+                    expected_specs=expected_specs,
+                )
+
+            self.assertTrue(ok)
+            python_exe_mock.assert_called_once_with(python_abi="cpython3.10")
+            argv = check_call_mock.call_args.args[0]
+            self.assertEqual(argv[0], "/usr/bin/python3.10")
+            self.assertEqual(argv[1:5], ["-m", "pip", "download", "--no-index"])
+            self.assertIn(str(wheelhouse_root), argv)
+
+    def test_prepare_python_runtime_wheelhouse_rebuilds_when_existing_wheelhouse_fails_offline_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prepared_root = Path(tmpdir) / "prepared"
+            scratch_root = Path(tmpdir) / "scratch"
+            wheelhouse_root = prepared_root / "python_runtime" / "cpython3.10" / "wheels"
+            wheelhouse_root.mkdir(parents=True, exist_ok=True)
+            (wheelhouse_root / "pytest-8.3.5-py3-none-any.whl").write_text("old\n", encoding="utf-8")
+            cfg = {
+                "dependency_sets": {
+                    "base": {
+                        "requirements": [
+                            {"pinned": "pytest==8.3.5", "source": "wheel"},
+                        ]
+                    }
+                }
+            }
+
+            def fake_download(*, out_dir, python_abi, platform_tag, expected_specs):
+                self.assertEqual(python_abi, "cpython3.10")
+                self.assertEqual(platform_tag, "manylinux2014_x86_64")
+                self.assertEqual(expected_specs, ({"name": "pytest", "version": "8.3.5", "source": "wheel"},))
+                (out_dir / "pytest-8.3.5-py3-none-any.whl").write_text("new\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(_PACK, "_wheelhouse_resolves_offline", side_effect=[False, True]) as resolve_mock,
+                mock.patch.object(_PACK, "_download_python_runtime_wheels", side_effect=fake_download) as download_mock,
+            ):
+                _PACK._prepare_python_runtime_wheelhouse_into_root(
+                    prepared_root=prepared_root,
+                    scratch_root=scratch_root,
+                    python_runtime_cfg=cfg,
+                )
+
+            self.assertEqual(resolve_mock.call_count, 1)
+            download_mock.assert_called_once()
+            self.assertEqual((wheelhouse_root / "pytest-8.3.5-py3-none-any.whl").read_text(encoding="utf-8"), "new\n")
+
     def test_resolve_transport_backends_from_ci_suite(self) -> None:
         backends = _PACK._resolve_transport_backends(
             config_path=(REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").resolve(),

@@ -42,8 +42,21 @@ _CI_RUNTIME_MOD = sys.modules["test_runner_ci_runtime"]
 class TestTestRunnerTestbedContract(unittest.TestCase):
     def test_write_ci_master_owner_configs_emits_owner_large_file_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            run_dir = Path(td)
+            run_dir = Path(td) / "runner_run" / "results" / "ci_case" / "run_3"
+            run_dir.mkdir(parents=True, exist_ok=True)
             resolved_case = {
+                "runtime": {
+                    "run_dir": str(run_dir),
+                },
+                "profile": {
+                    "test_stack": {
+                        "kind": "FLUXON",
+                        "port_alloc": {
+                            "kv_master_port_base": 50061,
+                            "kv_master_port_stride": 10,
+                        },
+                    }
+                },
                 "deploy": {
                     "instances": [
                         {"id": "master", "deployer": {"target": "local-node-a"}},
@@ -55,7 +68,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
             with mock.patch.object(_RUNNER, "_ci_base_runtime_service_target_ip", side_effect=["127.0.0.1", "127.0.0.1"]):
                 with mock.patch.object(_RUNNER, "_ci_base_runtime_service_port", side_effect=[19180, 19190]):
-                    _, owner_path = _RUNNER._write_ci_master_owner_configs(
+                    master_path, owner_path = _RUNNER._write_ci_master_owner_configs(
                         resolved_case,
                         run_dir=run_dir,
                         cluster_name="ci_cluster",
@@ -63,12 +76,58 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         owner_dram_bytes=1073741824,
                     )
 
+            master_cfg = yaml.safe_load(master_path.read_text(encoding="utf-8"))
             owner_cfg = yaml.safe_load(owner_path.read_text(encoding="utf-8"))
+            expected_master_port = 50061 + 10 * (3 - 1) + _RUNNER._test_stack_runner_port_slot(
+                runner_root=_RUNNER._test_stack_runner_root(run_dir),
+                stride=10,
+            )
+            self.assertEqual(master_cfg["port"], expected_master_port)
             self.assertEqual(
                 owner_cfg["fluxonkv_spec"]["large_file_paths"],
                 [str((run_dir / "services" / "owner_0" / "large").resolve())],
             )
             self.assertNotIn("shared_file_path", owner_cfg["fluxonkv_spec"])
+
+    def test_ci_required_ports_includes_local_master_kv_port(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "runner_run" / "results" / "ci_case" / "run_2"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            resolved_case = {
+                "runtime": {
+                    "run_dir": str(run_dir),
+                },
+                "profile": {
+                    "test_stack": {
+                        "kind": "FLUXON",
+                        "port_alloc": {
+                            "kv_master_port_base": 50061,
+                            "kv_master_port_stride": 10,
+                        },
+                    }
+                },
+                "deploy": {
+                    "instances": [
+                        {"id": "master", "deployer": {"target": "local-node-a"}},
+                    ],
+                    "target_ip_map": {"local-node-a": "127.0.0.1"},
+                },
+                "runtime_model": {
+                    "test_bed": {"kind": "ops"},
+                    "base_runtime": {"service_ids": []},
+                    "case_runtime": {"instance_ids": ["master"]},
+                },
+            }
+
+            with mock.patch.object(_RUNNER, "_ci_runtime_cleanup_case", return_value=resolved_case):
+                with mock.patch.object(_RUNNER, "_ci_local_runtime_targets", return_value={"local-node-a"}):
+                    required_ports = _RUNNER._ci_required_ports(resolved_case)
+
+            expected_master_port = 50061 + 10 * (2 - 1) + _RUNNER._test_stack_runner_port_slot(
+                runner_root=_RUNNER._test_stack_runner_root(run_dir),
+                stride=10,
+            )
+            self.assertEqual(required_ports, [("ci master", expected_master_port)])
 
     def test_ci_runtime_python_executable_requires_python310_on_path(self) -> None:
         with mock.patch.object(_RUNNER.shutil, "which", return_value=None):

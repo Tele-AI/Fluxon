@@ -695,6 +695,47 @@ GitHub Actions 主窗口中的许多日志并非本地直接打印，而是由 `
 
 因此，GitHub Actions 现在覆盖的是“由单一 `ci_2_virt_node.py` 入口启动，并通过 top-attention CI scene 执行 workload”这条真实 CI 路径，而不是在 suite 里再并存一层旧 scene。
 
+### 9.2 测试入口与 helper 收束原则
+
+**稳定结论：**
+
+- 测试入口要直接匹配真实执行模型。
+- 公共测试 helper 要收紧到少量稳定入口，不要持续增殖近义包装层。
+
+这里要把“方便复用”与“helper 面失控”区分开看。
+
+`teststack` / top-attention 入口的稳定设计不是“所有测试都统一包成同一种外壳”，而是：
+
+- 独立脚本 / 独立进程测试就按脚本 / 进程直接启动；
+- 既有纯 `pytest` 测试继续走稳定的 `pytest` 入口；
+- 多个脚本需要顺序执行时，可以在调用侧显式写顺序，不必为了三到五行循环再新增一层公共 helper。
+
+推荐边界如下：
+
+| 场景 | 推荐做法 | 避免什么 |
+| --- | --- | --- |
+| 单脚本 / 单进程测试 | 直接走 canonical direct-python 入口 | 为了表面统一再额外包一层 `pytest` |
+| 既有纯 `pytest` 测试 | 可继续走现有 canonical `pytest` 入口 | 把新的脚本型 / 进程型测试继续包进 `pytest` wrapper |
+| 多脚本顺序执行 | 在入口脚本里显式顺序调用，遇到首个非零退出码立即返回 | 新增只负责包装三到五行 loop 的近义 helper |
+| 需要 selector surface 的包装器 | 显式实现并文档化 selector contract | 透传未实现的 `-k`、`-q`、node selector 等 `pytest` 风格参数 |
+
+这里的方向不是扩大 `pytest` 入口覆盖面，而是让既有 `pytest` 用法保持边界稳定，同时让新增脚本 / 进程 / 生命周期测试优先回到 direct-process 模型。
+
+这条规则的目的不是反对 helper，而是限制 helper 数量。只有在 helper 明确新增了稳定契约时，它才值得进入公共层，例如：
+
+- 统一参数解析；
+- 统一入口日志与命令回显；
+- 统一 case-config 校验；
+- 统一 runtime endpoint / artifact surface 的接线。
+
+如果 helper 只是把调用侧本来就能清楚表达的一小段顺序控制换个名字重复包装，例如“单文件 direct-python”“多文件 direct-python”“显式 python 的多文件 direct-python”各自一套命名变体，这种拆分通常不会增加稳定契约，反而会扩大公共 surface，增加后续维护分支。
+
+因此，测试入口设计应优先追求：
+
+- 一类语义，一条 canonical 入口；
+- helper 少而稳，调用侧薄而直；
+- 公共层负责契约，调用侧负责局部编排。
+
 ## 10. GitOps 与 UI 的归属
 
 GitOps 挂在 test_runner UI 服务下。这里的约束是不额外拆出第二个独立控制面服务，不是要求 UI 随某一次测试 run 一起退出。
