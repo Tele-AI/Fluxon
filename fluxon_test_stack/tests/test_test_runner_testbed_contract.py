@@ -313,6 +313,70 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             )
             cleanup_runtime.assert_called_once_with(resolved_case, timeout_s=120)
 
+    def test_execute_ci_case_keeps_terminal_success_without_inline_delete_apply(self) -> None:
+        resolved_case = {
+            "case": {
+                "case_id": "ci_top_attention_mq_core__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+                "case_key": "case-key",
+            },
+            "scene": {
+                "ci": {
+                    "commands": [
+                        {
+                            "id": "top_attention_mq_core",
+                            "command": "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_core.py",
+                            "timeout_seconds": 60,
+                        }
+                    ]
+                }
+            },
+        }
+        prepared_case = _RUNNER._PreparedCase(
+            plan=_RUNNER._CasePlan(
+                case_family=_RUNNER.CASE_FAMILY_CI,
+                prepare_phases=(),
+                execute_phases=(
+                    _RUNNER._RuntimePhase(
+                        phase_id="ci_runner",
+                        layer=_RUNNER.RUNTIME_LAYER_CASE,
+                        instance_ids=("ci_runner",),
+                        write_ctx="CI execute",
+                    ),
+                ),
+            ),
+            ci_runner_exit_code_baseline=None,
+        )
+        tracking = _RUNNER._CaseRuntimeTracking(ci_apply_ids={"ci_runner": "apply-runner"})
+
+        with (
+            mock.patch.object(
+                _RUNNER,
+                "_deploy_runtime_phase",
+                return_value={"history_id": "apply-runner"},
+            ),
+            mock.patch.object(_RUNNER, "_record_ci_apply_id") as record_apply,
+            mock.patch.object(_RUNNER, "_wait_ci_instance_ready") as wait_ready,
+            mock.patch.object(_RUNNER, "_wait_ci_runner_exit_code", return_value=0) as wait_exit_code,
+            mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply,
+        ):
+            executed = _RUNNER._execute_ci_case(
+                planned_case=mock.Mock(ci_commands=[]),
+                resolved_case=resolved_case,
+                run_dir=Path("/tmp/ci_run_dir"),
+                run_index=3,
+                started_at=100,
+                prepared_case=prepared_case,
+                runtime_tracking=tracking,
+            )
+
+        self.assertEqual(executed.outcome, _RUNNER.RUN_OUTCOME_SUCCESS)
+        self.assertEqual(executed.summary["ci"], {"rc": 0})
+        record_apply.assert_called_once()
+        wait_ready.assert_called_once_with(resolved_case, instance_id="ci_runner")
+        wait_exit_code.assert_called_once()
+        delete_apply.assert_not_called()
+        self.assertEqual(tracking.ci_apply_ids["ci_runner"], "apply-runner")
+
     def test_finalize_ci_case_runtime_preserves_structured_instance_ids(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
