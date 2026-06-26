@@ -14,7 +14,6 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEST_REQUIREMENTS: list[str] = ["ops"]
-BUILD_CONFIG_EXT_PATH_ENV = "FLUXON_BUILD_CONFIG_EXT_PATH"
 
 
 def call(cmd: Sequence[str], *, env: dict[str, str] | None = None) -> int:
@@ -132,16 +131,6 @@ def write_build_config_ext(case_cfg_path: str | Path, *, scene_runtime: object) 
         encoding="utf-8",
     )
     return out_path
-
-
-def inject_build_config_ext_env(
-    env: dict[str, str] | None,
-    *,
-    build_config_ext_path: str | Path,
-) -> dict[str, str]:
-    prepared_env = os.environ.copy() if env is None else dict(env)
-    prepared_env[BUILD_CONFIG_EXT_PATH_ENV] = str(Path(build_config_ext_path).resolve())
-    return prepared_env
 
 
 def _iter_active_python_site_packages_roots() -> list[Path]:

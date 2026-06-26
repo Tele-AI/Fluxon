@@ -6,7 +6,6 @@ from pathlib import Path
 
 from _common import (
     REPO_ROOT,
-    inject_build_config_ext_env,
     load_case_config_payload,
     run_cargo,
     write_build_config_ext,
@@ -36,11 +35,7 @@ def main() -> int:
     scene_runtime = case_payload.get("scene_runtime")
     if not isinstance(scene_runtime, dict):
         raise ValueError("case config must define scene_runtime mapping")
-    build_config_ext_path = write_build_config_ext(case_cfg_path, scene_runtime=scene_runtime)
-    env = inject_build_config_ext_env(
-        None,
-        build_config_ext_path=build_config_ext_path,
-    )
+    write_build_config_ext(case_cfg_path, scene_runtime=scene_runtime)
     return run_cargo([
         "test",
         "--manifest-path",
@@ -48,7 +43,7 @@ def main() -> int:
         "--no-default-features",
         "--features",
         f"p2p_transfer,{feature}",
-    ], env=env)
+    ])
 
 
 if __name__ == "__main__":

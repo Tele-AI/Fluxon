@@ -97,10 +97,7 @@ class TestTopAttentionBinKvtestContract(unittest.TestCase):
                 run_cargo.call_args.kwargs["env"]["FLUXON_KV_TEST_ROUNDS"],
                 "p2p_only",
             )
-            self.assertEqual(
-                run_cargo.call_args.kwargs["env"]["FLUXON_BUILD_CONFIG_EXT_PATH"],
-                str((src_dir / "build_config_ext.yml").resolve()),
-            )
+            self.assertNotIn("FLUXON_BUILD_CONFIG_EXT_PATH", run_cargo.call_args.kwargs["env"])
 
 
 if __name__ == "__main__":

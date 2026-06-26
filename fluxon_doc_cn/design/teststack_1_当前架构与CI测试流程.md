@@ -10,7 +10,7 @@
 
 - `teststack` 由三层组成：
   - **上层：suite 编译层**：将 `scene × scale × profile` 组合成可执行 case；
-  - **中层：统一 case plan / dispatch 层**：把编译结果收敛成统一的 `prepare / execute` 外壳，并按 runtime backend 分发；结果观测和终态落盘放在 execute / finalize 两段里完成；
+  - **中层：统一 case plan / dispatch 层**：把不同 scene 编译出的执行细节包装成同一种两段式计划：先 `prepare` 准备运行目录、配置和前置实例，再 `execute` 启动主体 workload、等待结果，并按 runtime backend 分发；结果观测和终态落盘放在 execute / finalize 两段里完成；
   - **下层：runtime backend 执行层**：分别承接 `CI` backend 和 `TEST_STACK` backend 的具体 prepare、execute、finalize 实现。
 - `test_runner.py` 是统一执行器，覆盖 `CI` case、`TEST_STACK` benchmark case，以及 UI / GitOps 集成入口。
 - `test_runner.py` 当前主要承载上层和中层；`test_runner_runtime_backend.py` 承载下层 runtime backend 实现。
@@ -72,13 +72,13 @@ flowchart TD
 | 层级 | 作用 | 当前主要落点 |
 | --- | --- | --- |
 | 上层 | 解析 suite、selector、`scene/scale/profile`，并 materialize `resolved_case` | `test_runner.py` |
-| 中层 | 将不同 case family 收敛成统一 `_CasePlan` 外壳，并负责统一 dispatch | `test_runner.py` |
+| 中层 | 将不同 case family 包装成统一 `_CasePlan`：包含 `prepare` / `execute` 两段，并负责统一 dispatch | `test_runner.py` |
 | 下层 | 按 runtime backend 执行具体 runtime 逻辑 | `test_runner_runtime_backend.py` |
 
 这里的关键点是：
 
 - **上层统一的是 schema 和 case 编译模型**；
-- **中层统一的是 `prepare / execute` 的外壳**；结果观测和 finalize 是 runner 级收尾，不是 `_CasePlan` 的 phase；
+- **中层统一的是两段式 `_CasePlan`**：`prepare` 约定如何准备运行目录、配置和前置实例，`execute` 约定如何启动主体 workload 并等待结果；结果观测和 finalize 是 runner 级收尾，不是 `_CasePlan` 的 phase；
 - **下层不再按 `scene/scale/profile` 切分，而是按 runtime backend 切分**。
 
 这意味着：
