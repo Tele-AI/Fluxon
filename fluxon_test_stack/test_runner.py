@@ -174,6 +174,10 @@ CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S = 600
 CI_RUNNER_READINESS_PROBE_DEADLINE_S = 120
 CI_RUNNER_EXIT_CODE_GRACE_TIMEOUT_S = 300
 CI_RUNNER_TERMINAL_EXIT_CODE_FILE_GRACE_S = 15.0
+CI_RUNNER_STDOUT_TERMINAL_EXIT_CODE_RE = re.compile(
+    r"^\[ci_runner\] (?:wrote|found existing) exit_code=(-?[0-9]+); holding until controller stop$",
+    re.MULTILINE,
+)
 TEST_STACK_REMOTE_STAGE_SHARED_INCLUDE_RELPATHS = (
     "benchmark_config.py",
     "deployer_deploy.yaml",
@@ -15334,6 +15338,40 @@ def _parse_ci_runner_exit_code_text(*, raw: str, path: Path, ctx: str) -> int:
     return _require_int(rc, ctx, min_v=-255)
 
 
+def _parse_ci_runner_stdout_terminal_exit_code(
+    *,
+    raw: str,
+    path: Path,
+    ctx: str,
+) -> Optional[int]:
+    matches = list(CI_RUNNER_STDOUT_TERMINAL_EXIT_CODE_RE.finditer(raw))
+    if not matches:
+        return None
+    rc_text = matches[-1].group(1)
+    return _parse_ci_runner_exit_code_text(raw=rc_text, path=path, ctx=ctx)
+
+
+def _read_ci_runner_stdout_terminal_exit_code_if_present(
+    *,
+    resolved_case: Dict[str, Any],
+    run_dir: Path,
+    ctx: str,
+) -> Optional[int]:
+    stdout_path = (run_dir / "logs" / "ci_runner" / "stdout.log").resolve()
+    stdout_raw = _instance_read_text_if_present(
+        resolved_case,
+        instance_id="ci_runner",
+        path=stdout_path,
+    )
+    if stdout_raw is None:
+        return None
+    return _parse_ci_runner_stdout_terminal_exit_code(
+        raw=stdout_raw,
+        path=stdout_path,
+        ctx=ctx,
+    )
+
+
 def _read_ci_runner_exit_code_if_present(
     *,
     resolved_case: Dict[str, Any],
@@ -15345,8 +15383,15 @@ def _read_ci_runner_exit_code_if_present(
     exit_code_path = (run_dir / "logs" / "ci_runner" / "exit_code.txt").resolve()
     current_state = _observe_file_state(exit_code_path)
     if _has_new_file_state(before=baseline_state, after=current_state):
+        raw = exit_code_path.read_text(encoding="utf-8")
+        if not raw.strip():
+            return _read_ci_runner_stdout_terminal_exit_code_if_present(
+                resolved_case=resolved_case,
+                run_dir=run_dir,
+                ctx=local_ctx + ".stdout",
+            )
         return _parse_ci_runner_exit_code_text(
-            raw=exit_code_path.read_text(encoding="utf-8"),
+            raw=raw,
             path=exit_code_path,
             ctx=local_ctx,
         )
@@ -15356,7 +15401,17 @@ def _read_ci_runner_exit_code_if_present(
         path=exit_code_path,
     )
     if remote_raw is None:
-        return None
+        return _read_ci_runner_stdout_terminal_exit_code_if_present(
+            resolved_case=resolved_case,
+            run_dir=run_dir,
+            ctx=remote_ctx + ".stdout",
+        )
+    if not remote_raw.strip():
+        return _read_ci_runner_stdout_terminal_exit_code_if_present(
+            resolved_case=resolved_case,
+            run_dir=run_dir,
+            ctx=remote_ctx + ".stdout",
+        )
     return _parse_ci_runner_exit_code_text(
         raw=remote_raw,
         path=exit_code_path,

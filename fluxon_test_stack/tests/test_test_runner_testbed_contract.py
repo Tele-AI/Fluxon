@@ -431,6 +431,100 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
             self.assertEqual(rc, 0)
 
+    def test_wait_ci_runner_exit_code_prefers_stdout_marker_after_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            exit_code_path = (run_dir / "logs" / "ci_runner" / "exit_code.txt").resolve()
+            stdout_path = (run_dir / "logs" / "ci_runner" / "stdout.log").resolve()
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            resolved_case = {
+                "deploy": {
+                    "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                    "target_ip_map": {"logic-a": "10.0.0.2"},
+                    "instances": [
+                        {
+                            "id": "ci_runner",
+                            "k8s_ref": "deployment/ci-runner",
+                            "deployer": {"target": "logic-a"},
+                        }
+                    ],
+                }
+            }
+            status_calls = [
+                {"ok": True, "running": False, "exit_code": 143},
+            ]
+            stdout_reads = iter(
+                [
+                    "[ci_runner] running tests\n",
+                    "[ci_runner] SUCCESS rc=0\n[ci_runner] wrote exit_code=0; holding until controller stop\n",
+                ]
+            )
+
+            def _fake_observe_file_state(path: Path):
+                self.assertEqual(path, exit_code_path)
+                return None
+
+            def _fake_instance_read_text_if_present(*_args, **kwargs):
+                path = kwargs["path"]
+                if path == exit_code_path:
+                    return None
+                self.assertEqual(path, stdout_path)
+                return next(stdout_reads)
+
+            def _fake_instance_status(*_args, **_kwargs):
+                return status_calls.pop(0)
+
+            with (
+                mock.patch.object(_RUNNER, "_print_ci_wait_progress", return_value=(0, 999999999.0)),
+                mock.patch.object(_RUNNER, "_observe_file_state", side_effect=_fake_observe_file_state),
+                mock.patch.object(_RUNNER, "_instance_read_text_if_present", side_effect=_fake_instance_read_text_if_present),
+                mock.patch.object(_RUNNER, "_instance_status", side_effect=_fake_instance_status),
+                mock.patch.object(_RUNNER.time, "sleep"),
+            ):
+                rc = _RUNNER._wait_ci_runner_exit_code(
+                    resolved_case=resolved_case,
+                    run_dir=run_dir,
+                    timeout_s=60,
+                    baseline_state=None,
+                )
+
+            self.assertEqual(rc, 0)
+
+    def test_wait_ci_runner_exit_code_uses_stdout_marker_when_exit_code_file_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            exit_code_path = run_dir / "logs" / "ci_runner" / "exit_code.txt"
+            stdout_path = run_dir / "logs" / "ci_runner" / "stdout.log"
+            exit_code_path.parent.mkdir(parents=True, exist_ok=True)
+            exit_code_path.write_text("", encoding="utf-8")
+            stdout_path.write_text(
+                "[ci_runner] SUCCESS rc=0\n[ci_runner] wrote exit_code=0; holding until controller stop\n",
+                encoding="utf-8",
+            )
+            resolved_case = {
+                "deploy": {
+                    "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                    "target_ip_map": {"logic-a": "10.0.0.2"},
+                    "instances": [
+                        {
+                            "id": "ci_runner",
+                            "k8s_ref": "deployment/ci-runner",
+                            "deployer": {"target": "logic-a"},
+                        }
+                    ],
+                }
+            }
+
+            rc = _RUNNER._read_ci_runner_exit_code_if_present(
+                resolved_case=resolved_case,
+                run_dir=run_dir,
+                baseline_state=None,
+                local_ctx="ci_runner.exit_code",
+                remote_ctx="ci_runner.remote_exit_code",
+            )
+
+            self.assertEqual(rc, 0)
+
     def test_wait_ci_runner_exit_code_resume_prefers_exit_code_file_after_terminal_status(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
