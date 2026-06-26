@@ -875,6 +875,7 @@ def main() -> None:
     )
 
     suite_failed = False
+    failed_case_summaries: List[str] = []
     for planned_case in scheduled:
         case = planned_case.case
         if suite.run_mode == RUN_MODE_FULL_ONCE and planned_case.counted:
@@ -1123,8 +1124,22 @@ def main() -> None:
             if fatal_stop_after_finalize:
                 raise SystemExit(1)
 
+        case_result_parts = [
+            f"case_id={case.case_id}",
+            f"run_index={run_slot.run_index}",
+            f"outcome={outcome}",
+            f"counted={counted}",
+            f"summary={summary_path}",
+        ]
+        if case_error is not None:
+            case_result_parts.append(f"case_error={case_error}")
+        if finalize_error is not None:
+            case_result_parts.append(f"finalize_error={finalize_error}")
+        print("[CASE result] " + " ".join(case_result_parts), flush=True)
+
         if outcome != RUN_OUTCOME_SUCCESS:
             suite_failed = True
+            failed_case_summaries.append(" ".join(case_result_parts))
             # RUN_MODE_DEBUG_ONE_BY_ONE is intended for local iteration: stop at first failure.
             # RUN_MODE_FULL_ONCE should run the whole matrix so we can see every failing case
             # in one case_runs.yaml, then exit non-zero at the end.
@@ -1132,7 +1147,13 @@ def main() -> None:
                 raise SystemExit(1)
 
     if suite_failed:
+        print("[SUITE result] FAILED", flush=True)
+        for summary in failed_case_summaries:
+            print("[SUITE failed_case] " + summary, flush=True)
+        print(f"[SUITE artifacts] case_runs={case_runs_path}", flush=True)
         raise SystemExit(1)
+
+    print(f"[SUITE result] SUCCESS case_runs={case_runs_path}", flush=True)
 
 
 def _load_yaml_file(path: Path) -> Any:
