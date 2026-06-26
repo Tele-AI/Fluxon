@@ -94,6 +94,8 @@ class TestTopAttentionCargoKvUnitContract(unittest.TestCase):
                     "--no-default-features",
                     "--features",
                     "p2p_transfer,tcp_thread_transport",
+                    "--",
+                    "--test-threads=1",
                 ],
             )
             self.assertNotIn("env", run_cargo.call_args.kwargs)

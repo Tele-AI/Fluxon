@@ -244,5 +244,8 @@ def run_cargo(
 ) -> int:
     # Rust test binaries launched via cargo run/load depend on the wheel-bundled native
     # runtime under the active venv. Keep one authoritative search root for all wrappers.
+    cargo_args = list(args)
     effective_passthrough = [] if passthrough is None else list(passthrough)
-    return call(["cargo", *args, *effective_passthrough], env=_prepare_cargo_env(env))
+    if cargo_args and cargo_args[0] == "test":
+        effective_passthrough = ["--", "--test-threads=1", *effective_passthrough]
+    return call(["cargo", *cargo_args, *effective_passthrough], env=_prepare_cargo_env(env))

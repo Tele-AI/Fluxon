@@ -121,6 +121,8 @@ class TestTopAttentionLogMgmtContract(unittest.TestCase):
                     str(REPO_ROOT / "fluxon_rs" / "fluxon_util" / "Cargo.toml"),
                     "--test",
                     "log_mgmt",
+                    "--",
+                    "--test-threads=1",
                 ],
             )
 
@@ -255,6 +257,8 @@ class TestTopAttentionLogMgmtContract(unittest.TestCase):
                 str(REPO_ROOT / "fluxon_rs" / "fluxon_util" / "Cargo.toml"),
                 "--test",
                 "log_mgmt",
+                "--",
+                "--test-threads=1",
             ],
         )
 
