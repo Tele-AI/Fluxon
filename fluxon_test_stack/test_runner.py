@@ -124,6 +124,7 @@ RUN_OUTCOME_SUCCESS = "SUCCESS"
 RUN_OUTCOME_FAILED = "FAILED"
 _RUN_SUMMARY_INCOMPLETE_ERROR = "INCOMPLETE: run started but did not reach finalize; runner likely exited abruptly."
 _RUN_EXCEPTION_FILENAME = "exception.txt"
+_DEBUG_TAIL_MAX_BYTES = 8192
 CI_PRESERVED_APPLY_IDS_SCHEMA_VERSION = 1
 CI_PRESERVED_APPLY_IDS_FILENAME = "ci_preserved_apply_ids.yaml"
 CI_RUNTIME_CONTRACT_CLUSTER_KV_OWNER = "cluster_kv_owner"
@@ -951,6 +952,7 @@ def main() -> None:
         case_plan: Optional[_CasePlan] = None
         case_error: Optional[str] = None
         finalize_error: Optional[str] = None
+        case_debug_emitted = False
 
         try:
             resolved_case = _build_resolved_case_yaml(
@@ -1026,6 +1028,14 @@ def main() -> None:
             except Exception as write_exc:  # noqa: BLE001
                 case_error = f"{type(exc).__name__}: {exc} (failed to write {_RUN_EXCEPTION_FILENAME}: {type(write_exc).__name__}: {write_exc})"
             print(f"ERROR: case failed: case_id={case.case_id} err={case_error}")
+            _emit_case_debug_footer(
+                case_id=case.case_id,
+                run_dir=run_dir,
+                summary_path=summary_path,
+                case_runs_path=case_runs_path,
+                reason="case_exception",
+            )
+            case_debug_emitted = True
             outcome = RUN_OUTCOME_FAILED
 
         finally:
@@ -1123,9 +1133,27 @@ def main() -> None:
                     )
             except Exception as exc:
                 print(f"ERROR: failed to write/update summary.yaml: {exc}")
+                if not case_debug_emitted:
+                    _emit_case_debug_footer(
+                        case_id=case.case_id,
+                        run_dir=run_dir,
+                        summary_path=summary_path,
+                        case_runs_path=case_runs_path,
+                        reason="summary_update_error",
+                    )
+                    case_debug_emitted = True
                 raise SystemExit(1)
 
             if fatal_stop_after_finalize:
+                if not case_debug_emitted:
+                    _emit_case_debug_footer(
+                        case_id=case.case_id,
+                        run_dir=run_dir,
+                        summary_path=summary_path,
+                        case_runs_path=case_runs_path,
+                        reason="finalize_fatal_stop",
+                    )
+                    case_debug_emitted = True
                 raise SystemExit(1)
 
         case_result_parts = [
@@ -1142,6 +1170,15 @@ def main() -> None:
         print("[CASE result] " + " ".join(case_result_parts), flush=True)
 
         if outcome != RUN_OUTCOME_SUCCESS:
+            if not case_debug_emitted:
+                _emit_case_debug_footer(
+                    case_id=case.case_id,
+                    run_dir=run_dir,
+                    summary_path=summary_path,
+                    case_runs_path=case_runs_path,
+                    reason="case_failed",
+                )
+                case_debug_emitted = True
             suite_failed = True
             failed_case_summaries.append(" ".join(case_result_parts))
             # RUN_MODE_DEBUG_ONE_BY_ONE is intended for local iteration: stop at first failure.
@@ -1155,9 +1192,107 @@ def main() -> None:
         for summary in failed_case_summaries:
             print("[SUITE failed_case] " + summary, flush=True)
         print(f"[SUITE artifacts] case_runs={case_runs_path}", flush=True)
+        _emit_suite_debug_footer(
+            reason="suite_failed",
+            case_runs=case_runs,
+            case_runs_path=case_runs_path,
+            scheduled=scheduled,
+        )
         raise SystemExit(1)
 
     print(f"[SUITE result] SUCCESS case_runs={case_runs_path}", flush=True)
+    _emit_suite_debug_footer(
+        reason="suite_success",
+        case_runs=case_runs,
+        case_runs_path=case_runs_path,
+        scheduled=scheduled,
+    )
+
+
+def _read_text_tail_for_debug(path: Path, *, max_bytes: int = _DEBUG_TAIL_MAX_BYTES) -> Optional[str]:
+    try:
+        if not path.exists():
+            return None
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - int(max_bytes)), os.SEEK_SET)
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001
+        return f"<failed to read debug tail: {type(exc).__name__}: {exc}>"
+
+
+def _emit_debug_file_tail(label: str, path: Path, *, max_bytes: int = _DEBUG_TAIL_MAX_BYTES) -> None:
+    resolved = path.resolve()
+    text = _read_text_tail_for_debug(resolved, max_bytes=max_bytes)
+    print(f"[DEBUG file] label={label} path={resolved} exists={text is not None}", flush=True)
+    if text is None:
+        return
+    print(f"[DEBUG file_tail_begin] label={label} max_bytes={int(max_bytes)}", flush=True)
+    if text:
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+    print(f"[DEBUG file_tail_end] label={label}", flush=True)
+
+
+def _emit_case_debug_footer(
+    *,
+    case_id: str,
+    run_dir: Path,
+    summary_path: Path,
+    case_runs_path: Path,
+    reason: str,
+) -> None:
+    try:
+        print(
+            "[CASE debug] "
+            f"reason={reason} case_id={case_id} run_dir={run_dir.resolve()} "
+            f"summary={summary_path.resolve()} case_runs={case_runs_path.resolve()}",
+            flush=True,
+        )
+        _emit_debug_file_tail("summary.yaml", summary_path)
+        _emit_debug_file_tail(_RUN_EXCEPTION_FILENAME, run_dir / _RUN_EXCEPTION_FILENAME)
+        _emit_debug_file_tail("ci_runner.exit_code", run_dir / "logs" / "ci_runner" / "exit_code.txt")
+        _emit_debug_file_tail("ci_runner.stdout", run_dir / "logs" / "ci_runner" / "stdout.log")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[CASE debug] failed to emit debug footer: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _emit_suite_debug_footer(
+    *,
+    reason: str,
+    case_runs: Dict[str, Any],
+    case_runs_path: Path,
+    scheduled: List[_PlannedCase],
+) -> None:
+    try:
+        print(
+            "[SUITE debug] "
+            f"reason={reason} scheduled={len(scheduled)} case_runs={case_runs_path.resolve()}",
+            flush=True,
+        )
+        run_map = _case_runs_map(case_runs)
+        for planned_case in scheduled:
+            case_id = planned_case.case.case_id
+            rec = run_map.get(case_id)
+            if rec is None:
+                print(f"[SUITE debug_case] case_id={case_id} missing_in_case_runs=true", flush=True)
+                continue
+            last_run = rec.get("last_run")
+            last_run_json = json.dumps(last_run, sort_keys=True, separators=(",", ":"))
+            print(
+                "[SUITE debug_case] "
+                f"case_id={case_id} counted={planned_case.counted} "
+                f"total_runs={rec.get('total_runs')} success_runs={rec.get('success_runs')} "
+                f"failed_runs={rec.get('failed_runs')} counted_runs={rec.get('counted_runs')} "
+                f"last_run={last_run_json}",
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[SUITE debug] failed to emit debug footer: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _load_yaml_file(path: Path) -> Any:
@@ -14957,7 +15092,7 @@ def _print_ci_wait_progress(
     last_offset: int,
     next_heartbeat_at: float,
     deadline: float,
-) -> tuple[int, float]:
+) -> tuple[int, float, str]:
     now = time.time()
     next_offset, chunk = _ci_wait_progress_tail(
         resolved_case,
@@ -14969,7 +15104,7 @@ def _print_ci_wait_progress(
         if text:
             sys.stdout.write(_ci_log_prefix_lines(text + "\n", now=now))
             sys.stdout.flush()
-        return next_offset, now + _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS
+        return next_offset, now + _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS, chunk
     if now >= next_heartbeat_at:
         remaining_s = max(0, int(deadline - now))
         print(
@@ -14978,8 +15113,8 @@ def _print_ci_wait_progress(
             f"log={str((run_dir / 'logs' / 'ci_runner' / 'stdout.log').resolve())}",
             flush=True,
         )
-        return next_offset, now + _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS
-    return next_offset, next_heartbeat_at
+        return next_offset, now + _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS, ""
+    return next_offset, next_heartbeat_at, ""
 
 
 def _instance_file_exists(
@@ -15557,14 +15692,25 @@ def _wait_ci_runner_exit_code(
     last_status_err: str | None = None
     log_offset = 0
     next_heartbeat_at = 0.0
+    stdout_terminal_tail = ""
+    stdout_path = (run_dir / "logs" / "ci_runner" / "stdout.log").resolve()
     while True:
-        log_offset, next_heartbeat_at = _print_ci_wait_progress(
+        log_offset, next_heartbeat_at, stdout_chunk = _print_ci_wait_progress(
             resolved_case,
             run_dir=run_dir,
             last_offset=log_offset,
             next_heartbeat_at=next_heartbeat_at,
             deadline=deadline,
         )
+        if stdout_chunk:
+            stdout_terminal_tail = (stdout_terminal_tail + stdout_chunk)[-4096:]
+            rc_from_stdout_tail = _parse_ci_runner_stdout_terminal_exit_code(
+                raw=stdout_terminal_tail,
+                path=stdout_path,
+                ctx="ci_runner.stdout_progress",
+            )
+            if rc_from_stdout_tail is not None:
+                return rc_from_stdout_tail
         current_state = _observe_file_state(exit_code_path)
         rc_from_file = _read_ci_runner_exit_code_if_present(
             resolved_case=resolved_case,

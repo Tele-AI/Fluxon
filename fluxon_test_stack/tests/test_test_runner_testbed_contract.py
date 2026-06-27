@@ -518,7 +518,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 return status_calls.pop(0)
 
             with (
-                mock.patch.object(_RUNNER, "_print_ci_wait_progress", return_value=(0, 999999999.0)),
+                mock.patch.object(_RUNNER, "_print_ci_wait_progress", return_value=(0, 999999999.0, "")),
                 mock.patch.object(_RUNNER, "_observe_file_state", side_effect=_fake_observe_file_state),
                 mock.patch.object(_RUNNER, "_instance_read_text_if_present", side_effect=_fake_instance_read_text_if_present),
                 mock.patch.object(_RUNNER, "_instance_status", side_effect=_fake_instance_status),
@@ -578,7 +578,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 return status_calls.pop(0)
 
             with (
-                mock.patch.object(_RUNNER, "_print_ci_wait_progress", return_value=(0, 999999999.0)),
+                mock.patch.object(_RUNNER, "_print_ci_wait_progress", return_value=(0, 999999999.0, "")),
                 mock.patch.object(_RUNNER, "_observe_file_state", side_effect=_fake_observe_file_state),
                 mock.patch.object(_RUNNER, "_instance_read_text_if_present", side_effect=_fake_instance_read_text_if_present),
                 mock.patch.object(_RUNNER, "_instance_status", side_effect=_fake_instance_status),
@@ -591,6 +591,48 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     baseline_state=None,
                 )
 
+            self.assertEqual(rc, 0)
+
+    def test_wait_ci_runner_exit_code_returns_progress_stdout_marker_without_second_read(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            exit_code_path = (run_dir / "logs" / "ci_runner" / "exit_code.txt").resolve()
+            resolved_case = {
+                "deploy": {
+                    "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                    "target_ip_map": {"logic-a": "10.0.0.2"},
+                    "instances": [
+                        {
+                            "id": "ci_runner",
+                            "k8s_ref": "deployment/ci-runner",
+                            "deployer": {"target": "logic-a"},
+                        }
+                    ],
+                }
+            }
+            stdout_chunk = (
+                "[ci_runner] SUCCESS rc=0\n"
+                "[ci_runner] wrote exit_code=0; holding until controller stop\n"
+            )
+
+            with (
+                mock.patch.object(
+                    _RUNNER,
+                    "_print_ci_wait_progress",
+                    return_value=(len(stdout_chunk), 999999999.0, stdout_chunk),
+                ),
+                mock.patch.object(_RUNNER, "_observe_file_state", side_effect=AssertionError("exit_code should not be reread")),
+                mock.patch.object(_RUNNER, "_instance_read_text_if_present", side_effect=AssertionError("stdout should not be reread")),
+                mock.patch.object(_RUNNER, "_instance_status", side_effect=AssertionError("status should not be queried")),
+            ):
+                rc = _RUNNER._wait_ci_runner_exit_code(
+                    resolved_case=resolved_case,
+                    run_dir=run_dir,
+                    timeout_s=60,
+                    baseline_state=None,
+                )
+
+            self.assertEqual(exit_code_path.name, "exit_code.txt")
             self.assertEqual(rc, 0)
 
     def test_wait_ci_runner_exit_code_uses_stdout_marker_when_exit_code_file_is_empty(self) -> None:
