@@ -203,7 +203,9 @@ def _prepare_cargo_env(env: dict[str, str] | None) -> dict[str, str] | None:
     if env is None and libs_dir is None and closed_sdk_root is None:
         return None
 
-    prepared_env = os.environ.copy() if env is None else dict(env)
+    prepared_env = os.environ.copy()
+    if env is not None:
+        prepared_env.update(env)
     authoritative_entries: list[str] = []
 
     if libs_dir is not None:

@@ -27,6 +27,21 @@ _ENTRY = _load_module()
 
 
 class TestTopAttentionCommonContract(unittest.TestCase):
+    def test_prepare_cargo_env_preserves_parent_path_when_case_env_is_partial(self) -> None:
+        with mock.patch.object(_ENTRY, "_resolve_authoritative_fluxon_pyo3_libs_dir", return_value=None):
+            with mock.patch.object(_ENTRY, "_resolve_repo_closed_sdk_root", return_value=None):
+                with mock.patch.dict(
+                    _ENTRY.os.environ,
+                    {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp/fluxon-test-home"},
+                    clear=True,
+                ):
+                    prepared_env = _ENTRY._prepare_cargo_env({"FLUXON_KV_TEST_ROUNDS": "p2p_only"})
+
+        assert prepared_env is not None
+        self.assertEqual(prepared_env["PATH"], "/usr/local/bin:/usr/bin:/bin")
+        self.assertEqual(prepared_env["HOME"], "/tmp/fluxon-test-home")
+        self.assertEqual(prepared_env["FLUXON_KV_TEST_ROUNDS"], "p2p_only")
+
     def test_prepare_cargo_env_prefers_active_fluxon_pyo3_libs_dir_and_sanitizes_loader_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

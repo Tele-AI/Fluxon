@@ -125,6 +125,7 @@ RUN_OUTCOME_FAILED = "FAILED"
 _RUN_SUMMARY_INCOMPLETE_ERROR = "INCOMPLETE: run started but did not reach finalize; runner likely exited abruptly."
 _RUN_EXCEPTION_FILENAME = "exception.txt"
 _DEBUG_TAIL_MAX_BYTES = 8192
+_TEST_RUNNER_DIAGNOSTIC_VERSION = 2
 CI_PRESERVED_APPLY_IDS_SCHEMA_VERSION = 1
 CI_PRESERVED_APPLY_IDS_FILENAME = "ci_preserved_apply_ids.yaml"
 CI_RUNTIME_CONTRACT_CLUSTER_KV_OWNER = "cluster_kv_owner"
@@ -768,6 +769,12 @@ def main() -> None:
 
     _ui_history_register_workdir(workdir_root)
     _redirect_process_stdio_to_log(workdir_root)
+    print(
+        "[TEST_RUNNER diag] "
+        f"version={_TEST_RUNNER_DIAGNOSTIC_VERSION} action={action} "
+        f"script={Path(__file__).resolve()} workdir={workdir_root.resolve()}",
+        flush=True,
+    )
 
     if action == "clean":
         _clean_workdir(workdir_root)
@@ -1271,7 +1278,8 @@ def _emit_suite_debug_footer(
     try:
         print(
             "[SUITE debug] "
-            f"reason={reason} scheduled={len(scheduled)} case_runs={case_runs_path.resolve()}",
+            f"version={_TEST_RUNNER_DIAGNOSTIC_VERSION} reason={reason} "
+            f"scheduled={len(scheduled)} case_runs={case_runs_path.resolve()}",
             flush=True,
         )
         run_map = _case_runs_map(case_runs)
