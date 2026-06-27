@@ -22,8 +22,7 @@ async fn test1_lease_expire_removes_keys() {
     unsafe {
         std::env::set_var("FLUXON_LOG", "debug");
     }
-    let (master_fw, client_fw) =
-        start_master_and_client("lease_master_t1", "lease_client_t1", 18081).await;
+    let (master_fw, client_fw) = start_master_and_client("lease_master_t1", "lease_client_t1").await;
     let client_view = client_fw.client_kv_api_view();
     wait_master_ready(&client_view).await;
 
@@ -83,8 +82,7 @@ async fn test2_rebind_to_new_lease_preserves_until_new_expire() {
     unsafe {
         std::env::set_var("FLUXON_LOG", "debug");
     }
-    let (master_fw, client_fw) =
-        start_master_and_client("lease_master_t2", "lease_client_t2", 18082).await;
+    let (master_fw, client_fw) = start_master_and_client("lease_master_t2", "lease_client_t2").await;
     let client_view = client_fw.client_kv_api_view();
     wait_master_ready(&client_view).await;
 
@@ -163,8 +161,7 @@ async fn test3_keepalive() {
     unsafe {
         std::env::set_var("FLUXON_LOG", "debug");
     }
-    let (master_fw, client_fw) =
-        start_master_and_client("lease_master_t3", "lease_client_t3", 18083).await;
+    let (master_fw, client_fw) = start_master_and_client("lease_master_t3", "lease_client_t3").await;
     let client_view = client_fw.client_kv_api_view();
     wait_master_ready(&client_view).await;
 
@@ -239,8 +236,7 @@ async fn test4_delete_under_lease_then_get_fails() {
     unsafe {
         std::env::set_var("FLUXON_LOG", "debug");
     }
-    let (master_fw, client_fw) =
-        start_master_and_client("lease_master_t4", "lease_client_t4", 18084).await;
+    let (master_fw, client_fw) = start_master_and_client("lease_master_t4", "lease_client_t4").await;
     let client_view = client_fw.client_kv_api_view();
     wait_master_ready(&client_view).await;
 
@@ -294,7 +290,6 @@ async fn test5_eviction_when_lease_consumes_space() {
     let (master_fw, client_fw) = crate::kvcore_test_lib::start_master_and_client_with_client_dram(
         "lease_master_t5",
         "lease_client_t5",
-        18085,
         1024 * 1024 * 100,
     )
     .await;

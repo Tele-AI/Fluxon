@@ -378,13 +378,12 @@ def _execute_ci_case(
         ),
     )
     outcome = ctx.RUN_OUTCOME_SUCCESS if rc == 0 else ctx.RUN_OUTCOME_FAILED
-    if outcome == ctx.RUN_OUTCOME_SUCCESS and runtime_tracking.ci_apply_ids.get("ci_runner") is not None:
-        ctx._delete_apply_id(
-            resolved_case,
-            apply_id=ctx._require_str(runtime_tracking.ci_apply_ids.get("ci_runner"), "CI ci_runner apply_id"),
-            ctx="CI ci_runner apply",
+    if outcome == ctx.RUN_OUTCOME_SUCCESS:
+        _finalize_terminal_ci_runner_success(
+            ctx=ctx,
+            resolved_case=resolved_case,
+            runtime_tracking=runtime_tracking,
         )
-        del runtime_tracking.ci_apply_ids["ci_runner"]
     summary = ctx._build_ci_summary_yaml(
         resolved_case,
         run_index=run_index,
@@ -394,9 +393,30 @@ def _execute_ci_case(
         counted=False,
         ci_out={"rc": rc},
     )
-    for phase in prepared_case.plan.collect_phases:
-        ctx._collect_runtime_phase(resolved_case, run_dir=run_dir, phase=phase)
     return ctx._ExecutedCase(outcome=outcome, summary=summary)
+
+
+def _finalize_terminal_ci_runner_success(
+    *,
+    ctx: Any,
+    resolved_case: Dict[str, Any],
+    runtime_tracking: Any,
+) -> None:
+    apply_id = runtime_tracking.ci_apply_ids.pop("ci_runner", None)
+    if apply_id is None:
+        return
+    try:
+        ctx._delete_apply_id(
+            resolved_case,
+            apply_id=ctx._require_str(apply_id, "CI ci_runner apply_id"),
+            ctx="CI ci_runner terminal success apply",
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            "WARN: CI ci_runner terminal success cleanup failed; "
+            f"preserving terminal test result and excluding ci_runner from finalize tracking: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
 
 
 def _execute_test_stack_case(
@@ -414,7 +434,6 @@ def _execute_test_stack_case(
 
     outcome = ctx.RUN_OUTCOME_FAILED
     error_detail: Optional[str] = None
-    collect_error_detail: Optional[str] = None
     result_obj: Optional[Dict[str, Any]] = None
 
     try:
@@ -445,12 +464,6 @@ def _execute_test_stack_case(
         outcome = ctx.RUN_OUTCOME_SUCCESS
     except Exception as exc:  # noqa: BLE001
         error_detail = f"{type(exc).__name__}: {exc}"
-    finally:
-        try:
-            for phase in prepared_case.plan.collect_phases:
-                ctx._collect_runtime_phase(resolved_case, run_dir=run_dir, phase=phase)
-        except Exception as exc:  # noqa: BLE001
-            collect_error_detail = f"{type(exc).__name__}: {exc}"
 
     summary = {
         "schema_version": ctx.SCHEMA_VERSION,
@@ -472,7 +485,7 @@ def _execute_test_stack_case(
             "result_path": str(_require_test_stack_result_path(prepared_case.test_stack_result_path)),
             "result": result_obj,
             "error": error_detail,
-            "collect_error": collect_error_detail,
+            "collect_error": None,
         },
     }
     return ctx._ExecutedCase(outcome=outcome, summary=summary)
@@ -543,6 +556,7 @@ def _finalize_case_runtime(
         _finalize_test_stack_case_runtime(
             ctx=ctx,
             resolved_case=resolved_case,
+            run_dir=run_dir,
             runtime_tracking=runtime_tracking,
             outcome=outcome,
         )
@@ -579,10 +593,15 @@ def _finalize_ci_case_runtime(
     should_teardown = outcome == ctx.RUN_OUTCOME_SUCCESS or run_mode == ctx.RUN_MODE_FULL_ONCE
     if should_teardown:
         (run_dir / ctx.CI_PRESERVED_APPLY_IDS_FILENAME).unlink(missing_ok=True)
+        cleanup_instance_ids: list[str] = []
         for entry in reversed(tracked_apply_entries):
             apply_id = ctx._require_str(entry.get("apply_id"), "ci tracked apply entry.apply_id")
             instance_ids = ctx._require_list(entry.get("instance_ids"), "ci tracked apply entry.instance_ids")
             instance_id_text = ",".join(
+                ctx._require_str(raw_instance_id, "ci tracked apply entry.instance_ids[]")
+                for raw_instance_id in instance_ids
+            )
+            cleanup_instance_ids.extend(
                 ctx._require_str(raw_instance_id, "ci tracked apply entry.instance_ids[]")
                 for raw_instance_id in instance_ids
             )
@@ -591,7 +610,7 @@ def _finalize_ci_case_runtime(
                 apply_id=apply_id,
                 ctx=f"CI {instance_id_text} apply",
             )
-        ctx._ci_cleanup_runtime(resolved_case, timeout_s=120)
+        ctx._ci_cleanup_runtime(resolved_case, timeout_s=120, instance_ids=cleanup_instance_ids)
         return
     if not ci_preserved_apply_ids:
         return
@@ -617,11 +636,25 @@ def _finalize_test_stack_case_runtime(
     *,
     ctx: Any,
     resolved_case: Dict[str, Any],
+    run_dir: Path,
     runtime_tracking: Any,
     outcome: str,
 ) -> None:
     case = ctx._require_dict(resolved_case.get("case"), "resolved_case.case")
     run_mode = ctx._require_str(case.get("run_mode"), "resolved_case.case.run_mode")
+    collect_error_detail: Optional[str] = None
+
+    try:
+        # Collect first so failed runs still retain instance status snapshots before teardown.
+        ctx._run_adapter_action(resolved_case, run_dir=run_dir, action="collect")
+    except Exception as exc:  # noqa: BLE001
+        collect_error_detail = f"{type(exc).__name__}: {exc}"
+        summary_path = (run_dir / "summary.yaml").resolve()
+        summary = ctx._require_dict(ctx._load_yaml_file(summary_path), "summary.yaml")
+        test_stack_summary = ctx._require_dict(summary.get("test_stack"), "summary.yaml.test_stack")
+        test_stack_summary["collect_error"] = collect_error_detail
+        ctx._write_yaml_file(summary_path, summary)
+
     ts_preserved_apply_ids: list[str] = []
     if runtime_tracking.ts_nodes_deploy_attempted and runtime_tracking.ts_nodes_apply_id is not None:
         ts_preserved_apply_ids.append(

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde_yaml::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,8 +21,7 @@ pub fn find_file_upwards<P: AsRef<Path>>(start: P, filename: &str) -> Option<Pat
 }
 
 fn is_fluxon_repo_root(path: &Path) -> bool {
-    path.join("fluxon_rs").join("Cargo.toml").is_file()
-        && path.join("fluxon_test_stack").is_dir()
+    path.join("fluxon_rs").join("Cargo.toml").is_file() && path.join("fluxon_test_stack").is_dir()
 }
 
 fn find_fluxon_repo_root_upwards(start: &Path) -> Option<PathBuf> {
@@ -82,7 +81,11 @@ pub fn repo_root() -> Result<PathBuf> {
 /// Locate `build_config_ext.yml` by walking upwards from the repo/workspace anchor.
 pub fn locate_build_ext_config() -> Result<PathBuf> {
     let anchor = repo_root()?;
-    if let Some(path) = find_file_upwards(&anchor, "build_config_ext.yml") {
+    locate_build_ext_config_from_anchor(&anchor)
+}
+
+fn locate_build_ext_config_from_anchor(anchor: &Path) -> Result<PathBuf> {
+    if let Some(path) = find_file_upwards(anchor, "build_config_ext.yml") {
         return Ok(path);
     }
     Err(anyhow!(
@@ -260,7 +263,10 @@ pub fn load_tsdb_remote_write_url() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_fluxon_repo_root_upwards, repo_root_from_manifest_dir};
+    use super::{
+        find_fluxon_repo_root_upwards, locate_build_ext_config_from_anchor,
+        repo_root_from_manifest_dir,
+    };
     use std::fs;
     use tempfile::TempDir;
 
@@ -268,17 +274,36 @@ mod tests {
     fn find_fluxon_repo_root_prefers_nearest_nested_fluxon_tree() {
         let temp_dir = TempDir::new().expect("temp dir");
         let outer_root = temp_dir.path().join("outer_checkout");
-        let nested_root = outer_root.join("runner_run").join("results").join("case_1").join("run_1").join("src");
+        let nested_root = outer_root
+            .join("runner_run")
+            .join("results")
+            .join("case_1")
+            .join("run_1")
+            .join("src");
 
         fs::create_dir_all(outer_root.join(".git")).expect("create outer .git");
         fs::create_dir_all(outer_root.join("fluxon_rs")).expect("create outer fluxon_rs dir");
-        fs::create_dir_all(outer_root.join("fluxon_test_stack")).expect("create outer fluxon_test_stack dir");
-        fs::write(outer_root.join("fluxon_rs").join("Cargo.toml"), "[workspace]\n").expect("write outer cargo toml");
+        fs::create_dir_all(outer_root.join("fluxon_test_stack"))
+            .expect("create outer fluxon_test_stack dir");
+        fs::write(
+            outer_root.join("fluxon_rs").join("Cargo.toml"),
+            "[workspace]\n",
+        )
+        .expect("write outer cargo toml");
 
         fs::create_dir_all(nested_root.join("fluxon_rs")).expect("create nested fluxon_rs dir");
-        fs::create_dir_all(nested_root.join("fluxon_test_stack")).expect("create nested fluxon_test_stack dir");
-        fs::write(nested_root.join("fluxon_rs").join("Cargo.toml"), "[workspace]\n").expect("write nested cargo toml");
-        fs::write(nested_root.join("build_config_ext.yml"), "etcd: 127.0.0.1:2379\n").expect("write nested build_config_ext");
+        fs::create_dir_all(nested_root.join("fluxon_test_stack"))
+            .expect("create nested fluxon_test_stack dir");
+        fs::write(
+            nested_root.join("fluxon_rs").join("Cargo.toml"),
+            "[workspace]\n",
+        )
+        .expect("write nested cargo toml");
+        fs::write(
+            nested_root.join("build_config_ext.yml"),
+            "etcd: 127.0.0.1:2379\n",
+        )
+        .expect("write nested build_config_ext");
 
         let nested_manifest_dir = nested_root.join("fluxon_rs").join("fluxon_kv");
         fs::create_dir_all(&nested_manifest_dir).expect("create nested manifest dir");
@@ -291,22 +316,68 @@ mod tests {
     fn repo_root_from_manifest_dir_uses_nearest_fluxon_repo_root() {
         let temp_dir = TempDir::new().expect("temp dir");
         let outer_root = temp_dir.path().join("outer_checkout");
-        let nested_root = outer_root.join("runner_run").join("results").join("case_1").join("run_1").join("src");
+        let nested_root = outer_root
+            .join("runner_run")
+            .join("results")
+            .join("case_1")
+            .join("run_1")
+            .join("src");
 
         fs::create_dir_all(outer_root.join(".git")).expect("create outer .git");
         fs::create_dir_all(outer_root.join("fluxon_rs")).expect("create outer fluxon_rs dir");
-        fs::create_dir_all(outer_root.join("fluxon_test_stack")).expect("create outer fluxon_test_stack dir");
-        fs::write(outer_root.join("fluxon_rs").join("Cargo.toml"), "[workspace]\n").expect("write outer cargo toml");
-        fs::write(outer_root.join("build_config_ext.yml"), "etcd: 10.0.0.1:2379\n").expect("write outer build_config_ext");
+        fs::create_dir_all(outer_root.join("fluxon_test_stack"))
+            .expect("create outer fluxon_test_stack dir");
+        fs::write(
+            outer_root.join("fluxon_rs").join("Cargo.toml"),
+            "[workspace]\n",
+        )
+        .expect("write outer cargo toml");
+        fs::write(
+            outer_root.join("build_config_ext.yml"),
+            "etcd: 10.0.0.1:2379\n",
+        )
+        .expect("write outer build_config_ext");
 
         fs::create_dir_all(nested_root.join("fluxon_rs")).expect("create nested fluxon_rs dir");
-        fs::create_dir_all(nested_root.join("fluxon_test_stack")).expect("create nested fluxon_test_stack dir");
-        fs::write(nested_root.join("fluxon_rs").join("Cargo.toml"), "[workspace]\n").expect("write nested cargo toml");
-        fs::write(nested_root.join("build_config_ext.yml"), "etcd: 127.0.0.1:2379\n").expect("write nested build_config_ext");
+        fs::create_dir_all(nested_root.join("fluxon_test_stack"))
+            .expect("create nested fluxon_test_stack dir");
+        fs::write(
+            nested_root.join("fluxon_rs").join("Cargo.toml"),
+            "[workspace]\n",
+        )
+        .expect("write nested cargo toml");
+        fs::write(
+            nested_root.join("build_config_ext.yml"),
+            "etcd: 127.0.0.1:2379\n",
+        )
+        .expect("write nested build_config_ext");
 
         let nested_manifest_dir = nested_root.join("fluxon_rs").join("fluxon_util");
         fs::create_dir_all(&nested_manifest_dir).expect("create nested fluxon_util dir");
         let repo_root = repo_root_from_manifest_dir(&nested_manifest_dir);
         assert_eq!(repo_root, nested_root);
+    }
+
+    #[test]
+    fn locate_build_ext_config_from_anchor_uses_repo_visible_build_config() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let repo_root = temp_dir.path().join("run_1").join("src");
+        let nested_manifest_dir = repo_root.join("fluxon_rs").join("fluxon_util");
+        let build_config_path = repo_root.join("build_config_ext.yml");
+        fs::create_dir_all(repo_root.join("fluxon_test_stack"))
+            .expect("create fluxon_test_stack dir");
+        fs::create_dir_all(repo_root.join("fluxon_rs")).expect("create fluxon_rs dir");
+        fs::write(
+            repo_root.join("fluxon_rs").join("Cargo.toml"),
+            "[workspace]\n",
+        )
+        .expect("write workspace cargo toml");
+        fs::create_dir_all(&nested_manifest_dir).expect("create nested manifest dir");
+        fs::write(&build_config_path, "etcd: 127.0.0.1:2379\n").expect("write build config");
+
+        let anchor = repo_root_from_manifest_dir(&nested_manifest_dir);
+        let located =
+            locate_build_ext_config_from_anchor(&anchor).expect("locate build config from anchor");
+        assert_eq!(located, build_config_path);
     }
 }

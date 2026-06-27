@@ -120,14 +120,12 @@ SCENE_KIND_TEST_STACK = "TEST_STACK"
 CASE_FAMILY_INFER = "infer"
 CASE_FAMILY_CI = "ci"
 CASE_FAMILY_BENCH = "bench"
-INFER_PATTERN_REPEAT = "REPEAT_PROMPTS"
-INFER_PATTERN_UNIQUE = "UNIQUE_PROMPTS"
-INFER_STACK_VLLM_LMCACHE = "VLLM_LMCACHE"
-INFER_STACK_SGLANG_HICACHE = "SGLANG_HICACHE"
 RUN_OUTCOME_SUCCESS = "SUCCESS"
 RUN_OUTCOME_FAILED = "FAILED"
 _RUN_SUMMARY_INCOMPLETE_ERROR = "INCOMPLETE: run started but did not reach finalize; runner likely exited abruptly."
 _RUN_EXCEPTION_FILENAME = "exception.txt"
+_DEBUG_TAIL_MAX_BYTES = 8192
+_TEST_RUNNER_DIAGNOSTIC_VERSION = 2
 CI_PRESERVED_APPLY_IDS_SCHEMA_VERSION = 1
 CI_PRESERVED_APPLY_IDS_FILENAME = "ci_preserved_apply_ids.yaml"
 CI_RUNTIME_CONTRACT_CLUSTER_KV_OWNER = "cluster_kv_owner"
@@ -177,6 +175,11 @@ CI_OWNER_SHARED_BUNDLE_RELPATHS = ("services/share_mem/shared.json", "services/s
 CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S = 600
 CI_RUNNER_READINESS_PROBE_DEADLINE_S = 120
 CI_RUNNER_EXIT_CODE_GRACE_TIMEOUT_S = 300
+CI_RUNNER_TERMINAL_EXIT_CODE_FILE_GRACE_S = 15.0
+CI_RUNNER_STDOUT_TERMINAL_EXIT_CODE_RE = re.compile(
+    r"^\[ci_runner\] (?:wrote|found existing) exit_code=(-?[0-9]+); holding until controller stop$",
+    re.MULTILINE,
+)
 TEST_STACK_REMOTE_STAGE_SHARED_INCLUDE_RELPATHS = (
     "benchmark_config.py",
     "deployer_deploy.yaml",
@@ -407,9 +410,22 @@ def _runner_native_ci_scene_ids() -> Tuple[str, ...]:
     return (
         "ci_top_attention_doc_page_build",
         "ci_top_attention_bin_kvtest",
+        "ci_top_attention_cargo_fs_core",
+        "ci_top_attention_cargo_util",
+        "ci_top_attention_cargo_kv_unit",
+        "ci_top_attention_cargo_cli",
+        "ci_top_attention_cargo_commu",
+        "ci_top_attention_cargo_commu_contract",
+        "ci_top_attention_cargo_framework",
+        "ci_top_attention_cargo_fs",
+        "ci_top_attention_cargo_fs_s3_gateway",
+        "ci_top_attention_cargo_limit_thirdparty",
+        "ci_top_attention_cargo_mq",
+        "ci_top_attention_cargo_observability",
+        "ci_top_attention_cargo_ops",
+        "ci_top_attention_cargo_pyo3",
         "ci_top_attention_log_mgmt",
         "ci_top_attention_mq_core",
-        "ci_top_attention_log_mgmt",
     )
 
 
@@ -550,7 +566,7 @@ def _redirect_process_stdio_to_log(
     - test_runner can run for hours under terminal/session wrappers that may disappear while the
       suite is still executing.
     - A deleted PTY turns ordinary `print(..., flush=True)` into `OSError(EIO)`, which aborts the
-      runner in collect/finalize paths and leaves case_runs.yaml stuck at a reserved run.
+      runner in shutdown/finalize paths and leaves case_runs.yaml stuck at a reserved run.
     - Use a deterministic per-workdir log sink for the whole process, including child subprocesses.
     """
     global _RUNNER_STDIO_LOG_FP
@@ -753,6 +769,12 @@ def main() -> None:
 
     _ui_history_register_workdir(workdir_root)
     _redirect_process_stdio_to_log(workdir_root)
+    print(
+        "[TEST_RUNNER diag] "
+        f"version={_TEST_RUNNER_DIAGNOSTIC_VERSION} action={action} "
+        f"script={Path(__file__).resolve()} workdir={workdir_root.resolve()}",
+        flush=True,
+    )
 
     if action == "clean":
         _clean_workdir(workdir_root)
@@ -865,6 +887,7 @@ def main() -> None:
     )
 
     suite_failed = False
+    failed_case_summaries: List[str] = []
     for planned_case in scheduled:
         case = planned_case.case
         if suite.run_mode == RUN_MODE_FULL_ONCE and planned_case.counted:
@@ -936,6 +959,7 @@ def main() -> None:
         case_plan: Optional[_CasePlan] = None
         case_error: Optional[str] = None
         finalize_error: Optional[str] = None
+        case_debug_emitted = False
 
         try:
             resolved_case = _build_resolved_case_yaml(
@@ -959,7 +983,7 @@ def main() -> None:
             )
             if _case_family_uses_case_plan(case_family):
                 case_plan = _compile_case_plan(resolved_case)
-            if case_family in (CASE_FAMILY_INFER, CASE_FAMILY_CI, CASE_FAMILY_BENCH):
+            if case_family in (CASE_FAMILY_CI, CASE_FAMILY_BENCH):
                 _apply_stable_deploy_names(resolved_case)
                 _sync_case_runtime_model_from_deploy(resolved_case)
 
@@ -975,40 +999,7 @@ def main() -> None:
                     case_plan=case_plan,
                     runtime_tracking=runtime_tracking,
                 )
-            if case_family == CASE_FAMILY_INFER:
-                _ensure_deployer_online(resolved_case)
-                _write_deployer_manifests(resolved_case, run_dir, allow_overwrite=False)
-
-                infer_deploy_attempted = True
-                deploy_result = _run_adapter_action(
-                    resolved_case, run_dir=run_dir, action="deploy"
-                )
-                _validate_deploy_result(resolved_case, deploy_result)
-
-                endpoint_url = _resolved_endpoint_url(resolved_case, deploy_result)
-                _tcp_check_endpoint(endpoint_url)
-
-                infer_out = _run_infer_ai_perf(resolved_case, deploy_result, run_dir)
-                summary = _build_infer_summary_yaml(
-                    resolved_case,
-                    deploy_result,
-                    run_index=run_slot.run_index,
-                    started_at_unix_s=started_at,
-                    finished_at_unix_s=int(time.time()),
-                    outcome=RUN_OUTCOME_SUCCESS,
-                    counted=False,
-                    ai_perf_out=infer_out,
-                )
-                _write_yaml_file(run_dir / "summary.yaml", summary)
-
-                _run_adapter_action(
-                    resolved_case, run_dir=run_dir, action="collect"
-                )
-
-                outcome = RUN_OUTCOME_SUCCESS
-
-
-            elif _case_family_uses_case_plan(case_family):
+            if _case_family_uses_case_plan(case_family):
                 if case_plan is None:
                     raise ValueError(f"internal error: case_plan is missing for case_family={case_family}")
                 prepared_case = _prepare_case(
@@ -1044,23 +1035,17 @@ def main() -> None:
             except Exception as write_exc:  # noqa: BLE001
                 case_error = f"{type(exc).__name__}: {exc} (failed to write {_RUN_EXCEPTION_FILENAME}: {type(write_exc).__name__}: {write_exc})"
             print(f"ERROR: case failed: case_id={case.case_id} err={case_error}")
+            _emit_case_debug_footer(
+                case_id=case.case_id,
+                run_dir=run_dir,
+                summary_path=summary_path,
+                case_runs_path=case_runs_path,
+                reason="case_exception",
+            )
+            case_debug_emitted = True
             outcome = RUN_OUTCOME_FAILED
 
         finally:
-            if case_family == CASE_FAMILY_INFER and resolved_case is not None:
-                try:
-                    if infer_deploy_attempted:
-                        _run_adapter_action(
-                            resolved_case,
-                            run_dir=run_dir,
-                            action="teardown",
-                        )
-                except Exception as exc:
-                    print(
-                        "ERROR: teardown failed; stopping (no fallback). "
-                        f"case_id={case.case_id} err={type(exc).__name__}: {exc}"
-                    )
-                    raise SystemExit(1)
             if case_plan is not None and resolved_case is not None:
                 try:
                     _finalize_case_runtime(
@@ -1076,11 +1061,17 @@ def main() -> None:
                         "ERROR: teardown failed; stopping after finalize (no fallback). "
                         f"case_id={case.case_id} err={finalize_error}"
                     )
-                    if case_family == CASE_FAMILY_BENCH and outcome == RUN_OUTCOME_SUCCESS:
-                        print(
-                            "WARN: TEST_STACK finalize failed after terminal benchmark success; "
-                            f"preserving SUCCESS outcome for case_id={case.case_id} finalize_err={finalize_error}"
-                        )
+                    if _preserve_success_after_finalize_error(case_family=case_family, outcome=outcome):
+                        if case_family == CASE_FAMILY_BENCH:
+                            print(
+                                "WARN: TEST_STACK finalize failed after terminal benchmark success; "
+                                f"preserving SUCCESS outcome for case_id={case.case_id} finalize_err={finalize_error}"
+                            )
+                        else:
+                            print(
+                                "WARN: CI finalize failed after terminal ci_runner success; "
+                                f"preserving SUCCESS outcome for case_id={case.case_id} finalize_err={finalize_error}"
+                            )
                     else:
                         outcome = RUN_OUTCOME_FAILED
                     if suite.run_mode == RUN_MODE_DEBUG_ONE_BY_ONE and outcome != RUN_OUTCOME_SUCCESS:
@@ -1149,13 +1140,54 @@ def main() -> None:
                     )
             except Exception as exc:
                 print(f"ERROR: failed to write/update summary.yaml: {exc}")
+                if not case_debug_emitted:
+                    _emit_case_debug_footer(
+                        case_id=case.case_id,
+                        run_dir=run_dir,
+                        summary_path=summary_path,
+                        case_runs_path=case_runs_path,
+                        reason="summary_update_error",
+                    )
+                    case_debug_emitted = True
                 raise SystemExit(1)
 
             if fatal_stop_after_finalize:
+                if not case_debug_emitted:
+                    _emit_case_debug_footer(
+                        case_id=case.case_id,
+                        run_dir=run_dir,
+                        summary_path=summary_path,
+                        case_runs_path=case_runs_path,
+                        reason="finalize_fatal_stop",
+                    )
+                    case_debug_emitted = True
                 raise SystemExit(1)
 
+        case_result_parts = [
+            f"case_id={case.case_id}",
+            f"run_index={run_slot.run_index}",
+            f"outcome={outcome}",
+            f"counted={counted}",
+            f"summary={summary_path}",
+        ]
+        if case_error is not None:
+            case_result_parts.append(f"case_error={case_error}")
+        if finalize_error is not None:
+            case_result_parts.append(f"finalize_error={finalize_error}")
+        print("[CASE result] " + " ".join(case_result_parts), flush=True)
+
         if outcome != RUN_OUTCOME_SUCCESS:
+            if not case_debug_emitted:
+                _emit_case_debug_footer(
+                    case_id=case.case_id,
+                    run_dir=run_dir,
+                    summary_path=summary_path,
+                    case_runs_path=case_runs_path,
+                    reason="case_failed",
+                )
+                case_debug_emitted = True
             suite_failed = True
+            failed_case_summaries.append(" ".join(case_result_parts))
             # RUN_MODE_DEBUG_ONE_BY_ONE is intended for local iteration: stop at first failure.
             # RUN_MODE_FULL_ONCE should run the whole matrix so we can see every failing case
             # in one case_runs.yaml, then exit non-zero at the end.
@@ -1163,7 +1195,112 @@ def main() -> None:
                 raise SystemExit(1)
 
     if suite_failed:
+        print("[SUITE result] FAILED", flush=True)
+        for summary in failed_case_summaries:
+            print("[SUITE failed_case] " + summary, flush=True)
+        print(f"[SUITE artifacts] case_runs={case_runs_path}", flush=True)
+        _emit_suite_debug_footer(
+            reason="suite_failed",
+            case_runs=case_runs,
+            case_runs_path=case_runs_path,
+            scheduled=scheduled,
+        )
         raise SystemExit(1)
+
+    print(f"[SUITE result] SUCCESS case_runs={case_runs_path}", flush=True)
+    _emit_suite_debug_footer(
+        reason="suite_success",
+        case_runs=case_runs,
+        case_runs_path=case_runs_path,
+        scheduled=scheduled,
+    )
+
+
+def _read_text_tail_for_debug(path: Path, *, max_bytes: int = _DEBUG_TAIL_MAX_BYTES) -> Optional[str]:
+    try:
+        if not path.exists():
+            return None
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - int(max_bytes)), os.SEEK_SET)
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001
+        return f"<failed to read debug tail: {type(exc).__name__}: {exc}>"
+
+
+def _emit_debug_file_tail(label: str, path: Path, *, max_bytes: int = _DEBUG_TAIL_MAX_BYTES) -> None:
+    resolved = path.resolve()
+    text = _read_text_tail_for_debug(resolved, max_bytes=max_bytes)
+    print(f"[DEBUG file] label={label} path={resolved} exists={text is not None}", flush=True)
+    if text is None:
+        return
+    print(f"[DEBUG file_tail_begin] label={label} max_bytes={int(max_bytes)}", flush=True)
+    if text:
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+    print(f"[DEBUG file_tail_end] label={label}", flush=True)
+
+
+def _emit_case_debug_footer(
+    *,
+    case_id: str,
+    run_dir: Path,
+    summary_path: Path,
+    case_runs_path: Path,
+    reason: str,
+) -> None:
+    try:
+        print(
+            "[CASE debug] "
+            f"reason={reason} case_id={case_id} run_dir={run_dir.resolve()} "
+            f"summary={summary_path.resolve()} case_runs={case_runs_path.resolve()}",
+            flush=True,
+        )
+        _emit_debug_file_tail("summary.yaml", summary_path)
+        _emit_debug_file_tail(_RUN_EXCEPTION_FILENAME, run_dir / _RUN_EXCEPTION_FILENAME)
+        _emit_debug_file_tail("ci_runner.exit_code", run_dir / "logs" / "ci_runner" / "exit_code.txt")
+        _emit_debug_file_tail("ci_runner.stdout", run_dir / "logs" / "ci_runner" / "stdout.log")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[CASE debug] failed to emit debug footer: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _emit_suite_debug_footer(
+    *,
+    reason: str,
+    case_runs: Dict[str, Any],
+    case_runs_path: Path,
+    scheduled: List[_PlannedCase],
+) -> None:
+    try:
+        print(
+            "[SUITE debug] "
+            f"version={_TEST_RUNNER_DIAGNOSTIC_VERSION} reason={reason} "
+            f"scheduled={len(scheduled)} case_runs={case_runs_path.resolve()}",
+            flush=True,
+        )
+        run_map = _case_runs_map(case_runs)
+        for planned_case in scheduled:
+            case_id = planned_case.case.case_id
+            rec = run_map.get(case_id)
+            if rec is None:
+                print(f"[SUITE debug_case] case_id={case_id} missing_in_case_runs=true", flush=True)
+                continue
+            last_run = rec.get("last_run")
+            last_run_json = json.dumps(last_run, sort_keys=True, separators=(",", ":"))
+            print(
+                "[SUITE debug_case] "
+                f"case_id={case_id} counted={planned_case.counted} "
+                f"total_runs={rec.get('total_runs')} success_runs={rec.get('success_runs')} "
+                f"failed_runs={rec.get('failed_runs')} counted_runs={rec.get('counted_runs')} "
+                f"last_run={last_run_json}",
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[SUITE debug] failed to emit debug footer: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _load_yaml_file(path: Path) -> Any:
@@ -2406,7 +2543,7 @@ def _resolved_case_ops_namespace(resolved_case: Dict[str, Any]) -> str:
 def _apply_stable_deploy_names(resolved_case: Dict[str, Any]) -> None:
     """Rewrite deploy.instances[].k8s_ref into a stable logical deployment name.
 
-    For CI/infer, replacement semantics follow the logical case identity and stay rerun-stable.
+    For CI cases, replacement semantics follow the logical case identity and stay rerun-stable.
     For TEST_STACK benchmark workloads, names are additionally scoped by run_dir hash so a stale
     controller/runtime from an older runner cannot collide with the current run.
     """
@@ -2433,8 +2570,6 @@ def _apply_stable_deploy_names(resolved_case: Dict[str, Any]) -> None:
 
 def _resolved_case_kind(resolved_case: Dict[str, Any]) -> str:
     scene = _require_dict(resolved_case.get("scene"), "resolved_case.scene")
-    if scene.get("infer") is not None:
-        return SCENE_KIND_INFER
     if scene.get("ci") is not None:
         return SCENE_KIND_CI
     if scene.get("test_stack") is not None:
@@ -2445,7 +2580,7 @@ def _resolved_case_kind(resolved_case: Dict[str, Any]) -> str:
 def _resolved_case_family(resolved_case: Dict[str, Any]) -> str:
     case = _require_dict(resolved_case.get("case"), "resolved_case.case")
     family = _require_str(case.get("family"), "resolved_case.case.family")
-    if family not in (CASE_FAMILY_INFER, CASE_FAMILY_CI, CASE_FAMILY_BENCH):
+    if family not in (CASE_FAMILY_CI, CASE_FAMILY_BENCH):
         raise ValueError(f"resolved_case.case.family unsupported: {family!r}")
     return family
 
@@ -2472,8 +2607,6 @@ def _ci_runtime_contract_id(resolved_case: Dict[str, Any]) -> str:
 
 
 def _case_family_id(case_kind: str) -> str:
-    if case_kind == SCENE_KIND_INFER:
-        return CASE_FAMILY_INFER
     if case_kind == SCENE_KIND_CI:
         return CASE_FAMILY_CI
     if case_kind == SCENE_KIND_TEST_STACK:
@@ -2515,7 +2648,7 @@ def _close_case_runtime_locks(runtime_tracking: _CaseRuntimeTracking) -> None:
 def _build_runtime_model(case_family: str) -> Dict[str, Any]:
     if case_family == CASE_FAMILY_CI:
         case_instance_ids = list(CI_RUNTIME_LAYER_INSTANCE_IDS[RUNTIME_LAYER_CASE])
-    elif case_family in (CASE_FAMILY_INFER, CASE_FAMILY_BENCH):
+    elif case_family == CASE_FAMILY_BENCH:
         case_instance_ids = []
     else:
         raise ValueError(f"unsupported runtime model case family: {case_family}")
@@ -2616,9 +2749,6 @@ def _compile_case_runtime_artifacts(
         test_stack_meta = _compile_test_stack_case(resolved_case, run_index=run_index)
         _sync_case_runtime_model_from_deploy(resolved_case)
         return test_stack_meta
-    if case_family == CASE_FAMILY_INFER:
-        _sync_case_runtime_model_from_deploy(resolved_case)
-        return None
     raise ValueError(f"unsupported case family for runtime artifact compilation: {case_family}")
 
 
@@ -3063,16 +3193,6 @@ def _deploy_runtime_phase(
     return _deploy_runtime_phase_after_stage(resolved_case, run_dir=run_dir, phase=phase)
 
 
-def _collect_runtime_phase(
-    resolved_case: Dict[str, Any],
-    *,
-    run_dir: Path,
-    phase: _RuntimePhase,
-) -> None:
-    _write_runtime_phase_inputs(resolved_case, run_dir=run_dir, phase=phase)
-    _run_adapter_action(resolved_case, run_dir=run_dir, action="collect")
-
-
 def _ci_cluster_runtime_stage(resolved_case: Dict[str, Any]) -> _RemoteRunDirStage:
     verify_relpaths = list(CI_CLUSTER_RUNTIME_REMOTE_STAGE_VERIFY_RELPATHS)
     if _ci_has_instance(resolved_case, instance_id="owner_0"):
@@ -3126,12 +3246,6 @@ def _ci_runtime_phase(resolved_case: Dict[str, Any], phase_id: str) -> _RuntimeP
             write_ctx="CI",
             stage_run_dir=_ci_runner_runtime_stage(resolved_case),
         ),
-        "collect_all": _RuntimePhase(
-            phase_id="collect_all",
-            layer=RUNTIME_LAYER_CASE,
-            instance_ids=CI_RUNTIME_INSTANCE_IDS,
-            write_ctx="CI",
-        ),
     }
     try:
         return phases[phase_id]
@@ -3183,24 +3297,6 @@ def _test_stack_runtime_phase(
             write_ctx="TEST_STACK",
             stage_run_dir=stage_run_dir,
         )
-    if phase_id == "collect_nodes":
-        if node_ids is None or not node_ids:
-            raise ValueError("TEST_STACK collect_nodes phase requires non-empty node_ids")
-        return _RuntimePhase(
-            phase_id="collect_nodes",
-            layer=RUNTIME_LAYER_CASE,
-            instance_ids=node_ids,
-            write_ctx="TEST_STACK",
-        )
-    if phase_id == "collect_coordinator":
-        if node_ids is not None:
-            raise ValueError("TEST_STACK collect_coordinator phase does not accept node_ids")
-        return _RuntimePhase(
-            phase_id="collect_coordinator",
-            layer=RUNTIME_LAYER_CASE,
-            instance_ids=("coordinator",),
-            write_ctx="TEST_STACK",
-        )
     raise ValueError(f"unsupported TEST_STACK runtime phase: {phase_id}")
 
 
@@ -3227,14 +3323,6 @@ def _compile_case_plan(resolved_case: Dict[str, Any]) -> _CasePlan:
             prepare_phases=prepare_phases,
             execute_phases=(
                 _ci_runtime_phase(resolved_case, "ci_runner"),
-            ),
-            collect_phases=(
-                _RuntimePhase(
-                    phase_id="collect_all",
-                    layer=RUNTIME_LAYER_CASE,
-                    instance_ids=case_instance_ids,
-                    write_ctx="CI",
-                ),
             ),
         )
     if case_family == CASE_FAMILY_BENCH:
@@ -3290,15 +3378,6 @@ def _compile_case_plan(resolved_case: Dict[str, Any]) -> _CasePlan:
                     phase_id="nodes",
                     node_ids=node_ids_tuple,
                     include_stage_run_dir=False,
-                ),
-            ),
-            collect_phases=(
-                _test_stack_runtime_phase(phase_id="collect_nodes", node_ids=node_ids_tuple),
-                _RuntimePhase(
-                    phase_id="collect_coordinator",
-                    layer=RUNTIME_LAYER_CASE,
-                    instance_ids=prepare_ids_tuple,
-                    write_ctx="TEST_STACK",
                 ),
             ),
         )
@@ -3502,12 +3581,14 @@ def _finalize_ci_case_runtime(
 def _finalize_test_stack_case_runtime(
     resolved_case: Dict[str, Any],
     *,
+    run_dir: Path,
     runtime_tracking: _CaseRuntimeTracking,
     outcome: str,
 ) -> None:
     _finalize_test_stack_case_runtime_impl(
         ctx=sys.modules[__name__],
         resolved_case=resolved_case,
+        run_dir=run_dir,
         runtime_tracking=runtime_tracking,
         outcome=outcome,
     )
@@ -3650,6 +3731,14 @@ def _ci_base_runtime_service_url(resolved_case: Dict[str, Any], *, service_id: s
 def _resolved_run_dir_path(resolved_case: Dict[str, Any]) -> Path:
     runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
     return Path(_require_str(runtime.get("run_dir"), "runtime.run_dir")).resolve()
+
+
+def _resolved_case_run_index(resolved_case: Dict[str, Any]) -> int:
+    run_dir = _resolved_run_dir_path(resolved_case)
+    run_index = _ui_parse_run_index(run_dir.name)
+    if run_index is None:
+        raise ValueError(f"resolved_case.runtime.run_dir must end with run_<N>: {run_dir}")
+    return int(run_index)
 
 
 def _ci_share_mem_path(resolved_case: Dict[str, Any], *, run_dir: Path) -> str:
@@ -3893,10 +3982,62 @@ def _ci_local_runtime_targets(resolved_case: Dict[str, Any]) -> set[str]:
     return out
 
 
+def _ci_kv_master_port(resolved_case: Dict[str, Any]) -> Optional[int]:
+    profile = _require_dict(resolved_case.get("profile"), "resolved_case.profile")
+    profile_test_stack = profile.get("test_stack")
+    if profile_test_stack is None:
+        return None
+    profile_test_stack = _require_dict(profile_test_stack, "resolved_case.profile.test_stack")
+    backend_kind = _require_test_stack_backend_kind(
+        profile_test_stack.get("kind"),
+        "resolved_case.profile.test_stack.kind",
+    )
+    if backend_kind != TEST_STACK_BACKEND_FLUXON:
+        return None
+    port_alloc = _require_dict(profile_test_stack.get("port_alloc"), "profile.test_stack.port_alloc")
+    kv_master_port_base = _require_int(
+        port_alloc.get("kv_master_port_base"),
+        "profile.test_stack.port_alloc.kv_master_port_base",
+        min_v=1,
+    )
+    kv_master_port_stride = _require_int(
+        port_alloc.get("kv_master_port_stride"),
+        "profile.test_stack.port_alloc.kv_master_port_stride",
+        min_v=1,
+    )
+    run_index = _resolved_case_run_index(resolved_case)
+    runner_root = _test_stack_runner_root(_resolved_run_dir_path(resolved_case))
+    master_port_slot_offset = _test_stack_runner_port_slot(
+        runner_root=runner_root,
+        stride=kv_master_port_stride,
+    )
+    kv_master_port = (
+        int(kv_master_port_base)
+        + int(kv_master_port_stride) * int(run_index - 1)
+        + int(master_port_slot_offset)
+    )
+    if kv_master_port <= 0 or kv_master_port > 65535:
+        raise ValueError(f"computed kv_master_port out of range: {kv_master_port}")
+    return int(kv_master_port)
+
+
 def _ci_required_ports(resolved_case: Dict[str, Any]) -> List[Tuple[str, int]]:
     resolved_case = _ci_runtime_cleanup_case(resolved_case, ctx="CI required ports")
-    _ = _ci_local_runtime_targets(resolved_case)
-    return []
+    local_targets = _ci_local_runtime_targets(resolved_case)
+    if not local_targets:
+        return []
+    required_ports: List[Tuple[str, int]] = []
+    if "master" in set(_ci_case_instance_ids(resolved_case)):
+        master_instance = _find_deploy_instance(resolved_case, instance_id="master")
+        master_target = _require_str(
+            _require_dict(master_instance.get("deployer"), "master.deployer").get("target"),
+            "master.target",
+        )
+        if master_target in local_targets:
+            kv_master_port = _ci_kv_master_port(resolved_case)
+            if kv_master_port is not None:
+                required_ports.append(("ci master", int(kv_master_port)))
+    return required_ports
 
 
 def _ci_assert_ports_free(resolved_case: Dict[str, Any]) -> None:
@@ -6933,6 +7074,162 @@ def _runner_native_ci_commands_for_case(case: _ResolvedCase, *, ctx: str) -> Lis
                 "timeout_seconds": 21600,
             }
         ]
+    if scene_id == "ci_top_attention_cargo_fs_core":
+        return [
+            {
+                "id": "top_attention_cargo_fs_core",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs_core.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_util":
+        return [
+            {
+                "id": "top_attention_cargo_util",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_util.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_kv_unit":
+        return [
+            {
+                "id": "top_attention_cargo_kv_unit",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_kv_unit.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_cli":
+        return [
+            {
+                "id": "top_attention_cargo_cli",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_cli.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_commu":
+        return [
+            {
+                "id": "top_attention_cargo_commu",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_commu.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_commu_contract":
+        return [
+            {
+                "id": "top_attention_cargo_commu_contract",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_commu_contract.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_framework":
+        return [
+            {
+                "id": "top_attention_cargo_framework",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_framework.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_fs":
+        return [
+            {
+                "id": "top_attention_cargo_fs",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_fs_s3_gateway":
+        return [
+            {
+                "id": "top_attention_cargo_fs_s3_gateway",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs_s3_gateway.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_limit_thirdparty":
+        return [
+            {
+                "id": "top_attention_cargo_limit_thirdparty",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_limit_thirdparty.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_mq":
+        return [
+            {
+                "id": "top_attention_cargo_mq",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_mq.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_observability":
+        return [
+            {
+                "id": "top_attention_cargo_observability",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_observability.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_ops":
+        return [
+            {
+                "id": "top_attention_cargo_ops",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_ops.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_pyo3":
+        return [
+            {
+                "id": "top_attention_cargo_pyo3",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_pyo3.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
     if scene_id == "ci_top_attention_log_mgmt":
         return [
             {
@@ -7828,6 +8125,23 @@ def _build_resolved_case_yaml(
                 "runtime": selected_runtime,
             },
         }
+        profile_ts = profile_runtime_src.get("test_stack")
+        if profile_ts is not None:
+            profile_ts = _require_dict(profile_ts, "resolved_case.profile_source.runtime.test_stack")
+            backend_kind = _require_test_stack_backend_kind(
+                profile_ts.get("kind"),
+                "resolved_case.profile_source.test_stack.kind",
+            )
+            port_alloc = _resolve_test_stack_port_alloc(
+                profile_ts.get("port_alloc"),
+                topology=topology,
+                backend_kind=backend_kind,
+                ctx="resolved_case.profile_source.test_stack.port_alloc",
+            )
+            profile["test_stack"] = {
+                "kind": backend_kind,
+                "port_alloc": port_alloc,
+            }
         if selected_scene_config is not None:
             profile["ci"]["scene_config"] = selected_scene_config
     elif case_family == CASE_FAMILY_BENCH:
@@ -11010,9 +11324,10 @@ def _ci_cleanup_runtime(
     resolved_case: Dict[str, Any],
     *,
     timeout_s: int,
+    instance_ids: Optional[List[str]] = None,
 ) -> None:
     cleanup_case = _ci_runtime_cleanup_case(resolved_case, ctx="CI cleanup runtime")
-    for entry in _ci_runtime_current_apply_ids(cleanup_case):
+    for entry in _ci_runtime_current_apply_ids(cleanup_case, instance_ids=instance_ids):
         apply_id = _require_str(entry.get("apply_id"), "current_apply_entry.apply_id")
         instance_ids = _require_list(entry.get("instance_ids"), "current_apply_entry.instance_ids")
         instance_id_text = ",".join(
@@ -11245,7 +11560,7 @@ def _run_adapter_action(
     run_dir: Path,
     action: str,
 ) -> Optional[Dict[str, Any]]:
-    if action not in ("deploy", "collect", "teardown"):
+    if action not in ("deploy", "teardown"):
         raise ValueError(f"invalid adapter action: {action}")
 
     deploy = _require_dict(resolved_case.get("deploy"), "resolved_case.deploy")
@@ -11278,7 +11593,14 @@ def _run_subprocess(argv: List[str], *, cwd: str) -> None:
     print("RUN:", " ".join(_shell_quote(a) for a in argv), flush=True)
     proc = subprocess.run(argv, cwd=cwd)
     if proc.returncode != 0:
-        raise RuntimeError(f"command failed: rc={proc.returncode}")
+        raise RuntimeError(
+            "command failed: "
+            f"rc={proc.returncode} cwd={cwd} argv={' '.join(_shell_quote(a) for a in argv)}"
+        )
+
+
+def _preserve_success_after_finalize_error(*, case_family: str, outcome: str) -> bool:
+    return outcome == RUN_OUTCOME_SUCCESS and case_family in (CASE_FAMILY_BENCH, CASE_FAMILY_CI)
 
 
 _SSH_TRANSPORT_TIMEOUT_SECONDS = 180.0
@@ -11776,17 +12098,24 @@ def _cleanup_skipped_case_desired_applies(*, controller_url: str, case_id: str) 
         time.sleep(1.0)
 
 
-def _ci_runtime_current_apply_ids(resolved_case: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _ci_runtime_current_apply_ids(
+    resolved_case: Dict[str, Any],
+    *,
+    instance_ids: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     cleanup_case = _ci_runtime_cleanup_case(resolved_case, ctx="CI current runtime apply ids")
     deploy = _require_dict(cleanup_case.get("deploy"), "resolved_case.deploy")
     controller_url = _require_str(deploy.get("controller_url"), "deploy.controller_url").rstrip("/")
     deploy_instances = _require_list(deploy.get("instances"), "resolved_case.deploy.instances")
+    allowed_instance_ids = None if instance_ids is None else set(instance_ids)
 
     workload_to_instance_ids: Dict[Tuple[str, str], List[str]] = {}
     for raw in deploy_instances:
         inst = _require_dict(raw, "resolved_case.deploy.instances[]")
         instance_id = _require_str(inst.get("id"), "resolved_case.deploy.instances[].id")
         if instance_id not in set(_ci_case_instance_ids(cleanup_case)):
+            continue
+        if allowed_instance_ids is not None and instance_id not in allowed_instance_ids:
             continue
         k8s_ref = _require_str(inst.get("k8s_ref"), f"{instance_id}.k8s_ref")
         kind, name = _ops_kind_from_k8s_ref(k8s_ref, ctx=f"{instance_id}.k8s_ref")
@@ -13894,11 +14223,14 @@ def _write_ci_master_owner_configs(
     owner_dram_bytes: int,
 ) -> tuple[Path, Path]:
     owner_work_root = run_dir / "services" / "owner_0"
+    kv_master_port = _ci_kv_master_port(resolved_case)
+    if kv_master_port is None:
+        raise ValueError("CI cluster runtime requires resolved_case.profile.test_stack port_alloc for ci_master")
     master_cfg = {
         "etcd_endpoints": ["__ETCD__"],
         "cluster_name": cluster_name,
         "instance_key": "ci_master",
-        "port": 50052,
+        "port": int(kv_master_port),
         "monitoring": {
             "prometheus_base_url": "__PROM_BASE__",
             "prom_remote_write_url": ["__PROM_WRITE__"],
@@ -14768,7 +15100,7 @@ def _print_ci_wait_progress(
     last_offset: int,
     next_heartbeat_at: float,
     deadline: float,
-) -> tuple[int, float]:
+) -> tuple[int, float, str]:
     now = time.time()
     next_offset, chunk = _ci_wait_progress_tail(
         resolved_case,
@@ -14780,7 +15112,7 @@ def _print_ci_wait_progress(
         if text:
             sys.stdout.write(_ci_log_prefix_lines(text + "\n", now=now))
             sys.stdout.flush()
-        return next_offset, now + _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS
+        return next_offset, now + _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS, chunk
     if now >= next_heartbeat_at:
         remaining_s = max(0, int(deadline - now))
         print(
@@ -14789,8 +15121,8 @@ def _print_ci_wait_progress(
             f"log={str((run_dir / 'logs' / 'ci_runner' / 'stdout.log').resolve())}",
             flush=True,
         )
-        return next_offset, now + _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS
-    return next_offset, next_heartbeat_at
+        return next_offset, now + _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS, ""
+    return next_offset, next_heartbeat_at, ""
 
 
 def _instance_file_exists(
@@ -15149,6 +15481,124 @@ def _wait_instance_exit(
         time.sleep(2.0)
 
 
+def _parse_ci_runner_exit_code_text(*, raw: str, path: Path, ctx: str) -> int:
+    try:
+        rc = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{ctx}: path={path} raw={raw!r}") from exc
+    return _require_int(rc, ctx, min_v=-255)
+
+
+def _parse_ci_runner_stdout_terminal_exit_code(
+    *,
+    raw: str,
+    path: Path,
+    ctx: str,
+) -> Optional[int]:
+    matches = list(CI_RUNNER_STDOUT_TERMINAL_EXIT_CODE_RE.finditer(raw))
+    if not matches:
+        return None
+    rc_text = matches[-1].group(1)
+    return _parse_ci_runner_exit_code_text(raw=rc_text, path=path, ctx=ctx)
+
+
+def _read_ci_runner_stdout_terminal_exit_code_if_present(
+    *,
+    resolved_case: Dict[str, Any],
+    run_dir: Path,
+    ctx: str,
+) -> Optional[int]:
+    stdout_path = (run_dir / "logs" / "ci_runner" / "stdout.log").resolve()
+    stdout_raw = _instance_read_text_if_present(
+        resolved_case,
+        instance_id="ci_runner",
+        path=stdout_path,
+    )
+    if stdout_raw is None:
+        return None
+    return _parse_ci_runner_stdout_terminal_exit_code(
+        raw=stdout_raw,
+        path=stdout_path,
+        ctx=ctx,
+    )
+
+
+def _read_ci_runner_exit_code_if_present(
+    *,
+    resolved_case: Dict[str, Any],
+    run_dir: Path,
+    baseline_state: Optional[_ObservedFileState],
+    local_ctx: str,
+    remote_ctx: str,
+) -> Optional[int]:
+    exit_code_path = (run_dir / "logs" / "ci_runner" / "exit_code.txt").resolve()
+    current_state = _observe_file_state(exit_code_path)
+    if _has_new_file_state(before=baseline_state, after=current_state):
+        raw = exit_code_path.read_text(encoding="utf-8")
+        if not raw.strip():
+            return _read_ci_runner_stdout_terminal_exit_code_if_present(
+                resolved_case=resolved_case,
+                run_dir=run_dir,
+                ctx=local_ctx + ".stdout",
+            )
+        return _parse_ci_runner_exit_code_text(
+            raw=raw,
+            path=exit_code_path,
+            ctx=local_ctx,
+        )
+    remote_raw = _instance_read_text_if_present(
+        resolved_case,
+        instance_id="ci_runner",
+        path=exit_code_path,
+    )
+    if remote_raw is None:
+        return _read_ci_runner_stdout_terminal_exit_code_if_present(
+            resolved_case=resolved_case,
+            run_dir=run_dir,
+            ctx=remote_ctx + ".stdout",
+        )
+    if not remote_raw.strip():
+        return _read_ci_runner_stdout_terminal_exit_code_if_present(
+            resolved_case=resolved_case,
+            run_dir=run_dir,
+            ctx=remote_ctx + ".stdout",
+        )
+    return _parse_ci_runner_exit_code_text(
+        raw=remote_raw,
+        path=exit_code_path,
+        ctx=remote_ctx,
+    )
+
+
+def _wait_ci_runner_exit_code_file_after_terminal_status(
+    *,
+    resolved_case: Dict[str, Any],
+    run_dir: Path,
+    baseline_state: Optional[_ObservedFileState],
+    status_exit_code: int,
+) -> Optional[int]:
+    deadline = time.time() + float(CI_RUNNER_TERMINAL_EXIT_CODE_FILE_GRACE_S)
+    while True:
+        rc = _read_ci_runner_exit_code_if_present(
+            resolved_case=resolved_case,
+            run_dir=run_dir,
+            baseline_state=baseline_state,
+            local_ctx="ci_runner.exit_code",
+            remote_ctx="ci_runner.remote_exit_code",
+        )
+        if rc is not None:
+            if rc != int(status_exit_code):
+                print(
+                    "[CI wait exit_code] controller reported terminal process exit before exit_code.txt "
+                    f"became readable; preferring exit_code.txt rc={rc} controller_exit_code={status_exit_code}",
+                    flush=True,
+                )
+            return rc
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.5)
+
+
 def _wait_ci_runner_exit_code_resume(
     *,
     resolved_case: Dict[str, Any],
@@ -15172,19 +15622,15 @@ def _wait_ci_runner_exit_code_resume(
     deadline = time.time() + float(timeout_s)
     last_status_err: str | None = None
     while True:
-        raw = _instance_read_text_if_present(
-            resolved_case,
-            instance_id="ci_runner",
-            path=exit_code_path,
+        rc_from_file = _read_ci_runner_exit_code_if_present(
+            resolved_case=resolved_case,
+            run_dir=run_dir,
+            baseline_state=None,
+            local_ctx="ci_runner.resume_exit_code",
+            remote_ctx="ci_runner.resume_exit_code",
         )
-        if raw is not None:
-            try:
-                rc = int(raw.strip())
-            except ValueError as exc:
-                raise ValueError(
-                    f"ci_runner remote exit_code file is not an int: path={exit_code_path} raw={raw!r}"
-                ) from exc
-            return _require_int(rc, "ci_runner.resume_exit_code", min_v=-255)
+        if rc_from_file is not None:
+            return rc_from_file
 
         try:
             status = _instance_status(resolved_case, instance_id="ci_runner")
@@ -15201,7 +15647,16 @@ def _wait_ci_runner_exit_code_resume(
             continue
         status_exit_code = status.get("exit_code")
         if status.get("ok") is True and status.get("running") is False and isinstance(status_exit_code, int):
-            return _require_int(status_exit_code, "ci_runner.resume.status.exit_code", min_v=-255)
+            status_exit_code_i = _require_int(status_exit_code, "ci_runner.resume.status.exit_code", min_v=-255)
+            rc_after_grace = _wait_ci_runner_exit_code_file_after_terminal_status(
+                resolved_case=resolved_case,
+                run_dir=run_dir,
+                baseline_state=None,
+                status_exit_code=status_exit_code_i,
+            )
+            if rc_after_grace is not None:
+                return rc_after_grace
+            return status_exit_code_i
         if status.get("ok") is True and status.get("running") is False:
             # Deterministic behavior:
             # - If controller no longer reports desired workloads for this case, the CI runner cannot start.
@@ -15245,38 +15700,35 @@ def _wait_ci_runner_exit_code(
     last_status_err: str | None = None
     log_offset = 0
     next_heartbeat_at = 0.0
+    stdout_terminal_tail = ""
+    stdout_path = (run_dir / "logs" / "ci_runner" / "stdout.log").resolve()
     while True:
-        log_offset, next_heartbeat_at = _print_ci_wait_progress(
+        log_offset, next_heartbeat_at, stdout_chunk = _print_ci_wait_progress(
             resolved_case,
             run_dir=run_dir,
             last_offset=log_offset,
             next_heartbeat_at=next_heartbeat_at,
             deadline=deadline,
         )
+        if stdout_chunk:
+            stdout_terminal_tail = (stdout_terminal_tail + stdout_chunk)[-4096:]
+            rc_from_stdout_tail = _parse_ci_runner_stdout_terminal_exit_code(
+                raw=stdout_terminal_tail,
+                path=stdout_path,
+                ctx="ci_runner.stdout_progress",
+            )
+            if rc_from_stdout_tail is not None:
+                return rc_from_stdout_tail
         current_state = _observe_file_state(exit_code_path)
-        if _has_new_file_state(before=baseline_state, after=current_state):
-            raw = exit_code_path.read_text(encoding="utf-8").strip()
-            try:
-                rc = int(raw)
-            except ValueError as exc:
-                raise ValueError(
-                    f"ci_runner exit_code file is not an int: path={exit_code_path} raw={raw!r}"
-                ) from exc
-            return _require_int(rc, "ci_runner.exit_code", min_v=-255)
-        remote_raw = _instance_read_text_if_present(
-            resolved_case,
-            instance_id="ci_runner",
-            path=exit_code_path,
+        rc_from_file = _read_ci_runner_exit_code_if_present(
+            resolved_case=resolved_case,
+            run_dir=run_dir,
+            baseline_state=baseline_state,
+            local_ctx="ci_runner.exit_code",
+            remote_ctx="ci_runner.remote_exit_code",
         )
-        if remote_raw is not None:
-            raw = remote_raw.strip()
-            try:
-                rc = int(raw)
-            except ValueError as exc:
-                raise ValueError(
-                    f"ci_runner remote exit_code file is not an int: path={exit_code_path} raw={raw!r}"
-                ) from exc
-            return _require_int(rc, "ci_runner.remote_exit_code", min_v=-255)
+        if rc_from_file is not None:
+            return rc_from_file
         try:
             status = _instance_status(resolved_case, instance_id="ci_runner")
         except _HttpGetJsonTransientError as exc:
@@ -15290,7 +15742,16 @@ def _wait_ci_runner_exit_code(
             continue
         status_exit_code = status.get("exit_code")
         if status.get("ok") is True and status.get("running") is False and isinstance(status_exit_code, int):
-            return _require_int(status_exit_code, "ci_runner.status.exit_code", min_v=-255)
+            status_exit_code_i = _require_int(status_exit_code, "ci_runner.status.exit_code", min_v=-255)
+            rc_after_grace = _wait_ci_runner_exit_code_file_after_terminal_status(
+                resolved_case=resolved_case,
+                run_dir=run_dir,
+                baseline_state=baseline_state,
+                status_exit_code=status_exit_code_i,
+            )
+            if rc_after_grace is not None:
+                return rc_after_grace
+            return status_exit_code_i
         if status.get("ok") is True and status.get("running") is False:
             # Deterministic behavior:
             # - If controller no longer reports desired workloads for this case, the CI runner cannot start.

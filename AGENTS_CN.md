@@ -1,6 +1,7 @@
 保持本文档简洁。
 - 核心用户文档、开发文档和设计文档都在仓库内的 `fluxon_doc_cn/` 和 `fluxon_doc_en/` 下
 - 详细的中英文文档写作规约索引见 `fluxon_doc_cn/dev_doc/开发者 - 3 - 文档写作规约.md` 和 `fluxon_doc_en/dev_doc/Developer - 3 - Documentation Writing Rules.md`
+- `teststack` 架构与测试入口 / helper 设计规则索引见 [fluxon_doc_cn/design/teststack_1_当前架构与CI测试流程.md](fluxon_doc_cn/design/teststack_1_当前架构与CI测试流程.md)
 - `teststack` 有两个步骤：`start testbed` 和 `testrunner`
 - `teststack` 支持 UI；`testrunner` 应负责 UI 的 authority 和 API surface，但 UI 应作为常驻服务运行，并复用下层的 ops 接口
 - 本项目所有 Python 代码都必须兼容 Python `>= 3.10`
@@ -9,6 +10,9 @@
 - Git 操作仅限基础的 `stage`、`unstage`、`commit` 和 `push`。不要使用其他 Git 操作
 - 默认优先收束而不是兼容。除非任务明确要求，否则不要添加兼容层、废弃路径或别名
 - 一个概念优先只保留一个正式名字。避免同义参数、重复入口和并行配置面
+- 普通参数传递禁止使用环境变量。优先配置文件，其次使用显式命令行参数
+- 优先约定优于配置。如果一个规范路径或默认接线已经足够，就不要再增加额外配置旋钮
+- 尽量减少多路径配置传递。不要同时通过环境变量、命令参数、文件等并行通道传递同一份配置
 - 对测试入口，要直接匹配真实执行模型。如果测试本质上是独立脚本 / 独立进程测试，就按脚本 / 进程直接启动；不要为了表面统一再额外包一层 `pytest`
 - 对直接启动进程的测试包装器，不要透传 `-k`、`-q`、node selector 等 pytest 风格参数，除非该包装器显式实现并文档化了这组筛选接口
 - 新增集成测试或进程生命周期测试时，优先采用“直接启动进程 + 显式参数 + 显式检查退出码”的模式，而不是继续新增 pytest 专用包装层

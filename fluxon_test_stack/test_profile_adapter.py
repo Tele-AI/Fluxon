@@ -795,7 +795,6 @@ def _action_deploy(
     _write_yaml_file(logs_dir / "deploy_response.yaml", deploy_resp)
 
 
-
 def _action_collect(run_dir: Path, controller_url: str, instances: List[_InstanceReq]) -> None:
     logs_dir = run_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -806,8 +805,8 @@ def _action_collect(run_dir: Path, controller_url: str, instances: List[_Instanc
 
         # English note:
         # - /api/status is an observability endpoint. During transient runtime failures (e.g. P2P timeouts)
-        #   the controller may return a non-2xx HTTP status. Treat that as a captured status, not as a
-        #   hard failure of the "collect" phase, so the runner can still finalize deterministically using
+        #   the controller may return a non-2xx HTTP status. Treat that as captured status, not as a
+        #   hard failure of the collect phase, so the runner can still finalize deterministically using
         #   terminal artifacts (summary.yaml / benchmark_result.json).
         status_code, status = _http_status_allow_error(
             controller_url,
@@ -817,6 +816,7 @@ def _action_collect(run_dir: Path, controller_url: str, instances: List[_Instanc
             inst.authority,
         )
         _write_yaml_file(inst_dir / "status.yaml", {"status_code": int(status_code), "status": status})
+
 
 
 def _action_teardown(controller_url: str, instances: List[_InstanceReq]) -> None:
@@ -1029,6 +1029,21 @@ def _wait_running(
         time.sleep(1.0)
 
 
+def _http_status_allow_error(
+    controller_url: str,
+    target: str,
+    kind: str,
+    name: str,
+    authority: str,
+) -> tuple[int, Dict[str, Any]]:
+    qs = urllib.parse.urlencode(
+        {"target": target, "kind": kind, "name": name, "authority": authority}
+    )
+    url = controller_url + "/api/status?" + qs
+    req = _new_controller_request(url, method="GET")
+    return _http_json_allow_error_status(req)
+
+
 def _http_deploy(controller_url: str, yaml_text: str) -> Dict[str, Any]:
     url = controller_url + "/api/deploy"
     data = yaml_text.encode("utf-8")
@@ -1172,21 +1187,6 @@ def _http_status(controller_url: str, target: str, kind: str, name: str) -> Dict
     url = controller_url + "/api/status?" + qs
     req = _new_controller_request(url, method="GET")
     return _http_json(req)
-
-
-def _http_status_allow_error(
-    controller_url: str,
-    target: str,
-    kind: str,
-    name: str,
-    authority: str,
-) -> tuple[int, Dict[str, Any]]:
-    qs = urllib.parse.urlencode(
-        {"target": target, "kind": kind, "name": name, "authority": authority}
-    )
-    url = controller_url + "/api/status?" + qs
-    req = _new_controller_request(url, method="GET")
-    return _http_json_allow_error_status(req)
 
 
 def _http_delete_generation(

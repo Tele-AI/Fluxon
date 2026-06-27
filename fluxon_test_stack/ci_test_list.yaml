@@ -29,6 +29,118 @@ scenes:
       scales: [n1_kvowner_dram_20gib]
       profiles: [fluxon_tcp]
 
+  ci_top_attention_cargo_fs_core:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_util:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_kv_unit:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_cli:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_commu:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_commu_contract:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_framework:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_fs:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_fs_s3_gateway:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_limit_thirdparty:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_mq:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_observability:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_ops:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
+  ci_top_attention_cargo_pyo3:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+    select:
+      scales: [n1_kvowner_dram_3gib]
+      profiles: [fluxon_tcp]
+
   ci_top_attention_log_mgmt:
     ci:
       subject: rust
@@ -326,9 +438,12 @@ profiles:
           ci_top_attention_doc_page_build:
             doc_site_base_url: example.com
           ci_top_attention_bin_kvtest:
+            kv_transport_feature: tcp_thread_transport
             kv_test_rounds: all
-          ci_top_attention_log_mgmt:
-            enabled: true
+          ci_top_attention_cargo_fs_core: {}
+          ci_top_attention_cargo_util: {}
+          ci_top_attention_cargo_kv_unit:
+            kv_transport_feature: tcp_thread_transport
           ci_top_attention_log_mgmt:
             enabled: true
           ci_top_attention_mq_core: {}
@@ -476,9 +591,12 @@ profiles:
           ci_top_attention_doc_page_build:
             doc_site_base_url: example.com
           ci_top_attention_bin_kvtest:
+            kv_transport_feature: tcp_thread_transport
             kv_test_rounds: all
-          ci_top_attention_log_mgmt:
-            enabled: true
+          ci_top_attention_cargo_fs_core: {}
+          ci_top_attention_cargo_util: {}
+          ci_top_attention_cargo_kv_unit:
+            kv_transport_feature: tcp_thread_transport
           ci_top_attention_log_mgmt:
             enabled: true
           ci_top_attention_mq_core: {}
@@ -493,9 +611,12 @@ profiles:
           ci_top_attention_doc_page_build:
             doc_site_base_url: example.com
           ci_top_attention_bin_kvtest:
+            kv_transport_feature: tcp_thread_transport
             kv_test_rounds: all
-          ci_top_attention_log_mgmt:
-            enabled: true
+          ci_top_attention_cargo_fs_core: {}
+          ci_top_attention_cargo_util: {}
+          ci_top_attention_cargo_kv_unit:
+            kv_transport_feature: tcp_thread_transport
           ci_top_attention_log_mgmt:
             enabled: true
           ci_top_attention_mq_core: {}
@@ -510,9 +631,12 @@ profiles:
           ci_top_attention_doc_page_build:
             doc_site_base_url: example.com
           ci_top_attention_bin_kvtest:
+            kv_transport_feature: tcp_thread_transport
             kv_test_rounds: all
-          ci_top_attention_log_mgmt:
-            enabled: true
+          ci_top_attention_cargo_fs_core: {}
+          ci_top_attention_cargo_util: {}
+          ci_top_attention_cargo_kv_unit:
+            kv_transport_feature: tcp_thread_transport
           ci_top_attention_log_mgmt:
             enabled: true
           ci_top_attention_mq_core: {}

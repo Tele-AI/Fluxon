@@ -1,6 +1,7 @@
 Keep this document concise.
 - Core user, developer, and design docs are in-repo under fluxon_doc_cn/ and fluxon_doc_en/
 - Detailed bilingual doc writing rules are indexed at `fluxon_doc_en/dev_doc/Developer - 3 - Documentation Writing Rules.md` and `fluxon_doc_cn/dev_doc/开发者 - 3 - 文档写作规约.md`
+- Teststack architecture and test entry/helper design rules are indexed at [fluxon_doc_cn/design/teststack_1_当前架构与CI测试流程.md](fluxon_doc_cn/design/teststack_1_当前架构与CI测试流程.md)
 - teststack has two steps: start testbed and testrunner
 - teststack has UI support; testrunner should own the UI authority and API surface, and the UI should run as a long-lived service that reuses the ops interfaces underneath
 - All Python code in this project must be compatible with Python >=3.10
@@ -9,6 +10,9 @@ Keep this document concise.
 - Git operations are limited to basic `stage`, `unstage`, `commit`, and `push`. Do not use other Git operations.
 - Prefer contraction over compatibility by default. Do not add compatibility layers, deprecated paths, or aliases unless the task explicitly requires them.
 - Prefer one canonical name for one concept. Avoid synonym parameters, duplicated entrypoints, and parallel config surfaces.
+- Do not use environment variables for ordinary parameter passing. Prefer configuration files first, then explicit command-line arguments.
+- Prefer convention over configuration. When one canonical path or default wiring is sufficient, do not add extra config knobs.
+- Minimize multi-path config delivery. Do not pass the same config through parallel channels such as env vars, CLI flags, and files at the same time.
 - For test entrypoints, match the real execution model directly. If a test is a standalone script/process test, invoke it as a script/process; do not wrap it in `pytest` just for uniformity.
 - Do not forward pytest-style flags (`-k`, `-q`, node selectors, etc.) through direct-process test wrappers unless the wrapper explicitly implements and documents that selector surface.
 - For new integration or process-lifecycle tests, prefer direct process startup with explicit arguments and explicit exit-code checks over adding new pytest-only wrappers.

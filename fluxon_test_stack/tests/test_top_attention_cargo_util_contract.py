@@ -13,14 +13,14 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = REPO_ROOT / "fluxon_test_stack" / "top_attention_test_index" / "_bin_kvtest.py"
+MODULE_PATH = REPO_ROOT / "fluxon_test_stack" / "top_attention_test_index" / "_cargo_util.py"
 
 
 def _load_module():
     module_dir = MODULE_PATH.parent
     sys.path.insert(0, str(module_dir))
     try:
-        spec = importlib.util.spec_from_file_location("fluxon_test_stack_top_attention_bin_kvtest_contract", MODULE_PATH)
+        spec = importlib.util.spec_from_file_location("fluxon_test_stack_top_attention_cargo_util_contract", MODULE_PATH)
         assert spec is not None and spec.loader is not None
         mod = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = mod
@@ -34,8 +34,8 @@ def _load_module():
 _ENTRY = _load_module()
 
 
-class TestTopAttentionBinKvtestContract(unittest.TestCase):
-    def test_main_writes_build_config_ext_and_calls_cargo(self) -> None:
+class TestTopAttentionCargoUtilContract(unittest.TestCase):
+    def test_main_accepts_case_config_and_writes_build_config_ext(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
             cfg_dir = run_dir / "configs"
@@ -47,15 +47,12 @@ class TestTopAttentionBinKvtestContract(unittest.TestCase):
                 yaml.safe_dump(
                     {
                         "case": {
-                            "scene_id": "ci_top_attention_bin_kvtest",
+                            "scene_id": "ci_top_attention_cargo_util",
                             "scale_id": "n1_kvowner_dram_20gib",
-                            "profile_id": "fluxon_tcp_thread",
-                            "case_id": "ci_top_attention_bin_kvtest__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+                            "profile_id": "fluxon_tcp",
+                            "case_id": "ci_top_attention_cargo_util__n1_kvowner_dram_20gib__fluxon_tcp",
                         },
-                        "scene_config": {
-                            "kv_transport_feature": "tcp_thread_transport",
-                            "kv_test_rounds": "p2p_only",
-                        },
+                        "scene_config": {},
                         "scene_runtime": {
                             "etcd": {"ip": "127.0.0.1", "port": 19180},
                             "greptime": {"ip": "127.0.0.1", "port": 19190},
@@ -83,21 +80,19 @@ class TestTopAttentionBinKvtestContract(unittest.TestCase):
             self.assertEqual(
                 run_cargo.call_args.args[0],
                 [
-                    "run",
+                    "test",
                     "--manifest-path",
-                    str(REPO_ROOT / "fluxon_rs" / "fluxon_kv" / "Cargo.toml"),
-                    "--bin",
-                    "kv_test",
-                    "--no-default-features",
-                    "--features",
-                    "test_bins,p2p_transfer,tcp_thread_transport",
+                    str(REPO_ROOT / "fluxon_rs" / "fluxon_util" / "Cargo.toml"),
                 ],
             )
-            self.assertEqual(
-                run_cargo.call_args.kwargs["env"]["FLUXON_KV_TEST_ROUNDS"],
-                "p2p_only",
-            )
-            self.assertNotIn("FLUXON_BUILD_CONFIG_EXT_PATH", run_cargo.call_args.kwargs["env"])
+            self.assertNotIn("env", run_cargo.call_args.kwargs)
+
+    def test_main_rejects_pytest_style_passthrough_flags(self) -> None:
+        with mock.patch.object(sys, "argv", [str(MODULE_PATH), "-k", "lease"]):
+            with self.assertRaises(SystemExit) as cm:
+                _ENTRY.main()
+
+        self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":

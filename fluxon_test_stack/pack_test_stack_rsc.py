@@ -1203,7 +1203,13 @@ def _prepare_python_runtime_wheelhouse_into_root(
         dependency_sets=dependency_sets,
     )
     existing_names = sorted(path.name for path in wheelhouse_root.glob("*.whl"))
-    if _wheelhouse_satisfies_specs(existing_names=existing_names, expected_specs=expected_specs):
+    if _wheelhouse_satisfies_specs(existing_names=existing_names, expected_specs=expected_specs) and (
+        _wheelhouse_resolves_offline(
+            wheelhouse_root=wheelhouse_root,
+            python_abi=python_abi,
+            expected_specs=expected_specs,
+        )
+    ):
         print(f"Using existing prepared TEST_STACK runtime wheelhouse: {wheelhouse_root}")
         return
 
@@ -1329,6 +1335,34 @@ def _wheelhouse_satisfies_specs(
     return True
 
 
+def _wheelhouse_resolves_offline(
+    *,
+    wheelhouse_root: Path,
+    python_abi: str,
+    expected_specs: tuple[dict[str, str], ...],
+) -> bool:
+    python_bin = _python_executable_for_python_abi(python_abi=python_abi)
+    pinned_specs = [f"{spec['name']}=={spec['version']}" for spec in expected_specs]
+    with tempfile.TemporaryDirectory(prefix="fluxon_test_stack_wheelhouse_validate_") as td:
+        argv = [
+            python_bin,
+            "-m",
+            "pip",
+            "download",
+            "--no-index",
+            "--dest",
+            td,
+            "--find-links",
+            str(wheelhouse_root),
+        ]
+        argv.extend(pinned_specs)
+        try:
+            subprocess.check_call(argv, cwd=str(REPO_ROOT))
+        except subprocess.CalledProcessError:
+            return False
+    return True
+
+
 def _download_python_runtime_wheels(
     *,
     out_dir: Path,
@@ -1338,6 +1372,9 @@ def _download_python_runtime_wheels(
 ) -> None:
     abi_suffix = python_abi.removeprefix("cpython")
     cp_tag = "cp" + abi_suffix.replace(".", "")
+    # Pip evaluates dependency markers against the interpreter running pip, so
+    # preparing a cpython3.10 wheelhouse must run under a Python 3.10 binary.
+    python_bin = _python_executable_for_python_abi(python_abi=python_abi)
     wheel_specs: list[str] = []
     sdist_specs: list[str] = []
     for spec in expected_specs:
@@ -1349,7 +1386,7 @@ def _download_python_runtime_wheels(
 
     if wheel_specs:
         argv = [
-            sys.executable,
+            python_bin,
             "-m",
             "pip",
             "download",
@@ -1370,7 +1407,7 @@ def _download_python_runtime_wheels(
 
     for pinned in sdist_specs:
         argv = [
-            sys.executable,
+            python_bin,
             "-m",
             "pip",
             "wheel",
@@ -1386,6 +1423,55 @@ def _download_python_runtime_wheels(
             "downloaded TEST_STACK runtime wheelhouse is incomplete: "
             f"out_dir={out_dir} expected={[spec['name'] + '==' + spec['version'] for spec in expected_specs]}"
         )
+    if not _wheelhouse_resolves_offline(
+        wheelhouse_root=out_dir,
+        python_abi=python_abi,
+        expected_specs=expected_specs,
+    ):
+        raise RuntimeError(
+            "downloaded TEST_STACK runtime wheelhouse cannot satisfy offline dependency resolution: "
+            f"out_dir={out_dir} expected={[spec['name'] + '==' + spec['version'] for spec in expected_specs]}"
+        )
+
+
+def _python_executable_abi(python_bin: str) -> str:
+    try:
+        return subprocess.check_output(
+            [
+                python_bin,
+                "-c",
+                (
+                    "import sys; "
+                    "print(f'{sys.implementation.name}{sys.version_info[0]}.{sys.version_info[1]}')"
+                ),
+            ],
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"failed to probe python ABI for executable: {python_bin}") from exc
+
+
+def _python_executable_for_python_abi(*, python_abi: str) -> str:
+    version = python_abi.removeprefix("cpython")
+    candidate_names: list[str] = [f"python{version}", "python3", "python"]
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw_candidate in candidate_names:
+        resolved = shutil.which(raw_candidate)
+        if resolved is None or resolved in seen:
+            continue
+        seen.add(resolved)
+        candidates.append(resolved)
+    if not candidates:
+        raise RuntimeError(
+            f"preparing TEST_STACK runtime wheelhouse for {python_abi} requires a matching Python interpreter on PATH"
+        )
+    for python_bin in candidates:
+        if _python_executable_abi(python_bin) == python_abi:
+            return python_bin
+    raise RuntimeError(
+        f"preparing TEST_STACK runtime wheelhouse for {python_abi} requires a matching Python interpreter on PATH"
+    )
 
 
 def _normalize_python_distribution_name(name: str) -> str:

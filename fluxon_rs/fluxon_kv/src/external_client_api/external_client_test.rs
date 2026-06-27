@@ -11,7 +11,12 @@ use limit_thirdparty::tokio::{self};
 use std::time::{Duration, Instant};
 use tracing::info;
 
-fn new_master_config(instance_key: &str, port: u16, cluster: &str, etcd: &str) -> MasterConfig {
+fn new_master_config(
+    instance_key: &str,
+    port: Option<u16>,
+    cluster: &str,
+    etcd: &str,
+) -> MasterConfig {
     let prometheus_base_url = fluxon_util::dev_config::load_tsdb_base_url()
         .expect("read prometheus_base_url from build_config_ext.yml (key: prom)");
     let prom_remote_write_url =
@@ -24,7 +29,7 @@ fn new_master_config(instance_key: &str, port: u16, cluster: &str, etcd: &str) -
     MasterConfig {
         instance_key: instance_key.to_string(),
         cluster_name: cluster.to_string(),
-        port: Some(port),
+        port,
         etcd_endpoints: vec![etcd.to_string()],
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
@@ -144,7 +149,7 @@ async fn test_external_client_basic_crud() {
     std::fs::create_dir_all(shm_path).unwrap();
 
     // Start master
-    let master_cfg = new_master_config("ext_test_master", 50120, cluster, &etcd);
+    let master_cfg = new_master_config("ext_test_master", None, cluster, &etcd);
     let (master_fw, _) = run_master(ConfigArg::Config(master_cfg))
         .await
         .expect("start master");
@@ -306,7 +311,7 @@ pub async fn test_external_client_lifetime() {
     info!("[ELT-SETUP] cluster='{}', shm_path='{}'", cluster, shm_path);
 
     // Start master
-    let master_cfg = new_master_config("ext_lt_master", 50130, cluster, &etcd);
+    let master_cfg = new_master_config("ext_lt_master", None, cluster, &etcd);
     let (master_fw, _) = run_master(ConfigArg::Config(master_cfg))
         .await
         .expect("start master");

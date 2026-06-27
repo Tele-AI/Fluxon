@@ -289,6 +289,7 @@ async fn stage_worker_loop(
 ) {
     let mut pending_task: Option<StageTask> = None;
     loop {
+        let mut queue_guard = None;
         let (task, task_from_queue) = if let Some(t) = pending_task.take() {
             (t, false)
         } else {
@@ -297,6 +298,7 @@ async fn stage_worker_loop(
                 Some(t) => t,
                 None => return, // sender dropped, nothing to do
             };
+            queue_guard = Some(guard);
             (t, true)
         };
         if task_from_queue {
@@ -308,17 +310,20 @@ async fn stage_worker_loop(
         let mut staged_piece_keys: Vec<PieceKey> = vec![task.piece_key.clone()];
         let mut staged_piece_count = 1usize;
 
+        // Keep the receiver lock from the initial recv while peeking follow-up items.
+        // Otherwise another worker can grab the single shared receiver and block on
+        // recv(), which stalls this worker before it ever reaches the stage callback.
         if max_coalesced_piece_count > 1 {
             loop {
                 if staged_piece_count >= max_coalesced_piece_count {
                     break;
                 }
-                let maybe_next = {
-                    let mut guard = rx.lock().await;
-                    match guard.try_recv() {
-                        Ok(t) => Some(t),
-                        Err(_) => None,
-                    }
+                let maybe_next = if let Some(guard) = queue_guard.as_mut() {
+                    guard.try_recv().ok()
+                } else if let Ok(mut guard) = rx.try_lock() {
+                    guard.try_recv().ok()
+                } else {
+                    None
                 };
                 let Some(next_task) = maybe_next else {
                     break;
@@ -424,7 +429,9 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Condvar, Mutex};
     use tokio::time::{Duration, sleep};
 
     fn sample_key() -> PieceKey {
@@ -440,8 +447,10 @@ mod tests {
     async fn suggest_enqueues_and_worker_runs() {
         let stage_calls = Arc::new(AtomicUsize::new(0));
         let stage_calls_clone = stage_calls.clone();
+        let (stage_started_tx, stage_started_rx) = mpsc::sync_channel(1);
         let stage_piece_fn: StagePieceFn = Arc::new(move |_key, _identity| {
             stage_calls_clone.fetch_add(1, AtomicOrdering::Relaxed);
+            let _ = stage_started_tx.send(());
             Ok(())
         });
         let stage_piece_range_fn: StagePieceRangeFn =
@@ -455,6 +464,9 @@ mod tests {
 
         let outcome = ctrl.handle_suggest(sample_key(), None);
         assert_eq!(outcome, SuggestOutcome::Enqueued);
+        stage_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stage worker did not run within 5s");
 
         for _ in 0..50 {
             if stage_calls.load(AtomicOrdering::Relaxed) == 1 && ctrl.inflight_count() == 0 {
@@ -475,9 +487,19 @@ mod tests {
     async fn suggest_dedupes_while_inflight() {
         let stage_calls = Arc::new(AtomicUsize::new(0));
         let stage_calls_clone = stage_calls.clone();
+        let (stage_started_tx, stage_started_rx) = mpsc::sync_channel(1);
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let gate_clone = gate.clone();
         let stage_piece_fn: StagePieceFn = Arc::new(move |_key, _identity| {
             stage_calls_clone.fetch_add(1, AtomicOrdering::Relaxed);
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = stage_started_tx.send(());
+            let (lock, cv) = &*gate_clone;
+            let mut state = lock.lock().unwrap();
+            state.0 = true;
+            cv.notify_all();
+            while !state.1 {
+                state = cv.wait(state).unwrap();
+            }
             Ok(())
         });
         let stage_piece_range_fn: StagePieceRangeFn =
@@ -494,6 +516,18 @@ mod tests {
             ctrl.handle_suggest(key.clone(), None),
             SuggestOutcome::Enqueued
         );
+        stage_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stage worker did not start within 5s");
+        {
+            let (lock, cv) = &*gate;
+            let mut state = lock.lock().unwrap();
+            while !state.0 {
+                state = cv.wait(state).unwrap();
+            }
+            state.1 = true;
+            cv.notify_all();
+        }
         assert_eq!(
             ctrl.handle_suggest(key, None),
             SuggestOutcome::DedupedInflight
@@ -515,8 +549,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queue_drop_updates_snapshot() {
+        let (stage_started_tx, stage_started_rx) = mpsc::sync_channel(1);
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let gate_clone = gate.clone();
         let stage_piece_fn: StagePieceFn = Arc::new(move |_key, _identity| {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = stage_started_tx.send(());
+            let (lock, cv) = &*gate_clone;
+            let mut state = lock.lock().unwrap();
+            state.0 = true;
+            cv.notify_all();
+            while !state.1 {
+                state = cv.wait(state).unwrap();
+            }
             Ok(())
         });
         let stage_piece_range_fn: StagePieceRangeFn =
@@ -543,11 +587,27 @@ mod tests {
         };
 
         assert_eq!(ctrl.handle_suggest(key0, None), SuggestOutcome::Enqueued);
+        stage_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stage worker did not start within 5s");
+        {
+            let (lock, cv) = &*gate;
+            let mut state = lock.lock().unwrap();
+            while !state.0 {
+                state = cv.wait(state).unwrap();
+            }
+        }
         assert_eq!(ctrl.handle_suggest(key1, None), SuggestOutcome::Enqueued);
         assert_eq!(
             ctrl.handle_suggest(key2, None),
             SuggestOutcome::QueueDropped
         );
+        {
+            let (lock, cv) = &*gate;
+            let mut state = lock.lock().unwrap();
+            state.1 = true;
+            cv.notify_all();
+        }
 
         let snapshot = ctrl.stats_snapshot();
         assert_eq!(snapshot.suggest_enqueued_count, 2);

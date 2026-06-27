@@ -49,9 +49,20 @@ Entries:
 - `_deployment_codegen.py`: deployment code generation coverage
 - `_log_mgmt.py`: shared-supervisor ops log rolling plus Rust KV log sharding coverage. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_log_mgmt` scene, and `test_runner.py` dispatches to it from the runner-native `top_attention` CI execution model.
 - `_script_tools.py`: script utility coverage
-- `_cargo_fs_core.py`: cargo tests for the Rust FS core crate
-- `_cargo_util.py`: cargo tests for the Rust util crate
-- `_cargo_kv_unit.py`: cargo tests for the Rust KV crate
+- `_cargo_fs_core.py`: cargo tests for the Rust FS core crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_fs_core` runner-native scene.
+- `_cargo_util.py`: cargo tests for the Rust util crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_util` runner-native scene, with runtime endpoints supplied through canonical `--case-config`.
+- `_cargo_kv_unit.py`: cargo tests for the Rust KV crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_kv_unit` runner-native scene, with transport feature selection sourced only from canonical `--case-config` (`scene_config.kv_transport_feature`).
+- `_cargo_cli.py`: cargo tests for the Rust CLI crate
+- `_cargo_commu.py`: cargo tests for the Rust communication facade crate
+- `_cargo_commu_contract.py`: cargo tests for the Rust communication contract crate
+- `_cargo_framework.py`: cargo tests for the Rust framework crate
+- `_cargo_fs.py`: cargo tests for the Rust FS crate. This wrapper expects the prepared `fluxon_release/ext_images/tikv/*` runtime files.
+- `_cargo_fs_s3_gateway.py`: cargo tests for the Rust FS S3 gateway crate. This wrapper expects the prepared `fluxon_release/ext_images/tikv/*` runtime files.
+- `_cargo_limit_thirdparty.py`: cargo tests for the Rust third-party facade crate
+- `_cargo_mq.py`: cargo tests for the Rust MQ crate
+- `_cargo_observability.py`: cargo tests for the Rust observability crate
+- `_cargo_ops.py`: cargo tests for the Rust ops crate
+- `_cargo_pyo3.py`: cargo tests for the Rust PyO3 crate
 
 Operational note:
 
@@ -60,6 +71,9 @@ Operational note:
   provide at least 308 common non-bastion deploy targets in `target_ip_map` for
   the default 300-producer/8-consumer topology; pass `--config` for the large
   cluster suite before running it.
+- All `_cargo_*.py` wrappers are direct-process entrypoints. They do not forward
+  `pytest` selectors or `cargo test` passthrough flags unless the wrapper
+  explicitly defines that surface.
 
 Known gap:
 

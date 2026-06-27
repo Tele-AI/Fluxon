@@ -182,9 +182,42 @@ pub fn build_target_dir_() -> PathBuf {
 mod tests {
     use crate::{current_log_file_path, init_log};
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
     use tracing::{debug, error, info, warn};
+
+    fn wait_for_log_file(active_log_path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if active_log_path.exists() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "active log file should exist: {}",
+                active_log_path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn assert_logged_text(active_log_path: &Path, needles: &[&str]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Ok(content) = fs::read_to_string(active_log_path) {
+                if needles.iter().all(|needle| content.contains(needle)) {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "log file did not contain all expected records in time: {}",
+                active_log_path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     #[cfg(trybuild)]
     #[test]
@@ -195,11 +228,13 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(log_init)]
     fn test_init_log_with_file_path() {
         // 创建临时目录用于日志文件
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let log_path = temp_dir.path();
         let instance_key = "test_instance";
+        let previous_path = current_log_file_path();
 
         // 初始化日志系统
         init_log(log_path, instance_key);
@@ -213,45 +248,34 @@ mod tests {
         // 等待日志写入
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // 验证日志文件是否创建
-        let log_key = instance_key;
-        let mut log_file_found = false;
-
-        // 遍历日志目录，查找日志文件
-        for entry in fs::read_dir(log_path).expect("Failed to read log directory") {
-            let entry = entry.expect("Failed to read entry");
-            let file_name = entry.file_name();
-            let file_name_str = file_name.to_string_lossy();
-
-            if file_name_str.contains(log_key) && file_name_str.contains(".log") {
-                log_file_found = true;
-                if current_log_file_path()
-                    .as_ref()
-                    .is_some_and(|path| path.starts_with(log_path))
-                {
-                    let content = fs::read_to_string(entry.path()).expect("Failed to read log");
-                    assert!(
-                        content.contains("debug message"),
-                        "Log should contain debug"
-                    );
-                    assert!(content.contains("info message"), "Log should contain info");
-                    assert!(
-                        content.contains("warning message"),
-                        "Log should contain warning"
-                    );
-                    assert!(
-                        content.contains("error message"),
-                        "Log should contain error"
-                    );
-                }
-            }
+        let active_log_path = current_log_file_path().expect("active log file path should exist");
+        if let Some(ref previous_path) = previous_path {
+            assert_eq!(
+                active_log_path, *previous_path,
+                "init_log should preserve the first active log file path within a process"
+            );
+        } else {
+            wait_for_log_file(&active_log_path);
         }
-
-        assert!(log_file_found, "Log file should be created");
+        if previous_path.is_none() && active_log_path.starts_with(log_path) {
+            let file_name = active_log_path
+                .file_name()
+                .expect("active log file name")
+                .to_string_lossy();
+            assert!(
+                file_name.contains(instance_key),
+                "active log file should include instance key when this test owns initialization"
+            );
+            assert_logged_text(
+                &active_log_path,
+                &["debug message", "info message", "warning message", "error message"],
+            );
+        }
     }
 
     // 移除“不指定日志路径”的测试：生产入口强制要求提供 log_path。
     #[test]
+    #[serial_test::serial(log_init)]
     fn test_init_log_invalid_path() {
         // 测试无效路径的处理
         let invalid_path = PathBuf::from("/proc/invalid_path_that_cannot_be_created/logs");
@@ -266,11 +290,13 @@ mod tests {
     // 移除 init_log_test 相关测试：测试不再使用测试专用 logger。
 
     #[test]
+    #[serial_test::serial(log_init)]
     fn test_log_file_rotation() {
         // 测试日志文件按天滚动的功能
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let log_path = temp_dir.path();
         let instance_key = "rotation_test";
+        let previous_path = current_log_file_path();
 
         // 初始化日志
         init_log(log_path, instance_key);
@@ -284,20 +310,32 @@ mod tests {
         // 等待日志写入
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // 验证文件存在
-        let files: Vec<_> = fs::read_dir(log_path)
-            .expect("Failed to read log directory")
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-
-        assert!(
-            files.iter().any(|f| f.contains("fluxon-kv-rotation_test")),
-            "Log files should be created with correct instance key"
-        );
+        let active_log_path = current_log_file_path().expect("active log file path should exist");
+        if let Some(ref previous_path) = previous_path {
+            assert_eq!(
+                active_log_path, *previous_path,
+                "init_log should preserve the first active log file path within a process"
+            );
+        } else {
+            wait_for_log_file(&active_log_path);
+            assert!(
+                active_log_path.starts_with(log_path),
+                "first init_log call should bind to the requested directory"
+            );
+            let file_name = active_log_path
+                .file_name()
+                .expect("active log file name")
+                .to_string_lossy();
+            assert!(
+                file_name.contains("fluxon-kv-rotation_test"),
+                "first init_log call should use the requested instance key"
+            );
+            assert_logged_text(&active_log_path, &["Log message 0", "Warning message 0"]);
+        }
     }
 
     #[test]
+    #[serial_test::serial(log_init)]
     fn test_multiple_init_log_calls() {
         // 测试多次调用 init_log 的行为
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -306,6 +344,7 @@ mod tests {
         // 第一次初始化
         init_log(log_path, "instance1");
         info!("First init message");
+        let first_path = current_log_file_path().expect("first active log file path");
 
         // 第二次初始化（应该被忽略，因为 try_init 会失败）
         init_log(log_path, "instance2");
@@ -313,5 +352,10 @@ mod tests {
 
         // 验证不会崩溃
         std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            current_log_file_path().as_ref(),
+            Some(&first_path),
+            "multiple init_log calls should preserve the first active log file path"
+        );
     }
 }

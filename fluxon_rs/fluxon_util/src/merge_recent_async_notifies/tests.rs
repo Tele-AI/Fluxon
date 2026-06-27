@@ -5,11 +5,9 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial_test::serial(log_init)]
 async fn test_async_notification_merger_poll() {
-    // 初始化测试日志（落盘到统一测试目录）；级别可通过环境变量控制
-    unsafe {
-        std::env::set_var("FLUXON_LOG", "debug");
-    }
+    // Initialize test logs under the shared test workdir.
     init_log_test("merge_recent_async_notifies_poll");
 
     let (tx, rx) = mpsc::unbounded_channel::<i32>();
@@ -98,11 +96,9 @@ async fn test_async_notification_merger_poll() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial_test::serial(log_init)]
 async fn test_user_controlled_loop() {
-    // 初始化测试日志（第二个用例单独目录）
-    unsafe {
-        std::env::set_var("FLUXON_LOG", "debug");
-    }
+    // Initialize test logs under the shared test workdir.
     init_log_test("merge_recent_async_notifies_user_loop");
     let (tx, rx) = mpsc::unbounded_channel::<i32>();
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);

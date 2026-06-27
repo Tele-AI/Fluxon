@@ -611,6 +611,11 @@ pub fn init_log_test(test_case_name: &str) {
         .join("tests")
         .join(&case);
     fs::create_dir_all(&dir).expect("create test log dir");
+    if std::env::var_os("FLUXON_LOG").is_none() {
+        unsafe {
+            std::env::set_var("FLUXON_LOG", "debug");
+        }
+    }
     // Use test_case_name as instance key so file names are recognizable.
     init_log(&dir, &case);
 }

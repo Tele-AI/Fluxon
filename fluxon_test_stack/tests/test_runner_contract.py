@@ -60,6 +60,14 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
             test_ci_top_attention_doc_page_build_uses_online_docker_image,
         ),
         (
+            "ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime",
+            test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime,
+        ),
+        (
+            "ci_top_attention_additional_cargo_scenes_exist",
+            test_ci_top_attention_additional_cargo_scenes_exist,
+        ),
+        (
             "ci_top_attention_log_mgmt_scene_exists",
             test_ci_top_attention_log_mgmt_scene_exists,
         ),
@@ -285,6 +293,65 @@ def test_ci_top_attention_log_mgmt_scene_exists() -> None:
         return
     print("PASS: test_ci_top_attention_log_mgmt_scene_exists")
 
+
+def test_ci_top_attention_additional_cargo_scenes_exist() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
+    suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(suite_cfg, dict):
+        print("FAIL: test_ci_top_attention_additional_cargo_scenes_exist - suite config is not a mapping")
+        return
+
+    suite = _TEST_RUNNER._parse_suite_config(copy.deepcopy(suite_cfg))
+    expected_scene_ids = {
+        "ci_top_attention_cargo_cli",
+        "ci_top_attention_cargo_commu",
+        "ci_top_attention_cargo_commu_contract",
+        "ci_top_attention_cargo_framework",
+        "ci_top_attention_cargo_fs",
+        "ci_top_attention_cargo_fs_s3_gateway",
+        "ci_top_attention_cargo_limit_thirdparty",
+        "ci_top_attention_cargo_mq",
+        "ci_top_attention_cargo_observability",
+        "ci_top_attention_cargo_ops",
+        "ci_top_attention_cargo_pyo3",
+    }
+    missing = sorted(scene_id for scene_id in expected_scene_ids if scene_id not in suite.scenes)
+    if missing:
+        print(
+            "FAIL: test_ci_top_attention_additional_cargo_scenes_exist - "
+            f"missing scenes: {missing!r}"
+        )
+        return
+    for scene_id in sorted(expected_scene_ids):
+        scene = suite.scenes.get(scene_id)
+        if not isinstance(scene, dict):
+            print(
+                "FAIL: test_ci_top_attention_additional_cargo_scenes_exist - "
+                f"scene is not a mapping: {scene_id!r}"
+            )
+            return
+        ci = scene.get("ci")
+        if not isinstance(ci, dict):
+            print(
+                "FAIL: test_ci_top_attention_additional_cargo_scenes_exist - "
+                f"scene.ci missing: {scene_id!r}"
+            )
+            return
+        if ci.get("subject") != "rust":
+            print(
+                "FAIL: test_ci_top_attention_additional_cargo_scenes_exist - "
+                f"expected subject 'rust' for {scene_id!r}, got {ci.get('subject')!r}"
+            )
+            return
+        if ci.get("runtime_contract") != "rust_self_managed":
+            print(
+                "FAIL: test_ci_top_attention_additional_cargo_scenes_exist - "
+                f"expected runtime_contract 'rust_self_managed' for {scene_id!r}, got {ci.get('runtime_contract')!r}"
+            )
+            return
+    print("PASS: test_ci_top_attention_additional_cargo_scenes_exist")
+
 def test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
@@ -337,6 +404,120 @@ def test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime() -> None:
         )
         return
     print("PASS: test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime")
+
+
+def test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
+    suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(suite_cfg, dict):
+        print("FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - suite config is not a mapping")
+        return
+
+    suite_for_contract = copy.deepcopy(suite_cfg)
+    suite = _TEST_RUNNER._parse_suite_config(suite_for_contract)
+    cases = _TEST_RUNNER._expand_cases(suite)
+    case = next(
+        (
+            item
+            for item in cases
+            if item.scene_id == "ci_top_attention_cargo_kv_unit"
+            and item.profile_id == "fluxon_tcp"
+        ),
+        None,
+    )
+    if case is None:
+        print("FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - missing cargo kv unit case")
+        return
+    planned = _TEST_RUNNER._build_ci_execution_plan(case, suite)
+    if len(planned) != 1:
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            f"expected one planned case, got {len(planned)}"
+        )
+        return
+    commands = planned[0].ci_commands
+    if len(commands) != 1:
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            f"expected one command, got {len(commands)}"
+        )
+        return
+    command = commands[0]
+    if command.get("id") != "top_attention_cargo_kv_unit":
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            f"unexpected command id: {command.get('id')!r}"
+        )
+        return
+    scene = suite.scenes.get("ci_top_attention_cargo_kv_unit")
+    if not isinstance(scene, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "missing cargo kv unit scene"
+        )
+        return
+    ci = scene.get("ci")
+    if not isinstance(ci, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "scene.ci missing"
+        )
+        return
+    if ci.get("subject") != "rust":
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            f"expected subject 'rust', got {ci.get('subject')!r}"
+        )
+        return
+    if ci.get("runtime_contract") != "rust_self_managed":
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            f"expected runtime_contract 'rust_self_managed', got {ci.get('runtime_contract')!r}"
+        )
+        return
+    profile = suite.profiles.get("fluxon_tcp")
+    if not isinstance(profile, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "missing fluxon_tcp profile"
+        )
+        return
+    runtime = profile.get("runtime")
+    if not isinstance(runtime, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "profile.runtime missing"
+        )
+        return
+    profile_ci = runtime.get("ci")
+    if not isinstance(profile_ci, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "profile.runtime.ci missing"
+        )
+        return
+    scene_configs = profile_ci.get("scene_configs")
+    if not isinstance(scene_configs, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "profile.runtime.ci.scene_configs missing"
+        )
+        return
+    cargo_scene_config = scene_configs.get("ci_top_attention_cargo_kv_unit")
+    if not isinstance(cargo_scene_config, dict):
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            "missing ci_top_attention_cargo_kv_unit scene config"
+        )
+        return
+    if cargo_scene_config.get("kv_transport_feature") != "tcp_thread_transport":
+        print(
+            "FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - "
+            f"unexpected kv_transport_feature: {cargo_scene_config.get('kv_transport_feature')!r}"
+        )
+        return
+    print("PASS: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime")
 
 
 if __name__ == "__main__":

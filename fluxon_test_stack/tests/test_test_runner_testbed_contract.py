@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -35,13 +36,27 @@ def _load_module():
 
 
 _RUNNER = _load_module()
+_CI_RUNTIME_MOD = sys.modules["test_runner_ci_runtime"]
 
 
 class TestTestRunnerTestbedContract(unittest.TestCase):
     def test_write_ci_master_owner_configs_emits_owner_large_file_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            run_dir = Path(td)
+            run_dir = Path(td) / "runner_run" / "results" / "ci_case" / "run_3"
+            run_dir.mkdir(parents=True, exist_ok=True)
             resolved_case = {
+                "runtime": {
+                    "run_dir": str(run_dir),
+                },
+                "profile": {
+                    "test_stack": {
+                        "kind": "FLUXON",
+                        "port_alloc": {
+                            "kv_master_port_base": 50061,
+                            "kv_master_port_stride": 10,
+                        },
+                    }
+                },
                 "deploy": {
                     "instances": [
                         {"id": "master", "deployer": {"target": "local-node-a"}},
@@ -53,7 +68,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
             with mock.patch.object(_RUNNER, "_ci_base_runtime_service_target_ip", side_effect=["127.0.0.1", "127.0.0.1"]):
                 with mock.patch.object(_RUNNER, "_ci_base_runtime_service_port", side_effect=[19180, 19190]):
-                    _, owner_path = _RUNNER._write_ci_master_owner_configs(
+                    master_path, owner_path = _RUNNER._write_ci_master_owner_configs(
                         resolved_case,
                         run_dir=run_dir,
                         cluster_name="ci_cluster",
@@ -61,41 +76,178 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                         owner_dram_bytes=1073741824,
                     )
 
+            master_cfg = yaml.safe_load(master_path.read_text(encoding="utf-8"))
             owner_cfg = yaml.safe_load(owner_path.read_text(encoding="utf-8"))
+            expected_master_port = 50061 + 10 * (3 - 1) + _RUNNER._test_stack_runner_port_slot(
+                runner_root=_RUNNER._test_stack_runner_root(run_dir),
+                stride=10,
+            )
+            self.assertEqual(master_cfg["port"], expected_master_port)
             self.assertEqual(
                 owner_cfg["fluxonkv_spec"]["large_file_paths"],
                 [str((run_dir / "services" / "owner_0" / "large").resolve())],
             )
             self.assertNotIn("shared_file_path", owner_cfg["fluxonkv_spec"])
 
+    def test_ci_required_ports_includes_local_master_kv_port(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "runner_run" / "results" / "ci_case" / "run_2"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            resolved_case = {
+                "runtime": {
+                    "run_dir": str(run_dir),
+                },
+                "profile": {
+                    "test_stack": {
+                        "kind": "FLUXON",
+                        "port_alloc": {
+                            "kv_master_port_base": 50061,
+                            "kv_master_port_stride": 10,
+                        },
+                    }
+                },
+                "deploy": {
+                    "instances": [
+                        {"id": "master", "deployer": {"target": "local-node-a"}},
+                    ],
+                    "target_ip_map": {"local-node-a": "127.0.0.1"},
+                },
+                "runtime_model": {
+                    "test_bed": {"kind": "ops"},
+                    "base_runtime": {"service_ids": []},
+                    "case_runtime": {"instance_ids": ["master"]},
+                },
+            }
+
+            with mock.patch.object(_RUNNER, "_ci_runtime_cleanup_case", return_value=resolved_case):
+                with mock.patch.object(_RUNNER, "_ci_local_runtime_targets", return_value={"local-node-a"}):
+                    required_ports = _RUNNER._ci_required_ports(resolved_case)
+
+            expected_master_port = 50061 + 10 * (2 - 1) + _RUNNER._test_stack_runner_port_slot(
+                runner_root=_RUNNER._test_stack_runner_root(run_dir),
+                stride=10,
+            )
+            self.assertEqual(required_ports, [("ci master", expected_master_port)])
+
     def test_ci_runtime_python_executable_requires_python310_on_path(self) -> None:
         with mock.patch.object(_RUNNER.shutil, "which", return_value=None):
-            with self.assertRaisesRegex(ValueError, "requires python3.10 on PATH"):
+            with self.assertRaisesRegex(ValueError, "requires a Python 3.10 interpreter on PATH"):
                 _RUNNER._ci_runtime_python_executable()
 
-    def test_create_ci_runtime_venv_uses_python310(self) -> None:
+    def test_ci_runtime_python_executable_accepts_python3_alias_when_it_is_python310(self) -> None:
+        with mock.patch.object(
+            _RUNNER.shutil,
+            "which",
+            side_effect=lambda name: {
+                "python3.10": None,
+                "python3": "/usr/bin/python3",
+                "python": "/usr/bin/python",
+            }.get(name),
+        ):
+            with mock.patch.object(_CI_RUNTIME_MOD, "_python_executable_abi", return_value="cpython3.10"):
+                self.assertEqual(_RUNNER._ci_runtime_python_executable(), "/usr/bin/python3")
+
+    def test_create_ci_runtime_venv_uses_python310_abi_and_seeds_pip(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
             venv_dir = (run_dir / "venv").resolve()
             expected_venv_python = (venv_dir / "bin" / "python3").resolve()
+            observed_calls: list[list[str]] = []
 
             def _fake_create_venv(argv: list[str], *, cwd: str) -> None:
-                self.assertEqual(
-                    argv,
-                    ["/usr/bin/python3.10", "-m", "venv", str(venv_dir)],
-                )
+                observed_calls.append(argv)
                 self.assertEqual(cwd, str(run_dir))
-                expected_venv_python.parent.mkdir(parents=True, exist_ok=True)
-                expected_venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+                if len(observed_calls) == 1:
+                    self.assertEqual(
+                        argv,
+                        [
+                            "/usr/bin/python3.10",
+                            "-m",
+                            "venv",
+                            "--without-pip",
+                            str(venv_dir),
+                        ],
+                    )
+                    expected_venv_python.parent.mkdir(parents=True, exist_ok=True)
+                    expected_venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+                    return
+                if len(observed_calls) == 2:
+                    self.assertEqual(
+                        argv,
+                        [
+                            str(expected_venv_python),
+                            "-m",
+                            "ensurepip",
+                            "--upgrade",
+                            "--default-pip",
+                        ],
+                    )
+                    return
+                if len(observed_calls) == 3:
+                    self.assertEqual(
+                        argv,
+                        [
+                            str(expected_venv_python),
+                            "-m",
+                            "pip",
+                            "--version",
+                        ],
+                    )
+                    return
+                self.fail(f"unexpected _run_subprocess call: argv={argv!r}")
 
             with mock.patch.object(_RUNNER.shutil, "which", return_value="/usr/bin/python3.10"):
-                with mock.patch.object(_RUNNER, "_run_subprocess", side_effect=_fake_create_venv) as run_subprocess_mock:
-                    with mock.patch.object(_RUNNER, "_assert_ci_runtime_python_abi") as assert_python_abi:
-                        venv_python = _RUNNER._create_ci_runtime_venv(run_dir=run_dir)
+                with mock.patch.object(_CI_RUNTIME_MOD, "_python_executable_abi", return_value="cpython3.10"):
+                    with mock.patch.object(_RUNNER, "_run_subprocess", side_effect=_fake_create_venv) as run_subprocess_mock:
+                        with mock.patch.object(_RUNNER, "_assert_ci_runtime_python_abi") as assert_python_abi:
+                            venv_python = _RUNNER._create_ci_runtime_venv(run_dir=run_dir)
 
             self.assertEqual(venv_python, expected_venv_python)
-            run_subprocess_mock.assert_called_once()
+            self.assertEqual(
+                observed_calls,
+                [
+                    ["/usr/bin/python3.10", "-m", "venv", "--without-pip", str(venv_dir)],
+                    [str(expected_venv_python), "-m", "ensurepip", "--upgrade", "--default-pip"],
+                    [str(expected_venv_python), "-m", "pip", "--version"],
+                ],
+            )
+            self.assertEqual(run_subprocess_mock.call_count, 3)
             assert_python_abi.assert_called_once_with(venv_python=expected_venv_python)
+
+    def test_runner_native_bin_kvtest_scene_stays_on_direct_wrapper_command(self) -> None:
+        suite = _RUNNER._parse_suite_config(
+            yaml.safe_load(
+                (REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8")
+            )
+        )
+        cases = _RUNNER._expand_cases(suite)
+        case = next(item for item in cases if item.scene_id == "ci_top_attention_bin_kvtest" and item.profile_id == "fluxon_tcp")
+
+        planned = _RUNNER._build_ci_execution_plan(case, suite)
+
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_bin_kvtest")
+        self.assertIn(
+            "fluxon_test_stack/top_attention_test_index/_bin_kvtest.py",
+            planned[0].ci_commands[0]["command"],
+        )
+
+    def test_run_subprocess_reports_cwd_and_argv_on_failure(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["/usr/bin/python3", "-c", "raise SystemExit(2)"],
+            returncode=2,
+            stdout="",
+            stderr="boom\n",
+        )
+        with mock.patch.object(_RUNNER.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"command failed: rc=2 cwd=/tmp argv=/usr/bin/python3 -c 'raise SystemExit\(2\)'",
+            ):
+                _RUNNER._run_subprocess(
+                    ["/usr/bin/python3", "-c", "raise SystemExit(2)"],
+                    cwd="/tmp",
+                )
 
     def test_assert_ci_runtime_python_abi_accepts_python310_venv(self) -> None:
         with mock.patch.object(_RUNNER.subprocess, "check_output", return_value="cpython3.10\n") as check_output_mock:
@@ -159,7 +311,415 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 [call.kwargs["apply_id"] for call in delete_apply.call_args_list],
                 ["apply-runner", "apply-cluster"],
             )
-            cleanup_runtime.assert_called_once_with(resolved_case, timeout_s=120)
+            cleanup_runtime.assert_called_once_with(
+                resolved_case,
+                timeout_s=120,
+                instance_ids=["ci_runner", "master", "owner_0"],
+            )
+
+    def test_finalize_ci_case_runtime_cleanup_skips_untracked_ci_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            tracking = _RUNNER._CaseRuntimeTracking(
+                ci_attempted_instance_ids=["master", "owner_0", "ci_runner"],
+                ci_apply_ids={
+                    "master": "apply-cluster",
+                    "owner_0": "apply-cluster",
+                },
+            )
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_FULL_ONCE,
+                    "case_id": "ci_top_attention_mq_core__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+                }
+            }
+
+            with mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply:
+                with mock.patch.object(_RUNNER, "_ci_cleanup_runtime") as cleanup_runtime:
+                    _RUNNER._finalize_ci_case_runtime(
+                        resolved_case,
+                        run_dir=run_dir,
+                        runtime_tracking=tracking,
+                        outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+                    )
+
+            self.assertEqual([call.kwargs["apply_id"] for call in delete_apply.call_args_list], ["apply-cluster"])
+            cleanup_runtime.assert_called_once_with(
+                resolved_case,
+                timeout_s=120,
+                instance_ids=["master", "owner_0"],
+            )
+
+    def test_execute_ci_case_releases_ci_runner_after_terminal_success(self) -> None:
+        resolved_case = {
+            "case": {
+                "case_id": "ci_top_attention_mq_core__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+                "case_key": "case-key",
+            },
+            "scene": {
+                "ci": {
+                    "commands": [
+                        {
+                            "id": "top_attention_mq_core",
+                            "command": "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_core.py",
+                            "timeout_seconds": 60,
+                        }
+                    ]
+                }
+            },
+        }
+        prepared_case = _RUNNER._PreparedCase(
+            plan=_RUNNER._CasePlan(
+                case_family=_RUNNER.CASE_FAMILY_CI,
+                prepare_phases=(),
+                execute_phases=(
+                    _RUNNER._RuntimePhase(
+                        phase_id="ci_runner",
+                        layer=_RUNNER.RUNTIME_LAYER_CASE,
+                        instance_ids=("ci_runner",),
+                        write_ctx="CI execute",
+                    ),
+                ),
+            ),
+            ci_runner_exit_code_baseline=None,
+        )
+        tracking = _RUNNER._CaseRuntimeTracking(ci_apply_ids={"ci_runner": "apply-runner"})
+
+        with (
+            mock.patch.object(
+                _RUNNER,
+                "_deploy_runtime_phase",
+                return_value={"history_id": "apply-runner"},
+            ),
+            mock.patch.object(_RUNNER, "_record_ci_apply_id") as record_apply,
+            mock.patch.object(_RUNNER, "_wait_ci_instance_ready") as wait_ready,
+            mock.patch.object(_RUNNER, "_wait_ci_runner_exit_code", return_value=0) as wait_exit_code,
+            mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply,
+        ):
+            executed = _RUNNER._execute_ci_case(
+                planned_case=mock.Mock(ci_commands=[]),
+                resolved_case=resolved_case,
+                run_dir=Path("/tmp/ci_run_dir"),
+                run_index=3,
+                started_at=100,
+                prepared_case=prepared_case,
+                runtime_tracking=tracking,
+            )
+
+        self.assertEqual(executed.outcome, _RUNNER.RUN_OUTCOME_SUCCESS)
+        self.assertEqual(executed.summary["ci"], {"rc": 0})
+        record_apply.assert_called_once()
+        wait_ready.assert_called_once_with(resolved_case, instance_id="ci_runner")
+        wait_exit_code.assert_called_once()
+        delete_apply.assert_called_once_with(
+            resolved_case,
+            apply_id="apply-runner",
+            ctx="CI ci_runner terminal success apply",
+        )
+        self.assertNotIn("ci_runner", tracking.ci_apply_ids)
+
+    def test_execute_ci_case_preserves_success_when_ci_runner_cleanup_fails(self) -> None:
+        resolved_case = {
+            "case": {
+                "case_id": "ci_top_attention_mq_core__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+                "case_key": "case-key",
+            },
+            "scene": {
+                "ci": {
+                    "commands": [
+                        {
+                            "id": "top_attention_mq_core",
+                            "command": "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_core.py",
+                            "timeout_seconds": 60,
+                        }
+                    ]
+                }
+            },
+        }
+        prepared_case = _RUNNER._PreparedCase(
+            plan=_RUNNER._CasePlan(
+                case_family=_RUNNER.CASE_FAMILY_CI,
+                prepare_phases=(),
+                execute_phases=(
+                    _RUNNER._RuntimePhase(
+                        phase_id="ci_runner",
+                        layer=_RUNNER.RUNTIME_LAYER_CASE,
+                        instance_ids=("ci_runner",),
+                        write_ctx="CI execute",
+                    ),
+                ),
+            ),
+            ci_runner_exit_code_baseline=None,
+        )
+        tracking = _RUNNER._CaseRuntimeTracking(ci_apply_ids={"ci_runner": "apply-runner"})
+
+        with (
+            mock.patch.object(
+                _RUNNER,
+                "_deploy_runtime_phase",
+                return_value={"history_id": "apply-runner"},
+            ),
+            mock.patch.object(_RUNNER, "_record_ci_apply_id"),
+            mock.patch.object(_RUNNER, "_wait_ci_instance_ready"),
+            mock.patch.object(_RUNNER, "_wait_ci_runner_exit_code", return_value=0),
+            mock.patch.object(_RUNNER, "_delete_apply_id", side_effect=RuntimeError("controller stop failed")),
+            mock.patch("builtins.print") as print_mock,
+        ):
+            executed = _RUNNER._execute_ci_case(
+                planned_case=mock.Mock(ci_commands=[]),
+                resolved_case=resolved_case,
+                run_dir=Path("/tmp/ci_run_dir"),
+                run_index=3,
+                started_at=100,
+                prepared_case=prepared_case,
+                runtime_tracking=tracking,
+            )
+
+        self.assertEqual(executed.outcome, _RUNNER.RUN_OUTCOME_SUCCESS)
+        self.assertEqual(executed.summary["ci"], {"rc": 0})
+        self.assertNotIn("ci_runner", tracking.ci_apply_ids)
+        self.assertTrue(any("terminal success cleanup failed" in str(call) for call in print_mock.call_args_list))
+
+    def test_wait_ci_runner_exit_code_prefers_exit_code_file_after_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            exit_code_path = run_dir / "logs" / "ci_runner" / "exit_code.txt"
+            exit_code_path.parent.mkdir(parents=True, exist_ok=True)
+            resolved_case = {
+                "deploy": {
+                    "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                    "target_ip_map": {"logic-a": "10.0.0.2"},
+                    "instances": [
+                        {
+                            "id": "ci_runner",
+                            "k8s_ref": "deployment/ci-runner",
+                            "deployer": {"target": "logic-a"},
+                        }
+                    ],
+                }
+            }
+            baseline_state = None
+            observe_states = [None, None, _RUNNER._ObservedFileState(size=2, mtime_ns=1)]
+            status_calls = [
+                {"ok": True, "running": False, "exit_code": 143},
+            ]
+            file_reads = iter([None, "0\n"])
+
+            def _fake_observe_file_state(path: Path):
+                self.assertEqual(path, exit_code_path.resolve())
+                if observe_states:
+                    return observe_states.pop(0)
+                return _RUNNER._ObservedFileState(size=2, mtime_ns=1)
+
+            def _fake_instance_read_text_if_present(*_args, **_kwargs):
+                return next(file_reads, "0\n")
+
+            def _fake_instance_status(*_args, **_kwargs):
+                return status_calls.pop(0)
+
+            with (
+                mock.patch.object(_RUNNER, "_print_ci_wait_progress", return_value=(0, 999999999.0, "")),
+                mock.patch.object(_RUNNER, "_observe_file_state", side_effect=_fake_observe_file_state),
+                mock.patch.object(_RUNNER, "_instance_read_text_if_present", side_effect=_fake_instance_read_text_if_present),
+                mock.patch.object(_RUNNER, "_instance_status", side_effect=_fake_instance_status),
+                mock.patch.object(_RUNNER.time, "sleep"),
+            ):
+                exit_code_path.write_text("0\n", encoding="utf-8")
+                rc = _RUNNER._wait_ci_runner_exit_code(
+                    resolved_case=resolved_case,
+                    run_dir=run_dir,
+                    timeout_s=60,
+                    baseline_state=baseline_state,
+                )
+
+            self.assertEqual(rc, 0)
+
+    def test_wait_ci_runner_exit_code_prefers_stdout_marker_after_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            exit_code_path = (run_dir / "logs" / "ci_runner" / "exit_code.txt").resolve()
+            stdout_path = (run_dir / "logs" / "ci_runner" / "stdout.log").resolve()
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            resolved_case = {
+                "deploy": {
+                    "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                    "target_ip_map": {"logic-a": "10.0.0.2"},
+                    "instances": [
+                        {
+                            "id": "ci_runner",
+                            "k8s_ref": "deployment/ci-runner",
+                            "deployer": {"target": "logic-a"},
+                        }
+                    ],
+                }
+            }
+            status_calls = [
+                {"ok": True, "running": False, "exit_code": 143},
+            ]
+            stdout_reads = iter(
+                [
+                    "[ci_runner] running tests\n",
+                    "[ci_runner] SUCCESS rc=0\n[ci_runner] wrote exit_code=0; holding until controller stop\n",
+                ]
+            )
+
+            def _fake_observe_file_state(path: Path):
+                self.assertEqual(path, exit_code_path)
+                return None
+
+            def _fake_instance_read_text_if_present(*_args, **kwargs):
+                path = kwargs["path"]
+                if path == exit_code_path:
+                    return None
+                self.assertEqual(path, stdout_path)
+                return next(stdout_reads)
+
+            def _fake_instance_status(*_args, **_kwargs):
+                return status_calls.pop(0)
+
+            with (
+                mock.patch.object(_RUNNER, "_print_ci_wait_progress", return_value=(0, 999999999.0, "")),
+                mock.patch.object(_RUNNER, "_observe_file_state", side_effect=_fake_observe_file_state),
+                mock.patch.object(_RUNNER, "_instance_read_text_if_present", side_effect=_fake_instance_read_text_if_present),
+                mock.patch.object(_RUNNER, "_instance_status", side_effect=_fake_instance_status),
+                mock.patch.object(_RUNNER.time, "sleep"),
+            ):
+                rc = _RUNNER._wait_ci_runner_exit_code(
+                    resolved_case=resolved_case,
+                    run_dir=run_dir,
+                    timeout_s=60,
+                    baseline_state=None,
+                )
+
+            self.assertEqual(rc, 0)
+
+    def test_wait_ci_runner_exit_code_returns_progress_stdout_marker_without_second_read(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            exit_code_path = (run_dir / "logs" / "ci_runner" / "exit_code.txt").resolve()
+            resolved_case = {
+                "deploy": {
+                    "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                    "target_ip_map": {"logic-a": "10.0.0.2"},
+                    "instances": [
+                        {
+                            "id": "ci_runner",
+                            "k8s_ref": "deployment/ci-runner",
+                            "deployer": {"target": "logic-a"},
+                        }
+                    ],
+                }
+            }
+            stdout_chunk = (
+                "[ci_runner] SUCCESS rc=0\n"
+                "[ci_runner] wrote exit_code=0; holding until controller stop\n"
+            )
+
+            with (
+                mock.patch.object(
+                    _RUNNER,
+                    "_print_ci_wait_progress",
+                    return_value=(len(stdout_chunk), 999999999.0, stdout_chunk),
+                ),
+                mock.patch.object(_RUNNER, "_observe_file_state", side_effect=AssertionError("exit_code should not be reread")),
+                mock.patch.object(_RUNNER, "_instance_read_text_if_present", side_effect=AssertionError("stdout should not be reread")),
+                mock.patch.object(_RUNNER, "_instance_status", side_effect=AssertionError("status should not be queried")),
+            ):
+                rc = _RUNNER._wait_ci_runner_exit_code(
+                    resolved_case=resolved_case,
+                    run_dir=run_dir,
+                    timeout_s=60,
+                    baseline_state=None,
+                )
+
+            self.assertEqual(exit_code_path.name, "exit_code.txt")
+            self.assertEqual(rc, 0)
+
+    def test_wait_ci_runner_exit_code_uses_stdout_marker_when_exit_code_file_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            exit_code_path = run_dir / "logs" / "ci_runner" / "exit_code.txt"
+            stdout_path = run_dir / "logs" / "ci_runner" / "stdout.log"
+            exit_code_path.parent.mkdir(parents=True, exist_ok=True)
+            exit_code_path.write_text("", encoding="utf-8")
+            stdout_path.write_text(
+                "[ci_runner] SUCCESS rc=0\n[ci_runner] wrote exit_code=0; holding until controller stop\n",
+                encoding="utf-8",
+            )
+            resolved_case = {
+                "deploy": {
+                    "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                    "target_ip_map": {"logic-a": "10.0.0.2"},
+                    "instances": [
+                        {
+                            "id": "ci_runner",
+                            "k8s_ref": "deployment/ci-runner",
+                            "deployer": {"target": "logic-a"},
+                        }
+                    ],
+                }
+            }
+
+            rc = _RUNNER._read_ci_runner_exit_code_if_present(
+                resolved_case=resolved_case,
+                run_dir=run_dir,
+                baseline_state=None,
+                local_ctx="ci_runner.exit_code",
+                remote_ctx="ci_runner.remote_exit_code",
+            )
+
+            self.assertEqual(rc, 0)
+
+    def test_wait_ci_runner_exit_code_resume_prefers_exit_code_file_after_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            exit_code_path = run_dir / "logs" / "ci_runner" / "exit_code.txt"
+            exit_code_path.parent.mkdir(parents=True, exist_ok=True)
+            resolved_case = {
+                "deploy": {
+                    "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                    "target_ip_map": {"logic-a": "10.0.0.2"},
+                    "instances": [
+                        {
+                            "id": "ci_runner",
+                            "k8s_ref": "deployment/ci-runner",
+                            "deployer": {"target": "logic-a"},
+                        }
+                    ],
+                }
+            }
+            observe_states = [None, None, _RUNNER._ObservedFileState(size=2, mtime_ns=1)]
+            status_calls = [
+                {"ok": True, "running": False, "exit_code": 143},
+            ]
+            file_reads = iter([None, "0\n"])
+
+            def _fake_observe_file_state(path: Path):
+                self.assertEqual(path, exit_code_path.resolve())
+                if observe_states:
+                    return observe_states.pop(0)
+                return _RUNNER._ObservedFileState(size=2, mtime_ns=1)
+
+            def _fake_instance_read_text_if_present(*_args, **_kwargs):
+                return next(file_reads, "0\n")
+
+            def _fake_instance_status(*_args, **_kwargs):
+                return status_calls.pop(0)
+
+            with (
+                mock.patch.object(_RUNNER, "_observe_file_state", side_effect=_fake_observe_file_state),
+                mock.patch.object(_RUNNER, "_instance_read_text_if_present", side_effect=_fake_instance_read_text_if_present),
+                mock.patch.object(_RUNNER, "_instance_status", side_effect=_fake_instance_status),
+                mock.patch.object(_RUNNER.time, "sleep"),
+            ):
+                exit_code_path.write_text("0\n", encoding="utf-8")
+                rc = _RUNNER._wait_ci_runner_exit_code_resume(
+                    resolved_case=resolved_case,
+                    run_dir=run_dir,
+                    timeout_s=60,
+                )
+
+            self.assertEqual(rc, 0)
 
     def test_finalize_ci_case_runtime_preserves_structured_instance_ids(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -197,6 +757,110 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     ],
                 },
             )
+
+    def test_finalize_test_stack_case_runtime_collects_status_and_records_collect_error(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            summary_path = run_dir / "summary.yaml"
+            _RUNNER._write_yaml_file(
+                summary_path,
+                {
+                    "schema_version": _RUNNER.SCHEMA_VERSION,
+                    "case_id": "bench_case",
+                    "case_key": "bench_case_key",
+                    "run_index": 1,
+                    "outcome": _RUNNER.RUN_OUTCOME_FAILED,
+                    "counted": False,
+                    "timing": {
+                        "started_at_unix_s": 100,
+                        "finished_at_unix_s": 200,
+                    },
+                    "test_stack": {
+                        "coordinator_addr": "127.0.0.1:19999",
+                        "completion_signal": "benchmark_result_json",
+                        "result_path": str((run_dir / "benchmark_result.json").resolve()),
+                        "result": None,
+                        "error": "RuntimeError: benchmark failed",
+                        "collect_error": None,
+                    },
+                },
+            )
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_DEBUG_ONE_BY_ONE,
+                    "case_id": "bench_case",
+                    "case_key": "bench_case_key",
+                },
+                "deploy": {
+                    "instances": [
+                        {"id": "coordinator", "deployer": {"target": "local-node-a"}},
+                        {"id": "node_0", "deployer": {"target": "local-node-b"}},
+                    ]
+                },
+            }
+            tracking = _RUNNER._CaseRuntimeTracking(
+                ts_coord_deploy_attempted=True,
+                ts_coord_apply_id="apply-coord",
+                ts_nodes_deploy_attempted=True,
+                ts_nodes_apply_id="apply-node",
+            )
+
+            def _fake_run_adapter_action(resolved_case, *, run_dir: Path, action: str):
+                self.assertEqual(action, "collect")
+                instances = _RUNNER._require_list(resolved_case["deploy"]["instances"], "resolved_case.deploy.instances")
+                for instance in instances:
+                    inst_id = _RUNNER._require_str(instance.get("id"), "deploy.instances[].id")
+                    inst_dir = (run_dir / "logs" / inst_id).resolve()
+                    inst_dir.mkdir(parents=True, exist_ok=True)
+                    _RUNNER._write_yaml_file(
+                        inst_dir / "status.yaml",
+                        {"status_code": 500, "status": {"ok": False, "instance_id": inst_id}},
+                    )
+                raise RuntimeError("collect boom")
+
+            with mock.patch.object(_RUNNER, "_run_adapter_action", side_effect=_fake_run_adapter_action):
+                with mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply:
+                    _RUNNER._finalize_test_stack_case_runtime(
+                        resolved_case,
+                        run_dir=run_dir,
+                        runtime_tracking=tracking,
+                        outcome=_RUNNER.RUN_OUTCOME_FAILED,
+                    )
+
+            delete_apply.assert_not_called()
+            self.assertTrue((run_dir / "logs" / "coordinator" / "status.yaml").exists())
+            self.assertTrue((run_dir / "logs" / "node_0" / "status.yaml").exists())
+            updated_summary = yaml.safe_load(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                updated_summary["test_stack"]["collect_error"],
+                "RuntimeError: collect boom",
+            )
+
+    def test_finalize_error_preserves_success_for_ci_and_bench(self) -> None:
+        self.assertTrue(
+            _RUNNER._preserve_success_after_finalize_error(
+                case_family=_RUNNER.CASE_FAMILY_CI,
+                outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+            )
+        )
+        self.assertTrue(
+            _RUNNER._preserve_success_after_finalize_error(
+                case_family=_RUNNER.CASE_FAMILY_BENCH,
+                outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+            )
+        )
+        self.assertFalse(
+            _RUNNER._preserve_success_after_finalize_error(
+                case_family=_RUNNER.CASE_FAMILY_CI,
+                outcome=_RUNNER.RUN_OUTCOME_FAILED,
+            )
+        )
+        self.assertFalse(
+            _RUNNER._preserve_success_after_finalize_error(
+                case_family=_RUNNER.CASE_FAMILY_INFER,
+                outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+            )
+        )
 
     def test_write_ci_scene_config_yaml_emits_structured_scene_config(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -313,6 +977,77 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_bin_kvtest")
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
 
+    def test_top_attention_cargo_fs_core_ci_execution_plan_is_runner_native(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        case = next(item for item in cases if item.scene_id == "ci_top_attention_cargo_fs_core" and item.profile_id == "fluxon_tcp")
+        planned = _RUNNER._build_ci_execution_plan(case, suite)
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_cargo_fs_core")
+        self.assertIn(
+            "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs_core.py",
+            planned[0].ci_commands[0]["command"],
+        )
+        self.assertNotIn("--case-config", planned[0].ci_commands[0]["command"])
+
+    def test_top_attention_cargo_util_ci_execution_plan_is_runner_native(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        case = next(item for item in cases if item.scene_id == "ci_top_attention_cargo_util" and item.profile_id == "fluxon_tcp")
+        planned = _RUNNER._build_ci_execution_plan(case, suite)
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_cargo_util")
+        self.assertIn(
+            "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_util.py",
+            planned[0].ci_commands[0]["command"],
+        )
+        self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
+
+    def test_top_attention_cargo_kv_unit_ci_execution_plan_is_runner_native(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        case = next(item for item in cases if item.scene_id == "ci_top_attention_cargo_kv_unit" and item.profile_id == "fluxon_tcp")
+        planned = _RUNNER._build_ci_execution_plan(case, suite)
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_cargo_kv_unit")
+        self.assertIn(
+            "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_kv_unit.py",
+            planned[0].ci_commands[0]["command"],
+        )
+        self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
+
+    def test_additional_top_attention_cargo_ci_execution_plans_are_runner_native(self) -> None:
+        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        expected = {
+            "ci_top_attention_cargo_cli": ("top_attention_cargo_cli", "_cargo_cli.py"),
+            "ci_top_attention_cargo_commu": ("top_attention_cargo_commu", "_cargo_commu.py"),
+            "ci_top_attention_cargo_commu_contract": ("top_attention_cargo_commu_contract", "_cargo_commu_contract.py"),
+            "ci_top_attention_cargo_framework": ("top_attention_cargo_framework", "_cargo_framework.py"),
+            "ci_top_attention_cargo_fs": ("top_attention_cargo_fs", "_cargo_fs.py"),
+            "ci_top_attention_cargo_fs_s3_gateway": ("top_attention_cargo_fs_s3_gateway", "_cargo_fs_s3_gateway.py"),
+            "ci_top_attention_cargo_limit_thirdparty": ("top_attention_cargo_limit_thirdparty", "_cargo_limit_thirdparty.py"),
+            "ci_top_attention_cargo_mq": ("top_attention_cargo_mq", "_cargo_mq.py"),
+            "ci_top_attention_cargo_observability": ("top_attention_cargo_observability", "_cargo_observability.py"),
+            "ci_top_attention_cargo_ops": ("top_attention_cargo_ops", "_cargo_ops.py"),
+            "ci_top_attention_cargo_pyo3": ("top_attention_cargo_pyo3", "_cargo_pyo3.py"),
+        }
+        for scene_id, (command_id, script_name) in expected.items():
+            with self.subTest(scene_id=scene_id):
+                case = next(item for item in cases if item.scene_id == scene_id and item.profile_id == "fluxon_tcp")
+                planned = _RUNNER._build_ci_execution_plan(case, suite)
+                self.assertEqual(len(planned), 1)
+                self.assertEqual(planned[0].ci_commands[0]["id"], command_id)
+                self.assertIn(
+                    f"__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/{script_name}",
+                    planned[0].ci_commands[0]["command"],
+                )
+                self.assertNotIn("--case-config", planned[0].ci_commands[0]["command"])
+
     def test_top_attention_log_mgmt_ci_execution_plan_is_runner_native(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
         artifact_sets = suite_cfg.get("artifact_sets")
@@ -333,7 +1068,6 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_log_mgmt")
         self.assertIn(
             "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_log_mgmt.py",
-
             planned[0].ci_commands[0]["command"],
         )
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
@@ -351,6 +1085,36 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             planned[0].ci_commands[0]["command"],
         )
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
+
+    def test_top_attention_mq_core_ci_plan_has_no_collect_phase(self) -> None:
+        resolved_case = {
+            "case": {
+                "family": "ci",
+                "case_id": "ci_top_attention_mq_core__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+            },
+            "scene": {
+                "ci": {
+                    "runtime_contract": "cluster_kv_owner",
+                    "subject": "mq",
+                },
+            },
+            "deploy": {
+                "instances": [
+                    {"id": "master"},
+                    {"id": "owner_0"},
+                    {"id": "ci_runner"},
+                ],
+            },
+            "runtime_model": {
+                "test_bed": {"kind": "ops"},
+                "base_runtime": {},
+                "case_runtime": {"instance_ids": ["master", "owner_0", "ci_runner"]},
+            },
+        }
+        case_plan = _RUNNER._compile_case_plan(resolved_case)
+        self.assertEqual(tuple(phase.phase_id for phase in case_plan.prepare_phases), ("cluster_runtime",))
+        self.assertEqual(tuple(phase.phase_id for phase in case_plan.execute_phases), ("ci_runner",))
+        self.assertEqual(case_plan.execute_phases[0].instance_ids, ("ci_runner",))
 
     def test_doc_page_ci_execution_plan_uses_online_docker_image(self) -> None:
         suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))

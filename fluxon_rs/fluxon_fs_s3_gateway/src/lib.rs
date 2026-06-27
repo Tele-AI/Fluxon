@@ -5344,6 +5344,9 @@ mod tests {
     };
     use crate::transfer::encode_transfer_manifest_blob_with_empty_dirs;
     use fluxon_fs_core::config::{
+        FS_CACHE_DEFAULT_WRITE_SESSION_TARGET_INFLIGHT_BYTES_V1,
+        FS_EXPORT_DEFAULT_INLINE_BYTES_MAX_BYTES_V1,
+        FS_EXPORT_DEFAULT_METADATA_CACHE_TTL_MS_V1,
         FLUXON_FS_LOCAL_TRANSFER_CHECK_DST_EXPORT, FLUXON_FS_LOCAL_TRANSFER_CHECK_SRC_EXPORT,
         FluxonFsAccessModel, FluxonFsAccessUser, FluxonFsExport, FluxonFsExportRoutingMode,
         FluxonFsGlobalConfig, FluxonFsLocalTransferCheckJobSpecWire, FluxonFsRequestIdentity,
@@ -6242,6 +6245,9 @@ mod tests {
             cache_kv_key_prefix: format!("/{}/", name),
             cache_bytes_field_key: format!("{}_bytes", name),
             cache_max_bytes: 1024,
+            inline_bytes_max_bytes: FS_EXPORT_DEFAULT_INLINE_BYTES_MAX_BYTES_V1,
+            metadata_cache_ttl_ms: FS_EXPORT_DEFAULT_METADATA_CACHE_TTL_MS_V1,
+            async_backfill_enabled: true,
             rpc_paths: export_rpc_paths_for_export_name_v1(name),
         }
     }
@@ -6518,6 +6524,8 @@ mod tests {
                 access_config.clone(),
                 Arc::new(FluxonFsGlobalConfig {
                     stale_window_ms: 0,
+                    write_session_target_inflight_bytes:
+                        FS_CACHE_DEFAULT_WRITE_SESSION_TARGET_INFLIGHT_BYTES_V1,
                     rules: Vec::new(),
                     exports: BTreeMap::new(),
                 }),
@@ -6814,6 +6822,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             test_gateway_access_config(),
             Arc::new(FluxonFsGlobalConfig {
                 stale_window_ms: 0,
+                write_session_target_inflight_bytes:
+                    FS_CACHE_DEFAULT_WRITE_SESSION_TARGET_INFLIGHT_BYTES_V1,
                 rules: Vec::new(),
                 exports: BTreeMap::new(),
             }),
@@ -6918,6 +6928,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         }
         let fs_cache = FluxonFsGlobalConfig {
             stale_window_ms: 0,
+            write_session_target_inflight_bytes:
+                FS_CACHE_DEFAULT_WRITE_SESSION_TARGET_INFLIGHT_BYTES_V1,
             rules: Vec::new(),
             exports,
         };
@@ -6992,6 +7004,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         }
         let fs_cache = FluxonFsGlobalConfig {
             stale_window_ms: 0,
+            write_session_target_inflight_bytes:
+                FS_CACHE_DEFAULT_WRITE_SESSION_TARGET_INFLIGHT_BYTES_V1,
             rules: Vec::new(),
             exports,
         };
@@ -7038,6 +7052,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             access_config,
             Arc::new(FluxonFsGlobalConfig {
                 stale_window_ms: 0,
+                write_session_target_inflight_bytes:
+                    FS_CACHE_DEFAULT_WRITE_SESSION_TARGET_INFLIGHT_BYTES_V1,
                 rules: Vec::new(),
                 exports: BTreeMap::new(),
             }),
@@ -10780,6 +10796,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
 
         let fs_cache = FluxonFsGlobalConfig {
             stale_window_ms: 0,
+            write_session_target_inflight_bytes:
+                FS_CACHE_DEFAULT_WRITE_SESSION_TARGET_INFLIGHT_BYTES_V1,
             rules: Vec::new(),
             exports: BTreeMap::new(),
         };

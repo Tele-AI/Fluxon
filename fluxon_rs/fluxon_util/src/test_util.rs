@@ -170,6 +170,9 @@ pub fn start_test_etcd() -> Result<(), Box<dyn Error>> {
     let mut guard = etcd_process()
         .lock()
         .map_err(|_| boxed_error("test etcd process mutex poisoned"))?;
+    if endpoint_health(&endpoint, Duration::from_secs(2)) {
+        return Ok(());
+    }
     if let Some(child) = guard.as_mut() {
         if child.try_wait()?.is_none() {
             wait_for_etcd_ready(child, &endpoint)?;
@@ -239,13 +242,17 @@ pub fn start_test_etcd() -> Result<(), Box<dyn Error>> {
             ))
         })?;
 
-    wait_for_etcd_ready(&mut child, &endpoint).map_err(|e| {
+    if let Err(e) = wait_for_etcd_ready(&mut child, &endpoint) {
+        if endpoint_health(&endpoint, Duration::from_secs(2)) {
+            let _ = child.wait();
+            return Ok(());
+        }
         let stdout_hint = read_log_tail(&stdout_path);
         let stderr_hint = read_log_tail(&stderr_path);
-        boxed_error(format!(
+        return Err(boxed_error(format!(
             "{e}\netcd stdout tail:\n{stdout_hint}\netcd stderr tail:\n{stderr_hint}"
-        ))
-    })?;
+        )));
+    }
     *guard = Some(child);
     Ok(())
 }
