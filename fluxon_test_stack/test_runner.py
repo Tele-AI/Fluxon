@@ -11181,9 +11181,10 @@ def _ci_cleanup_runtime(
     resolved_case: Dict[str, Any],
     *,
     timeout_s: int,
+    instance_ids: Optional[List[str]] = None,
 ) -> None:
     cleanup_case = _ci_runtime_cleanup_case(resolved_case, ctx="CI cleanup runtime")
-    for entry in _ci_runtime_current_apply_ids(cleanup_case):
+    for entry in _ci_runtime_current_apply_ids(cleanup_case, instance_ids=instance_ids):
         apply_id = _require_str(entry.get("apply_id"), "current_apply_entry.apply_id")
         instance_ids = _require_list(entry.get("instance_ids"), "current_apply_entry.instance_ids")
         instance_id_text = ",".join(
@@ -11954,17 +11955,24 @@ def _cleanup_skipped_case_desired_applies(*, controller_url: str, case_id: str) 
         time.sleep(1.0)
 
 
-def _ci_runtime_current_apply_ids(resolved_case: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _ci_runtime_current_apply_ids(
+    resolved_case: Dict[str, Any],
+    *,
+    instance_ids: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     cleanup_case = _ci_runtime_cleanup_case(resolved_case, ctx="CI current runtime apply ids")
     deploy = _require_dict(cleanup_case.get("deploy"), "resolved_case.deploy")
     controller_url = _require_str(deploy.get("controller_url"), "deploy.controller_url").rstrip("/")
     deploy_instances = _require_list(deploy.get("instances"), "resolved_case.deploy.instances")
+    allowed_instance_ids = None if instance_ids is None else set(instance_ids)
 
     workload_to_instance_ids: Dict[Tuple[str, str], List[str]] = {}
     for raw in deploy_instances:
         inst = _require_dict(raw, "resolved_case.deploy.instances[]")
         instance_id = _require_str(inst.get("id"), "resolved_case.deploy.instances[].id")
         if instance_id not in set(_ci_case_instance_ids(cleanup_case)):
+            continue
+        if allowed_instance_ids is not None and instance_id not in allowed_instance_ids:
             continue
         k8s_ref = _require_str(inst.get("k8s_ref"), f"{instance_id}.k8s_ref")
         kind, name = _ops_kind_from_k8s_ref(k8s_ref, ctx=f"{instance_id}.k8s_ref")

@@ -378,6 +378,12 @@ def _execute_ci_case(
         ),
     )
     outcome = ctx.RUN_OUTCOME_SUCCESS if rc == 0 else ctx.RUN_OUTCOME_FAILED
+    if outcome == ctx.RUN_OUTCOME_SUCCESS:
+        _finalize_terminal_ci_runner_success(
+            ctx=ctx,
+            resolved_case=resolved_case,
+            runtime_tracking=runtime_tracking,
+        )
     summary = ctx._build_ci_summary_yaml(
         resolved_case,
         run_index=run_index,
@@ -388,6 +394,29 @@ def _execute_ci_case(
         ci_out={"rc": rc},
     )
     return ctx._ExecutedCase(outcome=outcome, summary=summary)
+
+
+def _finalize_terminal_ci_runner_success(
+    *,
+    ctx: Any,
+    resolved_case: Dict[str, Any],
+    runtime_tracking: Any,
+) -> None:
+    apply_id = runtime_tracking.ci_apply_ids.pop("ci_runner", None)
+    if apply_id is None:
+        return
+    try:
+        ctx._delete_apply_id(
+            resolved_case,
+            apply_id=ctx._require_str(apply_id, "CI ci_runner apply_id"),
+            ctx="CI ci_runner terminal success apply",
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            "WARN: CI ci_runner terminal success cleanup failed; "
+            f"preserving terminal test result and excluding ci_runner from finalize tracking: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
 
 
 def _execute_test_stack_case(
@@ -564,10 +593,15 @@ def _finalize_ci_case_runtime(
     should_teardown = outcome == ctx.RUN_OUTCOME_SUCCESS or run_mode == ctx.RUN_MODE_FULL_ONCE
     if should_teardown:
         (run_dir / ctx.CI_PRESERVED_APPLY_IDS_FILENAME).unlink(missing_ok=True)
+        cleanup_instance_ids: list[str] = []
         for entry in reversed(tracked_apply_entries):
             apply_id = ctx._require_str(entry.get("apply_id"), "ci tracked apply entry.apply_id")
             instance_ids = ctx._require_list(entry.get("instance_ids"), "ci tracked apply entry.instance_ids")
             instance_id_text = ",".join(
+                ctx._require_str(raw_instance_id, "ci tracked apply entry.instance_ids[]")
+                for raw_instance_id in instance_ids
+            )
+            cleanup_instance_ids.extend(
                 ctx._require_str(raw_instance_id, "ci tracked apply entry.instance_ids[]")
                 for raw_instance_id in instance_ids
             )
@@ -576,7 +610,7 @@ def _finalize_ci_case_runtime(
                 apply_id=apply_id,
                 ctx=f"CI {instance_id_text} apply",
             )
-        ctx._ci_cleanup_runtime(resolved_case, timeout_s=120)
+        ctx._ci_cleanup_runtime(resolved_case, timeout_s=120, instance_ids=cleanup_instance_ids)
         return
     if not ci_preserved_apply_ids:
         return
