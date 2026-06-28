@@ -27,6 +27,32 @@ _ENTRY = _load_module()
 
 
 class TestTopAttentionCommonContract(unittest.TestCase):
+    def test_call_enables_rust_backtrace_for_default_env(self) -> None:
+        with mock.patch.object(_ENTRY.subprocess, "call", return_value=0) as subprocess_call:
+            rc = _ENTRY.call(["cargo", "test"])
+
+        self.assertEqual(rc, 0)
+        prepared_env = subprocess_call.call_args.kwargs["env"]
+        self.assertEqual(prepared_env["RUST_BACKTRACE"], "1")
+        self.assertEqual(prepared_env["RUST_LIB_BACKTRACE"], "1")
+
+    def test_call_forces_rust_backtrace_for_explicit_env(self) -> None:
+        with mock.patch.object(_ENTRY.subprocess, "call", return_value=0) as subprocess_call:
+            rc = _ENTRY.call(
+                ["cargo", "test"],
+                env={
+                    "PATH": "/usr/bin",
+                    "RUST_BACKTRACE": "0",
+                    "RUST_LIB_BACKTRACE": "0",
+                },
+            )
+
+        self.assertEqual(rc, 0)
+        prepared_env = subprocess_call.call_args.kwargs["env"]
+        self.assertEqual(prepared_env["PATH"], "/usr/bin")
+        self.assertEqual(prepared_env["RUST_BACKTRACE"], "1")
+        self.assertEqual(prepared_env["RUST_LIB_BACKTRACE"], "1")
+
     def test_prepare_cargo_env_prefers_active_fluxon_pyo3_libs_dir_and_sanitizes_loader_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

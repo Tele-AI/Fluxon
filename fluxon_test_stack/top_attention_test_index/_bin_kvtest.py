@@ -7,7 +7,6 @@ from pathlib import Path
 
 from _common import (
     REPO_ROOT,
-    inject_build_config_ext_env,
     load_case_config_payload,
     run_cargo,
     write_build_config_ext,
@@ -57,7 +56,7 @@ def main() -> int:
     scene_runtime = case_payload.get("scene_runtime")
     if not isinstance(scene_runtime, dict):
         raise ValueError("case config must define scene_runtime mapping")
-    build_config_ext_path = write_build_config_ext(case_cfg_path, scene_runtime=scene_runtime)
+    write_build_config_ext(case_cfg_path, scene_runtime=scene_runtime)
 
     cargo_args = [
         "run",
@@ -71,11 +70,9 @@ def main() -> int:
     ]
     if passthrough:
         cargo_args.extend(["--", *passthrough])
-    env = inject_build_config_ext_env(
-        None,
-        build_config_ext_path=build_config_ext_path,
-    )
+    env = None
     if rounds != "all":
+        env = os.environ.copy()
         env["FLUXON_KV_TEST_ROUNDS"] = rounds
     return run_cargo(cargo_args, env=env)
 

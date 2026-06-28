@@ -6,7 +6,6 @@ from pathlib import Path
 
 from _common import (
     REPO_ROOT,
-    inject_build_config_ext_env,
     load_case_config_payload,
     run_cargo,
     write_build_config_ext,
@@ -25,23 +24,18 @@ def main() -> int:
         help="Canonical CI case config YAML emitted by test_runner.",
     )
     args = parser.parse_args()
-    env = None
     if args.case_config:
         case_cfg_path = Path(args.case_config).resolve()
         case_payload = load_case_config_payload(case_cfg_path, expected_scene_id=SCENE_ID)
         scene_runtime = case_payload.get("scene_runtime")
         if not isinstance(scene_runtime, dict):
             raise ValueError("case config must define scene_runtime mapping")
-        build_config_ext_path = write_build_config_ext(case_cfg_path, scene_runtime=scene_runtime)
-        env = inject_build_config_ext_env(
-            env,
-            build_config_ext_path=build_config_ext_path,
-        )
+        write_build_config_ext(case_cfg_path, scene_runtime=scene_runtime)
     return run_cargo([
         "test",
         "--manifest-path",
         str(REPO_ROOT / "fluxon_rs" / "fluxon_util" / "Cargo.toml"),
-    ], env=env)
+    ])
 
 
 if __name__ == "__main__":

@@ -1,43 +1,42 @@
 use crate::test_util::{is_etcd_running, start_test_etcd};
 use std::fs;
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use tempfile::TempDir;
 
-const BUILD_CONFIG_EXT_PATH_ENV: &str = "FLUXON_BUILD_CONFIG_EXT_PATH";
-
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<String>,
+struct BuildConfigGuard {
+    path: PathBuf,
+    previous: Option<Vec<u8>>,
 }
 
-impl EnvVarGuard {
-    fn set(key: &'static str, value: impl Into<String>) -> Self {
-        let previous = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value.into());
-        }
-        Self { key, previous }
+impl BuildConfigGuard {
+    fn install(content: String) -> Self {
+        let path = crate::dev_config::repo_root()
+            .expect("repo root")
+            .join("build_config_ext.yml");
+        let previous = fs::read(&path).ok();
+        fs::write(&path, content).expect("write test build_config_ext.yml");
+        Self { path, previous }
     }
 }
 
-impl Drop for EnvVarGuard {
+impl Drop for BuildConfigGuard {
     fn drop(&mut self) {
-        match self.previous.as_deref() {
-            Some(value) => unsafe {
-                std::env::set_var(self.key, value);
-            },
-            None => unsafe {
-                std::env::remove_var(self.key);
-            },
+        match &self.previous {
+            Some(content) => {
+                fs::write(&self.path, content).expect("restore previous build_config_ext.yml")
+            }
+            None => {
+                let _ = fs::remove_file(&self.path);
+            }
         }
     }
 }
 
-fn build_config_env_lock() -> &'static Mutex<()> {
-    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-    ENV_MUTEX.get_or_init(|| Mutex::new(()))
+fn build_config_file_lock() -> &'static Mutex<()> {
+    static BUILD_CONFIG_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    BUILD_CONFIG_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
 fn pick_free_etcd_port_pair() -> (u16, u16) {
@@ -60,28 +59,18 @@ fn pick_free_etcd_port_pair() -> (u16, u16) {
     panic!("failed to reserve a free etcd port pair");
 }
 
-fn install_test_build_config_ext() -> (TempDir, EnvVarGuard) {
-    let temp_dir = TempDir::new().expect("create temp build config dir");
+fn install_test_build_config_ext() -> BuildConfigGuard {
     let (client_port, _peer_port) = pick_free_etcd_port_pair();
-    let build_config_ext_path = temp_dir.path().join("build_config_ext.yml");
-    fs::write(
-        &build_config_ext_path,
-        format!("etcd: 127.0.0.1:{client_port}\n"),
-    )
-    .expect("write temp build_config_ext");
-    let guard = EnvVarGuard::set(BUILD_CONFIG_EXT_PATH_ENV, build_config_ext_path.display().to_string());
-    (temp_dir, guard)
+    BuildConfigGuard::install(format!("etcd: 127.0.0.1:{client_port}\n"))
 }
 
 #[test]
 #[serial_test::serial(build_config_ext)]
 fn test_etcd_only_starts_once() {
-    let _env_lock = build_config_env_lock().lock().expect("lock build config env");
-    let _temp_build_config = if std::env::var_os(BUILD_CONFIG_EXT_PATH_ENV).is_none() {
-        Some(install_test_build_config_ext())
-    } else {
-        None
-    };
+    let _config_lock = build_config_file_lock()
+        .lock()
+        .expect("lock build config file");
+    let _test_build_config = install_test_build_config_ext();
     start_test_etcd().expect("start local test etcd");
     assert!(is_etcd_running(), "etcd should be reachable after startup");
 
