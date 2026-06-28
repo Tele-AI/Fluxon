@@ -224,7 +224,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             "tcp_thread_transport",
         )
 
-    def test_generated_suite_supports_additional_runner_native_cargo_scenes(self) -> None:
+    def test_generated_suite_supports_additional_cargo_ci_scenes(self) -> None:
         scene_ids = [
             self._CARGO_CLI_SCENE_ID,
             self._CARGO_COMMU_SCENE_ID,

@@ -115,6 +115,35 @@ def _import_test_runner_module():
 _TEST_RUNNER = _import_test_runner_module()
 
 
+def _top_attention_command(
+    *,
+    command_id: str,
+    script_name: str,
+    case_config: bool = False,
+    timeout_seconds: int = 21600,
+) -> dict:
+    command = (
+        "__RUN_DIR__/venv/bin/python3 -u "
+        f"__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/{script_name}"
+    )
+    if case_config:
+        command += " --case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+    return {
+        "id": command_id,
+        "command": command,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def _suite_cfg_with_declared_ci_commands(command_map: dict[str, list[dict]]) -> dict:
+    repo_root = Path(__file__).resolve().parents[2]
+    suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
+    suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
+    for scene_id, commands in command_map.items():
+        suite_cfg["scenes"][scene_id]["ci"]["commands"] = copy.deepcopy(commands)
+    return suite_cfg
+
+
 def test_tcp_thread_keeps_protocol_implicit() -> None:
     kv_base = {
         "instance_key": "bench_base",
@@ -203,9 +232,18 @@ def test_suite_requires_benchmark_bundle_only_for_bench_cases() -> None:
 
 
 def test_ci_top_attention_doc_page_build_uses_online_docker_image() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
-    suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
+    suite_cfg = _suite_cfg_with_declared_ci_commands(
+        {
+            "ci_top_attention_doc_page_build": [
+                _top_attention_command(
+                    command_id="top_attention_doc_page_build",
+                    script_name="_doc_page_build.py",
+                    case_config=True,
+                    timeout_seconds=10800,
+                )
+            ]
+        }
+    )
     if not isinstance(suite_cfg, dict):
         print("FAIL: test_ci_top_attention_doc_page_build_uses_online_docker_image - suite config is not a mapping")
         return
@@ -353,9 +391,17 @@ def test_ci_top_attention_additional_cargo_scenes_exist() -> None:
     print("PASS: test_ci_top_attention_additional_cargo_scenes_exist")
 
 def test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
-    suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
+    suite_cfg = _suite_cfg_with_declared_ci_commands(
+        {
+            "ci_top_attention_mq_core": [
+                _top_attention_command(
+                    command_id="top_attention_mq_core",
+                    script_name="_mq_core.py",
+                    case_config=True,
+                )
+            ]
+        }
+    )
     if not isinstance(suite_cfg, dict):
         print("FAIL: test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime - suite config is not a mapping")
         return
@@ -407,9 +453,17 @@ def test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime() -> None:
 
 
 def test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
-    suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
+    suite_cfg = _suite_cfg_with_declared_ci_commands(
+        {
+            "ci_top_attention_cargo_kv_unit": [
+                _top_attention_command(
+                    command_id="top_attention_cargo_kv_unit",
+                    script_name="_cargo_kv_unit.py",
+                    case_config=True,
+                )
+            ]
+        }
+    )
     if not isinstance(suite_cfg, dict):
         print("FAIL: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime - suite config is not a mapping")
         return

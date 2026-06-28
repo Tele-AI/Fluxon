@@ -27,7 +27,7 @@ Entries:
 - `_pack_whl.py`: forwards to `setup_and_pack/pack_fluxon_pylib.py`
 - `_pack_test_rsc.py`: forwards to `fluxon_test_stack/pack_test_stack_rsc.py`
 - `_doc_page_build.py`: builds the docs through the configured Docker builder image
-- `_bin_kvtest.py`: forwards to the Rust `kv_test` binary command. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_bin_kvtest` scene, and `test_runner.py` dispatches to it from the runner-native `top_attention` CI execution model.
+- `_bin_kvtest.py`: forwards to the Rust `kv_test` binary command. CI suites declare this wrapper through the `ci_top_attention_bin_kvtest` scene command.
 - `_bin_external_client.py`: forwards to the Rust `external_client_test` binary
 - `_ctrl_c_kv.py`: forwards to existing runtime Ctrl-C child-retirement coverage
 - `_ctrl_c_mq.py`: forwards to `fluxon_py/tests/test_mq/test_example_ctrl_c_exit.py`
@@ -47,11 +47,11 @@ Entries:
 - `_fs_remote_mount.py`: heavier Fluxon FS remote mount integration coverage
 - `_test_stack_contract.py`: test-stack runner contract coverage
 - `_deployment_codegen.py`: deployment code generation coverage
-- `_log_mgmt.py`: shared-supervisor ops log rolling plus Rust KV log sharding coverage. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_log_mgmt` scene, and `test_runner.py` dispatches to it from the runner-native `top_attention` CI execution model.
+- `_log_mgmt.py`: shared-supervisor ops log rolling plus Rust KV log sharding coverage. CI suites declare this wrapper through the `ci_top_attention_log_mgmt` scene command.
 - `_script_tools.py`: script utility coverage
-- `_cargo_fs_core.py`: cargo tests for the Rust FS core crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_fs_core` runner-native scene.
-- `_cargo_util.py`: cargo tests for the Rust util crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_util` runner-native scene, with runtime endpoints supplied through canonical `--case-config`.
-- `_cargo_kv_unit.py`: cargo tests for the Rust KV crate. `ci_test_list.yaml` now exposes this wrapper as the formal `ci_top_attention_cargo_kv_unit` runner-native scene, with transport feature selection sourced only from canonical `--case-config` (`scene_config.kv_transport_feature`).
+- `_cargo_fs_core.py`: cargo tests for the Rust FS core crate. CI suites declare this wrapper through the `ci_top_attention_cargo_fs_core` scene command.
+- `_cargo_util.py`: cargo tests for the Rust util crate. CI suites declare this wrapper through the `ci_top_attention_cargo_util` scene command, with runtime endpoints supplied through canonical `--case-config`.
+- `_cargo_kv_unit.py`: cargo tests for the Rust KV crate. CI suites declare this wrapper through the `ci_top_attention_cargo_kv_unit` scene command, with transport feature selection sourced only from canonical `--case-config` (`scene_config.kv_transport_feature`).
 - `_cargo_cli.py`: cargo tests for the Rust CLI crate
 - `_cargo_commu.py`: cargo tests for the Rust communication facade crate
 - `_cargo_commu_contract.py`: cargo tests for the Rust communication contract crate
