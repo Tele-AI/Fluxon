@@ -158,7 +158,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 "fluxon_release/install.py",
                 "fluxon_release/closed_sdk/manifest.json",
                 "fluxon_release/test_rsc/source/prepare.yaml",
-                ".dever/tmp.log",
+                "ci_2_virt_node_workdir/tmp.log",
                 "skills/demo/SKILL.md",
             ):
                 path = repo_root / relpath
@@ -176,7 +176,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                         "fluxon_release/test_rsc/*",
                         "!fluxon_release/test_rsc/source/",
                         "!fluxon_release/test_rsc/source/**",
-                        ".dever",
+                        "ci_2_virt_node_workdir/",
                     ]
                 )
                 + "\n",
@@ -248,7 +248,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 "fluxon_release/install.py",
                 "fluxon_release/closed_sdk/manifest.json",
                 "fluxon_release/test_rsc/source/prepare.yaml",
-                ".dever/tmp.log",
+                "ci_2_virt_node_workdir/tmp.log",
                 "skills/demo/SKILL.md",
             ):
                 self.assertNotIn(relpath, staged_inputs)
@@ -271,7 +271,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                     b"fluxon_doc_cn/roadmap.md",
                     b"README.md",
                     b"fluxon_release/install.py",
-                    b".dever/run.log",
+                    b"ci_2_virt_node_workdir/run.log",
                     b"skills/demo/SKILL.md",
                 ]
             ) + b"\0"
@@ -287,7 +287,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
             self.assertTrue((stage_root / "fluxon_doc_cn" / "roadmap.md").is_file())
             self.assertTrue((stage_root / "scripts" / "_build_doc_site_in_container_inner.py").is_file())
             self.assertFalse((stage_root / "fluxon_release").exists())
-            self.assertFalse((stage_root / ".dever").exists())
+            self.assertFalse((stage_root / "ci_2_virt_node_workdir").exists())
             self.assertFalse((stage_root / "skills").exists())
 
     def test_collect_ci_source_relpaths_excludes_runtime_outputs(self) -> None:
@@ -298,7 +298,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 "fluxon_doc_cn/roadmap.md",
                 "README.md",
                 "fluxon_release/install.py",
-                ".dever/run.log",
+                "ci_2_virt_node_workdir/run.log",
                 "skills/demo/SKILL.md",
             ):
                 path = repo_root / relpath
@@ -309,7 +309,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                     [
                         "fluxon_release/*",
                         "!fluxon_release/install.py",
-                        ".dever",
+                        "ci_2_virt_node_workdir/",
                         "skills/",
                     ]
                 )
@@ -323,7 +323,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                     b"fluxon_doc_cn/roadmap.md",
                     b"README.md",
                     b"fluxon_release/install.py",
-                    b".dever/run.log",
+                    b"ci_2_virt_node_workdir/run.log",
                     b"skills/demo/SKILL.md",
                 ]
             ) + b"\0"
@@ -340,7 +340,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
                 ["README.md", "fluxon_doc_cn/roadmap.md", "scripts/_build_doc_site_in_container_inner.py"],
             )
             self.assertNotIn("fluxon_release/install.py", relpaths)
-            self.assertNotIn(".dever/run.log", relpaths)
+            self.assertNotIn("ci_2_virt_node_workdir/run.log", relpaths)
             self.assertNotIn("skills/demo/SKILL.md", relpaths)
 
     def test_collect_ci_source_relpaths_includes_rather_no_git_submodule_sources(self) -> None:
@@ -439,7 +439,7 @@ class TestPackTestStackRscCli(unittest.TestCase):
             repo_root = Path(tmpdir)
             tracked = repo_root / "README.md"
             tracked.write_text("tracked\n", encoding="utf-8")
-            blocked = repo_root / ".dever" / "blocked.txt"
+            blocked = repo_root / "ci_2_virt_node_workdir" / "blocked.txt"
             blocked.parent.mkdir(parents=True, exist_ok=True)
             blocked.write_text("blocked\n", encoding="utf-8")
 

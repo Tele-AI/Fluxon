@@ -52,7 +52,6 @@ node_modules
 fluxon_test_stack/bench_runner/
 fluxon_test_stack/start_test_bed/
 fluxon_test_stack/.manual_dispatch_release_tmp/
-.dever
 fluxon_release_*
 *.exit
 bench_suite.lock
@@ -60,3 +59,6 @@ bench_suite.lock
 deployment/local/
 setup_and_pack/pack_fluxonkv_pylib_env.yaml
 fluxon_rs/moka/
+/ci_remote_testbed.local.yaml
+/ci_remote_testbed_workdir/
+/ci_2_virt_node_workdir/

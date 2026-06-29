@@ -1,0 +1,93 @@
+name: remote_testbed_bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      bootstrap_mode:
+        description: "Remote testbed bootstrap mode"
+        required: true
+        default: "bare_then_apply"
+        type: choice
+        options:
+          - bare_then_apply
+          - apply_only
+          - bare_only
+
+permissions:
+  contents: read
+
+jobs:
+  remote-testbed-bench:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git \
+            pigz \
+            protobuf-compiler \
+            python3-venv \
+            rsync \
+            sshpass
+
+      - name: Install Python dependencies
+        run: python3 -m pip install PyYAML
+
+      - name: Sync rather_no_git_submodule workspace inputs
+        run: python3 fluxon_rs/scripts/rather_no_git_submodule.py
+
+      - name: Write local remote testbed config
+        env:
+          FLUXON_REMOTE_TESTBED_LOCAL_CONFIG_YAML: ${{ secrets.FLUXON_REMOTE_TESTBED_LOCAL_CONFIG_YAML }}
+        run: |
+          rm -f ci_remote_testbed.local.yaml
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          raw = os.environ.get("FLUXON_REMOTE_TESTBED_LOCAL_CONFIG_YAML", "")
+          if not raw.strip():
+              raise SystemExit("missing secret FLUXON_REMOTE_TESTBED_LOCAL_CONFIG_YAML")
+          payload = yaml.safe_load(raw)
+          if not isinstance(payload, dict):
+              raise SystemExit("FLUXON_REMOTE_TESTBED_LOCAL_CONFIG_YAML must decode to a YAML mapping")
+          Path("ci_remote_testbed.local.yaml").write_text(
+              yaml.safe_dump(payload, sort_keys=False, allow_unicode=False),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Run remote shared-testbed benchmark flow
+        run: |
+          python3 fluxon_test_stack/ci_remote_testbed.py \
+            --bootstrap-mode "${{ inputs.bootstrap_mode }}" \
+            --print-generated
+
+      - name: Normalize remote testbed debug artifact permissions
+        if: ${{ always() }}
+        run: |
+          chmod -R a+rX ci_remote_testbed_workdir || true
+          chmod -R a+rX fluxon_release || true
+
+      - name: Upload remote testbed debug artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-testbed-bench-debug-${{ github.sha }}
+          if-no-files-found: warn
+          compression-level: 1
+          path: |
+            ci_remote_testbed_workdir/**
+            fluxon_release/**

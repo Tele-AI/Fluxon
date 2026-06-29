@@ -509,7 +509,7 @@ def _test_rsc_manifest_relpaths(*, src_release_dir: Path, dispatch_release_scope
 
 def _dispatch_tmp_root(*, deployconf_path: Path) -> Path:
     # English note:
-    # - Do not inherit TMPDIR from outer automation (it may point into a tool-managed .dever namespace).
+    # - Do not inherit TMPDIR from outer automation (it may point into a tool-managed workspace namespace).
     # - Keep temp artifacts next to the deployconf so the path is deterministic and discoverable.
     p = deployconf_path.resolve().parent / ".manual_dispatch_release_tmp"
     p.mkdir(parents=True, exist_ok=True)

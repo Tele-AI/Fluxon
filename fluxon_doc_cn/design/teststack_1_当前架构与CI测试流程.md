@@ -695,6 +695,53 @@ GitHub Actions 主窗口中的许多日志并非本地直接打印，而是由 `
 
 因此，GitHub Actions 现在覆盖的是“由单一 `ci_2_virt_node.py` 入口启动，并通过 top-attention CI scene 执行 workload”这条真实 CI 路径，而不是在 suite 里再并存一层旧 scene。
 
+### 9.2 GitHub Actions 远端集群扩展：`ci_remote_testbed.py`
+
+**稳定结论：**
+
+- `ci_remote_testbed.py` 不是另一套 runner，它是 `ci_2_virt_node.py` 的远端共享 testbed 扩展，最终仍然复用 `test_runner.py`。
+- 它把一次 GitHub Actions 触发固定拆成两个 phase：`ci` 和 `benchmark`。
+- `ci` phase 直接继承仓库里的 canonical CI scene catalog；`benchmark` phase 只保留远端集群 `supported_topologies > 1` 的多机拓扑。
+- 本地远端配置只走 `ci_remote_testbed.local.yaml`，且必须是 YAML mapping；敏感 SSH / bastion / controller exec 信息只进入 `remote_auth.yaml`，不进入 manifest。
+
+| phase | 输入来源 | 选择规则 | 产物 |
+| --- | --- | --- | --- |
+| `ci` | `ci_test_list.yaml` | scene id 复用 canonical CI catalog，profile id 直接沿用 suite 声明 | `generated/ci.yaml` |
+| `benchmark` | `benchmark_full_matrix.yaml` | 只保留远端集群 `supported_topologies > 1` 的 multi-machine topology，对应的 scene / scale 才进入执行计划 | `generated/benchmark.yaml` |
+
+固定执行链路如下：
+
+```text
+GitHub Actions workflow_dispatch
+  -> write ci_remote_testbed.local.yaml from secret YAML
+  -> ci_remote_testbed.py
+  -> generate ci.yaml + benchmark.yaml
+  -> pack release once
+  -> dispatch once
+  -> start shared testbed once
+  -> test_runner.py once for ci
+  -> test_runner.py once for benchmark
+```
+
+- `phase_runs` 是这两个 runner 调用之间的稳定连接面，记录 `phase_name`、`suite_path`、`runner_workdir`、`scene_ids`、`profile_ids`、`allowed_scale_topologies`。
+- workflow 只负责触发和落地本地 YAML，不承载实际测试语义；测试语义仍由 `ci_remote_testbed.py` 和 `test_runner.py` 共同决定。
+
+### 9.3 远端触发的实际链路
+
+`ci_remote_testbed.py` 的远端执行不是“GitHub 每次都在远端直接跑一整套脚本再退出”，而是固定为：
+
+1. 在本地生成 `ci_remote_testbed.local.yaml` 和派生 bundle。
+2. 通过一次 SSH 触发 `controller_exec_host` 上的远端 launcher。
+3. 远端 launcher 在 `controller_exec_host` 上后台启动 `remote_runner.py`。
+4. GitHub Actions 继续通过同一个 `controller_exec_host` 轮询 `.remote_runner_exit_code` 和 `remote_runner.launch.log`。
+5. `remote_runner.py` 在远端按 phase 顺序调用 `test_runner.py`，先跑 `ci`，再跑 `benchmark`。
+
+这里的关键边界是：
+
+- SSH 触发只发生一次；
+- 后续状态收敛依赖轮询，而不是重复 SSH 启动；
+- `test_runner.py` 始终运行在远端机器上，不在 GitHub runner 本地执行。
+
 ## 10. GitOps 与 UI 的归属
 
 GitOps 挂在 test_runner UI 服务下。这里的约束是不额外拆出第二个独立控制面服务，不是要求 UI 随某一次测试 run 一起退出。
@@ -767,5 +814,5 @@ GitOps 挂在 test_runner UI 服务下。这里的约束是不额外拆出第二
   - 先准备 / 启动 testbed；
   - 再由 `test_runner.py` 执行 suite。
 - 对 `CI` 实现来说，远端 `ci_runner.sh` 负责执行命令，`test_runner.py` 持有 case 执行 authority。
-- `ci_2_virt_node.py` 只是把“本地双逻辑节点环境下的标准 CI 流程”封装出来，不改变 runner 的核心分层。
+- `ci_2_virt_node.py` 只是把“本地双逻辑节点环境下的标准 CI 流程”封装出来；`ci_remote_testbed.py` 则把同一套 runner 扩展到 GitHub Actions 触发的远端共享 testbed，不改变 runner 的核心分层。
 - UI 和 GitOps 都属于 `test_runner` 服务面；其中 UI 应作为常驻服务运行，不构成额外的测试执行框架。

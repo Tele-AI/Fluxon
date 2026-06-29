@@ -10,6 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "doc-site-builder-image.yml"
 ALL_TEST_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "all_test.yml"
 DOCS_PAGES_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "docs-pages.yml"
+REMOTE_TESTBED_BENCH_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "remote_testbed_bench.yml"
 
 
 class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
@@ -59,6 +60,26 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertNotIn("actions/setup-node", workflow_text)
         self.assertNotIn("doc-site-npm", workflow_text)
         self.assertNotIn("doc-site-plugins", workflow_text)
+
+    def test_remote_testbed_bench_workflow_uses_bounded_manual_remote_entrypoint(self) -> None:
+        workflow_text = REMOTE_TESTBED_BENCH_WORKFLOW_PATH.read_text(encoding="utf-8")
+        yaml.load(workflow_text, Loader=yaml.BaseLoader)
+
+        self.assertIn("workflow_dispatch:", workflow_text)
+        self.assertNotIn("pull_request:", workflow_text)
+        self.assertNotIn("push:", workflow_text)
+        self.assertIn("fluxon_test_stack/ci_remote_testbed.py", workflow_text)
+        self.assertIn("ci_remote_testbed.local.yaml", workflow_text)
+        self.assertIn("secrets.FLUXON_REMOTE_TESTBED_LOCAL_CONFIG_YAML", workflow_text)
+        self.assertNotIn("." + "dever", workflow_text)
+        self.assertIn("ci_remote_testbed_workdir/**", workflow_text)
+        self.assertNotIn("infra44-ThinkStation-PX", workflow_text)
+        self.assertNotIn("infra46-ThinkStation-PX", workflow_text)
+        self.assertNotIn("secrets.FLUXON_REMOTE_TESTBED_SSH_USER", workflow_text)
+        self.assertNotIn("secrets.FLUXON_REMOTE_TESTBED_SSH_PASSWORD", workflow_text)
+        self.assertNotIn("scene_id", workflow_text)
+        self.assertNotIn("profile_id", workflow_text)
+        self.assertIn("bootstrap_mode", workflow_text)
 
 
 if __name__ == "__main__":

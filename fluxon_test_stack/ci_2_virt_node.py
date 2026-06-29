@@ -26,7 +26,7 @@ DEFAULT_PACK_RELEASE_STATIC_CONFIG = REPO_ROOT / "setup_and_pack" / "nix" / "pac
 DEFAULT_RATHER_NO_GIT_SUBMODULE_SCRIPT = (
     REPO_ROOT / "fluxon_rs" / "scripts" / "rather_no_git_submodule.py"
 )
-DEFAULT_CI_2_VIRT_NODE_WORKDIR = REPO_ROOT / ".dever" / "ci_2_virt_node"
+DEFAULT_CI_2_VIRT_NODE_WORKDIR = REPO_ROOT / "ci_2_virt_node_workdir"
 DEFAULT_RELEASE_DIR = REPO_ROOT / "fluxon_release"
 PUBLIC_PROFILE_ID = "fluxon_tcp_thread"
 PUBLIC_ARTIFACT_SET_ID = "fluxon_tcp_thread"

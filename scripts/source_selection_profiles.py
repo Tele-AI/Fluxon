@@ -40,7 +40,7 @@ BUILD_SEED_INCLUDED_RELPATHS: frozenset[str] = frozenset(
     }
 )
 SOURCE_PACK_EXCLUDED_RELPATH_PREFIXES: tuple[str, ...] = (
-    ".dever/",
+    "ci_2_virt_node_workdir/",
     "fluxon_release/",
     "skills/",
 )
