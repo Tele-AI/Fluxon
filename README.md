@@ -14,21 +14,21 @@
 
 </div>
 
-As GPU throughput keeps climbing, bottlenecks in AI systems are expanding from isolated operators into the data plane. Inference services need cross-node `KV Cache` reuse. Training pipelines need to pass intermediate state across heterogeneous resource pools. Model files and `checkpoints` need to move reliably between remote access paths and local caches.
+As GPU throughput keeps climbing, bottlenecks in AI systems are expanding from isolated operators into the data plane. Inference services need cross-node `KV Cache` reuse. Training pipelines need to pass intermediate state across heterogeneous resource pools. Model files and `Checkpoint` data need to move reliably between remote access paths and local caches.
 
-Most existing systems, however, are still specialized components built for narrow scenarios, such as `MooncakeStore` for `KVCache`. Many AI workloads still lack mature AI-native infrastructure components, so algorithm teams often assemble temporary data-movement modules just to validate ideas quickly. As model scale and cluster elasticity grow together, the cost of this patchwork data plane keeps expanding, consuming CPU, I/O, memory, and operational effort, and exposing seven major engineering pain points:
+Most existing systems, however, are still specialized components built for narrow scenarios, such as `MooncakeStore` for `KV Cache`. Many AI workloads still lack mature `AI-native` infrastructure components, so algorithm teams often assemble temporary data-movement modules just to validate ideas quickly. As model scale and cluster elasticity grow together, the cost of this patchwork data plane keeps expanding, consuming CPU, I/O, memory, and operational effort, and exposing seven major engineering pain points:
 
-- Local solutions do not transfer well: specialized `KV Cache` systems bind cache semantics and `RDMA` transport to a narrow path, which makes them hard to carry over into more general data-plane scenarios
-- Resource governance is not unified enough: framework-level `L2` and external `L3` caches often live in the same host CPU memory, while `L2` remains outside unified indexing and eviction control, increasing cache-crossing overhead
-- No shared-memory fast path between local processes: many current data paths are organized around `RDMA` / `TCP`, so object handoff between colocated `workers` still detours through the network protocol stack
-- No dynamically elastic AI infra communication plane: handoff across resource pools needs dynamic membership and asynchronous transfer, while fixed-member communication models amplify connection-management and recovery complexity
-- Business processes are coupled to data-plane resource governance: when business processes start and stop dynamically while also contributing capacity, they trigger `rebalance` churn and connection storms in the data plane
-- Object lifecycles do not converge cleanly: caches, messages, and files each maintain their own reference and eviction state, and those states easily fragment across business frameworks, cache layers, and transport layers
-- Observability is split across systems: cache hits, transport paths, and object materialization are scattered across separate systems, so performance debugging becomes an exercise in stitching clues together from multiple metric sets
+- **Local solutions do not transfer well:** specialized `KV Cache` systems bind cache semantics and `RDMA` transport to a narrow path, which makes them hard to carry over into more general data-plane scenarios
+- **Resource governance is not unified enough:** framework-level `L2` and external `L3` caches often live in the same host `CPU` memory, while `L2` remains outside unified indexing and eviction control, increasing cache-crossing overhead
+- **No shared-memory fast path between local processes:** many current data paths are organized around `RDMA` / `TCP`, so object handoff between colocated `Workers` still detours through the network protocol stack
+- **No dynamically elastic `AI Infra` communication plane:** handoff across resource pools needs dynamic membership and asynchronous transfer, while fixed-member communication models amplify connection-management and recovery complexity
+- **Business processes are coupled to data-plane resource governance:** when business processes start and stop dynamically while also contributing capacity, they trigger `Rebalance` churn and connection storms in the data plane
+- **Object lifecycles do not converge cleanly:** caches, messages, and files each maintain their own reference and eviction state, and those states easily fragment across business frameworks, cache layers, and transport layers
+- **Observability is split across systems:** cache hits, transport paths, and object materialization are scattered across separate systems, so performance debugging becomes an exercise in stitching clues together from multiple metric sets
 
-Fluxon is designed around these problems. It separates data-plane resources, object lifecycles, cross-node transport, and business integration into explicit abstractions, then governs them on one integrated storage-and-transport foundation so more system budget goes to model computation instead of data-plane assembly and movement; built on that unified Rust-based storage-and-transport foundation, Fluxon exposes three standardized interfaces that target the core bottlenecks in AI systems:
+Fluxon is designed around these problems. It separates data-plane resources, object lifecycles, cross-node transport, and business integration into explicit abstractions, then governs them on one integrated storage-and-transport foundation so more system budget goes to model computation instead of data-plane assembly and movement. Built on that unified Rust-based storage-and-transport foundation, Fluxon exposes three standardized interfaces that target the core bottlenecks in AI systems:
 
-- **KV/RPC (Unified key-value and RPC)**: Breaks data silos and enables efficient cross-process, cross-node reuse of inference-side `KVCache` and `latent cache`
+- **KV/RPC (Unified key-value and RPC)**: Breaks data silos and enables efficient cross-process, cross-node reuse of inference-side `KV Cache` and `latent cache`
 - **MQ (Elastic message queue)**: Decouples system dependencies and supports elastic message transport across heterogeneous resource pools
 - **FS (`S3`-compatible file, object, and cache acceleration system)**: Unifies multi-form storage so one system can cache key-value, file, and object data, while supporting remote access, `S3` forwarding, and large-scale cross-cluster migration for AI data and model files
 
@@ -53,16 +53,16 @@ Fluxon is designed around these problems. It separates data-plane resources, obj
 
 ## 🧱 Foundation Capabilities
 
-- End-to-end Rust: moves connection handling, protocol encoding/decoding, state-machine progression, shared-memory management, and observability collection into Rust hot paths
-- Integrated storage and transport: prioritizes the cross-process shared-memory fast path and optimizes storage and transport within one unified data plane
-- High-performance inter-node transport: inside the cluster, `RDMA` is preferred, with automatic `TCP` fallback, and NICs can be enabled, disabled, and switched dynamically from the GUI
-- Automatic inter-node relay: supports automatic relay / forwarding across nodes and sub-clusters, reducing the integration cost of complex network topologies
-- Global memory allocation and governance: uniformly manages global memory allocation, object lifecycles, capacity boundaries, and reclamation policies to avoid fragmentation and uncontrolled growth
-- Unified role model: `master`, `owner_client`, and `external_client` cooperate in layers, organizing control-plane and data-plane responsibilities into a scalable tree topology while decoupling business service processes from data-plane resource governance and low-level communication paths
-- Unified object interface: lets the system organize multi-field objects uniformly, balancing API flexibility, ease of use, and room for low-level optimization
-- Tensor-native zero-copy handoff path: better suited for reusing high-frequency tensor objects across caching and transport paths
-- Unified observability: uses the `Prometheus` protocol and `Greptime` to consolidate `metric / trace / log`, and includes a built-in GUI for cluster member state, log information, key metrics, and topology
-- Shared capabilities across all three interfaces: `KV/RPC`, `MQ`, and `FS` reuse the same caching, transport, lease, capacity-governance, and observability substrate
+- **End-to-end Rust:** moves connection handling, protocol encoding/decoding, state-machine progression, shared-memory management, and observability collection into Rust hot paths, reducing hot-path jitter from interpreted execution, cross-language boundaries, and uncontrolled copying
+- **Integrated storage and transport:** places storage and transport on one unified data plane, prioritizes the cross-process shared-memory fast path, and reduces fragmentation between object lifecycle management and transport behavior
+- **High-performance inter-node transport:** prefers `RDMA` inside the cluster, supports automatic `TCP` fallback, and allows NICs to be enabled, disabled, and switched dynamically from the `GUI`, which lowers availability risk when one transport path degrades
+- **Automatic inter-node relay:** supports automatic `relay` / forwarding across nodes and sub-clusters, reducing the integration cost of complex network topologies
+- **Global memory allocation and governance:** uniformly manages global memory allocation, object lifecycles, capacity boundaries, and reclamation policies to avoid fragmentation and uncontrolled growth
+- **Unified role model:** `Master`, `Owner Client`, and `External Client` cooperate in layers, organize control-plane and data-plane responsibilities into a scalable tree topology, and decouple business processes from data-plane governance to reduce `Rebalance` churn and connection storms
+- **Unified object interface:** lets the system organize multi-field objects uniformly, balancing API flexibility, ease of use, and room for low-level optimization while keeping lifecycle state from scattering across layers
+- **Tensor-native zero-copy handoff path:** is better suited for reusing high-frequency tensor objects across caching and transport paths, especially for local-process handoff
+- **Unified observability:** uses the `Prometheus` protocol and `Greptime` to consolidate `metric / trace / log`, and includes a built-in `GUI` for cluster member state, log information, key metrics, and topology, which helps close observability gaps across systems
+- **Shared capabilities across all three interfaces:** `KV/RPC`, `MQ`, and `FS` reuse the same caching, transport, lease, capacity-governance, and observability substrate, avoiding duplicated data-plane stacks for adjacent workloads
 
 ![](./pics/fluxon_commu.png)
 
@@ -74,7 +74,7 @@ Fluxon is designed around these problems. It separates data-plane resources, obj
 
 ### Fluxon KV/RPC
 
-Designed for world-model inference caches, state sharing, service-to-service calls, and tensor object reuse. In scenarios such as multi-view latent-space prediction, state extrapolation, and prefix-cache reuse, Fluxon KV/RPC provides a more general AI data plane rather than a point solution for only a single `KVCache` use case.
+Designed for world-model inference caches, state sharing, service-to-service calls, and tensor object reuse. In scenarios such as multi-view latent-space prediction, state extrapolation, and prefix-cache reuse, Fluxon KV/RPC provides a more general AI data plane rather than a point solution for only a single `KV Cache` use case.
 
 - Local cache replicas and eventually consistent read path: prioritizes local fast-path hits while synchronizing metadata asynchronously in the background
 - Batched reclamation and hot-object management: advances invalid-object cleanup asynchronously through `batch_delete`, and combines it with `TinyLFU` to reuse hot objects more efficiently
@@ -85,12 +85,12 @@ Designed for world-model inference caches, state sharing, service-to-service cal
 
 ### Fluxon MQ
 
-Designed for heterogeneous training, data-processing pipelines, and intermediate-state handoff across resource pools. When the `producer` side and `consumer` side are split across different machines, different resource pools, or even different sub-clusters, Fluxon MQ consolidates message retention, capacity governance, and cross-cluster placement into one unified messaging layer.
+Designed for heterogeneous training, data-processing pipelines, and intermediate-state handoff across resource pools. When the `Producer` side and `Consumer` side are split across different machines, different resource pools, or even different sub-clusters, Fluxon MQ consolidates message retention, capacity governance, and cross-cluster placement into one unified messaging layer.
 
 - `Lease`-based retention semantics: binds message retention to the `channel`, ensuring data has bounded-time reliable retention before actual consumption
 - `channel`-level prefix statistics and capacity governance: continuously tracks message counts and capacity usage boundaries for scaling and traffic control
-- Cross-cluster load-aware placement: uses consumer-side location to decide payload placement, shortening prefetch paths and stabilizing throughput
-- Co-designed with KV: message shells and member metadata stay on the control plane, while large payloads stay on the `FluxonKV` data plane, avoiding a second duplicated large-object transport stack
+- Cross-cluster load-aware placement: uses `Consumer`-side location to decide `Payload` placement, shortening prefetch paths and stabilizing throughput
+- Co-designed with KV: message shells and member metadata stay on the control plane, while large `Payload` objects stay on the `FluxonKV` data plane, avoiding a second duplicated large-object transport stack
 
 ![](./pics/training_use_mq.png)
 
@@ -98,7 +98,7 @@ Designed for heterogeneous training, data-processing pipelines, and intermediate
 
 ### Fluxon FS
 
-Fluxon FS is an S3-compatible file and object cache for AI data and model files. It supports read/write acceleration, remote access, `S3` forwarding, cache hits, and large-scale cross-cluster migration. In workloads with high-resolution video, trajectory samples, checkpoints, and other large file objects, these capabilities are unified in one file data plane.
+Fluxon FS is an S3-compatible file and object cache for AI data and model files. It supports read/write acceleration, remote access, `S3` forwarding, cache hits, and large-scale cross-cluster migration. In workloads with high-resolution video, trajectory samples, `Checkpoint` data, and other large file objects, these capabilities are unified in one file data plane.
 
 - Unified caching system: directly reuses `FluxonKV/RPC` caching and communication capabilities, splits files into `KeyValue` shards, and lets one system support accelerated reads and writes for key-value, file, and object caching
 - `S3` forwarding access: supports object-storage access and forwarding for AI data and model files
@@ -120,13 +120,13 @@ The RPC benchmark mainly shows call latency and throughput across different mess
 
 ### Fluxon KV Benchmark
 
-The `TCP` benchmark shows that Fluxon is significantly ahead of `MooncakeStore` and `Redis` on the two read-heavy workloads `Read-affinity` and `Read-Zipf`. For `put_only`, the current main constraint remains the inflight metadata deduplication path rather than payload transport.
+The `TCP Benchmark` shows that Fluxon outperforms `MooncakeStore` and `Redis` on the two read-heavy workloads `Read-affinity` and `Read-Zipf`. For `put_only`, the current primary constraint remains the inflight metadata deduplication path rather than `Payload` transport.
 
 ![](./pics/kv_benchmark_chart.png)
 
 ### Fluxon FS Benchmark
 
-The benchmark results show that small-file reads and large-file writes are already significantly ahead of `Alluxio`, large-file reads are roughly comparable, and small-file writes still have room for further optimization.
+The benchmark results show that small-file reads and large-file writes already outperform `Alluxio`, large-file read performance is broadly on par, and small-file write performance still has further room to improve.
 
 ![](./pics/fs_benchmark_chart.png)
 
@@ -180,11 +180,11 @@ get demo:hello
 del demo:hello
 ```
 
-Runtime view:
+Expected runtime view:
 
 ![](./pics/quickstart_kv.png)
 
-Open the printed link to view the KV Web UI:
+Open the link printed in the terminal to access the `KV Web UI`:
 
 ![](./pics/quickstart_kvui.gif)
 
@@ -212,10 +212,10 @@ put world
 exit
 ```
 
-The background consumer keeps printing received messages.  
+The background `Consumer` keeps printing received messages.  
 Startup also prints the `MQ Web UI` address.
 
-Runtime view:
+Expected runtime view:
 
 ![](./pics/quickstart_mq.png)
 
@@ -244,16 +244,16 @@ cat notes.txt
 ui
 ```
 
-FS Quick Start additionally prints:
+`FS Quick Start` additionally prints:
 
 - `fs_s3` endpoint
-- Basic Auth entry; the default username / password is `admin / admin`
+- `Basic Auth` entry; the default username / password is `admin / admin`
 
-Runtime view:
+Expected runtime view:
 
 ![](./pics/quickstart_fs.png)
 
-Open the printed link to view the FS Web UI:
+Open the link printed in the terminal to access the `FS Web UI`:
 
 ![](./pics/quickstart_fsui.gif)
 
@@ -307,12 +307,12 @@ Some earlier contribution records are no longer fully reflected in the current c
 </p>
 
 - `yxrxy`: FluxonFS implementation and optimization
-- `zTz01`: KVCache optimization
+- `zTz01`: `KV Cache` optimization
 - `pakkah`: RDMA support, VLM exploration
-- `unity1263`: KV shared-memory design integration, benchmark toolchain
+- `unity1263`: `KV` shared-memory design integration, `Benchmark` toolchain
 - `mumupika`: Initial MQ implementation
 - `maplestarplayl`: IPC integration, SPDK integration
-- `RuileLu`: KV lease support
+- `RuileLu`: `KV Lease` support
 - `Summage`: Initial KV architecture optimization
 
 <a id="license"></a>
