@@ -3,7 +3,7 @@
 ## Coming soon
 
 - [CI] Cover all tests with GitHub Actions and fix existing bugs
-- [KV] Adapt and optimize `sglang` `KVCache`, and add a `BatchKV` interface plus a local-side elastic preallocated-memory `put` interface with `write-back` mode
+- [KV] Adapt and optimize `sglang` `KV Cache`, and add a `BatchKV` interface plus a local-side elastic preallocated-memory `put` interface with `write-back` mode
 - [OPS] Consolidate GitHub Actions integration tests into `FluxonOps` so internal clusters can reuse them directly later
 
 ## Release Notes
@@ -12,7 +12,7 @@
 
 - [PERF] Optimize `RPC`, `KV`, and `FS` performance
 - [MQ] Fix MQ control-plane scalability issues
-- [ETCD] Fix the gRPC size limit issue when listing etcd prefixes
+- [etcd] Fix the gRPC size limit issue when listing etcd prefixes
 - [OSS] Improve open-source readiness and related workflows
 
 ### 0.1.7

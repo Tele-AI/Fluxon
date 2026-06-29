@@ -2,45 +2,45 @@
 
 ## Overview
 
-Fluxon MQ is the queue layer built on top of the KV substrate. It is not a separate service stack. It reuses the same service plane, the same local shared memory pool, and the same Python client attachment path, then adds producer / consumer semantics.
+Fluxon MQ is the queue layer built on top of the KV substrate. It is not a separate service stack. It reuses the same service plane, the same local shared-memory pool, and the same Python client attachment path, then adds `Producer` / `Consumer` semantics.
 
 MQ objects can be understood in three layers:
 
-- Service plane: `etcd`, `greptime`, `fluxonkv master`
-- Local resident data-plane instance: `owner`
-- Business-process attachment layer: `FluxonKvClientConfig`, `new_store(...) -> KvClient`, plus the bound `producer` / `consumer` handles
+- Service plane: `etcd`, `Greptime`, `Fluxon KV Master`
+- Local resident data-plane instance: `Owner Client`
+- Business-process attachment layer: `FluxonKvClientConfig`, `new_store(...) -> KvClient`, plus the bound `Producer` / `Consumer` handles
 
 ```text
-etcd + greptime + fluxonkv master
-                |
-                v
-         kvclient owner
-                |
-                v
+etcd + Greptime + Fluxon KV Master
+                    |
+                    v
+              Owner Client
+                    |
+                    v
 +--------------------------------------------------------------+
-| kvclient external                                            |
+| External Client                                              |
 | FluxonKvClientConfig -> new_store(...) -> KvClient(store)    |
 +--------------------------------------------------------------+
                                 |
                                 +-> new_or_bind_with_unique_key(...)
                                         |
-                                        +-> producer
-                                        +-> consumer
+                                        +-> Producer
+                                        +-> Consumer
 ```
 
-See [Architecture and Concepts](<./User - 1 - Architecture and Concepts.md>) for `owner`, `external client`, and shared-memory terminology, and [User - 3 - KV and RPC Interface](<./User - 3 - KV and RPC Interface.md>) for `new_store(...) -> KvClient`.
+See [Architecture and Concepts](<./User - 1 - Architecture and Concepts.md>) for `Owner Client`, `External Client`, and shared-memory terminology, and [User - 3 - KV and RPC Interface](<./User - 3 - KV and RPC Interface.md>) for `new_store(...) -> KvClient`.
 
-MQ user processes have one fixed role constraint: producer / consumer processes must run as zero-contribution `external_client` attachments. Their lifecycles are expected to be dynamic, so they must not change cluster capacity; the long-lived capacity provider remains the local `owner`.
+MQ user processes have one fixed role constraint: `Producer` / `Consumer` processes must run as zero-contribution `external_client` attachments. Their lifecycles are expected to be dynamic, so they must not change cluster capacity; the long-lived capacity provider remains the local `Owner Client`.
 
 ## Service Plane
 
 MQ reuses the KV service plane directly. Start the shared chain first:
 
-1. `greptime`
+1. `Greptime`
 2. `etcd`
-3. `fluxonkv master`
-4. `owner`
-5. your producer / consumer process
+3. `Fluxon KV Master`
+4. `Owner Client`
+5. your `Producer` / `Consumer` process
 
 The common startup pattern is still `examples/start_master_owner.py`.
 
@@ -76,19 +76,19 @@ Key rules:
 
 The public minimal example is `examples/start_mpmc_demo.py`.
 
-Run one producer and one consumer after the service plane is ready:
+Run one `Producer` and one `Consumer` after the service plane is ready:
 
 ```bash
 python3 examples/start_mpmc_demo.py --role producer
 python3 examples/start_mpmc_demo.py --role consumer
 ```
 
-This example keeps one process-local `seq` counter. Restarting the producer resets that counter; it is not a cross-process persistent sequence.
+This example keeps one process-local `seq` counter. Restarting the `Producer` resets that counter; it is not a cross-process persistent sequence.
 
 The most important part of the example is the ownership chain:
 
-- one external `KvClient`
-- one bound producer or consumer handle on top of that store
+- one `External Client`-side `KvClient`
+- one bound `Producer` or `Consumer` handle on top of that store
 - `Ctrl-C` only requests shutdown and closes the handle once
 - `ProducerClosedError` and `ChannelClosedError` are normal close-path signals
 
@@ -123,9 +123,9 @@ Parameter constraints:
 ## Log Paths
 
 - Python-side MQ logs come from `init_logger(...)` and go to the current terminal by default; the threshold is controlled by `FLUXON_LOG`
-- Rust / KV background logs follow the shared service-plane pipeline, and the master's local log authority is `master_cfg["log_dir"]`
+- Rust / KV background logs follow the shared service-plane pipeline, and the `Master`'s local log authority is `master_cfg["log_dir"]`
 - `share_mem_path` is the shared bundle root for `mmap.file`, `shared.json`, and peer metadata
-- `large_file_paths` is the owner-only large-file authority for backend logs, profiles, caches, and other derived runtime assets
+- `large_file_paths` is the `Owner Client`-only large-file authority for backend logs, profiles, caches, and other derived runtime assets
 
 If `master.monitoring.otlp_log_api` is configured, backend logs continue to flow into the Greptime `fluxon_logs` table.
 
@@ -134,7 +134,7 @@ If `master.monitoring.otlp_log_api` is configured, backend logs continue to flow
 Two UI tables are especially useful:
 
 - `Channels`: channel-level summary
-- `Members`: individual producer / consumer detail
+- `Members`: individual `Producer` / `Consumer` detail
 
 ### Channel Summary
 
@@ -152,10 +152,10 @@ producer_1: 101/88, producer_2: 57/57
 
 Both offsets mean "the next offset":
 
-- `produce_offset`: next message offset the producer will write
-- `consume_offset`: next offset the consumer will commit
+- `produce_offset`: next message offset the `Producer` will write
+- `consume_offset`: next offset the `Consumer` will commit
 
-Current backlog per producer is:
+Current backlog per `Producer` is:
 
 ```text
 max(produce_offset - consume_offset, 0)
@@ -189,5 +189,5 @@ MQ prints consumer-latency statistics roughly every 30 seconds. Search logs with
 Quick reading:
 
 - high `py-get` total latency -> inspect PyO3-side `avg_wait_rx_ms`
-- high Rust `avg_get_handle_ms` -> prefetch queue is empty, or the producer side is idle, or the window is too small
+- high Rust `avg_get_handle_ms` -> prefetch queue is empty, or the `Producer` side is idle, or the window is too small
 - high Rust `avg_handle_await_ms` -> the single task is slow, for example `kv_get` or etcd commit

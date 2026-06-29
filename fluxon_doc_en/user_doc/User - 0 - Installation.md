@@ -5,9 +5,9 @@
 If you use Fluxon directly, you usually deal with two install bundles:
 
 - Fluxon core artifacts: `fluxon-*.whl`, `fluxon_pyo3-*.whl`, `pylib_src.tar.gz`, `install.py`, `fluxon_release.sha256`
-- Runtime packages for `etcd / greptime / TiKV`: `ext_images.tar.gz`
+- Runtime packages for `etcd / Greptime / TiKV`: `ext_images.tar.gz`
 
-If your Python process only attaches to an existing service plane, you normally only need the Fluxon core package. If you also need to start the KV / MQ / FS service plane yourself, prepare the `etcd / greptime / TiKV` runtime package as well. See [Architecture and Concepts](<./User - 1 - Architecture and Concepts.md>) for the role model.
+If your Python process only attaches to an existing service plane, you normally only need the Fluxon core package. If you also need to start the KV / MQ / FS service plane yourself, prepare the `etcd / Greptime / TiKV` runtime package as well. See [Architecture and Concepts](<./User - 1 - Architecture and Concepts.md>) for the role model.
 
 ### Download from GitHub Releases
 
@@ -25,7 +25,7 @@ cd fluxon_release
 pip install fluxon-*.whl fluxon_pyo3-*.whl
 ```
 
-#### Unpack `etcd / greptime / TiKV`
+#### Unpack `etcd / Greptime / TiKV`
 
 ```bash
 tar xzf ext_images.tar.gz
@@ -51,7 +51,7 @@ Fluxon does not replace these external dependencies from inside `fluxon_py.runti
 The main packaging entrypoint is `setup_and_pack/pack_release.py`. It automatically calls `setup_and_pack/pack_release_ext.py` and gathers core wheels, `pylib_src.tar.gz`, `install.py`, `ext_images.tar.gz`, and `fluxon_release.sha256` into `fluxon_release/`.
 
 - `setup_and_pack/pack_release.py`: package Fluxon core artifacts
-- `setup_and_pack/pack_release_ext.py`: export `etcd / greptime / TiKV` runtime objects
+- `setup_and_pack/pack_release_ext.py`: export `etcd / Greptime / TiKV` runtime objects
 
 Related docs:
 
@@ -70,7 +70,7 @@ Related docs:
 | `install.py` | Release runtime entrypoint |
 | `fluxon_release.sha256` | SHA256 checksum file for all release artifacts |
 
-#### `etcd / greptime / TiKV`
+#### `etcd / Greptime / TiKV`
 
 | File | Description |
 |---|---|

@@ -6,9 +6,9 @@ To use Fluxon KV you need to understand the fixed service-plane objects that com
 
 From a user point of view the most common objects are:
 
-- External dependencies: `etcd`, `greptime`, `TiKV`
-- Fluxon-native roles: `master`, `owner`
-- Startup entrypoints: raw `etcd / greptime / TiKV` runtimes, `fluxon_py.runtime`, and your own supervisor or scripts
+- External dependencies: `etcd`, `Greptime`, `TiKV`
+- Fluxon-native roles: `Master`, `Owner Client`
+- Startup entrypoints: raw `etcd / Greptime / TiKV` runtimes, `fluxon_py.runtime`, and your own supervisor or scripts
 
 If you are writing business code, this page answers three questions:
 
@@ -23,10 +23,10 @@ For the user-facing API, continue to [User - 3 - KV and RPC Interface](<./User -
 The service plane can be reduced to five stable objects:
 
 - External dependency: `etcd`
-- External dependency: `greptime`
+- External dependency: `Greptime`
 - External dependency: `TiKV`
-- Fluxon-native role: `master`
-- Fluxon-native role: `owner`
+- Fluxon-native role: `Master`
+- Fluxon-native role: `Owner Client`
 
 Deployment layout:
 
@@ -35,29 +35,29 @@ Deployment layout:
 Responsibilities:
 
 - `etcd`: control-plane metadata
-- `greptime`: standard observability path
+- `Greptime`: standard observability path
 - `TiKV`: persistent task-state storage for extended features such as FS transfer-state persistence
-- `master`: membership, routing, leases, monitoring broadcast, master-side logs
-- `owner`: local shared memory pool and `shared.json`
+- `Master`: membership, routing, leases, monitoring broadcast, master-side logs
+- `Owner Client`: local shared-memory pool and `shared.json`
 
 ### Minimum Startup Order
 
 The minimum chain for KV is:
 
-- KV: `greptime -> etcd -> fluxonkv master -> owner -> business process new_store(...)`
+- KV: `Greptime -> etcd -> Fluxon KV Master -> Owner Client -> business process new_store(...)`
 
 If you also need transfer-state-backed features such as directory transfer or pre-scan, add:
 
-- Transfer / Pre-Scan: `TiKV PD -> TiKV -> fs master transfer_state_store`
+- Transfer / Pre-Scan: `TiKV PD -> TiKV -> FS Master transfer_state_store`
 
 Hard boundary:
 
-- `etcd`, `greptime`, and `TiKV` are external dependencies
-- `master` and `owner` are Fluxon-native roles
+- `etcd`, `Greptime`, and `TiKV` are external dependencies
+- `Master` and `Owner Client` are Fluxon-native roles
 
-If the control plane is missing, `master` is unavailable. If `owner` is missing, `FluxonKvClientConfig({...}) -> new_store(...)` cannot attach to the shared memory pool. TiKV is not needed for the minimum KV read/write path, but it is required for features that depend on `transfer_state_store`.
+If the control plane is missing, `Master` is unavailable. If `Owner Client` is missing, `FluxonKvClientConfig({...}) -> new_store(...)` cannot attach to the shared-memory pool. TiKV is not needed for the minimum KV read/write path, but it is required for features that depend on `transfer_state_store`.
 
-### Start `etcd`, `greptime`, and `TiKV`
+### Start `etcd`, `Greptime`, and `TiKV`
 
 First prepare the runtime package described in [User - 0 - Installation](<./User - 0 - Installation.md>) and confirm these files exist:
 
@@ -159,7 +159,7 @@ These external services are not started by `fluxon_py.runtime`.
 
 ### `fluxon_py.runtime`
 
-`fluxon_py.runtime` only manages Fluxon-native roles. It does not replace `etcd`, `greptime`, or `TiKV`.
+`fluxon_py.runtime` only manages Fluxon-native roles. It does not replace `etcd`, `Greptime`, or `TiKV`.
 
 Common entrypoints:
 
@@ -176,7 +176,7 @@ If you are an installed-wheel user, prefer these Python entrypoints directly and
 
 See `examples/start_master_owner.py` for the common local pattern:
 
-- Default: start `master + owner`
-- `--without-master`: start only `owner` and attach to an existing master
+- Default: start `Master + Owner Client`
+- `--without-master`: start only `Owner Client` and attach to an existing `Master`
 
 The same role chain is reused by MQ and FS. MQ-specific behavior belongs to [User - 4 - MQ Interface](<./User - 4 - MQ Interface.md>) and FS-specific behavior belongs to [User - 5 - FS Interface](<./User - 5 - FS Interface.md>).

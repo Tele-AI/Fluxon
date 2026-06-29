@@ -17,6 +17,8 @@ This page defines how Fluxon user docs, developer docs, and design docs should b
 - Rules should be reusable methods, not a retelling of the current case. Concrete technical facts, incident lessons, and benchmark numbers belong in examples, counterexamples, or review checklists.
 - For behavior, ownership, or performance claims, define the observation scope first: abstraction level, covered path, preconditions, and exclusions.
 - Do not lift a local fact into a system-level conclusion without tracing the full path at the same abstraction level.
+- If the opening enumerates pain points, goals, evaluation dimensions, or explicit questions, the later sections should answer against that same list. Do not open on one axis and expand on another.
+- Keep one canonical name, spelling, and capitalization for one concept across a page and across the doc set. Roles, component names, and acronyms should stay consistent.
 
 ## 2. Design Docs
 
@@ -46,6 +48,7 @@ Design docs should especially follow these rules:
 - Commands, arguments, return objects, and prerequisites must be directly actionable.
 - Do not introduce internal reserved fields, temporary adapters, or statements that are only true for the current implementation details.
 - If an interface has a strong contract, such as `FlatDict`, `MemHolder`, or `Future.wait()`, the doc should use that contract directly instead of suggesting loosely typed alternatives.
+- Before a screenshot, GIF, terminal transcript, or Web UI preview, state the expected outcome or success condition in one line so the reader knows what they are about to see.
 
 ## 4. Developer Docs
 
@@ -61,6 +64,14 @@ Design docs should especially follow these rules:
 - Avoid overly long paragraphs. Large blocks of prose usually want to become a diagram, table, or list.
 - When a term first appears, anchor it to a real code module, struct, public type, or reserved field.
 - For important boundaries, prefer tables that state `supported / not supported / why`.
+- In Chinese or mixed-script docs, insert a half-width space between Chinese and Latin letters or digits by default. Do not add mechanical spaces around Chinese punctuation.
+- Wrap exact identifiers such as commands, paths, ports, config keys, type names, API names, and third-party component names in backticks.
+- If a list item contains both a takeaway and an explanation, prefer `**lead phrase**: explanation` so the reader can scan the conclusion first.
+- Keep English list headings grammatically parallel. For pain points, capabilities, or trade-offs, noun phrases are usually the most stable shape.
+- In English docs, prefer domain-idiomatic terminology and collocations over literal translation from Chinese source text.
+- Acronyms should normally stay fully capitalized unless a brand, project, or public API defines a different spelling.
+- For benchmarks, performance comparisons, and runtime observations, prefer objective engineering phrasing such as "roughly on par" or "still has room for further optimization" over conversational judgment.
+- If one sentence carries multiple actions, turns, and conclusions, split it before the reader has to backtrack for the subject or constraint.
 
 ## 6. Examples and Counterexamples
 
@@ -88,3 +99,7 @@ Before landing a doc, check at least these items:
 - Remaining costs such as encoding, assembly, materialization, locks, GIL overhead, or downstream reconstruction are not silently omitted.
 - A diagram or table has not been omitted where it would clearly reduce reader effort.
 - The writing does not contain obvious template tone, filler, or unnatural terms.
+- There are no repeated paragraphs, duplicated sections, or pasted draft leftovers.
+- Mixed-script spacing, backticks, terminology spelling, and capitalization are consistent.
+- Table-of-contents links, anchors, image paths, and external links all resolve correctly.
+- Code fences declare the right language, such as `bash`, `python`, or `yaml`.

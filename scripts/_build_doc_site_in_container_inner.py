@@ -572,6 +572,47 @@ DOC_SITE_POSTSCRIPT_JS = dedent(
         }})
       }}
 
+      function fluxonPageListingItemRoute(item, siteBasePath) {{
+        const link = item.querySelector(":scope h3 a[href]")
+        if (!isFluxonElement(link, "A")) return ""
+        try {{
+          const pathname = new URL(link.getAttribute("href") || "", window.location.href).pathname
+          return normalizeFluxonRoute(pathname, siteBasePath)
+        }} catch {{
+          return ""
+        }}
+      }}
+
+      function reorderFluxonRootPageListing() {{
+        const route = currentFluxonRoute()
+        const language = currentFluxonLanguage(route)
+        const expectedRootRoute = language === "cn" ? "/cn" : "/"
+        if (route !== expectedRootRoute) return
+
+        const siteBasePath = resolveFluxonSiteBasePath()
+        const orderedRoutes = FLUXON_EXPLORER_PRIORITY_ROOT_ROUTES[language] || []
+        if (!orderedRoutes.length) return
+
+        document.querySelectorAll(".page-listing .section-ul").forEach((list) => {{
+          if (!isFluxonElement(list, "UL")) return
+
+          let insertAfter = null
+          orderedRoutes.forEach((targetRoute) => {{
+            const item = Array.from(list.children).find((child) => {{
+              if (!isFluxonElement(child, "LI")) return false
+              return fluxonPageListingItemRoute(child, siteBasePath) === targetRoute
+            }})
+            if (!isFluxonElement(item, "LI")) return
+
+            const referenceNode = insertAfter ? insertAfter.nextSibling : list.firstChild
+            if (item !== referenceNode) {{
+              list.insertBefore(item, referenceNode || null)
+            }}
+            insertAfter = item
+          }})
+        }})
+      }}
+
       function filterFluxonExplorerTreeForLanguage() {{
         const siteBasePath = resolveFluxonSiteBasePath()
         const route = currentFluxonRoute()
@@ -789,6 +830,7 @@ DOC_SITE_POSTSCRIPT_JS = dedent(
               if (needsExplorerPatch || needsLanguageFilter) {{
                 insertFluxonExplorerHomeLink()
               }}
+              reorderFluxonRootPageListing()
             }})
           }}
         }})
@@ -808,6 +850,7 @@ DOC_SITE_POSTSCRIPT_JS = dedent(
           rewriteFluxonRootInternalLinks()
           insertFluxonLanguageSwitcher()
           insertFluxonExplorerHomeLink()
+          reorderFluxonRootPageListing()
           const siteBasePath = resolveFluxonSiteBasePath()
           const language = currentFluxonLanguage(currentFluxonRoute())
           const needsRetry =
