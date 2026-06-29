@@ -41,11 +41,11 @@ class TestBuildDocSiteContract(unittest.TestCase):
     def test_explorer_priority_root_routes(self) -> None:
         self.assertEqual(
             _DOC_SITE.EXPLORER_PRIORITY_ROOT_ROUTES["en"],
-            ("/dev_doc", "/user_doc"),
+            ("/user_doc", "/dev_doc", "/design"),
         )
         self.assertEqual(
             _DOC_SITE.EXPLORER_PRIORITY_ROOT_ROUTES["cn"],
-            ("/cn/dev_doc", "/cn/user_doc", "/cn/design"),
+            ("/cn/user_doc", "/cn/dev_doc", "/cn/design", "/cn/blog"),
         )
 
     def test_explorer_hidden_route_prefixes(self) -> None:

@@ -222,8 +222,8 @@ LANGUAGE_ROUTE_PAIRS = (
 )
 
 EXPLORER_PRIORITY_ROOT_ROUTES = {
-    "en": ("/dev_doc", "/user_doc"),
-    "cn": ("/cn/dev_doc", "/cn/user_doc", "/cn/design"),
+    "en": ("/user_doc", "/dev_doc", "/design"),
+    "cn": ("/cn/user_doc", "/cn/dev_doc", "/cn/design", "/cn/blog"),
 }
 
 EXPLORER_HIDDEN_ROUTE_PREFIXES = {
