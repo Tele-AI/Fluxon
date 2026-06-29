@@ -32,7 +32,7 @@ def _load_module(script_name: str):
 
 
 class TestTopAttentionMqChannelContract(unittest.TestCase):
-    def test_mq_channel_wrappers_accept_case_config_and_run_pytest(self) -> None:
+    def test_mq_channel_wrappers_accept_case_config_and_run_script_processes(self) -> None:
         cases = {
             "_mq_mpsc.py": (
                 "ci_top_attention_mq_mpsc",
@@ -43,8 +43,8 @@ class TestTopAttentionMqChannelContract(unittest.TestCase):
                 [
                     "fluxon_py/tests/test_api_chan_mpmc/test_api_chan_mpmc_base.py",
                     "fluxon_py/tests/test_api_chan_mpmc/test_api_chan_mpmc_quick_and_weighted_consume.py",
-                    "fluxon_py/tests/test_api_chan_mpmc/test_ready_channels_access.py",
                     "fluxon_py/tests/test_api_chan_mpmc/test_rebind_client.py",
+                    "fluxon_py/tests/test_api_chan_mpmc/test_ready_channels_access.py",
                 ],
             ),
         }
@@ -88,8 +88,11 @@ class TestTopAttentionMqChannelContract(unittest.TestCase):
 
                     self.assertEqual(rc, 0)
                     self.assertEqual(
-                        call.call_args.args[0],
-                        ["/tmp/venv/bin/python3", "-m", "pytest", *test_paths],
+                        [item.args[0] for item in call.call_args_list],
+                        [
+                            ["/tmp/venv/bin/python3", "-u", test_path]
+                            for test_path in test_paths
+                        ],
                     )
 
     def test_mq_mpmc_bench_wrapper_runs_script_processes(self) -> None:

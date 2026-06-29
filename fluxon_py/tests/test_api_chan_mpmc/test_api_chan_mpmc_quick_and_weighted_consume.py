@@ -128,7 +128,7 @@ def cli(args: Optional[Dict[str, Any]] = None) -> None:
     assert isinstance(options, dict)
     mode = options.get("mode")
     if mode == "main":
-        # Route main through the argmatrix-backed pytest entry
+        # Route main through the argmatrix-backed scenario entry.
         test_quick_and_fair_consume()
         return
     env = create_channel_env()

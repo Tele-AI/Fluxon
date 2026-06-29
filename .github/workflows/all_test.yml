@@ -236,6 +236,36 @@ jobs:
             --print-generated \
             --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy"
 
+      - name: Print ci_2_virt_node failure summary
+        if: ${{ failure() }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          workdir = Path(".dever/ci_2_virt_node/runner_run")
+          case_runs_path = workdir / "case_runs.yaml"
+          if not case_runs_path.exists():
+              print(f"missing {case_runs_path}")
+              raise SystemExit(0)
+
+          case_runs = yaml.safe_load(case_runs_path.read_text(encoding="utf-8"))
+          print("=== case_runs.yaml ===")
+          print(yaml.safe_dump(case_runs, sort_keys=False, allow_unicode=False))
+
+          for case in case_runs.get("cases", []):
+              last_run = case.get("last_run", {})
+              if last_run.get("outcome") != "SUCCESS":
+                  case_id = case.get("case_id")
+                  run_index = last_run.get("run_index")
+                  print(f"=== failed case: {case_id} run_{run_index} ===")
+                  summary_path = workdir / "results" / str(case_id) / f"run_{run_index}" / "summary.yaml"
+                  if summary_path.exists():
+                      print(summary_path.read_text(encoding="utf-8", errors="replace"))
+                  else:
+                      print(f"missing {summary_path}")
+          PY
+
       - name: Normalize ci_2_virt_node debug artifact permissions
         if: ${{ always() }}
         run: |

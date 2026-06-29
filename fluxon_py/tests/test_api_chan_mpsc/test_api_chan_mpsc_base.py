@@ -1650,14 +1650,6 @@ def test_new_or_bind_unique_key_namespace_collision() -> None:
     finally:
         release(env)
 
-
-
-def main() -> None:
-    cli()
-
-
-if __name__ == "__main__":
-    main()
 def _wait_fluxon_member_absent(instance_key: str, *, timeout_s: int = TEST_TIMEOUT_SECONDS) -> None:
     """Wait until a fluxon cluster member key disappears from etcd.
 
