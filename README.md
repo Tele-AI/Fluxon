@@ -1,6 +1,6 @@
 # Fluxon
 
-![](./pics/fluxon架构图20260423.png)
+![](./pics/post_en.png)
 
 <div align="center">
 
@@ -14,13 +14,25 @@
 
 </div>
 
-As GPU throughput keeps climbing, CPU and I/O paths increasingly become the hidden bottlenecks that drag down AI training and inference efficiency. Fluxon is built to aggressively consolidate the complexity of low-level storage and transport so more of the system budget can be spent on model work instead of data-plane plumbing.
+As GPU throughput keeps climbing, bottlenecks in AI systems are expanding from isolated operators into the data plane. Inference services need cross-node `KV Cache` reuse. Training pipelines need to pass intermediate state across heterogeneous resource pools. Model files and `checkpoints` need to move reliably between remote access paths and local caches.
 
-Built on a unified Rust-based storage-and-transport foundation, Fluxon exposes three standardized interfaces that target the core bottlenecks in AI systems:
+Most existing systems, however, are still specialized components built for narrow scenarios, such as `MooncakeStore` for `KVCache`. Many AI workloads still lack mature AI-native infrastructure components, so algorithm teams often assemble temporary data-movement modules just to validate ideas quickly. As model scale and cluster elasticity grow together, the cost of this patchwork data plane keeps expanding, consuming CPU, I/O, memory, and operational effort, and exposing seven major engineering pain points:
+
+- Local solutions do not transfer well: specialized `KV Cache` systems bind cache semantics and `RDMA` transport to a narrow path, which makes them hard to carry over into more general data-plane scenarios
+- Resource governance is not unified enough: framework-level `L2` and external `L3` caches often live in the same host CPU memory, while `L2` remains outside unified indexing and eviction control, increasing cache-crossing overhead
+- No shared-memory fast path between local processes: many current data paths are organized around `RDMA` / `TCP`, so object handoff between colocated `workers` still detours through the network protocol stack
+- No dynamically elastic AI infra communication plane: handoff across resource pools needs dynamic membership and asynchronous transfer, while fixed-member communication models amplify connection-management and recovery complexity
+- Business processes are coupled to data-plane resource governance: when business processes start and stop dynamically while also contributing capacity, they trigger `rebalance` churn and connection storms in the data plane
+- Object lifecycles do not converge cleanly: caches, messages, and files each maintain their own reference and eviction state, and those states easily fragment across business frameworks, cache layers, and transport layers
+- Observability is split across systems: cache hits, transport paths, and object materialization are scattered across separate systems, so performance debugging becomes an exercise in stitching clues together from multiple metric sets
+
+Fluxon is designed around these problems. It separates data-plane resources, object lifecycles, cross-node transport, and business integration into explicit abstractions, then governs them on one integrated storage-and-transport foundation so more system budget goes to model computation instead of data-plane assembly and movement; built on that unified Rust-based storage-and-transport foundation, Fluxon exposes three standardized interfaces that target the core bottlenecks in AI systems:
 
 - **KV/RPC (Unified key-value and RPC)**: Breaks data silos and enables efficient cross-process, cross-node reuse of inference-side `KVCache` and `latent cache`
 - **MQ (Elastic message queue)**: Decouples system dependencies and supports elastic message transport across heterogeneous resource pools
 - **FS (`S3`-compatible file, object, and cache acceleration system)**: Unifies multi-form storage so one system can cache key-value, file, and object data, while supporting remote access, `S3` forwarding, and large-scale cross-cluster migration for AI data and model files
+
+![](./pics/fluxon架构图20260423.png)
 
 <a id="contents"></a>
 
