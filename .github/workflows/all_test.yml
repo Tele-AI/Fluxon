@@ -1,6 +1,7 @@
 name: ci_2_virt_node
 
 on:
+  workflow_dispatch:
   push:
   pull_request:
     types:
@@ -121,18 +122,18 @@ jobs:
       - name: Normalize ci_2_virt_node debug artifact permissions
         if: ${{ always() }}
         run: |
-          chmod -R a+rX .dever || true
+          chmod -R a+rX ci_2_virt_node_workdir || true
           chmod -R a+rX fluxon_release || true
           chmod -R a+rX setup_and_pack/nix/runs || true
-          find .dever -type f -name '*.yaml' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.log' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.json' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.html' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.txt' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.sha256' -exec chmod a+r {} + || true
-          find .dever -type d -path '*/pack_release_runtime/*' -exec chmod a+rx {} + || true
-          find .dever -type d -path '*/pack_release_runtime/project-data/*' -exec chmod a+rx {} + || true
-          find .dever -path '*/pack_release_runtime/project-data/*' \
+          find ci_2_virt_node_workdir -type f -name '*.yaml' -exec chmod a+r {} + || true
+          find ci_2_virt_node_workdir -type f -name '*.log' -exec chmod a+r {} + || true
+          find ci_2_virt_node_workdir -type f -name '*.json' -exec chmod a+r {} + || true
+          find ci_2_virt_node_workdir -type f -name '*.html' -exec chmod a+r {} + || true
+          find ci_2_virt_node_workdir -type f -name '*.txt' -exec chmod a+r {} + || true
+          find ci_2_virt_node_workdir -type f -name '*.sha256' -exec chmod a+r {} + || true
+          find ci_2_virt_node_workdir -type d -path '*/pack_release_runtime/*' -exec chmod a+rx {} + || true
+          find ci_2_virt_node_workdir -type d -path '*/pack_release_runtime/project-data/*' -exec chmod a+rx {} + || true
+          find ci_2_virt_node_workdir -path '*/pack_release_runtime/project-data/*' \
             \( -path '*/instances/*/logs' -o -path '*/instances/*/release' -o -path '*/assemblies/*/profile' \) \
             -exec chmod -R a+rX {} + || true
 
@@ -144,9 +145,9 @@ jobs:
           if-no-files-found: warn
           compression-level: 1
           path: |
-            .dever/**
+            ci_2_virt_node_workdir/**
             fluxon_release/**
             setup_and_pack/nix/runs/**
-            .dever/**/pack_release_runtime/project-data/**/instances/**/logs/**
-            .dever/**/pack_release_runtime/project-data/**/instances/**/release/**
-            .dever/**/pack_release_runtime/project-data/**/assemblies/**/profile/**
+            ci_2_virt_node_workdir/**/pack_release_runtime/project-data/**/instances/**/logs/**
+            ci_2_virt_node_workdir/**/pack_release_runtime/project-data/**/instances/**/release/**
+            ci_2_virt_node_workdir/**/pack_release_runtime/project-data/**/assemblies/**/profile/**

@@ -119,7 +119,7 @@ class GitSourceSelectionUtilsTest(unittest.TestCase):
         self.assertTrue(
             _PROFILE_MOD.source_profile_relpath_excluded(
                 profile=_PROFILE_MOD.SOURCE_SELECTION_PROFILE_SOURCE_PACK,
-                relpath=".dever/run.log",
+                relpath="ci_2_virt_node_workdir/run.log",
             )
         )
         self.assertTrue(

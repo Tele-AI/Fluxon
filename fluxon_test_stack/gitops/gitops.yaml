@@ -20,7 +20,7 @@ repos:
                 import yaml
 
                 workdir_root = Path.cwd().resolve()
-                out_dir = (workdir_root / ".dever" / "deployer_bootstrap").resolve()
+                out_dir = (workdir_root / "ci_2_virt_node_workdir" / "deployer_bootstrap").resolve()
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out_path = out_dir / "cluster_ssh_bootstrap.yaml"
 

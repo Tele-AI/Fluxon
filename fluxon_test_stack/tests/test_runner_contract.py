@@ -75,6 +75,14 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
             "ci_top_attention_mq_core_uses_cluster_kv_owner_runtime",
             test_ci_top_attention_mq_core_uses_cluster_kv_owner_runtime,
         ),
+        (
+            "test_stack_topology_two_uses_both_remote_targets",
+            test_test_stack_topology_two_uses_both_remote_targets,
+        ),
+        (
+            "ci_materialized_target_for_topology_two_uses_secondary_for_non_master_instances",
+            test_ci_materialized_target_for_topology_two_uses_secondary_for_non_master_instances,
+        ),
     ]
     if selected_test_id is None:
         return checks
@@ -518,6 +526,109 @@ def test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime() -> None
         )
         return
     print("PASS: test_ci_top_attention_cargo_kv_unit_uses_rust_self_managed_runtime")
+
+
+def test_test_stack_topology_two_uses_both_remote_targets() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    suite_cfg_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
+    suite_cfg = yaml.safe_load(suite_cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(suite_cfg, dict):
+        print("FAIL: test_test_stack_topology_two_uses_both_remote_targets - suite config is not a mapping")
+        return
+
+    suite_for_contract = copy.deepcopy(suite_cfg)
+    suite = _TEST_RUNNER._parse_suite_config(suite_for_contract)
+    cases = _TEST_RUNNER._expand_cases(suite)
+    case = next(
+        (
+            item
+            for item in cases
+            if item.scene_id == "bench_mq"
+            and item.scale_id == "n2_kvowner_dram_20gib"
+            and item.profile_id == "fluxon_tcp"
+        ),
+        None,
+    )
+    if case is None:
+        print("FAIL: test_test_stack_topology_two_uses_both_remote_targets - missing bench_mq case")
+        return
+
+    scene_ts = suite.scenes["bench_mq"]["test_stack"]
+    scale = suite.scales["n2_kvowner_dram_20gib"]
+    profile = suite.profiles["fluxon_tcp"]
+    target_ip_map = profile["runtime"]["test_stack"]["deploy"]["target_ip_map"]
+    machine_targets = _TEST_RUNNER._test_stack_scale_machine_targets(
+        scale,
+        ctx="resolved_case.scale",
+        target_ip_map=target_ip_map,
+    )
+    if machine_targets != ["infra44-ThinkStation-PX", "infra46-ThinkStation-PX"]:
+        print(
+            "FAIL: test_test_stack_topology_two_uses_both_remote_targets - "
+            f"unexpected machine_targets: {machine_targets!r}"
+        )
+        return
+
+    role_plan = _TEST_RUNNER._build_test_stack_role_plan(
+        scene_ts,
+        scale,
+        ctx="scene[bench_mq].test_stack",
+        target_ip_map=target_ip_map,
+    )
+    if role_plan["producer"]["targets"] != ["infra44-ThinkStation-PX"]:
+        print(
+            "FAIL: test_test_stack_topology_two_uses_both_remote_targets - "
+            f"unexpected producer targets: {role_plan['producer']['targets']!r}"
+        )
+        return
+    if role_plan["consumer"]["targets"] != ["infra46-ThinkStation-PX"]:
+        print(
+            "FAIL: test_test_stack_topology_two_uses_both_remote_targets - "
+            f"unexpected consumer targets: {role_plan['consumer']['targets']!r}"
+        )
+        return
+    if role_plan["producer"]["count"] != 1 or role_plan["consumer"]["count"] != 1:
+        print(
+            "FAIL: test_test_stack_topology_two_uses_both_remote_targets - "
+            f"unexpected role counts: {role_plan!r}"
+        )
+        return
+
+    print("PASS: test_test_stack_topology_two_uses_both_remote_targets")
+
+
+def test_ci_materialized_target_for_topology_two_uses_secondary_for_non_master_instances() -> None:
+    targets = {
+        "primary": "infra44-ThinkStation-PX",
+        "secondary": "infra46-ThinkStation-PX",
+    }
+    if _TEST_RUNNER._ci_materialized_target_for_instance(
+        topology=2,
+        targets=targets,
+        instance_id="master",
+        ctx="resolved_case.scale",
+    ) != "infra44-ThinkStation-PX":
+        print(
+            "FAIL: test_ci_materialized_target_for_topology_two_uses_secondary_for_non_master_instances - "
+            "master did not map to primary"
+        )
+        return
+
+    for instance_id in ("owner_0", "ci_runner"):
+        actual = _TEST_RUNNER._ci_materialized_target_for_instance(
+            topology=2,
+            targets=targets,
+            instance_id=instance_id,
+            ctx="resolved_case.scale",
+        )
+        if actual != "infra46-ThinkStation-PX":
+            print(
+                "FAIL: test_ci_materialized_target_for_topology_two_uses_secondary_for_non_master_instances - "
+                f"{instance_id} did not map to secondary: {actual!r}"
+            )
+            return
+
+    print("PASS: test_ci_materialized_target_for_topology_two_uses_secondary_for_non_master_instances")
 
 
 if __name__ == "__main__":

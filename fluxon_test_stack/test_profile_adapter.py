@@ -11,7 +11,6 @@ import http.client
 import json
 import os
 import re
-import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -20,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import test_bed_transport
 import yaml
 
 
@@ -44,14 +44,9 @@ _CONTROLLER_HTTP_TIMEOUT_SECONDS = 30.0
 _CONTROLLER_HTTP_RETRY_DEADLINE_SECONDS = 300.0
 _CONTROLLER_HTTP_RETRY_SLEEP_SECONDS = 1.0
 _CONTROLLER_TRANSIENT_HTTP_STATUS_CODES = (500, 502, 503, 504)
-_CONTROLLER_SSH_CONNECT_TIMEOUT_SECONDS = 10
-_CONTROLLER_SSH_SUBPROCESS_GRACE_SECONDS = 10.0
-CONTROLLER_REQUEST_MODE_SSH_EXEC_PER_REQUEST = "ssh_exec_per_request"
-TEST_STACK_START_TEST_BED_CONFIG_ENV = "FLUXON_TEST_STACK_START_TEST_BED_CONFIG"
 RUNNER_REPO_ROOT = Path(__file__).resolve().parent.parent
 _CONTROLLER_BASIC_AUTH_HEADER_NAME = "x-fluxon-ops-authorization"
 _CONTROLLER_BASIC_AUTH_HEADER: str | None = None
-_SSH_STDERR_NOISE_PREFIXES = ("/etc/zsh/zshenv:", "zsh:")
 
 
 def _resolve_repo_root_cli_path(*, raw_path: Path, field_name: str) -> Path:
@@ -64,324 +59,9 @@ def _resolve_repo_root_cli_path(*, raw_path: Path, field_name: str) -> Path:
 
 
 def _load_test_bed_bootstrap_config_path() -> Path:
-    raw_override = os.environ.get(TEST_STACK_START_TEST_BED_CONFIG_ENV)
-    if raw_override:
-        override_path = Path(raw_override).expanduser()
-        if not override_path.is_absolute():
-            override_path = override_path.resolve()
-        if not override_path.exists():
-            raise ValueError(
-                f"{TEST_STACK_START_TEST_BED_CONFIG_ENV} points to a missing file: {override_path}"
-            )
-        return override_path
-    return (RUNNER_REPO_ROOT / "fluxon_test_stack" / "start_test_bed.yaml").resolve()
-
-
-def _load_test_bed_manifest_opt() -> Optional[tuple[Path, Dict[str, Any]]]:
-    manifest_path = _load_test_bed_bootstrap_config_path().with_name("manifest.json")
-    if not manifest_path.exists():
-        return None
-    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest = _require_dict(raw, f"test bed manifest {manifest_path}")
-    return manifest_path, manifest
-
-
-def _load_test_bed_cluster_hostnames_by_ip_opt() -> Optional[Dict[str, List[str]]]:
-    cfg_path = _load_test_bed_bootstrap_config_path()
-    if not cfg_path.exists():
-        return None
-    cfg = _require_dict(_load_yaml_file(cfg_path), f"test bed bootstrap config {cfg_path}")
-    raw_deployconf = _require_str(cfg.get("deployconf_path"), "start_test_bed.deployconf_path")
-    deployconf_path = Path(raw_deployconf)
-    if not deployconf_path.is_absolute():
-        deployconf_path = (cfg_path.parent / deployconf_path).resolve()
-    if not deployconf_path.exists():
-        return None
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"test bed deployconf {deployconf_path}")
-    raw_nodes = deployconf.get("cluster_nodes")
-    if not isinstance(raw_nodes, list):
-        return None
-    out: Dict[str, List[str]] = {}
-    for idx, raw_node in enumerate(raw_nodes):
-        node = _require_dict(raw_node, f"deployconf.cluster_nodes[{idx}]")
-        hostname = _require_str(node.get("hostname"), f"deployconf.cluster_nodes[{idx}].hostname")
-        ip = _require_str(node.get("ip"), f"deployconf.cluster_nodes[{idx}].ip")
-        out.setdefault(ip, []).append(hostname)
-    for ip, names in out.items():
-        out[ip] = sorted(names)
-    return out
-
-
-def _canonical_targets_for_ip_from_test_bed(node_ip: str) -> List[str]:
-    by_ip = _load_test_bed_cluster_hostnames_by_ip_opt()
-    if by_ip is None:
-        return []
-    return list(by_ip.get(node_ip, []))
-
-
-def _test_bed_manifest_transport_ctx_opt() -> Optional[Dict[str, Any]]:
-    manifest_info = _load_test_bed_manifest_opt()
-    if manifest_info is None:
-        return None
-    manifest_path, manifest = manifest_info
-    bastion = _require_dict(manifest.get("bastion"), f"test bed manifest {manifest_path}.bastion")
-    bastion_user_raw = manifest.get("bastion_user")
-    bastion_private_key_raw = manifest.get("bastion_private_key")
-    bastion_password_raw = manifest.get("bastion_password")
-    return {
-        "manifest": manifest,
-        "bastion_host": _require_str(bastion.get("host"), f"test bed manifest {manifest_path}.bastion.host"),
-        "bastion_port": _require_int(
-            bastion.get("ssh_port"),
-            f"test bed manifest {manifest_path}.bastion.ssh_port",
-            min_v=1,
-        ),
-        "bastion_user": (
-            "root"
-            if bastion_user_raw is None or not str(bastion_user_raw).strip()
-            else _require_str(bastion_user_raw, f"test bed manifest {manifest_path}.bastion_user")
-        ),
-        "bastion_private_key": (
-            None
-            if bastion_private_key_raw is None or not str(bastion_private_key_raw).strip()
-            else str(Path(str(bastion_private_key_raw)).expanduser().resolve())
-        ),
-        "bastion_password": (
-            None
-            if bastion_password_raw is None
-            else _require_str(bastion_password_raw, f"test bed manifest {manifest_path}.bastion_password")
-        ),
-    }
-
-
-def _clean_ssh_stderr_text(text: str) -> str:
-    if not text:
-        return ""
-    lines: List[str] = []
-    for raw in text.splitlines():
-        if any(raw.startswith(prefix) for prefix in _SSH_STDERR_NOISE_PREFIXES):
-            continue
-        lines.append(raw)
-    return "\n".join(lines).strip()
-
-
-def _shell_quote(s: str) -> str:
-    if s == "":
-        return "''"
-    if re.fullmatch(r"[A-Za-z0-9_./:=@+-]+", s):
-        return s
-    return "'" + s.replace("'", "'\\''") + "'"
-
-
-def _controller_transport_manifest_opt(*, url: str) -> Optional[Dict[str, Any]]:
-    manifest_info = _load_test_bed_manifest_opt()
-    if manifest_info is None:
-        return None
-    manifest_path, manifest = manifest_info
-    mode = _require_str(
-        manifest.get("controller_request_mode"),
-        f"testbed manifest {manifest_path}.controller_request_mode",
+    return test_bed_transport.load_test_bed_bootstrap_config_path_from_env_or_repo_root(
+        repo_root=RUNNER_REPO_ROOT,
     )
-    if mode != CONTROLLER_REQUEST_MODE_SSH_EXEC_PER_REQUEST:
-        return None
-    controller_url = _require_str(
-        manifest.get("controller_url"),
-        f"testbed manifest {manifest_path}.controller_url",
-    ).rstrip("/")
-    controller_public_url = _require_str(
-        manifest.get("controller_public_url"),
-        f"testbed manifest {manifest_path}.controller_public_url",
-    ).rstrip("/")
-    controller_cluster_url = str(manifest.get("controller_cluster_url") or "").rstrip("/")
-    normalized_url = _require_str(url, "controller transport url").rstrip("/")
-    allowed_prefixes = [controller_url, controller_public_url]
-    if controller_cluster_url:
-        allowed_prefixes.append(controller_cluster_url)
-    if not any(normalized_url.startswith(prefix) for prefix in allowed_prefixes):
-        return None
-    return manifest
-
-
-def _controller_request_exec_host(manifest: Dict[str, Any]) -> tuple[str, Optional[str], Optional[int], Optional[str]]:
-    raw_exec_host = manifest.get("controller_exec_host")
-    if raw_exec_host is not None and str(raw_exec_host).strip():
-        exec_host = _require_str(raw_exec_host, "testbed manifest.controller_exec_host")
-        exec_user_raw = manifest.get("controller_exec_user")
-        exec_port_raw = manifest.get("controller_exec_port")
-        exec_password_raw = manifest.get("controller_exec_password")
-        exec_user = None if exec_user_raw is None else _require_str(exec_user_raw, "testbed manifest.controller_exec_user")
-        exec_port = None if exec_port_raw is None else _require_int(exec_port_raw, "testbed manifest.controller_exec_port", min_v=1)
-        exec_password = (
-            None
-            if exec_password_raw is None
-            else _require_str(exec_password_raw, "testbed manifest.controller_exec_password")
-        )
-        return exec_host, exec_user, exec_port, exec_password
-    bastion = _require_dict(manifest.get("bastion"), "testbed manifest.bastion")
-    return _require_str(bastion.get("host"), "testbed manifest.bastion.host"), None, None, None
-
-
-def _controller_request_url_via_manifest(manifest: Dict[str, Any], *, url: str) -> str:
-    request_parts = urllib.parse.urlsplit(url)
-    exec_host, _, _, _ = _controller_request_exec_host(manifest)
-    bastion = _require_dict(manifest.get("bastion"), "testbed manifest.bastion")
-    bastion_host = _require_str(bastion.get("host"), "testbed manifest.bastion.host")
-    local_base = ""
-    if exec_host == bastion_host:
-        local_base = str(manifest.get("controller_bastion_local_url") or "").strip()
-    if not local_base:
-        local_base = str(manifest.get("controller_cluster_url") or "").strip()
-    if not local_base:
-        local_base = _require_str(
-            manifest.get("controller_bastion_local_url"),
-            "testbed manifest.controller_bastion_local_url",
-        )
-    local_parts = urllib.parse.urlsplit(local_base)
-    return urllib.parse.urlunsplit(
-        (local_parts.scheme, local_parts.netloc, request_parts.path, request_parts.query, "")
-    )
-
-
-def _controller_request_via_manifest(
-    req: urllib.request.Request,
-    *,
-    timeout_seconds: float,
-) -> Optional[tuple[int, bytes]]:
-    manifest = _controller_transport_manifest_opt(url=str(req.full_url))
-    if manifest is None:
-        return None
-    transport_ctx = _test_bed_manifest_transport_ctx_opt()
-    if transport_ctx is None:
-        raise ValueError("testbed transport manifest not found")
-    exec_host, exec_user, exec_port, exec_password = _controller_request_exec_host(manifest)
-    effective_url = _controller_request_url_via_manifest(manifest, url=str(req.full_url))
-    headers_json = json.dumps(dict(req.header_items()), separators=(",", ":"))
-    remote_script = (
-        "import json, sys, urllib.error, urllib.request\n"
-        "url, method, timeout_seconds, headers_json = sys.argv[1:5]\n"
-        "headers = json.loads(headers_json)\n"
-        "payload = sys.stdin.buffer.read()\n"
-        "if payload == b'':\n"
-        "    payload = None\n"
-        "request = urllib.request.Request(url, data=payload, method=method)\n"
-        "for key, value in headers.items():\n"
-        "    request.add_header(key, value)\n"
-        "try:\n"
-        "    with urllib.request.urlopen(request, timeout=float(timeout_seconds)) as resp:\n"
-        "        body = resp.read()\n"
-        "        status = int(resp.status)\n"
-        "except urllib.error.HTTPError as err:\n"
-        "    body = err.read()\n"
-        "    status = int(err.code)\n"
-        "except Exception as exc:\n"
-        "    print(json.dumps({'transport_error': f'{type(exc).__name__}: {exc}'}), file=sys.stderr)\n"
-        "    sys.exit(0)\n"
-        "sys.stdout.buffer.write(body)\n"
-        "sys.stdout.buffer.flush()\n"
-        "print(json.dumps({'status': status}), file=sys.stderr)\n"
-    )
-    remote_cmd = (
-        "python3 -c "
-        + _shell_quote(remote_script)
-        + " "
-        + _shell_quote(effective_url)
-        + " "
-        + _shell_quote(req.get_method())
-        + " "
-        + _shell_quote(str(float(timeout_seconds)))
-        + " "
-        + _shell_quote(headers_json)
-    )
-    argv = []
-    effective_password = exec_password
-    direct_bastion = exec_host == str(transport_ctx["bastion_host"])
-    if direct_bastion and effective_password is None and transport_ctx.get("bastion_password") is not None:
-        effective_password = str(transport_ctx["bastion_password"])
-    if effective_password is not None:
-        argv.extend(["sshpass", "-p", effective_password])
-    argv.extend(
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes" if effective_password is None else "BatchMode=no",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-o",
-            f"ConnectTimeout={_CONTROLLER_SSH_CONNECT_TIMEOUT_SECONDS}",
-        ]
-    )
-    if direct_bastion:
-        argv.extend(
-            [
-                "-o",
-                "HostKeyAlgorithms=+ssh-rsa",
-                "-o",
-                "PubkeyAcceptedAlgorithms=+ssh-rsa",
-            ]
-        )
-        if transport_ctx["bastion_private_key"]:
-            argv.extend(["-i", str(transport_ctx["bastion_private_key"]), "-o", "IdentitiesOnly=yes"])
-    else:
-        proxy_parts = []
-        if transport_ctx.get("bastion_password"):
-            proxy_parts.extend(["sshpass", "-p", str(transport_ctx["bastion_password"])])
-        proxy_parts.extend(
-            [
-                "ssh",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "HostKeyAlgorithms=+ssh-rsa",
-                "-o",
-                "PubkeyAcceptedAlgorithms=+ssh-rsa",
-            ]
-        )
-        if transport_ctx["bastion_private_key"]:
-            proxy_parts.extend(["-i", str(transport_ctx["bastion_private_key"]), "-o", "IdentitiesOnly=yes"])
-        proxy_parts.extend(
-            [
-                "-p",
-                str(transport_ctx["bastion_port"]),
-                f"{transport_ctx['bastion_user']}@{transport_ctx['bastion_host']}",
-                "-W",
-                "%h:%p",
-            ]
-        )
-        argv.extend(["-o", "ProxyCommand=" + " ".join(_shell_quote(str(part)) for part in proxy_parts)])
-    if exec_port is not None:
-        argv.extend(["-p", str(int(exec_port))])
-    target = exec_host if exec_user is None else f"{exec_user}@{exec_host}"
-    argv.extend([target, remote_cmd])
-    try:
-        completed = subprocess.run(
-            argv,
-            input=req.data if isinstance(req.data, bytes) else b"",
-            capture_output=True,
-            timeout=max(
-                float(timeout_seconds) + _CONTROLLER_SSH_SUBPROCESS_GRACE_SECONDS,
-                20.0,
-            ),
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise urllib.error.URLError(
-            f"ssh controller request timed out: url={effective_url} timeout={timeout_seconds}"
-        ) from exc
-    stderr_text = _clean_ssh_stderr_text(completed.stderr.decode("utf-8", errors="replace"))
-    if completed.returncode != 0:
-        detail = stderr_text or completed.stdout.decode("utf-8", errors="replace") or f"ssh exited with rc={completed.returncode}"
-        raise urllib.error.URLError(f"ssh controller request failed: url={effective_url} detail={detail}")
-    lines = [line for line in stderr_text.splitlines() if line.strip()]
-    if not lines:
-        raise ValueError(f"empty ssh controller response envelope: url={effective_url}")
-    envelope = _require_dict(json.loads(lines[-1]), f"ssh controller response {effective_url}")
-    transport_error = envelope.get("transport_error")
-    if transport_error is not None:
-        raise urllib.error.URLError(f"ssh controller transport error: url={effective_url} err={transport_error}")
-    status_code = _require_int(envelope.get("status"), f"ssh controller response {effective_url}.status", min_v=100)
-    return int(status_code), completed.stdout
 
 
 def main() -> None:
@@ -851,7 +531,14 @@ def _controller_target_for_target(target: str, target_ip_map: Dict[str, Any]) ->
     if not same_ip_targets:
         raise ValueError(f"target_ip_map has no targets for node ip: target={target} node_ip={node_ip}")
 
-    test_bed_targets = [candidate for candidate in _canonical_targets_for_ip_from_test_bed(node_ip) if candidate in same_ip_targets]
+    test_bed_targets = [
+        candidate
+        for candidate in test_bed_transport.canonical_targets_for_ip_from_test_bed(
+            bootstrap_config_path=_load_test_bed_bootstrap_config_path(),
+            node_ip=node_ip,
+        )
+        if candidate in same_ip_targets
+    ]
     if test_bed_targets:
         return test_bed_targets[0], node_ip
 
@@ -1243,7 +930,11 @@ def _http_json(req: urllib.request.Request) -> Dict[str, Any]:
     deadline = time.time() + _CONTROLLER_HTTP_RETRY_DEADLINE_SECONDS
     while True:
         try:
-            transported = _controller_request_via_manifest(req, timeout_seconds=_CONTROLLER_HTTP_TIMEOUT_SECONDS)
+            transported = test_bed_transport.controller_request_via_manifest(
+                req,
+                timeout_seconds=_CONTROLLER_HTTP_TIMEOUT_SECONDS,
+                bootstrap_config_path=_load_test_bed_bootstrap_config_path(),
+            )
             if transported is not None:
                 status_code, data = transported
                 if status_code in _CONTROLLER_TRANSIENT_HTTP_STATUS_CODES:
@@ -1281,7 +972,11 @@ def _http_json_allow_error_status(req: urllib.request.Request) -> tuple[int, Dic
     deadline = time.time() + _CONTROLLER_HTTP_RETRY_DEADLINE_SECONDS
     while True:
         try:
-            transported = _controller_request_via_manifest(req, timeout_seconds=_CONTROLLER_HTTP_TIMEOUT_SECONDS)
+            transported = test_bed_transport.controller_request_via_manifest(
+                req,
+                timeout_seconds=_CONTROLLER_HTTP_TIMEOUT_SECONDS,
+                bootstrap_config_path=_load_test_bed_bootstrap_config_path(),
+            )
             if transported is not None:
                 status_code, data = transported
                 return int(status_code), _require_dict(json.loads(data.decode("utf-8")), "http_json")
