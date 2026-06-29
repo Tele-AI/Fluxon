@@ -1381,7 +1381,10 @@ async fn key_meta_cache_check(
         }
     }
 
-    tracing::info!("🔍 Starting PUT and GET in parallel: {}", parallel_unique_key);
+    tracing::info!(
+        "🔍 Starting PUT and GET in parallel: {}",
+        parallel_unique_key
+    );
     for i in 0..10 {
         let (put_client, other_client) = if i % 2 == 0 {
             (client, client2)
@@ -1420,7 +1423,9 @@ async fn key_meta_cache_check(
         }
 
         assert!(
-            put_client.client_kv_api().has_cached_key(parallel_unique_key),
+            put_client
+                .client_kv_api()
+                .has_cached_key(parallel_unique_key),
             "put client should have immediate local cache metadata for key {} after put time {}",
             parallel_unique_key,
             i

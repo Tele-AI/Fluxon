@@ -52,10 +52,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from fluxon_py import FluxonKvClientConfig, new_store  # noqa: E402
 from fluxon_py.api_error import (  # noqa: E402
     ChannelClosedError,
+    KeyNotFoundError,
     MessageConsumptionNoNewMessageError,
     ProducerClosedError,
 )
 from fluxon_py.api_ext_chan import ChanType  # noqa: E402
+from fluxon_py._api_ext_chan.mpsc import MpscContext  # noqa: E402
 from fluxon_py.kvclient import KvClientType  # noqa: E402
 from fluxon_py.kvclient.nonzerocopy_encode import DLPackBytesView  # noqa: E402
 from fluxon_py.logging import init_logger  # noqa: E402
@@ -382,17 +384,23 @@ def _run_one_case(
         )
         _put_etcd_key(stop_key, b"1")
         time.sleep(SUMMARY_STOP_GRACE_SECONDS)
-        _signal_live_processes(worker_processes, signum=signal.SIGINT)
         try:
             _wait_for_processes_exit(worker_processes, timeout_seconds=WORKER_EXIT_TIMEOUT_SECONDS)
         except RuntimeError as err:
+            _signal_live_processes(worker_processes, signum=signal.SIGINT)
             logging.warning("[bench] worker shutdown timeout bench_id=%s error=%s", bench_id, err)
+            raise
         else:
-            _warn_if_worker_exited_nonzero(worker_processes, bench_id=bench_id)
+            _raise_if_worker_exited_nonzero(worker_processes, bench_id=bench_id)
     finally:
         _terminate_processes(worker_processes)
         _delete_etcd_key(stop_key)
         _clear_etcd_prefix(f"{SUMMARY_KEY_PREFIX}{bench_id}/")
+        if bootstrap_store is not None and bootstrap_producer is not None:
+            _best_effort_delete_case_broker_channels(
+                store=bootstrap_store,
+                mpmc_id=str(bootstrap_producer.get_chan_id()),
+            )
         if bootstrap_producer is not None:
             _best_effort_close(bootstrap_producer, role="bootstrap_producer")
         _best_effort_close(bootstrap_store, role="bootstrap_store")
@@ -985,18 +993,18 @@ def _index_summaries_by_consumer_id(summaries: list[dict[str, Any]]) -> dict[str
     return indexed
 
 
-def _warn_if_worker_exited_nonzero(processes: list[subprocess.Popen[str]], *, bench_id: str) -> None:
+def _raise_if_worker_exited_nonzero(processes: list[subprocess.Popen[str]], *, bench_id: str) -> None:
+    failures: list[str] = []
     for proc in processes:
         return_code = proc.poll()
         if return_code is None:
             continue
         if return_code != 0:
-            logging.warning(
-                "[bench] worker exited non-zero during teardown bench_id=%s pid=%s code=%s",
-                bench_id,
-                proc.pid,
-                return_code,
-            )
+            failures.append(f"pid={proc.pid} code={return_code}")
+    if failures:
+        raise RuntimeError(
+            f"worker exited non-zero during teardown bench_id={bench_id}: {', '.join(failures)}"
+        )
 
 
 def _maybe_write_consumer_summary(
@@ -1213,6 +1221,71 @@ def _clear_etcd_prefix(prefix: str) -> None:
     with etcd3.client(ETCD_HOST, ETCD_PORT) as etcd_client:
         for _, meta in etcd_client.get_prefix(prefix):
             etcd_client.delete(meta.key)
+
+
+def _best_effort_delete_case_broker_channels(*, store: Any, mpmc_id: str) -> None:
+    if not isinstance(mpmc_id, str) or not mpmc_id.isdigit():
+        logging.warning("[bench] skip broker cleanup for invalid mpmc_id=%r", mpmc_id)
+        return
+
+    channels_key = f"/mpmc_channels/{mpmc_id}/mpsc_channels"
+    try:
+        with etcd3.client(ETCD_HOST, ETCD_PORT) as etcd_client:
+            raw, _ = etcd_client.get(channels_key)
+        if raw is None:
+            return
+        loaded = json.loads(raw.decode("utf-8"))
+        if not isinstance(loaded, list):
+            raise TypeError(f"{channels_key} must contain a list, got {type(loaded).__name__}")
+
+        ctx = MpscContext(store)
+        payload_key_count = 0
+        payload_delete_ok = 0
+        payload_delete_failed = 0
+        try:
+            for chan_id in loaded:
+                if not isinstance(chan_id, str) or not chan_id.isdigit():
+                    raise ValueError(f"invalid sub-MPSC channel id in {channels_key}: {chan_id!r}")
+                payload_keys = ctx.delete_broker_channel(chan_id)
+                payload_key_count += len(payload_keys)
+                for payload_key in payload_keys:
+                    res = store.remove(payload_key)
+                    if res.is_ok():
+                        _ = res.unwrap()
+                        payload_delete_ok += 1
+                        continue
+                    err = res.unwrap_error()
+                    if isinstance(err, KeyNotFoundError):
+                        payload_delete_ok += 1
+                        continue
+                    payload_delete_failed += 1
+                    logging.warning(
+                        "[bench] broker payload cleanup failed key=%s err=%s",
+                        payload_key,
+                        err,
+                    )
+        finally:
+            ctx.close()
+        logging.info(
+            "[bench] deleted broker channels for mpmc_id=%s count=%s payload_keys=%s payload_delete_ok=%s payload_delete_failed=%s",
+            mpmc_id,
+            len(loaded),
+            payload_key_count,
+            payload_delete_ok,
+            payload_delete_failed,
+        )
+        print(
+            "BENCH_BROKER_CLEANUP "
+            f"mpmc_id={mpmc_id} channels={len(loaded)} payload_keys={payload_key_count} "
+            f"payload_delete_ok={payload_delete_ok} payload_delete_failed={payload_delete_failed}",
+            flush=True,
+        )
+    except Exception as err:  # noqa: BLE001
+        logging.warning(
+            "[bench] broker channel cleanup failed for mpmc_id=%s: %s",
+            mpmc_id,
+            err,
+        )
 
 
 def _best_effort_close(obj: Any, *, role: str) -> None:

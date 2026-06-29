@@ -28,10 +28,15 @@ use crate::nonblocking_monitor::{
 };
 use crate::shutdown::ShutdownCtl;
 use crate::LifecycleView;
+use crate::{BrokerError, BrokerHandle, BrokerReserveRequest};
 use tokio::sync::watch;
 use tracing::warn;
 
 const PRODUCE_OFFSET_ETCD_SLOW_WARN_THRESHOLD: Duration = Duration::from_secs(1);
+const BROKER_BACKPRESSURE_INITIAL_SLEEP_MS: u64 = 2;
+const BROKER_BACKPRESSURE_MAX_SLEEP_MS: u64 = 50;
+const BROKER_BACKPRESSURE_JITTER_MS: u64 = 7;
+const BROKER_BACKPRESSURE_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProducerMemberMeta {
@@ -266,6 +271,10 @@ impl MpscProducer {
         self.chan_mgr.payload_lease.id() as i64
     }
 
+    pub fn channel_capacity(&self) -> i64 {
+        self.chan_mgr.capacity()
+    }
+
     /// Shared shutdown controller for this producer instance.
     pub fn shutdown_ctl(&self) -> ShutdownCtl {
         self.shutdown.clone()
@@ -420,9 +429,7 @@ impl MpscProducer {
         let put_payload = Arc::new(put_payload);
         loop {
             if self.shutdown.is_closed() {
-                return Err(MpscError::Internal(
-                    "producer closed during put_with_payload".to_string(),
-                ));
+                return Err(MpscError::Closed);
             }
             let key_clone = msg_key.clone();
             let f = put_payload.clone();
@@ -479,6 +486,243 @@ impl MpscProducer {
         }
         Ok(())
     }
+
+    /// Broker-backed put path.
+    ///
+    /// This keeps the existing payload callback contract but moves
+    /// message id allocation and publish visibility into the broker.
+    /// The current etcd-backed `put_with_payload` remains untouched
+    /// until call sites are switched to this path.
+    pub async fn put_with_payload_via_broker<F>(
+        &mut self,
+        broker: &BrokerHandle,
+        payload_bytes: u64,
+        put_payload: F,
+    ) -> Result<(), MpscError>
+    where
+        F: Fn(String, i64, Option<String>) -> i32 + Send + Sync + 'static,
+    {
+        let preferred_sub_cluster_for_call = self.preferred_sub_cluster_for_put()?;
+        let published_msg_id = put_payload_via_broker(
+            broker,
+            self.chan_id,
+            &self.producer_idx,
+            self.category,
+            payload_bytes,
+            self.shutdown.clone(),
+            preferred_sub_cluster_for_call,
+            put_payload,
+        )
+        .await?;
+        self.next_msg_id = self.next_msg_id.max(published_msg_id + 1);
+        Ok(())
+    }
+}
+
+async fn put_payload_via_broker<F>(
+    broker: &BrokerHandle,
+    chan_id: i64,
+    producer_idx: &str,
+    category: MqCategory,
+    payload_bytes: u64,
+    shutdown: ShutdownCtl,
+    preferred_sub_cluster_for_call: Option<String>,
+    put_payload: F,
+) -> Result<i64, MpscError>
+where
+    F: Fn(String, i64, Option<String>) -> i32 + Send + Sync + 'static,
+{
+    use limit_thirdparty::tokio::task;
+    use tokio::time::sleep;
+
+    let put_payload = Arc::new(put_payload);
+    let reserve_wait_begin = Instant::now();
+    let mut reserve_retry_attempt: u32 = 0;
+    let mut payload_retry_attempt: u32 = 0;
+    let mut next_reserve_warn_at = Instant::now() + BROKER_BACKPRESSURE_WARN_INTERVAL;
+    let mut next_payload_warn_at = Instant::now() + BROKER_BACKPRESSURE_WARN_INTERVAL;
+
+    loop {
+        if shutdown.is_closed() {
+            return Err(MpscError::Closed);
+        }
+
+        let reservation = match broker
+            .reserve(BrokerReserveRequest {
+                channel_id: chan_id,
+                producer_id: producer_idx.to_string(),
+                category,
+                payload_bytes,
+                now_ms: broker_now_ms(),
+            })
+            .await
+        {
+            Ok(reservation) => {
+                reserve_retry_attempt = 0;
+                reservation
+            }
+            Err(BrokerError::ChannelFull {
+                channel_id,
+                capacity,
+                used_slots,
+            }) => {
+                let now = Instant::now();
+                if now >= next_reserve_warn_at {
+                    warn!(
+                        "broker reserve backpressured: chan_id={} producer_idx={} capacity={} used_slots={} waited_ms={}",
+                        channel_id,
+                        producer_idx,
+                        capacity,
+                        used_slots,
+                        reserve_wait_begin.elapsed().as_millis(),
+                    );
+                    next_reserve_warn_at = now + BROKER_BACKPRESSURE_WARN_INTERVAL;
+                }
+                let sleep_for =
+                    broker_backpressure_sleep_duration(producer_idx, reserve_retry_attempt);
+                reserve_retry_attempt = reserve_retry_attempt.saturating_add(1);
+                sleep(sleep_for).await;
+                continue;
+            }
+            Err(BrokerError::PayloadBytesFull {
+                capacity_bytes,
+                used_bytes,
+                requested_bytes,
+            }) => {
+                let now = Instant::now();
+                if now >= next_reserve_warn_at {
+                    warn!(
+                        "broker payload budget backpressured: chan_id={} producer_idx={} requested_bytes={} capacity_bytes={} used_bytes={} waited_ms={}",
+                        chan_id,
+                        producer_idx,
+                        requested_bytes,
+                        capacity_bytes,
+                        used_bytes,
+                        reserve_wait_begin.elapsed().as_millis(),
+                    );
+                    next_reserve_warn_at = now + BROKER_BACKPRESSURE_WARN_INTERVAL;
+                }
+                let sleep_for =
+                    broker_backpressure_sleep_duration(producer_idx, reserve_retry_attempt);
+                reserve_retry_attempt = reserve_retry_attempt.saturating_add(1);
+                sleep(sleep_for).await;
+                continue;
+            }
+            Err(BrokerError::PayloadTooLarge {
+                requested_bytes,
+                capacity_bytes,
+            }) => {
+                return Err(MpscError::Internal(format!(
+                    "broker payload too large: chan_id={} producer_idx={} requested_bytes={} capacity_bytes={}",
+                    chan_id, producer_idx, requested_bytes, capacity_bytes
+                )));
+            }
+            Err(other) => {
+                return Err(MpscError::Internal(format!(
+                    "broker reserve failed: chan_id={} producer_idx={} err={}",
+                    chan_id, producer_idx, other
+                )));
+            }
+        };
+        let reservation_id = reservation.envelope.reservation_id;
+        let msg_id = reservation.envelope.msg_id;
+        let msg_key = reservation.envelope.payload_key.clone();
+
+        let key_clone = msg_key.clone();
+        let f = put_payload.clone();
+        let hint = preferred_sub_cluster_for_call.clone();
+        let code = task::spawn_blocking(move || (f)(key_clone, msg_id, hint))
+            .await
+            .map_err(|e| {
+                abort_on_payload_failure_async(broker.clone(), chan_id, reservation_id);
+                MpscError::JoinError(e)
+            })?;
+
+        match code {
+            0 => {
+                broker
+                    .publish(chan_id, reservation_id, broker_now_ms())
+                    .await
+                    .map_err(|e| {
+                        MpscError::Internal(format!(
+                            "broker publish failed after payload write: chan_id={} producer_idx={} reservation_id={} msg_id={} err={}",
+                            chan_id, producer_idx, reservation_id, msg_id, e
+                        ))
+                    })?;
+                return Ok(msg_id);
+            }
+            1 => {
+                abort_broker_reservation_best_effort(broker, chan_id, reservation_id).await;
+                let now = Instant::now();
+                if now >= next_payload_warn_at {
+                    warn!(
+                        "broker payload write backpressured by owner pool: chan_id={} producer_idx={} waited_ms={}",
+                        chan_id,
+                        producer_idx,
+                        reserve_wait_begin.elapsed().as_millis(),
+                    );
+                    next_payload_warn_at = now + BROKER_BACKPRESSURE_WARN_INTERVAL;
+                }
+                let sleep_for =
+                    broker_backpressure_sleep_duration(producer_idx, payload_retry_attempt);
+                payload_retry_attempt = payload_retry_attempt.saturating_add(1);
+                sleep(sleep_for).await;
+                continue;
+            }
+            2 => {
+                abort_broker_reservation_best_effort(broker, chan_id, reservation_id).await;
+                return Err(MpscError::PutPayloadNonRetryable);
+            }
+            other => {
+                abort_broker_reservation_best_effort(broker, chan_id, reservation_id).await;
+                return Err(MpscError::PutPayloadUnknownCode { code: other });
+            }
+        }
+    }
+}
+
+fn broker_backpressure_sleep_duration(producer_idx: &str, retry_attempt: u32) -> Duration {
+    let shift = retry_attempt.min(6);
+    let base_ms = BROKER_BACKPRESSURE_INITIAL_SLEEP_MS
+        .saturating_mul(1_u64 << shift)
+        .min(BROKER_BACKPRESSURE_MAX_SLEEP_MS);
+    let jitter_ms = if BROKER_BACKPRESSURE_JITTER_MS == 0 {
+        0
+    } else {
+        producer_idx
+            .bytes()
+            .fold(retry_attempt as u64, |acc, byte| {
+                acc.wrapping_mul(31).wrapping_add(byte as u64)
+            })
+            % (BROKER_BACKPRESSURE_JITTER_MS + 1)
+    };
+    Duration::from_millis((base_ms + jitter_ms).min(BROKER_BACKPRESSURE_MAX_SLEEP_MS))
+}
+
+async fn abort_broker_reservation_best_effort(
+    broker: &BrokerHandle,
+    chan_id: i64,
+    reservation_id: u64,
+) {
+    if let Err(err) = broker.abort(chan_id, reservation_id).await {
+        warn!(
+            "best-effort broker abort failed: chan_id={} reservation_id={} err={}",
+            chan_id, reservation_id, err
+        );
+    }
+}
+
+fn abort_on_payload_failure_async(broker: BrokerHandle, chan_id: i64, reservation_id: u64) {
+    tokio::spawn(async move {
+        abort_broker_reservation_best_effort(&broker, chan_id, reservation_id).await;
+    });
+}
+
+fn broker_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before UNIX_EPOCH")
+        .as_millis() as i64
 }
 
 fn spawn_consumer_meta_watch(

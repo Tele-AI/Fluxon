@@ -95,6 +95,7 @@ limit_thirdparty = { path = "../limit_thirdparty" }
 fluxon_cli = { path = "../fluxon_cli" }
 fluxon_util = { path = "../fluxon_util" }
 fluxon_observability = { path = "../fluxon_observability" }
+fluxon_mq = { path = "../fluxon_mq" }
 [build-dependencies]
 tonic-build = { workspace = true }
 fluxon_util = { path = "../fluxon_util" }

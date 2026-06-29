@@ -51,6 +51,7 @@ BLOCKING_WINDOW_SECONDS = 0.5
 CHAN_CONFIG_TEST = {"capacity": 10, "ttl_seconds": 90, "weight": 1}
 
 MASTER_SCRIPT = [sys.executable, "-m", "fluxon_py.runtime.start_master"]
+BROKER_SCRIPT = [sys.executable, "-m", "fluxon_py.runtime.start_broker"]
 KVCLIENT_SCRIPT = [sys.executable, "-m", "fluxon_py.runtime.start_owner_kvclient"]
 ETCD_BIN = PROJECT_ROOT / "fluxon_release" / "ext_images" / "etcd" / "etcd"
 GREPTIME_BIN = PROJECT_ROOT / "fluxon_release" / "ext_images" / "greptime" / "greptime"
@@ -463,6 +464,7 @@ def _build_example_config(
     share_mem_path: str,
     greptime_http_port: int,
     master_port: int,
+    broker_port: int,
 ) -> dict[str, Any]:
     capacity = max(128, int(CHAN_CONFIG_TEST["capacity"]))
     ttl_seconds = max(90, int(CHAN_CONFIG_TEST["ttl_seconds"]))
@@ -474,6 +476,15 @@ def _build_example_config(
             "port": master_port,
             "log_dir": str((Path(share_mem_path).parent / "log" / "master").resolve()),
             "monitoring": _monitoring_block(greptime_http_port=greptime_http_port),
+        },
+        "broker": {
+            "instance_key": f"example_ctrlc_broker_{unique_suffix}",
+            "fluxonkv_spec": {
+                "cluster_name": cluster_name,
+                "shared_memory_path": shared_memory_path,
+                "shared_file_path": str((Path(shared_memory_path).parent / "sharefile").resolve()),
+                "p2p_listen_port": broker_port,
+            },
         },
         "kvclient": {
             "instance_key": f"example_ctrlc_owner_{unique_suffix}",
@@ -589,6 +600,7 @@ def _start_local_stack(*, temp_root: Path, config_path: Path) -> list[tuple[subp
     cluster_name = f"example_ctrlc_cluster_{unique_suffix}"
     share_mem_path = str((temp_root / "sharemem").resolve())
     master_port = _pick_free_port()
+    broker_port = _pick_free_port()
     config = _build_example_config(
         unique_suffix=unique_suffix,
         cluster_name=cluster_name,
@@ -596,14 +608,17 @@ def _start_local_stack(*, temp_root: Path, config_path: Path) -> list[tuple[subp
         share_mem_path=share_mem_path,
         greptime_http_port=greptime_http_port,
         master_port=master_port,
+        broker_port=broker_port,
     )
     config_path.write_text(
         yaml.safe_dump(config, sort_keys=False),
         encoding="utf-8",
     )
     master_config_path = temp_root / "master.yaml"
+    broker_config_path = temp_root / "broker.yaml"
     kvclient_config_path = temp_root / "kvclient.yaml"
     _write_runtime_subconfig(path=master_config_path, config=config, key="master")
+    _write_runtime_subconfig(path=broker_config_path, config=config, key="broker")
     _write_runtime_subconfig(path=kvclient_config_path, config=config, key="kvclient")
 
     master_proc = _spawn_logged(
@@ -643,8 +658,25 @@ def _start_local_stack(*, temp_root: Path, config_path: Path) -> list[tuple[subp
         proc=kvclient_proc,
         log_path=kvclient_log,
     )
+
+    broker_log = temp_root / "log" / "broker.log"
+    broker_proc = _spawn_logged(
+        cmd=[
+            *BROKER_SCRIPT,
+            "-c",
+            str(broker_config_path),
+            "-w",
+            str((temp_root / "broker_work").resolve()),
+        ],
+        workdir=PROJECT_ROOT,
+        log_path=broker_log,
+        env=env,
+    )
+    time.sleep(2.0)
+    _require_process_running(broker_proc, label="broker", log_path=broker_log)
     return [
         (kvclient_proc, kvclient_log),
+        (broker_proc, broker_log),
         (master_proc, master_log),
         (etcd_proc, etcd_log),
         (greptime_proc, greptime_log),

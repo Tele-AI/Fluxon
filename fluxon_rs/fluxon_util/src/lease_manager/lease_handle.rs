@@ -70,20 +70,16 @@ impl GeneralLease {
 
 impl Drop for GeneralLease {
     fn drop(&mut self) {
-        // Instrument drop of the high-level lease handle so we can correlate
-        // who released the last user-visible handle.
         let lease_id = self.id();
         let kind_str = match self.kind() {
             LeaseType::Etcd => "Etcd",
             LeaseType::KvClient => "KvClient",
         };
         let label = super::lifecycle::get_register_by(lease_id);
-        let bt = std::backtrace::Backtrace::force_capture();
-        tracing::info!(
+        tracing::debug!(
             lease_id,
             kind = kind_str,
             label = %label.clone().unwrap_or_else(|| "".to_string()),
-            backtrace = %format!("{:?}", bt),
             "GeneralLease drop: releasing user-visible lease handle",
         );
         // AutoCleanMapEntry drop happens after this method returns; the map

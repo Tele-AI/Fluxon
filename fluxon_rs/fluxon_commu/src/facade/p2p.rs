@@ -93,6 +93,19 @@ pub mod __hidden {
             self.view.upgrade()
         }
 
+        pub fn try_with_cluster_manager<R>(
+            &self,
+            f: impl FnOnce(&crate::cluster_manager::ClusterManager) -> R,
+        ) -> Option<R> {
+            let arc_view = self.view.upgrade()?;
+            unsafe {
+                let ptr =
+                    std::ptr::NonNull::new(Arc::as_ptr(&arc_view) as *const _ as *mut _).unwrap();
+                let view_ref: &dyn P2pModuleViewTrait = ptr.as_ref();
+                Some(f(view_ref.cluster_manager()))
+            }
+        }
+
         pub fn resource_registry(&self) -> &ResourceRegistry {
             let arc_view = self.view.upgrade().expect(
                 "view of module P2pModule has been dropped when accessing resource registry",
@@ -489,11 +502,6 @@ impl P2pModule {
                 return true;
             }
             let view = self.module_view();
-            let cm = view.cluster_manager();
-            let self_info = cm.get_self_info();
-            if self_info.node_role() != crate::NodeRole::External {
-                return false;
-            }
             let snapshot = self.cached_tier_snapshot();
             let Some(peer_gen) = snapshot.peer_gen(logical_peer) else {
                 return false;
@@ -501,24 +509,31 @@ impl P2pModule {
             if !snapshot.is_send_ready_intra_effective(&peer_gen) {
                 return false;
             }
-            let Some(owner_id) = self_info
-                .metadata
-                .get(crate::META_KEY_SHARED_STORAGE_NODE_ID)
-            else {
-                return false;
-            };
-            if logical_peer.as_ref() == owner_id.as_str() {
-                return false;
-            }
-            let Some(handle) = cm.ipc_bandwidth_attributor_handle() else {
-                return false;
-            };
-            match direction {
-                "tx" => handle.record_rx_bytes(bytes),
-                "rx" => handle.record_tx_bytes(bytes),
-                _ => return false,
-            }
-            true
+            view.try_with_cluster_manager(|cm| {
+                let self_info = cm.get_self_info();
+                if self_info.node_role() != crate::NodeRole::External {
+                    return false;
+                }
+                let Some(owner_id) = self_info
+                    .metadata
+                    .get(crate::META_KEY_SHARED_STORAGE_NODE_ID)
+                else {
+                    return false;
+                };
+                if logical_peer.as_ref() == owner_id.as_str() {
+                    return false;
+                }
+                let Some(handle) = cm.ipc_bandwidth_attributor_handle() else {
+                    return false;
+                };
+                match direction {
+                    "tx" => handle.record_rx_bytes(bytes),
+                    "rx" => handle.record_tx_bytes(bytes),
+                    _ => return false,
+                }
+                true
+            })
+            .unwrap_or(false)
         }
     }
 

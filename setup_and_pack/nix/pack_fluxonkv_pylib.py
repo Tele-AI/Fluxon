@@ -587,6 +587,8 @@ def main() -> int:
         target_cache_key = _sha256_json_bytes(raw=target_cache_key_descriptor)
         target_cache_dir = layout.target_caches_root_dir / target_cache_key
         target_cache_manifest_path = target_cache_dir / TARGET_CACHE_MANIFEST_FILE_NAME
+        _ensure_host_path_writable(layout.target_caches_root_dir)
+        _ensure_host_path_writable(target_cache_dir)
         _maybe_promote_compatible_target_cache_dir(
             target_caches_root=layout.target_caches_root_dir,
             target_cache_dir=target_cache_dir,
@@ -1348,7 +1350,6 @@ def _build_docker_argv(
     if prepare_build_scenario is not None:
         container_lines.extend(
             [
-                "export FLUXON_PREPARE_BUILD_SKIP_EXISTING_VENDOR_RUNTIME=1",
                 f"python3 /workspace/setup_and_pack/pub_prepare_build.py --scenario {shlex.quote(prepare_build_scenario)}",
                 "if [ -x \"$CARGO_TARGET_DIR/cxxpacked/bin/protoc\" ]; then",
                 "  export PROTOC=\"$CARGO_TARGET_DIR/cxxpacked/bin/protoc\"",
@@ -3040,6 +3041,16 @@ def _sudo_remove_tree(path: Path) -> None:
     )
     subprocess.run(
         host_sudo + ["rm", "-rf", str(path)],
+        check=True,
+    )
+
+
+def _ensure_host_path_writable(path: Path) -> None:
+    if not path.exists():
+        return
+    host_sudo = host_sudo_prefix()
+    subprocess.run(
+        host_sudo + ["chmod", "777", str(path)],
         check=True,
     )
 

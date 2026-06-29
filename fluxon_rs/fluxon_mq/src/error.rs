@@ -12,11 +12,23 @@ pub enum MpscError {
     #[error("no new message available")]
     NoMessage,
 
+    #[error("consumer is closed")]
+    Closed,
+
     #[error("etcd error: {0}")]
     Etcd(#[from] etcd_client::Error),
 
     #[error("spawn blocking task failed: {0}")]
     JoinError(#[from] tokio::task::JoinError),
+
+    #[error(
+        "message buffer full: channel_id={channel_id} capacity={capacity} used_slots={used_slots}"
+    )]
+    MessageBufferFull {
+        channel_id: i64,
+        capacity: i64,
+        used_slots: i64,
+    },
 
     #[error("put payload returned non-retryable error (code=2)")]
     PutPayloadNonRetryable,
@@ -61,10 +73,12 @@ impl MpscError {
         match self {
             // 可重试类
             MpscError::NoMessage => 1000,
+            MpscError::Closed => 1001,
 
             // etcd / 系统
             MpscError::Etcd(_) => 2000,
             MpscError::JoinError(_) => 2001,
+            MpscError::MessageBufferFull { .. } => 2002,
 
             // put payload
             MpscError::PutPayloadNonRetryable => 3000,

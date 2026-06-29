@@ -31,7 +31,7 @@ use fluxon_kv::user_api::FluxonUserApi;
 use fluxon_kv::{
     ConfigArg, Framework, KvClientTrait, KvGetResult,
     config::{ClientConfig, MasterConfig},
-    run_client, run_master,
+    run_broker, run_client, run_master,
 };
 use fluxon_ops;
 use fluxon_proxy;
@@ -2623,6 +2623,31 @@ fn python_config_to_master_config(
     }
 }
 
+fn python_config_to_client_config(
+    py: Python,
+    py_config: &Bound<'_, PyDict>,
+) -> ApiResult<ClientConfig> {
+    let config: serde_yaml::Value = match pyany_to_serde_value(py, &py_config.to_object(py)) {
+        Ok(val) => val,
+        Err(e) => return ApiResult::new_error(new_invalid_argument_error(py, &e.to_string())),
+    };
+
+    let yaml_str = match serde_yaml::to_string(&config) {
+        Ok(s) => s,
+        Err(e) => return ApiResult::new_error(new_invalid_argument_error(py, &e.to_string())),
+    };
+
+    let config: ClientConfigYaml = match ClientConfigYaml::from_str(&yaml_str) {
+        Ok(config) => config,
+        Err(e) => return ApiResult::new_error(new_invalid_argument_error(py, &e.to_string())),
+    };
+
+    match config.verify() {
+        Ok(config) => ApiResult::new_success(config.into()),
+        Err(e) => ApiResult::new_error(new_invalid_argument_error(py, &e.to_string())),
+    }
+}
+
 fn pyany_to_serde_value(py: Python, obj: &PyObject) -> PyResult<Value> {
     if obj.is_none(py) {
         Ok(Value::Null)
@@ -4138,6 +4163,124 @@ fn run_master_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyObjec
     run_master_inner(config, py).into_py_object(py)
 }
 
+/// Run broker with automatic lifecycle management
+/// This function creates a broker, runs it until Ctrl+C, then shuts down
+#[pyfunction]
+#[pyo3(signature = (config=None))]
+fn run_broker_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyObject {
+    fn run_broker_inner(config: Option<&Bound<'_, PyAny>>, py: Python) -> ApiResult<PyObject> {
+        println!("🛠️  Broker init configuration: {:?}", config);
+
+        let runtime = match Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                return ApiResult::new_error(new_general_error(
+                    py,
+                    &format!("Failed to create runtime: {}", e),
+                ));
+            }
+        };
+
+        let config_arg = match config {
+            None => ConfigArg::None,
+            Some(py_obj) => {
+                if py_obj.is_instance_of::<pyo3::types::PyString>() {
+                    let path_str: String = match py_obj.extract() {
+                        Ok(path) => path,
+                        Err(_) => {
+                            return ApiResult::new_error(new_invalid_argument_error(
+                                py,
+                                "Invalid configuration file path",
+                            ));
+                        }
+                    };
+                    ConfigArg::File(PathBuf::from(path_str))
+                } else if py_obj.is_instance_of::<PyDict>() {
+                    let py_dict = match py_obj.downcast::<PyDict>() {
+                        Ok(dict) => dict,
+                        Err(_) => {
+                            return ApiResult::new_error(new_invalid_argument_error(
+                                py,
+                                "Invalid configuration dictionary",
+                            ));
+                        }
+                    };
+                    match python_config_to_client_config(py, py_dict) {
+                        ApiResult::Success(client_config) => ConfigArg::Config(client_config),
+                        ApiResult::Error(error) => return ApiResult::new_error(error),
+                    }
+                } else {
+                    return ApiResult::new_error(new_invalid_argument_error(
+                        py,
+                        "Config parameter must be None, string (file path), or dict (config object)",
+                    ));
+                }
+            }
+        };
+
+        println!("🚀 Starting KV Broker...");
+
+        let (framework, final_config) = match py.allow_threads(|| {
+            runtime.run_async_from_sync(async move { fluxon_kv::run_broker(config_arg).await })
+        }) {
+            Ok(Ok((fw, cfg))) => (fw, cfg),
+            Ok(Err(e)) => {
+                return ApiResult::new_error(new_backend_init_failed_error(
+                    py,
+                    &format!("Failed to initialize KV broker: {}", e),
+                    Some("unified"),
+                ));
+            }
+            Err(e) => {
+                return ApiResult::new_error(new_backend_init_failed_error(
+                    py,
+                    &format!("Runtime bridge failed: {}", e),
+                    Some("unified"),
+                ));
+            }
+        };
+
+        println!("✅ KV Broker started successfully");
+        println!("📊 Instance: {}", final_config.instance_key);
+        println!("🏷️  Cluster: {}", final_config.cluster_name);
+        match final_config.fluxonkv_spec.p2p_listen_port {
+            Some(port) => println!("🔌 Port: {}", port),
+            None => println!("🔌 Port: auto"),
+        }
+        println!("🚀 Broker is running... Press Ctrl+C to stop");
+
+        let shutdown_result = py.allow_threads(|| {
+            runtime.block_on(async move {
+                if let Err(e) = tokio::signal::ctrl_c().await {
+                    eprintln!("Failed to listen for shutdown signal: {}", e);
+                }
+                match framework.shutdown().await {
+                    Ok(_) => {
+                        println!("✅ Broker shut down successfully");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Warning during shutdown: {}", e);
+                        Err(e)
+                    }
+                }
+            })
+        });
+
+        let out = match shutdown_result {
+            Ok(_) => ApiResult::new_success(new_none_success_instance(py)),
+            Err(e) => ApiResult::new_error(new_general_error(
+                py,
+                &format!("Error during shutdown: {}", e),
+            )),
+        };
+        runtime.shutdown_background();
+        out
+    }
+
+    run_broker_inner(config, py).into_py_object(py)
+}
+
 /// Python module definition
 #[pymodule]
 #[pyo3(name = "fluxon_pyo3")]
@@ -4158,6 +4301,7 @@ fn fluxon_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGeneralLease>()?;
     m.add_class::<PyLeaseBackendUid>()?;
     m.add_function(wrap_pyfunction!(run_master_blocking, m)?)?;
+    m.add_function(wrap_pyfunction!(run_broker_blocking, m)?)?;
     m.add_function(wrap_pyfunction!(monitor_render_cli, m)?)?;
     m.add_function(wrap_pyfunction!(monitor_render_web, m)?)?;
     m.add_function(wrap_pyfunction!(fluxon_ops_controller_blocking, m)?)?;

@@ -34,9 +34,11 @@ impl MemHolder {
 
             let data_owner = match &holder.holder {
                 MemHolderInner::Seg(seg_holder) => {
-                    FlatDictDataOwner::UserMemHolder(seg_holder.clone())
+                    FlatDictDataOwner::from_user_memholder(seg_holder.clone())
                 }
-                MemHolderInner::Owned(bytes) => FlatDictDataOwner::OwnedBytes(bytes.clone()),
+                MemHolderInner::Owned(bytes) => {
+                    FlatDictDataOwner::from_owned_bytes(bytes.as_ref().to_vec())
+                }
             };
             match decode_flat_dict_to_wrapped_py_object(py, data_owner) {
                 Ok(obj) => {
@@ -126,7 +128,7 @@ impl ExternalMemHolder {
                 return ApiResult::new_success(cached.clone_ref(py).into_py(py));
             }
 
-            let data_owner = FlatDictDataOwner::ExternalMemHolder(holder.holder.clone());
+            let data_owner = FlatDictDataOwner::from_external_memholder(holder.holder.clone());
             match decode_flat_dict_to_wrapped_py_object(py, data_owner) {
                 Ok(obj) => {
                     *holder.access_cache.write() = Some(obj.clone_ref(py));

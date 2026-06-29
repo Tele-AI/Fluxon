@@ -96,18 +96,34 @@ MPMC_ATTACH_PAYLOAD_KEEPALIVE_RETRIES = 3
 LOCAL_MEMBER_ID_RANGE_SIZE = 32
 MPMC_CREATE_LOCK_TTL_SECONDS = 10
 MPMC_CREATE_LOCK_TIMEOUT_SECONDS = 10.0
+MPMC_CLEANUP_ETCD_TIMEOUT_SECONDS = 2.0
 
 
-def new_etcd_client(api: KvClient) -> Result[etcd3.Etcd3Client, ApiError]:
+def _close_lease_handle(handle: Optional[object], label: str) -> None:
+    if handle is None:
+        return
+    try:
+        handle.close()  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001
+        logging.warning("failed to close lease handle %s: %s", label, e)
+
+
+def new_etcd_client(
+    api: KvClient, *, timeout_seconds: Optional[float] = None
+) -> Result[etcd3.Etcd3Client, ApiError]:
     """Create etcd client"""
     etcd_config: List[str] = api.get_etcd_config()
     first_address: str = etcd_config[0]
     host: str
     port_str: str
     host, port_str = first_address.split(":")
-    print(f"new_etcd_client: {host}:{port_str}")
     try:
-        client: etcd3.Etcd3Client = etcd3.client(host=host, port=int(port_str))
+        kwargs: Dict[str, Any] = {}
+        if timeout_seconds is not None:
+            kwargs["timeout"] = float(timeout_seconds)
+        client: etcd3.Etcd3Client = etcd3.client(
+            host=host, port=int(port_str), **kwargs
+        )
         return Result.new_ok(client)
     except Exception as e:
         return Result.new_error(
@@ -136,8 +152,10 @@ def stable_revoke_lease(api: KvClient, lease_id: int) -> Result[OkNone, ApiError
     endpoint = endpoints[0] if endpoints else None
 
     errors: List[str] = []
-    for attempt in range(3):
-        client_res = new_etcd_client(api)
+    for attempt in range(2):
+        client_res = new_etcd_client(
+            api, timeout_seconds=MPMC_CLEANUP_ETCD_TIMEOUT_SECONDS
+        )
         if not client_res.is_ok():
             err = client_res.unwrap_error()
             errors.append(str(err))
@@ -183,8 +201,10 @@ def stable_delete_ready_keys_for_member(
     member_id_str = str(member_id)
 
     errors: List[str] = []
-    for attempt in range(3):
-        client_res = new_etcd_client(api)
+    for attempt in range(2):
+        client_res = new_etcd_client(
+            api, timeout_seconds=MPMC_CLEANUP_ETCD_TIMEOUT_SECONDS
+        )
         if not client_res.is_ok():
             err = client_res.unwrap_error()
             errors.append(str(err))
@@ -203,22 +223,7 @@ def stable_delete_ready_keys_for_member(
             for key in keys_to_delete:
                 client.delete(key)
 
-            # Verify: keys should be gone immediately after delete on the same prefix.
-            remaining: List[bytes] = []
-            for value, meta in client.get_prefix(prefix):
-                if value is None:
-                    continue
-                if value.decode() != member_id_str:
-                    continue
-                remaining.append(meta.key)
-
-            if len(remaining) == 0:
-                return Result.new_ok(OK_NONE)
-
-            errors.append(
-                f"attempt={attempt}: remaining ready keys after delete: {remaining!r}"
-            )
-            time.sleep(0.1)
+            return Result.new_ok(OK_NONE)
         except Exception as e:  # noqa: BLE001
             errors.append(f"attempt={attempt}: {e}")
             time.sleep(0.1)
@@ -1802,19 +1807,16 @@ class MPMCChannel(FactoryOnly):
         except Exception as e:  # noqa: BLE001
             logging.warning(f"MPMC channel {self.mpmc_id} stop_watching failed: {e}")
 
-        # Drop PyLease handles to stop keepalive; etcd leases with
-        # revoke_on_drop=False are intentionally not revoked.
-        # Setting to None drops the PyO3 handle immediately in CPython,
-        # which releases the underlying Rust RAII and unregisters from
-        # the keepalive actor.
-        if hasattr(self, "_lm_mpmc_member"):
-            self._lm_mpmc_member = None  # type: ignore[assignment]
-        if hasattr(self, "_lm_mpmc_global"):
-            self._lm_mpmc_global = None  # type: ignore[assignment]
-        if hasattr(self, "_lm_cluster_long"):
-            self._lm_cluster_long = None  # type: ignore[assignment]
-        if hasattr(self, "_lm_kv_payload"):
-            self._lm_kv_payload = None  # type: ignore[assignment]
+        # Close lease handles explicitly so keepalive entries are unregistered
+        # before the owning KvClient starts shutting down.
+        _close_lease_handle(self._lm_mpmc_member, "mpmc_member")
+        self._lm_mpmc_member = None
+        _close_lease_handle(self._lm_mpmc_global, "mpmc_global")
+        self._lm_mpmc_global = None
+        _close_lease_handle(self._lm_cluster_long, "mpmc_cluster_long")
+        self._lm_cluster_long = None
+        _close_lease_handle(self._lm_kv_payload, "mpmc_kv_payload")
+        self._lm_kv_payload = None
 
         # Return a minimal Ok result to satisfy the explicit Result API contract
         return Result.new_ok(OK_NONE)
@@ -2026,6 +2028,12 @@ class MPMCChanProducer(ChannelProducer):
     def put_data(
         self, value: Dict[str, Union[int, float, bool, str, bytes, DLPacked]]
     ) -> Result[bool, ApiError]:
+        return self._put_data_impl(value)
+
+    def _put_data_impl(
+        self,
+        value: Dict[str, Union[int, float, bool, str, bytes, DLPacked]],
+    ) -> Result[bool, ApiError]:
         """Put data to the MPMC channel.
 
         Callers may invoke put_data / close concurrently from multiple threads.
@@ -2051,9 +2059,11 @@ class MPMCChanProducer(ChannelProducer):
                 )
             )
 
+        capacity = int(self.chan_config["capacity"])
+        assert capacity > 0, f"invalid MPMC channel capacity: {capacity}"
+
         # Do not hold _op_lock while performing network-heavy operations (count_prefix/put_data).
         # Otherwise close() may block behind a long RPC and tests like MQ capacity+auto-clean can hang.
-        capacity = int(self.chan_config["capacity"])  # validated upfront
         while True:
             if self.shutdown_ctl.closed:
                 return Result[bool, ApiError].new_error(
@@ -2159,6 +2169,20 @@ class MPMCChanProducer(ChannelProducer):
                 return Result[bool, ApiError].new_ok(True)
 
             err = put_result.unwrap_error()
+            if isinstance(err, MessageBufferFullError):
+                blocking_observed_unix_ms = int(time.time() * 1000)
+                try:
+                    candidate.record_blocking_put_observed(blocking_observed_unix_ms)
+                except Exception as e:  # noqa: BLE001
+                    logging.warning(
+                        "MPMCChanProducer mpmc_id=%s failed to record broker backpressure on mpsc_id=%s producer_idx=%s: %s",
+                        self.mpmc_id,
+                        candidate.get_chan_id(),
+                        candidate.get_producer_id(),
+                        e,
+                    )
+                time.sleep(0.02)
+                continue
             logging.error(
                 "MPMCChanProducer mpmc_id=%s failed to put data on mpsc_id=%s producer_idx=%s: %s",
                 self.mpmc_id,
@@ -2415,7 +2439,7 @@ class MPMCChanConsumer(ChannelConsumer):
         self.shutdown_ctl.closed = True
         if self.mpsc_consumer is not None and hasattr(self.mpsc_consumer, "request_shutdown"):
             self.mpsc_consumer.request_shutdown()
-    
+
     def get_chan_id(self) -> str:
         """
         Get the channel id.
@@ -2431,6 +2455,18 @@ class MPMCChanConsumer(ChannelConsumer):
     
     def get_data(
         self, batch_size: int = 1, try_time: Optional[int] = None, prefetch_num: int = 0
+    ) -> Result[List[Dict[str, Union[int, float, bool, str, bytes, DLPacked]]], ApiError]:
+        del prefetch_num
+        return self._get_data_impl(
+            batch_size=batch_size,
+            try_time=try_time,
+        )
+
+    def _get_data_impl(
+        self,
+        *,
+        batch_size: int,
+        try_time: Optional[int],
     ) -> Result[List[Dict[str, Union[int, float, bool, str, bytes, DLPacked]]], ApiError]:
         """Get data from the bound MPSC channel.
 
@@ -2463,22 +2499,7 @@ class MPMCChanConsumer(ChannelConsumer):
 
             # Get data from MPSC consumer (will automatically return producer info when MPSC acts as submodule)
             from .mpsc import ConsumedMessage
-            # # Map MPMC-level prefetch to per-MPSC prefetch: divide by active MPMC consumers, ceil, min divisor=1
-            # try:
-            #     active_consumers = self.mpmc_channel._get_active_consumer_count()
-            # except Exception as e:  # noqa: BLE001
-            #     logging.warning(
-            #         f"[Unreachable] Failed to get active consumer count: {e}"
-            #     )
-            #     active_consumers = 0
-
-            # # ceil division without importing math: (a + b - 1) // b
-            # mapped_prefetch = 0
-            # if prefetch_num > 0 and active_consumers > 0:
-            #     mapped_prefetch = (prefetch_num + active_consumers - 1) // active_consumers
-            result = self.mpsc_consumer.get_data(
-                batch_size, try_time, prefetch_num=prefetch_num
-            )
+            result = self.mpsc_consumer.get_data(batch_size, try_time=try_time)
             if not result.is_ok():
                 err = result.unwrap_error()
                 if self.shutdown_ctl.closed:
@@ -2548,6 +2569,18 @@ class MPMCChanConsumer(ChannelConsumer):
                 f"MPMCChanConsumer {self.get_consumer_id()} before_close on underlying MPSC consumer failed: {e}"
             )
 
+        # Close the underlying MPSC consumer first so local keepalive/prefetch
+        # tasks stop before lease revoke and ready-key cleanup.
+        try:
+            if self.mpsc_consumer is not None:
+                self.mpsc_consumer.release_local_handle().unwrap()
+        except Exception as e:  # noqa: BLE001
+            logging.warning(
+                f"MPMCChanConsumer {self.get_consumer_id()} failed to close underlying MPSC consumer: {e}"
+            )
+        finally:
+            self.mpsc_consumer = None
+
         # Delete ready keys for this consumer (best-effort).
         mpmc_id = self.mpmc_id
         assert mpmc_id is not None, "MPMC channel ID is None"
@@ -2598,17 +2631,6 @@ class MPMCChanConsumer(ChannelConsumer):
             logging.warning(
                 f"MPMCChanConsumer {self.get_consumer_id()} failed to revoke member lease: {e}"
             )
-
-        # Close the underlying MPSC consumer and drop the handle.
-        try:
-            if self.mpsc_consumer is not None:
-                self.mpsc_consumer.release_local_handle().unwrap()
-        except Exception as e:  # noqa: BLE001
-            logging.warning(
-                f"MPMCChanConsumer {self.get_consumer_id()} failed to close underlying MPSC consumer: {e}"
-            )
-        finally:
-            self.mpsc_consumer = None
 
         # Optional sub-component cleanup.
         try:

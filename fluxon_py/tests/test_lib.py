@@ -173,10 +173,11 @@ def setup_test_environment(logger: Logger, print_config: bool = True):
     # except RuntimeError as e:
     #     print(f"Failed to set start method to spawn: {e}, current start method: {multiprocessing.get_start_method()}")
 
-    loglevel_str="DEBUG"
+    loglevel_str = os.environ.get("FLUXON_LOG") or os.environ.get("LOG_LEVEL") or "DEBUG"
+    loglevel_str = str(loglevel_str).upper()
     os.environ["LOG_LEVEL"] = loglevel_str
     os.environ["FLUXON_LOG"] = loglevel_str
-    LOGGING_LEVEL= logging.DEBUG
+    LOGGING_LEVEL = getattr(logging, loglevel_str, logging.DEBUG)
     update_log_level(loglevel_str)
 
     print("=================================================")
@@ -190,7 +191,7 @@ def setup_test_environment(logger: Logger, print_config: bool = True):
                 self.flush()  # Flush immediately for every log record
 
         handler = FlushStreamHandler(sys.stdout)
-        handler.setLevel(logging.DEBUG)
+        handler.setLevel(LOGGING_LEVEL)
 
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)

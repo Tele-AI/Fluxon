@@ -138,7 +138,7 @@ def main() -> int:
                 with_tikv_runtime=args.with_tikv_runtime == "true",
             )
 
-        with script_utils.stage("Seeding profile cache compatibility entries"):
+        with script_utils.stage("Normalizing profile cache compatibility entries"):
             _seed_profile_cache_compat_entries(release_dir=release_dir)
 
         wheel = _find_single(release_dir, "fluxon-*.whl", "release wheel")
@@ -320,18 +320,24 @@ def _seed_invariant_release_runtime(
 
 def _seed_profile_cache_compat_entries(*, release_dir: Path) -> None:
     profiles_dir = release_dir / "profiles"
-    profiles_dir.mkdir(parents=True, exist_ok=True)
+    if not profiles_dir.exists():
+        return
+    if not profiles_dir.is_dir():
+        raise RuntimeError(f"release profiles path exists but is not a directory: {profiles_dir}")
 
+    # Old releases seeded profiles/<public transport profile> -> .. as a compatibility
+    # alias. That layout is not safe for recursive dispatch because it makes scp walk the
+    # release root through profiles/ forever. Keep real materialized profile releases, but
+    # remove the legacy recursive alias when it is present.
     profile_link = profiles_dir / _FIXED_TRANSPORT_PROFILE_ID
     expected_target = Path("..")
-    if profile_link.is_symlink():
-        if Path(os.readlink(profile_link)) == expected_target:
-            return
+    if profile_link.is_symlink() and Path(os.readlink(profile_link)) == expected_target:
         profile_link.unlink()
-    elif profile_link.exists():
-        raise RuntimeError(f"profile cache compatibility path already exists and is not a symlink: {profile_link}")
 
-    profile_link.symlink_to(expected_target)
+    try:
+        next(profiles_dir.iterdir())
+    except StopIteration:
+        profiles_dir.rmdir()
 
 
 def _remove_release_wheels(

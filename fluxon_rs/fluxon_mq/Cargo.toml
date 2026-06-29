@@ -17,6 +17,7 @@ parking_lot = { workspace = true }
 paste = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+bitcode = { workspace = true }
 etcd-client = { workspace = true }
 fluxon_util = { path = "../fluxon_util" }
 fluxon_observability = { path = "../fluxon_observability" }

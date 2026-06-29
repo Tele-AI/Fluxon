@@ -8,10 +8,9 @@ management to the Rust library exposed via `fluxon_pyo3`.
 Old Python implementations (ChanManager, etcd watchers, prefetch
 queues) have been removed.
 
-Currently this shim focuses on wiring up leases and identities. Data
-path operations (`put_data`/`get_data`) are intentionally left as
-placeholders and should be implemented in Rust and exposed via
-`fluxon_pyo3` in follow-up work.
+Broker-backed data-path operations are the default public contract.
+The old direct MPSC data path is kept only behind private helpers for
+short-lived internal checks.
 """
 
 from __future__ import annotations
@@ -55,6 +54,11 @@ from . import ChannelProducer, ChannelConsumer
 
 
 logging = init_logger(__name__)
+MPSC_PREFETCH_TARGET_MAX = 256
+MPSC_KVCLIENT_KEEPALIVE_RETRY_SLEEP_SECONDS = 0.05
+MPSC_KVCLIENT_KEEPALIVE_RETRIES = 3
+_LEASE_BACKEND_CALLBACK_LOCKS: Dict[str, threading.Lock] = {}
+_LEASE_BACKEND_CALLBACK_LOCKS_GUARD = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Test-only GC close markers
@@ -269,6 +273,11 @@ def _ensure_kvclient_lease_backend(api: KvClient, cluster: str) -> Any:
             message="KvClient must implement KvLeaseApi for MPSC payload lease",
         )
 
+    with _LEASE_BACKEND_CALLBACK_LOCKS_GUARD:
+        callback_lock = _LEASE_BACKEND_CALLBACK_LOCKS.setdefault(
+            cluster, threading.Lock()
+        )
+
     def allocate_cb(ttl_seconds: int) -> int:
         """Bridge to KvLeaseApi.allocate_lease for the given TTL.
 
@@ -279,7 +288,8 @@ def _ensure_kvclient_lease_backend(api: KvClient, cluster: str) -> Any:
         Do NOT raise ApiError dataclasses here (they are not Exceptions) to
         avoid PyErr(TypeError: exceptions must derive from BaseException).
         """
-        res = api.allocate_lease(int(ttl_seconds))
+        with callback_lock:
+            res = api.allocate_lease(int(ttl_seconds))
         if not res.is_ok():
             # Raise a real Python Exception so PyO3 converts it to Err(...)
             raise RuntimeError(
@@ -297,8 +307,21 @@ def _ensure_kvclient_lease_backend(api: KvClient, cluster: str) -> Any:
         cause type conversion errors in PyO3. See logs: "exceptions must derive
         from BaseException" when raising non-Exception ApiError values.
         """
-        # Keepalive must not alter TTL; do not pass custom_ttl
-        res = api.keepalive_lease(int(lease_id))
+        # Keepalive must not alter TTL; do not pass custom_ttl. The PyO3
+        # KvClient object uses mutable Rust borrows, so serialize callbacks
+        # from the lease actor to avoid re-entering the same client handle.
+        for attempt in range(MPSC_KVCLIENT_KEEPALIVE_RETRIES):
+            with callback_lock:
+                res = api.keepalive_lease(int(lease_id))
+            if res.is_ok():
+                _ = res.unwrap()
+                return None
+            err = res.unwrap_error()
+            if "Already mutably borrowed" in str(err) and attempt + 1 < MPSC_KVCLIENT_KEEPALIVE_RETRIES:
+                time.sleep(MPSC_KVCLIENT_KEEPALIVE_RETRY_SLEEP_SECONDS)
+                continue
+            break
+
         if not res.is_ok():
             err = res.unwrap_error()
             # When the client is shutting down, background keepalive calls can race with the
@@ -311,9 +334,6 @@ def _ensure_kvclient_lease_backend(api: KvClient, cluster: str) -> Any:
             raise RuntimeError(
                 f"kvclient keepalive_lease failed for cluster={cluster}: {err}"
             )
-        # Success: consume Ok(None) to satisfy strict Result policy
-        _ = res.unwrap()
-        # Success path: return None explicitly to map to Rust ()
         return None
 
     # Inject kvclient allocate/keepalive callbacks while constructing LeaseBackendUid.
@@ -402,6 +422,11 @@ class MpscContext:
             parent_mpmc_id_int_opt,
             parent_mpmc_member_id_opt,
         )
+
+    def delete_broker_channel(self, chan_id: str) -> list[str]:
+        if not isinstance(chan_id, str) or not chan_id.isdigit():
+            raise ValueError(f"invalid broker channel id: {chan_id!r}")
+        return list(self._inner.delete_broker_channel(int(chan_id)))
 
     def close(self) -> None:
         self._inner.close()
@@ -503,11 +528,13 @@ class MPSCChanProducer(ChannelProducer):
         # through the Rust MPSC layer.
         self._payload_lease_id = self._handle.payload_lease_id()  # type: ignore[attr-defined]
 
+        self._handle.init_broker()  # type: ignore[attr-defined]
+
         # Expose chan_id for legacy call sites that accessed the attribute.
         self.chan_id = self._chan_id
 
         logging.info(
-            "%s initialized via Rust MPSC: chan_id=%s, producer_idx=%s",
+            "%s initialized via Rust MPSC broker path: chan_id=%s, producer_idx=%s",
             self.dbg_tag(),
             self.get_chan_id(),
             self.get_producer_id(),
@@ -544,6 +571,25 @@ class MPSCChanProducer(ChannelProducer):
     def put_data(
         self, value: Dict[str, Union[int, float, bool, str, bytes, DLPacked]]
     ) -> Result[bool, ApiError]:
+        return self._put_data_with_writer(
+            value,
+            self._handle.put_flat_dict_ptrs,  # type: ignore[attr-defined]
+        )
+
+    def _put_data_legacy_for_internal_check(
+        self, value: Dict[str, Union[int, float, bool, str, bytes, DLPacked]]
+    ) -> Result[bool, ApiError]:
+        """Use the old direct MPSC write path for temporary internal checks only."""
+        return self._put_data_with_writer(
+            value,
+            self._handle.put_flat_dict_ptrs_legacy_for_internal_check,  # type: ignore[attr-defined]
+        )
+
+    def _put_data_with_writer(
+        self,
+        value: Dict[str, Union[int, float, bool, str, bytes, DLPacked]],
+        writer: Any,
+    ) -> Result[bool, ApiError]:
         """Put data into the channel via Rust backend.
 
         Payload write is executed in Rust and directly calls KV `kv_put_ptrs`, so Python
@@ -576,7 +622,7 @@ class MPSCChanProducer(ChannelProducer):
         dlpack_capsules: List[object] = []
         try:
             ptrs = _fluxon_kv.build_flat_dict_ptrs(value, keepalive, dlpack_capsules)
-            self._handle.put_flat_dict_ptrs(ptrs)  # type: ignore[attr-defined]
+            writer(ptrs)
         except Exception as e:  # pragma: no cover - thin shim
             if _is_close_during_put_error(e):
                 self.shutdown_ctl.closed = True
@@ -608,6 +654,10 @@ class MPSCChanProducer(ChannelProducer):
             # If Rust changes LeaseMgrError variants or mappings, update:
             #   1) The LeaseMgrError mapping in py_error_from_kv_error;
             #   2) The check here and its corresponding tests.
+            if e.__class__.__name__ == "MessageBufferFullError":
+                logging.debug("%s put_flat_dict_ptrs backpressured: %s", self.dbg_tag(), e)
+                return Result[bool, ApiError].new_error(e)  # type: ignore[arg-type]
+
             logging.error("%s put_flat_dict_ptrs failed: %s", self.dbg_tag(), e)
             if isinstance(e, PayloadLeaseNotFoundError):
                 # Mark closed and best-effort notify Rust side to stop callbacks/holds.
@@ -817,11 +867,12 @@ class MPSCChanConsumer(ChannelConsumer):
         else:
             self._handle.init_payload_callback(self._build_get_payload())  # type: ignore[attr-defined]
             self._handle.init_delete_callback(self._build_delete_callback())  # type: ignore[attr-defined]
+        self._handle.init_broker()  # type: ignore[attr-defined]
         # Guard to make close idempotent without relying on None checks.
         self._closed_local: bool = False
 
         logging.info(
-            "%s initialized via Rust MPSC: chan_id=%s, consumer_idx=%s, payload_backend=%s",
+            "%s initialized via Rust MPSC broker path: chan_id=%s, consumer_idx=%s, payload_backend=%s",
             self._dbg_tag,
             self._chan_id,
             self._consumer_id,
@@ -1080,38 +1131,144 @@ class MPSCChanConsumer(ChannelConsumer):
         List[Union[Dict[str, Union[int, float, bool, str, bytes, DLPacked]], ConsumedMessage]],
         ApiError,
     ]:
-        """Unified prefetch-first get API.
+        return self._get_data_broker(
+            batch_size=batch_size,
+            try_time=try_time,
+            prefetch_num=prefetch_num,
+        )
+
+    def _get_data_legacy_for_internal_check(
+        self,
+        batch_size: int = 1,
+        try_time: Optional[int] = None,
+        prefetch_num: int = 0,
+    ) -> Result[
+        List[Union[Dict[str, Union[int, float, bool, str, bytes, DLPacked]], ConsumedMessage]],
+        ApiError,
+    ]:
+        """Use the old prefetch MPSC read path for temporary internal checks only."""
+        return self._get_data_legacy_prefetch(
+            batch_size=batch_size,
+            try_time=try_time,
+            prefetch_num=prefetch_num,
+        )
+
+    def _get_data_broker(
+        self,
+        *,
+        batch_size: int,
+        try_time: Optional[int],
+        prefetch_num: int,
+    ) -> Result[
+        List[Union[Dict[str, Union[int, float, bool, str, bytes, DLPacked]], ConsumedMessage]],
+        ApiError,
+    ]:
+        """Get data via the broker-backed public path."""
+        timeout_ms = self._get_timeout_ms(try_time)
+        prefetch_target = min(
+            batch_size + max(prefetch_num, 0),
+            MPSC_PREFETCH_TARGET_MAX,
+        )
+        try:
+            batch = self._handle.get_batch(  # type: ignore[attr-defined]
+                batch_size,
+                prefetch_target,
+                timeout_ms,
+            )
+        except Exception as e:
+            if self.shutdown_ctl.closed:
+                api_err: ApiError = ChannelClosedError(
+                    message="Consumer is closed.",
+                    channel_id=self._chan_id,
+                )
+            elif isinstance(e, ApiError):
+                api_err = e
+            else:
+                api_err = MqGetDataUnknownError.from_exception(
+                    e, channel_id=self._chan_id, consumer_id=self._consumer_id
+                )
+            if isinstance(api_err, (MessageConsumptionNoNewMessageError, ChannelClosedError)):
+                logging.debug("%s get_batch finished without payload: %s", self.dbg_tag(), api_err)
+            else:
+                logging.error("%s get_batch failed: %s", self.dbg_tag(), api_err)
+            return Result[
+                List[
+                    Union[Dict[str, Union[int, float, bool, str, bytes, DLPacked]], ConsumedMessage]
+                ],
+                ApiError,
+            ].new_error(api_err)
+
+        if not batch:
+            return Result[
+                List[
+                    Union[Dict[str, Union[int, float, bool, str, bytes, DLPacked]], ConsumedMessage]
+                ],
+                ApiError,
+            ].new_error(
+                MessageConsumptionNoNewMessageError("No message available")
+            )
+
+        return Result(batch)
+
+    def _get_data_legacy_prefetch(
+        self,
+        *,
+        batch_size: int,
+        try_time: Optional[int],
+        prefetch_num: int,
+    ) -> Result[
+        List[Union[Dict[str, Union[int, float, bool, str, bytes, DLPacked]], ConsumedMessage]],
+        ApiError,
+    ]:
+        """Get data through the old direct MPSC prefetch path."""
+        timeout_ms = self._get_timeout_ms(try_time)
+
+        return self._get_data_with_fetcher(
+            batch_size=batch_size,
+            fetch_one=lambda prefetch_target, _timeout_ms: self._handle.get_one_legacy_for_internal_check(  # type: ignore[attr-defined]
+                prefetch_target,
+                timeout_ms,
+            ),
+            prefetch_target=min(
+                batch_size + max(prefetch_num, 0),
+                MPSC_PREFETCH_TARGET_MAX,
+            ),
+            timeout_ms=timeout_ms,
+        )
+
+    def _get_timeout_ms(self, try_time: Optional[int]) -> Optional[int]:
+        if try_time is None:
+            return None
+        t_sec = try_time if try_time > 0 else 1
+        timeout_ms = int(t_sec * 1000)
+        assert timeout_ms > 0
+        return timeout_ms
+
+    def _get_data_with_fetcher(
+        self,
+        *,
+        batch_size: int,
+        fetch_one: Any,
+        prefetch_target: int = 0,
+        timeout_ms: Optional[int] = None,
+    ) -> Result[
+        List[Union[Dict[str, Union[int, float, bool, str, bytes, DLPacked]], ConsumedMessage]],
+        ApiError,
+    ]:
+        """Common get loop used by broker and internal legacy checks.
 
         Semantics:
         - If it returns Ok([...]), each element is from a successful get_one call.
-        - If any get_one in this batch raises an error, the entire batch fails and
-          returns Err(ApiError) immediately (no "partial success" Ok list).
-
-        The window size is mapped to `batch_size + prefetch_num`, so the underlying
-        Rust actor maintains a local prefetch queue of that size.
+        - NoNewMessage/ChannelClosed only fail the call when the batch is still empty.
+          Already-consumed items must be returned to avoid losing partial progress.
+        - Payload/decode/unknown errors still fail immediately.
         """
-        prefetch_target = batch_size + max(prefetch_num, 0)
-
-        # Inline minimal fetch loop with explicit prefetch_target to keep
-        # ChannelConsumer.try_get_data signature aligned while still
-        # honoring the calculated window size here.
         results: List[Union[Dict[str, Union[int, float, bool, str, bytes, DLPacked]], ConsumedMessage]] = []
-        # try_time is seconds in Python; Rust get_one expects milliseconds.
-        timeout_ms: Optional[int]
-        if try_time is None:
-            timeout_ms = None
-        else:
-            # Compatibility: try_time must not be 0; if callers pass 0, treat it as 1 second.
-            t_sec = try_time if try_time > 0 else 1
-            timeout_ms = int(t_sec * 1000)
-            assert timeout_ms > 0
-	    
+
         for _ in range(batch_size):
             try:
-                # Pass timeout_ms (converted from try_time seconds) to Rust.
-                obj = self._handle.get_one(prefetch_target, timeout_ms)  # type: ignore[attr-defined]
+                obj = fetch_one(prefetch_target, timeout_ms)
             except Exception as e:
-                logging.error("%s get_one failed: %s", self.dbg_tag(), e)
                 # Rust is expected to raise an extension-layer ApiError. To avoid carrying
                 # arbitrary Exception types in Result, wrap non-ApiError into
                 # MqGetDataUnknownError to keep the error taxonomy narrow.
@@ -1126,6 +1283,12 @@ class MPSCChanConsumer(ChannelConsumer):
                     api_err = MqGetDataUnknownError.from_exception(
                         e, channel_id=self._chan_id, consumer_id=self._consumer_id
                     )
+                if isinstance(api_err, (MessageConsumptionNoNewMessageError, ChannelClosedError)):
+                    logging.debug("%s get_one finished without payload: %s", self.dbg_tag(), api_err)
+                    if results:
+                        return Result(results)
+                else:
+                    logging.error("%s get_one failed: %s", self.dbg_tag(), api_err)
                 return Result[
                     List[
                         Union[Dict[str, Union[int, float, bool, str, bytes, DLPacked]], ConsumedMessage]

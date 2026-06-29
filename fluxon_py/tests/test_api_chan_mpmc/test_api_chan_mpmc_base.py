@@ -45,6 +45,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from typing import Dict, List, Optional, Tuple
+from types import SimpleNamespace
 
 import etcd3
 
@@ -1397,6 +1398,33 @@ def _test_mpmc_dynamic_suite_once(prefetch: int) -> None:
 
 def test_mpmc_dynamic_suite() -> None:
     run_with_argmatrix(_test_mpmc_dynamic_suite_once)
+
+
+def test_mpmc_get_data_prefetch_is_per_consumer_not_divided() -> None:
+    calls: List[Tuple[int, Optional[int], int]] = []
+
+    class _DummyInnerConsumer:
+        def get_data(
+            self,
+            batch_size: int,
+            try_time: Optional[int] = None,
+            prefetch_num: int = 0,
+        ) -> Result[List[Dict[str, object]], ApiError]:
+            calls.append((batch_size, try_time, prefetch_num))
+            return Result.new_ok([])
+
+    consumer = object.__new__(MPMCChanConsumer)
+    consumer.shutdown_ctl = mpsc.MqShutdownCtl()
+    consumer.mpmc_id = "123"
+    consumer.mpmc_channel = SimpleNamespace(
+        _get_active_consumer_count=lambda: 8,
+    )
+    consumer.mpsc_consumer = _DummyInnerConsumer()
+
+    res = consumer.get_data(batch_size=40, try_time=2, prefetch_num=40)
+
+    assert res.is_ok()
+    assert calls == [(40, 2, 40)]
 
 
 

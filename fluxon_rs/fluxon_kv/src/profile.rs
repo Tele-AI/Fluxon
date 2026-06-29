@@ -7,6 +7,7 @@ use tracing::{info, warn};
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PprofRole {
     Master,
+    Broker,
     Client,
 }
 
@@ -14,6 +15,7 @@ impl PprofRole {
     fn as_str(self) -> &'static str {
         match self {
             PprofRole::Master => "master",
+            PprofRole::Broker => "broker",
             PprofRole::Client => "client",
         }
     }

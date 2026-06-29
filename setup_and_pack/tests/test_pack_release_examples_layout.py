@@ -104,6 +104,31 @@ class PackReleaseExamplesLayoutTest(unittest.TestCase):
                 check_call.assert_any_call([sys.executable, str(sync_script)], cwd=str(repo_root))
                 run_pack_steps.assert_called_once()
 
+    def test_seed_profile_cache_compat_entries_removes_legacy_recursive_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            release_dir = Path(tmpdir) / "fluxon_release"
+            profiles_dir = release_dir / "profiles"
+            profiles_dir.mkdir(parents=True)
+            (profiles_dir / _PACK_RELEASE._FIXED_TRANSPORT_PROFILE_ID).symlink_to("..")
+
+            _PACK_RELEASE._seed_profile_cache_compat_entries(release_dir=release_dir)
+
+            self.assertFalse((profiles_dir / _PACK_RELEASE._FIXED_TRANSPORT_PROFILE_ID).exists())
+            self.assertFalse(profiles_dir.exists())
+
+    def test_seed_profile_cache_compat_entries_preserves_materialized_profile_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            release_dir = Path(tmpdir) / "fluxon_release"
+            profile_dir = release_dir / "profiles" / _PACK_RELEASE._FIXED_TRANSPORT_PROFILE_ID
+            profile_dir.mkdir(parents=True)
+            (profile_dir / "install.py").write_text("print('install')\n", encoding="utf-8")
+            (profile_dir / "fluxon_release.sha256").write_text("", encoding="utf-8")
+
+            _PACK_RELEASE._seed_profile_cache_compat_entries(release_dir=release_dir)
+
+            self.assertTrue(profile_dir.is_dir())
+            self.assertTrue((profile_dir / "install.py").is_file())
+
     def test_resolve_examples_dir_prefers_app_examples(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

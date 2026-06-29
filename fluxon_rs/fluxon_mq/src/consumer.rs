@@ -47,6 +47,7 @@ use crate::nonblocking_monitor::{
 };
 use crate::shutdown::ShutdownCtl;
 use crate::LifecycleView;
+use crate::{BrokerEnvelope, BrokerFetchRequest, BrokerFetchedMessage, BrokerHandle};
 use tracing::{debug, info, warn};
 
 const NO_MESSAGE_WARN_INTERVAL: Duration = Duration::from_secs(30);
@@ -64,6 +65,9 @@ const PREFETCH_HANDLE_AWAIT_WARN_INTERVAL: Duration = Duration::from_secs(2);
 const COMMIT_PROGRESS_RETENTION: usize = 1024;
 const STALE_PRODUCER_PROBE_TOMB_TTL: Duration = Duration::from_secs(10);
 const READY_TRACE_HISTORY_PER_PRODUCER: usize = 64;
+const PREFETCH_REFILL_BURST_MAX: usize = 128;
+const PREFETCH_NO_MESSAGE_RETRY_EMPTY_SLEEP: Duration = Duration::from_millis(1);
+const PREFETCH_NO_MESSAGE_RETRY_PARTIAL_SLEEP: Duration = Duration::from_millis(5);
 static NEXT_CONSUMER_INSTANCE_ID: AtomicUsize = AtomicUsize::new(1);
 
 fn map_prefix_scan_error(err: EtcdPrefixScanError<MpscError>) -> MpscError {
@@ -93,6 +97,21 @@ fn merge_offset_cache_monotonic(current: &mut HashMap<String, i64>, fetched: Has
                 *current_offset = (*current_offset).max(fetched_offset);
             })
             .or_insert(fetched_offset);
+    }
+}
+
+fn prefetch_refill_launch_budget(target: usize, current: usize) -> usize {
+    target
+        .saturating_sub(current)
+        .min(PREFETCH_REFILL_BURST_MAX)
+        .max(1)
+}
+
+fn prefetch_no_message_retry_sleep(current: usize) -> Duration {
+    if current == 0 {
+        PREFETCH_NO_MESSAGE_RETRY_EMPTY_SLEEP
+    } else {
+        PREFETCH_NO_MESSAGE_RETRY_PARTIAL_SLEEP
     }
 }
 
@@ -296,9 +315,7 @@ impl CommitSequencer {
         let mut current_blocker_begin_at = wait_begin;
         loop {
             if shutdown.is_closed() {
-                return Err(MpscError::Internal(
-                    "consumer closed during consume-offset commit wait".to_string(),
-                ));
+                return Err(MpscError::Closed);
             }
             let observed_next_seq = self.next_seq.load(Ordering::SeqCst);
             if observed_next_seq == seq {
@@ -366,9 +383,7 @@ impl CommitSequencer {
                     );
                 }
                 _ = shutdown.wait_closed() => {
-                    return Err(MpscError::Internal(
-                        "consumer closed during consume-offset commit wait".to_string(),
-                    ));
+                    return Err(MpscError::Closed);
                 }
             }
         }
@@ -759,8 +774,15 @@ struct ReadyPathLatencySample {
 }
 
 /// Application-level payload (type-erased) to avoid coupling with upper layers.
-pub trait MqPayload: Downcast + Send {}
+pub trait MqPayload: Downcast + Send {
+    fn attach_cleanup(&mut self, cleanup: PayloadCleanup) -> Result<(), PayloadCleanup> {
+        Err(cleanup)
+    }
+}
 impl_downcast!(MqPayload);
+
+pub type PayloadCleanupFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+pub type PayloadCleanup = Box<dyn FnOnce() -> PayloadCleanupFuture + Send + 'static>;
 
 /// Callback result: deliver a payload or indicate retry/non-retry.
 pub enum PayloadResult {
@@ -813,10 +835,12 @@ pub struct MpscConsumer {
     ///
     /// 队列元素是一次完整 get 操作的 JoinHandle；consumer
     /// 只需 pop 并等待其完成即可，保证按提交顺序消费。
-    inflight_rx: mpsc::Receiver<InflightItem>,
+    inflight_queue: Arc<Mutex<VecDeque<InflightItem>>>,
     inflight_consume_notify: Arc<Notify>,
     /// 控制通道，仅用于下发回调设置等控制类命令。
     cmd_tx: mpsc::Sender<ConsumerCmd>,
+    /// Local mirror of payload callback for non-prefetch direct paths.
+    payload_cb: Option<PayloadCallback>,
     /// delete callback invoked after successful consume-offset commit.
     delete_cb: Option<DeleteCallback>,
     /// Shared shutdown controller used by higher layers to signal
@@ -1242,10 +1266,13 @@ impl MpscConsumer {
     }
 
     async fn recv_next_inflight_handle_with_idle_warn(&mut self) -> Option<InflightItem> {
-        match self.inflight_rx.try_recv() {
-            Ok(handle) => return Some(handle),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return None,
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+        if let Some(handle) = self
+            .inflight_queue
+            .lock()
+            .expect("inflight queue mutex poisoned")
+            .pop_front()
+        {
+            return Some(handle);
         }
 
         let idle_warn_sleep = tokio::time::sleep(NO_MESSAGE_WARN_INTERVAL);
@@ -1255,10 +1282,19 @@ impl MpscConsumer {
             if self.shutdown.is_closed() {
                 return None;
             }
+            let queue_notify = self.inflight_consume_notify.notified();
+            tokio::pin!(queue_notify);
             tokio::select! {
                 biased;
-                handle_opt = self.inflight_rx.recv() => {
-                    return handle_opt;
+                _ = &mut queue_notify => {
+                    if let Some(handle) = self
+                        .inflight_queue
+                        .lock()
+                        .expect("inflight queue mutex poisoned")
+                        .pop_front()
+                    {
+                        return Some(handle);
+                    }
                 }
                 _ = &mut idle_warn_sleep => {
                     let parent_mpmc_id = match self.category {
@@ -1399,7 +1435,7 @@ impl MpscConsumer {
         let global_lease_id = chan_mgr.global_lease.id() as i64;
         let (
             cmd_tx,
-            inflight_rx,
+            inflight_queue,
             target_inflight,
             inflight_queue_size,
             inflight_consume_notify,
@@ -1438,9 +1474,10 @@ impl MpscConsumer {
             chan_mgr,
             target_inflight,
             inflight_queue_size,
-            inflight_rx,
+            inflight_queue,
             cmd_tx,
             inflight_consume_notify,
+            payload_cb: None,
             delete_cb: None,
             shutdown,
             category,
@@ -1478,6 +1515,10 @@ impl MpscConsumer {
 
     pub fn consumer_idx(&self) -> &str {
         &self.consumer_idx
+    }
+
+    pub fn channel_capacity(&self) -> i64 {
+        self.chan_mgr.capacity()
     }
 
     pub fn lease_manager(&self) -> &LeaseManager {
@@ -1570,6 +1611,7 @@ impl MpscConsumer {
     /// This method is synchronous and only pushes a control command to the
     /// internal actor via `try_send`.
     pub fn set_payload_callback(&mut self, cb: PayloadCallback) {
+        self.payload_cb = Some(cb.clone());
         let _ = self.cmd_tx.try_send(ConsumerCmd::SetCallback(cb));
     }
 
@@ -1619,8 +1661,7 @@ impl MpscConsumer {
         } else {
             self.recv_next_inflight_handle_with_idle_warn().await
         };
-        let inflight_item =
-            handle_opt.ok_or_else(|| MpscError::Internal("prefetch actor closed".to_string()))?;
+        let inflight_item = handle_opt.ok_or(MpscError::Closed)?;
         debug!(
             "[MpscConsumer get_with_payload] instance_id={} chan_id={} seq={} producer_id={} consume_offset={} inflight_queue_size_after_pop={}",
             self.instance_id,
@@ -1893,6 +1934,48 @@ impl MpscConsumer {
             .await
     }
 
+    pub async fn get_with_payload_via_broker(
+        &mut self,
+        broker: &BrokerHandle,
+    ) -> Result<ConsumedPayload, MpscError> {
+        let cb = self
+            .payload_cb
+            .as_ref()
+            .ok_or_else(|| MpscError::Internal("payload callback not set".to_string()))?
+            .clone();
+        get_payload_via_broker(
+            broker,
+            self.chan_id,
+            self.consumer_idx.clone(),
+            cb,
+            self.delete_cb.clone(),
+            self.shutdown.clone(),
+        )
+        .await
+    }
+
+    pub async fn get_batch_with_payload_via_broker(
+        &mut self,
+        broker: &BrokerHandle,
+        batch_size: usize,
+    ) -> Result<Vec<ConsumedPayload>, MpscError> {
+        let cb = self
+            .payload_cb
+            .as_ref()
+            .ok_or_else(|| MpscError::Internal("payload callback not set".to_string()))?
+            .clone();
+        get_payload_batch_via_broker(
+            broker,
+            self.chan_id,
+            self.consumer_idx.clone(),
+            batch_size,
+            cb,
+            self.delete_cb.clone(),
+            self.shutdown.clone(),
+        )
+        .await
+    }
+
     /// Runs the KV payload fetch stage with retry semantics.
     /// Consume-offset commit is handled by the prefetch job.
     async fn run_single_get(
@@ -1909,9 +1992,7 @@ impl MpscConsumer {
         let mut payload_obj: Option<Box<dyn MqPayload>> = None;
         loop {
             if shutdown.is_closed() {
-                return Err(MpscError::Internal(
-                    "consumer closed during get_with_payload".to_string(),
-                ));
+                return Err(MpscError::Closed);
             }
             let msg_key = keys::backend_message_key_with_category(
                 chan_id,
@@ -1978,10 +2059,7 @@ impl MpscConsumer {
 
         loop {
             if shutdown.is_closed() {
-                return Err(MpscError::Internal(format!(
-                    "consumer closed during consume-offset commit: seq={} producer_id={} consume_offset={}",
-                    seq, producer_id, consume_offset
-                )));
+                return Err(MpscError::Closed);
             }
 
             attempts += 1;
@@ -1996,10 +2074,7 @@ impl MpscConsumer {
             let put_res = tokio::select! {
                 biased;
                 _ = shutdown.wait_closed() => {
-                    return Err(MpscError::Internal(format!(
-                        "consumer closed during consume-offset commit: seq={} producer_id={} consume_offset={}",
-                        seq, producer_id, consume_offset
-                    )));
+                    return Err(MpscError::Closed);
                 }
                 res = tokio::time::timeout(
                     COMMIT_OFFSET_PUT_TIMEOUT,
@@ -2073,10 +2148,7 @@ impl MpscConsumer {
             tokio::select! {
                 biased;
                 _ = shutdown.wait_closed() => {
-                    return Err(MpscError::Internal(format!(
-                        "consumer closed during consume-offset retry sleep: seq={} producer_id={} consume_offset={}",
-                        seq, producer_id, consume_offset
-                    )));
+                    return Err(MpscError::Closed);
                 }
                 _ = sleep(COMMIT_OFFSET_RETRY_SLEEP) => {}
             }
@@ -2174,6 +2246,586 @@ impl MpscConsumer {
         done.store(true, Ordering::Relaxed);
         result
     }
+}
+
+async fn get_payload_via_broker(
+    broker: &BrokerHandle,
+    chan_id: i64,
+    consumer_id: String,
+    cb: PayloadCallback,
+    delete_cb: Option<DeleteCallback>,
+    shutdown: ShutdownCtl,
+) -> Result<ConsumedPayload, MpscError> {
+    let fetched = broker
+        .fetch_next(BrokerFetchRequest {
+            channel_id: chan_id,
+            consumer_id: consumer_id.clone(),
+            now_ms: now_ms(),
+        })
+        .await
+        .map_err(|e| {
+            MpscError::Internal(format!(
+                "broker fetch failed: chan_id={} consumer_id={} err={}",
+                chan_id, consumer_id, e
+            ))
+        })?
+        .ok_or(MpscError::NoMessage)?;
+    let envelope = fetched.envelope;
+    let reservation_id = envelope.reservation_id;
+    let producer_id = envelope.producer_id.clone();
+    let payload_key = envelope.payload_key.clone();
+    let mut requeue_guard =
+        BrokerInflightRequeueGuard::new(broker.clone(), chan_id, vec![reservation_id]);
+    let mut payload = match run_payload_callback(
+        chan_id,
+        cb,
+        producer_id.clone(),
+        payload_key,
+        shutdown.clone(),
+    )
+    .await
+    {
+        Ok((payload, _kv_get_latency_ns)) => payload,
+        Err(err) => {
+            requeue_guard.requeue_now().await;
+            return Err(err);
+        }
+    };
+
+    let commit_outcome = match broker.commit(chan_id, reservation_id, now_ms()).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            requeue_guard.requeue_now().await;
+            return Err(MpscError::Internal(format!(
+                "broker commit failed: chan_id={} consumer_id={} reservation_id={} err={}",
+                chan_id, consumer_id, reservation_id, err
+            )));
+        }
+    };
+    requeue_guard.mark_completed(reservation_id);
+    if !commit_outcome.first_commit {
+        return Err(MpscError::Internal(format!(
+            "broker commit returned duplicate first_commit=false: chan_id={} consumer_id={} reservation_id={}",
+            chan_id, consumer_id, reservation_id
+        )));
+    }
+
+    if let Some(envelope) = commit_outcome.cleanup {
+        attach_or_run_broker_cleanup(
+            payload.as_mut(),
+            broker.clone(),
+            chan_id,
+            delete_cb.clone(),
+            shutdown.clone(),
+            envelope,
+        )
+        .await?;
+    }
+
+    Ok(ConsumedPayload {
+        producer_id,
+        payload,
+        nonblocking_hit: true,
+    })
+}
+
+struct BrokerBatchPayload {
+    producer_id: String,
+    payload: Box<dyn MqPayload>,
+}
+
+struct BrokerInflightRequeueGuard {
+    broker: BrokerHandle,
+    chan_id: i64,
+    reservation_ids: Vec<u64>,
+}
+
+impl BrokerInflightRequeueGuard {
+    fn new(broker: BrokerHandle, chan_id: i64, reservation_ids: Vec<u64>) -> Self {
+        Self {
+            broker,
+            chan_id,
+            reservation_ids,
+        }
+    }
+
+    fn extend<I>(&mut self, reservation_ids: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        self.reservation_ids.extend(reservation_ids);
+    }
+
+    fn mark_completed(&mut self, reservation_id: u64) {
+        if let Some(pos) = self
+            .reservation_ids
+            .iter()
+            .position(|current| *current == reservation_id)
+        {
+            self.reservation_ids.remove(pos);
+        }
+    }
+
+    async fn requeue_now(&mut self) {
+        let reservation_ids = std::mem::take(&mut self.reservation_ids);
+        requeue_pending_broker_inflight(&self.broker, self.chan_id, reservation_ids).await;
+    }
+}
+
+impl Drop for BrokerInflightRequeueGuard {
+    fn drop(&mut self) {
+        let reservation_ids = std::mem::take(&mut self.reservation_ids);
+        if reservation_ids.is_empty() {
+            return;
+        }
+        let broker = self.broker.clone();
+        let chan_id = self.chan_id;
+        tokio::spawn(async move {
+            requeue_pending_broker_inflight(&broker, chan_id, reservation_ids).await;
+        });
+    }
+}
+
+async fn get_payload_batch_via_broker(
+    broker: &BrokerHandle,
+    chan_id: i64,
+    consumer_id: String,
+    batch_size: usize,
+    cb: PayloadCallback,
+    delete_cb: Option<DeleteCallback>,
+    shutdown: ShutdownCtl,
+) -> Result<Vec<ConsumedPayload>, MpscError> {
+    if batch_size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let first = broker
+        .fetch_next(BrokerFetchRequest {
+            channel_id: chan_id,
+            consumer_id: consumer_id.clone(),
+            now_ms: now_ms(),
+        })
+        .await
+        .map_err(|e| {
+            MpscError::Internal(format!(
+                "broker fetch failed: chan_id={} consumer_id={} err={}",
+                chan_id, consumer_id, e
+            ))
+        })?
+        .ok_or(MpscError::NoMessage)?;
+
+    let mut fetched = Vec::with_capacity(batch_size);
+    let mut requeue_guard = BrokerInflightRequeueGuard::new(
+        broker.clone(),
+        chan_id,
+        vec![first.envelope.reservation_id],
+    );
+    fetched.push(first);
+
+    let remaining = batch_size.saturating_sub(1);
+    if remaining > 0 {
+        let mut more = match broker
+            .fetch_batch_available(
+                BrokerFetchRequest {
+                    channel_id: chan_id,
+                    consumer_id: consumer_id.clone(),
+                    now_ms: now_ms(),
+                },
+                remaining,
+            )
+            .await
+        {
+            Ok(batch) => {
+                requeue_guard.extend(
+                    batch
+                        .messages
+                        .iter()
+                        .map(|message| message.envelope.reservation_id),
+                );
+                batch.messages
+            }
+            Err(err) => {
+                requeue_guard.requeue_now().await;
+                return Err(MpscError::Internal(format!(
+                    "broker batch fetch failed: chan_id={} consumer_id={} err={}",
+                    chan_id, consumer_id, err
+                )));
+            }
+        };
+        fetched.append(&mut more);
+    }
+
+    match load_broker_payloads_commit_on_ready(
+        broker,
+        chan_id,
+        &consumer_id,
+        fetched,
+        cb,
+        delete_cb,
+        shutdown.clone(),
+        requeue_guard,
+    )
+    .await
+    {
+        Ok(payloads) => Ok(payloads
+            .into_iter()
+            .map(|item| ConsumedPayload {
+                producer_id: item.producer_id,
+                payload: item.payload,
+                nonblocking_hit: true,
+            })
+            .collect()),
+        Err(err) => Err(err),
+    }
+}
+
+async fn load_broker_payloads_commit_on_ready(
+    broker: &BrokerHandle,
+    chan_id: i64,
+    consumer_id: &str,
+    fetched: Vec<BrokerFetchedMessage>,
+    cb: PayloadCallback,
+    delete_cb: Option<DeleteCallback>,
+    shutdown: ShutdownCtl,
+    mut requeue_guard: BrokerInflightRequeueGuard,
+) -> Result<Vec<BrokerBatchPayload>, MpscError> {
+    let reservation_ids: Vec<u64> = fetched
+        .iter()
+        .map(|message| message.envelope.reservation_id)
+        .collect();
+    let mut join_set = JoinSet::new();
+
+    for message in fetched {
+        let envelope = message.envelope;
+        let reservation_id = envelope.reservation_id;
+        let producer_id = envelope.producer_id.clone();
+        let payload_key = envelope.payload_key.clone();
+        let cb = cb.clone();
+        let shutdown = shutdown.clone();
+        join_set.spawn(async move {
+            let result =
+                run_payload_callback(chan_id, cb, producer_id.clone(), payload_key, shutdown)
+                    .await
+                    .map(|(payload, _kv_get_latency_ns)| BrokerBatchPayload {
+                        producer_id,
+                        payload,
+                    });
+            (reservation_id, result)
+        });
+    }
+
+    let mut payload_results: HashMap<u64, Result<BrokerBatchPayload, MpscError>> =
+        HashMap::with_capacity(reservation_ids.len());
+    let mut batch_load_failure: Option<MpscError> = None;
+    while let Some(join_res) = join_set.join_next().await {
+        match join_res {
+            Ok((reservation_id, Ok(payload))) => {
+                payload_results.insert(reservation_id, Ok(payload));
+            }
+            Ok((reservation_id, Err(err))) => {
+                payload_results.insert(reservation_id, Err(err));
+                join_set.abort_all();
+                break;
+            }
+            Err(err) => {
+                join_set.abort_all();
+                batch_load_failure = Some(MpscError::JoinError(err));
+                break;
+            }
+        }
+    }
+
+    let mut committed_payloads = Vec::with_capacity(reservation_ids.len());
+    let mut remaining_reservation_ids = Vec::new();
+    let mut stop_error = batch_load_failure;
+    let mut stop_after_current = stop_error.is_some();
+
+    for reservation_id in reservation_ids {
+        if stop_after_current {
+            remaining_reservation_ids.push(reservation_id);
+            continue;
+        }
+
+        let Some(payload_result) = payload_results.remove(&reservation_id) else {
+            stop_error = Some(MpscError::Internal(format!(
+                "broker batch payload load canceled before ordered commit: chan_id={} consumer_id={} reservation_id={}",
+                chan_id, consumer_id, reservation_id
+            )));
+            stop_after_current = true;
+            remaining_reservation_ids.push(reservation_id);
+            continue;
+        };
+
+        let mut payload = match payload_result {
+            Ok(payload) => payload,
+            Err(err) => {
+                stop_error = Some(err);
+                stop_after_current = true;
+                remaining_reservation_ids.push(reservation_id);
+                continue;
+            }
+        };
+
+        let commit_outcome = match broker.commit(chan_id, reservation_id, now_ms()).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                stop_error = Some(MpscError::Internal(format!(
+                    "broker commit failed during batch consume: chan_id={} consumer_id={} reservation_id={} err={}",
+                    chan_id, consumer_id, reservation_id, err
+                )));
+                stop_after_current = true;
+                remaining_reservation_ids.push(reservation_id);
+                continue;
+            }
+        };
+        requeue_guard.mark_completed(reservation_id);
+        if !commit_outcome.first_commit {
+            stop_error = Some(MpscError::Internal(format!(
+                "broker commit returned duplicate during batch consume: chan_id={} consumer_id={} reservation_id={}",
+                chan_id, consumer_id, reservation_id
+            )));
+            stop_after_current = true;
+            remaining_reservation_ids.push(reservation_id);
+            continue;
+        }
+        if let Some(envelope) = commit_outcome.cleanup {
+            if let Err(err) = attach_or_run_broker_cleanup(
+                payload.payload.as_mut(),
+                broker.clone(),
+                chan_id,
+                delete_cb.clone(),
+                shutdown.clone(),
+                envelope,
+            )
+            .await
+            {
+                warn!(
+                    "broker cleanup failed during batch consume: chan_id={} consumer_id={} reservation_id={} err={}",
+                    chan_id, consumer_id, reservation_id, err
+                );
+                committed_payloads.push(payload);
+                stop_error = Some(err);
+                stop_after_current = true;
+                continue;
+            }
+        }
+
+        committed_payloads.push(payload);
+    }
+
+    if !remaining_reservation_ids.is_empty() {
+        requeue_guard.requeue_now().await;
+    }
+
+    if !committed_payloads.is_empty() {
+        return Ok(committed_payloads);
+    }
+
+    Err(stop_error.unwrap_or_else(|| {
+        MpscError::Internal(format!(
+            "broker batch consume stopped without committed payloads: chan_id={} consumer_id={}",
+            chan_id, consumer_id
+        ))
+    }))
+}
+
+async fn run_payload_callback(
+    chan_id: i64,
+    cb: PayloadCallback,
+    producer_id: String,
+    payload_key: String,
+    shutdown: ShutdownCtl,
+) -> Result<(Box<dyn MqPayload>, u128), MpscError> {
+    use tokio::time::sleep;
+
+    let kv_get_begin = Instant::now();
+    loop {
+        if shutdown.is_closed() {
+            return Err(MpscError::Closed);
+        }
+        let f = cb.clone();
+        let producer_for_closure = producer_id.clone();
+        let key_for_closure = payload_key.clone();
+        let res = (f)(producer_for_closure, key_for_closure).await;
+
+        match res {
+            PayloadResult::Ok(payload) => {
+                return Ok((payload, kv_get_begin.elapsed().as_nanos()));
+            }
+            PayloadResult::Retryable(msg) => {
+                warn!(
+                    "[MpscConsumer chan_id={}] get payload retryable: {}",
+                    chan_id, msg
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+            PayloadResult::NonRetryable(msg) => {
+                return Err(MpscError::GetPayloadNonRetryable { message: msg });
+            }
+        }
+    }
+}
+
+async fn run_delete_callback(
+    chan_id: i64,
+    delete_cb: &DeleteCallback,
+    payload_key: String,
+    shutdown: &ShutdownCtl,
+) -> Result<(), MpscError> {
+    use tokio::time::sleep;
+
+    loop {
+        if shutdown.is_closed() {
+            return Ok(());
+        }
+        let f = delete_cb.clone();
+        let key_clone = payload_key.clone();
+        let delete_begin = Instant::now();
+        let delete_fut = (f)(key_clone.clone());
+        tokio::pin!(delete_fut);
+        let res = loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_closed() => {
+                    debug!(
+                        "[MpscConsumer chan_id={}] stop delete callback on shutdown: key={}",
+                        chan_id,
+                        key_clone,
+                    );
+                    break DeleteResult::Ok;
+                }
+                res = &mut delete_fut => {
+                    break res;
+                }
+                _ = sleep(DELETE_CALLBACK_WARN_INTERVAL) => {
+                    warn!(
+                        "[MpscConsumer chan_id={}] delete callback still pending: key={} waited_ms={}",
+                        chan_id,
+                        key_clone,
+                        delete_begin.elapsed().as_millis(),
+                    );
+                }
+            }
+        };
+        match res {
+            DeleteResult::Ok => return Ok(()),
+            DeleteResult::Retryable(msg) => {
+                warn!(
+                    "[MpscConsumer chan_id={}] delete payload retryable: {}",
+                    chan_id, msg
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+            DeleteResult::NonRetryable(msg) => {
+                return Err(MpscError::DeletePayloadNonRetryable { message: msg });
+            }
+        }
+    }
+}
+
+async fn cleanup_broker_envelope(
+    broker: &BrokerHandle,
+    chan_id: i64,
+    delete_cb: Option<&DeleteCallback>,
+    shutdown: &ShutdownCtl,
+    envelope: BrokerEnvelope,
+) -> Result<(), MpscError> {
+    let reservation_id = envelope.reservation_id;
+    if let Some(delete_cb) = delete_cb {
+        run_delete_callback(chan_id, delete_cb, envelope.payload_key, shutdown).await?;
+    }
+    broker
+        .cleanup_ack(chan_id, reservation_id)
+        .await
+        .map_err(|e| {
+            MpscError::Internal(format!(
+                "broker cleanup ack failed: chan_id={} reservation_id={} err={}",
+                chan_id, reservation_id, e
+            ))
+        })?;
+    Ok(())
+}
+
+async fn attach_or_run_broker_cleanup(
+    payload: &mut dyn MqPayload,
+    broker: BrokerHandle,
+    chan_id: i64,
+    delete_cb: Option<DeleteCallback>,
+    shutdown: ShutdownCtl,
+    envelope: BrokerEnvelope,
+) -> Result<(), MpscError> {
+    let cleanup_envelope = envelope.clone();
+    let deferred_broker = broker.clone();
+    let deferred_delete_cb = delete_cb.clone();
+    let deferred_shutdown = shutdown.clone();
+    let cleanup = Box::new(move || {
+        Box::pin(async move {
+            if let Some(delete_cb) = deferred_delete_cb.as_ref() {
+                if let Err(err) = run_delete_callback(
+                    chan_id,
+                    delete_cb,
+                    cleanup_envelope.payload_key.clone(),
+                    &deferred_shutdown,
+                )
+                .await
+                {
+                    warn!(
+                        "deferred broker payload delete failed: chan_id={} reservation_id={} err={}",
+                        chan_id, cleanup_envelope.reservation_id, err
+                    );
+                    let _ = deferred_broker
+                        .cleanup_nack(chan_id, cleanup_envelope.reservation_id)
+                        .await;
+                    return;
+                }
+            }
+            if let Err(err) = deferred_broker
+                .cleanup_ack(chan_id, cleanup_envelope.reservation_id)
+                .await
+            {
+                warn!(
+                    "deferred broker cleanup ack failed: chan_id={} reservation_id={} err={}",
+                    chan_id, cleanup_envelope.reservation_id, err
+                );
+            }
+        }) as PayloadCleanupFuture
+    });
+    match payload.attach_cleanup(cleanup) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            cleanup_broker_envelope(&broker, chan_id, delete_cb.as_ref(), &shutdown, envelope).await
+        }
+    }
+}
+
+async fn requeue_pending_broker_inflight(
+    broker: &BrokerHandle,
+    chan_id: i64,
+    reservation_ids: Vec<u64>,
+) {
+    for reservation_id in reservation_ids.into_iter().rev() {
+        requeue_broker_inflight_best_effort(broker, chan_id, reservation_id).await;
+    }
+}
+
+async fn requeue_broker_inflight_best_effort(
+    broker: &BrokerHandle,
+    chan_id: i64,
+    reservation_id: u64,
+) {
+    if let Err(err) = broker.requeue_inflight(chan_id, reservation_id).await {
+        warn!(
+            "best-effort broker requeue failed: chan_id={} reservation_id={} err={}",
+            chan_id, reservation_id, err
+        );
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before UNIX_EPOCH")
+        .as_millis() as i64
 }
 
 /// MPSC consumer actor，持有 selector、offset、lease 等完整状态。
@@ -2454,9 +3106,10 @@ struct ConsumerActor {
     producer_selector: ProducerSelectorForConsumer,
     /// payload 回调，由上层通过 ConsumerCmd::SetCallback 设置.
     payload_cb: Option<PayloadCallback>,
-    /// 每个 producer 当前已预取但尚未持久化消费的“下一条 offset”
-    /// 提示，用于避免在 etcd consume offset 尚未更新时重复预取
-    /// 同一条消息。
+    /// 每个 producer 的本地 reservation cursor（下一条待预取 offset）。
+    ///
+    /// 这个 cursor 可能领先于 etcd consume offset，因为 actor 会在
+    /// consume-offset 持久化之前先连续发起多条 prefetch。
     prefetch_offset_map: HashMap<String, i64>,
     /// 本地缓存的 produce offset（来自 etcd），仅在无消息或
     /// 初始化时 refresh；平时 select_next_message 只读该缓存。
@@ -2479,7 +3132,7 @@ struct ConsumerActor {
     /// 向 consumer 暴露的预取队列 sender。
     ///
     /// 队列元素为一次完整 get 操作的 JoinHandle。
-    inflight_tx: mpsc::Sender<InflightItem>,
+    inflight_queue: Arc<Mutex<VecDeque<InflightItem>>>,
     /// inflight consume notify
     inflight_consume_notify: Arc<Notify>,
     /// 共享的预取窗口目标。
@@ -2597,10 +3250,12 @@ impl ConsumerActor {
     }
 
     fn cached_next_hint(&self, producer_id: &str) -> i64 {
+        let committed_next = self.cached_consume_offset(producer_id);
         self.prefetch_offset_map
             .get(producer_id)
             .copied()
-            .unwrap_or_else(|| self.cached_consume_offset(producer_id))
+            .map(|hint| hint.max(committed_next))
+            .unwrap_or(committed_next)
     }
 
     fn cached_produce_offset(&self, producer_id: &str) -> i64 {
@@ -2616,6 +3271,12 @@ impl ConsumerActor {
             || self.prefetch_offset_map.contains_key(producer_id)
     }
 
+    fn producer_has_prefetch_room(&self, producer_id: &str) -> bool {
+        let visible_tail = self.cached_produce_offset(producer_id);
+        let next_hint = self.cached_next_hint(producer_id);
+        next_hint <= visible_tail
+    }
+
     fn refresh_ready_state_from_local(&mut self, producer_id: &str) -> bool {
         let ready_before = self.ready_producers.contains(producer_id);
         let stale_before = self.stale_no_room_producers.contains(producer_id);
@@ -2626,8 +3287,7 @@ impl ConsumerActor {
             return ready_before || stale_before;
         }
 
-        let has_room =
-            self.cached_produce_offset(producer_id) >= self.cached_next_hint(producer_id);
+        let has_room = self.producer_has_prefetch_room(producer_id);
         if has_room {
             self.ready_producers.insert(producer_id.to_string());
             self.stale_no_room_producers.remove(producer_id);
@@ -2878,7 +3538,7 @@ impl ConsumerActor {
         global_lease_id: i64,
     ) -> (
         mpsc::Sender<ConsumerCmd>,
-        mpsc::Receiver<InflightItem>,
+        Arc<Mutex<VecDeque<InflightItem>>>,
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
         Arc<Notify>,
@@ -2889,7 +3549,7 @@ impl ConsumerActor {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (meta_tx, meta_rx) = mpsc::channel(8);
         let (produce_offset_tx, produce_offset_rx) = mpsc::channel(128);
-        let (inflight_tx, inflight_rx) = mpsc::channel(32);
+        let inflight_queue = Arc::new(Mutex::new(VecDeque::new()));
         let target_inflight = Arc::new(AtomicUsize::new(0));
         let inflight_queue_size = Arc::new(AtomicUsize::new(0));
         let inflight_consume_notify = Arc::new(Notify::new());
@@ -2911,7 +3571,7 @@ impl ConsumerActor {
             ready_producers: HashSet::new(),
             ready_trace_history: HashMap::new(),
             stale_no_room_producers: HashSet::new(),
-            inflight_tx,
+            inflight_queue: inflight_queue.clone(),
             inflight_consume_notify: inflight_consume_notify.clone(),
             target_inflight: target_inflight.clone(),
             inflight_queue_size: inflight_queue_size.clone(),
@@ -2960,7 +3620,7 @@ impl ConsumerActor {
 
         (
             cmd_tx,
-            inflight_rx,
+            inflight_queue,
             target_inflight,
             inflight_queue_size,
             inflight_consume_notify,
@@ -3118,7 +3778,7 @@ impl ConsumerActor {
             }
 
             // Do not poll `prefetch_tick()` as a `tokio::select!` branch. If the
-            // branch is canceled while `inflight_tx.send(...)` is pending, the
+            // branch is canceled while queueing a new inflight item is pending, the
             // oneshot receiver inside `InflightItem` is dropped after the
             // prefetch job has already started, which strands commit ordering.
             self.drain_pending_actor_inputs(&mut rx, &mut meta_rx, &mut produce_offset_rx);
@@ -3163,22 +3823,35 @@ impl ConsumerActor {
             return;
         }
 
-        for _ in 0..1 {
+        let initial_queue_size = self.inflight_queue_size.load(Ordering::SeqCst);
+        let burst_limit = prefetch_refill_launch_budget(target, initial_queue_size);
+        let mut launched = 0usize;
+        loop {
             let current = self.inflight_queue_size.load(Ordering::SeqCst);
             if current >= target {
-                self.wait_actor_inputs_or_inflight_consume(rx, meta_rx, produce_offset_rx)
-                    .await;
+                if launched == 0 {
+                    self.wait_actor_inputs_or_inflight_consume(rx, meta_rx, produce_offset_rx)
+                        .await;
+                }
+                return;
+            }
+            if launched >= burst_limit {
                 return;
             }
 
             match self.try_prefetch_one().await {
                 Ok(()) => {
+                    launched += 1;
                     self.prefetch_no_message_next_warn_at =
                         tokio::time::Instant::now() + NO_MESSAGE_WARN_INTERVAL;
                     self.maybe_log_select_next_message_stats(false);
                 }
                 Err(MpscError::NoMessage) => {
                     self.select_next_message_stats.record_no_message_backoff();
+                    if launched > 0 {
+                        self.maybe_log_select_next_message_stats(false);
+                        return;
+                    }
                     let now = tokio::time::Instant::now();
                     if now >= self.prefetch_no_message_next_warn_at {
                         let parent_mpmc_id = match self.category {
@@ -3195,7 +3868,13 @@ impl ConsumerActor {
                         self.prefetch_no_message_next_warn_at = now + NO_MESSAGE_WARN_INTERVAL;
                     }
                     self.maybe_log_select_next_message_stats(false);
-                    self.wait_actor_inputs(rx, meta_rx, produce_offset_rx).await;
+                    self.wait_actor_inputs_or_timeout(
+                        rx,
+                        meta_rx,
+                        produce_offset_rx,
+                        prefetch_no_message_retry_sleep(current),
+                    )
+                    .await;
                     return;
                 }
                 Err(other) => {
@@ -3213,6 +3892,7 @@ impl ConsumerActor {
                         Duration::from_millis(100),
                     )
                     .await;
+                    return;
                 }
             }
         }
@@ -3223,7 +3903,7 @@ impl ConsumerActor {
     /// 返回 `MpscError::NoMessage`。
     async fn try_prefetch_one(&mut self) -> Result<(), MpscError> {
         if self.shutdown.is_closed() {
-            return Err(MpscError::Internal("consumer closed".to_string()));
+            return Err(MpscError::Closed);
         }
         let cb = self
             .payload_cb
@@ -3305,16 +3985,17 @@ impl ConsumerActor {
             queue_size_after_inc,
             self.target_inflight.load(Ordering::SeqCst),
         );
-        self.inflight_tx
-            .send(InflightItem {
+        self.inflight_queue
+            .lock()
+            .expect("inflight queue mutex poisoned")
+            .push_back(InflightItem {
                 seq,
                 producer_id: producer_id_for_queue,
                 consume_offset,
                 ready_path_trace,
                 rx,
-            })
-            .await
-            .map_err(|_| MpscError::Internal("prefetch queue closed".to_string()))?;
+            });
+        self.inflight_consume_notify.notify_one();
         debug!(
             "[MpscConsumer enqueue] instance_id={} chan_id={} seq={} queue_send_completed queue_size_now={}",
             self.instance_id,
@@ -3445,31 +4126,66 @@ impl ConsumerActor {
             return Err(MpscError::NoMessage);
         }
 
-        self.producer_selector.moveon_round_robin();
-        let producer_id = self
-            .producer_selector
-            .current_producer_idx()
-            .ok_or(MpscError::NoMessage)?
-            .to_string();
+        let ready_count = self.ready_producers.len();
+        for _ in 0..ready_count {
+            self.producer_selector.moveon_round_robin();
+            let producer_id = self
+                .producer_selector
+                .current_producer_idx()
+                .ok_or(MpscError::NoMessage)?
+                .to_string();
 
-        let prod_off = self.cached_produce_offset(&producer_id);
-        let next_hint = self.cached_next_hint(&producer_id);
+            let next_hint = self.cached_next_hint(&producer_id);
 
-        if prod_off < next_hint {
+            if !self.producer_has_prefetch_room(&producer_id) {
+                if self.refresh_ready_state_from_local(&producer_id) {
+                    self.rebuild_ready_selector();
+                }
+                continue;
+            }
+
+            let actual_offset = next_hint;
+            self.prefetch_offset_map
+                .insert(producer_id.clone(), actual_offset + 1);
             if self.refresh_ready_state_from_local(&producer_id) {
                 self.rebuild_ready_selector();
             }
-            return Err(MpscError::NoMessage);
+
+            return Ok((producer_id, actual_offset));
         }
 
-        let actual_offset = next_hint;
-        self.prefetch_offset_map
-            .insert(producer_id.clone(), actual_offset + 1);
-        if self.refresh_ready_state_from_local(&producer_id) {
-            self.rebuild_ready_selector();
+        if !self.stale_no_room_producers.is_empty() {
+            self.probe_stale_no_room_producers_timed(trace).await?;
+            if !self.ready_producers.is_empty() {
+                let retry_ready_count = self.ready_producers.len();
+                for _ in 0..retry_ready_count {
+                    self.producer_selector.moveon_round_robin();
+                    let producer_id = self
+                        .producer_selector
+                        .current_producer_idx()
+                        .ok_or(MpscError::NoMessage)?
+                        .to_string();
+
+                    let next_hint = self.cached_next_hint(&producer_id);
+                    if !self.producer_has_prefetch_room(&producer_id) {
+                        if self.refresh_ready_state_from_local(&producer_id) {
+                            self.rebuild_ready_selector();
+                        }
+                        continue;
+                    }
+
+                    let actual_offset = next_hint;
+                    self.prefetch_offset_map
+                        .insert(producer_id.clone(), actual_offset + 1);
+                    if self.refresh_ready_state_from_local(&producer_id) {
+                        self.rebuild_ready_selector();
+                    }
+                    return Ok((producer_id, actual_offset));
+                }
+            }
         }
 
-        Ok((producer_id, actual_offset))
+        Err(MpscError::NoMessage)
     }
 
     async fn refresh_offsets_from_etcd_timed(
@@ -3623,8 +4339,22 @@ impl ConsumerActor {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_monotonic_offset, merge_offset_cache_monotonic};
+    use super::{
+        get_payload_batch_via_broker, get_payload_via_broker, merge_monotonic_offset,
+        merge_offset_cache_monotonic, MqPayload, PayloadCallback, PayloadResult,
+    };
+    use crate::{
+        keys::MqCategory, BrokerChannelConfig, BrokerFetchRequest, BrokerHandle,
+        BrokerReserveRequest,
+    };
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    struct TestPayload;
+
+    impl MqPayload for TestPayload {}
 
     #[test]
     fn merge_monotonic_offset_keeps_cached_when_probe_missing() {
@@ -3653,6 +4383,276 @@ mod tests {
         assert_eq!(current.get("producer_a"), Some(&62));
         assert_eq!(current.get("producer_b"), Some(&41));
         assert_eq!(current.get("producer_c"), Some(&7));
+    }
+
+    #[test]
+    fn visible_tail_does_not_allow_prefetch_past_last_published_offset() {
+        let visible_tail = 0;
+        let next_visible = 0;
+        let next_not_yet_published = 1;
+
+        assert!(next_visible <= visible_tail);
+        assert!(next_not_yet_published > visible_tail);
+    }
+
+    async fn fetch_next_for_test(
+        broker: &BrokerHandle,
+        channel_id: i64,
+        consumer_id: &str,
+        now_ms: i64,
+    ) -> crate::BrokerFetchedMessage {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            broker.fetch_next(BrokerFetchRequest {
+                channel_id,
+                consumer_id: consumer_id.to_string(),
+                now_ms,
+            }),
+        )
+        .await
+        .expect("timed out waiting for broker redelivery")
+        .unwrap()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn broker_single_consume_timeout_requeues_reserved_message() {
+        let broker = BrokerHandle::new_local_for_test(32);
+        broker
+            .upsert_channel(BrokerChannelConfig {
+                channel_id: 72,
+                capacity: 2,
+            })
+            .await
+            .unwrap();
+
+        let reserved = broker
+            .reserve(BrokerReserveRequest {
+                channel_id: 72,
+                producer_id: "p0".to_string(),
+                category: MqCategory::Mpsc,
+                payload_bytes: 1,
+                now_ms: 10,
+            })
+            .await
+            .unwrap();
+        broker
+            .publish(72, reserved.envelope.reservation_id, 20)
+            .await
+            .unwrap();
+
+        let callback_started = Arc::new(Notify::new());
+        let cb_started_for_callback = callback_started.clone();
+        let cb: PayloadCallback = Arc::new(move |_producer_id: String, _key: String| {
+            let cb_started_for_callback = cb_started_for_callback.clone();
+            Box::pin(async move {
+                cb_started_for_callback.notify_one();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                PayloadResult::Ok(Box::new(TestPayload))
+            })
+        });
+
+        let mut consume = Box::pin(get_payload_via_broker(
+            &broker,
+            72,
+            "c0".to_string(),
+            cb,
+            None,
+            crate::ShutdownCtl::new(),
+        ));
+        tokio::select! {
+            _ = callback_started.notified() => {}
+            result = &mut consume => panic!("consume completed before timeout setup: {:?}", result.err()),
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(5), &mut consume)
+            .await
+            .is_err());
+        drop(consume);
+
+        let redelivered = fetch_next_for_test(&broker, 72, "c1", 30).await;
+        assert_eq!(
+            redelivered.envelope.reservation_id,
+            reserved.envelope.reservation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_batch_consume_timeout_requeues_reserved_messages_in_order() {
+        let broker = BrokerHandle::new_local_for_test(32);
+        broker
+            .upsert_channel(BrokerChannelConfig {
+                channel_id: 73,
+                capacity: 2,
+            })
+            .await
+            .unwrap();
+
+        let first = broker
+            .reserve(BrokerReserveRequest {
+                channel_id: 73,
+                producer_id: "p0".to_string(),
+                category: MqCategory::Mpsc,
+                payload_bytes: 1,
+                now_ms: 10,
+            })
+            .await
+            .unwrap();
+        let second = broker
+            .reserve(BrokerReserveRequest {
+                channel_id: 73,
+                producer_id: "p0".to_string(),
+                category: MqCategory::Mpsc,
+                payload_bytes: 1,
+                now_ms: 11,
+            })
+            .await
+            .unwrap();
+        broker
+            .publish(73, first.envelope.reservation_id, 20)
+            .await
+            .unwrap();
+        broker
+            .publish(73, second.envelope.reservation_id, 21)
+            .await
+            .unwrap();
+
+        let callback_started = Arc::new(Notify::new());
+        let cb_started_for_callback = callback_started.clone();
+        let cb: PayloadCallback = Arc::new(move |_producer_id: String, _key: String| {
+            let cb_started_for_callback = cb_started_for_callback.clone();
+            Box::pin(async move {
+                cb_started_for_callback.notify_one();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                PayloadResult::Ok(Box::new(TestPayload))
+            })
+        });
+
+        let mut consume = Box::pin(get_payload_batch_via_broker(
+            &broker,
+            73,
+            "c0".to_string(),
+            2,
+            cb,
+            None,
+            crate::ShutdownCtl::new(),
+        ));
+        tokio::select! {
+            _ = callback_started.notified() => {}
+            result = &mut consume => panic!("batch consume completed before timeout setup: {:?}", result.err()),
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(5), &mut consume)
+            .await
+            .is_err());
+        drop(consume);
+
+        let redelivered_first = fetch_next_for_test(&broker, 73, "c1", 30).await;
+        let redelivered_second = fetch_next_for_test(&broker, 73, "c1", 31).await;
+        assert_eq!(
+            redelivered_first.envelope.reservation_id,
+            first.envelope.reservation_id
+        );
+        assert_eq!(
+            redelivered_second.envelope.reservation_id,
+            second.envelope.reservation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_batch_consume_requeues_without_out_of_order_commit() {
+        let broker = BrokerHandle::new_local_for_test(32);
+        broker
+            .upsert_channel(BrokerChannelConfig {
+                channel_id: 71,
+                capacity: 2,
+            })
+            .await
+            .unwrap();
+
+        let first = broker
+            .reserve(BrokerReserveRequest {
+                channel_id: 71,
+                producer_id: "p0".to_string(),
+                category: MqCategory::Mpsc,
+                payload_bytes: 1,
+                now_ms: 10,
+            })
+            .await
+            .unwrap();
+        let second = broker
+            .reserve(BrokerReserveRequest {
+                channel_id: 71,
+                producer_id: "p0".to_string(),
+                category: MqCategory::Mpsc,
+                payload_bytes: 1,
+                now_ms: 11,
+            })
+            .await
+            .unwrap();
+        broker
+            .publish(71, first.envelope.reservation_id, 20)
+            .await
+            .unwrap();
+        broker
+            .publish(71, second.envelope.reservation_id, 21)
+            .await
+            .unwrap();
+
+        let first_key = first.envelope.payload_key.clone();
+        let cb: PayloadCallback = Arc::new(move |_producer_id: String, key: String| {
+            let first_key = first_key.clone();
+            Box::pin(async move {
+                if key == first_key {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    PayloadResult::NonRetryable("first payload failed".to_string())
+                } else {
+                    PayloadResult::Ok(Box::new(TestPayload))
+                }
+            })
+        });
+
+        let err = get_payload_batch_via_broker(
+            &broker,
+            71,
+            "c0".to_string(),
+            2,
+            cb,
+            None,
+            crate::ShutdownCtl::new(),
+        )
+        .await
+        .err()
+        .expect("batch consume should fail when the first payload callback fails");
+        assert!(matches!(
+            err,
+            crate::MpscError::GetPayloadNonRetryable { .. }
+        ));
+
+        let redelivered_first = broker
+            .fetch_next(crate::BrokerFetchRequest {
+                channel_id: 71,
+                consumer_id: "c1".to_string(),
+                now_ms: 30,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let redelivered_second = broker
+            .fetch_next(crate::BrokerFetchRequest {
+                channel_id: 71,
+                consumer_id: "c1".to_string(),
+                now_ms: 31,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            redelivered_first.envelope.reservation_id,
+            first.envelope.reservation_id
+        );
+        assert_eq!(
+            redelivered_second.envelope.reservation_id,
+            second.envelope.reservation_id
+        );
     }
 }
 

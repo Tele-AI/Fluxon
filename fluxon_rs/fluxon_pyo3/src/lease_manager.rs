@@ -139,25 +139,38 @@ pub struct LeaseManagerHandle {
 // 仅作为 fluxon_mq::lease_manager::Lease 的包装，避免在 fluxon_pyo3 中重复实现 RAII 逻辑。
 #[pyclass]
 pub struct PyGeneralLease {
-    lease: fluxon_mq::lease_manager::GeneralLease,
+    lease: Option<fluxon_mq::lease_manager::GeneralLease>,
 }
 
 #[pymethods]
 impl PyGeneralLease {
     #[getter]
-    fn id(&self) -> u64 {
-        self.lease.id()
+    fn id(&self) -> PyResult<u64> {
+        Ok(self
+            .lease
+            .as_ref()
+            .ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("lease handle is closed")
+            })?
+            .id())
     }
 
     fn __repr__(&self) -> String {
-        match self.lease.kind() {
+        let Some(lease) = self.lease.as_ref() else {
+            return "<Lease closed>".to_string();
+        };
+        match lease.kind() {
             fluxon_util::lease_manager::LeaseType::Etcd => {
-                format!("<Lease etcd id={}>", self.id())
+                format!("<Lease etcd id={}>", lease.id())
             }
             fluxon_util::lease_manager::LeaseType::KvClient => {
-                format!("<Lease kvclient id={}>", self.id())
+                format!("<Lease kvclient id={}>", lease.id())
             }
         }
+    }
+
+    fn close(&mut self) {
+        self.lease = None;
     }
 }
 
@@ -220,7 +233,7 @@ impl LeaseManagerHandle {
             "end allocate_etcd_lease: id={}, elapsed_ms={}",
             lease.id(), t0.elapsed().as_millis()
         );
-        Ok(PyGeneralLease { lease })
+        Ok(PyGeneralLease { lease: Some(lease) })
     }
 
     /// Register existing etcd lease id for keepalive and wrap the core Lease.
@@ -272,7 +285,7 @@ impl LeaseManagerHandle {
             "end register_etcd_lease: id={}, elapsed_ms={}",
             lease.id(), t0.elapsed().as_millis()
         );
-        Ok(PyGeneralLease { lease })
+        Ok(PyGeneralLease { lease: Some(lease) })
     }
 
     /// Register a kvclient lease via constructed backend uid carrying callbacks.
@@ -330,7 +343,7 @@ impl LeaseManagerHandle {
             "end register_kvclient_lease_via_backend: id={}, elapsed_ms={}",
             lease.id(), t0.elapsed().as_millis()
         );
-        Ok(PyGeneralLease { lease })
+        Ok(PyGeneralLease { lease: Some(lease) })
     }
 
     /// Debug-only: dump current active lease entries from the keepalive actor.

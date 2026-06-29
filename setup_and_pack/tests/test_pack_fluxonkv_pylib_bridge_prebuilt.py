@@ -291,6 +291,25 @@ class BridgePrebuiltAuthorityMaterializationTest(unittest.TestCase):
         self.assertIn("pack_release_in_container.py", container_cmd)
         self.assertIn("--wheel-finalize-steps-json", container_cmd)
         self.assertNotIn("python3 - <<'PY'", container_cmd)
+        self.assertNotIn("FLUXON_PREPARE_BUILD_SKIP_EXISTING_VENDOR_RUNTIME=1", container_cmd)
+
+    def test_ensure_host_path_writable_chmods_existing_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            with mock.patch.object(
+                _PACKMOD,
+                "host_sudo_prefix",
+                return_value=["sudo", "-n"],
+            ), mock.patch.object(
+                _PACKMOD.subprocess,
+                "run",
+            ) as run_mock:
+                _PACKMOD._ensure_host_path_writable(path)
+
+        run_mock.assert_called_once_with(
+            ["sudo", "-n", "chmod", "777", str(path)],
+            check=True,
+        )
 
 
 if __name__ == "__main__":

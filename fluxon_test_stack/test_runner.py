@@ -158,6 +158,7 @@ CI_CLUSTER_RUNTIME_REMOTE_STAGE_INCLUDE_RELPATHS = (
 )
 CI_CLUSTER_RUNTIME_REMOTE_STAGE_VERIFY_RELPATHS = (
     "src/fluxon_py/runtime/start_master.py",
+    "src/fluxon_py/runtime/start_broker.py",
     "src/fluxon_py/runtime/start_owner_kvclient.py",
 )
 CI_RUNNER_REMOTE_STAGE_INCLUDE_RELPATHS = (

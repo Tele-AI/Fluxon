@@ -1,31 +1,33 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel as cbchan;
-use fluxon_mq::DeleteResult as CoreDeleteResult;
 use fluxon_mq::consumer::{
     ConsumedPayload as CoreConsumedPayload, MqPayload as CoreMqPayload,
     PayloadResult as CorePayloadResult,
 };
+use fluxon_mq::DeleteResult as CoreDeleteResult;
 use fluxon_mq::{
-    ChanManager, MpscConsumer as CoreMpscConsumer, MpscError as CoreMpscError,
-    MpscProducer as CoreMpscProducer, ShutdownCtl,
-    create::{ChanCreateConfig, create_mpsc_channel},
+    create::{create_mpsc_channel, ChanCreateConfig},
+    BrokerChannelConfig, BrokerHandle, ChanManager, MpscConsumer as CoreMpscConsumer,
+    MpscError as CoreMpscError, MpscProducer as CoreMpscProducer, ShutdownCtl,
 };
-use pyo3::Py;
-use pyo3::PyErr;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyString};
+use pyo3::Py;
+use pyo3::PyErr;
 use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
 // (no local payload buffering)
 
-use crate::flatdict_zerocopy::{FlatDictDataOwner, decode_flat_dict_to_wrapped_py_object};
+use crate::flatdict_zerocopy::{
+    attach_cleanup_to_flatdict_pyobject, decode_flat_dict_to_wrapped_py_object, FlatDictDataOwner,
+};
 use crate::lease_manager::PyLeaseBackendUid;
 use fluxon_kv::{Framework as KvFramework, KvClientTrait};
 use fluxon_mq::lease_manager::LeaseBackendUid;
-use fluxon_util::lease_manager::{GLOBAL_LM, LeaseManager};
+use fluxon_util::lease_manager::{LeaseManager, GLOBAL_LM};
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use tracing::{debug, warn};
 
@@ -33,9 +35,35 @@ use tracing::{debug, warn};
 // that implements the core MqPayload trait so we can downcast later.
 struct PyPayload {
     inner: PyObject,
+    cleanup_runtime: Handle,
 }
 
-impl CoreMqPayload for PyPayload {}
+impl CoreMqPayload for PyPayload {
+    fn attach_cleanup(
+        &mut self,
+        cleanup: fluxon_mq::consumer::PayloadCleanup,
+    ) -> Result<(), fluxon_mq::consumer::PayloadCleanup> {
+        let runtime = self.cleanup_runtime.clone();
+        let mut cleanup = Some(cleanup);
+        let attached = Python::with_gil(|py| {
+            attach_cleanup_to_flatdict_pyobject(py, &self.inner, || {
+                let cleanup = cleanup
+                    .take()
+                    .expect("cleanup must be present when DLPack attach is selected");
+                Box::new(move || {
+                    runtime.spawn(async move {
+                        cleanup().await;
+                    });
+                })
+            })
+        });
+        if attached {
+            Ok(())
+        } else {
+            Err(cleanup.expect("cleanup must remain present when attach fails"))
+        }
+    }
+}
 
 // Shared runtime for PyO3 helpers that are not lifecycle-governed by a KV Framework.
 // MQ producer/consumer operations should prefer the KV client's runtime/framework to
@@ -58,6 +86,59 @@ pub(crate) fn get_global_runtime() -> Arc<Runtime> {
     GLOBAL_RUNTIME
         .get_or_init(|| Arc::new(Runtime::new().expect("failed to create MPSC runtime")))
         .clone()
+}
+
+fn connect_distributed_broker(kv_framework: &Arc<KvFramework>) -> BrokerHandle {
+    BrokerHandle::new_distributed(
+        kv_framework.cluster_manager_view().clone(),
+        kv_framework.p2p_view().clone(),
+    )
+}
+
+fn init_broker_for_channel(
+    runtime: &Handle,
+    broker: &BrokerHandle,
+    channel_id: i64,
+    capacity: i64,
+) -> PyResult<()> {
+    use pyo3::exceptions::PyRuntimeError;
+
+    runtime
+        .run_async_from_sync(async move {
+            broker
+                .upsert_channel(BrokerChannelConfig {
+                    channel_id,
+                    capacity,
+                })
+                .await
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("broker runtime bridge failed: {}", e)))?
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to upsert broker channel config: chan_id={} capacity={} err={}",
+                channel_id, capacity, e
+            ))
+        })?;
+    Ok(())
+}
+
+fn delete_broker_channel(
+    runtime: &Handle,
+    broker: &BrokerHandle,
+    channel_id: i64,
+) -> PyResult<Vec<String>> {
+    use pyo3::exceptions::PyRuntimeError;
+
+    let payload_keys = runtime
+        .run_async_from_sync(async move { broker.delete_channel(channel_id).await })
+        .map_err(|e| PyRuntimeError::new_err(format!("broker runtime bridge failed: {}", e)))?
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to delete broker channel: chan_id={} err={}",
+                channel_id, e
+            ))
+        })?;
+    Ok(payload_keys)
 }
 
 fn get_consumed_message_class(py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -124,6 +205,120 @@ fn finalize_payload_result(
         );
     }
     result
+}
+
+fn map_producer_result(
+    py: Python<'_>,
+    result: Result<(), CoreMpscError>,
+    producer: &CoreMpscProducer,
+) -> PyResult<()> {
+    use crate::error::CoreMpscErrorReExport as CoreErr;
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => match e {
+            CoreErr::MessageBufferFull {
+                channel_id,
+                capacity,
+                ..
+            } => Err(crate::error::pyerr_message_buffer_full(
+                py,
+                &e.to_string(),
+                channel_id,
+                capacity,
+            )),
+            CoreErr::PutPayloadNonRetryable | CoreErr::PutPayloadUnknownCode { .. } => {
+                Err(crate::error::pyerr_chan_message_produce(
+                    py,
+                    &e.to_string(),
+                    producer.chan_id(),
+                    Some(&producer.producer_idx().to_string()),
+                    None,
+                ))
+            }
+            CoreErr::Etcd(_) => Err(crate::error::pyerr_etcd(py, &e.to_string(), "mpsc_rust")),
+            CoreErr::JoinError(_) => Err(crate::error::pyerr_join_error(
+                py,
+                &e.to_string(),
+                "mpsc_rust",
+            )),
+            CoreErr::Closed => Err(crate::error::pyerr_producer_closed(
+                py,
+                &e.to_string(),
+                producer.chan_id(),
+                Some(producer.producer_idx()),
+            )),
+            CoreErr::Internal(_) | CoreErr::NoMessage => Err(crate::error::pyerr_internal(
+                py,
+                &e.to_string(),
+                "mpsc_rust",
+            )),
+            _ => Err(crate::error::pyerr_internal(
+                py,
+                &e.to_string(),
+                "mpsc_rust",
+            )),
+        },
+    }
+}
+
+fn map_consumer_error(py: Python<'_>, err: CoreMpscError, chan_id: i64) -> PyErr {
+    use crate::error::CoreMpscErrorReExport as CoreErr;
+    let message = err.to_string();
+
+    match err {
+        CoreErr::NoMessage => crate::error::pyerr_message_consumption_no_new_message(
+            py, &message, chan_id, None, None,
+        ),
+        CoreErr::MessageBufferFull { capacity, .. } => {
+            crate::error::pyerr_message_buffer_full(py, &message, chan_id, capacity)
+        }
+        CoreErr::GetPayloadNonRetryable { .. }
+        | CoreErr::GetPayloadUnknownCode { .. }
+        | CoreErr::ConsumeOffsetUpdate { .. }
+        | CoreErr::DeletePayloadNonRetryable { .. }
+        | CoreErr::DeletePayloadUnknownCode { .. } => {
+            crate::error::pyerr_message_consumption(py, &message, chan_id, None, None)
+        }
+        CoreErr::PutPayloadNonRetryable | CoreErr::PutPayloadUnknownCode { .. } => {
+            crate::error::pyerr_chan_message_produce(py, &message, chan_id, None, None)
+        }
+        CoreErr::Etcd(_) => crate::error::pyerr_etcd(py, &message, "mpsc_rust"),
+        CoreErr::JoinError(_) => crate::error::pyerr_join_error(py, &message, "mpsc_rust"),
+        CoreErr::Internal(_) | CoreErr::Closed => {
+            crate::error::pyerr_internal(py, &message, "mpsc_rust")
+        }
+    }
+}
+
+fn consumed_payload_to_pyobject(
+    py: Python<'_>,
+    consumed: CoreConsumedPayload,
+) -> PyResult<(PyObject, u64)> {
+    use pyo3::exceptions::PyRuntimeError;
+
+    let CoreConsumedPayload { payload, .. } = consumed;
+    let pyobj = match payload.downcast::<PyPayload>() {
+        Ok(v) => v.inner,
+        Err(_) => {
+            return Err(PyRuntimeError::new_err(
+                "payload type mismatch: expected PyPayload",
+            ));
+        }
+    };
+
+    let payload_len: u64 = {
+        let any = pyobj.bind(py);
+        if any.is_instance_of::<PyBytes>() {
+            let b = any
+                .downcast::<PyBytes>()
+                .expect("PyBytes downcast failed after is_instance_of");
+            b.as_bytes().len() as u64
+        } else {
+            0
+        }
+    };
+    Ok((pyobj, payload_len))
 }
 
 // (LeaseManagerHandle and PyLease moved to lease_manager.rs)
@@ -307,6 +502,7 @@ impl MpscContext {
 
         Ok(MpscProducerHandle {
             inner: Some(producer),
+            broker: None,
             shutdown,
             kv_framework: self.kv_framework.clone(),
             kv_runtime: self.kv_runtime.clone(),
@@ -449,6 +645,7 @@ impl MpscContext {
 
         Ok(MpscConsumerHandle {
             inner: Some(consumer),
+            broker: None,
             shutdown,
             parent_mpmc_id_opt,
             kv_framework: self.kv_framework.clone(),
@@ -493,6 +690,11 @@ impl MpscContext {
             ))),
         }
     }
+
+    fn delete_broker_channel(&self, chan_id: i64) -> PyResult<Vec<String>> {
+        let broker = connect_distributed_broker(&self.kv_framework);
+        delete_broker_channel(&self.kv_runtime, &broker, chan_id)
+    }
 }
 
 /// PyO3 handle for MPSC producer. Currently this focuses on
@@ -501,6 +703,7 @@ impl MpscContext {
 #[pyclass]
 pub struct MpscProducerHandle {
     pub(crate) inner: Option<CoreMpscProducer>,
+    broker: Option<BrokerHandle>,
     shutdown: ShutdownCtl,
     kv_framework: Arc<KvFramework>,
     kv_runtime: Handle,
@@ -509,50 +712,18 @@ pub struct MpscProducerHandle {
     put_profile_window_bytes: u64,
 }
 
-#[pymethods]
+enum ProducerPutMode {
+    Etcd,
+    Broker { broker: BrokerHandle },
+}
+
 impl MpscProducerHandle {
-    fn chan_id(&self) -> i64 {
-        self.inner
-            .as_ref()
-            .expect("MpscProducerHandle inner not initialized or already taken by an in-flight put")
-            .chan_id()
-    }
-
-    fn producer_idx(&self) -> String {
-        self.inner
-            .as_ref()
-            .expect("MpscProducerHandle inner not initialized or already taken by an in-flight put")
-            .producer_idx()
-            .to_string()
-    }
-
-    fn payload_lease_id(&self) -> i64 {
-        self.inner
-            .as_ref()
-            .expect("MpscProducerHandle inner not initialized or already taken by an in-flight put")
-            .payload_lease_id()
-    }
-
-    /// Put a message payload into the underlying KV backend by passing raw ptr tuples.
-    ///
-    /// This avoids calling back into Python for kvclient.put and lets the KV backend
-    /// encode/copy directly into segment memory.
-    ///
-    /// `ptrs` is a list of `(type_id, dict_key_ptr, dict_key_len, val_u64, val_len, extra)`:
-    /// - `dict_key_ptr/dict_key_len`: UTF-8 bytes of the dict field key.
-    /// - For scalar types (bool/int64/float64), `val_u64` stores raw bits and `val_len` is fixed.
-    /// - For bytes-like types (string/bytes), `val_u64` stores a pointer and `val_len` is the byte length.
-    ///
-    /// Safety/lifetime contract:
-    /// - This is async on the Rust side; the caller must keep the memory behind pointers
-    ///   alive and immutable until this method returns.
-    #[pyo3(signature = (ptrs))]
-    fn put_flat_dict_ptrs(
+    fn put_flat_dict_ptrs_impl(
         &mut self,
         ptrs: Vec<(u8, u64, u32, u64, u32, Option<u32>)>,
+        mode: ProducerPutMode,
     ) -> PyResult<()> {
         use pyo3::exceptions::PyRuntimeError;
-        use std::sync::{Arc, Mutex};
 
         if self.shutdown.is_closed() {
             return Err(PyRuntimeError::new_err("MpscProducerHandle is closed"));
@@ -598,56 +769,79 @@ impl MpscProducerHandle {
         let (tx, rx) = cbchan::bounded::<(Result<(), CoreMpscError>, CoreMpscProducer)>(1);
 
         runtime.spawn(async move {
-            let mut guard = ProducerGuard::new(inner, tx);
+            let mut guard = ProducerGuard::new(inner, tx, ShutdownCtl::new());
             let payload_lease_id = guard.inner_mut().payload_lease_id() as u64;
-
-            let res = guard
-                .inner_mut()
-                .put_with_payload(move |key: String, _msg_id: i64, preferred_sub_cluster| {
-                    let mut o = fluxon_kv::client_kv_api::PutOptionalArgs::new();
-                    o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::LeaseId(
-                        payload_lease_id,
+            let put_payload: Arc<
+                dyn Fn(String, i64, Option<String>) -> i32 + Send + Sync + 'static,
+            > = Arc::new(move |key: String, _msg_id: i64, preferred_sub_cluster| {
+                let mut o = fluxon_kv::client_kv_api::PutOptionalArgs::new();
+                o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::LeaseId(
+                    payload_lease_id,
+                ));
+                if let Some(sc) = preferred_sub_cluster {
+                    o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::PreferredSubCluster(
+                        sc,
                     ));
-                    if let Some(sc) = preferred_sub_cluster {
-                        o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::PreferredSubCluster(
-                            sc,
-                        ));
-                    }
+                }
 
-                    let ptrs_for_call: Vec<(u8, usize, u32, u64, u32, Option<u32>)> =
-                        (*ptrs_arc).clone();
-                    let kv_framework_for_call = kv_framework.clone();
-                    let kv_runtime_for_call = kv_runtime.clone();
-                    let put_res = kv_runtime_for_call.run_async_from_sync(async move {
-                        unsafe { kv_framework_for_call.kv_put_ptrs(&key, ptrs_for_call, o).await }
-                    });
+                let ptrs_for_call: Vec<(u8, usize, u32, u64, u32, Option<u32>)> =
+                    (*ptrs_arc).clone();
+                let kv_framework_for_call = kv_framework.clone();
+                let kv_runtime_for_call = kv_runtime.clone();
+                let put_res = kv_runtime_for_call.run_async_from_sync(async move {
+                    unsafe { kv_framework_for_call.kv_put_ptrs(&key, ptrs_for_call, o).await }
+                });
 
-                    match put_res {
-                        Ok(Ok(())) => 0,
-                        Ok(Err(e)) => {
-                            if matches!(
-                                &e,
-                                fluxon_kv::rpcresp_kvresult_convert::msg_and_error::KvError::Api(
-                                    fluxon_kv::rpcresp_kvresult_convert::msg_and_error::ApiError::NoSpace { .. }
-                                )
-                            ) {
-                                1
-                            } else {
-                                if let Ok(mut g) = err_for_closure.lock() {
-                                    *g = Some(e.to_string());
-                                }
-                                2
-                            }
-                        }
-                        Err(e) => {
+                match put_res {
+                    Ok(Ok(())) => 0,
+                    Ok(Err(e)) => {
+                        if matches!(
+                            &e,
+                            fluxon_kv::rpcresp_kvresult_convert::msg_and_error::KvError::Api(
+                                fluxon_kv::rpcresp_kvresult_convert::msg_and_error::ApiError::NoSpace { .. }
+                            )
+                        ) {
+                            1
+                        } else {
                             if let Ok(mut g) = err_for_closure.lock() {
-                                *g = Some(format!("runtime bridge failed: {}", e));
+                                *g = Some(e.to_string());
                             }
                             2
                         }
                     }
-                })
-                .await;
+                    Err(e) => {
+                        if let Ok(mut g) = err_for_closure.lock() {
+                            *g = Some(format!("runtime bridge failed: {}", e));
+                        }
+                        2
+                    }
+                }
+            });
+
+            let res = match mode {
+                ProducerPutMode::Etcd => {
+                    let put_payload = put_payload.clone();
+                    guard
+                        .inner_mut()
+                        .put_with_payload(move |key, msg_id, preferred_sub_cluster| {
+                            (put_payload)(key, msg_id, preferred_sub_cluster)
+                        })
+                        .await
+                }
+                ProducerPutMode::Broker { broker } => {
+                    let put_payload = put_payload.clone();
+                    guard
+                        .inner_mut()
+                        .put_with_payload_via_broker(
+                            &broker,
+                            payload_len,
+                            move |key, msg_id, preferred_sub_cluster| {
+                                (put_payload)(key, msg_id, preferred_sub_cluster)
+                            },
+                        )
+                        .await
+                }
+            };
 
             guard.finish(res);
         });
@@ -658,8 +852,15 @@ impl MpscProducerHandle {
                     Ok(v) => break v,
                     Err(cbchan::RecvTimeoutError::Timeout) => {}
                     Err(cbchan::RecvTimeoutError::Disconnected) => {
+                        self.shutdown.close();
                         return (
-                            Err(PyRuntimeError::new_err("put_flat_dict_ptrs task cancelled")),
+                            Err(crate::error::pyerr_chan_message_produce(
+                                py,
+                                "producer is closed",
+                                self.chan_id(),
+                                Some(&self.producer_idx().to_string()),
+                                None,
+                            )),
                             None,
                         );
                     }
@@ -685,42 +886,10 @@ impl MpscProducerHandle {
                 }
             }
 
-            let mapped = match result {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    use crate::error::CoreMpscErrorReExport as CoreErr;
-                    match e {
-                        CoreErr::PutPayloadNonRetryable | CoreErr::PutPayloadUnknownCode { .. } => {
-                            Err(crate::error::pyerr_chan_message_produce(
-                                py,
-                                &e.to_string(),
-                                producer_back.chan_id(),
-                                Some(&producer_back.producer_idx().to_string()),
-                                None,
-                            ))
-                        }
-                        CoreErr::Etcd(_) => {
-                            Err(crate::error::pyerr_etcd(py, &e.to_string(), "mpsc_rust"))
-                        }
-                        CoreErr::JoinError(_) => Err(crate::error::pyerr_join_error(
-                            py,
-                            &e.to_string(),
-                            "mpsc_rust",
-                        )),
-                        CoreErr::Internal(_) => Err(crate::error::pyerr_internal(
-                            py,
-                            &e.to_string(),
-                            "mpsc_rust",
-                        )),
-                        _ => Err(crate::error::pyerr_internal(
-                            py,
-                            &e.to_string(),
-                            "mpsc_rust",
-                        )),
-                    }
-                }
-            };
-            (mapped, Some(producer_back))
+            (
+                map_producer_result(py, result, &producer_back),
+                Some(producer_back),
+            )
         });
 
         if let Some(back) = maybe_back {
@@ -742,6 +911,71 @@ impl MpscProducerHandle {
         }
 
         mapped
+    }
+}
+
+#[pymethods]
+impl MpscProducerHandle {
+    fn chan_id(&self) -> i64 {
+        self.inner
+            .as_ref()
+            .expect("MpscProducerHandle inner not initialized or already taken by an in-flight put")
+            .chan_id()
+    }
+
+    fn producer_idx(&self) -> String {
+        self.inner
+            .as_ref()
+            .expect("MpscProducerHandle inner not initialized or already taken by an in-flight put")
+            .producer_idx()
+            .to_string()
+    }
+
+    fn payload_lease_id(&self) -> i64 {
+        self.inner
+            .as_ref()
+            .expect("MpscProducerHandle inner not initialized or already taken by an in-flight put")
+            .payload_lease_id()
+    }
+
+    #[pyo3(signature = (ptrs))]
+    fn put_flat_dict_ptrs(
+        &mut self,
+        ptrs: Vec<(u8, u64, u32, u64, u32, Option<u32>)>,
+    ) -> PyResult<()> {
+        use pyo3::exceptions::PyRuntimeError;
+
+        let broker = self
+            .broker
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("broker is not initialized"))?;
+        self.put_flat_dict_ptrs_impl(ptrs, ProducerPutMode::Broker { broker })
+    }
+
+    #[pyo3(signature = (ptrs))]
+    fn put_flat_dict_ptrs_legacy_for_internal_check(
+        &mut self,
+        ptrs: Vec<(u8, u64, u32, u64, u32, Option<u32>)>,
+    ) -> PyResult<()> {
+        self.put_flat_dict_ptrs_impl(ptrs, ProducerPutMode::Etcd)
+    }
+
+    fn init_broker(&mut self) -> PyResult<()> {
+        use pyo3::exceptions::PyRuntimeError;
+
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("MpscProducerHandle inner not initialized"))?;
+        let broker = connect_distributed_broker(&self.kv_framework);
+        init_broker_for_channel(
+            &self.kv_runtime,
+            &broker,
+            inner.chan_id(),
+            inner.channel_capacity(),
+        )?;
+        self.broker = Some(broker);
+        Ok(())
     }
 
     // Removed: the legacy `put_with_payload(callback)` API was intentionally deleted to
@@ -797,6 +1031,7 @@ impl PyShutdownCtl {
 #[pyclass]
 pub struct MpscConsumerHandle {
     pub(crate) inner: Option<CoreMpscConsumer>,
+    broker: Option<BrokerHandle>,
     shutdown: ShutdownCtl,
     /// Optional parent MPMC id when this MPSC acts as a submodule of a MPMC channel.
     /// Only used for diagnostics (rate-limited retry logging) and not for behavior.
@@ -829,6 +1064,382 @@ pub struct MpscConsumerHandle {
     get_one_profile_last_timeout_ms: Option<i64>,
 }
 
+enum ConsumerGetMode {
+    Prefetch {
+        prefetch_target: usize,
+        timeout_ms: Option<i64>,
+        maybe_sync_sub_cluster: Option<Option<String>>,
+    },
+    Broker {
+        broker: BrokerHandle,
+        timeout_ms: Option<i64>,
+    },
+}
+
+impl MpscConsumerHandle {
+    fn get_one_impl(
+        &mut self,
+        py: Python<'_>,
+        mode: ConsumerGetMode,
+        profile_prefetch_target: usize,
+        profile_timeout_ms: Option<i64>,
+    ) -> PyResult<PyObject> {
+        use pyo3::exceptions::PyRuntimeError;
+        use std::time::Duration;
+        let get_one_begin = std::time::Instant::now();
+        let chan_id_for_profile = self.chan_id();
+        let consumer_idx_for_profile = self.consumer_idx();
+        self.get_one_profile_last_prefetch_target = profile_prefetch_target;
+        self.get_one_profile_last_timeout_ms = profile_timeout_ms;
+        if self.shutdown.is_closed() {
+            return Err(crate::error::pyerr_channel_closed(
+                py,
+                "consumer is closed",
+                self.chan_id(),
+            ));
+        }
+
+        let runtime = self.kv_runtime.clone();
+
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("MpscConsumerHandle is already in use"))?;
+
+        let (tx, rx) =
+            cbchan::bounded::<(Result<CoreConsumedPayload, CoreMpscError>, CoreMpscConsumer)>(1);
+
+        runtime.spawn(async move {
+            let mut guard = ConsumerGuard::new(inner, tx, ShutdownCtl::new());
+            let (chan_id_for_log, consumer_idx_for_log) = {
+                let inner_ref = guard.inner_mut();
+                (inner_ref.chan_id(), inner_ref.consumer_idx().to_string())
+            };
+            let res = match mode {
+                ConsumerGetMode::Prefetch {
+                    prefetch_target,
+                    timeout_ms,
+                    maybe_sync_sub_cluster,
+                } => {
+                    if let Some(sc) = maybe_sync_sub_cluster {
+                        if let Err(e) = guard.inner_mut().sync_kvclient_sub_cluster(sc.clone()).await
+                        {
+                            warn!(
+                                "[MpscConsumer chan_id={} consumer_idx={}] failed to sync kvclient_sub_cluster={:?}: {}; continuing consumption",
+                                chan_id_for_log, consumer_idx_for_log, sc, e
+                            );
+                        }
+                    }
+                    if let Some(ms) = timeout_ms {
+                        guard
+                            .inner_mut()
+                            .get_with_payload_retry_wait_timeout(
+                                prefetch_target,
+                                Duration::from_millis(ms as u64),
+                            )
+                            .await
+                    } else {
+                        guard
+                            .inner_mut()
+                            .get_with_payload_retry(prefetch_target)
+                            .await
+                    }
+                }
+                ConsumerGetMode::Broker { broker, timeout_ms } => {
+                    let fut = guard.inner_mut().get_with_payload_via_broker(&broker);
+                    if let Some(ms) = timeout_ms {
+                        match tokio::time::timeout(Duration::from_millis(ms as u64), fut).await {
+                            Ok(result) => result,
+                            Err(_) => Err(CoreMpscError::NoMessage),
+                        }
+                    } else {
+                        fut.await
+                    }
+                }
+            };
+            match &res {
+                Ok(payload) => {
+                    debug!(
+                        "[MpscConsumerHandle chan_id={} consumer_idx={}] async get finished: producer_id={} nonblocking_hit={}",
+                        chan_id_for_log,
+                        consumer_idx_for_log,
+                        payload.producer_id,
+                        payload.nonblocking_hit,
+                    );
+                }
+                Err(err) => {
+                    debug!(
+                        "[MpscConsumerHandle chan_id={} consumer_idx={}] async get finished with error: {:?}",
+                        chan_id_for_log,
+                        consumer_idx_for_log,
+                        err,
+                    );
+                }
+            }
+            guard.finish(res);
+        });
+
+        let mut wait_rx_ns: u64 = 0;
+        let mut wait_rx_max_ns: u64 = 0;
+        let mut signal_ns: u64 = 0;
+        let mut signal_max_ns: u64 = 0;
+        let mut recv_timeouts: u64 = 0;
+        let mut recv_calls: u64 = 0;
+        let wait_begin = Instant::now();
+        let mut next_pending_warn_at = wait_begin + GET_ONE_PENDING_WARN_INTERVAL;
+
+        let (result, consumer_back) = loop {
+            recv_calls += 1;
+            let recv_begin = Instant::now();
+            let recv_res = py.allow_threads(|| rx.recv_timeout(Duration::from_millis(50)));
+            let recv_elapsed_ns = recv_begin.elapsed().as_nanos() as u64;
+            wait_rx_ns += recv_elapsed_ns;
+            if recv_elapsed_ns > wait_rx_max_ns {
+                wait_rx_max_ns = recv_elapsed_ns;
+            }
+
+            match recv_res {
+                Ok(v) => break v,
+                Err(cbchan::RecvTimeoutError::Timeout) => {
+                    recv_timeouts += 1;
+                    let now = Instant::now();
+                    if now >= next_pending_warn_at {
+                        warn!(
+                            "[MpscConsumerHandle chan_id={} consumer_idx={}] get_one still pending: elapsed_ms={} recv_calls={} recv_timeouts={} prefetch_target={} timeout_ms={:?}",
+                            chan_id_for_profile,
+                            consumer_idx_for_profile,
+                            wait_begin.elapsed().as_millis(),
+                            recv_calls,
+                            recv_timeouts,
+                            profile_prefetch_target,
+                            profile_timeout_ms,
+                        );
+                        next_pending_warn_at = now + GET_ONE_PENDING_WARN_INTERVAL;
+                    }
+                }
+                Err(cbchan::RecvTimeoutError::Disconnected) => {
+                    return Err(PyRuntimeError::new_err("get_one task cancelled"));
+                }
+            }
+
+            let signal_begin = Instant::now();
+            let signal_res = py.check_signals();
+            let signal_elapsed_ns = signal_begin.elapsed().as_nanos() as u64;
+            signal_ns += signal_elapsed_ns;
+            if signal_elapsed_ns > signal_max_ns {
+                signal_max_ns = signal_elapsed_ns;
+            }
+
+            if let Err(e) = signal_res {
+                self.shutdown.close();
+                return Err(e);
+            }
+        };
+
+        let post_begin = Instant::now();
+        self.inner = Some(consumer_back);
+
+        let consumed = match result {
+            Ok(v) => v,
+            Err(e) => return Err(map_consumer_error(py, e, self.chan_id())),
+        };
+        let (pyobj, payload_len) = consumed_payload_to_pyobject(py, consumed)?;
+
+        let get_one_total = get_one_begin.elapsed();
+        let total_ns = get_one_total.as_nanos() as u64;
+        let post_ns = post_begin.elapsed().as_nanos() as u64;
+
+        self.get_one_profile_cnt += 1;
+        self.get_one_profile_window_bytes += payload_len;
+        self.get_one_profile_total_sum_ns += total_ns;
+        if total_ns > self.get_one_profile_total_max_ns {
+            self.get_one_profile_total_max_ns = total_ns;
+        }
+        self.get_one_profile_wait_rx_sum_ns += wait_rx_ns;
+        if wait_rx_max_ns > self.get_one_profile_wait_rx_max_ns {
+            self.get_one_profile_wait_rx_max_ns = wait_rx_max_ns;
+        }
+        self.get_one_profile_signal_sum_ns += signal_ns;
+        if signal_max_ns > self.get_one_profile_signal_max_ns {
+            self.get_one_profile_signal_max_ns = signal_max_ns;
+        }
+        self.get_one_profile_post_sum_ns += post_ns;
+        if post_ns > self.get_one_profile_post_max_ns {
+            self.get_one_profile_post_max_ns = post_ns;
+        }
+        self.get_one_profile_recv_timeouts += recv_timeouts;
+        self.get_one_profile_recv_calls += recv_calls;
+
+        let now = Instant::now();
+        if now >= self.get_one_profile_next_log_at && self.get_one_profile_cnt > 0 {
+            let cnt = self.get_one_profile_cnt;
+            let avg_total_ms =
+                (self.get_one_profile_total_sum_ns as f64) / (cnt as f64) / 1_000_000.0;
+            let avg_wait_rx_ms =
+                (self.get_one_profile_wait_rx_sum_ns as f64) / (cnt as f64) / 1_000_000.0;
+            let avg_signal_ms =
+                (self.get_one_profile_signal_sum_ns as f64) / (cnt as f64) / 1_000_000.0;
+            let avg_post_ms =
+                (self.get_one_profile_post_sum_ns as f64) / (cnt as f64) / 1_000_000.0;
+            let max_total_ms = (self.get_one_profile_total_max_ns as f64) / 1_000_000.0;
+            let max_wait_rx_ms = (self.get_one_profile_wait_rx_max_ns as f64) / 1_000_000.0;
+            let max_signal_ms = (self.get_one_profile_signal_max_ns as f64) / 1_000_000.0;
+            let max_post_ms = (self.get_one_profile_post_max_ns as f64) / 1_000_000.0;
+
+            tracing::info!(
+                "[MpscConsumerHandle chan_id={} consumer_idx={}] get_one breakdown: avg_total_ms={:.3} max_total_ms={:.3} avg_wait_rx_ms={:.3} max_wait_rx_ms={:.3} avg_signal_ms={:.3} max_signal_ms={:.3} avg_post_ms={:.3} max_post_ms={:.3} cnt={} recv_calls={} recv_timeouts={} last_prefetch_target={} last_timeout_ms={:?}",
+                chan_id_for_profile,
+                consumer_idx_for_profile,
+                avg_total_ms,
+                max_total_ms,
+                avg_wait_rx_ms,
+                max_wait_rx_ms,
+                avg_signal_ms,
+                max_signal_ms,
+                avg_post_ms,
+                max_post_ms,
+                cnt,
+                self.get_one_profile_recv_calls,
+                self.get_one_profile_recv_timeouts,
+                self.get_one_profile_last_prefetch_target,
+                self.get_one_profile_last_timeout_ms,
+            );
+
+            self.inner
+                .as_ref()
+                .expect("MpscConsumerHandle inner not initialized")
+                .observe_get_one_breakdown_window_ms(
+                    avg_total_ms,
+                    max_total_ms,
+                    avg_wait_rx_ms,
+                    max_wait_rx_ms,
+                    avg_signal_ms,
+                    max_signal_ms,
+                    avg_post_ms,
+                    max_post_ms,
+                    cnt,
+                    self.get_one_profile_recv_timeouts,
+                    self.get_one_profile_window_bytes,
+                );
+
+            self.get_one_profile_next_log_at = now + Duration::from_secs(30);
+            self.get_one_profile_cnt = 0;
+            self.get_one_profile_total_sum_ns = 0;
+            self.get_one_profile_total_max_ns = 0;
+            self.get_one_profile_wait_rx_sum_ns = 0;
+            self.get_one_profile_wait_rx_max_ns = 0;
+            self.get_one_profile_signal_sum_ns = 0;
+            self.get_one_profile_signal_max_ns = 0;
+            self.get_one_profile_post_sum_ns = 0;
+            self.get_one_profile_post_max_ns = 0;
+            self.get_one_profile_recv_timeouts = 0;
+            self.get_one_profile_recv_calls = 0;
+            self.get_one_profile_window_bytes = 0;
+        }
+        Ok(pyobj)
+    }
+
+    fn get_batch_via_broker_impl(
+        &mut self,
+        py: Python<'_>,
+        broker: BrokerHandle,
+        batch_size: usize,
+        timeout_ms: Option<i64>,
+    ) -> PyResult<Vec<PyObject>> {
+        use pyo3::exceptions::PyRuntimeError;
+
+        if self.shutdown.is_closed() {
+            return Err(crate::error::pyerr_channel_closed(
+                py,
+                "consumer is closed",
+                self.chan_id(),
+            ));
+        }
+
+        let chan_id_for_log = self.chan_id();
+        let consumer_idx_for_log = self.consumer_idx();
+        let runtime = self.kv_runtime.clone();
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("MpscConsumerHandle is already in use"))?;
+        let (tx, rx) = cbchan::bounded::<(
+            Result<Vec<CoreConsumedPayload>, CoreMpscError>,
+            CoreMpscConsumer,
+        )>(1);
+
+        runtime.spawn(async move {
+            let mut guard = BatchConsumerGuard::new(inner, tx, ShutdownCtl::new());
+            let res = {
+                let fut = guard
+                    .inner_mut()
+                    .get_batch_with_payload_via_broker(&broker, batch_size);
+                if let Some(ms) = timeout_ms {
+                    match tokio::time::timeout(Duration::from_millis(ms as u64), fut).await {
+                        Ok(result) => result,
+                        Err(_) => Err(CoreMpscError::NoMessage),
+                    }
+                } else {
+                    fut.await
+                }
+            };
+            guard.finish(res);
+        });
+
+        let wait_begin = Instant::now();
+        let mut next_pending_warn_at = wait_begin + GET_ONE_PENDING_WARN_INTERVAL;
+        let mut recv_calls: u64 = 0;
+        let mut recv_timeouts: u64 = 0;
+
+        let (result, consumer_back) = loop {
+            recv_calls += 1;
+            let recv_res = py.allow_threads(|| rx.recv_timeout(Duration::from_millis(50)));
+            match recv_res {
+                Ok(v) => break v,
+                Err(cbchan::RecvTimeoutError::Timeout) => {
+                    recv_timeouts += 1;
+                    let now = Instant::now();
+                    if now >= next_pending_warn_at {
+                        warn!(
+                            "[MpscConsumerHandle chan_id={} consumer_idx={}] get_batch still pending: elapsed_ms={} recv_calls={} recv_timeouts={} batch_size={} timeout_ms={:?}",
+                            chan_id_for_log,
+                            consumer_idx_for_log,
+                            wait_begin.elapsed().as_millis(),
+                            recv_calls,
+                            recv_timeouts,
+                            batch_size,
+                            timeout_ms,
+                        );
+                        next_pending_warn_at = now + GET_ONE_PENDING_WARN_INTERVAL;
+                    }
+                }
+                Err(cbchan::RecvTimeoutError::Disconnected) => {
+                    return Err(PyRuntimeError::new_err("get_batch task cancelled"));
+                }
+            }
+
+            if let Err(e) = py.check_signals() {
+                self.shutdown.close();
+                return Err(e);
+            }
+        };
+
+        self.inner = Some(consumer_back);
+        let payloads = match result {
+            Ok(v) => v,
+            Err(e) => return Err(map_consumer_error(py, e, chan_id_for_log)),
+        };
+
+        let mut objects = Vec::with_capacity(payloads.len());
+        for consumed in payloads {
+            let (pyobj, payload_len) = consumed_payload_to_pyobject(py, consumed)?;
+            self.get_one_profile_window_bytes += payload_len;
+            objects.push(pyobj);
+        }
+        Ok(objects)
+    }
+}
+
 #[pymethods]
 impl MpscConsumerHandle {
     fn chan_id(&self) -> i64 {
@@ -856,6 +1467,7 @@ impl MpscConsumerHandle {
         use std::sync::Arc;
 
         let cb: Arc<PyObject> = Arc::new(callback);
+        let kv_runtime = self.kv_runtime.clone();
 
         // Capture identifiers for rate-limited retry logging (diagnostic only).
         let mpsc_id_for_log = self.chan_id();
@@ -866,6 +1478,7 @@ impl MpscConsumerHandle {
         let bridge_cb: fluxon_mq::consumer::PayloadCallback = Arc::new(
             move |producer_id: String, key: String| {
                 let cb_for_call = cb.clone();
+                let kv_runtime_for_call = kv_runtime.clone();
                 Box::pin(async move {
                     let producer_id_for_call = producer_id.clone();
                     let key_for_call = key.clone();
@@ -921,6 +1534,7 @@ impl MpscConsumerHandle {
                                     } else {
                                         CorePayloadResult::Ok(Box::new(PyPayload {
                                             inner: obj.clone_ref(py),
+                                            cleanup_runtime: kv_runtime_for_call.clone(),
                                         }))
                                     }
                                 })
@@ -1129,8 +1743,10 @@ impl MpscConsumerHandle {
                     let py_wrap_begin = Instant::now();
                     stage.store(3, Ordering::Relaxed);
                     let payload_owner = match &holder {
-                        KvHolder::Owner(h) => FlatDictDataOwner::UserMemHolder(h.clone()),
-                        KvHolder::External(h) => FlatDictDataOwner::ExternalMemHolder(h.clone()),
+                        KvHolder::Owner(h) => FlatDictDataOwner::from_user_memholder(h.clone()),
+                        KvHolder::External(h) => {
+                            FlatDictDataOwner::from_external_memholder(h.clone())
+                        }
                     };
                     let pyobj_res: Result<PyObject, String> = Python::with_gil(|py| {
                         stage_for_py.store(4, Ordering::Relaxed);
@@ -1159,7 +1775,10 @@ impl MpscConsumerHandle {
 
                     match pyobj_res {
                         Ok(obj) => finalize_payload_result(
-                            CorePayloadResult::Ok(Box::new(PyPayload { inner: obj })),
+                            CorePayloadResult::Ok(Box::new(PyPayload {
+                                inner: obj,
+                                cleanup_runtime: kv_runtime_for_call.clone(),
+                            })),
                             &stage,
                             &done,
                             payload_begin,
@@ -1216,16 +1835,45 @@ impl MpscConsumerHandle {
         timeout_ms: Option<i64>,
     ) -> PyResult<PyObject> {
         use pyo3::exceptions::PyRuntimeError;
-        use std::time::Duration;
-        let get_one_begin = std::time::Instant::now();
-        let chan_id_for_profile = self.chan_id();
-        let consumer_idx_for_profile = self.consumer_idx();
-        self.get_one_profile_last_prefetch_target = prefetch_target;
-        self.get_one_profile_last_timeout_ms = timeout_ms;
-        if self.shutdown.is_closed() {
-            return Err(PyRuntimeError::new_err("MpscConsumerHandle is closed"));
-        }
 
+        let _ = prefetch_target;
+        let broker = self
+            .broker
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("broker is not initialized"))?;
+        self.get_one_impl(
+            py,
+            ConsumerGetMode::Broker { broker, timeout_ms },
+            0,
+            timeout_ms,
+        )
+    }
+
+    #[pyo3(signature = (batch_size, prefetch_target, timeout_ms=None))]
+    fn get_batch(
+        &mut self,
+        py: Python<'_>,
+        batch_size: usize,
+        prefetch_target: usize,
+        timeout_ms: Option<i64>,
+    ) -> PyResult<Vec<PyObject>> {
+        use pyo3::exceptions::PyRuntimeError;
+
+        let _ = prefetch_target;
+        let broker = self
+            .broker
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("broker is not initialized"))?;
+        self.get_batch_via_broker_impl(py, broker, batch_size, timeout_ms)
+    }
+
+    #[pyo3(signature = (prefetch_target, timeout_ms=None))]
+    fn get_one_legacy_for_internal_check(
+        &mut self,
+        py: Python<'_>,
+        prefetch_target: usize,
+        timeout_ms: Option<i64>,
+    ) -> PyResult<PyObject> {
         let maybe_sync_sub_cluster = {
             let now = Instant::now();
             if now >= self.next_sub_cluster_sync_at {
@@ -1242,293 +1890,34 @@ impl MpscConsumerHandle {
                 None
             }
         };
+        self.get_one_impl(
+            py,
+            ConsumerGetMode::Prefetch {
+                prefetch_target,
+                timeout_ms,
+                maybe_sync_sub_cluster,
+            },
+            prefetch_target,
+            timeout_ms,
+        )
+    }
 
-        let runtime = self.kv_runtime.clone();
+    fn init_broker(&mut self) -> PyResult<()> {
+        use pyo3::exceptions::PyRuntimeError;
 
         let inner = self
             .inner
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("MpscConsumerHandle is already in use"))?;
-
-        let (tx, rx) =
-            cbchan::bounded::<(Result<CoreConsumedPayload, CoreMpscError>, CoreMpscConsumer)>(1);
-
-        runtime.spawn(async move {
-            let mut guard = ConsumerGuard::new(inner, tx);
-            let (chan_id_for_log, consumer_idx_for_log) = {
-                let inner_ref = guard.inner_mut();
-                (inner_ref.chan_id(), inner_ref.consumer_idx().to_string())
-            };
-            if let Some(sc) = maybe_sync_sub_cluster {
-                if let Err(e) = guard.inner_mut().sync_kvclient_sub_cluster(sc.clone()).await {
-                    warn!(
-                        "[MpscConsumer chan_id={} consumer_idx={}] failed to sync kvclient_sub_cluster={:?}: {}; continuing consumption",
-                        chan_id_for_log, consumer_idx_for_log, sc, e
-                    );
-                }
-            }
-            let res = if let Some(ms) = timeout_ms {
-                guard
-                    .inner_mut()
-                    .get_with_payload_retry_wait_timeout(prefetch_target, Duration::from_millis(ms as u64))
-                    .await
-            } else {
-                guard.inner_mut().get_with_payload_retry(prefetch_target).await
-            };
-            match &res {
-                Ok(payload) => {
-                    debug!(
-                        "[MpscConsumerHandle chan_id={} consumer_idx={}] async get finished: producer_id={} nonblocking_hit={}",
-                        chan_id_for_log,
-                        consumer_idx_for_log,
-                        payload.producer_id,
-                        payload.nonblocking_hit,
-                    );
-                }
-                Err(err) => {
-                    debug!(
-                        "[MpscConsumerHandle chan_id={} consumer_idx={}] async get finished with error: {:?}",
-                        chan_id_for_log,
-                        consumer_idx_for_log,
-                        err,
-                    );
-                }
-            }
-            guard.finish(res);
-        });
-
-        let mut wait_rx_ns: u64 = 0;
-        let mut wait_rx_max_ns: u64 = 0;
-        let mut signal_ns: u64 = 0;
-        let mut signal_max_ns: u64 = 0;
-        let mut recv_timeouts: u64 = 0;
-        let mut recv_calls: u64 = 0;
-        let wait_begin = Instant::now();
-        let mut next_pending_warn_at = wait_begin + GET_ONE_PENDING_WARN_INTERVAL;
-
-        let (result, consumer_back) = loop {
-            recv_calls += 1;
-            let recv_begin = Instant::now();
-            let recv_res = py.allow_threads(|| rx.recv_timeout(Duration::from_millis(50)));
-            let recv_elapsed_ns = recv_begin.elapsed().as_nanos() as u64;
-            wait_rx_ns += recv_elapsed_ns;
-            if recv_elapsed_ns > wait_rx_max_ns {
-                wait_rx_max_ns = recv_elapsed_ns;
-            }
-
-            match recv_res {
-                Ok(v) => break v,
-                Err(cbchan::RecvTimeoutError::Timeout) => {
-                    recv_timeouts += 1;
-                    let now = Instant::now();
-                    if now >= next_pending_warn_at {
-                        warn!(
-                            "[MpscConsumerHandle chan_id={} consumer_idx={}] get_one still pending: elapsed_ms={} recv_calls={} recv_timeouts={} prefetch_target={} timeout_ms={:?}",
-                            chan_id_for_profile,
-                            consumer_idx_for_profile,
-                            wait_begin.elapsed().as_millis(),
-                            recv_calls,
-                            recv_timeouts,
-                            prefetch_target,
-                            timeout_ms,
-                        );
-                        next_pending_warn_at = now + GET_ONE_PENDING_WARN_INTERVAL;
-                    }
-                }
-                Err(cbchan::RecvTimeoutError::Disconnected) => {
-                    return Err(PyRuntimeError::new_err("get_one task cancelled"));
-                }
-            }
-
-            let signal_begin = Instant::now();
-            let signal_res = py.check_signals();
-            let signal_elapsed_ns = signal_begin.elapsed().as_nanos() as u64;
-            signal_ns += signal_elapsed_ns;
-            if signal_elapsed_ns > signal_max_ns {
-                signal_max_ns = signal_elapsed_ns;
-            }
-
-            if let Err(e) = signal_res {
-                self.shutdown.close();
-                return Err(e);
-            }
-        };
-
-        let post_begin = Instant::now();
-        self.inner = Some(consumer_back);
-
-        let consumed = match result {
-            Ok(v) => v,
-            Err(e) => {
-                use crate::error::CoreMpscErrorReExport as CoreErr;
-                return Err(match e {
-                    CoreErr::NoMessage => crate::error::pyerr_message_consumption_no_new_message(
-                        py,
-                        &e.to_string(),
-                        self.chan_id(),
-                        None,
-                        None,
-                    ),
-                    CoreErr::GetPayloadNonRetryable { .. }
-                    | CoreErr::GetPayloadUnknownCode { .. }
-                    | CoreErr::ConsumeOffsetUpdate { .. }
-                    | CoreErr::DeletePayloadNonRetryable { .. }
-                    | CoreErr::DeletePayloadUnknownCode { .. } => {
-                        crate::error::pyerr_message_consumption(
-                            py,
-                            &e.to_string(),
-                            self.chan_id(),
-                            None,
-                            None,
-                        )
-                    }
-                    CoreErr::PutPayloadNonRetryable | CoreErr::PutPayloadUnknownCode { .. } => {
-                        crate::error::pyerr_chan_message_produce(
-                            py,
-                            &e.to_string(),
-                            self.chan_id(),
-                            None,
-                            None,
-                        )
-                    }
-                    CoreErr::Etcd(_) => crate::error::pyerr_etcd(py, &e.to_string(), "mpsc_rust"),
-                    CoreErr::JoinError(_) => {
-                        crate::error::pyerr_join_error(py, &e.to_string(), "mpsc_rust")
-                    }
-                    CoreErr::Internal(_) => {
-                        crate::error::pyerr_internal(py, &e.to_string(), "mpsc_rust")
-                    }
-                });
-            }
-        };
-        // Downcast to PyPayload and extract the PyObject
-        let CoreConsumedPayload { payload, .. } = consumed;
-        let pyobj = match payload.downcast::<PyPayload>() {
-            Ok(v) => v.inner,
-            Err(_) => {
-                return Err(PyRuntimeError::new_err(
-                    "payload type mismatch: expected PyPayload",
-                ));
-            }
-        };
-
-        // English note:
-        // - MQ payload is expected to be bytes in the common path.
-        // - If payload is not a `bytes` object, we skip size accounting to avoid guessing.
-        let payload_len: u64 = {
-            let any = pyobj.bind(py);
-            if any.is_instance_of::<PyBytes>() {
-                let b = any
-                    .downcast::<PyBytes>()
-                    .expect("PyBytes downcast failed after is_instance_of");
-                b.as_bytes().len() as u64
-            } else {
-                0
-            }
-        };
-
-        let get_one_total = get_one_begin.elapsed();
-        let total_ns = get_one_total.as_nanos() as u64;
-        let post_ns = post_begin.elapsed().as_nanos() as u64;
-
-        self.get_one_profile_cnt += 1;
-        self.get_one_profile_window_bytes += payload_len;
-        self.get_one_profile_total_sum_ns += total_ns;
-        if total_ns > self.get_one_profile_total_max_ns {
-            self.get_one_profile_total_max_ns = total_ns;
-        }
-        self.get_one_profile_wait_rx_sum_ns += wait_rx_ns;
-        if wait_rx_max_ns > self.get_one_profile_wait_rx_max_ns {
-            self.get_one_profile_wait_rx_max_ns = wait_rx_max_ns;
-        }
-        self.get_one_profile_signal_sum_ns += signal_ns;
-        if signal_max_ns > self.get_one_profile_signal_max_ns {
-            self.get_one_profile_signal_max_ns = signal_max_ns;
-        }
-        self.get_one_profile_post_sum_ns += post_ns;
-        if post_ns > self.get_one_profile_post_max_ns {
-            self.get_one_profile_post_max_ns = post_ns;
-        }
-        self.get_one_profile_recv_timeouts += recv_timeouts;
-        self.get_one_profile_recv_calls += recv_calls;
-
-        let now = Instant::now();
-        if now >= self.get_one_profile_next_log_at && self.get_one_profile_cnt > 0 {
-            let cnt = self.get_one_profile_cnt;
-            let avg_total_ms =
-                (self.get_one_profile_total_sum_ns as f64) / (cnt as f64) / 1_000_000.0;
-            let avg_wait_rx_ms =
-                (self.get_one_profile_wait_rx_sum_ns as f64) / (cnt as f64) / 1_000_000.0;
-            let avg_signal_ms =
-                (self.get_one_profile_signal_sum_ns as f64) / (cnt as f64) / 1_000_000.0;
-            let avg_post_ms =
-                (self.get_one_profile_post_sum_ns as f64) / (cnt as f64) / 1_000_000.0;
-            let max_total_ms = (self.get_one_profile_total_max_ns as f64) / 1_000_000.0;
-            let max_wait_rx_ms = (self.get_one_profile_wait_rx_max_ns as f64) / 1_000_000.0;
-            let max_signal_ms = (self.get_one_profile_signal_max_ns as f64) / 1_000_000.0;
-            let max_post_ms = (self.get_one_profile_post_max_ns as f64) / 1_000_000.0;
-
-            tracing::info!(
-                "[MpscConsumerHandle chan_id={} consumer_idx={}] get_one breakdown: \
-avg_total_ms={:.3} max_total_ms={:.3} \
-avg_wait_rx_ms={:.3} max_wait_rx_ms={:.3} \
-avg_signal_ms={:.3} max_signal_ms={:.3} \
-avg_post_ms={:.3} max_post_ms={:.3} \
-cnt={} recv_calls={} recv_timeouts={} last_prefetch_target={} last_timeout_ms={:?}",
-                chan_id_for_profile,
-                consumer_idx_for_profile,
-                avg_total_ms,
-                max_total_ms,
-                avg_wait_rx_ms,
-                max_wait_rx_ms,
-                avg_signal_ms,
-                max_signal_ms,
-                avg_post_ms,
-                max_post_ms,
-                cnt,
-                self.get_one_profile_recv_calls,
-                self.get_one_profile_recv_timeouts,
-                self.get_one_profile_last_prefetch_target,
-                self.get_one_profile_last_timeout_ms,
-            );
-
-            self.inner
-                .as_ref()
-                .expect("MpscConsumerHandle inner not initialized")
-                .observe_get_one_breakdown_window_ms(
-                    avg_total_ms,
-                    max_total_ms,
-                    avg_wait_rx_ms,
-                    max_wait_rx_ms,
-                    avg_signal_ms,
-                    max_signal_ms,
-                    avg_post_ms,
-                    max_post_ms,
-                    cnt,
-                    self.get_one_profile_recv_timeouts,
-                    self.get_one_profile_window_bytes,
-                );
-
-            self.get_one_profile_next_log_at = now + Duration::from_secs(30);
-            self.get_one_profile_cnt = 0;
-            self.get_one_profile_total_sum_ns = 0;
-            self.get_one_profile_total_max_ns = 0;
-            self.get_one_profile_wait_rx_sum_ns = 0;
-            self.get_one_profile_wait_rx_max_ns = 0;
-            self.get_one_profile_signal_sum_ns = 0;
-            self.get_one_profile_signal_max_ns = 0;
-            self.get_one_profile_post_sum_ns = 0;
-            self.get_one_profile_post_max_ns = 0;
-            self.get_one_profile_recv_timeouts = 0;
-            self.get_one_profile_recv_calls = 0;
-            self.get_one_profile_window_bytes = 0;
-        }
-        // println!(
-        //     "[MpscConsumer chan_id={}] get_one total duration: {:?}",
-        //     self.chan_id(),
-        //     get_one_total
-        // );
-        Ok(pyobj)
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("MpscConsumerHandle inner not initialized"))?;
+        let broker = connect_distributed_broker(&self.kv_framework);
+        init_broker_for_channel(
+            &self.kv_runtime,
+            &broker,
+            inner.chan_id(),
+            inner.channel_capacity(),
+        )?;
+        self.broker = Some(broker);
+        Ok(())
     }
 
     /// Initialize a delete callback which will be invoked by Rust after
@@ -1793,16 +2182,19 @@ cnt={} recv_calls={} recv_timeouts={} last_prefetch_target={} last_timeout_ms={:
 struct ProducerGuard {
     inner: Option<CoreMpscProducer>,
     tx: Option<cbchan::Sender<(Result<(), CoreMpscError>, CoreMpscProducer)>>,
+    shutdown: ShutdownCtl,
 }
 
 impl ProducerGuard {
     fn new(
         inner: CoreMpscProducer,
         tx: cbchan::Sender<(Result<(), CoreMpscError>, CoreMpscProducer)>,
+        shutdown: ShutdownCtl,
     ) -> Self {
         Self {
             inner: Some(inner),
             tx: Some(tx),
+            shutdown,
         }
     }
 
@@ -1822,12 +2214,12 @@ impl ProducerGuard {
 impl Drop for ProducerGuard {
     fn drop(&mut self) {
         if let (Some(inner), Some(tx)) = (self.inner.take(), self.tx.take()) {
-            let _ = tx.send((
-                Err(CoreMpscError::Internal(
-                    "producer guard dropped unexpectedly".to_string(),
-                )),
-                inner,
-            ));
+            let err = if self.shutdown.is_closed() {
+                CoreMpscError::Closed
+            } else {
+                CoreMpscError::Internal("producer guard dropped unexpectedly".to_string())
+            };
+            let _ = tx.send((Err(err), inner));
         }
     }
 }
@@ -1837,16 +2229,19 @@ impl Drop for ProducerGuard {
 struct ConsumerGuard {
     inner: Option<CoreMpscConsumer>,
     tx: Option<cbchan::Sender<(Result<CoreConsumedPayload, CoreMpscError>, CoreMpscConsumer)>>,
+    shutdown: ShutdownCtl,
 }
 
 impl ConsumerGuard {
     fn new(
         inner: CoreMpscConsumer,
         tx: cbchan::Sender<(Result<CoreConsumedPayload, CoreMpscError>, CoreMpscConsumer)>,
+        shutdown: ShutdownCtl,
     ) -> Self {
         Self {
             inner: Some(inner),
             tx: Some(tx),
+            shutdown,
         }
     }
 
@@ -1885,12 +2280,65 @@ impl ConsumerGuard {
 impl Drop for ConsumerGuard {
     fn drop(&mut self) {
         if let (Some(inner), Some(tx)) = (self.inner.take(), self.tx.take()) {
-            let _ = tx.send((
-                Err(CoreMpscError::Internal(
-                    "consumer guard dropped unexpectedly".to_string(),
-                )),
-                inner,
-            ));
+            let err = if self.shutdown.is_closed() {
+                CoreMpscError::Closed
+            } else {
+                CoreMpscError::Internal("consumer guard dropped unexpectedly".to_string())
+            };
+            let _ = tx.send((Err(err), inner));
+        }
+    }
+}
+
+struct BatchConsumerGuard {
+    inner: Option<CoreMpscConsumer>,
+    tx: Option<
+        cbchan::Sender<(
+            Result<Vec<CoreConsumedPayload>, CoreMpscError>,
+            CoreMpscConsumer,
+        )>,
+    >,
+    shutdown: ShutdownCtl,
+}
+
+impl BatchConsumerGuard {
+    fn new(
+        inner: CoreMpscConsumer,
+        tx: cbchan::Sender<(
+            Result<Vec<CoreConsumedPayload>, CoreMpscError>,
+            CoreMpscConsumer,
+        )>,
+        shutdown: ShutdownCtl,
+    ) -> Self {
+        Self {
+            inner: Some(inner),
+            tx: Some(tx),
+            shutdown,
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut CoreMpscConsumer {
+        self.inner
+            .as_mut()
+            .expect("BatchConsumerGuard inner already taken")
+    }
+
+    fn finish(mut self, res: Result<Vec<CoreConsumedPayload>, CoreMpscError>) {
+        if let (Some(inner), Some(tx)) = (self.inner.take(), self.tx.take()) {
+            let _ = tx.send((res, inner));
+        }
+    }
+}
+
+impl Drop for BatchConsumerGuard {
+    fn drop(&mut self) {
+        if let (Some(inner), Some(tx)) = (self.inner.take(), self.tx.take()) {
+            let err = if self.shutdown.is_closed() {
+                CoreMpscError::Closed
+            } else {
+                CoreMpscError::Internal("batch consumer guard dropped unexpectedly".to_string())
+            };
+            let _ = tx.send((Err(err), inner));
         }
     }
 }
