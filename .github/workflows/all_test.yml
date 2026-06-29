@@ -259,11 +259,26 @@ jobs:
                   case_id = case.get("case_id")
                   run_index = last_run.get("run_index")
                   print(f"=== failed case: {case_id} run_{run_index} ===")
-                  summary_path = workdir / "results" / str(case_id) / f"run_{run_index}" / "summary.yaml"
-                  if summary_path.exists():
-                      print(summary_path.read_text(encoding="utf-8", errors="replace"))
+                  run_dir = workdir / "results" / str(case_id) / f"run_{run_index}"
+                  for rel in (
+                      "summary.yaml",
+                      "exception.txt",
+                      "logs/ci_runner/exit_code.txt",
+                  ):
+                      path = run_dir / rel
+                      print(f"=== {path} ===")
+                      if path.exists():
+                          print(path.read_text(encoding="utf-8", errors="replace"))
+                      else:
+                          print(f"missing {path}")
+
+                  stdout_path = run_dir / "logs" / "ci_runner" / "stdout.log"
+                  print(f"=== {stdout_path} tail ===")
+                  if stdout_path.exists():
+                      lines = stdout_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                      print("\n".join(lines[-240:]))
                   else:
-                      print(f"missing {summary_path}")
+                      print(f"missing {stdout_path}")
           PY
 
       - name: Normalize ci_2_virt_node debug artifact permissions

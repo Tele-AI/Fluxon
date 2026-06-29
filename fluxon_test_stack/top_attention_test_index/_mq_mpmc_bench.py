@@ -11,9 +11,37 @@ from _common import call, load_case_config_payload
 
 TEST_REQUIREMENTS = ["etcd", "kv-cluster", "ops"]
 SCENE_ID = "ci_top_attention_mq_mpmc_bench"
-SCRIPT_PATHS = [
-    "fluxon_py/tests/test_api_chan_mpmc/test_mpmc_simple_bench.py",
-    "fluxon_py/tests/test_api_chan_mpmc/test_mpmc_simple_bench2.py",
+SCRIPT_COMMANDS = [
+    (
+        "fluxon_py/tests/test_api_chan_mpmc/test_mpmc_simple_bench.py",
+        (
+            "--producer-count",
+            "4",
+            "--consumer-counts",
+            "2",
+            "--duration-seconds",
+            "60",
+            "--sample-start-seconds",
+            "10",
+            "--sample-duration-seconds",
+            "10",
+        ),
+    ),
+    (
+        "fluxon_py/tests/test_api_chan_mpmc/test_mpmc_simple_bench2.py",
+        (
+            "--producer-count",
+            "4",
+            "--video-messages-per-producer",
+            "15",
+            "--batch-size",
+            "64",
+            "--prefetch-num",
+            "0",
+            "--channel-capacity",
+            "128",
+        ),
+    ),
 ]
 
 
@@ -33,8 +61,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.case_config:
         load_case_config_payload(Path(args.case_config).resolve(), expected_scene_id=SCENE_ID)
-    for script_path in SCRIPT_PATHS:
-        rc = call([args.python, "-u", script_path], env=None)
+    for script_path, script_args in SCRIPT_COMMANDS:
+        rc = call([args.python, "-u", script_path, *script_args], env=None)
         if rc != 0:
             return rc
     return 0
