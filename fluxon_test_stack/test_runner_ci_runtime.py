@@ -11,12 +11,45 @@ _CI_RUNTIME_PYTHON_BIN_NAME = "python3.10"
 
 
 def _ci_runtime_python_executable() -> str:
-    python_bin = shutil.which(_CI_RUNTIME_PYTHON_BIN_NAME)
-    if python_bin is None:
+    candidates = []
+    seen: set[str] = set()
+    for raw_candidate in (
+        _CI_RUNTIME_PYTHON_BIN_NAME,
+        "python3",
+        "python",
+    ):
+        resolved = shutil.which(raw_candidate)
+        if resolved is None or resolved in seen:
+            continue
+        seen.add(resolved)
+        candidates.append(resolved)
+    if not candidates:
         raise ValueError(
-            "CI runtime requires python3.10 on PATH to create the offline-wheelhouse venv"
+            "CI runtime requires a Python 3.10 interpreter on PATH to create the offline-wheelhouse venv"
         )
-    return python_bin
+    for python_bin in candidates:
+        if _python_executable_abi(python_bin) == _TEST_STACK_DEFAULT_PYTHON_ABI:
+            return python_bin
+    raise ValueError(
+        "CI runtime requires a Python 3.10 interpreter on PATH to create the offline-wheelhouse venv"
+    )
+
+
+def _python_executable_abi(python_bin: str) -> str:
+    try:
+        return subprocess.check_output(
+            [
+                python_bin,
+                "-c",
+                (
+                    "import sys; "
+                    "print(f'{sys.implementation.name}{sys.version_info[0]}.{sys.version_info[1]}')"
+                ),
+            ],
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(f"failed to probe python ABI for executable: {python_bin}") from exc
 
 
 def _ci_runtime_python_abi(
@@ -67,9 +100,13 @@ def _create_ci_runtime_venv(
     if venv_dir.exists():
         raise ValueError(f"venv dir already exists (no overwrite): {venv_dir}")
     python_bin = _ci_runtime_python_executable()
-    run_subprocess([python_bin, "-m", "venv", str(venv_dir)])
+    # Skip venv's implicit ensurepip step, then seed pip explicitly so the venv stays
+    # self-contained and does not depend on host site-packages.
+    run_subprocess([python_bin, "-m", "venv", "--without-pip", str(venv_dir)])
     venv_python = venv_dir / "bin" / "python3"
     if not venv_python.exists():
         raise ValueError(f"venv python not found after creation: {venv_python}")
+    run_subprocess([str(venv_python), "-m", "ensurepip", "--upgrade", "--default-pip"])
+    run_subprocess([str(venv_python), "-m", "pip", "--version"])
     assert_python_abi(venv_python)
     return venv_python

@@ -122,10 +122,6 @@ SCENE_KIND_TEST_STACK = "TEST_STACK"
 CASE_FAMILY_INFER = "infer"
 CASE_FAMILY_CI = "ci"
 CASE_FAMILY_BENCH = "bench"
-INFER_PATTERN_REPEAT = "REPEAT_PROMPTS"
-INFER_PATTERN_UNIQUE = "UNIQUE_PROMPTS"
-INFER_STACK_VLLM_LMCACHE = "VLLM_LMCACHE"
-INFER_STACK_SGLANG_HICACHE = "SGLANG_HICACHE"
 RUN_OUTCOME_SUCCESS = "SUCCESS"
 RUN_OUTCOME_FAILED = "FAILED"
 _RUN_SUMMARY_INCOMPLETE_ERROR = "INCOMPLETE: run started but did not reach finalize; runner likely exited abruptly."
@@ -545,7 +541,7 @@ def _redirect_process_stdio_to_log(
     - test_runner can run for hours under terminal/session wrappers that may disappear while the
       suite is still executing.
     - A deleted PTY turns ordinary `print(..., flush=True)` into `OSError(EIO)`, which aborts the
-      runner in collect/finalize paths and leaves case_runs.yaml stuck at a reserved run.
+      runner in shutdown/finalize paths and leaves case_runs.yaml stuck at a reserved run.
     - Use a deterministic per-workdir log sink for the whole process, including child subprocesses.
     """
     global _RUNNER_STDIO_LOG_FP
@@ -954,7 +950,7 @@ def main() -> None:
             )
             if _case_family_uses_case_plan(case_family):
                 case_plan = _compile_case_plan(resolved_case)
-            if case_family in (CASE_FAMILY_INFER, CASE_FAMILY_CI, CASE_FAMILY_BENCH):
+            if case_family in (CASE_FAMILY_CI, CASE_FAMILY_BENCH):
                 _apply_stable_deploy_names(resolved_case)
                 _sync_case_runtime_model_from_deploy(resolved_case)
 
@@ -970,40 +966,7 @@ def main() -> None:
                     case_plan=case_plan,
                     runtime_tracking=runtime_tracking,
                 )
-            if case_family == CASE_FAMILY_INFER:
-                _ensure_deployer_online(resolved_case)
-                _write_deployer_manifests(resolved_case, run_dir, allow_overwrite=False)
-
-                infer_deploy_attempted = True
-                deploy_result = _run_adapter_action(
-                    resolved_case, run_dir=run_dir, action="deploy"
-                )
-                _validate_deploy_result(resolved_case, deploy_result)
-
-                endpoint_url = _resolved_endpoint_url(resolved_case, deploy_result)
-                _tcp_check_endpoint(endpoint_url)
-
-                infer_out = _run_infer_ai_perf(resolved_case, deploy_result, run_dir)
-                summary = _build_infer_summary_yaml(
-                    resolved_case,
-                    deploy_result,
-                    run_index=run_slot.run_index,
-                    started_at_unix_s=started_at,
-                    finished_at_unix_s=int(time.time()),
-                    outcome=RUN_OUTCOME_SUCCESS,
-                    counted=False,
-                    ai_perf_out=infer_out,
-                )
-                _write_yaml_file(run_dir / "summary.yaml", summary)
-
-                _run_adapter_action(
-                    resolved_case, run_dir=run_dir, action="collect"
-                )
-
-                outcome = RUN_OUTCOME_SUCCESS
-
-
-            elif _case_family_uses_case_plan(case_family):
+            if _case_family_uses_case_plan(case_family):
                 if case_plan is None:
                     raise ValueError(f"internal error: case_plan is missing for case_family={case_family}")
                 prepared_case = _prepare_case(
@@ -1042,20 +1005,6 @@ def main() -> None:
             outcome = RUN_OUTCOME_FAILED
 
         finally:
-            if case_family == CASE_FAMILY_INFER and resolved_case is not None:
-                try:
-                    if infer_deploy_attempted:
-                        _run_adapter_action(
-                            resolved_case,
-                            run_dir=run_dir,
-                            action="teardown",
-                        )
-                except Exception as exc:
-                    print(
-                        "ERROR: teardown failed; stopping (no fallback). "
-                        f"case_id={case.case_id} err={type(exc).__name__}: {exc}"
-                    )
-                    raise SystemExit(1)
             if case_plan is not None and resolved_case is not None:
                 try:
                     _finalize_case_runtime(
@@ -1071,11 +1020,17 @@ def main() -> None:
                         "ERROR: teardown failed; stopping after finalize (no fallback). "
                         f"case_id={case.case_id} err={finalize_error}"
                     )
-                    if case_family == CASE_FAMILY_BENCH and outcome == RUN_OUTCOME_SUCCESS:
-                        print(
-                            "WARN: TEST_STACK finalize failed after terminal benchmark success; "
-                            f"preserving SUCCESS outcome for case_id={case.case_id} finalize_err={finalize_error}"
-                        )
+                    if _preserve_success_after_finalize_error(case_family=case_family, outcome=outcome):
+                        if case_family == CASE_FAMILY_BENCH:
+                            print(
+                                "WARN: TEST_STACK finalize failed after terminal benchmark success; "
+                                f"preserving SUCCESS outcome for case_id={case.case_id} finalize_err={finalize_error}"
+                            )
+                        else:
+                            print(
+                                "WARN: CI finalize failed after terminal ci_runner success; "
+                                f"preserving SUCCESS outcome for case_id={case.case_id} finalize_err={finalize_error}"
+                            )
                     else:
                         outcome = RUN_OUTCOME_FAILED
                     if suite.run_mode == RUN_MODE_DEBUG_ONE_BY_ONE and outcome != RUN_OUTCOME_SUCCESS:
@@ -2129,7 +2084,7 @@ def _resolved_case_ops_namespace(resolved_case: Dict[str, Any]) -> str:
 def _apply_stable_deploy_names(resolved_case: Dict[str, Any]) -> None:
     """Rewrite deploy.instances[].k8s_ref into a stable logical deployment name.
 
-    For CI/infer, replacement semantics follow the logical case identity and stay rerun-stable.
+    For CI cases, replacement semantics follow the logical case identity and stay rerun-stable.
     For TEST_STACK benchmark workloads, names are additionally scoped by run_dir hash so a stale
     controller/runtime from an older runner cannot collide with the current run.
     """
@@ -2156,8 +2111,6 @@ def _apply_stable_deploy_names(resolved_case: Dict[str, Any]) -> None:
 
 def _resolved_case_kind(resolved_case: Dict[str, Any]) -> str:
     scene = _require_dict(resolved_case.get("scene"), "resolved_case.scene")
-    if scene.get("infer") is not None:
-        return SCENE_KIND_INFER
     if scene.get("ci") is not None:
         return SCENE_KIND_CI
     if scene.get("test_stack") is not None:
@@ -2168,7 +2121,7 @@ def _resolved_case_kind(resolved_case: Dict[str, Any]) -> str:
 def _resolved_case_family(resolved_case: Dict[str, Any]) -> str:
     case = _require_dict(resolved_case.get("case"), "resolved_case.case")
     family = _require_str(case.get("family"), "resolved_case.case.family")
-    if family not in (CASE_FAMILY_INFER, CASE_FAMILY_CI, CASE_FAMILY_BENCH):
+    if family not in (CASE_FAMILY_CI, CASE_FAMILY_BENCH):
         raise ValueError(f"resolved_case.case.family unsupported: {family!r}")
     return family
 
@@ -2195,8 +2148,6 @@ def _ci_runtime_contract_id(resolved_case: Dict[str, Any]) -> str:
 
 
 def _case_family_id(case_kind: str) -> str:
-    if case_kind == SCENE_KIND_INFER:
-        return CASE_FAMILY_INFER
     if case_kind == SCENE_KIND_CI:
         return CASE_FAMILY_CI
     if case_kind == SCENE_KIND_TEST_STACK:
@@ -2238,7 +2189,7 @@ def _close_case_runtime_locks(runtime_tracking: _CaseRuntimeTracking) -> None:
 def _build_runtime_model(case_family: str) -> Dict[str, Any]:
     if case_family == CASE_FAMILY_CI:
         case_instance_ids = list(CI_RUNTIME_LAYER_INSTANCE_IDS[RUNTIME_LAYER_CASE])
-    elif case_family in (CASE_FAMILY_INFER, CASE_FAMILY_BENCH):
+    elif case_family == CASE_FAMILY_BENCH:
         case_instance_ids = []
     else:
         raise ValueError(f"unsupported runtime model case family: {case_family}")
@@ -2339,9 +2290,6 @@ def _compile_case_runtime_artifacts(
         test_stack_meta = _compile_test_stack_case(resolved_case, run_index=run_index)
         _sync_case_runtime_model_from_deploy(resolved_case)
         return test_stack_meta
-    if case_family == CASE_FAMILY_INFER:
-        _sync_case_runtime_model_from_deploy(resolved_case)
-        return None
     raise ValueError(f"unsupported case family for runtime artifact compilation: {case_family}")
 
 
@@ -2786,16 +2734,6 @@ def _deploy_runtime_phase(
     return _deploy_runtime_phase_after_stage(resolved_case, run_dir=run_dir, phase=phase)
 
 
-def _collect_runtime_phase(
-    resolved_case: Dict[str, Any],
-    *,
-    run_dir: Path,
-    phase: _RuntimePhase,
-) -> None:
-    _write_runtime_phase_inputs(resolved_case, run_dir=run_dir, phase=phase)
-    _run_adapter_action(resolved_case, run_dir=run_dir, action="collect")
-
-
 def _ci_cluster_runtime_stage(resolved_case: Dict[str, Any]) -> _RemoteRunDirStage:
     verify_relpaths = list(CI_CLUSTER_RUNTIME_REMOTE_STAGE_VERIFY_RELPATHS)
     if _ci_has_instance(resolved_case, instance_id="owner_0"):
@@ -2849,12 +2787,6 @@ def _ci_runtime_phase(resolved_case: Dict[str, Any], phase_id: str) -> _RuntimeP
             write_ctx="CI",
             stage_run_dir=_ci_runner_runtime_stage(resolved_case),
         ),
-        "collect_all": _RuntimePhase(
-            phase_id="collect_all",
-            layer=RUNTIME_LAYER_CASE,
-            instance_ids=CI_RUNTIME_INSTANCE_IDS,
-            write_ctx="CI",
-        ),
     }
     try:
         return phases[phase_id]
@@ -2906,24 +2838,6 @@ def _test_stack_runtime_phase(
             write_ctx="TEST_STACK",
             stage_run_dir=stage_run_dir,
         )
-    if phase_id == "collect_nodes":
-        if node_ids is None or not node_ids:
-            raise ValueError("TEST_STACK collect_nodes phase requires non-empty node_ids")
-        return _RuntimePhase(
-            phase_id="collect_nodes",
-            layer=RUNTIME_LAYER_CASE,
-            instance_ids=node_ids,
-            write_ctx="TEST_STACK",
-        )
-    if phase_id == "collect_coordinator":
-        if node_ids is not None:
-            raise ValueError("TEST_STACK collect_coordinator phase does not accept node_ids")
-        return _RuntimePhase(
-            phase_id="collect_coordinator",
-            layer=RUNTIME_LAYER_CASE,
-            instance_ids=("coordinator",),
-            write_ctx="TEST_STACK",
-        )
     raise ValueError(f"unsupported TEST_STACK runtime phase: {phase_id}")
 
 
@@ -2950,14 +2864,6 @@ def _compile_case_plan(resolved_case: Dict[str, Any]) -> _CasePlan:
             prepare_phases=prepare_phases,
             execute_phases=(
                 _ci_runtime_phase(resolved_case, "ci_runner"),
-            ),
-            collect_phases=(
-                _RuntimePhase(
-                    phase_id="collect_all",
-                    layer=RUNTIME_LAYER_CASE,
-                    instance_ids=case_instance_ids,
-                    write_ctx="CI",
-                ),
             ),
         )
     if case_family == CASE_FAMILY_BENCH:
@@ -3013,15 +2919,6 @@ def _compile_case_plan(resolved_case: Dict[str, Any]) -> _CasePlan:
                     phase_id="nodes",
                     node_ids=node_ids_tuple,
                     include_stage_run_dir=False,
-                ),
-            ),
-            collect_phases=(
-                _test_stack_runtime_phase(phase_id="collect_nodes", node_ids=node_ids_tuple),
-                _RuntimePhase(
-                    phase_id="collect_coordinator",
-                    layer=RUNTIME_LAYER_CASE,
-                    instance_ids=prepare_ids_tuple,
-                    write_ctx="TEST_STACK",
                 ),
             ),
         )
@@ -3225,12 +3122,14 @@ def _finalize_ci_case_runtime(
 def _finalize_test_stack_case_runtime(
     resolved_case: Dict[str, Any],
     *,
+    run_dir: Path,
     runtime_tracking: _CaseRuntimeTracking,
     outcome: str,
 ) -> None:
     _finalize_test_stack_case_runtime_impl(
         ctx=sys.modules[__name__],
         resolved_case=resolved_case,
+        run_dir=run_dir,
         runtime_tracking=runtime_tracking,
         outcome=outcome,
     )
@@ -6652,6 +6551,162 @@ def _runner_native_ci_commands_for_case(case: _ResolvedCase, *, ctx: str) -> Lis
                     "__RUN_DIR__/venv/bin/python3 -u "
                     "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_bin_kvtest.py "
                     "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_fs_core":
+        return [
+            {
+                "id": "top_attention_cargo_fs_core",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs_core.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_util":
+        return [
+            {
+                "id": "top_attention_cargo_util",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_util.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_kv_unit":
+        return [
+            {
+                "id": "top_attention_cargo_kv_unit",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_kv_unit.py "
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_cli":
+        return [
+            {
+                "id": "top_attention_cargo_cli",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_cli.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_commu":
+        return [
+            {
+                "id": "top_attention_cargo_commu",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_commu.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_commu_contract":
+        return [
+            {
+                "id": "top_attention_cargo_commu_contract",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_commu_contract.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_framework":
+        return [
+            {
+                "id": "top_attention_cargo_framework",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_framework.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_fs":
+        return [
+            {
+                "id": "top_attention_cargo_fs",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_fs_s3_gateway":
+        return [
+            {
+                "id": "top_attention_cargo_fs_s3_gateway",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs_s3_gateway.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_limit_thirdparty":
+        return [
+            {
+                "id": "top_attention_cargo_limit_thirdparty",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_limit_thirdparty.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_mq":
+        return [
+            {
+                "id": "top_attention_cargo_mq",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_mq.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_observability":
+        return [
+            {
+                "id": "top_attention_cargo_observability",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_observability.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_ops":
+        return [
+            {
+                "id": "top_attention_cargo_ops",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_ops.py"
+                ),
+                "timeout_seconds": 21600,
+            }
+        ]
+    if scene_id == "ci_top_attention_cargo_pyo3":
+        return [
+            {
+                "id": "top_attention_cargo_pyo3",
+                "command": (
+                    "__RUN_DIR__/venv/bin/python3 -u "
+                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_pyo3.py"
                 ),
                 "timeout_seconds": 21600,
             }
@@ -10968,7 +11023,7 @@ def _run_adapter_action(
     run_dir: Path,
     action: str,
 ) -> Optional[Dict[str, Any]]:
-    if action not in ("deploy", "collect", "teardown"):
+    if action not in ("deploy", "teardown"):
         raise ValueError(f"invalid adapter action: {action}")
 
     deploy = _require_dict(resolved_case.get("deploy"), "resolved_case.deploy")
@@ -11001,7 +11056,14 @@ def _run_subprocess(argv: List[str], *, cwd: str) -> None:
     print("RUN:", " ".join(_shell_quote(a) for a in argv), flush=True)
     proc = subprocess.run(argv, cwd=cwd)
     if proc.returncode != 0:
-        raise RuntimeError(f"command failed: rc={proc.returncode}")
+        raise RuntimeError(
+            "command failed: "
+            f"rc={proc.returncode} cwd={cwd} argv={' '.join(_shell_quote(a) for a in argv)}"
+        )
+
+
+def _preserve_success_after_finalize_error(*, case_family: str, outcome: str) -> bool:
+    return outcome == RUN_OUTCOME_SUCCESS and case_family in (CASE_FAMILY_BENCH, CASE_FAMILY_CI)
 
 
 _SSH_TRANSPORT_TIMEOUT_SECONDS = 180.0

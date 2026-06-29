@@ -394,8 +394,6 @@ def _execute_ci_case(
         counted=False,
         ci_out={"rc": rc},
     )
-    for phase in prepared_case.plan.collect_phases:
-        ctx._collect_runtime_phase(resolved_case, run_dir=run_dir, phase=phase)
     return ctx._ExecutedCase(outcome=outcome, summary=summary)
 
 
@@ -414,7 +412,6 @@ def _execute_test_stack_case(
 
     outcome = ctx.RUN_OUTCOME_FAILED
     error_detail: Optional[str] = None
-    collect_error_detail: Optional[str] = None
     result_obj: Optional[Dict[str, Any]] = None
 
     try:
@@ -445,12 +442,6 @@ def _execute_test_stack_case(
         outcome = ctx.RUN_OUTCOME_SUCCESS
     except Exception as exc:  # noqa: BLE001
         error_detail = f"{type(exc).__name__}: {exc}"
-    finally:
-        try:
-            for phase in prepared_case.plan.collect_phases:
-                ctx._collect_runtime_phase(resolved_case, run_dir=run_dir, phase=phase)
-        except Exception as exc:  # noqa: BLE001
-            collect_error_detail = f"{type(exc).__name__}: {exc}"
 
     summary = {
         "schema_version": ctx.SCHEMA_VERSION,
@@ -472,7 +463,7 @@ def _execute_test_stack_case(
             "result_path": str(_require_test_stack_result_path(prepared_case.test_stack_result_path)),
             "result": result_obj,
             "error": error_detail,
-            "collect_error": collect_error_detail,
+            "collect_error": None,
         },
     }
     return ctx._ExecutedCase(outcome=outcome, summary=summary)
@@ -543,6 +534,7 @@ def _finalize_case_runtime(
         _finalize_test_stack_case_runtime(
             ctx=ctx,
             resolved_case=resolved_case,
+            run_dir=run_dir,
             runtime_tracking=runtime_tracking,
             outcome=outcome,
         )
@@ -617,11 +609,25 @@ def _finalize_test_stack_case_runtime(
     *,
     ctx: Any,
     resolved_case: Dict[str, Any],
+    run_dir: Path,
     runtime_tracking: Any,
     outcome: str,
 ) -> None:
     case = ctx._require_dict(resolved_case.get("case"), "resolved_case.case")
     run_mode = ctx._require_str(case.get("run_mode"), "resolved_case.case.run_mode")
+    collect_error_detail: Optional[str] = None
+
+    try:
+        # Collect first so failed runs still retain instance status snapshots before teardown.
+        ctx._run_adapter_action(resolved_case, run_dir=run_dir, action="collect")
+    except Exception as exc:  # noqa: BLE001
+        collect_error_detail = f"{type(exc).__name__}: {exc}"
+        summary_path = (run_dir / "summary.yaml").resolve()
+        summary = ctx._require_dict(ctx._load_yaml_file(summary_path), "summary.yaml")
+        test_stack_summary = ctx._require_dict(summary.get("test_stack"), "summary.yaml.test_stack")
+        test_stack_summary["collect_error"] = collect_error_detail
+        ctx._write_yaml_file(summary_path, summary)
+
     ts_preserved_apply_ids: list[str] = []
     if runtime_tracking.ts_nodes_deploy_attempted and runtime_tracking.ts_nodes_apply_id is not None:
         ts_preserved_apply_ids.append(

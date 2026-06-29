@@ -27,7 +27,12 @@ fn read_etcd() -> String {
         .expect("read etcd endpoint from build_config_ext.yml")
 }
 
-fn new_master_config(instance_key: &str, port: u16, cluster: &str, etcd: &str) -> MasterConfig {
+fn new_master_config(
+    instance_key: &str,
+    port: Option<u16>,
+    cluster: &str,
+    etcd: &str,
+) -> MasterConfig {
     let prometheus_base_url = fluxon_util::dev_config::load_tsdb_base_url()
         .expect("read prometheus_base_url from build_config_ext.yml (key: prom)");
     let prom_remote_write_url =
@@ -36,7 +41,7 @@ fn new_master_config(instance_key: &str, port: u16, cluster: &str, etcd: &str) -
     MasterConfig {
         instance_key: instance_key.to_string(),
         cluster_name: cluster.to_string(),
-        port: Some(port),
+        port,
         etcd_endpoints: vec![etcd.to_string()],
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
@@ -257,7 +262,7 @@ pub mod test_memholder {
         );
         let (master, _) = run_master(ConfigArg::Config(new_master_config(
             "mh_master",
-            50090,
+            None,
             &cluster,
             &etcd,
         )))
@@ -408,7 +413,7 @@ pub mod test_memholder {
         let cluster = unique_cluster_name("test_cluster_memholder_pin");
         let (master, _) = run_master(ConfigArg::Config(new_master_config(
             "pin_master",
-            50100,
+            None,
             &cluster,
             &etcd,
         )))

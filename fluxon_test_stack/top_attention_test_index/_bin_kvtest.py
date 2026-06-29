@@ -5,9 +5,12 @@ import argparse
 import os
 from pathlib import Path
 
-import yaml
-
-from _common import REPO_ROOT, load_case_config_payload, run_cargo
+from _common import (
+    REPO_ROOT,
+    load_case_config_payload,
+    run_cargo,
+    write_build_config_ext,
+)
 
 
 TEST_REQUIREMENTS = ["cargo", "etcd", "ops", "submodules"]
@@ -33,38 +36,6 @@ def _parse_kv_test_rounds(raw: object) -> str:
     return ",".join(rounds)
 
 
-def _require_scene_runtime_endpoint(scene_runtime: object, *, service_id: str) -> tuple[str, int]:
-    if not isinstance(scene_runtime, dict):
-        raise ValueError("case config scene_runtime must be a mapping")
-    raw_service = scene_runtime.get(service_id)
-    if not isinstance(raw_service, dict):
-        raise ValueError(f"case config scene_runtime.{service_id} must be a mapping")
-    ip = str(raw_service.get("ip") or "").strip()
-    if not ip:
-        raise ValueError(f"case config scene_runtime.{service_id}.ip must be set")
-    port = raw_service.get("port")
-    if not isinstance(port, int):
-        raise ValueError(f"case config scene_runtime.{service_id}.port must be an int")
-    return ip, port
-
-
-def _write_build_config_ext(case_cfg_path: Path, scene_runtime: dict) -> None:
-    etcd_ip, etcd_port = _require_scene_runtime_endpoint(scene_runtime, service_id="etcd")
-    greptime_ip, greptime_port = _require_scene_runtime_endpoint(scene_runtime, service_id="greptime")
-    out_path = case_cfg_path.resolve().parents[1] / "src" / "build_config_ext.yml"
-    out_path.write_text(
-        yaml.safe_dump(
-            {
-                "etcd": f"{etcd_ip}:{etcd_port}",
-                "prom": f"http://{greptime_ip}:{greptime_port}/v1/prometheus",
-                "prom_remote_write_url": f"http://{greptime_ip}:{greptime_port}/v1/prometheus/write",
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Flat index entry for the existing Rust kv_test binary."
@@ -85,7 +56,7 @@ def main() -> int:
     scene_runtime = case_payload.get("scene_runtime")
     if not isinstance(scene_runtime, dict):
         raise ValueError("case config must define scene_runtime mapping")
-    _write_build_config_ext(case_cfg_path, scene_runtime)
+    write_build_config_ext(case_cfg_path, scene_runtime=scene_runtime)
 
     cargo_args = [
         "run",

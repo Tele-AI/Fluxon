@@ -28,6 +28,18 @@ _ENTRY = _load_module()
 
 class TestCi2VirtNodeContract(unittest.TestCase):
     _KVTEST_SCENE_ID = "ci_top_attention_bin_kvtest"
+    _CARGO_KV_UNIT_SCENE_ID = "ci_top_attention_cargo_kv_unit"
+    _CARGO_CLI_SCENE_ID = "ci_top_attention_cargo_cli"
+    _CARGO_COMMU_SCENE_ID = "ci_top_attention_cargo_commu"
+    _CARGO_COMMU_CONTRACT_SCENE_ID = "ci_top_attention_cargo_commu_contract"
+    _CARGO_FRAMEWORK_SCENE_ID = "ci_top_attention_cargo_framework"
+    _CARGO_FS_SCENE_ID = "ci_top_attention_cargo_fs"
+    _CARGO_FS_S3_GATEWAY_SCENE_ID = "ci_top_attention_cargo_fs_s3_gateway"
+    _CARGO_LIMIT_THIRDPARTY_SCENE_ID = "ci_top_attention_cargo_limit_thirdparty"
+    _CARGO_MQ_SCENE_ID = "ci_top_attention_cargo_mq"
+    _CARGO_OBSERVABILITY_SCENE_ID = "ci_top_attention_cargo_observability"
+    _CARGO_OPS_SCENE_ID = "ci_top_attention_cargo_ops"
+    _CARGO_PYO3_SCENE_ID = "ci_top_attention_cargo_pyo3"
     _DOC_SCENE_ID = "ci_top_attention_doc_page_build"
     _LOG_MGMT_SCENE_ID = "ci_top_attention_log_mgmt"
     _MQ_SCENE_ID = "ci_top_attention_mq_core"
@@ -192,6 +204,62 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             ],
             "p2p_only",
         )
+
+    def test_generated_suite_injects_public_transport_feature_for_cargo_kv_unit(self) -> None:
+        suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
+        generated = _ENTRY._rewrite_suite_for_local_dual_nodes(
+            suite_cfg=suite_cfg,
+            scene_ids=[self._CARGO_KV_UNIT_SCENE_ID],
+            primary_node_name="local-node-a",
+            secondary_node_name="local-node-b",
+            host_ip="10.1.1.119",
+            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            controller_port=19080,
+        )
+
+        self.assertEqual(
+            generated["profiles"]["fluxon_tcp_thread"]["runtime"]["ci"]["scene_configs"][self._CARGO_KV_UNIT_SCENE_ID][
+                "kv_transport_feature"
+            ],
+            "tcp_thread_transport",
+        )
+
+    def test_generated_suite_supports_additional_runner_native_cargo_scenes(self) -> None:
+        scene_ids = [
+            self._CARGO_CLI_SCENE_ID,
+            self._CARGO_COMMU_SCENE_ID,
+            self._CARGO_COMMU_CONTRACT_SCENE_ID,
+            self._CARGO_FRAMEWORK_SCENE_ID,
+            self._CARGO_FS_SCENE_ID,
+            self._CARGO_FS_S3_GATEWAY_SCENE_ID,
+            self._CARGO_LIMIT_THIRDPARTY_SCENE_ID,
+            self._CARGO_MQ_SCENE_ID,
+            self._CARGO_OBSERVABILITY_SCENE_ID,
+            self._CARGO_OPS_SCENE_ID,
+            self._CARGO_PYO3_SCENE_ID,
+        ]
+        suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
+        generated = _ENTRY._rewrite_suite_for_local_dual_nodes(
+            suite_cfg=suite_cfg,
+            scene_ids=scene_ids,
+            primary_node_name="local-node-a",
+            secondary_node_name="local-node-b",
+            host_ip="10.1.1.119",
+            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            controller_port=19080,
+        )
+
+        self.assertEqual(set(generated["scenes"].keys()), set(scene_ids))
+        for scene_id in scene_ids:
+            self.assertEqual(
+                generated["scenes"][scene_id]["ci"]["runtime_contract"],
+                "rust_self_managed",
+            )
+            self.assertEqual(
+                generated["scenes"][scene_id]["ci"]["subject"],
+                "rust",
+            )
+            self.assertNotIn("commands", generated["scenes"][scene_id]["ci"])
 
     def test_generated_suite_supports_doc_page_ci_scene(self) -> None:
         suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")

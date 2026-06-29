@@ -47,13 +47,13 @@ fn test_cluster_name(master_key: &str) -> String {
 /// Use shared test workdir base from fluxon_util (merged into test_util)
 use fluxon_util::test_util::test_workdir_base;
 
-pub fn new_master_config(instance_key: &str, port: u16) -> MasterConfig {
+pub fn new_master_config(instance_key: &str, port: Option<u16>) -> MasterConfig {
     new_master_config_with_cluster(instance_key, port, LEASE_TEST_CLUSTER)
 }
 
 fn new_master_config_with_cluster(
     instance_key: &str,
-    port: u16,
+    port: Option<u16>,
     cluster_name: &str,
 ) -> MasterConfig {
     let etcd = fluxon_util::dev_config::read_etcd_endpoint_from_build_config()
@@ -76,7 +76,7 @@ fn new_master_config_with_cluster(
     let conf = MasterConfig {
         instance_key: instance_key.to_string(),
         cluster_name: cluster_name.to_string(),
-        port: Some(port),
+        port,
         etcd_endpoints: vec![etcd.clone()],
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
@@ -157,14 +157,13 @@ fn new_client_config_with_cluster_and_dram(
 pub async fn start_master_and_client(
     master_key: &str,
     client_key: &str,
-    port: u16,
 ) -> (Arc<Framework>, Arc<Framework>) {
     let cluster_name = test_cluster_name(master_key);
     clean_etcd_members(&cluster_name).await;
 
     let (master_fw, _) = run_master(ConfigArg::Config(new_master_config_with_cluster(
         master_key,
-        port,
+        None,
         &cluster_name,
     )))
     // Start the lease cleanup task for the master
@@ -197,7 +196,6 @@ pub async fn start_master_and_client(
 pub async fn start_master_and_client_with_client_dram(
     master_key: &str,
     client_key: &str,
-    port: u16,
     client_dram_bytes: u64,
 ) -> (Arc<Framework>, Arc<Framework>) {
     let cluster_name = test_cluster_name(master_key);
@@ -205,7 +203,7 @@ pub async fn start_master_and_client_with_client_dram(
 
     let (master_fw, _) = run_master(ConfigArg::Config(new_master_config_with_cluster(
         master_key,
-        port,
+        None,
         &cluster_name,
     )))
     .await

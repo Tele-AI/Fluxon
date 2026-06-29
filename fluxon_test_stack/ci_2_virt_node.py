@@ -415,11 +415,13 @@ def _rewrite_suite_for_local_dual_nodes(
     if scene_configs is not None:
         if not isinstance(scene_configs, dict):
             raise ValueError("generated public profile runtime.ci.scene_configs must be a mapping")
-        kv_scene_config = scene_configs.get("ci_top_attention_bin_kvtest")
-        if kv_scene_config is not None:
+        for scene_id in ("ci_top_attention_bin_kvtest", "ci_top_attention_cargo_kv_unit"):
+            kv_scene_config = scene_configs.get(scene_id)
+            if kv_scene_config is None:
+                continue
             if not isinstance(kv_scene_config, dict):
                 raise ValueError(
-                    "generated public profile runtime.ci.scene_configs['ci_top_attention_bin_kvtest'] must be a mapping"
+                    f"generated public profile runtime.ci.scene_configs[{scene_id!r}] must be a mapping"
                 )
             # The generated public profile is fixed to the tcp-thread transport branch.
             kv_scene_config["kv_transport_feature"] = PUBLIC_TRANSPORT_FEATURE

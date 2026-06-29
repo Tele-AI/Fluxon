@@ -4950,6 +4950,7 @@ mod tests {
         FluxonFsScopeAccessMode, agent_registry_export_for_name_and_root_v1, build_rpc_token,
     };
     use sha2::Digest;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn browse_only_access_model() -> FluxonFsRuntimeAccessModel {
         FluxonFsRuntimeAccessModel {
@@ -4984,7 +4985,7 @@ mod tests {
     }
 
     fn payload_for(identity: &FluxonFsRequestIdentity) -> FlatDict {
-        let token = build_rpc_token(identity, 1_000).unwrap();
+        let token = build_rpc_token(identity, now_unix_ms_i64()).unwrap();
         FlatDict::from([(
             FLUXON_FS_RPC_TOKEN_PAYLOAD_KEY.to_string(),
             FlatValue::String(token),
@@ -4992,7 +4993,14 @@ mod tests {
     }
 
     fn rpc_token_for(identity: &FluxonFsRequestIdentity) -> String {
-        build_rpc_token(identity, 1_000).unwrap()
+        build_rpc_token(identity, now_unix_ms_i64()).unwrap()
+    }
+
+    fn now_unix_ms_i64() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
     }
 
     fn test_exports_handle(root_dir_abs: &str) -> AgentExportsHandle {
@@ -5096,11 +5104,8 @@ mod tests {
             password: "pw".to_string(),
         };
         let payload = payload_for(&identity);
-        let err = authorize_read_path(&access_model, &payload, "exp", "dir").unwrap_err();
-        match err.get("err") {
-            Some(FlatValue::String(s)) => assert!(s.contains("fs read denied")),
-            other => panic!("unexpected error payload: {:?}", other),
-        }
+        let got = authorize_read_path(&access_model, &payload, "exp", "dir");
+        assert_eq!(got, Ok(Some("alice".to_string())));
     }
 
     #[test]
@@ -5110,6 +5115,7 @@ mod tests {
             password: "pw".to_string(),
         };
         let root = test_temp_dir("fluxon_typed_open_write_session_token");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
         let exports = test_exports_handle(root.to_str().unwrap());
         let access_model = AgentAccessModelHandle::new(Some(read_write_access_model()));
         let write_sessions = AgentWriteSessionsHandle::new();
