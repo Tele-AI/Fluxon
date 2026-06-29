@@ -100,6 +100,36 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             )
             self.assertNotIn("shared_file_path", owner_cfg["fluxonkv_spec"])
 
+    def test_ci_owner_prepare_wait_uses_shared_bundle_timeout_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            owner_cfg_path = run_dir / "configs" / "ci_owner_0.yaml"
+            owner_cfg_path.parent.mkdir(parents=True)
+            _RUNNER._write_yaml_file(
+                owner_cfg_path,
+                {
+                    "fluxonkv_spec": {
+                        "cluster_name": "ci_cluster",
+                        "share_mem_path": "/tmp/ci_shm",
+                    },
+                },
+            )
+            resolved_case = {"runtime": {"run_dir": str(run_dir)}}
+
+            with mock.patch.object(_RUNNER, "_wait_instance_running") as wait_running:
+                with mock.patch.object(
+                    _RUNNER,
+                    "_wait_ci_owner_shared_bundle_ready_and_stage_shared_json",
+                ) as wait_shared_bundle:
+                    _RUNNER._wait_ci_instance_ready(resolved_case, instance_id="owner_0")
+
+            wait_running.assert_called_once_with(resolved_case, instance_id="owner_0", timeout_s=60)
+            wait_shared_bundle.assert_called_once()
+            self.assertEqual(
+                wait_shared_bundle.call_args.kwargs["timeout_s"],
+                _RUNNER.CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S,
+            )
+
     def test_ci_runtime_python_executable_requires_python310_on_path(self) -> None:
         with mock.patch.object(_RUNNER.shutil, "which", return_value=None):
             with self.assertRaisesRegex(ValueError, "requires a Python 3.10 interpreter on PATH"):

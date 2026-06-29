@@ -3664,7 +3664,7 @@ def _wait_ci_instance_ready(resolved_case: Dict[str, Any], *, instance_id: str) 
             instance_id=instance_id,
             shared_json_path=shared_json_path,
             mmap_file_path=mmap_file_path,
-            timeout_s=180,
+            timeout_s=CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S,
         )
         return
     if instance_id == "ci_runner":
