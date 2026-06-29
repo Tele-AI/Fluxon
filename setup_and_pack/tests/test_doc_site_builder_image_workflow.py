@@ -42,6 +42,7 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         workflow_text = ALL_TEST_WORKFLOW_PATH.read_text(encoding="utf-8")
         yaml.load(workflow_text, Loader=yaml.BaseLoader)
 
+        self.assertIn("workflow_dispatch:", workflow_text)
         self.assertIn("fluxon_test_stack/ci_2_virt_node.py", workflow_text)
         self.assertIn("Write ci_2_virt_node suite", workflow_text)
         self.assertIn("ci_top_attention_bin_kvtest", workflow_text)
