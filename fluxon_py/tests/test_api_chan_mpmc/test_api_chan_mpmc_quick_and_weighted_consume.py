@@ -28,6 +28,7 @@ from fluxon_py.api_ext_chan import ChanType  # noqa: E402
 from fluxon_py.logging import init_logger  # noqa: E402
 from fluxon_py.api_error import MessageConsumptionNoNewMessageError  # noqa: E402
 from fluxon_py.tests.test_api_chan_mpsc.test_api_chan_mpsc_base import (  # noqa: E402
+    _wait_fluxon_member_absent,
     chan_type_from_string,
     configure_backend,
     create_channel_env,
@@ -469,6 +470,18 @@ def reset_producer_done_flag() -> None:
             etcd_client.delete(f"{PRODUCER_DONE_KEY}_{producer_id}")
 
 
+def _read_log_tail(path: str, *, max_lines: int = 80) -> str:
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return f"<missing log: {path}>"
+    except OSError as exc:
+        return f"<failed to read log {path}: {exc}>"
+    if not lines:
+        return "<empty log>"
+    return "\n".join(lines[-max_lines:])
+
+
 def _bootstrap_process_state(
     *,
     bootstrap_proc: subprocess.Popen,
@@ -477,7 +490,12 @@ def _bootstrap_process_state(
     rc = bootstrap_proc.poll()
     if rc is None:
         return None
-    return f"bootstrap producer exited rc={rc} log={bootstrap_log}"
+    return (
+        f"bootstrap producer exited rc={rc} log={bootstrap_log}\n"
+        "--- bootstrap log tail ---\n"
+        f"{_read_log_tail(bootstrap_log)}\n"
+        "--- end bootstrap log tail ---"
+    )
 
 
 def _wait_unique_key_mapping(
