@@ -30,6 +30,33 @@ _DISPATCH = _load_module()
 
 
 class TestManualDispatchReleaseTestRscContract(unittest.TestCase):
+    def test_finalize_remote_staged_dir_keeps_backup_when_cleanup_fails(self) -> None:
+        captured: list[tuple[str | None, str]] = []
+
+        def _fake_check_call_bash_with_optional_password(*, password: str | None, cmd: str) -> None:
+            captured.append((password, cmd))
+
+        with mock.patch.object(
+            _DISPATCH,
+            "_check_call_bash_with_optional_password",
+            side_effect=_fake_check_call_bash_with_optional_password,
+        ):
+            _DISPATCH._finalize_remote_staged_dir(
+                stage_dir_s="/remote/.fluxon_release.stage.abc123",
+                dst_dir_s="/remote/fluxon_release",
+                ssh_user="root",
+                ip="203.0.113.7",
+                ssh_port=30245,
+                ssh_password=None,
+            )
+
+        self.assertEqual(len(captured), 1)
+        password, cmd = captured[0]
+        self.assertIsNone(password)
+        self.assertIn('mv \'"\'"\'/remote/.fluxon_release.stage.abc123\'"\'"\' \'"\'"\'/remote/fluxon_release\'"\'"\'', cmd)
+        self.assertIn('rm -rf "$backup" || {', cmd)
+        self.assertIn("[manual_dispatch_release] warning: failed to remove old staged backup; keep it for later cleanup:", cmd)
+
     def test_deploy_and_profiles_dispatches_test_rsc_tree(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             release_dir = Path(td)

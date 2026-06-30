@@ -353,6 +353,41 @@ def test_parse_cluster_nodes_accepts_local_execution_mode() -> None:
     print("PASS: test_parse_cluster_nodes_accepts_local_execution_mode")
 
 
+def test_resolve_local_node_cfg_accepts_remote_only_controller_host() -> None:
+    module = _load_start_test_bed_module()
+    cluster_nodes = {
+        "gpu-a": {
+            "hostname": "gpu-a",
+            "ip": "10.233.111.42",
+            "hostworkdir": "/srv/gpu-a",
+            "execution_mode": "ssh",
+            "ssh_host": "116.238.240.2",
+            "ssh_user": "root",
+            "ssh_port": 30245,
+        },
+        "gpu-b": {
+            "hostname": "gpu-b",
+            "ip": "10.233.114.86",
+            "hostworkdir": "/srv/gpu-b",
+            "execution_mode": "ssh",
+            "ssh_host": "116.238.240.2",
+            "ssh_user": "root",
+            "ssh_port": 31408,
+        },
+    }
+    original_check_output = module.subprocess.check_output
+    try:
+        module.subprocess.check_output = lambda *args, **kwargs: "infra44-ThinkStation-PX\n"
+        resolved = module._resolve_local_node_cfg(
+            cluster_nodes,
+            controller_url="http://10.233.111.42:53180/r/ops/fluxon_gpu_monitor_remote",
+        )
+    finally:
+        module.subprocess.check_output = original_check_output
+    assert resolved is cluster_nodes["gpu-a"], resolved
+    print("PASS: test_resolve_local_node_cfg_accepts_remote_only_controller_host")
+
+
 def test_run_bare_waves_treats_local_execution_mode_node_as_local() -> None:
     module = _load_start_test_bed_module()
     cluster_nodes = {
@@ -442,6 +477,99 @@ def test_run_bare_waves_treats_local_execution_mode_node_as_local() -> None:
         module._bare_wave_bootstrap_log_path = original_log_path
     assert calls == [("local", "logic-a"), ("local", "logic-b")], calls
     print("PASS: test_run_bare_waves_treats_local_execution_mode_node_as_local")
+
+
+def test_run_bare_waves_stops_legacy_plain_services_before_atomic_launch() -> None:
+    module = _load_start_test_bed_module()
+    cluster_nodes = {
+        "logic-a": {
+            "hostname": "logic-a",
+            "ip": "127.0.0.1",
+            "hostworkdir": "/tmp/logic-a",
+            "execution_mode": "local",
+            "ssh_user": "tester",
+            "ssh_port": 22,
+        },
+    }
+    deployconf = {
+        "name_prefix": "fluxon-testbed",
+        "service": {
+            "master": {"node_bind": {"node": ["logic-a"]}},
+            "owner": {"node_bind": {"node": ["logic-a"]}},
+            "ops_controller": {"node_bind": {"node": ["logic-a"]}},
+            "ops_agent": {"node_bind": {"node": ["logic-a"]}},
+        },
+        "atomic_groups": {
+            "fluxon_core_controller": {
+                "phase": 1,
+                "nodes": ["logic-a"],
+                "services": ["master", "owner", "ops_controller", "ops_agent"],
+            }
+        },
+    }
+    stop_calls: list[str] = []
+    spawn_calls: list[str] = []
+    original_run_local_stop = module._run_local_stop
+    original_spawn_local = module._spawn_local_start
+    original_join = module._join_bare_launch
+    original_collect = module._collect_bare_runtime_statuses
+    original_bare_script_name = module._selection_bare_script_name
+    original_service_names = module._selection_service_names_for_target_node
+    original_log_path = module._bare_wave_bootstrap_log_path
+    try:
+        module._run_local_stop = lambda *, local_node_cfg, service_name: stop_calls.append(
+            f"{local_node_cfg['hostname']}:{service_name}"
+        )
+        module._spawn_local_start = lambda **kwargs: spawn_calls.append(kwargs["selection_name"]) or {
+            "mode": "local",
+            "node_name": kwargs["local_node_cfg"]["hostname"],
+            "selection_name": kwargs["selection_name"],
+            "bare_script_name": kwargs["bare_script_name"],
+            "bootstrap_log_path": kwargs["bootstrap_log_path"],
+            "expected_service_names": kwargs["expected_service_names"],
+            "launch_error": None,
+            "launcher_rc": 0,
+            "runtime_statuses": [],
+        }
+        module._join_bare_launch = lambda result: None
+        module._collect_bare_runtime_statuses = lambda **kwargs: []
+        module._selection_bare_script_name = lambda **kwargs: "fluxon_core_controller"
+        module._selection_service_names_for_target_node = (
+            lambda **kwargs: ["master", "owner", "ops_controller", "ops_agent"]
+        )
+        module._bare_wave_bootstrap_log_path = (
+            lambda **kwargs: Path("/tmp") / f"{kwargs['node_name']}_{kwargs['selection_name']}.log"
+        )
+        module._run_bare_waves(
+            workdir=Path("/tmp"),
+            deployconf=deployconf,
+            cluster_nodes=cluster_nodes,
+            local_node_cfg=cluster_nodes["logic-a"],
+            waves=[
+                {
+                    "launches": [
+                        {"node": "logic-a", "selection_name": "fluxon_core_controller"},
+                    ]
+                }
+            ],
+            bootstrap_bare_services=set(),
+        )
+    finally:
+        module._run_local_stop = original_run_local_stop
+        module._spawn_local_start = original_spawn_local
+        module._join_bare_launch = original_join
+        module._collect_bare_runtime_statuses = original_collect
+        module._selection_bare_script_name = original_bare_script_name
+        module._selection_service_names_for_target_node = original_service_names
+        module._bare_wave_bootstrap_log_path = original_log_path
+    assert stop_calls == [
+        "logic-a:master",
+        "logic-a:owner",
+        "logic-a:ops_controller",
+        "logic-a:ops_agent",
+    ], stop_calls
+    assert spawn_calls == ["fluxon_core_controller"], spawn_calls
+    print("PASS: test_run_bare_waves_stops_legacy_plain_services_before_atomic_launch")
 
 
 def test_local_coverage_bootstrap_excludes_duplicate_local_control_plane_selection() -> None:
@@ -1094,7 +1222,7 @@ service:
             encoding="utf-8",
         )
 
-        original_read_local_release_manifest_sha256 = module._read_local_release_manifest_sha256
+        original_read_release_manifest_sha256 = module._read_release_manifest_sha256
         original_with_release_manifest_sha256_env = module._with_release_manifest_sha256_env
         original_generate_daemonset_artifacts = module._generate_daemonset_artifacts
         original_refresh_cluster_bare_deploy_scripts = module._refresh_cluster_bare_deploy_scripts
@@ -1120,7 +1248,7 @@ service:
         call_sequence: list[str] = []
 
         try:
-            module._read_local_release_manifest_sha256 = lambda **_: "sha256"
+            module._read_release_manifest_sha256 = lambda **_: "sha256"
             module._with_release_manifest_sha256_env = lambda **kwargs: kwargs["deployconf"]
             module._generate_daemonset_artifacts = lambda **_: None
             module._refresh_cluster_bare_deploy_scripts = lambda **_: None
@@ -1194,7 +1322,7 @@ service:
             finally:
                 sys.argv = original_argv
         finally:
-            module._read_local_release_manifest_sha256 = original_read_local_release_manifest_sha256
+            module._read_release_manifest_sha256 = original_read_release_manifest_sha256
             module._with_release_manifest_sha256_env = original_with_release_manifest_sha256_env
             module._generate_daemonset_artifacts = original_generate_daemonset_artifacts
             module._refresh_cluster_bare_deploy_scripts = original_refresh_cluster_bare_deploy_scripts
@@ -1321,7 +1449,7 @@ service:
             encoding="utf-8",
         )
 
-        original_read_local_release_manifest_sha256 = module._read_local_release_manifest_sha256
+        original_read_release_manifest_sha256 = module._read_release_manifest_sha256
         original_with_release_manifest_sha256_env = module._with_release_manifest_sha256_env
         original_generate_daemonset_artifacts = module._generate_daemonset_artifacts
         original_refresh_cluster_bare_deploy_scripts = module._refresh_cluster_bare_deploy_scripts
@@ -1339,7 +1467,7 @@ service:
         run_calls: list[tuple[str, object]] = []
 
         try:
-            module._read_local_release_manifest_sha256 = lambda **_: "sha256"
+            module._read_release_manifest_sha256 = lambda **_: "sha256"
             module._with_release_manifest_sha256_env = lambda **kwargs: kwargs["deployconf"]
             module._generate_daemonset_artifacts = lambda **_: run_calls.append(("generate", None))
             module._refresh_cluster_bare_deploy_scripts = lambda **_: run_calls.append(("refresh_bare", None))
@@ -1390,7 +1518,7 @@ service:
             finally:
                 sys.argv = original_argv
         finally:
-            module._read_local_release_manifest_sha256 = original_read_local_release_manifest_sha256
+            module._read_release_manifest_sha256 = original_read_release_manifest_sha256
             module._with_release_manifest_sha256_env = original_with_release_manifest_sha256_env
             module._generate_daemonset_artifacts = original_generate_daemonset_artifacts
             module._refresh_cluster_bare_deploy_scripts = original_refresh_cluster_bare_deploy_scripts
@@ -1519,10 +1647,18 @@ def main() -> int:
             test_run_bare_waves_treats_local_execution_mode_node_as_local,
         ),
         (
+            "run_bare_waves_stops_legacy_plain_services_before_atomic_launch",
+            test_run_bare_waves_stops_legacy_plain_services_before_atomic_launch,
+        ),
+        (
             "local_coverage_bootstrap_excludes_duplicate_local_control_plane_selection",
             test_local_coverage_bootstrap_excludes_duplicate_local_control_plane_selection,
         ),
         ("parse_test_runner_ui_config_resolves_paths", test_parse_test_runner_ui_config_resolves_paths),
+        (
+            "resolve_local_node_cfg_accepts_remote_only_controller_host",
+            test_resolve_local_node_cfg_accepts_remote_only_controller_host,
+        ),
         (
             "normalize_bootstrap_deployconf_strips_legacy_master_p2p_listen_port",
             test_normalize_bootstrap_deployconf_strips_legacy_master_p2p_listen_port,

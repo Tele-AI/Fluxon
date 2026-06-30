@@ -11,6 +11,7 @@
 ### 0.2.1
 
 - [PERF] Optimize `RPC`, `KV`, and `FS` performance
+- [TOOL] Add GPU resource columns and trend curves to the KV monitoring panel
 - [MQ] Fix MQ control-plane scalability issues
 - [ETCD] Fix the gRPC size limit issue when listing etcd prefixes
 - [OSS] Improve open-source readiness and related workflows

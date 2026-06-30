@@ -160,6 +160,35 @@ python3 examples/start_master_owner.py
 python3 examples/start_master_owner.py --without-master
 ```
 
+The `master_ui` block starts the KV Web UI from the master process. With the example above, open:
+
+```text
+http://<host-ip-or-domain>:18080/view?cluster_name=demo-kv-cluster&member_kind=kv
+```
+
+The KV Web UI shows the KV member table and the `Metric Trends` chart panel. The table's `gpu` column summarizes GPU memory, utilization, temperature, and GPU process activity for each sampled node. `Metric Trends` can plot `GPU Memory Used`, `GPU Memory Total`, `GPU Util %`, `GPU Temp`, `GPU Proc Count`, `GPU Proc SM %`, and `GPU Proc Mem %`.
+
+GPU monitoring uses the standard Fluxon observability path:
+
+```text
+owner/master system-metric sampling
+  -> nvidia-smi
+  -> Prometheus remote-write
+  -> Greptime / Prometheus query API
+  -> KV Web UI
+```
+
+GPU curves require:
+
+| Item | Requirement |
+| --- | --- |
+| GPU visibility | The sampling process can run `nvidia-smi` and can see the target GPUs. |
+| Metric write path | `monitoring.prom_remote_write_url` points to a writable Greptime/Prometheus remote-write endpoint. |
+| Metric query path | `monitoring.prometheus_base_url` points to a queryable Prometheus API, for example Greptime's `/v1/prometheus`. |
+| Sampling scope | GPU metrics follow the system-metric sampling roles: master and owner/client processes report visible node resources; external clients do not duplicate system-resource sampling. |
+
+If a machine has no GPU, lacks `nvidia-smi`, or the process cannot access the GPU, the KV process keeps running. The member table shows `N/A` for `gpu`, and GPU trend cards have no samples.
+
 ### Lifecycle and Call Flow
 
 ```text

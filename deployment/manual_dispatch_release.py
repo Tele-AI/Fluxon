@@ -1063,7 +1063,17 @@ def _finalize_remote_staged_dir(
                 + sh_quote(stage_dir_s)
                 + " "
                 + sh_quote(dst_dir_s)
-                + " && rm -rf \"$backup\""
+                + " && "
+                + "if [ -n \"${backup:-}\" ] && [ -e \"$backup\" -o -L \"$backup\" ]; then "
+                + "rm -rf \"$backup\" || "
+                + "{ "
+                + "echo "
+                + sh_quote(
+                    "[manual_dispatch_release] warning: failed to remove old staged backup; keep it for later cleanup: "
+                )
+                + " \"$backup\" 1>&2; "
+                + "}; "
+                + "fi"
             )
         ),
     )

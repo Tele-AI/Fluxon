@@ -2,12 +2,16 @@ use crate::model::MemberRole;
 use anyhow::Context;
 use fluxon_observability::keys::{
     PROM_LABEL_FS_IO_OP, PROM_LABEL_FS_MOUNT_KIND, PROM_LABEL_FS_MOUNTPOINT_DIR_ABS,
-    PROM_LABEL_FS_TARGET_DIR_ABS, PROM_LABEL_MQ_CHAN_ID, PROM_LABEL_MQ_CONSUMER_IDX,
-    PROM_LABEL_MQ_METRIC, PROM_LABEL_MQ_PRODUCER_IDX, PROM_LABEL_MQ_STAT, PROM_LABEL_NODE,
-    PROM_LABEL_PEER, PROM_METRIC_CONTAINER_MEMORY_LIMIT_BYTES,
-    PROM_METRIC_CONTAINER_MEMORY_USAGE_BYTES, PROM_METRIC_FS_IO_OPS_TOTAL,
-    PROM_METRIC_FS_MOUNT_FS_TOTAL_BYTES, PROM_METRIC_FS_MOUNT_FS_USED_BYTES,
-    PROM_METRIC_KV_PEER_NETWORK_BYTES_TOTAL,
+    PROM_LABEL_FS_TARGET_DIR_ABS, PROM_LABEL_GPU_INDEX, PROM_LABEL_GPU_NAME, PROM_LABEL_MQ_CHAN_ID,
+    PROM_LABEL_MQ_CONSUMER_IDX, PROM_LABEL_MQ_METRIC, PROM_LABEL_MQ_PRODUCER_IDX,
+    PROM_LABEL_MQ_STAT, PROM_LABEL_NODE, PROM_LABEL_PEER, PROM_METRIC_CLIENT_NETWORK_MBPS,
+    PROM_METRIC_CONTAINER_MEMORY_LIMIT_BYTES, PROM_METRIC_CONTAINER_MEMORY_USAGE_BYTES,
+    PROM_METRIC_FS_IO_OPS_TOTAL, PROM_METRIC_FS_MOUNT_FS_TOTAL_BYTES,
+    PROM_METRIC_FS_MOUNT_FS_USED_BYTES, PROM_METRIC_GPU_MEMORY_TOTAL_BYTES,
+    PROM_METRIC_GPU_MEMORY_USED_BYTES, PROM_METRIC_GPU_PROCESS_COUNT,
+    PROM_METRIC_GPU_PROCESS_MEMORY_UTILIZATION_PERCENT,
+    PROM_METRIC_GPU_PROCESS_SM_UTILIZATION_PERCENT, PROM_METRIC_GPU_TEMPERATURE_CELSIUS,
+    PROM_METRIC_GPU_UTILIZATION_PERCENT, PROM_METRIC_KV_PEER_NETWORK_BYTES_TOTAL,
     PROM_METRIC_MQ_CONSUMER_NONBLOCKING_LATEST_INTERVAL_UNIX_MS,
     PROM_METRIC_MQ_CONSUMER_NONBLOCKING_LATEST_PHASE_CALLS,
     PROM_METRIC_MQ_CONSUMER_NONBLOCKING_LATEST_PHASE_RPS, PROM_METRIC_MQ_GET_ONE_LATENCY_US,
@@ -234,6 +238,17 @@ pub struct PromRangeSeries {
     pub values: Vec<(f64, String)>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GpuPromSnapshot {
+    pub memory_used_bytes: Option<f64>,
+    pub memory_total_bytes: Option<f64>,
+    pub utilization_percent: Option<f64>,
+    pub temperature_celsius: Option<f64>,
+    pub process_count: Option<f64>,
+    pub process_sm_utilization_percent: Option<f64>,
+    pub process_memory_utilization_percent: Option<f64>,
+}
+
 pub struct PromSnapshotMaps {
     pub node_cpu_usage_percent: HashMap<String, f64>,
     pub node_cpu_logical_cores: HashMap<String, f64>,
@@ -241,6 +256,7 @@ pub struct PromSnapshotMaps {
     pub node_memory_total_bytes: HashMap<String, f64>,
     pub container_memory_usage_bytes: HashMap<String, f64>,
     pub container_memory_limit_bytes: HashMap<String, f64>,
+    pub gpu_by_node_index_name: HashMap<(String, String, String), GpuPromSnapshot>,
     pub process_resident_memory_bytes: HashMap<String, f64>,
     pub process_cpu_usage_percent: HashMap<String, f64>,
     pub tokio_num_workers: HashMap<String, f64>,
@@ -291,6 +307,7 @@ impl PromSnapshotMaps {
             node_memory_total_bytes: HashMap::new(),
             container_memory_usage_bytes: HashMap::new(),
             container_memory_limit_bytes: HashMap::new(),
+            gpu_by_node_index_name: HashMap::new(),
             process_resident_memory_bytes: HashMap::new(),
             process_cpu_usage_percent: HashMap::new(),
             tokio_num_workers: HashMap::new(),
@@ -457,6 +474,39 @@ fn take_node_device_metric(samples: &[PromSample]) -> HashMap<(String, String), 
         out.insert((node.clone(), device.clone()), v);
     }
     out
+}
+
+fn take_gpu_metric(samples: &[PromSample]) -> HashMap<(String, String, String), f64> {
+    let mut out = HashMap::new();
+    for s in samples {
+        let Some(node) = s.metric.get(PROM_LABEL_NODE) else {
+            continue;
+        };
+        let Some(gpu_index) = s.metric.get(PROM_LABEL_GPU_INDEX) else {
+            continue;
+        };
+        let Some(gpu_name) = s.metric.get(PROM_LABEL_GPU_NAME) else {
+            continue;
+        };
+        let Some(v) = s.value_f64() else {
+            continue;
+        };
+        out.insert((node.clone(), gpu_index.clone(), gpu_name.clone()), v);
+    }
+    out
+}
+
+fn merge_gpu_metric<F>(
+    dst: &mut HashMap<(String, String, String), GpuPromSnapshot>,
+    src: HashMap<(String, String, String), f64>,
+    mut set: F,
+) where
+    F: FnMut(&mut GpuPromSnapshot, f64),
+{
+    for (key, value) in src {
+        let gpu = dst.entry(key).or_default();
+        set(gpu, value);
+    }
 }
 
 pub fn role_from_member_metadata(meta: &BTreeMap<String, String>) -> MemberRole {
@@ -1090,6 +1140,97 @@ pub async fn collect_prom_snapshot(
         )
         .await,
     );
+    merge_gpu_metric(
+        &mut out.gpu_by_node_index_name,
+        take_gpu_metric(
+            &q(
+                prom,
+                warnings,
+                PROM_METRIC_GPU_MEMORY_USED_BYTES,
+                PROM_METRIC_GPU_MEMORY_USED_BYTES,
+            )
+            .await,
+        ),
+        |gpu, v| gpu.memory_used_bytes = Some(v),
+    );
+    merge_gpu_metric(
+        &mut out.gpu_by_node_index_name,
+        take_gpu_metric(
+            &q(
+                prom,
+                warnings,
+                PROM_METRIC_GPU_MEMORY_TOTAL_BYTES,
+                PROM_METRIC_GPU_MEMORY_TOTAL_BYTES,
+            )
+            .await,
+        ),
+        |gpu, v| gpu.memory_total_bytes = Some(v),
+    );
+    merge_gpu_metric(
+        &mut out.gpu_by_node_index_name,
+        take_gpu_metric(
+            &q(
+                prom,
+                warnings,
+                PROM_METRIC_GPU_UTILIZATION_PERCENT,
+                PROM_METRIC_GPU_UTILIZATION_PERCENT,
+            )
+            .await,
+        ),
+        |gpu, v| gpu.utilization_percent = Some(v),
+    );
+    merge_gpu_metric(
+        &mut out.gpu_by_node_index_name,
+        take_gpu_metric(
+            &q(
+                prom,
+                warnings,
+                PROM_METRIC_GPU_TEMPERATURE_CELSIUS,
+                PROM_METRIC_GPU_TEMPERATURE_CELSIUS,
+            )
+            .await,
+        ),
+        |gpu, v| gpu.temperature_celsius = Some(v),
+    );
+    merge_gpu_metric(
+        &mut out.gpu_by_node_index_name,
+        take_gpu_metric(
+            &q(
+                prom,
+                warnings,
+                PROM_METRIC_GPU_PROCESS_COUNT,
+                PROM_METRIC_GPU_PROCESS_COUNT,
+            )
+            .await,
+        ),
+        |gpu, v| gpu.process_count = Some(v),
+    );
+    merge_gpu_metric(
+        &mut out.gpu_by_node_index_name,
+        take_gpu_metric(
+            &q(
+                prom,
+                warnings,
+                PROM_METRIC_GPU_PROCESS_SM_UTILIZATION_PERCENT,
+                PROM_METRIC_GPU_PROCESS_SM_UTILIZATION_PERCENT,
+            )
+            .await,
+        ),
+        |gpu, v| gpu.process_sm_utilization_percent = Some(v),
+    );
+    merge_gpu_metric(
+        &mut out.gpu_by_node_index_name,
+        take_gpu_metric(
+            &q(
+                prom,
+                warnings,
+                PROM_METRIC_GPU_PROCESS_MEMORY_UTILIZATION_PERCENT,
+                PROM_METRIC_GPU_PROCESS_MEMORY_UTILIZATION_PERCENT,
+            )
+            .await,
+        ),
+        |gpu, v| gpu.process_memory_utilization_percent = Some(v),
+    );
     out.process_resident_memory_bytes = take_node_metric(
         &q(
             prom,
@@ -1168,7 +1309,7 @@ pub async fn collect_prom_snapshot(
             prom,
             warnings,
             "process_network_tx_mbps",
-            "sum by (node) (rate(client_network_bytes_total{direction=\"tx\"}[2m])) * 8 / 1000000",
+            &format!("{PROM_METRIC_CLIENT_NETWORK_MBPS}{{direction=\"tx\"}}"),
         )
         .await,
     );
@@ -1177,7 +1318,7 @@ pub async fn collect_prom_snapshot(
             prom,
             warnings,
             "process_network_rx_mbps",
-            "sum by (node) (rate(client_network_bytes_total{direction=\"rx\"}[2m])) * 8 / 1000000",
+            &format!("{PROM_METRIC_CLIENT_NETWORK_MBPS}{{direction=\"rx\"}}"),
         )
         .await,
     );

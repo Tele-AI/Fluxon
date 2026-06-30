@@ -30,7 +30,7 @@ pub const OPS_PANEL_SERVICE_NAME: &str = "ops";
 
 use crate::config::{AVAILABLE_MEMBER_KINDS, MemberKind, MonitorConfig};
 use crate::model::{
-    ClusterMember, ClusterSnapshot, ClustersResponse, MemberRdmaDeviceSnapshot,
+    ClusterMember, ClusterSnapshot, ClustersResponse, GpuSnapshot, MemberRdmaDeviceSnapshot,
     MemberRdmaPortSnapshot, MemberSnapshot, NodeSnapshot, RdmaNetdevRateSnapshot,
     TransferEngineEdge,
 };
@@ -1359,6 +1359,7 @@ async fn build_fs_cluster_snapshot(
             node_memory_total_bytes: None,
             container_memory_usage_bytes: None,
             container_memory_limit_bytes: None,
+            gpus: Vec::new(),
             process_resident_memory_bytes: None,
             process_cpu_usage_percent: None,
             tokio_num_workers: None,
@@ -1864,6 +1865,38 @@ pub async fn build_cluster_snapshot_with_prom_query_time(
     let seg_used_bytes_by_node =
         sum_segment_bytes_by_node(&prom_maps.seg_used_bytes_by_node_device);
 
+    fn gpu_snapshots_for_member(
+        prom_maps: &crate::prom::PromSnapshotMaps,
+        member_id: &str,
+    ) -> Vec<GpuSnapshot> {
+        let mut out = Vec::new();
+        for ((node, index, name), gpu) in &prom_maps.gpu_by_node_index_name {
+            if node != member_id {
+                continue;
+            }
+            out.push(GpuSnapshot {
+                index: index.clone(),
+                name: name.clone(),
+                memory_used_bytes: gpu.memory_used_bytes,
+                memory_total_bytes: gpu.memory_total_bytes,
+                utilization_percent: gpu.utilization_percent,
+                temperature_celsius: gpu.temperature_celsius,
+                process_count: gpu.process_count,
+                process_sm_utilization_percent: gpu.process_sm_utilization_percent,
+                process_memory_utilization_percent: gpu.process_memory_utilization_percent,
+            });
+        }
+        out.sort_by(|a, b| {
+            let ai = a.index.parse::<u32>();
+            let bi = b.index.parse::<u32>();
+            match (ai, bi) {
+                (Ok(ai), Ok(bi)) => ai.cmp(&bi),
+                _ => a.index.cmp(&b.index),
+            }
+        });
+        out
+    }
+
     async fn prom_scalar_best_effort(
         warnings: &mut Vec<String>,
         prom: &PromClient,
@@ -2068,6 +2101,7 @@ pub async fn build_cluster_snapshot_with_prom_query_time(
                 .container_memory_limit_bytes
                 .get(&member_id)
                 .copied(),
+            gpus: gpu_snapshots_for_member(&prom_maps, &member_id),
             process_resident_memory_bytes: prom_maps
                 .process_resident_memory_bytes
                 .get(&member_id)

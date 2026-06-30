@@ -64,6 +64,7 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("bootstrap_start_reuses_already_present_selection", test_bootstrap_start_reuses_already_present_selection),
         ("bare_start_fails_when_child_exits_within_startup_window", test_bare_start_fails_when_child_exits_within_startup_window),
         ("pid_ready_check_requires_full_stable_window_after_first_child_observation", test_pid_ready_check_requires_full_stable_window_after_first_child_observation),
+        ("pid_ready_check_ignores_nested_selection_supervisor_children", test_pid_ready_check_ignores_nested_selection_supervisor_children),
         ("atomic_group_start_does_not_auto_stop_on_failure", test_atomic_group_start_does_not_auto_stop_on_failure),
         ("atomic_group_preserves_nested_heredoc_terminator", test_atomic_group_preserves_nested_heredoc_terminator),
         ("atomic_group_stop_script_is_shell_valid", test_atomic_group_stop_script_is_shell_valid),
@@ -810,6 +811,142 @@ def test_pid_ready_check_requires_full_stable_window_after_first_child_observati
         assert "unexpected success" not in result.stdout, result.stdout
         assert "child pid not stable long enough" in result.stdout, result.stdout
         print("PASS: test_pid_ready_check_requires_full_stable_window_after_first_child_observation")
+
+
+def test_pid_ready_check_ignores_nested_selection_supervisor_children() -> None:
+    proc_lifecycle = _load_python_module(
+        module_name="test_proc_lifecycle_codegen_nested_supervisor_runtime",
+        path=DEPLOYMENT_DIR / "utils" / "proc_lifecycle_codegen.py",
+    )
+    helpers = proc_lifecycle.render_bash_proc_lifecycle_funcs_pid_tree(
+        timeouts=proc_lifecycle.StopTimeouts(term_seconds=60, kill_seconds=10, supersede_seconds=30)
+    )
+    with tempfile.TemporaryDirectory(prefix="test_proc_lifecycle_nested_supervisor_") as td:
+        tmpdir = Path(td)
+        shell_script = tmpdir / "probe.sh"
+        root_script = tmpdir / "root_supervisor.py"
+        child_script = tmpdir / "real_child.py"
+        nested_supervisor_script = tmpdir / "selection_supervisor.py"
+
+        child_script.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import signal
+                import time
+
+                def _shutdown(_signum, _frame):
+                    raise SystemExit(0)
+
+                signal.signal(signal.SIGTERM, _shutdown)
+                signal.signal(signal.SIGINT, _shutdown)
+
+                while True:
+                    time.sleep(0.2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        nested_supervisor_script.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import signal
+                import time
+
+                def _shutdown(_signum, _frame):
+                    raise SystemExit(0)
+
+                signal.signal(signal.SIGTERM, _shutdown)
+                signal.signal(signal.SIGINT, _shutdown)
+
+                while True:
+                    time.sleep(0.2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        root_script.write_text(
+            textwrap.dedent(
+                f"""
+                #!/usr/bin/env python3
+                import signal
+                import subprocess
+                import sys
+                import time
+                from pathlib import Path
+
+                procs = []
+
+                def _shutdown(_signum, _frame):
+                    for proc in procs:
+                        if proc.poll() is None:
+                            proc.terminate()
+                    deadline = time.time() + 5
+                    for proc in procs:
+                        if proc.poll() is None:
+                            try:
+                                proc.wait(timeout=max(0.0, deadline - time.time()))
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                    raise SystemExit(0)
+
+                signal.signal(signal.SIGTERM, _shutdown)
+                signal.signal(signal.SIGINT, _shutdown)
+
+                procs.append(subprocess.Popen([sys.executable, str(Path({str(child_script)!r}))]))
+                procs.append(subprocess.Popen([sys.executable, str(Path({str(nested_supervisor_script)!r}))]))
+                while True:
+                    for proc in procs:
+                        if proc.poll() is not None:
+                            raise SystemExit(proc.returncode or 0)
+                    time.sleep(0.2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        shell_script.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                {helpers}
+                python3 {shlex.quote(str(root_script))} &
+                root_pid="$!"
+                startup_deadline_seconds=6
+                if ! wait_service_probably_ready_pid_tree "svc_plain" "$root_pid" 4 "$startup_deadline_seconds" "[test]"; then
+                  wait_rc="$?"
+                  kill "$root_pid" >/dev/null 2>&1 || true
+                  wait "$root_pid" >/dev/null 2>&1 || true
+                  exit "$wait_rc"
+                fi
+                kill "$root_pid" >/dev/null 2>&1 || true
+                wait "$root_pid" >/dev/null 2>&1 || true
+                exit 0
+                """
+            ),
+            encoding="utf-8",
+        )
+        shell_script.chmod(0o755)
+
+        result = subprocess.run(
+            ["bash", str(shell_script)],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(DEPLOYMENT_DIR.parent),
+            timeout=20,
+        )
+        assert result.returncode == 0, (
+            f"expected startup gate success rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert "multiple direct child pids" not in result.stdout, result.stdout
+        assert "probable-ready: ok" in result.stdout, result.stdout
+        print("PASS: test_pid_ready_check_ignores_nested_selection_supervisor_children")
 
 
 def test_atomic_group_preserves_nested_heredoc_terminator() -> None:

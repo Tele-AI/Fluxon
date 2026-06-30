@@ -200,6 +200,29 @@ master_ui:
 http://<host-ip-or-domain>:18080/view?cluster_name=demo-kv-cluster&member_kind=kv
 ```
 
+KV Web UI 会直接展示 KV 成员表和 `Metric Trends` 曲线面板。成员表的 `gpu` 列展示每个采样节点上 GPU 的显存、利用率、温度和 GPU 进程摘要；`Metric Trends` 里可以查看 `GPU Memory Used`、`GPU Memory Total`、`GPU Util %`、`GPU Temp`、`GPU Proc Count`、`GPU Proc SM %` 和 `GPU Proc Mem %` 的可视化曲线。
+
+GPU 监控使用 Fluxon 的标准监控链路：
+
+```text
+owner/master 系统指标采样
+  -> nvidia-smi
+  -> Prometheus remote-write
+  -> Greptime / Prometheus query API
+  -> KV Web UI
+```
+
+使用 GPU 曲线需要满足这些前置条件：
+
+| 项 | 要求 |
+| --- | --- |
+| GPU 可见性 | 采样进程所在机器能执行 `nvidia-smi`，并能看到目标 GPU。 |
+| 监控写入 | `monitoring.prom_remote_write_url` 指向可写的 Greptime/Prometheus remote-write 接口。 |
+| 监控查询 | `monitoring.prometheus_base_url` 指向可查询的 Prometheus API，例如 Greptime 的 `/v1/prometheus`。 |
+| 采样范围 | 当前 GPU 指标跟随系统指标采样角色，覆盖 master 和 owner/client 进程可见的节点资源；external client 不重复采样系统资源。 |
+
+如果机器没有 GPU、没有 `nvidia-smi`，或进程没有访问 GPU 的权限，KV 进程仍会继续运行；对应成员的 `gpu` 列显示 `N/A`，GPU 趋势卡片没有样本。
+
 `owner` 把共享内存池和 `shared.json` 准备好之后，再运行下面的业务最小示例。
 
 ### 生命周期与调用流程（Call Flow）

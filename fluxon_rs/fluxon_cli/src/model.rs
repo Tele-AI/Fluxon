@@ -56,6 +56,26 @@ pub struct RdmaNetdevRateSnapshot {
     pub rx_mbps: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GpuSnapshot {
+    pub index: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_used_bytes: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_total_bytes: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub utilization_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature_celsius: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_count: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_sm_utilization_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_memory_utilization_percent: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvTopologyOwnerExternalMaxSnapshot {
     pub owner_id: String,
@@ -379,6 +399,79 @@ fn fmt_bytes_per_sec_from_mbps(v_mbps: Option<f64>) -> (String, UiPillStatus) {
     fmt_bytes_auto(Some(bytes_per_sec), true)
 }
 
+fn fmt_bytes_gib_short(v: Option<f64>) -> String {
+    match v {
+        Some(bytes) => format!("{:.1}G", bytes / 1024.0 / 1024.0 / 1024.0),
+        None => "-".to_string(),
+    }
+}
+
+fn fmt_percent_short(v: Option<f64>) -> String {
+    match v {
+        Some(v) => format!("{:.0}%", v),
+        None => "-".to_string(),
+    }
+}
+
+fn fmt_temp_short(v: Option<f64>) -> String {
+    match v {
+        Some(v) => format!("{:.0}C", v),
+        None => "-".to_string(),
+    }
+}
+
+fn fmt_count_short(v: Option<f64>) -> String {
+    match v {
+        Some(v) => format!("{:.0}", v),
+        None => "-".to_string(),
+    }
+}
+
+fn render_gpu_summary(gpus: &[GpuSnapshot]) -> String {
+    if gpus.is_empty() {
+        return "N/A".to_string();
+    }
+
+    let mut rows: Vec<&GpuSnapshot> = gpus.iter().collect();
+    rows.sort_by(|a, b| {
+        let ai = a.index.parse::<u32>();
+        let bi = b.index.parse::<u32>();
+        match (ai, bi) {
+            (Ok(ai), Ok(bi)) => ai.cmp(&bi),
+            _ => a.index.cmp(&b.index),
+        }
+    });
+
+    rows.into_iter()
+        .map(|g| {
+            format!(
+                "{}: {}/{} util={} temp={} p={} sm={} pmem={}",
+                g.index,
+                fmt_bytes_gib_short(g.memory_used_bytes),
+                fmt_bytes_gib_short(g.memory_total_bytes),
+                fmt_percent_short(g.utilization_percent),
+                fmt_temp_short(g.temperature_celsius),
+                fmt_count_short(g.process_count),
+                fmt_percent_short(g.process_sm_utilization_percent),
+                fmt_percent_short(g.process_memory_utilization_percent),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn max_gpu_memory_used(gpus: &[GpuSnapshot]) -> Option<f64> {
+    gpus.iter()
+        .filter_map(|g| g.memory_used_bytes)
+        .fold(None, |acc, v| Some(acc.map(|a| a.max(v)).unwrap_or(v)))
+}
+
+fn max_gpu_utilization(gpus: &[GpuSnapshot]) -> Option<f64> {
+    gpus.iter()
+        .filter_map(|g| g.utilization_percent)
+        .fold(None, |acc, v| Some(acc.map(|a| a.max(v)).unwrap_or(v)))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfigSnapshot {
     pub subnet_whitelist: Vec<String>,
@@ -528,6 +621,7 @@ pub struct MemberSnapshot {
     pub node_memory_total_bytes: Option<f64>,
     pub container_memory_usage_bytes: Option<f64>,
     pub container_memory_limit_bytes: Option<f64>,
+    pub gpus: Vec<GpuSnapshot>,
     pub process_resident_memory_bytes: Option<f64>,
     pub process_cpu_usage_percent: Option<f64>,
     pub tokio_num_workers: Option<f64>,
@@ -1531,6 +1625,9 @@ pub struct MemberTableRowView {
     pub shared_mem_dir_text: String,
     pub p2p_listen_port_text: String,
     pub rdma_text: String,
+    pub gpu_text: String,
+    pub gpu_memory_used_sort: String,
+    pub gpu_utilization_sort: String,
     pub search_text: String,
     pub cpu_text: String,
     pub cpu_sort: String,
@@ -1937,6 +2034,7 @@ pub fn build_member_table_rows(snapshot: &ClusterSnapshot) -> Vec<MemberTableRow
                 }
                 parts.join(" ").trim().to_string()
             };
+            let gpu_text = render_gpu_summary(&m.gpus);
             let search_text = [
                 node.node_key.as_str(),
                 m.member_id.as_str(),
@@ -1946,6 +2044,7 @@ pub fn build_member_table_rows(snapshot: &ClusterSnapshot) -> Vec<MemberTableRow
                 accessible_ip_text.as_str(),
                 shared_mem_dir_text.as_str(),
                 rdma_text.as_str(),
+                gpu_text.as_str(),
             ]
             .join(" ");
 
@@ -1980,6 +2079,9 @@ pub fn build_member_table_rows(snapshot: &ClusterSnapshot) -> Vec<MemberTableRow
                 shared_mem_dir_text,
                 p2p_listen_port_text,
                 rdma_text,
+                gpu_text,
+                gpu_memory_used_sort: sort_value_opt(max_gpu_memory_used(&m.gpus)),
+                gpu_utilization_sort: sort_value_opt(max_gpu_utilization(&m.gpus)),
                 search_text,
                 cpu_text,
                 cpu_sort: sort_value_opt(m.node_cpu_usage_percent),
