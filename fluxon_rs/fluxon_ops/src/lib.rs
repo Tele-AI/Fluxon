@@ -6183,18 +6183,24 @@ impl DesiredStore {
         Ok(())
     }
 
-    async fn remove_apply(&self, apply_id: &str) -> anyhow::Result<Vec<DesiredWorkload>> {
+    async fn remove_apply(&self, apply_id: &str) -> anyhow::Result<bool> {
         let apply_id = validate_apply_id_for_file(apply_id)?;
 
         // Serialize persistence so on-disk desired is never interleaved by concurrent HTTP requests.
         let _guard = self.persist_guard.lock().await;
 
         let apply_path = desired_apply_record_file_path(&self.applies_dir, &apply_id)?;
-        if tokio::fs::metadata(&apply_path).await.is_err() {
-            anyhow::bail!(
-                "apply record not found under desired/applies: apply_id={}",
-                apply_id
-            );
+        match tokio::fs::metadata(&apply_path).await {
+            Ok(_) => {}
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(false);
+                }
+                return Err(anyhow::Error::new(e).context(format!(
+                    "stat desired apply record file: {}",
+                    apply_path.display()
+                )));
+            }
         }
 
         let removed: Vec<DesiredWorkload> = {
@@ -6244,7 +6250,7 @@ impl DesiredStore {
             }
         }
 
-        Ok(removed)
+        Ok(true)
     }
 }
 
@@ -15137,6 +15143,50 @@ mod tests {
             resolved.file_name().and_then(|v| v.to_str()),
             Some("workload__Deployment__demo.2026-06-20.log")
         );
+    }
+
+    #[tokio::test]
+    async fn desired_store_remove_apply_is_idempotent_after_record_disappears() {
+        let td = tempfile::tempdir().unwrap();
+        let desired = DesiredStore::load(td.path().to_path_buf()).await.unwrap();
+        let apply_id = "apply-idempotent";
+        let ts_ms = now_ts_ms();
+        let rec = DeployApplyRecord {
+            id: apply_id.to_string(),
+            ts_ms,
+            deployment_yaml: "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: demo\nspec:\n  targets: [node-a]\n  exec_argv: [/bin/true]\n".to_string(),
+            namespace: None,
+            deployment_yaml_sha256: "sha256-demo".to_string(),
+            lifecycle_phase: Some(ApplyLifecyclePhase::DeleteNotifying),
+            lifecycle_phase_updated_ts_ms: Some(ts_ms),
+        };
+        desired.persist_apply_record(&rec).await.unwrap();
+        desired
+            .upsert_many(vec![DesiredWorkload {
+                kind: WorkloadKind::Deployment,
+                name: "demo".to_string(),
+                logical_selection: "demo".to_string(),
+                service_name: "demo".to_string(),
+                atomic_group: None,
+                namespace: None,
+                targets: vec!["node-a".to_string()],
+                apply_id: Some(apply_id.to_string()),
+                exec_argv: vec!["/bin/true".to_string()],
+                exec_cwd: None,
+                updated_ts_ms: ts_ms,
+            }])
+            .await
+            .unwrap();
+
+        assert!(desired.apply_record_exists(apply_id).unwrap());
+        assert_eq!(desired.snapshot_apply_workloads(apply_id).len(), 1);
+        assert!(desired.remove_apply(apply_id).await.unwrap());
+        assert!(!desired.apply_record_exists(apply_id).unwrap());
+        assert!(desired.snapshot_apply_workloads(apply_id).is_empty());
+
+        assert!(!desired.remove_apply(apply_id).await.unwrap());
+        assert!(!desired.apply_record_exists(apply_id).unwrap());
+        assert!(desired.snapshot_apply_workloads(apply_id).is_empty());
     }
 
     #[test]
