@@ -2376,12 +2376,25 @@ class MPMCChanConsumer(ChannelConsumer):
         self.mpsc_consumer: Optional[MPSCChanConsumer] = None
         self.bound_mpsc_id: Optional[str] = None
 
-        # Get next available channel and bind to it
-        fails=[]
-        for i in range(10):
+        # Get next available channel and bind to it. Concurrent consumers may
+        # lose a claim/create race; retry those bounded authority-state races.
+        fails: List[ApiError] = []
+        max_bind_attempts = 10
+        for i in range(max_bind_attempts):
             next_channel_result = self.mpmc_channel.get_next_available_channel(self.api, self.chan_config)
             if not next_channel_result.is_ok():
-                raise ValueError(f"Failed to get next available channel: {next_channel_result.unwrap_error()}")
+                err = next_channel_result.unwrap_error()
+                if isinstance(err, (ChanCreateError, ChanBindError)):
+                    logging.warning(
+                        "MPMC consumer failed to get next channel on attempt %s/%s; retrying: %s",
+                        i + 1,
+                        max_bind_attempts,
+                        err,
+                    )
+                    fails.append(err)
+                    time.sleep(0.1)
+                    continue
+                raise ValueError(f"Failed to get next available channel: {err}")
             
             next_channel = next_channel_result.unwrap()
             if next_channel is None:
@@ -2404,13 +2417,15 @@ class MPMCChanConsumer(ChannelConsumer):
                 # claimed inside MPMCChannel return with _mpmc_ready_claimed=True.
                 res=self.mark_channel_ready(next_channel.get_chan_id())
                 if not res.is_ok():
-                    logging.warning(f"Failed to mark channel ready: {res.unwrap_error()}")
+                    err = res.unwrap_error()
+                    logging.warning(f"Failed to mark channel ready: {err}")
                     # Close the just-created/bound MPSC consumer to avoid dangling consumers
                     try:
                         next_channel.release_local_handle().unwrap()
                     except Exception as e:
                         logging.debug(f"close leaked MPSC consumer error: {e}")
-                    fails.append(res.unwrap_error())
+                    fails.append(err)
+                    time.sleep(0.1)
                     continue
                 if res.unwrap():
                     self.mpsc_consumer = next_channel
@@ -2426,12 +2441,15 @@ class MPMCChanConsumer(ChannelConsumer):
                         next_channel.release_local_handle().unwrap()
                     except Exception as e:
                         logging.debug(f"close leaked MPSC consumer error: {e}")
-                    fails.append("transaction failed")
+                    fails.append(ChanBindError("ready channel claim transaction failed"))
+                    time.sleep(0.1)
                     continue
             else:
                 raise ValueError(f"Unexpected channel type: {type(next_channel)}")
             
-        raise ValueError(f"Failed to mark channel ready with {len(fails)} fails: {fails}")
+        raise ValueError(
+            f"Failed to bind MPMC consumer after {max_bind_attempts} attempts: {fails}"
+        )
 
     def request_shutdown(self) -> None:
         if self.shutdown_ctl.closed:
