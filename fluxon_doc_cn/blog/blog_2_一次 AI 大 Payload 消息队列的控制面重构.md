@@ -32,13 +32,51 @@ broker 作为独立进程运行，长期维护 MQ 队列状态。它的生命周
 
 ## 实现结构
 
-Rust 侧的 broker 状态位于 `fluxon_rs/fluxon_mq/src/broker.rs`。它维护 `pending`、`visible`、`inflight`、`cleanup` 和 `cleanup_inflight` 等队列。`pending` 保存已 reserve 但尚未 publish 的消息，`visible` 保存可被 consumer 获取的消息，`inflight` 保存已 fetch 但尚未 commit 的消息，`cleanup` 和 `cleanup_inflight` 保存已提交但仍等待 Payload 清理确认的消息。broker 保存消息信封、Payload key、容量计数和字节预算，不保存 Payload bytes。
+Rust 侧的 broker 状态位于 `fluxon_rs/fluxon_mq/src/broker.rs`。这部分实现沿用 KV 设计里的角色边界：`master` 维护集群控制面和路由，`owner` 承载共享内存、对象副本和跨节点传输，producer、consumer 和 broker 都以 `external_client` 身份接入，不贡献 owner 容量。这个边界在 [KV 设计 1 - 概览与分层](../design/kv_1_概览与分层.md) 里有完整说明。
 
-producer 热路径位于 `fluxon_rs/fluxon_mq/src/producer.rs`。新的写入流程是 `reserve`、写 KV Payload、`publish`。当 broker 满或 Payload byte budget 满时，producer 在 Rust 热路径内退避重试，避免把可恢复的背压错误抛到 Python 外层，再由 Python 固定 sleep 后同步重试。这个调整减少了高并发下的 RPC 冲击，也让 producer 的等待逻辑更贴近真实队列状态。
+broker 保存的是消息控制面状态和 Payload 引用。Payload bytes 仍然由 KV owner 管理，broker 只记录 `payload_key`、`payload_bytes`、消息信封和队列位置。
 
-consumer 热路径位于 `fluxon_rs/fluxon_mq/src/consumer.rs` 和 `fluxon_rs/fluxon_pyo3/src/mpsc.rs`。consumer 从 broker `fetch` 消息，读取 Payload，随后 `commit` 并执行 cleanup。Python 层主要负责 API 包装、bench 编排和 teardown；消息推进已经迁移到 Rust 和 broker 路径。
+| 结构 | 关键字段 | 含义 |
+| --- | --- | --- |
+| `BrokerState` | `channels` | 按 `channel_id` 保存每个 channel 的队列状态 |
+| `BrokerState` | `payload_byte_capacity` | broker 维度的 Payload byte budget 上限 |
+| `BrokerState` | `used_payload_bytes` | 当前所有未释放消息占用的 Payload byte budget |
+| `ChannelState` | `config` | `BrokerChannelConfig`，包含 `channel_id` 和 `capacity` |
+| `ChannelState` | `next_reservation_id` | channel 内递增的 reservation 编号 |
+| `ChannelState` | `next_msg_by_producer` | 每个 `producer_id` 的下一个 `msg_id` |
+| `ChannelState` | `pending` | 已 `reserve`、尚未 `publish` 的消息 |
+| `ChannelState` | `visible` | 已写入 Payload 且可被 consumer `fetch` 的消息 |
+| `ChannelState` | `inflight` / `inflight_order` | 已被 consumer 取走、尚未 `commit` 的消息及其顺序 |
+| `ChannelState` | `cleanup` | 已 `commit`、等待 Payload 清理的消息 |
+| `ChannelState` | `cleanup_inflight` | 已分配给清理任务、等待 `cleanup_ack` 的消息 |
+| `ChannelState` | `committed` | 已提交的 `reservation_id` 集合，用于处理重复提交 |
+| `ChannelState` | `used_slots` | channel 当前占用的消息槽位 |
+| `ChannelState` | `reserve_waiters` / `fetch_waiters` | 因容量或可见消息不足而等待的请求 |
 
-MPMC bench 的清理逻辑位于 `fluxon_py/tests/test_api_chan_mpmc/test_mpmc_simple_bench.py`。teardown 时会删除本轮 MPMC 子 MPSC channel，并继续删除 broker 返回的 Payload keys。这样可以同时释放 broker byte budget 和 KV owner 中的实际 Payload，避免连续 case 后 owner pool 被旧数据占住。
+broker RPC 和内部状态机使用的主要消息结构如下：
+
+| 结构 | 字段 | 用途 |
+| --- | --- | --- |
+| `BrokerReserveRequest` | `channel_id`、`producer_id`、`category`、`payload_bytes`、`now_ms` | producer 申请消息占位和 Payload byte budget |
+| `BrokerFetchRequest` | `channel_id`、`consumer_id`、`now_ms` | consumer 请求下一条可见消息 |
+| `BrokerEnvelope` | `channel_id`、`producer_id`、`msg_id`、`reservation_id` | 标识一条消息和一次写入 reservation |
+| `BrokerEnvelope` | `payload_key`、`payload_bytes` | 指向 KV owner 中的 Payload，并计入 broker byte budget |
+| `BrokerEnvelope` | `reserved_at_ms`、`published_at_ms` | 记录消息进入 broker 状态机的时间 |
+| `BrokerCommitOutcome` | `first_commit`、`cleanup` | 告诉 consumer 本次提交是否首次生效，以及是否产生清理任务 |
+
+状态流转可以简化为下面这条链路：
+
+![](../../pics/blog2_mq_broker_state.png)
+
+producer 热路径位于 `fluxon_rs/fluxon_mq/src/producer.rs`。broker 路径的写入顺序是 `reserve -> KV put -> publish`。`reserve` 成功后，broker 已经生成 `payload_key` 并扣减 `payload_bytes`；producer 随后把实际 Payload 写入 KV owner。只有 KV 写入成功后，`publish` 才会把消息从 `pending` 推到 `visible`，因此 consumer 只能 fetch 到已经完成 Payload 写入的消息。如果 KV 写入失败，producer 会调用 `abort` 释放 reservation 和 byte budget。
+
+当 channel 满或 `payload_byte_capacity` 不足时，producer 在 Rust 热路径里按 `BrokerError::ChannelFull` 或 `BrokerError::PayloadBytesFull` 做退避重试。这个重试发生在 broker reserve 阶段，等待条件直接来自 `used_slots` 和 `used_payload_bytes`，比 Python 外层固定 sleep 更贴近真实队列状态。
+
+consumer 热路径位于 `fluxon_rs/fluxon_mq/src/consumer.rs` 和 `fluxon_rs/fluxon_pyo3/src/mpsc.rs`。consumer 先通过 broker `fetch` 取得 `BrokerEnvelope`，再用其中的 `payload_key` 从 KV owner 读取 Payload。业务处理和 commit 完成后，consumer 执行 Payload delete，并通过 cleanup 路径释放 broker 的 byte budget。Python 层主要负责 API 包装、bench 编排和 teardown；消息推进、背压等待和 cleanup 状态已经收敛到 Rust broker 路径。
+
+![](../../pics/blog2_mq_payload_flow.png)
+
+MPMC bench 的清理逻辑位于 `fluxon_py/tests/test_api_chan_mpmc/test_mpmc_simple_bench.py`。teardown 时会删除本轮 MPMC 子 MPSC channel，并继续删除 broker 返回的 Payload keys。这里需要同时处理两类资源：broker 侧的 `used_payload_bytes` 和 KV owner 侧的真实 Payload。前者靠 `cleanup_ack`、`abort` 或 `delete_channel` 释放；后者靠对 `payload_key` 执行 KV delete 释放。两边都释放后，连续 case 才不会被上一轮残留数据占住 owner pool 或 broker byte budget。
 
 ## 性能结果
 
