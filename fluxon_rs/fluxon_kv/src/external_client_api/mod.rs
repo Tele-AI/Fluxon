@@ -865,8 +865,7 @@ impl ExternalInner {
             return Ok(false);
         }
 
-        self.finish_owner_recover(&share_mem_path, payload)
-            .await?;
+        self.finish_owner_recover(&share_mem_path, payload).await?;
         Ok(true)
     }
 

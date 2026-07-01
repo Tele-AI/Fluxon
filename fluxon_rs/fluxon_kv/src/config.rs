@@ -733,7 +733,7 @@ pub struct ClientConfig {
     pub pprof_duration_seconds: Option<u64>,
     pub redis_compat_listen_addr: Option<std::net::SocketAddr>,
     pub fluxonkv_spec: FluxonKvSpec,
-    pub share_mem_path: String, // Mandatory shared bundle path
+    pub share_mem_path: String,           // Mandatory shared bundle path
     pub large_file_paths: LargeFilePaths, // Mandatory large-file roots for logs and caches
     pub test_spec_config: TestSpecConfig,
 }
@@ -1170,13 +1170,15 @@ impl ClientConfigYaml {
         } else {
             let Some(large_file_paths_yaml) = self.fluxonkv_spec.large_file_paths.as_ref() else {
                 return Err(ConfigError::InvalidClientConfig {
-                    detail: "fluxonkv_spec.large_file_paths is required for owner mode"
-                        .to_string(),
+                    detail: "fluxonkv_spec.large_file_paths is required for owner mode".to_string(),
                 }
                 .into_kverror());
             };
             LargeFilePaths {
-                paths: verify_non_empty_root_path_list(&large_file_paths_yaml.0, "large_file_paths")?,
+                paths: verify_non_empty_root_path_list(
+                    &large_file_paths_yaml.0,
+                    "large_file_paths",
+                )?,
             }
         };
 
@@ -1647,7 +1649,9 @@ fluxonkv_spec:
         .unwrap();
         let err = cfg.verify().unwrap_err();
         let text = format!("{err}");
-        assert!(text.contains("fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode"));
+        assert!(
+            text.contains("fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode")
+        );
     }
 
     #[test]
@@ -1667,7 +1671,9 @@ fluxonkv_spec:
         let logs_dir = large_file_paths.kv_logs_dir("test_cluster").unwrap();
         assert_eq!(
             logs_dir,
-            first_root.join("child").join("test_cluster_cluster_kv_logs")
+            first_root
+                .join("child")
+                .join("test_cluster_cluster_kv_logs")
         );
         assert!(logs_dir.exists());
 

@@ -11,8 +11,9 @@
 
 use crate::cluster_manager::ClusterManagerRdmaControlInit;
 use crate::config::{
-    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, LargeFilePaths, MasterConfig, MonitoringConfig,
-    ProtocolConfig, ProtocolType, TestSpecConfig, TestSpecTransportMode, TransferEngineType,
+    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, LargeFilePaths, MasterConfig,
+    MonitoringConfig, ProtocolConfig, ProtocolType, TestSpecConfig, TestSpecTransportMode,
+    TransferEngineType,
 };
 use crate::run_master_with_test_overrides;
 use crate::{ClientRunTestOverrides, MasterRunTestOverrides, run_client_with_test_overrides};
@@ -802,7 +803,6 @@ impl KvTestRoundOptions {
             kv_test_run_scope()
         )
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -842,8 +842,7 @@ fn default_client_large_file_paths(
     instance_key: &str,
     contribute_to_cluster_pool_size: &ContributeToClusterPoolSize,
 ) -> LargeFilePaths {
-    if contribute_to_cluster_pool_size.dram == 0
-        && contribute_to_cluster_pool_size.vram.is_empty()
+    if contribute_to_cluster_pool_size.dram == 0 && contribute_to_cluster_pool_size.vram.is_empty()
     {
         return LargeFilePaths { paths: Vec::new() };
     }

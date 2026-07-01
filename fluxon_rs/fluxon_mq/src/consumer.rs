@@ -55,6 +55,10 @@ const PREFETCH_LATENCY_LOG_INTERVAL: Duration = NO_MESSAGE_WARN_INTERVAL;
 const PREFETCH_LATENCY_WINDOW_SIZE: usize = 16;
 const NONBLOCKING_QUEUE_WAIT_THRESHOLD: Duration = Duration::from_millis(500);
 const DELETE_CALLBACK_WARN_INTERVAL: Duration = Duration::from_secs(1);
+const BROKER_CLEANUP_DELETE_RETRY_INITIAL_SLEEP: Duration = Duration::from_millis(50);
+const BROKER_CLEANUP_DELETE_RETRY_MAX_SLEEP: Duration = Duration::from_secs(5);
+const BROKER_CLEANUP_ACK_RETRY_INITIAL_SLEEP: Duration = Duration::from_millis(50);
+const BROKER_CLEANUP_ACK_RETRY_MAX_SLEEP: Duration = Duration::from_secs(5);
 const COMMIT_WAIT_WARN_INTERVAL: Duration = Duration::from_secs(10);
 const COMMIT_WAIT_BREAKDOWN_SUMMARY_THRESHOLD: Duration = Duration::from_millis(50);
 const COMMIT_OFFSET_PUT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2276,7 +2280,7 @@ async fn get_payload_via_broker(
     let payload_key = envelope.payload_key.clone();
     let mut requeue_guard =
         BrokerInflightRequeueGuard::new(broker.clone(), chan_id, vec![reservation_id]);
-    let mut payload = match run_payload_callback(
+    let payload = match run_payload_callback(
         chan_id,
         cb,
         producer_id.clone(),
@@ -2311,15 +2315,7 @@ async fn get_payload_via_broker(
     }
 
     if let Some(envelope) = commit_outcome.cleanup {
-        attach_or_run_broker_cleanup(
-            payload.as_mut(),
-            broker.clone(),
-            chan_id,
-            delete_cb.clone(),
-            shutdown.clone(),
-            envelope,
-        )
-        .await?;
+        spawn_broker_cleanup(broker.clone(), chan_id, delete_cb.clone(), envelope);
     }
 
     Ok(ConsumedPayload {
@@ -2556,7 +2552,7 @@ async fn load_broker_payloads_commit_on_ready(
             continue;
         };
 
-        let mut payload = match payload_result {
+        let payload = match payload_result {
             Ok(payload) => payload,
             Err(err) => {
                 stop_error = Some(err);
@@ -2589,25 +2585,7 @@ async fn load_broker_payloads_commit_on_ready(
             continue;
         }
         if let Some(envelope) = commit_outcome.cleanup {
-            if let Err(err) = attach_or_run_broker_cleanup(
-                payload.payload.as_mut(),
-                broker.clone(),
-                chan_id,
-                delete_cb.clone(),
-                shutdown.clone(),
-                envelope,
-            )
-            .await
-            {
-                warn!(
-                    "broker cleanup failed during batch consume: chan_id={} consumer_id={} reservation_id={} err={}",
-                    chan_id, consumer_id, reservation_id, err
-                );
-                committed_payloads.push(payload);
-                stop_error = Some(err);
-                stop_after_current = true;
-                continue;
-            }
+            spawn_broker_cleanup(broker.clone(), chan_id, delete_cb.clone(), envelope);
         }
 
         committed_payloads.push(payload);
@@ -2666,18 +2644,15 @@ async fn run_payload_callback(
     }
 }
 
-async fn run_delete_callback(
+async fn run_delete_callback_until_success(
     chan_id: i64,
     delete_cb: &DeleteCallback,
     payload_key: String,
-    shutdown: &ShutdownCtl,
-) -> Result<(), MpscError> {
+) {
     use tokio::time::sleep;
 
+    let mut retry_sleep = BROKER_CLEANUP_DELETE_RETRY_INITIAL_SLEEP;
     loop {
-        if shutdown.is_closed() {
-            return Ok(());
-        }
         let f = delete_cb.clone();
         let key_clone = payload_key.clone();
         let delete_begin = Instant::now();
@@ -2685,21 +2660,12 @@ async fn run_delete_callback(
         tokio::pin!(delete_fut);
         let res = loop {
             tokio::select! {
-                biased;
-                _ = shutdown.wait_closed() => {
-                    debug!(
-                        "[MpscConsumer chan_id={}] stop delete callback on shutdown: key={}",
-                        chan_id,
-                        key_clone,
-                    );
-                    break DeleteResult::Ok;
-                }
                 res = &mut delete_fut => {
                     break res;
                 }
                 _ = sleep(DELETE_CALLBACK_WARN_INTERVAL) => {
                     warn!(
-                        "[MpscConsumer chan_id={}] delete callback still pending: key={} waited_ms={}",
+                        "[MpscConsumer chan_id={}] async broker delete callback still pending: key={} waited_ms={}",
                         chan_id,
                         key_clone,
                         delete_begin.elapsed().as_millis(),
@@ -2708,94 +2674,73 @@ async fn run_delete_callback(
             }
         };
         match res {
-            DeleteResult::Ok => return Ok(()),
+            DeleteResult::Ok => return,
             DeleteResult::Retryable(msg) => {
                 warn!(
-                    "[MpscConsumer chan_id={}] delete payload retryable: {}",
-                    chan_id, msg
+                    "[MpscConsumer chan_id={}] async broker delete payload retryable; retry_after_ms={}: {}",
+                    chan_id,
+                    retry_sleep.as_millis(),
+                    msg
                 );
-                sleep(Duration::from_millis(50)).await;
             }
             DeleteResult::NonRetryable(msg) => {
-                return Err(MpscError::DeletePayloadNonRetryable { message: msg });
+                warn!(
+                    "[MpscConsumer chan_id={}] async broker delete payload non-retryable; keep retrying to preserve broker byte budget; retry_after_ms={}: {}",
+                    chan_id,
+                    retry_sleep.as_millis(),
+                    msg
+                );
             }
         }
+        sleep(retry_sleep).await;
+        retry_sleep = retry_sleep
+            .saturating_mul(2)
+            .min(BROKER_CLEANUP_DELETE_RETRY_MAX_SLEEP);
     }
 }
 
-async fn cleanup_broker_envelope(
-    broker: &BrokerHandle,
+async fn run_broker_cleanup_ack_until_success(
+    broker: BrokerHandle,
     chan_id: i64,
-    delete_cb: Option<&DeleteCallback>,
-    shutdown: &ShutdownCtl,
-    envelope: BrokerEnvelope,
-) -> Result<(), MpscError> {
-    let reservation_id = envelope.reservation_id;
-    if let Some(delete_cb) = delete_cb {
-        run_delete_callback(chan_id, delete_cb, envelope.payload_key, shutdown).await?;
+    reservation_id: u64,
+) {
+    use tokio::time::sleep;
+
+    let mut retry_sleep = BROKER_CLEANUP_ACK_RETRY_INITIAL_SLEEP;
+    loop {
+        match broker.cleanup_ack(chan_id, reservation_id).await {
+            Ok(()) => return,
+            Err(err) => {
+                warn!(
+                    "async broker cleanup ack failed; retry_after_ms={}: chan_id={} reservation_id={} err={}",
+                    retry_sleep.as_millis(),
+                    chan_id,
+                    reservation_id,
+                    err
+                );
+            }
+        }
+        sleep(retry_sleep).await;
+        retry_sleep = retry_sleep
+            .saturating_mul(2)
+            .min(BROKER_CLEANUP_ACK_RETRY_MAX_SLEEP);
     }
-    broker
-        .cleanup_ack(chan_id, reservation_id)
-        .await
-        .map_err(|e| {
-            MpscError::Internal(format!(
-                "broker cleanup ack failed: chan_id={} reservation_id={} err={}",
-                chan_id, reservation_id, e
-            ))
-        })?;
-    Ok(())
 }
 
-async fn attach_or_run_broker_cleanup(
-    payload: &mut dyn MqPayload,
+fn spawn_broker_cleanup(
     broker: BrokerHandle,
     chan_id: i64,
     delete_cb: Option<DeleteCallback>,
-    shutdown: ShutdownCtl,
     envelope: BrokerEnvelope,
-) -> Result<(), MpscError> {
-    let cleanup_envelope = envelope.clone();
-    let deferred_broker = broker.clone();
-    let deferred_delete_cb = delete_cb.clone();
-    let deferred_shutdown = shutdown.clone();
-    let cleanup = Box::new(move || {
-        Box::pin(async move {
-            if let Some(delete_cb) = deferred_delete_cb.as_ref() {
-                if let Err(err) = run_delete_callback(
-                    chan_id,
-                    delete_cb,
-                    cleanup_envelope.payload_key.clone(),
-                    &deferred_shutdown,
-                )
-                .await
-                {
-                    warn!(
-                        "deferred broker payload delete failed: chan_id={} reservation_id={} err={}",
-                        chan_id, cleanup_envelope.reservation_id, err
-                    );
-                    let _ = deferred_broker
-                        .cleanup_nack(chan_id, cleanup_envelope.reservation_id)
-                        .await;
-                    return;
-                }
-            }
-            if let Err(err) = deferred_broker
-                .cleanup_ack(chan_id, cleanup_envelope.reservation_id)
-                .await
-            {
-                warn!(
-                    "deferred broker cleanup ack failed: chan_id={} reservation_id={} err={}",
-                    chan_id, cleanup_envelope.reservation_id, err
-                );
-            }
-        }) as PayloadCleanupFuture
-    });
-    match payload.attach_cleanup(cleanup) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            cleanup_broker_envelope(&broker, chan_id, delete_cb.as_ref(), &shutdown, envelope).await
+) {
+    tokio::spawn(async move {
+        let reservation_id = envelope.reservation_id;
+        if let Some(delete_cb) = delete_cb.as_ref() {
+            run_delete_callback_until_success(chan_id, delete_cb, envelope.payload_key.clone())
+                .await;
         }
-    }
+        run_broker_cleanup_ack_until_success(broker, chan_id, reservation_id).await;
+    });
 }
 
 async fn requeue_pending_broker_inflight(
