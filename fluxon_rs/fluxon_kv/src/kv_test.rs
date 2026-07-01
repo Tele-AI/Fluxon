@@ -11,8 +11,9 @@
 
 use crate::cluster_manager::ClusterManagerRdmaControlInit;
 use crate::config::{
-    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, LargeFilePaths, MasterConfig, MonitoringConfig,
-    ProtocolConfig, ProtocolType, TestSpecConfig, TestSpecTransportMode, TransferEngineType,
+    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, LargeFilePaths, MasterConfig,
+    MonitoringConfig, ProtocolConfig, ProtocolType, TestSpecConfig, TestSpecTransportMode,
+    TransferEngineType,
 };
 use crate::run_master_with_test_overrides;
 use crate::{ClientRunTestOverrides, MasterRunTestOverrides, run_client_with_test_overrides};
@@ -802,7 +803,6 @@ impl KvTestRoundOptions {
             kv_test_run_scope()
         )
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -842,8 +842,7 @@ fn default_client_large_file_paths(
     instance_key: &str,
     contribute_to_cluster_pool_size: &ContributeToClusterPoolSize,
 ) -> LargeFilePaths {
-    if contribute_to_cluster_pool_size.dram == 0
-        && contribute_to_cluster_pool_size.vram.is_empty()
+    if contribute_to_cluster_pool_size.dram == 0 && contribute_to_cluster_pool_size.vram.is_empty()
     {
         return LargeFilePaths { paths: Vec::new() };
     }
@@ -1381,7 +1380,10 @@ async fn key_meta_cache_check(
         }
     }
 
-    tracing::info!("🔍 Starting PUT and GET in parallel: {}", parallel_unique_key);
+    tracing::info!(
+        "🔍 Starting PUT and GET in parallel: {}",
+        parallel_unique_key
+    );
     for i in 0..10 {
         let (put_client, other_client) = if i % 2 == 0 {
             (client, client2)
@@ -1420,7 +1422,9 @@ async fn key_meta_cache_check(
         }
 
         assert!(
-            put_client.client_kv_api().has_cached_key(parallel_unique_key),
+            put_client
+                .client_kv_api()
+                .has_cached_key(parallel_unique_key),
             "put client should have immediate local cache metadata for key {} after put time {}",
             parallel_unique_key,
             i

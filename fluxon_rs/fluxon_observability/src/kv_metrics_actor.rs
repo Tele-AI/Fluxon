@@ -14,15 +14,22 @@ use fluxon_util::prom_remote_write::{
 };
 
 use crate::keys::{
-    PROM_LABEL_COMPONENT, PROM_LABEL_FS_IO_OP, PROM_LABEL_FS_MOUNT_KIND,
-    PROM_LABEL_FS_MOUNTPOINT_DIR_ABS, PROM_LABEL_FS_TARGET_DIR_ABS, PROM_LABEL_METRIC,
-    PROM_LABEL_NODE, PROM_LABEL_PEER, PROM_LABEL_RDMA_DEVICE, PROM_LABEL_RDMA_NETDEV,
-    PROM_LABEL_RDMA_PCI_BDF, PROM_LABEL_RDMA_PORT, PROM_LABEL_RDMA_TRANSFER_STATE, PROM_LABEL_ROLE,
-    PROM_LABEL_STAT, PROM_LABEL_TCP_THREAD_LANE, PROM_METRIC_CONTAINER_MEMORY_LIMIT_BYTES,
+    PROM_LABEL_CACHE_EVENT, PROM_LABEL_COMPONENT, PROM_LABEL_FS_IO_OP, PROM_LABEL_FS_MOUNT_KIND,
+    PROM_LABEL_FS_MOUNTPOINT_DIR_ABS, PROM_LABEL_FS_TARGET_DIR_ABS, PROM_LABEL_GPU_INDEX,
+    PROM_LABEL_GPU_NAME, PROM_LABEL_METRIC, PROM_LABEL_NODE, PROM_LABEL_PEER,
+    PROM_LABEL_RDMA_DEVICE, PROM_LABEL_RDMA_NETDEV, PROM_LABEL_RDMA_PCI_BDF, PROM_LABEL_RDMA_PORT,
+    PROM_LABEL_RDMA_TRANSFER_STATE, PROM_LABEL_ROLE, PROM_LABEL_STAT, PROM_LABEL_TCP_THREAD_LANE,
+    PROM_METRIC_CLIENT_NETWORK_MBPS, PROM_METRIC_CONTAINER_MEMORY_LIMIT_BYTES,
     PROM_METRIC_CONTAINER_MEMORY_USAGE_BYTES, PROM_METRIC_FS_IO_OPS_TOTAL,
     PROM_METRIC_FS_MOUNT_FS_TOTAL_BYTES, PROM_METRIC_FS_MOUNT_FS_USED_BYTES,
-    PROM_METRIC_KV_PEER_NETWORK_BYTES_TOTAL, PROM_METRIC_P2P_RECV_TRANSPORT_BYTES_TOTAL,
-    PROM_METRIC_P2P_RECV_TRANSPORT_MESSAGES_TOTAL, PROM_METRIC_P2P_RPC_COMPLETION_BYTES_TOTAL,
+    PROM_METRIC_GPU_MEMORY_TOTAL_BYTES, PROM_METRIC_GPU_MEMORY_USED_BYTES,
+    PROM_METRIC_GPU_PROCESS_COUNT, PROM_METRIC_GPU_PROCESS_MEMORY_UTILIZATION_PERCENT,
+    PROM_METRIC_GPU_PROCESS_SM_UTILIZATION_PERCENT, PROM_METRIC_GPU_TEMPERATURE_CELSIUS,
+    PROM_METRIC_GPU_UTILIZATION_PERCENT, PROM_METRIC_KV_CACHE_EVENTS_TOTAL,
+    PROM_METRIC_KV_GET_CACHE_HIT_RATE_PERCENT, PROM_METRIC_KV_OP_END_BYTES_PER_SEC,
+    PROM_METRIC_KV_OP_END_EVENT_RPS, PROM_METRIC_KV_PEER_NETWORK_BYTES_TOTAL,
+    PROM_METRIC_P2P_RECV_TRANSPORT_BYTES_TOTAL, PROM_METRIC_P2P_RECV_TRANSPORT_MESSAGES_TOTAL,
+    PROM_METRIC_P2P_RPC_COMPLETION_BYTES_TOTAL,
     PROM_METRIC_P2P_RPC_COMPLETION_LATENCY_SAMPLE_COUNT,
     PROM_METRIC_P2P_RPC_COMPLETION_LATENCY_STAT_US, PROM_METRIC_P2P_RPC_COMPLETION_MESSAGES_TOTAL,
     PROM_METRIC_PROCESS_CPU_USAGE_PERCENT, PROM_METRIC_RDMA_PORT_ACTIVE_MTU_BYTES,
@@ -182,6 +189,21 @@ impl ObserveFsIoOp {
         match self {
             ObserveFsIoOp::Read => "read",
             ObserveFsIoOp::Write => "write",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObserveCacheEvent {
+    Hit,
+    Miss,
+}
+
+impl ObserveCacheEvent {
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            ObserveCacheEvent::Hit => "hit",
+            ObserveCacheEvent::Miss => "miss",
         }
     }
 }
@@ -842,6 +864,9 @@ pub enum ObserveOp {
         direction: ObserveDirection,
         bytes: u64,
     },
+    RecordCacheEvent {
+        event: ObserveCacheEvent,
+    },
     RecordFsIoOps {
         op: ObserveFsIoOp,
         ops: u64,
@@ -1136,6 +1161,11 @@ pub struct KvMetricsActorOwned {
     // Metrics (Prom collectors)
     operation_stat_gauge: GaugeVec,
     client_network_bytes_counter: CounterVec,
+    client_network_mbps_gauge: GaugeVec,
+    cache_events_counter: CounterVec,
+    kv_op_end_event_rps_gauge: GaugeVec,
+    kv_op_end_bytes_per_sec_gauge: GaugeVec,
+    kv_get_cache_hit_rate_percent_gauge: GaugeVec,
     kv_peer_network_bytes_counter: CounterVec,
     tcp_thread_latency_stat_gauge: GaugeVec,
     tcp_thread_latency_sample_count_gauge: GaugeVec,
@@ -1153,6 +1183,13 @@ pub struct KvMetricsActorOwned {
     node_memory_total_gauge: GaugeVec,
     container_memory_usage_gauge: GaugeVec,
     container_memory_limit_gauge: GaugeVec,
+    gpu_memory_used_gauge: GaugeVec,
+    gpu_memory_total_gauge: GaugeVec,
+    gpu_utilization_gauge: GaugeVec,
+    gpu_temperature_gauge: GaugeVec,
+    gpu_process_count_gauge: GaugeVec,
+    gpu_process_sm_utilization_gauge: GaugeVec,
+    gpu_process_memory_utilization_gauge: GaugeVec,
     process_resident_memory_gauge: GaugeVec,
     process_cpu_usage_gauge: GaugeVec,
     tokio_num_workers_gauge: GaugeVec,
@@ -1200,13 +1237,16 @@ pub struct KvMetricsActorOwned {
     pending_op_end_pulses: Vec<KvOpEndBytesPulse>,
     pending_tcp_thread_latency_samples: Vec<ObserveTcpThreadLatencySample>,
     pending_p2p_rpc_completion_latency_samples: Vec<ObserveP2pRpcCompletionLatencySample>,
+    pending_client_network_tx_bytes: u64,
+    pending_client_network_rx_bytes: u64,
     received_kv_op_metric_count: u64,
     received_op_end_pulse_count: u64,
     received_tcp_thread_latency_sample_count: u64,
     received_p2p_rpc_completion_latency_sample_count: u64,
     flush_count: u64,
 
-    enable_system_metrics: bool,
+    enable_node_metrics: bool,
+    enable_process_metrics: bool,
 }
 
 fn register_collector(registry: &Registry, collector: Box<dyn Collector>) {
@@ -1222,7 +1262,8 @@ impl KvMetricsActorOwned {
         node_id: String,
         node_role: String,
         prom: PromRemoteWriteHandle,
-        enable_system_metrics: bool,
+        enable_node_metrics: bool,
+        enable_process_metrics: bool,
     ) -> (ObserveHandle, Self) {
         let (tx, rx) = mpsc::channel(MAX_PENDING_EVENTS);
         let tcp_thread_transport_accumulator =
@@ -1256,6 +1297,51 @@ impl KvMetricsActorOwned {
             &["node", "role", "direction"],
         )
         .expect("client network bytes counter");
+
+        let client_network_mbps_gauge = GaugeVec::new(
+            Opts::new(
+                PROM_METRIC_CLIENT_NETWORK_MBPS,
+                "Windowed client network bandwidth in Mbps by node, role, and direction",
+            ),
+            &[PROM_LABEL_NODE, PROM_LABEL_ROLE, "direction"],
+        )
+        .expect("client network mbps gauge");
+
+        let cache_events_counter = CounterVec::new(
+            Opts::new(
+                PROM_METRIC_KV_CACHE_EVENTS_TOTAL,
+                "Total KV cache hit/miss events by node and role",
+            ),
+            &[PROM_LABEL_NODE, PROM_LABEL_ROLE, PROM_LABEL_CACHE_EVENT],
+        )
+        .expect("kv cache events counter");
+
+        let kv_op_end_event_rps_gauge = GaugeVec::new(
+            Opts::new(
+                PROM_METRIC_KV_OP_END_EVENT_RPS,
+                "Windowed KV op-end events per second by node, role, op, and status",
+            ),
+            &[PROM_LABEL_NODE, PROM_LABEL_ROLE, "op", "status"],
+        )
+        .expect("kv op end event rps gauge");
+
+        let kv_op_end_bytes_per_sec_gauge = GaugeVec::new(
+            Opts::new(
+                PROM_METRIC_KV_OP_END_BYTES_PER_SEC,
+                "Windowed KV op-end bytes per second by node, role, op, and status",
+            ),
+            &[PROM_LABEL_NODE, PROM_LABEL_ROLE, "op", "status"],
+        )
+        .expect("kv op end bytes per sec gauge");
+
+        let kv_get_cache_hit_rate_percent_gauge = GaugeVec::new(
+            Opts::new(
+                PROM_METRIC_KV_GET_CACHE_HIT_RATE_PERCENT,
+                "Windowed KV get cache hit rate percent by node and role",
+            ),
+            &[PROM_LABEL_NODE, PROM_LABEL_ROLE],
+        )
+        .expect("kv get cache hit rate percent gauge");
 
         let kv_peer_network_bytes_counter = CounterVec::new(
             Opts::new(
@@ -1451,6 +1537,76 @@ impl KvMetricsActorOwned {
             &["node", "role"],
         )
         .expect("container memory limit gauge");
+
+        let gpu_labels = &[
+            PROM_LABEL_NODE,
+            PROM_LABEL_ROLE,
+            PROM_LABEL_GPU_INDEX,
+            PROM_LABEL_GPU_NAME,
+        ];
+
+        let gpu_memory_used_gauge = GaugeVec::new(
+            Opts::new(
+                PROM_METRIC_GPU_MEMORY_USED_BYTES,
+                "GPU memory used in bytes from nvidia-smi",
+            ),
+            gpu_labels,
+        )
+        .expect("gpu memory used gauge");
+
+        let gpu_memory_total_gauge = GaugeVec::new(
+            Opts::new(
+                PROM_METRIC_GPU_MEMORY_TOTAL_BYTES,
+                "GPU memory total in bytes from nvidia-smi",
+            ),
+            gpu_labels,
+        )
+        .expect("gpu memory total gauge");
+
+        let gpu_utilization_gauge = GaugeVec::new(
+            Opts::new(
+                PROM_METRIC_GPU_UTILIZATION_PERCENT,
+                "GPU utilization percentage from nvidia-smi",
+            ),
+            gpu_labels,
+        )
+        .expect("gpu utilization gauge");
+
+        let gpu_temperature_gauge = GaugeVec::new(
+            Opts::new(
+                PROM_METRIC_GPU_TEMPERATURE_CELSIUS,
+                "GPU temperature in Celsius from nvidia-smi",
+            ),
+            gpu_labels,
+        )
+        .expect("gpu temperature gauge");
+
+        let gpu_process_count_gauge = GaugeVec::new(
+            Opts::new(
+                PROM_METRIC_GPU_PROCESS_COUNT,
+                "GPU process count from nvidia-smi pmon",
+            ),
+            gpu_labels,
+        )
+        .expect("gpu process count gauge");
+
+        let gpu_process_sm_utilization_gauge = GaugeVec::new(
+            Opts::new(
+                PROM_METRIC_GPU_PROCESS_SM_UTILIZATION_PERCENT,
+                "Sum of per-process SM utilization percentages from nvidia-smi pmon",
+            ),
+            gpu_labels,
+        )
+        .expect("gpu process sm utilization gauge");
+
+        let gpu_process_memory_utilization_gauge = GaugeVec::new(
+            Opts::new(
+                PROM_METRIC_GPU_PROCESS_MEMORY_UTILIZATION_PERCENT,
+                "Sum of per-process memory utilization percentages from nvidia-smi pmon",
+            ),
+            gpu_labels,
+        )
+        .expect("gpu process memory utilization gauge");
 
         let process_resident_memory_gauge = GaugeVec::new(
             Opts::new(
@@ -1773,6 +1929,14 @@ impl KvMetricsActorOwned {
 
         register_collector(&registry, Box::new(operation_stat_gauge.clone()));
         register_collector(&registry, Box::new(client_network_bytes_counter.clone()));
+        register_collector(&registry, Box::new(client_network_mbps_gauge.clone()));
+        register_collector(&registry, Box::new(cache_events_counter.clone()));
+        register_collector(&registry, Box::new(kv_op_end_event_rps_gauge.clone()));
+        register_collector(&registry, Box::new(kv_op_end_bytes_per_sec_gauge.clone()));
+        register_collector(
+            &registry,
+            Box::new(kv_get_cache_hit_rate_percent_gauge.clone()),
+        );
         register_collector(&registry, Box::new(kv_peer_network_bytes_counter.clone()));
         register_collector(&registry, Box::new(tcp_thread_latency_stat_gauge.clone()));
         register_collector(
@@ -1817,6 +1981,19 @@ impl KvMetricsActorOwned {
         register_collector(&registry, Box::new(node_memory_total_gauge.clone()));
         register_collector(&registry, Box::new(container_memory_usage_gauge.clone()));
         register_collector(&registry, Box::new(container_memory_limit_gauge.clone()));
+        register_collector(&registry, Box::new(gpu_memory_used_gauge.clone()));
+        register_collector(&registry, Box::new(gpu_memory_total_gauge.clone()));
+        register_collector(&registry, Box::new(gpu_utilization_gauge.clone()));
+        register_collector(&registry, Box::new(gpu_temperature_gauge.clone()));
+        register_collector(&registry, Box::new(gpu_process_count_gauge.clone()));
+        register_collector(
+            &registry,
+            Box::new(gpu_process_sm_utilization_gauge.clone()),
+        );
+        register_collector(
+            &registry,
+            Box::new(gpu_process_memory_utilization_gauge.clone()),
+        );
         register_collector(&registry, Box::new(process_resident_memory_gauge.clone()));
         register_collector(&registry, Box::new(process_cpu_usage_gauge.clone()));
         register_collector(&registry, Box::new(tokio_num_workers_gauge.clone()));
@@ -1877,6 +2054,11 @@ impl KvMetricsActorOwned {
             registry,
             operation_stat_gauge,
             client_network_bytes_counter,
+            client_network_mbps_gauge,
+            cache_events_counter,
+            kv_op_end_event_rps_gauge,
+            kv_op_end_bytes_per_sec_gauge,
+            kv_get_cache_hit_rate_percent_gauge,
             kv_peer_network_bytes_counter,
             tcp_thread_latency_stat_gauge,
             tcp_thread_latency_sample_count_gauge,
@@ -1894,6 +2076,13 @@ impl KvMetricsActorOwned {
             node_memory_total_gauge,
             container_memory_usage_gauge,
             container_memory_limit_gauge,
+            gpu_memory_used_gauge,
+            gpu_memory_total_gauge,
+            gpu_utilization_gauge,
+            gpu_temperature_gauge,
+            gpu_process_count_gauge,
+            gpu_process_sm_utilization_gauge,
+            gpu_process_memory_utilization_gauge,
             process_resident_memory_gauge,
             process_cpu_usage_gauge,
             tokio_num_workers_gauge,
@@ -1935,12 +2124,15 @@ impl KvMetricsActorOwned {
             pending_op_end_pulses: Vec::new(),
             pending_tcp_thread_latency_samples: Vec::new(),
             pending_p2p_rpc_completion_latency_samples: Vec::new(),
+            pending_client_network_tx_bytes: 0,
+            pending_client_network_rx_bytes: 0,
             received_kv_op_metric_count: 0,
             received_op_end_pulse_count: 0,
             received_tcp_thread_latency_sample_count: 0,
             received_p2p_rpc_completion_latency_sample_count: 0,
             flush_count: 0,
-            enable_system_metrics,
+            enable_node_metrics,
+            enable_process_metrics,
         };
 
         (handle, owned)
@@ -2102,6 +2294,25 @@ impl KvMetricsActorOwned {
                         direction.as_label(),
                     ])
                     .inc_by(bytes as f64);
+                match direction {
+                    ObserveDirection::Tx => {
+                        self.pending_client_network_tx_bytes =
+                            self.pending_client_network_tx_bytes.saturating_add(bytes);
+                    }
+                    ObserveDirection::Rx => {
+                        self.pending_client_network_rx_bytes =
+                            self.pending_client_network_rx_bytes.saturating_add(bytes);
+                    }
+                }
+            }
+            ObserveOp::RecordCacheEvent { event } => {
+                self.cache_events_counter
+                    .with_label_values(&[
+                        self.node_id.as_str(),
+                        self.node_role.as_str(),
+                        event.as_label(),
+                    ])
+                    .inc();
             }
             ObserveOp::RecordFsIoOps { op, ops } => {
                 if ops == 0 {
@@ -2229,8 +2440,8 @@ impl KvMetricsActorOwned {
         }
     }
 
-    fn tick_sample_system_metrics(&self) {
-        if !self.enable_system_metrics {
+    fn tick_sample_metrics(&self) {
+        if !self.enable_node_metrics && !self.enable_process_metrics {
             return;
         }
 
@@ -2256,29 +2467,37 @@ impl KvMetricsActorOwned {
                 .store(now as u64, Ordering::SeqCst);
         }
 
-        if let Err(err) = sample_cpu_usage_percent(self, node, role) {
-            warn!("failed to sample cpu usage: {err}");
+        if self.enable_node_metrics {
+            if let Err(err) = sample_cpu_usage_percent(self, node, role) {
+                warn!("failed to sample cpu usage: {err}");
+            }
+            if let Err(err) = sample_cpu_logical_cores(self, node, role) {
+                warn!("failed to sample cpu logical cores: {err}");
+            }
+            if let Err(err) = sample_host_memory_bytes(self, node, role) {
+                warn!("failed to sample host memory: {err}");
+            }
+            if let Err(err) = sample_container_memory_bytes(self, node, role) {
+                warn!("failed to sample container memory: {err}");
+            }
+            if let Err(err) = sample_gpu_metrics(self, node, role) {
+                debug!("failed to sample gpu metrics: {err}");
+            }
+            if let Err(err) = sample_network_bytes_by_interface(self, node) {
+                debug!("/proc/net/dev not available: {err}");
+            }
         }
-        if let Err(err) = sample_cpu_logical_cores(self, node, role) {
-            warn!("failed to sample cpu logical cores: {err}");
-        }
-        if let Err(err) = sample_host_memory_bytes(self, node, role) {
-            warn!("failed to sample host memory: {err}");
-        }
-        if let Err(err) = sample_container_memory_bytes(self, node, role) {
-            warn!("failed to sample container memory: {err}");
-        }
-        if let Err(err) = sample_process_cpu_usage_percent(self, node, role) {
-            warn!("failed to sample process cpu usage: {err}");
-        }
-        if let Err(err) = sample_process_rss_bytes(self, node, role) {
-            warn!("failed to sample process rss: {err}");
-        }
-        if let Err(err) = sample_tokio_runtime_metrics(self, node, role) {
-            warn!("failed to sample tokio runtime metrics: {err}");
-        }
-        if let Err(err) = sample_network_bytes_by_interface(self, node) {
-            debug!("/proc/net/dev not available: {err}");
+
+        if self.enable_process_metrics {
+            if let Err(err) = sample_process_cpu_usage_percent(self, node, role) {
+                warn!("failed to sample process cpu usage: {err}");
+            }
+            if let Err(err) = sample_process_rss_bytes(self, node, role) {
+                warn!("failed to sample process rss: {err}");
+            }
+            if let Err(err) = sample_tokio_runtime_metrics(self, node, role) {
+                warn!("failed to sample tokio runtime metrics: {err}");
+            }
         }
     }
 
@@ -2420,6 +2639,72 @@ impl KvMetricsActorOwned {
 
         summaries.sort_unstable_by(|lhs, rhs| lhs.metric.cmp(rhs.metric));
         summaries
+    }
+
+    fn tick_compute_and_set_kv_op_window_rates(
+        &self,
+        pulses: &[KvOpEndBytesPulse],
+        flush_interval: Duration,
+    ) {
+        self.kv_op_end_event_rps_gauge.reset();
+        self.kv_op_end_bytes_per_sec_gauge.reset();
+        self.kv_get_cache_hit_rate_percent_gauge.reset();
+
+        let window_secs = flush_interval.as_secs_f64().max(1.0);
+        let mut buckets: HashMap<(&'static str, &'static str), (u64, u64)> = HashMap::new();
+        for pulse in pulses {
+            let entry = buckets.entry((pulse.op, pulse.status)).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = entry.1.saturating_add(pulse.bytes);
+        }
+
+        let node = self.node_id.as_str();
+        let role = self.node_role.as_str();
+        let mut get_hit_events = 0u64;
+        let mut get_success_events = 0u64;
+        for ((op, status), (event_count, total_bytes)) in buckets {
+            let event_rps = event_count as f64 / window_secs;
+            let bytes_per_sec = total_bytes as f64 / window_secs;
+            self.kv_op_end_event_rps_gauge
+                .with_label_values(&[node, role, op, status])
+                .set(event_rps);
+            self.kv_op_end_bytes_per_sec_gauge
+                .with_label_values(&[node, role, op, status])
+                .set(bytes_per_sec);
+            if op == "get" && status == "hit" {
+                get_hit_events = event_count;
+            }
+            if op == "get" && status == "success" {
+                get_success_events = event_count;
+            }
+        }
+
+        let total_get_events = get_hit_events.saturating_add(get_success_events);
+        let hit_rate_percent = if total_get_events == 0 {
+            0.0
+        } else {
+            100.0 * (get_hit_events as f64) / (total_get_events as f64)
+        };
+        self.kv_get_cache_hit_rate_percent_gauge
+            .with_label_values(&[node, role])
+            .set(hit_rate_percent);
+    }
+
+    fn tick_compute_and_set_client_network_mbps(&mut self, flush_interval: Duration) {
+        self.client_network_mbps_gauge.reset();
+        let window_secs = flush_interval.as_secs_f64().max(1.0);
+        let tx_mbps = self.pending_client_network_tx_bytes as f64 * 8.0 / window_secs / 1_000_000.0;
+        let rx_mbps = self.pending_client_network_rx_bytes as f64 * 8.0 / window_secs / 1_000_000.0;
+        let node = self.node_id.as_str();
+        let role = self.node_role.as_str();
+        self.client_network_mbps_gauge
+            .with_label_values(&[node, role, "tx"])
+            .set(tx_mbps);
+        self.client_network_mbps_gauge
+            .with_label_values(&[node, role, "rx"])
+            .set(rx_mbps);
+        self.pending_client_network_tx_bytes = 0;
+        self.pending_client_network_rx_bytes = 0;
     }
 
     fn tick_compute_and_set_tcp_thread_latency_stats(
@@ -2806,9 +3091,14 @@ impl KvMetricsActorOwned {
                         p2p_rpc_completion_counter_summaries.len();
                     self.shm_file_size_bytes_gauge.reset();
                     self.shm_file_allocated_bytes_gauge.reset();
-                    self.tick_sample_system_metrics();
+                    self.tick_sample_metrics();
                     let operation_summaries =
                         self.tick_compute_and_set_operation_stats(&self.pending_kv_op_metrics);
+                    self.tick_compute_and_set_kv_op_window_rates(
+                        &self.pending_op_end_pulses,
+                        flush_interval,
+                    );
+                    self.tick_compute_and_set_client_network_mbps(flush_interval);
                     let tcp_thread_latency_summaries = self.tick_compute_and_set_tcp_thread_latency_stats(
                         &self.pending_tcp_thread_latency_samples,
                     );
@@ -3192,6 +3482,170 @@ fn sample_container_memory_bytes(
             .set(limit as f64);
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct GpuQuerySample {
+    index: String,
+    name: String,
+    memory_used_bytes: f64,
+    memory_total_bytes: f64,
+    utilization_percent: f64,
+    temperature_celsius: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GpuPmonSample {
+    process_count: u64,
+    sm_utilization_percent_sum: f64,
+    memory_utilization_percent_sum: f64,
+}
+
+fn sample_gpu_metrics(actor: &KvMetricsActorOwned, node: &str, role: &str) -> anyhow::Result<()> {
+    actor.gpu_memory_used_gauge.reset();
+    actor.gpu_memory_total_gauge.reset();
+    actor.gpu_utilization_gauge.reset();
+    actor.gpu_temperature_gauge.reset();
+    actor.gpu_process_count_gauge.reset();
+    actor.gpu_process_sm_utilization_gauge.reset();
+    actor.gpu_process_memory_utilization_gauge.reset();
+
+    let gpu_samples = read_nvidia_smi_gpu_query()?;
+    let pmon_samples = read_nvidia_smi_pmon().unwrap_or_default();
+
+    for sample in gpu_samples {
+        let pmon = pmon_samples.get(&sample.index).cloned().unwrap_or_default();
+        let labels = [node, role, sample.index.as_str(), sample.name.as_str()];
+        actor
+            .gpu_memory_used_gauge
+            .with_label_values(&labels)
+            .set(sample.memory_used_bytes);
+        actor
+            .gpu_memory_total_gauge
+            .with_label_values(&labels)
+            .set(sample.memory_total_bytes);
+        actor
+            .gpu_utilization_gauge
+            .with_label_values(&labels)
+            .set(sample.utilization_percent);
+        actor
+            .gpu_temperature_gauge
+            .with_label_values(&labels)
+            .set(sample.temperature_celsius);
+        actor
+            .gpu_process_count_gauge
+            .with_label_values(&labels)
+            .set(pmon.process_count as f64);
+        actor
+            .gpu_process_sm_utilization_gauge
+            .with_label_values(&labels)
+            .set(pmon.sm_utilization_percent_sum);
+        actor
+            .gpu_process_memory_utilization_gauge
+            .with_label_values(&labels)
+            .set(pmon.memory_utilization_percent_sum);
+    }
+
+    Ok(())
+}
+
+fn read_nvidia_smi_gpu_query() -> anyhow::Result<Vec<GpuQuerySample>> {
+    use anyhow::Context;
+    let output = std::process::Command::new("nvidia-smi")
+        .arg("--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu")
+        .arg("--format=csv,noheader,nounits")
+        .output()
+        .context("run nvidia-smi gpu query")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "nvidia-smi gpu query exited with status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8(output.stdout).context("nvidia-smi gpu query stdout utf8")?;
+    let mut out = Vec::new();
+    for (line_idx, line) in stdout.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if cols.len() != 6 {
+            anyhow::bail!(
+                "unexpected nvidia-smi gpu query line {}: {}",
+                line_idx + 1,
+                line
+            );
+        }
+        let memory_used_mib = parse_nvidia_number(cols[2])
+            .with_context(|| format!("parse gpu memory.used line {}", line_idx + 1))?;
+        let memory_total_mib = parse_nvidia_number(cols[3])
+            .with_context(|| format!("parse gpu memory.total line {}", line_idx + 1))?;
+        let utilization_percent = parse_nvidia_number(cols[4])
+            .with_context(|| format!("parse gpu utilization line {}", line_idx + 1))?;
+        let temperature_celsius = parse_nvidia_number(cols[5])
+            .with_context(|| format!("parse gpu temperature line {}", line_idx + 1))?;
+        out.push(GpuQuerySample {
+            index: cols[0].to_string(),
+            name: cols[1].to_string(),
+            memory_used_bytes: memory_used_mib * 1024.0 * 1024.0,
+            memory_total_bytes: memory_total_mib * 1024.0 * 1024.0,
+            utilization_percent,
+            temperature_celsius,
+        });
+    }
+    Ok(out)
+}
+
+fn read_nvidia_smi_pmon() -> anyhow::Result<HashMap<String, GpuPmonSample>> {
+    use anyhow::Context;
+    let output = std::process::Command::new("nvidia-smi")
+        .arg("pmon")
+        .arg("-c")
+        .arg("1")
+        .output()
+        .context("run nvidia-smi pmon")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "nvidia-smi pmon exited with status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8(output.stdout).context("nvidia-smi pmon stdout utf8")?;
+    let mut out: HashMap<String, GpuPmonSample> = HashMap::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 5 {
+            continue;
+        }
+        let gpu = cols[0].trim();
+        let pid = cols[1].trim();
+        if gpu == "-" || pid == "-" {
+            continue;
+        }
+        let sm = parse_nvidia_number(cols[3]).unwrap_or(0.0);
+        let mem = parse_nvidia_number(cols[4]).unwrap_or(0.0);
+        let entry = out.entry(gpu.to_string()).or_default();
+        entry.process_count = entry.process_count.saturating_add(1);
+        entry.sm_utilization_percent_sum += sm;
+        entry.memory_utilization_percent_sum += mem;
+    }
+    Ok(out)
+}
+
+fn parse_nvidia_number(s: &str) -> anyhow::Result<f64> {
+    let t = s.trim();
+    if t.is_empty() || t == "-" || t.eq_ignore_ascii_case("[not supported]") {
+        anyhow::bail!("not a numeric nvidia-smi field: {:?}", s);
+    }
+    let t = t.trim_end_matches('%').trim();
+    Ok(t.parse::<f64>()?)
 }
 
 fn read_self_container_memory_sample() -> anyhow::Result<CgroupMemorySample> {

@@ -702,26 +702,29 @@ impl MetricReporter {
         let view = self.view().clone();
         let member = view.cluster_manager().get_self_info();
         let member_role = member.node_role();
-        let enable_system_metrics = match member_role {
-            NodeRole::Master | NodeRole::Client => true,
-            NodeRole::External => false,
+        let (enable_node_metrics, enable_process_metrics) = match member_role {
+            NodeRole::Master | NodeRole::Client => (true, true),
+            NodeRole::External => (false, true),
             NodeRole::Unknown => {
                 // English note:
-                // - Machine-level metrics (host cpu/mem + process cpu/rss) are sampled periodically and can be
-                //   expensive if every external process emits them.
-                // - The system expects only owner/master to report machine/system metrics; unknown role is
-                //   treated as "do not sample" to avoid accidental high-cardinality duplication.
+                // - Node-level metrics must be emitted by owner/master only to avoid duplicate host samples.
+                // - Unknown roles are treated as "do not sample" because their metric ownership is unclear.
                 warn!(
-                    "kv metrics actor: system metrics sampling disabled due to unknown role: member_id={}",
+                    "kv metrics actor: periodic metric sampling disabled due to unknown role: member_id={}",
                     member.id
                 );
-                false
+                (false, false)
             }
         };
         let (node_id, node_role) = resolve_node_labels(&member);
         let prom = self.prom_remote_write_actor_handle().clone();
-        let (handle, owned) =
-            KvMetricsActorOwned::new(node_id, node_role, prom, enable_system_metrics);
+        let (handle, owned) = KvMetricsActorOwned::new(
+            node_id,
+            node_role,
+            prom,
+            enable_node_metrics,
+            enable_process_metrics,
+        );
         // English note:
         // - This handle is best-effort (try_send) and must not impact hot paths.
         // - We attach it to both MetricsHandle (operation-level metrics) and ClusterManager so that

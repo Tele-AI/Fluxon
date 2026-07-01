@@ -4,7 +4,7 @@ use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
 use fluxon_observability::kv_metrics_actor::{
     KvOpEndBytesPulse as ObserveOpEndBytesPulse, KvOpMetric, KvOpMetricGet, KvOpMetricPut,
-    ObserveDirection, ObserveFsIoOp, ObserveHandle, ObserveOp,
+    ObserveCacheEvent, ObserveDirection, ObserveFsIoOp, ObserveHandle, ObserveOp,
 };
 use fluxon_observability::types::FsMountKind;
 use std::borrow::Cow;
@@ -635,8 +635,22 @@ impl MetricsHandle {
     ) {
     }
 
-    pub fn record_cache_hit(&self, _node: &str, _role: &str) {}
-    pub fn record_cache_miss(&self, _node: &str, _role: &str) {}
+    pub fn record_cache_hit(&self, _node: &str, _role: &str) {
+        let Some(observe) = self.observe() else {
+            return;
+        };
+        observe.try_submit(ObserveOp::RecordCacheEvent {
+            event: ObserveCacheEvent::Hit,
+        });
+    }
+    pub fn record_cache_miss(&self, _node: &str, _role: &str) {
+        let Some(observe) = self.observe() else {
+            return;
+        };
+        observe.try_submit(ObserveOp::RecordCacheEvent {
+            event: ObserveCacheEvent::Miss,
+        });
+    }
     pub fn set_cache_bytes(&self, _node: &str, _role: &str, _total_bytes: i64) {}
     pub fn observe_cache_value_size(&self, _node: &str, _role: &str, _size_bytes: u64) {}
 }

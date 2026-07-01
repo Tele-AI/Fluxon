@@ -24,6 +24,8 @@ pub const PROM_LABEL_RDMA_PORT: &str = "rdma_port";
 pub const PROM_LABEL_RDMA_NETDEV: &str = "rdma_netdev";
 pub const PROM_LABEL_RDMA_PCI_BDF: &str = "rdma_pci_bdf";
 pub const PROM_LABEL_RDMA_TRANSFER_STATE: &str = "rdma_transfer_state";
+pub const PROM_LABEL_GPU_INDEX: &str = "gpu_index";
+pub const PROM_LABEL_GPU_NAME: &str = "gpu_name";
 
 // ---------------- KV peer network observe schema ----------------
 //
@@ -48,8 +50,24 @@ pub const PROM_VALUE_KV_COMPONENT_LOCAL_IPC: &str = "local_ipc";
 // These gauges are emitted by long-running Fluxon processes via the observe actor.
 // Keep names stable once published.
 pub const PROM_METRIC_PROCESS_CPU_USAGE_PERCENT: &str = "process_cpu_usage_percent";
+pub const PROM_METRIC_CLIENT_NETWORK_MBPS: &str = "client_network_mbps";
 pub const PROM_METRIC_CONTAINER_MEMORY_USAGE_BYTES: &str = "container_memory_usage_bytes";
 pub const PROM_METRIC_CONTAINER_MEMORY_LIMIT_BYTES: &str = "container_memory_limit_bytes";
+
+// ---------------- GPU observe schema ----------------
+//
+// These gauges are intentionally node-scoped and low-cardinality. They mirror the lightweight
+// `nvidia-smi --query-gpu ...` and `nvidia-smi pmon -c 1` probes used for operations triage.
+// Do not add per-process GPU labels here; process IDs are high-cardinality and churn quickly.
+pub const PROM_METRIC_GPU_MEMORY_USED_BYTES: &str = "gpu_memory_used_bytes";
+pub const PROM_METRIC_GPU_MEMORY_TOTAL_BYTES: &str = "gpu_memory_total_bytes";
+pub const PROM_METRIC_GPU_UTILIZATION_PERCENT: &str = "gpu_utilization_percent";
+pub const PROM_METRIC_GPU_TEMPERATURE_CELSIUS: &str = "gpu_temperature_celsius";
+pub const PROM_METRIC_GPU_PROCESS_COUNT: &str = "gpu_process_count";
+pub const PROM_METRIC_GPU_PROCESS_SM_UTILIZATION_PERCENT: &str =
+    "gpu_process_sm_utilization_percent";
+pub const PROM_METRIC_GPU_PROCESS_MEMORY_UTILIZATION_PERCENT: &str =
+    "gpu_process_memory_utilization_percent";
 
 // ---------------- Tokio runtime observe schema (stable runtime metrics) ----------------
 //
@@ -168,6 +186,11 @@ pub const PROM_METRIC_SHM_FILE_ALLOCATED_BYTES: &str = "shm_file_allocated_bytes
 // Use `rate(...[30s])` to get ops/s in the topology UI.
 pub const PROM_LABEL_FS_IO_OP: &str = "fs_io_op";
 pub const PROM_METRIC_FS_IO_OPS_TOTAL: &str = "fs_io_ops_total";
+pub const PROM_METRIC_KV_CACHE_EVENTS_TOTAL: &str = "kv_cache_events_total";
+pub const PROM_LABEL_CACHE_EVENT: &str = "cache_event";
+pub const PROM_METRIC_KV_OP_END_EVENT_RPS: &str = "kv_op_end_event_rps";
+pub const PROM_METRIC_KV_OP_END_BYTES_PER_SEC: &str = "kv_op_end_bytes_per_sec";
+pub const PROM_METRIC_KV_GET_CACHE_HIT_RATE_PERCENT: &str = "kv_get_cache_hit_rate_percent";
 
 // ---------------- MQ observe schema (labels + metric names) ----------------
 //

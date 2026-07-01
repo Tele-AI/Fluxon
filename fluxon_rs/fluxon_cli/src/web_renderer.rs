@@ -3086,6 +3086,7 @@ mod tests {
             node_memory_total_bytes: None,
             container_memory_usage_bytes: None,
             container_memory_limit_bytes: None,
+            gpus: Vec::new(),
             process_resident_memory_bytes: None,
             process_cpu_usage_percent: None,
             tokio_num_workers: None,

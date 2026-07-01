@@ -19,11 +19,13 @@ use hyper::Uri;
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnectorBuilder;
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{RwLock, watch};
 
+use fluxon_observability::keys::PROM_METRIC_CLIENT_NETWORK_MBPS;
 use fluxon_util::{
     FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
     fluxon_cli_proxy_desc_etcd_service_prefix_v2,
@@ -245,6 +247,8 @@ const FLUXON_CLI_AUTO_REFRESH_TOOL_JS: &str = r#"
     if (inFlightRef.inFlight) return;
     inFlightRef.inFlight = true;
     const state = hooks.captureState();
+    const scrollX = window.scrollX;
+    const scrollY = window.scrollY;
     try {
       const resp = await fetch(cfg.url, { cache: 'no-store' });
       if (!resp.ok) {
@@ -262,6 +266,7 @@ const FLUXON_CLI_AUTO_REFRESH_TOOL_JS: &str = r#"
       curApp.innerHTML = nextApp.innerHTML;
       hooks.restoreState(state);
       hooks.afterReplace();
+      window.scrollTo(scrollX, scrollY);
     } catch (e) {
       console.warn('auto_refresh: refresh failed:', e);
     } finally {
@@ -479,8 +484,21 @@ struct KvMetricPanelResponse {
 #[serde(rename_all = "snake_case")]
 struct KvMetricMembersResponse {
     metric: KvMetricMetaWire,
+    comparison_metric: Option<KvMetricMetaWire>,
+    additional_metrics: Vec<KvMetricMetaWire>,
     range: KvMetricRangeWire,
     members: Vec<KvMemberSeriesWire>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct KvMetricOwnersResponse {
+    metric: KvMetricMetaWire,
+    comparison_metric: Option<KvMetricMetaWire>,
+    additional_metrics: Vec<KvMetricMetaWire>,
+    range: KvMetricRangeWire,
+    owners: Vec<KvOwnerSeriesWire>,
     warnings: Vec<String>,
 }
 
@@ -489,6 +507,7 @@ struct KvMetricMembersResponse {
 struct KvMetricMetaWire {
     key: String,
     label: String,
+    series_label: String,
     unit: String,
     aggregate: String,
 }
@@ -504,8 +523,20 @@ struct KvMetricRangeWire {
 #[serde(rename_all = "snake_case")]
 struct KvAggregateMetricCardWire {
     metric: KvMetricMetaWire,
+    comparison_metric: Option<KvMetricMetaWire>,
     latest: Option<f64>,
     aggregate_series: Vec<(f64, f64)>,
+    comparison_latest: Option<f64>,
+    comparison_series: Vec<(f64, f64)>,
+    additional_series: Vec<KvMetricAdditionalSeriesWire>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct KvMetricAdditionalSeriesWire {
+    metric: KvMetricMetaWire,
+    latest: Option<f64>,
+    series: Vec<(f64, f64)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -516,12 +547,29 @@ struct KvMemberSeriesWire {
     node_key: String,
     latest: Option<f64>,
     series: Vec<(f64, f64)>,
+    comparison_latest: Option<f64>,
+    comparison_series: Vec<(f64, f64)>,
+    additional_series: Vec<KvMetricAdditionalSeriesWire>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct KvOwnerSeriesWire {
+    owner_id: String,
+    node_key: String,
+    latest: Option<f64>,
+    series: Vec<(f64, f64)>,
+    comparison_latest: Option<f64>,
+    comparison_series: Vec<(f64, f64)>,
+    additional_series: Vec<KvMetricAdditionalSeriesWire>,
+    members: Vec<KvMemberSeriesWire>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KvMetricAggregate {
     Sum,
     Max,
+    Mean,
 }
 
 impl KvMetricAggregate {
@@ -529,6 +577,7 @@ impl KvMetricAggregate {
         match self {
             Self::Sum => "sum",
             Self::Max => "max",
+            Self::Mean => "mean",
         }
     }
 }
@@ -537,93 +586,427 @@ impl KvMetricAggregate {
 enum KvMetricValueField {
     PutRps,
     GetRps,
+    GetCacheHitRatePercent,
     PutBps,
     GetBps,
+    ProcessCpuUsagePercent,
+    NodeCpuUsagePercent,
+    NodeCpuCapacityPercent,
+    ProcessNetworkTxMbps,
+    ProcessNetworkRxMbps,
+    NodeMemoryUsageBytes,
+    NodeMemoryTotalBytes,
+    NodeNetworkTxMbps,
+    NodeNetworkRxMbps,
     ProcessRss,
+    GpuMemoryUsed,
+    GpuMemoryTotal,
+    GpuUtilizationPercent,
+    GpuTemperatureCelsius,
+    GpuProcessCount,
+    GpuProcessSmUtilizationPercent,
+    GpuProcessMemoryUtilizationPercent,
     SegUsedBytes,
+    SegCapacityBytes,
     TokioGlobalQueueDepth,
     TokioBusyPercent,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KvMetricSeriesSpec {
+    key: &'static str,
+    label: &'static str,
+    series_label: &'static str,
+    unit: &'static str,
+    aggregate: KvMetricAggregate,
+    field: KvMetricValueField,
+    roles: Option<&'static [MemberRole]>,
+}
+
+impl KvMetricSeriesSpec {
+    const fn new(
+        key: &'static str,
+        label: &'static str,
+        series_label: &'static str,
+        unit: &'static str,
+        aggregate: KvMetricAggregate,
+        field: KvMetricValueField,
+    ) -> Self {
+        Self {
+            key,
+            label,
+            series_label,
+            unit,
+            aggregate,
+            field,
+            roles: None,
+        }
+    }
+
+    const fn new_with_roles(
+        key: &'static str,
+        label: &'static str,
+        series_label: &'static str,
+        unit: &'static str,
+        aggregate: KvMetricAggregate,
+        field: KvMetricValueField,
+        roles: &'static [MemberRole],
+    ) -> Self {
+        Self {
+            key,
+            label,
+            series_label,
+            unit,
+            aggregate,
+            field,
+            roles: Some(roles),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct KvMetricSpec {
     key: &'static str,
     label: &'static str,
+    series_label: &'static str,
     unit: &'static str,
     aggregate: KvMetricAggregate,
     field: KvMetricValueField,
     roles: &'static [MemberRole],
+    comparison: Option<KvMetricSeriesSpec>,
+    additional: &'static [KvMetricSeriesSpec],
+}
+
+impl KvMetricSpec {
+    const fn single(
+        key: &'static str,
+        label: &'static str,
+        unit: &'static str,
+        aggregate: KvMetricAggregate,
+        field: KvMetricValueField,
+        roles: &'static [MemberRole],
+    ) -> Self {
+        Self::single_with_series_label(key, label, label, unit, aggregate, field, roles)
+    }
+
+    const fn single_with_series_label(
+        key: &'static str,
+        label: &'static str,
+        series_label: &'static str,
+        unit: &'static str,
+        aggregate: KvMetricAggregate,
+        field: KvMetricValueField,
+        roles: &'static [MemberRole],
+    ) -> Self {
+        Self {
+            key,
+            label,
+            series_label,
+            unit,
+            aggregate,
+            field,
+            roles,
+            comparison: None,
+            additional: &[],
+        }
+    }
+
+    const fn paired(
+        primary: KvMetricSeriesSpec,
+        comparison: KvMetricSeriesSpec,
+        roles: &'static [MemberRole],
+    ) -> Self {
+        Self {
+            key: primary.key,
+            label: primary.label,
+            series_label: primary.series_label,
+            unit: primary.unit,
+            aggregate: primary.aggregate,
+            field: primary.field,
+            roles,
+            comparison: Some(comparison),
+            additional: &[],
+        }
+    }
+
+    const fn paired_with_additional(
+        primary: KvMetricSeriesSpec,
+        comparison: KvMetricSeriesSpec,
+        additional: &'static [KvMetricSeriesSpec],
+        roles: &'static [MemberRole],
+    ) -> Self {
+        Self {
+            key: primary.key,
+            label: primary.label,
+            series_label: primary.series_label,
+            unit: primary.unit,
+            aggregate: primary.aggregate,
+            field: primary.field,
+            roles,
+            comparison: Some(comparison),
+            additional,
+        }
+    }
 }
 
 const KV_METRIC_OWNER_AND_EXTERNAL_ROLES: &[MemberRole] =
     &[MemberRole::OwnerClient, MemberRole::ExternalClient];
+const KV_METRIC_OWNER_AND_EXTERNAL_LIKE_ROLES: &[MemberRole] = &[
+    MemberRole::OwnerClient,
+    MemberRole::ExternalClient,
+    MemberRole::SideTransferWorker,
+];
+const KV_METRIC_SYSTEM_ROLES: &[MemberRole] = &[MemberRole::Master, MemberRole::OwnerClient];
 const KV_METRIC_OWNER_ONLY_ROLES: &[MemberRole] = &[MemberRole::OwnerClient];
+const KV_NODE_MEMORY_ADDITIONAL_SPECS: &[KvMetricSeriesSpec] =
+    &[KvMetricSeriesSpec::new_with_roles(
+        "process_rss",
+        "Process RSS",
+        "Process RSS",
+        "bytes",
+        KvMetricAggregate::Sum,
+        KvMetricValueField::ProcessRss,
+        KV_METRIC_OWNER_AND_EXTERNAL_LIKE_ROLES,
+    )];
+const KV_NODE_CPU_ADDITIONAL_SPECS: &[KvMetricSeriesSpec] = &[KvMetricSeriesSpec::new_with_roles(
+    "process_cpu_usage_percent",
+    "Process CPU",
+    "Process CPU",
+    "percent",
+    KvMetricAggregate::Sum,
+    KvMetricValueField::ProcessCpuUsagePercent,
+    KV_METRIC_OWNER_AND_EXTERNAL_LIKE_ROLES,
+)];
 
 const KV_METRIC_SPECS: &[KvMetricSpec] = &[
-    KvMetricSpec {
-        key: "put_rps",
-        label: "Put RPS",
-        unit: "rps",
-        aggregate: KvMetricAggregate::Sum,
-        field: KvMetricValueField::PutRps,
-        roles: KV_METRIC_OWNER_AND_EXTERNAL_ROLES,
-    },
-    KvMetricSpec {
-        key: "get_rps",
-        label: "Get RPS",
-        unit: "rps",
-        aggregate: KvMetricAggregate::Sum,
-        field: KvMetricValueField::GetRps,
-        roles: KV_METRIC_OWNER_AND_EXTERNAL_ROLES,
-    },
-    KvMetricSpec {
-        key: "put_bps",
-        label: "Put B/s",
-        unit: "B/s",
-        aggregate: KvMetricAggregate::Sum,
-        field: KvMetricValueField::PutBps,
-        roles: KV_METRIC_OWNER_AND_EXTERNAL_ROLES,
-    },
-    KvMetricSpec {
-        key: "get_bps",
-        label: "Get B/s",
-        unit: "B/s",
-        aggregate: KvMetricAggregate::Sum,
-        field: KvMetricValueField::GetBps,
-        roles: KV_METRIC_OWNER_AND_EXTERNAL_ROLES,
-    },
-    KvMetricSpec {
-        key: "process_rss",
-        label: "Process RSS",
-        unit: "bytes",
-        aggregate: KvMetricAggregate::Sum,
-        field: KvMetricValueField::ProcessRss,
-        roles: KV_METRIC_OWNER_AND_EXTERNAL_ROLES,
-    },
-    KvMetricSpec {
-        key: "seg_used_bytes",
-        label: "Segment Used",
-        unit: "bytes",
-        aggregate: KvMetricAggregate::Sum,
-        field: KvMetricValueField::SegUsedBytes,
-        roles: KV_METRIC_OWNER_ONLY_ROLES,
-    },
-    KvMetricSpec {
-        key: "tokio_global_queue_depth",
-        label: "Tokio Queue Depth",
-        unit: "count",
-        aggregate: KvMetricAggregate::Sum,
-        field: KvMetricValueField::TokioGlobalQueueDepth,
-        roles: KV_METRIC_OWNER_ONLY_ROLES,
-    },
-    KvMetricSpec {
-        key: "tokio_busy_percent",
-        label: "Tokio Busy %",
-        unit: "percent",
-        aggregate: KvMetricAggregate::Max,
-        field: KvMetricValueField::TokioBusyPercent,
-        roles: KV_METRIC_OWNER_ONLY_ROLES,
-    },
+    KvMetricSpec::single(
+        "put_rps",
+        "Put RPS",
+        "rps",
+        KvMetricAggregate::Sum,
+        KvMetricValueField::PutRps,
+        KV_METRIC_OWNER_AND_EXTERNAL_ROLES,
+    ),
+    KvMetricSpec::single(
+        "get_rps",
+        "Get RPS",
+        "rps",
+        KvMetricAggregate::Sum,
+        KvMetricValueField::GetRps,
+        KV_METRIC_OWNER_AND_EXTERNAL_ROLES,
+    ),
+    KvMetricSpec::single(
+        "get_cache_hit_rate_percent",
+        "Cache Hit %",
+        "percent",
+        KvMetricAggregate::Mean,
+        KvMetricValueField::GetCacheHitRatePercent,
+        KV_METRIC_OWNER_ONLY_ROLES,
+    ),
+    KvMetricSpec::single(
+        "put_bps",
+        "Put B/s",
+        "B/s",
+        KvMetricAggregate::Sum,
+        KvMetricValueField::PutBps,
+        KV_METRIC_OWNER_AND_EXTERNAL_ROLES,
+    ),
+    KvMetricSpec::single(
+        "get_bps",
+        "Get B/s",
+        "B/s",
+        KvMetricAggregate::Sum,
+        KvMetricValueField::GetBps,
+        KV_METRIC_OWNER_AND_EXTERNAL_ROLES,
+    ),
+    KvMetricSpec::single(
+        "process_cpu_usage_percent",
+        "CPU Util %",
+        "percent",
+        KvMetricAggregate::Sum,
+        KvMetricValueField::ProcessCpuUsagePercent,
+        KV_METRIC_OWNER_AND_EXTERNAL_LIKE_ROLES,
+    ),
+    KvMetricSpec::paired_with_additional(
+        KvMetricSeriesSpec::new(
+            "node_cpu_usage_percent",
+            "Node CPU",
+            "Used",
+            "percent",
+            KvMetricAggregate::Sum,
+            KvMetricValueField::NodeCpuUsagePercent,
+        ),
+        KvMetricSeriesSpec::new(
+            "node_cpu_capacity_percent",
+            "Capacity",
+            "Capacity",
+            "percent",
+            KvMetricAggregate::Sum,
+            KvMetricValueField::NodeCpuCapacityPercent,
+        ),
+        KV_NODE_CPU_ADDITIONAL_SPECS,
+        KV_METRIC_OWNER_ONLY_ROLES,
+    ),
+    KvMetricSpec::paired(
+        KvMetricSeriesSpec::new(
+            "process_network_tx_mbps",
+            "Process Network",
+            "TX",
+            "mbps",
+            KvMetricAggregate::Sum,
+            KvMetricValueField::ProcessNetworkTxMbps,
+        ),
+        KvMetricSeriesSpec::new(
+            "process_network_rx_mbps",
+            "RX",
+            "RX",
+            "mbps",
+            KvMetricAggregate::Sum,
+            KvMetricValueField::ProcessNetworkRxMbps,
+        ),
+        KV_METRIC_OWNER_AND_EXTERNAL_LIKE_ROLES,
+    ),
+    KvMetricSpec::paired_with_additional(
+        KvMetricSeriesSpec::new(
+            "node_memory_usage_bytes",
+            "Node Memory",
+            "Used",
+            "bytes",
+            KvMetricAggregate::Sum,
+            KvMetricValueField::NodeMemoryUsageBytes,
+        ),
+        KvMetricSeriesSpec::new(
+            "node_memory_total_bytes",
+            "Total",
+            "Total",
+            "bytes",
+            KvMetricAggregate::Sum,
+            KvMetricValueField::NodeMemoryTotalBytes,
+        ),
+        KV_NODE_MEMORY_ADDITIONAL_SPECS,
+        KV_METRIC_OWNER_ONLY_ROLES,
+    ),
+    KvMetricSpec::paired(
+        KvMetricSeriesSpec::new(
+            "node_network_tx_mbps",
+            "Node Network",
+            "TX",
+            "mbps",
+            KvMetricAggregate::Sum,
+            KvMetricValueField::NodeNetworkTxMbps,
+        ),
+        KvMetricSeriesSpec::new(
+            "node_network_rx_mbps",
+            "RX",
+            "RX",
+            "mbps",
+            KvMetricAggregate::Sum,
+            KvMetricValueField::NodeNetworkRxMbps,
+        ),
+        KV_METRIC_OWNER_ONLY_ROLES,
+    ),
+    KvMetricSpec::single(
+        "process_rss",
+        "Process RSS",
+        "bytes",
+        KvMetricAggregate::Sum,
+        KvMetricValueField::ProcessRss,
+        KV_METRIC_OWNER_AND_EXTERNAL_LIKE_ROLES,
+    ),
+    KvMetricSpec::paired(
+        KvMetricSeriesSpec::new(
+            "seg_used_bytes",
+            "Segment Usage",
+            "Used",
+            "bytes",
+            KvMetricAggregate::Sum,
+            KvMetricValueField::SegUsedBytes,
+        ),
+        KvMetricSeriesSpec::new(
+            "seg_capacity_bytes",
+            "Capacity",
+            "Capacity",
+            "bytes",
+            KvMetricAggregate::Sum,
+            KvMetricValueField::SegCapacityBytes,
+        ),
+        KV_METRIC_OWNER_ONLY_ROLES,
+    ),
+    KvMetricSpec::paired(
+        KvMetricSeriesSpec::new(
+            "gpu_memory_used",
+            "GPU Memory",
+            "Used",
+            "bytes",
+            KvMetricAggregate::Sum,
+            KvMetricValueField::GpuMemoryUsed,
+        ),
+        KvMetricSeriesSpec::new(
+            "gpu_memory_total",
+            "Total",
+            "Total",
+            "bytes",
+            KvMetricAggregate::Sum,
+            KvMetricValueField::GpuMemoryTotal,
+        ),
+        KV_METRIC_SYSTEM_ROLES,
+    ),
+    KvMetricSpec::single(
+        "gpu_utilization_percent",
+        "GPU Util %",
+        "percent",
+        KvMetricAggregate::Sum,
+        KvMetricValueField::GpuUtilizationPercent,
+        KV_METRIC_SYSTEM_ROLES,
+    ),
+    KvMetricSpec::single(
+        "gpu_temperature_celsius",
+        "GPU Temp",
+        "celsius",
+        KvMetricAggregate::Max,
+        KvMetricValueField::GpuTemperatureCelsius,
+        KV_METRIC_SYSTEM_ROLES,
+    ),
+    KvMetricSpec::single(
+        "gpu_process_count",
+        "GPU Proc Count",
+        "count",
+        KvMetricAggregate::Sum,
+        KvMetricValueField::GpuProcessCount,
+        KV_METRIC_SYSTEM_ROLES,
+    ),
+    KvMetricSpec::single(
+        "gpu_process_sm_utilization_percent",
+        "GPU Proc SM %",
+        "percent",
+        KvMetricAggregate::Sum,
+        KvMetricValueField::GpuProcessSmUtilizationPercent,
+        KV_METRIC_SYSTEM_ROLES,
+    ),
+    KvMetricSpec::single(
+        "gpu_process_memory_utilization_percent",
+        "GPU Proc Mem %",
+        "percent",
+        KvMetricAggregate::Sum,
+        KvMetricValueField::GpuProcessMemoryUtilizationPercent,
+        KV_METRIC_SYSTEM_ROLES,
+    ),
+    KvMetricSpec::single(
+        "tokio_global_queue_depth",
+        "Tokio Queue Depth",
+        "count",
+        KvMetricAggregate::Sum,
+        KvMetricValueField::TokioGlobalQueueDepth,
+        KV_METRIC_OWNER_ONLY_ROLES,
+    ),
+    KvMetricSpec::single(
+        "tokio_busy_percent",
+        "Tokio Busy %",
+        "percent",
+        KvMetricAggregate::Max,
+        KvMetricValueField::TokioBusyPercent,
+        KV_METRIC_OWNER_ONLY_ROLES,
+    ),
 ];
 
 fn kv_metric_spec_by_key(key: &str) -> Option<KvMetricSpec> {
@@ -634,9 +1017,32 @@ fn kv_metric_meta(spec: KvMetricSpec) -> KvMetricMetaWire {
     KvMetricMetaWire {
         key: spec.key.to_string(),
         label: spec.label.to_string(),
+        series_label: spec.series_label.to_string(),
         unit: spec.unit.to_string(),
         aggregate: spec.aggregate.as_str().to_string(),
     }
+}
+
+fn kv_metric_meta_from_series(spec: KvMetricSeriesSpec) -> KvMetricMetaWire {
+    KvMetricMetaWire {
+        key: spec.key.to_string(),
+        label: spec.label.to_string(),
+        series_label: spec.series_label.to_string(),
+        unit: spec.unit.to_string(),
+        aggregate: spec.aggregate.as_str().to_string(),
+    }
+}
+
+fn kv_metric_comparison_meta(spec: KvMetricSpec) -> Option<KvMetricMetaWire> {
+    spec.comparison.map(kv_metric_meta_from_series)
+}
+
+fn kv_metric_additional_meta(spec: KvMetricSpec) -> Vec<KvMetricMetaWire> {
+    spec.additional
+        .iter()
+        .copied()
+        .map(kv_metric_meta_from_series)
+        .collect()
 }
 
 fn parse_kv_metric_window(raw: Option<&str>) -> Result<(String, f64, u64), String> {
@@ -683,25 +1089,85 @@ fn parse_member_roles_list(raw: Option<&Vec<String>>) -> Result<Option<Vec<Membe
     Ok(Some(out))
 }
 
-fn kv_metric_promql_for_member(spec: KvMetricSpec, member_id: &str) -> String {
-    match spec.field {
-        KvMetricValueField::PutRps => format!(
-            "sum_over_time(kv_op_end_event{{node={member_id:?},op=\"put\",status=\"success\"}}[1s])"
-        ),
+fn kv_metric_promql_for_field(field: KvMetricValueField, member_id: &str) -> String {
+    match field {
+        KvMetricValueField::PutRps => {
+            format!("sum(kv_op_end_event_rps{{node={member_id:?},op=\"put\",status=\"success\"}})")
+        }
         KvMetricValueField::GetRps => format!(
-            "sum_over_time(kv_op_end_event{{node={member_id:?},op=\"get\",status=~\"hit|success\"}}[1s])"
+            "sum(kv_op_end_event_rps{{node={member_id:?},op=\"get\",status=~\"hit|success\"}})"
         ),
+        KvMetricValueField::GetCacheHitRatePercent => {
+            format!("kv_get_cache_hit_rate_percent{{node={member_id:?}}}")
+        }
         KvMetricValueField::PutBps => format!(
-            "sum_over_time(kv_op_end_bytes{{node={member_id:?},op=\"put\",status=\"success\"}}[1s])"
+            "sum(kv_op_end_bytes_per_sec{{node={member_id:?},op=\"put\",status=\"success\"}})"
         ),
         KvMetricValueField::GetBps => format!(
-            "sum_over_time(kv_op_end_bytes{{node={member_id:?},op=\"get\",status=~\"hit|success\"}}[1s])"
+            "sum(kv_op_end_bytes_per_sec{{node={member_id:?},op=\"get\",status=~\"hit|success\"}})"
         ),
+        KvMetricValueField::ProcessCpuUsagePercent => {
+            format!("process_cpu_usage_percent{{node={member_id:?}}}")
+        }
+        KvMetricValueField::NodeCpuUsagePercent => {
+            format!(
+                "node_cpu_usage_percent{{node={member_id:?}}} * node_cpu_logical_cores{{node={member_id:?}}}"
+            )
+        }
+        KvMetricValueField::NodeCpuCapacityPercent => {
+            format!("node_cpu_logical_cores{{node={member_id:?}}} * 100")
+        }
+        KvMetricValueField::ProcessNetworkTxMbps => {
+            format!("{PROM_METRIC_CLIENT_NETWORK_MBPS}{{node={member_id:?},direction=\"tx\"}}")
+        }
+        KvMetricValueField::ProcessNetworkRxMbps => {
+            format!("{PROM_METRIC_CLIENT_NETWORK_MBPS}{{node={member_id:?},direction=\"rx\"}}")
+        }
+        KvMetricValueField::NodeMemoryUsageBytes => {
+            format!("node_memory_usage_bytes{{node={member_id:?}}}")
+        }
+        KvMetricValueField::NodeMemoryTotalBytes => {
+            format!("node_memory_total_bytes{{node={member_id:?}}}")
+        }
+        KvMetricValueField::NodeNetworkTxMbps => {
+            format!(
+                "sum(rate(node_network_transmit_bytes_total{{node={member_id:?}}}[2m])) * 8 / 1000000"
+            )
+        }
+        KvMetricValueField::NodeNetworkRxMbps => {
+            format!(
+                "sum(rate(node_network_receive_bytes_total{{node={member_id:?}}}[2m])) * 8 / 1000000"
+            )
+        }
         KvMetricValueField::ProcessRss => {
             format!("process_resident_memory_bytes{{node={member_id:?}}}")
         }
+        KvMetricValueField::GpuMemoryUsed => {
+            format!("sum(gpu_memory_used_bytes{{node={member_id:?}}})")
+        }
+        KvMetricValueField::GpuMemoryTotal => {
+            format!("sum(gpu_memory_total_bytes{{node={member_id:?}}})")
+        }
+        KvMetricValueField::GpuUtilizationPercent => {
+            format!("sum(gpu_utilization_percent{{node={member_id:?}}})")
+        }
+        KvMetricValueField::GpuTemperatureCelsius => {
+            format!("max(gpu_temperature_celsius{{node={member_id:?}}})")
+        }
+        KvMetricValueField::GpuProcessCount => {
+            format!("sum(gpu_process_count{{node={member_id:?}}})")
+        }
+        KvMetricValueField::GpuProcessSmUtilizationPercent => {
+            format!("sum(gpu_process_sm_utilization_percent{{node={member_id:?}}})")
+        }
+        KvMetricValueField::GpuProcessMemoryUtilizationPercent => {
+            format!("sum(gpu_process_memory_utilization_percent{{node={member_id:?}}})")
+        }
         KvMetricValueField::SegUsedBytes => {
             format!("sum(kvcache_segment_used_bytes{{node={member_id:?}}})")
+        }
+        KvMetricValueField::SegCapacityBytes => {
+            format!("sum(kvcache_segment_capacity_bytes{{node={member_id:?}}})")
         }
         KvMetricValueField::TokioGlobalQueueDepth => {
             format!("tokio_global_queue_depth{{node={member_id:?}}}")
@@ -712,11 +1178,67 @@ fn kv_metric_promql_for_member(spec: KvMetricSpec, member_id: &str) -> String {
     }
 }
 
+fn kv_metric_promql_for_member(spec: KvMetricSpec, member_id: &str) -> String {
+    kv_metric_promql_for_field(spec.field, member_id)
+}
+
 #[derive(Debug, Clone)]
 struct KvMetricMemberRef {
     member_id: String,
     role: MemberRole,
     node_key: String,
+}
+
+#[derive(Debug, Clone)]
+struct KvMetricOwnerRef {
+    owner_id: String,
+    node_key: String,
+    members: Vec<KvMetricMemberRef>,
+}
+
+fn kv_metric_member_matches(
+    member: &crate::model::MemberSnapshot,
+    spec: KvMetricSpec,
+    visible_roles: Option<&Vec<MemberRole>>,
+) -> bool {
+    if !spec.roles.contains(&member.role) {
+        return false;
+    }
+    if let Some(v) = visible_roles {
+        if !v.contains(&member.role) {
+            return false;
+        }
+    }
+    true
+}
+
+fn kv_metric_series_member_matches(
+    member: &crate::model::MemberSnapshot,
+    spec: KvMetricSeriesSpec,
+    visible_roles: Option<&Vec<MemberRole>>,
+) -> bool {
+    if let Some(roles) = spec.roles {
+        if !roles.contains(&member.role) {
+            return false;
+        }
+    }
+    if let Some(v) = visible_roles {
+        if !v.contains(&member.role) {
+            return false;
+        }
+    }
+    true
+}
+
+fn kv_metric_member_ref(
+    member: &crate::model::MemberSnapshot,
+    node_key: &str,
+) -> KvMetricMemberRef {
+    KvMetricMemberRef {
+        member_id: member.member_id.clone(),
+        role: member.role,
+        node_key: node_key.to_string(),
+    }
 }
 
 fn select_kv_metric_members(
@@ -727,22 +1249,70 @@ fn select_kv_metric_members(
     let mut out = Vec::new();
     for node in &snapshot.nodes {
         for member in &node.members {
-            if !spec.roles.contains(&member.role) {
+            if !kv_metric_member_matches(member, spec, visible_roles) {
                 continue;
             }
-            if let Some(v) = visible_roles {
-                if !v.contains(&member.role) {
-                    continue;
-                }
-            }
-            out.push(KvMetricMemberRef {
-                member_id: member.member_id.clone(),
-                role: member.role,
-                node_key: node.node_key.clone(),
-            });
+            out.push(kv_metric_member_ref(member, &node.node_key));
         }
     }
     out
+}
+
+fn select_kv_metric_owner_groups(
+    snapshot: &crate::model::ClusterSnapshot,
+    spec: KvMetricSpec,
+    visible_roles: Option<&Vec<MemberRole>>,
+) -> (Vec<KvMetricOwnerRef>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut warnings = Vec::new();
+
+    for node in &snapshot.nodes {
+        let mut owners = node
+            .members
+            .iter()
+            .filter(|m| m.role == MemberRole::OwnerClient)
+            .collect::<Vec<_>>();
+        owners.sort_by(|a, b| a.member_id.cmp(&b.member_id));
+        if owners.is_empty() {
+            continue;
+        }
+
+        if owners.len() == 1 {
+            let members = node
+                .members
+                .iter()
+                .filter(|member| kv_metric_member_matches(member, spec, visible_roles))
+                .map(|member| kv_metric_member_ref(member, &node.node_key))
+                .collect::<Vec<_>>();
+            if members.is_empty() {
+                continue;
+            }
+            out.push(KvMetricOwnerRef {
+                owner_id: owners[0].member_id.clone(),
+                node_key: node.node_key.clone(),
+                members,
+            });
+            continue;
+        }
+
+        warnings.push(format!(
+            "metric {} owner view: multiple owner_client members under node_key={}, grouping owner_client members only",
+            spec.key, node.node_key
+        ));
+        for owner in owners {
+            if !kv_metric_member_matches(owner, spec, visible_roles) {
+                continue;
+            }
+            out.push(KvMetricOwnerRef {
+                owner_id: owner.member_id.clone(),
+                node_key: node.node_key.clone(),
+                members: vec![kv_metric_member_ref(owner, &node.node_key)],
+            });
+        }
+    }
+
+    out.sort_by(|a, b| a.owner_id.cmp(&b.owner_id));
+    (out, warnings)
 }
 
 fn prom_regex_escape_literal_local(s: &str) -> String {
@@ -775,27 +1345,103 @@ fn prom_regex_union_exact_local(ids: &[String]) -> Option<String> {
     }
 }
 
-fn kv_metric_aggregate_promql(spec: KvMetricSpec, member_ids: &[String]) -> Result<String, String> {
+fn kv_metric_aggregate_promql_for_field(
+    field: KvMetricValueField,
+    aggregate: KvMetricAggregate,
+    member_ids: &[String],
+) -> Result<String, String> {
     let member_regex = prom_regex_union_exact_local(member_ids)
         .ok_or_else(|| "no visible members for metric".to_string())?;
-    let promql = match spec.field {
+    let promql = match field {
         KvMetricValueField::PutRps => format!(
-            "sum(sum_over_time(kv_op_end_event{{node=~{member_regex:?},op=\"put\",status=\"success\"}}[1s]))"
+            "sum(kv_op_end_event_rps{{node=~{member_regex:?},op=\"put\",status=\"success\"}})"
         ),
         KvMetricValueField::GetRps => format!(
-            "sum(sum_over_time(kv_op_end_event{{node=~{member_regex:?},op=\"get\",status=~\"hit|success\"}}[1s]))"
+            "sum(kv_op_end_event_rps{{node=~{member_regex:?},op=\"get\",status=~\"hit|success\"}})"
         ),
+        KvMetricValueField::GetCacheHitRatePercent => {
+            format!("avg(kv_get_cache_hit_rate_percent{{node=~{member_regex:?}}})")
+        }
         KvMetricValueField::PutBps => format!(
-            "sum(sum_over_time(kv_op_end_bytes{{node=~{member_regex:?},op=\"put\",status=\"success\"}}[1s]))"
+            "sum(kv_op_end_bytes_per_sec{{node=~{member_regex:?},op=\"put\",status=\"success\"}})"
         ),
         KvMetricValueField::GetBps => format!(
-            "sum(sum_over_time(kv_op_end_bytes{{node=~{member_regex:?},op=\"get\",status=~\"hit|success\"}}[1s]))"
+            "sum(kv_op_end_bytes_per_sec{{node=~{member_regex:?},op=\"get\",status=~\"hit|success\"}})"
         ),
+        KvMetricValueField::ProcessCpuUsagePercent => match aggregate {
+            KvMetricAggregate::Mean => {
+                format!("avg(process_cpu_usage_percent{{node=~{member_regex:?}}})")
+            }
+            KvMetricAggregate::Max => {
+                format!("max(process_cpu_usage_percent{{node=~{member_regex:?}}})")
+            }
+            KvMetricAggregate::Sum => {
+                format!("sum(process_cpu_usage_percent{{node=~{member_regex:?}}})")
+            }
+        },
+        KvMetricValueField::NodeCpuUsagePercent => {
+            format!(
+                "sum(node_cpu_usage_percent{{node=~{member_regex:?}}} * node_cpu_logical_cores{{node=~{member_regex:?}}})"
+            )
+        }
+        KvMetricValueField::NodeCpuCapacityPercent => {
+            format!("sum(node_cpu_logical_cores{{node=~{member_regex:?}}} * 100)")
+        }
+        KvMetricValueField::ProcessNetworkTxMbps => {
+            format!(
+                "sum({PROM_METRIC_CLIENT_NETWORK_MBPS}{{node=~{member_regex:?},direction=\"tx\"}})"
+            )
+        }
+        KvMetricValueField::ProcessNetworkRxMbps => {
+            format!(
+                "sum({PROM_METRIC_CLIENT_NETWORK_MBPS}{{node=~{member_regex:?},direction=\"rx\"}})"
+            )
+        }
+        KvMetricValueField::NodeMemoryUsageBytes => {
+            format!("sum(node_memory_usage_bytes{{node=~{member_regex:?}}})")
+        }
+        KvMetricValueField::NodeMemoryTotalBytes => {
+            format!("sum(node_memory_total_bytes{{node=~{member_regex:?}}})")
+        }
+        KvMetricValueField::NodeNetworkTxMbps => {
+            format!(
+                "sum(rate(node_network_transmit_bytes_total{{node=~{member_regex:?}}}[2m])) * 8 / 1000000"
+            )
+        }
+        KvMetricValueField::NodeNetworkRxMbps => {
+            format!(
+                "sum(rate(node_network_receive_bytes_total{{node=~{member_regex:?}}}[2m])) * 8 / 1000000"
+            )
+        }
         KvMetricValueField::ProcessRss => {
             format!("sum(process_resident_memory_bytes{{node=~{member_regex:?}}})")
         }
+        KvMetricValueField::GpuMemoryUsed => {
+            format!("sum(gpu_memory_used_bytes{{node=~{member_regex:?}}})")
+        }
+        KvMetricValueField::GpuMemoryTotal => {
+            format!("sum(gpu_memory_total_bytes{{node=~{member_regex:?}}})")
+        }
+        KvMetricValueField::GpuUtilizationPercent => {
+            format!("sum(gpu_utilization_percent{{node=~{member_regex:?}}})")
+        }
+        KvMetricValueField::GpuTemperatureCelsius => {
+            format!("max(gpu_temperature_celsius{{node=~{member_regex:?}}})")
+        }
+        KvMetricValueField::GpuProcessCount => {
+            format!("sum(gpu_process_count{{node=~{member_regex:?}}})")
+        }
+        KvMetricValueField::GpuProcessSmUtilizationPercent => {
+            format!("sum(gpu_process_sm_utilization_percent{{node=~{member_regex:?}}})")
+        }
+        KvMetricValueField::GpuProcessMemoryUtilizationPercent => {
+            format!("sum(gpu_process_memory_utilization_percent{{node=~{member_regex:?}}})")
+        }
         KvMetricValueField::SegUsedBytes => {
             format!("sum(kvcache_segment_used_bytes{{node=~{member_regex:?}}})")
+        }
+        KvMetricValueField::SegCapacityBytes => {
+            format!("sum(kvcache_segment_capacity_bytes{{node=~{member_regex:?}}})")
         }
         KvMetricValueField::TokioGlobalQueueDepth => {
             format!("sum(tokio_global_queue_depth{{node=~{member_regex:?}}})")
@@ -805,6 +1451,194 @@ fn kv_metric_aggregate_promql(spec: KvMetricSpec, member_ids: &[String]) -> Resu
         }
     };
     Ok(promql)
+}
+
+fn kv_metric_aggregate_promql(spec: KvMetricSpec, member_ids: &[String]) -> Result<String, String> {
+    kv_metric_aggregate_promql_for_field(spec.field, spec.aggregate, member_ids)
+}
+
+fn kv_metric_series_from_range(range: Vec<crate::prom::PromRangeSeries>) -> Vec<(f64, f64)> {
+    range
+        .into_iter()
+        .flat_map(|series| {
+            series
+                .values
+                .into_iter()
+                .filter_map(|(ts, value)| value.parse::<f64>().ok().map(|v| (ts, v)))
+        })
+        .collect::<Vec<_>>()
+}
+
+async fn query_kv_metric_member_series(
+    prom: &PromClient,
+    spec: KvMetricSpec,
+    member: KvMetricMemberRef,
+    start_s: f64,
+    end_s: f64,
+    step: &str,
+    warnings: &mut Vec<String>,
+) -> Option<KvMemberSeriesWire> {
+    let promql = kv_metric_promql_for_member(spec, &member.member_id);
+    let range = match prom.query_range(&promql, start_s, end_s, step).await {
+        Ok(v) => v,
+        Err(e) => {
+            warnings.push(format!(
+                "metric {} member {} query_range failed: {}",
+                spec.key, member.member_id, e
+            ));
+            return None;
+        }
+    };
+    let series = kv_metric_series_from_range(range);
+    Some(KvMemberSeriesWire {
+        member_id: member.member_id,
+        role: member.role.as_str().to_string(),
+        node_key: member.node_key,
+        latest: series.last().map(|(_, v)| *v),
+        series,
+        comparison_latest: None,
+        comparison_series: Vec::new(),
+        additional_series: Vec::new(),
+    })
+}
+
+async fn query_kv_metric_series_for_field(
+    prom: &PromClient,
+    field: KvMetricValueField,
+    member_id: &str,
+    start_s: f64,
+    end_s: f64,
+    step: &str,
+) -> Result<Vec<(f64, f64)>, String> {
+    let promql = kv_metric_promql_for_field(field, member_id);
+    prom.query_range(&promql, start_s, end_s, step)
+        .await
+        .map(kv_metric_series_from_range)
+        .map_err(|e| e.to_string())
+}
+
+async fn query_kv_metric_additional_aggregate_series(
+    prom: &PromClient,
+    spec: KvMetricSeriesSpec,
+    member_ids: &[String],
+    start_s: f64,
+    end_s: f64,
+    step: &str,
+) -> Result<KvMetricAdditionalSeriesWire, String> {
+    let promql = kv_metric_aggregate_promql_for_field(spec.field, spec.aggregate, member_ids)?;
+    let series = prom
+        .query_range(&promql, start_s, end_s, step)
+        .await
+        .map(kv_metric_series_from_range)
+        .map_err(|e| e.to_string())?;
+    Ok(KvMetricAdditionalSeriesWire {
+        metric: kv_metric_meta_from_series(spec),
+        latest: series.last().map(|(_, v)| *v),
+        series,
+    })
+}
+
+async fn query_kv_metric_additional_member_series(
+    prom: &PromClient,
+    spec: KvMetricSeriesSpec,
+    member_id: &str,
+    start_s: f64,
+    end_s: f64,
+    step: &str,
+) -> Result<KvMetricAdditionalSeriesWire, String> {
+    let series =
+        query_kv_metric_series_for_field(prom, spec.field, member_id, start_s, end_s, step).await?;
+    Ok(KvMetricAdditionalSeriesWire {
+        metric: kv_metric_meta_from_series(spec),
+        latest: series.last().map(|(_, v)| *v),
+        series,
+    })
+}
+
+fn kv_metric_additional_members_for_node(
+    snapshot: &crate::model::ClusterSnapshot,
+    node_key: &str,
+    spec: KvMetricSeriesSpec,
+    visible_roles: Option<&Vec<MemberRole>>,
+) -> Vec<KvMetricMemberRef> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for node in &snapshot.nodes {
+        if node.node_key != node_key {
+            continue;
+        }
+        for member in &node.members {
+            if !kv_metric_series_member_matches(member, spec, visible_roles) {
+                continue;
+            }
+            if seen.insert(member.member_id.clone()) {
+                out.push(kv_metric_member_ref(member, &node.node_key));
+            }
+        }
+    }
+    out
+}
+
+fn sort_kv_member_series_rows(rows: &mut [KvMemberSeriesWire]) {
+    rows.sort_by(|a, b| {
+        let av = a.latest.unwrap_or(f64::NEG_INFINITY);
+        let bv = b.latest.unwrap_or(f64::NEG_INFINITY);
+        bv.partial_cmp(&av)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.member_id.cmp(&b.member_id))
+    });
+}
+
+fn aggregate_kv_member_series(
+    aggregate: KvMetricAggregate,
+    members: &[KvMemberSeriesWire],
+) -> Vec<(f64, f64)> {
+    let mut by_ts: BTreeMap<i64, f64> = BTreeMap::new();
+    let mut counts_by_ts: BTreeMap<i64, usize> = BTreeMap::new();
+    for member in members {
+        for (ts, value) in &member.series {
+            if !ts.is_finite() || !value.is_finite() {
+                continue;
+            }
+            let ts_ms = (*ts * 1000.0).round() as i64;
+            match aggregate {
+                KvMetricAggregate::Sum => {
+                    *by_ts.entry(ts_ms).or_insert(0.0) += *value;
+                }
+                KvMetricAggregate::Max => {
+                    by_ts
+                        .entry(ts_ms)
+                        .and_modify(|cur| {
+                            if *value > *cur {
+                                *cur = *value;
+                            }
+                        })
+                        .or_insert(*value);
+                }
+                KvMetricAggregate::Mean => {
+                    *by_ts.entry(ts_ms).or_insert(0.0) += *value;
+                    *counts_by_ts.entry(ts_ms).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    by_ts
+        .into_iter()
+        .map(|(ts_ms, value)| {
+            let value = match aggregate {
+                KvMetricAggregate::Mean => {
+                    let count = counts_by_ts.get(&ts_ms).copied().unwrap_or(0);
+                    if count == 0 {
+                        value
+                    } else {
+                        value / count as f64
+                    }
+                }
+                _ => value,
+            };
+            (ts_ms as f64 / 1000.0, value)
+        })
+        .collect()
 }
 
 async fn kv_metric_panel(
@@ -863,8 +1697,12 @@ async fn kv_metric_panel(
         if members.is_empty() {
             cards.push(KvAggregateMetricCardWire {
                 metric: kv_metric_meta(spec),
+                comparison_metric: kv_metric_comparison_meta(spec),
                 latest: None,
                 aggregate_series: Vec::new(),
+                comparison_latest: None,
+                comparison_series: Vec::new(),
+                additional_series: Vec::new(),
             });
             continue;
         }
@@ -878,8 +1716,12 @@ async fn kv_metric_panel(
                 warnings.push(format!("metric {} unavailable: {}", spec.key, e));
                 cards.push(KvAggregateMetricCardWire {
                     metric: kv_metric_meta(spec),
+                    comparison_metric: kv_metric_comparison_meta(spec),
                     latest: None,
                     aggregate_series: Vec::new(),
+                    comparison_latest: None,
+                    comparison_series: Vec::new(),
+                    additional_series: Vec::new(),
                 });
                 continue;
             }
@@ -890,26 +1732,114 @@ async fn kv_metric_panel(
                 warnings.push(format!("metric {} query_range failed: {}", spec.key, e));
                 cards.push(KvAggregateMetricCardWire {
                     metric: kv_metric_meta(spec),
+                    comparison_metric: kv_metric_comparison_meta(spec),
                     latest: None,
                     aggregate_series: Vec::new(),
+                    comparison_latest: None,
+                    comparison_series: Vec::new(),
+                    additional_series: Vec::new(),
                 });
                 continue;
             }
         };
-        let aggregate_series = range
-            .into_iter()
-            .flat_map(|series| {
-                series
-                    .values
-                    .into_iter()
-                    .filter_map(|(ts, value)| value.parse::<f64>().ok().map(|v| (ts, v)))
-            })
-            .collect::<Vec<_>>();
+        let aggregate_series = kv_metric_series_from_range(range);
         let latest = aggregate_series.last().map(|(_, v)| *v);
+        let member_node_keys = members
+            .iter()
+            .map(|m| m.node_key.clone())
+            .collect::<BTreeSet<_>>();
+        let (comparison_latest, comparison_series) = match spec.comparison {
+            Some(comparison) => {
+                let comparison_promql = match kv_metric_aggregate_promql_for_field(
+                    comparison.field,
+                    comparison.aggregate,
+                    &member_ids,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warnings.push(format!("metric {} comparison unavailable: {}", spec.key, e));
+                        String::new()
+                    }
+                };
+                if comparison_promql.is_empty() {
+                    (None, Vec::new())
+                } else {
+                    match prom
+                        .query_range(&comparison_promql, start_s, end_s, &step)
+                        .await
+                    {
+                        Ok(v) => {
+                            let series = kv_metric_series_from_range(v);
+                            (series.last().map(|(_, v)| *v), series)
+                        }
+                        Err(e) => {
+                            warnings.push(format!(
+                                "metric {} comparison query_range failed: {}",
+                                spec.key, e
+                            ));
+                            (None, Vec::new())
+                        }
+                    }
+                }
+            }
+            None => (None, Vec::new()),
+        };
+        let mut additional_series = Vec::with_capacity(spec.additional.len());
+        for additional in spec.additional.iter().copied() {
+            let mut additional_member_ids = Vec::new();
+            let mut seen = BTreeSet::new();
+            for node_key in &member_node_keys {
+                for member in kv_metric_additional_members_for_node(
+                    &snapshot,
+                    node_key,
+                    additional,
+                    visible_member_roles.as_ref(),
+                ) {
+                    if seen.insert(member.member_id.clone()) {
+                        additional_member_ids.push(member.member_id);
+                    }
+                }
+            }
+            if additional_member_ids.is_empty() {
+                additional_series.push(KvMetricAdditionalSeriesWire {
+                    metric: kv_metric_meta_from_series(additional),
+                    latest: None,
+                    series: Vec::new(),
+                });
+                continue;
+            }
+            match query_kv_metric_additional_aggregate_series(
+                &prom,
+                additional,
+                &additional_member_ids,
+                start_s,
+                end_s,
+                &step,
+            )
+            .await
+            {
+                Ok(row) => additional_series.push(row),
+                Err(e) => {
+                    warnings.push(format!(
+                        "metric {} additional {} query_range failed: {}",
+                        spec.key, additional.key, e
+                    ));
+                    additional_series.push(KvMetricAdditionalSeriesWire {
+                        metric: kv_metric_meta_from_series(additional),
+                        latest: None,
+                        series: Vec::new(),
+                    });
+                }
+            }
+        }
         cards.push(KvAggregateMetricCardWire {
             metric: kv_metric_meta(spec),
+            comparison_metric: kv_metric_comparison_meta(spec),
             latest,
             aggregate_series,
+            comparison_latest,
+            comparison_series,
+            additional_series,
         });
     }
 
@@ -1000,51 +1930,301 @@ async fn kv_metric_members(
     let mut warnings = snapshot.warnings.clone();
     let mut rows = Vec::with_capacity(members.len());
     for member in members {
-        let promql = kv_metric_promql_for_member(spec, &member.member_id);
-        let range = match prom.query_range(&promql, start_s, end_s, &step).await {
-            Ok(v) => v,
-            Err(e) => {
-                warnings.push(format!(
-                    "metric {} member {} query_range failed: {}",
-                    spec.key, member.member_id, e
-                ));
-                continue;
+        if let Some(mut row) =
+            query_kv_metric_member_series(&prom, spec, member, start_s, end_s, &step, &mut warnings)
+                .await
+        {
+            if let Some(comparison) = spec.comparison {
+                match query_kv_metric_series_for_field(
+                    &prom,
+                    comparison.field,
+                    &row.member_id,
+                    start_s,
+                    end_s,
+                    &step,
+                )
+                .await
+                {
+                    Ok(series) => {
+                        row.comparison_latest = series.last().map(|(_, v)| *v);
+                        row.comparison_series = series;
+                    }
+                    Err(e) => warnings.push(format!(
+                        "metric {} member {} comparison query_range failed: {}",
+                        spec.key, row.member_id, e
+                    )),
+                }
             }
-        };
-        let series = range
-            .into_iter()
-            .flat_map(|series| {
-                series
-                    .values
-                    .into_iter()
-                    .filter_map(|(ts, value)| value.parse::<f64>().ok().map(|v| (ts, v)))
-            })
-            .collect::<Vec<_>>();
-        rows.push(KvMemberSeriesWire {
-            member_id: member.member_id,
-            role: member.role.as_str().to_string(),
-            node_key: member.node_key,
-            latest: series.last().map(|(_, v)| *v),
-            series,
-        });
+            for additional in spec.additional.iter().copied() {
+                match query_kv_metric_additional_member_series(
+                    &prom,
+                    additional,
+                    &row.member_id,
+                    start_s,
+                    end_s,
+                    &step,
+                )
+                .await
+                {
+                    Ok(series) => row.additional_series.push(series),
+                    Err(e) => warnings.push(format!(
+                        "metric {} member {} additional {} query_range failed: {}",
+                        spec.key, row.member_id, additional.key, e
+                    )),
+                }
+            }
+            rows.push(row);
+        }
     }
-    rows.sort_by(|a, b| {
-        let av = a.latest.unwrap_or(f64::NEG_INFINITY);
-        let bv = b.latest.unwrap_or(f64::NEG_INFINITY);
-        bv.partial_cmp(&av)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.member_id.cmp(&b.member_id))
-    });
+    sort_kv_member_series_rows(&mut rows);
 
     let mut resp = (
         StatusCode::OK,
         Json(KvMetricMembersResponse {
             metric: kv_metric_meta(spec),
+            comparison_metric: kv_metric_comparison_meta(spec),
+            additional_metrics: kv_metric_additional_meta(spec),
             range: KvMetricRangeWire {
                 window: window_label,
                 step_s,
             },
             members: rows,
+            warnings,
+        }),
+    )
+        .into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/json; charset=utf-8".parse().unwrap(),
+    );
+    resp
+}
+
+async fn kv_metric_owners(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<KvMetricMembersQuery>,
+) -> Response {
+    let Some(cluster_name) = q.cluster_name.as_ref() else {
+        return text_response(
+            StatusCode::BAD_REQUEST,
+            "missing query param: cluster_name".to_string(),
+        );
+    };
+    let Some(metric_key) = q.metric_key.as_ref() else {
+        return text_response(
+            StatusCode::BAD_REQUEST,
+            "missing query param: metric_key".to_string(),
+        );
+    };
+    let spec = match kv_metric_spec_by_key(metric_key) {
+        Some(v) => v,
+        None => {
+            return text_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid metric_key: {}", metric_key),
+            );
+        }
+    };
+    let visible_member_roles = match parse_member_roles_list(q.member_roles.as_ref()) {
+        Ok(v) => v,
+        Err(e) => return text_response(StatusCode::BAD_REQUEST, e),
+    };
+    let (window_label, window_secs, step_s) = match parse_kv_metric_window(q.window.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return text_response(StatusCode::BAD_REQUEST, e),
+    };
+    let cfg = MonitorConfig {
+        etcd_endpoints: st.cfg.etcd_endpoints.clone(),
+        prometheus_base_url: st.cfg.prometheus_base_url.clone(),
+        cluster_name: cluster_name.clone(),
+        member_kind: MemberKind::Kv,
+        output: OutputFormat::Web,
+        mq_unique_key_prefixes: st.cfg.mq_unique_key_prefixes.clone(),
+        http_listen_addr: st.cfg.http_listen_addr.clone(),
+        greptime_sql: st.cfg.greptime_sql.clone(),
+    };
+    let snapshot = match crate::build_cluster_snapshot(&cfg).await {
+        Ok(v) => v,
+        Err(e) => {
+            return text_response(
+                StatusCode::BAD_GATEWAY,
+                format!("snapshot build failed: {}", e),
+            );
+        }
+    };
+    let (groups, mut owner_warnings) =
+        select_kv_metric_owner_groups(&snapshot, spec, visible_member_roles.as_ref());
+    let prom = PromClient::new(st.cfg.prometheus_base_url.clone());
+    let end_s = match prom.effective_query_time_s() {
+        Ok(v) => v,
+        Err(e) => {
+            return text_response(
+                StatusCode::BAD_GATEWAY,
+                format!("resolve query time failed: {}", e),
+            );
+        }
+    };
+    let start_s = (end_s - window_secs).max(0.0);
+    let step = format!("{}s", step_s);
+    let mut warnings = snapshot.warnings.clone();
+    warnings.append(&mut owner_warnings);
+
+    let mut owners = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut members = Vec::with_capacity(group.members.len());
+        for member in group.members.iter().cloned() {
+            if let Some(mut row) = query_kv_metric_member_series(
+                &prom,
+                spec,
+                member,
+                start_s,
+                end_s,
+                &step,
+                &mut warnings,
+            )
+            .await
+            {
+                if let Some(comparison) = spec.comparison {
+                    match query_kv_metric_series_for_field(
+                        &prom,
+                        comparison.field,
+                        &row.member_id,
+                        start_s,
+                        end_s,
+                        &step,
+                    )
+                    .await
+                    {
+                        Ok(series) => {
+                            row.comparison_latest = series.last().map(|(_, v)| *v);
+                            row.comparison_series = series;
+                        }
+                        Err(e) => warnings.push(format!(
+                            "metric {} member {} comparison query_range failed: {}",
+                            spec.key, row.member_id, e
+                        )),
+                    }
+                }
+                members.push(row);
+            }
+        }
+        sort_kv_member_series_rows(&mut members);
+        let series = aggregate_kv_member_series(spec.aggregate, &members);
+        let (comparison_latest, comparison_series) = match spec.comparison {
+            Some(comparison) => {
+                let comparison_members = members
+                    .iter()
+                    .map(|member| KvMemberSeriesWire {
+                        member_id: member.member_id.clone(),
+                        role: member.role.clone(),
+                        node_key: member.node_key.clone(),
+                        latest: member.comparison_latest,
+                        series: member.comparison_series.clone(),
+                        comparison_latest: None,
+                        comparison_series: Vec::new(),
+                        additional_series: Vec::new(),
+                    })
+                    .collect::<Vec<_>>();
+                let comparison_series =
+                    aggregate_kv_member_series(comparison.aggregate, &comparison_members);
+                (comparison_series.last().map(|(_, v)| *v), comparison_series)
+            }
+            None => (None, Vec::new()),
+        };
+        for member in &mut members {
+            for additional in spec.additional.iter().copied() {
+                match query_kv_metric_additional_member_series(
+                    &prom,
+                    additional,
+                    &member.member_id,
+                    start_s,
+                    end_s,
+                    &step,
+                )
+                .await
+                {
+                    Ok(row) => member.additional_series.push(row),
+                    Err(e) => warnings.push(format!(
+                        "metric {} member {} additional {} query_range failed: {}",
+                        spec.key, member.member_id, additional.key, e
+                    )),
+                }
+            }
+        }
+        let mut owner_additional_series = Vec::with_capacity(spec.additional.len());
+        for additional in spec.additional.iter().copied() {
+            let additional_members = kv_metric_additional_members_for_node(
+                &snapshot,
+                &group.node_key,
+                additional,
+                visible_member_roles.as_ref(),
+            );
+            let additional_member_ids = additional_members
+                .into_iter()
+                .map(|m| m.member_id)
+                .collect::<Vec<_>>();
+            if additional_member_ids.is_empty() {
+                owner_additional_series.push(KvMetricAdditionalSeriesWire {
+                    metric: kv_metric_meta_from_series(additional),
+                    latest: None,
+                    series: Vec::new(),
+                });
+                continue;
+            }
+            match query_kv_metric_additional_aggregate_series(
+                &prom,
+                additional,
+                &additional_member_ids,
+                start_s,
+                end_s,
+                &step,
+            )
+            .await
+            {
+                Ok(row) => owner_additional_series.push(row),
+                Err(e) => {
+                    warnings.push(format!(
+                        "metric {} owner {} additional {} query_range failed: {}",
+                        spec.key, group.owner_id, additional.key, e
+                    ));
+                    owner_additional_series.push(KvMetricAdditionalSeriesWire {
+                        metric: kv_metric_meta_from_series(additional),
+                        latest: None,
+                        series: Vec::new(),
+                    });
+                }
+            }
+        }
+        owners.push(KvOwnerSeriesWire {
+            owner_id: group.owner_id,
+            node_key: group.node_key,
+            latest: series.last().map(|(_, v)| *v),
+            series,
+            comparison_latest,
+            comparison_series,
+            additional_series: owner_additional_series,
+            members,
+        });
+    }
+    owners.sort_by(|a, b| {
+        let av = a.latest.unwrap_or(f64::NEG_INFINITY);
+        let bv = b.latest.unwrap_or(f64::NEG_INFINITY);
+        bv.partial_cmp(&av)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.owner_id.cmp(&b.owner_id))
+    });
+
+    let mut resp = (
+        StatusCode::OK,
+        Json(KvMetricOwnersResponse {
+            metric: kv_metric_meta(spec),
+            comparison_metric: kv_metric_comparison_meta(spec),
+            additional_metrics: kv_metric_additional_meta(spec),
+            range: KvMetricRangeWire {
+                window: window_label,
+                step_s,
+            },
+            owners,
             warnings,
         }),
     )
@@ -2771,6 +3951,7 @@ fn build_router(st: Arc<AppState>) -> Router {
         .route("/api/clusters", get(api_clusters))
         .route("/api/kv_metric_panel", get(kv_metric_panel))
         .route("/api/kv_metric_members", get(kv_metric_members))
+        .route("/api/kv_metric_owners", get(kv_metric_owners))
         .route("/view", get(view))
         .route("/topology", get(topology_page))
         .route("/cli", get(cli))
@@ -3433,4 +4614,361 @@ where
     serve_http_with_shutdown_from_tcp(cfg, listener, shutdown, None)
         .await
         .with_context(|| format!("http serve failed at {}", listen_addr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MemberKind;
+    use crate::model::{ClusterSnapshot, MemberSnapshot, NodeSnapshot};
+
+    fn test_member(member_id: &str, role: MemberRole, node_start_time: i64) -> MemberSnapshot {
+        MemberSnapshot {
+            member_id: member_id.to_string(),
+            role,
+            is_p2p_relay: false,
+            is_side_transfer_worker: false,
+            node_start_time,
+            hostname: None,
+            accessible_ip: None,
+            shared_mem_dir: None,
+            p2p_listen_port: None,
+            rdma_runtime_reported: false,
+            rdma_probe_error: None,
+            rdma_devices: Vec::new(),
+            rdma_ports: Vec::new(),
+            rdma_transfer_engine: None,
+            pid: None,
+            cmd: None,
+            sub_cluster: None,
+            product_uuid: None,
+            node_cpu_usage_percent: None,
+            node_cpu_logical_cores: None,
+            node_memory_usage_bytes: None,
+            node_memory_total_bytes: None,
+            container_memory_usage_bytes: None,
+            container_memory_limit_bytes: None,
+            gpus: Vec::new(),
+            process_resident_memory_bytes: None,
+            process_cpu_usage_percent: None,
+            tokio_num_workers: None,
+            tokio_alive_tasks: None,
+            tokio_global_queue_depth: None,
+            tokio_busy_percent: None,
+            tokio_max_worker_busy_percent: None,
+            tokio_park_unpark_rate_hz: None,
+            process_net_tx_mbps: None,
+            process_net_rx_mbps: None,
+            kv_put_rps: None,
+            kv_get_rps: None,
+            kv_put_bps: None,
+            kv_get_bps: None,
+            kv_put_latency_mean_us: None,
+            kv_put_latency_p95_us: None,
+            kv_put_latency_p99_us: None,
+            kv_get_latency_mean_us: None,
+            kv_get_latency_p95_us: None,
+            kv_get_latency_p99_us: None,
+            seg_capacity_bytes: None,
+            seg_used_bytes: None,
+            fs_read_rps: None,
+            fs_write_rps: None,
+        }
+    }
+
+    fn test_snapshot(nodes: Vec<NodeSnapshot>) -> ClusterSnapshot {
+        ClusterSnapshot {
+            cluster_name: "test_cluster".to_string(),
+            member_kind: MemberKind::Kv,
+            etcd_endpoints: Vec::new(),
+            prometheus_base_url: "http://example.invalid".to_string(),
+            warnings: Vec::new(),
+            visible_member_roles: None,
+            master_id: None,
+            master_network: None,
+            transfer_engine_edges: Vec::new(),
+            kv_peer_network: Vec::new(),
+            rdma_netdev_network: Vec::new(),
+            fs_mount_fs: Vec::new(),
+            shm_files: Vec::new(),
+            fs_export_registry: Vec::new(),
+            fs_mount_registry: Vec::new(),
+            kv_topology_owner_external_max: Vec::new(),
+            kv_topology_machine_external_max: Vec::new(),
+            kv_topology_sub_cluster_owner_owner_max: Vec::new(),
+            nodes,
+            mq: None,
+            total_put_rps: None,
+            total_get_rps: None,
+            total_put_bps: None,
+            total_get_bps: None,
+            total_put_latency_mean_us: None,
+            total_put_latency_p95_us: None,
+            total_put_latency_p99_us: None,
+            total_get_latency_mean_us: None,
+            total_get_latency_p95_us: None,
+            total_get_latency_p99_us: None,
+        }
+    }
+
+    #[test]
+    fn cache_hit_metric_uses_windowed_gauge_queries() {
+        let spec = kv_metric_spec_by_key("get_cache_hit_rate_percent").unwrap();
+        let member_promql = kv_metric_promql_for_member(spec, "owner_a");
+        let aggregate_promql =
+            kv_metric_aggregate_promql(spec, &[String::from("owner_a")]).unwrap();
+        assert_eq!(
+            member_promql,
+            "kv_get_cache_hit_rate_percent{node=\"owner_a\"}"
+        );
+        assert_eq!(
+            aggregate_promql,
+            "avg(kv_get_cache_hit_rate_percent{node=~\"^(?:owner_a)$\"})"
+        );
+    }
+
+    #[test]
+    fn gpu_percent_metrics_use_sum_aggregation_so_totals_can_exceed_100() {
+        let spec = kv_metric_spec_by_key("gpu_utilization_percent").unwrap();
+        assert_eq!(spec.aggregate, KvMetricAggregate::Sum);
+        let member_promql = kv_metric_promql_for_member(spec, "owner_a");
+        let aggregate_promql =
+            kv_metric_aggregate_promql(spec, &[String::from("owner_a"), String::from("owner_b")])
+                .unwrap();
+        assert_eq!(
+            member_promql,
+            "sum(gpu_utilization_percent{node=\"owner_a\"})"
+        );
+        assert_eq!(
+            aggregate_promql,
+            "sum(gpu_utilization_percent{node=~\"^(?:owner_a|owner_b)$\"})"
+        );
+    }
+
+    #[test]
+    fn owner_grouping_keeps_single_owner_node_members_together() {
+        let spec = kv_metric_spec_by_key("get_cache_hit_rate_percent").unwrap();
+        let snapshot = test_snapshot(vec![
+            NodeSnapshot {
+                node_key: "node_a".to_string(),
+                hostname: None,
+                accessible_ip: None,
+                shared_mem_dir: None,
+                is_p2p_relay: false,
+                node_cpu_usage_percent: None,
+                node_cpu_logical_cores: None,
+                node_memory_usage_bytes: None,
+                node_memory_total_bytes: None,
+                container_memory_usage_bytes: None,
+                container_memory_limit_bytes: None,
+                members: vec![
+                    test_member("owner_a", MemberRole::OwnerClient, 1),
+                    test_member("master_a", MemberRole::Master, 1),
+                ],
+                segment_devices: Vec::new(),
+            },
+            NodeSnapshot {
+                node_key: "node_b".to_string(),
+                hostname: None,
+                accessible_ip: None,
+                shared_mem_dir: None,
+                is_p2p_relay: false,
+                node_cpu_usage_percent: None,
+                node_cpu_logical_cores: None,
+                node_memory_usage_bytes: None,
+                node_memory_total_bytes: None,
+                container_memory_usage_bytes: None,
+                container_memory_limit_bytes: None,
+                members: vec![test_member("owner_b", MemberRole::OwnerClient, 1)],
+                segment_devices: Vec::new(),
+            },
+        ]);
+        let (groups, warnings) = select_kv_metric_owner_groups(&snapshot, spec, None);
+        assert!(warnings.is_empty());
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].owner_id, "owner_a");
+        assert_eq!(groups[0].members.len(), 1);
+        assert_eq!(groups[0].members[0].member_id, "owner_a");
+        assert_eq!(groups[1].owner_id, "owner_b");
+    }
+
+    #[test]
+    fn aggregate_mean_series_is_computed_per_timestamp() {
+        let members = vec![
+            KvMemberSeriesWire {
+                member_id: "a".to_string(),
+                role: "owner_client".to_string(),
+                node_key: "node_a".to_string(),
+                latest: Some(30.0),
+                series: vec![(1.0, 10.0), (2.0, 30.0)],
+                comparison_latest: None,
+                comparison_series: Vec::new(),
+                additional_series: Vec::new(),
+            },
+            KvMemberSeriesWire {
+                member_id: "b".to_string(),
+                role: "owner_client".to_string(),
+                node_key: "node_b".to_string(),
+                latest: Some(50.0),
+                series: vec![(1.0, 20.0), (2.0, 50.0)],
+                comparison_latest: None,
+                comparison_series: Vec::new(),
+                additional_series: Vec::new(),
+            },
+        ];
+        let out = aggregate_kv_member_series(KvMetricAggregate::Mean, &members);
+        assert_eq!(out, vec![(1.0, 15.0), (2.0, 40.0)]);
+    }
+
+    #[test]
+    fn cpu_metric_uses_sum_aggregation_so_totals_can_exceed_100() {
+        let spec = kv_metric_spec_by_key("process_cpu_usage_percent").unwrap();
+        assert_eq!(spec.aggregate, KvMetricAggregate::Sum);
+        assert!(spec.roles.contains(&MemberRole::OwnerClient));
+        assert!(spec.roles.contains(&MemberRole::ExternalClient));
+        assert!(spec.roles.contains(&MemberRole::SideTransferWorker));
+        let member_promql = kv_metric_promql_for_member(spec, "owner_a");
+        let aggregate_promql = kv_metric_aggregate_promql(
+            spec,
+            &[String::from("owner_a"), String::from("external_a")],
+        )
+        .unwrap();
+        assert_eq!(member_promql, "process_cpu_usage_percent{node=\"owner_a\"}");
+        assert_eq!(
+            aggregate_promql,
+            "sum(process_cpu_usage_percent{node=~\"^(?:owner_a|external_a)$\"})"
+        );
+
+        let process_network_spec = kv_metric_spec_by_key("process_network_tx_mbps").unwrap();
+        let process_network_rx = process_network_spec
+            .comparison
+            .expect("process network rx comparison");
+        assert!(
+            process_network_spec
+                .roles
+                .contains(&MemberRole::OwnerClient)
+        );
+        assert!(
+            process_network_spec
+                .roles
+                .contains(&MemberRole::ExternalClient)
+        );
+        assert!(
+            process_network_spec
+                .roles
+                .contains(&MemberRole::SideTransferWorker)
+        );
+        assert_eq!(
+            kv_metric_promql_for_member(process_network_spec, "external_a"),
+            "client_network_mbps{node=\"external_a\",direction=\"tx\"}"
+        );
+        assert_eq!(
+            kv_metric_aggregate_promql_for_field(
+                process_network_rx.field,
+                process_network_rx.aggregate,
+                &[String::from("owner_a"), String::from("external_a")],
+            )
+            .unwrap(),
+            "sum(client_network_mbps{node=~\"^(?:owner_a|external_a)$\",direction=\"rx\"})"
+        );
+    }
+
+    #[test]
+    fn memory_segment_and_gpu_memory_cards_keep_capacity_and_process_memory_series() {
+        let memory_spec = kv_metric_spec_by_key("node_memory_usage_bytes").unwrap();
+        let memory_comparison = memory_spec.comparison.expect("memory total comparison");
+        assert_eq!(memory_spec.additional.len(), 1);
+        let memory_process_rss = memory_spec.additional[0];
+        assert_eq!(memory_process_rss.key, "process_rss");
+        assert!(
+            memory_process_rss
+                .roles
+                .unwrap()
+                .contains(&MemberRole::ExternalClient)
+        );
+        assert!(
+            memory_process_rss
+                .roles
+                .unwrap()
+                .contains(&MemberRole::SideTransferWorker)
+        );
+        assert_eq!(
+            kv_metric_promql_for_member(memory_spec, "owner_a"),
+            "node_memory_usage_bytes{node=\"owner_a\"}"
+        );
+        assert_eq!(
+            kv_metric_promql_for_field(memory_comparison.field, "owner_a"),
+            "node_memory_total_bytes{node=\"owner_a\"}"
+        );
+        assert_eq!(
+            kv_metric_aggregate_promql_for_field(
+                memory_comparison.field,
+                memory_comparison.aggregate,
+                &[String::from("owner_a"), String::from("owner_b")],
+            )
+            .unwrap(),
+            "sum(node_memory_total_bytes{node=~\"^(?:owner_a|owner_b)$\"})"
+        );
+        assert_eq!(
+            kv_metric_promql_for_field(memory_process_rss.field, "owner_a"),
+            "process_resident_memory_bytes{node=\"owner_a\"}"
+        );
+        assert_eq!(
+            kv_metric_aggregate_promql_for_field(
+                memory_process_rss.field,
+                memory_process_rss.aggregate,
+                &[String::from("owner_a"), String::from("ops_a")],
+            )
+            .unwrap(),
+            "sum(process_resident_memory_bytes{node=~\"^(?:owner_a|ops_a)$\"})"
+        );
+
+        let network_spec = kv_metric_spec_by_key("node_network_tx_mbps").unwrap();
+        let network_rx = network_spec.comparison.expect("network rx comparison");
+        assert_eq!(network_spec.label, "Node Network");
+        assert_eq!(network_spec.series_label, "TX");
+        assert_eq!(
+            kv_metric_promql_for_member(network_spec, "owner_a"),
+            "sum(rate(node_network_transmit_bytes_total{node=\"owner_a\"}[2m])) * 8 / 1000000"
+        );
+        assert_eq!(
+            kv_metric_promql_for_field(network_rx.field, "owner_a"),
+            "sum(rate(node_network_receive_bytes_total{node=\"owner_a\"}[2m])) * 8 / 1000000"
+        );
+        assert_eq!(
+            kv_metric_aggregate_promql_for_field(
+                network_rx.field,
+                network_rx.aggregate,
+                &[String::from("owner_a"), String::from("owner_b")],
+            )
+            .unwrap(),
+            "sum(rate(node_network_receive_bytes_total{node=~\"^(?:owner_a|owner_b)$\"}[2m])) * 8 / 1000000"
+        );
+
+        let segment_spec = kv_metric_spec_by_key("seg_used_bytes").unwrap();
+        let segment_comparison = segment_spec
+            .comparison
+            .expect("segment capacity comparison");
+        assert_eq!(
+            kv_metric_promql_for_member(segment_spec, "owner_a"),
+            "sum(kvcache_segment_used_bytes{node=\"owner_a\"})"
+        );
+        assert_eq!(
+            kv_metric_promql_for_field(segment_comparison.field, "owner_a"),
+            "sum(kvcache_segment_capacity_bytes{node=\"owner_a\"})"
+        );
+
+        let gpu_memory_spec = kv_metric_spec_by_key("gpu_memory_used").unwrap();
+        let gpu_memory_comparison = gpu_memory_spec
+            .comparison
+            .expect("gpu memory total comparison");
+        assert_eq!(
+            kv_metric_promql_for_member(gpu_memory_spec, "owner_a"),
+            "sum(gpu_memory_used_bytes{node=\"owner_a\"})"
+        );
+        assert_eq!(
+            kv_metric_promql_for_field(gpu_memory_comparison.field, "owner_a"),
+            "sum(gpu_memory_total_bytes{node=\"owner_a\"})"
+        );
+    }
 }
