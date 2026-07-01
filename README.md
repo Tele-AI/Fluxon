@@ -34,10 +34,6 @@ Fluxon is designed around these problems. It separates data-plane resources, obj
 
 ![](./pics/fluxon_architecture.png)
 
-## Acknowledgements
-
-Fluxon learns from and builds on ideas and components from projects including `pplx-gardon`, `iceoryx`, `Alluxio`, `Mooncake`, and `Moka`: local IPC and shared-memory paths, large-object data-plane design, cache governance, and AI-oriented data movement.
-
 <a id="contents"></a>
 
 ## 🧭 Contents
@@ -50,6 +46,7 @@ Fluxon learns from and builds on ideas and components from projects including `p
 - [Repository Structure](#repository-structure)
 - [Contributing](#contributing)
 - [Contributors](#contributors)
+- [Acknowledgements](#acknowledgements)
 - [License](#license)
 - [Stargazers over time](#stargazers-over-time)
 
@@ -318,6 +315,16 @@ Some earlier contribution records are no longer fully reflected in the current c
 - `maplestarplayl`: IPC integration, SPDK integration
 - `RuileLu`: `KV Lease` support
 - `Summage`: Initial KV architecture optimization
+
+## Acknowledgements
+
+- [Eclipse iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2): used by the same-node IPC path for local transport between Fluxon processes.
+- [Moka](https://github.com/moka-rs/moka): forked for the cache controller, with additional dynamic-capacity support for global memory governance.
+- [Mooncake](https://github.com/kvcache-ai/Mooncake): kept as a `KV Cache` backend wrapper and used as a reference point for large-object KV design and benchmarks.
+- [Alluxio](https://github.com/Alluxio/alluxio): referenced in FS design and evaluation for file/object caching and data locality.
+- [pplx-garden](https://github.com/perplexityai/pplx-garden): referenced for broader AI data-plane design and high-performance AI infrastructure ideas.
+
+We thank these projects and their communities for making this work available as open source.
 
 <a id="license"></a>
 
