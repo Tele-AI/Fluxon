@@ -116,6 +116,35 @@ def _atomic_stdout_write_line(line: str) -> None:
     os.write(sys.stdout.fileno(), payload)
 
 
+def _read_log_tail(path: str, *, max_lines: int = 120) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError:
+        return f"<log file not found: {path}>"
+    except Exception as exc:  # noqa: BLE001
+        return f"<failed to read log file {path}: {exc}>"
+    return "".join(lines[-max_lines:]).rstrip()
+
+
+def _format_subprocess_failure(
+    process_type: str,
+    identifier: str,
+    rc: int,
+    log_file: str,
+    *,
+    early: bool,
+) -> str:
+    phase = "exited early" if early else "failed"
+    return (
+        f"{process_type} {identifier} {phase} with return code {rc}. "
+        f"Log file: {log_file}\n"
+        "--- child log tail ---\n"
+        f"{_read_log_tail(log_file)}\n"
+        "--- end child log tail ---"
+    )
+
+
 INITIAL_PRODUCERS_COUNT = 3
 INITIAL_CONSUMERS_COUNT = 2
 NEW_PRODUCERS_MIN_COUNT = 1
@@ -289,11 +318,22 @@ def run_producer(env: "ChannelState", args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"[Producer-{args.producer_id}] Error: {exc}")
             _atomic_stdout_write_line(f"{PRODUCER_CRASH_MARKER} {args.producer_id}")
+            try:
+                producer.close().unwrap()
+            except Exception as close_exc:  # noqa: BLE001
+                print(
+                    f"[Producer-{args.producer_id}] close after error failed: "
+                    f"{close_exc}"
+                )
             raise
-        finally:
-            print(f"[Producer-{args.producer_id}] Finished")
-            _atomic_stdout_write_line(f"{PRODUCER_NORMAL_EXIT_MARKER} {args.producer_id}")
+        try:
             producer.close().unwrap()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Producer-{args.producer_id}] close failed: {exc}")
+            _atomic_stdout_write_line(f"{PRODUCER_CRASH_MARKER} {args.producer_id}")
+            raise
+        print(f"[Producer-{args.producer_id}] Finished")
+        _atomic_stdout_write_line(f"{PRODUCER_NORMAL_EXIT_MARKER} {args.producer_id}")
     finally:
         configure_backend(env, backend_type=prev_type, backend_ip=prev_ip)
     release(env, store_key)
@@ -423,19 +463,30 @@ def run_consumer(env: "ChannelState", args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"[Consumer-{args.consumer_id}] Error: {exc}")
             _atomic_stdout_write_line(f"{CONSUMER_CRASH_MARKER} {args.consumer_id}")
+            try:
+                consumer.close().unwrap()
+            except Exception as close_exc:  # noqa: BLE001
+                print(
+                    f"[Consumer-{args.consumer_id}] close after error failed: "
+                    f"{close_exc}"
+                )
             raise
-        finally:
-            print(
-                f"[Consumer-{args.consumer_id}] Finished, consumed"
-                f" {consumed_count} messages"
-            )
-            _atomic_stdout_write_line(f"{CONSUMER_NORMAL_EXIT_MARKER} {args.consumer_id}")
+        try:
             _etcd_call_with_retry(
                 f"delete consumer presence for consumer_id={args.consumer_id}",
                 lambda client: client.delete(f"/test_mpmc_consumer/{args.consumer_id}"),
                 max_attempts=3,
             )
             consumer.close().unwrap()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Consumer-{args.consumer_id}] cleanup failed: {exc}")
+            _atomic_stdout_write_line(f"{CONSUMER_CRASH_MARKER} {args.consumer_id}")
+            raise
+        print(
+            f"[Consumer-{args.consumer_id}] Finished, consumed"
+            f" {consumed_count} messages"
+        )
+        _atomic_stdout_write_line(f"{CONSUMER_NORMAL_EXIT_MARKER} {args.consumer_id}")
     finally:
         configure_backend(env, backend_type=prev_type, backend_ip=prev_ip)
     release(env, store_key)
@@ -680,8 +731,13 @@ def scenario_dynamic_producer_consumer(
                 continue
             if rc != 0:
                 raise RuntimeError(
-                    f"{process_type} {identifier} exited early with return code {rc}. "
-                    f"Check log file for details: {log_file}"
+                    _format_subprocess_failure(
+                        process_type,
+                        identifier,
+                        rc,
+                        log_file,
+                        early=True,
+                    )
                 )
 
     def wait_all_of_type(process_type: str, *, timeout_s: int) -> None:
@@ -703,8 +759,13 @@ def scenario_dynamic_producer_consumer(
                     print(f"Log file: {log_file}")
                     continue
                 raise RuntimeError(
-                    f"{ptype} {identifier} failed with return code {proc.returncode}."
-                    f" Check log file for details: {log_file}"
+                    _format_subprocess_failure(
+                        ptype,
+                        identifier,
+                        proc.returncode,
+                        log_file,
+                        early=False,
+                    )
                 )
 
             if not running:
@@ -1114,6 +1175,7 @@ def scenario_dynamic_producer_consumer(
 
             start_processes()
             time.sleep(5)
+            fail_fast_on_subprocess_error(process_type_filter="producer")
             _assert_test_mpmc_id_stable()
 
         for phase in range(CONSUMER_CRASH_RECOVER_PHASES):
@@ -1305,6 +1367,7 @@ def scenario_dynamic_producer_consumer(
                 recovered_consumers.append(consumer_id)
             start_processes()
             time.sleep(5)
+            fail_fast_on_subprocess_error(process_type_filter="producer")
             _assert_test_mpmc_id_stable()
 
         join_timeout_s = int(TEST_TIMEOUT_SECONDS)
