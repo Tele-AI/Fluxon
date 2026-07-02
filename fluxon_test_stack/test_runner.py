@@ -201,6 +201,7 @@ CI_RUNTIME_LAYER_INSTANCE_IDS: Dict[str, Tuple[str, ...]] = {
 }
 CI_RUNTIME_INSTANCE_IDS = CI_CASE_RUNTIME_INSTANCE_IDS
 CONTROLLER_STATUS_TRANSIENT_HTTP_CODES = (502, 503, 504)
+CONTROLLER_REQUEST_MODE_DIRECT = "direct"
 CONTROLLER_REQUEST_MODE_SSH_EXEC_PER_REQUEST = "ssh_exec_per_request"
 # Controller requests during TEST_STACK teardown can fan out to many remote nodes and are prone to
 # short SSH/control-plane stalls. Keep each attempt bounded, but allow a wider retry window so
@@ -260,7 +261,6 @@ TEST_STACK_KV_OWNER_INSTANCE_ID_PREFIX = "kv_owner_"
 TEST_STACK_REDIS_INSTANCE_ID_PREFIX = "redis_node_"
 TEST_STACK_ALLUXIO_INSTANCE_ID_PREFIX = "alluxio_node_"
 TEST_STACK_MOONCAKE_MASTER_INSTANCE_ID = "mooncake_master"
-TEST_STACK_BENCHMARK_FIXED_THREADS_PER_PROCESS = 4
 # Owner-mode Fluxon KV configs in CI / TEST_STACK share the same canonical label.
 FLUXON_KV_OWNER_SUB_CLUSTER = "owner"
 
@@ -1648,6 +1648,11 @@ def _test_bed_manifest_transport_ctx_opt() -> Optional[Dict[str, Any]]:
     if manifest_info is None:
         return None
     manifest_path, manifest = manifest_info
+    mode_raw = manifest.get("controller_request_mode")
+    if mode_raw is not None:
+        mode = _require_str(mode_raw, f"test bed manifest {manifest_path}.controller_request_mode")
+        if mode == CONTROLLER_REQUEST_MODE_DIRECT:
+            return None
     bastion = _require_dict(manifest.get("bastion"), f"test bed manifest {manifest_path}.bastion")
     bastion_user_raw = manifest.get("bastion_user")
     bastion_private_key_raw = manifest.get("bastion_private_key")
@@ -2187,6 +2192,7 @@ def _build_runtime_token_mapping(
     stack_identity: Dict[str, Any],
     extra_tokens: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
+    test_bed_bundle_root = _test_bed_bundle_root_opt()
     mapping = {
         "__WORKDIR_ROOT__": workdir_root,
         "__RUN_DIR__": run_dir,
@@ -2207,6 +2213,8 @@ def _build_runtime_token_mapping(
             "stack_identity.share_mem_path",
         ),
     }
+    if test_bed_bundle_root is not None:
+        mapping["__TEST_BED_BUNDLE_ROOT__"] = str(test_bed_bundle_root)
     if extra_tokens is not None:
         for token_name, token_value in extra_tokens.items():
             mapping[f"__{token_name}__"] = token_value
@@ -3869,12 +3877,40 @@ def _acquire_ui_service_lock(*, workdir_root: Path) -> Any:
     )
 
 
-def _acquire_ci_lock() -> Any:
+def _ci_lock_name_for_ops_cluster_name(ops_cluster_name: str) -> str:
+    return "bench_ci__" + hashlib.sha256(ops_cluster_name.encode("utf-8")).hexdigest()[:16] + ".lock"
+
+
+def _acquire_ci_lock(*, resolved_case: Optional[Dict[str, Any]] = None) -> Any:
+    owner_lines = [f"pid={os.getpid()}", f"repo_root={_runner_repo_root()}"]
+    busy_message = "another CI run is active (lock busy)"
     lock_path = _bench_lock_dir() / "bench_ci.lock"
+    if resolved_case is not None:
+        runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
+        stack_identity = _require_dict(
+            runtime.get("stack_identity"),
+            "resolved_case.runtime.stack_identity",
+        )
+        ops_cluster_name = _require_str(
+            stack_identity.get("ops_cluster_name"),
+            "resolved_case.runtime.stack_identity.ops_cluster_name",
+        )
+        controller_url = _require_str(
+            stack_identity.get("controller_url"),
+            "resolved_case.runtime.stack_identity.controller_url",
+        )
+        lock_path = _bench_lock_dir() / _ci_lock_name_for_ops_cluster_name(ops_cluster_name)
+        owner_lines.extend(
+            [
+                f"ops_cluster_name={ops_cluster_name}",
+                f"controller_url={controller_url}",
+            ]
+        )
+        busy_message = f"another CI run is active for ops_cluster_name={ops_cluster_name} (lock busy)"
     return _acquire_named_lock(
         lock_path=lock_path,
-        owner_lines=[f"pid={os.getpid()}", f"repo_root={_runner_repo_root()}"],
-        busy_message="another CI run is active (lock busy)",
+        owner_lines=owner_lines,
+        busy_message=busy_message,
     )
 
 
@@ -5718,11 +5754,6 @@ def _parse_scale(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
             f"{ctx}.benchmark.threads_per_process",
             min_v=1,
         )
-        if int(threads_per_process) != TEST_STACK_BENCHMARK_FIXED_THREADS_PER_PROCESS:
-            raise ValueError(
-                f"{ctx}.benchmark.threads_per_process must be fixed to "
-                f"{TEST_STACK_BENCHMARK_FIXED_THREADS_PER_PROCESS}"
-            )
         owner_group_processes = bench.get("owner_group_processes")
         if owner_group_processes is not None:
             _ = _require_int(owner_group_processes, f"{ctx}.benchmark.owner_group_processes", min_v=1)
@@ -7899,6 +7930,7 @@ def _test_stack_runtime_role_for_scene_role(*, scene_mode: str, role: str) -> st
 
 def _test_stack_scene_uses_per_target_process_fanout(*, scene_mode: str) -> bool:
     return scene_mode in (
+        TEST_STACK_MODE_MPMC,
         TEST_STACK_MODE_KVSTORE,
         TEST_STACK_MODE_KVSTORE_WITH_LOCAL_CACHE,
         TEST_STACK_MODE_RPC,
@@ -8886,11 +8918,6 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         "scale.benchmark.threads_per_process",
         min_v=1,
     )
-    if int(threads_per_process) != TEST_STACK_BENCHMARK_FIXED_THREADS_PER_PROCESS:
-        raise ValueError(
-            "scale.benchmark.threads_per_process must be fixed to "
-            f"{TEST_STACK_BENCHMARK_FIXED_THREADS_PER_PROCESS}"
-        )
     value_size = _require_int(bench.get("value_size"), "scale.benchmark.value_size", min_v=0)
     warmup = bench.get("metric_warmup_seconds")
     if not isinstance(warmup, (int, float)):
@@ -10242,11 +10269,11 @@ def _load_test_stack_cluster_nodes_and_dispatch(resolved_case: Dict[str, Any]) -
         target_ip_map = deploy.get("target_ip_map")
         if target_ip_map is not None:
             target_ip_map_d = _require_dict(target_ip_map, "resolved_case.deploy.target_ip_map")
-            cluster_nodes_by_ip: Dict[str, List[Dict[str, Any]]] = {}
+            cluster_nodes_by_ip: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
             for hostname, raw_node_cfg in cluster_nodes.items():
                 node_cfg = _require_dict(raw_node_cfg, f"cluster_nodes[{hostname}]")
                 node_ip = _require_str(node_cfg.get("ip"), f"cluster_nodes[{hostname}].ip")
-                cluster_nodes_by_ip.setdefault(node_ip, []).append(node_cfg)
+                cluster_nodes_by_ip.setdefault(node_ip, []).append((hostname, node_cfg))
             cluster_nodes = dict(cluster_nodes)
             for raw_target, raw_ip in target_ip_map_d.items():
                 target = _require_str(raw_target, "resolved_case.deploy.target_ip_map key")
@@ -10256,12 +10283,36 @@ def _load_test_stack_cluster_nodes_and_dispatch(resolved_case: Dict[str, Any]) -
                 matches = cluster_nodes_by_ip.get(node_ip, [])
                 if not matches:
                     continue
-                if len(matches) > 1:
-                    raise ValueError(
-                        "resolved_case.deploy.target_ip_map alias expansion is ambiguous: "
-                        f"target={target!r} ip={node_ip!r} matches={len(matches)}"
+                same_ip_targets = [
+                    _require_str(candidate, "resolved_case.deploy.target_ip_map key")
+                    for candidate, candidate_ip in target_ip_map_d.items()
+                    if _require_str(
+                        candidate_ip,
+                        f"resolved_case.deploy.target_ip_map[{candidate!r}]",
                     )
-                cluster_nodes[target] = copy.deepcopy(matches[0])
+                    == node_ip
+                ]
+                preferred = _controller_target_for_target(
+                    target,
+                    target_ip_map={
+                        candidate: node_ip
+                        for candidate in same_ip_targets
+                    },
+                )
+                selected: Optional[Dict[str, Any]] = None
+                for hostname, node_cfg in matches:
+                    if hostname == preferred:
+                        selected = node_cfg
+                        break
+                if selected is None and len(matches) == 1:
+                    selected = matches[0][1]
+                if selected is None:
+                    available = sorted(hostname for hostname, _node_cfg in matches)
+                    raise ValueError(
+                        "resolved_case.deploy.target_ip_map alias expansion has no canonical active node: "
+                        f"target={target!r} ip={node_ip!r} preferred={preferred!r} active_matches={available}"
+                    )
+                cluster_nodes[target] = copy.deepcopy(selected)
     return cluster_nodes, start_test_bed_mod.manual_dispatch_release
 
 
@@ -10972,6 +11023,14 @@ def _cluster_node_ssh_host(node_cfg: Dict[str, Any], *, target_name: str) -> str
     if ssh_host is None:
         return _require_str(node_cfg.get("ip"), f"cluster_nodes[{target_name}].ip")
     return _require_str(ssh_host, f"cluster_nodes[{target_name}].ssh_host")
+
+
+def _cluster_node_execution_mode(node_cfg: Dict[str, Any], *, target_name: str) -> str:
+    raw = node_cfg.get("execution_mode", "ssh")
+    if raw is None:
+        return "ssh"
+    mode = _require_str(raw, f"cluster_nodes[{target_name}].execution_mode").strip()
+    return mode or "ssh"
 
 
 def _sync_run_dir_archive_to_remote_target(
@@ -13916,10 +13975,17 @@ def _write_ci_prepare_env_script(*, run_dir: Path, exports: Dict[str, str]) -> P
 
 def _run_ci_prepare_steps(*, resolved_case: Dict[str, Any], run_dir: Path, src_root: Path) -> Dict[str, str]:
     prepare_steps = _resolved_ci_prepare_steps(resolved_case)
-    if not prepare_steps:
-        return {}
-
     exports: Dict[str, str] = {}
+    test_bed_start_cfg = _load_test_bed_bootstrap_config_path()
+    if _load_test_bed_manifest_opt() is not None:
+        exports[TEST_STACK_START_TEST_BED_CONFIG_ENV] = str(test_bed_start_cfg)
+    local_release_root = _local_release_root_override_opt()
+    if local_release_root is not None:
+        exports[_LOCAL_RELEASE_CACHE_ROOT_OVERRIDE_ENV] = str(local_release_root)
+
+    if not prepare_steps:
+        return exports
+
     for index, step in enumerate(prepare_steps):
         kind = _require_str(step.get("kind"), f"resolved_case.scene.ci.prepare[{index}].kind")
         if kind == CI_PREPARE_KIND_SETUP_DEV_ENV:
@@ -14305,6 +14371,20 @@ def _instance_remote_target_access_opt(
 def _run_remote_bash_capture(
     *, target_name: str, node_cfg: Dict[str, Any], remote_cmd: str
 ) -> str:
+    if _cluster_node_execution_mode(node_cfg, target_name=target_name) == "local":
+        completed = subprocess.run(
+            remote_cmd,
+            shell=True,
+            executable="/bin/bash",
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"local bash capture {target_name} failed rc={completed.returncode}\n"
+                f"cmd={remote_cmd}\nstdout={completed.stdout}\nstderr={completed.stderr}"
+            )
+        return completed.stdout
     transport_ctx = _test_bed_manifest_transport_ctx_opt()
     if transport_ctx is not None and target_name == str(transport_ctx["bastion_name"]):
         completed = _run_remote_bash_via_bastion_transport(
@@ -14366,6 +14446,27 @@ def _run_remote_bash_capture(
 def _run_remote_bash(
     *, target_name: str, node_cfg: Dict[str, Any], remote_cmd: str
 ) -> None:
+    if _cluster_node_execution_mode(node_cfg, target_name=target_name) == "local":
+        print("RUN:", remote_cmd, flush=True)
+        completed = subprocess.run(
+            remote_cmd,
+            shell=True,
+            executable="/bin/bash",
+            capture_output=True,
+            text=True,
+        )
+        if completed.stdout:
+            sys.stdout.write(completed.stdout)
+            sys.stdout.flush()
+        if completed.stderr:
+            sys.stderr.write(_clean_ssh_stderr_text(completed.stderr))
+            sys.stderr.flush()
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"local bash {target_name} failed rc={completed.returncode}\n"
+                f"cmd={remote_cmd}"
+            )
+        return
     transport_ctx = _test_bed_manifest_transport_ctx_opt()
     if transport_ctx is not None and target_name == str(transport_ctx["bastion_name"]):
         _run_remote_bash_via_bastion_transport(

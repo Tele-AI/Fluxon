@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -18,15 +21,21 @@ TEST_REQUIREMENTS = ["fluxon-release", "ops", "submodules", "test-stack-targets"
 
 
 SCENE_ID = "bench_mq"
-DEFAULT_PROFILE_ID = "fluxon_tcp"
+BASE_FLUXON_PROFILE_ID = "fluxon_tcp"
+CI_PUBLIC_PROFILE_ID = "fluxon_tcp_thread"
+DEFAULT_PROFILE_ID = CI_PUBLIC_PROFILE_ID
+LOCAL_RELEASE_ROOT_ENV = "FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT"
+RELEASE_MANIFEST_FILENAME = "fluxon_release.sha256"
 DEFAULT_CONFIG = REPO_ROOT / "fluxon_test_stack" / "benchmark_full_matrix.yaml"
-DEFAULT_WORKDIR = REPO_ROOT / ".tmp" / "test_largescale_mq_p300_c8"
+DEFAULT_WORKDIR = REPO_ROOT / ".tmp" / "test_largescale_mq_p160_c8"
 RUNNER = REPO_ROOT / "fluxon_test_stack" / "test_runner.py"
+LOCAL_TEST_STACK_COORDINATOR_PORT_OFFSET = 1000
+LOCAL_TEST_STACK_TOPOLOGY_PORT_SPAN = 100
 
 DEFAULT_BENCHMARK = {
     "processes_per_target": 1,
     "threads_per_process": 4,
-    "value_size": 16384,
+    "value_size": 256,
     "metric_warmup_seconds": 0,
     "op_timeout_seconds": 30,
     "cluster_ready_timeout_seconds": 1800,
@@ -44,10 +53,240 @@ def _repo_path(raw: str) -> Path:
     return (REPO_ROOT / path).resolve()
 
 
+def _resolve_user_path(raw: str) -> Path:
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (Path.cwd() / path).resolve()
+
+
 def _require_dict(raw: Any, ctx: str) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise SystemExit(f"{ctx} must be a mapping")
     return raw
+
+
+def _is_within_root(path: Path, root: Path) -> bool:
+    resolved_path = path.resolve()
+    resolved_root = root.resolve()
+    return resolved_path == resolved_root or resolved_root in resolved_path.parents
+
+
+def _clean_bundle_relpath(raw: str, *, field_name: str) -> Path:
+    relpath = Path(raw)
+    if relpath.is_absolute() or ".." in relpath.parts:
+        raise SystemExit(f"{field_name} must be a clean relative path: {relpath}")
+    return relpath
+
+
+def _load_yaml_mapping(path: Path, *, ctx: str) -> dict[str, Any]:
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return _require_dict(payload, ctx)
+
+
+def _write_yaml_mapping(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=False), encoding="utf-8")
+
+
+def _parse_sha256_manifest_names(path: Path) -> list[str]:
+    out: list[str] = []
+    for index, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            raise SystemExit(f"invalid sha256 manifest line {index}: {path}: {raw_line!r}")
+        out.append(parts[1].strip())
+    return out
+
+
+def _find_release_wheel_name_from_manifest(root: Path) -> str | None:
+    manifest_path = (root / RELEASE_MANIFEST_FILENAME).resolve()
+    if not manifest_path.is_file():
+        return None
+    wheel_names = [
+        Path(name).name
+        for name in _parse_sha256_manifest_names(manifest_path)
+        if Path(name).name.startswith("fluxon-") and Path(name).name.endswith(".whl")
+    ]
+    if not wheel_names:
+        return None
+    unique_names = sorted(set(wheel_names))
+    if len(unique_names) != 1:
+        raise SystemExit(f"release manifest must contain one Fluxon wheel: {manifest_path} wheels={unique_names}")
+    return unique_names[0]
+
+
+def _ci_public_release_wheel_name(fallback: str) -> str:
+    roots: list[Path] = []
+    env_root = os.environ.get(LOCAL_RELEASE_ROOT_ENV, "").strip()
+    if env_root:
+        roots.append(Path(env_root).expanduser().resolve())
+    roots.append((REPO_ROOT / "fluxon_release").resolve())
+    for root in roots:
+        wheel_name = _find_release_wheel_name_from_manifest(root)
+        if wheel_name is not None:
+            return wheel_name
+    return fallback
+
+
+def _ensure_ci_public_profile(cfg: dict[str, Any], profile_ids: list[str]) -> None:
+    if CI_PUBLIC_PROFILE_ID not in profile_ids:
+        return
+    profiles = _require_dict(cfg.get("profiles"), "config.profiles")
+    artifact_sets = _require_dict(cfg.get("artifact_sets"), "config.artifact_sets")
+    if CI_PUBLIC_PROFILE_ID in profiles and CI_PUBLIC_PROFILE_ID in artifact_sets:
+        return
+
+    base_profile = copy.deepcopy(
+        _require_dict(profiles.get(BASE_FLUXON_PROFILE_ID), f"config.profiles[{BASE_FLUXON_PROFILE_ID!r}]")
+    )
+    base_artifact_set = copy.deepcopy(
+        _require_dict(
+            artifact_sets.get(BASE_FLUXON_PROFILE_ID),
+            f"config.artifact_sets[{BASE_FLUXON_PROFILE_ID!r}]",
+        )
+    )
+
+    release_source = _require_dict(
+        base_artifact_set.get("release_source"),
+        f"config.artifact_sets[{BASE_FLUXON_PROFILE_ID!r}].release_source",
+    )
+    test_rsc_source = _require_dict(
+        base_artifact_set.get("test_rsc_source"),
+        f"config.artifact_sets[{BASE_FLUXON_PROFILE_ID!r}].test_rsc_source",
+    )
+    release_artifacts = _require_dict(
+        base_artifact_set.get("release_artifacts"),
+        f"config.artifact_sets[{BASE_FLUXON_PROFILE_ID!r}].release_artifacts",
+    )
+    release_source["key_prefix"] = f"profiles/{CI_PUBLIC_PROFILE_ID}"
+    test_rsc_source["key_prefix"] = f"test_rsc/{CI_PUBLIC_PROFILE_ID}"
+    release_artifacts["wheel"] = _ci_public_release_wheel_name(
+        str(release_artifacts.get("wheel", "")).strip() or "fluxon-0.2.1-py3-none-any.whl"
+    )
+    base_profile["artifact_set"] = CI_PUBLIC_PROFILE_ID
+    artifact_sets[CI_PUBLIC_PROFILE_ID] = base_artifact_set
+    profiles[CI_PUBLIC_PROFILE_ID] = base_profile
+
+
+def _bundle_relpath(path: Path, *, base: Path, dot_prefix: bool = False) -> str:
+    rel = os.path.relpath(str(path.resolve()), str(base.resolve())).replace(os.sep, "/")
+    if dot_prefix and rel != "." and not rel.startswith("."):
+        return f"./{rel}"
+    return rel
+
+
+def _relocated_bundle_path(
+    raw: Any,
+    *,
+    src_root: Path,
+    dst_root: Path,
+    base: Path,
+    field_name: str,
+    generated_bundle_child_name: str | None = None,
+) -> Path:
+    if not isinstance(raw, str) or not raw.strip():
+        raise SystemExit(f"{field_name} must be a non-empty path string")
+    raw_path = Path(raw).expanduser()
+    if raw_path.is_absolute():
+        resolved = raw_path.resolve()
+        if _is_within_root(resolved, dst_root):
+            return resolved
+        if _is_within_root(resolved, src_root):
+            return (dst_root / resolved.relative_to(src_root.resolve())).resolve()
+        if generated_bundle_child_name is not None and resolved.name == generated_bundle_child_name:
+            return (dst_root / generated_bundle_child_name).resolve()
+        raise SystemExit(
+            f"{field_name} must point inside the testbed bundle: path={resolved} src={src_root} dst={dst_root}"
+        )
+    return (base / raw_path).resolve()
+
+
+def _normalize_run_local_testbed_bundle(
+    *,
+    src_root: Path,
+    dst_root: Path,
+    start_config_relpath: str,
+) -> Path:
+    relpath = _clean_bundle_relpath(start_config_relpath, field_name="--start-config-relpath")
+    start_cfg = (dst_root / relpath).resolve()
+    if not _is_within_root(start_cfg, dst_root):
+        raise SystemExit(f"--start-config-relpath escapes testbed bundle: {relpath}")
+    if not start_cfg.is_file():
+        raise SystemExit(f"start config is missing inside testbed bundle: {start_cfg}")
+
+    start_payload = _load_yaml_mapping(start_cfg, ctx=f"start config {start_cfg}")
+    deployconf_path = _relocated_bundle_path(
+        start_payload.get("deployconf_path"),
+        src_root=src_root,
+        dst_root=dst_root,
+        base=start_cfg.parent,
+        field_name="start_test_bed.deployconf_path",
+    )
+    if not _is_within_root(deployconf_path, dst_root):
+        raise SystemExit(f"start_test_bed.deployconf_path escapes testbed bundle: {deployconf_path}")
+    if not deployconf_path.is_file():
+        raise SystemExit(f"start config deployconf_path is missing: {deployconf_path}")
+    start_payload["deployconf_path"] = _bundle_relpath(deployconf_path, base=start_cfg.parent, dot_prefix=True)
+    _write_yaml_mapping(start_cfg, start_payload)
+
+    deployconf_payload = _load_yaml_mapping(deployconf_path, ctx=f"deployconf {deployconf_path}")
+    mirror_outdir = _relocated_bundle_path(
+        deployconf_payload.get("gen_k8s_daemonset_mirror_outdir"),
+        src_root=src_root,
+        dst_root=dst_root,
+        base=deployconf_path.parent,
+        field_name="deployconf.gen_k8s_daemonset_mirror_outdir",
+        generated_bundle_child_name="gen_k8s_daemonset",
+    )
+    if not _is_within_root(mirror_outdir, dst_root):
+        raise SystemExit(f"deployconf.gen_k8s_daemonset_mirror_outdir escapes testbed bundle: {mirror_outdir}")
+    mirror_outdir.mkdir(parents=True, exist_ok=True)
+    deployconf_payload["gen_k8s_daemonset_mirror_outdir"] = str(mirror_outdir.resolve())
+    _write_yaml_mapping(deployconf_path, deployconf_payload)
+
+    manifest_path = start_cfg.with_name("manifest.json")
+    if manifest_path.exists():
+        try:
+            manifest = _require_dict(
+                json.loads(manifest_path.read_text(encoding="utf-8")),
+                f"testbed bundle manifest {manifest_path}",
+            )
+        except Exception as exc:
+            raise SystemExit(f"failed to load testbed bundle manifest {manifest_path}: {exc}") from exc
+
+        manifest_targets = {
+            "deployconf_path": deployconf_path,
+            "start_config_path": start_cfg,
+        }
+        for field_name in ("ssh_config_path", "workdir"):
+            if field_name not in manifest:
+                continue
+            target_path = _relocated_bundle_path(
+                manifest.get(field_name),
+                src_root=src_root,
+                dst_root=dst_root,
+                base=manifest_path.parent,
+                field_name=f"manifest.{field_name}",
+            )
+            if not _is_within_root(target_path, dst_root):
+                raise SystemExit(f"manifest.{field_name} escapes testbed bundle: {target_path}")
+            if field_name == "workdir":
+                target_path.mkdir(parents=True, exist_ok=True)
+            elif not target_path.exists():
+                raise SystemExit(f"manifest.{field_name} is missing inside testbed bundle: {target_path}")
+            manifest_targets[field_name] = target_path
+
+        for field_name, target_path in manifest_targets.items():
+            manifest[field_name] = _bundle_relpath(target_path, base=manifest_path.parent)
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    return start_cfg
 
 
 def _split_ids(raw_values: list[str] | None, *, default: str) -> list[str]:
@@ -95,6 +334,54 @@ def _profile_target_map(cfg: dict[str, Any], profile_id: str) -> dict[str, Any]:
     )
 
 
+def _local_test_stack_coordinator_port_base(*, controller_port: int, topology_key: Any) -> int:
+    topology_offset = 0
+    if isinstance(topology_key, int):
+        topology_offset = int(topology_key) * LOCAL_TEST_STACK_TOPOLOGY_PORT_SPAN
+    elif isinstance(topology_key, str) and topology_key.isdigit():
+        topology_offset = int(topology_key) * LOCAL_TEST_STACK_TOPOLOGY_PORT_SPAN
+    elif topology_key != "DEFAULT":
+        raise SystemExit(f"unsupported test_stack port_alloc topology key: {topology_key!r}")
+
+    port = int(controller_port) + LOCAL_TEST_STACK_COORDINATOR_PORT_OFFSET + topology_offset
+    if port <= 0 or port > 65535:
+        raise SystemExit(f"computed local TEST_STACK coordinator_port_base out of range: {port}")
+    return port
+
+
+def _rewrite_test_stack_coordinator_ports_for_local_controller(
+    suite: dict[str, Any],
+    *,
+    controller_port: int,
+) -> None:
+    profiles = _require_dict(suite.get("profiles"), "suite.profiles")
+    for profile_id, profile in profiles.items():
+        if not isinstance(profile, dict):
+            continue
+        runtime = _require_dict(profile.get("runtime"), f"suite.profiles[{profile_id!r}].runtime")
+        test_stack = _require_dict(
+            runtime.get("test_stack"),
+            f"suite.profiles[{profile_id!r}].runtime.test_stack",
+        )
+        port_alloc = _require_dict(
+            test_stack.get("port_alloc"),
+            f"suite.profiles[{profile_id!r}].runtime.test_stack.port_alloc",
+        )
+        by_topology = _require_dict(
+            port_alloc.get("by_topology"),
+            f"suite.profiles[{profile_id!r}].runtime.test_stack.port_alloc.by_topology",
+        )
+        for topology_key, entry in by_topology.items():
+            if not isinstance(entry, dict):
+                continue
+            if "coordinator_port_base" not in entry:
+                continue
+            entry["coordinator_port_base"] = _local_test_stack_coordinator_port_base(
+                controller_port=int(controller_port),
+                topology_key=topology_key,
+            )
+
+
 def _ordered_usable_targets(target_ip_map: dict[str, Any], *, ctx: str) -> list[str]:
     out: list[str] = []
     for raw_target in target_ip_map:
@@ -131,6 +418,41 @@ def _common_targets(cfg: dict[str, Any], profile_ids: list[str], required_count:
             "Pass --config pointing at a TEST_STACK suite with the large target_ip_map."
         )
     return ordered_common[:required_count]
+
+
+def _apply_single_host_logical_targets(
+    cfg: dict[str, Any],
+    *,
+    profile_ids: list[str],
+    required_count: int,
+    anchor_ip_override: str | None,
+) -> None:
+    if required_count <= 0:
+        raise SystemExit("--single-host-logical-targets requires a positive target count")
+    override_ip = None
+    if anchor_ip_override is not None:
+        override_ip = str(anchor_ip_override).strip()
+        if not override_ip:
+            raise SystemExit("single-host anchor IP override must be non-empty")
+    for profile_id in profile_ids:
+        target_map = _profile_target_map(cfg, profile_id)
+        ordered = _ordered_usable_targets(
+            target_map,
+            ctx=f"config.profiles[{profile_id!r}].runtime.test_stack.deploy.target_ip_map",
+        )
+        if not ordered:
+            raise SystemExit(
+                f"profile {profile_id!r} has no non-bastion target to use as the single-host anchor"
+            )
+        anchor_target = ordered[0]
+        anchor_ip = target_map.get(anchor_target)
+        if not isinstance(anchor_ip, str) or not anchor_ip.strip():
+            raise SystemExit(
+                f"profile {profile_id!r} anchor target {anchor_target!r} has no usable IP"
+            )
+        resolved_anchor_ip = override_ip or anchor_ip.strip()
+        for idx in range(1, int(required_count) + 1):
+            target_map[f"node-{idx}"] = resolved_anchor_ip
 
 
 def _base_benchmark(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -225,7 +547,13 @@ def _pruned_artifact_sets(cfg: dict[str, Any], profile_ids: list[str]) -> dict[s
     return out
 
 
-def _build_suite(cfg: dict[str, Any], args: argparse.Namespace, profile_ids: list[str]) -> dict[str, Any]:
+def _build_suite(
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+    profile_ids: list[str],
+    *,
+    single_host_anchor_ip: str | None = None,
+) -> dict[str, Any]:
     producer_count = int(args.producer_count)
     consumer_count = int(args.consumer_count)
     owner_count = int(args.owner_count)
@@ -235,6 +563,7 @@ def _build_suite(cfg: dict[str, Any], args: argparse.Namespace, profile_ids: lis
         ("owner-count", owner_count),
         ("owner-dram-gib", int(args.owner_dram_gib)),
         ("duration-seconds", int(args.duration_seconds)),
+        ("threads-per-process", int(args.threads_per_process)),
         ("op-timeout-seconds", int(args.op_timeout_seconds)),
         ("cluster-ready-timeout-seconds", int(args.cluster_ready_timeout_seconds)),
     ):
@@ -249,11 +578,36 @@ def _build_suite(cfg: dict[str, Any], args: argparse.Namespace, profile_ids: lis
     if int(args.consumer_sim_min_ms) > int(args.consumer_sim_max_ms):
         raise SystemExit("--consumer-sim-min-ms must be <= --consumer-sim-max-ms")
 
-    topology = producer_count + consumer_count
+    single_host = bool(args.single_host_logical_targets)
+    processes_per_target = owner_count if single_host else 1
+    if single_host:
+        if producer_count % processes_per_target != 0:
+            raise SystemExit(
+                "--single-host-logical-targets requires producer-count to be divisible by owner-count "
+                f"so process fanout can preserve the requested count: producer={producer_count} owner={owner_count}"
+            )
+        if consumer_count % processes_per_target != 0:
+            raise SystemExit(
+                "--single-host-logical-targets requires consumer-count to be divisible by owner-count "
+                f"so process fanout can preserve the requested count: consumer={consumer_count} owner={owner_count}"
+            )
+        producer_targets = producer_count // processes_per_target
+        consumer_targets = consumer_count // processes_per_target
+    else:
+        producer_targets = producer_count
+        consumer_targets = consumer_count
+    topology = producer_targets + consumer_targets
     if owner_count > topology:
         raise SystemExit(
             f"owner-count={owner_count} cannot exceed benchmark topology={topology} "
             "when owner targets are co-located with benchmark targets"
+        )
+    if single_host:
+        _apply_single_host_logical_targets(
+            cfg,
+            profile_ids=profile_ids,
+            required_count=topology,
+            anchor_ip_override=single_host_anchor_ip,
         )
 
     target_hosts = _common_targets(cfg, profile_ids, topology)
@@ -266,8 +620,8 @@ def _build_suite(cfg: dict[str, Any], args: argparse.Namespace, profile_ids: lis
     benchmark = _base_benchmark(cfg)
     benchmark.update(
         {
-            "processes_per_target": 1,
-            "threads_per_process": 4,
+            "processes_per_target": processes_per_target,
+            "threads_per_process": int(args.threads_per_process),
             "value_size": int(args.value_size),
             "metric_warmup_seconds": int(args.metric_warmup_seconds),
             "op_timeout_seconds": int(args.op_timeout_seconds),
@@ -279,12 +633,14 @@ def _build_suite(cfg: dict[str, Any], args: argparse.Namespace, profile_ids: lis
             ],
         }
     )
+    if single_host:
+        benchmark["owner_group_processes"] = 1
 
     _ensure_largescale_port_alloc(
         cfg,
         profile_ids=profile_ids,
         topology=topology,
-        required_p2p_ports_per_slot=topology + 1 + owner_count,
+        required_p2p_ports_per_slot=(topology * processes_per_target) + 1 + owner_count,
     )
 
     scenes = _require_dict(cfg.get("scenes"), "config.scenes")
@@ -292,8 +648,8 @@ def _build_suite(cfg: dict[str, Any], args: argparse.Namespace, profile_ids: lis
     scene["test_stack"] = copy.deepcopy(_require_dict(scene.get("test_stack"), f"config.scenes[{SCENE_ID!r}].test_stack"))
     scene["test_stack"]["mode"] = "MPMC"
     scene["test_stack"]["role_weights"] = _role_weights_for_exact_mpmc_counts(
-        producer_count,
-        consumer_count,
+        producer_targets,
+        consumer_targets,
     )
     scene["select"] = {"scales": [scale_id], "profiles": list(profile_ids)}
 
@@ -329,11 +685,80 @@ def _build_suite(cfg: dict[str, Any], args: argparse.Namespace, profile_ids: lis
     }
 
 
+def _prepare_run_local_testbed_bundle(
+    *,
+    source: str,
+    workdir: Path,
+    start_config_relpath: str,
+) -> Path:
+    src = _resolve_user_path(source)
+    if not src.is_dir():
+        raise SystemExit(f"--testbed-bundle-source must be an existing directory: {src}")
+    dst = (workdir / "testbed_bundle").resolve()
+    src_root_for_relocation = src.resolve()
+    if src == dst:
+        pass
+    else:
+        if src in dst.parents:
+            raise SystemExit(f"--testbed-bundle-source cannot contain the run-local destination: src={src} dst={dst}")
+        if dst in src.parents:
+            raise SystemExit(f"--testbed-bundle-source cannot be inside the run-local destination: src={src} dst={dst}")
+        if dst.exists():
+            shutil.rmtree(dst)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dst, symlinks=True)
+
+    return _normalize_run_local_testbed_bundle(
+        src_root=src_root_for_relocation,
+        dst_root=dst,
+        start_config_relpath=start_config_relpath,
+    )
+
+
+def _single_host_anchor_ip_from_start_config(start_cfg: Path) -> str:
+    start_payload = yaml.safe_load(start_cfg.read_text(encoding="utf-8"))
+    start = _require_dict(start_payload, f"start config {start_cfg}")
+    raw_deployconf = start.get("deployconf_path")
+    if not isinstance(raw_deployconf, str) or not raw_deployconf.strip():
+        raise SystemExit(f"start config {start_cfg} must define deployconf_path")
+    deployconf_path = Path(raw_deployconf).expanduser()
+    if not deployconf_path.is_absolute():
+        deployconf_path = (start_cfg.parent / deployconf_path).resolve()
+    if not deployconf_path.is_file():
+        raise SystemExit(f"start config deployconf_path is missing: {deployconf_path}")
+    deployconf_payload = yaml.safe_load(deployconf_path.read_text(encoding="utf-8"))
+    deployconf = _require_dict(deployconf_payload, f"deployconf {deployconf_path}")
+    cluster_nodes = deployconf.get("cluster_nodes")
+    if not isinstance(cluster_nodes, list) or not cluster_nodes:
+        raise SystemExit(f"deployconf {deployconf_path} must define non-empty cluster_nodes")
+    for index, raw_node in enumerate(cluster_nodes):
+        node = _require_dict(raw_node, f"deployconf.cluster_nodes[{index}]")
+        hostname = node.get("hostname")
+        if isinstance(hostname, str) and "bastion" in hostname.lower():
+            continue
+        node_ip = node.get("ip")
+        if isinstance(node_ip, str) and node_ip.strip():
+            return node_ip.strip()
+    raise SystemExit(f"deployconf {deployconf_path} has no non-bastion cluster node IP")
+
+
+def _controller_port_from_start_config(start_cfg: Path) -> int:
+    start_payload = yaml.safe_load(start_cfg.read_text(encoding="utf-8"))
+    start = _require_dict(start_payload, f"start config {start_cfg}")
+    raw_url = start.get("controller_url")
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        raise SystemExit(f"start config {start_cfg} must define controller_url")
+    parsed = urlparse(raw_url.strip())
+    if parsed.port is None:
+        raise SystemExit(f"start config {start_cfg} controller_url must include an explicit port: {raw_url}")
+    return int(parsed.port)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Flat index entry for the TEST_STACK large-scale MQ benchmark "
-            "(default: 30 owners at 5GiB, 300 producers, 8 consumers)."
+            "(default: 4 owners at 1GiB, 160 producers, 8 consumers, 256-byte values)."
         )
     )
     parser.add_argument("--python", default=os.environ.get("PYTHON", sys.executable))
@@ -343,13 +768,33 @@ def main() -> int:
     parser.add_argument("--profile", action="append", dest="profiles", help="Profile id to run; repeat or comma-separate.")
     parser.add_argument("--action", choices=["run", "clean"], default="run")
     parser.add_argument("--generate-only", action="store_true", help="Write the generated suite YAML and do not invoke test_runner.")
-    parser.add_argument("--owner-count", type=int, default=30)
-    parser.add_argument("--owner-dram-gib", type=int, default=5)
-    parser.add_argument("--producer-count", type=int, default=300)
+    parser.add_argument(
+        "--testbed-bundle-source",
+        help="Existing TEST_STACK testbed bundle directory copied to <workdir>/testbed_bundle before a real run.",
+    )
+    parser.add_argument(
+        "--start-config-relpath",
+        default="start_test_bed.runner.yaml",
+        help="Start-testbed config path inside the run-local testbed bundle.",
+    )
+    parser.add_argument(
+        "--single-host-logical-targets",
+        action="store_true",
+        help="Generate node-1..N logical TEST_STACK targets on the first usable target IP of each selected profile.",
+    )
+    parser.add_argument("--owner-count", type=int, default=4)
+    parser.add_argument("--owner-dram-gib", type=int, default=1)
+    parser.add_argument("--producer-count", type=int, default=160)
     parser.add_argument("--consumer-count", type=int, default=8)
     parser.add_argument("--duration-seconds", type=int, default=60)
-    parser.add_argument("--value-size", type=int, default=16384)
+    parser.add_argument("--value-size", type=int, default=256)
     parser.add_argument("--metric-warmup-seconds", type=int, default=0)
+    parser.add_argument(
+        "--threads-per-process",
+        type=int,
+        default=int(DEFAULT_BENCHMARK["threads_per_process"]),
+        help="Worker threads per benchmark process.",
+    )
     parser.add_argument("--op-timeout-seconds", type=int, default=30)
     parser.add_argument("--cluster-ready-timeout-seconds", type=int, default=1800)
     parser.add_argument("--consumer-sim-min-ms", type=int, default=700)
@@ -360,6 +805,21 @@ def main() -> int:
     if args.action == "clean":
         return call([args.python, "-u", str(RUNNER), "--workdir", str(workdir), "--action", "clean"])
 
+    start_cfg: Path | None = None
+    single_host_anchor_ip: str | None = None
+    local_controller_port: int | None = None
+    if not args.generate_only:
+        if not args.testbed_bundle_source:
+            raise SystemExit("--testbed-bundle-source is required unless --generate-only is set")
+        start_cfg = _prepare_run_local_testbed_bundle(
+            source=args.testbed_bundle_source,
+            workdir=workdir,
+            start_config_relpath=args.start_config_relpath,
+        )
+        local_controller_port = _controller_port_from_start_config(start_cfg)
+        if bool(args.single_host_logical_targets):
+            single_host_anchor_ip = _single_host_anchor_ip_from_start_config(start_cfg)
+
     config_path = _repo_path(args.config)
     if not config_path.exists():
         raise SystemExit(f"--config not found: {config_path}")
@@ -368,7 +828,18 @@ def main() -> int:
         cfg = _require_dict(yaml.safe_load(fh), f"config file {config_path}")
 
     profile_ids = _split_ids(args.profiles, default=DEFAULT_PROFILE_ID)
-    suite = _build_suite(cfg, args, profile_ids)
+    _ensure_ci_public_profile(cfg, profile_ids)
+    suite = _build_suite(
+        cfg,
+        args,
+        profile_ids,
+        single_host_anchor_ip=single_host_anchor_ip,
+    )
+    if local_controller_port is not None:
+        _rewrite_test_stack_coordinator_ports_for_local_controller(
+            suite,
+            controller_port=local_controller_port,
+        )
 
     suite_out = _repo_path(args.suite_out) if args.suite_out else (workdir / "largescale_mq_suite.yaml")
     suite_out.parent.mkdir(parents=True, exist_ok=True)
@@ -378,7 +849,13 @@ def main() -> int:
     print(f"generated suite: {suite_out}", flush=True)
     if args.generate_only:
         return 0
-    return call([args.python, "-u", str(RUNNER), "--config", str(suite_out), "--workdir", str(workdir), "--action", "run"])
+    assert start_cfg is not None
+    env = os.environ.copy()
+    env["FLUXON_TEST_STACK_START_TEST_BED_CONFIG"] = str(start_cfg)
+    return call(
+        [args.python, "-u", str(RUNNER), "--config", str(suite_out), "--workdir", str(workdir), "--action", "run"],
+        env=env,
+    )
 
 
 if __name__ == "__main__":

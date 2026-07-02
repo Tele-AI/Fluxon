@@ -2233,6 +2233,7 @@ class CoordinatorServer:
             "node_id": response_node_id,
             "node_role": assigned_role,
             "test_mode": active_test_mode,
+            "expected_nodes": int(self.expected_nodes),
             "threads_per_process": THREADS_PER_PROCESS,
             "max_benchmark_seconds": MAX_BENCHMARK_SECONDS,
             "cluster_ready_timeout_seconds": CLUSTER_READY_TIMEOUT_SECONDS,

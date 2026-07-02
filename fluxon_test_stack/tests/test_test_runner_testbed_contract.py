@@ -1183,6 +1183,31 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertIn('prepare_env_path="', script_text)
             self.assertIn('. "$prepare_env_path"', script_text)
 
+    def test_ci_prepare_exports_testbed_bundle_and_release_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bundle_root = root / "testbed_bundle"
+            bundle_root.mkdir()
+            start_cfg = bundle_root / "start_test_bed.runner.yaml"
+            start_cfg.write_text("schema_version: 6\n", encoding="utf-8")
+            (bundle_root / "manifest.json").write_text("{}", encoding="utf-8")
+            release_root = root / "fluxon_release"
+            release_root.mkdir()
+            env = {
+                **os.environ,
+                _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg),
+                "FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT": str(release_root),
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                exports = _RUNNER._run_ci_prepare_steps(
+                    resolved_case={"scene": {"ci": {}}},
+                    run_dir=root / "run",
+                    src_root=root / "src",
+                )
+
+            self.assertEqual(exports[_RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV], str(start_cfg))
+            self.assertEqual(exports["FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT"], str(release_root))
+
     def test_parse_ci_prepare_steps_accepts_online_docker_image(self) -> None:
         steps = _RUNNER._parse_ci_prepare_steps(
             [
@@ -1311,8 +1336,8 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             manifest_path.write_text(
                 json.dumps(
                     {
-                        "start_config_path": str(start_cfg),
-                        "workdir": str(workdir),
+                        "start_config_path": "start_test_bed.runner.yaml",
+                        "workdir": "bootstrap_workdir",
                         "bootstrap_mode": "apply_only",
                     }
                 ),
@@ -1342,6 +1367,109 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     "apply_only",
                 ],
             )
+
+    def test_runtime_token_mapping_includes_testbed_bundle_root_when_manifest_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bundle_root = Path(td)
+            start_cfg = bundle_root / "start_test_bed.runner.yaml"
+            start_cfg.write_text("schema_version: 6\n", encoding="utf-8")
+            (bundle_root / "manifest.json").write_text("{}", encoding="utf-8")
+            env = {**os.environ, _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg)}
+            with mock.patch.dict(os.environ, env, clear=True):
+                mapping = _RUNNER._build_runtime_token_mapping(
+                    workdir_root="/tmp/workdir",
+                    run_dir="/tmp/run",
+                    release_root="/tmp/release",
+                    test_rsc_root="/tmp/test_rsc",
+                    case_id="case",
+                    profile_id="profile",
+                    stack_identity={
+                        "cluster_name": "cluster",
+                        "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                        "share_mem_path": "/tmp/share",
+                    },
+                )
+
+            self.assertEqual(mapping["__TEST_BED_BUNDLE_ROOT__"], str(bundle_root.resolve()))
+
+    def test_direct_local_manifest_remote_bash_uses_local_process_without_bastion(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bundle_root = Path(td)
+            start_cfg = bundle_root / "start_test_bed.runner.yaml"
+            start_cfg.write_text("schema_version: 6\n", encoding="utf-8")
+            (bundle_root / "manifest.json").write_text(
+                json.dumps({"controller_request_mode": "direct"}),
+                encoding="utf-8",
+            )
+            env = {**os.environ, _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg)}
+            node_cfg = {
+                "execution_mode": "local",
+                "ip": "127.0.0.1",
+                "hostworkdir": td,
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                captured = _RUNNER._run_remote_bash_capture(
+                    target_name="logic-a",
+                    node_cfg=node_cfg,
+                    remote_cmd="printf '%s\\n' local-ok",
+                )
+
+            self.assertEqual(captured, "local-ok\n")
+
+    def test_load_test_stack_cluster_nodes_expands_same_host_logical_target_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bundle_root = Path(td)
+            start_cfg = bundle_root / "start_test_bed.runner.yaml"
+            deployconf_path = bundle_root / "deployconf.yaml"
+            start_cfg.write_text(
+                "\n".join(
+                    [
+                        "schema_version: 6",
+                        "deployconf_path: ./deployconf.yaml",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            deployconf_path.write_text(
+                "\n".join(
+                    [
+                        "cluster_nodes:",
+                        "  - hostname: logic-a",
+                        "    ip: 10.1.1.119",
+                        "    hostworkdir: /tmp/logic/a",
+                        "    execution_mode: local",
+                        "    ssh_user: runner",
+                        "    ssh_port: 22",
+                        "    ssh_password: null",
+                        "  - hostname: logic-b",
+                        "    ip: 10.1.1.119",
+                        "    hostworkdir: /tmp/logic/b",
+                        "    execution_mode: local",
+                        "    ssh_user: runner",
+                        "    ssh_port: 22",
+                        "    ssh_password: null",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            resolved_case = {
+                "deploy": {
+                    "target_ip_map": {
+                        "node-1": "10.1.1.119",
+                        "logic-a": "10.1.1.119",
+                        "logic-b": "10.1.1.119",
+                    }
+                }
+            }
+            env = {**os.environ, _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg)}
+            with mock.patch.dict(os.environ, env, clear=True):
+                cluster_nodes, _dispatch = _RUNNER._load_test_stack_cluster_nodes_and_dispatch(resolved_case)
+
+            self.assertIn("node-1", cluster_nodes)
+            self.assertEqual(cluster_nodes["node-1"]["hostname"], "logic-a")
+            self.assertEqual(cluster_nodes["node-1"]["hostworkdir"], "/tmp/logic/a")
 
     def test_load_source_stack_contract_accepts_same_host_dual_local_hostworkdirs(self) -> None:
         with tempfile.TemporaryDirectory() as td:

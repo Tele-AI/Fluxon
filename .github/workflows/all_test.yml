@@ -54,6 +54,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import copy
+          import shlex
           from pathlib import Path
           import yaml
 
@@ -64,7 +65,7 @@ jobs:
 
           top_attention_scene_prefix = "ci_top_attention_"
 
-          def top_attention_command(scene_id, *, case_config, timeout_seconds=21600):
+          def top_attention_command(scene_id, *, case_config, extra_args=None, timeout_seconds=21600):
               if not scene_id.startswith(top_attention_scene_prefix):
                   raise ValueError(f"not a top-attention CI scene id: {scene_id}")
               suffix = scene_id[len(top_attention_scene_prefix):]
@@ -74,6 +75,8 @@ jobs:
               )
               if case_config:
                   command += " --case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+              for arg in extra_args or []:
+                  command += " " + shlex.quote(str(arg))
               return {
                   "id": f"top_attention_{suffix}",
                   "command": command,
@@ -151,16 +154,70 @@ jobs:
                   "case_config": True,
                   "scene_config": {},
               },
+              "ci_top_attention_largescale_mq": {
+                  "subject": "mq",
+                  "runtime_contract": "rust_self_managed",
+                  "scale": "n1_kvowner_dram_3gib",
+                  "case_config": False,
+                  "command_variants": [
+                      {
+                          "id_suffix": f"p{producer_count}_c{consumer_count}",
+                          "extra_args": [
+                              "--single-host-logical-targets",
+                              "--testbed-bundle-source",
+                              "__TEST_BED_BUNDLE_ROOT__",
+                              "--workdir",
+                              f"__WORKDIR_ROOT__/largescale_mq_ci_single_host/p{producer_count}_c{consumer_count}",
+                              "--owner-count",
+                              "4",
+                              "--owner-dram-gib",
+                              "1",
+                              "--producer-count",
+                              str(producer_count),
+                              "--consumer-count",
+                              str(consumer_count),
+                              "--duration-seconds",
+                              "30",
+                              "--value-size",
+                              "256",
+                              "--op-timeout-seconds",
+                              "5",
+                              "--cluster-ready-timeout-seconds",
+                              "1800",
+                              "--consumer-sim-min-ms",
+                              "1",
+                              "--consumer-sim-max-ms",
+                              "1",
+                          ],
+                      }
+                      for producer_count, consumer_count in ((8, 8), (32, 32), (160, 8))
+                  ],
+                  "scene_config": {},
+              },
           }
 
           for scene_id, scene_def in top_attention_ci_scenes.items():
-              commands = [
-                  top_attention_command(
-                      scene_id,
-                      case_config=scene_def["case_config"],
-                      timeout_seconds=scene_def.get("timeout_seconds", 21600),
-                  )
-              ]
+              command_variants = scene_def.get("command_variants")
+              if command_variants is None:
+                  commands = [
+                      top_attention_command(
+                          scene_id,
+                          case_config=scene_def["case_config"],
+                          extra_args=scene_def.get("extra_args"),
+                          timeout_seconds=scene_def.get("timeout_seconds", 21600),
+                      )
+                  ]
+              else:
+                  commands = []
+                  for variant in command_variants:
+                      command = top_attention_command(
+                          scene_id,
+                          case_config=scene_def["case_config"],
+                          extra_args=variant["extra_args"],
+                          timeout_seconds=scene_def.get("timeout_seconds", 21600),
+                      )
+                      command["id"] = f"{command['id']}_{variant['id_suffix']}"
+                      commands.append(command)
               existing_scene = suite["scenes"].get(scene_id)
               if existing_scene is None:
                   suite["scenes"][scene_id] = {
@@ -189,6 +246,7 @@ jobs:
           # - ci_top_attention_mq_mpsc keeps MPSC API channel coverage inside the same CI testbed contract.
           # - ci_top_attention_mq_mpmc keeps MPMC API channel coverage inside the same CI testbed contract.
           # - ci_top_attention_mq_mpmc_bench keeps heavier MPMC benchmark-style coverage in this workflow.
+          # - ci_top_attention_largescale_mq runs a bounded same-host MQ TEST_STACK workload in GitHub Actions.
           suite["scenes"] = {
               key: value
               for key, value in suite["scenes"].items()
@@ -221,6 +279,7 @@ jobs:
           # - ci_top_attention_mq_mpsc stays on n1_kvowner_dram_20gib.
           # - ci_top_attention_mq_mpmc stays on n1_kvowner_dram_20gib.
           # - ci_top_attention_mq_mpmc_bench stays on n1_kvowner_dram_20gib.
+          # - ci_top_attention_largescale_mq stays on n1_kvowner_dram_3gib because the nested workload owns its bounded scale.
 
           out_path.write_text(
               yaml.safe_dump(suite, sort_keys=False, allow_unicode=False),

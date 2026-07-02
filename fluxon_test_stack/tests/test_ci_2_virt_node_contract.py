@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -94,6 +95,11 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             ]["greptime"]["endpoint"]["host_port"],
             19190,
         )
+        test_stack_ports = generated["profiles"]["fluxon_tcp_thread"]["runtime"]["test_stack"]["port_alloc"][
+            "by_topology"
+        ]
+        self.assertEqual(test_stack_ports[1]["coordinator_port_base"], 20180)
+        self.assertEqual(test_stack_ports[2]["coordinator_port_base"], 20280)
         self.assertEqual(
             generated["artifact_sets"]["fluxon_tcp_thread"]["release_source"]["key_prefix"],
             "profiles/fluxon_tcp_thread",
@@ -352,6 +358,8 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             generated["service"]["owner"]["entrypoint"],
         )
         self.assertEqual(generated["service"]["ops_controller"]["port"], 19180)
+        self.assertEqual(generated["namespace"], "fluxon_testbed")
+        self.assertEqual(generated["global_envs"]["FLUXON_CLUSTER_NAME"], "fluxon_testbed")
         self.assertIn(
             'http_listen_addr: "0.0.0.0:${OPS_CONTROLLER__PORT}"',
             generated["service"]["ops_controller"]["entrypoint"],
@@ -384,6 +392,38 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         self.assertIsNone(generated["test_runner_ui"]["gitops_config_path"])
         self.assertEqual(generated["bootstrap_phases"][0]["node"], "local-node-a")
 
+    def test_generated_local_testbed_supports_explicit_ops_cluster_name(self) -> None:
+        deployconf_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_DEPLOYCONF_TEMPLATE, ctx="deployconf")
+        deployconf = _ENTRY._rewrite_deployconf_for_local_dual_nodes(
+            deployconf_cfg=deployconf_cfg,
+            primary_node_name="local-node-a",
+            secondary_node_name="local-node-b",
+            host_ip="10.1.1.119",
+            primary_hostworkdir=Path("/tmp/fluxon_testbed/a"),
+            secondary_hostworkdir=Path("/tmp/fluxon_testbed/b"),
+            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            controller_port=19180,
+            testbed_ops_cluster_name="fluxon_testbed_mq_large_local",
+        )
+        start_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_START_TEST_BED_TEMPLATE, ctx="start_test_bed")
+        start = _ENTRY._rewrite_start_test_bed_for_local_dual_nodes(
+            start_cfg=start_cfg,
+            generated_deployconf_path=Path("/tmp/deployconf.yaml"),
+            primary_node_name="local-node-a",
+            controller_access_ip="10.1.1.119",
+            controller_port=19180,
+            ui_port=18080,
+            ui_workdir=Path("/tmp/ui"),
+            testbed_ops_cluster_name="fluxon_testbed_mq_large_local",
+        )
+
+        self.assertEqual(deployconf["namespace"], "fluxon_testbed_mq_large_local")
+        self.assertEqual(deployconf["global_envs"]["FLUXON_CLUSTER_NAME"], "fluxon_testbed_mq_large_local")
+        self.assertEqual(
+            start["controller_url"],
+            "http://10.1.1.119:19180/r/ops/fluxon_testbed_mq_large_local",
+        )
+
     def test_generated_apply_check_config_excludes_control_plane_reapply(self) -> None:
         start_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_START_TEST_BED_TEMPLATE, ctx="start_test_bed")
         local_cfg = _ENTRY._rewrite_start_test_bed_for_local_dual_nodes(
@@ -404,6 +444,132 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             generated["deploy_workloads"],
             ["fluxon_fs_master", "fluxon_fs_agent"],
         )
+
+    def test_write_ci_testbed_bundle_is_run_local_and_relocatable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bundle_root = root / "runner_run" / "testbed_bundle"
+            artifacts_source = root / "release" / "test_rsc"
+            artifacts_source.mkdir(parents=True)
+            (artifacts_source / "prepare.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+            deployconf = {
+                "gen_k8s_daemonset_mirror_outdir": "/tmp/old-mirror",
+                "cluster_nodes": [
+                    {
+                        "hostname": "runner-a",
+                        "ip": "10.1.1.119",
+                        "hostworkdir": "/tmp/runner/a",
+                        "execution_mode": "local",
+                    }
+                ],
+                "global_envs": {"FLUXON_CLUSTER_NAME": "fluxon_testbed"},
+            }
+            start_cfg = {"schema_version": 6, "deployconf_path": "/tmp/old-deployconf.yaml"}
+            apply_cfg = {"schema_version": 6, "deployconf_path": "/tmp/old-deployconf.yaml"}
+
+            paths = _ENTRY._write_ci_testbed_bundle(
+                bundle_root=bundle_root,
+                deployconf=deployconf,
+                start_cfg=start_cfg,
+                apply_check_start_cfg=apply_cfg,
+                artifacts_source_root=artifacts_source,
+            )
+
+            self.assertEqual(paths["bundle_root"], bundle_root.resolve())
+            manifest = json.loads((bundle_root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest,
+                {
+                    "bootstrap_mode": "apply_only",
+                    "controller_request_mode": "direct",
+                    "deployconf_path": "deployconf_testbed.local.yaml",
+                    "ssh_config_path": "ssh_config",
+                    "start_config_path": "start_test_bed.runner.yaml",
+                    "workdir": "bootstrap_workdir",
+                },
+            )
+            self.assertTrue((bundle_root / "bootstrap_workdir").is_dir())
+            self.assertTrue((bundle_root / "gen_k8s_daemonset").is_dir())
+            bundled_deployconf = _ENTRY._load_yaml_mapping(
+                bundle_root / "deployconf_testbed.local.yaml",
+                ctx="bundle deployconf",
+            )
+            self.assertEqual(
+                bundled_deployconf["gen_k8s_daemonset_mirror_outdir"],
+                str((bundle_root / "gen_k8s_daemonset").resolve()),
+            )
+            bundled_start = _ENTRY._load_yaml_mapping(
+                bundle_root / "start_test_bed.runner.yaml",
+                ctx="bundle start",
+            )
+            self.assertEqual(bundled_start["deployconf_path"], "./deployconf_testbed.local.yaml")
+            self.assertEqual((bundle_root / "artifacts" / "prepare.yaml").resolve(), (artifacts_source / "prepare.yaml").resolve())
+
+    def test_refresh_testbed_bundle_deployconf_uses_normalized_start_output(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bundle_root = root / "runner_run" / "testbed_bundle"
+            start_workdir = root / "start_test_bed" / "bare"
+            deployconf = {
+                "gen_k8s_daemonset_mirror_outdir": "/tmp/old-mirror",
+                "cluster_nodes": [],
+                "service": {
+                    "etcd": {
+                        "port": 33579,
+                        "entrypoint": "etcd --listen-client-urls http://0.0.0.0:33579",
+                    },
+                    "greptime": {
+                        "port": 35030,
+                    },
+                },
+            }
+            start_cfg = {"schema_version": 6, "deployconf_path": "/tmp/old-deployconf.yaml"}
+            paths = _ENTRY._write_ci_testbed_bundle(
+                bundle_root=bundle_root,
+                deployconf=deployconf,
+                start_cfg=start_cfg,
+                apply_check_start_cfg=start_cfg,
+                artifacts_source_root=root / "missing_artifacts",
+            )
+
+            start_workdir.mkdir(parents=True)
+            _ENTRY._write_yaml(
+                start_workdir / "deployconf.with_release_manifest_sha256.yaml",
+                {
+                    "gen_k8s_daemonset_mirror_outdir": "/tmp/start-workdir-mirror",
+                    "cluster_nodes": [],
+                    "service": {
+                        "etcd": {
+                            "port": 19180,
+                            "entrypoint": "etcd --listen-client-urls http://0.0.0.0:19180",
+                        },
+                        "greptime": {
+                            "port": 19190,
+                        },
+                    },
+                    "global_envs": {
+                        "FLUXON_RELEASE_MANIFEST_SHA256": "must-not-leak-into-runner-bundle",
+                    },
+                },
+            )
+
+            _ENTRY._refresh_ci_testbed_bundle_deployconf_from_start_workdir(
+                metadata={
+                    "testbed_bundle_path": paths["bundle_root"],
+                    "testbed_bundle_deployconf_path": paths["deployconf_path"],
+                },
+                start_workdir=start_workdir,
+            )
+
+            refreshed = _ENTRY._load_yaml_mapping(paths["deployconf_path"], ctx="refreshed deployconf")
+            self.assertEqual(refreshed["service"]["etcd"]["port"], 19180)
+            self.assertIn("19180", refreshed["service"]["etcd"]["entrypoint"])
+            self.assertEqual(refreshed["service"]["greptime"]["port"], 19190)
+            self.assertNotIn("FLUXON_RELEASE_MANIFEST_SHA256", refreshed["global_envs"])
+            self.assertEqual(
+                refreshed["gen_k8s_daemonset_mirror_outdir"],
+                str((bundle_root / "gen_k8s_daemonset").resolve()),
+            )
 
     def test_write_yaml_emits_ascii_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -540,10 +706,21 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             root = Path(td)
             workdir = root / "ci_2_virt_node_workdir"
             hostworkdir = root / "hostworkdir"
-            release_dir = REPO_ROOT / "fluxon_release"
+            release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
             wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
+            _ENTRY._write_yaml(
+                workdir / "start_test_bed" / "apply" / "deployconf.with_release_manifest_sha256.yaml",
+                {
+                    "gen_k8s_daemonset_mirror_outdir": "/tmp/mock-start-mirror",
+                    "cluster_nodes": [],
+                    "service": {
+                        "etcd": {"port": 19180},
+                        "greptime": {"port": 19190},
+                    },
+                },
+            )
             calls: list[tuple[list[str], dict[str, str] | None]] = []
 
             def fake_run(argv: list[str], *, env=None) -> None:
@@ -555,6 +732,8 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 str(workdir),
                 "--testbed-hostworkdir",
                 str(hostworkdir),
+                "--release-dir",
+                str(release_dir),
                 "--scene-id",
                 self._KVTEST_SCENE_ID,
                 "--skip-builder-image",
@@ -571,7 +750,6 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                             rc = _ENTRY.main()
             finally:
                 sys.argv = original_argv
-                wheel_path.unlink(missing_ok=True)
 
             self.assertEqual(rc, 0)
             self.assertTrue(calls)
@@ -580,12 +758,18 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             self.assertEqual(runner_argv[1], str((REPO_ROOT / "fluxon_test_stack" / "test_runner.py").resolve()))
             self.assertEqual(
                 runner_env[_ENTRY.TEST_STACK_START_TEST_BED_CONFIG_ENV],
-                str((workdir / "generated" / "start_test_bed.local.yaml").resolve()),
+                str((workdir / "runner_run" / "testbed_bundle" / "start_test_bed.runner.yaml").resolve()),
             )
             self.assertEqual(
                 runner_env["FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT"],
-                str((REPO_ROOT / "fluxon_release").resolve()),
+                str(release_dir.resolve()),
             )
+            refreshed = _ENTRY._load_yaml_mapping(
+                workdir / "runner_run" / "testbed_bundle" / "deployconf_testbed.local.yaml",
+                ctx="refreshed runner bundle deployconf",
+            )
+            self.assertEqual(refreshed["service"]["etcd"]["port"], 19180)
+            self.assertEqual(refreshed["service"]["greptime"]["port"], 19190)
 
     def test_main_supports_explicit_suite_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -608,7 +792,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             suite_cfg["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"][self._LOG_MGMT_SCENE_ID]["enabled"] = True
             suite_cfg["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"][self._MQ_SCENE_ID] = {}
             _ENTRY._write_yaml(suite_path, suite_cfg)
-            release_dir = REPO_ROOT / "fluxon_release"
+            release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
             wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
@@ -621,6 +805,8 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 str(workdir),
                 "--testbed-hostworkdir",
                 str(hostworkdir),
+                "--release-dir",
+                str(release_dir),
                 "--skip-builder-image",
                 "--skip-pack",
                 "--skip-dispatch",
@@ -636,7 +822,6 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                         rc = _ENTRY.main()
             finally:
                 sys.argv = original_argv
-                wheel_path.unlink(missing_ok=True)
 
             self.assertEqual(rc, 0)
             generated_suite = _ENTRY._load_yaml_mapping(
@@ -675,7 +860,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             root = Path(td)
             workdir = root / "ci_2_virt_node_workdir"
             hostworkdir = root / "hostworkdir"
-            release_dir = REPO_ROOT / "fluxon_release"
+            release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
             wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
@@ -686,6 +871,8 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 str(workdir),
                 "--testbed-hostworkdir",
                 str(hostworkdir),
+                "--release-dir",
+                str(release_dir),
                 "--scene-id",
                 self._DOC_SCENE_ID,
                 "--skip-builder-image",
@@ -702,7 +889,6 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                         rc = _ENTRY.main()
             finally:
                 sys.argv = original_argv
-                wheel_path.unlink(missing_ok=True)
 
             self.assertEqual(rc, 0)
             generated_deployconf = _ENTRY._load_yaml_mapping(
@@ -728,7 +914,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             root = Path(td)
             workdir = root / "ci_2_virt_node_workdir"
             hostworkdir = root / "hostworkdir"
-            release_dir = REPO_ROOT / "fluxon_release"
+            release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
             wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
@@ -736,6 +922,20 @@ class TestCi2VirtNodeContract(unittest.TestCase):
 
             def fake_run(argv: list[str], *, env=None) -> None:
                 calls.append((list(argv), None if env is None else dict(env)))
+                if argv[1] != str((REPO_ROOT / "fluxon_test_stack" / "start_test_bed.py").resolve()):
+                    return
+                start_workdir = Path(argv[argv.index("-w") + 1])
+                _ENTRY._write_yaml(
+                    start_workdir / "deployconf.with_release_manifest_sha256.yaml",
+                    {
+                        "gen_k8s_daemonset_mirror_outdir": "/tmp/mock-start-mirror",
+                        "cluster_nodes": [],
+                        "service": {
+                            "etcd": {"port": 19180},
+                            "greptime": {"port": 19190},
+                        },
+                    },
+                )
 
             argv = [
                 "ci_2_virt_node.py",
@@ -743,6 +943,8 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 str(workdir),
                 "--testbed-hostworkdir",
                 str(hostworkdir),
+                "--release-dir",
+                str(release_dir),
                 "--scene-id",
                 self._KVTEST_SCENE_ID,
                 "--skip-builder-image",
@@ -761,7 +963,6 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                                     rc = _ENTRY.main()
             finally:
                 sys.argv = original_argv
-                wheel_path.unlink(missing_ok=True)
 
             self.assertEqual(rc, 0)
             self.assertGreaterEqual(len(calls), 1)
@@ -833,7 +1034,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             root = Path(td)
             workdir = root / "ci_2_virt_node_workdir"
             hostworkdir = root / "hostworkdir"
-            release_dir = REPO_ROOT / "fluxon_release"
+            release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
             wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
@@ -841,6 +1042,20 @@ class TestCi2VirtNodeContract(unittest.TestCase):
 
             def fake_run(argv: list[str], *, env=None) -> None:
                 calls.append((list(argv), None if env is None else dict(env)))
+                if argv[1] != str((REPO_ROOT / "fluxon_test_stack" / "start_test_bed.py").resolve()):
+                    return
+                start_workdir = Path(argv[argv.index("-w") + 1])
+                _ENTRY._write_yaml(
+                    start_workdir / "deployconf.with_release_manifest_sha256.yaml",
+                    {
+                        "gen_k8s_daemonset_mirror_outdir": "/tmp/mock-start-mirror",
+                        "cluster_nodes": [],
+                        "service": {
+                            "etcd": {"port": 19180},
+                            "greptime": {"port": 19190},
+                        },
+                    },
+                )
 
             argv = [
                 "ci_2_virt_node.py",
@@ -848,6 +1063,8 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 str(workdir),
                 "--testbed-hostworkdir",
                 str(hostworkdir),
+                "--release-dir",
+                str(release_dir),
                 "--scene-id",
                 self._KVTEST_SCENE_ID,
                 "--skip-builder-image",
@@ -864,7 +1081,6 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                             rc = _ENTRY.main()
             finally:
                 sys.argv = original_argv
-                wheel_path.unlink(missing_ok=True)
 
             self.assertEqual(rc, 0)
             start_bed_calls = [
@@ -873,11 +1089,11 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             self.assertEqual(len(start_bed_calls), 2)
             self.assertEqual(
                 start_bed_calls[0][start_bed_calls[0].index("-c") + 1],
-                str((workdir / "generated" / "start_test_bed.local.yaml").resolve()),
+                str((workdir / "runner_run" / "testbed_bundle" / "start_test_bed.runner.yaml").resolve()),
             )
             self.assertEqual(
                 start_bed_calls[1][start_bed_calls[1].index("-c") + 1],
-                str((workdir / "generated" / "start_test_bed.apply_check.local.yaml").resolve()),
+                str((workdir / "runner_run" / "testbed_bundle" / "start_test_bed.apply_check.runner.yaml").resolve()),
             )
 
 
