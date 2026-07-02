@@ -50,6 +50,11 @@ use std::os::fd::IntoRawFd;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
+// Unit tests build a native test binary, so PyO3's extension-module mode must
+// link libpython there. The cdylib/wheel build keeps Python symbols unresolved.
+#[cfg(test)]
+include!(env!("FLUXON_PYO3_TEST_PYTHON_LINK_RS"));
+
 mod memholder;
 pub use memholder::{ExternalMemHolder, MemHolder};
 mod flatdict_zerocopy;
@@ -58,7 +63,7 @@ pub use kvfuture::KvFuture;
 mod error;
 mod etcd;
 mod mpsc; // Python ApiError constructors and MPSC error mapping
-pub use etcd::PyEtcdLock;
+pub use etcd::{PyEtcdKvClient, PyEtcdLock};
 pub use mpsc::{MpscConsumerHandle, MpscContext, MpscProducerHandle};
 mod lease_manager;
 pub use lease_manager::{LeaseManagerHandle, PyGeneralLease, PyLeaseBackendUid};
@@ -4154,6 +4159,7 @@ fn fluxon_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MpscConsumerHandle>()?;
     // English note: keep the `from fluxon_pyo3 import LeaseManagerHandle` import path stable for Python users.
     m.add_class::<LeaseManagerHandle>()?;
+    m.add_class::<PyEtcdKvClient>()?;
     m.add_class::<PyEtcdLock>()?;
     m.add_class::<PyGeneralLease>()?;
     m.add_class::<PyLeaseBackendUid>()?;
