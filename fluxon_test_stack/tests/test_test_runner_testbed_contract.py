@@ -74,10 +74,16 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
             resolved_case = {
+                "runtime_model": {
+                    _RUNNER.RUNTIME_LAYER_TEST_BED: {"kind": "ops"},
+                    _RUNNER.RUNTIME_LAYER_BASE: {},
+                    _RUNNER.RUNTIME_LAYER_CASE: {"instance_ids": ["master", "owner_0", "broker", "ci_runner"]},
+                },
                 "deploy": {
                     "instances": [
                         {"id": "master", "deployer": {"target": "local-node-a"}},
                         {"id": "owner_0", "deployer": {"target": "local-node-a"}},
+                        {"id": "broker", "deployer": {"target": "local-node-a"}},
                     ],
                     "target_ip_map": {"local-node-a": "127.0.0.1"},
                 }
@@ -287,6 +293,76 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 {"apply_id": "apply-runner", "instance_ids": ["ci_runner"]},
             ],
         )
+
+    def test_execute_ci_case_leaves_successful_runner_apply_for_finalize(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            tracking = _RUNNER._CaseRuntimeTracking()
+            resolved_case = {
+                "case": {
+                    "case_id": "ci_top_attention_mq_core__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+                    "case_key": "ci_top_attention_mq_core__n1_kvowner_dram_20gib__fluxon_tcp_thread",
+                }
+            }
+            plan = _RUNNER._CasePlan(
+                case_family=_RUNNER.CASE_FAMILY_CI,
+                prepare_phases=(),
+                execute_phases=(
+                    _RUNNER._RuntimePhase(
+                        phase_id="ci_runner",
+                        layer=_RUNNER.RUNTIME_LAYER_CASE,
+                        instance_ids=("ci_runner",),
+                        write_ctx="CI",
+                    ),
+                ),
+            )
+            prepared = _RUNNER._PreparedCase(plan=plan)
+            summary = {
+                "schema_version": _RUNNER.SCHEMA_VERSION,
+                "case_id": resolved_case["case"]["case_id"],
+                "case_key": resolved_case["case"]["case_key"],
+                "run_index": 1,
+                "outcome": _RUNNER.RUN_OUTCOME_SUCCESS,
+                "counted": False,
+                "timing": {"started_at_unix_s": 100, "finished_at_unix_s": 200},
+                "ci": {"rc": 0},
+            }
+
+            with mock.patch.object(_RUNNER, "_ci_runner_exit_code_timeout_seconds", return_value=60):
+                with mock.patch.object(_RUNNER, "_deploy_runtime_phase", return_value={"history_id": "apply-runner"}):
+                    with mock.patch.object(_RUNNER, "_wait_ci_instance_ready") as wait_ready:
+                        with mock.patch.object(_RUNNER, "_wait_ci_runner_exit_code", return_value=0):
+                            with mock.patch.object(_RUNNER, "_build_ci_summary_yaml", return_value=summary):
+                                with mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply:
+                                    executed = _RUNNER._execute_ci_case(
+                                        _RUNNER._PlannedCase(
+                                            case=_RUNNER._ResolvedCase(
+                                                scene_id="ci_top_attention_mq_core",
+                                                scale_id="n1_kvowner_dram_20gib",
+                                                profile_id="fluxon_tcp_thread",
+                                                case_id=resolved_case["case"]["case_id"],
+                                                case_key=resolved_case["case"]["case_key"],
+                                            ),
+                                            ci_commands=[],
+                                            ci_prepare_steps=[],
+                                            label="ci case",
+                                            command_id=None,
+                                            test_id=None,
+                                            counted=False,
+                                        ),
+                                        resolved_case=resolved_case,
+                                        run_dir=run_dir,
+                                        run_index=1,
+                                        started_at=100,
+                                        prepared_case=prepared,
+                                        runtime_tracking=tracking,
+                                    )
+
+            self.assertEqual(executed.outcome, _RUNNER.RUN_OUTCOME_SUCCESS)
+            self.assertEqual(tracking.ci_apply_ids, {"ci_runner": "apply-runner"})
+            self.assertEqual(tracking.ci_attempted_instance_ids, ["ci_runner"])
+            delete_apply.assert_not_called()
+            wait_ready.assert_called_once_with(resolved_case, instance_id="ci_runner")
 
     def test_finalize_ci_case_runtime_deletes_each_apply_id_once(self) -> None:
         with tempfile.TemporaryDirectory() as td:

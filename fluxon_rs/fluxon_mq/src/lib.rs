@@ -1,3 +1,4 @@
+pub mod broker;
 pub mod consumer;
 pub mod create;
 pub mod error;
@@ -10,6 +11,7 @@ pub mod nonblocking_monitor;
 pub mod producer;
 pub mod shutdown;
 
+pub use crate::broker::*;
 pub use crate::consumer::DeleteResult;
 pub use crate::consumer::MpscConsumer;
 pub use crate::create::{create_mpsc_channel, ChanCreateConfig};

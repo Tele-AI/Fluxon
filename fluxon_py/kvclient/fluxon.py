@@ -299,6 +299,9 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         self._client: Optional[fluxon_pyo3.KvClient] = None
         self._config = config
         self._init_error: Optional[ApiError] = None
+        self._client_op_lock = threading.RLock()
+        self._closing = False
+        self._closed = False
         cluster_name = config.fluxonkv_spec_cluster_name
         self._blocking_put_outer_total_log_window = _BlockingPutOuterTotalLogWindow(
             f"FluxonKVCacheStore[{cluster_name}]"
@@ -776,20 +779,31 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
     def close(self) -> Result[OkNone, ApiError]:
         """Close and tear down the store."""
         try:
-            # Backend returns a Result; MUST be explicitly consumed to avoid
-            # leaking an unconsumed Result that triggers __del__ assertion.
-            res = self._client.close()
-            if not res.is_ok():
-                # Propagate backend error (already an ApiError)
-                return Result.new_error(res.unwrap_error())
-            # Consume Ok(None-like) to satisfy strict consumption policy
-            _ = res.unwrap()
-            unregister_store_from_cleanup(self)
-            # English note:
-            # After a successful close, clear the backend handle to prevent any further calls and
-            # allow deterministic resource release without relying on Python GC timing.
-            self._client = None
+            with self._client_op_lock:
+                if self._closed:
+                    return Result.new_ok(OkNone())
+                self._closing = True
+                if self._client is None:
+                    self._closed = True
+                    unregister_store_from_cleanup(self)
+                    return Result.new_ok(OkNone())
+                # Backend returns a Result; MUST be explicitly consumed to avoid
+                # leaking an unconsumed Result that triggers __del__ assertion.
+                res = self._client.close()
+                if not res.is_ok():
+                    # Propagate backend error (already an ApiError)
+                    return Result.new_error(res.unwrap_error())
+                # Consume Ok(None-like) to satisfy strict consumption policy
+                _ = res.unwrap()
+                unregister_store_from_cleanup(self)
+                # English note:
+                # After a successful close, clear the backend handle to prevent any further calls and
+                # allow deterministic resource release without relying on Python GC timing.
+                self._client = None
+                self._closed = True
             return Result.new_ok(OkNone())
+        except KeyboardInterrupt as e:
+            return Result.new_error(GeneralError(f"Store close interrupted: {str(e)}"))
         except Exception as e:
             return Result.new_error(GeneralError(f"Failed to close client: {str(e)}"))
 
@@ -892,7 +906,10 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
     # --- Fluxon-kv lease helpers (synchronous) ---
     def allocate_lease(self, ttl_seconds: int) -> Result[int, ApiError]:
         try:
-            inner = self._client.allocate_lease(ttl_seconds)
+            with self._client_op_lock:
+                if self._closing or self._closed or self._client is None:
+                    return Result.new_error(GeneralError("allocate_lease called after store close started"))
+                inner = self._client.allocate_lease(ttl_seconds)
             if not inner.is_ok():
                 return Result.new_error(inner.unwrap_error())
             lease_id = inner.unwrap()
@@ -903,7 +920,10 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
 
     def keepalive_lease(self, lease_id: int) -> Result[OkNone, ApiError]:
         try:
-            inner = self._client.keepalive_lease(lease_id, "kvclient")
+            with self._client_op_lock:
+                if self._closing or self._closed or self._client is None:
+                    return Result.new_ok(OkNone())
+                inner = self._client.keepalive_lease(lease_id, "kvclient")
             if not inner.is_ok():
                 return Result.new_error(inner.unwrap_error())
             # Success returns a None-like sentinel from PyO3; normalize to OkNone

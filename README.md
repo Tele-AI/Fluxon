@@ -32,7 +32,7 @@ Fluxon is designed around these problems. It separates data-plane resources, obj
 - **MQ (Elastic message queue)**: Decouples system dependencies and supports elastic message transport across heterogeneous resource pools
 - **FS (`S3`-compatible file, object, and cache acceleration system)**: Unifies multi-form storage so one system can cache key-value, file, and object data, while supporting remote access, `S3` forwarding, and large-scale cross-cluster migration for AI data and model files
 
-![](./pics/fluxon架构图20260423.png)
+![](./pics/fluxon_architecture.png)
 
 <a id="contents"></a>
 

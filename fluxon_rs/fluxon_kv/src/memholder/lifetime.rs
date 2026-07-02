@@ -448,8 +448,8 @@ impl MemholderManagerTrait for MasterOwnerMemMgr {
 
     const DELETE_SUBMIT_QUEUE_CAPACITY: usize = 1000;
     const DELETE_TARGET_QUEUE_CAPACITY: usize = 1000;
-    const DELETE_MERGE_WINDOW_MILLIS: u64 = 1000;
-    const DELETE_RETRY_INTERVAL_MILLIS: u64 = 1000;
+    const DELETE_MERGE_WINDOW_MILLIS: u64 = 10;
+    const DELETE_RETRY_INTERVAL_MILLIS: u64 = 200;
 
     #[inline]
     fn inner_map(&self) -> &DashMap<Self::Key, Self::Value> {
@@ -737,8 +737,8 @@ impl MemholderManagerTrait for OwnerExternalMemMgr {
 
     const DELETE_SUBMIT_QUEUE_CAPACITY: usize = 1000;
     const DELETE_TARGET_QUEUE_CAPACITY: usize = 1000;
-    const DELETE_MERGE_WINDOW_MILLIS: u64 = 1000;
-    const DELETE_RETRY_INTERVAL_MILLIS: u64 = 1000;
+    const DELETE_MERGE_WINDOW_MILLIS: u64 = 10;
+    const DELETE_RETRY_INTERVAL_MILLIS: u64 = 200;
 
     #[inline]
     fn inner_map(&self) -> &DashMap<Self::Key, Self::Value> {

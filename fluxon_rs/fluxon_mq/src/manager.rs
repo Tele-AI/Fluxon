@@ -206,6 +206,7 @@ pub struct ChanManager {
     /// 决定好 payload lease id，并通过 LeaseManager 注册
     /// 对应的 kvclient keepalive；此处始终持有一个有效句柄。
     pub payload_lease: GeneralLease,
+    pub(crate) capacity: i64,
     pub(crate) etcd_client: etcd::Client,
 }
 
@@ -226,5 +227,9 @@ impl ChanManager {
     /// 时应复用该 lease，而不是额外创建新的 lease。
     pub fn member_lease_id(&self) -> i64 {
         self.member_lease.id() as i64
+    }
+
+    pub fn capacity(&self) -> i64 {
+        self.capacity
     }
 }

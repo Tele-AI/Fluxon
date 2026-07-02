@@ -30,6 +30,8 @@ from fluxon_py.api_error import (  # noqa: E402
     ChanKeyNotFoundError,
     ChanMessageConsumptionError,
     ChanMessageProduceError,
+    ChannelClosedError,
+    MessageConsumptionNoNewMessageError,
     ConsumerRegistrationError,
     ProducerRegistrationError,
 )
@@ -54,6 +56,7 @@ from fluxon_py.api_error import ApiError, Result, OkNone  # noqa: E402
 from fluxon_py._api_ext_chan.mpsc import (  # noqa: E402
     _new_produce_offset_of_all_producer_key,
 )
+from fluxon_py._api_ext_chan import mpsc  # noqa: E402
 from fluxon_py.logging import init_logger  # noqa: E402
 from fluxon_py.tests.test_lib import (  # noqa: E402
     KV_SVC_IP,
@@ -1568,6 +1571,119 @@ def _test_mpsc_channel_suite_once(prefetch: int) -> None:
 
 def test_mpsc_channel_suite() -> None:
     run_with_argmatrix(_test_mpsc_channel_suite_once)
+
+
+def test_mpsc_get_data_clamps_prefetch_target() -> None:
+    consumer = object.__new__(MPSCChanConsumer)
+    consumer.shutdown_ctl = mpsc.MqShutdownCtl()
+    consumer._chan_id = "1"
+    consumer._consumer_id = "2"
+    consumer._dbg_tag = "[MPSCChanConsumer chan_id=1 consumer_idx=2]"
+    consumer._closed_local = True
+
+    observed_targets: List[int] = []
+
+    class _DummyHandle:
+        def get_one_legacy_for_internal_check(
+            self,
+            prefetch_target: int,
+            timeout_ms: Optional[int],
+        ) -> Dict[str, bytes]:
+            observed_targets.append(prefetch_target)
+            return {"payload": b"x"}
+
+    consumer._handle = _DummyHandle()
+
+    res = consumer._get_data_legacy_for_internal_check(
+        batch_size=40,
+        try_time=1,
+        prefetch_num=400,
+    )
+
+    assert res.is_ok()
+    assert observed_targets
+    assert all(target == mpsc.MPSC_PREFETCH_TARGET_MAX for target in observed_targets)
+
+
+def test_mpsc_get_data_returns_partial_batch_on_no_message() -> None:
+    consumer = object.__new__(MPSCChanConsumer)
+    consumer.shutdown_ctl = mpsc.MqShutdownCtl()
+    consumer._chan_id = "1"
+    consumer._consumer_id = "2"
+    consumer._dbg_tag = "[MPSCChanConsumer chan_id=1 consumer_idx=2]"
+    consumer._closed_local = True
+
+    class _DummyHandle:
+        def get_batch(
+            self,
+            batch_size: int,
+            prefetch_target: int,
+            timeout_ms: Optional[int],
+        ) -> List[Dict[str, bytes]]:
+            del batch_size, prefetch_target, timeout_ms
+            return [{"payload": b"x"}]
+
+    consumer._handle = _DummyHandle()
+
+    res = consumer.get_data(batch_size=8, try_time=1, prefetch_num=0)
+
+    assert res.is_ok()
+    assert res.unwrap() == [{"payload": b"x"}]
+
+
+def test_mpsc_get_data_returns_partial_batch_on_channel_closed() -> None:
+    consumer = object.__new__(MPSCChanConsumer)
+    consumer.shutdown_ctl = mpsc.MqShutdownCtl()
+    consumer._chan_id = "1"
+    consumer._consumer_id = "2"
+    consumer._dbg_tag = "[MPSCChanConsumer chan_id=1 consumer_idx=2]"
+    consumer._closed_local = True
+
+    class _DummyHandle:
+        def get_batch(
+            self,
+            batch_size: int,
+            prefetch_target: int,
+            timeout_ms: Optional[int],
+        ) -> List[Dict[str, bytes]]:
+            del batch_size, prefetch_target, timeout_ms
+            return [{"payload": b"x"}]
+
+    consumer._handle = _DummyHandle()
+
+    res = consumer.get_data(batch_size=8, try_time=1, prefetch_num=0)
+
+    assert res.is_ok()
+    assert res.unwrap() == [{"payload": b"x"}]
+
+
+def test_mpsc_get_data_broker_passes_prefetch_target_to_batch() -> None:
+    consumer = object.__new__(MPSCChanConsumer)
+    consumer.shutdown_ctl = mpsc.MqShutdownCtl()
+    consumer._chan_id = "1"
+    consumer._consumer_id = "2"
+    consumer._dbg_tag = "[MPSCChanConsumer chan_id=1 consumer_idx=2]"
+    consumer._closed_local = True
+
+    observed: List[int] = []
+
+    class _DummyHandle:
+        def get_batch(
+            self,
+            batch_size: int,
+            prefetch_target: int,
+            timeout_ms: Optional[int],
+        ) -> List[Dict[str, bytes]]:
+            del batch_size, timeout_ms
+            observed.append(prefetch_target)
+            return [{"payload": b"x"}]
+
+    consumer._handle = _DummyHandle()
+
+    res = consumer.get_data(batch_size=40, try_time=1, prefetch_num=400)
+
+    assert res.is_ok()
+    assert observed == [mpsc.MPSC_PREFETCH_TARGET_MAX]
 
 
 def test_new_or_bind_unique_key_namespace_collision() -> None:

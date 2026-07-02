@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::os::raw::c_void;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use fluxon_kv::memholder::kvclient_encode::{
     BorrowedFlatKvValueRange, FLAT_KV_TYPE_BOOL, FLAT_KV_TYPE_BYTES, FLAT_KV_TYPE_FLOAT64,
@@ -30,23 +31,88 @@ const DLPACK_USED_CAPSULE_NAME_CSTR: &[u8] = b"used_dltensor\0";
 
 #[derive(Clone)]
 pub(crate) enum FlatDictDataOwner {
-    OwnedBytes(Arc<[u8]>),
-    UserMemHolder(Arc<RustMemHolder>),
-    ExternalMemHolder(Arc<RustExternalMemHolder>),
+    OwnedBytes(Arc<FlatDictOwnedBytes>),
+    UserMemHolder(Arc<FlatDictUserMemHolder>),
+    ExternalMemHolder(Arc<FlatDictExternalMemHolder>),
 }
 
 impl FlatDictDataOwner {
     pub(crate) fn from_owned_bytes(bytes: Vec<u8>) -> Self {
-        Self::OwnedBytes(Arc::<[u8]>::from(bytes))
+        Self::OwnedBytes(Arc::new(FlatDictOwnedBytes {
+            bytes: Arc::<[u8]>::from(bytes),
+        }))
+    }
+
+    pub(crate) fn from_user_memholder(holder: Arc<RustMemHolder>) -> Self {
+        Self::UserMemHolder(Arc::new(FlatDictUserMemHolder { holder }))
+    }
+
+    pub(crate) fn from_external_memholder(holder: Arc<RustExternalMemHolder>) -> Self {
+        Self::ExternalMemHolder(Arc::new(FlatDictExternalMemHolder { holder }))
     }
 
     fn bytes(&self) -> &[u8] {
         match self {
-            Self::OwnedBytes(bytes) => bytes.as_ref(),
-            Self::UserMemHolder(holder) => holder.bytes(),
-            Self::ExternalMemHolder(holder) => holder.bytes(),
+            Self::OwnedBytes(owner) => owner.bytes.as_ref(),
+            Self::UserMemHolder(owner) => owner.holder.bytes(),
+            Self::ExternalMemHolder(owner) => owner.holder.bytes(),
         }
     }
+}
+
+pub(crate) type FlatDictCleanup = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Clone)]
+pub(crate) struct FlatDictSharedCleanup {
+    state: Arc<FlatDictSharedCleanupState>,
+}
+
+struct FlatDictSharedCleanupState {
+    remaining_views: AtomicUsize,
+    cleanup: Mutex<Option<FlatDictCleanup>>,
+}
+
+impl FlatDictSharedCleanup {
+    fn new(view_count: usize, cleanup: FlatDictCleanup) -> Self {
+        assert!(
+            view_count > 0,
+            "flatdict cleanup requires at least one view"
+        );
+        Self {
+            state: Arc::new(FlatDictSharedCleanupState {
+                remaining_views: AtomicUsize::new(view_count),
+                cleanup: Mutex::new(Some(cleanup)),
+            }),
+        }
+    }
+
+    fn release(self) {
+        let previous = self.state.remaining_views.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous > 0, "flatdict cleanup released too many times");
+        if previous == 1 {
+            let cleanup = self.state.cleanup.lock().unwrap().take();
+            run_flatdict_cleanup(cleanup);
+        }
+    }
+}
+
+pub(crate) struct FlatDictOwnedBytes {
+    bytes: Arc<[u8]>,
+}
+
+pub(crate) struct FlatDictUserMemHolder {
+    holder: Arc<RustMemHolder>,
+}
+
+pub(crate) struct FlatDictExternalMemHolder {
+    holder: Arc<RustExternalMemHolder>,
+}
+
+fn run_flatdict_cleanup(cleanup: Option<FlatDictCleanup>) {
+    let Some(cleanup) = cleanup else {
+        return;
+    };
+    cleanup();
 }
 
 pub(crate) struct FlatDictEncodePlan {
@@ -254,6 +320,7 @@ pub(crate) struct FlatDictDLPackView {
     bits: u8,
     lanes: u16,
     shape: Arc<[i64]>,
+    cleanup: Mutex<Option<FlatDictSharedCleanup>>,
 }
 
 #[pymethods]
@@ -300,6 +367,32 @@ impl FlatDictDLPackView {
             bits,
             lanes,
             shape,
+            cleanup: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn attach_cleanup(
+        &self,
+        cleanup: FlatDictSharedCleanup,
+    ) -> Result<(), FlatDictSharedCleanup> {
+        let mut guard = self.cleanup.lock().unwrap();
+        if guard.is_some() {
+            return Err(cleanup);
+        }
+        *guard = Some(cleanup);
+        Ok(())
+    }
+
+    fn has_cleanup(&self) -> bool {
+        self.cleanup.lock().unwrap().is_some()
+    }
+}
+
+impl Drop for FlatDictDLPackView {
+    fn drop(&mut self) {
+        let cleanup = self.cleanup.get_mut().unwrap().take();
+        if let Some(cleanup) = cleanup {
+            cleanup.release();
         }
     }
 }
@@ -1001,4 +1094,95 @@ pub(crate) fn decode_flat_dict_to_wrapped_py_object(
         }
     }
     Ok(dict.into())
+}
+
+pub(crate) fn attach_cleanup_to_flatdict_pyobject<F>(
+    py: Python<'_>,
+    obj: &PyObject,
+    make_cleanup: F,
+) -> bool
+where
+    F: FnOnce() -> FlatDictCleanup,
+{
+    let any = obj.bind(py);
+    let Ok(dict) = any.downcast::<PyDict>() else {
+        return false;
+    };
+    let mut seen_views = HashSet::<usize>::new();
+    let mut view_count = 0usize;
+    for value in dict.values() {
+        if let Ok(view) = value.extract::<PyRef<'_, FlatDictDLPackView>>() {
+            let view_ptr = (&*view as *const FlatDictDLPackView) as usize;
+            if !seen_views.insert(view_ptr) {
+                continue;
+            }
+            if view.has_cleanup() {
+                return false;
+            }
+            view_count += 1;
+        }
+    }
+    if view_count == 0 {
+        return false;
+    }
+
+    let cleanup = FlatDictSharedCleanup::new(view_count, make_cleanup());
+    let mut seen_views = HashSet::<usize>::new();
+    for value in dict.values() {
+        if let Ok(view) = value.extract::<PyRef<'_, FlatDictDLPackView>>() {
+            let view_ptr = (&*view as *const FlatDictDLPackView) as usize;
+            if !seen_views.insert(view_ptr) {
+                continue;
+            }
+            assert!(
+                view.attach_cleanup(cleanup.clone()).is_ok(),
+                "flatdict cleanup attach must succeed after pre-check"
+            );
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::PyDict;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn cleanup_waits_for_all_dlpack_views() {
+        Python::with_gil(|py| {
+            let owner = FlatDictDataOwner::from_owned_bytes(vec![0u8; 16]);
+            let shape = Arc::<[i64]>::from(vec![8_i64]);
+            let view1 = Py::new(
+                py,
+                FlatDictDLPackView::new(owner.clone(), 0, 8, 1, 8, 1, shape.clone()),
+            )
+            .unwrap();
+            let view2 = Py::new(py, FlatDictDLPackView::new(owner, 8, 8, 1, 8, 1, shape)).unwrap();
+
+            let dict = PyDict::new_bound(py);
+            dict.set_item("a", view1.bind(py)).unwrap();
+            dict.set_item("b", view2.bind(py)).unwrap();
+
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_for_cleanup = hits.clone();
+            let dict_obj = dict.into_any().into_py(py);
+            assert!(attach_cleanup_to_flatdict_pyobject(py, &dict_obj, || {
+                let hits_for_cleanup = hits_for_cleanup.clone();
+                Box::new(move || {
+                    hits_for_cleanup.fetch_add(1, Ordering::SeqCst);
+                })
+            }));
+
+            drop(dict_obj);
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+            drop(view1);
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+            drop(view2);
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        });
+    }
 }

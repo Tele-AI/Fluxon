@@ -74,12 +74,10 @@ impl ClosedLocalSegmentLeaseRegistry {
     where
         G: Send + Sync + 'static,
     {
-        let boxed = self
-            .guards
-            .lock()
-            .await
-            .remove(&handle)
-            .ok_or_else(|| format!("closed sdk local segment lease handle {handle} not found"))?;
+        let boxed =
+            self.guards.lock().await.remove(&handle).ok_or_else(|| {
+                format!("closed sdk local segment lease handle {handle} not found")
+            })?;
         boxed.downcast::<G>().map(|guard| *guard).map_err(|_| {
             format!(
                 "closed sdk local segment lease handle {handle} has unexpected runtime guard type"
@@ -461,7 +459,7 @@ impl ClientTransferEngineCore {
                 len,
                 seg_guard,
             )
-                .await
+            .await
         }
     }
 
@@ -482,7 +480,11 @@ impl ClientTransferEngineCore {
             let initial_local_segment_guard = match seg_guard {
                 Some(guard) => Some(guard),
                 None if runtime.supports_local_segment_transfer() => {
-                    let local_addr = if peer_src_or_target { target_addr } else { src_addr };
+                    let local_addr = if peer_src_or_target {
+                        target_addr
+                    } else {
+                        src_addr
+                    };
                     match runtime.ensure_local_segment_guard(local_addr, None).await {
                         Ok(guard) => Some(guard),
                         Err(_) => None,

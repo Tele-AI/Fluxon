@@ -147,9 +147,9 @@ RUNTIME_LAYER_ORDER = (
     RUNTIME_LAYER_CASE,
 )
 CI_BASE_RUNTIME_SERVICE_IDS = ("etcd", "greptime")
-CI_CLUSTER_MEMBER_INSTANCE_IDS = ("master", "owner_0")
-CI_CLUSTER_RUNTIME_INSTANCE_IDS = ("master", "owner_0")
-CI_CASE_RUNTIME_INSTANCE_IDS = ("master", "owner_0", "ci_runner")
+CI_CLUSTER_MEMBER_INSTANCE_IDS = ("master", "owner_0", "broker")
+CI_CLUSTER_RUNTIME_INSTANCE_IDS = ("master", "owner_0", "broker")
+CI_CASE_RUNTIME_INSTANCE_IDS = ("master", "owner_0", "broker", "ci_runner")
 CI_CLUSTER_RUNTIME_REMOTE_STAGE_INCLUDE_RELPATHS = (
     "configs",
     "src/fluxon_py/runtime",
@@ -158,6 +158,7 @@ CI_CLUSTER_RUNTIME_REMOTE_STAGE_INCLUDE_RELPATHS = (
 )
 CI_CLUSTER_RUNTIME_REMOTE_STAGE_VERIFY_RELPATHS = (
     "src/fluxon_py/runtime/start_master.py",
+    "src/fluxon_py/runtime/start_broker.py",
     "src/fluxon_py/runtime/start_owner_kvclient.py",
 )
 CI_RUNNER_REMOTE_STAGE_INCLUDE_RELPATHS = (
@@ -3004,6 +3005,8 @@ def _ci_cluster_runtime_stage(resolved_case: Dict[str, Any]) -> _RemoteRunDirSta
         verify_relpaths.append("configs/ci_owner_0.yaml")
     if _ci_has_instance(resolved_case, instance_id="master"):
         verify_relpaths.append("configs/ci_master.yaml")
+    if _ci_has_instance(resolved_case, instance_id="broker"):
+        verify_relpaths.append("configs/ci_broker.yaml")
     return _RemoteRunDirStage(
         archive_prefix="fluxon_ci_cluster_runtime_run_dir__",
         stage_prefix="fluxon_ci_cluster_runtime_stage_",
@@ -3020,6 +3023,8 @@ def _ci_runner_runtime_stage(resolved_case: Dict[str, Any]) -> _RemoteRunDirStag
         verify_relpaths.append("configs/ci_owner_0.yaml")
     if _ci_has_instance(resolved_case, instance_id="master"):
         verify_relpaths.append("configs/ci_master.yaml")
+    if _ci_has_instance(resolved_case, instance_id="broker"):
+        verify_relpaths.append("configs/ci_broker.yaml")
     include_relpaths = list(CI_RUNNER_REMOTE_STAGE_INCLUDE_RELPATHS)
     if _ci_runtime_contract_id(resolved_case) == CI_RUNTIME_CONTRACT_CLUSTER_KV_OWNER:
         for relpath in ("fluxon_release", "test_rsc"):
@@ -3114,15 +3119,34 @@ def _compile_case_plan(resolved_case: Dict[str, Any]) -> _CasePlan:
         prepare_instance_ids = _ci_cluster_runtime_instance_ids(resolved_case)
         prepare_phases: Tuple[_RuntimePhase, ...] = ()
         if prepare_instance_ids:
-            prepare_phases = (
-                _RuntimePhase(
-                    phase_id="cluster_runtime",
-                    layer=RUNTIME_LAYER_CASE,
-                    instance_ids=prepare_instance_ids,
-                    write_ctx="CI",
-                    stage_run_dir=_ci_cluster_runtime_stage(resolved_case),
-                ),
+            prepare_phase_list: List[_RuntimePhase] = []
+            broker_prepare_ids = tuple(
+                instance_id for instance_id in prepare_instance_ids if instance_id == "broker"
             )
+            cluster_prepare_ids = tuple(
+                instance_id for instance_id in prepare_instance_ids if instance_id != "broker"
+            )
+            if cluster_prepare_ids:
+                prepare_phase_list.append(
+                    _RuntimePhase(
+                        phase_id="cluster_runtime",
+                        layer=RUNTIME_LAYER_CASE,
+                        instance_ids=cluster_prepare_ids,
+                        write_ctx="CI",
+                        stage_run_dir=_ci_cluster_runtime_stage(resolved_case),
+                    )
+                )
+            if broker_prepare_ids:
+                prepare_phase_list.append(
+                    _RuntimePhase(
+                        phase_id="broker_runtime",
+                        layer=RUNTIME_LAYER_CASE,
+                        instance_ids=broker_prepare_ids,
+                        write_ctx="CI",
+                        stage_run_dir=_ci_cluster_runtime_stage(resolved_case),
+                    )
+                )
+            prepare_phases = tuple(prepare_phase_list)
         return _CasePlan(
             case_family=case_family,
             prepare_phases=prepare_phases,
@@ -3666,6 +3690,9 @@ def _wait_ci_instance_ready(resolved_case: Dict[str, Any], *, instance_id: str) 
             mmap_file_path=mmap_file_path,
             timeout_s=CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S,
         )
+        return
+    if instance_id == "broker":
+        _wait_instance_running(resolved_case, instance_id=instance_id, timeout_s=60)
         return
     if instance_id == "ci_runner":
         _wait_instance_running(resolved_case, instance_id=instance_id, timeout_s=30)
@@ -5938,7 +5965,7 @@ def _validate_profile_ci_runtime_block(runtime: Dict[str, Any], ctx: str, target
             f"{tpl_ctx}.deployer",
         )
         target = _require_str(deployer.get("target"), f"{tpl_ctx}.deployer.target")
-        if instance_id in ("owner_0", "ci_runner"):
+        if instance_id in ("owner_0", "broker", "ci_runner"):
             if target != "__TARGET__":
                 raise ValueError(f"{tpl_ctx}.deployer.target must be '__TARGET__'")
         elif target not in target_ip_map:
@@ -8690,12 +8717,33 @@ def _ci_materialized_target_for_instance(*, topology: Any, targets: Dict[str, An
     primary = _require_str(targets.get("primary"), f"{ctx}.targets.primary")
     if instance_id == "master":
         return primary
-    if instance_id in ("owner_0", "ci_runner"):
+    if instance_id in ("owner_0", "broker", "ci_runner"):
         if machine_count == 1:
             return primary
         if machine_count == 2:
             return _require_str(targets.get("secondary"), f"{ctx}.targets.secondary")
     raise ValueError(f"{ctx} unsupported CI instance id for placement: {instance_id}")
+
+
+def _default_ci_broker_runtime_template() -> Dict[str, Any]:
+    return {
+        "lifecycle": "service",
+        "k8s_ref": "deployment/broker",
+        "deployer": {
+            "target": "__TARGET__",
+            "command": ["/bin/bash", "-lc"],
+            "args": [
+                """
+set -euo pipefail
+cd __RUN_DIR__/src
+mkdir -p __RUN_DIR__/services/broker
+exec __RUN_DIR__/venv/bin/python3 -m fluxon_py.runtime.start_broker \\
+  -c __RUN_DIR__/configs/ci_broker.yaml \\
+  -w __RUN_DIR__/services/broker
+""".strip()
+            ],
+        },
+    }
 
 
 def _compile_ci_case(resolved_case: Dict[str, Any]) -> None:
@@ -8708,13 +8756,24 @@ def _compile_ci_case(resolved_case: Dict[str, Any]) -> None:
     profile_ci = _require_dict(profile.get("ci"), "resolved_case.profile.ci")
     runtime_templates = _require_dict(profile_ci.get("runtime"), "resolved_case.profile.ci.runtime")
     deploy = _require_dict(resolved_case.get("deploy"), "resolved_case.deploy")
-    case_runtime_templates = _require_dict(
-        runtime_templates.get(RUNTIME_LAYER_CASE),
-        f"resolved_case.profile.ci.runtime.{RUNTIME_LAYER_CASE}",
+    case_runtime_templates = copy.deepcopy(
+        _require_dict(
+            runtime_templates.get(RUNTIME_LAYER_CASE),
+            f"resolved_case.profile.ci.runtime.{RUNTIME_LAYER_CASE}",
+        )
     )
+    if (
+        "master" in case_runtime_templates
+        and "owner_0" in case_runtime_templates
+        and "ci_runner" in case_runtime_templates
+        and "broker" not in case_runtime_templates
+    ):
+        case_runtime_templates["broker"] = _default_ci_broker_runtime_template()
 
     ordered_instance_ids = [
-        instance_id for instance_id in CI_CASE_RUNTIME_INSTANCE_IDS if instance_id in case_runtime_templates
+        instance_id
+        for instance_id in CI_CASE_RUNTIME_INSTANCE_IDS
+        if instance_id in case_runtime_templates
     ]
     if not ordered_instance_ids:
         raise ValueError("resolved_case.profile.ci.runtime.case_runtime must be non-empty")
@@ -13738,6 +13797,7 @@ def _write_ci_master_owner_configs(
     owner_dram_bytes: int,
 ) -> tuple[Path, Path]:
     owner_work_root = run_dir / "services" / "owner_0"
+    broker_work_root = run_dir / "services" / "broker"
     master_cfg = {
         "etcd_endpoints": ["__ETCD__"],
         "cluster_name": cluster_name,
@@ -13773,6 +13833,15 @@ def _write_ci_master_owner_configs(
         },
     }
 
+    broker_cfg = {
+        "instance_key": "ci_broker",
+        "contribute_to_cluster_pool_size": {"dram": 0, "vram": {}},
+        "fluxonkv_spec": {
+            "cluster_name": cluster_name,
+            "share_mem_path": share_mem_path,
+        },
+    }
+
     etcd_ip = _ci_base_runtime_service_target_ip(resolved_case, service_id="etcd")
     etcd_port = _ci_base_runtime_service_port(resolved_case, service_id="etcd")
     greptime_ip = _ci_base_runtime_service_target_ip(resolved_case, service_id="greptime")
@@ -13796,8 +13865,12 @@ def _write_ci_master_owner_configs(
     cfg_dir.mkdir(parents=True, exist_ok=True)
     master_path = cfg_dir / "ci_master.yaml"
     owner_path = cfg_dir / "ci_owner_0.yaml"
+    broker_path = cfg_dir / "ci_broker.yaml"
     _write_yaml_file(master_path, master_cfg)
     _write_yaml_file(owner_path, owner_cfg)
+    if _ci_has_instance(resolved_case, instance_id="broker"):
+        broker_work_root.mkdir(parents=True, exist_ok=True)
+        _write_yaml_file(broker_path, broker_cfg)
     return master_path, owner_path
 
 
@@ -16024,6 +16097,8 @@ def _ui_ops_logs_base_url(controller_url: str) -> str:
 def _ui_test_stack_member_role_for_instance_id(instance_id: str) -> str:
     if instance_id == "master":
         return "master"
+    if instance_id == "broker":
+        return "broker"
     return "owner_client"
 
 

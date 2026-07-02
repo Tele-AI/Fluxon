@@ -1230,6 +1230,7 @@ dependencies = [
  "fluxon_commu",
  "fluxon_framework",
  "fluxon_framework_compiled",
+ "fluxon_mq",
  "fluxon_observability",
  "fluxon_util",
  "futures",
@@ -1275,6 +1276,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bitcode",
  "downcast-rs",
  "etcd-client",
  "fluxon_commu",

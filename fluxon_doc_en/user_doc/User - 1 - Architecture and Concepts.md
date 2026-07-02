@@ -8,7 +8,7 @@ This page explains the core concepts and config fields that appear throughout th
 
 ### System Overview
 
-![](../../pics/架构全景图.png)
+![](../../pics/fluxon_architecture_overview.png)
 
 - Control plane / metadata: `etcd + Master` for members, leases, routing, and connection-state metadata
 - Data plane: `shared memory + transfer engine` for same-host reuse and cross-node data transfer

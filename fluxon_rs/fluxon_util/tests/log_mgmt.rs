@@ -59,7 +59,10 @@ fn kv_log_shards_roll_and_cleanup_with_test_window() {
         .expect("unix epoch")
         .as_secs() as i64;
     let _window_guard = EnvVarGuard::set(TEST_LOG_SHARD_WINDOW_SECONDS_ENV, "10");
-    let _anchor_guard = EnvVarGuard::set(TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS_ENV, (now - 2).to_string());
+    let _anchor_guard = EnvVarGuard::set(
+        TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS_ENV,
+        (now - 2).to_string(),
+    );
 
     fluxon_util::init_log(log_path, instance_key);
     tracing::info!(target: "fluxon_util", "[kv-log-mgmt][phase=before] ts={}", now);
@@ -115,7 +118,8 @@ fn resolve_readable_log_path_ignores_plain_base_log_when_daily_shards_exist() {
     let shard_path = temp_dir.path().join("startup.2026-06-21.log");
     fs::write(&shard_path, "shard\n").expect("write shard log");
 
-    let resolved = fluxon_util::resolve_readable_log_path(&base_path).expect("resolve readable log path");
+    let resolved =
+        fluxon_util::resolve_readable_log_path(&base_path).expect("resolve readable log path");
     assert_eq!(resolved, shard_path);
 }
 
@@ -128,7 +132,7 @@ fn latest_existing_daily_sharded_log_path_skips_invalid_candidates() {
     fs::write(&invalid_shard_path, "invalid\n").expect("write invalid shard");
     fs::write(&valid_shard_path, "valid\n").expect("write valid shard");
 
-    let resolved =
-        fluxon_util::latest_existing_daily_sharded_log_path(&base_path).expect("resolve latest shard");
+    let resolved = fluxon_util::latest_existing_daily_sharded_log_path(&base_path)
+        .expect("resolve latest shard");
     assert_eq!(resolved, valid_shard_path);
 }

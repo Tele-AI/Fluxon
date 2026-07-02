@@ -311,6 +311,7 @@ pub async fn create_mpsc_channel(
         global_lease: global_lease_handle,
         global_long_lease: global_long_lease_handle,
         payload_lease: payload_lease_handle,
+        capacity: cfg.capacity,
         etcd_client,
     })
 }
@@ -534,6 +535,7 @@ impl ChanManager {
             global_lease,
             global_long_lease,
             payload_lease,
+            capacity: meta.capacity,
             etcd_client: client,
         })
     }

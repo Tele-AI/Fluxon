@@ -86,6 +86,10 @@ use external_client_api::{ExternalClientApi, ExternalClientApiNewArg};
 use fluxon_commu::TransferBackendActivationMode;
 use fluxon_framework::LogicalModule;
 use fluxon_framework::{AnyResult, define_framework};
+use fluxon_mq::{
+    FLUXON_MQ_COMPONENT_BROKER_METADATA_VALUE, FLUXON_MQ_COMPONENT_METADATA_KEY,
+    register_broker_service,
+};
 use master_kv_router::{MasterKvRouter, MasterKvRouterNewArg};
 use master_seg_manager::MasterSegManager;
 use metric_reporter::{
@@ -192,6 +196,11 @@ pub(crate) struct ClientRunTestOverrides {
 pub(crate) struct MasterRunTestOverrides {
     pub rdma_control_init: ClusterManagerRdmaControlInit,
     pub transfer_backend_activation_mode: Option<TransferBackendActivationMode>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BrokerRunTestOverrides {
+    pub rdma_control_init: ClusterManagerRdmaControlInit,
 }
 
 /// Result of a unified `get` that carries the role-specific holder types.
@@ -456,6 +465,12 @@ struct Cli {
 enum Commands {
     /// Run as master node
     Master {
+        /// Configuration file path
+        #[arg(short = 'f', long = "config")]
+        config: Option<PathBuf>,
+    },
+    /// Run as broker node
+    Broker {
         /// Configuration file path
         #[arg(short = 'f', long = "config")]
         config: Option<PathBuf>,
@@ -1336,6 +1351,15 @@ pub async fn entry() -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
         }
+        Commands::Broker { config } => {
+            let config_arg = config.map_or(ConfigArg::None, ConfigArg::File);
+            let (framework, _) = run_broker(config_arg).await?;
+            framework.wait_shutdown_signal().await;
+            framework
+                .shutdown()
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+        }
         Commands::Client { config } => {
             let config_arg = config.map_or(ConfigArg::None, ConfigArg::File);
             let (framework, _) = run_client(config_arg).await?;
@@ -1546,6 +1570,205 @@ pub async fn run_master(
     config_arg: ConfigArg<MasterConfig>,
 ) -> Result<(Arc<Framework>, MasterConfig)> {
     run_master_impl(config_arg, None).await
+}
+
+async fn run_broker_impl(
+    config_arg: ConfigArg<ClientConfig>,
+    test_overrides: Option<BrokerRunTestOverrides>,
+) -> Result<(Arc<Framework>, ClientConfig)> {
+    #[cfg(unix)]
+    segfault_handler::install_sigsegv_classifier();
+
+    println!("Starting cache backend in BROKER mode");
+
+    let build_version = fluxon_util::git_version_build_record::get_current_git_commitid().unwrap();
+    let source_sha256 = fluxon_util::build_info::SOURCE_SHA256;
+    println!("Build version (git commit): {}", build_version);
+    println!("Build version (source-sha256): {}", source_sha256);
+
+    let config = load_client_config(config_arg)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load broker config: {}", e))?;
+
+    let dram = config.contribute_to_cluster_pool_size.dram;
+    let vram_is_zero = config
+        .contribute_to_cluster_pool_size
+        .vram
+        .values()
+        .all(|&v| v == 0);
+    if dram != 0 || !vram_is_zero {
+        anyhow::bail!(
+            "broker config must be a zero-contribution external-client config; instance_key={}",
+            config.instance_key
+        );
+    }
+    if matches!(
+        config.test_spec_config.side_transfer_role,
+        Some(SideTransferRole::Worker)
+    ) {
+        anyhow::bail!(
+            "broker config must not set test_spec_config.side_transfer_role=worker; instance_key={}",
+            config.instance_key
+        );
+    }
+
+    unsafe {
+        std::env::set_var(
+            "FLUXON_ENABLE_ICEORYX_LOGS",
+            if config.test_spec_config.enable_iceoryx_logs {
+                "1"
+            } else {
+                "0"
+            },
+        );
+    }
+
+    let config = bootstrap_zero_contribution_client_config(config).await?;
+
+    let kv_logs_dir = config
+        .large_file_paths
+        .kv_logs_dir(&config.cluster_name)
+        .map_err(|e| anyhow::anyhow!("invalid large_file_paths for broker kv logs: {}", e))?;
+    let observability_disabled = config.test_spec_config.disable_observability;
+    let greptime_tracing_rx = if observability_disabled {
+        fluxon_util::init_log(&kv_logs_dir, &config.instance_key);
+        None
+    } else {
+        let (greptime_tracing_layer, greptime_tracing_rx) =
+            fluxon_observability::greptime_otlp_tracing::new_tracing_layer(
+                crate::config::DEFAULT_OTLP_LOG_MAX_QUEUE_LINES,
+            );
+        fluxon_util::init_log_with_extra_layer(
+            &kv_logs_dir,
+            &config.instance_key,
+            greptime_tracing_layer,
+        );
+        Some(greptime_tracing_rx)
+    };
+    info!("Broker config: {:?}", config);
+    info!("Build version (git commit): {}", build_version);
+    info!("Build version (source-sha256): {}", source_sha256);
+
+    let mut metadata = HashMap::from([
+        ("external_client".to_string(), "true".to_string()),
+        (
+            FLUXON_MQ_COMPONENT_METADATA_KEY.to_string(),
+            FLUXON_MQ_COMPONENT_BROKER_METADATA_VALUE.to_string(),
+        ),
+        ("version".to_string(), build_version.clone()),
+    ]);
+    merge_startup_member_metadata(&mut metadata, HashMap::new())?;
+
+    let rdma_control_init = test_overrides
+        .as_ref()
+        .map(|overrides| overrides.rdma_control_init.clone())
+        .or_else(|| test_spec_config_rdma_control_init(Some(&config.test_spec_config)))
+        .unwrap_or_else(|| cluster_manager_rdma_control_init_from_config(&config));
+
+    let init_args = InitArgsBroker {
+        cluster_manager_arg: ClusterManagerNewArg {
+            etcd_endpoints: config.fluxonkv_spec.etcd_addresses.clone(),
+            cluster_name: config.cluster_name.clone(),
+            instance_name: Some(config.instance_key.clone()),
+            port: None,
+            metadata,
+            local_ipc_root: cluster_manager_local_ipc_root(
+                &config.share_mem_path,
+                &config.test_spec_config,
+            ),
+            rdma_control_init,
+            sub_cluster: config.fluxonkv_spec.sub_cluster.clone(),
+            network: None,
+        },
+        p2p_arg: P2pModuleNewArg::new(
+            config.fluxonkv_spec.p2p_listen_port,
+            tcp_thread_transport_tuning_from_test_spec_config(&config.test_spec_config),
+            config.test_spec_config.disable_crossowner_ipc,
+            config.test_spec_config.iceoryx_external_busy_poll,
+        )
+        .with_iceoryx_owner_client_busy_poll(config.test_spec_config.iceoryx_owner_client_busy_poll)
+        .with_user_rpc_sync_handler_thread_count(
+            config.test_spec_config.user_rpc_sync_handler_thread_count,
+        ),
+        metric_reporter_arg: MetricReporterNewArg {
+            test_spec_config: config.test_spec_config.clone(),
+        },
+        external_client_api_arg: ExternalClientApiNewArg {
+            share_mem_path: config.share_mem_path.clone(),
+            large_file_paths: config.large_file_paths.clone(),
+            expected_cluster_name: config.cluster_name.clone(),
+            expected_protocol_version: build_version.clone(),
+            enable_side_transfer: config.test_spec_config.enable_side_transfer,
+            short_circuit_put_payload_path: config.test_spec_config.short_circuit_put_payload_path,
+        },
+    };
+
+    let framework = Framework::new(format!(
+        "fluxon_kv.broker:{}:{}",
+        config.cluster_name, config.instance_key
+    ));
+    info!("Initializing broker framework...");
+
+    init_framework_broker(&framework, init_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to initialize broker framework: {:#}", e))?;
+    register_broker_service(framework.p2p_view().clone(), 4096);
+
+    let framework = Arc::new(framework);
+
+    if !observability_disabled {
+        let otlp_cluster_name = config.cluster_name.clone();
+        let otlp_member_id = config.instance_key.clone();
+        let cm_view = framework.cluster_manager_view().clone();
+        let p2p_view = framework.p2p_view().clone();
+        let spawner = cm_view.clone();
+        let _ = spawner.spawn("wait_master_otlp_log_api_broker", async move {
+            let outcome = wait_master_observe_broadcast(
+                &cm_view,
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(10),
+            )
+            .await;
+            let Some(cfg) = outcome.otlp_log_api() else {
+                warn!(
+                    "Broker OTLP log exporter disabled: master metadata does not carry otlp_log_api"
+                );
+                return;
+            };
+
+            start_greptime_otlp_tracing_exporter_kv(
+                cm_view,
+                p2p_view,
+                Some(cfg),
+                greptime_tracing_rx,
+                &otlp_cluster_name,
+                fluxon_observability::types::FluxonMemberRole::Broker,
+                &otlp_member_id,
+            );
+        });
+    }
+
+    let shutdown_waiter = framework.cluster_manager_view().register_shutdown_waiter();
+    let kv_profiles_dir = config
+        .large_file_paths
+        .kv_profiles_dir(&config.cluster_name)
+        .map_err(|e| anyhow::anyhow!("invalid large_file_paths for broker kv profiles: {}", e))?;
+    profile::spawn_pprof_flamegraph_on_timeout_or_shutdown(
+        config.pprof_duration_seconds,
+        kv_profiles_dir,
+        config.cluster_name.clone(),
+        profile::PprofRole::Broker,
+        config.instance_key.clone(),
+        shutdown_waiter,
+    );
+
+    Ok((framework, config))
+}
+
+pub async fn run_broker(
+    config_arg: ConfigArg<ClientConfig>,
+) -> Result<(Arc<Framework>, ClientConfig)> {
+    run_broker_impl(config_arg, None).await
 }
 
 #[cfg(feature = "test_bins")]
@@ -2736,8 +2959,8 @@ mod tests {
             large_file_paths: crate::config::LargeFilePaths {
                 paths: vec![owner_large_root.to_string_lossy().into_owned()],
             },
-            protocol_version:
-                fluxon_util::git_version_build_record::get_current_git_commitid().unwrap(),
+            protocol_version: fluxon_util::git_version_build_record::get_current_git_commitid()
+                .unwrap(),
             write_ts: Some(chrono::Utc::now().timestamp_micros()),
         };
         let shared_meta_json = serde_json::to_string(&shared_meta).unwrap();

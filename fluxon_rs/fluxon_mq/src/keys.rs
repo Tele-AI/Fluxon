@@ -1,9 +1,13 @@
 use std::fmt::Write as _;
 
+use bitcode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
+
 /// MQ category for key generation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Encode, Decode)]
 pub enum MqCategory {
     /// Standalone MPSC usage
+    #[default]
     Mpsc,
     /// MPSC acts as a submodule under an MPMC producer; carries parent mpmc id only.
     /// The producer member id is the same as `producer_idx` passed alongside and

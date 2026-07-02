@@ -51,6 +51,26 @@ pub(crate) fn pyerr_message_consumption_no_new_message(
     })
 }
 
+pub(crate) fn pyerr_channel_closed(py: Python<'_>, message: &str, channel_id: i64) -> PyErr {
+    build_ext_error(py, "ChannelClosedError", message, |kw| {
+        kw.set_item("channel_id", channel_id).unwrap();
+    })
+}
+
+pub(crate) fn pyerr_producer_closed(
+    py: Python<'_>,
+    message: &str,
+    channel_id: i64,
+    producer_idx: Option<&str>,
+) -> PyErr {
+    build_ext_error(py, "ProducerClosedError", message, |kw| {
+        kw.set_item("channel_id", channel_id).unwrap();
+        if let Some(p) = producer_idx {
+            kw.set_item("producer_idx", p).unwrap();
+        }
+    })
+}
+
 pub(crate) fn pyerr_message_consumption(
     py: Python<'_>,
     message: &str,
@@ -84,6 +104,18 @@ pub(crate) fn pyerr_chan_message_produce(
         if let Some(id) = message_id {
             kw.set_item("message_id", id).unwrap();
         }
+    })
+}
+
+pub(crate) fn pyerr_message_buffer_full(
+    py: Python<'_>,
+    message: &str,
+    channel_id: i64,
+    buffer_size: i64,
+) -> PyErr {
+    build_ext_error(py, "MessageBufferFullError", message, |kw| {
+        kw.set_item("channel_id", channel_id).unwrap();
+        kw.set_item("buffer_size", buffer_size).unwrap();
     })
 }
 
@@ -264,10 +296,13 @@ pub(crate) fn new_store_closed_error(py: Python<'_>, message: &str) -> PyObject 
 pub(crate) fn new_result_success(py: Python<'_>, value: PyObject) -> PyObject {
     let api_error_module = py.import_bound("fluxon_py.api_error").unwrap();
     let result_class = api_error_module.getattr("Result").unwrap();
-    result_class
-        .call_method1("new_ok", (value,))
-        .unwrap()
-        .into()
+    match result_class.call_method1("new_ok", (value,)) {
+        Ok(obj) => obj.into(),
+        Err(err) => {
+            let message = format!("Failed to build Result.new_ok: {}", err);
+            new_result_error(py, new_general_error(py, &message))
+        }
+    }
 }
 
 pub(crate) fn new_result_error(py: Python<'_>, error: PyObject) -> PyObject {

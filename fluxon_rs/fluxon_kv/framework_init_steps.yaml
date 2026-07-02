@@ -4,6 +4,8 @@ title: fluxon_kv init
 variants:
   - id: master
     tags: [master]
+  - id: broker
+    tags: [broker, external]
   - id: owner
     tags: [owner]
   - id: external
@@ -20,8 +22,8 @@ variants:
 # - A step depends on a resource by declaring `deps: ["res:<resource_id>"]`.
 resources:
   - id: cluster_member_watch_ready
-    tags: [master, owner, external]
-    publish_tags: [master, owner, external]
+    tags: [master, broker, owner, external]
+    publish_tags: [master, broker, owner, external]
     published_by: ClusterManager.step.1.init2
     doc: |
       - ClusterManager: member watch is established and continuous observation is available
@@ -56,8 +58,8 @@ resources:
 #   `Framework.step.0.attach_views`.
 
 module_tags:
-  ClusterManager: [master, owner, external]
-  P2pModule: [master, owner, external]
+  ClusterManager: [master, broker, owner, external]
+  P2pModule: [master, broker, owner, external]
   MasterSegManager: [master]
   MasterKvRouter: [master]
   MetricReporter: [master, owner, external]

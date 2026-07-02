@@ -378,13 +378,6 @@ def _execute_ci_case(
         ),
     )
     outcome = ctx.RUN_OUTCOME_SUCCESS if rc == 0 else ctx.RUN_OUTCOME_FAILED
-    if outcome == ctx.RUN_OUTCOME_SUCCESS and runtime_tracking.ci_apply_ids.get("ci_runner") is not None:
-        ctx._delete_apply_id(
-            resolved_case,
-            apply_id=ctx._require_str(runtime_tracking.ci_apply_ids.get("ci_runner"), "CI ci_runner apply_id"),
-            ctx="CI ci_runner apply",
-        )
-        del runtime_tracking.ci_apply_ids["ci_runner"]
     summary = ctx._build_ci_summary_yaml(
         resolved_case,
         run_index=run_index,
