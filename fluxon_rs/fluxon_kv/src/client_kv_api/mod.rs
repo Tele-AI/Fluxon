@@ -3,11 +3,17 @@ use crate::client_kv_api::msg_pack::{
     ExternalDeleteAckReq, ExternalDeleteAckResp, ExternalDeleteReq, ExternalDeleteResp,
     ExternalGetReq, ExternalGetResp, ExternalIsExistReq, ExternalIsExistResp, ExternalPutCommitReq,
     ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp, ExternalPutStartReq,
-    ExternalPutStartResp, ExternalPutTransferEndReq, ExternalPutTransferEndResp, SyncKvToFileReq,
-    SyncKvToFileResp, TestPutPhaseTrace,
+    ExternalPutStartResp, ExternalPutTransferEndReq, ExternalPutTransferEndResp,
+    SsdReplicaPersistReq, SsdReplicaPersistResp, SsdStageReadReq, SsdStageReadResp,
+    SyncKvToFileReq, SyncKvToFileResp, TestPutPhaseTrace,
 };
 use crate::cluster_manager::NodeIDString;
+use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::config::TestSpecConfig;
+use crate::kv_ssd_storage::{
+    DEFAULT_READ_TRANSFER_PIPELINE_CHUNK_BYTES, DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT,
+    KvSsdStorage, KvSsdStorageInit, SsdLoadedChunk,
+};
 use crate::master_kv_router::msg_pack::{
     BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, DeleteClientKvMetaCacheItem,
 };
@@ -22,8 +28,8 @@ use crate::{
     client_transfer_engine::{ClientTransferEngine, ClientTransferEngineAccessTrait},
     cluster_manager::{ClusterEvent, ClusterManager, ClusterManagerAccessTrait},
     master_kv_router::msg_pack::{
-        DeleteReq, GetDoneReq, GetMetaReq, GetRevokeReq, GetStartReq, PutDoneReq, PutRevokeReq,
-        PutStartReq,
+        DeleteReq, GetDoneReq, GetDoneResp, GetMetaReq, GetRevokeReq, GetStartReq, PutDoneReq,
+        PutRevokeReq, PutStartReq, SsdReplicaCommitReq,
     },
     metric_reporter::{MetricReporter, MetricReporterAccessTrait},
     metrics::{MetricsHandle, OperationKind, RequestStage},
@@ -37,6 +43,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use fluxon_framework::{LogicalModule, define_module};
 use fluxon_util::map_lock::AMapLock;
+use futures::stream::{FuturesUnordered, StreamExt};
 use limit_thirdparty::tokio;
 use parking_lot::Mutex;
 use std::sync::Weak;
@@ -451,6 +458,89 @@ async fn handle_external_put_revoke(
     }
 }
 
+async fn handle_ssd_stage_read(
+    view: &ClientKvApiView,
+    msg: &MsgPack<SsdStageReadReq>,
+) -> MsgPack<SsdStageReadResp> {
+    let req = msg.serialize_part.clone();
+    let inner = view.client_kv_api().inner();
+    let done_resp = match inner
+        .load_and_push_kv_from_ssd(
+            &req.key,
+            req.put_id,
+            req.stage_addr,
+            req.stage_len,
+            &req.target_node_id,
+            req.target_addr,
+            req.len,
+        )
+        .await
+    {
+        Ok(()) => inner.get_done(req.get_id).await,
+        Err(err) => Err(err),
+    };
+
+    match done_resp {
+        Ok(done_resp) => MsgPack {
+            serialize_part: SsdStageReadResp {
+                done_holder_id: done_resp.holder_id,
+                done_allocation_mode: done_resp.allocation_mode,
+                done_error_code: done_resp.error_code,
+                done_error_json: done_resp.error_json,
+                done_server_process_us: done_resp.server_process_us,
+                error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
+                error_json: String::new(),
+            },
+            raw_bytes: Vec::new(),
+        },
+        Err(err) => MsgPack {
+            serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+            raw_bytes: Vec::new(),
+        },
+    }
+}
+
+async fn handle_ssd_replica_persist(
+    view: &ClientKvApiView,
+    msg: &MsgPack<SsdReplicaPersistReq>,
+) -> MsgPack<SsdReplicaPersistResp> {
+    let req = msg.serialize_part.clone();
+    let inner = view.client_kv_api().inner();
+    let persisted = match inner
+        .persist_local_kv_to_ssd(&req.key, req.put_id, req.target_addr, req.len)
+        .await
+    {
+        Ok(persisted) => persisted,
+        Err(err) => {
+            return MsgPack {
+                serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                raw_bytes: Vec::new(),
+            };
+        }
+    };
+
+    if persisted {
+        if let Err(err) = inner
+            .commit_ssd_replica_to_master(&req.key, req.put_id, req.len)
+            .await
+        {
+            return MsgPack {
+                serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                raw_bytes: Vec::new(),
+            };
+        }
+    }
+
+    MsgPack {
+        serialize_part: SsdReplicaPersistResp {
+            persisted,
+            error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
+            error_json: String::new(),
+        },
+        raw_bytes: Vec::new(),
+    }
+}
+
 async fn handle_external_delete_ack(
     view: &ClientKvApiView,
     msg: &MsgPack<ExternalDeleteAckReq>,
@@ -729,6 +819,7 @@ define_module!(
 #[derive(Clone, Debug)]
 pub struct ClientKvApiNewArg {
     pub test_spec_config: TestSpecConfig,
+    pub ssd_storage: Option<KvSsdStorageInit>,
 }
 
 pub struct ClientKvApi(ClientKvApiInner);
@@ -775,6 +866,7 @@ impl std::ops::Deref for ClientKvApiViewHolder {
 pub struct ClientKvApiInner {
     view: ClientKvApiViewHolder,
     test_spec_config: TestSpecConfig,
+    ssd_storage: Option<Arc<KvSsdStorage>>,
     metrics: OnceLock<Arc<MetricsHandle>>,
 
     /// make sure each remote kv get run in order
@@ -818,6 +910,8 @@ pub struct ClientKvApiInner {
     rpc_caller_external_put_commit: RPCCaller<ExternalPutCommitReq>,
     rpc_caller_external_put_revoke: RPCCaller<ExternalPutRevokeReq>,
     rpc_caller_resolve_side_transfer_lane: RPCCaller<ResolveSideTransferLaneReq>,
+    rpc_caller_ssd_stage_read: RPCCaller<SsdStageReadReq>,
+    rpc_caller_ssd_replica_commit: RPCCaller<SsdReplicaCommitReq>,
 
     /// Default lease id recorded for inspection/convenience, but NOT auto-applied.
     /// Callers must explicitly pass `Some(lease_id)` to attach a put to a lease.
@@ -899,6 +993,222 @@ impl ClientKvApiInner {
 
     pub(crate) fn skip_put_end_commit_enabled(&self) -> bool {
         self.test_spec_config.skip_put_end_commit
+    }
+
+    pub(crate) async fn persist_local_kv_to_ssd(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        abs_addr: u64,
+        len: u64,
+    ) -> KvResult<bool> {
+        let Some(store) = self.ssd_storage.as_ref() else {
+            return Ok(false);
+        };
+        store.persist_from_addr(key, put_id, abs_addr, len).await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn commit_ssd_replica_to_master(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        len: u64,
+    ) -> KvResult<()> {
+        let node_id = self.view.cluster_manager().get_self_info().id.clone();
+        let req = MsgPack {
+            serialize_part: SsdReplicaCommitReq {
+                key: key.to_string(),
+                put_id,
+                node_id,
+                len,
+            },
+            raw_bytes: Vec::new(),
+        };
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let resp = self
+            .rpc_caller_ssd_replica_commit
+            .call(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                req,
+                Some(Duration::from_secs(60)),
+                2,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json,
+        )
+    }
+
+    pub(crate) async fn load_and_push_kv_from_ssd(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        stage_addr: u64,
+        stage_len: u64,
+        target_node_id: &NodeIDString,
+        target_addr: u64,
+        len: u64,
+    ) -> KvResult<()> {
+        let Some(store) = self.ssd_storage.as_ref() else {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "kv ssd storage is not enabled on this owner".to_string(),
+            }));
+        };
+
+        let self_node_id = &self.view.cluster_manager().get_self_info().id;
+        let peer_id = if target_node_id == self_node_id {
+            None
+        } else {
+            Some(target_node_id.clone())
+        };
+        let (chunk_tx, chunk_rx) = ::tokio::sync::mpsc::channel(
+            DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT
+                .saturating_mul(2)
+                .max(1),
+        );
+        let producer = store.load_into_addr_chunks(
+            key,
+            put_id,
+            stage_addr,
+            len,
+            stage_len,
+            DEFAULT_READ_TRANSFER_PIPELINE_CHUNK_BYTES,
+            DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT,
+            chunk_tx,
+        );
+        let consumer = self.transfer_loaded_ssd_chunks(peer_id, target_addr, chunk_rx);
+        let (producer_res, consumer_res) = ::tokio::join!(producer, consumer);
+        match (producer_res, consumer_res) {
+            (Ok(()), Ok(())) => Ok(()),
+            (_, Err(err)) => Err(err),
+            (Err(err), _) => Err(err),
+        }
+    }
+
+    async fn transfer_loaded_ssd_chunks(
+        &self,
+        peer_id: Option<NodeIDString>,
+        target_addr: u64,
+        mut chunk_rx: ::tokio::sync::mpsc::Receiver<SsdLoadedChunk>,
+    ) -> KvResult<()> {
+        let mut inflight = FuturesUnordered::new();
+        let mut rx_open = true;
+
+        loop {
+            tokio::select! {
+                maybe_chunk = chunk_rx.recv(), if rx_open && inflight.len() < DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT => {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            let chunk_target_addr = target_addr.checked_add(chunk.offset).ok_or_else(|| {
+                                KvError::Api(ApiError::InvalidArgument {
+                                    detail: format!(
+                                        "kv ssd transfer target addr overflow: target_addr={:#x} offset={}",
+                                        target_addr,
+                                        chunk.offset
+                                    ),
+                                })
+                            })?;
+                            let transfer_engine = self.view.client_transfer_engine();
+                            let peer_id = peer_id.clone();
+                            inflight.push(async move {
+                                transfer_engine
+                                    .transfer_data_no_copy(
+                                        peer_id,
+                                        false,
+                                        chunk.stage_addr,
+                                        chunk_target_addr,
+                                        chunk.len,
+                                        None,
+                                    )
+                                    .await?;
+                                Ok::<(), KvError>(())
+                            });
+                        }
+                        None => {
+                            rx_open = false;
+                        }
+                    }
+                }
+                Some(result) = inflight.next(), if !inflight.is_empty() => {
+                    result?;
+                }
+                else => {
+                    if !rx_open && inflight.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn stage_kv_from_ssd_source(
+        &self,
+        source_node_id: &NodeIDString,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        get_id: u64,
+        stage_addr: u64,
+        target_addr: u64,
+        len: u64,
+        stage_len: u64,
+    ) -> KvResult<GetDoneResp> {
+        let self_node_id = self.view.cluster_manager().get_self_info().id.clone();
+        if source_node_id == &self_node_id {
+            self.load_and_push_kv_from_ssd(
+                key,
+                put_id,
+                stage_addr,
+                stage_len,
+                &self_node_id,
+                target_addr,
+                len,
+            )
+            .await?;
+            return self.get_done(get_id).await;
+        }
+
+        let req = MsgPack {
+            serialize_part: SsdStageReadReq {
+                key: key.to_string(),
+                put_id,
+                get_id,
+                stage_addr,
+                stage_len,
+                target_node_id: self_node_id,
+                target_addr,
+                len,
+            },
+            raw_bytes: Vec::new(),
+        };
+        let resp = self
+            .rpc_caller_ssd_stage_read
+            .call(
+                self.view.p2p_module(),
+                source_node_id.clone().into(),
+                req,
+                Some(Duration::from_secs(60)),
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
+        let resp = resp.serialize_part;
+        crate::rpcresp_kvresult_convert::try_from_code(resp.error_code, resp.error_json)?;
+        Ok(GetDoneResp {
+            holder_id: resp.done_holder_id,
+            allocation_mode: resp.done_allocation_mode,
+            error_code: resp.done_error_code,
+            error_json: resp.done_error_json,
+            server_process_us: resp.done_server_process_us,
+        })
     }
 }
 
@@ -1518,10 +1828,16 @@ impl ClientKvApi {
 
     pub async fn construct(arg: ClientKvApiNewArg) -> Result<Self, KvError> {
         tracing::info!("Constructing ClientKvApi in Client mode (PreView)");
+        let ssd_storage = arg
+            .ssd_storage
+            .map(KvSsdStorage::new)
+            .transpose()?
+            .map(Arc::new);
 
         let inner = ClientKvApiInner {
             view: ClientKvApiViewHolder::new(),
             test_spec_config: arg.test_spec_config,
+            ssd_storage,
             metrics: OnceLock::new(),
             all_memholder_refcount: OnceLock::new(),
             get_remote_kv_lock: AMapLock::new(Duration::from_secs(60)),
@@ -1554,6 +1870,8 @@ impl ClientKvApi {
             rpc_caller_external_put_commit: RPCCaller::new(),
             rpc_caller_external_put_revoke: RPCCaller::new(),
             rpc_caller_resolve_side_transfer_lane: RPCCaller::new(),
+            rpc_caller_ssd_stage_read: RPCCaller::new(),
+            rpc_caller_ssd_replica_commit: RPCCaller::new(),
             default_lease_id: parking_lot::RwLock::new(None),
         };
         Ok(Self(inner))
@@ -1586,6 +1904,12 @@ impl ClientKvApi {
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_resolve_side_transfer_lane
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_ssd_stage_read
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_ssd_replica_commit
             .regist(inner.view.p2p_module());
         crate::key_prefix::init_for_p2p_owner(inner.view.p2p_module());
         crate::kvlease::init_for_p2p_owner(inner.view.p2p_module());
@@ -1680,6 +2004,31 @@ impl ClientKvApi {
                 let view_task = view.clone();
                 let _ = view.spawn("rpc_external_put_revoke", async move {
                     let result = handle_external_put_revoke(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
+        let view_ext = inner.view.clone_view();
+        RPCHandler::<SsdStageReadReq>::new().regist(inner.view.p2p_module(), move |resp, msg| {
+            let view = view_ext.clone();
+            let view_task = view.clone();
+            let _ = view.spawn("rpc_ssd_stage_read", async move {
+                let result = handle_ssd_stage_read(&view_task, &msg).await;
+                let _ = resp.send_resp(result).await;
+            });
+            Ok(())
+        });
+
+        let view_ext = inner.view.clone_view();
+        RPCHandler::<SsdReplicaPersistReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                let _ = view.spawn("rpc_ssd_replica_persist", async move {
+                    let result = handle_ssd_replica_persist(&view_task, &msg).await;
                     let _ = resp.send_resp(result).await;
                 });
                 Ok(())

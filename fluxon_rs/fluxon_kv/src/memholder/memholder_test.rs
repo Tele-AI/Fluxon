@@ -101,6 +101,7 @@ fn new_client_config_with_size(
         large_file_paths: crate::config::LargeFilePaths {
             paths: vec![format!("/tmp/kvcache_large/{}", instance_key)],
         },
+        ssd_storage: None,
         test_spec_config: TestSpecConfig::default(),
     }
 }
@@ -134,6 +135,7 @@ fn new_zero_contribution_client_config(
         },
         share_mem_path: format!("/tmp/kvcache_shared_memory/{}", owner_instance_key),
         large_file_paths: crate::config::LargeFilePaths { paths: Vec::new() },
+        ssd_storage: None,
         test_spec_config: TestSpecConfig::default(),
     }
 }

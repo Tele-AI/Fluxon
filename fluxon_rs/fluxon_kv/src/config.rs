@@ -581,6 +581,8 @@ pub struct FluxonKvSpecYaml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub large_file_paths: Option<LargeFilePathsYaml>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssd_storage: Option<YamlNullable<KvSsdStorageConfigYaml>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub p2p_listen_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redis_compat: Option<YamlNullable<RedisCompatConfigYaml>>,
@@ -591,6 +593,17 @@ pub struct FluxonKvSpecYaml {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct LargeFilePathsYaml(pub Vec<String>);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KvSsdStorageConfigYaml {
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvSsdStorageConfig {
+    pub max_bytes: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -682,6 +695,34 @@ impl LargeFilePaths {
         .into_kverror())
     }
 
+    fn resolve_all_usable_root_subdirs(
+        &self,
+        relative_dir: &Path,
+        target_name: &str,
+    ) -> KvResult<Vec<PathBuf>> {
+        self.require_configured_paths()?;
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        for root in &self.paths {
+            let candidate = Path::new(root).join(relative_dir);
+            match fs::create_dir_all(&candidate) {
+                Ok(()) => out.push(candidate),
+                Err(err) => errors.push(format!("{} ({})", candidate.display(), err)),
+            }
+        }
+        if out.is_empty() {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: format!(
+                    "large_file_paths contains no usable root for {}; tried: {}",
+                    target_name,
+                    errors.join(", ")
+                ),
+            }
+            .into_kverror());
+        }
+        Ok(out)
+    }
+
     pub fn kv_logs_dir(&self, cluster_name: &str) -> KvResult<PathBuf> {
         let relative_dir = PathBuf::from(format!("{cluster_name}_cluster_kv_logs"));
         self.resolve_preferred_root_subdir(&relative_dir, "kv logs")
@@ -714,6 +755,18 @@ impl LargeFilePaths {
             "fluxon fs disk cache",
         )
     }
+
+    pub fn kv_ssd_storage_dirs(
+        &self,
+        cluster_name: &str,
+        instance_key: &str,
+    ) -> KvResult<Vec<PathBuf>> {
+        let relative_dir = PathBuf::from(format!(
+            "{cluster_name}_cluster_kv_ssd_storage/{}",
+            crate::kv_ssd_storage::safe_path_component(instance_key)
+        ));
+        self.resolve_all_usable_root_subdirs(&relative_dir, "kv ssd storage")
+    }
 }
 
 /// KV client backend types supported by the system
@@ -733,8 +786,9 @@ pub struct ClientConfig {
     pub pprof_duration_seconds: Option<u64>,
     pub redis_compat_listen_addr: Option<std::net::SocketAddr>,
     pub fluxonkv_spec: FluxonKvSpec,
-    pub share_mem_path: String, // Mandatory shared bundle path
+    pub share_mem_path: String,           // Mandatory shared bundle path
     pub large_file_paths: LargeFilePaths, // Mandatory large-file roots for logs and caches
+    pub ssd_storage: Option<KvSsdStorageConfig>,
     pub test_spec_config: TestSpecConfig,
 }
 
@@ -1028,6 +1082,13 @@ impl ClientConfigYaml {
                 }
                 .into_kverror());
             }
+            if self.fluxonkv_spec.ssd_storage.is_some() {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "fluxonkv_spec.ssd_storage is forbidden in zero-contribution mode"
+                        .to_string(),
+                }
+                .into_kverror());
+            }
         }
 
         // Preserve historical behavior for configs that omit `protocol`, but allow
@@ -1170,13 +1231,15 @@ impl ClientConfigYaml {
         } else {
             let Some(large_file_paths_yaml) = self.fluxonkv_spec.large_file_paths.as_ref() else {
                 return Err(ConfigError::InvalidClientConfig {
-                    detail: "fluxonkv_spec.large_file_paths is required for owner mode"
-                        .to_string(),
+                    detail: "fluxonkv_spec.large_file_paths is required for owner mode".to_string(),
                 }
                 .into_kverror());
             };
             LargeFilePaths {
-                paths: verify_non_empty_root_path_list(&large_file_paths_yaml.0, "large_file_paths")?,
+                paths: verify_non_empty_root_path_list(
+                    &large_file_paths_yaml.0,
+                    "large_file_paths",
+                )?,
             }
         };
 
@@ -1204,6 +1267,28 @@ impl ClientConfigYaml {
             }
         };
 
+        let ssd_storage = if is_external {
+            None
+        } else {
+            match std::mem::take(&mut self.fluxonkv_spec.ssd_storage) {
+                None | Some(YamlNullable::Null) => None,
+                Some(YamlNullable::Value(raw)) => {
+                    if raw.max_bytes < crate::kv_ssd_storage::SSD_ALIGNMENT as u64 {
+                        return Err(ConfigError::InvalidClientConfig {
+                            detail: format!(
+                                "fluxonkv_spec.ssd_storage.max_bytes must be >= {}",
+                                crate::kv_ssd_storage::SSD_ALIGNMENT
+                            ),
+                        }
+                        .into_kverror());
+                    }
+                    Some(KvSsdStorageConfig {
+                        max_bytes: raw.max_bytes,
+                    })
+                }
+            }
+        };
+
         Ok(ClientConfig {
             cluster_name: fluxonkv_spec.cluster_name.clone(),
             etcd_addresses_raw,
@@ -1215,6 +1300,7 @@ impl ClientConfigYaml {
             fluxonkv_spec,
             share_mem_path,
             large_file_paths,
+            ssd_storage,
             test_spec_config,
         })
     }
@@ -1647,7 +1733,80 @@ fluxonkv_spec:
         .unwrap();
         let err = cfg.verify().unwrap_err();
         let text = format!("{err}");
-        assert!(text.contains("fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode"));
+        assert!(
+            text.contains("fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode")
+        );
+    }
+
+    #[test]
+    fn client_config_owner_accepts_ssd_storage() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
+  ssd_storage:
+    max_bytes: 1048576
+  sub_cluster: rack-a
+"#,
+        )
+        .unwrap();
+        let verified = cfg.verify().unwrap();
+        assert_eq!(
+            verified.ssd_storage.as_ref().map(|cfg| cfg.max_bytes),
+            Some(1048576)
+        );
+    }
+
+    #[test]
+    fn client_config_owner_rejects_too_small_ssd_storage() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
+  ssd_storage:
+    max_bytes: 1
+  sub_cluster: rack-a
+"#,
+        )
+        .unwrap();
+        let err = cfg.verify().unwrap_err();
+        let text = format!("{err}");
+        assert!(
+            text.contains("fluxonkv_spec.ssd_storage.max_bytes must be >= 512"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn client_config_zero_contribution_rejects_ssd_storage() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_external
+fluxonkv_spec:
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_external
+  ssd_storage:
+    max_bytes: 1048576
+"#,
+        )
+        .unwrap();
+        let err = cfg.verify().unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("fluxonkv_spec.ssd_storage is forbidden in zero-contribution mode"));
     }
 
     #[test]
@@ -1667,7 +1826,9 @@ fluxonkv_spec:
         let logs_dir = large_file_paths.kv_logs_dir("test_cluster").unwrap();
         assert_eq!(
             logs_dir,
-            first_root.join("child").join("test_cluster_cluster_kv_logs")
+            first_root
+                .join("child")
+                .join("test_cluster_cluster_kv_logs")
         );
         assert!(logs_dir.exists());
 
@@ -1681,6 +1842,32 @@ fluxonkv_spec:
                 .join("test_cluster_cluster_third_party_logs")
         );
         assert!(third_party_logs_dir.exists());
+    }
+
+    #[test]
+    fn large_file_paths_uses_all_usable_roots_for_kv_ssd_storage() {
+        let tempdir = new_test_dir("fluxon_large_paths_uses_all_usable_roots_for_kv_ssd_storage");
+        let first_root = tempdir.join("first_root");
+        let second_root = tempdir.join("second_root");
+
+        let large_file_paths = LargeFilePaths {
+            paths: vec![
+                first_root.to_string_lossy().into_owned(),
+                second_root.to_string_lossy().into_owned(),
+            ],
+        };
+
+        let dirs = large_file_paths
+            .kv_ssd_storage_dirs("test_cluster", "owner/a:b")
+            .unwrap();
+        assert_eq!(
+            dirs,
+            vec![
+                first_root.join("test_cluster_cluster_kv_ssd_storage/owner_a_b"),
+                second_root.join("test_cluster_cluster_kv_ssd_storage/owner_a_b"),
+            ]
+        );
+        assert!(dirs.iter().all(|dir| dir.exists()));
     }
 
     #[test]
