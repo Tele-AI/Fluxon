@@ -56,6 +56,10 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
             test_suite_requires_benchmark_bundle_only_for_bench_cases,
         ),
         (
+            "ci_lock_name_is_scoped_by_ops_cluster_name",
+            test_ci_lock_name_is_scoped_by_ops_cluster_name,
+        ),
+        (
             "ci_top_attention_doc_page_build_uses_online_docker_image",
             test_ci_top_attention_doc_page_build_uses_online_docker_image,
         ),
@@ -229,6 +233,21 @@ def test_suite_requires_benchmark_bundle_only_for_bench_cases() -> None:
         )
         return
     print("PASS: test_suite_requires_benchmark_bundle_only_for_bench_cases")
+
+
+def test_ci_lock_name_is_scoped_by_ops_cluster_name() -> None:
+    first = _TEST_RUNNER._ci_lock_name_for_ops_cluster_name("fluxon_testbed")
+    second = _TEST_RUNNER._ci_lock_name_for_ops_cluster_name("fluxon_testbed_mq_large_30680")
+    if first == second:
+        print("FAIL: test_ci_lock_name_is_scoped_by_ops_cluster_name - names should differ")
+        return
+    if first == "bench_ci.lock" or second == "bench_ci.lock":
+        print("FAIL: test_ci_lock_name_is_scoped_by_ops_cluster_name - lock name must not be global")
+        return
+    if first != _TEST_RUNNER._ci_lock_name_for_ops_cluster_name("fluxon_testbed"):
+        print("FAIL: test_ci_lock_name_is_scoped_by_ops_cluster_name - name should be deterministic")
+        return
+    print("PASS: test_ci_lock_name_is_scoped_by_ops_cluster_name")
 
 
 def test_ci_top_attention_doc_page_build_uses_online_docker_image() -> None:

@@ -19,7 +19,7 @@ def _prepare_ci_case(
 ) -> Any:
     _ = ctx._require_dict(resolved_case.get("deploy"), "resolved_case.deploy")
     ci_checkout_root = ctx._runner_repo_root()
-    runtime_tracking.ci_lock_fp = ctx._acquire_ci_lock()
+    runtime_tracking.ci_lock_fp = ctx._acquire_ci_lock(resolved_case=resolved_case)
     ctx._ensure_deployer_online(resolved_case)
     out_cluster_name = ctx._ci_cluster_name(resolved_case)
 

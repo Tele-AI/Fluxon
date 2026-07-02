@@ -11,18 +11,22 @@ enum MetricsActorMsg {
 
 #[derive(Clone)]
 pub struct MetricsHandle {
-    tx: mpsc::Sender<MetricsActorMsg>,
+    tx: Option<mpsc::Sender<MetricsActorMsg>>,
 }
 
 impl MetricsHandle {
+    pub fn noop() -> Self {
+        Self { tx: None }
+    }
+
     pub fn try_submit_timeseries(&self, series: Vec<TimeSeries>) {
         if series.is_empty() {
             return;
         }
-        if let Err(e) = self
-            .tx
-            .try_send(MetricsActorMsg::SubmitTimeSeries { series })
-        {
+        let Some(tx) = &self.tx else {
+            return;
+        };
+        if let Err(e) = tx.try_send(MetricsActorMsg::SubmitTimeSeries { series }) {
             warn!("metrics actor dropped SubmitTimeSeries: {}", e);
         }
     }
@@ -39,7 +43,7 @@ impl MetricsActorOwned {
         prom: PromRemoteWriteHandle,
     ) -> (MetricsHandle, MetricsActorOwned) {
         let (tx, rx) = mpsc::channel(max_pending_msgs);
-        let handle = MetricsHandle { tx };
+        let handle = MetricsHandle { tx: Some(tx) };
         let owned = MetricsActorOwned { rx, prom };
         (handle, owned)
     }
