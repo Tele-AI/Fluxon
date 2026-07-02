@@ -55,10 +55,13 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertIn("largescale_mq_ci_single_host", workflow_text)
         self.assertIn("--owner-count", workflow_text)
         self.assertIn('"4"', workflow_text)
+        self.assertNotIn("--threads-per-process", workflow_text)
+        self.assertNotIn('"timeout_seconds": 3600', workflow_text)
         self.assertIn("--value-size", workflow_text)
         self.assertIn('"256"', workflow_text)
         self.assertIn("for producer_count, consumer_count in ((8, 8), (32, 32), (160, 8))", workflow_text)
         self.assertIn('"30"', workflow_text)
+        self.assertIn("nested largescale MQ diagnostics", workflow_text)
         self.assertIn("doc_site_base_url", workflow_text)
         self.assertIn("rather_no_git_submodule.py", workflow_text)
 

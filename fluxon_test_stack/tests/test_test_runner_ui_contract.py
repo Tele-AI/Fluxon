@@ -106,6 +106,29 @@ class TestTestRunnerUiContract(unittest.TestCase):
             "[1970-01-01 00:01:40 UTC] a\n[1970-01-01 00:01:40 UTC] b\n",
         )
 
+    def test_print_ci_wait_status_snapshot_includes_status_and_file_states(self) -> None:
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            current_state = _RUNNER._ObservedFileState(size=12, mtime_ns=34)
+            with mock.patch.object(_RUNNER.time, "time", return_value=100.0):
+                with mock.patch.object(_RUNNER.sys, "stdout", buf):
+                    _RUNNER._print_ci_wait_status_snapshot(
+                        run_dir=run_dir,
+                        status={"ok": True, "running": True, "detail": "ignored"},
+                        baseline_state=None,
+                        current_state=current_state,
+                        last_status_err="transient",
+                    )
+
+        text = buf.getvalue()
+        self.assertIn("[CI wait exit_code] status_snapshot", text)
+        self.assertIn('"ok": true', text)
+        self.assertIn('"running": true', text)
+        self.assertIn("baseline_exit_code_state=missing", text)
+        self.assertIn("current_exit_code_state=size=12 mtime_ns=34", text)
+        self.assertIn("last_status_err=transient", text)
+
     def test_runner_stdio_mirror_enabled_only_for_github_actions(self) -> None:
         with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=True):
             self.assertTrue(_RUNNER._runner_stdio_mirror_enabled())

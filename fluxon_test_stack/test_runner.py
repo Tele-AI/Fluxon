@@ -448,6 +448,7 @@ _RUNNER_STDIO_KEEPALIVE_FDS: Optional[Tuple[int, int]] = None
 _RUNNER_STDIO_MIRROR_THREAD: Optional[threading.Thread] = None
 _RUNNER_STDIO_ROUTER_THREAD: Optional[threading.Thread] = None
 _CI_WAIT_HEARTBEAT_INTERVAL_SECONDS = 15.0
+_CI_WAIT_STATUS_SNAPSHOT_INTERVAL_SECONDS = 60.0
 _CI_WAIT_TAIL_MAX_CHARS = 8000
 _TEST_RUNNER_UI_MAX_LOG_CHUNK_BYTES = 1024 * 1024
 _TEST_RUNNER_UI_HISTORY_SCHEMA_VERSION = 1
@@ -14126,6 +14127,11 @@ def _write_ci_runner_script(
         cmd_lines.append(f"echo {_shell_quote('=' * 80)}")
         cmd_lines.append(f"echo {_shell_quote(f'STEP {idx}: {step_label} :: {cmd}')}")
         cmd_lines.append(f"echo {_shell_quote('=' * 80)}")
+        cmd_lines.append("step_started_at=$(date +%s)")
+        cmd_lines.append(
+            f"echo {_shell_quote(f'[ci_runner] STEP {idx} start label={step_label}')} "
+            '"started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"'
+        )
         if timeout_seconds is None:
             cmd_lines.append(f"{cmd}")
         else:
@@ -14134,6 +14140,12 @@ def _write_ci_runner_script(
             # - Timeout must be configured explicitly per command in suite config (no hidden defaults).
             cmd_lines.append(f"timeout --preserve-status --signal=KILL {int(timeout_seconds)} {cmd}")
         cmd_lines.append("rc=$?")
+        cmd_lines.append("step_finished_at=$(date +%s)")
+        cmd_lines.append(
+            f"echo {_shell_quote(f'[ci_runner] STEP {idx} finish label={step_label}')} "
+            '"rc=$rc elapsed_s=$((step_finished_at - step_started_at)) '
+            'finished_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"'
+        )
         cmd_lines.append('if [ "$rc" -ne 0 ]; then')
         cmd_lines.append('  echo "[ci_runner] FAILED rc=$rc"')
         cmd_lines.append('  fail_and_exit "$rc"')
@@ -14210,6 +14222,20 @@ fi
 	log_dir="{run_dir.as_posix()}/logs/ci_runner"
 	mkdir -p "$log_dir"
 	exit_code_path="$log_dir/exit_code.txt"
+	restart_count_path="$log_dir/restart_count.txt"
+	exec >>"$log_dir/stdout.log" 2>&1
+	if [ -f "$restart_count_path" ]; then
+	  restart_count="$(cat "$restart_count_path" 2>/dev/null || echo 0)"
+	else
+	  restart_count=0
+	fi
+	case "$restart_count" in
+	  ''|*[!0-9]*) restart_count=0 ;;
+	esac
+	restart_count=$((restart_count + 1))
+	printf '%s\n' "$restart_count" > "$restart_count_path"
+	echo
+	echo "[ci_runner] start attempt=$restart_count pid=$$ ppid=$PPID host=$(hostname) started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	# The CI runner workload is a Deployment and may be restarted.
 	# Once exit_code.txt is written, the run is terminal. If we restart, we must not delete it
 	# or re-run tests, otherwise the runner can never converge.
@@ -14236,7 +14262,6 @@ fi
 	    hold_pid=""
 	  done
 	}}
-exec >"$log_dir/stdout.log" 2>&1
 
 prepare_env_path="{_ci_prepare_env_path(run_dir=run_dir).as_posix()}"
 if [ -f "$prepare_env_path" ]; then
@@ -14738,6 +14763,56 @@ def _print_ci_wait_progress(
     return next_offset, next_heartbeat_at
 
 
+def _ci_wait_observed_file_state_debug(state: Optional[_ObservedFileState]) -> str:
+    if state is None:
+        return "missing"
+    return f"size={state.size} mtime_ns={state.mtime_ns}"
+
+
+def _ci_wait_status_debug(status: Dict[str, Any]) -> str:
+    preferred_keys = (
+        "ok",
+        "running",
+        "exit_code",
+        "pid",
+        "started_at",
+        "finished_at",
+        "message",
+        "error",
+        "stderr",
+    )
+    summary = {key: status.get(key) for key in preferred_keys if key in status}
+    if not summary:
+        summary = dict(status)
+    text = json.dumps(summary, ensure_ascii=True, sort_keys=True, default=str)
+    max_chars = 1200
+    if len(text) > max_chars:
+        return text[:max_chars] + "...<truncated>"
+    return text
+
+
+def _print_ci_wait_status_snapshot(
+    *,
+    run_dir: Path,
+    status: Optional[Dict[str, Any]],
+    baseline_state: Optional[_ObservedFileState],
+    current_state: Optional[_ObservedFileState],
+    last_status_err: Optional[str],
+) -> None:
+    now = time.time()
+    status_text = "unavailable" if status is None else _ci_wait_status_debug(status)
+    print(
+        f"{_ci_log_timestamp_prefix(now)} "
+        "[CI wait exit_code] status_snapshot "
+        f"status={status_text} "
+        f"baseline_exit_code_state={_ci_wait_observed_file_state_debug(baseline_state)} "
+        f"current_exit_code_state={_ci_wait_observed_file_state_debug(current_state)} "
+        f"last_status_err={last_status_err} "
+        f"log={str((run_dir / 'logs' / 'ci_runner' / 'stdout.log').resolve())}",
+        flush=True,
+    )
+
+
 def _instance_file_exists(
     resolved_case: Dict[str, Any], *, instance_id: str, path: Path
 ) -> bool:
@@ -15190,6 +15265,7 @@ def _wait_ci_runner_exit_code(
     last_status_err: str | None = None
     log_offset = 0
     next_heartbeat_at = 0.0
+    next_status_snapshot_at = 0.0
     while True:
         log_offset, next_heartbeat_at = _print_ci_wait_progress(
             resolved_case,
@@ -15226,6 +15302,16 @@ def _wait_ci_runner_exit_code(
             status = _instance_status(resolved_case, instance_id="ci_runner")
         except _HttpGetJsonTransientError as exc:
             last_status_err = str(exc)
+            now = time.time()
+            if now >= next_status_snapshot_at:
+                _print_ci_wait_status_snapshot(
+                    run_dir=run_dir,
+                    status=None,
+                    baseline_state=baseline_state,
+                    current_state=current_state,
+                    last_status_err=last_status_err,
+                )
+                next_status_snapshot_at = now + _CI_WAIT_STATUS_SNAPSHOT_INTERVAL_SECONDS
             if time.time() >= deadline:
                 raise ValueError(
                     "ci_runner.exit_code wait timeout with transient controller errors: "
@@ -15233,6 +15319,16 @@ def _wait_ci_runner_exit_code(
                 ) from exc
             time.sleep(2.0)
             continue
+        now = time.time()
+        if now >= next_status_snapshot_at:
+            _print_ci_wait_status_snapshot(
+                run_dir=run_dir,
+                status=status,
+                baseline_state=baseline_state,
+                current_state=current_state,
+                last_status_err=last_status_err,
+            )
+            next_status_snapshot_at = now + _CI_WAIT_STATUS_SNAPSHOT_INTERVAL_SECONDS
         status_exit_code = status.get("exit_code")
         if status.get("ok") is True and status.get("running") is False and isinstance(status_exit_code, int):
             return _require_int(status_exit_code, "ci_runner.status.exit_code", min_v=-255)

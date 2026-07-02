@@ -308,6 +308,21 @@ jobs:
               print(f"missing {case_runs_path}")
               raise SystemExit(0)
 
+          def print_file(path):
+              print(f"=== {path} ===")
+              if path.exists():
+                  print(path.read_text(encoding="utf-8", errors="replace"))
+              else:
+                  print(f"missing {path}")
+
+          def print_tail(path, *, line_count=240):
+              print(f"=== {path} tail ===")
+              if path.exists():
+                  lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                  print("\n".join(lines[-line_count:]))
+              else:
+                  print(f"missing {path}")
+
           case_runs = yaml.safe_load(case_runs_path.read_text(encoding="utf-8"))
           print("=== case_runs.yaml ===")
           print(yaml.safe_dump(case_runs, sort_keys=False, allow_unicode=False))
@@ -325,19 +340,24 @@ jobs:
                       "logs/ci_runner/exit_code.txt",
                   ):
                       path = run_dir / rel
-                      print(f"=== {path} ===")
-                      if path.exists():
-                          print(path.read_text(encoding="utf-8", errors="replace"))
-                      else:
-                          print(f"missing {path}")
+                      print_file(path)
 
                   stdout_path = run_dir / "logs" / "ci_runner" / "stdout.log"
-                  print(f"=== {stdout_path} tail ===")
-                  if stdout_path.exists():
-                      lines = stdout_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                      print("\n".join(lines[-240:]))
-                  else:
-                      print(f"missing {stdout_path}")
+                  print_tail(stdout_path)
+
+          nested_root = workdir / "largescale_mq_ci_single_host"
+          print(f"=== nested largescale MQ diagnostics: {nested_root} ===")
+          if not nested_root.exists():
+              print(f"missing {nested_root}")
+          else:
+              for path in sorted(nested_root.glob("*/case_runs.yaml")):
+                  print_file(path)
+              for path in sorted(nested_root.glob("*/results/*/run_*/summary.yaml")):
+                  print_file(path)
+              for path in sorted(nested_root.glob("*/results/*/run_*/exception.txt")):
+                  print_file(path)
+              for path in sorted(nested_root.glob("*/test_runner.log")):
+                  print_tail(path)
           PY
 
       - name: Normalize ci_2_virt_node debug artifact permissions

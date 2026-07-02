@@ -1182,6 +1182,12 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             script_text = script_path.read_text(encoding="utf-8")
             self.assertIn('prepare_env_path="', script_text)
             self.assertIn('. "$prepare_env_path"', script_text)
+            self.assertIn('restart_count_path="$log_dir/restart_count.txt"', script_text)
+            self.assertIn('exec >>"$log_dir/stdout.log" 2>&1', script_text)
+            self.assertIn("[ci_runner] start attempt=$restart_count", script_text)
+            self.assertIn("[ci_runner] STEP 1 start label=", script_text)
+            self.assertIn("[ci_runner] STEP 1 finish label=", script_text)
+            subprocess.run(["bash", "-n", str(script_path)], check=True)
 
     def test_ci_prepare_exports_testbed_bundle_and_release_authority(self) -> None:
         with tempfile.TemporaryDirectory() as td:
