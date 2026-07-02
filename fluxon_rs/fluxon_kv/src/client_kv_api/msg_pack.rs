@@ -1,8 +1,10 @@
+use crate::master_kv_router::msg_pack::GetAllocationMode;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::p2p::msg_pack::{MsgPackSerializePart, RPCReq};
 use crate::rpcresp_kvresult_convert::msg_and_error::ErrorCode;
 use bitcode::{Decode, Encode};
 
+use crate::cluster_manager::NodeIDString;
 use crate::memholder::ExternalMemHolderInfo;
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -86,6 +88,76 @@ pub struct ExternalGetResp {
 impl MsgPackSerializePart for ExternalGetResp {
     fn msg_id(&self) -> u32 {
         4002
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdStageReadReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub get_id: u64,
+    pub stage_addr: u64,
+    pub stage_len: u64,
+    pub target_node_id: NodeIDString,
+    pub target_addr: u64,
+    pub len: u64,
+}
+
+impl MsgPackSerializePart for SsdStageReadReq {
+    fn msg_id(&self) -> u32 {
+        4020
+    }
+}
+
+impl RPCReq for SsdStageReadReq {
+    type Resp = SsdStageReadResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdStageReadResp {
+    pub done_holder_id: u64,
+    pub done_allocation_mode: GetAllocationMode,
+    pub done_error_code: ErrorCode,
+    pub done_error_json: String,
+    pub done_server_process_us: i64,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for SsdStageReadResp {
+    fn msg_id(&self) -> u32 {
+        4021
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdReplicaPersistReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub target_addr: u64,
+    pub len: u64,
+}
+
+impl MsgPackSerializePart for SsdReplicaPersistReq {
+    fn msg_id(&self) -> u32 {
+        4022
+    }
+}
+
+impl RPCReq for SsdReplicaPersistReq {
+    type Resp = SsdReplicaPersistResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdReplicaPersistResp {
+    pub persisted: bool,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for SsdReplicaPersistResp {
+    fn msg_id(&self) -> u32 {
+        4023
     }
 }
 

@@ -2,9 +2,10 @@ use super::{
     InflightGetInfo, KvRouteInfo, MasterKvRouterView, NodeValueReplicaDesc, OwnerHoldingGetInfo,
     msg_pack::{
         GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetMetaResp, GetRevokeReq,
-        GetRevokeResp, GetStartReq, GetStartResp,
+        GetRevokeResp, GetSourceKind, GetStartReq, GetStartResp,
     },
 };
+use crate::kv_ssd_storage::{SSD_ALIGNMENT, align_ssd_io_len};
 use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::memholder::MemholderManagerTrait;
@@ -82,7 +83,7 @@ pub async fn handle_get_start(
             let mut remove_in_kv_routes = false;
             if let Some(one_kv_nodes_routes) = view.master_kv_router().inner().kv_routes.get(key) {
                 one_kv_nodes_routes.clean_up_tomb_nodes_replicas(put_id, tombs, view);
-                if one_kv_nodes_routes.nodes_replicas.read().is_empty() {
+                if !one_kv_nodes_routes.has_live_replica() {
                     remove_in_kv_routes = true;
                 }
             }
@@ -112,6 +113,67 @@ pub async fn handle_get_start(
                 raw_bytes: Vec::new(),
             },
         )
+    }
+    fn allocate_get_buffer_on_node(
+        view: &MasterKvRouterView,
+        node_id: &NodeID,
+        len: u64,
+        get_id: u64,
+        purpose: &str,
+    ) -> Result<Arc<Allocation>, msg_and_error::KvError> {
+        let node_allocators = view.master_seg_manager().get_node_allocators(node_id);
+        if node_allocators.is_empty() {
+            tracing::info!(
+                "No allocators found for {} during get: {}, node is not ready",
+                purpose,
+                node_id
+            );
+            return Err(msg_and_error::KvError::Unreachable(
+                msg_and_error::UnreachableError::OwnerNoSeg { detail: "config=0 initializes as external; non-zero initializes as owner; the owner must have memory space (segment)".to_string() }
+            ));
+        }
+
+        let allocator = node_allocators.choose(&mut rand::thread_rng()).unwrap();
+        let mut allocated_addr: Option<Allocation> = None;
+        for attempt in 1..=3 {
+            if let Ok(allocation) = allocator.allocate(len) {
+                allocated_addr = Some(allocation);
+                break;
+            } else {
+                tracing::info!(
+                    "{} allocation attempt {}/3 failed for get_id {} on node {}",
+                    purpose,
+                    attempt,
+                    get_id,
+                    node_id
+                );
+            }
+        }
+        if let Some(allocation) = allocated_addr {
+            return Ok(Arc::new(allocation));
+        }
+
+        let total = allocator.total_size_bytes();
+        let used = allocator.used_size_bytes();
+        let free = total.saturating_sub(used);
+        Err(msg_and_error::KvError::Api(
+            msg_and_error::ApiError::NoSpace {
+                node: node_id.as_ref().to_string(),
+                segment: allocator.seg_device_id.clone(),
+                total_capacity: total,
+                free_capacity: free,
+            },
+        ))
+    }
+    fn align_ssd_stage_addr(raw_addr: u64) -> Result<u64, msg_and_error::KvError> {
+        raw_addr
+            .checked_add(SSD_ALIGNMENT as u64 - 1)
+            .map(|addr| addr / SSD_ALIGNMENT as u64 * SSD_ALIGNMENT as u64)
+            .ok_or_else(|| {
+                msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                    detail: format!("ssd source staging address alignment overflow: {raw_addr}"),
+                })
+            })
     }
 
     tracing::debug!("Handling GetStartReq: {:?}", req.serialize_part);
@@ -253,11 +315,13 @@ pub async fn handle_get_start(
             put_id: one_kv_nodes_routes.put_id,
             get_id,
             node_id: resp_node_id.clone().into(),
+            source_kind: GetSourceKind::Memory,
             src_addr: resp_src_addr,
             target_addr: resp_target_addr,
             src_base_addr: resp_src_base,
             target_base_addr: resp_target_base,
             len: src_allocation.size(),
+            ssd_stage_len: 0,
             error_code: msg_and_error::OK,
             error_json: String::new(),
             server_process_us: 0,
@@ -270,8 +334,10 @@ pub async fn handle_get_start(
             req_node_id,
             len: src_allocation.size(),
             allocation: target_allocation, // 存储target allocation
+            source_allocation: None,
             route: one_kv_nodes_routes.clone(),
             allocation_mode,
+            source_kind: GetSourceKind::Memory,
         };
 
         view.master_kv_router()
@@ -308,6 +374,167 @@ pub async fn handle_get_start(
             },
         );
     }
+
+    let ssd_replicas = one_kv_nodes_routes.ssd_replicas.read().clone();
+    let mut ssd_replica_keys = ssd_replicas.keys().collect::<Vec<_>>();
+    while !ssd_replica_keys.is_empty() {
+        let to_remove_idx = rand::thread_rng().gen_range(0..ssd_replica_keys.len());
+        let selected_ssd_key = ssd_replica_keys.remove(to_remove_idx);
+        let ssd_replica = ssd_replicas
+            .get(&*selected_ssd_key)
+            .expect("selected SSD replica key must exist");
+        if ssd_replica.tomb_tag.is_tomb() {
+            tombs.insert(selected_ssd_key.to_owned());
+        } else {
+            let ssd_stage_len = match align_ssd_io_len(ssd_replica.len) {
+                Ok(len) => len,
+                Err(err) => {
+                    return failed_resp_err(
+                        err,
+                        Some((tombs, one_kv_nodes_routes.put_id)),
+                        &view,
+                        &req.serialize_part.key,
+                    );
+                }
+            };
+            let source_alloc_len = match ssd_stage_len.checked_add(SSD_ALIGNMENT as u64 - 1) {
+                Some(len) => len,
+                None => {
+                    let err =
+                        msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                            detail: format!(
+                                "ssd source staging allocation length overflow: {ssd_stage_len}"
+                            ),
+                        });
+                    return failed_resp_err(
+                        err,
+                        Some((tombs, one_kv_nodes_routes.put_id)),
+                        &view,
+                        &req.serialize_part.key,
+                    );
+                }
+            };
+            let source_allocation = match allocate_get_buffer_on_node(
+                &view,
+                &ssd_replica.node_id,
+                source_alloc_len,
+                get_id,
+                "ssd source staging",
+            ) {
+                Ok(allocation) => allocation,
+                Err(err) => {
+                    tracing::info!(
+                        "Skipping SSD source for get_id {} on node {}: {}",
+                        get_id,
+                        ssd_replica.node_id,
+                        err
+                    );
+                    continue;
+                }
+            };
+            let target_allocation = match allocate_get_buffer_on_node(
+                &view,
+                &req_node_id,
+                ssd_replica.len,
+                get_id,
+                "requesting target",
+            ) {
+                Ok(allocation) => allocation,
+                Err(err) => {
+                    return failed_resp_err(
+                        err,
+                        Some((tombs, one_kv_nodes_routes.put_id)),
+                        &view,
+                        &req.serialize_part.key,
+                    );
+                }
+            };
+            let allocation_mode = if one_kv_nodes_routes.try_reserve_get_durable_slot() {
+                GetAllocationMode::DurableReplica
+            } else {
+                GetAllocationMode::Temporary
+            };
+            let source_base = source_allocation.base_addr();
+            let source_raw_addr = match source_base.checked_add(source_allocation.addr()) {
+                Some(addr) => addr,
+                None => {
+                    let err =
+                        msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                            detail: format!(
+                                "ssd source staging raw address overflow: base={} offset={}",
+                                source_base,
+                                source_allocation.addr()
+                            ),
+                        });
+                    return failed_resp_err(
+                        err,
+                        Some((tombs, one_kv_nodes_routes.put_id)),
+                        &view,
+                        &req.serialize_part.key,
+                    );
+                }
+            };
+            let source_addr = match align_ssd_stage_addr(source_raw_addr) {
+                Ok(addr) => addr,
+                Err(err) => {
+                    return failed_resp_err(
+                        err,
+                        Some((tombs, one_kv_nodes_routes.put_id)),
+                        &view,
+                        &req.serialize_part.key,
+                    );
+                }
+            };
+            let target_base = target_allocation.base_addr();
+            let target_addr = target_base + target_allocation.addr();
+            let resp = GetStartResp {
+                put_id: one_kv_nodes_routes.put_id,
+                get_id,
+                node_id: ssd_replica.node_id.clone().into(),
+                source_kind: GetSourceKind::Ssd,
+                src_addr: source_addr,
+                target_addr,
+                src_base_addr: source_base,
+                target_base_addr: target_base,
+                len: ssd_replica.len,
+                ssd_stage_len,
+                error_code: msg_and_error::OK,
+                error_json: String::new(),
+                server_process_us: 0,
+            };
+            let info = InflightGetInfo {
+                put_id: one_kv_nodes_routes.put_id,
+                src_node_id: ssd_replica.node_id.clone(),
+                key: req.serialize_part.key.clone(),
+                req_node_id,
+                len: ssd_replica.len,
+                allocation: target_allocation,
+                source_allocation: Some(source_allocation),
+                route: one_kv_nodes_routes.clone(),
+                allocation_mode,
+                source_kind: GetSourceKind::Ssd,
+            };
+
+            view.master_kv_router()
+                .inner()
+                .inflight_gets
+                .insert(get_id, info)
+                .await;
+
+            clean_up_tombs(
+                &view,
+                Some((tombs, one_kv_nodes_routes.put_id)),
+                &req.serialize_part.key,
+            );
+            return (
+                get_id,
+                MsgPack {
+                    serialize_part: resp,
+                    raw_bytes: Vec::new(),
+                },
+            );
+        }
+    }
     tracing::info!("Key not found: {}", req.serialize_part.key);
     {
         let err = msg_and_error::KvError::Api(msg_and_error::ApiError::KeyNotFound {
@@ -319,6 +546,64 @@ pub async fn handle_get_start(
             &view,
             &req.serialize_part.key,
         )
+    }
+}
+
+fn drop_failed_ssd_source(view: &MasterKvRouterView, inflight_info: &InflightGetInfo) {
+    if inflight_info.source_kind != GetSourceKind::Ssd {
+        tracing::warn!(
+            "Ignoring drop_ssd_source for non-SSD get: get_key={} put_id=({},{}) source_kind={:?}",
+            inflight_info.key,
+            inflight_info.put_id.0,
+            inflight_info.put_id.1,
+            inflight_info.source_kind
+        );
+        return;
+    }
+
+    let route = inflight_info.route.clone();
+    if route.put_id != inflight_info.put_id {
+        return;
+    }
+
+    let removed = route
+        .ssd_replicas
+        .write()
+        .remove(&inflight_info.src_node_id)
+        .is_some();
+    if !removed {
+        return;
+    }
+
+    tracing::warn!(
+        "Removed failed SSD replica: key={} node={} put_id=({},{})",
+        inflight_info.key,
+        inflight_info.src_node_id,
+        inflight_info.put_id.0,
+        inflight_info.put_id.1
+    );
+
+    if route.has_live_replica() {
+        return;
+    }
+
+    let route_for_compare = route.clone();
+    let removed_route = view
+        .master_kv_router()
+        .inner()
+        .kv_routes
+        .remove_if(&inflight_info.key, |_, current| {
+            Arc::ptr_eq(current, &route_for_compare) && current.put_id == inflight_info.put_id
+        })
+        .is_some();
+    if removed_route && view.master_kv_router().prefix_index_enabled() {
+        let view_task = view.clone();
+        let key_for_prefix = inflight_info.key.clone();
+        let _ = view.spawn("ssd_failure_remove_prefix_index", async move {
+            let inner = view_task.master_kv_router().inner();
+            let mut tree = inner.prefix_index.write().await;
+            tree.remove(&key_for_prefix);
+        });
     }
 }
 
@@ -338,6 +623,9 @@ pub async fn handle_get_revoke(
         .remove(&get_id)
         .await
     {
+        if req.serialize_part.drop_ssd_source {
+            drop_failed_ssd_source(&view, &inflight_info);
+        }
         inflight_info.release_durable_slot_if_needed();
         tracing::info!("Revoked get operation with get_id: {}", get_id);
     } else {
@@ -381,7 +669,6 @@ pub async fn handle_get_done(
             .next_holder_id
             .fetch_add(1, Ordering::Relaxed);
 
-        let src_node_id = inflight_info.src_node_id;
         let key = inflight_info.key;
 
         // Create holding info
@@ -404,7 +691,7 @@ pub async fn handle_get_done(
                 if one_kv_nodes_routes.put_id == inflight_info.put_id {
                     let mut nodes_replicas = one_kv_nodes_routes.nodes_replicas.write();
                     if let Some(tomb_tag) =
-                        view.master_seg_manager().get_node_tomb_tag(&src_node_id)
+                        view.master_seg_manager().get_node_tomb_tag(&req_node_id)
                     {
                         if !tomb_tag.is_tomb() {
                             nodes_replicas.insert(
@@ -626,6 +913,21 @@ pub async fn handle_get_meta(
                 serialize_part: GetMetaResp {
                     exists: true,
                     len,
+                    error_code: msg_and_error::OK,
+                    error_json: String::new(),
+                },
+                raw_bytes: Vec::new(),
+            };
+        }
+        let ssd_replicas = (*one_kv_nodes_routes.ssd_replicas.read()).clone();
+        for (_, kv_info) in ssd_replicas.iter() {
+            if kv_info.tomb_tag.is_tomb() {
+                continue;
+            }
+            return MsgPack {
+                serialize_part: GetMetaResp {
+                    exists: true,
+                    len: kv_info.len,
                     error_code: msg_and_error::OK,
                     error_json: String::new(),
                 },
