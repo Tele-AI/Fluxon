@@ -1,12 +1,10 @@
 # KV 设计 5 - SSD 存储
 
-## 稳定结论
+## 设计目标
 
-当前 KV 的 SSD 存储应当是分布式 owner SSD 副本层。每个 owner 可以持有本地 SSD backing tier，master 在同一条 key-version 路由里分开记录内存 owner 副本和 SSD owner 副本；它和 CPU segment 内存副本共享 owner placement、allocation、transfer engine 和 `MemHolder` 生命周期。SSD 只承担可回填的数据源，不暴露第二套用户读写 API。
+SSD 存储在 Fluxon KV 中作为 owner 本地 backing tier 接入通用 KV 链路。它不是一套独立的读写 API，也不改变用户侧 `put/get/delete` 语义；master 仍然以 key-version 为单位维护路由，内存副本是第一数据源，SSD 副本是内存副本不可用时的回填数据源。
 
-读路径按内存优先。master 找不到可用内存副本时，可以选择任意 owner 上的 SSD 副本；SSD owner 把磁盘数据按 chunk 读入自己节点上的 CPU staging allocation，每个 chunk ready 后立即由 SSD owner 侧复用现有 transfer engine push 到请求方 target allocation 对应 offset。SSD source 路径由 SSD owner 在所有 chunk transfer 完成后直接向 master 发送 `GetDoneReq`，再把 holder 结果放进 `SsdStageReadResp` 回给请求方；请求方不再从 SSD owner staging 发起第二段 transfer，也不再在 SSD source 路径上单独发送 `GetDoneReq`。
-
-IO 层吸收 Pegaflow SSD cache 的核心做法：分片环形文件、`O_DIRECT` 对齐 buffer、`io_uring` 后台读写线程、有界读写队列、`Writing/Committed` 两阶段索引，以及 ring tail 推进时的主动失效。进一步对照 3FS 和 foyer 后，当前实现把底层 uring 调度改成 read/write 独立队列，并在同一 shard 内按 inflight 比例优先补读队列，避免 kvcache 回填读被持续写入压住；同时按 3FS 的位置生命周期约束保护正在读或正在写的 ring 位置，tail 推进不能覆盖 active IO。对大 payload 高带宽场景，aligned SSD stage 可以直接 readv 到 source staging allocation，跳过中间 aligned buffer 到 staging 的额外内存拷贝；SSD read 和 transfer 之间使用 producer/consumer pipeline，chunk read 完成即可发起对应 chunk transfer。owner 启动时从 `large_file_paths` 派生 SSD root，先按 `metadata.dev()` 去重，再为每个有效 device 建独立 writer/reader queue 和 `UringIoEngine`；shard 只在所属 device worker 的 shard 集内分配。写路径必须把内存提交和 SSD 提交拆开：内存 `PutDone` 先让 key-version 可读，SSD 写入完成后再通过独立 commit 把同一版本加入 `ssd_replicas`。
+读取侧采用“内存优先、SSD 回填”的设计。`GetStart` 优先选择 live 内存副本；没有可用内存副本时，master 才选择 SSD owner，并分配 SSD owner 本机 source staging 和 requester target。SSD owner 从本地 SSD 读入 source staging，再复用现有 transfer engine 把数据推到 requester target，最后继续使用原有 `GetDone` 和 `MemHolder` 生命周期。
 
 ## 公共契约
 
@@ -34,8 +32,8 @@ fluxonkv_spec:
 | 分布式 SSD 读取 | 已接入。`GetStart` 可以返回任意 SSD owner，source staging allocation 位于 SSD owner，target allocation 位于请求方 owner。 |
 | owner 内部多 SSD 路径 | 已接入。SSD root 来自 `large_file_paths`，先按 device 去重；每个有效 device 有独立 writer/reader queue、uring engine 和 shard 集，单 owner 可以利用多块真实本地 SSD。 |
 | 内存 KV 复用 | 已复用。SSD 回填由 SSD owner 侧调用 `transfer_data_no_copy` 按 chunk push 到 requester target，全部 chunk transfer 完成后由 SSD owner 调 master `get_done`；requester 只复用返回的 holder 结果构造 `MemHolder`。 |
-| Pegaflow IO 模型 | 已接入核心形态：分片 ring、`O_DIRECT`、`io_uring`、有界队列、两阶段提交、tail 失效；写路径已经把内存 `PutDone` 和 SSD commit 拆开。 |
-| 3FS 位置生命周期 | 已接入到 SSD ring。读 IO 提交前 pin committed entry；未完成的 `Writing` entry 和 pinned read entry 都会阻止物理位置复用。 |
+| SSD 写入 IO 模型 | 已接入。分片 ring、`O_DIRECT`、`io_uring`、有界队列、两阶段提交和 tail 失效都在 owner 本地 `KvSsdStorage` 内完成；写路径已经把内存 `PutDone` 和 SSD commit 拆开。 |
+| ring 位置生命周期 | 已接入。读 IO 提交前 pin committed entry；未完成的 `Writing` entry 和 pinned read entry 都会阻止物理位置复用。 |
 | 大 payload direct stage | 已接入 aligned fast path 和 chunk pipeline。master 给 SSD source staging 多分配最多 511 bytes，并在 allocation 内返回 512-byte 对齐后的 `src_addr`；SSD read 按 chunk 对齐 IO 长度直接写入 staging，chunk ready 后立刻 transfer，`MemHolder` 仍只使用真实 payload 长度。 |
 | 冷启动恢复 | 当前不扫描 SSD shard 重建 master 路由；路由仍由本轮运行时的 `put/get/delete` 生命周期产生。 |
 | lease key 专门治理 | 当前没有单独的 lease SSD 生命周期策略；lease 与普通 key 共用 key-version 路由约束。 |
@@ -49,9 +47,11 @@ flowchart TD
     B --> G["owner -> master PutDone(memory_ready)"]
     G --> H["master route: nodes_replicas"]
     B --> C["async KvSsdStorage.persist_from_addr(key, put_id, addr, len)"]
-    C --> D["SSD writer queue"]
-    D --> E["io_uring writev to sharded O_DIRECT ring"]
-    E --> F["commit index: Writing -> Committed"]
+    C --> D["copy payload to 512-byte aligned buffer"]
+    D --> E["per-device writer queue"]
+    E --> E2["shard ring entry: Writing"]
+    E2 --> E3["O_DIRECT + io_uring writev"]
+    E3 --> F["commit index: Writing -> Committed"]
     F --> I["owner -> master SsdReplicaCommit"]
     I --> J["master route: ssd_replicas"]
 
@@ -63,7 +63,8 @@ flowchart TD
     N -->|yes| O["allocate source staging on SSD owner"]
     O --> P["allocate target on requester"]
     P --> Q["return GetSourceKind::Ssd"]
-    Q --> R["SSD owner chunk readv into source staging"]
+    Q --> R0["pin committed SSD entry"]
+    R0 --> R["chunk read: direct staging or scratch fallback"]
     R --> S["SsdLoadedChunk(offset,len)"]
     S --> W["SSD owner transfer chunk: staging+offset -> requester target+offset"]
     W --> T["all chunks done: SSD owner -> master GetDoneReq"]
@@ -92,7 +93,7 @@ sequenceDiagram
     M-->>C: PutDoneResp
     M->>C: async SsdReplicaPersistReq(key, put_id, target_addr, len)
     C->>SSD: KvSsdStorage.persist_from_addr(...)
-    Note over SSD: writer queue -> io_uring writev -> Writing/Committed
+    Note over SSD: aligned buffer -> per-device writer queue\nshard ring Writing -> O_DIRECT + io_uring writev -> Committed
     C->>M: SsdReplicaCommitReq(key, put_id, node_id, len)
     Note right of M: ssd_replicas 写入 SSD 副本
 
@@ -104,6 +105,7 @@ sequenceDiagram
         M-->>C: GetStartResp(source_kind=Ssd, src_addr, target_addr, ssd_stage_len)
         C->>SO: SsdStageReadReq(get_id, stage_addr=src_addr, stage_len=ssd_stage_len, target_node_id, target_addr, len)
         SO->>SSD: load_into_addr_chunks(key, put_id, stage_addr, len, stage_len)
+        Note over SSD: pin committed entry\nchunk read direct to source staging or scratch fallback
         loop each ready chunk
             SSD-->>SO: SsdLoadedChunk(offset, stage_addr+offset, chunk_len)
             SO->>TE: transfer_data_no_copy(write, stage+offset -> target+offset, chunk_len)
@@ -259,7 +261,7 @@ struct KvSsdStorageInner {
 
 owner 如果是最终 target，先完成原有 transfer 和 `PutDoneReq`，让内存副本进入 `nodes_replicas`。master 随后在后台 task 里把 `SsdReplicaPersistReq { key, put_id, target_addr, len }` 发回 target owner，并持有 target allocation 的 `Arc<Allocation>`，保证 owner 从内存复制到 SSD 期间 payload 不会被释放或复用。
 
-owner 的 `rpc_ssd_replica_persist` handler 收到请求后，从 target allocation 的绝对地址调用 `persist_local_kv_to_ssd(...)`，进入 `KvSsdStorage::persist_from_addr(key, put_id, addr, len)`。`persist_from_addr` 把真实 payload 拷到 512-byte 对齐的 `AlignedBuffer`，`persist_buffer` 通过 `next_write_device` round-robin 选择一个 `SsdDeviceWorker.write_tx` 并等待后台 writer 完成。每个 `ssd_writer_loop` 只拿自己的 `shard_ids` 调 `SsdRingBuffer::prepare_write_on_shards(...)`，在 `ring.entries` 中建立 `Writing(SsdIndexEntry)`；对应 device 的 `UringIoEngine` 对该 shard 文件执行 `writev`，成功后提交为 `Committed(SsdIndexEntry)`。这之后 owner 发送 `SsdReplicaCommitReq` 给 master，补交 SSD 副本。
+owner 的 `rpc_ssd_replica_persist` handler 收到请求后，从 target allocation 的绝对地址调用 `persist_local_kv_to_ssd(...)`，进入 `KvSsdStorage::persist_from_addr(key, put_id, addr, len)`。`persist_from_addr` 把真实 payload 拷到 512-byte 对齐的 `AlignedBuffer`，`persist_buffer` 通过 `next_write_device` round-robin 选择一个 `SsdDeviceWorker.write_tx` 并等待后台 writer 完成。每个 `ssd_writer_loop` 只拿自己的 `shard_ids` 调 `SsdRingBuffer::prepare_write_on_shards(...)`，在 `ring.entries` 中建立 `Writing(SsdIndexEntry)`；对应 device 的 `UringIoEngine` 对该 shard 文件执行 `O_DIRECT + writev`，成功后提交为 `Committed(SsdIndexEntry)`。这之后 owner 发送 `SsdReplicaCommitReq` 给 master，补交 SSD 副本。写队列和底层 uring 队列都是有界队列；当 SSD 写入慢于提交速度时，背压停在 owner 本地 SSD persist 路径，不改变已经完成的内存 `PutDone` 语义。
 
 #### external
 
@@ -410,7 +412,7 @@ pub struct SsdStageReadResp {
 
 requester owner 收到 `GetSourceKind::Memory` 后走原有 transfer 分支，然后自己发送 `GetDoneReq`。requester owner 收到 `GetSourceKind::Ssd` 后调用 `stage_kv_from_ssd_source(...)`，该函数返回 `GetDoneResp` 对应字段；requester 跳过自己的 transfer，也跳过自己的 `get_done`，直接用返回的 done 结果构造 holder。
 
-SSD owner 的 `rpc_ssd_stage_read` task 调用 `load_and_push_kv_from_ssd(...)`。这个函数内部把 `KvSsdStorage::load_into_addr_chunks(...)` 作为生产者，把 `transfer_loaded_ssd_chunks(...)` 作为消费者：生产者 pin 当前 committed entry，按 chunk 把磁盘数据读入 master 分配的 `stage_addr + offset`；消费者每收到一个 `SsdLoadedChunk`，立即用 `transfer_data_no_copy(peer=target_node_id, peer_src_or_target=false, stage_addr + offset, target_addr + offset, chunk_len, None)` push 到 requester target。所有 chunk transfer 成功后，SSD owner 用 `SsdStageReadReq.get_id` 调 master `GetDoneReq`，并把 `GetDoneResp` 拆成 `SsdStageReadResp.done_*` 字段返回给 requester。
+SSD owner 的 `rpc_ssd_stage_read` task 调用 `load_and_push_kv_from_ssd(...)`。这个函数内部把 `KvSsdStorage::load_into_addr_chunks(...)` 作为生产者，把 `transfer_loaded_ssd_chunks(...)` 作为消费者：生产者 pin 当前 committed entry，按 chunk 把磁盘数据读入 master 分配的 `stage_addr + offset`；消费者每收到一个 `SsdLoadedChunk`，立即用 `transfer_data_no_copy(peer=target_node_id, peer_src_or_target=false, stage_addr + offset, target_addr + offset, chunk_len, None)` push 到 requester target。所有 chunk transfer 成功后，SSD owner 用 `SsdStageReadReq.get_id` 调 master `GetDoneReq`，并把 `GetDoneResp` 拆成 `SsdStageReadResp.done_*` 字段返回给 requester。读路径进入 per-device reader queue，底层 `UringIoEngine` 把 read/write 分成独立发送队列，并按 inflight 比例补读，避免回填读长期排在持续写入之后。
 
 ```rust
 struct SsdRingBuffer {
@@ -425,7 +427,7 @@ enum SsdEntryState {
 }
 ```
 
-`read_pins` 是 owner 本地 SSD ring 的生命周期保护，防止 writer 推进 tail 时覆盖 active read。chunk pipeline 在整个 producer 生命周期内持有同一个 read pin；每个 chunk 单独提交 read task。direct read 条件满足时，`readv` 直接写到 `SsdStageReadReq.stage_addr + offset`；否则先读 scratch aligned buffer，再复制当前 chunk 的真实 payload 长度到 staging。请求方 target 是否远端不影响 SSD direct read 的对齐判断。
+`read_pins` 是 owner 本地 SSD ring 的生命周期保护，防止 writer 推进 tail 时覆盖 active read。chunk pipeline 在整个 producer 生命周期内持有同一个 read pin；每个 chunk 单独提交 read task。direct read 条件满足时，`readv` 直接写到 `SsdStageReadReq.stage_addr + offset`；否则先读 scratch aligned buffer，再复制当前 chunk 的真实 payload 长度到 staging。direct read 省掉的是 scratch buffer 到 source staging 的本机 memcpy，不省掉 `source staging -> requester target` 的 transfer。请求方 target 是否远端不影响 SSD direct read 的对齐判断。
 
 #### external
 
@@ -758,11 +760,11 @@ flowchart TD
 | 组件 | 设计 |
 | --- | --- |
 | device root | owner 从 `large_file_paths` 派生 SSD root，创建目录后读取 `metadata.dev()`；同一 device 只保留第一个 root。 |
-| shard 文件 | 每个 owner 将 `max_bytes` 切成少量 shard，文件位于有效 device root 的 `shards/` 下，`shard_to_device` 记录 shard 到 device worker 的映射。 |
-| 对齐 | 数据写入前复制到 512-byte 对齐 buffer，实际 IO 长度按 512-byte 向上对齐。 |
+| shard 文件 | `max_bytes` 是 owner 本地 SSD cache 的容量上限；owner 将它拆成多个本地 ring shard 文件，每个 shard 位于某个有效 device root 的 `shards/` 下，`shard_to_device` 用来把 shard 映射到对应 device worker。 |
+| 对齐 | SSD shard 使用 `O_DIRECT` 绕过 page cache，减少大 payload 双重缓存；对应要求 buffer 地址、IO 长度和文件 offset 512-byte 对齐，由 `AlignedBuffer` / `align_ssd_io_len` 保证。 |
 | 写队列 | `persist_from_addr` 只把任务送入某个 device 的有界 writer queue；后台 writer 控制 inflight 数量，并只在本 device 的 `shard_ids` 内分配 ring 空间。 |
 | 读队列 | `load_into_addr_chunks` 先 pin committed 索引，再按 `entry.shard_id -> shard_to_device` 找到对应 device reader queue。只要 chunk staging 地址、文件 offset 和 staging 容量满足对齐约束，就直接读入目标 staging；否则读到 scratch aligned buffer 后只复制当前 chunk 的真实 payload 长度。 |
-| io_uring | 每个有效 device 拥有自己的 `UringIoEngine`，engine 内多个后台线程持有 `IoUring`，使用 `readv/writev` 提交该 device 的 shard 文件 IO。底层每个 uring shard 有独立 read/write 发送队列，按 read/write inflight 比例调度，优先保护 kvcache 回填读延迟。 |
+| io_uring | 每个有效 device 拥有自己的 `UringIoEngine`，engine 内多个后台线程持有 `IoUring`，使用 `readv/writev` 提交该 device 的 shard 文件 IO。底层每个 uring shard 有独立 read/write 发送队列，按 read/write inflight 比例调度，优先保护 KV 回填读延迟。 |
 | 索引状态 | 新写入先进入 `Writing`；只有 IO 完成且 offset 仍有效时才转为 `Committed`。 |
 | 位置保护 | `load_into_addr_chunks` 在 producer 生命周期内 pin committed entry；writer 分配新 ring 空间前检查 pinned read 和未完成 `Writing` entry，必要时等待 active IO 释放位置。 |
 | ring 失效 | shard head 推进超过容量时推进 tail，并移除被覆盖 key-version 的本地索引。 |
@@ -805,19 +807,6 @@ std::thread::Builder::new()
 
 `KvSsdStorage` 通过每个 `SsdDeviceWorker` 持有 `_files` 和 `_io`，确保该 device 的 shard fd 与 uring 线程生命周期覆盖所有读写 task。`UringIoEngine::drop` 会关闭 read/write channel，并 join 所有 uring 线程。
 
-## 3FS 和 foyer 对照
-
-| 参考点 | 对 kvcache SSD 的结论 |
-| --- | --- |
-| foyer read/write split queue | 已落地到底层 `UringIoEngine`。写入 flush 和回填读进入不同发送队列，同一 uring shard 内用 inflight 比例避免读饥饿。 |
-| foyer multi-partition device | 已落地到 owner 内部 per-device worker。`large_file_paths` 仍是唯一配置来源；owner 按 `metadata.dev()` 去重后为每个有效 device 建独立 writer/read queue、uring engine 和 shard 集。 |
-| foyer block buffer/reclaimer | 适合后续把小 key-version 合并成 blob，并用 blob index 加速恢复；当前 kvcache value 以较大连续 payload 为主，先保留单 key-version 连续写入。 |
-| 3FS write-new-position then commit metadata | 当前 `Writing/Committed` 两阶段索引已经匹配这条原则：IO 成功前不暴露 SSD 副本。 |
-| 3FS read holds chunk position reference | 已落地到 SSD ring 内部。读提交前 pin entry；tail 推进和物理 offset 复用必须避开 pinned read。 |
-| 3FS aligned direct read | 已落地 aligned fast path。master 自己控制 SSD source staging allocation，因此可以在 allocation 内选择对齐后的 source 地址，并把 SSD IO 长度扩到 512-byte 对齐；真实 payload 长度仍用于 transfer 和用户可见 `MemHolder`。 |
-| 3FS batch read/RDMA response | Fluxon 已复用现有 transfer engine，并已落地 read/transfer chunk pipeline；后续优化重点放在批量 SSD stage、批量 transfer 和小窗口 staging allocation。 |
-| PegaFlow fire-and-forget SSD ingest | 已落地到 put 路径。master 在 `PutDone` 中先提交内存 route，再通过后台 `post_put_ssd_replica_persist` 触发 owner 本地 SSD persist；owner 落盘成功后用 `SsdReplicaCommitReq` 独立提交 SSD route。 |
-
 ## 不变量
 
 - `ssd_replicas` 和 `nodes_replicas` 都属于同一个 `OneKvNodesRoutes.put_id`，不能跨版本复用。
@@ -833,4 +822,4 @@ std::thread::Builder::new()
 
 ## 关键结论
 
-这套实现把 SSD 做成和 CPU segment 同级的分布式数据源副本，但不新增并行的用户 API 或传输协议。Pegaflow 的优势被放在 owner 内部 IO 层：异步 direct IO、分片 ring、提交态隔离和队列背压；foyer 的 read/write 队列调度用于保护回填读延迟；3FS 的位置生命周期、aligned direct read 和 read/transfer chunk pipeline 用于保护 active IO 并减少大 payload 回填拷贝和串行等待。后续重点是批量 SSD stage、批量 transfer、小窗口 staging allocation 和 pipeline 观测指标。Fluxon 的优势继续由原有内存 KV 路由、allocation、transfer 和 holder 生命周期承接。
+这套实现把 SSD 做成和 CPU segment 同级的分布式数据源副本，但不新增并行的用户 API 或传输协议。写入侧先用 `PutDone` 提交内存 route，再由 target owner 本地异步写入 SSD，写成功后用 `SsdReplicaCommitReq` 补交 SSD route；读取侧先走内存副本，内存副本不可用时由 SSD owner 把本地 shard ring 中的 committed entry 按 chunk 读入 source staging，并边读边 transfer 到 requester target。owner 内部的分片 ring、`O_DIRECT` 对齐、`io_uring` 队列、`Writing/Committed` 两阶段索引、read pin、direct/scratch read 和 read/transfer pipeline 都服务于同一个目标：让 SSD 成为可回填的数据源，同时保持原有 KV 路由、allocation、transfer 和 holder 生命周期不变。后续重点是批量 SSD stage、批量 transfer、小窗口 staging allocation 和 pipeline 观测指标。
