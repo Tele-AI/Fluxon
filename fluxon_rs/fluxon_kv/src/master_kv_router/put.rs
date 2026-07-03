@@ -1,15 +1,19 @@
-use super::NodeValueReplicaDesc;
 use super::{
     InflightPutAllocation, InflightPutInfo, KvRouteInfo, MasterKvRouterView, PutPlacementMode,
-    msg_pack::{PutDoneReq, PutDoneResp, PutRevokeReq, PutRevokeResp, PutStartReq, PutStartResp},
+    msg_pack::{
+        PutDoneReq, PutDoneResp, PutRevokeReq, PutRevokeResp, PutStartReq, PutStartResp,
+        SsdReplicaCommitReq, SsdReplicaCommitResp,
+    },
     placement::PutPlacementTarget,
 };
+use super::{KvSsdRouteInfo, NodeValueReplicaDesc};
+use crate::client_kv_api::msg_pack::SsdReplicaPersistReq;
 use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::delete::DeleteKeyInfo;
 use crate::{
     cluster_manager::{META_KEY_LOCAL_IPC_ROOT, NodeID},
     master_seg_manager::one_seg_allocator::Allocation,
-    p2p::msg_pack::MsgPack,
+    p2p::msg_pack::{MsgPack, RPCCaller},
     rpcresp_kvresult_convert::msg_and_error,
 };
 use fluxon_commu::{META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME};
@@ -19,6 +23,7 @@ use rand::seq::SliceRandom;
 use std::{
     collections::HashMap,
     sync::{Arc, atomic::AtomicU32},
+    time::Duration,
 };
 
 pub type PutIDForAKey = (u64, u32);
@@ -474,6 +479,171 @@ pub async fn handle_put_revoke(
     }
 }
 
+fn spawn_ssd_replica_persist_request(
+    view: &MasterKvRouterView,
+    key: String,
+    put_id: PutIDForAKey,
+    node_id: NodeID,
+    len: u64,
+    allocation: Arc<Allocation>,
+) {
+    let target_addr = allocation.base_addr() + allocation.addr();
+    let view = view.clone();
+    let view_task = view.clone();
+    let _ = view.spawn("post_put_ssd_replica_persist", async move {
+        let _allocation_guard = allocation;
+        let req = MsgPack {
+            serialize_part: SsdReplicaPersistReq {
+                key: key.clone(),
+                put_id,
+                target_addr,
+                len,
+            },
+            raw_bytes: Vec::new(),
+        };
+        let resp = RPCCaller::<SsdReplicaPersistReq>::new()
+            .call(
+                view_task.p2p_module(),
+                node_id.clone(),
+                req,
+                Some(Duration::from_secs(60)),
+                2,
+            )
+            .await;
+        match resp {
+            Ok(resp) => {
+                if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
+                    resp.serialize_part.error_code,
+                    resp.serialize_part.error_json,
+                ) {
+                    tracing::warn!(
+                        "SSD replica persist failed: key={} put_id=({},{}) node={} err={}",
+                        key,
+                        put_id.0,
+                        put_id.1,
+                        node_id,
+                        err
+                    );
+                } else if resp.serialize_part.persisted {
+                    tracing::debug!(
+                        "SSD replica persist completed: key={} put_id=({},{}) node={}",
+                        key,
+                        put_id.0,
+                        put_id.1,
+                        node_id
+                    );
+                } else {
+                    tracing::debug!(
+                        "SSD replica persist skipped because owner has no SSD store: key={} put_id=({},{}) node={}",
+                        key,
+                        put_id.0,
+                        put_id.1,
+                        node_id
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "SSD replica persist RPC failed: key={} put_id=({},{}) node={} err={:?}",
+                    key,
+                    put_id.0,
+                    put_id.1,
+                    node_id,
+                    err
+                );
+            }
+        }
+    });
+}
+
+fn ok_ssd_replica_commit_resp() -> MsgPack<SsdReplicaCommitResp> {
+    MsgPack {
+        serialize_part: SsdReplicaCommitResp {
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+            server_process_us: 0,
+        },
+        raw_bytes: Vec::new(),
+    }
+}
+
+pub async fn handle_ssd_replica_commit(
+    view: MasterKvRouterView,
+    req: MsgPack<SsdReplicaCommitReq>,
+) -> MsgPack<SsdReplicaCommitResp> {
+    let req = req.serialize_part;
+    let node_id: NodeID = req.node_id.clone().into();
+    let Some(route_ref) = view.master_kv_router().inner().kv_routes.get(&req.key) else {
+        tracing::debug!(
+            "Ignoring SSD replica commit for missing key: key={} put_id=({},{}) node={}",
+            req.key,
+            req.put_id.0,
+            req.put_id.1,
+            req.node_id
+        );
+        return ok_ssd_replica_commit_resp();
+    };
+    let route = route_ref.value().clone();
+    drop(route_ref);
+
+    if route.put_id != req.put_id {
+        tracing::debug!(
+            "Ignoring stale SSD replica commit: key={} req_put_id=({},{}) current_put_id=({},{}) node={}",
+            req.key,
+            req.put_id.0,
+            req.put_id.1,
+            route.put_id.0,
+            route.put_id.1,
+            req.node_id
+        );
+        return ok_ssd_replica_commit_resp();
+    }
+
+    let tomb_tag = {
+        let replicas = route.nodes_replicas.read();
+        let Some(memory_replica) = replicas.get(&node_id) else {
+            tracing::debug!(
+                "Ignoring SSD replica commit without matching memory replica: key={} put_id=({},{}) node={}",
+                req.key,
+                req.put_id.0,
+                req.put_id.1,
+                req.node_id
+            );
+            return ok_ssd_replica_commit_resp();
+        };
+        memory_replica.tomb_tag.clone()
+    };
+
+    if tomb_tag.is_tomb() {
+        tracing::debug!(
+            "Ignoring SSD replica commit for tombed node: key={} put_id=({},{}) node={}",
+            req.key,
+            req.put_id.0,
+            req.put_id.1,
+            req.node_id
+        );
+        return ok_ssd_replica_commit_resp();
+    }
+
+    route.ssd_replicas.write().insert(
+        node_id.clone(),
+        KvSsdRouteInfo {
+            node_id,
+            len: req.len,
+            tomb_tag,
+        },
+    );
+    tracing::debug!(
+        "Committed SSD replica route: key={} put_id=({},{}) node={} len={}",
+        req.key,
+        req.put_id.0,
+        req.put_id.1,
+        req.node_id,
+        req.len
+    );
+    ok_ssd_replica_commit_resp()
+}
+
 pub async fn handle_put_done(
     view: MasterKvRouterView,
     req: MsgPack<PutDoneReq>,
@@ -488,6 +658,7 @@ pub async fn handle_put_done(
     if let Some(InflightPutInfo {
         node_id,
         key,
+        len,
         src_target_allocation,
         ..
     }) = view
@@ -631,8 +802,9 @@ pub async fn handle_put_done(
         let completed_info = KvRouteInfo {
             node_id: node_id.clone(),
             allocation: Arc::new(target_allocation),
-            tomb_tag,
+            tomb_tag: tomb_tag.clone(),
         };
+        let target_allocation_for_ssd = Arc::clone(&completed_info.allocation);
 
         // Insert into kv_routes with replica support
         let mut old_one_kv_routes: Option<Arc<OneKvNodesRoutes>> = None;
@@ -649,6 +821,7 @@ pub async fn handle_put_done(
                         put_id,
                         lease_id: lease_id_opt,
                         nodes_replicas: RwLock::new(HashMap::new()),
+                        ssd_replicas: RwLock::new(HashMap::new()),
                         get_durable_slots_used: AtomicU32::new(0),
                     })
                 });
@@ -659,6 +832,7 @@ pub async fn handle_put_done(
                     put_id,
                     lease_id: lease_id_opt,
                     nodes_replicas: RwLock::new(HashMap::new()),
+                    ssd_replicas: RwLock::new(HashMap::new()),
                     get_durable_slots_used: AtomicU32::new(0),
                 });
             }
@@ -667,6 +841,15 @@ pub async fn handle_put_done(
                 .write()
                 .insert(node_id.clone(), completed_info);
         }
+
+        spawn_ssd_replica_persist_request(
+            &view,
+            key.clone(),
+            put_id,
+            node_id.clone(),
+            len,
+            target_allocation_for_ssd,
+        );
 
         if let Some(old) = old_one_kv_routes {
             if let Err(err) = view

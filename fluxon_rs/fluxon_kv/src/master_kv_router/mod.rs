@@ -15,13 +15,14 @@ use self::{
     msg_pack::{
         BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, CountPrefixReq, CountPrefixResp,
         DeleteAckReq, DeleteReq, GetAllocationMode, GetDoneReq, GetMetaReq, GetRevokeReq,
-        GetStartReq, PutDoneReq, PutRevokeReq, PutStartReq,
+        GetSourceKind, GetStartReq, PutDoneReq, PutRevokeReq, PutStartReq, SsdReplicaCommitReq,
     },
     placement::{PlacementDefault, PlacementPolicy},
-    put::{handle_put_done, handle_put_revoke, handle_put_start},
+    put::{handle_put_done, handle_put_revoke, handle_put_start, handle_ssd_replica_commit},
 };
 use crate::ClientKvApiAccessTrait;
 use crate::client_kv_api::ClientKvApi;
+use crate::client_kv_api::msg_pack::SsdReplicaPersistReq;
 use crate::cluster_manager::{
     ClusterEvent, ClusterManager, ClusterManagerAccessTrait, NodeID, NodeIDString,
 };
@@ -116,8 +117,10 @@ pub struct InflightGetInfo {
     pub req_node_id: NodeID,
     pub len: u64,
     pub allocation: Arc<Allocation>,
+    pub source_allocation: Option<Arc<Allocation>>,
     pub route: Arc<OneKvNodesRoutes>,
     pub allocation_mode: GetAllocationMode,
+    pub source_kind: GetSourceKind,
 }
 
 impl InflightGetInfo {
@@ -201,6 +204,13 @@ pub struct KvRouteInfo {
     pub tomb_tag: NodeTombTag,
 }
 
+#[derive(Clone, Debug)]
+pub struct KvSsdRouteInfo {
+    pub node_id: NodeID,
+    pub len: u64,
+    pub tomb_tag: NodeTombTag,
+}
+
 #[derive(Debug)]
 pub struct OneKvNodesRoutes {
     /// the version id for a kv put operation
@@ -230,6 +240,8 @@ pub struct OneKvNodesRoutes {
 
     /// node_id -> KvRouteInfo
     pub nodes_replicas: RwLock<HashMap<NodeID, KvRouteInfo>>,
+    /// node_id -> SSD replica metadata for the same key-version.
+    pub ssd_replicas: RwLock<HashMap<NodeID, KvSsdRouteInfo>>,
     pub get_durable_slots_used: AtomicU32,
 }
 
@@ -247,7 +259,14 @@ impl OneKvNodesRoutes {
         let mut nodes_replicas = self.nodes_replicas.write();
         nodes_replicas.retain(|_, kv_info| !tombs.contains(&kv_info.node_id));
 
+        let mut ssd_replicas = self.ssd_replicas.write();
+        ssd_replicas.retain(|_, kv_info| !tombs.contains(&kv_info.node_id));
+
         return true;
+    }
+
+    fn has_live_replica(&self) -> bool {
+        !self.nodes_replicas.read().is_empty() || !self.ssd_replicas.read().is_empty()
     }
 
     fn try_reserve_get_durable_slot(&self) -> bool {
@@ -283,6 +302,7 @@ mod tests {
             put_id: (1, 0),
             lease_id: None,
             nodes_replicas: RwLock::new(HashMap::new()),
+            ssd_replicas: RwLock::new(HashMap::new()),
             get_durable_slots_used: AtomicU32::new(0),
         };
 
@@ -607,6 +627,7 @@ impl MasterKvRouter {
 
     fn register_rpc_callers(&self) {
         RPCCaller::<BatchDeleteClientKvMetaCacheReq>::new().regist(self.0.view().p2p_module());
+        RPCCaller::<SsdReplicaPersistReq>::new().regist(self.0.view().p2p_module());
     }
 
     fn register_rpc_handlers(&self) {
@@ -761,6 +782,22 @@ impl MasterKvRouter {
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send PutDoneResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<SsdReplicaCommitReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let view_task = view2.clone();
+            let _ = view.spawn("rpc_ssd_replica_commit", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack = handle_ssd_replica_commit(view_task, msg).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send SsdReplicaCommitResp: {:?}", e);
                 }
             });
             Ok(())

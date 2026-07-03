@@ -148,6 +148,7 @@ fn new_client_config_with_cluster_and_dram(
         large_file_paths: crate::config::LargeFilePaths {
             paths: vec![format!("{}/large/{}", base, instance_key)],
         },
+        ssd_storage: None,
         test_spec_config: TestSpecConfig::default(),
     };
     println!("fluxonkv core created client config for test: {:?}", conf);

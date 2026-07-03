@@ -35,6 +35,8 @@ pub enum MsgId {
     DeleteAckResp = 3024,
     BatchDeleteAckReq = 3029,
     BatchDeleteAckResp = 3030,
+    SsdReplicaCommitReq = 3031,
+    SsdReplicaCommitResp = 3032,
     GetMetaReq = 3019,
     GetMetaResp = 3020,
     BatchDeleteClientKvMetaCacheReq = 3021,

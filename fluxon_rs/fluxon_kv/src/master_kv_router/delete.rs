@@ -130,7 +130,7 @@ pub fn evict_one_kv_replica_for_node(
         return Ok(());
     }
 
-    let last_replica_gone = route.nodes_replicas.read().is_empty();
+    let last_replica_gone = !route.has_live_replica();
     if last_replica_gone {
         let removed = view
             .master_kv_router()
