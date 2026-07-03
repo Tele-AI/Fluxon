@@ -1101,7 +1101,9 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     "-m",
                     "pip",
                     "install",
+                    "--no-index",
                     "--force-reinstall",
+                    "--no-deps",
                     str(release_root / wheel_name),
                 ],
             )
@@ -1183,8 +1185,12 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertIn('prepare_env_path="', script_text)
             self.assertIn('. "$prepare_env_path"', script_text)
             self.assertIn('restart_count_path="$log_dir/restart_count.txt"', script_text)
+            self.assertIn('inflight_path="$log_dir/inflight_attempt.txt"', script_text)
             self.assertIn('exec >>"$log_dir/stdout.log" 2>&1', script_text)
             self.assertIn("[ci_runner] start attempt=$restart_count", script_text)
+            self.assertIn("previous attempt did not write exit_code.txt; refusing to rerun", script_text)
+            self.assertIn("write_exit_code -1", script_text)
+            self.assertIn('rm -f "$inflight_path"', script_text)
             self.assertIn("[ci_runner] STEP 1 start label=", script_text)
             self.assertIn("[ci_runner] STEP 1 finish label=", script_text)
             subprocess.run(["bash", "-n", str(script_path)], check=True)

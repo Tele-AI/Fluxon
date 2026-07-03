@@ -44,6 +44,8 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
 
         self.assertIn("fluxon_test_stack/ci_2_virt_node.py", workflow_text)
         self.assertIn("Write ci_2_virt_node suite", workflow_text)
+        self.assertIn("timeout --preserve-status --signal=INT 17000s", workflow_text)
+        self.assertIn("ci_2_virt_node failed or timed out before GitHub job cancellation", workflow_text)
         self.assertIn("ci_top_attention_bin_kvtest", workflow_text)
         self.assertIn("ci_top_attention_doc_page_build", workflow_text)
         self.assertIn("ci_top_attention_mq_core", workflow_text)
@@ -62,6 +64,7 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertIn("for producer_count, consumer_count in ((8, 8), (32, 32), (160, 8))", workflow_text)
         self.assertIn('"30"', workflow_text)
         self.assertIn("nested largescale MQ diagnostics", workflow_text)
+        self.assertNotIn("Print ci_2_virt_node failure summary", workflow_text)
         self.assertIn("doc_site_base_url", workflow_text)
         self.assertIn("rather_no_git_submodule.py", workflow_text)
 

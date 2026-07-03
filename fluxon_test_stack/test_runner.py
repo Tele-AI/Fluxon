@@ -447,9 +447,11 @@ _RUNNER_STDIO_LOG_FP: Optional[Any] = None
 _RUNNER_STDIO_KEEPALIVE_FDS: Optional[Tuple[int, int]] = None
 _RUNNER_STDIO_MIRROR_THREAD: Optional[threading.Thread] = None
 _RUNNER_STDIO_ROUTER_THREAD: Optional[threading.Thread] = None
-_CI_WAIT_HEARTBEAT_INTERVAL_SECONDS = 15.0
-_CI_WAIT_STATUS_SNAPSHOT_INTERVAL_SECONDS = 60.0
+_CI_WAIT_HEARTBEAT_INTERVAL_SECONDS = 60.0
+_CI_WAIT_STATUS_SNAPSHOT_INTERVAL_SECONDS = 180.0
 _CI_WAIT_TAIL_MAX_CHARS = 8000
+_CONTROLLER_TRANSIENT_LOG_INTERVAL_SECONDS = 60.0
+_CONTROLLER_TRANSIENT_LOG_NEXT_AT: Dict[Tuple[str, str], float] = {}
 _TEST_RUNNER_UI_MAX_LOG_CHUNK_BYTES = 1024 * 1024
 _TEST_RUNNER_UI_HISTORY_SCHEMA_VERSION = 1
 _TEST_RUNNER_UI_DEFAULT_LOOKBACK_DAYS = 30
@@ -10955,6 +10957,24 @@ def _http_json_allow_error_status(req: urllib.request.Request) -> Tuple[int, Dic
             time.sleep(CONTROLLER_HTTP_RETRY_SLEEP_SECONDS)
 
 
+def _print_controller_transient_retry(
+    *,
+    source: str,
+    url: str,
+    detail: str,
+) -> None:
+    now = time.time()
+    key = (source, url)
+    next_at = _CONTROLLER_TRANSIENT_LOG_NEXT_AT.get(key, 0.0)
+    if now < next_at:
+        return
+    _CONTROLLER_TRANSIENT_LOG_NEXT_AT[key] = now + _CONTROLLER_TRANSIENT_LOG_INTERVAL_SECONDS
+    print(
+        f"[{source}] transient controller error; retrying: url={url} {detail}",
+        flush=True,
+    )
+
+
 def _http_json_allow_error_status_allow_empty_success(
     req: urllib.request.Request,
 ) -> Tuple[int, Any]:
@@ -10985,10 +11005,10 @@ def _http_json_allow_error_status_allow_empty_success(
                         "controller request timed out after retry deadline: "
                         f"url={req.full_url} err=HTTPError: {exc}"
                     ) from exc
-                print(
-                    f"[_http_json_allow_error_status_allow_empty_success] transient HTTP error; retrying: "
-                    f"url={req.full_url} status={exc.code}",
-                    flush=True,
+                _print_controller_transient_retry(
+                    source="_http_json_allow_error_status_allow_empty_success",
+                    url=str(req.full_url),
+                    detail=f"status={exc.code}",
                 )
                 time.sleep(CONTROLLER_HTTP_RETRY_SLEEP_SECONDS)
                 continue
@@ -11003,10 +11023,10 @@ def _http_json_allow_error_status_allow_empty_success(
                     "controller request timed out after retry deadline: "
                     f"url={req.full_url} err={type(exc).__name__}: {exc}"
                 ) from exc
-            print(
-                f"[_http_json_allow_error_status_allow_empty_success] transient transport error; retrying: "
-                f"url={req.full_url} err={type(exc).__name__}: {exc}",
-                flush=True,
+            _print_controller_transient_retry(
+                source="_http_json_allow_error_status_allow_empty_success",
+                url=str(req.full_url),
+                detail=f"err={type(exc).__name__}: {exc}",
             )
             time.sleep(CONTROLLER_HTTP_RETRY_SLEEP_SECONDS)
 
@@ -13746,7 +13766,9 @@ def _ci_prepare_run_inputs(
             "-m",
             "pip",
             "install",
+            "--no-index",
             "--force-reinstall",
+            "--no-deps",
             str(wheel),
         ],
         cwd=str(src_root),
@@ -14222,6 +14244,7 @@ fi
 	log_dir="{run_dir.as_posix()}/logs/ci_runner"
 	mkdir -p "$log_dir"
 	exit_code_path="$log_dir/exit_code.txt"
+	inflight_path="$log_dir/inflight_attempt.txt"
 	restart_count_path="$log_dir/restart_count.txt"
 	exec >>"$log_dir/stdout.log" 2>&1
 	if [ -f "$restart_count_path" ]; then
@@ -14236,31 +14259,38 @@ fi
 	printf '%s\n' "$restart_count" > "$restart_count_path"
 	echo
 	echo "[ci_runner] start attempt=$restart_count pid=$$ ppid=$PPID host=$(hostname) started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	hold_until_controller_stop() {{
+	  while true; do
+	    sleep 3600 &
+	    hold_pid=$!
+	    wait "$hold_pid"
+	    hold_pid=""
+	  done
+	}}
+	write_exit_code() {{
+	  printf '%s\n' "$1" > "$exit_code_path"
+	}}
 	# The CI runner workload is a Deployment and may be restarted.
 	# Once exit_code.txt is written, the run is terminal. If we restart, we must not delete it
 	# or re-run tests, otherwise the runner can never converge.
 	if [ -f "$exit_code_path" ]; then
 	  prev="$(cat "$exit_code_path" 2>/dev/null || echo "")"
 	  echo "[ci_runner] found existing exit_code=$prev; holding until controller stop"
-	  while true; do
-	    sleep 3600 &
-	    hold_pid=$!
-	    wait "$hold_pid"
-	    hold_pid=""
-	  done
+	  hold_until_controller_stop
 	fi
-	write_exit_code() {{
-	  printf '%s\n' "$1" > "$exit_code_path"
-	}}
+	if [ -f "$inflight_path" ]; then
+	  prev_attempt="$(cat "$inflight_path" 2>/dev/null || echo "")"
+	  echo "[ci_runner] previous attempt did not write exit_code.txt; refusing to rerun: $prev_attempt"
+	  write_exit_code -1
+	  echo "[ci_runner] wrote exit_code=-1 after restart without terminal exit; holding until controller stop"
+	  hold_until_controller_stop
+	fi
+	printf 'attempt=%s pid=%s ppid=%s host=%s started_at_utc=%s\n' "$restart_count" "$$" "$PPID" "$(hostname)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$inflight_path"
 	fail_and_exit() {{
 	  write_exit_code "$1"
+	  rm -f "$inflight_path"
 	  echo "[ci_runner] wrote exit_code=$1; holding until controller stop"
-	  while true; do
-	    sleep 3600 &
-	    hold_pid=$!
-	    wait "$hold_pid"
-	    hold_pid=""
-	  done
+	  hold_until_controller_stop
 	}}
 
 prepare_env_path="{_ci_prepare_env_path(run_dir=run_dir).as_posix()}"

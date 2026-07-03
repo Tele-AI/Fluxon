@@ -290,14 +290,17 @@ jobs:
 
       - name: Run ci_2_virt_node full flow
         run: |
-          python3 fluxon_test_stack/ci_2_virt_node.py \
-            --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
-            --print-generated \
-            --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy"
-
-      - name: Print ci_2_virt_node failure summary
-        if: ${{ failure() }}
-        run: |
+          set +e
+          timeout --preserve-status --signal=INT 17000s \
+            python3 fluxon_test_stack/ci_2_virt_node.py \
+              --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
+              --print-generated \
+              --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy"
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          echo "ci_2_virt_node failed or timed out before GitHub job cancellation: rc=$rc"
           python3 - <<'PY'
           from pathlib import Path
           import yaml
@@ -359,6 +362,7 @@ jobs:
               for path in sorted(nested_root.glob("*/test_runner.log")):
                   print_tail(path)
           PY
+          exit "$rc"
 
       - name: Normalize ci_2_virt_node debug artifact permissions
         if: ${{ always() }}
