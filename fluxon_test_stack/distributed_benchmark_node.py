@@ -942,6 +942,8 @@ class MsgType(Enum):
     REGISTER = "register"
     READY = "ready"
     START = "start"
+    RUNTIME_READY = "runtime_ready"
+    RUNTIME_START = "runtime_start"
     RESULT = "result"
     ROUND_STATUS = "round_status"
 
@@ -3657,6 +3659,69 @@ class BenchmarkNode:
                         return cluster_ready_timeout_s + START_WAIT_POLL_INTERVAL_SECONDS
         return DEFAULT_START_WAIT_TIMEOUT_SECONDS
 
+    def _wait_for_mpmc_runtime_start(self) -> bool:
+        """Synchronize timed MPMC workers after every node has opened its runtime endpoints."""
+        if not isinstance(self.test_config, dict):
+            logger.error("❌ MPMC runtime_start requires test_config")
+            return False
+        node_id = self.node_id
+        runtime_ready_message = {
+            "type": MsgType.RUNTIME_READY.value,
+            "node_id": node_id,
+            "timestamp": time.time(),
+        }
+        try:
+            ready_response = self._send_rpc_with_retry(
+                rpc_name="RUNTIME_READY",
+                message_factory=lambda: {
+                    **runtime_ready_message,
+                    "timestamp": time.time(),
+                },
+                success_statuses=("success", "waiting"),
+                request_timeout_seconds=READY_RPC_TIMEOUT_SECONDS,
+                retry_deadline_seconds=self._resolve_ready_rpc_retry_deadline_seconds(),
+            )
+        except Exception as exc:
+            logger.error("💥 MPMC runtime_ready 请求失败: %s", exc)
+            return False
+        if ready_response is None:
+            return False
+
+        wait_timeout_s = self._resolve_start_wait_timeout_seconds()
+        wait_deadline = time.monotonic() + wait_timeout_s
+        runtime_start_message = {
+            "type": MsgType.RUNTIME_START.value,
+            "node_id": node_id,
+            "timestamp": time.time(),
+        }
+        logger.info(
+            "⏳ 等待 MPMC runtime_start: timeout_s=%.1f",
+            wait_timeout_s,
+        )
+        while True:
+            remaining_s = wait_deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                logger.error("❌ 等待 MPMC runtime_start 超时: timeout_s=%.1f", wait_timeout_s)
+                return False
+            response = self.send_rpc_message(
+                self.coordinator_host,
+                self.coordinator_port,
+                {
+                    **runtime_start_message,
+                    "timestamp": time.time(),
+                },
+                timeout=max(5.0, min(120.0, remaining_s + START_WAIT_POLL_INTERVAL_SECONDS)),
+            )
+            status = response.get("status") if isinstance(response, dict) else None
+            if status == "success":
+                logger.info(
+                    "✅ MPMC runtime_start released: runtime_ready=%s/%s",
+                    response.get("runtime_ready_count"),
+                    response.get("expected_nodes"),
+                )
+                return True
+            time.sleep(min(START_WAIT_POLL_INTERVAL_SECONDS, remaining_s))
+
     def wait_for_start(self) -> bool:
         """
         等待协调者发出开始信号。
@@ -4452,6 +4517,17 @@ class BenchmarkNode:
                     round_state.start_event.set()
                     return
                 time.sleep(0.2)
+
+        if not self._wait_for_mpmc_runtime_start():
+            self._set_forced_benchmark_result(
+                reason="mpmc_runtime_start_timeout",
+                total_workers=workers,
+                completed_workers=completed,
+                timed_out_worker_ids=sorted(pending_threads.keys()),
+            )
+            self._benchmark_stop.set()
+            round_state.start_event.set()
+            return
 
         self.start_time = time.time()
         self.end_time = self.start_time + int(self.test_config["max_benchmark_seconds"])

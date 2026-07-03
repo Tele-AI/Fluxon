@@ -90,6 +90,8 @@ class MsgType(Enum):
     REGISTER = "register"
     READY = "ready"
     START = "start"
+    RUNTIME_READY = "runtime_ready"
+    RUNTIME_START = "runtime_start"
     RESULT = "result"
     ROUND_STATUS = "round_status"
 
@@ -1504,6 +1506,7 @@ class CoordinatorServer:
         # safely even after the coordinator advances to the next round.
         self.round_gate_states: Dict[str, Dict[str, Any]] = {}
         self.ready_nodes_for_current_test: set[str] = set()
+        self.runtime_ready_nodes_for_current_test: set[str] = set()
         self.lock = threading.Lock()
         self.all_nodes_ready = threading.Event()
         self.all_results_received = threading.Event()
@@ -1926,6 +1929,18 @@ class CoordinatorServer:
                     logger.warning(f"❌ 向节点 {node_id} 发送就绪响应失败")
             elif msg_type == "start":
                 self.handle_start_request(message, client_socket)
+            elif msg_type == "runtime_ready":
+                if not node_id:
+                    node_id = message.get("node_id")
+                logger.debug(f"✅ 处理 runtime_ready 消息: {node_id}")
+                if not self.handle_runtime_ready(message, client_socket):
+                    logger.warning(f"❌ 向节点 {node_id} 发送 runtime_ready 响应失败")
+            elif msg_type == "runtime_start":
+                if not node_id:
+                    node_id = message.get("node_id")
+                logger.debug(f"▶️ 处理 runtime_start 消息: {node_id}")
+                if not self.handle_runtime_start_request(message, client_socket):
+                    logger.warning(f"❌ 向节点 {node_id} 发送 runtime_start 响应失败")
             elif msg_type == "result":
                 if not node_id:
                     node_id = message.get("node_id")
@@ -2009,6 +2024,78 @@ class CoordinatorServer:
             }
             if not self._send_tcp_response(client_socket, response):
                 logger.warning(f"❌ 向节点 {node_id} 发送开始测试响应失败")
+
+    def handle_runtime_ready(self, message: Dict, client_socket: socket.socket) -> bool:
+        """Handle post-START runtime-ready state for MPMC benchmarks."""
+        node_id = message.get("node_id")
+        if not isinstance(node_id, str) or not node_id.strip():
+            return self._send_tcp_response(
+                client_socket,
+                {"status": "error", "error": "runtime_ready missing node_id"},
+            )
+        with self.lock:
+            if node_id not in self.registered_nodes:
+                logger.warning("⚠️ 未注册的节点报告 runtime_ready: %s", node_id)
+                return self._send_tcp_response(
+                    client_socket,
+                    {"status": "error", "error": f"unregistered node: {node_id}"},
+                )
+            self.runtime_ready_nodes_for_current_test.add(node_id)
+            ready_count = len(self.runtime_ready_nodes_for_current_test)
+            ready_node_ids = sorted(self.runtime_ready_nodes_for_current_test)
+            all_runtime_ready = ready_count >= self.expected_nodes
+            logger.info(
+                "✅ MPMC runtime ready: node_id=%s runtime_ready=%s/%s",
+                node_id,
+                ready_count,
+                self.expected_nodes,
+            )
+        status = "success" if all_runtime_ready else "waiting"
+        return self._send_tcp_response(
+            client_socket,
+            {
+                "status": status,
+                "runtime_ready_count": ready_count,
+                "runtime_ready_node_ids": ready_node_ids,
+                "expected_nodes": int(self.expected_nodes),
+            },
+        )
+
+    def handle_runtime_start_request(self, message: Dict, client_socket: socket.socket) -> bool:
+        """Allow MPMC nodes to start the timed window only after all runtimes are ready."""
+        node_id = message.get("node_id")
+        if not isinstance(node_id, str) or not node_id.strip():
+            return self._send_tcp_response(
+                client_socket,
+                {"status": "error", "error": "runtime_start missing node_id"},
+            )
+        with self.lock:
+            if node_id not in self.registered_nodes:
+                logger.warning("⚠️ 未注册的节点请求 runtime_start: %s", node_id)
+                return self._send_tcp_response(
+                    client_socket,
+                    {"status": "error", "error": f"unregistered node: {node_id}"},
+                )
+            ready_count = len(self.runtime_ready_nodes_for_current_test)
+            ready_node_ids = sorted(self.runtime_ready_nodes_for_current_test)
+            all_runtime_ready = ready_count >= self.expected_nodes
+        status = "success" if all_runtime_ready else "waiting"
+        if status == "success":
+            logger.info(
+                "🎯 MPMC runtime start released: node_id=%s runtime_ready=%s/%s",
+                node_id,
+                ready_count,
+                self.expected_nodes,
+            )
+        return self._send_tcp_response(
+            client_socket,
+            {
+                "status": status,
+                "runtime_ready_count": ready_count,
+                "runtime_ready_node_ids": ready_node_ids,
+                "expected_nodes": int(self.expected_nodes),
+            },
+        )
 
     @staticmethod
     def _deep_merge(dst: dict, patch: dict) -> dict:
@@ -2411,6 +2498,7 @@ class CoordinatorServer:
                 "completion_error": None,
             }
             self.ready_nodes_for_current_test = set()
+            self.runtime_ready_nodes_for_current_test = set()
             # 新一轮测试前清理状态
             self.all_nodes_ready.clear()
             self.all_results_received.clear()

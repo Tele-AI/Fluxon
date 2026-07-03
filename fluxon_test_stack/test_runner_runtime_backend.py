@@ -480,6 +480,7 @@ def _wait_and_load_test_stack_benchmark_result_json(
 ) -> Dict[str, Any]:
     deadline = time.time() + float(timeout_s)
     last_err: Optional[str] = None
+    result_cached = False
     while True:
         try:
             raw = ctx._instance_read_text_if_present(
@@ -491,6 +492,9 @@ def _wait_and_load_test_stack_benchmark_result_json(
                 raise FileNotFoundError(
                     f"result file is not present yet: instance_id={writer_instance_id} path={result_path}"
                 )
+            if not result_cached and (not result_path.exists() or result_path.read_text(encoding="utf-8") != raw):
+                result_path.write_text(raw, encoding="utf-8")
+                result_cached = True
             parsed = json.loads(raw)
             result_obj = ctx._require_dict(parsed, "test_stack.benchmark_result")
             runs = ctx._require_list(result_obj.get("runs"), "benchmark_result.runs")
@@ -499,11 +503,12 @@ def _wait_and_load_test_stack_benchmark_result_json(
             run0 = ctx._require_dict(runs[0], "benchmark_result.runs[0]")
             completion = ctx._require_dict(run0.get("completion"), "benchmark_result.runs[0].completion")
             _ = ctx._require_str(completion.get("status"), "benchmark_result.runs[0].completion.status")
-            if not result_path.exists() or result_path.read_text(encoding="utf-8") != raw:
-                result_path.write_text(raw, encoding="utf-8")
             return result_obj
         except Exception as exc:  # noqa: BLE001
-            last_err = f"{type(exc).__name__}: {exc}"
+            raw_err = str(exc)
+            if len(raw_err) > 1000:
+                raw_err = raw_err[:1000] + "...<truncated>"
+            last_err = f"{type(exc).__name__}: {raw_err}"
             if time.time() >= deadline:
                 raise ValueError(
                     f"benchmark result json did not become readable/valid within timeout: "
