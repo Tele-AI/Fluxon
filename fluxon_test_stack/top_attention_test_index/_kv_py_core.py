@@ -11,6 +11,7 @@ def main() -> int:
     return run_pytest(
         "Flat index entry for Python KV backend core smoke tests.",
         [
+            "fluxon_py/tests/test_pyo3_etcd.py",
             "fluxon_py/tests/test_backend.py",
             "fluxon_py/tests/test_backend_fallback_close.py",
         ],

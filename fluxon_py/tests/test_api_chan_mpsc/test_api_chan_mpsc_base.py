@@ -97,7 +97,6 @@ CONSUMER_CONSTRUCTED_MARKER = "CONSUMER_CONSTRUCTED:"
 # Pre-init must stay alive to keep MPMC payload leases valid; the parent releases it via an etcd key.
 # Time limits are explicit to avoid orphaned pre_init processes when the parent crashes.
 PRE_INIT_RELEASE_KEY_PREFIX = "/test_api_chan_mpsc_preinit_release"
-PRE_INIT_CHAN_ID_WAIT_SECONDS = 30
 PRE_INIT_RELEASE_WAIT_SECONDS = 300
 
 
@@ -1192,36 +1191,6 @@ def test_mpsc_producer_consumer_inner(
         release(env, pre_init_store_key)
         return False
 
-    reader_thread = threading.Thread(target=_drain_pre_init_output, daemon=True)
-    reader_thread.start()
-
-    deadline = time.time() + PRE_INIT_CHAN_ID_WAIT_SECONDS
-    while True:
-        if chan_id_ready.is_set():
-            break
-        if pre_init_proc.poll() is not None:
-            break
-        if time.time() >= deadline:
-            break
-        time.sleep(0.1)
-
-    with chan_id_lock:
-        chan_id_1_local = chan_id_1
-        chan_id_2_local = chan_id_2
-
-    if not chan_id_1_local or not chan_id_2_local:
-        env.logger.warning(
-            "Failed to get channel IDs from pre_init (exit_code=%s). "
-            "chan_id_1=%s, chan_id_2=%s. See pre_init.log for details.",
-            pre_init_proc.returncode,
-            chan_id_1_local,
-            chan_id_2_local,
-        )
-        return False
-
-    chan_id_1 = chan_id_1_local
-    chan_id_2 = chan_id_2_local
-
     processes: List[Tuple[str, List[str]]] = []
     for idx in range(4):
         cmd = [
@@ -1650,14 +1619,6 @@ def test_new_or_bind_unique_key_namespace_collision() -> None:
     finally:
         release(env)
 
-
-
-def main() -> None:
-    cli()
-
-
-if __name__ == "__main__":
-    main()
 def _wait_fluxon_member_absent(instance_key: str, *, timeout_s: int = TEST_TIMEOUT_SECONDS) -> None:
     """Wait until a fluxon cluster member key disappears from etcd.
 

@@ -11,7 +11,7 @@ from _common import call, load_case_config_payload
 
 TEST_REQUIREMENTS = ["etcd", "fluxon-pyo3", "kv-cluster", "ops", "submodules"]
 SCENE_ID = "ci_top_attention_mq_core"
-TEST_PATHS = [
+SCRIPT_PATHS = [
     "fluxon_py/tests/test_mq/test_capacity_and_auto_clean.py",
     "fluxon_py/tests/test_mq/test_payload_lease_error.py",
 ]
@@ -33,7 +33,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.case_config:
         load_case_config_payload(Path(args.case_config).resolve(), expected_scene_id=SCENE_ID)
-    for test_path in TEST_PATHS:
+    for test_path in SCRIPT_PATHS:
         rc = call([args.python, "-u", str((Path(__file__).resolve().parents[2] / test_path))])
         if rc != 0:
             return rc

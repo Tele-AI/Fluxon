@@ -12,9 +12,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Tuple
-
-import etcd3
+from typing import Any, List, Optional, Tuple
 
 # Bootstrap import path to project root so absolute imports always work
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -33,8 +31,6 @@ from fluxon_py.api_ext_chan import ChanType  # noqa: E402
 from fluxon_py.api_error import MessageConsumptionNoNewMessageError  # noqa: E402
 from fluxon_py.logging import init_logger  # noqa: E402
 from fluxon_py.tests.test_lib import (  # noqa: E402
-    ETCD_HOST,
-    ETCD_PORT,
     KV_SVC_TYPE,
     KV_SVC_IP,
     setup_test_environment,
@@ -44,6 +40,10 @@ from fluxon_py.tests.test_lib import (  # noqa: E402
     new_shared_stores,
     load_test_fluxon_cluster_name,
     run_with_argmatrix,
+    etcd_control_call_with_retry as _etcd_call_with_retry,
+    etcd_control_delete_prefix as _etcd_delete_prefix,
+    etcd_control_get as _etcd_get,
+    etcd_control_put as _etcd_put,
 )
 from fluxon_py.kvclient import KvClientType, new_store  # noqa: E402
 from fluxon_py.kvclient.kvclient_interface import KvClient  # noqa: E402
@@ -116,22 +116,20 @@ def _wait_fluxon_member_absent(instance_key: str, *, timeout_s: int = 45) -> Non
     cluster = load_test_fluxon_cluster_name()
     key = f"/fluxon_kv_member_base/{cluster}/members/{instance_key}"
     deadline = time.time() + float(timeout_s)
-    with etcd3.client(ETCD_HOST, ETCD_PORT) as etcd_client:
-        while True:
-            val = etcd_client.get(key)[0]
-            if val is None:
-                return
-            if time.time() >= deadline:
-                raise RuntimeError(
-                    f"member key still exists after wait: {key}. Previous lease not expired"
-                )
-            # Progress logging is handled by the caller; keep quiet here.
-            time.sleep(1.0)
+    while True:
+        val = _etcd_get(key)
+        if val is None:
+            return
+        if time.time() >= deadline:
+            raise RuntimeError(
+                f"member key still exists after wait: {key}. Previous lease not expired"
+            )
+        # Progress logging is handled by the caller; keep quiet here.
+        time.sleep(1.0)
 
 
 # ------------------- Local CLI for subprocess workers -------------------
 import argparse
-from typing import Optional
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -277,14 +275,25 @@ def _create_store(env: ChannelState, instance_key: str) -> KvClient:
 
 # ------------------- Local verification and cleanup -------------------
 def clean_etcd() -> None:
-    with etcd3.client(ETCD_HOST, ETCD_PORT) as etcd_client:
-        etcd_client.delete_prefix("/mpmc_channels")
-        etcd_client.delete_prefix("/channels")
-        etcd_client.delete_prefix("/test_mpmc_stop_consumer")
-        etcd_client.delete_prefix("/test_mpmc_consumer")
-        etcd_client.delete_prefix("/test_mpmc_stop_producer")
-        etcd_client.delete_prefix(PRODUCER_PAUSE_KEY)
-        etcd_client.delete_prefix("/test_mpmc_rebind")
+    _etcd_delete_prefix("/mpmc_channels")
+    _etcd_delete_prefix("/channels")
+    _etcd_delete_prefix("/test_mpmc_stop_consumer")
+    _etcd_delete_prefix("/test_mpmc_consumer")
+    _etcd_delete_prefix("/test_mpmc_stop_producer")
+    _etcd_delete_prefix(PRODUCER_PAUSE_KEY)
+    _etcd_delete_prefix("/test_mpmc_rebind")
+
+
+def _read_log_tail(path: str, *, max_lines: int = 80) -> str:
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return f"<missing log: {path}>"
+    except OSError as exc:
+        return f"<failed to read log {path}: {exc}>"
+    if not lines:
+        return "<empty log>"
+    return "\n".join(lines[-max_lines:])
 
 
 def verify_production_consumption_counts(
@@ -407,12 +416,11 @@ def run_producer(env, args: argparse.Namespace) -> None:
         print(f"[Producer-{args.producer_id}] Started", flush=True)
         try:
             import uuid, random
-            etcd_client = producer.etcd_client
             index = 0
 
             while True:
                 # Check stop first
-                stop_flag, _ = etcd_client.get("/test_mpmc_stop_producer")
+                stop_flag = _etcd_get("/test_mpmc_stop_producer")
                 if stop_flag:
                     logging.info(
                         f"[RBD-STOP] Producer-{args.producer_id} stop flag detected"
@@ -422,7 +430,7 @@ def run_producer(env, args: argparse.Namespace) -> None:
                 i=0
                 while True:
                     i+=1
-                    pause_flag, _ = etcd_client.get(PRODUCER_PAUSE_KEY)
+                    pause_flag = _etcd_get(PRODUCER_PAUSE_KEY)
                     if not pause_flag:
                         logging.info(
                             f"[RBD-RESUME] Producer-{args.producer_id} resumed"
@@ -430,7 +438,7 @@ def run_producer(env, args: argparse.Namespace) -> None:
                         break
                     logging.info(f"[RBD-PAUSE] Producer-{args.producer_id} paused, loop i {i}")
                     # allow quick reaction to stop while paused
-                    stop_flag, _ = etcd_client.get("/test_mpmc_stop_producer")
+                    stop_flag = _etcd_get("/test_mpmc_stop_producer")
                     if stop_flag:
                         logging.info(
                             f"[RBD-STOP] Producer-{args.producer_id} stop while paused"
@@ -441,7 +449,7 @@ def run_producer(env, args: argparse.Namespace) -> None:
                     break
                 # Read current loop index to embed into message key for verification per loop
                 try:
-                    loop_val, _ = etcd_client.get(REBIND_LOOP_KEY)
+                    loop_val = _etcd_get(REBIND_LOOP_KEY)
                     loop_idx = int(loop_val.decode()) if loop_val else -1
                 except Exception:
                     loop_idx = -1
@@ -466,7 +474,7 @@ def run_producer(env, args: argparse.Namespace) -> None:
                     )
                     print(f"PRODUCE_MARKER: {args.producer_id}:{msg_id}")
                     # Track production per loop in etcd for gating
-                    etcd_client.put(
+                    _etcd_put(
                         f"/test_mpmc_rebind/produced/{loop_idx}/{args.producer_id}/{unique_id}",
                         b"",
                     )
@@ -528,11 +536,10 @@ def run_consumer(env, args: argparse.Namespace) -> None:
             f"[Consumer-{args.consumer_id}] Started with mpmc consumer {consumer.mpmc_channel.mpmc_member_id}",
             flush=True,
         )
-        etcd_client = consumer.etcd_client
-        etcd_client.put(
+        _etcd_put(
             f"/test_mpmc_consumer/{args.consumer_id}",
             b"dummy_value",
-            consumer.mpmc_channel.mpmc_global_lease,
+            lease_id=int(consumer.mpmc_channel.mpmc_global_lease.id),
         )
         logging.info(
             f"[RBD-REGISTER] Consumer-{args.consumer_id} registered in etcd"
@@ -581,7 +588,7 @@ def run_consumer(env, args: argparse.Namespace) -> None:
                                         raise ValueError(f"Invalid loop index in message id: {unique_id_str}")
                                     li = int(li_str)
                             if li >= 0:
-                                etcd_client.put(
+                                _etcd_put(
                                     f"/test_mpmc_rebind/consumed/{li}/{args.consumer_id}/{unique_id_str}",
                                     b"",
                                 )
@@ -621,9 +628,7 @@ def run_consumer(env, args: argparse.Namespace) -> None:
                             )
                             break
                     time.sleep(0.5)
-                stop_flag, _ = etcd_client.get(
-                    f"/test_mpmc_stop_consumer/{args.consumer_id}"
-                )
+                stop_flag = _etcd_get(f"/test_mpmc_stop_consumer/{args.consumer_id}")
                 if stop_flag:
                     # enter draining mode: keep getting until one timeout/no-data
                     if not draining:
@@ -680,11 +685,10 @@ def test_mpmc_rebind_client() -> None:
             )
             shutil.rmtree("logs", ignore_errors=True)
             clean_etcd()
-            with etcd3.client(ETCD_HOST, ETCD_PORT) as etcd_client:
-                if etcd_client.get("/test_mpmc_stop_producer")[0] is not None:
-                    raise RuntimeError(
-                        "precondition failed: /test_mpmc_stop_producer exists before test start"
-                    )
+            if _etcd_get("/test_mpmc_stop_producer") is not None:
+                raise RuntimeError(
+                    "precondition failed: /test_mpmc_stop_producer exists before test start"
+                )
             logging.info("[RBD-CTL-ETCD-CLEAN] cleared test prefixes")
 
             os.makedirs("logs", exist_ok=True)
@@ -730,91 +734,90 @@ def test_mpmc_rebind_client() -> None:
             )
 
             # Repeatedly stop and restart a single consumer while producers keep producing
-            etcd_client = etcd3.client(ETCD_HOST, ETCD_PORT)
             # initialize loop index for producers to tag messages
-            etcd_client.put(REBIND_LOOP_KEY, b"0")
+            _etcd_put(REBIND_LOOP_KEY, b"0")
             logging.info("[RBD-CTL-LOOPKEY] set loop_idx=0")
 
-            try:
-                for i in range(LOOPS - 1):
-                    logging.info(f"[RBD-CTL-LOOP] round={i} active_window={ACTIVE_WINDOW_SEC}s")
-                    # Soft window to allow production
-                    time.sleep(ACTIVE_WINDOW_SEC)
+            for i in range(LOOPS - 1):
+                logging.info(f"[RBD-CTL-LOOP] round={i} active_window={ACTIVE_WINDOW_SEC}s")
+                # Soft window to allow production
+                time.sleep(ACTIVE_WINDOW_SEC)
 
-                    # Pause producers and stop current consumer to drain until last get_data times out
-                    etcd_client.put(PRODUCER_PAUSE_KEY, b"1")
-                    logging.info("[RBD-CTL-PAUSE] producers paused")
-                    etcd_client.put(
-                        f"/test_mpmc_stop_consumer/{current_consumer}", b"dummy_value"
-                    )
-                    logging.info(
-                        f"[RBD-CTL-STOP-CONS] request stop consumer={current_consumer}"
-                    )
-                    while True:
-                        status, _ = etcd_client.get(
-                            f"/test_mpmc_consumer/{current_consumer}"
-                        )
-                        if not status:
-                            break
-                        time.sleep(0.5)
-                    logging.info(
-                        f"[RBD-CTL-WAIT-CONS] consumer exited id={current_consumer}"
-                    )
-
-                    # Switch to next loop index now that previous consumer fully drained and exited
-                    etcd_client.put(REBIND_LOOP_KEY, str(i + 1).encode())
-                    logging.info(f"[RBD-CTL-LOOPKEY] set loop_idx={i+1}")
-
-                    # Short gap, then start next consumer for next loop and resume producers
-                    time.sleep(INACTIVE_GAP_SEC)
-                    next_consumer = f"C{i+1}"
-                    print(
-                        f"[rebind_client] starting next consumer {next_consumer}",
-                        flush=True,
-                    )
-                    spawn(
-                        "consumer",
-                        _consumer_cmd(
-                            env.backend_type, env.backend_ip, next_consumer, prefetch
-                        ),
-                        next_consumer,
-                    )
-                    current_consumer = next_consumer
-                    # Resume producers for next round
-                    etcd_client.delete(PRODUCER_PAUSE_KEY)
-                    logging.info("[RBD-CTL-RESUME] producers resumed")
-
-                # After last loop index set, stop producers, then stop last consumer (which drains before exit)
-                etcd_client.put(PRODUCER_PAUSE_KEY, b"1")
-                logging.info("[RBD-CTL-FINAL-PAUSE] producers paused before shutdown")
-                etcd_client.put("/test_mpmc_stop_producer", b"dummy_value")
-                logging.info("[RBD-CTL-STOP-PROD] stop producers signaled")
-                for process_type, proc, log_file in subprocesses:
-                    if process_type != "producer":
-                        continue
-                    logging.info(f"[RBD-CTL-WAIT-PROD] waiting producer log={log_file}")
-                    proc.wait()
-                    if proc.returncode != 0:
-                        raise RuntimeError(
-                            f"producer failed with return code {proc.returncode}. Check log: {log_file}"
-                        )
-                logging.info("[RBD-CTL-PROD-DONE] producers exited")
-                # Stop the last consumer and wait for consumers to exit (drains until last get timeout)
-                etcd_client.put(
-                    f"/test_mpmc_stop_consumer/{current_consumer}", b"dummy_value"
-                )
+                # Pause producers and stop current consumer to drain until last get_data times out
+                _etcd_put(PRODUCER_PAUSE_KEY, b"1")
+                logging.info("[RBD-CTL-PAUSE] producers paused")
+                _etcd_put(f"/test_mpmc_stop_consumer/{current_consumer}", b"dummy_value")
                 logging.info(
-                    f"[RBD-CTL-STOP-LAST-CONS] request stop consumer={current_consumer}"
+                    f"[RBD-CTL-STOP-CONS] request stop consumer={current_consumer}"
                 )
-            finally:
-                etcd_client.close()
+                while True:
+                    status = _etcd_get(f"/test_mpmc_consumer/{current_consumer}")
+                    if not status:
+                        break
+                    time.sleep(0.5)
+                logging.info(
+                    f"[RBD-CTL-WAIT-CONS] consumer exited id={current_consumer}"
+                )
+
+                # Switch to next loop index now that previous consumer fully drained and exited
+                _etcd_put(REBIND_LOOP_KEY, str(i + 1).encode())
+                logging.info(f"[RBD-CTL-LOOPKEY] set loop_idx={i+1}")
+
+                # Short gap, then start next consumer for next loop and resume producers
+                time.sleep(INACTIVE_GAP_SEC)
+                next_consumer = f"C{i+1}"
+                print(
+                    f"[rebind_client] starting next consumer {next_consumer}",
+                    flush=True,
+                )
+                spawn(
+                    "consumer",
+                    _consumer_cmd(
+                        env.backend_type, env.backend_ip, next_consumer, prefetch
+                    ),
+                    next_consumer,
+                )
+                current_consumer = next_consumer
+                # Resume producers for next round
+                _etcd_call_with_retry(
+                    f"delete producer pause key {PRODUCER_PAUSE_KEY}",
+                    lambda client: client.delete(PRODUCER_PAUSE_KEY),
+                )
+                logging.info("[RBD-CTL-RESUME] producers resumed")
+
+            # After last loop index set, stop producers, then stop last consumer (which drains before exit)
+            _etcd_put(PRODUCER_PAUSE_KEY, b"1")
+            logging.info("[RBD-CTL-FINAL-PAUSE] producers paused before shutdown")
+            _etcd_put("/test_mpmc_stop_producer", b"dummy_value")
+            logging.info("[RBD-CTL-STOP-PROD] stop producers signaled")
+            for process_type, proc, log_file in subprocesses:
+                if process_type != "producer":
+                    continue
+                logging.info(f"[RBD-CTL-WAIT-PROD] waiting producer log={log_file}")
+                proc.wait()
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"producer failed with return code {proc.returncode}. Check log: {log_file}\n"
+                        "--- child log tail ---\n"
+                        f"{_read_log_tail(log_file)}\n"
+                        "--- end child log tail ---"
+                    )
+            logging.info("[RBD-CTL-PROD-DONE] producers exited")
+            # Stop the last consumer and wait for consumers to exit (drains until last get timeout)
+            _etcd_put(f"/test_mpmc_stop_consumer/{current_consumer}", b"dummy_value")
+            logging.info(
+                f"[RBD-CTL-STOP-LAST-CONS] request stop consumer={current_consumer}"
+            )
 
             for process_type, proc, log_file in subprocesses:
                 logging.info(f"[RBD-CTL-WAIT] waiting {process_type} log={log_file}")
                 proc.wait()
                 if proc.returncode != 0:
                     raise RuntimeError(
-                        f"{process_type} failed with return code {proc.returncode}. Check log: {log_file}"
+                        f"{process_type} failed with return code {proc.returncode}. Check log: {log_file}\n"
+                        "--- child log tail ---\n"
+                        f"{_read_log_tail(log_file)}\n"
+                        "--- end child log tail ---"
                     )
             logging.info("[RBD-CTL-ALL-DONE] all subprocesses exited")
 

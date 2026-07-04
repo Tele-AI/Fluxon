@@ -19,23 +19,15 @@ root_nav:
     nav_link_mode: index
   - kind: dir
     path: dev_doc
-    title: 开发者文档
-    nav_link_mode: index
-  - kind: dir
-    path: rules
-    title: 规则文档
+    title: 开发文档
     nav_link_mode: index
   - kind: dir
     path: design
-    title: 架构设计
+    title: 设计文档
     nav_link_mode: index
   - kind: dir
-    path: design_test
-    title: 设计测试
-    nav_link_mode: index
-  - kind: dir
-    path: blogs
-    title: 博客
+    path: blog
+    title: blog
     nav_link_mode: index
 
 page_overrides:

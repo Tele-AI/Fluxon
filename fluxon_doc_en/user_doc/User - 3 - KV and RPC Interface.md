@@ -16,15 +16,15 @@ Before writing `put_blocking`, `get_blocking`, or `rpc_call`, start the KV servi
 
 The most common objects are:
 
-- `greptime`: standard observability path
+- `Greptime`: standard observability path
 - `etcd`: KV control-plane metadata
-- `start_kv_master_process(...)`: starts `fluxonkv master`
-- `start_owner_kvclient_process(...)`: starts `owner`
+- `start_kv_master_process(...)`: starts `Fluxon KV Master`
+- `start_owner_kvclient_process(...)`: starts `Owner Client`
 
 The minimal local startup example is `examples/start_master_owner.py`. It only starts Fluxon-native roles and assumes:
 
 - `etcd` at `127.0.0.1:2379`
-- `greptime` HTTP at `127.0.0.1:34030`
+- `Greptime` HTTP at `127.0.0.1:34030`
 - the current Python environment already installed `fluxon-*.whl` and `fluxon_pyo3-*.whl`
 
 ### Minimal Role Startup Example
@@ -269,7 +269,7 @@ To increase user-process logs:
 FLUXON_LOG=DEBUG python3 examples/external_put_get_del.py
 ```
 
-Third-party Python components should place file logs under `store.third_party_logs_dir().unwrap(...)` and then append a component subdirectory such as `mq/`. This keeps log directory usage bounded and lets the Fluxon observability plane discover and collect those file logs through one owner-derived root.
+Third-party Python components should place file logs under `store.third_party_logs_dir().unwrap(...)` and then append a component subdirectory such as `mq/`. This keeps log directory usage bounded and lets the Fluxon observability plane discover and collect those file logs through one `Owner Client`-derived root.
 
 ### Minimal Node-to-Node RPC Example
 
@@ -334,8 +334,8 @@ Important constraints:
 
 You usually touch two config layers:
 
-- master config: starts the control-plane process
-- client / external config: attaches business code to the local owner and drives KV / RPC
+- `Master` config: starts the control-plane process
+- external-client config: attaches business code to the local `Owner Client` and drives KV / RPC
 
 Minimal master YAML:
 
@@ -359,7 +359,7 @@ fluxonkv_spec:
   p2p_listen_port: 31001
 ```
 
-Owner config adds memory contribution and etcd addresses:
+`Owner Client` config adds memory contribution and `etcd` addresses:
 
 ```yaml
 instance_key: my-owner-1
@@ -380,7 +380,7 @@ fluxonkv_spec:
 Keep these roots separate:
 
 - `share_mem_path`: shared bundle root. Runtime appends `cluster_name`, and that directory holds `mmap.file`, `shared.json`, and peer metadata.
-- `large_file_paths`: owner-only large-file authority for logs, profiles, caches, and other derived runtime assets
+- `large_file_paths`: `Owner Client`-only large-file authority for logs, profiles, caches, and other derived runtime assets
 - `FLUXON_LOG`: console log threshold for the user process
 
-In zero-contribution external mode, owner-only fields such as `fluxonkv_spec.etcd_addresses`, `fluxonkv_spec.sub_cluster`, `fluxonkv_spec.large_file_paths`, and `fluxonkv_spec.redis_compat` should not appear.
+In zero-contribution external mode, `Owner Client`-only fields such as `fluxonkv_spec.etcd_addresses`, `fluxonkv_spec.sub_cluster`, `fluxonkv_spec.large_file_paths`, and `fluxonkv_spec.redis_compat` should not appear.

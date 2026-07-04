@@ -6,33 +6,33 @@ Fluxon FS lets you mount a remote export into the current Python process and kee
 
 The core objects are:
 
-- KV service-plane objects: `etcd`, `greptime`, `master`, `owner`
-- FS role objects: `fs_master`, `fs_agent`
+- KV service-plane objects: `etcd`, `Greptime`, `Master`, `Owner Client`
+- FS role objects: `FS Master`, `FS Agent`
 - In-process mount objects: `FluxonKvClientConfig`, `new_store(...)`, `FluxonFsPatcher`, `mount_remote_dir(...)`
 
 ```text
-etcd + greptime + fluxonkv master + owner
-                       |
-                       v
-               fluxon_fs master
-                       |
-                       v
-               fluxon_fs agent
-                       |
-                       v
+etcd + Greptime + Fluxon KV Master + Owner Client
+                           |
+                           v
+                       FS Master
+                           |
+                           v
+                        FS Agent
+                           |
+                           v
 FluxonKvClientConfig -> new_store(...) -> KvClient(store)
-                       |
-                       v
-FluxonFsPatcher(store)
-                       |
-                       +-- set_master_config_yaml(...)
-                       +-- set_cache_config_yaml(...)
-                       +-- set_request_identity(...)
-                       +-- install()
-                       +-- mount_remote_dir(...)
-                       |
-                       v
-open() / read() / write() / close()
+                           |
+                           v
+                   FluxonFsPatcher(store)
+                           |
+                           +-- set_master_config_yaml(...)
+                           +-- set_cache_config_yaml(...)
+                           +-- set_request_identity(...)
+                           +-- install()
+                           +-- mount_remote_dir(...)
+                           |
+                           v
+               open() / read() / write() / close()
 ```
 
 See [Architecture and Concepts](<./User - 1 - Architecture and Concepts.md>) for the role model and [User - 3 - KV and RPC Interface](<./User - 3 - KV and RPC Interface.md>) for `FluxonKvClientConfig` and `new_store(...)`.
@@ -41,22 +41,22 @@ See [Architecture and Concepts](<./User - 1 - Architecture and Concepts.md>) for
 
 FS depends on the KV service plane and then adds two more roles on top:
 
-1. `greptime`
+1. `Greptime`
 2. `etcd`
-3. `fluxonkv master`
-4. `owner`
-5. `fs master`
-6. `fs agent`
+3. `Fluxon KV Master`
+4. `Owner Client`
+5. `FS Master`
+6. `FS Agent`
 7. your mount verification script
 
-`examples/start_kv_and_fs_svc.py` only starts Fluxon-native roles. `etcd` and `greptime` still follow [User - 2 - Service Plane](<./User - 2 - Service Plane.md>). If you need `/ui/transfers/` and pre-scan, start the TiKV PD / TiKV pair for `transfer_state_store` first.
+`examples/start_kv_and_fs_svc.py` only starts Fluxon-native roles. `etcd` and `Greptime` still follow [User - 2 - Service Plane](<./User - 2 - Service Plane.md>). If you need `/ui/transfers/` and pre-scan, start the TiKV PD / TiKV pair for `transfer_state_store` first.
 
-## `fs_master` and `fs_agent`
+## `FS Master` and `FS Agent`
 
 After the KV service plane is ready, FS adds two roles:
 
-- `fs_master`: attaches to the KV plane as an external client and owns panel / export snapshot distribution
-- `fs_agent`: registers exports to `fs_master` and exposes remote directory access
+- `FS Master`: attaches to the KV plane as an `External Client` and owns panel / export snapshot distribution
+- `FS Agent`: registers exports to `FS Master` and exposes remote directory access
 
 The reference script is `examples/start_kv_and_fs_svc.py`.
 
@@ -67,12 +67,12 @@ python3 examples/start_kv_and_fs_svc.py
 python3 examples/start_kv_and_fs_svc.py --without-master
 ```
 
-Default mode starts `kv master + owner + fs master + fs agent`. `--without-master` only starts `owner + fs_agent` and expects the cluster's `kv master` and `fs master` to already exist elsewhere.
+Default mode starts `KV Master + Owner Client + FS Master + FS Agent`. `--without-master` only starts `Owner Client + FS Agent` and expects the cluster's `KV Master` and `FS Master` to already exist elsewhere.
 
 Most important remote-agent constraints:
 
 - `ETCD_ENDPOINT` must point at the real cluster etcd endpoint
-- `FS_MASTER_INSTANCE_KEY` must match the existing `fs master`
+- `FS_MASTER_INSTANCE_KEY` must match the existing `FS Master`
 - `OWNER_INSTANCE_KEY`, `FS_AGENT_INSTANCE_KEY`, `EXPORT_NAME`, and `REMOTE_ROOT_DIR` must be unique per agent machine
 - `FS_PANEL_PUBLIC_BASE_URL` controls external links shown by the UI, while `FS_PANEL_LISTEN_ADDR` only controls the bind address
 
@@ -95,7 +95,7 @@ Minimum success path:
 
 The reader side always does three things:
 
-- attach to the local owner through one external client
+- attach to the local `Owner Client` through one `External Client`
 - install the patcher through `install_patcher_from_master(...)`
 - mount the selected export and alternate between remote and local reads
 
@@ -132,7 +132,7 @@ Typical pre-scan import flow:
 
 ### TiKV Config for Transfer State
 
-Directory transfer and pre-scan both depend on `transfer_state_store`. The `fs master` panel and any standalone pre-scan process must share the same TiKV namespace.
+Directory transfer and pre-scan both depend on `transfer_state_store`. The `FS Master` panel and any standalone pre-scan process must share the same TiKV namespace.
 
 The most important fields are:
 
@@ -144,7 +144,7 @@ The `start_kv_and_fs_svc.py` example uses:
 - `TRANSFER_STATE_STORE_PD_ENDPOINTS = ["127.0.0.1:12379"]`
 - `TRANSFER_STATE_STORE_KEY_PREFIX = "/fluxon_fs_transfer/demo-fs-cluster/"`
 
-`fs master` needs:
+`FS Master` needs:
 
 ```yaml
 transfer_state_store:
@@ -283,7 +283,7 @@ Common levels:
 
 ### `new_store failed`
 
-Usually means the external client did not attach to the local owner. Check:
+Usually means the `External Client` did not attach to the local `Owner Client`. Check:
 
 - whether `start_kv_and_fs_svc.py` is still running
 - `CLUSTER_NAME`
@@ -299,7 +299,7 @@ Usually means `set_cache_config_yaml(...)` did not complete successfully, or the
 
 ### `unknown export_name`
 
-The client is trying to mount an `EXPORT_NAME` that does not exist in the current `fs master` export snapshot. Check:
+The client is trying to mount an `EXPORT_NAME` that does not exist in the current `FS Master` export snapshot. Check:
 
 - whether writer and reader use the same `export_name`
 - whether `REMOTE_ROOT_DIR` matches the export definition

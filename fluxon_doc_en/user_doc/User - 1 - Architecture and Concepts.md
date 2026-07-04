@@ -10,10 +10,10 @@ This page explains the core concepts and config fields that appear throughout th
 
 ![](../../pics/架构全景图.png)
 
-- Control plane / metadata: `etcd + master` for members, leases, routing, and connection-state metadata
-- Data plane: `shared memory + transfer engine` for same-host reuse and cross-node data movement
-- KV: base read/write and RPC capability; `owner` contributes the memory pool and `external` attaches in zero-contribution mode
-- MQ: queue semantics built on top of KV and reusing the same service plane and shared memory pool
+- Control plane / metadata: `etcd + Master` for members, leases, routing, and connection-state metadata
+- Data plane: `shared memory + transfer engine` for same-host reuse and cross-node data transfer
+- KV: base read/write and RPC capability; `Owner Client` contributes the memory pool and `External Client` attaches in zero-contribution mode
+- MQ: queue semantics built on top of KV and reusing the same service plane and shared-memory pool
 - FluxonFS: remote file access built on top of KV; access control is persisted through `fluxon_fs.master_panel.access_db_path`, and transfer-state persistence uses `fluxon_fs.master_panel.transfer_state_store`
 - FluxonOps: deployment and operations control plane built on KV
 
@@ -24,13 +24,13 @@ This page explains the core concepts and config fields that appear throughout th
 Control plane:
 
 - **Fluxon KV Master**: cluster management, routing, coordination
-- **ETCD**: metadata store for member state, MQ state, offsets, and connection data
+- **etcd**: metadata store for member state, MQ state, offsets, and connection data
 - **Prometheus / GreptimeDB**: metrics collection and storage for the monitoring panel
 
 Per machine:
 
-- **Fluxon KV Owner**: contributes local data-plane resources and shared memory
-- **Fluxon KV External**: attaches to the owner's shared pool and exposes access to business processes
+- **Owner Client**: contributes local data-plane resources and shared memory
+- **External Client**: attaches to the local `Owner Client` shared pool and exposes access to business processes
 
 Cross-machine transport:
 
@@ -40,9 +40,9 @@ Cross-machine transport:
 
 | Role | Responsibility |
 |---|---|
-| **master** | Control-plane entrypoint: membership, routing, leases, monitoring broadcast |
-| **owner_client** | Data-plane resource provider: contributes the shared memory pool |
-| **external_client** | User-facing access point: attaches to an owner's pool without contributing memory |
+| **Master** (`master`) | Control-plane entrypoint: membership, routing, leases, monitoring broadcast |
+| **Owner Client** (`owner_client`) | Data-plane resource provider: contributes the shared-memory pool |
+| **External Client** (`external_client`) | User-facing access point: attaches to a local `Owner Client` pool without contributing memory |
 
 ### Core Config Fields
 
@@ -85,7 +85,7 @@ Cross-machine transport:
 `contribute_to_cluster_pool_size`
 
 - Memory contribution config
-- Non-zero for owners, omitted or zero for external clients
+- Non-zero for `Owner Clients`, omitted or zero for `External Clients`
 
 ### MQ Concepts
 
