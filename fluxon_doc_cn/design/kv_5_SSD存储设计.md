@@ -125,19 +125,6 @@ sequenceDiagram
 ```
 
 
-## 当前实现
-
-| 模块 | 职责 |
-| --- | --- |
-| `fluxon_kv/src/config.rs` | 解析 `fluxonkv_spec.ssd_storage.max_bytes`，禁止 external 声明该字段，派生 SSD 根目录。 |
-| `fluxon_kv/src/kv_ssd_storage.rs` | owner 内部 SSD cache。使用 shard 文件、`O_DIRECT`、`io_uring`、有界读写队列和两阶段索引管理 key-version bytes。 |
-| `client_kv_api/put.rs` | owner 是最终 target 时，先通过 `PutDoneReq` 提交内存副本；SSD persist 由 master 的后台 `SsdReplicaPersistReq` 触发，owner 完成本地落盘后再通过独立 SSD commit 上报。 |
-| `client_kv_api/get.rs` | `GetSourceKind::Ssd` 时，请求方让 SSD owner stage、push 并完成 `get_done`；stage RPC 成功后跳过请求方 transfer，也跳过请求方 `get_done`。 |
-| `client_kv_api/msg_pack.rs` | 定义 `SsdStageReadReq/SsdStageReadResp` 和 `SsdReplicaPersistReq/SsdReplicaPersistResp`，分别用于 SSD stage 读、回传 done 结果，以及 master 触发 owner 本地 SSD persist。 |
-| `master_kv_router/put.rs` | `put_done` 只提交内存副本，随后异步发起 `SsdReplicaPersistReq`；`SsdReplicaCommitReq` 单独写 `ssd_replicas`。 |
-| `master_kv_router/get.rs` | 内存副本优先；无内存副本时从 `ssd_replicas` 中选择可用 owner，分配 source staging 和 requester target。 |
-| `master_kv_router/delete.rs` | 内存副本被驱逐时，如果同 key-version 仍有 SSD 副本，保留 `kv_routes`。 |
-
 ## 接口里的角色分工
 
 SSD 逻辑按接口看最清楚：`put` 先让一个 key-version 的内存副本 ready，再异步补交 SSD 副本；`get` 决定读请求先走内存副本还是 SSD fallback。每个接口里再分 master、owner、external 三个角色看状态归属。
