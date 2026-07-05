@@ -10,6 +10,14 @@
 [![Latest](https://img.shields.io/badge/Latest-v0.2.1-f28500)](./fluxon_release)
 [![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#interface-capabilities)
 
+<details>
+  <summary>
+    <img src="https://img.shields.io/badge/WeChat-Join%20Group-07C160?logo=wechat&logoColor=white" alt="WeChat group" />
+  </summary>
+  <br/>
+  <img src="./pics/wechat_group.png" width="260" alt="WeChat group QR code" />
+</details>
+
 [English](./README.md) | [中文](./README_CN.md) | [Docs](https://tele-ai.github.io/Fluxon/) | [中文文档](https://tele-ai.github.io/Fluxon/cn/) | <a href="https://github.com/Tele-AI/Fluxon" title="GitHub Repository"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
 
 </div>
