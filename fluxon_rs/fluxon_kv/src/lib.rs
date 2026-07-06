@@ -2736,8 +2736,8 @@ mod tests {
             large_file_paths: crate::config::LargeFilePaths {
                 paths: vec![owner_large_root.to_string_lossy().into_owned()],
             },
-            protocol_version:
-                fluxon_util::git_version_build_record::get_current_git_commitid().unwrap(),
+            protocol_version: fluxon_util::git_version_build_record::get_current_git_commitid()
+                .unwrap(),
             write_ts: Some(chrono::Utc::now().timestamp_micros()),
         };
         let shared_meta_json = serde_json::to_string(&shared_meta).unwrap();

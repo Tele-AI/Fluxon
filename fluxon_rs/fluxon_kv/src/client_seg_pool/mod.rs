@@ -237,10 +237,7 @@ impl ClientSegPool {
         std::path::Path::new(share_mem_path).join(SIDE_TRANSFER_PEERS_DIRNAME)
     }
 
-    pub fn side_transfer_peer_file_path(
-        share_mem_path: &str,
-        side_id: &str,
-    ) -> std::path::PathBuf {
+    pub fn side_transfer_peer_file_path(share_mem_path: &str, side_id: &str) -> std::path::PathBuf {
         Self::side_transfer_peers_dir(share_mem_path).join(format!("{side_id}.json"))
     }
 
@@ -399,17 +396,13 @@ impl ClientSegPool {
                 crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
                     path: String::new(),
                     len: map_len as u64,
-                    detail: "share_mem_path is empty; explicit configuration required"
-                        .to_string(),
+                    detail: "share_mem_path is empty; explicit configuration required".to_string(),
                 },
             ));
         }
 
         let base_path = &share_mem_path;
-        tracing::info!(
-            "Using share_mem_path: {} for memory-mapped file",
-            base_path
-        );
+        tracing::info!("Using share_mem_path: {} for memory-mapped file", base_path);
         std::fs::create_dir_all(base_path).map_err(|e| {
             KvError::SharedMem(
                 crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {

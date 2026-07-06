@@ -164,6 +164,52 @@ _pid_tree_direct_child_pids() {{
   '
 }}
 
+_cmdline_contains_selection_supervisor_entry() {{
+  pid="$1"
+  if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  cmdline_path="/proc/$pid/cmdline"
+  if [ ! -r "$cmdline_path" ]; then
+    return 1
+  fi
+  tr '\\0' '\\n' < "$cmdline_path" 2>/dev/null | awk '
+    {{
+      if ($0 ~ /(^|\\/)selection_supervisor\\.py$/) {{
+        found=1;
+      }}
+    }}
+    END {{
+      exit(found ? 0 : 1);
+    }}
+  '
+}}
+
+_pid_tree_ready_candidate_child_pids() {{
+  root_pid="$1"
+  if [[ ! "$root_pid" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if ! _pid_exists "$root_pid"; then
+    return 1
+  fi
+
+  direct_child_pids="$(_pid_tree_direct_child_pids "$root_pid" 2>/dev/null || true)"
+  if [ -z "$direct_child_pids" ]; then
+    echo ""
+    return 0
+  fi
+
+  ready_child_pids=""
+  for child_pid in $direct_child_pids; do
+    if _cmdline_contains_selection_supervisor_entry "$child_pid"; then
+      continue
+    fi
+    ready_child_pids="$ready_child_pids $child_pid"
+  done
+  echo "${{ready_child_pids# }}"
+}}
+
 _now_monotonic_ms() {{
   python3 - <<'__FLUXON_MONOTONIC_MS__'
 import time
@@ -206,7 +252,7 @@ wait_service_probably_ready_pid_tree() {{
       return 1
     fi
 
-    current_child_pids="$(_pid_tree_direct_child_pids "$root_pid" 2>/dev/null || true)"
+    current_child_pids="$(_pid_tree_ready_candidate_child_pids "$root_pid" 2>/dev/null || true)"
     current_child_pid=""
     if [ -n "$current_child_pids" ]; then
       set -- $current_child_pids

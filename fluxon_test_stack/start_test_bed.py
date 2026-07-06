@@ -172,7 +172,11 @@ def main() -> None:
         )
     cluster_nodes = _parse_cluster_nodes(deployconf)
     cluster_name = _parse_cluster_name(deployconf)
-    local_node_cfg = _resolve_local_node_cfg(cluster_nodes)
+    controller_url = _require_str(config.get("controller_url"), "controller_url").rstrip("/")
+    local_node_cfg = _resolve_local_node_cfg(
+        cluster_nodes,
+        controller_url=controller_url,
+    )
     local_node_name = _require_str(local_node_cfg.get("hostname"), "local_node_cfg.hostname")
     bootstrap_mode = args.bootstrap_mode
     bootstrap_bare_services = _parse_bootstrap_bare_services(deployconf)
@@ -191,7 +195,6 @@ def main() -> None:
         config.get("deploy_workloads"),
         field_name="deploy_workloads",
     )
-    controller_url = _require_str(config.get("controller_url"), "controller_url").rstrip("/")
     _install_controller_basic_auth(
         config.get("controller_basic_auth"),
         field_name="controller_basic_auth",
@@ -268,7 +271,7 @@ def main() -> None:
     # - It must not prune desired files or inspect cluster membership directly.
     # - Coverage bare is config-derived, not controller-readiness-derived.
     # - This entry intentionally does not run takeover rescue or fallback loops.
-    release_manifest_sha256 = _read_local_release_manifest_sha256(
+    release_manifest_sha256 = _read_release_manifest_sha256(
         deployconf=deployconf,
         local_node_cfg=local_node_cfg,
     )
@@ -656,13 +659,20 @@ def _stop_local_controller_handover_selections(
                 flush=True,
             )
             try:
-                _run_local_stop(
-                    local_node_cfg=local_node_cfg,
-                    service_name=service_name,
-                )
+                if _cluster_node_is_local(local_node_cfg):
+                    _run_local_stop(
+                        local_node_cfg=local_node_cfg,
+                        service_name=service_name,
+                    )
+                else:
+                    _run_remote_stop(
+                        node_name=local_node_name,
+                        node_cfg=local_node_cfg,
+                        service_name=service_name,
+                    )
             except Exception as exc:
                 raise RuntimeError(
-                    "local controller handover stop failed via generated bare stop script: "
+                    "controller handover stop failed via generated bare stop script: "
                     f"node={local_node_name} selection={selection_name} service={service_name}"
                 ) from exc
             stopped_service_names.append(service_name)
@@ -1149,6 +1159,34 @@ def _read_local_release_manifest_sha256(
     if not manifest_path.exists():
         raise ValueError(f"Missing local release manifest for payload fingerprint: {manifest_path}")
     return hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+
+def _read_release_manifest_sha256(
+    *,
+    deployconf: dict[str, Any],
+    local_node_cfg: dict[str, Any],
+) -> str:
+    global_envs = deployconf.get("global_envs")
+    if not isinstance(global_envs, dict):
+        raise ValueError("deployconf.global_envs must be a mapping")
+    release_manifest_name = _require_str(
+        global_envs.get("FLUXON_RELEASE_SHA256_FILE"),
+        "global_envs.FLUXON_RELEASE_SHA256_FILE",
+    )
+    hostworkdir = _require_str(local_node_cfg.get("hostworkdir"), "local_node_cfg.hostworkdir")
+    manifest_path = Path(hostworkdir) / "fluxon_release" / release_manifest_name
+    if _cluster_node_is_local(local_node_cfg):
+        if not manifest_path.exists():
+            raise ValueError(f"Missing local release manifest for payload fingerprint: {manifest_path}")
+        return hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    raw_bytes = _read_remote_file_bytes_if_exists(
+        node_name=_require_str(local_node_cfg.get("hostname"), "local_node_cfg.hostname"),
+        node_cfg=local_node_cfg,
+        path=manifest_path,
+    )
+    if raw_bytes is None:
+        raise ValueError(f"Missing remote release manifest for payload fingerprint: {manifest_path}")
+    return hashlib.sha256(raw_bytes).hexdigest()
 
 
 def _with_release_manifest_sha256_env(
@@ -1830,7 +1868,11 @@ def _parse_name_list(raw: Any, *, field_name: str) -> list[str]:
     return _require_list_of_str(raw, field_name)
 
 
-def _resolve_local_node_cfg(cluster_nodes: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _resolve_local_node_cfg(
+    cluster_nodes: dict[str, dict[str, Any]],
+    *,
+    controller_url: str,
+) -> dict[str, Any]:
     local_nodes = [node_cfg for node_cfg in cluster_nodes.values() if _cluster_node_is_local(node_cfg)]
     if local_nodes:
         local_hostname = subprocess.check_output(["hostname"], text=True).strip()
@@ -1842,11 +1884,51 @@ def _resolve_local_node_cfg(cluster_nodes: dict[str, dict[str, Any]]) -> dict[st
         if local_controller_nodes:
             return local_controller_nodes[0]
         return local_nodes[0]
+    controller_node_cfg = _resolve_controller_node_cfg(
+        cluster_nodes=cluster_nodes,
+        controller_url=controller_url,
+    )
+    if controller_node_cfg is not None:
+        return controller_node_cfg
     local_hostname = subprocess.check_output(["hostname"], text=True).strip()
     node_cfg = cluster_nodes.get(local_hostname)
     if node_cfg is None:
-        raise ValueError(f"Current hostname is not present in deployconf.cluster_nodes: {local_hostname}")
+        raise ValueError(
+            "Current hostname is not present in deployconf.cluster_nodes and controller_url "
+            f"did not resolve to a cluster node: hostname={local_hostname} controller_url={controller_url}"
+        )
     return node_cfg
+
+
+def _resolve_controller_node_cfg(
+    *,
+    cluster_nodes: dict[str, dict[str, Any]],
+    controller_url: str,
+) -> dict[str, Any] | None:
+    parsed = urllib.parse.urlparse(controller_url)
+    controller_host = parsed.hostname
+    if controller_host is None:
+        return None
+    matched: list[dict[str, Any]] = []
+    for node_name, node_cfg in cluster_nodes.items():
+        node_hostnames = {
+            str(node_name),
+            _require_str(node_cfg.get("hostname"), f"cluster_nodes[{node_name}].hostname"),
+            _cluster_node_ssh_host(node_cfg, node_name=node_name),
+        }
+        ip_raw = node_cfg.get("ip")
+        if isinstance(ip_raw, str) and ip_raw.strip():
+            node_hostnames.add(ip_raw.strip())
+        if controller_host in node_hostnames:
+            matched.append(node_cfg)
+    if not matched:
+        return None
+    if len(matched) > 1:
+        raise ValueError(
+            "controller_url host matches multiple cluster nodes; controller endpoint must resolve uniquely: "
+            f"controller_url={controller_url} matched={[item.get('hostname') for item in matched]}"
+        )
+    return matched[0]
 
 
 def _cluster_node_is_local(node_cfg: dict[str, Any]) -> bool:
@@ -2749,8 +2831,17 @@ def _validate_release_generation_prerequisites(
     local_release_dir = Path(local_hostworkdir) / "fluxon_release"
     for filename in required_release_files:
         path = local_release_dir / filename
-        if not path.exists():
-            raise ValueError(f"Missing required local release artifact: {path}")
+        if _cluster_node_is_local(local_node_cfg):
+            if not path.exists():
+                raise ValueError(f"Missing required local release artifact: {path}")
+            continue
+        raw_bytes = _read_remote_file_bytes_if_exists(
+            node_name=_require_str(local_node_cfg.get("hostname"), "local_node_cfg.hostname"),
+            node_cfg=local_node_cfg,
+            path=path,
+        )
+        if raw_bytes is None:
+            raise ValueError(f"Missing required remote release artifact: {path}")
 
 
 def _validate_bare_bootstrap_prerequisites(
@@ -2762,11 +2853,19 @@ def _validate_bare_bootstrap_prerequisites(
     coverage_bootstrap_services: list[str],
 ) -> None:
     local_hostworkdir = _require_str(local_node_cfg.get("hostworkdir"), "local_node_cfg.hostworkdir")
-    local_node_name = _require_str(local_node_cfg.get("hostname"), "local_node_cfg.hostname")
     local_release_dir = Path(local_hostworkdir) / "fluxon_release"
     local_etcdctl = local_release_dir / "ext_images" / "etcd" / "etcdctl"
-    if not local_etcdctl.exists():
-        raise ValueError(f"Missing required local etcdctl for test bed checks: {local_etcdctl}")
+    if _cluster_node_is_local(local_node_cfg):
+        if not local_etcdctl.exists():
+            raise ValueError(f"Missing required local etcdctl for test bed checks: {local_etcdctl}")
+    else:
+        raw_bytes = _read_remote_file_bytes_if_exists(
+            node_name=_require_str(local_node_cfg.get("hostname"), "local_node_cfg.hostname"),
+            node_cfg=local_node_cfg,
+            path=local_etcdctl,
+        )
+        if raw_bytes is None:
+            raise ValueError(f"Missing required remote etcdctl for test bed checks: {local_etcdctl}")
     bare_target_services = _collect_bare_target_services(
         deployconf=deployconf,
         fixed_bootstrap_batches=fixed_bootstrap_batches,
@@ -3537,6 +3636,52 @@ def _print_bare_wave_summary(*, wave_idx: int, results: list[dict[str, Any]]) ->
                 print(f"      status_error={status_error}")
 
 
+def _stop_legacy_plain_services_for_atomic_selection(
+    *,
+    deployconf: dict[str, Any],
+    node_name: str,
+    node_cfg: dict[str, Any],
+    selection_name: str,
+    expected_service_names: list[str],
+) -> list[str]:
+    atomic_groups = deployconf.get("atomic_groups")
+    if not isinstance(atomic_groups, dict):
+        raise ValueError("deployconf.atomic_groups must be a mapping")
+    if selection_name not in atomic_groups:
+        return []
+
+    stopped_service_names: list[str] = []
+    seen_service_names: set[str] = set()
+    for service_name in expected_service_names:
+        if service_name in seen_service_names:
+            continue
+        seen_service_names.add(service_name)
+        print(
+            "[startbare.atomic_prelaunch_plain_stop] "
+            f"node={node_name} selection={selection_name} service={service_name}",
+            flush=True,
+        )
+        try:
+            if _cluster_node_is_local(node_cfg):
+                _run_local_stop(
+                    local_node_cfg=node_cfg,
+                    service_name=service_name,
+                )
+            else:
+                _run_remote_stop(
+                    node_name=node_name,
+                    node_cfg=node_cfg,
+                    service_name=service_name,
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                "atomic bare bootstrap failed to stop legacy plain service before launch: "
+                f"node={node_name} selection={selection_name} service={service_name}"
+            ) from exc
+        stopped_service_names.append(service_name)
+    return stopped_service_names
+
+
 def _run_bare_waves(
     *,
     workdir: Path,
@@ -3581,6 +3726,13 @@ def _run_bare_waves(
                 deployconf=deployconf,
                 selection_name=selection_name,
                 node_name=node_name,
+            )
+            _stop_legacy_plain_services_for_atomic_selection(
+                deployconf=deployconf,
+                node_name=node_name,
+                node_cfg=node_cfg,
+                selection_name=selection_name,
+                expected_service_names=expected_service_names,
             )
             bootstrap_log_path = _bare_wave_bootstrap_log_path(
                 workdir=workdir,
