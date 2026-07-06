@@ -5,6 +5,14 @@ This page defines how Fluxon user docs, developer docs, and design docs should b
 - Let readers reach the stable conclusion as quickly as possible.
 - Keep docs aligned with code, public contracts, and actual behavior.
 
+Before the detailed rules, keep these high-frequency judgments in mind:
+
+- Put the conclusion first and the expansion after it. Readers should see the stable statement before deciding whether to drill deeper.
+- Keep one name for one concept. Terminology drift directly weakens readability and trust.
+- Answer later sections on the same axis used by the opening question list. Do not switch classification schemes halfway through the page.
+- In English docs, prefer expressions that are natural in the domain instead of translating Chinese source text word by word.
+- If a list, table, or diagram can explain the point cleanly, do not force it into a long block of linear prose.
+
 ## 1. General Rules
 
 - Lead with the conclusion, then expand. A reader should know what the page answers within the first 30 seconds.
