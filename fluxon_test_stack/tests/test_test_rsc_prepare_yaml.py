@@ -26,6 +26,8 @@ class TestTestRscPrepareYaml(unittest.TestCase):
         self.assertIsInstance(requirements, list)
         pinned = {item.get("pinned") for item in requirements if isinstance(item, dict)}
         self.assertIn("pytest==8.3.5", pinned)
+        self.assertIn("tomli==2.2.1", pinned)
+        self.assertIn("exceptiongroup==1.3.0", pinned)
 
 
 if __name__ == "__main__":

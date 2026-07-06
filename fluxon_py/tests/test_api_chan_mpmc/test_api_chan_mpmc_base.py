@@ -44,9 +44,7 @@ PROJECT_ROOT = _find_project_root(CURRENT_DIR)
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from typing import Dict, List, Optional, Tuple
-
-import etcd3
+from typing import Any, Dict, List, Optional, Tuple
 
 from fluxon_py.api_ext_chan import (  # noqa: E402
     MPMCChanConsumer,
@@ -82,12 +80,12 @@ from fluxon_py.tests.test_lib import (  # noqa: E402
     KV_SVC_TYPE,
     CHAN_CONFIG_TEST,
     TEST_TIMEOUT_SECONDS,
-    ETCD_HOST,
-    ETCD_PORT,
     setup_test_environment,
     new_test_consumer,
     new_test_producer,
     run_with_argmatrix,
+    is_transient_etcd_control_failure as _is_transient_etcd_failure,
+    etcd_control_call_with_retry as _etcd_call_with_retry,
 )
 from fluxon_py.tests.test_lib import pre_kill_existing_test_processes_by_script_name  # noqa: E402
 
@@ -116,6 +114,35 @@ CONSUMER_CRASH_MARKER = "CONSUMER_CRASH:"
 def _atomic_stdout_write_line(line: str) -> None:
     payload = (line + "\n").encode("utf-8", "replace")
     os.write(sys.stdout.fileno(), payload)
+
+
+def _read_log_tail(path: str, *, max_lines: int = 120) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError:
+        return f"<log file not found: {path}>"
+    except Exception as exc:  # noqa: BLE001
+        return f"<failed to read log file {path}: {exc}>"
+    return "".join(lines[-max_lines:]).rstrip()
+
+
+def _format_subprocess_failure(
+    process_type: str,
+    identifier: str,
+    rc: int,
+    log_file: str,
+    *,
+    early: bool,
+) -> str:
+    phase = "exited early" if early else "failed"
+    return (
+        f"{process_type} {identifier} {phase} with return code {rc}. "
+        f"Log file: {log_file}\n"
+        "--- child log tail ---\n"
+        f"{_read_log_tail(log_file)}\n"
+        "--- end child log tail ---"
+    )
 
 
 INITIAL_PRODUCERS_COUNT = 3
@@ -264,7 +291,6 @@ def run_producer(env: "ChannelState", args: argparse.Namespace) -> None:
         )
         assert isinstance(producer, MPMCChanProducer)
         print(f"[Producer-{args.producer_id}] Started")
-        etcd_client = producer.etcd_client
         try:
             for index in range(args.message_count):
                 unique_id = str(uuid.uuid4())
@@ -292,11 +318,22 @@ def run_producer(env: "ChannelState", args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"[Producer-{args.producer_id}] Error: {exc}")
             _atomic_stdout_write_line(f"{PRODUCER_CRASH_MARKER} {args.producer_id}")
+            try:
+                producer.close().unwrap()
+            except Exception as close_exc:  # noqa: BLE001
+                print(
+                    f"[Producer-{args.producer_id}] close after error failed: "
+                    f"{close_exc}"
+                )
             raise
-        finally:
-            print(f"[Producer-{args.producer_id}] Finished")
-            _atomic_stdout_write_line(f"{PRODUCER_NORMAL_EXIT_MARKER} {args.producer_id}")
+        try:
             producer.close().unwrap()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Producer-{args.producer_id}] close failed: {exc}")
+            _atomic_stdout_write_line(f"{PRODUCER_CRASH_MARKER} {args.producer_id}")
+            raise
+        print(f"[Producer-{args.producer_id}] Finished")
+        _atomic_stdout_write_line(f"{PRODUCER_NORMAL_EXIT_MARKER} {args.producer_id}")
     finally:
         configure_backend(env, backend_type=prev_type, backend_ip=prev_ip)
     release(env, store_key)
@@ -324,11 +361,14 @@ def run_consumer(env: "ChannelState", args: argparse.Namespace) -> None:
             f"{consumer.mpmc_channel.mpmc_member_id}",
             flush=True,
         )
-        etcd_client = consumer.etcd_client
-        etcd_client.put(
-            f"/test_mpmc_consumer/{args.consumer_id}",
-            b"dummy_value",
-            consumer.mpmc_channel.mpmc_global_lease,
+        _etcd_call_with_retry(
+            f"publish consumer presence for consumer_id={args.consumer_id}",
+            lambda client: client.put(
+                f"/test_mpmc_consumer/{args.consumer_id}",
+                b"dummy_value",
+                lease_id=int(consumer.mpmc_channel.mpmc_global_lease.id),
+            ),
+            max_attempts=3,
         )
 
         consumed_count = 0
@@ -344,13 +384,19 @@ def run_consumer(env: "ChannelState", args: argparse.Namespace) -> None:
                 # Periodically check whether all producers are done.
                 now = time.time()
                 if now - last_producer_check >= producer_done_check_interval:
-                    stop_flag, _ = etcd_client.get(f"/test_mpmc_stop_producer")
+                    stop_flag = _etcd_call_with_retry(
+                        "read producer stop flag",
+                        lambda client: client.get("/test_mpmc_stop_producer"),
+                        max_attempts=3,
+                    )
                     all_producers_done = stop_flag is not None
                     last_producer_check = now
 
                 # External stop signal from harness.
-                stop_flag, _ = etcd_client.get(
-                    f"/test_mpmc_stop_consumer/{args.consumer_id}"
+                stop_flag = _etcd_call_with_retry(
+                    f"read consumer stop flag for consumer_id={args.consumer_id}",
+                    lambda client: client.get(f"/test_mpmc_stop_consumer/{args.consumer_id}"),
+                    max_attempts=3,
                 )
                 if stop_flag:
                     logging.info(
@@ -417,31 +463,47 @@ def run_consumer(env: "ChannelState", args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"[Consumer-{args.consumer_id}] Error: {exc}")
             _atomic_stdout_write_line(f"{CONSUMER_CRASH_MARKER} {args.consumer_id}")
+            try:
+                consumer.close().unwrap()
+            except Exception as close_exc:  # noqa: BLE001
+                print(
+                    f"[Consumer-{args.consumer_id}] close after error failed: "
+                    f"{close_exc}"
+                )
             raise
-        finally:
-            print(
-                f"[Consumer-{args.consumer_id}] Finished, consumed"
-                f" {consumed_count} messages"
+        try:
+            _etcd_call_with_retry(
+                f"delete consumer presence for consumer_id={args.consumer_id}",
+                lambda client: client.delete(f"/test_mpmc_consumer/{args.consumer_id}"),
+                max_attempts=3,
             )
-            _atomic_stdout_write_line(f"{CONSUMER_NORMAL_EXIT_MARKER} {args.consumer_id}")
-            etcd_client.delete(f"/test_mpmc_consumer/{args.consumer_id}")
             consumer.close().unwrap()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Consumer-{args.consumer_id}] cleanup failed: {exc}")
+            _atomic_stdout_write_line(f"{CONSUMER_CRASH_MARKER} {args.consumer_id}")
+            raise
+        print(
+            f"[Consumer-{args.consumer_id}] Finished, consumed"
+            f" {consumed_count} messages"
+        )
+        _atomic_stdout_write_line(f"{CONSUMER_NORMAL_EXIT_MARKER} {args.consumer_id}")
     finally:
         configure_backend(env, backend_type=prev_type, backend_ip=prev_ip)
     release(env, store_key)
 
 
 def clean_etcd() -> None:
-    with etcd3.client(ETCD_HOST, ETCD_PORT) as etcd_client:
+    def _clean(etcd_client: Any) -> None:
         etcd_client.delete_prefix("/mpmc_channels")
         etcd_client.delete_prefix("/channels")
         etcd_client.delete_prefix("/test_mpmc_stop_consumer")
         etcd_client.delete_prefix("/test_mpmc_consumer")
         etcd_client.delete_prefix("/test_mpmc_stop_producer")
 
+    _etcd_call_with_retry("clean MPMC test etcd prefixes", _clean)
+
 
 def _wait_until_lease_revoked(
-    etcd_client: etcd3.Etcd3Client,
     lease_id: int,
     *,
     timeout_s: float = 10.0,
@@ -449,7 +511,11 @@ def _wait_until_lease_revoked(
     deadline = time.time() + timeout_s
     while True:
         try:
-            info = etcd_client.get_lease_info(int(lease_id))
+            ttl_val = _etcd_call_with_retry(
+                f"read lease ttl for lease_id={lease_id}",
+                lambda client: client.lease_ttl(int(lease_id)),
+                max_attempts=3,
+            )
         except Exception as exc:  # noqa: BLE001
             msg = str(exc).lower()
             if "not found" in msg or "requested lease not found" in msg:
@@ -459,7 +525,6 @@ def _wait_until_lease_revoked(
                     f"lease revoke verification failed for lease_id={lease_id}: {exc}"
                 ) from exc
         else:
-            ttl_val = getattr(info, "TTL", None)
             if not isinstance(ttl_val, int):
                 raise RuntimeError(
                     f"invalid TTL returned for lease_id={lease_id}: {ttl_val!r}"
@@ -493,14 +558,19 @@ def test_mpmc_member_lease_expiry_closes_owner() -> None:
         chan_id = producer.get_chan_id()
         lease_id = int(producer.mpmc_channel.mpmc_member_lease.id)
 
-        with etcd3.client(ETCD_HOST, ETCD_PORT) as etcd_client:
-            mpsc_meta_before = list(etcd_client.get_prefix("/channels/meta/"))
-            assert len(mpsc_meta_before) == 0, (
-                "fresh MPMC producer should not create any sub-MPSC metadata before the first put, "
-                f"found {len(mpsc_meta_before)} keys"
-            )
-            etcd_client.revoke_lease(lease_id)
-            _wait_until_lease_revoked(etcd_client, lease_id)
+        mpsc_meta_before = _etcd_call_with_retry(
+            "list MPSC metadata before member lease revoke",
+            lambda client: list(client.get_prefix("/channels/meta/")),
+        )
+        assert len(mpsc_meta_before) == 0, (
+            "fresh MPMC producer should not create any sub-MPSC metadata before the first put, "
+            f"found {len(mpsc_meta_before)} keys"
+        )
+        _etcd_call_with_retry(
+            f"revoke member lease lease_id={lease_id}",
+            lambda client: client.revoke_lease(lease_id),
+        )
+        _wait_until_lease_revoked(lease_id)
 
         first_put = producer.put_data(
             {
@@ -516,11 +586,13 @@ def test_mpmc_member_lease_expiry_closes_owner() -> None:
         assert first_err.channel_id == chan_id
         assert producer.shutdown_ctl.closed, "producer must mark itself closed after member lease loss"
 
-        with etcd3.client(ETCD_HOST, ETCD_PORT) as etcd_client:
-            mpsc_meta_after = list(etcd_client.get_prefix("/channels/meta/"))
-            assert len(mpsc_meta_after) == 0, (
-                "dead member lease must stop sub-MPSC creation before any new channel meta is published"
-            )
+        mpsc_meta_after = _etcd_call_with_retry(
+            "list MPSC metadata after member lease revoke",
+            lambda client: list(client.get_prefix("/channels/meta/")),
+        )
+        assert len(mpsc_meta_after) == 0, (
+            "dead member lease must stop sub-MPSC creation before any new channel meta is published"
+        )
 
         second_put = producer.put_data(
             {
@@ -643,11 +715,12 @@ def scenario_dynamic_producer_consumer(
     # Map all process handles by identifier (producer_id/consumer_id)
     process_handles_by_id: Dict[str, Tuple[str, subprocess.Popen, str]] = {}
     joined_ids: set[str] = set()
-    etcd_client = etcd3.client(ETCD_HOST, ETCD_PORT)
     initial_consumers_id: List[str] = []
     dyn_consumers: List[str] = []
     recovered_consumers: List[str] = []
     test_mpmc_id: Optional[str] = None
+    scan_stop_event = threading.Event()
+    scan_thread: Optional[threading.Thread] = None
 
     def fail_fast_on_subprocess_error(*, process_type_filter: Optional[str] = None) -> None:
         for identifier, (process_type, proc, log_file) in process_handles_by_id.items():
@@ -658,8 +731,13 @@ def scenario_dynamic_producer_consumer(
                 continue
             if rc != 0:
                 raise RuntimeError(
-                    f"{process_type} {identifier} exited early with return code {rc}. "
-                    f"Check log file for details: {log_file}"
+                    _format_subprocess_failure(
+                        process_type,
+                        identifier,
+                        rc,
+                        log_file,
+                        early=True,
+                    )
                 )
 
     def wait_all_of_type(process_type: str, *, timeout_s: int) -> None:
@@ -681,8 +759,13 @@ def scenario_dynamic_producer_consumer(
                     print(f"Log file: {log_file}")
                     continue
                 raise RuntimeError(
-                    f"{ptype} {identifier} failed with return code {proc.returncode}."
-                    f" Check log file for details: {log_file}"
+                    _format_subprocess_failure(
+                        ptype,
+                        identifier,
+                        proc.returncode,
+                        log_file,
+                        early=False,
+                    )
                 )
 
             if not running:
@@ -716,9 +799,13 @@ def scenario_dynamic_producer_consumer(
 
     def _count_ready_keys_for_member_id(member_id: int) -> int:
         assert test_mpmc_id is not None, "test_mpmc_id must be initialized before counting ready keys"
-        ready_chans_kvs = list(etcd_client.get_prefix(_new_mpmc_ready_channels_prefix(test_mpmc_id)))
+        ready_prefix = _new_mpmc_ready_channels_prefix(test_mpmc_id)
+        ready_chans_kvs = _etcd_call_with_retry(
+            f"count ready keys for member_id={member_id}",
+            lambda client: list(client.get_prefix(ready_prefix)),
+        )
         count = 0
-        for value, _meta in ready_chans_kvs:
+        for _key, value in ready_chans_kvs:
             if value is None:
                 continue
             if value.decode() == str(member_id):
@@ -728,17 +815,21 @@ def scenario_dynamic_producer_consumer(
     def _list_ready_keys_for_member_id(member_id: int) -> List[str]:
         assert test_mpmc_id is not None, "test_mpmc_id must be initialized before listing ready keys"
         member_id_str = str(member_id)
-        ready_chans_kvs = list(etcd_client.get_prefix(_new_mpmc_ready_channels_prefix(test_mpmc_id)))
+        ready_prefix = _new_mpmc_ready_channels_prefix(test_mpmc_id)
+        ready_chans_kvs = _etcd_call_with_retry(
+            f"list ready keys for member_id={member_id}",
+            lambda client: list(client.get_prefix(ready_prefix)),
+        )
         keys: List[str] = []
-        for value, meta in ready_chans_kvs:
+        for key, value in ready_chans_kvs:
             if value is None:
                 continue
             if value.decode() != member_id_str:
                 continue
             try:
-                keys.append(meta.key.decode())
+                keys.append(key.decode())
             except Exception:
-                keys.append(repr(meta.key))
+                keys.append(repr(key))
         return keys
 
     def _wait_ready_keys_cleared_for_member_id(member_id: int, timeout_s: float) -> List[str]:
@@ -755,12 +846,19 @@ def scenario_dynamic_producer_consumer(
     def _wait_for_test_mpmc_id() -> str:
         deadline = time.time() + float(TEST_TIMEOUT_SECONDS)
         while True:
-            value, _meta = etcd_client.get(NEW_OR_BIND_MAPPING_KEY)
+            value = _etcd_call_with_retry(
+                f"read MPMC mapping key {NEW_OR_BIND_MAPPING_KEY}",
+                lambda client: client.get(NEW_OR_BIND_MAPPING_KEY),
+            )
             if value is not None:
                 raw = value.decode().strip()
                 if raw.isdigit():
                     candidate = raw
-                    meta_val, _meta = etcd_client.get(_new_mpmc_meta_key(candidate))
+                    meta_key = _new_mpmc_meta_key(candidate)
+                    meta_val = _etcd_call_with_retry(
+                        f"read MPMC meta key {meta_key}",
+                        lambda client: client.get(meta_key),
+                    )
                     if meta_val is not None:
                         return candidate
                     logging.warning(
@@ -782,7 +880,10 @@ def scenario_dynamic_producer_consumer(
 
     def _assert_test_mpmc_id_stable() -> None:
         assert test_mpmc_id is not None
-        value, _meta = etcd_client.get(NEW_OR_BIND_MAPPING_KEY)
+        value = _etcd_call_with_retry(
+            f"assert stable MPMC mapping key {NEW_OR_BIND_MAPPING_KEY}",
+            lambda client: client.get(NEW_OR_BIND_MAPPING_KEY),
+        )
         if value is None:
             raise RuntimeError(
                 f"etcd key {NEW_OR_BIND_MAPPING_KEY!r} disappeared during test; expected mpmc_id={test_mpmc_id}"
@@ -872,22 +973,25 @@ def scenario_dynamic_producer_consumer(
             str(prefetch),
         ]
 
-    def scan_producer_offset() -> None:
+    def scan_producer_offset(stop_event: threading.Event) -> None:
         # Use dedicated scan logger (single file mpmc_scan_offset.log)
         logger = _scan_logger
         mpsc_producer_offset_pair: Dict[int, Dict[int, List[int]]] = {}
-        scan_client = etcd3.client(ETCD_HOST, ETCD_PORT)
         mpsc_chans: List[int] = []
 
         def get_chans() -> List[int]:
             prefix = mpsc._new_etcd_meta_key_prefix()
+            meta_kvs = _etcd_call_with_retry(
+                "scan MPSC channel metadata keys",
+                lambda client: list(client.get_prefix(prefix)),
+            )
             return [
-                int(meta.key.decode().split("/")[-1])
-                for _, meta in scan_client.get_prefix(prefix)
+                int(key.decode().split("/")[-1])
+                for key, _value in meta_kvs
             ]
 
         try:
-            while True:
+            while not stop_event.is_set():
                 if mpsc_producer_offset_pair:
                     sum_unconsumed_count = 0
                     sum_consumed_count = 0
@@ -925,11 +1029,14 @@ def scenario_dynamic_producer_consumer(
                         )
                     logger.info(">>> sum_unconsumed_count: %s", sum_unconsumed_count)
                     logger.info(">>> sum_consumed_count: %s", sum_consumed_count)
-                ready_chans_kvs = list(scan_client.get_prefix(_READY_CHANNELS_BASE_PREFIX))
+                ready_chans_kvs = _etcd_call_with_retry(
+                    "scan all MPMC ready channel keys",
+                    lambda client: list(client.get_prefix(_READY_CHANNELS_BASE_PREFIX)),
+                )
                 mpmc_ids: set[str] = set()
                 ready_mpscs: List[str] = []
-                for value, meta in ready_chans_kvs:
-                    key = meta.key.decode()
+                for key_bytes, value in ready_chans_kvs:
+                    key = key_bytes.decode()
                     mpmc_id = key.split("/")[-2]
                     mpsc_id = key.split("/")[-1]
                     mpmc_ids.add(mpmc_id)
@@ -950,10 +1057,10 @@ def scenario_dynamic_producer_consumer(
                 logger.info("all_mpscs: %s", mpsc_chans)
                 for mpsc_id in mpsc_chans:
                     mpsc_producer_offset_pair.setdefault(mpsc_id, {})
-                    producer_offset_kvs = list(
-                        scan_client.get_prefix(
-                            mpsc._new_produce_offset_of_all_producer_key(mpsc_id)
-                        )
+                    producer_offset_prefix = mpsc._new_produce_offset_of_all_producer_key(mpsc_id)
+                    producer_offset_kvs = _etcd_call_with_retry(
+                        f"scan producer offsets for mpsc_id={mpsc_id}",
+                        lambda client: list(client.get_prefix(producer_offset_prefix)),
                     )
                     logger.info(
                         "mpsc %s producer_offset_kvs: %s",
@@ -961,8 +1068,8 @@ def scenario_dynamic_producer_consumer(
                         producer_offset_kvs,
                     )
                     mpsc_producer_offsets = {
-                        int(meta.key.decode().split("/")[-1]): int(value.decode())
-                        for value, meta in producer_offset_kvs
+                        int(key.decode().split("/")[-1]): int(value.decode())
+                        for key, value in producer_offset_kvs
                     }
                     logger.info(
                         "mpsc %s producer_offsets dict: %s",
@@ -981,7 +1088,10 @@ def scenario_dynamic_producer_consumer(
                         consume_offset_key = mpsc._new_consume_offset_of_one_producer_key(
                             mpsc_id, str(mpsc_producer_key)
                         )
-                        consume_value, _ = scan_client.get(consume_offset_key)
+                        consume_value = _etcd_call_with_retry(
+                            f"read consume offset {consume_offset_key}",
+                            lambda client: client.get(consume_offset_key),
+                        )
                         logger.info(
                             "mpsc_id: %s mpsc_producer_key: %s consume_offset_key: %s "
                             "mpsc_consume_offset: %s",
@@ -994,9 +1104,12 @@ def scenario_dynamic_producer_consumer(
                             mpsc_producer_offset_pair[mpsc_id][mpsc_producer_key][1] = int(
                                 consume_value.decode()
                             )
-                time.sleep(5)
-        finally:
-            scan_client.close()
+                stop_event.wait(5)
+        except Exception as exc:  # noqa: BLE001
+            if stop_event.is_set() and _is_transient_etcd_failure(exc):
+                logger.info("scan_producer_offset stopped during transient etcd failure: %s", exc)
+                return
+            logger.exception("scan_producer_offset stopped unexpectedly")
 
     try:
         # NOTE: `new_or_bind` has a race window during first-time channel creation when multiple
@@ -1022,7 +1135,11 @@ def scenario_dynamic_producer_consumer(
             initial_consumers_id.append(consumer_id)
         start_processes()
 
-        scan_thread = threading.Thread(target=scan_producer_offset, daemon=True)
+        scan_thread = threading.Thread(
+            target=scan_producer_offset,
+            args=(scan_stop_event,),
+            daemon=True,
+        )
         scan_thread.start()
 
         print("=== Starting dynamic management phase ===")
@@ -1058,6 +1175,7 @@ def scenario_dynamic_producer_consumer(
 
             start_processes()
             time.sleep(5)
+            fail_fast_on_subprocess_error(process_type_filter="producer")
             _assert_test_mpmc_id_stable()
 
         for phase in range(CONSUMER_CRASH_RECOVER_PHASES):
@@ -1071,8 +1189,11 @@ def scenario_dynamic_producer_consumer(
                     consumes_to_stop.append(consumer_id)
 
             for consumer_id in consumes_to_stop:
-                etcd_client.put(
-                    f"/test_mpmc_stop_consumer/{consumer_id}", b"dummy_value"
+                _etcd_call_with_retry(
+                    f"publish stop flag for consumer_id={consumer_id}",
+                    lambda client, consumer_id=consumer_id: client.put(
+                        f"/test_mpmc_stop_consumer/{consumer_id}", b"dummy_value"
+                    ),
                 )
 
             for consumer_id in consumes_to_stop:
@@ -1102,7 +1223,10 @@ def scenario_dynamic_producer_consumer(
                 member_id = _extract_mpmc_member_id_from_consumer_log(log_file)
 
                 # Verify that ready keys exist (global view) before join
-                ready_keys_before = list(etcd_client.get_prefix(_READY_CHANNELS_BASE_PREFIX))
+                ready_keys_before = _etcd_call_with_retry(
+                    f"list ready keys before joining consumer_id={consumer_id}",
+                    lambda client: list(client.get_prefix(_READY_CHANNELS_BASE_PREFIX)),
+                )
                 logging.info(
                     "Before join: total ready keys=%d (all mpmc) for consumer %s",
                     len(ready_keys_before),
@@ -1110,8 +1234,10 @@ def scenario_dynamic_producer_consumer(
                 )
                 if member_id is not None:
                     assert test_mpmc_id is not None
-                    ready_keys_under_test = list(
-                        etcd_client.get_prefix(_new_mpmc_ready_channels_prefix(test_mpmc_id))
+                    test_ready_prefix = _new_mpmc_ready_channels_prefix(test_mpmc_id)
+                    ready_keys_under_test = _etcd_call_with_retry(
+                        f"list test ready keys before joining consumer_id={consumer_id}",
+                        lambda client: list(client.get_prefix(test_ready_prefix)),
                     )
                     logging.info(
                         "Before join: test_mpmc_id=%s ready_keys=%d, consumer %s mpmc_member_id=%s ready_keys_by_member=%d",
@@ -1151,7 +1277,10 @@ def scenario_dynamic_producer_consumer(
                     leftover_keys = []
                 
                 # Verify that ready keys have been deleted for this consumer after sleep
-                ready_keys_after = list(etcd_client.get_prefix(_READY_CHANNELS_BASE_PREFIX))
+                ready_keys_after = _etcd_call_with_retry(
+                    f"list ready keys after joining consumer_id={consumer_id}",
+                    lambda client: list(client.get_prefix(_READY_CHANNELS_BASE_PREFIX)),
+                )
                 logging.info(
                     "After join and sleep: total ready keys=%d (all mpmc) for consumer %s",
                     len(ready_keys_after),
@@ -1159,8 +1288,10 @@ def scenario_dynamic_producer_consumer(
                 )
                 if member_id is not None:
                     assert test_mpmc_id is not None
-                    ready_keys_under_test_after = list(
-                        etcd_client.get_prefix(_new_mpmc_ready_channels_prefix(test_mpmc_id))
+                    test_ready_prefix_after = _new_mpmc_ready_channels_prefix(test_mpmc_id)
+                    ready_keys_under_test_after = _etcd_call_with_retry(
+                        f"list test ready keys after joining consumer_id={consumer_id}",
+                        lambda client: list(client.get_prefix(test_ready_prefix_after)),
                     )
                     left = _count_ready_keys_for_member_id(member_id)
                     logging.info(
@@ -1205,9 +1336,12 @@ def scenario_dynamic_producer_consumer(
                     "debug_all_ready_channels after close consumers %s",
                     consumes_to_stop,
                 )
-                ready_chans_kvs = list(etcd_client.get_prefix(_READY_CHANNELS_BASE_PREFIX))
-                for value, meta in ready_chans_kvs:
-                    key = meta.key.decode()
+                ready_chans_kvs = _etcd_call_with_retry(
+                    "debug all ready channels after closing consumers",
+                    lambda client: list(client.get_prefix(_READY_CHANNELS_BASE_PREFIX)),
+                )
+                for key_bytes, value in ready_chans_kvs:
+                    key = key_bytes.decode()
                     mpmc_id = key.split("/")[-2]
                     mpsc_id = key.split("/")[-1]
                     logging.info(
@@ -1233,6 +1367,7 @@ def scenario_dynamic_producer_consumer(
                 recovered_consumers.append(consumer_id)
             start_processes()
             time.sleep(5)
+            fail_fast_on_subprocess_error(process_type_filter="producer")
             _assert_test_mpmc_id_stable()
 
         join_timeout_s = int(TEST_TIMEOUT_SECONDS)
@@ -1241,7 +1376,10 @@ def scenario_dynamic_producer_consumer(
         wait_all_of_type("producer", timeout_s=join_timeout_s)
 
         # 2) Notify consumers that no more producers will publish; they will exit after idle timeout.
-        etcd_client.put("/test_mpmc_stop_producer", b"dummy_value")
+        _etcd_call_with_retry(
+            "publish producer stop flag",
+            lambda client: client.put("/test_mpmc_stop_producer", b"dummy_value"),
+        )
 
         # 3) Wait remaining consumers to drain and exit (or fail fast).
         wait_all_of_type("consumer", timeout_s=join_timeout_s)
@@ -1251,7 +1389,11 @@ def scenario_dynamic_producer_consumer(
         verify_exit_status(subprocesses)
         print("=== MPMC Dynamic Test PASSED ===")
     finally:
-        etcd_client.close()
+        scan_stop_event.set()
+        if scan_thread is not None:
+            scan_thread.join(timeout=10)
+            if scan_thread.is_alive():
+                logging.warning("scan_producer_offset did not stop before timeout")
 
 
 def verify_production_consumption_counts(

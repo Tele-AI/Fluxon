@@ -62,21 +62,137 @@ jobs:
           out_path = Path("${{ runner.temp }}") / "ci_test_list.ci.yaml"
           suite = yaml.safe_load(src_path.read_text(encoding="utf-8"))
 
+          top_attention_scene_prefix = "ci_top_attention_"
+
+          def top_attention_command(scene_id, *, case_config, timeout_seconds=21600):
+              if not scene_id.startswith(top_attention_scene_prefix):
+                  raise ValueError(f"not a top-attention CI scene id: {scene_id}")
+              suffix = scene_id[len(top_attention_scene_prefix):]
+              command = (
+                  "__RUN_DIR__/venv/bin/python3 -u "
+                  f"__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_{suffix}.py"
+              )
+              if case_config:
+                  command += " --case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+              return {
+                  "id": f"top_attention_{suffix}",
+                  "command": command,
+                  "timeout_seconds": timeout_seconds,
+              }
+
+          top_attention_ci_scenes = {
+              "ci_top_attention_doc_page_build": {
+                  "subject": "doc_page",
+                  "runtime_contract": "rust_self_managed",
+                  "scale": "n1_kvowner_dram_3gib",
+                  "case_config": True,
+                  "timeout_seconds": 10800,
+                  "scene_config": {
+                      "doc_site_base_url": "${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}",
+                  },
+              },
+              "ci_top_attention_bin_kvtest": {
+                  "subject": "rust",
+                  "runtime_contract": "rust_self_managed",
+                  "scale": "n1_kvowner_dram_20gib",
+                  "case_config": True,
+                  "scene_config": {
+                      "kv_test_rounds": "p2p_only",
+                  },
+              },
+              "ci_top_attention_log_mgmt": {
+                  "subject": "rust",
+                  "runtime_contract": "rust_self_managed",
+                  "scale": "n1_kvowner_dram_20gib",
+                  "case_config": True,
+                  "scene_config": {
+                      "enabled": True,
+                  },
+              },
+              "ci_top_attention_ctrl_c_kv": {
+                  "subject": "rust",
+                  "runtime_contract": "rust_self_managed",
+                  "scale": "n1_kvowner_dram_3gib",
+                  "case_config": False,
+                  "scene_config": {},
+              },
+              "ci_top_attention_ctrl_c_mq": {
+                  "subject": "mq",
+                  "runtime_contract": "rust_self_managed",
+                  "scale": "n1_kvowner_dram_20gib",
+                  "case_config": False,
+                  "scene_config": {},
+              },
+              "ci_top_attention_mq_core": {
+                  "subject": "mq",
+                  "runtime_contract": "cluster_kv_owner",
+                  "scale": "n1_kvowner_dram_20gib",
+                  "case_config": True,
+                  "scene_config": {},
+              },
+              "ci_top_attention_mq_mpsc": {
+                  "subject": "mq",
+                  "runtime_contract": "cluster_kv_owner",
+                  "scale": "n1_kvowner_dram_20gib",
+                  "case_config": True,
+                  "scene_config": {},
+              },
+              "ci_top_attention_mq_mpmc": {
+                  "subject": "mq",
+                  "runtime_contract": "cluster_kv_owner",
+                  "scale": "n1_kvowner_dram_20gib",
+                  "case_config": True,
+                  "scene_config": {},
+              },
+              "ci_top_attention_mq_mpmc_bench": {
+                  "subject": "mq",
+                  "runtime_contract": "cluster_kv_owner",
+                  "scale": "n1_kvowner_dram_20gib",
+                  "case_config": True,
+                  "scene_config": {},
+              },
+          }
+
+          for scene_id, scene_def in top_attention_ci_scenes.items():
+              commands = [
+                  top_attention_command(
+                      scene_id,
+                      case_config=scene_def["case_config"],
+                      timeout_seconds=scene_def.get("timeout_seconds", 21600),
+                  )
+              ]
+              existing_scene = suite["scenes"].get(scene_id)
+              if existing_scene is None:
+                  suite["scenes"][scene_id] = {
+                      "ci": {
+                          "subject": scene_def["subject"],
+                          "runtime_contract": scene_def["runtime_contract"],
+                          "commands": commands,
+                      },
+                      "select": {
+                          "scales": [scene_def["scale"]],
+                          "profiles": ["fluxon_tcp"],
+                      },
+                  }
+                  continue
+              existing_scene["ci"]["subject"] = scene_def["subject"]
+              existing_scene["ci"]["runtime_contract"] = scene_def["runtime_contract"]
+              existing_scene["ci"]["commands"] = commands
+
           # Scene selection:
           # - ci_top_attention_doc_page_build validates doc build through the prebuilt Docker image.
           # - ci_top_attention_bin_kvtest keeps the Rust kv_test entry under the testbed scene contract.
           # - ci_top_attention_log_mgmt keeps log rolling/sharding coverage under the same CI testbed contract.
+          # - ci_top_attention_ctrl_c_kv keeps runtime child-retirement Ctrl-C coverage in this workflow.
+          # - ci_top_attention_ctrl_c_mq keeps MQ Ctrl-C exit coverage in this workflow.
           # - ci_top_attention_mq_core keeps MQ correctness coverage inside the same CI testbed contract.
+          # - ci_top_attention_mq_mpsc keeps MPSC API channel coverage inside the same CI testbed contract.
+          # - ci_top_attention_mq_mpmc keeps MPMC API channel coverage inside the same CI testbed contract.
+          # - ci_top_attention_mq_mpmc_bench keeps heavier MPMC benchmark-style coverage in this workflow.
           suite["scenes"] = {
               key: value
               for key, value in suite["scenes"].items()
-              if key in (
-                  "ci_top_attention_doc_page_build",
-                  "ci_top_attention_bin_kvtest",
-                  "ci_top_attention_log_mgmt",
-                  "ci_top_attention_mq_core",
-                  "ci_top_attention_log_mgmt",
-              )
+              if key in top_attention_ci_scenes
           }
 
           # Profile selection:
@@ -90,19 +206,21 @@ jobs:
           # Scene-local workload config:
           # - Restrict kv_test to one round in CI for runtime control.
           # - Keep the doc-site base URL in scene_configs instead of workflow env.
-          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"]["ci_top_attention_bin_kvtest"]["kv_test_rounds"] = "p2p_only"
-          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"]["ci_top_attention_doc_page_build"]["doc_site_base_url"] = (
-              "${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
-          )
-          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"]["ci_top_attention_log_mgmt"]["enabled"] = True
-          suite["profiles"]["fluxon_tcp"]["runtime"]["ci"]["scene_configs"]["ci_top_attention_mq_core"] = {}
+          scene_configs = suite["profiles"]["fluxon_tcp"]["runtime"]["ci"].setdefault("scene_configs", {})
+          for scene_id, scene_def in top_attention_ci_scenes.items():
+              scene_configs[scene_id] = copy.deepcopy(scene_def["scene_config"])
 
           # Scale selection:
           # - Keep the original per-scene scales from ci_test_list.yaml.
           # - ci_top_attention_doc_page_build stays on n1_kvowner_dram_3gib.
           # - ci_top_attention_bin_kvtest stays on n1_kvowner_dram_20gib.
           # - ci_top_attention_log_mgmt stays on n1_kvowner_dram_20gib.
+          # - ci_top_attention_ctrl_c_kv stays on n1_kvowner_dram_3gib.
+          # - ci_top_attention_ctrl_c_mq stays on n1_kvowner_dram_20gib.
           # - ci_top_attention_mq_core stays on n1_kvowner_dram_20gib.
+          # - ci_top_attention_mq_mpsc stays on n1_kvowner_dram_20gib.
+          # - ci_top_attention_mq_mpmc stays on n1_kvowner_dram_20gib.
+          # - ci_top_attention_mq_mpmc_bench stays on n1_kvowner_dram_20gib.
 
           out_path.write_text(
               yaml.safe_dump(suite, sort_keys=False, allow_unicode=False),
@@ -117,6 +235,51 @@ jobs:
             --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
             --print-generated \
             --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy"
+
+      - name: Print ci_2_virt_node failure summary
+        if: ${{ failure() }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          workdir = Path(".dever/ci_2_virt_node/runner_run")
+          case_runs_path = workdir / "case_runs.yaml"
+          if not case_runs_path.exists():
+              print(f"missing {case_runs_path}")
+              raise SystemExit(0)
+
+          case_runs = yaml.safe_load(case_runs_path.read_text(encoding="utf-8"))
+          print("=== case_runs.yaml ===")
+          print(yaml.safe_dump(case_runs, sort_keys=False, allow_unicode=False))
+
+          for case in case_runs.get("cases", []):
+              last_run = case.get("last_run", {})
+              if last_run.get("outcome") != "SUCCESS":
+                  case_id = case.get("case_id")
+                  run_index = last_run.get("run_index")
+                  print(f"=== failed case: {case_id} run_{run_index} ===")
+                  run_dir = workdir / "results" / str(case_id) / f"run_{run_index}"
+                  for rel in (
+                      "summary.yaml",
+                      "exception.txt",
+                      "logs/ci_runner/exit_code.txt",
+                  ):
+                      path = run_dir / rel
+                      print(f"=== {path} ===")
+                      if path.exists():
+                          print(path.read_text(encoding="utf-8", errors="replace"))
+                      else:
+                          print(f"missing {path}")
+
+                  stdout_path = run_dir / "logs" / "ci_runner" / "stdout.log"
+                  print(f"=== {stdout_path} tail ===")
+                  if stdout_path.exists():
+                      lines = stdout_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                      print("\n".join(lines[-240:]))
+                  else:
+                      print(f"missing {stdout_path}")
+          PY
 
       - name: Normalize ci_2_virt_node debug artifact permissions
         if: ${{ always() }}

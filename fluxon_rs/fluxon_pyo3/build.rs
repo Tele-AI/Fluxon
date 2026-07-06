@@ -1,6 +1,7 @@
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 const DEFAULT_RUNTIME_SEARCH_SUBDIRS: &[&str] = &[
@@ -13,7 +14,53 @@ const DEFAULT_RUNTIME_SEARCH_SUBDIRS: &[&str] = &[
 ];
 const CLOSED_SDK_RUNTIME_ROOT_DIR_NAMES: &[&str] = &["native_runtime", "vendor_runtime"];
 
+const PYTHON_TEST_EMBED_LINK_ARGS_SCRIPT: &str = r#"
+import sysconfig
+
+args = []
+seen = set()
+
+def add(arg):
+    arg = str(arg or "").strip()
+    if arg and arg not in seen:
+        seen.add(arg)
+        args.append(arg)
+
+for key in ("LIBPL", "LIBDIR"):
+    path = sysconfig.get_config_var(key)
+    if path:
+        add("-L" + path)
+
+libname = ""
+ldlibrary = sysconfig.get_config_var("LDLIBRARY") or sysconfig.get_config_var("LIBRARY") or ""
+if ldlibrary.startswith("libpython"):
+    stem = ldlibrary[3:]
+    for suffix in (".so", ".a", ".dylib"):
+        pos = stem.find(suffix)
+        if pos >= 0:
+            stem = stem[:pos]
+            break
+    libname = stem
+
+if not libname:
+    version = sysconfig.get_config_var("VERSION") or ""
+    abiflags = sysconfig.get_config_var("ABIFLAGS") or ""
+    if version:
+        libname = "python" + version + abiflags
+
+if libname:
+    add("-l" + libname)
+
+for key in ("LIBS", "SYSLIBS"):
+    for arg in (sysconfig.get_config_var(key) or "").split():
+        add(arg)
+
+print("\n".join(args))
+"#;
+
 fn main() {
+    emit_python_test_embed_link_args();
+
     let target_dir = get_target_dir();
     let runtime_search_subdirs = load_runtime_search_subdirs();
     let runtime_root_dir_names = runtime_root_dir_names();
@@ -57,6 +104,105 @@ fn main() {
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=../target/debug/");
     println!("cargo:rerun-if-changed=../target/release/");
+}
+
+fn emit_python_test_embed_link_args() {
+    println!("cargo:rerun-if-env-changed=PYTHON");
+
+    let python = env::var("PYTHON")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "python3".to_string());
+
+    let output = match Command::new(&python)
+        .arg("-c")
+        .arg(PYTHON_TEST_EMBED_LINK_ARGS_SCRIPT)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            write_python_test_link_source(
+                None,
+                &format!(
+                    "failed to query Python embed link args with {}: {}",
+                    python, err
+                ),
+            );
+            println!(
+                "cargo:warning=failed to query Python embed link args with {}: {}",
+                python, err
+            );
+            return;
+        }
+    };
+
+    if !output.status.success() {
+        write_python_test_link_source(
+            None,
+            &format!(
+                "failed to query Python embed link args with {}: status={} stderr={}",
+                python,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        );
+        println!(
+            "cargo:warning=failed to query Python embed link args with {}: status={} stderr={}",
+            python,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return;
+    }
+
+    let mut python_link_lib = None;
+    for arg in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|arg| !arg.is_empty())
+    {
+        if let Some(path) = arg.strip_prefix("-L") {
+            if !path.is_empty() {
+                println!("cargo:rustc-link-search=native={path}");
+            }
+            continue;
+        }
+
+        if let Some(lib) = arg.strip_prefix("-l") {
+            if lib.starts_with("python") {
+                python_link_lib = Some(lib.to_string());
+            }
+        }
+    }
+
+    if let Some(lib) = python_link_lib {
+        write_python_test_link_source(Some(&lib), "");
+    } else {
+        let message = format!(
+            "Python embed link args from {} did not include a libpython entry",
+            python
+        );
+        write_python_test_link_source(None, &message);
+        println!(
+            "cargo:warning=Python embed link args from {} did not include a libpython entry",
+            python
+        );
+    }
+}
+
+fn write_python_test_link_source(python_link_lib: Option<&str>, message: &str) {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let path = out_dir.join("python_test_link.rs");
+    let source = match python_link_lib {
+        Some(lib) => format!("#[link(name = {lib:?})]\nunsafe extern \"C\" {{}}\n"),
+        None => format!("compile_error!({:?});\n", message),
+    };
+    fs::write(&path, source).expect("write generated Python test link source");
+    println!(
+        "cargo:rustc-env=FLUXON_PYO3_TEST_PYTHON_LINK_RS={}",
+        path.display()
+    );
 }
 
 fn get_target_dir() -> PathBuf {

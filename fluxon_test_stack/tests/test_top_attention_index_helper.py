@@ -62,6 +62,12 @@ class TestTopAttentionIndexHelper(unittest.TestCase):
             "ci_top_attention_bin_kvtest",
         )
 
+    def test_kv_py_core_keeps_pyo3_etcd_integration_test(self) -> None:
+        entry_text = (
+            REPO_ROOT / "fluxon_test_stack" / "top_attention_test_index" / "_kv_py_core.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("fluxon_py/tests/test_pyo3_etcd.py", entry_text)
+
 
 if __name__ == "__main__":
     unittest.main()

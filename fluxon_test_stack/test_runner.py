@@ -399,32 +399,6 @@ def _scene_id_is_allowed(scene_id: str) -> bool:
     return scene_id in SCENE_ENUMS_ALLOWED or scene_id.startswith(TOP_ATTENTION_SCENE_ID_PREFIX)
 
 
-def _runner_native_ci_scene_ids() -> Tuple[str, ...]:
-    return (
-        "ci_top_attention_doc_page_build",
-        "ci_top_attention_bin_kvtest",
-        "ci_top_attention_cargo_fs_core",
-        "ci_top_attention_cargo_util",
-        "ci_top_attention_cargo_kv_unit",
-        "ci_top_attention_cargo_cli",
-        "ci_top_attention_cargo_commu",
-        "ci_top_attention_cargo_commu_contract",
-        "ci_top_attention_cargo_framework",
-        "ci_top_attention_cargo_fs",
-        "ci_top_attention_cargo_fs_s3_gateway",
-        "ci_top_attention_cargo_limit_thirdparty",
-        "ci_top_attention_cargo_mq",
-        "ci_top_attention_cargo_observability",
-        "ci_top_attention_cargo_ops",
-        "ci_top_attention_cargo_pyo3",
-        "ci_top_attention_log_mgmt",
-        "ci_top_attention_mq_core",
-    )
-
-
-def _scene_id_uses_runner_native_ci_commands(scene_id: str) -> bool:
-    return scene_id in _runner_native_ci_scene_ids()
-
 TEST_STACK_RPC_BACKEND_FLUXON = "FLUXON"
 TEST_STACK_RPC_BACKEND_ZERORPC = "ZERORPC"
 TEST_STACK_RPC_BACKENDS_ALLOWED = {
@@ -3690,7 +3664,7 @@ def _wait_ci_instance_ready(resolved_case: Dict[str, Any], *, instance_id: str) 
             instance_id=instance_id,
             shared_json_path=shared_json_path,
             mmap_file_path=mmap_file_path,
-            timeout_s=180,
+            timeout_s=CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S,
         )
         return
     if instance_id == "ci_runner":
@@ -5386,7 +5360,7 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
     if kind == SCENE_KIND_CI:
         _forbid_unknown_keys(item, {"ci", "select"}, ctx)
         ci = _require_dict(item.get("ci"), f"{ctx}.ci")
-        _forbid_unknown_keys(ci, {"subject", "runtime_contract", "prepare"}, f"{ctx}.ci")
+        _forbid_unknown_keys(ci, {"subject", "runtime_contract", "commands", "prepare"}, f"{ctx}.ci")
         subject = _require_scene_subject(ci.get("subject"), f"{ctx}.ci.subject")
         if subject == SCENE_SUBJECT_INFER:
             raise ValueError(f"{ctx}.ci.subject must not be {SCENE_SUBJECT_INFER!r}")
@@ -5400,6 +5374,9 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
         raw_prepare = ci.get("prepare")
         if raw_prepare is not None:
             parsed_ci["prepare"] = _parse_ci_prepare_steps(raw_prepare, f"{ctx}.ci.prepare")
+        raw_commands = ci.get("commands")
+        if raw_commands is not None:
+            parsed_ci["commands"] = _parse_ci_commands(raw_commands, f"{ctx}.ci.commands")
         item["ci"] = parsed_ci
         return item
 
@@ -6819,215 +6796,6 @@ def _command_step_label(command: Dict[str, Any]) -> str:
     return f"{command_id}[{test_id}]"
 
 
-def _runner_native_ci_commands_for_case(case: _ResolvedCase, *, ctx: str) -> List[Dict[str, Any]]:
-    scene_id = _require_str(case.scene_id, f"{ctx}.scene_id")
-    if scene_id == "ci_top_attention_doc_page_build":
-        return [
-            {
-                "id": "top_attention_doc_page_build",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_doc_page_build.py "
-                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
-                ),
-                "timeout_seconds": 10800,
-            }
-        ]
-    if scene_id == "ci_top_attention_bin_kvtest":
-        return [
-            {
-                "id": "top_attention_bin_kvtest",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_bin_kvtest.py "
-                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_fs_core":
-        return [
-            {
-                "id": "top_attention_cargo_fs_core",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs_core.py"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_util":
-        return [
-            {
-                "id": "top_attention_cargo_util",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_util.py "
-                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_kv_unit":
-        return [
-            {
-                "id": "top_attention_cargo_kv_unit",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_kv_unit.py "
-                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_cli":
-        return [
-            {
-                "id": "top_attention_cargo_cli",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_cli.py"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_commu":
-        return [
-            {
-                "id": "top_attention_cargo_commu",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_commu.py"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_commu_contract":
-        return [
-            {
-                "id": "top_attention_cargo_commu_contract",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_commu_contract.py"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_framework":
-        return [
-            {
-                "id": "top_attention_cargo_framework",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_framework.py"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_fs":
-        return [
-            {
-                "id": "top_attention_cargo_fs",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs.py"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_fs_s3_gateway":
-        return [
-            {
-                "id": "top_attention_cargo_fs_s3_gateway",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_fs_s3_gateway.py"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_limit_thirdparty":
-        return [
-            {
-                "id": "top_attention_cargo_limit_thirdparty",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_limit_thirdparty.py"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_mq":
-        return [
-            {
-                "id": "top_attention_cargo_mq",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_mq.py"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_observability":
-        return [
-            {
-                "id": "top_attention_cargo_observability",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_observability.py"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_ops":
-        return [
-            {
-                "id": "top_attention_cargo_ops",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_ops.py"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_cargo_pyo3":
-        return [
-            {
-                "id": "top_attention_cargo_pyo3",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_cargo_pyo3.py"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_log_mgmt":
-        return [
-            {
-                "id": "top_attention_log_mgmt",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_log_mgmt.py "
-                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    if scene_id == "ci_top_attention_mq_core":
-        return [
-            {
-                "id": "top_attention_mq_core",
-                "command": (
-                    "__RUN_DIR__/venv/bin/python3 -u "
-                    "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_core.py "
-                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml"
-                ),
-                "timeout_seconds": 21600,
-            }
-        ]
-    raise ValueError(f"{ctx} unsupported runner-native CI scene: {scene_id!r}")
-
-
 def _materialize_selected_ci_steps(
     case: _ResolvedCase,
     command: Dict[str, Any],
@@ -7073,9 +6841,10 @@ def _materialize_selected_ci_steps(
 def _build_ci_execution_plan(case: _ResolvedCase, suite: _Suite) -> List[_PlannedCase]:
     selectors = suite.run_selectors
     scene_ci = _require_dict(suite.scenes[case.scene_id].get("ci"), f"scene[{case.scene_id}].ci")
-    if not _scene_id_uses_runner_native_ci_commands(case.scene_id):
-        raise ValueError(f"scene[{case.scene_id}] does not declare a runner-native CI command branch")
-    commands = _runner_native_ci_commands_for_case(case, ctx=f"scene[{case.scene_id}].ci")
+    commands = _parse_ci_commands(
+        scene_ci.get("commands"),
+        f"scene[{case.scene_id}].ci.commands",
+    )
     raw_prepare = scene_ci.get("prepare")
     ci_prepare_steps = None if raw_prepare is None else _parse_ci_prepare_steps(
         copy.deepcopy(raw_prepare),

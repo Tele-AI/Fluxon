@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import os
@@ -39,6 +40,35 @@ _RUNNER = _load_module()
 _CI_RUNTIME_MOD = sys.modules["test_runner_ci_runtime"]
 
 
+def _top_attention_command(
+    *,
+    command_id: str,
+    script_name: str,
+    case_config: bool = False,
+    timeout_seconds: int = 21600,
+) -> dict:
+    command = (
+        "__RUN_DIR__/venv/bin/python3 -u "
+        f"__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/{script_name}"
+    )
+    if case_config:
+        command += " --case-config __RUN_DIR__/configs/ci_scene_config.yaml"
+    return {
+        "id": command_id,
+        "command": command,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def _suite_cfg_with_declared_ci_commands(command_map: dict[str, list[dict]]) -> dict:
+    suite_cfg = yaml.safe_load(
+        (_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8")
+    )
+    for scene_id, commands in command_map.items():
+        suite_cfg["scenes"][scene_id]["ci"]["commands"] = copy.deepcopy(commands)
+    return suite_cfg
+
+
 class TestTestRunnerTestbedContract(unittest.TestCase):
     def test_write_ci_master_owner_configs_emits_owner_large_file_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -69,6 +99,36 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 [str((run_dir / "services" / "owner_0" / "large").resolve())],
             )
             self.assertNotIn("shared_file_path", owner_cfg["fluxonkv_spec"])
+
+    def test_ci_owner_prepare_wait_uses_shared_bundle_timeout_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            owner_cfg_path = run_dir / "configs" / "ci_owner_0.yaml"
+            owner_cfg_path.parent.mkdir(parents=True)
+            _RUNNER._write_yaml_file(
+                owner_cfg_path,
+                {
+                    "fluxonkv_spec": {
+                        "cluster_name": "ci_cluster",
+                        "share_mem_path": "/tmp/ci_shm",
+                    },
+                },
+            )
+            resolved_case = {"runtime": {"run_dir": str(run_dir)}}
+
+            with mock.patch.object(_RUNNER, "_wait_instance_running") as wait_running:
+                with mock.patch.object(
+                    _RUNNER,
+                    "_wait_ci_owner_shared_bundle_ready_and_stage_shared_json",
+                ) as wait_shared_bundle:
+                    _RUNNER._wait_ci_instance_ready(resolved_case, instance_id="owner_0")
+
+            wait_running.assert_called_once_with(resolved_case, instance_id="owner_0", timeout_s=60)
+            wait_shared_bundle.assert_called_once()
+            self.assertEqual(
+                wait_shared_bundle.call_args.kwargs["timeout_s"],
+                _RUNNER.CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S,
+            )
 
     def test_ci_runtime_python_executable_requires_python310_on_path(self) -> None:
         with mock.patch.object(_RUNNER.shutil, "which", return_value=None):
@@ -155,12 +215,19 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertEqual(run_subprocess_mock.call_count, 3)
             assert_python_abi.assert_called_once_with(venv_python=expected_venv_python)
 
-    def test_runner_native_bin_kvtest_scene_stays_on_direct_wrapper_command(self) -> None:
-        suite = _RUNNER._parse_suite_config(
-            yaml.safe_load(
-                (REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8")
-            )
+    def test_declared_bin_kvtest_scene_stays_on_direct_wrapper_command(self) -> None:
+        suite_cfg = _suite_cfg_with_declared_ci_commands(
+            {
+                "ci_top_attention_bin_kvtest": [
+                    _top_attention_command(
+                        command_id="top_attention_bin_kvtest",
+                        script_name="_bin_kvtest.py",
+                        case_config=True,
+                    )
+                ]
+            }
         )
+        suite = _RUNNER._parse_suite_config(suite_cfg)
         cases = _RUNNER._expand_cases(suite)
         case = next(item for item in cases if item.scene_id == "ci_top_attention_bin_kvtest" and item.profile_id == "fluxon_tcp")
 
@@ -500,8 +567,18 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         self.assertIn("fluxon_test_stack", _RUNNER._CI_SOURCE_OVERLAY_ROOTS)
         self.assertNotIn("quartz_prewarm", _RUNNER._CI_SOURCE_OVERLAY_ROOTS)
 
-    def test_top_attention_ci_execution_plan_is_runner_native(self) -> None:
-        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+    def test_top_attention_ci_execution_plan_uses_declared_command(self) -> None:
+        suite_cfg = _suite_cfg_with_declared_ci_commands(
+            {
+                "ci_top_attention_bin_kvtest": [
+                    _top_attention_command(
+                        command_id="top_attention_bin_kvtest",
+                        script_name="_bin_kvtest.py",
+                        case_config=True,
+                    )
+                ]
+            }
+        )
         suite = _RUNNER._parse_suite_config(suite_cfg)
         cases = _RUNNER._expand_cases(suite)
         case = next(item for item in cases if item.scene_id == "ci_top_attention_bin_kvtest" and item.profile_id == "fluxon_tcp")
@@ -510,8 +587,17 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         self.assertEqual(planned[0].ci_commands[0]["id"], "top_attention_bin_kvtest")
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
 
-    def test_top_attention_cargo_fs_core_ci_execution_plan_is_runner_native(self) -> None:
-        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+    def test_top_attention_cargo_fs_core_ci_execution_plan_uses_declared_command(self) -> None:
+        suite_cfg = _suite_cfg_with_declared_ci_commands(
+            {
+                "ci_top_attention_cargo_fs_core": [
+                    _top_attention_command(
+                        command_id="top_attention_cargo_fs_core",
+                        script_name="_cargo_fs_core.py",
+                    )
+                ]
+            }
+        )
         suite = _RUNNER._parse_suite_config(suite_cfg)
         cases = _RUNNER._expand_cases(suite)
         case = next(item for item in cases if item.scene_id == "ci_top_attention_cargo_fs_core" and item.profile_id == "fluxon_tcp")
@@ -524,8 +610,18 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         )
         self.assertNotIn("--case-config", planned[0].ci_commands[0]["command"])
 
-    def test_top_attention_cargo_util_ci_execution_plan_is_runner_native(self) -> None:
-        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+    def test_top_attention_cargo_util_ci_execution_plan_uses_declared_command(self) -> None:
+        suite_cfg = _suite_cfg_with_declared_ci_commands(
+            {
+                "ci_top_attention_cargo_util": [
+                    _top_attention_command(
+                        command_id="top_attention_cargo_util",
+                        script_name="_cargo_util.py",
+                        case_config=True,
+                    )
+                ]
+            }
+        )
         suite = _RUNNER._parse_suite_config(suite_cfg)
         cases = _RUNNER._expand_cases(suite)
         case = next(item for item in cases if item.scene_id == "ci_top_attention_cargo_util" and item.profile_id == "fluxon_tcp")
@@ -538,8 +634,18 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         )
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
 
-    def test_top_attention_cargo_kv_unit_ci_execution_plan_is_runner_native(self) -> None:
-        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+    def test_top_attention_cargo_kv_unit_ci_execution_plan_uses_declared_command(self) -> None:
+        suite_cfg = _suite_cfg_with_declared_ci_commands(
+            {
+                "ci_top_attention_cargo_kv_unit": [
+                    _top_attention_command(
+                        command_id="top_attention_cargo_kv_unit",
+                        script_name="_cargo_kv_unit.py",
+                        case_config=True,
+                    )
+                ]
+            }
+        )
         suite = _RUNNER._parse_suite_config(suite_cfg)
         cases = _RUNNER._expand_cases(suite)
         case = next(item for item in cases if item.scene_id == "ci_top_attention_cargo_kv_unit" and item.profile_id == "fluxon_tcp")
@@ -552,10 +658,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         )
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
 
-    def test_additional_top_attention_cargo_ci_execution_plans_are_runner_native(self) -> None:
-        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
-        suite = _RUNNER._parse_suite_config(suite_cfg)
-        cases = _RUNNER._expand_cases(suite)
+    def test_additional_top_attention_cargo_ci_execution_plans_use_declared_commands(self) -> None:
         expected = {
             "ci_top_attention_cargo_cli": ("top_attention_cargo_cli", "_cargo_cli.py"),
             "ci_top_attention_cargo_commu": ("top_attention_cargo_commu", "_cargo_commu.py"),
@@ -569,6 +672,19 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             "ci_top_attention_cargo_ops": ("top_attention_cargo_ops", "_cargo_ops.py"),
             "ci_top_attention_cargo_pyo3": ("top_attention_cargo_pyo3", "_cargo_pyo3.py"),
         }
+        suite_cfg = _suite_cfg_with_declared_ci_commands(
+            {
+                scene_id: [
+                    _top_attention_command(
+                        command_id=command_id,
+                        script_name=script_name,
+                    )
+                ]
+                for scene_id, (command_id, script_name) in expected.items()
+            }
+        )
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
         for scene_id, (command_id, script_name) in expected.items():
             with self.subTest(scene_id=scene_id):
                 case = next(item for item in cases if item.scene_id == scene_id and item.profile_id == "fluxon_tcp")
@@ -581,8 +697,18 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 )
                 self.assertNotIn("--case-config", planned[0].ci_commands[0]["command"])
 
-    def test_top_attention_log_mgmt_ci_execution_plan_is_runner_native(self) -> None:
-        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+    def test_top_attention_log_mgmt_ci_execution_plan_uses_declared_command(self) -> None:
+        suite_cfg = _suite_cfg_with_declared_ci_commands(
+            {
+                "ci_top_attention_log_mgmt": [
+                    _top_attention_command(
+                        command_id="top_attention_log_mgmt",
+                        script_name="_log_mgmt.py",
+                        case_config=True,
+                    )
+                ]
+            }
+        )
         artifact_sets = suite_cfg.get("artifact_sets")
         if isinstance(artifact_sets, dict):
             for artifact_set in artifact_sets.values():
@@ -605,8 +731,18 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         )
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
 
-    def test_top_attention_mq_core_ci_execution_plan_is_runner_native(self) -> None:
-        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+    def test_top_attention_mq_core_ci_execution_plan_uses_declared_command(self) -> None:
+        suite_cfg = _suite_cfg_with_declared_ci_commands(
+            {
+                "ci_top_attention_mq_core": [
+                    _top_attention_command(
+                        command_id="top_attention_mq_core",
+                        script_name="_mq_core.py",
+                        case_config=True,
+                    )
+                ]
+            }
+        )
         suite = _RUNNER._parse_suite_config(suite_cfg)
         cases = _RUNNER._expand_cases(suite)
         case = next(item for item in cases if item.scene_id == "ci_top_attention_mq_core" and item.profile_id == "fluxon_tcp")
@@ -618,6 +754,95 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             planned[0].ci_commands[0]["command"],
         )
         self.assertIn("--case-config __RUN_DIR__/configs/ci_scene_config.yaml", planned[0].ci_commands[0]["command"])
+
+    def test_requested_top_attention_ci_execution_plans_use_declared_commands(self) -> None:
+        suite_cfg = copy.deepcopy(
+            yaml.safe_load(
+                (_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8")
+            )
+        )
+        requested = {
+            "ci_top_attention_ctrl_c_kv": ("rust", "rust_self_managed", "_ctrl_c_kv.py", "top_attention_ctrl_c_kv", False),
+            "ci_top_attention_ctrl_c_mq": ("mq", "rust_self_managed", "_ctrl_c_mq.py", "top_attention_ctrl_c_mq", False),
+            "ci_top_attention_mq_mpsc": ("mq", "cluster_kv_owner", "_mq_mpsc.py", "top_attention_mq_mpsc", True),
+            "ci_top_attention_mq_mpmc": ("mq", "cluster_kv_owner", "_mq_mpmc.py", "top_attention_mq_mpmc", True),
+            "ci_top_attention_mq_mpmc_bench": ("mq", "cluster_kv_owner", "_mq_mpmc_bench.py", "top_attention_mq_mpmc_bench", True),
+        }
+        scene_configs = suite_cfg["profiles"]["fluxon_tcp"]["runtime"]["ci"].setdefault("scene_configs", {})
+        for scene_id, (subject, runtime_contract, script_name, command_id, needs_case_config) in requested.items():
+            suite_cfg["scenes"][scene_id] = {
+                "ci": {
+                    "subject": subject,
+                    "runtime_contract": runtime_contract,
+                    "commands": [
+                        _top_attention_command(
+                            command_id=command_id,
+                            script_name=script_name,
+                            case_config=needs_case_config,
+                        )
+                    ],
+                },
+                "select": {
+                    "scales": ["n1_kvowner_dram_20gib"],
+                    "profiles": ["fluxon_tcp"],
+                },
+            }
+            scene_configs[scene_id] = {}
+
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        for scene_id, (_subject, runtime_contract, script_name, command_id, needs_case_config) in requested.items():
+            with self.subTest(scene_id=scene_id):
+                case = next(item for item in cases if item.scene_id == scene_id and item.profile_id == "fluxon_tcp")
+                planned = _RUNNER._build_ci_execution_plan(case, suite)
+                self.assertEqual(len(planned), 1)
+                self.assertEqual(planned[0].ci_commands[0]["id"], command_id)
+                command = planned[0].ci_commands[0]["command"]
+                self.assertIn(
+                    f"__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/{script_name}",
+                    command,
+                )
+                self.assertEqual(
+                    "--case-config __RUN_DIR__/configs/ci_scene_config.yaml" in command,
+                    needs_case_config,
+                )
+
+                resolved_case = {
+                    "case": {
+                        "family": "ci",
+                        "case_id": f"{scene_id}__n1_kvowner_dram_20gib__fluxon_tcp",
+                    },
+                    "scene": {
+                        "ci": {
+                            "runtime_contract": runtime_contract,
+                            "subject": suite.scenes[scene_id]["ci"]["subject"],
+                        },
+                    },
+                    "deploy": {
+                        "instances": (
+                            [{"id": "master"}, {"id": "owner_0"}, {"id": "ci_runner"}]
+                            if runtime_contract == "cluster_kv_owner"
+                            else [{"id": "ci_runner"}]
+                        ),
+                    },
+                    "runtime_model": {
+                        "test_bed": {"kind": "ops"},
+                        "base_runtime": {},
+                        "case_runtime": {
+                            "instance_ids": (
+                                ["master", "owner_0", "ci_runner"]
+                                if runtime_contract == "cluster_kv_owner"
+                                else ["ci_runner"]
+                            ),
+                        },
+                    },
+                }
+                case_plan = _RUNNER._compile_case_plan(resolved_case)
+                if runtime_contract == "cluster_kv_owner":
+                    self.assertEqual(tuple(phase.phase_id for phase in case_plan.prepare_phases), ("cluster_runtime",))
+                else:
+                    self.assertEqual(tuple(phase.phase_id for phase in case_plan.prepare_phases), ())
+                self.assertEqual(tuple(phase.phase_id for phase in case_plan.execute_phases), ("ci_runner",))
 
     def test_top_attention_mq_core_ci_plan_has_no_collect_phase(self) -> None:
         resolved_case = {
@@ -650,7 +875,18 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         self.assertEqual(case_plan.execute_phases[0].instance_ids, ("ci_runner",))
 
     def test_doc_page_ci_execution_plan_uses_online_docker_image(self) -> None:
-        suite_cfg = yaml.safe_load((_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(encoding="utf-8"))
+        suite_cfg = _suite_cfg_with_declared_ci_commands(
+            {
+                "ci_top_attention_doc_page_build": [
+                    _top_attention_command(
+                        command_id="top_attention_doc_page_build",
+                        script_name="_doc_page_build.py",
+                        case_config=True,
+                        timeout_seconds=10800,
+                    )
+                ]
+            }
+        )
         suite = _RUNNER._parse_suite_config(suite_cfg)
         cases = _RUNNER._expand_cases(suite)
         case = next(item for item in cases if item.scene_id == "ci_top_attention_doc_page_build" and item.profile_id == "fluxon_tcp")
