@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib.util
 import json
 import os
 import re
@@ -26,11 +27,16 @@ CI_PUBLIC_PROFILE_ID = "fluxon_tcp_thread"
 DEFAULT_PROFILE_ID = CI_PUBLIC_PROFILE_ID
 LOCAL_RELEASE_ROOT_ENV = "FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT"
 RELEASE_MANIFEST_FILENAME = "fluxon_release.sha256"
+RELEASE_MANIFEST_SHA256_ENV_KEY = "FLUXON_RELEASE_MANIFEST_SHA256"
 DEFAULT_CONFIG = REPO_ROOT / "fluxon_test_stack" / "benchmark_full_matrix.yaml"
 DEFAULT_WORKDIR = REPO_ROOT / ".tmp" / "test_largescale_mq_p160_c8"
 RUNNER = REPO_ROOT / "fluxon_test_stack" / "test_runner.py"
 LOCAL_TEST_STACK_COORDINATOR_PORT_OFFSET = 1000
 LOCAL_TEST_STACK_TOPOLOGY_PORT_SPAN = 100
+LOCAL_TEST_STACK_COORDINATOR_FALLBACK_PORT_BASE = 20000
+LOCAL_TEST_STACK_COORDINATOR_FALLBACK_PORT_SPAN = 30000
+LOCAL_TEST_STACK_P2P_PORT_MIN = 20000
+LOCAL_TEST_STACK_P2P_PORT_MAX = 61000
 
 DEFAULT_BENCHMARK = {
     "processes_per_target": 1,
@@ -86,6 +92,28 @@ def _load_yaml_mapping(path: Path, *, ctx: str) -> dict[str, Any]:
 
 def _write_yaml_mapping(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=False), encoding="utf-8")
+
+
+def _load_start_test_bed_module() -> Any:
+    module_path = REPO_ROOT / "fluxon_test_stack" / "start_test_bed.py"
+    spec = importlib.util.spec_from_file_location("fluxon_test_stack_start_test_bed_for_largescale_mq", module_path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"failed to load start_test_bed module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sync_run_local_deployconf_from_normalized_view(*, deployconf_path: Path) -> None:
+    deployconf_payload = _load_yaml_mapping(deployconf_path, ctx=f"deployconf {deployconf_path}")
+    start_test_bed_mod = _load_start_test_bed_module()
+    normalized, _notes = start_test_bed_mod._normalize_bootstrap_deployconf(
+        deployconf=deployconf_payload,
+    )
+    global_envs = normalized.get("global_envs")
+    if isinstance(global_envs, dict):
+        global_envs.pop(RELEASE_MANIFEST_SHA256_ENV_KEY, None)
+    _write_yaml_mapping(deployconf_path, normalized)
 
 
 def _parse_sha256_manifest_names(path: Path) -> list[str]:
@@ -246,6 +274,7 @@ def _normalize_run_local_testbed_bundle(
     mirror_outdir.mkdir(parents=True, exist_ok=True)
     deployconf_payload["gen_k8s_daemonset_mirror_outdir"] = str(mirror_outdir.resolve())
     _write_yaml_mapping(deployconf_path, deployconf_payload)
+    _sync_run_local_deployconf_from_normalized_view(deployconf_path=deployconf_path)
 
     manifest_path = start_cfg.with_name("manifest.json")
     if manifest_path.exists():
@@ -334,19 +363,135 @@ def _profile_target_map(cfg: dict[str, Any], profile_id: str) -> dict[str, Any]:
     )
 
 
-def _local_test_stack_coordinator_port_base(*, controller_port: int, topology_key: Any) -> int:
-    topology_offset = 0
+def _local_test_stack_topology_port_offset(topology_key: Any) -> int:
     if isinstance(topology_key, int):
-        topology_offset = int(topology_key) * LOCAL_TEST_STACK_TOPOLOGY_PORT_SPAN
+        return int(topology_key) * LOCAL_TEST_STACK_TOPOLOGY_PORT_SPAN
     elif isinstance(topology_key, str) and topology_key.isdigit():
-        topology_offset = int(topology_key) * LOCAL_TEST_STACK_TOPOLOGY_PORT_SPAN
+        return int(topology_key) * LOCAL_TEST_STACK_TOPOLOGY_PORT_SPAN
     elif topology_key != "DEFAULT":
         raise SystemExit(f"unsupported test_stack port_alloc topology key: {topology_key!r}")
+    return 0
 
+
+def _local_test_stack_coordinator_port_base(*, controller_port: int, topology_key: Any) -> int:
+    topology_offset = _local_test_stack_topology_port_offset(topology_key)
     port = int(controller_port) + LOCAL_TEST_STACK_COORDINATOR_PORT_OFFSET + topology_offset
+    if port > 65535:
+        port = LOCAL_TEST_STACK_COORDINATOR_FALLBACK_PORT_BASE + (
+            (int(controller_port) + topology_offset) % LOCAL_TEST_STACK_COORDINATOR_FALLBACK_PORT_SPAN
+        )
     if port <= 0 or port > 65535:
         raise SystemExit(f"computed local TEST_STACK coordinator_port_base out of range: {port}")
     return port
+
+
+def _local_ephemeral_tcp_ports() -> set[int]:
+    try:
+        raw = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text(encoding="utf-8").split()
+    except FileNotFoundError:
+        return set()
+    if len(raw) != 2:
+        return set()
+    try:
+        start, end = int(raw[0]), int(raw[1])
+    except ValueError:
+        return set()
+    if start <= 0 or end < start or end > 65535:
+        return set()
+    return set(range(start, end + 1))
+
+
+def _local_busy_tcp_ports() -> set[int]:
+    ports: set[int] = set()
+    for proc_path in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        try:
+            lines = proc_path.read_text(encoding="utf-8").splitlines()[1:]
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            try:
+                ports.add(int(parts[1].rsplit(":", 1)[1], 16))
+            except ValueError:
+                continue
+    ports.update(_local_ephemeral_tcp_ports())
+    return ports
+
+
+def _find_local_tcp_port_block(
+    *,
+    preferred_start: int,
+    required_count: int,
+    busy_ports: set[int] | None = None,
+) -> int:
+    required_count = int(required_count)
+    if required_count <= 0:
+        raise SystemExit(f"required local TEST_STACK P2P port count must be positive: {required_count}")
+
+    min_port = LOCAL_TEST_STACK_P2P_PORT_MIN
+    max_start = LOCAL_TEST_STACK_P2P_PORT_MAX - required_count + 1
+    if max_start < min_port:
+        raise SystemExit(
+            "local TEST_STACK P2P port window is too small: "
+            f"required_count={required_count} min={LOCAL_TEST_STACK_P2P_PORT_MIN} max={LOCAL_TEST_STACK_P2P_PORT_MAX}"
+        )
+
+    busy = _local_busy_tcp_ports() if busy_ports is None else set(busy_ports)
+    preferred = min(max(int(preferred_start), min_port), max_start)
+    starts = list(range(preferred, max_start + 1)) + list(range(min_port, preferred))
+    for start in starts:
+        end = start + required_count - 1
+        if all(port not in busy for port in range(start, end + 1)):
+            return start
+
+    raise SystemExit(
+        "no free local TEST_STACK P2P port block found: "
+        f"required_count={required_count} min={LOCAL_TEST_STACK_P2P_PORT_MIN} max={LOCAL_TEST_STACK_P2P_PORT_MAX}"
+    )
+
+
+def _local_test_stack_p2p_port_base(
+    *,
+    controller_port: int,
+    topology_key: Any,
+    required_count: int,
+    busy_ports: set[int] | None = None,
+) -> int:
+    topology_offset = _local_test_stack_topology_port_offset(topology_key)
+    search_span = LOCAL_TEST_STACK_P2P_PORT_MAX - LOCAL_TEST_STACK_P2P_PORT_MIN - int(required_count) + 1
+    if search_span <= 0:
+        raise SystemExit(f"required local TEST_STACK P2P port count is too large: {required_count}")
+    preferred = LOCAL_TEST_STACK_P2P_PORT_MIN + (
+        (int(controller_port) + topology_offset * 17) % search_span
+    )
+    return _find_local_tcp_port_block(
+        preferred_start=preferred,
+        required_count=int(required_count),
+        busy_ports=busy_ports,
+    )
+
+
+def _local_test_stack_master_port_base(
+    *,
+    controller_port: int,
+    topology_key: Any,
+    required_count: int,
+    busy_ports: set[int] | None = None,
+) -> int:
+    topology_offset = _local_test_stack_topology_port_offset(topology_key)
+    search_span = LOCAL_TEST_STACK_P2P_PORT_MAX - LOCAL_TEST_STACK_P2P_PORT_MIN - int(required_count) + 1
+    if search_span <= 0:
+        raise SystemExit(f"required local TEST_STACK master port count is too large: {required_count}")
+    preferred = LOCAL_TEST_STACK_P2P_PORT_MIN + (
+        (int(controller_port) + topology_offset * 11 + 7000) % search_span
+    )
+    return _find_local_tcp_port_block(
+        preferred_start=preferred,
+        required_count=int(required_count),
+        busy_ports=busy_ports,
+    )
 
 
 def _rewrite_test_stack_coordinator_ports_for_local_controller(
@@ -354,6 +499,7 @@ def _rewrite_test_stack_coordinator_ports_for_local_controller(
     *,
     controller_port: int,
 ) -> None:
+    busy_ports = _local_busy_tcp_ports()
     profiles = _require_dict(suite.get("profiles"), "suite.profiles")
     for profile_id, profile in profiles.items():
         if not isinstance(profile, dict):
@@ -380,6 +526,32 @@ def _rewrite_test_stack_coordinator_ports_for_local_controller(
                 controller_port=int(controller_port),
                 topology_key=topology_key,
             )
+            if "kv_master_port_base" in entry and "kv_master_port_stride" in entry:
+                entry["kv_master_port_base"] = _local_test_stack_master_port_base(
+                    controller_port=int(controller_port),
+                    topology_key=topology_key,
+                    required_count=int(entry["kv_master_port_stride"]),
+                    busy_ports=busy_ports,
+                )
+                busy_ports.update(
+                    range(
+                        int(entry["kv_master_port_base"]),
+                        int(entry["kv_master_port_base"]) + int(entry["kv_master_port_stride"]),
+                    )
+                )
+            if "kv_p2p_port_base" in entry and "kv_p2p_port_stride" in entry:
+                entry["kv_p2p_port_base"] = _local_test_stack_p2p_port_base(
+                    controller_port=int(controller_port),
+                    topology_key=topology_key,
+                    required_count=int(entry["kv_p2p_port_stride"]),
+                    busy_ports=busy_ports,
+                )
+                busy_ports.update(
+                    range(
+                        int(entry["kv_p2p_port_base"]),
+                        int(entry["kv_p2p_port_base"]) + int(entry["kv_p2p_port_stride"]),
+                    )
+                )
 
 
 def _ordered_usable_targets(target_ip_map: dict[str, Any], *, ctx: str) -> list[str]:
@@ -640,7 +812,12 @@ def _build_suite(
         cfg,
         profile_ids=profile_ids,
         topology=topology,
-        required_p2p_ports_per_slot=(topology * processes_per_target) + 1 + owner_count,
+        required_p2p_ports_per_slot=(
+            producer_targets * processes_per_target * int(args.threads_per_process)
+            + consumer_targets * processes_per_target
+            + owner_count
+            + 1
+        ),
     )
 
     scenes = _require_dict(cfg.get("scenes"), "config.scenes")

@@ -61,9 +61,7 @@ fn read_test_log_shard_window_config() -> anyhow::Result<Option<LogShardWindowCo
         return Ok(None);
     }
     let window_seconds: i64 = window_text.parse().map_err(|e| {
-        anyhow::anyhow!(
-            "{TEST_LOG_SHARD_WINDOW_SECONDS_ENV} must be a positive integer: {e}"
-        )
+        anyhow::anyhow!("{TEST_LOG_SHARD_WINDOW_SECONDS_ENV} must be a positive integer: {e}")
     })?;
     if window_seconds <= 0 {
         anyhow::bail!("{TEST_LOG_SHARD_WINDOW_SECONDS_ENV} must be > 0");
@@ -85,7 +83,9 @@ fn read_test_log_shard_window_config() -> anyhow::Result<Option<LogShardWindowCo
     }))
 }
 
-fn resolve_shard_date_from_datetime(now: chrono::DateTime<chrono::Utc>) -> anyhow::Result<chrono::NaiveDate> {
+fn resolve_shard_date_from_datetime(
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<chrono::NaiveDate> {
     let Some(config) = read_test_log_shard_window_config()? else {
         return Ok(now.date_naive());
     };
@@ -99,8 +99,8 @@ fn resolve_shard_date_from_datetime(now: chrono::DateTime<chrono::Utc>) -> anyho
         );
     }
     let bucket_index = delta_seconds / config.window_seconds;
-    let base_date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
-        .expect("valid hard-coded synthetic base date");
+    let base_date =
+        chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid hard-coded synthetic base date");
     Ok(base_date + chrono::Days::new(bucket_index as u64))
 }
 
@@ -108,10 +108,7 @@ fn current_shard_date() -> anyhow::Result<chrono::NaiveDate> {
     resolve_shard_date_from_datetime(chrono::Utc::now())
 }
 
-fn cleanup_old_daily_sharded_logs(
-    base_path: &Path,
-    retention_days: usize,
-) -> anyhow::Result<()> {
+fn cleanup_old_daily_sharded_logs(base_path: &Path, retention_days: usize) -> anyhow::Result<()> {
     let parent = match base_path.parent() {
         Some(parent) => parent,
         None => return Ok(()),
@@ -124,7 +121,8 @@ fn cleanup_old_daily_sharded_logs(
         return Ok(());
     };
     fs::create_dir_all(parent)?;
-    let keep_since = current_shard_date()? - chrono::Days::new(retention_days.saturating_sub(1) as u64);
+    let keep_since =
+        current_shard_date()? - chrono::Days::new(retention_days.saturating_sub(1) as u64);
     let prefix = format!("{stem}.");
     for entry in std::fs::read_dir(parent)? {
         let entry = entry?;
@@ -180,10 +178,7 @@ impl DailyShardedFileWriter {
         current_daily_sharded_log_path(&self.base_path)
     }
 
-    fn rotate_if_needed(
-        &self,
-        state: &mut DailyShardedFileWriterState,
-    ) -> io::Result<()> {
+    fn rotate_if_needed(&self, state: &mut DailyShardedFileWriterState) -> io::Result<()> {
         let next_path = self
             .current_path()
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
@@ -314,20 +309,19 @@ pub fn daily_sharded_log_path(
     base_path: &Path,
     date: chrono::NaiveDate,
 ) -> anyhow::Result<PathBuf> {
-    let file_name = base_path.file_name().and_then(|v| v.to_str()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "log path must end with a valid utf-8 filename: {}",
-            base_path.display()
-        )
-    })?;
+    let file_name = base_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "log path must end with a valid utf-8 filename: {}",
+                base_path.display()
+            )
+        })?;
     let stem = file_name
         .strip_suffix(".log")
         .ok_or_else(|| anyhow::anyhow!("log path must end with .log: {}", base_path.display()))?;
-    Ok(base_path.with_file_name(format!(
-        "{}.{}.log",
-        stem,
-        date.format("%Y-%m-%d")
-    )))
+    Ok(base_path.with_file_name(format!("{}.{}.log", stem, date.format("%Y-%m-%d"))))
 }
 
 pub fn current_daily_sharded_log_path(base_path: &Path) -> anyhow::Result<PathBuf> {

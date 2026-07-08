@@ -851,6 +851,7 @@ def _rewrite_same_host_local_multi_node_fixed_ports(
     _set_service_port(tikv_pd_cfg, port=plan["tikv_pd_port"])
     _set_service_port(tikv_cfg, port=plan["tikv_port"])
     _set_service_port(master_cfg, port=plan["master_port"])
+    _set_service_port(ops_controller_cfg, port=plan["ops_controller_http_port"])
 
     etcd_entrypoint = _require_str(etcd_cfg.get("entrypoint"), "deployconf.service.etcd.entrypoint")
     etcd_entrypoint = _replace_expected_substring(
@@ -879,9 +880,9 @@ def _rewrite_same_host_local_multi_node_fixed_ports(
     )
 
     master_entrypoint = _require_str(master_cfg.get("entrypoint"), "deployconf.service.master.entrypoint")
-    master_cfg["entrypoint"] = _replace_expected_substring(
+    master_cfg["entrypoint"] = _replace_expected_regex(
         value=master_entrypoint,
-        old="port: 51051",
+        pattern=r"(?m)^[ \t]*port:\s+\d+\s*$",
         new=f"port: {plan['master_port']}",
         ctx="deployconf.service.master.entrypoint port",
     )
@@ -895,6 +896,12 @@ def _rewrite_same_host_local_multi_node_fixed_ports(
         old="p2p_listen_port: 12102",
         new=f"p2p_listen_port: {plan['ops_controller_kv_p2p_port']}",
         ctx="deployconf.service.ops_controller.entrypoint kv p2p_listen_port",
+    )
+    ops_controller_cfg["entrypoint"] = _replace_expected_substring(
+        value=ops_controller_cfg["entrypoint"],
+        old='http_listen_addr: "0.0.0.0:${OPS_CONTROLLER__PORT}"',
+        new=f'http_listen_addr: "0.0.0.0:{plan["ops_controller_http_port"]}"',
+        ctx="deployconf.service.ops_controller.entrypoint http_listen_addr",
     )
 
     ops_agent_entrypoint = _require_str(
@@ -925,6 +932,7 @@ def _build_same_host_local_multi_node_port_plan(
         for idx in range(node_count)
     ]
     plan = {
+        "ops_controller_http_port": controller_port,
         "master_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_MASTER_PORT_OFFSET,
         "fs_master_panel_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_FS_MASTER_PANEL_PORT_OFFSET,
         "ops_controller_kv_p2p_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_OPS_CONTROLLER_KV_P2P_PORT_OFFSET,
@@ -940,6 +948,7 @@ def _build_same_host_local_multi_node_port_plan(
     max_port = max(
         int(plan["master_port"]),
         int(plan["fs_master_panel_port"]),
+        int(plan["ops_controller_http_port"]),
         int(plan["ops_controller_kv_p2p_port"]),
         int(plan["etcd_client_port"]),
         int(plan["etcd_peer_port"]),
@@ -993,6 +1002,15 @@ def _replace_expected_substring(*, value: str, old: str, new: str, ctx: str) -> 
     if new in value:
         return value
     raise ValueError(f"{ctx} missing expected fragment: {old!r}")
+
+
+def _replace_expected_regex(*, value: str, pattern: str, new: str, ctx: str) -> str:
+    replaced, count = re.subn(pattern, new, value, count=1)
+    if count == 1:
+        return replaced
+    if new in value:
+        return value
+    raise ValueError(f"{ctx} missing expected pattern: {pattern!r}")
 
 
 def _rewrite_ops_agent_case_ports(

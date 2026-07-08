@@ -92,7 +92,6 @@ from .mq_config_check import validate_mpmc_config
 
 
 logging = init_logger()
-MPMC_ATTACH_PAYLOAD_KEEPALIVE_RETRIES = 3
 LOCAL_MEMBER_ID_RANGE_SIZE = 32
 MPMC_CREATE_LOCK_TTL_SECONDS = 10
 MPMC_CREATE_LOCK_TIMEOUT_SECONDS = 10.0
@@ -120,54 +119,6 @@ def new_etcd_client(api: KvClient) -> Result[etcd3.Etcd3Client, ApiError]:
                 transport_user=TransportUser.ETCD,
             )
         )
-
-def stable_revoke_lease(api: KvClient, lease_id: int) -> Result[OkNone, ApiError]:
-    """Revoke an etcd lease with bounded retries.
-
-    This helper is intended for shutdown/cleanup paths where the current etcd client
-    may be in a bad state (e.g. transient gRPC channel failure). Each attempt creates
-    a fresh etcd client instance and calls revoke_lease once.
-    """
-
-    if not isinstance(lease_id, int) or lease_id <= 0:
-        raise ValueError(f"invalid lease_id: {lease_id!r}")
-
-    endpoints = api.get_etcd_config()
-    endpoint = endpoints[0] if endpoints else None
-
-    errors: List[str] = []
-    for attempt in range(3):
-        client_res = new_etcd_client(api)
-        if not client_res.is_ok():
-            err = client_res.unwrap_error()
-            errors.append(str(err))
-            continue
-
-        client = client_res.unwrap()
-        try:
-            client.revoke_lease(int(lease_id))
-            return Result.new_ok(OK_NONE)
-        except Exception as e:  # noqa: BLE001
-            # etcd revoke is idempotent; treat NotFound as success so shutdown
-            # paths don't surface spurious errors when the lease was already
-            # revoked or expired.
-            msg = str(e)
-            if "requested lease not found" in msg:
-                return Result.new_ok(OK_NONE)
-            errors.append(f"attempt={attempt}: {e}")
-        finally:
-            try:
-                client.close()
-            except Exception as e:  # noqa: BLE001
-                logging.warning(f"stable_revoke_lease failed to close etcd client: {e}")
-
-    return Result.new_error(
-        NetworkError(
-            message=f"stable_revoke_lease failed for lease_id={lease_id}, errors={errors}",
-            endpoint=endpoint,
-        )
-    )
-
 
 def stable_delete_ready_keys_for_member(
     api: KvClient, mpmc_id: str, member_id: int
@@ -428,6 +379,17 @@ def _new_mpmc_role_key(mpmc_id: str, role: ChanRole, member_id: int) -> str:
     else:
         raise ValueError(f"Invalid role: {role}")
 
+def _extract_mpmc_member_id_from_role_key(key: bytes, mpmc_id: str, role: ChanRole) -> int:
+    key_str = key.decode()
+    prefix = _new_mpmc_role_key_prefix(mpmc_id, role) + "/"
+    if not key_str.startswith(prefix):
+        raise ValueError(f"Invalid MPMC role key format: {key_str}")
+
+    member_id_raw = key_str[len(prefix):]
+    if "/" in member_id_raw or not member_id_raw.isdigit():
+        raise ValueError(f"Invalid MPMC role key member id: {key_str}")
+    return int(member_id_raw)
+
 def _new_mpmc_mpsc_channels_key(mpmc_id: str) -> str:
     """
     Get the key for storing MPSC channel IDs in MPMC channel.
@@ -514,6 +476,7 @@ class MPMCChannel(FactoryOnly):
         shutdown_ctl: "MqShutdownCtl",
         id_allocator_cluster_lease_id: int,
         id_allocator_cluster_lease_handle_opt: Optional[object],
+        keep_shared_mpmc_leases: bool,
     ):
         """
         Initialize MPMC Channel.
@@ -528,6 +491,7 @@ class MPMCChannel(FactoryOnly):
         chan_config = validate_mpmc_config(chan_config, role=role)
         self.mpmc_id = mpmc_id
         self.chan_config = chan_config
+        self.role = role
         self.etcd_client: etcd3.Etcd3Client = etcd_client
         self.kv_api = kv_api
         self.new_ready_channels_callback = new_ready_channels_callback
@@ -539,8 +503,9 @@ class MPMCChannel(FactoryOnly):
 
         # MQ lease manager bridge (Rust RAII). Use this to register etcd and kvclient leases.
         self._lease_mgr = LeaseManagerHandle()
-        # Shared kvclient payload lease; managed here (common part)
-        self.payload_lease_id: Optional[int] = None
+        # Shared kvclient payload lease id; this channel may register a local
+        # keepalive contributor below.
+        self.payload_lease_id: Optional[int] = payload_lease_id
         self._lm_kv_payload: Optional[object] = None
         # Declare member/global/cluster lease handles to satisfy static analyzers
         self.mpmc_member_id: Optional[int] = None
@@ -586,7 +551,7 @@ class MPMCChannel(FactoryOnly):
 
         # Lease setup steps are split into closures for clarity.
 
-        # 1) Global etcd lease keepalive (no revoke on drop)
+        # 1) Global etcd lease keepalive contributor.
         def _setup_global_lease_keepalive():
             logging.debug(
                 f"[mpmc-lease] begin register global etcd keepalive: "
@@ -598,7 +563,6 @@ class MPMCChannel(FactoryOnly):
                     self._etcd_endpoints,
                     int(chan_config["ttl_seconds"]),
                     int(self.mpmc_global_lease.id),
-                    False,
                     register_by=f"mpmc_channel_global:{mpmc_id}",
                 )
             except Exception as e:
@@ -645,7 +609,7 @@ class MPMCChannel(FactoryOnly):
                     f"ok={self._lm_kv_payload is not None}"
                 )
 
-        # 3) Id-allocator cluster lease keepalive (no revoke on drop)
+        # 3) Id-allocator cluster lease keepalive contributor.
         def _setup_id_allocator_cluster_keepalive():
             if self._lm_cluster_long is not None:
                 logging.debug(
@@ -662,7 +626,6 @@ class MPMCChannel(FactoryOnly):
                 self._etcd_endpoints,
                 30 * 60,
                 int(self._id_allocator_cluster_lease_id),
-                False,
                 register_by=f"mpmc_id_allocator_cluster_long:{mpmc_id}",
             )
             logging.debug(
@@ -694,7 +657,6 @@ class MPMCChannel(FactoryOnly):
                     self._etcd_endpoints,
                     int(chan_config["ttl_seconds"]),
                     int(self.mpmc_member_lease.id),
-                    True,
                     register_by=f"mpmc_channel_member:{mpmc_id}/{self.mpmc_member_id}",
                 )
             except Exception as e:
@@ -719,16 +681,26 @@ class MPMCChannel(FactoryOnly):
                     f"[mpmc-lease] end put role key: key={mpmc_role_key}"
                 )
 
-        # Execute steps
-        # Execute steps with timing for precise stuck-location diagnostics
-        _t0 = time.time(); logging.debug(f"[mpmc-lease] STEP1 global keepalive begin: mpmc_id={mpmc_id}")
-        _setup_global_lease_keepalive(); logging.debug(f"[mpmc-lease] STEP1 global keepalive end: elapsed={time.time()-_t0:.3f}s")
+        # Top-level members all contribute keepalive for shared metadata,
+        # payload, and allocator leases. Local sub-MPSC handles may also
+        # register keepalive contributors, but cleanup remains explicit owner
+        # work and is never driven by lease-handle drop.
+        if keep_shared_mpmc_leases:
+            _t0 = time.time(); logging.debug(f"[mpmc-lease] STEP1 global keepalive begin: mpmc_id={mpmc_id}")
+            _setup_global_lease_keepalive(); logging.debug(f"[mpmc-lease] STEP1 global keepalive end: elapsed={time.time()-_t0:.3f}s")
 
-        _t1 = time.time(); logging.debug(f"[mpmc-lease] STEP2 payload lease keepalive begin: mpmc_id={mpmc_id}")
-        _setup_payload_lease_keepalive(); logging.debug(f"[mpmc-lease] STEP2 payload lease keepalive end: elapsed={time.time()-_t1:.3f}s")
+            _t1 = time.time(); logging.debug(f"[mpmc-lease] STEP2 payload lease keepalive begin: mpmc_id={mpmc_id}")
+            _setup_payload_lease_keepalive(); logging.debug(f"[mpmc-lease] STEP2 payload lease keepalive end: elapsed={time.time()-_t1:.3f}s")
 
-        _t2 = time.time(); logging.debug(f"[mpmc-lease] STEP3 id-allocator cluster lease keepalive begin: mpmc_id={mpmc_id}")
-        _setup_id_allocator_cluster_keepalive(); logging.debug(f"[mpmc-lease] STEP3 id-allocator cluster lease keepalive end: elapsed={time.time()-_t2:.3f}s")
+            _t2 = time.time(); logging.debug(f"[mpmc-lease] STEP3 id-allocator cluster lease keepalive begin: mpmc_id={mpmc_id}")
+            _setup_id_allocator_cluster_keepalive(); logging.debug(f"[mpmc-lease] STEP3 id-allocator cluster lease keepalive end: elapsed={time.time()-_t2:.3f}s")
+        else:
+            logging.debug(
+                f"[mpmc-lease] skip shared lease keepalive registration for this channel instance: "
+                f"mpmc_id={mpmc_id}, metadata_lease_id={int(self.mpmc_global_lease.id)}, "
+                f"payload_lease_id={int(payload_lease_id)}, "
+                f"id_allocator_cluster_lease_id={int(self._id_allocator_cluster_lease_id)}"
+            )
 
         _t3 = time.time(); logging.debug(f"[mpmc-lease] STEP4 member id and role-key begin: mpmc_id={mpmc_id}")
         _setup_member_and_role_key(); logging.debug(f"[mpmc-lease] STEP4 member id and role-key end: elapsed={time.time()-_t3:.3f}s")
@@ -1047,7 +1019,15 @@ class MPMCChannel(FactoryOnly):
             ready_channels: List[str], unready_channels: List[str]
         ) -> Optional[Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError]]:
             if producer is not None:
-                mpsc_producer = producer._get_next_channel_from_heap(ready_channels, unready_channels)
+                try:
+                    mpsc_producer = producer._get_next_channel_from_heap(ready_channels, unready_channels)
+                except Exception as e:
+                    return Result.new_error(
+                        ChanBindError(
+                            f"Failed to lazily bind ready MPSC producer for "
+                            f"mpmc_id={self.mpmc_id}: {e}"
+                        )
+                    )
                 if mpsc_producer is not None:
                     logging.debug(
                         f"{tag} Successfully got next available MPSC producer from heap for MPMC channel {self.mpmc_id}"
@@ -1340,10 +1320,18 @@ class MPMCChannel(FactoryOnly):
         Returns:
             int: Number of active consumers
         """
-        # get by role key prefix
-        role_key_prefix=_new_mpmc_role_key_prefix(self.mpmc_id, ChanRole.CONSUMER)
-        kvs=list(self.etcd_client.get_prefix(role_key_prefix))
-        return len(kvs)
+        return len(self.get_active_member_ids(ChanRole.CONSUMER))
+
+    def get_active_member_ids(self, role: ChanRole) -> List[int]:
+        """Return active MPMC member ids for one role."""
+
+        role_key_prefix = _new_mpmc_role_key_prefix(self.mpmc_id, role) + "/"
+        member_ids: List[int] = []
+        for _, meta in self.etcd_client.get_prefix(role_key_prefix):
+            member_ids.append(
+                _extract_mpmc_member_id_from_role_key(meta.key, self.mpmc_id, role)
+            )
+        return sorted(member_ids)
     
     
     @staticmethod
@@ -1394,7 +1382,6 @@ class MPMCChannel(FactoryOnly):
             endpoints,
             30 * 60,
             int(cluster_long_lease.id),
-            False,
             register_by=f"mpmc_id_allocator_cluster_long:{mpmc_id}",
         )
         allocator.update_lease(cluster_long_lease)
@@ -1460,6 +1447,7 @@ class MPMCChannel(FactoryOnly):
                 shutdown_ctl,
                 int(cluster_long_lease.id),
                 cluster_long_lease_handle,
+                True,
             )
         except Exception as e:
             logging.warning(
@@ -1557,30 +1545,10 @@ class MPMCChannel(FactoryOnly):
                 )
             return ttl_val > 0
 
-        def _payload_lease_is_valid(lease_id: int) -> bool:
-            last_err: Optional[ApiError] = None
-            for attempt in range(1, MPMC_ATTACH_PAYLOAD_KEEPALIVE_RETRIES + 1):
-                res = kv_api.keepalive_lease(int(lease_id))
-                if res.is_ok():
-                    _ = res.unwrap()
-                    return True
-                err = res.unwrap_error()
-                if isinstance(err, PayloadLeaseNotFoundError):
-                    return False
-                last_err = err
-                logging.warning(
-                    "MPMC %s payload lease keepalive attempt %s/%s failed during existing-channel attach: "
-                    "payload_lease_id=%s err=%s",
-                    mpmc_id,
-                    attempt,
-                    MPMC_ATTACH_PAYLOAD_KEEPALIVE_RETRIES,
-                    int(lease_id),
-                    err,
-                )
-            raise ValueError(f"MPMC {mpmc_id} payload lease keepalive failed: {last_err}")
-
         metadata_ok = _metadata_lease_is_valid(metadata_lease_id)
-        payload_ok = _payload_lease_is_valid(int(payload_lease_id_from_meta))
+        # Payload lease liveness is validated by keepalive registration during
+        # MPMCChannel construction. Existing attaches are top-level members and
+        # contribute keepalive for the shared payload lease.
         # The id-allocator cluster lease is required for correct membership/id allocation semantics.
         # Treat it as part of the MPMC meta contract: if it is dead, the meta is stale.
         def _id_allocator_cluster_lease_is_valid(lease_id: int) -> bool:
@@ -1600,12 +1568,11 @@ class MPMCChannel(FactoryOnly):
             return ttl_val > 0
 
         id_alloc_ok = _id_allocator_cluster_lease_is_valid(int(cluster_lease_id_from_meta))
-        if (not metadata_ok) or (not payload_ok):
+        if not metadata_ok:
             raise InvalidConfigurationError(
                 message=(
                     "MPMC meta is stale and cannot be bound safely. "
-                    f"mpmc_id={mpmc_id} metadata_lease_id={metadata_lease_id} metadata_ok={metadata_ok} "
-                    f"payload_lease_id={int(payload_lease_id_from_meta)} payload_ok={payload_ok}. "
+                    f"mpmc_id={mpmc_id} metadata_lease_id={metadata_lease_id} metadata_ok={metadata_ok}. "
                     "Delete the stale MPMC meta and unique mapping, then recreate a new MPMC channel."
                 ),
                 config_key="mpmc_meta_stale",
@@ -1620,7 +1587,7 @@ class MPMCChannel(FactoryOnly):
                 config_key="mpmc_meta_stale",
             )
 
-        # Build channel with provided lease; payload lease handling is inside __init__ (read-only)
+        # Build channel as a top-level keepalive contributor for shared leases.
         # Use FactoryOnly gate to construct instance
         MPMCChannel._allow_init = True
         try:
@@ -1637,6 +1604,7 @@ class MPMCChannel(FactoryOnly):
                 shutdown_ctl,
                 cluster_lease_id_from_meta,
                 None,
+                True,
             )
             return channel
         except Exception as e:
@@ -1802,8 +1770,16 @@ class MPMCChannel(FactoryOnly):
         except Exception as e:  # noqa: BLE001
             logging.warning(f"MPMC channel {self.mpmc_id} stop_watching failed: {e}")
 
-        # Drop PyLease handles to stop keepalive; etcd leases with
-        # revoke_on_drop=False are intentionally not revoked.
+        # Graceful owner cleanup: the member owns its role key. Crashes still
+        # fall back to member-lease TTL because the key is leased.
+        try:
+            if isinstance(self.mpmc_member_id, int):
+                role_key = _new_mpmc_role_key(self.mpmc_id, self.role, self.mpmc_member_id)
+                self.etcd_client.delete(role_key)
+        except Exception as e:  # noqa: BLE001
+            logging.warning(f"MPMC channel {self.mpmc_id} delete role key failed: {e}")
+
+        # Drop PyLease handles to stop local keepalive contribution.
         # Setting to None drops the PyO3 handle immediately in CPython,
         # which releases the underlying Rust RAII and unregisters from
         # the keepalive actor.
@@ -1907,6 +1883,7 @@ class MPMCChanProducer(ChannelProducer):
 
         # Priority queue for fair channel selection
         self._channel_queue = TimedPriorityQueue()
+        self._channel_queue_lock = threading.Lock()
 
         # Synchronous refresh in get_next_available_channel remains the authority path.
         # Construction has finished at this point, so the producer can rely on
@@ -1923,12 +1900,10 @@ class MPMCChanProducer(ChannelProducer):
         self.shutdown_ctl.closed = True
 
     def _load_ready_channels(self, new_ready_channels: List[str]):
-        for mpsc_id in new_ready_channels:
-            logging.debug(f"Loading ready channel: {mpsc_id} to priority queue")
-            producer = self.mpsc_producers.get(mpsc_id)
-            if producer is None:
-                producer = self._new_or_get_mpsc_producer(mpsc_id)
-            self._update_channel_usage_2_priority_q(producer)
+        with self._channel_queue_lock:
+            for mpsc_id in sorted(new_ready_channels, key=lambda item: int(item)):
+                logging.debug("Loading ready channel id lazily: %s", mpsc_id)
+                self._channel_queue.update(mpsc_id)
 
     def _new_ready_channels_callback(self, new_ready_channels: List[str]):
         logging.debug(f"mpmc {self.mpmc_id} producer {self.mpmc_channel.mpmc_member_id} watched new ready channels: {new_ready_channels}")
@@ -1936,17 +1911,18 @@ class MPMCChanProducer(ChannelProducer):
         self._load_ready_channels(new_ready_channels)
 
     def _remove_ready_channels_callback(self, removed_ready_channels: List[str]):
-        for mpsc_id in removed_ready_channels:
-            self._channel_queue.remove(mpsc_id)
+        with self._channel_queue_lock:
+            for mpsc_id in removed_ready_channels:
+                self._channel_queue.remove(mpsc_id)
 
     def _initialize_priority_queue(self):
         """
         Initialize the priority queue with existing ready channels.
         """
         self.mpmc_channel._refresh_local_ready_state()
-        for mpsc_id in self.mpmc_channel.get_ready_channels():
-            producer = self._new_or_get_mpsc_producer(mpsc_id)
-            self._update_channel_usage_2_priority_q(producer)
+        with self._channel_queue_lock:
+            for mpsc_id in sorted(self.mpmc_channel.get_ready_channels(), key=lambda item: int(item)):
+                self._channel_queue.update(mpsc_id)
             
 
     def _new_or_get_mpsc_producer(self, mpsc_id: str) -> MPSCChanProducer:
@@ -1985,7 +1961,8 @@ class MPMCChanProducer(ChannelProducer):
     def _update_channel_usage_2_priority_q(self, channel: MPSCChanProducer) -> None:
         """Record the latest use time for ``channel``."""
 
-        self._channel_queue.update(channel.chan_id)
+        with self._channel_queue_lock:
+            self._channel_queue.update(channel.chan_id)
 
     def _get_next_channel_from_heap(self, ready_channels: List[str], unready_channels: List[str]) -> Optional[MPSCChanProducer]:
         """
@@ -1999,17 +1976,25 @@ class MPMCChanProducer(ChannelProducer):
             Optional[MPSCChanProducer]: MPSC producer, or None if heap is empty
         """
 
-        mpsc_id = self._channel_queue.pop_ready(ready_channels)
-        if mpsc_id is None:
+        if not ready_channels:
             return None
-        # Immediately requeue the channel to keep scheduling state local
-        # and avoid relying on distant call sites to update usage.
-        self._channel_queue.update(mpsc_id)
+
+        sorted_ready_channels = sorted(ready_channels, key=lambda item: int(item))
+        with self._channel_queue_lock:
+            self._channel_queue.ensure_tracked(sorted_ready_channels)
+            mpsc_id = self._channel_queue.pop_ready(sorted_ready_channels)
+            if mpsc_id is None:
+                return None
+            # Immediately requeue the channel to keep scheduling state local
+            # and avoid relying on distant call sites to update usage.
+            self._channel_queue.update(mpsc_id)
+
         producer = self.mpsc_producers.get(mpsc_id)
         if producer is None:
             logging.debug(
-                "Channel %s popped from priority queue without cached producer", mpsc_id
+                "Binding ready channel lazily for MPMC producer: mpsc_id=%s", mpsc_id
             )
+            producer = self._new_or_get_mpsc_producer(mpsc_id)
         return producer
     
     def _record_mpsc_producer(self, mpsc_producer: MPSCChanProducer):
@@ -2572,34 +2557,9 @@ class MPMCChanConsumer(ChannelConsumer):
                 f"MPMCChanConsumer {self.get_consumer_id()} failed to delete ready keys: {e}"
             )
 
-        # Proactively revoke the per-member lease on close.
-        #
-        # Rationale:
-        # - MPMC uses the member lease to bind MPSC membership keys under
-        #   `/channels/<id>/consumer/consumer_<n>`. If we only rely on TTL, rebind
-        #   scenarios can temporarily observe multiple consumer binding keys and
-        #   fail with "invalid consumer binding state".
-        # - etcd revoke is idempotent; NotFound is treated as success by
-        #   `stable_revoke_lease`.
-        #
-        # Note: this may race with keepalive ticks; failures are surfaced as logs
-        # and do not change close idempotency.
-        try:
-            if self.mpmc_channel is not None and hasattr(self.mpmc_channel, "mpmc_member_lease"):
-                revoke_res = stable_revoke_lease(self.api, int(self.mpmc_channel.mpmc_member_lease.id))
-                if revoke_res.is_ok():
-                    revoke_res.unwrap()
-                else:
-                    logging.warning(
-                        f"MPMCChanConsumer {self.get_consumer_id()} failed to revoke member lease: "
-                        f"{revoke_res.unwrap_error()}"
-                    )
-        except Exception as e:  # noqa: BLE001
-            logging.warning(
-                f"MPMCChanConsumer {self.get_consumer_id()} failed to revoke member lease: {e}"
-            )
-
-        # Close the underlying MPSC consumer and drop the handle.
+        # Close the underlying MPSC consumer and drop the handle. The MPSC
+        # wrapper deletes its owned membership key on graceful close; member
+        # lease TTL remains the crash fallback.
         try:
             if self.mpsc_consumer is not None:
                 self.mpsc_consumer.release_local_handle().unwrap()

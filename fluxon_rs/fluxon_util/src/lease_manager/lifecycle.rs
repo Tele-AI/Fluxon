@@ -173,18 +173,15 @@ pub(crate) fn actor_register_entry(
                 }
             });
             if !created {
-                tracing::warn!(
-                    "duplicate KvClient lease registration ignored: backend={:?} lease_id={}",
+                tracing::debug!(
+                    "reuse KvClient lease registration: backend={:?} lease_id={}",
                     key.backend_uid(),
                     key.lease_id()
                 );
             }
             entry
         }
-        ActorRegisterInvocation::Etcd {
-            client,
-            revoke_on_drop,
-        } => {
+        ActorRegisterInvocation::Etcd { client } => {
             let registry = &(**actor_guard).registry;
             let (entry, created) = registry.get_or_init_with(key.clone(), || {
                 let handle = acquire_backend_handle(
@@ -204,18 +201,15 @@ pub(crate) fn actor_register_entry(
                     }))
                 });
                 LeaseEntry {
-                    kind: LeaseEntryKind::Etcd {
-                        handle,
-                        revoke_on_drop: *revoke_on_drop,
-                    },
+                    kind: LeaseEntryKind::Etcd { handle },
                     _actor_guard: actor_guard.clone(),
                     key: key.clone(),
                     _etcd_state_guard: Some(state_guard),
                 }
             });
             if !created {
-                tracing::warn!(
-                    "duplicate Etcd lease registration ignored: backend={:?} lease_id={}",
+                tracing::debug!(
+                    "reuse Etcd lease registration: backend={:?} lease_id={}",
                     key.backend_uid(),
                     key.lease_id()
                 );
@@ -241,18 +235,18 @@ pub(crate) fn actor_get_or_spawn_and_register(
     }
 
     let (actor_entry, created) = actor_map().get_or_init_with(ttl_seconds, || {
-        let inner = Arc::new(OneTtlKeepAliveInner {
+        Arc::new(OneTtlKeepAliveInner {
             ttl_seconds,
             registry: AutoCleanMap::new(),
             running_state: Mutex::new(false),
-        });
-        spawn_cb(inner.clone());
-        inner
+        })
     });
 
     let entry = actor_register_entry(&actor_entry, key.clone(), inv, rt.clone());
-    // If the actor existed previously but might be exiting, ensure it is running.
-    if !created {
+    if created {
+        spawn_cb((*actor_entry).clone());
+    } else {
+        // If the actor existed previously but might be exiting, ensure it is running.
         let inner = (*actor_entry).clone();
         let rth = rt.clone();
         rt.spawn(async move {
@@ -278,9 +272,9 @@ pub(crate) fn actor_get_or_spawn_and_register(
 //   this tick and then release naturally; the next tick will not see the entry.
 //   This one-last-tick behavior is benign and has no side effects beyond the
 //   regular cadence (we do not perform any keepalive during Drop).
-// - Therefore, Drop only performs local cleanup/logging and, for Etcd when
-//   revoke_on_drop is true, triggers a one-shot revoke; keepalive stopping is
-//   achieved by the entry removal itself.
+// - Therefore, Drop only performs local cleanup/logging. Keepalive stopping is
+//   achieved by the entry removal itself. Semantic owners must delete their own
+//   metadata explicitly during graceful close; backend TTL handles crash cleanup.
 impl Drop for LeaseEntry {
     fn drop(&mut self) {
         let lease_id = self.key.lease_id();
@@ -288,34 +282,7 @@ impl Drop for LeaseEntry {
             LeaseEntryKind::KvClient { .. } => {
                 debug_keepalive_log(lease_id, "kvclient lease unregistered");
             }
-            LeaseEntryKind::Etcd {
-                handle,
-                revoke_on_drop,
-                ..
-            } => {
-                if *revoke_on_drop {
-                    if let Some(mut cli) = handle.etcd_client() {
-                        let lid = lease_id as i64;
-                        // Use the runtime handle carried by the backend handle (LeaseBackendInner)
-                        let rt = handle.runtime_handle();
-                        rt.spawn(async move {
-                            if let Err(e) = cli.lease_revoke(lid).await {
-                                tracing::warn!(
-                                    "failed to revoke lease_id={} on drop: {:?}",
-                                    lid,
-                                    e
-                                );
-                            } else {
-                                tracing::debug!("revoked lease_id={} on drop", lid);
-                            }
-                        });
-                    } else {
-                        tracing::warn!(
-                            lease_id,
-                            "etcd revoke_on_drop: missing etcd client in backend handle"
-                        );
-                    }
-                }
+            LeaseEntryKind::Etcd { .. } => {
                 debug_keepalive_log(lease_id, "etcd lease unregistered");
             }
         }
@@ -332,7 +299,7 @@ pub async fn register_lease_for_keepalive(
     rt: tokio::runtime::Handle,
 ) -> AnyResult<GeneralLease> {
     match kind {
-        LeaseRegisterKind::Etcd { revoke_on_drop } => match backend_uid.kind() {
+        LeaseRegisterKind::Etcd => match backend_uid.kind() {
             LeaseType::Etcd => {
                 record_register_by(lease_id, format!("{:?},ttl={}", &backend_uid, ttl_seconds));
                 let endpoints = backend_uid
@@ -444,10 +411,7 @@ pub async fn register_lease_for_keepalive(
                     backend_uid.clone(),
                     lease_id,
                     ttl_seconds,
-                    ActorRegisterInvocation::Etcd {
-                        client,
-                        revoke_on_drop,
-                    },
+                    ActorRegisterInvocation::Etcd { client },
                     rt.clone(),
                 );
                 Ok(GeneralLease::Etcd {
@@ -569,5 +533,50 @@ pub async fn register_lease_for_keepalive(
                 anyhow::bail!("LeaseRegisterKind::KvClient requires KvClient backend uid");
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(9_000_000);
+
+    #[test]
+    fn new_actor_spawn_observes_first_registered_lease() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let ttl_seconds = 120_000 + id as i64;
+        let backend_uid = LeaseBackendUid::kv_client_with_callbacks(
+            format!("lifecycle_test_cluster_{id}"),
+            Arc::new(|_| Ok(1)),
+            Arc::new(|_| Ok(())),
+        );
+        let key = LeaseKey::new(backend_uid.clone(), id);
+        let inv = ActorRegisterInvocation::KvClient {
+            cb: backend_uid
+                .kv_keepalive_cb()
+                .expect("kv keepalive callback"),
+            label: None,
+        };
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_in_spawn = observed.clone();
+
+        let _entry = actor_get_or_spawn_and_register(
+            ttl_seconds,
+            key,
+            &inv,
+            move |inner| {
+                assert!(
+                    !inner.registry.is_empty(),
+                    "new keepalive actor must start after its first lease is registered"
+                );
+                observed_in_spawn.store(true, Ordering::SeqCst);
+            },
+            rt.handle().clone(),
+        );
+
+        assert!(observed.load(Ordering::SeqCst));
     }
 }

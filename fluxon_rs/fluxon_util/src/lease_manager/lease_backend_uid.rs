@@ -94,10 +94,10 @@ impl LeaseBackendUid {
 
 /// Keepalive registration payload for the unified lease manager.
 ///
-/// Etcd only needs a `revoke_on_drop` flag; KvClient path uses the
-/// keepalive closure carried by `LeaseBackendUid::KvClientWithCallbacks`.
+/// Etcd registration only contributes keepalive. Cleanup of owned keys must be
+/// performed by the semantic owner explicitly; lease drop never revokes.
 pub enum LeaseRegisterKind {
-    Etcd { revoke_on_drop: bool },
+    Etcd,
     KvClient { register_by: String },
 }
 

@@ -757,14 +757,13 @@ def _action_deploy(
         print('deployer_history_url=' + ui_url, flush=True)
 
     for inst in instances:
-        if inst.lifecycle == _LIFECYCLE_SERVICE:
-            _wait_running(
-                controller_url,
-                inst.controller_target,
-                inst.workload_kind,
-                inst.workload_name,
-                inst.authority,
-            )
+        _wait_running(
+            controller_url,
+            inst.controller_target,
+            inst.workload_kind,
+            inst.workload_name,
+            inst.authority,
+        )
 
     out_instances: List[Dict[str, Any]] = []
     for inst in instances:

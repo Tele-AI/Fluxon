@@ -19,15 +19,13 @@ pub struct ChanCreateConfig {
     /// When present, `create_mpsc_channel` will reuse this lease id
     /// for `/channels/meta/{chan_id}` 而不是通过
     /// `get_cluster_lease_id` 新建一个 cluster lease。生命周期
-    /// 由外层（例如 MPMC）控制；本组件仅负责 keepalive，且
-    /// 不会在 drop 时主动 revoke。
+    /// 由外层（例如 MPMC）控制；本组件仅贡献 keepalive。
     pub override_global_lease_id: Option<i64>,
     /// Optional override for the per-channel member lease id.
     ///
     /// 当 MPSC 被 MPMC 作为子模块使用时，可以将 MPMC 的全局
     /// lease 复用为 member lease，使得整个子链路在同一个
-    /// lease 生命周期内存在。此时本组件仅负责 keepalive，
-    /// 且不会在 drop 时 revoke 该 lease。
+    /// lease 生命周期内存在。此时本组件仅贡献 keepalive。
     pub override_member_lease_id: Option<i64>,
     /// Optional kvclient payload lease id used for backend payload keys.
     /// 当存在时，create_mpsc_channel 会直接将该 id 写入 channel
@@ -121,9 +119,7 @@ pub async fn create_mpsc_channel(
                     etcd_backend_uid.clone(),
                     cfg.ttl_seconds,
                     override_member_lease_id as u64,
-                    LeaseRegisterKind::Etcd {
-                        revoke_on_drop: false,
-                    },
+                    LeaseRegisterKind::Etcd,
                     rt_handle.clone(),
                 )
                 .await
@@ -223,9 +219,7 @@ pub async fn create_mpsc_channel(
             etcd_backend_uid.clone(),
             cfg.ttl_seconds,
             global_lease_id as u64,
-            LeaseRegisterKind::Etcd {
-                revoke_on_drop: false,
-            },
+            LeaseRegisterKind::Etcd,
             rt_handle.clone(),
         )
         .await
@@ -245,9 +239,7 @@ pub async fn create_mpsc_channel(
             etcd_backend_uid.clone(),
             30 * 60,
             global_long_lease_id as u64,
-            LeaseRegisterKind::Etcd {
-                revoke_on_drop: false,
-            },
+            LeaseRegisterKind::Etcd,
             rt_handle.clone(),
         )
         .await
@@ -280,9 +272,7 @@ pub async fn create_mpsc_channel(
                     etcd_backend_uid.clone(),
                     cfg.ttl_seconds,
                     member_lease_id_u64,
-                    LeaseRegisterKind::Etcd {
-                        revoke_on_drop: true,
-                    },
+                    LeaseRegisterKind::Etcd,
                     rt_handle.clone(),
                 )
                 .await
@@ -316,6 +306,157 @@ pub async fn create_mpsc_channel(
 }
 
 impl ChanManager {
+    /// Bind an existing MPSC channel as an MPMC sub-producer.
+    ///
+    /// The parent MPMC channel publishes metadata, member, and payload lease
+    /// ids. This constructor validates those ids and registers the local
+    /// sub-producer as another keepalive contributor for the same leases.
+    pub async fn new_mpmc_sub_producer_with_chan_id(
+        lease_manager: LeaseManager,
+        etcd_endpoints: Vec<String>,
+        kv_backend_uid: LeaseBackendUid,
+        chan_id: i64,
+        override_global_lease_id: i64,
+        override_member_lease_id: i64,
+        override_payload_lease_id: i64,
+        rt_handle: tokio::runtime::Handle,
+    ) -> anyhow::Result<Self> {
+        let etcd_backend_uid = LeaseBackendUid::etcd_from(etcd_endpoints.clone());
+        let client = etcd::Client::connect(etcd_endpoints, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect etcd failed: {}", e))?;
+        let mut meta_client = client.clone();
+        let meta_with_ver = get_chan_meta_with_version(&mut meta_client, chan_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_chan_meta failed for chan_id={}: {}", chan_id, e))?;
+        let meta = meta_with_ver.meta;
+
+        if meta.global_lease_id != override_global_lease_id {
+            anyhow::bail!(
+                "mpmc sub-producer global lease mismatch for chan_id={}: meta={} override={}",
+                chan_id,
+                meta.global_lease_id,
+                override_global_lease_id
+            );
+        }
+
+        let payload_lease_id = match meta.payload_lease_id {
+            Some(id) if id == override_payload_lease_id && id > 0 => id,
+            Some(id) => {
+                anyhow::bail!(
+                    "mpmc sub-producer payload lease mismatch for chan_id={}: meta={} override={}",
+                    chan_id,
+                    id,
+                    override_payload_lease_id
+                );
+            }
+            None => {
+                anyhow::bail!(
+                    "payload_lease_id missing in meta for chan_id={}, cannot bind MPMC sub-producer",
+                    chan_id
+                );
+            }
+        };
+
+        let member_lease = lease_manager
+            .register_lease_for_keepalive(
+                etcd_backend_uid.clone(),
+                meta.ttl_seconds,
+                override_member_lease_id as u64,
+                LeaseRegisterKind::Etcd,
+                rt_handle.clone(),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "register mpmc sub-producer member lease failed for chan_id={} lease_id={}: {}",
+                    chan_id,
+                    override_member_lease_id,
+                    e
+                )
+            })?;
+        lm_record_register_by(
+            override_member_lease_id as u64,
+            format!("mpmc_sub_producer_member:chan_id={}", chan_id),
+        );
+
+        let global_lease = lease_manager
+            .register_lease_for_keepalive(
+                etcd_backend_uid.clone(),
+                meta.ttl_seconds,
+                meta.global_lease_id as u64,
+                LeaseRegisterKind::Etcd,
+                rt_handle.clone(),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "register mpmc sub-producer global lease failed for chan_id={} lease_id={}: {}",
+                    chan_id,
+                    meta.global_lease_id,
+                    e
+                )
+            })?;
+        lm_record_register_by(
+            meta.global_lease_id as u64,
+            format!("mpmc_sub_producer_global:chan_id={}", chan_id),
+        );
+
+        let global_long_lease = lease_manager
+            .register_lease_for_keepalive(
+                etcd_backend_uid.clone(),
+                30 * 60,
+                meta.global_long_lease_id as u64,
+                LeaseRegisterKind::Etcd,
+                rt_handle.clone(),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "register mpmc sub-producer global-long lease failed for chan_id={} lease_id={}: {}",
+                    chan_id,
+                    meta.global_long_lease_id,
+                    e
+                )
+            })?;
+        lm_record_register_by(
+            meta.global_long_lease_id as u64,
+            format!("mpmc_sub_producer_global_long:chan_id={}", chan_id),
+        );
+
+        let payload_lease = lease_manager
+            .register_lease_for_keepalive(
+                kv_backend_uid.clone(),
+                meta.ttl_seconds,
+                payload_lease_id as u64,
+                LeaseRegisterKind::KvClient {
+                    register_by: format!("mpmc_sub_producer_payload:chan_id={}", chan_id),
+                },
+                rt_handle,
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "register mpmc sub-producer payload lease failed for chan_id={} lease_id={}: {}",
+                    chan_id,
+                    payload_lease_id,
+                    e
+                )
+            })?;
+
+        Ok(ChanManager {
+            lease_manager,
+            etcd_backend_uid: etcd_backend_uid.clone(),
+            kv_backend_uid: kv_backend_uid.clone(),
+            chan_id,
+            member_lease,
+            global_lease,
+            global_long_lease,
+            payload_lease,
+            etcd_client: client,
+        })
+    }
+
     /// Create a manager for an existing channel id by loading its
     /// global metadata from etcd and reconstructing the two channel-
     /// level leases (global lease and global-long lease for
@@ -356,9 +497,7 @@ impl ChanManager {
                 etcd_backend_uid.clone(),
                 meta.ttl_seconds,
                 meta.global_lease_id as u64,
-                LeaseRegisterKind::Etcd {
-                    revoke_on_drop: false,
-                },
+                LeaseRegisterKind::Etcd,
                 rt_handle.clone(),
             )
             .await
@@ -394,9 +533,7 @@ impl ChanManager {
                 etcd_backend_uid.clone(),
                 30 * 60,
                 meta.global_long_lease_id as u64,
-                LeaseRegisterKind::Etcd {
-                    revoke_on_drop: false,
-                },
+                LeaseRegisterKind::Etcd,
                 rt_handle.clone(),
             )
             .await
@@ -463,9 +600,7 @@ impl ChanManager {
                 etcd_backend_uid.clone(),
                 meta.ttl_seconds,
                 member_resp.id() as u64,
-                LeaseRegisterKind::Etcd {
-                    revoke_on_drop: true,
-                },
+                LeaseRegisterKind::Etcd,
                 rt_handle.clone(),
             )
             .await

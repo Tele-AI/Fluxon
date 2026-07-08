@@ -180,8 +180,7 @@ impl MpscContext {
     /// `override_global_lease_id` / `override_member_lease_id`
     /// 允许上层（例如 MPMC）覆写 channel 的 global / member
     /// lease。若提供，则 `create_mpsc_channel` 将复用该 lease
-    /// 而不是新建；生命周期仍由上层控制，本层只负责
-    /// keepalive，并在 drop 时不 revoke。
+    /// 而不是新建；生命周期仍由上层控制，本层只贡献 keepalive。
     #[pyo3(signature = (chan_id=None, ttl_seconds=None, weight=None, capacity=None, override_global_lease_id=None, override_member_lease_id=None, override_payload_lease_id=None, parent_mpmc_id_opt=None, parent_mpmc_member_id_opt=None))]
     fn new_producer(
         &self,
@@ -235,15 +234,53 @@ impl MpscContext {
                 // channel or by binding to an existing one.
                 let chan_mgr: anyhow::Result<ChanManager> = async {
                     match chan_id {
-                        Some(id) => ChanManager::new_with_chan_id(
-                            lease_manager.clone(),
-                            endpoints.clone(),
-                            kv_backend_uid.clone(),
-                            id,
-                            rth.clone(),
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e.to_string())),
+                        Some(id) => {
+                            if parent_mpmc_id_opt.is_some() || parent_mpmc_member_id_opt.is_some()
+                            {
+                                if parent_mpmc_id_opt.is_none()
+                                    || parent_mpmc_member_id_opt.is_none()
+                                {
+                                    return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None"));
+                                }
+                                let global_lease_id = override_global_lease_id.ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "override_global_lease_id is required for MPMC sub-producer bind"
+                                    )
+                                })?;
+                                let member_lease_id = override_member_lease_id.ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "override_member_lease_id is required for MPMC sub-producer bind"
+                                    )
+                                })?;
+                                let payload_lease_id = override_payload_lease_id.ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "override_payload_lease_id is required for MPMC sub-producer bind"
+                                    )
+                                })?;
+                                ChanManager::new_mpmc_sub_producer_with_chan_id(
+                                    lease_manager.clone(),
+                                    endpoints.clone(),
+                                    kv_backend_uid.clone(),
+                                    id,
+                                    global_lease_id,
+                                    member_lease_id,
+                                    payload_lease_id,
+                                    rth.clone(),
+                                )
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            } else {
+                                ChanManager::new_with_chan_id(
+                                    lease_manager.clone(),
+                                    endpoints.clone(),
+                                    kv_backend_uid.clone(),
+                                    id,
+                                    rth.clone(),
+                                )
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            }
+                        }
                         None => {
                             let cap = capacity.ok_or_else(|| {
                                 anyhow::anyhow!(

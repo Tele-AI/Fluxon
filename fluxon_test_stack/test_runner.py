@@ -892,25 +892,29 @@ def main() -> None:
         started_at = int(time.time())
         summary_path = run_dir / "summary.yaml"
         if not summary_path.exists():
+            placeholder_case_family = _case_family_from_scene_item(
+                _require_dict(suite.scenes.get(case.scene_id), f"suite.scenes[{case.scene_id!r}]"),
+                f"suite.scenes[{case.scene_id!r}]",
+            )
+            initial_summary: Dict[str, Any] = {
+                "schema_version": SCHEMA_VERSION,
+                "case_id": case.case_id,
+                "case_key": case.case_key,
+                "run_index": int(run_slot.run_index),
+                # This will be overwritten in finalize. If it remains, treat as an interrupted run.
+                "outcome": RUN_OUTCOME_FAILED,
+                "counted": False,
+                "timing": {
+                    "started_at_unix_s": int(started_at),
+                    "finished_at_unix_s": int(started_at),
+                },
+                "error": _RUN_SUMMARY_INCOMPLETE_ERROR,
+            }
+            if placeholder_case_family == CASE_FAMILY_BENCH:
+                initial_summary["test_stack"] = {}
             # Create an initial summary.yaml immediately, so every run_dir is observable even if
             # the runner is killed before reaching the finalize() path.
-            _write_yaml_file(
-                summary_path,
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "case_id": case.case_id,
-                    "case_key": case.case_key,
-                    "run_index": int(run_slot.run_index),
-                    # This will be overwritten in finalize. If it remains, treat as an interrupted run.
-                    "outcome": RUN_OUTCOME_FAILED,
-                    "counted": False,
-                    "timing": {
-                        "started_at_unix_s": int(started_at),
-                        "finished_at_unix_s": int(started_at),
-                    },
-                    "error": _RUN_SUMMARY_INCOMPLETE_ERROR,
-                },
-            )
+            _write_yaml_file(summary_path, initial_summary)
         infer_deploy_attempted = False
         runtime_tracking = _CaseRuntimeTracking()
         counted = False
@@ -1265,11 +1269,7 @@ def _source_deployconf_contract_hostworkdir(
 
 
 def _load_source_stack_contract() -> Dict[str, Any]:
-    source_deployconf_path = _load_test_bed_deployconf_path()
-    source_deployconf = _require_dict(
-        _load_yaml_file(source_deployconf_path),
-        f"bootstrap source deployconf {source_deployconf_path}",
-    )
+    source_deployconf_path, source_deployconf = _load_test_bed_deployconf()
     cluster_nodes = _require_list(source_deployconf.get("cluster_nodes"), "bootstrap source deployconf.cluster_nodes")
     contract_hostworkdir = _source_deployconf_contract_hostworkdir(source_deployconf, cluster_nodes)
 
@@ -1515,6 +1515,29 @@ def _load_test_bed_deployconf_path() -> Path:
     return p
 
 
+def _load_test_bed_deployconf() -> Tuple[Path, Dict[str, Any]]:
+    manifest_info = _load_test_bed_manifest_opt()
+    if manifest_info is not None:
+        manifest_path, manifest = manifest_info
+        raw_workdir = manifest.get("workdir")
+        if isinstance(raw_workdir, str) and raw_workdir.strip():
+            workdir_path = Path(raw_workdir).expanduser()
+            if not workdir_path.is_absolute():
+                workdir_path = (manifest_path.parent / workdir_path).resolve()
+            normalized_path = (workdir_path / "deployconf.with_release_manifest_sha256.yaml").resolve()
+            if normalized_path.is_file():
+                deployconf = _require_dict(
+                    _load_yaml_file(normalized_path),
+                    f"normalized test bed deployconf {normalized_path}",
+                )
+                global_envs = deployconf.get("global_envs")
+                if isinstance(global_envs, dict):
+                    global_envs.pop("FLUXON_RELEASE_MANIFEST_SHA256", None)
+                return normalized_path, deployconf
+    deployconf_path = _load_test_bed_deployconf_path()
+    return deployconf_path, _require_dict(_load_yaml_file(deployconf_path), f"test bed deployconf {deployconf_path}")
+
+
 def _load_test_bed_manifest_opt() -> Optional[Tuple[Path, Dict[str, Any]]]:
     manifest_path = _load_test_bed_bootstrap_config_path().with_name("manifest.json")
     if not manifest_path.exists():
@@ -1542,8 +1565,7 @@ def _test_bed_cluster_proxy_env() -> Dict[str, str]:
                     continue
                 proxy_cfg[key] = str(raw_value)
     if not proxy_cfg:
-        deployconf_path = _load_test_bed_deployconf_path()
-        deployconf = _require_dict(_load_yaml_file(deployconf_path), f"test bed deployconf {deployconf_path}")
+        deployconf_path, deployconf = _load_test_bed_deployconf()
         global_envs = _require_dict(deployconf.get("global_envs"), "test bed deployconf.global_envs")
         for key in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
             raw_value = global_envs.get(f"FLUXON_CLUSTER_PROXY__{key.upper()}")
@@ -1570,10 +1592,7 @@ def _render_env_exports(env_map: Dict[str, str]) -> str:
 
 
 def _load_test_bed_cluster_hostnames_by_ip_opt() -> Optional[Dict[str, List[str]]]:
-    deployconf_path = _load_test_bed_deployconf_path()
-    if not deployconf_path.exists():
-        return None
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"test bed deployconf {deployconf_path}")
+    _deployconf_path, deployconf = _load_test_bed_deployconf()
     raw_nodes = deployconf.get("cluster_nodes")
     if not isinstance(raw_nodes, list):
         return None
@@ -3428,10 +3447,14 @@ def _test_stack_result_timeout_seconds(
     *,
     max_benchmark_seconds: int,
     metric_warmup_seconds: float,
+    cluster_ready_timeout_seconds: int,
+    readiness_gate_count: int,
 ) -> int:
     return _test_stack_result_timeout_seconds_impl(
         max_benchmark_seconds=max_benchmark_seconds,
         metric_warmup_seconds=metric_warmup_seconds,
+        cluster_ready_timeout_seconds=cluster_ready_timeout_seconds,
+        readiness_gate_count=readiness_gate_count,
     )
 
 
@@ -8452,7 +8475,7 @@ def _build_test_stack_external_kv_owner_instances(
     kv_p2p_port_stride: int,
     kv_p2p_slot_offset: int,
     p2p_ports_per_slot: int,
-    node_total: int,
+    owner_p2p_port_offset: int,
     run_index: int,
     runtime_instance_prefix: str,
     kv_base: Dict[str, Any],
@@ -8494,7 +8517,7 @@ def _build_test_stack_external_kv_owner_instances(
             int(kv_p2p_port_base)
             + int(kv_p2p_port_stride) * int(run_index - 1)
             + int(kv_p2p_slot_offset) * int(p2p_ports_per_slot)
-            + int(node_total)
+            + int(owner_p2p_port_offset)
             + int(master_port_offset)
             + int(owner_ordinal)
         )
@@ -8965,15 +8988,23 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
     # - Port allocation must be stable across resume within the same run_dir, but also avoid collisions across
     #   different workdirs on different machines (runner_root slot offset).
     node_total = 0
+    benchmark_p2p_ports_per_slot = 0
     for role in roles_order:
         plan = _require_dict(role_plan.get(role), f"scale.role_plan[{role}]")
         role_target_count = _require_int(plan.get("count"), f"scale.role_plan[{role}].count", min_v=1)
         if _test_stack_scene_uses_per_target_process_fanout(scene_mode=scene_mode):
-            node_total += int(role_target_count) * int(processes_per_target)
+            role_node_total = int(role_target_count) * int(processes_per_target)
         else:
-            node_total += int(role_target_count)
+            role_node_total = int(role_target_count)
+        node_total += role_node_total
+        if scene_mode == TEST_STACK_MODE_MPMC and role == "producer":
+            benchmark_p2p_ports_per_slot += role_node_total * int(threads_per_process)
+        else:
+            benchmark_p2p_ports_per_slot += role_node_total
     if node_total <= 0:
         raise ValueError("computed node_total must be positive")
+    if benchmark_p2p_ports_per_slot <= 0:
+        raise ValueError("computed benchmark_p2p_ports_per_slot must be positive")
     owner_targets = _test_stack_owner_targets(
         scale=scale,
         role_plan=role_plan,
@@ -9011,15 +9042,17 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         assert kv_p2p_port_stride is not None
         # English note:
         # - Port allocation must be stable across resume within the same run_dir.
-        # - Allocate a disjoint KV P2P listen port for every KV process in the case:
-        #   benchmark nodes + (optional) dedicated KV owners.
+        # - MPMC producer workers create worker-owned KV runtimes before READY, so each
+        #   producer thread needs a disjoint P2P listen port.
+        # - Other benchmark nodes use one KV runtime per process.
+        # - Dedicated KV owners use one P2P listen port per owner process.
         owner_total = len(owner_targets) if uses_dedicated_kv_owners else 0
-        p2p_ports_per_slot = node_total + owner_total
+        p2p_ports_per_slot = benchmark_p2p_ports_per_slot + owner_total
         if kv_p2p_port_stride < p2p_ports_per_slot:
             raise ValueError(
                 "profile.test_stack.port_alloc.kv_p2p_port_stride too small for this case: "
                 f"stride={kv_p2p_port_stride} required_ports_per_slot={p2p_ports_per_slot} "
-                f"node_total={node_total} mode={scene_mode}"
+                f"benchmark_ports={benchmark_p2p_ports_per_slot} owner_total={owner_total} mode={scene_mode}"
             )
         kv_p2p_slot_count = kv_p2p_port_stride // p2p_ports_per_slot
         if kv_p2p_slot_count <= 0:
@@ -9611,7 +9644,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             kv_p2p_port_stride=kv_p2p_port_stride,
             kv_p2p_slot_offset=kv_p2p_slot_offset,
             p2p_ports_per_slot=p2p_ports_per_slot,
-            node_total=node_total,
+            owner_p2p_port_offset=benchmark_p2p_ports_per_slot,
             run_index=run_index,
             runtime_instance_prefix=runtime_instance_prefix,
             kv_base=kv_base,
@@ -9642,6 +9675,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
     rpc_server_zero_rpc_ports: Dict[str, int] = {}
     network_sample_targets_seen: set[str] = set()
 
+    benchmark_p2p_port_offset = 0
     for role in roles_order:
         plan = _require_dict(role_plan.get(role), f"scale.role_plan[{role}]")
         cnt = _require_int(plan.get("count"), f"scale.role_plan[{role}].count", min_v=1)
@@ -9729,10 +9763,21 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                         int(kv_p2p_port_base)
                         + int(kv_p2p_port_stride) * int(run_index - 1)
                         + int(kv_p2p_slot_offset) * int(p2p_ports_per_slot)
-                        + int(node_ordinal)
+                        + int(benchmark_p2p_port_offset)
                     )
                     if kv_p2p_listen_port <= 0 or kv_p2p_listen_port > 65535:
                         raise ValueError(f"computed kv_p2p_listen_port out of range: {kv_p2p_listen_port}")
+                    p2p_ports_for_node = (
+                        int(threads_per_process)
+                        if scene_mode == TEST_STACK_MODE_MPMC and role == "producer"
+                        else 1
+                    )
+                    kv_p2p_last_listen_port = int(kv_p2p_listen_port) + int(p2p_ports_for_node) - 1
+                    if kv_p2p_last_listen_port <= 0 or kv_p2p_last_listen_port > 65535:
+                        raise ValueError(
+                            "computed kv_p2p_listen_port range out of range: "
+                            f"first={kv_p2p_listen_port} count={p2p_ports_for_node} last={kv_p2p_last_listen_port}"
+                        )
                     fluxonkv_override = kv.get("fluxonkv_spec")
                     if fluxonkv_override is None:
                         fluxonkv_override = {}
@@ -9763,6 +9808,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                     fluxonkv_override["share_mem_path"] = selected_share_mem_path
                     fluxonkv_override["p2p_listen_port"] = int(kv_p2p_listen_port)
                     kv["fluxonkv_spec"] = fluxonkv_override
+                    benchmark_p2p_port_offset += p2p_ports_for_node
                 elif backend_kind == TEST_STACK_BACKEND_ALLUXIO:
                     if target not in alluxio_mount_root_by_target:
                         raise ValueError(
@@ -10264,8 +10310,7 @@ def _write_release_manifest(*, release_root: Path, relpaths: List[str]) -> None:
 
 def _load_test_stack_cluster_nodes_and_dispatch(resolved_case: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], Any]:
     start_test_bed_mod = _load_test_stack_start_test_bed_module(resolved_case)
-    deployconf_path = _load_test_bed_deployconf_path()
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"deployconf {deployconf_path}")
+    _deployconf_path, deployconf = _load_test_bed_deployconf()
     cluster_nodes = start_test_bed_mod._parse_cluster_nodes(deployconf)
     deploy = resolved_case.get("deploy")
     if isinstance(deploy, dict):
@@ -10321,8 +10366,7 @@ def _load_test_stack_cluster_nodes_and_dispatch(resolved_case: Dict[str, Any]) -
 
 def _test_bed_cluster_nodes_from_bundle() -> Dict[str, Dict[str, Any]]:
     start_test_bed_mod = _load_test_stack_start_test_bed_module({})
-    deployconf_path = _load_test_bed_deployconf_path()
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"deployconf {deployconf_path}")
+    _deployconf_path, deployconf = _load_test_bed_deployconf()
     return start_test_bed_mod._parse_cluster_nodes(deployconf)
 
 
@@ -10425,8 +10469,7 @@ def _test_stack_etcd_addresses(resolved_case: Dict[str, Any]) -> List[str]:
     - We derive etcd placement from the test bed deployconf to keep suite configs clean
       (no hardcoded host IPs in ci_test_list.yaml) while remaining deterministic.
     """
-    deployconf_path = _load_test_bed_deployconf_path()
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"deployconf {deployconf_path}")
+    _deployconf_path, deployconf = _load_test_bed_deployconf()
     services = _require_dict(deployconf.get("service"), "deployconf.service")
     etcd = _require_dict(services.get("etcd"), "deployconf.service.etcd")
     port = _require_int(etcd.get("port"), "deployconf.service.etcd.port", min_v=1)
@@ -10446,8 +10489,7 @@ def _test_stack_etcd_addresses(resolved_case: Dict[str, Any]) -> List[str]:
 
 
 def _active_test_stack_target_ip_map(*, ctx: str) -> Dict[str, str]:
-    deployconf_path = _load_test_bed_deployconf_path()
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"deployconf {deployconf_path}")
+    _deployconf_path, deployconf = _load_test_bed_deployconf()
     raw_nodes = _require_list(deployconf.get("cluster_nodes"), "deployconf.cluster_nodes")
     out: Dict[str, str] = {}
     for idx, raw_node in enumerate(raw_nodes):
@@ -10464,8 +10506,7 @@ def _active_test_stack_target_ip_map(*, ctx: str) -> Dict[str, str]:
 
 def _test_stack_greptime_host_port(resolved_case: Dict[str, Any]) -> Tuple[str, int]:
     """Infer Greptime host:port for TEST_STACK master monitoring config from the self-host deployconf."""
-    deployconf_path = _load_test_bed_deployconf_path()
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"deployconf {deployconf_path}")
+    _deployconf_path, deployconf = _load_test_bed_deployconf()
     services = _require_dict(deployconf.get("service"), "deployconf.service")
     greptime = _require_dict(services.get("greptime"), "deployconf.service.greptime")
     port = _require_int(greptime.get("port"), "deployconf.service.greptime.port", min_v=1)
@@ -11162,7 +11203,7 @@ def _run_adapter_action(
     run_dir: Path,
     action: str,
 ) -> Optional[Dict[str, Any]]:
-    if action not in ("deploy", "teardown"):
+    if action not in ("deploy", "collect", "teardown"):
         raise ValueError(f"invalid adapter action: {action}")
 
     deploy = _require_dict(resolved_case.get("deploy"), "resolved_case.deploy")
@@ -12416,6 +12457,7 @@ def _test_stack_runtime_command(
         ]
     )
     exec_cmd.extend(_shell_quote(arg) for arg in script_args)
+    nofile_prelude = _test_stack_runtime_nofile_prelude_command()
     memlock_prelude = ""
     if require_unlimited_memlock:
         memlock_prelude = (
@@ -12434,6 +12476,7 @@ def _test_stack_runtime_command(
         )
     return (
         "set -euo pipefail\n"
+        + nofile_prelude
         + memlock_prelude
         + "cd "
         + _shell_quote(str(run_dir.resolve()))
@@ -12482,6 +12525,7 @@ def _test_stack_runtime_module_command(
         ]
     )
     exec_cmd.extend(_shell_quote(arg) for arg in module_args)
+    nofile_prelude = _test_stack_runtime_nofile_prelude_command()
     memlock_prelude = ""
     if require_unlimited_memlock:
         memlock_prelude = (
@@ -12500,6 +12544,7 @@ def _test_stack_runtime_module_command(
         )
     return (
         "set -euo pipefail\n"
+        + nofile_prelude
         + memlock_prelude
         + "cd "
         + _shell_quote(str(run_dir.resolve()))
@@ -12515,6 +12560,19 @@ def _test_stack_runtime_module_command(
         + pre_exec_shell
         + " ".join(exec_cmd)
         + "\n"
+    )
+
+
+def _test_stack_runtime_nofile_prelude_command() -> str:
+    nofile_limit = 1048576
+    return (
+        f"ulimit -n {nofile_limit}\n"
+        + 'nofile_after="$(ulimit -n)"\n'
+        + f'if [ "${{nofile_after}}" != "{nofile_limit}" ]; then\n'
+        + '  printf \'ERROR: ulimit -n verification failed, got: %s\\n\' "${nofile_after}" >&2\n'
+        + "  grep -i 'open files' /proc/self/limits >&2 || true\n"
+        + "  exit 1\n"
+        + "fi\n"
     )
 
 

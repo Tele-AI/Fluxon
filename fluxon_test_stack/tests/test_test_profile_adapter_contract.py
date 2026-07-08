@@ -35,6 +35,68 @@ _ADAPTER = _load_module()
 
 
 class TestTestProfileAdapterContract(unittest.TestCase):
+    def test_action_deploy_waits_for_service_and_job_instances_before_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            (run_dir / "deployer_deploy.yaml").write_text("apiVersion: v1\nkind: List\n", encoding="utf-8")
+            instances = [
+                _ADAPTER._InstanceReq(
+                    id="coordinator",
+                    k8s_ref="deployment/coord",
+                    workload_kind="Deployment",
+                    workload_name="coord",
+                    authority="coord",
+                    target="local-node-a",
+                    controller_target="controller-a",
+                    node_ip="127.0.0.1",
+                    lifecycle="service",
+                    endpoint_scheme=None,
+                    host_port=None,
+                    payload_file_rel=None,
+                    payload_file_abs=None,
+                    payload_dest_path=None,
+                ),
+                _ADAPTER._InstanceReq(
+                    id="producer_0_proc_0",
+                    k8s_ref="deployment/producer",
+                    workload_kind="Deployment",
+                    workload_name="producer",
+                    authority="producer",
+                    target="local-node-b",
+                    controller_target="controller-b",
+                    node_ip="127.0.0.2",
+                    lifecycle="job",
+                    endpoint_scheme=None,
+                    host_port=None,
+                    payload_file_rel=None,
+                    payload_file_abs=None,
+                    payload_dest_path=None,
+                ),
+            ]
+
+            with mock.patch.object(_ADAPTER, "_preflight_ops_agents"):
+                with mock.patch.object(_ADAPTER, "_http_deploy", return_value={"history_id": "hist-1"}):
+                    with mock.patch.object(_ADAPTER, "_wait_running") as wait_running:
+                        _ADAPTER._action_deploy(
+                            run_dir,
+                            run_dir,
+                            {},
+                            "http://controller",
+                            instances,
+                            None,
+                            30,
+                        )
+
+            self.assertEqual(
+                wait_running.call_args_list,
+                [
+                    mock.call("http://controller", "controller-a", "Deployment", "coord", "coord"),
+                    mock.call("http://controller", "controller-b", "Deployment", "producer", "producer"),
+                ],
+            )
+            deploy_result = yaml.safe_load((run_dir / "deploy_result.yaml").read_text(encoding="utf-8"))
+            self.assertTrue(deploy_result["ready"])
+
     def test_action_collect_writes_per_instance_status_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)

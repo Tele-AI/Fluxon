@@ -21,7 +21,7 @@ pub enum LeaseBackendInner {
         /// Per-lease keepalive state keyed by lease_id. Auto-evicts when the last
         /// guard (AutoCleanMapEntry) for that lease is dropped.
         states: AutoCleanMap<u64, Arc<Mutex<EtcdState>>>,
-        /// Runtime handle to schedule background tasks (keepalive/revoke).
+        /// Runtime handle to schedule background keepalive tasks.
         rt: tokio::runtime::Handle,
     },
     KvClient {

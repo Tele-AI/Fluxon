@@ -259,7 +259,7 @@ pub struct LeaseKey {
 }
 
 impl LeaseKey {
-    fn new(backend_uid: LeaseBackendUid, lease_id: u64) -> Self {
+    pub(crate) fn new(backend_uid: LeaseBackendUid, lease_id: u64) -> Self {
         Self {
             backend_uid,
             lease_id,
@@ -480,7 +480,6 @@ pub enum ActorRegisterInvocation {
     },
     Etcd {
         client: Client,
-        revoke_on_drop: bool,
     },
 }
 

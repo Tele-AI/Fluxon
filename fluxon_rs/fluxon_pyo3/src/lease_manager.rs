@@ -177,15 +177,13 @@ impl LeaseManagerHandle {
         &self,
         endpoints: Vec<String>,
         ttl_seconds: i64,
-        revoke_on_drop: Option<bool>,
         py: Python<'_>,
     ) -> PyResult<PyGeneralLease> {
-        let revoke = revoke_on_drop.unwrap_or(true);
         let t0 = Instant::now();
         debug!(
             target: "fluxon_pyo3::lease",
-            "begin allocate_etcd_lease: endpoints={}, ttl_seconds={}, revoke_on_drop={}",
-            endpoints.join(","), ttl_seconds, revoke
+            "begin allocate_etcd_lease: endpoints={}, ttl_seconds={}",
+            endpoints.join(","), ttl_seconds
         );
         let rth = self.rt.handle().clone();
         let outer = py
@@ -203,9 +201,7 @@ impl LeaseManagerHandle {
                             uid,
                             ttl_seconds,
                             id,
-                            LeaseRegisterKind::Etcd {
-                                revoke_on_drop: revoke,
-                            },
+                            LeaseRegisterKind::Etcd,
                             rt,
                         )
                         .await
@@ -226,22 +222,20 @@ impl LeaseManagerHandle {
     /// Register existing etcd lease id for keepalive and wrap the core Lease.
     ///
     /// Caller must provide ttl_seconds explicitly; no fallback.
-    #[pyo3(signature = (endpoints, ttl_seconds, lease_id, revoke_on_drop=None, *, register_by))]
+    #[pyo3(signature = (endpoints, ttl_seconds, lease_id, *, register_by))]
     fn register_etcd_lease(
         &self,
         endpoints: Vec<String>,
         ttl_seconds: i64,
         lease_id: u64,
-        revoke_on_drop: Option<bool>,
         register_by: String,
         py: Python<'_>,
     ) -> PyResult<PyGeneralLease> {
-        let revoke = revoke_on_drop.unwrap_or(true);
         let t0 = Instant::now();
         debug!(
             target: "fluxon_pyo3::lease",
-            "begin register_etcd_lease: endpoints={}, ttl_seconds={}, lease_id={}, revoke_on_drop={}, register_by={}",
-            endpoints.join(","), ttl_seconds, lease_id, revoke, register_by
+            "begin register_etcd_lease: endpoints={}, ttl_seconds={}, lease_id={}, register_by={}",
+            endpoints.join(","), ttl_seconds, lease_id, register_by
         );
         fluxon_mq::lease_manager::record_register_by(lease_id, register_by);
         let rth = self.rt.handle().clone();
@@ -255,9 +249,7 @@ impl LeaseManagerHandle {
                             uid,
                             ttl_seconds,
                             lease_id,
-                            LeaseRegisterKind::Etcd {
-                                revoke_on_drop: revoke,
-                            },
+                            LeaseRegisterKind::Etcd,
                             rt,
                         )
                         .await

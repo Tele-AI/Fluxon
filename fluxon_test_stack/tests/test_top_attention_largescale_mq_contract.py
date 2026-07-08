@@ -58,6 +58,87 @@ class TestTopAttentionLargescaleMqContract(unittest.TestCase):
             )
         )
 
+    def test_local_coordinator_port_base_stays_in_range_for_high_controller_ports(self) -> None:
+        entry = _load_module()
+
+        self.assertEqual(
+            entry._local_test_stack_coordinator_port_base(controller_port=19080, topology_key=4),
+            20480,
+        )
+        self.assertEqual(
+            entry._local_test_stack_coordinator_port_base(controller_port=63680, topology_key=4),
+            65080,
+        )
+        self.assertEqual(
+            entry._local_test_stack_coordinator_port_base(controller_port=63680, topology_key=16),
+            25280,
+        )
+        self.assertEqual(
+            entry._local_test_stack_coordinator_port_base(controller_port=63680, topology_key="42"),
+            27880,
+        )
+
+    def test_local_p2p_port_block_skips_busy_ports(self) -> None:
+        entry = _load_module()
+
+        self.assertEqual(
+            entry._find_local_tcp_port_block(
+                preferred_start=20000,
+                required_count=4,
+                busy_ports={20000, 20001, 20002, 20003},
+            ),
+            20004,
+        )
+
+    def test_local_p2p_port_base_uses_free_block(self) -> None:
+        entry = _load_module()
+
+        base = entry._local_test_stack_p2p_port_base(
+            controller_port=63680,
+            topology_key=20,
+            required_count=8,
+            busy_ports=set(),
+        )
+        shifted = entry._local_test_stack_p2p_port_base(
+            controller_port=63680,
+            topology_key=20,
+            required_count=8,
+            busy_ports=set(range(base, base + 8)),
+        )
+
+        self.assertEqual(shifted, base + 8)
+
+    def test_local_p2p_port_base_avoids_ephemeral_ports(self) -> None:
+        entry = _load_module()
+
+        base = entry._local_test_stack_p2p_port_base(
+            controller_port=63680,
+            topology_key=4,
+            required_count=512,
+            busy_ports=set(range(32768, 61000)),
+        )
+
+        self.assertLess(base + 512, 32768)
+
+    def test_local_master_port_base_uses_free_non_ephemeral_block(self) -> None:
+        entry = _load_module()
+
+        base = entry._local_test_stack_master_port_base(
+            controller_port=23080,
+            topology_key=4,
+            required_count=10,
+            busy_ports=set(range(32768, 61000)),
+        )
+        shifted = entry._local_test_stack_master_port_base(
+            controller_port=23080,
+            topology_key=4,
+            required_count=10,
+            busy_ports=set(range(32768, 61000)) | set(range(base, base + 10)),
+        )
+
+        self.assertLess(base + 10, 32768)
+        self.assertEqual(shifted, base + 10)
+
     def test_generate_only_writes_minimal_ci_smoke_suite_without_running_runner(self) -> None:
         entry = _load_module()
         with tempfile.TemporaryDirectory() as td:
@@ -304,42 +385,43 @@ class TestTopAttentionLargescaleMqContract(unittest.TestCase):
                 return 0
 
             with mock.patch.object(entry, "call", side_effect=fake_call):
-                with mock.patch.dict("os.environ", {"FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT": "/tmp/release"}, clear=True):
-                    with mock.patch.object(
-                        sys,
-                        "argv",
-                        [
-                            str(MODULE_PATH),
-                            "--single-host-logical-targets",
-                            "--testbed-bundle-source",
-                            str(bundle),
-                            "--workdir",
-                            str(workdir),
-                            "--suite-out",
-                            str(suite_out),
-                            "--owner-count",
-                            "4",
-                            "--owner-dram-gib",
-                            "1",
-                            "--producer-count",
-                            "8",
-                            "--consumer-count",
-                            "8",
-                            "--duration-seconds",
-                            "30",
-                            "--value-size",
-                            "256",
-                            "--op-timeout-seconds",
-                            "5",
-                            "--cluster-ready-timeout-seconds",
-                            "1800",
-                            "--consumer-sim-min-ms",
-                            "1",
-                            "--consumer-sim-max-ms",
-                            "1",
-                        ],
-                    ):
-                        rc = entry.main()
+                with mock.patch.object(entry, "_local_busy_tcp_ports", return_value=set()):
+                    with mock.patch.dict("os.environ", {"FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT": "/tmp/release"}, clear=True):
+                        with mock.patch.object(
+                            sys,
+                            "argv",
+                            [
+                                str(MODULE_PATH),
+                                "--single-host-logical-targets",
+                                "--testbed-bundle-source",
+                                str(bundle),
+                                "--workdir",
+                                str(workdir),
+                                "--suite-out",
+                                str(suite_out),
+                                "--owner-count",
+                                "4",
+                                "--owner-dram-gib",
+                                "1",
+                                "--producer-count",
+                                "8",
+                                "--consumer-count",
+                                "8",
+                                "--duration-seconds",
+                                "30",
+                                "--value-size",
+                                "256",
+                                "--op-timeout-seconds",
+                                "5",
+                                "--cluster-ready-timeout-seconds",
+                                "1800",
+                                "--consumer-sim-min-ms",
+                                "1",
+                                "--consumer-sim-max-ms",
+                                "1",
+                            ],
+                        ):
+                            rc = entry.main()
 
             self.assertEqual(rc, 0)
             self.assertEqual(len(calls), 1)
@@ -378,6 +460,10 @@ class TestTopAttentionLargescaleMqContract(unittest.TestCase):
                 "by_topology"
             ][4]
             self.assertEqual(port_entry["coordinator_port_base"], 20480)
+            self.assertGreaterEqual(port_entry["kv_master_port_base"], entry.LOCAL_TEST_STACK_P2P_PORT_MIN)
+            self.assertNotEqual(port_entry["kv_master_port_base"], 50161)
+            self.assertGreaterEqual(port_entry["kv_p2p_port_base"], entry.LOCAL_TEST_STACK_P2P_PORT_MIN)
+            self.assertNotEqual(port_entry["kv_p2p_port_base"], 11666)
 
     def test_real_run_relocates_generated_bundle_mirror_after_bundle_move(self) -> None:
         entry = _load_module()

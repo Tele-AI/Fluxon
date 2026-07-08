@@ -174,8 +174,10 @@ __FLUXON_MONOTONIC_MS__
 
 wait_service_probably_ready_pid_tree() {{
   # Startup gate contract:
-  # - Success means one supervised direct child PID becomes visible, then stays unchanged for the
-  #   full startup_window_seconds before the overall startup deadline expires.
+  # - Success means the first observed supervised direct child PID becomes visible, then stays
+  #   alive for the full startup_window_seconds before the overall startup deadline expires.
+  # - Additional direct children are allowed. Some services start managed workload supervisors
+  #   under themselves during startup, and those children are not a service restart.
   # - During this startup window we do not probe service ports or readiness endpoints.
   # - A child exit or restart inside the window is treated as startup failure even if the
   #   supervisor process itself stays alive and restarts again later.
@@ -209,12 +211,10 @@ wait_service_probably_ready_pid_tree() {{
     current_child_pids="$(_pid_tree_direct_child_pids "$root_pid" 2>/dev/null || true)"
     current_child_pid=""
     if [ -n "$current_child_pids" ]; then
-      set -- $current_child_pids
-      if [ "$#" -ne 1 ]; then
-        echo "$context probable-ready: multiple direct child pids svc=$svc supervisor_pid=$root_pid child_pids=$current_child_pids"
-        return 1
-      fi
-      current_child_pid="$1"
+      for candidate_child_pid in $current_child_pids; do
+        current_child_pid="$candidate_child_pid"
+        break
+      done
     fi
 
     now_monotonic_ms="$(_now_monotonic_ms)"
@@ -226,9 +226,18 @@ wait_service_probably_ready_pid_tree() {{
     elif [ -z "$observed_child_pid" ]; then
       observed_child_pid="$current_child_pid"
       observed_child_since_monotonic_ms="$now_monotonic_ms"
-    elif [ "$current_child_pid" != "$observed_child_pid" ]; then
-      echo "$context probable-ready: child pid changed svc=$svc supervisor_pid=$root_pid child_pid=$observed_child_pid replacement_child_pid=$current_child_pid"
-      return 1
+    else
+      observed_child_still_present=0
+      for candidate_child_pid in $current_child_pids; do
+        if [ "$candidate_child_pid" = "$observed_child_pid" ]; then
+          observed_child_still_present=1
+          break
+        fi
+      done
+      if [ "$observed_child_still_present" -ne 1 ]; then
+        echo "$context probable-ready: child pid changed svc=$svc supervisor_pid=$root_pid child_pid=$observed_child_pid current_child_pids=$current_child_pids"
+        return 1
+      fi
     fi
 
     if [ -n "$observed_child_since_monotonic_ms" ] && [ $(( now_monotonic_ms - observed_child_since_monotonic_ms )) -ge "$startup_window_ms" ]; then

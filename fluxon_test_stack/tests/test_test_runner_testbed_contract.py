@@ -130,6 +130,26 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 _RUNNER.CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S,
             )
 
+    def test_test_stack_result_timeout_covers_mpmc_readiness_gates(self) -> None:
+        timeout_s = _RUNNER._test_stack_result_timeout_seconds(
+            max_benchmark_seconds=30,
+            metric_warmup_seconds=0.0,
+            cluster_ready_timeout_seconds=1800,
+            readiness_gate_count=2,
+        )
+
+        self.assertEqual(timeout_s, 4230)
+
+    def test_test_stack_result_timeout_covers_single_readiness_gate(self) -> None:
+        timeout_s = _RUNNER._test_stack_result_timeout_seconds(
+            max_benchmark_seconds=30,
+            metric_warmup_seconds=0.0,
+            cluster_ready_timeout_seconds=1800,
+            readiness_gate_count=1,
+        )
+
+        self.assertEqual(timeout_s, 2430)
+
     def test_ci_runtime_python_executable_requires_python310_on_path(self) -> None:
         with mock.patch.object(_RUNNER.shutil, "which", return_value=None):
             with self.assertRaisesRegex(ValueError, "requires a Python 3.10 interpreter on PATH"):
@@ -436,6 +456,101 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 "RuntimeError: collect boom",
             )
 
+    def test_finalize_test_stack_case_runtime_creates_test_stack_summary_for_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            summary_path = run_dir / "summary.yaml"
+            _RUNNER._write_yaml_file(
+                summary_path,
+                {
+                    "schema_version": _RUNNER.SCHEMA_VERSION,
+                    "case_id": "bench_case",
+                    "case_key": "bench_case_key",
+                    "run_index": 1,
+                    "outcome": _RUNNER.RUN_OUTCOME_FAILED,
+                    "counted": False,
+                    "timing": {
+                        "started_at_unix_s": 100,
+                        "finished_at_unix_s": 100,
+                    },
+                    "error": _RUNNER._RUN_SUMMARY_INCOMPLETE_ERROR,
+                },
+            )
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_DEBUG_ONE_BY_ONE,
+                    "case_id": "bench_case",
+                    "case_key": "bench_case_key",
+                },
+                "deploy": {"instances": []},
+            }
+            tracking = _RUNNER._CaseRuntimeTracking(
+                ts_coord_deploy_attempted=True,
+                ts_coord_apply_id="apply-coord",
+            )
+
+            with mock.patch.object(_RUNNER, "_run_adapter_action", side_effect=RuntimeError("collect boom")):
+                with mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply:
+                    _RUNNER._finalize_test_stack_case_runtime(
+                        resolved_case,
+                        run_dir=run_dir,
+                        runtime_tracking=tracking,
+                        outcome=_RUNNER.RUN_OUTCOME_FAILED,
+                    )
+
+            delete_apply.assert_not_called()
+            updated_summary = yaml.safe_load(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                updated_summary["test_stack"]["collect_error"],
+                "RuntimeError: collect boom",
+            )
+
+    def test_run_adapter_action_allows_collect(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            resolved_case = {
+                "case": {
+                    "case_id": "bench_case",
+                    "profile_id": "fluxon_tcp_thread",
+                },
+                "runtime": {
+                    "config_root": str(run_dir),
+                    "workdir_root": str(run_dir),
+                    "run_dir": str(run_dir),
+                    "stack_identity": {
+                        "cluster_name": "test_cluster",
+                        "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                        "share_mem_path": str(run_dir / "shm"),
+                    },
+                },
+                "artifact_set": {
+                    "release_root": str(run_dir / "release"),
+                    "test_rsc_root": str(run_dir / "test_rsc"),
+                },
+                "deploy": {
+                    "adapter_cmd": ["bash", "-lc", "true"],
+                },
+            }
+            observed: list[str] = []
+
+            def _fake_run_subprocess(argv: list[str], *, cwd: str) -> None:
+                nonlocal observed
+                observed = list(argv)
+                self.assertEqual(cwd, str(_RUNNER._runner_test_stack_root()))
+
+            with mock.patch.object(_RUNNER, "_run_subprocess", side_effect=_fake_run_subprocess):
+                result = _RUNNER._run_adapter_action(
+                    resolved_case,
+                    run_dir=run_dir,
+                    action="collect",
+                )
+
+            self.assertIsNone(result)
+            self.assertIn("--action", observed)
+            self.assertEqual(observed[observed.index("--action") + 1], "collect")
+            self.assertIn("--workdir", observed)
+            self.assertEqual(observed[observed.index("--workdir") + 1], str(run_dir))
+
     def test_finalize_error_preserves_success_for_ci_and_bench(self) -> None:
         self.assertTrue(
             _RUNNER._preserve_success_after_finalize_error(
@@ -544,7 +659,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                                 kv_p2p_port_stride=100,
                                 kv_p2p_slot_offset=0,
                                 p2p_ports_per_slot=10,
-                                node_total=1,
+                                owner_p2p_port_offset=1,
                                 run_index=1,
                                 runtime_instance_prefix=runtime_instance_prefix,
                                 kv_base={},
@@ -1545,6 +1660,95 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertEqual(contract["share_mem_hostworkdir"], "${HOSTWORKDIR}/shm1")
             self.assertNotIn("shared_memory_hostworkdir", contract)
             self.assertNotIn("shared_file_hostworkdir", contract)
+
+    def test_testbed_manifest_workdir_normalized_deployconf_is_runtime_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bundle_root = Path(td)
+            start_cfg = bundle_root / "start_test_bed.runner.yaml"
+            deployconf_path = bundle_root / "deployconf.yaml"
+            bootstrap_workdir = bundle_root / "bootstrap_workdir"
+            bootstrap_workdir.mkdir()
+            start_cfg.write_text(
+                "\n".join(
+                    [
+                        "schema_version: 6",
+                        "deployconf_path: ./deployconf.yaml",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            raw_deployconf = [
+                "cluster_nodes:",
+                "  - hostname: logic-a",
+                "    ip: 10.1.1.119",
+                "    hostworkdir: /tmp/logic/a",
+                "    execution_mode: local",
+                "    ssh_user: runner",
+                "    ssh_port: 22",
+                "service:",
+                "  etcd:",
+                "    port: 33579",
+                "    node_bind:",
+                "      node: [logic-a]",
+                "  greptime:",
+                "    port: 35030",
+                "    node_bind:",
+                "      node: [logic-a]",
+                "",
+            ]
+            deployconf_path.write_text("\n".join(raw_deployconf), encoding="utf-8")
+            (bootstrap_workdir / "deployconf.with_release_manifest_sha256.yaml").write_text(
+                "\n".join(
+                    [
+                        "global_envs:",
+                        "  FLUXON_RELEASE_MANIFEST_SHA256: should-not-leak",
+                        "cluster_nodes:",
+                        "  - hostname: logic-a",
+                        "    ip: 10.1.1.119",
+                        "    hostworkdir: /tmp/logic/a",
+                        "    execution_mode: local",
+                        "    ssh_user: runner",
+                        "    ssh_port: 22",
+                        "service:",
+                        "  etcd:",
+                        "    port: 57780",
+                        "    node_bind:",
+                        "      node: [logic-a]",
+                        "  greptime:",
+                        "    port: 57790",
+                        "    node_bind:",
+                        "      node: [logic-a]",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (bundle_root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "deployconf_path": "deployconf.yaml",
+                        "start_config_path": "start_test_bed.runner.yaml",
+                        "ssh_config_path": "start_test_bed.runner.yaml",
+                        "workdir": "bootstrap_workdir",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            resolved_case = {
+                "deploy": {
+                    "target_ip_map": {
+                        "logic-a": "10.1.1.119",
+                    }
+                }
+            }
+            env = {**os.environ, _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg)}
+            with mock.patch.dict(os.environ, env, clear=True):
+                etcd_addresses = _RUNNER._test_stack_etcd_addresses(resolved_case)
+                greptime_host, greptime_port = _RUNNER._test_stack_greptime_host_port(resolved_case)
+
+            self.assertEqual(etcd_addresses, ["10.1.1.119:57780"])
+            self.assertEqual((greptime_host, greptime_port), ("10.1.1.119", 57790))
 
     def test_load_source_stack_contract_rejects_multi_hostworkdir_remote_layout(self) -> None:
         with tempfile.TemporaryDirectory() as td:

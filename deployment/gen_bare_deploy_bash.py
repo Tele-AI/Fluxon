@@ -141,6 +141,11 @@ def main() -> None:
 
     for service_name, raw_service_cfg in services.items():
         service_cfg = _require_dict(raw_service_cfg, f"service.{service_name}")
+        stop_supervisor_labels = _bare_service_stop_supervisor_labels(
+            name_prefix=name_prefix,
+            service_name=service_name,
+            atomic_groups=atomic_groups,
+        )
         standalone_entrypoint = _resolve_service_entrypoint(
             service_name=service_name,
             service_cfg=service_cfg,
@@ -171,6 +176,7 @@ def main() -> None:
                 cluster_nodes=cluster_nodes,
                 service_name=service_name,
                 service_cfg=service_cfg,
+                supervisor_labels=stop_supervisor_labels,
             ),
         )
 
@@ -332,6 +338,32 @@ def _bare_atomic_group_member_selection_supervisor_label(
     )
 
 
+def _bare_service_stop_supervisor_labels(
+    *,
+    name_prefix: str,
+    service_name: str,
+    atomic_groups: Dict[str, Dict[str, Any]],
+) -> List[str]:
+    labels = [
+        _bare_plain_selection_supervisor_label(
+            name_prefix=name_prefix,
+            service_name=service_name,
+        )
+    ]
+    for group_name, group_cfg in atomic_groups.items():
+        group_services = _require_list_of_str(group_cfg.get("services"), f"atomic_groups.{group_name}.services")
+        if service_name not in group_services:
+            continue
+        labels.append(
+            _bare_atomic_group_member_selection_supervisor_label(
+                name_prefix=name_prefix,
+                group_name=group_name,
+                service_name=service_name,
+            )
+        )
+    return labels
+
+
 def _bare_entrypoint_script_name(*, workload_name: str) -> str:
     return f"entrypoint__{workload_name}.sh"
 
@@ -412,6 +444,7 @@ def _render_standalone_stop_script(
     cluster_nodes: List[Dict[str, Any]],
     service_name: str,
     service_cfg: Dict[str, Any],
+    supervisor_labels: List[str],
 ) -> str:
     allowed_nodes = _extract_nodes(service_cfg)
     return _render_bare_template(
@@ -423,9 +456,7 @@ def _render_standalone_stop_script(
             "HOST_PRELUDE": _render_host_prelude(cluster_nodes=cluster_nodes),
             "COMMON_NODE_RESOLUTION_TAIL": _render_common_node_resolution_tail(service_name=service_name),
             "SELECTION_SUPERVISOR_PATH_BLOCK": _render_selection_supervisor_path_from_script_dir(),
-            "SUPERVISOR_LABEL_ASSIGN": _sh_quote(
-                _bare_plain_selection_supervisor_label(name_prefix=name_prefix, service_name=service_name)
-            ),
+            "STOP_LABELS_BLOCK": _render_standalone_stop_labels_block(supervisor_labels=supervisor_labels),
         },
     )
 
@@ -574,6 +605,16 @@ def _render_service_port_export(*, service_name: str, service_cfg: Dict[str, Any
         indent + f"export {service_name.upper()}__PORT={_sh_quote(str(service_port))}\n"
         + indent + f"export SERVICE_PORT={_sh_quote(str(service_port))}\n"
     )
+
+
+def _render_standalone_stop_labels_block(*, supervisor_labels: List[str]) -> str:
+    if not supervisor_labels:
+        raise ValueError("supervisor_labels must be non-empty")
+    lines = ["STOP_SUPERVISOR_LABELS=(\n"]
+    for label in supervisor_labels:
+        lines.append(f"  {_sh_quote(label)}\n")
+    lines.append(")\n")
+    return "".join(lines)
 
 
 def _indent_script_block(*, script: str, prefix: str) -> str:

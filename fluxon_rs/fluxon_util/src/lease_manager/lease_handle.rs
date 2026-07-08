@@ -9,22 +9,16 @@ use std::sync::Arc;
 pub enum LeaseEntryKind {
     // KvClient keepalive is driven by a backend handle carrying the closure.
     // Keepalive must only accept the lease id and must not mutate TTL.
-    KvClient {
-        handle: LeaseBackendHandle,
-    },
-    // Etcd keepalive uses per-lease EtcdState stored inside the backend handle;
-    // `revoke_on_drop` only influences drop behavior.
-    Etcd {
-        handle: LeaseBackendHandle,
-        revoke_on_drop: bool,
-    },
+    KvClient { handle: LeaseBackendHandle },
+    // Etcd keepalive uses per-lease EtcdState stored inside the backend handle.
+    // Dropping the entry only unregisters local keepalive; it never revokes.
+    Etcd { handle: LeaseBackendHandle },
 }
 
 pub(crate) struct LeaseEntry {
-    // No ref_count: user-side LeaseHandle/GeneralLease Drop must drive
-    // unregister, so a single logical registration corresponds to a single
-    // table entry. Duplicate registrations for the same key are treated as a
-    // logic error and ignored (we only keep the first one).
+    // No separate counter: user-side LeaseHandle/GeneralLease Drop releases its
+    // AutoCleanMapEntry guard. Registrations for the same key reuse the same
+    // table entry; the entry is removed after the last guard is dropped.
     pub(crate) kind: LeaseEntryKind,
     // Guard of `actor_map(): AutoCleanMap<i64, Arc<OneTtlKeepAliveInner>>`, keyed by `ttl_seconds`.
     // Holding this keeps the per-ttl actor (`OneTtlKeepAliveInner`) alive while entries exist.

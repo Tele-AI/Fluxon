@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 import ctypes
+import etcd3
 
 from ..kvclient.kvclient_interface import KvClient
 from ..kvclient.kvclient_interface import DLPacked
@@ -190,6 +191,10 @@ def _new_etcd_consumer_key(chan_id: str, consumer_idx: str) -> str:
     return f"/channels/{chan_id}/consumer/consumer_{consumer_idx}"
 
 
+def _new_etcd_producer_weight_key(chan_id: str, producer_idx: str) -> str:
+    return f"/channels/{chan_id}/producer_weight/{producer_idx}"
+
+
 def _new_etcd_producer_key_prefix(chan_id: str) -> str:
     return f"/channels/{chan_id}/producer/producer_"
 
@@ -222,6 +227,33 @@ def _new_produce_offset_of_all_producer_key(chan_id: str) -> str:
 
 def _new_produce_offset_of_one_producer_key(chan_id: str, producer_idx: str) -> str:
     return f"/channels/{chan_id}/producer_offset_of_all_producer/{producer_idx}"
+
+
+def _delete_owned_etcd_keys_best_effort(api: KvClient, keys: List[str], dbg: str) -> None:
+    if not keys:
+        return
+    endpoints = api.get_etcd_config()
+    if not endpoints:
+        logging.warning("%s cannot delete owned etcd keys: empty etcd endpoint list", dbg)
+        return
+    first_address = endpoints[0]
+    try:
+        host, port_str = first_address.split(":")
+        client = etcd3.client(host=host, port=int(port_str))
+    except Exception as e:  # noqa: BLE001
+        logging.warning("%s failed to create etcd client for owned-key cleanup: %s", dbg, e)
+        return
+    try:
+        for key in keys:
+            try:
+                client.delete(key)
+            except Exception as e:  # noqa: BLE001
+                logging.warning("%s failed to delete owned etcd key %s: %s", dbg, key, e)
+    finally:
+        try:
+            client.close()
+        except Exception as e:  # noqa: BLE001
+            logging.debug("%s failed to close cleanup etcd client: %s", dbg, e)
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +474,7 @@ class MPSCChanProducer(ChannelProducer):
         self._handle_shutdown_ctl = _NoopCloseable()
         self._ctx = _NoopCloseable()
         self._handle = None  # type: ignore[assignment]
+        self._handle_lock = threading.Lock()
         self._chan_id = "-1"
         self._producer_id = "unknown"
         self._closed_local = False
@@ -531,10 +564,12 @@ class MPSCChanProducer(ChannelProducer):
         return self.shutdown_ctl.closed
 
     def record_nonblocking_put_success(self, unix_ms: int) -> None:
-        self._handle.record_nonblocking_put_success(unix_ms)  # type: ignore[attr-defined]
+        with self._handle_lock:
+            self._handle.record_nonblocking_put_success(unix_ms)  # type: ignore[attr-defined]
 
     def record_blocking_put_observed(self, unix_ms: int) -> None:
-        self._handle.record_blocking_put_observed(unix_ms)  # type: ignore[attr-defined]
+        with self._handle_lock:
+            self._handle.record_blocking_put_observed(unix_ms)  # type: ignore[attr-defined]
 
     # Note: historically the payload lease id was injected after
     # construction via `set_payload_lease_id`. Now we always resolve it
@@ -576,7 +611,20 @@ class MPSCChanProducer(ChannelProducer):
         dlpack_capsules: List[object] = []
         try:
             ptrs = _fluxon_kv.build_flat_dict_ptrs(value, keepalive, dlpack_capsules)
-            self._handle.put_flat_dict_ptrs(ptrs)  # type: ignore[attr-defined]
+        except Exception as e:  # pragma: no cover - thin shim
+            return Result[bool, ApiError].new_error(e)  # type: ignore[arg-type]
+
+        try:
+            with self._handle_lock:
+                if self.shutdown_ctl.closed:
+                    return Result[bool, ApiError].new_error(
+                        ProducerClosedError(
+                            message="producer is closed",
+                            channel_id=self.get_chan_id(),
+                            producer_idx=self.get_producer_id(),
+                        )
+                    )
+                self._handle.put_flat_dict_ptrs(ptrs)  # type: ignore[attr-defined]
         except Exception as e:  # pragma: no cover - thin shim
             if _is_close_during_put_error(e):
                 self.shutdown_ctl.closed = True
@@ -654,19 +702,41 @@ class MPSCChanProducer(ChannelProducer):
         logging.debug("%s close begin chan_id=%s mode=%s", dbg, chan_id, mode.value)
         self._closed_local = True
         self.shutdown_ctl.closed = True
+        by_gc = bool(getattr(self, "_closing_by_gc", False))
+        producer_id = getattr(self, "_producer_id", None)
         try:
-            # 1) tell Rust side to stop local tasks and retry loops
+            # Tell Rust side to stop local tasks and retry loops before waiting
+            # for an in-flight put to release the handle lock.
             self._handle_shutdown_ctl.close()
         except Exception as e:
             # If the underlying handle is already dropped or None, do not warn noisily.
             logging.debug("%s shutdown_ctl.close skipped: %s", dbg, e)
-        # Drop shutdown handle ref so no strong ref is kept in Python
-        self._handle_shutdown_ctl = None  # type: ignore[assignment]
-        # 2) drop PyO3 handle to release strong refs into Rust
-        try:
-            self._handle = None  # type: ignore[assignment]
-        except Exception as e:
-            logging.warning("%s failed to drop rust handle: %s", dbg, e)
+        handle_lock = getattr(self, "_handle_lock", None)
+        if handle_lock is None:
+            self._handle_shutdown_ctl = None  # type: ignore[assignment]
+            try:
+                self._handle = None  # type: ignore[assignment]
+            except Exception as e:
+                logging.warning("%s failed to drop rust handle: %s", dbg, e)
+        else:
+            with handle_lock:
+                # Drop shutdown handle ref so no strong ref is kept in Python
+                self._handle_shutdown_ctl = None  # type: ignore[assignment]
+                # Drop PyO3 handle to release strong refs into Rust
+                try:
+                    self._handle = None  # type: ignore[assignment]
+                except Exception as e:
+                    logging.warning("%s failed to drop rust handle: %s", dbg, e)
+        if not by_gc and isinstance(chan_id, str) and isinstance(producer_id, str):
+            if chan_id != "-1" and producer_id != "unknown":
+                _delete_owned_etcd_keys_best_effort(
+                    self.api,
+                    [
+                        _new_etcd_producer_key(chan_id, producer_id),
+                        _new_etcd_producer_weight_key(chan_id, producer_id),
+                    ],
+                    dbg,
+                )
         # RELEASE_LOCAL_HANDLE is used by outer MPMC teardown after the
         # shared distributed state has already been handed off to other
         # participants. In that path we must stop the local handle tasks,
@@ -678,7 +748,6 @@ class MPSCChanProducer(ChannelProducer):
                 logging.warning("%s failed to close mpsc context: %s", dbg, e)
         self._ctx = _NoopCloseable()
         # Record test marker to indicate whether this close was GC-triggered
-        by_gc = bool(getattr(self, "_closing_by_gc", False))
         if hasattr(self, "_chan_id") and hasattr(self, "_producer_id"):
             tag = f"mpsc:producer:{self._chan_id}:{self._producer_id}"
             _record_test_close_marker(tag, by_gc)
@@ -876,6 +945,8 @@ class MPSCChanConsumer(ChannelConsumer):
         logging.debug("%s close begin chan_id=%s mode=%s", dbg, chan_id, mode.value)
         self._closed_local = True
         self.shutdown_ctl.closed = True
+        by_gc = bool(getattr(self, "_closing_by_gc", False))
+        consumer_id = getattr(self, "_consumer_id", None)
         try:
             # 1) signal Rust shutdown to stop local prefetch/retry work
             self._handle_shutdown_ctl.close()
@@ -886,6 +957,13 @@ class MPSCChanConsumer(ChannelConsumer):
             self._handle = None  # type: ignore[assignment]
         except Exception as e:
             logging.warning("%s failed to drop rust handle: %s", dbg, e)
+        if not by_gc and isinstance(chan_id, str) and isinstance(consumer_id, str):
+            if chan_id != "-1" and consumer_id != "unknown":
+                _delete_owned_etcd_keys_best_effort(
+                    self.api,
+                    [_new_etcd_consumer_key(chan_id, consumer_id)],
+                    dbg,
+                )
         # RELEASE_LOCAL_HANDLE must only tear down this process-local
         # consumer handle. The shared MPMC state keeps running elsewhere,
         # so avoid a blocking full MQ framework shutdown in this mode.
@@ -895,11 +973,7 @@ class MPSCChanConsumer(ChannelConsumer):
             except Exception as e:
                 logging.warning("%s failed to close mpsc context: %s", dbg, e)
         self._ctx = _NoopCloseable()
-        # Do not touch etcd directly here. Channel key lifecycle must be handled
-        # by leases at the backend (Rust) layer. Tests will validate TTL-based
-        # cleanup; Python shim only ensures handles/keepalives are dropped.
         # Record test marker to indicate whether this close was GC-triggered
-        by_gc = bool(getattr(self, "_closing_by_gc", False))
         if hasattr(self, "_chan_id") and hasattr(self, "_consumer_id"):
             tag = f"mpsc:consumer:{self._chan_id}:{self._consumer_id}"
             _record_test_close_marker(tag, by_gc)

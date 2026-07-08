@@ -31,7 +31,6 @@ pub fn register_etcd_lease(
     endpoints: Vec<String>,
     ttl_seconds: i64,
     lease_id: u64,
-    revoke_on_drop: bool,
 ) -> Result<lease_manager::GeneralLease> {
     let rth = rt.handle().clone();
     let outer = rt
@@ -43,7 +42,7 @@ pub fn register_etcd_lease(
                     uid,
                     ttl_seconds,
                     lease_id,
-                    lease_manager::LeaseRegisterKind::Etcd { revoke_on_drop },
+                    lease_manager::LeaseRegisterKind::Etcd,
                     rth,
                 )
                 .await?;

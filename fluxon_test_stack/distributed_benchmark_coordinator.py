@@ -1509,6 +1509,7 @@ class CoordinatorServer:
         self.runtime_ready_nodes_for_current_test: set[str] = set()
         self.lock = threading.Lock()
         self.all_nodes_ready = threading.Event()
+        self.all_runtime_ready = threading.Event()
         self.all_results_received = threading.Event()
         self.test_config: Optional[TestConfig] = None
         # Multi-round test control (value-size sweep only; process fanout is deploy-time fixed).
@@ -2044,6 +2045,8 @@ class CoordinatorServer:
             ready_count = len(self.runtime_ready_nodes_for_current_test)
             ready_node_ids = sorted(self.runtime_ready_nodes_for_current_test)
             all_runtime_ready = ready_count >= self.expected_nodes
+            if all_runtime_ready:
+                self.all_runtime_ready.set()
             logger.info(
                 "✅ MPMC runtime ready: node_id=%s runtime_ready=%s/%s",
                 node_id,
@@ -2501,6 +2504,7 @@ class CoordinatorServer:
             self.runtime_ready_nodes_for_current_test = set()
             # 新一轮测试前清理状态
             self.all_nodes_ready.clear()
+            self.all_runtime_ready.clear()
             self.all_results_received.clear()
         logger.info(f"Test started: {config.test_id}")
         logger.info(f"Config: {config}")
@@ -2630,6 +2634,10 @@ class CoordinatorServer:
                 or str(node_id) in reported_node_ids
             )
 
+    def _runtime_ready_node_ids(self) -> List[str]:
+        with self.lock:
+            return sorted(str(node_id) for node_id in self.runtime_ready_nodes_for_current_test)
+
     def _missing_result_node_ids(self) -> List[str]:
         with self.lock:
             reported = set()
@@ -2700,6 +2708,29 @@ class CoordinatorServer:
             )
             return False
 
+    def wait_for_runtime_ready(self, *, timeout_s: float) -> bool:
+        """Wait for all MPMC nodes to finish runtime setup before result timing starts."""
+        if timeout_s <= 0:
+            raise ValueError(f"wait_for_runtime_ready timeout_s must be > 0, got {timeout_s}")
+
+        completed = self.all_runtime_ready.wait(timeout=timeout_s)
+        if completed:
+            return True
+
+        runtime_ready_nodes = self._runtime_ready_node_ids()
+        with self.lock:
+            registered_nodes = sorted(str(node_id) for node_id in self.registered_nodes.keys())
+        missing_runtime_ready_nodes = sorted(
+            node_id for node_id in registered_nodes if node_id not in runtime_ready_nodes
+        )
+        logger.error(
+            "❌ MPMC runtime nodes did not become ready before deadline: "
+            f"timeout_s={timeout_s} expected_nodes={self.expected_nodes} "
+            f"runtime_ready_nodes={runtime_ready_nodes} "
+            f"missing_runtime_ready_nodes={missing_runtime_ready_nodes}"
+        )
+        return False
+
     def _build_completion_metadata(
         self,
         *,
@@ -2709,6 +2740,7 @@ class CoordinatorServer:
     ) -> Dict[str, Any]:
         registered_node_ids = self._registered_node_ids()
         ready_node_ids = self._ready_node_ids()
+        runtime_ready_node_ids = self._runtime_ready_node_ids()
         reported_result_node_ids = self._reported_result_node_ids()
         pending_result_node_ids = self._missing_result_node_ids()
         return {
@@ -2719,6 +2751,8 @@ class CoordinatorServer:
             "registered_node_ids": registered_node_ids,
             "ready_node_count": len(ready_node_ids),
             "ready_node_ids": ready_node_ids,
+            "runtime_ready_node_count": len(runtime_ready_node_ids),
+            "runtime_ready_node_ids": runtime_ready_node_ids,
             "reported_result_node_count": len(reported_result_node_ids),
             "reported_result_node_ids": reported_result_node_ids,
             "pending_result_node_count": len(pending_result_node_ids),
@@ -3709,6 +3743,43 @@ def main():
                 f"💥 协调者启动失败或配置不满足: {coordinator.server_start_error}"
             )
             return 2
+
+        if cfg.test_mode == TestMode.MPMC.value:
+            runtime_ready_start_time = time.time()
+            logger.info(
+                "⏳ 等待 MPMC runtime_ready 屏障 "
+                f"(timeout_s={cfg.cluster_ready_timeout_seconds} "
+                f"expected_nodes={coordinator.expected_nodes})..."
+            )
+            runtime_ready_ok = coordinator.wait_for_runtime_ready(
+                timeout_s=float(cfg.cluster_ready_timeout_seconds)
+            )
+            runtime_ready_elapsed = time.time() - runtime_ready_start_time
+            if not runtime_ready_ok:
+                logger.error(
+                    "❌ MPMC runtime_ready did not complete before deadline: "
+                    f"timeout_s={cfg.cluster_ready_timeout_seconds} "
+                    f"expected_nodes={coordinator.expected_nodes}"
+                )
+                timed_out_summary = coordinator.build_incomplete_run_summary(
+                    elapsed_seconds=runtime_ready_elapsed,
+                    completion_error=(
+                        "MPMC runtime_ready wait timed out after "
+                        f"{float(cfg.cluster_ready_timeout_seconds):.1f}s"
+                    ),
+                )
+                all_summaries.append(timed_out_summary)
+                _write_benchmark_result_file(all_summaries)
+                logger.error(
+                    "❌ wrote incomplete benchmark_result.json due to MPMC runtime_ready timeout; "
+                    "runner will fail the case deterministically"
+                )
+                _hold_forever_after_result_written(reason="mpmc_runtime_ready_timeout")
+            logger.info(
+                "✅ MPMC runtime_ready 屏障完成: elapsed_s=%.1f expected_nodes=%s",
+                runtime_ready_elapsed,
+                coordinator.expected_nodes,
+            )
 
         start_time = time.time()
         logger.info(
