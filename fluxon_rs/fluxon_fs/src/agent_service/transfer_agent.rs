@@ -9,28 +9,23 @@ use std::time::{Duration, Instant};
 
 use fluxon_fs_core::config::{
     FS_AGENT_TRANSFER_STREAM_CLOSE_RPC_PATH, FS_AGENT_TRANSFER_STREAM_NEXT_RPC_PATH,
-    FS_AGENT_TRANSFER_STREAM_OPEN_RPC_PATH,
-    FS_MASTER_TRANSFER_SCHEDULER_HEARTBEAT_RPC_PATH, FS_MASTER_TRANSFER_SCHEDULER_RESULT_RPC_PATH,
-    FluxonFsTransferBatchCollectInfoWire, FluxonFsTransferBatchKind,
-    FluxonFsTransferCollectInfoKind, FluxonFsTransferDispositionWire,
-    FluxonFsTransferFailedFileReasonKindWire,
-    FluxonFsTransferReadStreamCloseWire, FluxonFsTransferReadStreamNextResultWire,
-    FluxonFsTransferReadStreamNextWire, FluxonFsTransferReadStreamOpenResultWire,
-    FluxonFsTransferReadStreamOpenWire,
-    FluxonFsTransferSkipEntryKind, FluxonFsTransferSkipEntryWire,
-    FluxonFsTransferManifestEntryWire, FluxonFsTransferManifestWire,
-    FluxonFsTransferScanMode,
-    FluxonFsTransferScanEventAckWire, FluxonFsTransferScanEventKindWire,
-    FluxonFsTransferScanEventWire, FluxonFsTransferScanLaunchResultWire,
+    FS_AGENT_TRANSFER_STREAM_OPEN_RPC_PATH, FS_MASTER_TRANSFER_SCHEDULER_HEARTBEAT_RPC_PATH,
+    FS_MASTER_TRANSFER_SCHEDULER_RESULT_RPC_PATH, FluxonFsTransferBatchCollectInfoWire,
+    FluxonFsTransferBatchKind, FluxonFsTransferCollectInfoKind, FluxonFsTransferDispositionWire,
+    FluxonFsTransferFailedFileReasonKindWire, FluxonFsTransferManifestEntryWire,
+    FluxonFsTransferManifestWire, FluxonFsTransferReadStreamCloseWire,
+    FluxonFsTransferReadStreamNextResultWire, FluxonFsTransferReadStreamNextWire,
+    FluxonFsTransferReadStreamOpenResultWire, FluxonFsTransferReadStreamOpenWire,
     FluxonFsTransferScanAssignmentWire, FluxonFsTransferScanBatchWire,
-    FluxonFsTransferScanChildUnitWire, FluxonFsTransferScanFrontier,
+    FluxonFsTransferScanChildUnitWire, FluxonFsTransferScanEventAckWire,
+    FluxonFsTransferScanEventKindWire, FluxonFsTransferScanEventWire, FluxonFsTransferScanFrontier,
     FluxonFsTransferScanFrontierDirEntry, FluxonFsTransferScanFrontierEntry,
-    FluxonFsTransferScanResultWire,
-    FluxonFsTransferSymlinkNoticeEntryWire, FluxonFsTransferWorkerCollectInfoResultWire,
-    FluxonFsTransferWorkerAssignmentWire, FluxonFsTransferWorkerFileResultWire,
-    FluxonFsTransferWorkerFailedFileResultWire,
-    FluxonFsTransferWorkerHeartbeatResultWire, FluxonFsTransferWorkerHeartbeatTelemetryWire,
-    FluxonFsTransferWorkerHeartbeatWire,
+    FluxonFsTransferScanLaunchResultWire, FluxonFsTransferScanMode, FluxonFsTransferScanResultWire,
+    FluxonFsTransferSkipEntryKind, FluxonFsTransferSkipEntryWire,
+    FluxonFsTransferSymlinkNoticeEntryWire, FluxonFsTransferWorkerAssignmentWire,
+    FluxonFsTransferWorkerCollectInfoResultWire, FluxonFsTransferWorkerFailedFileResultWire,
+    FluxonFsTransferWorkerFileResultWire, FluxonFsTransferWorkerHeartbeatResultWire,
+    FluxonFsTransferWorkerHeartbeatTelemetryWire, FluxonFsTransferWorkerHeartbeatWire,
     FluxonFsTransferWorkerLaunchResultWire, FluxonFsTransferWorkerResultAckWire,
     FluxonFsTransferWorkerResultWire, FluxonFsTransferWorkerStopReasonWire,
     transfer_collect_info_output_relpath,
@@ -39,8 +34,8 @@ use fluxon_fs_core::retry::{
     BackoffConfig, DEFAULT_WARN_INTERVAL_SECS, WarnConfig, next_backoff, should_warn,
 };
 use fluxon_kv::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError};
-use fluxon_kv::user_api::flat_dict::{FlatDict, FlatValue};
 use fluxon_kv::user_api::FluxonUserApi;
+use fluxon_kv::user_api::flat_dict::{FlatDict, FlatValue};
 use parking_lot::{Condvar, Mutex};
 
 use super::{
@@ -202,16 +197,13 @@ fn transfer_scan_session_state() -> &'static Mutex<TransferScanSessionState> {
     TRANSFER_SCAN_SESSION_STATE.get_or_init(|| Mutex::new(TransferScanSessionState::default()))
 }
 
-fn cleanup_expired_transfer_scan_sessions(
-    state: &mut TransferScanSessionState,
-    now_unix_ms: i64,
-) {
-    state
-        .root_dir_listing_sessions
-        .retain(|_, session| session.lease_expire_unix_ms <= 0 || session.lease_expire_unix_ms > now_unix_ms);
-    state
-        .subtree_streaming_sessions
-        .retain(|_, session| session.lease_expire_unix_ms <= 0 || session.lease_expire_unix_ms > now_unix_ms);
+fn cleanup_expired_transfer_scan_sessions(state: &mut TransferScanSessionState, now_unix_ms: i64) {
+    state.root_dir_listing_sessions.retain(|_, session| {
+        session.lease_expire_unix_ms <= 0 || session.lease_expire_unix_ms > now_unix_ms
+    });
+    state.subtree_streaming_sessions.retain(|_, session| {
+        session.lease_expire_unix_ms <= 0 || session.lease_expire_unix_ms > now_unix_ms
+    });
 }
 
 fn same_root_continuation_scan_unit(
@@ -301,10 +293,7 @@ fn flush_pending_root_direct_files_batch(
         return Ok(None);
     }
     let batch = build_direct_files_only_batch_from_entries_with_batch_id(
-        direct_files_only_batch_id_for_partition(
-            assignment,
-            session.next_direct_files_batch_index,
-        ),
+        direct_files_only_batch_id_for_partition(assignment, session.next_direct_files_batch_index),
         assignment,
         assignment.root_relpath.clone(),
         std::mem::take(&mut session.pending_direct_files),
@@ -313,7 +302,8 @@ fn flush_pending_root_direct_files_batch(
     )?;
     session.pending_direct_bytes = 0;
     session.next_direct_files_batch_index = session.next_direct_files_batch_index.saturating_add(1);
-    session.emitted_direct_files_batch_count = session.emitted_direct_files_batch_count.saturating_add(1);
+    session.emitted_direct_files_batch_count =
+        session.emitted_direct_files_batch_count.saturating_add(1);
     Ok(Some(batch))
 }
 
@@ -414,7 +404,8 @@ fn open_transfer_root_dir_listing_session(
     root_dir_abs: &str,
     assignment: &FluxonFsTransferScanAssignmentWire,
 ) -> Result<Option<TransferRootDirListingSession>, FlatDict> {
-    let dir_abs = safe_join_root(root_dir_abs, assignment.root_relpath.as_str()).map_err(resp_err_kverr)?;
+    let dir_abs =
+        safe_join_root(root_dir_abs, assignment.root_relpath.as_str()).map_err(resp_err_kverr)?;
     let read_dir = match retry_after_target_path_chmod(
         dir_abs.as_path(),
         "root_read_dir",
@@ -458,7 +449,10 @@ fn take_transfer_root_dir_listing_session(
     let now_unix_ms = chrono::Utc::now().timestamp_millis();
     let mut state = transfer_scan_session_state().lock();
     cleanup_expired_transfer_scan_sessions(&mut state, now_unix_ms);
-    if let Some(mut session) = state.root_dir_listing_sessions.remove(assignment.scan_unit_id.as_str()) {
+    if let Some(mut session) = state
+        .root_dir_listing_sessions
+        .remove(assignment.scan_unit_id.as_str())
+    {
         if session.job_id == assignment.job_id
             && session.scan_epoch == assignment.scan_epoch
             && session.root_relpath == assignment.root_relpath
@@ -507,7 +501,8 @@ fn open_transfer_subtree_streaming_session(
     if is_relpath_skipped(&assignment.skip_entries, assignment.root_relpath.as_str()) {
         return Ok(None);
     }
-    let dir_abs = safe_join_root(root_dir_abs, assignment.root_relpath.as_str()).map_err(resp_err_kverr)?;
+    let dir_abs =
+        safe_join_root(root_dir_abs, assignment.root_relpath.as_str()).map_err(resp_err_kverr)?;
     let root_md = retry_after_target_path_chmod(
         Path::new(root_dir_abs),
         "subtree_stream_root_symlink_metadata",
@@ -790,7 +785,8 @@ fn collect_transfer_root_dir_listing_slice(
     assignment: &FluxonFsTransferScanAssignmentWire,
     deadline: Option<TransferScanDeadline>,
 ) -> Result<TransferRootDirListingOutcome, FlatDict> {
-    let Some(mut session) = take_transfer_root_dir_listing_session(root_dir_abs, assignment)? else {
+    let Some(mut session) = take_transfer_root_dir_listing_session(root_dir_abs, assignment)?
+    else {
         return Ok(TransferRootDirListingOutcome::Finished(
             build_finished_empty_transfer_scan_result(assignment),
         ));
@@ -848,7 +844,8 @@ fn collect_transfer_root_dir_listing_slice(
         };
         scanned_entries = scanned_entries.saturating_add(1);
         let name = ent.file_name().to_string_lossy().to_string();
-        let child_relpath = normalize_child_relpath(assignment.root_relpath.as_str(), name.as_str());
+        let child_relpath =
+            normalize_child_relpath(assignment.root_relpath.as_str(), name.as_str());
         if is_relpath_skipped(&assignment.skip_entries, child_relpath.as_str()) {
             continue;
         }
@@ -899,10 +896,12 @@ fn collect_transfer_root_dir_listing_slice(
             let size = md.len().min(i64::MAX as u64) as i64;
             session.root_visible_entries = true;
             session.root_total_bytes = session.root_total_bytes.saturating_add(size);
-            session.pending_direct_files.push(FluxonFsTransferScanFrontierEntry {
-                relpath: child_relpath,
-                size,
-            });
+            session
+                .pending_direct_files
+                .push(FluxonFsTransferScanFrontierEntry {
+                    relpath: child_relpath,
+                    size,
+                });
             session.pending_direct_bytes = session.pending_direct_bytes.saturating_add(size);
             if should_flush_direct_batch(
                 assignment.batch_ready_bytes,
@@ -910,7 +909,9 @@ fn collect_transfer_root_dir_listing_slice(
                 session.pending_direct_files.len(),
                 session.pending_direct_empty_dirs.len(),
             ) {
-                if let Some(batch) = flush_pending_root_direct_files_batch(assignment, &mut session)? {
+                if let Some(batch) =
+                    flush_pending_root_direct_files_batch(assignment, &mut session)?
+                {
                     direct_files_only_batches.push(batch);
                 }
             }
@@ -933,14 +934,18 @@ fn collect_transfer_root_dir_listing_slice(
                 session.pending_direct_files.len(),
                 session.pending_direct_empty_dirs.len(),
             ) {
-                if let Some(batch) = flush_pending_root_direct_files_batch(assignment, &mut session)? {
+                if let Some(batch) =
+                    flush_pending_root_direct_files_batch(assignment, &mut session)?
+                {
                     direct_files_only_batches.push(batch);
                 }
             }
         } else {
-            session.direct_dirs.push(FluxonFsTransferScanFrontierDirEntry {
-                relpath: child_relpath,
-            });
+            session
+                .direct_dirs
+                .push(FluxonFsTransferScanFrontierDirEntry {
+                    relpath: child_relpath,
+                });
         }
     }
 }
@@ -1244,12 +1249,14 @@ impl TransferWorkerProgressWindow {
     fn record_written_bytes_and_maybe_ramp(&self, bytes: i64, now_unix_ms: i64) {
         let normalized = bytes.max(0);
         self.window_bytes.fetch_add(normalized, Ordering::SeqCst);
-        self.total_written_bytes.fetch_add(normalized, Ordering::SeqCst);
+        self.total_written_bytes
+            .fetch_add(normalized, Ordering::SeqCst);
         self.maybe_ramp(now_unix_ms);
     }
 
     fn record_materialized_empty_dir(&self) {
-        self.total_materialized_empty_dirs.fetch_add(1, Ordering::SeqCst);
+        self.total_materialized_empty_dirs
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     fn total_materialized_empty_dirs(&self) -> i64 {
@@ -1298,8 +1305,9 @@ impl TransferWorkerProgressWindow {
         }
         if previous_goodput > 0 {
             let delta = current_goodput.saturating_sub(previous_goodput);
-            let improvement_percent =
-                delta.saturating_mul(100).saturating_div(previous_goodput.max(1));
+            let improvement_percent = delta
+                .saturating_mul(100)
+                .saturating_div(previous_goodput.max(1));
             if improvement_percent < self.policy.min_improvement_percent {
                 return;
             }
@@ -1335,10 +1343,8 @@ impl TransferWorkerProgressWindow {
                 .saturating_mul(1000)
                 .saturating_div(window_elapsed_ms.max(1))
         };
-        self.peak_sample_goodput_bytes_per_sec.fetch_max(
-            window_goodput_bytes_per_sec.max(0),
-            Ordering::SeqCst,
-        );
+        self.peak_sample_goodput_bytes_per_sec
+            .fetch_max(window_goodput_bytes_per_sec.max(0), Ordering::SeqCst);
         Some(TransferWorkerThroughputSample {
             window_started_unix_ms,
             window_elapsed_ms,
@@ -1448,7 +1454,8 @@ impl TransferReadStreamActorOwned {
                 data: Vec::new(),
             });
         }
-        self.fill_prefetch_queue().map_err(|err| self.cache_terminal_error(err))?;
+        self.fill_prefetch_queue()
+            .map_err(|err| self.cache_terminal_error(err))?;
         let to_take = std::cmp::min(length as usize, (self.file_size - next_offset) as usize);
         let buf = self
             .take_prefetched_bytes(to_take)
@@ -1457,7 +1464,8 @@ impl TransferReadStreamActorOwned {
         self.replay_offset = next_offset;
         self.replay_data = buf.clone();
         self.next_offset = next_offset.saturating_add(buf.len() as i64);
-        self.fill_prefetch_queue().map_err(|err| self.cache_terminal_error(err))?;
+        self.fill_prefetch_queue()
+            .map_err(|err| self.cache_terminal_error(err))?;
         Ok(FluxonFsTransferReadStreamNextResultWire {
             stream_missing: false,
             data: buf,
@@ -1598,7 +1606,11 @@ impl TransferReadStreamActorHandle {
 
 struct TransferWorkerCoordinator<ReadChunkFn, CheckpointFn>
 where
-    ReadChunkFn: Fn(&FluxonFsTransferManifestEntryWire, i64, i64) -> Result<Vec<u8>, TransferWorkerExecutionError>,
+    ReadChunkFn: Fn(
+        &FluxonFsTransferManifestEntryWire,
+        i64,
+        i64,
+    ) -> Result<Vec<u8>, TransferWorkerExecutionError>,
     CheckpointFn: Fn() -> Result<(), TransferWorkerExecutionError>,
 {
     log_context: TransferWorkerLogContext,
@@ -1611,7 +1623,11 @@ where
 
 impl<ReadChunkFn, CheckpointFn> TransferWorkerCoordinator<ReadChunkFn, CheckpointFn>
 where
-    ReadChunkFn: Fn(&FluxonFsTransferManifestEntryWire, i64, i64) -> Result<Vec<u8>, TransferWorkerExecutionError>,
+    ReadChunkFn: Fn(
+        &FluxonFsTransferManifestEntryWire,
+        i64,
+        i64,
+    ) -> Result<Vec<u8>, TransferWorkerExecutionError>,
     CheckpointFn: Fn() -> Result<(), TransferWorkerExecutionError>,
 {
     fn new(
@@ -1693,7 +1709,8 @@ where
     }
 
     fn progress_snapshot(&self) -> TransferWorkerProgressSnapshot {
-        self.progress.snapshot(chrono::Utc::now().timestamp_millis())
+        self.progress
+            .snapshot(chrono::Utc::now().timestamp_millis())
     }
 
     fn stop(&self) {
@@ -1737,7 +1754,8 @@ impl TransferReadStreamRegistryHandle {
                 });
             }
         }
-        let full_path = safe_join_root(root_dir_abs, open.relpath.as_str()).map_err(resp_err_kverr)?;
+        let full_path =
+            safe_join_root(root_dir_abs, open.relpath.as_str()).map_err(resp_err_kverr)?;
         let file = open_file_with_target_path_chmod_retry(&full_path, "open_stream")?;
         let md = file.metadata().map_err(resp_err_io)?;
         let file_size = md.len().min(i64::MAX as u64) as i64;
@@ -1764,12 +1782,15 @@ impl TransferReadStreamRegistryHandle {
             });
         }
         state.streams.insert(stream_id.clone(), entry);
-        state.dedup_by_worker_file.insert(dedup_key, stream_id.clone());
+        state
+            .dedup_by_worker_file
+            .insert(dedup_key, stream_id.clone());
         drop(state);
         if let Err(resp) = TransferReadStreamActorHandle::start(stream_id.as_str(), actor) {
             let mut state = self.state.lock();
             state.streams.remove(stream_id.as_str());
-            state.dedup_by_worker_file
+            state
+                .dedup_by_worker_file
                 .retain(|_, existing_stream_id| existing_stream_id != &stream_id);
             return Err(resp);
         }
@@ -1811,7 +1832,9 @@ impl TransferReadStreamRegistryHandle {
         let Some(entry) = state.streams.remove(stream_id) else {
             return;
         };
-        state.dedup_by_worker_file.retain(|_, existing_stream_id| existing_stream_id != stream_id);
+        state
+            .dedup_by_worker_file
+            .retain(|_, existing_stream_id| existing_stream_id != stream_id);
         entry.close();
     }
 }
@@ -1894,20 +1917,22 @@ fn decode_transfer_stream_open_result_payload(
         return Err(TransferWorkerRpcFailure::Fatal(resp.clone()));
     }
     Ok(FluxonFsTransferReadStreamOpenResultWire {
-        stream_id: require_str(resp, "stream_id").map_err(resp_err_kverr).map_err(
-            |err| {
+        stream_id: require_str(resp, "stream_id")
+            .map_err(resp_err_kverr)
+            .map_err(|err| {
                 invalid_transfer_rpc_response(format!(
                     "transfer read stream open response missing stream_id: err={}",
                     transfer_rpc_response_err_text(&err)
                 ))
-            },
-        )?,
-        size: require_i64(resp, "size").map_err(resp_err_kverr).map_err(|err| {
-            invalid_transfer_rpc_response(format!(
-                "transfer read stream open response missing size: err={}",
-                transfer_rpc_response_err_text(&err)
-            ))
-        })?,
+            })?,
+        size: require_i64(resp, "size")
+            .map_err(resp_err_kverr)
+            .map_err(|err| {
+                invalid_transfer_rpc_response(format!(
+                    "transfer read stream open response missing size: err={}",
+                    transfer_rpc_response_err_text(&err)
+                ))
+            })?,
     })
 }
 
@@ -1980,11 +2005,15 @@ fn is_relpath_skipped(skip_entries: &[FluxonFsTransferSkipEntryWire], relpath: &
 }
 
 fn file_name_from_relpath(relpath: &str) -> Result<&str, FlatDict> {
-    relpath.rsplit('/').next().filter(|v| !v.is_empty()).ok_or_else(|| {
-        resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
-            detail: format!("relpath must contain file name: {}", relpath),
-        }))
-    })
+    relpath
+        .rsplit('/')
+        .next()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+                detail: format!("relpath must contain file name: {}", relpath),
+            }))
+        })
 }
 
 fn transfer_staging_dir_for_file(staging_prefix: &str, relpath: &str) -> String {
@@ -2106,8 +2135,12 @@ where
     match attempt() {
         Ok(value) => Ok(value),
         Err(initial_err) if initial_err.kind() == ErrorKind::PermissionDenied => {
-            let repair_dir =
-                repair_permission_denied_dir_for_retry(repair_anchor, op, target_path, &initial_err)?;
+            let repair_dir = repair_permission_denied_dir_for_retry(
+                repair_anchor,
+                op,
+                target_path,
+                &initial_err,
+            )?;
             attempt().map_err(|retry_err| {
                 resp_err_kverr(KvError::Api(ApiError::Unknown {
                     detail: format!(
@@ -2334,10 +2367,11 @@ fn collect_transfer_tree_with_deadline(
                         continue;
                     }
                 };
-                out.symlink_notices.push(FluxonFsTransferSymlinkNoticeEntryWire {
-                    relpath: child_rel,
-                    link_target: link_target.to_string_lossy().to_string(),
-                });
+                out.symlink_notices
+                    .push(FluxonFsTransferSymlinkNoticeEntryWire {
+                        relpath: child_rel,
+                        link_target: link_target.to_string_lossy().to_string(),
+                    });
                 continue;
             }
             if md.is_dir() {
@@ -2361,7 +2395,8 @@ fn collect_transfer_tree_with_deadline(
     }
     out.files.sort_by(|a, b| a.relpath.cmp(&b.relpath));
     out.empty_dirs.sort();
-    out.symlink_notices.sort_by(|a, b| a.relpath.cmp(&b.relpath));
+    out.symlink_notices
+        .sort_by(|a, b| a.relpath.cmp(&b.relpath));
     Ok(out)
 }
 
@@ -2574,10 +2609,8 @@ fn build_transfer_scan_events_for_result(
     event_seq_no_start: i64,
     result: FluxonFsTransferScanResultWire,
 ) -> (Vec<FluxonFsTransferScanEventWire>, bool, i64) {
-    let (child_scan_units, continue_locally) = split_same_root_continuation_from_child_scan_units(
-        assignment,
-        result.child_scan_units,
-    );
+    let (child_scan_units, continue_locally) =
+        split_same_root_continuation_from_child_scan_units(assignment, result.child_scan_units);
     if continue_locally {
         let event = build_transfer_scan_event(
             assignment,
@@ -2588,11 +2621,7 @@ fn build_transfer_scan_events_for_result(
             result.full_dir_batches,
             String::new(),
         );
-        return (
-            vec![event],
-            true,
-            event_seq_no_start.saturating_add(1),
-        );
+        return (vec![event], true, event_seq_no_start.saturating_add(1));
     }
     let mut next_event_seq_no = event_seq_no_start;
     let mut events = Vec::new();
@@ -2620,11 +2649,7 @@ fn build_transfer_scan_events_for_result(
         Vec::new(),
         String::new(),
     ));
-    (
-        events,
-        false,
-        next_event_seq_no.saturating_add(1),
-    )
+    (events, false, next_event_seq_no.saturating_add(1))
 }
 
 fn send_transfer_scan_event_once(
@@ -2637,10 +2662,7 @@ fn send_transfer_scan_event_once(
     }
     let event_json = serde_json::to_string(event)
         .map_err(|e| format!("serialize transfer scan event failed: {}", e))?;
-    let payload = FlatDict::from([(
-        "scan_event_json".to_string(),
-        FlatValue::String(event_json),
-    )]);
+    let payload = FlatDict::from([("scan_event_json".to_string(), FlatValue::String(event_json))]);
     let resp = api
         .rpc_client()
         .call(
@@ -2793,30 +2815,28 @@ fn run_transfer_scan_background_task(
     }
     let mut next_event_seq_no = 1_i64;
     loop {
-        let result = match build_transfer_scan_result_for_root_dir_abs(
-            root_dir_abs.as_str(),
-            &assignment,
-        ) {
-            Ok(v) => v,
-            Err(resp) => {
-                let failed = build_transfer_scan_event(
-                    &assignment,
-                    next_event_seq_no,
-                    FluxonFsTransferScanEventKindWire::Failed,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    transfer_rpc_response_err_text(&resp),
-                );
-                let _ = send_transfer_scan_event_with_retry(
-                    api.as_ref(),
-                    master_id.as_str(),
-                    &mut assignment,
-                    &failed,
-                );
-                break;
-            }
-        };
+        let result =
+            match build_transfer_scan_result_for_root_dir_abs(root_dir_abs.as_str(), &assignment) {
+                Ok(v) => v,
+                Err(resp) => {
+                    let failed = build_transfer_scan_event(
+                        &assignment,
+                        next_event_seq_no,
+                        FluxonFsTransferScanEventKindWire::Failed,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        transfer_rpc_response_err_text(&resp),
+                    );
+                    let _ = send_transfer_scan_event_with_retry(
+                        api.as_ref(),
+                        master_id.as_str(),
+                        &mut assignment,
+                        &failed,
+                    );
+                    break;
+                }
+            };
         let (events, continue_locally, next_seq_no_after_events) =
             build_transfer_scan_events_for_result(&assignment, next_event_seq_no, result);
         next_event_seq_no = next_seq_no_after_events;
@@ -2922,17 +2942,14 @@ impl TransferScanRegistryHandle {
         let assignment2 = assignment.clone();
         let thread_name = format!("fluxon_fs_transfer_scan_{}", assignment.scan_task_id);
         match thread::Builder::new().name(thread_name).spawn(move || {
-            run_transfer_scan_background_task(
-                registry,
-                api2,
-                master_id2,
-                exports2,
-                assignment2,
-            );
+            run_transfer_scan_background_task(registry, api2, master_id2, exports2, assignment2);
         }) {
             Ok(_) => Ok(FluxonFsTransferScanLaunchResultWire::started()),
             Err(err) => {
-                self.state.lock().tasks.remove(assignment.scan_task_id.as_str());
+                self.state
+                    .lock()
+                    .tasks
+                    .remove(assignment.scan_task_id.as_str());
                 Err(resp_err_kverr(KvError::Api(ApiError::Unknown {
                     detail: format!(
                         "spawn transfer scan thread failed: scan_task_id={} err={}",
@@ -3006,22 +3023,16 @@ impl TransferWorkerRegistryHandle {
         let master_id2 = master_id.to_string();
         let exports2 = exports.clone();
         let assignment2 = assignment.clone();
-        let thread_name = format!(
-            "fluxon_fs_transfer_worker_{}",
-            assignment.worker_task_id
-        );
+        let thread_name = format!("fluxon_fs_transfer_worker_{}", assignment.worker_task_id);
         match thread::Builder::new().name(thread_name).spawn(move || {
-            run_transfer_worker_background_task(
-                registry,
-                api2,
-                master_id2,
-                exports2,
-                assignment2,
-            );
+            run_transfer_worker_background_task(registry, api2, master_id2, exports2, assignment2);
         }) {
             Ok(_) => Ok(FluxonFsTransferWorkerLaunchResultWire::started()),
             Err(err) => {
-                self.state.lock().tasks.remove(assignment.worker_task_id.as_str());
+                self.state
+                    .lock()
+                    .tasks
+                    .remove(assignment.worker_task_id.as_str());
                 Err(resp_err_kverr(KvError::Api(ApiError::Unknown {
                     detail: format!(
                         "spawn transfer worker thread failed: worker_task_id={} err={}",
@@ -3298,10 +3309,7 @@ fn send_transfer_worker_result_once(
             detail: format!("serialize transfer worker result failed: {}", e),
         })))
     })?;
-    let payload = FlatDict::from([(
-        "result_json".to_string(),
-        FlatValue::String(result_json),
-    )]);
+    let payload = FlatDict::from([("result_json".to_string(), FlatValue::String(result_json))]);
     let resp = api
         .rpc_client()
         .call(
@@ -3396,7 +3404,10 @@ fn open_transfer_read_stream_via_rpc_once(
             "relpath".to_string(),
             FlatValue::String(file.relpath.clone()),
         ),
-        ("initial_offset".to_string(), FlatValue::Int64(initial_offset)),
+        (
+            "initial_offset".to_string(),
+            FlatValue::Int64(initial_offset),
+        ),
     ]);
     let resp = api
         .rpc_client()
@@ -3518,25 +3529,25 @@ impl TransferWorkerRemoteControl {
         loop {
             self.before_heartbeat_retry_attempt()?;
             let current_materialized_empty_dirs = self.progress.total_materialized_empty_dirs();
-            match self
-                .heartbeat
-                .ensure_continue(
-                    force,
-                    current_materialized_empty_dirs,
-                    |heartbeat_unix_ms, _heartbeat_detail| {
-                        let progress_snapshot =
-                            self.progress.snapshot(chrono::Utc::now().timestamp_millis());
-                        let telemetry =
-                            Some(transfer_worker_telemetry_from_progress_snapshot(&progress_snapshot));
-                        send_transfer_worker_heartbeat_once(
-                            self.api.as_ref(),
-                            self.master_id.as_str(),
-                            &self.assignment,
-                            heartbeat_unix_ms,
-                            telemetry,
-                        )
-                    },
-                ) {
+            match self.heartbeat.ensure_continue(
+                force,
+                current_materialized_empty_dirs,
+                |heartbeat_unix_ms, _heartbeat_detail| {
+                    let progress_snapshot = self
+                        .progress
+                        .snapshot(chrono::Utc::now().timestamp_millis());
+                    let telemetry = Some(transfer_worker_telemetry_from_progress_snapshot(
+                        &progress_snapshot,
+                    ));
+                    send_transfer_worker_heartbeat_once(
+                        self.api.as_ref(),
+                        self.master_id.as_str(),
+                        &self.assignment,
+                        heartbeat_unix_ms,
+                        telemetry,
+                    )
+                },
+            ) {
                 Ok(()) => return Ok(()),
                 Err(TransferWorkerHeartbeatGateError::Terminal(err)) => return Err(err),
                 Err(TransferWorkerHeartbeatGateError::Retryable {
@@ -3631,10 +3642,7 @@ impl TransferWorkerRemoteControl {
         )
     }
 
-    fn close_stream_with_retry(
-        &self,
-        stream_id: &str,
-    ) -> Result<(), TransferWorkerExecutionError> {
+    fn close_stream_with_retry(&self, stream_id: &str) -> Result<(), TransferWorkerExecutionError> {
         let api = self.api.clone();
         let assignment = self.assignment.clone();
         let op_detail = format!(
@@ -3744,9 +3752,9 @@ impl TransferWorkerRemoteControl {
         if ack.accepted {
             return Ok(());
         }
-        Err(TransferWorkerExecutionError::Stop(stop_reason_or_superseded(
-            ack.stop_reason,
-        )))
+        Err(TransferWorkerExecutionError::Stop(
+            stop_reason_or_superseded(ack.stop_reason),
+        ))
     }
 }
 
@@ -3825,10 +3833,12 @@ impl TransferWorkerHeartbeatGate {
         mut heartbeat_op: HeartbeatOp,
     ) -> Result<(), TransferWorkerHeartbeatGateError>
     where
-        HeartbeatOp: FnMut(
-            i64,
-            &'static str,
-        ) -> Result<FluxonFsTransferWorkerHeartbeatResultWire, TransferWorkerRpcFailure>,
+        HeartbeatOp:
+            FnMut(
+                i64,
+                &'static str,
+            )
+                -> Result<FluxonFsTransferWorkerHeartbeatResultWire, TransferWorkerRpcFailure>,
     {
         loop {
             let (heartbeat_unix_ms, heartbeat_detail) = {
@@ -3875,15 +3885,13 @@ impl TransferWorkerHeartbeatGate {
             state.heartbeat_inflight = false;
             let result = match heartbeat_result {
                 Ok(heartbeat_result) if heartbeat_result.continue_running => {
-                    state.last_heartbeat_completed_unix_ms =
-                        chrono::Utc::now().timestamp_millis();
+                    state.last_heartbeat_completed_unix_ms = chrono::Utc::now().timestamp_millis();
                     state.last_heartbeat_materialized_empty_dirs = current_materialized_empty_dirs;
                     state.granted_lease_expire_unix_ms = heartbeat_result.lease_expire_unix_ms;
                     Ok(())
                 }
                 Ok(heartbeat_result) => {
-                    state.last_heartbeat_completed_unix_ms =
-                        chrono::Utc::now().timestamp_millis();
+                    state.last_heartbeat_completed_unix_ms = chrono::Utc::now().timestamp_millis();
                     state.last_heartbeat_materialized_empty_dirs = current_materialized_empty_dirs;
                     let reason = stop_reason_or_superseded(heartbeat_result.stop_reason);
                     state.terminal_state =
@@ -3933,7 +3941,8 @@ fn run_transfer_worker_background_task(
     ));
     let dedup_expire_unix_ms = match control.ensure_continue(true) {
         Ok(()) => {
-            let dst_export_root = match exports.export_root_dir_abs(assignment.dst_export.as_str()) {
+            let dst_export_root = match exports.export_root_dir_abs(assignment.dst_export.as_str())
+            {
                 Ok(v) => v,
                 Err(err) => {
                     tracing::warn!(
@@ -3996,7 +4005,9 @@ fn run_transfer_worker_background_task(
                 },
                 {
                     let control = control.clone();
-                    move |file, read_offset, length| control.read_chunk_with_retry(file, read_offset, length)
+                    move |file, read_offset, length| {
+                        control.read_chunk_with_retry(file, read_offset, length)
+                    }
                 },
             ) {
                 Ok(result) => {
@@ -4004,33 +4015,37 @@ fn run_transfer_worker_background_task(
                     if let Err(resp) =
                         cleanup_transfer_worker_attempt_artifacts(&dst_root, &assignment)
                     {
-                        log_transfer_worker_cleanup_failure("before_result_submit", &assignment, &resp);
+                        log_transfer_worker_cleanup_failure(
+                            "before_result_submit",
+                            &assignment,
+                            &resp,
+                        );
                     }
                     match control.submit_result_with_retry(&result) {
-                    Ok(()) => control.dedup_expire_unix_ms(),
-                    Err(TransferWorkerExecutionError::Stop(reason)) => {
-                        tracing::info!(
-                            "transfer worker result submission stopped: job_id={} batch_id={} worker_id={} worker_task_id={} reason={:?}",
-                            assignment.job_id,
-                            assignment.batch_id,
-                            assignment.worker_id,
-                            assignment.worker_task_id,
-                            reason
-                        );
-                        control.dedup_expire_unix_ms()
+                        Ok(()) => control.dedup_expire_unix_ms(),
+                        Err(TransferWorkerExecutionError::Stop(reason)) => {
+                            tracing::info!(
+                                "transfer worker result submission stopped: job_id={} batch_id={} worker_id={} worker_task_id={} reason={:?}",
+                                assignment.job_id,
+                                assignment.batch_id,
+                                assignment.worker_id,
+                                assignment.worker_task_id,
+                                reason
+                            );
+                            control.dedup_expire_unix_ms()
+                        }
+                        Err(TransferWorkerExecutionError::Fatal(resp)) => {
+                            tracing::warn!(
+                                "transfer worker result submission failed: job_id={} batch_id={} worker_id={} worker_task_id={} resp={:?}",
+                                assignment.job_id,
+                                assignment.batch_id,
+                                assignment.worker_id,
+                                assignment.worker_task_id,
+                                resp
+                            );
+                            control.dedup_expire_unix_ms()
+                        }
                     }
-                    Err(TransferWorkerExecutionError::Fatal(resp)) => {
-                        tracing::warn!(
-                            "transfer worker result submission failed: job_id={} batch_id={} worker_id={} worker_task_id={} resp={:?}",
-                            assignment.job_id,
-                            assignment.batch_id,
-                            assignment.worker_id,
-                            assignment.worker_task_id,
-                            resp
-                        );
-                        control.dedup_expire_unix_ms()
-                    }
-                }
                 }
                 Err(TransferWorkerExecutionError::Stop(reason)) => {
                     control.close_all_streams();
@@ -4054,10 +4069,13 @@ fn run_transfer_worker_background_task(
                     if let Err(cleanup_resp) =
                         cleanup_transfer_worker_attempt_artifacts(&dst_root, &assignment)
                     {
-                        log_transfer_worker_cleanup_failure("after_fatal", &assignment, &cleanup_resp);
+                        log_transfer_worker_cleanup_failure(
+                            "after_fatal",
+                            &assignment,
+                            &cleanup_resp,
+                        );
                     }
-                    if let Some((fatal_kind, fatal_message)) =
-                        classify_transfer_worker_fatal(&resp)
+                    if let Some((fatal_kind, fatal_message)) = classify_transfer_worker_fatal(&resp)
                     {
                         match report_transfer_worker_fatal_once(
                             control.api.as_ref(),
@@ -4107,15 +4125,25 @@ fn run_transfer_worker_background_task(
             }
         }
         Err(TransferWorkerExecutionError::Stop(reason)) => {
-            let dst_export_root = exports.export_root_dir_abs(assignment.dst_export.as_str()).ok();
+            let dst_export_root = exports
+                .export_root_dir_abs(assignment.dst_export.as_str())
+                .ok();
             let dst_root = dst_export_root.and_then(|dst_export_root| {
-                safe_join_root(dst_export_root.as_str(), assignment.dst_root_relpath.as_str())
-                    .ok()
-                    .map(PathBuf::from)
+                safe_join_root(
+                    dst_export_root.as_str(),
+                    assignment.dst_root_relpath.as_str(),
+                )
+                .ok()
+                .map(PathBuf::from)
             });
             if let Some(dst_root) = dst_root {
-                if let Err(resp) = cleanup_transfer_worker_attempt_artifacts(&dst_root, &assignment) {
-                    log_transfer_worker_cleanup_failure("before_execution_stop", &assignment, &resp);
+                if let Err(resp) = cleanup_transfer_worker_attempt_artifacts(&dst_root, &assignment)
+                {
+                    log_transfer_worker_cleanup_failure(
+                        "before_execution_stop",
+                        &assignment,
+                        &resp,
+                    );
                 }
             }
             tracing::info!(
@@ -4129,11 +4157,16 @@ fn run_transfer_worker_background_task(
             control.dedup_expire_unix_ms()
         }
         Err(TransferWorkerExecutionError::Fatal(resp)) => {
-            let dst_export_root = exports.export_root_dir_abs(assignment.dst_export.as_str()).ok();
+            let dst_export_root = exports
+                .export_root_dir_abs(assignment.dst_export.as_str())
+                .ok();
             let dst_root = dst_export_root.and_then(|dst_export_root| {
-                safe_join_root(dst_export_root.as_str(), assignment.dst_root_relpath.as_str())
-                    .ok()
-                    .map(PathBuf::from)
+                safe_join_root(
+                    dst_export_root.as_str(),
+                    assignment.dst_root_relpath.as_str(),
+                )
+                .ok()
+                .map(PathBuf::from)
             });
             if let Some(dst_root) = dst_root {
                 if let Err(cleanup_resp) =
@@ -4509,7 +4542,9 @@ fn plan_transfer_subtree_batches(
             total_bytes: 0,
             root_is_empty: true,
             mergeable_empty_dir_count: 1,
-            mergeable_empty_dir_estimated_bytes: estimate_empty_dir_manifest_entry_bytes(root_relpath),
+            mergeable_empty_dir_estimated_bytes: estimate_empty_dir_manifest_entry_bytes(
+                root_relpath,
+            ),
             direct_files_only_batches: Vec::new(),
             full_dir_batches: Vec::new(),
             child_scan_units: Vec::new(),
@@ -4540,8 +4575,7 @@ fn plan_transfer_subtree_batches(
                 let child_empty_dir_count = child_plan.mergeable_empty_dir_count;
                 let child_empty_dir_estimated_bytes =
                     child_plan.mergeable_empty_dir_estimated_bytes;
-                if mergeable_empty_dir_count
-                    .saturating_add(child_empty_dir_count)
+                if mergeable_empty_dir_count.saturating_add(child_empty_dir_count)
                     > TRANSFER_MERGEABLE_EMPTY_DIR_BUDGET
                     || mergeable_empty_dir_estimated_bytes
                         .saturating_add(child_empty_dir_estimated_bytes)
@@ -4716,7 +4750,11 @@ fn build_root_direct_files_only_batch_from_entries(
 }
 
 fn sort_transfer_scan_batches(batches: &mut [FluxonFsTransferScanBatchWire]) {
-    batches.sort_by(|a, b| a.root_relpath.cmp(&b.root_relpath).then(a.batch_id.cmp(&b.batch_id)));
+    batches.sort_by(|a, b| {
+        a.root_relpath
+            .cmp(&b.root_relpath)
+            .then(a.batch_id.cmp(&b.batch_id))
+    });
 }
 
 fn build_full_dir_batch_for_mergeable_subtree(
@@ -4750,14 +4788,12 @@ fn build_transfer_scan_result_for_subtree_streaming_root_dir_abs(
     root_dir_abs: &str,
     assignment: &FluxonFsTransferScanAssignmentWire,
 ) -> Result<FluxonFsTransferScanResultWire, FlatDict> {
-    let Some(mut session) = take_transfer_subtree_streaming_session(root_dir_abs, assignment)? else {
+    let Some(mut session) = take_transfer_subtree_streaming_session(root_dir_abs, assignment)?
+    else {
         return Ok(build_finished_empty_subtree_stream_result(assignment));
     };
     loop {
-        if session
-            .dir_stack
-            .is_empty()
-        {
+        if session.dir_stack.is_empty() {
             let mut full_dir_batches = Vec::new();
             if let Some(batch) = flush_pending_subtree_stream_batch(assignment, &mut session)? {
                 full_dir_batches.push(batch);
@@ -4776,7 +4812,9 @@ fn build_transfer_scan_result_for_subtree_streaming_root_dir_abs(
                 finished: true,
             });
         }
-        if TransferScanDeadline::from_assignment(assignment).is_some_and(|deadline| deadline.reached()) {
+        if TransferScanDeadline::from_assignment(assignment)
+            .is_some_and(|deadline| deadline.reached())
+        {
             let mut full_dir_batches = Vec::new();
             if let Some(batch) = flush_pending_subtree_stream_batch(assignment, &mut session)? {
                 full_dir_batches.push(batch);
@@ -4808,7 +4846,10 @@ fn build_transfer_scan_result_for_subtree_streaming_root_dir_abs(
             if should_flush_subtree_stream_batch(
                 assignment.batch_ready_bytes,
                 session.pending_bytes,
-                session.pending_files.len().saturating_add(session.pending_symlink_notices.len()),
+                session
+                    .pending_files
+                    .len()
+                    .saturating_add(session.pending_symlink_notices.len()),
                 session.pending_empty_dirs.len(),
             ) {
                 let batch = flush_pending_subtree_stream_batch(assignment, &mut session)?.unwrap();
@@ -4865,22 +4906,30 @@ fn build_transfer_scan_result_for_subtree_streaming_root_dir_abs(
                 });
         } else if md.is_dir() {
             frame.saw_visible_child = true;
-            session.dir_stack.push(open_transfer_subtree_streaming_dir_frame(
-                child_path,
-                child_relpath,
-            )?);
+            session
+                .dir_stack
+                .push(open_transfer_subtree_streaming_dir_frame(
+                    child_path,
+                    child_relpath,
+                )?);
         } else if md.is_file() {
             frame.saw_visible_child = true;
             let size = md.len().min(i64::MAX as u64) as i64;
             session.pending_bytes = session.pending_bytes.saturating_add(size);
             session
                 .pending_files
-                .push(FluxonFsTransferScanFrontierEntry { relpath: child_relpath, size });
+                .push(FluxonFsTransferScanFrontierEntry {
+                    relpath: child_relpath,
+                    size,
+                });
         }
         if should_flush_subtree_stream_batch(
             assignment.batch_ready_bytes,
             session.pending_bytes,
-            session.pending_files.len().saturating_add(session.pending_symlink_notices.len()),
+            session
+                .pending_files
+                .len()
+                .saturating_add(session.pending_symlink_notices.len()),
             session.pending_empty_dirs.len(),
         ) {
             let batch = flush_pending_subtree_stream_batch(assignment, &mut session)?.unwrap();
@@ -4928,11 +4977,12 @@ pub(crate) fn build_transfer_scan_result_for_root_dir_abs(
         );
     }
     let deadline = TransferScanDeadline::from_assignment(assignment);
-    let root_listing = match collect_transfer_root_dir_listing_slice(root_dir_abs, assignment, deadline)? {
-        TransferRootDirListingOutcome::Complete(v) => v,
-        TransferRootDirListingOutcome::Finished(result) => return Ok(result),
-        TransferRootDirListingOutcome::Partial(result) => return Ok(result),
-    };
+    let root_listing =
+        match collect_transfer_root_dir_listing_slice(root_dir_abs, assignment, deadline)? {
+            TransferRootDirListingOutcome::Complete(v) => v,
+            TransferRootDirListingOutcome::Finished(result) => return Ok(result),
+            TransferRootDirListingOutcome::Partial(result) => return Ok(result),
+        };
     let mut direct_files = root_listing.direct_files;
     let mut direct_symlink_notices = root_listing.direct_symlink_notices;
     let mut direct_empty_dirs = root_listing.direct_empty_dirs;
@@ -4976,7 +5026,10 @@ pub(crate) fn build_transfer_scan_result_for_root_dir_abs(
         if (!direct_files.is_empty()
             || !direct_symlink_notices.is_empty()
             || !direct_empty_dirs.is_empty())
-            && !direct_files_only_disposition_covers_root(assignment, assignment.root_relpath.as_str())
+            && !direct_files_only_disposition_covers_root(
+                assignment,
+                assignment.root_relpath.as_str(),
+            )
         {
             let mut next_partition_index = root_listing.emitted_direct_files_batch_count;
             direct_files_only_batches.extend(build_partitioned_root_direct_files_only_batches(
@@ -4987,17 +5040,15 @@ pub(crate) fn build_transfer_scan_result_for_root_dir_abs(
                 direct_empty_dirs.clone(),
             )?);
         }
-        child_scan_units.extend(
-            direct_dirs[delegated_child_scan_unit_count..]
-                .iter()
-                .map(|entry| {
-                    new_child_scan_unit(
-                        entry.relpath.clone(),
-                        assignment.generation + 1,
-                        delegated_child_scan_mode(),
-                    )
-                }),
-        );
+        child_scan_units.extend(direct_dirs[delegated_child_scan_unit_count..].iter().map(
+            |entry| {
+                new_child_scan_unit(
+                    entry.relpath.clone(),
+                    assignment.generation + 1,
+                    delegated_child_scan_mode(),
+                )
+            },
+        ));
         child_scan_units.sort_by(|a, b| a.root_relpath.cmp(&b.root_relpath));
         sort_transfer_scan_batches(&mut direct_files_only_batches);
         return Ok(FluxonFsTransferScanResultWire {
@@ -5027,7 +5078,8 @@ pub(crate) fn build_transfer_scan_result_for_root_dir_abs(
     let mut root_partitioned = root_listing.emitted_direct_files_batch_count > 0
         || direct_files_only_disposition_covers_root(assignment, assignment.root_relpath.as_str());
     let mut mergeable_empty_dir_count = direct_empty_dirs.len();
-    let mut mergeable_empty_dir_estimated_bytes = estimate_empty_dir_manifest_bytes(&direct_empty_dirs);
+    let mut mergeable_empty_dir_estimated_bytes =
+        estimate_empty_dir_manifest_bytes(&direct_empty_dirs);
     for child_relpath in direct_dirs.iter().map(|entry| entry.relpath.clone()) {
         let child_plan = plan_transfer_subtree_batches(
             root_dir_abs,
@@ -5043,8 +5095,7 @@ pub(crate) fn build_transfer_scan_result_for_root_dir_abs(
                 let child_empty_dir_count = child_plan.mergeable_empty_dir_count;
                 let child_empty_dir_estimated_bytes =
                     child_plan.mergeable_empty_dir_estimated_bytes;
-                if mergeable_empty_dir_count
-                    .saturating_add(child_empty_dir_count)
+                if mergeable_empty_dir_count.saturating_add(child_empty_dir_count)
                     > TRANSFER_MERGEABLE_EMPTY_DIR_BUDGET
                     || mergeable_empty_dir_estimated_bytes
                         .saturating_add(child_empty_dir_estimated_bytes)
@@ -5083,7 +5134,10 @@ pub(crate) fn build_transfer_scan_result_for_root_dir_abs(
         if (!direct_files.is_empty()
             || !direct_symlink_notices.is_empty()
             || !mergeable_empty_child_relpaths.is_empty())
-            && !direct_files_only_disposition_covers_root(assignment, assignment.root_relpath.as_str())
+            && !direct_files_only_disposition_covers_root(
+                assignment,
+                assignment.root_relpath.as_str(),
+            )
         {
             let mut next_partition_index = root_listing.emitted_direct_files_batch_count;
             direct_empty_dirs.extend(mergeable_empty_child_relpaths);
@@ -5212,10 +5266,11 @@ fn handle_transfer_scan_assignment(
         assignment.generation,
         assignment.known_dispositions.len(),
     );
-    let result = match build_transfer_scan_result_for_root_dir_abs(root_dir_abs.as_str(), &assignment) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let result =
+        match build_transfer_scan_result_for_root_dir_abs(root_dir_abs.as_str(), &assignment) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     encode_transfer_scan_result(&result, "transfer scan result")
 }
 
@@ -5228,8 +5283,11 @@ fn prepare_transfer_file_streaming<ReadChunkFn, CheckpointFn>(
     coordinator: &TransferWorkerCoordinator<ReadChunkFn, CheckpointFn>,
 ) -> Result<PreparedTransferFile, TransferWorkerExecutionError>
 where
-    ReadChunkFn:
-        Fn(&FluxonFsTransferManifestEntryWire, i64, i64) -> Result<Vec<u8>, TransferWorkerExecutionError>,
+    ReadChunkFn: Fn(
+        &FluxonFsTransferManifestEntryWire,
+        i64,
+        i64,
+    ) -> Result<Vec<u8>, TransferWorkerExecutionError>,
     CheckpointFn: Fn() -> Result<(), TransferWorkerExecutionError>,
 {
     let staging_relpath = transfer_staging_file_relpath(staging_prefix, file.relpath.as_str())
@@ -5239,9 +5297,12 @@ where
         .map_err(TransferWorkerExecutionError::fatal)?;
     ensure_transfer_parent_dirs(dst_root, final_relpath.as_str())
         .map_err(TransferWorkerExecutionError::fatal)?;
-    let staging_abs = safe_join_root(dst_root.to_string_lossy().as_ref(), staging_relpath.as_str())
-        .map_err(resp_err_kverr)
-        .map_err(TransferWorkerExecutionError::fatal)?;
+    let staging_abs = safe_join_root(
+        dst_root.to_string_lossy().as_ref(),
+        staging_relpath.as_str(),
+    )
+    .map_err(resp_err_kverr)
+    .map_err(TransferWorkerExecutionError::fatal)?;
     let mut dst_file = open_create_file_with_parent_dir_chmod_retry(&staging_abs)
         .map_err(TransferWorkerExecutionError::fatal)?;
     dst_file
@@ -5254,14 +5315,14 @@ where
         let remaining = file.size.saturating_sub(copied);
         let chunk = coordinator.read_chunk(file, copied, remaining.min(CHUNK_BYTES as i64))?;
         if chunk.is_empty() {
-            return Err(TransferWorkerExecutionError::fatal(resp_err_kverr(KvError::Api(
-                ApiError::InvalidArgument {
+            return Err(TransferWorkerExecutionError::fatal(resp_err_kverr(
+                KvError::Api(ApiError::InvalidArgument {
                     detail: format!(
                         "transfer worker source ended before expected size: relpath={} expected={} copied={}",
                         file.relpath, file.size, copied
                     ),
-                },
-            ))));
+                }),
+            )));
         }
         dst_file
             .write_all(&chunk)
@@ -5271,13 +5332,14 @@ where
         coordinator.record_written_bytes(chunk.len() as i64);
     }
     if copied != file.size {
-        return Err(TransferWorkerExecutionError::fatal(resp_err_kverr(KvError::Api(
-            ApiError::InvalidArgument {
-            detail: format!(
-                "transfer worker size mismatch before staging completion: relpath={} expected={} actual={}",
-                file.relpath, file.size, copied
-            ),
-        }))));
+        return Err(TransferWorkerExecutionError::fatal(resp_err_kverr(
+            KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "transfer worker size mismatch before staging completion: relpath={} expected={} actual={}",
+                    file.relpath, file.size, copied
+                ),
+            }),
+        )));
     }
     // The staged file is still invisible at this point, so one more checkpoint
     // keeps supersession able to stop the worker before any later visible
@@ -5302,48 +5364,57 @@ fn execute_transfer_single_file<ReadChunkFn, CheckpointFn>(
     coordinator: &TransferWorkerCoordinator<ReadChunkFn, CheckpointFn>,
 ) -> Result<TransferWorkerLaneOutcome, TransferWorkerExecutionError>
 where
-    ReadChunkFn:
-        Fn(&FluxonFsTransferManifestEntryWire, i64, i64) -> Result<Vec<u8>, TransferWorkerExecutionError>,
+    ReadChunkFn: Fn(
+        &FluxonFsTransferManifestEntryWire,
+        i64,
+        i64,
+    ) -> Result<Vec<u8>, TransferWorkerExecutionError>,
     CheckpointFn: Fn() -> Result<(), TransferWorkerExecutionError>,
 {
     coordinator.checkpoint_continue()?;
-    let prepared = match prepare_transfer_file_streaming(dst_root, staging_prefix, file, coordinator) {
-        Ok(v) => v,
-        Err(TransferWorkerExecutionError::Fatal(resp)) => {
-            if let Some(failed) = classify_transfer_failed_file(file, &resp) {
-                let staging_relpath =
-                    transfer_staging_file_relpath(staging_prefix, file.relpath.as_str())
-                        .map_err(TransferWorkerExecutionError::fatal)?;
-                let staging_abs = safe_join_root(
-                    dst_root.to_string_lossy().as_ref(),
-                    staging_relpath.as_str(),
-                )
-                .map_err(resp_err_kverr)
-                .map_err(TransferWorkerExecutionError::fatal)?;
-                match fs::remove_file(&staging_abs) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == ErrorKind::NotFound => {}
-                    Err(err) => return Err(TransferWorkerExecutionError::fatal(resp_err_io(err))),
+    let prepared =
+        match prepare_transfer_file_streaming(dst_root, staging_prefix, file, coordinator) {
+            Ok(v) => v,
+            Err(TransferWorkerExecutionError::Fatal(resp)) => {
+                if let Some(failed) = classify_transfer_failed_file(file, &resp) {
+                    let staging_relpath =
+                        transfer_staging_file_relpath(staging_prefix, file.relpath.as_str())
+                            .map_err(TransferWorkerExecutionError::fatal)?;
+                    let staging_abs = safe_join_root(
+                        dst_root.to_string_lossy().as_ref(),
+                        staging_relpath.as_str(),
+                    )
+                    .map_err(resp_err_kverr)
+                    .map_err(TransferWorkerExecutionError::fatal)?;
+                    match fs::remove_file(&staging_abs) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(TransferWorkerExecutionError::fatal(resp_err_io(err)));
+                        }
+                    }
+                    return Ok(TransferWorkerLaneOutcome::Failed(
+                        TransferWorkerLaneFailedFileResult { result: failed },
+                    ));
                 }
-                return Ok(TransferWorkerLaneOutcome::Failed(
-                    TransferWorkerLaneFailedFileResult { result: failed },
-                ));
+                return Err(TransferWorkerExecutionError::Fatal(resp));
             }
-            return Err(TransferWorkerExecutionError::Fatal(resp));
-        }
-        Err(err) => return Err(err),
-    };
+            Err(err) => return Err(err),
+        };
     coordinator.checkpoint_continue()?;
-    let result = promote_prepared_transfer_file(dst_root, PreparedTransferFile {
-        staging_relpath: prepared.staging_relpath.clone(),
-        final_relpath: prepared.final_relpath.clone(),
-        visible_size: prepared.visible_size,
-    })
+    let result = promote_prepared_transfer_file(
+        dst_root,
+        PreparedTransferFile {
+            staging_relpath: prepared.staging_relpath.clone(),
+            final_relpath: prepared.final_relpath.clone(),
+            visible_size: prepared.visible_size,
+        },
+    )
     .map_err(TransferWorkerExecutionError::fatal);
     match result {
-        Ok(result) => Ok(TransferWorkerLaneOutcome::Visible(TransferWorkerLaneFileResult {
-            result,
-        })),
+        Ok(result) => Ok(TransferWorkerLaneOutcome::Visible(
+            TransferWorkerLaneFileResult { result },
+        )),
         Err(TransferWorkerExecutionError::Fatal(resp)) => {
             if let Some(failed) = classify_transfer_failed_file(file, &resp) {
                 let staging_abs = safe_join_root(
@@ -5374,8 +5445,11 @@ fn execute_transfer_empty_dir<ReadChunkFn, CheckpointFn>(
     coordinator: &TransferWorkerCoordinator<ReadChunkFn, CheckpointFn>,
 ) -> Result<TransferWorkerLaneOutcome, TransferWorkerExecutionError>
 where
-    ReadChunkFn:
-        Fn(&FluxonFsTransferManifestEntryWire, i64, i64) -> Result<Vec<u8>, TransferWorkerExecutionError>,
+    ReadChunkFn: Fn(
+        &FluxonFsTransferManifestEntryWire,
+        i64,
+        i64,
+    ) -> Result<Vec<u8>, TransferWorkerExecutionError>,
     CheckpointFn: Fn() -> Result<(), TransferWorkerExecutionError>,
 {
     coordinator.checkpoint_continue()?;
@@ -5393,11 +5467,14 @@ fn execute_transfer_worker_assignment_with_policy<ReadChunkFn, CheckpointFn>(
     read_chunk: ReadChunkFn,
 ) -> Result<FluxonFsTransferWorkerResultWire, TransferWorkerExecutionError>
 where
-    ReadChunkFn:
-        Fn(&FluxonFsTransferManifestEntryWire, i64, i64) -> Result<Vec<u8>, TransferWorkerExecutionError>
-            + Send
-            + Sync
-            + 'static,
+    ReadChunkFn: Fn(
+            &FluxonFsTransferManifestEntryWire,
+            i64,
+            i64,
+        ) -> Result<Vec<u8>, TransferWorkerExecutionError>
+        + Send
+        + Sync
+        + 'static,
     CheckpointFn: Fn() -> Result<(), TransferWorkerExecutionError> + Send + Sync + 'static,
 {
     let policy = policy.normalized();
@@ -5424,11 +5501,14 @@ fn execute_transfer_worker_assignment_with_policy_and_progress<ReadChunkFn, Chec
     read_chunk: ReadChunkFn,
 ) -> Result<FluxonFsTransferWorkerResultWire, TransferWorkerExecutionError>
 where
-    ReadChunkFn:
-        Fn(&FluxonFsTransferManifestEntryWire, i64, i64) -> Result<Vec<u8>, TransferWorkerExecutionError>
-            + Send
-            + Sync
-            + 'static,
+    ReadChunkFn: Fn(
+            &FluxonFsTransferManifestEntryWire,
+            i64,
+            i64,
+        ) -> Result<Vec<u8>, TransferWorkerExecutionError>
+        + Send
+        + Sync
+        + 'static,
     CheckpointFn: Fn() -> Result<(), TransferWorkerExecutionError> + Send + Sync + 'static,
 {
     create_dir_all_with_parent_dir_chmod_retry(dst_root)
@@ -5436,9 +5516,11 @@ where
     let manifest =
         FluxonFsTransferManifestWire::decode_from_blob(assignment.manifest_blob.as_slice())
             .map_err(|e| {
-                TransferWorkerExecutionError::fatal(resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
-                    detail: format!("decode transfer worker manifest failed: {}", e),
-                })))
+                TransferWorkerExecutionError::fatal(resp_err_kverr(KvError::Api(
+                    ApiError::InvalidArgument {
+                        detail: format!("decode transfer worker manifest failed: {}", e),
+                    },
+                )))
             })?;
     if transfer_manifest_is_empty_dirs_only_batch(&manifest, assignment.collect_infos.as_slice()) {
         // Empty-dir-only batches never generate byte-based ramp-up signals, so
@@ -5664,10 +5746,16 @@ fn promote_prepared_transfer_file(
     dst_root: &PathBuf,
     file: PreparedTransferFile,
 ) -> Result<FluxonFsTransferWorkerFileResultWire, FlatDict> {
-    let staging_abs = safe_join_root(dst_root.to_string_lossy().as_ref(), file.staging_relpath.as_str())
-        .map_err(resp_err_kverr)?;
-    let final_abs = safe_join_root(dst_root.to_string_lossy().as_ref(), file.final_relpath.as_str())
-        .map_err(resp_err_kverr)?;
+    let staging_abs = safe_join_root(
+        dst_root.to_string_lossy().as_ref(),
+        file.staging_relpath.as_str(),
+    )
+    .map_err(resp_err_kverr)?;
+    let final_abs = safe_join_root(
+        dst_root.to_string_lossy().as_ref(),
+        file.final_relpath.as_str(),
+    )
+    .map_err(resp_err_kverr)?;
     rename_with_dst_parent_dir_chmod_retry(&staging_abs, &final_abs)?;
     Ok(FluxonFsTransferWorkerFileResultWire {
         relpath: file.final_relpath.clone(),
@@ -5694,15 +5782,15 @@ fn prepare_transfer_collect_info_materialization(
                 ),
             }))
         })?;
-    let staging_relpath = transfer_collect_info_staging_relpath(
-        batch_id,
-        worker_task_id,
-        collect_info.collect_kind,
-    )?;
+    let staging_relpath =
+        transfer_collect_info_staging_relpath(batch_id, worker_task_id, collect_info.collect_kind)?;
     ensure_transfer_parent_dirs(dst_root, staging_relpath.as_str())?;
     ensure_transfer_parent_dirs(dst_root, output_relpath.as_str())?;
-    let staging_abs = safe_join_root(dst_root.to_string_lossy().as_ref(), staging_relpath.as_str())
-        .map_err(resp_err_kverr)?;
+    let staging_abs = safe_join_root(
+        dst_root.to_string_lossy().as_ref(),
+        staging_relpath.as_str(),
+    )
+    .map_err(resp_err_kverr)?;
     let mut dst_file = open_create_file_with_parent_dir_chmod_retry(&staging_abs)?;
     dst_file.set_len(0).map_err(resp_err_io)?;
     dst_file
@@ -5723,14 +5811,15 @@ fn transfer_collect_info_staging_relpath(
     worker_task_id: &str,
     collect_kind: FluxonFsTransferCollectInfoKind,
 ) -> Result<String, FlatDict> {
-    let output_relpath = transfer_collect_info_output_relpath(batch_id, collect_kind).map_err(|detail| {
-        resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
-            detail: format!(
-                "build transfer collect info output relpath failed: batch_id={} err={}",
-                batch_id, detail
-            ),
-        }))
-    })?;
+    let output_relpath =
+        transfer_collect_info_output_relpath(batch_id, collect_kind).map_err(|detail| {
+            resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "build transfer collect info output relpath failed: batch_id={} err={}",
+                    batch_id, detail
+                ),
+            }))
+        })?;
     Ok(format!("{}.{}.fluxon.part", output_relpath, worker_task_id))
 }
 
@@ -5750,9 +5839,12 @@ fn prune_empty_parent_dirs(mut current: PathBuf, root: &PathBuf) -> Result<(), F
     Ok(())
 }
 
-fn cleanup_attempt_staging_prefix(dst_root: &PathBuf, staging_prefix: &str) -> Result<(), FlatDict> {
-    let staging_abs =
-        safe_join_root(dst_root.to_string_lossy().as_ref(), staging_prefix).map_err(resp_err_kverr)?;
+fn cleanup_attempt_staging_prefix(
+    dst_root: &PathBuf,
+    staging_prefix: &str,
+) -> Result<(), FlatDict> {
+    let staging_abs = safe_join_root(dst_root.to_string_lossy().as_ref(), staging_prefix)
+        .map_err(resp_err_kverr)?;
     match fs::remove_dir_all(&staging_abs) {
         Ok(()) => {}
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
@@ -5865,7 +5957,8 @@ pub(crate) fn read_transfer_chunk_from_root_dir_abs(
         return Ok(Vec::new());
     }
     let to_read = std::cmp::min(length, size - offset) as usize;
-    f.seek(SeekFrom::Start(offset as u64)).map_err(resp_err_io)?;
+    f.seek(SeekFrom::Start(offset as u64))
+        .map_err(resp_err_io)?;
     let mut buf = vec![0u8; to_read];
     f.read_exact(&mut buf).map_err(resp_err_io)?;
     Ok(buf)
@@ -5881,11 +5974,14 @@ pub(crate) fn execute_transfer_worker_assignment<ReadChunkFn, CheckpointFn>(
     read_chunk: ReadChunkFn,
 ) -> Result<FluxonFsTransferWorkerResultWire, TransferWorkerExecutionError>
 where
-    ReadChunkFn:
-        Fn(&FluxonFsTransferManifestEntryWire, i64, i64) -> Result<Vec<u8>, TransferWorkerExecutionError>
-            + Send
-            + Sync
-            + 'static,
+    ReadChunkFn: Fn(
+            &FluxonFsTransferManifestEntryWire,
+            i64,
+            i64,
+        ) -> Result<Vec<u8>, TransferWorkerExecutionError>
+        + Send
+        + Sync
+        + 'static,
     CheckpointFn: Fn() -> Result<(), TransferWorkerExecutionError> + Send + Sync + 'static,
 {
     execute_transfer_worker_assignment_with_policy(
@@ -5943,12 +6039,19 @@ pub(super) fn handle_transfer_read(exports: &AgentExportsHandle, payload: FlatDi
         Ok(v) => v,
         Err(e) => return resp_err_kverr(e),
     };
-    let buf =
-        match read_transfer_chunk_from_root_dir_abs(root_dir_abs.as_str(), relpath.as_str(), offset, length) {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
-    resp_ok(BTreeMap::from([("data".to_string(), FlatValue::Bytes(buf))]))
+    let buf = match read_transfer_chunk_from_root_dir_abs(
+        root_dir_abs.as_str(),
+        relpath.as_str(),
+        offset,
+        length,
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    resp_ok(BTreeMap::from([(
+        "data".to_string(),
+        FlatValue::Bytes(buf),
+    )]))
 }
 
 pub(super) fn handle_transfer_stream_open(
@@ -6010,7 +6113,9 @@ pub(super) fn handle_transfer_worker(
         Err(resp) => return resp,
     };
     match registry.launch_task(api, master_id, exports, assignment) {
-        Ok(result) => encode_transfer_worker_launch_result(&result, "transfer worker launch result"),
+        Ok(result) => {
+            encode_transfer_worker_launch_result(&result, "transfer worker launch result")
+        }
         Err(resp) => resp,
     }
 }
@@ -6086,13 +6191,13 @@ mod tests {
             .collect()
     }
 
-    fn assert_all_child_scan_units_are_subtree_streaming(
-        result: &FluxonFsTransferScanResultWire,
-    ) {
-        assert!(result
-            .child_scan_units
-            .iter()
-            .all(|child| child.scan_mode == FluxonFsTransferScanMode::SubtreeStreaming));
+    fn assert_all_child_scan_units_are_subtree_streaming(result: &FluxonFsTransferScanResultWire) {
+        assert!(
+            result
+                .child_scan_units
+                .iter()
+                .all(|child| child.scan_mode == FluxonFsTransferScanMode::SubtreeStreaming)
+        );
     }
 
     fn ok_bool(resp: &FlatDict) -> bool {
@@ -6106,10 +6211,7 @@ mod tests {
                 panic!("unexpected open result fatal decode error: {:?}", other)
             }
             Err(TransferWorkerRpcFailure::Retryable { detail }) => {
-                panic!(
-                    "unexpected open result retryable decode error: {}",
-                    detail
-                )
+                panic!("unexpected open result retryable decode error: {}", detail)
             }
         }
     }
@@ -6121,10 +6223,7 @@ mod tests {
                 panic!("unexpected next result fatal decode error: {:?}", other)
             }
             Err(TransferWorkerRpcFailure::Retryable { detail }) => {
-                panic!(
-                    "unexpected next result retryable decode error: {}",
-                    detail
-                )
+                panic!("unexpected next result retryable decode error: {}", detail)
             }
         }
     }
@@ -6140,10 +6239,7 @@ mod tests {
             .collect()
     }
 
-    fn test_worker_assignment(
-        relpath: &str,
-        size: i64,
-    ) -> FluxonFsTransferWorkerAssignmentWire {
+    fn test_worker_assignment(relpath: &str, size: i64) -> FluxonFsTransferWorkerAssignmentWire {
         FluxonFsTransferWorkerAssignmentWire {
             job_id: "job".to_string(),
             batch_id: "batch".to_string(),
@@ -6158,12 +6254,13 @@ mod tests {
             root_relpath: ".".to_string(),
             staging_prefix: ".fluxon.stage/job/batch".to_string(),
             lease_expire_unix_ms: 0,
-            manifest_blob: build_transfer_manifest_blob(vec![
-                FluxonFsTransferScanFrontierEntry {
+            manifest_blob: build_transfer_manifest_blob(
+                vec![FluxonFsTransferScanFrontierEntry {
                     relpath: relpath.to_string(),
                     size,
-                },
-            ], Vec::new())
+                }],
+                Vec::new(),
+            )
             .unwrap(),
             collect_infos: Vec::new(),
         }
@@ -6183,7 +6280,11 @@ mod tests {
         read_chunk: ReadChunkFn,
     ) -> TransferWorkerCoordinator<ReadChunkFn, CheckpointFn>
     where
-        ReadChunkFn: Fn(&FluxonFsTransferManifestEntryWire, i64, i64) -> Result<Vec<u8>, TransferWorkerExecutionError>,
+        ReadChunkFn: Fn(
+            &FluxonFsTransferManifestEntryWire,
+            i64,
+            i64,
+        ) -> Result<Vec<u8>, TransferWorkerExecutionError>,
         CheckpointFn: Fn() -> Result<(), TransferWorkerExecutionError>,
     {
         let policy = Arc::new(TransferWorkerLanePolicy::production_default());
@@ -6217,16 +6318,19 @@ mod tests {
 
     #[test]
     fn build_transfer_manifest_blob_round_trips_entries() {
-        let blob = build_transfer_manifest_blob(vec![
-            FluxonFsTransferScanFrontierEntry {
-                relpath: "a".to_string(),
-                size: 1,
-            },
-            FluxonFsTransferScanFrontierEntry {
-                relpath: "b/c".to_string(),
-                size: 2,
-            },
-        ], vec!["empty".to_string()])
+        let blob = build_transfer_manifest_blob(
+            vec![
+                FluxonFsTransferScanFrontierEntry {
+                    relpath: "a".to_string(),
+                    size: 1,
+                },
+                FluxonFsTransferScanFrontierEntry {
+                    relpath: "b/c".to_string(),
+                    size: 2,
+                },
+            ],
+            vec!["empty".to_string()],
+        )
         .unwrap();
         let manifest = FluxonFsTransferManifestWire::decode_from_blob(&blob).unwrap();
         assert_eq!(manifest.entry_count, 2);
@@ -6250,11 +6354,12 @@ mod tests {
     #[test]
     fn materialize_transfer_collect_info_writes_task_scoped_staging_then_output_file() {
         let root = TempDir::new().unwrap();
-        let collect_infos = build_symlink_collect_infos(vec![FluxonFsTransferSymlinkNoticeEntryWire {
-            relpath: "root/link-file.bin".to_string(),
-            link_target: "target/file.bin".to_string(),
-        }])
-        .unwrap();
+        let collect_infos =
+            build_symlink_collect_infos(vec![FluxonFsTransferSymlinkNoticeEntryWire {
+                relpath: "root/link-file.bin".to_string(),
+                link_target: "target/file.bin".to_string(),
+            }])
+            .unwrap();
         let prepared = prepare_transfer_collect_info_materialization(
             &root.path().to_path_buf(),
             "batch-1",
@@ -6383,7 +6488,10 @@ mod tests {
             &exports,
             FlatDict::from([
                 ("export".to_string(), FlatValue::String("src".to_string())),
-                ("relpath".to_string(), FlatValue::String("f.bin".to_string())),
+                (
+                    "relpath".to_string(),
+                    FlatValue::String("f.bin".to_string()),
+                ),
                 ("offset".to_string(), FlatValue::Int64(2)),
                 ("length".to_string(), FlatValue::Int64(3)),
             ]),
@@ -6398,7 +6506,10 @@ mod tests {
             &exports,
             FlatDict::from([
                 ("export".to_string(), FlatValue::String("src".to_string())),
-                ("relpath".to_string(), FlatValue::String("f.bin".to_string())),
+                (
+                    "relpath".to_string(),
+                    FlatValue::String("f.bin".to_string()),
+                ),
                 ("offset".to_string(), FlatValue::Int64(6)),
                 ("length".to_string(), FlatValue::Int64(1)),
             ]),
@@ -6423,7 +6534,10 @@ mod tests {
             &exports,
             FlatDict::from([
                 ("export".to_string(), FlatValue::String("src".to_string())),
-                ("relpath".to_string(), FlatValue::String("f.bin".to_string())),
+                (
+                    "relpath".to_string(),
+                    FlatValue::String("f.bin".to_string()),
+                ),
                 ("offset".to_string(), FlatValue::Int64(1)),
                 ("length".to_string(), FlatValue::Int64(3)),
             ]),
@@ -6446,9 +6560,15 @@ mod tests {
             &exports,
             FlatDict::from([
                 ("export".to_string(), FlatValue::String("src".to_string())),
-                ("relpath".to_string(), FlatValue::String("f.bin".to_string())),
+                (
+                    "relpath".to_string(),
+                    FlatValue::String("f.bin".to_string()),
+                ),
                 ("offset".to_string(), FlatValue::Int64(0)),
-                ("length".to_string(), FlatValue::Int64(CHUNK_BYTES as i64 + 1)),
+                (
+                    "length".to_string(),
+                    FlatValue::Int64(CHUNK_BYTES as i64 + 1),
+                ),
             ]),
         );
         assert!(matches!(resp.get("ok"), Some(FlatValue::Bool(false))));
@@ -6470,7 +6590,10 @@ mod tests {
                     FlatValue::String("task-0".to_string()),
                 ),
                 ("export".to_string(), FlatValue::String("src".to_string())),
-                ("relpath".to_string(), FlatValue::String("f.bin".to_string())),
+                (
+                    "relpath".to_string(),
+                    FlatValue::String("f.bin".to_string()),
+                ),
                 ("initial_offset".to_string(), FlatValue::Int64(0)),
             ]),
         );
@@ -6551,7 +6674,10 @@ mod tests {
                     FlatValue::String("task-1".to_string()),
                 ),
                 ("export".to_string(), FlatValue::String("src".to_string())),
-                ("relpath".to_string(), FlatValue::String("f.bin".to_string())),
+                (
+                    "relpath".to_string(),
+                    FlatValue::String("f.bin".to_string()),
+                ),
                 ("initial_offset".to_string(), FlatValue::Int64(0)),
             ]),
         );
@@ -6584,7 +6710,10 @@ mod tests {
                 ("length".to_string(), FlatValue::Int64(2)),
             ]),
         );
-        assert!(matches!(invalid_resp.get("ok"), Some(FlatValue::Bool(false))));
+        assert!(matches!(
+            invalid_resp.get("ok"),
+            Some(FlatValue::Bool(false))
+        ));
     }
 
     #[test]
@@ -6603,7 +6732,10 @@ mod tests {
                     FlatValue::String("task-2".to_string()),
                 ),
                 ("export".to_string(), FlatValue::String("src".to_string())),
-                ("relpath".to_string(), FlatValue::String("f.bin".to_string())),
+                (
+                    "relpath".to_string(),
+                    FlatValue::String("f.bin".to_string()),
+                ),
                 ("initial_offset".to_string(), FlatValue::Int64(3)),
             ]),
         );
@@ -6647,7 +6779,10 @@ mod tests {
                     FlatValue::String("task-3".to_string()),
                 ),
                 ("export".to_string(), FlatValue::String("src".to_string())),
-                ("relpath".to_string(), FlatValue::String("f.bin".to_string())),
+                (
+                    "relpath".to_string(),
+                    FlatValue::String("f.bin".to_string()),
+                ),
                 ("initial_offset".to_string(), FlatValue::Int64(3)),
             ]),
         );
@@ -6718,7 +6853,10 @@ mod tests {
         let result = decode_result_json(&resp);
         assert!(result.finished);
         assert!(result.direct_files_only_batches.is_empty());
-        assert_eq!(child_scan_unit_roots(&result), vec!["root/child".to_string()]);
+        assert_eq!(
+            child_scan_unit_roots(&result),
+            vec!["root/child".to_string()]
+        );
         assert_all_child_scan_units_are_subtree_streaming(&result);
         assert!(result.full_dir_batches.is_empty());
     }
@@ -6781,7 +6919,8 @@ mod tests {
     }
 
     #[test]
-    fn handle_transfer_scan_assignment_groups_empty_children_into_direct_batch_without_direct_files() {
+    fn handle_transfer_scan_assignment_groups_empty_children_into_direct_batch_without_direct_files()
+     {
         let root = TempDir::new().unwrap();
         write_file(&root, "root/big/data.bin", b"12345");
         fs::create_dir_all(root.path().join("root/empty-a")).unwrap();
@@ -6814,9 +6953,10 @@ mod tests {
         assert_eq!(child_scan_unit_roots(&result), vec!["root/big".to_string()]);
         assert_all_child_scan_units_are_subtree_streaming(&result);
         assert!(result.full_dir_batches.is_empty());
-        let direct_manifest =
-            FluxonFsTransferManifestWire::decode_from_blob(&result.direct_files_only_batches[0].manifest_blob)
-                .unwrap();
+        let direct_manifest = FluxonFsTransferManifestWire::decode_from_blob(
+            &result.direct_files_only_batches[0].manifest_blob,
+        )
+        .unwrap();
         assert!(direct_manifest.entries.is_empty());
         assert_eq!(
             direct_manifest.empty_dir_relpaths,
@@ -6854,16 +6994,17 @@ mod tests {
         assert_eq!(result.direct_files_only_batches.len(), 1);
         assert_eq!(result.full_dir_batches.len(), 0);
         assert_eq!(result.child_scan_units.len(), 1);
-        assert_eq!(result.child_scan_units[0].root_relpath, "root/huge".to_string());
+        assert_eq!(
+            result.child_scan_units[0].root_relpath,
+            "root/huge".to_string()
+        );
         let manifest = FluxonFsTransferManifestWire::decode_from_blob(
             &result.direct_files_only_batches[0].manifest_blob,
         )
         .unwrap();
         assert!(manifest.entries.is_empty());
         assert!(!manifest.empty_dir_relpaths.is_empty());
-        assert!(
-            manifest.empty_dir_relpaths.len() <= TRANSFER_MERGEABLE_EMPTY_DIR_BUDGET
-        );
+        assert!(manifest.empty_dir_relpaths.len() <= TRANSFER_MERGEABLE_EMPTY_DIR_BUDGET);
         assert!(
             estimate_empty_dir_manifest_bytes(&manifest.empty_dir_relpaths)
                 <= TRANSFER_MERGEABLE_EMPTY_DIR_ESTIMATED_BYTES_BUDGET
@@ -6879,10 +7020,10 @@ mod tests {
             ))
             + 1;
         for idx in 0..child_count {
-            fs::create_dir_all(root.path().join(format!(
-                "root/branch-{idx:05}/{}",
-                "x".repeat(200)
-            )))
+            fs::create_dir_all(
+                root.path()
+                    .join(format!("root/branch-{idx:05}/{}", "x".repeat(200))),
+            )
             .unwrap();
         }
         let result = build_transfer_scan_result_for_root_dir_abs(
@@ -6908,10 +7049,12 @@ mod tests {
         assert!(!result.finished);
         assert!(result.direct_files_only_batches.is_empty());
         assert!(!result.child_scan_units.is_empty());
-        assert!(result
-            .child_scan_units
-            .iter()
-            .any(|child| child.scan_mode == FluxonFsTransferScanMode::FullTree));
+        assert!(
+            result
+                .child_scan_units
+                .iter()
+                .any(|child| child.scan_mode == FluxonFsTransferScanMode::FullTree)
+        );
         assert!(result.child_scan_units.iter().all(|child| {
             child.scan_mode == FluxonFsTransferScanMode::FullTree
                 || child.scan_mode == FluxonFsTransferScanMode::SubtreeStreaming
@@ -6963,10 +7106,16 @@ mod tests {
         assert!(!continue_locally);
         assert_eq!(next_event_seq_no, 9);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_kind, FluxonFsTransferScanEventKindWire::Append);
+        assert_eq!(
+            events[0].event_kind,
+            FluxonFsTransferScanEventKindWire::Append
+        );
         assert_eq!(events[0].event_seq_no, 7);
         assert_eq!(events[0].full_dir_batches.len(), 1);
-        assert_eq!(events[1].event_kind, FluxonFsTransferScanEventKindWire::Finished);
+        assert_eq!(
+            events[1].event_kind,
+            FluxonFsTransferScanEventKindWire::Finished
+        );
         assert_eq!(events[1].event_seq_no, 8);
         assert!(events[1].direct_files_only_batches.is_empty());
         assert!(events[1].child_scan_units.is_empty());
@@ -6997,17 +7146,21 @@ mod tests {
             skip_entries: Vec::new(),
         };
 
-        let first = build_transfer_scan_result_for_root_dir_abs(
-            root.path().to_str().unwrap(),
-            &assignment,
-        )
-        .unwrap();
+        let first =
+            build_transfer_scan_result_for_root_dir_abs(root.path().to_str().unwrap(), &assignment)
+                .unwrap();
         assert!(!first.finished);
         assert!(!first.direct_files_only_batches.is_empty());
         assert!(first.full_dir_batches.is_empty());
         assert_eq!(first.child_scan_units.len(), 1);
-        assert_eq!(first.child_scan_units[0].scan_unit_id, assignment.scan_unit_id);
-        assert_eq!(first.child_scan_units[0].root_relpath, assignment.root_relpath);
+        assert_eq!(
+            first.child_scan_units[0].scan_unit_id,
+            assignment.scan_unit_id
+        );
+        assert_eq!(
+            first.child_scan_units[0].root_relpath,
+            assignment.root_relpath
+        );
         assert_eq!(first.child_scan_units[0].generation, assignment.generation);
         let first_entry_count = first
             .direct_files_only_batches
@@ -7019,7 +7172,10 @@ mod tests {
                     .len()
             })
             .sum::<usize>();
-        assert_eq!(first_entry_count, TRANSFER_SCAN_ROOT_LISTING_SLICE_ENTRY_LIMIT);
+        assert_eq!(
+            first_entry_count,
+            TRANSFER_SCAN_ROOT_LISTING_SLICE_ENTRY_LIMIT
+        );
 
         let second_assignment = FluxonFsTransferScanAssignmentWire {
             scan_task_id: "task-2".to_string(),
@@ -7086,7 +7242,8 @@ mod tests {
     }
 
     #[test]
-    fn build_transfer_scan_result_root_direct_fanout_only_emits_child_scan_units_without_recursing() {
+    fn build_transfer_scan_result_root_direct_fanout_only_emits_child_scan_units_without_recursing()
+    {
         let root = TempDir::new().unwrap();
         write_file(&root, "root/direct.bin", b"abc");
         write_file(&root, "root/child/payload.bin", b"xyz");
@@ -7114,14 +7271,18 @@ mod tests {
         assert_eq!(result.direct_files_only_batches.len(), 1);
         assert_eq!(result.child_scan_units.len(), 1);
         assert!(result.full_dir_batches.is_empty());
-        assert_eq!(result.child_scan_units[0].root_relpath, "root/child".to_string());
+        assert_eq!(
+            result.child_scan_units[0].root_relpath,
+            "root/child".to_string()
+        );
         assert_eq!(
             result.child_scan_units[0].scan_mode,
             FluxonFsTransferScanMode::FullTree
         );
-        let manifest =
-            FluxonFsTransferManifestWire::decode_from_blob(&result.direct_files_only_batches[0].manifest_blob)
-                .unwrap();
+        let manifest = FluxonFsTransferManifestWire::decode_from_blob(
+            &result.direct_files_only_batches[0].manifest_blob,
+        )
+        .unwrap();
         assert_eq!(
             manifest.entries,
             vec![FluxonFsTransferManifestEntryWire {
@@ -7133,7 +7294,8 @@ mod tests {
     }
 
     #[test]
-    fn build_transfer_scan_result_directory_direct_fanout_only_emits_child_scan_units_without_recursing() {
+    fn build_transfer_scan_result_directory_direct_fanout_only_emits_child_scan_units_without_recursing()
+     {
         let root = TempDir::new().unwrap();
         write_file(&root, "root/child/direct.bin", b"abc");
         write_file(&root, "root/child/grand/payload.bin", b"xyz");
@@ -7161,14 +7323,18 @@ mod tests {
         assert_eq!(result.direct_files_only_batches.len(), 1);
         assert_eq!(result.child_scan_units.len(), 1);
         assert!(result.full_dir_batches.is_empty());
-        assert_eq!(result.child_scan_units[0].root_relpath, "root/child/grand".to_string());
+        assert_eq!(
+            result.child_scan_units[0].root_relpath,
+            "root/child/grand".to_string()
+        );
         assert_eq!(
             result.child_scan_units[0].scan_mode,
             FluxonFsTransferScanMode::FullTree
         );
-        let manifest =
-            FluxonFsTransferManifestWire::decode_from_blob(&result.direct_files_only_batches[0].manifest_blob)
-                .unwrap();
+        let manifest = FluxonFsTransferManifestWire::decode_from_blob(
+            &result.direct_files_only_batches[0].manifest_blob,
+        )
+        .unwrap();
         assert_eq!(
             manifest.entries,
             vec![FluxonFsTransferManifestEntryWire {
@@ -7206,10 +7372,14 @@ mod tests {
         .unwrap();
         assert!(result.finished);
         assert_eq!(result.direct_files_only_batches.len(), 1);
-        assert_eq!(result.direct_files_only_batches[0].root_relpath, "root/child");
-        let manifest =
-            FluxonFsTransferManifestWire::decode_from_blob(&result.direct_files_only_batches[0].manifest_blob)
-                .unwrap();
+        assert_eq!(
+            result.direct_files_only_batches[0].root_relpath,
+            "root/child"
+        );
+        let manifest = FluxonFsTransferManifestWire::decode_from_blob(
+            &result.direct_files_only_batches[0].manifest_blob,
+        )
+        .unwrap();
         assert_eq!(
             manifest.entries,
             vec![FluxonFsTransferManifestEntryWire {
@@ -7218,7 +7388,10 @@ mod tests {
             }]
         );
         assert!(manifest.empty_dir_relpaths.is_empty());
-        assert_eq!(child_scan_unit_roots(&result), vec!["root/child/grand".to_string()]);
+        assert_eq!(
+            child_scan_unit_roots(&result),
+            vec!["root/child/grand".to_string()]
+        );
         assert_all_child_scan_units_are_subtree_streaming(&result);
         assert!(result.full_dir_batches.is_empty());
     }
@@ -7253,10 +7426,14 @@ mod tests {
         assert!(result.finished);
         assert_eq!(result.direct_files_only_batches.len(), 1);
         assert_eq!(result.child_scan_units.len(), 1);
-        assert_eq!(result.child_scan_units[0].root_relpath, "root/child".to_string());
-        let manifest =
-            FluxonFsTransferManifestWire::decode_from_blob(&result.direct_files_only_batches[0].manifest_blob)
-                .unwrap();
+        assert_eq!(
+            result.child_scan_units[0].root_relpath,
+            "root/child".to_string()
+        );
+        let manifest = FluxonFsTransferManifestWire::decode_from_blob(
+            &result.direct_files_only_batches[0].manifest_blob,
+        )
+        .unwrap();
         assert_eq!(
             manifest.entries,
             vec![FluxonFsTransferManifestEntryWire {
@@ -7330,9 +7507,10 @@ mod tests {
         assert_eq!(result.direct_files_only_batches.len(), 1);
         assert!(result.child_scan_units.is_empty());
         assert!(result.full_dir_batches.is_empty());
-        let manifest =
-            FluxonFsTransferManifestWire::decode_from_blob(&result.direct_files_only_batches[0].manifest_blob)
-                .unwrap();
+        let manifest = FluxonFsTransferManifestWire::decode_from_blob(
+            &result.direct_files_only_batches[0].manifest_blob,
+        )
+        .unwrap();
         assert_eq!(
             manifest.entries,
             vec![FluxonFsTransferManifestEntryWire {
@@ -7407,7 +7585,10 @@ mod tests {
         assert!(result.finished);
         assert_eq!(result.direct_files_only_batches.len(), 1);
         assert_eq!(result.child_scan_units.len(), 1);
-        assert_eq!(result.child_scan_units[0].root_relpath, "root/child-b".to_string());
+        assert_eq!(
+            result.child_scan_units[0].root_relpath,
+            "root/child-b".to_string()
+        );
         assert_eq!(
             result.child_scan_units[0].scan_mode,
             FluxonFsTransferScanMode::FullTree
@@ -7447,9 +7628,10 @@ mod tests {
         assert_eq!(result.direct_files_only_batches.len(), 1);
         assert!(result.child_scan_units.is_empty());
         assert!(result.full_dir_batches.is_empty());
-        let manifest =
-            FluxonFsTransferManifestWire::decode_from_blob(&result.direct_files_only_batches[0].manifest_blob)
-                .unwrap();
+        let manifest = FluxonFsTransferManifestWire::decode_from_blob(
+            &result.direct_files_only_batches[0].manifest_blob,
+        )
+        .unwrap();
         assert_eq!(
             manifest.entries,
             vec![FluxonFsTransferManifestEntryWire {
@@ -7490,9 +7672,10 @@ mod tests {
         assert!(result.direct_files_only_batches.is_empty());
         assert!(result.child_scan_units.is_empty());
         assert_eq!(result.full_dir_batches.len(), 1);
-        let manifest =
-            FluxonFsTransferManifestWire::decode_from_blob(&result.full_dir_batches[0].manifest_blob)
-                .unwrap();
+        let manifest = FluxonFsTransferManifestWire::decode_from_blob(
+            &result.full_dir_batches[0].manifest_blob,
+        )
+        .unwrap();
         assert!(manifest.entries.is_empty());
         assert_eq!(manifest.empty_dir_relpaths, vec!["root".to_string()]);
     }
@@ -7533,7 +7716,8 @@ mod tests {
     }
 
     #[test]
-    fn handle_transfer_scan_assignment_does_not_reaggregate_root_when_descendant_batch_is_durable() {
+    fn handle_transfer_scan_assignment_does_not_reaggregate_root_when_descendant_batch_is_durable()
+    {
         let root = TempDir::new().unwrap();
         write_file(&root, "root/direct.bin", b"abc");
         write_file(&root, "root/big/data.bin", b"12345");
@@ -7579,21 +7763,29 @@ mod tests {
                 size: 3,
             }]
         );
-        assert!(result
-            .full_dir_batches
-            .iter()
-            .all(|batch| batch.root_relpath != "root"));
-        assert!(result
-            .full_dir_batches
-            .iter()
-            .all(|batch| batch.root_relpath != "root/big"));
-        assert_eq!(child_scan_unit_roots(&result), vec!["root/small".to_string()]);
+        assert!(
+            result
+                .full_dir_batches
+                .iter()
+                .all(|batch| batch.root_relpath != "root")
+        );
+        assert!(
+            result
+                .full_dir_batches
+                .iter()
+                .all(|batch| batch.root_relpath != "root/big")
+        );
+        assert_eq!(
+            child_scan_unit_roots(&result),
+            vec!["root/small".to_string()]
+        );
         assert_all_child_scan_units_are_subtree_streaming(&result);
         assert!(result.full_dir_batches.is_empty());
     }
 
     #[test]
-    fn handle_transfer_scan_assignment_honors_cross_generation_descendant_full_dir_during_restart() {
+    fn handle_transfer_scan_assignment_honors_cross_generation_descendant_full_dir_during_restart()
+    {
         let root = TempDir::new().unwrap();
         write_file(&root, "root/direct.bin", b"abc");
         write_file(&root, "root/big/data.bin", b"12345");
@@ -7639,21 +7831,29 @@ mod tests {
                 size: 3,
             }]
         );
-        assert!(result
-            .full_dir_batches
-            .iter()
-            .all(|batch| batch.root_relpath != "root"));
-        assert!(result
-            .full_dir_batches
-            .iter()
-            .all(|batch| batch.root_relpath != "root/big"));
-        assert_eq!(child_scan_unit_roots(&result), vec!["root/small".to_string()]);
+        assert!(
+            result
+                .full_dir_batches
+                .iter()
+                .all(|batch| batch.root_relpath != "root")
+        );
+        assert!(
+            result
+                .full_dir_batches
+                .iter()
+                .all(|batch| batch.root_relpath != "root/big")
+        );
+        assert_eq!(
+            child_scan_unit_roots(&result),
+            vec!["root/small".to_string()]
+        );
         assert_all_child_scan_units_are_subtree_streaming(&result);
         assert!(result.full_dir_batches.is_empty());
     }
 
     #[test]
-    fn handle_transfer_scan_assignment_replays_descendant_current_layer_when_only_partial_descendant_direct_files_batch_is_durable() {
+    fn handle_transfer_scan_assignment_replays_descendant_current_layer_when_only_partial_descendant_direct_files_batch_is_durable()
+     {
         let root = TempDir::new().unwrap();
         write_file(&root, "root/child/a.bin", b"ab");
         write_file(&root, "root/child/b.bin", b"cd");
@@ -7688,10 +7888,14 @@ mod tests {
         assert!(result.child_scan_units.is_empty());
         assert!(result.full_dir_batches.is_empty());
         assert_eq!(result.direct_files_only_batches.len(), 1);
-        assert_eq!(result.direct_files_only_batches[0].root_relpath, "root/child");
-        let manifest =
-            FluxonFsTransferManifestWire::decode_from_blob(&result.direct_files_only_batches[0].manifest_blob)
-                .unwrap();
+        assert_eq!(
+            result.direct_files_only_batches[0].root_relpath,
+            "root/child"
+        );
+        let manifest = FluxonFsTransferManifestWire::decode_from_blob(
+            &result.direct_files_only_batches[0].manifest_blob,
+        )
+        .unwrap();
         assert_eq!(
             manifest.entries,
             vec![
@@ -7737,7 +7941,10 @@ mod tests {
 
         assert!(result.finished);
         assert!(result.direct_files_only_batches.is_empty());
-        assert_eq!(child_scan_unit_roots(&result), vec!["root/parent".to_string()]);
+        assert_eq!(
+            child_scan_unit_roots(&result),
+            vec!["root/parent".to_string()]
+        );
         assert_all_child_scan_units_are_subtree_streaming(&result);
         assert!(result.full_dir_batches.is_empty());
     }
@@ -7772,9 +7979,10 @@ mod tests {
 
         assert!(result.finished);
         assert_eq!(result.direct_files_only_batches.len(), 1);
-        let manifest =
-            FluxonFsTransferManifestWire::decode_from_blob(&result.direct_files_only_batches[0].manifest_blob)
-                .unwrap();
+        let manifest = FluxonFsTransferManifestWire::decode_from_blob(
+            &result.direct_files_only_batches[0].manifest_blob,
+        )
+        .unwrap();
         assert_eq!(
             manifest.entries,
             vec![FluxonFsTransferManifestEntryWire {
@@ -7782,7 +7990,10 @@ mod tests {
                 size: 10,
             }]
         );
-        assert_eq!(child_scan_unit_roots(&result), vec!["root/child".to_string()]);
+        assert_eq!(
+            child_scan_unit_roots(&result),
+            vec!["root/child".to_string()]
+        );
         assert_all_child_scan_units_are_subtree_streaming(&result);
         assert!(result.full_dir_batches.is_empty());
     }
@@ -7820,7 +8031,10 @@ mod tests {
 
         assert!(ok_bool(&resp));
         assert!(result.finished);
-        assert_eq!(child_scan_unit_roots(&result), vec!["root/blocked".to_string()]);
+        assert_eq!(
+            child_scan_unit_roots(&result),
+            vec!["root/blocked".to_string()]
+        );
         assert_all_child_scan_units_are_subtree_streaming(&result);
         assert!(result.full_dir_batches.is_empty());
     }
@@ -7870,7 +8084,11 @@ mod tests {
         );
         assert_eq!(
             child_scan_unit_roots(&result),
-            vec!["root/a".to_string(), "root/b".to_string(), "root/c".to_string()]
+            vec![
+                "root/a".to_string(),
+                "root/b".to_string(),
+                "root/c".to_string()
+            ]
         );
         assert_all_child_scan_units_are_subtree_streaming(&result);
         assert!(result.full_dir_batches.is_empty());
@@ -7905,7 +8123,10 @@ mod tests {
         );
         let result = decode_result_json(&resp);
         assert_eq!(result.full_dir_batches.len(), 1);
-        assert_eq!(result.full_dir_batches[0].batch_kind, FluxonFsTransferBatchKind::SubtreeSlice);
+        assert_eq!(
+            result.full_dir_batches[0].batch_kind,
+            FluxonFsTransferBatchKind::SubtreeSlice
+        );
         assert_eq!(result.full_dir_batches[0].collect_infos.len(), 1);
         assert_eq!(
             decode_symlink_notice_collect_blob(
@@ -7957,11 +8178,15 @@ mod tests {
         assert!(result.direct_files_only_batches.is_empty());
         assert!(result.child_scan_units.is_empty());
         assert_eq!(result.full_dir_batches.len(), 1);
-        assert_eq!(result.full_dir_batches[0].batch_kind, FluxonFsTransferBatchKind::SubtreeSlice);
+        assert_eq!(
+            result.full_dir_batches[0].batch_kind,
+            FluxonFsTransferBatchKind::SubtreeSlice
+        );
         assert_eq!(result.full_dir_batches[0].root_relpath, "root".to_string());
-        let manifest =
-            FluxonFsTransferManifestWire::decode_from_blob(&result.full_dir_batches[0].manifest_blob)
-                .unwrap();
+        let manifest = FluxonFsTransferManifestWire::decode_from_blob(
+            &result.full_dir_batches[0].manifest_blob,
+        )
+        .unwrap();
         assert_eq!(
             manifest.entries,
             vec![
@@ -7982,7 +8207,9 @@ mod tests {
             FluxonFsTransferCollectInfoKind::SymlinkNotice
         );
         let mut notices = decode_symlink_notice_collect_blob(
-            direct_files_only_batch.collect_infos[0].collect_blob.as_slice()
+            direct_files_only_batch.collect_infos[0]
+                .collect_blob
+                .as_slice(),
         );
         notices.sort_by(|a, b| a.relpath.cmp(&b.relpath));
         assert_eq!(
@@ -8004,16 +8231,17 @@ mod tests {
     fn prepare_transfer_file_from_chunks_promotes_staged_file_to_final_path() {
         let root = TempDir::new().unwrap();
         let dst_root = root.path().to_path_buf();
-        let coordinator = test_transfer_coordinator(
-            || Ok(()),
-            {
-                let chunks = Arc::new(Mutex::new(vec![b"ab".to_vec(), b"cde".to_vec(), Vec::new()]));
-                move |_file, _read_offset, _length| {
-                    let mut chunks = chunks.lock();
-                    Ok(chunks.remove(0))
-                }
-            },
-        );
+        let coordinator = test_transfer_coordinator(|| Ok(()), {
+            let chunks = Arc::new(Mutex::new(vec![
+                b"ab".to_vec(),
+                b"cde".to_vec(),
+                Vec::new(),
+            ]));
+            move |_file, _read_offset, _length| {
+                let mut chunks = chunks.lock();
+                Ok(chunks.remove(0))
+            }
+        });
         let prepared = prepare_transfer_file_streaming(
             &dst_root,
             ".fluxon.stage/job/batch",
@@ -8038,32 +8266,31 @@ mod tests {
             fs::read(root.path().join("dir/file.bin")).unwrap(),
             b"abcde".to_vec()
         );
-        assert!(!root
-            .path()
-            .join(".fluxon.stage/job/batch/dir/file.bin/file.bin.fluxon.part")
-            .exists());
+        assert!(
+            !root
+                .path()
+                .join(".fluxon.stage/job/batch/dir/file.bin/file.bin.fluxon.part")
+                .exists()
+        );
     }
 
     #[test]
     fn prepare_transfer_file_from_chunks_truncates_existing_staging_file() {
         let root = TempDir::new().unwrap();
         let dst_root = root.path().to_path_buf();
-        let stale_staging =
-            root.path()
-                .join(".fluxon.stage/job/batch/dir/file.bin/file.bin.fluxon.part");
+        let stale_staging = root
+            .path()
+            .join(".fluxon.stage/job/batch/dir/file.bin/file.bin.fluxon.part");
         fs::create_dir_all(stale_staging.parent().unwrap()).unwrap();
         fs::write(&stale_staging, b"stale-data").unwrap();
 
-        let coordinator = test_transfer_coordinator(
-            || Ok(()),
-            {
-                let chunks = Arc::new(Mutex::new(vec![b"xy".to_vec(), Vec::new()]));
-                move |_file, _read_offset, _length| {
-                    let mut chunks = chunks.lock();
-                    Ok(chunks.remove(0))
-                }
-            },
-        );
+        let coordinator = test_transfer_coordinator(|| Ok(()), {
+            let chunks = Arc::new(Mutex::new(vec![b"xy".to_vec(), Vec::new()]));
+            move |_file, _read_offset, _length| {
+                let mut chunks = chunks.lock();
+                Ok(chunks.remove(0))
+            }
+        });
         let prepared = prepare_transfer_file_streaming(
             &dst_root,
             ".fluxon.stage/job/batch",
@@ -8076,23 +8303,23 @@ mod tests {
         .unwrap();
         promote_prepared_transfer_file(&dst_root, prepared).unwrap();
 
-        assert_eq!(fs::read(root.path().join("dir/file.bin")).unwrap(), b"xy".to_vec());
+        assert_eq!(
+            fs::read(root.path().join("dir/file.bin")).unwrap(),
+            b"xy".to_vec()
+        );
     }
 
     #[test]
     fn prepare_transfer_file_from_chunks_rejects_size_mismatch_and_keeps_staging_file() {
         let root = TempDir::new().unwrap();
         let dst_root = root.path().to_path_buf();
-        let coordinator = test_transfer_coordinator(
-            || Ok(()),
-            {
-                let chunks = Arc::new(Mutex::new(vec![b"xy".to_vec(), Vec::new()]));
-                move |_file, _read_offset, _length| {
-                    let mut chunks = chunks.lock();
-                    Ok(chunks.remove(0))
-                }
-            },
-        );
+        let coordinator = test_transfer_coordinator(|| Ok(()), {
+            let chunks = Arc::new(Mutex::new(vec![b"xy".to_vec(), Vec::new()]));
+            move |_file, _read_offset, _length| {
+                let mut chunks = chunks.lock();
+                Ok(chunks.remove(0))
+            }
+        });
         let err = prepare_transfer_file_streaming(
             &dst_root,
             ".fluxon.stage/job/batch",
@@ -8275,15 +8502,10 @@ mod tests {
         let file_bytes = b"hello".to_vec();
         let assignment = test_worker_assignment("dir/file.bin", file_bytes.len() as i64);
 
-        let result = execute_transfer_worker_assignment(
-            &assignment,
-            &dst_root,
-            || Ok(()),
-            {
-                let file_bytes = file_bytes.clone();
-                move |_file, _read_offset, _length| Ok(file_bytes.clone())
-            },
-        )
+        let result = execute_transfer_worker_assignment(&assignment, &dst_root, || Ok(()), {
+            let file_bytes = file_bytes.clone();
+            move |_file, _read_offset, _length| Ok(file_bytes.clone())
+        })
         .unwrap();
 
         assert_eq!(result.file_results.len(), 1);
@@ -8303,7 +8525,10 @@ mod tests {
         create_dir_all_with_parent_dir_chmod_retry(&target).unwrap();
 
         assert!(target.is_dir());
-        assert_eq!(fs::metadata(&locked_parent).unwrap().permissions().mode() & 0o777, 0o777);
+        assert_eq!(
+            fs::metadata(&locked_parent).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
     }
 
     #[cfg(unix)]
@@ -8318,21 +8543,19 @@ mod tests {
         let file_bytes = b"hello".to_vec();
         let assignment = test_worker_assignment("dir/file.bin", file_bytes.len() as i64);
 
-        let result = execute_transfer_worker_assignment(
-            &assignment,
-            &dst_root,
-            || Ok(()),
-            {
-                let file_bytes = file_bytes.clone();
-                move |_file, _read_offset, _length| Ok(file_bytes.clone())
-            },
-        )
+        let result = execute_transfer_worker_assignment(&assignment, &dst_root, || Ok(()), {
+            let file_bytes = file_bytes.clone();
+            move |_file, _read_offset, _length| Ok(file_bytes.clone())
+        })
         .unwrap();
 
         assert_eq!(result.file_results.len(), 1);
         assert!(dst_root.is_dir());
         assert_eq!(fs::read(dst_root.join("dir/file.bin")).unwrap(), file_bytes);
-        assert_eq!(fs::metadata(&locked_parent).unwrap().permissions().mode() & 0o777, 0o777);
+        assert_eq!(
+            fs::metadata(&locked_parent).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
     }
 
     #[test]
@@ -8349,47 +8572,48 @@ mod tests {
                 let assignment = assignment.clone();
                 let heartbeat_attempts = heartbeat_attempts.clone();
                 move || {
-                retry_transfer_worker_rpc_with_backoff(
-                    &assignment,
-                    "checkpoint",
-                    "test-checkpoint",
-                    BackoffConfig {
-                        initial_secs: 0,
-                        max_secs: 0,
-                    },
-                    WarnConfig {
-                        warn_interval_secs: 0,
-                    },
-                    || {
-                        let attempt =
-                            heartbeat_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                        if attempt < 3 {
-                            return Err(TransferWorkerRpcFailure::Retryable {
-                                detail: format!(
-                                    "transient heartbeat failure attempt={}",
-                                    attempt
-                                ),
-                            });
-                        }
-                        Ok(())
-                    },
-                )
-                .map_err(TransferWorkerExecutionError::fatal)
-            }
+                    retry_transfer_worker_rpc_with_backoff(
+                        &assignment,
+                        "checkpoint",
+                        "test-checkpoint",
+                        BackoffConfig {
+                            initial_secs: 0,
+                            max_secs: 0,
+                        },
+                        WarnConfig {
+                            warn_interval_secs: 0,
+                        },
+                        || {
+                            let attempt = heartbeat_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                            if attempt < 3 {
+                                return Err(TransferWorkerRpcFailure::Retryable {
+                                    detail: format!(
+                                        "transient heartbeat failure attempt={}",
+                                        attempt
+                                    ),
+                                });
+                            }
+                            Ok(())
+                        },
+                    )
+                    .map_err(TransferWorkerExecutionError::fatal)
+                }
             },
             {
                 let file_bytes = file_bytes.clone();
                 move |file, read_offset, _length| {
-                if file.relpath != "dir/file.bin" {
-                    return Err(TransferWorkerExecutionError::fatal(resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
-                        detail: format!("unexpected file relpath: {}", file.relpath),
-                    }))));
+                    if file.relpath != "dir/file.bin" {
+                        return Err(TransferWorkerExecutionError::fatal(resp_err_kverr(
+                            KvError::Api(ApiError::InvalidArgument {
+                                detail: format!("unexpected file relpath: {}", file.relpath),
+                            }),
+                        )));
+                    }
+                    if read_offset == 0 {
+                        return Ok(file_bytes.clone());
+                    }
+                    Ok(Vec::new())
                 }
-                if read_offset == 0 {
-                    return Ok(file_bytes.clone());
-                }
-                Ok(Vec::new())
-            }
             },
         )
         .unwrap();
@@ -8409,24 +8633,20 @@ mod tests {
         let file_bytes = b"payload".to_vec();
         let assignment = test_worker_assignment("dir/file.bin", file_bytes.len() as i64);
         let read_attempts = Arc::new(AtomicUsize::new(0));
-        let result = execute_transfer_worker_assignment(
-            &assignment,
-            &dst_root,
-            || Ok(()),
-            {
-                let assignment = assignment.clone();
-                let file_bytes = file_bytes.clone();
-                let read_attempts = read_attempts.clone();
-                move |file, read_offset, _length| {
+        let result = execute_transfer_worker_assignment(&assignment, &dst_root, || Ok(()), {
+            let assignment = assignment.clone();
+            let file_bytes = file_bytes.clone();
+            let read_attempts = read_attempts.clone();
+            move |file, read_offset, _length| {
                 if file.relpath != "dir/file.bin" {
-                    return Err(TransferWorkerExecutionError::fatal(resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
-                        detail: format!("unexpected file relpath: {}", file.relpath),
-                    }))));
+                    return Err(TransferWorkerExecutionError::fatal(resp_err_kverr(
+                        KvError::Api(ApiError::InvalidArgument {
+                            detail: format!("unexpected file relpath: {}", file.relpath),
+                        }),
+                    )));
                 }
-                let op_detail = format!(
-                    "test-read relpath={} offset={}",
-                    file.relpath, read_offset
-                );
+                let op_detail =
+                    format!("test-read relpath={} offset={}", file.relpath, read_offset);
                 retry_transfer_worker_rpc_with_backoff(
                     &assignment,
                     "read_chunk",
@@ -8443,10 +8663,7 @@ mod tests {
                             let attempt = read_attempts.fetch_add(1, Ordering::SeqCst) + 1;
                             if attempt < 3 {
                                 return Err(TransferWorkerRpcFailure::Retryable {
-                                    detail: format!(
-                                        "transient read failure attempt={}",
-                                        attempt
-                                    ),
+                                    detail: format!("transient read failure attempt={}", attempt),
                                 });
                             }
                             return Ok(file_bytes.clone());
@@ -8456,8 +8673,7 @@ mod tests {
                 )
                 .map_err(TransferWorkerExecutionError::fatal)
             }
-            },
-        )
+        })
         .unwrap();
 
         assert_eq!(read_attempts.load(Ordering::SeqCst), 3);
@@ -8481,23 +8697,23 @@ mod tests {
             {
                 let checkpoint_calls = checkpoint_calls.clone();
                 move || {
-                let calls = checkpoint_calls.fetch_add(1, Ordering::SeqCst) + 1;
-                if calls >= 4 {
-                    return Err(TransferWorkerExecutionError::Stop(
-                        FluxonFsTransferWorkerStopReasonWire::Superseded,
-                    ));
+                    let calls = checkpoint_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if calls >= 4 {
+                        return Err(TransferWorkerExecutionError::Stop(
+                            FluxonFsTransferWorkerStopReasonWire::Superseded,
+                        ));
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
             },
             {
                 let file_bytes = file_bytes.clone();
                 move |_file, read_offset, _length| {
-                if read_offset == 0 {
-                    return Ok(file_bytes.clone());
+                    if read_offset == 0 {
+                        return Ok(file_bytes.clone());
+                    }
+                    Ok(Vec::new())
                 }
-                Ok(Vec::new())
-            }
             },
         );
         assert!(matches!(
@@ -8567,12 +8783,7 @@ mod tests {
                             break;
                         }
                         if max_in_flight
-                            .compare_exchange(
-                                observed,
-                                current,
-                                Ordering::SeqCst,
-                                Ordering::SeqCst,
-                            )
+                            .compare_exchange(observed, current, Ordering::SeqCst, Ordering::SeqCst)
                             .is_ok()
                         {
                             break;
@@ -8588,8 +8799,14 @@ mod tests {
 
         assert_eq!(result.file_results.len(), 2);
         assert!(max_in_flight.load(Ordering::SeqCst) >= 2);
-        assert_eq!(fs::read(root.path().join("dir/a.bin")).unwrap(), b"xxx".to_vec());
-        assert_eq!(fs::read(root.path().join("dir/b.bin")).unwrap(), b"xxx".to_vec());
+        assert_eq!(
+            fs::read(root.path().join("dir/a.bin")).unwrap(),
+            b"xxx".to_vec()
+        );
+        assert_eq!(
+            fs::read(root.path().join("dir/b.bin")).unwrap(),
+            b"xxx".to_vec()
+        );
     }
 
     #[test]
@@ -8597,29 +8814,25 @@ mod tests {
         let root = TempDir::new().unwrap();
         let dst_root = root.path().to_path_buf();
         let file_bytes = b"hello".to_vec();
-        let collect_infos = build_symlink_collect_infos(vec![FluxonFsTransferSymlinkNoticeEntryWire {
-            relpath: "dir/link.bin".to_string(),
-            link_target: "dir/file.bin".to_string(),
-        }])
-        .unwrap();
+        let collect_infos =
+            build_symlink_collect_infos(vec![FluxonFsTransferSymlinkNoticeEntryWire {
+                relpath: "dir/link.bin".to_string(),
+                link_target: "dir/file.bin".to_string(),
+            }])
+            .unwrap();
         let assignment = FluxonFsTransferWorkerAssignmentWire {
             collect_infos: collect_infos.clone(),
             ..test_worker_assignment("dir/file.bin", file_bytes.len() as i64)
         };
-        let result = execute_transfer_worker_assignment(
-            &assignment,
-            &dst_root,
-            || Ok(()),
-            {
-                let file_bytes = file_bytes.clone();
-                move |_file, read_offset, _length| {
-                    if read_offset == 0 {
-                        return Ok(file_bytes.clone());
-                    }
-                    Ok(Vec::new())
+        let result = execute_transfer_worker_assignment(&assignment, &dst_root, || Ok(()), {
+            let file_bytes = file_bytes.clone();
+            move |_file, read_offset, _length| {
+                if read_offset == 0 {
+                    return Ok(file_bytes.clone());
                 }
-            },
-        )
+                Ok(Vec::new())
+            }
+        })
         .unwrap();
 
         assert_eq!(result.file_results.len(), 1);
@@ -8633,7 +8846,11 @@ mod tests {
             "fluxon_collect_info/batches/batch/symlinks.jsonl"
         );
         assert_eq!(
-            fs::read(root.path().join("fluxon_collect_info/batches/batch/symlinks.jsonl")).unwrap(),
+            fs::read(
+                root.path()
+                    .join("fluxon_collect_info/batches/batch/symlinks.jsonl")
+            )
+            .unwrap(),
             collect_infos[0].collect_blob
         );
     }
@@ -8643,16 +8860,19 @@ mod tests {
         let root = TempDir::new().unwrap();
         let dst_root = root.path().to_path_buf();
         let assignment = FluxonFsTransferWorkerAssignmentWire {
-            manifest_blob: build_transfer_manifest_blob(vec![
-                FluxonFsTransferScanFrontierEntry {
-                    relpath: "dir/good.bin".to_string(),
-                    size: 5,
-                },
-                FluxonFsTransferScanFrontierEntry {
-                    relpath: "dir/bad.bin".to_string(),
-                    size: 5,
-                },
-            ], Vec::new())
+            manifest_blob: build_transfer_manifest_blob(
+                vec![
+                    FluxonFsTransferScanFrontierEntry {
+                        relpath: "dir/good.bin".to_string(),
+                        size: 5,
+                    },
+                    FluxonFsTransferScanFrontierEntry {
+                        relpath: "dir/bad.bin".to_string(),
+                        size: 5,
+                    },
+                ],
+                Vec::new(),
+            )
             .unwrap(),
             ..test_worker_assignment("dir/good.bin", 5)
         };
@@ -8816,20 +9036,16 @@ mod tests {
         .unwrap();
 
         let progress_heartbeat_count = Arc::new(AtomicUsize::new(0));
-        gate.ensure_continue(
-            false,
-            TRANSFER_WORKER_HEARTBEAT_EMPTY_DIR_PROGRESS_COUNT,
-            {
-                let progress_heartbeat_count = progress_heartbeat_count.clone();
-                move |_heartbeat_unix_ms, heartbeat_detail| {
-                    assert_eq!(heartbeat_detail, "empty_dir_progress");
-                    progress_heartbeat_count.fetch_add(1, Ordering::SeqCst);
-                    Ok(FluxonFsTransferWorkerHeartbeatResultWire::continue_running(
-                        chrono::Utc::now().timestamp_millis() + 60_000,
-                    ))
-                }
-            },
-        )
+        gate.ensure_continue(false, TRANSFER_WORKER_HEARTBEAT_EMPTY_DIR_PROGRESS_COUNT, {
+            let progress_heartbeat_count = progress_heartbeat_count.clone();
+            move |_heartbeat_unix_ms, heartbeat_detail| {
+                assert_eq!(heartbeat_detail, "empty_dir_progress");
+                progress_heartbeat_count.fetch_add(1, Ordering::SeqCst);
+                Ok(FluxonFsTransferWorkerHeartbeatResultWire::continue_running(
+                    chrono::Utc::now().timestamp_millis() + 60_000,
+                ))
+            }
+        })
         .unwrap();
 
         gate.ensure_continue(
@@ -8927,20 +9143,15 @@ mod tests {
         let dst_root = root.path().to_path_buf();
         let file_bytes = b"hello".to_vec();
         let assignment = test_worker_assignment("dir/file.bin", file_bytes.len() as i64);
-        let result = execute_transfer_worker_assignment(
-            &assignment,
-            &dst_root,
-            || Ok(()),
-            {
-                let file_bytes = file_bytes.clone();
-                move |_file, read_offset, _length| {
-                    if read_offset == 0 {
-                        return Ok(file_bytes.clone());
-                    }
-                    Ok(Vec::new())
+        let result = execute_transfer_worker_assignment(&assignment, &dst_root, || Ok(()), {
+            let file_bytes = file_bytes.clone();
+            move |_file, read_offset, _length| {
+                if read_offset == 0 {
+                    return Ok(file_bytes.clone());
                 }
-            },
-        )
+                Ok(Vec::new())
+            }
+        })
         .unwrap();
 
         assert_eq!(result.file_results.len(), 1);
@@ -8948,7 +9159,10 @@ mod tests {
 
         cleanup_transfer_worker_attempt_artifacts(&dst_root, &assignment).unwrap();
 
-        assert_eq!(fs::read(root.path().join("dir/file.bin")).unwrap(), file_bytes);
+        assert_eq!(
+            fs::read(root.path().join("dir/file.bin")).unwrap(),
+            file_bytes
+        );
         assert!(!root.path().join(".fluxon.stage").exists());
     }
 
@@ -8957,11 +9171,12 @@ mod tests {
         let root = TempDir::new().unwrap();
         let dst_root = root.path().to_path_buf();
         let file_bytes = b"hello".to_vec();
-        let collect_infos = build_symlink_collect_infos(vec![FluxonFsTransferSymlinkNoticeEntryWire {
-            relpath: "root/link-file.bin".to_string(),
-            link_target: "target/file.bin".to_string(),
-        }])
-        .unwrap();
+        let collect_infos =
+            build_symlink_collect_infos(vec![FluxonFsTransferSymlinkNoticeEntryWire {
+                relpath: "root/link-file.bin".to_string(),
+                link_target: "target/file.bin".to_string(),
+            }])
+            .unwrap();
         let assignment = FluxonFsTransferWorkerAssignmentWire {
             collect_infos: collect_infos.clone(),
             ..test_worker_assignment("dir/file.bin", file_bytes.len() as i64)
@@ -8976,9 +9191,11 @@ mod tests {
         let result = execute_transfer_worker_assignment(
             &assignment,
             &dst_root,
-            || Err(TransferWorkerExecutionError::Stop(
-                FluxonFsTransferWorkerStopReasonWire::Superseded,
-            )),
+            || {
+                Err(TransferWorkerExecutionError::Stop(
+                    FluxonFsTransferWorkerStopReasonWire::Superseded,
+                ))
+            },
             {
                 let file_bytes = file_bytes.clone();
                 move |_file, read_offset, _length| {
@@ -8996,11 +9213,20 @@ mod tests {
                 FluxonFsTransferWorkerStopReasonWire::Superseded
             ))
         ));
-        assert!(root.path().join(prepared_collect.staging_relpath.as_str()).exists());
+        assert!(
+            root.path()
+                .join(prepared_collect.staging_relpath.as_str())
+                .exists()
+        );
 
         cleanup_transfer_worker_attempt_artifacts(&dst_root, &assignment).unwrap();
 
         assert!(!root.path().join(".fluxon.stage").exists());
-        assert!(!root.path().join(prepared_collect.staging_relpath.as_str()).exists());
+        assert!(
+            !root
+                .path()
+                .join(prepared_collect.staging_relpath.as_str())
+                .exists()
+        );
     }
 }

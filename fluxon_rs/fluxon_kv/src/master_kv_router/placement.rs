@@ -6,8 +6,8 @@ use crate::{
     rpcresp_kvresult_convert::msg_and_error::KvError,
 };
 use async_trait::async_trait;
-use rand::Rng;
 use rand::seq::SliceRandom;
+use rand::Rng;
 
 use super::MasterKvRouterView;
 
@@ -40,8 +40,8 @@ pub trait PlacementPolicy: Send + Sync {
 /// Change the type alias to switch behavior (and rebuild):
 /// - `LocalFirstPlacementPolicy` prefers local placement when possible.
 /// - `RandomPlacementPolicy` selects a random eligible target.
-// pub type PlacementDefault = LocalFirstPlacementPolicy;
-pub type PlacementDefault = RandomPlacementPolicy;
+pub type PlacementDefault = LocalFirstPlacementPolicy;
+// pub type PlacementDefault = RandomPlacementPolicy;
 
 /// A policy that prefers placing on the requesting node when possible.
 pub struct LocalFirstPlacementPolicy;

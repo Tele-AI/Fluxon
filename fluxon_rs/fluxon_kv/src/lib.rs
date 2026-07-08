@@ -30,6 +30,8 @@ pub use crate::client_seg_pool::SharedJsonMeta;
 pub use crate::cluster_manager::{ClusterEvent, ClusterMember};
 pub use fluxon_observability::types::FsMountKind;
 
+pub const OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES: u64 = 512 * 1024 * 1024;
+
 pub type MembershipEventReceiver =
     limit_thirdparty::tokio::sync::abroadcast::Receiver<ClusterEvent>;
 
@@ -56,8 +58,8 @@ use crate::external_client_api::ExternalClientApiViewTrait;
 use crate::master_kv_router::MasterKvRouterAccessTrait;
 use crate::master_kv_router::MasterKvRouterView;
 use crate::master_kv_router::MasterKvRouterViewTrait;
-use crate::master_lease_manager::MasterLeaseManager;
 use crate::master_lease_manager::master_lease_manager::MasterLeaseManagerNewArg;
+use crate::master_lease_manager::MasterLeaseManager;
 use crate::master_lease_manager::{
     MasterLeaseManagerAccessTrait, MasterLeaseManagerView, MasterLeaseManagerViewTrait,
 };
@@ -78,21 +80,21 @@ use client_seg_pool::{ClientSegPool, ClientSegPoolNewArg};
 use client_transfer_engine::ClientTransferEngine;
 use cluster_manager::{ClusterManager, ClusterManagerNewArg, ClusterManagerRdmaControlInit};
 use config::{
-    ClientConfig, ClientConfigYaml, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig,
-    MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole, TestSpecConfig,
-    TestSpecTransportMode, TransferEngineType, normalize_etcd_addresses,
+    normalize_etcd_addresses, ClientConfig, ClientConfigYaml, ContributeToClusterPoolSize,
+    FluxonKvSpec, MasterConfig, MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole,
+    TestSpecConfig, TestSpecTransportMode, TransferEngineType,
 };
 use external_client_api::{ExternalClientApi, ExternalClientApiNewArg};
 use fluxon_commu::TransferBackendActivationMode;
 use fluxon_framework::LogicalModule;
-use fluxon_framework::{AnyResult, define_framework};
+use fluxon_framework::{define_framework, AnyResult};
 use master_kv_router::{MasterKvRouter, MasterKvRouterNewArg};
 use master_seg_manager::MasterSegManager;
 use metric_reporter::{
-    META_KEY_KV_OBSERVE_BROADCAST, MetricReporter, MetricReporterAccessTrait, MetricReporterNewArg,
-    MetricReporterView, MetricReporterViewTrait, ObserveProxyCaller, ObserveProxyPicker,
     register_greptime_otlp_log_proxy_rpc, serialize_master_observe_broadcast,
-    wait_master_observe_broadcast,
+    wait_master_observe_broadcast, MetricReporter, MetricReporterAccessTrait, MetricReporterNewArg,
+    MetricReporterView, MetricReporterViewTrait, ObserveProxyCaller, ObserveProxyPicker,
+    META_KEY_KV_OBSERVE_BROADCAST,
 };
 use p2p::p2p_module::{P2pModule, P2pModuleNewArg, P2pTcpThreadTransportTuning};
 use sha2::{Digest, Sha256};
@@ -254,6 +256,16 @@ pub trait KvClientTrait {
     /// Existence check by role
     async fn kv_is_exist(&self, key: &str) -> KvResult<bool>;
 
+    /// Batch existence check by role.
+    ///
+    /// `allow_local_snapshot` only enables positive local-cache hits; misses
+    /// still fall through to the authority path.
+    async fn kv_batch_is_exist(
+        &self,
+        keys: Vec<String>,
+        allow_local_snapshot: bool,
+    ) -> KvResult<Vec<bool>>;
+
     /// Count keys by prefix via master-side radix index.
     async fn kv_count_prefix(&self, prefix: &str) -> KvResult<u64>;
 
@@ -399,6 +411,26 @@ impl KvClientTrait for Framework {
                 .client_kv_api()
                 .inner()
                 .is_exist(key)
+                .await
+        }
+    }
+
+    async fn kv_batch_is_exist(
+        &self,
+        keys: Vec<String>,
+        allow_local_snapshot: bool,
+    ) -> KvResult<Vec<bool>> {
+        if self.is_external_mode() {
+            self.external_client_api_view()
+                .external_client_api()
+                .inner()
+                .batch_is_exist(keys, allow_local_snapshot)
+                .await
+        } else {
+            self.client_kv_api_view()
+                .client_kv_api()
+                .inner()
+                .batch_is_exist(keys, allow_local_snapshot)
                 .await
         }
     }
@@ -1989,8 +2021,8 @@ async fn run_client_impl(
                 test_spec_config: config.test_spec_config.clone(),
             },
             external_client_api_arg: ExternalClientApiNewArg {
-                share_mem_path: config.share_mem_path.clone(),
-                large_file_paths: config.large_file_paths.clone(),
+                shared_memory_path: config.share_mem_path.clone(),
+                shared_file_path: config.share_mem_path.clone(),
                 expected_cluster_name: config.cluster_name.clone(),
                 expected_protocol_version: build_version.clone(),
                 enable_side_transfer: config.test_spec_config.enable_side_transfer,
@@ -2736,8 +2768,8 @@ mod tests {
             large_file_paths: crate::config::LargeFilePaths {
                 paths: vec![owner_large_root.to_string_lossy().into_owned()],
             },
-            protocol_version:
-                fluxon_util::git_version_build_record::get_current_git_commitid().unwrap(),
+            protocol_version: fluxon_util::git_version_build_record::get_current_git_commitid()
+                .unwrap(),
             write_ts: Some(chrono::Utc::now().timestamp_micros()),
         };
         let shared_meta_json = serde_json::to_string(&shared_meta).unwrap();

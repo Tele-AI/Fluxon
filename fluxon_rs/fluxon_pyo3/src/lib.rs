@@ -1,43 +1,62 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::slice;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 use bytes::Bytes;
 use fluxon_cli::config::MonitorConfigYaml as MonitorCliConfigYaml;
 use fluxon_fs::config::{
+    FluxonFsRequestIdentity, FluxonFsS3KvMissPolicy, FsAgentDeclaredExportWire,
     FLUXON_FS_CONTROL_SCHEMA_VERSION, FS_AGENT_DECLARED_EXPORT_JSON_KEY,
     FS_AGENT_EXPORT_PUBLISH_RPC_PATH, FS_AGENT_EXPORT_UNPUBLISH_RPC_PATH,
-    FS_MASTER_CONFIG_RPC_PATH, FluxonFsRequestIdentity, FluxonFsS3KvMissPolicy,
-    FsAgentDeclaredExportWire,
+    FS_MASTER_CONFIG_RPC_PATH,
+};
+use fluxon_kv::client_kv_api::msg_pack::{
+    ExternalBatchPutCommitItemReq, ExternalBatchPutCommitReq, ExternalBatchPutStartItemReq,
+    ExternalBatchPutStartReq, ExternalBatchPutTransferEndItemReq, ExternalBatchPutTransferEndReq,
+    ExternalPutRevokeReq,
 };
 use fluxon_kv::client_kv_api::ClientKvApiViewTrait;
-use fluxon_kv::cluster_manager::ClusterManagerViewTrait;
+use fluxon_kv::client_kv_api::{
+    ClientKvApiInner, OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef, OwnerReservedPutItem,
+};
+use fluxon_kv::client_seg_pool::ClientSegPoolViewTrait;
 use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
+use fluxon_kv::cluster_manager::ClusterManagerViewTrait;
 use fluxon_kv::config::{ClientConfigYaml, MasterConfigYaml};
+use fluxon_kv::external_client_api::ExternalClientApiViewTrait;
+use fluxon_kv::master_kv_router::msg_pack::{
+    BatchPreparePutKeyItemReq, BatchPutDoneItemReq, BatchPutRevokeItemReq, BatchPutStartItemReq,
+    PutDoneCommittedSlot,
+};
 use fluxon_kv::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
-use fluxon_kv::p2p::msg_pack::{MsgPack, RPCCaller, call_rpc};
+use fluxon_kv::memholder::kvclient_encode::{flat_kv_decode_borrowed, BorrowedFlatKvValueRange};
+use fluxon_kv::memholder::{
+    ExternalMemHolder as RustExternalMemHolder, MemoryInfo as RustMemoryInfo,
+    UserMemHolder as RustUserMemHolder,
+};
+use fluxon_kv::p2p::msg_pack::{call_rpc, MsgPack, RPCCaller};
 use fluxon_kv::p2p::p2p_module::P2pModuleViewTrait;
-use fluxon_kv::p2p::p2p_module::{UserRpcHandler, user_rpc_register_handler};
+use fluxon_kv::p2p::p2p_module::{user_rpc_register_handler, UserRpcHandler};
 use fluxon_kv::rpcresp_kvresult_convert::msg_and_error::{
     ApiError as CoreApiError, KvError as CoreKvError, KvResult, OK,
 };
 use fluxon_kv::user_api::FlatDict;
 use fluxon_kv::user_api::FlatValue;
 use fluxon_kv::user_api::FluxonUserApi;
+use fluxon_kv::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
 use fluxon_kv::{
-    ConfigArg, Framework, KvClientTrait, KvGetResult,
     config::{ClientConfig, MasterConfig},
-    run_client, run_master,
+    run_client, run_master, ConfigArg, Framework, KvClientTrait, KvGetResult,
 };
 use fluxon_ops;
 use fluxon_proxy;
-use fluxon_util::run_async_from_sync::{SyncAsyncBridge, borrow_stable_owner};
+use fluxon_util::run_async_from_sync::{borrow_stable_owner, SyncAsyncBridge};
 use fluxon_util::{
-    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
+    fluxon_cli_proxy_desc_etcd_key_v2, FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2,
 };
 use futures::Future;
 use pyo3::exceptions::{PyOSError, PyPermissionError, PyRuntimeError, PyValueError};
@@ -58,6 +77,7 @@ include!(env!("FLUXON_PYO3_TEST_PYTHON_LINK_RS"));
 mod memholder;
 pub use memholder::{ExternalMemHolder, MemHolder};
 mod flatdict_zerocopy;
+use flatdict_zerocopy::{decode_flat_dict_to_wrapped_py_object, FlatDictDataOwner};
 mod kvfuture;
 pub use kvfuture::KvFuture;
 mod error;
@@ -1930,6 +1950,451 @@ fn new_store_closed_error(py: Python, message: &str) -> PyObject {
     crate::error::new_store_closed_error(py, message)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RegisteredBufferRange {
+    start: usize,
+    end: usize,
+}
+
+impl RegisteredBufferRange {
+    fn contains(&self, ptr: usize, len: usize) -> bool {
+        if len == 0 {
+            return ptr >= self.start && ptr <= self.end;
+        }
+        let Some(req_end) = ptr.checked_add(len) else {
+            return false;
+        };
+        ptr >= self.start && req_end <= self.end
+    }
+}
+
+#[derive(Default, Debug)]
+struct RegisteredBufferRegistry {
+    ranges: Vec<RegisteredBufferRange>,
+}
+
+impl RegisteredBufferRegistry {
+    fn register(&mut self, ptr: usize, len: usize) {
+        let end = ptr.saturating_add(len);
+        self.ranges.push(RegisteredBufferRange { start: ptr, end });
+    }
+
+    fn contains(&self, ptr: usize, len: usize) -> bool {
+        self.ranges.iter().any(|range| range.contains(ptr, len))
+    }
+}
+
+const DEFAULT_PYO3_BATCH_CONCURRENCY: usize = 128;
+
+fn kv_error_to_ret_code(err: &CoreKvError) -> i32 {
+    match err {
+        CoreKvError::Config(inner) => -(inner.code() as i32),
+        CoreKvError::Api(inner) => -(inner.code() as i32),
+        CoreKvError::P2p(inner) => -(inner.code() as i32),
+        CoreKvError::SharedMem(inner) => -(inner.code() as i32),
+        CoreKvError::Unreachable(inner) => -(inner.code() as i32),
+        CoreKvError::ClusterManagerExt(inner) => -(inner.code() as i32),
+        CoreKvError::Metric(inner) => -(inner.code() as i32),
+        CoreKvError::LeaseMgr(inner) => -(inner.code() as i32),
+        CoreKvError::TransferEngine(inner) => -(inner.code() as i32),
+        CoreKvError::P2pTransfer(inner) => -(inner.code() as i32),
+    }
+}
+
+fn rpc_item_error_to_ret_code(error_code: u32, error_json: &str) -> i32 {
+    if error_code == OK {
+        0
+    } else {
+        let err = CoreKvError::from_json(error_code, error_json);
+        kv_error_to_ret_code(&err)
+    }
+}
+
+fn payload_slice_from_get_result<'a>(key: &str, get_result: &'a KvGetResult) -> KvResult<&'a [u8]> {
+    let data = match get_result {
+        KvGetResult::Owner(Some(holder)) => holder.bytes(),
+        KvGetResult::External(Some(holder)) => holder.bytes(),
+        KvGetResult::Owner(None) | KvGetResult::External(None) => {
+            return Err(CoreKvError::Api(CoreApiError::KeyNotFound {
+                key: key.to_string(),
+            }));
+        }
+    };
+
+    let entries = flat_kv_decode_borrowed(data).map_err(|detail| {
+        CoreKvError::Api(CoreApiError::Unknown {
+            detail: format!("decode flat dict for key {} failed: {}", key, detail),
+        })
+    })?;
+    for entry in entries {
+        if entry.key != "payload" {
+            continue;
+        }
+        if let BorrowedFlatKvValueRange::BytesRange { start, len } = entry.value {
+            let end = start.checked_add(len).ok_or_else(|| {
+                CoreKvError::Api(CoreApiError::Unknown {
+                    detail: format!("payload range overflow for key {}", key),
+                })
+            })?;
+            if end > data.len() {
+                return Err(CoreKvError::Api(CoreApiError::Unknown {
+                    detail: format!(
+                        "payload range out of bounds for key {}: end={} data_len={}",
+                        key,
+                        end,
+                        data.len()
+                    ),
+                }));
+            }
+            return Ok(&data[start..end]);
+        }
+        return Err(CoreKvError::Api(CoreApiError::InvalidArgument {
+            detail: format!("key {} payload field is not bytes", key),
+        }));
+    }
+
+    Err(CoreKvError::Api(CoreApiError::InvalidArgument {
+        detail: format!("key {} does not contain payload field", key),
+    }))
+}
+
+const FLUXON_PLAN_BLOB_MAGIC: u64 = 0x4658_504c_414e_5631;
+
+#[derive(Clone)]
+enum FluxonPlanRegistryEntry {
+    Put(Arc<FluxonPutPlan>),
+    Get(Arc<FluxonGetViewsPlan>),
+}
+
+enum FluxonPutPlanState {
+    Prepared(StagedPutPlanData),
+    Committing,
+}
+
+struct FluxonPutPlan {
+    blob: Box<[u64]>,
+    state: Mutex<FluxonPutPlanState>,
+}
+
+struct FluxonGetViewsPlan {
+    blob: Box<[u64]>,
+    _holders: Vec<StagedGetViewHolder>,
+}
+
+enum StagedGetViewHolder {
+    Owner { _holder: Arc<RustUserMemHolder> },
+    External { _holder: Arc<RustExternalMemHolder> },
+}
+
+fn external_get_start_result_to_py(
+    started: &fluxon_kv::external_client_api::ExternalClientGetStartResp,
+    py: Python,
+) -> PyObject {
+    let out = PyDict::new_bound(py);
+    out.set_item("handle", started.handle).expect("set handle");
+    out.set_item("raw_prefix_hit_len", started.raw_prefix_hit_len as u64)
+        .expect("set raw_prefix_hit_len");
+    out.into_py(py)
+}
+
+#[derive(Clone)]
+enum StagedPutPlanData {
+    Owner(StagedOwnerPutPlanData),
+    External(StagedExternalPutPlanData),
+}
+
+#[derive(Clone)]
+struct StagedOwnerPutPlanData {
+    keys: Vec<String>,
+    value_len: u64,
+    write_through: bool,
+    key_reservation_ids: Vec<u64>,
+    slot_lease: OwnerLocalReserveSlotLease,
+}
+
+#[derive(Clone)]
+struct StagedExternalPutPlanData {
+    keys: Vec<String>,
+    value_len: u64,
+    write_through: bool,
+    started_time: i64,
+    items: Vec<StagedExternalPutItem>,
+    short_circuit_payload: bool,
+}
+
+#[derive(Clone)]
+struct StagedExternalPutItem {
+    put_id: fluxon_kv::master_kv_router::put::PutIDForAKey,
+    src_offset: u64,
+    target_offset: u64,
+    transfer_target_offset: Option<u64>,
+    peer_id: Option<String>,
+    target_base_addr: u64,
+}
+
+#[derive(Clone)]
+struct StagedPutCommitItem {
+    idx: usize,
+    reserved_item: OwnerReservedPutItem,
+    slot_ref: OwnerLocalReserveSlotRef,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FluxonIoLocalitySnapshot {
+    op_count: u64,
+    bytes: u64,
+    transfer_us: u64,
+}
+
+impl FluxonIoLocalitySnapshot {
+    fn bandwidth_gbps(&self) -> f64 {
+        if self.transfer_us == 0 {
+            return 0.0;
+        }
+        (self.bytes as f64) / (self.transfer_us as f64 / 1_000_000.0) / 1_000_000_000.0
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct FluxonLocalitySnapshot {
+    l2_local_hit_pages: u64,
+    l2_local_hit_bytes: u64,
+    l2_remote_hit_pages: u64,
+    l2_remote_hit_bytes: u64,
+    put_local: FluxonIoLocalitySnapshot,
+    put_remote: FluxonIoLocalitySnapshot,
+    get_local: FluxonIoLocalitySnapshot,
+    get_remote: FluxonIoLocalitySnapshot,
+}
+
+#[derive(Default)]
+struct FluxonLocalityCounters {
+    l2_local_hit_pages: AtomicU64,
+    l2_local_hit_bytes: AtomicU64,
+    l2_remote_hit_pages: AtomicU64,
+    l2_remote_hit_bytes: AtomicU64,
+    put_local_ops: AtomicU64,
+    put_local_bytes: AtomicU64,
+    put_local_transfer_us: AtomicU64,
+    put_remote_ops: AtomicU64,
+    put_remote_bytes: AtomicU64,
+    put_remote_transfer_us: AtomicU64,
+    get_local_ops: AtomicU64,
+    get_local_bytes: AtomicU64,
+    get_local_transfer_us: AtomicU64,
+    get_remote_ops: AtomicU64,
+    get_remote_bytes: AtomicU64,
+    get_remote_transfer_us: AtomicU64,
+}
+
+impl FluxonLocalityCounters {
+    fn snapshot(&self) -> FluxonLocalitySnapshot {
+        FluxonLocalitySnapshot {
+            l2_local_hit_pages: self.l2_local_hit_pages.load(Ordering::Relaxed),
+            l2_local_hit_bytes: self.l2_local_hit_bytes.load(Ordering::Relaxed),
+            l2_remote_hit_pages: self.l2_remote_hit_pages.load(Ordering::Relaxed),
+            l2_remote_hit_bytes: self.l2_remote_hit_bytes.load(Ordering::Relaxed),
+            put_local: FluxonIoLocalitySnapshot {
+                op_count: self.put_local_ops.load(Ordering::Relaxed),
+                bytes: self.put_local_bytes.load(Ordering::Relaxed),
+                transfer_us: self.put_local_transfer_us.load(Ordering::Relaxed),
+            },
+            put_remote: FluxonIoLocalitySnapshot {
+                op_count: self.put_remote_ops.load(Ordering::Relaxed),
+                bytes: self.put_remote_bytes.load(Ordering::Relaxed),
+                transfer_us: self.put_remote_transfer_us.load(Ordering::Relaxed),
+            },
+            get_local: FluxonIoLocalitySnapshot {
+                op_count: self.get_local_ops.load(Ordering::Relaxed),
+                bytes: self.get_local_bytes.load(Ordering::Relaxed),
+                transfer_us: self.get_local_transfer_us.load(Ordering::Relaxed),
+            },
+            get_remote: FluxonIoLocalitySnapshot {
+                op_count: self.get_remote_ops.load(Ordering::Relaxed),
+                bytes: self.get_remote_bytes.load(Ordering::Relaxed),
+                transfer_us: self.get_remote_transfer_us.load(Ordering::Relaxed),
+            },
+        }
+    }
+
+    fn record_l2_hit(&self, remote: bool, bytes: u64) {
+        if remote {
+            self.l2_remote_hit_pages.fetch_add(1, Ordering::Relaxed);
+            self.l2_remote_hit_bytes.fetch_add(bytes, Ordering::Relaxed);
+        } else {
+            self.l2_local_hit_pages.fetch_add(1, Ordering::Relaxed);
+            self.l2_local_hit_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    fn record_put(&self, remote: bool, bytes: u64, transfer_us: i64) {
+        let transfer_us = transfer_us.max(0) as u64;
+        if remote {
+            self.put_remote_ops.fetch_add(1, Ordering::Relaxed);
+            self.put_remote_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.put_remote_transfer_us
+                .fetch_add(transfer_us, Ordering::Relaxed);
+        } else {
+            self.put_local_ops.fetch_add(1, Ordering::Relaxed);
+            self.put_local_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.put_local_transfer_us
+                .fetch_add(transfer_us, Ordering::Relaxed);
+        }
+    }
+
+    fn record_get(&self, remote: bool, bytes: u64, transfer_us: i64) {
+        let transfer_us = transfer_us.max(0) as u64;
+        if remote {
+            self.get_remote_ops.fetch_add(1, Ordering::Relaxed);
+            self.get_remote_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.get_remote_transfer_us
+                .fetch_add(transfer_us, Ordering::Relaxed);
+        } else {
+            self.get_local_ops.fetch_add(1, Ordering::Relaxed);
+            self.get_local_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.get_local_transfer_us
+                .fetch_add(transfer_us, Ordering::Relaxed);
+        }
+    }
+}
+
+fn build_plan_blob(value_ptrs: &[u64]) -> Box<[u64]> {
+    let mut words = Vec::with_capacity(2 + value_ptrs.len());
+    words.push(FLUXON_PLAN_BLOB_MAGIC);
+    words.push(value_ptrs.len() as u64);
+    words.extend_from_slice(value_ptrs);
+    words.into_boxed_slice()
+}
+
+fn plan_ptr_from_blob(blob: &[u64]) -> usize {
+    blob.as_ptr() as usize
+}
+
+fn plan_ptr_u64_to_usize(plan_ptr: u64, py: Python) -> Result<usize, PyObject> {
+    let plan_ptr_usize = usize::try_from(plan_ptr)
+        .map_err(|_| new_invalid_argument_error(py, "plan_ptr out of range"))?;
+    if plan_ptr_usize == 0 {
+        return Err(new_invalid_argument_error(py, "plan_ptr must be non-zero"));
+    }
+    Ok(plan_ptr_usize)
+}
+
+fn cleanup_plan_registry_entry(
+    registry: &Arc<RwLock<HashMap<usize, FluxonPlanRegistryEntry>>>,
+    plan_ptr: usize,
+) {
+    let mut guard = registry.write().expect("plan_registry poisoned");
+    guard.remove(&plan_ptr);
+}
+
+async fn release_staged_put_resources(
+    inner: &ClientKvApiInner,
+    key_reservation_ids: Vec<u64>,
+    slot_lease: OwnerLocalReserveSlotLease,
+) -> KvResult<()> {
+    let release_keys_result = inner
+        .batch_release_put_key_reservations(key_reservation_ids)
+        .await;
+    let release_slot_result = inner
+        .owner_release_local_reserve_slot_lease(slot_lease)
+        .await;
+    match (release_keys_result, release_slot_result) {
+        (Ok(_), Ok(_)) => Ok(()),
+        (Err(err), Ok(_)) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(primary_err), Err(cleanup_err)) => Err(CoreKvError::Api(CoreApiError::Unknown {
+            detail: format!(
+                "release_staged_put_resources failed twice: batch_release_put_key_reservations_err={} release_local_slot_lease_err={}",
+                primary_err, cleanup_err
+            ),
+        })),
+    }
+}
+
+async fn release_put_key_reservations_only(
+    inner: &ClientKvApiInner,
+    key_reservation_ids: Vec<u64>,
+) -> KvResult<()> {
+    inner
+        .batch_release_put_key_reservations(key_reservation_ids)
+        .await
+        .map(|_| ())
+}
+
+fn staged_put_uses_direct_local_commit(item: &OwnerReservedPutItem) -> bool {
+    !item.write_through || (item.peer_node_id.is_none() && item.src_addr == item.target_addr)
+}
+
+fn combine_kv_errors(
+    context: &str,
+    primary_err: CoreKvError,
+    secondary_err: CoreKvError,
+) -> CoreKvError {
+    CoreKvError::Api(CoreApiError::Unknown {
+        detail: format!(
+            "{}: primary_err={} secondary_err={}",
+            context, primary_err, secondary_err
+        ),
+    })
+}
+
+fn remove_precommit_local_visible_infos(
+    inner: &ClientKvApiInner,
+    keys: &[String],
+    memory_infos: &[Arc<RustMemoryInfo>],
+) {
+    for (key, memory_info) in keys.iter().zip(memory_infos.iter()) {
+        let _ = inner.remove_precommit_local_reserve_resident_slot_if_same(key, memory_info);
+    }
+}
+
+fn remove_precommit_local_visible_infos_for_items(
+    inner: &ClientKvApiInner,
+    items: &[StagedPutCommitItem],
+    memory_infos: &[Arc<RustMemoryInfo>],
+) {
+    for item in items {
+        let _ = inner.remove_precommit_local_reserve_resident_slot_if_same(
+            &item.reserved_item.key,
+            &memory_infos[item.idx],
+        );
+    }
+}
+
+async fn revoke_staged_put_items(
+    inner: &ClientKvApiInner,
+    items: &[StagedPutCommitItem],
+) -> KvResult<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    inner
+        .batch_put_revoke(
+            items
+                .iter()
+                .map(|item| BatchPutRevokeItemReq {
+                    key: item.reserved_item.key.clone(),
+                    put_id: item.reserved_item.put_id,
+                })
+                .collect(),
+        )
+        .await
+        .map(|_| ())
+}
+
+#[pyfunction]
+fn decode_flat_dict_payload(payload: Vec<u8>, py: Python<'_>) -> PyObject {
+    match decode_flat_dict_to_wrapped_py_object(py, FlatDictDataOwner::from_owned_bytes(payload)) {
+        Ok(value) => ApiResult::new_success(value).into_py_object(py),
+        Err(err) => ApiResult::<PyObject>::new_error(crate::error::py_error_from_kv_error(
+            py,
+            &err,
+            "flat dict decode failed",
+        ))
+        .into_py_object(py),
+    }
+}
+
 #[pyfunction]
 fn monitor_render_cli(config_path: String, workdir: String) -> PyResult<String> {
     let cfg_yaml = MonitorCliConfigYaml::from_file(std::path::Path::new(&config_path))
@@ -2676,6 +3141,9 @@ pub struct KvClient {
     // - Futures must not hold Arc<Runtime>; they should spawn via Handle clones only.
     runtime: Option<Runtime>,
     config: ClientConfig,
+    registered_buffers: RwLock<RegisteredBufferRegistry>,
+    plan_registry: Arc<RwLock<HashMap<usize, FluxonPlanRegistryEntry>>>,
+    locality_counters: Arc<FluxonLocalityCounters>,
 }
 
 #[pymethods]
@@ -2751,6 +3219,9 @@ impl KvClient {
                 framework: Some(framework),
                 runtime: Some(runtime),
                 config: final_config,
+                registered_buffers: RwLock::new(RegisteredBufferRegistry::default()),
+                plan_registry: Arc::new(RwLock::new(HashMap::new())),
+                locality_counters: Arc::new(FluxonLocalityCounters::default()),
             };
 
             match Py::new(py, client) {
@@ -2798,6 +3269,1524 @@ impl KvClient {
     /// Return the cluster name used by this client.
     fn cluster_name(&self) -> String {
         self.config.cluster_name.clone()
+    }
+
+    /// Wait until the local segment mapping is ready for direct hostless access.
+    fn wait_local_segments_ready(&self, py: Python) -> PyObject {
+        fn wait_local_segments_ready_inner(client: &KvClient, py: Python) -> ApiResult<PyObject> {
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+
+            if framework.is_external_mode() {
+                let framework_for_wait = framework.clone();
+                let ready_result = match py.allow_threads(|| {
+                    runtime.run_async_from_sync(async move {
+                        framework_for_wait
+                            .external_client_api_view()
+                            .external_client_api()
+                            .inner()
+                            .wait_current_owner_mapped_range()
+                            .await
+                    })
+                }) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return ApiResult::new_error(new_general_error(
+                            py,
+                            &format!("runtime bridge failed: {}", e),
+                        ));
+                    }
+                };
+                return match ready_result {
+                    Ok((node_id, owner_start_time, write_ptr, read_ptr, len)) => {
+                        let item = PyDict::new_bound(py);
+                        item.set_item("segment_label", "external_owner:0")
+                            .expect("set segment_label");
+                        item.set_item("write_ptr", write_ptr)
+                            .expect("set write_ptr");
+                        item.set_item("read_ptr", read_ptr).expect("set read_ptr");
+                        item.set_item("len", len).expect("set len");
+                        item.set_item("generation", owner_start_time)
+                            .expect("set generation");
+                        item.set_item("node_id", node_id).expect("set node_id");
+                        let out = PyList::empty_bound(py);
+                        out.append(item).expect("append external owner segment");
+                        ApiResult::new_success(out.into_py(py))
+                    }
+                    Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                        py,
+                        &err,
+                        "wait_local_segments_ready failed",
+                    )),
+                };
+            }
+
+            let self_info = framework
+                .cluster_manager_view()
+                .cluster_manager()
+                .get_self_info();
+            let framework_for_wait = framework.clone();
+            let ready_result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_wait
+                        .client_seg_pool_view()
+                        .client_seg_pool()
+                        .mapped_range()
+                        .await
+                        .ok_or_else(|| {
+                            CoreKvError::Api(CoreApiError::Unknown {
+                                detail: "local owner segment is not mounted".to_string(),
+                            })
+                        })
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+            match ready_result {
+                Ok((write_ptr, read_ptr, len)) => {
+                    let item = PyDict::new_bound(py);
+                    item.set_item("segment_label", "cpu:0")
+                        .expect("set segment_label");
+                    item.set_item("write_ptr", write_ptr)
+                        .expect("set write_ptr");
+                    item.set_item("read_ptr", read_ptr).expect("set read_ptr");
+                    item.set_item("len", len).expect("set len");
+                    item.set_item("generation", self_info.node_start_time)
+                        .expect("set generation");
+                    item.set_item("node_id", self_info.id).expect("set node_id");
+                    let out = PyList::empty_bound(py);
+                    out.append(item).expect("append local segment");
+                    ApiResult::new_success(out.into_py(py))
+                }
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "wait_local_segments_ready failed",
+                )),
+            }
+        }
+
+        wait_local_segments_ready_inner(self, py).into_py_object(py)
+    }
+
+    #[pyo3(signature = ())]
+    fn reserve_local_grant_blocking(&self, py: Python) -> PyObject {
+        fn reserve_local_grant_blocking_inner(
+            client: &KvClient,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            if framework.is_external_mode() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "reserve_local_grant_blocking currently only supports owner mode",
+                ));
+            }
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let framework_for_reserve = framework.clone();
+            let reserve_resp = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_reserve
+                        .client_kv_api_view()
+                        .client_kv_api()
+                        .inner()
+                        .reserve_local_grant()
+                        .await
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+            match reserve_resp {
+                Ok(resp) => ApiResult::new_success(
+                    (resp.grant_id, resp.addr, resp.base_addr, resp.len).into_py(py),
+                ),
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    &format!(
+                        "reserve_local_grant_blocking failed for fixed quantum={}B",
+                        OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES
+                    ),
+                )),
+            }
+        }
+
+        reserve_local_grant_blocking_inner(self, py).into_py_object(py)
+    }
+
+    #[pyo3(signature = (grant_id))]
+    fn release_local_grant_blocking(&self, grant_id: u64, py: Python) -> PyObject {
+        fn release_local_grant_blocking_inner(
+            client: &KvClient,
+            grant_id: u64,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            if framework.is_external_mode() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "release_local_grant_blocking currently only supports owner mode",
+                ));
+            }
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let framework_for_release = framework.clone();
+            let release_result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_release
+                        .client_kv_api_view()
+                        .client_kv_api()
+                        .inner()
+                        .release_local_grant(grant_id)
+                        .await
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+            match release_result {
+                Ok(()) => ApiResult::new_success(0i32.into_py(py)),
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "release_local_grant_blocking failed",
+                )),
+            }
+        }
+
+        release_local_grant_blocking_inner(self, grant_id, py).into_py_object(py)
+    }
+
+    #[pyo3(signature = (keys, value_len, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true))]
+    fn local_fast_put_start(
+        &self,
+        keys: Vec<String>,
+        value_len: u64,
+        reject_if_inflight_same_key: bool,
+        reject_if_exist_same_key: bool,
+        write_through: bool,
+        py: Python,
+    ) -> PyObject {
+        fn local_fast_put_start_inner(
+            client: &KvClient,
+            keys: Vec<String>,
+            value_len: u64,
+            reject_if_inflight_same_key: bool,
+            reject_if_exist_same_key: bool,
+            write_through: bool,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            if keys.is_empty() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "local_fast_put_start requires at least one key",
+                ));
+            }
+            if value_len == 0 {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "local_fast_put_start requires value_len > 0",
+                ));
+            }
+            if value_len > u32::MAX as u64 {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "local_fast_put_start value_len exceeds u32 limit",
+                ));
+            }
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+
+            if framework.is_external_mode() {
+                let framework_for_start = framework.clone();
+                let keys_for_req = keys.clone();
+                let external_start_result = match py.allow_threads(|| {
+                    runtime.run_async_from_sync(async move {
+                        let external_api_view = framework_for_start.external_client_api_view();
+                        let inner = external_api_view.external_client_api().inner();
+                        let started_time = inner.current_owner_start_time().await;
+                        let base_addr = inner.base_ptr().await?;
+                        let short_circuit_payload = inner.short_circuit_put_payload_path_enabled();
+                        let resp = inner
+                            .external_batch_put_start_rpc(ExternalBatchPutStartReq {
+                                items: keys_for_req
+                                    .iter()
+                                    .map(|key| ExternalBatchPutStartItemReq {
+                                        key: key.clone(),
+                                        len: value_len,
+                                        reject_if_inflight_same_key,
+                                        reject_if_exist_same_key,
+                                        write_through,
+                                        preferred_sub_cluster: None,
+                                    })
+                                    .collect(),
+                                started_time,
+                            })
+                            .await?;
+                        Ok::<_, CoreKvError>((base_addr, started_time, short_circuit_payload, resp))
+                    })
+                }) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return ApiResult::new_error(new_general_error(
+                            py,
+                            &format!("runtime bridge failed: {}", e),
+                        ));
+                    }
+                };
+                let (base_addr, started_time, short_circuit_payload, resp) =
+                    match external_start_result {
+                        Ok(v) => v,
+                        Err(err) => {
+                            return ApiResult::new_error(crate::error::py_error_from_kv_error(
+                                py,
+                                &err,
+                                "local_fast_put_start failed",
+                            ));
+                        }
+                    };
+                let revoke_started_puts = |started_items: Vec<(
+                    String,
+                    fluxon_kv::master_kv_router::put::PutIDForAKey,
+                )>|
+                 -> Option<CoreKvError> {
+                    if started_items.is_empty() {
+                        return None;
+                    }
+                    let framework_for_revoke = framework.clone();
+                    match py.allow_threads(|| {
+                        runtime.run_async_from_sync(async move {
+                            let external_api_view = framework_for_revoke.external_client_api_view();
+                            let inner = external_api_view.external_client_api().inner();
+                            for (key, put_id) in started_items {
+                                inner
+                                    .external_put_revoke_rpc(ExternalPutRevokeReq {
+                                        key,
+                                        put_id: Some(put_id),
+                                        started_time,
+                                    })
+                                    .await?;
+                            }
+                            Ok::<(), CoreKvError>(())
+                        })
+                    }) {
+                        Ok(Ok(())) => None,
+                        Ok(Err(err)) => Some(err),
+                        Err(err) => Some(CoreKvError::Api(CoreApiError::Unknown {
+                            detail: format!(
+                                "runtime bridge failed during external local_fast_put_start cleanup: {}",
+                                err
+                            ),
+                        })),
+                    }
+                };
+                let local_fast_put_start_error = |primary_err: CoreKvError,
+                                                  cleanup_err: Option<CoreKvError>|
+                 -> ApiResult<PyObject> {
+                    let err = match cleanup_err {
+                        Some(cleanup_err) => combine_kv_errors(
+                            "local_fast_put_start external cleanup failed",
+                            primary_err,
+                            cleanup_err,
+                        ),
+                        None => primary_err,
+                    };
+                    ApiResult::new_error(crate::error::py_error_from_kv_error(
+                        py,
+                        &err,
+                        "local_fast_put_start failed",
+                    ))
+                };
+                if resp.items.len() != keys.len() {
+                    let started_items = keys
+                        .iter()
+                        .zip(resp.items.iter())
+                        .filter_map(|(key, item)| {
+                            if item.error_code == OK {
+                                item.put_id.map(|put_id| (key.clone(), put_id))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let err = CoreKvError::Api(CoreApiError::Unknown {
+                        detail: format!(
+                            "local_fast_put_start external response length mismatch: expected={} got={}",
+                            keys.len(),
+                            resp.items.len()
+                        ),
+                    });
+                    return local_fast_put_start_error(err, revoke_started_puts(started_items));
+                }
+                let mut value_ptrs = Vec::with_capacity(keys.len());
+                let mut items = Vec::with_capacity(keys.len());
+                let mut started_items = Vec::with_capacity(keys.len());
+                for (key, item) in keys.iter().zip(resp.items.into_iter()) {
+                    if item.error_code != OK {
+                        let err = CoreKvError::from_json(item.error_code, &item.error_json);
+                        return local_fast_put_start_error(err, revoke_started_puts(started_items));
+                    }
+                    let Some(put_id) = item.put_id else {
+                        let err = CoreKvError::Api(CoreApiError::Unknown {
+                            detail: format!(
+                                "local_fast_put_start external missing put_id in success response for key={}",
+                                key
+                            ),
+                        });
+                        return local_fast_put_start_error(err, revoke_started_puts(started_items));
+                    };
+                    started_items.push((key.clone(), put_id));
+                    let value_ptr = (base_addr as u64)
+                        .checked_add(item.target_offset)
+                        .ok_or_else(|| {
+                            CoreKvError::Api(CoreApiError::Unknown {
+                                detail: "local_fast_put_start external value ptr overflow"
+                                    .to_string(),
+                            })
+                        });
+                    let value_ptr = match value_ptr {
+                        Ok(v) => v,
+                        Err(err) => {
+                            return local_fast_put_start_error(
+                                err,
+                                revoke_started_puts(started_items),
+                            );
+                        }
+                    };
+                    value_ptrs.push(value_ptr);
+                    items.push(StagedExternalPutItem {
+                        put_id,
+                        src_offset: item.src_offset,
+                        target_offset: item.target_offset,
+                        transfer_target_offset: item.transfer_target_offset,
+                        peer_id: item.peer_id,
+                        target_base_addr: item.target_base_addr,
+                    });
+                }
+                let plan = Arc::new(FluxonPutPlan {
+                    blob: build_plan_blob(&value_ptrs),
+                    state: Mutex::new(FluxonPutPlanState::Prepared(StagedPutPlanData::External(
+                        StagedExternalPutPlanData {
+                            keys,
+                            value_len,
+                            write_through,
+                            started_time,
+                            items,
+                            short_circuit_payload,
+                        },
+                    ))),
+                });
+                let plan_ptr = plan_ptr_from_blob(plan.blob.as_ref());
+                client
+                    .plan_registry
+                    .write()
+                    .expect("plan_registry poisoned")
+                    .insert(plan_ptr, FluxonPlanRegistryEntry::Put(plan));
+                return ApiResult::new_success((plan_ptr as u64).into_py(py));
+            }
+
+            let key_count = keys.len();
+            let framework_for_start = framework.clone();
+            let prepare_items = keys
+                .iter()
+                .map(|key| BatchPreparePutKeyItemReq {
+                    key: key.clone(),
+                    reject_if_inflight_same_key,
+                    reject_if_exist_same_key,
+                })
+                .collect::<Vec<_>>();
+
+            let prepare_and_slot_lease_result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    let client_kv_api_view = framework_for_start.client_kv_api_view();
+                    let inner = client_kv_api_view.client_kv_api().inner();
+                    let prepared = inner.batch_prepare_put_keys(prepare_items).await?;
+                    if prepared.reservation_ids.len() != key_count {
+                        let cleanup_result = inner
+                            .batch_release_put_key_reservations(prepared.reservation_ids.clone())
+                            .await;
+                        return match cleanup_result {
+                            Ok(_) => Err(CoreKvError::Api(CoreApiError::Unknown {
+                                detail: format!(
+                                    "local_fast_put_start reservation length mismatch: expected={} got={}",
+                                    key_count,
+                                    prepared.reservation_ids.len()
+                                ),
+                            })),
+                            Err(cleanup_err) => Err(CoreKvError::Api(CoreApiError::Unknown {
+                                detail: format!(
+                                    "local_fast_put_start reservation length mismatch and cleanup failed: expected={} got={} cleanup_err={}",
+                                    key_count,
+                                    prepared.reservation_ids.len(),
+                                    cleanup_err
+                                ),
+                            })),
+                        };
+                    }
+                    let slot_lease = match inner
+                        .owner_claim_local_reserve_slot_lease(value_len, key_count)
+                        .await
+                    {
+                        Ok(slot_lease) => slot_lease,
+                        Err(err) => {
+                            let cleanup_result = inner
+                                .batch_release_put_key_reservations(prepared.reservation_ids.clone())
+                                .await;
+                            return match cleanup_result {
+                                Ok(_) => Err(err),
+                                Err(cleanup_err) => Err(CoreKvError::Api(CoreApiError::Unknown {
+                                    detail: format!(
+                                        "local_fast_put_start reserve_local_grant failed: {} cleanup_err={}",
+                                        err, cleanup_err
+                                    ),
+                                })),
+                            };
+                        }
+                    };
+                    Ok((prepared.reservation_ids, slot_lease))
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+
+            let (key_reservation_ids, slot_lease) = match prepare_and_slot_lease_result {
+                Ok(v) => v,
+                Err(err) => {
+                    return ApiResult::new_error(crate::error::py_error_from_kv_error(
+                        py,
+                        &err,
+                        "local_fast_put_start failed",
+                    ));
+                }
+            };
+
+            let value_ptrs = slot_lease.value_ptrs();
+
+            let plan = Arc::new(FluxonPutPlan {
+                blob: build_plan_blob(&value_ptrs),
+                state: Mutex::new(FluxonPutPlanState::Prepared(StagedPutPlanData::Owner(
+                    StagedOwnerPutPlanData {
+                        keys,
+                        value_len,
+                        write_through,
+                        key_reservation_ids,
+                        slot_lease,
+                    },
+                ))),
+            });
+            let plan_ptr = plan_ptr_from_blob(plan.blob.as_ref());
+            client
+                .plan_registry
+                .write()
+                .expect("plan_registry poisoned")
+                .insert(plan_ptr, FluxonPlanRegistryEntry::Put(plan));
+            ApiResult::new_success((plan_ptr as u64).into_py(py))
+        }
+
+        local_fast_put_start_inner(
+            self,
+            keys,
+            value_len,
+            reject_if_inflight_same_key,
+            reject_if_exist_same_key,
+            write_through,
+            py,
+        )
+        .into_py_object(py)
+    }
+
+    #[pyo3(signature = (plan_ptr))]
+    fn local_fast_put_commit(&self, plan_ptr: u64, py: Python) -> PyObject {
+        fn local_fast_put_commit_inner(
+            client: &KvClient,
+            plan_ptr: u64,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let plan_ptr_usize = match plan_ptr_u64_to_usize(plan_ptr, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let runtime_handle = match client.runtime.as_ref() {
+                Some(v) => v.handle().clone(),
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let registry_entry = {
+                let guard = client.plan_registry.read().expect("plan_registry poisoned");
+                guard.get(&plan_ptr_usize).cloned()
+            };
+            let Some(FluxonPlanRegistryEntry::Put(plan)) = registry_entry else {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "local_fast_put_commit requires a live put plan_ptr",
+                ));
+            };
+            let plan_data = {
+                let mut state_guard = plan.state.lock().expect("put plan state poisoned");
+                match std::mem::replace(&mut *state_guard, FluxonPutPlanState::Committing) {
+                    FluxonPutPlanState::Prepared(data) => data,
+                    FluxonPutPlanState::Committing => {
+                        return ApiResult::new_error(new_invalid_argument_error(
+                            py,
+                            "local_fast_put_commit cannot be called twice on the same plan_ptr",
+                        ));
+                    }
+                }
+            };
+            let framework_for_commit = framework.clone();
+            let plan_registry = client.plan_registry.clone();
+            let transfer_concurrency = 128usize;
+            let future = async move {
+                let ret_codes = match plan_data {
+                    StagedPutPlanData::External(external_data) => {
+                        let external_api_view = framework_for_commit.external_client_api_view();
+                        let inner = external_api_view.external_client_api().inner();
+                        let keys = external_data.keys;
+                        let items = external_data.items;
+                        let result = if external_data.short_circuit_payload {
+                            inner
+                                .external_batch_put_commit_rpc(ExternalBatchPutCommitReq {
+                                    items: keys
+                                        .iter()
+                                        .zip(items.iter())
+                                        .map(|(key, item)| ExternalBatchPutCommitItemReq {
+                                            key: key.clone(),
+                                            len: external_data.value_len,
+                                            src_offset: item.src_offset,
+                                            remote_target: item.peer_id.is_some(),
+                                            put_id: Some(item.put_id),
+                                            lease_id: None,
+                                            write_through: external_data.write_through,
+                                        })
+                                        .collect(),
+                                    started_time: external_data.started_time,
+                                })
+                                .await
+                                .map(|resp| {
+                                    resp.items
+                                        .into_iter()
+                                        .map(|item| {
+                                            rpc_item_error_to_ret_code(
+                                                item.error_code,
+                                                &item.error_json,
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                        } else {
+                            inner
+                                .external_batch_put_transfer_end_rpc(
+                                    ExternalBatchPutTransferEndReq {
+                                        items: keys
+                                            .iter()
+                                            .zip(items.iter())
+                                            .map(|(key, item)| ExternalBatchPutTransferEndItemReq {
+                                                key: key.clone(),
+                                                len: external_data.value_len,
+                                                src_offset: item.src_offset,
+                                                target_offset: item
+                                                    .transfer_target_offset
+                                                    .unwrap_or(item.target_offset),
+                                                peer_id: item.peer_id.clone(),
+                                                target_base_addr: if item.peer_id.is_some() {
+                                                    Some(item.target_base_addr)
+                                                } else {
+                                                    None
+                                                },
+                                                put_id: Some(item.put_id),
+                                                write_through: external_data.write_through,
+                                                lease_id: None,
+                                            })
+                                            .collect(),
+                                        started_time: external_data.started_time,
+                                        transfer_concurrency,
+                                    },
+                                )
+                                .await
+                                .map(|resp| {
+                                    resp.items
+                                        .into_iter()
+                                        .map(|item| {
+                                            rpc_item_error_to_ret_code(
+                                                item.error_code,
+                                                &item.error_json,
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                        };
+                        match result {
+                            Ok(ret_codes) => ret_codes,
+                            Err(err) => vec![kv_error_to_ret_code(&err); keys.len()],
+                        }
+                    }
+                    StagedPutPlanData::Owner(owner_data) => {
+                        let client_kv_api_view = framework_for_commit.client_kv_api_view();
+                        let inner = client_kv_api_view.client_kv_api().inner();
+                        let start_items = owner_data
+                            .keys
+                            .iter()
+                            .map(|key| BatchPutStartItemReq {
+                                key: key.clone(),
+                                len: owner_data.value_len,
+                                reject_if_inflight_same_key: false,
+                                reject_if_exist_same_key: false,
+                                write_through: owner_data.write_through,
+                                preferred_sub_cluster: None,
+                            })
+                            .collect::<Vec<_>>();
+                        let slot_refs = owner_data.slot_lease.slots.clone();
+                        let slot_size = owner_data.slot_lease.slot_size;
+                        let value_len_usize = match usize::try_from(owner_data.value_len) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                let err = CoreKvError::Api(CoreApiError::InvalidArgument {
+                                    detail:
+                                        "local_fast_put_commit value_len does not fit into usize"
+                                            .to_string(),
+                                });
+                                let _ = release_staged_put_resources(
+                                    inner,
+                                    owner_data.key_reservation_ids,
+                                    owner_data.slot_lease,
+                                )
+                                .await;
+                                return ApiResult::new_success(vec![
+                                    kv_error_to_ret_code(&err);
+                                    owner_data.keys.len()
+                                ]);
+                            }
+                        };
+                        let mut memory_infos = Vec::with_capacity(owner_data.keys.len());
+                        for (key, slot_ref) in owner_data.keys.iter().zip(slot_refs.iter()) {
+                            let memory_info = inner
+                                .build_local_reserve_resident_memory_info(
+                                    key,
+                                    slot_ref.ptr,
+                                    owner_data.value_len as u32,
+                                    slot_size,
+                                    slot_ref.grant_id,
+                                    slot_ref.slot_index,
+                                )
+                                .await;
+                            inner.install_precommit_local_visible_memory_info(
+                                key,
+                                memory_info.clone(),
+                            );
+                            memory_infos.push(memory_info);
+                        }
+                        let mut ret_codes = Vec::with_capacity(owner_data.keys.len());
+                        match inner
+                            .owner_batch_put_start_reserved(start_items, None)
+                            .await
+                        {
+                            Ok(prepared_items) if prepared_items.len() == slot_refs.len() => {
+                                let mut direct_items = Vec::new();
+                                let mut copy_items = Vec::new();
+                                for (idx, (reserved_item, slot_ref)) in prepared_items
+                                    .into_iter()
+                                    .zip(slot_refs.iter().cloned())
+                                    .enumerate()
+                                {
+                                    let item = StagedPutCommitItem {
+                                        idx,
+                                        reserved_item,
+                                        slot_ref,
+                                    };
+                                    if staged_put_uses_direct_local_commit(&item.reserved_item) {
+                                        direct_items.push(item);
+                                    } else {
+                                        copy_items.push(item);
+                                    }
+                                }
+
+                                let mut item_results: Vec<Option<i32>> =
+                                    (0..slot_refs.len()).map(|_| None).collect();
+
+                                if !copy_items.is_empty() {
+                                    let reserved_copy_items = copy_items
+                                        .iter()
+                                        .map(|item| item.reserved_item.clone())
+                                        .collect::<Vec<_>>();
+                                    for item in &copy_items {
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(
+                                                item.slot_ref.ptr as *const u8,
+                                                item.reserved_item.src_addr as *mut u8,
+                                                value_len_usize,
+                                            );
+                                        }
+                                    }
+                                    match inner
+                                        .owner_batch_put_commit_reserved(
+                                            reserved_copy_items,
+                                            transfer_concurrency,
+                                        )
+                                        .await
+                                    {
+                                        Ok(copy_results)
+                                            if copy_results.len() == copy_items.len() =>
+                                        {
+                                            for (item, result) in
+                                                copy_items.iter().zip(copy_results.into_iter())
+                                            {
+                                                item_results[item.idx] = Some(match result {
+                                                    Ok(()) => 0,
+                                                    Err(err) => kv_error_to_ret_code(&err),
+                                                });
+                                            }
+                                        }
+                                        Ok(copy_results) => {
+                                            let err = CoreKvError::Api(CoreApiError::Unknown {
+                                                detail: format!(
+                                                    "local_fast_put_commit copy result length mismatch: expected={} got={}",
+                                                    copy_items.len(),
+                                                    copy_results.len()
+                                                ),
+                                            });
+                                            let code = kv_error_to_ret_code(&err);
+                                            for item in &copy_items {
+                                                item_results[item.idx] = Some(code);
+                                            }
+                                        }
+                                        Err(err) => {
+                                            let code = kv_error_to_ret_code(&err);
+                                            for item in &copy_items {
+                                                item_results[item.idx] = Some(code);
+                                            }
+                                        }
+                                    }
+                                    remove_precommit_local_visible_infos_for_items(
+                                        inner,
+                                        &copy_items,
+                                        &memory_infos,
+                                    );
+                                }
+
+                                if !direct_items.is_empty() {
+                                    let direct_done_req_items = direct_items
+                                        .iter()
+                                        .map(|item| BatchPutDoneItemReq {
+                                            key: item.reserved_item.key.clone(),
+                                            put_id: item.reserved_item.put_id,
+                                            lease_id: item.reserved_item.lease_id,
+                                            committed_slot: Some(PutDoneCommittedSlot {
+                                                grant_id: item.slot_ref.grant_id,
+                                                slot_index: item.slot_ref.slot_index,
+                                                slot_size,
+                                                addr: item.slot_ref.ptr,
+                                                base_addr: item.slot_ref.base_addr,
+                                                len: owner_data.value_len,
+                                            }),
+                                            publish_local_cache: false,
+                                        })
+                                        .collect::<Vec<_>>();
+                                    match inner.batch_put_done(direct_done_req_items).await {
+                                        Ok(done_resp)
+                                            if done_resp.items.len() == direct_items.len() =>
+                                        {
+                                            for (item, done_item) in
+                                                direct_items.iter().zip(done_resp.items.into_iter())
+                                            {
+                                                let result =
+                                                    fluxon_kv::rpcresp_kvresult_convert::try_from_code(
+                                                        done_item.error_code,
+                                                        done_item.error_json.clone(),
+                                                    );
+                                                if result.is_ok() {
+                                                    let promote = inner
+                                                        .promote_precommit_local_reserve_resident_slot_if_same(
+                                                            &item.reserved_item.key,
+                                                            item.reserved_item.put_id,
+                                                            memory_infos[item.idx].clone(),
+                                                        );
+                                                    if item.reserved_item.enqueue_write_back_append
+                                                    {
+                                                        if let Err(err) = inner
+                                                            .enqueue_write_back_remote_append(
+                                                                &item.reserved_item.key,
+                                                                item.reserved_item.put_id,
+                                                                item.reserved_item
+                                                                    .preferred_sub_cluster
+                                                                    .as_deref(),
+                                                            )
+                                                            .await
+                                                        {
+                                                            tracing::warn!(
+                                                                "local_fast_put_commit write-back remote append enqueue failed after direct local commit: key={} put_id=({},{}) err={}",
+                                                                item.reserved_item.key,
+                                                                item.reserved_item.put_id.0,
+                                                                item.reserved_item.put_id.1,
+                                                                err
+                                                            );
+                                                        }
+                                                    }
+                                                    inner.record_put_locality(
+                                                        false,
+                                                        owner_data.value_len,
+                                                        0,
+                                                    );
+                                                    item_results[item.idx] = Some(match promote {
+                                                        Ok(()) => 0,
+                                                        Err(err) => kv_error_to_ret_code(&err),
+                                                    });
+                                                } else if let Err(err) = result {
+                                                    item_results[item.idx] =
+                                                        Some(kv_error_to_ret_code(&err));
+                                                    let _ = inner
+                                                        .remove_precommit_local_reserve_resident_slot_if_same(
+                                                            &item.reserved_item.key,
+                                                            &memory_infos[item.idx],
+                                                        );
+                                                }
+                                            }
+                                        }
+                                        Ok(done_resp) => {
+                                            let err = CoreKvError::Api(CoreApiError::Unknown {
+                                                detail: format!(
+                                                    "local_fast_put_commit direct done response length mismatch: expected={} got={}",
+                                                    direct_items.len(),
+                                                    done_resp.items.len()
+                                                ),
+                                            });
+                                            let code = kv_error_to_ret_code(&err);
+                                            for item in &direct_items {
+                                                item_results[item.idx] = Some(code);
+                                            }
+                                            remove_precommit_local_visible_infos_for_items(
+                                                inner,
+                                                &direct_items,
+                                                &memory_infos,
+                                            );
+                                        }
+                                        Err(err) => {
+                                            let code = kv_error_to_ret_code(&err);
+                                            for item in &direct_items {
+                                                item_results[item.idx] = Some(code);
+                                            }
+                                            let _ =
+                                                revoke_staged_put_items(inner, &direct_items).await;
+                                            remove_precommit_local_visible_infos_for_items(
+                                                inner,
+                                                &direct_items,
+                                                &memory_infos,
+                                            );
+                                        }
+                                    }
+                                }
+
+                                for item in item_results {
+                                    ret_codes.push(item.unwrap_or_else(|| {
+                                        let err = CoreKvError::Api(CoreApiError::Unknown {
+                                            detail: "local_fast_put_commit result slot missing"
+                                                .to_string(),
+                                        });
+                                        kv_error_to_ret_code(&err)
+                                    }));
+                                }
+                            }
+                            Ok(prepared_items) => {
+                                let err = CoreKvError::Api(CoreApiError::Unknown {
+                                    detail: format!(
+                                        "local_fast_put_commit final reserve length mismatch: expected={} got={}",
+                                        slot_refs.len(),
+                                        prepared_items.len()
+                                    ),
+                                });
+                                let _ = inner.owner_batch_put_abort_reserved(prepared_items).await;
+                                remove_precommit_local_visible_infos(
+                                    inner,
+                                    &owner_data.keys,
+                                    &memory_infos,
+                                );
+                                ret_codes = vec![kv_error_to_ret_code(&err); owner_data.keys.len()];
+                            }
+                            Err(err) => {
+                                remove_precommit_local_visible_infos(
+                                    inner,
+                                    &owner_data.keys,
+                                    &memory_infos,
+                                );
+                                ret_codes = vec![kv_error_to_ret_code(&err); owner_data.keys.len()];
+                            }
+                        }
+                        if let Err(err) =
+                            release_put_key_reservations_only(inner, owner_data.key_reservation_ids)
+                                .await
+                        {
+                            tracing::warn!(
+                                "local_fast_put_commit key reservation cleanup failed: {}",
+                                err
+                            );
+                        }
+                        ret_codes
+                    }
+                };
+                cleanup_plan_registry_entry(&plan_registry, plan_ptr_usize);
+                ApiResult::new_success(ret_codes)
+            };
+            match KvFuture::new(future, runtime_handle, py) {
+                Ok(v) => ApiResult::new_success(v.into_any()),
+                Err(e) => ApiResult::new_error(new_general_error(
+                    py,
+                    &format!("Failed to create future: {}", e),
+                )),
+            }
+        }
+
+        local_fast_put_commit_inner(self, plan_ptr, py).into_py_object(py)
+    }
+
+    #[pyo3(signature = (plan_ptr))]
+    fn put_abort(&self, plan_ptr: u64, py: Python) -> PyObject {
+        fn put_abort_inner(client: &KvClient, plan_ptr: u64, py: Python) -> ApiResult<PyObject> {
+            let plan_ptr_usize = match plan_ptr_u64_to_usize(plan_ptr, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let removed = {
+                let mut guard = client
+                    .plan_registry
+                    .write()
+                    .expect("plan_registry poisoned");
+                guard.remove(&plan_ptr_usize)
+            };
+            let Some(FluxonPlanRegistryEntry::Put(plan)) = removed else {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "put_abort requires a live put plan_ptr",
+                ));
+            };
+            let plan_data = {
+                let mut state_guard = plan.state.lock().expect("put plan state poisoned");
+                match std::mem::replace(&mut *state_guard, FluxonPutPlanState::Committing) {
+                    FluxonPutPlanState::Prepared(data) => data,
+                    FluxonPutPlanState::Committing => {
+                        return ApiResult::new_error(new_invalid_argument_error(
+                            py,
+                            "put_abort cannot be used after local_fast_put_commit",
+                        ));
+                    }
+                }
+            };
+            let abort_result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    match plan_data {
+                        StagedPutPlanData::External(external_data) => {
+                            let external_api_view = framework.external_client_api_view();
+                            let inner = external_api_view.external_client_api().inner();
+                            for (key, item) in
+                                external_data.keys.iter().zip(external_data.items.iter())
+                            {
+                                inner
+                                    .external_put_revoke_rpc(ExternalPutRevokeReq {
+                                        key: key.clone(),
+                                        put_id: Some(item.put_id),
+                                        started_time: external_data.started_time,
+                                    })
+                                    .await?;
+                            }
+                            Ok::<(), CoreKvError>(())
+                        }
+                        StagedPutPlanData::Owner(owner_data) => {
+                            let client_kv_api_view = framework.client_kv_api_view();
+                            let inner = client_kv_api_view.client_kv_api().inner();
+                            release_staged_put_resources(
+                                inner,
+                                owner_data.key_reservation_ids,
+                                owner_data.slot_lease,
+                            )
+                            .await
+                        }
+                    }
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+            match abort_result {
+                Ok(()) => ApiResult::new_success(0i32.into_py(py)),
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "put_abort failed",
+                )),
+            }
+        }
+
+        put_abort_inner(self, plan_ptr, py).into_py_object(py)
+    }
+
+    #[pyo3(signature = (keys, concurrency=None))]
+    fn get_views(&self, keys: Vec<String>, concurrency: Option<usize>, py: Python) -> PyObject {
+        fn get_views_inner(
+            client: &KvClient,
+            keys: Vec<String>,
+            concurrency: Option<usize>,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            if keys.is_empty() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "get_views requires at least one key",
+                ));
+            }
+            if matches!(concurrency, Some(0)) {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "batch_concurrency must be > 0",
+                ));
+            }
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let keys_for_get = keys.clone();
+            let locality_counters = client.locality_counters.clone();
+            let result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    let mut holders = Vec::with_capacity(keys_for_get.len());
+                    let mut value_ptrs = Vec::with_capacity(keys_for_get.len());
+                    for key in &keys_for_get {
+                        match framework.kv_get(key).await? {
+                            KvGetResult::Owner(Some(holder)) => {
+                                let bytes = holder.bytes().len() as u64;
+                                locality_counters.record_l2_hit(false, bytes);
+                                locality_counters.record_get(false, bytes, 0);
+                                value_ptrs.push(holder.bytes().as_ptr() as u64);
+                                holders.push(StagedGetViewHolder::Owner { _holder: holder });
+                            }
+                            KvGetResult::External(Some(holder)) => {
+                                let bytes = holder.bytes().len() as u64;
+                                locality_counters.record_l2_hit(true, bytes);
+                                locality_counters.record_get(true, bytes, 0);
+                                value_ptrs.push(holder.bytes().as_ptr() as u64);
+                                holders.push(StagedGetViewHolder::External { _holder: holder });
+                            }
+                            KvGetResult::Owner(None) | KvGetResult::External(None) => {
+                                return Err(CoreKvError::Api(CoreApiError::KeyNotFound {
+                                    key: key.clone(),
+                                }));
+                            }
+                        }
+                    }
+                    Ok::<_, CoreKvError>((value_ptrs, holders))
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+            let (value_ptrs, holders) = match result {
+                Ok(v) => v,
+                Err(err) => {
+                    return ApiResult::new_error(crate::error::py_error_from_kv_error(
+                        py,
+                        &err,
+                        "get_views failed",
+                    ));
+                }
+            };
+            let plan = Arc::new(FluxonGetViewsPlan {
+                blob: build_plan_blob(&value_ptrs),
+                _holders: holders,
+            });
+            let plan_ptr = plan_ptr_from_blob(plan.blob.as_ref());
+            client
+                .plan_registry
+                .write()
+                .expect("plan_registry poisoned")
+                .insert(plan_ptr, FluxonPlanRegistryEntry::Get(plan));
+            ApiResult::new_success((plan_ptr as u64).into_py(py))
+        }
+
+        get_views_inner(self, keys, concurrency, py).into_py_object(py)
+    }
+
+    #[pyo3(signature = (plan_ptr))]
+    fn release_views(&self, plan_ptr: u64, py: Python) -> PyObject {
+        fn release_views_inner(
+            client: &KvClient,
+            plan_ptr: u64,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let plan_ptr_usize = match plan_ptr_u64_to_usize(plan_ptr, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let removed = {
+                let mut guard = client
+                    .plan_registry
+                    .write()
+                    .expect("plan_registry poisoned");
+                guard.remove(&plan_ptr_usize)
+            };
+            match removed {
+                Some(FluxonPlanRegistryEntry::Get(_plan)) => {
+                    ApiResult::new_success(0i32.into_py(py))
+                }
+                Some(FluxonPlanRegistryEntry::Put(_)) => ApiResult::new_error(
+                    new_invalid_argument_error(py, "release_views requires a get-views plan_ptr"),
+                ),
+                None => ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "release_views requires a live get-views plan_ptr",
+                )),
+            }
+        }
+
+        release_views_inner(self, plan_ptr, py).into_py_object(py)
+    }
+
+    #[pyo3(signature = (keys, prefix_best_effort=true, atomic_group_lens=None, concurrency=None))]
+    fn get_start(
+        &self,
+        keys: Vec<String>,
+        prefix_best_effort: bool,
+        atomic_group_lens: Option<Vec<usize>>,
+        concurrency: Option<usize>,
+        py: Python,
+    ) -> PyObject {
+        fn get_start_inner(
+            client: &KvClient,
+            keys: Vec<String>,
+            prefix_best_effort: bool,
+            atomic_group_lens: Option<Vec<usize>>,
+            concurrency: Option<usize>,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            if keys.is_empty() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "get_start requires at least one key",
+                ));
+            }
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            if !framework.is_external_mode() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "get_start is supported only in external-client mode",
+                ));
+            }
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let batch_concurrency = match concurrency.unwrap_or(DEFAULT_PYO3_BATCH_CONCURRENCY) {
+                0 => {
+                    return ApiResult::new_error(new_invalid_argument_error(
+                        py,
+                        "batch_concurrency must be > 0",
+                    ));
+                }
+                v => v,
+            };
+            let framework_for_start = framework.clone();
+            let started = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_start
+                        .external_client_api_view()
+                        .external_client_api()
+                        .inner()
+                        .get_start(
+                            keys,
+                            prefix_best_effort,
+                            atomic_group_lens,
+                            batch_concurrency,
+                        )
+                        .await
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+            match started {
+                Ok(v) => ApiResult::new_success(external_get_start_result_to_py(&v, py)),
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "get_start failed",
+                )),
+            }
+        }
+
+        get_start_inner(
+            self,
+            keys,
+            prefix_best_effort,
+            atomic_group_lens,
+            concurrency,
+            py,
+        )
+        .into_py_object(py)
+    }
+
+    #[pyo3(signature = (handle))]
+    fn get_transfer(&self, handle: u64, py: Python) -> PyObject {
+        fn get_transfer_inner(client: &KvClient, handle: u64, py: Python) -> ApiResult<PyObject> {
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            if !framework.is_external_mode() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "get_transfer is supported only in external-client mode",
+                ));
+            }
+            let framework_for_transfer = framework.clone();
+            let transfer_results = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_transfer
+                        .external_client_api_view()
+                        .external_client_api()
+                        .inner()
+                        .get_transfer(handle)
+                        .await
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+            let transfer_results = match transfer_results {
+                Ok(v) => v,
+                Err(err) => {
+                    return ApiResult::new_error(crate::error::py_error_from_kv_error(
+                        py,
+                        &err,
+                        "get_transfer failed",
+                    ));
+                }
+            };
+            let mut value_ptrs = Vec::with_capacity(transfer_results.len());
+            let mut holders = Vec::with_capacity(transfer_results.len());
+            for (idx, item) in transfer_results.into_iter().enumerate() {
+                match item {
+                    Ok(Some(holder)) => {
+                        value_ptrs.push(holder.bytes().as_ptr() as u64);
+                        holders.push(StagedGetViewHolder::External { _holder: holder });
+                    }
+                    Ok(None) => {
+                        return ApiResult::new_error(new_key_not_found_error(
+                            py,
+                            &format!("get_transfer external transfer missed key index {}", idx),
+                            None,
+                        ));
+                    }
+                    Err(err) => {
+                        return ApiResult::new_error(crate::error::py_error_from_kv_error(
+                            py,
+                            &err,
+                            "get_transfer external transfer item failed",
+                        ));
+                    }
+                }
+            }
+            let view_plan = Arc::new(FluxonGetViewsPlan {
+                blob: build_plan_blob(&value_ptrs),
+                _holders: holders,
+            });
+            let plan_ptr = plan_ptr_from_blob(view_plan.blob.as_ref());
+            let mut registry_guard = client
+                .plan_registry
+                .write()
+                .expect("plan_registry poisoned");
+            registry_guard.insert(plan_ptr, FluxonPlanRegistryEntry::Get(view_plan));
+            drop(registry_guard);
+            ApiResult::new_success((plan_ptr as u64).into_py(py))
+        }
+
+        get_transfer_inner(self, handle, py).into_py_object(py)
+    }
+
+    #[pyo3(signature = (handle))]
+    fn cancel_get_transfer(&self, handle: u64, py: Python) -> PyObject {
+        fn cancel_get_transfer_inner(
+            client: &KvClient,
+            handle: u64,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            if !framework.is_external_mode() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "cancel_get_transfer is supported only in external-client mode",
+                ));
+            }
+            let framework_for_cancel = framework.clone();
+            let cancel_res = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_cancel
+                        .external_client_api_view()
+                        .external_client_api()
+                        .inner()
+                        .cancel_get_transfer(handle)
+                        .await
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+            match cancel_res {
+                Ok(()) => ApiResult::new_success(0i32.into_py(py)),
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "cancel_get_transfer failed",
+                )),
+            }
+        }
+
+        cancel_get_transfer_inner(self, handle, py).into_py_object(py)
     }
 
     /// Allocate a fluxon-kv lease id synchronously.
@@ -2938,13 +4927,15 @@ impl KvClient {
     /// on the caller to keep the pointed-to memory alive until the async call completes.
     ///
     /// The backend encoding/copy runs on the Rust runtime without holding the Python GIL.
-    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, callback=None))]
+    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, callback=None))]
     fn put(
         &self,
         key: &str,
         ptrs: Vec<(u8, u64, u32, u64, u32, Option<u32>)>,
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
+        reject_if_exist_same_key: bool,
+        write_through: bool,
         callback: Option<PyObject>,
         py: Python,
     ) -> PyObject {
@@ -2954,6 +4945,8 @@ impl KvClient {
             ptrs: Vec<(u8, usize, u32, u64, u32, Option<u32>)>,
             lease_id: Option<u64>,
             reject_if_inflight_same_key: bool,
+            reject_if_exist_same_key: bool,
+            write_through: bool,
             callback: Option<PyObject>,
             py: Python,
         ) -> ApiResult<PyObject> {
@@ -2981,6 +4974,12 @@ impl KvClient {
                 }
                 if reject_if_inflight_same_key {
                     o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
+                }
+                if reject_if_exist_same_key {
+                    o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
+                }
+                if write_through {
+                    o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::WriteThrough);
                 }
                 o
             };
@@ -3041,6 +5040,8 @@ impl KvClient {
             ptrs_owned,
             lease_id,
             reject_if_inflight_same_key,
+            reject_if_exist_same_key,
+            write_through,
             callback,
             py,
         )
@@ -3048,13 +5049,15 @@ impl KvClient {
     }
 
     /// Put a key-value pair and wait for completion before returning.
-    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false))]
+    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true))]
     fn put_blocking(
         &self,
         key: &str,
         ptrs: Vec<(u8, u64, u32, u64, u32, Option<u32>)>,
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
+        reject_if_exist_same_key: bool,
+        write_through: bool,
         py: Python,
     ) -> PyObject {
         fn put_blocking_inner(
@@ -3063,6 +5066,8 @@ impl KvClient {
             ptrs: Vec<(u8, usize, u32, u64, u32, Option<u32>)>,
             lease_id: Option<u64>,
             reject_if_inflight_same_key: bool,
+            reject_if_exist_same_key: bool,
+            write_through: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if ptrs.len() > (u32::MAX as usize) {
@@ -3093,6 +5098,16 @@ impl KvClient {
                 put_opts
                     .0
                     .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
+            }
+            if reject_if_exist_same_key {
+                put_opts
+                    .0
+                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
+            }
+            if write_through {
+                put_opts
+                    .0
+                    .push(fluxon_kv::client_kv_api::PutOptionalArg::WriteThrough);
             }
             let result = match py.allow_threads(|| {
                 runtime.run_async_from_sync(async {
@@ -3141,6 +5156,534 @@ impl KvClient {
             ptrs_owned,
             lease_id,
             reject_if_inflight_same_key,
+            reject_if_exist_same_key,
+            write_through,
+            py,
+        )
+        .into_py_object(py)
+    }
+
+    /// Put a batch of key-value pairs and wait for completion before returning.
+    ///
+    /// Each item uses the same flatdict encoding contract as `put_blocking()`.
+    #[pyo3(signature = (keys, ptrs_groups, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, concurrency=None))]
+    fn batch_put_blocking(
+        &self,
+        keys: Vec<String>,
+        ptrs_groups: Vec<Vec<(u8, u64, u32, u64, u32, Option<u32>)>>,
+        lease_id: Option<u64>,
+        reject_if_inflight_same_key: bool,
+        reject_if_exist_same_key: bool,
+        write_through: bool,
+        concurrency: Option<usize>,
+        py: Python,
+    ) -> PyObject {
+        fn batch_put_blocking_inner(
+            client: &KvClient,
+            keys: Vec<String>,
+            ptrs_groups: Vec<Vec<(u8, usize, u32, u64, u32, Option<u32>)>>,
+            lease_id: Option<u64>,
+            reject_if_inflight_same_key: bool,
+            reject_if_exist_same_key: bool,
+            write_through: bool,
+            concurrency: Option<usize>,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            if keys.len() != ptrs_groups.len() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "batch_put_blocking requires keys and ptrs_groups to have the same length",
+                ));
+            }
+            if keys.is_empty() {
+                return ApiResult::new_success(Vec::<PyObject>::new().into_py(py));
+            }
+
+            let batch_concurrency = match concurrency.unwrap_or(DEFAULT_PYO3_BATCH_CONCURRENCY) {
+                0 => {
+                    return ApiResult::new_error(new_invalid_argument_error(
+                        py,
+                        "batch_concurrency must be > 0",
+                    ));
+                }
+                v => v,
+            };
+
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let framework = borrow_stable_owner(&framework);
+            let keys_for_results = keys;
+
+            let mut put_opts = fluxon_kv::client_kv_api::PutOptionalArgs::new();
+            if let Some(id) = lease_id {
+                put_opts
+                    .0
+                    .push(fluxon_kv::client_kv_api::PutOptionalArg::LeaseId(id));
+            }
+            if reject_if_inflight_same_key {
+                put_opts
+                    .0
+                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
+            }
+            if reject_if_exist_same_key {
+                put_opts
+                    .0
+                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
+            }
+            if write_through {
+                put_opts
+                    .0
+                    .push(fluxon_kv::client_kv_api::PutOptionalArg::WriteThrough);
+            }
+
+            if !framework.is_external_mode() {
+                let framework_for_backend = framework.clone();
+                let keys_for_backend = keys_for_results.clone();
+                let backend_result = match py.allow_threads(|| {
+                    runtime.run_async_from_sync(async move {
+                        unsafe {
+                            framework_for_backend
+                                .client_kv_api_view()
+                                .client_kv_api()
+                                .inner()
+                                .batch_put_flat_dict_ptrs(
+                                    keys_for_backend,
+                                    ptrs_groups,
+                                    put_opts,
+                                    batch_concurrency,
+                                )
+                                .await
+                        }
+                    })
+                }) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return ApiResult::new_error(new_general_error(
+                            py,
+                            &format!("runtime bridge failed: {}", e),
+                        ));
+                    }
+                };
+
+                return Python::with_gil(|py| match backend_result {
+                    Ok(per_item_results) => {
+                        let out = PyList::empty_bound(py);
+                        for (key, item_result) in keys_for_results
+                            .into_iter()
+                            .zip(per_item_results.into_iter())
+                        {
+                            let item = match item_result {
+                                Ok(()) => crate::error::new_result_success(
+                                    py,
+                                    new_none_success_instance(py),
+                                ),
+                                Err(err) => crate::error::new_result_error(
+                                    py,
+                                    crate::error::py_error_from_kv_error(
+                                        py,
+                                        &err,
+                                        &format!("Put failed for key {}", key),
+                                    ),
+                                ),
+                            };
+                            out.append(item).expect("append batch_put result");
+                        }
+                        ApiResult::new_success(out.into_py(py))
+                    }
+                    Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                        py,
+                        &err,
+                        "Batch put failed",
+                    )),
+                });
+            }
+
+            let framework_for_backend = framework.clone();
+            let keys_for_backend = keys_for_results.clone();
+            let backend_result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    unsafe {
+                        framework_for_backend
+                            .external_client_api_view()
+                            .external_client_api()
+                            .inner()
+                            .batch_put_flat_dict_ptrs(
+                                keys_for_backend,
+                                ptrs_groups,
+                                put_opts,
+                                batch_concurrency,
+                            )
+                            .await
+                    }
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+
+            Python::with_gil(|py| match backend_result {
+                Ok(per_item_results) => {
+                    let out = PyList::empty_bound(py);
+                    for (key, item_result) in keys_for_results
+                        .into_iter()
+                        .zip(per_item_results.into_iter())
+                    {
+                        let item = match item_result {
+                            Ok(()) => {
+                                crate::error::new_result_success(py, new_none_success_instance(py))
+                            }
+                            Err(err) => {
+                                let err_obj = crate::error::py_error_from_kv_error(
+                                    py,
+                                    &err,
+                                    &format!("Put failed for key {}", key),
+                                );
+                                crate::error::new_result_error(py, err_obj)
+                            }
+                        };
+                        out.append(item).expect("append batch_put result");
+                    }
+                    ApiResult::new_success(out.into_py(py))
+                }
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "Batch put failed",
+                )),
+            })
+        }
+
+        let mut ptrs_groups_owned: Vec<Vec<(u8, usize, u32, u64, u32, Option<u32>)>> =
+            Vec::with_capacity(ptrs_groups.len());
+        for ptrs in ptrs_groups.into_iter() {
+            let mut ptrs_owned: Vec<(u8, usize, u32, u64, u32, Option<u32>)> =
+                Vec::with_capacity(ptrs.len());
+            for (type_id, dict_key_ptr, dict_key_len, val_u64, val_len, extra) in ptrs.into_iter() {
+                let dict_key_ptr_usize: usize = match usize::try_from(dict_key_ptr) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return ApiResult::<PyObject>::new_error(new_invalid_argument_error(
+                            py,
+                            "dict_key_ptr out of range",
+                        ))
+                        .into_py_object(py);
+                    }
+                };
+                ptrs_owned.push((
+                    type_id,
+                    dict_key_ptr_usize,
+                    dict_key_len,
+                    val_u64,
+                    val_len,
+                    extra,
+                ));
+            }
+            if ptrs_owned.len() > (u32::MAX as usize) {
+                return ApiResult::<PyObject>::new_error(new_invalid_argument_error(
+                    py,
+                    "flat dict too large",
+                ))
+                .into_py_object(py);
+            }
+            ptrs_groups_owned.push(ptrs_owned);
+        }
+
+        batch_put_blocking_inner(
+            self,
+            keys,
+            ptrs_groups_owned,
+            lease_id,
+            reject_if_inflight_same_key,
+            reject_if_exist_same_key,
+            write_through,
+            concurrency,
+            py,
+        )
+        .into_py_object(py)
+    }
+
+    /// Register a caller-owned host buffer range used by batch zero-copy paths.
+    #[pyo3(signature = (ptr, len))]
+    fn register_buffer(&self, ptr: u64, len: u64, py: Python) -> PyObject {
+        fn register_buffer_inner(
+            client: &KvClient,
+            ptr: u64,
+            len: u64,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let ptr_usize = match usize::try_from(ptr) {
+                Ok(v) => v,
+                Err(_) => {
+                    return ApiResult::new_error(new_invalid_argument_error(
+                        py,
+                        "register_buffer ptr out of range",
+                    ));
+                }
+            };
+            let len_usize = match usize::try_from(len) {
+                Ok(v) => v,
+                Err(_) => {
+                    return ApiResult::new_error(new_invalid_argument_error(
+                        py,
+                        "register_buffer len out of range",
+                    ));
+                }
+            };
+            if ptr_usize == 0 && len_usize > 0 {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "register_buffer ptr must be non-zero when len > 0",
+                ));
+            }
+            let mut guard = client
+                .registered_buffers
+                .write()
+                .expect("registered_buffers poisoned");
+            guard.register(ptr_usize, len_usize);
+            ApiResult::new_success(0i32.into_py(py))
+        }
+
+        register_buffer_inner(self, ptr, len, py).into_py_object(py)
+    }
+
+    /// Native blocking batch put path for payload pointers.
+    #[pyo3(signature = (keys, payload_ptrs, payload_sizes, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true))]
+    fn batch_put_from(
+        &self,
+        keys: Vec<String>,
+        payload_ptrs: Vec<u64>,
+        payload_sizes: Vec<u32>,
+        lease_id: Option<u64>,
+        reject_if_inflight_same_key: bool,
+        reject_if_exist_same_key: bool,
+        write_through: bool,
+        py: Python,
+    ) -> PyObject {
+        fn batch_put_from_inner(
+            client: &KvClient,
+            keys: Vec<String>,
+            payload_ptrs: Vec<u64>,
+            payload_sizes: Vec<u32>,
+            lease_id: Option<u64>,
+            reject_if_inflight_same_key: bool,
+            reject_if_exist_same_key: bool,
+            write_through: bool,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            if keys.len() != payload_ptrs.len() || keys.len() != payload_sizes.len() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "batch_put_from requires keys, payload_ptrs, and payload_sizes to have the same length",
+                ));
+            }
+            if keys.is_empty() {
+                return ApiResult::new_success(Vec::<i32>::new().into_py(py));
+            }
+
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+
+            let registered = client
+                .registered_buffers
+                .read()
+                .expect("registered_buffers poisoned");
+            let mut payload_ptrs_usize = Vec::with_capacity(payload_ptrs.len());
+            for (&ptr, &size_u32) in payload_ptrs.iter().zip(payload_sizes.iter()) {
+                let ptr_usize = match usize::try_from(ptr) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return ApiResult::new_error(new_invalid_argument_error(
+                            py,
+                            "batch_put_from payload_ptr out of range",
+                        ));
+                    }
+                };
+                let size = size_u32 as usize;
+                if ptr_usize == 0 && size > 0 {
+                    return ApiResult::new_error(new_invalid_argument_error(
+                        py,
+                        "batch_put_from payload_ptr must be non-zero when payload_size > 0",
+                    ));
+                }
+                if !registered.ranges.is_empty() && !registered.contains(ptr_usize, size) {
+                    return ApiResult::new_error(new_invalid_argument_error(
+                        py,
+                        "batch_put_from payload range is not inside any registered buffer",
+                    ));
+                }
+                payload_ptrs_usize.push(ptr_usize);
+            }
+            drop(registered);
+
+            let framework = borrow_stable_owner(&framework);
+            let mut put_opts = fluxon_kv::client_kv_api::PutOptionalArgs::new();
+            if let Some(id) = lease_id {
+                put_opts
+                    .0
+                    .push(fluxon_kv::client_kv_api::PutOptionalArg::LeaseId(id));
+            }
+            if reject_if_inflight_same_key {
+                put_opts
+                    .0
+                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
+            }
+            if reject_if_exist_same_key {
+                put_opts
+                    .0
+                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
+            }
+            if write_through {
+                put_opts
+                    .0
+                    .push(fluxon_kv::client_kv_api::PutOptionalArg::WriteThrough);
+            }
+
+            let keys_for_backend = keys.clone();
+            let ptrs_groups = keys_for_backend
+                .iter()
+                .zip(payload_ptrs_usize.iter())
+                .zip(payload_sizes.iter())
+                .map(|((_key, payload_ptr), payload_size)| {
+                    vec![(
+                        5u8,
+                        b"payload".as_ptr() as usize,
+                        7u32,
+                        *payload_ptr as u64,
+                        *payload_size,
+                        None,
+                    )]
+                })
+                .collect::<Vec<_>>();
+            let batch_concurrency = DEFAULT_PYO3_BATCH_CONCURRENCY;
+
+            if !framework.is_external_mode() {
+                let framework_for_backend = framework.clone();
+                let backend_result = match py.allow_threads(|| {
+                    runtime.run_async_from_sync(async move {
+                        unsafe {
+                            framework_for_backend
+                                .client_kv_api_view()
+                                .client_kv_api()
+                                .inner()
+                                .batch_put_flat_dict_ptrs(
+                                    keys_for_backend,
+                                    ptrs_groups,
+                                    put_opts,
+                                    batch_concurrency,
+                                )
+                                .await
+                        }
+                    })
+                }) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return ApiResult::new_error(new_general_error(
+                            py,
+                            &format!("runtime bridge failed: {}", e),
+                        ));
+                    }
+                };
+                return match backend_result {
+                    Ok(per_item_results) => ApiResult::new_success(
+                        per_item_results
+                            .into_iter()
+                            .map(|item| match item {
+                                Ok(()) => 0,
+                                Err(err) => kv_error_to_ret_code(&err),
+                            })
+                            .collect::<Vec<_>>()
+                            .into_py(py),
+                    ),
+                    Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                        py,
+                        &err,
+                        "Batch put failed",
+                    )),
+                };
+            }
+
+            let framework_for_backend = framework.clone();
+            let backend_result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    unsafe {
+                        framework_for_backend
+                            .external_client_api_view()
+                            .external_client_api()
+                            .inner()
+                            .batch_put_flat_dict_ptrs(
+                                keys_for_backend,
+                                ptrs_groups,
+                                put_opts,
+                                batch_concurrency,
+                            )
+                            .await
+                    }
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+
+            match backend_result {
+                Ok(per_item_results) => ApiResult::new_success(
+                    per_item_results
+                        .into_iter()
+                        .map(|item| match item {
+                            Ok(()) => 0,
+                            Err(err) => kv_error_to_ret_code(&err),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_py(py),
+                ),
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "Batch put failed",
+                )),
+            }
+        }
+
+        batch_put_from_inner(
+            self,
+            keys,
+            payload_ptrs,
+            payload_sizes,
+            lease_id,
+            reject_if_inflight_same_key,
+            reject_if_exist_same_key,
+            write_through,
             py,
         )
         .into_py_object(py)
@@ -3322,6 +5865,195 @@ impl KvClient {
         get_blocking_inner(self, key, py).into_py_object(py)
     }
 
+    /// Get a batch of keys and wait for completion before returning.
+    ///
+    /// Returns a Python list of per-item `Result` objects, aligned with
+    /// `get_blocking()` semantics.
+    #[pyo3(signature = (keys, concurrency=None))]
+    fn batch_get_blocking(
+        &self,
+        keys: Vec<String>,
+        concurrency: Option<usize>,
+        py: Python,
+    ) -> PyObject {
+        fn batch_get_blocking_inner(
+            client: &KvClient,
+            keys: Vec<String>,
+            concurrency: Option<usize>,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            if keys.is_empty() {
+                return ApiResult::new_success(Vec::<PyObject>::new().into_py(py));
+            }
+
+            let batch_concurrency = match concurrency.unwrap_or(DEFAULT_PYO3_BATCH_CONCURRENCY) {
+                0 => {
+                    return ApiResult::new_error(new_invalid_argument_error(
+                        py,
+                        "batch_concurrency must be > 0",
+                    ));
+                }
+                v => v,
+            };
+
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let framework = borrow_stable_owner(&framework);
+            let keys_for_results = keys;
+
+            if !framework.is_external_mode() {
+                let framework_for_backend = framework.clone();
+                let keys_for_backend = keys_for_results.clone();
+                let backend_result = match py.allow_threads(|| {
+                    runtime.run_async_from_sync(async move {
+                        framework_for_backend
+                            .client_kv_api_view()
+                            .client_kv_api()
+                            .inner()
+                            .batch_get(keys_for_backend, batch_concurrency)
+                            .await
+                    })
+                }) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return ApiResult::new_error(new_general_error(
+                            py,
+                            &format!("runtime bridge failed: {}", e),
+                        ));
+                    }
+                };
+
+                return Python::with_gil(|py| match backend_result {
+                    Ok(per_item_results) => {
+                        let out = PyList::empty_bound(py);
+                        for (key, item_result) in keys_for_results
+                            .into_iter()
+                            .zip(per_item_results.into_iter())
+                        {
+                            let item = match item_result {
+                                Ok(Some((rust_holder, _remote_info))) => {
+                                    let mem_holder = MemHolder::new(rust_holder);
+                                    match mem_holder.into_py_mem_holder(py) {
+                                        ApiResult::Success(py_holder) => {
+                                            crate::error::new_result_success(py, py_holder)
+                                        }
+                                        ApiResult::Error(err) => {
+                                            crate::error::new_result_error(py, err)
+                                        }
+                                    }
+                                }
+                                Ok(None) => crate::error::new_result_error(
+                                    py,
+                                    new_key_not_found_error(
+                                        py,
+                                        &format!("Key not found: {}", key),
+                                        Some(&key),
+                                    ),
+                                ),
+                                Err(err) => crate::error::new_result_error(
+                                    py,
+                                    crate::error::py_error_from_kv_error(
+                                        py,
+                                        &err,
+                                        &format!("Get failed for key {}", key),
+                                    ),
+                                ),
+                            };
+                            out.append(item).expect("append batch_get result");
+                        }
+                        ApiResult::new_success(out.into_py(py))
+                    }
+                    Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                        py,
+                        &err,
+                        "Batch get failed",
+                    )),
+                });
+            }
+
+            let framework_for_backend = framework.clone();
+            let keys_for_backend = keys_for_results.clone();
+            let backend_result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_backend
+                        .external_client_api_view()
+                        .external_client_api()
+                        .inner()
+                        .batch_get(keys_for_backend, batch_concurrency)
+                        .await
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+
+            Python::with_gil(|py| match backend_result {
+                Ok(per_item_results) => {
+                    let out = PyList::empty_bound(py);
+                    for (key, item_result) in keys_for_results
+                        .into_iter()
+                        .zip(per_item_results.into_iter())
+                    {
+                        let item = match item_result {
+                            Ok(Some(external_mem_holder)) => {
+                                let pyo3_external = ExternalMemHolder::new(external_mem_holder);
+                                match pyo3_external.into_py_mem_holder(py) {
+                                    ApiResult::Success(py_holder) => {
+                                        crate::error::new_result_success(py, py_holder)
+                                    }
+                                    ApiResult::Error(err) => {
+                                        crate::error::new_result_error(py, err)
+                                    }
+                                }
+                            }
+                            Ok(None) => crate::error::new_result_error(
+                                py,
+                                new_key_not_found_error(
+                                    py,
+                                    &format!("Key not found: {}", key),
+                                    Some(&key),
+                                ),
+                            ),
+                            Err(err) => crate::error::new_result_error(
+                                py,
+                                crate::error::py_error_from_kv_error(
+                                    py,
+                                    &err,
+                                    &format!("Get failed for key {}", key),
+                                ),
+                            ),
+                        };
+                        out.append(item).expect("append batch_get result");
+                    }
+                    ApiResult::new_success(out.into_py(py))
+                }
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "Batch get failed",
+                )),
+            })
+        }
+
+        batch_get_blocking_inner(self, keys, concurrency, py).into_py_object(py)
+    }
+
     /// Delete a key (synchronous from Python; only put/get use KvFuture)
     #[pyo3(signature = (key, callback=None))]
     fn delete(&self, key: String, callback: Option<PyObject>, py: Python) -> PyObject {
@@ -3416,9 +6148,84 @@ impl KvClient {
         metrics_snapshot_inner(self, py).into_py_object(py)
     }
 
+    /// Async snapshot for Fluxon KV locality and IO counters.
+    fn observability_snapshot_async(&self, py: Python) -> PyObject {
+        fn observability_snapshot_async_inner(
+            client: &KvClient,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let _framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let runtime_handle = match client.runtime.as_ref() {
+                Some(v) => v.handle().clone(),
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let locality_counters = client.locality_counters.clone();
+            let future = async move {
+                let metrics = locality_counters.snapshot();
+                Python::with_gil(|py| {
+                    let out = PyDict::new_bound(py);
+                    out.set_item("l2_local_hit_pages", metrics.l2_local_hit_pages)
+                        .expect("set l2_local_hit_pages");
+                    out.set_item("l2_local_hit_bytes", metrics.l2_local_hit_bytes)
+                        .expect("set l2_local_hit_bytes");
+                    out.set_item("l2_remote_hit_pages", metrics.l2_remote_hit_pages)
+                        .expect("set l2_remote_hit_pages");
+                    out.set_item("l2_remote_hit_bytes", metrics.l2_remote_hit_bytes)
+                        .expect("set l2_remote_hit_bytes");
+                    let io = PyDict::new_bound(py);
+                    for (key, item) in [
+                        ("put_local", metrics.put_local.clone()),
+                        ("put_remote", metrics.put_remote.clone()),
+                        ("get_local", metrics.get_local.clone()),
+                        ("get_remote", metrics.get_remote.clone()),
+                    ] {
+                        let entry = PyDict::new_bound(py);
+                        entry
+                            .set_item("op_count", item.op_count)
+                            .expect("set op_count");
+                        entry.set_item("bytes", item.bytes).expect("set bytes");
+                        entry
+                            .set_item("transfer_us", item.transfer_us)
+                            .expect("set transfer_us");
+                        entry
+                            .set_item("bandwidth_gbps", item.bandwidth_gbps())
+                            .expect("set bandwidth_gbps");
+                        io.set_item(key, entry).expect("set io entry");
+                    }
+                    out.set_item("io", io).expect("set io");
+                    ApiResult::new_success(out.into_py(py))
+                })
+            };
+            match KvFuture::new(future, runtime_handle, py) {
+                Ok(py_future) => ApiResult::new_success(py_future.into_any()),
+                Err(e) => ApiResult::new_error(new_general_error(
+                    py,
+                    &format!("Failed to create future: {}", e),
+                )),
+            }
+        }
+
+        observability_snapshot_async_inner(self, py).into_py_object(py)
+    }
+
     /// Check if a key exists (synchronous; returns bool wrapped in Result)
-    fn is_exist(&self, key: String, py: Python) -> PyObject {
-        fn is_exist_inner(client: &KvClient, key: String, py: Python) -> ApiResult<PyObject> {
+    #[pyo3(signature = (key, allow_local_snapshot=false))]
+    fn is_exist(&self, key: String, allow_local_snapshot: bool, py: Python) -> PyObject {
+        fn is_exist_inner(
+            client: &KvClient,
+            key: String,
+            allow_local_snapshot: bool,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let _ = allow_local_snapshot;
             let framework = match require_kv_framework_api(client, py) {
                 Ok(v) => v,
                 Err(e) => return ApiResult::new_error(e),
@@ -3450,7 +6257,298 @@ impl KvClient {
                 }),
             }
         }
-        is_exist_inner(self, key, py).into_py_object(py)
+        is_exist_inner(self, key, allow_local_snapshot, py).into_py_object(py)
+    }
+
+    /// Native blocking batch get path writing payload bytes into caller-provided pointers.
+    #[pyo3(signature = (keys, payload_ptrs, payload_capacities))]
+    fn batch_get_into(
+        &self,
+        keys: Vec<String>,
+        payload_ptrs: Vec<u64>,
+        payload_capacities: Vec<u32>,
+        py: Python,
+    ) -> PyObject {
+        fn batch_get_into_inner(
+            client: &KvClient,
+            keys: Vec<String>,
+            payload_ptrs: Vec<u64>,
+            payload_capacities: Vec<u32>,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            if keys.len() != payload_ptrs.len() || keys.len() != payload_capacities.len() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "batch_get_into requires keys, payload_ptrs, and payload_capacities to have the same length",
+                ));
+            }
+            if keys.is_empty() {
+                return ApiResult::new_success(Vec::<i32>::new().into_py(py));
+            }
+
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+
+            let registered = client
+                .registered_buffers
+                .read()
+                .expect("registered_buffers poisoned");
+            let mut payload_ptrs_usize = Vec::with_capacity(payload_ptrs.len());
+            for (&ptr, &cap_u32) in payload_ptrs.iter().zip(payload_capacities.iter()) {
+                let ptr_usize = match usize::try_from(ptr) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return ApiResult::new_error(new_invalid_argument_error(
+                            py,
+                            "batch_get_into payload_ptr out of range",
+                        ));
+                    }
+                };
+                if ptr_usize == 0 && cap_u32 > 0 {
+                    return ApiResult::new_error(new_invalid_argument_error(
+                        py,
+                        "batch_get_into payload_ptr must be non-zero when payload_capacity > 0",
+                    ));
+                }
+                let cap = cap_u32 as usize;
+                if !registered.ranges.is_empty() && !registered.contains(ptr_usize, cap) {
+                    return ApiResult::new_error(new_invalid_argument_error(
+                        py,
+                        "batch_get_into destination range is not inside any registered buffer",
+                    ));
+                }
+                payload_ptrs_usize.push(ptr_usize);
+            }
+            drop(registered);
+
+            let framework = borrow_stable_owner(&framework);
+            let batch_concurrency = DEFAULT_PYO3_BATCH_CONCURRENCY;
+
+            if !framework.is_external_mode() {
+                let framework_for_backend = framework.clone();
+                let keys_for_backend = keys.clone();
+                let backend_result = match py.allow_threads(|| {
+                    runtime.run_async_from_sync(async move {
+                        framework_for_backend
+                            .client_kv_api_view()
+                            .client_kv_api()
+                            .inner()
+                            .batch_get(keys_for_backend, batch_concurrency)
+                            .await
+                    })
+                }) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return ApiResult::new_error(new_general_error(
+                            py,
+                            &format!("runtime bridge failed: {}", e),
+                        ));
+                    }
+                };
+
+                return match backend_result {
+                    Ok(per_item_results) => {
+                        let mut out = Vec::with_capacity(per_item_results.len());
+                        for (((key, payload_ptr), payload_capacity), item_result) in keys
+                            .into_iter()
+                            .zip(payload_ptrs_usize.into_iter())
+                            .zip(payload_capacities.into_iter())
+                            .zip(per_item_results.into_iter())
+                        {
+                            let code = match item_result {
+                                Ok(Some((holder, _remote_info))) => {
+                                    let holder_result = KvGetResult::Owner(Some(holder));
+                                    let payload =
+                                        match payload_slice_from_get_result(&key, &holder_result) {
+                                            Ok(payload) => payload,
+                                            Err(err) => {
+                                                out.push(kv_error_to_ret_code(&err));
+                                                continue;
+                                            }
+                                        };
+                                    if payload.len() > payload_capacity as usize {
+                                        -(4003i32)
+                                    } else {
+                                        if !payload.is_empty() {
+                                            unsafe {
+                                                std::ptr::copy_nonoverlapping(
+                                                    payload.as_ptr(),
+                                                    payload_ptr as *mut u8,
+                                                    payload.len(),
+                                                );
+                                            }
+                                        }
+                                        payload.len() as i32
+                                    }
+                                }
+                                Ok(None) => kv_error_to_ret_code(&CoreKvError::Api(
+                                    CoreApiError::KeyNotFound { key },
+                                )),
+                                Err(err) => kv_error_to_ret_code(&err),
+                            };
+                            out.push(code);
+                        }
+                        ApiResult::new_success(out.into_py(py))
+                    }
+                    Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                        py,
+                        &err,
+                        "Batch get failed",
+                    )),
+                };
+            }
+
+            let framework_for_backend = framework.clone();
+            let keys_for_backend = keys.clone();
+            let backend_result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_backend
+                        .external_client_api_view()
+                        .external_client_api()
+                        .inner()
+                        .batch_get(keys_for_backend, batch_concurrency)
+                        .await
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+
+            match backend_result {
+                Ok(per_item_results) => {
+                    let mut out = Vec::with_capacity(per_item_results.len());
+                    for (((key, payload_ptr), payload_capacity), item_result) in keys
+                        .into_iter()
+                        .zip(payload_ptrs_usize.into_iter())
+                        .zip(payload_capacities.into_iter())
+                        .zip(per_item_results.into_iter())
+                    {
+                        let code =
+                            match item_result {
+                                Ok(Some(holder)) => {
+                                    let holder_result = KvGetResult::External(Some(holder));
+                                    let payload =
+                                        match payload_slice_from_get_result(&key, &holder_result) {
+                                            Ok(payload) => payload,
+                                            Err(err) => {
+                                                out.push(kv_error_to_ret_code(&err));
+                                                continue;
+                                            }
+                                        };
+                                    if payload.len() > payload_capacity as usize {
+                                        -(4003i32)
+                                    } else {
+                                        if !payload.is_empty() {
+                                            unsafe {
+                                                std::ptr::copy_nonoverlapping(
+                                                    payload.as_ptr(),
+                                                    payload_ptr as *mut u8,
+                                                    payload.len(),
+                                                );
+                                            }
+                                        }
+                                        payload.len() as i32
+                                    }
+                                }
+                                Ok(None) => kv_error_to_ret_code(&CoreKvError::Api(
+                                    CoreApiError::KeyNotFound { key },
+                                )),
+                                Err(err) => kv_error_to_ret_code(&err),
+                            };
+                        out.push(code);
+                    }
+                    ApiResult::new_success(out.into_py(py))
+                }
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "Batch get failed",
+                )),
+            }
+        }
+
+        batch_get_into_inner(self, keys, payload_ptrs, payload_capacities, py).into_py_object(py)
+    }
+
+    /// Native blocking batch existence check.
+    #[pyo3(signature = (keys, allow_local_snapshot=false))]
+    fn batch_is_exist(
+        &self,
+        keys: Vec<String>,
+        allow_local_snapshot: bool,
+        py: Python,
+    ) -> PyObject {
+        fn batch_is_exist_inner(
+            client: &KvClient,
+            keys: Vec<String>,
+            allow_local_snapshot: bool,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            if keys.is_empty() {
+                return ApiResult::new_success(Vec::<i32>::new().into_py(py));
+            }
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let framework = borrow_stable_owner(&framework);
+            let result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework
+                        .kv_batch_is_exist(keys, allow_local_snapshot)
+                        .await
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+            match result {
+                Ok(exists_list) => {
+                    let ints = exists_list
+                        .into_iter()
+                        .map(|exists| if exists { 1i32 } else { 0i32 })
+                        .collect::<Vec<_>>();
+                    ApiResult::new_success(ints.into_py(py))
+                }
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "Batch existence check failed",
+                )),
+            }
+        }
+
+        batch_is_exist_inner(self, keys, allow_local_snapshot, py).into_py_object(py)
     }
 
     /// Count number of keys whose name starts with the given prefix.
@@ -4164,6 +7262,7 @@ fn fluxon_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGeneralLease>()?;
     m.add_class::<PyLeaseBackendUid>()?;
     m.add_function(wrap_pyfunction!(run_master_blocking, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_flat_dict_payload, m)?)?;
     m.add_function(wrap_pyfunction!(monitor_render_cli, m)?)?;
     m.add_function(wrap_pyfunction!(monitor_render_web, m)?)?;
     m.add_function(wrap_pyfunction!(fluxon_ops_controller_blocking, m)?)?;
@@ -4309,17 +7408,14 @@ mod tests {
             discovery.entries[0].provider_path,
             libs_dir.join("libmlx5-rdmav34.so")
         );
-        assert!(
-            discovery.outcomes.iter().any(|outcome| {
-                outcome.contains("config_ok:") && outcome.contains("driver=mlx5")
-            })
-        );
-        assert!(
-            discovery
-                .outcomes
-                .iter()
-                .any(|outcome| outcome.contains("config_parse_fail:"))
-        );
+        assert!(discovery
+            .outcomes
+            .iter()
+            .any(|outcome| { outcome.contains("config_ok:") && outcome.contains("driver=mlx5") }));
+        assert!(discovery
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.contains("config_parse_fail:")));
     }
 
     #[test]

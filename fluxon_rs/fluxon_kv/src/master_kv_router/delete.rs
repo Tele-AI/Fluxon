@@ -1,12 +1,12 @@
 use super::{
-    MasterKvRouterView,
     msg_pack::{
         BatchDeleteAckReq, BatchDeleteAckResp, BatchDeleteClientKvMetaCacheReq, DeleteAckReq,
         DeleteAckResp, DeleteClientKvMetaCacheItem, DeleteReq, DeleteResp,
     },
+    MasterKvRouterView,
 };
-use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::put::PutIDForAKey;
+use crate::master_kv_router::OneKvNodesRoutes;
 use crate::memholder::{
     EnsureMemholderMgmtDeleteActorOwned, MasterOwnerMemMgr, MemholderManagerTrait,
 };
@@ -90,6 +90,7 @@ pub fn evict_one_kv_replica_for_node(
     node_id: NodeID,
     put_id: PutIDForAKey,
 ) -> Result<(), msg_and_error::ErrorCode> {
+    let _guard = view.master_kv_router().inner().route_lifetime_lock.lock();
     let route = if let Some(route) = view.master_kv_router().inner().kv_routes.get(&key) {
         route.clone()
     } else {

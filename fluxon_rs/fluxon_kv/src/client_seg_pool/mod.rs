@@ -1,4 +1,3 @@
-use crate::ClientKvApiAccessTrait;
 use crate::client_kv_api::ClientKvApi;
 use crate::client_transfer_engine::{ClientTransferEngine, ClientTransferEngineAccessTrait};
 use crate::cluster_manager::ClusterManagerAccessTrait;
@@ -6,8 +5,9 @@ use crate::config::ContributeToClusterPoolSize;
 use crate::master_seg_manager::msg_pack::SegmentDeviceMemInfo;
 use crate::p2p::p2p_module::P2pModule;
 use crate::p2p::p2p_module::P2pModuleAccessTrait;
-use crate::rpcresp_kvresult_convert::FromError;
 use crate::rpcresp_kvresult_convert::msg_and_error::OK;
+use crate::rpcresp_kvresult_convert::FromError;
+use crate::ClientKvApiAccessTrait;
 use crate::{
     cluster_manager::{ClusterManager, ClusterMember},
     master_seg_manager::msg_pack::{
@@ -19,7 +19,7 @@ use crate::{
 use async_trait::async_trait;
 use bitcode::{Decode, Encode};
 use fluxon_commu::{CpuAllocatedMem, ShareGroupOwnerRef};
-use fluxon_framework::{LogicalModule, define_module};
+use fluxon_framework::{define_module, LogicalModule};
 use fluxon_util::new_map;
 use limit_thirdparty::tokio;
 use limit_thirdparty::tokio::sync::ARwLockReadGuardOwned;
@@ -237,10 +237,7 @@ impl ClientSegPool {
         std::path::Path::new(share_mem_path).join(SIDE_TRANSFER_PEERS_DIRNAME)
     }
 
-    pub fn side_transfer_peer_file_path(
-        share_mem_path: &str,
-        side_id: &str,
-    ) -> std::path::PathBuf {
+    pub fn side_transfer_peer_file_path(share_mem_path: &str, side_id: &str) -> std::path::PathBuf {
         Self::side_transfer_peers_dir(share_mem_path).join(format!("{side_id}.json"))
     }
 
@@ -399,17 +396,13 @@ impl ClientSegPool {
                 crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
                     path: String::new(),
                     len: map_len as u64,
-                    detail: "share_mem_path is empty; explicit configuration required"
-                        .to_string(),
+                    detail: "share_mem_path is empty; explicit configuration required".to_string(),
                 },
             ));
         }
 
         let base_path = &share_mem_path;
-        tracing::info!(
-            "Using share_mem_path: {} for memory-mapped file",
-            base_path
-        );
+        tracing::info!("Using share_mem_path: {} for memory-mapped file", base_path);
         std::fs::create_dir_all(base_path).map_err(|e| {
             KvError::SharedMem(
                 crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {

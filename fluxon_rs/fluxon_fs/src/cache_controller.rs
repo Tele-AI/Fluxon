@@ -429,8 +429,8 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::mpsc;
     use std::sync::{Condvar, Mutex};
     use tokio::time::{Duration, sleep};
 

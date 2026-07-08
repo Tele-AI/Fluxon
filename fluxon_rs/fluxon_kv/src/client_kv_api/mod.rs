@@ -1,15 +1,25 @@
 use crate::client_kv_api::delete::handle_batch_delete_client_kv_meta_cache;
+use crate::client_kv_api::local_reserve_rebalance::spawn_owner_local_reserve_rebalance_actor;
 use crate::client_kv_api::msg_pack::{
-    ExternalDeleteAckReq, ExternalDeleteAckResp, ExternalDeleteReq, ExternalDeleteResp,
-    ExternalGetReq, ExternalGetResp, ExternalIsExistReq, ExternalIsExistResp, ExternalPutCommitReq,
-    ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp, ExternalPutStartReq,
-    ExternalPutStartResp, ExternalPutTransferEndReq, ExternalPutTransferEndResp, SyncKvToFileReq,
-    SyncKvToFileResp, TestPutPhaseTrace,
+    ExternalBatchGetCancelReq, ExternalBatchGetCancelResp, ExternalBatchGetReq,
+    ExternalBatchGetResp, ExternalBatchGetStartReq, ExternalBatchGetStartResp,
+    ExternalBatchGetTransferReq, ExternalBatchGetTransferResp, ExternalBatchIsExistReq,
+    ExternalBatchIsExistResp, ExternalBatchPutCommitReq, ExternalBatchPutCommitResp,
+    ExternalBatchPutStartReq, ExternalBatchPutStartResp, ExternalBatchPutTransferEndReq,
+    ExternalBatchPutTransferEndResp, ExternalDeleteAckReq, ExternalDeleteAckResp,
+    ExternalDeleteReq, ExternalDeleteResp, ExternalGetReq, ExternalGetResp, ExternalIsExistReq,
+    ExternalIsExistResp, ExternalObservabilitySnapshotReq, ExternalObservabilitySnapshotResp,
+    ExternalPutCommitReq, ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp,
+    ExternalPutStartReq, ExternalPutStartResp, ExternalPutTransferEndReq,
+    ExternalPutTransferEndResp, SyncKvToFileReq, SyncKvToFileResp, TestPutPhaseTrace,
 };
-use crate::cluster_manager::NodeIDString;
+use crate::cluster_manager::{NodeID, NodeIDString};
 use crate::config::TestSpecConfig;
 use crate::master_kv_router::msg_pack::{
-    BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, DeleteClientKvMetaCacheItem,
+    BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchGetDoneReq, BatchGetRevokeReq,
+    BatchGetStartItemResp, BatchGetStartReq, BatchIsExistReq, BatchPreparePutKeysReq,
+    BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq,
+    CountPrefixReq, DeleteClientKvMetaCacheItem,
 };
 use crate::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
 use crate::memholder::{AllMemholderRefCount, MemoryInfo, UserMemHolder};
@@ -20,28 +30,37 @@ use crate::memholder::{
 use crate::{
     client_seg_pool::{ClientSegPool, ClientSegPoolAccessTrait, ResolveSideTransferLaneReq},
     client_transfer_engine::{ClientTransferEngine, ClientTransferEngineAccessTrait},
-    cluster_manager::{ClusterEvent, ClusterManager, ClusterManagerAccessTrait},
+    cluster_manager::{
+        app_logic_ext::{ClusterManagerAppLogicExt, ClusterManagerExtError},
+        ClusterEvent, ClusterManager, ClusterManagerAccessTrait,
+    },
     master_kv_router::msg_pack::{
-        DeleteReq, GetDoneReq, GetMetaReq, GetRevokeReq, GetStartReq, PutDoneReq, PutRevokeReq,
-        PutStartReq,
+        DeleteAckReq, DeleteReq, GetDoneReq, GetMetaReq, GetRevokeReq, GetStartReq,
+        MemHolderKeepAliveReq, PutAppendDoneReq, PutAppendRevokeReq, PutAppendStartReq, PutDoneReq,
+        PutRevokeReq, PutStartReq, ReleaseLocalGrantReq, ReserveLocalGrantReq,
     },
     metric_reporter::{MetricReporter, MetricReporterAccessTrait},
-    metrics::{MetricsHandle, OperationKind, RequestStage},
+    metrics::{KvLocalitySnapshot, MetricsHandle, OperationKind, RequestStage},
     p2p::{
         msg_pack::{RPCCaller, RPCHandler},
         p2p_module::{P2pModule, P2pModuleAccessTrait},
     },
-    rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult},
+    rpcresp_kvresult_convert::msg_and_error::{ApiError, ErrorCode, KvError, KvResult},
 };
 use async_trait::async_trait;
+use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
-use fluxon_framework::{LogicalModule, define_module};
+use fluxon_framework::{define_module, LogicalModule};
+use fluxon_framework_compiled::upgrade_view_guard::UpgradeViewGuard;
 use fluxon_util::map_lock::AMapLock;
 use limit_thirdparty::tokio;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Weak;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Information about a memholder held by external client
@@ -52,24 +71,105 @@ pub struct ExternalHoldingGetInfo {
     pub memory_info: Arc<MemoryInfo>, // The actual memholder being held
 }
 
-pub use get::RemoteGetInfo;
-pub mod external_api;
-pub use external_api::HandlerForExternalClient;
-pub type TestObservePutPhaseSink = Arc<Mutex<Option<TestPutPhaseTrace>>>;
-
-#[derive(Debug, Clone)]
-enum CachedValue {
-    MetadataOnly,
-    LocalReplica(Arc<MemoryInfo>),
+#[derive(Clone, Debug, Default)]
+pub struct OwnerRuntimeObserveSnapshot {
+    pub external_get_holding_entries: u64,
+    pub external_get_holding_bytes: u64,
+    pub external_pending_put_entries: u64,
 }
 
-impl CachedValue {
-    fn rank(&self) -> u8 {
-        match self {
-            Self::MetadataOnly => 0,
-            Self::LocalReplica(_) => 1,
+pub use get::RemoteGetInfo;
+pub use put::OwnerReservedPutItem;
+pub mod external_api;
+mod local_reserve_rebalance;
+pub use external_api::HandlerForExternalClient;
+pub type TestObservePutPhaseSink = Arc<Mutex<Option<TestPutPhaseTrace>>>;
+pub type ExternalGetStartTransferOutput =
+    Vec<KvResult<Option<(Arc<UserMemHolder>, Option<RemoteGetInfo>)>>>;
+
+pub enum ExternalGetStartOwnerItem {
+    Local {
+        memory_info: Arc<MemoryInfo>,
+    },
+    Started {
+        key: String,
+        item: BatchGetStartItemResp,
+    },
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct ExternalGetStartDedupKey {
+    pub keys: Vec<String>,
+    pub atomic_group_lens: Vec<usize>,
+    pub prefix_best_effort: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExternalGetStartPrefixResult {
+    pub raw_prefix_hit_len: usize,
+    pub transferable_len: usize,
+    pub first_miss_index: Option<usize>,
+    pub first_error_kind: Option<String>,
+}
+
+#[derive(Clone)]
+pub enum ExternalGetStartSharedItemResult {
+    Hit {
+        memholder: Arc<UserMemHolder>,
+    },
+    Miss,
+    Error {
+        error_code: ErrorCode,
+        error_json: String,
+    },
+}
+
+pub enum ExternalGetStartSharedPhase {
+    Starting,
+    Running {
+        prefix: ExternalGetStartPrefixResult,
+        keys: Vec<String>,
+    },
+    Ready {
+        prefix: ExternalGetStartPrefixResult,
+        keys: Vec<String>,
+        items: Vec<ExternalGetStartSharedItemResult>,
+    },
+    Failed {
+        error_code: ErrorCode,
+        error_json: String,
+    },
+}
+
+pub struct ExternalGetStartSharedState {
+    pub waiter_count: usize,
+    pub phase: ExternalGetStartSharedPhase,
+}
+
+pub struct ExternalGetStartSharedOp {
+    pub dedup_key: ExternalGetStartDedupKey,
+    pub transfer_concurrency: usize,
+    pub state: Mutex<ExternalGetStartSharedState>,
+    pub notify: Arc<limit_thirdparty::tokio::sync::Notify>,
+}
+
+impl ExternalGetStartSharedOp {
+    pub fn new(dedup_key: ExternalGetStartDedupKey, transfer_concurrency: usize) -> Self {
+        Self {
+            dedup_key,
+            transfer_concurrency,
+            state: Mutex::new(ExternalGetStartSharedState {
+                waiter_count: 1,
+                phase: ExternalGetStartSharedPhase::Starting,
+            }),
+            notify: Arc::new(limit_thirdparty::tokio::sync::Notify::new()),
         }
     }
+}
+
+pub struct ExternalGetStartEntry {
+    pub req_node_id: String,
+    pub shared_op: Arc<ExternalGetStartSharedOp>,
 }
 
 /// Optional arguments for put operations
@@ -79,6 +179,10 @@ pub enum PutOptionalArg {
     LeaseId(u64),
     /// Ask the master to fail-fast when the same key already has an inflight put.
     RejectIfInflightSameKey,
+    /// Ask the master to fail-fast when the key already has a committed live replica.
+    RejectIfExistSameKey,
+    /// Keep the legacy synchronous remote-placement semantics.
+    WriteThrough,
     /// Prefer placing the target allocation on a kvclient within this sub_cluster.
     PreferredSubCluster(String),
     /// Hidden test-only side-channel for collecting per-put phase timings.
@@ -98,6 +202,8 @@ impl PutOptionalArgs {
         self.0.iter().rev().find_map(|a| match a {
             PutOptionalArg::LeaseId(id) => Some(*id),
             PutOptionalArg::RejectIfInflightSameKey
+            | PutOptionalArg::RejectIfExistSameKey
+            | PutOptionalArg::WriteThrough
             | PutOptionalArg::PreferredSubCluster(_)
             | PutOptionalArg::TestObservePutPhases(_) => None,
         })
@@ -109,12 +215,26 @@ impl PutOptionalArgs {
             .any(|arg| matches!(arg, PutOptionalArg::RejectIfInflightSameKey))
     }
 
+    pub fn reject_if_exist_same_key(&self) -> bool {
+        self.0
+            .iter()
+            .any(|arg| matches!(arg, PutOptionalArg::RejectIfExistSameKey))
+    }
+
+    pub fn write_through(&self) -> bool {
+        self.0
+            .iter()
+            .any(|arg| matches!(arg, PutOptionalArg::WriteThrough))
+    }
+
     /// Get the last provided preferred_sub_cluster if any.
     pub fn preferred_sub_cluster(&self) -> Option<&str> {
         self.0.iter().rev().find_map(|a| match a {
             PutOptionalArg::PreferredSubCluster(sc) => Some(sc.as_str()),
             PutOptionalArg::LeaseId(_)
             | PutOptionalArg::RejectIfInflightSameKey
+            | PutOptionalArg::RejectIfExistSameKey
+            | PutOptionalArg::WriteThrough
             | PutOptionalArg::TestObservePutPhases(_) => None,
         })
     }
@@ -124,6 +244,8 @@ impl PutOptionalArgs {
             PutOptionalArg::TestObservePutPhases(sink) => Some(sink.clone()),
             PutOptionalArg::LeaseId(_)
             | PutOptionalArg::RejectIfInflightSameKey
+            | PutOptionalArg::RejectIfExistSameKey
+            | PutOptionalArg::WriteThrough
             | PutOptionalArg::PreferredSubCluster(_) => None,
         })
     }
@@ -274,6 +396,7 @@ pub enum KvMetrics {
         transfer_poll_wait_us: i64,
         transfer_poll_iters: i64,
         transfer_used_fast_path: bool,
+        transfer_used_nixl: bool,
         transfer_local_noop: bool,
         transfer_remote_transfer: bool,
     },
@@ -343,6 +466,104 @@ async fn handle_external_get(
     }
 }
 
+async fn handle_external_batch_get(
+    view: &ClientKvApiView,
+    msg: &MsgPack<ExternalBatchGetReq>,
+) -> MsgPack<ExternalBatchGetResp> {
+    let req = msg.serialize_part.clone();
+    let dbg_len = req.keys.len();
+    let resp = view
+        .client_kv_api()
+        .external_batch_get(req)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                "handle_external_batch_get error: {e}; batch_len={batch_len}",
+                batch_len = dbg_len
+            );
+            let mut r: ExternalBatchGetResp =
+                crate::rpcresp_kvresult_convert::FromError::from_error(&e);
+            r.items = Vec::new();
+            r
+        });
+    MsgPack {
+        serialize_part: resp,
+        raw_bytes: Vec::new(),
+    }
+}
+
+async fn handle_external_batch_get_start(
+    view: &ClientKvApiView,
+    msg: &MsgPack<ExternalBatchGetStartReq>,
+) -> MsgPack<ExternalBatchGetStartResp> {
+    let req = msg.serialize_part.clone();
+    let dbg_len = req.keys.len();
+    let resp = view
+        .client_kv_api()
+        .external_batch_get_start(req)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                "handle_external_batch_get_start error: {e}; batch_len={batch_len}",
+                batch_len = dbg_len
+            );
+            crate::rpcresp_kvresult_convert::FromError::from_error(&e)
+        });
+    MsgPack {
+        serialize_part: resp,
+        raw_bytes: Vec::new(),
+    }
+}
+
+async fn handle_external_batch_get_transfer(
+    view: &ClientKvApiView,
+    msg: &MsgPack<ExternalBatchGetTransferReq>,
+) -> MsgPack<ExternalBatchGetTransferResp> {
+    let req = msg.serialize_part.clone();
+    let dbg_handle = req.handle;
+    let resp = view
+        .client_kv_api()
+        .external_batch_get_transfer(req)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                "handle_external_batch_get_transfer error: {e}; handle={handle}",
+                handle = dbg_handle
+            );
+            let mut r: ExternalBatchGetTransferResp =
+                crate::rpcresp_kvresult_convert::FromError::from_error(&e);
+            r.items = Vec::new();
+            r
+        });
+    MsgPack {
+        serialize_part: resp,
+        raw_bytes: Vec::new(),
+    }
+}
+
+async fn handle_external_batch_get_cancel(
+    view: &ClientKvApiView,
+    msg: &MsgPack<ExternalBatchGetCancelReq>,
+) -> MsgPack<ExternalBatchGetCancelResp> {
+    let req = msg.serialize_part.clone();
+    let dbg_handle = req.handle;
+    let resp = view
+        .client_kv_api()
+        .external_batch_get_cancel(req)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                "handle_external_batch_get_cancel error: {e}; handle={handle}",
+                handle = dbg_handle
+            );
+            crate::rpcresp_kvresult_convert::FromError::from_error(&e)
+        });
+    MsgPack {
+        serialize_part: resp,
+        raw_bytes: Vec::new(),
+    }
+}
+
 async fn handle_external_put_start(
     view: &ClientKvApiView,
     msg: &MsgPack<ExternalPutStartReq>,
@@ -375,6 +596,33 @@ async fn handle_external_put_start(
         raw_bytes: Vec::new(),
     }
 }
+
+async fn handle_external_batch_put_start(
+    view: &ClientKvApiView,
+    msg: &MsgPack<ExternalBatchPutStartReq>,
+) -> MsgPack<ExternalBatchPutStartResp> {
+    let req = msg.serialize_part.clone();
+    let dbg_len = req.items.len();
+    let resp = view
+        .client_kv_api()
+        .external_batch_put_start(req)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                "handle_external_batch_put_start error: {e}; batch_len={batch_len}",
+                batch_len = dbg_len
+            );
+            let mut r: ExternalBatchPutStartResp =
+                crate::rpcresp_kvresult_convert::FromError::from_error(&e);
+            r.items = Vec::new();
+            r
+        });
+    MsgPack {
+        serialize_part: resp,
+        raw_bytes: Vec::new(),
+    }
+}
+
 async fn handle_external_put_transfer_end(
     view: &ClientKvApiView,
     msg: &MsgPack<ExternalPutTransferEndReq>,
@@ -401,6 +649,32 @@ async fn handle_external_put_transfer_end(
     }
 }
 
+async fn handle_external_batch_put_transfer_end(
+    view: &ClientKvApiView,
+    msg: &MsgPack<ExternalBatchPutTransferEndReq>,
+) -> MsgPack<ExternalBatchPutTransferEndResp> {
+    let req = msg.serialize_part.clone();
+    let dbg_len = req.items.len();
+    let resp = view
+        .client_kv_api()
+        .external_batch_put_transfer_end(req)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                "handle_external_batch_put_transfer_end error: {e}; batch_len={batch_len}",
+                batch_len = dbg_len
+            );
+            let mut r: ExternalBatchPutTransferEndResp =
+                crate::rpcresp_kvresult_convert::FromError::from_error(&e);
+            r.items = Vec::new();
+            r
+        });
+    MsgPack {
+        serialize_part: resp,
+        raw_bytes: Vec::new(),
+    }
+}
+
 async fn handle_external_put_commit(
     view: &ClientKvApiView,
     msg: &MsgPack<ExternalPutCommitReq>,
@@ -419,6 +693,32 @@ async fn handle_external_put_commit(
                 put_id = dbg_put_id
             );
             crate::rpcresp_kvresult_convert::FromError::from_error(&e)
+        });
+    MsgPack {
+        serialize_part: resp,
+        raw_bytes: Vec::new(),
+    }
+}
+
+async fn handle_external_batch_put_commit(
+    view: &ClientKvApiView,
+    msg: &MsgPack<ExternalBatchPutCommitReq>,
+) -> MsgPack<ExternalBatchPutCommitResp> {
+    let req = msg.serialize_part.clone();
+    let dbg_len = req.items.len();
+    let resp = view
+        .client_kv_api()
+        .external_batch_put_commit(req)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                "handle_external_batch_put_commit error: {e}; batch_len={batch_len}",
+                batch_len = dbg_len
+            );
+            let mut r: ExternalBatchPutCommitResp =
+                crate::rpcresp_kvresult_convert::FromError::from_error(&e);
+            r.items = Vec::new();
+            r
         });
     MsgPack {
         serialize_part: resp,
@@ -544,6 +844,51 @@ async fn handle_external_is_exist(
                 crate::rpcresp_kvresult_convert::FromError::from_error(&e);
             r.exists = false;
             r
+        });
+    MsgPack {
+        serialize_part: resp,
+        raw_bytes: Vec::new(),
+    }
+}
+
+async fn handle_external_batch_is_exist(
+    view: &ClientKvApiView,
+    msg: &MsgPack<ExternalBatchIsExistReq>,
+) -> MsgPack<ExternalBatchIsExistResp> {
+    let req = msg.serialize_part.clone();
+    let dbg_len = req.keys.len();
+    let resp = view
+        .client_kv_api()
+        .external_batch_is_exist(req)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                "handle_external_batch_is_exist error: {e}; batch_len={batch_len}",
+                batch_len = dbg_len
+            );
+            let mut r: ExternalBatchIsExistResp =
+                crate::rpcresp_kvresult_convert::FromError::from_error(&e);
+            r.exists_list = Vec::new();
+            r
+        });
+    MsgPack {
+        serialize_part: resp,
+        raw_bytes: Vec::new(),
+    }
+}
+
+async fn handle_external_observability_snapshot(
+    view: &ClientKvApiView,
+    msg: &MsgPack<ExternalObservabilitySnapshotReq>,
+) -> MsgPack<ExternalObservabilitySnapshotResp> {
+    let req = msg.serialize_part.clone();
+    let resp = view
+        .client_kv_api()
+        .external_observability_snapshot(req)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("handle_external_observability_snapshot error: {e}");
+            crate::rpcresp_kvresult_convert::FromError::from_error(&e)
         });
     MsgPack {
         serialize_part: resp,
@@ -737,7 +1082,38 @@ pub struct ClientKvApi(ClientKvApiInner);
 pub struct GetCachedInfo {
     put_time_ms: u64,
     put_version: u32,
-    value: CachedValue,
+    mem_holder: Arc<MemoryInfo>,
+}
+
+#[derive(Debug)]
+pub struct PrecommitLocalVisibleInfo {
+    mem_holder: Arc<MemoryInfo>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LocalSnapshotInfo {
+    put_time_ms: u64,
+    put_version: u32,
+}
+
+impl GetCachedInfo {
+    fn version_matches(&self, put_time_ms: u64, put_version: u32) -> bool {
+        if self.put_time_ms == put_time_ms {
+            self.put_version <= put_version
+        } else {
+            self.put_time_ms <= put_time_ms
+        }
+    }
+}
+
+impl LocalSnapshotInfo {
+    fn version_matches(&self, put_time_ms: u64, put_version: u32) -> bool {
+        if self.put_time_ms == put_time_ms {
+            self.put_version <= put_version
+        } else {
+            self.put_time_ms <= put_time_ms
+        }
+    }
 }
 
 struct ClientKvApiViewHolder {
@@ -782,6 +1158,16 @@ pub struct ClientKvApiInner {
     /// key -> value info on this node
     /// we can only remove value if it's put_time_ms and put_version match remote eviction command
     get_cached_info: DashMap<String, GetCachedInfo>,
+    /// key -> locally readable resident slot before backend put_start/put_done finishes.
+    precommit_local_visible_info: DashMap<String, PrecommitLocalVisibleInfo>,
+    /// key -> local replica version remembered from local put/get durable-replica success.
+    /// This authority is positive-only: hit means "can answer exists=true immediately when
+    /// allow_local_snapshot is enabled"; miss does not imply non-existence.
+    local_snapshot_info: DashMap<String, LocalSnapshotInfo>,
+    /// KvOwner-managed resident staging grants for hostless put_start.
+    owner_local_reserve_pool: Mutex<OwnerLocalReservePoolState>,
+    /// Wake the background reserve actor after demand/free-slot changes.
+    owner_local_reserve_rebalance_notify: Arc<limit_thirdparty::tokio::sync::Notify>,
 
     /// Shared delete actor input for owner -> external weak-index invalidation.
     pub external_invalidate_delete: EnsureMemholderMgmtDeleteHandle<DeleteClientKvMetaCacheItem>,
@@ -792,6 +1178,9 @@ pub struct ClientKvApiInner {
 
     // record external_client get_holding info (owned, flattened manager)
     pub external_get_holding: OwnerExternalMemMgr,
+    pub external_get_start_registry: DashMap<u64, Arc<ExternalGetStartEntry>>,
+    pub external_get_start_by_key: DashMap<ExternalGetStartDedupKey, Arc<ExternalGetStartSharedOp>>,
+    next_external_get_start_handle: AtomicU64,
     /// Weak handle to a shared refcount tracker for all UserMemHolder of this client.
     ///
     /// - A strong `Arc<AllMemholderRefCount>` is given to every `UserMemHolder` created by this client.
@@ -807,14 +1196,28 @@ pub struct ClientKvApiInner {
     rpc_caller_get_start: RPCCaller<GetStartReq>,
     rpc_caller_get_revoke: RPCCaller<GetRevokeReq>,
     rpc_caller_get_done: RPCCaller<GetDoneReq>,
+    rpc_caller_batch_get_start: RPCCaller<BatchGetStartReq>,
+    rpc_caller_batch_get_revoke: RPCCaller<BatchGetRevokeReq>,
+    rpc_caller_batch_get_done: RPCCaller<BatchGetDoneReq>,
     rpc_caller_put_start: RPCCaller<PutStartReq>,
     rpc_caller_put_revoke: RPCCaller<PutRevokeReq>,
     rpc_caller_put_done: RPCCaller<PutDoneReq>,
+    rpc_caller_batch_put_start: RPCCaller<BatchPutStartReq>,
+    rpc_caller_batch_put_revoke: RPCCaller<BatchPutRevokeReq>,
+    rpc_caller_batch_put_done: RPCCaller<BatchPutDoneReq>,
+    rpc_caller_batch_prepare_put_keys: RPCCaller<BatchPreparePutKeysReq>,
+    rpc_caller_batch_release_put_key_reservations: RPCCaller<BatchReleasePutKeyReservationsReq>,
+    rpc_caller_put_append_start: RPCCaller<PutAppendStartReq>,
+    rpc_caller_put_append_revoke: RPCCaller<PutAppendRevokeReq>,
+    rpc_caller_put_append_done: RPCCaller<PutAppendDoneReq>,
+    rpc_caller_reserve_local_grant: RPCCaller<ReserveLocalGrantReq>,
+    rpc_caller_release_local_grant: RPCCaller<ReleaseLocalGrantReq>,
     rpc_caller_delete: RPCCaller<DeleteReq>,
     rpc_caller_batch_delete_ack: RPCCaller<BatchDeleteAckReq>,
+    rpc_caller_batch_is_exist: RPCCaller<BatchIsExistReq>,
     rpc_caller_get_meta: RPCCaller<GetMetaReq>,
-    _rpc_caller_allocate_client_lease: RPCCaller<AllocateClientLeaseReq>,
-    _rpc_caller_client_lease_keepalive: RPCCaller<ClientLeaseKeepaliveReq>,
+    rpc_caller_allocate_client_lease: RPCCaller<AllocateClientLeaseReq>,
+    rpc_caller_client_lease_keepalive: RPCCaller<ClientLeaseKeepaliveReq>,
     rpc_caller_external_put_commit: RPCCaller<ExternalPutCommitReq>,
     rpc_caller_external_put_revoke: RPCCaller<ExternalPutRevokeReq>,
     rpc_caller_resolve_side_transfer_lane: RPCCaller<ResolveSideTransferLaneReq>,
@@ -826,71 +1229,32 @@ pub struct ClientKvApiInner {
     /// 注意：put_id (time_ms,version) 在不同 key 上并不全局唯一，因此必须携带 key 作为索引的一部分，避免碰撞。
     /// 使用 moka::sync::SegmentedCache 并设置 30 分钟 TTL，避免异常路径未清理导致的泄漏；不设置容量上限，纯 TTL 控制。
     external_pending_puts: moka::sync::SegmentedCache<(String, u64, u32), ExternalPendingPutCtx>,
+    write_back_append_tx: tokio::sync::ampsc::Sender<WriteBackAppendJob>,
+    write_back_append_rx: Mutex<Option<tokio::sync::ampsc::Receiver<WriteBackAppendJob>>>,
 }
 
 impl ClientKvApiInner {
-    fn should_replace_cached_info(
-        current: &GetCachedInfo,
-        put_time_ms: u64,
-        put_version: u32,
-        new_value_rank: u8,
-    ) -> bool {
-        if current.put_time_ms != put_time_ms {
-            return current.put_time_ms <= put_time_ms;
-        }
-        if current.put_version != put_version {
-            return current.put_version <= put_version;
-        }
-        current.value.rank() < new_value_rank
+    fn view(&self) -> &ClientKvApiView {
+        &self.view
     }
 
-    fn upsert_cached_info(&self, key: &str, candidate: GetCachedInfo) {
-        match self.get_cached_info.entry(key.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                if Self::should_replace_cached_info(
-                    entry.get(),
-                    candidate.put_time_ms,
-                    candidate.put_version,
-                    candidate.value.rank(),
-                ) {
-                    entry.insert(candidate);
-                }
-            }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                entry.insert(candidate);
-            }
+    pub(crate) fn release_local_reserve_route_for_memory_info(&self, memory_info: &MemoryInfo) {
+        let Some((slot_size, grant_id, slot_index)) = memory_info.local_reserve_resident_slot_ref()
+        else {
+            return;
+        };
+        if let Err(err) =
+            self.owner_release_local_reserve_committed_slot_route(slot_size, grant_id, slot_index)
+        {
+            tracing::warn!(
+                "failed to release local reserve committed slot route: key={} slot_size={} grant_id={} slot_index={} err={}",
+                memory_info.key,
+                slot_size,
+                grant_id,
+                slot_index,
+                err
+            );
         }
-    }
-
-    pub(crate) fn cache_metadata_only_after_put(
-        &self,
-        key: &str,
-        put_id: crate::master_kv_router::put::PutIDForAKey,
-    ) {
-        self.upsert_cached_info(
-            key,
-            GetCachedInfo {
-                put_time_ms: put_id.0,
-                put_version: put_id.1,
-                value: CachedValue::MetadataOnly,
-            },
-        );
-    }
-
-    pub(crate) fn cache_local_replica_after_get(
-        &self,
-        key: &str,
-        put_id: crate::master_kv_router::put::PutIDForAKey,
-        memory_info: Arc<MemoryInfo>,
-    ) {
-        self.upsert_cached_info(
-            key,
-            GetCachedInfo {
-                put_time_ms: put_id.0,
-                put_version: put_id.1,
-                value: CachedValue::LocalReplica(memory_info),
-            },
-        );
     }
 
     pub(crate) fn short_circuit_put_payload_path_enabled(&self) -> bool {
@@ -900,13 +1264,496 @@ impl ClientKvApiInner {
     pub(crate) fn skip_put_end_commit_enabled(&self) -> bool {
         self.test_spec_config.skip_put_end_commit
     }
+
+    pub(crate) fn remember_local_snapshot(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+    ) {
+        self.local_snapshot_info.insert(
+            key.to_string(),
+            LocalSnapshotInfo {
+                put_time_ms: put_id.0,
+                put_version: put_id.1,
+            },
+        );
+    }
+
+    pub(crate) fn has_local_snapshot(&self, key: &str) -> bool {
+        self.precommit_local_visible_info.contains_key(key)
+            || self.get_cached_info.contains_key(key)
+            || self.local_snapshot_info.contains_key(key)
+    }
+
+    pub(crate) fn remove_local_snapshot_if(
+        &self,
+        key: &str,
+        put_time_ms: u64,
+        put_version: u32,
+    ) -> bool {
+        self.local_snapshot_info
+            .remove_if(key, |_, v| v.version_matches(put_time_ms, put_version))
+            .is_some()
+    }
+
+    pub(crate) fn local_visible_mem_holder(&self, key: &str) -> Option<Arc<MemoryInfo>> {
+        if let Some(info) = self.precommit_local_visible_info.get(key) {
+            return Some(info.mem_holder.clone());
+        }
+        self.get_cached_info
+            .get(key)
+            .map(|info| info.mem_holder.clone())
+    }
+
+    pub async fn build_local_reserve_resident_memory_info(
+        &self,
+        key: &str,
+        addr: u64,
+        len: u32,
+        slot_size: u64,
+        grant_id: u64,
+        slot_index: u32,
+    ) -> Arc<MemoryInfo> {
+        let resident_owner_node_id: NodeID = self.view.cluster_manager().get_self_info().id.into();
+        Arc::new(
+            MemoryInfo::new_local_reserve_resident(
+                addr,
+                len,
+                key.to_string(),
+                resident_owner_node_id,
+                self.view.clone(),
+                slot_size,
+                grant_id,
+                slot_index,
+            )
+            .await,
+        )
+    }
+
+    pub async fn install_local_committed_memory_info(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        offset: u64,
+        len: u32,
+        holder_id: u64,
+    ) -> KvResult<()> {
+        let master_node_id: NodeID = self.view.cluster_manager().get_self_info().id.into();
+        let memory_info = Arc::new(
+            MemoryInfo::new(
+                offset,
+                len,
+                holder_id,
+                key.to_string(),
+                master_node_id,
+                self.view.clone(),
+            )
+            .await,
+        );
+        let replaced = self.get_cached_info.insert(
+            key.to_string(),
+            GetCachedInfo {
+                put_time_ms: put_id.0,
+                put_version: put_id.1,
+                mem_holder: memory_info,
+            },
+        );
+        if let Some(previous) = replaced {
+            self.release_local_reserve_route_for_memory_info(previous.mem_holder.as_ref());
+        }
+        self.remember_local_snapshot(key, put_id);
+        Ok(())
+    }
+
+    pub fn install_precommit_local_visible_memory_info(
+        &self,
+        key: &str,
+        memory_info: Arc<MemoryInfo>,
+    ) {
+        let (slot_size, grant_id, slot_index) = memory_info
+            .local_reserve_resident_slot_ref()
+            .expect("resident memory_info must carry local reserve slot ref");
+        self.owner_mark_local_reserve_slot_pending_visible(slot_size, grant_id, slot_index)
+            .expect("marking local reserve slot pending visible must succeed");
+        self.owner_retain_local_reserve_resident_slot_holder(slot_size, grant_id, slot_index)
+            .expect("retaining local reserve resident holder must succeed");
+        let replaced = self.precommit_local_visible_info.insert(
+            key.to_string(),
+            PrecommitLocalVisibleInfo {
+                mem_holder: memory_info.clone(),
+            },
+        );
+        assert!(
+            replaced.is_none(),
+            "precommit local visible cache must not be replaced for the same key"
+        );
+    }
+
+    pub fn remove_precommit_local_reserve_resident_slot_if_same(
+        &self,
+        key: &str,
+        expected_mem_holder: &Arc<MemoryInfo>,
+    ) -> bool {
+        self.precommit_local_visible_info
+            .remove_if(key, |_, info| {
+                Arc::ptr_eq(&info.mem_holder, expected_mem_holder)
+            })
+            .is_some()
+    }
+
+    pub fn promote_precommit_local_reserve_resident_slot_if_same(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        memory_info: Arc<MemoryInfo>,
+    ) -> KvResult<()> {
+        let is_same_pending = self
+            .precommit_local_visible_info
+            .get(key)
+            .map(|info| Arc::ptr_eq(&info.mem_holder, &memory_info))
+            .unwrap_or(false);
+        if !is_same_pending {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "precommit local visible cache missing while promoting key={}",
+                    key
+                ),
+            }));
+        }
+        let (slot_size, grant_id, slot_index) = memory_info
+            .local_reserve_resident_slot_ref()
+            .expect("resident memory_info must carry local reserve slot ref");
+        self.owner_promote_local_reserve_pending_slot_to_committed(
+            slot_size, grant_id, slot_index,
+        )?;
+        let removed = self
+            .precommit_local_visible_info
+            .remove_if(key, |_, info| Arc::ptr_eq(&info.mem_holder, &memory_info))
+            .is_some();
+        if !removed {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "precommit local visible cache disappeared while promoting key={}",
+                    key
+                ),
+            }));
+        }
+        let replaced = self.get_cached_info.insert(
+            key.to_string(),
+            GetCachedInfo {
+                put_time_ms: put_id.0,
+                put_version: put_id.1,
+                mem_holder: memory_info,
+            },
+        );
+        if let Some(previous) = replaced {
+            self.release_local_reserve_route_for_memory_info(previous.mem_holder.as_ref());
+        }
+        self.remember_local_snapshot(key, put_id);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ExternalPendingPutCtx {
-    pub peer_id: NodeIDString,
+    pub peer_id: Option<NodeIDString>,
+    pub src_offset: u64,
     pub target_base_addr: u64,
     pub target_offset: u64,
+    pub len: u64,
+    pub preferred_sub_cluster: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WriteBackAppendJob {
+    pub key: String,
+    pub put_id: crate::master_kv_router::put::PutIDForAKey,
+    pub holder: Arc<UserMemHolder>,
+    pub preferred_sub_cluster: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum OwnerLocalReserveSlotState {
+    Free,
+    Prepared,
+    PendingLocalVisible {
+        holder_ref_count: u32,
+    },
+    Committed {
+        route_live: bool,
+        holder_ref_count: u32,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct OwnerLocalReserveSlotRef {
+    pub grant_id: u64,
+    pub slot_index: u32,
+    pub ptr: u64,
+    pub base_addr: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OwnerLocalReserveSlotLease {
+    pub value_len: u64,
+    pub slot_size: u64,
+    pub slots: Vec<OwnerLocalReserveSlotRef>,
+}
+
+impl OwnerLocalReserveSlotLease {
+    pub fn value_ptrs(&self) -> Vec<u64> {
+        self.slots.iter().map(|slot| slot.ptr).collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OwnerLocalReserveGrantState {
+    pub grant_id: u64,
+    pub base_addr: u64,
+    pub addr: u64,
+    pub len: u64,
+    pub slot_size: u64,
+    pub slot_count: u32,
+    pub slot_states: Vec<OwnerLocalReserveSlotState>,
+    pub free_slots: Vec<u32>,
+    pub fully_free_since: Option<Instant>,
+}
+
+impl OwnerLocalReserveGrantState {
+    pub fn new(
+        grant_id: u64,
+        base_addr: u64,
+        addr: u64,
+        len: u64,
+        slot_size: u64,
+        slot_count: u32,
+    ) -> Self {
+        let mut free_slots = Vec::with_capacity(slot_count as usize);
+        for slot_index in (0..slot_count).rev() {
+            free_slots.push(slot_index);
+        }
+        Self {
+            grant_id,
+            base_addr,
+            addr,
+            len,
+            slot_size,
+            slot_count,
+            slot_states: vec![OwnerLocalReserveSlotState::Free; slot_count as usize],
+            free_slots,
+            fully_free_since: Some(Instant::now()),
+        }
+    }
+
+    pub fn claim_prepared_slot(&mut self) -> Option<OwnerLocalReserveSlotRef> {
+        let slot_index = self.free_slots.pop()?;
+        let state = self
+            .slot_states
+            .get_mut(slot_index as usize)
+            .expect("slot state index out of range");
+        assert!(
+            matches!(*state, OwnerLocalReserveSlotState::Free),
+            "claim_prepared_slot expects a free slot"
+        );
+        *state = OwnerLocalReserveSlotState::Prepared;
+        self.fully_free_since = None;
+        Some(OwnerLocalReserveSlotRef {
+            grant_id: self.grant_id,
+            slot_index,
+            ptr: self.addr + self.slot_size * slot_index as u64,
+            base_addr: self.base_addr,
+        })
+    }
+
+    pub fn mark_prepared_slot_pending_visible(&mut self, slot_index: u32) {
+        let state = self
+            .slot_states
+            .get_mut(slot_index as usize)
+            .expect("slot state index out of range");
+        assert!(
+            matches!(*state, OwnerLocalReserveSlotState::Prepared),
+            "mark_prepared_slot_pending_visible expects a prepared slot"
+        );
+        *state = OwnerLocalReserveSlotState::PendingLocalVisible {
+            holder_ref_count: 0,
+        };
+        self.fully_free_since = None;
+    }
+
+    pub fn promote_pending_visible_slot_to_committed(&mut self, slot_index: u32) {
+        let state = self
+            .slot_states
+            .get_mut(slot_index as usize)
+            .expect("slot state index out of range");
+        let holder_ref_count = match *state {
+            OwnerLocalReserveSlotState::PendingLocalVisible { holder_ref_count } => {
+                holder_ref_count
+            }
+            _ => {
+                unreachable!("promote_pending_visible_slot_to_committed expects a pending slot");
+            }
+        };
+        *state = OwnerLocalReserveSlotState::Committed {
+            route_live: true,
+            holder_ref_count,
+        };
+        self.fully_free_since = None;
+    }
+
+    pub fn release_prepared_slot(&mut self, slot_index: u32) {
+        let state = self
+            .slot_states
+            .get_mut(slot_index as usize)
+            .expect("slot state index out of range");
+        assert!(
+            matches!(*state, OwnerLocalReserveSlotState::Prepared),
+            "release_prepared_slot expects a prepared slot"
+        );
+        *state = OwnerLocalReserveSlotState::Free;
+        self.free_slots.push(slot_index);
+        if self.is_fully_free() {
+            self.fully_free_since = Some(Instant::now());
+        }
+    }
+
+    pub fn retain_resident_slot_holder(&mut self, slot_index: u32) {
+        let state = self
+            .slot_states
+            .get_mut(slot_index as usize)
+            .expect("slot state index out of range");
+        match state {
+            OwnerLocalReserveSlotState::PendingLocalVisible { holder_ref_count }
+            | OwnerLocalReserveSlotState::Committed {
+                holder_ref_count, ..
+            } => {
+                *holder_ref_count = holder_ref_count
+                    .checked_add(1)
+                    .expect("retain_resident_slot_holder overflow");
+            }
+            _ => {
+                unreachable!("retain_resident_slot_holder expects a resident slot");
+            }
+        }
+    }
+
+    pub fn release_resident_slot_holder(&mut self, slot_index: u32) {
+        let state = self
+            .slot_states
+            .get_mut(slot_index as usize)
+            .expect("slot state index out of range");
+        match state {
+            OwnerLocalReserveSlotState::PendingLocalVisible { holder_ref_count } => {
+                assert!(
+                    *holder_ref_count > 0,
+                    "release_resident_slot_holder expects holder_ref_count > 0"
+                );
+                *holder_ref_count -= 1;
+                if *holder_ref_count == 0 {
+                    *state = OwnerLocalReserveSlotState::Free;
+                    self.free_slots.push(slot_index);
+                    if self.is_fully_free() {
+                        self.fully_free_since = Some(Instant::now());
+                    }
+                }
+            }
+            OwnerLocalReserveSlotState::Committed {
+                route_live,
+                holder_ref_count,
+            } => {
+                *holder_ref_count = holder_ref_count
+                    .checked_sub(1)
+                    .expect("release_resident_slot_holder expects holder_ref_count > 0");
+                if !*route_live && *holder_ref_count == 0 {
+                    *state = OwnerLocalReserveSlotState::Free;
+                    self.free_slots.push(slot_index);
+                    if self.is_fully_free() {
+                        self.fully_free_since = Some(Instant::now());
+                    }
+                }
+            }
+            _ => {
+                unreachable!("release_resident_slot_holder expects a resident slot");
+            }
+        }
+    }
+
+    pub fn release_committed_slot_route(&mut self, slot_index: u32) {
+        let state = self
+            .slot_states
+            .get_mut(slot_index as usize)
+            .expect("slot state index out of range");
+        match state {
+            OwnerLocalReserveSlotState::Committed {
+                route_live,
+                holder_ref_count,
+            } => {
+                assert!(
+                    *route_live,
+                    "release_committed_slot_route expects a live route"
+                );
+                *route_live = false;
+                if *holder_ref_count == 0 {
+                    *state = OwnerLocalReserveSlotState::Free;
+                    self.free_slots.push(slot_index);
+                    if self.is_fully_free() {
+                        self.fully_free_since = Some(Instant::now());
+                    }
+                }
+            }
+            _ => {
+                unreachable!("release_committed_slot_route expects a committed slot");
+            }
+        }
+    }
+
+    pub fn is_fully_free(&self) -> bool {
+        self.free_slots.len() == self.slot_count as usize
+    }
+
+    pub fn used_slot_count(&self) -> usize {
+        self.slot_count as usize - self.free_slots.len()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OwnerLocalReserveClassState {
+    pub slot_size: u64,
+    pub slots_per_grant: u32,
+    pub grants: Vec<OwnerLocalReserveGrantState>,
+    pub last_grow_at: Option<Instant>,
+    pub pending_slot_demand: usize,
+}
+
+impl OwnerLocalReserveClassState {
+    pub fn new(slot_size: u64, slots_per_grant: u32) -> Self {
+        Self {
+            slot_size,
+            slots_per_grant,
+            grants: Vec::new(),
+            last_grow_at: None,
+            pending_slot_demand: 0,
+        }
+    }
+
+    pub fn free_slot_count(&self) -> usize {
+        self.grants.iter().map(|grant| grant.free_slots.len()).sum()
+    }
+
+    pub fn used_slot_count(&self) -> usize {
+        self.grants
+            .iter()
+            .map(|grant| grant.used_slot_count())
+            .sum()
+    }
+
+    pub fn grant_count(&self) -> usize {
+        self.grants.len()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct OwnerLocalReservePoolState {
+    pub classes: HashMap<u64, OwnerLocalReserveClassState>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1071,18 +1918,61 @@ impl MetricsSet {
     }
 }
 
+fn format_metrics_snapshot_prometheus(
+    client_id: &str,
+    timestamp_ms: i64,
+    metrics: &std::collections::HashMap<String, MetricsSet>,
+) -> String {
+    let mut result = String::new();
+
+    for (metric_name, metric_set) in metrics {
+        result.push_str(&metric_set.to_prometheus_format(metric_name, client_id));
+        result.push_str(&metric_set.to_prometheus_timeline_format(client_id));
+    }
+
+    result.push_str(&format!(
+        "kvcache_metrics_report_timestamp{{client=\"{}\"}} {}\n",
+        client_id, timestamp_ms
+    ));
+
+    result
+}
+
 impl ClientKvApiInner {
     pub fn get_holding_len(&self) -> usize {
         self.external_get_holding.total()
     }
+
+    pub fn runtime_observe_snapshot(&self) -> OwnerRuntimeObserveSnapshot {
+        let mut external_get_holding_bytes = 0u64;
+        for entry in self.external_get_holding.inner().iter() {
+            external_get_holding_bytes =
+                external_get_holding_bytes.saturating_add(entry.value().memory_info.len as u64);
+        }
+        OwnerRuntimeObserveSnapshot {
+            external_get_holding_entries: self.external_get_holding.total() as u64,
+            external_get_holding_bytes,
+            external_pending_put_entries: self.external_pending_puts.entry_count(),
+        }
+    }
+
     pub fn get_cache_len(&self) -> usize {
-        self.get_cached_info.len()
+        self.precommit_local_visible_info.len() + self.get_cached_info.len()
     }
     fn metrics_handle(&self) -> Arc<MetricsHandle> {
         self.metrics
             .get()
             .cloned()
             .expect("metrics handle not initialized")
+    }
+
+    pub fn locality_snapshot(&self) -> KvLocalitySnapshot {
+        self.metrics_handle().get_locality_snapshot()
+    }
+
+    pub fn record_put_locality(&self, remote: bool, bytes: u64, transfer_us: i64) {
+        self.metrics_handle()
+            .record_put_io_locality(remote, bytes, transfer_us);
     }
 
     fn client_id_str(&self) -> String {
@@ -1506,10 +2396,75 @@ impl ClientKvApiInner {
 
         new_ref
     }
+
+    pub(crate) fn owner_local_reserve_rebalance_notify(
+        &self,
+    ) -> Arc<limit_thirdparty::tokio::sync::Notify> {
+        self.owner_local_reserve_rebalance_notify.clone()
+    }
+
+    pub(crate) fn owner_local_reserve_register_pending_demand(
+        &self,
+        slot_size: u64,
+        slots_per_grant: u32,
+        demand_slots: usize,
+    ) {
+        let mut pool = self.owner_local_reserve_pool.lock();
+        let class_state = pool
+            .classes
+            .entry(slot_size)
+            .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
+        class_state.pending_slot_demand =
+            class_state.pending_slot_demand.saturating_add(demand_slots);
+    }
+
+    pub(crate) fn owner_local_reserve_consume_pending_demand(
+        &self,
+        slot_size: u64,
+        slots_per_grant: u32,
+        demand_slots: usize,
+    ) {
+        let mut pool = self.owner_local_reserve_pool.lock();
+        let class_state = pool
+            .classes
+            .entry(slot_size)
+            .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
+        class_state.pending_slot_demand =
+            class_state.pending_slot_demand.saturating_sub(demand_slots);
+    }
 }
 impl ClientKvApi {
     pub fn inner(&self) -> &ClientKvApiInner {
         &self.0
+    }
+
+    fn spawn_runtime_observe_reporter(&self) {
+        let view = self.0.view.clone_view();
+        let view_task = view.clone();
+        view.spawn("client_runtime_observe_reporter", async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut shutdown_waiter = view_task.register_shutdown_waiter();
+            loop {
+                tokio::select! {
+                    _ = shutdown_waiter.wait() => break,
+                    _ = interval.tick() => {
+                        let snapshot = view_task.client_kv_api().inner().runtime_observe_snapshot();
+                        let metrics = view_task.metric_reporter().metrics();
+                        metrics.set_kv_holding_entries(
+                            "owner_external_get_holding",
+                            snapshot.external_get_holding_entries,
+                        );
+                        metrics.set_kv_holding_bytes(
+                            "owner_external_get_holding",
+                            snapshot.external_get_holding_bytes,
+                        );
+                        metrics.set_kv_external_pending_put_entries(
+                            snapshot.external_pending_put_entries,
+                        );
+                    }
+                }
+            }
+        });
     }
 
     pub fn attach_view(&self, view: ClientKvApiView) {
@@ -1518,6 +2473,7 @@ impl ClientKvApi {
 
     pub async fn construct(arg: ClientKvApiNewArg) -> Result<Self, KvError> {
         tracing::info!("Constructing ClientKvApi in Client mode (PreView)");
+        let (write_back_append_tx, write_back_append_rx) = tokio::sync::ampsc::channel(1024);
 
         let inner = ClientKvApiInner {
             view: ClientKvApiViewHolder::new(),
@@ -1526,6 +2482,12 @@ impl ClientKvApi {
             all_memholder_refcount: OnceLock::new(),
             get_remote_kv_lock: AMapLock::new(Duration::from_secs(60)),
             get_cached_info: DashMap::new(),
+            precommit_local_visible_info: DashMap::new(),
+            local_snapshot_info: DashMap::new(),
+            owner_local_reserve_pool: Mutex::new(OwnerLocalReservePoolState::default()),
+            owner_local_reserve_rebalance_notify: Arc::new(
+                limit_thirdparty::tokio::sync::Notify::new(),
+            ),
             external_invalidate_delete: EnsureMemholderMgmtDeleteHandle::new(
                 OwnerExternalMemMgr::DELETE_SUBMIT_QUEUE_CAPACITY,
             ),
@@ -1534,6 +2496,9 @@ impl ClientKvApi {
             ),
             owner_delete_ack_mgr: OwnerDeleteAckMemMgr::default(),
             external_get_holding: OwnerExternalMemMgr::default(),
+            external_get_start_registry: DashMap::new(),
+            external_get_start_by_key: DashMap::new(),
+            next_external_get_start_handle: AtomicU64::new(1),
             external_pending_puts: moka::sync::Cache::builder()
                 .time_to_live(Duration::from_secs(30 * 60))
                 .segments(16)
@@ -1543,18 +2508,34 @@ impl ClientKvApi {
             rpc_caller_get_start: RPCCaller::new(),
             rpc_caller_get_revoke: RPCCaller::new(),
             rpc_caller_get_done: RPCCaller::new(),
+            rpc_caller_batch_get_start: RPCCaller::new(),
+            rpc_caller_batch_get_revoke: RPCCaller::new(),
+            rpc_caller_batch_get_done: RPCCaller::new(),
             rpc_caller_put_start: RPCCaller::new(),
             rpc_caller_put_revoke: RPCCaller::new(),
             rpc_caller_put_done: RPCCaller::new(),
+            rpc_caller_batch_put_start: RPCCaller::new(),
+            rpc_caller_batch_put_revoke: RPCCaller::new(),
+            rpc_caller_batch_put_done: RPCCaller::new(),
+            rpc_caller_batch_prepare_put_keys: RPCCaller::new(),
+            rpc_caller_batch_release_put_key_reservations: RPCCaller::new(),
+            rpc_caller_put_append_start: RPCCaller::new(),
+            rpc_caller_put_append_revoke: RPCCaller::new(),
+            rpc_caller_put_append_done: RPCCaller::new(),
+            rpc_caller_reserve_local_grant: RPCCaller::new(),
+            rpc_caller_release_local_grant: RPCCaller::new(),
             rpc_caller_delete: RPCCaller::new(),
             rpc_caller_batch_delete_ack: RPCCaller::new(),
+            rpc_caller_batch_is_exist: RPCCaller::new(),
             rpc_caller_get_meta: RPCCaller::new(),
-            _rpc_caller_allocate_client_lease: RPCCaller::new(),
-            _rpc_caller_client_lease_keepalive: RPCCaller::new(),
+            rpc_caller_allocate_client_lease: RPCCaller::new(),
+            rpc_caller_client_lease_keepalive: RPCCaller::new(),
             rpc_caller_external_put_commit: RPCCaller::new(),
             rpc_caller_external_put_revoke: RPCCaller::new(),
             rpc_caller_resolve_side_transfer_lane: RPCCaller::new(),
             default_lease_id: parking_lot::RwLock::new(None),
+            write_back_append_tx,
+            write_back_append_rx: Mutex::new(Some(write_back_append_rx)),
         };
         Ok(Self(inner))
     }
@@ -1570,12 +2551,54 @@ impl ClientKvApi {
         inner.rpc_caller_get_start.regist(inner.view.p2p_module());
         inner.rpc_caller_get_revoke.regist(inner.view.p2p_module());
         inner.rpc_caller_get_done.regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_get_start
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_get_revoke
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_get_done
+            .regist(inner.view.p2p_module());
         inner.rpc_caller_put_start.regist(inner.view.p2p_module());
         inner.rpc_caller_put_revoke.regist(inner.view.p2p_module());
         inner.rpc_caller_put_done.regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_put_start
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_put_revoke
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_put_done
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_prepare_put_keys
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_release_put_key_reservations
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_put_append_start
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_put_append_revoke
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_put_append_done
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_reserve_local_grant
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_release_local_grant
+            .regist(inner.view.p2p_module());
         inner.rpc_caller_delete.regist(inner.view.p2p_module());
         inner
             .rpc_caller_batch_delete_ack
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_is_exist
             .regist(inner.view.p2p_module());
         inner.rpc_caller_get_meta.regist(inner.view.p2p_module());
         inner
@@ -1592,14 +2615,17 @@ impl ClientKvApi {
         // Register master-only metric RPC callers
         crate::metrics::client::init_for_p2p_owner(inner.view.p2p_module());
         RPCCaller::<BatchDeleteAckReq>::new().regist(inner.view.p2p_module());
+        RPCCaller::<BatchIsExistReq>::new().regist(inner.view.p2p_module());
         RPCCaller::<BatchDeleteClientKvMetaCacheReq>::new().regist(inner.view.p2p_module());
+        spawn_owner_local_reserve_rebalance_actor(inner.view.clone_view());
+        self.spawn_runtime_observe_reporter();
 
         // External RPC handlers
         let view_ext = inner.view.clone_view();
         RPCHandler::<ExternalGetReq>::new().regist(inner.view.p2p_module(), move |resp, msg| {
             let view = view_ext.clone();
             let view_task = view.clone();
-            let _ = view.spawn("rpc_external_get", async move {
+            view.spawn("rpc_external_get", async move {
                 let result = handle_external_get(&view_task, &msg).await;
                 let _ = resp.send_resp(result).await;
             });
@@ -1607,10 +2633,66 @@ impl ClientKvApi {
         });
 
         let view_ext = inner.view.clone_view();
+        RPCHandler::<ExternalBatchGetReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_external_batch_get", async move {
+                    let result = handle_external_batch_get(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
+        let view_ext = inner.view.clone_view();
+        RPCHandler::<ExternalBatchGetStartReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_external_batch_get_start", async move {
+                    let result = handle_external_batch_get_start(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
+        let view_ext = inner.view.clone_view();
+        RPCHandler::<ExternalBatchGetTransferReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_external_batch_get_transfer", async move {
+                    let result = handle_external_batch_get_transfer(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
+        let view_ext = inner.view.clone_view();
+        RPCHandler::<ExternalBatchGetCancelReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_external_batch_get_cancel", async move {
+                    let result = handle_external_batch_get_cancel(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
+        let view_ext = inner.view.clone_view();
         RPCHandler::<ExternalPutStartReq>::new().regist(inner.view.p2p_module(), move |resp, msg| {
             let view = view_ext.clone();
             let view_task = view.clone();
-            let _ = view.spawn("rpc_external_put_start", async move {
+            view.spawn("rpc_external_put_start", async move {
                 let req = msg.serialize_part.clone();
                 tracing::info!(
                     "rpc_external_put_start received: self={} peer={} task_id={} key={} len={} started_time={}",
@@ -1645,13 +2727,41 @@ impl ClientKvApi {
         });
 
         let view_ext = inner.view.clone_view();
+        RPCHandler::<ExternalBatchPutStartReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_external_batch_put_start", async move {
+                    let result = handle_external_batch_put_start(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
+        let view_ext = inner.view.clone_view();
         RPCHandler::<ExternalPutTransferEndReq>::new().regist(
             inner.view.p2p_module(),
             move |resp, msg| {
                 let view = view_ext.clone();
                 let view_task = view.clone();
-                let _ = view.spawn("rpc_external_put_transfer_end", async move {
+                view.spawn("rpc_external_put_transfer_end", async move {
                     let result = handle_external_put_transfer_end(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
+        let view_ext = inner.view.clone_view();
+        RPCHandler::<ExternalBatchPutTransferEndReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_external_batch_put_transfer_end", async move {
+                    let result = handle_external_batch_put_transfer_end(&view_task, &msg).await;
                     let _ = resp.send_resp(result).await;
                 });
                 Ok(())
@@ -1664,8 +2774,22 @@ impl ClientKvApi {
             move |resp, msg| {
                 let view = view_ext.clone();
                 let view_task = view.clone();
-                let _ = view.spawn("rpc_external_put_commit", async move {
+                view.spawn("rpc_external_put_commit", async move {
                     let result = handle_external_put_commit(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
+        let view_ext = inner.view.clone_view();
+        RPCHandler::<ExternalBatchPutCommitReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_external_batch_put_commit", async move {
+                    let result = handle_external_batch_put_commit(&view_task, &msg).await;
                     let _ = resp.send_resp(result).await;
                 });
                 Ok(())
@@ -1678,7 +2802,7 @@ impl ClientKvApi {
             move |resp, msg| {
                 let view = view_ext.clone();
                 let view_task = view.clone();
-                let _ = view.spawn("rpc_external_put_revoke", async move {
+                view.spawn("rpc_external_put_revoke", async move {
                     let result = handle_external_put_revoke(&view_task, &msg).await;
                     let _ = resp.send_resp(result).await;
                 });
@@ -1690,7 +2814,7 @@ impl ClientKvApi {
         RPCHandler::<ExternalDeleteReq>::new().regist(inner.view.p2p_module(), move |resp, msg| {
             let view = view_ext.clone();
             let view_task = view.clone();
-            let _ = view.spawn("rpc_external_delete", async move {
+            view.spawn("rpc_external_delete", async move {
                 let result = handle_external_delete(&view_task, &msg).await;
                 let _ = resp.send_resp(result).await;
             });
@@ -1703,8 +2827,36 @@ impl ClientKvApi {
             move |resp, msg| {
                 let view = view_ext.clone();
                 let view_task = view.clone();
-                let _ = view.spawn("rpc_external_is_exist", async move {
+                view.spawn("rpc_external_is_exist", async move {
                     let result = handle_external_is_exist(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
+        let view_ext = inner.view.clone_view();
+        RPCHandler::<ExternalBatchIsExistReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_external_batch_is_exist", async move {
+                    let result = handle_external_batch_is_exist(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
+        let view_ext = inner.view.clone_view();
+        RPCHandler::<ExternalObservabilitySnapshotReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_external_observability_snapshot", async move {
+                    let result = handle_external_observability_snapshot(&view_task, &msg).await;
                     let _ = resp.send_resp(result).await;
                 });
                 Ok(())
@@ -1717,7 +2869,7 @@ impl ClientKvApi {
             move |resp, msg| {
                 let view = view_ext.clone();
                 let view_task = view.clone();
-                let _ = view.spawn("rpc_external_delete_ack", async move {
+                view.spawn("rpc_external_delete_ack", async move {
                     let result = handle_external_delete_ack(&view_task, &msg).await;
                     let _ = resp.send_resp(result).await;
                 });
@@ -1731,7 +2883,7 @@ impl ClientKvApi {
         RPCHandler::<SyncKvToFileReq>::new().regist(inner.view.p2p_module(), move |resp, msg| {
             let view = view_ext.clone();
             let view_task = view.clone();
-            let _ = view.spawn("rpc_sync_kv_to_file", async move {
+            view.spawn("rpc_sync_kv_to_file", async move {
                 let result = handle_sync_kv_to_file_client(&view_task, &msg).await;
                 let _ = resp.send_resp(result).await;
             });
@@ -1746,7 +2898,7 @@ impl ClientKvApi {
                 let req_node_id = resp.node_id().clone();
                 let view = view.clone();
                 let view_task = view.clone();
-                let _ = view.spawn("rpc_batch_delete_client_kv_meta_cache", async move {
+                view.spawn("rpc_batch_delete_client_kv_meta_cache", async move {
                     let ack =
                         handle_batch_delete_client_kv_meta_cache(&view_task, msg, req_node_id)
                             .await;
@@ -1773,11 +2925,17 @@ impl ClientKvApi {
             .expect("delete_ack_batch rx already taken, that's impossible");
         delete::spawn_owner_delete_ack_batch(inner.view.clone_view(), delete_ack_batch_rx);
 
+        if let Some(write_back_append_rx) = inner.write_back_append_rx.lock().take() {
+            put::spawn_write_back_append_actor(inner.view.clone_view(), write_back_append_rx);
+        } else {
+            tracing::warn!("write_back_append_rx already taken for ClientKvApi");
+        }
+
         // Spawn cluster listener to clean up get_holding when external_client leaves
         let view = inner.view.clone_view();
         let view2 = view.clone();
         let view_task = view2.clone();
-        let _ = view.spawn("client_cluster_listener", async move {
+        view.spawn("client_cluster_listener", async move {
             let mut listen_cluster_event = view_task.cluster_manager().listen();
             let mut shutdown_waiter = view_task.register_shutdown_waiter();
 
@@ -1917,9 +3075,8 @@ impl ClientKvApi {
         tracing::info!("------------------------------------------------------------");
     }
 
-    #[cfg(any(test, feature = "test_bins"))]
     pub fn has_cached_key(&self, key: &str) -> bool {
-        self.inner().get_cached_info.contains_key(key)
+        self.inner().has_local_snapshot(key)
     }
 
     // Removed is_client_mode(): ClientKvApi is owner-only and always constructed.

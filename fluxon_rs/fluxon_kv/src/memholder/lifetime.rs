@@ -1,5 +1,7 @@
 use super::DeleteTargetMember;
-use crate::client_kv_api::msg_pack::ExternalInvalidateWeakIndexReq;
+use crate::client_kv_api::msg_pack::{
+    ExternalInvalidateWeakIndexItem, ExternalInvalidateWeakIndexReq,
+};
 use crate::client_kv_api::{ClientKvApiView, ClientKvApiViewTrait, ExternalHoldingGetInfo};
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::external_client_api::{ExternalClientApiView, ExternalClientApiViewTrait};
@@ -786,18 +788,24 @@ impl MemholderManagerTrait for OwnerExternalMemMgr {
         target: Self::DeleteTarget,
         tasks: Vec<Self::DeleteTask>,
     ) -> Result<(), String> {
-        let mut keys: Vec<String> = tasks.into_iter().map(|task| task.key).collect();
-        keys.sort();
-        keys.dedup();
+        let mut items: Vec<ExternalInvalidateWeakIndexItem> = tasks
+            .into_iter()
+            .map(|task| ExternalInvalidateWeakIndexItem { key: task.key })
+            .collect();
+        items.sort_by(|a, b| a.key.cmp(&b.key));
+        items.dedup_by(|a, b| a.key == b.key);
 
-        if keys.is_empty() {
+        if items.is_empty() {
             return Ok(());
         }
 
         let rpc_caller = RPCCaller::<ExternalInvalidateWeakIndexReq>::new();
         rpc_caller.regist(ctx.p2p_module());
         let req = MsgPack {
-            serialize_part: ExternalInvalidateWeakIndexReq { keys },
+            serialize_part: ExternalInvalidateWeakIndexReq {
+                keys: Vec::new(),
+                items,
+            },
             raw_bytes: Vec::new(),
         };
 

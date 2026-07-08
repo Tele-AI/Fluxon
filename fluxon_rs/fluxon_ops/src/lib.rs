@@ -80,7 +80,8 @@ const DELETE_APPLY_NO_WAIT_DELAY_SECONDS: u64 = 30;
 
 const EMBEDDED_SELECTION_SUPERVISOR_SOURCE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/selection_supervisor.py"));
-const EMBEDDED_LOG_SHARD_HELPER_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/log_shard.py"));
+const EMBEDDED_LOG_SHARD_HELPER_SOURCE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/log_shard.py"));
 
 // Ops controller uses Fluxon user-RPC to talk to ops agents.
 // Keep the timeout as a fixed constant to avoid config surface area.
@@ -351,7 +352,10 @@ fn workload_log_latest_shard_identity(logical_path: &Path) -> anyhow::Result<Opt
     let Some(path) = resolve_readable_log_path(logical_path) else {
         return Ok(None);
     };
-    Ok(Some(workload_log_shard_identity_from_path(logical_path, &path)?))
+    Ok(Some(workload_log_shard_identity_from_path(
+        logical_path,
+        &path,
+    )?))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1110,7 +1114,9 @@ fn resolve_python_host_executable(python_exe: &Path) -> anyhow::Result<PathBuf> 
     Ok(resolved)
 }
 
-fn ensure_embedded_selection_supervisor_runtime(workdir: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+fn ensure_embedded_selection_supervisor_runtime(
+    workdir: &Path,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
     let runtime_dir = workdir.join(OPS_SELECTION_SUPERVISOR_DIR_NAME);
     std::fs::create_dir_all(&runtime_dir).with_context(|| {
         format!(
@@ -1657,10 +1663,11 @@ fn selection_owner_supervisor(
     scope_key: Option<&str>,
     exclude_pid: Option<u32>,
 ) -> anyhow::Result<Option<LiveSelectionSupervisor>> {
-    let owners: Vec<LiveSelectionSupervisor> = live_selection_supervisors(snapshot, Some(label), scope_key)?
-        .into_iter()
-        .filter(|supervisor| exclude_pid != Some(supervisor.pid()))
-        .collect();
+    let owners: Vec<LiveSelectionSupervisor> =
+        live_selection_supervisors(snapshot, Some(label), scope_key)?
+            .into_iter()
+            .filter(|supervisor| exclude_pid != Some(supervisor.pid()))
+            .collect();
     if owners.is_empty() {
         return Ok(None);
     }
@@ -2068,7 +2075,16 @@ fn wait_for_selection_attached(
     argv: &[String],
     cwd: Option<&str>,
 ) -> anyhow::Result<SelectionSupervisorStatus> {
-    wait_for_selection_attached_for_scope(kind, name, authority, None, apply_id, owner_ts_ms, argv, cwd)
+    wait_for_selection_attached_for_scope(
+        kind,
+        name,
+        authority,
+        None,
+        apply_id,
+        owner_ts_ms,
+        argv,
+        cwd,
+    )
 }
 
 fn wait_for_selection_attached_without_present_for_scope(
@@ -2803,10 +2819,9 @@ impl SupervisorBackedWorkloads {
     fn list_workloads(&self) -> anyhow::Result<Vec<WorkloadStatusSummary>> {
         let mut out: Vec<WorkloadStatusSummary> = Vec::new();
         let snapshot = selection_supervisor_proc_snapshot()?;
-        for status in observe_all_selection_statuses_for_snapshot(
-            &snapshot,
-            Some(self.scope_key.as_str()),
-        )? {
+        for status in
+            observe_all_selection_statuses_for_snapshot(&snapshot, Some(self.scope_key.as_str()))?
+        {
             let kind = status.kind.with_context(|| {
                 format!(
                     "selection supervisor list item missing kind: label={}",
@@ -3159,7 +3174,10 @@ impl UserRpcHandler for ReadWorkloadLogChunkHandler {
             None => {
                 let Some(path) = resolve_readable_log_path(&logical_path) else {
                     let resp = make_err_resp(
-                        format!("log file is not available yet: logical_path={}", logical_path.display()),
+                        format!(
+                            "log file is not available yet: logical_path={}",
+                            logical_path.display()
+                        ),
                         None,
                     );
                     return Ok(serde_json::to_vec(&resp).unwrap());
@@ -3186,138 +3204,11 @@ impl UserRpcHandler for ReadWorkloadLogChunkHandler {
         };
 
         let file_size = meta.len();
-        let (start, end, start_cursor, end_cursor, effective_path, effective_file_size) =
-            match req.direction {
-                LogReadDirection::Forward => {
-                    if let Some(cursor) = req.cursor.as_ref() {
-                        if cursor.offset > file_size {
-                            let resp = make_err_resp(
-                                format!(
-                                    "cursor out of range: shard={} cursor={} file_size={}",
-                                    cursor.shard, cursor.offset, file_size
-                                ),
-                                Some(file_size),
-                            );
-                            return Ok(serde_json::to_vec(&resp).unwrap());
-                        }
-                        let mut effective_path = path.clone();
-                        let mut effective_shard = shard.clone();
-                        let mut effective_file_size = file_size;
-                        let mut start = cursor.offset;
-                        if cursor.offset == file_size {
-                            if let Ok(Some(next_shard)) =
-                                workload_log_next_shard(&logical_path, &cursor.shard)
-                            {
-                                let next_path = match workload_log_path_for_shard(&logical_path, &next_shard) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        let resp = make_err_resp(format!("{}", e), Some(file_size));
-                                        return Ok(serde_json::to_vec(&resp).unwrap());
-                                    }
-                                };
-                                match std::fs::metadata(&next_path) {
-                                    Ok(next_meta) => {
-                                        effective_file_size = next_meta.len();
-                                        effective_path = next_path;
-                                        effective_shard = next_shard;
-                                        start = 0;
-                                    }
-                                    Err(e) => {
-                                        let resp = make_err_resp(
-                                            format!(
-                                                "stat next log shard failed: path={} err={}",
-                                                next_path.display(),
-                                                e
-                                            ),
-                                            Some(file_size),
-                                        );
-                                        return Ok(serde_json::to_vec(&resp).unwrap());
-                                    }
-                                }
-                            } else if let Ok(Some(latest_shard)) =
-                                workload_log_latest_shard_identity(&logical_path)
-                            {
-                                if latest_shard != cursor.shard {
-                                    let latest_path =
-                                        match workload_log_path_for_shard(&logical_path, &latest_shard) {
-                                            Ok(v) => v,
-                                            Err(e) => {
-                                                let resp = make_err_resp(format!("{}", e), Some(file_size));
-                                                return Ok(serde_json::to_vec(&resp).unwrap());
-                                            }
-                                        };
-                                    match std::fs::metadata(&latest_path) {
-                                        Ok(latest_meta) => {
-                                            effective_file_size = latest_meta.len();
-                                            effective_path = latest_path;
-                                            effective_shard = latest_shard;
-                                            start = 0;
-                                        }
-                                        Err(e) => {
-                                            let resp = make_err_resp(
-                                                format!(
-                                                    "stat latest log shard failed: path={} err={}",
-                                                    latest_path.display(),
-                                                    e
-                                                ),
-                                                Some(file_size),
-                                            );
-                                            return Ok(serde_json::to_vec(&resp).unwrap());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        let end = match max_bytes {
-                            Some(max_bytes) => {
-                                std::cmp::min(effective_file_size, start.saturating_add(max_bytes))
-                            }
-                            None => effective_file_size,
-                        };
-                        (
-                            start,
-                            end,
-                            Some(WorkloadLogCursor {
-                                shard: effective_shard.clone(),
-                                offset: start,
-                            }),
-                            Some(WorkloadLogCursor {
-                                shard: effective_shard.clone(),
-                                offset: end,
-                            }),
-                            effective_path,
-                            effective_file_size,
-                        )
-                    } else {
-                        let end = file_size;
-                        let start = match max_bytes {
-                            Some(max_bytes) => end.saturating_sub(max_bytes),
-                            None => 0,
-                        };
-                        (
-                            start,
-                            end,
-                            Some(WorkloadLogCursor {
-                                shard: shard.clone(),
-                                offset: start,
-                            }),
-                            Some(WorkloadLogCursor {
-                                shard: shard.clone(),
-                                offset: end,
-                            }),
-                            path.clone(),
-                            file_size,
-                        )
-                    }
-                }
-                LogReadDirection::Backward => {
-                    let Some(cursor) = req.cursor.as_ref() else {
-                        let resp = make_err_resp(
-                            "cursor is required for Backward reads".to_string(),
-                            Some(file_size),
-                        );
-                        return Ok(serde_json::to_vec(&resp).unwrap());
-                    };
+        let (start, end, start_cursor, end_cursor, effective_path, effective_file_size) = match req
+            .direction
+        {
+            LogReadDirection::Forward => {
+                if let Some(cursor) = req.cursor.as_ref() {
                     if cursor.offset > file_size {
                         let resp = make_err_resp(
                             format!(
@@ -3331,30 +3222,31 @@ impl UserRpcHandler for ReadWorkloadLogChunkHandler {
                     let mut effective_path = path.clone();
                     let mut effective_shard = shard.clone();
                     let mut effective_file_size = file_size;
-                    let mut end = cursor.offset;
-                    if cursor.offset == 0 {
-                        if let Ok(Some(prev_shard)) =
-                            workload_log_previous_shard(&logical_path, &cursor.shard)
+                    let mut start = cursor.offset;
+                    if cursor.offset == file_size {
+                        if let Ok(Some(next_shard)) =
+                            workload_log_next_shard(&logical_path, &cursor.shard)
                         {
-                            let prev_path = match workload_log_path_for_shard(&logical_path, &prev_shard) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let resp = make_err_resp(format!("{}", e), Some(file_size));
-                                    return Ok(serde_json::to_vec(&resp).unwrap());
-                                }
-                            };
-                            match std::fs::metadata(&prev_path) {
-                                Ok(prev_meta) => {
-                                    effective_file_size = prev_meta.len();
-                                    effective_path = prev_path;
-                                    effective_shard = prev_shard;
-                                    end = effective_file_size;
+                            let next_path =
+                                match workload_log_path_for_shard(&logical_path, &next_shard) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let resp = make_err_resp(format!("{}", e), Some(file_size));
+                                        return Ok(serde_json::to_vec(&resp).unwrap());
+                                    }
+                                };
+                            match std::fs::metadata(&next_path) {
+                                Ok(next_meta) => {
+                                    effective_file_size = next_meta.len();
+                                    effective_path = next_path;
+                                    effective_shard = next_shard;
+                                    start = 0;
                                 }
                                 Err(e) => {
                                     let resp = make_err_resp(
                                         format!(
-                                            "stat previous log shard failed: path={} err={}",
-                                            prev_path.display(),
+                                            "stat next log shard failed: path={} err={}",
+                                            next_path.display(),
                                             e
                                         ),
                                         Some(file_size),
@@ -3362,11 +3254,47 @@ impl UserRpcHandler for ReadWorkloadLogChunkHandler {
                                     return Ok(serde_json::to_vec(&resp).unwrap());
                                 }
                             }
+                        } else if let Ok(Some(latest_shard)) =
+                            workload_log_latest_shard_identity(&logical_path)
+                        {
+                            if latest_shard != cursor.shard {
+                                let latest_path =
+                                    match workload_log_path_for_shard(&logical_path, &latest_shard)
+                                    {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            let resp =
+                                                make_err_resp(format!("{}", e), Some(file_size));
+                                            return Ok(serde_json::to_vec(&resp).unwrap());
+                                        }
+                                    };
+                                match std::fs::metadata(&latest_path) {
+                                    Ok(latest_meta) => {
+                                        effective_file_size = latest_meta.len();
+                                        effective_path = latest_path;
+                                        effective_shard = latest_shard;
+                                        start = 0;
+                                    }
+                                    Err(e) => {
+                                        let resp = make_err_resp(
+                                            format!(
+                                                "stat latest log shard failed: path={} err={}",
+                                                latest_path.display(),
+                                                e
+                                            ),
+                                            Some(file_size),
+                                        );
+                                        return Ok(serde_json::to_vec(&resp).unwrap());
+                                    }
+                                }
+                            }
                         }
                     }
-                    let start = match max_bytes {
-                        Some(max_bytes) => end.saturating_sub(max_bytes),
-                        None => 0,
+                    let end = match max_bytes {
+                        Some(max_bytes) => {
+                            std::cmp::min(effective_file_size, start.saturating_add(max_bytes))
+                        }
+                        None => effective_file_size,
                     };
                     (
                         start,
@@ -3382,8 +3310,103 @@ impl UserRpcHandler for ReadWorkloadLogChunkHandler {
                         effective_path,
                         effective_file_size,
                     )
+                } else {
+                    let end = file_size;
+                    let start = match max_bytes {
+                        Some(max_bytes) => end.saturating_sub(max_bytes),
+                        None => 0,
+                    };
+                    (
+                        start,
+                        end,
+                        Some(WorkloadLogCursor {
+                            shard: shard.clone(),
+                            offset: start,
+                        }),
+                        Some(WorkloadLogCursor {
+                            shard: shard.clone(),
+                            offset: end,
+                        }),
+                        path.clone(),
+                        file_size,
+                    )
                 }
-            };
+            }
+            LogReadDirection::Backward => {
+                let Some(cursor) = req.cursor.as_ref() else {
+                    let resp = make_err_resp(
+                        "cursor is required for Backward reads".to_string(),
+                        Some(file_size),
+                    );
+                    return Ok(serde_json::to_vec(&resp).unwrap());
+                };
+                if cursor.offset > file_size {
+                    let resp = make_err_resp(
+                        format!(
+                            "cursor out of range: shard={} cursor={} file_size={}",
+                            cursor.shard, cursor.offset, file_size
+                        ),
+                        Some(file_size),
+                    );
+                    return Ok(serde_json::to_vec(&resp).unwrap());
+                }
+                let mut effective_path = path.clone();
+                let mut effective_shard = shard.clone();
+                let mut effective_file_size = file_size;
+                let mut end = cursor.offset;
+                if cursor.offset == 0 {
+                    if let Ok(Some(prev_shard)) =
+                        workload_log_previous_shard(&logical_path, &cursor.shard)
+                    {
+                        let prev_path =
+                            match workload_log_path_for_shard(&logical_path, &prev_shard) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let resp = make_err_resp(format!("{}", e), Some(file_size));
+                                    return Ok(serde_json::to_vec(&resp).unwrap());
+                                }
+                            };
+                        match std::fs::metadata(&prev_path) {
+                            Ok(prev_meta) => {
+                                effective_file_size = prev_meta.len();
+                                effective_path = prev_path;
+                                effective_shard = prev_shard;
+                                end = effective_file_size;
+                            }
+                            Err(e) => {
+                                let resp = make_err_resp(
+                                    format!(
+                                        "stat previous log shard failed: path={} err={}",
+                                        prev_path.display(),
+                                        e
+                                    ),
+                                    Some(file_size),
+                                );
+                                return Ok(serde_json::to_vec(&resp).unwrap());
+                            }
+                        }
+                    }
+                }
+                let start = match max_bytes {
+                    Some(max_bytes) => end.saturating_sub(max_bytes),
+                    None => 0,
+                };
+                (
+                    start,
+                    end,
+                    Some(WorkloadLogCursor {
+                        shard: effective_shard.clone(),
+                        offset: start,
+                    }),
+                    Some(WorkloadLogCursor {
+                        shard: effective_shard.clone(),
+                        offset: end,
+                    }),
+                    effective_path,
+                    effective_file_size,
+                )
+            }
+        };
 
         if end < start {
             let resp = make_err_resp(
@@ -3416,7 +3439,11 @@ impl UserRpcHandler for ReadWorkloadLogChunkHandler {
             Ok(v) => v,
             Err(e) => {
                 let resp = make_err_resp(
-                    format!("open log failed: path={} err={}", effective_path.display(), e),
+                    format!(
+                        "open log failed: path={} err={}",
+                        effective_path.display(),
+                        e
+                    ),
                     Some(effective_file_size),
                 );
                 return Ok(serde_json::to_vec(&resp).unwrap());
@@ -3425,7 +3452,11 @@ impl UserRpcHandler for ReadWorkloadLogChunkHandler {
 
         if let Err(e) = std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(start)) {
             let resp = make_err_resp(
-                format!("seek log failed: path={} err={}", effective_path.display(), e),
+                format!(
+                    "seek log failed: path={} err={}",
+                    effective_path.display(),
+                    e
+                ),
                 Some(effective_file_size),
             );
             return Ok(serde_json::to_vec(&resp).unwrap());
@@ -3434,7 +3465,11 @@ impl UserRpcHandler for ReadWorkloadLogChunkHandler {
         let mut buf: Vec<u8> = vec![0; len];
         if let Err(e) = std::io::Read::read_exact(&mut f, &mut buf) {
             let resp = make_err_resp(
-                format!("read log failed: path={} err={}", effective_path.display(), e),
+                format!(
+                    "read log failed: path={} err={}",
+                    effective_path.display(),
+                    e
+                ),
                 Some(effective_file_size),
             );
             return Ok(serde_json::to_vec(&resp).unwrap());
@@ -4067,8 +4102,7 @@ fn desired_workload_matches_running(
         &desired.name,
         &desired.authority,
         Some(workloads.scope_key.as_str()),
-    )
-    else {
+    ) else {
         return false;
     };
     desired_workload_status_matches_goal(&status, desired)
@@ -14337,14 +14371,14 @@ mod tests {
         assert_eq!(scoped_b.len(), 1);
         assert_eq!(scoped_b[0].pid(), 22);
 
-        let listed_a = observe_all_selection_statuses_for_snapshot(&snapshot, Some("/tmp/scope-a"))
-            .unwrap();
+        let listed_a =
+            observe_all_selection_statuses_for_snapshot(&snapshot, Some("/tmp/scope-a")).unwrap();
         assert_eq!(listed_a.len(), 1);
         assert_eq!(listed_a[0].label, "DaemonSet/target");
         assert_eq!(listed_a[0].pid, Some(11));
 
-        let listed_b = observe_all_selection_statuses_for_snapshot(&snapshot, Some("/tmp/scope-b"))
-            .unwrap();
+        let listed_b =
+            observe_all_selection_statuses_for_snapshot(&snapshot, Some("/tmp/scope-b")).unwrap();
         assert_eq!(listed_b.len(), 1);
         assert_eq!(listed_b[0].label, "DaemonSet/target");
         assert_eq!(listed_b[0].pid, Some(22));
@@ -14548,8 +14582,8 @@ mod tests {
             zombie_infos: Vec::new(),
         };
 
-        let listed = observe_apply_runtime_statuses_for_snapshot("apply-1", &snapshot, None)
-            .unwrap();
+        let listed =
+            observe_apply_runtime_statuses_for_snapshot("apply-1", &snapshot, None).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name.as_deref(), Some("target-present"));
         assert!(listed[0].present);
@@ -14774,12 +14808,8 @@ mod tests {
             None
         ));
 
-        let delete_old = workloads.delete_generation(
-            WorkloadKind::Deployment,
-            &name,
-            &name,
-            Some("apply-1"),
-        );
+        let delete_old =
+            workloads.delete_generation(WorkloadKind::Deployment, &name, &name, Some("apply-1"));
         if !delete_old.ok {
             let err = delete_old.err.as_deref().unwrap_or_default();
             assert!(
@@ -14813,8 +14843,7 @@ mod tests {
             delete_current.ok,
             "unguarded delete should bind and retire the current visible generation: {delete_current:?}"
         );
-        wait_for_selection_absent(WorkloadKind::Deployment, &name, &name, Some("apply-2"))
-            .unwrap();
+        wait_for_selection_absent(WorkloadKind::Deployment, &name, &name, Some("apply-2")).unwrap();
     }
 
     #[test]
@@ -14826,9 +14855,12 @@ mod tests {
             python_exe.display()
         );
         let workdir = tempfile::tempdir().unwrap();
-        let runtime =
-            SelectionSupervisorRuntime::materialize(workdir.path(), workdir.path(), python_exe.as_path())
-                .unwrap();
+        let runtime = SelectionSupervisorRuntime::materialize(
+            workdir.path(),
+            workdir.path(),
+            python_exe.as_path(),
+        )
+        .unwrap();
         assert!(runtime.script_path.exists());
         assert!(
             runtime
@@ -14849,9 +14881,12 @@ mod tests {
             python_exe.display()
         );
         let workdir = tempfile::tempdir().unwrap();
-        let runtime =
-            SelectionSupervisorRuntime::materialize(workdir.path(), workdir.path(), python_exe.as_path())
-                .unwrap();
+        let runtime = SelectionSupervisorRuntime::materialize(
+            workdir.path(),
+            workdir.path(),
+            python_exe.as_path(),
+        )
+        .unwrap();
         let log_path = workdir.path().join("startup.log");
         let command = vec![
             python_exe.display().to_string(),
@@ -14876,7 +14911,9 @@ mod tests {
             "--".to_string(),
             "/bin/true".to_string(),
         ];
-        let pid = runtime.spawn_detached_command(&log_path, command.as_slice()).unwrap();
+        let pid = runtime
+            .spawn_detached_command(&log_path, command.as_slice())
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let expected = "owner-ts-ms must be positive";
         let mut saw_expected = false;
@@ -15164,7 +15201,9 @@ mod tests {
             }),
             max_bytes: Some(65536),
         };
-        let raw = handler.handle("n1".into(), &serde_json::to_vec(&req).unwrap()).unwrap();
+        let raw = handler
+            .handle("n1".into(), &serde_json::to_vec(&req).unwrap())
+            .unwrap();
         let resp: ReadWorkloadLogResp = serde_json::from_slice(&raw).unwrap();
         assert!(resp.ok, "{resp:?}");
         assert_eq!(resp.text.as_deref(), Some("new\n"));
@@ -15209,7 +15248,9 @@ mod tests {
             }),
             max_bytes: Some(65536),
         };
-        let raw = handler.handle("n1".into(), &serde_json::to_vec(&req).unwrap()).unwrap();
+        let raw = handler
+            .handle("n1".into(), &serde_json::to_vec(&req).unwrap())
+            .unwrap();
         let resp: ReadWorkloadLogResp = serde_json::from_slice(&raw).unwrap();
         assert!(resp.ok, "{resp:?}");
         assert_eq!(resp.text.as_deref(), Some("old\n"));

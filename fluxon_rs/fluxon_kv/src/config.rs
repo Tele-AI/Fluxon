@@ -133,6 +133,10 @@ pub struct TestSpecConfig {
     pub short_circuit_put_payload_path: bool,
     #[serde(default)]
     pub skip_put_end_commit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_local_reserve_soft_wait_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_local_reserve_hard_timeout_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_mode: Option<TestSpecTransportMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,6 +175,8 @@ impl Default for TestSpecConfig {
             prefer_local_placement: false,
             short_circuit_put_payload_path: false,
             skip_put_end_commit: false,
+            owner_local_reserve_soft_wait_timeout_ms: None,
+            owner_local_reserve_hard_timeout_ms: None,
             transport_mode: None,
             tcp_thread_reactor_shard_count: None,
             tcp_thread_bulk_lane_count: None,
@@ -292,6 +298,38 @@ fn validate_required_transfer_rpc_fast_path_ready_timeout(
             detail: "test_spec_config.require_transfer_rpc_fast_path_ready_timeout_seconds requires explicit test_spec_config.rdma_device_names".to_string(),
         }
         .into_kverror());
+    }
+
+    Ok(())
+}
+
+fn validate_owner_local_reserve_timeouts(test_spec_config: &TestSpecConfig) -> KvResult<()> {
+    let Some(soft_wait_timeout_ms) = test_spec_config.owner_local_reserve_soft_wait_timeout_ms
+    else {
+        return Ok(());
+    };
+    if soft_wait_timeout_ms == 0 {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: "test_spec_config.owner_local_reserve_soft_wait_timeout_ms must be > 0"
+                .to_string(),
+        }
+        .into_kverror());
+    }
+
+    if let Some(hard_timeout_ms) = test_spec_config.owner_local_reserve_hard_timeout_ms {
+        if hard_timeout_ms == 0 {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "test_spec_config.owner_local_reserve_hard_timeout_ms must be > 0"
+                    .to_string(),
+            }
+            .into_kverror());
+        }
+        if hard_timeout_ms <= soft_wait_timeout_ms {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "test_spec_config.owner_local_reserve_hard_timeout_ms must be greater than owner_local_reserve_soft_wait_timeout_ms".to_string(),
+            }
+            .into_kverror());
+        }
     }
 
     Ok(())
@@ -733,7 +771,7 @@ pub struct ClientConfig {
     pub pprof_duration_seconds: Option<u64>,
     pub redis_compat_listen_addr: Option<std::net::SocketAddr>,
     pub fluxonkv_spec: FluxonKvSpec,
-    pub share_mem_path: String, // Mandatory shared bundle path
+    pub share_mem_path: String,           // Mandatory shared bundle path
     pub large_file_paths: LargeFilePaths, // Mandatory large-file roots for logs and caches
     pub test_spec_config: TestSpecConfig,
 }
@@ -913,6 +951,7 @@ impl ClientConfigYaml {
         )?;
         materialize_default_test_spec_transport_mode(&mut test_spec_config);
         validate_required_transfer_rpc_fast_path_ready_timeout(&test_spec_config)?;
+        validate_owner_local_reserve_timeouts(&test_spec_config)?;
         validate_test_spec_tcp_thread_tuning(&test_spec_config)?;
 
         // Role selection contract:
@@ -1170,13 +1209,15 @@ impl ClientConfigYaml {
         } else {
             let Some(large_file_paths_yaml) = self.fluxonkv_spec.large_file_paths.as_ref() else {
                 return Err(ConfigError::InvalidClientConfig {
-                    detail: "fluxonkv_spec.large_file_paths is required for owner mode"
-                        .to_string(),
+                    detail: "fluxonkv_spec.large_file_paths is required for owner mode".to_string(),
                 }
                 .into_kverror());
             };
             LargeFilePaths {
-                paths: verify_non_empty_root_path_list(&large_file_paths_yaml.0, "large_file_paths")?,
+                paths: verify_non_empty_root_path_list(
+                    &large_file_paths_yaml.0,
+                    "large_file_paths",
+                )?,
             }
         };
 
@@ -1498,6 +1539,7 @@ impl MasterConfigYaml {
         )?;
         materialize_default_test_spec_transport_mode(&mut test_spec_config);
         validate_required_transfer_rpc_fast_path_ready_timeout(&test_spec_config)?;
+        validate_owner_local_reserve_timeouts(&test_spec_config)?;
         validate_test_spec_tcp_thread_tuning(&test_spec_config)?;
         let protocol = apply_test_spec_rdma_device_names_to_protocol(
             self.protocol.unwrap_or(ProtocolConfig {
@@ -1647,7 +1689,9 @@ fluxonkv_spec:
         .unwrap();
         let err = cfg.verify().unwrap_err();
         let text = format!("{err}");
-        assert!(text.contains("fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode"));
+        assert!(
+            text.contains("fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode")
+        );
     }
 
     #[test]
@@ -1667,7 +1711,9 @@ fluxonkv_spec:
         let logs_dir = large_file_paths.kv_logs_dir("test_cluster").unwrap();
         assert_eq!(
             logs_dir,
-            first_root.join("child").join("test_cluster_cluster_kv_logs")
+            first_root
+                .join("child")
+                .join("test_cluster_cluster_kv_logs")
         );
         assert!(logs_dir.exists());
 
@@ -1736,8 +1782,8 @@ test_spec_config:
     }
 
     #[test]
-    fn client_test_spec_config_implicit_transport_mode_with_rdma_device_names_defaults_to_transfer_with_rpc()
-     {
+    fn client_test_spec_config_implicit_transport_mode_with_rdma_device_names_defaults_to_transfer_with_rpc(
+    ) {
         let cfg = ClientConfigYaml::from_str(
             r#"
 instance_key: test_owner
@@ -1802,8 +1848,8 @@ test_spec_config:
     }
 
     #[test]
-    fn client_test_spec_config_rejects_transfer_rpc_fast_path_ready_timeout_without_explicit_rdma_device_names()
-     {
+    fn client_test_spec_config_rejects_transfer_rpc_fast_path_ready_timeout_without_explicit_rdma_device_names(
+    ) {
         let cfg = ClientConfigYaml::from_str(
             r#"
 instance_key: test_owner
@@ -1847,10 +1893,9 @@ test_spec_config:
         )
         .unwrap();
         let err = cfg.verify().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("test_spec_config.tcp_thread_control_lane_count must be in [1, 8]")
-        );
+        assert!(err
+            .to_string()
+            .contains("test_spec_config.tcp_thread_control_lane_count must be in [1, 8]"));
     }
 
     #[test]

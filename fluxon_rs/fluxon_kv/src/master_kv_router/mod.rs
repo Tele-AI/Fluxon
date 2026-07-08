@@ -11,16 +11,29 @@ use self::{
     delete::handle_batch_delete_ack,
     delete::handle_delete,
     delete::handle_delete_ack,
-    get::{handle_get_done, handle_get_meta, handle_get_revoke, handle_get_start},
+    get::{
+        handle_batch_get_done, handle_batch_get_revoke, handle_batch_get_start,
+        handle_batch_is_exist, handle_get_done, handle_get_meta, handle_get_revoke,
+        handle_get_start,
+    },
     msg_pack::{
-        BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, CountPrefixReq, CountPrefixResp,
-        DeleteAckReq, DeleteReq, GetAllocationMode, GetDoneReq, GetMetaReq, GetRevokeReq,
-        GetStartReq, PutDoneReq, PutRevokeReq, PutStartReq,
+        BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchGetDoneReq, BatchGetRevokeReq,
+        BatchGetStartReq, BatchIsExistReq, BatchPreparePutKeysReq, BatchPutDoneReq,
+        BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq, CountPrefixReq,
+        CountPrefixResp, DeleteAckReq, DeleteReq, GetAllocationMode, GetDoneReq,
+        GetMasterOnlyMetricPartReq, GetMasterOnlyMetricPartResp, GetMetaReq, GetRevokeReq,
+        GetStartReq, MemHolderKeepAliveReq, MemHolderReleaseReq, PutAppendDoneReq,
+        PutAppendRevokeReq, PutAppendStartReq, PutDoneReq, PutRevokeReq, PutStartReq,
+        ReleaseLocalGrantReq, ReserveLocalGrantReq,
     },
     placement::{PlacementDefault, PlacementPolicy},
-    put::{handle_put_done, handle_put_revoke, handle_put_start},
+    put::{
+        handle_batch_prepare_put_keys, handle_batch_put_done, handle_batch_put_revoke,
+        handle_batch_put_start, handle_batch_release_put_key_reservations, handle_put_append_done,
+        handle_put_append_revoke, handle_put_append_start, handle_put_done, handle_put_revoke,
+        handle_put_start, handle_release_local_grant, handle_reserve_local_grant,
+    },
 };
-use crate::ClientKvApiAccessTrait;
 use crate::client_kv_api::ClientKvApi;
 use crate::cluster_manager::{
     ClusterEvent, ClusterManager, ClusterManagerAccessTrait, NodeID, NodeIDString,
@@ -29,29 +42,35 @@ use crate::config::TestSpecConfig;
 use crate::master_kv_router::delete::DeleteKeyInfo;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::master_lease_manager::{MasterLeaseManager, MasterLeaseManagerAccessTrait};
+use crate::master_seg_manager::one_seg_allocator::Allocation;
 use crate::master_seg_manager::MasterSegManager;
 use crate::master_seg_manager::MasterSegManagerAccessTrait;
 use crate::master_seg_manager::NodeTombTag;
-use crate::master_seg_manager::one_seg_allocator::Allocation;
-use crate::memholder::{EnsureMemholderMgmtDeleteHandle, MasterOwnerMemMgr, MemholderManagerTrait};
+use crate::memholder::{
+    EnsureMemholderMgmtDeleteHandle, MasterOwnerMemMgr, MemholderManagerTrait, NodeHolderKey,
+};
 use crate::metric_reporter::{MetricReporter, MetricReporterAccessTrait};
 use crate::p2p::msg_pack::{MsgPack, RPCCaller, RPCHandler};
 use crate::p2p::p2p_module::{P2pModule, P2pModuleAccessTrait};
+use crate::rpcresp_kvresult_convert;
 use crate::rpcresp_kvresult_convert::msg_and_error::{KvError, OK};
-use fluxon_framework::{LogicalModule, define_module};
+use crate::ClientKvApiAccessTrait;
+use fluxon_framework::{define_module, LogicalModule};
+use fluxon_framework_compiled::upgrade_view_guard::UpgradeViewGuard;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use dashmap::DashMap;
-use limit_thirdparty::tokio::sync::ARwLock;
+use limit_thirdparty::tokio::sync::{abroadcast, ARwLock};
 use limit_thirdparty::tokio::{self, sync::ampsc};
 use moka::notification::RemovalCause;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::borrow::Cow;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
@@ -69,10 +88,76 @@ pub enum PutPlacementMode {
     Remote,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ReservedCapacityReason {
+    LeaseBoundKv,
+    LocalReserveGrant,
+}
+
+#[derive(Debug, Default)]
+pub struct NodeCacheReservedCapacity {
+    pub total_bytes: AtomicU64,
+    pub lease_bound_kv_bytes: AtomicU64,
+    pub local_reserve_grant_bytes: AtomicU64,
+}
+
+impl NodeCacheReservedCapacity {
+    fn apply_delta(&self, reason: ReservedCapacityReason, delta_bytes: i64) {
+        if delta_bytes >= 0 {
+            let delta = delta_bytes as u64;
+            self.total_bytes.fetch_add(delta, Ordering::Relaxed);
+            match reason {
+                ReservedCapacityReason::LeaseBoundKv => {
+                    self.lease_bound_kv_bytes
+                        .fetch_add(delta, Ordering::Relaxed);
+                }
+                ReservedCapacityReason::LocalReserveGrant => {
+                    self.local_reserve_grant_bytes
+                        .fetch_add(delta, Ordering::Relaxed);
+                }
+            }
+        } else {
+            let delta = (-delta_bytes) as u64;
+            self.total_bytes.fetch_sub(delta, Ordering::Relaxed);
+            match reason {
+                ReservedCapacityReason::LeaseBoundKv => {
+                    self.lease_bound_kv_bytes
+                        .fetch_sub(delta, Ordering::Relaxed);
+                }
+                ReservedCapacityReason::LocalReserveGrant => {
+                    self.local_reserve_grant_bytes
+                        .fetch_sub(delta, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    fn total_reserved_bytes(&self) -> u64 {
+        self.total_bytes.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RequesterTargetPair {
     requester_node_id: NodeIDString,
     target_node_id: NodeIDString,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ReplicaCacheNodeObserveSnapshot {
+    pub owner_node: String,
+    pub entries: u64,
+    pub weighted_bytes: u64,
+    pub effective_capacity_bytes: u64,
+    pub reserved_capacity_bytes: u64,
+    pub base_capacity_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MasterRuntimeObserveSnapshot {
+    pub get_holding_entries: u64,
+    pub get_holding_bytes: u64,
+    pub replica_cache_nodes: Vec<ReplicaCacheNodeObserveSnapshot>,
 }
 
 impl RequesterTargetPair {
@@ -88,23 +173,49 @@ impl RequesterTargetPair {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct CommittedSlotReplica {
+    pub owner_node_id: NodeID,
+    pub grant_id: u64,
+    pub slot_index: u32,
+    pub slot_size: u64,
+    pub addr: u64,
+    pub len: u64,
+    pub base_addr: u64,
+}
+
 /// Information about a `put` operation that is currently in progress.
 pub enum InflightPutAllocation {
     /// Local fast path: the same allocation is used as both src (staging) and target (final).
     Local(Allocation),
     /// Remote path: separate allocations for src (on requester) and target (on selected node).
     Remote { src: Allocation, target: Allocation },
+    /// Local-first fast path: data is already committed in owner-local reserve slot.
+    LocalCommittedSlot(CommittedSlotReplica),
+}
+
+#[derive(Clone)]
+pub struct InflightPutCommitInfo {
+    pub node_id: NodeID,
+    pub src_target_allocation: Arc<Mutex<Option<InflightPutAllocation>>>,
 }
 
 /// Information about a `put` operation that is currently in progress.
 #[derive(Clone)]
 pub struct InflightPutInfo {
-    pub node_id: NodeID,
-    // seg_name: String,
     pub key: String,
     pub req_node_id: NodeID,
     pub len: u64,
-    pub src_target_allocation: Arc<Mutex<Option<InflightPutAllocation>>>,
+    pub commit_info: InflightPutCommitInfo,
+    pub remote_append: Option<InflightPutAppendInfo>,
+}
+
+#[derive(Clone)]
+pub struct InflightPutAppendInfo {
+    pub node_id: NodeID,
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub target_allocation: Arc<Mutex<Option<Allocation>>>,
 }
 
 /// Information about a `get` operation that is currently in progress.
@@ -135,6 +246,16 @@ pub struct OwnerHoldingGetInfo {
     pub holding_node_id: NodeID, // The node that requested the get (holder of the memory)
     pub len: u64,
     pub allocation: Arc<Allocation>, // The target allocation where data was transferred
+}
+
+pub struct LocalReserveGrantInfo {
+    pub owner_node_id: NodeID,
+    pub allocation: Allocation,
+}
+
+pub struct PreparedPutKeyReservationInfo {
+    pub owner_node_id: NodeID,
+    pub key: String,
 }
 
 async fn handle_count_prefix(
@@ -195,9 +316,38 @@ pub struct NodeValueReplicaDesc {
 /// Information about a completed `put` operation that can be retrieved via `get`.
 /// Now supports multiple replicas per key.
 #[derive(Clone, Debug)]
+pub enum KvReplicaBacking {
+    Allocation(Arc<Allocation>),
+    CommittedSlot(CommittedSlotReplica),
+}
+
+impl KvReplicaBacking {
+    pub fn abs_addr(&self) -> u64 {
+        match self {
+            Self::Allocation(allocation) => allocation.base_addr() + allocation.addr(),
+            Self::CommittedSlot(slot) => slot.addr,
+        }
+    }
+
+    pub fn base_addr(&self) -> u64 {
+        match self {
+            Self::Allocation(allocation) => allocation.base_addr(),
+            Self::CommittedSlot(slot) => slot.base_addr,
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Allocation(allocation) => allocation.size(),
+            Self::CommittedSlot(slot) => slot.len,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct KvRouteInfo {
     pub node_id: NodeID,
-    pub allocation: Arc<Allocation>,
+    pub backing: KvReplicaBacking,
     pub tomb_tag: NodeTombTag,
 }
 
@@ -238,7 +388,7 @@ impl OneKvNodesRoutes {
         &self,
         verify_put_id: PutIDForAKey,
         tombs: HashSet<NodeID>,
-        _view: &MasterKvRouterView,
+        view: &MasterKvRouterView,
     ) -> bool {
         if self.put_id != verify_put_id {
             return false;
@@ -346,6 +496,7 @@ pub struct MasterKvRouterInner {
 
     /// (key, put_time_ms, put_version) -> inflight_put_info
     pub inflight_puts: moka::future::Cache<(String, u64, u32), InflightPutInfo>,
+    pub inflight_put_appends: moka::future::Cache<(String, u64, u32), InflightPutAppendInfo>,
     /// key -> inflight put count
     pub inflight_put_key_counts: Arc<DashMap<String, u32>>,
     pub inflight_gets: moka::future::Cache<u64, InflightGetInfo>,
@@ -359,24 +510,37 @@ pub struct MasterKvRouterInner {
     /// Counter for holder_id
     pub next_holder_id: AtomicU64,
 
+    /// Counter for local reserve grant identifiers.
+    pub next_local_reserve_grant_id: AtomicU64,
+
+    /// Counter for prepared put-key reservation identifiers.
+    pub next_prepared_put_key_reservation_id: AtomicU64,
+
     /// Latest version of key-value replicas
     pub kv_routes: DashMap<String, Arc<OneKvNodesRoutes>>,
 
-    /// Prefix-counting index derived from `kv_routes`.
-    ///
-    /// It is updated through async follow-up maintenance, so it does not guarantee
-    /// immediate strong-consistency visibility for a freshly committed put.
-    /// The generic surface is `CountPrefix` RPC; the current primary use case is
-    /// MQ capacity backpressure / prefix counting.
+    /// Serializes route-level existence checks with cache-eviction route cleanup.
+    /// This protects route metadata consistency only; it does not create MemHolders
+    /// or move payload data.
+    pub route_lifetime_lock: Mutex<()>,
+
+    /// Grants reserved for owner-local hot-path staging.
+    pub local_reserve_grants: DashMap<u64, LocalReserveGrantInfo>,
+
+    /// Prepared key reservations for owner-local hot-path staging.
+    pub prepared_put_key_reservations: DashMap<u64, PreparedPutKeyReservationInfo>,
+
+    /// Prefix-counting index for keys, used by CountPrefix RPC.
     pub prefix_index: ARwLock<PrefixRadixTree>,
 
     /// Support replicas: node_id -> key -> route_info
     pub node_kv_cache_controller:
         DashMap<NodeIDString, Arc<moka::sync::SegmentedCache<String, NodeValueReplicaDesc>>>,
 
-    /// Per-node total bytes reserved for leased replicas. We subtract this from
-    /// the base max capacity of each node's moka cache. Acts like a fetch_sub/add counter.
-    pub lease_reserved_bytes: DashMap<NodeIDString, Arc<AtomicU64>>,
+    /// Per-node bytes reserved out of moka usable capacity.
+    /// The reservation is reason-grouped, but `total_bytes` is the authority
+    /// used to derive the effective moka max_capacity for the node.
+    pub node_cache_reserved_capacity: DashMap<NodeIDString, Arc<NodeCacheReservedCapacity>>,
 
     /// Historical final put placement decisions by target node.
     pub put_target_decision_counts: DashMap<NodeIDString, Arc<AtomicU64>>,
@@ -497,20 +661,29 @@ impl MasterKvRouter {
                 }
             })
             .build();
+        let inflight_put_appends = moka::future::Cache::builder()
+            .time_to_live(Duration::from_secs(60))
+            .build();
         let inner = MasterKvRouterInner {
             view: std::sync::OnceLock::new(),
             policy: policy_impl,
             test_spec_config: arg.test_spec_config,
             inflight_puts,
+            inflight_put_appends,
             inflight_put_key_counts,
             inflight_gets,
             get_holding: MasterOwnerMemMgr::default(),
             next_get_id: AtomicU64::new(0),
             next_holder_id: AtomicU64::new(0),
+            next_local_reserve_grant_id: AtomicU64::new(1),
+            next_prepared_put_key_reservation_id: AtomicU64::new(1),
             kv_routes: DashMap::new(),
+            route_lifetime_lock: Mutex::new(()),
+            local_reserve_grants: DashMap::new(),
+            prepared_put_key_reservations: DashMap::new(),
             prefix_index: ARwLock::new(PrefixRadixTree::new()),
             node_kv_cache_controller: DashMap::new(),
-            lease_reserved_bytes: DashMap::new(),
+            node_cache_reserved_capacity: DashMap::new(),
             put_target_decision_counts: DashMap::new(),
             put_requester_target_decision_counts: DashMap::new(),
             put_placement_mode_counts: DashMap::new(),
@@ -532,6 +705,7 @@ impl MasterKvRouter {
 
         self.spawn_cluster_listener();
         self.spawn_put_placement_reporter();
+        self.spawn_runtime_observe_reporter();
 
         let delete_broadcast_rx = self
             .0
@@ -587,7 +761,15 @@ impl MasterKvRouter {
         &self,
         key: &str,
         reject_if_inflight_same_key: bool,
+        reject_if_exist_same_key: bool,
     ) -> Result<(), KvError> {
+        if reject_if_exist_same_key && self.key_has_live_replica(key) {
+            return Err(KvError::Api(
+                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::KeyAlreadyExists {
+                    key: key.to_string(),
+                },
+            ));
+        }
         let counts = &self.inner().inflight_put_key_counts;
         let mut entry = counts.entry(key.to_string()).or_insert(0);
         if reject_if_inflight_same_key && *entry > 0 {
@@ -599,6 +781,20 @@ impl MasterKvRouter {
         }
         *entry += 1;
         Ok(())
+    }
+
+    pub fn key_has_live_replica(&self, key: &str) -> bool {
+        self.inner()
+            .kv_routes
+            .get(key)
+            .map(|one_kv_nodes_routes| {
+                one_kv_nodes_routes
+                    .nodes_replicas
+                    .read()
+                    .values()
+                    .any(|kv_info| !kv_info.tomb_tag.is_tomb())
+            })
+            .unwrap_or(false)
     }
 
     pub fn release_inflight_put_key(&self, key: &str) {
@@ -690,6 +886,92 @@ impl MasterKvRouter {
         crate::metrics::datasource::register_master_only_metric_handler(self.0.view());
 
         // --- Put Handlers ---
+        let view = self.0.view().clone();
+        RPCHandler::<ReserveLocalGrantReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
+            let view_task = view2.clone();
+            let _ = view.spawn("rpc_reserve_local_grant", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let (grant_id, mut ack) =
+                    handle_reserve_local_grant(view_task.clone(), msg, req_node_id).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send ReserveLocalGrantResp: {:?}", e);
+                    if grant_id != 0 {
+                        let _ = view_task
+                            .master_kv_router()
+                            .take_local_reserve_grant(grant_id);
+                    }
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<ReleaseLocalGrantReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
+            let view_task = view2.clone();
+            let _ = view.spawn("rpc_release_local_grant", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack = handle_release_local_grant(view_task, msg, req_node_id).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send ReleaseLocalGrantResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchPreparePutKeysReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
+            let view_task = view2.clone();
+            let _ = view.spawn("rpc_batch_prepare_put_keys", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let (reservation_ids, mut ack) =
+                    handle_batch_prepare_put_keys(view_task.clone(), msg, req_node_id).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchPreparePutKeysResp: {:?}", e);
+                    for reservation_id in reservation_ids {
+                        if let Some(info) = view_task
+                            .master_kv_router()
+                            .take_prepared_put_key_reservation(reservation_id)
+                        {
+                            view_task
+                                .master_kv_router()
+                                .release_inflight_put_key(&info.key);
+                        }
+                    }
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchReleasePutKeyReservationsReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
+            let view_task = view2.clone();
+            let _ = view.spawn("rpc_batch_release_put_key_reservations", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack =
+                    handle_batch_release_put_key_reservations(view_task, msg, req_node_id).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchReleasePutKeyReservationsResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
         let view = self.0.view().clone();
         RPCHandler::<PutStartReq>::new().regist(p2p, move |resp, msg| {
             let view = view.clone();
@@ -812,7 +1094,7 @@ impl MasterKvRouter {
             let view = view.clone();
             let view2 = view.clone();
             let view_task = view2.clone();
-            let _ = view.spawn("rpc_delete_ack", async move {
+            view.spawn("rpc_delete_ack", async move {
                 let ack = handle_delete_ack(view_task, msg).await;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send DeleteAckResp: {:?}", e);
@@ -826,10 +1108,57 @@ impl MasterKvRouter {
             let view = view.clone();
             let view2 = view.clone();
             let view_task = view2.clone();
-            let _ = view.spawn("rpc_batch_delete_ack", async move {
+            view.spawn("rpc_batch_delete_ack", async move {
                 let ack = handle_batch_delete_ack(view_task, msg).await;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send BatchDeleteAckResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<PutAppendStartReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
+            let view_task = view2.clone();
+            let _ = view.spawn("rpc_put_append_start", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack = handle_put_append_start(view_task.clone(), msg, req_node_id).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send PutAppendStartResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<PutAppendRevokeReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let view_task = view2.clone();
+            let _ = view.spawn("rpc_put_append_revoke", async move {
+                let ack = handle_put_append_revoke(view_task, msg).await;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send PutAppendRevokeResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<PutAppendDoneReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let view_task = view2.clone();
+            let _ = view.spawn("rpc_put_append_done", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack = handle_put_append_done(view_task, msg).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send PutAppendDoneResp: {:?}", e);
                 }
             });
             Ok(())
@@ -840,10 +1169,111 @@ impl MasterKvRouter {
         RPCHandler::<GetMetaReq>::new().regist(p2p, move |resp, msg| {
             let view = view.clone();
             let view2 = view.clone();
-            let _ = view.spawn("rpc_get_meta", async move {
+            view.spawn("rpc_get_meta", async move {
                 let ack = handle_get_meta(view2, msg, resp.node_id().clone()).await;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send GetMetaResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchIsExistReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            view.spawn("rpc_batch_is_exist", async move {
+                let ack = handle_batch_is_exist(view2, msg, resp.node_id().clone()).await;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchIsExistResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchPutStartReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
+            view.spawn("rpc_batch_put_start", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack = handle_batch_put_start(view2, msg, req_node_id).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchPutStartResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchPutRevokeReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            view.spawn("rpc_batch_put_revoke", async move {
+                let ack = handle_batch_put_revoke(view2, msg).await;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchPutRevokeResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchPutDoneReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            view.spawn("rpc_batch_put_done", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack = handle_batch_put_done(view2, msg).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchPutDoneResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchGetStartReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
+            view.spawn("rpc_batch_get_start", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack = handle_batch_get_start(view2, msg, req_node_id).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchGetStartResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchGetRevokeReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            view.spawn("rpc_batch_get_revoke", async move {
+                let ack = handle_batch_get_revoke(view2, msg).await;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchGetRevokeResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchGetDoneReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            view.spawn("rpc_batch_get_done", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack = handle_batch_get_done(view2, msg).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchGetDoneResp: {:?}", e);
                 }
             });
             Ok(())
@@ -856,7 +1286,7 @@ impl MasterKvRouter {
         let (tx, mut rx) = ampsc::channel::<ClusterEvent>(NODE_EVENT_QUEUE_CAPACITY);
         let view = self.inner().view().clone();
         let view_task = view.clone();
-        let _ = view.spawn("node_segment_registration_caller", async move {
+        view.spawn("node_segment_registration_caller", async move {
             use std::future::Future;
             use std::pin::Pin;
 
@@ -1171,7 +1601,7 @@ impl MasterKvRouter {
             > = HashMap::new();
 
             async fn send_event_with_warn(
-                _view: &MasterKvRouterView,
+                view: &MasterKvRouterView,
                 node_id: &str,
                 tx: ampsc::Sender<ClusterEvent>,
                 event: ClusterEvent,
@@ -1451,36 +1881,30 @@ impl MasterKvRouter {
         )
     }
 
-    /// Atomically adjust a node's cache capacity reservation by `delta_bytes`.
+    /// Atomically adjust a node's moka usable-capacity reservation by `delta_bytes`.
     /// Positive delta reserves capacity (fetch_sub from usable capacity),
     /// negative delta releases reservation (fetch_add back to usable capacity).
-    pub fn adjust_node_cache_capacity_for_lease(
+    pub fn adjust_node_cache_reserved_capacity(
         &self,
         node_id: &str,
+        reason: ReservedCapacityReason,
         delta_bytes: i64,
     ) -> crate::rpcresp_kvresult_convert::msg_and_error::KvResult<()> {
         if !self.replica_cache_enabled() {
             return Ok(());
         }
-        // Track per-node reserved bytes with an atomic counter
-        let reserved_counter = self
+        let reserved_capacity = self
             .inner()
-            .lease_reserved_bytes
+            .node_cache_reserved_capacity
             .entry(node_id.to_string())
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .or_insert_with(|| Arc::new(NodeCacheReservedCapacity::default()))
             .value()
             .clone();
 
-        // Apply delta to the counter with simple fetch ops per user's preference
-        if delta_bytes >= 0 {
-            reserved_counter.fetch_add(delta_bytes as u64, Ordering::Relaxed);
-        } else {
-            let sub = (-delta_bytes) as u64;
-            reserved_counter.fetch_sub(sub, Ordering::Relaxed);
-        }
+        reserved_capacity.apply_delta(reason, delta_bytes);
 
         // Recompute target capacity: base(=MOKA_CACHE_CAPACITY_RATIO * node_space) - reserved_total
-        let reserved_total = reserved_counter.load(Ordering::Relaxed);
+        let reserved_total = reserved_capacity.total_reserved_bytes();
         let node_space_size = self
             .inner()
             .view()
@@ -1489,12 +1913,7 @@ impl MasterKvRouter {
         if node_space_size == 0 {
             // Node not ready: this should not happen in a successful put_done path.
             // Revert the counter delta before returning error.
-            if delta_bytes >= 0 {
-                reserved_counter.fetch_sub(delta_bytes as u64, Ordering::Relaxed);
-            } else {
-                let add = (-delta_bytes) as u64;
-                reserved_counter.fetch_add(add, Ordering::Relaxed);
-            }
+            reserved_capacity.apply_delta(reason, -delta_bytes);
             return Err(
                 crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
                     crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::OwnerNoSeg {
@@ -1512,12 +1931,7 @@ impl MasterKvRouter {
         if let Some(cache) = self.get_node_cache_controller(node_id) {
             if let Err(e) = cache.set_max_capacity(new_capacity) {
                 // Revert counter and return error.
-                if delta_bytes >= 0 {
-                    reserved_counter.fetch_sub(delta_bytes as u64, Ordering::Relaxed);
-                } else {
-                    let add = (-delta_bytes) as u64;
-                    reserved_counter.fetch_add(add, Ordering::Relaxed);
-                }
+                reserved_capacity.apply_delta(reason, -delta_bytes);
                 return Err(crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
                     crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::RpcDecodeError {
                         rpc_input_json: format!(
@@ -1530,12 +1944,7 @@ impl MasterKvRouter {
             Ok(())
         } else {
             // Revert counter and return error.
-            if delta_bytes >= 0 {
-                reserved_counter.fetch_sub(delta_bytes as u64, Ordering::Relaxed);
-            } else {
-                let add = (-delta_bytes) as u64;
-                reserved_counter.fetch_add(add, Ordering::Relaxed);
-            }
+            reserved_capacity.apply_delta(reason, -delta_bytes);
             Err(
                 crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
                     crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::OwnerNoSeg {
@@ -1546,21 +1955,159 @@ impl MasterKvRouter {
         }
     }
 
-    // Note: no additional getters for reserved bytes; policy currently relies only on adjust calls.
-}
-
-impl MasterKvRouterView {
-    pub fn try_adjust_node_cache_capacity_for_lease(
-        &self,
-        node_id: &str,
-        delta_bytes: i64,
-    ) -> Option<crate::rpcresp_kvresult_convert::msg_and_error::KvResult<()>> {
-        let _view_guard = self.try_upgrade()?;
-        Some(
-            self.master_kv_router()
-                .adjust_node_cache_capacity_for_lease(node_id, delta_bytes),
-        )
+    pub fn next_local_reserve_grant_id(&self) -> u64 {
+        self.inner()
+            .next_local_reserve_grant_id
+            .fetch_add(1, Ordering::Relaxed)
     }
+
+    pub fn next_prepared_put_key_reservation_id(&self) -> u64 {
+        self.inner()
+            .next_prepared_put_key_reservation_id
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn install_local_reserve_grant(&self, grant_id: u64, grant: LocalReserveGrantInfo) {
+        if self
+            .inner()
+            .local_reserve_grants
+            .insert(grant_id, grant)
+            .is_some()
+        {
+            panic!(
+                "duplicate local reserve grant id indicates a logic bug: grant_id={}",
+                grant_id
+            );
+        }
+    }
+
+    pub fn take_local_reserve_grant(&self, grant_id: u64) -> Option<LocalReserveGrantInfo> {
+        self.inner()
+            .local_reserve_grants
+            .remove(&grant_id)
+            .map(|(_, grant)| grant)
+    }
+
+    pub fn install_prepared_put_key_reservation(
+        &self,
+        reservation_id: u64,
+        info: PreparedPutKeyReservationInfo,
+    ) {
+        if self
+            .inner()
+            .prepared_put_key_reservations
+            .insert(reservation_id, info)
+            .is_some()
+        {
+            panic!(
+                "duplicate prepared put key reservation id indicates a logic bug: reservation_id={}",
+                reservation_id
+            );
+        }
+    }
+
+    pub fn take_prepared_put_key_reservation(
+        &self,
+        reservation_id: u64,
+    ) -> Option<PreparedPutKeyReservationInfo> {
+        self.inner()
+            .prepared_put_key_reservations
+            .remove(&reservation_id)
+            .map(|(_, info)| info)
+    }
+
+    pub fn runtime_observe_snapshot(&self) -> MasterRuntimeObserveSnapshot {
+        let mut get_holding_bytes = 0u64;
+        for entry in self.inner().get_holding.inner().iter() {
+            get_holding_bytes = get_holding_bytes.saturating_add(entry.value().len);
+        }
+
+        let mut replica_cache_nodes = Vec::new();
+        for entry in self.inner().node_kv_cache_controller.iter() {
+            let owner_node = entry.key().clone();
+            let cache = entry.value().clone();
+            let node_space_size = self
+                .inner()
+                .view()
+                .master_seg_manager()
+                .get_node_space_size(owner_node.as_str());
+            let base_capacity_bytes = (node_space_size as f32 * MOKA_CACHE_CAPACITY_RATIO) as u64;
+            let reserved_capacity_bytes = self
+                .inner()
+                .node_cache_reserved_capacity
+                .get(owner_node.as_str())
+                .map(|reserved| reserved.total_reserved_bytes())
+                .unwrap_or(0);
+            let effective_capacity_bytes = cache.policy().max_capacity().unwrap_or(0);
+            replica_cache_nodes.push(ReplicaCacheNodeObserveSnapshot {
+                owner_node,
+                entries: cache.entry_count(),
+                weighted_bytes: cache.weighted_size(),
+                effective_capacity_bytes,
+                reserved_capacity_bytes,
+                base_capacity_bytes,
+            });
+        }
+
+        MasterRuntimeObserveSnapshot {
+            get_holding_entries: self.inner().get_holding.total() as u64,
+            get_holding_bytes,
+            replica_cache_nodes,
+        }
+    }
+
+    fn spawn_runtime_observe_reporter(&self) {
+        let view = self.0.view().clone();
+        let view_task = view.clone();
+        view.spawn("master_runtime_observe_reporter", async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut shutdown_waiter = view_task.register_shutdown_waiter();
+            loop {
+                tokio::select! {
+                    _ = shutdown_waiter.wait() => break,
+                    _ = interval.tick() => {
+                        let snapshot = view_task.master_kv_router().runtime_observe_snapshot();
+                        let metrics = view_task.metric_reporter().metrics();
+                        metrics.set_kv_holding_entries(
+                            "master_get_holding",
+                            snapshot.get_holding_entries,
+                        );
+                        metrics.set_kv_holding_bytes(
+                            "master_get_holding",
+                            snapshot.get_holding_bytes,
+                        );
+                        for node in snapshot.replica_cache_nodes {
+                            metrics.set_kv_replica_cache_entries(
+                                node.owner_node.as_str(),
+                                node.entries,
+                            );
+                            metrics.set_kv_replica_cache_weighted_bytes(
+                                node.owner_node.as_str(),
+                                node.weighted_bytes,
+                            );
+                            metrics.set_kv_replica_cache_capacity_bytes(
+                                node.owner_node.as_str(),
+                                "effective",
+                                node.effective_capacity_bytes,
+                            );
+                            metrics.set_kv_replica_cache_capacity_bytes(
+                                node.owner_node.as_str(),
+                                "reserved",
+                                node.reserved_capacity_bytes,
+                            );
+                            metrics.set_kv_replica_cache_capacity_bytes(
+                                node.owner_node.as_str(),
+                                "base",
+                                node.base_capacity_bytes,
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Note: no additional getters for reserved bytes; policy currently relies only on adjust calls.
 }
 // moved to crate::metrics::client
 
