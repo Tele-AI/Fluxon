@@ -12,11 +12,11 @@
 use crate::cluster_manager::ClusterManagerRdmaControlInit;
 use crate::config::{
     ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, LargeFilePaths, MasterConfig,
-    MonitoringConfig, ProtocolConfig, ProtocolType, TestSpecConfig, TestSpecTransportMode,
-    TransferEngineType,
+    MonitoringConfig, ProtocolConfig, ProtocolType, ReplicaTaskPlacementConfig, TestSpecConfig,
+    TestSpecTransportMode, TransferEngineType,
 };
 use crate::run_master_with_test_overrides;
-use crate::{run_client_with_test_overrides, ClientRunTestOverrides, MasterRunTestOverrides};
+use crate::{ClientRunTestOverrides, MasterRunTestOverrides, run_client_with_test_overrides};
 // external client runs via run_client when contribution is zero
 use crate::ConfigArg;
 use etcd_client::Client as EtcdClient;
@@ -519,16 +519,18 @@ async fn verify_rdma_transfer_data_link(
             );
         }
 
-        let Some(raw) =
-            fetch_transfer_link_te_value(cluster_name, from_instance_key, to_instance_key)
-                .await
-                .unwrap_or_else(|err| {
-                    panic!(
+        let Some(raw) = fetch_transfer_link_te_value(
+            cluster_name,
+            from_instance_key,
+            to_instance_key,
+        )
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
                 "closed transfer_link probe failed: cluster={} from={} to={} attempt={} err={}",
                 cluster_name, from_instance_key, to_instance_key, attempt, err
             )
-                })
-        else {
+        }) else {
             if Instant::now() >= deadline {
                 panic!(
                     "closed transfer data probe timed out without transfer_link_te key: cluster={} from={} to={} key_prefix={} key={} attempt={}",
@@ -990,6 +992,7 @@ fn new_master_launch(
             network: None,
             log_dir,
             master_ui: None,
+            replica_task_placement: ReplicaTaskPlacementConfig::default(),
             // Keep kv_test self-describing: each round carries the intended transfer mode.
             test_spec_config: kv_test_round_test_spec_config(round.round_profile),
         },

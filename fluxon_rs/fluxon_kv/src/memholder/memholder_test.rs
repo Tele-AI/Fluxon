@@ -15,7 +15,7 @@ use limit_thirdparty::tokio::time::sleep;
 
 use crate::config::{
     ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig, MonitoringConfig,
-    ProtocolConfig, ProtocolType, TestSpecConfig, TransferEngineType,
+    ProtocolConfig, ProtocolType, ReplicaTaskPlacementConfig, TestSpecConfig, TransferEngineType,
 };
 use crate::master_kv_router::MasterKvRouterView;
 use crate::master_seg_manager::one_seg_allocator::Allocation;
@@ -58,6 +58,7 @@ fn new_master_config(
         log_dir: "/tmp/fluxon_master_logs".to_string(),
         pprof_duration_seconds: None,
         master_ui: None,
+        replica_task_placement: ReplicaTaskPlacementConfig::default(),
         test_spec_config: TestSpecConfig::default(),
     }
 }

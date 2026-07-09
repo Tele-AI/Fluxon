@@ -1,3 +1,4 @@
+use crate::SharedJsonMeta;
 use crate::client_kv_api::external_api::{
     compute_external_get_start_transfer_prefix, normalize_external_get_start_group_lens,
 };
@@ -10,7 +11,6 @@ use crate::cluster_manager::{
     META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME,
 };
 use crate::rpcresp_kvresult_convert::ToResult;
-use crate::SharedJsonMeta;
 use crate::{
     client_kv_api::msg_pack::{
         ExternalBatchGetCancelReq, ExternalBatchGetReq, ExternalBatchGetStartReq,
@@ -33,16 +33,16 @@ use crate::{
         msg_pack::{MsgPack, RPCCaller, RPCHandler},
         p2p_module::{P2pModule, P2pModuleAccessTrait, RpcTransportPolicy},
     },
-    rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, SharedMemError, OK},
+    rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, OK, SharedMemError},
 };
 use async_trait::async_trait;
 use core::panic;
 use dashmap::DashMap;
 use fluxon_commu::ShareGroupOwnerRef;
-use fluxon_framework::{define_module, LogicalModule};
+use fluxon_framework::{LogicalModule, define_module};
 use fluxon_observability::kv_metrics_actor::{ObserveComponent, ObserveDirection};
 use fluxon_util::semaphore_map::SemaphoreMap;
-use libc::{mmap, MAP_SHARED, PROT_READ, PROT_WRITE};
+use libc::{MAP_SHARED, PROT_READ, PROT_WRITE, mmap};
 use limit_thirdparty::tokio;
 use limit_thirdparty::tokio::sync::{ARwLock, Notify};
 use limit_thirdparty::tokio::time::sleep;
@@ -51,8 +51,8 @@ use std::{
     fs::File,
     // path::PathBuf, // 不再使用PathBuf
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, OnceLock, Weak,
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -2610,7 +2610,7 @@ key={}, attempt={}/{}, err={}",
         let lease_id = opts.lease_id();
         let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
         let reject_if_exist_same_key = opts.reject_if_exist_same_key();
-        let write_through = opts.write_through();
+        let make_replica_task = opts.make_replica_task();
         let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
         let observe_sink = opts.test_observe_put_phases();
         let observe_enabled = true;
@@ -2647,7 +2647,7 @@ key={}, attempt={}/{}, err={}",
                     lease_id,
                     reject_if_inflight_same_key,
                     reject_if_exist_same_key,
-                    write_through,
+                    make_replica_task,
                     preferred_sub_cluster.as_deref(),
                     observe_enabled,
                 )
@@ -2701,7 +2701,7 @@ key={}, attempt={}/{}, err={}",
         let lease_id = opts.lease_id();
         let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
         let reject_if_exist_same_key = opts.reject_if_exist_same_key();
-        let write_through = opts.write_through();
+        let make_replica_task = opts.make_replica_task();
         let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
         let observe_sink = opts.test_observe_put_phases();
         let observe_enabled = true;
@@ -2737,7 +2737,7 @@ key={}, attempt={}/{}, err={}",
                     lease_id,
                     reject_if_inflight_same_key,
                     reject_if_exist_same_key,
-                    write_through,
+                    make_replica_task,
                     preferred_sub_cluster.as_deref(),
                     observe_enabled,
                 )
@@ -2800,7 +2800,7 @@ key={}, attempt={}/{}, err={}",
         let lease_id = opts.lease_id();
         let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
         let reject_if_exist_same_key = opts.reject_if_exist_same_key();
-        let write_through = opts.write_through();
+        let make_replica_task = opts.make_replica_task();
         let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
         let mut payload_lens = Vec::with_capacity(ptrs_groups.len());
         for ptrs in ptrs_groups.iter() {
@@ -2831,7 +2831,7 @@ key={}, attempt={}/{}, err={}",
                     lease_id,
                     reject_if_inflight_same_key,
                     reject_if_exist_same_key,
-                    write_through,
+                    make_replica_task,
                     preferred_sub_cluster.as_deref(),
                     transfer_concurrency.max(1),
                 )
@@ -2874,7 +2874,7 @@ key={}, attempt={}/{}, err={}",
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
-        write_through: bool,
+        make_replica_task: bool,
         preferred_sub_cluster: Option<&str>,
         transfer_concurrency: usize,
     ) -> KvResult<Vec<KvResult<()>>> {
@@ -2894,7 +2894,7 @@ key={}, attempt={}/{}, err={}",
                         len: *payload_len,
                         reject_if_inflight_same_key,
                         reject_if_exist_same_key,
-                        write_through,
+                        make_replica_task,
                         preferred_sub_cluster: preferred_sub_cluster.map(|s| s.to_string()),
                     })
                     .collect(),
@@ -2974,7 +2974,6 @@ key={}, attempt={}/{}, err={}",
                         remote_target: start_item.peer_id.is_some(),
                         put_id: Some(put_id),
                         lease_id,
-                        write_through,
                     },
                 ));
                 continue;
@@ -3001,7 +3000,6 @@ key={}, attempt={}/{}, err={}",
                         None
                     },
                     put_id: Some(put_id),
-                    write_through,
                     lease_id,
                 },
             ));
@@ -3151,7 +3149,7 @@ key={}, attempt={}/{}, err={}",
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
-        write_through: bool,
+        make_replica_task: bool,
         preferred_sub_cluster: Option<&str>,
         observe_enabled: bool,
     ) -> KvResult<TestPutPhaseTrace> {
@@ -3162,7 +3160,7 @@ key={}, attempt={}/{}, err={}",
                 len: payload_len,
                 reject_if_inflight_same_key,
                 reject_if_exist_same_key,
-                write_through,
+                make_replica_task,
                 preferred_sub_cluster: preferred_sub_cluster.map(|s| s.to_string()),
                 started_time,
                 test_observe_put_phases: true,
@@ -3206,7 +3204,6 @@ key={}, attempt={}/{}, err={}",
                     remote_target,
                     put_id: put_start_ok.put_id,
                     lease_id,
-                    write_through,
                     started_time,
                     test_observe_put_phases: true,
                 },
@@ -3275,7 +3272,6 @@ key={}, attempt={}/{}, err={}",
                     None
                 },
                 put_id: put_start_ok.put_id.clone(),
-                write_through,
                 lease_id,
                 started_time,
                 test_observe_put_phases: true,
@@ -3321,7 +3317,7 @@ key={}, attempt={}/{}, err={}",
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
-        write_through: bool,
+        make_replica_task: bool,
         preferred_sub_cluster: Option<&str>,
         observe_enabled: bool,
     ) -> KvResult<TestPutPhaseTrace> {
@@ -3333,7 +3329,7 @@ key={}, attempt={}/{}, err={}",
                 len: value.len() as u64,
                 reject_if_inflight_same_key,
                 reject_if_exist_same_key,
-                write_through,
+                make_replica_task,
                 preferred_sub_cluster: preferred_sub_cluster.map(|s| s.to_string()),
                 started_time,
                 test_observe_put_phases: true,
@@ -3376,7 +3372,6 @@ key={}, attempt={}/{}, err={}",
                     remote_target,
                     put_id: put_start_ok.put_id,
                     lease_id,
-                    write_through,
                     started_time,
                     test_observe_put_phases: true,
                 },
@@ -3459,7 +3454,6 @@ key={}, attempt={}/{}, err={}",
                     None
                 },
                 put_id: put_start_ok.put_id.clone(),
-                write_through,
                 lease_id,
                 started_time,
                 test_observe_put_phases: true,

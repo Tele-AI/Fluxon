@@ -10,7 +10,7 @@ use crate::client_kv_api::ClientKvApiView;
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::config::{
     ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig, MonitoringConfig,
-    ProtocolConfig, ProtocolType, TestSpecConfig, TransferEngineType,
+    ProtocolConfig, ProtocolType, ReplicaTaskPlacementConfig, TestSpecConfig, TransferEngineType,
 };
 use crate::{ConfigArg, Framework, run_client, run_master};
 
@@ -93,6 +93,7 @@ fn new_master_config_with_cluster(
         log_dir,
         pprof_duration_seconds: None,
         master_ui: None,
+        replica_task_placement: ReplicaTaskPlacementConfig::default(),
         test_spec_config: TestSpecConfig::default(),
     };
     println!("fluxonkv core created master config for test: {:?}", conf);

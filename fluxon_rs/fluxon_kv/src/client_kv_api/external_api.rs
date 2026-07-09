@@ -1,3 +1,4 @@
+use crate::client_kv_api::ClientKvApi;
 use crate::client_kv_api::msg_pack::{
     ExternalBatchGetCancelReq, ExternalBatchGetCancelResp, ExternalBatchGetItemResp,
     ExternalBatchGetReq, ExternalBatchGetResp, ExternalBatchGetStartReq, ExternalBatchGetStartResp,
@@ -11,33 +12,31 @@ use crate::client_kv_api::msg_pack::{
     ExternalPutRevokeReq, ExternalPutRevokeResp, ExternalPutStartReq, ExternalPutStartResp,
     ExternalPutTransferEndReq, ExternalPutTransferEndResp, TestPutPhaseTrace,
 };
-use crate::client_kv_api::ClientKvApi;
 use crate::client_kv_api::{
     self, ExternalGetStartDedupKey, ExternalGetStartEntry, ExternalGetStartOwnerItem,
     ExternalGetStartPrefixResult, ExternalGetStartSharedItemResult, ExternalGetStartSharedOp,
     ExternalGetStartSharedPhase, ExternalGetStartTransferOutput, ExternalHoldingGetInfo,
-    ExternalPendingPutCtx,
+    ExternalPendingPutCtx, ReplicaTaskTarget,
 };
-use crate::client_seg_pool::{parse_side_transfer_worker_lane_idx, ResolveSideTransferLaneReq};
+use crate::client_seg_pool::{ResolveSideTransferLaneReq, parse_side_transfer_worker_lane_idx};
 use crate::cluster_manager::NodeIDString;
 use crate::cluster_manager::{
     META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME,
 };
 use crate::master_kv_router::msg_pack::{
-    BatchPutDoneItemReq, BatchPutRevokeItemReq, BatchPutStartItemReq,
+    BatchPutDoneItemReq, BatchPutRevokeItemReq, BatchPutStartItemReq, PutDoneCommittedSlot,
 };
 use crate::memholder::MemholderManagerTrait;
 use crate::memholder::NodeHolderKey;
 use crate::memholder::{ExternalMemHolderInfo, UserMemHolder, UserMemHolderExposeKind};
 use crate::p2p::msg_pack::MsgPack;
-use crate::rpcresp_kvresult_convert::msg_and_error::{codes_api, ApiError, KvError, KvResult, OK};
 use crate::rpcresp_kvresult_convert::FromError;
 use crate::rpcresp_kvresult_convert::ToResult;
+use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, OK, codes_api};
 use async_trait::async_trait;
 use dashmap::mapref::entry::Entry;
-use futures::stream::{self, StreamExt};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use tracing;
@@ -85,6 +84,146 @@ fn local_committed_cache_publish(
         src_offset: req_src_offset,
         len,
     })
+}
+
+fn external_local_first_error_item(err: &KvError) -> ExternalBatchPutStartItemResp {
+    ExternalBatchPutStartItemResp {
+        put_id: None,
+        ..ExternalBatchPutStartItemResp::from_error(err)
+    }
+}
+
+fn external_local_first_release_keys(inner: &client_kv_api::ClientKvApiInner, keys: &[String]) {
+    for key in keys {
+        inner.release_external_local_first_put_key(key);
+    }
+}
+
+async fn commit_external_local_first_pending(
+    inner: &client_kv_api::ClientKvApiInner,
+    key: &str,
+    put_id: crate::master_kv_router::put::PutIDForAKey,
+    ctx: &ExternalPendingPutCtx,
+    req_src_offset: u64,
+    req_len: u64,
+    op: &'static str,
+) -> KvResult<PutDoneCommittedSlot> {
+    if ctx.peer_id.is_some() {
+        return Err(KvError::Api(ApiError::InvalidArgument {
+            detail: format!(
+                "{op} local-first pending ctx must not carry peer_id: key={} put_id=({},{})",
+                key, put_id.0, put_id.1
+            ),
+        }));
+    }
+    if ctx.src_offset != req_src_offset || ctx.len != req_len {
+        return Err(KvError::Api(ApiError::InvalidArgument {
+            detail: format!(
+                "{op} local-first request mismatches pending ctx: key={} put_id=({},{}) req_src_offset={} ctx_src_offset={} req_len={} ctx_len={}",
+                key, put_id.0, put_id.1, req_src_offset, ctx.src_offset, req_len, ctx.len
+            ),
+        }));
+    }
+    let slot_ref = ctx.local_reserve_slot.as_ref().ok_or_else(|| {
+        KvError::Api(ApiError::InvalidArgument {
+            detail: format!(
+                "{op} pending ctx is not local-first: key={} put_id=({},{})",
+                key, put_id.0, put_id.1
+            ),
+        })
+    })?;
+    let slot_size = ctx.local_reserve_slot_size.ok_or_else(|| {
+        KvError::Api(ApiError::InvalidArgument {
+            detail: format!(
+                "{op} local-first pending ctx missing slot_size: key={} put_id=({},{})",
+                key, put_id.0, put_id.1
+            ),
+        })
+    })?;
+    let len = u32::try_from(req_len).map_err(|_| {
+        KvError::Api(ApiError::Unknown {
+            detail: format!(
+                "{op} local-first len does not fit u32: key={} len={}",
+                key, req_len
+            ),
+        })
+    })?;
+    let memory_info = inner
+        .build_local_reserve_resident_memory_info(
+            key,
+            slot_ref.ptr,
+            len,
+            slot_size,
+            slot_ref.grant_id,
+            slot_ref.slot_index,
+        )
+        .await;
+    inner.install_precommit_local_visible_memory_info(key, memory_info.clone());
+    inner.promote_precommit_local_reserve_resident_slot_if_same(key, put_id, memory_info)?;
+    Ok(PutDoneCommittedSlot {
+        grant_id: slot_ref.grant_id,
+        slot_index: slot_ref.slot_index,
+        slot_size,
+        addr: slot_ref.ptr,
+        base_addr: slot_ref.base_addr,
+        len: req_len,
+    })
+}
+
+fn spawn_external_local_first_publish(
+    inner: &client_kv_api::ClientKvApiInner,
+    key: String,
+    put_id: crate::master_kv_router::put::PutIDForAKey,
+    lease_id: Option<u64>,
+    committed_slot: PutDoneCommittedSlot,
+) {
+    let view = inner.view.clone_view();
+    let spawn_view = view.clone();
+    spawn_view.spawn("external_local_first_route_publish", async move {
+        let inner = view.client_kv_api().inner();
+        match inner
+            .batch_put_done(vec![BatchPutDoneItemReq {
+                key: key.clone(),
+                put_id,
+                lease_id,
+                committed_slot: Some(committed_slot),
+                publish_local_cache: false,
+            }])
+            .await
+        {
+            Ok(resp) => {
+                if let Some(item) = resp.items.into_iter().next() {
+                    if let Err(err) =
+                        crate::rpcresp_kvresult_convert::try_from_code(item.error_code, item.error_json)
+                    {
+                        tracing::warn!(
+                            "external local-first route publish failed: key={} put_id=({},{}) err={}",
+                            key,
+                            put_id.0,
+                            put_id.1,
+                            err
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        "external local-first route publish returned empty response: key={} put_id=({},{})",
+                        key,
+                        put_id.0,
+                        put_id.1
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "external local-first route publish rpc failed: key={} put_id=({},{}) err={}",
+                    key,
+                    put_id.0,
+                    put_id.1,
+                    err
+                );
+            }
+        }
+    });
 }
 
 pub(crate) fn normalize_external_get_start_group_lens(
@@ -769,7 +908,6 @@ impl ClientKvApi {
                     .is_some_and(|peer| peer != owner_id.as_str()),
                 put_id: Some(put_id),
                 lease_id: req.lease_id,
-                write_through: req.write_through,
                 started_time: req.started_time,
                 test_observe_put_phases: req.test_observe_put_phases,
             },
@@ -1222,7 +1360,7 @@ impl HandlerForExternalClient for ClientKvApi {
                 req.len as u32,
                 req.reject_if_inflight_same_key,
                 req.reject_if_exist_same_key,
-                req.write_through,
+                req.make_replica_task,
                 req.preferred_sub_cluster.as_deref(),
                 source_node_id,
             )
@@ -1256,6 +1394,16 @@ impl HandlerForExternalClient for ClientKvApi {
             src_offset
         };
         let remote_offset = put_start_resp.target_addr - put_start_resp.target_base_addr;
+        let replica_target =
+            put_start_resp
+                .replica_target
+                .as_ref()
+                .map(|target| ReplicaTaskTarget {
+                    node_id: target.node_id.clone(),
+                    target_offset: target.target_addr - target.target_base_addr,
+                    target_base_addr: target.target_base_addr,
+                    len: target.len,
+                });
         inner.external_pending_puts.insert(
             (
                 req.key.clone(),
@@ -1276,7 +1424,11 @@ impl HandlerForExternalClient for ClientKvApi {
                     remote_offset
                 },
                 len: req.len,
+                make_replica_task: req.make_replica_task && replica_target.is_some(),
                 preferred_sub_cluster: req.preferred_sub_cluster.clone(),
+                replica_target,
+                local_reserve_slot: None,
+                local_reserve_slot_size: None,
             },
         );
         if !is_local_target {
@@ -1337,94 +1489,93 @@ impl HandlerForExternalClient for ClientKvApi {
 
         self.validate_requester_owner_status_updated(req.started_time)?;
 
-        let start_resp = inner
-            .batch_put_start(
-                req.items
-                    .iter()
-                    .map(|item| BatchPutStartItemReq {
-                        key: item.key.clone(),
-                        len: item.len,
-                        reject_if_inflight_same_key: item.reject_if_inflight_same_key,
-                        reject_if_exist_same_key: item.reject_if_exist_same_key,
-                        write_through: item.write_through,
-                        preferred_sub_cluster: item.preferred_sub_cluster.clone(),
-                    })
-                    .collect(),
-            )
-            .await?;
-        if start_resp.items.len() != req.items.len() {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "external_batch_put_start response length mismatch: expected={} got={}",
-                    req.items.len(),
-                    start_resp.items.len()
-                ),
+        let Some(first_item) = req.items.first() else {
+            return Ok(ExternalBatchPutStartResp {
+                items: Vec::new(),
+                error_code: OK,
+                error_json: String::new(),
+            });
+        };
+        let value_len = first_item.len;
+        if req.items.iter().any(|item| item.len != value_len) {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "external_batch_put_start local-first requires uniform item len"
+                    .to_string(),
             }));
         }
 
+        let mut reserved_keys = Vec::with_capacity(req.items.len());
+        for item in &req.items {
+            if let Err(err) = inner.reserve_external_local_first_put_key(
+                &item.key,
+                item.reject_if_inflight_same_key,
+                item.reject_if_exist_same_key,
+            ) {
+                external_local_first_release_keys(inner, &reserved_keys);
+                let items = req
+                    .items
+                    .iter()
+                    .map(|_| external_local_first_error_item(&err))
+                    .collect();
+                return Ok(ExternalBatchPutStartResp {
+                    items,
+                    error_code: OK,
+                    error_json: String::new(),
+                });
+            }
+            reserved_keys.push(item.key.clone());
+        }
+
+        let slot_lease = match inner
+            .owner_claim_local_reserve_slot_lease(value_len, req.items.len())
+            .await
+        {
+            Ok(slot_lease) => slot_lease,
+            Err(err) => {
+                external_local_first_release_keys(inner, &reserved_keys);
+                return Err(err);
+            }
+        };
         let self_node_id = inner.view.cluster_manager().get_self_info().id.clone();
         let mut items = Vec::with_capacity(req.items.len());
-        for (req_item, start_item) in req.items.into_iter().zip(start_resp.items.into_iter()) {
-            if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
-                start_item.error_code,
-                start_item.error_json.clone(),
-            ) {
-                items.push(ExternalBatchPutStartItemResp {
-                    put_id: None,
-                    ..ExternalBatchPutStartItemResp::from_error(&err)
-                });
-                continue;
-            }
-
-            let src_offset = start_item.src_addr - start_item.src_base_addr;
-            let is_local_target = start_item.node_id == self_node_id;
-            let target_offset = if is_local_target {
-                start_item.target_addr - start_item.target_base_addr
-            } else {
-                src_offset
-            };
-            let remote_offset = start_item.target_addr - start_item.target_base_addr;
+        for (req_item, slot_ref) in req.items.into_iter().zip(slot_lease.slots.into_iter()) {
+            let put_id = inner.next_external_local_first_put_id();
+            let src_offset = slot_ref.ptr.saturating_sub(slot_ref.base_addr);
             inner.external_pending_puts.insert(
-                (
-                    req_item.key.clone(),
-                    start_item.put_id.0,
-                    start_item.put_id.1,
-                ),
+                (req_item.key.clone(), put_id.0, put_id.1),
                 ExternalPendingPutCtx {
-                    peer_id: if is_local_target {
-                        None
-                    } else {
-                        Some(start_item.node_id.clone())
-                    },
+                    peer_id: None,
                     src_offset,
-                    target_base_addr: start_item.target_base_addr,
-                    target_offset: if is_local_target {
-                        target_offset
-                    } else {
-                        remote_offset
-                    },
+                    target_base_addr: slot_ref.base_addr,
+                    target_offset: src_offset,
                     len: req_item.len,
+                    make_replica_task: req_item.make_replica_task,
                     preferred_sub_cluster: req_item.preferred_sub_cluster.clone(),
+                    replica_target: None,
+                    local_reserve_slot: Some(slot_ref.clone()),
+                    local_reserve_slot_size: Some(slot_lease.slot_size),
                 },
+            );
+            tracing::debug!(
+                "external_batch_put_start local-first: key={} put_id=({},{}) node_id={} base={:#x} offset={:#x} len={}",
+                req_item.key,
+                put_id.0,
+                put_id.1,
+                self_node_id,
+                slot_ref.base_addr,
+                src_offset,
+                req_item.len
             );
             items.push(ExternalBatchPutStartItemResp {
                 error_code: OK,
                 src_offset,
-                target_offset,
-                transfer_target_offset: if is_local_target {
-                    None
-                } else {
-                    Some(remote_offset)
-                },
-                peer_id: if is_local_target {
-                    None
-                } else {
-                    Some(start_item.node_id)
-                },
-                src_base_addr: start_item.src_base_addr,
-                target_base_addr: start_item.target_base_addr,
+                target_offset: src_offset,
+                transfer_target_offset: None,
+                peer_id: None,
+                src_base_addr: slot_ref.base_addr,
+                target_base_addr: slot_ref.base_addr,
                 error_json: String::new(),
-                put_id: Some(start_item.put_id),
+                put_id: Some(put_id),
             });
         }
 
@@ -1462,23 +1613,27 @@ impl HandlerForExternalClient for ClientKvApi {
             .external_pending_puts
             .get(&(req.key.clone(), put_id.0, put_id.1))
             .map(|ctx| ctx.clone());
-        let preferred_sub_cluster = pending_ctx
+        let replica_target = pending_ctx
             .as_ref()
-            .and_then(|ctx| ctx.preferred_sub_cluster.clone());
+            .and_then(|ctx| ctx.replica_target.clone());
+        let admitted_replica_task = pending_ctx
+            .as_ref()
+            .map(|ctx| ctx.make_replica_task)
+            .unwrap_or(false);
         let self_node_id = inner.view.cluster_manager().get_self_info().id.clone();
         let req_remote_target = req
             .peer_id
             .as_deref()
             .is_some_and(|peer| peer != self_node_id.as_str());
-        let has_remote_append = pending_ctx
+        let has_remote_target = pending_ctx
             .as_ref()
             .and_then(|ctx| ctx.peer_id.as_ref())
             .is_some();
-        if pending_ctx.is_some() && req_remote_target != has_remote_append {
+        if pending_ctx.is_some() && req_remote_target != has_remote_target {
             let err = KvError::Api(ApiError::InvalidArgument {
                 detail: format!(
                     "external_put_transfer_end peer_id mismatches pending ctx: key={} put_id=({},{}) req_remote_target={} ctx_remote_target={}",
-                    req.key, put_id.0, put_id.1, req_remote_target, has_remote_append
+                    req.key, put_id.0, put_id.1, req_remote_target, has_remote_target
                 ),
             });
             if let Err(revoke_err) = inner.put_revoke(&req.key, put_id).await {
@@ -1495,120 +1650,8 @@ impl HandlerForExternalClient for ClientKvApi {
                 .invalidate(&(req.key.clone(), put_id.0, put_id.1));
             return Ok(ExternalPutTransferEndResp::from_error(&err));
         }
-
-        // Delegate transfer to owner put_transfer (offset-based) then end
-        // For remote target, ignore caller's target_offset (staging) and use stashed remote ctx.
-        let (peer_id_for_transfer, target_off_for_transfer, target_base_for_transfer) =
-            if let Some(peer) = req.peer_id.clone() {
-                if peer == self_node_id.as_ref() {
-                    (None, req.target_offset, None)
-                } else {
-                    match pending_ctx.as_ref() {
-                        Some(ctx) if ctx.peer_id.is_some() => (
-                            ctx.peer_id.clone(),
-                            ctx.target_offset,
-                            Some(ctx.target_base_addr),
-                        ),
-                        None => match req.target_base_addr {
-                            Some(target_base_addr) => {
-                                (Some(peer.into()), req.target_offset, Some(target_base_addr))
-                            }
-                            None => {
-                                let err = KvError::Unreachable(
-                                    crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::RpcDecodeError {
-                                        rpc_input_json: format!(
-                                            "missing pending remote put ctx and caller target_base_addr; key={}, put_id=({},{}), peer_id={}",
-                                            req.key, put_id.0, put_id.1, peer
-                                        ),
-                                    },
-                                );
-                                return Ok(ExternalPutTransferEndResp::from_error(&err));
-                            }
-                        },
-                        Some(_) => match req.target_base_addr {
-                            Some(target_base_addr) => {
-                                (Some(peer.into()), req.target_offset, Some(target_base_addr))
-                            }
-                            None => {
-                                let err = KvError::Unreachable(
-                                    crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::RpcDecodeError {
-                                        rpc_input_json: format!(
-                                            "pending local ctx conflicted with remote external_put_transfer_end; key={}, put_id=({},{}), peer_id={}",
-                                            req.key, put_id.0, put_id.1, peer
-                                        ),
-                                    },
-                                );
-                                return Ok(ExternalPutTransferEndResp::from_error(&err));
-                            }
-                        },
-                    }
-                }
-            } else {
-                (None, req.target_offset, None)
-            };
-        let transfer_peer_id_for_trace = peer_id_for_transfer.as_ref().map(|peer| peer.to_string());
-
-        tracing::debug!(
-            "external_put_transfer_end resolved: key={}, put_id=({},{}) src_off={:#x}, tgt_off={:#x}, len={}, peer_id={:?}, target_base={:?}",
-            req.key,
-            put_id.0,
-            put_id.1,
-            req.src_offset,
-            target_off_for_transfer,
-            req.len,
-            peer_id_for_transfer,
-            target_base_for_transfer
-        );
-
-        let transfer_started_at = Instant::now();
-        let mut put_locality_recorded = false;
-        if req.write_through {
-            let transfer_result = inner
-                .put_transfer(
-                    &req.key,
-                    put_id,
-                    req.src_offset,
-                    target_off_for_transfer,
-                    req.len,
-                    peer_id_for_transfer,
-                    target_base_for_transfer,
-                )
-                .await;
-            match transfer_result {
-                Ok(breakdown) => {
-                    let breakdown_transfer_us = breakdown.submit_blocking_us
-                        + breakdown.create_xfer_req_us
-                        + breakdown.post_xfer_req_us
-                        + breakdown.poll_wait_us;
-                    inner.record_put_locality(
-                        breakdown.remote_transfer,
-                        req.len,
-                        breakdown_transfer_us,
-                    );
-                    put_locality_recorded = true;
-                }
-                Err(e) => {
-                    tracing::error!("Failed to transfer data: {}", e);
-                    // On transfer failure, revoke the put to release resources
-                    if let Err(revoke_err) = inner.put_revoke(&req.key, put_id).await {
-                        tracing::warn!(
-                            "put_revoke also failed after transfer error: {}",
-                            revoke_err
-                        );
-                    }
-                    // Cleanup pending ctx on failure
-                    inner
-                        .external_pending_puts
-                        .invalidate(&(req.key.clone(), put_id.0, put_id.1));
-                    return Ok(crate::rpcresp_kvresult_convert::FromError::from_error(&e));
-                }
-            }
-        }
-
-        let put_transfer_total_us = duration_to_i64_us(transfer_started_at.elapsed());
-        if req.write_through && !put_locality_recorded {
-            inner.record_put_locality(false, req.len, 0);
-        }
+        let put_transfer_total_us = 0;
+        let transfer_peer_id_for_trace = None;
 
         if inner.skip_put_end_commit_enabled() {
             inner
@@ -1640,35 +1683,31 @@ impl HandlerForExternalClient for ClientKvApi {
         }
 
         let end_started_at = Instant::now();
-        let publish_local_cache = !req.write_through || !req_remote_target;
-        let local_cache_publish = if publish_local_cache {
-            match local_committed_cache_publish(
-                "external_put_transfer_end",
-                &req.key,
-                put_id,
-                pending_ctx.as_ref(),
-                req.src_offset,
-                req.len,
-            ) {
-                Ok(publish) => Some(publish),
-                Err(err) => {
-                    if let Err(revoke_err) = inner.put_revoke(&req.key, put_id).await {
-                        tracing::warn!(
-                            "external_put_transfer_end put_revoke failed after local cache publish precheck error: key={} put_id=({},{}) err={}",
-                            req.key,
-                            put_id.0,
-                            put_id.1,
-                            revoke_err
-                        );
-                    }
-                    inner
-                        .external_pending_puts
-                        .invalidate(&(req.key.clone(), put_id.0, put_id.1));
-                    return Ok(crate::rpcresp_kvresult_convert::FromError::from_error(&err));
+        let publish_local_cache = true;
+        let local_cache_publish = match local_committed_cache_publish(
+            "external_put_transfer_end",
+            &req.key,
+            put_id,
+            pending_ctx.as_ref(),
+            req.src_offset,
+            req.len,
+        ) {
+            Ok(publish) => publish,
+            Err(err) => {
+                if let Err(revoke_err) = inner.put_revoke(&req.key, put_id).await {
+                    tracing::warn!(
+                        "external_put_transfer_end put_revoke failed after local cache publish precheck error: key={} put_id=({},{}) err={}",
+                        req.key,
+                        put_id.0,
+                        put_id.1,
+                        revoke_err
+                    );
                 }
+                inner
+                    .external_pending_puts
+                    .invalidate(&(req.key.clone(), put_id.0, put_id.1));
+                return Ok(crate::rpcresp_kvresult_convert::FromError::from_error(&err));
             }
-        } else {
-            None
         };
         let put_end = match inner
             .put_end_with_local_cache_publish(&req.key, put_id, req.lease_id, publish_local_cache)
@@ -1686,46 +1725,43 @@ impl HandlerForExternalClient for ClientKvApi {
         let put_end_stats = put_end.stats;
         let put_end_total_us = duration_to_i64_us(end_started_at.elapsed());
 
-        if publish_local_cache {
-            let Some(holder_id) = put_end.local_cache_holder_id else {
-                let err = KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "external_put_transfer_end missing local cache holder after local commit: key={} put_id=({},{})",
-                        req.key, put_id.0, put_id.1
-                    ),
-                });
-                inner
-                    .external_pending_puts
-                    .invalidate(&(req.key.clone(), put_id.0, put_id.1));
-                return Ok(crate::rpcresp_kvresult_convert::FromError::from_error(&err));
-            };
-            let publish = local_cache_publish
-                .as_ref()
-                .expect("publish_local_cache precheck must provide local cache publish info");
+        let Some(holder_id) = put_end.local_cache_holder_id else {
+            let err = KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "external_put_transfer_end missing local cache holder after local commit: key={} put_id=({},{})",
+                    req.key, put_id.0, put_id.1
+                ),
+            });
             inner
-                .install_local_committed_memory_info(
-                    &req.key,
-                    put_id,
-                    publish.src_offset,
-                    publish.len,
-                    holder_id,
-                )
-                .await?;
-        }
+                .external_pending_puts
+                .invalidate(&(req.key.clone(), put_id.0, put_id.1));
+            return Ok(crate::rpcresp_kvresult_convert::FromError::from_error(&err));
+        };
+        inner
+            .install_local_committed_memory_info(
+                &req.key,
+                put_id,
+                local_cache_publish.src_offset,
+                local_cache_publish.len,
+                holder_id,
+            )
+            .await?;
         inner
             .external_pending_puts
             .invalidate(&(req.key.clone(), put_id.0, put_id.1));
-        if !req.write_through && (has_remote_append || req_remote_target) {
+        if admitted_replica_task && replica_target.is_some() {
             if let Err(err) = inner
-                .enqueue_write_back_remote_append(
+                .make_replica_task(
                     &req.key,
                     put_id,
-                    preferred_sub_cluster.as_deref(),
+                    replica_target
+                        .clone()
+                        .expect("make_replica_task requires pre-reserved replica target"),
                 )
                 .await
             {
                 tracing::warn!(
-                    "write-back external_put_transfer_end enqueue failed after local commit: key={} put_id=({},{}) err={}",
+                    "external_put_transfer_end make replica task failed after local commit: key={} put_id=({},{}) err={}",
                     req.key,
                     put_id.0,
                     put_id.1,
@@ -1784,18 +1820,15 @@ impl HandlerForExternalClient for ClientKvApi {
             lease_id: Option<u64>,
             len: u64,
             put_locality: Option<(bool, i64)>,
-            remember_local_snapshot: bool,
-            publish_local_cache: bool,
-            local_cache_publish: Option<LocalCommittedCachePublish>,
-            enqueue_write_back_append: bool,
-            preferred_sub_cluster: Option<String>,
+            local_cache_publish: LocalCommittedCachePublish,
+            make_replica_task: bool,
+            replica_target: Option<ReplicaTaskTarget>,
         }
 
         let mut results: Vec<Option<ExternalBatchPutTransferEndItemResp>> =
             (0..req.items.len()).map(|_| None).collect();
         let mut done_pending = Vec::new();
         let mut revoke_pending = Vec::new();
-        let mut transfer_futures = Vec::new();
 
         for (idx, item) in req.items.into_iter().enumerate() {
             let Some(put_id) = item.put_id else {
@@ -1815,17 +1848,77 @@ impl HandlerForExternalClient for ClientKvApi {
                 .external_pending_puts
                 .get(&(item.key.clone(), put_id.0, put_id.1))
                 .map(|ctx| ctx.clone());
-            let preferred_sub_cluster = pending_ctx
-                .as_ref()
-                .and_then(|ctx| ctx.preferred_sub_cluster.clone());
+            if let Some(ctx) = pending_ctx.as_ref() {
+                if ctx.local_reserve_slot.is_some() {
+                    if item.peer_id.is_some() {
+                        let err = KvError::Api(ApiError::InvalidArgument {
+                            detail: format!(
+                                "external_batch_put_transfer_end local-first item must be local target: key={} put_id=({},{})",
+                                item.key, put_id.0, put_id.1
+                            ),
+                        });
+                        results[idx] = Some(ExternalBatchPutTransferEndItemResp::from_error(&err));
+                        inner.external_pending_puts.invalidate(&(
+                            item.key.clone(),
+                            put_id.0,
+                            put_id.1,
+                        ));
+                        inner.release_external_local_first_put_key(&item.key);
+                        continue;
+                    }
+                    match commit_external_local_first_pending(
+                        inner,
+                        &item.key,
+                        put_id,
+                        ctx,
+                        item.src_offset,
+                        item.len,
+                        "external_batch_put_transfer_end",
+                    )
+                    .await
+                    {
+                        Ok(committed_slot) => {
+                            inner.record_put_locality(false, item.len, 0);
+                            inner.external_pending_puts.invalidate(&(
+                                item.key.clone(),
+                                put_id.0,
+                                put_id.1,
+                            ));
+                            inner.release_external_local_first_put_key(&item.key);
+                            spawn_external_local_first_publish(
+                                inner,
+                                item.key.clone(),
+                                put_id,
+                                item.lease_id,
+                                committed_slot,
+                            );
+                            results[idx] = Some(ExternalBatchPutTransferEndItemResp {
+                                error_code: OK,
+                                error_json: String::new(),
+                            });
+                        }
+                        Err(err) => {
+                            inner.external_pending_puts.invalidate(&(
+                                item.key.clone(),
+                                put_id.0,
+                                put_id.1,
+                            ));
+                            inner.release_external_local_first_put_key(&item.key);
+                            results[idx] =
+                                Some(ExternalBatchPutTransferEndItemResp::from_error(&err));
+                        }
+                    }
+                    continue;
+                }
+            }
             let has_remote_append = pending_ctx
                 .as_ref()
                 .and_then(|ctx| ctx.peer_id.as_ref())
                 .is_some();
-            if item.peer_id.is_some() != has_remote_append {
+            if item.peer_id.is_some() || has_remote_append {
                 let err = KvError::Api(ApiError::InvalidArgument {
                     detail: format!(
-                        "external_batch_put_transfer_end peer_id mismatches pending ctx: key={} put_id=({},{}) req_remote_target={} ctx_remote_target={}",
+                        "external_batch_put_transfer_end remote primary target is no longer supported: key={} put_id=({},{}) req_remote_target={} ctx_remote_target={}",
                         item.key,
                         put_id.0,
                         put_id.1,
@@ -1843,193 +1936,49 @@ impl HandlerForExternalClient for ClientKvApi {
                     .invalidate(&(item.key.clone(), put_id.0, put_id.1));
                 continue;
             }
-            let remember_local_snapshot = !item.write_through || item.peer_id.is_none();
-            let publish_local_cache = remember_local_snapshot;
-            let enqueue_write_back_append = !item.write_through && item.peer_id.is_some();
-            let local_cache_publish = if publish_local_cache {
-                match local_committed_cache_publish(
-                    "external_batch_put_transfer_end",
-                    &item.key,
-                    put_id,
-                    pending_ctx.as_ref(),
-                    item.src_offset,
-                    item.len,
-                ) {
-                    Ok(publish) => Some(publish),
-                    Err(err) => {
-                        results[idx] = Some(ExternalBatchPutTransferEndItemResp::from_error(&err));
-                        revoke_pending.push(BatchPutRevokeItemReq {
-                            key: item.key.clone(),
-                            put_id,
-                        });
-                        inner.external_pending_puts.invalidate(&(
-                            item.key.clone(),
-                            put_id.0,
-                            put_id.1,
-                        ));
-                        continue;
-                    }
-                }
-            } else {
-                None
-            };
-
-            let transfer_args = if let Some(peer) = item.peer_id.clone() {
-                match pending_ctx.as_ref() {
-                    Some(ctx) if ctx.peer_id.is_some() => {
-                        Ok((ctx.peer_id.clone(), ctx.target_offset, Some(ctx.target_base_addr)))
-                    }
-                    None => match item.target_base_addr {
-                        Some(target_base_addr) => {
-                            Ok((Some(peer.into()), item.target_offset, Some(target_base_addr)))
-                        }
-                        None => Err(KvError::Unreachable(
-                            crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::RpcDecodeError {
-                                rpc_input_json: format!(
-                                    "missing pending remote put ctx and caller target_base_addr in external_batch_put_transfer_end; key={}, put_id=({},{}), peer_id={}",
-                                    item.key, put_id.0, put_id.1, peer
-                                ),
-                            },
-                        )),
-                    },
-                    Some(_) => match item.target_base_addr {
-                        Some(target_base_addr) => {
-                            Ok((Some(peer.into()), item.target_offset, Some(target_base_addr)))
-                        }
-                        None => Err(KvError::Unreachable(
-                            crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::RpcDecodeError {
-                                rpc_input_json: format!(
-                                    "pending local ctx conflicted with remote external_batch_put_transfer_end; key={}, put_id=({},{}), peer_id={}",
-                                    item.key, put_id.0, put_id.1, peer
-                                ),
-                            },
-                        )),
-                    },
-                }
-            } else {
-                Ok((None, item.target_offset, None))
-            };
-            let (peer_id_for_transfer, target_off_for_transfer, target_base_for_transfer) =
-                match transfer_args {
-                    Ok(v) => v,
-                    Err(err) => {
-                        results[idx] = Some(ExternalBatchPutTransferEndItemResp::from_error(&err));
-                        continue;
-                    }
-                };
-
-            if !item.write_through {
-                done_pending.push(DonePending {
-                    idx,
-                    key: item.key,
-                    put_id,
-                    lease_id: item.lease_id,
-                    len: item.len,
-                    put_locality: Some((false, 0)),
-                    remember_local_snapshot,
-                    publish_local_cache,
-                    local_cache_publish,
-                    enqueue_write_back_append,
-                    preferred_sub_cluster,
-                });
-                continue;
-            }
-
-            transfer_futures.push(async move {
-                let transfer_started_at = Instant::now();
-                let transfer_result = inner
-                    .put_transfer(
-                        &item.key,
-                        put_id,
-                        item.src_offset,
-                        target_off_for_transfer,
-                        item.len,
-                        peer_id_for_transfer,
-                        target_base_for_transfer,
-                    )
-                    .await;
-                (
-                    idx,
-                    item.key,
-                    item.len,
-                    put_id,
-                    item.lease_id,
-                    remember_local_snapshot,
-                    publish_local_cache,
-                    local_cache_publish,
-                    preferred_sub_cluster,
-                    duration_to_i64_us(transfer_started_at.elapsed()),
-                    transfer_result,
-                )
-            });
-        }
-
-        let transfer_concurrency = req.transfer_concurrency.max(1);
-        let mut transfer_stream =
-            stream::iter(transfer_futures).buffer_unordered(transfer_concurrency);
-        while let Some(joined) = transfer_stream.next().await {
-            match joined {
-                (
-                    idx,
-                    key,
-                    len,
-                    put_id,
-                    lease_id,
-                    remember_local_snapshot,
-                    publish_local_cache,
-                    local_cache_publish,
-                    preferred_sub_cluster,
-                    wall_transfer_us,
-                    Ok(breakdown),
-                ) => {
-                    let breakdown_transfer_us = breakdown.submit_blocking_us
-                        + breakdown.create_xfer_req_us
-                        + breakdown.post_xfer_req_us
-                        + breakdown.poll_wait_us;
-                    let transfer_us = breakdown_transfer_us.max(wall_transfer_us);
-                    done_pending.push(DonePending {
-                        idx,
-                        key,
-                        put_id,
-                        lease_id,
-                        len,
-                        put_locality: Some((breakdown.remote_transfer, transfer_us)),
-                        remember_local_snapshot,
-                        publish_local_cache,
-                        local_cache_publish,
-                        enqueue_write_back_append: false,
-                        preferred_sub_cluster,
-                    });
-                }
-                (
-                    idx,
-                    key,
-                    _len,
-                    put_id,
-                    _lease_id,
-                    _remember_local_snapshot,
-                    _publish_local_cache,
-                    _local_cache_publish,
-                    _preferred_sub_cluster,
-                    _wall_transfer_us,
-                    Err(err),
-                ) => {
+            let local_cache_publish = match local_committed_cache_publish(
+                "external_batch_put_transfer_end",
+                &item.key,
+                put_id,
+                pending_ctx.as_ref(),
+                item.src_offset,
+                item.len,
+            ) {
+                Ok(publish) => publish,
+                Err(err) => {
                     results[idx] = Some(ExternalBatchPutTransferEndItemResp::from_error(&err));
                     revoke_pending.push(BatchPutRevokeItemReq {
-                        key: key.clone(),
+                        key: item.key.clone(),
                         put_id,
                     });
                     inner
                         .external_pending_puts
-                        .invalidate(&(key, put_id.0, put_id.1));
+                        .invalidate(&(item.key.clone(), put_id.0, put_id.1));
+                    continue;
                 }
-            }
+            };
+            done_pending.push(DonePending {
+                idx,
+                key: item.key,
+                put_id,
+                lease_id: item.lease_id,
+                len: item.len,
+                put_locality: Some((false, 0)),
+                local_cache_publish,
+                make_replica_task: pending_ctx
+                    .as_ref()
+                    .map(|ctx| ctx.make_replica_task)
+                    .unwrap_or(false),
+                replica_target: pending_ctx
+                    .as_ref()
+                    .and_then(|ctx| ctx.replica_target.clone()),
+            });
         }
 
         if !revoke_pending.is_empty() {
             if let Err(err) = inner.batch_put_revoke(revoke_pending).await {
                 tracing::warn!(
-                    "external_batch_put_transfer_end batch_put_revoke failed after transfer errors: {}",
+                    "external_batch_put_transfer_end batch_put_revoke failed after precheck errors: {}",
                     err
                 );
             }
@@ -2074,7 +2023,7 @@ impl HandlerForExternalClient for ClientKvApi {
                         put_id: pending.put_id,
                         lease_id: pending.lease_id,
                         committed_slot: None,
-                        publish_local_cache: pending.publish_local_cache,
+                        publish_local_cache: true,
                     })
                     .collect(),
             )
@@ -2105,42 +2054,34 @@ impl HandlerForExternalClient for ClientKvApi {
             if let Some((remote, transfer_us)) = pending.put_locality {
                 inner.record_put_locality(remote, pending.len, transfer_us);
             }
-            if pending.publish_local_cache {
-                let Some(holder_id) = done_item.local_cache_holder_id else {
-                    return Err(KvError::Api(ApiError::Unknown {
-                        detail: format!(
-                            "external_batch_put_transfer_end missing local cache holder after local commit: key={} put_id=({},{})",
-                            pending.key, pending.put_id.0, pending.put_id.1
-                        ),
-                    }));
-                };
-                let publish = pending
-                    .local_cache_publish
-                    .as_ref()
-                    .expect("publish_local_cache precheck must provide local cache publish info");
-                inner
-                    .install_local_committed_memory_info(
-                        &pending.key,
-                        pending.put_id,
-                        publish.src_offset,
-                        publish.len,
-                        holder_id,
-                    )
-                    .await?;
-            } else if pending.remember_local_snapshot {
-                inner.remember_local_snapshot(&pending.key, pending.put_id);
-            }
-            if pending.enqueue_write_back_append {
+            let Some(holder_id) = done_item.local_cache_holder_id else {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "external_batch_put_transfer_end missing local cache holder after local commit: key={} put_id=({},{})",
+                        pending.key, pending.put_id.0, pending.put_id.1
+                    ),
+                }));
+            };
+            inner
+                .install_local_committed_memory_info(
+                    &pending.key,
+                    pending.put_id,
+                    pending.local_cache_publish.src_offset,
+                    pending.local_cache_publish.len,
+                    holder_id,
+                )
+                .await?;
+            if pending.make_replica_task {
+                let target = pending
+                    .replica_target
+                    .clone()
+                    .expect("make_replica_task requires pre-reserved replica target");
                 if let Err(err) = inner
-                    .enqueue_write_back_remote_append(
-                        &pending.key,
-                        pending.put_id,
-                        pending.preferred_sub_cluster.as_deref(),
-                    )
+                    .make_replica_task(&pending.key, pending.put_id, target)
                     .await
                 {
                     tracing::warn!(
-                        "external_batch_put_transfer_end write-back enqueue failed after local commit: key={} put_id=({},{}) err={}",
+                        "external_batch_put_transfer_end make replica task failed after local commit: key={} put_id=({},{}) err={}",
                         pending.key,
                         pending.put_id.0,
                         pending.put_id.1,
@@ -2190,18 +2131,53 @@ impl HandlerForExternalClient for ClientKvApi {
             .external_pending_puts
             .get(&(req.key.clone(), put_id.0, put_id.1))
             .map(|ctx| ctx.clone());
-        if let Some(ctx) = pending_ctx.as_ref() {
-            let has_remote_append = ctx.peer_id.is_some();
-            if req.remote_target != has_remote_append {
-                let err = KvError::Api(ApiError::InvalidArgument {
-                    detail: format!(
-                        "external_put_commit remote_target mismatches pending ctx: key={} put_id=({},{}) req_remote_target={} ctx_remote_target={}",
-                        req.key, put_id.0, put_id.1, req.remote_target, has_remote_append
-                    ),
-                });
+        let has_remote_append = pending_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.peer_id.as_ref())
+            .is_some();
+        if req.remote_target || has_remote_append {
+            let err = KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "external_put_commit remote primary target is no longer supported: key={} put_id=({},{}) req_remote_target={} ctx_remote_target={}",
+                    req.key, put_id.0, put_id.1, req.remote_target, has_remote_append
+                ),
+            });
+            if let Err(revoke_err) = inner.put_revoke(&req.key, put_id).await {
+                tracing::warn!(
+                    "external_put_commit put_revoke failed after remote primary target: key={} put_id=({},{}) err={}",
+                    req.key,
+                    put_id.0,
+                    put_id.1,
+                    revoke_err
+                );
+            }
+            inner
+                .external_pending_puts
+                .invalidate(&(req.key.clone(), put_id.0, put_id.1));
+            return Ok(ExternalPutCommitResp::from_error(&err));
+        }
+        let replica_target = pending_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.replica_target.clone());
+        let admitted_replica_task = pending_ctx
+            .as_ref()
+            .map(|ctx| ctx.make_replica_task)
+            .unwrap_or(false);
+
+        let end_started_at = Instant::now();
+        let local_cache_publish = match local_committed_cache_publish(
+            "external_put_commit",
+            &req.key,
+            put_id,
+            pending_ctx.as_ref(),
+            req.src_offset,
+            req.len,
+        ) {
+            Ok(publish) => publish,
+            Err(err) => {
                 if let Err(revoke_err) = inner.put_revoke(&req.key, put_id).await {
                     tracing::warn!(
-                        "external_put_commit put_revoke failed after remote_target mismatch: key={} put_id=({},{}) err={}",
+                        "external_put_commit put_revoke failed after local cache publish precheck error: key={} put_id=({},{}) err={}",
                         req.key,
                         put_id.0,
                         put_id.1,
@@ -2213,46 +2189,9 @@ impl HandlerForExternalClient for ClientKvApi {
                     .invalidate(&(req.key.clone(), put_id.0, put_id.1));
                 return Ok(ExternalPutCommitResp::from_error(&err));
             }
-        }
-        let remember_local_snapshot = !req.write_through || !req.remote_target;
-        let enqueue_write_back_append = !req.write_through && req.remote_target;
-        let preferred_sub_cluster = pending_ctx
-            .as_ref()
-            .and_then(|ctx| ctx.preferred_sub_cluster.clone());
-
-        let end_started_at = Instant::now();
-        let publish_local_cache = remember_local_snapshot;
-        let local_cache_publish = if publish_local_cache {
-            match local_committed_cache_publish(
-                "external_put_commit",
-                &req.key,
-                put_id,
-                pending_ctx.as_ref(),
-                req.src_offset,
-                req.len,
-            ) {
-                Ok(publish) => Some(publish),
-                Err(err) => {
-                    if let Err(revoke_err) = inner.put_revoke(&req.key, put_id).await {
-                        tracing::warn!(
-                            "external_put_commit put_revoke failed after local cache publish precheck error: key={} put_id=({},{}) err={}",
-                            req.key,
-                            put_id.0,
-                            put_id.1,
-                            revoke_err
-                        );
-                    }
-                    inner
-                        .external_pending_puts
-                        .invalidate(&(req.key.clone(), put_id.0, put_id.1));
-                    return Ok(ExternalPutCommitResp::from_error(&err));
-                }
-            }
-        } else {
-            None
         };
         let put_end = match inner
-            .put_end_with_local_cache_publish(&req.key, put_id, req.lease_id, publish_local_cache)
+            .put_end_with_local_cache_publish(&req.key, put_id, req.lease_id, true)
             .await
         {
             Ok(end) => end,
@@ -2265,46 +2204,43 @@ impl HandlerForExternalClient for ClientKvApi {
         };
         let put_end_stats = put_end.stats;
         let put_end_total_us = duration_to_i64_us(end_started_at.elapsed());
-        if publish_local_cache {
-            let Some(holder_id) = put_end.local_cache_holder_id else {
-                let err = KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "external_put_commit missing local cache holder after local commit: key={} put_id=({},{})",
-                        req.key, put_id.0, put_id.1
-                    ),
-                });
-                inner
-                    .external_pending_puts
-                    .invalidate(&(req.key.clone(), put_id.0, put_id.1));
-                return Ok(ExternalPutCommitResp::from_error(&err));
-            };
-            let publish = local_cache_publish
-                .as_ref()
-                .expect("publish_local_cache precheck must provide local cache publish info");
+        let Some(holder_id) = put_end.local_cache_holder_id else {
+            let err = KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "external_put_commit missing local cache holder after local commit: key={} put_id=({},{})",
+                    req.key, put_id.0, put_id.1
+                ),
+            });
             inner
-                .install_local_committed_memory_info(
-                    &req.key,
-                    put_id,
-                    publish.src_offset,
-                    publish.len,
-                    holder_id,
-                )
-                .await?;
-        }
+                .external_pending_puts
+                .invalidate(&(req.key.clone(), put_id.0, put_id.1));
+            return Ok(ExternalPutCommitResp::from_error(&err));
+        };
+        inner
+            .install_local_committed_memory_info(
+                &req.key,
+                put_id,
+                local_cache_publish.src_offset,
+                local_cache_publish.len,
+                holder_id,
+            )
+            .await?;
         inner
             .external_pending_puts
             .invalidate(&(req.key.clone(), put_id.0, put_id.1));
-        if enqueue_write_back_append {
+        if admitted_replica_task && replica_target.is_some() {
             if let Err(err) = inner
-                .enqueue_write_back_remote_append(
+                .make_replica_task(
                     &req.key,
                     put_id,
-                    preferred_sub_cluster.as_deref(),
+                    replica_target
+                        .clone()
+                        .expect("make_replica_task requires pre-reserved replica target"),
                 )
                 .await
             {
                 tracing::warn!(
-                    "write-back external_put_commit enqueue failed after local commit: key={} put_id=({},{}) err={}",
+                    "external_put_commit make replica task failed after local commit: key={} put_id=({},{}) err={}",
                     req.key,
                     put_id.0,
                     put_id.1,
@@ -2354,11 +2290,9 @@ impl HandlerForExternalClient for ClientKvApi {
             key: String,
             put_id: crate::master_kv_router::put::PutIDForAKey,
             lease_id: Option<u64>,
-            remember_local_snapshot: bool,
-            publish_local_cache: bool,
-            local_cache_publish: Option<LocalCommittedCachePublish>,
-            enqueue_write_back_append: bool,
-            preferred_sub_cluster: Option<String>,
+            local_cache_publish: LocalCommittedCachePublish,
+            make_replica_task: bool,
+            replica_target: Option<ReplicaTaskTarget>,
         }
 
         let mut results: Vec<Option<ExternalBatchPutCommitItemResp>> =
@@ -2384,14 +2318,98 @@ impl HandlerForExternalClient for ClientKvApi {
                 .get(&(item.key.clone(), put_id.0, put_id.1))
                 .map(|ctx| ctx.clone());
             if let Some(ctx) = pending_ctx.as_ref() {
-                let has_remote_append = ctx.peer_id.is_some();
-                if item.remote_target != has_remote_append {
-                    let err = KvError::Api(ApiError::InvalidArgument {
-                        detail: format!(
-                            "external_batch_put_commit remote_target mismatches pending ctx: key={} put_id=({},{}) req_remote_target={} ctx_remote_target={}",
-                            item.key, put_id.0, put_id.1, item.remote_target, has_remote_append
-                        ),
-                    });
+                if ctx.local_reserve_slot.is_some() {
+                    if item.remote_target {
+                        let err = KvError::Api(ApiError::InvalidArgument {
+                            detail: format!(
+                                "external_batch_put_commit local-first item must be local target: key={} put_id=({},{})",
+                                item.key, put_id.0, put_id.1
+                            ),
+                        });
+                        results[idx] = Some(ExternalBatchPutCommitItemResp::from_error(&err));
+                        inner.external_pending_puts.invalidate(&(
+                            item.key.clone(),
+                            put_id.0,
+                            put_id.1,
+                        ));
+                        inner.release_external_local_first_put_key(&item.key);
+                        continue;
+                    }
+                    match commit_external_local_first_pending(
+                        inner,
+                        &item.key,
+                        put_id,
+                        ctx,
+                        item.src_offset,
+                        item.len,
+                        "external_batch_put_commit",
+                    )
+                    .await
+                    {
+                        Ok(committed_slot) => {
+                            inner.record_put_locality(false, item.len, 0);
+                            inner.external_pending_puts.invalidate(&(
+                                item.key.clone(),
+                                put_id.0,
+                                put_id.1,
+                            ));
+                            inner.release_external_local_first_put_key(&item.key);
+                            spawn_external_local_first_publish(
+                                inner,
+                                item.key.clone(),
+                                put_id,
+                                item.lease_id,
+                                committed_slot,
+                            );
+                            results[idx] = Some(ExternalBatchPutCommitItemResp {
+                                error_code: OK,
+                                error_json: String::new(),
+                            });
+                        }
+                        Err(err) => {
+                            inner.external_pending_puts.invalidate(&(
+                                item.key.clone(),
+                                put_id.0,
+                                put_id.1,
+                            ));
+                            inner.release_external_local_first_put_key(&item.key);
+                            results[idx] = Some(ExternalBatchPutCommitItemResp::from_error(&err));
+                        }
+                    }
+                    continue;
+                }
+            }
+            let has_remote_append = pending_ctx
+                .as_ref()
+                .and_then(|ctx| ctx.peer_id.as_ref())
+                .is_some();
+            if item.remote_target || has_remote_append {
+                let err = KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "external_batch_put_commit remote primary target is no longer supported: key={} put_id=({},{}) req_remote_target={} ctx_remote_target={}",
+                        item.key, put_id.0, put_id.1, item.remote_target, has_remote_append
+                    ),
+                });
+                results[idx] = Some(ExternalBatchPutCommitItemResp::from_error(&err));
+                revoke_pending.push(BatchPutRevokeItemReq {
+                    key: item.key.clone(),
+                    put_id,
+                });
+                inner
+                    .external_pending_puts
+                    .invalidate(&(item.key.clone(), put_id.0, put_id.1));
+                continue;
+            };
+            let local_cache_publish = match local_committed_cache_publish(
+                "external_batch_put_commit",
+                &item.key,
+                put_id,
+                pending_ctx.as_ref(),
+                item.src_offset,
+                item.len,
+            ) {
+                Ok(publish) => publish,
+                Err(err) => {
                     results[idx] = Some(ExternalBatchPutCommitItemResp::from_error(&err));
                     revoke_pending.push(BatchPutRevokeItemReq {
                         key: item.key.clone(),
@@ -2402,49 +2420,20 @@ impl HandlerForExternalClient for ClientKvApi {
                         .invalidate(&(item.key.clone(), put_id.0, put_id.1));
                     continue;
                 }
-            }
-            let remember_local_snapshot = !item.write_through || !item.remote_target;
-            let publish_local_cache = remember_local_snapshot;
-            let local_cache_publish = if publish_local_cache {
-                match local_committed_cache_publish(
-                    "external_batch_put_commit",
-                    &item.key,
-                    put_id,
-                    pending_ctx.as_ref(),
-                    item.src_offset,
-                    item.len,
-                ) {
-                    Ok(publish) => Some(publish),
-                    Err(err) => {
-                        results[idx] = Some(ExternalBatchPutCommitItemResp::from_error(&err));
-                        revoke_pending.push(BatchPutRevokeItemReq {
-                            key: item.key.clone(),
-                            put_id,
-                        });
-                        inner.external_pending_puts.invalidate(&(
-                            item.key.clone(),
-                            put_id.0,
-                            put_id.1,
-                        ));
-                        continue;
-                    }
-                }
-            } else {
-                None
             };
-            let preferred_sub_cluster = pending_ctx
-                .as_ref()
-                .and_then(|ctx| ctx.preferred_sub_cluster.clone());
             done_pending.push(DonePending {
                 idx,
                 key: item.key.clone(),
                 put_id,
                 lease_id: item.lease_id,
-                remember_local_snapshot,
-                publish_local_cache,
                 local_cache_publish,
-                enqueue_write_back_append: !item.write_through && item.remote_target,
-                preferred_sub_cluster,
+                make_replica_task: pending_ctx
+                    .as_ref()
+                    .map(|ctx| ctx.make_replica_task)
+                    .unwrap_or(false),
+                replica_target: pending_ctx
+                    .as_ref()
+                    .and_then(|ctx| ctx.replica_target.clone()),
             });
         }
 
@@ -2493,7 +2482,7 @@ impl HandlerForExternalClient for ClientKvApi {
                         put_id: pending.put_id,
                         lease_id: pending.lease_id,
                         committed_slot: None,
-                        publish_local_cache: pending.publish_local_cache,
+                        publish_local_cache: true,
                     })
                     .collect(),
             )
@@ -2521,42 +2510,34 @@ impl HandlerForExternalClient for ClientKvApi {
                 results[pending.idx] = Some(ExternalBatchPutCommitItemResp::from_error(&err));
                 continue;
             }
-            if pending.publish_local_cache {
-                let Some(holder_id) = done_item.local_cache_holder_id else {
-                    return Err(KvError::Api(ApiError::Unknown {
-                        detail: format!(
-                            "external_batch_put_commit missing local cache holder after local commit: key={} put_id=({},{})",
-                            pending.key, pending.put_id.0, pending.put_id.1
-                        ),
-                    }));
-                };
-                let publish = pending
-                    .local_cache_publish
-                    .as_ref()
-                    .expect("publish_local_cache precheck must provide local cache publish info");
-                inner
-                    .install_local_committed_memory_info(
-                        &pending.key,
-                        pending.put_id,
-                        publish.src_offset,
-                        publish.len,
-                        holder_id,
-                    )
-                    .await?;
-            } else if pending.remember_local_snapshot {
-                inner.remember_local_snapshot(&pending.key, pending.put_id);
-            }
-            if pending.enqueue_write_back_append {
+            let Some(holder_id) = done_item.local_cache_holder_id else {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "external_batch_put_commit missing local cache holder after local commit: key={} put_id=({},{})",
+                        pending.key, pending.put_id.0, pending.put_id.1
+                    ),
+                }));
+            };
+            inner
+                .install_local_committed_memory_info(
+                    &pending.key,
+                    pending.put_id,
+                    pending.local_cache_publish.src_offset,
+                    pending.local_cache_publish.len,
+                    holder_id,
+                )
+                .await?;
+            if pending.make_replica_task {
+                let target = pending
+                    .replica_target
+                    .clone()
+                    .expect("make_replica_task requires pre-reserved replica target");
                 if let Err(err) = inner
-                    .enqueue_write_back_remote_append(
-                        &pending.key,
-                        pending.put_id,
-                        pending.preferred_sub_cluster.as_deref(),
-                    )
+                    .make_replica_task(&pending.key, pending.put_id, target)
                     .await
                 {
                     tracing::warn!(
-                        "external_batch_put_commit write-back enqueue failed after local commit: key={} put_id=({},{}) err={}",
+                        "external_batch_put_commit make replica task failed after local commit: key={} put_id=({},{}) err={}",
                         pending.key,
                         pending.put_id.0,
                         pending.put_id.1,
@@ -2602,9 +2583,32 @@ impl HandlerForExternalClient for ClientKvApi {
             );
             return Ok(ExternalPutRevokeResp::from_error(&err));
         };
+        let pending_ctx = inner
+            .external_pending_puts
+            .get(&(req.key.clone(), put_id.0, put_id.1))
+            .map(|ctx| ctx.clone());
         inner
             .external_pending_puts
             .invalidate(&(req.key.clone(), put_id.0, put_id.1));
+        if let Some(ctx) = pending_ctx {
+            if let (Some(slot_ref), Some(slot_size)) =
+                (ctx.local_reserve_slot, ctx.local_reserve_slot_size)
+            {
+                inner.release_external_local_first_put_key(&req.key);
+                let lease = client_kv_api::OwnerLocalReserveSlotLease {
+                    value_len: ctx.len,
+                    slot_size,
+                    slots: vec![slot_ref],
+                };
+                return match inner.owner_release_local_reserve_slot_lease(lease).await {
+                    Ok(_) => Ok(ExternalPutRevokeResp {
+                        error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
+                        error_json: String::new(),
+                    }),
+                    Err(e) => Ok(ExternalPutRevokeResp::from_error(&e)),
+                };
+            }
+        }
         match inner.put_revoke(&req.key, put_id).await {
             Ok(_) => Ok(ExternalPutRevokeResp {
                 error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,

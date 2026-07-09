@@ -58,8 +58,8 @@ use crate::external_client_api::ExternalClientApiViewTrait;
 use crate::master_kv_router::MasterKvRouterAccessTrait;
 use crate::master_kv_router::MasterKvRouterView;
 use crate::master_kv_router::MasterKvRouterViewTrait;
-use crate::master_lease_manager::master_lease_manager::MasterLeaseManagerNewArg;
 use crate::master_lease_manager::MasterLeaseManager;
+use crate::master_lease_manager::master_lease_manager::MasterLeaseManagerNewArg;
 use crate::master_lease_manager::{
     MasterLeaseManagerAccessTrait, MasterLeaseManagerView, MasterLeaseManagerViewTrait,
 };
@@ -80,21 +80,21 @@ use client_seg_pool::{ClientSegPool, ClientSegPoolNewArg};
 use client_transfer_engine::ClientTransferEngine;
 use cluster_manager::{ClusterManager, ClusterManagerNewArg, ClusterManagerRdmaControlInit};
 use config::{
-    normalize_etcd_addresses, ClientConfig, ClientConfigYaml, ContributeToClusterPoolSize,
-    FluxonKvSpec, MasterConfig, MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole,
-    TestSpecConfig, TestSpecTransportMode, TransferEngineType,
+    ClientConfig, ClientConfigYaml, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig,
+    MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole, TestSpecConfig,
+    TestSpecTransportMode, TransferEngineType, normalize_etcd_addresses,
 };
 use external_client_api::{ExternalClientApi, ExternalClientApiNewArg};
 use fluxon_commu::TransferBackendActivationMode;
 use fluxon_framework::LogicalModule;
-use fluxon_framework::{define_framework, AnyResult};
+use fluxon_framework::{AnyResult, define_framework};
 use master_kv_router::{MasterKvRouter, MasterKvRouterNewArg};
 use master_seg_manager::MasterSegManager;
 use metric_reporter::{
-    register_greptime_otlp_log_proxy_rpc, serialize_master_observe_broadcast,
-    wait_master_observe_broadcast, MetricReporter, MetricReporterAccessTrait, MetricReporterNewArg,
+    META_KEY_KV_OBSERVE_BROADCAST, MetricReporter, MetricReporterAccessTrait, MetricReporterNewArg,
     MetricReporterView, MetricReporterViewTrait, ObserveProxyCaller, ObserveProxyPicker,
-    META_KEY_KV_OBSERVE_BROADCAST,
+    register_greptime_otlp_log_proxy_rpc, serialize_master_observe_broadcast,
+    wait_master_observe_broadcast,
 };
 use p2p::p2p_module::{P2pModule, P2pModuleNewArg, P2pTcpThreadTransportTuning};
 use sha2::{Digest, Sha256};
@@ -1521,6 +1521,7 @@ async fn run_master_impl(
         master_seg_manager_arg: MasterSegManagerNewArg,
         master_kv_router_arg: MasterKvRouterNewArg {
             test_spec_config: config.test_spec_config.clone(),
+            replica_task_placement: config.replica_task_placement.clone(),
         },
         metric_reporter_arg: MetricReporterNewArg {
             test_spec_config: config.test_spec_config.clone(),

@@ -49,12 +49,14 @@ async fn test1_lease_expire_removes_keys() {
     tracing::info!("[test1-verify-present-during-ttl] verifying keys exist within TTL window");
     for _ in 0..3 {
         for k in &keys {
-            assert!(client_view
-                .client_kv_api()
-                .inner()
-                .is_exist(k)
-                .await
-                .unwrap());
+            assert!(
+                client_view
+                    .client_kv_api()
+                    .inner()
+                    .is_exist(k)
+                    .await
+                    .unwrap()
+            );
         }
         sleep(Duration::from_millis(500)).await;
     }
@@ -120,12 +122,14 @@ async fn test2_rebind_to_new_lease_preserves_until_new_expire() {
     // After l1 expiry, keys should still exist due to l2
     sleep(Duration::from_secs(3)).await;
     for k in &keys {
-        assert!(client_view
-            .client_kv_api()
-            .inner()
-            .is_exist(k)
-            .await
-            .unwrap());
+        assert!(
+            client_view
+                .client_kv_api()
+                .inner()
+                .is_exist(k)
+                .await
+                .unwrap()
+        );
     }
     tracing::info!(
         "[test2-verify-still-present-after-first-expire] keys still exist after first lease expired, held by second lease"
@@ -192,12 +196,14 @@ async fn test3_keepalive() {
             .await
             .unwrap();
         for k in &keys {
-            assert!(client_view
-                .client_kv_api()
-                .inner()
-                .is_exist(k)
-                .await
-                .unwrap());
+            assert!(
+                client_view
+                    .client_kv_api()
+                    .inner()
+                    .is_exist(k)
+                    .await
+                    .unwrap()
+            );
         }
         if i % 2 == 0 {
             tracing::info!(
@@ -211,12 +217,14 @@ async fn test3_keepalive() {
     // Stop keepalive, wait beyond TTL
     sleep(Duration::from_secs(3)).await;
     for k in &keys {
-        assert!(!client_view
-            .client_kv_api()
-            .inner()
-            .is_exist(k)
-            .await
-            .unwrap());
+        assert!(
+            !client_view
+                .client_kv_api()
+                .inner()
+                .is_exist(k)
+                .await
+                .unwrap()
+        );
     }
     tracing::info!(
         "[test3-stop-keepalive-wait-verify-missing] verified keys removed after stopping keepalive and waiting past TTL"
@@ -259,12 +267,14 @@ async fn test4_delete_under_lease_then_get_fails() {
     }
     sleep(Duration::from_secs(2)).await;
     for k in &keys {
-        assert!(!client_view
-            .client_kv_api()
-            .inner()
-            .is_exist(k)
-            .await
-            .unwrap());
+        assert!(
+            !client_view
+                .client_kv_api()
+                .inner()
+                .is_exist(k)
+                .await
+                .unwrap()
+        );
     }
     tracing::info!(
         "[test4-delete-keys-sleep-2s-verify-missing] deleted keys and verified not exist after delay"

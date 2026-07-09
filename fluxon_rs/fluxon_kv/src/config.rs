@@ -483,6 +483,193 @@ pub const DEFAULT_OTLP_LOG_FLUSH_INTERVAL_MS: u64 = 2000;
 pub const DEFAULT_OTLP_LOG_MAX_BATCH_LINES: usize = 2000;
 pub const DEFAULT_OTLP_LOG_MAX_QUEUE_LINES: usize = 20000;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicaTaskPlacementPolicyKind {
+    LocalFirst,
+    Random,
+    QueueAware,
+    WeightedRoleAware,
+    BoundedRoleQueueAware,
+    PressureRoleQueueAware,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaTaskPlacementConfigYaml {
+    #[serde(default = "default_replica_task_placement_policy")]
+    pub policy: ReplicaTaskPlacementPolicyKind,
+    #[serde(default = "default_replica_task_active_node_roles")]
+    pub active_node_roles: Vec<String>,
+    #[serde(default = "default_replica_task_remote_only_node_roles")]
+    pub remote_only_node_roles: Vec<String>,
+    #[serde(default = "default_replica_task_restrict_to_remote_only_node_roles")]
+    pub restrict_to_remote_only_node_roles: bool,
+    #[serde(default = "default_replica_task_remote_only_shard_weight")]
+    pub remote_only_shard_weight: f64,
+    #[serde(default = "default_replica_task_role_queue_window_ms")]
+    pub role_queue_window_ms: f64,
+    #[serde(default = "default_replica_task_role_pressure_gap_ms")]
+    pub role_pressure_gap_ms: f64,
+    #[serde(default = "default_replica_task_role_fabric_guard_ms")]
+    pub role_fabric_guard_ms: f64,
+    #[serde(default = "default_replica_task_role_max_shard_imbalance")]
+    pub role_max_shard_imbalance: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplicaTaskPlacementConfig {
+    pub policy: ReplicaTaskPlacementPolicyKind,
+    pub active_node_roles: Vec<String>,
+    pub remote_only_node_roles: Vec<String>,
+    pub restrict_to_remote_only_node_roles: bool,
+    pub remote_only_shard_weight: f64,
+    pub role_queue_window_ms: f64,
+    pub role_pressure_gap_ms: f64,
+    pub role_fabric_guard_ms: f64,
+    pub role_max_shard_imbalance: f64,
+}
+
+fn default_replica_task_placement_policy() -> ReplicaTaskPlacementPolicyKind {
+    ReplicaTaskPlacementPolicyKind::LocalFirst
+}
+
+fn default_replica_task_active_node_roles() -> Vec<String> {
+    vec!["prefill".to_string(), "decode".to_string()]
+}
+
+fn default_replica_task_remote_only_node_roles() -> Vec<String> {
+    vec!["remote_cache".to_string()]
+}
+
+fn default_replica_task_restrict_to_remote_only_node_roles() -> bool {
+    true
+}
+
+fn default_replica_task_remote_only_shard_weight() -> f64 {
+    1.02
+}
+
+fn default_replica_task_role_queue_window_ms() -> f64 {
+    1.0
+}
+
+fn default_replica_task_role_pressure_gap_ms() -> f64 {
+    0.5
+}
+
+fn default_replica_task_role_fabric_guard_ms() -> f64 {
+    50.0
+}
+
+fn default_replica_task_role_max_shard_imbalance() -> f64 {
+    1.30
+}
+
+impl Default for ReplicaTaskPlacementConfigYaml {
+    fn default() -> Self {
+        Self {
+            policy: default_replica_task_placement_policy(),
+            active_node_roles: default_replica_task_active_node_roles(),
+            remote_only_node_roles: default_replica_task_remote_only_node_roles(),
+            restrict_to_remote_only_node_roles:
+                default_replica_task_restrict_to_remote_only_node_roles(),
+            remote_only_shard_weight: default_replica_task_remote_only_shard_weight(),
+            role_queue_window_ms: default_replica_task_role_queue_window_ms(),
+            role_pressure_gap_ms: default_replica_task_role_pressure_gap_ms(),
+            role_fabric_guard_ms: default_replica_task_role_fabric_guard_ms(),
+            role_max_shard_imbalance: default_replica_task_role_max_shard_imbalance(),
+        }
+    }
+}
+
+impl Default for ReplicaTaskPlacementConfig {
+    fn default() -> Self {
+        ReplicaTaskPlacementConfigYaml::default()
+            .verify()
+            .expect("default replica_task_placement config must be valid")
+    }
+}
+
+fn normalize_role_list(raw_roles: Vec<String>, field_name: &str) -> KvResult<Vec<String>> {
+    let mut deduped = std::collections::BTreeSet::new();
+    for (idx, raw) in raw_roles.into_iter().enumerate() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: format!("{field_name}[{idx}] must be a non-empty string"),
+            }
+            .into_kverror());
+        }
+        deduped.insert(trimmed.to_string());
+    }
+    if deduped.is_empty() {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: format!("{field_name} must contain at least one role"),
+        }
+        .into_kverror());
+    }
+    Ok(deduped.into_iter().collect())
+}
+
+fn verify_finite_nonnegative_f64(value: f64, field_name: &str) -> KvResult<f64> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: format!("{field_name} must be a finite non-negative number"),
+        }
+        .into_kverror());
+    }
+    Ok(value)
+}
+
+impl ReplicaTaskPlacementConfigYaml {
+    pub fn verify(self) -> KvResult<ReplicaTaskPlacementConfig> {
+        let remote_only_shard_weight = self.remote_only_shard_weight;
+        if !remote_only_shard_weight.is_finite() || remote_only_shard_weight <= 0.0 {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "replica_task_placement.remote_only_shard_weight must be a finite positive number"
+                    .to_string(),
+            }
+            .into_kverror());
+        }
+        let role_max_shard_imbalance = self.role_max_shard_imbalance;
+        if !role_max_shard_imbalance.is_finite() || role_max_shard_imbalance < 1.0 {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "replica_task_placement.role_max_shard_imbalance must be finite and >= 1.0"
+                    .to_string(),
+            }
+            .into_kverror());
+        }
+
+        Ok(ReplicaTaskPlacementConfig {
+            policy: self.policy,
+            active_node_roles: normalize_role_list(
+                self.active_node_roles,
+                "replica_task_placement.active_node_roles",
+            )?,
+            remote_only_node_roles: normalize_role_list(
+                self.remote_only_node_roles,
+                "replica_task_placement.remote_only_node_roles",
+            )?,
+            restrict_to_remote_only_node_roles: self.restrict_to_remote_only_node_roles,
+            remote_only_shard_weight,
+            role_queue_window_ms: verify_finite_nonnegative_f64(
+                self.role_queue_window_ms,
+                "replica_task_placement.role_queue_window_ms",
+            )?,
+            role_pressure_gap_ms: verify_finite_nonnegative_f64(
+                self.role_pressure_gap_ms,
+                "replica_task_placement.role_pressure_gap_ms",
+            )?,
+            role_fabric_guard_ms: verify_finite_nonnegative_f64(
+                self.role_fabric_guard_ms,
+                "replica_task_placement.role_fabric_guard_ms",
+            )?,
+            role_max_shard_imbalance,
+        })
+    }
+}
+
 fn verify_otlp_log_api(cfg: &mut GreptimeOtlpLogConfigYaml) -> KvResult<GreptimeOtlpLogConfig> {
     let endpoint = cfg.otlp_endpoint.trim();
     if endpoint.is_empty() || !endpoint.contains("://") {
@@ -578,6 +765,8 @@ pub struct MasterConfigYaml {
     pub log_dir: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub master_ui: Option<MasterUiConfigYaml>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_task_placement: Option<ReplicaTaskPlacementConfigYaml>,
     #[serde(default)]
     pub test_spec_config: TestSpecConfig,
 }
@@ -597,6 +786,7 @@ pub struct MasterConfig {
     pub pprof_duration_seconds: Option<u64>,
     pub log_dir: String,
     pub master_ui: Option<MasterUiConfig>,
+    pub replica_task_placement: ReplicaTaskPlacementConfig,
     pub test_spec_config: TestSpecConfig,
 }
 
@@ -1531,6 +1721,11 @@ impl MasterConfigYaml {
             None => None,
         };
 
+        let replica_task_placement = match self.replica_task_placement {
+            Some(cfg) => cfg.verify()?,
+            None => ReplicaTaskPlacementConfig::default(),
+        };
+
         let mut test_spec_config = self.test_spec_config;
         let transport_mode_was_explicit = test_spec_config.transport_mode.is_some();
         let normalized_rdma_device_names = normalize_test_spec_rdma_device_names(
@@ -1567,6 +1762,7 @@ impl MasterConfigYaml {
             network,
             log_dir: self.log_dir,
             master_ui,
+            replica_task_placement,
             test_spec_config,
         })
     }
@@ -1782,8 +1978,8 @@ test_spec_config:
     }
 
     #[test]
-    fn client_test_spec_config_implicit_transport_mode_with_rdma_device_names_defaults_to_transfer_with_rpc(
-    ) {
+    fn client_test_spec_config_implicit_transport_mode_with_rdma_device_names_defaults_to_transfer_with_rpc()
+     {
         let cfg = ClientConfigYaml::from_str(
             r#"
 instance_key: test_owner
@@ -1848,8 +2044,8 @@ test_spec_config:
     }
 
     #[test]
-    fn client_test_spec_config_rejects_transfer_rpc_fast_path_ready_timeout_without_explicit_rdma_device_names(
-    ) {
+    fn client_test_spec_config_rejects_transfer_rpc_fast_path_ready_timeout_without_explicit_rdma_device_names()
+     {
         let cfg = ClientConfigYaml::from_str(
             r#"
 instance_key: test_owner
@@ -1893,9 +2089,10 @@ test_spec_config:
         )
         .unwrap();
         let err = cfg.verify().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("test_spec_config.tcp_thread_control_lane_count must be in [1, 8]"));
+        assert!(
+            err.to_string()
+                .contains("test_spec_config.tcp_thread_control_lane_count must be in [1, 8]")
+        );
     }
 
     #[test]
@@ -2242,6 +2439,76 @@ test_spec_config:
             Some("mlx5_0,mlx5_4".to_string())
         );
         assert!(verified.enable_transfer_rpc_fast_path);
+    }
+
+    #[test]
+    fn master_config_accepts_replica_task_placement_policy() {
+        let cfg = MasterConfigYaml::from_str(
+            r#"
+instance_key: test_master
+cluster_name: test_cluster
+port: 18080
+etcd_endpoints: ["127.0.0.1:2379"]
+network:
+  subnet_whitelist: ["127.0.0.0/8"]
+monitoring:
+  prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
+log_dir: /tmp/test_master_logs
+replica_task_placement:
+  policy: bounded_role_queue_aware
+  active_node_roles: [" decode ", "prefill", "decode"]
+  remote_only_node_roles: ["remote_cache", " mem_only "]
+  restrict_to_remote_only_node_roles: true
+  remote_only_shard_weight: 1.08
+  role_queue_window_ms: 2.5
+  role_pressure_gap_ms: 0.75
+  role_fabric_guard_ms: 40.0
+  role_max_shard_imbalance: 1.5
+"#,
+        )
+        .unwrap();
+        let verified = cfg.verify().unwrap();
+        assert_eq!(
+            verified.replica_task_placement.policy,
+            ReplicaTaskPlacementPolicyKind::BoundedRoleQueueAware
+        );
+        assert_eq!(
+            verified.replica_task_placement.active_node_roles,
+            vec!["decode".to_string(), "prefill".to_string()]
+        );
+        assert_eq!(
+            verified.replica_task_placement.remote_only_node_roles,
+            vec!["mem_only".to_string(), "remote_cache".to_string()]
+        );
+        assert!(
+            verified
+                .replica_task_placement
+                .restrict_to_remote_only_node_roles
+        );
+        assert_eq!(verified.replica_task_placement.role_queue_window_ms, 2.5);
+    }
+
+    #[test]
+    fn master_config_rejects_invalid_replica_task_placement_weight() {
+        let cfg = MasterConfigYaml::from_str(
+            r#"
+instance_key: test_master
+cluster_name: test_cluster
+port: 18080
+etcd_endpoints: ["127.0.0.1:2379"]
+network:
+  subnet_whitelist: ["127.0.0.0/8"]
+monitoring:
+  prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
+log_dir: /tmp/test_master_logs
+replica_task_placement:
+  policy: weighted_role_aware
+  remote_only_shard_weight: 0.0
+"#,
+        )
+        .unwrap();
+        let err = cfg.verify().unwrap_err();
+        assert!(format!("{err}").contains("remote_only_shard_weight"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use super::{
+    InflightGetInfo, KvRouteInfo, MasterKvRouterView, NodeValueReplicaDesc, OwnerHoldingGetInfo,
     msg_pack::{
         BatchGetDoneItemResp, BatchGetDoneReq, BatchGetDoneResp, BatchGetRevokeItemResp,
         BatchGetRevokeReq, BatchGetRevokeResp, BatchGetStartItemResp, BatchGetStartReq,
@@ -7,25 +8,24 @@ use super::{
         GetStartResp, MemHolderKeepAliveReq, MemHolderKeepAliveResp, MemHolderReleaseReq,
         MemHolderReleaseResp,
     },
-    InflightGetInfo, KvRouteInfo, MasterKvRouterView, NodeValueReplicaDesc, OwnerHoldingGetInfo,
 };
-use crate::master_kv_router::put::PutIDForAKey;
 use crate::master_kv_router::OneKvNodesRoutes;
+use crate::master_kv_router::put::PutIDForAKey;
 use crate::memholder::MemholderManagerTrait;
 use crate::{
     cluster_manager::NodeID,
-    master_seg_manager::{one_seg_allocator::Allocation, MasterSegManagerAccessTrait},
+    master_seg_manager::{MasterSegManagerAccessTrait, one_seg_allocator::Allocation},
     p2p::msg_pack::MsgPack,
     rpcresp_kvresult_convert::msg_and_error::{self, kv},
 };
 use dashmap::DashMap;
 use limit_thirdparty::tokio;
-use rand::seq::SliceRandom;
 use rand::Rng;
+use rand::seq::SliceRandom;
 use std::collections::HashSet;
 use std::{
     collections::HashMap,
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc, atomic::Ordering},
 };
 
 fn update_moka_for_node(

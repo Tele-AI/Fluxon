@@ -382,7 +382,7 @@ pub struct PutStartReq {
     pub len: u64,
     pub reject_if_inflight_same_key: bool,
     pub reject_if_exist_same_key: bool,
-    pub write_through: bool,
+    pub make_replica_task: bool,
     /// Prefer placing the target allocation on any kvclient within this sub_cluster.
     pub preferred_sub_cluster: Option<String>,
     /// Optional source-node override for side-transfer workers that share an owner's mmap.
@@ -393,6 +393,14 @@ impl MsgPackSerializePart for PutStartReq {
         MsgId::PutStartReq as u32
     }
 }
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct PutReplicaTarget {
+    pub node_id: NodeIDString,
+    pub target_addr: u64,
+    pub target_base_addr: u64,
+    pub len: u64,
+}
+
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct PutStartResp {
     pub put_id: PutIDForAKey,
@@ -408,6 +416,7 @@ pub struct PutStartResp {
     pub error_json: String,
     /// Server-side processing time in microseconds for this RPC handler
     pub server_process_us: i64,
+    pub replica_target: Option<PutReplicaTarget>,
 }
 impl MsgPackSerializePart for PutStartResp {
     fn msg_id(&self) -> u32 {
@@ -492,7 +501,7 @@ pub struct BatchPutStartItemReq {
     pub len: u64,
     pub reject_if_inflight_same_key: bool,
     pub reject_if_exist_same_key: bool,
-    pub write_through: bool,
+    pub make_replica_task: bool,
     pub preferred_sub_cluster: Option<String>,
 }
 
@@ -517,6 +526,7 @@ pub struct BatchPutStartItemResp {
     pub len: u64,
     pub error_code: ErrorCode,
     pub error_json: String,
+    pub replica_target: Option<PutReplicaTarget>,
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]

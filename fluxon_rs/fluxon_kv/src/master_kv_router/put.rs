@@ -1,5 +1,9 @@
 use super::NodeValueReplicaDesc;
 use super::{
+    CommittedSlotReplica, InflightPutAllocation, InflightPutCommitInfo, InflightPutInfo,
+    InflightReplicaTaskInfo, KvReplicaBacking, KvRouteInfo, LocalReserveGrantInfo,
+    MasterKvRouterView, OwnerHoldingGetInfo, PreparedPutKeyReservationInfo, PutPlacementMode,
+    ReservedCapacityReason,
     msg_pack::{
         BatchPreparePutKeysReq, BatchPreparePutKeysResp, BatchPutDoneItemResp, BatchPutDoneReq,
         BatchPutDoneResp, BatchPutRevokeItemResp, BatchPutRevokeReq, BatchPutRevokeResp,
@@ -11,22 +15,19 @@ use super::{
         ReserveLocalGrantResp,
     },
     placement::PutPlacementTarget,
-    CommittedSlotReplica, InflightPutAllocation, InflightPutAppendInfo, InflightPutCommitInfo,
-    InflightPutInfo, KvReplicaBacking, KvRouteInfo, LocalReserveGrantInfo, MasterKvRouterView,
-    OwnerHoldingGetInfo, PreparedPutKeyReservationInfo, PutPlacementMode, ReservedCapacityReason,
 };
-use crate::master_kv_router::delete::DeleteKeyInfo;
 use crate::master_kv_router::OneKvNodesRoutes;
+use crate::master_kv_router::delete::DeleteKeyInfo;
 use crate::memholder::MemholderManagerTrait;
 use crate::{
+    OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES,
     cluster_manager::{
-        NodeID, META_KEY_LOCAL_IPC_ROOT, META_KEY_SHARED_STORAGE_NODE_ID,
-        META_KEY_SHARED_STORAGE_NODE_START_TIME,
+        META_KEY_LOCAL_IPC_ROOT, META_KEY_SHARED_STORAGE_NODE_ID,
+        META_KEY_SHARED_STORAGE_NODE_START_TIME, NodeID,
     },
-    master_seg_manager::{one_seg_allocator::Allocation, MasterSegManagerAccessTrait},
+    master_seg_manager::{MasterSegManagerAccessTrait, one_seg_allocator::Allocation},
     p2p::msg_pack::MsgPack,
     rpcresp_kvresult_convert::msg_and_error::{self, kv},
-    OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES,
 };
 use chrono::Utc;
 use limit_thirdparty::tokio;
@@ -35,7 +36,7 @@ use parking_lot::RwLock;
 use rand::seq::SliceRandom;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{atomic::AtomicU32, Arc},
+    sync::{Arc, atomic::AtomicU32},
 };
 
 pub type PutIDForAKey = (u64, u32);
@@ -268,96 +269,6 @@ fn append_current_route_replica_if_matching(
     true
 }
 
-fn choose_remote_append_target(
-    view: &MasterKvRouterView,
-    source_node_id: &NodeID,
-    excluded_nodes: &HashSet<NodeID>,
-    preferred_sub_cluster: Option<&str>,
-    len: u64,
-) -> msg_and_error::KvResult<(NodeID, Allocation)> {
-    let seg_manager = view.master_seg_manager();
-    let mut last_no_space_ctx: Option<(String, String, u64, u64)> = None;
-
-    if let Some(sc) = preferred_sub_cluster {
-        let mut preferred_nodes: Vec<NodeID> = view
-            .cluster_manager()
-            .get_client_members()
-            .into_iter()
-            .filter_map(|m| (m.sub_cluster.as_deref() == Some(sc)).then_some(m.id.into()))
-            .collect();
-        preferred_nodes.retain(|node_id| {
-            node_id.as_ref() != source_node_id.as_ref() && !excluded_nodes.contains(node_id)
-        });
-        preferred_nodes.shuffle(&mut rand::thread_rng());
-        for node_id in preferred_nodes {
-            let node_allocators = seg_manager.get_node_allocators(&node_id);
-            let Some(allocator) = node_allocators.choose(&mut rand::thread_rng()).cloned() else {
-                continue;
-            };
-            let total = allocator.total_size_bytes();
-            let used = allocator.used_size_bytes();
-            let free = total.saturating_sub(used);
-            last_no_space_ctx = Some((
-                node_id.as_ref().to_string(),
-                allocator.seg_device_id.clone(),
-                total,
-                free,
-            ));
-            if let Ok(allocation) = allocator.allocate(len) {
-                return Ok((node_id, allocation));
-            }
-        }
-    }
-
-    let all_segs = seg_manager.get_all_segments_allocator();
-    let mut candidates: Vec<(
-        NodeID,
-        Arc<crate::master_seg_manager::one_seg_allocator::OneSegAllocator>,
-    )> = all_segs
-        .into_iter()
-        .filter_map(|(node_id, allocator)| {
-            let node_id: NodeID = node_id.into();
-            if node_id.as_ref() == source_node_id.as_ref() || excluded_nodes.contains(&node_id) {
-                return None;
-            }
-            Some((node_id, allocator))
-        })
-        .collect();
-    candidates.shuffle(&mut rand::thread_rng());
-    for (node_id, allocator) in candidates {
-        let total = allocator.total_size_bytes();
-        let used = allocator.used_size_bytes();
-        let free = total.saturating_sub(used);
-        last_no_space_ctx = Some((
-            node_id.as_ref().to_string(),
-            allocator.seg_device_id.clone(),
-            total,
-            free,
-        ));
-        if let Ok(allocation) = allocator.allocate(len) {
-            return Ok((node_id, allocation));
-        }
-    }
-
-    Err(
-        if let Some((node, segment, total_capacity, free_capacity)) = last_no_space_ctx {
-            msg_and_error::KvError::Api(msg_and_error::ApiError::NoSpace {
-                node,
-                segment,
-                total_capacity,
-                free_capacity,
-            })
-        } else {
-            msg_and_error::KvError::Api(msg_and_error::ApiError::NoSpace {
-                node: "unknown".to_string(),
-                segment: "unknown".to_string(),
-                total_capacity: 0,
-                free_capacity: 0,
-            })
-        },
-    )
-}
-
 fn allocate_from_node_local_segment(
     view: &MasterKvRouterView,
     node_id: &NodeID,
@@ -404,23 +315,47 @@ fn allocate_from_node_local_segment(
     ))
 }
 
-fn reserve_write_back_remote_append(
+fn reserve_replica_task(
     view: &MasterKvRouterView,
     key: &str,
     put_id: PutIDForAKey,
     source_node_id: &NodeID,
     preferred_sub_cluster: Option<&str>,
     len: u64,
-) -> msg_and_error::KvResult<InflightPutAppendInfo> {
-    let (target_node_id, target_allocation) = choose_remote_append_target(
+) -> msg_and_error::KvResult<InflightReplicaTaskInfo> {
+    reserve_replica_task_excluding(
         view,
+        key,
+        put_id,
         source_node_id,
-        &HashSet::new(),
         preferred_sub_cluster,
         len,
-    )?;
+        &HashSet::new(),
+    )
+}
+
+fn reserve_replica_task_excluding(
+    view: &MasterKvRouterView,
+    key: &str,
+    put_id: PutIDForAKey,
+    source_node_id: &NodeID,
+    preferred_sub_cluster: Option<&str>,
+    len: u64,
+    excluded_nodes: &HashSet<NodeID>,
+) -> msg_and_error::KvResult<InflightReplicaTaskInfo> {
+    let (target_node_id, target_allocation) = view
+        .master_kv_router()
+        .inner()
+        .policy
+        .select_remote_target(
+            view,
+            source_node_id,
+            excluded_nodes,
+            preferred_sub_cluster,
+            len,
+        )?;
     tracing::debug!(
-        "write-back remote append reserved: key={} put_id=({},{}) source_node_id={} target_node_id={} preferred_sub_cluster={:?} len={}",
+        "replica task reserved: key={} put_id=({},{}) source_node_id={} target_node_id={} preferred_sub_cluster={:?} len={}",
         key,
         put_id.0,
         put_id.1,
@@ -429,7 +364,7 @@ fn reserve_write_back_remote_append(
         preferred_sub_cluster,
         len
     );
-    Ok(InflightPutAppendInfo {
+    Ok(InflightReplicaTaskInfo {
         node_id: target_node_id,
         key: key.to_string(),
         put_id,
@@ -437,44 +372,132 @@ fn reserve_write_back_remote_append(
     })
 }
 
-fn try_reserve_write_back_remote_append(
-    view: &MasterKvRouterView,
-    key: &str,
+async fn publish_completed_put_route(
+    view: MasterKvRouterView,
+    key: String,
     put_id: PutIDForAKey,
-    source_node_id: &NodeID,
-    preferred_sub_cluster: Option<&str>,
-    len: u64,
-) -> msg_and_error::KvResult<Option<InflightPutAppendInfo>> {
-    match reserve_write_back_remote_append(
-        view,
-        key,
-        put_id,
-        source_node_id,
-        preferred_sub_cluster,
-        len,
-    ) {
-        Ok(reserved) => Ok(Some(reserved)),
-        Err(msg_and_error::KvError::Api(msg_and_error::ApiError::NoSpace {
-            node,
-            segment,
-            total_capacity,
-            free_capacity,
-        })) => {
-            tracing::info!(
-                "write-back remote append not scheduled; fallback to local-only commit: key={} put_id=({},{}) source_node_id={} preferred_sub_cluster={:?} node={} segment={} total_capacity={} free_capacity={}",
-                key,
-                put_id.0,
-                put_id.1,
-                source_node_id,
-                preferred_sub_cluster,
-                node,
-                segment,
-                total_capacity,
-                free_capacity
-            );
-            Ok(None)
+    lease_id_opt: Option<u64>,
+    node_id: NodeID,
+    completed_info: KvRouteInfo,
+    target_cap_bytes: u64,
+    local_cache_holder_id: Option<u64>,
+) -> MsgPack<PutDoneResp> {
+    let saturated_weight_u32 = if target_cap_bytes > u32::MAX as u64 {
+        tracing::warn!(
+            "moka weight saturation: key={} put_id=({},{}) cap={}B exceeds u32::MAX; weight set to u32::MAX",
+            key,
+            put_id.0,
+            put_id.1,
+            target_cap_bytes
+        );
+        u32::MAX
+    } else {
+        target_cap_bytes as u32
+    };
+
+    let mut old_one_kv_routes: Option<Arc<OneKvNodesRoutes>> = None;
+    let mut inserted = false;
+    {
+        let mut one_kv_routes = view
+            .master_kv_router()
+            .inner()
+            .kv_routes
+            .entry(key.clone())
+            .or_insert_with(|| {
+                inserted = true;
+                Arc::new(OneKvNodesRoutes {
+                    put_id,
+                    lease_id: lease_id_opt,
+                    nodes_replicas: RwLock::new(HashMap::new()),
+                    get_durable_slots_used: AtomicU32::new(0),
+                })
+            });
+        if !inserted {
+            old_one_kv_routes = Some(one_kv_routes.clone());
+            *one_kv_routes = Arc::new(OneKvNodesRoutes {
+                put_id,
+                lease_id: lease_id_opt,
+                nodes_replicas: RwLock::new(HashMap::new()),
+                get_durable_slots_used: AtomicU32::new(0),
+            });
         }
-        Err(err) => Err(err),
+        one_kv_routes
+            .nodes_replicas
+            .write()
+            .insert(node_id.clone(), completed_info);
+    }
+
+    if let Some(old) = old_one_kv_routes {
+        if let Err(err) = view
+            .master_kv_router()
+            .inner()
+            .delete_broadcast
+            .sender()
+            .send(DeleteKeyInfo::Key {
+                key: key.clone(),
+                nodes_kv_route_info: old,
+            })
+            .await
+        {
+            tracing::warn!("Failed to send delete broadcast: {}", err);
+        }
+    }
+
+    {
+        let view_task = view.clone();
+        let key_for_spawn = key.clone();
+        let node_for_spawn = node_id.clone();
+        let do_prefix_index_update = view.master_kv_router().prefix_index_enabled();
+        let do_cache_insert =
+            lease_id_opt.is_none() && view.master_kv_router().replica_cache_enabled();
+        let cap_bytes_u32 = saturated_weight_u32;
+        view.spawn("post_put_done_maintenance", async move {
+            if do_prefix_index_update {
+                let inner = view_task.master_kv_router().inner();
+                let mut tree = inner.prefix_index.write().await;
+                tree.insert(&key_for_spawn);
+            }
+
+            if do_cache_insert {
+                let cache = view_task
+                    .master_kv_router()
+                    .get_node_cache_controller(&node_for_spawn);
+                if let Some(cache) = cache {
+                    let desc = NodeValueReplicaDesc {
+                        weight_bytes: cap_bytes_u32,
+                        put_id,
+                    };
+                    tracing::debug!("Inserting key: {:?} into cache", key_for_spawn);
+                    cache.insert(key_for_spawn.clone(), desc);
+                    tracing::debug!(
+                        "Inserted key: {:?} into cache, current cache size: {}",
+                        key_for_spawn,
+                        cache.weighted_size()
+                    );
+                } else {
+                    tracing::warn!(
+                        "No cache controller found for node: {}, node is not ready",
+                        node_for_spawn
+                    );
+                }
+            }
+        });
+    }
+
+    tracing::info!(
+        "Completed put operation with put_id: {:?}, key: {:?}",
+        put_id,
+        key
+    );
+
+    MsgPack {
+        serialize_part: PutDoneResp {
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+            server_process_us: 0,
+            local_cache_holder_id,
+        },
+        raw_bytes: Vec::new(),
     }
 }
 
@@ -550,12 +573,12 @@ pub async fn handle_put_start(
     let finalize = |commit_node_id: NodeID,
                     response_node_id: NodeID,
                     inflight_alloc: InflightPutAllocation,
-                    remote_append: Option<InflightPutAppendInfo>,
                     src_addr: u64,
                     target_addr: u64,
                     src_base_addr: u64,
                     target_base_addr: u64,
-                    len: u64| {
+                    len: u64,
+                    replica_target: Option<InflightReplicaTaskInfo>| {
         let info = InflightPutInfo {
             key: key.clone(),
             len,
@@ -563,8 +586,8 @@ pub async fn handle_put_start(
             commit_info: InflightPutCommitInfo {
                 node_id: commit_node_id,
                 src_target_allocation: Arc::new(Mutex::new(Some(inflight_alloc))),
+                replica_target: replica_target.clone(),
             },
-            remote_append,
         };
 
         let view_task = view.clone();
@@ -577,6 +600,19 @@ pub async fn handle_put_start(
                 .insert(inflight_put_key, info)
                 .await;
 
+            let response_replica_target = replica_target.as_ref().map(|target| {
+                let target_allocation_guard = target.target_allocation.lock();
+                let target_allocation = target_allocation_guard.as_ref().expect(
+                    "replica target allocation must exist while building put_start response",
+                );
+                super::msg_pack::PutReplicaTarget {
+                    node_id: target.node_id.clone().into(),
+                    target_addr: target_allocation.base_addr() + target_allocation.addr(),
+                    target_base_addr: target_allocation.base_addr(),
+                    len: target_allocation.size(),
+                }
+            });
+
             let resp = PutStartResp {
                 put_id,
                 node_id: response_node_id.into(),
@@ -588,6 +624,7 @@ pub async fn handle_put_start(
                 error_code: msg_and_error::OK,
                 error_json: String::new(),
                 server_process_us: 0,
+                replica_target: response_replica_target,
             };
 
             (
@@ -600,22 +637,9 @@ pub async fn handle_put_start(
         }
     };
 
-    let put_target = if req.serialize_part.write_through {
-        view.master_kv_router()
-            .inner()
-            .policy
-            .select_put_target(
-                &view,
-                &source_node_id,
-                req.serialize_part.preferred_sub_cluster.as_deref(),
-                req.serialize_part.len,
-            )
-            .await
-    } else {
-        Ok(PutPlacementTarget::Local {
-            node_id: source_node_id.clone(),
-        })
-    };
+    let put_target = Ok(PutPlacementTarget::Local {
+        node_id: source_node_id.clone(),
+    });
 
     match put_target {
         Ok(PutPlacementTarget::Local { node_id }) => {
@@ -653,10 +677,8 @@ pub async fn handle_put_start(
             let src = src_allocation
                 .take()
                 .expect("src_allocation must exist when finalizing local put");
-            let remote_append = if req.serialize_part.write_through {
-                None
-            } else {
-                match try_reserve_write_back_remote_append(
+            let replica_target = if req.serialize_part.make_replica_task {
+                match reserve_replica_task(
                     &view,
                     &key,
                     put_id,
@@ -664,47 +686,57 @@ pub async fn handle_put_start(
                     req.serialize_part.preferred_sub_cluster.as_deref(),
                     req.serialize_part.len,
                 ) {
-                    Ok(reserved) => reserved,
-                    Err(err) => {
-                        let resp: PutStartResp =
-                            crate::rpcresp_kvresult_convert::FromError::from_error(&err);
-                        return (
-                            (0, 0),
-                            MsgPack {
-                                serialize_part: resp,
-                                raw_bytes: Vec::new(),
-                            },
+                    Ok(reservation) => {
+                        view.master_kv_router()
+                            .record_replica_task_target(reservation.node_id.as_ref());
+                        Some(reservation)
+                    }
+                    Err(msg_and_error::KvError::Api(msg_and_error::ApiError::NoSpace {
+                        node,
+                        segment,
+                        total_capacity,
+                        free_capacity,
+                    })) => {
+                        tracing::info!(
+                            "replica task not pre-reserved; local-only commit remains valid: key={} put_id=({},{}) source_node_id={} preferred_sub_cluster={:?} node={} segment={} total_capacity={} free_capacity={}",
+                            key,
+                            put_id.0,
+                            put_id.1,
+                            source_node_id,
+                            req.serialize_part.preferred_sub_cluster,
+                            node,
+                            segment,
+                            total_capacity,
+                            free_capacity
                         );
+                        None
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "replica task pre-reserve failed; local-only commit remains valid: key={} put_id=({},{}) source_node_id={} preferred_sub_cluster={:?} err={}",
+                            key,
+                            put_id.0,
+                            put_id.1,
+                            source_node_id,
+                            req.serialize_part.preferred_sub_cluster,
+                            err
+                        );
+                        None
                     }
                 }
+            } else {
+                None
             };
-            let (response_node_id, response_target_addr, response_target_base_addr, response_len) =
-                if let Some(remote_append) = remote_append.as_ref() {
-                    let target_allocation_guard = remote_append.target_allocation.lock();
-                    let target_allocation = target_allocation_guard
-                        .as_ref()
-                        .expect("reserved remote append allocation must exist during put_start");
-                    let target_base = target_allocation.base_addr();
-                    let target_addr = target_base + target_allocation.addr();
-                    (
-                        remote_append.node_id.clone(),
-                        target_addr,
-                        target_base,
-                        target_allocation.size(),
-                    )
-                } else {
-                    (node_id.clone(), abs, src_base, allocation_size)
-                };
             let fut = finalize(
+                node_id.clone(),
                 node_id,
-                response_node_id,
                 InflightPutAllocation::Local(src),
-                remote_append,
                 abs,
-                response_target_addr,
+                abs,
                 src_base,
-                response_target_base_addr,
-                response_len,
+                src_base,
+                allocation_size,
+                replica_target,
             );
             let result = fut.await;
             key_reservation.disarm();
@@ -754,12 +786,12 @@ pub async fn handle_put_start(
                     src,
                     target: target_allocation,
                 },
-                None,
                 src_base + src_offset,
                 target_base + target_offset,
                 src_base,
                 target_base,
                 allocation_size,
+                None,
             );
             let result = fut.await;
             key_reservation.disarm();
@@ -1057,6 +1089,7 @@ pub async fn handle_put_revoke(
 pub async fn handle_put_done(
     view: MasterKvRouterView,
     req: MsgPack<PutDoneReq>,
+    req_node_id: NodeID,
 ) -> MsgPack<PutDoneResp> {
     tracing::debug!("Handling PutDoneReq: {:?}", req.serialize_part);
 
@@ -1067,10 +1100,7 @@ pub async fn handle_put_done(
 
     // Remove from inflight_puts and store in completed_puts
     if let Some(InflightPutInfo {
-        key,
-        commit_info,
-        remote_append,
-        ..
+        key, commit_info, ..
     }) = view
         .master_kv_router()
         .inner()
@@ -1453,17 +1483,17 @@ pub async fn handle_put_done(
                 .insert(node_id.clone(), completed_info);
         }
 
-        if let Some(remote_append) = remote_append {
+        if let Some(replica_target) = commit_info.replica_target {
             view.master_kv_router()
                 .inner()
-                .inflight_put_appends
+                .inflight_replica_tasks
                 .insert(
                     (
-                        remote_append.key.clone(),
-                        remote_append.put_id.0,
-                        remote_append.put_id.1,
+                        replica_target.key.clone(),
+                        replica_target.put_id.0,
+                        replica_target.put_id.1,
                     ),
-                    remote_append,
+                    replica_target,
                 )
                 .await;
         }
@@ -1541,6 +1571,104 @@ pub async fn handle_put_done(
             key
         );
     } else {
+        if let Some(slot) = req.serialize_part.committed_slot.clone() {
+            let key = req.serialize_part.key.clone();
+            let node_id = req_node_id;
+            let Some(tomb_tag) = view.master_seg_manager().get_node_tomb_tag(&node_id) else {
+                let err = msg_and_error::KvError::Api(
+                    msg_and_error::ApiError::InvalidPutMasterState {
+                        detail: format!(
+                            "local-first put_done node tomb tag missing: key={} put_id=({},{}) node_id={}",
+                            key, put_id.0, put_id.1, node_id
+                        ),
+                    },
+                );
+                return MsgPack {
+                    serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                    raw_bytes: Vec::new(),
+                };
+            };
+            if tomb_tag.is_tomb() {
+                let err =
+                    msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+                        detail: format!(
+                            "local-first put_done node is tomb: key={} put_id=({},{}) node_id={}",
+                            key, put_id.0, put_id.1, node_id
+                        ),
+                    });
+                return MsgPack {
+                    serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                    raw_bytes: Vec::new(),
+                };
+            }
+            if req.serialize_part.publish_local_cache {
+                let err = msg_and_error::KvError::Api(
+                    msg_and_error::ApiError::InvalidPutMasterState {
+                        detail: format!(
+                            "local-first put_done does not support publish_local_cache: key={} put_id=({},{})",
+                            key, put_id.0, put_id.1
+                        ),
+                    },
+                );
+                return MsgPack {
+                    serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                    raw_bytes: Vec::new(),
+                };
+            }
+            let target_cap_bytes = slot.len;
+            if let Some(lease_id) = lease_id_opt {
+                if let Err(e) = view
+                    .master_lease_manager()
+                    .attach_key(lease_id, key.clone(), put_id)
+                    .await
+                {
+                    let kv_err: crate::rpcresp_kvresult_convert::msg_and_error::KvError = e.into();
+                    return MsgPack {
+                        serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(
+                            &kv_err,
+                        ),
+                        raw_bytes: Vec::new(),
+                    };
+                }
+                if let Err(e) = view.master_kv_router().adjust_node_cache_reserved_capacity(
+                    node_id.as_ref(),
+                    ReservedCapacityReason::LeaseBoundKv,
+                    target_cap_bytes as i64,
+                ) {
+                    let kv_err: crate::rpcresp_kvresult_convert::msg_and_error::KvError = e.into();
+                    return MsgPack {
+                        serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(
+                            &kv_err,
+                        ),
+                        raw_bytes: Vec::new(),
+                    };
+                }
+            }
+            let completed_info = KvRouteInfo {
+                node_id: node_id.clone(),
+                backing: KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
+                    owner_node_id: node_id.clone(),
+                    grant_id: slot.grant_id,
+                    slot_index: slot.slot_index,
+                    slot_size: slot.slot_size,
+                    addr: slot.addr,
+                    len: slot.len,
+                    base_addr: slot.base_addr,
+                }),
+                tomb_tag,
+            };
+            return publish_completed_put_route(
+                view,
+                key,
+                put_id,
+                lease_id_opt,
+                node_id,
+                completed_info,
+                target_cap_bytes,
+                None,
+            )
+            .await;
+        }
         tracing::warn!(
             "Put operation with put_id {:?} not found for completion",
             put_id
@@ -1580,7 +1708,7 @@ pub async fn handle_batch_put_start(
                     len: item.len,
                     reject_if_inflight_same_key: item.reject_if_inflight_same_key,
                     reject_if_exist_same_key: item.reject_if_exist_same_key,
-                    write_through: item.write_through,
+                    make_replica_task: item.make_replica_task,
                     preferred_sub_cluster: item.preferred_sub_cluster,
                     source_node_id: None,
                 },
@@ -1600,6 +1728,7 @@ pub async fn handle_batch_put_start(
             len: part.len,
             error_code: part.error_code,
             error_json: part.error_json,
+            replica_target: part.replica_target,
         });
     }
     MsgPack {
@@ -1650,6 +1779,7 @@ pub async fn handle_batch_put_revoke(
 pub async fn handle_batch_put_done(
     view: MasterKvRouterView,
     req: MsgPack<BatchPutDoneReq>,
+    req_node_id: NodeID,
 ) -> MsgPack<BatchPutDoneResp> {
     let mut items = Vec::with_capacity(req.serialize_part.items.len());
     for item in req.serialize_part.items {
@@ -1668,6 +1798,7 @@ pub async fn handle_batch_put_done(
                 },
                 raw_bytes: Vec::new(),
             },
+            req_node_id.clone(),
         )
         .await;
         let part = resp.serialize_part;
@@ -1697,18 +1828,21 @@ pub async fn handle_put_append_start(
 ) -> MsgPack<PutAppendStartResp> {
     let key = req.serialize_part.key.clone();
     let put_id = req.serialize_part.put_id;
-    let current_route_still_needs_remote = view
+    let route_snapshot = view
         .master_kv_router()
         .inner()
         .kv_routes
         .get(&key)
-        .map(|route| current_route_needs_remote_replica(&route, &req_node_id, put_id))
+        .map(|route| route.clone());
+    let current_route_still_needs_remote = route_snapshot
+        .as_ref()
+        .map(|route| current_route_needs_remote_replica(route, &req_node_id, put_id))
         .unwrap_or(false);
     if !current_route_still_needs_remote {
         let _ = view
             .master_kv_router()
             .inner()
-            .inflight_put_appends
+            .inflight_replica_tasks
             .remove(&(key.clone(), put_id.0, put_id.1))
             .await;
         return MsgPack {
@@ -1722,31 +1856,91 @@ pub async fn handle_put_append_start(
         };
     }
 
-    let Some(inflight) = view
+    let append_key = (key.clone(), put_id.0, put_id.1);
+    let inflight = if let Some(existing) = view
         .master_kv_router()
         .inner()
-        .inflight_put_appends
-        .get(&(key.clone(), put_id.0, put_id.1))
+        .inflight_replica_tasks
+        .get(&append_key)
         .await
-    else {
-        let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
-            detail: format!(
-                "Write-back append reservation missing: key={} put_id=({},{}) requester_node_id={}",
-                key, put_id.0, put_id.1, req_node_id
-            ),
-        });
-        let resp: PutAppendStartResp = crate::rpcresp_kvresult_convert::FromError::from_error(&err);
-        return MsgPack {
-            serialize_part: resp,
-            raw_bytes: Vec::new(),
+    {
+        existing
+    } else {
+        let excluded_nodes = route_snapshot
+            .as_ref()
+            .map(|route| {
+                route
+                    .nodes_replicas
+                    .read()
+                    .values()
+                    .filter_map(|replica| {
+                        (!replica.tomb_tag.is_tomb()).then_some(replica.node_id.clone())
+                    })
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let reservation = match reserve_replica_task_excluding(
+            &view,
+            &key,
+            put_id,
+            &req_node_id,
+            req.serialize_part.preferred_sub_cluster.as_deref(),
+            req.serialize_part.len,
+            &excluded_nodes,
+        ) {
+            Ok(reservation) => reservation,
+            Err(msg_and_error::KvError::Api(msg_and_error::ApiError::NoSpace {
+                node,
+                segment,
+                total_capacity,
+                free_capacity,
+            })) => {
+                tracing::info!(
+                    "replica task not scheduled; local-only commit remains valid: key={} put_id=({},{}) source_node_id={} preferred_sub_cluster={:?} node={} segment={} total_capacity={} free_capacity={}",
+                    key,
+                    put_id.0,
+                    put_id.1,
+                    req_node_id,
+                    req.serialize_part.preferred_sub_cluster,
+                    node,
+                    segment,
+                    total_capacity,
+                    free_capacity
+                );
+                return MsgPack {
+                    serialize_part: PutAppendStartResp {
+                        scheduled: false,
+                        error_code: msg_and_error::OK,
+                        error_json: String::new(),
+                        ..Default::default()
+                    },
+                    raw_bytes: Vec::new(),
+                };
+            }
+            Err(err) => {
+                let resp: PutAppendStartResp =
+                    crate::rpcresp_kvresult_convert::FromError::from_error(&err);
+                return MsgPack {
+                    serialize_part: resp,
+                    raw_bytes: Vec::new(),
+                };
+            }
         };
+        view.master_kv_router()
+            .record_replica_task_target(reservation.node_id.as_ref());
+        view.master_kv_router()
+            .inner()
+            .inflight_replica_tasks
+            .insert(append_key.clone(), reservation.clone())
+            .await;
+        reservation
     };
     let (target_base_addr, target_addr, allocation_size) = {
         let target_allocation_guard = inflight.target_allocation.lock();
         let Some(target_allocation): Option<&Allocation> = target_allocation_guard.as_ref() else {
             let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
                 detail: format!(
-                    "Write-back append reservation allocation missing: key={} put_id=({},{}) requester_node_id={}",
+                    "Replica task reservation allocation missing: key={} put_id=({},{}) requester_node_id={}",
                     key, put_id.0, put_id.1, req_node_id
                 ),
             });
@@ -1787,7 +1981,7 @@ pub async fn handle_put_append_revoke(
     let _ = view
         .master_kv_router()
         .inner()
-        .inflight_put_appends
+        .inflight_replica_tasks
         .remove(&(key, put_id.0, put_id.1))
         .await;
     MsgPack {
@@ -1808,7 +2002,7 @@ pub async fn handle_put_append_done(
     let Some(inflight) = view
         .master_kv_router()
         .inner()
-        .inflight_put_appends
+        .inflight_replica_tasks
         .remove(&(key.clone(), put_id.0, put_id.1))
         .await
     else {
@@ -1826,7 +2020,7 @@ pub async fn handle_put_append_done(
     let Some(allocation) = inflight.target_allocation.lock().take() else {
         let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
             detail: format!(
-                "Put append target allocation already taken: key={} put_id=({},{})",
+                "Replica task append target allocation already taken: key={} put_id=({},{})",
                 key, put_id.0, put_id.1
             ),
         });

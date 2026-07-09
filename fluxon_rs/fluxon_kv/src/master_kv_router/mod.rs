@@ -26,7 +26,7 @@ use self::{
         PutAppendRevokeReq, PutAppendStartReq, PutDoneReq, PutRevokeReq, PutStartReq,
         ReleaseLocalGrantReq, ReserveLocalGrantReq,
     },
-    placement::{PlacementDefault, PlacementPolicy},
+    placement::{PlacementPolicy, build_placement_policy},
     put::{
         handle_batch_prepare_put_keys, handle_batch_put_done, handle_batch_put_revoke,
         handle_batch_put_start, handle_batch_release_put_key_reservations, handle_put_append_done,
@@ -34,18 +34,19 @@ use self::{
         handle_put_start, handle_release_local_grant, handle_reserve_local_grant,
     },
 };
+use crate::ClientKvApiAccessTrait;
 use crate::client_kv_api::ClientKvApi;
 use crate::cluster_manager::{
     ClusterEvent, ClusterManager, ClusterManagerAccessTrait, NodeID, NodeIDString,
 };
-use crate::config::TestSpecConfig;
+use crate::config::{ReplicaTaskPlacementConfig, TestSpecConfig};
 use crate::master_kv_router::delete::DeleteKeyInfo;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::master_lease_manager::{MasterLeaseManager, MasterLeaseManagerAccessTrait};
-use crate::master_seg_manager::one_seg_allocator::Allocation;
 use crate::master_seg_manager::MasterSegManager;
 use crate::master_seg_manager::MasterSegManagerAccessTrait;
 use crate::master_seg_manager::NodeTombTag;
+use crate::master_seg_manager::one_seg_allocator::Allocation;
 use crate::memholder::{
     EnsureMemholderMgmtDeleteHandle, MasterOwnerMemMgr, MemholderManagerTrait, NodeHolderKey,
 };
@@ -54,14 +55,13 @@ use crate::p2p::msg_pack::{MsgPack, RPCCaller, RPCHandler};
 use crate::p2p::p2p_module::{P2pModule, P2pModuleAccessTrait};
 use crate::rpcresp_kvresult_convert;
 use crate::rpcresp_kvresult_convert::msg_and_error::{KvError, OK};
-use crate::ClientKvApiAccessTrait;
-use fluxon_framework::{define_module, LogicalModule};
+use fluxon_framework::{LogicalModule, define_module};
 use fluxon_framework_compiled::upgrade_view_guard::UpgradeViewGuard;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use dashmap::DashMap;
-use limit_thirdparty::tokio::sync::{abroadcast, ARwLock};
+use limit_thirdparty::tokio::sync::{ARwLock, abroadcast};
 use limit_thirdparty::tokio::{self, sync::ampsc};
 use moka::notification::RemovalCause;
 use parking_lot::Mutex;
@@ -69,8 +69,8 @@ use parking_lot::RwLock;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
@@ -198,6 +198,7 @@ pub enum InflightPutAllocation {
 pub struct InflightPutCommitInfo {
     pub node_id: NodeID,
     pub src_target_allocation: Arc<Mutex<Option<InflightPutAllocation>>>,
+    pub replica_target: Option<InflightReplicaTaskInfo>,
 }
 
 /// Information about a `put` operation that is currently in progress.
@@ -207,11 +208,10 @@ pub struct InflightPutInfo {
     pub req_node_id: NodeID,
     pub len: u64,
     pub commit_info: InflightPutCommitInfo,
-    pub remote_append: Option<InflightPutAppendInfo>,
 }
 
 #[derive(Clone)]
-pub struct InflightPutAppendInfo {
+pub struct InflightReplicaTaskInfo {
     pub node_id: NodeID,
     pub key: String,
     pub put_id: PutIDForAKey,
@@ -305,6 +305,7 @@ define_module!(
 #[derive(Clone, Debug, Default)]
 pub struct MasterKvRouterNewArg {
     pub test_spec_config: TestSpecConfig,
+    pub replica_task_placement: ReplicaTaskPlacementConfig,
 }
 
 #[derive(Clone)]
@@ -493,10 +494,11 @@ pub struct MasterKvRouterInner {
     view: std::sync::OnceLock<MasterKvRouterView>,
     pub policy: Box<dyn PlacementPolicy>,
     test_spec_config: TestSpecConfig,
+    pub replica_task_placement: ReplicaTaskPlacementConfig,
 
     /// (key, put_time_ms, put_version) -> inflight_put_info
     pub inflight_puts: moka::future::Cache<(String, u64, u32), InflightPutInfo>,
-    pub inflight_put_appends: moka::future::Cache<(String, u64, u32), InflightPutAppendInfo>,
+    pub inflight_replica_tasks: moka::future::Cache<(String, u64, u32), InflightReplicaTaskInfo>,
     /// key -> inflight put count
     pub inflight_put_key_counts: Arc<DashMap<String, u32>>,
     pub inflight_gets: moka::future::Cache<u64, InflightGetInfo>,
@@ -550,6 +552,9 @@ pub struct MasterKvRouterInner {
 
     /// Historical final put placement decisions grouped by placement mode.
     pub put_placement_mode_counts: DashMap<&'static str, Arc<AtomicU64>>,
+
+    /// Historical accepted replica task reservations by target node.
+    pub replica_task_target_counts: DashMap<NodeIDString, Arc<AtomicU64>>,
 
     /// Support replicas: key -> version_id
     recent_key_versionid_allocator: moka::sync::SegmentedCache<String, Arc<AtomicU32>>,
@@ -634,7 +639,7 @@ impl MasterKvRouter {
     }
 
     pub async fn construct(arg: MasterKvRouterNewArg) -> Result<Self, KvError> {
-        let policy_impl: Box<dyn PlacementPolicy> = Box::new(PlacementDefault::new());
+        let policy_impl = build_placement_policy(arg.replica_task_placement.clone());
         let inflight_put_ttl_seconds = if arg.test_spec_config.skip_put_end_commit {
             INFLIGHT_PUT_TTL_SECONDS_SKIP_PUT_END_COMMIT
         } else {
@@ -661,15 +666,16 @@ impl MasterKvRouter {
                 }
             })
             .build();
-        let inflight_put_appends = moka::future::Cache::builder()
+        let inflight_replica_tasks = moka::future::Cache::builder()
             .time_to_live(Duration::from_secs(60))
             .build();
         let inner = MasterKvRouterInner {
             view: std::sync::OnceLock::new(),
             policy: policy_impl,
             test_spec_config: arg.test_spec_config,
+            replica_task_placement: arg.replica_task_placement,
             inflight_puts,
-            inflight_put_appends,
+            inflight_replica_tasks,
             inflight_put_key_counts,
             inflight_gets,
             get_holding: MasterOwnerMemMgr::default(),
@@ -687,6 +693,7 @@ impl MasterKvRouter {
             put_target_decision_counts: DashMap::new(),
             put_requester_target_decision_counts: DashMap::new(),
             put_placement_mode_counts: DashMap::new(),
+            replica_task_target_counts: DashMap::new(),
             recent_key_versionid_allocator: moka::sync::SegmentedCache::builder(8)
                 .time_to_idle(Duration::from_secs(5))
                 .build(),
@@ -1037,9 +1044,10 @@ impl MasterKvRouter {
             let view = view.clone();
             let view2 = view.clone();
             let view_task = view2.clone();
+            let req_node_id = resp.node_id().clone();
             let _ = view.spawn("rpc_put_done", async move {
                 let t0 = Utc::now().timestamp_micros();
-                let mut ack = handle_put_done(view_task, msg).await;
+                let mut ack = handle_put_done(view_task, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send PutDoneResp: {:?}", e);
@@ -1224,9 +1232,10 @@ impl MasterKvRouter {
         RPCHandler::<BatchPutDoneReq>::new().regist(p2p, move |resp, msg| {
             let view = view.clone();
             let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
             view.spawn("rpc_batch_put_done", async move {
                 let t0 = Utc::now().timestamp_micros();
-                let mut ack = handle_batch_put_done(view2, msg).await;
+                let mut ack = handle_batch_put_done(view2, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send BatchPutDoneResp: {:?}", e);
@@ -1754,6 +1763,17 @@ impl MasterKvRouter {
         mode_counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_replica_task_target(&self, target_node_id: &str) {
+        let target_counter = self
+            .inner()
+            .replica_task_target_counts
+            .entry(target_node_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .value()
+            .clone();
+        target_counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn spawn_put_placement_reporter(&self) {
         let view = self.inner().view().clone();
         let view_task = view.clone();
@@ -1791,11 +1811,20 @@ impl MasterKvRouter {
                             .collect();
                         mode_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
+                        let mut replica_task_target_counts: Vec<(String, u64)> = router
+                            .inner()
+                            .replica_task_target_counts
+                            .iter()
+                            .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+                            .collect();
+                        replica_task_target_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
                         info!(
-                            "put placement historical distribution | target_counts={:?} | mode_counts={:?} | requester_target_counts={:?}",
+                            "put placement historical distribution | target_counts={:?} | mode_counts={:?} | requester_target_counts={:?} | replica_task_target_counts={:?}",
                             target_counts,
                             mode_counts,
                             requester_target_counts,
+                            replica_task_target_counts,
                         );
                     }
                     _ = shutdown_waiter.wait() => {

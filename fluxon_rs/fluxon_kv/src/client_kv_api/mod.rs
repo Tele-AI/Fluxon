@@ -31,8 +31,8 @@ use crate::{
     client_seg_pool::{ClientSegPool, ClientSegPoolAccessTrait, ResolveSideTransferLaneReq},
     client_transfer_engine::{ClientTransferEngine, ClientTransferEngineAccessTrait},
     cluster_manager::{
-        app_logic_ext::{ClusterManagerAppLogicExt, ClusterManagerExtError},
         ClusterEvent, ClusterManager, ClusterManagerAccessTrait,
+        app_logic_ext::{ClusterManagerAppLogicExt, ClusterManagerExtError},
     },
     master_kv_router::msg_pack::{
         DeleteAckReq, DeleteReq, GetDoneReq, GetMetaReq, GetRevokeReq, GetStartReq,
@@ -50,18 +50,22 @@ use crate::{
 use async_trait::async_trait;
 use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
-use fluxon_framework::{define_module, LogicalModule};
+use fluxon_framework::{LogicalModule, define_module};
 use fluxon_framework_compiled::upgrade_view_guard::UpgradeViewGuard;
 use fluxon_util::map_lock::AMapLock;
 use limit_thirdparty::tokio;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Weak;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
+
+const REPLICA_TASK_QUEUE_CAPACITY: usize = 128;
+const OWNER_LOCAL_PUBLISH_QUEUE_CAPACITY: usize = 4096;
+const OWNER_LOCAL_PUBLISH_MAX_INFLIGHT: usize = 64;
 
 /// Information about a memholder held by external client
 #[derive(Clone)]
@@ -79,7 +83,7 @@ pub struct OwnerRuntimeObserveSnapshot {
 }
 
 pub use get::RemoteGetInfo;
-pub use put::OwnerReservedPutItem;
+pub use put::{OwnerLocalPublishItem, OwnerLocalPublishJob, OwnerReservedPutItem};
 pub mod external_api;
 mod local_reserve_rebalance;
 pub use external_api::HandlerForExternalClient;
@@ -181,8 +185,8 @@ pub enum PutOptionalArg {
     RejectIfInflightSameKey,
     /// Ask the master to fail-fast when the key already has a committed live replica.
     RejectIfExistSameKey,
-    /// Keep the legacy synchronous remote-placement semantics.
-    WriteThrough,
+    /// Disable asynchronous remote replica task after local commit in write-back mode.
+    SkipMakeReplicaTask,
     /// Prefer placing the target allocation on a kvclient within this sub_cluster.
     PreferredSubCluster(String),
     /// Hidden test-only side-channel for collecting per-put phase timings.
@@ -203,7 +207,7 @@ impl PutOptionalArgs {
             PutOptionalArg::LeaseId(id) => Some(*id),
             PutOptionalArg::RejectIfInflightSameKey
             | PutOptionalArg::RejectIfExistSameKey
-            | PutOptionalArg::WriteThrough
+            | PutOptionalArg::SkipMakeReplicaTask
             | PutOptionalArg::PreferredSubCluster(_)
             | PutOptionalArg::TestObservePutPhases(_) => None,
         })
@@ -221,10 +225,11 @@ impl PutOptionalArgs {
             .any(|arg| matches!(arg, PutOptionalArg::RejectIfExistSameKey))
     }
 
-    pub fn write_through(&self) -> bool {
-        self.0
+    pub fn make_replica_task(&self) -> bool {
+        !self
+            .0
             .iter()
-            .any(|arg| matches!(arg, PutOptionalArg::WriteThrough))
+            .any(|arg| matches!(arg, PutOptionalArg::SkipMakeReplicaTask))
     }
 
     /// Get the last provided preferred_sub_cluster if any.
@@ -234,7 +239,7 @@ impl PutOptionalArgs {
             PutOptionalArg::LeaseId(_)
             | PutOptionalArg::RejectIfInflightSameKey
             | PutOptionalArg::RejectIfExistSameKey
-            | PutOptionalArg::WriteThrough
+            | PutOptionalArg::SkipMakeReplicaTask
             | PutOptionalArg::TestObservePutPhases(_) => None,
         })
     }
@@ -245,7 +250,7 @@ impl PutOptionalArgs {
             PutOptionalArg::LeaseId(_)
             | PutOptionalArg::RejectIfInflightSameKey
             | PutOptionalArg::RejectIfExistSameKey
-            | PutOptionalArg::WriteThrough
+            | PutOptionalArg::SkipMakeReplicaTask
             | PutOptionalArg::PreferredSubCluster(_) => None,
         })
     }
@@ -1140,6 +1145,14 @@ impl ClientKvApiViewHolder {
     }
 }
 
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 impl std::ops::Deref for ClientKvApiViewHolder {
     type Target = ClientKvApiView;
 
@@ -1168,6 +1181,10 @@ pub struct ClientKvApiInner {
     owner_local_reserve_pool: Mutex<OwnerLocalReservePoolState>,
     /// Wake the background reserve actor after demand/free-slot changes.
     owner_local_reserve_rebalance_notify: Arc<limit_thirdparty::tokio::sync::Notify>,
+    /// Owner-local write-back put ids for external local-first path.
+    external_local_first_put_id_counter: AtomicU32,
+    /// Owner-local inflight write guard for external local-first path.
+    external_local_first_inflight_key_counts: DashMap<String, u32>,
 
     /// Shared delete actor input for owner -> external weak-index invalidation.
     pub external_invalidate_delete: EnsureMemholderMgmtDeleteHandle<DeleteClientKvMetaCacheItem>,
@@ -1229,8 +1246,10 @@ pub struct ClientKvApiInner {
     /// 注意：put_id (time_ms,version) 在不同 key 上并不全局唯一，因此必须携带 key 作为索引的一部分，避免碰撞。
     /// 使用 moka::sync::SegmentedCache 并设置 30 分钟 TTL，避免异常路径未清理导致的泄漏；不设置容量上限，纯 TTL 控制。
     external_pending_puts: moka::sync::SegmentedCache<(String, u64, u32), ExternalPendingPutCtx>,
-    write_back_append_tx: tokio::sync::ampsc::Sender<WriteBackAppendJob>,
-    write_back_append_rx: Mutex<Option<tokio::sync::ampsc::Receiver<WriteBackAppendJob>>>,
+    owner_local_publish_tx: tokio::sync::ampsc::Sender<OwnerLocalPublishJob>,
+    owner_local_publish_rx: Mutex<Option<tokio::sync::ampsc::Receiver<OwnerLocalPublishJob>>>,
+    replica_task_tx: tokio::sync::ampsc::Sender<ReplicaTaskJob>,
+    replica_task_rx: Mutex<Option<tokio::sync::ampsc::Receiver<ReplicaTaskJob>>>,
 }
 
 impl ClientKvApiInner {
@@ -1263,6 +1282,73 @@ impl ClientKvApiInner {
 
     pub(crate) fn skip_put_end_commit_enabled(&self) -> bool {
         self.test_spec_config.skip_put_end_commit
+    }
+
+    pub(crate) fn next_external_local_first_put_id(
+        &self,
+    ) -> crate::master_kv_router::put::PutIDForAKey {
+        (
+            now_unix_ms(),
+            self.external_local_first_put_id_counter
+                .fetch_add(1, Ordering::Relaxed),
+        )
+    }
+
+    pub fn next_owner_local_first_put_id(&self) -> crate::master_kv_router::put::PutIDForAKey {
+        self.next_external_local_first_put_id()
+    }
+
+    pub async fn enqueue_owner_local_publish(&self, job: OwnerLocalPublishJob) -> KvResult<()> {
+        let key_count = job.items.len();
+        let first_key = job
+            .items
+            .first()
+            .map(|item| item.key.as_str())
+            .unwrap_or("<empty>")
+            .to_string();
+        self.owner_local_publish_tx.try_send(job).map_err(|err| {
+            KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "owner local publish queue is full or closed: first_key={} key_count={} err={}",
+                    first_key, key_count, err
+                ),
+            })
+        })
+    }
+
+    pub(crate) fn reserve_external_local_first_put_key(
+        &self,
+        key: &str,
+        reject_if_inflight_same_key: bool,
+        reject_if_exist_same_key: bool,
+    ) -> KvResult<()> {
+        if reject_if_exist_same_key && self.has_local_snapshot(key) {
+            return Err(KvError::Api(ApiError::KeyAlreadyExists {
+                key: key.to_string(),
+            }));
+        }
+        let mut entry = self
+            .external_local_first_inflight_key_counts
+            .entry(key.to_string())
+            .or_insert(0);
+        if reject_if_inflight_same_key && *entry > 0 {
+            return Err(KvError::Api(ApiError::KeyBeingWritten {
+                key: key.to_string(),
+            }));
+        }
+        *entry += 1;
+        Ok(())
+    }
+
+    pub(crate) fn release_external_local_first_put_key(&self, key: &str) {
+        if let Some(mut entry) = self.external_local_first_inflight_key_counts.get_mut(key) {
+            if *entry <= 1 {
+                drop(entry);
+                self.external_local_first_inflight_key_counts.remove(key);
+            } else {
+                *entry -= 1;
+            }
+        }
     }
 
     pub(crate) fn remember_local_snapshot(
@@ -1461,14 +1547,27 @@ pub struct ExternalPendingPutCtx {
     pub target_base_addr: u64,
     pub target_offset: u64,
     pub len: u64,
+    pub make_replica_task: bool,
     pub preferred_sub_cluster: Option<String>,
+    pub replica_target: Option<ReplicaTaskTarget>,
+    pub local_reserve_slot: Option<OwnerLocalReserveSlotRef>,
+    pub local_reserve_slot_size: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplicaTaskTarget {
+    pub node_id: String,
+    pub target_offset: u64,
+    pub target_base_addr: u64,
+    pub len: u64,
 }
 
 #[derive(Clone)]
-pub(crate) struct WriteBackAppendJob {
+pub(crate) struct ReplicaTaskJob {
     pub key: String,
     pub put_id: crate::master_kv_router::put::PutIDForAKey,
     pub holder: Arc<UserMemHolder>,
+    pub target: Option<ReplicaTaskTarget>,
     pub preferred_sub_cluster: Option<String>,
 }
 
@@ -2473,7 +2572,10 @@ impl ClientKvApi {
 
     pub async fn construct(arg: ClientKvApiNewArg) -> Result<Self, KvError> {
         tracing::info!("Constructing ClientKvApi in Client mode (PreView)");
-        let (write_back_append_tx, write_back_append_rx) = tokio::sync::ampsc::channel(1024);
+        let (replica_task_tx, replica_task_rx) =
+            tokio::sync::ampsc::channel(REPLICA_TASK_QUEUE_CAPACITY);
+        let (owner_local_publish_tx, owner_local_publish_rx) =
+            tokio::sync::ampsc::channel(OWNER_LOCAL_PUBLISH_QUEUE_CAPACITY);
 
         let inner = ClientKvApiInner {
             view: ClientKvApiViewHolder::new(),
@@ -2488,6 +2590,8 @@ impl ClientKvApi {
             owner_local_reserve_rebalance_notify: Arc::new(
                 limit_thirdparty::tokio::sync::Notify::new(),
             ),
+            external_local_first_put_id_counter: AtomicU32::new(0),
+            external_local_first_inflight_key_counts: DashMap::new(),
             external_invalidate_delete: EnsureMemholderMgmtDeleteHandle::new(
                 OwnerExternalMemMgr::DELETE_SUBMIT_QUEUE_CAPACITY,
             ),
@@ -2534,8 +2638,10 @@ impl ClientKvApi {
             rpc_caller_external_put_revoke: RPCCaller::new(),
             rpc_caller_resolve_side_transfer_lane: RPCCaller::new(),
             default_lease_id: parking_lot::RwLock::new(None),
-            write_back_append_tx,
-            write_back_append_rx: Mutex::new(Some(write_back_append_rx)),
+            owner_local_publish_tx,
+            owner_local_publish_rx: Mutex::new(Some(owner_local_publish_rx)),
+            replica_task_tx,
+            replica_task_rx: Mutex::new(Some(replica_task_rx)),
         };
         Ok(Self(inner))
     }
@@ -2925,10 +3031,19 @@ impl ClientKvApi {
             .expect("delete_ack_batch rx already taken, that's impossible");
         delete::spawn_owner_delete_ack_batch(inner.view.clone_view(), delete_ack_batch_rx);
 
-        if let Some(write_back_append_rx) = inner.write_back_append_rx.lock().take() {
-            put::spawn_write_back_append_actor(inner.view.clone_view(), write_back_append_rx);
+        if let Some(replica_task_rx) = inner.replica_task_rx.lock().take() {
+            put::spawn_replica_task_actor(inner.view.clone_view(), replica_task_rx);
         } else {
-            tracing::warn!("write_back_append_rx already taken for ClientKvApi");
+            tracing::warn!("replica_task_rx already taken for ClientKvApi");
+        }
+        if let Some(owner_local_publish_rx) = inner.owner_local_publish_rx.lock().take() {
+            put::spawn_owner_local_publish_dispatcher(
+                inner.view.clone_view(),
+                owner_local_publish_rx,
+                OWNER_LOCAL_PUBLISH_MAX_INFLIGHT,
+            );
+        } else {
+            tracing::warn!("owner_local_publish_rx already taken for ClientKvApi");
         }
 
         // Spawn cluster listener to clean up get_holding when external_client leaves

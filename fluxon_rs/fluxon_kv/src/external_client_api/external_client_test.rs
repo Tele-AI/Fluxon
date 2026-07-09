@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use crate::cluster_manager::NodeID;
 use crate::config::{
     ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, LargeFilePaths, MasterConfig,
-    MonitoringConfig, ProtocolConfig, ProtocolType, TestSpecConfig, TransferEngineType,
+    MonitoringConfig, ProtocolConfig, ProtocolType, ReplicaTaskPlacementConfig, TestSpecConfig,
+    TransferEngineType,
 };
 use crate::master_kv_router::MasterKvRouterView;
 use crate::{ConfigArg, run_client, run_master};
@@ -46,6 +47,7 @@ fn new_master_config(
         log_dir,
         pprof_duration_seconds: None,
         master_ui: None,
+        replica_task_placement: ReplicaTaskPlacementConfig::default(),
         test_spec_config: TestSpecConfig::default(),
     }
 }

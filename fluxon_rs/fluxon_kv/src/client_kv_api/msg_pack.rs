@@ -218,7 +218,7 @@ pub struct ExternalBatchPutStartItemReq {
     pub len: u64,
     pub reject_if_inflight_same_key: bool,
     pub reject_if_exist_same_key: bool,
-    pub write_through: bool,
+    pub make_replica_task: bool,
     pub preferred_sub_cluster: Option<String>,
 }
 
@@ -271,7 +271,6 @@ pub struct ExternalBatchPutTransferEndItemReq {
     pub peer_id: Option<String>,
     pub target_base_addr: Option<u64>,
     pub put_id: Option<PutIDForAKey>,
-    pub write_through: bool,
     pub lease_id: Option<u64>,
 }
 
@@ -317,7 +316,6 @@ pub struct ExternalBatchPutCommitItemReq {
     pub remote_target: bool,
     pub put_id: Option<PutIDForAKey>,
     pub lease_id: Option<u64>,
-    pub write_through: bool,
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -480,7 +478,7 @@ pub struct ExternalPutStartReq {
     pub len: u64,
     pub reject_if_inflight_same_key: bool,
     pub reject_if_exist_same_key: bool,
-    pub write_through: bool,
+    pub make_replica_task: bool,
     /// Prefer placing the target allocation on any kvclient within this sub_cluster.
     pub preferred_sub_cluster: Option<String>,
     /// Owner node_start_time observed by external when request starts
@@ -526,7 +524,6 @@ pub struct ExternalPutTransferEndReq {
     pub peer_id: Option<String>,
     pub target_base_addr: Option<u64>,
     pub put_id: Option<PutIDForAKey>,
-    pub write_through: bool,
     /// Optional lease to attach this key to when committing
     pub lease_id: Option<u64>,
     /// Owner node_start_time observed by external when request starts
@@ -563,7 +560,6 @@ pub struct ExternalPutCommitReq {
     pub remote_target: bool,
     pub put_id: Option<PutIDForAKey>,
     pub lease_id: Option<u64>,
-    pub write_through: bool,
     /// Owner node_start_time observed by the caller when request starts
     pub started_time: i64,
     pub test_observe_put_phases: bool,

@@ -9,54 +9,51 @@ use std::thread;
 use bytes::Bytes;
 use fluxon_cli::config::MonitorConfigYaml as MonitorCliConfigYaml;
 use fluxon_fs::config::{
-    FluxonFsRequestIdentity, FluxonFsS3KvMissPolicy, FsAgentDeclaredExportWire,
     FLUXON_FS_CONTROL_SCHEMA_VERSION, FS_AGENT_DECLARED_EXPORT_JSON_KEY,
     FS_AGENT_EXPORT_PUBLISH_RPC_PATH, FS_AGENT_EXPORT_UNPUBLISH_RPC_PATH,
-    FS_MASTER_CONFIG_RPC_PATH,
+    FS_MASTER_CONFIG_RPC_PATH, FluxonFsRequestIdentity, FluxonFsS3KvMissPolicy,
+    FsAgentDeclaredExportWire,
 };
+use fluxon_kv::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
+use fluxon_kv::client_kv_api::ClientKvApiViewTrait;
 use fluxon_kv::client_kv_api::msg_pack::{
     ExternalBatchPutCommitItemReq, ExternalBatchPutCommitReq, ExternalBatchPutStartItemReq,
     ExternalBatchPutStartReq, ExternalBatchPutTransferEndItemReq, ExternalBatchPutTransferEndReq,
     ExternalPutRevokeReq,
 };
-use fluxon_kv::client_kv_api::ClientKvApiViewTrait;
 use fluxon_kv::client_kv_api::{
-    ClientKvApiInner, OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef, OwnerReservedPutItem,
+    ClientKvApiInner, OwnerLocalPublishItem, OwnerLocalPublishJob, OwnerLocalReserveSlotLease,
 };
 use fluxon_kv::client_seg_pool::ClientSegPoolViewTrait;
-use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use fluxon_kv::cluster_manager::ClusterManagerViewTrait;
+use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use fluxon_kv::config::{ClientConfigYaml, MasterConfigYaml};
 use fluxon_kv::external_client_api::ExternalClientApiViewTrait;
-use fluxon_kv::master_kv_router::msg_pack::{
-    BatchPreparePutKeyItemReq, BatchPutDoneItemReq, BatchPutRevokeItemReq, BatchPutStartItemReq,
-    PutDoneCommittedSlot,
-};
+use fluxon_kv::master_kv_router::msg_pack::{BatchPreparePutKeyItemReq, PutDoneCommittedSlot};
 use fluxon_kv::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
-use fluxon_kv::memholder::kvclient_encode::{flat_kv_decode_borrowed, BorrowedFlatKvValueRange};
+use fluxon_kv::memholder::kvclient_encode::{BorrowedFlatKvValueRange, flat_kv_decode_borrowed};
 use fluxon_kv::memholder::{
-    ExternalMemHolder as RustExternalMemHolder, MemoryInfo as RustMemoryInfo,
-    UserMemHolder as RustUserMemHolder,
+    ExternalMemHolder as RustExternalMemHolder, UserMemHolder as RustUserMemHolder,
 };
-use fluxon_kv::p2p::msg_pack::{call_rpc, MsgPack, RPCCaller};
+use fluxon_kv::p2p::msg_pack::{MsgPack, RPCCaller, call_rpc};
 use fluxon_kv::p2p::p2p_module::P2pModuleViewTrait;
-use fluxon_kv::p2p::p2p_module::{user_rpc_register_handler, UserRpcHandler};
+use fluxon_kv::p2p::p2p_module::{UserRpcHandler, user_rpc_register_handler};
 use fluxon_kv::rpcresp_kvresult_convert::msg_and_error::{
     ApiError as CoreApiError, KvError as CoreKvError, KvResult, OK,
 };
 use fluxon_kv::user_api::FlatDict;
 use fluxon_kv::user_api::FlatValue;
 use fluxon_kv::user_api::FluxonUserApi;
-use fluxon_kv::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
 use fluxon_kv::{
+    ConfigArg, Framework, KvClientTrait, KvGetResult,
     config::{ClientConfig, MasterConfig},
-    run_client, run_master, ConfigArg, Framework, KvClientTrait, KvGetResult,
+    run_client, run_master,
 };
 use fluxon_ops;
 use fluxon_proxy;
-use fluxon_util::run_async_from_sync::{borrow_stable_owner, SyncAsyncBridge};
+use fluxon_util::run_async_from_sync::{SyncAsyncBridge, borrow_stable_owner};
 use fluxon_util::{
-    fluxon_cli_proxy_desc_etcd_key_v2, FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2,
+    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
 };
 use futures::Future;
 use pyo3::exceptions::{PyOSError, PyPermissionError, PyRuntimeError, PyValueError};
@@ -77,7 +74,7 @@ include!(env!("FLUXON_PYO3_TEST_PYTHON_LINK_RS"));
 mod memholder;
 pub use memholder::{ExternalMemHolder, MemHolder};
 mod flatdict_zerocopy;
-use flatdict_zerocopy::{decode_flat_dict_to_wrapped_py_object, FlatDictDataOwner};
+use flatdict_zerocopy::{FlatDictDataOwner, decode_flat_dict_to_wrapped_py_object};
 mod kvfuture;
 pub use kvfuture::KvFuture;
 mod error;
@@ -2107,7 +2104,6 @@ enum StagedPutPlanData {
 struct StagedOwnerPutPlanData {
     keys: Vec<String>,
     value_len: u64,
-    write_through: bool,
     key_reservation_ids: Vec<u64>,
     slot_lease: OwnerLocalReserveSlotLease,
 }
@@ -2116,7 +2112,6 @@ struct StagedOwnerPutPlanData {
 struct StagedExternalPutPlanData {
     keys: Vec<String>,
     value_len: u64,
-    write_through: bool,
     started_time: i64,
     items: Vec<StagedExternalPutItem>,
     short_circuit_payload: bool,
@@ -2130,13 +2125,6 @@ struct StagedExternalPutItem {
     transfer_target_offset: Option<u64>,
     peer_id: Option<String>,
     target_base_addr: u64,
-}
-
-#[derive(Clone)]
-struct StagedPutCommitItem {
-    idx: usize,
-    reserved_item: OwnerReservedPutItem,
-    slot_ref: OwnerLocalReserveSlotRef,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2321,10 +2309,6 @@ async fn release_put_key_reservations_only(
         .map(|_| ())
 }
 
-fn staged_put_uses_direct_local_commit(item: &OwnerReservedPutItem) -> bool {
-    !item.write_through || (item.peer_node_id.is_none() && item.src_addr == item.target_addr)
-}
-
 fn combine_kv_errors(
     context: &str,
     primary_err: CoreKvError,
@@ -2336,50 +2320,6 @@ fn combine_kv_errors(
             context, primary_err, secondary_err
         ),
     })
-}
-
-fn remove_precommit_local_visible_infos(
-    inner: &ClientKvApiInner,
-    keys: &[String],
-    memory_infos: &[Arc<RustMemoryInfo>],
-) {
-    for (key, memory_info) in keys.iter().zip(memory_infos.iter()) {
-        let _ = inner.remove_precommit_local_reserve_resident_slot_if_same(key, memory_info);
-    }
-}
-
-fn remove_precommit_local_visible_infos_for_items(
-    inner: &ClientKvApiInner,
-    items: &[StagedPutCommitItem],
-    memory_infos: &[Arc<RustMemoryInfo>],
-) {
-    for item in items {
-        let _ = inner.remove_precommit_local_reserve_resident_slot_if_same(
-            &item.reserved_item.key,
-            &memory_infos[item.idx],
-        );
-    }
-}
-
-async fn revoke_staged_put_items(
-    inner: &ClientKvApiInner,
-    items: &[StagedPutCommitItem],
-) -> KvResult<()> {
-    if items.is_empty() {
-        return Ok(());
-    }
-    inner
-        .batch_put_revoke(
-            items
-                .iter()
-                .map(|item| BatchPutRevokeItemReq {
-                    key: item.reserved_item.key.clone(),
-                    put_id: item.reserved_item.put_id,
-                })
-                .collect(),
-        )
-        .await
-        .map(|_| ())
 }
 
 #[pyfunction]
@@ -3506,14 +3446,13 @@ impl KvClient {
         release_local_grant_blocking_inner(self, grant_id, py).into_py_object(py)
     }
 
-    #[pyo3(signature = (keys, value_len, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true))]
+    #[pyo3(signature = (keys, value_len, reject_if_inflight_same_key=false, reject_if_exist_same_key=false))]
     fn local_fast_put_start(
         &self,
         keys: Vec<String>,
         value_len: u64,
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
-        write_through: bool,
         py: Python,
     ) -> PyObject {
         fn local_fast_put_start_inner(
@@ -3522,7 +3461,6 @@ impl KvClient {
             value_len: u64,
             reject_if_inflight_same_key: bool,
             reject_if_exist_same_key: bool,
-            write_through: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if keys.is_empty() {
@@ -3556,7 +3494,6 @@ impl KvClient {
                     ));
                 }
             };
-
             if framework.is_external_mode() {
                 let framework_for_start = framework.clone();
                 let keys_for_req = keys.clone();
@@ -3576,7 +3513,7 @@ impl KvClient {
                                         len: value_len,
                                         reject_if_inflight_same_key,
                                         reject_if_exist_same_key,
-                                        write_through,
+                                        make_replica_task: true,
                                         preferred_sub_cluster: None,
                                     })
                                     .collect(),
@@ -3729,7 +3666,6 @@ impl KvClient {
                         StagedExternalPutPlanData {
                             keys,
                             value_len,
-                            write_through,
                             started_time,
                             items,
                             short_circuit_payload,
@@ -3834,7 +3770,6 @@ impl KvClient {
                     StagedOwnerPutPlanData {
                         keys,
                         value_len,
-                        write_through,
                         key_reservation_ids,
                         slot_lease,
                     },
@@ -3855,7 +3790,6 @@ impl KvClient {
             value_len,
             reject_if_inflight_same_key,
             reject_if_exist_same_key,
-            write_through,
             py,
         )
         .into_py_object(py)
@@ -3930,7 +3864,6 @@ impl KvClient {
                                             remote_target: item.peer_id.is_some(),
                                             put_id: Some(item.put_id),
                                             lease_id: None,
-                                            write_through: external_data.write_through,
                                         })
                                         .collect(),
                                     started_time: external_data.started_time,
@@ -3968,7 +3901,6 @@ impl KvClient {
                                                     None
                                                 },
                                                 put_id: Some(item.put_id),
-                                                write_through: external_data.write_through,
                                                 lease_id: None,
                                             })
                                             .collect(),
@@ -3997,27 +3929,33 @@ impl KvClient {
                     StagedPutPlanData::Owner(owner_data) => {
                         let client_kv_api_view = framework_for_commit.client_kv_api_view();
                         let inner = client_kv_api_view.client_kv_api().inner();
-                        let start_items = owner_data
-                            .keys
-                            .iter()
-                            .map(|key| BatchPutStartItemReq {
-                                key: key.clone(),
-                                len: owner_data.value_len,
-                                reject_if_inflight_same_key: false,
-                                reject_if_exist_same_key: false,
-                                write_through: owner_data.write_through,
-                                preferred_sub_cluster: None,
-                            })
-                            .collect::<Vec<_>>();
                         let slot_refs = owner_data.slot_lease.slots.clone();
                         let slot_size = owner_data.slot_lease.slot_size;
-                        let value_len_usize = match usize::try_from(owner_data.value_len) {
+                        if slot_refs.len() != owner_data.keys.len() {
+                            let err = CoreKvError::Api(CoreApiError::Unknown {
+                                detail: format!(
+                                    "local_fast_put_commit slot/key length mismatch: keys={} slots={}",
+                                    owner_data.keys.len(),
+                                    slot_refs.len()
+                                ),
+                            });
+                            let _ = release_staged_put_resources(
+                                inner,
+                                owner_data.key_reservation_ids,
+                                owner_data.slot_lease,
+                            )
+                            .await;
+                            return ApiResult::new_success(vec![
+                                kv_error_to_ret_code(&err);
+                                owner_data.keys.len()
+                            ]);
+                        }
+                        let value_len_u32 = match u32::try_from(owner_data.value_len) {
                             Ok(value) => value,
                             Err(_) => {
                                 let err = CoreKvError::Api(CoreApiError::InvalidArgument {
-                                    detail:
-                                        "local_fast_put_commit value_len does not fit into usize"
-                                            .to_string(),
+                                    detail: "local_fast_put_commit value_len does not fit into u32"
+                                        .to_string(),
                                 });
                                 let _ = release_staged_put_resources(
                                     inner,
@@ -4031,13 +3969,14 @@ impl KvClient {
                                 ]);
                             }
                         };
-                        let mut memory_infos = Vec::with_capacity(owner_data.keys.len());
+                        let mut publish_items = Vec::with_capacity(owner_data.keys.len());
+                        let mut ret_codes = Vec::with_capacity(owner_data.keys.len());
                         for (key, slot_ref) in owner_data.keys.iter().zip(slot_refs.iter()) {
                             let memory_info = inner
                                 .build_local_reserve_resident_memory_info(
                                     key,
                                     slot_ref.ptr,
-                                    owner_data.value_len as u32,
+                                    value_len_u32,
                                     slot_size,
                                     slot_ref.grant_id,
                                     slot_ref.slot_index,
@@ -4047,249 +3986,75 @@ impl KvClient {
                                 key,
                                 memory_info.clone(),
                             );
-                            memory_infos.push(memory_info);
-                        }
-                        let mut ret_codes = Vec::with_capacity(owner_data.keys.len());
-                        match inner
-                            .owner_batch_put_start_reserved(start_items, None)
-                            .await
-                        {
-                            Ok(prepared_items) if prepared_items.len() == slot_refs.len() => {
-                                let mut direct_items = Vec::new();
-                                let mut copy_items = Vec::new();
-                                for (idx, (reserved_item, slot_ref)) in prepared_items
-                                    .into_iter()
-                                    .zip(slot_refs.iter().cloned())
-                                    .enumerate()
-                                {
-                                    let item = StagedPutCommitItem {
-                                        idx,
-                                        reserved_item,
-                                        slot_ref,
-                                    };
-                                    if staged_put_uses_direct_local_commit(&item.reserved_item) {
-                                        direct_items.push(item);
-                                    } else {
-                                        copy_items.push(item);
-                                    }
+                            let put_id = inner.next_owner_local_first_put_id();
+                            let promote = inner
+                                .promote_precommit_local_reserve_resident_slot_if_same(
+                                    key,
+                                    put_id,
+                                    memory_info.clone(),
+                                );
+                            match promote {
+                                Ok(()) => {
+                                    inner.record_put_locality(false, owner_data.value_len, 0);
+                                    publish_items.push(OwnerLocalPublishItem {
+                                        key: key.clone(),
+                                        put_id,
+                                        value_len: owner_data.value_len,
+                                        lease_id: None,
+                                        committed_slot: PutDoneCommittedSlot {
+                                            grant_id: slot_ref.grant_id,
+                                            slot_index: slot_ref.slot_index,
+                                            slot_size,
+                                            addr: slot_ref.ptr,
+                                            base_addr: slot_ref.base_addr,
+                                            len: owner_data.value_len,
+                                        },
+                                        make_replica_task: true,
+                                        preferred_sub_cluster: None,
+                                    });
+                                    ret_codes.push(0);
                                 }
-
-                                let mut item_results: Vec<Option<i32>> =
-                                    (0..slot_refs.len()).map(|_| None).collect();
-
-                                if !copy_items.is_empty() {
-                                    let reserved_copy_items = copy_items
-                                        .iter()
-                                        .map(|item| item.reserved_item.clone())
-                                        .collect::<Vec<_>>();
-                                    for item in &copy_items {
-                                        unsafe {
-                                            std::ptr::copy_nonoverlapping(
-                                                item.slot_ref.ptr as *const u8,
-                                                item.reserved_item.src_addr as *mut u8,
-                                                value_len_usize,
-                                            );
-                                        }
-                                    }
-                                    match inner
-                                        .owner_batch_put_commit_reserved(
-                                            reserved_copy_items,
-                                            transfer_concurrency,
-                                        )
-                                        .await
-                                    {
-                                        Ok(copy_results)
-                                            if copy_results.len() == copy_items.len() =>
-                                        {
-                                            for (item, result) in
-                                                copy_items.iter().zip(copy_results.into_iter())
-                                            {
-                                                item_results[item.idx] = Some(match result {
-                                                    Ok(()) => 0,
-                                                    Err(err) => kv_error_to_ret_code(&err),
-                                                });
-                                            }
-                                        }
-                                        Ok(copy_results) => {
-                                            let err = CoreKvError::Api(CoreApiError::Unknown {
-                                                detail: format!(
-                                                    "local_fast_put_commit copy result length mismatch: expected={} got={}",
-                                                    copy_items.len(),
-                                                    copy_results.len()
-                                                ),
-                                            });
-                                            let code = kv_error_to_ret_code(&err);
-                                            for item in &copy_items {
-                                                item_results[item.idx] = Some(code);
-                                            }
-                                        }
-                                        Err(err) => {
-                                            let code = kv_error_to_ret_code(&err);
-                                            for item in &copy_items {
-                                                item_results[item.idx] = Some(code);
-                                            }
-                                        }
-                                    }
-                                    remove_precommit_local_visible_infos_for_items(
-                                        inner,
-                                        &copy_items,
-                                        &memory_infos,
+                                Err(err) => {
+                                    let _ = inner
+                                        .remove_precommit_local_reserve_resident_slot_if_same(
+                                            key,
+                                            &memory_info,
+                                        );
+                                    ret_codes.push(kv_error_to_ret_code(&err));
+                                }
+                            }
+                        }
+                        if !publish_items.is_empty() {
+                            if let Err(err) = inner
+                                .enqueue_owner_local_publish(OwnerLocalPublishJob {
+                                    items: publish_items,
+                                    key_reservation_ids: owner_data.key_reservation_ids.clone(),
+                                })
+                                .await
+                            {
+                                tracing::warn!(
+                                    "local_fast_put_commit owner local publish enqueue failed after local commit: {}",
+                                    err
+                                );
+                                if let Err(cleanup_err) = release_put_key_reservations_only(
+                                    inner,
+                                    owner_data.key_reservation_ids,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        "local_fast_put_commit key reservation cleanup failed after owner local publish enqueue error: {}",
+                                        cleanup_err
                                     );
                                 }
-
-                                if !direct_items.is_empty() {
-                                    let direct_done_req_items = direct_items
-                                        .iter()
-                                        .map(|item| BatchPutDoneItemReq {
-                                            key: item.reserved_item.key.clone(),
-                                            put_id: item.reserved_item.put_id,
-                                            lease_id: item.reserved_item.lease_id,
-                                            committed_slot: Some(PutDoneCommittedSlot {
-                                                grant_id: item.slot_ref.grant_id,
-                                                slot_index: item.slot_ref.slot_index,
-                                                slot_size,
-                                                addr: item.slot_ref.ptr,
-                                                base_addr: item.slot_ref.base_addr,
-                                                len: owner_data.value_len,
-                                            }),
-                                            publish_local_cache: false,
-                                        })
-                                        .collect::<Vec<_>>();
-                                    match inner.batch_put_done(direct_done_req_items).await {
-                                        Ok(done_resp)
-                                            if done_resp.items.len() == direct_items.len() =>
-                                        {
-                                            for (item, done_item) in
-                                                direct_items.iter().zip(done_resp.items.into_iter())
-                                            {
-                                                let result =
-                                                    fluxon_kv::rpcresp_kvresult_convert::try_from_code(
-                                                        done_item.error_code,
-                                                        done_item.error_json.clone(),
-                                                    );
-                                                if result.is_ok() {
-                                                    let promote = inner
-                                                        .promote_precommit_local_reserve_resident_slot_if_same(
-                                                            &item.reserved_item.key,
-                                                            item.reserved_item.put_id,
-                                                            memory_infos[item.idx].clone(),
-                                                        );
-                                                    if item.reserved_item.enqueue_write_back_append
-                                                    {
-                                                        if let Err(err) = inner
-                                                            .enqueue_write_back_remote_append(
-                                                                &item.reserved_item.key,
-                                                                item.reserved_item.put_id,
-                                                                item.reserved_item
-                                                                    .preferred_sub_cluster
-                                                                    .as_deref(),
-                                                            )
-                                                            .await
-                                                        {
-                                                            tracing::warn!(
-                                                                "local_fast_put_commit write-back remote append enqueue failed after direct local commit: key={} put_id=({},{}) err={}",
-                                                                item.reserved_item.key,
-                                                                item.reserved_item.put_id.0,
-                                                                item.reserved_item.put_id.1,
-                                                                err
-                                                            );
-                                                        }
-                                                    }
-                                                    inner.record_put_locality(
-                                                        false,
-                                                        owner_data.value_len,
-                                                        0,
-                                                    );
-                                                    item_results[item.idx] = Some(match promote {
-                                                        Ok(()) => 0,
-                                                        Err(err) => kv_error_to_ret_code(&err),
-                                                    });
-                                                } else if let Err(err) = result {
-                                                    item_results[item.idx] =
-                                                        Some(kv_error_to_ret_code(&err));
-                                                    let _ = inner
-                                                        .remove_precommit_local_reserve_resident_slot_if_same(
-                                                            &item.reserved_item.key,
-                                                            &memory_infos[item.idx],
-                                                        );
-                                                }
-                                            }
-                                        }
-                                        Ok(done_resp) => {
-                                            let err = CoreKvError::Api(CoreApiError::Unknown {
-                                                detail: format!(
-                                                    "local_fast_put_commit direct done response length mismatch: expected={} got={}",
-                                                    direct_items.len(),
-                                                    done_resp.items.len()
-                                                ),
-                                            });
-                                            let code = kv_error_to_ret_code(&err);
-                                            for item in &direct_items {
-                                                item_results[item.idx] = Some(code);
-                                            }
-                                            remove_precommit_local_visible_infos_for_items(
-                                                inner,
-                                                &direct_items,
-                                                &memory_infos,
-                                            );
-                                        }
-                                        Err(err) => {
-                                            let code = kv_error_to_ret_code(&err);
-                                            for item in &direct_items {
-                                                item_results[item.idx] = Some(code);
-                                            }
-                                            let _ =
-                                                revoke_staged_put_items(inner, &direct_items).await;
-                                            remove_precommit_local_visible_infos_for_items(
-                                                inner,
-                                                &direct_items,
-                                                &memory_infos,
-                                            );
-                                        }
-                                    }
-                                }
-
-                                for item in item_results {
-                                    ret_codes.push(item.unwrap_or_else(|| {
-                                        let err = CoreKvError::Api(CoreApiError::Unknown {
-                                            detail: "local_fast_put_commit result slot missing"
-                                                .to_string(),
-                                        });
-                                        kv_error_to_ret_code(&err)
-                                    }));
-                                }
+                                ret_codes = vec![kv_error_to_ret_code(&err); ret_codes.len()];
                             }
-                            Ok(prepared_items) => {
-                                let err = CoreKvError::Api(CoreApiError::Unknown {
-                                    detail: format!(
-                                        "local_fast_put_commit final reserve length mismatch: expected={} got={}",
-                                        slot_refs.len(),
-                                        prepared_items.len()
-                                    ),
-                                });
-                                let _ = inner.owner_batch_put_abort_reserved(prepared_items).await;
-                                remove_precommit_local_visible_infos(
-                                    inner,
-                                    &owner_data.keys,
-                                    &memory_infos,
-                                );
-                                ret_codes = vec![kv_error_to_ret_code(&err); owner_data.keys.len()];
-                            }
-                            Err(err) => {
-                                remove_precommit_local_visible_infos(
-                                    inner,
-                                    &owner_data.keys,
-                                    &memory_infos,
-                                );
-                                ret_codes = vec![kv_error_to_ret_code(&err); owner_data.keys.len()];
-                            }
-                        }
-                        if let Err(err) =
+                        } else if let Err(err) =
                             release_put_key_reservations_only(inner, owner_data.key_reservation_ids)
                                 .await
                         {
                             tracing::warn!(
-                                "local_fast_put_commit key reservation cleanup failed: {}",
+                                "local_fast_put_commit key reservation cleanup failed after partial local commit: {}",
                                 err
                             );
                         }
@@ -4927,7 +4692,7 @@ impl KvClient {
     /// on the caller to keep the pointed-to memory alive until the async call completes.
     ///
     /// The backend encoding/copy runs on the Rust runtime without holding the Python GIL.
-    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, callback=None))]
+    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, callback=None))]
     fn put(
         &self,
         key: &str,
@@ -4935,7 +4700,6 @@ impl KvClient {
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
-        write_through: bool,
         callback: Option<PyObject>,
         py: Python,
     ) -> PyObject {
@@ -4946,7 +4710,6 @@ impl KvClient {
             lease_id: Option<u64>,
             reject_if_inflight_same_key: bool,
             reject_if_exist_same_key: bool,
-            write_through: bool,
             callback: Option<PyObject>,
             py: Python,
         ) -> ApiResult<PyObject> {
@@ -4977,9 +4740,6 @@ impl KvClient {
                 }
                 if reject_if_exist_same_key {
                     o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
-                }
-                if write_through {
-                    o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::WriteThrough);
                 }
                 o
             };
@@ -5041,7 +4801,6 @@ impl KvClient {
             lease_id,
             reject_if_inflight_same_key,
             reject_if_exist_same_key,
-            write_through,
             callback,
             py,
         )
@@ -5049,7 +4808,7 @@ impl KvClient {
     }
 
     /// Put a key-value pair and wait for completion before returning.
-    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true))]
+    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false))]
     fn put_blocking(
         &self,
         key: &str,
@@ -5057,7 +4816,6 @@ impl KvClient {
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
-        write_through: bool,
         py: Python,
     ) -> PyObject {
         fn put_blocking_inner(
@@ -5067,7 +4825,6 @@ impl KvClient {
             lease_id: Option<u64>,
             reject_if_inflight_same_key: bool,
             reject_if_exist_same_key: bool,
-            write_through: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if ptrs.len() > (u32::MAX as usize) {
@@ -5103,11 +4860,6 @@ impl KvClient {
                 put_opts
                     .0
                     .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
-            }
-            if write_through {
-                put_opts
-                    .0
-                    .push(fluxon_kv::client_kv_api::PutOptionalArg::WriteThrough);
             }
             let result = match py.allow_threads(|| {
                 runtime.run_async_from_sync(async {
@@ -5157,7 +4909,6 @@ impl KvClient {
             lease_id,
             reject_if_inflight_same_key,
             reject_if_exist_same_key,
-            write_through,
             py,
         )
         .into_py_object(py)
@@ -5166,7 +4917,7 @@ impl KvClient {
     /// Put a batch of key-value pairs and wait for completion before returning.
     ///
     /// Each item uses the same flatdict encoding contract as `put_blocking()`.
-    #[pyo3(signature = (keys, ptrs_groups, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, concurrency=None))]
+    #[pyo3(signature = (keys, ptrs_groups, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, concurrency=None))]
     fn batch_put_blocking(
         &self,
         keys: Vec<String>,
@@ -5174,7 +4925,6 @@ impl KvClient {
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
-        write_through: bool,
         concurrency: Option<usize>,
         py: Python,
     ) -> PyObject {
@@ -5185,7 +4935,6 @@ impl KvClient {
             lease_id: Option<u64>,
             reject_if_inflight_same_key: bool,
             reject_if_exist_same_key: bool,
-            write_through: bool,
             concurrency: Option<usize>,
             py: Python,
         ) -> ApiResult<PyObject> {
@@ -5240,11 +4989,6 @@ impl KvClient {
                 put_opts
                     .0
                     .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
-            }
-            if write_through {
-                put_opts
-                    .0
-                    .push(fluxon_kv::client_kv_api::PutOptionalArg::WriteThrough);
             }
 
             if !framework.is_external_mode() {
@@ -5411,7 +5155,6 @@ impl KvClient {
             lease_id,
             reject_if_inflight_same_key,
             reject_if_exist_same_key,
-            write_through,
             concurrency,
             py,
         )
@@ -5463,7 +5206,7 @@ impl KvClient {
     }
 
     /// Native blocking batch put path for payload pointers.
-    #[pyo3(signature = (keys, payload_ptrs, payload_sizes, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true))]
+    #[pyo3(signature = (keys, payload_ptrs, payload_sizes, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false))]
     fn batch_put_from(
         &self,
         keys: Vec<String>,
@@ -5472,7 +5215,6 @@ impl KvClient {
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
-        write_through: bool,
         py: Python,
     ) -> PyObject {
         fn batch_put_from_inner(
@@ -5483,7 +5225,6 @@ impl KvClient {
             lease_id: Option<u64>,
             reject_if_inflight_same_key: bool,
             reject_if_exist_same_key: bool,
-            write_through: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if keys.len() != payload_ptrs.len() || keys.len() != payload_sizes.len() {
@@ -5558,11 +5299,6 @@ impl KvClient {
                 put_opts
                     .0
                     .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
-            }
-            if write_through {
-                put_opts
-                    .0
-                    .push(fluxon_kv::client_kv_api::PutOptionalArg::WriteThrough);
             }
 
             let keys_for_backend = keys.clone();
@@ -5683,7 +5419,6 @@ impl KvClient {
             lease_id,
             reject_if_inflight_same_key,
             reject_if_exist_same_key,
-            write_through,
             py,
         )
         .into_py_object(py)
@@ -7408,14 +7143,17 @@ mod tests {
             discovery.entries[0].provider_path,
             libs_dir.join("libmlx5-rdmav34.so")
         );
-        assert!(discovery
-            .outcomes
-            .iter()
-            .any(|outcome| { outcome.contains("config_ok:") && outcome.contains("driver=mlx5") }));
-        assert!(discovery
-            .outcomes
-            .iter()
-            .any(|outcome| outcome.contains("config_parse_fail:")));
+        assert!(
+            discovery.outcomes.iter().any(|outcome| {
+                outcome.contains("config_ok:") && outcome.contains("driver=mlx5")
+            })
+        );
+        assert!(
+            discovery
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.contains("config_parse_fail:"))
+        );
     }
 
     #[test]
