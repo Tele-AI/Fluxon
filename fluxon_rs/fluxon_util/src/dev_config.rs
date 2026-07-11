@@ -255,12 +255,6 @@ pub fn load_tsdb_host_port() -> Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
-/// Name aligned with setup_and_pack/utils/repo_config_utils.py: load_tsdb_remote_write_url.
-/// Wraps read_prom_remote_write_url_from_build_config for compatibility with Python tooling.
-pub fn load_tsdb_remote_write_url() -> Result<String> {
-    read_prom_remote_write_url_from_build_config()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{

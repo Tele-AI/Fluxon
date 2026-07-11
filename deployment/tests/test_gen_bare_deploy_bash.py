@@ -20,6 +20,8 @@ import yaml
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEPLOYMENT_DIR = SCRIPT_DIR.parent
 GENERATOR_PATH = DEPLOYMENT_DIR / "gen_bare_deploy_bash.py"
+STANDALONE_STARTUP_DEADLINE_SECONDS = 60
+ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS = 60
 
 
 def main() -> int:
@@ -199,10 +201,11 @@ def test_atomic_group_start_does_not_auto_stop_on_failure() -> None:
         assert 'echo "[rollout] probable-ready failed svc=$SERVICE label=$SUPERVISOR_LABEL supervisor_pid=$SUPERVISOR_PID"' in script, script
         assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID"' in script, script
         assert 'GROUP_STARTUP_DEADLINE_SECONDS=' not in script, script
-        assert script.count('STARTUP_DEADLINE_SECONDS=20') == 2, script
+        assert script.count(f"STARTUP_DEADLINE_SECONDS={ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS}") == 2, script
         _assert_deadline_after_launch(
             script=script,
             wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_SECONDS" "[rollout]"',
+            deadline_seconds=ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS,
         )
         assert "export SERVICE_PORT=23456" in script, script
         assert "unset SERVICE_PORT" in script, script
@@ -372,6 +375,7 @@ def test_normalized_testbed_master_exports_service_port_for_atomic_group() -> No
         _assert_deadline_after_launch(
             script=master_block,
             wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_SECONDS" "[rollout]"',
+            deadline_seconds=ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS,
         )
         assert "wait_service_tcp_ready" not in master_block, master_block
         print("PASS: test_normalized_testbed_master_exports_service_port_for_atomic_group")
@@ -1097,9 +1101,9 @@ def _wait_until_selection_absent(
     raise RuntimeError(f"timeout waiting selection absent: label={label} scope_key={scope_key}")
 
 
-def _assert_deadline_after_launch(*, script: str, wait_call: str) -> None:
+def _assert_deadline_after_launch(*, script: str, wait_call: str, deadline_seconds: int) -> None:
     launch_check = 'if [[ ! "$SUPERVISOR_PID" =~ ^[0-9]+$ ]]; then'
-    deadline_assign = 'STARTUP_DEADLINE_SECONDS=20'
+    deadline_assign = f"STARTUP_DEADLINE_SECONDS={deadline_seconds}"
     assert launch_check in script, script
     assert deadline_assign in script, script
     assert wait_call in script, script
@@ -1114,6 +1118,7 @@ def _assert_standalone_deadline_after_launch(script: str) -> None:
     _assert_deadline_after_launch(
         script=script,
         wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_SECONDS" "[bare]"',
+        deadline_seconds=STANDALONE_STARTUP_DEADLINE_SECONDS,
     )
 
 

@@ -38,7 +38,7 @@ Entries:
 - `_kv_py_core.py`: Python KV backend/core smoke coverage
 - `_relay_mq.py`: MQ relay docker coverage
 - `_mq_core.py`: non-Ctrl-C MQ correctness coverage
-- `_largescale_mq.py`: TEST_STACK large-scale MQ benchmark wrapper (defaults to 4 owners at 1GiB, 160 producers, 8 consumers, 256-byte values)
+- `_largescale_mq.py`: TEST_STACK large-scale MQ benchmark wrapper (defaults to 4 owners at 1GiB, 320 producers, 8 consumers, 1 worker thread per process, and 256-byte values)
 - `_mq_mpsc.py`: MPSC API channel coverage
 - `_mq_mpmc.py`: MPMC API channel coverage
 - `_mq_mpmc_bench.py`: heavier MPMC bench scripts

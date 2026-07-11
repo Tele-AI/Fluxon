@@ -70,6 +70,103 @@ def _suite_cfg_with_declared_ci_commands(command_map: dict[str, list[dict]]) -> 
 
 
 class TestTestRunnerTestbedContract(unittest.TestCase):
+    def test_http_get_json_retries_connection_reset(self) -> None:
+        class _Response:
+            status = 200
+
+            def __enter__(self) -> "_Response":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok": true, "running": true}'
+
+        with mock.patch.object(_RUNNER, "_CONTROLLER_BASIC_AUTH_HEADER", "test-auth"):
+            with mock.patch.object(_RUNNER, "_controller_request_via_manifest", return_value=None):
+                with mock.patch.object(
+                    _RUNNER.urllib.request,
+                    "urlopen",
+                    side_effect=[ConnectionResetError("reset by peer"), _Response()],
+                ) as urlopen_mock:
+                    with mock.patch.object(_RUNNER.time, "sleep") as sleep_mock:
+                        payload = _RUNNER._http_get_json("http://controller/api/status?instance_id=master")
+
+        self.assertEqual(payload, {"ok": True, "running": True})
+        self.assertEqual(urlopen_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(1.0)
+
+    def test_local_mpmc_large_fanout_computes_node_start_throttle(self) -> None:
+        producer_targets = [f"node-{idx}" for idx in range(1, 81)]
+        consumer_targets = ["node-81", "node-82"]
+        all_targets = producer_targets + consumer_targets
+        role_plan = {
+            "producer": {"count": len(producer_targets), "targets": producer_targets},
+            "consumer": {"count": len(consumer_targets), "targets": consumer_targets},
+        }
+        target_ip_map = {target: "10.9.0.7" for target in all_targets}
+        cluster_nodes = {target: {"execution_mode": "local"} for target in all_targets}
+
+        max_seconds = _RUNNER._test_stack_local_benchmark_node_start_throttle_max_seconds(
+            scene_mode=_RUNNER.TEST_STACK_MODE_MPMC,
+            node_total=328,
+            role_plan=role_plan,
+            roles_order=["producer", "consumer"],
+            target_ip_map=target_ip_map,
+            cluster_nodes=cluster_nodes,
+            ctx="scale",
+        )
+
+        self.assertAlmostEqual(max_seconds, 158.4)
+        self.assertEqual(
+            _RUNNER._test_stack_local_benchmark_node_start_throttle_delay_seconds(
+                node_ordinal=0,
+                node_total=328,
+                max_seconds=max_seconds,
+            ),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            _RUNNER._test_stack_local_benchmark_node_start_throttle_delay_seconds(
+                node_ordinal=327,
+                node_total=328,
+                max_seconds=max_seconds,
+            ),
+            max_seconds,
+        )
+
+        target_ip_map["node-82"] = "10.9.0.8"
+        self.assertEqual(
+            _RUNNER._test_stack_local_benchmark_node_start_throttle_max_seconds(
+                scene_mode=_RUNNER.TEST_STACK_MODE_MPMC,
+                node_total=328,
+                role_plan=role_plan,
+                roles_order=["producer", "consumer"],
+                target_ip_map=target_ip_map,
+                cluster_nodes=cluster_nodes,
+                ctx="scale",
+            ),
+            0.0,
+        )
+
+    def test_runtime_command_places_pre_exec_shell_before_python_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            command = _RUNNER._test_stack_runtime_command(
+                run_dir=Path(td),
+                venv_python=Path("/opt/venv/bin/python"),
+                script_path="/repo/fluxon_test_stack/distributed_benchmark_node.py",
+                script_args=["--instance-key", "bench__node_0"],
+                runtime_env={},
+                pre_exec_shell="sleep 12.50\n",
+            )
+
+        self.assertIn("sleep 12.50\nexec /opt/venv/bin/python -u ", command)
+        self.assertLess(
+            command.index("sleep 12.50"),
+            command.index("exec /opt/venv/bin/python -u"),
+        )
+
     def test_write_ci_master_owner_configs_emits_owner_large_file_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
@@ -129,6 +226,35 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 wait_shared_bundle.call_args.kwargs["timeout_s"],
                 _RUNNER.CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S,
             )
+
+    def test_wait_instance_files_present_tolerates_transient_status_error(self) -> None:
+        paths = [Path("/tmp/shared.json"), Path("/tmp/mmap.file")]
+
+        with mock.patch.object(
+            _RUNNER,
+            "_instance_file_exists",
+            side_effect=[False, False, True, True],
+        ) as file_exists:
+            with mock.patch.object(
+                _RUNNER,
+                "_instance_status",
+                side_effect=[
+                    _RUNNER._HttpGetJsonTransientError("timed out"),
+                    {"ok": True, "running": True},
+                ],
+            ) as instance_status:
+                with mock.patch.object(_RUNNER.time, "sleep") as sleep_mock:
+                    _RUNNER._wait_instance_files_present(
+                        {"deploy": {}},
+                        instance_id="kv_owner_node-1",
+                        paths=paths,
+                        timeout_s=30,
+                        ctx="owner shared bundle wait",
+                    )
+
+        self.assertEqual(file_exists.call_count, 4)
+        instance_status.assert_called_once_with({"deploy": {}}, instance_id="kv_owner_node-1")
+        sleep_mock.assert_called_once_with(2.0)
 
     def test_test_stack_result_timeout_covers_mpmc_readiness_gates(self) -> None:
         timeout_s = _RUNNER._test_stack_result_timeout_seconds(

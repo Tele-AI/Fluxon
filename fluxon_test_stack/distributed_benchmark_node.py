@@ -25,12 +25,14 @@ from concurrent.futures import (
 from enum import Enum, unique
 
 import argparse
+import fcntl
 import os
 import queue
 import sys
 import json
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 # Add package root and project root to sys.path.
 package_root = os.path.dirname(os.path.abspath(__file__))
@@ -44,10 +46,12 @@ try:
     from .benchmark_node_mq import (
         MQState,
         MQGetStatus,
+        MQ_MESSAGE_KIND_PREFEED,
         apply_mq_config_from_test_config,
         build_message,
         get_cluster_info_snapshot,
         init_mq_channel,
+        mq_put_to_channel_once,
         mq_put_once,
         mq_get_once,
         MQClosedError,
@@ -85,10 +89,12 @@ except ImportError:
     from benchmark_node_mq import (
         MQState,
         MQGetStatus,
+        MQ_MESSAGE_KIND_PREFEED,
         apply_mq_config_from_test_config,
         build_message,
         get_cluster_info_snapshot,
         init_mq_channel,
+        mq_put_to_channel_once,
         mq_put_once,
         mq_get_once,
         MQClosedError,
@@ -180,6 +186,9 @@ CHAN_CONFIG = {
 METRIC_WARMUP_SECONDS = 60.0
 MIN_EFFECTIVE_BENCHMARK_SECONDS = 30.0
 START_WAIT_POLL_INTERVAL_SECONDS = 1.0
+START_WAIT_POLL_BACKOFF_FACTOR = 1.4
+START_WAIT_POLL_MAX_SECONDS = 10.0
+START_WAIT_POLL_JITTER_SECONDS = 0.5
 DEFAULT_START_WAIT_TIMEOUT_SECONDS = 300.0
 REGISTER_RPC_TIMEOUT_SECONDS = 10.0
 REGISTER_RPC_RETRY_DEADLINE_SECONDS = 120.0
@@ -220,12 +229,24 @@ NETWORK_SAMPLE_INTERVAL_SECONDS = 1.0
 TCP_THREAD_TRANSPORT_QUERY_TIMEOUT_SECONDS = 10.0
 # No fallback/default: MPMC cluster readiness timeout must be explicitly provided
 # by the coordinator via test_config["cluster_ready_timeout_seconds"].
-RPC_CLOSE_TIMEOUT_SECONDS = 2.0
 MPMC_READY_INIT_STAGGER_MIN_EXPECTED_NODES = 16
 MPMC_READY_INIT_STAGGER_SECONDS_PER_EXTRA_NODE = 0.5
 MPMC_READY_INIT_STAGGER_MAX_SECONDS = 60.0
 READY_RUNTIME_INIT_RETRY_BASE_SECONDS = 1.0
 READY_RUNTIME_INIT_RETRY_MAX_SECONDS = 10.0
+RUNTIME_INIT_ETCD_HEALTH_PROBE_TIMEOUT_SECONDS = 1.0
+RUNTIME_INIT_ETCD_HEALTH_CACHE_TTL_SECONDS = 2.0
+RUNTIME_INIT_ETCD_HEALTH_WAIT_LOG_INTERVAL_SECONDS = 10.0
+RUNTIME_INIT_ETCD_HEALTH_MIN_EXPECTED_NODES = 64
+RUNTIME_INIT_ETCD_HEALTH_ROOT = Path("/tmp/fluxon_mpmc_runtime_health")
+MPMC_PRODUCER_RUNTIME_MODE_ACTIVE = "active"
+MPMC_PRODUCER_RUNTIME_MODE_LOGICAL_ONLY = "logical_only"
+MPMC_PRODUCER_RUNTIME_MODES = {
+    MPMC_PRODUCER_RUNTIME_MODE_ACTIVE,
+    MPMC_PRODUCER_RUNTIME_MODE_LOGICAL_ONLY,
+}
+MPMC_PRODUCER_PREFEED_MESSAGES_PER_CHANNEL = 2
+MPMC_PRODUCER_PREFEED_SLOW_PUT_LOG_SECONDS = 5.0
 
 TCP_THREAD_PROM_METRIC_SEND_ENQUEUED = "send_enqueued"
 TCP_THREAD_PROM_METRIC_SOCKET_SUBMITTED = "socket_submitted"
@@ -662,14 +683,9 @@ class _GreptimeOtlpLogExporter:
             time.sleep(0.1)
         return self._queue.unfinished_tasks == 0
 
-    def close(self, timeout_s: float) -> None:
+    def close(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=timeout_s)
-        if self._thread.is_alive():
-            logger.warning(
-                "⚠️ Greptime OTLP exporter thread did not exit before timeout: member_id=%s",
-                self._cfg.member_id,
-            )
+        self._thread.join()
 
     def _run(self) -> None:
         while True:
@@ -746,31 +762,6 @@ def _empty_p2p_receive_transport_components() -> Dict[str, Any]:
             }
         components[component] = component_metrics
     return components
-
-
-def _call_with_timeout(*, fn: Callable[[], Any], timeout_s: float, ctx: str) -> tuple[bool, Any]:
-    """Call fn with a hard timeout. Used to avoid stop-intent hangs during shutdown.
-
-    Returning (ok, value_or_exc):
-    - ok=True: fn returned normally, value_or_exc is the return value
-    - ok=False: fn timed out or raised, value_or_exc is a short error object / exception
-    """
-    out: Dict[str, Any] = {}
-
-    def _target() -> None:
-        try:
-            out["value"] = fn()
-        except BaseException as exc:
-            out["exc"] = exc
-
-    t = threading.Thread(target=_target, name=f"timeout-call:{ctx}", daemon=True)
-    t.start()
-    t.join(timeout_s)
-    if t.is_alive():
-        return False, {"error": "timeout", "timeout_s": float(timeout_s)}
-    if "exc" in out:
-        return False, out["exc"]
-    return True, out.get("value")
 
 
 def _compact_error_detail_label(error_msg: str) -> str:
@@ -1019,15 +1010,12 @@ class OperationResult:
 
 @dataclass
 class PreparedWorkerRuntime:
-    """Worker-owned MPMC runtime prepared before the benchmark window starts."""
+    """MPMC worker endpoint prepared before the benchmark window starts."""
 
     producer: Any = None
     consumer: Any = None
-    kv_store: Any = None
     local_mq_state: Optional[MQState] = None
-    close_producer_on_exit: bool = True
-    close_consumer_on_exit: bool = True
-    close_kv_store_on_exit: bool = True
+    logical_only: bool = False
 
 
 @dataclass
@@ -1037,9 +1025,13 @@ class PreparedMPMCRound:
     pending_threads: Dict[int, threading.Thread] = field(default_factory=dict)
     worker_results: Dict[int, List[OperationResult]] = field(default_factory=dict)
     prepared_runtimes: Dict[int, PreparedWorkerRuntime] = field(default_factory=dict)
+    ready_thread_ids: set[int] = field(default_factory=set)
     prepare_errors: Dict[int, str] = field(default_factory=dict)
+    fatal_errors: Dict[int, BaseException] = field(default_factory=dict)
+    closed_endpoint_ids: set[int] = field(default_factory=set)
     worker_results_lock: threading.Lock = field(default_factory=threading.Lock)
     prepared_lock: threading.Lock = field(default_factory=threading.Lock)
+    endpoint_close_lock: threading.Lock = field(default_factory=threading.Lock)
     start_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -1131,9 +1123,7 @@ class NetworkBandwidthSampler:
     def stop(self) -> None:
         self._stop.set()
         if self._thread.is_alive():
-            self._thread.join(timeout=self.interval_seconds + 2.0)
-            if self._thread.is_alive():
-                logger.warning("⚠️ 网络采样线程未在预期时间内退出: target=%s", self.target)
+            self._thread.join()
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -1255,7 +1245,9 @@ class BenchmarkNode:
         self._prepared_mpmc_round: Optional[PreparedMPMCRound] = None
         self._runtime_init_stagger_once_lock = threading.Lock()
         self._runtime_init_stagger_once_done = False
+        self._mpmc_producer_kv_store_lock = threading.Lock()
         self._mpmc_endpoint_prepare_lock = threading.Lock()
+        self._kv_store_close_lock = threading.Lock()
         self._kv_store_closed = False
         self._fluxon_phase_log_exporter: Optional[_GreptimeOtlpLogExporter] = None
         # 多轮 benchmark 控制：由协调者在 START 响应中告知是否还有后续轮次。
@@ -1325,6 +1317,78 @@ class BenchmarkNode:
                 max_sleep_seconds=max_sleep_seconds
             )
 
+    def _mpmc_expected_nodes(self) -> int:
+        if not isinstance(self.test_config, dict):
+            return 0
+        expected_nodes_raw = self.test_config.get("expected_nodes")
+        try:
+            return int(expected_nodes_raw)
+        except (TypeError, ValueError):
+            return 0
+
+    def _mpmc_producer_runtime_mode(self) -> str:
+        if not isinstance(self.test_config, dict):
+            return MPMC_PRODUCER_RUNTIME_MODE_ACTIVE
+        raw_mode = self.test_config.get(
+            "mpmc_producer_runtime_mode",
+            MPMC_PRODUCER_RUNTIME_MODE_ACTIVE,
+        )
+        if raw_mode is None:
+            mode = MPMC_PRODUCER_RUNTIME_MODE_ACTIVE
+        else:
+            mode = str(raw_mode).strip()
+        if mode not in MPMC_PRODUCER_RUNTIME_MODES:
+            raise ValueError(
+                "mpmc_producer_runtime_mode must be one of "
+                f"{sorted(MPMC_PRODUCER_RUNTIME_MODES)}, got: {raw_mode!r}"
+            )
+        return mode
+
+    def _is_mpmc_producer_prefeed_leader(self, *, thread_id: int) -> bool:
+        if not isinstance(self.test_config, dict):
+            raise RuntimeError("MPMC producer prefeed leader requires test_config")
+        leader = self.test_config.get("mpmc_producer_prefeed_leader")
+        if not isinstance(leader, bool):
+            raise RuntimeError(
+                "mpmc_producer_prefeed_leader must be an explicit bool for every producer"
+            )
+        return leader and thread_id == 0
+
+    def _expected_mpmc_consumer_workers(self) -> int:
+        if not isinstance(self.test_config, dict):
+            raise RuntimeError("expected MPMC consumer workers require test_config")
+        raw_count = self.test_config.get("expected_mpmc_consumer_workers")
+        if not isinstance(raw_count, int) or isinstance(raw_count, bool) or raw_count <= 0:
+            raise RuntimeError(
+                "expected_mpmc_consumer_workers must be an explicit positive integer, "
+                f"got: {raw_count!r}"
+            )
+        return raw_count
+
+    def _runtime_init_etcd_health_wait_enabled(self) -> bool:
+        if not isinstance(self.test_config, dict):
+            return False
+        if str(self.test_config.get("test_mode", "")).strip() != TestMode.MPMC.value:
+            return False
+        return self._mpmc_expected_nodes() > RUNTIME_INIT_ETCD_HEALTH_MIN_EXPECTED_NODES
+
+    def _runtime_init_etcd_health_scope_dir(self, kvcache_config: Dict[str, Any]) -> Path:
+        fluxonkv_spec = kvcache_config.get("fluxonkv_spec")
+        cluster_name = ""
+        if isinstance(fluxonkv_spec, dict):
+            raw_cluster_name = fluxonkv_spec.get("cluster_name")
+            if isinstance(raw_cluster_name, str):
+                cluster_name = raw_cluster_name.strip()
+        scope_key_parts = {
+            "cluster_name": cluster_name,
+            "coordinator": f"{self.coordinator_host}:{self.coordinator_port}",
+            "mq_unique_id": str(self.mq_unique_id or "").strip(),
+            "test_id": str(self.test_config.get("test_id", "") if isinstance(self.test_config, dict) else "").strip(),
+        }
+        scope_key = json.dumps(scope_key_parts, sort_keys=True, ensure_ascii=True)
+        scope_hash = hashlib.sha256(scope_key.encode("utf-8")).hexdigest()[:24]
+        return RUNTIME_INIT_ETCD_HEALTH_ROOT / scope_hash
+
     @staticmethod
     def _is_retryable_runtime_init_error(error_msg: str) -> bool:
         """Classify transient Fluxon runtime init failures seen during fan-out startup."""
@@ -1375,18 +1439,374 @@ class BenchmarkNode:
         jitter_s = self._stable_fraction_from_text(key) * 0.5
         return base_s + jitter_s
 
+    @staticmethod
+    def _runtime_init_shared_json_candidates(kvcache_config: Dict[str, Any]) -> List[Path]:
+        fluxonkv_spec = kvcache_config.get("fluxonkv_spec")
+        if not isinstance(fluxonkv_spec, dict):
+            return []
+
+        raw_share_mem_path = fluxonkv_spec.get("share_mem_path")
+        raw_cluster_name = fluxonkv_spec.get("cluster_name")
+        if not isinstance(raw_share_mem_path, str) or not raw_share_mem_path.strip():
+            return []
+        if not isinstance(raw_cluster_name, str) or not raw_cluster_name.strip():
+            return []
+
+        share_mem_path = Path(raw_share_mem_path.strip())
+        cluster_name = raw_cluster_name.strip()
+        candidates = [
+            share_mem_path / cluster_name / "shared.json",
+            share_mem_path / "shared.json",
+        ]
+        out: List[Path] = []
+        seen = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(candidate)
+        return out
+
+    @staticmethod
+    def _runtime_init_raw_etcd_endpoints(kvcache_config: Dict[str, Any]) -> Tuple[List[Any], str, bool]:
+        fluxonkv_spec = kvcache_config.get("fluxonkv_spec")
+        if not isinstance(fluxonkv_spec, dict):
+            return [], "no fluxonkv_spec configured", False
+
+        raw_endpoints = fluxonkv_spec.get("etcd_addresses")
+        if raw_endpoints is None:
+            raw_endpoints = fluxonkv_spec.get("etcd_addresses_raw")
+        if isinstance(raw_endpoints, str):
+            return [raw_endpoints], "fluxonkv_spec.etcd_addresses", True
+        if isinstance(raw_endpoints, list) and raw_endpoints:
+            return list(raw_endpoints), "fluxonkv_spec.etcd_addresses", True
+
+        shared_json_candidates = BenchmarkNode._runtime_init_shared_json_candidates(kvcache_config)
+        if not shared_json_candidates:
+            return [], "no etcd health endpoint configured", False
+
+        missing_paths: List[str] = []
+        for shared_json_path in shared_json_candidates:
+            try:
+                payload = json.loads(shared_json_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                missing_paths.append(str(shared_json_path))
+                continue
+            except Exception as exc:  # noqa: BLE001
+                return (
+                    [],
+                    f"owner shared.json is not readable: path={shared_json_path} err={type(exc).__name__}: {exc}",
+                    True,
+                )
+            if not isinstance(payload, dict):
+                return [], f"owner shared.json is not a JSON object: path={shared_json_path}", True
+            shared_endpoints = payload.get("etcd_addresses")
+            if isinstance(shared_endpoints, str):
+                return [shared_endpoints], f"owner shared.json: {shared_json_path}", True
+            if isinstance(shared_endpoints, list) and shared_endpoints:
+                return list(shared_endpoints), f"owner shared.json: {shared_json_path}", True
+            return [], f"owner shared.json missing non-empty etcd_addresses: path={shared_json_path}", True
+
+        return [], f"owner shared.json not ready: candidates={missing_paths}", True
+
+    @staticmethod
+    def _runtime_init_etcd_health_urls_from_endpoints(endpoints: List[Any]) -> List[str]:
+        urls: List[str] = []
+        seen = set()
+        for endpoint in endpoints:
+            endpoint_text = str(endpoint).strip()
+            if not endpoint_text:
+                continue
+            if "://" not in endpoint_text:
+                endpoint_text = f"http://{endpoint_text}"
+            parsed = urllib.parse.urlparse(endpoint_text)
+            if not parsed.scheme or not parsed.netloc:
+                continue
+            health_url = urllib.parse.urlunparse(
+                (parsed.scheme, parsed.netloc, "/health", "", "", "")
+            )
+            if health_url in seen:
+                continue
+            seen.add(health_url)
+            urls.append(health_url)
+        return urls
+
+    @staticmethod
+    def _runtime_init_etcd_health_urls_with_source(kvcache_config: Dict[str, Any]) -> Tuple[List[str], str, bool]:
+        endpoints, source, should_wait = BenchmarkNode._runtime_init_raw_etcd_endpoints(kvcache_config)
+        return (
+            BenchmarkNode._runtime_init_etcd_health_urls_from_endpoints(endpoints),
+            source,
+            should_wait,
+        )
+
+    @staticmethod
+    def _runtime_init_etcd_health_urls(kvcache_config: Dict[str, Any]) -> List[str]:
+        urls, _source, _should_wait = BenchmarkNode._runtime_init_etcd_health_urls_with_source(kvcache_config)
+        return urls
+
+    @staticmethod
+    def _runtime_init_etcd_health_probe_expected(kvcache_config: Dict[str, Any]) -> bool:
+        endpoints, _source, should_wait = BenchmarkNode._runtime_init_raw_etcd_endpoints(kvcache_config)
+        return bool(endpoints) or should_wait
+
+    def _runtime_init_etcd_health_cache_paths(
+        self,
+        kvcache_config: Dict[str, Any],
+    ) -> Tuple[Path, Path]:
+        urls, source, should_wait = self._runtime_init_etcd_health_urls_with_source(kvcache_config)
+        cache_key = json.dumps(
+            {
+                "source": source,
+                "should_wait": should_wait,
+                "urls": urls,
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+        )
+        cache_hash = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:24]
+        health_scope_dir = self._runtime_init_etcd_health_scope_dir(kvcache_config)
+        return (
+            health_scope_dir / f"etcd_health_{cache_hash}.json",
+            health_scope_dir / f"etcd_health_{cache_hash}.lock",
+        )
+
+    @staticmethod
+    def _read_runtime_init_etcd_health_cache(cache_path: Path) -> Optional[Tuple[bool, str]]:
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            written_ts = float(payload.get("time", 0.0))
+        except (TypeError, ValueError):
+            return None
+        if time.time() - written_ts > RUNTIME_INIT_ETCD_HEALTH_CACHE_TTL_SECONDS:
+            return None
+        healthy = bool(payload.get("healthy"))
+        detail = str(payload.get("detail", "cached etcd health result"))
+        return healthy, detail
+
+    @staticmethod
+    def _write_runtime_init_etcd_health_cache(
+        cache_path: Path,
+        *,
+        healthy: bool,
+        detail: str,
+    ) -> None:
+        payload = {
+            "time": time.time(),
+            "healthy": bool(healthy),
+            "detail": str(detail),
+            "pid": os.getpid(),
+        }
+        tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+        try:
+            tmp_path.write_text(
+                json.dumps(payload, sort_keys=True, ensure_ascii=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(tmp_path, cache_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "runtime init etcd health cache write failed: path=%s err=%s",
+                cache_path,
+                exc,
+            )
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    def _probe_runtime_init_etcd_health(
+        self,
+        kvcache_config: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        urls, source, should_wait = self._runtime_init_etcd_health_urls_with_source(kvcache_config)
+        if not urls:
+            return (False, source) if should_wait else (True, source)
+
+        errors: List[str] = []
+        for health_url in urls:
+            req = urllib.request.Request(
+                health_url,
+                headers={"User-Agent": "fluxon-benchmark-node/1.0"},
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(
+                    req,
+                    timeout=RUNTIME_INIT_ETCD_HEALTH_PROBE_TIMEOUT_SECONDS,
+                ) as resp:
+                    status = int(getattr(resp, "status", 200))
+                    body_text = resp.read().decode("utf-8", errors="replace")
+                if status != 200:
+                    errors.append(f"{health_url}: http {status}")
+                    continue
+                payload = json.loads(body_text) if body_text.strip() else {}
+                raw_health = payload.get("health")
+                if raw_health is True or str(raw_health).lower() == "true":
+                    return True, f"{source} {health_url}"
+                errors.append(f"{health_url}: unhealthy body={body_text[:160]!r}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{health_url}: {type(exc).__name__}: {exc}")
+        return False, "; ".join(errors[:3])
+
+    def _probe_runtime_init_etcd_health_shared(
+        self,
+        kvcache_config: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """Coalesce same-host etcd health probes during large MPMC startup."""
+        try:
+            cache_path, lock_path = self._runtime_init_etcd_health_cache_paths(kvcache_config)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("runtime init etcd health cache unavailable: err=%s", exc)
+            return self._probe_runtime_init_etcd_health(kvcache_config)
+
+        cached = self._read_runtime_init_etcd_health_cache(cache_path)
+        if cached is not None:
+            healthy, detail = cached
+            return healthy, f"{detail} cache={cache_path}"
+
+        try:
+            lock_handle = lock_path.open("a+", encoding="utf-8")
+        except OSError as exc:
+            logger.debug("runtime init etcd health lock open failed: path=%s err=%s", lock_path, exc)
+            return self._probe_runtime_init_etcd_health(kvcache_config)
+
+        with lock_handle:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                cached = self._read_runtime_init_etcd_health_cache(cache_path)
+                if cached is not None:
+                    healthy, detail = cached
+                    return healthy, f"{detail} cache={cache_path}"
+                return False, f"another process is probing etcd health: cache={cache_path}"
+            except OSError as exc:
+                logger.debug(
+                    "runtime init etcd health lock acquire failed: path=%s err=%s",
+                    lock_path,
+                    exc,
+                )
+                return self._probe_runtime_init_etcd_health(kvcache_config)
+
+            try:
+                cached = self._read_runtime_init_etcd_health_cache(cache_path)
+                if cached is not None:
+                    healthy, detail = cached
+                    return healthy, f"{detail} cache={cache_path}"
+
+                healthy, detail = self._probe_runtime_init_etcd_health(kvcache_config)
+                self._write_runtime_init_etcd_health_cache(
+                    cache_path,
+                    healthy=healthy,
+                    detail=detail,
+                )
+                return healthy, detail
+            finally:
+                try:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+
+    def _wait_for_runtime_init_etcd_health(
+        self,
+        kvcache_config: Dict[str, Any],
+        *,
+        deadline_ts: float,
+        ctx: str,
+    ) -> Optional[str]:
+        """Delay large MPMC runtime initialization while etcd is unhealthy."""
+        if not self._runtime_init_etcd_health_wait_enabled():
+            return None
+        if not self._runtime_init_etcd_health_probe_expected(kvcache_config):
+            return None
+
+        attempt = 0
+        next_wait_log_ts = 0.0
+        while True:
+            healthy, detail = self._probe_runtime_init_etcd_health_shared(kvcache_config)
+            if healthy:
+                if attempt > 0:
+                    logger.info(
+                        "✅ etcd health recovered before MPMC runtime init: ctx=%s detail=%s",
+                        ctx,
+                        detail,
+                    )
+                return None
+
+            remaining_s = deadline_ts - time.monotonic()
+            if remaining_s <= 0.0:
+                return (
+                    "etcd health wait timed out before MPMC runtime init: "
+                    f"ctx={ctx} detail={detail}"
+                )
+
+            attempt += 1
+            sleep_s = min(
+                self._runtime_init_retry_sleep_seconds(attempt=attempt),
+                max(0.0, remaining_s),
+            )
+            now = time.monotonic()
+            if now >= next_wait_log_ts:
+                logger.warning(
+                    "⏳ etcd health not ready; delaying MPMC runtime init: "
+                    "ctx=%s sleep=%.2fs remaining=%.2fs detail=%s",
+                    ctx,
+                    sleep_s,
+                    remaining_s,
+                    detail,
+                )
+                next_wait_log_ts = now + RUNTIME_INIT_ETCD_HEALTH_WAIT_LOG_INTERVAL_SECONDS
+            time.sleep(sleep_s)
+
     def _init_kv_store_with_ready_retry(
         self,
         kvcache_config: Dict[str, Any],
+        *,
+        deadline_ts: Optional[float] = None,
     ) -> Tuple[Optional[Any], Optional[str]]:
         """Initialize the KV client with bounded retry for transient fan-out failures."""
-        deadline_s = self._runtime_init_retry_deadline_seconds()
-        deadline_ts = time.monotonic() + deadline_s if deadline_s > 0.0 else time.monotonic()
+        start_ts = time.monotonic()
+        if deadline_ts is None:
+            deadline_s = self._runtime_init_retry_deadline_seconds()
+            deadline_ts = start_ts + deadline_s if deadline_s > 0.0 else start_ts
+        else:
+            deadline_s = max(0.0, float(deadline_ts) - start_ts)
         attempt = 0
         last_err: Optional[str] = None
 
         while True:
             attempt += 1
+            remaining_before_attempt_s = deadline_ts - time.monotonic()
+            if deadline_s > 0.0 and remaining_before_attempt_s <= 0.0:
+                return (
+                    None,
+                    f"runtime init retry deadline elapsed before attempt {attempt} "
+                    f"(within {deadline_s:.1f}s)",
+                )
+
+            health_err = self._wait_for_runtime_init_etcd_health(
+                kvcache_config,
+                deadline_ts=deadline_ts,
+                ctx="kv_store_init",
+            )
+            if health_err is not None:
+                return None, health_err
+            remaining_before_attempt_s = deadline_ts - time.monotonic()
+            if deadline_s > 0.0 and remaining_before_attempt_s <= 0.0:
+                return (
+                    None,
+                    f"runtime init retry deadline elapsed before attempt {attempt} "
+                    f"(within {deadline_s:.1f}s)",
+                )
             store, err = init_kv_store(kvcache_config)
             if err is None:
                 if attempt > 1:
@@ -1616,7 +2036,7 @@ class BenchmarkNode:
         exporter = self._fluxon_phase_log_exporter
         if exporter is None:
             return
-        exporter.close(GREPTIME_OTLP_LOG_EXPORT_DRAIN_TIMEOUT_SECONDS)
+        exporter.close()
         self._fluxon_phase_log_exporter = None
 
     def _start_network_bandwidth_sampler(self) -> None:
@@ -2374,7 +2794,8 @@ class BenchmarkNode:
 
     def _stop_heartbeat(self) -> None:
         self._heartbeat_stop.set()
-        self._heartbeat_thread.join(timeout=1.0)
+        if self._heartbeat_thread.ident is not None:
+            self._heartbeat_thread.join()
 
     def _inflight_begin(self) -> int:
         """Increment in-flight request count and return the current value."""
@@ -2398,125 +2819,109 @@ class BenchmarkNode:
 
     def _close_kv_store(self, *, reason: str) -> None:
         """Close the shared KvClient exactly once."""
-        close_fs_runtime(self, logger=logger, reason=reason)
-        close_rpc_runtime(self)
-        if self.kv_store is None:
-            return
-        if self._kv_store_closed:
-            return
-        logger.info("🔒 Closing kv_store: reason=%s", reason)
-        ok, close_res = _call_with_timeout(
-            fn=self.kv_store.close,
-            timeout_s=RPC_CLOSE_TIMEOUT_SECONDS,
-            ctx=f"kv_store.close reason={reason}",
-        )
-        if not ok:
-            logger.warning("⚠️ kv_store close timed out or raised: reason=%s err=%s", reason, close_res)
-            return
-        if not close_res.is_ok():
-            logger.warning("⚠️ kv_store 关闭失败: reason=%s err=%s", reason, close_res.unwrap_error())
-            return
-        close_res.unwrap()
-        self._kv_store_closed = True
+        with self._kv_store_close_lock:
+            close_fs_runtime(self, logger=logger, reason=reason)
+            close_rpc_runtime(self)
+            if self.kv_store is None or self._kv_store_closed:
+                return
 
-    def _close_worker_owned_kv_store(
-        self,
-        kv_store: Any,
-        *,
-        reason: str,
-        thread_id: int,
-    ) -> None:
-        """Close a worker-owned KvClient created after START for MPMC producer."""
-        if kv_store is None:
-            return
-        logger.info(
-            "🔒 Closing worker-owned kv_store: reason=%s thread_id=%s",
-            reason,
-            thread_id,
-        )
-        ok, close_res = _call_with_timeout(
-            fn=kv_store.close,
-            timeout_s=RPC_CLOSE_TIMEOUT_SECONDS,
-            ctx=f"worker-owned kv_store.close reason={reason} thread_id={thread_id}",
-        )
-        if not ok:
-            logger.warning(
-                "⚠️ worker-owned kv_store close timed out or raised: "
-                "reason=%s thread_id=%s err=%s",
+            logger.info("🔒 Closing kv_store: reason=%s", reason)
+            close_started = time.monotonic()
+            close_res = self.kv_store.close()
+            if not close_res.is_ok():
+                close_error = close_res.unwrap_error()
+                raise RuntimeError(
+                    f"kv_store close failed: reason={reason} err={close_error}"
+                )
+            close_res.unwrap()
+            self._kv_store_closed = True
+            logger.info(
+                "✅ kv_store closed: reason=%s elapsed_seconds=%.3f",
                 reason,
-                thread_id,
-                close_res,
+                time.monotonic() - close_started,
             )
-            return
-        if not close_res.is_ok():
-            logger.warning(
-                "⚠️ worker-owned kv_store 关闭失败: reason=%s thread_id=%s err=%s",
-                reason,
-                thread_id,
-                close_res.unwrap_error(),
-            )
-            return
-        close_res.unwrap()
 
-    def _prepare_mpmc_worker_runtime(self, *, thread_id: int) -> PreparedWorkerRuntime:
-        """Prepare one worker-owned MPMC runtime before the benchmark window starts."""
-        return self._prepare_mpmc_worker_runtime_uncached(thread_id=thread_id)
-
-    def _prepare_mpmc_worker_runtime_uncached(
+    def _prepare_mpmc_worker_runtime(
         self,
         *,
         thread_id: int,
         producer_kvcache_config: Optional[Dict[str, Any]] = None,
+        runtime_init_deadline_ts: Optional[float] = None,
     ) -> PreparedWorkerRuntime:
-        """Prepare one owned MPMC runtime without process-level reuse."""
+        """Prepare one MPMC endpoint, reusing the producer process KV runtime."""
         node_role = self.test_config.get("node_role", "")
         test_mode = self.test_config.get("test_mode", "")
-        kv_store = self.kv_store
-        worker_owned_kv_store = None
-        if kv_store is None:
-            if not (test_mode == TestMode.MPMC.value and node_role == "producer"):
-                raise RuntimeError("MPMC 模式下 KV store 未初始化")
+        if (
+            test_mode == TestMode.MPMC.value
+            and node_role == "producer"
+            and self._mpmc_producer_runtime_mode()
+            == MPMC_PRODUCER_RUNTIME_MODE_LOGICAL_ONLY
+        ):
             logger.info(
-                "🔧 线程 %s 正在创建 MPMC producer worker-owned KVCache 存储实例",
+                "⏭️ MPMC producer logical-only runtime prepared: thread_id=%s instance_key=%s",
                 thread_id,
+                self.instance_key,
             )
-            max_benchmark_seconds = float(
-                self.test_config.get("max_benchmark_seconds", 0.0)
+            return PreparedWorkerRuntime(
+                producer=None,
+                consumer=None,
+                local_mq_state=None,
+                logical_only=True,
             )
-            max_start_stagger_s = (
-                max_benchmark_seconds / 2.0
-                if max_benchmark_seconds > 0.0
-                else None
-            )
-            self._sleep_for_runtime_init_stagger_once(
-                max_sleep_seconds=max_start_stagger_s
-            )
+        kv_store = self.kv_store
+        if test_mode == TestMode.MPMC.value and node_role == "producer":
+            self._sleep_for_runtime_init_stagger_once()
             if producer_kvcache_config is None:
-                worker_kvcache_config = self._worker_owned_kvcache_config(
+                producer_process_kvcache_config = self._worker_owned_kvcache_config(
                     self.test_config["kvcache_config"],
                     thread_id=thread_id,
                 )
             else:
-                worker_kvcache_config = copy.deepcopy(producer_kvcache_config)
-            store, err = self._init_kv_store_with_ready_retry(
-                worker_kvcache_config
-            )
-            if err is not None:
-                raise RuntimeError(
-                    f"线程 {thread_id} 创建 MPMC producer worker-owned KV store 失败: {err}"
+                producer_process_kvcache_config = copy.deepcopy(producer_kvcache_config)
+
+            if runtime_init_deadline_ts is None:
+                deadline_s = self._runtime_init_retry_deadline_seconds()
+                runtime_init_deadline_ts = (
+                    time.monotonic() + deadline_s if deadline_s > 0.0 else time.monotonic()
                 )
-            kv_store = store
-            worker_owned_kv_store = store
-            self._attach_fluxon_phase_summary_callback(worker_owned_kv_store)
-            logger.info(
-                "✅ 线程 %s 已创建 MPMC producer worker-owned KVCache 存储实例",
-                thread_id,
+            with self._mpmc_producer_kv_store_lock:
+                kv_store = self.kv_store
+                if kv_store is None:
+                    logger.info(
+                        "🔧 线程 %s 正在创建 MPMC producer process-shared KVCache 存储实例",
+                        thread_id,
+                    )
+                    store, err = self._init_kv_store_with_ready_retry(
+                        producer_process_kvcache_config,
+                        deadline_ts=runtime_init_deadline_ts,
+                    )
+                    if err is not None:
+                        raise RuntimeError(
+                            f"线程 {thread_id} 创建 MPMC producer process-shared KV store 失败: {err}"
+                        )
+                    self._attach_fluxon_phase_summary_callback(store)
+                    self.kv_store = store
+                    kv_store = store
+                    logger.info(
+                        "✅ 线程 %s 已创建 MPMC producer process-shared KVCache 存储实例",
+                        thread_id,
+                    )
+
+            if kv_store is None:
+                raise RuntimeError(
+                    f"线程 {thread_id} 未获得 MPMC producer process-shared KV store"
+                )
+
+            return self._prepare_mpmc_endpoint_runtime_from_kv_store(
+                thread_id=thread_id,
+                kv_store=kv_store,
             )
 
+        if kv_store is None:
+            raise RuntimeError("MPMC 模式下 KV store 未初始化")
         return self._prepare_mpmc_endpoint_runtime_from_kv_store(
             thread_id=thread_id,
             kv_store=kv_store,
-            worker_owned_kv_store=worker_owned_kv_store,
         )
 
     def _prepare_mpmc_endpoint_runtime_from_kv_store(
@@ -2524,45 +2929,36 @@ class BenchmarkNode:
         *,
         thread_id: int,
         kv_store: Any,
-        worker_owned_kv_store: Any,
     ) -> PreparedWorkerRuntime:
         """Attach one MPMC endpoint using an already-created KV client."""
         node_role = self.test_config.get("node_role", "")
         producer = None
         consumer = None
-        try:
-            with self._mpmc_endpoint_prepare_lock:
-                if node_role == "producer":
-                    producer, _, err = init_mq_channel(
-                        role="producer",
-                        kv_store=kv_store,
-                        chan_config=self.chan_config,
-                        unique_id=self.mq_unique_id,
-                        weight=self.mq_state.weight if self.mq_state else 1.0,
-                    )
-                    if err is not None:
-                        raise RuntimeError(f"线程 {thread_id} 初始化 MPMC producer 失败: {err}")
-                    if self.mq_state is not None and self.mq_state.producer_id is None:
-                        self.mq_state.producer_id = self.instance_key or self.node_id
-                elif node_role == "consumer":
-                    _, consumer, err = init_mq_channel(
-                        role="consumer",
-                        kv_store=kv_store,
-                        chan_config=self.chan_config,
-                        unique_id=self.mq_unique_id,
-                        weight=self.mq_state.weight if self.mq_state else 1.0,
-                    )
-                    if err is not None:
-                        raise RuntimeError(f"线程 {thread_id} 初始化 MPMC consumer 失败: {err}")
-                else:
-                    raise RuntimeError(f"不支持的 MPMC 角色: {node_role}")
-        except Exception:
-            self._close_worker_owned_kv_store(
-                worker_owned_kv_store,
-                reason="mpmc_endpoint_prepare_failed",
-                thread_id=thread_id,
-            )
-            raise
+        with self._mpmc_endpoint_prepare_lock:
+            if node_role == "producer":
+                producer, _, err = init_mq_channel(
+                    role="producer",
+                    kv_store=kv_store,
+                    chan_config=self.chan_config,
+                    unique_id=self.mq_unique_id,
+                    weight=self.mq_state.weight if self.mq_state else 1.0,
+                )
+                if err is not None:
+                    raise RuntimeError(f"线程 {thread_id} 初始化 MPMC producer 失败: {err}")
+                if self.mq_state is not None and self.mq_state.producer_id is None:
+                    self.mq_state.producer_id = self.instance_key or self.node_id
+            elif node_role == "consumer":
+                _, consumer, err = init_mq_channel(
+                    role="consumer",
+                    kv_store=kv_store,
+                    chan_config=self.chan_config,
+                    unique_id=self.mq_unique_id,
+                    weight=self.mq_state.weight if self.mq_state else 1.0,
+                )
+                if err is not None:
+                    raise RuntimeError(f"线程 {thread_id} 初始化 MPMC consumer 失败: {err}")
+            else:
+                raise RuntimeError(f"不支持的 MPMC 角色: {node_role}")
 
         local_mq_state: Optional[MQState] = None
         if node_role == "producer":
@@ -2577,7 +2973,6 @@ class BenchmarkNode:
         return PreparedWorkerRuntime(
             producer=producer,
             consumer=consumer,
-            kv_store=worker_owned_kv_store,
             local_mq_state=local_mq_state,
         )
 
@@ -2597,7 +2992,10 @@ class BenchmarkNode:
                 )
             attempt += 1
             try:
-                runtime = self._prepare_mpmc_worker_runtime(thread_id=thread_id)
+                runtime = self._prepare_mpmc_worker_runtime(
+                    thread_id=thread_id,
+                    runtime_init_deadline_ts=deadline_ts,
+                )
                 if attempt > 1:
                     logger.info(
                         "✅ MPMC endpoint prepare retry succeeded: ctx=%s thread_id=%s attempts=%s",
@@ -2637,7 +3035,7 @@ class BenchmarkNode:
         runtime: PreparedWorkerRuntime,
         expected_workers: int,
         timeout_s: float,
-    ) -> None:
+    ) -> Any:
         """Wait until the MPMC topology is ready before starting metrics."""
         if timeout_s <= 0:
             raise RuntimeError(f"MPMC cluster ready timeout_s must be > 0, got {timeout_s}")
@@ -2671,7 +3069,7 @@ class BenchmarkNode:
                     ready_channels,
                     active_consumers,
                 )
-                return
+                return snapshot
             now = time.time()
             if now >= deadline_ts:
                 raise RuntimeError(
@@ -2696,6 +3094,266 @@ class BenchmarkNode:
                 last_wait_reason = readiness.reason
             time.sleep(1.0)
 
+    def _wait_mpmc_prefeed_topology(
+        self,
+        *,
+        runtime: PreparedWorkerRuntime,
+        timeout_s: float,
+    ) -> Any:
+        """Wait for two identical authoritative observations of the full consumer topology."""
+        if runtime.producer is None:
+            raise RuntimeError("MPMC prefeed topology requires a producer endpoint")
+        expected_channels = self._expected_mpmc_consumer_workers()
+        deadline_ts = time.monotonic() + float(timeout_s)
+        previous_stable_key: Optional[Tuple[Any, ...]] = None
+        stable_observations = 0
+        last_reason = ""
+        last_log_ts = 0.0
+
+        while True:
+            snapshot = get_cluster_info_snapshot(runtime.producer)
+            channel_ids = snapshot.mpsc_channel_ids
+            ready_channel_ids = snapshot.ready_channel_ids
+            active_consumers = snapshot.active_consumers
+
+            if channel_ids is None or ready_channel_ids is None or active_consumers is None:
+                reason = (
+                    "incomplete authority snapshot: "
+                    f"channels={channel_ids} ready={ready_channel_ids} "
+                    f"active_consumers={active_consumers}"
+                )
+                stable_key = None
+            elif len(channel_ids) != expected_channels:
+                reason = (
+                    "channel count mismatch: "
+                    f"actual={len(channel_ids)} expected={expected_channels} ids={channel_ids}"
+                )
+                stable_key = None
+            elif len(ready_channel_ids) != expected_channels:
+                reason = (
+                    "ready channel count mismatch: "
+                    f"actual={len(ready_channel_ids)} expected={expected_channels} "
+                    f"ids={ready_channel_ids}"
+                )
+                stable_key = None
+            elif len(set(channel_ids)) != expected_channels:
+                reason = f"channel authority contains duplicate ids: ids={channel_ids}"
+                stable_key = None
+            elif len(set(ready_channel_ids)) != expected_channels:
+                reason = f"ready channel authority contains duplicate ids: ids={ready_channel_ids}"
+                stable_key = None
+            elif set(channel_ids) != set(ready_channel_ids):
+                reason = (
+                    "ready channel set differs from channel authority: "
+                    f"channels={channel_ids} ready={ready_channel_ids}"
+                )
+                stable_key = None
+            elif int(active_consumers) != expected_channels:
+                reason = (
+                    "active consumer count mismatch: "
+                    f"actual={active_consumers} expected={expected_channels}"
+                )
+                stable_key = None
+            else:
+                stable_key = (
+                    snapshot.mpmc_id,
+                    channel_ids,
+                    ready_channel_ids,
+                    int(active_consumers),
+                )
+                reason = "ready"
+
+            if stable_key is not None:
+                if stable_key == previous_stable_key:
+                    stable_observations += 1
+                else:
+                    previous_stable_key = stable_key
+                    stable_observations = 1
+                if stable_observations >= 2:
+                    logger.info(
+                        "✅ MPMC prefeed topology stable: expected_channels=%s channel_ids=%s",
+                        expected_channels,
+                        channel_ids,
+                    )
+                    return snapshot
+            else:
+                previous_stable_key = None
+                stable_observations = 0
+
+            now = time.monotonic()
+            if now >= deadline_ts:
+                raise RuntimeError(
+                    "MPMC prefeed topology did not stabilize before timeout: "
+                    f"expected_channels={expected_channels} reason={reason}"
+                )
+            if reason != last_reason or now - last_log_ts >= 10.0:
+                logger.info(
+                    "⏳ MPMC prefeed topology waiting: expected_channels=%s reason=%s",
+                    expected_channels,
+                    reason,
+                )
+                last_reason = reason
+                last_log_ts = now
+            time.sleep(min(1.0, max(0.0, deadline_ts - now)))
+
+    def _prefeed_mpmc_producer_channels(
+        self,
+        *,
+        runtime: PreparedWorkerRuntime,
+        thread_id: int,
+        timeout_s: float,
+    ) -> None:
+        """Open and feed every known MPSC channel before releasing consumers."""
+        if runtime.logical_only:
+            return
+        producer = runtime.producer
+        if producer is None:
+            raise RuntimeError(
+                f"MPMC producer prefeed requires an active producer endpoint: thread_id={thread_id}"
+            )
+
+        snapshot = self._wait_mpmc_prefeed_topology(
+            runtime=runtime,
+            timeout_s=timeout_s,
+        )
+        channel_ids = getattr(snapshot, "mpsc_channel_ids", None)
+        if channel_ids is None:
+            raise RuntimeError(
+                f"MPMC producer prefeed cannot determine channel ids: thread_id={thread_id}"
+            )
+        channel_ids = tuple(str(channel_id) for channel_id in channel_ids)
+        total_mpsc_channels = len(channel_ids)
+        if total_mpsc_channels <= 0:
+            raise RuntimeError(
+                "MPMC producer prefeed requires at least one MPSC channel: "
+                f"thread_id={thread_id} total_mpsc_channels={total_mpsc_channels}"
+            )
+
+        mq_state = runtime.local_mq_state or self.mq_state
+        if mq_state is None:
+            raise RuntimeError(
+                f"MPMC producer prefeed requires MQ state: thread_id={thread_id}"
+            )
+
+        value_size = int(self.test_config.get("value_size", 1024))
+        message_count = total_mpsc_channels * MPMC_PRODUCER_PREFEED_MESSAGES_PER_CHANNEL
+        fallback_producer_id = self.instance_key or self.node_id
+        prefeed_deadline_ts = time.monotonic() + float(timeout_s)
+        logger.info(
+            "🔥 MPMC producer prefeed start: thread_id=%s total_mpsc_channels=%s messages=%s value_size=%s",
+            thread_id,
+            total_mpsc_channels,
+            message_count,
+            value_size,
+        )
+
+        completed = 0
+        for channel_id in channel_ids:
+            for channel_message_idx in range(MPMC_PRODUCER_PREFEED_MESSAGES_PER_CHANNEL):
+                if self._benchmark_stop.is_set():
+                    raise RuntimeError(
+                        "MPMC producer prefeed stopped: "
+                        f"thread_id={thread_id} channel_id={channel_id} completed={completed}"
+                    )
+                if time.monotonic() >= prefeed_deadline_ts:
+                    raise RuntimeError(
+                        "MPMC producer prefeed timed out before completing: "
+                        f"thread_id={thread_id} completed={completed}/{message_count} "
+                        f"timeout_s={timeout_s}"
+                    )
+
+                value = build_message(
+                    mq_state,
+                    value_size,
+                    fallback_producer_id=fallback_producer_id,
+                    message_kind=MQ_MESSAGE_KIND_PREFEED,
+                )
+                put_start = time.perf_counter()
+                err = mq_put_to_channel_once(producer, channel_id, value)
+                put_latency_s = time.perf_counter() - put_start
+                completed += 1
+                if put_latency_s >= MPMC_PRODUCER_PREFEED_SLOW_PUT_LOG_SECONDS:
+                    logger.warning(
+                        "⚠️ MPMC producer prefeed slow PUT: thread_id=%s channel_id=%s "
+                        "channel_message=%s/%s completed=%s/%s latency_s=%.3f",
+                        thread_id,
+                        channel_id,
+                        channel_message_idx + 1,
+                        MPMC_PRODUCER_PREFEED_MESSAGES_PER_CHANNEL,
+                        completed,
+                        message_count,
+                        put_latency_s,
+                    )
+                if err is not None:
+                    raise RuntimeError(
+                        "MPMC producer prefeed PUT failed: "
+                        f"thread_id={thread_id} channel_id={channel_id} "
+                        f"channel_message={channel_message_idx + 1}/"
+                        f"{MPMC_PRODUCER_PREFEED_MESSAGES_PER_CHANNEL} err={err}"
+                    )
+
+        final_snapshot = self._wait_mpmc_prefeed_topology(
+            runtime=runtime,
+            timeout_s=max(0.001, prefeed_deadline_ts - time.monotonic()),
+        )
+        final_channel_ids = tuple(getattr(final_snapshot, "mpsc_channel_ids", ()) or ())
+        if final_channel_ids != channel_ids:
+            raise RuntimeError(
+                "MPMC channel topology changed during prefeed: "
+                f"before={channel_ids} after={final_channel_ids}"
+            )
+
+        logger.info(
+            "✅ MPMC producer prefeed complete: thread_id=%s total_mpsc_channels=%s messages=%s",
+            thread_id,
+            total_mpsc_channels,
+            message_count,
+        )
+
+    def _consume_mpmc_prefeed_messages(
+        self,
+        *,
+        round_state: PreparedMPMCRound,
+        timeout_s: float,
+    ) -> None:
+        """Drain and validate each consumer endpoint's prefeed before metric start."""
+        deadline_ts = time.monotonic() + float(timeout_s)
+        for thread_id, runtime in sorted(round_state.prepared_runtimes.items()):
+            consumer = runtime.consumer
+            if consumer is None:
+                raise RuntimeError(
+                    f"MPMC consumer prefeed drain requires endpoint: thread_id={thread_id}"
+                )
+            consumed = 0
+            while consumed < MPMC_PRODUCER_PREFEED_MESSAGES_PER_CHANNEL:
+                if time.monotonic() >= deadline_ts:
+                    raise RuntimeError(
+                        "MPMC consumer prefeed drain timed out: "
+                        f"thread_id={thread_id} consumed={consumed}/"
+                        f"{MPMC_PRODUCER_PREFEED_MESSAGES_PER_CHANNEL}"
+                    )
+                outcome = mq_get_once(consumer, batch_size=1)
+                if outcome.status == MQGetStatus.NO_MESSAGE:
+                    time.sleep(MPMC_NO_MESSAGE_RETRY_SLEEP_SECONDS)
+                    continue
+                if outcome.status != MQGetStatus.DATA or not outcome.ok:
+                    raise RuntimeError(
+                        "MPMC consumer prefeed drain failed: "
+                        f"thread_id={thread_id} status={outcome.status.value} "
+                        f"err={outcome.error_msg}"
+                    )
+                if outcome.message_kind != MQ_MESSAGE_KIND_PREFEED:
+                    raise RuntimeError(
+                        "MPMC consumer received non-prefeed message before runtime start: "
+                        f"thread_id={thread_id} message_kind={outcome.message_kind!r}"
+                    )
+                consumed += 1
+            logger.info(
+                "✅ MPMC consumer prefeed drained: thread_id=%s messages=%s",
+                thread_id,
+                consumed,
+            )
+
     def _prepare_mpmc_round_before_ready(self, *, workers: int) -> None:
         """Prepare one MPMC round before reporting READY to the coordinator."""
         if self._prepared_mpmc_round is not None:
@@ -2708,6 +3366,7 @@ class BenchmarkNode:
             raise RuntimeError(f"不支持的 MPMC 角色: {role}")
 
         round_state = PreparedMPMCRound()
+        self._prepared_mpmc_round = round_state
         prepare_retry_deadline_ts = time.monotonic() + cluster_ready_timeout_s
 
         def worker_target(thread_id: int) -> None:
@@ -2719,6 +3378,23 @@ class BenchmarkNode:
                 )
                 with round_state.prepared_lock:
                     round_state.prepared_runtimes[thread_id] = runtime
+                if role == "producer" and self._is_mpmc_producer_prefeed_leader(
+                    thread_id=thread_id
+                ):
+                    self._prefeed_mpmc_producer_channels(
+                        runtime=runtime,
+                        thread_id=thread_id,
+                        timeout_s=cluster_ready_timeout_s,
+                    )
+                elif role == "producer" and not runtime.logical_only:
+                    logger.info(
+                        "⏭️ MPMC producer prefeed skipped on non-leader: "
+                        "thread_id=%s instance_key=%s",
+                        thread_id,
+                        self.instance_key,
+                    )
+                with round_state.prepared_lock:
+                    round_state.ready_thread_ids.add(thread_id)
                 logger.info("✅ 线程 %s 已完成 MPMC endpoint prepare", thread_id)
                 round_state.start_event.wait()
                 result_list = self._run_worker_thread(
@@ -2730,34 +3406,68 @@ class BenchmarkNode:
                     _debug_print(
                         f"worker {thread_id} wrapper done, ops={len(result_list)}"
                     )
-            except Exception as exc:
-                logger.error(f"❌ 线程 {thread_id} 执行异常: {exc}")
+            except BaseException as exc:
                 with round_state.prepared_lock:
-                    round_state.prepare_errors[thread_id] = str(exc)
+                    if isinstance(exc, Exception):
+                        round_state.prepare_errors[thread_id] = str(exc)
+                    else:
+                        round_state.fatal_errors[thread_id] = exc
+                if isinstance(exc, Exception):
+                    logger.error(f"❌ 线程 {thread_id} 执行异常: {exc}")
+                else:
+                    logger.critical(
+                        "💥 MPMC worker fatal BaseException: thread_id=%s type=%s err=%s",
+                        thread_id,
+                        type(exc).__name__,
+                        exc,
+                    )
                 if role == "producer":
                     _debug_print(
-                        f"worker {thread_id} wrapper exception: {exc}"
+                        f"worker {thread_id} wrapper exception: {type(exc).__name__}: {exc}"
                     )
                 result_list = []
             with round_state.worker_results_lock:
                 round_state.worker_results[thread_id] = result_list
 
+        defer_worker_start_until_start = role == "producer"
         for thread_id in range(workers):
             thread = threading.Thread(
                 target=worker_target,
                 args=(thread_id,),
                 name=f"bench-worker-{self.node_id}-{thread_id}",
-                daemon=True,
+                daemon=False,
             )
             round_state.pending_threads[thread_id] = thread
-            thread.start()
+            if not defer_worker_start_until_start:
+                thread.start()
+
+        if defer_worker_start_until_start:
+            self._prepared_mpmc_round = round_state
+            logger.info(
+                "✅ MPMC producer round deferred until START: workers=%s role=%s",
+                workers,
+                role,
+            )
+            return
 
         prepare_deadline_ts = time.time() + cluster_ready_timeout_s
         while True:
             with round_state.prepared_lock:
-                prepared_count = len(round_state.prepared_runtimes)
+                prepared_count = len(round_state.ready_thread_ids)
                 prepare_error_snapshot = dict(round_state.prepare_errors)
+                fatal_error_snapshot = dict(round_state.fatal_errors)
+            if fatal_error_snapshot:
+                self._raise_mpmc_fatal_worker_error(
+                    round_state=round_state,
+                    fatal_errors=fatal_error_snapshot,
+                    stage="prepare_before_ready",
+                )
             if prepare_error_snapshot:
+                self._finish_mpmc_round(
+                    round_state=round_state,
+                    reason="prepare_before_ready_failed",
+                )
+                self._prepared_mpmc_round = None
                 raise RuntimeError(
                     "MPMC worker prepare failed: "
                     + ", ".join(
@@ -2768,17 +3478,29 @@ class BenchmarkNode:
             if prepared_count == workers:
                 break
             if time.time() >= prepare_deadline_ts:
+                self._finish_mpmc_round(
+                    round_state=round_state,
+                    reason="prepare_before_ready_timeout",
+                )
+                self._prepared_mpmc_round = None
                 raise RuntimeError(
                     f"MPMC worker prepare timed out: prepared={prepared_count}/{workers}"
                 )
             time.sleep(0.5)
 
-        self._wait_mpmc_cluster_ready(
-            runtime=round_state.prepared_runtimes[0],
-            expected_workers=workers,
-            timeout_s=cluster_ready_timeout_s,
-        )
-        self._prepared_mpmc_round = round_state
+        try:
+            self._wait_mpmc_cluster_ready(
+                runtime=round_state.prepared_runtimes[0],
+                expected_workers=workers,
+                timeout_s=cluster_ready_timeout_s,
+            )
+        except BaseException:
+            self._finish_mpmc_round(
+                round_state=round_state,
+                reason="cluster_ready_failed",
+            )
+            self._prepared_mpmc_round = None
+            raise
         logger.info(
             "✅ MPMC round prepared before READY: workers=%s role=%s",
             workers,
@@ -2798,136 +3520,165 @@ class BenchmarkNode:
         self._prepared_mpmc_round = None
         return round_state
 
-    def _request_shutdown_prepared_mpmc_endpoints_for_stop_intent(
+    def _raise_mpmc_fatal_worker_error(
         self,
         *,
         round_state: PreparedMPMCRound,
+        fatal_errors: Dict[int, BaseException],
+        stage: str,
     ) -> None:
-        """Request shutdown on active MPMC endpoints so blocked worker ops can unwind."""
-        role = self.test_config.get("node_role")
-        if role == "producer":
-            endpoint_label = "producer"
-            blocked_op_label = "PUT"
-            endpoint_items = [
-                (thread_id, runtime.producer)
-                for thread_id, runtime in sorted(round_state.prepared_runtimes.items())
-                if runtime.producer is not None
-            ]
-        elif role == "consumer":
-            endpoint_label = "consumer"
-            blocked_op_label = "GET"
-            endpoint_items = [
-                (thread_id, runtime.consumer)
-                for thread_id, runtime in sorted(round_state.prepared_runtimes.items())
-                if runtime.consumer is not None
-            ]
-        else:
-            raise RuntimeError(f"unsupported MPMC node_role for stop-intent close: {role}")
-
-        if not endpoint_items:
-            return
-        logger.info(
-            "🛑 主线程通知所有活动 MPMC %ss shutdown，以中断阻塞 %s: thread_ids=%s",
-            endpoint_label,
-            blocked_op_label,
-            [thread_id for thread_id, _ in endpoint_items],
-        )
-        requested_endpoint_ids = set()
-        for thread_id, endpoint in endpoint_items:
-            endpoint_id = id(endpoint)
-            if endpoint_id in requested_endpoint_ids:
-                continue
-            requested_endpoint_ids.add(endpoint_id)
-            request_shutdown = getattr(endpoint, "request_shutdown", None)
-            if request_shutdown is None:
-                logger.warning(
-                    "活动 MPMC %s 缺少 request_shutdown: thread_id=%s",
-                    endpoint_label,
-                    thread_id,
-                )
-                continue
-            try:
-                request_shutdown()
-                logger.info(
-                    "✅ 主线程已通知 MPMC %s shutdown: thread_id=%s",
-                    endpoint_label,
-                    thread_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "通知活动 MPMC %s shutdown 失败: thread_id=%s err=%s",
-                    endpoint_label,
-                    thread_id,
-                    exc,
-                )
-
-    def _close_prepared_mpmc_endpoints_for_stop_intent(
-        self,
-        *,
-        round_state: PreparedMPMCRound,
-    ) -> None:
-        """Close active prepared MPMC endpoints after shutdown has been requested."""
-        role = self.test_config.get("node_role")
-        if role == "producer":
-            endpoint_label = "producer"
-            blocked_op_label = "PUT"
-            endpoint_items = [
-                (thread_id, runtime.producer)
-                for thread_id, runtime in sorted(round_state.prepared_runtimes.items())
-                if runtime.producer is not None
-            ]
-        elif role == "consumer":
-            endpoint_label = "consumer"
-            blocked_op_label = "GET"
-            endpoint_items = [
-                (thread_id, runtime.consumer)
-                for thread_id, runtime in sorted(round_state.prepared_runtimes.items())
-                if runtime.consumer is not None
-            ]
-        else:
-            raise RuntimeError(f"unsupported MPMC node_role for stop-intent close: {role}")
-
-        if not endpoint_items:
-            return
-        logger.info(
-            "🛑 主线程关闭所有活动 MPMC %ss，以中断阻塞 %s: thread_ids=%s",
-            endpoint_label,
-            blocked_op_label,
-            [thread_id for thread_id, _ in endpoint_items],
-        )
-        closed_endpoint_ids = set()
-        for thread_id, endpoint in endpoint_items:
-            endpoint_id = id(endpoint)
-            if endpoint_id in closed_endpoint_ids:
-                continue
-            closed_endpoint_ids.add(endpoint_id)
-            ok, close_res = _call_with_timeout(
-                fn=endpoint.close,
-                timeout_s=RPC_CLOSE_TIMEOUT_SECONDS,
-                ctx=f"mpmc {endpoint_label}.close thread_id={thread_id}",
+        """Stop this node after a worker panic or another fatal BaseException."""
+        if not fatal_errors:
+            raise ValueError("fatal_errors must not be empty")
+        try:
+            self._finish_mpmc_round(
+                round_state=round_state,
+                reason=f"fatal_worker_error:{stage}",
             )
-            if not ok:
-                logger.warning(
-                    "关闭活动 MPMC %s 超时或抛出异常: thread_id=%s err=%s",
-                    endpoint_label,
-                    thread_id,
-                    close_res,
-                )
-                continue
-            if close_res.is_ok():
-                close_res.unwrap()
-                logger.info(
-                    "✅ 主线程已关闭 MPMC %s: thread_id=%s",
-                    endpoint_label,
-                    thread_id,
-                )
-                continue
-            logger.warning(
-                "关闭活动 MPMC %s 失败: thread_id=%s err=%s",
+            self._close_kv_store(reason=f"mpmc_fatal_worker_error:{stage}")
+        except BaseException as cleanup_exc:
+            logger.error(
+                "MPMC fatal cleanup raised: stage=%s type=%s err=%s",
+                stage,
+                type(cleanup_exc).__name__,
+                cleanup_exc,
+            )
+
+        first_thread_id = sorted(fatal_errors)[0]
+        first_error = fatal_errors[first_thread_id]
+        details = ", ".join(
+            f"thread_{thread_id}={type(exc).__name__}: {exc}"
+            for thread_id, exc in sorted(fatal_errors.items())
+        )
+        raise RuntimeError(
+            f"fatal MPMC worker BaseException at {stage}; runtime is not recoverable: {details}"
+        ) from first_error
+
+    def _close_mpmc_round_endpoints(
+        self,
+        *,
+        round_state: PreparedMPMCRound,
+        reason: str,
+    ) -> None:
+        """Close every round-owned endpoint and consume every close result."""
+        role = self.test_config.get("node_role")
+        with round_state.prepared_lock:
+            runtime_items = sorted(round_state.prepared_runtimes.items())
+            if role == "producer":
+                endpoint_label = "producer"
+                blocked_op_label = "PUT"
+                endpoint_items = [
+                    (thread_id, runtime.producer)
+                    for thread_id, runtime in runtime_items
+                    if runtime.producer is not None
+                ]
+            elif role == "consumer":
+                endpoint_label = "consumer"
+                blocked_op_label = "GET"
+                endpoint_items = [
+                    (thread_id, runtime.consumer)
+                    for thread_id, runtime in runtime_items
+                    if runtime.consumer is not None
+                ]
+            else:
+                raise RuntimeError(f"unsupported MPMC node_role for close: {role}")
+
+        if not endpoint_items:
+            return
+        close_errors: List[str] = []
+        with round_state.endpoint_close_lock:
+            logger.info(
+                "🛑 Closing round-owned MPMC %ss to interrupt blocked %s: "
+                "reason=%s thread_ids=%s",
                 endpoint_label,
-                thread_id,
-                close_res.unwrap_error(),
+                blocked_op_label,
+                reason,
+                [thread_id for thread_id, _ in endpoint_items],
             )
+            for thread_id, endpoint in endpoint_items:
+                endpoint_id = id(endpoint)
+                if endpoint_id in round_state.closed_endpoint_ids:
+                    continue
+                close_started = time.monotonic()
+                try:
+                    close_res = endpoint.close()
+                    if close_res.is_ok():
+                        close_res.unwrap()
+                    else:
+                        close_error = close_res.unwrap_error()
+                        close_errors.append(
+                            f"thread_id={thread_id} err={close_error}"
+                        )
+                        continue
+                except BaseException as exc:
+                    close_errors.append(
+                        f"thread_id={thread_id} {type(exc).__name__}: {exc}"
+                    )
+                    continue
+
+                round_state.closed_endpoint_ids.add(endpoint_id)
+                logger.info(
+                    "✅ Closed round-owned MPMC %s: thread_id=%s "
+                    "elapsed_seconds=%.3f",
+                    endpoint_label,
+                    thread_id,
+                    time.monotonic() - close_started,
+                )
+
+        if close_errors:
+            raise RuntimeError(
+                f"MPMC {endpoint_label} close failed: reason={reason}; "
+                + "; ".join(close_errors)
+            )
+
+    def _finish_mpmc_round(
+        self,
+        *,
+        round_state: PreparedMPMCRound,
+        reason: str,
+    ) -> None:
+        """Stop a round, join every started worker, then release its endpoints."""
+        self._benchmark_stop.set()
+        round_state.start_event.set()
+        cleanup_errors: List[BaseException] = []
+
+        try:
+            self._close_mpmc_round_endpoints(
+                round_state=round_state,
+                reason=reason,
+            )
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+
+        for thread_id, thread in sorted(round_state.pending_threads.items()):
+            if thread.ident is None:
+                continue
+            if thread.is_alive():
+                logger.info(
+                    "⏳ Waiting for MPMC worker exit after endpoint close: "
+                    "reason=%s thread_id=%s",
+                    reason,
+                    thread_id,
+                )
+            thread.join()
+
+        # A worker may finish endpoint construction while shutdown was being
+        # requested. Rescan after every worker has transferred or dropped ownership.
+        try:
+            self._close_mpmc_round_endpoints(
+                round_state=round_state,
+                reason=f"{reason}:post_join",
+            )
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+
+        if cleanup_errors:
+            details = "; ".join(
+                f"{type(exc).__name__}: {exc}" for exc in cleanup_errors
+            )
+            raise RuntimeError(
+                f"MPMC round cleanup failed: reason={reason}; {details}"
+            ) from cleanup_errors[0]
 
     def _collect_finished_mpmc_workers(
         self,
@@ -2981,29 +3732,6 @@ class BenchmarkNode:
             completed += 1
             logger.info(f"✅ 已完成 {completed}/{total_workers} 个线程")
         return completed
-
-    def _close_thread_owned_mq_endpoint(self, endpoint: Any, *, role: str, thread_id: int) -> None:
-        """Close one worker-owned MPMC endpoint from the owning worker thread."""
-        if endpoint is None:
-            return
-        ok, close_res = _call_with_timeout(
-            fn=endpoint.close,
-            timeout_s=RPC_CLOSE_TIMEOUT_SECONDS,
-            ctx=f"mpmc thread_owned {role}.close thread_id={thread_id}",
-        )
-        if not ok:
-            logger.warning("关闭线程自有 MPMC %s 超时或抛出异常: thread_id=%s err=%s", role, thread_id, close_res)
-            return
-        if not close_res.is_ok():
-            logger.warning(
-                "关闭线程自有 MPMC %s 失败: thread_id=%s err=%s",
-                role,
-                thread_id,
-                close_res.unwrap_error(),
-            )
-            return
-        close_res.unwrap()
-        logger.info("✅ 线程 %s 已关闭自有 MPMC %s", thread_id, role)
 
     def register_and_get_test_config(self) -> bool:
         """
@@ -3204,7 +3932,7 @@ class BenchmarkNode:
                 self.kv_store = None
                 logger.info(
                     "⏭️ MPMC producer skips shared KVCache init; "
-                    "worker-owned runtimes are prepared before READY"
+                    "the process-shared runtime is prepared after START"
                 )
             else:
                 # 1) Initialize KVCache store
@@ -3227,6 +3955,12 @@ class BenchmarkNode:
                 logger.info("🔧 MPMC模式，初始化 MPMC 相关配置（每线程独立实例）...")
 
                 node_role = (self.mq_state.role or node_role) if self.mq_state else node_role
+                if node_role == "producer":
+                    producer_runtime_mode = self._mpmc_producer_runtime_mode()
+                    logger.info(
+                        "🔧 MPMC producer runtime mode: %s",
+                        producer_runtime_mode,
+                    )
                 # Do not create Producer/Consumer instances here; each worker thread initializes them in _run_worker_thread.
             else:
                 logger.info("🔧 KVSTORE/RPC模式，只使用KVCache存储")
@@ -3811,6 +4545,16 @@ class BenchmarkNode:
                         return cluster_ready_timeout_s + START_WAIT_POLL_INTERVAL_SECONDS
         return DEFAULT_START_WAIT_TIMEOUT_SECONDS
 
+    def _start_wait_poll_sleep_seconds(self, *, attempt: int, remaining_seconds: float) -> float:
+        base_s = min(
+            START_WAIT_POLL_MAX_SECONDS,
+            START_WAIT_POLL_INTERVAL_SECONDS
+            * (START_WAIT_POLL_BACKOFF_FACTOR ** max(0, attempt - 1)),
+        )
+        key = f"{self.instance_key or self.node_id}:start-wait:{attempt}"
+        jitter_s = self._stable_fraction_from_text(key) * START_WAIT_POLL_JITTER_SECONDS
+        return min(max(0.0, remaining_seconds), base_s + jitter_s)
+
     def _wait_for_mpmc_runtime_start(self) -> bool:
         """Synchronize timed MPMC workers after every node has opened its runtime endpoints."""
         if not isinstance(self.test_config, dict):
@@ -3847,9 +4591,12 @@ class BenchmarkNode:
             "timestamp": time.time(),
         }
         logger.info(
-            "⏳ 等待 MPMC runtime_start: timeout_s=%.1f",
+            "⏳ 等待 MPMC runtime_start: timeout_s=%.1f initial_poll_s=%.1f max_poll_s=%.1f",
             wait_timeout_s,
+            START_WAIT_POLL_INTERVAL_SECONDS,
+            START_WAIT_POLL_MAX_SECONDS,
         )
+        wait_attempt = 0
         while True:
             remaining_s = wait_deadline - time.monotonic()
             if remaining_s <= 0.0:
@@ -3872,7 +4619,13 @@ class BenchmarkNode:
                     response.get("expected_nodes"),
                 )
                 return True
-            time.sleep(min(START_WAIT_POLL_INTERVAL_SECONDS, remaining_s))
+            wait_attempt += 1
+            time.sleep(
+                self._start_wait_poll_sleep_seconds(
+                    attempt=wait_attempt,
+                    remaining_seconds=wait_deadline - time.monotonic(),
+                )
+            )
 
     def wait_for_start(self) -> bool:
         """
@@ -3887,14 +4640,15 @@ class BenchmarkNode:
             "timestamp": time.time(),  # Current timestamp
         }
         wait_timeout_s = self._resolve_start_wait_timeout_seconds()
-        poll_interval_s = START_WAIT_POLL_INTERVAL_SECONDS
         wait_deadline = time.monotonic() + wait_timeout_s
         try:
             logger.info(
-                "⏳ 等待协调者 START: timeout_s=%.1f poll_interval_s=%.1f",
+                "⏳ 等待协调者 START: timeout_s=%.1f initial_poll_s=%.1f max_poll_s=%.1f",
                 wait_timeout_s,
-                poll_interval_s,
+                START_WAIT_POLL_INTERVAL_SECONDS,
+                START_WAIT_POLL_MAX_SECONDS,
             )
+            wait_attempt = 0
             while True:
                 remaining_s = wait_deadline - time.monotonic()
                 if remaining_s <= 0.0:
@@ -3902,8 +4656,11 @@ class BenchmarkNode:
                 resp = self.send_rpc_message(
                     self.coordinator_host,
                     self.coordinator_port,
-                    start_request,
-                    timeout=max(5.0, min(120.0, remaining_s + poll_interval_s)),
+                    {
+                        **start_request,
+                        "timestamp": time.time(),
+                    },
+                    timeout=max(5.0, min(120.0, remaining_s + START_WAIT_POLL_INTERVAL_SECONDS)),
                 )
                 status = resp.get("status") if resp else None
                 if status == "success":
@@ -4010,7 +4767,13 @@ class BenchmarkNode:
                 remaining_s = wait_deadline - time.monotonic()
                 if remaining_s <= 0.0:
                     break
-                time.sleep(min(poll_interval_s, remaining_s))
+                wait_attempt += 1
+                time.sleep(
+                    self._start_wait_poll_sleep_seconds(
+                        attempt=wait_attempt,
+                        remaining_seconds=remaining_s,
+                    )
+                )
             logger.error(
                 "❌ 等待开始信号超时，未收到开始信号: timeout_s=%.1f",
                 wait_timeout_s,
@@ -4307,6 +5070,16 @@ class BenchmarkNode:
         producer = prepared_runtime.producer
         consumer = prepared_runtime.consumer
         local_mq_state = prepared_runtime.local_mq_state
+        if prepared_runtime.logical_only:
+            if node_role != "producer":
+                raise RuntimeError(
+                    f"logical-only MPMC runtime is only valid for producer, got: {node_role}"
+                )
+            logger.info(
+                "⏭️ MPMC logical-only producer worker exits without endpoint operations: thread_id=%s",
+                thread_id,
+            )
+            return []
 
         op_idx = 0
         try:
@@ -4401,20 +5174,10 @@ class BenchmarkNode:
                 results.append(result)
                 op_idx += 1
         finally:
-            if prepared_runtime.close_producer_on_exit:
-                self._close_thread_owned_mq_endpoint(producer, role="producer", thread_id=thread_id)
-            if prepared_runtime.close_consumer_on_exit:
-                self._close_thread_owned_mq_endpoint(consumer, role="consumer", thread_id=thread_id)
-            if prepared_runtime.close_kv_store_on_exit:
-                self._close_worker_owned_kv_store(
-                    prepared_runtime.kv_store,
-                    reason="mpmc_worker_exit",
-                    thread_id=thread_id,
-                )
-        _debug_print(
-            f"thread {thread_id} exit run loop, total_ops={len(results)}, "
-            f"last_op_idx={op_idx}"
-        )
+            _debug_print(
+                f"thread {thread_id} exit run loop, total_ops={len(results)}, "
+                f"last_op_idx={op_idx}"
+            )
         return results
 
     def _set_forced_benchmark_result(
@@ -4531,7 +5294,7 @@ class BenchmarkNode:
                 target=worker_target,
                 args=(thread_id,),
                 name=f"bench-kv-worker-{self.node_id}-{thread_id}",
-                daemon=True,
+                daemon=False,
             )
             pending_threads[thread_id] = thread
             thread.start()
@@ -4605,9 +5368,42 @@ class BenchmarkNode:
                 completed_workers=completed,
                 timed_out_worker_ids=sorted(pending_threads.keys()),
             )
+            logger.error(
+                "Waiting for timed-out KV workers before process teardown: thread_ids=%s",
+                sorted(pending_threads.keys()),
+            )
+            for thread in pending_threads.values():
+                thread.join()
+            self._collect_finished_kv_workers(
+                pending_threads=pending_threads,
+                worker_results=worker_results,
+                worker_results_lock=worker_results_lock,
+                completed=completed,
+                total_workers=workers,
+            )
 
     def _run_mpmc_workers(self, *, workers: int, deadline_ts: float) -> None:
         round_state = self._consume_prepared_mpmc_round(expected_workers=workers)
+        try:
+            self._run_mpmc_round(
+                round_state=round_state,
+                workers=workers,
+                deadline_ts=deadline_ts,
+            )
+        finally:
+            self._finish_mpmc_round(
+                round_state=round_state,
+                reason="run_mpmc_workers_exit",
+            )
+
+    def _run_mpmc_round(
+        self,
+        *,
+        round_state: PreparedMPMCRound,
+        workers: int,
+        deadline_ts: float,
+    ) -> None:
+        """Run operations while the caller retains round resource ownership."""
         pending_threads = dict(round_state.pending_threads)
         completed = 0
         stop_requested = False
@@ -4644,8 +5440,15 @@ class BenchmarkNode:
             )
             while True:
                 with round_state.prepared_lock:
-                    prepared_count = len(round_state.prepared_runtimes)
+                    prepared_count = len(round_state.ready_thread_ids)
                     prepare_error_snapshot = dict(round_state.prepare_errors)
+                    fatal_error_snapshot = dict(round_state.fatal_errors)
+                if fatal_error_snapshot:
+                    self._raise_mpmc_fatal_worker_error(
+                        round_state=round_state,
+                        fatal_errors=fatal_error_snapshot,
+                        stage="producer_prepare_after_start",
+                    )
                 if prepare_error_snapshot:
                     self._set_forced_benchmark_result(
                         reason="mpmc_worker_prepare_failed",
@@ -4678,6 +5481,12 @@ class BenchmarkNode:
                     return
                 time.sleep(0.2)
 
+        if role == "consumer":
+            self._consume_mpmc_prefeed_messages(
+                round_state=round_state,
+                timeout_s=float(self.test_config["cluster_ready_timeout_seconds"]),
+            )
+
         if not self._wait_for_mpmc_runtime_start():
             self._set_forced_benchmark_result(
                 reason="mpmc_runtime_start_timeout",
@@ -4697,6 +5506,14 @@ class BenchmarkNode:
         round_state.start_event.set()
 
         while pending_threads:
+            with round_state.prepared_lock:
+                fatal_error_snapshot = dict(round_state.fatal_errors)
+            if fatal_error_snapshot:
+                self._raise_mpmc_fatal_worker_error(
+                    round_state=round_state,
+                    fatal_errors=fatal_error_snapshot,
+                    stage="benchmark_operation",
+                )
             now = time.time()
             if not stop_requested and now >= deadline_ts:
                 stop_requested = True
@@ -4704,11 +5521,9 @@ class BenchmarkNode:
                 self._benchmark_stop.set()
                 stop_grace_deadline_ts = now + MPMC_WORKER_EXIT_GRACE_SECONDS
                 logger.info("🛑 benchmark 到达运行时长，主线程发出 MPMC stop intent")
-                self._request_shutdown_prepared_mpmc_endpoints_for_stop_intent(
-                    round_state=round_state
-                )
-                self._close_prepared_mpmc_endpoints_for_stop_intent(
-                    round_state=round_state
+                self._close_mpmc_round_endpoints(
+                    round_state=round_state,
+                    reason="benchmark_deadline",
                 )
             completed = self._collect_finished_mpmc_workers(
                 pending_threads=pending_threads,
@@ -4759,6 +5574,14 @@ class BenchmarkNode:
             completed=completed,
             total_workers=workers,
         )
+        with round_state.prepared_lock:
+            fatal_error_snapshot = dict(round_state.fatal_errors)
+        if fatal_error_snapshot:
+            self._raise_mpmc_fatal_worker_error(
+                round_state=round_state,
+                fatal_errors=fatal_error_snapshot,
+                stage="benchmark_completion",
+            )
         if pending_threads:
             timed_out_worker_ids = sorted(pending_threads.keys())
             self._set_forced_benchmark_result(
@@ -4897,6 +5720,7 @@ def main():
     benchmark_node.coordinator_host = host_part
     benchmark_node.coordinator_port = port_val
     benchmark_node.instance_key = args.instance_key
+    delayed_process_cleanup = False
 
     try:
 
@@ -4980,12 +5804,27 @@ def main():
             )
             return 0
 
+        delayed_process_cleanup = True
+
     except KeyboardInterrupt:
         logger.warning("⚠️ 接收到中断信号，正在退出...")
+        return 130
     except Exception as e:
         logger.error(f"💥 程序执行出现异常: {e}")
         logger.debug("📍 异常详情:", exc_info=True)
         sys.exit(1)
+    finally:
+        pending_round = benchmark_node._prepared_mpmc_round
+        if pending_round is not None:
+            benchmark_node._prepared_mpmc_round = None
+            benchmark_node._finish_mpmc_round(
+                round_state=pending_round,
+                reason="node_process_early_exit",
+            )
+        if not delayed_process_cleanup:
+            benchmark_node._close_kv_store(reason="node_process_early_exit")
+            benchmark_node._close_fluxon_phase_log_exporter()
+
     # Wait 30 seconds before dropping KvClient, so underlying resources can finish cleanup/reporting.
     logger.info("⏳ 析构 KVClient 前等待 30 秒…")
     time.sleep(30)

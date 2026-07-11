@@ -39,14 +39,6 @@ from setup_and_pack.utils.repo_config_utils import (
     load_test_kv_svc_type_from_test_config,
 )
 
-# --------------------
-# Test config helpers (backed by setup_and_pack/utils/repo_config_utils.py)
-# --------------------
-def load_test_kv_svc_type(*, config_path: Optional[Path] = None) -> str:
-    """Load kv_svc_type from fluxon_py/tests/test_config.yaml without defaults."""
-    return load_test_kv_svc_type_from_test_config(config_path=config_path)
-
-
 def load_test_kv_svc_ip(*, config_path: Optional[Path] = None) -> str:
     """Load test backend host from test_config.yaml."""
     etcd_addr = load_test_etcd_address_from_test_config(config_path=config_path)
@@ -77,16 +69,6 @@ def load_test_mooncake_master_server_address(*, config_path: Optional[Path] = No
     return f"{host}:{port}"
 
 
-def load_test_fluxon_cluster_name(*, config_path: Optional[Path] = None) -> str:
-    """Load required Fluxon cluster name from test_config.yaml."""
-    return load_test_fluxon_cluster_name_from_test_config(config_path=config_path)
-
-
-def load_test_fluxon_share_mem_path(*, config_path: Optional[Path] = None) -> str:
-    """Load required Fluxon shared-memory path from test_config.yaml."""
-    return load_test_fluxon_share_mem_path_from_test_config(config_path=config_path)
-
-
 def load_test_chan_config(*, config_path: Optional[Path] = None) -> Dict[str, int]:
     """Return default chan_config for tests.
 
@@ -98,7 +80,7 @@ def load_test_chan_config(*, config_path: Optional[Path] = None) -> Dict[str, in
 _ETCD_ADDRESS = load_test_etcd_address_from_test_config()
 ETCD_HOST, _ETCD_PORT = _verify_host_port(_ETCD_ADDRESS, field="test_config.yaml.etcd_address")
 ETCD_PORT = int(_ETCD_PORT)
-KV_SVC_TYPE = load_test_kv_svc_type()
+KV_SVC_TYPE = load_test_kv_svc_type_from_test_config()
 KV_SVC_IP = load_test_kv_svc_ip()
 CHAN_CONFIG_TEST = load_test_chan_config()
 MOONCAKE_METADATA_SERVER = (
@@ -275,8 +257,8 @@ def new_shared_stores(
             }
         else:
             # Strictly require fluxon-specific fields from the shared test/example deployconf.
-            cluster_name = load_test_fluxon_cluster_name()
-            share_mem = load_test_fluxon_share_mem_path()
+            cluster_name = load_test_fluxon_cluster_name_from_test_config()
+            share_mem = load_test_fluxon_share_mem_path_from_test_config()
             spec = {
                 "fluxonkv_spec": {
                     "cluster_name": cluster_name,
@@ -408,16 +390,6 @@ def manully_unbind_if_cstyle_construct(chan_type: ChanType, chan_id: str, constr
 # --------------------
 # Cross-test process housekeeping
 # --------------------
-def pre_kill_existing_test_processes(script_path: str, subcommands: List[str], sleep_after_seconds: int) -> None:
-    """Backward-compatible wrapper: dispatch to the script-basename based implementation.
-
-    Note: per current convention, the matching rule is simplified to "same script basename".
-    """
-    import os as _os
-    base = _os.path.basename(script_path)
-    pre_kill_existing_test_processes_by_script_name(base, sleep_after_seconds)
-
-
 def pre_kill_existing_test_processes_by_script_name(script_basename: str, sleep_after_seconds: int) -> None:
     """Kill stale test processes by script file name only, then sleep for a window.
 

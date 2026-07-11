@@ -5,7 +5,6 @@ from collections.abc import Mapping
 import atexit
 import ctypes
 from dataclasses import dataclass
-import enum
 import os
 import signal
 import subprocess
@@ -43,19 +42,10 @@ class RuntimeSingletonSpec:
     workdir_path: Path
 
 
-class ChildStopMode(enum.Enum):
-    # Keep this compatibility surface for installed scripts that still import
-    # the old stop-mode API while the runtime converges on the attached-child
-    # model. Child shutdown no longer branches on this enum.
-    PROCESS = "process"
-    PROCESS_GROUP = "process_group"
-
-
 @dataclass(frozen=True)
 class ManagedSubprocess:
     label: str
     proc: subprocess.Popen[Any]
-    stop_mode: ChildStopMode = ChildStopMode.PROCESS
 
 
 def resolve_runtime_config_path(

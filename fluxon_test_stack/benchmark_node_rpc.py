@@ -631,10 +631,6 @@ def _empty_fluxon_phase_bucket_counts() -> Dict[str, int]:
     return {"ok": 0, "miss": 0, "timeout": 0, "error": 0}
 
 
-def _positive_ts_diff_us(later_ts_us: float, earlier_ts_us: float) -> float:
-    return max(0.0, float(later_ts_us) - float(earlier_ts_us))
-
-
 def _cross_process_ts_diff_us(
     later_ts_us: Optional[float],
     earlier_ts_us: Optional[float],
@@ -1790,30 +1786,6 @@ def _spawn_zerorpc_echo_server(*, endpoint: str) -> _ZeroRpcServerHandle:
     )
 
 
-def _build_operation_result(
-    operation_result_cls: Any,
-    *,
-    success: bool,
-    latency_us: float,
-    operation_type: str,
-    key: str,
-    data_size: int,
-    inflight_at_start: int,
-    outcome_kind: Any,
-    error_msg: Optional[str],
-) -> Any:
-    return operation_result_cls(
-        success=success,
-        latency_us=latency_us,
-        operation_type=operation_type,
-        key=key,
-        data_size=data_size,
-        inflight_at_start=inflight_at_start,
-        outcome_kind=outcome_kind,
-        error_msg=error_msg,
-    )
-
-
 def prepare_rpc_before_ready(benchmark_node: Any) -> bool:
     test_config = getattr(benchmark_node, "test_config", None)
     if not isinstance(test_config, dict):
@@ -1966,8 +1938,7 @@ def run_rpc_worker(
                 )
             else:
                 data_size = len(payload)
-            result = _build_operation_result(
-                operation_result_cls,
+            result = operation_result_cls(
                 success=err is None,
                 latency_us=max(0.0, (finished_at - started_at) * 1_000_000.0),
                 operation_type=KV_OPERATION_RPC,
@@ -1982,8 +1953,7 @@ def run_rpc_worker(
                 error_msg=err,
             )
         except Exception as exc:  # noqa: BLE001
-            result = _build_operation_result(
-                operation_result_cls,
+            result = operation_result_cls(
                 success=False,
                 latency_us=0.0,
                 operation_type=KV_OPERATION_RPC,

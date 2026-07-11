@@ -29,10 +29,8 @@ sys.path.insert(0, str(DEPLOYMENT_UTILS_DIR))
 import manual_dispatch_release
 from utils import log_shard
 from selection_runtime import (
-    atomic_group_member_authority_name as _selection_atomic_group_member_authority_name,
     atomic_group_member_selection_workload_name as _selection_atomic_group_member_selection_workload_name,
     daemonset_selection_supervisor_label as _selection_daemonset_supervisor_label,
-    plain_selection_authority_name as _selection_plain_selection_authority_name,
     plain_selection_workload_name as _selection_plain_workload_name,
     resolve_coverage_selection_name as _selection_resolve_coverage_selection_name,
     resolve_selection_nodes as _selection_resolve_selection_nodes,
@@ -187,9 +185,9 @@ def main() -> None:
         )
         fixed_bootstrap_batches = _bootstrap_fixed_batches(bootstrap_phases)
         coverage_bootstrap_services = _bootstrap_coverage_services(bootstrap_phases)
-    deploy_workloads = _parse_name_list(
+    deploy_workloads = _require_list_of_str(
         config.get("deploy_workloads"),
-        field_name="deploy_workloads",
+        "deploy_workloads",
     )
     controller_url = _require_str(config.get("controller_url"), "controller_url").rstrip("/")
     _install_controller_basic_auth(
@@ -1844,10 +1842,6 @@ def _bootstrap_coverage_services(bootstrap_phases: list[dict[str, Any]]) -> list
     return _dedup_str_list(out)
 
 
-def _parse_name_list(raw: Any, *, field_name: str) -> list[str]:
-    return _require_list_of_str(raw, field_name)
-
-
 def _resolve_local_node_cfg(cluster_nodes: dict[str, dict[str, Any]]) -> dict[str, Any]:
     local_nodes = [node_cfg for node_cfg in cluster_nodes.values() if _cluster_node_is_local(node_cfg)]
     if local_nodes:
@@ -2074,12 +2068,6 @@ def _resolve_service_nodes(*, services: dict[str, Any], service_name: str) -> li
     return _require_list_of_str(node_bind.get("node"), f"service.{service_name}.node_bind.node")
 
 
-def _resolve_selection_service_name(*, deployconf: dict[str, Any], selection_name: str) -> str:
-    return _selection_resolve_selection_service_name(
-        selection_name=selection_name,
-    )
-
-
 def _resolve_selection_nodes(*, deployconf: dict[str, Any], selection_name: str) -> list[str]:
     services = deployconf.get("service")
     if not isinstance(services, dict):
@@ -2256,7 +2244,7 @@ def _selection_member_keys(
             out.extend(_service_member_keys(service_name=service_name, nodes=eligible_nodes))
         return _dedup_str_list(out)
 
-    service_name = _resolve_selection_service_name(deployconf=deployconf, selection_name=selection_name)
+    service_name = _selection_resolve_selection_service_name(selection_name=selection_name)
     return _service_member_keys(service_name=service_name, nodes=nodes)
 
 
@@ -2993,7 +2981,7 @@ def _selection_service_names(*, deployconf: dict[str, Any], selection_name: str)
     group_cfg = atomic_groups.get(selection_name)
     if isinstance(group_cfg, dict):
         return _require_list_of_str(group_cfg.get("services"), f"atomic_groups.{selection_name}.services")
-    return [_resolve_selection_service_name(deployconf=deployconf, selection_name=selection_name)]
+    return [_selection_resolve_selection_service_name(selection_name=selection_name)]
 
 
 def _selection_service_names_for_target_node(
@@ -3031,7 +3019,7 @@ def _selection_bare_script_name(*, deployconf: dict[str, Any], selection_name: s
         raise ValueError("deployconf.atomic_groups must be a mapping")
     if selection_name in atomic_groups:
         return selection_name
-    return _resolve_selection_service_name(deployconf=deployconf, selection_name=selection_name)
+    return _selection_resolve_selection_service_name(selection_name=selection_name)
 
 
 def _bare_plain_selection_supervisor_identity(

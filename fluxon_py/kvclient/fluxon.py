@@ -297,6 +297,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
 
     def __init__(self, config: FluxonKvClientConfig):
         self._client: Optional[fluxon_pyo3.KvClient] = None
+        self._close_lock = threading.Lock()
         self._config = config
         self._init_error: Optional[ApiError] = None
         cluster_name = config.fluxonkv_spec_cluster_name
@@ -775,23 +776,23 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
 
     def close(self) -> Result[OkNone, ApiError]:
         """Close and tear down the store."""
-        try:
-            # Backend returns a Result; MUST be explicitly consumed to avoid
-            # leaking an unconsumed Result that triggers __del__ assertion.
-            res = self._client.close()
-            if not res.is_ok():
-                # Propagate backend error (already an ApiError)
-                return Result.new_error(res.unwrap_error())
-            # Consume Ok(None-like) to satisfy strict consumption policy
-            _ = res.unwrap()
-            unregister_store_from_cleanup(self)
-            # English note:
-            # After a successful close, clear the backend handle to prevent any further calls and
-            # allow deterministic resource release without relying on Python GC timing.
-            self._client = None
-            return Result.new_ok(OkNone())
-        except Exception as e:
-            return Result.new_error(GeneralError(f"Failed to close client: {str(e)}"))
+        with self._close_lock:
+            if self._client is None:
+                unregister_store_from_cleanup(self)
+                return Result.new_ok(OkNone())
+
+            try:
+                # Keep the mutable PyO3 borrow behind one lock until shutdown
+                # completes. Concurrent close callers wait and then observe None.
+                res = self._client.close()
+                if not res.is_ok():
+                    return Result.new_error(res.unwrap_error())
+                _ = res.unwrap()
+                unregister_store_from_cleanup(self)
+                self._client = None
+                return Result.new_ok(OkNone())
+            except Exception as e:
+                return Result.new_error(GeneralError(f"Failed to close client: {str(e)}"))
 
     def is_write_once(self) -> bool:
         """Whether the store is write-once (keys cannot be overwritten)."""

@@ -56,6 +56,10 @@ mod flatdict_zerocopy;
 mod kvfuture;
 pub use kvfuture::KvFuture;
 mod error;
+use error::{
+    new_backend_init_failed_error, new_general_error, new_invalid_argument_error,
+    new_key_not_found_error, new_network_error, new_none_success_instance,
+};
 mod etcd;
 mod mpsc; // Python ApiError constructors and MPSC error mapping
 pub use etcd::PyEtcdLock;
@@ -1871,11 +1875,6 @@ impl FluxonFsAgent {
     }
 }
 
-// Compatibility wrappers: delegate to crate::error central helpers.
-fn new_none_success_instance(py: Python) -> PyObject {
-    crate::error::new_none_success_instance(py)
-}
-
 fn py_request_identity_tuple_to_core(
     request_identity: Option<(String, String)>,
 ) -> PyResult<Option<FluxonFsRequestIdentity>> {
@@ -1895,34 +1894,6 @@ fn py_request_identity_tuple_to_core(
         }
         None => Ok(None),
     }
-}
-
-fn new_general_error(py: Python, message: &str) -> PyObject {
-    crate::error::new_general_error(py, message)
-}
-
-fn new_invalid_argument_error(py: Python, message: &str) -> PyObject {
-    crate::error::new_invalid_argument_error(py, message)
-}
-
-fn new_backend_init_failed_error(
-    py: Python,
-    message: &str,
-    backend_name: Option<&str>,
-) -> PyObject {
-    crate::error::new_backend_init_failed_error(py, message, backend_name)
-}
-
-fn new_network_error(py: Python, message: &str, endpoint: Option<&str>) -> PyObject {
-    crate::error::new_network_error(py, message, endpoint)
-}
-
-fn new_key_not_found_error(py: Python, message: &str, key: Option<&str>) -> PyObject {
-    crate::error::new_key_not_found_error(py, message, key)
-}
-
-fn new_store_closed_error(py: Python, message: &str) -> PyObject {
-    crate::error::new_store_closed_error(py, message)
 }
 
 #[pyfunction]
@@ -1974,11 +1945,6 @@ fn monitor_render_web(config_path: String, workdir: String) -> PyResult<String> 
 struct OpsControllerConfigYaml {
     ops_controller: fluxon_ops::ControllerConfigYaml,
     fluxon_cli: fluxon_cli::config::MonitorConfigYaml,
-}
-
-fn ops_panel_proxy_desc_etcd_key(service_name: &str, cluster_name: &str) -> String {
-    // English note: keep this key format consistent with fluxon_cli::server::fluxon_cli_proxy_desc_etcd_key.
-    fluxon_cli_proxy_desc_etcd_key_v2(service_name, cluster_name)
 }
 
 #[pyfunction]
@@ -2115,7 +2081,10 @@ fn fluxon_ops_controller_blocking(
                 Duration::from_secs(60),
             );
 
-            let etcd_key = ops_panel_proxy_desc_etcd_key(fluxon_ops::OPS_SERVICE_NAME, &cli_cfg.cluster_name);
+            let etcd_key = fluxon_cli_proxy_desc_etcd_key_v2(
+                fluxon_ops::OPS_SERVICE_NAME,
+                &cli_cfg.cluster_name,
+            );
             // English note:
             // - Self-host bootstrap can put etcd under heavy load (range reads, linearizable reads).
             // - If etcd connect/get stalls without returning, the controller would hang forever and never

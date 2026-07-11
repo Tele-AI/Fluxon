@@ -124,15 +124,6 @@ fn cluster_manager_rdma_control_init_from_transfer_config(
     ClusterManagerRdmaControlInit::Disabled
 }
 
-fn cluster_manager_rdma_control_init_from_config(
-    config: &ClientConfig,
-) -> ClusterManagerRdmaControlInit {
-    cluster_manager_rdma_control_init_from_transfer_config(
-        config.fluxonkv_spec.transfer_engine,
-        &config.protocol,
-    )
-}
-
 fn test_spec_config_rdma_control_init(
     test_spec_config: Option<&TestSpecConfig>,
 ) -> Option<ClusterManagerRdmaControlInit> {
@@ -1940,7 +1931,12 @@ async fn run_client_impl(
         .as_ref()
         .map(|overrides| overrides.rdma_control_init.clone())
         .or_else(|| test_spec_config_rdma_control_init(Some(&config.test_spec_config)))
-        .unwrap_or_else(|| cluster_manager_rdma_control_init_from_config(&config));
+        .unwrap_or_else(|| {
+            cluster_manager_rdma_control_init_from_transfer_config(
+                config.fluxonkv_spec.transfer_engine,
+                &config.protocol,
+            )
+        });
     let transfer_backend_activation_mode = test_overrides
         .as_ref()
         .and_then(|overrides| overrides.transfer_backend_activation_mode)
@@ -2736,8 +2732,8 @@ mod tests {
             large_file_paths: crate::config::LargeFilePaths {
                 paths: vec![owner_large_root.to_string_lossy().into_owned()],
             },
-            protocol_version:
-                fluxon_util::git_version_build_record::get_current_git_commitid().unwrap(),
+            protocol_version: fluxon_util::git_version_build_record::get_current_git_commitid()
+                .unwrap(),
             write_ts: Some(chrono::Utc::now().timestamp_micros()),
         };
         let shared_meta_json = serde_json::to_string(&shared_meta).unwrap();

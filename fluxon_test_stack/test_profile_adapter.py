@@ -46,6 +46,7 @@ _CONTROLLER_HTTP_RETRY_SLEEP_SECONDS = 1.0
 _CONTROLLER_TRANSIENT_HTTP_STATUS_CODES = (500, 502, 503, 504)
 _CONTROLLER_SSH_CONNECT_TIMEOUT_SECONDS = 10
 _CONTROLLER_SSH_SUBPROCESS_GRACE_SECONDS = 10.0
+_COLLECT_WORKLOAD_LOG_TAIL_BYTES = 256 * 1024
 CONTROLLER_REQUEST_MODE_SSH_EXEC_PER_REQUEST = "ssh_exec_per_request"
 TEST_STACK_START_TEST_BED_CONFIG_ENV = "FLUXON_TEST_STACK_START_TEST_BED_CONFIG"
 RUNNER_REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -756,13 +757,22 @@ def _action_deploy(
         ui_url = controller_url.rstrip('/') + '/?history_id=' + history_id.strip()
         print('deployer_history_url=' + ui_url, flush=True)
 
-    for inst in instances:
+    service_instances = [inst for inst in instances if inst.lifecycle == _LIFECYCLE_SERVICE]
+    skipped_job_instances = [inst.id for inst in instances if inst.lifecycle == _LIFECYCLE_JOB]
+
+    for inst in service_instances:
         _wait_running(
             controller_url,
             inst.controller_target,
             inst.workload_kind,
             inst.workload_name,
             inst.authority,
+        )
+    if skipped_job_instances:
+        print(
+            "deployer_skipped_job_status_wait_count="
+            f"{len(skipped_job_instances)}",
+            flush=True,
         )
 
     out_instances: List[Dict[str, Any]] = []
@@ -785,6 +795,8 @@ def _action_deploy(
         "instances": out_instances,
         "ready": True,
         "history_id": history_id,
+        "service_wait_count": len(service_instances),
+        "job_status_wait_skipped_count": len(skipped_job_instances),
     }
     _write_yaml_file(run_dir / "deploy_result.yaml", deploy_result)
 
@@ -815,6 +827,49 @@ def _action_collect(run_dir: Path, controller_url: str, instances: List[_Instanc
             inst.authority,
         )
         _write_yaml_file(inst_dir / "status.yaml", {"status_code": int(status_code), "status": status})
+        _collect_workload_log_tail(controller_url, inst, inst_dir)
+
+
+def _collect_workload_log_tail(controller_url: str, inst: _InstanceReq, inst_dir: Path) -> None:
+    instance_key = OPS_AGENT_INSTANCE_KEY_PREFIX + inst.controller_target
+    request_meta = {
+        "instance_key": instance_key,
+        "kind": inst.workload_kind,
+        "name": inst.workload_name,
+        "direction": "Backward",
+        "max_bytes": _COLLECT_WORKLOAD_LOG_TAIL_BYTES,
+    }
+    out_json = inst_dir / "workload_log_tail.json"
+    out_text = inst_dir / "workload_log_tail.txt"
+
+    try:
+        status_code, payload = _http_workload_log_allow_error(
+            controller_url,
+            instance_key=instance_key,
+            kind=inst.workload_kind,
+            name=inst.workload_name,
+            max_bytes=_COLLECT_WORKLOAD_LOG_TAIL_BYTES,
+        )
+        _write_json_file(
+            out_json,
+            {
+                "status_code": int(status_code),
+                "request": request_meta,
+                "response": payload,
+            },
+        )
+        text = payload.get("text")
+        if isinstance(text, str):
+            _write_text_file(out_text, text)
+    except Exception as exc:  # noqa: BLE001
+        _write_json_file(
+            out_json,
+            {
+                "status_code": None,
+                "request": request_meta,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
 
 
 
@@ -1040,6 +1095,31 @@ def _http_status_allow_error(
     )
     url = controller_url + "/api/status?" + qs
     req = _new_controller_request(url, method="GET")
+    return _http_json_allow_error_status(req)
+
+
+def _http_workload_log_allow_error(
+    controller_url: str,
+    *,
+    instance_key: str,
+    kind: str,
+    name: str,
+    max_bytes: int,
+) -> tuple[int, Dict[str, Any]]:
+    url = controller_url + "/api/workload_log"
+    payload = {
+        "instance_key": instance_key,
+        "kind": kind,
+        "name": name,
+        "direction": "Backward",
+        "max_bytes": int(max_bytes),
+    }
+    req = _new_controller_request(
+        url,
+        method="POST",
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        content_type="application/json",
+    )
     return _http_json_allow_error_status(req)
 
 
@@ -1277,38 +1357,25 @@ def _http_json(req: urllib.request.Request) -> Dict[str, Any]:
 
 
 def _http_json_allow_error_status(req: urllib.request.Request) -> tuple[int, Dict[str, Any]]:
-    deadline = time.time() + _CONTROLLER_HTTP_RETRY_DEADLINE_SECONDS
-    while True:
+    try:
+        transported = _controller_request_via_manifest(req, timeout_seconds=_CONTROLLER_HTTP_TIMEOUT_SECONDS)
+        if transported is not None:
+            status_code, data = transported
+            return int(status_code), _require_dict(json.loads(data.decode("utf-8")), "http_json")
+        with urllib.request.urlopen(req, timeout=_CONTROLLER_HTTP_TIMEOUT_SECONDS) as resp:
+            data = resp.read()
+        return 200, _require_dict(json.loads(data.decode("utf-8")), "http_json")
+    except urllib.error.HTTPError as err:
+        data = err.read()
+        if not data:
+            return err.code, {"ok": False, "err": f"http status {err.code}"}
         try:
-            transported = _controller_request_via_manifest(req, timeout_seconds=_CONTROLLER_HTTP_TIMEOUT_SECONDS)
-            if transported is not None:
-                status_code, data = transported
-                return int(status_code), _require_dict(json.loads(data.decode("utf-8")), "http_json")
-            return 200, _http_json(req)
-        except urllib.error.HTTPError as err:
-            if int(err.code) in _CONTROLLER_TRANSIENT_HTTP_STATUS_CODES:
-                _retry_controller_request_or_raise(
-                    deadline=deadline,
-                    ctx="_http_json_allow_error_status",
-                    req=req,
-                    exc=err,
-                )
-                continue
-            data = err.read()
-            if not data:
-                return err.code, {"ok": False, "err": f"http status {err.code}"}
-            try:
-                obj = json.loads(data.decode("utf-8"))
-            except Exception as exc:
-                raise ValueError(f"http error response is not valid json: status={err.code} err={exc}") from exc
-            return err.code, _require_dict(obj, "http_error_json")
-        except (urllib.error.URLError, TimeoutError, OSError, ConnectionError) as exc:
-            _retry_controller_request_or_raise(
-                deadline=deadline,
-                ctx="_http_json_allow_error_status",
-                req=req,
-                exc=exc,
-            )
+            obj = json.loads(data.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError(f"http error response is not valid json: status={err.code} err={exc}") from exc
+        return err.code, _require_dict(obj, "http_error_json")
+    except (urllib.error.URLError, TimeoutError, OSError, ConnectionError) as exc:
+        return 0, {"ok": False, "err": f"{type(exc).__name__}: {exc}"}
 
 
 def _load_yaml_file(path: Path) -> Any:
@@ -1326,6 +1393,21 @@ def _write_yaml_file(path: Path, obj: Any) -> None:
             default_flow_style=False,
             allow_unicode=False,
         )
+    tmp.replace(path)
+
+
+def _write_json_file(path: Path, obj: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps(obj, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+def _write_text_file(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
 
 

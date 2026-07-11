@@ -66,6 +66,18 @@ const EXTERNAL_INIT_CONTROL_PLANE_READY_TIMEOUT_SECS: u64 = 30;
 const EXTERNAL_INIT_CONTROL_PLANE_READY_POLL_MS: u64 = 100;
 const EXTERNAL_INIT_CONTROL_PLANE_READY_CONSECUTIVE_SUCCESSES: usize = 2;
 
+fn ensure_external_put_loop_running(
+    shutdown_poller: &fluxon_framework_compiled::shutdown::ShutdownPoller,
+) -> KvResult<()> {
+    if shutdown_poller.is_running() {
+        return Ok(());
+    }
+
+    Err(KvError::Api(ApiError::SystemShutdown {
+        detail: "external put retry loop stopped during framework shutdown".to_string(),
+    }))
+}
+
 fn duration_to_i64_us(duration: std::time::Duration) -> i64 {
     duration.as_micros().min(i64::MAX as u128) as i64
 }
@@ -865,8 +877,7 @@ impl ExternalInner {
             return Ok(false);
         }
 
-        self.finish_owner_recover(&share_mem_path, payload)
-            .await?;
+        self.finish_owner_recover(&share_mem_path, payload).await?;
         Ok(true)
     }
 
@@ -1829,7 +1840,9 @@ key={}, attempt={}/{}, err={}",
         // Recoverable conditions:
         // - OwnerStartTimeMismatch (owner restarted)
         // - Any P2P transport error (owner offline / link down): NodeNotConnected, ConnectionError, Timeout, SendFailed, etc.
+        let shutdown_poller = self.view.register_shutdown_poller();
         loop {
+            ensure_external_put_loop_running(&shutdown_poller)?;
             match self
                 .put_inner(
                     key,
@@ -1914,7 +1927,9 @@ key={}, attempt={}/{}, err={}",
             }
         };
 
+        let shutdown_poller = self.view.register_shutdown_poller();
         loop {
+            ensure_external_put_loop_running(&shutdown_poller)?;
             match unsafe {
                 self.put_inner_flat_dict_ptrs(
                     key,
@@ -2871,5 +2886,22 @@ impl LogicalModule for ExternalClientApi {
 
         tracing::info!("ExternalClientApi shutdown completed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluxon_framework_compiled::shutdown::ShutdownPoller;
+
+    #[test]
+    fn external_put_retry_loop_rejects_framework_shutdown() {
+        let shutdown_poller = ShutdownPoller::new();
+        assert!(ensure_external_put_loop_running(&shutdown_poller).is_ok());
+
+        shutdown_poller.shutdown();
+        let err = ensure_external_put_loop_running(&shutdown_poller)
+            .expect_err("external put retry loop must stop after framework shutdown");
+        assert!(matches!(err, KvError::Api(ApiError::SystemShutdown { .. })));
     }
 }

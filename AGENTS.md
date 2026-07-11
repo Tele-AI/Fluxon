@@ -9,6 +9,7 @@ Keep this document concise.
 - Git operations are limited to basic `stage`, `unstage`, `commit`, and `push`. Do not use other Git operations.
 - Prefer contraction over compatibility by default. Do not add compatibility layers, deprecated paths, or aliases unless the task explicitly requires them.
 - Prefer one canonical name for one concept. Avoid synonym parameters, duplicated entrypoints, and parallel config surfaces.
+- Do not add forwarding wrappers that only rename a call, pass through arguments, or unpack/repack its result without adding a contract, validation, transformation, or ownership boundary. Call the canonical implementation directly.
 - Do not use environment variables for ordinary parameter passing. Prefer configuration files first, then explicit command-line arguments.
 - Prefer convention over configuration. When one canonical path or default wiring is sufficient, do not add extra config knobs.
 - Minimize multi-path config delivery. Do not pass the same config through parallel channels such as env vars, CLI flags, and files at the same time.

@@ -21,8 +21,6 @@ def main() -> None:
 
 
 from fluxon_py.runtime.process_runner import (  # noqa: E402
-    ChildStopMode,
-    ManagedSubprocess,
     build_runtime_singleton_spec,
     _stop_existing_processes_if_running,
 )
@@ -223,7 +221,6 @@ class TestProcessRunner(unittest.TestCase):
                     "",
                     f"sys.path.insert(0, {str(REPO_ROOT)!r})",
                     "from fluxon_py.runtime.process_runner import (",
-                    "    ChildStopMode,",
                     "    ManagedSubprocess,",
                     "    bind_current_process_parent_death_sigterm,",
                     "    wait_subproc_or_ctrlc,",
@@ -236,7 +233,7 @@ class TestProcessRunner(unittest.TestCase):
                     ")",
                     "ready.write_text(f'{os.getpid()} {worker.pid}', encoding='utf-8')",
                     "wait_subproc_or_ctrlc(",
-                    "    [ManagedSubprocess(label='worker', proc=worker, stop_mode=ChildStopMode.PROCESS_GROUP)],",
+                    "    [ManagedSubprocess(label='worker', proc=worker)],",
                     "    on_ctrlc=lambda: None,",
                     ")",
                     "",

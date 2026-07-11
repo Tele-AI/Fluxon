@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 import ast
+import json
 import os
 import sys
 import tempfile
@@ -30,6 +31,33 @@ except ImportError as exc:
     TestMode = None  # type: ignore[assignment]
 else:
     NODE_RUNTIME_IMPORT_ERROR = None
+
+
+class _FakeCloseResult:
+    def __init__(self) -> None:
+        self.consumed = False
+
+    def is_ok(self) -> bool:
+        return True
+
+    def unwrap(self):
+        self.consumed = True
+        return None
+
+
+class _FakeClosableEndpoint:
+    def __init__(self, *, close_delay_seconds: float = 0.0) -> None:
+        self.close_delay_seconds = close_delay_seconds
+        self.close_calls = 0
+        self.close_results = []
+
+    def close(self) -> _FakeCloseResult:
+        self.close_calls += 1
+        if self.close_delay_seconds > 0.0:
+            time.sleep(self.close_delay_seconds)
+        result = _FakeCloseResult()
+        self.close_results.append(result)
+        return result
 
 
 def _new_coordinator_with_temp_config():
@@ -78,6 +106,148 @@ def _new_coordinator_with_temp_config():
 
 
 class TestMPMCReadinessContract(unittest.TestCase):
+    def test_new_or_bind_existing_mapping_binds_without_unique_lock(self) -> None:
+        try:
+            from fluxon_py import api_ext_chan
+            from fluxon_py.api_error import Result
+            from fluxon_py.api_ext_chan import ChanRole, ChanType
+        except ImportError as exc:
+            self.skipTest(f"fluxon_py runtime import unavailable: {exc}")
+
+        unique_id = "mq-fast-bind"
+        sentinel_channel = object()
+
+        class FakeEtcd:
+            def __init__(self) -> None:
+                self.get_keys = []
+                self.transaction_calls = 0
+
+            def get(self, key):
+                self.get_keys.append(key)
+                if key == api_ext_chan._new_unique_mapping_key(unique_id):
+                    return b"123", None
+                return None, None
+
+            def transaction(self, **_kwargs):
+                self.transaction_calls += 1
+                raise AssertionError("existing mapping fast-bind must not acquire the unique lock")
+
+        fake_etcd = FakeEtcd()
+        bind_calls = []
+        deleted_chan_ids = []
+
+        def fake_new_etcd_client(_api):
+            return Result.new_ok(fake_etcd)
+
+        def fake_chan_bind(api, chan_config, chan_id, chan_type, chan_role, etcd_client):
+            bind_calls.append((api, chan_config, chan_id, chan_type, chan_role, etcd_client))
+            return Result.new_ok("bound")
+
+        def fake_get_chan_by_id(chan_type, chan_id):
+            self.assertEqual(chan_type, ChanType.MPMC)
+            self.assertEqual(chan_id, "123")
+            return Result.new_ok(sentinel_channel)
+
+        def fake_del_chan_by_id(chan_type, chan_id):
+            deleted_chan_ids.append((chan_type, chan_id))
+
+        with mock.patch.object(api_ext_chan, "new_etcd_client", side_effect=fake_new_etcd_client):
+            with mock.patch.object(api_ext_chan, "chan_bind", side_effect=fake_chan_bind):
+                with mock.patch.object(api_ext_chan, "get_chan_by_id", side_effect=fake_get_chan_by_id):
+                    with mock.patch.object(api_ext_chan, "del_chan_by_id", side_effect=fake_del_chan_by_id):
+                        res = api_ext_chan.new_or_bind_with_unique_key(
+                            object(),
+                            {"capacity": 10, "ttl_seconds": 90, "weight": 1},
+                            unique_id,
+                            ChanType.MPMC,
+                            ChanRole.PRODUCER,
+                        )
+
+        self.assertTrue(res.is_ok())
+        self.assertIs(res.unwrap(), sentinel_channel)
+        self.assertEqual(fake_etcd.transaction_calls, 0)
+        self.assertNotIn(api_ext_chan._new_unique_lock_key(unique_id), fake_etcd.get_keys)
+        self.assertEqual(len(bind_calls), 1)
+        self.assertEqual(bind_calls[0][2], "123")
+        self.assertEqual(deleted_chan_ids, [(ChanType.MPMC, "123")])
+
+    def test_new_or_bind_fast_bind_retries_transient_unique_key_read(self) -> None:
+        try:
+            from fluxon_py import api_ext_chan
+            from fluxon_py.api_error import Result
+            from fluxon_py.api_ext_chan import ChanRole, ChanType
+        except ImportError as exc:
+            self.skipTest(f"fluxon_py runtime import unavailable: {exc}")
+
+        unique_id = "mq-fast-bind-read-retry"
+        sentinel_channel = object()
+
+        class FakeEtcd:
+            def __init__(self) -> None:
+                self.unique_get_calls = 0
+                self.transaction_calls = 0
+
+            def get(self, key):
+                if key == api_ext_chan._new_unique_mapping_key(unique_id):
+                    self.unique_get_calls += 1
+                    if self.unique_get_calls == 1:
+                        raise RuntimeError("etcd connection failed")
+                    return b"123", None
+                return None, None
+
+            def transaction(self, **_kwargs):
+                self.transaction_calls += 1
+                raise AssertionError("existing mapping retry fast-bind must not acquire the unique lock")
+
+        fake_etcd = FakeEtcd()
+        sleeps = []
+
+        def fake_new_etcd_client(_api):
+            return Result.new_ok(fake_etcd)
+
+        def fake_chan_bind(api, chan_config, chan_id, chan_type, chan_role, etcd_client):
+            return Result.new_ok("bound")
+
+        def fake_get_chan_by_id(chan_type, chan_id):
+            return Result.new_ok(sentinel_channel)
+
+        with mock.patch.object(api_ext_chan, "new_etcd_client", side_effect=fake_new_etcd_client):
+            with mock.patch.object(api_ext_chan, "chan_bind", side_effect=fake_chan_bind):
+                with mock.patch.object(api_ext_chan, "get_chan_by_id", side_effect=fake_get_chan_by_id):
+                    with mock.patch.object(api_ext_chan, "del_chan_by_id", return_value=None):
+                        with mock.patch.object(api_ext_chan.time, "sleep", side_effect=lambda seconds: sleeps.append(seconds)):
+                            res = api_ext_chan.new_or_bind_with_unique_key(
+                                object(),
+                                {"capacity": 10, "ttl_seconds": 90, "weight": 1},
+                                unique_id,
+                                ChanType.MPMC,
+                                ChanRole.PRODUCER,
+                            )
+
+        self.assertTrue(res.is_ok())
+        self.assertIs(res.unwrap(), sentinel_channel)
+        self.assertEqual(fake_etcd.unique_get_calls, 2)
+        self.assertEqual(fake_etcd.transaction_calls, 0)
+        self.assertEqual(sleeps, [api_ext_chan.MQ_UNIQUE_FAST_BIND_READ_RETRY_BASE_SECONDS])
+
+    def test_coordinator_start_waiting_warning_is_log_throttled(self) -> None:
+        coordinator = _new_coordinator_with_temp_config()
+        logger_obj = coordinator._log_start_waiting_warning.__globals__["logger"]
+
+        with mock.patch.object(logger_obj, "warning") as warning_mock:
+            coordinator._log_start_waiting_warning(node_id="node-1")
+            coordinator._log_start_waiting_warning(node_id="node-2")
+            coordinator._log_start_waiting_warning(node_id="node-3")
+
+            self.assertEqual(warning_mock.call_count, 1)
+            self.assertEqual(coordinator._start_waiting_warning_suppressed_count, 2)
+
+            coordinator._start_waiting_warning_next_log_ts = 0.0
+            coordinator._log_start_waiting_warning(node_id="node-4")
+
+            self.assertEqual(warning_mock.call_count, 2)
+            self.assertIn("suppressed_waiting_warnings", warning_mock.call_args.args[0])
+
     def test_mpsc_producer_serializes_pyo3_handle_access(self) -> None:
         source = Path("fluxon_py/_api_ext_chan/mpsc.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -197,6 +367,102 @@ class TestMPMCReadinessContract(unittest.TestCase):
 
         self.assertTrue(factory_keep_shared_arg("new_global_mpmc_channel"))
         self.assertFalse(factory_keep_shared_arg("new_existed_global_mpmc_channel"))
+
+    def test_mpmc_member_lease_is_allocated_after_shared_setup(self) -> None:
+        source = Path("fluxon_py/_api_ext_chan/mpmc.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        mpmc_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "MPMCChannel"
+        )
+        init_func = next(
+            node
+            for node in mpmc_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+
+        def is_member_lease_target(target: ast.AST) -> bool:
+            return (
+                isinstance(target, ast.Attribute)
+                and target.attr == "mpmc_member_lease"
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            )
+
+        def is_member_lease_assign(node: ast.AST) -> bool:
+            if isinstance(node, ast.AnnAssign):
+                return is_member_lease_target(node.target)
+            return isinstance(node, ast.Assign) and any(
+                is_member_lease_target(target) for target in node.targets
+            )
+
+        def assign_value(node: ast.AST) -> ast.AST:
+            if isinstance(node, ast.AnnAssign):
+                assert node.value is not None
+                return node.value
+            assert isinstance(node, ast.Assign)
+            return node.value
+
+        init_body_member_lease_assigns = [
+            node
+            for node in init_func.body
+            if is_member_lease_assign(node)
+        ]
+        self.assertEqual(len(init_body_member_lease_assigns), 1)
+        initial_value = assign_value(init_body_member_lease_assigns[0])
+        self.assertIsInstance(initial_value, ast.Constant)
+        self.assertIsNone(initial_value.value)
+
+        setup_member_fn = next(
+            node
+            for node in init_func.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_setup_member_and_role_key"
+        )
+        lease_assigns = [
+            node
+            for node in ast.walk(setup_member_fn)
+            if is_member_lease_assign(node)
+            and isinstance(assign_value(node), ast.Call)
+            and isinstance(assign_value(node).func, ast.Attribute)
+            and assign_value(node).func.attr == "lease"
+        ]
+        self.assertEqual(len(lease_assigns), 1)
+
+        member_lease_register_calls = [
+            node
+            for node in ast.walk(setup_member_fn)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr
+            in {"register_etcd_lease", "register_newly_granted_etcd_lease"}
+        ]
+        self.assertEqual(len(member_lease_register_calls), 1)
+        self.assertEqual(
+            member_lease_register_calls[0].func.attr,
+            "register_newly_granted_etcd_lease",
+        )
+
+        shared_setup_guard = next(
+            node
+            for node in init_func.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "keep_shared_mpmc_leases"
+        )
+        member_setup_call = next(
+            node
+            for node in init_func.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "_setup_member_and_role_key"
+        )
+        self.assertLess(
+            shared_setup_guard.lineno,
+            member_setup_call.lineno,
+        )
 
     def test_consumer_does_not_wait_for_ready_channels_before_reporting_ready(self) -> None:
         readiness = evaluate_mpmc_topology_ready(
@@ -324,25 +590,8 @@ class TestMPMCReadinessContract(unittest.TestCase):
                 )
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
-    def test_stop_intent_requests_shutdown_before_close(self) -> None:
-        calls = []
-
-        class FakeCloseResult:
-            def is_ok(self) -> bool:
-                return True
-
-            def unwrap(self):
-                return None
-
-        class FakeEndpoint:
-            def request_shutdown(self) -> None:
-                calls.append("request_shutdown")
-
-            def close(self) -> FakeCloseResult:
-                calls.append("close")
-                return FakeCloseResult()
-
-        endpoint = FakeEndpoint()
+    def test_stop_intent_closes_each_endpoint_once(self) -> None:
+        endpoint = _FakeClosableEndpoint()
         round_state = node_mod.PreparedMPMCRound(
             prepared_runtimes={
                 0: PreparedWorkerRuntime(producer=endpoint),
@@ -355,13 +604,84 @@ class TestMPMCReadinessContract(unittest.TestCase):
             "test_mode": TestMode.MPMC.value,
         }
 
-        node._request_shutdown_prepared_mpmc_endpoints_for_stop_intent(round_state=round_state)
-        node._close_prepared_mpmc_endpoints_for_stop_intent(round_state=round_state)
+        node._close_mpmc_round_endpoints(
+            round_state=round_state,
+            reason="test_stop_intent",
+        )
 
-        self.assertEqual(calls, ["request_shutdown", "close"])
+        self.assertEqual(endpoint.close_calls, 1)
+        self.assertTrue(endpoint.close_results[0].consumed)
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
-    def test_worker_owned_kvcache_init_is_parallel_per_process(self) -> None:
+    def test_kv_close_waits_past_legacy_timeout_and_consumes_result(self) -> None:
+        store = _FakeClosableEndpoint(close_delay_seconds=2.05)
+        node = BenchmarkNode()
+        node.kv_store = store
+
+        started = time.monotonic()
+        with mock.patch.object(node_mod, "close_fs_runtime"):
+            with mock.patch.object(node_mod, "close_rpc_runtime"):
+                node._close_kv_store(reason="slow_close_regression")
+
+        self.assertGreaterEqual(time.monotonic() - started, 2.0)
+        self.assertTrue(node._kv_store_closed)
+        self.assertEqual(store.close_calls, 1)
+        self.assertTrue(store.close_results[0].consumed)
+        self.assertFalse(
+            any(thread.name.startswith("timeout-call:") for thread in threading.enumerate())
+        )
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_concurrent_kv_close_calls_share_one_completed_close(self) -> None:
+        store = _FakeClosableEndpoint(close_delay_seconds=0.05)
+        node = BenchmarkNode()
+        node.kv_store = store
+        errors = []
+
+        def close_store() -> None:
+            try:
+                node._close_kv_store(reason="concurrent_close_regression")
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(node_mod, "close_fs_runtime"):
+            with mock.patch.object(node_mod, "close_rpc_runtime"):
+                threads = [threading.Thread(target=close_store) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=2.0)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(store.close_calls, 1)
+        self.assertTrue(store.close_results[0].consumed)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_mpmc_worker_does_not_close_round_owned_endpoint(self) -> None:
+        endpoint = _FakeClosableEndpoint()
+        node = BenchmarkNode()
+        node.test_config = {
+            "node_role": "producer",
+            "test_mode": TestMode.MPMC.value,
+            "value_size": 256,
+        }
+        node._benchmark_stop.set()
+
+        with mock.patch.object(node_mod, "run_fs_worker", return_value=None):
+            with mock.patch.object(node_mod, "run_rpc_worker", return_value=None):
+                with mock.patch.object(node_mod, "run_kv_worker", return_value=None):
+                    results = node._run_worker_thread(
+                        0,
+                        time.time() + 1.0,
+                        prepared_runtime=PreparedWorkerRuntime(producer=endpoint),
+                    )
+
+        self.assertEqual(results, [])
+        self.assertEqual(endpoint.close_calls, 0)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_producer_kvcache_init_is_shared_per_process(self) -> None:
         class FakeStore:
             pass
 
@@ -388,7 +708,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
             active_count = 0
             max_active_count = 0
 
-            def fake_init_kv_store(_config):
+            def fake_init_kv_store(_config, **_kwargs):
                 nonlocal active_count, max_active_count
                 with active_lock:
                     active_count += 1
@@ -423,10 +743,11 @@ class TestMPMCReadinessContract(unittest.TestCase):
                         thread.join(timeout=2.0)
 
             self.assertEqual(errors, [])
-            self.assertEqual(max_active_count, 2)
+            self.assertEqual(max_active_count, 1)
+            self.assertIsNotNone(node.kv_store)
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
-    def test_worker_owned_kvcache_stagger_runs_once_per_process(self) -> None:
+    def test_process_shared_kvcache_stagger_runs_once_per_process(self) -> None:
         class FakeStore:
             pass
 
@@ -435,8 +756,9 @@ class TestMPMCReadinessContract(unittest.TestCase):
             node.test_config = {
                 "node_role": "producer",
                 "test_mode": TestMode.MPMC.value,
-                "cluster_ready_timeout_seconds": 5,
-                "max_benchmark_seconds": 30,
+                "cluster_ready_timeout_seconds": 1800,
+                "expected_nodes": 328,
+                "max_benchmark_seconds": 60,
                 "kvcache_config": {
                     "instance_key": "producer_0",
                     "fluxonkv_spec": {
@@ -455,7 +777,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
             def fake_stagger(**kwargs):
                 stagger_calls.append(kwargs)
 
-            def fake_init_kv_store(config):
+            def fake_init_kv_store(config, **_kwargs):
                 init_kv_configs.append(config)
                 return FakeStore(), None
 
@@ -469,18 +791,20 @@ class TestMPMCReadinessContract(unittest.TestCase):
                 )
                 return object(), None, None
 
-            with mock.patch.object(node, "_sleep_for_runtime_init_stagger", side_effect=fake_stagger):
-                with mock.patch.object(node, "_init_kv_store_with_ready_retry", side_effect=fake_init_kv_store):
-                    with mock.patch.object(node_mod, "init_mq_channel", side_effect=fake_init_mq_channel):
-                        node._prepare_mpmc_worker_runtime(thread_id=0)
-                        node._prepare_mpmc_worker_runtime(thread_id=1)
+            with mock.patch.object(node, "_wait_for_runtime_init_etcd_health", return_value=None):
+                with mock.patch.object(node, "_sleep_for_runtime_init_stagger", side_effect=fake_stagger):
+                    with mock.patch.object(node, "_init_kv_store_with_ready_retry", side_effect=fake_init_kv_store):
+                        with mock.patch.object(node_mod, "init_mq_channel", side_effect=fake_init_mq_channel):
+                            node._prepare_mpmc_worker_runtime(thread_id=0)
+                            node._prepare_mpmc_worker_runtime(thread_id=1)
 
             self.assertEqual(len(stagger_calls), 1)
-            self.assertEqual(len(init_kv_configs), 2)
+            self.assertEqual(stagger_calls[0], {"max_sleep_seconds": None})
+            self.assertEqual(len(init_kv_configs), 1)
             self.assertEqual(len(init_mq_calls), 2)
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
-    def test_mpmc_producer_runtime_is_worker_owned_per_thread(self) -> None:
+    def test_mpmc_producer_workers_share_process_kv_runtime(self) -> None:
         class FakeStore:
             pass
 
@@ -507,7 +831,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
             stores = []
             producers = []
 
-            def fake_init_kv_store(config):
+            def fake_init_kv_store(config, **_kwargs):
                 init_kv_configs.append(config)
                 store = FakeStore()
                 stores.append(store)
@@ -530,23 +854,16 @@ class TestMPMCReadinessContract(unittest.TestCase):
                     runtime_0 = node._prepare_mpmc_worker_runtime(thread_id=0)
                     runtime_1 = node._prepare_mpmc_worker_runtime(thread_id=1)
 
-            self.assertEqual(len(init_kv_configs), 2)
+            self.assertEqual(len(init_kv_configs), 1)
             self.assertEqual(init_kv_configs[0]["instance_key"], "producer_0__worker_0")
-            self.assertEqual(init_kv_configs[1]["instance_key"], "producer_0__worker_1")
             self.assertEqual(init_kv_configs[0]["fluxonkv_spec"]["p2p_listen_port"], 11826)
-            self.assertEqual(init_kv_configs[1]["fluxonkv_spec"]["p2p_listen_port"], 11827)
             self.assertEqual(len(init_mq_calls), 2)
             self.assertIs(init_mq_calls[0]["kv_store"], stores[0])
-            self.assertIs(init_mq_calls[1]["kv_store"], stores[1])
+            self.assertIs(init_mq_calls[1]["kv_store"], stores[0])
             self.assertIs(runtime_0.producer, producers[0])
             self.assertIs(runtime_1.producer, producers[1])
-            self.assertIs(runtime_0.kv_store, stores[0])
-            self.assertIs(runtime_1.kv_store, stores[1])
+            self.assertIs(node.kv_store, stores[0])
             self.assertIsNot(runtime_0.local_mq_state, runtime_1.local_mq_state)
-            self.assertTrue(runtime_0.close_producer_on_exit)
-            self.assertTrue(runtime_1.close_producer_on_exit)
-            self.assertTrue(runtime_0.close_kv_store_on_exit)
-            self.assertTrue(runtime_1.close_kv_store_on_exit)
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
     def test_mpmc_producer_endpoint_attach_is_not_serialized_across_node_instances(self) -> None:
@@ -583,7 +900,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
                 def _sleep_for_runtime_init_stagger(self, **kwargs) -> None:
                     return None
 
-                def _init_kv_store_with_ready_retry(self, config):
+                def _init_kv_store_with_ready_retry(self, config, **_kwargs):
                     return object(), None
 
                 def _prepare_mpmc_endpoint_runtime_from_kv_store(self, **kwargs) -> PreparedWorkerRuntime:
@@ -596,8 +913,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
                     with active_lock:
                         active_count -= 1
                     return PreparedWorkerRuntime(
-                        producer=object(),
-                        kv_store=kwargs["worker_owned_kv_store"],
+                        producer=_FakeClosableEndpoint(),
                     )
 
             nodes = [
@@ -682,6 +998,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
             "Failed to get next available channel: ChanCreateError",
             'GRpcStatus(Status { code: NotFound, message: "etcdserver: requested lease not found" })',
             "ChanBindError(20004: Bind failed for chan_id=19)",
+            "EtcdError(13003: Failed to read unique key before lock: '/mq_unique_keys/x', err=etcd connection failed)",
         ]
 
         for message in messages:
@@ -756,6 +1073,42 @@ class TestMPMCReadinessContract(unittest.TestCase):
         self.assertEqual(metadata["runtime_ready_node_count"], 2)
         self.assertEqual(metadata["runtime_ready_node_ids"], ["node-a", "node-b"])
 
+    def test_coordinator_assigns_one_prefeed_leader_and_global_consumer_count(self) -> None:
+        coordinator = _new_coordinator_with_temp_config()
+        self.assertEqual(coordinator.expected_mpmc_consumer_workers, 1)
+        self.assertEqual(
+            coordinator.instance_mpmc_producer_prefeed_leader_map,
+            {"producer_0": True},
+        )
+
+        sent = []
+        handle_register_globals = coordinator.handle_register.__func__.__globals__
+        with (
+            mock.patch.dict(
+                handle_register_globals,
+                {"_load_benchmark_section": lambda _path: {}},
+            ),
+            mock.patch.object(
+                coordinator,
+                "_send_tcp_response",
+                side_effect=lambda _sock, response: sent.append(response) or True,
+            ),
+        ):
+            self.assertTrue(
+                coordinator.handle_register(
+                    {
+                        "node_id": "producer-node",
+                        "node_type": "worker",
+                        "instance_key": "producer_0",
+                    },
+                    object(),
+                )
+            )
+
+        config = sent[-1]["config"]
+        self.assertEqual(config["expected_mpmc_consumer_workers"], 1)
+        self.assertIs(config["mpmc_producer_prefeed_leader"], True)
+
     def test_coordinator_waits_for_mpmc_runtime_ready_before_result_wait(self) -> None:
         coordinator_source = Path(
             "fluxon_test_stack/distributed_benchmark_coordinator.py"
@@ -794,13 +1147,19 @@ class TestMPMCReadinessContract(unittest.TestCase):
         self.assertIn("RUNTIME_READY = \"runtime_ready\"", node_source)
         self.assertIn("RUNTIME_START = \"runtime_start\"", node_source)
         wait_call = node_source.index("if not self._wait_for_mpmc_runtime_start():")
+        prefeed_drain_call = node_source.rindex(
+            "self._consume_mpmc_prefeed_messages(",
+            0,
+            wait_call,
+        )
         start_time_set = node_source.index("self.start_time = time.time()", wait_call)
         start_event_set = node_source.index("round_state.start_event.set()", start_time_set)
+        self.assertLess(prefeed_drain_call, wait_call)
         self.assertLess(wait_call, start_time_set)
         self.assertLess(start_time_set, start_event_set)
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
-    def test_producer_prewarm_before_ready_waits_for_endpoint(self) -> None:
+    def test_producer_prewarm_before_ready_defers_endpoint_until_start(self) -> None:
         class ProducerNode(BenchmarkNode):
             def __init__(self) -> None:
                 super().__init__()
@@ -810,7 +1169,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
             def _prepare_mpmc_worker_runtime_with_retry(self, **kwargs) -> PreparedWorkerRuntime:
                 self.prepare_started.set()
                 self.allow_prepare.wait(timeout=2.0)
-                return PreparedWorkerRuntime(producer=object())
+                return PreparedWorkerRuntime(producer=_FakeClosableEndpoint())
 
             def _run_worker_thread(self, *args, **kwargs):
                 return []
@@ -821,31 +1180,100 @@ class TestMPMCReadinessContract(unittest.TestCase):
             def _wait_mpmc_cluster_ready(self, **kwargs) -> None:
                 return None
 
+            def _prefeed_mpmc_producer_channels(self, **kwargs) -> None:
+                return None
+
         node = ProducerNode()
         node.test_config = {
             "node_role": "producer",
             "test_mode": TestMode.MPMC.value,
+            "mpmc_producer_prefeed_leader": False,
             "cluster_ready_timeout_seconds": 5,
             "threads_per_process": 1,
             "max_benchmark_seconds": 5,
+            "value_size": 256,
         }
 
-        prepare_thread = threading.Thread(
-            target=node._prepare_mpmc_round_before_ready,
-            kwargs={"workers": 1},
+        node._prepare_mpmc_round_before_ready(workers=1)
+
+        self.assertIsNotNone(node._prepared_mpmc_round)
+        round_state = node._prepared_mpmc_round
+        self.assertEqual(sorted(round_state.pending_threads), [0])
+        self.assertEqual(round_state.prepared_runtimes, {})
+        self.assertIsNone(round_state.pending_threads[0].ident)
+        self.assertFalse(node.prepare_started.is_set())
+
+        run_thread = threading.Thread(
+            target=node._run_mpmc_workers,
+            kwargs={"workers": 1, "deadline_ts": 0.0},
         )
-        prepare_thread.start()
+        run_thread.start()
         self.assertTrue(node.prepare_started.wait(timeout=1.0))
-        self.assertTrue(prepare_thread.is_alive())
-        self.assertIsNone(node._prepared_mpmc_round)
+        self.assertTrue(run_thread.is_alive())
 
         node.allow_prepare.set()
-        prepare_thread.join(timeout=2.0)
-        self.assertFalse(prepare_thread.is_alive())
-        self.assertIsNotNone(node._prepared_mpmc_round)
-        self.assertEqual(sorted(node._prepared_mpmc_round.prepared_runtimes), [0])
+        run_thread.join(timeout=2.0)
 
+        self.assertFalse(run_thread.is_alive())
+        self.assertEqual(sorted(round_state.prepared_runtimes), [0])
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_mpmc_producer_prefeed_leader_is_explicit_coordinator_assignment(self) -> None:
+        node = BenchmarkNode()
+        node.test_config = {"mpmc_producer_prefeed_leader": True}
+        self.assertTrue(node._is_mpmc_producer_prefeed_leader(thread_id=0))
+        self.assertFalse(node._is_mpmc_producer_prefeed_leader(thread_id=1))
+
+        node.test_config = {"mpmc_producer_prefeed_leader": False}
+        self.assertFalse(node._is_mpmc_producer_prefeed_leader(thread_id=0))
+
+        node.test_config = {}
+        with self.assertRaisesRegex(RuntimeError, "explicit bool"):
+            node._is_mpmc_producer_prefeed_leader(thread_id=0)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_non_leader_mpmc_producer_skips_prefeed_after_start(self) -> None:
+        class NonLeaderProducerNode(BenchmarkNode):
+            def __init__(self) -> None:
+                super().__init__()
+                self.events = []
+
+            def _prepare_mpmc_worker_runtime_with_retry(self, **kwargs) -> PreparedWorkerRuntime:
+                return PreparedWorkerRuntime(producer=_FakeClosableEndpoint())
+
+            def _wait_for_mpmc_runtime_start(self) -> bool:
+                self.events.append("runtime_start")
+                return False
+
+            def _run_worker_thread(self, *args, **kwargs):
+                return []
+
+            def _prefeed_mpmc_producer_channels(self, **kwargs) -> None:
+                self.events.append("prefeed")
+
+        node = NonLeaderProducerNode()
+        node.instance_key = (
+            "bench_mq__largescale_mq__abc123__producer_0_proc_1"
+        )
+        node.test_config = {
+            "node_role": "producer",
+            "test_mode": TestMode.MPMC.value,
+            "mpmc_producer_prefeed_leader": False,
+            "cluster_ready_timeout_seconds": 5,
+            "threads_per_process": 1,
+            "max_benchmark_seconds": 5,
+            "value_size": 256,
+        }
+
+        node._prepare_mpmc_round_before_ready(workers=1)
         node._run_mpmc_workers(workers=1, deadline_ts=0.0)
+
+        self.assertEqual(node.events, ["runtime_start"])
+        self.assertIsNotNone(node._forced_benchmark_result)
+        self.assertEqual(
+            node._forced_benchmark_result["forced_failure_reason"],
+            "mpmc_runtime_start_timeout",
+        )
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
     def test_consumer_prewarm_before_ready_still_waits_for_endpoint(self) -> None:
@@ -855,7 +1283,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
                 self.waited_cluster_ready = False
 
             def _prepare_mpmc_worker_runtime_with_retry(self, **kwargs) -> PreparedWorkerRuntime:
-                return PreparedWorkerRuntime(consumer=object())
+                return PreparedWorkerRuntime(consumer=_FakeClosableEndpoint())
 
             def _wait_mpmc_cluster_ready(self, **kwargs) -> None:
                 self.waited_cluster_ready = True
@@ -865,6 +1293,9 @@ class TestMPMCReadinessContract(unittest.TestCase):
 
             def _wait_for_mpmc_runtime_start(self) -> bool:
                 return True
+
+            def _prefeed_mpmc_producer_channels(self, **kwargs) -> None:
+                return None
 
         node = ConsumerNode()
         node.test_config = {
@@ -879,9 +1310,210 @@ class TestMPMCReadinessContract(unittest.TestCase):
         self.assertIsNotNone(node._prepared_mpmc_round)
         self.assertEqual(len(node._prepared_mpmc_round.prepared_runtimes), 1)
         self.assertTrue(node.waited_cluster_ready)
-        node._prepared_mpmc_round.start_event.set()
-        for thread in node._prepared_mpmc_round.pending_threads.values():
-            thread.join(timeout=2.0)
+        node._finish_mpmc_round(
+            round_state=node._prepared_mpmc_round,
+            reason="test_consumer_prewarm_cleanup",
+        )
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_mpmc_producer_prefeeds_all_ready_channels(self) -> None:
+        class PrefeedNode(BenchmarkNode):
+            def __init__(self) -> None:
+                super().__init__()
+                self.cluster_ready_calls = []
+
+            def _wait_mpmc_prefeed_topology(self, **kwargs):
+                self.cluster_ready_calls.append(kwargs)
+                return SimpleNamespace(mpsc_channel_ids=("11", "12", "13"))
+
+        node = PrefeedNode()
+        node.instance_key = "producer_0_proc_0"
+        node.node_id = "node_producer_0"
+        node.mq_state = node_mod.MQState(role="producer", weight=1.0)
+        node.test_config = {
+            "node_role": "producer",
+            "test_mode": TestMode.MPMC.value,
+            "cluster_ready_timeout_seconds": 5,
+            "threads_per_process": 1,
+            "max_benchmark_seconds": 5,
+            "value_size": 256,
+        }
+        producer = object()
+        runtime = PreparedWorkerRuntime(
+            producer=producer,
+            local_mq_state=node_mod.MQState(
+                role="producer",
+                weight=1.0,
+                producer_id="producer_0_proc_0",
+            ),
+        )
+        put_calls = []
+
+        def fake_mq_put_to_channel_once(actual_producer, channel_id, value):
+            self.assertIs(actual_producer, producer)
+            put_calls.append((channel_id, value))
+            return None
+
+        with mock.patch.object(
+            node_mod,
+            "mq_put_to_channel_once",
+            side_effect=fake_mq_put_to_channel_once,
+        ):
+            node._prefeed_mpmc_producer_channels(
+                runtime=runtime,
+                thread_id=0,
+                timeout_s=5.0,
+            )
+
+        self.assertEqual(
+            len(put_calls),
+            3 * node_mod.MPMC_PRODUCER_PREFEED_MESSAGES_PER_CHANNEL,
+        )
+        self.assertEqual(
+            [channel_id for channel_id, _value in put_calls],
+            ["11", "11", "12", "12", "13", "13"],
+        )
+        self.assertEqual(len(node.cluster_ready_calls), 2)
+        self.assertEqual(node.cluster_ready_calls[0]["runtime"], runtime)
+        self.assertEqual(node.cluster_ready_calls[0]["timeout_s"], 5.0)
+        for _channel_id, value in put_calls:
+            header = json.loads(value["payload"].split(b"\n", 1)[0].decode("utf-8"))
+            self.assertEqual(header["message_kind"], "prefeed")
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_prefeed_waits_for_exact_stable_global_consumer_topology(self) -> None:
+        node = BenchmarkNode()
+        node.test_config = {
+            "node_role": "producer",
+            "test_mode": TestMode.MPMC.value,
+            "expected_mpmc_consumer_workers": 2,
+        }
+        runtime = PreparedWorkerRuntime(producer=object())
+        snapshots = [
+            SimpleNamespace(
+                mpmc_id="7",
+                mpsc_channel_ids=("11",),
+                ready_channel_ids=("11",),
+                active_consumers=1,
+            ),
+            SimpleNamespace(
+                mpmc_id="7",
+                mpsc_channel_ids=("11", "12"),
+                ready_channel_ids=("11", "12"),
+                active_consumers=2,
+            ),
+            SimpleNamespace(
+                mpmc_id="7",
+                mpsc_channel_ids=("11", "12"),
+                ready_channel_ids=("11", "12"),
+                active_consumers=2,
+            ),
+        ]
+
+        with mock.patch.object(
+            node_mod,
+            "get_cluster_info_snapshot",
+            side_effect=snapshots,
+        ) as snapshot_mock, mock.patch.object(node_mod.time, "sleep", return_value=None):
+            snapshot = node._wait_mpmc_prefeed_topology(
+                runtime=runtime,
+                timeout_s=5.0,
+            )
+
+        self.assertEqual(snapshot.mpsc_channel_ids, ("11", "12"))
+        self.assertEqual(snapshot_mock.call_count, 3)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_prefeed_put_targets_the_declared_channel(self) -> None:
+        import fluxon_test_stack.benchmark_node_mq as mq_mod
+        from fluxon_py.api_error import Result
+
+        put_values = []
+
+        class FakeChannel:
+            def put_data(self, value):
+                put_values.append(value)
+                return Result.new_ok(True)
+
+        class FakeMPMCChannel:
+            def get_remote_ready_channels(self):
+                return ["11", "12"]
+
+        class FakeProducer:
+            def __init__(self) -> None:
+                self.mpmc_channel = FakeMPMCChannel()
+                self.bound_channel_ids = []
+
+            def _new_or_get_mpsc_producer(self, channel_id):
+                self.bound_channel_ids.append(channel_id)
+                return FakeChannel()
+
+        producer = FakeProducer()
+        value = {"unique_id": "prefeed-1", "payload": b"value"}
+        with mock.patch.object(mq_mod, "MPMCChanProducer", FakeProducer):
+            err = mq_mod.mq_put_to_channel_once(producer, "12", value)
+
+        self.assertIsNone(err)
+        self.assertEqual(producer.bound_channel_ids, ["12"])
+        self.assertEqual(put_values, [value])
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_consumer_drains_and_validates_prefeed_before_runtime_ready(self) -> None:
+        from fluxon_test_stack.benchmark_node_mq import MQGetOutcome
+
+        node = BenchmarkNode()
+        node.test_config = {
+            "node_role": "consumer",
+            "test_mode": TestMode.MPMC.value,
+            "cluster_ready_timeout_seconds": 5,
+        }
+        round_state = node_mod.PreparedMPMCRound(
+            prepared_runtimes={
+                0: PreparedWorkerRuntime(consumer=object()),
+                1: PreparedWorkerRuntime(consumer=object()),
+            }
+        )
+        outcomes = [
+            MQGetOutcome(
+                status=node_mod.MQGetStatus.DATA,
+                ok=True,
+                error_msg="",
+                data_size=256,
+                message_kind="prefeed",
+            )
+            for _ in range(4)
+        ]
+        with mock.patch.object(node_mod, "mq_get_once", side_effect=outcomes) as get_mock:
+            node._consume_mpmc_prefeed_messages(round_state=round_state, timeout_s=5.0)
+
+        self.assertEqual(get_mock.call_count, 4)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_consumer_rejects_benchmark_message_during_prefeed_drain(self) -> None:
+        from fluxon_test_stack.benchmark_node_mq import MQGetOutcome
+
+        node = BenchmarkNode()
+        node.test_config = {
+            "node_role": "consumer",
+            "test_mode": TestMode.MPMC.value,
+            "cluster_ready_timeout_seconds": 5,
+        }
+        round_state = node_mod.PreparedMPMCRound(
+            prepared_runtimes={0: PreparedWorkerRuntime(consumer=object())}
+        )
+        outcome = MQGetOutcome(
+            status=node_mod.MQGetStatus.DATA,
+            ok=True,
+            error_msg="",
+            data_size=256,
+            message_kind="benchmark",
+        )
+        with mock.patch.object(node_mod, "mq_get_once", return_value=outcome):
+            with self.assertRaisesRegex(RuntimeError, "non-prefeed message"):
+                node._consume_mpmc_prefeed_messages(
+                    round_state=round_state,
+                    timeout_s=5.0,
+                )
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
     def test_mpmc_runtime_start_gate_runs_before_timed_workers(self) -> None:
@@ -889,21 +1521,30 @@ class TestMPMCReadinessContract(unittest.TestCase):
             def __init__(self) -> None:
                 super().__init__()
                 self.runtime_start_checked = False
+                self.events = []
 
             def _prepare_mpmc_worker_runtime_with_retry(self, **kwargs) -> PreparedWorkerRuntime:
-                return PreparedWorkerRuntime(producer=object())
+                return PreparedWorkerRuntime(producer=_FakeClosableEndpoint())
 
             def _wait_for_mpmc_runtime_start(self) -> bool:
+                self.events.append("runtime_start")
                 self.runtime_start_checked = True
                 return False
 
             def _run_worker_thread(self, *args, **kwargs):
                 return []
 
+            def _prefeed_mpmc_producer_channels(self, **kwargs) -> None:
+                self.events.append("prefeed")
+
         node = GatedProducerNode()
+        node.instance_key = (
+            "bench_mq__largescale_mq__abc123__producer_0_proc_0"
+        )
         node.test_config = {
             "node_role": "producer",
             "test_mode": TestMode.MPMC.value,
+            "mpmc_producer_prefeed_leader": True,
             "cluster_ready_timeout_seconds": 5,
             "threads_per_process": 1,
             "max_benchmark_seconds": 5,
@@ -914,6 +1555,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
         node._run_mpmc_workers(workers=1, deadline_ts=0.0)
 
         self.assertTrue(node.runtime_start_checked)
+        self.assertEqual(node.events, ["prefeed", "runtime_start"])
         self.assertIsNotNone(node._forced_benchmark_result)
         self.assertEqual(
             node._forced_benchmark_result["forced_failure_reason"],
@@ -936,6 +1578,194 @@ class TestMPMCReadinessContract(unittest.TestCase):
         self.assertLessEqual(stagger_s, 24.0)
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_runtime_init_etcd_health_cache_is_workload_scoped(self) -> None:
+        node = BenchmarkNode()
+        node.coordinator_host = "127.0.0.1"
+        node.coordinator_port = 7777
+        node.mq_unique_id = "mq-run-a"
+        node.test_config = {
+            "test_mode": TestMode.MPMC.value,
+            "expected_nodes": 328,
+            "test_id": "run-1",
+        }
+        config = {
+            "instance_key": "producer_0",
+            "fluxonkv_spec": {
+                "cluster_name": "bench-cluster",
+                "share_mem_path": "/tmp/fluxon-test-shm/node-1",
+            },
+        }
+
+        first_dir = node._runtime_init_etcd_health_scope_dir(config)
+        self.assertIn("fluxon_mpmc_runtime_health", str(first_dir))
+
+        same = BenchmarkNode()
+        same.coordinator_host = node.coordinator_host
+        same.coordinator_port = node.coordinator_port
+        same.mq_unique_id = node.mq_unique_id
+        same.test_config = dict(node.test_config)
+        self.assertEqual(same._runtime_init_etcd_health_scope_dir(config), first_dir)
+
+        other = BenchmarkNode()
+        other.coordinator_host = node.coordinator_host
+        other.coordinator_port = node.coordinator_port
+        other.mq_unique_id = "mq-run-b"
+        other.test_config = dict(node.test_config)
+        self.assertNotEqual(other._runtime_init_etcd_health_scope_dir(config), first_dir)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_start_wait_poll_sleep_uses_bounded_backoff(self) -> None:
+        node = BenchmarkNode()
+        node.instance_key = "producer_0_proc_0"
+
+        first_sleep = node._start_wait_poll_sleep_seconds(
+            attempt=1,
+            remaining_seconds=100.0,
+        )
+        fifth_sleep = node._start_wait_poll_sleep_seconds(
+            attempt=5,
+            remaining_seconds=100.0,
+        )
+        capped_sleep = node._start_wait_poll_sleep_seconds(
+            attempt=100,
+            remaining_seconds=100.0,
+        )
+        short_remaining_sleep = node._start_wait_poll_sleep_seconds(
+            attempt=100,
+            remaining_seconds=0.25,
+        )
+
+        self.assertGreaterEqual(first_sleep, node_mod.START_WAIT_POLL_INTERVAL_SECONDS)
+        self.assertGreater(fifth_sleep, first_sleep)
+        self.assertLessEqual(
+            capped_sleep,
+            node_mod.START_WAIT_POLL_MAX_SECONDS + node_mod.START_WAIT_POLL_JITTER_SECONDS,
+        )
+        self.assertEqual(short_remaining_sleep, 0.25)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_runtime_init_etcd_health_urls_are_derived_from_kvcache_config(self) -> None:
+        urls = BenchmarkNode._runtime_init_etcd_health_urls(
+            {
+                "fluxonkv_spec": {
+                    "etcd_addresses": [
+                        "127.0.0.1:2379",
+                        "http://10.1.1.2:2380",
+                        "http://10.1.1.2:2380/",
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(
+            urls,
+            [
+                "http://127.0.0.1:2379/health",
+                "http://10.1.1.2:2380/health",
+            ],
+        )
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_runtime_init_etcd_health_urls_are_derived_from_owner_shared_json(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            share_mem_path = Path(td) / "shm1" / "node-1"
+            cluster_name = "fluxon_benchmark_test"
+            shared_dir = share_mem_path / cluster_name
+            shared_dir.mkdir(parents=True)
+            (shared_dir / "shared.json").write_text(
+                json.dumps({"etcd_addresses": ["127.0.0.1:2379"]}),
+                encoding="utf-8",
+            )
+
+            urls = BenchmarkNode._runtime_init_etcd_health_urls(
+                {
+                    "fluxonkv_spec": {
+                        "cluster_name": cluster_name,
+                        "share_mem_path": str(share_mem_path),
+                    },
+                }
+            )
+
+        self.assertEqual(urls, ["http://127.0.0.1:2379/health"])
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_runtime_init_etcd_health_probe_waits_for_missing_owner_shared_json(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            node = BenchmarkNode()
+            healthy, detail = node._probe_runtime_init_etcd_health(
+                {
+                    "fluxonkv_spec": {
+                        "cluster_name": "fluxon_benchmark_test",
+                        "share_mem_path": str(Path(td) / "shm1" / "node-1"),
+                    },
+                }
+            )
+
+        self.assertFalse(healthy)
+        self.assertIn("owner shared.json not ready", detail)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_runtime_init_waits_for_etcd_health_before_initialization(self) -> None:
+        node = BenchmarkNode()
+        node.test_config = {
+            "test_mode": TestMode.MPMC.value,
+            "expected_nodes": 328,
+        }
+        node._runtime_init_retry_sleep_seconds = lambda attempt: 0.0  # type: ignore[method-assign]
+        config = {
+            "fluxonkv_spec": {
+                "etcd_addresses": ["127.0.0.1:2379"],
+            },
+        }
+        probes = [(False, "timeout"), (True, "http://127.0.0.1:2379/health")]
+        sleeps = []
+
+        with mock.patch.object(node, "_probe_runtime_init_etcd_health_shared", side_effect=probes):
+            with mock.patch.object(node_mod.time, "sleep", side_effect=lambda seconds: sleeps.append(seconds)):
+                err = node._wait_for_runtime_init_etcd_health(
+                    config,
+                    deadline_ts=time.monotonic() + 1.0,
+                    ctx="test",
+                )
+
+        self.assertIsNone(err)
+        self.assertEqual(sleeps, [0.0])
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_runtime_init_etcd_health_probe_uses_shared_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            node = BenchmarkNode()
+            node.coordinator_host = "127.0.0.1"
+            node.coordinator_port = 7777
+            node.mq_unique_id = "mq-run-a"
+            node.test_config = {
+                "test_mode": TestMode.MPMC.value,
+                "expected_nodes": 328,
+                "test_id": "run-1",
+            }
+            config = {
+                "fluxonkv_spec": {
+                    "cluster_name": "bench-cluster",
+                    "etcd_addresses": ["127.0.0.1:2379"],
+                },
+            }
+            calls = []
+
+            def fake_probe(_config):
+                calls.append("probe")
+                return True, "http://127.0.0.1:2379/health"
+
+            with mock.patch.object(node_mod, "RUNTIME_INIT_ETCD_HEALTH_ROOT", Path(td) / "health"):
+                with mock.patch.object(node, "_probe_runtime_init_etcd_health", side_effect=fake_probe):
+                    first = node._probe_runtime_init_etcd_health_shared(config)
+                    second = node._probe_runtime_init_etcd_health_shared(config)
+
+        self.assertEqual(first[0], True)
+        self.assertEqual(second[0], True)
+        self.assertEqual(calls, ["probe"])
+        self.assertIn("cache=", second[1])
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
     def test_kv_store_init_retries_transient_errors(self) -> None:
         node = BenchmarkNode()
         node.test_config = {
@@ -947,7 +1777,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
         sentinel_store = object()
         original_init_kv_store = node_mod.init_kv_store
 
-        def fake_init_kv_store(config):
+        def fake_init_kv_store(config, **_kwargs):
             calls.append(config)
             if len(calls) == 1:
                 return None, "Failed to connect to etcd: status probe timed out after 10s"
@@ -964,7 +1794,59 @@ class TestMPMCReadinessContract(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
-    def test_producer_worker_owned_runtime_initializes_kv_before_mq_attach(self) -> None:
+    def test_endpoint_prepare_never_retries_pyo3_style_panic(self) -> None:
+        node = BenchmarkNode()
+        node._runtime_init_retry_sleep_seconds = lambda attempt: 0.0  # type: ignore[method-assign]
+        calls = []
+        class SyntheticPanic(BaseException):
+            pass
+
+        def fake_prepare(**_kwargs):
+            calls.append("prepare")
+            raise SyntheticPanic(
+                "tcp_thread reactor spawn failed: timed out waiting on channel"
+            )
+
+        with mock.patch.object(node, "_prepare_mpmc_worker_runtime", side_effect=fake_prepare):
+            with self.assertRaises(SyntheticPanic):
+                node._prepare_mpmc_worker_runtime_with_retry(
+                    thread_id=0,
+                    deadline_ts=time.monotonic() + 5.0,
+                    ctx="test",
+                )
+
+        self.assertEqual(calls, ["prepare"])
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_worker_panic_is_forwarded_to_main_thread_without_prepare_timeout(self) -> None:
+        class SyntheticPanic(BaseException):
+            pass
+
+        class PanicNode(BenchmarkNode):
+            def _prepare_mpmc_worker_runtime_with_retry(self, **_kwargs):
+                raise SyntheticPanic("fatal runtime panic")
+
+            def _close_kv_store(self, *, reason: str) -> None:
+                self.closed_reason = reason
+
+        node = PanicNode()
+        node.test_config = {
+            "node_role": "consumer",
+            "test_mode": TestMode.MPMC.value,
+            "cluster_ready_timeout_seconds": 30,
+            "threads_per_process": 1,
+        }
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "runtime is not recoverable") as ctx:
+            node._prepare_mpmc_round_before_ready(workers=1)
+
+        self.assertIsInstance(ctx.exception.__cause__, SyntheticPanic)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertIn("mpmc_fatal_worker_error", node.closed_reason)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_producer_process_shared_runtime_initializes_kv_before_mq_attach(self) -> None:
         node = BenchmarkNode()
         node.instance_key = "producer_0_proc_0"
         node.node_id = "node_producer"
@@ -991,7 +1873,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
         sentinel_producer = object()
         original_init_mq_channel = node_mod.init_mq_channel
 
-        def fake_init_kv_store(config):
+        def fake_init_kv_store(config, **_kwargs):
             init_kv_configs.append(config)
             events.append("kv_init")
             return sentinel_store, None
@@ -1009,9 +1891,172 @@ class TestMPMCReadinessContract(unittest.TestCase):
             node_mod.init_mq_channel = original_init_mq_channel
 
         self.assertIs(runtime.producer, sentinel_producer)
-        self.assertIs(runtime.kv_store, sentinel_store)
+        self.assertIs(node.kv_store, sentinel_store)
         self.assertEqual(init_kv_configs[0]["instance_key"], "producer_0_proc_0__worker_0")
         self.assertEqual(events, ["kv_init", "mq_attach"])
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_producer_workers_reuse_one_process_kv_runtime(self) -> None:
+        node = BenchmarkNode()
+        node.instance_key = "producer_0_proc_0"
+        node.node_id = "node_producer"
+        node.mq_unique_id = "mpmc-test"
+        node.mq_state = node_mod.MQState(role="producer", weight=1.0)
+        node.chan_config = {}
+        node.test_config = {
+            "node_role": "producer",
+            "test_mode": TestMode.MPMC.value,
+            "cluster_ready_timeout_seconds": 5,
+            "kvcache_config": {
+                "instance_key": "producer_0_proc_0",
+                "fluxonkv_spec": {
+                    "share_mem_path": "/tmp/fluxon-test-shm/node-1",
+                    "cluster_name": "fluxon_benchmark",
+                    "p2p_listen_port": 12000,
+                },
+            },
+        }
+
+        init_kv_configs = []
+        attach_stores = []
+        sentinel_store = object()
+
+        def fake_init_kv_store(config, **_kwargs):
+            init_kv_configs.append(config)
+            return sentinel_store, None
+
+        def fake_init_mq_channel(**kwargs):
+            attach_stores.append(kwargs["kv_store"])
+            return object(), None, None
+
+        node._sleep_for_runtime_init_stagger = lambda **kwargs: None  # type: ignore[method-assign]
+        with mock.patch.object(node_mod, "init_mq_channel", side_effect=fake_init_mq_channel):
+            with mock.patch.object(node, "_init_kv_store_with_ready_retry", side_effect=fake_init_kv_store):
+                first = node._prepare_mpmc_worker_runtime(thread_id=0)
+                second = node._prepare_mpmc_worker_runtime(thread_id=1)
+
+        self.assertEqual(len(init_kv_configs), 1)
+        self.assertEqual(attach_stores, [sentinel_store, sentinel_store])
+        self.assertIs(node.kv_store, sentinel_store)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_producer_runtime_initializes_kv_then_attaches_mq_without_global_gate(self) -> None:
+        node = BenchmarkNode()
+        node.instance_key = "producer_0_proc_0"
+        node.node_id = "node_producer"
+        node.mq_unique_id = "mpmc-test"
+        node.mq_state = node_mod.MQState(role="producer", weight=1.0)
+        node.chan_config = {}
+        node.test_config = {
+            "node_role": "producer",
+            "test_mode": TestMode.MPMC.value,
+            "cluster_ready_timeout_seconds": 5,
+            "expected_nodes": 328,
+            "kvcache_config": {
+                "instance_key": "producer_0_proc_0",
+                "fluxonkv_spec": {
+                    "share_mem_path": "/tmp/fluxon-test-shm/node-1",
+                    "cluster_name": "fluxon_benchmark",
+                    "p2p_listen_port": 12000,
+                },
+            },
+        }
+
+        events = []
+        sentinel_store = object()
+        sentinel_producer = object()
+        original_init_mq_channel = node_mod.init_mq_channel
+
+        def fake_init_kv_store(config, **kwargs):
+            events.append("kv_init")
+            self.assertEqual(config["instance_key"], "producer_0_proc_0__worker_0")
+            self.assertGreater(kwargs["deadline_ts"], time.monotonic())
+            return sentinel_store, None
+
+        def fake_init_mq_channel(**kwargs):
+            events.append("mq_attach")
+            return sentinel_producer, None, None
+
+        node_mod.init_mq_channel = fake_init_mq_channel
+        node._sleep_for_runtime_init_stagger = lambda **kwargs: None  # type: ignore[method-assign]
+        try:
+            with mock.patch.object(node, "_init_kv_store_with_ready_retry", side_effect=fake_init_kv_store):
+                runtime = node._prepare_mpmc_worker_runtime(thread_id=0)
+        finally:
+            node_mod.init_mq_channel = original_init_mq_channel
+
+        self.assertIs(runtime.producer, sentinel_producer)
+        self.assertEqual(events, ["kv_init", "mq_attach"])
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_logical_only_producer_runtime_skips_kv_and_mq_attach(self) -> None:
+        node = BenchmarkNode()
+        node.instance_key = "producer_200_proc_0"
+        node.node_id = "node_producer_logical"
+        node.mq_unique_id = "mpmc-test"
+        node.mq_state = node_mod.MQState(role="producer", weight=1.0)
+        node.chan_config = {}
+        node.test_config = {
+            "node_role": "producer",
+            "test_mode": TestMode.MPMC.value,
+            "cluster_ready_timeout_seconds": 5,
+            "mpmc_producer_runtime_mode": "logical_only",
+            "kvcache_config": {
+                "instance_key": "producer_200_proc_0",
+                "fluxonkv_spec": {
+                    "share_mem_path": "/tmp/fluxon-test-shm/node-1",
+                    "cluster_name": "fluxon_benchmark",
+                    "p2p_listen_port": 12000,
+                },
+            },
+        }
+
+        def fail_init_kv_store(*_args, **_kwargs):
+            raise AssertionError("logical-only producer must not initialize KV")
+
+        def fail_init_mq_channel(**_kwargs):
+            raise AssertionError("logical-only producer must not attach MQ")
+
+        original_init_mq_channel = node_mod.init_mq_channel
+        node_mod.init_mq_channel = fail_init_mq_channel
+        try:
+            with mock.patch.object(node, "_init_kv_store_with_ready_retry", side_effect=fail_init_kv_store):
+                runtime = node._prepare_mpmc_worker_runtime(thread_id=0)
+        finally:
+            node_mod.init_mq_channel = original_init_mq_channel
+
+        self.assertTrue(runtime.logical_only)
+        self.assertIsNone(runtime.producer)
+        self.assertIsNone(runtime.consumer)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_logical_only_producer_worker_reports_empty_successful_result_set(self) -> None:
+        node = BenchmarkNode()
+        node.instance_key = "producer_200_proc_0"
+        node.node_id = "node_producer_logical"
+        node.test_config = {
+            "node_role": "producer",
+            "test_mode": TestMode.MPMC.value,
+            "cluster_ready_timeout_seconds": 5,
+            "threads_per_process": 1,
+            "max_benchmark_seconds": 5,
+            "value_size": 256,
+            "mpmc_producer_runtime_mode": "logical_only",
+        }
+        runtime = PreparedWorkerRuntime(
+            logical_only=True,
+        )
+
+        with mock.patch.object(node_mod, "run_fs_worker", return_value=None):
+            with mock.patch.object(node_mod, "run_rpc_worker", return_value=None):
+                with mock.patch.object(node_mod, "run_kv_worker", return_value=None):
+                    results = node._run_worker_thread(
+                        0,
+                        time.time() + 1.0,
+                        prepared_runtime=runtime,
+                    )
+
+        self.assertEqual(results, [])
 
 
 if __name__ == "__main__":

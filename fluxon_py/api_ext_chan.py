@@ -37,6 +37,9 @@ import logging
 MQ_UNIQUE_KEY_PREFIX = "/mq_unique_keys/"
 MQ_UNIQUE_LOCK_PREFIX = "/mq_unique_locks/"
 MQ_UNIQUE_LOCK_WAIT_MULTIPLIER = 200
+MQ_UNIQUE_FAST_BIND_READ_RETRY_ATTEMPTS = 3
+MQ_UNIQUE_FAST_BIND_READ_RETRY_BASE_SECONDS = 0.2
+MQ_UNIQUE_FAST_BIND_READ_RETRY_MAX_SECONDS = 1.0
 
 
 def _new_unique_mapping_key(unique_id: str) -> str:
@@ -306,6 +309,67 @@ def new_or_bind_with_unique_key(
             ChanBindError(f"Channel {existing_chan_id} not found in active nodes, error: {result.unwrap_error()}")
         )
 
+    def _try_bind_existing_channel_without_lock() -> Result[object, ApiError]:
+        """
+        Bind fast when the unique mapping is already published.
+
+        The distributed lock is only needed to create a channel or clean stale
+        metadata. Existing mappings can bind directly and avoid turning a large
+        producer fan-out into hundreds of serialized etcd lock acquisitions.
+        """
+        last_read_exc: Optional[Exception] = None
+        for read_attempt in range(MQ_UNIQUE_FAST_BIND_READ_RETRY_ATTEMPTS):
+            try:
+                existing_chan_id_res = _read_unique_chan_id()
+                break
+            except Exception as e:  # noqa: BLE001
+                last_read_exc = e
+                if read_attempt >= MQ_UNIQUE_FAST_BIND_READ_RETRY_ATTEMPTS - 1:
+                    return Result[object, ApiError].new_error(
+                        EtcdError(
+                            message=f"Failed to read unique key before lock: {unique_key!r}, err={e}",
+                            component="api_ext_chan.new_or_bind_with_unique_key",
+                            transport=TransportName.GRPC,
+                            transport_user=TransportUser.ETCD,
+                        )
+                    )
+                sleep_s = min(
+                    MQ_UNIQUE_FAST_BIND_READ_RETRY_MAX_SECONDS,
+                    MQ_UNIQUE_FAST_BIND_READ_RETRY_BASE_SECONDS * (2 ** read_attempt),
+                )
+                logging.warning(
+                    "unique key fast-bind read failed transiently; retrying: unique_key=%s attempt=%s/%s sleep_seconds=%.2f err=%s",
+                    unique_key,
+                    read_attempt + 1,
+                    MQ_UNIQUE_FAST_BIND_READ_RETRY_ATTEMPTS,
+                    sleep_s,
+                    e,
+                )
+                time.sleep(sleep_s)
+        else:
+            assert last_read_exc is not None
+            return Result[object, ApiError].new_error(
+                EtcdError(
+                    message=f"Failed to read unique key before lock: {unique_key!r}, err={last_read_exc}",
+                    component="api_ext_chan.new_or_bind_with_unique_key",
+                    transport=TransportName.GRPC,
+                    transport_user=TransportUser.ETCD,
+                )
+            )
+
+        if not existing_chan_id_res.is_ok():
+            return Result[object, ApiError].new_error(existing_chan_id_res.unwrap_error())
+
+        existing_chan_id_exists, existing_chan_id = existing_chan_id_res.unwrap()
+        if not existing_chan_id_exists:
+            return Result[object, ApiError].new_ok(("no_mapping", None))
+
+        assert existing_chan_id is not None
+        bind_res = _bind_existing_channel(existing_chan_id)
+        if bind_res.is_ok():
+            return Result[object, ApiError].new_ok(bind_res.unwrap())
+        return Result[object, ApiError].new_error(bind_res.unwrap_error())
+
     def _resolve_or_create_under_lock() -> Result[object, ApiError]:
         """
         Resolve the unique key under lock.
@@ -430,6 +494,28 @@ def new_or_bind_with_unique_key(
     final_error: Optional[ApiError] = None
     max_attempts = 3
     for attempt_idx in range(max_attempts):
+        fast_bind_res = _try_bind_existing_channel_without_lock()
+        if fast_bind_res.is_ok():
+            fast_bind_value = fast_bind_res.unwrap()
+            if not (
+                isinstance(fast_bind_value, tuple)
+                and len(fast_bind_value) == 2
+                and fast_bind_value[0] == "no_mapping"
+            ):
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_ok(fast_bind_value)
+        else:
+            fast_bind_err = fast_bind_res.unwrap_error()
+            if not _is_stale_bind_error(fast_bind_err):
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(fast_bind_err)
+
+            logging.warning(
+                "existing channel fast bind found stale state outside lock; falling back to locked resolve. unique_key=%s err=%s attempt=%s/%s",
+                unique_key,
+                fast_bind_err,
+                attempt_idx + 1,
+                max_attempts,
+            )
+
         try:
             lock_token = _acquire_lock(key=lock_key, ttl_seconds=120)
         except Exception as e:  # noqa: BLE001

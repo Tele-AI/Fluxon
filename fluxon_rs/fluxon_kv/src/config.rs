@@ -407,20 +407,7 @@ fn verify_non_empty_root_path_list(paths: &[String], field_name: &str) -> KvResu
     Ok(out)
 }
 
-fn resolve_compiled_rdma_transfer_engine() -> KvResult<TransferEngineType> {
-    Ok(TransferEngineType::Closed)
-}
-
-fn resolve_transfer_engine_for_test_spec(
-    _test_spec_config: Option<&TestSpecConfig>,
-) -> KvResult<TransferEngineType> {
-    resolve_compiled_rdma_transfer_engine()
-}
-
-fn resolve_transfer_engine_for_protocol_and_test_spec(
-    protocol: &ProtocolConfig,
-    test_spec_config: Option<&TestSpecConfig>,
-) -> KvResult<TransferEngineType> {
+fn resolve_transfer_engine_for_protocol(protocol: &ProtocolConfig) -> KvResult<TransferEngineType> {
     if matches!(protocol.protocol_type, ProtocolType::Tcp) {
         return Err(ConfigError::InvalidClientConfig {
             detail:
@@ -429,7 +416,7 @@ fn resolve_transfer_engine_for_protocol_and_test_spec(
         }
         .into_kverror());
     }
-    resolve_transfer_engine_for_test_spec(test_spec_config)
+    Ok(TransferEngineType::Closed)
 }
 
 // Defaults for `monitoring.otlp_log_api`.
@@ -733,7 +720,7 @@ pub struct ClientConfig {
     pub pprof_duration_seconds: Option<u64>,
     pub redis_compat_listen_addr: Option<std::net::SocketAddr>,
     pub fluxonkv_spec: FluxonKvSpec,
-    pub share_mem_path: String, // Mandatory shared bundle path
+    pub share_mem_path: String,           // Mandatory shared bundle path
     pub large_file_paths: LargeFilePaths, // Mandatory large-file roots for logs and caches
     pub test_spec_config: TestSpecConfig,
 }
@@ -1108,7 +1095,7 @@ impl ClientConfigYaml {
         let transfer_engine = if is_side_transfer_worker {
             TransferEngineType::P2p
         } else {
-            resolve_transfer_engine_for_protocol_and_test_spec(&protocol, Some(&test_spec_config))?
+            resolve_transfer_engine_for_protocol(&protocol)?
         };
         let enable_transfer_rpc_fast_path = if is_side_transfer_worker {
             false
@@ -1170,13 +1157,15 @@ impl ClientConfigYaml {
         } else {
             let Some(large_file_paths_yaml) = self.fluxonkv_spec.large_file_paths.as_ref() else {
                 return Err(ConfigError::InvalidClientConfig {
-                    detail: "fluxonkv_spec.large_file_paths is required for owner mode"
-                        .to_string(),
+                    detail: "fluxonkv_spec.large_file_paths is required for owner mode".to_string(),
                 }
                 .into_kverror());
             };
             LargeFilePaths {
-                paths: verify_non_empty_root_path_list(&large_file_paths_yaml.0, "large_file_paths")?,
+                paths: verify_non_empty_root_path_list(
+                    &large_file_paths_yaml.0,
+                    "large_file_paths",
+                )?,
             }
         };
 
@@ -1506,8 +1495,7 @@ impl MasterConfigYaml {
             }),
             normalized_rdma_device_names.as_ref(),
         );
-        let transfer_engine =
-            resolve_transfer_engine_for_protocol_and_test_spec(&protocol, Some(&test_spec_config))?;
+        let transfer_engine = resolve_transfer_engine_for_protocol(&protocol)?;
 
         Ok(MasterConfig {
             instance_key: self.instance_key,
@@ -1647,7 +1635,9 @@ fluxonkv_spec:
         .unwrap();
         let err = cfg.verify().unwrap_err();
         let text = format!("{err}");
-        assert!(text.contains("fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode"));
+        assert!(
+            text.contains("fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode")
+        );
     }
 
     #[test]
@@ -1667,7 +1657,9 @@ fluxonkv_spec:
         let logs_dir = large_file_paths.kv_logs_dir("test_cluster").unwrap();
         assert_eq!(
             logs_dir,
-            first_root.join("child").join("test_cluster_cluster_kv_logs")
+            first_root
+                .join("child")
+                .join("test_cluster_cluster_kv_logs")
         );
         assert!(logs_dir.exists());
 

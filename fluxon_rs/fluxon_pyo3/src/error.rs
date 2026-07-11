@@ -257,10 +257,6 @@ pub(crate) fn new_file_write_error(
     error_class.call((), Some(&kwargs)).unwrap().into()
 }
 
-pub(crate) fn new_store_closed_error(py: Python<'_>, message: &str) -> PyObject {
-    new_api_error_base(py, "StoreClosedError", message)
-}
-
 pub(crate) fn new_result_success(py: Python<'_>, value: PyObject) -> PyObject {
     let api_error_module = py.import_bound("fluxon_py.api_error").unwrap();
     let result_class = api_error_module.getattr("Result").unwrap();

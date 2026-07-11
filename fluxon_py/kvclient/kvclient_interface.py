@@ -220,8 +220,13 @@ class KvClient(FactoryOnly):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Context manager exit: best-effort close."""
-        self.close()
+        """Close the client and consume the explicit close result."""
+        close_result = self.close()
+        if close_result.is_ok():
+            close_result.unwrap()
+            return
+        close_error = close_result.unwrap_error()
+        raise RuntimeError(f"KvClient context close failed: {close_error}")
 
 
 class KvLeaseApi(ABC):

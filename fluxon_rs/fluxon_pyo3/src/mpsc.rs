@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -51,6 +52,23 @@ const RUST_KV_DELETE_JOIN_WARN_INTERVAL: Duration = Duration::from_secs(1);
 const PAYLOAD_STAGE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
 const PAYLOAD_STAGE_SLOW_WARN_THRESHOLD: Duration = Duration::from_secs(1);
 const GET_ONE_PENDING_WARN_INTERVAL: Duration = Duration::from_secs(2);
+
+async fn run_mpsc_bind_until_shutdown<T, F>(
+    shutdown: ShutdownCtl,
+    bind_future: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    tokio::pin!(bind_future);
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_closed() => {
+            Err(anyhow::anyhow!("MPSC producer bind cancelled by shutdown"))
+        }
+        result = &mut bind_future => result,
+    }
+}
 
 /// Global runtime for standalone PyO3 helpers (e.g., lease_manager.rs).
 /// MQ operations should use the KV client's runtime/framework instead.
@@ -142,6 +160,13 @@ pub struct MpscContext {
 
 #[pymethods]
 impl MpscContext {
+    #[staticmethod]
+    fn new_shutdown_ctl() -> PyShutdownCtl {
+        PyShutdownCtl {
+            shutdown: ShutdownCtl::new(),
+        }
+    }
+
     /// Create a new MPSC context from etcd endpoints.
     ///
     /// The runtime is created lazily on first use and shared
@@ -181,7 +206,7 @@ impl MpscContext {
     /// 允许上层（例如 MPMC）覆写 channel 的 global / member
     /// lease。若提供，则 `create_mpsc_channel` 将复用该 lease
     /// 而不是新建；生命周期仍由上层控制，本层只贡献 keepalive。
-    #[pyo3(signature = (chan_id=None, ttl_seconds=None, weight=None, capacity=None, override_global_lease_id=None, override_member_lease_id=None, override_payload_lease_id=None, parent_mpmc_id_opt=None, parent_mpmc_member_id_opt=None))]
+    #[pyo3(signature = (chan_id=None, ttl_seconds=None, weight=None, capacity=None, override_global_lease_id=None, override_member_lease_id=None, override_payload_lease_id=None, parent_mpmc_id_opt=None, parent_mpmc_member_id_opt=None, bind_shutdown_ctl=None))]
     fn new_producer(
         &self,
         chan_id: Option<i64>,
@@ -193,6 +218,7 @@ impl MpscContext {
         override_payload_lease_id: Option<i64>,
         parent_mpmc_id_opt: Option<i64>,
         parent_mpmc_member_id_opt: Option<i64>,
+        bind_shutdown_ctl: Option<Py<PyShutdownCtl>>,
         py: Python<'_>,
     ) -> PyResult<MpscProducerHandle> {
         let ttl_seconds = match ttl_seconds {
@@ -222,12 +248,18 @@ impl MpscContext {
         let lifecycle = self.mq_framework.as_ref().cloned().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("MpscContext is closed")
         })?;
-        let shutdown = ShutdownCtl::new();
+        let shutdown = match bind_shutdown_ctl {
+            Some(bind_shutdown_ctl) => bind_shutdown_ctl.borrow(py).shutdown.clone(),
+            None => ShutdownCtl::new(),
+        };
         let shutdown_for_core = shutdown.clone();
+        let shutdown_for_bind = shutdown.clone();
         let runtime = self.kv_runtime.clone();
         let rth = runtime.clone();
         let outer = py.allow_threads(|| runtime
-            .run_async_from_sync(async move {
+            .run_async_from_sync(run_mpsc_bind_until_shutdown(
+                shutdown_for_bind,
+                async move {
                 let lease_manager = GLOBAL_LM.clone();
 
                 // Construct channel manager either by creating a new
@@ -330,7 +362,8 @@ impl MpscContext {
                     observe,
                 )
                 .await
-            }))
+                },
+            )))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "runtime bridge failed in new_producer: {}",
                 e
@@ -1310,7 +1343,7 @@ impl MpscConsumerHandle {
                     .get_with_payload_retry_wait_timeout(prefetch_target, Duration::from_millis(ms as u64))
                     .await
             } else {
-                guard.inner_mut().get_with_payload_retry(prefetch_target).await
+                guard.inner_mut().get_with_payload(prefetch_target).await
             };
             match &res {
                 Ok(payload) => {
@@ -1696,18 +1729,6 @@ cnt={} recv_calls={} recv_timeouts={} last_prefetch_target={} last_timeout_ms={:
                 "MpscConsumerHandle inner not initialized",
             )),
         }
-    }
-
-    /// Call Rust-side get API using the callback that was
-    /// previously initialized via `init_payload_callback`.
-    ///
-    /// 为向后兼容，仍保留旧接口签名；内部会先初始化回调，
-    /// 然后调用 `get_one` 返回 payload。
-    #[pyo3(signature = (callback))]
-    fn get_with_payload(&mut self, py: Python<'_>, callback: PyObject) -> PyResult<PyObject> {
-        self.init_payload_callback(callback)?;
-        // Backward-compatible entry: use prefetch_target = 1.
-        self.get_one(py, 1, None)
     }
 
     /// Mark this consumer as closed. Prefetch actor and retry loops

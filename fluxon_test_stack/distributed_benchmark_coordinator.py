@@ -426,9 +426,24 @@ def get_consumer_sim_handle_ms_range(config_path: str) -> Optional[Tuple[int, in
     return (min_ms, max_ms)
 
 
-def _load_benchmark_config(config_path: str) -> Dict[str, Any]:
-    """加载 CONFIG['benchmark']，用于统一读取 value_size / mode 等字段。"""
-    return _load_benchmark_section(config_path)
+def get_mpmc_active_producer_runtime_limit(config_path: str) -> Optional[int]:
+    """Read the optional MPMC active producer runtime limit."""
+    benchmark_cfg = _load_benchmark_section(config_path)
+    raw_limit = benchmark_cfg.get("mpmc_active_producer_runtime_limit")
+    if raw_limit is None:
+        return None
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "benchmark.mpmc_active_producer_runtime_limit must be an integer"
+        ) from exc
+    if limit <= 0:
+        raise ValueError(
+            "benchmark.mpmc_active_producer_runtime_limit must be > 0, "
+            f"got: {raw_limit!r}"
+        )
+    return limit
 
 
 def get_value_size_from_config(config_path: str) -> int:
@@ -444,7 +459,7 @@ def get_test_mode_from_config(config_path: str) -> str:
 
     Allowed values: KVSTORE / KVSTORE_WITH_LOCAL_CACHE / RPC / MPMC
     """
-    benchmark_cfg = _load_benchmark_config(config_path)
+    benchmark_cfg = _load_benchmark_section(config_path)
     if "mode" not in benchmark_cfg:
         print("❌ benchmark.mode 未配置")
         exit(1)
@@ -556,6 +571,13 @@ print(
     f"ℹ️ 从配置加载 CONSUMER_SIM_HANDLE_MS_RANGE: {CONSUMER_SIM_HANDLE_MS_RANGE}"
 )
 
+MPMC_ACTIVE_PRODUCER_RUNTIME_LIMIT = get_mpmc_active_producer_runtime_limit(KVCACHE_CONFIG_PATH)
+print(
+    f"ℹ️ 从配置加载 MPMC_ACTIVE_PRODUCER_RUNTIME_LIMIT: {MPMC_ACTIVE_PRODUCER_RUNTIME_LIMIT}"
+)
+MPMC_PRODUCER_RUNTIME_MODE_ACTIVE = "active"
+MPMC_PRODUCER_RUNTIME_MODE_LOGICAL_ONLY = "logical_only"
+
 
 CURR_TEST_MODE = get_test_mode_from_config(KVCACHE_CONFIG_PATH)
 print(f"ℹ️ 从配置加载 CURR_TEST_MODE: {CURR_TEST_MODE}")
@@ -607,6 +629,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("coordinator")
 
+START_WAITING_WARNING_LOG_INTERVAL_SECONDS = 10.0
+
 
 @dataclass
 class TestConfig:
@@ -652,6 +676,9 @@ class NodeConfig:
     mq_weight: float = 1.0
     mq_config: Optional[dict] = None
     mq_unique_id: Optional[str] = None
+    mpmc_producer_runtime_mode: Optional[str] = None
+    expected_mpmc_consumer_workers: Optional[int] = None
+    mpmc_producer_prefeed_leader: Optional[bool] = None
     # Optional: simulated MQ consumer handling time (milliseconds range)
     consumer_sim_handle_ms_range: Optional[Tuple[int, int]] = None
     network_sample: Optional[Dict[str, Any]] = None
@@ -1512,6 +1539,9 @@ class CoordinatorServer:
         self.all_runtime_ready = threading.Event()
         self.all_results_received = threading.Event()
         self.test_config: Optional[TestConfig] = None
+        self._start_waiting_warning_lock = threading.Lock()
+        self._start_waiting_warning_next_log_ts = 0.0
+        self._start_waiting_warning_suppressed_count = 0
         # Multi-round test control (value-size sweep only; process fanout is deploy-time fixed).
         self.current_round_index: int = 0
         self.total_rounds: int = 1
@@ -1526,6 +1556,11 @@ class CoordinatorServer:
         self.instance_role_map: Dict[str, str] = {}
         # map instance_key -> key_prefix, derived deterministically from role + ordinal in config
         self.instance_key_prefix_map: Dict[str, str] = {}
+        # map MPMC producer instance_key -> active/logical_only runtime mode
+        self.instance_mpmc_producer_runtime_mode_map: Dict[str, str] = {}
+        # Exactly one active producer is elected to perform cluster prefeed.
+        self.instance_mpmc_producer_prefeed_leader_map: Dict[str, bool] = {}
+        self.expected_mpmc_consumer_workers: int = 0
         # map instance_key -> affinity slot index, assigned explicitly per benchmark member
         self.instance_affinity_slot_map: Dict[str, int] = {}
         self.instance_network_sample_map: Dict[str, Dict[str, Any]] = {}
@@ -1697,6 +1732,9 @@ class CoordinatorServer:
                 self.instance_mq_map = {}
                 self.instance_role_map = {}
                 self.instance_key_prefix_map = {}
+                self.instance_mpmc_producer_runtime_mode_map = {}
+                self.instance_mpmc_producer_prefeed_leader_map = {}
+                self.expected_mpmc_consumer_workers = 0
                 self.instance_affinity_slot_map = {}
                 self.instance_network_sample_map = {}
                 missing_keys = []
@@ -1768,6 +1806,10 @@ class CoordinatorServer:
                             "producer": 0,
                             "consumer": 0,
                         }
+                        producer_runtime_mode_counts: Dict[str, int] = {
+                            MPMC_PRODUCER_RUNTIME_MODE_ACTIVE: 0,
+                            MPMC_PRODUCER_RUNTIME_MODE_LOGICAL_ONLY: 0,
+                        }
                         for i, ik0 in enumerate(instance_keys_in_order):
                             role0 = NODE_ROLES[i]
                             ord0 = counters.get(role0, 0)
@@ -1776,13 +1818,57 @@ class CoordinatorServer:
                                 kp = "benchmark_kv"
                             elif role0 in ("producer", "consumer"):
                                 kp = f"benchmark_{role0}_{ord0}"
+                                if role0 == "producer":
+                                    runtime_mode = MPMC_PRODUCER_RUNTIME_MODE_ACTIVE
+                                    if (
+                                        MPMC_ACTIVE_PRODUCER_RUNTIME_LIMIT is not None
+                                        and ord0 >= MPMC_ACTIVE_PRODUCER_RUNTIME_LIMIT
+                                    ):
+                                        runtime_mode = MPMC_PRODUCER_RUNTIME_MODE_LOGICAL_ONLY
+                                    self.instance_mpmc_producer_runtime_mode_map[ik0] = runtime_mode
+                                    producer_runtime_mode_counts[runtime_mode] += 1
                             else:
                                 raise ValueError(f"unexpected node role: {role0}")
                             self.instance_key_prefix_map[ik0] = kp
                             self.instance_affinity_slot_map[ik0] = i
+                        if CURR_TEST_MODE == TestMode.MPMC.value:
+                            self.expected_mpmc_consumer_workers = (
+                                counters["consumer"] * THREADS_PER_PROCESS
+                            )
+                            active_producer_keys = [
+                                instance_key
+                                for instance_key in instance_keys_in_order
+                                if self.instance_role_map[instance_key] == "producer"
+                                and self.instance_mpmc_producer_runtime_mode_map.get(instance_key)
+                                == MPMC_PRODUCER_RUNTIME_MODE_ACTIVE
+                            ]
+                            if self.expected_mpmc_consumer_workers <= 0:
+                                raise ValueError(
+                                    "MPMC benchmark requires at least one consumer worker"
+                                )
+                            if not active_producer_keys:
+                                raise ValueError(
+                                    "MPMC benchmark requires at least one active producer"
+                                )
+                            leader_key = active_producer_keys[0]
+                            self.instance_mpmc_producer_prefeed_leader_map = {
+                                instance_key: instance_key == leader_key
+                                for instance_key in instance_keys_in_order
+                                if self.instance_role_map[instance_key] == "producer"
+                            }
+                            logger.info(
+                                "🔧 MPMC producer runtime modes: active=%s logical_only=%s "
+                                "limit=%s prefeed_leader=%s expected_consumer_workers=%s",
+                                producer_runtime_mode_counts[MPMC_PRODUCER_RUNTIME_MODE_ACTIVE],
+                                producer_runtime_mode_counts[MPMC_PRODUCER_RUNTIME_MODE_LOGICAL_ONLY],
+                                MPMC_ACTIVE_PRODUCER_RUNTIME_LIMIT,
+                                leader_key,
+                                self.expected_mpmc_consumer_workers,
+                            )
 
         except Exception as e:
             # By rule: if config is invalid, print the error; do not fallback/recover.
+            self.server_start_error = f"invalid benchmark configuration: {e}"
             logger.error(f"❌ 读取或解析KVCache配置失败: {e}")
 
     def start(self):
@@ -1980,6 +2066,28 @@ class CoordinatorServer:
             except Exception:
                 pass
 
+    def _log_start_waiting_warning(self, *, node_id: Any) -> None:
+        now = time.monotonic()
+        with self._start_waiting_warning_lock:
+            if now < self._start_waiting_warning_next_log_ts:
+                self._start_waiting_warning_suppressed_count += 1
+                return
+
+            suppressed_count = self._start_waiting_warning_suppressed_count
+            self._start_waiting_warning_suppressed_count = 0
+            self._start_waiting_warning_next_log_ts = (
+                now + START_WAITING_WARNING_LOG_INTERVAL_SECONDS
+            )
+
+        if suppressed_count > 0:
+            logger.warning(
+                "⚠️ 节点 %s 发送请求开始测试，但尚未所有节点就绪; suppressed_waiting_warnings=%s",
+                node_id,
+                suppressed_count,
+            )
+        else:
+            logger.warning(f"⚠️ 节点 {node_id} 发送请求开始测试，但尚未所有节点就绪")
+
     def handle_start_request(self, message: Dict, client_socket: socket.socket):
         node_id = message.get("node_id")
         if not self.test_config:
@@ -1993,7 +2101,7 @@ class CoordinatorServer:
             return
 
         if not self.all_nodes_ready.is_set():
-            logger.warning(f"⚠️ 节点 {node_id} 发送请求开始测试，但尚未所有节点就绪")
+            self._log_start_waiting_warning(node_id=node_id)
             # Reply directly
             response = {
                 "status": "waiting",  # Keep waiting
@@ -2253,6 +2361,9 @@ class CoordinatorServer:
             mq_role_effective: Optional[str] = None
             mq_weight_effective: float = 1.0
             mq_final_cfg: Optional[Dict[str, Any]] = None
+            mpmc_producer_runtime_mode: Optional[str] = None
+            expected_mpmc_consumer_workers: Optional[int] = None
+            mpmc_producer_prefeed_leader: Optional[bool] = None
             if active_test_mode == TestMode.MPMC.value:
                 mq_role_effective = mq_role
                 mq_weight_effective = float(mq_weight)
@@ -2261,6 +2372,26 @@ class CoordinatorServer:
                     mq_final_cfg = self._deep_merge(mq_final_cfg, mq_patch)
                 mq_final_cfg["role"] = mq_role_effective
                 mq_final_cfg["weight"] = mq_weight_effective
+                if assigned_role == "producer":
+                    mpmc_producer_runtime_mode = (
+                        self.instance_mpmc_producer_runtime_mode_map.get(
+                            instance_key,
+                            MPMC_PRODUCER_RUNTIME_MODE_ACTIVE,
+                        )
+                    )
+                    mpmc_producer_prefeed_leader = (
+                        self.instance_mpmc_producer_prefeed_leader_map.get(instance_key)
+                    )
+                    if not isinstance(mpmc_producer_prefeed_leader, bool):
+                        raise ValueError(
+                            "missing explicit MPMC producer prefeed leader assignment: "
+                            f"instance_key={instance_key}"
+                        )
+                expected_mpmc_consumer_workers = self.expected_mpmc_consumer_workers
+                if expected_mpmc_consumer_workers <= 0:
+                    raise ValueError(
+                        "expected_mpmc_consumer_workers must be positive for MPMC"
+                    )
 
             node_config = NodeConfig(
                 node_id=response_node_id,
@@ -2282,6 +2413,9 @@ class CoordinatorServer:
                 mq_weight=mq_weight_effective,
                 mq_config=mq_final_cfg,
                 mq_unique_id=self.mq_unique_id,
+                mpmc_producer_runtime_mode=mpmc_producer_runtime_mode,
+                expected_mpmc_consumer_workers=expected_mpmc_consumer_workers,
+                mpmc_producer_prefeed_leader=mpmc_producer_prefeed_leader,
                 consumer_sim_handle_ms_range=CONSUMER_SIM_HANDLE_MS_RANGE,
                 network_sample=copy.deepcopy(self.instance_network_sample_map.get(instance_key)),
                 prometheus_base_url=self.prometheus_base_url,
@@ -2348,6 +2482,16 @@ class CoordinatorServer:
             response_config["mq"] = node_config.mq_config
         if node_config.mq_unique_id is not None:
             response_config["mq_new_or_bind_unique_key"] = node_config.mq_unique_id
+        if node_config.mpmc_producer_runtime_mode is not None:
+            response_config["mpmc_producer_runtime_mode"] = node_config.mpmc_producer_runtime_mode
+        if node_config.expected_mpmc_consumer_workers is not None:
+            response_config["expected_mpmc_consumer_workers"] = (
+                node_config.expected_mpmc_consumer_workers
+            )
+        if node_config.mpmc_producer_prefeed_leader is not None:
+            response_config["mpmc_producer_prefeed_leader"] = (
+                node_config.mpmc_producer_prefeed_leader
+            )
         benchmark_cfg = _load_benchmark_section(KVCACHE_CONFIG_PATH)
         response_config = merge_kv_benchmark_extras(response_config, benchmark_cfg)
         response_config = merge_rpc_benchmark_extras(response_config, benchmark_cfg)

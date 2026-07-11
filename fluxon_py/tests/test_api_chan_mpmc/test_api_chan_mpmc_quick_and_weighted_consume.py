@@ -43,7 +43,6 @@ from fluxon_py.tests.test_lib import (  # noqa: E402
     setup_test_environment,
     new_test_consumer,
     new_test_producer,
-    load_test_fluxon_cluster_name,
     run_with_argmatrix,
 )
 from fluxon_py.api_ext_chan import (  # noqa: E402
@@ -262,13 +261,47 @@ def spawn_processes(env) -> List[Tuple[str, subprocess.Popen, str]]:
 
 
 def wait_for_processes(processes: List[Tuple[str, subprocess.Popen, str]]) -> None:
-    for process_type, proc, log_file in processes:
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Process {process_type} failed (log: {log_file}),"
-                f" return code: {proc.returncode}"
-            )
+    remaining = set(range(len(processes)))
+    while remaining:
+        finished_index: Optional[int] = None
+        for index in list(remaining):
+            _process_type, proc, _log_file = processes[index]
+            if proc.poll() is not None:
+                finished_index = index
+                break
+        if finished_index is None:
+            time.sleep(0.2)
+            continue
+
+        process_type, proc, log_file = processes[finished_index]
+        remaining.remove(finished_index)
+        if proc.returncode == 0:
+            continue
+
+        for _other_type, other_proc, _other_log in processes:
+            if other_proc is proc or other_proc.poll() is not None:
+                continue
+            other_proc.terminate()
+
+        deadline = time.monotonic() + 5.0
+        for _other_type, other_proc, _other_log in processes:
+            if other_proc is proc or other_proc.poll() is not None:
+                continue
+            remaining_wait = max(0.0, deadline - time.monotonic())
+            try:
+                other_proc.wait(timeout=remaining_wait)
+            except subprocess.TimeoutExpired:
+                other_proc.kill()
+                other_proc.wait()
+
+        log_tail = _read_log_tail(log_file, max_lines=160)
+        raise RuntimeError(
+            f"Process {process_type} failed (log: {log_file}),"
+            f" return code: {proc.returncode}\n"
+            "--- failed process log tail ---\n"
+            f"{log_tail}\n"
+            "--- end failed process log tail ---"
+        )
 
 
 def verify_quick_and_fair(log_files: List[str]) -> None:

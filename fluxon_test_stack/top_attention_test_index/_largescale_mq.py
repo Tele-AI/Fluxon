@@ -29,7 +29,7 @@ LOCAL_RELEASE_ROOT_ENV = "FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT"
 RELEASE_MANIFEST_FILENAME = "fluxon_release.sha256"
 RELEASE_MANIFEST_SHA256_ENV_KEY = "FLUXON_RELEASE_MANIFEST_SHA256"
 DEFAULT_CONFIG = REPO_ROOT / "fluxon_test_stack" / "benchmark_full_matrix.yaml"
-DEFAULT_WORKDIR = REPO_ROOT / ".tmp" / "test_largescale_mq_p160_c8"
+DEFAULT_WORKDIR = REPO_ROOT / ".tmp" / "test_largescale_mq_p320_c8"
 RUNNER = REPO_ROOT / "fluxon_test_stack" / "test_runner.py"
 LOCAL_TEST_STACK_COORDINATOR_PORT_OFFSET = 1000
 LOCAL_TEST_STACK_TOPOLOGY_PORT_SPAN = 100
@@ -40,7 +40,7 @@ LOCAL_TEST_STACK_P2P_PORT_MAX = 61000
 
 DEFAULT_BENCHMARK = {
     "processes_per_target": 1,
-    "threads_per_process": 4,
+    "threads_per_process": 1,
     "value_size": 256,
     "metric_warmup_seconds": 0,
     "op_timeout_seconds": 30,
@@ -805,6 +805,15 @@ def _build_suite(
             ],
         }
     )
+    active_producer_limit = getattr(args, "mpmc_active_producer_runtime_limit", None)
+    if active_producer_limit is not None:
+        active_producer_limit = int(active_producer_limit)
+        if active_producer_limit <= 0 or active_producer_limit > producer_count:
+            raise SystemExit(
+                "--mpmc-active-producer-runtime-limit must satisfy "
+                f"1 <= limit <= producer-count ({producer_count}), got {active_producer_limit}"
+            )
+        benchmark["mpmc_active_producer_runtime_limit"] = active_producer_limit
     if single_host:
         benchmark["owner_group_processes"] = 1
 
@@ -935,7 +944,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Flat index entry for the TEST_STACK large-scale MQ benchmark "
-            "(default: 4 owners at 1GiB, 160 producers, 8 consumers, 256-byte values)."
+            "(default: 4 owners at 1GiB, 320 producers, 8 consumers, "
+            "1 worker thread per process, 256-byte values)."
         )
     )
     parser.add_argument("--python", default=os.environ.get("PYTHON", sys.executable))
@@ -961,7 +971,7 @@ def main() -> int:
     )
     parser.add_argument("--owner-count", type=int, default=4)
     parser.add_argument("--owner-dram-gib", type=int, default=1)
-    parser.add_argument("--producer-count", type=int, default=160)
+    parser.add_argument("--producer-count", type=int, default=320)
     parser.add_argument("--consumer-count", type=int, default=8)
     parser.add_argument("--duration-seconds", type=int, default=60)
     parser.add_argument("--value-size", type=int, default=256)
@@ -974,6 +984,14 @@ def main() -> int:
     )
     parser.add_argument("--op-timeout-seconds", type=int, default=30)
     parser.add_argument("--cluster-ready-timeout-seconds", type=int, default=1800)
+    parser.add_argument(
+        "--mpmc-active-producer-runtime-limit",
+        type=int,
+        help=(
+            "Optional MPMC test-stack limit for active producer runtimes; "
+            "producer nodes beyond the limit participate as logical-only nodes."
+        ),
+    )
     parser.add_argument("--consumer-sim-min-ms", type=int, default=700)
     parser.add_argument("--consumer-sim-max-ms", type=int, default=1500)
     args = parser.parse_args()

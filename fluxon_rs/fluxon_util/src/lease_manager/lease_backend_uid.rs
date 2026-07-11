@@ -97,8 +97,16 @@ impl LeaseBackendUid {
 /// Etcd registration only contributes keepalive. Cleanup of owned keys must be
 /// performed by the semantic owner explicitly; lease drop never revokes.
 pub enum LeaseRegisterKind {
+    /// Register an etcd lease id that may already have existed before this call.
+    /// Registration validates the lease with an initial keepalive probe.
     Etcd,
-    KvClient { register_by: String },
+    /// Register an etcd lease id that was just granted by the caller on the same
+    /// backend. The grant itself proves lease existence, so registration skips
+    /// the initial keepalive probe and only installs the periodic keepalive actor.
+    EtcdNewlyGranted,
+    KvClient {
+        register_by: String,
+    },
 }
 
 // Manual trait impls so that hashing/equality only consider the backend identity

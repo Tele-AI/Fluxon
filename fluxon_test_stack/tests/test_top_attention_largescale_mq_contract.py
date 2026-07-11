@@ -207,6 +207,63 @@ class TestTopAttentionLargescaleMqContract(unittest.TestCase):
             cases = runner._expand_cases(parsed)
             self.assertEqual([case.case_id for case in cases], [f"bench_mq__{scale_id}__fluxon_tcp_thread"])
 
+    def test_generate_only_writes_explicit_active_producer_runtime_limit(self) -> None:
+        entry = _load_module()
+        with tempfile.TemporaryDirectory() as td:
+            suite_out = Path(td) / "largescale_mq_p320_limit.yaml"
+
+            with mock.patch.object(entry, "call", side_effect=AssertionError("test_runner should not run")):
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(MODULE_PATH),
+                        "--generate-only",
+                        "--single-host-logical-targets",
+                        "--suite-out",
+                        str(suite_out),
+                        "--owner-count",
+                        "4",
+                        "--owner-dram-gib",
+                        "1",
+                        "--producer-count",
+                        "320",
+                        "--consumer-count",
+                        "8",
+                        "--duration-seconds",
+                        "60",
+                        "--value-size",
+                        "256",
+                        "--threads-per-process",
+                        "1",
+                        "--op-timeout-seconds",
+                        "30",
+                        "--cluster-ready-timeout-seconds",
+                        "1800",
+                        "--mpmc-active-producer-runtime-limit",
+                        "160",
+                        "--consumer-sim-min-ms",
+                        "700",
+                        "--consumer-sim-max-ms",
+                        "1500",
+                    ],
+                ):
+                    rc = entry.main()
+
+            self.assertEqual(rc, 0)
+            suite = yaml.safe_load(suite_out.read_text(encoding="utf-8"))
+            scale_id = "largescale_mq_n4owner_1gib_p320_c8"
+            scale = suite["scales"][scale_id]
+            self.assertEqual(scale["topology"], 82)
+            self.assertEqual(scale["benchmark"]["processes_per_target"], 4)
+            self.assertEqual(scale["benchmark"]["threads_per_process"], 1)
+            self.assertEqual(scale["benchmark"]["mpmc_active_producer_runtime_limit"], 160)
+
+            runner = _load_runner_module()
+            parsed = runner._parse_suite_config(suite)
+            cases = runner._expand_cases(parsed)
+            self.assertEqual([case.case_id for case in cases], [f"bench_mq__{scale_id}__fluxon_tcp_thread"])
+
     def test_single_host_logical_targets_support_ci_owner_producer_consumer_matrix(self) -> None:
         entry = _load_module()
         cases = (
@@ -238,7 +295,9 @@ class TestTopAttentionLargescaleMqContract(unittest.TestCase):
                                 "--consumer-count",
                                 str(consumer_count),
                                 "--duration-seconds",
-                                "30",
+                                "90",
+                                "--metric-warmup-seconds",
+                                "60",
                                 "--value-size",
                                 "256",
                                 "--op-timeout-seconds",
@@ -262,9 +321,11 @@ class TestTopAttentionLargescaleMqContract(unittest.TestCase):
                     self.assertEqual(scale["owner"]["targets"], ["node-1", "node-2", "node-3", "node-4"])
                     self.assertEqual(len(scale["targets"]["hosts"]), topology)
                     self.assertEqual(scale["benchmark"]["processes_per_target"], 4)
-                    self.assertEqual(scale["benchmark"]["threads_per_process"], 4)
+                    self.assertEqual(scale["benchmark"]["threads_per_process"], 1)
                     self.assertEqual(scale["benchmark"]["owner_group_processes"], 1)
                     self.assertEqual(scale["benchmark"]["value_size"], 256)
+                    self.assertEqual(scale["duration_seconds"], 90)
+                    self.assertEqual(scale["benchmark"]["metric_warmup_seconds"], 60)
                     target_map = suite["profiles"]["fluxon_tcp_thread"]["runtime"]["test_stack"]["deploy"]["target_ip_map"]
                     self.assertIn(f"node-{topology}", target_map)
                     self.assertEqual(target_map["node-1"], target_map[f"node-{topology}"])
@@ -287,7 +348,7 @@ class TestTopAttentionLargescaleMqContract(unittest.TestCase):
             suite_out = Path(td) / "largescale_mq_default.yaml"
             cfg = yaml.safe_load(entry.DEFAULT_CONFIG.read_text(encoding="utf-8"))
             target_map = cfg["profiles"]["fluxon_tcp"]["runtime"]["test_stack"]["deploy"]["target_ip_map"]
-            for idx in range(1, 169):
+            for idx in range(1, 329):
                 target_map[f"node-{idx}"] = f"10.88.{idx // 250}.{idx % 250 + 1}"
             config_path.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=False), encoding="utf-8")
 
@@ -308,13 +369,13 @@ class TestTopAttentionLargescaleMqContract(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             suite = yaml.safe_load(suite_out.read_text(encoding="utf-8"))
-            scale_id = "largescale_mq_n4owner_1gib_p160_c8"
+            scale_id = "largescale_mq_n4owner_1gib_p320_c8"
             scale = suite["scales"][scale_id]
-            self.assertEqual(scale["topology"], 168)
+            self.assertEqual(scale["topology"], 328)
             self.assertEqual(scale["owner"]["owner_count"], 4)
             self.assertEqual(scale["owner"]["owner_dram_bytes"], 1073741824)
             self.assertEqual(scale["benchmark"]["processes_per_target"], 1)
-            self.assertEqual(scale["benchmark"]["threads_per_process"], 4)
+            self.assertEqual(scale["benchmark"]["threads_per_process"], 1)
             self.assertNotIn("owner_group_processes", scale["benchmark"])
             self.assertEqual(scale["benchmark"]["value_size"], 256)
             self.assertEqual(scale["owner"]["targets"], ["node-1", "node-2", "node-3", "node-4"])

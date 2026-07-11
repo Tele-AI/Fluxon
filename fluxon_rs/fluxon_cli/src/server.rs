@@ -54,17 +54,6 @@ fn new_proxy_client() -> hyper::Client<hyper_rustls::HttpsConnector<HttpConnecto
     hyper::Client::builder().build::<_, Body>(https)
 }
 
-fn fluxon_cli_proxy_desc_etcd_key(service_name: &str, cluster_name: &str) -> String {
-    // English note: keep this etcd key format stable because it forms a lightweight "registry"
-    // contract between fluxon_cli (consumer) and business panels (publishers).
-    //
-    // Causal chain:
-    // - fluxon_cli must proxy panels without understanding any business-specific API paths.
-    // - Each service publishes a small descriptor (base_url + allowlist) into etcd.
-    // - fluxon_cli reads the descriptor and performs a pure L7 proxy based on the allowlist.
-    fluxon_cli_proxy_desc_etcd_key_v2(service_name, cluster_name)
-}
-
 #[derive(Debug, Clone)]
 pub struct RegisteredPanelProxyBackendReq {
     pub service_name: String,
@@ -349,10 +338,6 @@ fn available_member_kind_query_strs() -> Vec<&'static str> {
         .copied()
         .map(|k| k.as_query_str())
         .collect()
-}
-
-fn parse_member_kind(s: &str) -> Option<MemberKind> {
-    MemberKind::parse_query_str(s)
 }
 
 #[derive(Clone)]
@@ -1722,7 +1707,7 @@ async fn view(
             ),
         );
     };
-    let Some(member_kind) = parse_member_kind(member_kind_raw) else {
+    let Some(member_kind) = MemberKind::parse_query_str(member_kind_raw) else {
         return text_response(
             StatusCode::BAD_REQUEST,
             format!("invalid member_kind: {}", member_kind_raw),
@@ -1811,7 +1796,7 @@ async fn cli(
             "missing query param: member_kind\nUsage:\n  /cli?cluster_name=<name>&member_kind=<kind>\n  /api/clusters\n".to_string(),
         );
     };
-    let Some(member_kind) = parse_member_kind(member_kind_raw) else {
+    let Some(member_kind) = MemberKind::parse_query_str(member_kind_raw) else {
         return text_response(
             StatusCode::BAD_REQUEST,
             format!("invalid member_kind: {}", member_kind_raw),
@@ -2360,7 +2345,7 @@ async fn api_logs(State(st): State<Arc<AppState>>, Query(q): Query<LogsApiQuery>
             "missing query param: member_kind".to_string(),
         );
     };
-    let Some(member_kind) = parse_member_kind(member_kind_raw) else {
+    let Some(member_kind) = MemberKind::parse_query_str(member_kind_raw) else {
         return text_response(
             StatusCode::BAD_REQUEST,
             format!("invalid member_kind: {}", member_kind_raw),
@@ -2929,7 +2914,7 @@ async fn proxy_registered_service_impl(
             );
         }
     };
-    let etcd_key = fluxon_cli_proxy_desc_etcd_key(service_name, cluster_name);
+    let etcd_key = fluxon_cli_proxy_desc_etcd_key_v2(service_name, cluster_name);
     let resp = match etcd.get(etcd_key.clone(), None).await {
         Ok(v) => v,
         Err(e) => {

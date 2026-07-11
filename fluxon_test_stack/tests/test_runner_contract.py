@@ -60,6 +60,10 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
             test_ci_lock_name_is_scoped_by_ops_cluster_name,
         ),
         (
+            "suite_cluster_name_is_scoped_by_workdir",
+            test_suite_cluster_name_is_scoped_by_workdir,
+        ),
+        (
             "ci_top_attention_doc_page_build_uses_online_docker_image",
             test_ci_top_attention_doc_page_build_uses_online_docker_image,
         ),
@@ -248,6 +252,38 @@ def test_ci_lock_name_is_scoped_by_ops_cluster_name() -> None:
         print("FAIL: test_ci_lock_name_is_scoped_by_ops_cluster_name - name should be deterministic")
         return
     print("PASS: test_ci_lock_name_is_scoped_by_ops_cluster_name")
+
+
+def test_suite_cluster_name_is_scoped_by_workdir() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        workdir_a = Path(td) / "run-a"
+        workdir_b = Path(td) / "run-b"
+        workdir_a.mkdir()
+        workdir_b.mkdir()
+
+        first = _TEST_RUNNER._suite_cluster_name_for_workdir(workdir_a)
+        second = _TEST_RUNNER._suite_cluster_name_for_workdir(workdir_a)
+        other = _TEST_RUNNER._suite_cluster_name_for_workdir(workdir_b)
+
+    if first != second:
+        print(
+            "FAIL: test_suite_cluster_name_is_scoped_by_workdir - "
+            f"expected stable name, got {first!r} then {second!r}"
+        )
+        return
+    if first == other:
+        print(
+            "FAIL: test_suite_cluster_name_is_scoped_by_workdir - "
+            f"different workdirs must not share cluster namespace: {first!r}"
+        )
+        return
+    if not first.startswith("fluxon_benchmark_") or not other.startswith("fluxon_benchmark_"):
+        print(
+            "FAIL: test_suite_cluster_name_is_scoped_by_workdir - "
+            f"unexpected names: {first!r}, {other!r}"
+        )
+        return
+    print("PASS: test_suite_cluster_name_is_scoped_by_workdir")
 
 
 def test_ci_top_attention_doc_page_build_uses_online_docker_image() -> None:

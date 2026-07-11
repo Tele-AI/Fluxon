@@ -1594,28 +1594,20 @@ async fn invoke_completion_async_with_post_submit(
         .map_err(|_| ClosedSdkConsumerError::RuntimeCompletionDropped)
 }
 
-async fn invoke_completion_async(
-    submit: impl FnOnce(
-        *mut c_void,
-        Option<extern "C" fn(*mut c_void, FluxonCommuClosedRuntimeCompletionResult)>,
-    ) -> i32,
-) -> Result<(i32, Bytes), ClosedSdkConsumerError> {
-    invoke_completion_async_with_keepalive(None, submit).await
-}
-
 pub async fn runtime_invoke(
     request: &ClosedRuntimeRequest,
 ) -> Result<ClosedRuntimeResponse, ClosedSdkConsumerError> {
     let encoded_request = bitcode::encode(request);
-    let (status_code, payload) = invoke_completion_async(|user_data, callback| unsafe {
-        fluxon_commu_closed_runtime_call_async(
-            encoded_request.as_ptr(),
-            encoded_request.len(),
-            user_data,
-            callback,
-        )
-    })
-    .await?;
+    let (status_code, payload) =
+        invoke_completion_async_with_keepalive(None, |user_data, callback| unsafe {
+            fluxon_commu_closed_runtime_call_async(
+                encoded_request.as_ptr(),
+                encoded_request.len(),
+                user_data,
+                callback,
+            )
+        })
+        .await?;
     match status_code {
         FLUXON_COMMU_CLOSED_RUNTIME_RESULT_OK => {
             bitcode::decode::<ClosedRuntimeResponse>(payload.as_ref()).map_err(|error| {

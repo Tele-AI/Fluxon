@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "doc-site-builder-image.yml"
 ALL_TEST_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "all_test.yml"
 DOCS_PAGES_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "docs-pages.yml"
-LARGESCALE_MQ_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "largescale-mq.yml"
+STANDALONE_LARGESCALE_MQ_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "largescale-mq.yml"
 
 
 class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
@@ -57,12 +57,13 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertIn("largescale_mq_ci_single_host", workflow_text)
         self.assertIn("--owner-count", workflow_text)
         self.assertIn('"4"', workflow_text)
-        self.assertNotIn("--threads-per-process", workflow_text)
+        self.assertIn("--threads-per-process", workflow_text)
         self.assertNotIn('"timeout_seconds": 3600', workflow_text)
         self.assertIn("--value-size", workflow_text)
         self.assertIn('"256"', workflow_text)
         self.assertIn("for producer_count, consumer_count in ((8, 8), (32, 32), (160, 8))", workflow_text)
-        self.assertIn('"30"', workflow_text)
+        self.assertIn('"--duration-seconds",\n                              "90"', workflow_text)
+        self.assertIn('"--metric-warmup-seconds",\n                              "60"', workflow_text)
         self.assertIn("nested largescale MQ diagnostics", workflow_text)
         self.assertIn("nested largescale MQ failed run diagnostics", workflow_text)
         self.assertIn("logs/ci_runner/restart_count.txt", workflow_text)
@@ -84,29 +85,14 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertNotIn("doc-site-npm", workflow_text)
         self.assertNotIn("doc-site-plugins", workflow_text)
 
-    def test_largescale_mq_workflow_runs_manual_self_hosted_entrypoint(self) -> None:
-        workflow_text = LARGESCALE_MQ_WORKFLOW_PATH.read_text(encoding="utf-8")
-        yaml.load(workflow_text, Loader=yaml.BaseLoader)
-
-        self.assertIn("workflow_dispatch", workflow_text)
-        self.assertIn("self-hosted", workflow_text)
-        self.assertIn("fluxon_test_stack/top_attention_test_index/_largescale_mq.py", workflow_text)
-        self.assertIn("--generate-only", workflow_text)
-        self.assertIn("Run large-scale MQ benchmark", workflow_text)
-        self.assertIn("inputs.run_mode == 'run'", workflow_text)
-        self.assertIn("testbed_bundle_path", workflow_text)
-        self.assertIn("--testbed-bundle-source", workflow_text)
-        self.assertIn("${{ toJSON(inputs.testbed_bundle_path) }}", workflow_text)
-        self.assertNotIn("FLUXON_TEST_STACK_START_TEST_BED_CONFIG", workflow_text)
-        self.assertIn("owner_count", workflow_text)
-        self.assertIn('default: "4"', workflow_text)
-        self.assertIn("owner_dram_gib", workflow_text)
-        self.assertIn('default: "1"', workflow_text)
-        self.assertIn("value_size", workflow_text)
-        self.assertIn('default: "256"', workflow_text)
-        self.assertIn("--producer-count", workflow_text)
-        self.assertIn("--consumer-count", workflow_text)
-        self.assertIn("actions/upload-artifact@v4", workflow_text)
+    def test_largescale_mq_only_uses_main_testbed_workflow(self) -> None:
+        self.assertFalse(STANDALONE_LARGESCALE_MQ_WORKFLOW_PATH.exists())
+        for workflow_path in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+            if workflow_path == ALL_TEST_WORKFLOW_PATH:
+                continue
+            workflow_text = workflow_path.read_text(encoding="utf-8")
+            self.assertNotIn("ci_top_attention_largescale_mq", workflow_text, workflow_path.as_posix())
+            self.assertNotIn("top_attention_test_index/_largescale_mq.py", workflow_text, workflow_path.as_posix())
 
 
 if __name__ == "__main__":

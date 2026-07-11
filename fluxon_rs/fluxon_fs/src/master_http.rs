@@ -182,18 +182,6 @@ impl FsS3BackendAgent {
         }
     }
 
-    fn normalize_request_identity(
-        request_identity: FluxonFsRequestIdentity,
-    ) -> Option<FluxonFsRequestIdentity> {
-        // English note:
-        // - Transfer reconcile uses an all-empty identity as an internal sentinel.
-        // - The lower RPC layer now recognizes that sentinel and converts it into
-        //   an explicit internal-control bypass marker instead of a user token.
-        // - Preserve the sentinel here so internal reconcile keeps its privileged
-        //   semantics while normal user identities still emit regular RPC tokens.
-        Some(request_identity)
-    }
-
     fn s3_path_for_err(export_name: &str, relpath: &str) -> String {
         // English note: keep it human-readable for logs; it is not a real URI.
         format!("s3://{}/{}", export_name, relpath)
@@ -233,7 +221,7 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
     ) -> BoxFuture<'static, Result<fluxon_fs_s3_gateway::RemoteStat, fluxon_fs_s3_gateway::S3Error>>
     {
         let this = self.clone();
-        let request_identity = Self::normalize_request_identity(request_identity);
+        let request_identity = Some(request_identity);
         Box::pin(async move {
             let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
             let export2 = export_name.clone();
@@ -276,7 +264,7 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
     ) -> BoxFuture<'static, Result<fluxon_fs_s3_gateway::RemoteStat, fluxon_fs_s3_gateway::S3Error>>
     {
         let this = self.clone();
-        let request_identity = Self::normalize_request_identity(request_identity);
+        let request_identity = Some(request_identity);
         Box::pin(async move {
             let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
             let exporter2 = exporter_id.clone();
@@ -322,7 +310,7 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
         Result<Vec<fluxon_fs_s3_gateway::RemoteDirEntry>, fluxon_fs_s3_gateway::S3Error>,
     > {
         let this = self.clone();
-        let request_identity = Self::normalize_request_identity(request_identity);
+        let request_identity = Some(request_identity);
         Box::pin(async move {
             let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
             let export2 = export_name.clone();
@@ -365,7 +353,7 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
         mtime_ns: i64,
     ) -> BoxFuture<'static, Result<Vec<u8>, fluxon_fs_s3_gateway::S3Error>> {
         let this = self.clone();
-        let request_identity = Self::normalize_request_identity(request_identity);
+        let request_identity = Some(request_identity);
         Box::pin(async move {
             let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
             let export2 = export_name.clone();
@@ -406,7 +394,7 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
         data: Vec<u8>,
     ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
         let this = self.clone();
-        let request_identity = Self::normalize_request_identity(request_identity);
+        let request_identity = Some(request_identity);
         Box::pin(async move {
             if data.len() > fluxon_fs_core::s3_gateway::FS_S3_OBJECT_PIECE_BYTES {
                 return Err(fluxon_fs_s3_gateway::S3Error::InvalidRequest {
@@ -446,7 +434,7 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
         size: i64,
     ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
         let this = self.clone();
-        let request_identity = Self::normalize_request_identity(request_identity);
+        let request_identity = Some(request_identity);
         Box::pin(async move {
             let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
             let export2 = export_name.clone();
@@ -480,7 +468,7 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
         mode: i64,
     ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
         let this = self.clone();
-        let request_identity = Self::normalize_request_identity(request_identity);
+        let request_identity = Some(request_identity);
         Box::pin(async move {
             let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
             let export2 = export_name.clone();
@@ -518,7 +506,7 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
         dst_relpath: Arc<str>,
     ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
         let this = self.clone();
-        let request_identity = Self::normalize_request_identity(request_identity);
+        let request_identity = Some(request_identity);
         Box::pin(async move {
             let path_for_err = format!(
                 "{} -> {}",
@@ -556,7 +544,7 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
         relpath: Arc<str>,
     ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
         let this = self.clone();
-        let request_identity = Self::normalize_request_identity(request_identity);
+        let request_identity = Some(request_identity);
         Box::pin(async move {
             let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
             let export2 = export_name.clone();
@@ -588,7 +576,7 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
         relpath: Arc<str>,
     ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
         let this = self.clone();
-        let request_identity = Self::normalize_request_identity(request_identity);
+        let request_identity = Some(request_identity);
         Box::pin(async move {
             let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
             let export2 = export_name.clone();
@@ -770,17 +758,6 @@ mod tests {
     }
 
     #[test]
-    fn internal_empty_request_identity_is_preserved() {
-        let normalized = FsS3BackendAgent::normalize_request_identity(FluxonFsRequestIdentity {
-            username: String::new(),
-            password: String::new(),
-        });
-        let normalized = normalized.expect("internal sentinel must stay present");
-        assert!(normalized.username.is_empty());
-        assert!(normalized.password.is_empty());
-    }
-
-    #[test]
     fn export_registry_sync_budget_exhausts_at_limit() {
         assert!(!export_registry_sync_budget_exhausted(Duration::from_secs(
             EXPORT_REGISTRY_SYNC_MAX_WAIT_SECS - 1,
@@ -834,14 +811,6 @@ mod tests {
 
 fn redirect_response(location: &str) -> Response {
     axum::response::Redirect::to(location).into_response()
-}
-
-fn redirect_to_fs_s3_ui_response() -> Response {
-    redirect_response("/fs_s3/ui/")
-}
-
-fn redirect_to_fs_master_admin_response() -> Response {
-    redirect_response("/fs_s3/ui/admin/fs_master/")
 }
 
 pub fn run_master_blocking(config_path: &str, workdir: &str) -> anyhow::Result<()> {
@@ -2315,11 +2284,11 @@ fn spawn_persist_export_registry_snapshot_to_etcd(
 }
 
 async fn panel_view_html() -> Response {
-    redirect_to_fs_s3_ui_response()
+    redirect_response("/fs_s3/ui/")
 }
 
 async fn panel_view_cli() -> Response {
-    redirect_to_fs_master_admin_response()
+    redirect_response("/fs_s3/ui/admin/fs_master/")
 }
 
 #[derive(Clone)]

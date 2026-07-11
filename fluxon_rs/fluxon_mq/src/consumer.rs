@@ -1489,14 +1489,6 @@ impl MpscConsumer {
         self.shutdown.clone()
     }
 
-    fn record_nonblocking_get_success(&self, unix_ms: i64) {
-        self.nonblocking_monitor.try_record_nonblocking(unix_ms);
-    }
-
-    fn record_blocking_get_observed(&self, unix_ms: i64) {
-        self.nonblocking_monitor.try_record_blocking(unix_ms);
-    }
-
     /// Sync the consumer membership metadata in etcd with the given kvclient
     /// sub-cluster.
     ///
@@ -1612,7 +1604,8 @@ impl MpscConsumer {
             match timeout(dur, self.recv_next_inflight_handle_with_idle_warn()).await {
                 Ok(v) => v,
                 Err(_) => {
-                    self.record_blocking_get_observed(get_handle_begin_unix_ms);
+                    self.nonblocking_monitor
+                        .try_record_blocking(get_handle_begin_unix_ms);
                     return Err(MpscError::NoMessage);
                 }
             }
@@ -1773,9 +1766,11 @@ impl MpscConsumer {
         self.prefetch_latency_etcd_put_first_poll_to_ready_window
             .push(latest_etcd_put_first_poll_to_ready_ns);
         if nonblocking_hit {
-            self.record_nonblocking_get_success(get_handle_end_unix_ms);
+            self.nonblocking_monitor
+                .try_record_nonblocking(get_handle_end_unix_ms);
         } else {
-            self.record_blocking_get_observed(get_handle_begin_unix_ms);
+            self.nonblocking_monitor
+                .try_record_blocking(get_handle_begin_unix_ms);
         }
 
         let parent_mpmc_id = match self.category {
@@ -1870,18 +1865,6 @@ impl MpscConsumer {
             payload: fetched.payload,
             nonblocking_hit,
         })
-    }
-
-    /// Variant of get_with_payload that treats回调返回码 `1` 为可重试
-    /// 错误，并在 actor 内部进行重试。调用方只会看到成功或
-    /// 不可恢复错误（包括返回码为 2 的情况）。
-    pub async fn get_with_payload_retry(
-        &mut self,
-        prefetch_target: usize,
-    ) -> Result<ConsumedPayload, MpscError> {
-        // 底层 prefetch_actor 始终以带重试语义执行 get，
-        // 这里直接复用统一实现。
-        self.get_with_payload(prefetch_target).await
     }
 
     pub async fn get_with_payload_retry_wait_timeout(

@@ -358,14 +358,13 @@ async fn stage_worker_loop(
         let result = rt_handle
             .spawn_blocking(move || {
                 if staged_piece_count_clone > 1 {
-                    stage_piece_range_fn_invoke(
-                        &fn_range_clone,
+                    fn_range_clone(
                         &key_clone,
                         staged_piece_count_clone,
                         identity_clone.as_ref(),
                     )
                 } else {
-                    stage_piece_fn_invoke(&fn_clone, &key_clone, identity_clone.as_ref())
+                    fn_clone(&key_clone, identity_clone.as_ref())
                 }
             })
             .await;
@@ -399,23 +398,6 @@ async fn stage_worker_loop(
             }
         }
     }
-}
-
-fn stage_piece_fn_invoke(
-    f: &StagePieceFn,
-    key: &PieceKey,
-    identity: Option<&FluxonFsRequestIdentity>,
-) -> Result<(), String> {
-    f(key, identity)
-}
-
-fn stage_piece_range_fn_invoke(
-    f: &StagePieceRangeFn,
-    key: &PieceKey,
-    piece_count: usize,
-    identity: Option<&FluxonFsRequestIdentity>,
-) -> Result<(), String> {
-    f(key, piece_count, identity)
 }
 
 fn now_ms() -> i64 {

@@ -60,7 +60,7 @@ from utils import log_shard
 from test_runner_ci_runtime import (
     _assert_ci_runtime_python_abi as _assert_ci_runtime_python_abi_impl,
     _ci_runtime_python_abi as _ci_runtime_python_abi_impl,
-    _ci_runtime_python_executable as _ci_runtime_python_executable_impl,
+    _ci_runtime_python_executable,
     _create_ci_runtime_venv as _create_ci_runtime_venv_impl,
 )
 from test_runner_models import (
@@ -86,20 +86,16 @@ from test_runner_runtime_backend import (
     _finalize_test_stack_case_runtime as _finalize_test_stack_case_runtime_impl,
     _prepare_ci_case as _prepare_ci_case_impl,
     _prepare_test_stack_case as _prepare_test_stack_case_impl,
-    _require_ci_runner_exit_code_baseline as _require_ci_runner_exit_code_baseline_impl,
-    _require_test_stack_result_path as _require_test_stack_result_path_impl,
-    _require_test_stack_result_timeout as _require_test_stack_result_timeout_impl,
-    _test_stack_result_timeout_seconds as _test_stack_result_timeout_seconds_impl,
+    _test_stack_result_timeout_seconds,
     _wait_and_load_test_stack_benchmark_result_json as _wait_and_load_test_stack_benchmark_result_json_impl,
 )
 from test_runner_ui_runtime import (
-    _ci_log_prefix_lines as _ci_log_prefix_lines_impl,
-    _ci_log_timestamp_prefix as _ci_log_timestamp_prefix_impl,
-    _load_gitops_ctx_for_ui as _load_gitops_ctx_for_ui_impl,
+    _ci_log_prefix_lines,
+    _ci_log_timestamp_prefix,
     _redirect_process_stdio_to_log as _redirect_process_stdio_to_log_impl,
     _resolve_history_roots_cli_paths as _resolve_history_roots_cli_paths_impl,
     _resolve_repo_root_cli_path as _resolve_repo_root_cli_path_impl,
-    _runner_stdio_mirror_enabled as _runner_stdio_mirror_enabled_impl,
+    _runner_stdio_mirror_enabled,
     _start_runner_stdio_log_mirror as _start_runner_stdio_log_mirror_impl,
     run_ui_service as run_ui_service_impl,
 )
@@ -298,6 +294,12 @@ TEST_STACK_MODES_REQUIRE_KV_MASTER = (
     TEST_STACK_MODE_RPC,
 )
 
+# Local same-host MPMC runs can create hundreds of benchmark workers on one machine.
+# Keep the throttle implicit and bounded so normal multi-host suites do not gain a new config surface.
+TEST_STACK_LOCAL_NODE_START_THROTTLE_MIN_NODES = 64
+TEST_STACK_LOCAL_NODE_START_THROTTLE_SECONDS_PER_EXTRA_NODE = 0.6
+TEST_STACK_LOCAL_NODE_START_THROTTLE_MAX_SECONDS = 180.0
+
 
 def _test_stack_mode_requires_kv_master(mode: str) -> bool:
     return mode in TEST_STACK_MODES_REQUIRE_KV_MASTER
@@ -462,41 +464,13 @@ _TEST_RUNNER_UI_HISTORY_CACHE: Dict[str, Any] = {}
 _TEST_RUNNER_UI_LOCK_FILENAME = ".test_runner_ui.lock"
 
 
-def _runner_stdio_mirror_enabled() -> bool:
-    return _runner_stdio_mirror_enabled_impl()
-
-
-def _ci_log_timestamp_prefix(now: Optional[float] = None) -> str:
-    return _ci_log_timestamp_prefix_impl(now)
-
-
-def _ci_log_prefix_lines(text: str, *, now: Optional[float] = None) -> str:
-    return _ci_log_prefix_lines_impl(text, now=now)
-
-
 def _service_log_base_path(workdir_root: Path, *, filename: str) -> Path:
     return (workdir_root / filename).resolve()
 
 
-def _service_log_daily_path(base_path: Path, *, now: Optional[datetime.datetime] = None) -> Path:
-    return log_shard.daily_sharded_log_path(base_path, now=now)
-
-
-def _service_log_latest_path(base_path: Path) -> Optional[Path]:
-    return log_shard.latest_existing_daily_sharded_log_path(base_path)
-
-
 def _service_log_resolve_read_path(workdir_root: Path, *, filename: str) -> Optional[Path]:
     base_path = _service_log_base_path(workdir_root, filename=filename)
-    return _service_log_resolve_read_path_from_base(base_path)
-
-
-def _service_log_resolve_read_path_from_base(base_path: Path) -> Optional[Path]:
     return log_shard.resolve_readable_log_path(base_path)
-
-
-def _cleanup_old_service_logs(base_path: Path, *, retention_days: int = _SERVICE_LOG_RETENTION_DAYS) -> None:
-    log_shard.cleanup_old_daily_sharded_logs(base_path, retention_days=retention_days)
 
 
 def _start_runner_stdio_log_router(*, base_log_path: Path, read_fd: int) -> None:
@@ -554,17 +528,6 @@ def _resolve_history_roots_cli_paths(raw_paths: List[str]) -> List[Path]:
     return _resolve_history_roots_cli_paths_impl(
         repo_root=REPO_ROOT,
         raw_paths=raw_paths,
-    )
-
-
-def _load_gitops_ctx_for_ui(
-    *,
-    workdir_root: Path,
-    gitops_config_path: Optional[Path],
-) -> Optional[gitops_lib.GitOpsContext]:
-    return _load_gitops_ctx_for_ui_impl(
-        workdir_root=workdir_root,
-        gitops_config_path=gitops_config_path,
     )
 
 
@@ -1985,17 +1948,20 @@ def _remote_ssh_common_argv() -> List[str]:
 
 
 def _suite_cluster_name_for_workdir(workdir_root: Path) -> str:
-    """Return the fixed benchmark workload cluster namespace.
+    """Return a stable, workdir-scoped benchmark workload cluster namespace.
 
     English note:
-    - Benchmark runs intentionally reuse one stable cluster namespace so shared-memory and
-      etcd state stay under a predictable top-level path.
+    - Benchmark runs inside one workdir intentionally reuse one namespace so resume sees the
+      same shared-memory and etcd roots.
+    - Different workdirs must not reuse the same namespace. TEST_STACK keeps long-running
+      ops services alive and etcd RDMA-control keys are not lease-scoped, so a fixed
+      cluster name lets stale benchmark state from an older run affect a later one.
     - Isolation from the ops bed still comes from the explicit `cluster_name !=
       ops_cluster_name` guard in `_load_stack_identity`.
     """
 
-    _ = workdir_root
-    return "fluxon_benchmark"
+    workdir_scope = hashlib.sha256(str(workdir_root.resolve()).encode("utf-8")).hexdigest()[:12]
+    return f"fluxon_benchmark_{workdir_scope}"
 
 
 def _cluster_scoped_shared_dir(*, root_path: str, cluster_name: str) -> Path:
@@ -2114,6 +2080,122 @@ def _test_stack_owner_targets_by_machine(
     for machine_owner_targets in out.values():
         machine_owner_targets.sort()
     return out
+
+
+def _test_stack_benchmark_targets(
+    *,
+    role_plan: Dict[str, Any],
+    roles_order: List[str],
+    ctx: str,
+) -> List[str]:
+    targets: List[str] = []
+    for role in roles_order:
+        plan = _require_dict(role_plan.get(role), f"{ctx}.role_plan[{role}]")
+        count = _require_int(plan.get("count"), f"{ctx}.role_plan[{role}].count", min_v=1)
+        raw_targets = _require_list(plan.get("targets"), f"{ctx}.role_plan[{role}].targets")
+        if len(raw_targets) != int(count):
+            raise ValueError(
+                f"{ctx}.role_plan[{role}].targets length must equal count: "
+                f"count={count} targets={len(raw_targets)}"
+            )
+        for index, raw_target in enumerate(raw_targets):
+            targets.append(_require_str(raw_target, f"{ctx}.role_plan[{role}].targets[{index}]"))
+    return targets
+
+
+def _test_stack_targets_are_same_host_local(
+    *,
+    targets: List[str],
+    target_ip_map: Dict[str, Any],
+    cluster_nodes: Dict[str, Any],
+    ctx: str,
+) -> bool:
+    if not targets:
+        return False
+    ips: set[str] = set()
+    for index, target in enumerate(targets):
+        target_name = _require_str(target, f"{ctx}.targets[{index}]")
+        ips.add(
+            _require_str(
+                target_ip_map.get(target_name),
+                f"{ctx}.target_ip_map[{target_name!r}]",
+            )
+        )
+        node_cfg = _require_dict(cluster_nodes.get(target_name), f"{ctx}.cluster_nodes[{target_name!r}]")
+        execution_mode_raw = node_cfg.get("execution_mode", "ssh")
+        execution_mode = execution_mode_raw.strip() if isinstance(execution_mode_raw, str) else ""
+        if execution_mode != "local":
+            return False
+    return len(ips) == 1
+
+
+def _test_stack_local_benchmark_node_start_throttle_max_seconds(
+    *,
+    scene_mode: str,
+    node_total: int,
+    role_plan: Dict[str, Any],
+    roles_order: List[str],
+    target_ip_map: Dict[str, Any],
+    cluster_nodes: Dict[str, Any],
+    ctx: str,
+) -> float:
+    if scene_mode != TEST_STACK_MODE_MPMC:
+        return 0.0
+    if int(node_total) <= TEST_STACK_LOCAL_NODE_START_THROTTLE_MIN_NODES:
+        return 0.0
+    benchmark_targets = _test_stack_benchmark_targets(
+        role_plan=role_plan,
+        roles_order=roles_order,
+        ctx=ctx,
+    )
+    if not _test_stack_targets_are_same_host_local(
+        targets=benchmark_targets,
+        target_ip_map=target_ip_map,
+        cluster_nodes=cluster_nodes,
+        ctx=ctx,
+    ):
+        return 0.0
+    extra_nodes = int(node_total) - TEST_STACK_LOCAL_NODE_START_THROTTLE_MIN_NODES
+    return min(
+        TEST_STACK_LOCAL_NODE_START_THROTTLE_MAX_SECONDS,
+        float(extra_nodes) * TEST_STACK_LOCAL_NODE_START_THROTTLE_SECONDS_PER_EXTRA_NODE,
+    )
+
+
+def _test_stack_local_benchmark_node_start_throttle_delay_seconds(
+    *,
+    node_ordinal: int,
+    node_total: int,
+    max_seconds: float,
+) -> float:
+    if max_seconds <= 0.0:
+        return 0.0
+    if node_total <= 1:
+        return 0.0
+    ordinal = max(0, min(int(node_ordinal), int(node_total) - 1))
+    return float(max_seconds) * (float(ordinal) / float(int(node_total) - 1))
+
+
+def _test_stack_node_start_throttle_prelude(
+    *,
+    delay_seconds: float,
+    instance_key: str,
+) -> str:
+    if delay_seconds <= 0.0:
+        return ""
+    delay_text = f"{float(delay_seconds):.2f}"
+    message = (
+        "[TEST_STACK] benchmark node start throttle: "
+        f"sleep_seconds={delay_text} instance_key={instance_key}"
+    )
+    return (
+        "printf '%s\\n' "
+        + _shell_quote(message)
+        + "\n"
+        + "sleep "
+        + _shell_quote(delay_text)
+        + "\n"
+    )
 
 
 def _test_stack_owner_target_for_node_process(
@@ -2950,10 +3032,6 @@ def _write_phase_inputs(
     _write_deployer_manifests(phase_case, run_dir, allow_overwrite=True)
 
 
-def _ci_write_phase_inputs(resolved_case: Dict[str, Any], *, run_dir: Path, instance_ids: List[str]) -> None:
-    _write_phase_inputs(resolved_case, run_dir=run_dir, instance_ids=instance_ids, ctx="CI")
-
-
 def _runtime_phase_label(phase: _RuntimePhase) -> str:
     return f"{phase.write_ctx} {phase.phase_id} [{phase.layer}]"
 
@@ -3426,35 +3504,6 @@ def _finalize_test_stack_case_runtime(
         run_dir=run_dir,
         runtime_tracking=runtime_tracking,
         outcome=outcome,
-    )
-
-
-def _require_ci_runner_exit_code_baseline(
-    baseline_state: Optional[_ObservedFileState],
-) -> Optional[_ObservedFileState]:
-    return _require_ci_runner_exit_code_baseline_impl(baseline_state)
-
-
-def _require_test_stack_result_path(result_path: Optional[Path]) -> Path:
-    return _require_test_stack_result_path_impl(result_path)
-
-
-def _require_test_stack_result_timeout(timeout_s: Optional[int]) -> int:
-    return _require_test_stack_result_timeout_impl(timeout_s)
-
-
-def _test_stack_result_timeout_seconds(
-    *,
-    max_benchmark_seconds: int,
-    metric_warmup_seconds: float,
-    cluster_ready_timeout_seconds: int,
-    readiness_gate_count: int,
-) -> int:
-    return _test_stack_result_timeout_seconds_impl(
-        max_benchmark_seconds=max_benchmark_seconds,
-        metric_warmup_seconds=metric_warmup_seconds,
-        cluster_ready_timeout_seconds=cluster_ready_timeout_seconds,
-        readiness_gate_count=readiness_gate_count,
     )
 
 
@@ -4489,10 +4538,6 @@ def _normalize_owner_cpu_core_by_target(
             raise ValueError(f"{ctx} contains duplicate target: {target!r}")
         out[target] = _require_int(raw_core, f"{ctx}[{target!r}]", min_v=0)
     return out
-
-
-def _render_runtime_env_exports(runtime_env: Dict[str, str]) -> str:
-    return _render_env_exports(runtime_env)
 
 
 def _parse_selector_ids(raw: Any, ctx: str) -> Optional[Tuple[str, ...]]:
@@ -5767,6 +5812,7 @@ def _parse_scale(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
                 "cluster_ready_timeout_seconds",
                 "value_size_list",
                 "consumer_sim_handle_ms_range",
+                "mpmc_active_producer_runtime_limit",
             },
             f"{ctx}.benchmark",
         )
@@ -5808,6 +5854,13 @@ def _parse_scale(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
             if len(r) != 2:
                 raise ValueError(f"{ctx}.benchmark.consumer_sim_handle_ms_range must have 2 items")
             _ = _require_int(r[0], f"{ctx}.benchmark.consumer_sim_handle_ms_range[0]", min_v=0)
+        active_producer_limit = bench.get("mpmc_active_producer_runtime_limit")
+        if active_producer_limit is not None:
+            _ = _require_int(
+                active_producer_limit,
+                f"{ctx}.benchmark.mpmc_active_producer_runtime_limit",
+                min_v=1,
+            )
             _ = _require_int(r[1], f"{ctx}.benchmark.consumer_sim_handle_ms_range[1]", min_v=0)
             if int(r[0]) > int(r[1]):
                 raise ValueError(f"{ctx}.benchmark.consumer_sim_handle_ms_range invalid: {r}")
@@ -8980,6 +9033,14 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
 
     value_size_list = _require_list(bench.get("value_size_list"), "scale.benchmark.value_size_list")
     consumer_sim_handle_ms_range = bench.get("consumer_sim_handle_ms_range")
+    mpmc_active_producer_runtime_limit_raw = bench.get("mpmc_active_producer_runtime_limit")
+    mpmc_active_producer_runtime_limit: Optional[int] = None
+    if mpmc_active_producer_runtime_limit_raw is not None:
+        mpmc_active_producer_runtime_limit = _require_int(
+            mpmc_active_producer_runtime_limit_raw,
+            "scale.benchmark.mpmc_active_producer_runtime_limit",
+            min_v=1,
+        )
 
     # Compute a deterministic per-node P2P listen port allocation for this case.
     #
@@ -9066,6 +9127,15 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
     node_instances: List[Dict[str, Any]] = []
     node_roles: List[str] = []
     node_overrides: List[Dict[str, Any]] = []
+    benchmark_node_start_throttle_max_seconds = _test_stack_local_benchmark_node_start_throttle_max_seconds(
+        scene_mode=scene_mode,
+        node_total=node_total,
+        role_plan=role_plan,
+        roles_order=roles_order,
+        target_ip_map=target_ip_map,
+        cluster_nodes=cluster_nodes,
+        ctx="resolved_case.scale",
+    )
     stack_cluster_name: Optional[str] = None
     stack_share_mem_path: Optional[str] = None
     if backend_kind == TEST_STACK_BACKEND_FLUXON:
@@ -9713,6 +9783,18 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                 )
                 if scene_mode == TEST_STACK_MODE_KVSTORE:
                     runtime_role = KV_NODE_ROLE_WORKER
+                node_ordinal = len(node_overrides)
+                node_start_throttle_delay_seconds = (
+                    _test_stack_local_benchmark_node_start_throttle_delay_seconds(
+                        node_ordinal=node_ordinal,
+                        node_total=node_total,
+                        max_seconds=benchmark_node_start_throttle_max_seconds,
+                    )
+                )
+                node_start_throttle_prelude = _test_stack_node_start_throttle_prelude(
+                    delay_seconds=node_start_throttle_delay_seconds,
+                    instance_key=runtime_instance_key,
+                )
 
                 mapping = {
                     "__INSTANCE_KEY__": instance_key,
@@ -9745,6 +9827,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                             coordinator_addr,
                         ],
                         runtime_env=runtime_env,
+                        pre_exec_shell=node_start_throttle_prelude,
                     )
                 ]
                 node_instances.append(inst)
@@ -9758,7 +9841,6 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                         "kv_node_patch_template.compiled",
                     )
                     kv = _deep_merge_dict(kv, kv_patch)
-                    node_ordinal = len(node_overrides)
                     kv_p2p_listen_port = (
                         int(kv_p2p_port_base)
                         + int(kv_p2p_port_stride) * int(run_index - 1)
@@ -9913,6 +9995,10 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         "node_roles": node_roles,
         "value_size_list": value_size_list,
     }
+    if mpmc_active_producer_runtime_limit is not None:
+        benchmark_out["mpmc_active_producer_runtime_limit"] = int(
+            mpmc_active_producer_runtime_limit
+        )
     value_size_mode = ts_scene.get("value_size_mode")
     if value_size_mode is None:
         benchmark_out["value_size_mode"] = "FIXED"
@@ -12051,10 +12137,6 @@ def _ci_runtime_wheelhouse_root(*, test_rsc_root: Path) -> Path:
     )
 
 
-def _ci_runtime_python_executable() -> str:
-    return _ci_runtime_python_executable_impl()
-
-
 def _ci_runtime_python_abi(*, venv_python: Path) -> str:
     return _ci_runtime_python_abi_impl(
         venv_python=venv_python,
@@ -12435,6 +12517,7 @@ def _test_stack_runtime_command(
     script_path: str,
     script_args: List[str],
     runtime_env: Dict[str, str],
+    pre_exec_shell: str = "",
     exec_wrapper_argv: Optional[List[str]] = None,
 ) -> str:
     assert_env_cmd = _test_stack_runtime_env_assert_command(
@@ -12445,7 +12528,7 @@ def _test_stack_runtime_command(
     vendor_site_packages = (
         run_dir / _TEST_STACK_RUNTIME_DIRNAME / _TEST_STACK_RUNTIME_VENDOR_SITE_PACKAGES_DIRNAME
     ).resolve()
-    runtime_env_exports = _render_runtime_env_exports(runtime_env)
+    runtime_env_exports = _render_env_exports(runtime_env)
     exec_cmd = ["exec"]
     if exec_wrapper_argv is not None:
         exec_cmd.extend(_shell_quote(arg) for arg in exec_wrapper_argv)
@@ -12489,6 +12572,7 @@ def _test_stack_runtime_command(
         + runtime_env_exports
         + assert_env_cmd
         + "\n"
+        + pre_exec_shell
         + " ".join(exec_cmd)
         + "\n"
     )
@@ -12512,7 +12596,7 @@ def _test_stack_runtime_module_command(
     vendor_site_packages = (
         run_dir / _TEST_STACK_RUNTIME_DIRNAME / _TEST_STACK_RUNTIME_VENDOR_SITE_PACKAGES_DIRNAME
     ).resolve()
-    runtime_env_exports = _render_runtime_env_exports(runtime_env)
+    runtime_env_exports = _render_env_exports(runtime_env)
     exec_cmd = ["exec"]
     if exec_wrapper_argv is not None:
         exec_cmd.extend(_shell_quote(arg) for arg in exec_wrapper_argv)
@@ -14401,7 +14485,7 @@ def _http_get_json(url: str) -> Dict[str, Any]:
             if int(exc.code) not in CONTROLLER_STATUS_TRANSIENT_HTTP_CODES:
                 raise
             last_err = exc
-        except (TimeoutError, urllib.error.URLError) as exc:
+        except (TimeoutError, urllib.error.URLError, OSError, ConnectionError) as exc:
             last_err = exc
         if time.time() >= deadline:
             if last_err is None:
@@ -14933,6 +15017,8 @@ def _wait_instance_files_present(
     if not paths:
         raise ValueError(f"{ctx}: paths is empty")
     deadline = time.time() + float(timeout_s)
+    last_status: Optional[Dict[str, Any]] = None
+    last_status_err: Optional[str] = None
     while True:
         missing = [
             str(path)
@@ -14941,12 +15027,25 @@ def _wait_instance_files_present(
         ]
         if not missing:
             return
-        status = _instance_status(resolved_case, instance_id=instance_id)
+        try:
+            status = _instance_status(resolved_case, instance_id=instance_id)
+        except _HttpGetJsonTransientError as exc:
+            last_status_err = str(exc)
+            if time.time() >= deadline:
+                raise ValueError(
+                    f"{ctx}: wait timeout with transient controller errors; "
+                    f"missing={missing} last_status={last_status} last_status_err={last_status_err}"
+                ) from exc
+            time.sleep(2.0)
+            continue
+        last_status = status
         exit_code = status.get("exit_code")
         if status.get("ok") is True and status.get("running") is False and isinstance(exit_code, int):
             raise ValueError(f"{ctx}: {instance_id} exited before artifacts were ready: status={status}")
         if time.time() >= deadline:
-            raise ValueError(f"{ctx}: wait timeout; missing={missing} status={status}")
+            raise ValueError(
+                f"{ctx}: wait timeout; missing={missing} status={status} last_status_err={last_status_err}"
+            )
         time.sleep(2.0)
 
 

@@ -33,11 +33,6 @@ class StopTimeouts:
             raise ValueError("supersede_seconds must be positive")
 
 
-def render_bash_proc_lifecycle_funcs(*, timeouts: StopTimeouts) -> str:
-    """Compatibility wrapper that now returns pid-tree based helpers only."""
-    return render_bash_proc_lifecycle_funcs_pid_tree(timeouts=timeouts)
-
-
 def render_bash_proc_lifecycle_funcs_pid_tree(*, timeouts: StopTimeouts) -> str:
     """Return bash helper functions that stop a service by killing its PID subtree.
 

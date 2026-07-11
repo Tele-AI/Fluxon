@@ -18,6 +18,9 @@ from ..api_error import Result, ApiError, OkNone, OK_NONE, ApiTimeoutError
 from ..api_error import InvalidArgumentError
 from ..kvclient.kvclient_interface import DLPacked
 from .mpsc import (
+    MPSCChanProducer,
+    MPSCChanConsumer,
+    ChanRole,
     _ensure_kvclient_lease_backend,
 )
 from ..api_error import (
@@ -59,25 +62,7 @@ from ..api_error import (
 )
 from ..api_error import NetworkError, PayloadLeaseNotFoundError
 from enum import Enum
-from .mpsc import (
-MPSCChanProducer,
-MPSCChanConsumer,
-ChanManager,
-_new_etcd_meta_key,
-_new_etcd_producer_key,
-_new_etcd_consumer_key,
-_new_etcd_producer_key_prefix,
-_new_etcd_consumer_key_prefix,
-_new_next_producer_id_key,
-_new_register_consumer_idx,
-_new_consume_offset_of_all_producer_key,
-_new_consume_offset_of_one_producer_key,
-_new_message_key,
-ChanType,
-ChanRole,
-ConsumedMessage,
-MqShutdownCtl,
-)
+from .mq_lifecycle import MqShutdownCtl
 from . import ChannelProducer, ChannelConsumer
 from .utils import TimedPriorityQueue
 from fluxon_py.logging import init_logger
@@ -536,8 +521,10 @@ class MPMCChannel(FactoryOnly):
             # The factory probes the lease before any `with_lease` writes.
             assert int(self._lm_cluster_long.id) == int(self._id_allocator_cluster_lease_id)  # type: ignore[attr-defined]
         
-        # Create local MPMC lease for operations
-        self.mpmc_member_lease: etcd3.Lease = etcd_client.lease(chan_config["ttl_seconds"])        
+        # Created only after shared setup and member-id allocation. At p160/c8
+        # scale those earlier steps can consume most of a short TTL before the
+        # role key is published, so the per-member lease must start late.
+        self.mpmc_member_lease: etcd3.Lease = None  # type: ignore[assignment]
         # Save endpoints for etcd lease keepalive registration
         # Only allow obtaining endpoints from KvClient; disallow other sources.
         if kv_api is None:
@@ -637,7 +624,7 @@ class MPMCChannel(FactoryOnly):
         def _setup_member_and_role_key():
             logging.debug(
                 f"[mpmc-lease] begin allocate mpmc member id and register member lease: "
-                f"mpmc_id={mpmc_id}, member_lease_id={int(self.mpmc_member_lease.id)}"
+                f"mpmc_id={mpmc_id}"
             )
             mpmc_member_id_result = _allocate_mpmc_member_id_with_local_cache(
                 etcd_client=etcd_client,
@@ -652,16 +639,33 @@ class MPMCChannel(FactoryOnly):
                 )
             self.mpmc_member_id = mpmc_member_id_result.unwrap()
 
+            self.mpmc_member_lease = etcd_client.lease(int(chan_config["ttl_seconds"]))
+            member_lease_id = int(self.mpmc_member_lease.id)
+            logging.debug(
+                f"[mpmc-lease] allocated member lease: mpmc_id={mpmc_id}, "
+                f"member_id={self.mpmc_member_id}, member_lease_id={member_lease_id}"
+            )
             try:
-                self._lm_mpmc_member = self._lease_mgr.register_etcd_lease(
+                self._lm_mpmc_member = self._lease_mgr.register_newly_granted_etcd_lease(
                     self._etcd_endpoints,
                     int(chan_config["ttl_seconds"]),
-                    int(self.mpmc_member_lease.id),
+                    member_lease_id,
                     register_by=f"mpmc_channel_member:{mpmc_id}/{self.mpmc_member_id}",
                 )
             except Exception as e:
-                logging.warning(f"failed to register etcd keepalive for mpmc member lease: {e}")
                 self._lm_mpmc_member = None
+                raise RuntimeError(
+                    "failed to register etcd keepalive for mpmc member lease: "
+                    f"mpmc_id={mpmc_id}, member_id={self.mpmc_member_id}, "
+                    f"member_lease_id={member_lease_id}: {e}"
+                ) from e
+            else:
+                if self._lm_mpmc_member is None:
+                    raise RuntimeError(
+                        "register_newly_granted_etcd_lease returned no handle for mpmc member lease: "
+                        f"mpmc_id={mpmc_id}, member_id={self.mpmc_member_id}, "
+                        f"member_lease_id={member_lease_id}"
+                    )
             finally:
                 logging.debug(
                     f"[mpmc-lease] end register member lease: mpmc_id={mpmc_id}, "
@@ -730,17 +734,12 @@ class MPMCChannel(FactoryOnly):
         meta_object = json.loads(meta_data.decode())
         return Result.new_ok(meta_object)
     
-    def get_mpsc_channels(self) -> Result[List[str], ApiError]:
-        """
-        Get all MPSC channel IDs in this MPMC channel.
-        
-        Returns:
-            Result[List[str]]: List of MPSC channel IDs
-        """
+    def _get_mpsc_channels_snapshot(self) -> Tuple[List[str], Optional[bytes]]:
+        """Read and validate the channel list together with its CAS value."""
         channels_key = _new_mpmc_mpsc_channels_key(self.mpmc_id)
         channels_data, _ = self.etcd_client.get(channels_key)
         if channels_data is None:
-            return Result.new_ok([])
+            return [], None
         raw = json.loads(channels_data.decode())
         if not isinstance(raw, list):
             raise ValueError(f"invalid mpsc_channels value for mpmc_id={self.mpmc_id}: {raw!r}")
@@ -756,8 +755,8 @@ class MPMCChannel(FactoryOnly):
                 raise ValueError(f"invalid mpsc_id element for mpmc_id={self.mpmc_id}: {item!r}")
             channels.append(item)
 
-        return Result.new_ok(channels)
-    
+        return channels, channels_data
+
     def get_remote_ready_channels(self) -> List[str]:
         """
         Get ready MPSC channel IDs by scanning the ready prefix.
@@ -945,7 +944,7 @@ class MPMCChannel(FactoryOnly):
         if ttl_val > 0:
             return Result.new_ok(OK_NONE)
 
-        self.shutdown_ctl.closed = True
+        self.shutdown_ctl.close()
         return Result.new_error(
             ChannelClosedError(
                 message=(
@@ -1157,7 +1156,37 @@ class MPMCChannel(FactoryOnly):
             Result[Union[MPSCChanConsumer, MPSCChanProducer]]: New MPSC object
         """
         lock_key = f"/mpmc_channels/{self.mpmc_id}/create_lock"
-        
+        published_channel: Optional[Union[MPSCChanConsumer, MPSCChanProducer]] = None
+
+        def close_unpublished_channel(
+            channel: Union[MPSCChanConsumer, MPSCChanProducer],
+            *,
+            reason: str,
+        ) -> None:
+            try:
+                close_result = channel._discard()
+                if not close_result.is_ok():
+                    logging.warning(
+                        "Failed to close unpublished MPSC after %s for mpmc_id=%s: %s",
+                        reason,
+                        self.mpmc_id,
+                        close_result.unwrap_error(),
+                    )
+                else:
+                    close_result.unwrap()
+            except Exception as close_error:
+                logging.warning(
+                    "Failed to close unpublished MPSC after %s for mpmc_id=%s: %s",
+                    reason,
+                    self.mpmc_id,
+                    close_error,
+                )
+
+        def channels_snapshot_compare(channels_key: str, expected_value: Optional[bytes]):
+            if expected_value is None:
+                return self.etcd_client.transactions.create(channels_key) == 0
+            return self.etcd_client.transactions.value(channels_key) == expected_value
+
         try:
             with EtcdLock(
                 self._etcd_endpoints,
@@ -1165,16 +1194,10 @@ class MPMCChannel(FactoryOnly):
                 MPMC_CREATE_LOCK_TTL_SECONDS,
                 MPMC_CREATE_LOCK_TIMEOUT_SECONDS,
             ):
-                # Get current channels
-                mpsc_result = self.get_mpsc_channels()
-                if not mpsc_result.is_ok():
-                    error = mpsc_result.unwrap_error()
-                    if error is not None:
-                        return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(error)
-                    else:
-                        return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(ChanCreateError("Failed to get channels"))
-                
-                current_mpscs = mpsc_result.unwrap()
+                # Keep the raw value from the same read. The create lock is an
+                # optimization only: its lease may expire during costly MPSC
+                # construction, so publication must compare this exact snapshot.
+                current_mpscs, expected_channels_value = self._get_mpsc_channels_snapshot()
                 
                 # Role-specific constraints
                 if chan_role == ChanRole.PRODUCER:
@@ -1234,12 +1257,45 @@ class MPMCChannel(FactoryOnly):
                         override_payload_lease_id=self.payload_lease_id,
                         parent_mpmc_id_opt=self.mpmc_id,
                         parent_mpmc_member_id_opt=self.mpmc_member_id,
+                        _parent_shutdown_ctl=self.shutdown_ctl,
                     )
-                    # Record the created channel
                     mpsc_id = mpsc_producer.chan_id
-                    current_mpscs.append(mpsc_id)
                     channels_key = _new_mpmc_mpsc_channels_key(self.mpmc_id)
-                    self.etcd_client.put(channels_key, json.dumps(current_mpscs).encode(), self.mpmc_global_lease)
+                    published_mpscs = current_mpscs + [mpsc_id]
+                    try:
+                        success, _ = self.etcd_client.transaction(
+                            compare=[
+                                channels_snapshot_compare(
+                                    channels_key,
+                                    expected_channels_value,
+                                )
+                            ],
+                            success=[
+                                self.etcd_client.transactions.put(
+                                    channels_key,
+                                    json.dumps(published_mpscs).encode(),
+                                    self.mpmc_global_lease,
+                                )
+                            ],
+                            failure=[],
+                        )
+                    except Exception:
+                        close_unpublished_channel(
+                            mpsc_producer,
+                            reason="producer publish exception",
+                        )
+                        raise
+                    if not success:
+                        close_unpublished_channel(
+                            mpsc_producer,
+                            reason="producer channel-list CAS conflict",
+                        )
+                        return Result[
+                            Union[MPSCChanConsumer, MPSCChanProducer], ApiError
+                        ].new_error(
+                            ChanCreateError("Producer can only create the first channel")
+                        )
+                    published_channel = mpsc_producer
                     return Result.new_ok(mpsc_producer)
                 elif chan_role == ChanRole.CONSUMER:
                     logging.debug(f"Creating new MPSC consumer for MPMC channel {self.mpmc_id}")
@@ -1273,44 +1329,155 @@ class MPMCChannel(FactoryOnly):
                     mpsc_id = mpsc_consumer.chan_id
                     channels_key = _new_mpmc_mpsc_channels_key(self.mpmc_id)
                     ready_key = _new_mpmc_ready_channel_key(self.mpmc_id, mpsc_id)
-                    published_mpscs = current_mpscs.copy()
-                    published_mpscs.append(mpsc_id)
-                    success, _ = self.etcd_client.transaction(
-                        compare=[
-                            self.etcd_client.transactions.create(ready_key) == 0
-                        ],
-                        success=[
-                            self.etcd_client.transactions.put(
-                                channels_key,
-                                json.dumps(published_mpscs).encode(),
-                                self.mpmc_global_lease,
-                            ),
-                            self.etcd_client.transactions.put(
-                                ready_key,
-                                str(self.mpmc_member_id).encode(),
-                                self.mpmc_member_lease,
-                            ),
-                        ],
-                        failure=[],
-                    )
-                    if not success:
+                    for publish_attempt in count(1):
+                        published_mpscs = current_mpscs + [mpsc_id]
                         try:
-                            mpsc_consumer.release_local_handle().unwrap()
-                        except Exception as e:
-                            logging.debug(f"close leaked MPSC consumer error: {e}")
-                        return Result[
-                            Union[MPSCChanConsumer, MPSCChanProducer], ApiError
-                        ].new_error(
-                            ChanCreateError(
-                                f"Failed to publish claimed MPSC consumer {mpsc_id} for "
-                                f"MPMC channel {self.mpmc_id}"
+                            success, _ = self.etcd_client.transaction(
+                                compare=[
+                                    channels_snapshot_compare(
+                                        channels_key,
+                                        expected_channels_value,
+                                    ),
+                                    self.etcd_client.transactions.create(ready_key) == 0,
+                                ],
+                                success=[
+                                    self.etcd_client.transactions.put(
+                                        channels_key,
+                                        json.dumps(published_mpscs).encode(),
+                                        self.mpmc_global_lease,
+                                    ),
+                                    self.etcd_client.transactions.put(
+                                        ready_key,
+                                        str(self.mpmc_member_id).encode(),
+                                        self.mpmc_member_lease,
+                                    ),
+                                ],
+                                failure=[],
                             )
+                        except Exception:
+                            close_unpublished_channel(
+                                mpsc_consumer,
+                                reason="consumer publish exception",
+                            )
+                            raise
+
+                        if success:
+                            mpsc_consumer._mpmc_ready_claimed = True
+                            published_channel = mpsc_consumer
+                            logging.debug(
+                                "Created new MPSC consumer %s for MPMC channel %s "
+                                "after %s publish attempt(s)",
+                                mpsc_id,
+                                self.mpmc_id,
+                                publish_attempt,
+                            )
+                            return Result.new_ok(mpsc_consumer)
+
+                        latest_mpscs, latest_channels_value = (
+                            self._get_mpsc_channels_snapshot()
                         )
-                    mpsc_consumer._mpmc_ready_claimed = True
-                    logging.debug(f"Created new MPSC consumer {mpsc_id} for MPMC channel {self.mpmc_id}")
-                    return Result.new_ok(mpsc_consumer)
+                        if mpsc_id in latest_mpscs:
+                            close_unpublished_channel(
+                                mpsc_consumer,
+                                reason="unexpected duplicate channel id after CAS conflict",
+                            )
+                            return Result[
+                                Union[MPSCChanConsumer, MPSCChanProducer], ApiError
+                            ].new_error(
+                                ChanCreateError(
+                                    f"MPSC channel {mpsc_id} appeared in MPMC channel "
+                                    f"{self.mpmc_id} without its atomic ready publication"
+                                )
+                            )
+
+                        current_mpsc_set = set(current_mpscs)
+                        latest_mpsc_set = set(latest_mpscs)
+                        if (
+                            len(latest_mpscs) <= len(current_mpscs)
+                            or not current_mpsc_set.issubset(latest_mpsc_set)
+                        ):
+                            close_unpublished_channel(
+                                mpsc_consumer,
+                                reason="non-monotonic channel-list CAS conflict",
+                            )
+                            return Result[
+                                Union[MPSCChanConsumer, MPSCChanProducer], ApiError
+                            ].new_error(
+                                ChanCreateError(
+                                    "MPMC channel list did not advance monotonically after "
+                                    f"publish conflict for mpmc_id={self.mpmc_id}"
+                                )
+                            )
+
+                        # A concurrent creator advanced the append-only list.
+                        # Prefer its unclaimed channel before retrying this new one.
+                        latest_ready_set = set(self.get_remote_ready_channels())
+                        latest_unready_mpscs = [
+                            candidate
+                            for candidate in latest_mpscs
+                            if candidate not in latest_ready_set
+                        ]
+                        if latest_unready_mpscs:
+                            close_unpublished_channel(
+                                mpsc_consumer,
+                                reason="new unready channel won publish race",
+                            )
+                            existing_consumer_res = (
+                                self._try_bind_existing_unready_consumer(
+                                    api,
+                                    chan_config,
+                                    latest_unready_mpscs,
+                                )
+                            )
+                            if existing_consumer_res is not None:
+                                return existing_consumer_res
+                            return Result[
+                                Union[MPSCChanConsumer, MPSCChanProducer], ApiError
+                            ].new_error(
+                                ChanCreateError(
+                                    "Lost ready-claim race after MPMC channel-list "
+                                    f"publish conflict for mpmc_id={self.mpmc_id}"
+                                )
+                            )
+
+                        active_consumers = self._get_active_consumer_count()
+                        if active_consumers <= len(latest_mpscs):
+                            close_unpublished_channel(
+                                mpsc_consumer,
+                                reason="channel list already covers active consumers",
+                            )
+                            return Result[
+                                Union[MPSCChanConsumer, MPSCChanProducer], ApiError
+                            ].new_error(
+                                ChanCreateError(
+                                    "Not enough active consumers to create new channel"
+                                )
+                            )
+
+                        logging.debug(
+                            "Retrying MPSC consumer publication after channel-list CAS "
+                            "conflict: mpmc_id=%s mpsc_id=%s attempt=%s old_count=%s "
+                            "new_count=%s active_consumers=%s",
+                            self.mpmc_id,
+                            mpsc_id,
+                            publish_attempt,
+                            len(current_mpscs),
+                            len(latest_mpscs),
+                            active_consumers,
+                        )
+                        current_mpscs = latest_mpscs
+                        expected_channels_value = latest_channels_value
                 
         except Exception as e:
+            if published_channel is not None:
+                logging.warning(
+                    "MPMC create lock cleanup failed after atomic publication; "
+                    "keeping published channel: mpmc_id=%s mpsc_id=%s error=%s",
+                    self.mpmc_id,
+                    published_channel.chan_id,
+                    e,
+                )
+                return Result.new_ok(published_channel)
             return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(ChanCreateError(f"Failed to create MPSC channel: {e}"))
     
     def _get_active_consumer_count(self) -> int:
@@ -1587,7 +1754,9 @@ class MPMCChannel(FactoryOnly):
                 config_key="mpmc_meta_stale",
             )
 
-        # Build channel as a top-level keepalive contributor for shared leases.
+        # Existing attaches are per-member endpoints. The creator owns shared
+        # metadata/payload/id-allocator keepalives; each attach only needs its
+        # own member lease to publish membership.
         # Use FactoryOnly gate to construct instance
         MPMCChannel._allow_init = True
         try:
@@ -1604,7 +1773,7 @@ class MPMCChannel(FactoryOnly):
                 shutdown_ctl,
                 cluster_lease_id_from_meta,
                 None,
-                True,
+                False,
             )
             return channel
         except Exception as e:
@@ -1687,14 +1856,7 @@ class MPMCChannel(FactoryOnly):
             Returns:
                 List[str]: List of unready MPSC channel IDs
             """
-            # Get all channels
-            all_channels_result = self.get_mpsc_channels()
-            if not all_channels_result.is_ok():
-                return []
-            
-            all_channels = all_channels_result.unwrap()
-            if all_channels is None:
-                all_channels = []
+            all_channels, _ = self._get_mpsc_channels_snapshot()
             
             # Get ready channels
             ready_channels = self.get_ready_channels()
@@ -1745,9 +1907,7 @@ class MPMCChannel(FactoryOnly):
         except Exception as e:  # noqa: BLE001
             logging.warning(f"MPMC channel {self.mpmc_id} cancel watch failed: {e}")
         if watch_thread is not None:
-            watch_thread.join(timeout=2)
-            if watch_thread.is_alive():
-                logging.warning(f"MPMC channel {self.mpmc_id} watch thread did not stop before timeout")
+            watch_thread.join()
     
     def close(self) -> Result[OkNone, ApiError]:
         """Close the MPMC channel.
@@ -1761,7 +1921,7 @@ class MPMCChannel(FactoryOnly):
         with self.shutdown_ctl._op_lock:
             if self._close_done:
                 return Result.new_ok(OK_NONE)
-            self.shutdown_ctl.closed = True
+            self.shutdown_ctl.close()
             self._close_done = True
 
         # Best-effort stop watcher thread (no exception swallow)
@@ -1894,11 +2054,6 @@ class MPMCChanProducer(ChannelProducer):
     # close() is defined later in the class to follow the concurrency pattern
     # (set closed, acquire op-lock, verify closed), see around line ~1386.
 
-    def request_shutdown(self) -> None:
-        if self.shutdown_ctl.closed:
-            return
-        self.shutdown_ctl.closed = True
-
     def _load_ready_channels(self, new_ready_channels: List[str]):
         with self._channel_queue_lock:
             for mpsc_id in sorted(new_ready_channels, key=lambda item: int(item)):
@@ -1953,7 +2108,24 @@ class MPMCChanProducer(ChannelProducer):
                     override_payload_lease_id=self.mpmc_channel.payload_lease_id,
                     parent_mpmc_id_opt=self.mpmc_id,
                     parent_mpmc_member_id_opt=self.mpmc_channel.mpmc_member_id,
+                    _parent_shutdown_ctl=self.shutdown_ctl,
                 )
+
+                if self.shutdown_ctl.closed:
+                    close_result = mpsc_producer.close()
+                    if close_result.is_ok():
+                        _ = close_result.unwrap()
+                    else:
+                        close_error = close_result.unwrap_error()
+                        logging.warning(
+                            "mpmc %s failed to close MPSC producer %s after shutdown raced with bind: %s",
+                            self.mpmc_id,
+                            mpsc_id,
+                            close_error,
+                        )
+                    raise RuntimeError(
+                        "MPMCChanProducer closed while binding MPSC producer"
+                    )
                 self.mpsc_producers[mpsc_id] = mpsc_producer
 
             return self.mpsc_producers[mpsc_id]
@@ -2015,7 +2187,7 @@ class MPMCChanProducer(ChannelProducer):
 
         Callers may invoke put_data / close concurrently from multiple threads.
         Coordination uses MqShutdownCtl._op_lock and the closed flag:
-        - close() sets shutdown_ctl.closed=True first, then tries to acquire _op_lock;
+        - close() publishes shutdown first, then tries to acquire _op_lock;
         - put_data checks shutdown_ctl.closed while holding _op_lock and returns an error
           when closed, preventing sends after close().
         """
@@ -2056,6 +2228,10 @@ class MPMCChanProducer(ChannelProducer):
 
             if not next_channel_result.is_ok():
                 error = next_channel_result.unwrap_error()
+                if self.shutdown_ctl.closed:
+                    return Result[bool, ApiError].new_error(
+                        ProducerClosedError("MPMC producer is closed.")
+                    )
                 if error is not None:
                     return Result[bool, ApiError].new_error(error)
                 return Result[bool, ApiError].new_error(
@@ -2063,6 +2239,13 @@ class MPMCChanProducer(ChannelProducer):
                 )
 
             candidate = next_channel_result.unwrap()
+            # Binding a newly published MPSC can block while its Rust handle is
+            # initialized. Shutdown may arrive after the pre-bind check, so do
+            # not continue into capacity or payload work once binding returns.
+            if self.shutdown_ctl.closed:
+                return Result[bool, ApiError].new_error(
+                    ProducerClosedError("MPMC producer is closed.")
+                )
             if not isinstance(candidate, MPSCChanProducer):
                 time.sleep(0.02)
                 continue
@@ -2100,6 +2283,11 @@ class MPMCChanProducer(ChannelProducer):
 
             current = count_res.unwrap()
             assert isinstance(current, int), f"count_prefix returned non-int: {type(current)}"
+
+            if self.shutdown_ctl.closed:
+                return Result[bool, ApiError].new_error(
+                    ProducerClosedError("MPMC producer is closed.")
+                )
 
             if current >= capacity:
                 blocking_observed_unix_ms = int(time.time() * 1000)
@@ -2161,7 +2349,7 @@ class MPMCChanProducer(ChannelProducer):
             if isinstance(err, PayloadLeaseNotFoundError) or (
                 isinstance(err, NetworkError) and ("LeaseNotFound" in str(err))
             ):
-                self.shutdown_ctl.closed = True
+                self.shutdown_ctl.close()
                 return Result[bool, ApiError].new_error(
                     ProducerClosedError(
                         message="payload lease not found; mpmc producer is closed",
@@ -2178,13 +2366,11 @@ class MPMCChanProducer(ChannelProducer):
         """
         Close the MPMC producer.
         """
-        # MPMC follows a unified close pattern:
-        # - record the closed state via shared MqShutdownCtl;
-        # - check whether already closed;
-        # - set shutdown_ctl.closed=True outside of heavy work, and perform cleanup
-        #   while holding shutdown_ctl._op_lock.
-
         assert hasattr(self, "shutdown_ctl"), "MPMCChanProducer.close called but 'shutdown_ctl' is missing"
+
+        # Publish shutdown before waiting for an active operation. MPSC owns the
+        # callback that translates this signal into construction cancellation.
+        self.shutdown_ctl.close()
 
         # `shutdown_ctl.closed` is the shared stop signal for all outer/inner
         # MPMC objects. Use the producer-local `_close_done` flag for cleanup de-dup
@@ -2193,7 +2379,6 @@ class MPMCChanProducer(ChannelProducer):
         with self.shutdown_ctl._op_lock:
             if self._close_done:
                 return Result.new_ok(OK_NONE)
-            self.shutdown_ctl.closed = True
             self._close_done = True
 
         # Explicitly close local sub-MPSC handles so their per-process runtime,
@@ -2205,7 +2390,7 @@ class MPMCChanProducer(ChannelProducer):
             self.mpsc_producers.clear()
         for local_producer in local_producers:
             try:
-                local_producer.release_local_handle().unwrap()
+                local_producer.close().unwrap()
             except Exception as e:
                 logging.warning(
                     "MPMCChanProducer %s close sub-mpsc producer failed: %s",
@@ -2368,7 +2553,7 @@ class MPMCChanConsumer(ChannelConsumer):
                     logging.warning(f"Failed to mark channel ready: {res.unwrap_error()}")
                     # Close the just-created/bound MPSC consumer to avoid dangling consumers
                     try:
-                        next_channel.release_local_handle().unwrap()
+                        next_channel._discard().unwrap()
                     except Exception as e:
                         logging.debug(f"close leaked MPSC consumer error: {e}")
                     fails.append(res.unwrap_error())
@@ -2384,7 +2569,7 @@ class MPMCChanConsumer(ChannelConsumer):
                     logging.warning(f"Failed to mark channel ready by condition, retry {i}")
                     # Close the MPSC consumer we just created/bound since we lost the race
                     try:
-                        next_channel.release_local_handle().unwrap()
+                        next_channel._discard().unwrap()
                     except Exception as e:
                         logging.debug(f"close leaked MPSC consumer error: {e}")
                     fails.append("transaction failed")
@@ -2394,13 +2579,6 @@ class MPMCChanConsumer(ChannelConsumer):
             
         raise ValueError(f"Failed to mark channel ready with {len(fails)} fails: {fails}")
 
-    def request_shutdown(self) -> None:
-        if self.shutdown_ctl.closed:
-            return
-        self.shutdown_ctl.closed = True
-        if self.mpsc_consumer is not None and hasattr(self.mpsc_consumer, "request_shutdown"):
-            self.mpsc_consumer.request_shutdown()
-    
     def get_chan_id(self) -> str:
         """
         Get the channel id.
@@ -2503,17 +2681,16 @@ class MPMCChanConsumer(ChannelConsumer):
     
     def close(self) -> Result[OkNone, ApiError]:
         """Close the MPMC consumer with eager wake-up for in-flight get_data."""
-        self.shutdown_ctl.closed = True
+        self.shutdown_ctl.close()
 
-        # Wake the inner MPSC consumer before waiting on the outer op lock.
-        # Otherwise a concurrent outer get_data() can hold _op_lock while blocked
-        # in inner get_data(), and close() would never reach the shutdown signal.
+        # Inner close publishes its Rust shutdown signal before waiting for an
+        # active get, so the outer operation lock can drain without deadlocking.
         try:
             if self.mpsc_consumer is not None:
-                self.mpsc_consumer.request_shutdown()
+                self.mpsc_consumer.close().unwrap()
         except Exception as e:  # noqa: BLE001
             logging.warning(
-                f"MPMCChanConsumer {self.get_consumer_id()} request_shutdown on underlying MPSC consumer failed: {e}"
+                f"MPMCChanConsumer {self.get_consumer_id()} close underlying MPSC consumer failed: {e}"
             )
 
         # `shutdown_ctl.closed` is only the shared shutdown signal. Keep a separate
@@ -2523,15 +2700,6 @@ class MPMCChanConsumer(ChannelConsumer):
             if self._close_done:
                 return Result.new_ok(OK_NONE)
             self._close_done = True
-
-        # Mark the underlying MPSC consumer closed before final cleanup.
-        try:
-            if self.mpsc_consumer is not None:
-                self.mpsc_consumer.before_close()
-        except Exception as e:  # noqa: BLE001
-            logging.warning(
-                f"MPMCChanConsumer {self.get_consumer_id()} before_close on underlying MPSC consumer failed: {e}"
-            )
 
         # Delete ready keys for this consumer (best-effort).
         mpmc_id = self.mpmc_id
@@ -2557,18 +2725,7 @@ class MPMCChanConsumer(ChannelConsumer):
                 f"MPMCChanConsumer {self.get_consumer_id()} failed to delete ready keys: {e}"
             )
 
-        # Close the underlying MPSC consumer and drop the handle. The MPSC
-        # wrapper deletes its owned membership key on graceful close; member
-        # lease TTL remains the crash fallback.
-        try:
-            if self.mpsc_consumer is not None:
-                self.mpsc_consumer.release_local_handle().unwrap()
-        except Exception as e:  # noqa: BLE001
-            logging.warning(
-                f"MPMCChanConsumer {self.get_consumer_id()} failed to close underlying MPSC consumer: {e}"
-            )
-        finally:
-            self.mpsc_consumer = None
+        self.mpsc_consumer = None
 
         # Optional sub-component cleanup.
         try:

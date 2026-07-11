@@ -298,10 +298,13 @@ pub async fn register_lease_for_keepalive(
     kind: LeaseRegisterKind,
     rt: tokio::runtime::Handle,
 ) -> AnyResult<GeneralLease> {
+    let skip_initial_etcd_probe = matches!(&kind, LeaseRegisterKind::EtcdNewlyGranted);
     match kind {
-        LeaseRegisterKind::Etcd => match backend_uid.kind() {
+        LeaseRegisterKind::Etcd | LeaseRegisterKind::EtcdNewlyGranted => match backend_uid.kind() {
             LeaseType::Etcd => {
-                record_register_by(lease_id, format!("{:?},ttl={}", &backend_uid, ttl_seconds));
+                if get_register_by(lease_id).is_none() {
+                    record_register_by(lease_id, format!("{:?},ttl={}", &backend_uid, ttl_seconds));
+                }
                 let endpoints = backend_uid
                     .endpoints()
                     .expect("etcd backend must carry endpoints");
@@ -325,86 +328,94 @@ pub async fn register_lease_for_keepalive(
                     }))
                 });
 
-                // Fail fast: validate the lease id is alive on the target etcd cluster.
-                // We assume keepalive is always expected to work; if it does not, surfacing
-                // an error here is preferable to letting later writes fail with "lease not found".
-                let mut last_probe_err: Option<anyhow::Error> = None;
-                for attempt in 1..=INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES {
-                    let mut st = shared_state_guard.lock().await;
-                    match tokio::time::timeout(
-                        Duration::from_millis(INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS),
-                        st.keepalive_once(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {
-                            drop(st);
-                            if attempt > 1 {
+                if skip_initial_etcd_probe {
+                    tracing::debug!(
+                        lease_id,
+                        ttl_seconds,
+                        "skip initial etcd keepalive probe for newly granted lease"
+                    );
+                } else {
+                    // Fail fast: validate the lease id is alive on the target etcd cluster.
+                    // We assume keepalive is always expected to work; if it does not, surfacing
+                    // an error here is preferable to letting later writes fail with "lease not found".
+                    let mut last_probe_err: Option<anyhow::Error> = None;
+                    for attempt in 1..=INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES {
+                        let mut st = shared_state_guard.lock().await;
+                        match tokio::time::timeout(
+                            Duration::from_millis(INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS),
+                            st.keepalive_once(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                drop(st);
+                                if attempt > 1 {
+                                    tracing::warn!(
+                                        lease_id,
+                                        attempt,
+                                        total = INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
+                                        budget_ms = INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS,
+                                        "initial etcd keepalive probe succeeded after retry"
+                                    );
+                                }
+                                last_probe_err = None;
+                                break;
+                            }
+                            Ok(Err(err)) => {
+                                let last_stage = st.last_stage();
+                                st.reset_stream();
+                                drop(st);
                                 tracing::warn!(
                                     lease_id,
                                     attempt,
                                     total = INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
                                     budget_ms = INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS,
-                                    "initial etcd keepalive probe succeeded after retry"
+                                    stage = last_stage,
+                                    "initial etcd keepalive probe failed, will {}: {:?}",
+                                    if attempt < INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES {
+                                        "retry"
+                                    } else {
+                                        "stop"
+                                    },
+                                    err
                                 );
+                                last_probe_err = Some(err.context(format!(
+                                    "initial etcd keepalive probe failed for lease_id={} attempt={}/{}",
+                                    lease_id, attempt, INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES
+                                )));
                             }
-                            last_probe_err = None;
-                            break;
-                        }
-                        Ok(Err(err)) => {
-                            let last_stage = st.last_stage();
-                            st.reset_stream();
-                            drop(st);
-                            tracing::warn!(
-                                lease_id,
-                                attempt,
-                                total = INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
-                                budget_ms = INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS,
-                                stage = last_stage,
-                                "initial etcd keepalive probe failed, will {}: {:?}",
-                                if attempt < INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES {
-                                    "retry"
-                                } else {
-                                    "stop"
-                                },
-                                err
-                            );
-                            last_probe_err = Some(err.context(format!(
-                                "initial etcd keepalive probe failed for lease_id={} attempt={}/{}",
-                                lease_id, attempt, INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES
-                            )));
-                        }
-                        Err(_) => {
-                            let last_stage = st.last_stage();
-                            st.reset_stream();
-                            drop(st);
-                            let err = anyhow::anyhow!(
-                                "initial etcd keepalive probe timed out for lease_id={} attempt={}/{} budget_ms={} stage={}",
-                                lease_id,
-                                attempt,
-                                INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
-                                INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS,
-                                last_stage
-                            );
-                            tracing::warn!(
-                                lease_id,
-                                attempt,
-                                total = INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
-                                budget_ms = INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS,
-                                stage = last_stage,
-                                "initial etcd keepalive probe timed out, will {}",
-                                if attempt < INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES {
-                                    "retry"
-                                } else {
-                                    "stop"
-                                }
-                            );
-                            last_probe_err = Some(err);
+                            Err(_) => {
+                                let last_stage = st.last_stage();
+                                st.reset_stream();
+                                drop(st);
+                                let err = anyhow::anyhow!(
+                                    "initial etcd keepalive probe timed out for lease_id={} attempt={}/{} budget_ms={} stage={}",
+                                    lease_id,
+                                    attempt,
+                                    INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
+                                    INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS,
+                                    last_stage
+                                );
+                                tracing::warn!(
+                                    lease_id,
+                                    attempt,
+                                    total = INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
+                                    budget_ms = INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS,
+                                    stage = last_stage,
+                                    "initial etcd keepalive probe timed out, will {}",
+                                    if attempt < INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES {
+                                        "retry"
+                                    } else {
+                                        "stop"
+                                    }
+                                );
+                                last_probe_err = Some(err);
+                            }
                         }
                     }
-                }
-                if let Some(err) = last_probe_err {
-                    return Err(err);
+                    if let Some(err) = last_probe_err {
+                        return Err(err);
+                    }
                 }
 
                 let entry = keepalive_actor::actor_register_lease(

@@ -216,10 +216,6 @@ def pyo3_workspace_copy_relative_paths(transport_backend: str, rdma_backend: str
     return collect_public_workspace_input_relative_paths(repo_root=REPO_ROOT)
 
 
-def _pyo3_input_relative_paths(transport_backend: str, rdma_backend: str) -> tuple[str, ...]:
-    return pyo3_workspace_copy_relative_paths(transport_backend, rdma_backend)
-
-
 def _wheel_variant_key(transport_backend: str, rdma_backend: str) -> str:
     if rdma_backend != "closed_sdk":
         raise RuntimeError(f"unsupported rdma_backend for public wheel variant key: {rdma_backend!r}")
@@ -449,7 +445,7 @@ class PyO3PackState:
     def current_checksum(self) -> str:
         return _compute_inputs_digest(
             self.repo_root,
-            _pyo3_input_relative_paths(self.transport_backend, self.rdma_backend),
+            pyo3_workspace_copy_relative_paths(self.transport_backend, self.rdma_backend),
         ) + f"|transport_backend={self.transport_backend}|rdma_backend={self.rdma_backend}"
 
     def find_cached_wheel(self) -> Path | None:
@@ -469,11 +465,8 @@ class PyO3PackState:
             raise RuntimeError(f"ambiguous cached wheel for {token} in {self.target_wheels_dir}: {names}")
         return candidates[0]
 
-    def wheel_check(self) -> script_utils.ArtifactCheck:
-        return self.wheel_rule.check()
-
     def reuse_existing_wheel(self) -> bool:
-        wheel_check = self.wheel_check()
+        wheel_check = self.wheel_rule.check()
         if not wheel_check.is_ready():
             return False
         wheel_path = self.find_cached_wheel()
@@ -1445,7 +1438,7 @@ def _container_native_object_root(*, object_id: str) -> str:
 
 
 def _native_object_dir_name(*, object_id: str) -> str:
-    return _camel_to_snake(object_id)
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", object_id).lower()
 
 
 def _backend_native_object_id(selected_backend_plan: dict) -> str | None:
@@ -1491,10 +1484,6 @@ def _object_kind_from_object_id(*, object_id: str) -> str:
         return NATIVE_RUNTIME_OBJECT_KIND_BY_ID[object_id]
     except KeyError as exc:
         raise RuntimeError(f"unsupported native runtime object id: {object_id}") from exc
-
-
-def _camel_to_snake(value: str) -> str:
-    return re.sub(r"(?<!^)(?=[A-Z])", "_", value).lower()
 
 
 def _bridge_prebuilt_direct_mount_paths(

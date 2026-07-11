@@ -141,8 +141,8 @@ def main() -> None:
             if shutdown_notified:
                 return
             shutdown_notified = True
-            logger.info(f"[producer] caught {reason}, requesting shutdown...")
-            producer.request_shutdown()
+            logger.info(f"[producer] caught {reason}, closing...")
+            _best_effort_close_result(producer, logger, "producer")
 
         restore_signal_listener = register_ctrlc_callback(_on_ctrlc, thread_name="test-mq-producer-signal")
         logger.info(f"[producer] joined mpmc_id={producer.get_chan_id()}, key={demo_cfg['key']}")
@@ -266,8 +266,8 @@ def main() -> None:
             if shutdown_notified:
                 return
             shutdown_notified = True
-            logger.info(f"[consumer] caught {reason}, requesting shutdown...")
-            consumer.request_shutdown()
+            logger.info(f"[consumer] caught {reason}, closing...")
+            _best_effort_close_result(consumer, logger, "consumer")
 
         restore_signal_listener = register_ctrlc_callback(_on_ctrlc, thread_name="test-mq-consumer-signal")
         logger.info(f"[consumer] joined mpmc_id={consumer.get_chan_id()}, key={demo_cfg['key']}")

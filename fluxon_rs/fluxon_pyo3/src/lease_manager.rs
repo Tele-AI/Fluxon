@@ -267,6 +267,60 @@ impl LeaseManagerHandle {
         Ok(PyGeneralLease { lease })
     }
 
+    /// Register a caller-granted etcd lease id for keepalive and wrap the core Lease.
+    ///
+    /// The caller must have just granted this lease on the same etcd backend. This
+    /// path skips the initial keepalive probe and only installs periodic keepalive.
+    #[pyo3(signature = (endpoints, ttl_seconds, lease_id, *, register_by))]
+    fn register_newly_granted_etcd_lease(
+        &self,
+        endpoints: Vec<String>,
+        ttl_seconds: i64,
+        lease_id: u64,
+        register_by: String,
+        py: Python<'_>,
+    ) -> PyResult<PyGeneralLease> {
+        let t0 = Instant::now();
+        debug!(
+            target: "fluxon_pyo3::lease",
+            "begin register_newly_granted_etcd_lease: endpoints={}, ttl_seconds={}, lease_id={}, register_by={}",
+            endpoints.join(","), ttl_seconds, lease_id, register_by
+        );
+        fluxon_mq::lease_manager::record_register_by(lease_id, register_by);
+        let rth = self.rt.handle().clone();
+        let outer = py
+            .allow_threads(|| {
+                self.rt.run_async_from_sync(async move {
+                    let uid = LeaseBackendUid::etcd_from(endpoints);
+                    let rt = rth;
+                    GLOBAL_LM
+                        .register_lease_for_keepalive(
+                            uid,
+                            ttl_seconds,
+                            lease_id,
+                            LeaseRegisterKind::EtcdNewlyGranted,
+                            rt,
+                        )
+                        .await
+                })
+            })
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "runtime bridge failed in register_newly_granted_etcd_lease: {}",
+                    e
+                )
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let lease =
+            outer.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        debug!(
+            target: "fluxon_pyo3::lease",
+            "end register_newly_granted_etcd_lease: id={}, elapsed_ms={}",
+            lease.id(), t0.elapsed().as_millis()
+        );
+        Ok(PyGeneralLease { lease })
+    }
+
     /// Register a kvclient lease via constructed backend uid carrying callbacks.
     ///
     /// 统一风格：由 Python 先构造 `LeaseBackendUid.kv_client_with_callbacks(...)`，

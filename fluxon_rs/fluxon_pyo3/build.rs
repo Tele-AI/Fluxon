@@ -16,7 +16,7 @@ const CLOSED_SDK_RUNTIME_ROOT_DIR_NAMES: &[&str] = &["native_runtime", "vendor_r
 fn main() {
     let target_dir = get_target_dir();
     let runtime_search_subdirs = load_runtime_search_subdirs();
-    let runtime_root_dir_names = runtime_root_dir_names();
+    let runtime_root_dir_names = CLOSED_SDK_RUNTIME_ROOT_DIR_NAMES.to_vec();
 
     for path in native_runtime_search_dirs(
         &target_dir,
@@ -81,10 +81,6 @@ fn get_target_dir() -> PathBuf {
     }
 
     panic!("failed to locate target directory from OUT_DIR");
-}
-
-fn runtime_root_dir_names() -> Vec<&'static str> {
-    CLOSED_SDK_RUNTIME_ROOT_DIR_NAMES.to_vec()
 }
 
 fn native_runtime_search_dirs(
