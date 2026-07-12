@@ -291,7 +291,14 @@ def new_or_bind_with_unique_key(
             unique_id,
             existing_chan_id,
         )
-        result = chan_bind(api, chan_config, existing_chan_id, chan_type, chan_role, etcd_client)
+        result = _construct_bound_channel(
+            api,
+            chan_config,
+            existing_chan_id,
+            chan_type,
+            chan_role,
+            etcd_client,
+        )
         if not result.is_ok():
             err = result.unwrap_error()
             if _is_stale_bind_error(err):
@@ -300,14 +307,10 @@ def new_or_bind_with_unique_key(
                 ChanBindError(f"Bind failed for chan_id={existing_chan_id}: {err}")
             )
 
-        _ = result.unwrap()
-        result = get_chan_by_id(chan_type, existing_chan_id)
-        del_chan_by_id(chan_type, existing_chan_id)
-        if result.is_ok():
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_ok(result.unwrap())
-        return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
-            ChanBindError(f"Channel {existing_chan_id} not found in active nodes, error: {result.unwrap_error()}")
-        )
+        return Result[
+            Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer],
+            ApiError,
+        ].new_ok(result.unwrap())
 
     def _try_bind_existing_channel_without_lock() -> Result[object, ApiError]:
         """
@@ -725,6 +728,127 @@ def chan_new(
         )
 
 
+def _construct_bound_channel(
+    api: KvClient,
+    chan_config: Dict[str, int],
+    chan_id: str,
+    chan_type: ChanType,
+    chan_role: ChanRole,
+    etcd_client: Optional[etcd3.Etcd3Client] = None,
+) -> Result[
+    Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer],
+    ApiError,
+]:
+    """Construct one bound channel without publishing it through the process registry."""
+
+    if chan_type == ChanType.MPSC:
+        if chan_role == ChanRole.PRODUCER:
+            try:
+                producer = MPSCChanProducer(api, chan_id, chan_config, etcd_client)
+            except (InvalidConfigurationError, PayloadLeaseNotFoundError) as e:
+                return Result.new_error(e)
+            except Exception as e:
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message=f"MPSC producer initialize error! {e}",
+                    )
+                )
+            if not isinstance(producer.chan_id, str) or not producer.chan_id.isdigit():
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message="MPSC producer initialize error!",
+                    )
+                )
+            return Result.new_ok(producer)
+        elif chan_role == ChanRole.CONSUMER:
+            try:
+                consumer = MPSCChanConsumer(api, chan_id, chan_config, etcd_client)
+            except (InvalidConfigurationError, PayloadLeaseNotFoundError) as e:
+                return Result.new_error(e)
+            except Exception as e:
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message=f"MPSC consumer initialize error! {e}",
+                    )
+                )
+            if not isinstance(consumer.chan_id, str) or not consumer.chan_id.isdigit():
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message="MPSC consumer initialize error!",
+                    )
+                )
+            return Result.new_ok(consumer)
+        else:
+            return Result.new_error(
+                InvalidConfigurationError(
+                    message="Invalid MPSC channel role",
+                )
+            )
+    elif chan_type == ChanType.MPMC:
+        if chan_role == ChanRole.PRODUCER:
+            try:
+                producer = MPMCChanProducer(api, chan_id, chan_config, etcd_client)
+            except InvalidConfigurationError as e:
+                if "lease not found" in str(e).lower() or "payload lease" in str(e).lower():
+                    return Result.new_error(
+                        InvalidConfigurationError(
+                            message=str(e),
+                            config_key="mpmc_meta_stale",
+                        )
+                    )
+                return Result.new_error(e)
+            except Exception as e:
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message=f"MPMC producer initialize error! {e}",
+                    )
+                )
+            if not isinstance(producer.mpmc_id, str) or not producer.mpmc_id.isdigit():
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message="MPMC producer initialize error!",
+                    )
+                )
+            return Result.new_ok(producer)
+        elif chan_role == ChanRole.CONSUMER:
+            try:
+                consumer = MPMCChanConsumer(api, chan_id, chan_config, etcd_client)
+            except InvalidConfigurationError as e:
+                if "lease not found" in str(e).lower() or "payload lease" in str(e).lower():
+                    return Result.new_error(
+                        InvalidConfigurationError(
+                            message=str(e),
+                            config_key="mpmc_meta_stale",
+                        )
+                    )
+                return Result.new_error(e)
+            except Exception as e:
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message=f"MPMC consumer initialize error! {e}",
+                    )
+                )
+            if not isinstance(consumer.mpmc_id, str) or not consumer.mpmc_id.isdigit():
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message="MPMC consumer initialize error!",
+                    )
+                )
+            return Result.new_ok(consumer)
+        else:
+            return Result.new_error(
+                InvalidConfigurationError(
+                    message="Invalid MPMC channel role",
+                )
+            )
+    else:
+        return Result.new_error(
+            InvalidConfigurationError(
+                message="Invalid channel type or role",
+            )
+        )
+
+
 def chan_bind(
     api: KvClient,
     chan_config: Dict[str, int],
@@ -733,120 +857,20 @@ def chan_bind(
     chan_role: ChanRole,
     etcd_client: Optional[etcd3.Etcd3Client] = None,
 ) -> Result[bool, ApiError]:
-    if chan_type == ChanType.MPSC:
-        if chan_role == ChanRole.PRODUCER:
-            producer = None
-            try:
-                producer = MPSCChanProducer(api, chan_id, chan_config, etcd_client)
-            except (InvalidConfigurationError, PayloadLeaseNotFoundError) as e:
-                return Result[bool, ApiError].new_error(e)
-            except Exception as e:
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message=f"MPSC producer initialize error! {e}",
-                    )
-                )
-            if not isinstance(producer.chan_id, str) or not producer.chan_id.isdigit():
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message="MPSC producer initialize error!",
-                    )
-                )
-            CHANID_2_NODES[chan_type.value + "_" + producer.chan_id] = producer
-            return Result(True)
-        elif chan_role == ChanRole.CONSUMER:
-            consumer = None
-            try:
-                consumer = MPSCChanConsumer(api, chan_id, chan_config, etcd_client)
-            except (InvalidConfigurationError, PayloadLeaseNotFoundError) as e:
-                return Result[bool, ApiError].new_error(e)
-            except Exception as e:
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message=f"MPSC consumer initialize error! {e}",
-                    )
-                )
-            if not isinstance(consumer.chan_id, str) or not consumer.chan_id.isdigit():
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message="MPSC consumer initialize error!",
-                    )
-                )
-            CHANID_2_NODES[chan_type.value + "_" + consumer.chan_id] = consumer
-            return Result(True)
-        else:
-            return Result[bool, ApiError].new_error(
-                InvalidConfigurationError(
-                    message="Invalid MPSC channel role",
-                )
-            )
-    elif chan_type == ChanType.MPMC:
-        if chan_role == ChanRole.PRODUCER:
-            producer = None
-            try:
-                producer = MPMCChanProducer(api, chan_id, chan_config, etcd_client)
-            except InvalidConfigurationError as e:
-                if "lease not found" in str(e).lower() or "payload lease" in str(e).lower():
-                    return Result[bool, ApiError].new_error(
-                        InvalidConfigurationError(
-                            message=str(e),
-                            config_key="mpmc_meta_stale",
-                        )
-                    )
-                return Result[bool, ApiError].new_error(e)
-            except Exception as e:
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message=f"MPMC producer initialize error! {e}",
-                    )
-                )
-            if not isinstance(producer.mpmc_id, str) or not producer.mpmc_id.isdigit():
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message="MPMC producer initialize error!",
-                    )
-                )
-            CHANID_2_NODES[chan_type.value + "_" + producer.mpmc_id] = producer
-            return Result(True)
-        elif chan_role == ChanRole.CONSUMER:
-            consumer = None
-            try:
-                consumer = MPMCChanConsumer(api, chan_id, chan_config, etcd_client)
-            except InvalidConfigurationError as e:
-                if "lease not found" in str(e).lower() or "payload lease" in str(e).lower():
-                    return Result[bool, ApiError].new_error(
-                        InvalidConfigurationError(
-                            message=str(e),
-                            config_key="mpmc_meta_stale",
-                        )
-                    )
-                return Result[bool, ApiError].new_error(e)
-            except Exception as e:
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message=f"MPMC consumer initialize error! {e}",
-                    )
-                )
-            if not isinstance(consumer.mpmc_id, str) or not consumer.mpmc_id.isdigit():
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message="MPMC consumer initialize error!",
-                    )
-                )
-            CHANID_2_NODES[chan_type.value + "_" + consumer.mpmc_id] = consumer
-            return Result(True)
-        else:
-            return Result[bool, ApiError].new_error(
-                InvalidConfigurationError(
-                    message="Invalid MPMC channel role",
-                )
-            )
-    else:
-        return Result[bool, ApiError].new_error(
-            InvalidConfigurationError(
-                message="Invalid channel type or role",
-            )
-        )
+    """Bind a channel and publish it through the legacy process registry."""
+
+    result = _construct_bound_channel(
+        api,
+        chan_config,
+        chan_id,
+        chan_type,
+        chan_role,
+        etcd_client,
+    )
+    if not result.is_ok():
+        return Result.new_error(result.unwrap_error())
+    set_chan_by_id(chan_type, chan_id, result.unwrap())
+    return Result.new_ok(True)
 
 
 def chan_unbind(chan_type: ChanType, chan_id: str) -> Result[bool, ApiError]:

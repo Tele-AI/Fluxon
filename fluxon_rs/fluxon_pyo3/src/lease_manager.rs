@@ -1,6 +1,6 @@
 use anyhow::Result as AnyResult;
-use fluxon_util::lease_manager::GLOBAL_LM;
 use fluxon_util::lease_manager::snapshot_active_lease_debug as lm_snapshot_active_lease_debug;
+use fluxon_util::lease_manager::GLOBAL_LM;
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -298,7 +298,7 @@ impl LeaseManagerHandle {
                             uid,
                             ttl_seconds,
                             lease_id,
-                            LeaseRegisterKind::EtcdNewlyGranted,
+                            LeaseRegisterKind::EtcdValidated,
                             rt,
                         )
                         .await

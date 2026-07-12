@@ -836,7 +836,7 @@ def _collect_workload_log_tail(controller_url: str, inst: _InstanceReq, inst_dir
         "instance_key": instance_key,
         "kind": inst.workload_kind,
         "name": inst.workload_name,
-        "direction": "Backward",
+        "direction": "Forward",
         "max_bytes": _COLLECT_WORKLOAD_LOG_TAIL_BYTES,
     }
     out_json = inst_dir / "workload_log_tail.json"
@@ -1111,7 +1111,7 @@ def _http_workload_log_allow_error(
         "instance_key": instance_key,
         "kind": kind,
         "name": name,
-        "direction": "Backward",
+        "direction": "Forward",
         "max_bytes": int(max_bytes),
     }
     req = _new_controller_request(

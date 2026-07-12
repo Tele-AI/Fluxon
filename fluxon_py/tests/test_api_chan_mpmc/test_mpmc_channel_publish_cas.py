@@ -126,12 +126,15 @@ class _FakeMPSCProducer:
     def __init__(self, *_args, **_kwargs):
         self.chan_id = "1001"
         self.closed = False
-        self.discard_result = _CloseResult()
+        self.rollback_result = _CloseResult()
         type(self).last_instance = self
 
-    def _discard(self):
+    def _rollback_unpublished_channel(self):
         self.closed = True
-        return self.discard_result
+        return self.rollback_result
+
+    def get_chan_id(self):
+        return self.chan_id
 
 
 class _FakeMPSCConsumer:
@@ -159,12 +162,12 @@ def _new_channel(etcd_client, *, member_id, active_consumers):
     channel.mpmc_member_lease = SimpleNamespace(id=member_id)
     channel.mpmc_global_lease = SimpleNamespace(id=900)
     channel.payload_lease_id = 901
-    channel._get_active_consumer_count = lambda: active_consumers
+    channel.get_active_member_ids = lambda role: list(range(1, active_consumers + 1))
     return channel
 
 
 class MPMCChannelPublishCASTest(unittest.TestCase):
-    def test_unpublished_producer_discard_result_is_consumed(self):
+    def test_unpublished_producer_rollback_result_is_consumed(self):
         etcd_client = _AlwaysConflictEtcd(stale_reader_count=1)
         channel = _new_channel(etcd_client, member_id=11, active_consumers=1)
         channel.shutdown_ctl = object()
@@ -186,7 +189,7 @@ class MPMCChannelPublishCASTest(unittest.TestCase):
         producer = _FakeMPSCProducer.last_instance
         self.assertIsNotNone(producer)
         self.assertTrue(producer.closed)
-        self.assertTrue(producer.discard_result.consumed)
+        self.assertTrue(producer.rollback_result.consumed)
 
     def test_concurrent_stale_consumer_writers_do_not_lose_channel(self):
         etcd_client = _FakeEtcd(stale_reader_count=2)

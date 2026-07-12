@@ -4,29 +4,29 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel as cbchan;
-use fluxon_mq::DeleteResult as CoreDeleteResult;
 use fluxon_mq::consumer::{
     ConsumedPayload as CoreConsumedPayload, MqPayload as CoreMqPayload,
     PayloadResult as CorePayloadResult,
 };
+use fluxon_mq::DeleteResult as CoreDeleteResult;
 use fluxon_mq::{
+    create::{create_mpsc_channel, ChanCreateConfig},
     ChanManager, MpscConsumer as CoreMpscConsumer, MpscError as CoreMpscError,
     MpscProducer as CoreMpscProducer, ShutdownCtl,
-    create::{ChanCreateConfig, create_mpsc_channel},
 };
-use pyo3::Py;
-use pyo3::PyErr;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyString};
+use pyo3::Py;
+use pyo3::PyErr;
 use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
 // (no local payload buffering)
 
-use crate::flatdict_zerocopy::{FlatDictDataOwner, decode_flat_dict_to_wrapped_py_object};
+use crate::flatdict_zerocopy::{decode_flat_dict_to_wrapped_py_object, FlatDictDataOwner};
 use crate::lease_manager::PyLeaseBackendUid;
 use fluxon_kv::{Framework as KvFramework, KvClientTrait};
 use fluxon_mq::lease_manager::LeaseBackendUid;
-use fluxon_util::lease_manager::{GLOBAL_LM, LeaseManager};
+use fluxon_util::lease_manager::{LeaseManager, GLOBAL_LM};
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use tracing::{debug, warn};
 
@@ -53,20 +53,20 @@ const PAYLOAD_STAGE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
 const PAYLOAD_STAGE_SLOW_WARN_THRESHOLD: Duration = Duration::from_secs(1);
 const GET_ONE_PENDING_WARN_INTERVAL: Duration = Duration::from_secs(2);
 
-async fn run_mpsc_bind_until_shutdown<T, F>(
-    shutdown: ShutdownCtl,
-    bind_future: F,
+async fn await_cancel_safe_mpmc_subchannel_load<T, F>(
+    shutdown: &ShutdownCtl,
+    load: F,
 ) -> anyhow::Result<T>
 where
     F: Future<Output = anyhow::Result<T>>,
 {
-    tokio::pin!(bind_future);
+    tokio::pin!(load);
     tokio::select! {
         biased;
         _ = shutdown.wait_closed() => {
-            Err(anyhow::anyhow!("MPSC producer bind cancelled by shutdown"))
+            Err(anyhow::anyhow!("MPMC sub-producer construction stopped by shutdown"))
         }
-        result = &mut bind_future => result,
+        result = &mut load => result,
     }
 }
 
@@ -253,13 +253,10 @@ impl MpscContext {
             None => ShutdownCtl::new(),
         };
         let shutdown_for_core = shutdown.clone();
-        let shutdown_for_bind = shutdown.clone();
         let runtime = self.kv_runtime.clone();
         let rth = runtime.clone();
         let outer = py.allow_threads(|| runtime
-            .run_async_from_sync(run_mpsc_bind_until_shutdown(
-                shutdown_for_bind,
-                async move {
+            .run_async_from_sync(async move {
                 let lease_manager = GLOBAL_LM.clone();
 
                 // Construct channel manager either by creating a new
@@ -289,15 +286,21 @@ impl MpscContext {
                                         "override_payload_lease_id is required for MPMC sub-producer bind"
                                     )
                                 })?;
-                                ChanManager::new_mpmc_sub_producer_with_chan_id(
-                                    lease_manager.clone(),
-                                    endpoints.clone(),
-                                    kv_backend_uid.clone(),
-                                    id,
-                                    global_lease_id,
-                                    member_lease_id,
-                                    payload_lease_id,
-                                    rth.clone(),
+                                // This loader only reads channel metadata and acquires RAII
+                                // keepalive guards. It does not publish membership or channel
+                                // state, so dropping it on shutdown cannot leave remote state.
+                                await_cancel_safe_mpmc_subchannel_load(
+                                    &shutdown_for_core,
+                                    ChanManager::new_mpmc_sub_producer_with_chan_id(
+                                        lease_manager.clone(),
+                                        endpoints.clone(),
+                                        kv_backend_uid.clone(),
+                                        id,
+                                        global_lease_id,
+                                        member_lease_id,
+                                        payload_lease_id,
+                                        rth.clone(),
+                                    ),
                                 )
                                 .await
                                 .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -342,6 +345,12 @@ impl MpscContext {
                 .await;
                 let chan_mgr = chan_mgr?;
 
+                if shutdown_for_core.is_closed() {
+                    return Err(anyhow::anyhow!(
+                        "MPSC producer construction stopped before membership bind"
+                    ));
+                }
+
                 let category = match (parent_mpmc_id_opt, parent_mpmc_member_id_opt) {
                     (Some(pid), Some(_mid)) => fluxon_mq::keys::MqCategory::MpmcSub { parent_mpmc_id: pid },
                     (None, None) => fluxon_mq::keys::MqCategory::Mpsc,
@@ -362,8 +371,7 @@ impl MpscContext {
                     observe,
                 )
                 .await
-                },
-            )))
+            }))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "runtime bridge failed in new_producer: {}",
                 e
@@ -1950,5 +1958,56 @@ impl Drop for ConsumerGuard {
                 inner,
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn mpmc_subchannel_load_releases_raii_state_on_shutdown() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let shutdown = ShutdownCtl::new();
+            let shutdown_from_task = shutdown.clone();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let entered_from_load = entered.clone();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let dropped_from_load = dropped.clone();
+
+            let close_task = tokio::spawn(async move {
+                entered.notified().await;
+                shutdown_from_task.close();
+            });
+            let load = async move {
+                let _drop_signal = DropSignal(dropped_from_load);
+                entered_from_load.notify_one();
+                std::future::pending::<anyhow::Result<()>>().await
+            };
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                await_cancel_safe_mpmc_subchannel_load(&shutdown, load),
+            )
+            .await
+            .expect("shutdown must interrupt the pending MPMC subchannel load");
+            close_task.await.expect("close task");
+
+            let error = result.expect_err("shutdown must return an error");
+            assert!(error.to_string().contains("stopped by shutdown"));
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "cancelling the read-only loader must drop its acquired RAII guards"
+            );
+        });
     }
 }

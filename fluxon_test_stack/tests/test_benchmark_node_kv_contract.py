@@ -15,7 +15,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from fluxon_py.api_error import OkNone, Result
-from fluxon_py.kvclient.kvclient_interface import KvLeaseApi
 from benchmark_node_kv import FluxonBlockingStore
 
 
@@ -82,41 +81,15 @@ class _FakeFluxonStore:
 
 
 class TestBenchmarkNodeKvContract(unittest.TestCase):
-    def test_fluxon_blocking_store_exposes_channel_backend_contract(self) -> None:
+    def test_fluxon_blocking_store_keeps_channel_client_as_typed_inner_owner(self) -> None:
         raw_store = _FakeFluxonStore()
         store = FluxonBlockingStore(raw_store)  # type: ignore[arg-type]
 
-        self.assertIsInstance(store, KvLeaseApi)
-        self.assertIs(store._client, raw_store._client)
-        self.assertEqual(store.get_etcd_config(), ["127.0.0.1:2379"])
-        self.assertEqual(store.get_cluster_name(), "fluxon_benchmark")
-        self.assertEqual(store.config(), "bench-config")
-
-        store.ensure_zero_contribution_for_channel()
-        self.assertTrue(raw_store.zero_contribution_checked)
-
-        self.assertEqual(store.count_prefix("/mpmc/1/").unwrap(), 3)
-        self.assertEqual(store.allocate_lease(90).unwrap(), 42)
-        self.assertIsInstance(store.keepalive_lease(42).unwrap(), OkNone)
-
-        self.assertEqual(store.get("k"), "get-result")
-        self.assertEqual(store.remove("k"), "remove-result")
-        self.assertEqual(
-            store.sync_kv_to_file("k", "node-a", "/tmp/out", 7, "payload", timeout_ms=10000),
-            "sync_kv_to_file-result",
-        )
-        self.assertEqual(
-            raw_store.calls[-3:],
-            [
-                ("get", ("k",), {}),
-                ("remove", ("k",), {}),
-                (
-                    "sync_kv_to_file",
-                    ("k", "node-a", "/tmp/out", 7, "payload"),
-                    {"timeout_ms": 10000},
-                ),
-            ],
-        )
+        self.assertIs(store.kv_client, raw_store)
+        self.assertFalse(hasattr(store, "_client"))
+        self.assertFalse(hasattr(store, "get_etcd_config"))
+        self.assertFalse(hasattr(store, "allocate_lease"))
+        self.assertFalse(hasattr(store, "rpc_call"))
 
 
 if __name__ == "__main__":

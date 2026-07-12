@@ -1,14 +1,18 @@
 use anyhow::Context;
 use etcd_client as etcd;
+use std::time::Duration;
 
 use fluxon_util::etcd::{get_cluster_lease_id, DistributeIdAllocator};
 use fluxon_util::lease_manager::{
-    record_register_by as lm_record_register_by, LeaseBackendUid, LeaseManager, LeaseRegisterKind,
+    record_register_by as lm_record_register_by, registered_etcd_client, LeaseBackendUid,
+    LeaseManager, LeaseRegisterKind,
 };
 
 use crate::error::MpscError;
 use crate::keys;
 use crate::manager::{get_chan_meta_with_version, ChanGlobalMeta, ChanManager};
+
+const MPMC_SUBCHANNEL_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct ChanCreateConfig {
     pub capacity: i64,
@@ -171,49 +175,10 @@ pub async fn create_mpsc_channel(
             ))
         })?;
 
-    // 4) Write meta atomically. Persist both channel-level lease ids
-    // into meta so that other components can reconstruct
-    // `ChanManager` from etcd alone.
-    let meta = ChanGlobalMeta {
-        capacity: cfg.capacity,
-        ttl_seconds: cfg.ttl_seconds,
-        global_lease_id,
-        global_long_lease_id,
-        payload_lease_id: Some(payload_lease_id_i64),
-    };
-    let meta_bytes = serde_json::to_vec(&meta)
-        .map_err(|e| MpscError::Internal(format!("serialize ChanMeta failed: {}", e)))?;
-
-    let meta_key = keys::etcd_meta_key(chan_id);
-
-    let compare = etcd::Compare::create_revision(meta_key.clone(), etcd::CompareOp::Equal, 0);
-    let put_meta = etcd::TxnOp::put(
-        meta_key.clone(),
-        meta_bytes,
-        Some(etcd::PutOptions::new().with_lease(global_lease_id)),
-    );
-    let txn = etcd::Txn::new()
-        .when(vec![compare])
-        .and_then(vec![put_meta]);
-    let txn_res = client
-        .txn(txn)
-        .await
-        .with_context(|| format!("failed to write meta for chan_id={}", chan_id))
-        .map_err(|e| MpscError::Internal(e.to_string()))?;
-
-    if !txn_res.succeeded() {
-        return Err(MpscError::Internal(format!(
-            "meta key already exists for chan_id={}",
-            chan_id
-        )));
-    }
-
-    // 构造带有三种 etcd lease handle + 一个 kvclient
-    // payload lease 的 ChanManager：
-    // - member_lease: per-channel 成员 lease，由当前 manager 实例持有
-    // - global_lease: channel 元数据的 global lease（TTL = 用户 ttl）
-    // - global_long_lease: id allocator 的长 TTL global lease
-    // - payload_lease: kvclient payload lease（始终存在）
+    // Prepare every fallible lease handle before publishing channel metadata.
+    // Once `/channels/meta/{chan_id}` becomes visible, this function must be able
+    // to return a complete ChanManager without another remote await that could
+    // strand a half-created channel under a caller-owned shared lease.
     let global_lease_handle = lease_manager
         .register_lease_for_keepalive(
             etcd_backend_uid.clone(),
@@ -229,11 +194,11 @@ pub async fn create_mpsc_channel(
                 chan_id, e
             ))
         })?;
-    // Enrich register_by for easier attribution in diagnostics
     lm_record_register_by(
         global_lease_id as u64,
         format!("mpsc_global:chan_id={}", chan_id),
     );
+
     let global_long_lease_handle = lease_manager
         .register_lease_for_keepalive(
             etcd_backend_uid.clone(),
@@ -290,6 +255,43 @@ pub async fn create_mpsc_channel(
         format!("mpsc_member:chan_id={}", chan_id),
     );
 
+    // 4) Write meta atomically. Persist both channel-level lease ids
+    // into meta so that other components can reconstruct
+    // `ChanManager` from etcd alone.
+    let meta = ChanGlobalMeta {
+        capacity: cfg.capacity,
+        ttl_seconds: cfg.ttl_seconds,
+        global_lease_id,
+        global_long_lease_id,
+        payload_lease_id: Some(payload_lease_id_i64),
+    };
+    let meta_bytes = serde_json::to_vec(&meta)
+        .map_err(|e| MpscError::Internal(format!("serialize ChanMeta failed: {}", e)))?;
+
+    let meta_key = keys::etcd_meta_key(chan_id);
+
+    let compare = etcd::Compare::create_revision(meta_key.clone(), etcd::CompareOp::Equal, 0);
+    let put_meta = etcd::TxnOp::put(
+        meta_key.clone(),
+        meta_bytes,
+        Some(etcd::PutOptions::new().with_lease(global_lease_id)),
+    );
+    let txn = etcd::Txn::new()
+        .when(vec![compare])
+        .and_then(vec![put_meta]);
+    let txn_res = client
+        .txn(txn)
+        .await
+        .with_context(|| format!("failed to write meta for chan_id={}", chan_id))
+        .map_err(|e| MpscError::Internal(e.to_string()))?;
+
+    if !txn_res.succeeded() {
+        return Err(MpscError::Internal(format!(
+            "meta key already exists for chan_id={}",
+            chan_id
+        )));
+    }
+
     let etcd_client = client;
 
     Ok(ChanManager {
@@ -308,9 +310,10 @@ pub async fn create_mpsc_channel(
 impl ChanManager {
     /// Bind an existing MPSC channel as an MPMC sub-producer.
     ///
-    /// The parent MPMC channel publishes metadata, member, and payload lease
-    /// ids. This constructor validates those ids and registers the local
-    /// sub-producer as another keepalive contributor for the same leases.
+    /// The caller must supply leases from a live parent MPMC endpoint and a
+    /// ready subchannel. This constructor matches those ids against channel
+    /// metadata and installs periodic keepalive contributors without repeating
+    /// synchronous probes for every local subchannel handle.
     pub async fn new_mpmc_sub_producer_with_chan_id(
         lease_manager: LeaseManager,
         etcd_endpoints: Vec<String>,
@@ -322,13 +325,26 @@ impl ChanManager {
         rt_handle: tokio::runtime::Handle,
     ) -> anyhow::Result<Self> {
         let etcd_backend_uid = LeaseBackendUid::etcd_from(etcd_endpoints.clone());
-        let client = etcd::Client::connect(etcd_endpoints, None)
-            .await
-            .map_err(|e| anyhow::anyhow!("connect etcd failed: {}", e))?;
+        let client = registered_etcd_client(&etcd_backend_uid).map_err(|e| {
+            anyhow::anyhow!(
+                "MPMC sub-producer requires its parent to register the etcd backend first: {}",
+                e
+            )
+        })?;
         let mut meta_client = client.clone();
-        let meta_with_ver = get_chan_meta_with_version(&mut meta_client, chan_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("get_chan_meta failed for chan_id={}: {}", chan_id, e))?;
+        let meta_with_ver = tokio::time::timeout(
+            MPMC_SUBCHANNEL_METADATA_TIMEOUT,
+            get_chan_meta_with_version(&mut meta_client, chan_id),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "get_chan_meta timed out after {} ms for chan_id={}",
+                MPMC_SUBCHANNEL_METADATA_TIMEOUT.as_millis(),
+                chan_id
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("get_chan_meta failed for chan_id={}: {}", chan_id, e))?;
         let meta = meta_with_ver.meta;
 
         if meta.global_lease_id != override_global_lease_id {
@@ -363,7 +379,7 @@ impl ChanManager {
                 etcd_backend_uid.clone(),
                 meta.ttl_seconds,
                 override_member_lease_id as u64,
-                LeaseRegisterKind::Etcd,
+                LeaseRegisterKind::EtcdValidated,
                 rt_handle.clone(),
             )
             .await
@@ -385,7 +401,7 @@ impl ChanManager {
                 etcd_backend_uid.clone(),
                 meta.ttl_seconds,
                 meta.global_lease_id as u64,
-                LeaseRegisterKind::Etcd,
+                LeaseRegisterKind::EtcdValidated,
                 rt_handle.clone(),
             )
             .await
@@ -407,7 +423,7 @@ impl ChanManager {
                 etcd_backend_uid.clone(),
                 30 * 60,
                 meta.global_long_lease_id as u64,
-                LeaseRegisterKind::Etcd,
+                LeaseRegisterKind::EtcdValidated,
                 rt_handle.clone(),
             )
             .await
@@ -429,7 +445,7 @@ impl ChanManager {
                 kv_backend_uid.clone(),
                 meta.ttl_seconds,
                 payload_lease_id as u64,
-                LeaseRegisterKind::KvClient {
+                LeaseRegisterKind::KvClientValidated {
                     register_by: format!("mpmc_sub_producer_payload:chan_id={}", chan_id),
                 },
                 rt_handle,

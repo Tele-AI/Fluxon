@@ -63,6 +63,7 @@ try:
         KV_NODE_ROLE_SEED,
         KV_NODE_ROLE_WORKER,
         KVGetResultKind,
+        FluxonBlockingStore,
         canonicalize_kv_node_role,
         classify_kv_get_result,
         init_kv_store,
@@ -106,6 +107,7 @@ except ImportError:
         KV_NODE_ROLE_SEED,
         KV_NODE_ROLE_WORKER,
         KVGetResultKind,
+        FluxonBlockingStore,
         canonicalize_kv_node_role,
         classify_kv_get_result,
         init_kv_store,
@@ -1197,7 +1199,8 @@ class BenchmarkNode:
     def __init__(self):
         self.test_config: Optional[Dict[str, Any]] = None
         self.node_id: str = f"node_{uuid.uuid4().hex[:8]}"
-        self.kv_store: Optional[KvClient] = None
+        self.kv_store: Optional[Any] = None
+        self.fluxon_client: Optional[KvClient] = None
         self.channel_id: Optional[str] = None  # Channel ID
         # Coordinator address must be provided by CLI; keep unset until main() assigns.
         self.coordinator_host: str = ""
@@ -2836,6 +2839,7 @@ class BenchmarkNode:
                 )
             close_res.unwrap()
             self._kv_store_closed = True
+            self.fluxon_client = None
             logger.info(
                 "✅ kv_store closed: reason=%s elapsed_seconds=%.3f",
                 reason,
@@ -2870,6 +2874,7 @@ class BenchmarkNode:
                 logical_only=True,
             )
         kv_store = self.kv_store
+        kv_client = self.fluxon_client
         if test_mode == TestMode.MPMC.value and node_role == "producer":
             self._sleep_for_runtime_init_stagger_once()
             if producer_kvcache_config is None:
@@ -2887,6 +2892,7 @@ class BenchmarkNode:
                 )
             with self._mpmc_producer_kv_store_lock:
                 kv_store = self.kv_store
+                kv_client = self.fluxon_client
                 if kv_store is None:
                     logger.info(
                         "🔧 线程 %s 正在创建 MPMC producer process-shared KVCache 存储实例",
@@ -2902,36 +2908,42 @@ class BenchmarkNode:
                         )
                     self._attach_fluxon_phase_summary_callback(store)
                     self.kv_store = store
+                    if not isinstance(store, FluxonBlockingStore):
+                        raise RuntimeError(
+                            "MPMC requires the Fluxon KV backend; benchmark wrapper is missing"
+                        )
+                    self.fluxon_client = store.kv_client
                     kv_store = store
+                    kv_client = self.fluxon_client
                     logger.info(
                         "✅ 线程 %s 已创建 MPMC producer process-shared KVCache 存储实例",
                         thread_id,
                     )
 
-            if kv_store is None:
+            if kv_store is None or kv_client is None:
                 raise RuntimeError(
-                    f"线程 {thread_id} 未获得 MPMC producer process-shared KV store"
+                    f"线程 {thread_id} 未获得 MPMC producer process-shared Fluxon client"
                 )
 
             return self._prepare_mpmc_endpoint_runtime_from_kv_store(
                 thread_id=thread_id,
-                kv_store=kv_store,
+                kv_client=kv_client,
             )
 
-        if kv_store is None:
-            raise RuntimeError("MPMC 模式下 KV store 未初始化")
+        if kv_store is None or kv_client is None:
+            raise RuntimeError("MPMC 模式下 Fluxon client 未初始化")
         return self._prepare_mpmc_endpoint_runtime_from_kv_store(
             thread_id=thread_id,
-            kv_store=kv_store,
+            kv_client=kv_client,
         )
 
     def _prepare_mpmc_endpoint_runtime_from_kv_store(
         self,
         *,
         thread_id: int,
-        kv_store: Any,
+        kv_client: KvClient,
     ) -> PreparedWorkerRuntime:
-        """Attach one MPMC endpoint using an already-created KV client."""
+        """Attach one MPMC endpoint using the canonical Fluxon client."""
         node_role = self.test_config.get("node_role", "")
         producer = None
         consumer = None
@@ -2939,7 +2951,7 @@ class BenchmarkNode:
             if node_role == "producer":
                 producer, _, err = init_mq_channel(
                     role="producer",
-                    kv_store=kv_store,
+                    kv_store=kv_client,
                     chan_config=self.chan_config,
                     unique_id=self.mq_unique_id,
                     weight=self.mq_state.weight if self.mq_state else 1.0,
@@ -2951,7 +2963,7 @@ class BenchmarkNode:
             elif node_role == "consumer":
                 _, consumer, err = init_mq_channel(
                     role="consumer",
-                    kv_store=kv_store,
+                    kv_store=kv_client,
                     chan_config=self.chan_config,
                     unique_id=self.mq_unique_id,
                     weight=self.mq_state.weight if self.mq_state else 1.0,
@@ -3049,7 +3061,34 @@ class BenchmarkNode:
         last_wait_log_ts = 0.0
         last_wait_reason = ""
         while True:
-            snapshot = get_cluster_info_snapshot(endpoint)
+            try:
+                snapshot = get_cluster_info_snapshot(endpoint)
+            except Exception as exc:  # noqa: BLE001
+                now = time.time()
+                observation_reason = (
+                    "topology observation unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if now >= deadline_ts:
+                    raise RuntimeError(
+                        "MPMC topology did not become observable before timeout: "
+                        f"role={role} expected_workers={expected_workers} "
+                        f"reason={observation_reason}"
+                    ) from exc
+                if (
+                    observation_reason != last_wait_reason
+                    or now - last_wait_log_ts >= 10.0
+                ):
+                    logger.info(
+                        "⏳ MPMC topology waiting: role=%s expected_workers=%s reason=%s",
+                        role,
+                        expected_workers,
+                        observation_reason,
+                    )
+                    last_wait_log_ts = now
+                    last_wait_reason = observation_reason
+                time.sleep(1.0)
+                continue
             ready_channels = snapshot.ready_channels
             active_consumers = snapshot.active_consumers
             readiness = evaluate_mpmc_topology_ready(
@@ -3335,10 +3374,10 @@ class BenchmarkNode:
 
         round_state = PreparedMPMCRound()
         self._prepared_mpmc_round = round_state
-        prepare_retry_deadline_ts = time.monotonic() + cluster_ready_timeout_s
 
         def worker_target(thread_id: int) -> None:
             try:
+                prepare_retry_deadline_ts = time.monotonic() + cluster_ready_timeout_s
                 runtime = self._prepare_mpmc_worker_runtime_with_retry(
                     thread_id=thread_id,
                     deadline_ts=prepare_retry_deadline_ts,
@@ -3906,6 +3945,7 @@ class BenchmarkNode:
             )
             if defer_shared_kv_store:
                 self.kv_store = None
+                self.fluxon_client = None
                 logger.info(
                     "⏭️ MPMC producer skips shared KVCache init; "
                     "the process-shared runtime is prepared after START"
@@ -3923,11 +3963,16 @@ class BenchmarkNode:
                     logger.error(f"❌ KVCache存储实例创建失败: {err}")
                     return False
                 self.kv_store = store
+                self.fluxon_client = (
+                    store.kv_client if isinstance(store, FluxonBlockingStore) else None
+                )
                 self._attach_fluxon_phase_summary_callback(self.kv_store)
                 logger.info("✅ KVCache存储实例创建成功")
 
             # 2) Initialize MPMC components based on test mode
             if test_mode == TestMode.MPMC.value:
+                if not defer_shared_kv_store and self.fluxon_client is None:
+                    raise RuntimeError("MPMC requires a FluxonBlockingStore-backed KvClient")
                 logger.info("🔧 MPMC模式，初始化 MPMC 相关配置（每线程独立实例）...")
 
                 node_role = (self.mq_state.role or node_role) if self.mq_state else node_role

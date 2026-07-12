@@ -7,7 +7,7 @@ use etcd_client::{Client, LeaseKeepAliveStream, LeaseKeeper};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::debug;
 
 /// Per-lease keepalive timeout budget for a single task.
@@ -285,6 +285,12 @@ pub(crate) struct OneTtlKeepAliveInner {
 
 impl OneTtlKeepAliveInner {}
 
+fn new_keepalive_ticker(period: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(Instant::now() + period, period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker
+}
+
 // Spawn the actor loop for a given inner. The loop exits when:
 // - `inner.stop` is true; or
 // - the registry is observed empty on a tick.
@@ -305,10 +311,21 @@ fn spawn_loop(rt: &tokio::runtime::Handle, inner: Arc<OneTtlKeepAliveInner>) {
         if period.as_millis() == 0 {
             period = Duration::from_secs(1);
         }
-        let mut ticker = tokio::time::interval(period);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Registration already validates an existing lease or follows a fresh grant.
+        // Start at the normal TTL cadence so a large batch does not open every
+        // keepalive stream twice immediately after registration.
+        let mut ticker = new_keepalive_ticker(period);
+        let mut retry_after_failure = false;
 
         loop {
+            if retry_after_failure {
+                // A short retry delay keeps failed leases responsive without turning
+                // a backend outage into a tight loop.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } else {
+                ticker.tick().await;
+            }
+
             type SnapItem = (LeaseKey, LeaseBackendHandle);
 
             // snapshot leases; if empty, exit
@@ -425,23 +442,7 @@ fn spawn_loop(rt: &tokio::runtime::Handle, inner: Arc<OneTtlKeepAliveInner>) {
                 }
             }
 
-            if !exist_fail {
-                // Normal path: wait until the next tick according to the TTL-based period.
-                ticker.tick().await;
-            } else {
-                // Failure path: add a small fixed backoff to avoid a tight busy loop when
-                // the backend (etcd / kvclient / network) is already in a bad state.
-                //
-                // Design notes:
-                // - keepalive failures usually indicate downstream problems; immediately
-                //   retrying in a zero-interval loop would just hammer the failing system;
-                // - we choose a fixed, TTL-independent 100ms backoff so that even under
-                //   continuous failure we cap retries at ~10/s per TTL bucket instead of
-                //   spinning as fast as the CPU allows;
-                // - if we ever need more sophisticated backoff (exponential, error-class
-                //   dependent, etc.), this branch is the only place that needs to change.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            retry_after_failure = exist_fail;
         }
     });
 }
@@ -503,4 +504,31 @@ pub fn actor_register_lease(
         },
         rt,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn periodic_keepalive_does_not_tick_immediately_after_registration() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let period = Duration::from_millis(200);
+            let mut ticker = new_keepalive_ticker(period);
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), ticker.tick())
+                    .await
+                    .is_err(),
+                "the first periodic keepalive must wait for its configured cadence"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(400), ticker.tick())
+                    .await
+                    .is_ok(),
+                "the first periodic keepalive must run after the cadence elapses"
+            );
+        });
+    }
 }

@@ -1801,9 +1801,12 @@ def prepare_rpc_before_ready(benchmark_node: Any) -> bool:
     if not is_rpc_server:
         return True
     if runtime_cfg.backend_kind == RPC_BACKEND_KIND_FLUXON:
+        fluxon_client = benchmark_node.fluxon_client
+        if fluxon_client is None:
+            raise RuntimeError("Fluxon RPC benchmark requires the canonical Fluxon client")
         rpc_store = getattr(benchmark_node, "_fluxon_rpc_store", None)
         if rpc_store is None:
-            rpc_store = _FluxonRpcStore(benchmark_node.kv_store)
+            rpc_store = _FluxonRpcStore(fluxon_client)
             attach_phase_callback = getattr(
                 benchmark_node,
                 "_attach_fluxon_phase_summary_callback",
@@ -1895,9 +1898,12 @@ def run_rpc_worker(
             if runtime_cfg.backend_kind == RPC_BACKEND_KIND_FLUXON:
                 rpc_store = getattr(benchmark_node, "_fluxon_rpc_store", None)
                 if rpc_store is None:
-                    if benchmark_node.kv_store is None:
-                        raise RuntimeError("RPC benchmark requires kv_store to be initialized")
-                    rpc_store = _FluxonRpcStore(benchmark_node.kv_store)
+                    fluxon_client = benchmark_node.fluxon_client
+                    if fluxon_client is None:
+                        raise RuntimeError(
+                            "Fluxon RPC benchmark requires the canonical Fluxon client"
+                        )
+                    rpc_store = _FluxonRpcStore(fluxon_client)
                     attach_phase_callback = getattr(
                         benchmark_node,
                         "_attach_fluxon_phase_summary_callback",

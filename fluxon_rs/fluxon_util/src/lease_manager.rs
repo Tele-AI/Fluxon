@@ -7,7 +7,8 @@ mod lifecycle;
 pub use lease_backend_handle::LeaseBackendHandle;
 pub use lease_backend_uid::{LeaseBackendUid, LeaseRegisterKind, LeaseType};
 pub use lease_handle::GeneralLease;
-pub use lease_handle::{GLOBAL_LM, LeaseManager};
+pub use lease_handle::{LeaseManager, GLOBAL_LM};
 pub use lifecycle::{
-    debug_keepalive_log, get_register_by, record_register_by, snapshot_active_lease_debug,
+    debug_keepalive_log, get_register_by, record_register_by, registered_etcd_client,
+    snapshot_active_lease_debug,
 };

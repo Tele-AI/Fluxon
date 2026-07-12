@@ -64,16 +64,20 @@ impl GeneralLease {
 
 impl Drop for GeneralLease {
     fn drop(&mut self) {
-        // Instrument drop of the high-level lease handle so we can correlate
-        // who released the last user-visible handle.
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+
+        // Backtraces are useful for lifecycle diagnostics but are expensive in
+        // a large MPMC teardown, so capture them only when debug logging is on.
         let lease_id = self.id();
         let kind_str = match self.kind() {
             LeaseType::Etcd => "Etcd",
             LeaseType::KvClient => "KvClient",
         };
         let label = super::lifecycle::get_register_by(lease_id);
-        let bt = std::backtrace::Backtrace::force_capture();
-        tracing::info!(
+        let bt = std::backtrace::Backtrace::capture();
+        tracing::debug!(
             lease_id,
             kind = kind_str,
             label = %label.clone().unwrap_or_else(|| "".to_string()),

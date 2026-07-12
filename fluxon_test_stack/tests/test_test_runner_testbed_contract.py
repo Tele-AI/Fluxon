@@ -70,6 +70,58 @@ def _suite_cfg_with_declared_ci_commands(command_map: dict[str, list[dict]]) -> 
 
 
 class TestTestRunnerTestbedContract(unittest.TestCase):
+    def test_test_stack_result_cache_waits_for_complete_valid_snapshot(self) -> None:
+        snapshots = iter(
+            [
+                '{"runs":',
+                '{"runs":[{"completion":{"status":"SUCCESS"}}]}',
+            ]
+        )
+
+        class Context:
+            @staticmethod
+            def _instance_read_text_if_present(*_args, **_kwargs):
+                return next(snapshots)
+
+            @staticmethod
+            def _require_dict(value, _label):
+                if not isinstance(value, dict):
+                    raise TypeError("expected dict")
+                return value
+
+            @staticmethod
+            def _require_list(value, _label):
+                if not isinstance(value, list):
+                    raise TypeError("expected list")
+                return value
+
+            @staticmethod
+            def _require_str(value, _label):
+                if not isinstance(value, str):
+                    raise TypeError("expected str")
+                return value
+
+        with tempfile.TemporaryDirectory() as td:
+            result_path = Path(td) / "benchmark_result.json"
+            wait_impl = _RUNNER._wait_and_load_test_stack_benchmark_result_json_impl
+            wait_globals = wait_impl.__globals__
+            with mock.patch.object(wait_globals["time"], "sleep", return_value=None):
+                result = wait_impl(
+                    ctx=Context(),
+                    resolved_case={},
+                    result_path=result_path,
+                    timeout_s=5,
+                    case_id="case-a",
+                    writer_instance_id="coordinator",
+                )
+
+            self.assertEqual(result["runs"][0]["completion"]["status"], "SUCCESS")
+            self.assertEqual(
+                json.loads(result_path.read_text(encoding="utf-8")),
+                result,
+            )
+            self.assertFalse(result_path.with_suffix(".json.tmp").exists())
+
     def test_runtime_nofile_prelude_supports_github_hosted_hard_limit(self) -> None:
         prelude = _RUNNER._test_stack_runtime_nofile_prelude_command()
         completed = subprocess.run(

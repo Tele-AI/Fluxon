@@ -25,7 +25,7 @@ from benchmark_role_names import (
 )
 from fluxon_py import FluxonKvClientConfig as KVCacheConfig
 from fluxon_py import new_store
-from fluxon_py.kvclient.kvclient_interface import KvClient, KvLeaseApi, PutOptionalArgs
+from fluxon_py.kvclient.kvclient_interface import KvClient, PutOptionalArgs
 
 TEST_MODE_MPMC = "MPMC"
 TEST_MODE_KVSTORE = "KVSTORE"
@@ -1861,80 +1861,17 @@ def _sanitize_benchmark_client_kvcache_config(kvcache_config: dict[str, Any]) ->
     return sanitized
 
 
-class FluxonBlockingStore(KvLeaseApi):
+class FluxonBlockingStore:
     def __init__(self, store: KvClient) -> None:
         self.backend_kind = BACKEND_KIND_FLUXON
         self._store = store
         self._phase_profiler = _FluxonPhaseProfiler()
 
     @property
-    def _client(self) -> Any:
-        return self._store._client  # type: ignore[attr-defined]
+    def kv_client(self) -> KvClient:
+        """Return the uniquely owned client for MQ and RPC control paths."""
 
-    def put(
-        self,
-        key: str,
-        value: dict[str, Union[int, float, bool, str, bytes, bytearray, memoryview]],
-        opts: Optional[PutOptionalArgs] = None,
-    ) -> Any:
-        return self._store.put(key, value, opts=opts)
-
-    def get(self, key: str) -> Any:
-        return self._store.get(key)
-
-    def get_size(self, key: str) -> Any:
-        return self._store.get_size(key)
-
-    def is_exist(self, key: str) -> Any:
-        return self._store.is_exist(key)
-
-    def remove(self, key: str) -> Any:
-        return self._store.remove(key)
-
-    def sync_kv_to_file(
-        self,
-        key: str,
-        target_instance_key: str,
-        filepath: str,
-        file_offset: int,
-        bytes_field_key: str,
-        timeout_ms: int = 60_000,
-    ) -> Any:
-        return self._store.sync_kv_to_file(
-            key,
-            target_instance_key,
-            filepath,
-            file_offset,
-            bytes_field_key,
-            timeout_ms=timeout_ms,
-        )
-
-    def instance_key(self) -> Any:
-        return self._store.instance_key()
-
-    def config(self) -> Any:
-        return self._store.config()
-
-    def get_cluster_name(self) -> str:
-        return self._store.get_cluster_name()
-
-    def get_etcd_config(self) -> List[str]:
-        return self._store.get_etcd_config()
-
-    def third_party_logs_dir(self) -> Any:
-        return self._store.third_party_logs_dir()
-
-    def ensure_zero_contribution_for_channel(self) -> None:
-        self._store.ensure_zero_contribution_for_channel()
-
-    def count_prefix(self, prefix: str) -> Any:
-        return self._store.count_prefix(prefix)
-
-    def allocate_lease(self, ttl_seconds: int) -> Any:
-        return self._store.allocate_lease(ttl_seconds)
-
-    def keepalive_lease(self, lease_id: int) -> Any:
-        return self._store.keepalive_lease(lease_id)
+        return self._store
 
     def put_blocking(
         self,
@@ -2035,32 +1972,6 @@ class FluxonBlockingStore(KvLeaseApi):
         except Exception as exc:
             _bench_kv_print(f"{ctx} GET exception key={key!r} err={exc}")
             return f"GET exception: {exc}"
-
-    def rpc_register(self, path: str, handler: Any) -> Any:
-        return self._store.rpc_register(path, handler)
-
-    def rpc_register_bytes(self, path: str, handler: Any) -> Any:
-        return self._store.rpc_register_bytes(path, handler)
-
-    def rpc_call(
-        self,
-        target_instance_key: str,
-        path: str,
-        payload: Dict[str, Any],
-        *,
-        timeout_ms: int,
-    ) -> Any:
-        return self._store.rpc_call(target_instance_key, path, payload, timeout_ms=timeout_ms)
-
-    def rpc_call_bytes(
-        self,
-        target_instance_key: str,
-        path: str,
-        payload: bytes,
-        *,
-        timeout_ms: int,
-    ) -> Any:
-        return self._store.rpc_call_bytes(target_instance_key, path, payload, timeout_ms=timeout_ms)
 
     def close(self) -> _SimpleResult:
         try:

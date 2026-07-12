@@ -100,10 +100,16 @@ pub enum LeaseRegisterKind {
     /// Register an etcd lease id that may already have existed before this call.
     /// Registration validates the lease with an initial keepalive probe.
     Etcd,
-    /// Register an etcd lease id that was just granted by the caller on the same
-    /// backend. The grant itself proves lease existence, so registration skips
-    /// the initial keepalive probe and only installs the periodic keepalive actor.
-    EtcdNewlyGranted,
+    /// Register an etcd lease id whose existence the caller has already validated
+    /// on the same backend. A fresh grant and a parent-owned MPMC lease both satisfy
+    /// this contract, so registration only installs the periodic keepalive actor.
+    EtcdValidated,
+    /// Register a kvclient lease whose existence is guaranteed by the caller's
+    /// owning control plane. Registration installs periodic keepalive without a
+    /// duplicate synchronous probe.
+    KvClientValidated {
+        register_by: String,
+    },
     KvClient {
         register_by: String,
     },

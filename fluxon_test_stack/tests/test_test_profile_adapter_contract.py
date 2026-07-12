@@ -276,6 +276,12 @@ class TestTestProfileAdapterContract(unittest.TestCase):
             )
             coord_tail = (run_dir / "logs" / "coordinator" / "workload_log_tail.txt").read_text(encoding="utf-8")
             self.assertEqual(coord_tail, "coord tail\n")
+            coord_diag = json.loads(
+                (run_dir / "logs" / "coordinator" / "workload_log_tail.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(coord_diag["request"]["direction"], "Forward")
             node_diag = json.loads((run_dir / "logs" / "node_0" / "workload_log_tail.json").read_text(encoding="utf-8"))
             self.assertEqual(node_diag["status_code"], 400)
             self.assertEqual(node_diag["response"]["err"], "log file is not available yet")

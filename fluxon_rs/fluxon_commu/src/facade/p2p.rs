@@ -1330,20 +1330,22 @@ pub mod rpc {
                     if matches!(err, P2pError::InvalidRpcTimeout { .. }) {
                         return Err(err);
                     }
-                    warn!(
-                        "RPC call failed with error={:?}, retrying in 5 seconds, msg_id={}",
-                        err,
-                        req.msg_id()
-                    );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
                     failed_count += 1;
+                    if attempt_idx + 1 < retry {
+                        warn!(
+                            "RPC call failed with error={:?}, retrying in 5 seconds, msg_id={}",
+                            err,
+                            req.msg_id()
+                        );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
         }
 
         Err(P2pError::Timeout {
             detail: format!(
-                "RPC call failed with retry {} times, msg_id: {}",
+                "RPC call failed after {} attempts, msg_id: {}",
                 retry,
                 req.msg_id()
             ),

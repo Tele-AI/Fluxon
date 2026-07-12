@@ -5,7 +5,13 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+import sys
+from pathlib import Path
 from unittest import mock
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from fluxon_py.api_error import OkNone, Result
 from fluxon_py.kvclient.fluxon import FluxonKVCacheStore

@@ -19,10 +19,10 @@ class MqShutdownCtl:
         self._next_callback_id = 0
         self._close_callbacks: Dict[int, Callable[[], None]] = {}
 
-    def register_construction_cancel(
+    def register_construction_shutdown(
         self, callback: Callable[[], None]
     ) -> Callable[[], None]:
-        """Register construction-time cancellation owned by an inner object."""
+        """Register a shutdown signal owned by an in-flight inner construction."""
 
         with self._callback_lock:
             if self.closed:
@@ -44,7 +44,7 @@ class MqShutdownCtl:
         return unregister
 
     def close(self) -> None:
-        """Publish shutdown and cancel registered in-flight construction."""
+        """Publish shutdown and notify registered in-flight constructions."""
 
         with self._callback_lock:
             self.closed = True
