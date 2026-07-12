@@ -39,8 +39,10 @@ import yaml
 
 RUNNER_REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNNER_DEPLOYMENT_DIR = RUNNER_REPO_ROOT / "deployment"
+RUNNER_DEPLOYMENT_UTILS_DIR = RUNNER_DEPLOYMENT_DIR / "utils"
 RUNNER_TEMPLATE_DIR = (RUNNER_REPO_ROOT / "fluxon_test_stack" / "test_runner_templates").resolve()
 sys.path.insert(0, str(RUNNER_DEPLOYMENT_DIR))
+sys.path.insert(0, str(RUNNER_DEPLOYMENT_UTILS_DIR))
 
 from benchmark_role_names import (
     KV_NODE_ROLE_SEED,
@@ -56,7 +58,7 @@ from top_attention_index_helper import (
     run_top_attention_entries,
     select_top_attention_entries,
 )
-from utils import log_shard
+import log_shard
 from test_runner_ci_runtime import (
     _assert_ci_runtime_python_abi as _assert_ci_runtime_python_abi_impl,
     _ci_runtime_python_abi as _ci_runtime_python_abi_impl,
@@ -169,6 +171,7 @@ CI_OWNER_SHARED_BUNDLE_RELPATHS = ("services/share_mem/shared.json", "services/s
 CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S = 600
 CI_RUNNER_READINESS_PROBE_DEADLINE_S = 120
 CI_RUNNER_EXIT_CODE_GRACE_TIMEOUT_S = 300
+TEST_STACK_RUNTIME_NOFILE_LIMIT = 65536
 TEST_STACK_REMOTE_STAGE_SHARED_INCLUDE_RELPATHS = (
     "benchmark_config.py",
     "deployer_deploy.yaml",
@@ -12648,7 +12651,7 @@ def _test_stack_runtime_module_command(
 
 
 def _test_stack_runtime_nofile_prelude_command() -> str:
-    nofile_limit = 1048576
+    nofile_limit = TEST_STACK_RUNTIME_NOFILE_LIMIT
     return (
         f"ulimit -n {nofile_limit}\n"
         + 'nofile_after="$(ulimit -n)"\n'

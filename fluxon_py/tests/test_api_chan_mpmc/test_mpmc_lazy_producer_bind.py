@@ -344,12 +344,6 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
             def __init__(self, api):
                 self.api = api
 
-            @staticmethod
-            def new_shutdown_ctl():
-                shutdown_ctl = _BindShutdownCtl()
-                created_shutdown_ctls.append(shutdown_ctl)
-                return shutdown_ctl
-
             def new_producer(self, *args):
                 bind_shutdown_ctl = args[-1]
                 bind_entered.set()
@@ -360,11 +354,20 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
             def close(self):
                 return
 
+        class _ShutdownCtlFactory:
+            @staticmethod
+            def new_shutdown_ctl():
+                shutdown_ctl = _BindShutdownCtl()
+                created_shutdown_ctls.append(shutdown_ctl)
+                return shutdown_ctl
+
         parent_shutdown_ctl = MqShutdownCtl()
         errors = []
         old_context = mpsc_module.MpscContext
+        old_rust_context = mpsc_module._RustMpscContext
         old_validate = mpsc_module.validate_mpsc_config
         mpsc_module.MpscContext = _BlockingMpscContext
+        mpsc_module._RustMpscContext = _ShutdownCtlFactory
         mpsc_module.validate_mpsc_config = lambda config, role: {
             "ttl_seconds": 60,
             "capacity": 1,
@@ -384,6 +387,7 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
             worker.join(timeout=1.0)
         finally:
             mpsc_module.MpscContext = old_context
+            mpsc_module._RustMpscContext = old_rust_context
             mpsc_module.validate_mpsc_config = old_validate
 
         self.assertFalse(worker.is_alive())

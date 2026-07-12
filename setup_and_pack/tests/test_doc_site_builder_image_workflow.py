@@ -70,6 +70,8 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertIn("logs/ci_runner/inflight_attempt.txt", workflow_text)
         self.assertIn("benchmark_result.json", workflow_text)
         self.assertIn("deploy_result.yaml", workflow_text)
+        self.assertIn('run_dir.glob("logs/*/status.yaml")', workflow_text)
+        self.assertIn('run_dir.glob("logs/*/workload_log_tail.txt")', workflow_text)
         self.assertNotIn("Print ci_2_virt_node failure summary", workflow_text)
         self.assertIn("doc_site_base_url", workflow_text)
         self.assertIn("rather_no_git_submodule.py", workflow_text)

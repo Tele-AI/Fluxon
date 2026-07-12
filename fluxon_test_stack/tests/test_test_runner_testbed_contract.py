@@ -70,6 +70,29 @@ def _suite_cfg_with_declared_ci_commands(command_map: dict[str, list[dict]]) -> 
 
 
 class TestTestRunnerTestbedContract(unittest.TestCase):
+    def test_runtime_nofile_prelude_supports_github_hosted_hard_limit(self) -> None:
+        prelude = _RUNNER._test_stack_runtime_nofile_prelude_command()
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                (
+                    "set -euo pipefail\n"
+                    "ulimit -Sn 1024\n"
+                    "ulimit -Hn 65536\n"
+                    f"{prelude}"
+                    "ulimit -Sn\n"
+                ),
+            ],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "65536")
+        self.assertNotIn("1048576", prelude)
+
     def test_http_get_json_retries_connection_reset(self) -> None:
         class _Response:
             status = 200

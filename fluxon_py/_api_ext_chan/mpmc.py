@@ -18,6 +18,7 @@ from ..api_error import Result, ApiError, OkNone, OK_NONE, ApiTimeoutError
 from ..api_error import InvalidArgumentError
 from ..kvclient.kvclient_interface import DLPacked
 from .mpsc import (
+    ConsumedMessage,
     MPSCChanProducer,
     MPSCChanConsumer,
     ChanRole,
@@ -1230,7 +1231,9 @@ class MPMCChannel(FactoryOnly):
                     # Only create if the lock-protected recheck still found no
                     # claimable unready channel and active consumers outnumber
                     # the existing sub-MPSC count.
-                    active_consumers = self._get_active_consumer_count()
+                    active_consumers = len(
+                        self.get_active_member_ids(ChanRole.CONSUMER)
+                    )
                     if active_consumers <= len(current_mpscs):
                         return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(ChanCreateError("Not enough active consumers to create new channel"))
                 else:
@@ -1440,7 +1443,9 @@ class MPMCChannel(FactoryOnly):
                                 )
                             )
 
-                        active_consumers = self._get_active_consumer_count()
+                        active_consumers = len(
+                            self.get_active_member_ids(ChanRole.CONSUMER)
+                        )
                         if active_consumers <= len(latest_mpscs):
                             close_unpublished_channel(
                                 mpsc_consumer,
@@ -1480,15 +1485,6 @@ class MPMCChannel(FactoryOnly):
                 return Result.new_ok(published_channel)
             return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(ChanCreateError(f"Failed to create MPSC channel: {e}"))
     
-    def _get_active_consumer_count(self) -> int:
-        """
-        Get the count of active consumers for this MPMC channel.
-        
-        Returns:
-            int: Number of active consumers
-        """
-        return len(self.get_active_member_ids(ChanRole.CONSUMER))
-
     def get_active_member_ids(self, role: ChanRole) -> List[int]:
         """Return active MPMC member ids for one role."""
 
@@ -2624,21 +2620,6 @@ class MPMCChanConsumer(ChannelConsumer):
                     )
                 )
 
-            # Get data from MPSC consumer (will automatically return producer info when MPSC acts as submodule)
-            from .mpsc import ConsumedMessage
-            # # Map MPMC-level prefetch to per-MPSC prefetch: divide by active MPMC consumers, ceil, min divisor=1
-            # try:
-            #     active_consumers = self.mpmc_channel._get_active_consumer_count()
-            # except Exception as e:  # noqa: BLE001
-            #     logging.warning(
-            #         f"[Unreachable] Failed to get active consumer count: {e}"
-            #     )
-            #     active_consumers = 0
-
-            # # ceil division without importing math: (a + b - 1) // b
-            # mapped_prefetch = 0
-            # if prefetch_num > 0 and active_consumers > 0:
-            #     mapped_prefetch = (prefetch_num + active_consumers - 1) // active_consumers
             result = self.mpsc_consumer.get_data(
                 batch_size, try_time, prefetch_num=prefetch_num
             )

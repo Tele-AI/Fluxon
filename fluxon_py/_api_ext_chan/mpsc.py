@@ -308,10 +308,6 @@ class MpscContext:
             )
         self._inner = _RustMpscContext(etcd_endpoints, self.kv_backend_uid, raw)
 
-    @staticmethod
-    def new_shutdown_ctl() -> Any:
-        return _RustMpscContext.new_shutdown_ctl()
-
     def new_producer(
         self,
         chan_id: Optional[str],
@@ -405,7 +401,7 @@ class MPSCChanProducer(ChannelProducer):
     ) -> None:
         # Lifecycle safety: initialize critical fields first so close() can be
         # invoked without hasattr/getattr checks even if construction fails.
-        self._handle_shutdown_ctl = MpscContext.new_shutdown_ctl()
+        self._handle_shutdown_ctl = _RustMpscContext.new_shutdown_ctl()
         self._parent_mpmc_id = parent_mpmc_id_opt
         self._ctx = _NoopCloseable()
         self._handle = None  # type: ignore[assignment]

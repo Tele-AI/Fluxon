@@ -1033,6 +1033,7 @@ class PreparedMPMCRound:
     prepared_lock: threading.Lock = field(default_factory=threading.Lock)
     endpoint_close_lock: threading.Lock = field(default_factory=threading.Lock)
     start_event: threading.Event = field(default_factory=threading.Event)
+    benchmark_deadline_ts: Optional[float] = None
 
 
 @dataclass
@@ -3050,22 +3051,19 @@ class BenchmarkNode:
         while True:
             snapshot = get_cluster_info_snapshot(endpoint)
             ready_channels = snapshot.ready_channels
-            total_mpsc_channels = snapshot.total_mpsc_channels
             active_consumers = snapshot.active_consumers
             readiness = evaluate_mpmc_topology_ready(
                 role=role,
                 expected_workers=expected_workers,
-                total_mpsc_channels=total_mpsc_channels,
                 ready_channels=ready_channels,
                 active_consumers=active_consumers,
             )
             if readiness.ready:
                 logger.info(
-                    "✅ MPMC topology ready: role=%s expected_workers=%s mpmc_id=%s total_mpsc_channels=%s ready_channels=%s active_consumers=%s",
+                    "✅ MPMC topology ready: role=%s expected_workers=%s mpmc_id=%s ready_channels=%s active_consumers=%s",
                     role,
                     expected_workers,
                     snapshot.mpmc_id,
-                    total_mpsc_channels,
                     ready_channels,
                     active_consumers,
                 )
@@ -3075,17 +3073,16 @@ class BenchmarkNode:
                 raise RuntimeError(
                     "MPMC topology did not become ready before timeout: "
                     f"role={role} expected_workers={expected_workers} "
-                    f"mpmc_id={snapshot.mpmc_id} total_mpsc_channels={total_mpsc_channels} "
+                    f"mpmc_id={snapshot.mpmc_id} "
                     f"ready_channels={ready_channels} active_consumers={active_consumers} "
                     f"reason={readiness.reason}"
                 )
             if readiness.reason != last_wait_reason or now - last_wait_log_ts >= 10.0:
                 logger.info(
-                    "⏳ MPMC topology waiting: role=%s expected_workers=%s mpmc_id=%s total_mpsc_channels=%s ready_channels=%s active_consumers=%s reason=%s",
+                    "⏳ MPMC topology waiting: role=%s expected_workers=%s mpmc_id=%s ready_channels=%s active_consumers=%s reason=%s",
                     role,
                     expected_workers,
                     snapshot.mpmc_id,
-                    total_mpsc_channels,
                     ready_channels,
                     active_consumers,
                     readiness.reason,
@@ -3112,43 +3109,20 @@ class BenchmarkNode:
 
         while True:
             snapshot = get_cluster_info_snapshot(runtime.producer)
-            channel_ids = snapshot.mpsc_channel_ids
             ready_channel_ids = snapshot.ready_channel_ids
             active_consumers = snapshot.active_consumers
 
-            if channel_ids is None or ready_channel_ids is None or active_consumers is None:
-                reason = (
-                    "incomplete authority snapshot: "
-                    f"channels={channel_ids} ready={ready_channel_ids} "
-                    f"active_consumers={active_consumers}"
-                )
-                stable_key = None
-            elif len(channel_ids) != expected_channels:
-                reason = (
-                    "channel count mismatch: "
-                    f"actual={len(channel_ids)} expected={expected_channels} ids={channel_ids}"
-                )
-                stable_key = None
-            elif len(ready_channel_ids) != expected_channels:
+            if len(ready_channel_ids) != expected_channels:
                 reason = (
                     "ready channel count mismatch: "
                     f"actual={len(ready_channel_ids)} expected={expected_channels} "
                     f"ids={ready_channel_ids}"
                 )
                 stable_key = None
-            elif len(set(channel_ids)) != expected_channels:
-                reason = f"channel authority contains duplicate ids: ids={channel_ids}"
-                stable_key = None
             elif len(set(ready_channel_ids)) != expected_channels:
                 reason = f"ready channel authority contains duplicate ids: ids={ready_channel_ids}"
                 stable_key = None
-            elif set(channel_ids) != set(ready_channel_ids):
-                reason = (
-                    "ready channel set differs from channel authority: "
-                    f"channels={channel_ids} ready={ready_channel_ids}"
-                )
-                stable_key = None
-            elif int(active_consumers) != expected_channels:
+            elif active_consumers != expected_channels:
                 reason = (
                     "active consumer count mismatch: "
                     f"actual={active_consumers} expected={expected_channels}"
@@ -3157,9 +3131,8 @@ class BenchmarkNode:
             else:
                 stable_key = (
                     snapshot.mpmc_id,
-                    channel_ids,
                     ready_channel_ids,
-                    int(active_consumers),
+                    active_consumers,
                 )
                 reason = "ready"
 
@@ -3171,9 +3144,9 @@ class BenchmarkNode:
                     stable_observations = 1
                 if stable_observations >= 2:
                     logger.info(
-                        "✅ MPMC prefeed topology stable: expected_channels=%s channel_ids=%s",
+                        "✅ MPMC prefeed topology stable: expected_channels=%s ready_channel_ids=%s",
                         expected_channels,
-                        channel_ids,
+                        ready_channel_ids,
                     )
                     return snapshot
             else:
@@ -3216,12 +3189,7 @@ class BenchmarkNode:
             runtime=runtime,
             timeout_s=timeout_s,
         )
-        channel_ids = getattr(snapshot, "mpsc_channel_ids", None)
-        if channel_ids is None:
-            raise RuntimeError(
-                f"MPMC producer prefeed cannot determine channel ids: thread_id={thread_id}"
-            )
-        channel_ids = tuple(str(channel_id) for channel_id in channel_ids)
+        channel_ids = snapshot.ready_channel_ids
         total_mpsc_channels = len(channel_ids)
         if total_mpsc_channels <= 0:
             raise RuntimeError(
@@ -3296,7 +3264,7 @@ class BenchmarkNode:
             runtime=runtime,
             timeout_s=max(0.001, prefeed_deadline_ts - time.monotonic()),
         )
-        final_channel_ids = tuple(getattr(final_snapshot, "mpsc_channel_ids", ()) or ())
+        final_channel_ids = final_snapshot.ready_channel_ids
         if final_channel_ids != channel_ids:
             raise RuntimeError(
                 "MPMC channel topology changed during prefeed: "
@@ -3397,11 +3365,19 @@ class BenchmarkNode:
                     round_state.ready_thread_ids.add(thread_id)
                 logger.info("✅ 线程 %s 已完成 MPMC endpoint prepare", thread_id)
                 round_state.start_event.wait()
-                result_list = self._run_worker_thread(
-                    thread_id,
-                    0.0,
-                    prepared_runtime=runtime,
-                )
+                if self._benchmark_stop.is_set():
+                    result_list = []
+                else:
+                    deadline_ts = round_state.benchmark_deadline_ts
+                    if deadline_ts is None:
+                        raise RuntimeError(
+                            "MPMC benchmark deadline must be published before worker start"
+                        )
+                    result_list = self._run_worker_thread(
+                        thread_id,
+                        deadline_ts,
+                        prepared_runtime=runtime,
+                    )
                 if role == "producer":
                     _debug_print(
                         f"worker {thread_id} wrapper done, ops={len(result_list)}"
@@ -5382,13 +5358,12 @@ class BenchmarkNode:
                 total_workers=workers,
             )
 
-    def _run_mpmc_workers(self, *, workers: int, deadline_ts: float) -> None:
+    def _run_mpmc_workers(self, *, workers: int) -> None:
         round_state = self._consume_prepared_mpmc_round(expected_workers=workers)
         try:
             self._run_mpmc_round(
                 round_state=round_state,
                 workers=workers,
-                deadline_ts=deadline_ts,
             )
         finally:
             self._finish_mpmc_round(
@@ -5401,7 +5376,6 @@ class BenchmarkNode:
         *,
         round_state: PreparedMPMCRound,
         workers: int,
-        deadline_ts: float,
     ) -> None:
         """Run operations while the caller retains round resource ownership."""
         pending_threads = dict(round_state.pending_threads)
@@ -5501,6 +5475,7 @@ class BenchmarkNode:
         self.start_time = time.time()
         self.end_time = self.start_time + int(self.test_config["max_benchmark_seconds"])
         deadline_ts = self.end_time
+        round_state.benchmark_deadline_ts = deadline_ts
         self._start_network_bandwidth_sampler()
         self._start_heartbeat()
         round_state.start_event.set()
@@ -5627,7 +5602,7 @@ class BenchmarkNode:
             if test_mode == TestMode.MPMC.value:
                 self.start_time = None
                 self.end_time = None
-                self._run_mpmc_workers(workers=threads_per_process, deadline_ts=0.0)
+                self._run_mpmc_workers(workers=threads_per_process)
             else:
                 self.start_time = time.time()
                 max_benchmark_seconds = int(self.test_config["max_benchmark_seconds"])

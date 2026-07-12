@@ -468,7 +468,6 @@ class TestMPMCReadinessContract(unittest.TestCase):
         readiness = evaluate_mpmc_topology_ready(
             role="consumer",
             expected_workers=1,
-            total_mpsc_channels=1,
             ready_channels=0,
             active_consumers=1,
         )
@@ -479,14 +478,12 @@ class TestMPMCReadinessContract(unittest.TestCase):
         no_ready_channel = evaluate_mpmc_topology_ready(
             role="producer",
             expected_workers=1,
-            total_mpsc_channels=1,
             ready_channels=0,
             active_consumers=1,
         )
         no_consumer = evaluate_mpmc_topology_ready(
             role="producer",
             expected_workers=1,
-            total_mpsc_channels=1,
             ready_channels=1,
             active_consumers=0,
         )
@@ -495,6 +492,52 @@ class TestMPMCReadinessContract(unittest.TestCase):
         self.assertIn("ready_channels", no_ready_channel.reason)
         self.assertFalse(no_consumer.ready)
         self.assertIn("active_consumers", no_consumer.reason)
+
+    def test_cluster_info_snapshot_uses_typed_ready_channel_authority(self) -> None:
+        from fluxon_py.api_ext_chan import ChanRole, MPMCChanProducer
+        from fluxon_test_stack.benchmark_node_mq import get_cluster_info_snapshot
+
+        class FakeChannel:
+            def get_remote_ready_channels(self):
+                return ["12", "11"]
+
+            def get_active_member_ids(self, role):
+                self_role = role
+                self.assert_role = self_role
+                return [21, 22]
+
+        channel = FakeChannel()
+
+        class FakeProducer(MPMCChanProducer):
+            def __init__(self) -> None:
+                self.mpmc_channel = channel
+
+            def get_chan_id(self) -> str:
+                return "7"
+
+            def __del__(self) -> None:
+                pass
+
+        snapshot = get_cluster_info_snapshot(FakeProducer())
+
+        self.assertEqual(channel.assert_role, ChanRole.CONSUMER)
+        self.assertEqual(snapshot.mpmc_id, "7")
+        self.assertEqual(snapshot.active_consumers, 2)
+        self.assertEqual(snapshot.ready_channel_ids, ("11", "12"))
+        self.assertEqual(snapshot.ready_channels, 2)
+
+    def test_cluster_info_snapshot_rejects_duck_typed_endpoint(self) -> None:
+        from fluxon_test_stack.benchmark_node_mq import get_cluster_info_snapshot
+
+        endpoint = SimpleNamespace(
+            get_chan_id=lambda: "7",
+            mpmc_channel=SimpleNamespace(
+                get_remote_ready_channels=lambda: ["11"],
+            ),
+        )
+
+        with self.assertRaisesRegex(TypeError, "MPMCChanProducer or MPMCChanConsumer"):
+            get_cluster_info_snapshot(endpoint)
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
     def test_worker_owned_kvcache_config_sets_per_worker_identity_and_port(self) -> None:
@@ -1153,10 +1196,71 @@ class TestMPMCReadinessContract(unittest.TestCase):
             wait_call,
         )
         start_time_set = node_source.index("self.start_time = time.time()", wait_call)
+        deadline_publish = node_source.index(
+            "round_state.benchmark_deadline_ts = deadline_ts",
+            start_time_set,
+        )
         start_event_set = node_source.index("round_state.start_event.set()", start_time_set)
         self.assertLess(prefeed_drain_call, wait_call)
         self.assertLess(wait_call, start_time_set)
+        self.assertLess(start_time_set, deadline_publish)
+        self.assertLess(deadline_publish, start_event_set)
         self.assertLess(start_time_set, start_event_set)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_consumer_receives_deadline_created_after_runtime_start(self) -> None:
+        class ConsumerNode(BenchmarkNode):
+            def __init__(self) -> None:
+                super().__init__()
+                self.runtime_start_release_ts = 0.0
+                self.worker_deadlines = []
+
+            def _prepare_mpmc_worker_runtime_with_retry(self, **kwargs) -> PreparedWorkerRuntime:
+                return PreparedWorkerRuntime(consumer=_FakeClosableEndpoint())
+
+            def _wait_mpmc_cluster_ready(self, **kwargs) -> None:
+                return None
+
+            def _consume_mpmc_prefeed_messages(self, **kwargs) -> None:
+                return None
+
+            def _wait_for_mpmc_runtime_start(self) -> bool:
+                self.runtime_start_release_ts = time.time()
+                return True
+
+            def _start_network_bandwidth_sampler(self) -> None:
+                return None
+
+            def _start_heartbeat(self) -> None:
+                return None
+
+            def _run_worker_thread(
+                self,
+                thread_id,
+                deadline_ts,
+                *,
+                prepared_runtime=None,
+            ):
+                self.worker_deadlines.append(deadline_ts)
+                return []
+
+        node = ConsumerNode()
+        node.test_config = {
+            "node_role": "consumer",
+            "test_mode": TestMode.MPMC.value,
+            "cluster_ready_timeout_seconds": 5,
+            "threads_per_process": 1,
+            "max_benchmark_seconds": 90,
+        }
+
+        node._prepare_mpmc_round_before_ready(workers=1)
+        node._run_mpmc_workers(workers=1)
+
+        self.assertIsNotNone(node.start_time)
+        self.assertIsNotNone(node.end_time)
+        self.assertGreaterEqual(node.start_time, node.runtime_start_release_ts)
+        self.assertEqual(node.worker_deadlines, [node.end_time])
+        self.assertEqual(node.end_time - node.start_time, 90)
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
     def test_producer_prewarm_before_ready_defers_endpoint_until_start(self) -> None:
@@ -1205,7 +1309,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
 
         run_thread = threading.Thread(
             target=node._run_mpmc_workers,
-            kwargs={"workers": 1, "deadline_ts": 0.0},
+            kwargs={"workers": 1},
         )
         run_thread.start()
         self.assertTrue(node.prepare_started.wait(timeout=1.0))
@@ -1266,7 +1370,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
         }
 
         node._prepare_mpmc_round_before_ready(workers=1)
-        node._run_mpmc_workers(workers=1, deadline_ts=0.0)
+        node._run_mpmc_workers(workers=1)
 
         self.assertEqual(node.events, ["runtime_start"])
         self.assertIsNotNone(node._forced_benchmark_result)
@@ -1324,7 +1428,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
 
             def _wait_mpmc_prefeed_topology(self, **kwargs):
                 self.cluster_ready_calls.append(kwargs)
-                return SimpleNamespace(mpsc_channel_ids=("11", "12", "13"))
+                return SimpleNamespace(ready_channel_ids=("11", "12", "13"))
 
         node = PrefeedNode()
         node.instance_key = "producer_0_proc_0"
@@ -1392,19 +1496,16 @@ class TestMPMCReadinessContract(unittest.TestCase):
         snapshots = [
             SimpleNamespace(
                 mpmc_id="7",
-                mpsc_channel_ids=("11",),
                 ready_channel_ids=("11",),
                 active_consumers=1,
             ),
             SimpleNamespace(
                 mpmc_id="7",
-                mpsc_channel_ids=("11", "12"),
                 ready_channel_ids=("11", "12"),
                 active_consumers=2,
             ),
             SimpleNamespace(
                 mpmc_id="7",
-                mpsc_channel_ids=("11", "12"),
                 ready_channel_ids=("11", "12"),
                 active_consumers=2,
             ),
@@ -1420,7 +1521,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
                 timeout_s=5.0,
             )
 
-        self.assertEqual(snapshot.mpsc_channel_ids, ("11", "12"))
+        self.assertEqual(snapshot.ready_channel_ids, ("11", "12"))
         self.assertEqual(snapshot_mock.call_count, 3)
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
@@ -1552,7 +1653,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
         }
 
         node._prepare_mpmc_round_before_ready(workers=1)
-        node._run_mpmc_workers(workers=1, deadline_ts=0.0)
+        node._run_mpmc_workers(workers=1)
 
         self.assertTrue(node.runtime_start_checked)
         self.assertEqual(node.events, ["prefeed", "runtime_start"])

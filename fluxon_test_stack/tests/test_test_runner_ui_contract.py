@@ -582,7 +582,15 @@ class TestTestRunnerUiContract(unittest.TestCase):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.bind(("127.0.0.1", 0))
                 port = int(sock.getsockname()[1])
-            with mock.patch.object(_RUNNER, "_ui_discovery_roots", return_value=[service_root.resolve()]):
+            with mock.patch.object(
+                _RUNNER,
+                "_ui_history_list_recent_workdirs",
+                return_value=[],
+            ), mock.patch.object(
+                _RUNNER,
+                "_ui_discovery_roots",
+                return_value=[service_root.resolve()],
+            ):
                 server_thread = threading.Thread(
                     target=_RUNNER._serve_test_runner_ui,
                     kwargs={

@@ -159,69 +159,50 @@ jobs:
                   "runtime_contract": "rust_self_managed",
                   "scale": "n1_kvowner_dram_3gib",
                   "case_config": False,
-                  "command_variants": [
-                      {
-                          "id_suffix": f"p{producer_count}_c{consumer_count}",
-                          "extra_args": [
-                              "--single-host-logical-targets",
-                              "--testbed-bundle-source",
-                              "__TEST_BED_BUNDLE_ROOT__",
-                              "--workdir",
-                              f"__WORKDIR_ROOT__/largescale_mq_ci_single_host/p{producer_count}_c{consumer_count}",
-                              "--owner-count",
-                              "4",
-                              "--owner-dram-gib",
-                              "1",
-                              "--producer-count",
-                              str(producer_count),
-                              "--consumer-count",
-                              str(consumer_count),
-                              "--threads-per-process",
-                              "1",
-                              "--duration-seconds",
-                              "90",
-                              "--metric-warmup-seconds",
-                              "60",
-                              "--value-size",
-                              "256",
-                              "--op-timeout-seconds",
-                              "5",
-                              "--cluster-ready-timeout-seconds",
-                              "1800",
-                              "--consumer-sim-min-ms",
-                              "1",
-                              "--consumer-sim-max-ms",
-                              "1",
-                          ],
-                      }
-                      for producer_count, consumer_count in ((8, 8), (32, 32), (160, 8))
+                  "extra_args": [
+                      "--single-host-logical-targets",
+                      "--testbed-bundle-source",
+                      "__TEST_BED_BUNDLE_ROOT__",
+                      "--workdir",
+                      "__WORKDIR_ROOT__/largescale_mq_ci_single_host/p160_c8",
+                      "--owner-count",
+                      "4",
+                      "--owner-dram-gib",
+                      "1",
+                      "--producer-count",
+                      "160",
+                      "--consumer-count",
+                      "8",
+                      "--threads-per-process",
+                      "1",
+                      "--duration-seconds",
+                      "90",
+                      "--metric-warmup-seconds",
+                      "60",
+                      "--value-size",
+                      "256",
+                      "--op-timeout-seconds",
+                      "5",
+                      "--cluster-ready-timeout-seconds",
+                      "1800",
+                      "--consumer-sim-min-ms",
+                      "1",
+                      "--consumer-sim-max-ms",
+                      "1",
                   ],
                   "scene_config": {},
               },
           }
 
           for scene_id, scene_def in top_attention_ci_scenes.items():
-              command_variants = scene_def.get("command_variants")
-              if command_variants is None:
-                  commands = [
-                      top_attention_command(
-                          scene_id,
-                          case_config=scene_def["case_config"],
-                          extra_args=scene_def.get("extra_args"),
-                          timeout_seconds=scene_def.get("timeout_seconds", 21600),
-                      )
-                  ]
-              else:
-                  commands = []
-                  for variant in command_variants:
-                      command = top_attention_command(
-                          scene_id,
-                          case_config=scene_def["case_config"],
-                          extra_args=variant["extra_args"],
-                          timeout_seconds=scene_def.get("timeout_seconds", 21600),
-                      )
-                      command["id"] = f"{command['id']}_{variant['id_suffix']}"
-                      commands.append(command)
+              commands = [
+                  top_attention_command(
+                      scene_id,
+                      case_config=scene_def["case_config"],
+                      extra_args=scene_def.get("extra_args"),
+                      timeout_seconds=scene_def.get("timeout_seconds", 21600),
+                  )
+              ]
               existing_scene = suite["scenes"].get(scene_id)
               if existing_scene is None:
                   suite["scenes"][scene_id] = {
@@ -391,6 +372,14 @@ jobs:
                   ):
                       print_file(run_dir / rel)
                   print_tail(run_dir / "logs" / "ci_runner" / "stdout.log", line_count=320)
+                  for path in sorted(run_dir.glob("logs/*/status.yaml")):
+                      print_file(path)
+                  for path in sorted(run_dir.glob("logs/*/workload_log_tail.txt")):
+                      print_tail(path, line_count=160)
+                  for path in sorted(run_dir.glob("logs/*/workload_log_tail.json")):
+                      if path.with_suffix(".txt").exists():
+                          continue
+                      print_tail(path, line_count=160)
 
               for path in sorted(nested_root.glob("*/test_runner.log")):
                   print_tail(path, line_count=320)

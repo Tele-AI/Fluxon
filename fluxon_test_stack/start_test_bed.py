@@ -27,7 +27,7 @@ DEPLOYMENT_UTILS_DIR = DEPLOYMENT_DIR / "utils"
 sys.path.insert(0, str(DEPLOYMENT_DIR))
 sys.path.insert(0, str(DEPLOYMENT_UTILS_DIR))
 import manual_dispatch_release
-from utils import log_shard
+import log_shard
 from selection_runtime import (
     atomic_group_member_selection_workload_name as _selection_atomic_group_member_selection_workload_name,
     daemonset_selection_supervisor_label as _selection_daemonset_supervisor_label,

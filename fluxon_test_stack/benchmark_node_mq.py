@@ -187,54 +187,44 @@ def _verify_message(raw: bytes) -> tuple[bool, str, int, Optional[str]]:
     return True, "", len(raw), str(message_kind)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ClusterInfoSnapshot:
-    """Snapshot of MPMC cluster info for producer/consumer status checks."""
+    """Complete producer-visible MPMC topology observation."""
 
-    mpmc_id: Optional[str] = None
-    active_consumers: Optional[int] = None
-    ready_channels: Optional[int] = None
-    total_mpsc_channels: Optional[int] = None
-    ready_channel_ids: Optional[Tuple[str, ...]] = None
-    mpsc_channel_ids: Optional[Tuple[str, ...]] = None
+    mpmc_id: str
+    active_consumers: int
+    ready_channel_ids: Tuple[str, ...]
 
-    def mq_any_consumer_alive(self) -> bool:
-        """Whether any consumer is alive.
-
-        If active_consumers is None, conservatively assume consumers exist to avoid stopping producers too early.
-        """
-        if self.active_consumers is None:
-            return True
-        return int(self.active_consumers) > 0
+    @property
+    def ready_channels(self) -> int:
+        """Return the number of authoritative ready channel IDs."""
+        return len(self.ready_channel_ids)
 
 
-def get_cluster_info_snapshot(endpoint: Any) -> ClusterInfoSnapshot:
-    """Fetch current ClusterInfoSnapshot from an MPMC endpoint."""
-    chan = getattr(endpoint, "mpmc_channel", None)
-    snapshot = ClusterInfoSnapshot()
-    if chan is None:
-        return snapshot
+def get_cluster_info_snapshot(
+    endpoint: MPMCChanProducer | MPMCChanConsumer,
+) -> ClusterInfoSnapshot:
+    """Read one complete MPMC topology observation from a typed endpoint."""
+    if not isinstance(endpoint, (MPMCChanProducer, MPMCChanConsumer)):
+        raise TypeError(
+            "MPMC topology snapshot requires MPMCChanProducer or MPMCChanConsumer, "
+            f"got {type(endpoint).__name__}"
+        )
 
-    try:
-        snapshot.mpmc_id = getattr(chan, "mpmc_id", None)
-        if hasattr(chan, "_get_active_consumer_count"):
-            snapshot.active_consumers = chan._get_active_consumer_count()  # type: ignore[attr-defined]
-        if hasattr(chan, "get_remote_ready_channels"):
-            ready = chan.get_remote_ready_channels()  # type: ignore[call-arg]
-            ready_ids = tuple(sorted((str(item) for item in (ready or [])), key=int))
-            snapshot.ready_channel_ids = ready_ids
-            snapshot.ready_channels = len(ready_ids)
-        if hasattr(chan, "_get_mpsc_channels_snapshot"):
-            all_channels, _ = chan._get_mpsc_channels_snapshot()  # type: ignore[attr-defined]
-            channel_ids = tuple(
-                sorted((str(item) for item in all_channels), key=int)
-            )
-            snapshot.mpsc_channel_ids = channel_ids
-            snapshot.total_mpsc_channels = len(channel_ids)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Failed to fetch channel info: {exc}")
+    channel = endpoint.mpmc_channel
+    if channel is None:
+        raise RuntimeError("MPMC topology snapshot requires an open endpoint")
 
-    return snapshot
+    ready_channel_ids = channel.get_remote_ready_channels()
+    for channel_id in ready_channel_ids:
+        if not isinstance(channel_id, str) or not channel_id.isdigit():
+            raise ValueError(f"invalid ready MPSC channel ID: {channel_id!r}")
+
+    return ClusterInfoSnapshot(
+        mpmc_id=endpoint.get_chan_id(),
+        active_consumers=len(channel.get_active_member_ids(ChanRole.CONSUMER)),
+        ready_channel_ids=tuple(sorted(ready_channel_ids, key=int)),
+    )
 
 
 def init_mq_channel(

@@ -6265,10 +6265,11 @@ impl DesiredStore {
 
         let apply_path = desired_apply_record_file_path(&self.applies_dir, &apply_id)?;
         if tokio::fs::metadata(&apply_path).await.is_err() {
-            anyhow::bail!(
-                "apply record not found under desired/applies: apply_id={}",
-                apply_id
-            );
+            // Reconcile and wait_delete_apply share finalization ownership. Both
+            // may observe the same drained runtime before either acquires this
+            // persistence guard, so the second finalizer must accept absence as
+            // the already-completed state.
+            return Ok(Vec::new());
         }
 
         let removed: Vec<DesiredWorkload> = {
@@ -15339,5 +15340,32 @@ mod tests {
                 offset: 4,
             })
         );
+    }
+
+    #[test]
+    fn remove_apply_accepts_an_already_finalized_record() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let td = tempfile::tempdir().unwrap();
+            let desired = DesiredStore::load(td.path().join("desired")).await.unwrap();
+            desired
+                .persist_apply_record(&DeployApplyRecord {
+                    id: "apply-1".to_string(),
+                    ts_ms: 1,
+                    deployment_yaml: "kind: Deployment\n".to_string(),
+                    namespace: None,
+                    deployment_yaml_sha256: sha256_hex(b"kind: Deployment\n"),
+                    lifecycle_phase: Some(ApplyLifecyclePhase::DeleteNotifying),
+                    lifecycle_phase_updated_ts_ms: Some(2),
+                })
+                .await
+                .unwrap();
+
+            assert!(desired.remove_apply("apply-1").await.unwrap().is_empty());
+            assert!(desired.remove_apply("apply-1").await.unwrap().is_empty());
+        });
     }
 }

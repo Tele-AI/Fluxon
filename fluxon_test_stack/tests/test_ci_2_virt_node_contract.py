@@ -45,6 +45,22 @@ class TestCi2VirtNodeContract(unittest.TestCase):
     _LOG_MGMT_SCENE_ID = "ci_top_attention_log_mgmt"
     _MQ_SCENE_ID = "ci_top_attention_mq_core"
 
+    def test_all_test_workflow_has_one_p160_c8_largescale_mq_command(self) -> None:
+        workflow = (REPO_ROOT / ".github" / "workflows" / "all_test.yml").read_text(
+            encoding="utf-8"
+        )
+        scene_start = workflow.index('"ci_top_attention_largescale_mq": {')
+        scene_end = workflow.index('          }\n\n          for scene_id', scene_start)
+        scene = workflow[scene_start:scene_end]
+
+        self.assertIn('"__WORKDIR_ROOT__/largescale_mq_ci_single_host/p160_c8"', scene)
+        self.assertIn('"--producer-count",\n                      "160"', scene)
+        self.assertIn('"--consumer-count",\n                      "8"', scene)
+        self.assertIn('"--metric-warmup-seconds",\n                      "60"', scene)
+        self.assertNotIn("command_variants", scene)
+        self.assertNotIn("p8_c8", scene)
+        self.assertNotIn("p32_c32", scene)
+
     def test_generated_suite_is_public_dual_local_nodes_ci_only(self) -> None:
         suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
         generated = _ENTRY._rewrite_suite_for_local_dual_nodes(
