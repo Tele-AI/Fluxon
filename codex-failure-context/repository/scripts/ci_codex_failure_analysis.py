@@ -17,8 +17,6 @@ import zipfile
 
 
 LOG_SUFFIXES = frozenset({".err", ".log", ".out", ".stderr", ".stdout"})
-TESTBED_HOSTWORKDIR_DIRNAME = "fluxon_deploy"
-MIDDLEWARE_LOG_SERVICES = ("etcd", "greptime")
 DIAGNOSTIC_NAMES = frozenset(
     {
         "benchmark_result.json",
@@ -86,16 +84,6 @@ def _should_collect(path: Path) -> bool:
     )
 
 
-def _middleware_log_service(path: Path) -> str | None:
-    """Return the canonical service name for a testbed middleware log."""
-    if path.parent.name.lower() != "log" or path.suffix.lower() != ".log":
-        return None
-    service_name = path.name.split(".", 1)[0].lower()
-    if service_name not in MIDDLEWARE_LOG_SERVICES:
-        return None
-    return service_name
-
-
 def _collect_context(args: argparse.Namespace) -> None:
     repo_root = args.repo_root.resolve()
     runner_temp = args.runner_temp.resolve()
@@ -116,18 +104,16 @@ def _collect_context(args: argparse.Namespace) -> None:
         repo_root / "setup_and_pack" / "nix" / "runs",
         repo_root / "fluxon_release",
     ]
-    middleware_log_root = runner_temp / TESTBED_HOSTWORKDIR_DIRNAME
-    middleware_log_counts = {service_name: 0 for service_name in MIDDLEWARE_LOG_SERVICES}
     copied: list[dict[str, object]] = []
     skipped: list[dict[str, str]] = []
 
-    def copy_text_diagnostic(source: Path, relative: Path) -> bool:
+    def copy_text_diagnostic(source: Path, relative: Path) -> None:
         try:
             with source.open("rb") as stream:
                 sample = stream.read(65536)
             if b"\0" in sample:
                 skipped.append({"source": str(source), "reason": "binary content detected"})
-                return False
+                return
 
             sha256, byte_count, line_count = _file_digest(source)
             destination = repository_root / relative
@@ -142,7 +128,6 @@ def _collect_context(args: argparse.Namespace) -> None:
                     "sha256": sha256,
                 }
             )
-            return True
         except Exception as exc:
             skipped.append(
                 {
@@ -150,7 +135,6 @@ def _collect_context(args: argparse.Namespace) -> None:
                     "reason": f"{type(exc).__name__}: {exc}",
                 }
             )
-            return False
 
     for source_root in source_roots:
         if not source_root.exists():
@@ -160,29 +144,6 @@ def _collect_context(args: argparse.Namespace) -> None:
             if not source.is_file() or source.is_symlink() or not _should_collect(source):
                 continue
             copy_text_diagnostic(source, source.relative_to(repo_root))
-
-    if not middleware_log_root.exists():
-        skipped.append(
-            {
-                "source": str(middleware_log_root),
-                "reason": "testbed hostworkdir root is missing",
-            }
-        )
-    else:
-        middleware_log_candidates = {
-            source
-            for pattern in ("log/*.log", "*/log/*.log")
-            for source in middleware_log_root.glob(pattern)
-        }
-        for source in sorted(middleware_log_candidates):
-            if not source.is_file() or source.is_symlink():
-                continue
-            service_name = _middleware_log_service(source)
-            if service_name is None:
-                continue
-            relative = Path("runner-temp") / source.relative_to(runner_temp)
-            if copy_text_diagnostic(source, relative):
-                middleware_log_counts[service_name] += 1
 
     explicit_files = [
         repo_root / ".github" / "workflows" / "all_test.yml",
@@ -204,17 +165,6 @@ def _collect_context(args: argparse.Namespace) -> None:
     manifest = {
         "contract": "Files are copied in full without tail truncation.",
         "source_roots": [str(path) for path in source_roots],
-        "middleware_logs": {
-            "contract": (
-                "Complete etcd and GreptimeDB service stdout/stderr logs are copied; "
-                "middleware data directories are excluded."
-            ),
-            "source_root": str(middleware_log_root),
-            "services": {
-                service_name: {"copied_file_count": middleware_log_counts[service_name]}
-                for service_name in MIDDLEWARE_LOG_SERVICES
-            },
-        },
         "copied_file_count": len(copied),
         "copied_total_bytes": sum(int(item["bytes"]) for item in copied),
         "copied": copied,
@@ -227,13 +177,6 @@ def _collect_context(args: argparse.Namespace) -> None:
     print(
         f"Collected {manifest['copied_file_count']} complete text diagnostics "
         f"({manifest['copied_total_bytes']} bytes) in {context_root}"
-    )
-    print(
-        "Collected testbed middleware service logs: "
-        + " ".join(
-            f"{service_name}={middleware_log_counts[service_name]}"
-            for service_name in MIDDLEWARE_LOG_SERVICES
-        )
     )
     if skipped:
         print(f"Recorded {len(skipped)} missing, binary, or unreadable paths in manifest.json")
@@ -722,7 +665,7 @@ def _build_inventory(args: argparse.Namespace) -> None:
     print(f"Evidence inventory: files={payload['file_count']} bytes={payload['total_bytes']}")
 
 
-def _print_report(args: argparse.Namespace) -> None:
+def _render_report(args: argparse.Namespace) -> None:
     report = _required_env("CODEX_REPORT")
     failed_run_url = _required_env("FAILED_RUN_URL")
     api_key = _required_env("OPENAI_API_KEY")
@@ -736,7 +679,9 @@ def _print_report(args: argparse.Namespace) -> None:
         f"Failed run: {failed_run_url}\n\n"
         f"{report}\n"
     )
-    print(rendered, end="", flush=True)
+    output_path = args.output.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(rendered, encoding="utf-8")
     _append_text(args.summary.resolve(), rendered)
 
 
@@ -777,12 +722,13 @@ def _parse_args() -> argparse.Namespace:
     build_inventory.add_argument("--context-root", type=Path, required=True)
     build_inventory.set_defaults(handler=_build_inventory)
 
-    print_report = subparsers.add_parser(
-        "print-report",
-        help="Redact configured secrets and print the final report.",
+    render_report = subparsers.add_parser(
+        "render-report",
+        help="Redact configured secrets and write the final report.",
     )
-    print_report.add_argument("--summary", type=Path, required=True)
-    print_report.set_defaults(handler=_print_report)
+    render_report.add_argument("--output", type=Path, required=True)
+    render_report.add_argument("--summary", type=Path, required=True)
+    render_report.set_defaults(handler=_render_report)
 
     args = parser.parse_args()
     if getattr(args, "history_failure_limit", 0) < 0:

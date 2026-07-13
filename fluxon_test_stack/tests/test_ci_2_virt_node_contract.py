@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -15,6 +17,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = REPO_ROOT / "fluxon_test_stack" / "ci_2_virt_node.py"
 WORKFLOW_HELPER_PATH = REPO_ROOT / "scripts" / "ci_2_virt_node_workflow.py"
+CODEX_HELPER_PATH = REPO_ROOT / "scripts" / "ci_codex_failure_analysis.py"
 
 
 def _load_module():
@@ -42,6 +45,21 @@ def _load_workflow_helper():
 
 
 _WORKFLOW_HELPER = _load_workflow_helper()
+
+
+def _load_codex_helper():
+    spec = importlib.util.spec_from_file_location(
+        "fluxon_ci_codex_failure_analysis_contract",
+        CODEX_HELPER_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_CODEX_HELPER = _load_codex_helper()
 
 
 class TestCi2VirtNodeContract(unittest.TestCase):
@@ -134,6 +152,119 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 ["systemd-tmpfiles", "--clean"],
                 check=True,
             )
+
+    def test_codex_report_prints_in_analysis_job_and_redacts_api_secrets(self) -> None:
+        workflow = (REPO_ROOT / ".github" / "workflows" / "all_test.yml").read_text(encoding="utf-8")
+        self.assertIn("scripts/ci_codex_failure_analysis.py print-report", workflow)
+        self.assertNotIn("publish_codex_failure_report", workflow)
+        self.assertNotIn("codex-ci-failure-report-", workflow)
+        self.assertNotIn("actions/upload-artifact@v4", workflow)
+        self.assertEqual(
+            workflow.count("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"),
+            2,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            summary = Path(td) / "summary.md"
+            api_key = "secret-api-key"
+            base_url = "https://openai.example.invalid/v1"
+            report = f"diagnosis key={api_key} base={base_url} endpoint={base_url}/responses"
+            output = io.StringIO()
+            with mock.patch.dict(
+                _CODEX_HELPER.os.environ,
+                {
+                    "CODEX_REPORT": report,
+                    "FAILED_RUN_URL": "https://github.com/Tele-AI/Fluxon/actions/runs/1",
+                    "OPENAI_API_KEY": api_key,
+                    "OPENAI_BASE_URL": base_url,
+                },
+            ):
+                with contextlib.redirect_stdout(output):
+                    _CODEX_HELPER._print_report(mock.Mock(summary=summary))
+
+            rendered = output.getvalue()
+            self.assertIn("# Codex CI failure analysis", rendered)
+            self.assertIn("diagnosis key=[REDACTED]", rendered)
+            self.assertNotIn(api_key, rendered)
+            self.assertNotIn(base_url, rendered)
+            self.assertEqual(summary.read_text(encoding="utf-8"), rendered)
+
+    def test_codex_context_collects_testbed_middleware_service_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo_root = root / "repository"
+            runner_temp = root / "runner-temp"
+            repo_root.mkdir()
+            runner_temp.mkdir()
+
+            service_log_root = runner_temp / "fluxon_deploy" / "a" / "log"
+            service_log_root.mkdir(parents=True)
+            etcd_log = service_log_root / "etcd.2026-07-14.log"
+            greptime_log = service_log_root / "greptime.log"
+            etcd_log.write_text("etcd server line 1\netcd server line 2\n", encoding="utf-8")
+            greptime_log.write_text("greptime server line\n", encoding="utf-8")
+            (service_log_root / "owner.2026-07-14.log").write_text(
+                "owner service line\n",
+                encoding="utf-8",
+            )
+            middleware_data_log = (
+                runner_temp / "fluxon_deploy" / "a" / "data" / "etcd.log"
+            )
+            middleware_data_log.parent.mkdir()
+            middleware_data_log.write_text("data directory file\n", encoding="utf-8")
+
+            context_root = runner_temp / "codex-failure-context"
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                _CODEX_HELPER._collect_context(
+                    mock.Mock(
+                        repo_root=repo_root,
+                        runner_temp=runner_temp,
+                        context_root=context_root,
+                    )
+                )
+
+            copied_log_root = (
+                context_root
+                / "repository"
+                / "runner-temp"
+                / "fluxon_deploy"
+                / "a"
+                / "log"
+            )
+            self.assertEqual(
+                (copied_log_root / etcd_log.name).read_text(encoding="utf-8"),
+                etcd_log.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                (copied_log_root / greptime_log.name).read_text(encoding="utf-8"),
+                greptime_log.read_text(encoding="utf-8"),
+            )
+            self.assertFalse((copied_log_root / "owner.2026-07-14.log").exists())
+            self.assertFalse(
+                (
+                    context_root
+                    / "repository"
+                    / "runner-temp"
+                    / "fluxon_deploy"
+                    / "a"
+                    / "data"
+                    / "etcd.log"
+                ).exists()
+            )
+
+            manifest = json.loads(
+                (context_root / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["copied_file_count"], 2)
+            self.assertEqual(
+                manifest["middleware_logs"]["services"],
+                {
+                    "etcd": {"copied_file_count": 1},
+                    "greptime": {"copied_file_count": 1},
+                },
+            )
+            self.assertIn("etcd=1 greptime=1", output.getvalue())
 
     def test_generated_suite_is_public_dual_local_nodes_ci_only(self) -> None:
         suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
