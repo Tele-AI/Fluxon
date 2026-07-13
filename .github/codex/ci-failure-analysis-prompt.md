@@ -9,10 +9,10 @@
 
 必须完成的证据工作：
 
-1. 首先读取 `failure-context/inventory.json`、当前 run/job 元数据和所有 manifest，明确本次实际取得了哪些文件、哪些文件缺失或读取失败。
+1. 首先读取 `failure-context/inventory.json`、`github/current-artifact-status.json`、当前 run/job/check-run 元数据、`github/current-job.annotations.json` 和所有 manifest，明确本次实际取得了哪些文件、哪些文件缺失或读取失败。GitHub check-run annotations 是 runner 崩溃、磁盘耗尽等平台级首错的权威证据，必须优先检查。
 2. 递归枚举 `failure-context/`。必须分析其中每一个已采集的运行日志和诊断文件，包括 `.log`、`.txt`、`.out`、`.err`、`.json`、`.yaml`、`.yml`；不得只看 tail、异常摘要或单一错误行。大文件应分块读取或结合完整检索分析。
-3. `failure-context/github/current-job.log` 是本次失败 job 的完整 GitHub Actions 日志；`failure-context/current/` 是本次 runner 保存的完整文本诊断 artifact。两者必须交叉验证。
-4. `failure-context/github/history/` 保存了最近若干次真实历史失败 run 的元数据和完整失败 job 日志。必须逐次分析，并与当前失败比较；不得把历史错误未经证据地套到当前 run。
+3. `failure-context/github/current-job.log` 在存在时是本次失败 job 的完整 GitHub Actions 日志；`failure-context/current/` 在存在时是本次 runner 保存的完整文本诊断 artifact。应与 check-run annotations 交叉验证。若 runner 异常退出导致日志或 artifact 永久缺失，必须以对应 status/fetch-error 和 annotation 明确说明，不能把它误判为普通下载竞态。
+4. `failure-context/github/history/` 保存了最近若干次真实历史失败 run 的元数据、check-run annotations 和完整失败 job 日志。必须逐次分析，并与当前失败比较；不得把历史错误未经证据地套到当前 run。
 5. 检查当前 checkout 中与错误路径直接相关的实现、测试和 workflow，追踪到具体文件、函数、配置或生命周期边界。不得仅根据报错字符串猜测。
 6. 区分首个可执行根因、后续级联错误、清理阶段噪声、超时/取消造成的次生现象。使用时间戳、case id、PID、端口、退出码和重试信息重建因果链。
 7. 若任何日志被截断、过期、缺失、无法解析或因规模未能完整读取，必须在报告中逐项披露；不得声称已经分析未读取的内容。

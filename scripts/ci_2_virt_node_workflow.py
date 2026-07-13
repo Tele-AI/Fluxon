@@ -3,13 +3,105 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 from pathlib import Path
 import shlex
-
-import yaml
-
+import shutil
+import subprocess
+import time
 
 TOP_ATTENTION_SCENE_PREFIX = "ci_top_attention_"
+SYSTEM_TEMP_ROOT = Path("/tmp")
+RUNNER_TEMP_PROTECTED_PREFIXES = ("_github_", "_runner_")
+SYSTEM_TEMP_GARBAGE_PREFIXES = (
+    "fluxon-",
+    "fluxon_",
+    "pip-build-",
+    "pip-ephem-wheel-cache-",
+    "pip-install-",
+    "pip-unpack-",
+)
+RUNNER_TEMP_MIN_AGE_SECONDS = 15 * 60
+SYSTEM_TEMP_MIN_AGE_SECONDS = 30 * 60
+
+
+def _entry_allocated_bytes(path: Path) -> int:
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return int(path.lstat().st_blocks) * 512
+    except FileNotFoundError:
+        return 0
+    total = 0
+    for root, dirs, files in os.walk(path, followlinks=False):
+        for name in [*dirs, *files]:
+            child = Path(root) / name
+            try:
+                total += int(child.lstat().st_blocks) * 512
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def _remove_temp_entry(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        path.unlink(missing_ok=True)
+        return
+    shutil.rmtree(path)
+
+
+def _scan_and_clean_temp(_: argparse.Namespace) -> None:
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        raise RuntimeError("scan-and-clean-temp is restricted to GitHub-hosted workflow runs")
+    runner_temp_raw = os.environ.get("RUNNER_TEMP")
+    if not runner_temp_raw:
+        raise RuntimeError("RUNNER_TEMP must be set for scan-and-clean-temp")
+    runner_temp = Path(runner_temp_raw).resolve()
+    if runner_temp == Path("/") or SYSTEM_TEMP_ROOT.resolve() == Path("/"):
+        raise RuntimeError("temporary cleanup roots must not resolve to /")
+
+    now = time.time()
+    free_before = shutil.disk_usage("/").free
+    subprocess.run(["systemd-tmpfiles", "--clean"], check=True)
+
+    candidates: list[Path] = []
+    if runner_temp.is_dir():
+        for path in runner_temp.iterdir():
+            if path.name.startswith(RUNNER_TEMP_PROTECTED_PREFIXES):
+                continue
+            try:
+                age_seconds = now - path.lstat().st_mtime
+            except FileNotFoundError:
+                continue
+            if age_seconds >= RUNNER_TEMP_MIN_AGE_SECONDS:
+                candidates.append(path)
+
+    if SYSTEM_TEMP_ROOT.is_dir():
+        for path in SYSTEM_TEMP_ROOT.iterdir():
+            try:
+                age_seconds = now - path.lstat().st_mtime
+            except FileNotFoundError:
+                continue
+            if path.name.startswith(SYSTEM_TEMP_GARBAGE_PREFIXES):
+                if age_seconds >= SYSTEM_TEMP_MIN_AGE_SECONDS:
+                    candidates.append(path)
+
+    removed: list[dict[str, int | str]] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        normalized = path.absolute()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        allocated_bytes = _entry_allocated_bytes(path)
+        _remove_temp_entry(path)
+        removed.append({"path": str(path), "allocated_bytes": allocated_bytes})
+
+    free_after = shutil.disk_usage("/").free
+    print(
+        "temporary data cleanup complete: "
+        f"removed={removed} reclaimed_bytes={max(0, free_after - free_before)} free_bytes={free_after}",
+        flush=True,
+    )
 
 
 def _top_attention_command(
@@ -145,6 +237,8 @@ def _top_attention_ci_scenes(doc_site_base_url: str) -> dict[str, dict[str, obje
 
 
 def _write_suite(args: argparse.Namespace) -> None:
+    import yaml
+
     owner, separator, repository_name = args.repository.partition("/")
     if not separator or not owner or not repository_name or "/" in repository_name:
         raise ValueError("--repository must use the OWNER/REPOSITORY form")
@@ -223,6 +317,8 @@ def _print_tail(path: Path, *, line_count: int = 240) -> None:
 
 
 def _print_failure_diagnostics(args: argparse.Namespace) -> None:
+    import yaml
+
     workdir = args.workdir
     case_runs_path = workdir / "case_runs.yaml"
     if not case_runs_path.exists():
@@ -306,6 +402,12 @@ def _print_failure_diagnostics(args: argparse.Namespace) -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Support the ci_2_virt_node GitHub workflow.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    clean_temp = subparsers.add_parser(
+        "scan-and-clean-temp",
+        help="Clean stale runner and system temporary data before the CI flow starts.",
+    )
+    clean_temp.set_defaults(handler=_scan_and_clean_temp)
 
     write_suite = subparsers.add_parser("write-suite", help="Write the bounded CI suite.")
     write_suite.add_argument("--source", type=Path, required=True)

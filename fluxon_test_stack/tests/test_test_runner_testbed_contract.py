@@ -529,18 +529,83 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
             with mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply:
                 with mock.patch.object(_RUNNER, "_ci_cleanup_runtime") as cleanup_runtime:
-                    _RUNNER._finalize_ci_case_runtime(
-                        resolved_case,
-                        run_dir=run_dir,
-                        runtime_tracking=tracking,
-                        outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
-                    )
+                    with mock.patch.object(_RUNNER, "_cleanup_successful_ci_case_data") as cleanup_success_data:
+                        _RUNNER._finalize_ci_case_runtime(
+                            resolved_case,
+                            run_dir=run_dir,
+                            runtime_tracking=tracking,
+                            outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+                        )
 
             self.assertEqual(
                 [call.kwargs["apply_id"] for call in delete_apply.call_args_list],
                 ["apply-runner", "apply-cluster"],
             )
             cleanup_runtime.assert_called_once_with(resolved_case, timeout_s=120)
+            cleanup_success_data.assert_called_once_with(resolved_case, run_dir=run_dir)
+
+    def test_ci_success_cleanup_reuses_canonical_root_and_removes_ephemeral_data(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "results" / "case" / "run_1"
+            run_dir.mkdir(parents=True)
+            share_mem_root = root / "shm"
+            resolved_case = {
+                "case": {"case_id": "ci_case"},
+                "runtime": {
+                    "run_dir": str(run_dir),
+                    "stack_identity": {"share_mem_path": str(share_mem_root)},
+                },
+                "deploy": {
+                    "instances": [
+                        {"id": "ci_runner", "deployer": {"target": "local-node-a"}},
+                    ]
+                },
+            }
+            self.assertEqual(
+                _RUNNER._ci_share_mem_path(resolved_case),
+                str((share_mem_root / "ci").resolve()),
+            )
+            bundle_dir = _RUNNER._ci_case_shared_bundle_dir(resolved_case)
+            bundle_dir.mkdir(parents=True)
+            (bundle_dir / "mmap.file").write_bytes(b"payload")
+            for relpath in _RUNNER.CI_SUCCESS_RUNTIME_DATA_RELPATHS:
+                path = run_dir / relpath
+                path.mkdir(parents=True)
+                (path / "payload.bin").write_bytes(b"payload")
+            (run_dir / "logs").mkdir()
+            (run_dir / "logs" / "stdout.log").write_text("ok\n", encoding="utf-8")
+            (run_dir / "summary.yaml").write_text("outcome: SUCCESS\n", encoding="utf-8")
+
+            with mock.patch.object(_RUNNER, "_instance_remote_target_access_opt", return_value=None):
+                _RUNNER._cleanup_successful_ci_case_data(resolved_case, run_dir=run_dir)
+
+            self.assertFalse(bundle_dir.exists())
+            for relpath in _RUNNER.CI_SUCCESS_RUNTIME_DATA_RELPATHS:
+                self.assertFalse((run_dir / relpath).exists())
+            self.assertTrue((run_dir / "logs" / "stdout.log").exists())
+            self.assertTrue((run_dir / "summary.yaml").exists())
+
+    def test_finalize_ci_case_runtime_keeps_failure_data(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_FULL_ONCE,
+                    "case_id": "ci_case",
+                }
+            }
+
+            with mock.patch.object(_RUNNER, "_ci_cleanup_runtime"):
+                with mock.patch.object(_RUNNER, "_cleanup_successful_ci_case_data") as cleanup_success_data:
+                    _RUNNER._finalize_ci_case_runtime(
+                        resolved_case,
+                        run_dir=run_dir,
+                        runtime_tracking=_RUNNER._CaseRuntimeTracking(),
+                        outcome=_RUNNER.RUN_OUTCOME_FAILED,
+                    )
+
+            cleanup_success_data.assert_not_called()
 
     def test_finalize_ci_case_runtime_preserves_structured_instance_ids(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -705,6 +770,59 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 updated_summary["test_stack"]["collect_error"],
                 "RuntimeError: collect boom",
             )
+
+    def test_finalize_test_stack_success_removes_ephemeral_run_data(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_FULL_ONCE,
+                    "case_id": "bench_case",
+                }
+            }
+            tracking = _RUNNER._CaseRuntimeTracking(
+                ts_coord_deploy_attempted=True,
+                ts_coord_apply_id="apply-coord",
+                ts_nodes_deploy_attempted=True,
+                ts_nodes_apply_id="apply-nodes",
+            )
+
+            with mock.patch.object(_RUNNER, "_run_adapter_action"):
+                with mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply:
+                    with mock.patch.object(
+                        _RUNNER,
+                        "_cleanup_successful_test_stack_case_data",
+                    ) as cleanup_success_data:
+                        _RUNNER._finalize_test_stack_case_runtime(
+                            resolved_case,
+                            run_dir=run_dir,
+                            runtime_tracking=tracking,
+                            outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+                        )
+
+            self.assertEqual(
+                [call.kwargs["apply_id"] for call in delete_apply.call_args_list],
+                ["apply-nodes", "apply-coord"],
+            )
+            cleanup_success_data.assert_called_once_with(run_dir=run_dir)
+
+    def test_test_stack_success_cleanup_keeps_result_and_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            for relpath in _RUNNER.TEST_STACK_SUCCESS_RUNTIME_DATA_RELPATHS:
+                path = run_dir / relpath
+                path.mkdir(parents=True)
+                (path / "payload.bin").write_bytes(b"payload")
+            (run_dir / "logs").mkdir()
+            (run_dir / "logs" / "status.yaml").write_text("ok: true\n", encoding="utf-8")
+            (run_dir / "benchmark_result.json").write_text('{"runs": []}\n', encoding="utf-8")
+
+            _RUNNER._cleanup_successful_test_stack_case_data(run_dir=run_dir)
+
+            for relpath in _RUNNER.TEST_STACK_SUCCESS_RUNTIME_DATA_RELPATHS:
+                self.assertFalse((run_dir / relpath).exists())
+            self.assertTrue((run_dir / "logs" / "status.yaml").exists())
+            self.assertTrue((run_dir / "benchmark_result.json").exists())
 
     def test_run_adapter_action_allows_collect(self) -> None:
         with tempfile.TemporaryDirectory() as td:

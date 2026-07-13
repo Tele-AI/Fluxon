@@ -21,6 +21,24 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Free hosted runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          tool-cache: false
+          swap-storage: false
+
+      - name: Scan and clean temporary data
+        run: >-
+          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_TEMP="$RUNNER_TEMP"
+          "$(command -v python3)"
+          scripts/ci_2_virt_node_workflow.py scan-and-clean-temp
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -154,24 +172,19 @@ jobs:
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
         run: python3 scripts/ci_codex_failure_analysis.py check-api-config
 
-      - name: Download current failure context
-        if: ${{ steps.api_config.outputs.available == 'true' }}
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: codex-failure-context-${{ github.run_id }}
-          path: failure-context/current
-
-      - name: Fetch current and historical Actions logs
+      - name: Fetch current and historical failure evidence
         if: ${{ steps.api_config.outputs.available == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/ci_codex_failure_analysis.py fetch-logs \
+          python3 scripts/ci_codex_failure_analysis.py fetch-evidence \
             --repository "$GITHUB_REPOSITORY" \
             --current-run-id "$GITHUB_RUN_ID" \
+            --current-context-artifact-name "codex-failure-context-$GITHUB_RUN_ID" \
             --workflow-file all_test.yml \
             --history-failure-limit 5 \
+            --artifact-wait-seconds 60 \
+            --artifact-poll-seconds 5 \
             --context-root failure-context
 
       - name: Build complete evidence inventory

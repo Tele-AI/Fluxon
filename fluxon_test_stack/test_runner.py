@@ -171,6 +171,8 @@ CI_OWNER_SHARED_BUNDLE_RELPATHS = ("services/share_mem/shared.json", "services/s
 CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S = 600
 CI_RUNNER_READINESS_PROBE_DEADLINE_S = 120
 CI_RUNNER_EXIT_CODE_GRACE_TIMEOUT_S = 300
+CI_SUCCESS_RUNTIME_DATA_RELPATHS = ("services", "src", "venv")
+TEST_STACK_SUCCESS_RUNTIME_DATA_RELPATHS = ("__pycache__", "services", "test_stack_runtime")
 TEST_STACK_RUNTIME_NOFILE_LIMIT = 65536
 TEST_STACK_REMOTE_STAGE_SHARED_INCLUDE_RELPATHS = (
     "benchmark_config.py",
@@ -3624,19 +3626,29 @@ def _resolved_run_dir_path(resolved_case: Dict[str, Any]) -> Path:
     return Path(_require_str(runtime.get("run_dir"), "runtime.run_dir")).resolve()
 
 
-def _ci_share_mem_path(resolved_case: Dict[str, Any], *, run_dir: Path) -> str:
+def _ci_share_mem_path(resolved_case: Dict[str, Any]) -> str:
     runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
     stack_identity = _require_dict(runtime.get("stack_identity"), "resolved_case.runtime.stack_identity")
     share_mem_root = _require_str(
         stack_identity.get("share_mem_path"),
         "resolved_case.runtime.stack_identity.share_mem_path",
     )
-    # English note:
-    # - iceoryx2 uses share_mem_path as a base for per-node paths (e.g. .../nodes/<id>/iox2_<hash>/.service_tag).
-    # - The per-node suffix can be long, and some filesystems enforce a max path length of 255 bytes.
-    # - Therefore share_mem_path must be short and must not embed run_dir (which can be deep under repo/workdir).
-    token = hashlib.sha256(str(run_dir.resolve()).encode("utf-8")).hexdigest()[:16]
-    return str((Path(share_mem_root) / "ci" / token).resolve())
+    # CI cases are serialized and cluster_name already scopes every shared bundle.
+    return str((Path(share_mem_root) / "ci").resolve())
+
+
+def _ci_case_shared_bundle_dir(resolved_case: Dict[str, Any]) -> Path:
+    share_mem_root = Path(_ci_share_mem_path(resolved_case)).resolve()
+    cluster_name = _ci_cluster_name(resolved_case)
+    if Path(cluster_name).name != cluster_name:
+        raise ValueError(f"CI cluster_name must be one path component: {cluster_name!r}")
+    bundle_dir = (share_mem_root / cluster_name).resolve()
+    if bundle_dir.parent != share_mem_root:
+        raise ValueError(
+            "CI shared bundle escaped its canonical root: "
+            f"root={share_mem_root} cluster_name={cluster_name!r} bundle_dir={bundle_dir}"
+        )
+    return bundle_dir
 
 
 def _ci_owner_shared_bundle_paths(run_dir: Path, *, owner_config_path: Path) -> List[Path]:
@@ -15118,6 +15130,115 @@ def _test_stack_external_owner_shared_bundle_wait_instance_ids(
         "TEST_STACK owner shared bundle wait could not match any owner target to node runtime targets: "
         f"owner_targets={sorted(owner_target_to_instance_id.keys())} "
         f"node_runtime_targets={node_runtime_targets}"
+    )
+
+
+def _cleanup_successful_run_dir_data(*, run_dir: Path, relpaths: Tuple[str, ...], ctx: str) -> None:
+    root = run_dir.resolve()
+    free_before = shutil.disk_usage(root).free
+    removed: List[str] = []
+    for raw_relpath in relpaths:
+        relpath = _require_clean_relpath(raw_relpath, f"{ctx} relpath")
+        path = (root / relpath).resolve()
+        if path.parent != root:
+            raise ValueError(f"{ctx} only accepts direct run_dir children: relpath={relpath!r}")
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+        else:
+            continue
+        removed.append(relpath)
+    free_after = shutil.disk_usage(root).free
+    print(
+        f"[{ctx}] removed={removed} reclaimed_bytes={max(0, free_after - free_before)} run_dir={root}",
+        flush=True,
+    )
+
+
+def _instance_path_exists(
+    resolved_case: Dict[str, Any], *, instance_id: str, path: Path
+) -> bool:
+    if path.exists() or path.is_symlink():
+        return True
+    remote_access = _instance_remote_target_access_opt(resolved_case, instance_id=instance_id)
+    if remote_access is None:
+        return False
+    target_name, node_cfg, dispatch_mod = remote_access
+    sentinel = "__DEVER_REMOTE_PATH_PRESENT__"
+    quoted_path = dispatch_mod.sh_quote(str(path))
+    remote_cmd = (
+        f"if [ -e {quoted_path} ] || [ -L {quoted_path} ]; then printf '%s\\n' "
+        + dispatch_mod.sh_quote(sentinel)
+        + "; fi"
+    )
+    output = _run_remote_bash_capture(target_name=target_name, node_cfg=node_cfg, remote_cmd=remote_cmd)
+    return output == sentinel + "\n"
+
+
+def _instance_remove_directory_and_verify_absent(
+    resolved_case: Dict[str, Any],
+    *,
+    instance_id: str,
+    path: Path,
+    timeout_s: int,
+    ctx: str,
+) -> None:
+    normalized_path = path.resolve()
+    remote_access = _instance_remote_target_access_opt(resolved_case, instance_id=instance_id)
+    if remote_access is None:
+        try:
+            shutil.rmtree(normalized_path)
+        except FileNotFoundError:
+            pass
+    else:
+        target_name, node_cfg, dispatch_mod = remote_access
+        remote_cmd = "rm -rf -- " + dispatch_mod.sh_quote(str(normalized_path))
+        _run_remote_bash(target_name=target_name, node_cfg=node_cfg, remote_cmd=remote_cmd)
+
+    deadline = time.time() + float(timeout_s)
+    while _instance_path_exists(
+        resolved_case,
+        instance_id=instance_id,
+        path=normalized_path,
+    ):
+        if time.time() >= deadline:
+            raise ValueError(f"{ctx}: delete timeout; remaining={normalized_path}")
+        time.sleep(0.5)
+
+
+def _cleanup_successful_ci_case_data(resolved_case: Dict[str, Any], *, run_dir: Path) -> None:
+    bundle_dir = _ci_case_shared_bundle_dir(resolved_case)
+    bundle_instance_id = (
+        "owner_0"
+        if _find_deploy_instance_opt(resolved_case, instance_id="owner_0") is not None
+        else "ci_runner"
+    )
+    print(
+        f"[CI success cleanup] shared_bundle={bundle_dir} instance_id={bundle_instance_id}",
+        flush=True,
+    )
+    _instance_remove_directory_and_verify_absent(
+        resolved_case,
+        instance_id=bundle_instance_id,
+        path=bundle_dir,
+        timeout_s=30,
+        ctx="CI success shared bundle cleanup",
+    )
+    _cleanup_successful_run_dir_data(
+        run_dir=run_dir,
+        relpaths=CI_SUCCESS_RUNTIME_DATA_RELPATHS,
+        ctx="CI success run data cleanup",
+    )
+
+
+def _cleanup_successful_test_stack_case_data(*, run_dir: Path) -> None:
+    _cleanup_successful_run_dir_data(
+        run_dir=run_dir,
+        relpaths=TEST_STACK_SUCCESS_RUNTIME_DATA_RELPATHS,
+        ctx="TEST_STACK success run data cleanup",
     )
 
 

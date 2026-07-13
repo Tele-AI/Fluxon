@@ -45,6 +45,7 @@ SAME_HOST_LOCAL_MULTI_NODE_ETCD_CLIENT_PORT_OFFSET = 100
 SAME_HOST_LOCAL_MULTI_NODE_GREPTIME_PORT_OFFSET = 110
 SAME_HOST_LOCAL_MULTI_NODE_TEST_STACK_COORDINATOR_PORT_OFFSET = 1000
 SAME_HOST_LOCAL_MULTI_NODE_TEST_STACK_TOPOLOGY_PORT_SPAN = 100
+EPHEMERAL_CI_TIKV_RESERVE_SPACE = "0KiB"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -573,6 +574,21 @@ def _require_mapping_rewritten_template(
     return rewritten
 
 
+def _rewrite_tikv_storage_for_ephemeral_ci(entrypoint: str) -> str:
+    marker = "[storage]\n"
+    if entrypoint.count(marker) != 1:
+        raise ValueError("deployconf.service.tikv.entrypoint must contain exactly one [storage] section")
+    if "reserve-space" in entrypoint or "reserve-raft-space" in entrypoint:
+        raise ValueError("deployconf.service.tikv.entrypoint already configures TiKV reserve files")
+    replacement = (
+        marker
+        + "# The ephemeral CI runner cannot dedicate multi-GiB placeholder files to TiKV.\n"
+        + f'reserve-space = "{EPHEMERAL_CI_TIKV_RESERVE_SPACE}"\n'
+        + f'reserve-raft-space = "{EPHEMERAL_CI_TIKV_RESERVE_SPACE}"\n'
+    )
+    return entrypoint.replace(marker, replacement, 1)
+
+
 def _rewrite_deployconf_for_local_dual_nodes(
     *,
     deployconf_cfg: dict[str, Any],
@@ -644,6 +660,13 @@ def _rewrite_deployconf_for_local_dual_nodes(
     if not isinstance(ops_controller_cfg, dict):
         raise ValueError("deployconf.service.ops_controller must be a mapping")
     ops_controller_cfg["port"] = int(controller_port)
+    tikv_cfg = service_cfg.get("tikv")
+    if not isinstance(tikv_cfg, dict):
+        raise ValueError("deployconf.service.tikv must be a mapping")
+    tikv_entrypoint = tikv_cfg.get("entrypoint")
+    if not isinstance(tikv_entrypoint, str):
+        raise ValueError("deployconf.service.tikv.entrypoint must be a string")
+    tikv_cfg["entrypoint"] = _rewrite_tikv_storage_for_ephemeral_ci(tikv_entrypoint)
     master_cfg = service_cfg.get("master")
     if not isinstance(master_cfg, dict):
         raise ValueError("deployconf.service.master must be a mapping")

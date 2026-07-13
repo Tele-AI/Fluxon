@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = REPO_ROOT / "fluxon_test_stack" / "ci_2_virt_node.py"
+WORKFLOW_HELPER_PATH = REPO_ROOT / "scripts" / "ci_2_virt_node_workflow.py"
 
 
 def _load_module():
@@ -25,6 +27,21 @@ def _load_module():
 
 
 _ENTRY = _load_module()
+
+
+def _load_workflow_helper():
+    spec = importlib.util.spec_from_file_location(
+        "fluxon_ci_2_virt_node_workflow_contract",
+        WORKFLOW_HELPER_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_WORKFLOW_HELPER = _load_workflow_helper()
 
 
 class TestCi2VirtNodeContract(unittest.TestCase):
@@ -45,21 +62,78 @@ class TestCi2VirtNodeContract(unittest.TestCase):
     _LOG_MGMT_SCENE_ID = "ci_top_attention_log_mgmt"
     _MQ_SCENE_ID = "ci_top_attention_mq_core"
 
-    def test_all_test_workflow_has_one_p160_c8_largescale_mq_command(self) -> None:
+    def test_all_test_workflow_generates_one_p160_c8_largescale_mq_command_from_script(self) -> None:
         workflow = (REPO_ROOT / ".github" / "workflows" / "all_test.yml").read_text(
             encoding="utf-8"
         )
-        scene_start = workflow.index('"ci_top_attention_largescale_mq": {')
-        scene_end = workflow.index('          }\n\n          for scene_id', scene_start)
-        scene = workflow[scene_start:scene_end]
+        helper = (REPO_ROOT / "scripts" / "ci_2_virt_node_workflow.py").read_text(encoding="utf-8")
 
-        self.assertIn('"__WORKDIR_ROOT__/largescale_mq_ci_single_host/p160_c8"', scene)
-        self.assertIn('"--producer-count",\n                      "160"', scene)
-        self.assertIn('"--consumer-count",\n                      "8"', scene)
-        self.assertIn('"--metric-warmup-seconds",\n                      "60"', scene)
-        self.assertNotIn("command_variants", scene)
-        self.assertNotIn("p8_c8", scene)
-        self.assertNotIn("p32_c32", scene)
+        self.assertIn("scripts/ci_2_virt_node_workflow.py write-suite", workflow)
+        self.assertIn(
+            "jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be",
+            workflow,
+        )
+        self.assertIn("scripts/ci_2_virt_node_workflow.py scan-and-clean-temp", workflow)
+        self.assertNotIn("--producer-count", workflow)
+        self.assertNotIn("/usr/local/lib/android", workflow)
+        self.assertIn('"__WORKDIR_ROOT__/largescale_mq_ci_single_host/p160_c8"', helper)
+        self.assertIn('"--producer-count",\n                "160"', helper)
+        self.assertIn('"--consumer-count",\n                "8"', helper)
+        self.assertIn('"--metric-warmup-seconds",\n                "60"', helper)
+        self.assertNotIn("command_variants", helper)
+        self.assertNotIn("p8_c8", helper)
+        self.assertNotIn("p32_c32", helper)
+
+    def test_scan_and_clean_temp_is_scoped_and_preserves_runner_control_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner_temp = root / "runner_temp"
+            system_temp = root / "system_temp"
+            runner_temp.mkdir()
+            system_temp.mkdir()
+            stale_runner = runner_temp / "stale-build"
+            protected_runner = runner_temp / "_runner_file_commands"
+            recent_runner = runner_temp / "recent-build"
+            stale_system = system_temp / "fluxon_stale"
+            unrelated_system = system_temp / "systemd-private-service"
+            for path in (
+                stale_runner,
+                protected_runner,
+                recent_runner,
+                stale_system,
+                unrelated_system,
+            ):
+                path.mkdir()
+                (path / "payload").write_text("x", encoding="utf-8")
+            now = _WORKFLOW_HELPER.time.time()
+            old_timestamp = now - max(
+                _WORKFLOW_HELPER.RUNNER_TEMP_MIN_AGE_SECONDS,
+                _WORKFLOW_HELPER.SYSTEM_TEMP_MIN_AGE_SECONDS,
+            ) - 60
+            for path in (stale_runner, protected_runner, stale_system, unrelated_system):
+                os.utime(path, (old_timestamp, old_timestamp))
+
+            with mock.patch.dict(
+                _WORKFLOW_HELPER.os.environ,
+                {"GITHUB_ACTIONS": "true", "RUNNER_TEMP": str(runner_temp)},
+            ):
+                with mock.patch.object(
+                    _WORKFLOW_HELPER,
+                    "SYSTEM_TEMP_ROOT",
+                    system_temp,
+                ):
+                    with mock.patch.object(_WORKFLOW_HELPER.subprocess, "run") as run_mock:
+                        _WORKFLOW_HELPER._scan_and_clean_temp(mock.Mock())
+
+            self.assertFalse(stale_runner.exists())
+            self.assertFalse(stale_system.exists())
+            self.assertTrue(protected_runner.exists())
+            self.assertTrue(recent_runner.exists())
+            self.assertTrue(unrelated_system.exists())
+            run_mock.assert_called_once_with(
+                ["systemd-tmpfiles", "--clean"],
+                check=True,
+            )
 
     def test_generated_suite_is_public_dual_local_nodes_ci_only(self) -> None:
         suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
@@ -387,6 +461,9 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         self.assertIn("local-node-a", generated["service"]["ops_agent"]["entrypoint"])
         self.assertIn("local-node-b", generated["service"]["ops_agent"]["entrypoint"])
         self.assertIn('    - "10.1.1.119/32"', generated["service"]["master"]["entrypoint"])
+        tikv_entrypoint = generated["service"]["tikv"]["entrypoint"]
+        self.assertIn('reserve-space = "0KiB"', tikv_entrypoint)
+        self.assertIn('reserve-raft-space = "0KiB"', tikv_entrypoint)
 
     def test_generated_start_test_bed_config_points_to_local_authorities(self) -> None:
         start_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_START_TEST_BED_TEMPLATE, ctx="start_test_bed")

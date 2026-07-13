@@ -64,7 +64,7 @@ def _prepare_ci_case(
     services_root = (run_dir / "services").resolve()
     services_root.mkdir(parents=True, exist_ok=True)
     (services_root / "share_mem").mkdir(parents=True, exist_ok=True)
-    share_mem_path = ctx._ci_share_mem_path(resolved_case, run_dir=run_dir)
+    share_mem_path = ctx._ci_share_mem_path(resolved_case)
     Path(share_mem_path).mkdir(parents=True, exist_ok=True)
 
     venv_python = ctx._create_ci_runtime_venv(run_dir=run_dir)
@@ -591,6 +591,8 @@ def _finalize_ci_case_runtime(
                 ctx=f"CI {instance_id_text} apply",
             )
         ctx._ci_cleanup_runtime(resolved_case, timeout_s=120)
+        if outcome == ctx.RUN_OUTCOME_SUCCESS:
+            ctx._cleanup_successful_ci_case_data(resolved_case, run_dir=run_dir)
         return
     if not ci_preserved_apply_ids:
         return
@@ -666,6 +668,8 @@ def _finalize_test_stack_case_runtime(
                 apply_id=ctx._require_str(runtime_tracking.ts_coord_apply_id, "TEST_STACK coordinator apply_id"),
                 ctx="TEST_STACK coordinator apply",
             )
+        if outcome == ctx.RUN_OUTCOME_SUCCESS:
+            ctx._cleanup_successful_test_stack_case_data(run_dir=run_dir)
         return
     if not ts_preserved_apply_ids:
         return

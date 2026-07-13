@@ -5,11 +5,15 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+import time
 from urllib.parse import urlsplit
+import zipfile
 
 
 LOG_SUFFIXES = frozenset({".err", ".log", ".out", ".stderr", ".stdout"})
@@ -43,6 +47,14 @@ def _append_text(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(value)
+
+
+def _write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def _file_digest(path: Path) -> tuple[str, int, int]:
@@ -241,9 +253,201 @@ def _fetch_api_json(repository: str, api_path: str, destination: Path, error_pat
     )
 
 
+def _fetch_api_url(api_url: str, destination: Path, error_path: Path) -> bool:
+    return _run_to_file(
+        ["gh", "api", api_url],
+        destination=destination,
+        error_path=error_path,
+    )
+
+
 def _write_fetch_error(path: Path, message: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"{message}\n", encoding="utf-8")
+
+
+def _safe_extract_zip(archive_path: Path, destination: Path) -> None:
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    destination_root = destination.resolve()
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in archive.infolist():
+            relative = PurePosixPath(info.filename)
+            if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+                raise ValueError(f"unsafe artifact archive path: {info.filename!r}")
+            if stat.S_ISLNK(info.external_attr >> 16):
+                raise ValueError(f"artifact archive contains a symlink: {info.filename!r}")
+            target = destination.joinpath(*relative.parts)
+            resolved_target = target.resolve()
+            if not resolved_target.is_relative_to(destination_root):
+                raise ValueError(f"artifact archive path escapes destination: {info.filename!r}")
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info) as source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+
+
+def _artifact_api_result(repository: str, run_id: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def _download_current_context_artifact(
+    *,
+    repository: str,
+    run_id: str,
+    artifact_name: str,
+    context_root: Path,
+    github_root: Path,
+    wait_seconds: float,
+    poll_seconds: float,
+) -> bool:
+    status_path = github_root / "current-artifact-status.json"
+    error_path = github_root / "current-artifact.fetch-error.txt"
+    deadline = time.monotonic() + wait_seconds
+    attempts = 0
+    last_error = "artifact was not listed"
+    while True:
+        attempts += 1
+        result = _artifact_api_result(repository, run_id)
+        artifact: dict[str, object] | None = None
+        if result.returncode == 0:
+            try:
+                payload = json.loads(result.stdout.decode("utf-8"))
+                artifacts = payload.get("artifacts", [])
+                if not isinstance(artifacts, list):
+                    raise TypeError("artifacts is not a list")
+                matches = [
+                    item
+                    for item in artifacts
+                    if isinstance(item, dict)
+                    and item.get("name") == artifact_name
+                    and not item.get("expired", False)
+                    and item.get("id") is not None
+                ]
+                if matches:
+                    artifact = max(matches, key=lambda item: int(item["id"]))
+                else:
+                    last_error = "artifact was not listed"
+            except (TypeError, ValueError) as exc:
+                last_error = f"failed to parse artifact listing: {exc}"
+        else:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            last_error = detail or f"artifact listing exited with {result.returncode}"
+
+        if artifact is not None:
+            artifact_id = str(artifact["id"])
+            with tempfile.TemporaryDirectory(prefix="codex-artifact-", dir=github_root) as raw_tmp:
+                archive_path = Path(raw_tmp) / "artifact.zip"
+                download_error = Path(raw_tmp) / "download-error.txt"
+                downloaded = _run_to_file(
+                    [
+                        "gh",
+                        "api",
+                        f"repos/{repository}/actions/artifacts/{artifact_id}/zip",
+                    ],
+                    destination=archive_path,
+                    error_path=download_error,
+                )
+                if downloaded:
+                    try:
+                        _safe_extract_zip(archive_path, context_root / "current")
+                    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                        last_error = f"failed to extract artifact: {type(exc).__name__}: {exc}"
+                    else:
+                        error_path.unlink(missing_ok=True)
+                        _write_json(
+                            status_path,
+                            {
+                                "artifact_id": artifact["id"],
+                                "artifact_name": artifact_name,
+                                "attempts": attempts,
+                                "size_in_bytes": artifact.get("size_in_bytes"),
+                                "status": "downloaded",
+                            },
+                        )
+                        print(
+                            f"Downloaded current failure context artifact after {attempts} attempt(s)"
+                        )
+                        return True
+                else:
+                    last_error = download_error.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).strip()
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_seconds, remaining))
+
+    _write_fetch_error(
+        error_path,
+        f"Failed to download artifact {artifact_name!r} after {attempts} attempt(s): {last_error}",
+    )
+    _write_json(
+        status_path,
+        {
+            "artifact_name": artifact_name,
+            "attempts": attempts,
+            "reason": last_error,
+            "status": "unavailable",
+        },
+    )
+    print(f"Current failure context artifact is unavailable after {attempts} attempt(s)")
+    return False
+
+
+def _extract_job_log_from_run_archive(
+    *,
+    repository: str,
+    run_id: str,
+    job_name: str,
+    destination: Path,
+) -> bool:
+    error_path = destination.with_name(f"{destination.stem}.run-archive.fetch-error.txt")
+    with tempfile.TemporaryDirectory(prefix="codex-run-logs-") as raw_tmp:
+        archive_path = Path(raw_tmp) / "run-logs.zip"
+        if not _run_to_file(
+            ["gh", "api", f"repos/{repository}/actions/runs/{run_id}/logs"],
+            destination=archive_path,
+            error_path=error_path,
+        ):
+            return False
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                expected_suffix = f"_{job_name}.txt"
+                candidates = [
+                    info
+                    for info in archive.infolist()
+                    if "/" not in info.filename and info.filename.endswith(expected_suffix)
+                ]
+                if len(candidates) != 1:
+                    raise ValueError(
+                        f"expected one combined log for job {job_name!r}, found {len(candidates)}"
+                    )
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(candidates[0]) as source, destination.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            destination.unlink(missing_ok=True)
+            _write_fetch_error(
+                error_path,
+                f"Failed to extract job log from run archive: {type(exc).__name__}: {exc}",
+            )
+            return False
+    error_path.unlink(missing_ok=True)
+    return True
 
 
 def _fetch_test_job_log(
@@ -264,20 +468,64 @@ def _fetch_test_job_log(
     try:
         payload = json.loads(jobs_json.read_text(encoding="utf-8"))
         jobs = payload.get("jobs", [])
-        job_id = next(
-            (str(job["id"]) for job in jobs if job.get("name") == "ci-2-virt-node"),
-            "",
+        if not isinstance(jobs, list):
+            raise TypeError("jobs is not a list")
+        job = next(
+            (job for job in jobs if isinstance(job, dict) and job.get("name") == "ci-2-virt-node"),
+            None,
         )
     except (KeyError, TypeError, ValueError) as exc:
         _write_fetch_error(error_path, f"Failed to parse jobs for run {run_id}: {exc}")
         return
-    if not job_id:
+    if job is None or job.get("id") is None:
         _write_fetch_error(error_path, f"Run {run_id} has no ci-2-virt-node job")
         return
-    _run_to_file(
-        ["gh", "run", "view", run_id, "--repo", repository, "--job", job_id, "--log"],
+
+    job_id = str(job["id"])
+    evidence_prefix = destination.with_suffix("")
+    check_run_url = str(
+        job.get("check_run_url")
+        or f"https://api.github.com/repos/{repository}/check-runs/{job_id}"
+    )
+    _fetch_api_url(
+        check_run_url,
+        evidence_prefix.with_name(f"{evidence_prefix.name}.check-run.json"),
+        evidence_prefix.with_name(f"{evidence_prefix.name}.check-run.fetch-error.txt"),
+    )
+    _fetch_api_url(
+        f"{check_run_url}/annotations?per_page=100",
+        evidence_prefix.with_name(f"{evidence_prefix.name}.annotations.json"),
+        evidence_prefix.with_name(f"{evidence_prefix.name}.annotations.fetch-error.txt"),
+    )
+
+    log_status_path = evidence_prefix.with_name(f"{evidence_prefix.name}.log-status.json")
+    if _run_to_file(
+        ["gh", "api", f"repos/{repository}/actions/jobs/{job_id}/logs"],
         destination=destination,
         error_path=error_path,
+    ):
+        _write_json(
+            log_status_path,
+            {"job_id": int(job_id), "source": "job_logs_api", "status": "downloaded"},
+        )
+        return
+
+    if _extract_job_log_from_run_archive(
+        repository=repository,
+        run_id=run_id,
+        job_name="ci-2-virt-node",
+        destination=destination,
+    ):
+        error_path.unlink(missing_ok=True)
+        _write_json(
+            log_status_path,
+            {"job_id": int(job_id), "source": "run_logs_archive", "status": "downloaded"},
+        )
+        return
+
+    _write_json(
+        log_status_path,
+        {"job_id": int(job_id), "source": None, "status": "unavailable"},
     )
 
 
@@ -297,16 +545,27 @@ def _run_metadata_fields(run: dict[str, object]) -> list[str]:
     ]
 
 
-def _fetch_logs(args: argparse.Namespace) -> None:
+def _fetch_evidence(args: argparse.Namespace) -> None:
     context_root = args.context_root.resolve()
     github_root = context_root / "github"
     history_root = github_root / "history"
     history_root.mkdir(parents=True, exist_ok=True)
+    _download_current_context_artifact(
+        repository=args.repository,
+        run_id=args.current_run_id,
+        artifact_name=args.current_context_artifact_name,
+        context_root=context_root,
+        github_root=github_root,
+        wait_seconds=args.artifact_wait_seconds,
+        poll_seconds=args.artifact_poll_seconds,
+    )
     if not (context_root / "current" / "manifest.json").is_file():
-        _write_fetch_error(
-            github_root / "current-artifact.fetch-error.txt",
-            "Current failure-context artifact is missing or could not be downloaded",
-        )
+        error_path = github_root / "current-artifact.fetch-error.txt"
+        if not error_path.exists():
+            _write_fetch_error(
+                error_path,
+                "Current failure-context artifact is missing or did not contain manifest.json",
+            )
 
     _fetch_api_json(
         args.repository,
@@ -442,16 +701,19 @@ def _parse_args() -> argparse.Namespace:
     )
     check_config.set_defaults(handler=_check_api_config)
 
-    fetch_logs = subparsers.add_parser(
-        "fetch-logs",
-        help="Fetch current and historical GitHub Actions failure logs.",
+    fetch_evidence = subparsers.add_parser(
+        "fetch-evidence",
+        help="Fetch current and historical GitHub Actions failure evidence.",
     )
-    fetch_logs.add_argument("--repository", required=True)
-    fetch_logs.add_argument("--current-run-id", required=True)
-    fetch_logs.add_argument("--workflow-file", required=True)
-    fetch_logs.add_argument("--history-failure-limit", type=int, default=5)
-    fetch_logs.add_argument("--context-root", type=Path, required=True)
-    fetch_logs.set_defaults(handler=_fetch_logs)
+    fetch_evidence.add_argument("--repository", required=True)
+    fetch_evidence.add_argument("--current-run-id", required=True)
+    fetch_evidence.add_argument("--current-context-artifact-name", required=True)
+    fetch_evidence.add_argument("--workflow-file", required=True)
+    fetch_evidence.add_argument("--history-failure-limit", type=int, default=5)
+    fetch_evidence.add_argument("--artifact-wait-seconds", type=float, default=60.0)
+    fetch_evidence.add_argument("--artifact-poll-seconds", type=float, default=5.0)
+    fetch_evidence.add_argument("--context-root", type=Path, required=True)
+    fetch_evidence.set_defaults(handler=_fetch_evidence)
 
     build_inventory = subparsers.add_parser(
         "build-inventory",
@@ -471,6 +733,10 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if getattr(args, "history_failure_limit", 0) < 0:
         parser.error("--history-failure-limit must be non-negative")
+    if getattr(args, "artifact_wait_seconds", 0.0) < 0:
+        parser.error("--artifact-wait-seconds must be non-negative")
+    if getattr(args, "artifact_poll_seconds", 1.0) <= 0:
+        parser.error("--artifact-poll-seconds must be positive")
     return args
 
 
