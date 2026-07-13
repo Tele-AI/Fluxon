@@ -1591,10 +1591,56 @@ class TestMPMCReadinessContract(unittest.TestCase):
         )
         self.assertEqual(len(node.cluster_ready_calls), 2)
         self.assertEqual(node.cluster_ready_calls[0]["runtime"], runtime)
-        self.assertEqual(node.cluster_ready_calls[0]["timeout_s"], 5.0)
+        self.assertGreater(node.cluster_ready_calls[0]["timeout_s"], 0.0)
+        self.assertLessEqual(node.cluster_ready_calls[0]["timeout_s"], 5.0)
         for _channel_id, value in put_calls:
             header = json.loads(value["payload"].split(b"\n", 1)[0].decode("utf-8"))
             self.assertEqual(header["message_kind"], "prefeed")
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_mpmc_producer_prefeed_retries_transient_put_failure(self) -> None:
+        class PrefeedNode(BenchmarkNode):
+            def _wait_mpmc_prefeed_topology(self, **_kwargs):
+                return SimpleNamespace(ready_channel_ids=("11",))
+
+        node = PrefeedNode()
+        node.instance_key = "producer_0_proc_0"
+        node.node_id = "node_producer_0"
+        node.mq_state = node_mod.MQState(role="producer", weight=1.0)
+        node.test_config = {
+            "node_role": "producer",
+            "test_mode": TestMode.MPMC.value,
+            "value_size": 256,
+        }
+        node._runtime_init_retry_sleep_seconds = lambda attempt: 0.0  # type: ignore[method-assign]
+        runtime = PreparedWorkerRuntime(
+            producer=object(),
+            local_mq_state=node_mod.MQState(
+                role="producer",
+                weight=1.0,
+                producer_id="producer_0_proc_0",
+            ),
+        )
+
+        with mock.patch.object(
+            node_mod,
+            "mq_put_to_channel_once",
+            side_effect=[
+                "MPSC channel is not ready for prefeed: channel_id=11",
+                None,
+                None,
+            ],
+        ) as put_mock, mock.patch.object(node_mod.time, "sleep", return_value=None):
+            node._prefeed_mpmc_producer_channels(
+                runtime=runtime,
+                thread_id=0,
+                timeout_s=5.0,
+            )
+
+        self.assertEqual(put_mock.call_count, 3)
+        first_value = put_mock.call_args_list[0].args[2]
+        retried_value = put_mock.call_args_list[1].args[2]
+        self.assertEqual(first_value["unique_id"], retried_value["unique_id"])
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
     def test_prefeed_waits_for_exact_stable_global_consumer_topology(self) -> None:
@@ -1634,6 +1680,35 @@ class TestMPMCReadinessContract(unittest.TestCase):
             )
 
         self.assertEqual(snapshot.ready_channel_ids, ("11", "12"))
+        self.assertEqual(snapshot_mock.call_count, 3)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_prefeed_topology_retries_transient_observation_failure(self) -> None:
+        node = BenchmarkNode()
+        node.test_config = {
+            "node_role": "producer",
+            "test_mode": TestMode.MPMC.value,
+            "expected_mpmc_consumer_workers": 1,
+        }
+        node._runtime_init_retry_sleep_seconds = lambda attempt: 0.0  # type: ignore[method-assign]
+        ready = SimpleNamespace(
+            mpmc_id="7",
+            ready_channel_ids=("11",),
+            active_consumers=1,
+        )
+        runtime = PreparedWorkerRuntime(producer=object())
+
+        with mock.patch.object(
+            node_mod,
+            "get_cluster_info_snapshot",
+            side_effect=[RuntimeError("etcd status probe timed out"), ready, ready],
+        ) as snapshot_mock, mock.patch.object(node_mod.time, "sleep", return_value=None):
+            snapshot = node._wait_mpmc_prefeed_topology(
+                runtime=runtime,
+                timeout_s=5.0,
+            )
+
+        self.assertEqual(snapshot.ready_channel_ids, ("11",))
         self.assertEqual(snapshot_mock.call_count, 3)
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
@@ -1788,7 +1863,37 @@ class TestMPMCReadinessContract(unittest.TestCase):
         node.test_config["expected_nodes"] = 64
         stagger_s = node._runtime_init_stagger_seconds()
         self.assertGreaterEqual(stagger_s, 0.0)
-        self.assertLessEqual(stagger_s, 24.0)
+        self.assertLessEqual(stagger_s, 72.0)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_runtime_init_stagger_prioritizes_prefeed_producer(self) -> None:
+        node = BenchmarkNode()
+        node.instance_key = "bench_mq__producer_0_proc_0"
+        node.test_config = {
+            "test_mode": TestMode.MPMC.value,
+            "node_role": "producer",
+            "expected_nodes": 168,
+            "mpmc_producer_prefeed_leader": False,
+        }
+
+        with mock.patch.object(node, "_stable_fraction_from_text", return_value=0.5):
+            self.assertEqual(node._runtime_init_stagger_seconds(), 114.0)
+            node.test_config["mpmc_producer_prefeed_leader"] = True
+            self.assertEqual(node._runtime_init_stagger_seconds(), 0.0)
+
+    @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
+    def test_runtime_init_retry_uses_equal_jittered_exponential_backoff(self) -> None:
+        node = BenchmarkNode()
+        node.instance_key = "producer_7_proc_3"
+
+        with mock.patch.object(node, "_stable_fraction_from_text", return_value=0.0):
+            self.assertEqual(node._runtime_init_retry_sleep_seconds(attempt=1), 0.5)
+            self.assertEqual(node._runtime_init_retry_sleep_seconds(attempt=2), 1.0)
+            self.assertEqual(node._runtime_init_retry_sleep_seconds(attempt=6), 15.0)
+        with mock.patch.object(node, "_stable_fraction_from_text", return_value=1.0):
+            self.assertEqual(node._runtime_init_retry_sleep_seconds(attempt=1), 1.0)
+            self.assertEqual(node._runtime_init_retry_sleep_seconds(attempt=2), 2.0)
+            self.assertEqual(node._runtime_init_retry_sleep_seconds(attempt=6), 30.0)
 
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
     def test_runtime_init_etcd_health_cache_is_workload_scoped(self) -> None:

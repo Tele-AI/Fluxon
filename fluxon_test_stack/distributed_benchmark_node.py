@@ -232,10 +232,11 @@ TCP_THREAD_TRANSPORT_QUERY_TIMEOUT_SECONDS = 10.0
 # No fallback/default: MPMC cluster readiness timeout must be explicitly provided
 # by the coordinator via test_config["cluster_ready_timeout_seconds"].
 MPMC_READY_INIT_STAGGER_MIN_EXPECTED_NODES = 16
-MPMC_READY_INIT_STAGGER_SECONDS_PER_EXTRA_NODE = 0.5
-MPMC_READY_INIT_STAGGER_MAX_SECONDS = 60.0
+MPMC_READY_INIT_STAGGER_SECONDS_PER_EXTRA_NODE = 1.5
+MPMC_READY_INIT_STAGGER_MAX_SECONDS = 300.0
 READY_RUNTIME_INIT_RETRY_BASE_SECONDS = 1.0
-READY_RUNTIME_INIT_RETRY_MAX_SECONDS = 10.0
+READY_RUNTIME_INIT_RETRY_MAX_SECONDS = 30.0
+READY_RUNTIME_INIT_RETRY_EQUAL_JITTER_RATIO = 0.5
 RUNTIME_INIT_ETCD_HEALTH_PROBE_TIMEOUT_SECONDS = 1.0
 RUNTIME_INIT_ETCD_HEALTH_CACHE_TTL_SECONDS = 2.0
 RUNTIME_INIT_ETCD_HEALTH_WAIT_LOG_INTERVAL_SECONDS = 10.0
@@ -1279,6 +1280,14 @@ class BenchmarkNode:
         if expected_nodes <= MPMC_READY_INIT_STAGGER_MIN_EXPECTED_NODES:
             return 0.0
 
+        if (
+            str(self.test_config.get("node_role", "")).strip() == "producer"
+            and self.test_config.get("mpmc_producer_prefeed_leader") is True
+        ):
+            # The prefeed producer is the readiness bootstrap path for every
+            # consumer. Start it before the large producer fan-out.
+            return 0.0
+
         max_stagger_s = min(
             MPMC_READY_INIT_STAGGER_MAX_SECONDS,
             (
@@ -1435,13 +1444,14 @@ class BenchmarkNode:
         return max(0.0, timeout_s)
 
     def _runtime_init_retry_sleep_seconds(self, *, attempt: int) -> float:
-        base_s = min(
+        retry_window_s = min(
             READY_RUNTIME_INIT_RETRY_MAX_SECONDS,
             READY_RUNTIME_INIT_RETRY_BASE_SECONDS * (2 ** max(0, attempt - 1)),
         )
         key = f"{self.instance_key or self.node_id}:{attempt}"
-        jitter_s = self._stable_fraction_from_text(key) * 0.5
-        return base_s + jitter_s
+        jitter_fraction = self._stable_fraction_from_text(key)
+        floor_s = retry_window_s * READY_RUNTIME_INIT_RETRY_EQUAL_JITTER_RATIO
+        return floor_s + (retry_window_s - floor_s) * jitter_fraction
 
     @staticmethod
     def _runtime_init_shared_json_candidates(kvcache_config: Dict[str, Any]) -> List[Path]:
@@ -3145,9 +3155,44 @@ class BenchmarkNode:
         stable_observations = 0
         last_reason = ""
         last_log_ts = 0.0
+        snapshot_error_attempt = 0
 
         while True:
-            snapshot = get_cluster_info_snapshot(runtime.producer)
+            try:
+                snapshot = get_cluster_info_snapshot(runtime.producer)
+            except Exception as exc:  # noqa: BLE001
+                snapshot_error_attempt += 1
+                now = time.monotonic()
+                reason = f"topology observation failed: {type(exc).__name__}: {exc}"
+                remaining_s = deadline_ts - now
+                if remaining_s <= 0.0:
+                    raise RuntimeError(
+                        "MPMC prefeed topology did not become observable before timeout: "
+                        f"expected_channels={expected_channels} reason={reason}"
+                    ) from exc
+                sleep_s = min(
+                    remaining_s,
+                    self._runtime_init_retry_sleep_seconds(
+                        attempt=snapshot_error_attempt
+                    ),
+                )
+                if reason != last_reason or now - last_log_ts >= 10.0:
+                    logger.warning(
+                        "⏳ MPMC prefeed topology observation retry: "
+                        "expected_channels=%s attempt=%s sleep_seconds=%.2f "
+                        "remaining_seconds=%.1f reason=%s",
+                        expected_channels,
+                        snapshot_error_attempt,
+                        sleep_s,
+                        remaining_s,
+                        reason,
+                    )
+                    last_reason = reason
+                    last_log_ts = now
+                time.sleep(sleep_s)
+                continue
+
+            snapshot_error_attempt = 0
             ready_channel_ids = snapshot.ready_channel_ids
             active_consumers = snapshot.active_consumers
 
@@ -3208,6 +3253,100 @@ class BenchmarkNode:
                 last_log_ts = now
             time.sleep(min(1.0, max(0.0, deadline_ts - now)))
 
+    @staticmethod
+    def _is_retryable_mpmc_prefeed_put_error(error_msg: str) -> bool:
+        lowered = str(error_msg).lower()
+        fatal_markers = (
+            "producer is not initialized",
+            "invalid mpsc channel_id",
+            "prefeed producer closed",
+        )
+        if any(marker in lowered for marker in fatal_markers):
+            return False
+        retryable_markers = (
+            "channel is not ready for prefeed",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection refused",
+            "networkerror",
+            "etcdserver: request timed out",
+            "failed to get next available channel",
+            "lease keepalive",
+        )
+        return any(marker in lowered for marker in retryable_markers)
+
+    def _put_mpmc_prefeed_message_with_retry(
+        self,
+        *,
+        producer: Any,
+        channel_id: str,
+        value: Dict[str, Any],
+        deadline_ts: float,
+        thread_id: int,
+        channel_message_idx: int,
+    ) -> None:
+        """Put one prefeed message, retrying transient errors on the same endpoint."""
+        attempt = 0
+        while True:
+            if self._benchmark_stop.is_set():
+                raise RuntimeError(
+                    "MPMC producer prefeed stopped before PUT completed: "
+                    f"thread_id={thread_id} channel_id={channel_id}"
+                )
+            remaining_s = deadline_ts - time.monotonic()
+            if remaining_s <= 0.0:
+                raise RuntimeError(
+                    "MPMC producer prefeed PUT timed out: "
+                    f"thread_id={thread_id} channel_id={channel_id} "
+                    f"channel_message={channel_message_idx + 1} attempts={attempt}"
+                )
+
+            attempt += 1
+            err = mq_put_to_channel_once(producer, channel_id, value)
+            if err is None:
+                if attempt > 1:
+                    logger.info(
+                        "✅ MPMC producer prefeed PUT retry succeeded: "
+                        "thread_id=%s channel_id=%s channel_message=%s attempts=%s",
+                        thread_id,
+                        channel_id,
+                        channel_message_idx + 1,
+                        attempt,
+                    )
+                return
+            if not self._is_retryable_mpmc_prefeed_put_error(err):
+                raise RuntimeError(
+                    "MPMC producer prefeed PUT failed: "
+                    f"thread_id={thread_id} channel_id={channel_id} "
+                    f"channel_message={channel_message_idx + 1} err={err}"
+                )
+
+            remaining_s = deadline_ts - time.monotonic()
+            if remaining_s <= 0.0:
+                raise RuntimeError(
+                    "MPMC producer prefeed PUT retry deadline exceeded: "
+                    f"thread_id={thread_id} channel_id={channel_id} "
+                    f"channel_message={channel_message_idx + 1} attempts={attempt} err={err}"
+                )
+            sleep_s = min(
+                remaining_s,
+                self._runtime_init_retry_sleep_seconds(attempt=attempt),
+            )
+            logger.warning(
+                "⚠️ MPMC producer prefeed PUT transient failure; retrying: "
+                "thread_id=%s channel_id=%s channel_message=%s attempt=%s "
+                "sleep_seconds=%.2f remaining_seconds=%.1f err=%s",
+                thread_id,
+                channel_id,
+                channel_message_idx + 1,
+                attempt,
+                sleep_s,
+                remaining_s,
+                err,
+            )
+            time.sleep(sleep_s)
+
     def _prefeed_mpmc_producer_channels(
         self,
         *,
@@ -3224,9 +3363,10 @@ class BenchmarkNode:
                 f"MPMC producer prefeed requires an active producer endpoint: thread_id={thread_id}"
             )
 
+        prefeed_deadline_ts = time.monotonic() + float(timeout_s)
         snapshot = self._wait_mpmc_prefeed_topology(
             runtime=runtime,
-            timeout_s=timeout_s,
+            timeout_s=max(0.001, prefeed_deadline_ts - time.monotonic()),
         )
         channel_ids = snapshot.ready_channel_ids
         total_mpsc_channels = len(channel_ids)
@@ -3245,7 +3385,6 @@ class BenchmarkNode:
         value_size = int(self.test_config.get("value_size", 1024))
         message_count = total_mpsc_channels * MPMC_PRODUCER_PREFEED_MESSAGES_PER_CHANNEL
         fallback_producer_id = self.instance_key or self.node_id
-        prefeed_deadline_ts = time.monotonic() + float(timeout_s)
         logger.info(
             "🔥 MPMC producer prefeed start: thread_id=%s total_mpsc_channels=%s messages=%s value_size=%s",
             thread_id,
@@ -3276,7 +3415,14 @@ class BenchmarkNode:
                     message_kind=MQ_MESSAGE_KIND_PREFEED,
                 )
                 put_start = time.perf_counter()
-                err = mq_put_to_channel_once(producer, channel_id, value)
+                self._put_mpmc_prefeed_message_with_retry(
+                    producer=producer,
+                    channel_id=channel_id,
+                    value=value,
+                    deadline_ts=prefeed_deadline_ts,
+                    thread_id=thread_id,
+                    channel_message_idx=channel_message_idx,
+                )
                 put_latency_s = time.perf_counter() - put_start
                 completed += 1
                 if put_latency_s >= MPMC_PRODUCER_PREFEED_SLOW_PUT_LOG_SECONDS:
@@ -3290,13 +3436,6 @@ class BenchmarkNode:
                         completed,
                         message_count,
                         put_latency_s,
-                    )
-                if err is not None:
-                    raise RuntimeError(
-                        "MPMC producer prefeed PUT failed: "
-                        f"thread_id={thread_id} channel_id={channel_id} "
-                        f"channel_message={channel_message_idx + 1}/"
-                        f"{MPMC_PRODUCER_PREFEED_MESSAGES_PER_CHANNEL} err={err}"
                     )
 
         final_snapshot = self._wait_mpmc_prefeed_topology(
@@ -3391,7 +3530,10 @@ class BenchmarkNode:
                     self._prefeed_mpmc_producer_channels(
                         runtime=runtime,
                         thread_id=thread_id,
-                        timeout_s=cluster_ready_timeout_s,
+                        timeout_s=max(
+                            0.001,
+                            prepare_retry_deadline_ts - time.monotonic(),
+                        ),
                     )
                 elif role == "producer" and not runtime.logical_only:
                     logger.info(

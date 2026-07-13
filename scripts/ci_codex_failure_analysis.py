@@ -18,7 +18,7 @@ import zipfile
 
 LOG_SUFFIXES = frozenset({".err", ".log", ".out", ".stderr", ".stdout"})
 TESTBED_HOSTWORKDIR_DIRNAME = "fluxon_deploy"
-MIDDLEWARE_LOG_SERVICES = ("etcd", "greptime")
+TESTBED_SERVICE_LOG_NAMES = ("etcd", "greptime", "ops_controller")
 DIAGNOSTIC_NAMES = frozenset(
     {
         "benchmark_result.json",
@@ -86,12 +86,12 @@ def _should_collect(path: Path) -> bool:
     )
 
 
-def _middleware_log_service(path: Path) -> str | None:
-    """Return the canonical service name for a testbed middleware log."""
+def _testbed_service_log_name(path: Path) -> str | None:
+    """Return the canonical service name for a collected testbed log."""
     if path.parent.name.lower() != "log" or path.suffix.lower() != ".log":
         return None
     service_name = path.name.split(".", 1)[0].lower()
-    if service_name not in MIDDLEWARE_LOG_SERVICES:
+    if service_name not in TESTBED_SERVICE_LOG_NAMES:
         return None
     return service_name
 
@@ -113,11 +113,14 @@ def _collect_context(args: argparse.Namespace) -> None:
 
     source_roots = [
         repo_root / ".dever" / "ci_2_virt_node" / "runner_run",
+        repo_root / ".dever" / "ci_2_virt_node" / "start_test_bed",
         repo_root / "setup_and_pack" / "nix" / "runs",
         repo_root / "fluxon_release",
     ]
-    middleware_log_root = runner_temp / TESTBED_HOSTWORKDIR_DIRNAME
-    middleware_log_counts = {service_name: 0 for service_name in MIDDLEWARE_LOG_SERVICES}
+    testbed_service_log_root = runner_temp / TESTBED_HOSTWORKDIR_DIRNAME
+    testbed_service_log_counts = {
+        service_name: 0 for service_name in TESTBED_SERVICE_LOG_NAMES
+    }
     copied: list[dict[str, object]] = []
     skipped: list[dict[str, str]] = []
 
@@ -161,28 +164,28 @@ def _collect_context(args: argparse.Namespace) -> None:
                 continue
             copy_text_diagnostic(source, source.relative_to(repo_root))
 
-    if not middleware_log_root.exists():
+    if not testbed_service_log_root.exists():
         skipped.append(
             {
-                "source": str(middleware_log_root),
+                "source": str(testbed_service_log_root),
                 "reason": "testbed hostworkdir root is missing",
             }
         )
     else:
-        middleware_log_candidates = {
+        testbed_service_log_candidates = {
             source
             for pattern in ("log/*.log", "*/log/*.log")
-            for source in middleware_log_root.glob(pattern)
+            for source in testbed_service_log_root.glob(pattern)
         }
-        for source in sorted(middleware_log_candidates):
+        for source in sorted(testbed_service_log_candidates):
             if not source.is_file() or source.is_symlink():
                 continue
-            service_name = _middleware_log_service(source)
+            service_name = _testbed_service_log_name(source)
             if service_name is None:
                 continue
             relative = Path("runner-temp") / source.relative_to(runner_temp)
             if copy_text_diagnostic(source, relative):
-                middleware_log_counts[service_name] += 1
+                testbed_service_log_counts[service_name] += 1
 
     explicit_files = [
         repo_root / ".github" / "workflows" / "all_test.yml",
@@ -204,15 +207,17 @@ def _collect_context(args: argparse.Namespace) -> None:
     manifest = {
         "contract": "Files are copied in full without tail truncation.",
         "source_roots": [str(path) for path in source_roots],
-        "middleware_logs": {
+        "testbed_service_logs": {
             "contract": (
-                "Complete etcd and GreptimeDB service stdout/stderr logs are copied; "
-                "middleware data directories are excluded."
+                "Complete etcd, GreptimeDB, and Ops controller service stdout/stderr "
+                "logs are copied; service data directories are excluded."
             ),
-            "source_root": str(middleware_log_root),
+            "source_root": str(testbed_service_log_root),
             "services": {
-                service_name: {"copied_file_count": middleware_log_counts[service_name]}
-                for service_name in MIDDLEWARE_LOG_SERVICES
+                service_name: {
+                    "copied_file_count": testbed_service_log_counts[service_name]
+                }
+                for service_name in TESTBED_SERVICE_LOG_NAMES
             },
         },
         "copied_file_count": len(copied),
@@ -229,10 +234,10 @@ def _collect_context(args: argparse.Namespace) -> None:
         f"({manifest['copied_total_bytes']} bytes) in {context_root}"
     )
     print(
-        "Collected testbed middleware service logs: "
+        "Collected testbed service logs: "
         + " ".join(
-            f"{service_name}={middleware_log_counts[service_name]}"
-            for service_name in MIDDLEWARE_LOG_SERVICES
+            f"{service_name}={testbed_service_log_counts[service_name]}"
+            for service_name in TESTBED_SERVICE_LOG_NAMES
         )
     )
     if skipped:

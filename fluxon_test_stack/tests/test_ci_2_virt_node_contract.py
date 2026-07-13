@@ -189,7 +189,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             self.assertNotIn(base_url, rendered)
             self.assertEqual(summary.read_text(encoding="utf-8"), rendered)
 
-    def test_codex_context_collects_testbed_middleware_service_logs(self) -> None:
+    def test_codex_context_collects_testbed_service_logs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             repo_root = root / "repository"
@@ -201,8 +201,13 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             service_log_root.mkdir(parents=True)
             etcd_log = service_log_root / "etcd.2026-07-14.log"
             greptime_log = service_log_root / "greptime.log"
+            ops_controller_log = service_log_root / "ops_controller.2026-07-14.log"
             etcd_log.write_text("etcd server line 1\netcd server line 2\n", encoding="utf-8")
             greptime_log.write_text("greptime server line\n", encoding="utf-8")
+            ops_controller_log.write_text(
+                "ops controller server line\n",
+                encoding="utf-8",
+            )
             (service_log_root / "owner.2026-07-14.log").write_text(
                 "owner service line\n",
                 encoding="utf-8",
@@ -240,6 +245,10 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 (copied_log_root / greptime_log.name).read_text(encoding="utf-8"),
                 greptime_log.read_text(encoding="utf-8"),
             )
+            self.assertEqual(
+                (copied_log_root / ops_controller_log.name).read_text(encoding="utf-8"),
+                ops_controller_log.read_text(encoding="utf-8"),
+            )
             self.assertFalse((copied_log_root / "owner.2026-07-14.log").exists())
             self.assertFalse(
                 (
@@ -256,15 +265,19 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             manifest = json.loads(
                 (context_root / "manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["copied_file_count"], 2)
+            self.assertEqual(manifest["copied_file_count"], 3)
             self.assertEqual(
-                manifest["middleware_logs"]["services"],
+                manifest["testbed_service_logs"]["services"],
                 {
                     "etcd": {"copied_file_count": 1},
                     "greptime": {"copied_file_count": 1},
+                    "ops_controller": {"copied_file_count": 1},
                 },
             )
-            self.assertIn("etcd=1 greptime=1", output.getvalue())
+            self.assertIn(
+                "etcd=1 greptime=1 ops_controller=1",
+                output.getvalue(),
+            )
 
     def test_generated_suite_is_public_dual_local_nodes_ci_only(self) -> None:
         suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
