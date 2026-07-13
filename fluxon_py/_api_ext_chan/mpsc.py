@@ -481,7 +481,9 @@ class MPSCChanProducer(ChannelProducer):
         self._parent_mpmc_id = parent_mpmc_id_opt
         self._ctx = _NoopCloseable()
         self._handle = None  # type: ignore[assignment]
-        self._handle_lock = threading.Lock()
+        # PyO3 handle methods borrow `&mut self`, so calls on one handle are
+        # single-flight. Lifecycle shutdown must never wait on this lock.
+        self._data_path_lock = threading.Lock()
         self._chan_id = "-1"
         self._producer_id = "unknown"
         self._closed_local = False
@@ -601,12 +603,18 @@ class MPSCChanProducer(ChannelProducer):
             logging.debug("%s shutdown signal skipped: %s", self.dbg_tag(), e)
 
     def record_nonblocking_put_success(self, unix_ms: int) -> None:
-        with self._handle_lock:
-            self._handle.record_nonblocking_put_success(unix_ms)  # type: ignore[attr-defined]
+        with self._data_path_lock:
+            handle = self._handle
+            if self.shutdown_ctl.closed or handle is None:
+                return
+            handle.record_nonblocking_put_success(unix_ms)
 
     def record_blocking_put_observed(self, unix_ms: int) -> None:
-        with self._handle_lock:
-            self._handle.record_blocking_put_observed(unix_ms)  # type: ignore[attr-defined]
+        with self._data_path_lock:
+            handle = self._handle
+            if self.shutdown_ctl.closed or handle is None:
+                return
+            handle.record_blocking_put_observed(unix_ms)
 
     # Note: historically the payload lease id was injected after
     # construction via `set_payload_lease_id`. Now we always resolve it
@@ -652,8 +660,9 @@ class MPSCChanProducer(ChannelProducer):
             return Result[bool, ApiError].new_error(e)  # type: ignore[arg-type]
 
         try:
-            with self._handle_lock:
-                if self.shutdown_ctl.closed:
+            with self._data_path_lock:
+                handle = self._handle
+                if self.shutdown_ctl.closed or handle is None:
                     return Result[bool, ApiError].new_error(
                         ProducerClosedError(
                             message="producer is closed",
@@ -661,8 +670,17 @@ class MPSCChanProducer(ChannelProducer):
                             producer_idx=self.get_producer_id(),
                         )
                     )
-                self._handle.put_flat_dict_ptrs(ptrs)  # type: ignore[attr-defined]
+                handle.put_flat_dict_ptrs(ptrs)
         except Exception as e:  # pragma: no cover - thin shim
+            if self.shutdown_ctl.closed:
+                logging.debug("%s put stopped by close: %s", self.dbg_tag(), e)
+                return Result[bool, ApiError].new_error(
+                    ProducerClosedError(
+                        message="producer is closed",
+                        channel_id=self.get_chan_id(),
+                        producer_idx=self.get_producer_id(),
+                    )
+                )
             if _is_close_during_put_error(e):
                 self._signal_shutdown()
                 logging.info("%s put aborted by close: %s", self.dbg_tag(), e)
@@ -726,20 +744,10 @@ class MPSCChanProducer(ChannelProducer):
             )
             self._closed_local = True
             self._signal_shutdown()
-            handle_lock = getattr(self, "_handle_lock", None)
-            if handle_lock is None:
-                self._handle_shutdown_ctl = None  # type: ignore[assignment]
-                try:
-                    self._handle = None  # type: ignore[assignment]
-                except Exception as e:
-                    logging.warning("%s failed to drop rust handle: %s", dbg, e)
-            else:
-                with handle_lock:
-                    self._handle_shutdown_ctl = None  # type: ignore[assignment]
-                    try:
-                        self._handle = None  # type: ignore[assignment]
-                    except Exception as e:
-                        logging.warning("%s failed to drop rust handle: %s", dbg, e)
+            self._handle_shutdown_ctl = None  # type: ignore[assignment]
+            # In-flight calls retain their own strong reference and unwind
+            # after the independent Rust shutdown signal above.
+            self._handle = None  # type: ignore[assignment]
             if self._parent_mpmc_id is None:
                 try:
                     self._ctx.close()
@@ -859,7 +867,9 @@ class MPSCChanConsumer(ChannelConsumer):
         self._parent_mpmc_id = parent_mpmc_id_opt
         self._ctx = _NoopCloseable()
         self._handle = None  # type: ignore[assignment]
-        self._handle_lock = threading.Lock()
+        # Consumer ordering is single-flight at the PyO3 `&mut self` boundary.
+        # close() signals shutdown independently and never waits on this lock.
+        self._data_path_lock = threading.Lock()
         self._chan_id = "-1"
         self._consumer_id = "unknown"
         # MPMC may claim the sub-channel ready key before returning this
@@ -988,14 +998,10 @@ class MPSCChanConsumer(ChannelConsumer):
             )
             self._closed_local = True
             self._signal_shutdown()
-            handle_lock = getattr(self, "_handle_lock", None)
-            if handle_lock is None:
-                self._handle_shutdown_ctl = None  # type: ignore[assignment]
-                self._handle = None  # type: ignore[assignment]
-            else:
-                with handle_lock:
-                    self._handle_shutdown_ctl = None  # type: ignore[assignment]
-                    self._handle = None  # type: ignore[assignment]
+            self._handle_shutdown_ctl = None  # type: ignore[assignment]
+            # The active get keeps the PyO3 object alive until it observes
+            # shutdown and returns; detaching here does not invalidate it.
+            self._handle = None  # type: ignore[assignment]
             if self._parent_mpmc_id is None:
                 try:
                     self._ctx.close()
@@ -1262,19 +1268,20 @@ class MPSCChanConsumer(ChannelConsumer):
             t_sec = try_time if try_time > 0 else 1
             timeout_ms = int(t_sec * 1000)
             assert timeout_ms > 0
-	    
+
         for _ in range(batch_size):
             try:
                 # Pass timeout_ms (converted from try_time seconds) to Rust.
-                with self._handle_lock:
-                    if self.shutdown_ctl.closed:
+                with self._data_path_lock:
+                    handle = self._handle
+                    if self.shutdown_ctl.closed or handle is None:
                         return Result.new_error(
                             ChannelClosedError(
                                 message="Consumer is closed.",
                                 channel_id=self._chan_id,
                             )
                         )
-                    obj = self._handle.get_one(prefetch_target, timeout_ms)  # type: ignore[attr-defined]
+                    obj = handle.get_one(prefetch_target, timeout_ms)
             except Exception as e:
                 # Rust is expected to raise an extension-layer ApiError. To avoid carrying
                 # arbitrary Exception types in Result, wrap non-ApiError into

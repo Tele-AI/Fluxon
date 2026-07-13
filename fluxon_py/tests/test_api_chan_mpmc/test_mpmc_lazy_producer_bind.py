@@ -102,7 +102,7 @@ def _make_close_test_handle(
     obj._handle_shutdown_ctl = _FakeCloseable()
     obj._ctx = _FakeCloseable()
     obj._handle = None
-    obj._handle_lock = threading.Lock()
+    obj._data_path_lock = threading.Lock()
     obj.shutdown_ctl = _FakeShutdownCtl()
     obj.api = object()
     obj._parent_mpmc_id = "1" if subchannel else None
@@ -555,20 +555,21 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
             ],
         )
 
-    def test_mpsc_consumer_close_wakes_blocked_get(self):
+    def test_mpsc_consumer_close_does_not_wait_for_blocked_get(self):
         get_entered = threading.Event()
-        get_stopped = threading.Event()
+        shutdown_signaled = threading.Event()
+        release_get = threading.Event()
 
         class _BlockingGetHandle:
             def get_one(self, prefetch_target, timeout_ms):
                 get_entered.set()
-                if not get_stopped.wait(timeout=1.0):
-                    raise AssertionError("close did not wake blocked get")
+                if not release_get.wait(timeout=2.0):
+                    raise AssertionError("test did not release blocked get")
                 raise RuntimeError("get cancelled")
 
         class _GetShutdownCtl:
             def close(self):
-                get_stopped.set()
+                shutdown_signaled.set()
 
         consumer = _make_close_test_handle(
             MPSCChanConsumer,
@@ -584,18 +585,94 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
         worker.start()
         self.assertTrue(get_entered.wait(timeout=1.0))
 
+        close_results = []
         with mock.patch.object(
             mpsc_module,
             "_delete_owned_etcd_state",
             return_value=Result.new_ok(OkNone()),
         ):
-            consumer.close().unwrap()
+            closer = threading.Thread(
+                target=lambda: close_results.append(consumer.close()),
+                daemon=True,
+            )
+            closer.start()
+            self.assertTrue(shutdown_signaled.wait(timeout=1.0))
+            closer.join(timeout=0.5)
+
+        self.assertFalse(closer.is_alive())
+        self.assertTrue(worker.is_alive())
+        self.assertEqual(len(close_results), 1)
+        close_results[0].unwrap()
+
+        release_get.set()
         worker.join(timeout=1.0)
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0].is_ok())
         self.assertIsInstance(results[0].unwrap_error(), ChannelClosedError)
+
+    def test_mpsc_producer_close_does_not_wait_for_blocked_put(self):
+        put_entered = threading.Event()
+        shutdown_signaled = threading.Event()
+        release_put = threading.Event()
+
+        class _BlockingPutHandle:
+            def put_flat_dict_ptrs(self, ptrs):
+                put_entered.set()
+                if not release_put.wait(timeout=2.0):
+                    raise AssertionError("test did not release blocked put")
+                raise RuntimeError("put cancelled")
+
+        class _PutShutdownCtl:
+            def close(self):
+                shutdown_signaled.set()
+
+        producer = _make_close_test_handle(
+            MPSCChanProducer,
+            subchannel=True,
+        )
+        producer._handle = _BlockingPutHandle()
+        producer._handle_shutdown_ctl = _PutShutdownCtl()
+        results = []
+        fake_pyo3 = types.SimpleNamespace(build_flat_dict_ptrs=lambda *_args: [])
+
+        close_results = []
+        with (
+            mock.patch.object(mpsc_module, "_fluxon_kv", fake_pyo3),
+            mock.patch.object(
+                mpsc_module,
+                "_delete_owned_etcd_state",
+                return_value=Result.new_ok(OkNone()),
+            ),
+        ):
+            worker = threading.Thread(
+                target=lambda: results.append(producer.put_data({"value": b"x"})),
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(put_entered.wait(timeout=1.0))
+
+            closer = threading.Thread(
+                target=lambda: close_results.append(producer.close()),
+                daemon=True,
+            )
+            closer.start()
+            self.assertTrue(shutdown_signaled.wait(timeout=1.0))
+            closer.join(timeout=0.5)
+
+        self.assertFalse(closer.is_alive())
+        self.assertTrue(worker.is_alive())
+        self.assertEqual(len(close_results), 1)
+        close_results[0].unwrap()
+
+        release_put.set()
+        worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].is_ok())
+        self.assertIsInstance(results[0].unwrap_error(), ProducerClosedError)
 
     @staticmethod
     def _capture_mpsc_construction_error(parent_shutdown_ctl, errors):

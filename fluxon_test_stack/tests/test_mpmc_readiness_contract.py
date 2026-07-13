@@ -324,22 +324,20 @@ class TestMPMCReadinessContract(unittest.TestCase):
                 if isinstance(node, ast.FunctionDef) and node.name == name
             )
 
-        def is_self_handle_lock(expr: ast.AST) -> bool:
+        def is_self_data_path_lock(expr: ast.AST) -> bool:
             return (
                 isinstance(expr, ast.Attribute)
-                and expr.attr == "_handle_lock"
+                and expr.attr == "_data_path_lock"
                 and isinstance(expr.value, ast.Name)
                 and expr.value.id == "self"
             )
 
-        def is_self_handle_call(call: ast.Call, attr: str) -> bool:
+        def is_local_handle_call(call: ast.Call, attr: str) -> bool:
             return (
                 isinstance(call.func, ast.Attribute)
                 and call.func.attr == attr
-                and isinstance(call.func.value, ast.Attribute)
-                and call.func.value.attr == "_handle"
-                and isinstance(call.func.value.value, ast.Name)
-                and call.func.value.value.id == "self"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "handle"
             )
 
         init_func = method("__init__")
@@ -347,7 +345,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
             node
             for node in ast.walk(init_func)
             if isinstance(node, ast.Assign)
-            and any(is_self_handle_lock(target) for target in node.targets)
+            and any(is_self_data_path_lock(target) for target in node.targets)
         ]
         self.assertEqual(len(lock_assigns), 1)
 
@@ -362,18 +360,28 @@ class TestMPMCReadinessContract(unittest.TestCase):
                 node
                 for node in ast.walk(fn)
                 if isinstance(node, ast.With)
-                and any(is_self_handle_lock(item.context_expr) for item in node.items)
+                and any(is_self_data_path_lock(item.context_expr) for item in node.items)
             ]
-            self.assertTrue(with_nodes, f"{method_name} must hold self._handle_lock")
+            self.assertTrue(with_nodes, f"{method_name} must hold self._data_path_lock")
             self.assertTrue(
                 any(
-                    is_self_handle_call(call, handle_attr)
+                    is_local_handle_call(call, handle_attr)
                     for with_node in with_nodes
                     for call in ast.walk(with_node)
                     if isinstance(call, ast.Call)
                 ),
-                f"{method_name} must call self._handle.{handle_attr} under self._handle_lock",
+                f"{method_name} must call local handle.{handle_attr} under self._data_path_lock",
             )
+
+        close_func = method("close")
+        self.assertFalse(
+            any(
+                isinstance(node, ast.With)
+                and any(is_self_data_path_lock(item.context_expr) for item in node.items)
+                for node in ast.walk(close_func)
+            ),
+            "MPSCChanProducer.close must not wait for the data-path lock",
+        )
 
     def test_existing_mpmc_attach_does_not_register_shared_keepalives(self) -> None:
         source = Path("fluxon_py/_api_ext_chan/mpmc.py").read_text(encoding="utf-8")
