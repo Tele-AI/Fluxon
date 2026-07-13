@@ -8,6 +8,7 @@ import logging
 from logging import Logger
 from fluxon_py.logging import init_logger, update_log_level
 import multiprocessing
+import threading
 from typing import List
 from fluxon_py.kvclient.kvclient_interface import KvClient
 from fluxon_py import FluxonKvClientConfig
@@ -15,7 +16,7 @@ from fluxon_py import new_store
 from fluxon_py import ChanType, ChanRole, chan_new, chan_bind, MPSCChanConsumer, MPMCChanConsumer, MPSCChanProducer, MPMCChanProducer
 from typing import Optional, Dict, Union
 from fluxon_py import api_ext_chan
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, TypeVar
 import signal
 from typing import Tuple
 import subprocess
@@ -105,6 +106,91 @@ BACKUP_LOGGING_ROOT: Any = None
 TEST_ARGMATRIX: Dict[str, Iterable[Any]] = {
     "prefetch": (0,),
 }
+T = TypeVar("T")
+_TEST_ETCD_CLIENT_LOCK = threading.Lock()
+_TEST_ETCD_CLIENT: Optional[Any] = None
+
+
+def etcd_control_client() -> Any:
+    """Return the cached PyO3 etcd client for process-level test control-plane ops."""
+    global _TEST_ETCD_CLIENT
+    with _TEST_ETCD_CLIENT_LOCK:
+        if _TEST_ETCD_CLIENT is None:
+            from fluxon_py.tool import import_fluxon_pyo3_local
+
+            fluxon_pyo3 = import_fluxon_pyo3_local()
+            _TEST_ETCD_CLIENT = fluxon_pyo3.EtcdKvClient([f"{ETCD_HOST}:{ETCD_PORT}"])
+        return _TEST_ETCD_CLIENT
+
+
+def is_transient_etcd_control_failure(exc: BaseException) -> bool:
+    rendered = f"{type(exc).__name__}: {exc}"
+    lowered = rendered.lower()
+    return (
+        "unavailable" in lowered
+        or "etcdserver: request timed out" in rendered
+        or "timed out" in lowered
+        or "timeout" in lowered
+        or "connection" in lowered
+        or "transport" in lowered
+        or "broken pipe" in lowered
+        or "closed" in lowered
+    )
+
+
+def etcd_control_call_with_retry(
+    context: str,
+    operation: Callable[[Any], T],
+    *,
+    max_attempts: int = 5,
+) -> T:
+    if max_attempts <= 0:
+        raise ValueError(f"max_attempts must be positive, got {max_attempts!r}")
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            client = etcd_control_client()
+            return operation(client)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if (not is_transient_etcd_control_failure(exc)) or attempt == max_attempts:
+                raise
+            sleep_s = min(0.2 * attempt, 2.0)
+            logging.warning(
+                "transient etcd failure during %s; retrying in %.1fs "
+                "(attempt %d/%d): %s",
+                context,
+                sleep_s,
+                attempt,
+                max_attempts,
+                exc,
+            )
+            time.sleep(sleep_s)
+
+    assert last_exc is not None
+    raise RuntimeError(f"etcd operation {context!r} failed") from last_exc
+
+
+def etcd_control_get(key: str) -> Optional[bytes]:
+    return etcd_control_call_with_retry(f"get {key}", lambda client: client.get(key))
+
+
+def etcd_control_put(key: str, value: bytes, lease_id: Optional[int] = None) -> None:
+    if lease_id is None:
+        etcd_control_call_with_retry(f"put {key}", lambda client: client.put(key, value))
+        return
+    etcd_control_call_with_retry(
+        f"put {key} with lease",
+        lambda client: client.put(key, value, lease_id=lease_id),
+    )
+
+
+def etcd_control_delete_prefix(prefix: str) -> int:
+    return etcd_control_call_with_retry(
+        f"delete_prefix {prefix}",
+        lambda client: client.delete_prefix(prefix),
+    )
 
 
 def run_with_argmatrix(

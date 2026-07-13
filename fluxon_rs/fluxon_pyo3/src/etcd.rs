@@ -1,8 +1,12 @@
 use etcd_client as etcd;
+use fluxon_util::auto_clean_map::{AutoCleanMap, AutoCleanMapEntry};
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
+use pyo3::types::{PyBytes, PyList, PyTuple};
 use pyo3::{PyErr, PyObject};
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tracing::debug;
@@ -12,6 +16,407 @@ fn is_lease_not_found_error(err: &etcd::Error) -> bool {
     msg.contains("requested lease not found")
         || msg.contains("lease not found")
         || msg.contains("code: notfound")
+}
+
+fn normalize_raw_endpoint(endpoint: &str) -> PyResult<String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "etcd endpoint must be non-empty raw host:port",
+        ));
+    }
+    if endpoint.contains("://") {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "etcd endpoint must be raw host:port without scheme, got: {}",
+            endpoint
+        )));
+    }
+    Ok(format!("http://{}", endpoint))
+}
+
+fn normalize_raw_endpoints(endpoints: Vec<String>, component: &str) -> PyResult<Vec<String>> {
+    if endpoints.is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{} requires at least one endpoint",
+            component
+        )));
+    }
+    let mut normalized = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        normalized.push(normalize_raw_endpoint(&endpoint)?);
+    }
+    Ok(normalized)
+}
+
+struct EtcdKvBackend {
+    endpoints: Vec<String>,
+    client: tokio::sync::RwLock<Option<etcd::Client>>,
+}
+
+impl EtcdKvBackend {
+    fn new(endpoints: Vec<String>) -> Self {
+        Self {
+            endpoints,
+            client: tokio::sync::RwLock::new(None),
+        }
+    }
+
+    async fn client(&self) -> anyhow::Result<etcd::Client> {
+        {
+            let guard = self.client.read().await;
+            if let Some(client) = guard.as_ref() {
+                return Ok(client.clone());
+            }
+        }
+
+        let mut guard = self.client.write().await;
+        if let Some(client) = guard.as_ref() {
+            return Ok(client.clone());
+        }
+
+        let client = etcd::Client::connect(self.endpoints.clone(), None)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to connect etcd endpoints={:?}: {:?}",
+                    self.endpoints,
+                    e
+                )
+            })?;
+        *guard = Some(client.clone());
+        Ok(client)
+    }
+
+    async fn clear_client(&self) {
+        let mut guard = self.client.write().await;
+        *guard = None;
+    }
+}
+
+fn etcd_kv_backend_map() -> &'static AutoCleanMap<Vec<String>, EtcdKvBackend> {
+    static MAP: OnceLock<AutoCleanMap<Vec<String>, EtcdKvBackend>> = OnceLock::new();
+    MAP.get_or_init(|| AutoCleanMap::new())
+}
+
+fn is_reconnectable_etcd_error(err: &etcd::Error) -> bool {
+    is_reconnectable_etcd_error_text(&format!("{:?}", err))
+}
+
+fn is_reconnectable_etcd_error_text(msg: &str) -> bool {
+    let msg = msg.to_ascii_lowercase();
+    msg.contains("unavailable")
+        || msg.contains("connection")
+        || msg.contains("transport")
+        || msg.contains("timed out")
+        || msg.contains("timeout")
+        || msg.contains("broken pipe")
+        || msg.contains("closed")
+}
+
+async fn run_etcd_op<T, F, Fut>(
+    backend: AutoCleanMapEntry<Vec<String>, EtcdKvBackend>,
+    context: String,
+    mut op: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut(etcd::Client) -> Fut,
+    Fut: Future<Output = Result<T, etcd::Error>>,
+{
+    let mut last_err = None;
+    for attempt in 1..=2 {
+        let client = backend.client().await?;
+        match op(client).await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                let should_retry = attempt == 1 && is_reconnectable_etcd_error(&err);
+                last_err = Some(err);
+                if should_retry {
+                    backend.clear_client().await;
+                    continue;
+                }
+                let err = last_err.take().expect("etcd error must be recorded");
+                return Err(anyhow::anyhow!("{}: {:?}", context, err));
+            }
+        }
+    }
+
+    let err = last_err.expect("etcd retry loop must record the last error");
+    Err(anyhow::anyhow!("{}: {:?}", context, err))
+}
+
+#[pyclass(name = "EtcdKvClient")]
+pub struct PyEtcdKvClient {
+    rt: Arc<Runtime>,
+    endpoints: Vec<String>,
+    backend: AutoCleanMapEntry<Vec<String>, EtcdKvBackend>,
+}
+
+#[pymethods]
+impl PyEtcdKvClient {
+    #[new]
+    fn new(endpoints: Vec<String>) -> PyResult<Self> {
+        let endpoints = normalize_raw_endpoints(endpoints, "EtcdKvClient")?;
+        let backend = etcd_kv_backend_map()
+            .get_or_init(endpoints.clone(), || EtcdKvBackend::new(endpoints.clone()));
+        Ok(Self {
+            rt: crate::mpsc::get_global_runtime(),
+            endpoints,
+            backend,
+        })
+    }
+
+    fn get(&self, py: Python<'_>, key: String) -> PyResult<Option<Py<PyBytes>>> {
+        if key.is_empty() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "etcd get key must not be empty",
+            ));
+        }
+
+        let backend = self.backend.clone();
+        let key_for_op = key.clone();
+        let value = py
+            .allow_threads(|| {
+                self.rt.run_async_from_sync(async move {
+                    let resp = run_etcd_op(
+                        backend,
+                        format!("etcd get failed for key={}", key),
+                        move |mut client| {
+                            let key = key_for_op.clone();
+                            async move { client.get(key, None).await }
+                        },
+                    )
+                    .await?;
+                    Ok::<Option<Vec<u8>>, anyhow::Error>(
+                        resp.kvs().first().map(|kv| kv.value().to_vec()),
+                    )
+                })
+            })
+            .map_err(|e| anyhow::anyhow!("runtime bridge failed in EtcdKvClient.get: {}", e))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        Ok(value.map(|raw| PyBytes::new_bound(py, &raw).into()))
+    }
+
+    fn get_prefix(&self, py: Python<'_>, prefix: String) -> PyResult<PyObject> {
+        if prefix.is_empty() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "etcd get_prefix prefix must not be empty",
+            ));
+        }
+
+        let backend = self.backend.clone();
+        let prefix_for_op = prefix.clone();
+        let rows = py
+            .allow_threads(|| {
+                self.rt.run_async_from_sync(async move {
+                    let resp = run_etcd_op(
+                        backend,
+                        format!("etcd get_prefix failed for prefix={}", prefix),
+                        move |mut client| {
+                            let prefix = prefix_for_op.clone();
+                            async move {
+                                client
+                                    .get(prefix, Some(etcd::GetOptions::new().with_prefix()))
+                                    .await
+                            }
+                        },
+                    )
+                    .await?;
+                    Ok::<Vec<(Vec<u8>, Vec<u8>)>, anyhow::Error>(
+                        resp.kvs()
+                            .iter()
+                            .map(|kv| (kv.key().to_vec(), kv.value().to_vec()))
+                            .collect(),
+                    )
+                })
+            })
+            .map_err(|e| anyhow::anyhow!("runtime bridge failed in EtcdKvClient.get_prefix: {}", e))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        let out = PyList::empty_bound(py);
+        for (key, value) in rows {
+            let item = PyTuple::new_bound(
+                py,
+                [
+                    PyBytes::new_bound(py, &key).into_py(py),
+                    PyBytes::new_bound(py, &value).into_py(py),
+                ],
+            );
+            out.append(item)?;
+        }
+        Ok(out.into_any().into_py(py))
+    }
+
+    #[pyo3(signature = (key, value, lease_id=None))]
+    fn put(
+        &self,
+        py: Python<'_>,
+        key: String,
+        value: PyBackedBytes,
+        lease_id: Option<i64>,
+    ) -> PyResult<()> {
+        if key.is_empty() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "etcd put key must not be empty",
+            ));
+        }
+        if let Some(lease_id) = lease_id {
+            if lease_id <= 0 {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "lease_id must be positive, got {}",
+                    lease_id
+                )));
+            }
+        }
+
+        let backend = self.backend.clone();
+        let key_for_op = key.clone();
+        let value = value.as_ref().to_vec();
+        py.allow_threads(|| {
+            self.rt.run_async_from_sync(async move {
+                run_etcd_op(
+                    backend,
+                    format!("etcd put failed for key={}", key),
+                    move |mut client| {
+                        let key = key_for_op.clone();
+                        let value = value.clone();
+                        async move {
+                            let opts = lease_id.map(|id| etcd::PutOptions::new().with_lease(id));
+                            client.put(key, value, opts).await.map(|_| ())
+                        }
+                    },
+                )
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+        })
+        .map_err(|e| anyhow::anyhow!("runtime bridge failed in EtcdKvClient.put: {}", e))
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    fn delete(&self, py: Python<'_>, key: String) -> PyResult<bool> {
+        if key.is_empty() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "etcd delete key must not be empty",
+            ));
+        }
+
+        let backend = self.backend.clone();
+        let key_for_op = key.clone();
+        py.allow_threads(|| {
+            self.rt.run_async_from_sync(async move {
+                run_etcd_op(
+                    backend,
+                    format!("etcd delete failed for key={}", key),
+                    move |mut client| {
+                        let key = key_for_op.clone();
+                        async move {
+                            client
+                                .delete(key, None)
+                                .await
+                                .map(|resp| resp.deleted() > 0)
+                        }
+                    },
+                )
+                .await
+            })
+        })
+        .map_err(|e| anyhow::anyhow!("runtime bridge failed in EtcdKvClient.delete: {}", e))
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    fn delete_prefix(&self, py: Python<'_>, prefix: String) -> PyResult<i64> {
+        if prefix.is_empty() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "etcd delete_prefix prefix must not be empty",
+            ));
+        }
+
+        let backend = self.backend.clone();
+        let prefix_for_op = prefix.clone();
+        py.allow_threads(|| {
+            self.rt.run_async_from_sync(async move {
+                run_etcd_op(
+                    backend,
+                    format!("etcd delete_prefix failed for prefix={}", prefix),
+                    move |mut client| {
+                        let prefix = prefix_for_op.clone();
+                        async move {
+                            client
+                                .delete(prefix, Some(etcd::DeleteOptions::new().with_prefix()))
+                                .await
+                                .map(|resp| resp.deleted())
+                        }
+                    },
+                )
+                .await
+            })
+        })
+        .map_err(|e| anyhow::anyhow!("runtime bridge failed in EtcdKvClient.delete_prefix: {}", e))
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    fn lease_ttl(&self, py: Python<'_>, lease_id: i64) -> PyResult<i64> {
+        if lease_id <= 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "lease_id must be positive, got {}",
+                lease_id
+            )));
+        }
+
+        let backend = self.backend.clone();
+        py.allow_threads(|| {
+            self.rt.run_async_from_sync(async move {
+                run_etcd_op(
+                    backend,
+                    format!("etcd lease_ttl failed for lease_id={}", lease_id),
+                    move |mut client| async move {
+                        client
+                            .lease_time_to_live(lease_id, None)
+                            .await
+                            .map(|resp| resp.ttl())
+                    },
+                )
+                .await
+            })
+        })
+        .map_err(|e| anyhow::anyhow!("runtime bridge failed in EtcdKvClient.lease_ttl: {}", e))
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    fn revoke_lease(&self, py: Python<'_>, lease_id: i64) -> PyResult<()> {
+        if lease_id <= 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "lease_id must be positive, got {}",
+                lease_id
+            )));
+        }
+
+        let backend = self.backend.clone();
+        py.allow_threads(|| {
+            self.rt.run_async_from_sync(async move {
+                run_etcd_op(
+                    backend,
+                    format!("etcd revoke_lease failed for lease_id={}", lease_id),
+                    move |mut client| async move { client.lease_revoke(lease_id).await.map(|_| ()) },
+                )
+                .await
+            })
+        })
+        .map_err(|e| anyhow::anyhow!("runtime bridge failed in EtcdKvClient.revoke_lease: {}", e))
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<EtcdKvClient endpoints={:?}>", self.endpoints)
+    }
 }
 
 #[pyclass(name = "EtcdLock")]
@@ -35,11 +440,7 @@ impl PyEtcdLock {
         ttl_seconds: i64,
         timeout_seconds: Option<f64>,
     ) -> PyResult<Self> {
-        if endpoints.is_empty() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "EtcdLock requires at least one endpoint",
-            ));
-        }
+        let endpoints = normalize_raw_endpoints(endpoints, "EtcdLock")?;
         if ttl_seconds <= 0 {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                 "EtcdLock ttl_seconds must be > 0, got {}",
@@ -283,5 +684,119 @@ impl PyEtcdLock {
             self.lock_key.is_some(),
             self.lease_id
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_KEY_SEQ: AtomicUsize = AtomicUsize::new(1);
+
+    fn unique_test_endpoints() -> Vec<String> {
+        let seq = TEST_KEY_SEQ.fetch_add(1, Ordering::Relaxed);
+        vec![format!("http://unit-test-etcd-backend-{}", seq)]
+    }
+
+    #[test]
+    fn normalize_raw_endpoint_accepts_raw_host_port() {
+        assert_eq!(
+            normalize_raw_endpoint(" 127.0.0.1:2379 ").unwrap(),
+            "http://127.0.0.1:2379"
+        );
+    }
+
+    #[test]
+    fn normalize_raw_endpoint_rejects_empty_or_schemed_endpoint() {
+        assert!(normalize_raw_endpoint("").is_err());
+        assert!(normalize_raw_endpoint("   ").is_err());
+        assert!(normalize_raw_endpoint("http://127.0.0.1:2379").is_err());
+        assert!(normalize_raw_endpoint("https://127.0.0.1:2379").is_err());
+    }
+
+    #[test]
+    fn normalize_raw_endpoints_requires_at_least_one_endpoint() {
+        assert!(normalize_raw_endpoints(Vec::new(), "EtcdKvClient").is_err());
+        assert_eq!(
+            normalize_raw_endpoints(
+                vec!["127.0.0.1:2379".to_string(), "localhost:2380".to_string()],
+                "EtcdKvClient",
+            )
+            .unwrap(),
+            vec![
+                "http://127.0.0.1:2379".to_string(),
+                "http://localhost:2380".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn etcd_kv_client_constructor_normalizes_raw_endpoints() {
+        let client = PyEtcdKvClient::new(vec!["127.0.0.1:2379".to_string()]).unwrap();
+        assert_eq!(client.endpoints, vec!["http://127.0.0.1:2379"]);
+    }
+
+    #[test]
+    fn etcd_lock_constructor_normalizes_raw_endpoints() {
+        let lock = PyEtcdLock::new(
+            vec!["127.0.0.1:2379".to_string()],
+            "/unit-test/lock".to_string(),
+            10,
+            Some(1.0),
+        )
+        .unwrap();
+        assert_eq!(lock.endpoints, vec!["http://127.0.0.1:2379"]);
+    }
+
+    #[test]
+    fn etcd_lock_constructor_rejects_schemed_endpoints() {
+        assert!(PyEtcdLock::new(
+            vec!["http://127.0.0.1:2379".to_string()],
+            "/unit-test/lock".to_string(),
+            10,
+            Some(1.0),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn etcd_kv_backend_map_reuses_and_auto_cleans_live_entries() {
+        let endpoints = unique_test_endpoints();
+        let map = etcd_kv_backend_map();
+        assert!(map.with_existing(&endpoints, |_| ()).is_none());
+
+        {
+            let entry_a =
+                map.get_or_init(endpoints.clone(), || EtcdKvBackend::new(endpoints.clone()));
+            assert!(map.with_existing(&endpoints, |_| ()).is_some());
+
+            {
+                let entry_b = map.get_or_init(endpoints.clone(), || {
+                    panic!("live backend entry should be reused")
+                });
+                assert!(std::ptr::eq(&*entry_a, &*entry_b));
+            }
+
+            assert!(map.with_existing(&endpoints, |_| ()).is_some());
+        }
+
+        assert!(map.with_existing(&endpoints, |_| ()).is_none());
+    }
+
+    #[test]
+    fn reconnectable_error_text_matches_transient_transport_failures() {
+        assert!(is_reconnectable_etcd_error_text("StatusCode::UNAVAILABLE"));
+        assert!(is_reconnectable_etcd_error_text(
+            "etcdserver: request timed out"
+        ));
+        assert!(is_reconnectable_etcd_error_text("transport error"));
+        assert!(is_reconnectable_etcd_error_text("connection closed"));
+        assert!(is_reconnectable_etcd_error_text("broken pipe"));
+
+        assert!(!is_reconnectable_etcd_error_text(
+            "requested lease not found"
+        ));
+        assert!(!is_reconnectable_etcd_error_text("permission denied"));
     }
 }
