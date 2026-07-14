@@ -2,258 +2,108 @@
 
 ## KV 和 RPC 接口
 
-本页描述 Fluxon 的 Python KV API 和节点间 RPC 调用。两者由同一个 `KvClient` 实例提供，共享生命周期。
+本页介绍 Fluxon 的 Python KV API 和节点间 RPC。两类接口都由同一个 `KvClient` 提供，使用相同的配置、数据模型和关闭流程。
 
-`cluster_name`、`instance_key`、`etcd` 等前置概念见 [架构和概念](用户%20-%201%20-%20架构和概念.md)。
+开始前应先按 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md) 启动 Greptime、etcd、Master 和本机 Owner。本页只关注业务进程如何连接已经运行的 KV 集群。
 
-Python 业务代码优先直接在代码里写 Python dict，并传给 `FluxonKvClientConfig(...)`；YAML 更适合独立进程启动、supervisor、部署和示例环境。
+业务代码建议直接把 Python dict 传给 `FluxonKvClientConfig(...)`。YAML 文件和角色配置差异放在本页的进阶说明中。
 
-### 服务平面
+### 开始前检查
 
-在写 `put_blocking/get_blocking/rpc_call` 这些 Python 业务代码之前，需要先把 KV 依赖的服务平面拉起来。共性的角色关系、启动顺序和 runtime 边界，统一见 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md)。
+运行本页示例前，确认以下条件：
 
-![](../../pics/deploy_arch_1.png)
+- Master 和本机 Owner 已经启动，本机共享内存目录下已经生成 `shared.json`。
+- 当前 Python 环境已经安装 `fluxon-*.whl` 和 `fluxon_pyo3-*.whl`；安装方式见 [用户 - 0 - 安装](./用户%20-%200%20-%20安装.md)。
+- 业务进程的 `cluster_name` 与目标集群一致。
+- 业务进程的 `share_mem_path` 与同一台机器上的 Owner 一致。
+- 每个业务进程使用不同的 `instance_key`。
 
-直接接触的服务平面对象主要有：
-
-- `greptime`：用于标准监控链路。安装与启动见 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md)
-- `etcd`：KV 控制面元数据存储。安装与启动见 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md)
-- `start_kv_master_process(...)`：启动 `fluxonkv master`
-- `start_owner_kvclient_process(...)`：启动 `owner`
-
-最小可运行示例脚本如下。这个脚本只启动 Fluxon 自己的角色；`etcd` / `greptime` 仍按服务平面文档单独启动，并且默认假设：
-
-- `etcd` 在 `127.0.0.1:2379`
-- `greptime` HTTP 在 `127.0.0.1:34030`
-- 当前 `python3` 所在环境已经安装 `fluxon-*.whl` 和 `fluxon_pyo3-*.whl`；安装方式见 [用户 - 0 - 安装](./用户%20-%200%20-%20安装.md)
-
-对应示例脚本：`examples/start_master_owner.py`
-
-这个脚本支持两种启动方式：
-
-- 默认方式：启动 `master + owner`
-- `--without-master`：只启动 `owner`，接入已经存在的 KV 集群 `master`
+按用户 2 的默认配置启动时，本页示例可以直接保留：
 
 ```python
-#!/usr/bin/env python3
-
-import argparse
-
-from pathlib import Path
-
-from fluxon_py.runtime import (
-    start_kv_master_process,
-    start_owner_kvclient_process,
-    wait_subproc_or_ctrlc,
-)
-from fluxon_py.runtime.process_runner import ManagedSubprocess
-
-ETCD_ENDPOINT = "127.0.0.1:2379"
-GREPTIME_HTTP_PORT = 34030
-GREPTIME_BASE_URL = f"http://127.0.0.1:{GREPTIME_HTTP_PORT}"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARE_MEM_PATH = Path("/dev/shm/fluxon_kv_demo").resolve()
-WORKDIR = Path("/tmp/fluxon_kv_demo/runtime").resolve()
-MASTER_PORT = 31000
-MASTER_UI_PORT = 18080
-MASTER_INSTANCE_KEY = "demo_kv_master"
-OWNER_INSTANCE_KEY = "demo_kv_owner"
-OWNER_DRAM_BYTES = 1073741824
-
-
-def main() -> None:
-    args = parse_args()
-    log_dir = (WORKDIR / "log").resolve()
-
-    if args.with_master:
-        master_log_dir = (WORKDIR / "master_logs").resolve()
-        master_log_dir.mkdir(parents=True, exist_ok=True)
-        master_stdout_log = log_dir / "master.log"
-        master_proc = start_kv_master_process(
-            config=build_master_config(log_dir=master_log_dir),
-            log_path=master_stdout_log,
-        )
-    else:
-        master_stdout_log = None
-        master_proc = None
-
-    owner_stdout_log = log_dir / "owner.log"
-    owner_proc = start_owner_kvclient_process(
-        config=build_owner_config(),
-        log_path=owner_stdout_log,
-    )
-    children = []
-    if master_proc is not None:
-        children.append(
-            ManagedSubprocess(
-                label="master",
-                proc=master_proc,
-            )
-        )
-    children.append(
-        ManagedSubprocess(
-            label="owner",
-            proc=owner_proc,
-        )
-    )
-
-    print(f"[fluxon_kv] share_mem_path: {SHARE_MEM_PATH}")
-    print(f"[fluxon_kv] etcd endpoint: {ETCD_ENDPOINT}")
-    print(f"[fluxon_kv] greptime base url: {GREPTIME_BASE_URL}")
-    print(f"[fluxon_kv] start master in this script: {args.with_master}")
-    if master_stdout_log is not None:
-        print(f"[fluxon_kv] master stdout log: {master_stdout_log}")
-        print(
-            "[fluxon_kv] kv web ui: "
-            f"http://<host-ip-or-domain>:{MASTER_UI_PORT}/view?cluster_name={CLUSTER_NAME}&member_kind=kv"
-        )
-    else:
-        print("[fluxon_kv] master stdout log: disabled by --without-master")
-    print(f"[fluxon_kv] owner stdout log: {owner_stdout_log}")
-    stack_label = "master and owner" if args.with_master else "owner"
-    print(f"[fluxon_kv] waiting for Ctrl-C to stop {stack_label}")
-    wait_subproc_or_ctrlc(
-        children,
-        on_ctrlc=lambda: print(f"[fluxon_kv] caught Ctrl-C, stopping {stack_label}"),
-    )
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Start KV demo owner, optionally with a local master")
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--with-master",
-        dest="with_master",
-        action="store_true",
-        help="Start a local kv master in this script (default)",
-    )
-    group.add_argument(
-        "--without-master",
-        dest="with_master",
-        action="store_false",
-        help="Do not start a local kv master; only start owner and attach to an existing cluster master",
-    )
-    parser.set_defaults(with_master=True)
-    return parser.parse_args()
-
-
-def build_master_config(*, log_dir: Path) -> dict:
-    return {
-        "instance_key": MASTER_INSTANCE_KEY,
-        "cluster_name": CLUSTER_NAME,
-        "port": MASTER_PORT,
-        "etcd_endpoints": [ETCD_ENDPOINT],
-        "log_dir": str(log_dir),
-        "monitoring": {
-            "prometheus_base_url": f"{GREPTIME_BASE_URL}/v1/prometheus",
-            "prom_remote_write_url": [f"{GREPTIME_BASE_URL}/v1/prometheus/write"],
-            "otlp_log_api": {
-                "otlp_endpoint": f"{GREPTIME_BASE_URL}/v1/otlp/v1/logs",
-            },
-        },
-        "master_ui": {
-            "http_listen_addr": f"0.0.0.0:{MASTER_UI_PORT}",
-        },
-    }
-
-
-def build_owner_config() -> dict:
-    return {
-        "instance_key": OWNER_INSTANCE_KEY,
-        "contribute_to_cluster_pool_size": {
-            "dram": OWNER_DRAM_BYTES,
-            "vram": {},
-        },
-        "fluxonkv_spec": {
-            "etcd_addresses": [ETCD_ENDPOINT],
-            "cluster_name": CLUSTER_NAME,
-            "share_mem_path": str(SHARE_MEM_PATH),
-            "sub_cluster": "default",
-            "large_file_paths": [str((WORKDIR / "large" / "owner").resolve())],
-        },
-    }
-
-
-if __name__ == "__main__":
-    main()
+SHARE_MEM_PATH = "/dev/shm/fluxon_kv_demo"
 ```
 
-启动命令：
+本页示例创建的是只使用本机 Owner 内存池的 External Client。它不向集群贡献内存，因此配置中不应加入 Owner 专用的 `contribute_to_cluster_pool_size`、`etcd_addresses`、`sub_cluster` 或 `large_file_paths`。
+
+### 共同的调用流程
+
+KV 和 RPC 都从同一个 `KvClient` 开始：
+
+```text
+FluxonKvClientConfig
+        ↓
+new_store(config).unwrap(...) → KvClient
+        ↓
+调用 KV 或 RPC 接口
+        ↓
+store.close().unwrap(...)
+```
+
+- `FluxonKvClientConfig` 保存当前 Python 进程的连接配置。
+- `new_store(...)` 创建 `KvClient`。
+- `KvClient` 同时提供 KV 和 RPC 接口。
+- 大多数公开接口返回 `Result`。示例使用 `unwrap("错误说明")` 取得成功值；失败时会带着这段说明抛出错误。
+- 不再使用客户端时，应调用 `close()` 并消费它返回的 `Result`。
+
+### FlatDict 数据模型
+
+KV value、RPC 请求和 RPC 响应都使用一层 Python dict，例如：
+
+```python
+value = {
+    "payload": b"hello",
+    "count": 1,
+    "source": "demo",
+}
+```
+
+字段名必须是字符串，字段值可以是 `int`、`float`、`bool`、`str`、`bytes` 或 DLPack 数据。不要在 value 中继续嵌套 dict 或 list。
+
+对应类型为：
+
+```python
+FlatDict = Dict[str, Union[int, float, bool, str, bytes, DLPacked]]
+```
+
+### KV 最小示例
+
+`examples/external_put_get_del.py` 完成一次写入、读取、删除和存在性检查。
+
+运行前只需确认三个值：
+
+- `INSTANCE_KEY`：当前 Python 进程的唯一标识。同一集群内不能与其他进程重复。
+- `CLUSTER_NAME`：必须与 Master 和本机 Owner 一致。
+- `SHARE_MEM_PATH`：必须与本机 Owner 一致。
+
+示例中的 `test_spec_config.disable_observability = True` 只用于关闭示例进程的观测后台任务，让最小示例专注于 KV 调用；它不是连接集群所需的核心字段。
+
+运行命令：
 
 ```bash
-python3 examples/start_master_owner.py
-python3 examples/start_master_owner.py --without-master
+python3 examples/external_put_get_del.py
 ```
 
-默认命令会启动本机 `master + owner`。`--without-master` 只启动本机 `owner`，要求同一个 `cluster_name` 对应的 `master` 已经在别处运行。
-
-上面的 `build_master_config(...)` 里，`master_ui` 是可缺省配置块。配置后，`start_kv_master_process(...)` 会让 KV Web UI 直接作为 `master` 内的 HTTP 服务一起启动：
-
-```yaml
-master_ui:
-  http_listen_addr: 0.0.0.0:18080
-```
-
-这个 UI 的实际宿主是 `fluxon_cli` 的 KV monitor web。URL 形状固定为：
+成功时会看到：
 
 ```text
-http://<host-ip-or-domain>:18080/view?cluster_name=demo-kv-cluster&member_kind=kv
+OK put key=hello
+world
+OK del key=hello
+OK is_exist after remove -> False
 ```
 
-`owner` 把共享内存池和 `shared.json` 准备好之后，再运行下面的业务最小示例。
+脚本依次执行：
 
-### 生命周期与调用流程（Call Flow）
+1. 使用 `new_store(...)` 连接本机 Owner。
+2. 使用 `put_blocking(...)` 写入 `{"payload": b"world"}`。
+3. 使用 `get_blocking(...)` 取得 `MemHolder`，再调用 `access()` 得到 `FlatDict`。
+4. 使用 `remove(...)` 删除 key，并用 `is_exist(...)` 确认 key 已不存在。
+5. 释放 `MemHolder` 相关引用，再关闭 `KvClient`。
 
-```text
-User-visible processes:
-- etcd (control-plane metadata store)
-- Fluxon cluster node process(es) (the remote peers you address via instance_key/node_id)
-- Your Python process (business code using fluxon_py)
-
-FluxonKvClientConfig (prefer Python dict; YAML also supported)
-            |
-            v
-new_store(cfg) -> KvClient (one instance in your Python process)
-     |               |
-     |               +-- KV: put_blocking/get_blocking/remove/... -> Result[...]
-     |               |                                   get_blocking() -> Result[MemHolder, ApiError]
-     |               |                                                  -> access() -> Result[FlatDict, ApiError]
-     |               |
-     |               +-- Node call(server): rpc_register(path, handler) -> Result[OkNone, ApiError]
-     |               |                       (handler lives in your Python process; keep it running)
-     |               |
-     |               +-- Node call(client): rpc_call(node_id, path, payload, timeout_ms) -> Result[响应句柄, ApiError]
-     |                                                                    -> wait() -> Result[FlatDict, ApiError]
-     |
-     v
-api.close() -> Result[OkNone, ApiError]
-```
-
-### 核心对象（Python）
-
-- `FluxonKvClientConfig`：配置对象，优先直接从 Python dict 创建，也支持从 YAML 文件加载。
-- `new_store(config: FluxonKvClientConfig) -> Result[KvClient, ApiError]`：创建 KV client 实例。
-- `KvClient`：统一入口，同时提供 KV 读写与节点间调用。
-- `KvClient.third_party_logs_dir() -> Result[str, ApiError]`：返回 Fluxon 分配给第三方 Python 组件的日志根目录。组件应在这个根目录下继续派生自己的子目录，例如 `mq/`。
-- `MemHolder`：`get_blocking(...)` 成功后的读取结果持有者，`access()` 取得 `FlatDict`。
-- `PutOptionalArgs`：`put_blocking(...)` 的可选参数对象，当前常用字段是 `lease_id`。
-- `test_spec_config.disable_observability`：最小 external client 示例里显式设为 `True`，避免把 OTLP / observe 后台任务引入“只验证 KV/RPC 基本链路”的示例生命周期。
-
-注意：
-
-- `MemHolder` 没有 `bytes()`；需要 `access()` 后从 dict 里取 bytes 字段（常用字段名 `payload`）。
-- `store.close()` 会等待当前 client 暴露出去的 `MemHolder` 全部释放；示例里在 `close()` 前显式删掉 `mem` / `flat`，就是为了满足这个关闭约束。
-- `Result` 必须显式消费：调用 `unwrap()` 或 `unwrap_error()`。
-
-### FlatDict（数据模型）
-
-KV value 和节点间调用的 payload 统一为 flat dict：
-
-- `FlatDict = Dict[str, Union[int, float, bool, str, bytes, dlpack]]`
-
-### KV 接口最小示例
-
-对应示例脚本：`examples/external_put_get_del.py`
+<details>
+<summary><strong>📄 查看完整脚本（点击展开）</strong>｜<code>examples/external_put_get_del.py</code></summary>
 
 ```python
 #!/usr/bin/env python3
@@ -315,88 +165,87 @@ if __name__ == "__main__":
     main()
 ```
 
-### 常用接口（KV）
+</details>
 
-上面的 KV 最小示例如果要打开更详细的用户进程日志，直接在启动 Python 进程前设置：
+### 常用 KV 接口
 
-```bash
-FLUXON_LOG=DEBUG python3 examples/external_put_get_del.py
+#### 写入
+
+```python
+put_blocking(
+    key: str,
+    value: FlatDict,
+    opts: Optional[PutOptionalArgs] = None,
+) -> Result[OkNone, ApiError]
 ```
 
-日志相关对象如下：
+- `key` 是要写入的 KV key。
+- `value` 是一层 `FlatDict`。
+- 普通写入不需要传 `opts`。
+- 返回成功时写入已经完成，不需要再调用 `wait()`。
 
-- `FLUXON_LOG`：控制当前 Python 业务进程 console logger 的输出门限
-- Fluxon Python 侧 logger 会读取 `FLUXON_LOG`；合法值是 `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`，默认 `INFO`
-- `log_dir`：`master` 本地日志 authority
-- `share_mem_path`：KV 共享 bundle 根目录，只承载 `mmap.file`、`shared.json` 和 peer metadata
-- `large_file_paths`：owner 侧大文件根目录，日志、profile、cache 等运行时资产都从这里派生
-- `store.third_party_logs_dir().unwrap(...)`：返回 `{large_file_paths[0]}/{cluster_name}_cluster_third_party_logs`。第三方 Python 组件应只在这个根目录下派生自己的子目录，这样目录使用更收束，Fluxon 观测平面也能统一感知和采集这些文件日志。
+#### 读取
 
-如果服务平面的 `master.monitoring.otlp_log_api` 已经配置，后台服务日志还会继续采集到 Greptime 的 `fluxon_logs` 表。
+```python
+get_blocking(key: str) -> Result[MemHolder, ApiError]
+MemHolder.access() -> Result[FlatDict, ApiError]
+```
 
-`put_blocking(key: str, value: FlatDict, opts: Optional[PutOptionalArgs] = None) -> Result[OkNone, ApiError]`
+`get_blocking(...)` 返回 `MemHolder`，需要再调用 `access()` 才能取得业务 dict。`MemHolder` 本身没有 `bytes()`；bytes 字段应从 `access()` 返回的 `FlatDict` 中读取。
 
-- 作用：写入或覆盖一个 KV。
-- `key`：要写入的 KV key。
-- `value`：要写入的 flat dict payload。
-- `opts`：可选写参数；普通写入通常传 `None`，需要额外写控制时再传 `PutOptionalArgs(...)`。
-- 返回链路：调用返回成功后，这次写入已经完成，不需要再额外 `wait()`。
+`store.close()` 会等待当前客户端交给业务代码的 `MemHolder` 全部释放。读取结束后不要长期持有 `MemHolder`，关闭前应像示例一样释放相关引用。
 
-`PutOptionalArgs(lease_id: Optional[int] = None)`
+#### 删除与检查
 
-- 作用：`put_blocking(...)` 的可选参数对象。
-- `lease_id`：提交写入时，把这个 key 绑定到指定 lease。
-- 常用方式：普通业务写入一般不用传；只有需要 lease 生命周期控制时才显式构造它。
+```python
+remove(key: str) -> Result[OkNone, ApiError]
+is_exist(key: str) -> Result[bool, ApiError]
+```
 
-`PutOptionalArgs.support_mooncake() -> Tuple[bool, List[str]]`
+`remove(...)` 用于删除 key，`is_exist(...)` 用于检查 key 是否存在。删除后立即调用 `get_blocking(...)` 不保证马上返回 `KeyNotFoundError`，因为读取路径仍可能受到 Owner 和 Master 元数据缓存清理时序的影响；验证删除请求时优先使用 `is_exist(...)`。
 
-- 作用：检查当前这组写参数是否兼容 mooncake 写入路径。
-- 返回值：第一个返回值表示是否兼容，第二个返回值列出不兼容字段名。
+### 节点间 RPC 最小示例
 
-`get_blocking(key: str) -> Result[MemHolder, ApiError]`
+节点间 RPC 允许一个业务进程注册处理函数，另一个业务进程通过目标 `instance_key` 调用它。两个进程都需要先创建自己的 `KvClient`。
 
-- 作用：读取一个 KV。
-- `key`：要读取的 KV key。
-- 返回链路：接口成功后直接拿到 `MemHolder`，再调用 `access()` 取得 `FlatDict`。
+运行前确认：
 
-`MemHolder`
+- `RPC_SERVER_INSTANCE_KEY` 和 `RPC_CLIENT_INSTANCE_KEY` 不同，并且在集群内都唯一。
+- Server 和 Client 的 `CLUSTER_NAME` 与目标集群一致。
+- Server 和 Client 的 `SHARE_MEM_PATH` 分别与各自所在机器的 Owner 一致；本机示例使用相同路径。
+- `--target-instance-key` 等于 Server 实际使用的 `instance_key`。
+- Client 调用的路径与 Server 注册的路径一致；本例都是 `/count`。
 
-- 作用：`get_blocking(...)` 成功后的读取结果持有者。
-- 理解方式：它不是最终的业务 dict，也不是原始 bytes；还要继续 `access()`。
+先在终端一启动 Server：
 
-`MemHolder.access() -> Result[FlatDict, ApiError]`
+```bash
+python3 examples/rpc_call.py serve
+```
 
-- 作用：把 `MemHolder` 中的数据展开成 `FlatDict`。
-- 常用用法：`flat = mem.access().unwrap(...)`，然后再从 `flat["payload"]` 之类的字段里取业务值。
-- 注意：`MemHolder` 本身没有 `bytes()`；如果 value 里有 bytes 字段，要先 `access()` 再取。
+看到下面的输出后保持 Server 运行：
 
-`get_size(key: str) -> Result[int, ApiError]`
+```text
+[rpc] handler ready instance_key=demo_rpc_server
+[rpc] waiting for Ctrl-C
+```
 
-- 作用：只查询 value 大小，不把 payload 整体取回。
-- `key`：要查询的 KV key。
-- 适合场景：先判断对象大小，再决定是否继续 `get(...)`。
+再在终端二启动 Client：
 
-`is_exist(key: str) -> Result[bool, ApiError]`
+```bash
+python3 examples/rpc_call.py call --target-instance-key demo_rpc_server
+```
 
-- 作用：判断某个 KV key 当前是否存在。
-- `key`：要检查的 KV key。
+首次调用成功时，Client 输出 `1`；Server 同时打印调用方、payload 和累计调用次数。
 
-`remove(key: str) -> Result[OkNone, ApiError]`
+调用过程如下：
 
-- 作用：删除一个 KV。
-- `key`：要删除的 KV key。
+```text
+Server：new_store → rpc_register("/count", handler) → 持续运行
+Client：new_store → rpc_call(...) → wait() → FlatDict 响应 → close
+```
 
-`is_exist(key: str) -> Result[bool, ApiError]`
-
-- 作用：查询当前 key 是否还存在。
-- 最小示例里，`remove(...)` 之后优先用它验证“删除请求已经生效”。
-- 注意：`remove(...)` 之后立刻 `get_blocking(...)` 不保证马上返回 `KeyNotFoundError`；删除后的读路径还会受 owner / master 元数据 cache 清理时序影响。如果你要验证“删除传播后不可读”，需要给删除传播留出观察时间。
-
-### 节点间 RPC 调用最小示例
-
-这里的 RPC 指节点间 RPC 调用，目标节点通常用目标实例的 `instance_key` 来标识。
-
-对应示例脚本：`examples/rpc_call.py`
+<details>
+<summary><strong>📄 查看完整脚本（点击展开）</strong>｜<code>examples/rpc_call.py</code></summary>
 
 ```python
 #!/usr/bin/env python3
@@ -495,46 +344,74 @@ if __name__ == "__main__":
     main()
 ```
 
-### 常用接口（节点间 RPC）
+</details>
 
-- `rpc_register(path: str, handler: Callable[[from_node_id: str, payload: FlatDict], FlatDict]) -> Result[OkNone, ApiError]`
-- `rpc_call(node_id: str, path: str, payload: FlatDict, timeout_ms: int = 10000) -> Result[响应句柄, ApiError]`
+### 常用 RPC 接口
 
-使用约束如下：
+#### 注册处理函数
 
-- `node_id` 通常对应目标节点的 `instance_key`（见：[架构和概念](用户%20-%201%20-%20架构和概念.md)）。
-- `timeout_ms` 默认是 `10000`；如果调用方显式指定，必须满足 `timeout_ms >= 10000`。
-
-### 配置对象与配置文件
-
-KV 环境至少会直接接触两类配置对象：
-
-- master 配置：启动控制面进程，负责 etcd、成员路由、监控和 master 日志目录
-- client / external 配置：创建 `FluxonKvClientConfig`，供 `new_store(...)` 附着到同机 owner 并发起 KV / RPC
-
-业务代码直接编辑的通常是第二类配置对象，并且通常直接编辑 Python dict；需要先把 KV 集群拉起来时，两类配置对象都要准备，此时再把配置落成 YAML 给 CLI / runtime 进程使用。
-
-#### 1) master 配置
-
-最小 master 配置示例：
-
-```yaml
-instance_key: my-master-1
-cluster_name: demo-kv-cluster
-port: 31000
-etcd_endpoints:
-  - 127.0.0.1:2379
-log_dir: /var/lib/fluxon/master_logs
+```python
+rpc_register(
+    path: str,
+    handler: Callable[[from_node_id: str, payload: FlatDict], FlatDict],
+) -> Result[OkNone, ApiError]
 ```
 
-理解方式：
+- `path` 是 RPC 路径，必须与 Client 调用时使用的路径一致。
+- `handler` 接收调用方的 `instance_key` 和 `FlatDict` payload，并返回一个 `FlatDict`。
+- 注册成功后，Server 进程必须保持运行。
 
-- `etcd_endpoints`：master 控制面连接的 etcd 地址
-- `log_dir`：master 自己的日志 / profile authority；运行时会在这个目录下继续派生 cluster 级日志子目录
+#### 发起调用
 
-#### 2) client / external 配置
+```python
+rpc_call(
+    node_id: str,
+    path: str,
+    payload: FlatDict,
+    timeout_ms: int = 10000,
+) -> Result[KvFuture, ApiError]
+```
 
-业务代码里直接把 Python dict 传给 `FluxonKvClientConfig(...)` 的构造方式如下：
+- `node_id` 通常是目标进程的 `instance_key`。
+- `timeout_ms` 默认是 `10000`；显式指定时不能小于 `10000`。
+- `rpc_call(...).unwrap(...)` 先取得响应句柄。
+- 响应句柄的 `wait().unwrap(...)` 等待远端完成并取得 `FlatDict` 响应。
+
+### 进阶说明
+
+#### 异步接口与写入选项
+
+`put_blocking(...)` 和 `get_blocking(...)` 会等待操作完成后再返回。需要先提交操作、稍后再等待结果时，可以使用：
+
+```python
+put(...) -> Result[KvFuture, ApiError]
+get(...) -> Result[KvFuture, ApiError]
+```
+
+两者都先返回 `KvFuture`，再通过 `wait()` 取得最终结果。
+
+其他接口：
+
+- `get_size(key) -> Result[int, ApiError]`：只查询 value 大小，不读取完整 payload。
+- `PutOptionalArgs(lease_id=None, reject_if_inflight_same_key=False)`：控制 lease 绑定，或在同一个 key 已有写入进行时立即拒绝新的写入。
+- `PutOptionalArgs.support_mooncake() -> Tuple[bool, List[str]]`：检查当前写入选项是否兼容 Mooncake，并返回不兼容字段名。
+
+#### 日志与观测
+
+- `FLUXON_LOG` 控制当前 Python 进程的控制台日志级别，可选值为 `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`，默认是 `INFO`。
+- `store.third_party_logs_dir().unwrap(...)` 返回 Fluxon 为第三方 Python 组件分配的文件日志根目录。组件应继续在该目录下创建自己的子目录，例如 `mq/`。
+- `test_spec_config.disable_observability` 是测试和最小示例使用的开关。普通业务配置不应为了连接集群而依赖这个字段。
+- Master 配置了 `monitoring.otlp_log_api` 后，后台服务日志会继续写入 Greptime 的 `fluxon_logs` 表。
+
+需要查看更详细的示例进程日志时，可以运行：
+
+```bash
+FLUXON_LOG=DEBUG python3 examples/external_put_get_del.py
+```
+
+#### Python dict 与 YAML
+
+业务代码优先直接构造 `FluxonKvClientConfig`：
 
 ```python
 from fluxon_py import FluxonKvClientConfig
@@ -544,68 +421,70 @@ cfg = FluxonKvClientConfig(
         "instance_key": "my-kv-client-1",
         "fluxonkv_spec": {
             "cluster_name": "demo-kv-cluster",
-            "share_mem_path": "/dev/shm/fluxon",
+            "share_mem_path": "/dev/shm/fluxon_kv_demo",
         },
     }
 )
 ```
 
-如果配置已经落成 YAML 文件，也可以直接从文件构造：
+配置已经保存为 YAML 时，也可以从文件加载：
 
 ```python
-from fluxon_py import FluxonKvClientConfig
-
 cfg = FluxonKvClientConfig.from_file("./kv_external.yaml")
 ```
 
-这两种方式最终得到的是同一个配置对象，后续都传给 `new_store(cfg)`。
-
-最小 external-client 配置示例：
+External Client 的 YAML 与上面的 Python dict 等价：
 
 ```yaml
-# 当前 Python 进程 / external client 的唯一实例标识
 instance_key: my-kv-client-1
-
 fluxonkv_spec:
-  # 目标集群名；必须和 master / owner 保持一致
   cluster_name: demo-kv-cluster
-  # 共享 bundle 根目录；运行时会在其下拼接 cluster_name
-  share_mem_path: /dev/shm/fluxon
-  # 可选：覆盖当前 client 的 P2P 监听端口
-  p2p_listen_port: 31001
+  share_mem_path: /dev/shm/fluxon_kv_demo
 ```
 
-Owner 节点需要额外配置内存贡献和 etcd 地址：
+Owner 会向集群贡献内存，因此需要额外提供容量、etcd、子集群和大文件目录：
 
 ```yaml
-# owner 实例标识；同样要求全局唯一
 instance_key: my-owner-1
-
-# owner 向集群贡献的内存池大小
 contribute_to_cluster_pool_size:
-  # DRAM 贡献，单位字节
-  dram: 1677721600
-  # VRAM 贡献；这里为空表示不贡献显存
+  dram: 1073741824
   vram: {}
-
 fluxonkv_spec:
-  # owner 连接 etcd 的地址列表
   etcd_addresses:
     - 127.0.0.1:2379
-  # 目标集群名；必须和 master / external 保持一致
   cluster_name: demo-kv-cluster
-  # 共享 bundle 根目录；运行时会在其下拼接 cluster_name
-  share_mem_path: /dev/shm/fluxon
-  # owner 自己的 P2P 监听端口
-  p2p_listen_port: 31000
-  # owner 所属子集群标签
+  share_mem_path: /dev/shm/fluxon_kv_demo
   sub_cluster: default
+  large_file_paths:
+    - /tmp/fluxon_kv_demo/runtime/large/owner
 ```
 
-这里需要把共享 bundle 和大文件根目录分清楚：
+Master 使用独立的启动配置，不传给 `FluxonKvClientConfig`：
 
-- `share_mem_path`：共享 bundle 根目录；运行时拼接 `cluster_name` 后，同时承载 `mmap.file`、`shared.json` 和 peer metadata
-- `large_file_paths`：owner 独占的大文件 authority，日志、profile、cache 等运行时资产都从这里派生
-- `FLUXON_LOG`：用户 Python 进程 console log 的门限，不写时默认 `INFO`
+```yaml
+instance_key: my-master-1
+cluster_name: demo-kv-cluster
+port: 31000
+etcd_endpoints:
+  - 127.0.0.1:2379
+log_dir: /tmp/fluxon_kv_demo/runtime/master_logs
+```
 
-zero-contribution external 模式下有一个硬约束：`fluxonkv_spec.etcd_addresses`、`fluxonkv_spec.sub_cluster`、`fluxonkv_spec.large_file_paths`、`fluxonkv_spec.redis_compat` 这类 owner 侧字段不应出现。
+这些角色的启动方式、日志目录和多机约束见 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md)。
+
+#### 可选：KV Web UI
+
+需要查看 KV 集群状态时，可以在 Master 配置中加入：
+
+```yaml
+master_ui:
+  http_listen_addr: 0.0.0.0:18080
+```
+
+`master_ui` 依赖 Master 的 `monitoring` 配置。Master 启动后，浏览器访问：
+
+```text
+http://<master-host>:18080/view?cluster_name=demo-kv-cluster&member_kind=kv
+```
+
+`0.0.0.0` 只表示监听本机所有网卡；浏览器地址应使用实际可访问的 Master 主机名或 IP。

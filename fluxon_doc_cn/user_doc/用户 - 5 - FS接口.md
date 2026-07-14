@@ -1,94 +1,91 @@
-# 用户 - 5 - FS接口
+# 用户 - 5 - FS 接口
 
-<!-- Maintenance note: Keep this page in three layers: KV service plane dependency, FS master/agent roles, then the remote mount/read/write verification script. Do not merge FS roles into the KV-only service-plane page, and do not skip the KV dependency layer here. -->
+## FS 接口
 
-## 总体介绍
+Fluxon FS 可以把远端机器上的目录挂载到当前 Python 进程中。挂载完成后，业务代码继续使用普通的 `open()`、`read()` 和 `write()` 访问文件。
 
-Fluxon FS 提供的是“把远端 export 挂到当前 Python 进程里，然后继续用 `open()` / `read()` / `write()` 访问”的能力。
+### 先理解四个名称
 
-用户直接接触的核心对象有三层：
+- `export`：FS Agent 对外暴露的一份目录。
+- `EXPORT_NAME`：这份 export 的逻辑名称。
+- `REMOTE_ROOT_DIR`：该目录在 FS Agent 机器上的实际路径。
+- `mount_dir_abs`：Reader 进程中的本地挂载目录。
 
-- KV 服务平面对象：`etcd`、`greptime`、`master`、`owner`
-- FS 角色对象：`fs_master`、`fs_agent`
-- 当前 Python 进程内的 FS 挂载对象：`FluxonKvClientConfig`、`new_store(...)`、`FluxonFsPatcher`、`mount_remote_dir(...)`
-
-它们之间的关系如下：
+它们的关系如下：
 
 ```text
-etcd + greptime + fluxonkv master + owner
-                       |
-                       v
-               fluxon_fs master
-                       |
-                       v
-               fluxon_fs agent
-                       |
-                       v
-FluxonKvClientConfig -> new_store(...) -> KvClient(store)
-                       |
-                       v
-FluxonFsPatcher(store)
-                       |
-                       +-- set_master_config_yaml(...)
-                       +-- set_cache_config_yaml(...)
-                       +-- set_request_identity(...)
-                       +-- install()
-                       +-- mount_remote_dir(...)
-                       |
-                       v
-open() / read() / write() / close()
+FS Agent 暴露 REMOTE_ROOT_DIR
+              ↓
+FS Master 发布 EXPORT_NAME
+              ↓
+Reader 把 export 挂载到 mount_dir_abs
+              ↓
+       open() / read() / write()
 ```
 
-`owner`、`external client`、`shared memory` 这些前置概念见 [架构和概念](./用户%20-%201%20-%20架构和概念.md)。`FluxonKvClientConfig` 和 `new_store(...)` 的基础语义见 [KV 和 RPC 接口](./用户%20-%203%20-%20KV-RPC接口.md)。
+FS Master 负责 export 配置、访问控制和管理页面；FS Agent 负责提供远端目录访问。`FluxonFsPatcher` 安装在 Reader 进程中，把对挂载目录的文件操作转发到对应的 FS Agent。
 
-## 服务平面
+### 开始前检查
 
-在进入挂载代码之前，需要先把 FS 依赖的 KV 服务平面拉起来。共性的角色关系、启动顺序和 runtime 边界，统一见 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md)。
+运行本页示例前，确认以下条件：
 
-FS 直接复用 KV / MQ 的这条服务平面链路，直接接触的对象主要有：
+- 已按 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md) 启动 Greptime 和 etcd。
+- 当前 Python 环境已经安装 `fluxon-*.whl` 和 `fluxon_pyo3-*.whl`；安装方式见 [用户 - 0 - 安装](./用户%20-%200%20-%20安装.md)。
+- 本机完整示例使用的端口没有被占用，`WORKDIR` 和 `REMOTE_ROOT_DIR` 可写。
+- `KvClient` 的基础用法已经明确；相关说明见 [用户 - 3 - KV 和 RPC 接口](./用户%20-%203%20-%20KV-RPC接口.md)。
 
-- `greptime`：标准监控链路
-- `etcd`：KV / FS 控制面元数据存储
-- `start_kv_master_process(...)`：启动 `fluxonkv master`
-- `start_owner_kvclient_process(...)`：启动 `owner`
+普通挂载和文件读写不使用目录传输状态。只有启用 `/ui/transfers/` 或预扫描时，才需要额外启动 PD 和 TiKV。
 
-FS 用户进程的共享前置链路如下：
+### 先按使用场景选择
 
-1. 先起 `greptime`
-2. 再起 `etcd`
-3. 再起 `fluxonkv master`
-4. 再起 `owner`
-5. 再起 `fs master`
-6. 再起 `fs agent`
-7. 最后再运行挂载验证脚本
+- **本机完整示例**：启动本机 KV Master、Owner、FS Master 和 FS Agent。首次运行优先使用这条路径。
+- **接入已有集群**：本机只启动新的 Owner 和 FS Agent，连接已有 KV Master 与 FS Master。
+- **目录传输或预扫描**：完成 FS 基础服务后，再准备 PD 和 TiKV。该流程放在本页末尾。
 
-这条顺序对应的是本页默认的本地完整示例，也就是由当前脚本同时拉起 `kv master + owner + fs master + fs_agent`。
+### 启动本机 FS 服务
 
-`examples/start_kv_and_fs_svc.py` 只启动 Fluxon 自己的角色。`etcd` / `greptime` 仍按服务平面文档单独启动；如果需要 `/ui/transfers/` 和预扫描，还要先启动 `transfer_state_store` 对应的 `pd` / `tikv`：
+`examples/start_kv_and_fs_svc.py` 默认在本机启动：
 
-- 当前 `python3` 所在环境已经安装 `fluxon-*.whl` 和 `fluxon_pyo3-*.whl`；安装方式见 [用户 - 0 - 安装](./用户%20-%200%20-%20安装.md)
+```text
+KV Master → Owner → FS Master → FS Agent
+```
 
-这个脚本支持两种启动方式：
+#### 首次只需确认这些值
 
-- 默认方式：启动 `kv master + owner + fs master + fs agent`
-- `--without-master`：只启动 `owner + fs_agent`，接入已经存在的 `kv master + fs master`
+- `CLUSTER_NAME`：KV 与 FS 共用的集群名。
+- `SHARE_MEM_PATH`：本机 Owner 和所有本机 FS 进程共用的共享内存目录。
+- `FS_MASTER_INSTANCE_KEY`：FS Master 的实例标识，也是 FS Agent 和 Reader 获取配置时使用的目标。
+- `EXPORT_NAME`：FS Agent 发布、Reader 挂载的 export 名。
+- `REMOTE_ROOT_DIR`：本机 FS Agent 暴露的绝对目录。
+- `ADMIN_USERNAME` / `ADMIN_PASSWORD`：首次创建 access DB 时使用的管理员凭据。
 
-## FS master 与 fs_agent
+首次本机运行时，其他实例标识、端口、`WORKDIR` 和 cache 大小可以先保留示例值。`admin/admin` 只适合本机演示，实际环境必须修改。
 
-KV 服务平面起来以后，FS 在这条链路上再加两个角色：
+#### 启动命令与成功判据
 
-- `fs_master`：复用 KV external client 接入 KV 平面，并承载 panel / export 快照分发
-- `fs_agent`：向 `fs_master` 注册 export，并对外提供远端目录访问
+在独立终端中运行：
 
-对应示例脚本：`examples/start_kv_and_fs_svc.py`
+```bash
+python3 examples/start_kv_and_fs_svc.py
+```
+
+启动成功后：
+
+- 终端打印 `cluster name`、`remote root dir`、`export name` 和四个角色的日志路径。
+- 终端最后打印 `waiting for Ctrl-C to stop fs demo stack`，进程保持运行。
+- `/tmp/fluxon_fs_demo/remote_root` 已经创建。
+- FS Panel 可以通过 `http://127.0.0.1:34180` 访问。
+- `/tmp/fluxon_fs_demo/runtime/log/` 下的四个日志中没有启动错误。
 
 完整脚本如下：
+
+<details>
+<summary><strong>📄 查看完整脚本（点击展开）</strong>｜<code>examples/start_kv_and_fs_svc.py</code></summary>
 
 ```python
 #!/usr/bin/env python3
 
 import argparse
-
 from pathlib import Path
 
 from fluxon_py.runtime import (
@@ -125,10 +122,15 @@ TRANSFER_STATE_STORE_KEY_PREFIX = f"/fluxon_fs_transfer/{CLUSTER_NAME}/"
 FS_MASTER_ACCESS_DB_PATH = (WORKDIR / "fs_master" / "access.db").resolve()
 
 
+def build_owner_large_file_paths() -> list[str]:
+    return [str((WORKDIR / "large" / "owner").resolve())]
+
+
 def main() -> None:
     args = parse_args()
     WORKDIR.mkdir(parents=True, exist_ok=True)
     REMOTE_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+
     log_dir = (WORKDIR / "log").resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,7 +170,7 @@ def main() -> None:
         config=build_fs_agent_config(),
         log_path=fs_agent_stdout_log,
     )
-    children = []
+    children: list[ManagedSubprocess] = []
     if kv_master_proc is not None:
         children.append(
             ManagedSubprocess(
@@ -281,7 +283,7 @@ def build_owner_config() -> dict:
             "cluster_name": CLUSTER_NAME,
             "share_mem_path": str(SHARE_MEM_PATH),
             "sub_cluster": "default",
-            "large_file_paths": [str((WORKDIR / "large" / "owner").resolve())],
+            "large_file_paths": build_owner_large_file_paths(),
         },
     }
 
@@ -377,162 +379,205 @@ if __name__ == "__main__":
     main()
 ```
 
-启动命令：
+</details>
+
+#### 接入已有集群
+
+远端 Agent 机器使用：
 
 ```bash
-python3 examples/start_kv_and_fs_svc.py
 python3 examples/start_kv_and_fs_svc.py --without-master
 ```
 
-默认命令会启动本机 `kv master + owner + fs master + fs agent`。`--without-master` 只启动本机 `owner + fs_agent`，要求同一个 `cluster_name` 对应的 `kv master` 和 `fs master` 已经在别处运行。
+运行前必须调整：
 
-远端 agent 机器最关键的约束如下：
+- `ETCD_ENDPOINT` 和 `CLUSTER_NAME`：指向已有集群。
+- `FS_MASTER_INSTANCE_KEY`：与已有 FS Master 完全一致。
+- `SHARE_MEM_PATH`：与当前机器的新 Owner 一致。
+- `OWNER_INSTANCE_KEY` 和 `FS_AGENT_INSTANCE_KEY`：在集群内使用新值。
+- `EXPORT_NAME`：为当前远端目录分配不重复的名称。
+- `REMOTE_ROOT_DIR`：使用当前 Agent 机器上的绝对路径。
 
-- `ETCD_ENDPOINT` 必须改成现有集群实际使用的 `etcd` 地址
-- `FS_MASTER_INSTANCE_KEY` 必须和现有 `fs master` 的实例 key 一致
-- `OWNER_INSTANCE_KEY`、`FS_AGENT_INSTANCE_KEY`、`EXPORT_NAME`、`REMOTE_ROOT_DIR` 必须在每台 agent 机器上都唯一；重复使用这些值会让 UI 里的 agents 或 runtime exports 折叠到同一个成员上
-- `FS_PANEL_PUBLIC_BASE_URL` 控制 UI 页面里的对外链接；外部访问 `fs master` 时，要把它改成实际可访问地址，`FS_PANEL_LISTEN_ADDR` 只控制绑定地址
+该模式只管理本机 Owner 和 FS Agent，不会启动 KV Master、FS Master 或 Panel。
 
-脚本会持续运行，并打印：
+### 远程挂载读写验证
 
-- `cluster name`
-- `share_mem_path`
-- `remote root dir`
-- `export name`
-- `owner instance key`
-- `fs master instance key`
-- `fs agent instance key`
-- `start masters in this script`
+验证流程使用三个脚本：
+
+- `start_kv_and_fs_svc.py`：启动服务角色。
+- `start_fluxon_fs_writer.py`：注册 export，并持续写远端文件和本地对照文件。
+- `start_fluxon_fs_reader.py`：挂载 export，并持续读取远端文件和本地对照文件。
+
+#### 运行前的配置对应关系
+
+Writer 和 Reader 都要求：
+
+- `-c/--config` 指向已经准备好的环境 YAML。
+- `-w/--workdir` 指向当前进程独占的可写目录。
+- `kvclient.instance_key` 在集群内唯一。
+- `cluster_name` 与 FS 服务一致。
+- `share_mem_path` 与各自机器上的 Owner 一致。
+
+此外：
+
+- Writer 配置中的 export 名和远端根目录必须与目标 FS Agent 对应。
+- Reader 的 `fluxon_fs.master.instance_key` 必须等于目标 `FS_MASTER_INSTANCE_KEY`。
+- Reader 的 `export_name` 必须等于 Writer 注册、FS Master 发布的 export 名。
+- Writer 和 Reader 使用相同的远端相对路径。
+
+本页不内嵌完整 Writer/Reader YAML；`-c` 应使用当前部署环境已经确认过的配置文件。
+
+#### Reader 挂载目录要求
+
+`mount_dir_abs` 必须满足：
+
+- 使用绝对路径。
+- 不能是 `/`。
+- 目录不存在时可以由 Fluxon 创建。
+- 目录已经存在时必须为空。
+- 不能与当前进程中的其他挂载目录重叠。
+
+挂载目录不要求放在 `/fluxon_fs/` 下，例如 `/tmp/fluxon_fs_demo/mount_demo` 也可以。
+
+#### 启动 Writer
+
+保持 FS 服务运行，在第二个终端执行：
+
+```bash
+python3 examples/start_fluxon_fs_writer.py \
+  -c <writer-config.yaml> \
+  -w <writer-workdir>
+```
+
+Writer 成功后会持续打印：
+
+```text
+[writer] op=write_remote ...
+[writer] op=write_local ...
+```
+
+#### 启动 Reader
+
+在第三个终端执行：
+
+```bash
+python3 examples/start_fluxon_fs_reader.py \
+  -c <reader-config.yaml> \
+  -w <reader-workdir>
+```
+
+Reader 完成挂载并找到文件后，会持续打印：
+
+```text
+[reader] op=read_remote ...
+[reader] op=read_local ...
+```
+
+这表示远端 export 挂载和本地 cache 规则都已经生效。
+
+> **当前示例限制**：`start_fluxon_fs_reader.py` 尚未调用 `set_request_identity(...)`，也不会从 YAML 读取用户名和密码。在启用了访问控制的 FS Master 上，需要在应用代码中显式设置请求身份，否则远端文件操作会因缺少认证 token 失败。
+
+### `FluxonFsPatcher` 调用顺序
+
+Reader 的推荐流程是：
+
+```text
+new_store(...)
+→ install_patcher_from_master(...)
+→ wait_cache_config_loaded()
+→ set_request_identity(...)
+→ mount_remote_dir(...)
+→ open() / read() / write()
+→ patcher.uninstall()
+→ store.close()
+```
+
+关键规则：
+
+- `FluxonFsPatcher` 依赖 `new_store(...)` 返回的 `KvClient`。
+- `install_patcher_from_master(...)` 会从 FS Master 拉取 export 配置并安装 Patcher。
+- `set_request_identity(username, password)` 为后续 FS 请求设置身份。
+- 必须先调用 `patcher.uninstall()`，再关闭 `store`。
+
+需要手动控制配置加载时，可以使用：
+
+- `load_cache_config_from_master_config_file(config_path)`：读取文件中的 FS Master 实例信息，并阻塞到配置拉取成功。
+- `start_cache_config_fetch_from_master_config_file(config_path)`：在后台持续从 FS Master 拉取配置；`install_patcher_from_master(...)` 已经调用了这个接口。
+- `set_cache_config_yaml(...)`：不从 FS Master 拉取时，直接注入 export 和 cache 配置。
+
+普通 Reader 优先使用 `install_patcher_from_master(...)`，不需要自行组合这些接口。
+
+### 进阶配置
+
+#### Panel 与访问控制
+
+- `FS_PANEL_LISTEN_ADDR` 决定 FS Master 在本机监听的网卡和端口。
+- `FS_PANEL_PUBLIC_BASE_URL` 是浏览器和页面链接使用的公开地址。跨机器访问时，应改成实际可达的主机名或 IP。
+- `FS_MASTER_ACCESS_DB_PATH` 保存用户、密码和权限，应使用稳定、可写的绝对路径。
+- `bootstrap_access_model` 只在 access DB 没有用户时写入首批账号。
+- 数据库已有用户后，修改 `ADMIN_USERNAME` 或 `ADMIN_PASSWORD` 不会覆盖现有账号。
+- `can_manage_users: true` 的管理员在运行时可以访问所有当前 export。
+
+#### 日志
+
+服务脚本把子进程标准输出写入：
+
+- `WORKDIR/log/kv_master.log`
 - `WORKDIR/log/owner.log`
+- `WORKDIR/log/fs_master.log`
 - `WORKDIR/log/fs_agent.log`
 
-默认模式下，还会额外打印：
+Writer 和 Reader 的 Python 日志默认输出到当前终端。需要增加日志时，可以设置：
 
-- `panel listen addr`
-- `panel public base url`
-- `transfer state store pd_endpoints`
-- `transfer state store key_prefix`
-- 默认管理员用户名密码
-- `WORKDIR/log/kv_master.log`
-- `WORKDIR/log/fs_master.log`
+```bash
+FLUXON_LOG=DEBUG python3 examples/start_fluxon_fs_reader.py \
+  -c <reader-config.yaml> \
+  -w <reader-workdir>
+```
 
-默认模式下，这个脚本把四个子进程的 `stdout/stderr` 都收进 `WORKDIR/log`，终端只保留摘要信息；按 `Ctrl-C` 时，主进程会统一停止这四个角色。`--without-master` 模式下，脚本只管理本机 `owner + fs_agent` 两个角色。
+#### 常见错误
 
-## 远程挂载读写验证
+- **`new_store failed`**：先检查服务脚本是否仍在运行，以及 `cluster_name`、`share_mem_path` 是否与本机 Owner 一致。
+- **`unknown export_name`**：检查 Reader 的 `export_name` 是否已经由 FS Agent 注册并由 FS Master 发布。
+- **挂载目录错误**：检查路径是否为绝对路径、是否为空，以及是否与已有挂载重叠。
+- **`fluxon_fs cache config is not loaded yet`**：检查 FS Master 实例标识是否正确，并确认配置拉取已经完成。
+- **`permission denied` / `PermissionError`**：检查是否调用了 `set_request_identity(...)`，以及账号密码和 access DB 权限。
 
-根目录 `examples/` 里的公开 FS 验证脚本收束成三类对象：
+### 可选：目录传输与预扫描
 
-- `examples/start_kv_and_fs_svc.py`
-  - 本机直接拉起 `kv master + owner + fs master + fs agent`
-- `examples/start_fluxon_fs_writer.py`
-  - 注册 export，并持续写远端 export 文件和本地 cache 规则文件
-- `examples/start_fluxon_fs_reader.py`
-  - 通过 `install_patcher_from_master(...)` 安装 patcher，挂载 export，并持续交替读取远端文件和本地文件
+目录传输适合跨机器或跨共享存储的大目录搬迁。它会持续记录扫描进度、batch 数量、运行中的 worker 和实时带宽。
 
-最小成功路径如下：
+该功能依赖 TiKV `transfer_state_store`。开始前先按 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md) 启动 PD 和 TiKV。
 
-1. 运行 `python3 examples/start_kv_and_fs_svc.py`
-2. 保持它持续运行
-3. 准备 writer 配置，运行 `python3 examples/start_fluxon_fs_writer.py -c <writer-config.yaml> -w <writer-workdir>`
-4. 准备 reader 配置，运行 `python3 examples/start_fluxon_fs_reader.py -c <reader-config.yaml> -w <reader-workdir>`
+#### 在页面发起目录传输
 
-这条最小成功路径默认对应本页的本地完整示例，也就是不带 `--without-master` 的启动方式。`--without-master` 用于把当前机器接到已经存在的 KV / FS 集群；如果继续运行 `start_fluxon_fs_writer.py` / `start_fluxon_fs_reader.py`，配置里的这些对象必须和现有集群一致：
+在双 pane 页面中：
 
-- `cluster_name`
-- `share_mem_path`
-- `fluxon_fs.master.instance_key`
-- `export_name`
-- `remote_root_dir_abs`
+1. 左侧定位源文件夹。
+2. 右侧定位目标 export 和目录。
+3. 把左侧文件夹拖到右侧。
+4. 设置 `desired_worker_count` 和 `batch_ready_bytes`。
+5. 提交后到 `/ui/transfers/` 查看任务。
 
-`start_fluxon_fs_writer.py` 固定负责两件事：
+`FluxonFS Transfer Jobs` 会显示扫描进度、batch 数量、运行中的 worker 和实时带宽。
 
-- 向当前 `fs master` 注册当前 export
-- 持续写入远端 export 文件和本地 cache 规则文件
+#### 导入预扫描
 
-`start_fluxon_fs_reader.py` 固定负责三件事：
+`/ui/transfers/` 的 `Pre-Scans` 区域可以把已有预扫描导入为正式任务：
 
-- 用 external client 接到本机 owner
-- 通过 `install_patcher_from_master(...)` 安装 patcher，并从 `fs master` 拉取配置
-- 把指定 export 挂到本地 mount dir，持续交替读取远端文件和本地文件
+1. 找到预扫描记录并点击 `Import`。
+2. 选择 source export 和 target export。
+3. 填写 target prefix 和 `desired_worker_count`。
+4. 提交后在 `FluxonFS Transfer Jobs` 中查看。
 
-当 `reader` 开始稳定打印 `op=read_remote` / `op=read_local` 时，说明远端挂载链路和本地 cache 规则都已经打通。
+#### TiKV 命名空间
 
-如果你要直接在自己的 Python 进程里调用 `FluxonFsPatcher` 和 `mount_remote_dir(...)`，继续看下面的 API 规则；根目录 `examples/` 不再保留单独的进程内挂载演示脚本。
-
-## 目录传输与预扫描
-
-有时候需要做一次很大的目录搬迁，例如跨机群搬迁，或者跨共享存储搬迁。目录里可能有多层子目录、很多文件，整个任务会持续很久。这个时候，用户真正关心的通常不是某一个文件，而是这次目录任务有没有开始、当前扫到哪里了、是不是已经开始写入、现在带宽怎么样。
-
-目录传输与预扫描就是为这种场景准备的。它把这种长时间的大目录搬运收成一个持续运行的任务：目录可以直接在网页里发起，也可以先做预扫描，等目录规模、目标位置和并发策略确定后，再导入成正式任务。
-
-### 在网页里直接发起目录传输
-
-最常见的入口是双 pane 浏览页面里的跨 export 文件夹拖拽。这里说的是网页里的文件夹从一个 pane 拖到另一个 pane，不是把本地文件夹拖进浏览器。
-
-操作顺序如下：
-
-1. 打开两个 pane
-2. 左侧定位源文件夹
-3. 右侧定位目标 export 和目标目录
-4. 把左侧文件夹拖到右侧
-5. 在弹窗里填写 `desired_worker_count` 和 `batch_ready_bytes`
-6. 提交后，到 `/ui/transfers/` 查看任务
-
-提交之后，这个目录任务会出现在 `/ui/transfers/` 的 `FluxonFS Transfer Jobs` 里。
-
-### 页面上能看到什么
-
-`/ui/transfers/` 页面里，和这组功能直接相关的有两个区域：
-
-- `Pre-Scans`
-- `FluxonFS Transfer Jobs`
-
-`FluxonFS Transfer Jobs` 用来查看已经进入正式传输链路的目录任务。页面上会持续显示：
-
-- 扫描进度
-- 已经拆出的 batch 数量
-- 当前 running batches 数量
-- 当前 `live bandwidth`
-- worker 明细
-
-这些信息通常足够判断：
-
-- 任务现在还在扫描，还是已经开始写入
-- 当前带宽是否正常
-- 当前并发是否达到预期
-
-### 在页面上导入预扫描
-
-当 `Pre-Scans` 里已经有一条预扫描记录后，可以直接在网页里把它导入成正式目录任务。
-
-操作顺序如下：
-
-1. 打开 `/ui/transfers/`
-2. 在 `Pre-Scans` 里找到对应任务
-3. 点击 `Import`
-4. 在弹窗里选择 `source export`
-5. 选择 `target export`
-6. 填写 `target prefix`
-7. 填写 `desired_worker_count`
-8. 提交后，这个任务会进入 `FluxonFS Transfer Jobs`
-
-如果同一个源目录同时匹配多个 `source export`，页面会把这些候选都列出来，由用户自己选择。
-
-### 启动时的 TiKV 配置
-
-目录传输和预扫描都依赖 `transfer_state_store`。`fs master` 页面和独立发起预扫描的进程，必须共用同一份 TiKV 命名空间；否则脚本里发起的预扫描，页面上看不到。
-
-启动时最关键的是下面两项要一致：
+FS Master 与独立预扫描进程必须使用相同的：
 
 - `pd_endpoints`
 - `key_prefix`
 
-本页这个 `start_kv_and_fs_svc.py` 示例已经把它们写成：
-
-- `TRANSFER_STATE_STORE_PD_ENDPOINTS = ["127.0.0.1:12379"]`
-- `TRANSFER_STATE_STORE_KEY_PREFIX = "/fluxon_fs_transfer/demo-fs-cluster/"`
-
-`fs master` 的 `master_panel` 配置里需要带上这一段：
+本页示例统一使用：
 
 ```yaml
 transfer_state_store:
@@ -543,34 +588,12 @@ transfer_state_store:
     key_prefix: "/fluxon_fs_transfer/demo-fs-cluster/"
 ```
 
-独立预扫描脚本里用的 `FluxonFsTransferStateStoreTiKvConfig(...)`，也要使用同样的 `pd_endpoints` 和 `key_prefix`。
+#### 独立预扫描示例
 
-### 页面截图（待补）
+独立预扫描只依赖 PD 和 TiKV，不要求 KV Master、Owner、FS Master 或 FS Agent 已经启动。后续 FS Master 使用相同 `pd_endpoints` 和 `key_prefix` 启动后，页面即可看到预扫描结果。
 
-- 图：`/ui/transfers/` 页面总览
-  需要标出 `Pre-Scans` 和 `FluxonFS Transfer Jobs`
-- 图：`Pre-Scans` 的 `Import` 弹窗
-  需要标出 `source export`、`target export`、`target prefix`、`desired_worker_count`
-- 图：双 pane 页面里跨 export 拖拽文件夹后的目录传输表单
-  需要标出 `desired_worker_count` 和 `batch_ready_bytes`
-
-### 独立进程发起预扫描示例
-
-独立发起预扫描时，需要先启动的是 TiKV `transfer_state_store` 对应的 PD 和 TiKV。
-
-这一段不依赖下面这些组件先启动：
-
-- `etcd`
-- `fluxonkv master`
-- `owner`
-- `fs master`
-- `fs agent`
-
-也就是说，只要 TiKV `transfer_state_store` 可用，预扫描脚本就可以先单独跑起来。等后面 `fs master` 页面使用同一份 `pd_endpoints` 和 `key_prefix` 启动后，网页里就能看到这次预扫描。
-
-下面这个示例会扫描 `/data/demo_src`，并把结果写到和页面共用的 `transfer_state_store` 里。脚本跑完后，打开 `/ui/transfers/`，就可以在 `Pre-Scans` 里看到这次预扫描。
-
-最小示例如下：
+<details>
+<summary><strong>📄 查看完整预扫描示例（点击展开）</strong></summary>
 
 ```python
 #!/usr/bin/env python3
@@ -588,7 +611,7 @@ STORE = FluxonFsTransferStateStoreConfig(
     kind=FluxonFsTransferStateStoreKind.TIKV,
     tikv=FluxonFsTransferStateStoreTiKvConfig(
         pd_endpoints=["127.0.0.1:12379"],
-        key_prefix="/fluxon_fs_transfer/demo_prescan/",
+        key_prefix="/fluxon_fs_transfer/demo-fs-cluster/",
     ),
 )
 
@@ -613,137 +636,6 @@ summary = transfer_check_local_blocking(
 print(summary)
 ```
 
-`summary` 里最有用的是 `job_id`、`scan_epoch` 和 `batch_count`。网页上的 `Pre-Scans` 会按同一个 `job_id` 展示这次预扫描结果。
+</details>
 
-## 关键对象与规则
-
-### `FluxonFsPatcher`
-
-`FluxonFsPatcher` 不是独立入口，它必须依附在 `new_store(...)` 返回的 `store` 上。
-
-固定顺序如下：
-
-1. `store = new_store(cfg)...`
-2. `patcher = FluxonFsPatcher(store)`
-3. `patcher.set_master_config_yaml(...)`
-4. `patcher.set_cache_config_yaml(...)`
-4. `patcher.set_request_identity(...)`
-5. `patcher.install()`
-6. `patcher.mount_remote_dir(...)`
-7. `open()` / `read()` / `write()`
-8. `patcher.uninstall()`
-9. `store.close()`
-
-这里不能把 `store.close()` 放到 `patcher.uninstall()` 前面，因为 patcher 还在工作时，后续文件操作仍然可能走到底层 client。
-
-### `set_master_config_yaml(...)` 与 `set_cache_config_yaml(...)`
-
-这两个接口一起构成当前示例里的最小 authority：
-
-- `set_master_config_yaml(...)` 负责注入 `fluxon_fs.master.instance_key`，让挂载后的 mount-registry RPC 能回报给正确的 `fs master`
-- `set_cache_config_yaml(...)` 负责注入当前 export 快照，让 patcher 知道有哪些 export 可以挂载
-
-业务代码可以直接在 Python 里构造这两段 YAML 文本；当前公开 runtime 示例 `start_fluxon_fs_reader.py` 则通过 `install_patcher_from_master(...)` 从配置文件和 `fs master` 拉取这两层信息。
-
-### `set_request_identity(...)`
-
-`set_request_identity(username, password)` 负责把当前 Python 进程里的后续 FS 请求绑定到这组身份。
-
-如果不设置身份：
-
-- 当 `access_db` 为空、系统还没有启用真实用户模型时，请求可能处于未鉴权路径
-- 一旦 master 已经有用户和 `scope_access`，请求会按这个身份做权限判断
-
-用户示例里应该显式设置身份，不要把鉴权省略掉。
-
-### `bootstrap_access_model`
-
-`bootstrap_access_model` 是 `fs master` 启动配置里的必填项，用来给一个空的 `access_db` 写入第一批账号和目录权限。
-
-配置位置：
-
-```yaml
- fluxon_fs:
-  master_panel:
-    access_db_path: /path/to/access.db
-    bootstrap_access_model:
-      users:
-        - username: admin
-          password: admin
-          can_manage_users: true
-      scope_access: []
-```
-
-规则如下：
-
-- `access_db_path` 是长期 authority
-- `bootstrap_access_model` 必须在启动配置里显式提供
-- 只有当 `access_db` 还没有用户时，`bootstrap_access_model` 才会写入数据库
-- 数据库一旦已有用户，后续重启以数据库为准
-- `can_manage_users: true` 的用户在运行时可以访问所有当前 export，不依赖在数据库里预先展开 root `scope_access`
-- 页面不再提供首次管理员创建入口；首个管理员只能通过启动配置初始化
-
-## 挂载目录规则
-
-`mount_remote_dir(local_mount_dir_abs=..., export_name=...)` 对本地挂载目录的要求如下：
-
-- 必须是绝对路径
-- 不能是 `/`
-- 如果目录不存在，Fluxon 会创建它
-- 如果目录已存在，它必须是空目录
-- 不能和当前进程里已有挂载目录互相重叠
-
-因此，挂载目录并不要求必须放在 `/fluxon_fs/...` 下。`/tmp/fluxon_fs_demo/mount_demo` 这种绝对路径也可以。
-
-## 日志
-
-如果需要更详细的 Python 侧日志，可以在启动用户进程前设置：
-
-```bash
-FLUXON_LOG=DEBUG python3 examples/start_fluxon_fs_reader.py -c <reader-config.yaml> -w <reader-workdir>
-```
-
-常用值有：
-
-- `DEBUG`
-- `INFO`
-- `WARNING`
-- `ERROR`
-- `CRITICAL`
-
-## 常见错误
-
-### `new_store failed`
-
-通常表示当前 external client 没有接上本机 owner。先检查：
-
-- `start_kv_and_fs_svc.py` 是否还在运行
-- `CLUSTER_NAME`
-- `SHARE_MEM_PATH`
-
-### `fluxon_fs cache config is not loaded yet`
-
-通常表示 `set_cache_config_yaml(...)` 没有成功完成，或者脚本里的 cache 配置和服务端当前 export 配置不一致。先检查：
-
-- `FS_MASTER_INSTANCE_KEY` 是否一致
-- `EXPORT_NAME`
-- `REMOTE_ROOT_DIR`
-
-### `unknown export_name`
-
-表示客户端要挂载的 `EXPORT_NAME` 没有出现在当前 `fs master` 的 export 快照里。先检查：
-
-- `start_fluxon_fs_writer.py` 和 `start_fluxon_fs_reader.py` 的 `export_name` 是否一致
-- `REMOTE_ROOT_DIR` 是否和启动脚本里的 export 配置对应
-
-### `permission denied` 或 `PermissionError`
-
-这表示路径存在，但当前身份没有访问权限。先检查：
-
-- `ADMIN_USERNAME`
-- `ADMIN_PASSWORD`
-- 当前 `access_db` 里是否已经被新的用户数据覆盖
-
-如果你已经通过页面或数据库改过管理员密码，那么旧的 `bootstrap_access_model` 密码不会再生效。
-
-管理员对所有 export 的访问权限也是运行时按 `can_manage_users` 判断，不需要额外往 `scope_access` 里补根路径。
+运行前将 `src_root_dir` 改成实际存在的源目录。`summary` 中最常用的是 `job_id`、`scan_epoch` 和 `batch_count`。
