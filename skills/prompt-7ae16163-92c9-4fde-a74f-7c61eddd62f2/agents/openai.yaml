@@ -1,0 +1,6 @@
+interface:
+  display_name: "dever_canvas仅做参考"
+  short_description: "dever_canvas仅做参考"
+  default_prompt: "Use $prompt-7ae16163-92c9-4fde-a74f-7c61eddd62f2."
+policy:
+  allow_implicit_invocation: false
