@@ -1,280 +1,131 @@
-# 用户 - 4 - MQ接口
+# 用户 - 4 - MQ 接口
 
-<!-- Maintenance note: This page may reference the KV service-plane page, but its own authority object is MQ. Do not expand the service-plane scope here. -->
+## MQ 接口
 
-## 总体介绍
+Fluxon MQ 复用 KV 服务平面和本机 Owner 的内存池，在 `KvClient` 上提供 Producer 和 Consumer。Producer 使用 `put_data(...)` 发送消息，Consumer 使用 `get_data(...)` 接收消息。
 
-Fluxon 提供的是建立在 KV 底座之上的消息队列能力。它不是一套独立于 KV 的新服务，而是复用同一套服务平面、同一套本机共享内存池，以及同一个 Python client 接入内核，在这个基础上提供 producer / consumer 语义。
+最重要的连接规则是：Producer 和 Consumer 使用相同的 `CHANNEL_KEY`、Channel 类型和 Channel 配置，才能进入同一个 Channel。
 
-如果先按层级架构看，MQ 相关对象可以分成三层：
+### 开始前检查
 
-- 服务平面：`etcd`、`greptime`、`fluxonkv master`。这一层负责元数据、成员关系、路由、租约以及标准监控链路。
-- 本机数据面常驻实例：`owner`。这一层在本机长期驻留，提供共享内存池和本机数据面资源，角色上更接近一个本机 daemon。
-- 业务进程接入层：`FluxonKvClientConfig`、`new_store(...)` 返回的 `KvClient(store)`、以及继续绑定出来的 `producer` / `consumer`。这一层负责让业务进程以 external client 身份附着到同机 `owner`，再继续使用 MQ API 收发消息。
+运行 MQ 示例前，确认以下条件：
 
-因此，使用时可以先按下面这条生命周期依赖关系来理解：
+- 已按 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md) 启动 Greptime、etcd、Master 和本机 Owner。
+- 本机共享内存目录下已经生成 `shared.json`。
+- 当前 Python 环境已经安装 `fluxon-*.whl` 和 `fluxon_pyo3-*.whl`；安装方式见 [用户 - 0 - 安装](./用户%20-%200%20-%20安装.md)。
+- Producer 和 Consumer 的 `cluster_name` 与目标集群一致。
+- 每个进程的 `share_mem_path` 与同一台机器上的 Owner 一致。
+- 每个 Producer 和 Consumer 进程使用不同的 `instance_key`。
 
-```text
-etcd + greptime + fluxonkv master
-                |
-                v
-         kvclient owner
-                |
-                v
-+--------------------------------------------------------------+
-| kvclient external                                            |
-| FluxonKvClientConfig -> new_store(...) -> KvClient(store)    |
-+--------------------------------------------------------------+
-                                |
-                                +-> new_or_bind_with_unique_key(...)
-                                        |
-                                        +-> producer
-                                        +-> consumer
-```
-
-`owner`、`external client`、`shared memory` 这些前置概念见 [架构和概念](./用户%20-%201%20-%20架构和概念.md)；`new_store(...) -> KvClient` 的配置和基础语义见 [KV 和 RPC 接口](./用户%20-%203%20-%20KV-RPC接口.md)。
-
-MQ 用户侧有一个固定角色约束：producer / consumer 必须以 `external_client` 模式运行，也就是 zero-contribution 模式。原因很直接：producer / consumer 会动态加入和离开，这些业务侧进程不应改变集群容量；容量提供者应当始终是常驻的 `owner`。
-
-## 服务平面
-
-在进入 producer / consumer 代码之前，需要先把 MQ 依赖的服务平面拉起来。共性的角色关系、启动顺序和 runtime 边界，统一见 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md)。
-
-![](../../pics/deploy_arch_1.png)
-
-MQ 直接复用 KV 服务平面，没有自己独立的一套底座。直接接触的服务平面对象主要有：
-
-- `greptime`：用于标准监控链路。安装与启动见 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md)
-- `etcd`：MQ / KV 服务平面元数据存储。安装与启动见 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md)
-- `start_kv_master_process(...)`：启动 `fluxonkv master`
-- `start_owner_kvclient_process(...)`：启动 `owner`
-
-MQ 用户进程的最小前置链路如下：
-
-1. 先起 `greptime`
-2. 再起 `etcd`
-3. 再起 `fluxonkv master`
-4. 再起 `owner`
-5. 最后再运行 producer / consumer
-
-最小可运行示例脚本如下。MQ 复用的就是这条 KV 角色启动链路；这个脚本只启动 Fluxon 自己的角色，`etcd` / `greptime` 仍按服务平面文档单独启动：
-
-- 当前 `python3` 所在环境已经安装 `fluxon-*.whl` 和 `fluxon_pyo3-*.whl`；安装方式见 [用户 - 0 - 安装](./用户%20-%200%20-%20安装.md)
-
-对应示例脚本：`examples/start_master_owner.py`
-
-这个脚本支持两种启动方式：
-
-- 默认方式：启动 `master + owner`
-- `--without-master`：只启动 `owner`，接入已经存在的 KV 集群 `master`
+按 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md) 的默认配置启动时，本页示例可以直接保留：
 
 ```python
-#!/usr/bin/env python3
-
-import argparse
-
-from pathlib import Path
-
-from fluxon_py.runtime import (
-    start_kv_master_process,
-    start_owner_kvclient_process,
-    wait_subproc_or_ctrlc,
-)
-from fluxon_py.runtime.process_runner import ManagedSubprocess
-
-ETCD_ENDPOINT = "127.0.0.1:2379"
-GREPTIME_HTTP_PORT = 34030
-GREPTIME_BASE_URL = f"http://127.0.0.1:{GREPTIME_HTTP_PORT}"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARE_MEM_PATH = Path("/dev/shm/fluxon_kv_demo").resolve()
-WORKDIR = Path("/tmp/fluxon_kv_demo/runtime").resolve()
-MASTER_PORT = 31000
-MASTER_INSTANCE_KEY = "demo_kv_master"
-OWNER_INSTANCE_KEY = "demo_kv_owner"
-OWNER_DRAM_BYTES = 1073741824
-
-
-def main() -> None:
-    args = parse_args()
-    log_dir = (WORKDIR / "log").resolve()
-
-    if args.with_master:
-        master_log_dir = (WORKDIR / "master_logs").resolve()
-        master_log_dir.mkdir(parents=True, exist_ok=True)
-        master_stdout_log = log_dir / "master.log"
-        master_proc = start_kv_master_process(
-            config=build_master_config(log_dir=master_log_dir),
-            log_path=master_stdout_log,
-        )
-    else:
-        master_stdout_log = None
-        master_proc = None
-
-    owner_stdout_log = log_dir / "owner.log"
-    owner_proc = start_owner_kvclient_process(
-        config=build_owner_config(),
-        log_path=owner_stdout_log,
-    )
-    children = []
-    if master_proc is not None:
-        children.append(
-            ManagedSubprocess(
-                label="master",
-                proc=master_proc,
-            )
-        )
-    children.append(
-        ManagedSubprocess(
-            label="owner",
-            proc=owner_proc,
-        )
-    )
-
-    print(f"[fluxon_kv] share_mem_path: {SHARE_MEM_PATH}")
-    print(f"[fluxon_kv] etcd endpoint: {ETCD_ENDPOINT}")
-    print(f"[fluxon_kv] greptime base url: {GREPTIME_BASE_URL}")
-    print(f"[fluxon_kv] start master in this script: {args.with_master}")
-    if master_stdout_log is not None:
-        print(f"[fluxon_kv] master stdout log: {master_stdout_log}")
-    else:
-        print("[fluxon_kv] master stdout log: disabled by --without-master")
-    print(f"[fluxon_kv] owner stdout log: {owner_stdout_log}")
-    stack_label = "master and owner" if args.with_master else "owner"
-    print(f"[fluxon_kv] waiting for Ctrl-C to stop {stack_label}")
-    wait_subproc_or_ctrlc(
-        children,
-        on_ctrlc=lambda: print(f"[fluxon_kv] caught Ctrl-C, stopping {stack_label}"),
-    )
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Start KV demo owner, optionally with a local master")
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--with-master",
-        dest="with_master",
-        action="store_true",
-        help="Start a local kv master in this script (default)",
-    )
-    group.add_argument(
-        "--without-master",
-        dest="with_master",
-        action="store_false",
-        help="Do not start a local kv master; only start owner and attach to an existing cluster master",
-    )
-    parser.set_defaults(with_master=True)
-    return parser.parse_args()
-
-
-def build_master_config(*, log_dir: Path) -> dict:
-    return {
-        "instance_key": MASTER_INSTANCE_KEY,
-        "cluster_name": CLUSTER_NAME,
-        "port": MASTER_PORT,
-        "etcd_endpoints": [ETCD_ENDPOINT],
-        "log_dir": str(log_dir),
-        "monitoring": {
-            "prometheus_base_url": f"{GREPTIME_BASE_URL}/v1/prometheus",
-            "prom_remote_write_url": [f"{GREPTIME_BASE_URL}/v1/prometheus/write"],
-            "otlp_log_api": {
-                "otlp_endpoint": f"{GREPTIME_BASE_URL}/v1/otlp/v1/logs",
-            },
-        },
-    }
-
-
-def build_owner_config() -> dict:
-    return {
-        "instance_key": OWNER_INSTANCE_KEY,
-        "contribute_to_cluster_pool_size": {
-            "dram": OWNER_DRAM_BYTES,
-            "vram": {},
-        },
-        "fluxonkv_spec": {
-            "etcd_addresses": [ETCD_ENDPOINT],
-            "cluster_name": CLUSTER_NAME,
-            "share_mem_path": str(SHARE_MEM_PATH),
-            "sub_cluster": "default",
-            "large_file_paths": [str((WORKDIR / "large" / "owner").resolve())],
-        },
-    }
-
-
-if __name__ == "__main__":
-    main()
+SHARE_MEM_PATH = "/dev/shm/fluxon_kv_demo"
 ```
 
-启动命令：
+Producer 和 Consumer 都是 External Client，只使用 Owner 已经提供的容量。它们的配置中不应加入 Owner 专用的 `contribute_to_cluster_pool_size`、`etcd_addresses`、`sub_cluster` 或 `large_file_paths`。
 
-```bash
-python3 examples/start_master_owner.py
-python3 examples/start_master_owner.py --without-master
-```
+`KvClient`、`FlatDict` 和 `Result` 的基础用法见 [用户 - 3 - KV 和 RPC 接口](./用户%20-%203%20-%20KV-RPC接口.md)。
 
-默认命令会启动本机 `master + owner`。`--without-master` 只启动本机 `owner`，要求同一个 `cluster_name` 对应的 `master` 已经在别处运行。
+### 对象关系
 
-`owner` 把共享内存池和 `shared.json` 准备好之后，再运行下面的 MQ 最小示例。默认模式下，这个服务平面脚本会把子进程终端输出写到 `WORKDIR/log/master.log` 和 `WORKDIR/log/owner.log`，终端只保留摘要信息；`--without-master` 模式下只会生成 `WORKDIR/log/owner.log`。
-
-`cluster`、`owner_client`、`external_client`、`shared memory` 这些前置概念见 [架构和概念](./用户%20-%201%20-%20架构和概念.md)；`new_store(...) -> KvClient` 的配置和基础语义见 [KV 和 RPC 接口](./用户%20-%203%20-%20KV-RPC接口.md)。
-
-## 对象关系
-
-`new_store(...)` 和 MQ handle 的关系如下：
+MQ 的最小调用关系如下：
 
 ```text
 FluxonKvClientConfig
-        |
-        v
-new_store(cfg) -> KvClient (store)
-        |
-        +-- new_or_bind_with_unique_key(
-        |       store,
-        |       chan_config,
-        |       unique_id,
-        |       chan_type,
-        |       chan_role,
-        |   )
-        |
-        +-- producer handle
-        |       put_data(...)
-        |       close()
-        |
-        +-- consumer handle
-        |       get_data(...)
-        |       close()
-        |
-        v
-store.close()
+        ↓
+new_store(...) → KvClient
+        ↓
+使用相同 CHANNEL_KEY 绑定 Channel
+        ├─ Producer → put_data(...)
+        └─ Consumer → get_data(...)
 ```
 
-关键关系如下：
+`new_or_bind_with_unique_key(...)` 会根据 `CHANNEL_KEY` 查找 Channel：
 
-- `new_store(...)` 构造的是 `KvClient`；本页里的 `store` 只是示例变量名
-- `KvClient` 的基础语义、配置字段、`external_client` 约束都在 [KV 和 RPC 接口](./用户%20-%203%20-%20KV-RPC接口.md) 里定义
-- `new_or_bind_with_unique_key(...)` 不是独立入口，它必须运行在 `store` 之上
-- 退出顺序固定是：先 `producer.close()` / `consumer.close()`，再 `store.close()`
+- 第一个使用该 key 的进程创建 Channel。
+- 后续进程使用相同 key 绑定已有 Channel。
+- 不同逻辑 Channel 应使用不同的 key。
 
-## MQ接口最小示例
+每个进程都先创建自己的 `KvClient`，再在其上创建 Producer 或 Consumer handle。退出时顺序固定为：
 
-跑通一对 producer / consumer 的最小对象如下：
+```text
+先关闭 Producer / Consumer handle → 再关闭 KvClient
+```
 
-- `examples/start_mpmc_demo.py`
+### MQ 最小示例
 
-它只保留一个命令参数：
+`examples/start_mpmc_demo.py` 使用 `ChanType.MPMC`，允许多个 Producer 和多个 Consumer。首次运行只启动一个 Consumer 和一个 Producer。
 
-- `--role producer`
-- `--role consumer`
+#### 首次只需确认这些值
 
-先把服务平面拉起来，然后分别运行：
+- `--role`：当前进程运行 Producer 还是 Consumer。
+- `CLUSTER_NAME`：必须与 Master 和本机 Owner 一致。
+- `SHARE_MEM_PATH`：必须与本机 Owner 一致。
+- `CHANNEL_KEY`：两个进程必须完全一致；示例使用 `demo_mq_channel_doc`。
+- `instance_key`：脚本根据角色生成 `demo_mq_producer` 或 `demo_mq_consumer`，因此两个进程的标识不同。
+
+示例中的其他值可以先保留：
+
+- `CHANNEL_CAPACITY = 128`
+- `CHANNEL_TTL_SECONDS = 300`
+- `PRODUCER_INTERVAL_SECONDS = 1.0`
+- `CONSUMER_BATCH_SIZE = 1`
+
+这些配置的含义和约束见后面的进阶说明。如果需要同时启动两个相同角色的进程，必须为每个进程分配不同的 `instance_key`，不能继续直接复用示例根据角色生成的固定值。
+
+#### 消息内容
+
+Producer 发送的每条消息都是 `FlatDict`：
+
+```python
+{
+    "seq": 1,
+    "payload": b"hello mq #1",
+}
+```
+
+- `seq` 是示例自定义的进程内消息序号。
+- `payload` 是示例自定义的数据字段。
+- `b"..."` 表示 Python bytes。
+
+这些字段名不是 MQ 的固定字段，可以替换为业务需要的其他 `FlatDict` 字段。
+
+#### 启动 Consumer 和 Producer
+
+先在终端一启动 Consumer：
 
 ```bash
-python3 examples/start_mpmc_demo.py --role producer
 python3 examples/start_mpmc_demo.py --role consumer
 ```
 
-这个最小示例里，`producer` 每成功发送一条消息，就把本进程内的 `seq` 加 `1`；如果你重启 `producer` 进程，计数会从 `1` 重新开始，而不是跨进程持久延续。
+Consumer 绑定成功后会打印包含下面内容的日志：
 
-对应的真实脚本内容如下：
+```text
+[consumer] ready: channel_key=demo_mq_channel_doc
+```
+
+再在终端二启动 Producer：
+
+```bash
+python3 examples/start_mpmc_demo.py --role producer
+```
+
+成功运行后，两端会持续出现类似日志：
+
+```text
+[producer] ready: channel_key=demo_mq_channel_doc
+[producer] sent: seq=1 payload=hello mq #1
+[consumer] got: seq=1 payload=hello mq #1
+```
+
+看到 Producer 持续发送、Consumer 持续收到相同序号和 payload，即表示最小链路已经跑通。分别在两个终端按 Ctrl-C 可以停止进程。
+
+`seq` 只保存在 Producer 当前进程中。重启 Producer 后，它会从 `1` 重新开始，不会跨进程持久化。
+
+<details>
+<summary><strong>📄 查看完整脚本（点击展开）</strong>｜<code>examples/start_mpmc_demo.py</code></summary>
 
 ```python
 #!/usr/bin/env python3
@@ -475,7 +326,6 @@ def main() -> None:
     parser.add_argument("--role", choices=["producer", "consumer"], required=True)
     args = parser.parse_args()
 
-    # The minimal example keeps share_mem_path explicit and local.
     # init_logger() reads FLUXON_LOG and sets the user-process console log level.
     logger = init_logger(f"mpmc_demo_{args.role}")
     shutdown_requested = threading.Event()
@@ -499,70 +349,128 @@ if __name__ == "__main__":
     main()
 ```
 
-这个最小示例对应的前置条件只有一条：
+</details>
 
-1. 先把 `greptime + etcd + master + owner` 这套服务平面拉起来
+完整脚本还处理了 Ctrl-C 和关闭期间的并发情况。首次使用只需记住：先关闭 Producer 或 Consumer handle，再关闭底层 `KvClient`。
 
-代码块里的注释已经把这份最小示例最容易混淆的局部因果直接写在对应位置，包括：
+### 常用接口
 
-- 每个全局常量控制什么
-- `new_store(...)` 和 MQ handle 的先后关系
-- `Ctrl-C` 回调为什么只做“设置退出标志位 + 调一次 close()”
-- `ProducerClosedError` / `ChannelClosedError` 为什么是正常关闭路径
-- 为什么一定是先关 handle，再关 `store`
+#### 创建或绑定 Channel
 
-常见启动方式：
+```python
+new_or_bind_with_unique_key(
+    api: KvClient,
+    chan_config: Dict[str, int],
+    unique_id: str,
+    chan_type: ChanType,
+    chan_role: ChanRole,
+) -> Result[
+    Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer],
+    ApiError,
+]
+```
+
+- `api` 是 `new_store(...)` 创建的 `KvClient`。
+- `chan_config` 是 Channel 配置。
+- `unique_id` 是稳定的 Channel key。相同 key 指向同一个逻辑 Channel。
+- `chan_type` 选择 `ChanType.MPMC` 或 `ChanType.MPSC`。
+- `chan_role` 选择 `ChanRole.PRODUCER` 或 `ChanRole.CONSUMER`。
+
+创建或绑定失败时，应先打印 `unwrap_error()`，再检查 `cluster_name`、`share_mem_path`、`unique_id`、Channel 类型和 Channel 配置是否一致。Producer 和 Consumer 的 `chan_role` 本来就不同，不需要设置成相同角色。
+
+#### 发送消息
+
+```python
+producer.put_data(value: FlatDict) -> Result[bool, ApiError]
+```
+
+`value` 是一层 `FlatDict`。返回成功表示消息已经交给 Channel；返回错误时应消费 `unwrap_error()`。
+
+#### 接收消息
+
+```python
+consumer.get_data(
+    batch_size: int = 1,
+    try_time: Optional[int] = None,
+    prefetch_num: int = 0,
+) -> Result[List[Any], ApiError]
+```
+
+- `batch_size`：本次最多请求的消息数，必须是正整数。
+- `try_time`：阻塞路径的最长等待秒数；设为 `0` 时用于非阻塞尝试。
+- `prefetch_num`：额外预取窗口大小，入门示例保留 `0`。
+
+成功结果是消息列表；本页 MPMC 示例中的每条消息都是 `FlatDict`。没有消息时可能返回空列表，业务循环应继续等待下一次读取。
+
+#### 查看身份和关闭
+
+- `producer.get_chan_id()` / `consumer.get_chan_id()`：返回当前 handle 绑定的 Channel ID。
+- `producer.get_producer_id()`：返回 Producer member ID。
+- `consumer.get_consumer_id()`：返回 Consumer member ID。
+- `close() -> Result[OkNone, ApiError]`：关闭当前 MQ handle。
+
+### 进阶说明
+
+#### Channel 类型和配置
+
+- `ChanType.MPMC` 支持多个 Producer 和多个 Consumer；`capacity` 与 `ttl_seconds` 都是必填项。
+- `ChanType.MPSC` 支持多个 Producer 和一个 Consumer；`ttl_seconds` 必填，`capacity` 可选。
+- `capacity` 必须是正整数，用于限制在途消息数量。达到限制后，Producer 会等待 Channel 出现可用空间。
+- `ttl_seconds` 必须是整数且不小于 `90`，用于 Channel 和成员租约。
+- 绑定同一个 `CHANNEL_KEY` 的进程应使用相同的 Channel 类型、`capacity` 和 `ttl_seconds`。
+
+示例中的两个本地参数不属于 Channel 配置：
+
+- `PRODUCER_INTERVAL_SECONDS` 只控制 Producer 两次发送之间的等待时间，必须为非负值。
+- `CONSUMER_BATCH_SIZE` 控制每次 `get_data(...)` 请求的消息数，必须是正整数。
+
+#### 生命周期和错误处理
+
+Ctrl-C 关闭期间，发送或接收循环可能观察到：
+
+- `ProducerClosedError`：Producer handle 已关闭，正常退出发送循环。
+- `ChannelClosedError`：Consumer handle 已关闭，正常退出接收循环。
+
+这两种错误在主动关闭路径中不代表新的数据面故障。其他错误应打印 `unwrap_error()` 并停止当前循环。
+
+关闭顺序始终是：
+
+1. 请求业务循环停止。
+2. 关闭 Producer 或 Consumer handle。
+3. 等待循环退出。
+4. 最后关闭 `KvClient`。
+
+#### 日志
+
+- MQ Python 日志由 `init_logger(...)` 初始化，默认输出到当前终端。
+- `FLUXON_LOG` 控制日志级别，可选值为 `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`，默认是 `INFO`。
+- MQ Rust 和 KV 后台日志使用 [用户 - 2 - 服务平面](./用户%20-%202%20-%20服务平面.md) 中说明的服务平面日志目录。
+- Master 配置了 `monitoring.otlp_log_api` 后，后台日志还会写入 Greptime 的 `fluxon_logs` 表。
+
+需要增加日志时，可以运行：
 
 ```bash
 FLUXON_LOG=INFO python3 examples/start_mpmc_demo.py --role producer
 FLUXON_LOG=DEBUG python3 examples/start_mpmc_demo.py --role consumer
 ```
 
-## 常用接口
+### 网页监控
 
-- `new_or_bind_with_unique_key(api, chan_config, unique_id, chan_type, chan_role)`：存在则 bind，不存在则创建
-- `producer.put_data(value: FlatDict) -> Result[bool, ApiError]`：写一条消息
-- `consumer.get_data(batch_size: int = 1, try_time: Optional[int] = None, prefetch_num: int = 0) -> Result[List[Any], ApiError]`：按批拉消息
-- `producer.get_chan_id()` / `consumer.get_chan_id()`：查看当前 handle 绑定的 `chan_id`
-- `producer.get_producer_id()` / `consumer.get_consumer_id()`：查看当前 member id
-- `close() -> Result[OkNone, ApiError]`：关闭当前 MQ handle
+先按 [用户 - 3 - KV 和 RPC 接口](./用户%20-%203%20-%20KV-RPC接口.md) 中的“可选：KV Web UI”启用 Master Web UI。进入对应集群页面后，MQ 主要查看：
 
-参数约束如下：
+- `Channels`：Channel 汇总。
+- `Members`：单个 Producer 和 Consumer 明细。
 
-- `chan_type` 当前最常用的是 `ChanType.MPMC`，也支持 `ChanType.MPSC`
-- `chan_role` 只能是 `ChanRole.PRODUCER` 或 `ChanRole.CONSUMER`
-- `try_time` 是秒级等待上限；如果需要阻塞拉取窗口控制，再看 `prefetch_num`
+#### 1. 先看是否存在积压
 
-### 关键接口常见错误处理
+在 `Channels` 表中，先按 `current_inflight` 降序排列：
 
-- `new_or_bind_with_unique_key(...)` 失败：直接把 `unwrap_error()` 打出来，先检查 `cluster_name`、`share_mem_path`、`unique_id`、`chan_role` 是否和对端一致
-- `producer.put_data(...)` 返回 `ProducerClosedError`：按正常关闭路径处理，直接退出主循环
-- `consumer.get_data(...)` 返回 `ChannelClosedError`：按正常关闭路径处理，直接退出主循环
+- 接近 `0`：当前 Channel 基本消费完毕。
+- 持续升高：消息产生速度高于消费速度，需要继续查看具体 Producer。
 
-### 日志路径
+#### 2. 再看具体 Producer
 
-日志路径如下：
-
-- MQ Python 部分：由 `init_logger(...)` 初始化，直接输出到当前终端，不默认落盘，门限由 `FLUXON_LOG` 控制
-- MQ Rust / KV 后台部分：和 KV 一起走服务平面的后台日志链路；`master` 本地日志目录由 `master_cfg["log_dir"]` 指定
-- `share_mem_path`：KV 共享 bundle 根目录，只承载 `mmap.file`、`shared.json` 和 peer metadata；后端日志、profile、cache 从 owner 的 `large_file_paths` 派生
-
-如果服务平面的 `master.monitoring.otlp_log_api` 已经配置，MQ Rust / KV 后台部分的日志还会继续采集到 Greptime 的 `fluxon_logs` 表。
-
-## 网页监控
-
-网页监控页面里直接可用的对象有两个：
-
-- `Channels` 表：看 channel 级汇总
-- `Members` 表：看单个 producer / consumer 明细
-
-### 查看 Channel 汇总
-
-`Channels` 表适合先看每个 channel 的整体状态，尤其是积压量和各个 producer 的写入进度。
-
-重点字段：
-
-`producer_offsets` 是 channel 下每个 producer 的 offset 明细，格式是：
+`producer_offsets` 的格式为：
 
 ```text
 producer_idx: produce_offset/consume_offset
@@ -574,70 +482,43 @@ producer_idx: produce_offset/consume_offset
 producer_1: 101/88, producer_2: 57/57
 ```
 
-这里的两个 offset 都表示“下一条 offset”：
+两个 offset 都表示下一条位置：
 
-- `produce_offset`：这个 producer 下一条将要写入的 offset
-- `consume_offset`：consumer 下一条将要提交的 offset
+- `produce_offset`：Producer 下一条要写入的位置。
+- `consume_offset`：Consumer 下一条要提交的位置。
 
-所以单个 producer 的当前未消费量就是：
+单个 Producer 的未消费量为：
 
 ```text
 max(produce_offset - consume_offset, 0)
 ```
 
-`current_inflight` 就是这个 channel 下所有 producer 上面这项的求和。
+`current_inflight` 是同一个 Channel 中所有 Producer 未消费量的总和。某一个 Producer 的差值持续增大时，说明积压主要来自该 Producer；多个 Producer 都有明显差值时，说明整个 Channel 的消费速度不足。
 
-常见查看方式：
+#### 3. 最后定位成员
 
-- `current_inflight` 持续升高，同时某一个 producer 在 `producer_offsets` 里差值越来越大
-  - 说明这个 producer 的消息在持续堆积
-- `current_inflight` 接近 `0`
-  - 说明当前 channel 基本被消费干净
-- `producer_offsets` 里多个 producer 都有明显差值
-  - 说明积压不是单个 producer 偏斜，而是整个 channel 消费跟不上
+在 `Members` 表中：
 
-### 查看 Producer / Consumer 明细
+1. 使用 `channel_unique_keys` 搜索 Python 侧传入的 `CHANNEL_KEY`。
+2. 查看对应行的 `chan_id`、`owner_id` 和 `external_client_id`。
+3. 继续检查 offset 和消费延迟字段。
 
-`Members` 表适合继续下钻到单个 producer / consumer。
+`channel_unique_keys` 是 Channel 级 key，不是单个 Producer 或 Consumer 的 member ID。需要查看 handle ID 时，使用 Python 接口的 `get_producer_id()` 或 `get_consumer_id()`。
 
-重点字段：
+`Channels` 和 `Members` 都支持字段筛选和多级排序。`current_inflight` 适合寻找积压最大的 Channel，`channel_unique_keys` 适合定位业务代码使用的 Channel。
 
-- `channel_unique_keys`：显示这个 member 所属 channel 的 `unique_id` 绑定 key
-- `produce_offset` / `consume_offset`：查看单个成员当前的写入位置和消费提交位置
-- `chan_id`、`owner_id`、`external_client_id`：继续定位这个成员属于哪个 channel、owner 和 external client
+### 延迟排查
 
-从 Python 侧用 `new_or_bind_with_unique_key(...)` 接入 MQ 时，定位方式如下：
+MQ 大约每 30 秒打印一次消费延迟统计。基础链路已经运行但消费较慢时，再搜索以下关键词：
 
-- 先在 `Members` 表搜 `channel_unique_keys`
-- 找到对应 row 之后，再看它的 `chan_id`、`owner_id`、`external_client_id`、offset 和消费延迟字段
-
-这里要注意一个边界：
-
-- 页面里显示的 `channel_unique_keys` 仍然是 channel 级 key
-- 当前监控页面没有单独暴露“某个 producer / consumer 实例自己的 unique member id”，因为现有 snapshot 权威数据里没有这个对象
-
-### 筛选与排序
-
-网页监控里的 `Channels` / `Members` 两张表都支持和 KV 页面同一套字段排序：
-
-- 可以在表头上方的 `Sort #1` 到 `Sort #4` 里选字段排序
-- `producer_offsets` 和 `current_inflight` 都支持这套排序
-- `channel_unique_keys` 也支持过滤和排序，适合直接按 Python 侧传入的 `unique_id` 查 channel
-- `producer_offsets` 适合做文本过滤，快速定位某个 producer
-- `current_inflight` 适合做排序，快速找到当前积压最大的 channel
-
-## 延迟排查
-
-MQ 每 30s 在日志中打印一次消费延迟统计。如果遇到消费慢的问题，按以下关键词搜索日志：
-
-| 日志关键词 | 观测层 | 说明 |
+| 日志关键词 | 观测位置 | 含义 |
 |---|---|---|
-| `py-get latency` | Python 调用侧 | 用户调用 `get_data()` 的总耗时 |
-| `get_one breakdown` | PyO3 层 | 跨语言桥接等待时间拆分 |
-| `MpscConsumer prefetch` | Rust MQ 层 | 预取队列和单条任务耗时 |
+| `py-get latency` | Python 调用侧 | `get_data()` 的总耗时 |
+| `get_one breakdown` | Python/Rust 边界 | 跨语言等待时间拆分 |
+| `MpscConsumer prefetch` | Rust MQ | 预取队列和单条任务耗时 |
 
-快速定位：
+快速判断：
 
-- `py-get` 总耗时高 → 先看 PyO3 层的 `avg_wait_rx_ms` 是否大
-- Rust 层 `avg_get_handle_ms` 高 → 预取队列为空，可能是生产侧无数据或窗口过小
-- Rust 层 `avg_handle_await_ms` 高 → 单条任务本身慢，例如 `kv_get` 或 etcd 提交慢
+- `py-get` 总耗时高时，先看 `avg_wait_rx_ms` 是否较高。
+- `avg_get_handle_ms` 高时，预取队列可能为空，常见原因是 Producer 暂时没有数据或预取窗口过小。
+- `avg_handle_await_ms` 高时，单条任务本身较慢，例如 KV 读取或 etcd 提交较慢。

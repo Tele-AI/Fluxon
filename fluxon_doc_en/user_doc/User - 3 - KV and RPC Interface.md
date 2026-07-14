@@ -2,206 +2,108 @@
 
 ## KV and RPC Interface
 
-This page describes Fluxon's Python KV API and node-to-node RPC calls. Both are exposed from the same `KvClient` instance and share one lifecycle.
+This page introduces the Fluxon Python KV API and node-to-node RPC. Both are provided by the same `KvClient` and share one configuration model, data model, and shutdown flow.
 
-See [Architecture and Concepts](<./User - 1 - Architecture and Concepts.md>) for `cluster_name`, `instance_key`, `etcd`, and the other base concepts.
+Before continuing, follow [User - 2 - Service Plane](<./User - 2 - Service Plane.md>) to start Greptime, etcd, Master, and the local Owner Client. This page focuses only on how an application process connects to an already running KV cluster.
 
-For business code, prefer passing a Python dict directly into `FluxonKvClientConfig(...)`. YAML is better suited to standalone processes, supervisors, deployment, and example environments.
+Application code should normally pass a Python dict directly to `FluxonKvClientConfig(...)`. YAML files and role-specific configuration are covered in the advanced section.
 
-### Service Plane
+### Checks Before Starting
 
-Before writing `put_blocking`, `get_blocking`, or `rpc_call`, start the KV service plane first. The shared role model, startup order, and runtime boundary are described in [User - 2 - Service Plane](<./User - 2 - Service Plane.md>).
+Confirm the following before running the examples:
 
-![](../../pics/deploy_arch_1.png)
+- Master and the local Owner Client are running, and `shared.json` exists under the local shared-memory directory.
+- The current Python environment has installed `fluxon-*.whl` and `fluxon_pyo3-*.whl`; see [User - 0 - Installation](<./User - 0 - Installation.md>).
+- The application process uses the same `cluster_name` as the target cluster.
+- Its `share_mem_path` matches the Owner Client on the same machine.
+- Every application process has a different `instance_key`.
 
-The most common objects are:
-
-- `Greptime`: standard observability path
-- `etcd`: KV control-plane metadata
-- `start_kv_master_process(...)`: starts `Fluxon KV Master`
-- `start_owner_kvclient_process(...)`: starts `Owner Client`
-
-The minimal local startup example is `examples/start_master_owner.py`. It only starts Fluxon-native roles and assumes:
-
-- `etcd` at `127.0.0.1:2379`
-- `Greptime` HTTP at `127.0.0.1:34030`
-- the current Python environment already installed `fluxon-*.whl` and `fluxon_pyo3-*.whl`
-
-### Minimal Role Startup Example
+When the default configuration from User 2 is used, the examples on this page can keep:
 
 ```python
-#!/usr/bin/env python3
-
-import argparse
-
-from pathlib import Path
-
-from fluxon_py.runtime import (
-    start_kv_master_process,
-    start_owner_kvclient_process,
-    wait_subproc_or_ctrlc,
-)
-from fluxon_py.runtime.process_runner import ManagedSubprocess
-
-ETCD_ENDPOINT = "127.0.0.1:2379"
-GREPTIME_HTTP_PORT = 34030
-GREPTIME_BASE_URL = f"http://127.0.0.1:{GREPTIME_HTTP_PORT}"
 CLUSTER_NAME = "demo-kv-cluster"
-SHARE_MEM_PATH = Path("/dev/shm/fluxon_kv_demo").resolve()
-WORKDIR = Path("/tmp/fluxon_kv_demo/runtime").resolve()
-MASTER_PORT = 31000
-MASTER_UI_PORT = 18080
-MASTER_INSTANCE_KEY = "demo_kv_master"
-OWNER_INSTANCE_KEY = "demo_kv_owner"
-OWNER_DRAM_BYTES = 1073741824
-
-
-def main() -> None:
-    args = parse_args()
-    log_dir = (WORKDIR / "log").resolve()
-
-    if args.with_master:
-        master_log_dir = (WORKDIR / "master_logs").resolve()
-        master_log_dir.mkdir(parents=True, exist_ok=True)
-        master_stdout_log = log_dir / "master.log"
-        master_proc = start_kv_master_process(
-            config=build_master_config(log_dir=master_log_dir),
-            log_path=master_stdout_log,
-        )
-    else:
-        master_stdout_log = None
-        master_proc = None
-
-    owner_stdout_log = log_dir / "owner.log"
-    owner_proc = start_owner_kvclient_process(
-        config=build_owner_config(),
-        log_path=owner_stdout_log,
-    )
-    children = []
-    if master_proc is not None:
-        children.append(ManagedSubprocess(label="master", proc=master_proc))
-    children.append(ManagedSubprocess(label="owner", proc=owner_proc))
-
-    print(f"[fluxon_kv] share_mem_path: {SHARE_MEM_PATH}")
-    print(f"[fluxon_kv] etcd endpoint: {ETCD_ENDPOINT}")
-    print(f"[fluxon_kv] greptime base url: {GREPTIME_BASE_URL}")
-    print(f"[fluxon_kv] start master in this script: {args.with_master}")
-    if master_stdout_log is not None:
-        print(f"[fluxon_kv] master stdout log: {master_stdout_log}")
-        print(
-            "[fluxon_kv] kv web ui: "
-            f"http://<host-ip-or-domain>:{MASTER_UI_PORT}/view?cluster_name={CLUSTER_NAME}&member_kind=kv"
-        )
-    else:
-        print("[fluxon_kv] master stdout log: disabled by --without-master")
-    print(f"[fluxon_kv] owner stdout log: {owner_stdout_log}")
-    stack_label = "master and owner" if args.with_master else "owner"
-    print(f"[fluxon_kv] waiting for Ctrl-C to stop {stack_label}")
-    wait_subproc_or_ctrlc(
-        children,
-        on_ctrlc=lambda: print(f"[fluxon_kv] caught Ctrl-C, stopping {stack_label}"),
-    )
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Start KV demo owner, optionally with a local master")
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("--with-master", dest="with_master", action="store_true")
-    group.add_argument("--without-master", dest="with_master", action="store_false")
-    parser.set_defaults(with_master=True)
-    return parser.parse_args()
-
-
-def build_master_config(*, log_dir: Path) -> dict:
-    return {
-        "instance_key": MASTER_INSTANCE_KEY,
-        "cluster_name": CLUSTER_NAME,
-        "port": MASTER_PORT,
-        "etcd_endpoints": [ETCD_ENDPOINT],
-        "log_dir": str(log_dir),
-        "monitoring": {
-            "prometheus_base_url": f"{GREPTIME_BASE_URL}/v1/prometheus",
-            "prom_remote_write_url": [f"{GREPTIME_BASE_URL}/v1/prometheus/write"],
-            "otlp_log_api": {
-                "otlp_endpoint": f"{GREPTIME_BASE_URL}/v1/otlp/v1/logs",
-            },
-        },
-        "master_ui": {
-            "http_listen_addr": f"0.0.0.0:{MASTER_UI_PORT}",
-        },
-    }
-
-
-def build_owner_config() -> dict:
-    return {
-        "instance_key": OWNER_INSTANCE_KEY,
-        "contribute_to_cluster_pool_size": {
-            "dram": OWNER_DRAM_BYTES,
-            "vram": {},
-        },
-        "fluxonkv_spec": {
-            "etcd_addresses": [ETCD_ENDPOINT],
-            "cluster_name": CLUSTER_NAME,
-            "share_mem_path": str(SHARE_MEM_PATH),
-            "sub_cluster": "default",
-            "large_file_paths": [str((WORKDIR / "large" / "owner").resolve())],
-        },
-    }
-
-
-if __name__ == "__main__":
-    main()
+SHARE_MEM_PATH = "/dev/shm/fluxon_kv_demo"
 ```
 
-Start it with:
+The examples create External Clients that use the local Owner Client's memory pool without contributing capacity. Their configs therefore must not contain Owner-only fields such as `contribute_to_cluster_pool_size`, `etcd_addresses`, `sub_cluster`, or `large_file_paths`.
 
-```bash
-python3 examples/start_master_owner.py
-python3 examples/start_master_owner.py --without-master
-```
+### Shared Call Flow
 
-### Lifecycle and Call Flow
+Both KV and RPC begin with the same `KvClient`:
 
 ```text
 FluxonKvClientConfig
-            |
-            v
-new_store(cfg) -> KvClient
-     |               |
-     |               +-- KV: put_blocking / get_blocking / remove / is_exist / ...
-     |               |
-     |               +-- RPC server: rpc_register(path, handler)
-     |               |
-     |               +-- RPC client: rpc_call(node_id, path, payload, timeout_ms)
-     |
-     v
-close()
+        ↓
+new_store(config).unwrap(...) → KvClient
+        ↓
+call KV or RPC APIs
+        ↓
+store.close().unwrap(...)
 ```
 
-### Core Python Objects
+- `FluxonKvClientConfig` holds the connection settings for the current Python process.
+- `new_store(...)` creates a `KvClient`.
+- `KvClient` provides both KV and RPC APIs.
+- Most public APIs return `Result`. The examples use `unwrap("error context")` to obtain a successful value; failures are raised with that context.
+- Call `close()` and consume its `Result` when the client is no longer needed.
 
-- `FluxonKvClientConfig`: config object, usually built from a Python dict
-- `new_store(config: FluxonKvClientConfig) -> Result[KvClient, ApiError]`: create one KV client
-- `KvClient`: single entrypoint for both KV and RPC
-- `KvClient.third_party_logs_dir() -> Result[str, ApiError]`: return the Fluxon-assigned log root for third-party Python components. Components should derive their own subdirectories under this root, for example `mq/`.
-- `MemHolder`: successful result holder from `get_blocking(...)`
-- `PutOptionalArgs`: optional write controls, most commonly `lease_id`
+### FlatDict Data Model
 
-Notes:
+KV values, RPC requests, and RPC responses all use a single-level Python dict:
 
-- `MemHolder` does not expose `bytes()` directly; call `access()` and read the bytes field from the returned flat dict
-- `store.close()` waits until all user-visible `MemHolder` references are dropped
-- `Result` values must be consumed explicitly with `unwrap()` or `unwrap_error()`
+```python
+value = {
+    "payload": b"hello",
+    "count": 1,
+    "source": "demo",
+}
+```
 
-### Data Model
+Keys must be strings. Values may be `int`, `float`, `bool`, `str`, `bytes`, or DLPack data. Do not nest another dict or list inside a value.
 
-Both KV values and RPC payloads use one flat-dict contract:
+The corresponding type is:
 
-- `FlatDict = Dict[str, Union[int, float, bool, str, bytes, dlpack]]`
+```python
+FlatDict = Dict[str, Union[int, float, bool, str, bytes, DLPacked]]
+```
 
 ### Minimal KV Example
 
-`examples/external_put_get_del.py`:
+`examples/external_put_get_del.py` performs one write, read, delete, and existence check.
+
+Only three values need to be checked before running it:
+
+- `INSTANCE_KEY`: Unique identity of the current Python process. It must not duplicate another process in the cluster.
+- `CLUSTER_NAME`: Must match Master and the local Owner Client.
+- `SHARE_MEM_PATH`: Must match the local Owner Client.
+
+The example also sets `test_spec_config.disable_observability = True` to keep observability background tasks out of this minimal process. It is not a core field required to attach to the cluster.
+
+Run:
+
+```bash
+python3 examples/external_put_get_del.py
+```
+
+A successful run prints:
+
+```text
+OK put key=hello
+world
+OK del key=hello
+OK is_exist after remove -> False
+```
+
+The script performs these steps:
+
+1. Attach to the local Owner Client with `new_store(...)`.
+2. Write `{"payload": b"world"}` with `put_blocking(...)`.
+3. Obtain a `MemHolder` with `get_blocking(...)`, then call `access()` to get the `FlatDict`.
+4. Delete the key with `remove(...)` and confirm its absence with `is_exist(...)`.
+5. Release references associated with the `MemHolder`, then close the `KvClient`.
+
+<details>
+<summary><strong>📄 View full script (click to expand)</strong> | <code>examples/external_put_get_del.py</code></summary>
 
 ```python
 #!/usr/bin/env python3
@@ -233,15 +135,25 @@ def main() -> None:
 
     try:
         store.put_blocking(key, {"payload": value}).unwrap("put_blocking failed")
+        print(f"OK put key={key}")
+
         mem = store.get_blocking(key).unwrap("get_blocking failed")
         flat = mem.access().unwrap("mem.access failed")
         payload = flat["payload"]
+        if not isinstance(payload, (bytes, bytearray)):
+            raise RuntimeError(f"payload is not bytes: {type(payload)}")
         print(bytes(payload).decode("utf-8"))
+
         store.remove(key).unwrap("remove failed")
+        print(f"OK del key={key}")
+
         exists = store.is_exist(key).unwrap("is_exist failed")
         if exists:
-            raise RuntimeError("expected deleted key to be absent")
+            raise RuntimeError(f"expected is_exist({key!r}) to be False after remove")
+        print("OK is_exist after remove -> False")
     finally:
+        # Release MemHolder-related references before close(); client shutdown waits
+        # until all user-visible holders are dropped.
         if "flat" in locals():
             del flat
         if "mem" in locals():
@@ -253,27 +165,87 @@ if __name__ == "__main__":
     main()
 ```
 
-Useful calls:
+</details>
 
-- `put_blocking(key, value, opts=None)`: write or overwrite one KV object
-- `get_blocking(key)`: return `MemHolder`
-- `MemHolder.access()`: expand to `FlatDict`
-- `get_size(key)`: query payload size without reading the whole object
-- `is_exist(key)`: existence check
-- `remove(key)`: delete a key
-- `third_party_logs_dir()`: return `{large_file_paths[0]}/{cluster_name}_cluster_third_party_logs` as a `Result[str, ApiError]`
+### Common KV APIs
 
-To increase user-process logs:
+#### Write
 
-```bash
-FLUXON_LOG=DEBUG python3 examples/external_put_get_del.py
+```python
+put_blocking(
+    key: str,
+    value: FlatDict,
+    opts: Optional[PutOptionalArgs] = None,
+) -> Result[OkNone, ApiError]
 ```
 
-Third-party Python components should place file logs under `store.third_party_logs_dir().unwrap(...)` and then append a component subdirectory such as `mq/`. This keeps log directory usage bounded and lets the Fluxon observability plane discover and collect those file logs through one `Owner Client`-derived root.
+- `key` is the KV key to write.
+- `value` is a single-level `FlatDict`.
+- Ordinary writes do not need `opts`.
+- A successful return means that the write is complete; no additional `wait()` is needed.
+
+#### Read
+
+```python
+get_blocking(key: str) -> Result[MemHolder, ApiError]
+MemHolder.access() -> Result[FlatDict, ApiError]
+```
+
+`get_blocking(...)` returns a `MemHolder`. Call `access()` to obtain the application dict. `MemHolder` does not expose `bytes()` directly; read bytes fields from the `FlatDict` returned by `access()`.
+
+`store.close()` waits for all `MemHolder` objects exposed to application code to be released. Do not retain them longer than needed, and release related references before closing as shown in the example.
+
+#### Delete and Check
+
+```python
+remove(key: str) -> Result[OkNone, ApiError]
+is_exist(key: str) -> Result[bool, ApiError]
+```
+
+Use `remove(...)` to delete a key and `is_exist(...)` to check whether it exists. An immediate `get_blocking(...)` after deletion is not guaranteed to return `KeyNotFoundError` because Owner Client and Master metadata caches may still be converging. Prefer `is_exist(...)` when verifying the delete request.
 
 ### Minimal Node-to-Node RPC Example
 
-`examples/rpc_call.py`:
+Node-to-node RPC lets one application process register a handler and another call it through the target `instance_key`. Both processes first create their own `KvClient`.
+
+Before running the example, confirm:
+
+- `RPC_SERVER_INSTANCE_KEY` and `RPC_CLIENT_INSTANCE_KEY` are different and both unique within the cluster.
+- Server and Client use the target cluster's `CLUSTER_NAME`.
+- Each process uses the `SHARE_MEM_PATH` of the Owner Client on its own machine. The local example uses one shared path.
+- `--target-instance-key` matches the `instance_key` actually used by Server.
+- The Client call path matches the path registered by Server. This example uses `/count`.
+
+Start Server in terminal one:
+
+```bash
+python3 examples/rpc_call.py serve
+```
+
+Keep Server running after it prints:
+
+```text
+[rpc] handler ready instance_key=demo_rpc_server
+[rpc] waiting for Ctrl-C
+```
+
+Start Client in terminal two:
+
+```bash
+python3 examples/rpc_call.py call --target-instance-key demo_rpc_server
+```
+
+On the first successful call, Client prints `1`. Server also prints the caller, payload, and cumulative call count.
+
+The call flow is:
+
+```text
+Server: new_store → rpc_register("/count", handler) → keep running
+Client: new_store → rpc_call(...) → wait() → FlatDict response → close
+```
+
+<details>
+<summary><strong>📄 View full script (click to expand)</strong> | <code>examples/rpc_call.py</code></summary>
 
 ```python
 #!/usr/bin/env python3
@@ -287,6 +259,31 @@ RPC_SERVER_INSTANCE_KEY = "demo_rpc_server"
 RPC_CLIENT_INSTANCE_KEY = "demo_rpc_client"
 CLUSTER_NAME = "demo-kv-cluster"
 SHARE_MEM_PATH = "/dev/shm/fluxon_kv_demo"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Minimal node-to-node RPC example")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    serve_parser = subparsers.add_parser("serve", help="Start one RPC handler process")
+    serve_parser.add_argument("--instance-key", default=RPC_SERVER_INSTANCE_KEY, help="RPC handler instance key")
+
+    call_parser = subparsers.add_parser("call", help="Call one RPC handler and print the counter")
+    call_parser.add_argument("--instance-key", default=RPC_CLIENT_INSTANCE_KEY, help="RPC caller instance key")
+    call_parser.add_argument(
+        "--target-instance-key",
+        default=RPC_SERVER_INSTANCE_KEY,
+        help="Target RPC handler instance key",
+    )
+
+    args = parser.parse_args()
+    if args.command == "serve":
+        run_server(instance_key=args.instance_key)
+        return
+    if args.command == "call":
+        run_client(instance_key=args.instance_key, target_instance_key=args.target_instance_key)
+        return
+    raise AssertionError("unreachable")
 
 
 def _build_config(*, instance_key: str) -> FluxonKvClientConfig:
@@ -319,25 +316,150 @@ def run_server(*, instance_key: str) -> None:
 
     try:
         store.rpc_register("/count", count_handler).unwrap("rpc_register failed")
+        print(f"[rpc] handler ready instance_key={instance_key}")
+        print("[rpc] waiting for Ctrl-C")
         signal.pause()
+    except KeyboardInterrupt:
+        print("[rpc] caught Ctrl-C, stopping handler")
+        raise SystemExit(130)
     finally:
         store.close().unwrap("close failed")
+
+
+def run_client(*, instance_key: str, target_instance_key: str) -> None:
+    store = new_store(_build_config(instance_key=instance_key)).unwrap("new_store failed")
+    try:
+        resp = (
+            store.rpc_call(target_instance_key, "/count", {"payload": b"hi"})
+            .unwrap("rpc_call failed")
+            .wait()
+            .unwrap("rpc wait failed")
+        )
+        print(resp["count"])
+    finally:
+        store.close().unwrap("close failed")
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-Important constraints:
+</details>
 
-- `node_id` usually matches the target node's `instance_key`
-- `timeout_ms` defaults to `10000`
-- Keep one primary public pattern: `rpc_call(...).wait()` on the response handle
+### Common RPC APIs
 
-### Config Objects
+#### Register a Handler
 
-You usually touch two config layers:
+```python
+rpc_register(
+    path: str,
+    handler: Callable[[from_node_id: str, payload: FlatDict], FlatDict],
+) -> Result[OkNone, ApiError]
+```
 
-- `Master` config: starts the control-plane process
-- external-client config: attaches business code to the local `Owner Client` and drives KV / RPC
+- `path` is the RPC path and must match the Client call path.
+- `handler` receives the caller's `instance_key` and a `FlatDict` payload, then returns a `FlatDict`.
+- Server must remain running after registration succeeds.
 
-Minimal master YAML:
+#### Make a Call
+
+```python
+rpc_call(
+    node_id: str,
+    path: str,
+    payload: FlatDict,
+    timeout_ms: int = 10000,
+) -> Result[KvFuture, ApiError]
+```
+
+- `node_id` normally identifies the target process by its `instance_key`.
+- `timeout_ms` defaults to `10000`; an explicit value must not be lower than `10000`.
+- `rpc_call(...).unwrap(...)` first obtains the response handle.
+- Calling `wait().unwrap(...)` on that handle waits for remote completion and returns the response `FlatDict`.
+
+### Advanced Notes
+
+#### Async APIs and Write Options
+
+`put_blocking(...)` and `get_blocking(...)` return only after the operation completes. To submit an operation first and wait for its result later, use:
+
+```python
+put(...) -> Result[KvFuture, ApiError]
+get(...) -> Result[KvFuture, ApiError]
+```
+
+Both return a `KvFuture` first. Call `wait()` to obtain the final result.
+
+Other APIs:
+
+- `get_size(key) -> Result[int, ApiError]`: Query the value size without reading the full payload.
+- `PutOptionalArgs(lease_id=None, reject_if_inflight_same_key=False)`: Bind a write to a lease or reject it immediately when another write for the same key is already in flight.
+- `PutOptionalArgs.support_mooncake() -> Tuple[bool, List[str]]`: Check whether the selected write options are compatible with Mooncake and return the incompatible field names.
+
+#### Logging and Observability
+
+- `FLUXON_LOG` controls the console log level of the current Python process. Valid values are `DEBUG`, `INFO`, `WARNING`, `ERROR`, and `CRITICAL`; the default is `INFO`.
+- `store.third_party_logs_dir().unwrap(...)` returns the file-log root allocated by Fluxon for third-party Python components. Each component should create its own subdirectory below that root, such as `mq/`.
+- `test_spec_config.disable_observability` is a testing and minimal-example switch. Ordinary application configs should not depend on it merely to attach to the cluster.
+- When Master configures `monitoring.otlp_log_api`, background service logs are also written to the Greptime `fluxon_logs` table.
+
+To enable more detailed logs for the example process:
+
+```bash
+FLUXON_LOG=DEBUG python3 examples/external_put_get_del.py
+```
+
+#### Python Dicts and YAML
+
+Application code should normally construct `FluxonKvClientConfig` directly:
+
+```python
+from fluxon_py import FluxonKvClientConfig
+
+cfg = FluxonKvClientConfig(
+    {
+        "instance_key": "my-kv-client-1",
+        "fluxonkv_spec": {
+            "cluster_name": "demo-kv-cluster",
+            "share_mem_path": "/dev/shm/fluxon_kv_demo",
+        },
+    }
+)
+```
+
+When configuration is already stored in YAML, load it from a file:
+
+```python
+cfg = FluxonKvClientConfig.from_file("./kv_external.yaml")
+```
+
+The External Client YAML below is equivalent to the Python dict above:
+
+```yaml
+instance_key: my-kv-client-1
+fluxonkv_spec:
+  cluster_name: demo-kv-cluster
+  share_mem_path: /dev/shm/fluxon_kv_demo
+```
+
+Owner Client contributes memory to the cluster and therefore also needs capacity, etcd, sub-cluster, and large-file settings:
+
+```yaml
+instance_key: my-owner-1
+contribute_to_cluster_pool_size:
+  dram: 1073741824
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses:
+    - 127.0.0.1:2379
+  cluster_name: demo-kv-cluster
+  share_mem_path: /dev/shm/fluxon_kv_demo
+  sub_cluster: default
+  large_file_paths:
+    - /tmp/fluxon_kv_demo/runtime/large/owner
+```
+
+Master uses a separate startup config that is not passed to `FluxonKvClientConfig`:
 
 ```yaml
 instance_key: my-master-1
@@ -345,42 +467,24 @@ cluster_name: demo-kv-cluster
 port: 31000
 etcd_endpoints:
   - 127.0.0.1:2379
-log_dir: /var/lib/fluxon/master_logs
+log_dir: /tmp/fluxon_kv_demo/runtime/master_logs
 ```
 
-Minimal external-client YAML:
+See [User - 2 - Service Plane](<./User - 2 - Service Plane.md>) for startup commands, log directories, and multi-machine constraints for these roles.
+
+#### Optional: KV Web UI
+
+To inspect KV cluster state, add the following block to the Master config:
 
 ```yaml
-instance_key: my-kv-client-1
-
-fluxonkv_spec:
-  cluster_name: demo-kv-cluster
-  share_mem_path: /dev/shm/fluxon
-  p2p_listen_port: 31001
+master_ui:
+  http_listen_addr: 0.0.0.0:18080
 ```
 
-`Owner Client` config adds memory contribution and `etcd` addresses:
+`master_ui` depends on the Master `monitoring` config. After Master starts, open:
 
-```yaml
-instance_key: my-owner-1
-
-contribute_to_cluster_pool_size:
-  dram: 1677721600
-  vram: {}
-
-fluxonkv_spec:
-  etcd_addresses:
-    - 127.0.0.1:2379
-  cluster_name: demo-kv-cluster
-  share_mem_path: /dev/shm/fluxon
-  p2p_listen_port: 31000
-  sub_cluster: default
+```text
+http://<master-host>:18080/view?cluster_name=demo-kv-cluster&member_kind=kv
 ```
 
-Keep these roots separate:
-
-- `share_mem_path`: shared bundle root. Runtime appends `cluster_name`, and that directory holds `mmap.file`, `shared.json`, and peer metadata.
-- `large_file_paths`: `Owner Client`-only large-file authority for logs, profiles, caches, and other derived runtime assets
-- `FLUXON_LOG`: console log threshold for the user process
-
-In zero-contribution external mode, `Owner Client`-only fields such as `fluxonkv_spec.etcd_addresses`, `fluxonkv_spec.sub_cluster`, `fluxonkv_spec.large_file_paths`, and `fluxonkv_spec.redis_compat` should not appear.
+`0.0.0.0` only means "listen on all local interfaces." Use a reachable Master hostname or IP address in the browser URL.
