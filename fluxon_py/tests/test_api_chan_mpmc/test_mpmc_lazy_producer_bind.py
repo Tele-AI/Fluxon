@@ -219,6 +219,41 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
 
             self.assertEqual(selected, ready_channels)
 
+    def test_put_preserves_first_channel_closed_error(self):
+        class _LeaseLostChannel:
+            def __init__(self):
+                self.calls = 0
+
+            def get_next_available_channel(self, api, chan_config, producer):
+                self.calls += 1
+                producer.shutdown_ctl.close()
+                return Result.new_error(
+                    ChannelClosedError(
+                        message="MPMC member lease expired.",
+                        channel_id="7",
+                    )
+                )
+
+        channel = _LeaseLostChannel()
+        producer = MPMCChanProducer.__new__(MPMCChanProducer)
+        producer.shutdown_ctl = MqShutdownCtl()
+        producer.chan_config = {"capacity": 1}
+        producer.mpmc_channel = channel
+        producer.mpmc_id = "7"
+        producer.api = object()
+
+        first = producer.put_data({"value": b"first"})
+        self.assertFalse(first.is_ok())
+        first_error = first.unwrap_error()
+        self.assertIsInstance(first_error, ChannelClosedError)
+        self.assertEqual(first_error.channel_id, "7")
+        self.assertTrue(producer.shutdown_ctl.closed)
+
+        second = producer.put_data({"value": b"second"})
+        self.assertFalse(second.is_ok())
+        self.assertIsInstance(second.unwrap_error(), ProducerClosedError)
+        self.assertEqual(channel.calls, 1)
+
     def test_put_stops_after_shutdown_during_lazy_bind(self):
         bind_entered = threading.Event()
         release_bind = threading.Event()

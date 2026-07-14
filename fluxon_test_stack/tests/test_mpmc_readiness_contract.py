@@ -64,6 +64,25 @@ class _FakeClosableEndpoint:
         return result
 
 
+class _FakeTransactionOperand:
+    def __eq__(self, _other):
+        return self
+
+
+class _FakeTransactions:
+    def create(self, key):
+        return _FakeTransactionOperand()
+
+    def value(self, key):
+        return _FakeTransactionOperand()
+
+    def put(self, key, value, lease=None):
+        return ("put", key, value, lease)
+
+    def delete(self, key):
+        return ("delete", key)
+
+
 def _new_fake_fluxon_blocking_store():
     if node_mod is None:
         raise RuntimeError("distributed benchmark node is unavailable")
@@ -230,6 +249,164 @@ class TestMPMCReadinessContract(unittest.TestCase):
         self.assertEqual(fake_etcd.unique_get_calls, 2)
         self.assertEqual(fake_etcd.transaction_calls, 0)
         self.assertEqual(sleeps, [api_ext_chan.MQ_UNIQUE_FAST_BIND_READ_RETRY_BASE_SECONDS])
+
+    def test_fast_bind_failure_reuses_locked_resolver(self) -> None:
+        try:
+            from fluxon_py import api_ext_chan
+            from fluxon_py.api_error import InvalidConfigurationError, Result
+            from fluxon_py.api_ext_chan import ChanRole, ChanType
+        except ImportError as exc:
+            self.skipTest(f"fluxon_py runtime import unavailable: {exc}")
+
+        unique_id = "mq-fast-bind-fallback"
+        unique_key = api_ext_chan._new_unique_mapping_key(unique_id)
+        meta_key = api_ext_chan._new_mpmc_meta_key("123")
+        sentinel_channel = object()
+
+        class FakeEtcd:
+            def __init__(self) -> None:
+                self.transactions = _FakeTransactions()
+                self.transaction_calls = 0
+                self.delete_calls = []
+
+            def get(self, key):
+                if key == unique_key:
+                    return b"123", None
+                if key == meta_key:
+                    return b"present", None
+                return None, None
+
+            def lease(self, _ttl_seconds):
+                return SimpleNamespace(id=1)
+
+            def transaction(self, **_kwargs):
+                self.transaction_calls += 1
+                return True, []
+
+            def delete(self, key):
+                self.delete_calls.append(key)
+
+        fake_etcd = FakeEtcd()
+        bind_calls = 0
+
+        def fake_construct_bound_channel(*_args, **_kwargs):
+            nonlocal bind_calls
+            bind_calls += 1
+            if bind_calls == 1:
+                return Result.new_error(
+                    InvalidConfigurationError(message="synthetic fast-bind failure")
+                )
+            return Result.new_ok(sentinel_channel)
+
+        with mock.patch.object(
+            api_ext_chan,
+            "new_etcd_client",
+            return_value=Result.new_ok(fake_etcd),
+        ):
+            with mock.patch.object(
+                api_ext_chan,
+                "_construct_bound_channel",
+                side_effect=fake_construct_bound_channel,
+            ):
+                res = api_ext_chan.new_or_bind_with_unique_key(
+                    object(),
+                    {"capacity": 10, "ttl_seconds": 90, "weight": 1},
+                    unique_id,
+                    ChanType.MPMC,
+                    ChanRole.PRODUCER,
+                )
+
+        self.assertTrue(res.is_ok())
+        self.assertIs(res.unwrap(), sentinel_channel)
+        self.assertEqual(bind_calls, 2)
+        self.assertEqual(fake_etcd.transaction_calls, 2)
+        self.assertEqual(fake_etcd.delete_calls, [])
+
+    def test_fast_bind_missing_mpsc_meta_rebuilds_under_lock(self) -> None:
+        try:
+            from fluxon_py import api_ext_chan
+            from fluxon_py.api_error import InvalidConfigurationError, Result
+            from fluxon_py.api_ext_chan import ChanRole, ChanType
+        except ImportError as exc:
+            self.skipTest(f"fluxon_py runtime import unavailable: {exc}")
+
+        unique_id = "mq-fast-bind-missing-mpsc-meta"
+        unique_key = api_ext_chan._new_unique_mapping_key(unique_id)
+        stale_meta_key = api_ext_chan._new_etcd_meta_key("3")
+        sentinel_channel = object()
+
+        class FakeEtcd:
+            def __init__(self) -> None:
+                self.transactions = _FakeTransactions()
+                self.transaction_calls = 0
+                self.delete_calls = []
+
+            def get(self, key):
+                if key == unique_key:
+                    return b"3", None
+                if key == stale_meta_key:
+                    return None, None
+                return None, None
+
+            def lease(self, _ttl_seconds):
+                return SimpleNamespace(id=1)
+
+            def transaction(self, **_kwargs):
+                self.transaction_calls += 1
+                return True, []
+
+            def delete(self, key):
+                self.delete_calls.append(key)
+
+        fake_etcd = FakeEtcd()
+        bind_calls = 0
+
+        def fake_construct_bound_channel(*_args, **_kwargs):
+            nonlocal bind_calls
+            bind_calls += 1
+            return Result.new_error(
+                InvalidConfigurationError(
+                    message=(
+                        "MPSC producer initialize error! failed to bind MPSC producer: "
+                        "get_chan_meta failed for chan_id=3: channel meta not found: chan_id=3"
+                    )
+                )
+            )
+
+        with mock.patch.object(
+            api_ext_chan,
+            "new_etcd_client",
+            return_value=Result.new_ok(fake_etcd),
+        ):
+            with mock.patch.object(
+                api_ext_chan,
+                "_construct_bound_channel",
+                side_effect=fake_construct_bound_channel,
+            ):
+                with mock.patch.object(
+                    api_ext_chan,
+                    "chan_new",
+                    return_value=Result.new_ok("4"),
+                ):
+                    with mock.patch.object(
+                        api_ext_chan,
+                        "get_chan_by_id",
+                        return_value=Result.new_ok(sentinel_channel),
+                    ):
+                        with mock.patch.object(api_ext_chan, "del_chan_by_id"):
+                            res = api_ext_chan.new_or_bind_with_unique_key(
+                                object(),
+                                {"capacity": 10, "ttl_seconds": 90, "weight": 1},
+                                unique_id,
+                                ChanType.MPSC,
+                                ChanRole.PRODUCER,
+                            )
+
+        self.assertTrue(res.is_ok())
+        self.assertIs(res.unwrap(), sentinel_channel)
+        self.assertEqual(bind_calls, 1)
+        self.assertEqual(fake_etcd.delete_calls, [unique_key])
+        self.assertEqual(fake_etcd.transaction_calls, 3)
 
     def test_concurrent_fast_bind_returns_each_constructed_handle_directly(self) -> None:
         try:

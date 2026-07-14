@@ -50,7 +50,6 @@ from ..api_error import (
     ChanKeyNotFoundError,
     ChanConfigEmptyError,
     ChanMessageConsumptionError,
-    ChanMessageProduceError,
     ChanCreateError,
     ChanDeleteError,
     ChanBindError,
@@ -2377,15 +2376,8 @@ class MPMCChanProducer(ChannelProducer):
                 )
 
             if not next_channel_result.is_ok():
-                error = next_channel_result.unwrap_error()
-                if self.shutdown_ctl.closed:
-                    return Result[bool, ApiError].new_error(
-                        ProducerClosedError("MPMC producer is closed.")
-                    )
-                if error is not None:
-                    return Result[bool, ApiError].new_error(error)
                 return Result[bool, ApiError].new_error(
-                    ChanMessageProduceError("Failed to get next channel")
+                    next_channel_result.unwrap_error()
                 )
 
             candidate = next_channel_result.unwrap()

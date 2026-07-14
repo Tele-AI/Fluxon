@@ -291,7 +291,7 @@ def new_or_bind_with_unique_key(
             unique_id,
             existing_chan_id,
         )
-        result = _construct_bound_channel(
+        return _construct_bound_channel(
             api,
             chan_config,
             existing_chan_id,
@@ -299,18 +299,6 @@ def new_or_bind_with_unique_key(
             chan_role,
             etcd_client,
         )
-        if not result.is_ok():
-            err = result.unwrap_error()
-            if _is_stale_bind_error(err):
-                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(err)
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
-                ChanBindError(f"Bind failed for chan_id={existing_chan_id}: {err}")
-            )
-
-        return Result[
-            Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer],
-            ApiError,
-        ].new_ok(result.unwrap())
 
     def _try_bind_existing_channel_without_lock() -> Result[object, ApiError]:
         """
@@ -493,115 +481,121 @@ def new_or_bind_with_unique_key(
                 ChanCreateError(f"RETRY: exception in new_or_bind_with_unique_key: {e}")
             )
 
-    final_value: Optional[object] = None
-    final_error: Optional[ApiError] = None
-    max_attempts = 3
-    for attempt_idx in range(max_attempts):
-        fast_bind_res = _try_bind_existing_channel_without_lock()
-        if fast_bind_res.is_ok():
-            fast_bind_value = fast_bind_res.unwrap()
+    def _new_or_bind_without_fast_path() -> Result[
+        Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer],
+        ApiError,
+    ]:
+        final_value: Optional[object] = None
+        final_error: Optional[ApiError] = None
+        max_attempts = 3
+        for attempt_idx in range(max_attempts):
+            try:
+                lock_token = _acquire_lock(key=lock_key, ttl_seconds=120)
+            except Exception as e:  # noqa: BLE001
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
+                    EtcdError(
+                        message=f"Failed to acquire etcd lock: {lock_key}, err={e}",
+                        component="api_ext_chan.new_or_bind_with_unique_key",
+                        transport=TransportName.GRPC,
+                        transport_user=TransportUser.ETCD,
+                    )
+                )
+
+            try:
+                first_res = _call_resolve_under_lock()
+                if first_res.is_ok():
+                    final_value = first_res.unwrap()
+                    final_error = None
+                else:
+                    err = first_res.unwrap_error()
+                    logging.warning(
+                        "new_or_bind_with_unique_key retry once under lock: unique_key=%s err=%s",
+                        unique_key,
+                        err,
+                    )
+                    second_res = _call_resolve_under_lock()
+                    if second_res.is_ok():
+                        final_value = second_res.unwrap()
+                        final_error = None
+                    else:
+                        final_value = None
+                        final_error = second_res.unwrap_error()
+            finally:
+                _release_lock(key=lock_key, token=lock_token)
+
+            if final_value is None:
+                assert final_error is not None
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(final_error)
+
             if not (
-                isinstance(fast_bind_value, tuple)
-                and len(fast_bind_value) == 2
-                and fast_bind_value[0] == "no_mapping"
+                isinstance(final_value, tuple)
+                and len(final_value) == 2
+                and final_value[0] == "bind_existing"
             ):
-                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_ok(fast_bind_value)
-        else:
-            fast_bind_err = fast_bind_res.unwrap_error()
-            if not _is_stale_bind_error(fast_bind_err):
-                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(fast_bind_err)
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_ok(final_value)
+
+            bind_chan_id = final_value[1]
+            bind_res = _bind_existing_channel(bind_chan_id)
+            if bind_res.is_ok():
+                return bind_res
+
+            bind_err = bind_res.unwrap_error()
+            if not _is_stale_bind_error(bind_err):
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
+                    ChanBindError(f"Bind failed for chan_id={bind_chan_id}: {bind_err}")
+                )
 
             logging.warning(
-                "existing channel fast bind found stale state outside lock; falling back to locked resolve. unique_key=%s err=%s attempt=%s/%s",
+                "existing channel bind failed with stale state outside lock; cleanup and retry. unique_key=%s chan_id=%s err=%s attempt=%s/%s",
                 unique_key,
-                fast_bind_err,
+                bind_chan_id,
+                bind_err,
                 attempt_idx + 1,
                 max_attempts,
             )
-
-        try:
-            lock_token = _acquire_lock(key=lock_key, ttl_seconds=120)
-        except Exception as e:  # noqa: BLE001
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
-                EtcdError(
-                    message=f"Failed to acquire etcd lock: {lock_key}, err={e}",
-                    component="api_ext_chan.new_or_bind_with_unique_key",
-                    transport=TransportName.GRPC,
-                    transport_user=TransportUser.ETCD,
+            try:
+                cleanup_lock_token = _acquire_lock(key=lock_key, ttl_seconds=120)
+            except Exception as e:  # noqa: BLE001
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
+                    EtcdError(
+                        message=f"Failed to reacquire etcd lock for stale cleanup: {lock_key}, err={e}",
+                        component="api_ext_chan.new_or_bind_with_unique_key",
+                        transport=TransportName.GRPC,
+                        transport_user=TransportUser.ETCD,
+                    )
                 )
-            )
-
-        try:
-            first_res = _call_resolve_under_lock()
-            if first_res.is_ok():
-                final_value = first_res.unwrap()
-                final_error = None
-            else:
-                err = first_res.unwrap_error()
-                logging.warning(
-                    "new_or_bind_with_unique_key retry once under lock: unique_key=%s err=%s",
-                    unique_key,
-                    err,
+            try:
+                cleanup_res = _cleanup_stale_mapping_under_lock(expected_chan_id=bind_chan_id)
+            finally:
+                _release_lock(key=lock_key, token=cleanup_lock_token)
+            if not cleanup_res.is_ok():
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
+                    cleanup_res.unwrap_error()
                 )
-                second_res = _call_resolve_under_lock()
-                if second_res.is_ok():
-                    final_value = second_res.unwrap()
-                    final_error = None
-                else:
-                    final_value = None
-                    final_error = second_res.unwrap_error()
-        finally:
-            _release_lock(key=lock_key, token=lock_token)
 
-        if final_value is None:
-            assert final_error is not None
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(final_error)
+            final_value = None
+            final_error = bind_err
 
-        if not (isinstance(final_value, tuple) and len(final_value) == 2 and final_value[0] == "bind_existing"):
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_ok(final_value)
+        assert final_error is not None
+        return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(final_error)
 
-        bind_chan_id = final_value[1]
-        bind_res = _bind_existing_channel(bind_chan_id)
-        if bind_res.is_ok():
-            return bind_res
-
-        bind_err = bind_res.unwrap_error()
-        if not _is_stale_bind_error(bind_err):
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(bind_err)
-
+    fast_bind_res = _try_bind_existing_channel_without_lock()
+    if fast_bind_res.is_ok():
+        fast_bind_value = fast_bind_res.unwrap()
+        if not (
+            isinstance(fast_bind_value, tuple)
+            and len(fast_bind_value) == 2
+            and fast_bind_value[0] == "no_mapping"
+        ):
+            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_ok(fast_bind_value)
+    else:
         logging.warning(
-            "existing channel bind failed with stale state outside lock; cleanup and retry. unique_key=%s chan_id=%s err=%s attempt=%s/%s",
+            "existing channel fast bind failed; falling back to locked resolve. unique_key=%s err=%s",
             unique_key,
-            bind_chan_id,
-            bind_err,
-            attempt_idx + 1,
-            max_attempts,
+            fast_bind_res.unwrap_error(),
         )
-        try:
-            cleanup_lock_token = _acquire_lock(key=lock_key, ttl_seconds=120)
-        except Exception as e:  # noqa: BLE001
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
-                EtcdError(
-                    message=f"Failed to reacquire etcd lock for stale cleanup: {lock_key}, err={e}",
-                    component="api_ext_chan.new_or_bind_with_unique_key",
-                    transport=TransportName.GRPC,
-                    transport_user=TransportUser.ETCD,
-                )
-            )
-        try:
-            cleanup_res = _cleanup_stale_mapping_under_lock(expected_chan_id=bind_chan_id)
-        finally:
-            _release_lock(key=lock_key, token=cleanup_lock_token)
-        if not cleanup_res.is_ok():
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
-                cleanup_res.unwrap_error()
-            )
 
-        final_value = None
-        final_error = bind_err
-
-    assert final_error is not None
-    return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(final_error)
+    return _new_or_bind_without_fast_path()
 
 
 def new_etcd_client(api: KvClient) -> Result[etcd3.Etcd3Client, ApiError]:
