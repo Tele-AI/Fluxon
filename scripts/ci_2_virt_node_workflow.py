@@ -11,6 +11,9 @@ import subprocess
 import time
 
 TOP_ATTENTION_SCENE_PREFIX = "ci_top_attention_"
+CI_SUITE_KIND_TEST_ALL = "test-all"
+CI_SUITE_KIND_LARGE_SCALE = "large-scale"
+CI_LARGE_SCALE_SCENE_ID = "ci_top_attention_largescale_mq"
 SYSTEM_TEMP_ROOT = Path("/tmp")
 RUNNER_TEMP_PROTECTED_PREFIXES = ("_github_", "_runner_")
 SYSTEM_TEMP_GARBAGE_PREFIXES = (
@@ -236,6 +239,22 @@ def _top_attention_ci_scenes(doc_site_base_url: str) -> dict[str, dict[str, obje
     }
 
 
+def _select_ci_scenes(
+    scenes: dict[str, dict[str, object]],
+    *,
+    suite_kind: str,
+) -> dict[str, dict[str, object]]:
+    if suite_kind == CI_SUITE_KIND_TEST_ALL:
+        return {
+            scene_id: scene
+            for scene_id, scene in scenes.items()
+            if scene_id != CI_LARGE_SCALE_SCENE_ID
+        }
+    if suite_kind == CI_SUITE_KIND_LARGE_SCALE:
+        return {CI_LARGE_SCALE_SCENE_ID: scenes[CI_LARGE_SCALE_SCENE_ID]}
+    raise ValueError(f"unsupported CI suite kind: {suite_kind!r}")
+
+
 def _write_suite(args: argparse.Namespace) -> None:
     import yaml
 
@@ -245,8 +264,9 @@ def _write_suite(args: argparse.Namespace) -> None:
     suite = yaml.safe_load(args.source.read_text(encoding="utf-8"))
     if not isinstance(suite, dict):
         raise ValueError(f"suite must be a YAML mapping: {args.source}")
-    top_attention_ci_scenes = _top_attention_ci_scenes(
-        f"{owner}.github.io/{repository_name}"
+    top_attention_ci_scenes = _select_ci_scenes(
+        _top_attention_ci_scenes(f"{owner}.github.io/{repository_name}"),
+        suite_kind=args.suite_kind,
     )
 
     for scene_id, scene_def in top_attention_ci_scenes.items():
@@ -413,6 +433,11 @@ def _parse_args() -> argparse.Namespace:
     write_suite.add_argument("--source", type=Path, required=True)
     write_suite.add_argument("--output", type=Path, required=True)
     write_suite.add_argument("--repository", required=True)
+    write_suite.add_argument(
+        "--suite-kind",
+        choices=(CI_SUITE_KIND_TEST_ALL, CI_SUITE_KIND_LARGE_SCALE),
+        required=True,
+    )
     write_suite.set_defaults(handler=_write_suite)
 
     diagnostics = subparsers.add_parser(

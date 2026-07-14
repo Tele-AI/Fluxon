@@ -38,42 +38,34 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertNotIn("ci_2_virt_node.py", workflow_text)
         self.assertNotIn("fluxon_test_stack/", workflow_text)
 
-    def test_main_testbed_workflow_keeps_suite_generation_in_workflow(self) -> None:
+    def test_main_testbed_workflow_builds_release_before_parallel_test_jobs(self) -> None:
         workflow_text = ALL_TEST_WORKFLOW_PATH.read_text(encoding="utf-8")
-        yaml.load(workflow_text, Loader=yaml.BaseLoader)
+        workflow = yaml.load(workflow_text, Loader=yaml.BaseLoader)
+        jobs = workflow["jobs"]
 
         self.assertIn("fluxon_test_stack/ci_2_virt_node.py", workflow_text)
-        self.assertIn("Write ci_2_virt_node suite", workflow_text)
+        self.assertEqual(
+            jobs["ci-2-virt-node"]["needs"],
+            "package-wheel",
+        )
+        self.assertEqual(
+            jobs["ci-large-scale-mq"]["needs"],
+            "package-wheel",
+        )
+        self.assertNotIn("needs", jobs["package-wheel"])
+        self.assertEqual(
+            jobs["codex_failure_analysis"]["needs"],
+            ["package-wheel", "ci-2-virt-node", "ci-large-scale-mq"],
+        )
+        self.assertIn("Write test-all suite", workflow_text)
+        self.assertIn("Write standalone large-scale MQ suite", workflow_text)
+        self.assertIn("--suite-kind test-all", workflow_text)
+        self.assertIn("--suite-kind large-scale", workflow_text)
+        self.assertEqual(workflow_text.count("--skip-pack"), 2)
+        self.assertIn("fluxon-ci-release-${{ github.sha }}", workflow_text)
         self.assertIn("timeout --preserve-status --signal=INT 17000s", workflow_text)
-        self.assertIn("ci_2_virt_node failed or timed out before GitHub job cancellation", workflow_text)
-        self.assertIn("ci_top_attention_bin_kvtest", workflow_text)
-        self.assertIn("ci_top_attention_doc_page_build", workflow_text)
-        self.assertIn("ci_top_attention_mq_core", workflow_text)
-        self.assertIn("ci_top_attention_largescale_mq", workflow_text)
-        self.assertIn("_{suffix}.py", workflow_text)
-        self.assertIn("--single-host-logical-targets", workflow_text)
-        self.assertIn("--testbed-bundle-source", workflow_text)
-        self.assertIn("__TEST_BED_BUNDLE_ROOT__", workflow_text)
-        self.assertIn("largescale_mq_ci_single_host", workflow_text)
-        self.assertIn("--owner-count", workflow_text)
-        self.assertIn('"4"', workflow_text)
-        self.assertIn("--threads-per-process", workflow_text)
-        self.assertNotIn('"timeout_seconds": 3600', workflow_text)
-        self.assertIn("--value-size", workflow_text)
-        self.assertIn('"256"', workflow_text)
-        self.assertIn("for producer_count, consumer_count in ((8, 8), (32, 32), (160, 8))", workflow_text)
-        self.assertIn('"--duration-seconds",\n                              "90"', workflow_text)
-        self.assertIn('"--metric-warmup-seconds",\n                              "60"', workflow_text)
-        self.assertIn("nested largescale MQ diagnostics", workflow_text)
-        self.assertIn("nested largescale MQ failed run diagnostics", workflow_text)
-        self.assertIn("logs/ci_runner/restart_count.txt", workflow_text)
-        self.assertIn("logs/ci_runner/inflight_attempt.txt", workflow_text)
-        self.assertIn("benchmark_result.json", workflow_text)
-        self.assertIn("deploy_result.yaml", workflow_text)
-        self.assertIn('run_dir.glob("logs/*/status.yaml")', workflow_text)
-        self.assertIn('run_dir.glob("logs/*/workload_log_tail.txt")', workflow_text)
-        self.assertNotIn("Print ci_2_virt_node failure summary", workflow_text)
-        self.assertIn("doc_site_base_url", workflow_text)
+        self.assertIn("test-all failed or timed out before GitHub job cancellation", workflow_text)
+        self.assertIn("large-scale MQ failed or timed out before GitHub job cancellation", workflow_text)
         self.assertIn("rather_no_git_submodule.py", workflow_text)
 
     def test_docs_pages_uses_container_entrypoint(self) -> None:
@@ -87,14 +79,11 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertNotIn("doc-site-npm", workflow_text)
         self.assertNotIn("doc-site-plugins", workflow_text)
 
-    def test_largescale_mq_only_uses_main_testbed_workflow(self) -> None:
+    def test_largescale_mq_is_a_dedicated_job_in_main_dag(self) -> None:
         self.assertFalse(STANDALONE_LARGESCALE_MQ_WORKFLOW_PATH.exists())
-        for workflow_path in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")):
-            if workflow_path == ALL_TEST_WORKFLOW_PATH:
-                continue
-            workflow_text = workflow_path.read_text(encoding="utf-8")
-            self.assertNotIn("ci_top_attention_largescale_mq", workflow_text, workflow_path.as_posix())
-            self.assertNotIn("top_attention_test_index/_largescale_mq.py", workflow_text, workflow_path.as_posix())
+        workflow_text = ALL_TEST_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn("ci-large-scale-mq:", workflow_text)
+        self.assertIn("--suite-kind large-scale", workflow_text)
 
 
 if __name__ == "__main__":

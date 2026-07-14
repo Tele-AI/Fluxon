@@ -13,7 +13,8 @@ permissions:
   contents: read
 
 jobs:
-  ci-2-virt-node:
+  package-wheel:
+    name: package-wheel
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -40,7 +41,7 @@ jobs:
           scripts/ci_2_virt_node_workflow.py scan-and-clean-temp
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
@@ -69,26 +70,158 @@ jobs:
       - name: Sync rather_no_git_submodule workspace inputs
         run: python3 fluxon_rs/scripts/rather_no_git_submodule.py
 
-      - name: Write ci_2_virt_node suite
+      - name: Write package input suite
         run: |
           python3 scripts/ci_2_virt_node_workflow.py write-suite \
             --source fluxon_test_stack/ci_test_list.yaml \
             --output "$RUNNER_TEMP/ci_test_list.ci.yaml" \
-            --repository "$GITHUB_REPOSITORY"
+            --repository "$GITHUB_REPOSITORY" \
+            --suite-kind test-all
 
-      - name: Run ci_2_virt_node full flow
+      - name: Package Fluxon wheel and CI release
+        run: |
+          timeout --preserve-status --signal=INT 10800s \
+            python3 fluxon_test_stack/ci_2_virt_node.py \
+              --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
+              --workdir .dever/ci_2_virt_node \
+              --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy" \
+              --skip-dispatch \
+              --skip-start-testbed \
+              --skip-runner \
+              --print-generated
+
+      - name: Archive Fluxon CI release
+        run: |
+          tar -I 'pigz -p 4' \
+            --exclude='fluxon_release/ext_images' \
+            -cf "$RUNNER_TEMP/fluxon-ci-release.tar.gz" \
+            fluxon_release
+
+      - name: Upload Fluxon CI release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fluxon-ci-release-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          path: ${{ runner.temp }}/fluxon-ci-release.tar.gz
+
+      - name: Collect package failure-analysis context
+        if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+        run: |
+          python3 scripts/ci_codex_failure_analysis.py collect-context \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --runner-temp "$RUNNER_TEMP" \
+            --context-root "$RUNNER_TEMP/codex-failure-context"
+
+      - name: Upload package failure-analysis context
+        if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-failure-context-${{ github.run_id }}-package-wheel
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+          compression-level: 6
+          path: ${{ runner.temp }}/codex-failure-context/**
+
+  ci-2-virt-node:
+    name: ci-2-virt-node
+    needs: package-wheel
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Free hosted runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          tool-cache: false
+          swap-storage: false
+
+      - name: Scan and clean temporary data
+        run: >-
+          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_TEMP="$RUNNER_TEMP"
+          "$(command -v python3)"
+          scripts/ci_2_virt_node_workflow.py scan-and-clean-temp
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git \
+            pigz \
+            protobuf-compiler \
+            python3-venv \
+            rsync
+
+      - name: Verify Docker availability
+        run: |
+          command -v docker >/dev/null
+          if ! docker info >/dev/null 2>&1; then
+            sudo systemctl start docker
+            docker info >/dev/null
+          fi
+          docker version
+
+      - name: Install Python dependencies
+        run: python3 -m pip install PyYAML
+
+      - name: Sync rather_no_git_submodule workspace inputs
+        run: python3 fluxon_rs/scripts/rather_no_git_submodule.py
+
+      - name: Download Fluxon CI release
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: fluxon-ci-release-${{ github.sha }}
+          path: ${{ runner.temp }}/fluxon-ci-release
+
+      - name: Materialize Fluxon CI release
+        run: |
+          rm -rf fluxon_release
+          tar -xzf "$RUNNER_TEMP/fluxon-ci-release/fluxon-ci-release.tar.gz"
+          test -f fluxon_release/ext_images.tar.gz
+          tar -xzf fluxon_release/ext_images.tar.gz -C fluxon_release
+          test -f fluxon_release/fluxon_release.sha256
+          test -f fluxon_release/profiles/fluxon_tcp_thread/fluxon_release.sha256
+          test -f fluxon_release/test_rsc/fluxon_tcp_thread/fluxon_test_rsc.sha256
+          test -f fluxon_release/ext_images/ext_images.sha256
+
+      - name: Write test-all suite
+        run: |
+          python3 scripts/ci_2_virt_node_workflow.py write-suite \
+            --source fluxon_test_stack/ci_test_list.yaml \
+            --output "$RUNNER_TEMP/ci_test_list.ci.yaml" \
+            --repository "$GITHUB_REPOSITORY" \
+            --suite-kind test-all
+
+      - name: Run test-all flow
         run: |
           set +e
           timeout --preserve-status --signal=INT 17000s \
             python3 fluxon_test_stack/ci_2_virt_node.py \
               --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
               --print-generated \
-              --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy"
+              --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy" \
+              --skip-pack
           rc=$?
           if [ "$rc" -eq 0 ]; then
             exit 0
           fi
-          echo "ci_2_virt_node failed or timed out before GitHub job cancellation: rc=$rc"
+          echo "test-all failed or timed out before GitHub job cancellation: rc=$rc"
           python3 scripts/ci_2_virt_node_workflow.py print-failure-diagnostics \
             --workdir .dever/ci_2_virt_node/runner_run
           exit "$rc"
@@ -96,18 +229,14 @@ jobs:
       - name: Normalize ci_2_virt_node debug artifact permissions
         if: ${{ always() }}
         run: |
-          chmod -R a+rX .dever || true
-          chmod -R a+rX fluxon_release || true
-          chmod -R a+rX setup_and_pack/nix/runs || true
-          find .dever -type f -name '*.yaml' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.log' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.json' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.html' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.txt' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.sha256' -exec chmod a+r {} + || true
-          find .dever -type d -path '*/pack_release_runtime/*' -exec chmod a+rx {} + || true
-          find .dever -type d -path '*/pack_release_runtime/project-data/*' -exec chmod a+rx {} + || true
-          find .dever -path '*/pack_release_runtime/project-data/*' \
+          chmod -R a+rX .dever/ci_2_virt_node || true
+          find .dever/ci_2_virt_node -type f -name '*.yaml' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.log' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.json' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.html' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.txt' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.sha256' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -path '*/pack_release_runtime/project-data/*' \
             \( -path '*/instances/*/logs' -o -path '*/instances/*/release' -o -path '*/assemblies/*/profile' \) \
             -exec chmod -R a+rX {} + || true
 
@@ -123,7 +252,7 @@ jobs:
         if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: codex-failure-context-${{ github.run_id }}
+          name: codex-failure-context-${{ github.run_id }}-test-all
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 14
@@ -139,17 +268,154 @@ jobs:
           include-hidden-files: true
           compression-level: 1
           path: |
-            .dever/**
-            fluxon_release/**
-            setup_and_pack/nix/runs/**
-            .dever/**/pack_release_runtime/project-data/**/instances/**/logs/**
-            .dever/**/pack_release_runtime/project-data/**/instances/**/release/**
-            .dever/**/pack_release_runtime/project-data/**/assemblies/**/profile/**
+            .dever/ci_2_virt_node/**
+
+  ci-large-scale-mq:
+    name: ci-large-scale-mq
+    needs: package-wheel
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Free hosted runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          tool-cache: false
+          swap-storage: false
+
+      - name: Scan and clean temporary data
+        run: >-
+          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_TEMP="$RUNNER_TEMP"
+          "$(command -v python3)"
+          scripts/ci_2_virt_node_workflow.py scan-and-clean-temp
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git \
+            pigz \
+            protobuf-compiler \
+            python3-venv \
+            rsync
+
+      - name: Verify Docker availability
+        run: |
+          command -v docker >/dev/null
+          if ! docker info >/dev/null 2>&1; then
+            sudo systemctl start docker
+            docker info >/dev/null
+          fi
+          docker version
+
+      - name: Install Python dependencies
+        run: python3 -m pip install PyYAML
+
+      - name: Sync rather_no_git_submodule workspace inputs
+        run: python3 fluxon_rs/scripts/rather_no_git_submodule.py
+
+      - name: Download Fluxon CI release
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: fluxon-ci-release-${{ github.sha }}
+          path: ${{ runner.temp }}/fluxon-ci-release
+
+      - name: Materialize Fluxon CI release
+        run: |
+          rm -rf fluxon_release
+          tar -xzf "$RUNNER_TEMP/fluxon-ci-release/fluxon-ci-release.tar.gz"
+          test -f fluxon_release/ext_images.tar.gz
+          tar -xzf fluxon_release/ext_images.tar.gz -C fluxon_release
+          test -f fluxon_release/fluxon_release.sha256
+          test -f fluxon_release/profiles/fluxon_tcp_thread/fluxon_release.sha256
+          test -f fluxon_release/test_rsc/fluxon_tcp_thread/fluxon_test_rsc.sha256
+          test -f fluxon_release/ext_images/ext_images.sha256
+
+      - name: Write standalone large-scale MQ suite
+        run: |
+          python3 scripts/ci_2_virt_node_workflow.py write-suite \
+            --source fluxon_test_stack/ci_test_list.yaml \
+            --output "$RUNNER_TEMP/ci_test_list.ci.yaml" \
+            --repository "$GITHUB_REPOSITORY" \
+            --suite-kind large-scale
+
+      - name: Run standalone large-scale MQ flow
+        run: |
+          set +e
+          timeout --preserve-status --signal=INT 17000s \
+            python3 fluxon_test_stack/ci_2_virt_node.py \
+              --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
+              --print-generated \
+              --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy" \
+              --skip-pack
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          echo "large-scale MQ failed or timed out before GitHub job cancellation: rc=$rc"
+          python3 scripts/ci_2_virt_node_workflow.py print-failure-diagnostics \
+            --workdir .dever/ci_2_virt_node/runner_run
+          exit "$rc"
+
+      - name: Normalize large-scale MQ debug artifact permissions
+        if: ${{ always() }}
+        run: |
+          chmod -R a+rX .dever/ci_2_virt_node || true
+          find .dever/ci_2_virt_node -type f -name '*.yaml' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.log' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.json' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.txt' -exec chmod a+r {} + || true
+
+      - name: Collect large-scale MQ failure-analysis context
+        if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+        run: |
+          python3 scripts/ci_codex_failure_analysis.py collect-context \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --runner-temp "$RUNNER_TEMP" \
+            --context-root "$RUNNER_TEMP/codex-failure-context"
+
+      - name: Upload large-scale MQ failure-analysis context
+        if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-failure-context-${{ github.run_id }}-large-scale
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+          compression-level: 6
+          path: ${{ runner.temp }}/codex-failure-context/**
+
+      - name: Upload large-scale MQ debug artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-large-scale-mq-debug-${{ github.sha }}
+          if-no-files-found: warn
+          include-hidden-files: true
+          compression-level: 1
+          path: .dever/ci_2_virt_node/**
 
   codex_failure_analysis:
     name: Codex failure analysis
-    needs: ci-2-virt-node
-    if: ${{ always() && needs['ci-2-virt-node'].result == 'failure' && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+    needs:
+      - package-wheel
+      - ci-2-virt-node
+      - ci-large-scale-mq
+    if: ${{ always() && (needs['package-wheel'].result == 'failure' || needs['ci-2-virt-node'].result == 'failure' || needs['ci-large-scale-mq'].result == 'failure') && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
     environment: OPENAI_API_KEY
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -174,11 +440,14 @@ jobs:
         if: ${{ steps.api_config.outputs.available == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          CURRENT_JOB_NAME: ${{ needs['ci-large-scale-mq'].result == 'failure' && 'ci-large-scale-mq' || needs['ci-2-virt-node'].result == 'failure' && 'ci-2-virt-node' || 'package-wheel' }}
+          CURRENT_CONTEXT_ARTIFACT_NAME: ${{ needs['ci-large-scale-mq'].result == 'failure' && format('codex-failure-context-{0}-large-scale', github.run_id) || needs['ci-2-virt-node'].result == 'failure' && format('codex-failure-context-{0}-test-all', github.run_id) || format('codex-failure-context-{0}-package-wheel', github.run_id) }}
         run: |
           python3 scripts/ci_codex_failure_analysis.py fetch-evidence \
             --repository "$GITHUB_REPOSITORY" \
             --current-run-id "$GITHUB_RUN_ID" \
-            --current-context-artifact-name "codex-failure-context-$GITHUB_RUN_ID" \
+            --current-job-name "$CURRENT_JOB_NAME" \
+            --current-context-artifact-name "$CURRENT_CONTEXT_ARTIFACT_NAME" \
             --workflow-file all_test.yml \
             --history-failure-limit 5 \
             --artifact-wait-seconds 60 \

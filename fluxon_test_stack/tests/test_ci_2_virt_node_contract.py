@@ -80,13 +80,37 @@ class TestCi2VirtNodeContract(unittest.TestCase):
     _LOG_MGMT_SCENE_ID = "ci_top_attention_log_mgmt"
     _MQ_SCENE_ID = "ci_top_attention_mq_core"
 
-    def test_all_test_workflow_generates_one_p160_c8_largescale_mq_command_from_script(self) -> None:
+    def test_all_test_workflow_runs_test_all_and_largescale_after_one_package_job(self) -> None:
         workflow = (REPO_ROOT / ".github" / "workflows" / "all_test.yml").read_text(
             encoding="utf-8"
         )
         helper = (REPO_ROOT / "scripts" / "ci_2_virt_node_workflow.py").read_text(encoding="utf-8")
+        codex_helper = (REPO_ROOT / "scripts" / "ci_codex_failure_analysis.py").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("scripts/ci_2_virt_node_workflow.py write-suite", workflow)
+        self.assertIn("package-wheel:", workflow)
+        self.assertIn("ci-large-scale-mq:", workflow)
+        self.assertEqual(workflow.count("needs: package-wheel"), 2)
+        self.assertIn("--suite-kind test-all", workflow)
+        self.assertIn("--suite-kind large-scale", workflow)
+        self.assertIn('--current-job-name "$CURRENT_JOB_NAME"', workflow)
+        self.assertIn("job_name=args.current_job_name", codex_helper)
+        self.assertNotIn('job_name="ci-2-virt-node"', codex_helper)
+        self.assertEqual(workflow.count("--skip-pack"), 2)
+        self.assertEqual(workflow.count("actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131"), 2)
+        self.assertIn("fluxon-ci-release-${{ github.sha }}", workflow)
+        self.assertEqual(
+            workflow.count(
+                "test -f fluxon_release/test_rsc/fluxon_tcp_thread/fluxon_test_rsc.sha256"
+            ),
+            2,
+        )
+        self.assertEqual(
+            workflow.count("test -f fluxon_release/ext_images/ext_images.sha256"),
+            2,
+        )
         self.assertIn(
             "jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be",
             workflow,
@@ -101,6 +125,30 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         self.assertNotIn("command_variants", helper)
         self.assertNotIn("p8_c8", helper)
         self.assertNotIn("p32_c32", helper)
+
+    def test_suite_kind_partitions_largescale_from_test_all(self) -> None:
+        all_scenes = _WORKFLOW_HELPER._top_attention_ci_scenes(
+            "Tele-AI.github.io/Fluxon"
+        )
+        test_all = _WORKFLOW_HELPER._select_ci_scenes(
+            all_scenes,
+            suite_kind=_WORKFLOW_HELPER.CI_SUITE_KIND_TEST_ALL,
+        )
+        large_scale = _WORKFLOW_HELPER._select_ci_scenes(
+            all_scenes,
+            suite_kind=_WORKFLOW_HELPER.CI_SUITE_KIND_LARGE_SCALE,
+        )
+
+        self.assertNotIn(_WORKFLOW_HELPER.CI_LARGE_SCALE_SCENE_ID, test_all)
+        self.assertEqual(
+            set(large_scale),
+            {_WORKFLOW_HELPER.CI_LARGE_SCALE_SCENE_ID},
+        )
+        self.assertEqual(
+            set(test_all) | set(large_scale),
+            set(all_scenes),
+        )
+        self.assertFalse(set(test_all) & set(large_scale))
 
     def test_scan_and_clean_temp_is_scoped_and_preserves_runner_control_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -159,9 +207,9 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         self.assertNotIn("publish_codex_failure_report", workflow)
         self.assertNotIn("codex-ci-failure-report-", workflow)
         self.assertNotIn("actions/upload-artifact@v4", workflow)
-        self.assertEqual(
+        self.assertGreaterEqual(
             workflow.count("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"),
-            2,
+            6,
         )
 
         with tempfile.TemporaryDirectory() as td:

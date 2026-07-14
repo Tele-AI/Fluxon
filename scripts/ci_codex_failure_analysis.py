@@ -516,6 +516,7 @@ def _fetch_test_job_log(
     *,
     repository: str,
     run_id: str,
+    job_name: str,
     destination: Path,
     jobs_json: Path,
 ) -> None:
@@ -533,14 +534,14 @@ def _fetch_test_job_log(
         if not isinstance(jobs, list):
             raise TypeError("jobs is not a list")
         job = next(
-            (job for job in jobs if isinstance(job, dict) and job.get("name") == "ci-2-virt-node"),
+            (job for job in jobs if isinstance(job, dict) and job.get("name") == job_name),
             None,
         )
     except (KeyError, TypeError, ValueError) as exc:
         _write_fetch_error(error_path, f"Failed to parse jobs for run {run_id}: {exc}")
         return
     if job is None or job.get("id") is None:
-        _write_fetch_error(error_path, f"Run {run_id} has no ci-2-virt-node job")
+        _write_fetch_error(error_path, f"Run {run_id} has no {job_name!r} job")
         return
 
     job_id = str(job["id"])
@@ -575,7 +576,7 @@ def _fetch_test_job_log(
     if _extract_job_log_from_run_archive(
         repository=repository,
         run_id=run_id,
-        job_name="ci-2-virt-node",
+        job_name=job_name,
         destination=destination,
     ):
         error_path.unlink(missing_ok=True)
@@ -638,6 +639,7 @@ def _fetch_evidence(args: argparse.Namespace) -> None:
     _fetch_test_job_log(
         repository=args.repository,
         run_id=args.current_run_id,
+        job_name=args.current_job_name,
         destination=github_root / "current-job.log",
         jobs_json=github_root / "current-jobs.json",
     )
@@ -692,7 +694,8 @@ def _fetch_evidence(args: argparse.Namespace) -> None:
         _fetch_test_job_log(
             repository=args.repository,
             run_id=run_id,
-            destination=run_root / "ci-2-virt-node.log",
+            job_name=args.current_job_name,
+            destination=run_root / "selected-job.log",
             jobs_json=run_root / "jobs.json",
         )
 
@@ -767,6 +770,7 @@ def _parse_args() -> argparse.Namespace:
     )
     fetch_evidence.add_argument("--repository", required=True)
     fetch_evidence.add_argument("--current-run-id", required=True)
+    fetch_evidence.add_argument("--current-job-name", required=True)
     fetch_evidence.add_argument("--current-context-artifact-name", required=True)
     fetch_evidence.add_argument("--workflow-file", required=True)
     fetch_evidence.add_argument("--history-failure-limit", type=int, default=5)
