@@ -1,7 +1,7 @@
 from concurrent.futures import thread
 from itertools import count
 from math import log
-import os, time, struct, threading, json, random, typing, etcd3, copy, fcntl
+import os, time, struct, threading, json, random, typing, etcd3, copy, fcntl, uuid
 from typing import Callable, Dict, Optional, Tuple, Any, List, Set, Union, cast
 from abc import ABC, abstractmethod
 
@@ -95,7 +95,8 @@ logging = init_logger()
 MPMC_ATTACH_PAYLOAD_KEEPALIVE_RETRIES = 3
 LOCAL_MEMBER_ID_RANGE_SIZE = 32
 MPMC_CREATE_LOCK_TTL_SECONDS = 10
-MPMC_CREATE_LOCK_TIMEOUT_SECONDS = 10.0
+MPMC_CREATE_LOCK_TIMEOUT_SECONDS = 30.0
+_MPMC_CREATE_IN_PROGRESS_MESSAGE = "MPSC channel creation is already in progress"
 
 
 def new_etcd_client(api: KvClient) -> Result[etcd3.Etcd3Client, ApiError]:
@@ -411,9 +412,9 @@ def _new_mpmc_role_key_prefix(mpmc_id: str, role: ChanRole) -> str:
     Get the key prefix for storing MPMC channel role.
     """
     if role == ChanRole.PRODUCER:
-        return f"/mpmc_channels/producer/{mpmc_id}"
+        return f"/mpmc_channels/producer/{mpmc_id}/"
     elif role == ChanRole.CONSUMER:
-        return f"/mpmc_channels/consumer/{mpmc_id}"
+        return f"/mpmc_channels/consumer/{mpmc_id}/"
     else:
         raise ValueError(f"Invalid role: {role}")
 
@@ -447,6 +448,21 @@ def _new_mpmc_ready_channels_prefix(mpmc_id: str) -> str:
     Get the prefix for all ready channels in MPMC channel.
     """
     return f"/mpmc_channels/ready/{mpmc_id}/" # we need the / at the end for extracting mpsc_id from key
+
+
+def _new_mpmc_create_reservations_prefix(mpmc_id: str) -> str:
+    """Get the prefix for in-flight sub-MPSC creation reservations."""
+    return f"/mpmc_channels/create_reservations/{mpmc_id}/"
+
+
+def _new_mpmc_create_reservation_key(
+    mpmc_id: str, role: ChanRole, member_id: int
+) -> str:
+    """Get the member-owned reservation key for sub-MPSC creation."""
+    return (
+        f"{_new_mpmc_create_reservations_prefix(mpmc_id)}"
+        f"{role.value}/{member_id}"
+    )
 
 
 def _extract_mpsc_id_from_ready_key(key: bytes, mpmc_id: str) -> str:
@@ -758,17 +774,12 @@ class MPMCChannel(FactoryOnly):
         meta_object = json.loads(meta_data.decode())
         return Result.new_ok(meta_object)
     
-    def get_mpsc_channels(self) -> Result[List[str], ApiError]:
-        """
-        Get all MPSC channel IDs in this MPMC channel.
-        
-        Returns:
-            Result[List[str]]: List of MPSC channel IDs
-        """
+    def _read_mpsc_channels_snapshot(self) -> Tuple[List[str], Optional[bytes]]:
+        """Read and validate the published sub-MPSC list and its raw value."""
         channels_key = _new_mpmc_mpsc_channels_key(self.mpmc_id)
         channels_data, _ = self.etcd_client.get(channels_key)
         if channels_data is None:
-            return Result.new_ok([])
+            return [], None
         raw = json.loads(channels_data.decode())
         if not isinstance(raw, list):
             raise ValueError(f"invalid mpsc_channels value for mpmc_id={self.mpmc_id}: {raw!r}")
@@ -784,6 +795,11 @@ class MPMCChannel(FactoryOnly):
                 raise ValueError(f"invalid mpsc_id element for mpmc_id={self.mpmc_id}: {item!r}")
             channels.append(item)
 
+        return channels, channels_data
+
+    def get_mpsc_channels(self) -> Result[List[str], ApiError]:
+        """Get all published MPSC channel IDs in this MPMC channel."""
+        channels, _ = self._read_mpsc_channels_snapshot()
         return Result.new_ok(channels)
     
     def get_remote_ready_channels(self) -> List[str]:
@@ -840,6 +856,7 @@ class MPMCChannel(FactoryOnly):
             raise ValueError(f"mpmc_member_id is None for mpmc_id={self.mpmc_id}")
 
         ready_key = _new_mpmc_ready_channel_key(self.mpmc_id, mpsc_id)
+        expected_owner = str(self.mpmc_member_id).encode()
         try:
             success, _ = self.etcd_client.transaction(
                 compare=[
@@ -848,7 +865,7 @@ class MPMCChannel(FactoryOnly):
                 success=[
                     self.etcd_client.transactions.put(
                         ready_key,
-                        str(self.mpmc_member_id).encode(),
+                        expected_owner,
                         self.mpmc_member_lease,
                     )
                 ],
@@ -856,10 +873,38 @@ class MPMCChannel(FactoryOnly):
             )
             return Result.new_ok(bool(success))
         except Exception as e:
+            reconciliation_errors: List[str] = []
+            for attempt in range(1, 4):
+                try:
+                    ready_owner, _ = self.etcd_client.get(ready_key)
+                    if ready_owner == expected_owner:
+                        logging.warning(
+                            "Ready claim response was lost but authority confirms ownership: "
+                            "mpmc_id=%s mpsc_id=%s member_id=%s",
+                            self.mpmc_id,
+                            mpsc_id,
+                            self.mpmc_member_id,
+                        )
+                        return Result.new_ok(True)
+                    if ready_owner is not None:
+                        reconciliation_errors.append(
+                            f"attempt={attempt}: observed_other_owner={ready_owner!r}"
+                        )
+                except Exception as read_error:
+                    reconciliation_errors.append(
+                        f"attempt={attempt}: {read_error}"
+                    )
+                if attempt < 3:
+                    time.sleep(0.05 * attempt)
+
+            # An absent read cannot fence the original create-if-absent txn.
+            # Revoke this member lease so a delayed put cannot become live.
+            self._fail_close_member(reason="ambiguous_ready_claim")
             return Result.new_error(
                 ChanBindError(
                     f"Failed to claim ready key for mpmc_id={self.mpmc_id}, "
-                    f"mpsc_id={mpsc_id}: {e}"
+                    f"mpsc_id={mpsc_id}: {e}; reconciliation_errors="
+                    f"{reconciliation_errors}"
                 )
             )
 
@@ -869,7 +914,24 @@ class MPMCChannel(FactoryOnly):
 
         ready_key = _new_mpmc_ready_channel_key(self.mpmc_id, mpsc_id)
         try:
-            self.etcd_client.delete(ready_key)
+            expected_owner = str(self.mpmc_member_id).encode()
+            success, _ = self.etcd_client.transaction(
+                compare=[
+                    self.etcd_client.transactions.value(ready_key)
+                    == expected_owner
+                ],
+                success=[self.etcd_client.transactions.delete(ready_key)],
+                failure=[],
+            )
+            if not success:
+                logging.debug(
+                    "Ready key cleanup skipped after %s because ownership changed: "
+                    "mpmc_id=%s mpsc_id=%s member_id=%s",
+                    reason,
+                    self.mpmc_id,
+                    mpsc_id,
+                    self.mpmc_member_id,
+                )
         except Exception as e:
             logging.warning(
                 "Failed to delete ready key after %s for mpmc_id=%s mpsc_id=%s: %s",
@@ -878,6 +940,45 @@ class MPMCChannel(FactoryOnly):
                 mpsc_id,
                 e,
             )
+
+    def _bind_claimed_existing_unready_consumer(
+        self,
+        api: KvClient,
+        chan_config: Dict[str, int],
+        mpsc_id: str,
+    ) -> Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError]:
+        """Bind a consumer after this member has atomically claimed its ready key."""
+        try:
+            mpsc_consumer = MPSCChanConsumer(
+                api,
+                mpsc_id,
+                chan_config,
+                self.etcd_client,
+                self.mpmc_member_lease,
+                self.mpmc_global_lease,
+                override_payload_lease_id=self.payload_lease_id,
+                parent_mpmc_id_opt=self.mpmc_id,
+                parent_mpmc_member_id_opt=self.mpmc_member_id,
+            )
+        except Exception as e:
+            self._best_effort_delete_ready_channel(
+                mpsc_id,
+                reason="existing_unready_bind_failure",
+            )
+            return Result.new_error(
+                ChanBindError(
+                    f"Failed to bind claimed existing MPSC consumer for "
+                    f"mpmc_id={self.mpmc_id}, mpsc_id={mpsc_id}: {e}"
+                )
+            )
+
+        mpsc_consumer._mpmc_ready_claimed = True
+        logging.debug(
+            "Bound claimed existing unready MPSC consumer for mpmc_id=%s, mpsc_id=%s",
+            self.mpmc_id,
+            mpsc_id,
+        )
+        return Result.new_ok(mpsc_consumer)
 
     def _try_bind_existing_unready_consumer(
         self,
@@ -906,39 +1007,218 @@ class MPMCChannel(FactoryOnly):
                 )
                 continue
 
-            try:
-                mpsc_consumer = MPSCChanConsumer(
-                    api,
-                    mpsc_id,
-                    chan_config,
-                    self.etcd_client,
-                    self.mpmc_member_lease,
-                    self.mpmc_global_lease,
-                    override_payload_lease_id=self.payload_lease_id,
-                    parent_mpmc_id_opt=self.mpmc_id,
-                    parent_mpmc_member_id_opt=self.mpmc_member_id,
-                )
-            except Exception as e:
-                self._best_effort_delete_ready_channel(
-                    mpsc_id,
-                    reason="existing_unready_bind_failure",
-                )
-                return Result.new_error(
-                    ChanBindError(
-                        f"Failed to bind claimed existing MPSC consumer for "
-                        f"mpmc_id={self.mpmc_id}, mpsc_id={mpsc_id}: {e}"
-                    )
-                )
-
-            mpsc_consumer._mpmc_ready_claimed = True
-            logging.debug(
-                "Bound claimed existing unready MPSC consumer for mpmc_id=%s, mpsc_id=%s",
-                self.mpmc_id,
+            return self._bind_claimed_existing_unready_consumer(
+                api,
+                chan_config,
                 mpsc_id,
             )
-            return Result.new_ok(mpsc_consumer)
 
         return None
+
+    def _get_create_reservation_count(self) -> int:
+        """Count live member-leased sub-MPSC creation reservations."""
+        prefix = _new_mpmc_create_reservations_prefix(self.mpmc_id)
+        return sum(1 for _ in self.etcd_client.get_prefix(prefix))
+
+    def _best_effort_delete_create_reservation(
+        self,
+        reservation_key: str,
+        reservation_token: bytes,
+        *,
+        reason: str,
+    ) -> Tuple[bool, bool]:
+        """Fence this create attempt with a linearized reservation CAS.
+
+        Returns ``(linearized, deleted_owned_token)``. A linearized compare is
+        enough to fence a pending publish, while an ambiguous reservation-create
+        RPC additionally requires ``deleted_owned_token=True`` or member-lease
+        revocation because a late create could otherwise appear after an absent
+        compare.
+        """
+        errors: List[str] = []
+        for attempt in range(1, 4):
+            try:
+                success, _ = self.etcd_client.transaction(
+                    compare=[
+                        self.etcd_client.transactions.value(reservation_key)
+                        == reservation_token
+                    ],
+                    success=[self.etcd_client.transactions.delete(reservation_key)],
+                    failure=[],
+                )
+                if not success:
+                    logging.debug(
+                        "Create reservation cleanup skipped after %s because ownership changed: "
+                        "mpmc_id=%s key=%s",
+                        reason,
+                        self.mpmc_id,
+                        reservation_key,
+                    )
+                return True, bool(success)
+            except Exception as e:
+                errors.append(f"attempt={attempt}: {e}")
+                if attempt < 3:
+                    time.sleep(0.05 * attempt)
+
+        # A live keepalive would otherwise preserve the stale reservation
+        # indefinitely. Stop this member so its lease can be revoked or expire.
+        logging.error(
+            "Failed to delete owned create reservation after %s; closing MPMC member: "
+            "mpmc_id=%s key=%s errors=%s",
+            reason,
+            self.mpmc_id,
+            reservation_key,
+            errors,
+        )
+        self._fail_close_member(
+            reason=f"reservation_cleanup_failure:{reason}",
+        )
+        return False, False
+
+    def _fail_close_member(self, *, reason: str) -> None:
+        """Stop keepalive and revoke this member lease after an ambiguous create."""
+        self.shutdown_ctl.closed = True
+        self._lm_mpmc_member = None
+        lease_id = int(self.mpmc_member_lease.id)
+        try:
+            self.etcd_client.revoke_lease(lease_id)
+        except Exception as e:
+            if "requested lease not found" not in str(e).lower():
+                logging.error(
+                    "Failed to revoke MPMC member lease after %s: "
+                    "mpmc_id=%s member_id=%s lease_id=%s error=%s",
+                    reason,
+                    self.mpmc_id,
+                    self.mpmc_member_id,
+                    lease_id,
+                    e,
+                )
+
+    @staticmethod
+    def _release_failed_new_mpsc(
+        mpsc_object: Union[MPSCChanConsumer, MPSCChanProducer],
+        *,
+        reason: str,
+    ) -> None:
+        """Release a process-local MPSC handle after publication failed."""
+        try:
+            mpsc_object.release_local_handle().unwrap()
+        except Exception as e:
+            logging.warning(
+                "Failed to release new MPSC local handle after %s: %s",
+                reason,
+                e,
+            )
+
+    def _reconcile_new_mpsc_publish(
+        self,
+        mpsc_id: str,
+        chan_role: ChanRole,
+    ) -> Optional[bool]:
+        """Resolve an ambiguous publish RPC using linearizable authority reads."""
+        successful_absent_reads = 0
+        for attempt in range(1, 6):
+            try:
+                current_mpscs, _ = self._read_mpsc_channels_snapshot()
+                if mpsc_id not in current_mpscs:
+                    successful_absent_reads += 1
+                elif chan_role == ChanRole.PRODUCER:
+                    return True
+                else:
+                    ready_key = _new_mpmc_ready_channel_key(self.mpmc_id, mpsc_id)
+                    ready_owner, _ = self.etcd_client.get(ready_key)
+                    expected_owner = str(self.mpmc_member_id).encode()
+                    if ready_owner == expected_owner:
+                        return True
+                    logging.error(
+                        "Published MPSC list contains %s but ready ownership is inconsistent: "
+                        "mpmc_id=%s expected=%r actual=%r",
+                        mpsc_id,
+                        self.mpmc_id,
+                        expected_owner,
+                        ready_owner,
+                    )
+                    return None
+            except Exception as e:
+                logging.warning(
+                    "Publish reconciliation attempt %s/5 failed for mpmc_id=%s "
+                    "mpsc_id=%s: %s",
+                    attempt,
+                    self.mpmc_id,
+                    mpsc_id,
+                    e,
+                )
+            if attempt < 5:
+                time.sleep(0.1)
+
+        if successful_absent_reads > 0:
+            return False
+        return None
+
+    def _abort_unpublished_new_mpsc(
+        self,
+        mpsc_object: Union[MPSCChanConsumer, MPSCChanProducer],
+        *,
+        reason: str,
+    ) -> None:
+        """Release a failed create and delete its unpublished distributed metadata."""
+        mpsc_id = mpsc_object.chan_id
+        self._release_failed_new_mpsc(mpsc_object, reason=reason)
+
+        meta_key = _new_etcd_meta_key(mpsc_id)
+        abort_key = f"/channels/aborted/{mpsc_id}"
+        channel_prefix = f"/channels/{mpsc_id}/"
+        allocator_prefix = f"dist_id_allocator/channels/{mpsc_id}/"
+        cluster_lease_key = f"cluster_lease/id_allocator/channels/{mpsc_id}"
+        cleanup_errors: List[str] = []
+        for attempt in range(1, 4):
+            try:
+                meta_data, _ = self.etcd_client.get(meta_key)
+                global_long_lease_id: Optional[int] = None
+                if meta_data is not None:
+                    try:
+                        meta_obj = json.loads(meta_data.decode())
+                    except Exception as meta_error:
+                        logging.warning(
+                            "Failed to decode unpublished MPSC meta before cleanup: "
+                            "mpmc_id=%s mpsc_id=%s error=%s",
+                            self.mpmc_id,
+                            mpsc_id,
+                            meta_error,
+                        )
+                    else:
+                        lease_id_value = meta_obj.get("global_long_lease_id")
+                        if isinstance(lease_id_value, int) and lease_id_value > 0:
+                            global_long_lease_id = lease_id_value
+
+                # Fence every Rust-side create/bind write before deleting state.
+                # Channel ids are monotonic and never reused, so this marker is
+                # intentionally permanent until a full `/channels` reset.
+                self.etcd_client.put(abort_key, b"1")
+                self.etcd_client.delete_prefix(channel_prefix)
+                self.etcd_client.delete_prefix(allocator_prefix)
+                self.etcd_client.delete(meta_key)
+                self.etcd_client.delete(cluster_lease_key)
+                if global_long_lease_id is not None:
+                    try:
+                        self.etcd_client.revoke_lease(global_long_lease_id)
+                    except Exception as revoke_error:
+                        if "requested lease not found" not in str(revoke_error).lower():
+                            raise
+                return
+            except Exception as e:
+                cleanup_errors.append(f"attempt={attempt}: {e}")
+                if attempt < 3:
+                    time.sleep(0.05 * attempt)
+
+        logging.error(
+            "Failed to clean unpublished MPSC distributed metadata: mpmc_id=%s "
+            "mpsc_id=%s reason=%s errors=%s",
+            self.mpmc_id,
+            mpsc_id,
+            reason,
+            cleanup_errors,
+        )
 
     def _ensure_member_lease_alive(self) -> Result[OkNone, ApiError]:
         lease_id = int(self.mpmc_member_lease.id)
@@ -1128,6 +1408,89 @@ class MPMCChannel(FactoryOnly):
 
         create_error = create_result.unwrap_error()
         if (
+            isinstance(create_error, ChanCreateError)
+            and create_error.message == _MPMC_CREATE_IN_PROGRESS_MESSAGE
+        ):
+            # A reservation replaces the old behavior where contenders waited
+            # behind a long-held create lock. Wait outside that lock for the
+            # publisher, or retry reservation if the owner failed and cleaned up.
+            wait_deadline = time.monotonic() + MPMC_CREATE_LOCK_TIMEOUT_SECONDS
+            while time.monotonic() < wait_deadline:
+                if self.shutdown_ctl.closed:
+                    return Result.new_error(
+                        ChannelClosedError(
+                            message="MPMC channel is closed.",
+                            channel_id=self.mpmc_id,
+                        )
+                    )
+
+                self._refresh_local_ready_state()
+                ready_channels = self.get_ready_channels()
+                unready_channels = self.unready_channels
+                existing_result = try_existing_channels(
+                    ready_channels,
+                    unready_channels,
+                )
+                if existing_result is not None:
+                    return existing_result
+
+                try:
+                    in_flight_creates = self._get_create_reservation_count()
+                except Exception as e:
+                    return Result.new_error(
+                        ChanCreateError(
+                            f"Failed to inspect in-flight MPSC creation for "
+                            f"MPMC channel {self.mpmc_id}: {e}"
+                        )
+                    )
+
+                should_retry_create = in_flight_creates == 0
+                if producer is None:
+                    try:
+                        active_consumers = self._get_active_consumer_count()
+                    except Exception as e:
+                        return Result.new_error(
+                            ChanCreateError(
+                                f"Failed to count active consumers while waiting for "
+                                f"MPMC channel {self.mpmc_id}: {e}"
+                            )
+                        )
+                    published_channel_count = len(
+                        set(ready_channels).union(unready_channels)
+                    )
+                    should_retry_create = active_consumers > (
+                        published_channel_count + in_flight_creates
+                    )
+
+                if should_retry_create:
+                    create_result = self.try_create_mpsc_channel(
+                        api,
+                        chan_config,
+                        chan_role,
+                    )
+                    if create_result.is_ok():
+                        mpsc_object = create_result.unwrap()
+                        if producer is not None:
+                            assert isinstance(mpsc_object, MPSCChanProducer)
+                            producer._record_mpsc_producer(mpsc_object)
+                        return Result.new_ok(mpsc_object)
+
+                    create_error = create_result.unwrap_error()
+                    if not (
+                        isinstance(create_error, ChanCreateError)
+                        and create_error.message == _MPMC_CREATE_IN_PROGRESS_MESSAGE
+                    ):
+                        break
+
+                time.sleep(0.05)
+            else:
+                create_error = ChanCreateError(
+                    f"{_MPMC_CREATE_IN_PROGRESS_MESSAGE} after waiting "
+                    f"{MPMC_CREATE_LOCK_TIMEOUT_SECONDS:.0f}s for "
+                    f"MPMC channel {self.mpmc_id}"
+                )
+
+        if (
             producer is not None
             and isinstance(create_error, ChanCreateError)
             and create_error.message == "Producer can only create the first channel"
@@ -1161,23 +1524,30 @@ class MPMCChannel(FactoryOnly):
             chan_config: Dict[str, int],
             chan_role: ChanRole,
         ) -> Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError]:
+        """Reserve, construct, and publish a new sub-MPSC.
+
+        The create lock protects only authority reads, reservation accounting,
+        and the final list update. Rust-backed MPSC construction runs outside
+        the lock because it may perform lease probes and other network I/O.
         """
-        Try to create a new MPSC channel and add it to this MPMC channel.
-        Uses etcd lock to ensure atomic creation.
-        Producer: only create if this is the first channel
-        Consumer: only create if active consumer count > existing MPSC channels
-        
-        Args:
-            api(KvClient): KV store API (required for creating MPSC objects)
-            api(KvClient): KV store API (required for creating MPSC objects)
-            chan_config(Dict[str, int]): Channel configuration (required for creating MPSC objects)
-            chan_role(ChanRole): Channel role (PRODUCER or CONSUMER)
-            
-        Returns:
-            Result[Union[MPSCChanConsumer, MPSCChanProducer]]: New MPSC object
-        """
+        if chan_role not in (ChanRole.PRODUCER, ChanRole.CONSUMER):
+            return Result.new_error(
+                ChanCreateError(f"Invalid channel role: {chan_role}")
+            )
+        if self.mpmc_member_id is None:
+            return Result.new_error(
+                ChanCreateError(
+                    f"Cannot create MPSC for mpmc_id={self.mpmc_id}: member id is missing"
+                )
+            )
+
         lock_key = f"/mpmc_channels/{self.mpmc_id}/create_lock"
-        
+        claimed_existing_mpsc_id: Optional[str] = None
+        reservation_key: Optional[str] = None
+        reservation_token: Optional[bytes] = None
+        reservation_create_confirmed = False
+
+        # Phase 1: re-read authority state and reserve one creation slot.
         try:
             with EtcdLock(
                 self._etcd_endpoints,
@@ -1185,153 +1555,280 @@ class MPMCChannel(FactoryOnly):
                 MPMC_CREATE_LOCK_TTL_SECONDS,
                 MPMC_CREATE_LOCK_TIMEOUT_SECONDS,
             ):
-                # Get current channels
                 mpsc_result = self.get_mpsc_channels()
                 if not mpsc_result.is_ok():
                     error = mpsc_result.unwrap_error()
-                    if error is not None:
-                        return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(error)
-                    else:
-                        return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(ChanCreateError("Failed to get channels"))
-                
+                    return Result.new_error(
+                        error
+                        if error is not None
+                        else ChanCreateError("Failed to get channels")
+                    )
+
                 current_mpscs = mpsc_result.unwrap()
-                
-                # Role-specific constraints
+                in_flight_creates = self._get_create_reservation_count()
+
                 if chan_role == ChanRole.PRODUCER:
-                    # Producer: only create if this is the first channel
                     if current_mpscs:
-                        return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(ChanCreateError("Producer can only create the first channel"))
-                elif chan_role == ChanRole.CONSUMER:
-                    # Consumer: lock-free snapshots are not authoritative. Re-read
-                    # under the create lock and claim any existing unready MPSC
-                    # before deciding to allocate a new one.
+                        return Result.new_error(
+                            ChanCreateError("Producer can only create the first channel")
+                        )
+                    if in_flight_creates > 0:
+                        return Result.new_error(
+                            ChanCreateError(_MPMC_CREATE_IN_PROGRESS_MESSAGE)
+                        )
+                else:
+                    # The lock-free caller already tried this path. Re-check under
+                    # the lock so a concurrently published unready channel wins
+                    # over allocating another one, but bind it after releasing the lock.
                     ready_channel_set = set(self.get_remote_ready_channels())
                     current_unready_mpscs = [
                         mpsc_id for mpsc_id in current_mpscs if mpsc_id not in ready_channel_set
                     ]
-                    if current_unready_mpscs:
-                        logging.debug(
-                            "Consumer create-lock recheck found existing unready MPSCs for "
-                            "mpmc_id=%s: %s",
-                            self.mpmc_id,
-                            current_unready_mpscs,
-                        )
-                        existing_consumer_res = self._try_bind_existing_unready_consumer(
-                            api,
-                            chan_config,
-                            current_unready_mpscs,
-                        )
-                        if existing_consumer_res is not None:
-                            return existing_consumer_res
+                    for mpsc_id in current_unready_mpscs:
+                        claim_res = self.try_claim_ready_channel(mpsc_id)
+                        if not claim_res.is_ok():
+                            return Result.new_error(claim_res.unwrap_error())
+                        if claim_res.unwrap():
+                            claimed_existing_mpsc_id = mpsc_id
+                            break
 
-                    # Only create if the lock-protected recheck still found no
-                    # claimable unready channel and active consumers outnumber
-                    # the existing sub-MPSC count.
-                    active_consumers = self._get_active_consumer_count()
-                    if active_consumers <= len(current_mpscs):
-                        return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(ChanCreateError("Not enough active consumers to create new channel"))
-                else:
-                    return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(ChanCreateError(f"Invalid channel role: {chan_role}"))
-                
-                # Create MPSC object (let it handle its own ID allocation)
-                if chan_role == ChanRole.PRODUCER:
-                    logging.debug(f"Creating new MPSC producer for MPMC channel {self.mpmc_id}")
-                    mpsc_producer = MPSCChanProducer(
-                        api,
-                        None,
-                        chan_config,
-                        self.etcd_client,
-                        # Tie producer membership keys to per-member lease so restarts do not collide.
-                        self.mpmc_member_lease,
-                        # Keep channel meta stable under the shared/global lease.
-                        self.mpmc_global_lease,
-                        # IMPORTANT: Always reuse the MPMC-shared kv payload lease for
-                        # newly created sub MPSC channels so all producers bind payload
-                        # keys under the SAME lease. Not doing this would cause subtle
-                        # payload lease "split" across sub-channels even though they
-                        # belong to the same MPMC. This is not a fallback; it's a
-                        # required invariant for MPMC semantics.
-                        override_payload_lease_id=self.payload_lease_id,
-                        parent_mpmc_id_opt=self.mpmc_id,
-                        parent_mpmc_member_id_opt=self.mpmc_member_id,
-                    )
-                    # Record the created channel
-                    mpsc_id = mpsc_producer.chan_id
-                    current_mpscs.append(mpsc_id)
-                    channels_key = _new_mpmc_mpsc_channels_key(self.mpmc_id)
-                    self.etcd_client.put(channels_key, json.dumps(current_mpscs).encode(), self.mpmc_global_lease)
-                    return Result.new_ok(mpsc_producer)
-                elif chan_role == ChanRole.CONSUMER:
-                    logging.debug(f"Creating new MPSC consumer for MPMC channel {self.mpmc_id}")
-                    mpsc_consumer: Optional[MPSCChanConsumer] = None
-                    try:
-                        mpsc_consumer = MPSCChanConsumer(
-                            api,
-                            None,
-                            chan_config,
-                            self.etcd_client,
-                            # Tie consumer membership keys to per-member lease so restarts do not collide.
-                            self.mpmc_member_lease,
-                            # Keep channel meta stable under the shared/global lease.
-                            self.mpmc_global_lease,
-                            # Match producer-side semantics: new sub MPSC must reuse
-                            # the shared kv payload lease of the parent MPMC.
-                            override_payload_lease_id=self.payload_lease_id,
-                            parent_mpmc_id_opt=self.mpmc_id,
-                            parent_mpmc_member_id_opt=self.mpmc_member_id,
-                        )
-                    except Exception as e:
-                        logging.error(f"Fatal error creating MPSC consumer for MPMC channel {self.mpmc_id}: {e}")
-                        return Result[
-                            Union[MPSCChanConsumer, MPSCChanProducer], ApiError
-                        ].new_error(
-                            ChanCreateError(
-                                f"Failed to create MPSC consumer when try_create_mpsc_channel: {e}"
+                    if claimed_existing_mpsc_id is None:
+                        active_consumers = self._get_active_consumer_count()
+                        if active_consumers <= len(current_mpscs) + in_flight_creates:
+                            if in_flight_creates > 0:
+                                return Result.new_error(
+                                    ChanCreateError(_MPMC_CREATE_IN_PROGRESS_MESSAGE)
+                                )
+                            return Result.new_error(
+                                ChanCreateError(
+                                    "Not enough active consumers to create new channel"
+                                )
                             )
-                        )
-                    assert mpsc_consumer is not None
-                    mpsc_id = mpsc_consumer.chan_id
-                    channels_key = _new_mpmc_mpsc_channels_key(self.mpmc_id)
-                    ready_key = _new_mpmc_ready_channel_key(self.mpmc_id, mpsc_id)
-                    published_mpscs = current_mpscs.copy()
-                    published_mpscs.append(mpsc_id)
-                    success, _ = self.etcd_client.transaction(
+
+                if claimed_existing_mpsc_id is None:
+                    reservation_key = _new_mpmc_create_reservation_key(
+                        self.mpmc_id,
+                        chan_role,
+                        self.mpmc_member_id,
+                    )
+                    reservation_token = uuid.uuid4().hex.encode()
+                    reserved, _ = self.etcd_client.transaction(
                         compare=[
-                            self.etcd_client.transactions.create(ready_key) == 0
+                            self.etcd_client.transactions.create(reservation_key) == 0
                         ],
                         success=[
                             self.etcd_client.transactions.put(
-                                channels_key,
-                                json.dumps(published_mpscs).encode(),
-                                self.mpmc_global_lease,
-                            ),
-                            self.etcd_client.transactions.put(
-                                ready_key,
-                                str(self.mpmc_member_id).encode(),
+                                reservation_key,
+                                reservation_token,
                                 self.mpmc_member_lease,
-                            ),
+                            )
                         ],
                         failure=[],
                     )
-                    if not success:
-                        try:
-                            mpsc_consumer.release_local_handle().unwrap()
-                        except Exception as e:
-                            logging.debug(f"close leaked MPSC consumer error: {e}")
-                        return Result[
-                            Union[MPSCChanConsumer, MPSCChanProducer], ApiError
-                        ].new_error(
-                            ChanCreateError(
-                                f"Failed to publish claimed MPSC consumer {mpsc_id} for "
-                                f"MPMC channel {self.mpmc_id}"
-                            )
+                    reservation_create_confirmed = True
+                    if not reserved:
+                        return Result.new_error(
+                            ChanCreateError(_MPMC_CREATE_IN_PROGRESS_MESSAGE)
                         )
-                    mpsc_consumer._mpmc_ready_claimed = True
-                    logging.debug(f"Created new MPSC consumer {mpsc_id} for MPMC channel {self.mpmc_id}")
-                    return Result.new_ok(mpsc_consumer)
-                
         except Exception as e:
-            return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(ChanCreateError(f"Failed to create MPSC channel: {e}"))
+            if reservation_key is not None and reservation_token is not None:
+                _, deleted_owned_token = self._best_effort_delete_create_reservation(
+                    reservation_key,
+                    reservation_token,
+                    reason="reserve_lock_exit_failure",
+                )
+                if not reservation_create_confirmed and not deleted_owned_token:
+                    # An unresolved create RPC may still arrive after a cleanup
+                    # compare that observed the key as absent. Revoking the
+                    # member lease prevents that late put from becoming live.
+                    self._fail_close_member(
+                        reason="ambiguous_reservation_create",
+                    )
+            if claimed_existing_mpsc_id is not None:
+                self._best_effort_delete_ready_channel(
+                    claimed_existing_mpsc_id,
+                    reason="claim_lock_exit_failure",
+                )
+            return Result.new_error(
+                ChanCreateError(f"Failed to reserve MPSC channel creation: {e}")
+            )
+
+        if claimed_existing_mpsc_id is not None:
+            return self._bind_claimed_existing_unready_consumer(
+                api,
+                chan_config,
+                claimed_existing_mpsc_id,
+            )
+
+        assert reservation_key is not None
+        assert reservation_token is not None
+
+        # Phase 2: run the expensive Rust-backed constructor without the create lock.
+        try:
+            if chan_role == ChanRole.PRODUCER:
+                logging.debug(
+                    "Creating new MPSC producer outside create lock for MPMC channel %s",
+                    self.mpmc_id,
+                )
+                mpsc_object: Union[MPSCChanConsumer, MPSCChanProducer] = MPSCChanProducer(
+                    api,
+                    None,
+                    chan_config,
+                    self.etcd_client,
+                    self.mpmc_member_lease,
+                    self.mpmc_global_lease,
+                    override_payload_lease_id=self.payload_lease_id,
+                    parent_mpmc_id_opt=self.mpmc_id,
+                    parent_mpmc_member_id_opt=self.mpmc_member_id,
+                )
+            else:
+                logging.debug(
+                    "Creating new MPSC consumer outside create lock for MPMC channel %s",
+                    self.mpmc_id,
+                )
+                mpsc_object = MPSCChanConsumer(
+                    api,
+                    None,
+                    chan_config,
+                    self.etcd_client,
+                    self.mpmc_member_lease,
+                    self.mpmc_global_lease,
+                    override_payload_lease_id=self.payload_lease_id,
+                    parent_mpmc_id_opt=self.mpmc_id,
+                    parent_mpmc_member_id_opt=self.mpmc_member_id,
+                )
+        except Exception as e:
+            self._best_effort_delete_create_reservation(
+                reservation_key,
+                reservation_token,
+                reason="constructor_failure",
+            )
+            return Result.new_error(
+                ChanCreateError(
+                    f"Failed to construct new MPSC {chan_role.value} for "
+                    f"MPMC channel {self.mpmc_id}: {e}"
+                )
+            )
+
+        # Phase 3: publish against the latest list, then delete the reservation
+        # in the same transaction. The raw-list compare also protects against a
+        # stale lock holder overwriting a newer list generation.
+        mpsc_id = mpsc_object.chan_id
+        published = False
+        publish_error: Optional[Exception] = None
+        try:
+            with EtcdLock(
+                self._etcd_endpoints,
+                lock_key,
+                MPMC_CREATE_LOCK_TTL_SECONDS,
+                MPMC_CREATE_LOCK_TIMEOUT_SECONDS,
+            ):
+                current_mpscs, current_channels_value = (
+                    self._read_mpsc_channels_snapshot()
+                )
+                channels_key = _new_mpmc_mpsc_channels_key(self.mpmc_id)
+                compares = [
+                    self.etcd_client.transactions.value(reservation_key)
+                    == reservation_token
+                ]
+                if current_channels_value is None:
+                    compares.append(
+                        self.etcd_client.transactions.create(channels_key) == 0
+                    )
+                else:
+                    compares.append(
+                        self.etcd_client.transactions.value(channels_key)
+                        == current_channels_value
+                    )
+
+                success_ops = [
+                    self.etcd_client.transactions.put(
+                        channels_key,
+                        json.dumps(current_mpscs + [mpsc_id]).encode(),
+                        self.mpmc_global_lease,
+                    )
+                ]
+                if chan_role == ChanRole.CONSUMER:
+                    ready_key = _new_mpmc_ready_channel_key(self.mpmc_id, mpsc_id)
+                    compares.append(
+                        self.etcd_client.transactions.create(ready_key) == 0
+                    )
+                    success_ops.append(
+                        self.etcd_client.transactions.put(
+                            ready_key,
+                            str(self.mpmc_member_id).encode(),
+                            self.mpmc_member_lease,
+                        )
+                    )
+                success_ops.append(
+                    self.etcd_client.transactions.delete(reservation_key)
+                )
+
+                published, _ = self.etcd_client.transaction(
+                    compare=compares,
+                    success=success_ops,
+                    failure=[],
+                )
+        except Exception as e:
+            publish_error = e
+
+        if not published and publish_error is not None:
+            reconciled = self._reconcile_new_mpsc_publish(mpsc_id, chan_role)
+            if reconciled is True:
+                published = True
+
+        if not published:
+            fenced, _ = self._best_effort_delete_create_reservation(
+                reservation_key,
+                reservation_token,
+                reason="publish_failure",
+            )
+            detail = "transaction compare failed" if publish_error is None else str(publish_error)
+            reconciled_after_fence = (
+                self._reconcile_new_mpsc_publish(mpsc_id, chan_role)
+                if fenced
+                else None
+            )
+            if reconciled_after_fence is True:
+                published = True
+            elif fenced and reconciled_after_fence is False:
+                self._abort_unpublished_new_mpsc(
+                    mpsc_object,
+                    reason="publish_failure",
+                )
+            else:
+                # Without a completed reservation CAS, a delayed publish may
+                # still commit. Preserve distributed metadata and stop this
+                # member instead of risking deletion of a published channel.
+                self._release_failed_new_mpsc(
+                    mpsc_object,
+                    reason="ambiguous_publish",
+                )
+                self.shutdown_ctl.closed = True
+                self._lm_mpmc_member = None
+                return Result.new_error(
+                    ChanCreateError(
+                        f"Could not fence and reconcile MPSC {mpsc_id} publication "
+                        f"for MPMC channel {self.mpmc_id}: {detail}"
+                    )
+                )
+
+        if not published:
+            return Result.new_error(
+                ChanCreateError(
+                    f"Failed to publish new MPSC {mpsc_id} for MPMC channel "
+                    f"{self.mpmc_id}: {detail}"
+                )
+            )
+
+        if isinstance(mpsc_object, MPSCChanConsumer):
+            mpsc_object._mpmc_ready_claimed = True
+        logging.debug(
+            "Created and published new MPSC %s for MPMC channel %s",
+            mpsc_id,
+            self.mpmc_id,
+        )
+        return Result.new_ok(mpsc_object)
     
     def _get_active_consumer_count(self) -> int:
         """

@@ -11,7 +11,7 @@ use fluxon_mq::consumer::{
 use fluxon_mq::{
     ChanManager, MpscConsumer as CoreMpscConsumer, MpscError as CoreMpscError,
     MpscProducer as CoreMpscProducer, ShutdownCtl,
-    create::{ChanCreateConfig, create_mpsc_channel},
+    create::{ChanCreateConfig, MpscCreateRollback, create_mpsc_channel},
 };
 use pyo3::Py;
 use pyo3::PyErr;
@@ -231,6 +231,12 @@ impl MpscContext {
             .run_async_from_sync(async move {
                 let lease_manager = GLOBAL_LM.clone();
 
+                let category = match (parent_mpmc_id_opt, parent_mpmc_member_id_opt) {
+                    (Some(pid), Some(_mid)) => fluxon_mq::keys::MqCategory::MpmcSub { parent_mpmc_id: pid },
+                    (None, None) => fluxon_mq::keys::MqCategory::Mpsc,
+                    _ => return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None")),
+                };
+
                 // Construct channel manager either by creating a new
                 // channel or by binding to an existing one.
                 let chan_mgr: anyhow::Result<ChanManager> = async {
@@ -272,14 +278,15 @@ impl MpscContext {
                 }
                 .await;
                 let chan_mgr = chan_mgr?;
+                let rollback = chan_id.is_none().then(|| {
+                    MpscCreateRollback::from_created_manager(
+                        &chan_mgr,
+                        override_global_lease_id,
+                        override_member_lease_id,
+                    )
+                });
 
-                let category = match (parent_mpmc_id_opt, parent_mpmc_member_id_opt) {
-                    (Some(pid), Some(_mid)) => fluxon_mq::keys::MqCategory::MpmcSub { parent_mpmc_id: pid },
-                    (None, None) => fluxon_mq::keys::MqCategory::Mpsc,
-                    _ => return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None")),
-                };
-
-                CoreMpscProducer::bind_mpsc(
+                let bind_result = CoreMpscProducer::bind_mpsc(
                     chan_mgr,
                     ttl_seconds,
                     weight,
@@ -292,7 +299,22 @@ impl MpscContext {
                     observe_node_role,
                     observe,
                 )
-                .await
+                .await;
+                match bind_result {
+                    Ok(producer) => Ok(producer),
+                    Err(bind_error) => {
+                        if let Some(rollback) = rollback {
+                            if let Err(rollback_error) = rollback.rollback(&etcd_backend).await {
+                                return Err(anyhow::anyhow!(
+                                    "{}; rollback failed for newly created MPSC producer: {:#}",
+                                    bind_error,
+                                    rollback_error
+                                ));
+                            }
+                        }
+                        Err(bind_error)
+                    }
+                }
             }))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "runtime bridge failed in new_producer: {}",
@@ -374,6 +396,12 @@ impl MpscContext {
             .run_async_from_sync(async move {
                 let lease_manager = GLOBAL_LM.clone();
 
+                let category = match (parent_mpmc_id_opt, parent_mpmc_member_id_opt) {
+                    (Some(pid), Some(_mid)) => fluxon_mq::keys::MqCategory::MpmcSub { parent_mpmc_id: pid },
+                    (None, None) => fluxon_mq::keys::MqCategory::Mpsc,
+                    _ => return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None")),
+                };
+
                 let chan_mgr: anyhow::Result<ChanManager> = async {
                     match chan_id {
                         Some(id) => ChanManager::new_with_chan_id(
@@ -415,14 +443,15 @@ impl MpscContext {
                 }
                 .await;
                 let chan_mgr = chan_mgr?;
+                let rollback = chan_id.is_none().then(|| {
+                    MpscCreateRollback::from_created_manager(
+                        &chan_mgr,
+                        override_global_lease_id,
+                        override_member_lease_id,
+                    )
+                });
 
-                let category = match (parent_mpmc_id_opt, parent_mpmc_member_id_opt) {
-                    (Some(pid), Some(_mid)) => fluxon_mq::keys::MqCategory::MpmcSub { parent_mpmc_id: pid },
-                    (None, None) => fluxon_mq::keys::MqCategory::Mpsc,
-                    _ => return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None")),
-                };
-
-                CoreMpscConsumer::bind_mpsc(
+                let bind_result = CoreMpscConsumer::bind_mpsc(
                     chan_mgr,
                     ttl_seconds,
                     lifecycle,
@@ -434,7 +463,22 @@ impl MpscContext {
                     observe_node_role,
                     observe,
                 )
-                .await
+                .await;
+                match bind_result {
+                    Ok(consumer) => Ok(consumer),
+                    Err(bind_error) => {
+                        if let Some(rollback) = rollback {
+                            if let Err(rollback_error) = rollback.rollback(&etcd_backend).await {
+                                return Err(anyhow::anyhow!(
+                                    "{}; rollback failed for newly created MPSC consumer: {:#}",
+                                    bind_error,
+                                    rollback_error
+                                ));
+                            }
+                        }
+                        Err(bind_error)
+                    }
+                }
             }))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "runtime bridge failed in new_consumer: {}",

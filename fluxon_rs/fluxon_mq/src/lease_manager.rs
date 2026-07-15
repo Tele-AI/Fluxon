@@ -17,7 +17,7 @@ pub use fluxon_util::lease_manager::{debug_keepalive_log, get_register_by, recor
 
 // Re-export actor-based lease types
 pub use fluxon_util::lease_manager::{
-    GLOBAL_LM, GeneralLease, LeaseBackendHandle, LeaseBackendUid, LeaseRegisterKind, LeaseType,
+    GeneralLease, LeaseBackendHandle, LeaseBackendUid, LeaseRegisterKind, LeaseType, GLOBAL_LM,
 };
 
 // Canonicalization is handled by LeaseBackendUid constructor.

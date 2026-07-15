@@ -24,6 +24,14 @@ pub fn etcd_meta_key(chan_id: i64) -> String {
     s
 }
 
+/// Permanent fence for a channel id whose creation was rolled back.
+pub fn etcd_aborted_key(chan_id: i64) -> String {
+    let mut s = String::with_capacity(35);
+    s.push_str("/channels/aborted/");
+    let _ = write!(&mut s, "{}", chan_id);
+    s
+}
+
 /// Etcd key for a producer registration under a channel.
 pub fn etcd_producer_key(chan_id: i64, producer_idx: &str) -> String {
     let mut s = String::with_capacity(64);
@@ -216,4 +224,14 @@ pub fn etcd_register_consumer_idx_key(chan_id: i64, idx: i64) -> String {
     s.push_str("/consumer_");
     let _ = write!(&mut s, "{}", idx);
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::etcd_aborted_key;
+
+    #[test]
+    fn aborted_key_uses_the_permanent_channel_fence_namespace() {
+        assert_eq!(etcd_aborted_key(7), "/channels/aborted/7");
+    }
 }

@@ -166,6 +166,8 @@ impl MpscProducer {
             }
         };
         let key = keys::etcd_producer_key(chan_id, &producer_idx);
+        let meta_key = keys::etcd_meta_key(chan_id);
+        let aborted_key = keys::etcd_aborted_key(chan_id);
 
         let member_meta = ProducerMemberMeta {
             producer_idx: producer_idx.clone(),
@@ -174,19 +176,26 @@ impl MpscProducer {
         let member_meta_bytes = serde_json::to_vec(&member_meta)
             .map_err(|e| anyhow::anyhow!("serialize ProducerMemberMeta failed: {}", e))?;
 
-        let compare = etcd::Compare::create_revision(key.clone(), etcd::CompareOp::Equal, 0);
+        let compares = vec![
+            etcd::Compare::create_revision(aborted_key.clone(), etcd::CompareOp::Equal, 0),
+            etcd::Compare::create_revision(meta_key.clone(), etcd::CompareOp::Greater, 0),
+            etcd::Compare::create_revision(key.clone(), etcd::CompareOp::Equal, 0),
+        ];
         let put_op = etcd::TxnOp::put(
             key.clone(),
             member_meta_bytes,
             Some(etcd::PutOptions::new().with_lease(member_lease_id)),
         );
-        let txn = etcd::Txn::new().when(vec![compare]).and_then(vec![put_op]);
+        let txn = etcd::Txn::new().when(compares).and_then(vec![put_op]);
         let txn_res = client
             .txn(txn)
             .await
             .with_context(|| format!("failed to bind producer membership key {}", key))?;
         if !txn_res.succeeded() {
-            anyhow::bail!("producer membership key {} already exists", key);
+            anyhow::bail!(
+                "producer membership bind rejected for key {}: channel aborted, meta missing, or membership already exists",
+                key
+            );
         }
 
         // 4) Optionally write producer weight (default 1)，挂在
@@ -194,14 +203,29 @@ impl MpscProducer {
         let weight = weight.unwrap_or(1);
         let weight_key = keys::etcd_producer_weight_key(chan_id, &producer_idx);
         let global_lease_id = chan_mgr.global_lease.id() as i64;
-        client
-            .put(
-                weight_key.clone(),
-                weight.to_string(),
-                Some(etcd::PutOptions::new().with_lease(global_lease_id)),
-            )
+        let weight_compares = vec![
+            etcd::Compare::create_revision(aborted_key, etcd::CompareOp::Equal, 0),
+            etcd::Compare::create_revision(meta_key, etcd::CompareOp::Greater, 0),
+            etcd::Compare::create_revision(key.clone(), etcd::CompareOp::Greater, 0),
+        ];
+        let put_weight = etcd::TxnOp::put(
+            weight_key.clone(),
+            weight.to_string(),
+            Some(etcd::PutOptions::new().with_lease(global_lease_id)),
+        );
+        let weight_txn = etcd::Txn::new()
+            .when(weight_compares)
+            .and_then(vec![put_weight]);
+        let weight_txn_res = client
+            .txn(weight_txn)
             .await
             .with_context(|| format!("failed to write producer weight key {}", weight_key))?;
+        if !weight_txn_res.succeeded() {
+            anyhow::bail!(
+                "producer weight write rejected for key {}: channel aborted, meta missing, or membership missing",
+                weight_key.clone(),
+            );
+        }
 
         let (consumer_bind_state_tx, consumer_bind_state_rx) =
             watch::channel(ConsumerBindState::NoneBound);
