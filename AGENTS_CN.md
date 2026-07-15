@@ -55,4 +55,4 @@
 
 ## 组件契约索引
 
-- MQ 关闭：用户和测试路径必须先关闭所有公共 producer / consumer 并消费其 `Result`，再关闭底层 `KvClient`。Endpoint `close()` 负责子通道、MQ runtime、keepalive 和后台任务的内部回收；不要访问 MQ 私有生命周期对象。见 [用户 - 4 - MQ 接口](<fluxon_doc_cn/user_doc/用户 - 4 - MQ接口.md#关闭生命周期>) 和 [User - 4 - MQ Interface](<fluxon_doc_en/user_doc/User - 4 - MQ Interface.md#shutdown-lifecycle>)。
+- MQ 关闭：用户和测试路径必须先关闭所有公共 producer / consumer 并消费其 `Result`，再关闭底层 `KvClient`。Endpoint `close()` 负责子通道、MQ runtime、keepalive 和后台任务的内部回收；不要访问 MQ 私有生命周期对象。Fluxon KV lease 的分配与 keepalive 必须留在原生 Rust 内，不得通过 Python 回调桥接。见 [用户 - 4 - MQ 接口](<fluxon_doc_cn/user_doc/用户 - 4 - MQ接口.md#关闭生命周期>) 和 [User - 4 - MQ Interface](<fluxon_doc_en/user_doc/User - 4 - MQ Interface.md#shutdown-lifecycle>)。

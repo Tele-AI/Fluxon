@@ -18,9 +18,7 @@ use fluxon_kv::client_kv_api::ClientKvApiViewTrait;
 use fluxon_kv::cluster_manager::ClusterManagerViewTrait;
 use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use fluxon_kv::config::{ClientConfigYaml, MasterConfigYaml};
-use fluxon_kv::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
-use fluxon_kv::p2p::msg_pack::{MsgPack, RPCCaller, call_rpc};
-use fluxon_kv::p2p::p2p_module::P2pModuleViewTrait;
+use fluxon_kv::p2p::msg_pack::{MsgPack, call_rpc};
 use fluxon_kv::p2p::p2p_module::{UserRpcHandler, user_rpc_register_handler};
 use fluxon_kv::rpcresp_kvresult_convert::msg_and_error::{
     ApiError as CoreApiError, KvError as CoreKvError, KvResult, OK,
@@ -39,7 +37,6 @@ use fluxon_util::run_async_from_sync::{SyncAsyncBridge, borrow_stable_owner};
 use fluxon_util::{
     FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
 };
-use futures::Future;
 use pyo3::exceptions::{
     PyKeyboardInterrupt, PyOSError, PyPermissionError, PyRuntimeError, PyValueError,
 };
@@ -72,7 +69,7 @@ mod mpsc; // Python ApiError constructors and MPSC error mapping
 pub use etcd::{PyEtcdKvClient, PyEtcdLock};
 pub use mpsc::{MpscConsumerHandle, MpscContext, MpscProducerHandle};
 mod lease_manager;
-pub use lease_manager::{LeaseManagerHandle, PyGeneralLease, PyLeaseBackendUid};
+pub use lease_manager::{LeaseManagerHandle, PyGeneralLease};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RdmavDriverEnvUpdate {
@@ -930,17 +927,66 @@ fn new_fluxon_fs_context(client: &KvClient) -> PyResult<FluxonFsContext> {
 struct FluxonMqContext {
     kv_framework: Arc<Framework>,
     runtime: tokio::runtime::Handle,
+    kv_lease_backend: fluxon_mq::lease_manager::LeaseBackendUid,
     mq_framework: fluxon_mq::Framework,
 }
 
-fn new_fluxon_mq_context(client: &KvClient) -> PyResult<FluxonMqContext> {
-    let kv_framework = require_kv_framework(client)?;
+struct FluxonKvLeaseContext {
+    backend: fluxon_mq::lease_manager::LeaseBackendUid,
+    runtime: tokio::runtime::Handle,
+}
+
+fn new_fluxon_kv_lease_context(client: &KvClient) -> PyResult<FluxonKvLeaseContext> {
+    let framework = require_kv_framework(client)?;
     let runtime = client
         .runtime
         .as_ref()
         .ok_or_else(|| PyRuntimeError::new_err("KvClient runtime is missing"))?
         .handle()
         .clone();
+    let cluster = client.config.cluster_name.clone();
+    let instance_key = client.config.instance_key.clone();
+
+    let allocate_framework = framework.clone();
+    let allocate: fluxon_mq::lease_manager::KvAllocateLease = Arc::new(move |ttl_seconds| {
+        let framework = allocate_framework.clone();
+        Box::pin(async move {
+            if ttl_seconds <= 0 {
+                anyhow::bail!("Fluxon KV lease TTL must be positive: {}", ttl_seconds);
+            }
+            framework
+                .kv_allocate_lease(ttl_seconds as u64)
+                .await
+                .map_err(|err| anyhow::anyhow!("Fluxon KV lease allocation failed: {}", err))
+        })
+    });
+
+    let keepalive_framework = framework;
+    let keepalive: fluxon_mq::lease_manager::KvKeepaliveLease = Arc::new(move |lease_id| {
+        let framework = keepalive_framework.clone();
+        Box::pin(async move {
+            framework
+                .kv_keepalive_lease(lease_id)
+                .await
+                .map_err(|err| anyhow::anyhow!("Fluxon KV lease keepalive failed: {}", err))
+        })
+    });
+
+    Ok(FluxonKvLeaseContext {
+        backend: fluxon_mq::lease_manager::LeaseBackendUid::kv_client(
+            cluster,
+            instance_key,
+            allocate,
+            keepalive,
+        ),
+        runtime,
+    })
+}
+
+fn new_fluxon_mq_context(client: &KvClient) -> PyResult<FluxonMqContext> {
+    let lease_context = new_fluxon_kv_lease_context(client)?;
+    let kv_framework = require_kv_framework(client)?;
+    let runtime = lease_context.runtime;
     let mq_framework: fluxon_mq::Framework = {
         let _guard = runtime.enter();
         fluxon_mq::new_mq_framework()
@@ -949,6 +995,7 @@ fn new_fluxon_mq_context(client: &KvClient) -> PyResult<FluxonMqContext> {
     Ok(FluxonMqContext {
         kv_framework,
         runtime,
+        kv_lease_backend: lease_context.backend,
         mq_framework,
     })
 }
@@ -4145,7 +4192,6 @@ fn fluxon_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEtcdKvClient>()?;
     m.add_class::<PyEtcdLock>()?;
     m.add_class::<PyGeneralLease>()?;
-    m.add_class::<PyLeaseBackendUid>()?;
     m.add_function(wrap_pyfunction!(run_master_blocking, m)?)?;
     m.add_function(wrap_pyfunction!(monitor_render_cli, m)?)?;
     m.add_function(wrap_pyfunction!(monitor_render_web, m)?)?;
@@ -4170,8 +4216,8 @@ mod tests {
         sanitize_bundled_ld_library_path_entries, set_authoritative_bundled_ld_library_path,
         validate_single_fluxon_pyo3_libs_root,
     };
-    use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
     use pyo3::Python;
+    use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};

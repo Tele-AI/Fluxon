@@ -5882,7 +5882,6 @@ def main():
     benchmark_node.coordinator_host = host_part
     benchmark_node.coordinator_port = port_val
     benchmark_node.instance_key = args.instance_key
-    delayed_process_cleanup = False
 
     try:
 
@@ -5962,11 +5961,9 @@ def main():
         if benchmark_node._forced_benchmark_result is not None:
             logger.error(
                 "❌ benchmark produced a forced failure result; "
-                "skip post-run cleanup delay and exit immediately so the invalid sample is reported upstream"
+                "close process-owned resources and exit so the invalid sample is reported upstream"
             )
             return 0
-
-        delayed_process_cleanup = True
 
     except KeyboardInterrupt:
         logger.warning("⚠️ 接收到中断信号，正在退出...")
@@ -5976,47 +5973,19 @@ def main():
         logger.debug("📍 异常详情:", exc_info=True)
         sys.exit(1)
     finally:
-        pending_round = benchmark_node._prepared_mpmc_round
-        if pending_round is not None:
-            benchmark_node._prepared_mpmc_round = None
-            benchmark_node._finish_mpmc_round(
-                round_state=pending_round,
-                reason="node_process_early_exit",
-            )
-        if not delayed_process_cleanup:
-            benchmark_node._close_kv_store(reason="node_process_early_exit")
-            benchmark_node._close_fluxon_phase_log_exporter()
-
-    # Wait 30 seconds before dropping KvClient, so underlying resources can finish cleanup/reporting.
-    logger.info("⏳ 析构 KVClient 前等待 30 秒…")
-    time.sleep(30)
-
-    # After 30 seconds, do a dummy PUT to ensure the client is still alive and resources were not released early.
-    try:
-        if benchmark_node.kv_store is not None and not benchmark_node._kv_store_closed:
-            dummy_key_prefix = benchmark_node.key_prefix or "benchmark"
-            dummy_key = f"{dummy_key_prefix}_dummy_shutdown_{int(time.time())}"
-            sampled_val_size = benchmark_node._resolve_kv_value_size(0, 0) if benchmark_node.test_config else 1024
-            val_size = min(int(sampled_val_size), 1024)
-            dummy_val = benchmark_node._generate_test_data(val_size)
-            dummy_deadline_ts = time.time() + 5.0
-            put_res = benchmark_node._put_single_operation(
-                dummy_key,
-                dummy_val,
-                inflight_at_start=0,
-                deadline_ts=dummy_deadline_ts,
-                ctx=f"node={benchmark_node.node_id} role=dummy thread=-1 op=-1",
-            )
-            logger.info(f"🧪 dummy PUT after sleep: success={put_res.success}, latency_us={put_res.latency_us:.0f}, key={dummy_key}")
-        else:
-            logger.warning("⚠️ dummy PUT 跳过：kv_store 不存在")
-    except Exception as e:
-        logger.error(f"❌ dummy PUT 执行失败: {e}")
-
-    # Explicitly close KvClient so lease-keepalive background tasks stop before interpreter exit,
-    # avoiding errors like "cannot schedule new futures after shutdown".
-    benchmark_node._close_kv_store(reason="node_process_exit")
-    benchmark_node._close_fluxon_phase_log_exporter()
+        try:
+            pending_round = benchmark_node._prepared_mpmc_round
+            if pending_round is not None:
+                benchmark_node._prepared_mpmc_round = None
+                benchmark_node._finish_mpmc_round(
+                    round_state=pending_round,
+                    reason="node_process_early_exit",
+                )
+        finally:
+            try:
+                benchmark_node._close_kv_store(reason="node_process_exit")
+            finally:
+                benchmark_node._close_fluxon_phase_log_exporter()
 
     end_time_main = time.time()
     total_duration_main = end_time_main - start_time_main

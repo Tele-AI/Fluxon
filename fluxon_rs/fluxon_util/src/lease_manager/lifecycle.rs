@@ -14,10 +14,10 @@ use anyhow::{Context, Result as AnyResult};
 use etcd_client::Client;
 
 use super::keepalive_actor::{
-    self, ensure_inner_running, ActorRegisterInvocation, EtcdState, LeaseKey, OneTtlKeepAliveInner,
+    self, ActorRegisterInvocation, EtcdState, LeaseKey, OneTtlKeepAliveInner, ensure_inner_running,
 };
 use super::lease_backend_handle::{LeaseBackendHandle, LeaseBackendInner};
-use super::lease_backend_uid::{LeaseBackendUid, LeaseRegisterKind, LeaseType};
+use super::lease_backend_uid::{KvKeepaliveLease, LeaseBackendUid, LeaseRegisterKind, LeaseType};
 use super::lease_handle::{GeneralLease, LeaseEntry, LeaseEntryKind};
 use crate::auto_clean_map::{AutoCleanMap, AutoCleanMapEntry};
 
@@ -96,19 +96,24 @@ fn backend_map() -> &'static AutoCleanMap<LeaseBackendUid, LeaseBackendInner> {
 /// Acquire a backend handle that carries the AutoCleanMapEntry guard.
 pub fn acquire_backend_handle(
     uid: LeaseBackendUid,
-    kv_cb: Option<Arc<dyn Fn(u64) -> AnyResult<()> + Send + Sync + 'static>>,
+    kv_keepalive: Option<KvKeepaliveLease>,
     etcd_client: Option<Client>,
     rt: tokio::runtime::Handle,
 ) -> LeaseBackendHandle {
     let entry: AutoCleanMapEntry<LeaseBackendUid, LeaseBackendInner> =
         backend_map().get_or_init(uid.clone(), || match &uid {
-            LeaseBackendUid::KvClientWithCallbacks { cluster, .. } => {
-                let cb = kv_cb.expect(
-                    "kvclient backend acquire requires keepalive callback on first creation",
+            LeaseBackendUid::KvClient {
+                cluster,
+                instance_key,
+                ..
+            } => {
+                let keepalive = kv_keepalive.expect(
+                    "kvclient backend acquire requires keepalive operation on first creation",
                 );
                 LeaseBackendInner::KvClient {
                     _cluster: cluster.clone(),
-                    keepalive_cb: cb,
+                    _instance_key: instance_key.clone(),
+                    keepalive,
                     rt: rt.clone(),
                 }
             }
@@ -157,8 +162,7 @@ pub fn registered_etcd_client(uid: &LeaseBackendUid) -> AnyResult<Client> {
 
 // ---------- Per-TTL Actor Map & Registration Helpers ----------
 
-// Rust-side keepalive callback type for KvClient entries.
-pub(crate) type OnKeepalive = Arc<dyn Fn(u64) -> AnyResult<()> + Send + Sync + 'static>;
+pub(crate) type OnKeepalive = KvKeepaliveLease;
 
 fn actor_map() -> &'static AutoCleanMap<i64, Arc<OneTtlKeepAliveInner>> {
     static MAP: OnceLock<AutoCleanMap<i64, Arc<OneTtlKeepAliveInner>>> = OnceLock::new();
@@ -178,12 +182,12 @@ pub(crate) fn actor_register_entry(
     rt: tokio::runtime::Handle,
 ) -> AutoCleanMapEntry<LeaseKey, LeaseEntry> {
     match inv {
-        ActorRegisterInvocation::KvClient { cb, .. } => {
+        ActorRegisterInvocation::KvClient { keepalive, .. } => {
             let registry = &(**actor_guard).registry;
             let (entry, created) = registry.get_or_init_with(key.clone(), || {
                 let handle = acquire_backend_handle(
                     key.backend_uid().clone(),
-                    Some(cb.clone()),
+                    Some(keepalive.clone()),
                     None,
                     rt.clone(),
                 );
@@ -471,8 +475,10 @@ pub async fn register_lease_for_keepalive(
         | LeaseRegisterKind::KvClientValidated { register_by } => match backend_uid.kind() {
             LeaseType::KvClient => {
                 record_register_by(lease_id, register_by.clone());
-                let cb = backend_uid.kv_keepalive_cb().ok_or_else(|| {
-                    anyhow::anyhow!("kvclient keepalive callback missing in LeaseBackendUid; construct kv backend via kv_client_with_callbacks()")
+                let keepalive = backend_uid.kv_keepalive().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Fluxon KV keepalive operation missing from KvClient lease backend"
+                    )
                 })?;
                 if skip_initial_kvclient_probe {
                     tracing::debug!(
@@ -487,15 +493,8 @@ pub async fn register_lease_for_keepalive(
                     const INITIAL_KVCLIENT_KEEPALIVE_RETRIES: usize = 3;
                     let mut last_err: Option<anyhow::Error> = None;
                     for attempt in 1..=INITIAL_KVCLIENT_KEEPALIVE_RETRIES {
-                        let res = limit_thirdparty::tokio::task::spawn_blocking({
-                            let cb = cb.clone();
-                            let lid = lease_id;
-                            move || (cb)(lid)
-                        })
-                        .await;
-
-                        match res {
-                            Ok(Ok(())) => {
+                        match (keepalive)(lease_id).await {
+                            Ok(()) => {
                                 if attempt > 1 {
                                     tracing::debug!(
                                         lease_id,
@@ -507,7 +506,7 @@ pub async fn register_lease_for_keepalive(
                                 last_err = None;
                                 break;
                             }
-                            Ok(Err(err)) => {
+                            Err(err) => {
                                 tracing::warn!(
                                     lease_id,
                                     attempt,
@@ -521,24 +520,6 @@ pub async fn register_lease_for_keepalive(
                                     err
                                 );
                                 last_err = Some(err);
-                            }
-                            Err(join_err) => {
-                                tracing::warn!(
-                                    lease_id,
-                                    attempt,
-                                    total = INITIAL_KVCLIENT_KEEPALIVE_RETRIES,
-                                    "spawn_blocking join failed for initial kvclient keepalive, will {}: {:?}",
-                                    if attempt < INITIAL_KVCLIENT_KEEPALIVE_RETRIES {
-                                        "retry"
-                                    } else {
-                                        "stop"
-                                    },
-                                    join_err
-                                );
-                                last_err = Some(anyhow::anyhow!(
-                                    "spawn_blocking join failed for initial keepalive: {:?}",
-                                    join_err
-                                ));
                             }
                         }
 
@@ -560,7 +541,7 @@ pub async fn register_lease_for_keepalive(
                     lease_id,
                     ttl_seconds,
                     ActorRegisterInvocation::KvClient {
-                        cb,
+                        keepalive,
                         label: Some(register_by),
                     },
                     rt,
@@ -590,16 +571,15 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
         let ttl_seconds = 120_000 + id as i64;
-        let backend_uid = LeaseBackendUid::kv_client_with_callbacks(
+        let backend_uid = LeaseBackendUid::kv_client(
             format!("lifecycle_test_cluster_{id}"),
-            Arc::new(|_| Ok(1)),
-            Arc::new(|_| Ok(())),
+            format!("lifecycle_test_client_{id}"),
+            Arc::new(|_| Box::pin(async { Ok(1) })),
+            Arc::new(|_| Box::pin(async { Ok(()) })),
         );
         let key = LeaseKey::new(backend_uid.clone(), id);
         let inv = ActorRegisterInvocation::KvClient {
-            cb: backend_uid
-                .kv_keepalive_cb()
-                .expect("kv keepalive callback"),
+            keepalive: backend_uid.kv_keepalive().expect("kv keepalive operation"),
             label: None,
         };
         let observed = Arc::new(AtomicBool::new(false));
@@ -627,13 +607,14 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let id = NEXT_TEST_ID.fetch_add(2, Ordering::SeqCst);
         let keepalive_calls = Arc::new(AtomicU64::new(0));
-        let calls_from_callback = keepalive_calls.clone();
-        let backend_uid = LeaseBackendUid::kv_client_with_callbacks(
+        let calls_from_operation = keepalive_calls.clone();
+        let backend_uid = LeaseBackendUid::kv_client(
             format!("validated_kvclient_test_cluster_{id}"),
-            Arc::new(|_| Ok(1)),
+            format!("validated_kvclient_test_client_{id}"),
+            Arc::new(|_| Box::pin(async { Ok(1) })),
             Arc::new(move |_| {
-                calls_from_callback.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                calls_from_operation.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
             }),
         );
 

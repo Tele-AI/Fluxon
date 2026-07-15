@@ -55,4 +55,4 @@ Keep this document concise.
 
 ## Component Contract Index
 
-- MQ shutdown: user and test paths close every public producer / consumer and consume its `Result` before closing the backing `KvClient`. Endpoint `close()` owns child-channel, MQ runtime, keepalive, and background-task teardown; do not access private MQ lifecycle objects. See [User - 4 - MQ Interface](<fluxon_doc_en/user_doc/User - 4 - MQ Interface.md#shutdown-lifecycle>) and [用户 - 4 - MQ 接口](<fluxon_doc_cn/user_doc/用户 - 4 - MQ接口.md#关闭生命周期>).
+- MQ shutdown: user and test paths close every public producer / consumer and consume its `Result` before closing the backing `KvClient`. Endpoint `close()` owns child-channel, MQ runtime, keepalive, and background-task teardown; do not access private MQ lifecycle objects. Fluxon KV lease allocation and keepalive stay in native Rust and must not bridge through Python callbacks. See [User - 4 - MQ Interface](<fluxon_doc_en/user_doc/User - 4 - MQ Interface.md#shutdown-lifecycle>) and [用户 - 4 - MQ 接口](<fluxon_doc_cn/user_doc/用户 - 4 - MQ接口.md#关闭生命周期>).

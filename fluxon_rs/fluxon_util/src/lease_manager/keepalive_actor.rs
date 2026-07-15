@@ -27,16 +27,9 @@ pub(crate) const KEEPALIVE_PER_TASK_BUDGET_MS: u64 = 1500;
 
 /// Per-lease error log rate limit period for keepalive failures.
 ///
-/// 设计说明：
-/// - 单个 lease 在底层 etcd/kvclient 出现持续错误时，如果每次 tick
-///   都直接按错误路径完整打日志，很容易在高 QPS 或大量 lease 场景下
-///   把错误日志刷爆，并放大下游异常信号。
-/// - keepalive actor 的职责是“汇聚并驱动后台心跳”，这里的错误日志只
-///   需要起到“该 lease 正处于异常态”的告警作用，而不需要在每一次
-///   重试上都打印完整堆栈。
-/// - 因此这里按 lease 维度做一个简单的限频：同一个 lease 在该时间窗
-///   内的 keepalive 错误（包括超时、etcd stream 异常以及回调返回 Err）
-///   只允许打一条错误/告警日志，避免重复噪音，占用过多 I/O。
+/// Persistent backend failures can otherwise emit one full error per lease on
+/// every tick. Rate limiting retains the unhealthy-lease signal without
+/// amplifying log I/O at large scale.
 const KEEPALIVE_ERROR_LOG_PERIOD_SECS: u64 = 30;
 const KEEPALIVE_ERROR_LOG_SKIP_FIRST: bool = false;
 const KEEPALIVE_ERROR_LOG_KEY_PREFIX: &str = "lease_keepalive_error:";
@@ -373,10 +366,8 @@ fn spawn_loop(rt: &tokio::runtime::Handle, inner: Arc<OneTtlKeepAliveInner>) {
             // Drive keepalive concurrently: spawn one task per lease and join them.
             // Any join failure is unexpected and should be treated as Unreachable.
             //
-            // IMPORTANT: bound the wait time for each keepalive task to avoid
-            // head-of-line blocking in this TTL bucket. If a task exceeds the
-            // budget, abort its join handle (the underlying work may still
-            // complete) and proceed to the next; the next tick will retry.
+            // Bound each keepalive task to avoid head-of-line blocking in this
+            // TTL bucket. Aborting drops the native async operation itself.
             let mut joins: Vec<(u64, tokio::task::JoinHandle<(u64, anyhow::Result<()>)>)> =
                 Vec::with_capacity(snapshot.len());
             for (key, handle) in snapshot.into_iter() {
@@ -468,15 +459,13 @@ pub(crate) async fn ensure_inner_running(
 
 // unified backend object table now lives in lease_backend_handle.rs
 
-// No global kvclient closure registries here. KvClient callbacks live
-// inside `LeaseBackendUid::KvClientWithCallbacks` and are cloned by
-// the lease manager or provided during backend acquire.
+// Native Fluxon KV lease operations live inside `LeaseBackendUid`.
 
 // ---------- actor register / unregister (KvClient & Etcd) ----------
 #[allow(clippy::large_enum_variant)]
 pub enum ActorRegisterInvocation {
     KvClient {
-        cb: OnKeepalive,
+        keepalive: OnKeepalive,
         label: Option<String>,
     },
     Etcd {

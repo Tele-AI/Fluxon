@@ -305,100 +305,28 @@ class ChanRole(Enum):
     CONSUMER = "consumer"
 
 
-def _ensure_kvclient_lease_backend(api: KvClient, cluster: str) -> Any:
-    """Ensure kvclient lease allocator/keepalive callbacks are registered and return backend uid.
+def _require_fluxon_raw_client(api: KvClient) -> Any:
+    """Return the live native client required by the Rust MQ implementation."""
 
-    The MQ layer injects kvclient allocate/keepalive capability into the unified
-    LeaseBackendUid abstraction. The underlying fluxon_util::lease_manager builds
-    a KvClient backend uid keyed by the cluster name.
-    """
-    from ..kvclient.kvclient_interface import KvLeaseApi
-    from fluxon_pyo3 import LeaseBackendUid as _PyLeaseBackendUid  # type: ignore[attr-defined]
-
-    if not isinstance(api, KvLeaseApi):
-        raise InvalidConfigurationError(
-            message="KvClient must implement KvLeaseApi for MPSC payload lease",
-        )
-
-    def allocate_cb(ttl_seconds: int) -> int:
-        """Bridge to KvLeaseApi.allocate_lease for the given TTL.
-
-        Rust expects this callback to either:
-          - return a valid positive lease id (int), or
-          - raise a Python Exception (derives from BaseException) to signal error.
-
-        Do NOT raise ApiError dataclasses here (they are not Exceptions) to
-        avoid PyErr(TypeError: exceptions must derive from BaseException).
-        """
-        res = api.allocate_lease(int(ttl_seconds))
-        if not res.is_ok():
-            # Raise a real Python Exception so PyO3 converts it to Err(...)
-            raise RuntimeError(
-                f"kvclient allocate_lease failed for cluster={cluster}: {res.unwrap_error()}"
-            )
-        lease_id = res.unwrap()
-        assert isinstance(lease_id, int) and lease_id > 0
-        return lease_id
-
-    def keepalive_cb(lease_id: int) -> None:
-        """Bridge to KvLeaseApi.keepalive_lease for the given lease id.
-
-        Rust expects a successful keepalive to return None (unit) and failures
-        to raise a Python Exception. Returning a custom Result object here will
-        cause type conversion errors in PyO3. See logs: "exceptions must derive
-        from BaseException" when raising non-Exception ApiError values.
-        """
-        # Keepalive must not alter TTL; do not pass custom_ttl
-        res = api.keepalive_lease(int(lease_id))
-        if not res.is_ok():
-            err = res.unwrap_error()
-            # When the client is shutting down, background keepalive calls can race with the
-            # P2P/framework shutdown and surface as a transient "SystemShutdown" network error.
-            # Treat it as a no-op so the lease manager can stop cleanly without poisoning the
-            # process exit code after successful workload completion.
-            if isinstance(err, NetworkError) and ("SystemShutdown" in str(err)):
-                return None
-            # Raise a real Python Exception so PyO3 converts it to Err(...)
-            raise RuntimeError(
-                f"kvclient keepalive_lease failed for cluster={cluster}: {err}"
-            )
-        # Success: consume Ok(None) to satisfy strict Result policy
-        _ = res.unwrap()
-        # Success path: return None explicitly to map to Rust ()
-        return None
-
-    # Inject kvclient allocate/keepalive callbacks while constructing LeaseBackendUid.
-    return _PyLeaseBackendUid.kv_client_with_callbacks(
-        cluster,
-        allocate_cb,
-        keepalive_cb,
-    )
-
-
+    if not isinstance(api, _fluxon_kv.FluxonKVCacheStore):
+        raise InvalidConfigurationError(message="MQ requires FluxonKVCacheStore")
+    raw = api._client
+    if raw is None:
+        raise InvalidConfigurationError(message="MQ requires an open FluxonKVCacheStore")
+    return raw
 
 
 class MpscContext:
-    """Python wrapper around Rust MpscContext with shared kv backend state."""
+    """Python wrapper around the Rust-owned MQ and KV lease context."""
 
     def __init__(self, api: KvClient) -> None:
-        cluster = api.get_cluster_name()
         etcd_endpoints: List[str] = api.get_etcd_config()
 
         self.api = api
-        self.cluster = cluster
         self.etcd_endpoints = etcd_endpoints
 
-        # Inject kvclient lease capability via LeaseBackendUid during construction.
-        self.kv_backend_uid = _ensure_kvclient_lease_backend(api, cluster)
-
-        # Underlying Rust context receives endpoints plus the kv backend uid
-        # that already carries kvclient allocate/keepalive callbacks.
-        raw = getattr(api, "_client", None)
-        if raw is None:
-            raise InvalidConfigurationError(
-                message="MPSC requires a fluxon-backed KvClient exposing `_client` (fluxon_pyo3.KvClient)",
-            )
-        self._inner = _RustMpscContext(etcd_endpoints, self.kv_backend_uid, raw)
+        raw = _require_fluxon_raw_client(api)
+        self._inner = _RustMpscContext(etcd_endpoints, raw)
 
     def new_producer(
         self,

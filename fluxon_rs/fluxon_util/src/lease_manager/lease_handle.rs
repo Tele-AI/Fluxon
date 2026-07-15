@@ -103,7 +103,7 @@ impl LeaseManager {
 
     /// Unified keepalive entrypoint: etcd leases go through the async keepalive
     /// pipeline; kvclient leases are registered into the same TTL actor with a
-    /// Rust callback carried by the backend uid.
+    /// native async operation carried by the backend uid.
     pub async fn register_lease_for_keepalive(
         &self,
         backend_uid: LeaseBackendUid,
@@ -116,11 +116,7 @@ impl LeaseManager {
             .await
     }
 
-    /// Allocate a kvclient lease id via the per-backend allocator closure
-    /// stored inside `LeaseBackendUid::KvClientWithCallbacks`.
-    ///
-    /// The callback may bridge into Python and block waiting for a result, so
-    /// we always isolate it in Tokio's blocking pool.
+    /// Allocate a Fluxon KV lease through the native async backend operation.
     pub async fn allocate_kvclient_lease(
         &self,
         backend_uid: LeaseBackendUid,
@@ -131,21 +127,13 @@ impl LeaseManager {
                 let cluster = backend_uid
                     .cluster()
                     .expect("kvclient backend missing cluster");
-                let cb = backend_uid.kv_allocate_cb().ok_or_else(|| {
+                let allocate = backend_uid.kv_allocate().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "kvclient allocate callback missing in LeaseBackendUid for cluster={}; construct kv backend via kv_client_with_callbacks()",
+                        "Fluxon KV allocate operation missing from lease backend for cluster={}",
                         cluster
                     )
                 })?;
-                match limit_thirdparty::tokio::task::spawn_blocking(move || cb(ttl_seconds)).await {
-                    Ok(Ok(id)) => Ok(id),
-                    Ok(Err(err)) => Err(err),
-                    Err(join_err) => Err(anyhow::anyhow!(
-                        "spawn_blocking join failed while allocating kvclient lease for cluster={}: {:?}",
-                        cluster,
-                        join_err
-                    )),
-                }
+                allocate(ttl_seconds).await
             }
             super::lease_backend_uid::LeaseType::Etcd => {
                 anyhow::bail!("allocate_kvclient_lease requires KvClient backend uid")

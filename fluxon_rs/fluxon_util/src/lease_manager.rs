@@ -5,7 +5,9 @@ mod lease_handle;
 mod lifecycle;
 
 pub use lease_backend_handle::LeaseBackendHandle;
-pub use lease_backend_uid::{LeaseBackendUid, LeaseRegisterKind, LeaseType};
+pub use lease_backend_uid::{
+    KvAllocateLease, KvKeepaliveLease, KvLeaseFuture, LeaseBackendUid, LeaseRegisterKind, LeaseType,
+};
 pub use lease_handle::GeneralLease;
 pub use lease_handle::{LeaseManager, GLOBAL_LM};
 pub use lifecycle::{

@@ -2,7 +2,6 @@ use pyo3::PyErr;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use fluxon_mq::MpscError as CoreMpscError;
 // Re-export the core MPSC error type for callers who want to depend on a single error hub.
 pub use fluxon_mq::MpscError as CoreMpscErrorReExport;
 

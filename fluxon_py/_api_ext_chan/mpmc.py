@@ -26,7 +26,7 @@ from .mpsc import (
     MPSCChanConsumer,
     ChanRole,
     _delete_owned_etcd_state,
-    _ensure_kvclient_lease_backend,
+    _require_fluxon_raw_client,
 )
 from ..api_error import (
     ApiFileNotFoundError as ExtFileNotFoundError,
@@ -544,9 +544,7 @@ class MPMCChannel(FactoryOnly):
                 "kv_api is required to obtain etcd endpoints; only KvClient config is allowed"
             )
         self._etcd_endpoints: List[str] = kv_api.get_etcd_config()
-        # Construct kvclient backend uid carrying allocate/keepalive callbacks (unified style)
-        cluster = kv_api.get_cluster_name()
-        self.kv_backend_uid = _ensure_kvclient_lease_backend(kv_api, cluster)
+        raw_kv_client = _require_fluxon_raw_client(kv_api)
 
         # Lease setup steps are split into closures for clarity.
 
@@ -587,8 +585,8 @@ class MPMCChannel(FactoryOnly):
             )
             try:
                 role_label = "producer" if role == ChanRole.PRODUCER else "consumer"
-                self._lm_kv_payload = self._lease_mgr.register_kvclient_lease_via_backend(
-                    self.kv_backend_uid,
+                self._lm_kv_payload = self._lease_mgr.register_kvclient_lease(
+                    raw_kv_client,
                     self.payload_lease_id,
                     int(chan_config["ttl_seconds"]),
                     register_by=f"mpmc_{role_label}_payload_lease:{mpmc_id}",

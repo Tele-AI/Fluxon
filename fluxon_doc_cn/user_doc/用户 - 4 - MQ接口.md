@@ -288,10 +288,10 @@ sequenceDiagram
 | 责任方 | 负责内容 |
 | --- | --- |
 | 用户 / 测试代码 | 调用公共 `producer.close()` / `consumer.close()`，检查返回的 `Result`，然后调用 `store.close()`。 |
-| MQ endpoint | 在 `close()` 内部停止收发路径，关闭所属子通道和 MQ runtime，并结束由该 endpoint 持有的 keepalive 与后台任务。 |
+| MQ endpoint | 在 `close()` 内部停止收发路径，关闭所属子通道和 MQ runtime，并结束由该 endpoint 持有的 keepalive 与后台任务。Fluxon KV lease keepalive 始终留在 Rust 生命周期内。 |
 | `KvClient` | 在 MQ endpoint 全部关闭后回收 KV client 资源。 |
 
-MQ endpoint 的内部生命周期对调用方不可见。用户代码、示例和测试都不应访问私有字段、原始 shutdown controller 或 MQ framework，也不应用等待、强制退出或静默丢弃 `close()` 的 `Result` 来代替上述两步。
+MQ endpoint 的内部生命周期对调用方不可见。用户代码、示例和测试都不应创建 lease manager 对象或 Python keepalive 回调，也不应访问私有字段、原始 shutdown controller 或 MQ framework。等待、强制退出或静默丢弃 `close()` 的 `Result` 都不能代替上述两步。
 
 ## MQ接口最小示例
 

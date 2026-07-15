@@ -125,11 +125,40 @@ Lease 生命周期拆成两类职责。keepalive contributor 持有真实 lease 
 | 角色 | 当前职责 | 关键对象 |
 | --- | --- | --- |
 | `LeaseManager` | 统一注册 etcd lease 和 KvClient lease keepalive；按 TTL 驱动后台 keepalive actor | `register_lease_for_keepalive`、`LeaseEntry` |
+| `LeaseBackendUid::KvClient` | 持有原生 Rust async allocate / keepalive operation；操作直接使用 Fluxon KV `Framework` | `KvAllocateLease`、`KvKeepaliveLease` |
 | `GeneralLease` | 面向 MQ / PyO3 的 RAII keepalive contributor 句柄；Drop 只释放本地 registry guard | `Etcd`、`KvClient` |
 | `ChanManager` | MPSC channel 的生命周期聚合点；持有 member、global、global-long、payload 四类真实 lease 句柄 | `member_lease`、`global_lease`、`global_long_lease`、`payload_lease` |
 | `MpscProducer` / `MpscConsumer` | 绑定成员 key，启动 watch、actor、monitor，发送或消费消息 | Rust `bind_mpsc` |
 | `MPMCChannel` | MPMC 外层控制面，管理 MPMC meta、成员、ready key、子 MPSC 列表，以及当前实例实际登记的 lease handle | Python `MPMCChannel` |
 | `ShutdownCtl` / `MqShutdownCtl` | 本地关闭信号；打断重试、预取、watch 和正在等待的操作 | Rust `ShutdownCtl`、Python `MqShutdownCtl` |
+
+### Fluxon KV lease 的语言边界
+
+**当前实现边界**：`MpscContext` 从底层 `KvClient` 取得 Rust `Arc<Framework>`，并按 `(cluster, instance_key)` 构造 `LeaseBackendUid::KvClient`。Lease actor 直接 await `KvClientTrait::kv_allocate_lease` / `kv_keepalive_lease`；超时取消会直接 drop 这条 Rust future。不同 `KvClient` 实例不会因为 `cluster` 同名而错误复用已关闭 `Framework` 的 operation。
+
+```mermaid
+sequenceDiagram
+    participant Py as Python MQ wrapper
+    participant Ctx as PyO3 MpscContext
+    participant LM as Rust LeaseManager
+    participant KV as Fluxon KV Framework
+
+    Py->>Ctx: construct with native KvClient
+    Ctx->>Ctx: derive native KvClient lease backend
+    Ctx->>LM: register lease backend and guard
+    loop TTL cadence
+        LM->>KV: await kv_keepalive_lease(lease_id)
+        KV-->>LM: Rust Result
+    end
+    Py->>Ctx: endpoint close()
+    Ctx->>LM: drop lease guards and stop later ticks
+```
+
+| 边界 | 规约 |
+| --- | --- |
+| Python 公共接口 | 只关闭 producer / consumer 并消费 `Result`；不创建 lease backend 或 keepalive callback。 |
+| PyO3 接入 | 只在构造 / 注册时提取原生 `KvClient`；不把 Python callable 交给 keepalive actor。 |
+| Rust actor | 直接 await Fluxon KV future；不得通过 Python thread pool 回调 KV wrapper。 |
 
 ## Lease 类型与生命周期
 
@@ -257,7 +286,7 @@ sequenceDiagram
 | 句柄 | 持有什么 | Drop 后果 |
 | --- | --- | --- |
 | `GeneralLease::Etcd` | `lease_id`、`LeaseBackendUid`、keepalive registry entry guard | 释放当前句柄的 guard；若这是最后一个真实句柄，registry entry 被移除，后续 tick 不再 keepalive；不会 revoke。 |
-| `GeneralLease::KvClient` | `lease_id`、`LeaseBackendUid`、keepalive registry entry guard | 释放当前句柄的 guard；若这是最后一个真实句柄，registry entry 被移除，后续 tick 不再调用 KvClient keepalive 回调。 |
+| `GeneralLease::KvClient` | `lease_id`、`LeaseBackendUid`、keepalive registry entry guard | 释放当前句柄的 guard；若这是最后一个真实句柄，registry entry 被移除，后续 tick 不再执行原生 KvClient keepalive operation。 |
 
 `GeneralLease` 不再表达 cleanup 权限。cleanup 权限由 MQ 对象的语义 owner 决定：
 
@@ -577,6 +606,7 @@ Contributor 范围必须按实际注册路径判断。当前 MPMC creator 持有
 
 | 路径 | 入口 / 类型 | 对应职责 |
 | --- | --- | --- |
+| `fluxon_rs/fluxon_util/src/lease_manager/lease_backend_uid.rs` | `LeaseBackendUid::KvClient`、`KvAllocateLease`、`KvKeepaliveLease` | 原生 async Fluxon KV lease backend 及其取消边界。 |
 | `fluxon_rs/fluxon_util/src/lease_manager/lease_handle.rs` | `GeneralLease`、`LeaseManager::register_lease_for_keepalive` | 通用 RAII handle 与注册入口。 |
 | `fluxon_rs/fluxon_util/src/lease_manager/lifecycle.rs` | `register_lease_for_keepalive`、`LeaseEntry::drop` | Registry 复用、首次 keepalive、最后一个 guard 释放后的本地注销。 |
 | `fluxon_rs/fluxon_mq/src/manager.rs` | `ChanGlobalMeta`、`ChanMemberMeta`、`ChanManager` | Channel meta、queue-scoped member identity 与四类 lease handle 的聚合对象。 |
@@ -584,7 +614,7 @@ Contributor 范围必须按实际注册路径判断。当前 MPMC creator 持有
 | `fluxon_rs/fluxon_mq/src/producer.rs` | `MpscProducer::bind_mpsc` | Producer membership、`external_client_id`、weight 与 lease 绑定。 |
 | `fluxon_rs/fluxon_mq/src/consumer.rs` | `MpscConsumer::bind_mpsc` | Consumer membership、`external_client_id`、ID allocator 与运行 actor。 |
 | `fluxon_rs/fluxon_mq/src/shutdown.rs` | `ShutdownCtl` | Rust actor 与等待操作的关闭信号。 |
-| `fluxon_rs/fluxon_pyo3/src/mpsc.rs` | `MpscContext::new_producer`、`new_consumer`、`close` | Python 到 Rust 的创建 / 绑定分支和 MQ framework 关闭。 |
+| `fluxon_rs/fluxon_pyo3/src/lib.rs`、`mpsc.rs` | `new_fluxon_kv_lease_context`、`MpscContext::new_producer`、`new_consumer`、`close` | 从原生 KV framework 构造 lease backend，承接 Python 到 Rust 的创建 / 绑定分支和 MQ framework 关闭。 |
 | `fluxon_py/_api_ext_chan/mpsc.py` | `MPSCChanProducer.close`、`MPSCChanConsumer.close`、`_close_owned_mpsc_context`、`_delete_owned_etcd_state` | 直接 MPSC / MPMC 子通道的统一关闭路径，以及 GC 关闭语义。 |
 | `fluxon_py/_api_ext_chan/mpmc.py` | `MPMCChannel.new_global_mpmc_channel`、`new_existed_global_mpmc_channel`、`MPMCChannel.close` | MPMC creator / attach、shared handle 选择、member 与 role 生命周期。 |
 | `fluxon_py/_api_ext_chan/mpmc.py` | `stable_delete_ready_keys_for_member`、`MPMCChanProducer.close`、`MPMCChanConsumer.close` | Ready key 重试删除与外层 MPMC 关闭顺序。 |

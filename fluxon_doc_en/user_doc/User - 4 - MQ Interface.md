@@ -106,10 +106,10 @@ The ownership boundary is:
 | Owner | Responsibility |
 | --- | --- |
 | Application / test | Call public `producer.close()` / `consumer.close()`, check its `Result`, then call `store.close()`. |
-| MQ endpoint | Within `close()`, stop send/receive paths, close owned subchannels and the MQ runtime, and finish endpoint-owned keepalive and background tasks. |
+| MQ endpoint | Within `close()`, stop send/receive paths, close owned subchannels and the MQ runtime, and finish endpoint-owned keepalive and background tasks. Fluxon KV lease keepalive remains inside the Rust lifecycle. |
 | `KvClient` | Release KV client resources after every MQ endpoint has closed. |
 
-The endpoint's internal lifecycle is not part of the caller-facing API. User code, examples, and tests must not access private fields, raw shutdown controllers, or the MQ framework. Sleeps, forced process exits, and silently discarded `close()` results are not substitutes for the two public close calls above.
+The endpoint's internal lifecycle is not part of the caller-facing API. User code, examples, and tests must not create lease-manager objects or Python keepalive callbacks, access private fields, raw shutdown controllers, or the MQ framework. Sleeps, forced process exits, and silently discarded `close()` results are not substitutes for the two public close calls above.
 
 ## Minimal MQ Example
 

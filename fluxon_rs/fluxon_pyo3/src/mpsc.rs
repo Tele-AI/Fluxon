@@ -4,29 +4,28 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel as cbchan;
+use fluxon_mq::DeleteResult as CoreDeleteResult;
 use fluxon_mq::consumer::{
     ConsumedPayload as CoreConsumedPayload, MqPayload as CoreMqPayload,
     PayloadResult as CorePayloadResult,
 };
-use fluxon_mq::DeleteResult as CoreDeleteResult;
 use fluxon_mq::{
-    create::{create_mpsc_channel, ChanCreateConfig},
     ChanManager, MpscConsumer as CoreMpscConsumer, MpscError as CoreMpscError,
     MpscProducer as CoreMpscProducer, ShutdownCtl,
+    create::{ChanCreateConfig, create_mpsc_channel},
 };
-use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyString};
 use pyo3::Py;
 use pyo3::PyErr;
+use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyBytes, PyString};
 use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
 // (no local payload buffering)
 
-use crate::flatdict_zerocopy::{decode_flat_dict_to_wrapped_py_object, FlatDictDataOwner};
-use crate::lease_manager::PyLeaseBackendUid;
+use crate::flatdict_zerocopy::{FlatDictDataOwner, decode_flat_dict_to_wrapped_py_object};
 use fluxon_kv::{Framework as KvFramework, KvClientTrait};
 use fluxon_mq::lease_manager::LeaseBackendUid;
-use fluxon_util::lease_manager::{LeaseManager, GLOBAL_LM};
+use fluxon_util::lease_manager::GLOBAL_LM;
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use tracing::{debug, warn};
 
@@ -147,8 +146,7 @@ fn finalize_payload_result(
 // (LeaseManagerHandle and PyLease moved to lease_manager.rs)
 
 /// Shared MPSC context bound to a specific etcd endpoint set.
-/// Holds only the endpoints; runtime and lease managers are
-/// singletons under the hood.
+/// Owns the native Fluxon KV lease backend used by all child endpoints.
 #[pyclass]
 pub struct MpscContext {
     endpoints: Vec<String>,
@@ -167,24 +165,21 @@ impl MpscContext {
         }
     }
 
-    /// Create a new MPSC context from etcd endpoints.
+    /// Create an MPSC context on the native KV client's runtime.
     ///
-    /// The runtime is created lazily on first use and shared
-    /// globally; `LeaseManager::for_endpoints` handles per-endpoint
-    /// singletons internally.
+    /// The context derives its lease backend directly from the client's Rust
+    /// framework; no Python callback participates in lease operations.
     #[new]
     fn new(
         py: Python<'_>,
         etcd_endpoints: Vec<String>,
-        kv_backend_uid: Py<PyLeaseBackendUid>,
         kv_client: Py<crate::KvClient>,
     ) -> PyResult<Self> {
-        let uid = kv_backend_uid.borrow(py).backend_uid().clone();
         let kv_client_ref = kv_client.borrow(py);
         let mq_context = crate::new_fluxon_mq_context(&kv_client_ref)?;
         Ok(Self {
             endpoints: etcd_endpoints,
-            kv_backend_uid: uid,
+            kv_backend_uid: mq_context.kv_lease_backend,
             kv_framework: mq_context.kv_framework.clone(),
             kv_runtime: mq_context.runtime.clone(),
             mq_framework: Some(mq_context.mq_framework.clone()),

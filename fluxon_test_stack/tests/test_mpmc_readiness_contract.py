@@ -612,6 +612,41 @@ class TestMPMCReadinessContract(unittest.TestCase):
         self.assertTrue(factory_keep_shared_arg("new_global_mpmc_channel"))
         self.assertFalse(factory_keep_shared_arg("new_existed_global_mpmc_channel"))
 
+    def test_fluxon_kv_lease_keepalive_stays_inside_rust(self) -> None:
+        pyo3_lease = Path("fluxon_rs/fluxon_pyo3/src/lease_manager.rs").read_text(
+            encoding="utf-8"
+        )
+        pyo3_mpsc = Path("fluxon_rs/fluxon_pyo3/src/mpsc.rs").read_text(
+            encoding="utf-8"
+        )
+        backend_handle = Path(
+            "fluxon_rs/fluxon_util/src/lease_manager/lease_backend_handle.rs"
+        ).read_text(encoding="utf-8")
+        python_mpsc = Path("fluxon_py/_api_ext_chan/mpsc.py").read_text(
+            encoding="utf-8"
+        )
+        python_mpmc = Path("fluxon_py/_api_ext_chan/mpmc.py").read_text(
+            encoding="utf-8"
+        )
+        benchmark_node = Path(
+            "fluxon_test_stack/distributed_benchmark_node.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("PyLeaseBackendUid", pyo3_lease)
+        self.assertNotIn("run_longtime_py_function", pyo3_lease)
+        self.assertNotIn("kv_backend_uid: Py<", pyo3_mpsc)
+        self.assertIn("(keepalive)(lease_id).await", backend_handle)
+        self.assertNotIn("_ensure_kvclient_lease_backend", python_mpsc)
+        self.assertNotIn("keepalive_cb", python_mpsc)
+        self.assertIn("_RustMpscContext(etcd_endpoints, raw)", python_mpsc)
+        self.assertIn("register_kvclient_lease(", python_mpmc)
+        self.assertNotIn("_dummy_shutdown_", benchmark_node)
+        self.assertNotIn("time.sleep(30)", benchmark_node)
+        self.assertIn("_finish_mpmc_round(", benchmark_node)
+        self.assertIn(
+            '_close_kv_store(reason="node_process_exit")', benchmark_node
+        )
+
     def test_mpmc_member_lease_is_allocated_after_shared_setup(self) -> None:
         source = Path("fluxon_py/_api_ext_chan/mpmc.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
