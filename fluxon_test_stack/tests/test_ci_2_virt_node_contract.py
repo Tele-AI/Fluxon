@@ -134,6 +134,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             "fluxon_test_stack/top_attention_test_index/_largescale_mq.py",
             large_job,
         )
+        self.assertIn("--owner-count 2", large_job)
         self.assertIn("--producer-count 160", large_job)
         self.assertIn("--consumer-count 8", large_job)
         self.assertIn("--metric-warmup-seconds 60", large_job)
