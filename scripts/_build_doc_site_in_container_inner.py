@@ -1636,9 +1636,6 @@ def rewrite_target_path(raw_target: str) -> str:
 
 
 def rewrite_variant_target_path(raw_target: str, *, language: str) -> str:
-    if language != "cn":
-        return rewrite_target_path(raw_target)
-
     unescaped_target = decode_markdown_target(raw_target)
     if (
         not unescaped_target
@@ -1653,6 +1650,19 @@ def rewrite_variant_target_path(raw_target: str, *, language: str) -> str:
 
     split = urllib.parse.urlsplit(unescaped_target)
     path_part = urllib.parse.unquote(split.path)
+    if path_part.startswith("../../pics/"):
+        # Source docs live one directory below the repository root. Quartz resolves
+        # staged page assets from the page route, so remove that repository-only hop.
+        rebuilt = urllib.parse.quote(path_part[len("../") :], safe="/.")
+        if split.query:
+            rebuilt += f"?{split.query}"
+        if split.fragment:
+            rebuilt += f"#{split.fragment}"
+        return rebuilt
+
+    if language != "cn":
+        return rewrite_target_path(raw_target)
+
     if path_part.endswith("README_CN.md"):
         normalized_path = normalize_readme_target_path(path_part)
         if normalized_path is not None:

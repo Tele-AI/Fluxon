@@ -10,6 +10,7 @@ use crate::cluster_manager::NodeIDString;
 use crate::cluster_manager::{
     META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME,
 };
+use crate::master_kv_router::msg_pack::GetSourceKind;
 use crate::memholder::ExternalMemHolderInfo;
 use crate::memholder::MemholderManagerTrait;
 use crate::memholder::NodeHolderKey;
@@ -340,7 +341,7 @@ impl HandlerForExternalClient for ClientKvApi {
         self.validate_requester_owner_status_updated(req.started_time)?;
 
         // dummy implementation, tmp owner user memholder for temporary holding to make self memholder
-        let (memholder, _) = match inner.get(&req.key).await? {
+        let (memholder, get_info) = match inner.get(&req.key).await? {
             Some(holder) => holder,
             None => {
                 return Ok(ExternalGetResp {
@@ -368,6 +369,9 @@ impl HandlerForExternalClient for ClientKvApi {
             offset: memholder.get_offset(),
             len: memholder.get_length() as u32,
             holder_id: memholder.holder_id(),
+            source_kind: get_info
+                .map(|info| info.source_kind())
+                .unwrap_or(GetSourceKind::Memory),
         };
         Ok(ExternalGetResp {
             external_memholder_info: Some(external_memholder_info),

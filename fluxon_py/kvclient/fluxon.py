@@ -283,6 +283,10 @@ class FluxonMemHolder(MemHolder):
             return Result.new_error(res.unwrap_error())
         return Result.new_ok(res.unwrap())
 
+    def _benchmark_source_kind(self) -> str:
+        """Return the storage source selected for this benchmark GET."""
+        return str(self._inner_holder._benchmark_source_kind())
+
     # release() intentionally omitted for now.
 
 

@@ -1,857 +1,696 @@
-# KV 设计 5 - SSD 存储
+# 将 Fluxon KV 扩展至 SSD 介质
 
-## 设计目标
+Fluxon KV 原本只有内存缓存层，可保留的数据规模受 DRAM 容量与成本约束。latent cache 需要足够大的缓存工作集才能覆盖更多复用请求，KV cache 也可以通过扩大缓存容量提高命中机会。为此，Fluxon KV 引入 owner 本地 SSD 作为内存层的下一级缓存，形成内存—SSD 多级缓存。
 
-SSD 存储在 Fluxon KV 中作为 owner 本地 backing tier 接入通用 KV 链路。它不是一套独立的读写 API，也不改变用户侧 `put/get/delete` 语义；master 仍然以 key-version 为单位维护路由，内存副本是第一数据源，SSD 副本是内存副本不可用时的回填数据源。
+用户继续调用 `put/get/delete`，`get` 仍返回 `MemHolder`。master 管理 key-version 级别的逻辑路由；SSD 文件 offset、`O_DIRECT` 对齐、`io_uring` 调度、ring 覆盖保护和 chunk pipeline 由 owner 管理。写入先提交内存副本，再异步进入 SSD；读取先检查内存副本，找不到时才进入 SSD 回填。
 
-读取侧采用“内存优先、SSD 回填”的设计。`GetStart` 优先选择 live 内存副本；没有可用内存副本时，master 才选择 SSD owner，并分配 SSD owner 本机 source staging 和 requester target。SSD owner 从本地 SSD 读入 source staging，再复用现有 transfer engine 把数据推到 requester target，最后继续使用原有 `GetDone` 和 `MemHolder` 生命周期。
+本文描述 SSD 介质层的读写、回填、观测和生命周期设计。具体 workload 下的容量收益、延迟和命中率变化需要单独测试，不能从介质接入本身直接推导。
 
-## 公共契约
+## 0. 背景：为什么扩展到 SSD
 
-公共配置只有一个 owner-only 字段：
+内存 KV 受 DRAM 容量与成本约束。latent cache 和 KV cache 都可能需要超过内存容量的缓存工作集；把较冷的 value 保留在 SSD，可以在内存副本驱逐后继续提供回填来源，并利用 SSD 容量与带宽扩大可命中的数据范围。
+
+这次扩展的目标包括：
+
+- **扩大有效容量**：让 owner 本地 SSD 承接一部分已经写入过的 value bytes，降低内存副本被驱逐后的 miss 代价。
+- **保持公共 API 不变**：external 和用户侧仍然只看 `MemHolder`，不暴露 SSD handler、文件路径或 offset。
+- **保护热路径**：只要 master 还能找到 live memory replica，`get` 就不会进入 SSD 分支。
+- **先接入通用能力**：当前重点是把 SSD 写入、读取回填、容量限制、驱逐、观测和失败清理接到统一 KV 生命周期里，并尽可能优化通用性能。
+- **避免持久化引擎侵入**：当前不做 WAL、checkpoint、冷启动扫描和跨进程恢复。
+
+这层 SSD 给内存副本不足的 key-version 提供 owner-local bytes source，承担运行期回填，不提供持久化数据库语义。
+
+## 1. 全景模型：Master 管 route，Owner 管介质
+
+SSD 不增加用户 API。master 维护 key-version 级别的逻辑 route；SSD 文件位置、读写队列、对齐和覆盖保护留在 owner 本地。
+
+SSD 挂在 owner 内部，作为已有 KV route 的补充副本。master 的 `OneKvNodesRoutes` 以 key-version 为中心组织路由，`node_replicas` 用一张 map 定位各 owner，entry 内的 `memory` 和 `ssd` 分别记录两层副本。两者共享 route 的 `put_id`，不能跨版本复用。
+
+先看全景图。它仍然是组件地图，但在关键边上标出主链路顺序：`1x` 是写入和 SSD commit，`2x` 是内存命中读取，`3x` 是 SSD 回填读取。
+
+```mermaid
+flowchart LR
+    user["external / user\nput / get / delete"]
+    requester["requester owner\nrequester target allocation\nfinal MemHolder owner"]
+    master["master\nkey-version route\ninflight put/get\nget_holding"]
+    memory_owner["memory owner\nnode_replicas.memory allocation"]
+    ssd_owner["SSD owner\nsource staging\nKvSsdStorage"]
+    ssd_media["owner-local SSD\nshard files\nring index"]
+
+    user -->|"1a put / 2a get public KV API"| requester
+    requester -->|"1b PutStart + PutDone\n2b / 3a GetStart"| master
+    master -->|"1c async SsdReplicaPersistReq"| ssd_owner
+    ssd_owner -->|"1d local persist / ring commit"| ssd_media
+    ssd_owner -->|"1e SsdReplicaCommit"| master
+    master -->|"2c Memory source: owner + allocation"| requester
+    requester -->|"2d transfer_data_no_copy(peer source)"| memory_owner
+    master -->|"3b SSD source: owner + len + stage plan"| requester
+    requester -->|"3c SsdStageReadReq(target address, get_id)"| ssd_owner
+    ssd_owner -->|"3d local read / pin / offset lookup"| ssd_media
+    ssd_owner -->|"3e transfer_data_no_copy(peer target) chunk push"| requester
+    ssd_owner -->|"3f GetDone after all chunks"| master
+```
+
+这张图里的边界可以压成一句话：master 回答“当前 key-version 哪个 owner 有可读副本”，owner 回答“这个副本在本地内存或 SSD 里怎样读”。具体到角色：
+
+| 角色 | 负责什么 | 不负责什么 |
+| --- | --- | --- |
+| master | 当前 key-version、`node_replicas`、in-flight 生命周期和 holder 注册。 | SSD shard、文件 offset、`O_DIRECT` 对齐和本地 IO 调度。 |
+| memory owner | 已提交内存副本的 allocation，作为 memory source。 | SSD 文件位置和 SSD read pin。 |
+| SSD owner | 本地 `KvSsdStorage`、source staging、shard 文件、ring index、reader/writer queue。 | 用户侧 API 和全局 key-version 判断。 |
+| requester owner | 本次 `get` 的 target allocation，成功后成为用户可见 `MemHolder`。 | 解析 SSD offset 或直接访问 SSD 文件。 |
+
+这里有一个重要取舍：master 不保存 SSD offset。收益是 route 极轻量，跨节点控制面不需要理解本地文件布局；代价是 owner 重启后，原 SSD bytes 没有冷恢复路径，master 里的 SSD route 也必须随节点 tomb 和路由清理失效。这正是本文反复强调“运行期介质层”的原因。
+
+master 的 SSD route 只记录“谁拥有当前 key-version 的 SSD 副本”和“真实 payload 长度”，不记录本地物理位置。
+
+## 2. 配置与观测：容量按介质分层可见
+
+SSD 不再引入单独的配置对象。公共配置只在已有 owner-only `large_file_paths` 旁增加一个同长度的 `large_limit_size` 数组：
 
 ```yaml
 fluxonkv_spec:
-  large_file_paths: [/data/fluxon_large]
-  ssd_storage:
-    max_bytes: 4294967296
+  large_file_paths: [/data/fluxon_large0, /data/fluxon_large1]
+  large_limit_size: ["4GB", "8GB"]
 ```
 
-规则：
+`large_limit_size` 缺省或为 `null` 时不启用 KV SSD。出现时必须和 `large_file_paths` 长度一致，每一项可以写整数 bytes，也可以写 `"512.9B"`、`"1.5GB"` 这类 size 字符串；`MB/GB` 按二进制单位解析，等价于 `MiB/GiB`，小数结果按 bytes 向下截断。解析后的值必须大于或等于 512 bytes，满足当前 `O_DIRECT` 对齐约束。zero-contribution external 不能声明 `large_limit_size`；external 启动时只继承 owner 暴露的共享 bundle 和运行时路径信息，不贡献 SSD 容量。
 
-- `ssd_storage` 缺省或为 `null` 时不启用 SSD。
-- `max_bytes` 必须大于或等于 512 bytes，满足当前 `O_DIRECT` 对齐约束。
-- zero-contribution external 禁止声明 `ssd_storage`；external 只能通过 owner 的 mmap、RPC 和 transfer surface 访问 SSD 回填结果。
-- 实际目录为每个可用 `large_file_root` 下的 `<cluster_name>_cluster_kv_ssd_storage/<safe_instance_key>/`；owner 启动时创建目录并读取 `metadata.dev()`，同一个 device 只保留第一个 root，避免多个路径指向同一块盘时制造虚假的 IO 并行度。
-- 用户侧 `put/get/delete` API 不因 SSD 增加新入口；SSD 副本是 master 路由内部能力。
+owner 初始化时不会读取单独的 SSD 路径参数。实际 SSD cache root 从每个可用 `large_file_paths` 派生：
 
-## 范围边界
+```text
+<large_file_root>/<cluster_name>_cluster_kv_ssd_storage/<safe_instance_key>/
+```
 
-| 范围 | 当前结论 |
+随后 owner 创建目录并读取 `metadata.dev()`。如果多个 path 指向同一个实际 device，只保留第一个 root。这个去重很关键：否则两个目录看似提供两条 IO 路径，实际落在同一块盘上，会让调度层误判并行度。
+
+`large_limit_size[i]` 只约束 `large_file_paths[i]` 派生出的 KV SSD cache root。当前这个容量不代表整块 SSD 的物理容量，也不约束日志、profile、FS disk cache 等其他大文件资产；它只限制 key-value payload 落入 KV SSD 介质层的 ring 用量。写入超过该 device root 的 ring 容量时，ring 会推进 tail 驱逐旧的 SSD entry；如果即将覆盖未完成写入或 active read pin，则本次写入等待空间释放。
+
+初始化完成后，`KvSsdStorage` 拿到一组有效 device root。每个有效 device 拥有独立的本地对象：
+
+| 本地对象 | 作用 |
 | --- | --- |
-| 分布式 SSD 读取 | 已接入。读取 key 时，master 仍优先选择可用内存副本；没有可用内存副本时，才选择持有 SSD 副本的 owner。磁盘数据先读到 SSD owner 本机的 source staging，再传到请求方 owner 的 target allocation。 |
-| owner 内部多 SSD 路径 | 已接入。owner 可通过多个 `large_file_paths` 使用多块本地 SSD；路径会先按实际 device 去重，只有落在不同 device 上的 SSD cache root 目录才会创建独立读写队列、`UringIoEngine` 和 shard 文件集。 |
-| 内存 KV 复用 | 已复用。SSD 回填继续走现有 KV transfer 链路：SSD owner 按 chunk 读出数据后，通过 `transfer_data_no_copy` 写到请求方 target；全部 chunk 完成后，SSD owner 向 master 提交 `get_done`，用户侧仍通过普通 `get` 拿到 `MemHolder`，不需要调用 SSD 专用接口。 |
-| SSD 写入 IO 模型 | 已接入。owner 完成内存 `PutDone` 后，再异步把同一份 payload 写入本地 SSD。SSD 写入在 `KvSsdStorage` 内完成，使用 shard ring、`O_DIRECT`、`io_uring`、有界队列和 `Writing -> Committed` 两阶段提交。 |
-| ring 位置生命周期 | 已接入。SSD 读写会保护正在使用的物理位置：读 IO 提交前会 pin 已提交的 entry；未完成写入的 `Writing` entry 和正在读取的 pinned entry 都不会被新的写入覆盖。 |
-| 大 payload direct stage | 已接入 aligned fast path 和 chunk pipeline。master 给 SSD source staging 多分配最多 511 bytes，并在 allocation 内返回 512-byte 对齐后的 `src_addr`；SSD read 按 chunk 对齐 IO 长度直接写入 staging，chunk ready 后立刻 transfer，`MemHolder` 仍只使用真实 payload 长度。 |
-| 冷启动恢复 | 当前不支持。owner 启动时不会扫描已有 SSD shard 来重建 master 路由；SSD 副本路由只来自本轮运行期间的 `put/get/delete` 生命周期。 |
-| lease key 专门治理 | 当前没有专用策略。带 lease 的 key 和普通 key 使用同一套 key-version 路由与 SSD 副本生命周期，SSD 层不单独维护 lease 过期扫描或清理规则。 |
-| 独立 SSD 路径参数 | 不提供。SSD cache 目录统一从 owner 的 `large_file_paths` 派生，不再增加单独的 SSD 路径配置，避免日志、共享 bundle、FS disk cache 和 KV SSD cache 出现多套路径来源。 |
+| shard 文件集合 | 存放 ring 分配出来的连续 SSD offset。 |
+| writer queue | 接收本 device 的写任务。 |
+| reader queue | 接收本 device 的读任务。 |
+| `UringIoEngine` | 提交本 device shard 文件上的 `read/write`；`Iovec` 模式只作为测试和对照路径保留。 |
 
-## 数据流
+每个有效 device root 的 `large_limit_size` 会被拆成本 device 的 shard 容量。`shard_to_device` 记录每个 shard 属于哪个 device，读路径用 committed entry 里的 `shard_id` 找回对应 reader queue。
 
-```mermaid
-flowchart TD
-    A["owner put target allocation"] --> B["write bytes into owner mmap"]
-    B --> G["owner -> master PutDone(memory_ready)"]
-    G --> H["master route: nodes_replicas"]
-    B --> C["async KvSsdStorage.persist_from_addr(key, put_id, addr, len)"]
-    C --> D["copy payload to 512-byte aligned buffer"]
-    D --> E["per-device writer queue"]
-    E --> E2["SsdRingBuffer 分配 shard_id + file_offset，记录 Writing entry"]
-    E2 --> E3["O_DIRECT + io_uring writev 写入 SSD shard 文件"]
-    E3 --> F["提交索引：Writing -> Committed"]
-    F --> I["owner -> master SsdReplicaCommit"]
-    I --> J["master route: ssd_replicas"]
+观测面也必须同步分层。过去 UI 只展示 memory segment 用量时，读者会自然把 KV 容量理解成一层内存池；接入 SSD 后，这个视角不够了。owner 需要分别上报 memory segment 和 KV SSD 的 capacity/used，UI 也要按资源类型展示，避免把 SSD 介质层的容量混进内存 segment。
 
-    J["get_start"] --> K{"live memory replica?"}
-    K -->|yes| L["return GetSourceKind::Memory"]
-    L --> M["existing transfer path"]
+当前观测面应至少能区分：
 
-    K -->|no| N{"live SSD replica?"}
-    N -->|yes| O["allocate source staging on SSD owner"]
-    O --> P["allocate target on requester"]
-    P --> Q["return GetSourceKind::Ssd"]
-    Q --> R0["SsdRingBuffer pin committed entry"]
-    R0 --> R1["根据 entry.shard_id 找到 device reader queue"]
-    R1 --> R["从 SSD shard 文件按 file_offset 读取 chunk"]
-    R --> S["SsdLoadedChunk(offset,len)"]
-    S --> W["SSD owner transfer chunk: staging+offset -> requester target+offset"]
-    W --> T["all chunks done: SSD owner -> master GetDoneReq"]
-    T --> V["SsdStageReadResp carries GetDoneResp fields"]
-
-    N -->|no| U["KeyNotFound"]
-```
-
-## 端到端调用时序
-
-SSD 路径只在两个位置扩展主链路：`put_done` 提交内存副本后，owner 异步把本地 target allocation 落到 SSD，并在完成后单独提交 SSD 副本；`get_start` 找不到可用内存副本时，master 为 SSD owner 分配 source staging，再由 SSD owner 按 chunk 把磁盘数据读入 staging 并 push 到 requester target。`get_done` 和 `MemHolder` 生命周期仍复用原有内存 KV 逻辑。SSD 回填时，最终 holder 对应的是请求方 owner 上的 target allocation；SSD owner 只负责从本地 SSD 读出数据、把全部 chunk 传到请求方 target，并在传输完成后向 master 调用 `GetDoneReq`。master 返回的 holder 字段会由 SSD owner 放入 `SsdStageReadResp` 带回请求方，请求方再用这些字段构造普通 `MemHolder`。
+| 资源类型 | 指标 | UI 展示意图 |
+| --- | --- | --- |
+| `memory_segment` | `kvcache_segment_capacity_bytes` / `kvcache_segment_used_bytes` | 展示 owner 可直接承载 `MemHolder` 的内存 segment 容量和占用。 |
+| `kv_ssd` | `kv_ssd_capacity_bytes` / `kv_ssd_used_bytes` | 展示 owner-local SSD 介质层的容量和 ring 已用空间。 |
 
 ```mermaid
 sequenceDiagram
-    participant C as requester owner
-    participant M as master
-    participant SO as SSD owner
-    participant TE as transfer engine
-    participant SSD as SSD shard files / SsdRingBuffer
-
-    C->>M: PutStartReq(key, len)
-    M-->>C: PutStartResp(target allocation)
-    Note over C: payload 写入 target allocation
-    C->>M: PutDoneReq(memory_ready)
-    Note right of M: nodes_replicas 写入内存副本\nkey-version 立即可读\nspawn post_put_ssd_replica_persist
-    M-->>C: PutDoneResp
-    M->>C: async SsdReplicaPersistReq(key, put_id, target_addr, len)
-    C->>SSD: KvSsdStorage.persist_from_addr(...)
-    Note over SSD: aligned buffer -> per-device writer queue\nSsdRingBuffer 分配 shard_id + file_offset\nO_DIRECT + io_uring writev 写入 SSD shard 文件\nWriting -> Committed
-    C->>M: SsdReplicaCommitReq(key, put_id, node_id, len)
-    Note right of M: ssd_replicas 写入 SSD 副本
-
-    C->>M: GetStartReq(key)
-    alt live memory replica exists
-        M-->>C: GetStartResp(source_kind=Memory, src_addr, target_addr)
-    else only SSD replica exists
-        Note right of M: 在 SSD owner CPU segment 分配 source_allocation\n在 requester CPU segment 分配 target allocation
-        M-->>C: GetStartResp(source_kind=Ssd, src_addr, target_addr, ssd_stage_len)
-        C->>SO: SsdStageReadReq(get_id, stage_addr=src_addr, stage_len=ssd_stage_len, target_node_id, target_addr, len)
-        SO->>SSD: load_into_addr_chunks(key, put_id, stage_addr, len, stage_len)
-        Note over SSD: SsdRingBuffer pin committed entry\n按 entry.shard_id 进入 device reader queue\n从 SSD shard 文件按 file_offset 读取 chunk
-        loop each ready chunk
-            SSD-->>SO: SsdLoadedChunk(offset, stage_addr+offset, chunk_len)
-            SO->>TE: transfer_data_no_copy(write, stage+offset -> target+offset, chunk_len)
-        end
-        SO->>M: GetDoneReq(get_id)
-        Note right of M: target allocation 进入 get_holding\nsource_allocation 释放
-        M-->>SO: GetDoneResp(holder_id for requester target)
-        SO-->>C: SsdStageReadResp(done_holder_id, done_allocation_mode)
-    end
-    opt source_kind=Memory
-        C->>TE: transfer_data_no_copy(read, src_addr -> target_addr, len)
-        C->>M: GetDoneReq(get_id)
-        Note right of M: target allocation 进入 get_holding
-        M-->>C: GetDoneResp(holder_id)
-    end
+    participant owner_mem_metric as owner_mem_metric allocator counters
+    participant owner_ssd_metric as owner_ssd_metric KvSsdStorage
+    participant owner_ssd_snapshot as owner_ssd_snapshot roots shards rings
+    participant prometheus as prometheus metrics store
+    participant kv_ui as kv_ui resource table
+    participant operator_view as operator_view capacity reader
+    owner_mem_metric->>prometheus: Export memory_segment capacity bytes and used bytes
+    owner_ssd_metric->>owner_ssd_snapshot: Collect local SSD roots shards and ring usage
+    owner_ssd_snapshot-->>owner_ssd_metric: Return kv_ssd capacity bytes and used bytes
+    owner_ssd_metric->>prometheus: Export kv_ssd metrics as a separate resource family
+    prometheus->>kv_ui: Return memory_segment and kv_ssd metrics to the UI
+    kv_ui->>operator_view: Render memory segment and KV SSD as separate rows
+    operator_view-->>kv_ui: SSD capacity is read as media capacity not DRAM holder capacity
 ```
 
+## 3. 写入：先内存可见，再异步进入 SSD
 
-## 接口里的角色分工
+`PutDoneReq` 只表示内存副本 ready。master 收到它之后，从 in-flight put 状态里拿到 target allocation，并把它写入对应 owner 的 `node_replicas[node_id].memory`。这一步成功后，key-version 已经可以被普通 `get` 命中。
 
-SSD 逻辑按接口看最清楚：`put` 先让一个 key-version 的内存副本 ready，再异步补交 SSD 副本；`get` 决定读请求先走内存副本还是 SSD fallback。每个接口里再分 master、owner、external 三个角色看状态归属。
+这里故意不等待 SSD。SSD persist 会受到本地盘延迟、`O_DIRECT` 对齐、writer queue 和 ring 空间影响；如果把这些因素塞进同步 `PutDone`，用户侧写入延迟会被 SSD 介质层拖住，内存 KV 的快路径也会被改写。
 
-### put
+因此 `PutDone` 后，master 只做两件事：
 
-```mermaid
-sequenceDiagram
-    participant E as external
-    participant O as owner
-    participant M as master
-    participant SSD as owner SSD store
+1. 把 target allocation 作为内存副本写入 `node_replicas[node_id].memory`。
+2. 如果 target owner 启用了 SSD，启动后台 SSD persist 请求。
 
-    E->>O: ExternalPutStartReq(key, len)
-    O->>M: PutStartReq(key, len)
-    Note right of M: 分配 put_id 和 src/target allocation\n记录 inflight_puts
-    M-->>O: PutStartResp(put_id, src_addr, target_addr)
-    O-->>E: ExternalPutStartResp(offsets, put_id)
+后台请求携带 `key`、`put_id`、`target_addr` 和 `len`。master 同时用一个 `Arc<Allocation>` 守住 target allocation，保证 owner 从内存复制 payload 到 SSD 前，这块内存不会被提前释放或复用。
 
-    Note over E,O: external 写 owner mmap/staging
-    E->>O: ExternalPutTransferEndReq(put_id)
-    O->>O: transfer_data_no_copy if remote target
-    O->>M: PutDoneReq(memory_ready)
-    Note right of M: 写 nodes_replicas\nkey-version 立即可读\nspawn post_put_ssd_replica_persist
-    M-->>O: PutDoneResp
-    O-->>E: ExternalPutTransferEndResp
-    M->>O: async SsdReplicaPersistReq(key, put_id, target_addr, len)
-    O->>SSD: persist_from_addr(key, put_id, target_addr, len)
-    Note over SSD: device write_tx -> per-device ssd_writer_loop -> io_uring writev\nWriting -> Committed
-    O->>M: SsdReplicaCommitReq(key, put_id, node_id, len)
-    Note right of M: 写 ssd_replicas
-```
+target owner 收到 SSD persist 请求后，进入 owner 本地 SSD 存储黑盒：复制 payload、处理对齐、分配 ring offset、提交本地 IO，并在成功后把本地 entry 标记为可读。第 6 节会展开这个黑盒里的 `aligned_len`、`Writing -> Committed`、read pin 和 `io_uring` 调度；本节只看 master 与 owner 的宏观协议。
 
-#### master
-
-master 持有 `put` 的权威控制面状态：`inflight_puts` 记录未完成写入，`kv_routes` 记录提交后的当前版本。当前实现里 `PutDoneReq` 只表示内存副本 ready；SSD 副本通过独立 `SsdReplicaCommitReq` 进入 route。
-
-当前协议结构如下。
+`OneKvNodesRoutes` 中与两层副本直接相关的结构如下，非关键字段用省略号隐藏：
 
 ```rust
-pub struct MasterKvRouterInner {
-    // PutStart 到 PutDone / PutRevoke 期间保留的 put 在途状态。
-    pub inflight_puts: moka::future::Cache<(String, u64, u32), InflightPutInfo>,
-    // 已提交 key-version 的权威路由表。
-    pub kv_routes: DashMap<String, Arc<OneKvNodesRoutes>>,
-    ...
-}
-
-pub struct InflightPutInfo {
-    // 放置策略最终选中的 target owner。
-    pub node_id: NodeID,
-    pub key: String,
-    // 发起这次 put 的原始请求节点。
-    pub req_node_id: NodeID,
-    pub len: u64,
-    // PutDone 前保留 source / target allocation，避免内存被提前释放。
-    pub src_target_allocation: Arc<Mutex<Option<InflightPutAllocation>>>,
-}
-
 pub struct OneKvNodesRoutes {
-    // 当前已提交 value 的稳定版本号。
-    pub put_id: PutIDForAKey,
-    // 内存副本路由；PutDone 成功后立即写入。
-    pub nodes_replicas: RwLock<HashMap<NodeID, KvRouteInfo>>,
-    // SSD 副本路由；只记录 owner 和长度，不保存本地文件 offset。
-    pub ssd_replicas: RwLock<HashMap<NodeID, KvSsdRouteInfo>>,
-    ...
+    pub put_id: PutIDForAKey, // Bind all replicas to one key version.
+    // ...
+    pub node_replicas: RwLock<HashMap<NodeID, KvNodeReplicas>>, // Index both cache layers by owner.
+    // ...
 }
 
-pub struct PutDoneReq {
-    pub key: String,
-    // 和当前 route 版本匹配时，才提交内存副本。
-    pub put_id: PutIDForAKey,
-    pub lease_id: Option<u64>,
+pub struct KvNodeReplicas {
+    pub tomb_tag: NodeTombTag,           // Track this owner incarnation once.
+    pub memory: Option<Arc<Allocation>>, // Hold the readable memory replica when present.
+    pub ssd: Option<KvSsdReplicaInfo>,   // Record the readable SSD replica when present.
 }
 
-pub struct SsdReplicaCommitReq {
-    pub key: String,
-    // SSD late commit 必须用这个版本号防止污染新 route。
-    pub put_id: PutIDForAKey,
-    // 完成 SSD persist 的 owner 节点。
-    pub node_id: NodeIDString,
-    // 真实 payload 长度；SSD 文件 offset 只保存在 owner 本地。
-    pub len: u64,
+pub struct KvSsdReplicaInfo {
+    pub len: u64, // Preserve the real payload length.
 }
 ```
 
-`PutStartReq` 到达 master 后，master 分配 `put_id` 和源/目标 allocation，并把 allocation 放进 `InflightPutInfo.src_target_allocation`。`PutDoneReq` 到达时，master 只把 target allocation 写入 `nodes_replicas`，此时 key-version 已经可被 `get` 命中。SSD owner 后续完成落盘后再发 `SsdReplicaCommitReq`，master 校验 `kv_routes[key].put_id == put_id` 后，把 `KvSsdRouteInfo { node_id, len, tomb_tag }` 写入同一个 `OneKvNodesRoutes.ssd_replicas`。master 不保存 SSD 文件 offset，也不保存 owner 本地 ring index。
-
-#### owner
-
-owner 持有数据面：本机 CPU segment、可选 SSD store、put transfer 和 SSD persist。当前实现里，SSD persist 发生在 master 收到 `PutDoneReq` 并提交内存路由之后，不能阻塞内存副本 ready。
-
-当前 owner 字段如下。
-
-```rust
-pub struct ClientKvApiInner {
-    // owner 本地可选 SSD cache；external 不直接持有它。
-    ssd_storage: Option<Arc<KvSsdStorage>>,
-    rpc_caller_put_start: RPCCaller<PutStartReq>,
-    rpc_caller_put_done: RPCCaller<PutDoneReq>,
-    rpc_caller_ssd_replica_commit: RPCCaller<SsdReplicaCommitReq>,
-    ...
-}
-
-pub struct SsdReplicaPersistReq {
-    pub key: String,
-    pub put_id: PutIDForAKey,
-    // 已经 PutDone 的内存 target 绝对地址，owner 从这里复制 payload 到 SSD。
-    pub target_addr: u64,
-    pub len: u64,
-}
-
-pub struct KvSsdStorage {
-    // 按 device 去重后的 SSD cache root 目录。
-    root_dirs: Vec<PathBuf>,
-    // 每个有效 device 对应一个读写 worker。
-    devices: Vec<SsdDeviceWorker>,
-    // shard_id 到 device worker 的映射，读路径按它选择 reader queue。
-    shard_to_device: Vec<usize>,
-    // 写入按有效 device 做 round-robin。
-    next_write_device: AtomicUsize,
-    // 全部 shard ring 和 key-version 索引的共享状态。
-    inner: Arc<Mutex<KvSsdStorageInner>>,
-    // ring 空间被 active IO 占住时，用它通知 writer 重试。
-    space_notify: Arc<Notify>,
-}
-
-struct SsdDeviceWorker {
-    // Linux metadata.dev() 得到的实际 device 标识。
-    device_id: u64,
-    root_dir: PathBuf,
-    // 这个 device 负责的 shard 文件编号。
-    shard_ids: Vec<usize>,
-    // 持有 shard 文件 fd，保证 uring IO 生命周期内 fd 有效。
-    _files: Vec<std::fs::File>,
-    // 这个 device 独立的 io_uring engine。
-    _io: Arc<UringIoEngine>,
-    // per-device 写队列。
-    write_tx: tokio_mpsc::Sender<WriteCommand>,
-    // per-device 读队列。
-    read_tx: tokio_mpsc::Sender<ReadCommand>,
-}
-
-struct KvSsdStorageInner {
-    // 管理各 shard 文件内的环形 offset 空间和 key-version 索引。
-    ring: SsdRingBuffer,
-}
-```
-
-当 master 把这次 put 的最终 target allocation 放在某个 owner 上时，这个 owner 就是该 key-version 的内存副本 owner。`PutDoneReq` 只把这个 target allocation 提交到 `nodes_replicas`；提交完成后，这个 key-version 已经可以被普通 `get` 读到。SSD 落盘不在 `PutDoneReq` 的同步路径里；master 会在后台 task 中向同一个 target owner 发送 `SsdReplicaPersistReq { key, put_id, target_addr, len }`。这个后台 task 会继续持有 target allocation 的 `Arc<Allocation>`，保证 owner 从内存复制 payload 到 SSD 之前，这块内存不会被释放或复用。
-
-target owner 收到 `SsdReplicaPersistReq` 后，从 `target_addr` 指向的内存 target 复制完整 payload，并构造 512-byte 对齐的 `AlignedBuffer`。随后 `persist_buffer` 按 value 级别通过 `next_write_device` round-robin 选择一个有效 device 的 `write_tx`；当前实现不会把同一个 payload 拆到多个 device。该 device 的 `ssd_writer_loop` 只在自己的 `shard_ids` 中选择一个 shard，由 `SsdRingBuffer::prepare_write_on_shards(...)` 为整个 aligned payload 分配一段连续 `file_offset`，并先记录 `Writing(SsdIndexEntry)`。对应 device 的 `UringIoEngine` 对这个 shard 文件执行 `O_DIRECT + writev`；写入成功后，entry 才从 `Writing` 提交为 `Committed`。最后 owner 向 master 发送 `SsdReplicaCommitReq`；master 校验请求里的 `put_id` 与当前内存 route 的 `put_id` 相同后，才会把这个 key-version 的 SSD 副本补充进 `ssd_replicas`。写队列和底层 uring 队列都是有界队列；如果 SSD 变慢，背压只停在 owner 本地 SSD persist 路径，不会回头改变已经完成的内存 `PutDone` 语义。
-
-#### external
-
-external 的状态边界只到 owner mmap 写入：它保存本次 put 所需的 `key`、`len`、`put_id` 和 mmap offset。SSD route 由 master 管理，SSD 文件位置由 target owner 本地 `SsdRingBuffer` 管理，external 不保存也不更新这些状态。
-
-```rust
-pub struct ExternalPutStartReq {
-    pub key: String,
-    pub len: u64,
-    // 透传给 master PutStart，用于拒绝同 key 并发 put。
-    pub reject_if_inflight_same_key: bool,
-    // 透传给 master 放置策略，影响 target owner 选择。
-    pub preferred_sub_cluster: Option<String>,
-    // owner 代际校验，防止旧 external 请求提交到新 owner。
-    pub started_time: i64,
-    pub test_observe_put_phases: bool,
-}
-
-pub struct ExternalPutTransferEndReq {
-    pub key: String,
-    pub len: u64,
-    // external 实际写入的 owner mmap offset；远端 target 时它是本地 staging。
-    pub src_offset: u64,
-    // 本地 target 时等于最终 target；远端 target 时由 owner 内部上下文修正。
-    pub target_offset: u64,
-    // 远端 target owner；本地 target 时为空。
-    pub peer_id: Option<String>,
-    // 远端 target owner 的 base addr；本地 target 时为空。
-    pub target_base_addr: Option<u64>,
-    // ExternalPutStart 返回的版本号，TransferEnd 用它完成 PutDone。
-    pub put_id: Option<PutIDForAKey>,
-    pub lease_id: Option<u64>,
-    pub started_time: i64,
-    pub test_observe_put_phases: bool,
-}
-```
-
-external put 仍然是 `ExternalPutStart -> 写 owner mmap -> ExternalPutTransferEnd`。`ExternalPutTransferEndResp` 只代表内存提交完成；SSD 是否启用、何时 persist 成功、何时写入 `ssd_replicas` 都由 owner 和 master 的内部 commit 协议决定。external 只通过 `started_time` 做 owner 代际校验，避免把旧代际请求提交给新 owner。
-
-### get
+`memory` 和 `ssd` 独立更新。内存驱逐只把 `memory` 设为 `None`，SSD 读失败后的清理只把 `ssd` 设为 `None`；两者都为空时删除整个 node entry。`tomb_tag` 标识 map key 对应的节点实例：节点离开或重启时旧 tag 会变为 tomb，新实例使用新的 tag，因此每个 owner 只需保存一份当前实例标记。
 
 ```mermaid
 sequenceDiagram
-    participant E as external
-    participant RO as requester owner
-    participant M as master
-    participant SO as SSD owner
-    participant TE as transfer engine
-    participant SSD as owner SSD store
-
-    E->>RO: ExternalGetReq(key)
-    RO->>M: GetStartReq(key)
-    alt memory replica exists
-        M-->>RO: GetStartResp(source_kind=Memory)
-    else SSD fallback
-        Note right of M: 在 SSD owner 分配 source_allocation\n在 requester owner 分配 target allocation\n写 inflight_gets
-        M-->>RO: GetStartResp(source_kind=Ssd, src_addr, target_addr, ssd_stage_len)
-        RO->>SO: SsdStageReadReq(get_id, stage_addr=src_addr, stage_len=ssd_stage_len, target_node_id, target_addr, len)
-        SO->>SSD: load_into_addr_chunks(key, put_id, stage_addr, len, stage_len)
-        Note over SSD: pin committed entry\nproducer 按 chunk readv direct 或 scratch fallback
-        loop each ready chunk
-            SSD-->>SO: SsdLoadedChunk(offset, stage_addr+offset, chunk_len)
-            SO->>TE: transfer_data_no_copy(write, stage+offset -> target+offset, chunk_len)
-        end
-        SO->>M: GetDoneReq(get_id)
-        Note right of M: requester target allocation -> get_holding\nsource_allocation 释放
-        M-->>SO: GetDoneResp(holder_id for requester target)
-        SO-->>RO: SsdStageReadResp(done_holder_id, done_allocation_mode)
-    end
-    opt source_kind=Memory
-        RO->>RO: transfer_data_no_copy(read, src_addr -> target_addr, len)
-        RO->>M: GetDoneReq(get_id)
-        Note right of M: target allocation -> get_holding
-        M-->>RO: GetDoneResp(holder_id)
-    end
-    RO-->>E: ExternalGetResp(ExternalMemHolderInfo)
+    participant master_route as master_route OneKvNodesRoutes
+    participant node_replicas as node_replicas NodeID to KvNodeReplicas
+    participant owner_target as owner_target memory allocation
+    participant owner_ssd_store as owner_ssd_store local persist black box
+    owner_target->>master_route: PutDoneReq reports that memory payload is ready
+    master_route->>node_replicas: Set memory to target allocation and retain tomb_tag
+    node_replicas-->>master_route: Memory replica becomes visible for get
+    master_route-->>owner_target: PutDoneResp confirms memory visibility
+    master_route->>owner_target: SsdReplicaPersistReq carries true payload len
+    owner_target->>owner_ssd_store: Persist payload under the same key and put_id
+    owner_ssd_store-->>owner_target: Local SSD entry is committed and readable
+    owner_target->>master_route: SsdReplicaCommitReq publishes owner and true len
+    master_route->>node_replicas: Validate memory and set ssd to committed metadata
+    node_replicas-->>master_route: SSD replica becomes visible for fallback
 ```
 
-#### master
+owner 本地 SSD 写成功后，还不能直接成为可读副本。owner 需要向 master 提交 `SsdReplicaCommitReq`，把 `key`、`put_id`、`node_id` 和真实 `len` 写回控制面。
 
-master 是 `get` 的控制面 authority：`kv_routes` 决定当前 key-version 可以从哪些内存或 SSD 副本读取，`inflight_gets` 记录本次 get 的 source/target allocation，`get_holding` 记录 `GetDone` 后仍被 holder 持有的 requester target allocation。
+master 的校验链保持有界：
+
+1. 如果 `kv_routes` 里已经没有这个 key，忽略 commit。
+2. 如果当前 route 的 `put_id` 和请求里的 `put_id` 不一致，忽略 commit。
+3. 如果这个 owner 已经没有对应内存副本，忽略 commit。
+4. 如果 owner 的 tomb tag 已经失效，忽略 commit。
+5. 全部通过后，把 `KvSsdReplicaInfo { len }` 写入对应 entry 的 `ssd`。
+
+第 2 条是 late commit 的安全阀。SSD persist 可能晚于同 key 的后续覆盖写，`put_id` 校验保证旧版本 SSD 数据不会污染新版本 route，也不会 resurrect 已经被删除或覆盖的对象。
+
+## 4. 读取：内存优先，SSD 只做回填
+
+读路径从 `GetStartReq` 开始。master 读取 `node_replicas` 快照，先从 `memory` 为 `Some` 的 entry 中随机选择一个非 tomb 副本。命中时返回 `GetSourceKind::Memory`，同时给 requester owner 准备 target allocation。
+
+这里保留原来的内存读优化：如果 requester owner 本身已经持有内存副本，可以复用本地 replica allocation；否则 master 分配新的 requester target，并根据 durable slot 决定后续是否能提升为 durable replica。
+
+只要内存副本存在，SSD 分支完全不会执行。这保证了 SSD 介质层不干扰热路径：热 key、近端副本和已有内存副本仍然走原有 transfer 和 `GetDone`。
+
+进入 SSD 回填前，先明确两块核心内存的生命周期：
+
+| 名称 | 归属 | 用途 | 生命周期 |
+| --- | --- | --- | --- |
+| source staging | SSD owner | 只服务本次读盘和 chunk push。 | `GetDone`、`GetRevoke` 或 in-flight 超时后释放。 |
+| requester target | requester owner | 承接最终 payload bytes。 | 成功后进入 `get_holding`，成为用户可见 `MemHolder`。 |
+
+当 master 没有找到可用内存副本时，才从同一快照选择 `ssd` 为 `Some` 的 entry。选择 live SSD replica 后，master 就按上表分配 source staging 和 requester target。
+
+source staging 的长度按 SSD read 对齐要求计算。master 先计算 `ssd_stage_len = align_ssd_io_len(len)`，再额外多申请 `SSD_ALIGNMENT - 1` bytes。这样即使 allocation 起始地址不对齐，也能在 allocation 内找到一个 512-byte 对齐的 `src_addr`。
+
+`GetStartResp` 返回给 requester 的 `src_addr` 是对齐后的 SSD owner staging 地址，`target_addr` 是 requester owner target 地址，`ssd_stage_len` 是可用于 direct read 的对齐容量，`len` 仍然是真实 payload 长度。
+
+master 同时把这次 get 写入 `inflight_gets`。SSD source 路径里的 `InflightGetInfo.source_allocation` 保存 source staging allocation；最终 `GetDone` 只把 requester target allocation 放进 `get_holding`。
+
+master 侧和 allocation 相关的字段可以压缩成下面这个生命周期骨架：
 
 ```rust
-pub struct MasterKvRouterInner {
-    // GetStart 到 GetDone / GetRevoke 期间保留的 get 在途状态。
-    pub inflight_gets: moka::future::Cache<u64, InflightGetInfo>,
-    // GetDone 后的 holder authority，键由 requester 节点和 holder_id 组成。
-    pub get_holding: MasterOwnerMemMgr,
-    // get_start 查询的当前稳定 key-version 路由。
-    pub kv_routes: DashMap<String, Arc<OneKvNodesRoutes>>,
-    ...
-}
-
-pub struct OneKvNodesRoutes {
-    // 当前稳定版本号，内存副本和 SSD 副本共享它。
-    pub put_id: PutIDForAKey,
-    // 内存副本优先作为 get source。
-    pub nodes_replicas: RwLock<HashMap<NodeID, KvRouteInfo>>,
-    // 内存副本不可用时才作为 SSD fallback source。
-    pub ssd_replicas: RwLock<HashMap<NodeID, KvSsdRouteInfo>>,
-    pub get_durable_slots_used: AtomicU32,
-}
-
-pub struct KvSsdRouteInfo {
-    // 持有本地 SSD 副本的 owner。
-    pub node_id: NodeID,
-    // 真实 payload 长度；SSD stage 和 transfer 对外只暴露这个长度。
-    pub len: u64,
-    // 和内存 route 对齐的节点代际，用于失效判断。
-    pub tomb_tag: NodeTombTag,
-}
-
 pub struct InflightGetInfo {
-    // 本次 get 命中的 key-version，用于拒绝过期完成。
-    pub put_id: PutIDForAKey,
-    // master 选中的 source 节点；SSD fallback 时是 SSD owner。
-    pub src_node_id: NodeID,
-    // 发起 get 的 requester owner，最终 holder 归属使用它。
-    pub req_node_id: NodeID,
-    pub len: u64,
-    // requester target allocation，GetDone 后进入 get_holding。
-    pub allocation: Arc<Allocation>,
-    // SSD source staging allocation；memory source 路径为空。
-    pub source_allocation: Option<Arc<Allocation>>,
-    pub route: Arc<OneKvNodesRoutes>,
-    pub allocation_mode: GetAllocationMode,
-    // 区分 memory source 和 SSD fallback source。
-    pub source_kind: GetSourceKind,
+    pub put_id: PutIDForAKey,                    // Guard the key version across the get.
+    pub src_node_id: NodeID,                     // Identify the selected memory or SSD source.
+    pub key: String,                             // Keep the logical key for completion and cleanup.
+    pub req_node_id: NodeID,                     // Identify the requester that owns the final holder.
+    pub len: u64,                                // Preserve the real payload length.
+    pub allocation: Arc<Allocation>,             // Hold the requester target until GetDone.
+    pub source_allocation: Option<Arc<Allocation>>, // Hold SSD staging only for SSD fallback.
+    pub route: Arc<OneKvNodesRoutes>,             // Keep the route alive and release its durable slot.
+    pub allocation_mode: GetAllocationMode,       // Decide whether GetDone may add a memory replica.
+    pub source_kind: GetSourceKind,               // Distinguish the memory and SSD cleanup paths.
 }
 ```
 
-master 处理 `GetStartReq` 时先查 `kv_routes`，并优先选择 live 内存副本。命中内存副本时，`GetStartResp` 返回 `GetSourceKind::Memory`，requester owner 按原有 transfer 路径把数据搬到 requester target。只有没有可用内存副本时，master 才从 `ssd_replicas` 里选择 SSD owner，并同时分配两块 allocation：`source_allocation` 位于 SSD owner，用作本地读盘 staging；`allocation` 位于 requester owner，是最终进入 holder 的 target。`GetStartResp.src_addr` 是 SSD owner 本地对齐后的 staging 地址，`target_addr` 是 requester target 地址，`ssd_stage_len` 是对齐后的 source staging 容量，`len` 始终是真实 payload 长度。
+这些字段和 route 的关系是：
 
-`GetDoneReq` 到达后，master 从 `inflight_gets` 取出本次 get，把 requester target allocation 转入 `get_holding`，并返回 `holder_id`。memory source 路径由 requester owner 调用 `GetDoneReq`；SSD source 路径由 SSD owner 在全部 chunk transfer 完成后调用。无论谁发起 `GetDoneReq`，holder 都归属 `InflightGetInfo.req_node_id` 对应的 requester owner，SSD owner 的 `source_allocation` 只作为读盘 staging，不进入 `get_holding`。
-
-#### owner
-
-owner 在 `get` 里有两个可能角色：requester owner 负责调用 master，并根据 `GetSourceKind` 选择 memory transfer 或 SSD stage RPC；SSD owner 负责响应 `SsdStageReadReq`，读取本地 SSD，把读出的 bytes 按 chunk push 到 requester target，并在全部 chunk transfer 完成后向 master 发送 `GetDoneReq`。
-
-```rust
-pub struct ClientKvApiInner {
-    // requester owner 和 SSD owner 都通过它访问本地 SSD cache。
-    ssd_storage: Option<Arc<KvSsdStorage>>,
-    // external get 返回的 holder 在 owner 侧的借用表。
-    pub external_get_holding: OwnerExternalMemMgr,
-    rpc_caller_get_start: RPCCaller<GetStartReq>,
-    rpc_caller_get_done: RPCCaller<GetDoneReq>,
-    rpc_caller_ssd_stage_read: RPCCaller<SsdStageReadReq>,
-    ...
-}
-
-pub struct SsdStageReadReq {
-    pub key: String,
-    pub put_id: PutIDForAKey,
-    // SSD owner 用它在全部 chunk transfer 完成后调用 master GetDoneReq。
-    pub get_id: u64,
-    // master 在 SSD owner 上分配的 source staging 对齐地址。
-    pub stage_addr: u64,
-    // source staging 容量，包含 O_DIRECT 对齐需要的空间。
-    pub stage_len: u64,
-    // 最终接收数据的 requester owner。
-    pub target_node_id: NodeIDString,
-    // requester target allocation 的绝对地址。
-    pub target_addr: u64,
-    // 真实 payload 长度。
-    pub len: u64,
-}
-
-pub struct SsdStageReadResp {
-    // master GetDoneResp 的 holder_id 投影。
-    pub done_holder_id: u64,
-    // master GetDoneResp 的 allocation_mode 投影。
-    pub done_allocation_mode: GetAllocationMode,
-    // master GetDoneResp 的状态字段投影。
-    pub done_error_code: ErrorCode,
-    pub done_error_json: String,
-    pub done_server_process_us: i64,
-    // SsdStageRead RPC 自身的状态字段。
-    pub error_code: ErrorCode,
-    pub error_json: String,
-}
-```
-
-requester owner 收到 `GetSourceKind::Memory` 时，继续走原有内存 transfer：从 `src_addr` 读，把数据写到 `target_addr`，传输完成后由 requester owner 自己调用 master `GetDoneReq`。收到 `GetSourceKind::Ssd` 时，requester owner 不自己读 SSD，也不自己调用 `get_done`；它向 SSD owner 发起 `SsdStageReadReq`，等待 `SsdStageReadResp` 带回 master `GetDoneResp` 的 holder 字段。
-
-SSD owner 收到 `SsdStageReadReq` 后，在本地执行 `load_and_push_kv_from_ssd(...)`。read producer 先 pin 当前 committed entry，再按 chunk 从 SSD shard 文件读到 `stage_addr + offset`；transfer consumer 每收到一个 `SsdLoadedChunk`，就把 `stage_addr + offset` 推到 requester 的 `target_addr + offset`。全部 chunk transfer 成功后，SSD owner 用 `get_id` 向 master 调 `GetDoneReq`，再把返回的 `holder_id` 和 `allocation_mode` 填入 `SsdStageReadResp.done_*` 返回 requester。读路径进入 per-device reader queue，底层 `UringIoEngine` 把 read/write 分成独立发送队列，并按 inflight 比例补读，避免回填读长期排在持续写入之后。
-
-```rust
-struct SsdRingBuffer {
-    // key-version 到 Writing/Committed SSD 位置的全局索引。
-    entries: HashMap<KvSsdKey, SsdEntryState>,
-    // active read pin，防止 writer 推进 tail 覆盖正在读取的位置。
-    read_pins: HashMap<KvSsdKey, SsdReadPinInfo>,
-    ...
-}
-
-enum SsdEntryState {
-    // 已分配 offset 但 writev 尚未完成。
-    Writing(SsdIndexEntry),
-    // writev 成功后才允许 get_start 作为 SSD source 命中。
-    Committed(SsdIndexEntry),
-}
-```
-
-`read_pins` 是 owner 本地 SSD ring 的生命周期保护，防止 writer 推进 tail 时覆盖 active read。chunk pipeline 在整个 producer 生命周期内持有同一个 read pin；每个 chunk 单独提交 read task。direct read 条件满足时，`readv` 直接写到 `SsdStageReadReq.stage_addr + offset`；否则先读 scratch aligned buffer，再复制当前 chunk 的真实 payload 长度到 staging。direct read 省掉的是 scratch buffer 到 source staging 的本机 memcpy，不省掉 `source staging -> requester target` 的 transfer。请求方 target 是否远端不影响 SSD direct read 的对齐判断。
-
-#### external
-
-external 的状态边界只到 owner 返回的 mmap holder：它发 `ExternalGetReq` 给 requester owner，并接收 `ExternalMemHolderInfo { offset, len, holder_id }`。SSD route 由 master 管理，SSD 文件位置和 source staging 由 SSD owner 管理，external 不保存也不更新这些状态。
-
-```rust
-pub struct ExternalGetReq {
-    pub key: String,
-    // external 通过 owner 发起 get，req_node_id 仍指向请求方身份。
-    pub req_node_id: String,
-    // owner 代际校验，防止过期 external 请求继续使用旧 owner。
-    pub started_time: i64,
-}
-
-pub struct ExternalGetResp {
-    pub error_code: ErrorCode,
-    pub error_json: String,
-    // 成功时返回 external 可见的 holder 元数据。
-    pub external_memholder_info: Option<ExternalMemHolderInfo>,
-}
-
-pub struct ExternalMemHolderInfo {
-    // external attach 到 owner mmap 后可见的 offset。
-    pub offset: u64,
-    // 真实 payload 长度。
-    pub len: u32,
-    // 后续 release ack 使用的 holder id。
-    pub holder_id: u64,
-}
-
-pub struct ExternalMemHolder {
-    pub offset: u64,
-    // 当前 external 进程内 mmap 后的绝对地址。
-    pub addr: u64,
-    pub len: u32,
-    pub holder_id: u64,
-    pub key: String,
-    pub external_client_id: String,
-    // drop/release 时校验 owner 代际。
-    pub owner_start_time: i64,
-    ...
-}
-```
-
-owner 内部完成普通 `get` 后，会把 `MemoryInfo` 写入 `external_get_holding`，用这条 owner 侧引用代表 external 当前仍在借用该 holder；随后 owner 只把 `ExternalMemHolderInfo { offset, len, holder_id }` 返回给 external。external 构造 `ExternalMemHolder` 后，通过 owner mmap 的 `offset/addr` 读取结果。external holder drop 时，会向 owner 发送 `ExternalDeleteAckReq`；owner 删除 `external_get_holding` 中对应记录，释放 external 这一份引用。只有当 owner 侧不再有其它 `Arc<MemoryInfo>` 引用时，`MemoryInfo` drop 才会沿用原有 owner -> master holder ack 链路释放 master `get_holding`。
-
-### stage 失败和释放
+- `node_replicas[node_id].memory` 中的 allocation 是内存副本本身，所以 memory source 可以直接把这块 allocation 作为读源。
+- `node_replicas[node_id].ssd` 不持有 allocation，只记录真实 `len`；SSD owner 来自 map key，tomb tag 由同一 entry 共享。SSD 文件 offset、shard 和 read pin 都留在 owner 本地。
+- `InflightGetInfo.allocation` 永远是 requester owner 上的 target allocation。成功 `GetDone` 后，这块 allocation 会进入 `OwnerHoldingGetInfo`，成为用户可见 `MemHolder` 的内存。
+- `InflightGetInfo.source_allocation` 只在 `source_kind == GetSourceKind::Ssd` 时存在，用来守住 SSD owner 上的临时 source staging。成功 `GetDone`、失败 `GetRevoke` 或 in-flight TTL 清理都会移除 `InflightGetInfo`，这块 staging allocation 随引用释放。
+- 因此 master 在 SSD 回填时确实持有两块 allocation：`source_allocation` 管读盘 stage 的临时生命周期，`allocation` 管 requester target 和最终 holder 生命周期。两者不会混进同一个 holder。
 
 ```mermaid
 sequenceDiagram
-    participant RO as requester owner
-    participant M as master
-    participant SO as SSD owner
-
-    RO->>SO: SsdStageReadReq
-    SO-->>RO: stage error
-    RO->>M: GetRevokeReq(drop_ssd_source=true)
-    Note right of M: 查 inflight_gets\n确认 source_kind=Ssd\n删除 route.ssd_replicas[src_node_id]
-    alt no live replica remains
-        M->>M: remove kv_routes and prefix index
-    end
+    participant requester_owner as requester_owner target allocation
+    participant master_route as master_route GetStart owner
+    participant master_route_check as master_route_check memory then SSD
+    participant owner_ssd_stage as owner_ssd_stage source allocation
+    participant owner_memory as owner_memory replica source
+    participant owner_ssd_executor as owner_ssd_executor read push
+    requester_owner->>master_route: GetStartReq asks for a readable source
+    master_route->>master_route_check: Load current key version route
+    master_route_check-->>master_route: Return live memory replica when a memory option can serve
+    master_route-->>requester_owner: Memory branch returns owner allocation and requester target
+    requester_owner->>owner_memory: Transfer memory replica into requester target
+    owner_memory-->>requester_owner: Memory hit completes without SSD staging
+    requester_owner->>master_route: GetDoneReq registers requester target as holder
+    master_route_check-->>master_route: If memory is missing return live SSD marker when available
+    master_route->>owner_ssd_stage: Allocate temporary source staging on SSD owner
+    owner_ssd_stage-->>master_route: Return aligned stage address and stage length
+    master_route-->>requester_owner: SSD branch returns stage address target address and length
+    requester_owner->>owner_ssd_executor: SsdStageReadReq gives final requester target to SSD owner
+    owner_ssd_executor-->>requester_owner: SSD owner pushes payload into requester target
+    owner_ssd_executor->>master_route: GetDoneReq completes the same holder lifecycle
+    master_route_check-->>master_route: If no source exists return no live replica
+    master_route-->>requester_owner: KeyNotFound when memory and SSD are both unavailable
 ```
 
+requester owner 收到 `GetStartResp` 后，根据 `GetSourceKind` 切换内部路径：
+
+| source kind | 行为 |
+| --- | --- |
+| `Memory` | 沿用原有 transfer，从 `src_addr` 读到 `target_addr`，传输完成后 requester 调用 `GetDoneReq`。 |
+| `Ssd`，source 本地 | requester 本地执行 SSD stage，读盘后把结果写到 requester target，再调用 `GetDoneReq`。 |
+| `Ssd`，source 远端 | requester 发送 `SsdStageReadReq` 给 SSD owner，由 SSD owner 读盘、push、调用 `GetDoneReq`，再把 done 结果投影回 requester。 |
+
+这个设计让 requester target 始终是最终 holder 归属地。SSD owner 只是数据源和 stage 执行者，不把自己的 staging allocation 暴露给用户。
+
+## 5. 回填传输：SSD source 主动 push，省掉一次 RTT
+
+SSD 回填由 bytes producer 所在的 SSD owner 发起 transfer。SSD owner 读出一个 chunk，就直接把这个 chunk 写到 requester target。
+
+这里有一个容易忽略但很关键的分支：远端 memory get 和远端 SSD 回填的 transfer 发起方不同。
+
+Memory 路径是 requester 发起 transfer、peer 作为 source 的模型；SSD 路径是 source owner 发起 transfer、requester 作为 target 的模型。这一转换消除了 chunk 就绪后的额外 RTT，实现了读盘与网络传输的 pipeline 重叠。
+
+远端 memory source 路径里，requester owner 已经从 `GetStartResp` 拿到远端 `src_addr` 和本地 `target_addr`。它自己调用 transfer engine，把 peer 端的内存副本作为 source，把本地 allocation 作为 target。这里的数据流向仍然是 memory owner 到 requester，只是 transfer API 的发起方是 requester。
+
+远端 SSD source 路径里，requester 不等 SSD owner 读完整个 payload 后再发起 transfer。requester 只发一次 `SsdStageReadReq`，把 `get_id`、SSD owner 上的 `stage_addr`、requester 上的 `target_addr` 和长度交给 SSD owner。随后每个 chunk 一旦从 SSD 读到 source staging，SSD owner 立刻把数据 push 到 requester target。
+
+这减少的是 stage-ready 之后再让 requester 发起一次 transfer 的 RTT。生产 bytes 的 SSD owner 在 chunk ready 的本地上下文里直接 push，chunk read 和 transfer 可以重叠；requester 不需要在每个 chunk ready 后收到通知、再回过头发起一次 transfer。必要的 `SsdStageReadReq` 仍然存在，因为 requester 需要把 target 地址和 `get_id` 交给 SSD owner。
+
+和 transfer engine 接口对上看，关键是 `transfer_data_no_copy` 的方向位。下面是删减后的接口骨架：
+
 ```rust
-pub struct GetRevokeReq {
-    // 要撤销的在途 get。
-    pub get_id: u64,
-    // 只有 SSD stage 失败时才置 true，用来删除失败的 SSD source route。
-    pub drop_ssd_source: bool,
-}
+pub async fn transfer_data_no_copy(
+    &self,                                      // Use this node's transfer engine.
+    peer_node: Option<NodeIDString>,            // Select the remote peer; None means local transfer.
+    peer_src_or_target: bool,                   // True: peer owns source; false: peer owns target.
+    src_addr: u64,                              // Provide the absolute source address.
+    target_addr: u64,                           // Provide the absolute target address.
+    len: u64,                                   // Transfer this many real payload bytes.
+    seg_guard: Option<ClientCpuMemReadGuard>,   // Optionally keep the local segment alive.
+) -> KvResult<TransferBreakdown>;
 ```
 
-SSD stage 失败时，请求方调用 `get_revoke_ssd_source(...)`，也就是 `GetRevokeReq { drop_ssd_source: true }`。master 从 `inflight_gets` 找到本次 get，只有 `source_kind == GetSourceKind::Ssd` 时才会删除 `route.ssd_replicas[src_node_id]`，避免后续 get 继续选择同一个失败 SSD source。如果同一个 `OneKvNodesRoutes` 下已经没有 live 内存副本和 SSD 副本，master 再删除 `kv_routes` 并异步清理 prefix index。
-
-这里的释放边界是：SSD owner 上的 `source_allocation` 只服务本次 stage，失败后随 `inflight_gets` 清理释放；requester target allocation 没有进入 `get_holding`，因此不会生成用户可见 holder。
-
-## 关键代码片段
-
-### put_done 只提交内存副本
-
-当前实现中，`put_done` 只把内存 target allocation 写入 `nodes_replicas`。SSD 是否落盘不影响这次 `PutDone` 的可见性。
+这里 `peer_src_or_target == true` 表示 peer 端持有 source，当前节点发起从 peer source 到本地 target 的 transfer；`peer_src_or_target == false` 表示 peer 端持有 target，当前节点从本地 source 把数据写到 peer target。transfer engine 也会据此选择本地 segment guard：前者守住 `target_addr`，后者守住 `src_addr`。远端 memory get 和远端 SSD 回填正好分别落在这两个方向上：
 
 ```rust
-pub struct PutDoneReq {
-    pub key: String,
-    // 只提交这个 key-version 的内存副本。
-    pub put_id: PutIDForAKey,
-    pub lease_id: Option<u64>,
-}
-
-// 这里只把内存 target 写入 nodes_replicas；SSD 副本稍后独立 commit。
-one_kv_routes
-    .nodes_replicas
-    .write()
-    .insert(node_id.clone(), completed_info);
-```
-
-这段边界是：`nodes_replicas` 代表内存副本 ready，`get_start` 可以立即从这里返回 memory source；`ssd_replicas` 不能在这一步写入，否则 `PutDone` 会被 SSD persist 延迟拖住。SSD 副本后续用同一个 `put_id` 独立提交。
-
-### SSD replica 独立 commit
-
-SSD owner 后台 persist 成功后，单独向 master 提交同一个 key-version 的 SSD 副本。master 必须校验当前 route 的 `put_id` 仍然匹配，避免旧版本 SSD late commit 污染新版本路由。
-
-```rust
-pub struct SsdReplicaCommitReq {
-    pub key: String,
-    // 必须匹配当前 route 版本，避免 SSD late commit 污染新版本。
-    pub put_id: PutIDForAKey,
-    // 完成落盘的 SSD owner。
-    pub node_id: NodeIDString,
-    // 真实 payload 长度。
-    pub len: u64,
-}
-
-if let Some(route) = kv_routes.get(&req.key) {
-    // 过期 put_id 直接丢弃，不 resurrect 旧版本。
-    if route.put_id == req.put_id {
-        // master 只保存 SSD owner 和长度；文件 offset 留在 owner 本地 ring index。
-        route.ssd_replicas.write().insert(
-            node_id.clone(),
-            KvSsdRouteInfo {
-                node_id: node_id.clone(),
-                len: req.len,
-                tomb_tag,
-            },
-        );
-    }
-}
-```
-
-master 只在 `req.put_id == route.put_id` 时写 `ssd_replicas`；过期 `put_id` 的 late commit 会被丢弃，不能 resurrect 旧版本。`SsdReplicaCommitReq.len` 是真实 payload 长度；SSD shard 文件 offset 不进入 master route，只留在 target owner 本地 `SsdRingBuffer`。
-
-### get_start 分配分布式 SSD staging
-
-SSD fallback 发生在 master 已经没有可用 `nodes_replicas` 之后。source staging 一定分配在 SSD owner 的 CPU segment 上，target allocation 一定分配在 requester 的 CPU segment 上。
-
-```rust
-// SSD read 使用 O_DIRECT，读长度先按 512 bytes 对齐。
-let ssd_stage_len = align_ssd_io_len(ssd_replica.len)?;
-// 额外预留 511 bytes，确保 allocation 内能找到 512-byte 对齐地址。
-let source_alloc_len = ssd_stage_len + SSD_ALIGNMENT as u64 - 1;
-
-// source staging 放在 SSD owner 上，只服务本次读盘和 push。
-let source_allocation = allocate_get_buffer_on_node(
-    &view,
-    &ssd_replica.node_id,
-    source_alloc_len,
-    get_id,
-    "ssd source staging",
-)?;
-// target allocation 放在 requester 上，GetDone 后转成最终 holder。
-let target_allocation = allocate_get_buffer_on_node(
-    &view,
-    &req_node_id,
-    ssd_replica.len,
-    get_id,
-    "requesting target",
-)?;
-
-// 返回给 SSD owner 的是对齐后的 staging 地址，不一定等于 allocation 起点。
-let source_addr = align_ssd_stage_addr(source_base + source_allocation.addr())?;
-```
-
-这里的关键边界是：`source_allocation` 在 SSD owner 上，只用于读盘 staging；`target_allocation` 在 requester owner 上，成功 `GetDone` 后进入 `get_holding`。`source_alloc_len = align_up(len, 512) + 511`，保证 allocation 内总能找到 512-byte 对齐的 `src_addr`；`src_addr` 是对齐后的 staging 地址，不一定等于 `source_allocation` 起点。
-
-### requester 触发 SSD owner stage/push/done
-
-请求方收到 `GetSourceKind::Ssd` 后，让 SSD owner 把数据读入 `src_addr`、按 chunk push 到 `target_addr + offset`，并由 SSD owner 直接完成 master `get_done`。这里没有新增用户 API；`SsdStageReadReq` 是 owner 内部 RPC。stage RPC 成功返回时，requester target 已经可读，并且 requester 已经拿到 master done 结果；请求方跳过自己的 transfer 分支，也跳过自己的 `get_done`。
-
-```rust
-let mut ssd_done_resp = None;
-if resp.source_kind == GetSourceKind::Ssd {
-    // SSD owner 负责读盘、push chunk，并在完成后调用 master GetDoneReq。
-    let done_resp = self.stage_kv_from_ssd_source(
-        &resp.node_id,
-        key,
-        put_id,
-        get_id,
-        resp.src_addr,
-        resp.target_addr,
-        data_len as u64,
-        resp.ssd_stage_len,
+// Memory get: requester owner initiates transfer with peer as source.
+client_transfer_engine
+    .transfer_data_no_copy(
+        Some(memory_owner_id),       // Contact the owner that holds the memory replica.
+        true,                        // Interpret the peer address as the source.
+        remote_src_addr,             // Read from the peer's replica allocation.
+        requester_target_addr,       // Write into the requester's local target.
+        len,                         // Move only the real payload bytes.
+        None,                        // Let the engine acquire the local target guard.
     )
     .await?;
-    ssd_done_resp = Some(done_resp);
-}
 
-if resp.source_kind == GetSourceKind::Ssd {
-    // SSD owner 已经把全部 chunk push 到 target_addr，并完成 get_done。
-} else {
-    // memory source 路径仍由 requester 自己做 transfer。
-    self.view.client_transfer_engine()
-        .transfer_data_no_copy(peer_id, true, resp.src_addr, resp.target_addr, len, None)
-        .await?;
-}
+// SSD refill: SSD owner pushes a ready chunk to requester target.
+let chunk_target_addr = requester_target_addr
+    .checked_add(chunk.offset)       // Place this chunk at its payload offset.
+    .ok_or_else(|| KvError::Api(ApiError::InvalidArgument { // Convert overflow into a KV error.
+        detail: "chunk target addr overflow".to_string(),   // Explain which address calculation failed.
+    }))?;
 
-let done_resp = if let Some(done_resp) = ssd_done_resp {
-    // SSD source 路径复用 SsdStageReadResp 带回的 GetDoneResp 字段。
-    done_resp
-} else {
-    // memory source 路径的 GetDoneReq 仍由 requester 发送。
-    self.get_done(get_id).await?
-};
+client_transfer_engine
+    .transfer_data_no_copy(
+        Some(requester_owner_id),    // Contact the requester that owns the final target.
+        false,                       // Interpret the peer address as the target.
+        chunk.stage_addr,            // Read from this SSD owner's ready staging chunk.
+        chunk_target_addr,           // Write to the matching offset in requester target.
+        chunk.len,                   // Move this chunk's real payload length.
+        None,                        // Let the engine acquire the local source guard.
+    )
+    .await?;
 ```
 
-SSD source 路径里，`stage_kv_from_ssd_source(...)` 成功返回时，SSD owner 已经完成读盘、chunk transfer 和 master `GetDoneReq`。requester 因此跳过自己的 transfer 和 `get_done`，直接复用 `SsdStageReadResp.done_*` 构造 holder。memory source 路径仍由 requester 自己 transfer 并调用 `get_done`。
-
-### SSD chunk read 与 direct/scratch fallback
-
-当前实现只有 SSD 回填读路径会把 payload 切成 chunk；SSD 写入按 value 级别一次写入一个 device 的一个 shard 连续 offset。`SsdLoadedChunk` 是 read producer 交给 transfer consumer 的最小就绪单元；`ReadCommand` 记录本次 chunk 要读的 committed entry、shard 文件 offset 和读入目标。
+`SsdStageReadReq` 的作用是把第二段代码所需的远端 target 信息先交给 SSD owner。它只携带 stage 授权和地址描述：
 
 ```rust
-pub(crate) struct SsdLoadedChunk {
-    // 当前 chunk 在完整 payload 中的偏移。
-    pub offset: u64,
-    // 当前 chunk 在 SSD owner source staging 中的起始地址。
-    pub stage_addr: u64,
-    // 当前 chunk 的真实 payload 长度，不包含 O_DIRECT padding。
-    pub len: u64,
-}
-
-struct ReadCommand {
-    key: KvSsdKey,
-    // 已 pin 的 committed entry，里面包含 shard_id、file_offset 和长度。
-    entry: SsdIndexEntry,
-    // 这次 chunk read 在 SSD shard 文件内的起始 offset。
-    file_offset: u64,
-    // Direct 表示直接读入 staging，Scratch 表示先读入 aligned buffer。
-    target: ReadTarget,
-    // 持有 read pin，防止 writer 在读完成前覆盖该位置。
-    _read_pin: Option<SsdReadPin>,
-    done_tx: oneshot::Sender<KvResult<ReadOutput>>,
+pub struct SsdStageReadReq {
+    pub key: String,                    // Identify the logical KV entry.
+    pub put_id: PutIDForAKey,           // Reject data from a different key version.
+    pub get_id: u64,                    // Bind the stage operation to its in-flight get.
+    pub stage_addr: u64,                // Point to aligned staging on the SSD owner.
+    pub stage_len: u64,                 // State the available aligned staging capacity.
+    pub target_node_id: NodeIDString,   // Identify the requester that owns the target.
+    pub target_addr: u64,               // Point to the requester's final allocation.
+    pub len: u64,                       // Preserve the real payload length.
 }
 ```
-
-`load_and_push_kv_from_ssd(...)` 把 SSD read 和 transfer 做成流水线：producer 按 chunk 提交 SSD read，并把读好的 chunk 放入 ready queue；consumer 收到 ready chunk 后立即 push 到 requester target。读和传输可以重叠，多个 chunk 可以同时处于 read inflight 或 transfer inflight 状态。
-
-```rust
-// ready queue 让 read producer 和 transfer consumer 解耦。
-let (chunk_tx, chunk_rx) = ::tokio::sync::mpsc::channel(
-    DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT.saturating_mul(2).max(1),
-);
-
-// producer 按 chunk 从 SSD shard 文件读入 source staging。
-let producer = store.load_into_addr_chunks(
-    key,
-    put_id,
-    stage_addr,
-    len,
-    stage_len,
-    DEFAULT_READ_TRANSFER_PIPELINE_CHUNK_BYTES,
-    DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT,
-    chunk_tx,
-);
-// consumer 收到 ready chunk 后立即 push 到 requester target。
-let consumer = self.transfer_loaded_ssd_chunks(peer_id, target_addr, chunk_rx);
-// 两个 future 并发执行，形成 read-transfer pipeline。
-let (producer_res, consumer_res) = ::tokio::join!(producer, consumer);
-```
-
-`load_into_addr_chunks(...)` 先 pin 当前 committed entry，pin 生命周期覆盖整个 producer。每个 chunk 用 `entry.file_offset + offset` 定位 SSD shard 文件中的读取位置，并根据 staging 地址、文件 offset 和 staging 容量选择 direct 或 scratch；chunk read 完成后立即发送 `SsdLoadedChunk`。
-
-```rust
-// pin 生命周期覆盖整个 producer，writer 不能覆盖 active read 位置。
-let (entry, _read_pin) = {
-    let mut inner = self.inner.lock();
-    let Some(entry) = inner.ring.pin_read(&key) else {
-        return Err(KvError::Api(ApiError::KeyNotFound { key: key.key.clone() }));
-    };
-    (entry, SsdReadPin { ... })
-};
-
-// 每个 chunk 在同一个 committed entry 内推进文件 offset。
-let file_offset = entry.file_offset + offset;
-let target = match choose_chunk_read_path(stage_addr, read_len, target_len, file_offset) {
-    // staging 地址、文件 offset 和 IO 长度都满足对齐时走 direct read。
-    SsdReadPath::Direct => ReadTarget::Direct {
-        target_addr: stage_addr,
-        len: read_len as usize,
-    },
-    // 否则先读到 aligned scratch buffer。
-    SsdReadPath::Scratch => ReadTarget::Scratch(AlignedBuffer::zeroed(read_len as usize)?),
-};
-
-// submit_read_command 根据 entry.shard_id 进入对应 device reader queue。
-let output = submit_read_command(key, entry, file_offset, target, None).await?;
-if let ReadOutput::Scratch(buffer) = output {
-    // scratch 路径只把真实 payload 长度复制到 staging。
-    copy_payload_to_stage(buffer, stage_addr, payload_len)?;
-}
-// 下游 transfer 只看到真实 payload 长度。
-ready_tx.send(SsdLoadedChunk { offset, stage_addr, len: payload_len }).await?;
-```
-
-direct 路径把 `readv` 的目标直接设为当前 chunk 的 source staging；scratch 路径先读入 aligned buffer，再只复制当前 chunk 的真实 payload 长度到 staging。两条路径最后都只把真实 payload 长度暴露给 transfer 和 `MemHolder`，不会把 `O_DIRECT` padding 暴露给用户。
-
-## IO 模型
 
 ```mermaid
-flowchart TD
-    A["large_file_paths"] --> B["derive SSD roots"]
-    B --> C["create root dirs + metadata.dev()"]
-    C --> D["deduplicate device roots"]
-    D --> E0["SsdDeviceWorker device 0"]
-    D --> E1["SsdDeviceWorker device 1"]
-    E0 --> F0["shard_ids: 0,2,..."]
-    E1 --> F1["shard_ids: 1,3,..."]
-    F0 --> G0["device 0 writer/read queues"]
-    F1 --> G1["device 1 writer/read queues"]
-    G0 --> H0["device 0 UringIoEngine"]
-    G1 --> H1["device 1 UringIoEngine"]
-    I["persist_buffer"] --> J["next_write_device round-robin"]
-    J --> G0
-    J --> G1
-    K["submit_read_command(entry.shard_id)"] --> L["shard_to_device"]
-    L --> G0
-    L --> G1
+sequenceDiagram
+    participant requester_owner as requester_owner target holder
+    participant memory_source_owner as memory_source_owner memory replica
+    participant owner_ssd_source as owner_ssd_source stage executor
+    participant owner_chunk_reader as owner_chunk_reader local SSD
+    participant transfer_engine as transfer_engine bytes mover
+    participant master_get_done as master_get_done holder completion
+    requester_owner->>transfer_engine: Memory path calls transfer_data_no_copy with peer source
+    transfer_engine->>memory_source_owner: Read remote memory source
+    transfer_engine-->>requester_owner: Memory payload lands in requester target
+    requester_owner->>master_get_done: Requester calls GetDoneReq after memory transfer
+    requester_owner->>owner_ssd_source: SSD path sends one SsdStageReadReq with target address
+    owner_ssd_source->>owner_chunk_reader: Read next chunk from local SSD into source staging
+    owner_chunk_reader-->>owner_ssd_source: Return ready chunk with offset and real length
+    owner_ssd_source->>transfer_engine: Call transfer_data_no_copy with peer target
+    transfer_engine-->>requester_owner: Chunk lands in requester target as payload bytes only
+    owner_ssd_source->>owner_chunk_reader: Continue chunk reads within inflight budget
+    owner_ssd_source->>master_get_done: SSD owner calls GetDoneReq after all chunks arrive
+    master_get_done-->>requester_owner: Requester receives normal holder result
 ```
 
-| 组件 | 设计 |
+SSD owner 执行 stage 时，把读盘和传输拆成两个并发 future：
+
+- **producer**：按 chunk 从 SSD 读到 source staging。
+- **consumer**：收到 ready chunk 后立刻 push 到 requester target。
+
+两者之间用一个有界 `mpsc` ready queue 连接。默认 chunk 大小是 4 MB，默认 pipeline inflight 是 4。producer 不需要等完整 payload 读完才开始传输；consumer 也不需要理解 SSD 文件 offset，只处理 `SsdLoadedChunk { offset, stage_addr, len }`。
+
+实现骨架可以压成下面这一段。`load_into_addr_chunks` 在 producer 侧按 chunk 发起 SSD read，并把已经读入 staging 的 chunk 送进 `ready_tx`；`transfer_loaded_ssd_chunks` 在 consumer 侧从 `ready_rx` 取 chunk，再调用 transfer engine push 到 requester target。两边用 `join!` 同时运行，所以第一个 chunk 进入 ready queue 后，网络传输就可以开始，不必等待后续 chunk 读完。
+
+```rust
+let ready_queue_capacity = DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT
+    .saturating_mul(2) // Buffer two transfer windows between reader and sender.
+    .max(1);           // Keep the bounded channel valid for any configured window.
+let (chunk_tx, chunk_rx) =
+    ::tokio::sync::mpsc::channel(ready_queue_capacity); // Connect producer and consumer.
+
+let producer = store.load_into_addr_chunks(
+    key,                                          // Select the logical KV entry.
+    put_id,                                       // Select the exact committed version.
+    stage_addr,                                   // Read chunks into aligned source staging.
+    len,                                          // Stop after the real payload length.
+    stage_len,                                    // Enforce the staging allocation capacity.
+    DEFAULT_READ_TRANSFER_PIPELINE_CHUNK_BYTES,   // Bound each SSD read to 4 MiB.
+    DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT,      // Allow up to four concurrent SSD reads.
+    chunk_tx,                                     // Publish each ready chunk to the sender.
+);
+
+let consumer = self.transfer_loaded_ssd_chunks(
+    peer_id,      // Select the remote requester; None means the target is local.
+    target_addr,  // Use the requester's final allocation as the transfer base.
+    chunk_rx,     // Consume chunks as soon as their SSD reads complete.
+);
+let (producer_res, consumer_res) = ::tokio::join!(
+    producer, // Run SSD reads concurrently with network transfers.
+    consumer, // Push ready chunks without waiting for the full value.
+);
+match (producer_res, consumer_res) {
+    (Ok(()), Ok(())) => Ok(()),
+    (_, Err(err)) => Err(err),
+    (Err(err), _) => Err(err),
+}
+```
+
+consumer 只在 transfer inflight 少于 4 时从 ready queue 取新 chunk。达到上限后，有界 queue 会把背压传给 producer；已提交的 transfer 完成后，consumer 再继续取 chunk。
+
+```mermaid
+sequenceDiagram
+    participant owner_ssd_ring as owner_ssd_ring committed entry
+    participant owner_chunk_producer as owner_chunk_producer read future
+    participant owner_shard_reader as owner_shard_reader local file IO
+    participant owner_ready_queue as owner_ready_queue bounded mpsc
+    participant owner_push_consumer as owner_push_consumer transfer future
+    participant requester_target as requester_target final allocation
+    owner_chunk_producer->>owner_ssd_ring: Pin committed entry before any chunk read
+    owner_ssd_ring-->>owner_chunk_producer: Read pin blocks ring tail from overwriting active data
+    par read producer
+        owner_chunk_producer->>owner_shard_reader: Submit chunk N read into source staging
+        owner_shard_reader-->>owner_chunk_producer: Return chunk N offset stage address and real length
+        owner_chunk_producer->>owner_ready_queue: Enqueue chunk N when inflight budget allows
+        owner_chunk_producer->>owner_shard_reader: Submit chunk N plus 1 while transfer runs
+    and transfer consumer
+        owner_ready_queue-->>owner_push_consumer: Deliver ready chunk N when push side has capacity
+        owner_push_consumer->>requester_target: Push chunk N into requester target at matching offset
+        owner_push_consumer->>owner_ready_queue: Wait for the next ready chunk
+    end
+    owner_push_consumer-->>owner_ssd_ring: Release read pin after all chunk transfers complete
+```
+
+## 6. Owner 本地机制：对齐、ring 和 IO 调度
+
+`O_DIRECT` 对齐、SSD 文件 offset、ring 覆盖保护和 `io_uring` 调度封装在 owner 本地。master 和用户侧只看到真实 payload 长度和普通 `MemHolder`。
+
+### 6.1 写入：双轨长度限制 padding 的作用域
+
+target owner 收到 SSD persist 请求后，会从 target allocation 复制真实 payload，并构造 512-byte 对齐的写入 buffer。这样做是为了满足当前 `O_DIRECT` 约束：地址、长度和文件 offset 都要按 512 bytes 对齐。
+
+这会引入一个工程问题：SSD IO 需要对齐长度，用户语义需要真实长度。当前实现用“双轨长度”把两者分开：
+
+| 长度 | 使用范围 | 对外语义 |
+| --- | --- | --- |
+| `len` | master route、`SsdReplicaCommitReq`、transfer 长度、`MemHolder.len`。 | 真实 payload 长度。 |
+| `aligned_len` | owner 本地 ring 分配、shard 文件 offset 推进、`O_DIRECT` read/write。 | 本地 IO 长度，padding 不出 owner。 |
+
+具体路径是：
+
+- `SsdReplicaPersistReq.len` 只表示真实 payload 长度。owner 从 target allocation 复制数据时，只复制前 `len` bytes。
+- owner 本地计算 `aligned_len = align_up(len, 512)`，创建长度为 `aligned_len` 的 `AlignedBuffer`。这块 buffer 先置零，再把真实 payload 拷进去。
+- ring 分配、shard 文件 offset 推进和 SSD 写入提交都使用 `aligned_len`。
+- `SsdIndexEntry` 同时记录 `len` 和 `aligned_len`：`len` 服务后续 `get`、route commit、holder 长度和传输长度；`aligned_len` 只服务 owner 本地空间管理和文件 IO。
+- owner 向 master 提交 `SsdReplicaCommitReq` 时只提交真实 `len`。读取侧也会校验 `entry.len == len`，即使 direct read 读入了对齐后的范围，向 requester target 和 `MemHolder` 暴露的仍然只有真实 payload bytes。
+
+### 6.2 Ring：先 Writing，后 Committed
+
+本地 SSD 引擎按 value 粒度选路：
+
+- 用 `next_write_device` round-robin 选择一个有效 device。
+- 把整个 value 发送到这个 device 的 writer queue。
+- 当前实现不把同一个 payload 拆到多块 device 做条带化。
+
+这意味着多 device 并行发生在 value 粒度：不同 value 可以落到不同 device；一个 value 内部仍是某个 shard 的连续 offset。
+
+真正决定 SSD 文件位置的是 owner 本地 `SsdRingBuffer`。writer task 只在本 device 的 `shard_ids` 里选择 shard，并为 aligned payload 分配连续文件区间。ring 分配逻辑有几个关键点：
+
+- `aligned_len = align_up(len, 512)`，ring 按对齐后长度分配空间。
+- 每个 shard 是环形空间，`head` 前进分配新写入，`tail` 表示可以覆盖到哪里。
+- 如果当前 shard 尾部剩余空间不足，会跳到文件开头继续找连续空间。
+- 如果推进 `tail` 会覆盖未完成写入或 active read pin，返回 `BlockedByBusyIo`。
+
+分配成功后，ring 先插入 `Writing(SsdIndexEntry)`。这个状态表示 offset 已经分配，但 SSD 写入还没成功。默认单 buffer 路径使用 `O_DIRECT + io_uring write`；只有写入字节数等于 aligned buffer 长度，entry 才会提交成 `Committed`。
+
+`Writing -> Committed` 是 SSD 可见性的核心保护。读路径的 `pin_read` 只接受 committed 且 offset 仍有效的 entry，所以未完成的 SSD 写入不会被 `get` 选中。
+
+```mermaid
+sequenceDiagram
+    participant owner_target as owner_target memory allocation
+    participant owner_aligned_buffer as owner_aligned_buffer len plus padding
+    participant owner_ssd_ring as owner_ssd_ring len and aligned_len
+    participant owner_shard_file as owner_shard_file aligned write range
+    owner_target->>owner_aligned_buffer: Copy only len bytes from target allocation
+    owner_aligned_buffer-->>owner_target: Return aligned_len buffer with zero padding after len
+    owner_target->>owner_ssd_ring: Reserve ring space by aligned_len
+    owner_ssd_ring-->>owner_target: Return Writing entry storing both len and aligned_len
+    owner_target->>owner_shard_file: Submit O_DIRECT write for aligned_len bytes
+    owner_shard_file-->>owner_target: Complete write for all aligned bytes
+    owner_target->>owner_ssd_ring: Commit Writing entry after write success
+    owner_ssd_ring-->>owner_target: Return Committed entry readable by pin_read
+```
+
+### 6.3 读取：direct read 和 scratch fallback
+
+每个 chunk 的文件位置由 `entry.file_offset + offset` 得到。read path 的选择取决于三个条件：
+
+- staging 地址是否 512-byte 对齐；
+- SSD 文件 offset 是否 512-byte 对齐；
+- 本次 read 长度和 target capacity 是否满足对齐要求。
+
+满足条件时走 direct read：默认单 buffer 路径直接把数据读到 `stage_addr + offset`。否则走 scratch read：先读入 512-byte 对齐的 `AlignedBuffer`，再只复制当前 chunk 的真实 payload 长度到 staging。
+
+两条路径最后都只向下游发送真实 payload 长度。`O_DIRECT` padding 不会进入 transfer 长度，也不会进入用户 `MemHolder.len`。
+
+```mermaid
+sequenceDiagram
+    participant owner_ssd_reader as owner_ssd_reader chunk executor
+    participant owner_read_planner as owner_read_planner alignment check
+    participant owner_source_staging as owner_source_staging stage allocation
+    participant owner_scratch_buffer as owner_scratch_buffer aligned fallback
+    participant transfer_path as transfer_path payload mover
+    participant user_memholder as user_memholder final bytes
+    owner_ssd_reader->>owner_read_planner: Plan chunk offset payload length and aligned read length
+    owner_read_planner-->>owner_ssd_reader: Return direct read plan when address offset and length align
+    owner_ssd_reader->>owner_source_staging: Direct read writes aligned bytes into stage address
+    owner_source_staging-->>transfer_path: Send ready chunk with real payload length
+    owner_read_planner-->>owner_ssd_reader: Return scratch read plan when any direct condition is missing
+    owner_ssd_reader->>owner_scratch_buffer: Read padded bytes into aligned scratch buffer
+    owner_scratch_buffer->>owner_source_staging: Copy only real payload bytes into source staging
+    owner_source_staging-->>transfer_path: Send ready chunk after padding is hidden
+    transfer_path->>user_memholder: Push real payload length only into MemHolder data
+```
+
+### 6.4 IO 调度：读写队列和 uring 权重
+
+底层每个有效 device 有独立 writer queue、reader queue 和 `UringIoEngine`。writer task 负责 ring 分配和 SSD 写入提交，reader task 负责 chunk read 提交和 offset 有效性复查。
+
+`UringIoEngine` 把 read 和 write 分成两个 channel。每个 uring 线程在 `io_depth` 限制内提交 SQE，并用简单权重控制读写 inflight 比例：读 inflight 不超过写 inflight 的若干倍时优先补读，否则补写。这让持续写入存在时，SSD 回填读不会长期排在写队列后面。
+
+当前默认 `KvSsdUringMode::SingleBuffer`：常见单 buffer 读写直接提交 `IORING_OP_READ` / `IORING_OP_WRITE`，避免为一个连续 buffer 构造一元素 iovec。`Iovec` 模式仍保留为测试和对照路径；这项优化只覆盖 owner 本地 SSD IO 提交层，不代表完整 KV `put/get` 端到端收益。
+
+reader completion 还有一次 offset 复查：read completion 返回后，会检查 entry 在 ring 中是否仍然有效。如果已经无效，就删除 entry 并返回 `KeyNotFound`。正常情况下 read pin 会阻止覆盖；这个复查是对并发状态和异常路径的最后防线。
+
+```mermaid
+sequenceDiagram
+    participant owner_writer_queue as owner_writer_queue per device
+    participant owner_reader_queue as owner_reader_queue per device
+    participant owner_writer_loop as owner_writer_loop persist worker
+    participant owner_reader_loop as owner_reader_loop refill worker
+    participant owner_uring_engine as owner_uring_engine IO scheduler
+    participant kernel_io_uring as kernel_io_uring completion queue
+    participant owner_ssd_ring as owner_ssd_ring offset index
+    owner_writer_queue->>owner_writer_loop: Deliver SSD persist job for this device
+    owner_writer_loop->>owner_ssd_ring: Allocate ring offset and create Writing entry
+    owner_writer_loop->>owner_uring_engine: Submit write request for aligned payload
+    owner_reader_queue->>owner_reader_loop: Deliver SSD refill read job for this device
+    owner_reader_loop->>owner_ssd_ring: Pin committed entry before read
+    owner_reader_loop->>owner_uring_engine: Submit chunk read request
+    owner_uring_engine->>kernel_io_uring: Submit read and write SQEs within io depth
+    kernel_io_uring-->>owner_uring_engine: Return completion event for read or write
+    owner_uring_engine-->>owner_writer_loop: Write completion lets writer commit entry
+    owner_uring_engine-->>owner_reader_loop: Read completion returns chunk bytes to reader
+    owner_reader_loop->>owner_ssd_ring: Recheck offset validity before returning chunk
+    owner_ssd_ring-->>owner_reader_loop: Invalid offset triggers entry cleanup and KeyNotFound
+```
+
+## 7. 一致性：沿用 key-version 和 holder 生命周期
+
+SSD bytes 是否可见由 master route 和 owner ring 共同决定；最终进入 `get_holding` 的只有 requester target，source staging 始终是临时内存。
+
+SSD source 路径里，谁调用 master `GetDoneReq` 取决于 stage 执行位置：
+
+- 本地 SSD source：requester 自己读盘并完成 target 写入后，直接调用 `GetDoneReq`。
+- 远端 SSD source：SSD owner 读盘并 push 到 requester target 后，由 SSD owner 调用 `GetDoneReq`。
+
+无论是谁调用，master 在 `inflight_gets` 里记录的 `req_node_id` 都是 requester owner。`GetDoneReq` 取出 `InflightGetInfo` 后，把 requester target allocation 写入 `get_holding`，生成 `holder_id`。source staging allocation 不进入 `get_holding`，只随 in-flight get 生命周期释放。
+
+远端 SSD owner 会把 master `GetDoneResp` 的 `holder_id`、`allocation_mode`、错误码和 server time 投影到 `SsdStageReadResp.done_*` 字段。requester 收到后，用这些字段构造普通 external holder 响应。用户看不到 SSD stage RPC。
+
+`GetStart` 为 requester target 分配 allocation 时，会尝试占用 route 上的 durable slot。成功时，`allocation_mode` 是 `DurableReplica`；失败时就是 `Temporary`。`GetDone` 继续复用原有提升逻辑：只要 `allocation_mode == DurableReplica`，route 的 `put_id` 仍然匹配，请求方节点 tomb tag 仍然 live，master 就可以把 requester target 写入对应 entry 的 `memory`。这表示一次 SSD 回填读回来的数据，后续可以变成新的内存副本。
+
+失败路径同样需要明确。SSD stage 失败时，请求方会调用：
+
+```rust
+GetRevokeReq {
+    get_id,                 // Revoke this in-flight get and release its allocations.
+    drop_ssd_source: true,  // Clear the failed SSD option from the current route.
+}
+```
+
+master 处理 `GetRevokeReq` 时先删除 `inflight_gets`。只有 `drop_ssd_source == true` 且 `InflightGetInfo.source_kind == GetSourceKind::Ssd` 时，才会把当前 route 中 `src_node_id` 对应 entry 的 `ssd` 设为 `None`；如果它也没有内存副本，则同时删除该 entry。
+
+这里有两个防误删条件：
+
+- 如果本次 get 的 source kind 不等于 `Ssd`，`drop_ssd_source` 会被忽略。
+- 如果 route 的 `put_id` 已经不同于本次 in-flight get 的 `put_id`，不会删除新版本 route。
+
+删除失败 SSD source 后，如果这个 key-version 已经没有 live 内存副本和 SSD 副本，master 会删除 `kv_routes`；若 prefix index 开启，再异步清理 prefix index。requester target 没有进入 `get_holding`，用户不会拿到半成品 holder。
+
+Staging allocation 的泄漏边界也在这里收住。当前实现里，source staging 被保存在 `InflightGetInfo.source_allocation`；成功 `GetDone`、失败 `GetRevoke`、或 `inflight_gets` 的 TTL 驱逐都会移除 in-flight 状态，让这块 owner 本地 allocation 随引用释放。远端 requester 崩溃时，master 侧 in-flight TTL 和节点 tomb 清理会兜住控制面；SSD owner 崩溃时，进程内 staging 本身随进程退出消失。
+
+```mermaid
+sequenceDiagram
+    participant master_control as master_control inflight get owner
+    participant owner_ssd_source as owner_ssd_source staging holder
+    participant requester_owner as requester_owner target holder
+    participant master_route_table as master_route_table current route
+    participant master_get_holding as master_get_holding holder map
+    participant master_inflight_cleanup as master_inflight_cleanup TTL tomb
+    master_control->>owner_ssd_source: Start SSD stage with source_allocation in InflightGetInfo
+    owner_ssd_source->>requester_owner: Success path pushes all payload bytes into requester target
+    owner_ssd_source->>master_control: Success path sends GetDoneReq for get_id
+    master_control->>master_get_holding: Move requester target into get_holding
+    master_get_holding-->>master_control: Return holder_id for requester target
+    master_control->>master_inflight_cleanup: Drop source_allocation reference after success
+    requester_owner->>master_control: Failure path sends GetRevokeReq with drop_ssd_source
+    master_control->>master_route_table: Remove failed SSD source only for matching source kind and put_id
+    master_control->>master_inflight_cleanup: Drop source_allocation reference after failure
+    master_inflight_cleanup->>master_route_table: Timeout or node tomb cleanup removes inflight state
+    master_inflight_cleanup->>owner_ssd_source: Staging allocation is released when reference drops
+    master_get_holding-->>requester_owner: Only requester target can become user visible MemHolder
+```
+
+delete 和覆盖写不需要给 SSD 单独定义语义。覆盖写会生成新的 `put_id`，旧版本 SSD late commit 会因为 `put_id` 不匹配被忽略。显式 delete 会移除整个 `kv_routes` 条目，并广播清理客户端缓存。节点 tomb 清理会删除该节点在 `node_replicas` 中的整个 entry，内存和 SSD 状态一起失效。
+
+本地内存副本驱逐只把对应 entry 的 `memory` 设为 `None`，同一 key-version 的 `ssd` 不受影响。SSD 失败或驱逐也只清理 `ssd`。两个字段都为空时才删除 node entry，整个 route 没有副本时才删除 `kv_routes` 条目。
+
+公共 `get` 是否能读到 SSD bytes，只取决于当前 master route 是否仍然包含 live SSD replica。旧 bytes 即使还留在 shard 文件里，只要 route 被删除或版本不再匹配，公共 API 就不能命中它。owner 本地 ring 后续可以随着 head/tail 推进覆盖这些空间。
+
+Owner 重启是这套设计的另一个明确边界。当前 shard 文件打开时使用 `create + truncate`，owner 进程启动会重建本地 SSD cache 文件和空 ring；没有 WAL、checkpoint 或 shard 扫描来恢复旧 entry。换句话说，owner 重启即清空本地 SSD cache，以极简恢复逻辑换取运行期写读路径的低开销。对应的 master route 会随 owner tomb、版本校验和路由清理失效，后续读取要么命中其他 live replica，要么返回 miss。
+
+## 8. 设计取舍与当前边界
+
+这套设计用运行期回填能力换容量弹性，不提供冷启动恢复、用户侧 SSD API 或单 value 多 device 条带化。
+
+这套设计的硬约束是把复杂性限制在 owner 本地，避免扩张公共 API 和 master 控制面。
+
+| 设计选择 | 得到什么 | 放弃或代价 | 当前边界 |
+| --- | --- | --- | --- |
+| master 不保存 SSD offset | master route 轻量，跨节点控制面只看 key-version、owner 和长度。 | owner 重启后无法用 master route 找回旧 SSD bytes。 | **SSD 只作为运行期介质层**。 |
+| `PutDone` 不等待 SSD | 用户写入延迟保持内存 KV 语义，SSD 慢时背压停在 owner 本地 persist 路径。 | SSD 副本是 late commit，需要 `put_id` 防止旧版本污染。 | **内存副本 ready 才是同步提交点**。 |
+| `O_DIRECT + io_uring`，而非 `mmap` / PageCache | 避免大 value 污染 page cache，减少 PageCache 与用户态之间的额外搬运和不可控抖动。 | 必须自己处理 512-byte 对齐、aligned buffer、ring 覆盖和 read pin。 | **IO 复杂性封装在 owner**。 |
+| source-driven push | chunk ready 后由 SSD owner 直接推到 requester target，读盘和网络传输可重叠。 | requester 必须先通过 `SsdStageReadReq` 交出 target 地址和 `get_id`。 | **省的是 stage-ready 后的额外 RTT**。 |
+| value 级 device 选择 | 调度简单，单 value 文件位置连续，读路径容易 pin。 | 单个大 value 不跨 device 条带化。 | **多 device 并行发生在 value 粒度**。 |
+| 启动时 truncate shard | 没有恢复扫描、WAL 和 checkpoint，运行期路径更短。 | 进程重启后本地 SSD cache 全失效。 | **不支持冷启动恢复**。 |
+| scratch 读路径 | 不满足 direct read 对齐时仍能正确读取真实 payload。 | 该 chunk 多一次本地 copy。 | **padding 不进入用户 holder**。 |
+
+为了避免把这层实现理解成通用持久化数据库，当前边界需要写清：
+
+| 项目 | 当前结论 |
 | --- | --- |
-| device root | owner 从 `large_file_paths` 派生 SSD cache root；创建目录后用 `metadata.dev()` 判断真实 device，同一 device 只保留一个有效 root。 |
-| shard 文件 | `max_bytes` 是 owner 本地 SSD cache 的容量上限；容量被拆成多个 shard 文件，分布到有效 device root 的 `shards/` 下。`shard_to_device` 记录每个 shard 属于哪个 device。 |
-| 写入选路 | `persist_buffer` 用 `next_write_device` round-robin 选择一个 device；一个 payload 只进入这个 device 的 writer queue，并在该 device 的某个 shard 中分配一段连续 `file_offset`。 |
-| 读取选路 | committed entry 保存 `shard_id` 和 `file_offset`；读 chunk 时通过 `entry.shard_id -> shard_to_device` 找到 device reader queue，再从对应 shard 文件的 `file_offset + offset` 读取。 |
-| per-device worker | 每个有效 device 有独立 writer queue、reader queue 和 `UringIoEngine`；这些 worker 只处理本 device 的 shard 文件 IO。 |
-| 对齐与回收 | SSD shard 使用 `O_DIRECT`，要求地址、长度和文件 offset 512-byte 对齐；不满足 direct 条件的读 chunk 走 scratch buffer。ring head/tail 和 read pin 只在 owner 本地保护 shard 文件位置，不进入 master route。 |
+| 冷启动恢复 | **不支持**。owner 启动时重建并清空 SSD cache 文件，不扫描已有 shard 重建 master route。 |
+| 用户侧 SSD API | **不提供**。用户仍然只调用 `put/get/delete`，返回普通 `MemHolder`。 |
+| 独立 SSD 路径参数 | **不提供**。SSD cache root 从 owner `large_file_paths` 派生。 |
+| 单 value 多 device 条带化 | **当前不做**。一个 value 写入一个 device 的一个 shard 连续 offset。 |
+| SSD 文件 offset 外露 | **不外露**。offset、shard_id 和 read pin 都是 owner 本地实现细节。 |
+| UI 容量视图 | **必须分层展示**。memory segment 和 `kv_ssd` 的 capacity/used 分开呈现。 |
+| KV cache 场景收益 | **尚待测试**。当前先完成功能接入和通用路径优化，业务 workload 下的容量收益、命中率和尾延迟需要后续压测验证。 |
+| lease key 专门 SSD 治理 | **当前没有专门策略**，仍复用 key-version route 和已有生命周期。 |
 
-## Task / Actor / 独立线程
+## 9. 链路回看
 
-这一节只列运行时执行单元，不再重复 device/shard 选路。SSD 没有新增独立的 master route actor；控制面仍由原有 master/owner RPC handler 承载。新增的后台执行主要在 owner 本地：每个有效 device 有 writer task、reader task 和对应的 `UringIoEngine` 后台线程。
+写入先让内存副本可见，读取先找内存副本；SSD 在后台补充副本，并在内存 miss 后提供回填。
 
-### owner 本地 SSD IO 执行单元
+把整条链路压成一句话：写入先提交内存 route，再异步写 owner 本地 SSD，写成后用同一个 `put_id` 补交 SSD route；读取先找内存 route，找不到才选择 SSD owner，SSD owner 从本地 shard 按 chunk 读入 staging，并把数据 push 到 requester target，最后复用原有 `GetDone` 和 `MemHolder` 生命周期。
 
-| 执行单元 | 创建位置 | 类型 | 输入 | 职责 |
-| --- | --- | --- | --- | --- |
-| `ssd_writer_loop` | `KvSsdStorage::new`，每个 effective device 一个 | `tokio::task::spawn` | `SsdDeviceWorker.write_tx` | 从 `persist_from_addr` 接收写任务，只在本 device 的 `shard_ids` 内调用 `SsdRingBuffer::prepare_write_on_shards`，提交 `writev`，完成后 `commit(Writing -> Committed)`。 |
-| `ssd_reader_loop` | `KvSsdStorage::new`，每个 effective device 一个 | `tokio::task::spawn` | `SsdDeviceWorker.read_tx` | 从 `load_into_addr_chunks` 接收属于本 device shard 的 chunk 读任务，提交 direct/scratch `readv`，校验 offset 仍有效，完成后回传 chunk 读结果；整条 producer 完成后释放 `SsdReadPin`。 |
-| `fluxon-kv-ssd-uring-{idx}` | 每个 device 的 `UringIoEngine::new_multi` | `std::thread::spawn` | `read_rx/write_rx: crossbeam::channel` | 每个线程持有一个 `IoUring`，只提交本 device shard 文件的 `Readv/Writev` SQE，并按 read/write inflight 比例调度后回传 CQE。 |
+```mermaid
+sequenceDiagram
+    participant owner_target as owner_target put memory replica
+    participant requester_owner as requester_owner get target
+    participant master_route as master_route key version owner len
+    participant owner_ssd_source as owner_ssd_source stage executor
+    participant owner_ssd_media as owner_ssd_media ring and shard files
+    participant master_get_holding as master_get_holding holder map
+    owner_target->>master_route: PutDoneReq reports memory replica ready
+    master_route-->>owner_target: Commit memory route so node_replicas memory can serve get
+    master_route->>owner_target: Start background SsdReplicaPersistReq
+    owner_target->>owner_ssd_media: Reserve ring range and write aligned bytes
+    owner_ssd_media-->>owner_target: Return Committed entry readable by local SSD owner
+    owner_target->>master_route: SsdReplicaCommitReq publishes owner and payload length only
+    master_route-->>owner_target: Commit SSD route only when put_id and tomb tag still match
+    requester_owner->>master_route: Later GetStartReq finds no live memory replica
+    master_route-->>requester_owner: Return SSD source stage address target address and length
+    requester_owner->>owner_ssd_source: SsdStageReadReq gives SSD owner final target info
+    owner_ssd_source->>owner_ssd_media: Pin committed entry and read chunks from local shard
+    owner_ssd_media-->>owner_ssd_source: Return chunk bytes from owner local media
+    owner_ssd_source-->>requester_owner: Push payload chunks into requester target
+    owner_ssd_source->>master_route: GetDoneReq completes normal holder lifecycle
+    master_route->>master_get_holding: Register requester target as user visible holder
+    master_get_holding-->>owner_ssd_source: Return holder_id for requester target
+    owner_ssd_source-->>requester_owner: Return SsdStageReadResp with normal MemHolder result
+```
 
-`KvSsdStorage` 通过每个 `SsdDeviceWorker` 持有 shard fd 和 `UringIoEngine`，保证 fd 与 uring 线程生命周期覆盖 writer/reader task；drop 时关闭 channel 并 join uring 线程。
-
-### 控制面 RPC / 清理任务
-
-| 执行单元 | 创建位置 | 类型 | 输入 | 职责 |
-| --- | --- | --- | --- | --- |
-| `rpc_ssd_replica_commit` | `MasterKvRouter` RPC handler 注册 | `view.spawn(...)` | `SsdReplicaCommitReq` | owner SSD persist 成功后提交 SSD 副本，master 校验 `put_id` 后写 `ssd_replicas`。 |
-| `rpc_ssd_stage_read` | `ClientKvApi` RPC handler 注册 | `view.spawn(...)` | `SsdStageReadReq` | 远端 SSD owner 收到 stage 请求后，在 owner 进程内调用 `load_and_push_kv_from_ssd(...)`；SSD read producer 和 transfer consumer 流水线完成后，再调用 master `get_done` 并回传 done fields。 |
-| `ssd_failure_remove_prefix_index` | `get_revoke(drop_ssd_source=true)` | `view.spawn(...)` | 失败 SSD source 的 key | 当失败 SSD source 是最后一个 live replica 时，异步删除 prefix index。 |
-
-SSD route 的权威更新点仍是原有 master RPC handler：
-
-- `PutDone`：同步更新 `nodes_replicas`，让内存副本立即可读。
-- `SsdReplicaCommit`：SSD persist 完成后同步更新 `ssd_replicas`，并拒绝过期 `put_id`。
-- `GetStart`：同步选择内存副本或 SSD 副本，并写入 `inflight_gets`。
-- `GetRevoke`：同步删除失败 SSD source；必要时触发 prefix index 小任务。
-- `Delete` / 覆盖写失效：复用原有 `delete_broadcast` 管线。
-
-## 不变量
-
-- `nodes_replicas` 和 `ssd_replicas` 都属于同一个 `OneKvNodesRoutes.put_id`，不能跨版本复用。
-- `PutDoneReq` 只表示内存副本 ready；SSD 副本只能由匹配当前 `put_id` 的 `SsdReplicaCommitReq` 补充进 `ssd_replicas`。
-- `SsdReplicaCommitReq` 是内部控制面 RPC，不改变用户侧 `put/get/delete` API。
-- `GetSourceKind::Ssd` 必须同时有 SSD owner source staging 和 requester target allocation；成功后只有 requester target allocation 进入 `get_holding`。
-- SSD 回填失败必须通过 `get_revoke(drop_ssd_source=true)` 清理 in-flight get，并从 master 路由里移除失败的 SSD 副本。
-- master 路由被删除后，旧 SSD bytes 即使还在 shard 文件里，也不能被公共 `get` 命中。
-
-## 关键结论
-
-这套实现把 SSD 作为内存 KV 之外的可回填数据源副本，而不是新增一套用户 API。写入侧先完成内存 `PutDone`，再由 target owner 异步落 SSD，并通过 `SsdReplicaCommitReq` 补充 SSD route；读取侧优先使用内存副本，内存副本不可用时由 SSD owner 从本地 shard 文件读出数据，按 chunk push 到 requester target，再复用原有 `get_done` 和 holder 生命周期。
-
-因此，SSD 相关的 shard ring、`O_DIRECT`、`io_uring`、read pin 和 read/transfer pipeline 都限制在 owner 本地实现内；master 只保存这个 key-version 有哪些 owner 持有 SSD 副本，以及 value 的真实 payload 长度，不保存 SSD 文件 offset、shard_id 或本地 ring 状态。
+Fluxon KV 这次介质扩展的核心取舍是：把难题放在 owner 本地，把公共契约保持小。master 管 key-version route，owner 管本地 SSD 位置和 IO，external 继续拿普通 holder，观测面把 memory segment 和 KV SSD 分开呈现。当前阶段先完成能力接入和通用路径优化，让 SSD 可以成为内存 KV 的本地回填介质；它在具体 KV cache 场景里的收益，还需要后续 workload 测试来确认。

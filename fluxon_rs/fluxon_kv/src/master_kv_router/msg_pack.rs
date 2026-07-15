@@ -290,6 +290,37 @@ impl RPCReq for SsdReplicaCommitReq {
     type Resp = SsdReplicaCommitResp;
 }
 
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct SsdReplicaEviction {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchSsdReplicaEvictReq {
+    pub evictions: Vec<SsdReplicaEviction>,
+}
+impl MsgPackSerializePart for BatchSsdReplicaEvictReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchSsdReplicaEvictReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchSsdReplicaEvictResp {
+    pub removed_count: u32,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for BatchSsdReplicaEvictResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchSsdReplicaEvictResp as u32
+    }
+}
+impl RPCReq for BatchSsdReplicaEvictReq {
+    type Resp = BatchSsdReplicaEvictResp;
+}
+
 // --- RPC for MemHolder KeepAlive ---
 
 #[derive(Default, Debug, Clone, Encode, Decode)]

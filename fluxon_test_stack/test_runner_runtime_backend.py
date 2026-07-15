@@ -190,10 +190,28 @@ def _prepare_test_stack_case(
         profile_test_stack.get("kind"),
         "resolved_case.profile.test_stack.kind",
     )
+    mooncake_storage_mode: Optional[str] = None
+    if backend_kind == ctx.TEST_STACK_BACKEND_MOONCAKE:
+        runtime_config = ctx._require_dict(
+            profile_test_stack.get("runtime_config"),
+            "resolved_case.profile.test_stack.runtime_config",
+        )
+        mooncake_storage = ctx._normalize_testbed_mooncake_storage_config(
+            runtime_config.get("testbed_mooncake_storage"),
+            "resolved_case.profile.test_stack.runtime_config.testbed_mooncake_storage",
+        )
+        mooncake_storage_mode = ctx._require_str(
+            mooncake_storage.get("mode"),
+            "resolved_case.profile.test_stack.runtime_config.testbed_mooncake_storage.mode",
+        )
     owner_instance_ids: List[str] = []
     share_mem_path: Optional[str] = None
     stack_cluster_name: Optional[str] = None
-    if ctx._test_stack_backend_uses_dedicated_kv_owners(backend_kind=backend_kind, mode=mode):
+    if ctx._test_stack_backend_uses_dedicated_kv_owners(
+        backend_kind=backend_kind,
+        mode=mode,
+        mooncake_storage_mode=mooncake_storage_mode,
+    ):
         runtime = ctx._require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
         owner_instance_ids = [
             iid
@@ -321,7 +339,11 @@ def _prepare_test_stack_case(
                 timeout_s=int(cluster_ready_timeout_seconds),
                 ctx="TEST_STACK owner shared bundle",
             )
-    elif ctx._test_stack_backend_uses_dedicated_kv_owners(backend_kind=backend_kind, mode=mode):
+    elif ctx._test_stack_backend_uses_dedicated_kv_owners(
+        backend_kind=backend_kind,
+        mode=mode,
+        mooncake_storage_mode=mooncake_storage_mode,
+    ):
         for owner_id in owner_instance_ids:
             ctx._wait_instance_running(resolved_case, instance_id=owner_id, timeout_s=60)
     ctx._stage_runtime_phase_run_dir(resolved_case, run_dir=run_dir, phase=node_runtime_phase)

@@ -12,10 +12,11 @@ use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::config::TestSpecConfig;
 use crate::kv_ssd_storage::{
     DEFAULT_READ_TRANSFER_PIPELINE_CHUNK_BYTES, DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT,
-    KvSsdStorage, KvSsdStorageInit, SsdLoadedChunk,
+    KvSsdPersistGuard, KvSsdStorage, KvSsdStorageInit, SsdLoadedChunk,
 };
 use crate::master_kv_router::msg_pack::{
-    BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, DeleteClientKvMetaCacheItem,
+    BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchSsdReplicaEvictReq,
+    DeleteClientKvMetaCacheItem, SsdReplicaEviction,
 };
 use crate::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
 use crate::memholder::{AllMemholderRefCount, MemoryInfo, UserMemHolder};
@@ -46,10 +47,15 @@ use fluxon_util::map_lock::AMapLock;
 use futures::stream::{FuturesUnordered, StreamExt};
 use limit_thirdparty::tokio;
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::Weak;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::warn;
+
+const SSD_EVICTION_BATCH_MAX_ITEMS: usize = 256;
+const SSD_EVICTION_BATCH_MAX_DELAY: Duration = Duration::from_millis(10);
+const SSD_EVICTION_BATCH_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Information about a memholder held by external client
 #[derive(Clone)]
@@ -506,11 +512,11 @@ async fn handle_ssd_replica_persist(
 ) -> MsgPack<SsdReplicaPersistResp> {
     let req = msg.serialize_part.clone();
     let inner = view.client_kv_api().inner();
-    let persisted = match inner
+    let persist_guard = match inner
         .persist_local_kv_to_ssd(&req.key, req.put_id, req.target_addr, req.len)
         .await
     {
-        Ok(persisted) => persisted,
+        Ok(persist_guard) => persist_guard,
         Err(err) => {
             return MsgPack {
                 serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
@@ -519,6 +525,7 @@ async fn handle_ssd_replica_persist(
         }
     };
 
+    let persisted = persist_guard.is_some();
     if persisted {
         if let Err(err) = inner
             .commit_ssd_replica_to_master(&req.key, req.put_id, req.len)
@@ -530,6 +537,7 @@ async fn handle_ssd_replica_persist(
             };
         }
     }
+    drop(persist_guard);
 
     MsgPack {
         serialize_part: SsdReplicaPersistResp {
@@ -863,6 +871,80 @@ impl std::ops::Deref for ClientKvApiViewHolder {
     }
 }
 
+fn spawn_ssd_replica_eviction_batch(
+    view: ClientKvApiView,
+    mut rx: ::tokio::sync::mpsc::Receiver<Vec<SsdReplicaEviction>>,
+) {
+    let view_for_task = view.clone();
+    let _ = view.spawn("ssd_replica_eviction_batch", async move {
+        let mut pending = VecDeque::new();
+        let mut rx_closed = false;
+        let mut shutdown_waiter = view_for_task.register_shutdown_waiter();
+
+        'actor: loop {
+            if pending.is_empty() {
+                let received = tokio::select! {
+                    received = rx.recv() => received,
+                    _ = shutdown_waiter.wait() => break 'actor,
+                };
+                match received {
+                    Some(replicas) => pending.extend(replicas),
+                    None => break,
+                }
+            }
+
+            let deadline = ::tokio::time::Instant::now() + SSD_EVICTION_BATCH_MAX_DELAY;
+            while pending.len() < SSD_EVICTION_BATCH_MAX_ITEMS && !rx_closed {
+                let received = tokio::select! {
+                    received = ::tokio::time::timeout_at(deadline, rx.recv()) => received,
+                    _ = shutdown_waiter.wait() => break 'actor,
+                };
+                match received {
+                    Ok(Some(replicas)) => pending.extend(replicas),
+                    Ok(None) => rx_closed = true,
+                    Err(_) => break,
+                }
+            }
+
+            let batch_len = pending.len().min(SSD_EVICTION_BATCH_MAX_ITEMS);
+            let batch = pending.drain(..batch_len).collect::<Vec<_>>();
+            let retry_batch = batch.clone();
+            let send_result = tokio::select! {
+                result = view_for_task
+                    .client_kv_api()
+                    .inner()
+                    .evict_ssd_replicas_from_master(batch) => result,
+                _ = shutdown_waiter.wait() => break 'actor,
+            };
+            match send_result {
+                Ok(removed_count) => tracing::debug!(
+                    "Sent SSD replica eviction batch: requested={} removed={}",
+                    batch_len,
+                    removed_count
+                ),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to send SSD replica eviction batch; retaining it for retry: requested={} err={}",
+                        batch_len,
+                        err
+                    );
+                    for eviction in retry_batch.into_iter().rev() {
+                        pending.push_front(eviction);
+                    }
+                    tokio::select! {
+                        _ = ::tokio::time::sleep(SSD_EVICTION_BATCH_RETRY_DELAY) => {}
+                        _ = shutdown_waiter.wait() => break 'actor,
+                    }
+                }
+            }
+
+            if rx_closed && pending.is_empty() {
+                break;
+            }
+        }
+    });
+}
+
 pub struct ClientKvApiInner {
     view: ClientKvApiViewHolder,
     test_spec_config: TestSpecConfig,
@@ -912,6 +994,7 @@ pub struct ClientKvApiInner {
     rpc_caller_resolve_side_transfer_lane: RPCCaller<ResolveSideTransferLaneReq>,
     rpc_caller_ssd_stage_read: RPCCaller<SsdStageReadReq>,
     rpc_caller_ssd_replica_commit: RPCCaller<SsdReplicaCommitReq>,
+    rpc_caller_batch_ssd_replica_evict: RPCCaller<BatchSsdReplicaEvictReq>,
 
     /// Default lease id recorded for inspection/convenience, but NOT auto-applied.
     /// Callers must explicitly pass `Some(lease_id)` to attach a put to a lease.
@@ -1001,12 +1084,21 @@ impl ClientKvApiInner {
         put_id: crate::master_kv_router::put::PutIDForAKey,
         abs_addr: u64,
         len: u64,
-    ) -> KvResult<bool> {
+    ) -> KvResult<Option<KvSsdPersistGuard>> {
         let Some(store) = self.ssd_storage.as_ref() else {
-            return Ok(false);
+            return Ok(None);
         };
-        store.persist_from_addr(key, put_id, abs_addr, len).await?;
-        Ok(true)
+        let guard = store.persist_from_addr(key, put_id, abs_addr, len).await?;
+        Ok(Some(guard))
+    }
+
+    pub(crate) fn kv_ssd_storage_usage_snapshot(
+        &self,
+    ) -> Vec<crate::kv_ssd_storage::KvSsdStorageDeviceUsage> {
+        self.ssd_storage
+            .as_ref()
+            .map(|store| store.device_usage_snapshot())
+            .unwrap_or_default()
     }
 
     pub(crate) async fn commit_ssd_replica_to_master(
@@ -1047,6 +1139,37 @@ impl ClientKvApiInner {
         )
     }
 
+    async fn evict_ssd_replicas_from_master(
+        &self,
+        evictions: Vec<SsdReplicaEviction>,
+    ) -> KvResult<u32> {
+        let req = MsgPack {
+            serialize_part: BatchSsdReplicaEvictReq { evictions },
+            raw_bytes: Vec::new(),
+        };
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let resp = self
+            .rpc_caller_batch_ssd_replica_evict
+            .call(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                req,
+                Some(Duration::from_secs(10)),
+                2,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json,
+        )?;
+        Ok(resp.serialize_part.removed_count)
+    }
+
     pub(crate) async fn load_and_push_kv_from_ssd(
         &self,
         key: &str,
@@ -1069,6 +1192,19 @@ impl ClientKvApiInner {
         } else {
             Some(target_node_id.clone())
         };
+        if peer_id.is_none() && stage_addr == target_addr {
+            tracing::debug!(
+                "Loading local SSD replica directly into target: key={} target={:#x} len={} capacity={}",
+                key,
+                target_addr,
+                len,
+                stage_len
+            );
+            return store
+                .load_into_addr(key, put_id, target_addr, len, stage_len)
+                .await;
+        }
+
         let (chunk_tx, chunk_rx) = ::tokio::sync::mpsc::channel(
             DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT
                 .saturating_mul(2)
@@ -1822,17 +1958,22 @@ impl ClientKvApi {
         &self.0
     }
 
+    pub(crate) fn kv_ssd_storage_usage_snapshot(
+        &self,
+    ) -> Vec<crate::kv_ssd_storage::KvSsdStorageDeviceUsage> {
+        self.inner().kv_ssd_storage_usage_snapshot()
+    }
+
     pub fn attach_view(&self, view: ClientKvApiView) {
         self.0.view.attach(view);
     }
 
     pub async fn construct(arg: ClientKvApiNewArg) -> Result<Self, KvError> {
         tracing::info!("Constructing ClientKvApi in Client mode (PreView)");
-        let ssd_storage = arg
-            .ssd_storage
-            .map(KvSsdStorage::new)
-            .transpose()?
-            .map(Arc::new);
+        let ssd_storage = match arg.ssd_storage {
+            Some(init) => Some(Arc::new(KvSsdStorage::new(init).await?)),
+            None => None,
+        };
 
         let inner = ClientKvApiInner {
             view: ClientKvApiViewHolder::new(),
@@ -1872,6 +2013,7 @@ impl ClientKvApi {
             rpc_caller_resolve_side_transfer_lane: RPCCaller::new(),
             rpc_caller_ssd_stage_read: RPCCaller::new(),
             rpc_caller_ssd_replica_commit: RPCCaller::new(),
+            rpc_caller_batch_ssd_replica_evict: RPCCaller::new(),
             default_lease_id: parking_lot::RwLock::new(None),
         };
         Ok(Self(inner))
@@ -1910,6 +2052,9 @@ impl ClientKvApi {
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_ssd_replica_commit
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_ssd_replica_evict
             .regist(inner.view.p2p_module());
         crate::key_prefix::init_for_p2p_owner(inner.view.p2p_module());
         crate::kvlease::init_for_p2p_owner(inner.view.p2p_module());
@@ -2121,6 +2266,13 @@ impl ClientKvApi {
             .take_rx()
             .expect("delete_ack_batch rx already taken, that's impossible");
         delete::spawn_owner_delete_ack_batch(inner.view.clone_view(), delete_ack_batch_rx);
+
+        if let Some(store) = inner.ssd_storage.as_ref() {
+            let eviction_rx = store
+                .take_eviction_rx()
+                .expect("SSD eviction receiver must only be taken during client initialization");
+            spawn_ssd_replica_eviction_batch(inner.view.clone_view(), eviction_rx);
+        }
 
         // Spawn cluster listener to clean up get_holding when external_client leaves
         let view = inner.view.clone_view();

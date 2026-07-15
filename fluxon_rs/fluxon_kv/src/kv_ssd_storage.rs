@@ -1,3 +1,6 @@
+use crate::config::{KvSsdStorageBackend, KvSsdUringMode};
+use crate::kv_ssd_storage_foyer::{FoyerKvSsdPersistGuard, FoyerKvSsdStorage};
+use crate::master_kv_router::msg_pack::SsdReplicaEviction;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult};
 use ::tokio::{
@@ -28,13 +31,21 @@ const DEFAULT_WRITE_QUEUE_DEPTH: usize = 8;
 const DEFAULT_READ_QUEUE_DEPTH: usize = 16;
 const DEFAULT_WRITE_INFLIGHT: usize = 2;
 const DEFAULT_READ_INFLIGHT: usize = 16;
+const DEFAULT_EVICTION_QUEUE_DEPTH: usize = 1024;
 pub(crate) const DEFAULT_READ_TRANSFER_PIPELINE_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct KvSsdStorageInit {
-    pub root_dirs: Vec<PathBuf>,
-    pub max_bytes: u64,
+    pub root_limits: Vec<KvSsdStorageRootLimit>,
+    pub uring_mode: KvSsdUringMode,
+    pub backend: KvSsdStorageBackend,
+}
+
+#[derive(Clone, Debug)]
+pub struct KvSsdStorageRootLimit {
+    pub root_dir: PathBuf,
+    pub limit_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -45,6 +56,9 @@ pub struct KvSsdStorage {
     next_write_device: AtomicUsize,
     inner: Arc<Mutex<KvSsdStorageInner>>,
     space_notify: Arc<Notify>,
+    eviction_rx: Mutex<Option<tokio_mpsc::Receiver<Vec<SsdReplicaEviction>>>>,
+    _eviction_tx_guard: Option<tokio_mpsc::Sender<Vec<SsdReplicaEviction>>>,
+    foyer: Option<FoyerKvSsdStorage>,
 }
 
 #[derive(Debug)]
@@ -62,12 +76,21 @@ struct SsdDeviceWorker {
 struct SsdDeviceRoot {
     device_id: u64,
     root_dir: PathBuf,
+    limit_bytes: u64,
 }
 
 struct OpenedSsdShard {
     shard_id: usize,
     device_idx: usize,
+    capacity: u64,
     file: std::fs::File,
+}
+
+#[derive(Clone, Debug)]
+struct SsdShardSpec {
+    shard_id: usize,
+    device_idx: usize,
+    capacity: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,6 +98,13 @@ pub(crate) struct SsdLoadedChunk {
     pub offset: u64,
     pub stage_addr: u64,
     pub len: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct KvSsdStorageDeviceUsage {
+    pub device: String,
+    pub capacity_bytes: u64,
+    pub used_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -135,14 +165,21 @@ struct SsdRingBuffer {
 
 #[derive(Debug)]
 enum SsdPreparedWrite {
-    Ready(SsdIndexEntry),
+    Ready {
+        entry: SsdIndexEntry,
+        evicted: Vec<KvSsdKey>,
+    },
     Existing,
     BlockedByBusyIo,
 }
 
 #[derive(Debug)]
 enum SsdAllocation {
-    Ready { begin: u64, file_offset: u64 },
+    Ready {
+        begin: u64,
+        file_offset: u64,
+        evicted: Vec<KvSsdKey>,
+    },
     BlockedByBusyIo,
     TooLarge,
 }
@@ -219,8 +256,19 @@ impl SsdRingBuffer {
                 detail: "kv ssd device has no shards".to_string(),
             }));
         }
-        if self.entries.contains_key(&key) {
-            return Ok(SsdPreparedWrite::Existing);
+        if let Some(state) = self.entries.get(&key) {
+            return Ok(match state {
+                SsdEntryState::Writing(_) => SsdPreparedWrite::BlockedByBusyIo,
+                SsdEntryState::Committed(entry) if entry.len == len => SsdPreparedWrite::Existing,
+                SsdEntryState::Committed(entry) => {
+                    return Err(KvError::Api(ApiError::InvalidArgument {
+                        detail: format!(
+                            "kv ssd duplicate persist length mismatch: key={} put_id=({},{}) existing_len={} requested_len={}",
+                            key.key, key.put_id.0, key.put_id.1, entry.len, len
+                        ),
+                    }));
+                }
+            });
         }
         let aligned_len = align_up_u64(len, SSD_ALIGNMENT as u64)?;
         let max_capacity = self
@@ -250,8 +298,14 @@ impl SsdRingBuffer {
             if !allowed_shards.contains(&shard_id) {
                 continue;
             }
-            let (begin, file_offset) = match self.allocate_contiguous(shard_id, aligned_len) {
-                SsdAllocation::Ready { begin, file_offset } => (begin, file_offset),
+            let (begin, file_offset, evicted) = match self
+                .allocate_contiguous(shard_id, aligned_len)
+            {
+                SsdAllocation::Ready {
+                    begin,
+                    file_offset,
+                    evicted,
+                } => (begin, file_offset, evicted),
                 SsdAllocation::BlockedByBusyIo => continue,
                 SsdAllocation::TooLarge => unreachable!("aligned_len was checked against capacity"),
             };
@@ -267,7 +321,7 @@ impl SsdRingBuffer {
             self.entries
                 .insert(key.clone(), SsdEntryState::Writing(entry.clone()));
             self.shards[shard_id].order.push_back(key);
-            return Ok(SsdPreparedWrite::Ready(entry));
+            return Ok(SsdPreparedWrite::Ready { entry, evicted });
         }
 
         Ok(SsdPreparedWrite::BlockedByBusyIo)
@@ -293,19 +347,21 @@ impl SsdRingBuffer {
         }
 
         self.shards[shard_id].head = new_head;
-        self.advance_tail(shard_id, new_tail);
+        let evicted = self.advance_tail(shard_id, new_tail);
         SsdAllocation::Ready {
             begin,
             file_offset: begin % capacity,
+            evicted,
         }
     }
 
-    fn advance_tail(&mut self, shard_id: usize, new_tail: u64) {
+    fn advance_tail(&mut self, shard_id: usize, new_tail: u64) -> Vec<KvSsdKey> {
         if new_tail <= self.shards[shard_id].tail {
-            return;
+            return Vec::new();
         }
         debug_assert!(!self.has_busy_entries_before(shard_id, new_tail));
         self.shards[shard_id].tail = new_tail;
+        let mut evicted = Vec::new();
 
         while let Some(key) = self.shards[shard_id].order.front() {
             match self.entries.get(key) {
@@ -315,10 +371,13 @@ impl SsdRingBuffer {
                         .order
                         .pop_front()
                         .expect("front key exists");
-                    self.entries.remove(&key);
+                    if matches!(self.entries.remove(&key), Some(SsdEntryState::Committed(_))) {
+                        evicted.push(key);
+                    }
                 }
             }
         }
+        evicted
     }
 
     fn commit(&mut self, key: &KvSsdKey, success: bool) -> bool {
@@ -348,6 +407,17 @@ impl SsdRingBuffer {
             .is_some_and(|shard| entry.begin >= shard.tail)
     }
 
+    fn used_bytes_by_shard(&self) -> Vec<u64> {
+        let mut out = vec![0u64; self.shards.len()];
+        for state in self.entries.values() {
+            let entry = state.entry();
+            if self.is_offset_valid(entry) {
+                out[entry.shard_id] = out[entry.shard_id].saturating_add(entry.aligned_len);
+            }
+        }
+        out
+    }
+
     fn has_busy_entries_before(&self, shard_id: usize, new_tail: u64) -> bool {
         if new_tail <= self.shards[shard_id].tail {
             return false;
@@ -371,6 +441,11 @@ struct SsdReadPin {
     key: KvSsdKey,
 }
 
+pub(crate) struct KvSsdPersistGuard {
+    _native_pin: Option<SsdReadPin>,
+    _foyer_guard: Option<FoyerKvSsdPersistGuard>,
+}
+
 impl Drop for SsdReadPin {
     fn drop(&mut self) {
         self.inner.lock().ring.unpin_read(&self.key);
@@ -382,7 +457,7 @@ struct WriteCommand {
     key: KvSsdKey,
     entry_len: u64,
     data: AlignedBuffer,
-    done_tx: oneshot::Sender<KvResult<()>>,
+    done_tx: oneshot::Sender<KvResult<KvSsdPersistGuard>>,
 }
 
 struct ReadCommand {
@@ -398,7 +473,7 @@ struct WriteTask {
     key: KvSsdKey,
     entry: SsdIndexEntry,
     data: AlignedBuffer,
-    done_tx: oneshot::Sender<KvResult<()>>,
+    done_tx: oneshot::Sender<KvResult<KvSsdPersistGuard>>,
 }
 
 struct ReadTask {
@@ -414,7 +489,7 @@ struct WriteCompletion {
     key: KvSsdKey,
     success: bool,
     result: KvResult<()>,
-    done_tx: oneshot::Sender<KvResult<()>>,
+    done_tx: oneshot::Sender<KvResult<KvSsdPersistGuard>>,
 }
 
 struct ReadCompletion {
@@ -458,36 +533,87 @@ pub fn safe_path_component(raw: &str) -> String {
 }
 
 impl KvSsdStorage {
-    pub fn new(init: KvSsdStorageInit) -> KvResult<Self> {
-        if init.max_bytes < SSD_ALIGNMENT as u64 {
+    pub async fn new(init: KvSsdStorageInit) -> KvResult<Self> {
+        if init.root_limits.is_empty() {
             return Err(KvError::Api(ApiError::InvalidArgument {
-                detail: format!("kv ssd storage max_bytes must be >= {}", SSD_ALIGNMENT),
+                detail: "kv ssd storage root_limits must contain at least one path".to_string(),
             }));
         }
-        if init.root_dirs.is_empty() {
-            return Err(KvError::Api(ApiError::InvalidArgument {
-                detail: "kv ssd storage root_dirs must contain at least one path".to_string(),
-            }));
+        for (idx, root_limit) in init.root_limits.iter().enumerate() {
+            if root_limit.limit_bytes < SSD_ALIGNMENT as u64 {
+                return Err(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "kv ssd storage root_limits[{idx}].limit_bytes must be >= {}",
+                        SSD_ALIGNMENT
+                    ),
+                }));
+            }
         }
 
-        let device_roots = deduplicate_device_roots(&init.root_dirs)?;
+        if init.backend == KvSsdStorageBackend::Foyer {
+            if init.root_limits.len() != 1 {
+                return Err(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "foyer kv ssd backend requires exactly one root, got {}",
+                        init.root_limits.len()
+                    ),
+                }));
+            }
+            tracing::warn!(
+                "Using test-only Foyer KV SSD backend; proactive SSD eviction notifications are unavailable"
+            );
+            let root_limit = init
+                .root_limits
+                .into_iter()
+                .next()
+                .expect("foyer root count checked above");
+            let dummy_capacity = root_limit.limit_bytes;
+            let foyer = FoyerKvSsdStorage::new(root_limit).await?;
+            let root_dirs = vec![foyer.root_dir().to_path_buf()];
+            let (eviction_tx, eviction_rx) = tokio_mpsc::channel(DEFAULT_EVICTION_QUEUE_DEPTH);
+            return Ok(Self {
+                root_dirs,
+                devices: Vec::new(),
+                shard_to_device: Vec::new(),
+                next_write_device: AtomicUsize::new(0),
+                inner: Arc::new(Mutex::new(KvSsdStorageInner {
+                    ring: SsdRingBuffer::new(vec![dummy_capacity]),
+                })),
+                space_notify: Arc::new(Notify::new()),
+                eviction_rx: Mutex::new(Some(eviction_rx)),
+                _eviction_tx_guard: Some(eviction_tx),
+                foyer: Some(foyer),
+            });
+        }
+
+        let device_roots = deduplicate_device_roots(&init.root_limits)?;
         let effective_root_dirs = device_roots
             .iter()
             .map(|root| root.root_dir.clone())
             .collect::<Vec<_>>();
-        let shard_count = choose_shard_count(init.max_bytes, device_roots.len());
-        let shard_capacity = aligned_shard_capacity(init.max_bytes, shard_count)?;
-        let opened_shards = open_cache_files(&device_roots, shard_count, shard_capacity)?;
+        let shard_specs = build_shard_specs(&device_roots)?;
+        let opened_shards = open_cache_files(&device_roots, &shard_specs)?;
         let inner = Arc::new(Mutex::new(KvSsdStorageInner {
-            ring: SsdRingBuffer::new(vec![shard_capacity; shard_count]),
+            ring: SsdRingBuffer::new(
+                shard_specs
+                    .iter()
+                    .map(|spec| spec.capacity)
+                    .collect::<Vec<_>>(),
+            ),
         }));
         let space_notify = Arc::new(Notify::new());
+        let (eviction_tx, eviction_rx) = tokio_mpsc::channel(DEFAULT_EVICTION_QUEUE_DEPTH);
+        let shard_count = shard_specs.len();
         let mut shard_to_device = vec![0usize; shard_count];
         let mut device_shards = device_roots
             .iter()
             .map(|root| (root.clone(), Vec::<(usize, std::fs::File)>::new()))
             .collect::<Vec<_>>();
         for opened in opened_shards {
+            debug_assert_eq!(
+                inner.lock().ring.shards[opened.shard_id].capacity,
+                opened.capacity
+            );
             shard_to_device[opened.shard_id] = opened.device_idx;
             device_shards[opened.device_idx]
                 .1
@@ -509,6 +635,7 @@ impl KvSsdStorage {
                 UringConfig {
                     threads: DEFAULT_URING_THREADS,
                     io_depth: DEFAULT_URING_IO_DEPTH,
+                    mode: init.uring_mode,
                 },
             )?);
             let (write_tx, write_rx) = tokio_mpsc::channel(DEFAULT_WRITE_QUEUE_DEPTH);
@@ -521,6 +648,7 @@ impl KvSsdStorage {
                 Arc::clone(&space_notify),
                 DEFAULT_WRITE_INFLIGHT,
                 shard_ids.clone(),
+                eviction_tx.clone(),
             ));
             task::spawn(ssd_reader_loop(
                 Arc::clone(&inner),
@@ -550,11 +678,57 @@ impl KvSsdStorage {
             next_write_device: AtomicUsize::new(0),
             inner,
             space_notify,
+            eviction_rx: Mutex::new(Some(eviction_rx)),
+            _eviction_tx_guard: None,
+            foyer: None,
         })
     }
 
     pub fn root_dirs(&self) -> &[PathBuf] {
         &self.root_dirs
+    }
+
+    pub(crate) fn device_usage_snapshot(&self) -> Vec<KvSsdStorageDeviceUsage> {
+        if let Some(foyer) = self.foyer.as_ref() {
+            return vec![KvSsdStorageDeviceUsage {
+                device: format!("foyer:{}", foyer.root_dir().display()),
+                capacity_bytes: foyer.capacity_bytes(),
+                used_bytes: foyer.logical_used_bytes(),
+            }];
+        }
+        let inner = self.inner.lock();
+        let used_by_shard = inner.ring.used_bytes_by_shard();
+        self.devices
+            .iter()
+            .enumerate()
+            .map(|(device_idx, device)| {
+                let mut capacity_bytes = 0u64;
+                let mut used_bytes = 0u64;
+                for shard_id in &device.shard_ids {
+                    if self
+                        .shard_to_device
+                        .get(*shard_id)
+                        .is_some_and(|mapped| *mapped == device_idx)
+                    {
+                        let Some(shard) = inner.ring.shards.get(*shard_id) else {
+                            continue;
+                        };
+                        capacity_bytes = capacity_bytes.saturating_add(shard.capacity);
+                        used_bytes = used_bytes
+                            .saturating_add(used_by_shard.get(*shard_id).copied().unwrap_or(0));
+                    }
+                }
+                KvSsdStorageDeviceUsage {
+                    device: format!("dev:{}:{}", device.device_id, device.root_dir.display()),
+                    capacity_bytes,
+                    used_bytes,
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn take_eviction_rx(&self) -> Option<tokio_mpsc::Receiver<Vec<SsdReplicaEviction>>> {
+        self.eviction_rx.lock().take()
     }
 
     fn next_write_tx(&self) -> KvResult<tokio_mpsc::Sender<WriteCommand>> {
@@ -595,14 +769,23 @@ impl KvSsdStorage {
         Ok(device.read_tx.clone())
     }
 
-    pub async fn persist_from_addr(
+    pub(crate) async fn persist_from_addr(
         &self,
         key: &str,
         put_id: PutIDForAKey,
         addr: u64,
         len: u64,
-    ) -> KvResult<()> {
+    ) -> KvResult<KvSsdPersistGuard> {
         validate_key(key)?;
+        if let Some(foyer) = self.foyer.as_ref() {
+            return foyer
+                .persist_from_addr(key, put_id, addr, len)
+                .await
+                .map(|guard| KvSsdPersistGuard {
+                    _native_pin: None,
+                    _foyer_guard: Some(guard),
+                });
+        }
         let len_usize = usize::try_from(len).map_err(|_| {
             KvError::Api(ApiError::InvalidArgument {
                 detail: format!("kv ssd persist len does not fit usize: {}", len),
@@ -615,13 +798,21 @@ impl KvSsdStorage {
 
     pub async fn persist(&self, key: &str, put_id: PutIDForAKey, data: &[u8]) -> KvResult<()> {
         validate_key(key)?;
+        if let Some(foyer) = self.foyer.as_ref() {
+            let guard = foyer.persist(key, put_id, data).await?;
+            drop(guard);
+            return Ok(());
+        }
         let aligned_len = align_up_usize(data.len(), SSD_ALIGNMENT)?;
         let mut buffer = AlignedBuffer::zeroed(aligned_len)?;
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.as_mut_ptr(), data.len());
         }
-        self.persist_buffer(key, put_id, data.len() as u64, buffer)
-            .await
+        let guard = self
+            .persist_buffer(key, put_id, data.len() as u64, buffer)
+            .await?;
+        drop(guard);
+        Ok(())
     }
 
     async fn persist_buffer(
@@ -630,7 +821,7 @@ impl KvSsdStorage {
         put_id: PutIDForAKey,
         entry_len: u64,
         data: AlignedBuffer,
-    ) -> KvResult<()> {
+    ) -> KvResult<KvSsdPersistGuard> {
         let (done_tx, done_rx) = oneshot::channel();
         let write_tx = self.next_write_tx()?;
         write_tx
@@ -665,6 +856,11 @@ impl KvSsdStorage {
         target_len: u64,
     ) -> KvResult<()> {
         validate_key(key)?;
+        if let Some(foyer) = self.foyer.as_ref() {
+            return foyer
+                .load_into_addr(key, put_id, target_addr, len, target_len)
+                .await;
+        }
         if target_len < len {
             return Err(KvError::Api(ApiError::InvalidArgument {
                 detail: format!(
@@ -751,6 +947,20 @@ impl KvSsdStorage {
         ready_tx: tokio_mpsc::Sender<SsdLoadedChunk>,
     ) -> KvResult<()> {
         validate_key(key)?;
+        if let Some(foyer) = self.foyer.as_ref() {
+            return foyer
+                .load_into_addr_chunks(
+                    key,
+                    put_id,
+                    target_addr,
+                    len,
+                    target_len,
+                    chunk_bytes,
+                    max_read_inflight,
+                    ready_tx,
+                )
+                .await;
+        }
         if target_len < len {
             return Err(KvError::Api(ApiError::InvalidArgument {
                 detail: format!(
@@ -937,12 +1147,42 @@ impl KvSsdStorage {
 
     #[cfg(test)]
     async fn has_entry(&self, key: &str, put_id: PutIDForAKey) -> bool {
+        if let Some(foyer) = self.foyer.as_ref() {
+            return foyer.contains(key, put_id);
+        }
         let key = KvSsdKey {
             key: key.to_string(),
             put_id,
         };
         self.inner.lock().ring.get(&key).is_some()
     }
+}
+
+fn prepare_ssd_write(
+    inner: &Arc<Mutex<KvSsdStorageInner>>,
+    space_notify: &Arc<Notify>,
+    key: &KvSsdKey,
+    entry_len: u64,
+    shard_ids: &[usize],
+) -> (KvResult<SsdPreparedWrite>, Option<KvSsdPersistGuard>) {
+    let (prepared, existing_pinned) = {
+        let mut inner = inner.lock();
+        let prepared = inner
+            .ring
+            .prepare_write_on_shards(key.clone(), entry_len, shard_ids);
+        let existing_pinned = matches!(&prepared, Ok(SsdPreparedWrite::Existing))
+            && inner.ring.pin_read(key).is_some();
+        (prepared, existing_pinned)
+    };
+    let guard = existing_pinned.then(|| KvSsdPersistGuard {
+        _native_pin: Some(SsdReadPin {
+            inner: Arc::clone(inner),
+            space_notify: Arc::clone(space_notify),
+            key: key.clone(),
+        }),
+        _foyer_guard: None,
+    });
+    (prepared, guard)
 }
 
 async fn ssd_writer_loop(
@@ -952,6 +1192,7 @@ async fn ssd_writer_loop(
     space_notify: Arc<Notify>,
     write_inflight: usize,
     shard_ids: Vec<usize>,
+    eviction_tx: tokio_mpsc::Sender<Vec<SsdReplicaEviction>>,
 ) {
     let mut pending: VecDeque<WriteCommand> = VecDeque::new();
     let mut inflight = FuturesUnordered::new();
@@ -962,14 +1203,11 @@ async fn ssd_writer_loop(
             let Some(cmd) = pending.pop_front() else {
                 break;
             };
-            let prepared = {
-                let mut inner = inner.lock();
-                inner
-                    .ring
-                    .prepare_write_on_shards(cmd.key.clone(), cmd.entry_len, &shard_ids)
-            };
+            let (prepared, existing_guard) =
+                prepare_ssd_write(&inner, &space_notify, &cmd.key, cmd.entry_len, &shard_ids);
             match prepared {
-                Ok(SsdPreparedWrite::Ready(entry)) => {
+                Ok(SsdPreparedWrite::Ready { entry, evicted }) => {
+                    publish_ssd_evictions(&eviction_tx, evicted);
                     inflight.push(execute_write(
                         WriteTask {
                             key: cmd.key,
@@ -981,7 +1219,12 @@ async fn ssd_writer_loop(
                     ));
                 }
                 Ok(SsdPreparedWrite::Existing) => {
-                    let _ = cmd.done_tx.send(Ok(()));
+                    let result = existing_guard.ok_or_else(|| {
+                        KvError::Api(ApiError::KeyNotFound {
+                            key: cmd.key.key.clone(),
+                        })
+                    });
+                    let _ = cmd.done_tx.send(result);
                 }
                 Ok(SsdPreparedWrite::BlockedByBusyIo) => {
                     pending.push_front(cmd);
@@ -1016,14 +1259,11 @@ async fn ssd_writer_loop(
             let Some(cmd) = pending.pop_front() else {
                 break;
             };
-            let prepared = {
-                let mut inner = inner.lock();
-                inner
-                    .ring
-                    .prepare_write_on_shards(cmd.key.clone(), cmd.entry_len, &shard_ids)
-            };
+            let (prepared, existing_guard) =
+                prepare_ssd_write(&inner, &space_notify, &cmd.key, cmd.entry_len, &shard_ids);
             match prepared {
-                Ok(SsdPreparedWrite::Ready(entry)) => {
+                Ok(SsdPreparedWrite::Ready { entry, evicted }) => {
+                    publish_ssd_evictions(&eviction_tx, evicted);
                     inflight.push(execute_write(
                         WriteTask {
                             key: cmd.key,
@@ -1035,7 +1275,12 @@ async fn ssd_writer_loop(
                     ));
                 }
                 Ok(SsdPreparedWrite::Existing) => {
-                    let _ = cmd.done_tx.send(Ok(()));
+                    let result = existing_guard.ok_or_else(|| {
+                        KvError::Api(ApiError::KeyNotFound {
+                            key: cmd.key.key.clone(),
+                        })
+                    });
+                    let _ = cmd.done_tx.send(result);
                 }
                 Ok(SsdPreparedWrite::BlockedByBusyIo) => {
                     pending.push_front(cmd);
@@ -1055,22 +1300,52 @@ async fn ssd_writer_loop(
     }
 }
 
+fn publish_ssd_evictions(
+    eviction_tx: &tokio_mpsc::Sender<Vec<SsdReplicaEviction>>,
+    evicted: Vec<KvSsdKey>,
+) {
+    if evicted.is_empty() {
+        return;
+    }
+    let replicas = evicted
+        .into_iter()
+        .map(|key| SsdReplicaEviction {
+            key: key.key,
+            put_id: key.put_id,
+        })
+        .collect();
+    if let Err(err) = eviction_tx.try_send(replicas) {
+        tracing::warn!(
+            "Dropping SSD eviction notification because its queue is unavailable: {err}"
+        );
+    }
+}
+
 fn finish_write_completion(
     inner: &Arc<Mutex<KvSsdStorageInner>>,
-    space_notify: &Notify,
+    space_notify: &Arc<Notify>,
     completion: WriteCompletion,
 ) {
-    let committed = inner
-        .lock()
-        .ring
-        .commit(&completion.key, completion.success);
+    let (committed, commit_pinned) = {
+        let mut inner = inner.lock();
+        let committed = inner.ring.commit(&completion.key, completion.success);
+        let commit_pinned = committed && inner.ring.pin_read(&completion.key).is_some();
+        (committed, commit_pinned)
+    };
     space_notify.notify_one();
-    let result = if completion.success && !committed {
-        Err(KvError::Api(ApiError::KeyNotFound {
+    let result = match completion.result {
+        Err(err) => Err(err),
+        Ok(()) if committed && commit_pinned => Ok(KvSsdPersistGuard {
+            _native_pin: Some(SsdReadPin {
+                inner: Arc::clone(inner),
+                space_notify: Arc::clone(space_notify),
+                key: completion.key.clone(),
+            }),
+            _foyer_guard: None,
+        }),
+        Ok(()) => Err(KvError::Api(ApiError::KeyNotFound {
             key: completion.key.key.clone(),
-        }))
-    } else {
-        completion.result
+        })),
     };
     let _ = completion.done_tx.send(result);
 }
@@ -1088,7 +1363,7 @@ async fn execute_write(task: WriteTask, io: Arc<UringIoEngine>) -> WriteCompleti
     let result = async move {
         let rx = {
             let data_ptr = data.as_ptr();
-            io.writev_at_async(shard_id, vec![(data_ptr, data_len)], file_offset)?
+            io.write_at_async(shard_id, data_ptr, data_len, file_offset)?
         };
         let written = rx
             .await
@@ -1187,7 +1462,7 @@ async fn execute_read(task: ReadTask, io: Arc<UringIoEngine>) -> ReadCompletion 
                 let buffer_len = buffer.len();
                 let rx = {
                     let buffer_ptr = buffer.as_mut_ptr();
-                    io.readv_at_async(shard_id, vec![(buffer_ptr, buffer_len)], file_offset)?
+                    io.read_at_async(shard_id, buffer_ptr, buffer_len, file_offset)?
                 };
                 let read = rx
                     .await
@@ -1201,8 +1476,7 @@ async fn execute_read(task: ReadTask, io: Arc<UringIoEngine>) -> ReadCompletion 
                 Ok(ReadOutput::Scratch(buffer))
             }
             ReadTarget::Direct { target_addr, len } => {
-                let rx =
-                    io.readv_at_async(shard_id, vec![(target_addr as *mut u8, len)], file_offset)?;
+                let rx = io.read_at_async(shard_id, target_addr as *mut u8, len, file_offset)?;
                 let read = rx
                     .await
                     .map_err(|_| io::Error::other("kv ssd read completion dropped"))??;
@@ -1231,10 +1505,13 @@ async fn execute_read(task: ReadTask, io: Arc<UringIoEngine>) -> ReadCompletion 
 struct UringConfig {
     threads: usize,
     io_depth: usize,
+    mode: KvSsdUringMode,
 }
 
 #[derive(Clone, Copy)]
 enum IoType {
+    Read,
+    Write,
     Readv,
     Writev,
 }
@@ -1245,7 +1522,8 @@ struct IoCtx {
     len: usize,
     offset: u64,
     complete: oneshot::Sender<io::Result<usize>>,
-    iovecs: Box<[libc::iovec]>,
+    buffer: Option<(*mut u8, usize)>,
+    iovecs: Option<Box<[libc::iovec]>>,
 }
 
 unsafe impl Send for IoCtx {}
@@ -1311,6 +1589,8 @@ impl UringShard {
                 }
                 let ctx = unsafe { Box::from_raw(data as *mut IoCtx) };
                 match ctx.io_type {
+                    IoType::Read => read_inflight = read_inflight.saturating_sub(1),
+                    IoType::Write => write_inflight = write_inflight.saturating_sub(1),
                     IoType::Readv => read_inflight = read_inflight.saturating_sub(1),
                     IoType::Writev => write_inflight = write_inflight.saturating_sub(1),
                 }
@@ -1400,8 +1680,35 @@ impl UringShard {
 
     fn submit_ctx(&mut self, ctx: IoCtx, read_inflight: &mut usize, write_inflight: &mut usize) {
         let fd = Fd(ctx.fd);
-        let iovecs_ptr = ctx.iovecs.as_ptr();
+        let buffer = ctx.buffer;
+        let iovecs_ptr = ctx
+            .iovecs
+            .as_ref()
+            .map(|iovecs| iovecs.as_ptr())
+            .unwrap_or(std::ptr::null());
         let sqe = match ctx.io_type {
+            IoType::Read => {
+                let Some((ptr, len)) = buffer else {
+                    let _ = ctx.complete.send(Err(io::Error::other(
+                        "single-buffer read missing buffer pointer",
+                    )));
+                    return;
+                };
+                opcode::Read::new(fd, ptr, len as _)
+                    .offset(ctx.offset)
+                    .build()
+            }
+            IoType::Write => {
+                let Some((ptr, len)) = buffer else {
+                    let _ = ctx.complete.send(Err(io::Error::other(
+                        "single-buffer write missing buffer pointer",
+                    )));
+                    return;
+                };
+                opcode::Write::new(fd, ptr as *const u8, len as _)
+                    .offset(ctx.offset)
+                    .build()
+            }
             IoType::Readv => opcode::Readv::new(fd, iovecs_ptr, ctx.len as _)
                 .offset(ctx.offset)
                 .build(),
@@ -1421,6 +1728,8 @@ impl UringShard {
             return;
         }
         match io_type {
+            IoType::Read => *read_inflight += 1,
+            IoType::Write => *write_inflight += 1,
             IoType::Readv => *read_inflight += 1,
             IoType::Writev => *write_inflight += 1,
         }
@@ -1433,6 +1742,7 @@ struct UringIoEngine {
     read_txs: Vec<crossbeam::channel::Sender<IoCtx>>,
     write_txs: Vec<crossbeam::channel::Sender<IoCtx>>,
     handles: Vec<JoinHandle<()>>,
+    mode: KvSsdUringMode,
 }
 
 impl UringIoEngine {
@@ -1478,7 +1788,38 @@ impl UringIoEngine {
             read_txs,
             write_txs,
             handles,
+            mode: cfg.mode,
         })
+    }
+
+    fn read_at_async(
+        &self,
+        shard_id: usize,
+        ptr: *mut u8,
+        len: usize,
+        offset: u64,
+    ) -> io::Result<oneshot::Receiver<io::Result<usize>>> {
+        match self.mode {
+            KvSsdUringMode::SingleBuffer => {
+                self.submit_buffer(IoType::Read, shard_id, ptr, len, offset)
+            }
+            KvSsdUringMode::Iovec => self.readv_at_async(shard_id, vec![(ptr, len)], offset),
+        }
+    }
+
+    fn write_at_async(
+        &self,
+        shard_id: usize,
+        ptr: *const u8,
+        len: usize,
+        offset: u64,
+    ) -> io::Result<oneshot::Receiver<io::Result<usize>>> {
+        match self.mode {
+            KvSsdUringMode::SingleBuffer => {
+                self.submit_buffer(IoType::Write, shard_id, ptr as *mut u8, len, offset)
+            }
+            KvSsdUringMode::Iovec => self.writev_at_async(shard_id, vec![(ptr, len)], offset),
+        }
     }
 
     fn readv_at_async(
@@ -1501,6 +1842,40 @@ impl UringIoEngine {
             .map(|(ptr, len)| (ptr as *mut u8, len))
             .collect();
         self.submit_iovecs(IoType::Writev, shard_id, iovecs, offset)
+    }
+
+    fn submit_buffer(
+        &self,
+        io_type: IoType,
+        shard_id: usize,
+        ptr: *mut u8,
+        len: usize,
+        offset: u64,
+    ) -> io::Result<oneshot::Receiver<io::Result<usize>>> {
+        if !matches!(io_type, IoType::Read | IoType::Write) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "single-buffer submit requires read/write io type",
+            ));
+        }
+        validate_direct_io([(ptr as usize, len)], offset)?;
+        let (tx, rx) = oneshot::channel();
+        let ctx = IoCtx {
+            io_type,
+            fd: self.fd(shard_id)?,
+            len,
+            offset,
+            complete: tx,
+            buffer: Some((ptr, len)),
+            iovecs: None,
+        };
+        self.pick_tx(io_type, shard_id).send(ctx).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("io_uring send failed: {}", err),
+            )
+        })?;
+        Ok(rx)
     }
 
     fn submit_iovecs(
@@ -1535,7 +1910,8 @@ impl UringIoEngine {
             len: iovecs_libc.len(),
             offset,
             complete: tx,
-            iovecs: iovecs_libc,
+            buffer: None,
+            iovecs: Some(iovecs_libc),
         };
         self.pick_tx(io_type, shard_id).send(ctx).map_err(|err| {
             io::Error::new(
@@ -1557,6 +1933,8 @@ impl UringIoEngine {
 
     fn pick_tx(&self, io_type: IoType, shard_id: usize) -> &crossbeam::channel::Sender<IoCtx> {
         match io_type {
+            IoType::Read => &self.read_txs[shard_id % self.read_txs.len()],
+            IoType::Write => &self.write_txs[shard_id % self.write_txs.len()],
             IoType::Readv => &self.read_txs[shard_id % self.read_txs.len()],
             IoType::Writev => &self.write_txs[shard_id % self.write_txs.len()],
         }
@@ -1681,12 +2059,9 @@ fn choose_chunk_read_path(
     }
 }
 
-fn choose_shard_count(max_bytes: u64, root_count: usize) -> usize {
-    let max_aligned_shards = (max_bytes / SSD_ALIGNMENT as u64).max(1) as usize;
-    DEFAULT_SHARDS_PER_OWNER
-        .max(root_count)
-        .min(max_aligned_shards)
-        .max(1)
+fn choose_device_shard_count(limit_bytes: u64) -> usize {
+    let max_aligned_shards = (limit_bytes / SSD_ALIGNMENT as u64).max(1) as usize;
+    DEFAULT_SHARDS_PER_OWNER.min(max_aligned_shards).max(1)
 }
 
 fn aligned_shard_capacity(capacity_bytes: u64, shard_count: usize) -> KvResult<u64> {
@@ -1700,28 +2075,53 @@ fn aligned_shard_capacity(capacity_bytes: u64, shard_count: usize) -> KvResult<u
     Ok(capacity)
 }
 
-fn deduplicate_device_roots(root_dirs: &[PathBuf]) -> KvResult<Vec<SsdDeviceRoot>> {
-    if root_dirs.is_empty() {
+fn build_shard_specs(device_roots: &[SsdDeviceRoot]) -> KvResult<Vec<SsdShardSpec>> {
+    if device_roots.is_empty() {
         return Err(KvError::Api(ApiError::InvalidArgument {
-            detail: "kv ssd storage root_dirs must contain at least one path".to_string(),
+            detail: "kv ssd storage root_limits must contain at least one path".to_string(),
+        }));
+    }
+    let mut shard_specs = Vec::new();
+    for (device_idx, root) in device_roots.iter().enumerate() {
+        let shard_count = choose_device_shard_count(root.limit_bytes);
+        let shard_capacity = aligned_shard_capacity(root.limit_bytes, shard_count)?;
+        for _ in 0..shard_count {
+            let shard_id = shard_specs.len();
+            shard_specs.push(SsdShardSpec {
+                shard_id,
+                device_idx,
+                capacity: shard_capacity,
+            });
+        }
+    }
+    Ok(shard_specs)
+}
+
+fn deduplicate_device_roots(root_limits: &[KvSsdStorageRootLimit]) -> KvResult<Vec<SsdDeviceRoot>> {
+    if root_limits.is_empty() {
+        return Err(KvError::Api(ApiError::InvalidArgument {
+            detail: "kv ssd storage root_limits must contain at least one path".to_string(),
         }));
     }
     let mut seen_devices = HashSet::new();
     let mut device_roots = Vec::new();
-    for root_dir in root_dirs {
-        fs::create_dir_all(root_dir).map_err(|err| file_error(root_dir, 0, err))?;
-        let metadata = fs::metadata(root_dir).map_err(|err| file_error(root_dir, 0, err))?;
+    for root_limit in root_limits {
+        fs::create_dir_all(&root_limit.root_dir)
+            .map_err(|err| file_error(&root_limit.root_dir, 0, err))?;
+        let metadata = fs::metadata(&root_limit.root_dir)
+            .map_err(|err| file_error(&root_limit.root_dir, 0, err))?;
         let device_id = metadata.dev();
         if seen_devices.insert(device_id) {
             device_roots.push(SsdDeviceRoot {
                 device_id,
-                root_dir: root_dir.clone(),
+                root_dir: root_limit.root_dir.clone(),
+                limit_bytes: root_limit.limit_bytes,
             });
         }
     }
     if device_roots.is_empty() {
         return Err(KvError::Api(ApiError::InvalidArgument {
-            detail: "kv ssd storage root_dirs contains no usable device".to_string(),
+            detail: "kv ssd storage root_limits contains no usable device".to_string(),
         }));
     }
     Ok(device_roots)
@@ -1729,21 +2129,27 @@ fn deduplicate_device_roots(root_dirs: &[PathBuf]) -> KvResult<Vec<SsdDeviceRoot
 
 fn open_cache_files(
     device_roots: &[SsdDeviceRoot],
-    shard_count: usize,
-    shard_capacity: u64,
+    shard_specs: &[SsdShardSpec],
 ) -> KvResult<Vec<OpenedSsdShard>> {
     if device_roots.is_empty() {
         return Err(KvError::Api(ApiError::InvalidArgument {
-            detail: "kv ssd storage root_dirs must contain at least one path".to_string(),
+            detail: "kv ssd storage root_limits must contain at least one path".to_string(),
         }));
     }
-    let mut files = Vec::with_capacity(shard_count);
-    for shard_id in 0..shard_count {
-        let device_idx = shard_id % device_roots.len();
-        let root_dir = &device_roots[device_idx].root_dir;
+    let mut files = Vec::with_capacity(shard_specs.len());
+    for spec in shard_specs {
+        let Some(device_root) = device_roots.get(spec.device_idx) else {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "kv ssd shard spec references invalid device index: shard_id={} device_idx={}",
+                    spec.shard_id, spec.device_idx
+                ),
+            }));
+        };
+        let root_dir = &device_root.root_dir;
         let shards_dir = root_dir.join("shards");
         fs::create_dir_all(&shards_dir).map_err(|err| file_error(&shards_dir, 0, err))?;
-        let path = shards_dir.join(format!("shard-{shard_id:06}.dat"));
+        let path = shards_dir.join(format!("shard-{:06}.dat", spec.shard_id));
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -1752,11 +2158,12 @@ fn open_cache_files(
             .custom_flags(libc::O_DIRECT)
             .open(&path)
             .map_err(|err| file_error(&path, 0, err))?;
-        file.set_len(shard_capacity)
+        file.set_len(spec.capacity)
             .map_err(|err| file_error(&path, 0, err))?;
         files.push(OpenedSsdShard {
-            shard_id,
-            device_idx,
+            shard_id: spec.shard_id,
+            device_idx: spec.device_idx,
+            capacity: spec.capacity,
             file,
         });
     }
@@ -1849,6 +2256,7 @@ impl From<io::Error> for KvError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn new_root() -> PathBuf {
@@ -1859,12 +2267,145 @@ mod tests {
             .join(Uuid::new_v4().to_string())
     }
 
-    async fn new_store(max_bytes: u64) -> KvSsdStorage {
+    async fn new_store_with_mode(max_bytes: u64, uring_mode: KvSsdUringMode) -> KvSsdStorage {
         KvSsdStorage::new(KvSsdStorageInit {
-            root_dirs: vec![new_root()],
-            max_bytes,
+            root_limits: vec![KvSsdStorageRootLimit {
+                root_dir: new_root(),
+                limit_bytes: max_bytes,
+            }],
+            uring_mode,
+            backend: KvSsdStorageBackend::Native,
         })
+        .await
         .unwrap()
+    }
+
+    async fn new_store(max_bytes: u64) -> KvSsdStorage {
+        new_store_with_mode(max_bytes, KvSsdUringMode::SingleBuffer).await
+    }
+
+    async fn new_foyer_store(max_bytes: u64) -> KvSsdStorage {
+        KvSsdStorage::new(KvSsdStorageInit {
+            root_limits: vec![KvSsdStorageRootLimit {
+                root_dir: new_root(),
+                limit_bytes: max_bytes,
+            }],
+            uring_mode: KvSsdUringMode::SingleBuffer,
+            backend: KvSsdStorageBackend::Foyer,
+        })
+        .await
+        .unwrap()
+    }
+
+    #[::tokio::test]
+    async fn foyer_backend_persists_and_loads_from_disk_without_memory_admission() {
+        let store = new_foyer_store(128 * 1024 * 1024).await;
+        let data = (0..8193).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
+        let put_id = (91, 2);
+
+        store.persist("foyer", put_id, &data).await.unwrap();
+        let foyer = store.foyer.as_ref().unwrap();
+        assert_eq!(foyer.memory_usage(), 0);
+
+        let mut loaded = vec![0u8; data.len()];
+        store
+            .load_into_addr(
+                "foyer",
+                put_id,
+                loaded.as_mut_ptr() as u64,
+                data.len() as u64,
+                loaded.len() as u64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(loaded, data);
+        assert_eq!(foyer.source_counts(), (0, 1, 0));
+        assert_eq!(foyer.memory_usage(), 0);
+
+        let mut chunked = vec![0u8; data.len()];
+        let (ready_tx, mut ready_rx) = tokio_mpsc::channel(8);
+        store
+            .load_into_addr_chunks(
+                "foyer",
+                put_id,
+                chunked.as_mut_ptr() as u64,
+                data.len() as u64,
+                chunked.len() as u64,
+                4096,
+                4,
+                ready_tx,
+            )
+            .await
+            .unwrap();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = ready_rx.recv().await {
+            chunks.push((chunk.offset, chunk.len));
+        }
+        assert_eq!(chunked, data);
+        assert_eq!(chunks, vec![(0, 4096), (4096, 4096), (8192, 1)]);
+        assert_eq!(foyer.source_counts(), (0, 2, 0));
+        assert_eq!(foyer.memory_usage(), 0);
+    }
+
+    #[::tokio::test]
+    async fn foyer_backend_backpressures_concurrent_persists_until_durable() {
+        const ENTRY_COUNT: usize = 24;
+        const ENTRY_BYTES: usize = 1024 * 1024;
+
+        let store = new_foyer_store(128 * 1024 * 1024).await;
+        let keys = (0..ENTRY_COUNT)
+            .map(|idx| format!("foyer-concurrent-{idx}"))
+            .collect::<Vec<_>>();
+        let values = (0..ENTRY_COUNT)
+            .map(|idx| vec![(idx % 251) as u8; ENTRY_BYTES])
+            .collect::<Vec<_>>();
+        let persists = keys
+            .iter()
+            .zip(values.iter())
+            .enumerate()
+            .map(|(idx, (key, value))| store.persist(key, (100 + idx as u64, 0), value));
+        for result in futures::future::join_all(persists).await {
+            result.unwrap();
+        }
+
+        let foyer = store.foyer.as_ref().unwrap();
+        assert_eq!(foyer.memory_usage(), 0);
+        for (idx, (key, expected)) in keys.iter().zip(values.iter()).enumerate() {
+            let mut loaded = vec![0u8; expected.len()];
+            store
+                .load_into_addr(
+                    key,
+                    (100 + idx as u64, 0),
+                    loaded.as_mut_ptr() as u64,
+                    loaded.len() as u64,
+                    loaded.len() as u64,
+                )
+                .await
+                .unwrap();
+            assert_eq!(&loaded, expected);
+        }
+        assert_eq!(foyer.memory_usage(), 0);
+    }
+
+    #[::tokio::test]
+    async fn foyer_backend_rejects_multiple_roots() {
+        let err = KvSsdStorage::new(KvSsdStorageInit {
+            root_limits: vec![
+                KvSsdStorageRootLimit {
+                    root_dir: new_root(),
+                    limit_bytes: 128 * 1024 * 1024,
+                },
+                KvSsdStorageRootLimit {
+                    root_dir: new_root(),
+                    limit_bytes: 128 * 1024 * 1024,
+                },
+            ],
+            uring_mode: KvSsdUringMode::SingleBuffer,
+            backend: KvSsdStorageBackend::Foyer,
+        })
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("requires exactly one root"));
     }
 
     fn test_key(key: &str, version: u64) -> KvSsdKey {
@@ -1876,8 +2417,92 @@ mod tests {
 
     fn prepare_ready(ring: &mut SsdRingBuffer, key: &KvSsdKey) -> SsdIndexEntry {
         match ring.prepare_write(key.clone(), 500).unwrap() {
-            SsdPreparedWrite::Ready(entry) => entry,
+            SsdPreparedWrite::Ready { entry, .. } => entry,
             other => panic!("expected ready SSD write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shard_specs_preserve_per_device_limits() {
+        let device_roots = vec![
+            SsdDeviceRoot {
+                device_id: 1,
+                root_dir: PathBuf::from("/tmp/fluxon-test-ssd-a"),
+                limit_bytes: 4 * SSD_ALIGNMENT as u64,
+            },
+            SsdDeviceRoot {
+                device_id: 2,
+                root_dir: PathBuf::from("/tmp/fluxon-test-ssd-b"),
+                limit_bytes: 8 * SSD_ALIGNMENT as u64,
+            },
+        ];
+
+        let shard_specs = build_shard_specs(&device_roots).unwrap();
+        let mut capacity_by_device = [0u64; 2];
+        for spec in shard_specs {
+            capacity_by_device[spec.device_idx] =
+                capacity_by_device[spec.device_idx].saturating_add(spec.capacity);
+        }
+
+        assert_eq!(capacity_by_device[0], 4 * SSD_ALIGNMENT as u64);
+        assert_eq!(capacity_by_device[1], 8 * SSD_ALIGNMENT as u64);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ReferenceSqeShape {
+        Read,
+        Write,
+        Readv,
+        Writev,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SubmitWaitAction {
+        Retry,
+        DrainCompletions,
+        FailWorker,
+    }
+
+    fn fluxon_current_sqe_shape(io_type: IoType, iovec_count: usize) -> ReferenceSqeShape {
+        assert!(iovec_count > 0);
+        match io_type {
+            IoType::Read => ReferenceSqeShape::Read,
+            IoType::Write => ReferenceSqeShape::Write,
+            IoType::Readv => ReferenceSqeShape::Readv,
+            IoType::Writev => ReferenceSqeShape::Writev,
+        }
+    }
+
+    fn ringline_reference_direct_io_sqe_shape(
+        io_type: IoType,
+        iovec_count: usize,
+    ) -> Option<ReferenceSqeShape> {
+        assert!(iovec_count > 0);
+        match (io_type, iovec_count) {
+            (IoType::Readv, 1) => Some(ReferenceSqeShape::Read),
+            (IoType::Writev, 1) => Some(ReferenceSqeShape::Write),
+            (_, _) => None,
+        }
+    }
+
+    fn ringline_reference_direct_io_allowed(buf_addr: u64, len: u64, offset: u64) -> bool {
+        len != 0
+            && buf_addr.is_multiple_of(SSD_ALIGNMENT as u64)
+            && len.is_multiple_of(SSD_ALIGNMENT as u64)
+            && offset.is_multiple_of(SSD_ALIGNMENT as u64)
+    }
+
+    fn fluxon_current_submit_wait_error_action(_err: &io::Error) -> SubmitWaitAction {
+        SubmitWaitAction::FailWorker
+    }
+
+    fn ringline_reference_submit_wait_error_action(err: &io::Error) -> SubmitWaitAction {
+        if err.kind() == io::ErrorKind::Interrupted {
+            SubmitWaitAction::Retry
+        } else if err.raw_os_error() == Some(libc::EBUSY) {
+            SubmitWaitAction::DrainCompletions
+        } else {
+            SubmitWaitAction::FailWorker
         }
     }
 
@@ -1892,6 +2517,27 @@ mod tests {
         store
             .load_into_addr(
                 "k",
+                put_id,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+                out.len() as u64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[::tokio::test]
+    async fn persist_and_load_roundtrip_supports_iovec_ablation_mode() {
+        let store = new_store_with_mode(1024 * 1024, KvSsdUringMode::Iovec).await;
+        let data = b"hello from ssd through iovec";
+        let put_id = (10, 2);
+        store.persist("k-iovec", put_id, data).await.unwrap();
+
+        let mut out = vec![0u8; data.len()];
+        store
+            .load_into_addr(
+                "k-iovec",
                 put_id,
                 out.as_mut_ptr() as u64,
                 out.len() as u64,
@@ -2008,6 +2654,708 @@ mod tests {
         );
     }
 
+    #[test]
+    fn chunk_read_path_matches_ringline_alignment_plus_stage_capacity() {
+        let cases = [
+            (4096, 512, 512, 0, SsdReadPath::Direct),
+            (4097, 512, 512, 0, SsdReadPath::Scratch),
+            (4096, 500, 512, 0, SsdReadPath::Scratch),
+            (4096, 512, 511, 0, SsdReadPath::Scratch),
+            (4096, 512, 512, 1, SsdReadPath::Scratch),
+            (4096, 0, 512, 0, SsdReadPath::Scratch),
+        ];
+
+        for (target_addr, read_len, target_len, file_offset, expected) in cases {
+            let ringline_direct =
+                ringline_reference_direct_io_allowed(target_addr, read_len, file_offset);
+            assert_eq!(
+                choose_chunk_read_path(target_addr, read_len, target_len, file_offset),
+                expected
+            );
+            assert_eq!(
+                expected == SsdReadPath::Direct,
+                ringline_direct && target_len >= read_len
+            );
+        }
+    }
+
+    #[test]
+    fn full_read_path_adds_payload_contract_to_ringline_alignment() {
+        let entry = SsdIndexEntry {
+            shard_id: 0,
+            begin: 0,
+            len: 500,
+            aligned_len: 512,
+            file_offset: 0,
+        };
+        let target_addr = 4096;
+
+        assert!(ringline_reference_direct_io_allowed(
+            target_addr,
+            entry.aligned_len,
+            entry.file_offset
+        ));
+        assert_eq!(
+            choose_read_path(&entry, target_addr, entry.len, entry.aligned_len),
+            SsdReadPath::Direct
+        );
+        assert_eq!(
+            choose_read_path(&entry, target_addr, entry.len - 1, entry.aligned_len),
+            SsdReadPath::Scratch
+        );
+        assert_eq!(
+            choose_read_path(&entry, target_addr, entry.len, entry.len),
+            SsdReadPath::Scratch
+        );
+    }
+
+    #[test]
+    fn ringline_reference_uses_single_buffer_direct_io_opcodes() {
+        assert_eq!(
+            fluxon_current_sqe_shape(IoType::Readv, 1),
+            ReferenceSqeShape::Readv
+        );
+        assert_eq!(
+            ringline_reference_direct_io_sqe_shape(IoType::Readv, 1),
+            Some(ReferenceSqeShape::Read)
+        );
+        assert_eq!(
+            fluxon_current_sqe_shape(IoType::Writev, 1),
+            ReferenceSqeShape::Writev
+        );
+        assert_eq!(
+            ringline_reference_direct_io_sqe_shape(IoType::Writev, 1),
+            Some(ReferenceSqeShape::Write)
+        );
+        assert_eq!(
+            ringline_reference_direct_io_sqe_shape(IoType::Readv, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn ringline_reference_classifies_transient_submit_wait_errors() {
+        let interrupted = io::Error::from(io::ErrorKind::Interrupted);
+        let busy = io::Error::from_raw_os_error(libc::EBUSY);
+        let invalid = io::Error::from_raw_os_error(libc::EINVAL);
+
+        assert_eq!(
+            fluxon_current_submit_wait_error_action(&interrupted),
+            SubmitWaitAction::FailWorker
+        );
+        assert_eq!(
+            ringline_reference_submit_wait_error_action(&interrupted),
+            SubmitWaitAction::Retry
+        );
+        assert_eq!(
+            fluxon_current_submit_wait_error_action(&busy),
+            SubmitWaitAction::FailWorker
+        );
+        assert_eq!(
+            ringline_reference_submit_wait_error_action(&busy),
+            SubmitWaitAction::DrainCompletions
+        );
+        assert_eq!(
+            ringline_reference_submit_wait_error_action(&invalid),
+            SubmitWaitAction::FailWorker
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PerfOpcode {
+        FluxonReadv,
+        FluxonWritev,
+        RinglineRead,
+        RinglineWrite,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct PerfResult {
+        opcode: PerfOpcode,
+        ops: usize,
+        bytes_per_op: usize,
+        elapsed: std::time::Duration,
+    }
+
+    impl PerfResult {
+        fn ns_per_op(&self) -> f64 {
+            self.elapsed.as_nanos() as f64 / self.ops as f64
+        }
+
+        fn mib_per_sec(&self) -> f64 {
+            let bytes = self.ops as f64 * self.bytes_per_op as f64;
+            bytes / self.elapsed.as_secs_f64() / 1024.0 / 1024.0
+        }
+    }
+
+    fn best_perf_result(results: &[PerfResult]) -> PerfResult {
+        results
+            .iter()
+            .min_by_key(|result| result.elapsed)
+            .copied()
+            .unwrap()
+    }
+
+    fn median_perf_result(results: &[PerfResult]) -> PerfResult {
+        let mut sorted = results.to_vec();
+        sorted.sort_by_key(|result| result.elapsed);
+        sorted[sorted.len() / 2]
+    }
+
+    fn print_perf_pair_result(
+        stat: &str,
+        label: &str,
+        fluxon: PerfResult,
+        ringline: PerfResult,
+        rounds: usize,
+    ) {
+        println!(
+            "uring opcode perf {stat}-of-{rounds} {label}: {:?}: ops={} bytes/op={} elapsed={:?} ns/op={:.1} MiB/s={:.1}",
+            fluxon.opcode,
+            fluxon.ops,
+            fluxon.bytes_per_op,
+            fluxon.elapsed,
+            fluxon.ns_per_op(),
+            fluxon.mib_per_sec()
+        );
+        println!(
+            "uring opcode perf {stat}-of-{rounds} {label}: {:?}: ops={} bytes/op={} elapsed={:?} ns/op={:.1} MiB/s={:.1}",
+            ringline.opcode,
+            ringline.ops,
+            ringline.bytes_per_op,
+            ringline.elapsed,
+            ringline.ns_per_op(),
+            ringline.mib_per_sec()
+        );
+        println!(
+            "uring opcode perf delta {stat}-of-{rounds} {label}: ringline-style relative to Fluxon = {:.2}%",
+            (fluxon.ns_per_op() - ringline.ns_per_op()) / fluxon.ns_per_op() * 100.0
+        );
+    }
+
+    fn print_perf_pair(
+        label: &str,
+        fluxon_results: &[PerfResult],
+        ringline_results: &[PerfResult],
+    ) {
+        assert_eq!(fluxon_results.len(), ringline_results.len());
+        let rounds = fluxon_results.len();
+        print_perf_pair_result(
+            "best",
+            label,
+            best_perf_result(fluxon_results),
+            best_perf_result(ringline_results),
+            rounds,
+        );
+        print_perf_pair_result(
+            "median",
+            label,
+            median_perf_result(fluxon_results),
+            median_perf_result(ringline_results),
+            rounds,
+        );
+    }
+
+    fn run_uring_io_perf(
+        opcode: PerfOpcode,
+        fd: RawFd,
+        buffer: &mut AlignedBuffer,
+        ops: usize,
+        bytes_per_op: usize,
+        offset_slots: usize,
+    ) -> io::Result<PerfResult> {
+        assert!(offset_slots > 0);
+        let mut ring = IoUring::builder().build(64)?;
+        let start = std::time::Instant::now();
+        for idx in 0..ops {
+            let offset = u64::try_from((idx % offset_slots) * bytes_per_op).unwrap();
+            let iovec = libc::iovec {
+                iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
+                iov_len: bytes_per_op,
+            };
+            let sqe = match opcode {
+                PerfOpcode::FluxonReadv => {
+                    opcode::Readv::new(Fd(fd), &iovec, 1).offset(offset).build()
+                }
+                PerfOpcode::FluxonWritev => opcode::Writev::new(Fd(fd), &iovec, 1)
+                    .offset(offset)
+                    .build(),
+                PerfOpcode::RinglineRead => {
+                    opcode::Read::new(Fd(fd), buffer.as_mut_ptr(), bytes_per_op as _)
+                        .offset(offset)
+                        .build()
+                }
+                PerfOpcode::RinglineWrite => {
+                    opcode::Write::new(Fd(fd), buffer.as_ptr(), bytes_per_op as _)
+                        .offset(offset)
+                        .build()
+                }
+            }
+            .user_data((idx + 1) as u64);
+            unsafe {
+                ring.submission()
+                    .push(&sqe)
+                    .map_err(|_| io::Error::other("submission queue full"))?;
+            }
+            ring.submit_and_wait(1)?;
+            let mut cq = ring.completion();
+            let cqe: io_uring::cqueue::Entry = cq
+                .next()
+                .ok_or_else(|| io::Error::other("missing completion"))?;
+            if cqe.result() != bytes_per_op as i32 {
+                return Err(io::Error::other(format!(
+                    "short uring perf completion: {} != {}",
+                    cqe.result(),
+                    bytes_per_op
+                )));
+            }
+        }
+        Ok(PerfResult {
+            opcode,
+            ops,
+            bytes_per_op,
+            elapsed: start.elapsed(),
+        })
+    }
+
+    #[test]
+    #[ignore = "manual perf comparison for Fluxon Readv/Writev vs ringline-style Read/Write"]
+    fn perf_compare_fluxon_iovecs_with_ringline_single_buffer_ops() {
+        let dir = std::env::temp_dir().join(format!("fluxon-kv-ssd-perf-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for (bytes_per_op, ops, offset_slots, rounds) in [
+            (4096usize, 256usize, 128usize, 3usize),
+            (1024 * 1024usize, 12usize, 12usize, 3usize),
+            (10 * 1024 * 1024usize, 3usize, 3usize, 3usize),
+        ] {
+            assert!(bytes_per_op.is_multiple_of(SSD_ALIGNMENT));
+            let file_len = bytes_per_op.checked_mul(offset_slots).unwrap();
+            let path = dir.join(format!("direct-{bytes_per_op}.dat"));
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(&path)
+                .unwrap();
+            file.set_len(file_len as u64).unwrap();
+
+            let mut seed = AlignedBuffer::zeroed(bytes_per_op).unwrap();
+            unsafe {
+                std::ptr::write_bytes(seed.as_mut_ptr(), 0x5a, bytes_per_op);
+            }
+            for slot in 0..offset_slots {
+                let offset = u64::try_from(slot * bytes_per_op).unwrap();
+                let written = unsafe {
+                    libc::pwrite(
+                        file.as_raw_fd(),
+                        seed.as_ptr() as *const _,
+                        bytes_per_op,
+                        offset as libc::off_t,
+                    )
+                };
+                assert_eq!(written, bytes_per_op as isize);
+            }
+
+            let mut readv_buffer = AlignedBuffer::zeroed(bytes_per_op).unwrap();
+            let mut read_buffer = AlignedBuffer::zeroed(bytes_per_op).unwrap();
+            let mut writev_buffer = AlignedBuffer::zeroed(bytes_per_op).unwrap();
+            let mut write_buffer = AlignedBuffer::zeroed(bytes_per_op).unwrap();
+            unsafe {
+                std::ptr::write_bytes(writev_buffer.as_mut_ptr(), 0xa5, bytes_per_op);
+                std::ptr::write_bytes(write_buffer.as_mut_ptr(), 0x3c, bytes_per_op);
+            }
+
+            let warmup_ops = ops.min(16);
+            let _ = run_uring_io_perf(
+                PerfOpcode::FluxonReadv,
+                file.as_raw_fd(),
+                &mut readv_buffer,
+                warmup_ops,
+                bytes_per_op,
+                offset_slots,
+            )
+            .unwrap();
+            let _ = run_uring_io_perf(
+                PerfOpcode::RinglineRead,
+                file.as_raw_fd(),
+                &mut read_buffer,
+                warmup_ops,
+                bytes_per_op,
+                offset_slots,
+            )
+            .unwrap();
+            let _ = run_uring_io_perf(
+                PerfOpcode::FluxonWritev,
+                file.as_raw_fd(),
+                &mut writev_buffer,
+                warmup_ops,
+                bytes_per_op,
+                offset_slots,
+            )
+            .unwrap();
+            let _ = run_uring_io_perf(
+                PerfOpcode::RinglineWrite,
+                file.as_raw_fd(),
+                &mut write_buffer,
+                warmup_ops,
+                bytes_per_op,
+                offset_slots,
+            )
+            .unwrap();
+
+            let mut readv_results = Vec::with_capacity(rounds);
+            let mut read_results = Vec::with_capacity(rounds);
+            let mut writev_results = Vec::with_capacity(rounds);
+            let mut write_results = Vec::with_capacity(rounds);
+            for round_idx in 0..rounds {
+                if round_idx % 2 == 0 {
+                    readv_results.push(
+                        run_uring_io_perf(
+                            PerfOpcode::FluxonReadv,
+                            file.as_raw_fd(),
+                            &mut readv_buffer,
+                            ops,
+                            bytes_per_op,
+                            offset_slots,
+                        )
+                        .unwrap(),
+                    );
+                    read_results.push(
+                        run_uring_io_perf(
+                            PerfOpcode::RinglineRead,
+                            file.as_raw_fd(),
+                            &mut read_buffer,
+                            ops,
+                            bytes_per_op,
+                            offset_slots,
+                        )
+                        .unwrap(),
+                    );
+                } else {
+                    read_results.push(
+                        run_uring_io_perf(
+                            PerfOpcode::RinglineRead,
+                            file.as_raw_fd(),
+                            &mut read_buffer,
+                            ops,
+                            bytes_per_op,
+                            offset_slots,
+                        )
+                        .unwrap(),
+                    );
+                    readv_results.push(
+                        run_uring_io_perf(
+                            PerfOpcode::FluxonReadv,
+                            file.as_raw_fd(),
+                            &mut readv_buffer,
+                            ops,
+                            bytes_per_op,
+                            offset_slots,
+                        )
+                        .unwrap(),
+                    );
+                }
+
+                if round_idx % 2 == 0 {
+                    writev_results.push(
+                        run_uring_io_perf(
+                            PerfOpcode::FluxonWritev,
+                            file.as_raw_fd(),
+                            &mut writev_buffer,
+                            ops,
+                            bytes_per_op,
+                            offset_slots,
+                        )
+                        .unwrap(),
+                    );
+                    write_results.push(
+                        run_uring_io_perf(
+                            PerfOpcode::RinglineWrite,
+                            file.as_raw_fd(),
+                            &mut write_buffer,
+                            ops,
+                            bytes_per_op,
+                            offset_slots,
+                        )
+                        .unwrap(),
+                    );
+                } else {
+                    write_results.push(
+                        run_uring_io_perf(
+                            PerfOpcode::RinglineWrite,
+                            file.as_raw_fd(),
+                            &mut write_buffer,
+                            ops,
+                            bytes_per_op,
+                            offset_slots,
+                        )
+                        .unwrap(),
+                    );
+                    writev_results.push(
+                        run_uring_io_perf(
+                            PerfOpcode::FluxonWritev,
+                            file.as_raw_fd(),
+                            &mut writev_buffer,
+                            ops,
+                            bytes_per_op,
+                            offset_slots,
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+
+            print_perf_pair("read", &readv_results, &read_results);
+            print_perf_pair("write", &writev_results, &write_results);
+
+            fs::remove_file(&path).ok();
+        }
+        fs::remove_dir(&dir).ok();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum StoragePerfOp {
+        Persist,
+        Load,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct StoragePerfResult {
+        mode: KvSsdUringMode,
+        op: StoragePerfOp,
+        ops: usize,
+        bytes_per_op: usize,
+        elapsed: std::time::Duration,
+    }
+
+    impl StoragePerfResult {
+        fn ns_per_op(&self) -> f64 {
+            self.elapsed.as_nanos() as f64 / self.ops as f64
+        }
+
+        fn mib_per_sec(&self) -> f64 {
+            let bytes = self.ops as f64 * self.bytes_per_op as f64;
+            bytes / self.elapsed.as_secs_f64() / 1024.0 / 1024.0
+        }
+    }
+
+    fn storage_perf_capacity(bytes_per_op: usize, ops: usize) -> u64 {
+        let bytes = bytes_per_op
+            .checked_mul(ops)
+            .and_then(|value| value.checked_mul(2))
+            .unwrap();
+        align_up_u64(bytes as u64, SSD_ALIGNMENT as u64).unwrap()
+    }
+
+    fn storage_perf_data(bytes_per_op: usize) -> Vec<u8> {
+        (0..bytes_per_op)
+            .map(|idx| ((idx * 31 + idx / 251) % 251) as u8)
+            .collect()
+    }
+
+    async fn run_storage_persist_perf(
+        mode: KvSsdUringMode,
+        bytes_per_op: usize,
+        ops: usize,
+    ) -> StoragePerfResult {
+        let store = new_store_with_mode(storage_perf_capacity(bytes_per_op, ops), mode).await;
+        let data = storage_perf_data(bytes_per_op);
+        let start = std::time::Instant::now();
+        for idx in 0..ops {
+            store
+                .persist(
+                    &format!("persist-{mode:?}-{idx}"),
+                    (idx as u64, 0),
+                    data.as_slice(),
+                )
+                .await
+                .unwrap();
+        }
+        StoragePerfResult {
+            mode,
+            op: StoragePerfOp::Persist,
+            ops,
+            bytes_per_op,
+            elapsed: start.elapsed(),
+        }
+    }
+
+    async fn storage_with_seeded_values(
+        mode: KvSsdUringMode,
+        bytes_per_op: usize,
+        ops: usize,
+        data: &[u8],
+    ) -> KvSsdStorage {
+        let store = new_store_with_mode(storage_perf_capacity(bytes_per_op, ops), mode).await;
+        for idx in 0..ops {
+            store
+                .persist(&format!("load-{mode:?}-{idx}"), (idx as u64, 0), data)
+                .await
+                .unwrap();
+        }
+        store
+    }
+
+    async fn run_storage_load_perf(
+        mode: KvSsdUringMode,
+        bytes_per_op: usize,
+        ops: usize,
+    ) -> StoragePerfResult {
+        let data = storage_perf_data(bytes_per_op);
+        let store = storage_with_seeded_values(mode, bytes_per_op, ops, data.as_slice()).await;
+        let mut out = AlignedBuffer::zeroed(bytes_per_op).unwrap();
+        let start = std::time::Instant::now();
+        for idx in 0..ops {
+            store
+                .load_into_addr(
+                    &format!("load-{mode:?}-{idx}"),
+                    (idx as u64, 0),
+                    out.as_mut_ptr() as u64,
+                    bytes_per_op as u64,
+                    out.len() as u64,
+                )
+                .await
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        let out_slice = unsafe { std::slice::from_raw_parts(out.as_ptr(), data.len()) };
+        assert_eq!(out_slice, data.as_slice());
+        StoragePerfResult {
+            mode,
+            op: StoragePerfOp::Load,
+            ops,
+            bytes_per_op,
+            elapsed,
+        }
+    }
+
+    fn best_storage_perf_result(results: &[StoragePerfResult]) -> StoragePerfResult {
+        results
+            .iter()
+            .min_by_key(|result| result.elapsed)
+            .copied()
+            .unwrap()
+    }
+
+    fn median_storage_perf_result(results: &[StoragePerfResult]) -> StoragePerfResult {
+        let mut sorted = results.to_vec();
+        sorted.sort_by_key(|result| result.elapsed);
+        sorted[sorted.len() / 2]
+    }
+
+    fn print_storage_perf_pair_result(
+        stat: &str,
+        label: &str,
+        iovec: StoragePerfResult,
+        single_buffer: StoragePerfResult,
+        rounds: usize,
+    ) {
+        println!(
+            "kv ssd storage perf {stat}-of-{rounds} {label}: {:?} {:?}: ops={} bytes/op={} elapsed={:?} ns/op={:.1} MiB/s={:.1}",
+            iovec.mode,
+            iovec.op,
+            iovec.ops,
+            iovec.bytes_per_op,
+            iovec.elapsed,
+            iovec.ns_per_op(),
+            iovec.mib_per_sec()
+        );
+        println!(
+            "kv ssd storage perf {stat}-of-{rounds} {label}: {:?} {:?}: ops={} bytes/op={} elapsed={:?} ns/op={:.1} MiB/s={:.1}",
+            single_buffer.mode,
+            single_buffer.op,
+            single_buffer.ops,
+            single_buffer.bytes_per_op,
+            single_buffer.elapsed,
+            single_buffer.ns_per_op(),
+            single_buffer.mib_per_sec()
+        );
+        println!(
+            "kv ssd storage perf delta {stat}-of-{rounds} {label}: single_buffer relative to iovec = {:.2}%",
+            (iovec.ns_per_op() - single_buffer.ns_per_op()) / iovec.ns_per_op() * 100.0
+        );
+    }
+
+    fn print_storage_perf_pair(
+        label: &str,
+        iovec_results: &[StoragePerfResult],
+        single_buffer_results: &[StoragePerfResult],
+    ) {
+        assert_eq!(iovec_results.len(), single_buffer_results.len());
+        let rounds = iovec_results.len();
+        print_storage_perf_pair_result(
+            "best",
+            label,
+            best_storage_perf_result(iovec_results),
+            best_storage_perf_result(single_buffer_results),
+            rounds,
+        );
+        print_storage_perf_pair_result(
+            "median",
+            label,
+            median_storage_perf_result(iovec_results),
+            median_storage_perf_result(single_buffer_results),
+            rounds,
+        );
+    }
+
+    #[::tokio::test]
+    #[ignore = "manual KvSsdStorage-level perf comparison for iovec vs single-buffer uring mode"]
+    async fn perf_compare_kv_ssd_storage_iovec_with_single_buffer_mode() {
+        for (bytes_per_op, ops, rounds) in [
+            (1024 * 1024usize, 4usize, 3usize),
+            (10 * 1024 * 1024usize, 2usize, 3usize),
+        ] {
+            assert!(bytes_per_op.is_multiple_of(SSD_ALIGNMENT));
+
+            let mut iovec_persist_results = Vec::with_capacity(rounds);
+            let mut single_persist_results = Vec::with_capacity(rounds);
+            let mut iovec_load_results = Vec::with_capacity(rounds);
+            let mut single_load_results = Vec::with_capacity(rounds);
+
+            for round_idx in 0..rounds {
+                if round_idx % 2 == 0 {
+                    iovec_persist_results.push(
+                        run_storage_persist_perf(KvSsdUringMode::Iovec, bytes_per_op, ops).await,
+                    );
+                    single_persist_results.push(
+                        run_storage_persist_perf(KvSsdUringMode::SingleBuffer, bytes_per_op, ops)
+                            .await,
+                    );
+                    iovec_load_results.push(
+                        run_storage_load_perf(KvSsdUringMode::Iovec, bytes_per_op, ops).await,
+                    );
+                    single_load_results.push(
+                        run_storage_load_perf(KvSsdUringMode::SingleBuffer, bytes_per_op, ops)
+                            .await,
+                    );
+                } else {
+                    single_persist_results.push(
+                        run_storage_persist_perf(KvSsdUringMode::SingleBuffer, bytes_per_op, ops)
+                            .await,
+                    );
+                    iovec_persist_results.push(
+                        run_storage_persist_perf(KvSsdUringMode::Iovec, bytes_per_op, ops).await,
+                    );
+                    single_load_results.push(
+                        run_storage_load_perf(KvSsdUringMode::SingleBuffer, bytes_per_op, ops)
+                            .await,
+                    );
+                    iovec_load_results.push(
+                        run_storage_load_perf(KvSsdUringMode::Iovec, bytes_per_op, ops).await,
+                    );
+                }
+            }
+
+            let label = format!("{} bytes/op persist", bytes_per_op);
+            print_storage_perf_pair(&label, &iovec_persist_results, &single_persist_results);
+            let label = format!("{} bytes/op load", bytes_per_op);
+            print_storage_perf_pair(&label, &iovec_load_results, &single_load_results);
+        }
+    }
+
     #[::tokio::test]
     async fn unaligned_payload_loads_direct_when_stage_capacity_is_aligned() {
         let store = new_store(1024 * 1024).await;
@@ -2051,9 +3399,20 @@ mod tests {
         let root_a = new_root();
         let root_b = new_root();
         let store = KvSsdStorage::new(KvSsdStorageInit {
-            root_dirs: vec![root_a.clone(), root_b.clone()],
-            max_bytes: 4 * SSD_ALIGNMENT as u64,
+            root_limits: vec![
+                KvSsdStorageRootLimit {
+                    root_dir: root_a.clone(),
+                    limit_bytes: 4 * SSD_ALIGNMENT as u64,
+                },
+                KvSsdStorageRootLimit {
+                    root_dir: root_b.clone(),
+                    limit_bytes: 8 * SSD_ALIGNMENT as u64,
+                },
+            ],
+            uring_mode: KvSsdUringMode::SingleBuffer,
+            backend: KvSsdStorageBackend::Native,
         })
+        .await
         .unwrap();
 
         assert_eq!(
@@ -2081,7 +3440,7 @@ mod tests {
                 .prepare_write_on_shards(key.clone(), 500, &[1, 3])
                 .unwrap()
             {
-                SsdPreparedWrite::Ready(entry) => entry,
+                SsdPreparedWrite::Ready { entry, .. } => entry,
                 other => panic!("expected ready SSD write, got {other:?}"),
             };
             allocated_shards.push(entry.shard_id);
@@ -2094,6 +3453,9 @@ mod tests {
     #[::tokio::test]
     async fn ring_keeps_new_entry_and_expires_old() {
         let store = new_store(1024).await;
+        let mut eviction_rx = store
+            .take_eviction_rx()
+            .expect("SSD eviction receiver must be available once");
         store.persist("old", (1, 0), &[1u8; 500]).await.unwrap();
         store.persist("filler", (2, 0), &[2u8; 500]).await.unwrap();
         store.persist("new", (3, 0), &[3u8; 500]).await.unwrap();
@@ -2101,6 +3463,60 @@ mod tests {
         assert!(!store.has_entry("old", (1, 0)).await);
         assert!(store.has_entry("filler", (2, 0)).await);
         assert!(store.has_entry("new", (3, 0)).await);
+        let evicted = ::tokio::time::timeout(Duration::from_secs(1), eviction_rx.recv())
+            .await
+            .expect("SSD eviction notification must arrive")
+            .expect("SSD eviction channel must stay open");
+        assert_eq!(
+            evicted,
+            vec![SsdReplicaEviction {
+                key: "old".to_string(),
+                put_id: (1, 0),
+            }]
+        );
+    }
+
+    #[::tokio::test]
+    async fn persist_guard_blocks_eviction_until_route_commit_finishes() {
+        let store = Arc::new(new_store(512).await);
+        let mut eviction_rx = store
+            .take_eviction_rx()
+            .expect("SSD eviction receiver must be available once");
+        let old_data = vec![1u8; 500];
+        let guard = store
+            .persist_from_addr(
+                "old",
+                (1, 0),
+                old_data.as_ptr() as u64,
+                old_data.len() as u64,
+            )
+            .await
+            .unwrap();
+
+        let store_for_write = Arc::clone(&store);
+        let mut new_write =
+            ::tokio::spawn(
+                async move { store_for_write.persist("new", (2, 0), &[2u8; 500]).await },
+            );
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(50), &mut new_write)
+                .await
+                .is_err(),
+            "new write must wait while the old route commit holds an entry pin"
+        );
+
+        drop(guard);
+        ::tokio::time::timeout(Duration::from_secs(1), &mut new_write)
+            .await
+            .expect("new write must resume after the route commit pin is dropped")
+            .expect("new write task must complete")
+            .expect("new write must succeed");
+        let evicted = ::tokio::time::timeout(Duration::from_secs(1), eviction_rx.recv())
+            .await
+            .expect("SSD eviction notification must arrive")
+            .expect("SSD eviction channel must stay open");
+        assert_eq!(evicted[0].key, "old");
+        assert_eq!(evicted[0].put_id, (1, 0));
     }
 
     #[test]

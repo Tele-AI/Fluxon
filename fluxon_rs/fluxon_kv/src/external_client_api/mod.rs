@@ -18,6 +18,7 @@ use crate::{
     cluster_manager::{
         ClusterManager, ClusterManagerAccessTrait, IpcBandwidthAttributorHandle, NodeRole,
     },
+    master_kv_router::msg_pack::GetSourceKind,
     master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq},
     memholder::ExternalMemHolder,
     p2p::{
@@ -1609,11 +1610,29 @@ impl ExternalInner {
         }
     }
 
-    /// External Get operation (outer): retry + wait wrapper around get_inner
+    /// External Get operation with the selected storage source for this call.
+    pub(crate) async fn get_with_source(
+        &self,
+        key: &str,
+    ) -> KvResult<Option<(Arc<crate::memholder::ExternalMemHolder>, GetSourceKind)>> {
+        self.get_with_source_inner(key).await
+    }
+
+    /// External Get operation (outer): retry + wait wrapper around get_inner.
     pub async fn get(
         &self,
         key: &str,
     ) -> KvResult<Option<Arc<crate::memholder::ExternalMemHolder>>> {
+        Ok(self
+            .get_with_source_inner(key)
+            .await?
+            .map(|(holder, _source_kind)| holder))
+    }
+
+    async fn get_with_source_inner(
+        &self,
+        key: &str,
+    ) -> KvResult<Option<(Arc<crate::memholder::ExternalMemHolder>, GetSourceKind)>> {
         tracing::debug!("External get request for key: {}", key);
 
         // Ensure external mode configured; if not, block until owner is ready once
@@ -1629,7 +1648,7 @@ impl ExternalInner {
 
         // 1) Fast path: try weak-index lookup first
         if let Some(h) = self.try_get_from_weak_cache(key).await {
-            return Ok(Some(h));
+            return Ok(Some((h, GetSourceKind::Memory)));
         }
 
         // 2) Ensure only one inflight get() per key using a keyed semaphore (permits=1)
@@ -1646,7 +1665,7 @@ impl ExternalInner {
                 key
             );
             drop(permit);
-            return Ok(Some(h));
+            return Ok(Some((h, GetSourceKind::Memory)));
         }
 
         let mut recover_attempts: usize = 0;
@@ -1659,7 +1678,7 @@ impl ExternalInner {
             match self.get_inner(key, prev_owner_start_time).await {
                 Ok(v) => {
                     // Update weak index on success if Some
-                    if let Some(ref h) = v {
+                    if let Some((ref h, _source_kind)) = v {
                         // let hex= &h.bytes()[..std::cmp::min(16, h.len as usize)];
                         // tracing::info!("external get done, key={}, partial_hex={:?}", key, hex);
                         self.key_weak_memholder_index
@@ -1707,7 +1726,7 @@ key={}, attempt={}/{}, err={}",
         &self,
         key: &str,
         started_time: i64,
-    ) -> KvResult<Option<Arc<crate::memholder::ExternalMemHolder>>> {
+    ) -> KvResult<Option<(Arc<crate::memholder::ExternalMemHolder>, GetSourceKind)>> {
         // Ensure external mode configured and compute base address
         let base_ptr = self.base_ptr_ro().await.expect(
             "ExternalClientApi.get_inner called in non-external mode (no shared memory configured)",
@@ -1750,6 +1769,7 @@ key={}, attempt={}/{}, err={}",
         );
         match result {
             Some(info) => {
+                let source_kind = info.source_kind;
                 // Attribute external<->owner shared-memory payload bytes to the owner topology edge.
                 //
                 // Causal chain:
@@ -1787,7 +1807,7 @@ key={}, attempt={}/{}, err={}",
                     info.len,
                     info.holder_id
                 );
-                Ok(Some(external_memholder))
+                Ok(Some((external_memholder, source_kind)))
             }
             None => Ok(None),
         }

@@ -1,3 +1,4 @@
+use crate::client_kv_api::{ClientKvApi, ClientKvApiAccessTrait};
 use crate::cluster_manager::META_KEY_LOCAL_IPC_ROOT;
 use crate::cluster_manager::{
     ClusterEvent, ClusterManager, ClusterManagerAccessTrait, ClusterManagerView, ClusterMember,
@@ -304,6 +305,7 @@ define_module!(
     MetricReporter,
     (cluster_manager, ClusterManager),
     (p2p, P2pModule),
+    (client_kv_api, ClientKvApi),
     (master_seg_manager, MasterSegManager),
     (metric_reporter, MetricReporter)
 );
@@ -623,6 +625,7 @@ impl MetricReporter {
 
     pub async fn init2_after_prom_remote_write_wait(&self) -> Result<(), KvError> {
         self.spawn_master_only_collect_loop();
+        self.spawn_owner_local_collect_loop();
         Ok(())
     }
 
@@ -916,6 +919,32 @@ impl MetricReporter {
         });
     }
 
+    fn spawn_owner_local_collect_loop(&self) {
+        let view = self.view().clone();
+        let shutdown_poller = view.register_shutdown_poller();
+        let mut shutdown_waiter = view.register_shutdown_waiter();
+        let view_task = view.clone();
+        let _ = view.spawn("metric_owner_local_collect_loop", async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(METRICS_FLUSH_INTERVAL_SECS));
+            loop {
+                tokio::select! {
+                    _ = shutdown_waiter.wait() => {
+                        info!("Owner-local metric collector stopped by shutdown signal");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        if !shutdown_poller.is_running() {
+                            info!("Owner-local metric collector stopped by shutdown signal");
+                            break;
+                        }
+                        view_task.metric_reporter().owner_local_collect();
+                    }
+                }
+            }
+        });
+    }
+
     /// Collect per-segment capacity/usage from MasterSegManager (master only).
     fn collect_segment_metrics(&self) {
         let view = self.view().clone();
@@ -940,6 +969,22 @@ impl MetricReporter {
         }
 
         self.collect_segment_metrics();
+    }
+
+    fn owner_local_collect(&self) {
+        let view = self.view().clone();
+        let member = view.cluster_manager().get_self_info();
+        if !matches!(member.node_role(), crate::cluster_manager::NodeRole::Client) {
+            return;
+        }
+
+        let node = member.id.as_ref();
+        for usage in view.client_kv_api().kv_ssd_storage_usage_snapshot() {
+            self.metrics
+                .set_kv_ssd_capacity_bytes(node, &usage.device, usage.capacity_bytes);
+            self.metrics
+                .set_kv_ssd_used_bytes(node, &usage.device, usage.used_bytes);
+        }
     }
 
     async fn wait_prom_remote_write_urls_best_effort(&self) -> Result<(), KvError> {

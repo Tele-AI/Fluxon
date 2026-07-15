@@ -474,9 +474,9 @@ impl MemholderManagerTrait for MasterOwnerMemMgr {
         };
 
         let mut targets = Vec::new();
-        let nodes_replicas = nodes_kv_route_info.nodes_replicas.read();
-        for (node_id, kv_route_info) in nodes_replicas.iter() {
-            if kv_route_info.tomb_tag.is_tomb() {
+        let node_replicas = nodes_kv_route_info.node_replicas.read();
+        for (node_id, replicas) in node_replicas.iter() {
+            if replicas.tomb_tag.is_tomb() || replicas.memory.is_none() {
                 continue;
             }
             let Some(member) = ctx
@@ -517,11 +517,11 @@ impl MemholderManagerTrait for MasterOwnerMemMgr {
                 continue;
             };
 
-            let nodes_replicas = nodes_kv_route_info.nodes_replicas.read();
-            let Some(kv_route_info) = nodes_replicas.get(target.node_id.as_str()) else {
+            let node_replicas = nodes_kv_route_info.node_replicas.read();
+            let Some(replicas) = node_replicas.get(target.node_id.as_str()) else {
                 continue;
             };
-            if kv_route_info.tomb_tag.is_tomb() {
+            if replicas.tomb_tag.is_tomb() || replicas.memory.is_none() {
                 continue;
             }
 

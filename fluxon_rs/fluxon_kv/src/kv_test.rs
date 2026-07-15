@@ -679,7 +679,7 @@ impl KvTestStorageProfile {
         match self {
             Self::Memory => None,
             Self::Ssd | Self::MemorySsd => Some(KvSsdStorageConfig {
-                max_bytes: KV_TEST_SSD_STORAGE_BYTES,
+                large_limit_size: vec![KV_TEST_SSD_STORAGE_BYTES],
             }),
         }
     }
@@ -1703,12 +1703,19 @@ async fn force_evict_memory_replicas_for_storage_probe(
         if let Some(route) = master_view.master_kv_router().inner().kv_routes.get(key) {
             let put_id = route.put_id;
             let memory_replica_nodes = route
-                .nodes_replicas
+                .node_replicas
                 .read()
-                .keys()
-                .cloned()
+                .iter()
+                .filter_map(|(node_id, replicas)| {
+                    replicas.memory.is_some().then(|| node_id.clone())
+                })
                 .collect::<Vec<_>>();
-            let ssd_replica_count = route.ssd_replicas.read().len();
+            let ssd_replica_count = route
+                .node_replicas
+                .read()
+                .values()
+                .filter(|replicas| replicas.ssd.is_some())
+                .count();
             if ssd_replica_count > 0 {
                 break (put_id, memory_replica_nodes);
             }
@@ -1742,12 +1749,20 @@ async fn force_evict_memory_replicas_for_storage_probe(
         panic!("storage profile probe route disappeared after memory replicas eviction: key={key}");
     };
     assert!(
-        route.nodes_replicas.read().is_empty(),
+        route
+            .node_replicas
+            .read()
+            .values()
+            .all(|replicas| replicas.memory.is_none()),
         "storage profile probe memory replicas still exist after eviction: key={}",
         key
     );
     assert!(
-        !route.ssd_replicas.read().is_empty(),
+        route
+            .node_replicas
+            .read()
+            .values()
+            .any(|replicas| replicas.ssd.is_some()),
         "storage profile probe SSD replica disappeared after memory replicas eviction: key={}",
         key
     );
@@ -1795,6 +1810,56 @@ async fn assert_owner_get_source_kind(
     );
 }
 
+fn invalidate_ssd_route_len_for_storage_probe(master_framework: &crate::Framework, key: &str) {
+    let master_view = master_framework.master_kv_router_view();
+    let route = master_view
+        .master_kv_router()
+        .inner()
+        .kv_routes
+        .get(key)
+        .unwrap_or_else(|| panic!("stale SSD route probe is missing key={key}"));
+    let mut node_replicas = route.node_replicas.write();
+    for replicas in node_replicas.values_mut() {
+        if let Some(ssd) = replicas.ssd.as_mut() {
+            ssd.len = ssd
+                .len
+                .checked_add(1)
+                .expect("stale SSD route probe length must not overflow");
+            return;
+        }
+    }
+    panic!("stale SSD route probe found no SSD replica for key={key}");
+}
+
+async fn assert_stale_ssd_route_retries_to_miss(
+    master_framework: &crate::Framework,
+    reader_framework: &crate::Framework,
+    key: &str,
+) {
+    let reader_view = reader_framework.client_kv_api_view().clone();
+    let result = reader_view
+        .client_kv_api()
+        .inner()
+        .get(key)
+        .await
+        .unwrap_or_else(|err| {
+            panic!("stale SSD route probe returned an error: key={key} err={err}")
+        });
+    assert!(
+        result.is_none(),
+        "stale SSD route probe must retry and converge to a miss: key={key}"
+    );
+    assert!(
+        !master_framework
+            .master_kv_router_view()
+            .master_kv_router()
+            .inner()
+            .kv_routes
+            .contains_key(key),
+        "stale SSD route probe must remove the empty route: key={key}"
+    );
+}
+
 async fn run_non_rdma_storage_profile_coverage(
     round: &KvTestRoundOptions,
     master_framework: &crate::Framework,
@@ -1837,6 +1902,11 @@ async fn run_non_rdma_storage_profile_coverage(
         &format!("{}:ssd", round.round_name),
         64 * 1024 + 123,
     );
+    let stale_ssd_key = format!("storage_profile_stale_ssd_key_{}", round.round_name);
+    let stale_ssd_value = build_storage_profile_probe_value_with_len(
+        &format!("{}:stale_ssd", round.round_name),
+        64 * 1024 + 321,
+    );
     if round.storage_profile.requires_ssd_source() {
         writer_api
             .inner()
@@ -1849,6 +1919,19 @@ async fn run_non_rdma_storage_profile_coverage(
                 )
             });
         force_evict_memory_replicas_for_storage_probe(master_framework, &ssd_key).await;
+
+        writer_api
+            .inner()
+            .put(&stale_ssd_key, &stale_ssd_value, storage_probe_put_opts())
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "storage profile stale SSD probe put failed: key={} err={}",
+                    stale_ssd_key, err
+                )
+            });
+        force_evict_memory_replicas_for_storage_probe(master_framework, &stale_ssd_key).await;
+        invalidate_ssd_route_len_for_storage_probe(master_framework, &stale_ssd_key);
     }
 
     let reader_launch = new_client_launch(round, "test_storage_profile_reader", None);
@@ -1869,6 +1952,8 @@ async fn run_non_rdma_storage_profile_coverage(
     }
     if round.storage_profile.requires_ssd_source() {
         assert_owner_get_source_kind(&reader_framework, &ssd_key, &ssd_value, GetSourceKind::Ssd)
+            .await;
+        assert_stale_ssd_route_retries_to_miss(master_framework, &reader_framework, &stale_ssd_key)
             .await;
     }
 
@@ -2764,10 +2849,10 @@ async fn run_kv_round(round: &KvTestRoundOptions) {
             .kv_routes
             .get(CLIENT_COMMUNICATION_KEY)
         {
-            let replicas = one_kv_nodes_routes.nodes_replicas.read();
+            let replicas = one_kv_nodes_routes.node_replicas.read();
             let active_replica_count = replicas
                 .iter()
-                .filter(|(_, kv_info)| !kv_info.tomb_tag.is_tomb())
+                .filter(|(_, replicas)| !replicas.tomb_tag.is_tomb() && replicas.memory.is_some())
                 .count();
 
             info!(

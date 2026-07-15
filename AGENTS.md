@@ -1,6 +1,7 @@
 Keep this document concise.
 - Core user, developer, and design docs are in-repo under fluxon_doc_cn/ and fluxon_doc_en/
 - Detailed bilingual doc writing rules are indexed at `fluxon_doc_en/dev_doc/Developer - 3 - Documentation Writing Rules.md` and `fluxon_doc_cn/dev_doc/开发者 - 3 - 文档写作规约.md`
+- The bilingual technical copy-editing workflow and one-shot example are at `fluxon_doc_en/dev_doc/Developer - 5 - Technical Documentation Copy Editing.md` and `fluxon_doc_cn/dev_doc/开发者 - 5 - 技术文档审校.md`
 - teststack has two steps: start testbed and testrunner
 - teststack has UI support; testrunner should own the UI authority and API surface, and the UI should run as a long-lived service that reuses the ops interfaces underneath
 - All Python code in this project must be compatible with Python >=3.10

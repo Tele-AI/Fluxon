@@ -26,6 +26,13 @@ pub enum YamlNullable<T> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SizeBytesYaml {
+    Bytes(u64),
+    Text(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GreptimeOtlpLogConfigYaml {
     pub otlp_endpoint: String,
@@ -97,6 +104,32 @@ pub enum SideTransferRole {
     Worker,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KvSsdUringMode {
+    SingleBuffer,
+    Iovec,
+}
+
+impl Default for KvSsdUringMode {
+    fn default() -> Self {
+        Self::SingleBuffer
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KvSsdStorageBackend {
+    Native,
+    Foyer,
+}
+
+impl Default for KvSsdStorageBackend {
+    fn default() -> Self {
+        Self::Native
+    }
+}
+
 const TEST_SPEC_TCP_THREAD_REACTOR_SHARD_COUNT_MIN: u8 = 1;
 const TEST_SPEC_TCP_THREAD_REACTOR_SHARD_COUNT_MAX: u8 = 16;
 const TEST_SPEC_TCP_THREAD_BULK_LANE_COUNT_MIN: u8 = 1;
@@ -155,6 +188,10 @@ pub struct TestSpecConfig {
     pub side_transfer_worker_p2p_port_base: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub side_transfer_role: Option<SideTransferRole>,
+    #[serde(default)]
+    pub kv_ssd_uring_mode: KvSsdUringMode,
+    #[serde(default)]
+    pub kv_ssd_storage_backend: KvSsdStorageBackend,
 }
 
 impl Default for TestSpecConfig {
@@ -182,8 +219,22 @@ impl Default for TestSpecConfig {
             side_transfer_worker_count: 0,
             side_transfer_worker_p2p_port_base: None,
             side_transfer_role: None,
+            kv_ssd_uring_mode: KvSsdUringMode::default(),
+            kv_ssd_storage_backend: KvSsdStorageBackend::default(),
         }
     }
+}
+
+fn validate_test_spec_kv_ssd_backend(test_spec_config: &TestSpecConfig) -> KvResult<()> {
+    if test_spec_config.kv_ssd_storage_backend == KvSsdStorageBackend::Foyer
+        && test_spec_config.kv_ssd_uring_mode != KvSsdUringMode::SingleBuffer
+    {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: "test_spec_config.kv_ssd_uring_mode is only valid with test_spec_config.kv_ssd_storage_backend=native".to_string(),
+        }
+        .into_kverror());
+    }
+    Ok(())
 }
 
 fn resolve_enable_transfer_rpc_fast_path(
@@ -566,8 +617,8 @@ pub struct MasterConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContributeToClusterPoolSizeYaml {
-    pub dram: u64,                  // bytes
-    pub vram: HashMap<String, u64>, // gpu_id -> bytes
+    pub dram: SizeBytesYaml,                  // bytes
+    pub vram: HashMap<String, SizeBytesYaml>, // gpu_id -> bytes
 }
 
 /// Configuration for Fluxon KV backend specifications
@@ -581,7 +632,7 @@ pub struct FluxonKvSpecYaml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub large_file_paths: Option<LargeFilePathsYaml>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssd_storage: Option<YamlNullable<KvSsdStorageConfigYaml>>,
+    pub large_limit_size: Option<YamlNullable<Vec<SizeBytesYaml>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p2p_listen_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -594,15 +645,9 @@ pub struct FluxonKvSpecYaml {
 #[serde(transparent)]
 pub struct LargeFilePathsYaml(pub Vec<String>);
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct KvSsdStorageConfigYaml {
-    pub max_bytes: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvSsdStorageConfig {
-    pub max_bytes: u64,
+    pub large_limit_size: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -767,6 +812,48 @@ impl LargeFilePaths {
         ));
         self.resolve_all_usable_root_subdirs(&relative_dir, "kv ssd storage")
     }
+
+    pub fn kv_ssd_storage_root_limits(
+        &self,
+        cluster_name: &str,
+        instance_key: &str,
+        large_limit_size: &[u64],
+    ) -> KvResult<Vec<(PathBuf, u64)>> {
+        self.require_configured_paths()?;
+        if large_limit_size.len() != self.paths.len() {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: format!(
+                    "large_limit_size length must match large_file_paths length: large_limit_size={} large_file_paths={}",
+                    large_limit_size.len(),
+                    self.paths.len()
+                ),
+            }
+            .into_kverror());
+        }
+        let relative_dir = PathBuf::from(format!(
+            "{cluster_name}_cluster_kv_ssd_storage/{}",
+            crate::kv_ssd_storage::safe_path_component(instance_key)
+        ));
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        for (root, limit_bytes) in self.paths.iter().zip(large_limit_size.iter().copied()) {
+            let candidate = Path::new(root).join(&relative_dir);
+            match fs::create_dir_all(&candidate) {
+                Ok(()) => out.push((candidate, limit_bytes)),
+                Err(err) => errors.push(format!("{} ({})", candidate.display(), err)),
+            }
+        }
+        if out.is_empty() {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: format!(
+                    "large_file_paths contains no usable root for kv ssd storage; tried: {}",
+                    errors.join(", ")
+                ),
+            }
+            .into_kverror());
+        }
+        Ok(out)
+    }
 }
 
 /// KV client backend types supported by the system
@@ -793,6 +880,123 @@ pub struct ClientConfig {
 }
 
 const CAPACITY_ALIGNMENT_BYTES: u64 = 16 * 1024 * 1024;
+
+fn parse_size_bytes(value: &SizeBytesYaml, field: &str) -> KvResult<u64> {
+    match value {
+        SizeBytesYaml::Bytes(bytes) => Ok(*bytes),
+        SizeBytesYaml::Text(text) => parse_size_bytes_text(text, field),
+    }
+}
+
+fn parse_size_bytes_text(raw: &str, field: &str) -> KvResult<u64> {
+    let input = raw.trim();
+    if input.is_empty() {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: format!("{field} size must not be empty"),
+        }
+        .into_kverror());
+    }
+
+    let mut number_end = 0usize;
+    let mut saw_digit = false;
+    let mut saw_dot = false;
+    for (idx, ch) in input.char_indices() {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            number_end = idx + ch.len_utf8();
+            continue;
+        }
+        if ch == '.' && !saw_dot {
+            saw_dot = true;
+            number_end = idx + ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    let number = input[..number_end].trim();
+    let unit = input[number_end..].trim();
+    if !saw_digit || number == "." {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: format!("{field} size must start with a number, got: {raw}"),
+        }
+        .into_kverror());
+    }
+    if unit.chars().any(|ch| !ch.is_ascii_alphabetic()) {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: format!("{field} size unit must be alphabetic, got: {raw}"),
+        }
+        .into_kverror());
+    }
+    let multiplier = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" | "byte" | "bytes" => 1u128,
+        "kb" | "kib" => 1024u128,
+        "mb" | "mib" => 1024u128.pow(2),
+        "gb" | "gib" => 1024u128.pow(3),
+        "tb" | "tib" => 1024u128.pow(4),
+        _ => {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: format!(
+                    "{field} size unit must be one of B, KB, MB, GB, TB, KiB, MiB, GiB, TiB; got: {raw}"
+                ),
+            }
+            .into_kverror());
+        }
+    };
+
+    let (whole, frac) = match number.split_once('.') {
+        Some((whole, frac)) => {
+            if frac.is_empty() {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: format!("{field} size has empty fractional part: {raw}"),
+                }
+                .into_kverror());
+            }
+            (whole, frac)
+        }
+        None => (number, ""),
+    };
+    let digits = format!("{whole}{frac}");
+    let mut numerator = 0u128;
+    for ch in digits.chars() {
+        let digit = ch.to_digit(10).ok_or_else(|| {
+            ConfigError::InvalidClientConfig {
+                detail: format!("{field} size has invalid number: {raw}"),
+            }
+            .into_kverror()
+        })? as u128;
+        numerator = numerator
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(digit))
+            .ok_or_else(|| {
+                ConfigError::InvalidClientConfig {
+                    detail: format!("{field} size is too large: {raw}"),
+                }
+                .into_kverror()
+            })?;
+    }
+    let scale = (0..frac.len()).try_fold(1u128, |acc, _| {
+        acc.checked_mul(10).ok_or_else(|| {
+            ConfigError::InvalidClientConfig {
+                detail: format!("{field} size has too many decimal places: {raw}"),
+            }
+            .into_kverror()
+        })
+    })?;
+    let bytes_num = numerator.checked_mul(multiplier).ok_or_else(|| {
+        ConfigError::InvalidClientConfig {
+            detail: format!("{field} size is too large: {raw}"),
+        }
+        .into_kverror()
+    })?;
+    let bytes = bytes_num / scale;
+    if bytes > u64::MAX as u128 {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: format!("{field} size exceeds u64 bytes: {raw}"),
+        }
+        .into_kverror());
+    }
+    Ok(bytes as u64)
+}
 
 fn _validate_host_port_no_scheme(value: &str, field: &str) -> KvResult<()> {
     let s = value.trim();
@@ -841,17 +1045,8 @@ fn _validate_host_port_no_scheme(value: &str, field: &str) -> KvResult<()> {
     Ok(())
 }
 
-fn _validate_capacity_multiple_of_alignment(value: u64, field: &str) -> KvResult<()> {
-    if value % CAPACITY_ALIGNMENT_BYTES != 0 {
-        return Err(ConfigError::InvalidClientConfig {
-            detail: format!(
-                "{} must be multiple of {} bytes, got: {}",
-                field, CAPACITY_ALIGNMENT_BYTES, value
-            ),
-        }
-        .into_kverror());
-    }
-    Ok(())
+fn align_capacity_down(value: u64) -> u64 {
+    value / CAPACITY_ALIGNMENT_BYTES * CAPACITY_ALIGNMENT_BYTES
 }
 
 pub fn normalize_etcd_addresses(addresses: &[String]) -> KvResult<Vec<String>> {
@@ -968,6 +1163,7 @@ impl ClientConfigYaml {
         materialize_default_test_spec_transport_mode(&mut test_spec_config);
         validate_required_transfer_rpc_fast_path_ready_timeout(&test_spec_config)?;
         validate_test_spec_tcp_thread_tuning(&test_spec_config)?;
+        validate_test_spec_kv_ssd_backend(&test_spec_config)?;
 
         // Role selection contract:
         // - Missing contribute_to_cluster_pool_size means "zero-contribution" mode.
@@ -984,49 +1180,39 @@ impl ClientConfigYaml {
                 },
             ),
             Some(c) => {
-                _validate_capacity_multiple_of_alignment(
-                    c.dram,
+                let dram = align_capacity_down(parse_size_bytes(
+                    &c.dram,
                     "contribute_to_cluster_pool_size.dram",
-                )?;
+                )?);
+                let mut vram = HashMap::new();
                 for (gpu_id, size) in c.vram.iter() {
-                    _validate_capacity_multiple_of_alignment(
-                        *size,
-                        &format!("contribute_to_cluster_pool_size.vram.{gpu_id}"),
-                    )?;
+                    vram.insert(
+                        gpu_id.clone(),
+                        align_capacity_down(parse_size_bytes(
+                            size,
+                            &format!("contribute_to_cluster_pool_size.vram.{gpu_id}"),
+                        )?),
+                    );
                 }
-                let vram_is_zero = c.vram.values().all(|&v| v == 0);
-                if c.dram == 0 && !vram_is_zero {
+                let vram_is_zero = vram.values().all(|&v| v == 0);
+                if dram == 0 && !vram_is_zero {
                     return Err(ConfigError::InvalidClientConfig {
                         detail: "contribute_to_cluster_pool_size is partially zero: dram=0 but vram has non-zero values".to_string(),
                     }
                     .into_kverror());
                 }
-                let is_zero = c.dram == 0 && vram_is_zero;
+                let is_zero = dram == 0 && vram_is_zero;
 
-                (
-                    is_zero,
-                    ContributeToClusterPoolSize {
-                        dram: c.dram,
-                        vram: c.vram.clone(),
-                    },
-                )
+                (is_zero, ContributeToClusterPoolSize { dram, vram })
             }
         };
 
-        if !is_external {
-            let Some(contrib_yaml) = &self.contribute_to_cluster_pool_size else {
-                return Err(ConfigError::InvalidClientConfig {
-                    detail: "contribute_to_cluster_pool_size is required for owner mode (non-zero contribution)".to_string(),
-                }
-                .into_kverror());
-            };
-            if contrib_yaml.dram == 0 {
-                return Err(ConfigError::InvalidClientConfig {
-                    detail: "owner mode requires non-zero contribute_to_cluster_pool_size.dram"
-                        .to_string(),
-                }
-                .into_kverror());
+        if !is_external && contribute_to_cluster_pool_size.dram == 0 {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "owner mode requires non-zero contribute_to_cluster_pool_size.dram"
+                    .to_string(),
             }
+            .into_kverror());
         }
 
         let is_side_transfer_worker = matches!(
@@ -1082,9 +1268,9 @@ impl ClientConfigYaml {
                 }
                 .into_kverror());
             }
-            if self.fluxonkv_spec.ssd_storage.is_some() {
+            if self.fluxonkv_spec.large_limit_size.is_some() {
                 return Err(ConfigError::InvalidClientConfig {
-                    detail: "fluxonkv_spec.ssd_storage is forbidden in zero-contribution mode"
+                    detail: "fluxonkv_spec.large_limit_size is forbidden in zero-contribution mode"
                         .to_string(),
                 }
                 .into_kverror());
@@ -1270,21 +1456,38 @@ impl ClientConfigYaml {
         let ssd_storage = if is_external {
             None
         } else {
-            match std::mem::take(&mut self.fluxonkv_spec.ssd_storage) {
+            match std::mem::take(&mut self.fluxonkv_spec.large_limit_size) {
                 None | Some(YamlNullable::Null) => None,
-                Some(YamlNullable::Value(raw)) => {
-                    if raw.max_bytes < crate::kv_ssd_storage::SSD_ALIGNMENT as u64 {
+                Some(YamlNullable::Value(raw_large_limit_size)) => {
+                    let mut large_limit_size = Vec::with_capacity(raw_large_limit_size.len());
+                    for (idx, limit) in raw_large_limit_size.iter().enumerate() {
+                        large_limit_size.push(parse_size_bytes(
+                            limit,
+                            &format!("fluxonkv_spec.large_limit_size[{idx}]"),
+                        )?);
+                    }
+                    if large_limit_size.len() != large_file_paths.paths.len() {
                         return Err(ConfigError::InvalidClientConfig {
                             detail: format!(
-                                "fluxonkv_spec.ssd_storage.max_bytes must be >= {}",
-                                crate::kv_ssd_storage::SSD_ALIGNMENT
+                                "fluxonkv_spec.large_limit_size length must match fluxonkv_spec.large_file_paths length: large_limit_size={} large_file_paths={}",
+                                large_limit_size.len(),
+                                large_file_paths.paths.len()
                             ),
                         }
                         .into_kverror());
                     }
-                    Some(KvSsdStorageConfig {
-                        max_bytes: raw.max_bytes,
-                    })
+                    for (idx, limit) in large_limit_size.iter().enumerate() {
+                        if *limit < crate::kv_ssd_storage::SSD_ALIGNMENT as u64 {
+                            return Err(ConfigError::InvalidClientConfig {
+                                detail: format!(
+                                    "fluxonkv_spec.large_limit_size[{idx}] must be >= {}",
+                                    crate::kv_ssd_storage::SSD_ALIGNMENT
+                                ),
+                            }
+                            .into_kverror());
+                        }
+                    }
+                    Some(KvSsdStorageConfig { large_limit_size })
                 }
             }
         };
@@ -1585,6 +1788,7 @@ impl MasterConfigYaml {
         materialize_default_test_spec_transport_mode(&mut test_spec_config);
         validate_required_transfer_rpc_fast_path_ready_timeout(&test_spec_config)?;
         validate_test_spec_tcp_thread_tuning(&test_spec_config)?;
+        validate_test_spec_kv_ssd_backend(&test_spec_config)?;
         let protocol = apply_test_spec_rdma_device_names_to_protocol(
             self.protocol.unwrap_or(ProtocolConfig {
                 protocol_type: ProtocolType::Rdma,
@@ -1739,7 +1943,7 @@ fluxonkv_spec:
     }
 
     #[test]
-    fn client_config_owner_accepts_ssd_storage() {
+    fn client_config_owner_accepts_large_limit_size() {
         let cfg = ClientConfigYaml::from_str(
             r#"
 instance_key: test_owner
@@ -1751,21 +1955,77 @@ fluxonkv_spec:
   cluster_name: test_cluster
   share_mem_path: /tmp/test_owner
   large_file_paths: [/tmp/test_owner_large]
-  ssd_storage:
-    max_bytes: 1048576
+  large_limit_size: [1048576]
   sub_cluster: rack-a
 "#,
         )
         .unwrap();
         let verified = cfg.verify().unwrap();
         assert_eq!(
-            verified.ssd_storage.as_ref().map(|cfg| cfg.max_bytes),
-            Some(1048576)
+            verified
+                .ssd_storage
+                .as_ref()
+                .map(|cfg| cfg.large_limit_size.as_slice()),
+            Some([1048576].as_slice())
+        );
+        assert_eq!(
+            verified.test_spec_config.kv_ssd_uring_mode,
+            KvSsdUringMode::SingleBuffer
+        );
+        assert_eq!(
+            verified.test_spec_config.kv_ssd_storage_backend,
+            KvSsdStorageBackend::Native
         );
     }
 
     #[test]
-    fn client_config_owner_rejects_too_small_ssd_storage() {
+    fn client_config_accepts_size_strings() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 1.1GB
+  vram:
+    "0": 0.5GB
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
+  large_limit_size: [512.9B]
+  sub_cluster: rack-a
+"#,
+        )
+        .unwrap();
+        let verified = cfg.verify().unwrap();
+        assert_eq!(
+            verified.contribute_to_cluster_pool_size.dram,
+            70 * CAPACITY_ALIGNMENT_BYTES
+        );
+        assert_eq!(
+            verified
+                .contribute_to_cluster_pool_size
+                .vram
+                .get("0")
+                .copied(),
+            Some(512 * 1024 * 1024)
+        );
+        assert_eq!(
+            verified
+                .ssd_storage
+                .as_ref()
+                .map(|cfg| cfg.large_limit_size.as_slice()),
+            Some([512].as_slice())
+        );
+    }
+
+    #[test]
+    fn size_string_truncates_fractional_bytes() {
+        assert_eq!(parse_size_bytes_text("0.9B", "test_size").unwrap(), 0);
+    }
+
+    #[test]
+    fn client_test_spec_config_accepts_kv_ssd_iovec_ablation_mode() {
         let cfg = ClientConfigYaml::from_str(
             r#"
 instance_key: test_owner
@@ -1777,8 +2037,86 @@ fluxonkv_spec:
   cluster_name: test_cluster
   share_mem_path: /tmp/test_owner
   large_file_paths: [/tmp/test_owner_large]
-  ssd_storage:
-    max_bytes: 1
+  large_limit_size: [1048576]
+  sub_cluster: rack-a
+test_spec_config:
+  kv_ssd_uring_mode: iovec
+"#,
+        )
+        .unwrap();
+        let verified = cfg.verify().unwrap();
+        assert_eq!(
+            verified.test_spec_config.kv_ssd_uring_mode,
+            KvSsdUringMode::Iovec
+        );
+    }
+
+    #[test]
+    fn client_test_spec_config_accepts_foyer_kv_ssd_backend() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
+  large_limit_size: [134217728]
+  sub_cluster: rack-a
+test_spec_config:
+  kv_ssd_storage_backend: foyer
+"#,
+        )
+        .unwrap();
+        let verified = cfg.verify().unwrap();
+        assert_eq!(
+            verified.test_spec_config.kv_ssd_storage_backend,
+            KvSsdStorageBackend::Foyer
+        );
+    }
+
+    #[test]
+    fn client_test_spec_config_rejects_foyer_with_iovec_mode() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
+  large_limit_size: [134217728]
+  sub_cluster: rack-a
+test_spec_config:
+  kv_ssd_storage_backend: foyer
+  kv_ssd_uring_mode: iovec
+"#,
+        )
+        .unwrap();
+        let err = cfg.verify().unwrap_err();
+        assert!(format!("{err}").contains("kv_ssd_uring_mode is only valid"));
+    }
+
+    #[test]
+    fn client_config_owner_rejects_large_limit_size_length_mismatch() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large_a, /tmp/test_owner_large_b]
+  large_limit_size: [1048576]
   sub_cluster: rack-a
 "#,
         )
@@ -1786,27 +2124,54 @@ fluxonkv_spec:
         let err = cfg.verify().unwrap_err();
         let text = format!("{err}");
         assert!(
-            text.contains("fluxonkv_spec.ssd_storage.max_bytes must be >= 512"),
+            text.contains("fluxonkv_spec.large_limit_size length must match fluxonkv_spec.large_file_paths length"),
             "{text}"
         );
     }
 
     #[test]
-    fn client_config_zero_contribution_rejects_ssd_storage() {
+    fn client_config_owner_rejects_too_small_large_limit_size() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
+  large_limit_size: [1]
+  sub_cluster: rack-a
+"#,
+        )
+        .unwrap();
+        let err = cfg.verify().unwrap_err();
+        let text = format!("{err}");
+        assert!(
+            text.contains("fluxonkv_spec.large_limit_size[0] must be >= 512"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn client_config_zero_contribution_rejects_large_limit_size() {
         let cfg = ClientConfigYaml::from_str(
             r#"
 instance_key: test_external
 fluxonkv_spec:
   cluster_name: test_cluster
   share_mem_path: /tmp/test_external
-  ssd_storage:
-    max_bytes: 1048576
+  large_limit_size: [1048576]
 "#,
         )
         .unwrap();
         let err = cfg.verify().unwrap_err();
         let text = format!("{err}");
-        assert!(text.contains("fluxonkv_spec.ssd_storage is forbidden in zero-contribution mode"));
+        assert!(
+            text.contains("fluxonkv_spec.large_limit_size is forbidden in zero-contribution mode")
+        );
     }
 
     #[test]

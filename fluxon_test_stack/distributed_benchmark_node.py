@@ -55,8 +55,13 @@ try:
     from .benchmark_node_kv import (
         KV_OPERATION_GET,
         KV_OPERATION_PUT,
+        BACKEND_KIND_FLUXON,
+        BACKEND_KIND_MOONCAKE,
+        BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX,
+        BENCHMARK_KEY_KV_GET_OUTPUT,
         KV_NODE_ROLE_SEED,
         KV_NODE_ROLE_WORKER,
+        KVBenchmarkBlockingStore,
         KVGetResultKind,
         canonicalize_kv_node_role,
         classify_kv_get_result,
@@ -95,8 +100,13 @@ except ImportError:
     from benchmark_node_kv import (
         KV_OPERATION_GET,
         KV_OPERATION_PUT,
+        BACKEND_KIND_FLUXON,
+        BACKEND_KIND_MOONCAKE,
+        BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX,
+        BENCHMARK_KEY_KV_GET_OUTPUT,
         KV_NODE_ROLE_SEED,
         KV_NODE_ROLE_WORKER,
+        KVBenchmarkBlockingStore,
         KVGetResultKind,
         canonicalize_kv_node_role,
         classify_kv_get_result,
@@ -1002,6 +1012,8 @@ class OperationResult:
     worker_id: Optional[int] = None
     # Operation completion time (wall clock), used for precise warmup filtering
     finish_ts: float = 0.0
+    # Selected source for a successful KV GET: "memory", "ssd", or None.
+    get_source_kind: Optional[str] = None
 
 
 @dataclass
@@ -1233,6 +1245,7 @@ class BenchmarkNode:
         )
         self._network_bandwidth_sampler: Optional[NetworkBandwidthSampler] = None
         self._network_bandwidth_summary: Dict[str, Any] = {}
+        self._kv_get_source_counter_window: Dict[str, Any] = {}
         self._benchmark_stop = threading.Event()
         self._forced_benchmark_result: Optional[Dict[str, Any]] = None
         self._prepared_mpmc_round: Optional[PreparedMPMCRound] = None
@@ -2745,7 +2758,11 @@ class BenchmarkNode:
             logger.info("🔧 正在创建KVCache存储实例...")
             # KV store initialization is needed only once. A previous merge caused duplicate calls,
             # leading to repeated cluster member registration.
-            store, err = init_kv_store(kvcache_config)
+            store, err = init_kv_store(
+                kvcache_config,
+                kv_get_output=self.test_config.get(BENCHMARK_KEY_KV_GET_OUTPUT),
+                kv_cuda_device_index=self.test_config.get(BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX),
+            )
             if err is not None:
                 logger.error(f"❌ KVCache存储实例创建失败: {err}")
                 return False
@@ -2872,6 +2889,80 @@ class BenchmarkNode:
             return payload_pool[random.randrange(len(payload_pool))]
         return os.urandom(size_int)
 
+    def _build_kv_get_source_summary(
+        self,
+        get_hit_ops: List[OperationResult],
+    ) -> Dict[str, Any]:
+        hit_count = len(get_hit_ops)
+        store = self.kv_store
+        if not isinstance(store, KVBenchmarkBlockingStore):
+            return {
+                "observation_kind": "unavailable",
+                "get_memory_hit_operations": 0,
+                "get_ssd_hit_operations": 0,
+                "get_unknown_source_operations": hit_count,
+                "get_observed_hit_operations": hit_count,
+                "complete": False,
+                "details": {},
+            }
+
+        if store.backend_kind == BACKEND_KIND_FLUXON:
+            memory_hits = sum(
+                1 for op in get_hit_ops if op.get_source_kind == "memory"
+            )
+            ssd_hits = sum(1 for op in get_hit_ops if op.get_source_kind == "ssd")
+            unknown_hits = max(0, hit_count - memory_hits - ssd_hits)
+            return {
+                "observation_kind": "fluxon_per_operation_route_source",
+                "get_memory_hit_operations": memory_hits,
+                "get_ssd_hit_operations": ssd_hits,
+                "get_unknown_source_operations": unknown_hits,
+                "get_observed_hit_operations": hit_count,
+                "complete": unknown_hits == 0,
+                "details": {},
+            }
+
+        if store.backend_kind == BACKEND_KIND_MOONCAKE:
+            details = copy.deepcopy(self._kv_get_source_counter_window)
+            raw_ssd_hits = details.get("ssd_read_count")
+            if (
+                bool(details.get("complete"))
+                and isinstance(raw_ssd_hits, int)
+                and not isinstance(raw_ssd_hits, bool)
+                and 0 <= raw_ssd_hits <= hit_count
+            ):
+                ssd_hits = int(raw_ssd_hits)
+                return {
+                    "observation_kind": "mooncake_offload_rpc_counter_window",
+                    "get_memory_hit_operations": hit_count - ssd_hits,
+                    "get_ssd_hit_operations": ssd_hits,
+                    "get_unknown_source_operations": 0,
+                    "get_observed_hit_operations": hit_count,
+                    "complete": True,
+                    "details": details,
+                }
+            if isinstance(raw_ssd_hits, int) and raw_ssd_hits > hit_count:
+                details["counter_excess_operations"] = raw_ssd_hits - hit_count
+            return {
+                "observation_kind": "mooncake_offload_rpc_counter_window",
+                "get_memory_hit_operations": 0,
+                "get_ssd_hit_operations": 0,
+                "get_unknown_source_operations": hit_count,
+                "get_observed_hit_operations": hit_count,
+                "complete": False,
+                "details": details,
+            }
+
+        return {
+            "observation_kind": "unavailable",
+            "get_memory_hit_operations": 0,
+            "get_ssd_hit_operations": 0,
+            "get_unknown_source_operations": hit_count,
+            "get_observed_hit_operations": hit_count,
+            "complete": False,
+            "details": {},
+        }
+
     def _calculate_benchmark_results(self) -> Dict[str, Any]:
         """Compute benchmark results."""
         def _empty_results() -> Dict[str, Any]:
@@ -2887,6 +2978,15 @@ class BenchmarkNode:
                 "get_hit_operations": 0,
                 "get_miss_operations": 0,
                 "get_error_operations": 0,
+                "get_source_summary": {
+                    "observation_kind": "unavailable",
+                    "get_memory_hit_operations": 0,
+                    "get_ssd_hit_operations": 0,
+                    "get_unknown_source_operations": 0,
+                    "get_observed_hit_operations": 0,
+                    "complete": False,
+                    "details": {},
+                },
                 "total_duration_seconds": 0,
                 "avg_latency_us": 0,
                 "p50_latency_us": 0,
@@ -2951,6 +3051,7 @@ class BenchmarkNode:
         get_error_ops = [
             r for r in get_ops if r.outcome_kind == OperationOutcome.ERROR
         ]
+        get_source_summary = self._build_kv_get_source_summary(get_hit_ops)
 
         # Effective duration: exclude warmup; cut off at end_time
         effective_start = self.start_time + METRIC_WARMUP_SECONDS
@@ -3088,6 +3189,7 @@ class BenchmarkNode:
             "get_hit_operations": len(get_hit_ops),
             "get_miss_operations": len(get_miss_ops),
             "get_error_operations": len(get_error_ops),
+            "get_source_summary": get_source_summary,
             "total_duration_seconds": duration,
             "avg_latency_us": avg_latency,
             "p50_latency_us": p50_latency,
@@ -3527,7 +3629,14 @@ class BenchmarkNode:
         """Execute single GET operation and measure performance."""
         op_start = time.perf_counter()
         try:
-            err = kv_get_once(self.kv_store, key, deadline_ts=deadline_ts, ctx=ctx)
+            completion = kv_get_once(
+                self.kv_store,
+                key,
+                deadline_ts=deadline_ts,
+                ctx=ctx,
+                expected_payload_size=expected_data_size,
+            )
+            err = completion.error_msg
             op_end = time.perf_counter()
             if err is not None:
                 get_outcome = classify_kv_get_result(err)
@@ -3554,6 +3663,11 @@ class BenchmarkNode:
                 inflight_at_start=inflight_at_start,
                 outcome_kind=OperationOutcome.CACHE_HIT,
                 error_msg=None,
+                get_source_kind=(
+                    completion.source_kind.value
+                    if completion.source_kind is not None
+                    else None
+                ),
             )
         except Exception as e:
             op_end = time.perf_counter()
@@ -3888,6 +4002,15 @@ class BenchmarkNode:
             "get_hit_operations": 0,
             "get_miss_operations": 0,
             "get_error_operations": 0,
+            "get_source_summary": {
+                "observation_kind": "unavailable",
+                "get_memory_hit_operations": 0,
+                "get_ssd_hit_operations": 0,
+                "get_unknown_source_operations": 0,
+                "get_observed_hit_operations": 0,
+                "complete": False,
+                "details": {},
+            },
             "total_duration_seconds": 0,
             "avg_latency_us": 0,
             "p50_latency_us": 0,
@@ -4152,6 +4275,7 @@ class BenchmarkNode:
         self._kv_store_closed = False
         self._network_bandwidth_sampler = None
         self._network_bandwidth_summary = {}
+        self._kv_get_source_counter_window = {}
 
         try:
             if test_mode == TestMode.MPMC.value:
@@ -4166,6 +4290,11 @@ class BenchmarkNode:
                 # - KV mode: end_time is deadline_ts
                 # - MPMC mode: overwritten to now when stop intent is triggered
                 self.end_time = deadline_ts
+                if isinstance(self.kv_store, KVBenchmarkBlockingStore):
+                    self.kv_store.begin_get_source_counter_window(
+                        start_ts=self.start_time + METRIC_WARMUP_SECONDS,
+                        end_ts=deadline_ts,
+                    )
                 self._start_network_bandwidth_sampler()
                 # Start heartbeat after time window is initialized, so it can report elapsed/remaining.
                 self._start_heartbeat()
@@ -4173,6 +4302,10 @@ class BenchmarkNode:
         finally:
             self._stop_heartbeat()
             self._stop_network_bandwidth_sampler()
+            if isinstance(self.kv_store, KVBenchmarkBlockingStore):
+                self._kv_get_source_counter_window = (
+                    self.kv_store.finish_get_source_counter_window()
+                )
 
         # Keep previously set end_time (KV mode: deadline; MPMC mode: close time).
         if self.end_time is None:

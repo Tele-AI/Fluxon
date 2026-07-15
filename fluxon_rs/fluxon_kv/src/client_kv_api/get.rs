@@ -22,6 +22,8 @@ use crate::{
 use chrono::Utc;
 use std::sync::Arc;
 
+const MAX_STALE_SSD_ROUTE_RETRIES: usize = 3;
+
 #[derive(Debug, Clone)]
 pub struct RemoteGetInfo {
     get_id: u64,
@@ -124,109 +126,202 @@ impl ClientKvApiInner {
         }
 
         obe_get_cache_miss(&metrics, &client_id, &node_role, key);
-        let t1 = Utc::now().timestamp_micros();
-        let resp = {
-            match self.get_start(key).await {
-                Ok(resp) => resp,
-                Err(err) => {
-                    obe_get_start_error_rpc(&metrics, &client_id, &node_role, key);
+        let mut stale_ssd_route_retries = 0usize;
+        'remote_get: loop {
+            let t1 = Utc::now().timestamp_micros();
+            let resp = {
+                match self.get_start(key).await {
+                    Ok(resp) => resp,
+                    Err(err) => {
+                        obe_get_start_error_rpc(&metrics, &client_id, &node_role, key);
+                        return Err(err);
+                    }
+                }
+            };
+            let start_handle_us = resp.server_process_us;
+            let t2 = Utc::now().timestamp_micros();
+            // start stage success
+            // Note: only record timestamps; no scope begin/end
+            //       errors handled above and below
+            if resp.error_code != OK {
+                if resp.error_code == codes_api::API_KEY_NOT_FOUND {
+                    obe_get_start_not_found(&metrics, &client_id, &node_role, key);
+                    return Ok(None);
+                }
+                obe_get_start_error_status(&metrics, &client_id, &node_role, key);
+                crate::rpcresp_kvresult_convert::try_from_code(
+                    resp.error_code,
+                    resp.error_json.clone(),
+                )?;
+                unreachable!("try_from_code should have returned Err for non-OK, unreachable");
+            }
+            obe_get_start_success(&metrics, &client_id, &node_role, key, t1, t2);
+
+            let put_id = resp.put_id;
+            let get_id = resp.get_id;
+            let data_len = resp.len as usize;
+
+            let abs_src = resp.src_addr;
+            let abs_target = resp.target_addr;
+
+            // debug get slice from src_addr and len
+            tracing::debug!(
+                "kv get src addr {:#x} to target addr {:#x}",
+                abs_src,
+                abs_target
+            );
+
+            let peer_id = if &*resp.node_id == &*self.view.cluster_manager().get_self_info().id {
+                None
+            } else {
+                Some(resp.node_id.clone())
+            };
+
+            #[cfg(test)]
+            {
+                self.test_record.add_transfering_get(
+                    get_id,
+                    key.to_string(),
+                    data_len as u32,
+                    abs_target,
+                    resp.node_id.to_string(),
+                    peer_id.is_some(),
+                );
+            }
+
+            let mut ssd_done_resp = None;
+            if resp.source_kind == GetSourceKind::Ssd {
+                let ssd_stage_len = resp.ssd_stage_len;
+                if ssd_stage_len < data_len as u64 {
+                    #[cfg(test)]
+                    {
+                        self.test_record.remove_transfering_get(get_id);
+                    }
+
+                    let err = KvError::Api(ApiError::InvalidArgument {
+                        detail: format!(
+                            "invalid ssd stage len for key={} get_id={} data_len={} ssd_stage_len={}",
+                            key, get_id, data_len, ssd_stage_len
+                        ),
+                    });
+                    self.get_revoke_ssd_source(get_id).await?;
+                    if stale_ssd_route_retries < MAX_STALE_SSD_ROUTE_RETRIES {
+                        stale_ssd_route_retries += 1;
+                        tracing::warn!(
+                            "Retrying get after invalid SSD route metadata: key={} retry={}/{}",
+                            key,
+                            stale_ssd_route_retries,
+                            MAX_STALE_SSD_ROUTE_RETRIES
+                        );
+                        continue 'remote_get;
+                    }
                     return Err(err);
                 }
-            }
-        };
-        let start_handle_us = resp.server_process_us;
-        let t2 = Utc::now().timestamp_micros();
-        // start stage success
-        // Note: only record timestamps; no scope begin/end
-        //       errors handled above and below
-        if resp.error_code != OK {
-            if resp.error_code == codes_api::API_KEY_NOT_FOUND {
-                obe_get_start_not_found(&metrics, &client_id, &node_role, key);
-                return Ok(None);
-            }
-            obe_get_start_error_status(&metrics, &client_id, &node_role, key);
-            crate::rpcresp_kvresult_convert::try_from_code(
-                resp.error_code,
-                resp.error_json.clone(),
-            )?;
-            unreachable!("try_from_code should have returned Err for non-OK, unreachable");
-        }
-        obe_get_start_success(&metrics, &client_id, &node_role, key, t1, t2);
-
-        let put_id = resp.put_id;
-        let get_id = resp.get_id;
-        let data_len = resp.len as usize;
-
-        let abs_src = resp.src_addr;
-        let abs_target = resp.target_addr;
-
-        // debug get slice from src_addr and len
-        tracing::debug!(
-            "kv get src addr {:#x} to target addr {:#x}",
-            abs_src,
-            abs_target
-        );
-
-        let peer_id = if &*resp.node_id == &*self.view.cluster_manager().get_self_info().id {
-            None
-        } else {
-            Some(resp.node_id.clone())
-        };
-
-        #[cfg(test)]
-        {
-            self.test_record.add_transfering_get(
-                get_id,
-                key.to_string(),
-                data_len as u32,
-                abs_target,
-                resp.node_id.to_string(),
-                peer_id.is_some(),
-            );
-        }
-
-        let mut ssd_done_resp = None;
-        if resp.source_kind == GetSourceKind::Ssd {
-            let ssd_stage_len = resp.ssd_stage_len;
-            if ssd_stage_len < data_len as u64 {
-                #[cfg(test)]
-                {
-                    self.test_record.remove_transfering_get(get_id);
-                }
-
-                self.get_revoke(get_id).await?;
-                return Err(KvError::Api(ApiError::InvalidArgument {
-                    detail: format!(
-                        "invalid ssd stage len for key={} get_id={} data_len={} ssd_stage_len={}",
-                        key, get_id, data_len, ssd_stage_len
-                    ),
-                }));
-            }
-            let done_resp = match self
-                .stage_kv_from_ssd_source(
-                    &resp.node_id,
-                    key,
-                    put_id,
-                    get_id,
-                    abs_src,
-                    abs_target,
-                    data_len as u64,
-                    ssd_stage_len,
-                )
-                .await
-            {
-                Ok(done_resp) => done_resp,
-                Err(err) => {
-                    tracing::warn!(
-                        "kv get ssd stage failed: key={}, source_node={}, stage={:#x}, target={:#x}, len={}, ssd_stage_len={}, err={}",
+                let done_resp = match self
+                    .stage_kv_from_ssd_source(
+                        &resp.node_id,
                         key,
-                        resp.node_id,
+                        put_id,
+                        get_id,
                         abs_src,
                         abs_target,
-                        data_len,
+                        data_len as u64,
                         ssd_stage_len,
-                        err
-                    );
+                    )
+                    .await
+                {
+                    Ok(done_resp) => done_resp,
+                    Err(err) => {
+                        tracing::warn!(
+                            "kv get ssd stage failed: key={}, source_node={}, stage={:#x}, target={:#x}, len={}, ssd_stage_len={}, err={}",
+                            key,
+                            resp.node_id,
+                            abs_src,
+                            abs_target,
+                            data_len,
+                            ssd_stage_len,
+                            err
+                        );
+
+                        #[cfg(test)]
+                        {
+                            self.test_record.remove_transfering_get(get_id);
+                        }
+
+                        obe_get_transfer_error(
+                            &metrics,
+                            &client_id,
+                            &node_role,
+                            key,
+                            data_len as u64,
+                        );
+                        self.get_revoke_ssd_source(get_id).await?;
+                        if stale_ssd_route_retries < MAX_STALE_SSD_ROUTE_RETRIES {
+                            stale_ssd_route_retries += 1;
+                            tracing::warn!(
+                                "Retrying get after failed SSD source cleanup: key={} retry={}/{}",
+                                key,
+                                stale_ssd_route_retries,
+                                MAX_STALE_SSD_ROUTE_RETRIES
+                            );
+                            continue 'remote_get;
+                        }
+                        return Err(err);
+                    }
+                };
+                ssd_done_resp = Some(done_resp);
+                tracing::debug!(
+                    "kv get ssd staged and pushed: key={}, source_node={}, stage={:#x}, target={:#x}, len={}, ssd_stage_len={}",
+                    key,
+                    resp.node_id,
+                    abs_src,
+                    abs_target,
+                    data_len,
+                    ssd_stage_len
+                );
+            }
+
+            // transfer data (skip if local and src==target to avoid redundant copy)
+            if resp.source_kind == GetSourceKind::Ssd {
+                tracing::debug!(
+                    "kv get ssd owner push complete: key={}, target={:#x}, len={} (skip requester transfer)",
+                    key,
+                    abs_target,
+                    data_len
+                );
+            } else if peer_id.is_none() && abs_src == abs_target {
+                tracing::debug!(
+                    "kv get local no-op: src==target {:#x}, len={} (skip transfer)",
+                    abs_target,
+                    data_len
+                );
+            } else {
+                // tracing::debug!(
+                //     "kv get transfer in transfer engine path from {}",
+                //     peer_id.as_ref().map(|v| &**v).unwrap_or("self")
+                // );
+                tracing::debug!(
+                    "p2p get transfer: key={}, remote_src={:#x} -> local_target={:#x}, len={}, peer={:?}",
+                    key,
+                    abs_src,
+                    abs_target,
+                    data_len,
+                    peer_id
+                );
+                if let Err(e) = self
+                    .view
+                    .client_transfer_engine()
+                    .transfer_data_no_copy(
+                        peer_id.clone(),
+                        true,
+                        abs_src,
+                        abs_target,
+                        data_len as u64,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!("transfer data failed: {:?}", e);
 
                     #[cfg(test)]
                     {
@@ -234,202 +329,145 @@ impl ClientKvApiInner {
                     }
 
                     obe_get_transfer_error(&metrics, &client_id, &node_role, key, data_len as u64);
-                    self.get_revoke_ssd_source(get_id).await?;
-                    return Err(err);
+                    self.get_revoke(get_id).await?;
+                    return Err(KvError::Api(ApiError::Transfer {
+                        from_addr: abs_src,
+                        to_addr: abs_target,
+                        len: data_len as u64,
+                        error: e.to_string(),
+                    }));
+                } else {
+                    tracing::debug!(
+                        "get_transfer success key={}, src_addr={:#x}, target_addr={:#x}, len={}, peer_id={:?}",
+                        key,
+                        abs_src,
+                        abs_target,
+                        data_len,
+                        peer_id
+                    );
+                }
+            }
+            let t3 = Utc::now().timestamp_micros();
+            obe_get_transfer_success(
+                &metrics,
+                &client_id,
+                &node_role,
+                key,
+                data_len as u64,
+                t2,
+                t3,
+            );
+
+            // Removed post-transfer zero-header verification per request.
+
+            // Complete the get operation and get holder_id. SSD source already called
+            // get_done after pushing into the requester target.
+            let done_resp = if let Some(done_resp) = ssd_done_resp {
+                done_resp
+            } else {
+                match self.get_done(get_id).await {
+                    Ok(resp) => resp,
+                    Err(err) => {
+                        obe_get_end_error_rpc(
+                            &metrics,
+                            &client_id,
+                            &node_role,
+                            key,
+                            data_len as u64,
+                        );
+                        return Err(err);
+                    }
                 }
             };
-            ssd_done_resp = Some(done_resp);
-            tracing::debug!(
-                "kv get ssd staged and pushed: key={}, source_node={}, stage={:#x}, target={:#x}, len={}, ssd_stage_len={}",
-                key,
-                resp.node_id,
-                abs_src,
-                abs_target,
-                data_len,
-                ssd_stage_len
-            );
-        }
-
-        // transfer data (skip if local and src==target to avoid redundant copy)
-        if resp.source_kind == GetSourceKind::Ssd {
-            tracing::debug!(
-                "kv get ssd owner push complete: key={}, target={:#x}, len={} (skip requester transfer)",
-                key,
-                abs_target,
-                data_len
-            );
-        } else if peer_id.is_none() && abs_src == abs_target {
-            tracing::debug!(
-                "kv get local no-op: src==target {:#x}, len={} (skip transfer)",
-                abs_target,
-                data_len
-            );
-        } else {
-            // tracing::debug!(
-            //     "kv get transfer in transfer engine path from {}",
-            //     peer_id.as_ref().map(|v| &**v).unwrap_or("self")
-            // );
-            tracing::debug!(
-                "p2p get transfer: key={}, remote_src={:#x} -> local_target={:#x}, len={}, peer={:?}",
-                key,
-                abs_src,
-                abs_target,
-                data_len,
-                peer_id
-            );
-            if let Err(e) = self
-                .view
-                .client_transfer_engine()
-                .transfer_data_no_copy(
-                    peer_id.clone(),
-                    true,
-                    abs_src,
-                    abs_target,
-                    data_len as u64,
-                    None,
-                )
-                .await
-            {
-                tracing::warn!("transfer data failed: {:?}", e);
-
+            let end_handle_us = done_resp.server_process_us;
+            let t4 = Utc::now().timestamp_micros();
+            if done_resp.error_code != OK {
+                obe_get_done_error_status(&metrics, &client_id, &node_role, key, data_len as u64);
                 #[cfg(test)]
                 {
                     self.test_record.remove_transfering_get(get_id);
                 }
 
-                obe_get_transfer_error(&metrics, &client_id, &node_role, key, data_len as u64);
-                self.get_revoke(get_id).await?;
-                return Err(KvError::Api(ApiError::Transfer {
-                    from_addr: abs_src,
-                    to_addr: abs_target,
-                    len: data_len as u64,
-                    error: e.to_string(),
-                }));
-            } else {
-                tracing::debug!(
-                    "get_transfer success key={}, src_addr={:#x}, target_addr={:#x}, len={}, peer_id={:?}",
-                    key,
-                    abs_src,
-                    abs_target,
-                    data_len,
-                    peer_id
-                );
+                crate::rpcresp_kvresult_convert::try_from_code(
+                    done_resp.error_code,
+                    done_resp.error_json.clone(),
+                )?;
+                unreachable!("error path should have returned above");
             }
-        }
-        let t3 = Utc::now().timestamp_micros();
-        obe_get_transfer_success(
-            &metrics,
-            &client_id,
-            &node_role,
-            key,
-            data_len as u64,
-            t2,
-            t3,
-        );
+            // end/done stage success and push detailed metrics
+            obe_get_done_success(
+                &metrics,
+                &client_id,
+                &node_role,
+                key,
+                data_len as u64,
+                get_id,
+                t1,
+                t2,
+                t3,
+                t4,
+                start_handle_us,
+                end_handle_us,
+            );
 
-        // Removed post-transfer zero-header verification per request.
-
-        // Complete the get operation and get holder_id. SSD source already called
-        // get_done after pushing into the requester target.
-        let done_resp = if let Some(done_resp) = ssd_done_resp {
-            done_resp
-        } else {
-            match self.get_done(get_id).await {
-                Ok(resp) => resp,
-                Err(err) => {
-                    obe_get_end_error_rpc(&metrics, &client_id, &node_role, key, data_len as u64);
-                    return Err(err);
-                }
-            }
-        };
-        let end_handle_us = done_resp.server_process_us;
-        let t4 = Utc::now().timestamp_micros();
-        if done_resp.error_code != OK {
-            obe_get_done_error_status(&metrics, &client_id, &node_role, key, data_len as u64);
             #[cfg(test)]
             {
                 self.test_record.remove_transfering_get(get_id);
             }
 
-            crate::rpcresp_kvresult_convert::try_from_code(
-                done_resp.error_code,
-                done_resp.error_json.clone(),
-            )?;
-            unreachable!("error path should have returned above");
+            // pulses and network bytes emitted inside obe_get_done_success
+
+            let holder_id = done_resp.holder_id;
+            let expose_kind = if done_resp.allocation_mode == GetAllocationMode::Temporary {
+                UserMemHolderExposeKind::OwnedCopy
+            } else {
+                UserMemHolderExposeKind::SegPtr
+            };
+            let master_node_id: NodeID = self
+                .view
+                .cluster_manager()
+                .find_or_wait_master_node()
+                .await?
+                .into();
+
+            // Create MemHolder with keep alive functionality
+            // Convert target_addr to offset using base address from master response
+            let offset = resp.target_addr - resp.target_base_addr;
+            let memory_info = Arc::new(
+                MemoryInfo::new(
+                    offset,
+                    data_len as u32,
+                    holder_id,
+                    key.to_string(),
+                    master_node_id,
+                    self.view.clone(),
+                )
+                .await,
+            );
+            // Create GetInfo with information from the response
+            let get_info = RemoteGetInfo {
+                get_id,
+                data_len,
+                source_kind: resp.source_kind,
+                src_addr: abs_src,
+                target_addr: abs_target,
+                node_id: resp.node_id.into(),
+                peer_is_src_or_target: true,
+            };
+
+            if done_resp.allocation_mode != GetAllocationMode::Temporary {
+                self.cache_local_replica_after_get(key, put_id, memory_info.clone());
+                metrics.observe_cache_value_size(&client_id, node_role.as_str(), data_len as u64);
+            }
+            let user_mem_holder = Arc::new(UserMemHolder::new(
+                memory_info,
+                self.get_or_init_all_memholder_refcount(),
+                expose_kind,
+            ));
+            // let partial_hex=&user_mem_holder.bytes()[..std::cmp::min(16, user_mem_holder.bytes().len())];
+            // tracing::debug!("external get done, key={}, partial_hex={:?}", key, partial_hex);
+            return Ok(Some((user_mem_holder, Some(get_info))));
         }
-        // end/done stage success and push detailed metrics
-        obe_get_done_success(
-            &metrics,
-            &client_id,
-            &node_role,
-            key,
-            data_len as u64,
-            get_id,
-            t1,
-            t2,
-            t3,
-            t4,
-            start_handle_us,
-            end_handle_us,
-        );
-
-        #[cfg(test)]
-        {
-            self.test_record.remove_transfering_get(get_id);
-        }
-
-        // pulses and network bytes emitted inside obe_get_done_success
-
-        let holder_id = done_resp.holder_id;
-        let expose_kind = if done_resp.allocation_mode == GetAllocationMode::Temporary {
-            UserMemHolderExposeKind::OwnedCopy
-        } else {
-            UserMemHolderExposeKind::SegPtr
-        };
-        let master_node_id: NodeID = self
-            .view
-            .cluster_manager()
-            .find_or_wait_master_node()
-            .await?
-            .into();
-
-        // Create MemHolder with keep alive functionality
-        // Convert target_addr to offset using base address from master response
-        let offset = resp.target_addr - resp.target_base_addr;
-        let memory_info = Arc::new(
-            MemoryInfo::new(
-                offset,
-                data_len as u32,
-                holder_id,
-                key.to_string(),
-                master_node_id,
-                self.view.clone(),
-            )
-            .await,
-        );
-        // Create GetInfo with information from the response
-        let get_info = RemoteGetInfo {
-            get_id,
-            data_len,
-            source_kind: resp.source_kind,
-            src_addr: abs_src,
-            target_addr: abs_target,
-            node_id: resp.node_id.into(),
-            peer_is_src_or_target: true,
-        };
-
-        if done_resp.allocation_mode != GetAllocationMode::Temporary {
-            self.cache_local_replica_after_get(key, put_id, memory_info.clone());
-            metrics.observe_cache_value_size(&client_id, node_role.as_str(), data_len as u64);
-        }
-        let user_mem_holder = Arc::new(UserMemHolder::new(
-            memory_info,
-            self.get_or_init_all_memholder_refcount(),
-            expose_kind,
-        ));
-        // let partial_hex=&user_mem_holder.bytes()[..std::cmp::min(16, user_mem_holder.bytes().len())];
-        // tracing::debug!("external get done, key={}, partial_hex={:?}", key, partial_hex);
-        Ok(Some((user_mem_holder, Some(get_info))))
     }
 
     pub async fn is_exist(&self, key: &str) -> KvResult<bool> {

@@ -201,6 +201,7 @@ pub struct ExternalMemHolderInfo {
     pub offset: u64,
     pub len: u32,
     pub holder_id: u64,
+    pub source_kind: crate::master_kv_router::msg_pack::GetSourceKind,
 }
 impl ExternalMemHolder {
     /// Get the memory offset

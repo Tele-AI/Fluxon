@@ -8,14 +8,15 @@ mod count_prefix_index;
 
 use self::{
     count_prefix_index::PrefixRadixTree,
-    delete::handle_batch_delete_ack,
     delete::handle_delete,
     delete::handle_delete_ack,
+    delete::{handle_batch_delete_ack, handle_batch_ssd_replica_evict},
     get::{handle_get_done, handle_get_meta, handle_get_revoke, handle_get_start},
     msg_pack::{
-        BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, CountPrefixReq, CountPrefixResp,
-        DeleteAckReq, DeleteReq, GetAllocationMode, GetDoneReq, GetMetaReq, GetRevokeReq,
-        GetSourceKind, GetStartReq, PutDoneReq, PutRevokeReq, PutStartReq, SsdReplicaCommitReq,
+        BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchSsdReplicaEvictReq,
+        CountPrefixReq, CountPrefixResp, DeleteAckReq, DeleteReq, GetAllocationMode, GetDoneReq,
+        GetMetaReq, GetRevokeReq, GetSourceKind, GetStartReq, PutDoneReq, PutRevokeReq,
+        PutStartReq, SsdReplicaCommitReq,
     },
     placement::{PlacementDefault, PlacementPolicy},
     put::{handle_put_done, handle_put_revoke, handle_put_start, handle_ssd_replica_commit},
@@ -105,6 +106,7 @@ pub struct InflightPutInfo {
     pub key: String,
     pub req_node_id: NodeID,
     pub len: u64,
+    pub persist_to_ssd: bool,
     pub src_target_allocation: Arc<Mutex<Option<InflightPutAllocation>>>,
 }
 
@@ -121,6 +123,7 @@ pub struct InflightGetInfo {
     pub route: Arc<OneKvNodesRoutes>,
     pub allocation_mode: GetAllocationMode,
     pub source_kind: GetSourceKind,
+    pub(crate) cache_capacity_reservation: Option<Arc<NodeCacheCapacityReservation>>,
 }
 
 impl InflightGetInfo {
@@ -195,20 +198,90 @@ pub struct NodeValueReplicaDesc {
     pub put_id: PutIDForAKey,
 }
 
-/// Information about a completed `put` operation that can be retrieved via `get`.
-/// Now supports multiple replicas per key.
-#[derive(Clone, Debug)]
-pub struct KvRouteInfo {
-    pub node_id: NodeID,
-    pub allocation: Arc<Allocation>,
-    pub tomb_tag: NodeTombTag,
+type NodeReplicaCache = moka::sync::SegmentedCache<String, NodeValueReplicaDesc>;
+
+pub(crate) struct NodeCacheCapacityReservation {
+    node_id: NodeIDString,
+    bytes: u64,
+    base_capacity: u64,
+    reserved_bytes: Arc<Mutex<u64>>,
+    cache: Arc<NodeReplicaCache>,
+}
+
+impl NodeCacheCapacityReservation {
+    fn reserve(
+        node_id: NodeIDString,
+        bytes: u64,
+        base_capacity: u64,
+        reserved_bytes: Arc<Mutex<u64>>,
+        cache: Arc<NodeReplicaCache>,
+    ) -> Result<Self, String> {
+        let mut reserved = reserved_bytes.lock();
+        let new_reserved = reserved.checked_add(bytes).ok_or_else(|| {
+            format!(
+                "cache capacity reservation overflow: node_id={} reserved={} bytes={}",
+                node_id, *reserved, bytes
+            )
+        })?;
+        let new_capacity = base_capacity.saturating_sub(new_reserved);
+        cache.set_max_capacity(new_capacity).map_err(|err| {
+            format!(
+                "moka.set_max_capacity failed while reserving: node_id={} new_capacity={} err={}",
+                node_id, new_capacity, err
+            )
+        })?;
+        *reserved = new_reserved;
+        drop(reserved);
+
+        Ok(Self {
+            node_id,
+            bytes,
+            base_capacity,
+            reserved_bytes,
+            cache,
+        })
+    }
+}
+
+impl Drop for NodeCacheCapacityReservation {
+    fn drop(&mut self) {
+        let mut reserved = self.reserved_bytes.lock();
+        let new_reserved = reserved.checked_sub(self.bytes).unwrap_or_else(|| {
+            panic!(
+                "cache capacity reservation underflow: node_id={} reserved={} bytes={}",
+                self.node_id, *reserved, self.bytes
+            )
+        });
+        let new_capacity = self.base_capacity.saturating_sub(new_reserved);
+        self.cache
+            .set_max_capacity(new_capacity)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "moka.set_max_capacity failed while releasing reservation: node_id={} new_capacity={} err={}",
+                    self.node_id, new_capacity, err
+                )
+            });
+        *reserved = new_reserved;
+    }
 }
 
 #[derive(Clone, Debug)]
-pub struct KvSsdRouteInfo {
-    pub node_id: NodeID,
+pub struct KvSsdReplicaInfo {
     pub len: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct KvNodeReplicas {
     pub tomb_tag: NodeTombTag,
+    pub memory: Option<Arc<Allocation>>,
+    pub ssd: Option<KvSsdReplicaInfo>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SsdReplicaCommitStatus {
+    Committed,
+    MissingMemory,
+    TombedNode,
 }
 
 #[derive(Debug)]
@@ -238,35 +311,114 @@ pub struct OneKvNodesRoutes {
     ///   nodes must not insert leased keys into moka caches.
     pub lease_id: Option<u64>,
 
-    /// node_id -> KvRouteInfo
-    pub nodes_replicas: RwLock<HashMap<NodeID, KvRouteInfo>>,
-    /// node_id -> SSD replica metadata for the same key-version.
-    pub ssd_replicas: RwLock<HashMap<NodeID, KvSsdRouteInfo>>,
+    /// Per-node memory and SSD replicas for this key-version.
+    pub node_replicas: RwLock<HashMap<NodeID, KvNodeReplicas>>,
     pub get_durable_slots_used: AtomicU32,
 }
 
 impl OneKvNodesRoutes {
-    fn clean_up_tomb_nodes_replicas(
+    fn new(put_id: PutIDForAKey, lease_id: Option<u64>) -> Self {
+        Self {
+            put_id,
+            lease_id,
+            node_replicas: RwLock::new(HashMap::new()),
+            get_durable_slots_used: AtomicU32::new(0),
+        }
+    }
+
+    fn remove_tombed_node_replicas(
         &self,
         verify_put_id: PutIDForAKey,
         tombs: HashSet<NodeID>,
-        _view: &MasterKvRouterView,
     ) -> bool {
         if self.put_id != verify_put_id {
             return false;
         }
 
-        let mut nodes_replicas = self.nodes_replicas.write();
-        nodes_replicas.retain(|_, kv_info| !tombs.contains(&kv_info.node_id));
+        self.node_replicas
+            .write()
+            .retain(|node_id, replicas| !tombs.contains(node_id) || !replicas.tomb_tag.is_tomb());
 
-        let mut ssd_replicas = self.ssd_replicas.write();
-        ssd_replicas.retain(|_, kv_info| !tombs.contains(&kv_info.node_id));
-
-        return true;
+        true
     }
 
     fn has_live_replica(&self) -> bool {
-        !self.nodes_replicas.read().is_empty() || !self.ssd_replicas.read().is_empty()
+        self.node_replicas.read().values().any(|replicas| {
+            !replicas.tomb_tag.is_tomb() && (replicas.memory.is_some() || replicas.ssd.is_some())
+        })
+    }
+
+    fn has_memory_replica(&self, node_id: &NodeID) -> bool {
+        self.node_replicas
+            .read()
+            .get(node_id)
+            .is_some_and(|replicas| !replicas.tomb_tag.is_tomb() && replicas.memory.is_some())
+    }
+
+    fn insert_memory_replica(
+        &self,
+        node_id: NodeID,
+        allocation: Arc<Allocation>,
+        tomb_tag: NodeTombTag,
+    ) {
+        let mut node_replicas = self.node_replicas.write();
+        if let Some(replicas) = node_replicas.get_mut(&node_id) {
+            if !replicas.tomb_tag.is_tomb() {
+                replicas.memory = Some(allocation);
+                return;
+            }
+        }
+
+        node_replicas.insert(
+            node_id,
+            KvNodeReplicas {
+                tomb_tag,
+                memory: Some(allocation),
+                ssd: None,
+            },
+        );
+    }
+
+    fn commit_ssd_replica(&self, node_id: &NodeID, len: u64) -> SsdReplicaCommitStatus {
+        let mut node_replicas = self.node_replicas.write();
+        let Some(replicas) = node_replicas.get_mut(node_id) else {
+            return SsdReplicaCommitStatus::MissingMemory;
+        };
+        if replicas.memory.is_none() {
+            return SsdReplicaCommitStatus::MissingMemory;
+        }
+        if replicas.tomb_tag.is_tomb() {
+            return SsdReplicaCommitStatus::TombedNode;
+        }
+
+        replicas.ssd = Some(KvSsdReplicaInfo { len });
+        SsdReplicaCommitStatus::Committed
+    }
+
+    fn remove_memory_replica(&self, node_id: &NodeID) -> bool {
+        let mut node_replicas = self.node_replicas.write();
+        let Some(replicas) = node_replicas.get_mut(node_id) else {
+            return false;
+        };
+        let removed = replicas.memory.take().is_some();
+        let remove_node = replicas.ssd.is_none();
+        if remove_node {
+            node_replicas.remove(node_id);
+        }
+        removed
+    }
+
+    fn remove_ssd_replica(&self, node_id: &NodeID) -> bool {
+        let mut node_replicas = self.node_replicas.write();
+        let Some(replicas) = node_replicas.get_mut(node_id) else {
+            return false;
+        };
+        let removed = replicas.ssd.take().is_some();
+        let remove_node = replicas.memory.is_none();
+        if remove_node {
+            node_replicas.remove(node_id);
+        }
+        removed
     }
 
     fn try_reserve_get_durable_slot(&self) -> bool {
@@ -294,17 +446,13 @@ impl OneKvNodesRoutes {
 mod tests {
     use super::*;
     use crate::cluster_manager::ClusterMember;
+    use crate::master_seg_manager::msg_pack::SegmentDeviceDescription;
+    use crate::master_seg_manager::one_seg_allocator::OneSegAllocator;
     use std::collections::HashMap;
 
     #[test]
     fn one_kv_nodes_routes_only_reserves_two_get_durable_slots() {
-        let routes = OneKvNodesRoutes {
-            put_id: (1, 0),
-            lease_id: None,
-            nodes_replicas: RwLock::new(HashMap::new()),
-            ssd_replicas: RwLock::new(HashMap::new()),
-            get_durable_slots_used: AtomicU32::new(0),
-        };
+        let routes = OneKvNodesRoutes::new((1, 0), None);
 
         assert!(routes.try_reserve_get_durable_slot());
         assert!(routes.try_reserve_get_durable_slot());
@@ -312,6 +460,82 @@ mod tests {
 
         routes.release_get_durable_slot();
         assert!(routes.try_reserve_get_durable_slot());
+    }
+
+    #[test]
+    fn one_kv_nodes_routes_updates_memory_and_ssd_independently() {
+        let routes = OneKvNodesRoutes::new((1, 0), None);
+        let node_id: NodeID = "node-a".to_string().into();
+        let allocator = Arc::new(
+            OneSegAllocator::new(
+                "route-test".to_string(),
+                SegmentDeviceDescription::Cpu,
+                0,
+                4096,
+            )
+            .expect("test allocator must be created"),
+        );
+        let allocation = Arc::new(
+            allocator
+                .allocate(512)
+                .expect("test allocation must be created"),
+        );
+
+        assert_eq!(
+            routes.commit_ssd_replica(&node_id, 512),
+            SsdReplicaCommitStatus::MissingMemory
+        );
+        routes.insert_memory_replica(node_id.clone(), allocation, NodeTombTag::new());
+        assert_eq!(
+            routes.commit_ssd_replica(&node_id, 512),
+            SsdReplicaCommitStatus::Committed
+        );
+
+        assert!(routes.remove_memory_replica(&node_id));
+        {
+            let node_replicas = routes.node_replicas.read();
+            let replicas = node_replicas
+                .get(&node_id)
+                .expect("SSD replica must keep the node entry alive");
+            assert!(replicas.memory.is_none());
+            assert_eq!(replicas.ssd.as_ref().map(|ssd| ssd.len), Some(512));
+        }
+
+        assert!(routes.remove_ssd_replica(&node_id));
+        assert!(routes.node_replicas.read().is_empty());
+
+        let old_tomb_tag = NodeTombTag::new();
+        let old_allocation = Arc::new(
+            allocator
+                .allocate(512)
+                .expect("old-incarnation test allocation must be created"),
+        );
+        routes.insert_memory_replica(node_id.clone(), old_allocation, old_tomb_tag.clone());
+        assert_eq!(
+            routes.commit_ssd_replica(&node_id, 512),
+            SsdReplicaCommitStatus::Committed
+        );
+        old_tomb_tag.set_tomb();
+
+        let new_allocation = Arc::new(
+            allocator
+                .allocate(512)
+                .expect("new-incarnation test allocation must be created"),
+        );
+        routes.insert_memory_replica(node_id.clone(), new_allocation, NodeTombTag::new());
+        assert!(
+            routes.remove_tombed_node_replicas(routes.put_id, HashSet::from([node_id.clone()]),)
+        );
+        assert!(routes.has_memory_replica(&node_id));
+        assert!(
+            routes
+                .node_replicas
+                .read()
+                .get(&node_id)
+                .expect("new node incarnation must remain indexed")
+                .ssd
+                .is_none()
+        );
     }
 
     fn new_test_member(metadata: HashMap<String, String>) -> ClusterMember {
@@ -391,12 +615,10 @@ pub struct MasterKvRouterInner {
     pub prefix_index: ARwLock<PrefixRadixTree>,
 
     /// Support replicas: node_id -> key -> route_info
-    pub node_kv_cache_controller:
-        DashMap<NodeIDString, Arc<moka::sync::SegmentedCache<String, NodeValueReplicaDesc>>>,
+    pub node_kv_cache_controller: DashMap<NodeIDString, Arc<NodeReplicaCache>>,
 
-    /// Per-node total bytes reserved for leased replicas. We subtract this from
-    /// the base max capacity of each node's moka cache. Acts like a fetch_sub/add counter.
-    pub lease_reserved_bytes: DashMap<NodeIDString, Arc<AtomicU64>>,
+    /// Per-node bytes held outside Moka while still consuming allocator space.
+    pub cache_reserved_bytes: DashMap<NodeIDString, Arc<Mutex<u64>>>,
 
     /// Historical final put placement decisions by target node.
     pub put_target_decision_counts: DashMap<NodeIDString, Arc<AtomicU64>>,
@@ -530,7 +752,7 @@ impl MasterKvRouter {
             kv_routes: DashMap::new(),
             prefix_index: ARwLock::new(PrefixRadixTree::new()),
             node_kv_cache_controller: DashMap::new(),
-            lease_reserved_bytes: DashMap::new(),
+            cache_reserved_bytes: DashMap::new(),
             put_target_decision_counts: DashMap::new(),
             put_requester_target_decision_counts: DashMap::new(),
             put_placement_mode_counts: DashMap::new(),
@@ -798,6 +1020,20 @@ impl MasterKvRouter {
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send SsdReplicaCommitResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchSsdReplicaEvictReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let req_node_id = resp.node_id().clone();
+            let view_task = view.clone();
+            let _ = view.spawn("rpc_batch_ssd_replica_evict", async move {
+                let ack = handle_batch_ssd_replica_evict(view_task, msg, req_node_id).await;
+                if let Err(err) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchSsdReplicaEvictResp: {:?}", err);
                 }
             });
             Ok(())
@@ -1413,10 +1649,7 @@ impl MasterKvRouter {
         });
     }
 
-    pub fn get_node_cache_controller(
-        &self,
-        node_id: &str,
-    ) -> Option<Arc<moka::sync::SegmentedCache<String, NodeValueReplicaDesc>>> {
+    pub fn get_node_cache_controller(&self, node_id: &str) -> Option<Arc<NodeReplicaCache>> {
         if !self.replica_cache_enabled() {
             return None;
         }
@@ -1488,55 +1721,27 @@ impl MasterKvRouter {
         )
     }
 
-    /// Atomically adjust a node's cache capacity reservation by `delta_bytes`.
-    /// Positive delta reserves capacity (fetch_sub from usable capacity),
-    /// negative delta releases reservation (fetch_add back to usable capacity).
-    pub fn adjust_node_cache_capacity_for_lease(
+    pub(crate) fn reserve_node_cache_capacity(
         &self,
         node_id: &str,
-        delta_bytes: i64,
-    ) -> crate::rpcresp_kvresult_convert::msg_and_error::KvResult<()> {
+        bytes: u64,
+    ) -> crate::rpcresp_kvresult_convert::msg_and_error::KvResult<
+        Option<NodeCacheCapacityReservation>,
+    > {
         if !self.replica_cache_enabled() {
-            return Ok(());
+            return Ok(None);
         }
-        // Track per-node reserved bytes with an atomic counter
-        let reserved_counter = self
-            .inner()
-            .lease_reserved_bytes
-            .entry(node_id.to_string())
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-            .value()
-            .clone();
-
-        // Apply delta to the counter with simple fetch ops per user's preference
-        if delta_bytes >= 0 {
-            reserved_counter.fetch_add(delta_bytes as u64, Ordering::Relaxed);
-        } else {
-            let sub = (-delta_bytes) as u64;
-            reserved_counter.fetch_sub(sub, Ordering::Relaxed);
-        }
-
-        // Recompute target capacity: base(=MOKA_CACHE_CAPACITY_RATIO * node_space) - reserved_total
-        let reserved_total = reserved_counter.load(Ordering::Relaxed);
         let node_space_size = self
             .inner()
             .view()
             .master_seg_manager()
             .get_node_space_size(node_id);
         if node_space_size == 0 {
-            // Node not ready: this should not happen in a successful put_done path.
-            // Revert the counter delta before returning error.
-            if delta_bytes >= 0 {
-                reserved_counter.fetch_sub(delta_bytes as u64, Ordering::Relaxed);
-            } else {
-                let add = (-delta_bytes) as u64;
-                reserved_counter.fetch_add(add, Ordering::Relaxed);
-            }
             return Err(
                 crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
                     crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::OwnerNoSeg {
                         detail: format!(
-                            "node_id={} has no segment (node_space_size=0) while adjusting cache capacity",
+                            "node_id={} has no segment while reserving cache capacity",
                             node_id
                         ),
                     },
@@ -1544,62 +1749,158 @@ impl MasterKvRouter {
             );
         }
         let base_capacity = (node_space_size as f32 * MOKA_CACHE_CAPACITY_RATIO) as u64;
-        let new_capacity = base_capacity.saturating_sub(reserved_total);
-
-        if let Some(cache) = self.get_node_cache_controller(node_id) {
-            if let Err(e) = cache.set_max_capacity(new_capacity) {
-                // Revert counter and return error.
-                if delta_bytes >= 0 {
-                    reserved_counter.fetch_sub(delta_bytes as u64, Ordering::Relaxed);
-                } else {
-                    let add = (-delta_bytes) as u64;
-                    reserved_counter.fetch_add(add, Ordering::Relaxed);
-                }
-                return Err(crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
-                    crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::RpcDecodeError {
-                        rpc_input_json: format!(
-                            "moka.set_max_capacity failed: node_id={}, new_capacity={}, err={}",
-                            node_id, new_capacity, e
-                        ),
-                    }
-                ));
-            }
-            Ok(())
-        } else {
-            // Revert counter and return error.
-            if delta_bytes >= 0 {
-                reserved_counter.fetch_sub(delta_bytes as u64, Ordering::Relaxed);
-            } else {
-                let add = (-delta_bytes) as u64;
-                reserved_counter.fetch_add(add, Ordering::Relaxed);
-            }
-            Err(
-                crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
-                    crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::OwnerNoSeg {
-                        detail: format!("node_id={} cache_controller not found", node_id),
-                    },
-                ),
+        let cache = self.get_node_cache_controller(node_id).ok_or_else(|| {
+            crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
+                crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::OwnerNoSeg {
+                    detail: format!("node_id={} cache_controller not found", node_id),
+                },
             )
-        }
-    }
+        })?;
+        let reserved_bytes = self
+            .inner()
+            .cache_reserved_bytes
+            .entry(node_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(0)))
+            .value()
+            .clone();
 
-    // Note: no additional getters for reserved bytes; policy currently relies only on adjust calls.
-}
-
-impl MasterKvRouterView {
-    pub fn try_adjust_node_cache_capacity_for_lease(
-        &self,
-        node_id: &str,
-        delta_bytes: i64,
-    ) -> Option<crate::rpcresp_kvresult_convert::msg_and_error::KvResult<()>> {
-        let _view_guard = self.try_upgrade()?;
-        Some(
-            self.master_kv_router()
-                .adjust_node_cache_capacity_for_lease(node_id, delta_bytes),
+        NodeCacheCapacityReservation::reserve(
+            node_id.to_string(),
+            bytes,
+            base_capacity,
+            reserved_bytes,
+            cache,
         )
+        .map(Some)
+        .map_err(|detail| {
+            crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
+                crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::OwnerNoSeg {
+                    detail,
+                },
+            )
+        })
     }
 }
 // moved to crate::metrics::client
+
+#[cfg(test)]
+mod cache_capacity_reservation_tests {
+    use super::*;
+    use crate::master_seg_manager::msg_pack::SegmentDeviceDescription;
+    use crate::master_seg_manager::one_seg_allocator::OneSegAllocator;
+
+    fn new_cache(capacity: u64) -> Arc<NodeReplicaCache> {
+        Arc::new(
+            moka::sync::SegmentedCache::builder(1)
+                .max_capacity(capacity)
+                .weigher(Box::new(|_key: &String, value: &NodeValueReplicaDesc| {
+                    value.weight_bytes
+                }))
+                .build(),
+        )
+    }
+
+    #[test]
+    fn pending_persist_reservation_reduces_capacity_until_guard_drops() {
+        let cache = new_cache(800);
+        let reserved_bytes = Arc::new(Mutex::new(0));
+        let first = NodeCacheCapacityReservation::reserve(
+            "node-a".to_string(),
+            120,
+            800,
+            reserved_bytes.clone(),
+            cache.clone(),
+        )
+        .unwrap();
+        let second = NodeCacheCapacityReservation::reserve(
+            "node-a".to_string(),
+            80,
+            800,
+            reserved_bytes.clone(),
+            cache.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(*reserved_bytes.lock(), 200);
+        assert_eq!(cache.policy().max_capacity(), Some(600));
+
+        drop(first);
+        assert_eq!(*reserved_bytes.lock(), 80);
+        assert_eq!(cache.policy().max_capacity(), Some(720));
+
+        drop(second);
+        assert_eq!(*reserved_bytes.lock(), 0);
+        assert_eq!(cache.policy().max_capacity(), Some(800));
+    }
+
+    #[test]
+    fn inflight_get_keeps_capacity_reserved_until_handoff_drops() {
+        let cache = new_cache(800);
+        let reserved_bytes = Arc::new(Mutex::new(0));
+        let reservation = Arc::new(
+            NodeCacheCapacityReservation::reserve(
+                "node-a".to_string(),
+                120,
+                800,
+                reserved_bytes.clone(),
+                cache.clone(),
+            )
+            .unwrap(),
+        );
+        let allocator = Arc::new(
+            OneSegAllocator::new(
+                "inflight-get-reservation-test".to_string(),
+                SegmentDeviceDescription::Cpu,
+                0,
+                4096,
+            )
+            .expect("test allocator must be created"),
+        );
+        let allocation = Arc::new(
+            allocator
+                .allocate(512)
+                .expect("test allocation must be created"),
+        );
+        let route = Arc::new(OneKvNodesRoutes::new((1, 0), None));
+        let mut inflight = InflightGetInfo {
+            put_id: (1, 0),
+            src_node_id: "node-b".to_string().into(),
+            key: "key-a".to_string(),
+            req_node_id: "node-a".to_string().into(),
+            len: 512,
+            allocation,
+            source_allocation: None,
+            route,
+            allocation_mode: GetAllocationMode::DurableReplica,
+            source_kind: GetSourceKind::Memory,
+            cache_capacity_reservation: Some(reservation),
+        };
+
+        assert_eq!(*reserved_bytes.lock(), 120);
+        assert_eq!(cache.policy().max_capacity(), Some(680));
+
+        let handoff = inflight.cache_capacity_reservation.take();
+        drop(inflight);
+        assert_eq!(*reserved_bytes.lock(), 120);
+
+        drop(handoff);
+        assert_eq!(*reserved_bytes.lock(), 0);
+        assert_eq!(cache.policy().max_capacity(), Some(800));
+    }
+
+    #[test]
+    #[should_panic(expected = "cache capacity reservation underflow")]
+    fn reservation_release_fails_fast_on_counter_underflow() {
+        let reservation = NodeCacheCapacityReservation {
+            node_id: "node-a".to_string(),
+            bytes: 1,
+            base_capacity: 800,
+            reserved_bytes: Arc::new(Mutex::new(0)),
+            cache: new_cache(800),
+        };
+        drop(reservation);
+    }
+}
 
 #[cfg(test)]
 mod placement_metrics_tests {

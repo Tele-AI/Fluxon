@@ -252,6 +252,28 @@ impl MetricsHandle {
         });
     }
 
+    pub fn set_kv_ssd_capacity_bytes(&self, node: &str, device: &str, bytes: u64) {
+        let Some(observe) = self.observe() else {
+            return;
+        };
+        observe.try_submit(ObserveOp::SetKvSsdCapacityBytes {
+            node: node.to_string(),
+            device: device.to_string(),
+            bytes,
+        });
+    }
+
+    pub fn set_kv_ssd_used_bytes(&self, node: &str, device: &str, bytes: u64) {
+        let Some(observe) = self.observe() else {
+            return;
+        };
+        observe.try_submit(ObserveOp::SetKvSsdUsedBytes {
+            node: node.to_string(),
+            device: device.to_string(),
+            bytes,
+        });
+    }
+
     pub fn set_fs_mount_fs_bytes(
         &self,
         mount_kind: FsMountKind,

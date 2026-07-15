@@ -1,5 +1,6 @@
 use super::{
-    InflightGetInfo, KvRouteInfo, MasterKvRouterView, NodeValueReplicaDesc, OwnerHoldingGetInfo,
+    InflightGetInfo, MasterKvRouterView, NodeCacheCapacityReservation, NodeValueReplicaDesc,
+    OwnerHoldingGetInfo,
     msg_pack::{
         GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetMetaResp, GetRevokeReq,
         GetRevokeResp, GetSourceKind, GetStartReq, GetStartResp,
@@ -7,22 +8,185 @@ use super::{
 };
 use crate::kv_ssd_storage::{SSD_ALIGNMENT, align_ssd_io_len};
 use crate::master_kv_router::OneKvNodesRoutes;
+use crate::master_kv_router::delete::remove_one_ssd_replica_for_node;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::memholder::MemholderManagerTrait;
 use crate::{
     cluster_manager::NodeID, master_seg_manager::one_seg_allocator::Allocation,
-    p2p::msg_pack::MsgPack, rpcresp_kvresult_convert::msg_and_error,
+    master_seg_manager::one_seg_allocator::OneSegAllocator, p2p::msg_pack::MsgPack,
+    rpcresp_kvresult_convert::msg_and_error,
 };
 use rand::Rng;
 use rand::seq::SliceRandom;
 use std::collections::HashSet;
-use std::{
-    collections::HashMap,
-    sync::{Arc, atomic::Ordering},
-};
+use std::future::Future;
+use std::sync::{Arc, atomic::Ordering};
+use std::time::{Duration, Instant};
+
+const GET_ALLOCATION_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const GET_ALLOCATION_RETRY_INTERVAL: Duration = Duration::from_millis(2);
+
+struct AllocationWaitResult {
+    allocation: Option<Allocation>,
+    attempts: usize,
+    elapsed: Duration,
+}
+
+fn try_allocate_from_segments(
+    allocators: &[Arc<OneSegAllocator>],
+    len: u64,
+    attempts: &mut usize,
+) -> Option<Allocation> {
+    for allocator in allocators {
+        *attempts += 1;
+        if let Ok(allocation) = allocator.allocate(len) {
+            return Some(allocation);
+        }
+    }
+    None
+}
+
+async fn allocate_with_bounded_wait<F, Fut>(
+    allocators: &[Arc<OneSegAllocator>],
+    len: u64,
+    timeout: Duration,
+    retry_interval: Duration,
+    mut advance_reclamation: F,
+) -> AllocationWaitResult
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let started = Instant::now();
+    let mut attempts = 0usize;
+
+    loop {
+        if let Some(allocation) = try_allocate_from_segments(allocators, len, &mut attempts) {
+            return AllocationWaitResult {
+                allocation: Some(allocation),
+                attempts,
+                elapsed: started.elapsed(),
+            };
+        }
+
+        if started.elapsed() >= timeout {
+            return AllocationWaitResult {
+                allocation: None,
+                attempts,
+                elapsed: started.elapsed(),
+            };
+        }
+
+        // Moka eviction removes the route first and releases the allocation after
+        // the owner processes its invalidation RPC. Drive pending eviction work,
+        // then yield so that RPC and holder ACK tasks can make progress.
+        advance_reclamation().await;
+
+        // In-process maintenance can release an allocation synchronously. Retry
+        // once before sleeping so this path does not add a fixed 2 ms penalty.
+        if let Some(allocation) = try_allocate_from_segments(allocators, len, &mut attempts) {
+            return AllocationWaitResult {
+                allocation: Some(allocation),
+                attempts,
+                elapsed: started.elapsed(),
+            };
+        }
+
+        tokio::time::sleep(retry_interval).await;
+    }
+}
+
+async fn allocate_get_buffer_on_node(
+    view: &MasterKvRouterView,
+    node_id: &NodeID,
+    len: u64,
+    get_id: u64,
+    purpose: &str,
+) -> Result<Arc<Allocation>, msg_and_error::KvError> {
+    let mut node_allocators = view.master_seg_manager().get_node_allocators(node_id);
+    if node_allocators.is_empty() {
+        tracing::info!(
+            "No allocators found for {} during get: {}, node is not ready",
+            purpose,
+            node_id
+        );
+        return Err(msg_and_error::KvError::Unreachable(
+            msg_and_error::UnreachableError::OwnerNoSeg { detail: "config=0 initializes as external; non-zero initializes as owner; the owner must have memory space (segment)".to_string() }
+        ));
+    }
+
+    node_allocators.shuffle(&mut rand::thread_rng());
+    let cache = view
+        .master_kv_router()
+        .get_node_cache_controller(node_id.as_ref());
+    let result = allocate_with_bounded_wait(
+        &node_allocators,
+        len,
+        GET_ALLOCATION_WAIT_TIMEOUT,
+        GET_ALLOCATION_RETRY_INTERVAL,
+        || {
+            if let Some(cache) = cache.as_ref() {
+                cache.run_pending_tasks();
+            }
+            let inflight_gets = view.master_kv_router().inner().inflight_gets.clone();
+            let inflight_puts = view.master_kv_router().inner().inflight_puts.clone();
+            async move {
+                // Moka removes an in-flight entry from lookup immediately, but
+                // its maintenance queue can retain the RAII value briefly. Drain
+                // both queues under allocator pressure so completed PUT/GET
+                // staging and target allocations are actually released.
+                inflight_gets.run_pending_tasks().await;
+                inflight_puts.run_pending_tasks().await;
+            }
+        },
+    )
+    .await;
+
+    if let Some(allocation) = result.allocation {
+        if result.attempts > node_allocators.len() {
+            tracing::debug!(
+                "{} allocation recovered after {} attempts and {:?} for get_id {} on node {}",
+                purpose,
+                result.attempts,
+                result.elapsed,
+                get_id,
+                node_id
+            );
+        }
+        return Ok(Arc::new(allocation));
+    }
+
+    let allocator = node_allocators
+        .iter()
+        .max_by_key(|allocator| {
+            allocator
+                .total_size_bytes()
+                .saturating_sub(allocator.used_size_bytes())
+        })
+        .expect("non-empty allocator list must have a diagnostic allocator");
+    let total = allocator.total_size_bytes();
+    let used = allocator.used_size_bytes();
+    let free = total.saturating_sub(used);
+    tracing::info!(
+        "{} allocation timed out after {} attempts and {:?} for get_id {} on node {}",
+        purpose,
+        result.attempts,
+        result.elapsed,
+        get_id,
+        node_id
+    );
+    Err(msg_and_error::KvError::Api(
+        msg_and_error::ApiError::NoSpace {
+            node: node_id.as_ref().to_string(),
+            segment: allocator.seg_device_id.clone(),
+            total_capacity: total,
+            free_capacity: free,
+        },
+    ))
+}
 
 fn update_moka_for_node(
-    view: MasterKvRouterView,
+    view: &MasterKvRouterView,
     node_id: String,
     key: String,
     weight: u32,
@@ -32,41 +196,75 @@ fn update_moka_for_node(
     if !view.master_kv_router().replica_cache_enabled() {
         return;
     }
-    let view_task = view.clone();
-    let _ = view.spawn("update_moka_for_node", async move {
-        if let Some(cache) = view_task
-            .master_kv_router()
-            .get_node_cache_controller(&node_id)
-        {
-            if new_inserted {
-                cache.insert(
-                    key.clone(),
-                    NodeValueReplicaDesc {
-                        weight_bytes: weight,
-                        put_id,
-                    },
-                );
-                tracing::debug!(
-                    "Inserted key: {:?} into node cache: {}, weight={}",
-                    key,
-                    node_id,
-                    weight
-                );
-            } else {
-                let _ = cache.get(&key);
-                tracing::debug!(
-                    "Touched key: {:?} on node cache: {} (TTL refresh)",
-                    key,
-                    node_id
-                );
-            }
+    if let Some(cache) = view.master_kv_router().get_node_cache_controller(&node_id) {
+        if new_inserted {
+            cache.insert(
+                key.clone(),
+                NodeValueReplicaDesc {
+                    weight_bytes: weight,
+                    put_id,
+                },
+            );
+            cache.run_pending_tasks();
+            tracing::debug!(
+                "Inserted key: {:?} into node cache: {}, weight={}",
+                key,
+                node_id,
+                weight
+            );
         } else {
-            tracing::warn!(
-                "No cache controller found for node: {} when updating moka",
+            let _ = cache.get(&key);
+            tracing::debug!(
+                "Touched key: {:?} on node cache: {} (TTL refresh)",
+                key,
                 node_id
             );
         }
-    });
+    } else {
+        tracing::warn!(
+            "No cache controller found for node: {} when updating moka",
+            node_id
+        );
+    }
+}
+
+fn reserve_durable_get_target(
+    view: &MasterKvRouterView,
+    route: &Arc<OneKvNodesRoutes>,
+    node_id: &NodeID,
+    target_allocation: &mut Arc<Allocation>,
+) -> (GetAllocationMode, Option<Arc<NodeCacheCapacityReservation>>) {
+    if !route.try_reserve_get_durable_slot() {
+        return (GetAllocationMode::Temporary, None);
+    }
+
+    let reservation = match view
+        .master_kv_router()
+        .reserve_node_cache_capacity(node_id.as_ref(), target_allocation.capcity())
+    {
+        Ok(reservation) => reservation,
+        Err(err) => {
+            route.release_get_durable_slot();
+            tracing::warn!(
+                "Falling back to a temporary GET target because cache capacity reservation failed: node={} bytes={} err={}",
+                node_id,
+                target_allocation.capcity(),
+                err
+            );
+            return (GetAllocationMode::Temporary, None);
+        }
+    };
+
+    if route.lease_id.is_some() {
+        if let Some(reservation) = reservation {
+            Arc::get_mut(target_allocation)
+                .expect("new GET target allocation must be uniquely owned")
+                .set_on_drop(move || drop(reservation));
+        }
+        (GetAllocationMode::DurableReplica, None)
+    } else {
+        (GetAllocationMode::DurableReplica, reservation.map(Arc::new))
+    }
 }
 
 pub async fn handle_get_start(
@@ -80,21 +278,25 @@ pub async fn handle_get_start(
         key: &str,
     ) {
         if let Some((tombs, put_id)) = tombs_and_put_id {
-            let mut remove_in_kv_routes = false;
-            if let Some(one_kv_nodes_routes) = view.master_kv_router().inner().kv_routes.get(key) {
-                one_kv_nodes_routes.clean_up_tomb_nodes_replicas(put_id, tombs, view);
-                if !one_kv_nodes_routes.has_live_replica() {
-                    remove_in_kv_routes = true;
-                }
-            }
+            let route_to_remove = view
+                .master_kv_router()
+                .inner()
+                .kv_routes
+                .get(key)
+                .map(|route| route.value().clone())
+                .filter(|route| {
+                    route.remove_tombed_node_replicas(put_id, tombs) && !route.has_live_replica()
+                });
 
-            if remove_in_kv_routes {
-                view.master_kv_router()
-                    .inner()
-                    .kv_routes
-                    .remove_if(key, |_, one_kv_nodes_routes| {
-                        one_kv_nodes_routes.put_id == put_id
-                    });
+            if let Some(route_to_remove) = route_to_remove {
+                view.master_kv_router().inner().kv_routes.remove_if(
+                    key,
+                    |_, one_kv_nodes_routes| {
+                        Arc::ptr_eq(one_kv_nodes_routes, &route_to_remove)
+                            && one_kv_nodes_routes.put_id == put_id
+                            && !one_kv_nodes_routes.has_live_replica()
+                    },
+                );
             }
         }
     }
@@ -113,57 +315,6 @@ pub async fn handle_get_start(
                 raw_bytes: Vec::new(),
             },
         )
-    }
-    fn allocate_get_buffer_on_node(
-        view: &MasterKvRouterView,
-        node_id: &NodeID,
-        len: u64,
-        get_id: u64,
-        purpose: &str,
-    ) -> Result<Arc<Allocation>, msg_and_error::KvError> {
-        let node_allocators = view.master_seg_manager().get_node_allocators(node_id);
-        if node_allocators.is_empty() {
-            tracing::info!(
-                "No allocators found for {} during get: {}, node is not ready",
-                purpose,
-                node_id
-            );
-            return Err(msg_and_error::KvError::Unreachable(
-                msg_and_error::UnreachableError::OwnerNoSeg { detail: "config=0 initializes as external; non-zero initializes as owner; the owner must have memory space (segment)".to_string() }
-            ));
-        }
-
-        let allocator = node_allocators.choose(&mut rand::thread_rng()).unwrap();
-        let mut allocated_addr: Option<Allocation> = None;
-        for attempt in 1..=3 {
-            if let Ok(allocation) = allocator.allocate(len) {
-                allocated_addr = Some(allocation);
-                break;
-            } else {
-                tracing::info!(
-                    "{} allocation attempt {}/3 failed for get_id {} on node {}",
-                    purpose,
-                    attempt,
-                    get_id,
-                    node_id
-                );
-            }
-        }
-        if let Some(allocation) = allocated_addr {
-            return Ok(Arc::new(allocation));
-        }
-
-        let total = allocator.total_size_bytes();
-        let used = allocator.used_size_bytes();
-        let free = total.saturating_sub(used);
-        Err(msg_and_error::KvError::Api(
-            msg_and_error::ApiError::NoSpace {
-                node: node_id.as_ref().to_string(),
-                segment: allocator.seg_device_id.clone(),
-                total_capacity: total,
-                free_capacity: free,
-            },
-        ))
     }
     fn align_ssd_stage_addr(raw_addr: u64) -> Result<u64, msg_and_error::KvError> {
         raw_addr
@@ -200,41 +351,53 @@ pub async fn handle_get_start(
         return failed_resp_err(err, None, &view, &req.serialize_part.key);
     };
 
-    let replicas: HashMap<NodeID, KvRouteInfo> = one_kv_nodes_routes.nodes_replicas.read().clone();
-    // Currently we are holding the lock with `replicas`
-    // 选择一个replica (这里可以实现更复杂的选择逻辑)
-    let mut replica_keys = replicas.keys().collect::<Vec<_>>();
+    let replicas = one_kv_nodes_routes.node_replicas.read().clone();
+    let mut replica_keys = replicas
+        .iter()
+        .filter_map(|(node_id, replicas)| replicas.memory.is_some().then_some(node_id))
+        .collect::<Vec<_>>();
     let mut tombs = HashSet::new();
     let mut target_allocations = None;
     let mut allocation_mode = GetAllocationMode::Temporary;
-    for _ in 0..replicas.len() {
+    let mut target_capacity_reservation = None;
+    while !replica_keys.is_empty() {
         let to_remove_idx = rand::thread_rng().gen_range(0..replica_keys.len());
         let selected_replica_key = replica_keys.remove(to_remove_idx);
-        let selected_replica = replicas.get(&*selected_replica_key).unwrap();
+        let selected_replica = replicas
+            .get(selected_replica_key)
+            .expect("selected memory replica node must exist");
         if selected_replica.tomb_tag.is_tomb() {
             tombs.insert(selected_replica_key.to_owned());
             continue;
         }
-        let src_allocation = selected_replica.allocation.clone();
-        let src_node_id = selected_replica.node_id.clone();
+        let src_allocation = selected_replica
+            .memory
+            .as_ref()
+            .expect("selected memory replica must exist")
+            .clone();
+        let src_node_id = selected_replica_key.to_owned();
 
         // 为get调用方分配接收内存作为传输target
         if target_allocations.is_none() {
-            target_allocations = if let Some(replica_on_recv_node) = replicas.get(&req_node_id) {
+            target_allocations = if let Some(replica_on_recv_node) = replicas
+                .get(&req_node_id)
+                .filter(|replicas| !replicas.tomb_tag.is_tomb())
+                .and_then(|replicas| replicas.memory.as_ref())
+            {
                 allocation_mode = GetAllocationMode::ReuseReplica;
-                Some(replica_on_recv_node.allocation.clone())
+                Some(replica_on_recv_node.clone())
             } else {
-                let target_allocation = {
-                    let req_node_allocators =
-                        view.master_seg_manager().get_node_allocators(&req_node_id);
-                    if req_node_allocators.is_empty() {
-                        tracing::info!(
-                            "No allocators found for requesting node: {}, node is not ready",
-                            req_node_id
-                        );
-                        let err = msg_and_error::KvError::Unreachable(
-                            msg_and_error::UnreachableError::OwnerNoSeg { detail: "config=0 initializes as external; non-zero initializes as owner; the owner must have memory space (segment)".to_string() }
-                        );
+                let mut target_allocation = match allocate_get_buffer_on_node(
+                    &view,
+                    &req_node_id,
+                    src_allocation.size(),
+                    get_id,
+                    "requesting target",
+                )
+                .await
+                {
+                    Ok(allocation) => allocation,
+                    Err(err) => {
                         return failed_resp_err(
                             err,
                             Some((tombs, one_kv_nodes_routes.put_id)),
@@ -242,49 +405,16 @@ pub async fn handle_get_start(
                             &req.serialize_part.key,
                         );
                     }
-
-                    let target_allocator =
-                        req_node_allocators.choose(&mut rand::thread_rng()).unwrap();
-
-                    let mut allocated_addr: Option<Allocation> = None;
-                    for attempt in 1..=3 {
-                        if let Ok(allocation) = target_allocator.allocate(src_allocation.size()) {
-                            allocated_addr = Some(allocation);
-                            break;
-                        } else {
-                            tracing::info!(
-                                "Requesting node as target allocation attempt {}/3 failed for get_id {}",
-                                attempt,
-                                get_id
-                            );
-                        }
-                    }
-                    if allocated_addr.is_none() {
-                        tracing::info!("No space left for target(Requesting node) allocation");
-                        let total = target_allocator.total_size_bytes();
-                        let used = target_allocator.used_size_bytes();
-                        let free = total.saturating_sub(used);
-                        let err = msg_and_error::KvError::Api(msg_and_error::ApiError::NoSpace {
-                            node: req_node_id.as_ref().to_string(),
-                            segment: target_allocator.seg_device_id.clone(),
-                            total_capacity: total,
-                            free_capacity: free,
-                        });
-                        return failed_resp_err(
-                            err,
-                            Some((tombs, one_kv_nodes_routes.put_id)),
-                            &view,
-                            &req.serialize_part.key,
-                        );
-                    }
-                    allocated_addr.unwrap()
                 };
-                if one_kv_nodes_routes.try_reserve_get_durable_slot() {
-                    allocation_mode = GetAllocationMode::DurableReplica;
-                } else {
-                    allocation_mode = GetAllocationMode::Temporary;
-                }
-                Some(Arc::new(target_allocation))
+                let (mode, reservation) = reserve_durable_get_target(
+                    &view,
+                    &one_kv_nodes_routes,
+                    &req_node_id,
+                    &mut target_allocation,
+                );
+                allocation_mode = mode;
+                target_capacity_reservation = reservation;
+                Some(target_allocation)
             };
         }
 
@@ -334,10 +464,12 @@ pub async fn handle_get_start(
             req_node_id,
             len: src_allocation.size(),
             allocation: target_allocation, // 存储target allocation
-            source_allocation: None,
+            // Keep the source alive if Moka evicts its route during the transfer.
+            source_allocation: Some(src_allocation),
             route: one_kv_nodes_routes.clone(),
             allocation_mode,
             source_kind: GetSourceKind::Memory,
+            cache_capacity_reservation: target_capacity_reservation,
         };
 
         view.master_kv_router()
@@ -352,7 +484,7 @@ pub async fn handle_get_start(
         // unnecessary cache work.
         if one_kv_nodes_routes.lease_id.is_none() {
             update_moka_for_node(
-                view.clone(),
+                &view,
                 src_node_id.to_string(),
                 req.serialize_part.key.clone(),
                 0,
@@ -375,17 +507,23 @@ pub async fn handle_get_start(
         );
     }
 
-    let ssd_replicas = one_kv_nodes_routes.ssd_replicas.read().clone();
-    let mut ssd_replica_keys = ssd_replicas.keys().collect::<Vec<_>>();
+    let mut ssd_replica_keys = replicas
+        .iter()
+        .filter_map(|(node_id, replicas)| replicas.ssd.is_some().then_some(node_id))
+        .collect::<Vec<_>>();
     while !ssd_replica_keys.is_empty() {
         let to_remove_idx = rand::thread_rng().gen_range(0..ssd_replica_keys.len());
         let selected_ssd_key = ssd_replica_keys.remove(to_remove_idx);
-        let ssd_replica = ssd_replicas
-            .get(&*selected_ssd_key)
-            .expect("selected SSD replica key must exist");
-        if ssd_replica.tomb_tag.is_tomb() {
+        let selected_node_replicas = replicas
+            .get(selected_ssd_key)
+            .expect("selected SSD replica node must exist");
+        if selected_node_replicas.tomb_tag.is_tomb() {
             tombs.insert(selected_ssd_key.to_owned());
         } else {
+            let ssd_replica = selected_node_replicas
+                .ssd
+                .as_ref()
+                .expect("selected SSD replica must exist");
             let ssd_stage_len = match align_ssd_io_len(ssd_replica.len) {
                 Ok(len) => len,
                 Err(err) => {
@@ -397,85 +535,16 @@ pub async fn handle_get_start(
                     );
                 }
             };
-            let source_alloc_len = match ssd_stage_len.checked_add(SSD_ALIGNMENT as u64 - 1) {
-                Some(len) => len,
-                None => {
-                    let err =
-                        msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
-                            detail: format!(
-                                "ssd source staging allocation length overflow: {ssd_stage_len}"
-                            ),
-                        });
-                    return failed_resp_err(
-                        err,
-                        Some((tombs, one_kv_nodes_routes.put_id)),
-                        &view,
-                        &req.serialize_part.key,
-                    );
-                }
-            };
-            let source_allocation = match allocate_get_buffer_on_node(
-                &view,
-                &ssd_replica.node_id,
-                source_alloc_len,
-                get_id,
-                "ssd source staging",
-            ) {
-                Ok(allocation) => allocation,
-                Err(err) => {
-                    tracing::info!(
-                        "Skipping SSD source for get_id {} on node {}: {}",
-                        get_id,
-                        ssd_replica.node_id,
-                        err
-                    );
-                    continue;
-                }
-            };
-            let target_allocation = match allocate_get_buffer_on_node(
+            let mut target_allocation = match allocate_get_buffer_on_node(
                 &view,
                 &req_node_id,
                 ssd_replica.len,
                 get_id,
                 "requesting target",
-            ) {
+            )
+            .await
+            {
                 Ok(allocation) => allocation,
-                Err(err) => {
-                    return failed_resp_err(
-                        err,
-                        Some((tombs, one_kv_nodes_routes.put_id)),
-                        &view,
-                        &req.serialize_part.key,
-                    );
-                }
-            };
-            let allocation_mode = if one_kv_nodes_routes.try_reserve_get_durable_slot() {
-                GetAllocationMode::DurableReplica
-            } else {
-                GetAllocationMode::Temporary
-            };
-            let source_base = source_allocation.base_addr();
-            let source_raw_addr = match source_base.checked_add(source_allocation.addr()) {
-                Some(addr) => addr,
-                None => {
-                    let err =
-                        msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
-                            detail: format!(
-                                "ssd source staging raw address overflow: base={} offset={}",
-                                source_base,
-                                source_allocation.addr()
-                            ),
-                        });
-                    return failed_resp_err(
-                        err,
-                        Some((tombs, one_kv_nodes_routes.put_id)),
-                        &view,
-                        &req.serialize_part.key,
-                    );
-                }
-            };
-            let source_addr = match align_ssd_stage_addr(source_raw_addr) {
-                Ok(addr) => addr,
                 Err(err) => {
                     return failed_resp_err(
                         err,
@@ -486,33 +555,167 @@ pub async fn handle_get_start(
                 }
             };
             let target_base = target_allocation.base_addr();
-            let target_addr = target_base + target_allocation.addr();
+            let target_addr = match target_base.checked_add(target_allocation.addr()) {
+                Some(addr) => addr,
+                None => {
+                    let err =
+                        msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                            detail: format!(
+                                "requesting target address overflow: base={} offset={}",
+                                target_base,
+                                target_allocation.addr()
+                            ),
+                        });
+                    return failed_resp_err(
+                        err,
+                        Some((tombs, one_kv_nodes_routes.put_id)),
+                        &view,
+                        &req.serialize_part.key,
+                    );
+                }
+            };
+
+            let local_direct_read = selected_ssd_key == &req_node_id;
+            let (source_allocation, source_base, source_addr, response_ssd_stage_len) =
+                if local_direct_read {
+                    let target_capacity = target_allocation.capcity();
+                    if target_capacity < ssd_stage_len {
+                        let err = msg_and_error::KvError::Api(
+                            msg_and_error::ApiError::InvalidArgument {
+                                detail: format!(
+                                    "local SSD direct target capacity too small: len={} aligned_len={} capacity={}",
+                                    ssd_replica.len, ssd_stage_len, target_capacity
+                                ),
+                            },
+                        );
+                        return failed_resp_err(
+                            err,
+                            Some((tombs, one_kv_nodes_routes.put_id)),
+                            &view,
+                            &req.serialize_part.key,
+                        );
+                    }
+                    tracing::debug!(
+                        "Using local SSD direct read for get_id {} on node {}: target={:#x} len={} capacity={}",
+                        get_id,
+                        selected_ssd_key,
+                        target_addr,
+                        ssd_replica.len,
+                        target_capacity
+                    );
+                    (None, target_base, target_addr, target_capacity)
+                } else {
+                    let source_alloc_len = match ssd_stage_len.checked_add(SSD_ALIGNMENT as u64 - 1)
+                    {
+                        Some(len) => len,
+                        None => {
+                            let err = msg_and_error::KvError::Api(
+                                msg_and_error::ApiError::InvalidArgument {
+                                    detail: format!(
+                                        "ssd source staging allocation length overflow: {ssd_stage_len}"
+                                    ),
+                                },
+                            );
+                            return failed_resp_err(
+                                err,
+                                Some((tombs, one_kv_nodes_routes.put_id)),
+                                &view,
+                                &req.serialize_part.key,
+                            );
+                        }
+                    };
+                    let source_allocation = match allocate_get_buffer_on_node(
+                        &view,
+                        selected_ssd_key,
+                        source_alloc_len,
+                        get_id,
+                        "ssd source staging",
+                    )
+                    .await
+                    {
+                        Ok(allocation) => allocation,
+                        Err(err) => {
+                            tracing::info!(
+                                "Skipping SSD source for get_id {} on node {}: {}",
+                                get_id,
+                                selected_ssd_key,
+                                err
+                            );
+                            continue;
+                        }
+                    };
+                    let source_base = source_allocation.base_addr();
+                    let source_raw_addr = match source_base.checked_add(source_allocation.addr()) {
+                        Some(addr) => addr,
+                        None => {
+                            let err = msg_and_error::KvError::Api(
+                                msg_and_error::ApiError::InvalidArgument {
+                                    detail: format!(
+                                        "ssd source staging raw address overflow: base={} offset={}",
+                                        source_base,
+                                        source_allocation.addr()
+                                    ),
+                                },
+                            );
+                            return failed_resp_err(
+                                err,
+                                Some((tombs, one_kv_nodes_routes.put_id)),
+                                &view,
+                                &req.serialize_part.key,
+                            );
+                        }
+                    };
+                    let source_addr = match align_ssd_stage_addr(source_raw_addr) {
+                        Ok(addr) => addr,
+                        Err(err) => {
+                            return failed_resp_err(
+                                err,
+                                Some((tombs, one_kv_nodes_routes.put_id)),
+                                &view,
+                                &req.serialize_part.key,
+                            );
+                        }
+                    };
+                    (
+                        Some(source_allocation),
+                        source_base,
+                        source_addr,
+                        ssd_stage_len,
+                    )
+                };
+            let (allocation_mode, cache_capacity_reservation) = reserve_durable_get_target(
+                &view,
+                &one_kv_nodes_routes,
+                &req_node_id,
+                &mut target_allocation,
+            );
             let resp = GetStartResp {
                 put_id: one_kv_nodes_routes.put_id,
                 get_id,
-                node_id: ssd_replica.node_id.clone().into(),
+                node_id: selected_ssd_key.to_owned().into(),
                 source_kind: GetSourceKind::Ssd,
                 src_addr: source_addr,
                 target_addr,
                 src_base_addr: source_base,
                 target_base_addr: target_base,
                 len: ssd_replica.len,
-                ssd_stage_len,
+                ssd_stage_len: response_ssd_stage_len,
                 error_code: msg_and_error::OK,
                 error_json: String::new(),
                 server_process_us: 0,
             };
             let info = InflightGetInfo {
                 put_id: one_kv_nodes_routes.put_id,
-                src_node_id: ssd_replica.node_id.clone(),
+                src_node_id: selected_ssd_key.to_owned(),
                 key: req.serialize_part.key.clone(),
                 req_node_id,
                 len: ssd_replica.len,
                 allocation: target_allocation,
-                source_allocation: Some(source_allocation),
+                source_allocation,
                 route: one_kv_nodes_routes.clone(),
                 allocation_mode,
                 source_kind: GetSourceKind::Ssd,
+                cache_capacity_reservation,
             };
 
             view.master_kv_router()
@@ -561,17 +764,13 @@ fn drop_failed_ssd_source(view: &MasterKvRouterView, inflight_info: &InflightGet
         return;
     }
 
-    let route = inflight_info.route.clone();
-    if route.put_id != inflight_info.put_id {
-        return;
-    }
-
-    let removed = route
-        .ssd_replicas
-        .write()
-        .remove(&inflight_info.src_node_id)
-        .is_some();
-    if !removed {
+    let removal = remove_one_ssd_replica_for_node(
+        view,
+        &inflight_info.key,
+        &inflight_info.src_node_id,
+        inflight_info.put_id,
+    );
+    if !removal.replica_removed {
         return;
     }
 
@@ -583,26 +782,15 @@ fn drop_failed_ssd_source(view: &MasterKvRouterView, inflight_info: &InflightGet
         inflight_info.put_id.1
     );
 
-    if route.has_live_replica() {
-        return;
-    }
-
-    let route_for_compare = route.clone();
-    let removed_route = view
-        .master_kv_router()
-        .inner()
-        .kv_routes
-        .remove_if(&inflight_info.key, |_, current| {
-            Arc::ptr_eq(current, &route_for_compare) && current.put_id == inflight_info.put_id
-        })
-        .is_some();
-    if removed_route && view.master_kv_router().prefix_index_enabled() {
+    if removal.route_removed && view.master_kv_router().prefix_index_enabled() {
         let view_task = view.clone();
         let key_for_prefix = inflight_info.key.clone();
         let _ = view.spawn("ssd_failure_remove_prefix_index", async move {
             let inner = view_task.master_kv_router().inner();
             let mut tree = inner.prefix_index.write().await;
-            tree.remove(&key_for_prefix);
+            if !inner.kv_routes.contains_key(&key_for_prefix) {
+                tree.remove(&key_for_prefix);
+            }
         });
     }
 }
@@ -649,13 +837,14 @@ pub async fn handle_get_done(
 
     let get_id = req.serialize_part.get_id;
     // Remove from inflight_gets and transfer to get_holding
-    if let Some(inflight_info) = view
+    if let Some(mut inflight_info) = view
         .master_kv_router()
         .inner()
         .inflight_gets
         .remove(&get_id)
         .await
     {
+        let mut cache_capacity_reservation = inflight_info.cache_capacity_reservation.take();
         let mut allocation_mode = inflight_info.allocation_mode;
         let route = inflight_info.route.clone();
         // clone req_node_id to avoid borrow/move conflict when inserting into kv_routes
@@ -687,20 +876,22 @@ pub async fn handle_get_done(
 
         if allocation_mode == GetAllocationMode::DurableReplica {
             let mut promote_committed = false;
-            if let Some(one_kv_nodes_routes) = view.master_kv_router().inner().kv_routes.get(&key) {
+            let current_route = view
+                .master_kv_router()
+                .inner()
+                .kv_routes
+                .get(&key)
+                .map(|route| route.value().clone());
+            if let Some(one_kv_nodes_routes) = current_route {
                 if one_kv_nodes_routes.put_id == inflight_info.put_id {
-                    let mut nodes_replicas = one_kv_nodes_routes.nodes_replicas.write();
                     if let Some(tomb_tag) =
                         view.master_seg_manager().get_node_tomb_tag(&req_node_id)
                     {
                         if !tomb_tag.is_tomb() {
-                            nodes_replicas.insert(
+                            one_kv_nodes_routes.insert_memory_replica(
                                 inflight_info.req_node_id.clone(),
-                                KvRouteInfo {
-                                    node_id: inflight_info.req_node_id,
-                                    allocation: inflight_info.allocation,
-                                    tomb_tag,
-                                },
+                                inflight_info.allocation,
+                                tomb_tag,
                             );
                             promote_committed = true;
                             // Read lease binding from route snapshot: for this put_id,
@@ -720,8 +911,11 @@ pub async fn handle_get_done(
                                 } else {
                                     alloc_cap as u32
                                 };
+                                // Move the target from the in-flight reservation into
+                                // Moka in the same handler turn.
+                                drop(cache_capacity_reservation.take());
                                 update_moka_for_node(
-                                    view.clone(),
+                                    &view,
                                     req_node_id.to_string(),
                                     key.clone(),
                                     req_weight,
@@ -900,34 +1094,36 @@ pub async fn handle_get_meta(
         .get(&req.serialize_part.key)
     {
         // lock and clone, release the lock quickly
-        let nodes_replicas: HashMap<NodeID, KvRouteInfo> =
-            (*one_kv_nodes_routes.nodes_replicas.read()).clone();
+        let node_replicas = one_kv_nodes_routes.node_replicas.read().clone();
 
-        // Key exists, get metadata from the first replica
-        for (_, kv_info) in nodes_replicas.iter() {
-            if kv_info.tomb_tag.is_tomb() {
+        for replicas in node_replicas.values() {
+            if replicas.tomb_tag.is_tomb() {
                 continue;
             }
-            let len = kv_info.allocation.size();
+            let Some(allocation) = replicas.memory.as_ref() else {
+                continue;
+            };
             return MsgPack {
                 serialize_part: GetMetaResp {
                     exists: true,
-                    len,
+                    len: allocation.size(),
                     error_code: msg_and_error::OK,
                     error_json: String::new(),
                 },
                 raw_bytes: Vec::new(),
             };
         }
-        let ssd_replicas = (*one_kv_nodes_routes.ssd_replicas.read()).clone();
-        for (_, kv_info) in ssd_replicas.iter() {
-            if kv_info.tomb_tag.is_tomb() {
+        for replicas in node_replicas.values() {
+            if replicas.tomb_tag.is_tomb() {
                 continue;
             }
+            let Some(ssd) = replicas.ssd.as_ref() else {
+                continue;
+            };
             return MsgPack {
                 serialize_part: GetMetaResp {
                     exists: true,
-                    len: kv_info.len,
+                    len: ssd.len,
                     error_code: msg_and_error::OK,
                     error_json: String::new(),
                 },
@@ -984,5 +1180,104 @@ pub async fn handle_get_meta(
                 raw_bytes: Vec::new(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master_seg_manager::msg_pack::SegmentDeviceDescription;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[::tokio::test]
+    async fn allocation_waits_for_delayed_release() {
+        let allocator = Arc::new(
+            OneSegAllocator::new(
+                "get-wait-test".to_string(),
+                SegmentDeviceDescription::Cpu,
+                0,
+                4096,
+            )
+            .expect("test allocator must be created"),
+        );
+        let held = allocator
+            .allocate(4096)
+            .expect("test allocator must initially have capacity");
+        let reclamation_attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_wait = Arc::clone(&reclamation_attempts);
+        let allocators = [Arc::clone(&allocator)];
+
+        let wait_for_allocation = allocate_with_bounded_wait(
+            &allocators,
+            4096,
+            Duration::from_millis(500),
+            Duration::from_millis(1),
+            move || {
+                attempts_for_wait.fetch_add(1, Ordering::Relaxed);
+                async {}
+            },
+        );
+        let release_capacity = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        };
+
+        let (result, ()) = tokio::join!(wait_for_allocation, release_capacity);
+        assert!(result.allocation.is_some());
+        assert!(result.attempts > 1);
+        assert!(reclamation_attempts.load(Ordering::Relaxed) > 0);
+    }
+
+    #[::tokio::test]
+    async fn allocation_wait_drains_removed_moka_value() {
+        let allocator = Arc::new(
+            OneSegAllocator::new(
+                "get-moka-drain-test".to_string(),
+                SegmentDeviceDescription::Cpu,
+                0,
+                4096,
+            )
+            .expect("test allocator must be created"),
+        );
+        let allocation = Arc::new(
+            allocator
+                .allocate(4096)
+                .expect("test allocator must initially have capacity"),
+        );
+        let allocation_weak = Arc::downgrade(&allocation);
+        let cache = moka::future::Cache::builder()
+            .eviction_listener(|_key: Arc<u64>, _value: Arc<Allocation>, _cause| {})
+            .build();
+        cache.insert(1, allocation).await;
+        cache.run_pending_tasks().await;
+
+        let removed = cache
+            .remove(&1)
+            .await
+            .expect("the test allocation must still be present");
+        drop(removed);
+        assert!(
+            allocation_weak.upgrade().is_some(),
+            "Moka's pending remove should still retain the allocation before maintenance"
+        );
+
+        let allocators = [Arc::clone(&allocator)];
+        let result = allocate_with_bounded_wait(
+            &allocators,
+            4096,
+            Duration::from_millis(500),
+            Duration::from_millis(1),
+            || {
+                let cache = cache.clone();
+                async move {
+                    cache.run_pending_tasks().await;
+                }
+            },
+        )
+        .await;
+
+        assert!(result.allocation.is_some());
+        assert!(result.attempts > 1);
+        assert!(allocation_weak.upgrade().is_none());
     }
 }
