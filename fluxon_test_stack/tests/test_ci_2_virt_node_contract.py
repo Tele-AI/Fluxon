@@ -135,7 +135,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             large_job,
         )
         self.assertIn("--owner-count 2", large_job)
-        self.assertIn("--producer-count 160", large_job)
+        self.assertIn("--producer-count 80", large_job)
         self.assertIn("--consumer-count 8", large_job)
         self.assertIn("--metric-warmup-seconds 60", large_job)
         self.assertIn("Install packaged Fluxon wheel", large_job)

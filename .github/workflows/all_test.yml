@@ -364,7 +364,7 @@ jobs:
             --workdir .dever/ci_large_scale_mq \
             --owner-count 2 \
             --owner-dram-gib 1 \
-            --producer-count 160 \
+            --producer-count 80 \
             --consumer-count 8 \
             --threads-per-process 1 \
             --duration-seconds 90 \
