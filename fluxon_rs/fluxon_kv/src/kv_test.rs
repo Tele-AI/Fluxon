@@ -1902,6 +1902,11 @@ async fn run_non_rdma_storage_profile_coverage(
         &format!("{}:ssd", round.round_name),
         64 * 1024 + 123,
     );
+    let local_small_ssd_key = format!("storage_profile_local_small_ssd_key_{}", round.round_name);
+    let local_small_ssd_value = build_storage_profile_probe_value_with_len(
+        &format!("{}:local_small_ssd", round.round_name),
+        123,
+    );
     let stale_ssd_key = format!("storage_profile_stale_ssd_key_{}", round.round_name);
     let stale_ssd_value = build_storage_profile_probe_value_with_len(
         &format!("{}:stale_ssd", round.round_name),
@@ -1919,6 +1924,22 @@ async fn run_non_rdma_storage_profile_coverage(
                 )
             });
         force_evict_memory_replicas_for_storage_probe(master_framework, &ssd_key).await;
+
+        writer_api
+            .inner()
+            .put(
+                &local_small_ssd_key,
+                &local_small_ssd_value,
+                storage_probe_put_opts(),
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "storage profile local small SSD probe put failed: key={} err={}",
+                    local_small_ssd_key, err
+                )
+            });
+        force_evict_memory_replicas_for_storage_probe(master_framework, &local_small_ssd_key).await;
 
         writer_api
             .inner()
@@ -1951,6 +1972,13 @@ async fn run_non_rdma_storage_profile_coverage(
         .await;
     }
     if round.storage_profile.requires_ssd_source() {
+        assert_owner_get_source_kind(
+            writer_framework,
+            &local_small_ssd_key,
+            &local_small_ssd_value,
+            GetSourceKind::Ssd,
+        )
+        .await;
         assert_owner_get_source_kind(&reader_framework, &ssd_key, &ssd_value, GetSourceKind::Ssd)
             .await;
         assert_stale_ssd_route_retries_to_miss(master_framework, &reader_framework, &stale_ssd_key)

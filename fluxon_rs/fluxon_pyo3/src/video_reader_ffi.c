@@ -7,6 +7,7 @@
 #include <libavformat/avformat.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mem.h>
 #include <libswscale/swscale.h>
 
 typedef int (*FluxonVideoReadAtFn)(
@@ -436,6 +437,7 @@ cleanup:
         avformat_close_input(&fmt_ctx);
     }
     if (avio_ctx != NULL) {
+        av_freep(&avio_ctx->buffer);
         avio_context_free(&avio_ctx);
     }
     if (avio_buffer != NULL) {

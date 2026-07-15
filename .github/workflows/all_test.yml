@@ -97,8 +97,15 @@ jobs:
                   "scale": "n1_kvowner_dram_20gib",
                   "case_config": True,
                   "scene_config": {
-                      "kv_test_rounds": "p2p_only",
+                      "kv_test_rounds": "p2p_only,p2p_only_ssd",
                   },
+              },
+              "ci_top_attention_cargo_kv_unit": {
+                  "subject": "rust",
+                  "runtime_contract": "rust_self_managed",
+                  "scale": "n1_kvowner_dram_20gib",
+                  "case_config": True,
+                  "scene_config": {},
               },
               "ci_top_attention_log_mgmt": {
                   "subject": "rust",
@@ -181,7 +188,8 @@ jobs:
 
           # Scene selection:
           # - ci_top_attention_doc_page_build validates doc build through the prebuilt Docker image.
-          # - ci_top_attention_bin_kvtest keeps the Rust kv_test entry under the testbed scene contract.
+          # - ci_top_attention_bin_kvtest covers the memory and native SSD P2P rounds.
+          # - ci_top_attention_cargo_kv_unit runs the Rust KV crate unit tests.
           # - ci_top_attention_log_mgmt keeps log rolling/sharding coverage under the same CI testbed contract.
           # - ci_top_attention_ctrl_c_kv keeps runtime child-retirement Ctrl-C coverage in this workflow.
           # - ci_top_attention_ctrl_c_mq keeps MQ Ctrl-C exit coverage in this workflow.
@@ -214,6 +222,7 @@ jobs:
           # - Keep the original per-scene scales from ci_test_list.yaml.
           # - ci_top_attention_doc_page_build stays on n1_kvowner_dram_3gib.
           # - ci_top_attention_bin_kvtest stays on n1_kvowner_dram_20gib.
+          # - ci_top_attention_cargo_kv_unit stays on n1_kvowner_dram_20gib.
           # - ci_top_attention_log_mgmt stays on n1_kvowner_dram_20gib.
           # - ci_top_attention_ctrl_c_kv stays on n1_kvowner_dram_3gib.
           # - ci_top_attention_ctrl_c_mq stays on n1_kvowner_dram_20gib.

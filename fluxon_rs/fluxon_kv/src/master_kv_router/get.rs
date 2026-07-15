@@ -575,28 +575,12 @@ pub async fn handle_get_start(
                 }
             };
 
-            let local_direct_read = selected_ssd_key == &req_node_id;
+            let local_ssd_read = selected_ssd_key == &req_node_id;
             let (source_allocation, source_base, source_addr, response_ssd_stage_len) =
-                if local_direct_read {
+                if local_ssd_read {
                     let target_capacity = target_allocation.capcity();
-                    if target_capacity < ssd_stage_len {
-                        let err = msg_and_error::KvError::Api(
-                            msg_and_error::ApiError::InvalidArgument {
-                                detail: format!(
-                                    "local SSD direct target capacity too small: len={} aligned_len={} capacity={}",
-                                    ssd_replica.len, ssd_stage_len, target_capacity
-                                ),
-                            },
-                        );
-                        return failed_resp_err(
-                            err,
-                            Some((tombs, one_kv_nodes_routes.put_id)),
-                            &view,
-                            &req.serialize_part.key,
-                        );
-                    }
                     tracing::debug!(
-                        "Using local SSD direct read for get_id {} on node {}: target={:#x} len={} capacity={}",
+                        "Using local SSD read for get_id {} on node {}: target={:#x} len={} capacity={}",
                         get_id,
                         selected_ssd_key,
                         target_addr,

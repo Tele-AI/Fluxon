@@ -44,6 +44,8 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertIn("fluxon_test_stack/ci_2_virt_node.py", workflow_text)
         self.assertIn("Write ci_2_virt_node suite", workflow_text)
         self.assertIn("ci_top_attention_bin_kvtest", workflow_text)
+        self.assertIn("ci_top_attention_cargo_kv_unit", workflow_text)
+        self.assertIn('"kv_test_rounds": "p2p_only,p2p_only_ssd"', workflow_text)
         self.assertIn("ci_top_attention_doc_page_build", workflow_text)
         self.assertIn("ci_top_attention_mq_core", workflow_text)
         self.assertIn("doc_site_base_url", workflow_text)

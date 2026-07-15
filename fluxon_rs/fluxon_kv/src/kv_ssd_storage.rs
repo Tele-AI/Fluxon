@@ -66,6 +66,7 @@ struct SsdDeviceWorker {
     device_id: u64,
     root_dir: PathBuf,
     shard_ids: Vec<usize>,
+    max_shard_capacity: u64,
     _files: Vec<std::fs::File>,
     _io: Arc<UringIoEngine>,
     write_tx: tokio_mpsc::Sender<WriteCommand>,
@@ -626,6 +627,20 @@ impl KvSsdStorage {
                 .iter()
                 .map(|(shard_id, _)| *shard_id)
                 .collect::<Vec<_>>();
+            let max_shard_capacity = shard_ids
+                .iter()
+                .filter_map(|shard_id| shard_specs.get(*shard_id))
+                .map(|spec| spec.capacity)
+                .max()
+                .ok_or_else(|| {
+                    KvError::Api(ApiError::InvalidArgument {
+                        detail: format!(
+                            "kv ssd device has no shards: device_id={} root_dir={}",
+                            device_root.device_id,
+                            device_root.root_dir.display()
+                        ),
+                    })
+                })?;
             let fds = shard_files
                 .iter()
                 .map(|(shard_id, file)| (*shard_id, file.as_raw_fd()))
@@ -661,6 +676,7 @@ impl KvSsdStorage {
                 device_id: device_root.device_id,
                 root_dir: device_root.root_dir,
                 shard_ids,
+                max_shard_capacity,
                 _files: shard_files
                     .into_iter()
                     .map(|(_, file)| file)
@@ -731,14 +747,37 @@ impl KvSsdStorage {
         self.eviction_rx.lock().take()
     }
 
-    fn next_write_tx(&self) -> KvResult<tokio_mpsc::Sender<WriteCommand>> {
+    fn next_write_tx(&self, entry_len: u64) -> KvResult<tokio_mpsc::Sender<WriteCommand>> {
         if self.devices.is_empty() {
             return Err(KvError::Api(ApiError::InvalidArgument {
                 detail: "kv ssd storage has no active device".to_string(),
             }));
         }
-        let idx = self.next_write_device.fetch_add(1, Ordering::Relaxed) % self.devices.len();
-        Ok(self.devices[idx].write_tx.clone())
+        let aligned_len = align_ssd_io_len(entry_len)?;
+        let capacities = self
+            .devices
+            .iter()
+            .map(|device| device.max_shard_capacity)
+            .collect::<Vec<_>>();
+        loop {
+            let start_idx = self.next_write_device.load(Ordering::Relaxed);
+            let Some(device_idx) = select_write_device(&capacities, aligned_len, start_idx) else {
+                return Err(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "kv ssd value len={} aligned_len={} exceeds every device shard capacity: {:?}",
+                        entry_len, aligned_len, capacities
+                    ),
+                }));
+            };
+            let next_idx = (device_idx + 1) % self.devices.len();
+            if self
+                .next_write_device
+                .compare_exchange_weak(start_idx, next_idx, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(self.devices[device_idx].write_tx.clone());
+            }
+        }
     }
 
     fn read_tx_for_shard(&self, shard_id: usize) -> KvResult<tokio_mpsc::Sender<ReadCommand>> {
@@ -823,7 +862,7 @@ impl KvSsdStorage {
         data: AlignedBuffer,
     ) -> KvResult<KvSsdPersistGuard> {
         let (done_tx, done_rx) = oneshot::channel();
-        let write_tx = self.next_write_tx()?;
+        let write_tx = self.next_write_tx(entry_len)?;
         write_tx
             .send(WriteCommand {
                 key: KvSsdKey {
@@ -1531,9 +1570,26 @@ unsafe impl Send for IoCtx {}
 struct UringShard {
     read_rx: crossbeam::channel::Receiver<IoCtx>,
     write_rx: crossbeam::channel::Receiver<IoCtx>,
-    uring: IoUring,
+    uring: Option<IoUring>,
     io_depth: usize,
     read_weight: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitWaitAction {
+    Retry,
+    DrainCompletions,
+    FailWorker,
+}
+
+fn submit_wait_error_action(err: &io::Error) -> SubmitWaitAction {
+    if err.kind() == io::ErrorKind::Interrupted {
+        SubmitWaitAction::Retry
+    } else if err.raw_os_error() == Some(libc::EBUSY) {
+        SubmitWaitAction::DrainCompletions
+    } else {
+        SubmitWaitAction::FailWorker
+    }
 }
 
 impl UringShard {
@@ -1542,6 +1598,8 @@ impl UringShard {
         let mut write_inflight = 0usize;
         let mut read_closed = false;
         let mut write_closed = false;
+        let mut submitted = HashMap::new();
+        let mut next_token = 1u64;
 
         loop {
             let mut inflight = read_inflight + write_inflight;
@@ -1555,53 +1613,98 @@ impl UringShard {
                 let Some(ctx) = next else {
                     break;
                 };
-                self.submit_ctx(ctx, &mut read_inflight, &mut write_inflight);
+                self.submit_ctx(
+                    ctx,
+                    &mut submitted,
+                    &mut next_token,
+                    &mut read_inflight,
+                    &mut write_inflight,
+                );
                 inflight = read_inflight + write_inflight;
             }
 
             if read_closed && write_closed && inflight == 0 {
+                debug_assert!(submitted.is_empty());
                 return;
             }
             if inflight == 0 {
                 let Some(ctx) = self.recv_blocking(&mut read_closed, &mut write_closed) else {
                     continue;
                 };
-                self.submit_ctx(ctx, &mut read_inflight, &mut write_inflight);
+                self.submit_ctx(
+                    ctx,
+                    &mut submitted,
+                    &mut next_token,
+                    &mut read_inflight,
+                    &mut write_inflight,
+                );
                 continue;
             }
-            if let Err(err) = self.uring.submit_and_wait(1) {
-                while let Some(cqe) = self.uring.completion().next() {
-                    let data = cqe.user_data();
-                    if data != 0 {
-                        let ctx = unsafe { Box::from_raw(data as *mut IoCtx) };
-                        let _ = ctx.complete.send(Err(io::Error::other(format!(
-                            "io_uring submit failed: {err}"
-                        ))));
+            let submit_result = self
+                .uring
+                .as_mut()
+                .expect("io_uring must exist while its worker is running")
+                .submit_and_wait(1);
+            if let Err(err) = submit_result {
+                match submit_wait_error_action(&err) {
+                    SubmitWaitAction::Retry | SubmitWaitAction::DrainCompletions => {
+                        self.drain_completions(
+                            &mut submitted,
+                            &mut read_inflight,
+                            &mut write_inflight,
+                        );
+                        continue;
+                    }
+                    SubmitWaitAction::FailWorker => {
+                        let error_kind = err.kind();
+                        let detail = format!("io_uring submit failed: {err}");
+                        drop(self.uring.take());
+                        for (_, ctx) in submitted.drain() {
+                            let _ = ctx
+                                .complete
+                                .send(Err(io::Error::new(error_kind, detail.clone())));
+                        }
+                        return;
                     }
                 }
-                return;
             }
 
-            for cqe in self.uring.completion() {
-                let data = cqe.user_data();
-                if data == 0 {
-                    continue;
-                }
-                let ctx = unsafe { Box::from_raw(data as *mut IoCtx) };
-                match ctx.io_type {
-                    IoType::Read => read_inflight = read_inflight.saturating_sub(1),
-                    IoType::Write => write_inflight = write_inflight.saturating_sub(1),
-                    IoType::Readv => read_inflight = read_inflight.saturating_sub(1),
-                    IoType::Writev => write_inflight = write_inflight.saturating_sub(1),
-                }
-                let res = cqe.result();
-                let send_res = if res < 0 {
-                    Err(io::Error::from_raw_os_error(-res))
-                } else {
-                    Ok(res as usize)
-                };
-                let _ = ctx.complete.send(send_res);
+            self.drain_completions(&mut submitted, &mut read_inflight, &mut write_inflight);
+        }
+    }
+
+    fn drain_completions(
+        &mut self,
+        submitted: &mut HashMap<u64, IoCtx>,
+        read_inflight: &mut usize,
+        write_inflight: &mut usize,
+    ) {
+        let uring = self
+            .uring
+            .as_mut()
+            .expect("io_uring must exist while draining completions");
+        for cqe in uring.completion() {
+            let token = cqe.user_data();
+            if token == 0 {
+                continue;
             }
+            let Some(ctx) = submitted.remove(&token) else {
+                tracing::warn!("Ignoring io_uring completion with unknown token {token}");
+                continue;
+            };
+            match ctx.io_type {
+                IoType::Read | IoType::Readv => *read_inflight = read_inflight.saturating_sub(1),
+                IoType::Write | IoType::Writev => {
+                    *write_inflight = write_inflight.saturating_sub(1)
+                }
+            }
+            let result = cqe.result();
+            let send_result = if result < 0 {
+                Err(io::Error::from_raw_os_error(-result))
+            } else {
+                Ok(result as usize)
+            };
+            let _ = ctx.complete.send(send_result);
         }
     }
 
@@ -1678,7 +1781,14 @@ impl UringShard {
         }
     }
 
-    fn submit_ctx(&mut self, ctx: IoCtx, read_inflight: &mut usize, write_inflight: &mut usize) {
+    fn submit_ctx(
+        &mut self,
+        ctx: IoCtx,
+        submitted: &mut HashMap<u64, IoCtx>,
+        next_token: &mut u64,
+        read_inflight: &mut usize,
+        write_inflight: &mut usize,
+    ) {
         let fd = Fd(ctx.fd);
         let buffer = ctx.buffer;
         let iovecs_ptr = ctx
@@ -1717,21 +1827,42 @@ impl UringShard {
                 .build(),
         };
         let io_type = ctx.io_type;
-        let data = Box::into_raw(Box::new(ctx)) as u64;
-        let sqe = sqe.user_data(data);
-        let push_result = unsafe { self.uring.submission().push(&sqe) };
+        let token = next_submission_token(next_token, submitted);
+        let sqe = sqe.user_data(token);
+        let Some(uring) = self.uring.as_mut() else {
+            let _ = ctx
+                .complete
+                .send(Err(io::Error::other("io_uring worker is closed")));
+            return;
+        };
+        let push_result = unsafe { uring.submission().push(&sqe) };
         if push_result.is_err() {
-            let ctx = unsafe { Box::from_raw(data as *mut IoCtx) };
             let _ = ctx
                 .complete
                 .send(Err(io::Error::other("submission queue full")));
             return;
         }
+        let replaced = submitted.insert(token, ctx);
+        debug_assert!(
+            replaced.is_none(),
+            "io_uring submission token must be unique"
+        );
         match io_type {
-            IoType::Read => *read_inflight += 1,
-            IoType::Write => *write_inflight += 1,
-            IoType::Readv => *read_inflight += 1,
-            IoType::Writev => *write_inflight += 1,
+            IoType::Read | IoType::Readv => *read_inflight += 1,
+            IoType::Write | IoType::Writev => *write_inflight += 1,
+        }
+    }
+}
+
+fn next_submission_token(next_token: &mut u64, submitted: &HashMap<u64, IoCtx>) -> u64 {
+    loop {
+        if *next_token == 0 {
+            *next_token = 1;
+        }
+        let token = *next_token;
+        *next_token = token.wrapping_add(1);
+        if !submitted.contains_key(&token) {
+            return token;
         }
     }
 }
@@ -1773,7 +1904,7 @@ impl UringIoEngine {
                     UringShard {
                         read_rx,
                         write_rx,
-                        uring,
+                        uring: Some(uring),
                         io_depth: cfg.io_depth,
                         read_weight: DEFAULT_URING_READ_WEIGHT,
                     }
@@ -2062,6 +2193,16 @@ fn choose_chunk_read_path(
 fn choose_device_shard_count(limit_bytes: u64) -> usize {
     let max_aligned_shards = (limit_bytes / SSD_ALIGNMENT as u64).max(1) as usize;
     DEFAULT_SHARDS_PER_OWNER.min(max_aligned_shards).max(1)
+}
+
+fn select_write_device(
+    max_shard_capacities: &[u64],
+    aligned_len: u64,
+    start_idx: usize,
+) -> Option<usize> {
+    (0..max_shard_capacities.len())
+        .map(|offset| start_idx.wrapping_add(offset) % max_shard_capacities.len())
+        .find(|device_idx| max_shard_capacities[*device_idx] >= aligned_len)
 }
 
 fn aligned_shard_capacity(capacity_bytes: u64, shard_count: usize) -> KvResult<u64> {
@@ -2448,19 +2589,21 @@ mod tests {
         assert_eq!(capacity_by_device[1], 8 * SSD_ALIGNMENT as u64);
     }
 
+    #[test]
+    fn write_device_selection_skips_devices_with_undersized_shards() {
+        let capacities = [1024, 4096];
+
+        assert_eq!(select_write_device(&capacities, 2048, 0), Some(1));
+        assert_eq!(select_write_device(&capacities, 2048, 1), Some(1));
+        assert_eq!(select_write_device(&capacities, 8192, 0), None);
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ReferenceSqeShape {
         Read,
         Write,
         Readv,
         Writev,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum SubmitWaitAction {
-        Retry,
-        DrainCompletions,
-        FailWorker,
     }
 
     fn fluxon_current_sqe_shape(io_type: IoType, iovec_count: usize) -> ReferenceSqeShape {
@@ -2490,20 +2633,6 @@ mod tests {
             && buf_addr.is_multiple_of(SSD_ALIGNMENT as u64)
             && len.is_multiple_of(SSD_ALIGNMENT as u64)
             && offset.is_multiple_of(SSD_ALIGNMENT as u64)
-    }
-
-    fn fluxon_current_submit_wait_error_action(_err: &io::Error) -> SubmitWaitAction {
-        SubmitWaitAction::FailWorker
-    }
-
-    fn ringline_reference_submit_wait_error_action(err: &io::Error) -> SubmitWaitAction {
-        if err.kind() == io::ErrorKind::Interrupted {
-            SubmitWaitAction::Retry
-        } else if err.raw_os_error() == Some(libc::EBUSY) {
-            SubmitWaitAction::DrainCompletions
-        } else {
-            SubmitWaitAction::FailWorker
-        }
     }
 
     #[::tokio::test]
@@ -2734,29 +2863,21 @@ mod tests {
     }
 
     #[test]
-    fn ringline_reference_classifies_transient_submit_wait_errors() {
+    fn submit_wait_error_action_classifies_transient_errors() {
         let interrupted = io::Error::from(io::ErrorKind::Interrupted);
         let busy = io::Error::from_raw_os_error(libc::EBUSY);
         let invalid = io::Error::from_raw_os_error(libc::EINVAL);
 
         assert_eq!(
-            fluxon_current_submit_wait_error_action(&interrupted),
-            SubmitWaitAction::FailWorker
-        );
-        assert_eq!(
-            ringline_reference_submit_wait_error_action(&interrupted),
+            submit_wait_error_action(&interrupted),
             SubmitWaitAction::Retry
         );
         assert_eq!(
-            fluxon_current_submit_wait_error_action(&busy),
-            SubmitWaitAction::FailWorker
-        );
-        assert_eq!(
-            ringline_reference_submit_wait_error_action(&busy),
+            submit_wait_error_action(&busy),
             SubmitWaitAction::DrainCompletions
         );
         assert_eq!(
-            ringline_reference_submit_wait_error_action(&invalid),
+            submit_wait_error_action(&invalid),
             SubmitWaitAction::FailWorker
         );
     }
