@@ -31,6 +31,37 @@ pub use crate::cluster_manager::{ClusterEvent, ClusterMember};
 pub use fluxon_observability::types::FsMountKind;
 
 pub const OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES: u64 = 4 * 1024;
+
+pub(crate) fn owner_local_reserve_slot_size_bytes(value_len: u64) -> Option<u64> {
+    let normalized = value_len.max(OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES);
+    let alignment_mask = OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES - 1;
+    let slot_size = normalized
+        .checked_add(alignment_mask)
+        .map(|rounded| rounded & !alignment_mask)?;
+    (slot_size <= OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES).then_some(slot_size)
+}
+
+pub(crate) fn owner_local_reserve_slots_per_grant(slot_size: u64) -> Option<u32> {
+    if slot_size == 0 || slot_size > OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES {
+        return None;
+    }
+    u32::try_from(OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES / slot_size).ok()
+}
+
+pub(crate) fn owner_local_reserve_expected_grant_count(
+    value_len: u64,
+    payload_capacity_bytes: u64,
+) -> Option<u64> {
+    if value_len == 0 || payload_capacity_bytes == 0 {
+        return None;
+    }
+    let slot_size = owner_local_reserve_slot_size_bytes(value_len)?;
+    let slots_per_grant = u64::from(owner_local_reserve_slots_per_grant(slot_size)?);
+    let value_count =
+        payload_capacity_bytes / value_len + u64::from(payload_capacity_bytes % value_len != 0);
+    Some(value_count / slots_per_grant + u64::from(value_count % slots_per_grant != 0))
+}
 
 pub type MembershipEventReceiver =
     limit_thirdparty::tokio::sync::abroadcast::Receiver<ClusterEvent>;
@@ -804,6 +835,7 @@ fn build_side_transfer_worker_config(
     test_spec_config.side_transfer_role = Some(SideTransferRole::Worker);
     test_spec_config.transport_mode = None;
     test_spec_config.rdma_device_names = None;
+    test_spec_config.owner_local_reserve_expected_capacity = None;
 
     Ok(ClientConfig {
         cluster_name: owner_config.cluster_name.clone(),
@@ -818,6 +850,7 @@ fn build_side_transfer_worker_config(
             rdma_device_names: None,
         },
         pprof_duration_seconds: owner_config.pprof_duration_seconds,
+        replica_writeback_hot_capacity_ratio: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: Vec::new(),
@@ -868,6 +901,7 @@ fn build_side_transfer_worker_config_yaml(
         protocol: Some(side_config.protocol),
         contribute_to_cluster_pool_size: None,
         pprof_duration_seconds: side_config.pprof_duration_seconds,
+        replica_writeback_hot_capacity_ratio: None,
         fluxonkv_spec: crate::config::FluxonKvSpecYaml {
             etcd_addresses: None,
             cluster_name: side_config.cluster_name,
@@ -1522,6 +1556,8 @@ async fn run_master_impl(
         master_kv_router_arg: MasterKvRouterNewArg {
             test_spec_config: config.test_spec_config.clone(),
             replica_task_placement: config.replica_task_placement.clone(),
+            replica_cache_capacity_ratio: config.replica_cache_capacity_ratio,
+            replica_writeback_tier1_capacity_ratio: config.replica_writeback_tier1_capacity_ratio,
         },
         metric_reporter_arg: MetricReporterNewArg {
             test_spec_config: config.test_spec_config.clone(),
@@ -2069,6 +2105,11 @@ async fn run_client_impl(
             },
             client_kv_api_arg: ClientKvApiNewArg {
                 test_spec_config: config.test_spec_config.clone(),
+                owner_hot_cache_capacity_bytes: config.replica_writeback_hot_capacity_ratio.map(
+                    |ratio| {
+                        (config.contribute_to_cluster_pool_size.dram as f64 * ratio).floor() as u64
+                    },
+                ),
             },
             client_seg_pool_arg: ClientSegPoolNewArg {
                 contribute_size: config.contribute_to_cluster_pool_size.clone(),
@@ -2488,6 +2529,7 @@ mod tests {
                 rdma_device_names: None,
             },
             pprof_duration_seconds: None,
+            replica_writeback_hot_capacity_ratio: None,
             redis_compat_listen_addr: None,
             fluxonkv_spec: FluxonKvSpec {
                 etcd_addresses: vec!["http://127.0.0.1:2379".to_string()],
@@ -2795,6 +2837,7 @@ mod tests {
                 rdma_device_names: None,
             },
             pprof_duration_seconds: None,
+            replica_writeback_hot_capacity_ratio: None,
             redis_compat_listen_addr: None,
             fluxonkv_spec: FluxonKvSpec {
                 etcd_addresses: Vec::new(),

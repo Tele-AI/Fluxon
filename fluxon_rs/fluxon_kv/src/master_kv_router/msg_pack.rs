@@ -5,6 +5,7 @@ use crate::{
 };
 use bitcode::{Decode, Encode};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::put::PutIDForAKey;
 
@@ -264,20 +265,42 @@ impl RPCReq for GetMasterOnlyMetricPartReq {
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct ReserveLocalGrantReq;
+pub struct ReserveLocalGrantReq {
+    /// Slot class that needs capacity. Zero means a raw grant request with no reclaim fallback.
+    pub slot_size: u64,
+    /// Number of slots the owner is currently short of in this class.
+    pub required_free_slots: u32,
+    /// Reclaim committed slots before growing the physical grant pool. This keeps owner-local
+    /// free-slot headroom without changing the owner's advertised capacity.
+    pub reclaim_before_grow: bool,
+}
 impl MsgPackSerializePart for ReserveLocalGrantReq {
     fn msg_id(&self) -> u32 {
         MsgId::ReserveLocalGrantReq as u32
     }
 }
 
+#[allow(unused_assignments)]
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub enum ReserveLocalGrantOutcome {
+    #[default]
+    None,
+    Granted {
+        grant_id: u64,
+        node_id: NodeIDString,
+        addr: u64,
+        base_addr: u64,
+        len: u64,
+    },
+    Reclaimed {
+        slot_size: u64,
+        reclaimed_slots: u32,
+    },
+}
+
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct ReserveLocalGrantResp {
-    pub grant_id: u64,
-    pub node_id: NodeIDString,
-    pub addr: u64,
-    pub base_addr: u64,
-    pub len: u64,
+    pub outcome: ReserveLocalGrantOutcome,
     pub error_code: ErrorCode,
     pub error_json: String,
     pub server_process_us: i64,
@@ -289,6 +312,134 @@ impl MsgPackSerializePart for ReserveLocalGrantResp {
 }
 impl RPCReq for ReserveLocalGrantReq {
     type Resp = ReserveLocalGrantResp;
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum OwnerReclaimPhase {
+    #[default]
+    Prepare,
+    Commit,
+    Abort,
+    Finalize,
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum OwnerReclaimItemState {
+    #[default]
+    Busy,
+    Prepared,
+    Committed,
+    Aborted,
+    Finalized,
+    Stale,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub enum OwnerReclaimBacking {
+    #[default]
+    Allocation,
+    CommittedSlot {
+        grant_id: u64,
+        slot_index: u32,
+        slot_size: u64,
+    },
+    /// A master-owned allocation with no owner-side key index. The master reclaims this
+    /// backing directly after installing its key-activity fence and never sends it to the owner.
+    UnindexedAllocation,
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum OwnerReclaimReason {
+    #[default]
+    Reserve,
+    CapacityEviction,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct OwnerReclaimItem {
+    pub key: String,
+    pub put_id: (u64, u32),
+    pub epoch: u64,
+    pub backing: OwnerReclaimBacking,
+    pub reason: OwnerReclaimReason,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchOwnerReclaimReq {
+    pub phase: OwnerReclaimPhase,
+    pub items: Vec<OwnerReclaimItem>,
+}
+
+impl MsgPackSerializePart for BatchOwnerReclaimReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchOwnerReclaimReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct OwnerReclaimItemResp {
+    pub key: String,
+    pub epoch: u64,
+    pub state: OwnerReclaimItemState,
+    pub detail: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchOwnerReclaimResp {
+    pub items: Vec<OwnerReclaimItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for BatchOwnerReclaimResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchOwnerReclaimResp as u32
+    }
+}
+
+impl RPCReq for BatchOwnerReclaimReq {
+    type Resp = BatchOwnerReclaimResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct EnqueueReplicaTaskItem {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchEnqueueReplicaTaskReq {
+    pub items: Vec<EnqueueReplicaTaskItem>,
+}
+
+impl MsgPackSerializePart for BatchEnqueueReplicaTaskReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchEnqueueReplicaTaskReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct EnqueueReplicaTaskItemResp {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub accepted: bool,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchEnqueueReplicaTaskResp {
+    pub items: Vec<EnqueueReplicaTaskItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for BatchEnqueueReplicaTaskResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchEnqueueReplicaTaskResp as u32
+    }
+}
+
+impl RPCReq for BatchEnqueueReplicaTaskReq {
+    type Resp = BatchEnqueueReplicaTaskResp;
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -461,6 +612,95 @@ pub struct PutDoneCommittedSlot {
     pub len: u64,
 }
 
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct PutAtomicGroupMember {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+}
+
+/// Version-scoped members of one caller-declared atomic put group.
+///
+/// Groups with one member are represented as `None` on the route. Multi-member
+/// groups let eviction require one common remote-cache owner to hold every member.
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct PutAtomicGroup {
+    pub members: Vec<PutAtomicGroupMember>,
+}
+
+pub fn build_put_atomic_group_assignments(
+    keys_and_put_ids: &[(String, PutIDForAKey)],
+    atomic_group_lens: &[usize],
+) -> Result<Vec<Option<PutAtomicGroup>>, String> {
+    build_shared_put_atomic_group_assignments(keys_and_put_ids, atomic_group_lens).map(
+        |assignments| {
+            assignments
+                .into_iter()
+                .map(|group| group.map(|group| group.as_ref().clone()))
+                .collect()
+        },
+    )
+}
+
+/// Builds one shared descriptor per multi-key group and assigns cheap `Arc`
+/// clones to its members. This is the grouped-put representation used by the
+/// V2 route-publish protocol; unlike the legacy wire representation, it is
+/// linear in the number of keys rather than the sum of squared group sizes.
+pub fn build_shared_put_atomic_group_assignments(
+    keys_and_put_ids: &[(String, PutIDForAKey)],
+    atomic_group_lens: &[usize],
+) -> Result<Vec<Option<Arc<PutAtomicGroup>>>, String> {
+    if atomic_group_lens.is_empty() && !keys_and_put_ids.is_empty() {
+        return Err("atomic_group_lens must be non-empty".to_string());
+    }
+    let mut offset = 0usize;
+    let mut assignments = Vec::with_capacity(keys_and_put_ids.len());
+    for (group_index, group_len) in atomic_group_lens.iter().copied().enumerate() {
+        if group_len == 0 {
+            return Err(format!(
+                "atomic_group_lens entries must be > 0; index={group_index}"
+            ));
+        }
+        if group_len > 4096 {
+            return Err(format!(
+                "atomic_group_lens entries must be <= 4096; index={group_index} len={group_len}"
+            ));
+        }
+        let end = offset
+            .checked_add(group_len)
+            .ok_or_else(|| "atomic_group_lens sum overflowed usize".to_string())?;
+        let members = keys_and_put_ids.get(offset..end).ok_or_else(|| {
+            format!(
+                "atomic_group_lens exceeds keys length; end={} keys={}",
+                end,
+                keys_and_put_ids.len()
+            )
+        })?;
+        if group_len == 1 {
+            assignments.push(None);
+        } else {
+            let group = Arc::new(PutAtomicGroup {
+                members: members
+                    .iter()
+                    .map(|(key, put_id)| PutAtomicGroupMember {
+                        key: key.clone(),
+                        put_id: *put_id,
+                    })
+                    .collect(),
+            });
+            assignments.extend((0..group_len).map(|_| Some(group.clone())));
+        }
+        offset = end;
+    }
+    if offset != keys_and_put_ids.len() {
+        return Err(format!(
+            "atomic_group_lens must sum to keys length; sum={} keys={}",
+            offset,
+            keys_and_put_ids.len()
+        ));
+    }
+    Ok(assignments)
+}
+
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct PutDoneReq {
     pub key: String,
@@ -471,6 +711,8 @@ pub struct PutDoneReq {
     pub committed_slot: Option<PutDoneCommittedSlot>,
     /// Ask master to keep a local read holder for the committing node.
     pub publish_local_cache: bool,
+    /// Multi-key atomic group for this exact key version.
+    pub atomic_group: Option<PutAtomicGroup>,
 }
 impl MsgPackSerializePart for PutDoneReq {
     fn msg_id(&self) -> u32 {
@@ -591,6 +833,7 @@ pub struct BatchPutDoneItemReq {
     pub lease_id: Option<u64>,
     pub committed_slot: Option<PutDoneCommittedSlot>,
     pub publish_local_cache: bool,
+    pub atomic_group: Option<PutAtomicGroup>,
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -628,12 +871,56 @@ impl RPCReq for BatchPutDoneReq {
     type Resp = BatchPutDoneResp;
 }
 
+/// Linear-size V2 batch route publication. `atomic_group_lens` partitions the
+/// ordered items; the master reconstructs each group once from the item keys
+/// and put ids, then shares one interned descriptor across member routes.
+///
+/// The V1 `BatchPutDoneReq` remains registered unchanged for rolling and API
+/// compatibility.
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct GroupedBatchPutDoneItemReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub lease_id: Option<u64>,
+    pub committed_slot: Option<PutDoneCommittedSlot>,
+    pub publish_local_cache: bool,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct GroupedBatchPutDoneReq {
+    pub items: Vec<GroupedBatchPutDoneItemReq>,
+    pub atomic_group_lens: Vec<usize>,
+}
+impl MsgPackSerializePart for GroupedBatchPutDoneReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::GroupedBatchPutDoneReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct GroupedBatchPutDoneResp {
+    pub items: Vec<BatchPutDoneItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for GroupedBatchPutDoneResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::GroupedBatchPutDoneResp as u32
+    }
+}
+impl RPCReq for GroupedBatchPutDoneReq {
+    type Resp = GroupedBatchPutDoneResp;
+}
+
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct PutAppendStartReq {
     pub key: String,
     pub put_id: PutIDForAKey,
     pub len: u64,
     pub preferred_sub_cluster: Option<String>,
+    pub demote_source_on_remote_complete: bool,
+    pub protect_source_on_remote_complete: bool,
 }
 impl MsgPackSerializePart for PutAppendStartReq {
     fn msg_id(&self) -> u32 {
@@ -935,4 +1222,113 @@ impl MsgPackSerializePart for BatchDeleteClientKvMetaCacheResp {
 
 impl RPCReq for BatchDeleteClientKvMetaCacheReq {
     type Resp = BatchDeleteClientKvMetaCacheResp;
+}
+
+#[cfg(test)]
+mod put_atomic_group_tests {
+    use super::*;
+
+    #[test]
+    fn assignments_expand_only_multi_member_groups() {
+        let keys_and_put_ids = vec![
+            ("a".to_string(), (1, 0)),
+            ("b".to_string(), (1, 1)),
+            ("c".to_string(), (1, 2)),
+        ];
+        let assignments = build_put_atomic_group_assignments(&keys_and_put_ids, &[2, 1]).unwrap();
+        assert_eq!(assignments.len(), 3);
+        assert_eq!(assignments[0], assignments[1]);
+        assert_eq!(assignments[0].as_ref().unwrap().members.len(), 2);
+        assert!(assignments[2].is_none());
+    }
+
+    #[test]
+    fn assignments_reject_invalid_partitions() {
+        let keys_and_put_ids = vec![("a".to_string(), (1, 0)), ("b".to_string(), (1, 1))];
+        assert!(build_put_atomic_group_assignments(&keys_and_put_ids, &[1]).is_err());
+        assert!(build_put_atomic_group_assignments(&keys_and_put_ids, &[0, 2]).is_err());
+    }
+
+    #[test]
+    fn batch_put_done_group_round_trips_on_wire() {
+        let group = PutAtomicGroup {
+            members: vec![
+                PutAtomicGroupMember {
+                    key: "a".to_string(),
+                    put_id: (1, 0),
+                },
+                PutAtomicGroupMember {
+                    key: "b".to_string(),
+                    put_id: (1, 1),
+                },
+            ],
+        };
+        let req = BatchPutDoneReq {
+            items: vec![BatchPutDoneItemReq {
+                key: "a".to_string(),
+                put_id: (1, 0),
+                lease_id: None,
+                committed_slot: None,
+                publish_local_cache: false,
+                atomic_group: Some(group.clone()),
+            }],
+        };
+        let decoded: BatchPutDoneReq =
+            bitcode::decode(&bitcode::encode(&req)).expect("decode atomic put group");
+        assert_eq!(decoded.items[0].atomic_group.as_ref(), Some(&group));
+    }
+
+    #[test]
+    fn grouped_batch_put_done_wire_is_linear_and_round_trips() {
+        let keys_and_put_ids = (0..128)
+            .map(|index| (format!("page-{index:03}"), (7, index)))
+            .collect::<Vec<_>>();
+        let group = PutAtomicGroup {
+            members: keys_and_put_ids
+                .iter()
+                .map(|(key, put_id)| PutAtomicGroupMember {
+                    key: key.clone(),
+                    put_id: *put_id,
+                })
+                .collect(),
+        };
+        let legacy = BatchPutDoneReq {
+            items: keys_and_put_ids
+                .iter()
+                .map(|(key, put_id)| BatchPutDoneItemReq {
+                    key: key.clone(),
+                    put_id: *put_id,
+                    lease_id: None,
+                    committed_slot: None,
+                    publish_local_cache: false,
+                    atomic_group: Some(group.clone()),
+                })
+                .collect(),
+        };
+        let grouped = GroupedBatchPutDoneReq {
+            items: keys_and_put_ids
+                .iter()
+                .map(|(key, put_id)| GroupedBatchPutDoneItemReq {
+                    key: key.clone(),
+                    put_id: *put_id,
+                    lease_id: None,
+                    committed_slot: None,
+                    publish_local_cache: false,
+                })
+                .collect(),
+            atomic_group_lens: vec![128],
+        };
+        let legacy_bytes = bitcode::encode(&legacy);
+        let grouped_bytes = bitcode::encode(&grouped);
+        assert!(
+            grouped_bytes.len() * 16 < legacy_bytes.len(),
+            "grouped={} legacy={}",
+            grouped_bytes.len(),
+            legacy_bytes.len()
+        );
+        let decoded: GroupedBatchPutDoneReq =
+            bitcode::decode(&grouped_bytes).expect("decode grouped put done");
+        assert_eq!(decoded.items.len(), 128);
+        assert_eq!(decoded.atomic_group_lens, vec![128]);
+    }
 }

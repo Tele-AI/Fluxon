@@ -89,8 +89,19 @@ async fn apply_delete_client_kv_meta_cache_item(
     let client_api = view.client_kv_api();
     let client_inner = client_api.inner();
 
-    if let Some((_removed_key, cached_info)) =
-        client_inner
+    let cached_info = {
+        let controls = client_inner.owner_key_control.lock();
+        if controls
+            .get(&delete_item.key)
+            .is_some_and(|state| state.reclaim.is_some())
+        {
+            tracing::debug!(
+                "skip legacy local-index delete while owner reclaim fence is active: key={}",
+                delete_item.key
+            );
+            return;
+        }
+        let cached_info = client_inner
             .get_cached_info
             .remove_if(&delete_item.key, |_, v| {
                 let res = if v.put_time_ms == delete_item.put_time_ms {
@@ -112,14 +123,25 @@ async fn apply_delete_client_kv_meta_cache_item(
                 }
                 res
             })
-    {
+            .map(|(_, cached_info)| cached_info);
+        let _ = client_inner
+            .local_snapshot_info
+            .remove_if(&delete_item.key, |_, snapshot| {
+                if snapshot.put_time_ms == delete_item.put_time_ms {
+                    snapshot.put_version <= delete_item.put_version
+                } else {
+                    snapshot.put_time_ms <= delete_item.put_time_ms
+                }
+            });
+        cached_info
+    };
+    if let Some(cached_info) = cached_info {
+        client_inner.owner_hot_invalidate_version(
+            &delete_item.key,
+            (cached_info.put_time_ms, cached_info.put_version),
+        );
         client_inner.release_local_reserve_route_for_memory_info(cached_info.mem_holder.as_ref());
     }
-    let _ = client_inner.remove_local_snapshot_if(
-        &delete_item.key,
-        delete_item.put_time_ms,
-        delete_item.put_version,
-    );
 
     if let Err(err) = client_inner
         .external_invalidate_delete

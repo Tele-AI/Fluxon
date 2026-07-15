@@ -9,15 +9,16 @@ pub mod surface;
 pub mod wire;
 
 pub use rpc::{
-    MIN_EXPLICIT_RPC_TIMEOUT_SECS, MsgPack, MsgPackSerializePart, RPCReq, RpcCallObserveTrace,
-    RpcCallObservedOutput, USER_RPC_OBSERVE_TRACE_RAW_BYTES_INDEX,
+    MIN_EXPLICIT_RPC_TIMEOUT_MS, MIN_EXPLICIT_RPC_TIMEOUT_SECS, MsgPack, MsgPackSerializePart,
+    RPCReq, RpcCallObserveTrace, RpcCallObservedOutput, USER_RPC_OBSERVE_TRACE_RAW_BYTES_INDEX,
     USER_RPC_OWNER1_OBSERVE_TRACE_RAW_BYTES_INDEX, USER_RPC_REQ_MSG_ID,
     USER_RPC_REQUEST_OWNER1_OBSERVE_TRACE_RAW_BYTES_INDEX, USER_RPC_RESP_MSG_ID,
     UserRpcBytesAsyncHandler, UserRpcBytesError, UserRpcBytesFuture, UserRpcBytesHandler,
     UserRpcObserveTrace, UserRpcOwner1ObserveTrace, UserRpcTransportPathKind,
     current_cross_process_monotonic_us, decode_user_rpc_observe_trace,
     decode_user_rpc_owner1_observe_trace, encode_user_rpc_observe_trace,
-    encode_user_rpc_owner1_observe_trace,
+    encode_user_rpc_owner1_observe_trace, validate_explicit_rpc_timeout,
+    validate_explicit_rpc_timeout_ms,
 };
 pub use surface::*;
 pub use wire::*;

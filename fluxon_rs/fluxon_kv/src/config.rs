@@ -97,12 +97,21 @@ pub enum SideTransferRole {
     Worker,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerLocalReserveExpectedCapacity {
+    pub value_len: u64,
+    pub payload_capacity_bytes: u64,
+}
+
 const TEST_SPEC_TCP_THREAD_REACTOR_SHARD_COUNT_MIN: u8 = 1;
 const TEST_SPEC_TCP_THREAD_REACTOR_SHARD_COUNT_MAX: u8 = 16;
 const TEST_SPEC_TCP_THREAD_BULK_LANE_COUNT_MIN: u8 = 1;
 const TEST_SPEC_TCP_THREAD_BULK_LANE_COUNT_MAX: u8 = 8;
 const TEST_SPEC_TCP_THREAD_CONTROL_LANE_COUNT_MIN: u8 = 1;
 const TEST_SPEC_TCP_THREAD_CONTROL_LANE_COUNT_MAX: u8 = 8;
+const TEST_SPEC_REPLICA_TASK_MAX_INFLIGHT_MIN: u16 = 1;
+const TEST_SPEC_REPLICA_TASK_MAX_INFLIGHT_MAX: u16 = 64;
 
 fn default_iceoryx_owner_client_busy_poll() -> bool {
     true
@@ -137,6 +146,8 @@ pub struct TestSpecConfig {
     pub owner_local_reserve_soft_wait_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_local_reserve_hard_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_local_reserve_expected_capacity: Option<OwnerLocalReserveExpectedCapacity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_mode: Option<TestSpecTransportMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +158,10 @@ pub struct TestSpecConfig {
     pub tcp_thread_control_lane_count: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_rpc_sync_handler_thread_count: Option<u16>,
+    /// Maximum number of replica append pipelines in flight on an owner. Different keys may run
+    /// concurrently; each key remains strictly serialized by the replica dispatcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_task_max_inflight: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rdma_device_names: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,11 +192,13 @@ impl Default for TestSpecConfig {
             skip_put_end_commit: false,
             owner_local_reserve_soft_wait_timeout_ms: None,
             owner_local_reserve_hard_timeout_ms: None,
+            owner_local_reserve_expected_capacity: None,
             transport_mode: None,
             tcp_thread_reactor_shard_count: None,
             tcp_thread_bulk_lane_count: None,
             tcp_thread_control_lane_count: None,
             user_rpc_sync_handler_thread_count: None,
+            replica_task_max_inflight: None,
             rdma_device_names: None,
             require_transfer_rpc_fast_path_ready_timeout_seconds: None,
             enable_side_transfer: false,
@@ -304,10 +321,12 @@ fn validate_required_transfer_rpc_fast_path_ready_timeout(
 }
 
 fn validate_owner_local_reserve_timeouts(test_spec_config: &TestSpecConfig) -> KvResult<()> {
-    let Some(soft_wait_timeout_ms) = test_spec_config.owner_local_reserve_soft_wait_timeout_ms
-    else {
-        return Ok(());
-    };
+    let soft_wait_timeout_ms = test_spec_config
+        .owner_local_reserve_soft_wait_timeout_ms
+        .unwrap_or(10);
+    let hard_timeout_ms = test_spec_config
+        .owner_local_reserve_hard_timeout_ms
+        .unwrap_or(10_000);
     if soft_wait_timeout_ms == 0 {
         return Err(ConfigError::InvalidClientConfig {
             detail: "test_spec_config.owner_local_reserve_soft_wait_timeout_ms must be > 0"
@@ -315,23 +334,57 @@ fn validate_owner_local_reserve_timeouts(test_spec_config: &TestSpecConfig) -> K
         }
         .into_kverror());
     }
-
-    if let Some(hard_timeout_ms) = test_spec_config.owner_local_reserve_hard_timeout_ms {
-        if hard_timeout_ms == 0 {
-            return Err(ConfigError::InvalidClientConfig {
-                detail: "test_spec_config.owner_local_reserve_hard_timeout_ms must be > 0"
-                    .to_string(),
-            }
-            .into_kverror());
+    if hard_timeout_ms == 0 {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: "test_spec_config.owner_local_reserve_hard_timeout_ms must be > 0".to_string(),
         }
-        if hard_timeout_ms <= soft_wait_timeout_ms {
-            return Err(ConfigError::InvalidClientConfig {
-                detail: "test_spec_config.owner_local_reserve_hard_timeout_ms must be greater than owner_local_reserve_soft_wait_timeout_ms".to_string(),
-            }
-            .into_kverror());
+        .into_kverror());
+    }
+    if hard_timeout_ms <= soft_wait_timeout_ms {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: "test_spec_config.owner_local_reserve_hard_timeout_ms must be greater than owner_local_reserve_soft_wait_timeout_ms".to_string(),
         }
+        .into_kverror());
     }
 
+    Ok(())
+}
+
+fn validate_owner_local_reserve_expected_capacity(
+    test_spec_config: &TestSpecConfig,
+) -> KvResult<()> {
+    let Some(expected) = &test_spec_config.owner_local_reserve_expected_capacity else {
+        return Ok(());
+    };
+    if expected.value_len == 0 {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: "test_spec_config.owner_local_reserve_expected_capacity.value_len must be > 0"
+                .to_string(),
+        }
+        .into_kverror());
+    }
+    if expected.payload_capacity_bytes == 0 {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: "test_spec_config.owner_local_reserve_expected_capacity.payload_capacity_bytes must be > 0"
+                .to_string(),
+        }
+        .into_kverror());
+    }
+    if crate::owner_local_reserve_expected_grant_count(
+        expected.value_len,
+        expected.payload_capacity_bytes,
+    )
+    .is_none()
+    {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: format!(
+                "test_spec_config.owner_local_reserve_expected_capacity.value_len={} cannot be represented by a local-reserve slot no larger than {} bytes",
+                expected.value_len,
+                crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES
+            ),
+        }
+        .into_kverror());
+    }
     Ok(())
 }
 
@@ -387,6 +440,21 @@ fn validate_test_spec_tcp_thread_tuning(test_spec_config: &TestSpecConfig) -> Kv
             return Err(ConfigError::InvalidTestConfig {
                 detail: "test_spec_config.user_rpc_sync_handler_thread_count must be > 0"
                     .to_string(),
+            }
+            .into_kverror());
+        }
+    }
+    if let Some(value) = test_spec_config.replica_task_max_inflight {
+        if !(TEST_SPEC_REPLICA_TASK_MAX_INFLIGHT_MIN..=TEST_SPEC_REPLICA_TASK_MAX_INFLIGHT_MAX)
+            .contains(&value)
+        {
+            return Err(ConfigError::InvalidTestConfig {
+                detail: format!(
+                    "test_spec_config.replica_task_max_inflight must be in [{}, {}], got {}",
+                    TEST_SPEC_REPLICA_TASK_MAX_INFLIGHT_MIN,
+                    TEST_SPEC_REPLICA_TASK_MAX_INFLIGHT_MAX,
+                    value
+                ),
             }
             .into_kverror());
         }
@@ -482,6 +550,11 @@ pub const DEFAULT_OTLP_LOG_TABLE_NAME: &str = "fluxon_logs";
 pub const DEFAULT_OTLP_LOG_FLUSH_INTERVAL_MS: u64 = 2000;
 pub const DEFAULT_OTLP_LOG_MAX_BATCH_LINES: usize = 2000;
 pub const DEFAULT_OTLP_LOG_MAX_QUEUE_LINES: usize = 20000;
+pub const DEFAULT_REPLICA_CACHE_CAPACITY_RATIO: f64 = 0.95;
+
+fn default_replica_cache_capacity_ratio() -> f64 {
+    DEFAULT_REPLICA_CACHE_CAPACITY_RATIO
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -767,6 +840,12 @@ pub struct MasterConfigYaml {
     pub master_ui: Option<MasterUiConfigYaml>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica_task_placement: Option<ReplicaTaskPlacementConfigYaml>,
+    #[serde(default = "default_replica_cache_capacity_ratio")]
+    pub replica_cache_capacity_ratio: f64,
+    /// Optional inclusive hot-tier capacity. Entries evicted from this tier remain in the
+    /// resident replica cache and are proactively copied to a remote-only owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_writeback_tier1_capacity_ratio: Option<f64>,
     #[serde(default)]
     pub test_spec_config: TestSpecConfig,
 }
@@ -787,6 +866,8 @@ pub struct MasterConfig {
     pub log_dir: String,
     pub master_ui: Option<MasterUiConfig>,
     pub replica_task_placement: ReplicaTaskPlacementConfig,
+    pub replica_cache_capacity_ratio: f64,
+    pub replica_writeback_tier1_capacity_ratio: Option<f64>,
     pub test_spec_config: TestSpecConfig,
 }
 
@@ -837,6 +918,10 @@ pub struct ClientConfigYaml {
     pub contribute_to_cluster_pool_size: Option<ContributeToClusterPoolSizeYaml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pprof_duration_seconds: Option<u64>,
+    /// Optional owner-local hot working-set threshold. Size eviction from this
+    /// logical tier schedules an asynchronous remote replica write-back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_writeback_hot_capacity_ratio: Option<f64>,
     pub fluxonkv_spec: FluxonKvSpecYaml,
     #[serde(default)]
     pub test_spec_config: TestSpecConfig,
@@ -959,6 +1044,7 @@ pub struct ClientConfig {
     pub contribute_to_cluster_pool_size: ContributeToClusterPoolSize,
     pub protocol: ProtocolConfig,
     pub pprof_duration_seconds: Option<u64>,
+    pub replica_writeback_hot_capacity_ratio: Option<f64>,
     pub redis_compat_listen_addr: Option<std::net::SocketAddr>,
     pub fluxonkv_spec: FluxonKvSpec,
     pub share_mem_path: String,           // Mandatory shared bundle path
@@ -1142,6 +1228,7 @@ impl ClientConfigYaml {
         materialize_default_test_spec_transport_mode(&mut test_spec_config);
         validate_required_transfer_rpc_fast_path_ready_timeout(&test_spec_config)?;
         validate_owner_local_reserve_timeouts(&test_spec_config)?;
+        validate_owner_local_reserve_expected_capacity(&test_spec_config)?;
         validate_test_spec_tcp_thread_tuning(&test_spec_config)?;
 
         // Role selection contract:
@@ -1199,6 +1286,58 @@ impl ClientConfigYaml {
                 return Err(ConfigError::InvalidClientConfig {
                     detail: "owner mode requires non-zero contribute_to_cluster_pool_size.dram"
                         .to_string(),
+                }
+                .into_kverror());
+            }
+        }
+
+        if let Some(hot_ratio) = self.replica_writeback_hot_capacity_ratio {
+            if !hot_ratio.is_finite() || hot_ratio <= 0.0 || hot_ratio >= 1.0 {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "replica_writeback_hot_capacity_ratio must be finite and in (0, 1)"
+                        .to_string(),
+                }
+                .into_kverror());
+            }
+            if is_external {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "replica_writeback_hot_capacity_ratio is only valid on owner configs"
+                        .to_string(),
+                }
+                .into_kverror());
+            }
+        }
+
+        if let Some(expected) = &test_spec_config.owner_local_reserve_expected_capacity {
+            if is_external {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "test_spec_config.owner_local_reserve_expected_capacity is only valid on owner configs"
+                        .to_string(),
+                }
+                .into_kverror());
+            }
+            let expected_grants = crate::owner_local_reserve_expected_grant_count(
+                expected.value_len,
+                expected.payload_capacity_bytes,
+            )
+            .expect("owner local-reserve expected capacity was validated");
+            let physical_reserve_bytes = expected_grants
+                .checked_mul(crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES)
+                .ok_or_else(|| {
+                    ConfigError::InvalidClientConfig {
+                        detail: "test_spec_config.owner_local_reserve_expected_capacity physical reserve size overflows u64"
+                            .to_string(),
+                    }
+                    .into_kverror()
+                })?;
+            if physical_reserve_bytes > contribute_to_cluster_pool_size.dram {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: format!(
+                        "test_spec_config.owner_local_reserve_expected_capacity requires {} physical bytes across {} grants, exceeding owner dram contribution {}",
+                        physical_reserve_bytes,
+                        expected_grants,
+                        contribute_to_cluster_pool_size.dram
+                    ),
                 }
                 .into_kverror());
             }
@@ -1442,6 +1581,7 @@ impl ClientConfigYaml {
             contribute_to_cluster_pool_size,
             protocol,
             pprof_duration_seconds,
+            replica_writeback_hot_capacity_ratio: self.replica_writeback_hot_capacity_ratio,
             redis_compat_listen_addr,
             fluxonkv_spec,
             share_mem_path,
@@ -1725,6 +1865,36 @@ impl MasterConfigYaml {
             Some(cfg) => cfg.verify()?,
             None => ReplicaTaskPlacementConfig::default(),
         };
+        if !self.replica_cache_capacity_ratio.is_finite()
+            || self.replica_cache_capacity_ratio <= 0.0
+            || self.replica_cache_capacity_ratio > 1.0
+        {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "replica_cache_capacity_ratio must be finite and in (0, 1]".to_string(),
+            }
+            .into_kverror());
+        }
+        if let Some(tier1_ratio) = self.replica_writeback_tier1_capacity_ratio {
+            if !tier1_ratio.is_finite()
+                || tier1_ratio <= 0.0
+                || tier1_ratio >= self.replica_cache_capacity_ratio
+            {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: format!(
+                        "replica_writeback_tier1_capacity_ratio must be finite, positive, and smaller than replica_cache_capacity_ratio ({})",
+                        self.replica_cache_capacity_ratio
+                    ),
+                }
+                .into_kverror());
+            }
+            if !replica_task_placement.restrict_to_remote_only_node_roles {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "replica_writeback_tier1_capacity_ratio requires replica_task_placement.restrict_to_remote_only_node_roles=true"
+                        .to_string(),
+                }
+                .into_kverror());
+            }
+        }
 
         let mut test_spec_config = self.test_spec_config;
         let transport_mode_was_explicit = test_spec_config.transport_mode.is_some();
@@ -1735,6 +1905,17 @@ impl MasterConfigYaml {
         materialize_default_test_spec_transport_mode(&mut test_spec_config);
         validate_required_transfer_rpc_fast_path_ready_timeout(&test_spec_config)?;
         validate_owner_local_reserve_timeouts(&test_spec_config)?;
+        validate_owner_local_reserve_expected_capacity(&test_spec_config)?;
+        if test_spec_config
+            .owner_local_reserve_expected_capacity
+            .is_some()
+        {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "test_spec_config.owner_local_reserve_expected_capacity is only valid on owner configs"
+                    .to_string(),
+            }
+            .into_kverror());
+        }
         validate_test_spec_tcp_thread_tuning(&test_spec_config)?;
         let protocol = apply_test_spec_rdma_device_names_to_protocol(
             self.protocol.unwrap_or(ProtocolConfig {
@@ -1763,6 +1944,8 @@ impl MasterConfigYaml {
             log_dir: self.log_dir,
             master_ui,
             replica_task_placement,
+            replica_cache_capacity_ratio: self.replica_cache_capacity_ratio,
+            replica_writeback_tier1_capacity_ratio: self.replica_writeback_tier1_capacity_ratio,
             test_spec_config,
         })
     }
@@ -1852,6 +2035,195 @@ fluxonkv_spec:
             Some(TestSpecTransportMode::TransferWithRpc)
         );
         assert!(verified.fluxonkv_spec.enable_transfer_rpc_fast_path);
+    }
+
+    #[test]
+    fn owner_replica_writeback_hot_capacity_ratio_is_owner_only_and_bounded() {
+        let owner = r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+replica_writeback_hot_capacity_ratio: RATIO
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner_hot
+  large_file_paths: [/tmp/test_owner_hot_large]
+  sub_cluster: rack-a
+"#;
+        let verified = ClientConfigYaml::from_str(&owner.replace("RATIO", "0.75"))
+            .unwrap()
+            .verify()
+            .unwrap();
+        assert_eq!(verified.replica_writeback_hot_capacity_ratio, Some(0.75));
+
+        for invalid in ["0", "1", "-0.1", ".nan"] {
+            let err = ClientConfigYaml::from_str(&owner.replace("RATIO", invalid))
+                .unwrap()
+                .verify()
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("replica_writeback_hot_capacity_ratio")
+            );
+        }
+
+        let external = r#"
+instance_key: test_external
+replica_writeback_hot_capacity_ratio: 0.75
+fluxonkv_spec:
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_external_hot
+"#;
+        let err = ClientConfigYaml::from_str(external)
+            .unwrap()
+            .verify()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("replica_writeback_hot_capacity_ratio is only valid on owner configs")
+        );
+    }
+
+    #[test]
+    fn owner_local_reserve_expected_capacity_accepts_exact_fit_payload_target() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 137438953472
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner_expected
+  large_file_paths: [/tmp/test_owner_expected_large]
+  sub_cluster: rack-a
+test_spec_config:
+  owner_local_reserve_expected_capacity:
+    value_len: 4718592
+    payload_capacity_bytes: 109951162777
+"#,
+        )
+        .unwrap();
+        let verified = cfg.verify().unwrap();
+        let expected = verified
+            .test_spec_config
+            .owner_local_reserve_expected_capacity
+            .unwrap();
+        assert_eq!(expected.value_len, 4_718_592);
+        assert_eq!(expected.payload_capacity_bytes, 109_951_162_777);
+        assert_eq!(
+            crate::owner_local_reserve_expected_grant_count(
+                expected.value_len,
+                expected.payload_capacity_bytes,
+            ),
+            Some(207)
+        );
+    }
+
+    #[test]
+    fn owner_local_reserve_expected_capacity_rejects_zero_value_len() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 1073741824
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner_expected_zero
+  large_file_paths: [/tmp/test_owner_expected_zero_large]
+  sub_cluster: rack-a
+test_spec_config:
+  owner_local_reserve_expected_capacity:
+    value_len: 0
+    payload_capacity_bytes: 4096
+"#,
+        )
+        .unwrap();
+        let err = cfg.verify().unwrap_err();
+        assert!(err.to_string().contains(
+            "test_spec_config.owner_local_reserve_expected_capacity.value_len must be > 0"
+        ));
+    }
+
+    #[test]
+    fn owner_local_reserve_expected_capacity_rejects_physical_target_over_owner_capacity() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner_expected_too_large
+  large_file_paths: [/tmp/test_owner_expected_too_large_large]
+  sub_cluster: rack-a
+test_spec_config:
+  owner_local_reserve_expected_capacity:
+    value_len: 4096
+    payload_capacity_bytes: 4096
+"#,
+        )
+        .unwrap();
+        let err = cfg.verify().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exceeding owner dram contribution")
+        );
+    }
+
+    #[test]
+    fn owner_local_reserve_hard_timeout_is_validated_without_soft_override() {
+        let mut cfg = TestSpecConfig {
+            owner_local_reserve_hard_timeout_ms: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            validate_owner_local_reserve_timeouts(&cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("owner_local_reserve_hard_timeout_ms must be > 0")
+        );
+
+        cfg.owner_local_reserve_hard_timeout_ms = Some(5);
+        assert!(
+            validate_owner_local_reserve_timeouts(&cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("must be greater than owner_local_reserve_soft_wait_timeout_ms")
+        );
+
+        cfg.owner_local_reserve_hard_timeout_ms = Some(20);
+        validate_owner_local_reserve_timeouts(&cfg).unwrap();
+    }
+
+    #[test]
+    fn replica_task_max_inflight_is_strictly_bounded() {
+        for value in [1, 16, 64] {
+            let cfg = TestSpecConfig {
+                replica_task_max_inflight: Some(value),
+                ..Default::default()
+            };
+            validate_test_spec_tcp_thread_tuning(&cfg).unwrap();
+        }
+        for value in [0, 65] {
+            let cfg = TestSpecConfig {
+                replica_task_max_inflight: Some(value),
+                ..Default::default()
+            };
+            assert!(
+                validate_test_spec_tcp_thread_tuning(&cfg)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("replica_task_max_inflight must be in [1, 64]")
+            );
+        }
     }
 
     #[test]
@@ -2486,6 +2858,79 @@ replica_task_placement:
                 .restrict_to_remote_only_node_roles
         );
         assert_eq!(verified.replica_task_placement.role_queue_window_ms, 2.5);
+        assert_eq!(
+            verified.replica_cache_capacity_ratio,
+            DEFAULT_REPLICA_CACHE_CAPACITY_RATIO
+        );
+    }
+
+    #[test]
+    fn master_config_validates_replica_cache_capacity_ratio() {
+        let base = r#"
+instance_key: test_master
+cluster_name: test_cluster
+port: 18080
+etcd_endpoints: ["127.0.0.1:2379"]
+network:
+  subnet_whitelist: ["127.0.0.0/8"]
+monitoring:
+  prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
+log_dir: /tmp/test_master_logs
+replica_cache_capacity_ratio: RATIO
+"#;
+
+        let valid = MasterConfigYaml::from_str(&base.replace("RATIO", "0.9"))
+            .unwrap()
+            .verify()
+            .unwrap();
+        assert_eq!(valid.replica_cache_capacity_ratio, 0.9);
+
+        for invalid in ["0", "-0.1", "1.01", ".nan"] {
+            let cfg = MasterConfigYaml::from_str(&base.replace("RATIO", invalid)).unwrap();
+            let err = cfg.verify().unwrap_err();
+            assert!(format!("{err}").contains("replica_cache_capacity_ratio"));
+        }
+    }
+
+    #[test]
+    fn master_config_validates_replica_writeback_tier1_capacity_ratio() {
+        let base = r#"
+instance_key: test_master
+cluster_name: test_cluster
+port: 18080
+etcd_endpoints: ["127.0.0.1:2379"]
+network:
+  subnet_whitelist: ["127.0.0.0/8"]
+monitoring:
+  prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
+log_dir: /tmp/test_master_logs
+replica_cache_capacity_ratio: 0.95
+replica_writeback_tier1_capacity_ratio: RATIO
+"#;
+
+        let valid = MasterConfigYaml::from_str(&base.replace("RATIO", "0.75"))
+            .unwrap()
+            .verify()
+            .unwrap();
+        assert_eq!(valid.replica_writeback_tier1_capacity_ratio, Some(0.75));
+
+        for invalid in ["0", "-0.1", "0.95", "0.96", ".nan"] {
+            let cfg = MasterConfigYaml::from_str(&base.replace("RATIO", invalid)).unwrap();
+            let err = cfg.verify().unwrap_err();
+            assert!(format!("{err}").contains("replica_writeback_tier1_capacity_ratio"));
+        }
+
+        let unrestricted = base
+            .replace("RATIO", "0.75")
+            .replace(
+                "replica_cache_capacity_ratio: 0.95",
+                "replica_cache_capacity_ratio: 0.95\nreplica_task_placement:\n  restrict_to_remote_only_node_roles: false",
+            );
+        let err = MasterConfigYaml::from_str(&unrestricted)
+            .unwrap()
+            .verify()
+            .unwrap_err();
+        assert!(format!("{err}").contains("restrict_to_remote_only_node_roles=true"));
     }
 
     #[test]

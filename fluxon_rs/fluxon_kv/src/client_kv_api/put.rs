@@ -1,6 +1,7 @@
 use super::{
-    ClientKvApiInner, OwnerLocalReserveClassState, OwnerLocalReserveGrantState,
-    OwnerLocalReservePoolState, OwnerLocalReserveSlotLease, ReplicaTaskJob, ReplicaTaskTarget,
+    ClientKvApiInner, OwnerHotEvictionEvent, OwnerLocalReserveClassState,
+    OwnerLocalReserveGrantState, OwnerLocalReservePoolState, OwnerLocalReserveSlotLease,
+    OwnerLocalReserveSlotRef, ReplicaTaskJob, ReplicaTaskTarget,
     local_reserve_rebalance::{owner_local_reserve_timeout_config, wait_owner_local_reserve_ready},
 };
 use crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
@@ -15,13 +16,16 @@ use crate::observe_kvope::{
 use crate::{
     client_kv_api::ClientKvApiView,
     master_kv_router::msg_pack::{
-        BatchPreparePutKeyItemReq, BatchPreparePutKeysReq, BatchPreparePutKeysResp,
-        BatchPutDoneItemReq, BatchPutDoneReq, BatchPutDoneResp, BatchPutRevokeItemReq,
-        BatchPutRevokeReq, BatchPutRevokeResp, BatchPutStartItemReq, BatchPutStartReq,
-        BatchPutStartResp, BatchReleasePutKeyReservationsReq, BatchReleasePutKeyReservationsResp,
-        PutAppendDoneReq, PutAppendDoneResp, PutAppendRevokeReq, PutAppendStartReq,
-        PutAppendStartResp, PutDoneCommittedSlot, PutDoneReq, PutRevokeReq, PutStartReq,
-        PutStartResp, ReleaseLocalGrantReq, ReserveLocalGrantReq, ReserveLocalGrantResp,
+        BatchEnqueueReplicaTaskReq, BatchEnqueueReplicaTaskResp, BatchPreparePutKeyItemReq,
+        BatchPreparePutKeysReq, BatchPreparePutKeysResp, BatchPutDoneItemReq, BatchPutDoneReq,
+        BatchPutDoneResp, BatchPutRevokeItemReq, BatchPutRevokeReq, BatchPutRevokeResp,
+        BatchPutStartItemReq, BatchPutStartReq, BatchPutStartResp,
+        BatchReleasePutKeyReservationsReq, BatchReleasePutKeyReservationsResp,
+        EnqueueReplicaTaskItemResp, GroupedBatchPutDoneItemReq, GroupedBatchPutDoneReq,
+        GroupedBatchPutDoneResp, PutAppendDoneReq, PutAppendDoneResp, PutAppendRevokeReq,
+        PutAppendStartReq, PutAppendStartResp, PutAtomicGroup, PutDoneCommittedSlot, PutDoneReq,
+        PutRevokeReq, PutStartReq, PutStartResp, ReleaseLocalGrantReq, ReserveLocalGrantOutcome,
+        ReserveLocalGrantReq,
     },
     memholder::{UserMemHolder, UserMemHolderExposeKind},
     p2p::msg_pack::MsgPack,
@@ -30,40 +34,30 @@ use crate::{
 };
 use chrono::Utc;
 use fluxon_commu::TransferBreakdown;
+use fluxon_util::semaphore_map::SemaphoreMap;
 use limit_thirdparty::tokio;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, atomic::Ordering};
+use std::time::{Duration, Instant};
 use tracing::info;
 
 fn duration_to_i64_us(duration: std::time::Duration) -> i64 {
     duration.as_micros().min(i64::MAX as u128) as i64
 }
 
-const OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES: u64 = 4 * 1024;
 fn owner_local_reserve_slot_size(value_len: u64) -> KvResult<u64> {
-    let normalized = value_len.max(OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES);
-    let slot_size = normalized.checked_next_power_of_two().ok_or_else(|| {
+    crate::owner_local_reserve_slot_size_bytes(value_len).ok_or_else(|| {
         KvError::Api(ApiError::InvalidArgument {
             detail: format!(
-                "value_len={} exceeds resident local reserve slot size range",
-                value_len
+                "value_len={} cannot be represented by a resident local-reserve slot no larger than {} bytes",
+                value_len, OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES
             ),
         })
-    })?;
-    if slot_size > OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES {
-        return Err(KvError::Api(ApiError::InvalidArgument {
-            detail: format!(
-                "value_len={} requires slot_size={} larger than local reserve grant quantum={}",
-                value_len, slot_size, OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES
-            ),
-        }));
-    }
-    Ok(slot_size)
+    })
 }
 
 fn owner_local_reserve_slots_per_grant(slot_size: u64) -> u32 {
-    let slots = (OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES / slot_size).max(1);
-    slots.min(u32::MAX as u64) as u32
+    crate::owner_local_reserve_slots_per_grant(slot_size)
+        .expect("validated local-reserve slot size must fit in a grant")
 }
 
 fn owner_local_reserve_install_grant(
@@ -94,27 +88,18 @@ fn owner_local_reserve_try_claim(
     value_len: u64,
     key_count: usize,
 ) -> Option<OwnerLocalReserveSlotLease> {
-    let class_state = pool
+    let free_slots = pool
         .classes
         .entry(slot_size)
-        .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
-    if class_state.free_slot_count() < key_count {
+        .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant))
+        .free_slot_count();
+    if free_slots < key_count {
         return None;
     }
-    let mut slots = Vec::with_capacity(key_count);
-    for grant in class_state.grants.iter_mut() {
-        while slots.len() < key_count {
-            match grant.claim_prepared_slot() {
-                Some(slot) => slots.push(slot),
-                None => break,
-            }
-        }
-        if slots.len() == key_count {
-            break;
-        }
-    }
-    assert!(
-        slots.len() == key_count,
+    let slots = owner_local_reserve_claim_available(pool, slot_size, slots_per_grant, key_count);
+    assert_eq!(
+        slots.len(),
+        key_count,
         "free_slot_count check and claim path diverged"
     );
     Some(OwnerLocalReserveSlotLease {
@@ -122,6 +107,300 @@ fn owner_local_reserve_try_claim(
         slot_size,
         slots,
     })
+}
+
+fn owner_local_reserve_claim_available(
+    pool: &mut OwnerLocalReservePoolState,
+    slot_size: u64,
+    slots_per_grant: u32,
+    max_slots: usize,
+) -> Vec<OwnerLocalReserveSlotRef> {
+    let class_state = pool
+        .classes
+        .entry(slot_size)
+        .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
+    let claim_count = class_state.free_slot_count().min(max_slots);
+    let mut slots = Vec::with_capacity(claim_count);
+    for grant in class_state.grants.iter_mut() {
+        while slots.len() < claim_count {
+            match grant.claim_prepared_slot() {
+                Some(slot) => slots.push(slot),
+                None => break,
+            }
+        }
+        if slots.len() == claim_count {
+            break;
+        }
+    }
+    assert_eq!(
+        slots.len(),
+        claim_count,
+        "free_slot_count check and claim path diverged"
+    );
+    slots
+}
+
+struct OwnerLocalReservePendingDemandGuard<'a> {
+    inner: &'a ClientKvApiInner,
+    slot_size: u64,
+    slots_per_grant: u32,
+    pending_slots: usize,
+}
+
+impl<'a> OwnerLocalReservePendingDemandGuard<'a> {
+    fn new(
+        inner: &'a ClientKvApiInner,
+        slot_size: u64,
+        slots_per_grant: u32,
+        pending_slots: usize,
+    ) -> Self {
+        inner.owner_local_reserve_register_pending_demand(
+            slot_size,
+            slots_per_grant,
+            pending_slots,
+        );
+        Self {
+            inner,
+            slot_size,
+            slots_per_grant,
+            pending_slots,
+        }
+    }
+
+    fn consume(&mut self) {
+        if self.pending_slots == 0 {
+            return;
+        }
+        self.inner.owner_local_reserve_consume_pending_demand(
+            self.slot_size,
+            self.slots_per_grant,
+            self.pending_slots,
+        );
+        self.pending_slots = 0;
+        self.inner
+            .owner_local_reserve_rebalance_notify()
+            .notify_waiters();
+    }
+
+    fn disarm_after_locked_consume(&mut self) {
+        assert!(
+            self.pending_slots > 0,
+            "pending-demand guard was already consumed"
+        );
+        self.pending_slots = 0;
+        self.inner
+            .owner_local_reserve_rebalance_notify()
+            .notify_waiters();
+    }
+}
+
+impl Drop for OwnerLocalReservePendingDemandGuard<'_> {
+    fn drop(&mut self) {
+        self.consume();
+    }
+}
+
+#[cfg(test)]
+mod local_reserve_claim_tests {
+    use super::{
+        OwnerLocalReserveGrantState, OwnerLocalReservePoolState,
+        owner_local_reserve_claim_available, owner_local_reserve_install_grant,
+        owner_local_reserve_slot_size, owner_local_reserve_slots_per_grant,
+    };
+    use crate::client_kv_api::{ClientKvApi, ClientKvApiNewArg};
+    use crate::config::TestSpecConfig;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn slot_size_uses_page_aligned_exact_fit() {
+        const SGLANG_KV_PAGE_BYTES: u64 = 4_718_592;
+
+        let slot_size = owner_local_reserve_slot_size(SGLANG_KV_PAGE_BYTES).unwrap();
+        assert_eq!(slot_size, SGLANG_KV_PAGE_BYTES);
+        assert_eq!(owner_local_reserve_slots_per_grant(slot_size), 113);
+        assert_eq!(owner_local_reserve_slot_size(4_097).unwrap(), 8_192);
+    }
+
+    #[test]
+    fn partial_claim_keeps_progress_for_large_waiters() {
+        let mut pool = OwnerLocalReservePoolState::default();
+        owner_local_reserve_install_grant(
+            &mut pool,
+            8,
+            4,
+            OwnerLocalReserveGrantState::new(1, 1000, 1000, 32, 8, 4),
+        );
+
+        let first = owner_local_reserve_claim_available(&mut pool, 8, 4, 3);
+        assert_eq!(first.len(), 3);
+        assert_eq!(pool.classes.get(&8).unwrap().free_slot_count(), 1);
+
+        let second = owner_local_reserve_claim_available(&mut pool, 8, 4, 3);
+        assert_eq!(second.len(), 1);
+        assert_eq!(pool.classes.get(&8).unwrap().free_slot_count(), 0);
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn later_waiter_cannot_steal_slot_before_current_claim_turn_completes() {
+        const SLOT_SIZE: u64 = 4 * 1024;
+        const SLOTS_PER_GRANT: u32 = 4;
+
+        let api = Arc::new(
+            ClientKvApi::construct(ClientKvApiNewArg {
+                test_spec_config: TestSpecConfig::default(),
+                owner_hot_cache_capacity_bytes: None,
+            })
+            .await
+            .expect("construct test ClientKvApi"),
+        );
+        {
+            let mut pool = api.inner().owner_local_reserve_pool.lock();
+            owner_local_reserve_install_grant(
+                &mut pool,
+                SLOT_SIZE,
+                SLOTS_PER_GRANT,
+                OwnerLocalReserveGrantState::new(
+                    1,
+                    1000,
+                    1000,
+                    SLOT_SIZE * u64::from(SLOTS_PER_GRANT),
+                    SLOT_SIZE,
+                    SLOTS_PER_GRANT,
+                ),
+            );
+        }
+
+        // Model a five-slot waiter that has made partial progress while owning the claim turn.
+        let current_claim_turn = api.inner().owner_local_reserve_claim_lock.lock().await;
+        let first_partial = {
+            let mut pool = api.inner().owner_local_reserve_pool.lock();
+            owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOTS_PER_GRANT, 3)
+        };
+        assert_eq!(first_partial.len(), 3);
+
+        // A later one-slot request must queue even though one slot is currently free.
+        let later_api = Arc::clone(&api);
+        let mut later_waiter = tokio::spawn(async move {
+            later_api
+                .inner()
+                .owner_claim_local_reserve_slot_lease(SLOT_SIZE, 1)
+                .await
+        });
+        assert!(
+            limit_thirdparty::tokio::time::timeout(Duration::from_millis(25), &mut later_waiter,)
+                .await
+                .is_err(),
+            "later waiter bypassed the active claim turn"
+        );
+        assert_eq!(
+            api.inner()
+                .owner_local_reserve_pool
+                .lock()
+                .classes
+                .get(&SLOT_SIZE)
+                .unwrap()
+                .free_slot_count(),
+            1,
+            "later waiter stole the current waiter's remaining free slot"
+        );
+
+        // Refill lets the current waiter reach all five slots before handing off the turn.
+        let first_remainder = {
+            let mut pool = api.inner().owner_local_reserve_pool.lock();
+            owner_local_reserve_install_grant(
+                &mut pool,
+                SLOT_SIZE,
+                SLOTS_PER_GRANT,
+                OwnerLocalReserveGrantState::new(
+                    2,
+                    2000,
+                    2000,
+                    SLOT_SIZE * u64::from(SLOTS_PER_GRANT),
+                    SLOT_SIZE,
+                    SLOTS_PER_GRANT,
+                ),
+            );
+            owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOTS_PER_GRANT, 2)
+        };
+        assert_eq!(first_partial.len() + first_remainder.len(), 5);
+        drop(current_claim_turn);
+
+        let later_lease =
+            limit_thirdparty::tokio::time::timeout(Duration::from_secs(1), later_waiter)
+                .await
+                .expect("later waiter did not receive the next claim turn")
+                .expect("later waiter task panicked")
+                .expect("later waiter failed to claim a free slot");
+        assert_eq!(later_lease.slots.len(), 1);
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn queued_claims_publish_aggregate_demand_and_cancel_cleanly() {
+        const SLOT_SIZE: u64 = 4 * 1024;
+        const SLOTS_PER_GRANT: u32 = 4;
+
+        let api = Arc::new(
+            ClientKvApi::construct(ClientKvApiNewArg {
+                test_spec_config: TestSpecConfig::default(),
+                owner_hot_cache_capacity_bytes: None,
+            })
+            .await
+            .expect("construct test ClientKvApi"),
+        );
+        let claim_turn = api.inner().owner_local_reserve_claim_lock.lock().await;
+
+        let first_api = Arc::clone(&api);
+        let first = tokio::spawn(async move {
+            first_api
+                .inner()
+                .owner_claim_local_reserve_slot_lease(SLOT_SIZE, 3)
+                .await
+        });
+        let second_api = Arc::clone(&api);
+        let second = tokio::spawn(async move {
+            second_api
+                .inner()
+                .owner_claim_local_reserve_slot_lease(SLOT_SIZE, 2)
+                .await
+        });
+
+        limit_thirdparty::tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let pending = api
+                    .inner()
+                    .owner_local_reserve_pool
+                    .lock()
+                    .classes
+                    .get(&SLOT_SIZE)
+                    .map(|class| class.pending_slot_demand)
+                    .unwrap_or_default();
+                if pending == 5 {
+                    break;
+                }
+                limit_thirdparty::tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued claims did not publish aggregate demand");
+
+        first.abort();
+        second.abort();
+        let _ = first.await;
+        let _ = second.await;
+        assert_eq!(
+            api.inner()
+                .owner_local_reserve_pool
+                .lock()
+                .classes
+                .get(&SLOT_SIZE)
+                .unwrap()
+                .pending_slot_demand,
+            0,
+            "cancelled queued claims leaked pending demand"
+        );
+        drop(claim_turn);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +428,7 @@ pub struct OwnerLocalPublishItem {
     pub committed_slot: PutDoneCommittedSlot,
     pub make_replica_task: bool,
     pub preferred_sub_cluster: Option<String>,
+    pub atomic_group: Option<PutAtomicGroup>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +448,49 @@ pub struct PutEndWithLocalCachePublish {
     pub local_cache_holder_id: Option<u64>,
 }
 
+fn owner_local_reserve_timeout_error(
+    inner: &ClientKvApiInner,
+    stage: &'static str,
+    slot_size: u64,
+    key_count: usize,
+    soft_wait_timeout: std::time::Duration,
+    hard_wait_timeout: std::time::Duration,
+    request_started_at: Instant,
+) -> KvError {
+    let (used_slots, free_slots, pending_slots, grants, expected_grants) = {
+        let pool = inner.owner_local_reserve_pool.lock();
+        pool.classes
+            .get(&slot_size)
+            .map(|class_state| {
+                (
+                    class_state.used_slot_count(),
+                    class_state.free_slot_count(),
+                    class_state.pending_slot_demand,
+                    class_state.grant_count(),
+                    class_state.expected_grant_count,
+                )
+            })
+            .unwrap_or((0, 0, 0, 0, 0))
+    };
+    KvError::Api(ApiError::Unknown {
+        detail: format!(
+            "owner local reserve refill timeout: stage={} slot_size={} key_count={} remaining_slots={} used_slots={} free_slots={} pending_slots={} grants={} expected_grants={} waited_ms={} soft_wait_timeout_ms={} hard_timeout_ms={}",
+            stage,
+            slot_size,
+            key_count,
+            key_count.saturating_sub(free_slots),
+            used_slots,
+            free_slots,
+            pending_slots,
+            grants,
+            expected_grants,
+            request_started_at.elapsed().as_millis(),
+            soft_wait_timeout.as_millis(),
+            hard_wait_timeout.as_millis()
+        ),
+    })
+}
+
 impl ClientKvApiInner {
     pub async fn owner_claim_local_reserve_slot_lease(
         &self,
@@ -177,93 +500,100 @@ impl ClientKvApiInner {
         let slot_size = owner_local_reserve_slot_size(value_len)?;
         let slots_per_grant = owner_local_reserve_slots_per_grant(slot_size);
         let (soft_wait_timeout, hard_wait_timeout) = owner_local_reserve_timeout_config(self);
-        let hard_deadline = Instant::now()
+        let request_started_at = Instant::now();
+        let hard_deadline = request_started_at
             .checked_add(hard_wait_timeout)
             .ok_or_else(|| {
                 KvError::Api(ApiError::Unknown {
                     detail: "owner local reserve hard timeout overflow".to_string(),
                 })
             })?;
-        let mut pending_demand_registered = false;
-        let claim_result = {
-            let mut pool = self.owner_local_reserve_pool.lock();
-            let class_state = pool
-                .classes
-                .entry(slot_size)
-                .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
-            if class_state.free_slot_count() >= key_count {
-                Some(owner_local_reserve_try_claim(
-                    &mut pool,
-                    slot_size,
-                    slots_per_grant,
-                    value_len,
-                    key_count,
-                ))
-            } else {
-                None
-            }
-        };
-        if let Some(Some(lease)) = claim_result {
-            return Ok(lease);
-        }
-        self.owner_local_reserve_register_pending_demand(slot_size, slots_per_grant, key_count);
-        pending_demand_registered = true;
+        // Publish demand before waiting for the FIFO turn so one refill can cover all queued
+        // claimants. The guard also removes demand if the caller is cancelled while queued.
+        let mut pending_demand =
+            OwnerLocalReservePendingDemandGuard::new(self, slot_size, slots_per_grant, key_count);
         self.owner_local_reserve_rebalance_notify().notify_waiters();
-        if !wait_owner_local_reserve_ready(
-            self,
-            slot_size,
-            slots_per_grant,
-            key_count,
-            soft_wait_timeout,
-            hard_deadline,
+
+        let Some(remaining_for_turn) = hard_deadline.checked_duration_since(Instant::now()) else {
+            return Err(owner_local_reserve_timeout_error(
+                self,
+                "claim_turn",
+                slot_size,
+                key_count,
+                soft_wait_timeout,
+                hard_wait_timeout,
+                request_started_at,
+            ));
+        };
+        let _claim_turn = match tokio::time::timeout(
+            remaining_for_turn,
+            self.owner_local_reserve_claim_lock.lock(),
         )
         .await
         {
-            let soft_wait_timeout_ms = soft_wait_timeout.as_millis();
-            let hard_wait_timeout_ms = hard_wait_timeout.as_millis();
-            if pending_demand_registered {
-                self.owner_local_reserve_consume_pending_demand(
+            Ok(claim_turn) => claim_turn,
+            Err(_) => {
+                return Err(owner_local_reserve_timeout_error(
+                    self,
+                    "claim_turn",
                     slot_size,
-                    slots_per_grant,
                     key_count,
-                );
+                    soft_wait_timeout,
+                    hard_wait_timeout,
+                    request_started_at,
+                ));
             }
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "owner local reserve refill timeout: slot_size={} key_count={} soft_wait_timeout_ms={} hard_timeout_ms={}",
-                    slot_size, key_count, soft_wait_timeout_ms, hard_wait_timeout_ms
-                ),
-            }));
-        }
-        let claim_result = {
-            let mut pool = self.owner_local_reserve_pool.lock();
-            let class_state = pool
-                .classes
-                .entry(slot_size)
-                .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
-            if class_state.free_slot_count() >= key_count {
-                Some(owner_local_reserve_try_claim(
+        };
+
+        loop {
+            let claim = {
+                let mut pool = self.owner_local_reserve_pool.lock();
+                let claim = owner_local_reserve_try_claim(
                     &mut pool,
                     slot_size,
                     slots_per_grant,
                     value_len,
                     key_count,
-                ))
-            } else {
-                None
+                );
+                if claim.is_some() {
+                    let class_state = pool
+                        .classes
+                        .get_mut(&slot_size)
+                        .expect("claimed local-reserve class must exist");
+                    class_state.pending_slot_demand = class_state
+                        .pending_slot_demand
+                        .checked_sub(key_count)
+                        .expect("claimed local-reserve demand underflow");
+                }
+                claim
+            };
+            if let Some(lease) = claim {
+                pending_demand.disarm_after_locked_consume();
+                return Ok(lease);
             }
-        };
-        if let Some(Some(lease)) = claim_result {
-            self.owner_local_reserve_consume_pending_demand(slot_size, slots_per_grant, key_count);
-            return Ok(lease);
+            self.owner_local_reserve_rebalance_notify().notify_waiters();
+            if !wait_owner_local_reserve_ready(
+                self,
+                slot_size,
+                slots_per_grant,
+                key_count,
+                soft_wait_timeout,
+                hard_deadline,
+            )
+            .await
+            {
+                break;
+            }
         }
-        self.owner_local_reserve_consume_pending_demand(slot_size, slots_per_grant, key_count);
-        Err(KvError::Api(ApiError::Unknown {
-            detail: format!(
-                "owner local reserve ready check returned without available slots: slot_size={} key_count={}",
-                slot_size, key_count
-            ),
-        }))
+        Err(owner_local_reserve_timeout_error(
+            self,
+            "refill",
+            slot_size,
+            key_count,
+            soft_wait_timeout,
+            hard_wait_timeout,
+            request_started_at,
+        ))
     }
 
     pub async fn owner_release_local_reserve_slot_lease(
@@ -627,6 +957,7 @@ impl ClientKvApiInner {
                 lease_id: pending.item.lease_id,
                 committed_slot: None,
                 publish_local_cache: false,
+                atomic_group: None,
             })
             .collect::<Vec<_>>();
         let done_resp = self.batch_put_done(done_req_items).await?;
@@ -846,6 +1177,7 @@ impl ClientKvApiInner {
                 lease_id: pending.lease_id,
                 committed_slot: None,
                 publish_local_cache: false,
+                atomic_group: None,
             })
             .collect::<Vec<_>>();
         let done_resp = self.batch_put_done(done_req_items).await?;
@@ -908,9 +1240,9 @@ impl ClientKvApiInner {
         put_id: PutIDForAKey,
         target: ReplicaTaskTarget,
     ) -> KvResult<()> {
-        let Some(memory_info) = self.local_visible_mem_holder(key) else {
+        let Some(memory_info) = self.local_committed_mem_holder_for_put_id(key, put_id) else {
             tracing::warn!(
-                "replica task source holder is unavailable after local commit; dropping replica task: key={} put_id=({},{})",
+                "replica task source holder is unavailable or version-mismatched after local commit; dropping replica task: key={} put_id=({},{})",
                 key,
                 put_id.0,
                 put_id.1
@@ -924,17 +1256,25 @@ impl ClientKvApiInner {
             UserMemHolderExposeKind::SegPtr,
         ));
 
-        match self.replica_task_tx.try_send(ReplicaTaskJob {
-            key: key.to_string(),
-            put_id,
-            holder,
-            target: Some(target),
-            preferred_sub_cluster: None,
-        }) {
+        // A full queue must apply backpressure. Dropping a promised replica task leaves a
+        // local-only committed slot that reserve reclaim cannot safely release.
+        match self
+            .replica_task_tx
+            .send(ReplicaTaskJob {
+                key: key.to_string(),
+                put_id,
+                holder,
+                target: Some(target),
+                preferred_sub_cluster: None,
+                hot_replica_guard: None,
+                protect_source_on_remote_complete: true,
+            })
+            .await
+        {
             Ok(()) => Ok(()),
             Err(err) => {
                 tracing::warn!(
-                    "replica task actor enqueue failed; dropping replica task: key={} put_id=({},{}) err={}",
+                    "replica task actor queue closed; local-only commit remains valid: key={} put_id=({},{}) err={}",
                     key,
                     put_id.0,
                     put_id.1,
@@ -950,15 +1290,16 @@ impl ClientKvApiInner {
         key: &str,
         put_id: PutIDForAKey,
         preferred_sub_cluster: Option<String>,
-    ) -> KvResult<()> {
-        let Some(memory_info) = self.local_visible_mem_holder(key) else {
+        protect_source_on_remote_complete: bool,
+    ) -> KvResult<bool> {
+        let Some(memory_info) = self.local_committed_mem_holder_for_put_id(key, put_id) else {
             tracing::warn!(
-                "replica append task source holder is unavailable after local publish; dropping replica task: key={} put_id=({},{})",
+                "replica append task source holder is unavailable or version-mismatched after local publish; dropping replica task: key={} put_id=({},{})",
                 key,
                 put_id.0,
                 put_id.1
             );
-            return Ok(());
+            return Ok(false);
         };
 
         let holder = Arc::new(UserMemHolder::new(
@@ -967,23 +1308,30 @@ impl ClientKvApiInner {
             UserMemHolderExposeKind::SegPtr,
         ));
 
-        match self.replica_task_tx.try_send(ReplicaTaskJob {
-            key: key.to_string(),
-            put_id,
-            holder,
-            target: None,
-            preferred_sub_cluster,
-        }) {
-            Ok(()) => Ok(()),
+        // Preserve append tasks under burst load for the same reclaim-safety reason above.
+        match self
+            .replica_task_tx
+            .send(ReplicaTaskJob {
+                key: key.to_string(),
+                put_id,
+                holder,
+                target: None,
+                preferred_sub_cluster,
+                hot_replica_guard: None,
+                protect_source_on_remote_complete,
+            })
+            .await
+        {
+            Ok(()) => Ok(true),
             Err(err) => {
                 tracing::warn!(
-                    "replica append task actor enqueue failed; dropping replica task: key={} put_id=({},{}) err={}",
+                    "replica append task actor queue closed; local-only commit remains valid: key={} put_id=({},{}) err={}",
                     key,
                     put_id.0,
                     put_id.1,
                     err
                 );
-                Ok(())
+                Ok(false)
             }
         }
     }
@@ -1460,14 +1808,23 @@ impl ClientKvApiInner {
         .await
     }
 
-    pub async fn reserve_local_grant(&self) -> KvResult<ReserveLocalGrantResp> {
+    pub async fn reserve_local_grant(
+        &self,
+        slot_size: u64,
+        required_free_slots: u32,
+        reclaim_before_grow: bool,
+    ) -> KvResult<ReserveLocalGrantOutcome> {
         if !self.view.register_shutdown_poller().is_running() {
             return Err(KvError::Api(ApiError::SystemShutdown {
                 detail: "ClientKvApi is shutting down; rejecting reserve_local_grant".to_string(),
             }));
         }
         let req = MsgPack {
-            serialize_part: ReserveLocalGrantReq::default(),
+            serialize_part: ReserveLocalGrantReq {
+                slot_size,
+                required_free_slots,
+                reclaim_before_grow,
+            },
             raw_bytes: Vec::new(),
         };
         let master_node_id = self
@@ -1490,7 +1847,12 @@ impl ClientKvApiInner {
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
         )?;
-        Ok(resp.serialize_part)
+        match resp.serialize_part.outcome {
+            ReserveLocalGrantOutcome::None => Err(KvError::Api(ApiError::Unknown {
+                detail: "reserve_local_grant returned success without an outcome".to_string(),
+            })),
+            outcome => Ok(outcome),
+        }
     }
 
     pub async fn release_local_grant(&self, grant_id: u64) -> KvResult<()> {
@@ -1571,6 +1933,8 @@ impl ClientKvApiInner {
         put_id: PutIDForAKey,
         len: u32,
         preferred_sub_cluster: Option<&str>,
+        demote_source_on_remote_complete: bool,
+        protect_source_on_remote_complete: bool,
     ) -> KvResult<PutAppendStartResp> {
         if !self.view.register_shutdown_poller().is_running() {
             return Err(KvError::Api(ApiError::SystemShutdown {
@@ -1583,6 +1947,8 @@ impl ClientKvApiInner {
                 put_id,
                 len: len as u64,
                 preferred_sub_cluster: preferred_sub_cluster.map(|s| s.to_string()),
+                demote_source_on_remote_complete,
+                protect_source_on_remote_complete,
             },
             raw_bytes: Vec::new(),
         };
@@ -1897,6 +2263,56 @@ impl ClientKvApiInner {
         Ok(resp.serialize_part)
     }
 
+    pub async fn grouped_batch_put_done(
+        &self,
+        items: Vec<GroupedBatchPutDoneItemReq>,
+        atomic_group_lens: Vec<usize>,
+    ) -> KvResult<GroupedBatchPutDoneResp> {
+        if items.is_empty() {
+            return Ok(GroupedBatchPutDoneResp {
+                items: Vec::new(),
+                error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
+                error_json: String::new(),
+                server_process_us: 0,
+            });
+        }
+        if !self.view.register_shutdown_poller().is_running() {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: "ClientKvApi is shutting down; rejecting grouped_batch_put_done"
+                    .to_string(),
+            }));
+        }
+        let req = MsgPack {
+            serialize_part: GroupedBatchPutDoneReq {
+                items,
+                atomic_group_lens,
+            },
+            raw_bytes: Vec::new(),
+        };
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let resp = self
+            .rpc_caller_grouped_batch_put_done
+            .call_with_transport_policy(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                req,
+                Some(std::time::Duration::from_secs(60)),
+                RpcTransportPolicy::ForceTransport,
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json.clone(),
+        )?;
+        Ok(resp.serialize_part)
+    }
+
     /// 完成 Put 操作，提交数据（inner，无监控）
     pub async fn put_end_inner(
         &self,
@@ -1916,6 +2332,7 @@ impl ClientKvApiInner {
                 lease_id,
                 committed_slot: None,
                 publish_local_cache: false,
+                atomic_group: None,
             },
             raw_bytes: Vec::new(),
         };
@@ -1971,6 +2388,7 @@ impl ClientKvApiInner {
                 lease_id,
                 committed_slot: None,
                 publish_local_cache,
+                atomic_group: None,
             },
             raw_bytes: Vec::new(),
         };
@@ -2068,12 +2486,327 @@ impl ClientKvApiInner {
     }
 }
 
+const OWNER_HOT_APPEND_START_MAX_ATTEMPTS: usize = 3;
+
+fn replica_append_demotes_source_on_remote_complete(is_owner_hot: bool) -> bool {
+    // Owner-hot eviction is an exclusive tier transition after the remote cohort is recoverable.
+    // Ordinary replica and tier-1 append tasks remain inclusive.
+    is_owner_hot
+}
+
+#[cfg(test)]
+mod owner_hot_replica_policy_tests {
+    use super::{
+        OwnerLocalPublishItem, complete_owner_local_publish_group_lens,
+        replica_append_demotes_source_on_remote_complete,
+    };
+    use crate::master_kv_router::msg_pack::{
+        PutAtomicGroup, PutAtomicGroupMember, PutDoneCommittedSlot,
+    };
+
+    #[test]
+    fn owner_hot_replication_is_exclusive_after_remote_completion() {
+        assert!(replica_append_demotes_source_on_remote_complete(true));
+        assert!(!replica_append_demotes_source_on_remote_complete(false));
+    }
+
+    fn publish_item(
+        key: &str,
+        put_id: (u64, u32),
+        atomic_group: Option<PutAtomicGroup>,
+    ) -> OwnerLocalPublishItem {
+        OwnerLocalPublishItem {
+            key: key.to_string(),
+            put_id,
+            value_len: 1,
+            lease_id: None,
+            committed_slot: PutDoneCommittedSlot::default(),
+            make_replica_task: false,
+            preferred_sub_cluster: None,
+            atomic_group,
+        }
+    }
+
+    #[test]
+    fn grouped_publish_partition_requires_a_complete_ordered_group() {
+        let group = PutAtomicGroup {
+            members: vec![
+                PutAtomicGroupMember {
+                    key: "a".to_string(),
+                    put_id: (1, 0),
+                },
+                PutAtomicGroupMember {
+                    key: "b".to_string(),
+                    put_id: (1, 1),
+                },
+                PutAtomicGroupMember {
+                    key: "c".to_string(),
+                    put_id: (1, 2),
+                },
+            ],
+        };
+        let complete = vec![
+            publish_item("a", (1, 0), Some(group.clone())),
+            publish_item("b", (1, 1), Some(group.clone())),
+            publish_item("c", (1, 2), Some(group.clone())),
+            publish_item("single", (2, 0), None),
+        ];
+        assert_eq!(
+            complete_owner_local_publish_group_lens(&complete),
+            Some(vec![3, 1])
+        );
+
+        let partial = vec![
+            publish_item("a", (1, 0), Some(group.clone())),
+            publish_item("b", (1, 1), Some(group)),
+        ];
+        assert_eq!(complete_owner_local_publish_group_lens(&partial), None);
+    }
+}
+
+async fn start_replica_append_with_retry(
+    inner: &ClientKvApiInner,
+    job: &ReplicaTaskJob,
+    len: u32,
+) -> KvResult<PutAppendStartResp> {
+    let max_attempts = if job.hot_replica_guard.is_some() {
+        OWNER_HOT_APPEND_START_MAX_ATTEMPTS
+    } else {
+        1
+    };
+    let mut attempt = 1usize;
+    loop {
+        match inner
+            .put_append_start(
+                &job.key,
+                job.put_id,
+                len,
+                job.preferred_sub_cluster.as_deref(),
+                replica_append_demotes_source_on_remote_complete(job.hot_replica_guard.is_some()),
+                job.protect_source_on_remote_complete,
+            )
+            .await
+        {
+            Ok(resp) => return Ok(resp),
+            Err(err)
+                if attempt < max_attempts
+                    && matches!(err, KvError::Api(ApiError::KeyBeingWritten { .. })) =>
+            {
+                tracing::warn!(
+                    "owner hot replica append start failed; retrying: key={} put_id=({},{}) attempt={}/{} err={}",
+                    job.key,
+                    job.put_id.0,
+                    job.put_id.1,
+                    attempt,
+                    max_attempts,
+                    err
+                );
+                let delay_ms = 25u64.saturating_mul(1u64 << (attempt - 1));
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+pub fn spawn_owner_hot_replica_dispatcher(
+    view: ClientKvApiView,
+    mut rx: tokio::sync::ampsc::Receiver<OwnerHotEvictionEvent>,
+) {
+    let view_task = view.clone();
+    let _ = view.spawn("owner_hot_replica_dispatcher", async move {
+        let mut shutdown_waiter = view_task.register_shutdown_waiter();
+        loop {
+            let event = tokio::select! {
+                _ = shutdown_waiter.wait() => {
+                    tracing::info!("owner_hot_replica_dispatcher stopping due to shutdown signal");
+                    break;
+                }
+                event = rx.recv() => {
+                    match event {
+                        Some(event) => event,
+                        None => break,
+                    }
+                }
+            };
+            let inner = view_task.client_kv_api().inner();
+            let Some(memory_info) = event.memory_info.upgrade() else {
+                event.guard.mark_obsolete();
+                continue;
+            };
+            if !inner.owner_hot_source_is_current(
+                &event.key,
+                event.put_id,
+                &memory_info,
+            ) {
+                event.guard.mark_obsolete();
+                continue;
+            }
+            let holder = Arc::new(UserMemHolder::new(
+                memory_info,
+                inner.get_or_init_all_memholder_refcount(),
+                UserMemHolderExposeKind::SegPtr,
+            ));
+            let key = event.key.clone();
+            let put_id = event.put_id;
+            if let Err(err) = inner
+                .replica_task_tx
+                .send(ReplicaTaskJob {
+                    key: event.key,
+                    put_id: event.put_id,
+                    holder,
+                    target: None,
+                    preferred_sub_cluster: None,
+                    hot_replica_guard: Some(event.guard),
+                    protect_source_on_remote_complete: false,
+                })
+                .await
+            {
+                tracing::warn!(
+                    "replica task actor queue closed for owner hot eviction: key={} put_id=({},{}) err={}",
+                    key,
+                    put_id.0,
+                    put_id.1,
+                    err
+                );
+            }
+        }
+    });
+}
+
+async fn process_replica_task(view_task: ClientKvApiView, job: ReplicaTaskJob) {
+    let inner = view_task.client_kv_api().inner();
+    let src_offset = job.holder.memory_info().offset;
+    let len = job.holder.get_length() as u64;
+    let target = if let Some(target) = job.target.clone() {
+        target
+    } else {
+        let len_u32 = match u32::try_from(len) {
+            Ok(len_u32) => len_u32,
+            Err(_) => {
+                tracing::warn!(
+                    "replica append task length does not fit u32: key={} put_id=({},{}) len={}",
+                    job.key,
+                    job.put_id.0,
+                    job.put_id.1,
+                    len
+                );
+                return;
+            }
+        };
+        let append_start = match start_replica_append_with_retry(inner, &job, len_u32).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::warn!(
+                    "replica append task start failed: key={} put_id=({},{}) err={}",
+                    job.key,
+                    job.put_id.0,
+                    job.put_id.1,
+                    err
+                );
+                return;
+            }
+        };
+        if !append_start.scheduled {
+            tracing::debug!(
+                "replica append task not scheduled: key={} put_id=({},{})",
+                job.key,
+                job.put_id.0,
+                job.put_id.1
+            );
+            if let Some(guard) = job.hot_replica_guard.as_ref() {
+                guard.mark_already_satisfied();
+            }
+            return;
+        }
+        ReplicaTaskTarget {
+            node_id: append_start.node_id,
+            target_offset: append_start.target_addr - append_start.target_base_addr,
+            target_base_addr: append_start.target_base_addr,
+            len: append_start.len,
+        }
+    };
+    if len != target.len {
+        tracing::warn!(
+            "replica task length mismatch: key={} put_id=({},{}) src_len={} target_len={}",
+            job.key,
+            job.put_id.0,
+            job.put_id.1,
+            len,
+            target.len
+        );
+        spawn_replica_task_revoke(view_task.clone(), job.key, job.put_id, "length mismatch");
+        return;
+    }
+    if let Err(err) = inner
+        .put_transfer(
+            &job.key,
+            job.put_id,
+            src_offset,
+            target.target_offset,
+            len,
+            Some(target.node_id.clone()),
+            Some(target.target_base_addr),
+        )
+        .await
+    {
+        tracing::warn!(
+            "replica task transfer failed: key={} put_id=({},{}) err={}",
+            job.key,
+            job.put_id.0,
+            job.put_id.1,
+            err
+        );
+        spawn_replica_task_revoke(view_task.clone(), job.key, job.put_id, "transfer error");
+        return;
+    }
+    // Append-done may reclaim the source synchronously. Release the transfer-only holder first so
+    // this task does not make its own reclaim look busy.
+    drop(job.holder);
+    match inner.put_append_done(&job.key, job.put_id).await {
+        Ok(resp) => {
+            tracing::debug!(
+                "replica task append done: key={} put_id=({},{}) appended={}",
+                job.key,
+                job.put_id.0,
+                job.put_id.1,
+                resp.appended
+            );
+            if let Some(guard) = job.hot_replica_guard.as_ref() {
+                if resp.appended {
+                    guard.mark_completed();
+                } else {
+                    guard.mark_already_satisfied();
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                "replica task append done failed: key={} put_id=({},{}) err={}",
+                job.key,
+                job.put_id.0,
+                job.put_id.1,
+                err
+            );
+        }
+    }
+}
+
 pub fn spawn_replica_task_actor(
     view: ClientKvApiView,
     mut rx: tokio::sync::ampsc::Receiver<ReplicaTaskJob>,
+    max_inflight: usize,
 ) {
     let view_task = view.clone();
     let _ = view.spawn("replica_task_actor", async move {
+        let max_inflight = max_inflight.max(1);
+        let semaphore = Arc::new(::tokio::sync::Semaphore::new(max_inflight));
+        let per_key = Arc::new(SemaphoreMap::new(1, Duration::from_secs(10 * 60)));
+        tracing::info!(
+            max_inflight,
+            "replica task actor started with bounded cross-key concurrency"
+        );
         let mut shutdown_waiter = view_task.register_shutdown_waiter();
         loop {
             let job = tokio::select! {
@@ -2088,123 +2821,65 @@ pub fn spawn_replica_task_actor(
                     }
                 }
             };
-            let inner = view_task.client_kv_api().inner();
-            let src_offset = job.holder.memory_info().offset;
-            let len = job.holder.get_length() as u64;
-            let target = if let Some(target) = job.target.clone() {
-                target
-            } else {
-                let len_u32 = match u32::try_from(len) {
-                    Ok(len_u32) => len_u32,
-                    Err(_) => {
-                        tracing::warn!(
-                            "replica append task length does not fit u32: key={} put_id=({},{}) len={}",
-                            job.key,
-                            job.put_id.0,
-                            job.put_id.1,
-                            len
-                        );
-                        continue;
-                    }
-                };
-                let append_start = match inner
-                    .put_append_start(
-                        &job.key,
-                        job.put_id,
-                        len_u32,
-                        job.preferred_sub_cluster.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(resp) => resp,
-                    Err(err) => {
-                        tracing::warn!(
-                            "replica append task start failed: key={} put_id=({},{}) err={}",
-                            job.key,
-                            job.put_id.0,
-                            job.put_id.1,
-                            err
-                        );
-                        continue;
-                    }
-                };
-                if !append_start.scheduled {
-                    tracing::debug!(
-                        "replica append task not scheduled: key={} put_id=({},{})",
-                        job.key,
-                        job.put_id.0,
-                        job.put_id.1
-                    );
-                    continue;
-                }
-                ReplicaTaskTarget {
-                    node_id: append_start.node_id,
-                    target_offset: append_start.target_addr - append_start.target_base_addr,
-                    target_base_addr: append_start.target_base_addr,
-                    len: append_start.len,
-                }
-            };
-            if len != target.len {
-                tracing::warn!(
-                    "replica task length mismatch: key={} put_id=({},{}) src_len={} target_len={}",
-                    job.key,
-                    job.put_id.0,
-                    job.put_id.1,
-                    len,
-                    target.len
-                );
-                spawn_replica_task_revoke(
-                    view_task.clone(),
-                    job.key,
-                    job.put_id,
-                    "length mismatch",
-                );
-                continue;
-            }
-            if let Err(err) = inner
-                .put_transfer(
-                    &job.key,
-                    job.put_id,
-                    src_offset,
-                    target.target_offset,
-                    len,
-                    Some(target.node_id.clone()),
-                    Some(target.target_base_addr),
-                )
-                .await
-            {
-                tracing::warn!(
-                    "replica task transfer failed: key={} put_id=({},{}) err={}",
-                    job.key,
-                    job.put_id.0,
-                    job.put_id.1,
-                    err
-                );
-                spawn_replica_task_revoke(view_task.clone(), job.key, job.put_id, "transfer error");
-                continue;
-            }
-            match inner.put_append_done(&job.key, job.put_id).await {
-                Ok(resp) => {
-                    tracing::debug!(
-                        "replica task append done: key={} put_id=({},{}) appended={}",
-                        job.key,
-                        job.put_id.0,
-                        job.put_id.1,
-                        resp.appended
-                    );
-                }
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
                 Err(err) => {
                     tracing::warn!(
-                        "replica task append done failed: key={} put_id=({},{}) err={}",
-                        job.key,
-                        job.put_id.0,
-                        job.put_id.1,
+                        "replica task actor semaphore closed; dropping queued work: err={}",
                         err
                     );
+                    break;
                 }
-            }
+            };
+            let spawn_view = view_task.clone();
+            let worker_view = view_task.clone();
+            let worker_per_key = per_key.clone();
+            spawn_view.spawn("replica_task_worker", async move {
+                let _permit = permit;
+                let _key_permit = worker_per_key.acquire(job.key.clone()).await;
+                process_replica_task(worker_view, job).await;
+            });
         }
     });
+}
+
+pub async fn handle_batch_enqueue_replica_tasks(
+    view: &ClientKvApiView,
+    req: MsgPack<BatchEnqueueReplicaTaskReq>,
+) -> MsgPack<BatchEnqueueReplicaTaskResp> {
+    let inner = view.client_kv_api().inner();
+    let mut items = Vec::with_capacity(req.serialize_part.items.len());
+    for item in req.serialize_part.items {
+        let accepted = match inner
+            .make_replica_append_task(&item.key, item.put_id, None, false)
+            .await
+        {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                tracing::warn!(
+                    "tier1 write-back enqueue failed: key={} put_id=({},{}) err={}",
+                    item.key,
+                    item.put_id.0,
+                    item.put_id.1,
+                    err
+                );
+                false
+            }
+        };
+        items.push(EnqueueReplicaTaskItemResp {
+            key: item.key,
+            put_id: item.put_id,
+            accepted,
+        });
+    }
+    MsgPack {
+        serialize_part: BatchEnqueueReplicaTaskResp {
+            items,
+            error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
+            error_json: String::new(),
+        },
+        raw_bytes: Vec::new(),
+    }
 }
 
 pub fn spawn_owner_local_publish_dispatcher(
@@ -2251,6 +2926,42 @@ pub fn spawn_owner_local_publish_dispatcher(
     });
 }
 
+/// Returns the linear group partition only when every multi-key group is present,
+/// contiguous, and in the caller-declared member order. A partial batch must use
+/// the legacy per-item descriptors so the V2 wire format never changes semantics.
+fn complete_owner_local_publish_group_lens(items: &[OwnerLocalPublishItem]) -> Option<Vec<usize>> {
+    let mut offset = 0usize;
+    let mut group_lens = Vec::new();
+    while offset < items.len() {
+        let item = &items[offset];
+        let Some(group) = item.atomic_group.as_ref() else {
+            group_lens.push(1);
+            offset += 1;
+            continue;
+        };
+        let group_len = group.members.len();
+        if group_len < 2 {
+            return None;
+        }
+        let end = offset.checked_add(group_len)?;
+        let group_items = items.get(offset..end)?;
+        if group_items
+            .iter()
+            .zip(group.members.iter())
+            .any(|(group_item, member)| {
+                group_item.key != member.key
+                    || group_item.put_id != member.put_id
+                    || group_item.atomic_group.as_ref() != Some(group)
+            })
+        {
+            return None;
+        }
+        group_lens.push(group_len);
+        offset = end;
+    }
+    Some(group_lens)
+}
+
 async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLocalPublishJob) {
     let inner = view.client_kv_api().inner();
     if job.items.is_empty() {
@@ -2258,21 +2969,58 @@ async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLocalPublishJo
         return;
     }
 
-    let done_req_items = job
-        .items
-        .iter()
-        .map(|item| BatchPutDoneItemReq {
-            key: item.key.clone(),
-            put_id: item.put_id,
-            lease_id: item.lease_id,
-            committed_slot: Some(item.committed_slot.clone()),
-            publish_local_cache: false,
-        })
-        .collect::<Vec<_>>();
+    let group_lens = complete_owner_local_publish_group_lens(&job.items);
+    let done_items = if let Some(atomic_group_lens) = group_lens {
+        inner
+            .owner_hot_counters
+            .grouped_put_done_batches
+            .fetch_add(1, Ordering::Relaxed);
+        inner
+            .owner_hot_counters
+            .grouped_put_done_items
+            .fetch_add(job.items.len() as u64, Ordering::Relaxed);
+        let items = job
+            .items
+            .iter()
+            .map(|item| GroupedBatchPutDoneItemReq {
+                key: item.key.clone(),
+                put_id: item.put_id,
+                lease_id: item.lease_id,
+                committed_slot: Some(item.committed_slot.clone()),
+                publish_local_cache: false,
+            })
+            .collect::<Vec<_>>();
+        inner
+            .grouped_batch_put_done(items, atomic_group_lens)
+            .await
+            .map(|resp| resp.items)
+    } else {
+        inner
+            .owner_hot_counters
+            .legacy_put_done_batches
+            .fetch_add(1, Ordering::Relaxed);
+        inner
+            .owner_hot_counters
+            .legacy_put_done_items
+            .fetch_add(job.items.len() as u64, Ordering::Relaxed);
+        let items = job
+            .items
+            .iter()
+            .map(|item| BatchPutDoneItemReq {
+                key: item.key.clone(),
+                put_id: item.put_id,
+                lease_id: item.lease_id,
+                committed_slot: Some(item.committed_slot.clone()),
+                publish_local_cache: false,
+                atomic_group: item.atomic_group.clone(),
+            })
+            .collect::<Vec<_>>();
+        inner.batch_put_done(items).await.map(|resp| resp.items)
+    };
 
-    match inner.batch_put_done(done_req_items).await {
-        Ok(done_resp) if done_resp.items.len() == job.items.len() => {
-            for (item, done_item) in job.items.iter().zip(done_resp.items.into_iter()) {
+    match done_items {
+        Ok(done_items) if done_items.len() == job.items.len() => {
+            for (item, done_item) in job.items.iter().zip(done_items.into_iter()) {
                 if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
                     done_item.error_code,
                     done_item.error_json.clone(),
@@ -2292,6 +3040,7 @@ async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLocalPublishJo
                             &item.key,
                             item.put_id,
                             item.preferred_sub_cluster.clone(),
+                            true,
                         )
                         .await
                     {
@@ -2306,11 +3055,11 @@ async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLocalPublishJo
                 }
             }
         }
-        Ok(done_resp) => {
+        Ok(done_items) => {
             tracing::warn!(
                 "owner local publish response length mismatch: expected={} got={}",
                 job.items.len(),
-                done_resp.items.len()
+                done_items.len()
             );
         }
         Err(err) => {

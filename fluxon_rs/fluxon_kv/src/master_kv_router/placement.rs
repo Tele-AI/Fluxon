@@ -391,7 +391,7 @@ fn no_space_error(last_no_space_ctx: Option<NoSpaceCtx>) -> KvError {
     }
 }
 
-fn member_matches_roles(member: Option<&ClusterMember>, roles: &[String]) -> bool {
+pub(super) fn member_matches_roles(member: Option<&ClusterMember>, roles: &[String]) -> bool {
     let Some(member) = member else {
         return false;
     };

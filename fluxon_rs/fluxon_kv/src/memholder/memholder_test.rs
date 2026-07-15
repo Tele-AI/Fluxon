@@ -59,6 +59,8 @@ fn new_master_config(
         pprof_duration_seconds: None,
         master_ui: None,
         replica_task_placement: ReplicaTaskPlacementConfig::default(),
+        replica_cache_capacity_ratio: crate::config::DEFAULT_REPLICA_CACHE_CAPACITY_RATIO,
+        replica_writeback_tier1_capacity_ratio: None,
         test_spec_config: TestSpecConfig::default(),
     }
 }
@@ -89,6 +91,7 @@ fn new_client_config_with_size(
             rdma_device_names: None,
         },
         pprof_duration_seconds: None,
+        replica_writeback_hot_capacity_ratio: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: vec![etcd.to_string()],
@@ -124,6 +127,7 @@ fn new_zero_contribution_client_config(
             rdma_device_names: None,
         },
         pprof_duration_seconds: None,
+        replica_writeback_hot_capacity_ratio: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: Vec::new(),
@@ -242,6 +246,7 @@ pub mod test_memholder {
         new_master_config, new_zero_contribution_client_config, read_etcd, unique_cluster_name,
         wait_node_allocators, wait_weak_drop,
     };
+    use crate::memholder::{MemholderManagerTrait, NodeHolderKey};
     use crate::{ConfigArg, run_client, run_master};
     use std::time::{Duration, Instant};
     use tokio::time::sleep;
@@ -588,10 +593,16 @@ pub mod test_memholder {
             .unwrap()
             .unwrap();
         let ext_hold_holder_id = eh1.holder_id;
-        // Note: master's get_holding is keyed by the requesting node of the inner owner get
-        // for external GET, the owner performs an inner get, so the node is the owner
+        let ext_hold_owner_holder_id = owner_api
+            .inner()
+            .external_get_holding
+            .inner_map()
+            .get(&NodeHolderKey::new(external_id.clone(), ext_hold_holder_id))
+            .expect("capture ext_hold owner holding")
+            .memory_info
+            .holder_id;
         let ext_hold_weak =
-            capture_master_holding_allocation(&master_view, &owner_id, ext_hold_holder_id)
+            capture_master_holding_allocation(&master_view, &owner_id, ext_hold_owner_holder_id)
                 .expect("capture ext_hold weak");
         drop(eh2);
 
@@ -608,9 +619,19 @@ pub mod test_memholder {
             .unwrap()
             .unwrap();
         let ext_release_holder_id = er1.holder_id;
-        // Similar rationale as above: use owner_id when capturing master's holding entry
+        let ext_release_owner_holder_id = owner_api
+            .inner()
+            .external_get_holding
+            .inner_map()
+            .get(&NodeHolderKey::new(
+                external_id.clone(),
+                ext_release_holder_id,
+            ))
+            .expect("capture ext_release owner holding")
+            .memory_info
+            .holder_id;
         let ext_release_weak =
-            capture_master_holding_allocation(&master_view, &owner_id, ext_release_holder_id)
+            capture_master_holding_allocation(&master_view, &owner_id, ext_release_owner_holder_id)
                 .expect("capture ext_release weak");
         drop(er1);
         drop(er2); // drop all for release key

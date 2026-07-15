@@ -1,4 +1,4 @@
-use super::{ClientKvApiInner, GetCachedInfo, KvMetrics};
+use super::{ClientKvApiInner, KvMetrics};
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::memholder::{MemoryInfo, UserMemHolder, UserMemHolderExposeKind};
 // no StageScope; timestamps-based metrics only
@@ -266,16 +266,17 @@ impl ClientKvApiInner {
                 peer_is_src_or_target: pending.peer_is_remote,
             };
             if done_item.allocation_mode != GetAllocationMode::Temporary {
-                self.get_cached_info.insert(
-                    pending.key.clone(),
-                    GetCachedInfo {
-                        put_time_ms: pending.start_item.put_id.0,
-                        put_version: pending.start_item.put_id.1,
-                        mem_holder: memory_info.clone(),
-                    },
-                );
-                self.remember_local_snapshot(&pending.key, pending.start_item.put_id);
-                metrics.observe_cache_value_size(&client_id, node_role.as_str(), data_len as u64);
+                if self.install_get_cached_info_if_unfenced(
+                    &pending.key,
+                    pending.start_item.put_id,
+                    memory_info.clone(),
+                ) {
+                    metrics.observe_cache_value_size(
+                        &client_id,
+                        node_role.as_str(),
+                        data_len as u64,
+                    );
+                }
             }
             let user_mem_holder = Arc::new(UserMemHolder::new(
                 memory_info,
@@ -549,16 +550,17 @@ impl ClientKvApiInner {
                 peer_is_src_or_target: pending.peer_is_remote,
             };
             if done_item.allocation_mode != GetAllocationMode::Temporary {
-                self.get_cached_info.insert(
-                    pending.key.clone(),
-                    GetCachedInfo {
-                        put_time_ms: pending.start_item.put_id.0,
-                        put_version: pending.start_item.put_id.1,
-                        mem_holder: memory_info.clone(),
-                    },
-                );
-                self.remember_local_snapshot(&pending.key, pending.start_item.put_id);
-                metrics.observe_cache_value_size(&client_id, node_role.as_str(), data_len as u64);
+                if self.install_get_cached_info_if_unfenced(
+                    &pending.key,
+                    pending.start_item.put_id,
+                    memory_info.clone(),
+                ) {
+                    metrics.observe_cache_value_size(
+                        &client_id,
+                        node_role.as_str(),
+                        data_len as u64,
+                    );
+                }
             }
             let user_mem_holder = Arc::new(UserMemHolder::new(
                 memory_info,
@@ -933,16 +935,9 @@ impl ClientKvApiInner {
         };
 
         if done_resp.allocation_mode != GetAllocationMode::Temporary {
-            self.get_cached_info.insert(
-                key.to_string(),
-                GetCachedInfo {
-                    put_time_ms: put_id.0,
-                    put_version: put_id.1,
-                    mem_holder: memory_info.clone(),
-                },
-            );
-            self.remember_local_snapshot(key, put_id);
-            metrics.observe_cache_value_size(&client_id, node_role.as_str(), data_len as u64);
+            if self.install_get_cached_info_if_unfenced(key, put_id, memory_info.clone()) {
+                metrics.observe_cache_value_size(&client_id, node_role.as_str(), data_len as u64);
+            }
         }
         let user_mem_holder = Arc::new(UserMemHolder::new(
             memory_info,

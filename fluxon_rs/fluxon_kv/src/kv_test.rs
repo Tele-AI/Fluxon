@@ -993,6 +993,8 @@ fn new_master_launch(
             log_dir,
             master_ui: None,
             replica_task_placement: ReplicaTaskPlacementConfig::default(),
+            replica_cache_capacity_ratio: crate::config::DEFAULT_REPLICA_CACHE_CAPACITY_RATIO,
+            replica_writeback_tier1_capacity_ratio: None,
             // Keep kv_test self-describing: each round carries the intended transfer mode.
             test_spec_config: kv_test_round_test_spec_config(round.round_profile),
         },
@@ -1032,6 +1034,7 @@ fn build_client_launch(
         contribute_to_cluster_pool_size: contribute_to_cluster_pool_size.clone(),
         protocol: options.protocol_config.unwrap_or_else(tcp_protocol_config),
         pprof_duration_seconds: None,
+        replica_writeback_hot_capacity_ratio: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: fluxonkv_etcd_addresses,

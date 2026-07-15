@@ -1297,6 +1297,8 @@ pub mod rpc {
         timeout: Option<std::time::Duration>,
         transport_policy: RpcTransportPolicy,
     ) -> P2PResult<MsgPack<REQ::Resp>> {
+        validate_explicit_rpc_timeout(timeout)?;
+
         let mut failed_count = 0;
         let shutdown_poller = p2p.module_view().register_shutdown_poller();
 
@@ -1371,6 +1373,8 @@ pub mod rpc {
         timeout: Option<std::time::Duration>,
         transport_policy: RpcTransportPolicy,
     ) -> P2PResult<RpcCallObservedOutput<REQ::Resp>> {
+        validate_explicit_rpc_timeout(timeout)?;
+
         regist_rpc_send::<REQ>(p2p);
 
         {
@@ -1381,31 +1385,12 @@ pub mod rpc {
                 .await?;
         }
 
-        let timeout_duration = match timeout {
-            Some(duration) => {
-                let min_duration = Duration::from_secs(MIN_EXPLICIT_RPC_TIMEOUT_SECS);
-                if duration < min_duration {
-                    return Err(P2pError::InvalidRpcTimeout {
-                        timeout_ms: duration.as_secs() * 1_000
-                            + u64::from(duration.subsec_millis()),
-                        min_timeout_ms: MIN_EXPLICIT_RPC_TIMEOUT_SECS * 1_000,
-                        reason: format!(
-                            "Explicit RPC timeout below {}s is forbidden.",
-                            MIN_EXPLICIT_RPC_TIMEOUT_SECS
-                        ),
-                    });
-                }
-                Some(duration)
-            }
-            None => None,
-        };
-
         let wire_encode_started_at = Instant::now();
         let msg_id = req.msg_id();
         let wire_body = req.into_wire_body()?;
         let wire_encode_us = duration_to_i64_us(wire_encode_started_at.elapsed());
         let raw_output = p2p
-            .call_raw_observed(node, msg_id, wire_body, timeout_duration, transport_policy)
+            .call_raw_observed(node, msg_id, wire_body, timeout, transport_policy)
             .await?;
         let response_local_observe = raw_output.message.local_observe;
         let resp_decode_started_at = Instant::now();

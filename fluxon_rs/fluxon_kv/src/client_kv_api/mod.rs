@@ -13,16 +13,18 @@ use crate::client_kv_api::msg_pack::{
     ExternalPutStartReq, ExternalPutStartResp, ExternalPutTransferEndReq,
     ExternalPutTransferEndResp, SyncKvToFileReq, SyncKvToFileResp, TestPutPhaseTrace,
 };
+use crate::client_kv_api::reclaim::handle_batch_owner_reclaim;
 use crate::cluster_manager::{NodeID, NodeIDString};
 use crate::config::TestSpecConfig;
 use crate::master_kv_router::msg_pack::{
-    BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchGetDoneReq, BatchGetRevokeReq,
-    BatchGetStartItemResp, BatchGetStartReq, BatchIsExistReq, BatchPreparePutKeysReq,
-    BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq,
-    CountPrefixReq, DeleteClientKvMetaCacheItem,
+    BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchEnqueueReplicaTaskReq,
+    BatchGetDoneReq, BatchGetRevokeReq, BatchGetStartItemResp, BatchGetStartReq, BatchIsExistReq,
+    BatchOwnerReclaimReq, BatchPreparePutKeysReq, BatchPutDoneReq, BatchPutRevokeReq,
+    BatchPutStartReq, BatchReleasePutKeyReservationsReq, CountPrefixReq,
+    DeleteClientKvMetaCacheItem, GroupedBatchPutDoneReq,
 };
 use crate::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
-use crate::memholder::{AllMemholderRefCount, MemoryInfo, UserMemHolder};
+use crate::memholder::{AllMemholderRefCount, ExternalMemHolderInfo, MemoryInfo, UserMemHolder};
 use crate::memholder::{
     EnsureMemholderMgmtDeleteHandle, MemholderManagerTrait, NodeHolderKey, OwnerDeleteAckItem,
     OwnerDeleteAckMemMgr, OwnerExternalMemMgr,
@@ -49,11 +51,13 @@ use crate::{
 };
 use async_trait::async_trait;
 use crossbeam::queue::SegQueue;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use fluxon_framework::{LogicalModule, define_module};
 use fluxon_framework_compiled::upgrade_view_guard::UpgradeViewGuard;
 use fluxon_util::map_lock::AMapLock;
 use limit_thirdparty::tokio;
+use moka::notification::RemovalCause;
+use moka::ops::compute::Op as MokaComputeOp;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -64,6 +68,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 const REPLICA_TASK_QUEUE_CAPACITY: usize = 128;
+// Queue only weak source references. This preserves a deep policy backlog without turning queued
+// write-back work into non-reclaimable owner memory; the dispatcher pins a still-current source
+// immediately before handing it to the bounded replica-task actor.
+const OWNER_HOT_EVICTION_QUEUE_CAPACITY: usize = 4096;
 const OWNER_LOCAL_PUBLISH_QUEUE_CAPACITY: usize = 4096;
 const OWNER_LOCAL_PUBLISH_MAX_INFLIGHT: usize = 64;
 
@@ -80,12 +88,37 @@ pub struct OwnerRuntimeObserveSnapshot {
     pub external_get_holding_entries: u64,
     pub external_get_holding_bytes: u64,
     pub external_pending_put_entries: u64,
+    pub hot_cache_capacity_bytes: u64,
+    pub hot_cache_entries: u64,
+    pub hot_cache_weighted_bytes: u64,
+    pub hot_size_evictions: u64,
+    pub hot_replica_enqueued: u64,
+    pub hot_replica_completed: u64,
+    pub hot_replica_already_satisfied: u64,
+    pub hot_replica_failed: u64,
+    pub hot_replica_obsolete: u64,
+    pub hot_replica_dispatch_failed: u64,
+    pub hot_replica_inflight: u64,
+    pub hot_eviction_skipped_stale: u64,
+    pub hot_eviction_skipped_reclaim: u64,
+    pub hot_eviction_skipped_duplicate: u64,
+    pub hot_group_registry_entries: u64,
+    pub hot_group_replica_triggered: u64,
+    pub hot_group_replica_triggers: u64,
+    pub hot_group_members_enqueued: u64,
+    pub hot_group_trigger_duplicates: u64,
+    pub hot_group_trigger_incomplete: u64,
+    pub grouped_put_done_batches: u64,
+    pub grouped_put_done_items: u64,
+    pub legacy_put_done_batches: u64,
+    pub legacy_put_done_items: u64,
 }
 
 pub use get::RemoteGetInfo;
 pub use put::{OwnerLocalPublishItem, OwnerLocalPublishJob, OwnerReservedPutItem};
 pub mod external_api;
 mod local_reserve_rebalance;
+mod reclaim;
 pub use external_api::HandlerForExternalClient;
 pub type TestObservePutPhaseSink = Arc<Mutex<Option<TestPutPhaseTrace>>>;
 pub type ExternalGetStartTransferOutput =
@@ -153,6 +186,8 @@ pub struct ExternalGetStartSharedState {
 pub struct ExternalGetStartSharedOp {
     pub dedup_key: ExternalGetStartDedupKey,
     pub transfer_concurrency: usize,
+    /// Set only when every requested page is already owner-local.
+    pub inline_local_memory_infos: OnceLock<Vec<Arc<MemoryInfo>>>,
     pub state: Mutex<ExternalGetStartSharedState>,
     pub notify: Arc<limit_thirdparty::tokio::sync::Notify>,
 }
@@ -162,6 +197,7 @@ impl ExternalGetStartSharedOp {
         Self {
             dedup_key,
             transfer_concurrency,
+            inline_local_memory_infos: OnceLock::new(),
             state: Mutex::new(ExternalGetStartSharedState {
                 waiter_count: 1,
                 phase: ExternalGetStartSharedPhase::Starting,
@@ -1079,6 +1115,8 @@ define_module!(
 #[derive(Clone, Debug)]
 pub struct ClientKvApiNewArg {
     pub test_spec_config: TestSpecConfig,
+    /// Logical hot-tier capacity only. This does not resize the owner segment.
+    pub owner_hot_cache_capacity_bytes: Option<u64>,
 }
 
 pub struct ClientKvApi(ClientKvApiInner);
@@ -1101,24 +1139,646 @@ pub(crate) struct LocalSnapshotInfo {
     put_version: u32,
 }
 
-impl GetCachedInfo {
-    fn version_matches(&self, put_time_ms: u64, put_version: u32) -> bool {
-        if self.put_time_ms == put_time_ms {
-            self.put_version <= put_version
-        } else {
-            self.put_time_ms <= put_time_ms
+#[derive(Clone)]
+struct OwnerHotCacheEntry {
+    put_id: crate::master_kv_router::put::PutIDForAKey,
+    memory_info: Weak<MemoryInfo>,
+    weight_bytes: u32,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct OwnerHotReplicaIdentity {
+    key: String,
+    put_time_ms: u64,
+    put_version: u32,
+}
+
+impl OwnerHotReplicaIdentity {
+    fn from_group_member(member: &crate::master_kv_router::msg_pack::PutAtomicGroupMember) -> Self {
+        Self {
+            key: member.key.clone(),
+            put_time_ms: member.put_id.0,
+            put_version: member.put_id.1,
         }
     }
 }
 
-impl LocalSnapshotInfo {
-    fn version_matches(&self, put_time_ms: u64, put_version: u32) -> bool {
-        if self.put_time_ms == put_time_ms {
-            self.put_version <= put_version
-        } else {
-            self.put_time_ms <= put_time_ms
+#[derive(Default)]
+struct OwnerHotCacheCounters {
+    size_evictions: AtomicU64,
+    replica_enqueued: AtomicU64,
+    replica_completed: AtomicU64,
+    replica_already_satisfied: AtomicU64,
+    replica_failed: AtomicU64,
+    replica_obsolete: AtomicU64,
+    replica_dispatch_failed: AtomicU64,
+    skipped_stale: AtomicU64,
+    skipped_reclaim: AtomicU64,
+    skipped_duplicate: AtomicU64,
+    group_replica_triggers: AtomicU64,
+    group_members_enqueued: AtomicU64,
+    group_trigger_duplicates: AtomicU64,
+    group_trigger_incomplete: AtomicU64,
+    grouped_put_done_batches: AtomicU64,
+    grouped_put_done_items: AtomicU64,
+    legacy_put_done_batches: AtomicU64,
+    legacy_put_done_items: AtomicU64,
+}
+
+const OWNER_HOT_REPLICA_OUTCOME_PENDING: u32 = 0;
+const OWNER_HOT_REPLICA_OUTCOME_RECORDED: u32 = 1;
+
+pub(crate) struct OwnerHotReplicaGuard {
+    identity: OwnerHotReplicaIdentity,
+    inflight: Arc<DashSet<OwnerHotReplicaIdentity>>,
+    counters: Arc<OwnerHotCacheCounters>,
+    group_trigger: Option<OwnerHotReplicaIdentity>,
+    group_replica_triggered: Arc<DashSet<OwnerHotReplicaIdentity>>,
+    outcome: AtomicU32,
+}
+
+impl OwnerHotReplicaGuard {
+    fn new(
+        identity: OwnerHotReplicaIdentity,
+        inflight: Arc<DashSet<OwnerHotReplicaIdentity>>,
+        counters: Arc<OwnerHotCacheCounters>,
+        group_trigger: Option<OwnerHotReplicaIdentity>,
+        group_replica_triggered: Arc<DashSet<OwnerHotReplicaIdentity>>,
+    ) -> Self {
+        Self {
+            identity,
+            inflight,
+            counters,
+            group_trigger,
+            group_replica_triggered,
+            outcome: AtomicU32::new(OWNER_HOT_REPLICA_OUTCOME_PENDING),
         }
     }
+
+    fn release_group_trigger(&self) {
+        if let Some(group_trigger) = self.group_trigger.as_ref() {
+            self.group_replica_triggered.remove(group_trigger);
+        }
+    }
+
+    pub(crate) fn mark_completed(&self) {
+        if self
+            .outcome
+            .compare_exchange(
+                OWNER_HOT_REPLICA_OUTCOME_PENDING,
+                OWNER_HOT_REPLICA_OUTCOME_RECORDED,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.counters
+                .replica_completed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn mark_already_satisfied(&self) {
+        if self
+            .outcome
+            .compare_exchange(
+                OWNER_HOT_REPLICA_OUTCOME_PENDING,
+                OWNER_HOT_REPLICA_OUTCOME_RECORDED,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.counters
+                .replica_already_satisfied
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn mark_obsolete(&self) {
+        if self
+            .outcome
+            .compare_exchange(
+                OWNER_HOT_REPLICA_OUTCOME_PENDING,
+                OWNER_HOT_REPLICA_OUTCOME_RECORDED,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.counters
+                .replica_obsolete
+                .fetch_add(1, Ordering::Relaxed);
+            self.release_group_trigger();
+        }
+    }
+
+    fn mark_dispatch_failed(&self) {
+        if self
+            .outcome
+            .compare_exchange(
+                OWNER_HOT_REPLICA_OUTCOME_PENDING,
+                OWNER_HOT_REPLICA_OUTCOME_RECORDED,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.counters
+                .replica_dispatch_failed
+                .fetch_add(1, Ordering::Relaxed);
+            self.release_group_trigger();
+        }
+    }
+}
+
+impl Drop for OwnerHotReplicaGuard {
+    fn drop(&mut self) {
+        if self.outcome.load(Ordering::Relaxed) == OWNER_HOT_REPLICA_OUTCOME_PENDING {
+            self.counters.replica_failed.fetch_add(1, Ordering::Relaxed);
+            self.release_group_trigger();
+        }
+        self.inflight.remove(&self.identity);
+    }
+}
+
+pub(crate) struct OwnerHotEvictionEvent {
+    key: String,
+    put_id: crate::master_kv_router::put::PutIDForAKey,
+    memory_info: Weak<MemoryInfo>,
+    guard: OwnerHotReplicaGuard,
+}
+
+pub(crate) struct OwnerPreparedReclaim {
+    item: crate::master_kv_router::msg_pack::OwnerReclaimItem,
+    cached_info: GetCachedInfo,
+    local_snapshot: Option<LocalSnapshotInfo>,
+}
+
+pub(crate) enum OwnerReclaimRecord {
+    Prepared(OwnerPreparedReclaim),
+    Committed(crate::master_kv_router::msg_pack::OwnerReclaimItem),
+}
+
+#[derive(Default)]
+pub(crate) struct OwnerKeyControlState {
+    local_puts: u32,
+    reclaim: Option<OwnerReclaimRecord>,
+}
+
+fn resolve_local_visible_batch<T>(
+    keys: &[String],
+    controls: &HashMap<String, OwnerKeyControlState>,
+    mut resolve_unfenced: impl FnMut(&str) -> Option<T>,
+) -> Vec<Option<T>> {
+    keys.iter()
+        .map(|key| {
+            if controls
+                .get(key)
+                .is_some_and(|state| state.reclaim.is_some())
+            {
+                None
+            } else {
+                resolve_unfenced(key)
+            }
+        })
+        .collect()
+}
+
+fn allocate_external_holding_id(counter: &AtomicU64) -> u64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("external holding id space exhausted")
+}
+
+fn owner_hot_weight_bytes(memory_info: &MemoryInfo) -> u32 {
+    let bytes = memory_info
+        .local_reserve_resident_slot_ref()
+        .map(|(slot_size, _, _)| slot_size)
+        .unwrap_or(memory_info.len as u64);
+    u32::try_from(bytes).unwrap_or(u32::MAX)
+}
+
+fn clone_if_owner_hot_entry_matches<T>(
+    current_put_id: crate::master_kv_router::put::PutIDForAKey,
+    current: &Arc<T>,
+    entry_put_id: crate::master_kv_router::put::PutIDForAKey,
+    entry: &Weak<T>,
+) -> Option<Arc<T>> {
+    (current_put_id == entry_put_id && Weak::ptr_eq(entry, &Arc::downgrade(current)))
+        .then(|| current.clone())
+}
+
+fn pin_current_owner_hot_source(
+    key: &str,
+    entry: &OwnerHotCacheEntry,
+    owner_key_control: &Mutex<HashMap<String, OwnerKeyControlState>>,
+    get_cached_info: &DashMap<String, GetCachedInfo>,
+    counters: &OwnerHotCacheCounters,
+) -> Option<Arc<MemoryInfo>> {
+    let controls = owner_key_control.lock();
+    if controls
+        .get(key)
+        .is_some_and(|state| state.reclaim.is_some())
+    {
+        counters.skipped_reclaim.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let Some(cached) = get_cached_info.get(key) else {
+        counters.skipped_stale.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let Some(pinned) = clone_if_owner_hot_entry_matches(
+        (cached.put_time_ms, cached.put_version),
+        &cached.mem_holder,
+        entry.put_id,
+        &entry.memory_info,
+    ) else {
+        counters.skipped_stale.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+
+    // This clone is made under the same key fence used by reclaim. If reclaim
+    // wins first the source is absent/fenced; if this clone wins, reclaim sees
+    // the additional strong reference and returns Busy.
+    Some(pinned)
+}
+
+fn owner_hot_group_anchor_identity(
+    group: &crate::master_kv_router::msg_pack::PutAtomicGroup,
+) -> Option<OwnerHotReplicaIdentity> {
+    group
+        .members
+        .first()
+        .map(OwnerHotReplicaIdentity::from_group_member)
+}
+
+fn register_owner_hot_atomic_group(
+    atomic_groups: &DashMap<
+        OwnerHotReplicaIdentity,
+        Arc<crate::master_kv_router::msg_pack::PutAtomicGroup>,
+    >,
+    group: &crate::master_kv_router::msg_pack::PutAtomicGroup,
+) {
+    let Some(anchor) = owner_hot_group_anchor_identity(group) else {
+        return;
+    };
+    let existing = atomic_groups
+        .get(&anchor)
+        .map(|entry| entry.value().clone());
+    let group = match existing {
+        Some(existing) if existing.as_ref() == group => existing,
+        Some(_) => {
+            tracing::warn!(
+                "owner hot atomic-group anchor reused with different membership: key={} put_id=({},{})",
+                anchor.key,
+                anchor.put_time_ms,
+                anchor.put_version
+            );
+            Arc::new(group.clone())
+        }
+        None => Arc::new(group.clone()),
+    };
+    for member in &group.members {
+        atomic_groups.insert(
+            OwnerHotReplicaIdentity::from_group_member(member),
+            group.clone(),
+        );
+    }
+}
+
+fn forget_owner_hot_atomic_group(
+    atomic_groups: &DashMap<
+        OwnerHotReplicaIdentity,
+        Arc<crate::master_kv_router::msg_pack::PutAtomicGroup>,
+    >,
+    group_replica_triggered: &DashSet<OwnerHotReplicaIdentity>,
+    identity: &OwnerHotReplicaIdentity,
+) {
+    let group = atomic_groups
+        .get(identity)
+        .map(|entry| entry.value().clone());
+    let Some(group) = group else {
+        return;
+    };
+    if let Some(anchor) = owner_hot_group_anchor_identity(group.as_ref()) {
+        group_replica_triggered.remove(&anchor);
+    }
+    for member in &group.members {
+        atomic_groups.remove(&OwnerHotReplicaIdentity::from_group_member(member));
+    }
+}
+
+fn pin_current_owner_hot_group_sources(
+    group: &crate::master_kv_router::msg_pack::PutAtomicGroup,
+    owner_key_control: &Mutex<HashMap<String, OwnerKeyControlState>>,
+    get_cached_info: &DashMap<String, GetCachedInfo>,
+    counters: &OwnerHotCacheCounters,
+) -> Option<Vec<(OwnerHotReplicaIdentity, Arc<MemoryInfo>)>> {
+    let controls = owner_key_control.lock();
+    let mut sources = Vec::with_capacity(group.members.len());
+    for member in &group.members {
+        if controls
+            .get(&member.key)
+            .is_some_and(|state| state.reclaim.is_some())
+        {
+            counters.skipped_reclaim.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let Some(cached) = get_cached_info.get(&member.key) else {
+            counters.skipped_stale.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        if (cached.put_time_ms, cached.put_version) != member.put_id {
+            counters.skipped_stale.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        sources.push((
+            OwnerHotReplicaIdentity::from_group_member(member),
+            cached.mem_holder.clone(),
+        ));
+    }
+    Some(sources)
+}
+
+fn owner_hot_tp_cohort_key_rows(
+    identity: &OwnerHotReplicaIdentity,
+    group: Option<&crate::master_kv_router::msg_pack::PutAtomicGroup>,
+) -> Result<Option<Vec<Vec<String>>>, ()> {
+    let member_keys = group
+        .map(|group| {
+            group
+                .members
+                .iter()
+                .map(|member| member.key.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![identity.key.as_str()]);
+    let Some(first_key) = member_keys.first().copied() else {
+        return Err(());
+    };
+    let first_tp = crate::master_kv_router::infer_sglang_tp_key(first_key);
+    let Some(first_tp) = first_tp else {
+        return member_keys
+            .iter()
+            .all(|key| crate::master_kv_router::infer_sglang_tp_key(key).is_none())
+            .then_some(None)
+            .ok_or(());
+    };
+    let mut logical_members = Vec::with_capacity(member_keys.len());
+    for key in member_keys {
+        let Some(member_tp) = crate::master_kv_router::infer_sglang_tp_key(key) else {
+            return Err(());
+        };
+        if member_tp.rank != first_tp.rank || member_tp.size != first_tp.size {
+            return Err(());
+        }
+        logical_members.push(member_tp.logical_prefix.to_string());
+    }
+    if first_tp.size == 1 {
+        return Ok(None);
+    }
+    Ok(Some(
+        (0..first_tp.size)
+            .map(|rank| {
+                logical_members
+                    .iter()
+                    .map(|logical_prefix| format!("{logical_prefix}_{rank}_{}", first_tp.size))
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+    ))
+}
+
+fn pin_current_owner_hot_tp_cohort_sources(
+    cohort_key_rows: &[Vec<String>],
+    expect_atomic_group: bool,
+    owner_key_control: &Mutex<HashMap<String, OwnerKeyControlState>>,
+    get_cached_info: &DashMap<String, GetCachedInfo>,
+    atomic_groups: &DashMap<
+        OwnerHotReplicaIdentity,
+        Arc<crate::master_kv_router::msg_pack::PutAtomicGroup>,
+    >,
+    counters: &OwnerHotCacheCounters,
+) -> Option<Vec<(OwnerHotReplicaIdentity, Arc<MemoryInfo>)>> {
+    let controls = owner_key_control.lock();
+    let mut cohort_sources = Vec::new();
+    for rank_keys in cohort_key_rows {
+        if rank_keys.is_empty() {
+            return None;
+        }
+        let mut rank_sources = Vec::with_capacity(rank_keys.len());
+        for key in rank_keys {
+            if controls
+                .get(key)
+                .is_some_and(|state| state.reclaim.is_some())
+            {
+                counters.skipped_reclaim.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            let Some(cached) = get_cached_info.get(key) else {
+                counters.skipped_stale.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            rank_sources.push((
+                OwnerHotReplicaIdentity {
+                    key: key.clone(),
+                    put_time_ms: cached.put_time_ms,
+                    put_version: cached.put_version,
+                },
+                cached.mem_holder.clone(),
+            ));
+        }
+
+        if expect_atomic_group {
+            let Some(rank_group) = atomic_groups
+                .get(&rank_sources[0].0)
+                .map(|entry| entry.value().clone())
+            else {
+                return None;
+            };
+            if rank_group.members.len() != rank_sources.len()
+                || rank_group.members.iter().zip(rank_sources.iter()).any(
+                    |(member, (identity, _))| {
+                        member.key != identity.key
+                            || member.put_id != (identity.put_time_ms, identity.put_version)
+                    },
+                )
+            {
+                return None;
+            }
+            for (identity, _) in &rank_sources {
+                if !atomic_groups
+                    .get(identity)
+                    .is_some_and(|entry| Arc::ptr_eq(entry.value(), &rank_group))
+                {
+                    return None;
+                }
+            }
+        } else if rank_sources.len() != 1 || atomic_groups.contains_key(&rank_sources[0].0) {
+            return None;
+        }
+        cohort_sources.extend(rank_sources);
+    }
+    Some(cohort_sources)
+}
+
+fn try_enqueue_owner_hot_replica_event(
+    identity: OwnerHotReplicaIdentity,
+    memory_info: Arc<MemoryInfo>,
+    group_trigger: Option<OwnerHotReplicaIdentity>,
+    inflight: &Arc<DashSet<OwnerHotReplicaIdentity>>,
+    group_replica_triggered: &Arc<DashSet<OwnerHotReplicaIdentity>>,
+    counters: &Arc<OwnerHotCacheCounters>,
+    eviction_tx: &tokio::sync::ampsc::Sender<OwnerHotEvictionEvent>,
+) -> bool {
+    if !inflight.insert(identity.clone()) {
+        counters.skipped_duplicate.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let event = OwnerHotEvictionEvent {
+        key: identity.key.clone(),
+        put_id: (identity.put_time_ms, identity.put_version),
+        memory_info: Arc::downgrade(&memory_info),
+        guard: OwnerHotReplicaGuard::new(
+            identity,
+            inflight.clone(),
+            counters.clone(),
+            group_trigger,
+            group_replica_triggered.clone(),
+        ),
+    };
+    match eviction_tx.try_send(event) {
+        Ok(()) => {
+            counters.replica_enqueued.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(err) => {
+            let event = err.into_inner();
+            tracing::warn!(
+                "owner hot-cache eviction actor is closed; replica event dropped: key={} put_id=({},{})",
+                event.key,
+                event.put_id.0,
+                event.put_id.1
+            );
+            event.guard.mark_dispatch_failed();
+            false
+        }
+    }
+}
+
+fn build_owner_hot_cache(
+    capacity_bytes: u64,
+    owner_key_control: Arc<Mutex<HashMap<String, OwnerKeyControlState>>>,
+    get_cached_info: Arc<DashMap<String, GetCachedInfo>>,
+    inflight: Arc<DashSet<OwnerHotReplicaIdentity>>,
+    atomic_groups: Arc<
+        DashMap<OwnerHotReplicaIdentity, Arc<crate::master_kv_router::msg_pack::PutAtomicGroup>>,
+    >,
+    group_replica_triggered: Arc<DashSet<OwnerHotReplicaIdentity>>,
+    counters: Arc<OwnerHotCacheCounters>,
+    eviction_tx: tokio::sync::ampsc::Sender<OwnerHotEvictionEvent>,
+) -> moka::sync::Cache<String, OwnerHotCacheEntry> {
+    assert!(
+        capacity_bytes > 0,
+        "owner hot-cache capacity must be positive"
+    );
+    moka::sync::Cache::builder()
+        .max_capacity(capacity_bytes)
+        .weigher(|_key: &String, entry: &OwnerHotCacheEntry| entry.weight_bytes)
+        .eviction_listener(move |key, entry, cause| {
+            if cause != RemovalCause::Size {
+                return;
+            }
+            counters.size_evictions.fetch_add(1, Ordering::Relaxed);
+            let Some(memory_info) = pin_current_owner_hot_source(
+                key.as_str(),
+                &entry,
+                owner_key_control.as_ref(),
+                get_cached_info.as_ref(),
+                counters.as_ref(),
+            ) else {
+                return;
+            };
+            let identity = OwnerHotReplicaIdentity {
+                key: (*key).clone(),
+                put_time_ms: entry.put_id.0,
+                put_version: entry.put_id.1,
+            };
+            let group = atomic_groups
+                .get(&identity)
+                .map(|entry| entry.value().clone());
+            let cohort_sources = match owner_hot_tp_cohort_key_rows(&identity, group.as_deref()) {
+                Ok(Some(cohort_key_rows)) => pin_current_owner_hot_tp_cohort_sources(
+                    &cohort_key_rows,
+                    group.is_some(),
+                    owner_key_control.as_ref(),
+                    get_cached_info.as_ref(),
+                    atomic_groups.as_ref(),
+                    counters.as_ref(),
+                ),
+                Ok(None) => match group.as_deref() {
+                    Some(group) => pin_current_owner_hot_group_sources(
+                        group,
+                        owner_key_control.as_ref(),
+                        get_cached_info.as_ref(),
+                        counters.as_ref(),
+                    ),
+                    None => Some(vec![(identity.clone(), memory_info)]),
+                },
+                Err(()) => None,
+            };
+            let Some(cohort_sources) = cohort_sources else {
+                counters
+                    .group_trigger_incomplete
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            if cohort_sources.len() > 1 {
+                counters
+                    .group_replica_triggers
+                    .fetch_add(1, Ordering::Relaxed);
+                let mut enqueued = 0u64;
+                for (member_identity, member_memory_info) in cohort_sources {
+                    if try_enqueue_owner_hot_replica_event(
+                        member_identity,
+                        member_memory_info,
+                        None,
+                        &inflight,
+                        &group_replica_triggered,
+                        &counters,
+                        &eviction_tx,
+                    ) {
+                        enqueued = enqueued.saturating_add(1);
+                    }
+                }
+                counters
+                    .group_members_enqueued
+                    .fetch_add(enqueued, Ordering::Relaxed);
+                if enqueued == 0 {
+                    counters
+                        .group_trigger_duplicates
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
+            let (identity, memory_info) = cohort_sources
+                .into_iter()
+                .next()
+                .expect("owner hot cohort must contain its trigger source");
+            let _ = try_enqueue_owner_hot_replica_event(
+                identity,
+                memory_info,
+                None,
+                &inflight,
+                &group_replica_triggered,
+                &counters,
+                &eviction_tx,
+            );
+        })
+        .build()
 }
 
 struct ClientKvApiViewHolder {
@@ -1170,7 +1830,7 @@ pub struct ClientKvApiInner {
     pub get_remote_kv_lock: AMapLock<String>,
     /// key -> value info on this node
     /// we can only remove value if it's put_time_ms and put_version match remote eviction command
-    get_cached_info: DashMap<String, GetCachedInfo>,
+    get_cached_info: Arc<DashMap<String, GetCachedInfo>>,
     /// key -> locally readable resident slot before backend put_start/put_done finishes.
     precommit_local_visible_info: DashMap<String, PrecommitLocalVisibleInfo>,
     /// key -> local replica version remembered from local put/get durable-replica success.
@@ -1179,12 +1839,25 @@ pub struct ClientKvApiInner {
     local_snapshot_info: DashMap<String, LocalSnapshotInfo>,
     /// KvOwner-managed resident staging grants for hostless put_start.
     owner_local_reserve_pool: Mutex<OwnerLocalReservePoolState>,
+    /// Serialize reserve claims so a later waiter cannot steal slots reclaimed for the
+    /// waiter currently assembling a lease. Tokio's mutex provides FIFO acquisition order.
+    owner_local_reserve_claim_lock: limit_thirdparty::tokio::sync::AMutex<()>,
     /// Wake the background reserve actor after demand/free-slot changes.
     owner_local_reserve_rebalance_notify: Arc<limit_thirdparty::tokio::sync::Notify>,
     /// Owner-local write-back put ids for external local-first path.
     external_local_first_put_id_counter: AtomicU32,
-    /// Owner-local inflight write guard for external local-first path.
-    external_local_first_inflight_key_counts: DashMap<String, u32>,
+    /// Atomic owner-side gate for local-first puts, local index access, and reclaim fencing.
+    owner_key_control: Arc<Mutex<HashMap<String, OwnerKeyControlState>>>,
+    /// A weak-value admission/recency tier. It never owns resident memory and
+    /// therefore cannot become a second physical-reclaim authority.
+    owner_hot_cache: Option<moka::sync::Cache<String, OwnerHotCacheEntry>>,
+    owner_hot_replica_inflight: Arc<DashSet<OwnerHotReplicaIdentity>>,
+    owner_hot_atomic_groups: Arc<
+        DashMap<OwnerHotReplicaIdentity, Arc<crate::master_kv_router::msg_pack::PutAtomicGroup>>,
+    >,
+    owner_hot_group_replica_triggered: Arc<DashSet<OwnerHotReplicaIdentity>>,
+    owner_hot_counters: Arc<OwnerHotCacheCounters>,
+    owner_hot_eviction_rx: Mutex<Option<tokio::sync::ampsc::Receiver<OwnerHotEvictionEvent>>>,
 
     /// Shared delete actor input for owner -> external weak-index invalidation.
     pub external_invalidate_delete: EnsureMemholderMgmtDeleteHandle<DeleteClientKvMetaCacheItem>,
@@ -1198,6 +1871,8 @@ pub struct ClientKvApiInner {
     pub external_get_start_registry: DashMap<u64, Arc<ExternalGetStartEntry>>,
     pub external_get_start_by_key: DashMap<ExternalGetStartDedupKey, Arc<ExternalGetStartSharedOp>>,
     next_external_get_start_handle: AtomicU64,
+    /// External holding identities are independent from upstream and resident holder ids.
+    next_external_holding_id: AtomicU64,
     /// Weak handle to a shared refcount tracker for all UserMemHolder of this client.
     ///
     /// - A strong `Arc<AllMemholderRefCount>` is given to every `UserMemHolder` created by this client.
@@ -1222,6 +1897,7 @@ pub struct ClientKvApiInner {
     rpc_caller_batch_put_start: RPCCaller<BatchPutStartReq>,
     rpc_caller_batch_put_revoke: RPCCaller<BatchPutRevokeReq>,
     rpc_caller_batch_put_done: RPCCaller<BatchPutDoneReq>,
+    rpc_caller_grouped_batch_put_done: RPCCaller<GroupedBatchPutDoneReq>,
     rpc_caller_batch_prepare_put_keys: RPCCaller<BatchPreparePutKeysReq>,
     rpc_caller_batch_release_put_key_reservations: RPCCaller<BatchReleasePutKeyReservationsReq>,
     rpc_caller_put_append_start: RPCCaller<PutAppendStartReq>,
@@ -1255,6 +1931,112 @@ pub struct ClientKvApiInner {
 impl ClientKvApiInner {
     fn view(&self) -> &ClientKvApiView {
         &self.view
+    }
+
+    fn owner_hot_register_atomic_group(
+        &self,
+        group: &crate::master_kv_router::msg_pack::PutAtomicGroup,
+    ) {
+        register_owner_hot_atomic_group(self.owner_hot_atomic_groups.as_ref(), group);
+    }
+
+    fn owner_hot_forget_atomic_group_for_member(&self, identity: &OwnerHotReplicaIdentity) {
+        forget_owner_hot_atomic_group(
+            self.owner_hot_atomic_groups.as_ref(),
+            self.owner_hot_group_replica_triggered.as_ref(),
+            identity,
+        );
+    }
+
+    fn owner_hot_track_committed(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        memory_info: &Arc<MemoryInfo>,
+        atomic_group: Option<&crate::master_kv_router::msg_pack::PutAtomicGroup>,
+    ) {
+        let Some(cache) = self.owner_hot_cache.as_ref() else {
+            return;
+        };
+        if !self.owner_hot_source_is_current(key, put_id, memory_info) {
+            return;
+        }
+        if let Some(group) = atomic_group {
+            self.owner_hot_register_atomic_group(group);
+        }
+        cache.insert(
+            key.to_string(),
+            OwnerHotCacheEntry {
+                put_id,
+                memory_info: Arc::downgrade(memory_info),
+                weight_bytes: owner_hot_weight_bytes(memory_info.as_ref()),
+            },
+        );
+        if !self.owner_hot_source_is_current(key, put_id, memory_info) {
+            self.owner_hot_invalidate_version(key, put_id);
+        }
+    }
+
+    fn owner_hot_touch_or_promote(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        memory_info: &Arc<MemoryInfo>,
+    ) {
+        let Some(cache) = self.owner_hot_cache.as_ref() else {
+            return;
+        };
+        if cache.get(key).is_some_and(|entry| {
+            entry.put_id == put_id && Weak::ptr_eq(&entry.memory_info, &Arc::downgrade(memory_info))
+        }) {
+            return;
+        }
+        self.owner_hot_track_committed(key, put_id, memory_info, None);
+    }
+
+    pub(crate) fn owner_hot_source_is_current(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        memory_info: &Arc<MemoryInfo>,
+    ) -> bool {
+        let controls = self.owner_key_control.lock();
+        if controls
+            .get(key)
+            .is_some_and(|state| state.reclaim.is_some())
+        {
+            return false;
+        }
+        self.get_cached_info.get(key).is_some_and(|cached| {
+            cached.put_time_ms == put_id.0
+                && cached.put_version == put_id.1
+                && Arc::ptr_eq(&cached.mem_holder, memory_info)
+        })
+    }
+
+    pub(crate) fn owner_hot_invalidate_version(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+    ) {
+        let Some(cache) = self.owner_hot_cache.as_ref() else {
+            return;
+        };
+        let _ = cache.entry(key.to_string()).and_compute_with(|entry| {
+            if entry
+                .as_ref()
+                .is_some_and(|entry| entry.value().put_id == put_id)
+            {
+                MokaComputeOp::Remove
+            } else {
+                MokaComputeOp::Nop
+            }
+        });
+        self.owner_hot_forget_atomic_group_for_member(&OwnerHotReplicaIdentity {
+            key: key.to_string(),
+            put_time_ms: put_id.0,
+            put_version: put_id.1,
+        });
     }
 
     pub(crate) fn release_local_reserve_route_for_memory_info(&self, memory_info: &MemoryInfo) {
@@ -1322,32 +2104,51 @@ impl ClientKvApiInner {
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
     ) -> KvResult<()> {
-        if reject_if_exist_same_key && self.has_local_snapshot(key) {
-            return Err(KvError::Api(ApiError::KeyAlreadyExists {
-                key: key.to_string(),
-            }));
-        }
-        let mut entry = self
-            .external_local_first_inflight_key_counts
-            .entry(key.to_string())
-            .or_insert(0);
-        if reject_if_inflight_same_key && *entry > 0 {
+        let mut controls = self.owner_key_control.lock();
+        if controls
+            .get(key)
+            .is_some_and(|state| state.reclaim.is_some())
+        {
             return Err(KvError::Api(ApiError::KeyBeingWritten {
                 key: key.to_string(),
             }));
         }
-        *entry += 1;
+        if reject_if_exist_same_key
+            && (self.precommit_local_visible_info.contains_key(key)
+                || self.get_cached_info.contains_key(key)
+                || self.local_snapshot_info.contains_key(key))
+        {
+            return Err(KvError::Api(ApiError::KeyAlreadyExists {
+                key: key.to_string(),
+            }));
+        }
+        let state = controls.entry(key.to_string()).or_default();
+        if reject_if_inflight_same_key && state.local_puts > 0 {
+            return Err(KvError::Api(ApiError::KeyBeingWritten {
+                key: key.to_string(),
+            }));
+        }
+        state.local_puts = state
+            .local_puts
+            .checked_add(1)
+            .expect("owner local-first put counter overflow");
         Ok(())
     }
 
     pub(crate) fn release_external_local_first_put_key(&self, key: &str) {
-        if let Some(mut entry) = self.external_local_first_inflight_key_counts.get_mut(key) {
-            if *entry <= 1 {
-                drop(entry);
-                self.external_local_first_inflight_key_counts.remove(key);
-            } else {
-                *entry -= 1;
-            }
+        let mut controls = self.owner_key_control.lock();
+        let remove = {
+            let state = controls
+                .get_mut(key)
+                .expect("owner local-first put state missing on release");
+            state.local_puts = state
+                .local_puts
+                .checked_sub(1)
+                .expect("owner local-first put counter underflow");
+            state.local_puts == 0 && state.reclaim.is_none()
+        };
+        if remove {
+            controls.remove(key);
         }
     }
 
@@ -1356,6 +2157,19 @@ impl ClientKvApiInner {
         key: &str,
         put_id: crate::master_kv_router::put::PutIDForAKey,
     ) {
+        let controls = self.owner_key_control.lock();
+        if controls
+            .get(key)
+            .is_some_and(|state| state.reclaim.is_some())
+        {
+            tracing::debug!(
+                "skip local snapshot publication behind owner reclaim fence: key={} put_id=({},{})",
+                key,
+                put_id.0,
+                put_id.1
+            );
+            return;
+        }
         self.local_snapshot_info.insert(
             key.to_string(),
             LocalSnapshotInfo {
@@ -1366,29 +2180,133 @@ impl ClientKvApiInner {
     }
 
     pub(crate) fn has_local_snapshot(&self, key: &str) -> bool {
+        let controls = self.owner_key_control.lock();
+        if controls
+            .get(key)
+            .is_some_and(|state| state.reclaim.is_some())
+        {
+            return false;
+        }
         self.precommit_local_visible_info.contains_key(key)
             || self.get_cached_info.contains_key(key)
             || self.local_snapshot_info.contains_key(key)
     }
 
-    pub(crate) fn remove_local_snapshot_if(
-        &self,
-        key: &str,
-        put_time_ms: u64,
-        put_version: u32,
-    ) -> bool {
-        self.local_snapshot_info
-            .remove_if(key, |_, v| v.version_matches(put_time_ms, put_version))
-            .is_some()
+    pub(crate) fn local_visible_mem_holder(&self, key: &str) -> Option<Arc<MemoryInfo>> {
+        let (memory_info, hot_put_id) = {
+            let controls = self.owner_key_control.lock();
+            if controls
+                .get(key)
+                .is_some_and(|state| state.reclaim.is_some())
+            {
+                return None;
+            }
+            let memory_info = self.local_visible_mem_holder_unfenced(key);
+            let hot_put_id = memory_info.as_ref().and_then(|memory_info| {
+                self.get_cached_info
+                    .get(key)
+                    .filter(|cached| Arc::ptr_eq(&cached.mem_holder, memory_info))
+                    .map(|cached| (cached.put_time_ms, cached.put_version))
+            });
+            (memory_info, hot_put_id)
+        };
+        if let Some(put_id) = hot_put_id {
+            self.owner_hot_touch_or_promote(
+                key,
+                put_id,
+                memory_info
+                    .as_ref()
+                    .expect("hot touch requires a local memory holder"),
+            );
+        }
+        memory_info
     }
 
-    pub(crate) fn local_visible_mem_holder(&self, key: &str) -> Option<Arc<MemoryInfo>> {
+    pub(crate) fn local_committed_mem_holder_for_put_id(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+    ) -> Option<Arc<MemoryInfo>> {
+        let controls = self.owner_key_control.lock();
+        if controls
+            .get(key)
+            .is_some_and(|state| state.reclaim.is_some())
+        {
+            return None;
+        }
+        self.get_cached_info.get(key).and_then(|info| {
+            (info.put_time_ms == put_id.0 && info.put_version == put_id.1)
+                .then(|| info.mem_holder.clone())
+        })
+    }
+
+    fn local_visible_mem_holder_unfenced(&self, key: &str) -> Option<Arc<MemoryInfo>> {
         if let Some(info) = self.precommit_local_visible_info.get(key) {
             return Some(info.mem_holder.clone());
         }
         self.get_cached_info
             .get(key)
             .map(|info| info.mem_holder.clone())
+    }
+
+    pub(crate) fn local_visible_mem_holders(
+        &self,
+        keys: &[String],
+    ) -> Vec<Option<Arc<MemoryInfo>>> {
+        // A hostless get_start commonly checks hundreds of pages from one
+        // local prefix. Take one coherent reclaim-fence snapshot instead of
+        // locking owner_key_control once per page. The MemoryInfo Arcs keep
+        // any selected backing alive if reclaim begins after this snapshot.
+        let resolved = {
+            let controls = self.owner_key_control.lock();
+            resolve_local_visible_batch(keys, &controls, |key| {
+                let memory_info = self.local_visible_mem_holder_unfenced(key)?;
+                let hot_put_id = self
+                    .get_cached_info
+                    .get(key)
+                    .filter(|cached| Arc::ptr_eq(&cached.mem_holder, &memory_info))
+                    .map(|cached| (cached.put_time_ms, cached.put_version));
+                Some((memory_info, hot_put_id))
+            })
+        };
+        resolved
+            .into_iter()
+            .zip(keys)
+            .map(|(resolved, key)| {
+                let (memory_info, hot_put_id) = resolved?;
+                if let Some(put_id) = hot_put_id {
+                    self.owner_hot_touch_or_promote(key, put_id, &memory_info);
+                }
+                Some(memory_info)
+            })
+            .collect()
+    }
+
+    pub(crate) fn install_external_get_holding(
+        &self,
+        req_node_id: &str,
+        memory_info: Arc<MemoryInfo>,
+    ) -> ExternalMemHolderInfo {
+        let external_holder_id = allocate_external_holding_id(&self.next_external_holding_id);
+        let key = NodeHolderKey::new(req_node_id.to_string(), external_holder_id);
+        let external_memholder_info = ExternalMemHolderInfo {
+            offset: memory_info.offset,
+            len: memory_info.len,
+            holder_id: external_holder_id,
+        };
+        let previous = self.external_get_holding.inner().insert(
+            key,
+            ExternalHoldingGetInfo {
+                key: memory_info.key.clone(),
+                req_node_id: req_node_id.to_string(),
+                memory_info,
+            },
+        );
+        assert!(
+            previous.is_none(),
+            "fresh external holding id unexpectedly replaced a live holding"
+        );
+        external_memholder_info
     }
 
     pub async fn build_local_reserve_resident_memory_info(
@@ -1436,19 +2354,80 @@ impl ClientKvApiInner {
             )
             .await,
         );
-        let replaced = self.get_cached_info.insert(
-            key.to_string(),
-            GetCachedInfo {
-                put_time_ms: put_id.0,
-                put_version: put_id.1,
-                mem_holder: memory_info,
-            },
-        );
-        if let Some(previous) = replaced {
-            self.release_local_reserve_route_for_memory_info(previous.mem_holder.as_ref());
+        {
+            let controls = self.owner_key_control.lock();
+            if controls
+                .get(key)
+                .is_some_and(|state| state.reclaim.is_some())
+            {
+                return Err(KvError::Api(ApiError::KeyBeingWritten {
+                    key: key.to_string(),
+                }));
+            }
+            let replaced = self.get_cached_info.insert(
+                key.to_string(),
+                GetCachedInfo {
+                    put_time_ms: put_id.0,
+                    put_version: put_id.1,
+                    mem_holder: memory_info.clone(),
+                },
+            );
+            if let Some(previous) = replaced {
+                self.release_local_reserve_route_for_memory_info(previous.mem_holder.as_ref());
+            }
+            self.local_snapshot_info.insert(
+                key.to_string(),
+                LocalSnapshotInfo {
+                    put_time_ms: put_id.0,
+                    put_version: put_id.1,
+                },
+            );
         }
-        self.remember_local_snapshot(key, put_id);
+        self.owner_hot_track_committed(key, put_id, &memory_info, None);
         Ok(())
+    }
+
+    pub(crate) fn install_get_cached_info_if_unfenced(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        memory_info: Arc<MemoryInfo>,
+    ) -> bool {
+        {
+            let controls = self.owner_key_control.lock();
+            if controls
+                .get(key)
+                .is_some_and(|state| state.reclaim.is_some())
+            {
+                tracing::debug!(
+                    "skip get cache publication behind owner reclaim fence: key={} put_id=({},{})",
+                    key,
+                    put_id.0,
+                    put_id.1
+                );
+                return false;
+            }
+            let replaced = self.get_cached_info.insert(
+                key.to_string(),
+                GetCachedInfo {
+                    put_time_ms: put_id.0,
+                    put_version: put_id.1,
+                    mem_holder: memory_info.clone(),
+                },
+            );
+            if let Some(previous) = replaced {
+                self.release_local_reserve_route_for_memory_info(previous.mem_holder.as_ref());
+            }
+            self.local_snapshot_info.insert(
+                key.to_string(),
+                LocalSnapshotInfo {
+                    put_time_ms: put_id.0,
+                    put_version: put_id.1,
+                },
+            );
+        }
+        self.owner_hot_track_committed(key, put_id, &memory_info, None);
+        true
     }
 
     pub fn install_precommit_local_visible_memory_info(
@@ -1456,6 +2435,13 @@ impl ClientKvApiInner {
         key: &str,
         memory_info: Arc<MemoryInfo>,
     ) {
+        let controls = self.owner_key_control.lock();
+        assert!(
+            !controls
+                .get(key)
+                .is_some_and(|state| state.reclaim.is_some()),
+            "precommit local index publication must not cross an owner reclaim fence"
+        );
         let (slot_size, grant_id, slot_index) = memory_info
             .local_reserve_resident_slot_ref()
             .expect("resident memory_info must carry local reserve slot ref");
@@ -1480,6 +2466,7 @@ impl ClientKvApiInner {
         key: &str,
         expected_mem_holder: &Arc<MemoryInfo>,
     ) -> bool {
+        let _controls = self.owner_key_control.lock();
         self.precommit_local_visible_info
             .remove_if(key, |_, info| {
                 Arc::ptr_eq(&info.mem_holder, expected_mem_holder)
@@ -1492,50 +2479,69 @@ impl ClientKvApiInner {
         key: &str,
         put_id: crate::master_kv_router::put::PutIDForAKey,
         memory_info: Arc<MemoryInfo>,
+        atomic_group: Option<&crate::master_kv_router::msg_pack::PutAtomicGroup>,
     ) -> KvResult<()> {
-        let is_same_pending = self
-            .precommit_local_visible_info
-            .get(key)
-            .map(|info| Arc::ptr_eq(&info.mem_holder, &memory_info))
-            .unwrap_or(false);
-        if !is_same_pending {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "precommit local visible cache missing while promoting key={}",
-                    key
-                ),
-            }));
+        {
+            let controls = self.owner_key_control.lock();
+            if controls
+                .get(key)
+                .is_some_and(|state| state.reclaim.is_some())
+            {
+                return Err(KvError::Api(ApiError::KeyBeingWritten {
+                    key: key.to_string(),
+                }));
+            }
+            let is_same_pending = self
+                .precommit_local_visible_info
+                .get(key)
+                .map(|info| Arc::ptr_eq(&info.mem_holder, &memory_info))
+                .unwrap_or(false);
+            if !is_same_pending {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "precommit local visible cache missing while promoting key={}",
+                        key
+                    ),
+                }));
+            }
+            let (slot_size, grant_id, slot_index) = memory_info
+                .local_reserve_resident_slot_ref()
+                .expect("resident memory_info must carry local reserve slot ref");
+            self.owner_promote_local_reserve_pending_slot_to_committed(
+                slot_size, grant_id, slot_index,
+            )?;
+            let removed = self
+                .precommit_local_visible_info
+                .remove_if(key, |_, info| Arc::ptr_eq(&info.mem_holder, &memory_info))
+                .is_some();
+            if !removed {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "precommit local visible cache disappeared while promoting key={}",
+                        key
+                    ),
+                }));
+            }
+            let replaced = self.get_cached_info.insert(
+                key.to_string(),
+                GetCachedInfo {
+                    put_time_ms: put_id.0,
+                    put_version: put_id.1,
+                    mem_holder: memory_info.clone(),
+                },
+            );
+            if let Some(previous) = replaced {
+                self.release_local_reserve_route_for_memory_info(previous.mem_holder.as_ref());
+            }
+            self.local_snapshot_info.insert(
+                key.to_string(),
+                LocalSnapshotInfo {
+                    put_time_ms: put_id.0,
+                    put_version: put_id.1,
+                },
+            );
         }
-        let (slot_size, grant_id, slot_index) = memory_info
-            .local_reserve_resident_slot_ref()
-            .expect("resident memory_info must carry local reserve slot ref");
-        self.owner_promote_local_reserve_pending_slot_to_committed(
-            slot_size, grant_id, slot_index,
-        )?;
-        let removed = self
-            .precommit_local_visible_info
-            .remove_if(key, |_, info| Arc::ptr_eq(&info.mem_holder, &memory_info))
-            .is_some();
-        if !removed {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "precommit local visible cache disappeared while promoting key={}",
-                    key
-                ),
-            }));
-        }
-        let replaced = self.get_cached_info.insert(
-            key.to_string(),
-            GetCachedInfo {
-                put_time_ms: put_id.0,
-                put_version: put_id.1,
-                mem_holder: memory_info,
-            },
-        );
-        if let Some(previous) = replaced {
-            self.release_local_reserve_route_for_memory_info(previous.mem_holder.as_ref());
-        }
-        self.remember_local_snapshot(key, put_id);
+        self.owner_hot_track_committed(key, put_id, &memory_info, atomic_group);
         Ok(())
     }
 }
@@ -1552,6 +2558,7 @@ pub struct ExternalPendingPutCtx {
     pub replica_target: Option<ReplicaTaskTarget>,
     pub local_reserve_slot: Option<OwnerLocalReserveSlotRef>,
     pub local_reserve_slot_size: Option<u64>,
+    pub atomic_group: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
 }
 
 #[derive(Debug, Clone)]
@@ -1562,13 +2569,14 @@ pub(crate) struct ReplicaTaskTarget {
     pub len: u64,
 }
 
-#[derive(Clone)]
 pub(crate) struct ReplicaTaskJob {
     pub key: String,
     pub put_id: crate::master_kv_router::put::PutIDForAKey,
     pub holder: Arc<UserMemHolder>,
     pub target: Option<ReplicaTaskTarget>,
     pub preferred_sub_cluster: Option<String>,
+    pub hot_replica_guard: Option<OwnerHotReplicaGuard>,
+    pub protect_source_on_remote_complete: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1821,6 +2829,7 @@ pub(crate) struct OwnerLocalReserveClassState {
     pub grants: Vec<OwnerLocalReserveGrantState>,
     pub last_grow_at: Option<Instant>,
     pub pending_slot_demand: usize,
+    pub expected_grant_count: usize,
 }
 
 impl OwnerLocalReserveClassState {
@@ -1831,6 +2840,7 @@ impl OwnerLocalReserveClassState {
             grants: Vec::new(),
             last_grow_at: None,
             pending_slot_demand: 0,
+            expected_grant_count: 0,
         }
     }
 
@@ -1847,6 +2857,297 @@ impl OwnerLocalReserveClassState {
 
     pub fn grant_count(&self) -> usize {
         self.grants.len()
+    }
+}
+
+#[cfg(test)]
+mod owner_reclaim_slot_tests {
+    use super::{
+        GetCachedInfo, OwnerHotCacheCounters, OwnerHotCacheEntry, OwnerHotReplicaGuard,
+        OwnerHotReplicaIdentity, OwnerKeyControlState, OwnerLocalReserveGrantState,
+        OwnerReclaimRecord, allocate_external_holding_id, build_owner_hot_cache,
+        clone_if_owner_hot_entry_matches, forget_owner_hot_atomic_group,
+        owner_hot_tp_cohort_key_rows, register_owner_hot_atomic_group, resolve_local_visible_batch,
+    };
+    use crate::master_kv_router::msg_pack::{
+        OwnerReclaimItem, PutAtomicGroup, PutAtomicGroupMember,
+    };
+    use dashmap::{DashMap, DashSet};
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Weak};
+
+    #[test]
+    fn external_holding_ids_are_nonzero_and_unique_for_resident_pages() {
+        let counter = AtomicU64::new(1);
+        let first = allocate_external_holding_id(&counter);
+        let second = allocate_external_holding_id(&counter);
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn hot_source_pin_requires_the_same_version_and_allocation() {
+        let current = Arc::new(7u64);
+        let current_weak = Arc::downgrade(&current);
+        let other = Arc::new(7u64);
+        let other_weak = Arc::downgrade(&other);
+
+        let pinned = clone_if_owner_hot_entry_matches((10, 2), &current, (10, 2), &current_weak)
+            .expect("matching source should be pinned");
+        assert!(Arc::ptr_eq(&pinned, &current));
+        assert_eq!(Arc::strong_count(&current), 2);
+        drop(pinned);
+
+        assert!(
+            clone_if_owner_hot_entry_matches((10, 2), &current, (10, 3), &current_weak).is_none()
+        );
+        assert!(
+            clone_if_owner_hot_entry_matches((10, 2), &current, (10, 2), &other_weak).is_none()
+        );
+    }
+
+    #[test]
+    fn hot_replica_guard_keeps_dedup_until_terminal_outcome() {
+        let identity = OwnerHotReplicaIdentity {
+            key: "hot-key".to_string(),
+            put_time_ms: 10,
+            put_version: 2,
+        };
+        let inflight = Arc::new(DashSet::new());
+        assert!(inflight.insert(identity.clone()));
+        let counters = Arc::new(OwnerHotCacheCounters::default());
+        let group_replica_triggered = Arc::new(DashSet::new());
+        let guard = OwnerHotReplicaGuard::new(
+            identity.clone(),
+            inflight.clone(),
+            counters.clone(),
+            None,
+            group_replica_triggered,
+        );
+        assert!(inflight.contains(&identity));
+
+        guard.mark_completed();
+        drop(guard);
+        assert!(!inflight.contains(&identity));
+        assert_eq!(counters.replica_completed.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.replica_failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn hot_atomic_group_registry_interns_members_and_forgets_as_one_unit() {
+        let group = PutAtomicGroup {
+            members: vec![
+                PutAtomicGroupMember {
+                    key: "group-a".to_string(),
+                    put_id: (10, 1),
+                },
+                PutAtomicGroupMember {
+                    key: "group-b".to_string(),
+                    put_id: (10, 2),
+                },
+            ],
+        };
+        let atomic_groups = DashMap::new();
+        register_owner_hot_atomic_group(&atomic_groups, &group);
+        register_owner_hot_atomic_group(&atomic_groups, &group);
+        assert_eq!(atomic_groups.len(), 2);
+
+        let first = OwnerHotReplicaIdentity::from_group_member(&group.members[0]);
+        let second = OwnerHotReplicaIdentity::from_group_member(&group.members[1]);
+        let first_group = atomic_groups.get(&first).unwrap().value().clone();
+        let second_group = atomic_groups.get(&second).unwrap().value().clone();
+        assert!(Arc::ptr_eq(&first_group, &second_group));
+
+        let triggered = DashSet::new();
+        assert!(triggered.insert(first.clone()));
+        forget_owner_hot_atomic_group(&atomic_groups, &triggered, &second);
+        assert!(atomic_groups.is_empty());
+        assert!(!triggered.contains(&first));
+    }
+
+    #[test]
+    fn owner_hot_tp_cohort_expands_the_same_group_boundary_across_ranks() {
+        let identity = OwnerHotReplicaIdentity {
+            key: "page0_model_0_2".to_string(),
+            put_time_ms: 10,
+            put_version: 1,
+        };
+        let rank0_group = PutAtomicGroup {
+            members: vec![
+                PutAtomicGroupMember {
+                    key: "page0_model_0_2".to_string(),
+                    put_id: (10, 1),
+                },
+                PutAtomicGroupMember {
+                    key: "page1_model_0_2".to_string(),
+                    put_id: (10, 2),
+                },
+            ],
+        };
+        assert_eq!(
+            owner_hot_tp_cohort_key_rows(&identity, Some(&rank0_group)),
+            Ok(Some(vec![
+                vec!["page0_model_0_2".to_string(), "page1_model_0_2".to_string(),],
+                vec!["page0_model_1_2".to_string(), "page1_model_1_2".to_string(),],
+            ]))
+        );
+
+        let mixed_rank_group = PutAtomicGroup {
+            members: vec![
+                rank0_group.members[0].clone(),
+                PutAtomicGroupMember {
+                    key: "page1_model_1_2".to_string(),
+                    put_id: (11, 2),
+                },
+            ],
+        };
+        assert_eq!(
+            owner_hot_tp_cohort_key_rows(&identity, Some(&mixed_rank_group)),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn hot_group_trigger_is_persistent_on_success_and_retryable_on_failure() {
+        let member = OwnerHotReplicaIdentity {
+            key: "member".to_string(),
+            put_time_ms: 10,
+            put_version: 2,
+        };
+        let group_trigger = OwnerHotReplicaIdentity {
+            key: "anchor".to_string(),
+            put_time_ms: 10,
+            put_version: 1,
+        };
+        let inflight = Arc::new(DashSet::new());
+        let triggered = Arc::new(DashSet::new());
+        let counters = Arc::new(OwnerHotCacheCounters::default());
+
+        assert!(inflight.insert(member.clone()));
+        assert!(triggered.insert(group_trigger.clone()));
+        let failed_guard = OwnerHotReplicaGuard::new(
+            member.clone(),
+            inflight.clone(),
+            counters.clone(),
+            Some(group_trigger.clone()),
+            triggered.clone(),
+        );
+        drop(failed_guard);
+        assert!(!inflight.contains(&member));
+        assert!(!triggered.contains(&group_trigger));
+        assert_eq!(counters.replica_failed.load(Ordering::Relaxed), 1);
+
+        assert!(inflight.insert(member.clone()));
+        assert!(triggered.insert(group_trigger.clone()));
+        let completed_guard = OwnerHotReplicaGuard::new(
+            member.clone(),
+            inflight.clone(),
+            counters.clone(),
+            Some(group_trigger.clone()),
+            triggered.clone(),
+        );
+        completed_guard.mark_completed();
+        drop(completed_guard);
+        assert!(!inflight.contains(&member));
+        assert!(triggered.contains(&group_trigger));
+        assert_eq!(counters.replica_completed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn hot_cache_only_dispatches_size_removals_and_keeps_capacity() {
+        let controls = Arc::new(Mutex::new(HashMap::new()));
+        let cached = Arc::new(DashMap::<String, GetCachedInfo>::new());
+        let inflight = Arc::new(DashSet::new());
+        let atomic_groups = Arc::new(DashMap::new());
+        let group_replica_triggered = Arc::new(DashSet::new());
+        let counters = Arc::new(OwnerHotCacheCounters::default());
+        let (tx, mut rx) = limit_thirdparty::tokio::sync::ampsc::channel(8);
+        let cache = build_owner_hot_cache(
+            10,
+            controls,
+            cached,
+            inflight,
+            atomic_groups,
+            group_replica_triggered,
+            counters.clone(),
+            tx,
+        );
+        let entry = |put_version| OwnerHotCacheEntry {
+            put_id: (10, put_version),
+            memory_info: Weak::new(),
+            weight_bytes: 6,
+        };
+
+        cache.insert("explicit".to_string(), entry(0));
+        cache.run_pending_tasks();
+        cache.invalidate("explicit");
+        cache.run_pending_tasks();
+        assert_eq!(counters.size_evictions.load(Ordering::Relaxed), 0);
+
+        cache.insert("size-a".to_string(), entry(1));
+        cache.insert("size-b".to_string(), entry(2));
+        cache.run_pending_tasks();
+        assert!(counters.size_evictions.load(Ordering::Relaxed) >= 1);
+        assert_eq!(cache.policy().max_capacity(), Some(10));
+        assert!(
+            rx.try_recv().is_err(),
+            "stale weak entries must not dispatch"
+        );
+    }
+
+    #[test]
+    fn batch_local_visibility_skips_reclaim_fenced_keys() {
+        let keys = vec![
+            "local-a".to_string(),
+            "fenced".to_string(),
+            "local-b".to_string(),
+        ];
+        let mut controls = HashMap::new();
+        controls.insert(
+            "fenced".to_string(),
+            OwnerKeyControlState {
+                local_puts: 0,
+                reclaim: Some(OwnerReclaimRecord::Committed(OwnerReclaimItem {
+                    key: "fenced".to_string(),
+                    ..OwnerReclaimItem::default()
+                })),
+            },
+        );
+        let mut resolved_keys = Vec::new();
+
+        let visible = resolve_local_visible_batch(&keys, &controls, |key| {
+            resolved_keys.push(key.to_string());
+            Some(key.to_string())
+        });
+
+        assert_eq!(
+            visible,
+            vec![
+                Some("local-a".to_string()),
+                None,
+                Some("local-b".to_string())
+            ]
+        );
+        assert_eq!(resolved_keys, vec!["local-a", "local-b"]);
+    }
+
+    #[test]
+    fn committed_slot_becomes_free_only_after_route_and_holder_are_released() {
+        let mut grant = OwnerLocalReserveGrantState::new(7, 0, 0, 16, 8, 2);
+        let slot = grant.claim_prepared_slot().expect("slot should be free");
+        grant.mark_prepared_slot_pending_visible(slot.slot_index);
+        grant.retain_resident_slot_holder(slot.slot_index);
+        grant.promote_pending_visible_slot_to_committed(slot.slot_index);
+
+        grant.release_committed_slot_route(slot.slot_index);
+        assert_eq!(grant.free_slots.len(), 1);
+
+        grant.release_resident_slot_holder(slot.slot_index);
+        assert_eq!(grant.free_slots.len(), 2);
+        assert!(grant.is_fully_free());
     }
 }
 
@@ -2048,10 +3349,99 @@ impl ClientKvApiInner {
             external_get_holding_bytes =
                 external_get_holding_bytes.saturating_add(entry.value().memory_info.len as u64);
         }
+        let (hot_cache_capacity_bytes, hot_cache_entries, hot_cache_weighted_bytes) = self
+            .owner_hot_cache
+            .as_ref()
+            .map(|cache| {
+                (
+                    cache.policy().max_capacity().unwrap_or(0),
+                    cache.entry_count(),
+                    cache.weighted_size(),
+                )
+            })
+            .unwrap_or_default();
         OwnerRuntimeObserveSnapshot {
             external_get_holding_entries: self.external_get_holding.total() as u64,
             external_get_holding_bytes,
             external_pending_put_entries: self.external_pending_puts.entry_count(),
+            hot_cache_capacity_bytes,
+            hot_cache_entries,
+            hot_cache_weighted_bytes,
+            hot_size_evictions: self
+                .owner_hot_counters
+                .size_evictions
+                .load(Ordering::Relaxed),
+            hot_replica_enqueued: self
+                .owner_hot_counters
+                .replica_enqueued
+                .load(Ordering::Relaxed),
+            hot_replica_completed: self
+                .owner_hot_counters
+                .replica_completed
+                .load(Ordering::Relaxed),
+            hot_replica_already_satisfied: self
+                .owner_hot_counters
+                .replica_already_satisfied
+                .load(Ordering::Relaxed),
+            hot_replica_failed: self
+                .owner_hot_counters
+                .replica_failed
+                .load(Ordering::Relaxed),
+            hot_replica_obsolete: self
+                .owner_hot_counters
+                .replica_obsolete
+                .load(Ordering::Relaxed),
+            hot_replica_dispatch_failed: self
+                .owner_hot_counters
+                .replica_dispatch_failed
+                .load(Ordering::Relaxed),
+            hot_replica_inflight: self.owner_hot_replica_inflight.len() as u64,
+            hot_eviction_skipped_stale: self
+                .owner_hot_counters
+                .skipped_stale
+                .load(Ordering::Relaxed),
+            hot_eviction_skipped_reclaim: self
+                .owner_hot_counters
+                .skipped_reclaim
+                .load(Ordering::Relaxed),
+            hot_eviction_skipped_duplicate: self
+                .owner_hot_counters
+                .skipped_duplicate
+                .load(Ordering::Relaxed),
+            hot_group_registry_entries: self.owner_hot_atomic_groups.len() as u64,
+            hot_group_replica_triggered: self.owner_hot_group_replica_triggered.len() as u64,
+            hot_group_replica_triggers: self
+                .owner_hot_counters
+                .group_replica_triggers
+                .load(Ordering::Relaxed),
+            hot_group_members_enqueued: self
+                .owner_hot_counters
+                .group_members_enqueued
+                .load(Ordering::Relaxed),
+            hot_group_trigger_duplicates: self
+                .owner_hot_counters
+                .group_trigger_duplicates
+                .load(Ordering::Relaxed),
+            hot_group_trigger_incomplete: self
+                .owner_hot_counters
+                .group_trigger_incomplete
+                .load(Ordering::Relaxed),
+            grouped_put_done_batches: self
+                .owner_hot_counters
+                .grouped_put_done_batches
+                .load(Ordering::Relaxed),
+            grouped_put_done_items: self
+                .owner_hot_counters
+                .grouped_put_done_items
+                .load(Ordering::Relaxed),
+            legacy_put_done_batches: self
+                .owner_hot_counters
+                .legacy_put_done_batches
+                .load(Ordering::Relaxed),
+            legacy_put_done_items: self
+                .owner_hot_counters
+                .legacy_put_done_items
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -2560,6 +3950,35 @@ impl ClientKvApi {
                         metrics.set_kv_external_pending_put_entries(
                             snapshot.external_pending_put_entries,
                         );
+                        if snapshot.hot_cache_capacity_bytes > 0 {
+                            tracing::info!(
+                                capacity_bytes = snapshot.hot_cache_capacity_bytes,
+                                entries = snapshot.hot_cache_entries,
+                                weighted_bytes = snapshot.hot_cache_weighted_bytes,
+                                size_evictions = snapshot.hot_size_evictions,
+                                replica_enqueued = snapshot.hot_replica_enqueued,
+                                replica_completed = snapshot.hot_replica_completed,
+                                replica_already_satisfied = snapshot.hot_replica_already_satisfied,
+                                replica_failed = snapshot.hot_replica_failed,
+                                replica_obsolete = snapshot.hot_replica_obsolete,
+                                replica_dispatch_failed = snapshot.hot_replica_dispatch_failed,
+                                replica_inflight = snapshot.hot_replica_inflight,
+                                skipped_stale = snapshot.hot_eviction_skipped_stale,
+                                skipped_reclaim = snapshot.hot_eviction_skipped_reclaim,
+                                skipped_duplicate = snapshot.hot_eviction_skipped_duplicate,
+                                group_registry_entries = snapshot.hot_group_registry_entries,
+                                group_replica_triggered = snapshot.hot_group_replica_triggered,
+                                group_replica_triggers = snapshot.hot_group_replica_triggers,
+                                group_members_enqueued = snapshot.hot_group_members_enqueued,
+                                group_trigger_duplicates = snapshot.hot_group_trigger_duplicates,
+                                group_trigger_incomplete = snapshot.hot_group_trigger_incomplete,
+                                grouped_put_done_batches = snapshot.grouped_put_done_batches,
+                                grouped_put_done_items = snapshot.grouped_put_done_items,
+                                legacy_put_done_batches = snapshot.legacy_put_done_batches,
+                                legacy_put_done_items = snapshot.legacy_put_done_items,
+                                "owner hot replica policy snapshot"
+                            );
+                        }
                     }
                 }
             }
@@ -2572,26 +3991,57 @@ impl ClientKvApi {
 
     pub async fn construct(arg: ClientKvApiNewArg) -> Result<Self, KvError> {
         tracing::info!("Constructing ClientKvApi in Client mode (PreView)");
+        let ClientKvApiNewArg {
+            test_spec_config,
+            owner_hot_cache_capacity_bytes,
+        } = arg;
         let (replica_task_tx, replica_task_rx) =
             tokio::sync::ampsc::channel(REPLICA_TASK_QUEUE_CAPACITY);
         let (owner_local_publish_tx, owner_local_publish_rx) =
             tokio::sync::ampsc::channel(OWNER_LOCAL_PUBLISH_QUEUE_CAPACITY);
+        let (owner_hot_eviction_tx, owner_hot_eviction_rx) =
+            tokio::sync::ampsc::channel(OWNER_HOT_EVICTION_QUEUE_CAPACITY);
+        let get_cached_info = Arc::new(DashMap::new());
+        let owner_key_control = Arc::new(Mutex::new(HashMap::new()));
+        let owner_hot_replica_inflight = Arc::new(DashSet::new());
+        let owner_hot_atomic_groups = Arc::new(DashMap::new());
+        let owner_hot_group_replica_triggered = Arc::new(DashSet::new());
+        let owner_hot_counters = Arc::new(OwnerHotCacheCounters::default());
+        let owner_hot_cache = owner_hot_cache_capacity_bytes.map(|capacity_bytes| {
+            build_owner_hot_cache(
+                capacity_bytes,
+                owner_key_control.clone(),
+                get_cached_info.clone(),
+                owner_hot_replica_inflight.clone(),
+                owner_hot_atomic_groups.clone(),
+                owner_hot_group_replica_triggered.clone(),
+                owner_hot_counters.clone(),
+                owner_hot_eviction_tx,
+            )
+        });
 
         let inner = ClientKvApiInner {
             view: ClientKvApiViewHolder::new(),
-            test_spec_config: arg.test_spec_config,
+            test_spec_config,
             metrics: OnceLock::new(),
             all_memholder_refcount: OnceLock::new(),
             get_remote_kv_lock: AMapLock::new(Duration::from_secs(60)),
-            get_cached_info: DashMap::new(),
+            get_cached_info,
             precommit_local_visible_info: DashMap::new(),
             local_snapshot_info: DashMap::new(),
             owner_local_reserve_pool: Mutex::new(OwnerLocalReservePoolState::default()),
+            owner_local_reserve_claim_lock: limit_thirdparty::tokio::sync::AMutex::new(()),
             owner_local_reserve_rebalance_notify: Arc::new(
                 limit_thirdparty::tokio::sync::Notify::new(),
             ),
             external_local_first_put_id_counter: AtomicU32::new(0),
-            external_local_first_inflight_key_counts: DashMap::new(),
+            owner_key_control,
+            owner_hot_cache,
+            owner_hot_replica_inflight,
+            owner_hot_atomic_groups,
+            owner_hot_group_replica_triggered,
+            owner_hot_counters,
+            owner_hot_eviction_rx: Mutex::new(Some(owner_hot_eviction_rx)),
             external_invalidate_delete: EnsureMemholderMgmtDeleteHandle::new(
                 OwnerExternalMemMgr::DELETE_SUBMIT_QUEUE_CAPACITY,
             ),
@@ -2603,6 +4053,7 @@ impl ClientKvApi {
             external_get_start_registry: DashMap::new(),
             external_get_start_by_key: DashMap::new(),
             next_external_get_start_handle: AtomicU64::new(1),
+            next_external_holding_id: AtomicU64::new(1),
             external_pending_puts: moka::sync::Cache::builder()
                 .time_to_live(Duration::from_secs(30 * 60))
                 .segments(16)
@@ -2621,6 +4072,7 @@ impl ClientKvApi {
             rpc_caller_batch_put_start: RPCCaller::new(),
             rpc_caller_batch_put_revoke: RPCCaller::new(),
             rpc_caller_batch_put_done: RPCCaller::new(),
+            rpc_caller_grouped_batch_put_done: RPCCaller::new(),
             rpc_caller_batch_prepare_put_keys: RPCCaller::new(),
             rpc_caller_batch_release_put_key_reservations: RPCCaller::new(),
             rpc_caller_put_append_start: RPCCaller::new(),
@@ -2677,6 +4129,9 @@ impl ClientKvApi {
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_batch_put_done
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_grouped_batch_put_done
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_batch_prepare_put_keys
@@ -2998,6 +4453,39 @@ impl ClientKvApi {
 
         // client rpc handler register
         let view = inner.view.clone_view();
+        RPCHandler::<BatchEnqueueReplicaTaskReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_batch_enqueue_replica_tasks", async move {
+                    let ack = put::handle_batch_enqueue_replica_tasks(&view_task, msg).await;
+                    if let Err(e) = resp.send_resp(ack).await {
+                        warn!("Failed to send BatchEnqueueReplicaTaskResp: {:?}", e);
+                    }
+                });
+                Ok(())
+            },
+        );
+
+        let view = inner.view.clone_view();
+        RPCHandler::<BatchOwnerReclaimReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let req_node_id = resp.node_id().clone();
+                let view = view.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_batch_owner_reclaim", async move {
+                    let ack = handle_batch_owner_reclaim(&view_task, msg, req_node_id).await;
+                    if let Err(e) = resp.send_resp(ack).await {
+                        warn!("Failed to send BatchOwnerReclaimResp: {:?}", e);
+                    }
+                });
+                Ok(())
+            },
+        );
+
+        let view = inner.view.clone_view();
         RPCHandler::<BatchDeleteClientKvMetaCacheReq>::new().regist(
             inner.view.p2p_module(),
             move |resp, msg| {
@@ -3032,9 +4520,26 @@ impl ClientKvApi {
         delete::spawn_owner_delete_ack_batch(inner.view.clone_view(), delete_ack_batch_rx);
 
         if let Some(replica_task_rx) = inner.replica_task_rx.lock().take() {
-            put::spawn_replica_task_actor(inner.view.clone_view(), replica_task_rx);
+            put::spawn_replica_task_actor(
+                inner.view.clone_view(),
+                replica_task_rx,
+                inner
+                    .test_spec_config
+                    .replica_task_max_inflight
+                    .unwrap_or(1) as usize,
+            );
         } else {
             tracing::warn!("replica_task_rx already taken for ClientKvApi");
+        }
+        if inner.owner_hot_cache.is_some() {
+            if let Some(owner_hot_eviction_rx) = inner.owner_hot_eviction_rx.lock().take() {
+                put::spawn_owner_hot_replica_dispatcher(
+                    inner.view.clone_view(),
+                    owner_hot_eviction_rx,
+                );
+            } else {
+                tracing::warn!("owner_hot_eviction_rx already taken for ClientKvApi");
+            }
         }
         if let Some(owner_local_publish_rx) = inner.owner_local_publish_rx.lock().take() {
             put::spawn_owner_local_publish_dispatcher(

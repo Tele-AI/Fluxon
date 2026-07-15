@@ -26,6 +26,7 @@ use bitcode::{Decode, Encode};
 
 #[derive(Clone, Debug)]
 pub enum MemoryInfoDropAction {
+    None,
     OwnerDeleteAck,
     ReleaseLocalReserveResidentSlot {
         slot_size: u64,
@@ -231,7 +232,22 @@ impl MemoryInfo {
                 grant_id,
                 slot_index,
             } => Some((slot_size, grant_id, slot_index)),
-            MemoryInfoDropAction::OwnerDeleteAck => None,
+            MemoryInfoDropAction::None | MemoryInfoDropAction::OwnerDeleteAck => None,
+        }
+    }
+
+    pub(crate) fn take_local_reserve_resident_slot_ref(&mut self) -> Option<(u64, u64, u32)> {
+        let action = std::mem::replace(&mut self.drop_action, MemoryInfoDropAction::None);
+        match action {
+            MemoryInfoDropAction::ReleaseLocalReserveResidentSlot {
+                slot_size,
+                grant_id,
+                slot_index,
+            } => Some((slot_size, grant_id, slot_index)),
+            other => {
+                self.drop_action = other;
+                None
+            }
         }
     }
 }
@@ -240,6 +256,7 @@ impl MemoryInfo {
 impl Drop for MemoryInfo {
     fn drop(&mut self) {
         match &self.drop_action {
+            MemoryInfoDropAction::None => {}
             MemoryInfoDropAction::OwnerDeleteAck => {
                 let ctx = OwnerDeleteAckCtx {
                     view: self.view.clone(),

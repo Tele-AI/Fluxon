@@ -66,6 +66,7 @@ protocol:                              # Transport protocol override (dict(optio
   protocol_type:                       # Protocol type (('tcp'|'rdma'))
   rdma_device_names:                   # Explicit RDMA devices for protocol config (['{str}'](optional))
 pprof_duration_seconds:                # Dump pprof flamegraph after N seconds (int(optional))
+replica_writeback_hot_capacity_ratio: 0.75 # Owner-local hot working-set ratio in the open interval zero to one (float(optional))
 contribute_to_cluster_pool_size:       # Capacity contributed to cluster pool (dict(optional))
   dram: 1677721600                     # - DRAM contribution (int(multiple of 16777216))
   vram:                                # - VRAM contribution per GPU (dict(dynamic_key))
@@ -82,11 +83,17 @@ test_spec_config:                      # Test-only config overrides (dict(option
   prefer_local_placement: false        # Prefer placing new KV writes on the requester-local owner when possible (bool(optional))
   short_circuit_put_payload_path: false # Keep large put_start allocation but skip payload memcpy + transfer (bool(optional))
   skip_put_end_commit: false           # Return success after payload transfer without put_done commit; inflight_put TTL cleanup only (bool(optional))
+  owner_local_reserve_soft_wait_timeout_ms: # Local-reserve polling interval, >0 (int(optional))
+  owner_local_reserve_hard_timeout_ms: # Local-reserve end-to-end claim timeout, > soft wait (int(optional))
+  owner_local_reserve_expected_capacity: # Owner-only local-reserve prewarm target (dict(optional))
+    value_len:                         # Canonical value payload bytes, >0 and <=512 MiB (int)
+    payload_capacity_bytes:            # Expected payload capacity to keep resident, >0 (int)
   transport_mode:                      # transfer_only|transfer_with_rpc (str(optional))
   tcp_thread_reactor_shard_count:      # tcp_thread reactor shard count, 1..16 (int(optional))
   tcp_thread_bulk_lane_count:          # tcp_thread bulk lane count, 1..8 (int(optional))
   tcp_thread_control_lane_count:       # tcp_thread control lane count, 1..8 (int(optional))
   user_rpc_sync_handler_thread_count:  # Owner-dedicated sync user-RPC worker thread count, >0 (int(optional))
+  replica_task_max_inflight:           # Concurrent replica append pipelines, 1..64; per-key order stays serialized (int(optional))
   require_transfer_rpc_fast_path_ready_timeout_seconds: # Require owner-owner transfer-rpc fast path before owner ready/shared.json publication (int(optional))
   rdma_device_names:                   # Explicit RDMA devices for benchmark/test fast-path fanout (['{str}'](optional))
   enable_side_transfer: false          # Enable TCP side-transfer fast-path (bool(optional))
@@ -135,11 +142,15 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         "prefer_local_placement",
         "short_circuit_put_payload_path",
         "skip_put_end_commit",
+        "owner_local_reserve_soft_wait_timeout_ms",
+        "owner_local_reserve_hard_timeout_ms",
+        "owner_local_reserve_expected_capacity",
         "transport_mode",
         "tcp_thread_reactor_shard_count",
         "tcp_thread_bulk_lane_count",
         "tcp_thread_control_lane_count",
         "user_rpc_sync_handler_thread_count",
+        "replica_task_max_inflight",
         "require_transfer_rpc_fast_path_ready_timeout_seconds",
         "rdma_device_names",
         "enable_side_transfer",
@@ -234,6 +245,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         ("tcp_thread_reactor_shard_count", 1, 16),
         ("tcp_thread_bulk_lane_count", 1, 8),
         ("tcp_thread_control_lane_count", 1, 8),
+        ("replica_task_max_inflight", 1, 64),
     ):
         value = raw.get(key)
         if value is None:
@@ -253,6 +265,50 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         if user_rpc_sync_handler_thread_count <= 0:
             raise ValueError(f"{ctx}.user_rpc_sync_handler_thread_count must be > 0")
         out["user_rpc_sync_handler_thread_count"] = user_rpc_sync_handler_thread_count
+
+    reserve_timeouts: Dict[str, int] = {}
+    for key in (
+        "owner_local_reserve_soft_wait_timeout_ms",
+        "owner_local_reserve_hard_timeout_ms",
+    ):
+        value = raw.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{ctx}.{key} must be an int")
+        if value <= 0:
+            raise ValueError(f"{ctx}.{key} must be > 0")
+        reserve_timeouts[key] = value
+        out[key] = value
+    soft_timeout_ms = reserve_timeouts.get("owner_local_reserve_soft_wait_timeout_ms", 10)
+    hard_timeout_ms = reserve_timeouts.get("owner_local_reserve_hard_timeout_ms", 10_000)
+    if hard_timeout_ms <= soft_timeout_ms:
+        raise ValueError(
+            f"{ctx}.owner_local_reserve_hard_timeout_ms must be greater than "
+            f"{ctx}.owner_local_reserve_soft_wait_timeout_ms"
+        )
+
+    expected_capacity = raw.get("owner_local_reserve_expected_capacity")
+    if expected_capacity is not None:
+        expected_ctx = f"{ctx}.owner_local_reserve_expected_capacity"
+        if not isinstance(expected_capacity, dict):
+            raise ValueError(f"{expected_ctx} must be a mapping")
+        unknown_expected = sorted(
+            set(expected_capacity.keys()) - {"value_len", "payload_capacity_bytes"}
+        )
+        if unknown_expected:
+            raise ValueError(f"{expected_ctx} contains unknown keys: {unknown_expected}")
+        normalized_expected: Dict[str, int] = {}
+        for key in ("value_len", "payload_capacity_bytes"):
+            value = expected_capacity.get(key)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{expected_ctx}.{key} must be an int")
+            if value <= 0:
+                raise ValueError(f"{expected_ctx}.{key} must be > 0")
+            normalized_expected[key] = value
+        if normalized_expected["value_len"] > 512 * 1024 * 1024:
+            raise ValueError(f"{expected_ctx}.value_len must be <= 536870912")
+        out["owner_local_reserve_expected_capacity"] = normalized_expected
 
     side_transfer_worker_count = raw.get("side_transfer_worker_count")
     if side_transfer_worker_count is not None:
@@ -348,6 +404,23 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
         raise ValueError("fluxonkv_spec must be a mapping")
 
     is_zero_contribution = _is_zero_contribution_fluxonkv_config(cfg)
+    test_spec_config = cfg.get("test_spec_config") or {}
+    expected_capacity = test_spec_config.get("owner_local_reserve_expected_capacity")
+    hot_capacity_ratio = cfg.get("replica_writeback_hot_capacity_ratio")
+
+    if hot_capacity_ratio is not None:
+        if isinstance(hot_capacity_ratio, bool) or not isinstance(
+            hot_capacity_ratio, (int, float)
+        ):
+            raise ValueError(
+                "replica_writeback_hot_capacity_ratio must be a number in (0, 1)"
+            )
+        hot_capacity_ratio = float(hot_capacity_ratio)
+        if not 0.0 < hot_capacity_ratio < 1.0:
+            raise ValueError(
+                "replica_writeback_hot_capacity_ratio must be finite and in (0, 1)"
+            )
+        cfg["replica_writeback_hot_capacity_ratio"] = hot_capacity_ratio
 
     share_mem_path = spec.get("share_mem_path")
     if not isinstance(share_mem_path, str) or not share_mem_path.strip():
@@ -360,6 +433,14 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
         raise ValueError("fluxonkv_spec.transfer_engine has been removed from Fluxon KV config")
 
     if is_zero_contribution:
+        if hot_capacity_ratio is not None:
+            raise ValueError(
+                "replica_writeback_hot_capacity_ratio is only valid on owner configs"
+            )
+        if expected_capacity is not None:
+            raise ValueError(
+                "test_spec_config.owner_local_reserve_expected_capacity is only valid on owner configs"
+            )
         forbidden_spec_keys = [
             "etcd_addresses",
             "redis_compat",
@@ -378,6 +459,23 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
         )
     if int(contrib["dram"]) == 0:
         raise ValueError("owner mode requires non-zero contribute_to_cluster_pool_size.dram")
+
+    if expected_capacity is not None:
+        value_len = int(expected_capacity["value_len"])
+        payload_capacity_bytes = int(expected_capacity["payload_capacity_bytes"])
+        slot_size = max(value_len, 4096)
+        slot_size = (slot_size + 4095) & ~4095
+        slots_per_grant = (512 * 1024 * 1024) // slot_size
+        value_count = (payload_capacity_bytes + value_len - 1) // value_len
+        expected_grants = (value_count + slots_per_grant - 1) // slots_per_grant
+        physical_reserve_bytes = expected_grants * 512 * 1024 * 1024
+        owner_dram_bytes = int(contrib["dram"])
+        if physical_reserve_bytes > owner_dram_bytes:
+            raise ValueError(
+                "test_spec_config.owner_local_reserve_expected_capacity requires "
+                f"{physical_reserve_bytes} physical bytes across {expected_grants} grants, "
+                f"exceeding owner dram contribution {owner_dram_bytes}"
+            )
 
     if "etcd_addresses" not in spec:
         raise ValueError("fluxonkv_spec.etcd_addresses is required for owner mode")
@@ -433,6 +531,10 @@ class FluxonKvClientConfig():
         if has_mooncake == has_fluxon:
             raise ValueError(
                 "exactly one of [mooncake_spec, fluxonkv_spec] is required (and the chosen spec must not be null)"
+            )
+        if "replica_writeback_hot_capacity_ratio" in plain and not has_fluxon:
+            raise ValueError(
+                "replica_writeback_hot_capacity_ratio requires fluxonkv_spec"
             )
 
         pprof_duration_seconds = plain.get("pprof_duration_seconds")
@@ -750,8 +852,8 @@ def _parse_type_annotation(comment: str) -> Optional[Tuple[str, Dict[str, Any]]]
                         return parsed_type_name, merged_params
                     return type_name, {"constraint": constraint}
         
-        # 6) Primitive types: str, int, bool, None
-        if type_str in ["str", "int", "bool", "None"]:
+        # 6) Primitive types: str, int, float, bool, None
+        if type_str in ["str", "int", "float", "bool", "None"]:
             return type_str, {}
         
         debug_print("type_str ", type_str, "not matched to any type")
@@ -871,7 +973,16 @@ def _validate_value_by_type(value: Any, type_info: Tuple[str, Dict[str, Any]], p
                             raise_validation_error(f"Value must be multiple of {multiple}, got {value}")
                         else:
                             return None
-    
+
+    elif type_name == "float":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if raise_err:
+                raise_validation_error(
+                    f"Expected float-compatible number, got {type(value).__name__}"
+                )
+            else:
+                return None
+
     elif type_name == "bool":
         if not isinstance(value, bool):
             if raise_err:

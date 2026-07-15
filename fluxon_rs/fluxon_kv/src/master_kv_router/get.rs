@@ -1,5 +1,6 @@
 use super::{
-    InflightGetInfo, KvRouteInfo, MasterKvRouterView, NodeValueReplicaDesc, OwnerHoldingGetInfo,
+    InflightGetInfo, KvRouteInfo, MasterKeyActivityCompletionGuard, MasterKvRouterView,
+    OwnerHoldingGetInfo,
     msg_pack::{
         BatchGetDoneItemResp, BatchGetDoneReq, BatchGetDoneResp, BatchGetRevokeItemResp,
         BatchGetRevokeReq, BatchGetRevokeResp, BatchGetStartItemResp, BatchGetStartReq,
@@ -8,6 +9,7 @@ use super::{
         GetStartResp, MemHolderKeepAliveReq, MemHolderKeepAliveResp, MemHolderReleaseReq,
         MemHolderReleaseResp,
     },
+    route_maintenance::{RoutePublishEvent, enqueue_post_route_maintenance},
 };
 use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::put::PutIDForAKey;
@@ -28,48 +30,31 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 
-fn update_moka_for_node(
-    view: MasterKvRouterView,
-    node_id: String,
-    key: String,
-    weight: u32,
-    put_id: PutIDForAKey,
-    new_inserted: bool,
-) {
+fn touch_moka_for_node(view: MasterKvRouterView, node_id: String, key: String) {
     if !view.master_kv_router().replica_cache_enabled() {
         return;
     }
     let view_task = view.clone();
-    view.spawn("update_moka_for_node", async move {
+    view.spawn("touch_moka_for_node", async move {
         if let Some(cache) = view_task
             .master_kv_router()
             .get_node_cache_controller(&node_id)
         {
-            if new_inserted {
-                cache.insert(
-                    key.clone(),
-                    NodeValueReplicaDesc {
-                        weight_bytes: weight,
-                        put_id,
-                    },
-                );
-                tracing::debug!(
-                    "Inserted key: {:?} into node cache: {}, weight={}",
-                    key,
-                    node_id,
-                    weight
-                );
-            } else {
-                let _ = cache.get(&key);
-                tracing::debug!(
-                    "Touched key: {:?} on node cache: {} (TTL refresh)",
-                    key,
-                    node_id
-                );
+            if let Some(desc) = cache.get(&key)
+                && let Some(tier1_cache) = view_task
+                    .master_kv_router()
+                    .get_node_writeback_tier1_controller(&node_id)
+            {
+                tier1_cache.insert(key.clone(), desc);
             }
+            tracing::debug!(
+                "Touched key: {:?} on node cache: {} (TTL refresh)",
+                key,
+                node_id
+            );
         } else {
             tracing::warn!(
-                "No cache controller found for node: {} when updating moka",
+                "No cache controller found for node: {} when touching moka",
                 node_id
             );
         }
@@ -131,6 +116,14 @@ pub async fn handle_get_start(
     }
 
     tracing::debug!("Handling GetStartReq: {:?}", req.serialize_part);
+
+    let activity_lease = match view
+        .master_kv_router()
+        .reserve_inflight_get_key(&req.serialize_part.key)
+    {
+        Ok(activity_lease) => activity_lease,
+        Err(err) => return failed_resp_err(err, None, &view, &req.serialize_part.key),
+    };
 
     let get_id = view
         .master_kv_router()
@@ -303,6 +296,12 @@ pub async fn handle_get_start(
             error_json: String::new(),
             server_process_us: 0,
         };
+        view.master_kv_router().record_get_source_selection(
+            req_node_id.as_ref(),
+            resp_node_id.as_ref(),
+            src_len,
+            allocation_mode,
+        );
         // 创建在途的Get操作信息
         let info = InflightGetInfo {
             put_id: one_kv_nodes_routes.put_id,
@@ -313,6 +312,7 @@ pub async fn handle_get_start(
             allocation: target_allocation, // 存储target allocation
             route: one_kv_nodes_routes.clone(),
             allocation_mode,
+            _activity_lease: activity_lease,
         };
 
         view.master_kv_router()
@@ -326,13 +326,10 @@ pub async fn handle_get_start(
         // For leased keys, there should be no moka entry; skip touching to avoid
         // unnecessary cache work.
         if one_kv_nodes_routes.lease_id.is_none() {
-            update_moka_for_node(
+            touch_moka_for_node(
                 view.clone(),
                 src_node_id.to_string(),
                 req.serialize_part.key.clone(),
-                0,
-                one_kv_nodes_routes.put_id,
-                false,
             );
         }
 
@@ -379,6 +376,8 @@ pub async fn handle_get_revoke(
         .remove(&get_id)
         .await
     {
+        let _activity_completion =
+            MasterKeyActivityCompletionGuard::new(inflight_info._activity_lease.clone());
         inflight_info.release_durable_slot_if_needed();
         tracing::info!("Revoked get operation with get_id: {}", get_id);
     } else {
@@ -409,6 +408,8 @@ pub async fn handle_get_done(
         .remove(&get_id)
         .await
     {
+        let _activity_completion =
+            MasterKeyActivityCompletionGuard::new(inflight_info._activity_lease.clone());
         let mut allocation_mode = inflight_info.allocation_mode;
         let route = inflight_info.route.clone();
         // clone req_node_id to avoid borrow/move conflict when inserting into kv_routes
@@ -441,6 +442,7 @@ pub async fn handle_get_done(
 
         if allocation_mode == GetAllocationMode::DurableReplica {
             let mut promote_committed = false;
+            let mut route_publish_event = None;
             if let Some(one_kv_nodes_routes) = view.master_kv_router().inner().kv_routes.get(&key) {
                 if one_kv_nodes_routes.put_id == inflight_info.put_id {
                     let mut nodes_replicas = one_kv_nodes_routes.nodes_replicas.write();
@@ -455,44 +457,18 @@ pub async fn handle_get_done(
                                     backing: super::KvReplicaBacking::Allocation(
                                         inflight_info.allocation,
                                     ),
+                                    owner_local_indexed: true,
                                     tomb_tag,
                                 },
                             );
                             promote_committed = true;
-                            // Read lease binding from route snapshot: for this put_id,
-                            // if the key is leased, we must NOT insert into moka.
-                            if one_kv_nodes_routes.lease_id.is_none() {
-                                // notify moka cache controller for requesting node after route insert
-                                // See put.rs for rationale: saturate weight to avoid u32 truncation
-                                let req_weight = if alloc_cap > u32::MAX as u64 {
-                                    tracing::warn!(
-                                        "moka weight saturation on get_done: key={} put_id=({},{}) cap={}B exceeds u32::MAX; weight set to u32::MAX",
-                                        key,
-                                        inflight_info.put_id.0,
-                                        inflight_info.put_id.1,
-                                        alloc_cap
-                                    );
-                                    u32::MAX
-                                } else {
-                                    alloc_cap as u32
-                                };
-                                update_moka_for_node(
-                                    view.clone(),
-                                    req_node_id.to_string(),
-                                    key.clone(),
-                                    req_weight,
-                                    inflight_info.put_id,
-                                    true,
-                                );
-                            } else {
-                                tracing::debug!(
-                                    "Skip moka insert for leased key={} put_id=({},{}) on node {}",
-                                    key,
-                                    inflight_info.put_id.0,
-                                    inflight_info.put_id.1,
-                                    req_node_id
-                                );
-                            }
+                            route_publish_event = Some(RoutePublishEvent::replica_append(
+                                key.clone(),
+                                inflight_info.put_id,
+                                one_kv_nodes_routes.lease_id,
+                                req_node_id.clone(),
+                                alloc_cap,
+                            ));
                         } else {
                             tracing::warn!(
                                 "get node is tomb, get_id: {}, put_id: {:?}",
@@ -522,9 +498,41 @@ pub async fn handle_get_done(
                     key
                 );
             }
+            if let Some(event) = route_publish_event {
+                enqueue_post_route_maintenance(&view, event).await;
+            }
             if !promote_committed {
                 allocation_mode = GetAllocationMode::Temporary;
                 route.release_get_durable_slot();
+            }
+        } else if allocation_mode == GetAllocationMode::ReuseReplica {
+            let mut local_index_published = false;
+            if let Some(current_route) = view.master_kv_router().inner().kv_routes.get(&key) {
+                if current_route.put_id == inflight_info.put_id {
+                    let mut replicas = current_route.nodes_replicas.write();
+                    if let Some(replica) = replicas.get_mut(&req_node_id) {
+                        local_index_published = !replica.tomb_tag.is_tomb()
+                            && matches!(
+                                &replica.backing,
+                                super::KvReplicaBacking::Allocation(allocation)
+                                    if Arc::ptr_eq(allocation, &inflight_info.allocation)
+                            );
+                        if local_index_published {
+                            replica.owner_local_indexed = true;
+                        }
+                    }
+                }
+            }
+            if !local_index_published {
+                tracing::warn!(
+                    "Reused get allocation is no longer the current owner route; returning a temporary holder: get_id={} key={} put_id=({},{}) owner={}",
+                    get_id,
+                    key,
+                    inflight_info.put_id.0,
+                    inflight_info.put_id.1,
+                    req_node_id
+                );
+                allocation_mode = GetAllocationMode::Temporary;
             }
         }
 

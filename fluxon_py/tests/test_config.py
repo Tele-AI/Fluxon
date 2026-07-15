@@ -54,6 +54,7 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("fluxonkv_protocol_field", test_fluxonkv_protocol_field),
         ("fluxonkv_runtime_defaults_are_internal", test_fluxonkv_runtime_defaults_are_internal),
         ("fluxonkv_removed_rdma_config_keys", test_fluxonkv_removed_rdma_config_keys),
+        ("fluxonkv_owner_hot_writeback", test_fluxonkv_owner_hot_writeback),
         ("fluxonkv_test_spec_config", test_fluxonkv_test_spec_config),
         ("fluxon_pyo3_import_authority", test_fluxon_pyo3_import_authority),
     ]
@@ -444,6 +445,61 @@ def test_fluxonkv_removed_rdma_config_keys():
         print(f"❌ FAIL: test_fluxonkv_removed_rdma_config_keys - {e}")
 
 
+def test_fluxonkv_owner_hot_writeback():
+    """Validate the owner-only hot-tier ratio and preserve it in Rust YAML."""
+    try:
+        owner = _owner_fluxonkv_base_config(tag="owner_hot_writeback")
+        owner["replica_writeback_hot_capacity_ratio"] = 0.75
+        loaded = yaml.safe_load(
+            FluxonKvClientConfig(owner).to_fluxon_kv_client_config_yaml_str()
+        )
+        assert loaded["replica_writeback_hot_capacity_ratio"] == 0.75
+
+        for invalid in (0, 1, -0.1, float("nan"), True, "0.75"):
+            invalid_owner = _owner_fluxonkv_base_config(tag="owner_hot_invalid")
+            invalid_owner["replica_writeback_hot_capacity_ratio"] = invalid
+            try:
+                FluxonKvClientConfig(invalid_owner)
+                print(
+                    "❌ FAIL: test_fluxonkv_owner_hot_writeback - invalid ratio should be rejected"
+                )
+                return
+            except ValueError:
+                pass
+
+        external = {
+            "instance_key": "external_hot_invalid",
+            "replica_writeback_hot_capacity_ratio": 0.75,
+            "fluxonkv_spec": {
+                "cluster_name": "test_cluster",
+                "share_mem_path": "/tmp/kvcache_shared_memory/external_hot_invalid",
+            },
+        }
+        try:
+            FluxonKvClientConfig(external)
+            print(
+                "❌ FAIL: test_fluxonkv_owner_hot_writeback - external ratio should be rejected"
+            )
+            return
+        except ValueError:
+            pass
+
+        mooncake = config_dict()
+        mooncake["replica_writeback_hot_capacity_ratio"] = 0.75
+        try:
+            FluxonKvClientConfig(mooncake)
+            print(
+                "❌ FAIL: test_fluxonkv_owner_hot_writeback - Mooncake ratio should be rejected"
+            )
+            return
+        except ValueError:
+            pass
+
+        print("✅ PASS: test_fluxonkv_owner_hot_writeback")
+    except Exception as e:
+        print(f"❌ FAIL: test_fluxonkv_owner_hot_writeback - {e}")
+
+
 def test_fluxonkv_test_spec_config():
     """Ensure test_spec_config is accepted, normalized, and serialized."""
     try:
@@ -473,6 +529,7 @@ def test_fluxonkv_test_spec_config():
         rdma_devices["test_spec_config"]["tcp_thread_reactor_shard_count"] = 2
         rdma_devices["test_spec_config"]["tcp_thread_bulk_lane_count"] = 4
         rdma_devices["test_spec_config"]["tcp_thread_control_lane_count"] = 3
+        rdma_devices["test_spec_config"]["replica_task_max_inflight"] = 16
         rdma_devices["test_spec_config"][
             "require_transfer_rpc_fast_path_ready_timeout_seconds"
         ] = 45
@@ -487,11 +544,57 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["tcp_thread_reactor_shard_count"] == 2
         assert loaded["test_spec_config"]["tcp_thread_bulk_lane_count"] == 4
         assert loaded["test_spec_config"]["tcp_thread_control_lane_count"] == 3
+        assert loaded["test_spec_config"]["replica_task_max_inflight"] == 16
         assert (
             loaded["test_spec_config"]["require_transfer_rpc_fast_path_ready_timeout_seconds"]
             == 45
         )
         assert config.protocol_rdma_device_names == "mlx5_0,mlx5_4"
+
+        expected_capacity = _owner_fluxonkv_base_config(tag="expected_capacity")
+        expected_capacity["contribute_to_cluster_pool_size"]["dram"] = 137438953472
+        expected_capacity["test_spec_config"] = {
+            "owner_local_reserve_soft_wait_timeout_ms": 10,
+            "owner_local_reserve_hard_timeout_ms": 10_000,
+            "owner_local_reserve_expected_capacity": {
+                "value_len": 4_718_592,
+                "payload_capacity_bytes": 109_951_162_777,
+            },
+        }
+        config = FluxonKvClientConfig(expected_capacity)
+        loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
+        assert loaded["test_spec_config"]["owner_local_reserve_soft_wait_timeout_ms"] == 10
+        assert loaded["test_spec_config"]["owner_local_reserve_hard_timeout_ms"] == 10_000
+        assert loaded["test_spec_config"]["owner_local_reserve_expected_capacity"] == {
+            "value_len": 4_718_592,
+            "payload_capacity_bytes": 109_951_162_777,
+        }
+
+        invalid_reserve_timeout = copy.deepcopy(expected_capacity)
+        invalid_reserve_timeout["test_spec_config"][
+            "owner_local_reserve_hard_timeout_ms"
+        ] = 10
+        try:
+            FluxonKvClientConfig(invalid_reserve_timeout)
+            print(
+                "❌ FAIL: test_fluxonkv_test_spec_config - local-reserve hard timeout should exceed soft timeout"
+            )
+            return
+        except ValueError:
+            pass
+
+        invalid_expected_capacity = copy.deepcopy(expected_capacity)
+        invalid_expected_capacity["test_spec_config"][
+            "owner_local_reserve_expected_capacity"
+        ]["value_len"] = 0
+        try:
+            FluxonKvClientConfig(invalid_expected_capacity)
+            print(
+                "❌ FAIL: test_fluxonkv_test_spec_config - expected-capacity value_len=0 should be rejected"
+            )
+            return
+        except ValueError:
+            pass
 
         implicit_transport = copy.deepcopy(base)
         implicit_transport["test_spec_config"] = {

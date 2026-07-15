@@ -1,20 +1,21 @@
-use super::NodeValueReplicaDesc;
 use super::{
     CommittedSlotReplica, InflightPutAllocation, InflightPutCommitInfo, InflightPutInfo,
     InflightReplicaTaskInfo, KvReplicaBacking, KvRouteInfo, LocalReserveGrantInfo,
-    MasterKvRouterView, OwnerHoldingGetInfo, PreparedPutKeyReservationInfo, PutPlacementMode,
-    ReservedCapacityReason,
+    MasterKeyActivityCompletionGuard, MasterKvRouterView, OwnerHoldingGetInfo,
+    PreparedPutKeyReservationInfo, PutPlacementMode, ReservedCapacityReason,
     msg_pack::{
         BatchPreparePutKeysReq, BatchPreparePutKeysResp, BatchPutDoneItemResp, BatchPutDoneReq,
         BatchPutDoneResp, BatchPutRevokeItemResp, BatchPutRevokeReq, BatchPutRevokeResp,
         BatchPutStartItemResp, BatchPutStartReq, BatchPutStartResp,
-        BatchReleasePutKeyReservationsReq, BatchReleasePutKeyReservationsResp, PutAppendDoneReq,
-        PutAppendDoneResp, PutAppendRevokeReq, PutAppendRevokeResp, PutAppendStartReq,
-        PutAppendStartResp, PutDoneReq, PutDoneResp, PutRevokeReq, PutRevokeResp, PutStartReq,
-        PutStartResp, ReleaseLocalGrantReq, ReleaseLocalGrantResp, ReserveLocalGrantReq,
-        ReserveLocalGrantResp,
+        BatchReleasePutKeyReservationsReq, BatchReleasePutKeyReservationsResp,
+        GroupedBatchPutDoneReq, GroupedBatchPutDoneResp, PutAppendDoneReq, PutAppendDoneResp,
+        PutAppendRevokeReq, PutAppendRevokeResp, PutAppendStartReq, PutAppendStartResp,
+        PutAtomicGroup, PutDoneReq, PutDoneResp, PutRevokeReq, PutRevokeResp, PutStartReq,
+        PutStartResp, ReleaseLocalGrantReq, ReleaseLocalGrantResp, ReserveLocalGrantOutcome,
+        ReserveLocalGrantReq, ReserveLocalGrantResp, build_shared_put_atomic_group_assignments,
     },
     placement::PutPlacementTarget,
+    route_maintenance::{RoutePublishEvent, enqueue_post_route_maintenance},
 };
 use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::delete::DeleteKeyInfo;
@@ -40,36 +41,6 @@ use std::{
 };
 
 pub type PutIDForAKey = (u64, u32);
-
-struct InflightPutKeyReservation {
-    view: MasterKvRouterView,
-    key: String,
-    active: bool,
-}
-
-impl InflightPutKeyReservation {
-    fn new(view: MasterKvRouterView, key: String) -> Self {
-        Self {
-            view,
-            key,
-            active: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for InflightPutKeyReservation {
-    fn drop(&mut self) {
-        if self.active {
-            self.view
-                .master_kv_router()
-                .release_inflight_put_key(&self.key);
-        }
-    }
-}
 
 fn validate_put_start_source_node_override(
     view: &MasterKvRouterView,
@@ -192,7 +163,7 @@ fn append_current_route_replica_if_matching(
     put_id: PutIDForAKey,
     node_id: NodeID,
     allocation: Allocation,
-) -> bool {
+) -> Option<RoutePublishEvent> {
     let Some(one_kv_nodes_routes) = view.master_kv_router().inner().kv_routes.get(key) else {
         tracing::debug!(
             "append_current_route_replica_if_matching skipped because route disappeared: key={} put_id=({},{})",
@@ -200,7 +171,7 @@ fn append_current_route_replica_if_matching(
             put_id.0,
             put_id.1
         );
-        return false;
+        return None;
     };
     if one_kv_nodes_routes.put_id != put_id {
         tracing::debug!(
@@ -211,7 +182,7 @@ fn append_current_route_replica_if_matching(
             put_id.0,
             put_id.1
         );
-        return false;
+        return None;
     }
     let Some(tomb_tag) = view.master_seg_manager().get_node_tomb_tag(&node_id) else {
         tracing::warn!(
@@ -221,7 +192,7 @@ fn append_current_route_replica_if_matching(
             put_id.1,
             node_id
         );
-        return false;
+        return None;
     };
     if tomb_tag.is_tomb() {
         tracing::warn!(
@@ -231,42 +202,26 @@ fn append_current_route_replica_if_matching(
             put_id.1,
             node_id
         );
-        return false;
+        return None;
     }
-    let alloc_cap = allocation.capcity();
-    let req_weight = if alloc_cap > u32::MAX as u64 {
-        tracing::warn!(
-            "moka weight saturation on put append: key={} put_id=({},{}) cap={}B exceeds u32::MAX; weight set to u32::MAX",
-            key,
-            put_id.0,
-            put_id.1,
-            alloc_cap
-        );
-        u32::MAX
-    } else {
-        alloc_cap as u32
-    };
+    let capacity_bytes = allocation.capcity();
     let lease_id = one_kv_nodes_routes.lease_id;
     one_kv_nodes_routes.nodes_replicas.write().insert(
         node_id.clone(),
         KvRouteInfo {
             node_id: node_id.clone(),
             backing: KvReplicaBacking::Allocation(Arc::new(allocation)),
+            owner_local_indexed: false,
             tomb_tag,
         },
     );
-    if lease_id.is_none() {
-        if let Some(cache) = view.master_kv_router().get_node_cache_controller(&node_id) {
-            cache.insert(
-                key.to_string(),
-                NodeValueReplicaDesc {
-                    weight_bytes: req_weight,
-                    put_id,
-                },
-            );
-        }
-    }
-    true
+    Some(RoutePublishEvent::replica_append(
+        key.to_string(),
+        put_id,
+        lease_id,
+        node_id,
+        capacity_bytes,
+    ))
 }
 
 fn allocate_from_node_local_segment(
@@ -331,6 +286,8 @@ fn reserve_replica_task(
         preferred_sub_cluster,
         len,
         &HashSet::new(),
+        false,
+        true,
     )
 }
 
@@ -342,7 +299,10 @@ fn reserve_replica_task_excluding(
     preferred_sub_cluster: Option<&str>,
     len: u64,
     excluded_nodes: &HashSet<NodeID>,
+    demote_source_on_remote_complete: bool,
+    protect_source_on_remote_complete: bool,
 ) -> msg_and_error::KvResult<InflightReplicaTaskInfo> {
+    let activity_lease = view.master_kv_router().reserve_inflight_replica_key(key)?;
     let (target_node_id, target_allocation) = view
         .master_kv_router()
         .inner()
@@ -366,9 +326,13 @@ fn reserve_replica_task_excluding(
     );
     Ok(InflightReplicaTaskInfo {
         node_id: target_node_id,
+        source_node_id: source_node_id.clone(),
         key: key.to_string(),
         put_id,
         target_allocation: Arc::new(Mutex::new(Some(target_allocation))),
+        demote_source_on_remote_complete,
+        protect_source_on_remote_complete,
+        _activity_lease: activity_lease,
     })
 }
 
@@ -377,24 +341,12 @@ async fn publish_completed_put_route(
     key: String,
     put_id: PutIDForAKey,
     lease_id_opt: Option<u64>,
+    atomic_group: Option<Arc<super::msg_pack::PutAtomicGroup>>,
     node_id: NodeID,
     completed_info: KvRouteInfo,
     target_cap_bytes: u64,
     local_cache_holder_id: Option<u64>,
 ) -> MsgPack<PutDoneResp> {
-    let saturated_weight_u32 = if target_cap_bytes > u32::MAX as u64 {
-        tracing::warn!(
-            "moka weight saturation: key={} put_id=({},{}) cap={}B exceeds u32::MAX; weight set to u32::MAX",
-            key,
-            put_id.0,
-            put_id.1,
-            target_cap_bytes
-        );
-        u32::MAX
-    } else {
-        target_cap_bytes as u32
-    };
-
     let mut old_one_kv_routes: Option<Arc<OneKvNodesRoutes>> = None;
     let mut inserted = false;
     {
@@ -408,6 +360,7 @@ async fn publish_completed_put_route(
                 Arc::new(OneKvNodesRoutes {
                     put_id,
                     lease_id: lease_id_opt,
+                    atomic_group: atomic_group.clone(),
                     nodes_replicas: RwLock::new(HashMap::new()),
                     get_durable_slots_used: AtomicU32::new(0),
                 })
@@ -417,6 +370,7 @@ async fn publish_completed_put_route(
             *one_kv_routes = Arc::new(OneKvNodesRoutes {
                 put_id,
                 lease_id: lease_id_opt,
+                atomic_group: atomic_group.clone(),
                 nodes_replicas: RwLock::new(HashMap::new()),
                 get_durable_slots_used: AtomicU32::new(0),
             });
@@ -443,48 +397,19 @@ async fn publish_completed_put_route(
         }
     }
 
-    {
-        let view_task = view.clone();
-        let key_for_spawn = key.clone();
-        let node_for_spawn = node_id.clone();
-        let do_prefix_index_update = view.master_kv_router().prefix_index_enabled();
-        let do_cache_insert =
-            lease_id_opt.is_none() && view.master_kv_router().replica_cache_enabled();
-        let cap_bytes_u32 = saturated_weight_u32;
-        view.spawn("post_put_done_maintenance", async move {
-            if do_prefix_index_update {
-                let inner = view_task.master_kv_router().inner();
-                let mut tree = inner.prefix_index.write().await;
-                tree.insert(&key_for_spawn);
-            }
+    enqueue_post_route_maintenance(
+        &view,
+        RoutePublishEvent::primary_put(
+            key.clone(),
+            put_id,
+            lease_id_opt,
+            node_id.clone(),
+            target_cap_bytes,
+        ),
+    )
+    .await;
 
-            if do_cache_insert {
-                let cache = view_task
-                    .master_kv_router()
-                    .get_node_cache_controller(&node_for_spawn);
-                if let Some(cache) = cache {
-                    let desc = NodeValueReplicaDesc {
-                        weight_bytes: cap_bytes_u32,
-                        put_id,
-                    };
-                    tracing::debug!("Inserting key: {:?} into cache", key_for_spawn);
-                    cache.insert(key_for_spawn.clone(), desc);
-                    tracing::debug!(
-                        "Inserted key: {:?} into cache, current cache size: {}",
-                        key_for_spawn,
-                        cache.weighted_size()
-                    );
-                } else {
-                    tracing::warn!(
-                        "No cache controller found for node: {}, node is not ready",
-                        node_for_spawn
-                    );
-                }
-            }
-        });
-    }
-
-    tracing::info!(
+    tracing::debug!(
         "Completed put operation with put_id: {:?}, key: {:?}",
         put_id,
         key
@@ -507,21 +432,23 @@ pub async fn handle_put_start(
     req_node_id: NodeID,
 ) -> (PutIDForAKey, MsgPack<PutStartResp>) {
     let key = req.serialize_part.key.clone();
-    if let Err(err) = view.master_kv_router().reserve_inflight_put_key(
+    let activity_lease = match view.master_kv_router().reserve_inflight_put_key(
         &key,
         req.serialize_part.reject_if_inflight_same_key,
         req.serialize_part.reject_if_exist_same_key,
     ) {
-        let resp: PutStartResp = crate::rpcresp_kvresult_convert::FromError::from_error(&err);
-        return (
-            (0, 0),
-            MsgPack {
-                serialize_part: resp,
-                raw_bytes: Vec::new(),
-            },
-        );
-    }
-    let mut key_reservation = InflightPutKeyReservation::new(view.clone(), key.clone());
+        Ok(activity_lease) => activity_lease,
+        Err(err) => {
+            let resp: PutStartResp = crate::rpcresp_kvresult_convert::FromError::from_error(&err);
+            return (
+                (0, 0),
+                MsgPack {
+                    serialize_part: resp,
+                    raw_bytes: Vec::new(),
+                },
+            );
+        }
+    };
     let source_node_id = match req.serialize_part.source_node_id.as_ref() {
         Some(source_node_id) => {
             let source_node_id: NodeID = source_node_id.clone().into();
@@ -588,6 +515,7 @@ pub async fn handle_put_start(
                 src_target_allocation: Arc::new(Mutex::new(Some(inflight_alloc))),
                 replica_target: replica_target.clone(),
             },
+            _activity_lease: activity_lease.clone(),
         };
 
         let view_task = view.clone();
@@ -637,9 +565,22 @@ pub async fn handle_put_start(
         }
     };
 
-    let put_target = Ok(PutPlacementTarget::Local {
-        node_id: source_node_id.clone(),
-    });
+    let put_target = if req.serialize_part.make_replica_task {
+        Ok(PutPlacementTarget::Local {
+            node_id: source_node_id.clone(),
+        })
+    } else {
+        view.master_kv_router()
+            .inner()
+            .policy
+            .select_put_target(
+                &view,
+                &source_node_id,
+                req.serialize_part.preferred_sub_cluster.as_deref(),
+                req.serialize_part.len,
+            )
+            .await
+    };
 
     match put_target {
         Ok(PutPlacementTarget::Local { node_id }) => {
@@ -738,9 +679,7 @@ pub async fn handle_put_start(
                 allocation_size,
                 replica_target,
             );
-            let result = fut.await;
-            key_reservation.disarm();
-            return result;
+            return fut.await;
         }
         Ok(PutPlacementTarget::Remote {
             node_id,
@@ -793,9 +732,7 @@ pub async fn handle_put_start(
                 allocation_size,
                 None,
             );
-            let result = fut.await;
-            key_reservation.disarm();
-            return result;
+            return fut.await;
         }
         Err(err) => {
             let resp: PutStartResp = crate::rpcresp_kvresult_convert::FromError::from_error(&err);
@@ -815,9 +752,42 @@ pub async fn handle_reserve_local_grant(
     req: MsgPack<ReserveLocalGrantReq>,
     req_node_id: NodeID,
 ) -> (u64, MsgPack<ReserveLocalGrantResp>) {
-    let _ = req;
-
-    let mut allocation = match allocate_from_node_local_segment(
+    if req.serialize_part.reclaim_before_grow
+        && req.serialize_part.slot_size != 0
+        && req.serialize_part.required_free_slots != 0
+    {
+        let reclaimed = crate::master_kv_router::reclaim::reclaim_owner_slots_for_reserve(
+            &view,
+            &req_node_id,
+            req.serialize_part.slot_size,
+            req.serialize_part.required_free_slots,
+        )
+        .await;
+        tracing::info!(
+            "owner reserve proactive headroom reclaim: owner={} slot_size={} requested_slots={} reclaimed={}",
+            req_node_id,
+            req.serialize_part.slot_size,
+            req.serialize_part.required_free_slots,
+            reclaimed
+        );
+        if reclaimed != 0 {
+            return (
+                0,
+                MsgPack {
+                    serialize_part: ReserveLocalGrantResp {
+                        outcome: ReserveLocalGrantOutcome::Reclaimed {
+                            slot_size: req.serialize_part.slot_size,
+                            reclaimed_slots: reclaimed,
+                        },
+                        error_code: msg_and_error::OK,
+                        ..Default::default()
+                    },
+                    raw_bytes: Vec::new(),
+                },
+            );
+        }
+    }
+    let allocation = match allocate_from_node_local_segment(
         &view,
         &req_node_id,
         OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES,
@@ -825,6 +795,85 @@ pub async fn handle_reserve_local_grant(
     ) {
         Ok(allocation) => allocation,
         Err(err) => {
+            let physical_no_space = matches!(
+                &err,
+                msg_and_error::KvError::Api(msg_and_error::ApiError::NoSpace { .. })
+            );
+            if physical_no_space
+                && req.serialize_part.slot_size != 0
+                && req.serialize_part.required_free_slots != 0
+            {
+                let requested_eviction_weight = req
+                    .serialize_part
+                    .slot_size
+                    .saturating_mul(u64::from(req.serialize_part.required_free_slots));
+                let pending_eviction_weight = view
+                    .master_kv_router()
+                    .eviction_reclaim_pending_weight(req_node_id.as_ref());
+                let additional_eviction_weight =
+                    requested_eviction_weight.saturating_sub(pending_eviction_weight);
+                if additional_eviction_weight != 0 {
+                    if let Some(cache) = view
+                        .master_kv_router()
+                        .get_node_cache_controller(req_node_id.as_ref())
+                    {
+                        let weighted_size_before = cache.weighted_size();
+                        let recoverable_evicted_weight =
+                            view.master_kv_router().evict_recoverable_cache_weight(
+                                req_node_id.as_ref(),
+                                additional_eviction_weight,
+                            );
+                        let fallback_requested_weight =
+                            additional_eviction_weight.saturating_sub(recoverable_evicted_weight);
+                        let fallback_evicted_weight = if view
+                            .master_kv_router()
+                            .owner_cache_allows_unrecoverable_reserve_pressure_eviction(
+                                req_node_id.as_ref(),
+                            ) {
+                            cache.evict_some(fallback_requested_weight)
+                        } else {
+                            0
+                        };
+                        tracing::info!(
+                            "owner reserve requested moka eviction: owner={} slot_size={} requested_slots={} requested_weight={} pending_weight_before={} recoverable_evicted_weight={} fallback_requested_weight={} fallback_evicted_weight={} shortfall_weight={} weighted_size_before={} weighted_size_after={}",
+                            req_node_id,
+                            req.serialize_part.slot_size,
+                            req.serialize_part.required_free_slots,
+                            requested_eviction_weight,
+                            pending_eviction_weight,
+                            recoverable_evicted_weight,
+                            fallback_requested_weight,
+                            fallback_evicted_weight,
+                            fallback_requested_weight.saturating_sub(fallback_evicted_weight),
+                            weighted_size_before,
+                            cache.weighted_size()
+                        );
+                    }
+                }
+                let reclaimed = crate::master_kv_router::reclaim::reclaim_owner_slots_for_reserve(
+                    &view,
+                    &req_node_id,
+                    req.serialize_part.slot_size,
+                    req.serialize_part.required_free_slots,
+                )
+                .await;
+                if reclaimed != 0 {
+                    return (
+                        0,
+                        MsgPack {
+                            serialize_part: ReserveLocalGrantResp {
+                                outcome: ReserveLocalGrantOutcome::Reclaimed {
+                                    slot_size: req.serialize_part.slot_size,
+                                    reclaimed_slots: reclaimed,
+                                },
+                                error_code: msg_and_error::OK,
+                                ..Default::default()
+                            },
+                            raw_bytes: Vec::new(),
+                        },
+                    );
+                }
+            }
             let resp: ReserveLocalGrantResp =
                 crate::rpcresp_kvresult_convert::FromError::from_error(&err);
             return (
@@ -836,43 +885,6 @@ pub async fn handle_reserve_local_grant(
             );
         }
     };
-
-    let reserved_bytes = allocation.capcity();
-    if let Err(err) = view.master_kv_router().adjust_node_cache_reserved_capacity(
-        req_node_id.as_ref(),
-        ReservedCapacityReason::LocalReserveGrant,
-        reserved_bytes as i64,
-    ) {
-        let resp: ReserveLocalGrantResp =
-            crate::rpcresp_kvresult_convert::FromError::from_error(&err);
-        return (
-            0,
-            MsgPack {
-                serialize_part: resp,
-                raw_bytes: Vec::new(),
-            },
-        );
-    }
-
-    let view_clone = view.clone();
-    let node_id_string = req_node_id.as_ref().to_string();
-    allocation.set_on_drop(move || {
-        if let Err(e) = view_clone
-            .master_kv_router()
-            .adjust_node_cache_reserved_capacity(
-                &node_id_string,
-                ReservedCapacityReason::LocalReserveGrant,
-                -(reserved_bytes as i64),
-            )
-        {
-            tracing::warn!(
-                "Failed to restore moka capacity on local reserve grant drop: node_id={}, bytes={}, err={}",
-                node_id_string,
-                reserved_bytes,
-                e
-            );
-        }
-    });
 
     let grant_id = view.master_kv_router().next_local_reserve_grant_id();
     let grant_base_addr = allocation.base_addr();
@@ -890,11 +902,13 @@ pub async fn handle_reserve_local_grant(
         grant_id,
         MsgPack {
             serialize_part: ReserveLocalGrantResp {
-                grant_id,
-                node_id: req_node_id.into_owned(),
-                addr: grant_abs_addr,
-                base_addr: grant_base_addr,
-                len: grant_len,
+                outcome: ReserveLocalGrantOutcome::Granted {
+                    grant_id,
+                    node_id: req_node_id.into_owned(),
+                    addr: grant_abs_addr,
+                    base_addr: grant_base_addr,
+                    len: grant_len,
+                },
                 error_code: msg_and_error::OK,
                 error_json: String::new(),
                 server_process_us: 0,
@@ -952,29 +966,29 @@ pub async fn handle_batch_prepare_put_keys(
 ) -> (Vec<u64>, MsgPack<BatchPreparePutKeysResp>) {
     let mut reservation_ids = Vec::with_capacity(req.serialize_part.items.len());
     for item in req.serialize_part.items {
-        if let Err(err) = view.master_kv_router().reserve_inflight_put_key(
+        let activity_lease = match view.master_kv_router().reserve_inflight_put_key(
             &item.key,
             item.reject_if_inflight_same_key,
             item.reject_if_exist_same_key,
         ) {
-            for reservation_id in reservation_ids.drain(..) {
-                if let Some(info) = view
-                    .master_kv_router()
-                    .take_prepared_put_key_reservation(reservation_id)
-                {
-                    view.master_kv_router().release_inflight_put_key(&info.key);
+            Ok(activity_lease) => activity_lease,
+            Err(err) => {
+                for reservation_id in reservation_ids.drain(..) {
+                    let _ = view
+                        .master_kv_router()
+                        .take_prepared_put_key_reservation(reservation_id);
                 }
+                let resp: BatchPreparePutKeysResp =
+                    crate::rpcresp_kvresult_convert::FromError::from_error(&err);
+                return (
+                    Vec::new(),
+                    MsgPack {
+                        serialize_part: resp,
+                        raw_bytes: Vec::new(),
+                    },
+                );
             }
-            let resp: BatchPreparePutKeysResp =
-                crate::rpcresp_kvresult_convert::FromError::from_error(&err);
-            return (
-                Vec::new(),
-                MsgPack {
-                    serialize_part: resp,
-                    raw_bytes: Vec::new(),
-                },
-            );
-        }
+        };
         let reservation_id = view
             .master_kv_router()
             .next_prepared_put_key_reservation_id();
@@ -984,6 +998,7 @@ pub async fn handle_batch_prepare_put_keys(
                 PreparedPutKeyReservationInfo {
                     owner_node_id: req_node_id.clone(),
                     key: item.key,
+                    _activity_lease: activity_lease,
                 },
             );
         reservation_ids.push(reservation_id);
@@ -1043,9 +1058,7 @@ pub async fn handle_batch_release_put_key_reservations(
         taken.push((reservation_id, info));
     }
 
-    for (_reservation_id, info) in taken {
-        view.master_kv_router().release_inflight_put_key(&info.key);
-    }
+    drop(taken);
 
     MsgPack {
         serialize_part: BatchReleasePutKeyReservationsResp::default(),
@@ -1070,8 +1083,13 @@ pub async fn handle_put_revoke(
         .remove(&kvrouter_key)
         .await
     {
-        view.master_kv_router()
-            .release_inflight_put_key(&inflight_info.key);
+        let _activity_completion =
+            MasterKeyActivityCompletionGuard::new(inflight_info._activity_lease.clone());
+        let _replica_activity_completion = inflight_info
+            .commit_info
+            .replica_target
+            .as_ref()
+            .map(|target| MasterKeyActivityCompletionGuard::new(target._activity_lease.clone()));
         tracing::info!("Revoked put operation with put_id: {:?}", kvrouter_key);
     } else {
         tracing::warn!(
@@ -1091,16 +1109,45 @@ pub async fn handle_put_done(
     req: MsgPack<PutDoneReq>,
     req_node_id: NodeID,
 ) -> MsgPack<PutDoneResp> {
+    handle_put_done_with_resolved_group(view, req, req_node_id, None).await
+}
+
+async fn handle_put_done_with_resolved_group(
+    view: MasterKvRouterView,
+    req: MsgPack<PutDoneReq>,
+    req_node_id: NodeID,
+    resolved_atomic_group: Option<Arc<PutAtomicGroup>>,
+) -> MsgPack<PutDoneResp> {
     tracing::debug!("Handling PutDoneReq: {:?}", req.serialize_part);
 
     let put_id = req.serialize_part.put_id;
     let lease_id_opt = req.serialize_part.lease_id;
     let full_put_id: (String, u64, u32) = (req.serialize_part.key.clone(), put_id.0, put_id.1);
     let local_cache_holder_id: Option<u64>;
+    let atomic_group = if let Some(group) = resolved_atomic_group {
+        Some(group)
+    } else {
+        match view.master_kv_router().resolve_put_atomic_group(
+            &req.serialize_part.key,
+            put_id,
+            req.serialize_part.atomic_group.clone(),
+        ) {
+            Ok(group) => group,
+            Err(err) => {
+                return MsgPack {
+                    serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                    raw_bytes: Vec::new(),
+                };
+            }
+        }
+    };
 
     // Remove from inflight_puts and store in completed_puts
     if let Some(InflightPutInfo {
-        key, commit_info, ..
+        key,
+        commit_info,
+        _activity_lease,
+        ..
     }) = view
         .master_kv_router()
         .inner()
@@ -1108,7 +1155,11 @@ pub async fn handle_put_done(
         .remove(&full_put_id)
         .await
     {
-        view.master_kv_router().release_inflight_put_key(&key);
+        let _activity_completion = MasterKeyActivityCompletionGuard::new(_activity_lease);
+        let mut replica_activity_completion = commit_info
+            .replica_target
+            .as_ref()
+            .map(|target| MasterKeyActivityCompletionGuard::new(target._activity_lease.clone()));
         let node_id = commit_info.node_id;
         let Some(allocs) = commit_info.src_target_allocation.lock().take() else {
             tracing::warn!(
@@ -1159,7 +1210,7 @@ pub async fn handle_put_done(
         let (target_cap_bytes, completed_info, local_cache_publish_supported) = match allocs {
             InflightPutAllocation::Local(mut target_allocation) => {
                 if let Some(slot) = route_committed_slot {
-                    let target_cap_bytes = slot.len;
+                    let target_cap_bytes = slot.slot_size;
                     if let Some(lease_id) = lease_id_opt {
                         if let Err(e) = view
                             .master_lease_manager()
@@ -1202,6 +1253,7 @@ pub async fn handle_put_done(
                                 len: slot.len,
                                 base_addr: slot.base_addr,
                             }),
+                            owner_local_indexed: true,
                             tomb_tag,
                         },
                         false,
@@ -1238,6 +1290,14 @@ pub async fn handle_put_done(
                         let view_clone = view.clone();
                         let node_id_string = node_id.as_ref().to_string();
                         target_allocation.set_on_drop(move || {
+                            // The allocation can be released while FrameworkInner itself is
+                            // being dropped.  At that point the weak module view can no longer
+                            // be upgraded and restoring the runtime Moka reservation is both
+                            // impossible and unnecessary.  Keep an upgrade guard alive for the
+                            // whole callback so dependency access cannot race the final drop.
+                            let Some(_view_guard) = view_clone.try_upgrade() else {
+                                return;
+                            };
                             if let Err(e) = view_clone
                                 .master_kv_router()
                                 .adjust_node_cache_reserved_capacity(
@@ -1260,6 +1320,7 @@ pub async fn handle_put_done(
                         KvRouteInfo {
                             node_id: node_id.clone(),
                             backing: KvReplicaBacking::Allocation(Arc::new(target_allocation)),
+                            owner_local_indexed: req.serialize_part.publish_local_cache,
                             tomb_tag,
                         },
                         true,
@@ -1303,6 +1364,11 @@ pub async fn handle_put_done(
                     let view_clone = view.clone();
                     let node_id_string = node_id.as_ref().to_string();
                     target.set_on_drop(move || {
+                        // See the equivalent local-placement callback above.  A final framework
+                        // teardown must not call back into the module currently being destroyed.
+                        let Some(_view_guard) = view_clone.try_upgrade() else {
+                            return;
+                        };
                         if let Err(e) = view_clone
                             .master_kv_router()
                             .adjust_node_cache_reserved_capacity(
@@ -1325,13 +1391,14 @@ pub async fn handle_put_done(
                     KvRouteInfo {
                         node_id: node_id.clone(),
                         backing: KvReplicaBacking::Allocation(Arc::new(target)),
+                        owner_local_indexed: false,
                         tomb_tag,
                     },
                     false,
                 )
             }
             InflightPutAllocation::LocalCommittedSlot(slot) => {
-                let target_cap_bytes = slot.len;
+                let target_cap_bytes = slot.slot_size;
                 if let Some(lease_id) = lease_id_opt {
                     if let Err(e) = view
                         .master_lease_manager()
@@ -1367,6 +1434,7 @@ pub async fn handle_put_done(
                     KvRouteInfo {
                         node_id: node_id.clone(),
                         backing: KvReplicaBacking::CommittedSlot(slot),
+                        owner_local_indexed: true,
                         tomb_tag,
                     },
                     false,
@@ -1374,19 +1442,6 @@ pub async fn handle_put_done(
             }
         };
 
-        // NOTE on weight sizing for moka cache:
-        // - moka's `weigher` returns a u32 per-entry weight while the cache's
-        //   `max_capacity` and `weighted_size()` use u64. If an allocation's
-        //   capacity exceeds u32::MAX (e.g., >= 4 GiB), a naive `as u32` cast
-        //   would truncate and could become 0 for ~exact 4 GiB multiples.
-        //   That would effectively disable size-based eviction because such
-        //   entries would contribute 0 to the cache weight and the cache would
-        //   never reach its configured capacity. This directly causes the
-        //   observed "non‑lease mode eviction not working; puts fill to full".
-        // - To make eviction robust, we saturate the per-entry weight at
-        //   u32::MAX when `capcity()` is larger than u32::MAX. This keeps the
-        //   cache accounting conservative (evicts earlier rather than later)
-        //   and prevents weight=0 due to truncation.
         local_cache_holder_id = if req.serialize_part.publish_local_cache {
             if !local_cache_publish_supported {
                 let err = msg_and_error::KvError::Api(
@@ -1435,20 +1490,6 @@ pub async fn handle_put_done(
             None
         };
 
-        let saturated_weight_u32 = if target_cap_bytes > u32::MAX as u64 {
-            tracing::warn!(
-                "moka weight saturation: key={} put_id=({},{}) cap={}B exceeds u32::MAX; weight set to u32::MAX",
-                key,
-                put_id.0,
-                put_id.1,
-                target_cap_bytes
-            );
-            u32::MAX
-        } else {
-            target_cap_bytes as u32
-        };
-        // Note: moka cache insertion happens after commit in a spawned task
-        // using the same saturated weight; avoid unused local here.
         // Insert into kv_routes with replica support
         let mut old_one_kv_routes: Option<Arc<OneKvNodesRoutes>> = None;
         let mut inserted = false;
@@ -1463,6 +1504,7 @@ pub async fn handle_put_done(
                     Arc::new(OneKvNodesRoutes {
                         put_id,
                         lease_id: lease_id_opt,
+                        atomic_group: atomic_group.clone(),
                         nodes_replicas: RwLock::new(HashMap::new()),
                         get_durable_slots_used: AtomicU32::new(0),
                     })
@@ -1473,6 +1515,7 @@ pub async fn handle_put_done(
                 *one_kv_routes = Arc::new(OneKvNodesRoutes {
                     put_id,
                     lease_id: lease_id_opt,
+                    atomic_group: atomic_group.clone(),
                     nodes_replicas: RwLock::new(HashMap::new()),
                     get_durable_slots_used: AtomicU32::new(0),
                 });
@@ -1496,6 +1539,10 @@ pub async fn handle_put_done(
                     replica_target,
                 )
                 .await;
+            replica_activity_completion
+                .as_mut()
+                .expect("replica target activity guard must exist")
+                .disarm();
         }
 
         if let Some(old) = old_one_kv_routes {
@@ -1514,58 +1561,21 @@ pub async fn handle_put_done(
             }
         }
 
-        // Post-commit maintenance: update prefix-count index (for CountPrefix RPC)
-        // and, if applicable, update per-node cache controller. Run both in a
-        // spawned task to keep the PutDone RPC path lean and consistent with
-        // other async cache control operations. Deletion path already removes
-        // the index entry in delete.rs (do_delete_one_kv_all_replicas).
-        {
-            let view_task = view.clone();
-            let key_for_spawn = key.clone();
-            let node_for_spawn = node_id.clone();
-            let do_prefix_index_update = view.master_kv_router().prefix_index_enabled();
-            let do_cache_insert =
-                lease_id_opt.is_none() && view.master_kv_router().replica_cache_enabled();
-            // Reuse the saturated weight computed above for moka insertion
-            let cap_bytes_u32 = saturated_weight_u32;
-            view.spawn("post_put_done_maintenance", async move {
-                // 1) Update prefix-counting index
-                if do_prefix_index_update {
-                    let inner = view_task.master_kv_router().inner();
-                    let mut tree = inner.prefix_index.write().await;
-                    tree.insert(&key_for_spawn);
-                }
-
-                // 2) Optionally update node cache controller (non-leased keys)
-                if do_cache_insert {
-                    let cache = view_task
-                        .master_kv_router()
-                        .get_node_cache_controller(&node_for_spawn);
-                    if let Some(cache) = cache {
-                        let desc = NodeValueReplicaDesc {
-                            weight_bytes: cap_bytes_u32,
-                            put_id,
-                        };
-                        tracing::debug!("Inserting key: {:?} into cache", key_for_spawn);
-                        cache.insert(key_for_spawn.clone(), desc);
-                        tracing::debug!(
-                            "Inserted key: {:?} into cache, current cache size: {}",
-                            key_for_spawn,
-                            cache.weighted_size()
-                        );
-                    } else {
-                        tracing::warn!(
-                            "No cache controller found for node: {}, node is not ready",
-                            node_for_spawn
-                        );
-                    }
-                }
-            });
-        }
+        enqueue_post_route_maintenance(
+            &view,
+            RoutePublishEvent::primary_put(
+                key.clone(),
+                put_id,
+                lease_id_opt,
+                node_id.clone(),
+                target_cap_bytes,
+            ),
+        )
+        .await;
 
         // Lease attach is handled before kv_routes insertion
 
-        tracing::info!(
+        tracing::debug!(
             "Completed put operation with put_id: {:?}, key: {:?}",
             put_id,
             key
@@ -1573,6 +1583,20 @@ pub async fn handle_put_done(
     } else {
         if let Some(slot) = req.serialize_part.committed_slot.clone() {
             let key = req.serialize_part.key.clone();
+            let _activity_lease = match view
+                .master_kv_router()
+                .reserve_inflight_put_key(&key, false, false)
+            {
+                Ok(activity_lease) => activity_lease,
+                Err(err) => {
+                    return MsgPack {
+                        serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(
+                            &err,
+                        ),
+                        raw_bytes: Vec::new(),
+                    };
+                }
+            };
             let node_id = req_node_id;
             let Some(tomb_tag) = view.master_seg_manager().get_node_tomb_tag(&node_id) else {
                 let err = msg_and_error::KvError::Api(
@@ -1615,7 +1639,7 @@ pub async fn handle_put_done(
                     raw_bytes: Vec::new(),
                 };
             }
-            let target_cap_bytes = slot.len;
+            let target_cap_bytes = slot.slot_size;
             if let Some(lease_id) = lease_id_opt {
                 if let Err(e) = view
                     .master_lease_manager()
@@ -1655,6 +1679,7 @@ pub async fn handle_put_done(
                     len: slot.len,
                     base_addr: slot.base_addr,
                 }),
+                owner_local_indexed: true,
                 tomb_tag,
             };
             return publish_completed_put_route(
@@ -1662,6 +1687,7 @@ pub async fn handle_put_done(
                 key,
                 put_id,
                 lease_id_opt,
+                atomic_group,
                 node_id,
                 completed_info,
                 target_cap_bytes,
@@ -1795,6 +1821,7 @@ pub async fn handle_batch_put_done(
                     lease_id,
                     committed_slot: item.committed_slot,
                     publish_local_cache: item.publish_local_cache,
+                    atomic_group: item.atomic_group,
                 },
                 raw_bytes: Vec::new(),
             },
@@ -1812,6 +1839,115 @@ pub async fn handle_batch_put_done(
     }
     MsgPack {
         serialize_part: BatchPutDoneResp {
+            items,
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+            server_process_us: 0,
+        },
+        raw_bytes: Vec::new(),
+    }
+}
+
+/// V2 route publication for local-first puts. The wire carries each key once
+/// plus a compact ordered partition. The master materializes one shared group
+/// descriptor per partition and passes cheap `Arc` clones to member routes,
+/// avoiding both repeated wire descriptors and repeated group validation.
+pub async fn handle_grouped_batch_put_done(
+    view: MasterKvRouterView,
+    req: MsgPack<GroupedBatchPutDoneReq>,
+    req_node_id: NodeID,
+) -> MsgPack<GroupedBatchPutDoneResp> {
+    let GroupedBatchPutDoneReq {
+        items: request_items,
+        atomic_group_lens,
+    } = req.serialize_part;
+    let keys_and_put_ids = request_items
+        .iter()
+        .map(|item| (item.key.clone(), item.put_id))
+        .collect::<Vec<_>>();
+    let assignments =
+        match build_shared_put_atomic_group_assignments(&keys_and_put_ids, &atomic_group_lens) {
+            Ok(assignments) => assignments,
+            Err(detail) => {
+                let err = msg_and_error::ApiError::InvalidArgument { detail };
+                let (error_code, error_json) = err.to_code_and_json();
+                return MsgPack {
+                    serialize_part: GroupedBatchPutDoneResp {
+                        items: Vec::new(),
+                        error_code,
+                        error_json,
+                        server_process_us: 0,
+                    },
+                    raw_bytes: Vec::new(),
+                };
+            }
+        };
+
+    // The partition builder derives membership from these exact ordered items.
+    // Reject duplicate/empty keys once per group so every member is represented
+    // exactly once before any route becomes visible.
+    let mut offset = 0usize;
+    for group_len in atomic_group_lens.iter().copied() {
+        if group_len > 1 {
+            let mut unique = HashSet::with_capacity(group_len);
+            let end = offset + group_len;
+            if keys_and_put_ids[offset..end]
+                .iter()
+                .any(|(key, _)| key.is_empty() || !unique.insert(key.as_str()))
+            {
+                let err = msg_and_error::ApiError::InvalidArgument {
+                    detail: format!(
+                        "grouped put member keys must be non-empty and unique: offset={} len={}",
+                        offset, group_len
+                    ),
+                };
+                let (error_code, error_json) = err.to_code_and_json();
+                return MsgPack {
+                    serialize_part: GroupedBatchPutDoneResp {
+                        items: Vec::new(),
+                        error_code,
+                        error_json,
+                        server_process_us: 0,
+                    },
+                    raw_bytes: Vec::new(),
+                };
+            }
+        }
+        offset += group_len;
+    }
+
+    let mut items = Vec::with_capacity(request_items.len());
+    for (item, atomic_group) in request_items.into_iter().zip(assignments) {
+        let key = item.key.clone();
+        let put_id = item.put_id;
+        let resp = handle_put_done_with_resolved_group(
+            view.clone(),
+            MsgPack {
+                serialize_part: PutDoneReq {
+                    key,
+                    put_id,
+                    lease_id: item.lease_id,
+                    committed_slot: item.committed_slot,
+                    publish_local_cache: item.publish_local_cache,
+                    atomic_group: None,
+                },
+                raw_bytes: Vec::new(),
+            },
+            req_node_id.clone(),
+            atomic_group,
+        )
+        .await;
+        let part = resp.serialize_part;
+        items.push(BatchPutDoneItemResp {
+            key: item.key,
+            put_id: item.put_id,
+            error_code: part.error_code,
+            error_json: part.error_json,
+            local_cache_holder_id: part.local_cache_holder_id,
+        });
+    }
+    MsgPack {
+        serialize_part: GroupedBatchPutDoneResp {
             items,
             error_code: msg_and_error::OK,
             error_json: String::new(),
@@ -1839,12 +1975,20 @@ pub async fn handle_put_append_start(
         .map(|route| current_route_needs_remote_replica(route, &req_node_id, put_id))
         .unwrap_or(false);
     if !current_route_still_needs_remote {
-        let _ = view
+        if let Some(inflight) = view
             .master_kv_router()
             .inner()
             .inflight_replica_tasks
             .remove(&(key.clone(), put_id.0, put_id.1))
-            .await;
+            .await
+        {
+            inflight._activity_lease.release_now();
+        }
+        if req.serialize_part.demote_source_on_remote_complete {
+            view.master_kv_router()
+                .demote_owner_hot_cohort_if_recoverable(req_node_id.as_ref(), &key, put_id)
+                .await;
+        }
         return MsgPack {
             serialize_part: PutAppendStartResp {
                 scheduled: false,
@@ -1887,6 +2031,8 @@ pub async fn handle_put_append_start(
             req.serialize_part.preferred_sub_cluster.as_deref(),
             req.serialize_part.len,
             &excluded_nodes,
+            req.serialize_part.demote_source_on_remote_complete,
+            req.serialize_part.protect_source_on_remote_complete,
         ) {
             Ok(reservation) => reservation,
             Err(msg_and_error::KvError::Api(msg_and_error::ApiError::NoSpace {
@@ -1978,12 +2124,15 @@ pub async fn handle_put_append_revoke(
 ) -> MsgPack<PutAppendRevokeResp> {
     let put_id = req.serialize_part.put_id;
     let key = req.serialize_part.key;
-    let _ = view
+    if let Some(inflight) = view
         .master_kv_router()
         .inner()
         .inflight_replica_tasks
         .remove(&(key, put_id.0, put_id.1))
-        .await;
+        .await
+    {
+        inflight._activity_lease.release_now();
+    }
     MsgPack {
         serialize_part: PutAppendRevokeResp {
             error_code: msg_and_error::OK,
@@ -2017,6 +2166,8 @@ pub async fn handle_put_append_done(
             raw_bytes: Vec::new(),
         };
     };
+    let _activity_completion =
+        MasterKeyActivityCompletionGuard::new(inflight._activity_lease.clone());
     let Some(allocation) = inflight.target_allocation.lock().take() else {
         let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
             detail: format!(
@@ -2029,13 +2180,22 @@ pub async fn handle_put_append_done(
             raw_bytes: Vec::new(),
         };
     };
-    let appended = append_current_route_replica_if_matching(
+    let published = append_current_route_replica_if_matching(
         &view,
         &key,
         inflight.put_id,
         inflight.node_id,
         allocation,
     );
+    let appended = published.is_some();
+    if let Some(event) = published {
+        enqueue_post_route_maintenance(&view, event).await;
+    }
+    if inflight.demote_source_on_remote_complete {
+        view.master_kv_router()
+            .demote_owner_hot_cohort_if_recoverable(inflight.source_node_id.as_ref(), &key, put_id)
+            .await;
+    }
     MsgPack {
         serialize_part: PutAppendDoneResp {
             appended,

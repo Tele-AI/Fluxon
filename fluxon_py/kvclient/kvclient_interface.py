@@ -75,11 +75,22 @@ class PutOptionalArgs:
     - write_through: keep synchronous remote-placement semantics when the backend
       supports an async write-back path. Defaults to True to match SGLang
       HiCache's default write policy.
+    - make_replica_task: enqueue an asynchronous replica after a local write-back
+      commit. Set False for a local-only write-back.
+    - make_replica_task_mask: optional per-key replica admission decisions for
+      local_fast_put_start(). Its length must match the key batch. The scalar
+      make_replica_task remains the batch-wide gate.
+    - atomic_group_lens: optional positive lengths that partition the ordered
+      local_fast_put_start() key batch into atomic groups. Replica admission
+      must be uniform within every group.
     """
     lease_id: Optional[int] = None
     reject_if_inflight_same_key: bool = False
     reject_if_exist_same_key: bool = False
     write_through: bool = True
+    make_replica_task: bool = True
+    make_replica_task_mask: Optional[List[bool]] = None
+    atomic_group_lens: Optional[List[int]] = None
 
     def support_mooncake(self) -> Tuple[bool, List[str]]:
         """
@@ -100,6 +111,12 @@ class PutOptionalArgs:
             unsupported.append("reject_if_exist_same_key")
         if self.write_through:
             unsupported.append("write_through")
+        if not self.make_replica_task:
+            unsupported.append("make_replica_task")
+        if self.make_replica_task_mask is not None:
+            unsupported.append("make_replica_task_mask")
+        if self.atomic_group_lens is not None:
+            unsupported.append("atomic_group_lens")
         return (len(unsupported) == 0, unsupported)
 
 

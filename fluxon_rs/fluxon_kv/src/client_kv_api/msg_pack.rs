@@ -150,11 +150,21 @@ pub struct ExternalBatchGetStartResp {
     pub error_json: String,
     pub handle: u64,
     pub raw_prefix_hit_len: usize,
+    pub transfer_plan: ExternalBatchGetStartTransferPlan,
 }
 impl MsgPackSerializePart for ExternalBatchGetStartResp {
     fn msg_id(&self) -> u32 {
         4031
     }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub enum ExternalBatchGetStartTransferPlan {
+    #[default]
+    OwnerRpc,
+    InlineLocal {
+        items: Vec<ExternalBatchGetItemResp>,
+    },
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -191,11 +201,21 @@ pub struct ExternalBatchGetCancelReq {
     pub req_node_id: String,
     /// Owner node_start_time observed by external when request starts
     pub started_time: i64,
+    pub transfer_plan: ExternalBatchGetCancelPlan,
 }
 impl MsgPackSerializePart for ExternalBatchGetCancelReq {
     fn msg_id(&self) -> u32 {
         4034
     }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub enum ExternalBatchGetCancelPlan {
+    #[default]
+    OwnerRpc,
+    InlineLocal {
+        holder_ids: Vec<u64>,
+    },
 }
 impl RPCReq for ExternalBatchGetCancelReq {
     type Resp = ExternalBatchGetCancelResp;
@@ -212,6 +232,65 @@ impl MsgPackSerializePart for ExternalBatchGetCancelResp {
     }
 }
 
+#[cfg(test)]
+mod external_batch_get_plan_wire_tests {
+    use super::{
+        ExternalBatchGetCancelPlan, ExternalBatchGetCancelReq, ExternalBatchGetItemResp,
+        ExternalBatchGetStartResp, ExternalBatchGetStartTransferPlan,
+    };
+    use crate::memholder::ExternalMemHolderInfo;
+    use crate::rpcresp_kvresult_convert::msg_and_error::OK;
+
+    #[test]
+    fn inline_start_and_cancel_plans_round_trip() {
+        let start = ExternalBatchGetStartResp {
+            error_code: OK,
+            error_json: String::new(),
+            handle: 19,
+            raw_prefix_hit_len: 2,
+            transfer_plan: ExternalBatchGetStartTransferPlan::InlineLocal {
+                items: vec![ExternalBatchGetItemResp {
+                    error_code: OK,
+                    error_json: String::new(),
+                    external_memholder_info: Some(ExternalMemHolderInfo {
+                        offset: 4096,
+                        len: 8192,
+                        holder_id: 23,
+                    }),
+                }],
+            },
+        };
+        let decoded_start: ExternalBatchGetStartResp =
+            bitcode::decode(&bitcode::encode(&start)).expect("decode inline start plan");
+        assert_eq!(decoded_start.handle, 19);
+        assert!(matches!(
+            decoded_start.transfer_plan,
+            ExternalBatchGetStartTransferPlan::InlineLocal { items }
+                if items.len() == 1
+                    && items[0]
+                        .external_memholder_info
+                        .as_ref()
+                        .is_some_and(|info| info.holder_id == 23)
+        ));
+
+        let cancel = ExternalBatchGetCancelReq {
+            handle: 19,
+            req_node_id: "external-a".to_string(),
+            started_time: 29,
+            transfer_plan: ExternalBatchGetCancelPlan::InlineLocal {
+                holder_ids: vec![23, 24],
+            },
+        };
+        let decoded_cancel: ExternalBatchGetCancelReq =
+            bitcode::decode(&bitcode::encode(&cancel)).expect("decode inline cancel plan");
+        assert!(matches!(
+            decoded_cancel.transfer_plan,
+            ExternalBatchGetCancelPlan::InlineLocal { holder_ids }
+                if holder_ids == vec![23, 24]
+        ));
+    }
+}
+
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct ExternalBatchPutStartItemReq {
     pub key: String,
@@ -225,6 +304,8 @@ pub struct ExternalBatchPutStartItemReq {
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct ExternalBatchPutStartReq {
     pub items: Vec<ExternalBatchPutStartItemReq>,
+    /// Positive lengths partitioning `items`; omitted means one group per item.
+    pub atomic_group_lens: Option<Vec<usize>>,
     /// Owner node_start_time observed by external when request starts
     pub started_time: i64,
 }

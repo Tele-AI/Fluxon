@@ -55,6 +55,63 @@ _PyBytes_AsString.restype = ctypes.c_void_p
 
 _SIDE_TRANSFER_WORKER_PYTHON_ENV = "FLUXON_KV_SIDE_WORKER_PYTHON"
 _BLOCKING_PUT_OUTER_TOTAL_LOG_INTERVAL_NS = 10 * 1_000_000_000
+_MIN_EXPLICIT_RPC_TIMEOUT_MS = int(fluxon_pyo3.MIN_EXPLICIT_RPC_TIMEOUT_MS)
+
+
+def _validate_explicit_rpc_timeout_ms(timeout_ms: int) -> None:
+    if not isinstance(timeout_ms, int):
+        raise InvalidArgumentError(message=f"timeout_ms must be int; got {type(timeout_ms)}")
+    if timeout_ms < _MIN_EXPLICIT_RPC_TIMEOUT_MS:
+        raise InvalidArgumentError(
+            message=(
+                f"timeout_ms must be >= {_MIN_EXPLICIT_RPC_TIMEOUT_MS}; "
+                f"got {timeout_ms}"
+            )
+        )
+
+
+def _validate_put_atomic_groups(
+    keys: List[str],
+    atomic_group_lens: Optional[List[int]],
+    make_replica_task_mask: Optional[List[bool]],
+) -> Optional[List[int]]:
+    if atomic_group_lens is None:
+        return None
+    if not isinstance(atomic_group_lens, list):
+        raise ValueError(
+            "atomic_group_lens must be list[int] when provided; "
+            f"got {type(atomic_group_lens)}"
+        )
+    normalized_group_lens: List[int] = []
+    for index, length in enumerate(atomic_group_lens):
+        if type(length) is not int:
+            raise ValueError(
+                "atomic_group_lens items must be int; "
+                f"index={index} got={type(length)}"
+            )
+        if length <= 0:
+            raise ValueError(
+                "atomic_group_lens entries must be > 0; "
+                f"index={index} got={length}"
+            )
+        normalized_group_lens.append(length)
+    group_sum = sum(normalized_group_lens)
+    if group_sum != len(keys):
+        raise ValueError(
+            "atomic_group_lens must sum to keys length; "
+            f"sum={group_sum} keys={len(keys)}"
+        )
+    if make_replica_task_mask is not None:
+        offset = 0
+        for group_index, group_len in enumerate(normalized_group_lens):
+            group_mask = make_replica_task_mask[offset : offset + group_len]
+            if any(item != group_mask[0] for item in group_mask[1:]):
+                raise ValueError(
+                    "make_replica_task_mask must be uniform within each atomic group; "
+                    f"group_index={group_index} offset={offset} len={group_len}"
+                )
+            offset += group_len
+    return normalized_group_lens
 
 
 def _percentile_nearest_rank_ns(sorted_values: List[int], percentile: int) -> int:
@@ -480,6 +537,9 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 bool(opts.reject_if_exist_same_key) if opts is not None else False
             )
             write_through = bool(opts.write_through) if opts is not None else True
+            make_replica_task = (
+                bool(opts.make_replica_task) if opts is not None else True
+            )
             inner_res = self._client.put(
                 key,
                 ptrs,
@@ -487,6 +547,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 reject_if_inflight_same_key=reject_if_inflight_same_key,
                 reject_if_exist_same_key=reject_if_exist_same_key,
                 write_through=write_through,
+                make_replica_task=make_replica_task,
             )
             if not inner_res.is_ok():
                 err = inner_res.unwrap_error()
@@ -534,6 +595,9 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 bool(opts.reject_if_exist_same_key) if opts is not None else False
             )
             write_through = bool(opts.write_through) if opts is not None else True
+            make_replica_task = (
+                bool(opts.make_replica_task) if opts is not None else True
+            )
             inner_res = self._client.put_blocking(
                 key,
                 ptrs,
@@ -541,6 +605,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 reject_if_inflight_same_key=reject_if_inflight_same_key,
                 reject_if_exist_same_key=reject_if_exist_same_key,
                 write_through=write_through,
+                make_replica_task=make_replica_task,
             )
             if not inner_res.is_ok():
                 return Result.new_error(inner_res.unwrap_error())
@@ -605,6 +670,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             bool(opts.reject_if_exist_same_key) if opts is not None else False
         )
         write_through = bool(opts.write_through) if opts is not None else True
+        make_replica_task = bool(opts.make_replica_task) if opts is not None else True
 
         keepalive_groups: List[List[bytes]] = []
         dlpack_groups: List[List[object]] = []
@@ -624,6 +690,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 reject_if_inflight_same_key=reject_if_inflight_same_key,
                 reject_if_exist_same_key=reject_if_exist_same_key,
                 write_through=write_through,
+                make_replica_task=make_replica_task,
                 concurrency=concurrency if concurrency is not None else self._batch_concurrency,
             )
             if not inner_res.is_ok():
@@ -741,6 +808,9 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 bool(opts.reject_if_exist_same_key) if opts is not None else False
             )
             write_through = bool(opts.write_through) if opts is not None else True
+            make_replica_task = (
+                bool(opts.make_replica_task) if opts is not None else True
+            )
             inner_res = self._client.put(
                 key,
                 ptrs,
@@ -748,6 +818,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 reject_if_inflight_same_key=reject_if_inflight_same_key,
                 reject_if_exist_same_key=reject_if_exist_same_key,
                 write_through=write_through,
+                make_replica_task=make_replica_task,
             )
             if not inner_res.is_ok():
                 return Result.new_error(_map_nospace_to_storagefull(inner_res.unwrap_error()))
@@ -786,6 +857,9 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 bool(opts.reject_if_exist_same_key) if opts is not None else False
             )
             write_through = bool(opts.write_through) if opts is not None else True
+            make_replica_task = (
+                bool(opts.make_replica_task) if opts is not None else True
+            )
             inner_res = self._client.put_blocking(
                 key,
                 ptrs,
@@ -793,6 +867,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 reject_if_inflight_same_key=reject_if_inflight_same_key,
                 reject_if_exist_same_key=reject_if_exist_same_key,
                 write_through=write_through,
+                make_replica_task=make_replica_task,
             )
             if not inner_res.is_ok():
                 return Result.new_error(inner_res.unwrap_error())
@@ -989,6 +1064,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             bool(opts.reject_if_exist_same_key) if opts is not None else False
         )
         write_through = bool(opts.write_through) if opts is not None else True
+        make_replica_task = bool(opts.make_replica_task) if opts is not None else True
 
         try:
             inner_res = self._client.batch_put_from(
@@ -999,6 +1075,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 reject_if_inflight_same_key=reject_if_inflight_same_key,
                 reject_if_exist_same_key=reject_if_exist_same_key,
                 write_through=write_through,
+                make_replica_task=make_replica_task,
             )
             if inner_res.is_ok():
                 submit_results = list(inner_res.unwrap())
@@ -1203,10 +1280,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         try:
             if self._client is None:
                 raise GeneralError(message="Store not initialized when rpc_call(). Call setup() first.")
-            if not isinstance(timeout_ms, int):
-                raise InvalidArgumentError(message=f"timeout_ms must be int; got {type(timeout_ms)}")
-            if timeout_ms < 10_000:
-                raise InvalidArgumentError(message=f"timeout_ms must be >= 10000; got {timeout_ms}")
+            _validate_explicit_rpc_timeout_ms(timeout_ms)
 
             encoded = encode_flat_kv_dict(payload)
             if not encoded.is_ok():
@@ -1233,10 +1307,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 raise GeneralError(message="Store not initialized when rpc_call_bytes(). Call setup() first.")
             if not isinstance(payload, (bytes, bytearray)):
                 raise InvalidArgumentError(message=f"payload must be bytes; got {type(payload)}")
-            if not isinstance(timeout_ms, int):
-                raise InvalidArgumentError(message=f"timeout_ms must be int; got {type(timeout_ms)}")
-            if timeout_ms < 10_000:
-                raise InvalidArgumentError(message=f"timeout_ms must be >= 10000; got {timeout_ms}")
+            _validate_explicit_rpc_timeout_ms(timeout_ms)
 
             inner = self._client.rpc_call(node_id, path, bytes(payload), timeout_ms)
             if not inner.is_ok():
@@ -1328,10 +1399,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 raise InvalidArgumentError(message=f"file_offset must be int; got {type(file_offset)}")
             if file_offset < 0:
                 raise InvalidArgumentError(message=f"file_offset must be >= 0; got {file_offset}")
-            if not isinstance(timeout_ms, int):
-                raise InvalidArgumentError(message=f"timeout_ms must be int; got {type(timeout_ms)}")
-            if timeout_ms < 10_000:
-                raise InvalidArgumentError(message=f"timeout_ms must be >= 10000; got {timeout_ms}")
+            _validate_explicit_rpc_timeout_ms(timeout_ms)
 
             return self._client.sync_kv_to_file(
                 target_instance_key,
@@ -1452,12 +1520,41 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             bool(opts.reject_if_exist_same_key) if opts is not None else False
         )
         write_through = bool(opts.write_through) if opts is not None else True
+        make_replica_task = bool(opts.make_replica_task) if opts is not None else True
+        make_replica_task_mask: Optional[List[bool]] = None
+        if opts is not None and opts.make_replica_task_mask is not None:
+            requested_mask = opts.make_replica_task_mask
+            if not isinstance(requested_mask, list):
+                raise ValueError(
+                    "make_replica_task_mask must be list[bool] when provided; "
+                    f"got {type(requested_mask)}"
+                )
+            if len(requested_mask) != len(keys):
+                raise ValueError(
+                    "make_replica_task_mask length must match keys length; "
+                    f"keys={len(keys)} mask={len(requested_mask)}"
+                )
+            for index, item in enumerate(requested_mask):
+                if type(item) is not bool:
+                    raise ValueError(
+                        "make_replica_task_mask items must be bool; "
+                        f"index={index} got={type(item)}"
+                    )
+            make_replica_task_mask = list(requested_mask)
+        atomic_group_lens = _validate_put_atomic_groups(
+            keys,
+            opts.atomic_group_lens if opts is not None else None,
+            make_replica_task_mask,
+        )
         inner_res = self._client.local_fast_put_start(
             keys,
             value_len,
             reject_if_inflight_same_key=reject_if_inflight_same_key,
             reject_if_exist_same_key=reject_if_exist_same_key,
             write_through=write_through,
+            make_replica_task=make_replica_task,
+            make_replica_task_mask=make_replica_task_mask,
+            atomic_group_lens=atomic_group_lens,
         )
         if not inner_res.is_ok():
             err = inner_res.unwrap_error()
@@ -1609,6 +1706,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             raise RuntimeError(
                 f"cancel_get_transfer backend error: {inner_res.unwrap_error()}"
             )
+        _ = inner_res.unwrap()
         handle.closed = True
 
     def get_transfer(

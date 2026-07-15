@@ -1,8 +1,7 @@
 use super::{
     MasterKvRouterView,
     msg_pack::{
-        BatchDeleteAckReq, BatchDeleteAckResp, BatchDeleteClientKvMetaCacheReq, DeleteAckReq,
-        DeleteAckResp, DeleteClientKvMetaCacheItem, DeleteReq, DeleteResp,
+        BatchDeleteAckReq, BatchDeleteAckResp, DeleteAckReq, DeleteAckResp, DeleteReq, DeleteResp,
     },
 };
 use crate::master_kv_router::OneKvNodesRoutes;
@@ -11,12 +10,18 @@ use crate::memholder::{
     EnsureMemholderMgmtDeleteActorOwned, MasterOwnerMemMgr, MemholderManagerTrait,
 };
 use crate::{
-    cluster_manager::NodeID,
-    p2p::msg_pack::{MsgPack, RPCCaller},
+    p2p::msg_pack::MsgPack,
     rpcresp_kvresult_convert::msg_and_error::{self, kv},
 };
 use limit_thirdparty::tokio;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+
+#[cfg(any(test, feature = "test_bins"))]
+use super::msg_pack::{BatchDeleteClientKvMetaCacheReq, DeleteClientKvMetaCacheItem};
+#[cfg(any(test, feature = "test_bins"))]
+use crate::{cluster_manager::NodeID, p2p::msg_pack::RPCCaller};
+#[cfg(any(test, feature = "test_bins"))]
+use std::time::Duration;
 
 /// Remove a key from master indices and trigger client cache invalidation broadcast.
 ///
@@ -45,7 +50,7 @@ pub fn do_delete_one_kv_all_replicas(
                 if view.master_kv_router().prefix_index_enabled() {
                     let inner = view.master_kv_router().inner();
                     let mut tree = inner.prefix_index.write().await;
-                    tree.remove(&key_clone);
+                    tree.remove(&key_clone, deleted_put_id);
                 }
 
                 if let Err(err) = view
@@ -68,6 +73,8 @@ pub fn do_delete_one_kv_all_replicas(
                     if let Some(cache) = view.master_kv_router().get_node_cache_controller(node_id)
                     {
                         let _ = cache.remove(&key_clone);
+                        view.master_kv_router()
+                            .remove_node_writeback_tier1_entry(node_id, &key_clone);
                         tracing::debug!(
                             "Removed key {} from node cache controller: {}",
                             key_clone,
@@ -84,6 +91,8 @@ pub fn do_delete_one_kv_all_replicas(
     }
 }
 
+/// Test-only direct route removal. Production eviction uses the fenced owner reclaim protocol.
+#[cfg(any(test, feature = "test_bins"))]
 pub fn evict_one_kv_replica_for_node(
     view: &MasterKvRouterView,
     key: String,
@@ -145,7 +154,7 @@ pub fn evict_one_kv_replica_for_node(
             let _ = view.spawn("local_evict_remove_prefix_index", async move {
                 let inner = view_task.master_kv_router().inner();
                 let mut tree = inner.prefix_index.write().await;
-                tree.remove(&key_for_prefix);
+                tree.remove(&key_for_prefix, put_id);
             });
         }
     }

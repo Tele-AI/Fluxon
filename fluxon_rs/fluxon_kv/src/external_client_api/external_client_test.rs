@@ -48,6 +48,8 @@ fn new_master_config(
         pprof_duration_seconds: None,
         master_ui: None,
         replica_task_placement: ReplicaTaskPlacementConfig::default(),
+        replica_cache_capacity_ratio: crate::config::DEFAULT_REPLICA_CACHE_CAPACITY_RATIO,
+        replica_writeback_tier1_capacity_ratio: None,
         test_spec_config: TestSpecConfig::default(),
     }
 }
@@ -78,6 +80,7 @@ fn new_client_config(
             rdma_device_names: None,
         },
         pprof_duration_seconds: None,
+        replica_writeback_hot_capacity_ratio: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: vec![etcd.to_string()],
@@ -121,6 +124,7 @@ fn new_zero_contribution_client_config(
             rdma_device_names: None,
         },
         pprof_duration_seconds: None,
+        replica_writeback_hot_capacity_ratio: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: Vec::new(),

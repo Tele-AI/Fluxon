@@ -60,3 +60,6 @@ bench_suite.lock
 deployment/local/
 setup_and_pack/pack_fluxonkv_pylib_env.yaml
 fluxon_rs/moka/
+fluxon_rs/*.btr
+fluxon_rs/moka.bak_non_git_*/
+build_*.rc

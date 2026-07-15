@@ -29,7 +29,10 @@ use fluxon_kv::cluster_manager::ClusterManagerViewTrait;
 use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use fluxon_kv::config::{ClientConfigYaml, MasterConfigYaml};
 use fluxon_kv::external_client_api::ExternalClientApiViewTrait;
-use fluxon_kv::master_kv_router::msg_pack::{BatchPreparePutKeyItemReq, PutDoneCommittedSlot};
+use fluxon_kv::master_kv_router::msg_pack::{
+    BatchPreparePutKeyItemReq, PutDoneCommittedSlot, ReserveLocalGrantOutcome,
+    build_put_atomic_group_assignments,
+};
 use fluxon_kv::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
 use fluxon_kv::memholder::kvclient_encode::{BorrowedFlatKvValueRange, flat_kv_decode_borrowed};
 use fluxon_kv::memholder::{
@@ -2078,6 +2081,25 @@ struct FluxonGetViewsPlan {
     _holders: Vec<StagedGetViewHolder>,
 }
 
+fn defer_drop_to_runtime<T>(runtime: Option<&Runtime>, value: T)
+where
+    T: Send + 'static,
+{
+    if let Some(runtime) = runtime {
+        // Dropping a read plan can release hundreds of ExternalMemHolder
+        // instances. Each holder schedules its delete ACK, so doing the full
+        // drop on the Python scheduler thread adds milliseconds to every
+        // restore completion. The CUDA consumer has already finished before
+        // release_views is called; removing the plan from the registry makes
+        // the pointer invalid immediately, while the actual holder release can
+        // safely run on Tokio's blocking pool.
+        let _join = runtime.spawn_blocking(move || drop(value));
+    } else {
+        // A post-close caller has no runtime on which to defer cleanup.
+        drop(value);
+    }
+}
+
 enum StagedGetViewHolder {
     Owner { _holder: Arc<RustUserMemHolder> },
     External { _holder: Arc<RustExternalMemHolder> },
@@ -2106,6 +2128,8 @@ struct StagedOwnerPutPlanData {
     value_len: u64,
     key_reservation_ids: Vec<u64>,
     slot_lease: OwnerLocalReserveSlotLease,
+    make_replica_task_mask: Vec<bool>,
+    atomic_group_lens: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -3086,6 +3110,105 @@ pub struct KvClient {
     locality_counters: Arc<FluxonLocalityCounters>,
 }
 
+fn build_put_optional_args(
+    lease_id: Option<u64>,
+    reject_if_inflight_same_key: bool,
+    reject_if_exist_same_key: bool,
+    write_through: bool,
+    make_replica_task: bool,
+) -> fluxon_kv::client_kv_api::PutOptionalArgs {
+    let mut opts = fluxon_kv::client_kv_api::PutOptionalArgs::new();
+    if let Some(id) = lease_id {
+        opts.0
+            .push(fluxon_kv::client_kv_api::PutOptionalArg::LeaseId(id));
+    }
+    if reject_if_inflight_same_key {
+        opts.0
+            .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
+    }
+    if reject_if_exist_same_key {
+        opts.0
+            .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
+    }
+    if write_through || !make_replica_task {
+        opts.0
+            .push(fluxon_kv::client_kv_api::PutOptionalArg::SkipMakeReplicaTask);
+    }
+    opts
+}
+
+fn resolve_make_replica_task_mask(
+    key_count: usize,
+    write_through: bool,
+    make_replica_task: bool,
+    requested_mask: Option<Vec<bool>>,
+    atomic_group_lens: &[usize],
+) -> Result<Vec<bool>, String> {
+    let requested_mask = match requested_mask {
+        Some(mask) => {
+            if mask.len() != key_count {
+                return Err(format!(
+                    "make_replica_task_mask length must match keys length; keys={} mask={}",
+                    key_count,
+                    mask.len()
+                ));
+            }
+            mask
+        }
+        None => vec![true; key_count],
+    };
+    let mut offset = 0usize;
+    for (group_index, group_len) in atomic_group_lens.iter().copied().enumerate() {
+        let end = offset + group_len;
+        let group_mask = &requested_mask[offset..end];
+        if group_mask[1..].iter().any(|item| *item != group_mask[0]) {
+            return Err(format!(
+                "make_replica_task_mask must be uniform within each atomic group; group_index={} offset={} len={}",
+                group_index, offset, group_len
+            ));
+        }
+        offset = end;
+    }
+    let enabled = !write_through && make_replica_task;
+    Ok(requested_mask
+        .into_iter()
+        .map(|requested| enabled && requested)
+        .collect())
+}
+
+fn normalize_put_atomic_group_lens(
+    key_count: usize,
+    requested_group_lens: Option<Vec<usize>>,
+) -> Result<Vec<usize>, String> {
+    let Some(group_lens) = requested_group_lens else {
+        return Ok(vec![1; key_count]);
+    };
+    if group_lens.is_empty() {
+        return Err("atomic_group_lens must be non-empty when provided".to_string());
+    }
+    if let Some((index, _)) = group_lens
+        .iter()
+        .enumerate()
+        .find(|(_, length)| **length == 0)
+    {
+        return Err(format!(
+            "atomic_group_lens entries must be > 0; index={} got=0",
+            index
+        ));
+    }
+    let group_sum = group_lens
+        .iter()
+        .try_fold(0usize, |sum, length| sum.checked_add(*length))
+        .ok_or_else(|| "atomic_group_lens sum overflowed usize".to_string())?;
+    if group_sum != key_count {
+        return Err(format!(
+            "atomic_group_lens must sum to keys length; sum={} keys={}",
+            group_sum, key_count
+        ));
+    }
+    Ok(group_lens)
+}
+
 #[pymethods]
 impl KvClient {
     /// Create a new KV client
@@ -3358,7 +3481,7 @@ impl KvClient {
                         .client_kv_api_view()
                         .client_kv_api()
                         .inner()
-                        .reserve_local_grant()
+                        .reserve_local_grant(0, 0, false)
                         .await
                 })
             }) {
@@ -3371,9 +3494,22 @@ impl KvClient {
                 }
             };
             match reserve_resp {
-                Ok(resp) => ApiResult::new_success(
-                    (resp.grant_id, resp.addr, resp.base_addr, resp.len).into_py(py),
-                ),
+                Ok(ReserveLocalGrantOutcome::Granted {
+                    grant_id,
+                    node_id: _,
+                    addr,
+                    base_addr,
+                    len,
+                }) => ApiResult::new_success((grant_id, addr, base_addr, len).into_py(py)),
+                Ok(ReserveLocalGrantOutcome::Reclaimed { .. }) => {
+                    ApiResult::new_error(new_general_error(
+                        py,
+                        "raw reserve_local_grant request unexpectedly reclaimed class slots",
+                    ))
+                }
+                Ok(ReserveLocalGrantOutcome::None) => {
+                    unreachable!("reserve_local_grant filters empty successful outcomes")
+                }
                 Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
                     py,
                     &err,
@@ -3446,13 +3582,17 @@ impl KvClient {
         release_local_grant_blocking_inner(self, grant_id, py).into_py_object(py)
     }
 
-    #[pyo3(signature = (keys, value_len, reject_if_inflight_same_key=false, reject_if_exist_same_key=false))]
+    #[pyo3(signature = (keys, value_len, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, make_replica_task=true, make_replica_task_mask=None, atomic_group_lens=None))]
     fn local_fast_put_start(
         &self,
         keys: Vec<String>,
         value_len: u64,
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
+        write_through: bool,
+        make_replica_task: bool,
+        make_replica_task_mask: Option<Vec<bool>>,
+        atomic_group_lens: Option<Vec<usize>>,
         py: Python,
     ) -> PyObject {
         fn local_fast_put_start_inner(
@@ -3461,6 +3601,10 @@ impl KvClient {
             value_len: u64,
             reject_if_inflight_same_key: bool,
             reject_if_exist_same_key: bool,
+            write_through: bool,
+            make_replica_task: bool,
+            make_replica_task_mask: Option<Vec<bool>>,
+            atomic_group_lens: Option<Vec<usize>>,
             py: Python,
         ) -> ApiResult<PyObject> {
             if keys.is_empty() {
@@ -3481,6 +3625,25 @@ impl KvClient {
                     "local_fast_put_start value_len exceeds u32 limit",
                 ));
             }
+            let atomic_group_lens =
+                match normalize_put_atomic_group_lens(keys.len(), atomic_group_lens) {
+                    Ok(group_lens) => group_lens,
+                    Err(detail) => {
+                        return ApiResult::new_error(new_invalid_argument_error(py, &detail));
+                    }
+                };
+            let make_replica_task_mask = match resolve_make_replica_task_mask(
+                keys.len(),
+                write_through,
+                make_replica_task,
+                make_replica_task_mask,
+                &atomic_group_lens,
+            ) {
+                Ok(mask) => mask,
+                Err(detail) => {
+                    return ApiResult::new_error(new_invalid_argument_error(py, &detail));
+                }
+            };
             let framework = match require_kv_framework_api(client, py) {
                 Ok(v) => v,
                 Err(e) => return ApiResult::new_error(e),
@@ -3497,6 +3660,8 @@ impl KvClient {
             if framework.is_external_mode() {
                 let framework_for_start = framework.clone();
                 let keys_for_req = keys.clone();
+                let make_replica_task_mask_for_req = make_replica_task_mask.clone();
+                let atomic_group_lens_for_req = atomic_group_lens.clone();
                 let external_start_result = match py.allow_threads(|| {
                     runtime.run_async_from_sync(async move {
                         let external_api_view = framework_for_start.external_client_api_view();
@@ -3508,15 +3673,17 @@ impl KvClient {
                             .external_batch_put_start_rpc(ExternalBatchPutStartReq {
                                 items: keys_for_req
                                     .iter()
-                                    .map(|key| ExternalBatchPutStartItemReq {
+                                    .zip(make_replica_task_mask_for_req.iter())
+                                    .map(|(key, make_replica_task)| ExternalBatchPutStartItemReq {
                                         key: key.clone(),
                                         len: value_len,
                                         reject_if_inflight_same_key,
                                         reject_if_exist_same_key,
-                                        make_replica_task: true,
+                                        make_replica_task: *make_replica_task,
                                         preferred_sub_cluster: None,
                                     })
                                     .collect(),
+                                atomic_group_lens: Some(atomic_group_lens_for_req),
                                 started_time,
                             })
                             .await?;
@@ -3681,6 +3848,13 @@ impl KvClient {
                 return ApiResult::new_success((plan_ptr as u64).into_py(py));
             }
 
+            if write_through {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "local_fast_put_start write_through=true requires external mode",
+                ));
+            }
+
             let key_count = keys.len();
             let framework_for_start = framework.clone();
             let prepare_items = keys
@@ -3772,6 +3946,8 @@ impl KvClient {
                         value_len,
                         key_reservation_ids,
                         slot_lease,
+                        make_replica_task_mask,
+                        atomic_group_lens,
                     },
                 ))),
             });
@@ -3790,6 +3966,10 @@ impl KvClient {
             value_len,
             reject_if_inflight_same_key,
             reject_if_exist_same_key,
+            write_through,
+            make_replica_task,
+            make_replica_task_mask,
+            atomic_group_lens,
             py,
         )
         .into_py_object(py)
@@ -3931,12 +4111,15 @@ impl KvClient {
                         let inner = client_kv_api_view.client_kv_api().inner();
                         let slot_refs = owner_data.slot_lease.slots.clone();
                         let slot_size = owner_data.slot_lease.slot_size;
-                        if slot_refs.len() != owner_data.keys.len() {
+                        if slot_refs.len() != owner_data.keys.len()
+                            || owner_data.make_replica_task_mask.len() != owner_data.keys.len()
+                        {
                             let err = CoreKvError::Api(CoreApiError::Unknown {
                                 detail: format!(
-                                    "local_fast_put_commit slot/key length mismatch: keys={} slots={}",
+                                    "local_fast_put_commit staged length mismatch: keys={} slots={} replica_mask={}",
                                     owner_data.keys.len(),
-                                    slot_refs.len()
+                                    slot_refs.len(),
+                                    owner_data.make_replica_task_mask.len()
                                 ),
                             });
                             let _ = release_staged_put_resources(
@@ -3971,7 +4154,44 @@ impl KvClient {
                         };
                         let mut publish_items = Vec::with_capacity(owner_data.keys.len());
                         let mut ret_codes = Vec::with_capacity(owner_data.keys.len());
-                        for (key, slot_ref) in owner_data.keys.iter().zip(slot_refs.iter()) {
+                        let put_ids = owner_data
+                            .keys
+                            .iter()
+                            .map(|_| inner.next_owner_local_first_put_id())
+                            .collect::<Vec<_>>();
+                        let keys_and_put_ids = owner_data
+                            .keys
+                            .iter()
+                            .cloned()
+                            .zip(put_ids.iter().copied())
+                            .collect::<Vec<_>>();
+                        let atomic_groups = match build_put_atomic_group_assignments(
+                            &keys_and_put_ids,
+                            &owner_data.atomic_group_lens,
+                        ) {
+                            Ok(groups) => groups,
+                            Err(detail) => {
+                                let err =
+                                    CoreKvError::Api(CoreApiError::InvalidArgument { detail });
+                                let _ = release_staged_put_resources(
+                                    inner,
+                                    owner_data.key_reservation_ids,
+                                    owner_data.slot_lease,
+                                )
+                                .await;
+                                return ApiResult::new_success(vec![
+                                    kv_error_to_ret_code(&err);
+                                    owner_data.keys.len()
+                                ]);
+                            }
+                        };
+                        for (idx, ((key, slot_ref), make_replica_task)) in owner_data
+                            .keys
+                            .iter()
+                            .zip(slot_refs.iter())
+                            .zip(owner_data.make_replica_task_mask.iter())
+                            .enumerate()
+                        {
                             let memory_info = inner
                                 .build_local_reserve_resident_memory_info(
                                     key,
@@ -3986,12 +4206,13 @@ impl KvClient {
                                 key,
                                 memory_info.clone(),
                             );
-                            let put_id = inner.next_owner_local_first_put_id();
+                            let put_id = put_ids[idx];
                             let promote = inner
                                 .promote_precommit_local_reserve_resident_slot_if_same(
                                     key,
                                     put_id,
                                     memory_info.clone(),
+                                    atomic_groups[idx].as_ref(),
                                 );
                             match promote {
                                 Ok(()) => {
@@ -4009,8 +4230,9 @@ impl KvClient {
                                             base_addr: slot_ref.base_addr,
                                             len: owner_data.value_len,
                                         },
-                                        make_replica_task: true,
+                                        make_replica_task: *make_replica_task,
                                         preferred_sub_cluster: None,
+                                        atomic_group: atomic_groups[idx].clone(),
                                     });
                                     ret_codes.push(0);
                                 }
@@ -4292,7 +4514,8 @@ impl KvClient {
                 guard.remove(&plan_ptr_usize)
             };
             match removed {
-                Some(FluxonPlanRegistryEntry::Get(_plan)) => {
+                Some(FluxonPlanRegistryEntry::Get(plan)) => {
+                    defer_drop_to_runtime(client.runtime.as_ref(), plan);
                     ApiResult::new_success(0i32.into_py(py))
                 }
                 Some(FluxonPlanRegistryEntry::Put(_)) => ApiResult::new_error(
@@ -4692,7 +4915,7 @@ impl KvClient {
     /// on the caller to keep the pointed-to memory alive until the async call completes.
     ///
     /// The backend encoding/copy runs on the Rust runtime without holding the Python GIL.
-    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, callback=None))]
+    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, callback=None, write_through=true, make_replica_task=true))]
     fn put(
         &self,
         key: &str,
@@ -4701,6 +4924,8 @@ impl KvClient {
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
         callback: Option<PyObject>,
+        write_through: bool,
+        make_replica_task: bool,
         py: Python,
     ) -> PyObject {
         fn put_inner(
@@ -4711,6 +4936,8 @@ impl KvClient {
             reject_if_inflight_same_key: bool,
             reject_if_exist_same_key: bool,
             callback: Option<PyObject>,
+            write_through: bool,
+            make_replica_task: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if ptrs.len() > (u32::MAX as usize) {
@@ -4730,19 +4957,13 @@ impl KvClient {
                     ));
                 }
             };
-            let put_opts = {
-                let mut o = fluxon_kv::client_kv_api::PutOptionalArgs::new();
-                if let Some(id) = lease_id {
-                    o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::LeaseId(id));
-                }
-                if reject_if_inflight_same_key {
-                    o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
-                }
-                if reject_if_exist_same_key {
-                    o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
-                }
-                o
-            };
+            let put_opts = build_put_optional_args(
+                lease_id,
+                reject_if_inflight_same_key,
+                reject_if_exist_same_key,
+                write_through,
+                make_replica_task,
+            );
 
             let future = async move {
                 let result = unsafe { framework.kv_put_ptrs(&key, ptrs, put_opts).await };
@@ -4802,13 +5023,15 @@ impl KvClient {
             reject_if_inflight_same_key,
             reject_if_exist_same_key,
             callback,
+            write_through,
+            make_replica_task,
             py,
         )
         .into_py_object(py)
     }
 
     /// Put a key-value pair and wait for completion before returning.
-    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false))]
+    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, make_replica_task=true))]
     fn put_blocking(
         &self,
         key: &str,
@@ -4816,6 +5039,8 @@ impl KvClient {
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
+        write_through: bool,
+        make_replica_task: bool,
         py: Python,
     ) -> PyObject {
         fn put_blocking_inner(
@@ -4825,6 +5050,8 @@ impl KvClient {
             lease_id: Option<u64>,
             reject_if_inflight_same_key: bool,
             reject_if_exist_same_key: bool,
+            write_through: bool,
+            make_replica_task: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if ptrs.len() > (u32::MAX as usize) {
@@ -4845,22 +5072,13 @@ impl KvClient {
                 }
             };
             let framework = borrow_stable_owner(&framework);
-            let mut put_opts = fluxon_kv::client_kv_api::PutOptionalArgs::new();
-            if let Some(id) = lease_id {
-                put_opts
-                    .0
-                    .push(fluxon_kv::client_kv_api::PutOptionalArg::LeaseId(id));
-            }
-            if reject_if_inflight_same_key {
-                put_opts
-                    .0
-                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
-            }
-            if reject_if_exist_same_key {
-                put_opts
-                    .0
-                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
-            }
+            let put_opts = build_put_optional_args(
+                lease_id,
+                reject_if_inflight_same_key,
+                reject_if_exist_same_key,
+                write_through,
+                make_replica_task,
+            );
             let result = match py.allow_threads(|| {
                 runtime.run_async_from_sync(async {
                     unsafe { framework.kv_put_ptrs(&key, ptrs, put_opts).await }
@@ -4909,6 +5127,8 @@ impl KvClient {
             lease_id,
             reject_if_inflight_same_key,
             reject_if_exist_same_key,
+            write_through,
+            make_replica_task,
             py,
         )
         .into_py_object(py)
@@ -4917,7 +5137,7 @@ impl KvClient {
     /// Put a batch of key-value pairs and wait for completion before returning.
     ///
     /// Each item uses the same flatdict encoding contract as `put_blocking()`.
-    #[pyo3(signature = (keys, ptrs_groups, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, concurrency=None))]
+    #[pyo3(signature = (keys, ptrs_groups, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, concurrency=None, write_through=true, make_replica_task=true))]
     fn batch_put_blocking(
         &self,
         keys: Vec<String>,
@@ -4926,6 +5146,8 @@ impl KvClient {
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
         concurrency: Option<usize>,
+        write_through: bool,
+        make_replica_task: bool,
         py: Python,
     ) -> PyObject {
         fn batch_put_blocking_inner(
@@ -4936,6 +5158,8 @@ impl KvClient {
             reject_if_inflight_same_key: bool,
             reject_if_exist_same_key: bool,
             concurrency: Option<usize>,
+            write_through: bool,
+            make_replica_task: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if keys.len() != ptrs_groups.len() {
@@ -4974,22 +5198,13 @@ impl KvClient {
             let framework = borrow_stable_owner(&framework);
             let keys_for_results = keys;
 
-            let mut put_opts = fluxon_kv::client_kv_api::PutOptionalArgs::new();
-            if let Some(id) = lease_id {
-                put_opts
-                    .0
-                    .push(fluxon_kv::client_kv_api::PutOptionalArg::LeaseId(id));
-            }
-            if reject_if_inflight_same_key {
-                put_opts
-                    .0
-                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
-            }
-            if reject_if_exist_same_key {
-                put_opts
-                    .0
-                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
-            }
+            let put_opts = build_put_optional_args(
+                lease_id,
+                reject_if_inflight_same_key,
+                reject_if_exist_same_key,
+                write_through,
+                make_replica_task,
+            );
 
             if !framework.is_external_mode() {
                 let framework_for_backend = framework.clone();
@@ -5156,6 +5371,8 @@ impl KvClient {
             reject_if_inflight_same_key,
             reject_if_exist_same_key,
             concurrency,
+            write_through,
+            make_replica_task,
             py,
         )
         .into_py_object(py)
@@ -5206,7 +5423,7 @@ impl KvClient {
     }
 
     /// Native blocking batch put path for payload pointers.
-    #[pyo3(signature = (keys, payload_ptrs, payload_sizes, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false))]
+    #[pyo3(signature = (keys, payload_ptrs, payload_sizes, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, make_replica_task=true))]
     fn batch_put_from(
         &self,
         keys: Vec<String>,
@@ -5215,6 +5432,8 @@ impl KvClient {
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
+        write_through: bool,
+        make_replica_task: bool,
         py: Python,
     ) -> PyObject {
         fn batch_put_from_inner(
@@ -5225,6 +5444,8 @@ impl KvClient {
             lease_id: Option<u64>,
             reject_if_inflight_same_key: bool,
             reject_if_exist_same_key: bool,
+            write_through: bool,
+            make_replica_task: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if keys.len() != payload_ptrs.len() || keys.len() != payload_sizes.len() {
@@ -5284,22 +5505,13 @@ impl KvClient {
             drop(registered);
 
             let framework = borrow_stable_owner(&framework);
-            let mut put_opts = fluxon_kv::client_kv_api::PutOptionalArgs::new();
-            if let Some(id) = lease_id {
-                put_opts
-                    .0
-                    .push(fluxon_kv::client_kv_api::PutOptionalArg::LeaseId(id));
-            }
-            if reject_if_inflight_same_key {
-                put_opts
-                    .0
-                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
-            }
-            if reject_if_exist_same_key {
-                put_opts
-                    .0
-                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
-            }
+            let put_opts = build_put_optional_args(
+                lease_id,
+                reject_if_inflight_same_key,
+                reject_if_exist_same_key,
+                write_through,
+                make_replica_task,
+            );
 
             let keys_for_backend = keys.clone();
             let ptrs_groups = keys_for_backend
@@ -5419,6 +5631,8 @@ impl KvClient {
             lease_id,
             reject_if_inflight_same_key,
             reject_if_exist_same_key,
+            write_through,
+            make_replica_task,
             py,
         )
         .into_py_object(py)
@@ -6359,14 +6573,11 @@ impl KvClient {
             timeout_ms: u64,
             py: Python,
         ) -> ApiResult<PyObject> {
-            if timeout_ms < fluxon_kv::user_rpc::USER_RPC_MIN_TIMEOUT_MS {
-                return ApiResult::new_error(new_invalid_argument_error(
+            if let Err(err) = fluxon_kv::user_rpc::validate_timeout_ms(timeout_ms) {
+                return ApiResult::new_error(crate::error::py_error_from_kv_error(
                     py,
-                    &format!(
-                        "timeout_ms must be >= {} (got {})",
-                        fluxon_kv::user_rpc::USER_RPC_MIN_TIMEOUT_MS,
-                        timeout_ms
-                    ),
+                    &err,
+                    "Invalid RPC timeout",
                 ));
             }
 
@@ -6482,14 +6693,13 @@ impl KvClient {
             timeout_ms: u64,
             py: Python,
         ) -> ApiResult<PyObject> {
-            const MIN_TIMEOUT_MS: u64 = 10_000;
-            if timeout_ms < MIN_TIMEOUT_MS {
-                return ApiResult::new_error(new_invalid_argument_error(
+            if let Err(err) = fluxon_kv::p2p::msg_pack::validate_explicit_rpc_timeout_ms(timeout_ms)
+            {
+                let err = CoreKvError::from(err);
+                return ApiResult::new_error(crate::error::py_error_from_kv_error(
                     py,
-                    &format!(
-                        "timeout_ms must be >= {} (got {})",
-                        MIN_TIMEOUT_MS, timeout_ms
-                    ),
+                    &err,
+                    "Invalid RPC timeout",
                 ));
             }
             if target_instance_key.trim().is_empty() {
@@ -6981,6 +7191,10 @@ fn run_master_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyObjec
 #[pyo3(name = "fluxon_pyo3")]
 fn fluxon_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_dynamic_libraries()?;
+    m.add(
+        "MIN_EXPLICIT_RPC_TIMEOUT_MS",
+        fluxon_kv::p2p::msg_pack::MIN_EXPLICIT_RPC_TIMEOUT_MS,
+    )?;
     m.add_class::<KvClient>()?;
     m.add_class::<KvMaster>()?;
     m.add_class::<KvFuture>()?;
@@ -7014,17 +7228,150 @@ fn fluxon_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bundled_driver_names_from_entries, configure_bundled_rdmav_driver_env,
+        build_put_optional_args, bundled_driver_names_from_entries,
+        configure_bundled_rdmav_driver_env, defer_drop_to_runtime,
         discover_bundled_ibverbs_driver_config,
         extract_fluxon_pyo3_libs_root_from_loaded_library_line, loaded_fluxon_pyo3_libs_roots,
-        parse_bundled_ibverbs_driver_name, sanitize_bundled_ld_library_path_entries,
+        normalize_put_atomic_group_lens, parse_bundled_ibverbs_driver_name,
+        resolve_make_replica_task_mask, sanitize_bundled_ld_library_path_entries,
         set_authoritative_bundled_ld_library_path, validate_single_fluxon_pyo3_libs_root,
     };
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn defer_drop_to_runtime_eventually_drops_value() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        defer_drop_to_runtime(Some(&runtime), DropProbe(dropped.clone()));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dropped.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn defer_drop_without_runtime_is_synchronous() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        defer_drop_to_runtime(None, DropProbe(dropped.clone()));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn put_options_control_async_replica_task() {
+        let write_through = build_put_optional_args(None, false, false, true, true);
+        let write_back = build_put_optional_args(None, false, false, false, true);
+        let local_only = build_put_optional_args(None, false, false, false, false);
+
+        assert!(!write_through.make_replica_task());
+        assert!(write_back.make_replica_task());
+        assert!(!local_only.make_replica_task());
+    }
+
+    #[test]
+    fn local_fast_put_replica_mask_broadcasts_scalar() {
+        assert_eq!(
+            resolve_make_replica_task_mask(3, false, true, None, &[1, 1, 1]).unwrap(),
+            vec![true, true, true]
+        );
+        assert_eq!(
+            resolve_make_replica_task_mask(3, false, false, None, &[1, 1, 1]).unwrap(),
+            vec![false, false, false]
+        );
+    }
+
+    #[test]
+    fn local_fast_put_replica_mask_selects_items() {
+        assert_eq!(
+            resolve_make_replica_task_mask(
+                4,
+                false,
+                true,
+                Some(vec![true, false, true, false]),
+                &[1, 1, 1, 1],
+            )
+            .unwrap(),
+            vec![true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn local_fast_put_replica_mask_respects_global_gates() {
+        let requested = Some(vec![true, false, true]);
+        assert_eq!(
+            resolve_make_replica_task_mask(3, true, true, requested.clone(), &[1, 1, 1]).unwrap(),
+            vec![false, false, false]
+        );
+        assert_eq!(
+            resolve_make_replica_task_mask(3, false, false, requested, &[1, 1, 1]).unwrap(),
+            vec![false, false, false]
+        );
+    }
+
+    #[test]
+    fn local_fast_put_replica_mask_rejects_length_mismatch() {
+        let err =
+            resolve_make_replica_task_mask(3, false, true, Some(vec![true, false]), &[1, 1, 1])
+                .unwrap_err();
+        assert_eq!(
+            err,
+            "make_replica_task_mask length must match keys length; keys=3 mask=2"
+        );
+    }
+
+    #[test]
+    fn local_fast_put_atomic_groups_accept_valid_partition() {
+        assert_eq!(
+            normalize_put_atomic_group_lens(5, Some(vec![2, 3])).unwrap(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            normalize_put_atomic_group_lens(3, None).unwrap(),
+            vec![1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn local_fast_put_atomic_groups_reject_zero_and_sum_mismatch() {
+        assert_eq!(
+            normalize_put_atomic_group_lens(3, Some(vec![1, 0, 2])).unwrap_err(),
+            "atomic_group_lens entries must be > 0; index=1 got=0"
+        );
+        assert_eq!(
+            normalize_put_atomic_group_lens(3, Some(vec![1, 1])).unwrap_err(),
+            "atomic_group_lens must sum to keys length; sum=2 keys=3"
+        );
+    }
+
+    #[test]
+    fn local_fast_put_replica_mask_rejects_split_atomic_group() {
+        let err = resolve_make_replica_task_mask(
+            5,
+            false,
+            true,
+            Some(vec![true, true, false, true, true]),
+            &[2, 3],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "make_replica_task_mask must be uniform within each atomic group; group_index=1 offset=2 len=3"
+        );
+    }
 
     struct EnvSnapshot {
         key: &'static str,

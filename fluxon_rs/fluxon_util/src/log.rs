@@ -226,20 +226,6 @@ fn setup_global_log_guards(file_guard: WorkerGuard, console_guard: WorkerGuard) 
     let _ = GLOBAL_CONSOLE_LOG_GUARD.set(console_guard);
 }
 
-fn workspace_targets_filter(
-    workspace_level: filter::LevelFilter,
-    non_workspace_default: filter::LevelFilter,
-) -> filter::Targets {
-    let mut targets = filter::Targets::new().with_default(non_workspace_default);
-    for c in generated_crates::OUR_CRATES {
-        targets = targets.with_target(*c, workspace_level);
-    }
-    for c in RDMA_DEBUG_TARGETS {
-        targets = targets.with_target(*c, workspace_level);
-    }
-    targets
-}
-
 fn third_party_log_target_overrides(
     enable_iceoryx_logs: bool,
     default_level: filter::LevelFilter,
@@ -480,11 +466,16 @@ where
             }
 
             if let Some(level) = crate_level {
-                // Use build-time generated workspace member list.
-                let our_crates: &[&str] = generated_crates::OUR_CRATES;
+                // Use build-time generated workspace members plus the explicit RDMA
+                // diagnostic targets. A bare level remains one canonical setting for
+                // console, file, and exporter layers.
+                let our_crates = generated_crates::OUR_CRATES
+                    .iter()
+                    .copied()
+                    .chain(RDMA_DEBUG_TARGETS.iter().copied());
                 let mut changed = removed_bare_debug;
                 for c in our_crates {
-                    if !existing_targets.contains(&c.to_string()) {
+                    if !existing_targets.contains(c) {
                         new_parts.push(format!("{}={}", c, level));
                         changed = true;
                     }
@@ -516,8 +507,9 @@ where
         }
     }
 
-    // File log keeps workspace crates at DEBUG; non-workspace crates default to WARN.
-    // This avoids dumping verbose dependency debug logs (e.g. h2/tower) into file output.
+    // All sinks follow the canonical RUST_LOG/FLUXON_LOG filter. Keeping a fixed DEBUG
+    // file layer here makes an `info` or `error` runtime silently continue formatting
+    // and writing high-volume debug events.
     let file_path = current_daily_log_file_path(log_path, instance_key);
     // Keep a copy for the whole process lifetime; collectors can clone it.
     if let Some(prev) = GLOBAL_LOG_FILE_PATH.get() {
@@ -542,18 +534,17 @@ where
             .map(|v| v.trim().to_ascii_lowercase()),
         Some(v) if !matches!(v.as_str(), "" | "0" | "false" | "no")
     );
-    let file_filter =
-        workspace_targets_filter(filter::LevelFilter::DEBUG, filter::LevelFilter::WARN);
+    let file_filter = EnvFilter::from_default_env();
     let file_layer = tracing_subscriber::fmt::layer()
         .with_timer(UtcSecondTimer)
         .with_writer(file_writer)
         .with_ansi(false)
-        .with_filter(file_filter.clone().or(third_party_log_target_overrides(
+        .with_filter(file_filter.or(third_party_log_target_overrides(
             enable_iceoryx_logs,
             filter::LevelFilter::WARN,
         )));
 
-    // Console logging follows user config (RUST_LOG/FLUXON_LOG); file logging ignores it.
+    // Console logging follows the same user config as file output.
     let (console_writer, console_guard) = non_blocking(io::stdout());
     let console_env_filter = EnvFilter::from_default_env();
     let console_layer = tracing_subscriber::fmt::layer()
@@ -561,9 +552,8 @@ where
         .with_filter(console_env_filter);
 
     // Register layers.
-    // `extra_layer` follows the same target filtering as file output (workspace=DEBUG, deps=WARN)
-    // to avoid exporting noisy dependency debug logs by default.
-    let extra_layer = extra_layer.with_filter(file_filter.clone().or(
+    // Exporters follow the same canonical user filter as local sinks.
+    let extra_layer = extra_layer.with_filter(EnvFilter::from_default_env().or(
         third_party_log_target_overrides(enable_iceoryx_logs, filter::LevelFilter::WARN),
     ));
     let _ = tracing_subscriber::registry()
