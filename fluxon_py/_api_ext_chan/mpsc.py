@@ -102,6 +102,23 @@ class _NoopCloseable:
     def close(self) -> None:  # pragma: no cover - trivial utility
         return
 
+
+def _close_owned_mpsc_context(
+    context: Any, *, channel_id: Optional[str]
+) -> Result[OkNone, ApiError]:
+    """Close one endpoint-owned MQ context before its KV client closes."""
+    try:
+        context.close()
+    except Exception as e:
+        return Result.new_error(
+            ResourceCleanupError(
+                message=f"failed to close MPSC context: {e}",
+                resource_type="mpsc_context",
+                resource_id=channel_id or "unknown",
+            )
+        )
+    return Result.new_ok(OkNone())
+
 # ---------------------------------------------------------------------------
 # fluxon_pyo3 bridging
 # ---------------------------------------------------------------------------
@@ -748,15 +765,18 @@ class MPSCChanProducer(ChannelProducer):
             # In-flight calls retain their own strong reference and unwind
             # after the independent Rust shutdown signal above.
             self._handle = None  # type: ignore[assignment]
-            if self._parent_mpmc_id is None:
-                try:
-                    self._ctx.close()
-                except Exception as e:
-                    logging.warning("%s failed to close mpsc context: %s", dbg, e)
-            self._ctx = _NoopCloseable()
             if hasattr(self, "_chan_id") and hasattr(self, "_producer_id"):
                 tag = f"mpsc:producer:{self._chan_id}:{self._producer_id}"
                 _record_test_close_marker(tag, by_gc)
+
+        context_close_result = _close_owned_mpsc_context(
+            self._ctx,
+            channel_id=chan_id,
+        )
+        if not context_close_result.is_ok():
+            return context_close_result
+        context_close_result.unwrap()
+        self._ctx = _NoopCloseable()
 
         if (
             not by_gc
@@ -1002,15 +1022,18 @@ class MPSCChanConsumer(ChannelConsumer):
             # The active get keeps the PyO3 object alive until it observes
             # shutdown and returns; detaching here does not invalidate it.
             self._handle = None  # type: ignore[assignment]
-            if self._parent_mpmc_id is None:
-                try:
-                    self._ctx.close()
-                except Exception as e:
-                    logging.warning("%s failed to close mpsc context: %s", dbg, e)
-            self._ctx = _NoopCloseable()
             if hasattr(self, "_chan_id") and hasattr(self, "_consumer_id"):
                 tag = f"mpsc:consumer:{self._chan_id}:{self._consumer_id}"
                 _record_test_close_marker(tag, by_gc)
+
+        context_close_result = _close_owned_mpsc_context(
+            self._ctx,
+            channel_id=chan_id,
+        )
+        if not context_close_result.is_ok():
+            return context_close_result
+        context_close_result.unwrap()
+        self._ctx = _NoopCloseable()
 
         if (
             not by_gc

@@ -81,6 +81,18 @@ class _FakeCloseable:
         self.closed = True
 
 
+class _FailOnceCloseable:
+    def __init__(self):
+        self.close_calls = 0
+        self.closed = False
+
+    def close(self):
+        self.close_calls += 1
+        if self.close_calls == 1:
+            raise RuntimeError("synthetic context close failure")
+        self.closed = True
+
+
 class _FakeShutdownCtl:
     def __init__(self):
         self.closed = False
@@ -753,7 +765,7 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
                 "/channels/7/producer_weight/11",
             ], [])],
         )
-        self.assertFalse(context.closed)
+        self.assertTrue(context.closed)
 
     def test_full_close_deletes_producer_membership(self):
         calls = []
@@ -794,7 +806,7 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
             consumer.close().unwrap()
 
         self.assertEqual(calls, [(["/channels/7/consumer/consumer_11"], [])])
-        self.assertFalse(context.closed)
+        self.assertTrue(context.closed)
 
     def test_full_close_deletes_consumer_membership(self):
         calls = []
@@ -812,7 +824,7 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
         self.assertEqual(calls, [(["/channels/7/consumer/consumer_11"], [])])
         self.assertTrue(context.closed)
 
-    def test_subchannel_close_keeps_parent_context_but_deletes_membership(self):
+    def test_subchannel_context_close_error_is_reported_and_retryable(self):
         cases = [
             (
                 MPSCChanProducer,
@@ -838,11 +850,22 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
                         endpoint_type,
                         subchannel=True,
                     )
-                    context = endpoint._ctx
+                    context = _FailOnceCloseable()
+                    endpoint._ctx = context
+
+                    first_close = endpoint.close()
+                    self.assertFalse(first_close.is_ok())
+                    self.assertIsInstance(
+                        first_close.unwrap_error(),
+                        ResourceCleanupError,
+                    )
+                    self.assertEqual(calls, [])
+
                     endpoint.close().unwrap()
 
                 self.assertEqual(calls, expected_deletes)
-                self.assertFalse(context.closed)
+                self.assertTrue(context.closed)
+                self.assertEqual(context.close_calls, 2)
 
     def test_unpublished_channel_rollback_deletes_all_channel_scoped_state(self):
         endpoint = _make_close_test_handle(

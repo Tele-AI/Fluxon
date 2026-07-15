@@ -52,3 +52,7 @@ Keep this document concise.
 - Type signatures, docs, and runtime behavior must match. If an API says it returns `MemHolder`, it must return `MemHolder`.
 - For internal invariants, fail fast or assert. Do not silently probe and fallback as if the contract were unclear.
 - For one semantic operation, keep one primary path. Do not mix `foo_blocking()` with `foo().wait()` in the same public pattern unless that distinction is itself part of the contract.
+
+## Component Contract Index
+
+- MQ shutdown: user and test paths close every public producer / consumer and consume its `Result` before closing the backing `KvClient`. Endpoint `close()` owns child-channel, MQ runtime, keepalive, and background-task teardown; do not access private MQ lifecycle objects. See [User - 4 - MQ Interface](<fluxon_doc_en/user_doc/User - 4 - MQ Interface.md#shutdown-lifecycle>) and [用户 - 4 - MQ 接口](<fluxon_doc_cn/user_doc/用户 - 4 - MQ接口.md#关闭生命周期>).

@@ -254,6 +254,45 @@ store.close()
 - `new_or_bind_with_unique_key(...)` 不是独立入口，它必须运行在 `store` 之上
 - 退出顺序固定是：先 `producer.close()` / `consumer.close()`，再 `store.close()`
 
+## 关闭生命周期
+
+用户和测试代码只需要调用两层公共接口，顺序固定：
+
+```python
+producer.close().unwrap("close MQ producer failed")
+# 如果当前角色是 consumer：
+# consumer.close().unwrap("close MQ consumer failed")
+
+store.close().unwrap("close KV store failed")
+```
+
+同一个 `store` 上有多个 MQ handle 时，必须先调用所有 handle 的 `close()` 并消费结果，再调用 `store.close()`。两层 `close()` 都返回 `Result[OkNone, ApiError]`；关闭错误必须记录或向上传播，不能静默丢弃。
+
+```mermaid
+sequenceDiagram
+    participant App as 用户 / 测试代码
+    participant Endpoint as producer / consumer
+    participant Internal as endpoint 内部 MQ 资源
+    participant Store as KvClient
+
+    App->>Endpoint: close()
+    Endpoint->>Internal: 停止数据路径并回收内部资源
+    Internal-->>Endpoint: 关闭完成
+    Endpoint-->>App: Result[OkNone, ApiError]
+    App->>Store: close()
+    Store-->>App: Result[OkNone, ApiError]
+```
+
+职责边界如下：
+
+| 责任方 | 负责内容 |
+| --- | --- |
+| 用户 / 测试代码 | 调用公共 `producer.close()` / `consumer.close()`，检查返回的 `Result`，然后调用 `store.close()`。 |
+| MQ endpoint | 在 `close()` 内部停止收发路径，关闭所属子通道和 MQ runtime，并结束由该 endpoint 持有的 keepalive 与后台任务。 |
+| `KvClient` | 在 MQ endpoint 全部关闭后回收 KV client 资源。 |
+
+MQ endpoint 的内部生命周期对调用方不可见。用户代码、示例和测试都不应访问私有字段、原始 shutdown controller 或 MQ framework，也不应用等待、强制退出或静默丢弃 `close()` 的 `Result` 来代替上述两步。
+
 ## MQ接口最小示例
 
 跑通一对 producer / consumer 的最小对象如下：

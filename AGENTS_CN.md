@@ -52,3 +52,7 @@
 - 类型签名、文档和运行时行为必须一致。如果 API 说它返回 `MemHolder`，那它就必须返回 `MemHolder`
 - 对内部不变量，要快速失败或直接断言。不要像契约不清楚一样静默探测后再回退
 - 对一个语义操作，只保留一条主路径。除非这种区别本身就是契约的一部分，否则不要在同一套公开模式里混用 `foo_blocking()` 和 `foo().wait()`
+
+## 组件契约索引
+
+- MQ 关闭：用户和测试路径必须先关闭所有公共 producer / consumer 并消费其 `Result`，再关闭底层 `KvClient`。Endpoint `close()` 负责子通道、MQ runtime、keepalive 和后台任务的内部回收；不要访问 MQ 私有生命周期对象。见 [用户 - 4 - MQ 接口](<fluxon_doc_cn/user_doc/用户 - 4 - MQ接口.md#关闭生命周期>) 和 [User - 4 - MQ Interface](<fluxon_doc_en/user_doc/User - 4 - MQ Interface.md#shutdown-lifecycle>)。

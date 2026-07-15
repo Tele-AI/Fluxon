@@ -72,6 +72,45 @@ Key rules:
 - `new_or_bind_with_unique_key(...)` is not a standalone public entrypoint; it must run on top of a store
 - Shutdown order is fixed: close the MQ handle first, then close `store`
 
+## Shutdown Lifecycle
+
+User and test code uses only two layers of public API, in this fixed order:
+
+```python
+producer.close().unwrap("close MQ producer failed")
+# For a consumer process instead:
+# consumer.close().unwrap("close MQ consumer failed")
+
+store.close().unwrap("close KV store failed")
+```
+
+If one `store` owns multiple MQ handles, call `close()` on every handle and consume each result before `store.close()` runs. Both layers return `Result[OkNone, ApiError]`. Close errors must be recorded or propagated rather than silently discarded.
+
+```mermaid
+sequenceDiagram
+    participant App as Application / test
+    participant Endpoint as Producer / Consumer
+    participant Internal as Endpoint-owned MQ resources
+    participant Store as KvClient
+
+    App->>Endpoint: close()
+    Endpoint->>Internal: stop data paths and release internal resources
+    Internal-->>Endpoint: cleanup complete
+    Endpoint-->>App: Result[OkNone, ApiError]
+    App->>Store: close()
+    Store-->>App: Result[OkNone, ApiError]
+```
+
+The ownership boundary is:
+
+| Owner | Responsibility |
+| --- | --- |
+| Application / test | Call public `producer.close()` / `consumer.close()`, check its `Result`, then call `store.close()`. |
+| MQ endpoint | Within `close()`, stop send/receive paths, close owned subchannels and the MQ runtime, and finish endpoint-owned keepalive and background tasks. |
+| `KvClient` | Release KV client resources after every MQ endpoint has closed. |
+
+The endpoint's internal lifecycle is not part of the caller-facing API. User code, examples, and tests must not access private fields, raw shutdown controllers, or the MQ framework. Sleeps, forced process exits, and silently discarded `close()` results are not substitutes for the two public close calls above.
+
 ## Minimal MQ Example
 
 The public minimal example is `examples/start_mpmc_demo.py`.
