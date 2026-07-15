@@ -2,406 +2,243 @@
 from __future__ import annotations
 
 import argparse
-import copy
-import importlib.util
+import hashlib
+import ipaddress
 import json
 import os
-import re
+import pprint
+import resource
 import shutil
+import signal
+import socket
+import subprocess
 import sys
+import time
+import traceback
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, BinaryIO, Iterable
 
 import yaml
 
-from _common import REPO_ROOT, call
+from _common import REPO_ROOT
 
 
-TEST_REQUIREMENTS = ["fluxon-release", "ops", "submodules", "test-stack-targets"]
+TEST_REQUIREMENTS = ["fluxon-release"]
+
+DEFAULT_WORKDIR = REPO_ROOT / ".dever" / "ci_large_scale_mq"
+DEFAULT_RELEASE_DIR = REPO_ROOT / "fluxon_release"
+COORDINATOR_SOURCE = REPO_ROOT / "fluxon_test_stack" / "distributed_benchmark_coordinator.py"
+NODE_SOURCE = REPO_ROOT / "fluxon_test_stack" / "distributed_benchmark_node.py"
+RUNTIME_SOURCE_NAMES = (
+    "benchmark_node_fs.py",
+    "benchmark_node_kv.py",
+    "benchmark_node_mq.py",
+    "benchmark_node_rpc.py",
+    "benchmark_role_names.py",
+    "distributed_benchmark_coordinator.py",
+    "distributed_benchmark_node.py",
+    "mpmc_readiness.py",
+)
+
+PORT_MIN = 20000
+PORT_MAX = 32767
+OWNER_SUB_CLUSTER = "owner"
+MQ_CAPACITY = 40
+MQ_TTL_SECONDS = 90
+START_IDLE_SECONDS = 10.0
+POST_RESULT_WORKER_EXIT_TIMEOUT_SECONDS = 600.0
+PROCESS_STOP_GRACE_SECONDS = 30.0
+PROCESS_TERM_GRACE_SECONDS = 10.0
+RESOURCE_SAMPLE_INTERVAL_SECONDS = 30.0
+LOG_TAIL_LINES = 100
+REQUIRED_NOFILE_LIMIT = 65536
 
 
-SCENE_ID = "bench_mq"
-BASE_FLUXON_PROFILE_ID = "fluxon_tcp"
-CI_PUBLIC_PROFILE_ID = "fluxon_tcp_thread"
-DEFAULT_PROFILE_ID = CI_PUBLIC_PROFILE_ID
-LOCAL_RELEASE_ROOT_ENV = "FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT"
-RELEASE_MANIFEST_FILENAME = "fluxon_release.sha256"
-RELEASE_MANIFEST_SHA256_ENV_KEY = "FLUXON_RELEASE_MANIFEST_SHA256"
-DEFAULT_CONFIG = REPO_ROOT / "fluxon_test_stack" / "benchmark_full_matrix.yaml"
-DEFAULT_WORKDIR = REPO_ROOT / ".tmp" / "test_largescale_mq_p320_c8"
-RUNNER = REPO_ROOT / "fluxon_test_stack" / "test_runner.py"
-LOCAL_TEST_STACK_COORDINATOR_PORT_OFFSET = 1000
-LOCAL_TEST_STACK_TOPOLOGY_PORT_SPAN = 100
-LOCAL_TEST_STACK_COORDINATOR_FALLBACK_PORT_BASE = 20000
-LOCAL_TEST_STACK_COORDINATOR_FALLBACK_PORT_SPAN = 30000
-LOCAL_TEST_STACK_P2P_PORT_MIN = 20000
-LOCAL_TEST_STACK_P2P_PORT_MAX = 61000
-
-DEFAULT_BENCHMARK = {
-    "processes_per_target": 1,
-    "threads_per_process": 1,
-    "value_size": 256,
-    "metric_warmup_seconds": 0,
-    "op_timeout_seconds": 30,
-    "cluster_ready_timeout_seconds": 1800,
-    "value_size_list": [],
-    "consumer_sim_handle_ms_range": [700, 1500],
-}
-
-_NODE_TARGET_RE = re.compile(r"node-([1-9][0-9]*)$")
+@dataclass(frozen=True)
+class PortPlan:
+    etcd_client: int
+    etcd_peer: int
+    greptime_http: int
+    master: int
+    coordinator: int
+    owners: list[int]
+    workers: list[int]
 
 
-def _repo_path(raw: str) -> Path:
-    path = Path(raw).expanduser()
-    if path.is_absolute():
-        return path
-    return (REPO_ROOT / path).resolve()
+@dataclass
+class ManagedProcess:
+    name: str
+    kind: str
+    command: list[str]
+    process: subprocess.Popen[bytes]
+    log_path: Path
+    log_stream: BinaryIO
+    started_at_unix_s: float
 
-
-def _resolve_user_path(raw: str) -> Path:
-    path = Path(raw).expanduser()
-    if path.is_absolute():
-        return path.resolve()
-    return (Path.cwd() / path).resolve()
-
-
-def _require_dict(raw: Any, ctx: str) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise SystemExit(f"{ctx} must be a mapping")
-    return raw
-
-
-def _is_within_root(path: Path, root: Path) -> bool:
-    resolved_path = path.resolve()
-    resolved_root = root.resolve()
-    return resolved_path == resolved_root or resolved_root in resolved_path.parents
-
-
-def _clean_bundle_relpath(raw: str, *, field_name: str) -> Path:
-    relpath = Path(raw)
-    if relpath.is_absolute() or ".." in relpath.parts:
-        raise SystemExit(f"{field_name} must be a clean relative path: {relpath}")
-    return relpath
-
-
-def _load_yaml_mapping(path: Path, *, ctx: str) -> dict[str, Any]:
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return _require_dict(payload, ctx)
-
-
-def _write_yaml_mapping(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=False), encoding="utf-8")
-
-
-def _load_start_test_bed_module() -> Any:
-    module_path = REPO_ROOT / "fluxon_test_stack" / "start_test_bed.py"
-    spec = importlib.util.spec_from_file_location("fluxon_test_stack_start_test_bed_for_largescale_mq", module_path)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"failed to load start_test_bed module: {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _sync_run_local_deployconf_from_normalized_view(*, deployconf_path: Path) -> None:
-    deployconf_payload = _load_yaml_mapping(deployconf_path, ctx=f"deployconf {deployconf_path}")
-    start_test_bed_mod = _load_start_test_bed_module()
-    normalized, _notes = start_test_bed_mod._normalize_bootstrap_deployconf(
-        deployconf=deployconf_payload,
-    )
-    global_envs = normalized.get("global_envs")
-    if isinstance(global_envs, dict):
-        global_envs.pop(RELEASE_MANIFEST_SHA256_ENV_KEY, None)
-    _write_yaml_mapping(deployconf_path, normalized)
-
-
-def _parse_sha256_manifest_names(path: Path) -> list[str]:
-    out: list[str] = []
-    for index, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        line = raw_line.strip()
-        if not line:
-            continue
-        parts = line.split(maxsplit=1)
-        if len(parts) != 2:
-            raise SystemExit(f"invalid sha256 manifest line {index}: {path}: {raw_line!r}")
-        out.append(parts[1].strip())
-    return out
-
-
-def _find_release_wheel_name_from_manifest(root: Path) -> str | None:
-    manifest_path = (root / RELEASE_MANIFEST_FILENAME).resolve()
-    if not manifest_path.is_file():
-        return None
-    wheel_names = [
-        Path(name).name
-        for name in _parse_sha256_manifest_names(manifest_path)
-        if Path(name).name.startswith("fluxon-") and Path(name).name.endswith(".whl")
-    ]
-    if not wheel_names:
-        return None
-    unique_names = sorted(set(wheel_names))
-    if len(unique_names) != 1:
-        raise SystemExit(f"release manifest must contain one Fluxon wheel: {manifest_path} wheels={unique_names}")
-    return unique_names[0]
-
-
-def _ci_public_release_wheel_name(fallback: str) -> str:
-    roots: list[Path] = []
-    env_root = os.environ.get(LOCAL_RELEASE_ROOT_ENV, "").strip()
-    if env_root:
-        roots.append(Path(env_root).expanduser().resolve())
-    roots.append((REPO_ROOT / "fluxon_release").resolve())
-    for root in roots:
-        wheel_name = _find_release_wheel_name_from_manifest(root)
-        if wheel_name is not None:
-            return wheel_name
-    return fallback
-
-
-def _ensure_ci_public_profile(cfg: dict[str, Any], profile_ids: list[str]) -> None:
-    if CI_PUBLIC_PROFILE_ID not in profile_ids:
-        return
-    profiles = _require_dict(cfg.get("profiles"), "config.profiles")
-    artifact_sets = _require_dict(cfg.get("artifact_sets"), "config.artifact_sets")
-    if CI_PUBLIC_PROFILE_ID in profiles and CI_PUBLIC_PROFILE_ID in artifact_sets:
-        return
-
-    base_profile = copy.deepcopy(
-        _require_dict(profiles.get(BASE_FLUXON_PROFILE_ID), f"config.profiles[{BASE_FLUXON_PROFILE_ID!r}]")
-    )
-    base_artifact_set = copy.deepcopy(
-        _require_dict(
-            artifact_sets.get(BASE_FLUXON_PROFILE_ID),
-            f"config.artifact_sets[{BASE_FLUXON_PROFILE_ID!r}]",
-        )
-    )
-
-    release_source = _require_dict(
-        base_artifact_set.get("release_source"),
-        f"config.artifact_sets[{BASE_FLUXON_PROFILE_ID!r}].release_source",
-    )
-    test_rsc_source = _require_dict(
-        base_artifact_set.get("test_rsc_source"),
-        f"config.artifact_sets[{BASE_FLUXON_PROFILE_ID!r}].test_rsc_source",
-    )
-    release_artifacts = _require_dict(
-        base_artifact_set.get("release_artifacts"),
-        f"config.artifact_sets[{BASE_FLUXON_PROFILE_ID!r}].release_artifacts",
-    )
-    release_source["key_prefix"] = f"profiles/{CI_PUBLIC_PROFILE_ID}"
-    test_rsc_source["key_prefix"] = f"test_rsc/{CI_PUBLIC_PROFILE_ID}"
-    release_artifacts["wheel"] = _ci_public_release_wheel_name(
-        str(release_artifacts.get("wheel", "")).strip() or "fluxon-0.2.1-py3-none-any.whl"
-    )
-    base_profile["artifact_set"] = CI_PUBLIC_PROFILE_ID
-    artifact_sets[CI_PUBLIC_PROFILE_ID] = base_artifact_set
-    profiles[CI_PUBLIC_PROFILE_ID] = base_profile
-
-
-def _bundle_relpath(path: Path, *, base: Path, dot_prefix: bool = False) -> str:
-    rel = os.path.relpath(str(path.resolve()), str(base.resolve())).replace(os.sep, "/")
-    if dot_prefix and rel != "." and not rel.startswith("."):
-        return f"./{rel}"
-    return rel
-
-
-def _relocated_bundle_path(
-    raw: Any,
-    *,
-    src_root: Path,
-    dst_root: Path,
-    base: Path,
-    field_name: str,
-    generated_bundle_child_name: str | None = None,
-) -> Path:
-    if not isinstance(raw, str) or not raw.strip():
-        raise SystemExit(f"{field_name} must be a non-empty path string")
-    raw_path = Path(raw).expanduser()
-    if raw_path.is_absolute():
-        resolved = raw_path.resolve()
-        if _is_within_root(resolved, dst_root):
-            return resolved
-        if _is_within_root(resolved, src_root):
-            return (dst_root / resolved.relative_to(src_root.resolve())).resolve()
-        if generated_bundle_child_name is not None and resolved.name == generated_bundle_child_name:
-            return (dst_root / generated_bundle_child_name).resolve()
-        raise SystemExit(
-            f"{field_name} must point inside the testbed bundle: path={resolved} src={src_root} dst={dst_root}"
-        )
-    return (base / raw_path).resolve()
-
-
-def _normalize_run_local_testbed_bundle(
-    *,
-    src_root: Path,
-    dst_root: Path,
-    start_config_relpath: str,
-) -> Path:
-    relpath = _clean_bundle_relpath(start_config_relpath, field_name="--start-config-relpath")
-    start_cfg = (dst_root / relpath).resolve()
-    if not _is_within_root(start_cfg, dst_root):
-        raise SystemExit(f"--start-config-relpath escapes testbed bundle: {relpath}")
-    if not start_cfg.is_file():
-        raise SystemExit(f"start config is missing inside testbed bundle: {start_cfg}")
-
-    start_payload = _load_yaml_mapping(start_cfg, ctx=f"start config {start_cfg}")
-    deployconf_path = _relocated_bundle_path(
-        start_payload.get("deployconf_path"),
-        src_root=src_root,
-        dst_root=dst_root,
-        base=start_cfg.parent,
-        field_name="start_test_bed.deployconf_path",
-    )
-    if not _is_within_root(deployconf_path, dst_root):
-        raise SystemExit(f"start_test_bed.deployconf_path escapes testbed bundle: {deployconf_path}")
-    if not deployconf_path.is_file():
-        raise SystemExit(f"start config deployconf_path is missing: {deployconf_path}")
-    start_payload["deployconf_path"] = _bundle_relpath(deployconf_path, base=start_cfg.parent, dot_prefix=True)
-    _write_yaml_mapping(start_cfg, start_payload)
-
-    deployconf_payload = _load_yaml_mapping(deployconf_path, ctx=f"deployconf {deployconf_path}")
-    mirror_outdir = _relocated_bundle_path(
-        deployconf_payload.get("gen_k8s_daemonset_mirror_outdir"),
-        src_root=src_root,
-        dst_root=dst_root,
-        base=deployconf_path.parent,
-        field_name="deployconf.gen_k8s_daemonset_mirror_outdir",
-        generated_bundle_child_name="gen_k8s_daemonset",
-    )
-    if not _is_within_root(mirror_outdir, dst_root):
-        raise SystemExit(f"deployconf.gen_k8s_daemonset_mirror_outdir escapes testbed bundle: {mirror_outdir}")
-    mirror_outdir.mkdir(parents=True, exist_ok=True)
-    deployconf_payload["gen_k8s_daemonset_mirror_outdir"] = str(mirror_outdir.resolve())
-    _write_yaml_mapping(deployconf_path, deployconf_payload)
-    _sync_run_local_deployconf_from_normalized_view(deployconf_path=deployconf_path)
-
-    manifest_path = start_cfg.with_name("manifest.json")
-    if manifest_path.exists():
-        try:
-            manifest = _require_dict(
-                json.loads(manifest_path.read_text(encoding="utf-8")),
-                f"testbed bundle manifest {manifest_path}",
-            )
-        except Exception as exc:
-            raise SystemExit(f"failed to load testbed bundle manifest {manifest_path}: {exc}") from exc
-
-        manifest_targets = {
-            "deployconf_path": deployconf_path,
-            "start_config_path": start_cfg,
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "pid": self.process.pid,
+            "returncode": self.process.poll(),
+            "command": self.command,
+            "log_path": str(self.log_path),
+            "started_at_unix_s": self.started_at_unix_s,
         }
-        for field_name in ("ssh_config_path", "workdir"):
-            if field_name not in manifest:
-                continue
-            target_path = _relocated_bundle_path(
-                manifest.get(field_name),
-                src_root=src_root,
-                dst_root=dst_root,
-                base=manifest_path.parent,
-                field_name=f"manifest.{field_name}",
+
+
+class ProcessRegistry:
+    def __init__(self, *, workdir: Path, child_env: dict[str, str]) -> None:
+        self.workdir = workdir
+        self.child_env = child_env
+        self.records: list[ManagedProcess] = []
+        self.status_path = workdir / "processes.json"
+
+    def start(
+        self,
+        *,
+        name: str,
+        kind: str,
+        command: list[str],
+        cwd: Path,
+        log_path: Path,
+    ) -> ManagedProcess:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_stream = log_path.open("ab", buffering=0)
+        print("+ " + " ".join(command), flush=True)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                env=self.child_env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
             )
-            if not _is_within_root(target_path, dst_root):
-                raise SystemExit(f"manifest.{field_name} escapes testbed bundle: {target_path}")
-            if field_name == "workdir":
-                target_path.mkdir(parents=True, exist_ok=True)
-            elif not target_path.exists():
-                raise SystemExit(f"manifest.{field_name} is missing inside testbed bundle: {target_path}")
-            manifest_targets[field_name] = target_path
+        except BaseException:
+            log_stream.close()
+            raise
+        record = ManagedProcess(
+            name=name,
+            kind=kind,
+            command=list(command),
+            process=process,
+            log_path=log_path,
+            log_stream=log_stream,
+            started_at_unix_s=time.time(),
+        )
+        self.records.append(record)
+        self.write_status()
+        return record
 
-        for field_name, target_path in manifest_targets.items():
-            manifest[field_name] = _bundle_relpath(target_path, base=manifest_path.parent)
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+    def write_status(self) -> None:
+        _write_json_atomic(
+            self.status_path,
+            {
+                "schema_version": 1,
+                "updated_at_unix_s": time.time(),
+                "processes": [record.snapshot() for record in self.records],
+            },
         )
 
-    return start_cfg
+    def alive(self, *, kinds: set[str] | None = None) -> list[ManagedProcess]:
+        return [
+            record
+            for record in self.records
+            if record.process.poll() is None and (kinds is None or record.kind in kinds)
+        ]
 
+    def assert_alive(self, records: Iterable[ManagedProcess], *, context: str) -> None:
+        exited = [
+            f"{record.name}(rc={record.process.poll()})"
+            for record in records
+            if record.process.poll() is not None
+        ]
+        if exited:
+            self.write_status()
+            raise RuntimeError(f"{context}: required process exited: {', '.join(exited)}")
 
-def _split_ids(raw_values: list[str] | None, *, default: str) -> list[str]:
-    if not raw_values:
-        return [default]
-    out: list[str] = []
-    seen: set[str] = set()
-    for raw in raw_values:
-        for part in raw.split(","):
-            value = part.strip()
-            if not value:
-                continue
-            if value in seen:
-                continue
-            seen.add(value)
-            out.append(value)
-    if not out:
-        raise SystemExit("at least one profile id is required")
-    return out
-
-
-def _target_sort_key(target: str) -> tuple[int, int | str]:
-    match = _NODE_TARGET_RE.fullmatch(target)
-    if match is not None:
-        return (0, int(match.group(1)))
-    return (1, target)
-
-
-def _profile_test_stack(cfg: dict[str, Any], profile_id: str) -> dict[str, Any]:
-    profiles = _require_dict(cfg.get("profiles"), "config.profiles")
-    profile = _require_dict(profiles.get(profile_id), f"config.profiles[{profile_id!r}]")
-    runtime = _require_dict(profile.get("runtime"), f"config.profiles[{profile_id!r}].runtime")
-    return _require_dict(runtime.get("test_stack"), f"config.profiles[{profile_id!r}].runtime.test_stack")
-
-
-def _profile_target_map(cfg: dict[str, Any], profile_id: str) -> dict[str, Any]:
-    test_stack = _profile_test_stack(cfg, profile_id)
-    deploy = _require_dict(
-        test_stack.get("deploy"),
-        f"config.profiles[{profile_id!r}].runtime.test_stack.deploy",
-    )
-    return _require_dict(
-        deploy.get("target_ip_map"),
-        f"config.profiles[{profile_id!r}].runtime.test_stack.deploy.target_ip_map",
-    )
-
-
-def _local_test_stack_topology_port_offset(topology_key: Any) -> int:
-    if isinstance(topology_key, int):
-        return int(topology_key) * LOCAL_TEST_STACK_TOPOLOGY_PORT_SPAN
-    elif isinstance(topology_key, str) and topology_key.isdigit():
-        return int(topology_key) * LOCAL_TEST_STACK_TOPOLOGY_PORT_SPAN
-    elif topology_key != "DEFAULT":
-        raise SystemExit(f"unsupported test_stack port_alloc topology key: {topology_key!r}")
-    return 0
-
-
-def _local_test_stack_coordinator_port_base(*, controller_port: int, topology_key: Any) -> int:
-    topology_offset = _local_test_stack_topology_port_offset(topology_key)
-    port = int(controller_port) + LOCAL_TEST_STACK_COORDINATOR_PORT_OFFSET + topology_offset
-    if port > 65535:
-        port = LOCAL_TEST_STACK_COORDINATOR_FALLBACK_PORT_BASE + (
-            (int(controller_port) + topology_offset) % LOCAL_TEST_STACK_COORDINATOR_FALLBACK_PORT_SPAN
+    def stop_all(self) -> None:
+        stop_groups = (
+            [record for record in reversed(self.records) if record.kind == "worker"],
+            [record for record in reversed(self.records) if record.kind == "coordinator"],
+            [record for record in reversed(self.records) if record.kind == "owner"],
+            [
+                record
+                for record in reversed(self.records)
+                if record.name == "master"
+            ],
+            [
+                record
+                for record in reversed(self.records)
+                if record.name == "greptime"
+            ],
+            [
+                record
+                for record in reversed(self.records)
+                if record.name == "etcd"
+            ],
         )
-    if port <= 0 or port > 65535:
-        raise SystemExit(f"computed local TEST_STACK coordinator_port_base out of range: {port}")
-    return port
+        for records in stop_groups:
+            self._signal_and_wait(records, signal.SIGINT, PROCESS_STOP_GRACE_SECONDS)
+            self._signal_and_wait(records, signal.SIGTERM, PROCESS_TERM_GRACE_SECONDS)
+            self._signal_and_wait(records, signal.SIGKILL, 5.0)
+        self.write_status()
+        for record in self.records:
+            record.log_stream.close()
+
+    @staticmethod
+    def _signal_and_wait(
+        records: list[ManagedProcess],
+        sig: signal.Signals,
+        timeout_seconds: float,
+    ) -> None:
+        alive = [record for record in records if record.process.poll() is None]
+        if not alive:
+            return
+        for record in alive:
+            try:
+                os.killpg(record.process.pid, sig)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if all(record.process.poll() is not None for record in alive):
+                return
+            time.sleep(0.2)
 
 
-def _local_ephemeral_tcp_ports() -> set[int]:
-    try:
-        raw = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text(encoding="utf-8").split()
-    except FileNotFoundError:
-        return set()
-    if len(raw) != 2:
-        return set()
-    try:
-        start, end = int(raw[0]), int(raw[1])
-    except ValueError:
-        return set()
-    if start <= 0 or end < start or end > 65535:
-        return set()
-    return set(range(start, end + 1))
+def _write_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
 
 
-def _local_busy_tcp_ports() -> set[int]:
+def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=False),
+        encoding="utf-8",
+    )
+
+
+def _write_benchmark_config(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "from __future__ import annotations\n"
+        "from typing import Any, Dict\n\n"
+        f"CONFIG: Dict[str, Any] = {pprint.pformat(payload, width=120, sort_dicts=False)}\n",
+        encoding="utf-8",
+    )
+
+
+def _busy_tcp_ports() -> set[int]:
     ports: set[int] = set()
     for proc_path in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
         try:
@@ -410,647 +247,1236 @@ def _local_busy_tcp_ports() -> set[int]:
             continue
         for line in lines:
             parts = line.split()
-            if len(parts) < 4:
+            if len(parts) < 2:
                 continue
             try:
                 ports.add(int(parts[1].rsplit(":", 1)[1], 16))
             except ValueError:
                 continue
-    ports.update(_local_ephemeral_tcp_ports())
     return ports
 
 
-def _find_local_tcp_port_block(
+def _find_tcp_port_block(
     *,
     preferred_start: int,
     required_count: int,
     busy_ports: set[int] | None = None,
 ) -> int:
-    required_count = int(required_count)
     if required_count <= 0:
-        raise SystemExit(f"required local TEST_STACK P2P port count must be positive: {required_count}")
-
-    min_port = LOCAL_TEST_STACK_P2P_PORT_MIN
-    max_start = LOCAL_TEST_STACK_P2P_PORT_MAX - required_count + 1
-    if max_start < min_port:
-        raise SystemExit(
-            "local TEST_STACK P2P port window is too small: "
-            f"required_count={required_count} min={LOCAL_TEST_STACK_P2P_PORT_MIN} max={LOCAL_TEST_STACK_P2P_PORT_MAX}"
+        raise ValueError("required_count must be positive")
+    max_start = PORT_MAX - required_count + 1
+    if max_start < PORT_MIN:
+        raise ValueError(
+            f"requested local port block is too large: count={required_count} range={PORT_MIN}-{PORT_MAX}"
         )
-
-    busy = _local_busy_tcp_ports() if busy_ports is None else set(busy_ports)
-    preferred = min(max(int(preferred_start), min_port), max_start)
-    starts = list(range(preferred, max_start + 1)) + list(range(min_port, preferred))
-    for start in starts:
-        end = start + required_count - 1
-        if all(port not in busy for port in range(start, end + 1)):
+    busy = _busy_tcp_ports() if busy_ports is None else set(busy_ports)
+    preferred = min(max(int(preferred_start), PORT_MIN), max_start)
+    for start in (*range(preferred, max_start + 1), *range(PORT_MIN, preferred)):
+        if all(port not in busy for port in range(start, start + required_count)):
             return start
-
-    raise SystemExit(
-        "no free local TEST_STACK P2P port block found: "
-        f"required_count={required_count} min={LOCAL_TEST_STACK_P2P_PORT_MIN} max={LOCAL_TEST_STACK_P2P_PORT_MAX}"
+    raise RuntimeError(
+        f"no free local TCP port block: count={required_count} range={PORT_MIN}-{PORT_MAX}"
     )
 
 
-def _local_test_stack_p2p_port_base(
+def _allocate_port_plan(
     *,
-    controller_port: int,
-    topology_key: Any,
-    required_count: int,
+    workdir: Path,
+    owner_count: int,
+    worker_count: int,
     busy_ports: set[int] | None = None,
-) -> int:
-    topology_offset = _local_test_stack_topology_port_offset(topology_key)
-    search_span = LOCAL_TEST_STACK_P2P_PORT_MAX - LOCAL_TEST_STACK_P2P_PORT_MIN - int(required_count) + 1
+) -> PortPlan:
+    required_count = 5 + owner_count + worker_count
+    search_span = PORT_MAX - PORT_MIN - required_count + 2
     if search_span <= 0:
-        raise SystemExit(f"required local TEST_STACK P2P port count is too large: {required_count}")
-    preferred = LOCAL_TEST_STACK_P2P_PORT_MIN + (
-        (int(controller_port) + topology_offset * 17) % search_span
-    )
-    return _find_local_tcp_port_block(
-        preferred_start=preferred,
-        required_count=int(required_count),
+        raise ValueError(f"process topology needs too many local ports: {required_count}")
+    digest = hashlib.sha256(str(workdir.resolve()).encode("utf-8")).digest()
+    preferred_start = PORT_MIN + int.from_bytes(digest[:4], "big") % search_span
+    base = _find_tcp_port_block(
+        preferred_start=preferred_start,
+        required_count=required_count,
         busy_ports=busy_ports,
     )
-
-
-def _local_test_stack_master_port_base(
-    *,
-    controller_port: int,
-    topology_key: Any,
-    required_count: int,
-    busy_ports: set[int] | None = None,
-) -> int:
-    topology_offset = _local_test_stack_topology_port_offset(topology_key)
-    search_span = LOCAL_TEST_STACK_P2P_PORT_MAX - LOCAL_TEST_STACK_P2P_PORT_MIN - int(required_count) + 1
-    if search_span <= 0:
-        raise SystemExit(f"required local TEST_STACK master port count is too large: {required_count}")
-    preferred = LOCAL_TEST_STACK_P2P_PORT_MIN + (
-        (int(controller_port) + topology_offset * 11 + 7000) % search_span
+    cursor = base
+    etcd_client = cursor
+    cursor += 1
+    etcd_peer = cursor
+    cursor += 1
+    greptime_http = cursor
+    cursor += 1
+    master = cursor
+    cursor += 1
+    coordinator = cursor
+    cursor += 1
+    owners = list(range(cursor, cursor + owner_count))
+    cursor += owner_count
+    workers = list(range(cursor, cursor + worker_count))
+    return PortPlan(
+        etcd_client=etcd_client,
+        etcd_peer=etcd_peer,
+        greptime_http=greptime_http,
+        master=master,
+        coordinator=coordinator,
+        owners=owners,
+        workers=workers,
     )
-    return _find_local_tcp_port_block(
-        preferred_start=preferred,
-        required_count=int(required_count),
-        busy_ports=busy_ports,
-    )
 
 
-def _rewrite_test_stack_coordinator_ports_for_local_controller(
-    suite: dict[str, Any],
-    *,
-    controller_port: int,
-) -> None:
-    busy_ports = _local_busy_tcp_ports()
-    profiles = _require_dict(suite.get("profiles"), "suite.profiles")
-    for profile_id, profile in profiles.items():
-        if not isinstance(profile, dict):
+def _host_ipv4_addresses() -> list[str]:
+    candidates: set[str] = {"127.0.0.1"}
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except socket.gaierror:
+        infos = []
+    for info in infos:
+        raw = info[4][0]
+        try:
+            address = ipaddress.ip_address(raw)
+        except ValueError:
             continue
-        runtime = _require_dict(profile.get("runtime"), f"suite.profiles[{profile_id!r}].runtime")
-        test_stack = _require_dict(
-            runtime.get("test_stack"),
-            f"suite.profiles[{profile_id!r}].runtime.test_stack",
-        )
-        port_alloc = _require_dict(
-            test_stack.get("port_alloc"),
-            f"suite.profiles[{profile_id!r}].runtime.test_stack.port_alloc",
-        )
-        by_topology = _require_dict(
-            port_alloc.get("by_topology"),
-            f"suite.profiles[{profile_id!r}].runtime.test_stack.port_alloc.by_topology",
-        )
-        for topology_key, entry in by_topology.items():
-            if not isinstance(entry, dict):
-                continue
-            if "coordinator_port_base" not in entry:
-                continue
-            entry["coordinator_port_base"] = _local_test_stack_coordinator_port_base(
-                controller_port=int(controller_port),
-                topology_key=topology_key,
-            )
-            if "kv_master_port_base" in entry and "kv_master_port_stride" in entry:
-                entry["kv_master_port_base"] = _local_test_stack_master_port_base(
-                    controller_port=int(controller_port),
-                    topology_key=topology_key,
-                    required_count=int(entry["kv_master_port_stride"]),
-                    busy_ports=busy_ports,
-                )
-                busy_ports.update(
-                    range(
-                        int(entry["kv_master_port_base"]),
-                        int(entry["kv_master_port_base"]) + int(entry["kv_master_port_stride"]),
-                    )
-                )
-            if "kv_p2p_port_base" in entry and "kv_p2p_port_stride" in entry:
-                entry["kv_p2p_port_base"] = _local_test_stack_p2p_port_base(
-                    controller_port=int(controller_port),
-                    topology_key=topology_key,
-                    required_count=int(entry["kv_p2p_port_stride"]),
-                    busy_ports=busy_ports,
-                )
-                busy_ports.update(
-                    range(
-                        int(entry["kv_p2p_port_base"]),
-                        int(entry["kv_p2p_port_base"]) + int(entry["kv_p2p_port_stride"]),
-                    )
-                )
+        if isinstance(address, ipaddress.IPv4Address):
+            candidates.add(str(address))
+    return sorted(candidates, key=lambda value: (value == "127.0.0.1", value))
 
 
-def _ordered_usable_targets(target_ip_map: dict[str, Any], *, ctx: str) -> list[str]:
-    out: list[str] = []
-    for raw_target in target_ip_map:
-        if not isinstance(raw_target, str):
-            raise SystemExit(f"{ctx} target key must be a string: {raw_target!r}")
-        if "bastion" in raw_target.lower():
-            continue
-        out.append(raw_target)
-    return sorted(out, key=_target_sort_key)
-
-
-def _common_targets(cfg: dict[str, Any], profile_ids: list[str], required_count: int) -> list[str]:
-    ordered_by_profile: list[tuple[str, list[str]]] = []
-    common: set[str] | None = None
-    for profile_id in profile_ids:
-        target_map = _profile_target_map(cfg, profile_id)
-        ordered = _ordered_usable_targets(
-            target_map,
-            ctx=f"config.profiles[{profile_id!r}].runtime.test_stack.deploy.target_ip_map",
-        )
-        ordered_by_profile.append((profile_id, ordered))
-        current = set(ordered)
-        common = current if common is None else common & current
-
-    assert common is not None
-    first_profile, first_ordered = ordered_by_profile[0]
-    ordered_common = [target for target in first_ordered if target in common]
-    if len(ordered_common) < required_count:
-        counts = ", ".join(f"{profile_id}={len(targets)}" for profile_id, targets in ordered_by_profile)
-        raise SystemExit(
-            "large-scale MQ needs "
-            f"{required_count} common non-bastion deploy targets across selected profiles, "
-            f"but only found {len(ordered_common)} from {first_profile!r}; profile target counts: {counts}. "
-            "Pass --config pointing at a TEST_STACK suite with the large target_ip_map."
-        )
-    return ordered_common[:required_count]
-
-
-def _apply_single_host_logical_targets(
-    cfg: dict[str, Any],
-    *,
-    profile_ids: list[str],
-    required_count: int,
-    anchor_ip_override: str | None,
-) -> None:
-    if required_count <= 0:
-        raise SystemExit("--single-host-logical-targets requires a positive target count")
-    override_ip = None
-    if anchor_ip_override is not None:
-        override_ip = str(anchor_ip_override).strip()
-        if not override_ip:
-            raise SystemExit("single-host anchor IP override must be non-empty")
-    for profile_id in profile_ids:
-        target_map = _profile_target_map(cfg, profile_id)
-        ordered = _ordered_usable_targets(
-            target_map,
-            ctx=f"config.profiles[{profile_id!r}].runtime.test_stack.deploy.target_ip_map",
-        )
-        if not ordered:
-            raise SystemExit(
-                f"profile {profile_id!r} has no non-bastion target to use as the single-host anchor"
-            )
-        anchor_target = ordered[0]
-        anchor_ip = target_map.get(anchor_target)
-        if not isinstance(anchor_ip, str) or not anchor_ip.strip():
-            raise SystemExit(
-                f"profile {profile_id!r} anchor target {anchor_target!r} has no usable IP"
-            )
-        resolved_anchor_ip = override_ip or anchor_ip.strip()
-        for idx in range(1, int(required_count) + 1):
-            target_map[f"node-{idx}"] = resolved_anchor_ip
-
-
-def _base_benchmark(cfg: dict[str, Any]) -> dict[str, Any]:
-    scenes = _require_dict(cfg.get("scenes"), "config.scenes")
-    scene = _require_dict(scenes.get(SCENE_ID), f"config.scenes[{SCENE_ID!r}]")
-    select = _require_dict(scene.get("select"), f"config.scenes[{SCENE_ID!r}].select")
-    scale_ids = select.get("scales")
-    scales = _require_dict(cfg.get("scales"), "config.scales")
-    if isinstance(scale_ids, list):
-        for raw_scale_id in scale_ids:
-            if not isinstance(raw_scale_id, str):
-                continue
-            scale = scales.get(raw_scale_id)
-            if isinstance(scale, dict) and isinstance(scale.get("benchmark"), dict):
-                return copy.deepcopy(scale["benchmark"])
-    return copy.deepcopy(DEFAULT_BENCHMARK)
-
-
-def _role_weights_for_exact_mpmc_counts(producer_count: int, consumer_count: int) -> dict[str, int]:
-    if producer_count < 2 or consumer_count < 2:
-        raise SystemExit(
-            "exact MPMC count encoding requires producer-count and consumer-count to both be >= 2 "
-            "because test_runner assigns one target to each role before applying role_weights"
-        )
+def _runtime_test_spec() -> dict[str, bool]:
     return {
-        "producer": int(producer_count) - 1,
-        "consumer": int(consumer_count) - 1,
+        "disable_observability": True,
+        "disable_master_replica_cache": True,
+        "disable_prefix_index": True,
     }
 
 
-def _ensure_largescale_port_alloc(
-    cfg: dict[str, Any],
-    *,
-    profile_ids: list[str],
-    topology: int,
-    required_p2p_ports_per_slot: int,
-) -> None:
-    for profile_id in profile_ids:
-        test_stack = _profile_test_stack(cfg, profile_id)
-        kind = str(test_stack.get("kind", "")).strip().upper()
-        if kind != "FLUXON":
-            raise SystemExit(
-                f"profile {profile_id!r} has test_stack.kind={kind!r}; "
-                f"{SCENE_ID} large-scale MQ requires a FLUXON TEST_STACK profile"
-            )
-
-        port_alloc = _require_dict(
-            test_stack.get("port_alloc"),
-            f"config.profiles[{profile_id!r}].runtime.test_stack.port_alloc",
-        )
-        by_topology = _require_dict(
-            port_alloc.get("by_topology"),
-            f"config.profiles[{profile_id!r}].runtime.test_stack.port_alloc.by_topology",
-        )
-        exact = by_topology.get(topology)
-        if exact is None:
-            exact = by_topology.get(str(topology))
-        default = by_topology.get("DEFAULT")
-        source = exact or default
-        if source is None:
-            numeric_entries = [
-                (key, value)
-                for key, value in by_topology.items()
-                if isinstance(key, int) and isinstance(value, dict)
-            ]
-            if numeric_entries:
-                source = sorted(numeric_entries, key=lambda item: item[0])[-1][1]
-        if source is None:
-            raise SystemExit(
-                f"profile {profile_id!r} has no usable port_alloc entry to clone for topology={topology}"
-            )
-
-        entry = copy.deepcopy(_require_dict(source, f"profile {profile_id!r} port_alloc source"))
-        p2p_stride = int(entry.get("kv_p2p_port_stride", 0))
-        entry["kv_p2p_port_stride"] = max(p2p_stride, required_p2p_ports_per_slot, 512)
-        by_topology[int(topology)] = entry
-
-
-def _pruned_artifact_sets(cfg: dict[str, Any], profile_ids: list[str]) -> dict[str, Any]:
-    profiles = _require_dict(cfg.get("profiles"), "config.profiles")
-    artifact_sets = _require_dict(cfg.get("artifact_sets"), "config.artifact_sets")
-    out: dict[str, Any] = {}
-    for profile_id in profile_ids:
-        profile = _require_dict(profiles.get(profile_id), f"config.profiles[{profile_id!r}]")
-        artifact_set_id = profile.get("artifact_set")
-        if not isinstance(artifact_set_id, str):
-            raise SystemExit(f"config.profiles[{profile_id!r}].artifact_set must be a string")
-        artifact_set = artifact_sets.get(artifact_set_id)
-        if not isinstance(artifact_set, dict):
-            raise SystemExit(f"profile {profile_id!r} references missing artifact_set {artifact_set_id!r}")
-        out[artifact_set_id] = copy.deepcopy(artifact_set)
-    return out
-
-
-def _build_suite(
-    cfg: dict[str, Any],
-    args: argparse.Namespace,
-    profile_ids: list[str],
-    *,
-    single_host_anchor_ip: str | None = None,
-) -> dict[str, Any]:
-    producer_count = int(args.producer_count)
-    consumer_count = int(args.consumer_count)
-    owner_count = int(args.owner_count)
-    for name, value in (
-        ("producer-count", producer_count),
-        ("consumer-count", consumer_count),
-        ("owner-count", owner_count),
-        ("owner-dram-gib", int(args.owner_dram_gib)),
-        ("duration-seconds", int(args.duration_seconds)),
-        ("threads-per-process", int(args.threads_per_process)),
-        ("op-timeout-seconds", int(args.op_timeout_seconds)),
-        ("cluster-ready-timeout-seconds", int(args.cluster_ready_timeout_seconds)),
-    ):
+def _validate_args(args: argparse.Namespace) -> None:
+    positive_fields = (
+        "owner_count",
+        "owner_dram_gib",
+        "producer_count",
+        "consumer_count",
+        "duration_seconds",
+        "threads_per_process",
+        "op_timeout_seconds",
+        "cluster_ready_timeout_seconds",
+    )
+    for field_name in positive_fields:
+        value = int(getattr(args, field_name))
         if value <= 0:
-            raise SystemExit(f"--{name} must be > 0")
-    if int(args.metric_warmup_seconds) < 0:
-        raise SystemExit("--metric-warmup-seconds must be >= 0")
+            raise ValueError(f"--{field_name.replace('_', '-')} must be > 0")
     if int(args.value_size) < 0:
-        raise SystemExit("--value-size must be >= 0")
-    if int(args.consumer_sim_min_ms) < 0 or int(args.consumer_sim_max_ms) < 0:
-        raise SystemExit("--consumer-sim-min-ms and --consumer-sim-max-ms must be >= 0")
-    if int(args.consumer_sim_min_ms) > int(args.consumer_sim_max_ms):
-        raise SystemExit("--consumer-sim-min-ms must be <= --consumer-sim-max-ms")
+        raise ValueError("--value-size must be >= 0")
+    if int(args.metric_warmup_seconds) < 0:
+        raise ValueError("--metric-warmup-seconds must be >= 0")
+    if int(args.duration_seconds) - int(args.metric_warmup_seconds) < 30:
+        raise ValueError("duration-seconds minus metric-warmup-seconds must be at least 30")
+    if int(args.op_timeout_seconds) > int(args.duration_seconds):
+        raise ValueError("--op-timeout-seconds cannot exceed --duration-seconds")
+    if int(args.consumer_sim_min_ms) < 0:
+        raise ValueError("--consumer-sim-min-ms must be >= 0")
+    if int(args.consumer_sim_max_ms) < int(args.consumer_sim_min_ms):
+        raise ValueError("--consumer-sim-max-ms must be >= --consumer-sim-min-ms")
 
-    single_host = bool(args.single_host_logical_targets)
-    processes_per_target = owner_count if single_host else 1
-    if single_host:
-        if producer_count % processes_per_target != 0:
-            raise SystemExit(
-                "--single-host-logical-targets requires producer-count to be divisible by owner-count "
-                f"so process fanout can preserve the requested count: producer={producer_count} owner={owner_count}"
-            )
-        if consumer_count % processes_per_target != 0:
-            raise SystemExit(
-                "--single-host-logical-targets requires consumer-count to be divisible by owner-count "
-                f"so process fanout can preserve the requested count: consumer={consumer_count} owner={owner_count}"
-            )
-        producer_targets = producer_count // processes_per_target
-        consumer_targets = consumer_count // processes_per_target
-    else:
-        producer_targets = producer_count
-        consumer_targets = consumer_count
-    topology = producer_targets + consumer_targets
-    if owner_count > topology:
-        raise SystemExit(
-            f"owner-count={owner_count} cannot exceed benchmark topology={topology} "
-            "when owner targets are co-located with benchmark targets"
-        )
-    if single_host:
-        _apply_single_host_logical_targets(
-            cfg,
-            profile_ids=profile_ids,
-            required_count=topology,
-            anchor_ip_override=single_host_anchor_ip,
-        )
 
-    target_hosts = _common_targets(cfg, profile_ids, topology)
-    owner_targets = target_hosts[:owner_count]
+def _build_runtime_artifacts(
+    *,
+    args: argparse.Namespace,
+    workdir: Path,
+    ports: PortPlan,
+    host_ips: list[str],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    worker_count = int(args.producer_count) + int(args.consumer_count)
+    if len(ports.workers) != worker_count:
+        raise ValueError("worker port plan does not match requested topology")
+    if len(ports.owners) != int(args.owner_count):
+        raise ValueError("owner port plan does not match requested topology")
+
+    scope = hashlib.sha256(str(workdir.resolve()).encode("utf-8")).hexdigest()[:12]
+    cluster_name = f"fluxon_largescale_{scope}"
+    runtime_prefix = f"largescale_{scope}"
+    etcd_address = f"127.0.0.1:{ports.etcd_client}"
+    greptime_origin = f"http://127.0.0.1:{ports.greptime_http}"
+    share_root = (workdir / "services" / "share_mem").resolve()
+    result_path = (workdir / "benchmark_result.json").resolve()
     owner_dram_bytes = int(args.owner_dram_gib) * 1024 * 1024 * 1024
-    scale_id = f"largescale_mq_n{owner_count}owner_{args.owner_dram_gib}gib_p{producer_count}_c{consumer_count}"
-    if len(scale_id) > 64:
-        raise SystemExit(f"generated scale id is too long for test_runner: {scale_id!r}")
+    test_spec = _runtime_test_spec()
 
-    benchmark = _base_benchmark(cfg)
-    benchmark.update(
-        {
-            "processes_per_target": processes_per_target,
+    owner_configs: list[dict[str, Any]] = []
+    owner_roots: list[Path] = []
+    for owner_index, owner_port in enumerate(ports.owners):
+        owner_root = (share_root / f"owner_{owner_index}").resolve()
+        owner_roots.append(owner_root)
+        owner_workdir = (workdir / "services" / f"owner_{owner_index}").resolve()
+        owner_configs.append(
+            {
+                "instance_key": f"{runtime_prefix}__owner_{owner_index}",
+                "contribute_to_cluster_pool_size": {
+                    "dram": owner_dram_bytes,
+                    "vram": {},
+                },
+                "fluxonkv_spec": {
+                    "etcd_addresses": [etcd_address],
+                    "cluster_name": cluster_name,
+                    "share_mem_path": str(owner_root),
+                    "large_file_paths": [str((owner_workdir / "large").resolve())],
+                    "sub_cluster": OWNER_SUB_CLUSTER,
+                    "p2p_listen_port": owner_port,
+                },
+                "test_spec_config": dict(test_spec),
+            }
+        )
+
+    master_config = {
+        "instance_key": f"{runtime_prefix}__master",
+        "cluster_name": cluster_name,
+        "port": ports.master,
+        "etcd_endpoints": [etcd_address],
+        "network": {
+            "subnet_whitelist": [f"{address}/32" for address in host_ips],
+        },
+        "monitoring": {
+            "prometheus_base_url": greptime_origin + "/v1/prometheus",
+            "prom_remote_write_url": [greptime_origin + "/v1/prometheus/write"],
+            "otlp_log_api": {
+                "otlp_endpoint": greptime_origin + "/v1/otlp/v1/logs",
+                "db_name": "public",
+                "table_name": "fluxon_logs",
+            },
+        },
+        "log_dir": str((workdir / "services" / "master_logs").resolve()),
+        "test_spec_config": dict(test_spec),
+    }
+
+    node_roles: list[str] = []
+    node_overrides: list[dict[str, Any]] = []
+    worker_specs: list[dict[str, Any]] = []
+    global_index = 0
+    for role, role_count in (
+        ("producer", int(args.producer_count)),
+        ("consumer", int(args.consumer_count)),
+    ):
+        for role_index in range(role_count):
+            owner_index = global_index % int(args.owner_count)
+            instance_key = f"{runtime_prefix}__{role}_{role_index:03d}"
+            p2p_port = ports.workers[global_index]
+            node_roles.append(role)
+            node_overrides.append(
+                {
+                    "kv": {
+                        "instance_key": instance_key,
+                        "fluxonkv_spec": {
+                            "cluster_name": cluster_name,
+                            "share_mem_path": str(owner_roots[owner_index]),
+                            "p2p_listen_port": p2p_port,
+                        },
+                    },
+                    "mq_role": role,
+                    "mq": {"weight": 1.0},
+                    "network_sample": {
+                        "target": host_ips[0],
+                        "leader": global_index == 0,
+                    },
+                }
+            )
+            worker_specs.append(
+                {
+                    "instance_key": instance_key,
+                    "role": role,
+                    "role_index": role_index,
+                    "owner_index": owner_index,
+                    "p2p_listen_port": p2p_port,
+                }
+            )
+            global_index += 1
+
+    benchmark_config = {
+        "benchmark": {
+            "mode": "MPMC",
+            "workload_id": "largescale_mq",
             "threads_per_process": int(args.threads_per_process),
-            "value_size": int(args.value_size),
-            "metric_warmup_seconds": int(args.metric_warmup_seconds),
-            "op_timeout_seconds": int(args.op_timeout_seconds),
+            "max_benchmark_seconds": int(args.duration_seconds),
             "cluster_ready_timeout_seconds": int(args.cluster_ready_timeout_seconds),
+            "metric_warmup_seconds": float(args.metric_warmup_seconds),
+            "start_idle_seconds": START_IDLE_SECONDS,
+            "op_timeout_seconds": float(args.op_timeout_seconds),
+            "value_size": int(args.value_size),
+            "value_size_mode": "FIXED",
             "value_size_list": [],
+            "node_roles": node_roles,
             "consumer_sim_handle_ms_range": [
                 int(args.consumer_sim_min_ms),
                 int(args.consumer_sim_max_ms),
             ],
-        }
-    )
-    active_producer_limit = getattr(args, "mpmc_active_producer_runtime_limit", None)
-    if active_producer_limit is not None:
-        active_producer_limit = int(active_producer_limit)
-        if active_producer_limit <= 0 or active_producer_limit > producer_count:
-            raise SystemExit(
-                "--mpmc-active-producer-runtime-limit must satisfy "
-                f"1 <= limit <= producer-count ({producer_count}), got {active_producer_limit}"
-            )
-        benchmark["mpmc_active_producer_runtime_limit"] = active_producer_limit
-    if single_host:
-        benchmark["owner_group_processes"] = 1
-
-    _ensure_largescale_port_alloc(
-        cfg,
-        profile_ids=profile_ids,
-        topology=topology,
-        required_p2p_ports_per_slot=(
-            producer_targets * processes_per_target * int(args.threads_per_process)
-            + consumer_targets * processes_per_target
-            + owner_count
-            + 1
-        ),
-    )
-
-    scenes = _require_dict(cfg.get("scenes"), "config.scenes")
-    scene = copy.deepcopy(_require_dict(scenes.get(SCENE_ID), f"config.scenes[{SCENE_ID!r}]"))
-    scene["test_stack"] = copy.deepcopy(_require_dict(scene.get("test_stack"), f"config.scenes[{SCENE_ID!r}].test_stack"))
-    scene["test_stack"]["mode"] = "MPMC"
-    scene["test_stack"]["role_weights"] = _role_weights_for_exact_mpmc_counts(
-        producer_targets,
-        consumer_targets,
-    )
-    scene["select"] = {"scales": [scale_id], "profiles": list(profile_ids)}
-
-    profiles = _require_dict(cfg.get("profiles"), "config.profiles")
-    case_ids = [f"{SCENE_ID}__{scale_id}__{profile_id}" for profile_id in profile_ids]
-    return {
-        "schema_version": cfg.get("schema_version"),
-        "run": {
-            "mode": "full_once",
-            "selectors": {
-                "case_ids": case_ids,
-                "profile_ids": list(profile_ids),
-                "command_ids": "ALL",
-                "test_ids": "ALL",
+        },
+        "kv_base": {
+            "instance_key": f"{runtime_prefix}__benchmark_base",
+            "contribute_to_cluster_pool_size": {"dram": 0, "vram": {}},
+            "fluxonkv_spec": {
+                "cluster_name": cluster_name,
+                "share_mem_path": str(owner_roots[0]),
             },
+            "test_spec_config": dict(test_spec),
         },
-        "scenes": {SCENE_ID: scene},
-        "scales": {
-            scale_id: {
-                "duration_seconds": int(args.duration_seconds),
-                "topology": topology,
-                "targets": {"hosts": target_hosts},
-                "owner": {
-                    "owner_count": owner_count,
-                    "owner_dram_bytes": owner_dram_bytes,
-                    "targets": owner_targets,
-                },
-                "benchmark": benchmark,
-            }
+        "mq_base": {
+            "capacity": MQ_CAPACITY,
+            "ttl_seconds": MQ_TTL_SECONDS,
         },
-        "artifact_sets": _pruned_artifact_sets(cfg, profile_ids),
-        "profiles": {profile_id: copy.deepcopy(profiles[profile_id]) for profile_id in profile_ids},
+        "mq_new_or_bind_unique_key": f"{runtime_prefix}__mpmc",
+        "node_overrides": node_overrides,
+        "coordinator": {"port": ports.coordinator},
+        "output": {"result_path": str(result_path)},
+    }
+
+    plan = {
+        "schema_version": 1,
+        "execution_model": "bare_local_processes",
+        "uses_testbed": False,
+        "workdir": str(workdir),
+        "cluster_name": cluster_name,
+        "host_ipv4_addresses": host_ips,
+        "ports": asdict(ports),
+        "topology": {
+            "owner_count": int(args.owner_count),
+            "owner_dram_bytes": owner_dram_bytes,
+            "producer_count": int(args.producer_count),
+            "consumer_count": int(args.consumer_count),
+            "worker_count": worker_count,
+            "threads_per_process": int(args.threads_per_process),
+        },
+        "workers": worker_specs,
+        "paths": {
+            "benchmark_config": str((workdir / "benchmark_config.py").resolve()),
+            "benchmark_result": str(result_path),
+            "master_config": str((workdir / "configs" / "master.yaml").resolve()),
+            "owner_configs": [
+                str((workdir / "configs" / f"owner_{index}.yaml").resolve())
+                for index in range(int(args.owner_count))
+            ],
+        },
+    }
+    return plan, benchmark_config, master_config, owner_configs
+
+
+def _materialize_runtime(
+    *,
+    workdir: Path,
+    plan: dict[str, Any],
+    benchmark_config: dict[str, Any],
+    master_config: dict[str, Any],
+    owner_configs: list[dict[str, Any]],
+) -> dict[str, Path]:
+    _write_json_atomic(workdir / "run_plan.json", plan)
+    _write_benchmark_config(workdir / "benchmark_config.py", benchmark_config)
+    master_path = workdir / "configs" / "master.yaml"
+    _write_yaml(master_path, master_config)
+    owner_paths: list[Path] = []
+    for index, owner_config in enumerate(owner_configs):
+        owner_path = workdir / "configs" / f"owner_{index}.yaml"
+        _write_yaml(owner_path, owner_config)
+        owner_paths.append(owner_path)
+        owner_root = Path(owner_config["fluxonkv_spec"]["share_mem_path"])
+        owner_root.mkdir(parents=True, exist_ok=True)
+        Path(owner_config["fluxonkv_spec"]["large_file_paths"][0]).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+    Path(master_config["log_dir"]).mkdir(parents=True, exist_ok=True)
+
+    runtime_package = workdir / "runtime" / "fluxon_test_stack"
+    runtime_package.mkdir(parents=True, exist_ok=True)
+    source_root = REPO_ROOT / "fluxon_test_stack"
+    for source_name in RUNTIME_SOURCE_NAMES:
+        source_path = source_root / source_name
+        if not source_path.is_file():
+            raise FileNotFoundError(f"benchmark runtime source is missing: {source_path}")
+        shutil.copy2(source_path, runtime_package / source_name)
+
+    return {
+        "master_config": master_path,
+        "coordinator_script": runtime_package / COORDINATOR_SOURCE.name,
+        "node_script": runtime_package / NODE_SOURCE.name,
+        **{
+            f"owner_config_{index}": owner_path
+            for index, owner_path in enumerate(owner_paths)
+        },
     }
 
 
-def _prepare_run_local_testbed_bundle(
-    *,
-    source: str,
-    workdir: Path,
-    start_config_relpath: str,
-) -> Path:
-    src = _resolve_user_path(source)
-    if not src.is_dir():
-        raise SystemExit(f"--testbed-bundle-source must be an existing directory: {src}")
-    dst = (workdir / "testbed_bundle").resolve()
-    src_root_for_relocation = src.resolve()
-    if src == dst:
-        pass
-    else:
-        if src in dst.parents:
-            raise SystemExit(f"--testbed-bundle-source cannot contain the run-local destination: src={src} dst={dst}")
-        if dst in src.parents:
-            raise SystemExit(f"--testbed-bundle-source cannot be inside the run-local destination: src={src} dst={dst}")
-        if dst.exists():
-            shutil.rmtree(dst)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src, dst, symlinks=True)
+def _prepare_new_workdir(workdir: Path) -> None:
+    if workdir.exists() and any(workdir.iterdir()):
+        raise RuntimeError(
+            f"workdir is not empty: {workdir}; run --action clean before a new bare-local run"
+        )
+    workdir.mkdir(parents=True, exist_ok=True)
 
-    return _normalize_run_local_testbed_bundle(
-        src_root=src_root_for_relocation,
-        dst_root=dst,
-        start_config_relpath=start_config_relpath,
+
+def _clean_workdir(workdir: Path) -> None:
+    status_path = workdir / "processes.json"
+    process_groups: list[int] = []
+    if status_path.is_file():
+        try:
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"cannot parse process registry before clean: {status_path}: {exc}") from exc
+        for raw in reversed(payload.get("processes", [])):
+            if not isinstance(raw, dict) or not isinstance(raw.get("pid"), int):
+                continue
+            pid = int(raw["pid"])
+            proc_root = Path("/proc") / str(pid)
+            try:
+                cwd = (proc_root / "cwd").resolve(strict=True)
+                pgid = os.getpgid(pid)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if cwd != workdir and workdir not in cwd.parents:
+                raise RuntimeError(
+                    f"refusing to stop recorded pid outside workdir: pid={pid} cwd={cwd} workdir={workdir}"
+                )
+            if pgid != pid:
+                raise RuntimeError(f"refusing to signal non-leader recorded pid: pid={pid} pgid={pgid}")
+            process_groups.append(pid)
+        for pgid in process_groups:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + PROCESS_TERM_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            if all(not _process_group_exists(pgid) for pgid in process_groups):
+                break
+            time.sleep(0.2)
+        for pgid in process_groups:
+            if not _process_group_exists(pgid):
+                continue
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    if workdir.exists():
+        shutil.rmtree(workdir)
+
+
+def _process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _remove_large_runtime_data(workdir: Path) -> None:
+    errors: list[str] = []
+    for mmap_path in (workdir / "services").rglob("mmap.file"):
+        try:
+            mmap_path.unlink(missing_ok=True)
+        except OSError as exc:
+            errors.append(f"{mmap_path}: {type(exc).__name__}: {exc}")
+    for data_root in (
+        workdir / "services" / "etcd" / "data",
+        workdir / "services" / "greptime" / "data",
+    ):
+        try:
+            if data_root.exists():
+                shutil.rmtree(data_root)
+        except OSError as exc:
+            errors.append(f"{data_root}: {type(exc).__name__}: {exc}")
+    for large_root in (workdir / "services").glob("owner_*/large"):
+        try:
+            if large_root.exists():
+                shutil.rmtree(large_root)
+        except OSError as exc:
+            errors.append(f"{large_root}: {type(exc).__name__}: {exc}")
+    if errors:
+        _write_json_atomic(
+            workdir / "cleanup_errors.json",
+            {
+                "schema_version": 1,
+                "errors": errors,
+                "timestamp_unix_s": time.time(),
+            },
+        )
+        print(f"[bare-large-scale] cleanup errors: {errors}", flush=True)
+
+
+def _child_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env["RUST_BACKTRACE"] = "1"
+    env["RUST_LIB_BACKTRACE"] = "1"
+    env.setdefault("RUST_LOG", "info")
+    env.setdefault("FLUXON_LOG", "info")
+    return env
+
+
+def _ensure_nofile_limit() -> None:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < REQUIRED_NOFILE_LIMIT:
+        raise RuntimeError(
+            "large-scale MQ requires a higher file-descriptor hard limit: "
+            f"required={REQUIRED_NOFILE_LIMIT} soft={soft} hard={hard}"
+        )
+    if soft < REQUIRED_NOFILE_LIMIT:
+        resource.setrlimit(
+            resource.RLIMIT_NOFILE,
+            (REQUIRED_NOFILE_LIMIT, hard),
+        )
+    effective_soft, effective_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    print(
+        "[bare-large-scale] nofile limit: "
+        f"soft={effective_soft} hard={effective_hard}",
+        flush=True,
     )
 
 
-def _single_host_anchor_ip_from_start_config(start_cfg: Path) -> str:
-    start_payload = yaml.safe_load(start_cfg.read_text(encoding="utf-8"))
-    start = _require_dict(start_payload, f"start config {start_cfg}")
-    raw_deployconf = start.get("deployconf_path")
-    if not isinstance(raw_deployconf, str) or not raw_deployconf.strip():
-        raise SystemExit(f"start config {start_cfg} must define deployconf_path")
-    deployconf_path = Path(raw_deployconf).expanduser()
-    if not deployconf_path.is_absolute():
-        deployconf_path = (start_cfg.parent / deployconf_path).resolve()
-    if not deployconf_path.is_file():
-        raise SystemExit(f"start config deployconf_path is missing: {deployconf_path}")
-    deployconf_payload = yaml.safe_load(deployconf_path.read_text(encoding="utf-8"))
-    deployconf = _require_dict(deployconf_payload, f"deployconf {deployconf_path}")
-    cluster_nodes = deployconf.get("cluster_nodes")
-    if not isinstance(cluster_nodes, list) or not cluster_nodes:
-        raise SystemExit(f"deployconf {deployconf_path} must define non-empty cluster_nodes")
-    for index, raw_node in enumerate(cluster_nodes):
-        node = _require_dict(raw_node, f"deployconf.cluster_nodes[{index}]")
-        hostname = node.get("hostname")
-        if isinstance(hostname, str) and "bastion" in hostname.lower():
+def _validate_release(release_dir: Path, python: str, workdir: Path, child_env: dict[str, str]) -> dict[str, Path]:
+    binaries = {
+        "etcd": release_dir / "ext_images" / "etcd" / "etcd",
+        "etcdctl": release_dir / "ext_images" / "etcd" / "etcdctl",
+        "greptime": release_dir / "ext_images" / "greptime" / "greptime",
+    }
+    for name, path in binaries.items():
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise RuntimeError(f"release binary is missing or not executable: {name}={path}")
+    probe = subprocess.run(
+        [
+            python,
+            "-c",
+            (
+                "import json, pathlib, fluxon_py, fluxon_pyo3; "
+                "print(json.dumps({"
+                "'fluxon_py': str(pathlib.Path(fluxon_py.__file__).resolve()), "
+                "'fluxon_pyo3': str(pathlib.Path(fluxon_pyo3.__file__).resolve())"
+                "}))"
+            ),
+        ],
+        cwd=str(workdir),
+        env=child_env,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(
+            "selected Python cannot import the packaged Fluxon wheel: "
+            f"python={python} output={probe.stdout.strip()}"
+        )
+    try:
+        imported = json.loads(probe.stdout.strip().splitlines()[-1])
+        imported_path = Path(imported["fluxon_py"]).resolve()
+        imported_pyo3_path = Path(imported["fluxon_pyo3"]).resolve()
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"cannot parse packaged Fluxon import probe: output={probe.stdout.strip()}"
+        ) from exc
+    checkout_package_roots = (
+        (REPO_ROOT / "fluxon_py").resolve(),
+        (REPO_ROOT / "src" / "fluxon_py").resolve(),
+    )
+    if any(
+        imported_path == package_root or package_root in imported_path.parents
+        for package_root in checkout_package_roots
+    ):
+        raise RuntimeError(
+            "bare-local runtime resolved fluxon_py from the checkout instead of the packaged wheel: "
+            f"{imported_path}"
+        )
+    print(
+        "[bare-large-scale] packaged runtime: "
+        f"fluxon_py={imported_path} fluxon_pyo3={imported_pyo3_path}",
+        flush=True,
+    )
+    return binaries
+
+
+def _wait_tcp_ready(
+    *,
+    host: str,
+    port: int,
+    timeout_seconds: float,
+    registry: ProcessRegistry,
+    required: Iterable[ManagedProcess],
+    context: str,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_error = ""
+    while time.monotonic() < deadline:
+        registry.assert_alive(required, context=context)
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return
+        except OSError as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        time.sleep(0.5)
+    raise TimeoutError(f"{context} did not listen on {host}:{port}: last_error={last_error}")
+
+
+def _wait_etcd_ready(
+    *,
+    etcdctl: Path,
+    port: int,
+    timeout_seconds: float,
+    registry: ProcessRegistry,
+    process: ManagedProcess,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    endpoint = f"http://127.0.0.1:{port}"
+    last_output = ""
+    while time.monotonic() < deadline:
+        registry.assert_alive([process], context="etcd readiness")
+        probe = subprocess.run(
+            [str(etcdctl), "--endpoints", endpoint, "endpoint", "health"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+        )
+        last_output = probe.stdout.strip()
+        if probe.returncode == 0:
+            return
+        time.sleep(0.5)
+    raise TimeoutError(f"etcd did not become healthy: endpoint={endpoint} output={last_output}")
+
+
+def _owner_bundle_path(owner_config: dict[str, Any], cluster_name: str) -> Path:
+    return Path(owner_config["fluxonkv_spec"]["share_mem_path"]) / cluster_name
+
+
+def _wait_owner_bundles(
+    *,
+    owner_configs: list[dict[str, Any]],
+    cluster_name: str,
+    timeout_seconds: float,
+    registry: ProcessRegistry,
+    required: Iterable[ManagedProcess],
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    pending = set(range(len(owner_configs)))
+    last_errors: dict[int, str] = {}
+    while pending and time.monotonic() < deadline:
+        registry.assert_alive(required, context="owner shared bundle readiness")
+        for owner_index in list(pending):
+            bundle_dir = _owner_bundle_path(owner_configs[owner_index], cluster_name)
+            shared_path = bundle_dir / "shared.json"
+            mmap_path = bundle_dir / "mmap.file"
+            try:
+                if not mmap_path.is_file():
+                    raise FileNotFoundError(f"missing {mmap_path}")
+                payload = json.loads(shared_path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("shared.json is not an object")
+                if payload.get("cluster_name") != cluster_name:
+                    raise ValueError(
+                        f"cluster_name mismatch: {payload.get('cluster_name')!r} != {cluster_name!r}"
+                    )
+                endpoints = payload.get("etcd_addresses")
+                if not isinstance(endpoints, list) or not endpoints:
+                    raise ValueError("shared.json has no etcd_addresses")
+                if int(payload.get("segment_len", 0)) <= 0:
+                    raise ValueError("shared.json segment_len is not positive")
+            except Exception as exc:
+                last_errors[owner_index] = f"{type(exc).__name__}: {exc}"
+                continue
+            pending.remove(owner_index)
+            print(
+                f"[bare-large-scale] owner ready: index={owner_index} bundle={bundle_dir}",
+                flush=True,
+            )
+        if pending:
+            time.sleep(0.5)
+    if pending:
+        raise TimeoutError(
+            "owner shared bundles did not become ready: "
+            f"pending={sorted(pending)} last_errors={last_errors}"
+        )
+
+
+def _read_proc_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def _resource_snapshot(registry: ProcessRegistry) -> dict[str, Any]:
+    meminfo: dict[str, str] = {}
+    raw_meminfo = _read_proc_text(Path("/proc/meminfo"))
+    if raw_meminfo:
+        for line in raw_meminfo.splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key in {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}:
+                meminfo[key] = value.strip()
+    return {
+        "timestamp_unix_s": time.time(),
+        "loadavg": _read_proc_text(Path("/proc/loadavg")),
+        "meminfo": meminfo,
+        "cgroup": {
+            "memory.current": _read_proc_text(Path("/sys/fs/cgroup/memory.current")),
+            "memory.events": _read_proc_text(Path("/sys/fs/cgroup/memory.events")),
+            "memory.pressure": _read_proc_text(Path("/sys/fs/cgroup/memory.pressure")),
+            "cpu.pressure": _read_proc_text(Path("/sys/fs/cgroup/cpu.pressure")),
+            "pids.current": _read_proc_text(Path("/sys/fs/cgroup/pids.current")),
+        },
+        "tracked_processes": len(registry.records),
+        "tracked_alive": len(registry.alive()),
+        "workers_alive": len(registry.alive(kinds={"worker"})),
+        "benchmark_progress": _benchmark_progress_snapshot(registry),
+    }
+
+
+def _benchmark_progress_snapshot(registry: ProcessRegistry) -> dict[str, Any]:
+    coordinator_log = registry.workdir / "logs" / "coordinator.log"
+    try:
+        raw = coordinator_log.read_bytes()
+    except (FileNotFoundError, OSError):
+        raw = b""
+    workers = [record for record in registry.records if record.kind == "worker"]
+    return {
+        "registered": raw.count("节点注册成功:".encode("utf-8")),
+        "ready": raw.count("节点就绪:".encode("utf-8")),
+        "runtime_ready": raw.count("MPMC runtime ready:".encode("utf-8")),
+        "reported_result": raw.count("的测试结果".encode("utf-8")),
+        "worker_total": len(workers),
+        "worker_exited": sum(record.process.poll() is not None for record in workers),
+        "worker_nonzero": sum(
+            record.process.poll() not in (None, 0)
+            for record in workers
+        ),
+        "result_file_present": (registry.workdir / "benchmark_result.json").is_file(),
+    }
+
+
+def _append_resource_snapshot(workdir: Path, registry: ProcessRegistry) -> None:
+    snapshot = _resource_snapshot(registry)
+    print("[bare-large-scale resource] " + json.dumps(snapshot, sort_keys=True), flush=True)
+    with (workdir / "resource_samples.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(snapshot, sort_keys=True) + "\n")
+
+
+def _load_complete_result(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    runs = payload.get("runs")
+    if not isinstance(runs, list) or not runs:
+        return None
+    for run in runs:
+        if not isinstance(run, dict):
+            return None
+        completion = run.get("completion")
+        if not isinstance(completion, dict) or not isinstance(completion.get("status"), str):
+            return None
+    return payload
+
+
+def _validate_benchmark_result(result: dict[str, Any], *, expected_nodes: int) -> None:
+    runs = result.get("runs")
+    if not isinstance(runs, list) or not runs:
+        raise ValueError("benchmark_result.runs must be a non-empty list")
+    failures: list[str] = []
+    for run_index, raw_run in enumerate(runs):
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"benchmark_result.runs[{run_index}] must be an object")
+        completion = raw_run.get("completion")
+        if not isinstance(completion, dict):
+            raise ValueError(f"benchmark_result.runs[{run_index}].completion must be an object")
+        observed = {
+            "status": completion.get("status"),
+            "expected_nodes": completion.get("expected_nodes"),
+            "registered_node_count": completion.get("registered_node_count"),
+            "ready_node_count": completion.get("ready_node_count"),
+            "runtime_ready_node_count": completion.get("runtime_ready_node_count"),
+            "reported_result_node_count": completion.get("reported_result_node_count"),
+            "pending_result_node_count": completion.get("pending_result_node_count"),
+            "completed": raw_run.get("completed", True),
+            "total_ops": raw_run.get("total_ops"),
+            "total_successful_ops": raw_run.get("total_successful_ops"),
+            "total_failed_ops": raw_run.get("total_failed_ops"),
+            "completion_error": completion.get("completion_error"),
+        }
+        valid = (
+            observed["status"] == "SUCCESS"
+            and observed["expected_nodes"] == expected_nodes
+            and observed["registered_node_count"] == expected_nodes
+            and observed["ready_node_count"] == expected_nodes
+            and observed["runtime_ready_node_count"] == expected_nodes
+            and observed["reported_result_node_count"] == expected_nodes
+            and observed["pending_result_node_count"] == 0
+            and observed["completed"] is True
+            and isinstance(observed["total_ops"], int)
+            and observed["total_ops"] > 0
+            and isinstance(observed["total_successful_ops"], int)
+            and observed["total_successful_ops"] > 0
+        )
+        if not valid:
+            failures.append(f"run[{run_index}]={observed}")
+    if failures:
+        raise ValueError("large-scale MQ did not complete on every worker: " + "; ".join(failures))
+
+
+def _wait_for_result(
+    *,
+    result_path: Path,
+    timeout_seconds: float,
+    registry: ProcessRegistry,
+    critical: list[ManagedProcess],
+    workers: list[ManagedProcess],
+    workdir: Path,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    next_resource_sample = 0.0
+    while time.monotonic() < deadline:
+        result = _load_complete_result(result_path)
+        if result is not None:
+            return result
+        registry.assert_alive(critical, context="benchmark result wait")
+        registry.assert_alive(workers, context="benchmark result wait")
+        now = time.monotonic()
+        if now >= next_resource_sample:
+            _append_resource_snapshot(workdir, registry)
+            registry.write_status()
+            next_resource_sample = now + RESOURCE_SAMPLE_INTERVAL_SECONDS
+        time.sleep(0.5)
+    raise TimeoutError(
+        f"benchmark_result.json did not become complete within {timeout_seconds:.1f}s: {result_path}"
+    )
+
+
+def _wait_workers_exit(
+    *,
+    workers: list[ManagedProcess],
+    critical: list[ManagedProcess],
+    registry: ProcessRegistry,
+    workdir: Path,
+) -> None:
+    deadline = time.monotonic() + POST_RESULT_WORKER_EXIT_TIMEOUT_SECONDS
+    next_resource_sample = 0.0
+    while time.monotonic() < deadline:
+        registry.assert_alive(critical, context="post-result worker shutdown")
+        nonzero = [
+            f"{record.name}(rc={record.process.poll()})"
+            for record in workers
+            if record.process.poll() not in (None, 0)
+        ]
+        if nonzero:
+            raise RuntimeError("workers exited nonzero after reporting result: " + ", ".join(nonzero))
+        alive = [record for record in workers if record.process.poll() is None]
+        if not alive:
+            registry.write_status()
+            return
+        now = time.monotonic()
+        if now >= next_resource_sample:
+            print(
+                f"[bare-large-scale] waiting for worker shutdown: alive={len(alive)}/{len(workers)}",
+                flush=True,
+            )
+            _append_resource_snapshot(workdir, registry)
+            next_resource_sample = now + RESOURCE_SAMPLE_INTERVAL_SECONDS
+        time.sleep(0.5)
+    alive_names = [record.name for record in workers if record.process.poll() is None]
+    raise TimeoutError(
+        "workers did not finish their normal close path after benchmark result: "
+        f"alive_count={len(alive_names)} alive={alive_names}"
+    )
+
+
+def _tail_text(path: Path, line_count: int = LOG_TAIL_LINES) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return f"missing log: {path}"
+    return "\n".join(lines[-line_count:])
+
+
+def _print_failure_tails(registry: ProcessRegistry) -> None:
+    selected: list[ManagedProcess] = []
+    selected.extend(record for record in registry.records if record.kind != "worker")
+    failed_workers = [
+        record
+        for record in registry.records
+        if record.kind == "worker" and record.process.poll() not in (None, 0)
+    ]
+    selected.extend(failed_workers[:10])
+    if not failed_workers:
+        selected.extend(
+            [record for record in registry.records if record.kind == "worker"][:4]
+        )
+    seen: set[str] = set()
+    for record in selected:
+        if record.name in seen:
             continue
-        node_ip = node.get("ip")
-        if isinstance(node_ip, str) and node_ip.strip():
-            return node_ip.strip()
-    raise SystemExit(f"deployconf {deployconf_path} has no non-bastion cluster node IP")
+        seen.add(record.name)
+        print(
+            f"=== {record.name} rc={record.process.poll()} log={record.log_path} tail ===",
+            flush=True,
+        )
+        print(_tail_text(record.log_path), flush=True)
+    registered_logs = {record.log_path.resolve() for record in registry.records}
+    nested_logs = [
+        path
+        for path in sorted((registry.workdir / "services").rglob("*.log"))
+        if path.resolve() not in registered_logs
+    ]
+    for path in nested_logs[:20]:
+        print(f"=== nested service log={path} tail ===", flush=True)
+        print(_tail_text(path), flush=True)
 
 
-def _controller_port_from_start_config(start_cfg: Path) -> int:
-    start_payload = yaml.safe_load(start_cfg.read_text(encoding="utf-8"))
-    start = _require_dict(start_payload, f"start config {start_cfg}")
-    raw_url = start.get("controller_url")
-    if not isinstance(raw_url, str) or not raw_url.strip():
-        raise SystemExit(f"start config {start_cfg} must define controller_url")
-    parsed = urlparse(raw_url.strip())
-    if parsed.port is None:
-        raise SystemExit(f"start config {start_cfg} controller_url must include an explicit port: {raw_url}")
-    return int(parsed.port)
+def _install_signal_handlers() -> dict[signal.Signals, Any]:
+    previous: dict[signal.Signals, Any] = {}
+
+    def _raise_interrupt(signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt(f"received signal {signum}")
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous[sig] = signal.getsignal(sig)
+        signal.signal(sig, _raise_interrupt)
+    return previous
 
 
-def main() -> int:
+def _restore_signal_handlers(previous: dict[signal.Signals, Any]) -> None:
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
+
+
+def _run_bare_local(args: argparse.Namespace) -> int:
+    _validate_args(args)
+    workdir = Path(args.workdir).expanduser().resolve()
+    release_dir = Path(args.release_dir).expanduser().resolve()
+    _prepare_new_workdir(workdir)
+
+    worker_count = int(args.producer_count) + int(args.consumer_count)
+    ports = _allocate_port_plan(
+        workdir=workdir,
+        owner_count=int(args.owner_count),
+        worker_count=worker_count,
+    )
+    host_ips = _host_ipv4_addresses()
+    plan, benchmark_config, master_config, owner_configs = _build_runtime_artifacts(
+        args=args,
+        workdir=workdir,
+        ports=ports,
+        host_ips=host_ips,
+    )
+    runtime_paths = _materialize_runtime(
+        workdir=workdir,
+        plan=plan,
+        benchmark_config=benchmark_config,
+        master_config=master_config,
+        owner_configs=owner_configs,
+    )
+    print(
+        "[bare-large-scale] plan materialized: "
+        f"owners={args.owner_count} producers={args.producer_count} "
+        f"consumers={args.consumer_count} workdir={workdir}",
+        flush=True,
+    )
+    if args.plan_only:
+        return 0
+
+    child_env = _child_environment()
+    registry = ProcessRegistry(workdir=workdir, child_env=child_env)
+    previous_handlers = _install_signal_handlers()
+    failure: BaseException | None = None
+    exit_code = 1
+    started_at = time.time()
+    try:
+        _ensure_nofile_limit()
+        binaries = _validate_release(release_dir, args.python, workdir, child_env)
+        etcd_workdir = workdir / "services" / "etcd"
+        etcd_workdir.mkdir(parents=True, exist_ok=True)
+        etcd = registry.start(
+            name="etcd",
+            kind="service",
+            command=[
+                str(binaries["etcd"]),
+                "--name",
+                "largescale-etcd",
+                "--data-dir",
+                str((etcd_workdir / "data").resolve()),
+                "--listen-client-urls",
+                f"http://127.0.0.1:{ports.etcd_client}",
+                "--advertise-client-urls",
+                f"http://127.0.0.1:{ports.etcd_client}",
+                "--listen-peer-urls",
+                f"http://127.0.0.1:{ports.etcd_peer}",
+                "--initial-advertise-peer-urls",
+                f"http://127.0.0.1:{ports.etcd_peer}",
+                "--initial-cluster",
+                f"largescale-etcd=http://127.0.0.1:{ports.etcd_peer}",
+                "--initial-cluster-state",
+                "new",
+                "--initial-cluster-token",
+                plan["cluster_name"],
+                "--auto-compaction-mode",
+                "periodic",
+                "--auto-compaction-retention",
+                "1h",
+                "--log-level",
+                "info",
+            ],
+            cwd=etcd_workdir,
+            log_path=workdir / "logs" / "etcd.log",
+        )
+        _wait_etcd_ready(
+            etcdctl=binaries["etcdctl"],
+            port=ports.etcd_client,
+            timeout_seconds=60,
+            registry=registry,
+            process=etcd,
+        )
+
+        greptime_workdir = workdir / "services" / "greptime"
+        greptime_workdir.mkdir(parents=True, exist_ok=True)
+        greptime = registry.start(
+            name="greptime",
+            kind="service",
+            command=[
+                str(binaries["greptime"]),
+                "standalone",
+                "start",
+                "--data-home",
+                str((greptime_workdir / "data").resolve()),
+                "--http-addr",
+                f"127.0.0.1:{ports.greptime_http}",
+            ],
+            cwd=greptime_workdir,
+            log_path=workdir / "logs" / "greptime.log",
+        )
+        _wait_tcp_ready(
+            host="127.0.0.1",
+            port=ports.greptime_http,
+            timeout_seconds=120,
+            registry=registry,
+            required=[greptime],
+            context="greptime readiness",
+        )
+
+        master_workdir = workdir / "services" / "master"
+        master_workdir.mkdir(parents=True, exist_ok=True)
+        master = registry.start(
+            name="master",
+            kind="service",
+            command=[
+                args.python,
+                "-u",
+                "-m",
+                "fluxon_py.runtime.start_master",
+                "-c",
+                str(runtime_paths["master_config"]),
+                "-w",
+                str(master_workdir),
+            ],
+            cwd=workdir,
+            log_path=workdir / "logs" / "master.log",
+        )
+        _wait_tcp_ready(
+            host="127.0.0.1",
+            port=ports.master,
+            timeout_seconds=120,
+            registry=registry,
+            required=[etcd, greptime, master],
+            context="master readiness",
+        )
+        time.sleep(2.0)
+        registry.assert_alive([master], context="master post-readiness stability")
+
+        owners: list[ManagedProcess] = []
+        for owner_index in range(int(args.owner_count)):
+            owner_workdir = workdir / "services" / f"owner_{owner_index}"
+            owner_workdir.mkdir(parents=True, exist_ok=True)
+            owners.append(
+                registry.start(
+                    name=f"owner_{owner_index}",
+                    kind="owner",
+                    command=[
+                        args.python,
+                        "-u",
+                        "-m",
+                        "fluxon_py.runtime.start_owner_kvclient",
+                        "-c",
+                        str(runtime_paths[f"owner_config_{owner_index}"]),
+                        "-w",
+                        str(owner_workdir),
+                    ],
+                    cwd=workdir,
+                    log_path=workdir / "logs" / f"owner_{owner_index}.log",
+                )
+            )
+            time.sleep(0.1)
+        _wait_owner_bundles(
+            owner_configs=owner_configs,
+            cluster_name=plan["cluster_name"],
+            timeout_seconds=float(args.cluster_ready_timeout_seconds),
+            registry=registry,
+            required=[etcd, greptime, master, *owners],
+        )
+
+        coordinator = registry.start(
+            name="coordinator",
+            kind="coordinator",
+            command=[
+                args.python,
+                "-u",
+                str(runtime_paths["coordinator_script"]),
+            ],
+            cwd=workdir,
+            log_path=workdir / "logs" / "coordinator.log",
+        )
+        critical = [etcd, greptime, master, *owners, coordinator]
+        _wait_tcp_ready(
+            host="127.0.0.1",
+            port=ports.coordinator,
+            timeout_seconds=120,
+            registry=registry,
+            required=critical,
+            context="coordinator readiness",
+        )
+
+        workers: list[ManagedProcess] = []
+        for worker_index, worker_spec in enumerate(plan["workers"]):
+            instance_key = str(worker_spec["instance_key"])
+            role = str(worker_spec["role"])
+            role_index = int(worker_spec["role_index"])
+            workers.append(
+                registry.start(
+                    name=instance_key,
+                    kind="worker",
+                    command=[
+                        args.python,
+                        "-u",
+                        str(runtime_paths["node_script"]),
+                        "--instance-key",
+                        instance_key,
+                        "--coordinator",
+                        f"127.0.0.1:{ports.coordinator}",
+                    ],
+                    cwd=workdir,
+                    log_path=workdir / "logs" / "workers" / f"{role}_{role_index:03d}.log",
+                )
+            )
+            if worker_index % 16 == 15 or worker_index + 1 == worker_count:
+                print(
+                    f"[bare-large-scale] workers started: {worker_index + 1}/{worker_count}",
+                    flush=True,
+                )
+            time.sleep(0.05)
+
+        result_timeout_seconds = (
+            float(args.duration_seconds)
+            + float(args.metric_warmup_seconds)
+            + float(args.cluster_ready_timeout_seconds) * 2.0
+            + 600.0
+        )
+        result = _wait_for_result(
+            result_path=workdir / "benchmark_result.json",
+            timeout_seconds=result_timeout_seconds,
+            registry=registry,
+            critical=critical,
+            workers=workers,
+            workdir=workdir,
+        )
+        _validate_benchmark_result(result, expected_nodes=worker_count)
+        print(
+            f"[bare-large-scale] benchmark result validated for all {worker_count} workers",
+            flush=True,
+        )
+        _wait_workers_exit(
+            workers=workers,
+            critical=critical,
+            registry=registry,
+            workdir=workdir,
+        )
+        summary = {
+            "schema_version": 1,
+            "outcome": "SUCCESS",
+            "started_at_unix_s": started_at,
+            "finished_at_unix_s": time.time(),
+            "expected_workers": worker_count,
+            "normal_worker_exits": sum(record.process.poll() == 0 for record in workers),
+            "benchmark_result": result,
+        }
+        _write_json_atomic(workdir / "summary.json", summary)
+        print(
+            f"[bare-large-scale] SUCCESS: all {worker_count} workers reported and exited normally",
+            flush=True,
+        )
+        exit_code = 0
+    except KeyboardInterrupt as exc:
+        failure = exc
+        exit_code = 130
+    except BaseException as exc:
+        failure = exc
+        exit_code = 1
+    finally:
+        if failure is not None:
+            _write_json_atomic(
+                workdir / "failure.json",
+                {
+                    "schema_version": 1,
+                    "error_type": type(failure).__name__,
+                    "error": str(failure),
+                    "traceback": "".join(
+                        traceback.format_exception(type(failure), failure, failure.__traceback__)
+                    ),
+                    "timestamp_unix_s": time.time(),
+                },
+            )
+            print(
+                f"[bare-large-scale] FAILED: {type(failure).__name__}: {failure}",
+                flush=True,
+            )
+            _print_failure_tails(registry)
+        registry.stop_all()
+        _remove_large_runtime_data(workdir)
+        _restore_signal_handlers(previous_handlers)
+    return exit_code
+
+
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Flat index entry for the TEST_STACK large-scale MQ benchmark "
-            "(default: 4 owners at 1GiB, 320 producers, 8 consumers, "
-            "1 worker thread per process, 256-byte values)."
+            "Run the large-scale MPMC benchmark as direct local processes. "
+            "This entrypoint does not use testbed, ops, ci_2_virt_node, or test_runner."
         )
     )
-    parser.add_argument("--python", default=os.environ.get("PYTHON", sys.executable))
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Base TEST_STACK suite YAML.")
-    parser.add_argument("--workdir", default=str(DEFAULT_WORKDIR), help="test_runner workdir.")
-    parser.add_argument("--suite-out", help="Generated suite YAML path; default is <workdir>/largescale_mq_suite.yaml.")
-    parser.add_argument("--profile", action="append", dest="profiles", help="Profile id to run; repeat or comma-separate.")
-    parser.add_argument("--action", choices=["run", "clean"], default="run")
-    parser.add_argument("--generate-only", action="store_true", help="Write the generated suite YAML and do not invoke test_runner.")
+    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--release-dir", default=str(DEFAULT_RELEASE_DIR))
+    parser.add_argument("--workdir", default=str(DEFAULT_WORKDIR))
+    parser.add_argument("--action", choices=("run", "clean"), default="run")
     parser.add_argument(
-        "--testbed-bundle-source",
-        help="Existing TEST_STACK testbed bundle directory copied to <workdir>/testbed_bundle before a real run.",
-    )
-    parser.add_argument(
-        "--start-config-relpath",
-        default="start_test_bed.runner.yaml",
-        help="Start-testbed config path inside the run-local testbed bundle.",
-    )
-    parser.add_argument(
-        "--single-host-logical-targets",
+        "--plan-only",
         action="store_true",
-        help="Generate node-1..N logical TEST_STACK targets on the first usable target IP of each selected profile.",
+        help="Materialize the direct-process plan and runtime configs without starting processes.",
     )
     parser.add_argument("--owner-count", type=int, default=4)
     parser.add_argument("--owner-dram-gib", type=int, default=1)
-    parser.add_argument("--producer-count", type=int, default=320)
+    parser.add_argument("--producer-count", type=int, default=160)
     parser.add_argument("--consumer-count", type=int, default=8)
-    parser.add_argument("--duration-seconds", type=int, default=60)
+    parser.add_argument("--threads-per-process", type=int, default=1)
+    parser.add_argument("--duration-seconds", type=int, default=90)
+    parser.add_argument("--metric-warmup-seconds", type=int, default=60)
     parser.add_argument("--value-size", type=int, default=256)
-    parser.add_argument("--metric-warmup-seconds", type=int, default=0)
-    parser.add_argument(
-        "--threads-per-process",
-        type=int,
-        default=int(DEFAULT_BENCHMARK["threads_per_process"]),
-        help="Worker threads per benchmark process.",
-    )
-    parser.add_argument("--op-timeout-seconds", type=int, default=30)
+    parser.add_argument("--op-timeout-seconds", type=int, default=5)
     parser.add_argument("--cluster-ready-timeout-seconds", type=int, default=1800)
-    parser.add_argument(
-        "--mpmc-active-producer-runtime-limit",
-        type=int,
-        help=(
-            "Optional MPMC test-stack limit for active producer runtimes; "
-            "producer nodes beyond the limit participate as logical-only nodes."
-        ),
-    )
-    parser.add_argument("--consumer-sim-min-ms", type=int, default=700)
-    parser.add_argument("--consumer-sim-max-ms", type=int, default=1500)
-    args = parser.parse_args()
+    parser.add_argument("--consumer-sim-min-ms", type=int, default=1)
+    parser.add_argument("--consumer-sim-max-ms", type=int, default=1)
+    return parser.parse_args()
 
-    workdir = _repo_path(args.workdir)
+
+def main() -> int:
+    args = _parse_args()
+    workdir = Path(args.workdir).expanduser().resolve()
     if args.action == "clean":
-        return call([args.python, "-u", str(RUNNER), "--workdir", str(workdir), "--action", "clean"])
-
-    start_cfg: Path | None = None
-    single_host_anchor_ip: str | None = None
-    local_controller_port: int | None = None
-    if not args.generate_only:
-        if not args.testbed_bundle_source:
-            raise SystemExit("--testbed-bundle-source is required unless --generate-only is set")
-        start_cfg = _prepare_run_local_testbed_bundle(
-            source=args.testbed_bundle_source,
-            workdir=workdir,
-            start_config_relpath=args.start_config_relpath,
-        )
-        local_controller_port = _controller_port_from_start_config(start_cfg)
-        if bool(args.single_host_logical_targets):
-            single_host_anchor_ip = _single_host_anchor_ip_from_start_config(start_cfg)
-
-    config_path = _repo_path(args.config)
-    if not config_path.exists():
-        raise SystemExit(f"--config not found: {config_path}")
-
-    with config_path.open("r", encoding="utf-8") as fh:
-        cfg = _require_dict(yaml.safe_load(fh), f"config file {config_path}")
-
-    profile_ids = _split_ids(args.profiles, default=DEFAULT_PROFILE_ID)
-    _ensure_ci_public_profile(cfg, profile_ids)
-    suite = _build_suite(
-        cfg,
-        args,
-        profile_ids,
-        single_host_anchor_ip=single_host_anchor_ip,
-    )
-    if local_controller_port is not None:
-        _rewrite_test_stack_coordinator_ports_for_local_controller(
-            suite,
-            controller_port=local_controller_port,
-        )
-
-    suite_out = _repo_path(args.suite_out) if args.suite_out else (workdir / "largescale_mq_suite.yaml")
-    suite_out.parent.mkdir(parents=True, exist_ok=True)
-    with suite_out.open("w", encoding="utf-8") as fh:
-        yaml.safe_dump(suite, fh, sort_keys=False, allow_unicode=False)
-
-    print(f"generated suite: {suite_out}", flush=True)
-    if args.generate_only:
+        _clean_workdir(workdir)
         return 0
-    assert start_cfg is not None
-    env = os.environ.copy()
-    env["FLUXON_TEST_STACK_START_TEST_BED_CONFIG"] = str(start_cfg)
-    return call(
-        [args.python, "-u", str(RUNNER), "--config", str(suite_out), "--workdir", str(workdir), "--action", "run"],
-        env=env,
-    )
+    return _run_bare_local(args)
 
 
 if __name__ == "__main__":

@@ -93,12 +93,20 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         self.assertIn("package-wheel:", workflow)
         self.assertIn("ci-large-scale-mq:", workflow)
         self.assertEqual(workflow.count("needs: package-wheel"), 2)
-        self.assertIn("--suite-kind test-all", workflow)
-        self.assertIn("--suite-kind large-scale", workflow)
+        self.assertNotIn("--suite-kind", workflow)
         self.assertIn('--current-job-name "$CURRENT_JOB_NAME"', workflow)
         self.assertIn("job_name=args.current_job_name", codex_helper)
         self.assertNotIn('job_name="ci-2-virt-node"', codex_helper)
-        self.assertEqual(workflow.count("--skip-pack"), 2)
+        self.assertIn('repo_root / ".dever" / "ci_large_scale_mq"', codex_helper)
+        for diagnostic_name in (
+            "failure.json",
+            "processes.json",
+            "resource_samples.jsonl",
+            "run_plan.json",
+            "summary.json",
+        ):
+            self.assertIn(f'"{diagnostic_name}"', codex_helper)
+        self.assertEqual(workflow.count("--skip-pack"), 1)
         self.assertEqual(workflow.count("actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131"), 2)
         self.assertIn("fluxon-ci-release-${{ github.sha }}", workflow)
         self.assertEqual(
@@ -116,39 +124,39 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             workflow,
         )
         self.assertIn("scripts/ci_2_virt_node_workflow.py scan-and-clean-temp", workflow)
-        self.assertNotIn("--producer-count", workflow)
         self.assertNotIn("/usr/local/lib/android", workflow)
-        self.assertIn('"__WORKDIR_ROOT__/largescale_mq_ci_single_host/p160_c8"', helper)
-        self.assertIn('"--producer-count",\n                "160"', helper)
-        self.assertIn('"--consumer-count",\n                "8"', helper)
-        self.assertIn('"--metric-warmup-seconds",\n                "60"', helper)
+        self.assertNotIn("ci_top_attention_largescale_mq", helper)
+        large_job = workflow.split("  ci-large-scale-mq:", 1)[1].split(
+            "  codex_failure_analysis:",
+            1,
+        )[0]
+        self.assertIn(
+            "fluxon_test_stack/top_attention_test_index/_largescale_mq.py",
+            large_job,
+        )
+        self.assertIn("--producer-count 160", large_job)
+        self.assertIn("--consumer-count 8", large_job)
+        self.assertIn("--metric-warmup-seconds 60", large_job)
+        self.assertIn("Install packaged Fluxon wheel", large_job)
+        self.assertNotIn("ci_2_virt_node.py", large_job)
+        self.assertNotIn("start_test_bed", large_job)
+        self.assertNotIn("test_runner.py", large_job)
+        self.assertNotIn("--testbed-hostworkdir", large_job)
+        self.assertNotIn("rather_no_git_submodule.py", large_job)
+        self.assertNotIn("path: .dever/ci_large_scale_mq/**", large_job)
+        self.assertIn(".dever/ci_large_scale_mq/logs/**/*.log", large_job)
+        self.assertIn(".dever/ci_large_scale_mq/services/**/shared.json", large_job)
         self.assertNotIn("command_variants", helper)
         self.assertNotIn("p8_c8", helper)
         self.assertNotIn("p32_c32", helper)
 
-    def test_suite_kind_partitions_largescale_from_test_all(self) -> None:
+    def test_test_all_scene_set_excludes_bare_local_largescale(self) -> None:
         all_scenes = _WORKFLOW_HELPER._top_attention_ci_scenes(
             "Tele-AI.github.io/Fluxon"
         )
-        test_all = _WORKFLOW_HELPER._select_ci_scenes(
-            all_scenes,
-            suite_kind=_WORKFLOW_HELPER.CI_SUITE_KIND_TEST_ALL,
-        )
-        large_scale = _WORKFLOW_HELPER._select_ci_scenes(
-            all_scenes,
-            suite_kind=_WORKFLOW_HELPER.CI_SUITE_KIND_LARGE_SCALE,
-        )
 
-        self.assertNotIn(_WORKFLOW_HELPER.CI_LARGE_SCALE_SCENE_ID, test_all)
-        self.assertEqual(
-            set(large_scale),
-            {_WORKFLOW_HELPER.CI_LARGE_SCALE_SCENE_ID},
-        )
-        self.assertEqual(
-            set(test_all) | set(large_scale),
-            set(all_scenes),
-        )
-        self.assertFalse(set(test_all) & set(large_scale))
+        self.assertNotIn("ci_top_attention_largescale_mq", all_scenes)
+        self.assertTrue(all_scenes)
 
     def test_scan_and_clean_temp_is_scoped_and_preserves_runner_control_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:

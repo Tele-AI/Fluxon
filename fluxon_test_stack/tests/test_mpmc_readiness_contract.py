@@ -1325,6 +1325,29 @@ class TestMPMCReadinessContract(unittest.TestCase):
 
         self.assertFalse(BenchmarkNode._is_retryable_runtime_init_error(message))
 
+    def test_failed_framework_init_shuts_down_partial_runtime(self) -> None:
+        source = (REPO_ROOT / "fluxon_rs" / "fluxon_kv" / "src" / "lib.rs").read_text(
+            encoding="utf-8"
+        )
+        helper_start = source.index("async fn finish_framework_init(")
+        helper_end = source.index("async fn run_master_impl(", helper_start)
+        helper_source = source[helper_start:helper_end]
+
+        self.assertIn("framework.shutdown().await", helper_source)
+        self.assertIn("failed to shut down partially initialized framework", helper_source)
+        for init_function in (
+            "init_framework_master",
+            "init_framework_external",
+            "init_framework_owner",
+        ):
+            init_call = f"{init_function}(&framework, init_args).await"
+            call_pos = source.index(init_call)
+            self.assertIn(
+                "finish_framework_init(",
+                source[max(0, call_pos - 120) : call_pos],
+                f"{init_function} must release partially initialized modules before returning",
+            )
+
     @unittest.skipIf(node_mod is None, f"distributed benchmark node import failed: {NODE_RUNTIME_IMPORT_ERROR}")
     def test_worker_owned_kvcache_config_rejects_port_range_overflow(self) -> None:
         base_config = {

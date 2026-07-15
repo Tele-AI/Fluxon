@@ -21,18 +21,24 @@ TESTBED_HOSTWORKDIR_DIRNAME = "fluxon_deploy"
 TESTBED_SERVICE_LOG_NAMES = ("etcd", "greptime", "ops_controller")
 DIAGNOSTIC_NAMES = frozenset(
     {
+        "benchmark_config.py",
         "benchmark_result.json",
         "case_runs.yaml",
         "ci_scene_config.yaml",
         "deploy_result.yaml",
         "exception.txt",
         "exit_code.txt",
+        "failure.json",
         "inflight_attempt.txt",
+        "processes.json",
+        "resource_samples.jsonl",
         "restart_count.txt",
         "result.json",
+        "run_plan.json",
         "status.yaml",
         "stderr.txt",
         "stdout.txt",
+        "summary.json",
         "summary.yaml",
     }
 )
@@ -83,6 +89,10 @@ def _should_collect(path: Path) -> bool:
         or path.name.endswith("_log_tail.txt")
         or path.suffix.lower() in LOG_SUFFIXES
         or "logs" in lowered_parts
+        or (
+            "configs" in lowered_parts
+            and path.suffix.lower() in {".yaml", ".yml"}
+        )
     )
 
 
@@ -114,6 +124,7 @@ def _collect_context(args: argparse.Namespace) -> None:
     source_roots = [
         repo_root / ".dever" / "ci_2_virt_node" / "runner_run",
         repo_root / ".dever" / "ci_2_virt_node" / "start_test_bed",
+        repo_root / ".dever" / "ci_large_scale_mq",
         repo_root / "setup_and_pack" / "nix" / "runs",
         repo_root / "fluxon_release",
     ]

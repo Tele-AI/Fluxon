@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import sys
@@ -10,19 +11,19 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import yaml
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INDEX_DIR = REPO_ROOT / "fluxon_test_stack" / "top_attention_test_index"
 MODULE_PATH = INDEX_DIR / "_largescale_mq.py"
-RUNNER_PATH = REPO_ROOT / "fluxon_test_stack" / "test_runner.py"
 
 
 def _load_module():
     sys.path.insert(0, str(INDEX_DIR))
     try:
-        spec = importlib.util.spec_from_file_location("fluxon_test_stack_top_attention_largescale_mq", MODULE_PATH)
+        spec = importlib.util.spec_from_file_location(
+            "fluxon_test_stack_top_attention_largescale_mq",
+            MODULE_PATH,
+        )
         assert spec is not None and spec.loader is not None
         mod = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = mod
@@ -33,56 +34,95 @@ def _load_module():
             sys.path.pop(0)
 
 
-def _load_runner_module():
-    runner_dir = RUNNER_PATH.parent
-    sys.path.insert(0, str(runner_dir))
-    try:
-        spec = importlib.util.spec_from_file_location("fluxon_test_stack_runner_for_largescale_mq", RUNNER_PATH)
-        assert spec is not None and spec.loader is not None
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = mod
-        spec.loader.exec_module(mod)
-        return mod
-    finally:
-        if sys.path and sys.path[0] == str(runner_dir):
-            sys.path.pop(0)
+def _args(**overrides):
+    values = {
+        "python": sys.executable,
+        "release_dir": str(REPO_ROOT / "fluxon_release"),
+        "workdir": "",
+        "action": "run",
+        "plan_only": True,
+        "owner_count": 4,
+        "owner_dram_gib": 1,
+        "producer_count": 160,
+        "consumer_count": 8,
+        "threads_per_process": 1,
+        "duration_seconds": 90,
+        "metric_warmup_seconds": 60,
+        "value_size": 256,
+        "op_timeout_seconds": 5,
+        "cluster_ready_timeout_seconds": 1800,
+        "consumer_sim_min_ms": 1,
+        "consumer_sim_max_ms": 1,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def _success_result(expected_nodes: int) -> dict:
+    return {
+        "runs": [
+            {
+                "completed": True,
+                "total_ops": 100,
+                "total_successful_ops": 100,
+                "total_failed_ops": 0,
+                "completion": {
+                    "status": "SUCCESS",
+                    "expected_nodes": expected_nodes,
+                    "registered_node_count": expected_nodes,
+                    "ready_node_count": expected_nodes,
+                    "runtime_ready_node_count": expected_nodes,
+                    "reported_result_node_count": expected_nodes,
+                    "pending_result_node_count": 0,
+                    "completion_error": None,
+                },
+            }
+        ]
+    }
 
 
 class TestTopAttentionLargescaleMqContract(unittest.TestCase):
-    def test_runner_mpmc_uses_process_fanout_for_single_host_logical_targets(self) -> None:
-        runner = _load_runner_module()
+    def test_entrypoint_is_bare_local_and_has_no_testbed_runner_surface(self) -> None:
+        entry = _load_module()
+        source = MODULE_PATH.read_text(encoding="utf-8")
 
-        self.assertTrue(
-            runner._test_stack_scene_uses_per_target_process_fanout(
-                scene_mode=runner.TEST_STACK_MODE_MPMC,
+        self.assertEqual(entry.TEST_REQUIREMENTS, ["fluxon-release"])
+        self.assertIn('execution_model": "bare_local_processes"', source)
+        self.assertNotIn("--testbed-bundle-source", source)
+        self.assertNotIn("start_test_bed.py", source)
+        self.assertNotIn("test_runner.py", source)
+        self.assertNotIn("ci_2_virt_node.py", source)
+        self.assertNotIn("mpmc_active_producer_runtime_limit", source)
+
+    def test_port_plan_reserves_one_port_for_every_real_process_runtime(self) -> None:
+        entry = _load_module()
+        with tempfile.TemporaryDirectory() as td:
+            plan = entry._allocate_port_plan(
+                workdir=Path(td),
+                owner_count=4,
+                worker_count=168,
+                busy_ports=set(),
             )
-        )
 
-    def test_local_coordinator_port_base_stays_in_range_for_high_controller_ports(self) -> None:
+        all_ports = [
+            plan.etcd_client,
+            plan.etcd_peer,
+            plan.greptime_http,
+            plan.master,
+            plan.coordinator,
+            *plan.owners,
+            *plan.workers,
+        ]
+        self.assertEqual(len(plan.owners), 4)
+        self.assertEqual(len(plan.workers), 168)
+        self.assertEqual(len(all_ports), len(set(all_ports)))
+        self.assertGreaterEqual(min(all_ports), entry.PORT_MIN)
+        self.assertLessEqual(max(all_ports), entry.PORT_MAX)
+
+    def test_port_allocator_skips_a_busy_contiguous_block(self) -> None:
         entry = _load_module()
-
         self.assertEqual(
-            entry._local_test_stack_coordinator_port_base(controller_port=19080, topology_key=4),
-            20480,
-        )
-        self.assertEqual(
-            entry._local_test_stack_coordinator_port_base(controller_port=63680, topology_key=4),
-            65080,
-        )
-        self.assertEqual(
-            entry._local_test_stack_coordinator_port_base(controller_port=63680, topology_key=16),
-            25280,
-        )
-        self.assertEqual(
-            entry._local_test_stack_coordinator_port_base(controller_port=63680, topology_key="42"),
-            27880,
-        )
-
-    def test_local_p2p_port_block_skips_busy_ports(self) -> None:
-        entry = _load_module()
-
-        self.assertEqual(
-            entry._find_local_tcp_port_block(
+            entry._find_tcp_port_block(
                 preferred_start=20000,
                 required_count=4,
                 busy_ports={20000, 20001, 20002, 20003},
@@ -90,534 +130,131 @@ class TestTopAttentionLargescaleMqContract(unittest.TestCase):
             20004,
         )
 
-    def test_local_p2p_port_base_uses_free_block(self) -> None:
-        entry = _load_module()
-
-        base = entry._local_test_stack_p2p_port_base(
-            controller_port=63680,
-            topology_key=20,
-            required_count=8,
-            busy_ports=set(),
-        )
-        shifted = entry._local_test_stack_p2p_port_base(
-            controller_port=63680,
-            topology_key=20,
-            required_count=8,
-            busy_ports=set(range(base, base + 8)),
-        )
-
-        self.assertEqual(shifted, base + 8)
-
-    def test_local_p2p_port_base_avoids_ephemeral_ports(self) -> None:
-        entry = _load_module()
-
-        base = entry._local_test_stack_p2p_port_base(
-            controller_port=63680,
-            topology_key=4,
-            required_count=512,
-            busy_ports=set(range(32768, 61000)),
-        )
-
-        self.assertLess(base + 512, 32768)
-
-    def test_local_master_port_base_uses_free_non_ephemeral_block(self) -> None:
-        entry = _load_module()
-
-        base = entry._local_test_stack_master_port_base(
-            controller_port=23080,
-            topology_key=4,
-            required_count=10,
-            busy_ports=set(range(32768, 61000)),
-        )
-        shifted = entry._local_test_stack_master_port_base(
-            controller_port=23080,
-            topology_key=4,
-            required_count=10,
-            busy_ports=set(range(32768, 61000)) | set(range(base, base + 10)),
-        )
-
-        self.assertLess(base + 10, 32768)
-        self.assertEqual(shifted, base + 10)
-
-    def test_generate_only_writes_minimal_ci_smoke_suite_without_running_runner(self) -> None:
+    def test_runtime_config_materializes_all_160_producers_and_8_consumers(self) -> None:
         entry = _load_module()
         with tempfile.TemporaryDirectory() as td:
-            suite_out = Path(td) / "largescale_mq_suite.yaml"
+            workdir = Path(td) / "run"
+            ports = entry._allocate_port_plan(
+                workdir=workdir,
+                owner_count=4,
+                worker_count=168,
+                busy_ports=set(),
+            )
+            plan, benchmark, master, owners = entry._build_runtime_artifacts(
+                args=_args(workdir=str(workdir)),
+                workdir=workdir,
+                ports=ports,
+                host_ips=["10.0.0.10", "127.0.0.1"],
+            )
 
-            with mock.patch.object(entry, "call", side_effect=AssertionError("test_runner should not run")):
+        self.assertEqual(plan["execution_model"], "bare_local_processes")
+        self.assertFalse(plan["uses_testbed"])
+        self.assertEqual(plan["topology"]["owner_count"], 4)
+        self.assertEqual(plan["topology"]["producer_count"], 160)
+        self.assertEqual(plan["topology"]["consumer_count"], 8)
+        self.assertEqual(plan["topology"]["worker_count"], 168)
+        self.assertEqual(len(plan["workers"]), 168)
+        self.assertEqual(len(owners), 4)
+        self.assertEqual(master["network"]["subnet_whitelist"], ["10.0.0.10/32", "127.0.0.1/32"])
+        self.assertIn("monitoring", master)
+
+        roles = benchmark["benchmark"]["node_roles"]
+        self.assertEqual(roles.count("producer"), 160)
+        self.assertEqual(roles.count("consumer"), 8)
+        self.assertEqual(len(benchmark["node_overrides"]), 168)
+        self.assertNotIn("mpmc_active_producer_runtime_limit", benchmark["benchmark"])
+        self.assertEqual(
+            {worker["owner_index"] for worker in plan["workers"]},
+            {0, 1, 2, 3},
+        )
+        self.assertEqual(
+            benchmark["kv_base"]["contribute_to_cluster_pool_size"]["dram"],
+            0,
+        )
+
+    def test_plan_only_writes_direct_runtime_artifacts_without_starting_processes(self) -> None:
+        entry = _load_module()
+        with tempfile.TemporaryDirectory() as td:
+            workdir = Path(td) / "bare-run"
+            argv = [
+                str(MODULE_PATH),
+                "--plan-only",
+                "--workdir",
+                str(workdir),
+                "--owner-count",
+                "2",
+                "--producer-count",
+                "4",
+                "--consumer-count",
+                "2",
+                "--duration-seconds",
+                "31",
+                "--metric-warmup-seconds",
+                "1",
+            ]
+            with mock.patch.object(sys, "argv", argv):
                 with mock.patch.object(
-                    sys,
-                    "argv",
-                    [
-                        str(MODULE_PATH),
-                        "--generate-only",
-                        "--suite-out",
-                        str(suite_out),
-                        "--owner-count",
-                        "1",
-                        "--owner-dram-gib",
-                        "1",
-                        "--producer-count",
-                        "2",
-                        "--consumer-count",
-                        "2",
-                        "--duration-seconds",
-                        "1",
-                        "--value-size",
-                        "256",
-                        "--threads-per-process",
-                        "1",
-                        "--op-timeout-seconds",
-                        "5",
-                        "--cluster-ready-timeout-seconds",
-                        "1800",
-                        "--consumer-sim-min-ms",
-                        "1",
-                        "--consumer-sim-max-ms",
-                        "1",
-                    ],
+                    entry.subprocess,
+                    "Popen",
+                    side_effect=AssertionError("plan-only must not start a process"),
                 ):
-                    rc = entry.main()
+                    self.assertEqual(entry.main(), 0)
 
-            self.assertEqual(rc, 0)
-            suite = yaml.safe_load(suite_out.read_text(encoding="utf-8"))
-            scale_id = "largescale_mq_n1owner_1gib_p2_c2"
-            self.assertEqual(set(suite["scenes"].keys()), {"bench_mq"})
-            self.assertEqual(suite["scenes"]["bench_mq"]["test_stack"]["mode"], "MPMC")
-            self.assertEqual(
-                suite["scenes"]["bench_mq"]["test_stack"]["role_weights"],
-                {"producer": 1, "consumer": 1},
+            plan = json.loads((workdir / "run_plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["execution_model"], "bare_local_processes")
+            self.assertEqual(plan["topology"]["worker_count"], 6)
+            self.assertTrue((workdir / "benchmark_config.py").is_file())
+            self.assertTrue((workdir / "configs" / "master.yaml").is_file())
+            self.assertTrue((workdir / "configs" / "owner_0.yaml").is_file())
+            self.assertTrue((workdir / "configs" / "owner_1.yaml").is_file())
+            self.assertTrue(
+                (workdir / "runtime" / "fluxon_test_stack" / "distributed_benchmark_node.py").is_file()
             )
-            self.assertEqual(suite["scenes"]["bench_mq"]["select"]["scales"], [scale_id])
-            self.assertEqual(suite["run"]["selectors"]["case_ids"], [f"bench_mq__{scale_id}__fluxon_tcp_thread"])
-            self.assertEqual(suite["scales"][scale_id]["topology"], 4)
-            self.assertEqual(suite["scales"][scale_id]["owner"]["owner_count"], 1)
-            self.assertEqual(suite["scales"][scale_id]["owner"]["owner_dram_bytes"], 1073741824)
-            self.assertEqual(suite["scales"][scale_id]["benchmark"]["threads_per_process"], 1)
-            self.assertEqual(
-                suite["scales"][scale_id]["targets"]["hosts"],
-                ["node-1", "node-2", "node-3", "node-4"],
-            )
-            self.assertEqual(suite["scales"][scale_id]["owner"]["targets"], ["node-1"])
-            port_entry = suite["profiles"]["fluxon_tcp_thread"]["runtime"]["test_stack"]["port_alloc"]["by_topology"][4]
-            self.assertGreaterEqual(port_entry["kv_p2p_port_stride"], 512)
 
-            runner = _load_runner_module()
-            parsed = runner._parse_suite_config(suite)
-            cases = runner._expand_cases(parsed)
-            self.assertEqual([case.case_id for case in cases], [f"bench_mq__{scale_id}__fluxon_tcp_thread"])
+    def test_result_contract_requires_every_worker_at_every_gate(self) -> None:
+        entry = _load_module()
+        result = _success_result(168)
+        entry._validate_benchmark_result(result, expected_nodes=168)
 
-    def test_generate_only_writes_explicit_active_producer_runtime_limit(self) -> None:
+        result["runs"][0]["completion"]["runtime_ready_node_count"] = 167
+        with self.assertRaisesRegex(ValueError, "did not complete on every worker"):
+            entry._validate_benchmark_result(result, expected_nodes=168)
+
+    def test_large_runtime_cleanup_preserves_text_diagnostics(self) -> None:
         entry = _load_module()
         with tempfile.TemporaryDirectory() as td:
-            suite_out = Path(td) / "largescale_mq_p320_limit.yaml"
+            workdir = Path(td)
+            bundle = workdir / "services" / "share_mem" / "owner_0" / "cluster"
+            bundle.mkdir(parents=True)
+            (bundle / "mmap.file").write_bytes(b"large")
+            (bundle / "shared.json").write_text("{}\n", encoding="utf-8")
+            service_log = workdir / "services" / "master" / "log" / "master_core.log"
+            service_log.parent.mkdir(parents=True)
+            service_log.write_text("diagnostic\n", encoding="utf-8")
+            for data_root in (
+                workdir / "services" / "etcd" / "data",
+                workdir / "services" / "greptime" / "data",
+                workdir / "services" / "owner_0" / "large",
+            ):
+                data_root.mkdir(parents=True)
+                (data_root / "payload").write_bytes(b"data")
 
-            with mock.patch.object(entry, "call", side_effect=AssertionError("test_runner should not run")):
-                with mock.patch.object(
-                    sys,
-                    "argv",
-                    [
-                        str(MODULE_PATH),
-                        "--generate-only",
-                        "--single-host-logical-targets",
-                        "--suite-out",
-                        str(suite_out),
-                        "--owner-count",
-                        "4",
-                        "--owner-dram-gib",
-                        "1",
-                        "--producer-count",
-                        "320",
-                        "--consumer-count",
-                        "8",
-                        "--duration-seconds",
-                        "60",
-                        "--value-size",
-                        "256",
-                        "--threads-per-process",
-                        "1",
-                        "--op-timeout-seconds",
-                        "30",
-                        "--cluster-ready-timeout-seconds",
-                        "1800",
-                        "--mpmc-active-producer-runtime-limit",
-                        "160",
-                        "--consumer-sim-min-ms",
-                        "700",
-                        "--consumer-sim-max-ms",
-                        "1500",
-                    ],
-                ):
-                    rc = entry.main()
+            entry._remove_large_runtime_data(workdir)
 
-            self.assertEqual(rc, 0)
-            suite = yaml.safe_load(suite_out.read_text(encoding="utf-8"))
-            scale_id = "largescale_mq_n4owner_1gib_p320_c8"
-            scale = suite["scales"][scale_id]
-            self.assertEqual(scale["topology"], 82)
-            self.assertEqual(scale["benchmark"]["processes_per_target"], 4)
-            self.assertEqual(scale["benchmark"]["threads_per_process"], 1)
-            self.assertEqual(scale["benchmark"]["mpmc_active_producer_runtime_limit"], 160)
+            self.assertFalse((bundle / "mmap.file").exists())
+            self.assertTrue((bundle / "shared.json").is_file())
+            self.assertTrue(service_log.is_file())
+            self.assertFalse((workdir / "services" / "etcd" / "data").exists())
+            self.assertFalse((workdir / "services" / "greptime" / "data").exists())
+            self.assertFalse((workdir / "services" / "owner_0" / "large").exists())
 
-            runner = _load_runner_module()
-            parsed = runner._parse_suite_config(suite)
-            cases = runner._expand_cases(parsed)
-            self.assertEqual([case.case_id for case in cases], [f"bench_mq__{scale_id}__fluxon_tcp_thread"])
-
-    def test_single_host_logical_targets_support_ci_owner_producer_consumer_matrix(self) -> None:
+    def test_argument_contract_rejects_less_than_thirty_effective_seconds(self) -> None:
         entry = _load_module()
-        cases = (
-            (8, 8, 4, {"producer": 1, "consumer": 1}),
-            (32, 32, 16, {"producer": 7, "consumer": 7}),
-            (160, 8, 42, {"producer": 39, "consumer": 1}),
-        )
-        for producer_count, consumer_count, topology, role_weights in cases:
-            with self.subTest(producer_count=producer_count, consumer_count=consumer_count):
-                with tempfile.TemporaryDirectory() as td:
-                    suite_out = Path(td) / f"largescale_mq_p{producer_count}_c{consumer_count}.yaml"
-
-                    with mock.patch.object(entry, "call", side_effect=AssertionError("test_runner should not run")):
-                        with mock.patch.object(
-                            sys,
-                            "argv",
-                            [
-                                str(MODULE_PATH),
-                                "--generate-only",
-                                "--single-host-logical-targets",
-                                "--suite-out",
-                                str(suite_out),
-                                "--owner-count",
-                                "4",
-                                "--owner-dram-gib",
-                                "1",
-                                "--producer-count",
-                                str(producer_count),
-                                "--consumer-count",
-                                str(consumer_count),
-                                "--duration-seconds",
-                                "90",
-                                "--metric-warmup-seconds",
-                                "60",
-                                "--value-size",
-                                "256",
-                                "--op-timeout-seconds",
-                                "5",
-                                "--cluster-ready-timeout-seconds",
-                                "1800",
-                                "--consumer-sim-min-ms",
-                                "1",
-                                "--consumer-sim-max-ms",
-                                "1",
-                            ],
-                        ):
-                            rc = entry.main()
-
-                    self.assertEqual(rc, 0)
-                    suite = yaml.safe_load(suite_out.read_text(encoding="utf-8"))
-                    scale_id = f"largescale_mq_n4owner_1gib_p{producer_count}_c{consumer_count}"
-                    scale = suite["scales"][scale_id]
-                    self.assertEqual(scale["topology"], topology)
-                    self.assertEqual(scale["owner"]["owner_count"], 4)
-                    self.assertEqual(scale["owner"]["targets"], ["node-1", "node-2", "node-3", "node-4"])
-                    self.assertEqual(len(scale["targets"]["hosts"]), topology)
-                    self.assertEqual(scale["benchmark"]["processes_per_target"], 4)
-                    self.assertEqual(scale["benchmark"]["threads_per_process"], 1)
-                    self.assertEqual(scale["benchmark"]["owner_group_processes"], 1)
-                    self.assertEqual(scale["benchmark"]["value_size"], 256)
-                    self.assertEqual(scale["duration_seconds"], 90)
-                    self.assertEqual(scale["benchmark"]["metric_warmup_seconds"], 60)
-                    target_map = suite["profiles"]["fluxon_tcp_thread"]["runtime"]["test_stack"]["deploy"]["target_ip_map"]
-                    self.assertIn(f"node-{topology}", target_map)
-                    self.assertEqual(target_map["node-1"], target_map[f"node-{topology}"])
-                    self.assertEqual(
-                        suite["scenes"]["bench_mq"]["test_stack"]["role_weights"],
-                        role_weights,
-                    )
-                    port_entry = suite["profiles"]["fluxon_tcp_thread"]["runtime"]["test_stack"]["port_alloc"]["by_topology"][topology]
-                    self.assertGreaterEqual(port_entry["kv_p2p_port_stride"], 512)
-
-                    runner = _load_runner_module()
-                    parsed = runner._parse_suite_config(suite)
-                    expanded = runner._expand_cases(parsed)
-                    self.assertEqual([case.case_id for case in expanded], [f"bench_mq__{scale_id}__fluxon_tcp_thread"])
-
-    def test_script_defaults_keep_owner_and_payload_small(self) -> None:
-        entry = _load_module()
-        with tempfile.TemporaryDirectory() as td:
-            config_path = Path(td) / "benchmark_full_matrix_many_targets.yaml"
-            suite_out = Path(td) / "largescale_mq_default.yaml"
-            cfg = yaml.safe_load(entry.DEFAULT_CONFIG.read_text(encoding="utf-8"))
-            target_map = cfg["profiles"]["fluxon_tcp"]["runtime"]["test_stack"]["deploy"]["target_ip_map"]
-            for idx in range(1, 329):
-                target_map[f"node-{idx}"] = f"10.88.{idx // 250}.{idx % 250 + 1}"
-            config_path.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=False), encoding="utf-8")
-
-            with mock.patch.object(entry, "call", side_effect=AssertionError("test_runner should not run")):
-                with mock.patch.object(
-                    sys,
-                    "argv",
-                    [
-                        str(MODULE_PATH),
-                        "--generate-only",
-                        "--config",
-                        str(config_path),
-                        "--suite-out",
-                        str(suite_out),
-                    ],
-                ):
-                    rc = entry.main()
-
-            self.assertEqual(rc, 0)
-            suite = yaml.safe_load(suite_out.read_text(encoding="utf-8"))
-            scale_id = "largescale_mq_n4owner_1gib_p320_c8"
-            scale = suite["scales"][scale_id]
-            self.assertEqual(scale["topology"], 328)
-            self.assertEqual(scale["owner"]["owner_count"], 4)
-            self.assertEqual(scale["owner"]["owner_dram_bytes"], 1073741824)
-            self.assertEqual(scale["benchmark"]["processes_per_target"], 1)
-            self.assertEqual(scale["benchmark"]["threads_per_process"], 1)
-            self.assertNotIn("owner_group_processes", scale["benchmark"])
-            self.assertEqual(scale["benchmark"]["value_size"], 256)
-            self.assertEqual(scale["owner"]["targets"], ["node-1", "node-2", "node-3", "node-4"])
-
-    def test_real_run_copies_bundle_uses_active_testbed_ip_and_invokes_runner(self) -> None:
-        entry = _load_module()
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            bundle = root / "source_bundle"
-            bundle.mkdir()
-            (bundle / "bootstrap_workdir").mkdir()
-            (bundle / "ssh_config").write_text("# local\n", encoding="utf-8")
-            (bundle / "gen_k8s_daemonset").mkdir()
-            source_deployconf = bundle / "deployconf_testbed.local.yaml"
-            source_start = bundle / "start_test_bed.runner.yaml"
-            source_ssh_config = bundle / "ssh_config"
-            source_bootstrap_workdir = bundle / "bootstrap_workdir"
-            (bundle / "deployconf_testbed.local.yaml").write_text(
-                "\n".join(
-                    [
-                        f"gen_k8s_daemonset_mirror_outdir: {bundle / 'gen_k8s_daemonset'}",
-                        "global_envs:",
-                        "  FLUXON_CLUSTER_NAME: fluxon_testbed",
-                        "  FLUXON_SHARED_MEM: ${HOSTWORKDIR}/shm",
-                        "cluster_nodes:",
-                        "  - hostname: runner-a",
-                        "    ip: 10.9.0.7",
-                        "    hostworkdir: /tmp/runner/a",
-                        "    execution_mode: local",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            (bundle / "start_test_bed.runner.yaml").write_text(
-                "\n".join(
-                    [
-                        "schema_version: 6",
-                        f"deployconf_path: {source_deployconf}",
-                        "controller_url: http://10.9.0.7:19080/r/ops/fluxon_testbed",
-                        "controller_basic_auth:",
-                        "  username: ops_admin",
-                        "  password: ops_password",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            (bundle / "manifest.json").write_text(
-                json.dumps(
-                    {
-                        "deployconf_path": str(source_deployconf),
-                        "start_config_path": str(source_start),
-                        "ssh_config_path": str(source_ssh_config),
-                        "workdir": str(source_bootstrap_workdir),
-                        "bootstrap_mode": "apply_only",
-                        "controller_request_mode": "direct",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            workdir = root / "run"
-            suite_out = root / "suite.yaml"
-            calls: list[tuple[list[str], dict[str, str] | None]] = []
-
-            def fake_call(cmd, *, env=None):
-                calls.append((list(cmd), None if env is None else dict(env)))
-                return 0
-
-            with mock.patch.object(entry, "call", side_effect=fake_call):
-                with mock.patch.object(entry, "_local_busy_tcp_ports", return_value=set()):
-                    with mock.patch.dict("os.environ", {"FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT": "/tmp/release"}, clear=True):
-                        with mock.patch.object(
-                            sys,
-                            "argv",
-                            [
-                                str(MODULE_PATH),
-                                "--single-host-logical-targets",
-                                "--testbed-bundle-source",
-                                str(bundle),
-                                "--workdir",
-                                str(workdir),
-                                "--suite-out",
-                                str(suite_out),
-                                "--owner-count",
-                                "4",
-                                "--owner-dram-gib",
-                                "1",
-                                "--producer-count",
-                                "8",
-                                "--consumer-count",
-                                "8",
-                                "--duration-seconds",
-                                "30",
-                                "--value-size",
-                                "256",
-                                "--op-timeout-seconds",
-                                "5",
-                                "--cluster-ready-timeout-seconds",
-                                "1800",
-                                "--consumer-sim-min-ms",
-                                "1",
-                                "--consumer-sim-max-ms",
-                                "1",
-                            ],
-                        ):
-                            rc = entry.main()
-
-            self.assertEqual(rc, 0)
-            self.assertEqual(len(calls), 1)
-            run_local_start = workdir / "testbed_bundle" / "start_test_bed.runner.yaml"
-            self.assertEqual(
-                calls[0][1]["FLUXON_TEST_STACK_START_TEST_BED_CONFIG"],
-                str(run_local_start.resolve()),
-            )
-            self.assertEqual(calls[0][1]["FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT"], "/tmp/release")
-            self.assertEqual(calls[0][0][0:3], [sys.executable, "-u", str(RUNNER_PATH)])
-            self.assertIn("--action", calls[0][0])
-            self.assertIn("run", calls[0][0])
-            run_local_deployconf = workdir / "testbed_bundle" / "deployconf_testbed.local.yaml"
-            run_local_mirror = workdir / "testbed_bundle" / "gen_k8s_daemonset"
-            run_local_start_payload = yaml.safe_load(run_local_start.read_text(encoding="utf-8"))
-            self.assertEqual(run_local_start_payload["deployconf_path"], "./deployconf_testbed.local.yaml")
-            run_local_deployconf_payload = yaml.safe_load(run_local_deployconf.read_text(encoding="utf-8"))
-            self.assertEqual(
-                run_local_deployconf_payload["gen_k8s_daemonset_mirror_outdir"],
-                str(run_local_mirror.resolve()),
-            )
-            run_local_manifest = json.loads((workdir / "testbed_bundle" / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(run_local_manifest["deployconf_path"], "deployconf_testbed.local.yaml")
-            self.assertEqual(run_local_manifest["start_config_path"], "start_test_bed.runner.yaml")
-            self.assertEqual(run_local_manifest["ssh_config_path"], "ssh_config")
-            self.assertEqual(run_local_manifest["workdir"], "bootstrap_workdir")
-            suite = yaml.safe_load(suite_out.read_text(encoding="utf-8"))
-            scale = suite["scales"]["largescale_mq_n4owner_1gib_p8_c8"]
-            self.assertEqual(scale["topology"], 4)
-            self.assertEqual(scale["benchmark"]["processes_per_target"], 4)
-            self.assertEqual(scale["benchmark"]["owner_group_processes"], 1)
-            target_map = suite["profiles"]["fluxon_tcp_thread"]["runtime"]["test_stack"]["deploy"]["target_ip_map"]
-            self.assertEqual(target_map["node-1"], "10.9.0.7")
-            self.assertEqual(target_map["node-4"], "10.9.0.7")
-            port_entry = suite["profiles"]["fluxon_tcp_thread"]["runtime"]["test_stack"]["port_alloc"][
-                "by_topology"
-            ][4]
-            self.assertEqual(port_entry["coordinator_port_base"], 20480)
-            self.assertGreaterEqual(port_entry["kv_master_port_base"], entry.LOCAL_TEST_STACK_P2P_PORT_MIN)
-            self.assertNotEqual(port_entry["kv_master_port_base"], 50161)
-            self.assertGreaterEqual(port_entry["kv_p2p_port_base"], entry.LOCAL_TEST_STACK_P2P_PORT_MIN)
-            self.assertNotEqual(port_entry["kv_p2p_port_base"], 11666)
-
-    def test_real_run_relocates_generated_bundle_mirror_after_bundle_move(self) -> None:
-        entry = _load_module()
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            previous_bundle = root / "previous_runner" / "testbed_bundle"
-            source_bundle = root / "current_runner" / "testbed_bundle"
-            previous_bundle.mkdir(parents=True)
-            source_bundle.mkdir(parents=True)
-            (source_bundle / "bootstrap_workdir").mkdir()
-            (source_bundle / "ssh_config").write_text("# local\n", encoding="utf-8")
-            (source_bundle / "gen_k8s_daemonset").mkdir()
-            source_deployconf = source_bundle / "deployconf_testbed.local.yaml"
-            source_start = source_bundle / "start_test_bed.runner.yaml"
-            source_deployconf.write_text(
-                "\n".join(
-                    [
-                        f"gen_k8s_daemonset_mirror_outdir: {previous_bundle / 'gen_k8s_daemonset'}",
-                        "global_envs:",
-                        "  FLUXON_CLUSTER_NAME: fluxon_testbed",
-                        "  FLUXON_SHARED_MEM: ${HOSTWORKDIR}/shm",
-                        "cluster_nodes:",
-                        "  - hostname: runner-a",
-                        "    ip: 10.9.0.8",
-                        "    hostworkdir: /tmp/runner/a",
-                        "    execution_mode: local",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            source_start.write_text(
-                "\n".join(
-                    [
-                        "schema_version: 6",
-                        "deployconf_path: ./deployconf_testbed.local.yaml",
-                        "controller_url: http://10.9.0.8:19080/r/ops/fluxon_testbed",
-                        "controller_basic_auth:",
-                        "  username: ops_admin",
-                        "  password: ops_password",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            (source_bundle / "manifest.json").write_text(
-                json.dumps(
-                    {
-                        "deployconf_path": "deployconf_testbed.local.yaml",
-                        "start_config_path": "start_test_bed.runner.yaml",
-                        "ssh_config_path": "ssh_config",
-                        "workdir": "bootstrap_workdir",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            workdir = root / "run"
-            suite_out = root / "suite.yaml"
-
-            with mock.patch.object(entry, "call", return_value=0):
-                with mock.patch.object(
-                    sys,
-                    "argv",
-                    [
-                        str(MODULE_PATH),
-                        "--single-host-logical-targets",
-                        "--testbed-bundle-source",
-                        str(source_bundle),
-                        "--workdir",
-                        str(workdir),
-                        "--suite-out",
-                        str(suite_out),
-                        "--owner-count",
-                        "4",
-                        "--owner-dram-gib",
-                        "1",
-                        "--producer-count",
-                        "8",
-                        "--consumer-count",
-                        "8",
-                    ],
-                ):
-                    rc = entry.main()
-
-            self.assertEqual(rc, 0)
-            run_local_mirror = workdir / "testbed_bundle" / "gen_k8s_daemonset"
-            run_local_deployconf = workdir / "testbed_bundle" / "deployconf_testbed.local.yaml"
-            run_local_deployconf_payload = yaml.safe_load(run_local_deployconf.read_text(encoding="utf-8"))
-            self.assertEqual(
-                run_local_deployconf_payload["gen_k8s_daemonset_mirror_outdir"],
-                str(run_local_mirror.resolve()),
+        with self.assertRaisesRegex(ValueError, "at least 30"):
+            entry._validate_args(
+                _args(duration_seconds=60, metric_warmup_seconds=31)
             )
 
 
 if __name__ == "__main__":
-    raise SystemExit(unittest.main())
+    unittest.main()

@@ -1340,6 +1340,25 @@ pub async fn entry() -> Result<()> {
     Ok(())
 }
 
+async fn finish_framework_init(
+    framework: &Framework,
+    init_result: anyhow::Result<()>,
+) -> Result<()> {
+    let Err(init_error) = init_result else {
+        return Ok(());
+    };
+
+    if let Err(shutdown_error) = framework.shutdown().await {
+        return Err(anyhow::anyhow!(
+            "Failed to initialize framework: {init_error:#}; failed to shut down partially initialized framework: {shutdown_error}"
+        ));
+    }
+
+    Err(anyhow::anyhow!(
+        "Failed to initialize framework: {init_error:#}"
+    ))
+}
+
 async fn run_master_impl(
     config_arg: ConfigArg<MasterConfig>,
     test_overrides: Option<MasterRunTestOverrides>,
@@ -1497,9 +1516,11 @@ async fn run_master_impl(
     ));
     info!("Initializing master framework...");
 
-    init_framework_master(&framework, init_args)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to initialize framework: {:#}", e))?;
+    finish_framework_init(
+        &framework,
+        init_framework_master(&framework, init_args).await,
+    )
+    .await?;
 
     if !observability_disabled {
         start_greptime_otlp_tracing_exporter_kv(
@@ -1996,9 +2017,11 @@ async fn run_client_impl(
             },
         };
 
-        init_framework_external(&framework, init_args)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to initialize framework: {:#}", e))?;
+        finish_framework_init(
+            &framework,
+            init_framework_external(&framework, init_args).await,
+        )
+        .await?;
     } else {
         let init_args = InitArgsOwner {
             cluster_manager_arg: ClusterManagerNewArg {
@@ -2070,9 +2093,11 @@ async fn run_client_impl(
             },
         };
 
-        init_framework_owner(&framework, init_args)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to initialize framework: {:#}", e))?;
+        finish_framework_init(
+            &framework,
+            init_framework_owner(&framework, init_args).await,
+        )
+        .await?;
     }
 
     let framework = Arc::new(framework);

@@ -58,14 +58,13 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
             ["package-wheel", "ci-2-virt-node", "ci-large-scale-mq"],
         )
         self.assertIn("Write test-all suite", workflow_text)
-        self.assertIn("Write standalone large-scale MQ suite", workflow_text)
-        self.assertIn("--suite-kind test-all", workflow_text)
-        self.assertIn("--suite-kind large-scale", workflow_text)
-        self.assertEqual(workflow_text.count("--skip-pack"), 2)
+        self.assertNotIn("Write standalone large-scale MQ suite", workflow_text)
+        self.assertNotIn("--suite-kind", workflow_text)
+        self.assertEqual(workflow_text.count("--skip-pack"), 1)
         self.assertIn("fluxon-ci-release-${{ github.sha }}", workflow_text)
         self.assertIn("timeout --preserve-status --signal=INT 17000s", workflow_text)
         self.assertIn("test-all failed or timed out before GitHub job cancellation", workflow_text)
-        self.assertIn("large-scale MQ failed or timed out before GitHub job cancellation", workflow_text)
+        self.assertNotIn("large-scale MQ failed or timed out before GitHub job cancellation", workflow_text)
         self.assertIn("rather_no_git_submodule.py", workflow_text)
 
     def test_docs_pages_uses_container_entrypoint(self) -> None:
@@ -83,7 +82,18 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertFalse(STANDALONE_LARGESCALE_MQ_WORKFLOW_PATH.exists())
         workflow_text = ALL_TEST_WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertIn("ci-large-scale-mq:", workflow_text)
-        self.assertIn("--suite-kind large-scale", workflow_text)
+        large_job = workflow_text.split("  ci-large-scale-mq:", 1)[1].split(
+            "  codex_failure_analysis:",
+            1,
+        )[0]
+        self.assertIn(
+            "fluxon_test_stack/top_attention_test_index/_largescale_mq.py",
+            large_job,
+        )
+        self.assertIn("Install packaged Fluxon wheel", large_job)
+        self.assertNotIn("ci_2_virt_node.py", large_job)
+        self.assertNotIn("test_runner.py", large_job)
+        self.assertNotIn("start_test_bed", large_job)
 
 
 if __name__ == "__main__":

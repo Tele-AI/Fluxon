@@ -11,9 +11,6 @@ import subprocess
 import time
 
 TOP_ATTENTION_SCENE_PREFIX = "ci_top_attention_"
-CI_SUITE_KIND_TEST_ALL = "test-all"
-CI_SUITE_KIND_LARGE_SCALE = "large-scale"
-CI_LARGE_SCALE_SCENE_ID = "ci_top_attention_largescale_mq"
 SYSTEM_TEMP_ROOT = Path("/tmp")
 RUNNER_TEMP_PROTECTED_PREFIXES = ("_github_", "_runner_")
 SYSTEM_TEMP_GARBAGE_PREFIXES = (
@@ -198,61 +195,7 @@ def _top_attention_ci_scenes(doc_site_base_url: str) -> dict[str, dict[str, obje
             "case_config": True,
             "scene_config": {},
         },
-        "ci_top_attention_largescale_mq": {
-            "subject": "mq",
-            "runtime_contract": "rust_self_managed",
-            "scale": "n1_kvowner_dram_3gib",
-            "case_config": False,
-            "extra_args": [
-                "--single-host-logical-targets",
-                "--testbed-bundle-source",
-                "__TEST_BED_BUNDLE_ROOT__",
-                "--workdir",
-                "__WORKDIR_ROOT__/largescale_mq_ci_single_host/p160_c8",
-                "--owner-count",
-                "4",
-                "--owner-dram-gib",
-                "1",
-                "--producer-count",
-                "160",
-                "--consumer-count",
-                "8",
-                "--threads-per-process",
-                "1",
-                "--duration-seconds",
-                "90",
-                "--metric-warmup-seconds",
-                "60",
-                "--value-size",
-                "256",
-                "--op-timeout-seconds",
-                "5",
-                "--cluster-ready-timeout-seconds",
-                "1800",
-                "--consumer-sim-min-ms",
-                "1",
-                "--consumer-sim-max-ms",
-                "1",
-            ],
-            "scene_config": {},
-        },
     }
-
-
-def _select_ci_scenes(
-    scenes: dict[str, dict[str, object]],
-    *,
-    suite_kind: str,
-) -> dict[str, dict[str, object]]:
-    if suite_kind == CI_SUITE_KIND_TEST_ALL:
-        return {
-            scene_id: scene
-            for scene_id, scene in scenes.items()
-            if scene_id != CI_LARGE_SCALE_SCENE_ID
-        }
-    if suite_kind == CI_SUITE_KIND_LARGE_SCALE:
-        return {CI_LARGE_SCALE_SCENE_ID: scenes[CI_LARGE_SCALE_SCENE_ID]}
-    raise ValueError(f"unsupported CI suite kind: {suite_kind!r}")
 
 
 def _write_suite(args: argparse.Namespace) -> None:
@@ -264,9 +207,8 @@ def _write_suite(args: argparse.Namespace) -> None:
     suite = yaml.safe_load(args.source.read_text(encoding="utf-8"))
     if not isinstance(suite, dict):
         raise ValueError(f"suite must be a YAML mapping: {args.source}")
-    top_attention_ci_scenes = _select_ci_scenes(
-        _top_attention_ci_scenes(f"{owner}.github.io/{repository_name}"),
-        suite_kind=args.suite_kind,
+    top_attention_ci_scenes = _top_attention_ci_scenes(
+        f"{owner}.github.io/{repository_name}"
     )
 
     for scene_id, scene_def in top_attention_ci_scenes.items():
@@ -366,58 +308,6 @@ def _print_failure_diagnostics(args: argparse.Namespace) -> None:
             _print_file(run_dir / relative)
         _print_tail(run_dir / "logs" / "ci_runner" / "stdout.log")
 
-    nested_root = workdir / "largescale_mq_ci_single_host"
-    print(f"=== nested largescale MQ diagnostics: {nested_root} ===")
-    if not nested_root.exists():
-        print(f"missing {nested_root}")
-        return
-
-    nested_failed_run_dirs: list[Path] = []
-    for path in sorted(nested_root.glob("*/case_runs.yaml")):
-        _print_file(path)
-        try:
-            nested_case_runs = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        except Exception as exc:
-            print(f"failed to parse {path}: {type(exc).__name__}: {exc}")
-            continue
-        for case in nested_case_runs.get("cases", []):
-            last_run = case.get("last_run", {})
-            if last_run.get("outcome") == "SUCCESS":
-                continue
-            case_id = case.get("case_id")
-            run_index = last_run.get("run_index")
-            nested_failed_run_dirs.append(
-                path.parent / "results" / str(case_id) / f"run_{run_index}"
-            )
-
-    print("=== nested largescale MQ failed run diagnostics ===")
-    if not nested_failed_run_dirs:
-        print("no failed nested run dirs found from nested case_runs.yaml")
-    for run_dir in nested_failed_run_dirs:
-        print(f"--- nested failed run: {run_dir} ---")
-        for relative in (
-            "summary.yaml",
-            "exception.txt",
-            "benchmark_result.json",
-            "deploy_result.yaml",
-            "logs/ci_runner/exit_code.txt",
-            "logs/ci_runner/restart_count.txt",
-            "logs/ci_runner/inflight_attempt.txt",
-        ):
-            _print_file(run_dir / relative)
-        _print_tail(run_dir / "logs" / "ci_runner" / "stdout.log", line_count=320)
-        for path in sorted(run_dir.glob("logs/*/status.yaml")):
-            _print_file(path)
-        for path in sorted(run_dir.glob("logs/*/workload_log_tail.txt")):
-            _print_tail(path, line_count=160)
-        for path in sorted(run_dir.glob("logs/*/workload_log_tail.json")):
-            if path.with_suffix(".txt").exists():
-                continue
-            _print_tail(path, line_count=160)
-
-    for path in sorted(nested_root.glob("*/test_runner.log")):
-        _print_tail(path, line_count=320)
-
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Support the ci_2_virt_node GitHub workflow.")
@@ -433,11 +323,6 @@ def _parse_args() -> argparse.Namespace:
     write_suite.add_argument("--source", type=Path, required=True)
     write_suite.add_argument("--output", type=Path, required=True)
     write_suite.add_argument("--repository", required=True)
-    write_suite.add_argument(
-        "--suite-kind",
-        choices=(CI_SUITE_KIND_TEST_ALL, CI_SUITE_KIND_LARGE_SCALE),
-        required=True,
-    )
     write_suite.set_defaults(handler=_write_suite)
 
     diagnostics = subparsers.add_parser(

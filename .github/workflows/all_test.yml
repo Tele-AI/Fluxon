@@ -75,8 +75,7 @@ jobs:
           python3 scripts/ci_2_virt_node_workflow.py write-suite \
             --source fluxon_test_stack/ci_test_list.yaml \
             --output "$RUNNER_TEMP/ci_test_list.ci.yaml" \
-            --repository "$GITHUB_REPOSITORY" \
-            --suite-kind test-all
+            --repository "$GITHUB_REPOSITORY"
 
       - name: Package Fluxon wheel and CI release
         run: |
@@ -205,8 +204,7 @@ jobs:
           python3 scripts/ci_2_virt_node_workflow.py write-suite \
             --source fluxon_test_stack/ci_test_list.yaml \
             --output "$RUNNER_TEMP/ci_test_list.ci.yaml" \
-            --repository "$GITHUB_REPOSITORY" \
-            --suite-kind test-all
+            --repository "$GITHUB_REPOSITORY"
 
       - name: Run test-all flow
         run: |
@@ -274,6 +272,7 @@ jobs:
     name: ci-large-scale-mq
     needs: package-wheel
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -303,30 +302,8 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install host dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            git \
-            pigz \
-            protobuf-compiler \
-            python3-venv \
-            rsync
-
-      - name: Verify Docker availability
-        run: |
-          command -v docker >/dev/null
-          if ! docker info >/dev/null 2>&1; then
-            sudo systemctl start docker
-            docker info >/dev/null
-          fi
-          docker version
-
       - name: Install Python dependencies
         run: python3 -m pip install PyYAML
-
-      - name: Sync rather_no_git_submodule workspace inputs
-        run: python3 fluxon_rs/scripts/rather_no_git_submodule.py
 
       - name: Download Fluxon CI release
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -345,40 +322,57 @@ jobs:
           test -f fluxon_release/test_rsc/fluxon_tcp_thread/fluxon_test_rsc.sha256
           test -f fluxon_release/ext_images/ext_images.sha256
 
-      - name: Write standalone large-scale MQ suite
+      - name: Install packaged Fluxon wheel
         run: |
-          python3 scripts/ci_2_virt_node_workflow.py write-suite \
-            --source fluxon_test_stack/ci_test_list.yaml \
-            --output "$RUNNER_TEMP/ci_test_list.ci.yaml" \
-            --repository "$GITHUB_REPOSITORY" \
-            --suite-kind large-scale
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
 
-      - name: Run standalone large-scale MQ flow
+          wheels = sorted(Path("fluxon_release").glob("fluxon-*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected exactly one packaged Fluxon wheel, found {len(wheels)}")
+          subprocess.run(
+              [
+                  sys.executable,
+                  "-m",
+                  "pip",
+                  "install",
+                  "--no-index",
+                  "--force-reinstall",
+                  "--no-deps",
+                  str(wheels[0]),
+              ],
+              check=True,
+          )
+          PY
+
+      - name: Run bare-local large-scale MQ
         run: |
-          set +e
-          timeout --preserve-status --signal=INT 17000s \
-            python3 fluxon_test_stack/ci_2_virt_node.py \
-              --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
-              --print-generated \
-              --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy" \
-              --skip-pack
-          rc=$?
-          if [ "$rc" -eq 0 ]; then
-            exit 0
-          fi
-          echo "large-scale MQ failed or timed out before GitHub job cancellation: rc=$rc"
-          python3 scripts/ci_2_virt_node_workflow.py print-failure-diagnostics \
-            --workdir .dever/ci_2_virt_node/runner_run
-          exit "$rc"
+          python3 -u fluxon_test_stack/top_attention_test_index/_largescale_mq.py \
+            --release-dir fluxon_release \
+            --workdir .dever/ci_large_scale_mq \
+            --owner-count 4 \
+            --owner-dram-gib 1 \
+            --producer-count 160 \
+            --consumer-count 8 \
+            --threads-per-process 1 \
+            --duration-seconds 90 \
+            --metric-warmup-seconds 60 \
+            --value-size 256 \
+            --op-timeout-seconds 5 \
+            --cluster-ready-timeout-seconds 1800 \
+            --consumer-sim-min-ms 1 \
+            --consumer-sim-max-ms 1
 
       - name: Normalize large-scale MQ debug artifact permissions
         if: ${{ always() }}
         run: |
-          chmod -R a+rX .dever/ci_2_virt_node || true
-          find .dever/ci_2_virt_node -type f -name '*.yaml' -exec chmod a+r {} + || true
-          find .dever/ci_2_virt_node -type f -name '*.log' -exec chmod a+r {} + || true
-          find .dever/ci_2_virt_node -type f -name '*.json' -exec chmod a+r {} + || true
-          find .dever/ci_2_virt_node -type f -name '*.txt' -exec chmod a+r {} + || true
+          chmod -R a+rX .dever/ci_large_scale_mq || true
+          find .dever/ci_large_scale_mq -type f -name '*.yaml' -exec chmod a+r {} + || true
+          find .dever/ci_large_scale_mq -type f -name '*.log' -exec chmod a+r {} + || true
+          find .dever/ci_large_scale_mq -type f -name '*.json' -exec chmod a+r {} + || true
+          find .dever/ci_large_scale_mq -type f -name '*.jsonl' -exec chmod a+r {} + || true
 
       - name: Collect large-scale MQ failure-analysis context
         if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
@@ -407,7 +401,14 @@ jobs:
           if-no-files-found: warn
           include-hidden-files: true
           compression-level: 1
-          path: .dever/ci_2_virt_node/**
+          path: |
+            .dever/ci_large_scale_mq/*.json
+            .dever/ci_large_scale_mq/*.jsonl
+            .dever/ci_large_scale_mq/benchmark_config.py
+            .dever/ci_large_scale_mq/configs/*.yaml
+            .dever/ci_large_scale_mq/logs/**/*.log
+            .dever/ci_large_scale_mq/services/**/*.log
+            .dever/ci_large_scale_mq/services/**/shared.json
 
   codex_failure_analysis:
     name: Codex failure analysis
