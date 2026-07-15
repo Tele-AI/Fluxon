@@ -40,7 +40,9 @@ use fluxon_util::{
     FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
 };
 use futures::Future;
-use pyo3::exceptions::{PyOSError, PyPermissionError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{
+    PyKeyboardInterrupt, PyOSError, PyPermissionError, PyRuntimeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule, PyString, PyTuple};
@@ -3985,9 +3987,17 @@ impl Drop for KvMaster {
 
 /// Run master with automatic lifecycle management
 /// This function creates a master, runs it until Ctrl+C, then shuts down
+fn finish_master_owned_ctrl_c(py: Python<'_>, signal_result: PyResult<()>) -> PyResult<()> {
+    match signal_result {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_instance_of::<PyKeyboardInterrupt>(py) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (config=None))]
-fn run_master_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyObject {
+fn run_master_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyResult<PyObject> {
     fn run_master_inner(config: Option<&Bound<'_, PyAny>>, py: Python) -> ApiResult<PyObject> {
         // Debug config
         println!("🛠️  Master init configuration: {:?}", config);
@@ -4109,7 +4119,11 @@ fn run_master_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyObjec
         out
     }
 
-    run_master_inner(config, py).into_py_object(py)
+    let result = run_master_inner(config, py);
+    // This function owns Ctrl+C and has already completed framework shutdown.
+    // Consume Python's duplicate KeyboardInterrupt before constructing Result.ok.
+    finish_master_owned_ctrl_c(py, py.check_signals())?;
+    Ok(result.into_py_object(py))
 }
 
 /// Python module definition
@@ -4151,15 +4165,29 @@ mod tests {
     use super::{
         bundled_driver_names_from_entries, configure_bundled_rdmav_driver_env,
         discover_bundled_ibverbs_driver_config,
-        extract_fluxon_pyo3_libs_root_from_loaded_library_line, loaded_fluxon_pyo3_libs_roots,
-        parse_bundled_ibverbs_driver_name, sanitize_bundled_ld_library_path_entries,
-        set_authoritative_bundled_ld_library_path, validate_single_fluxon_pyo3_libs_root,
+        extract_fluxon_pyo3_libs_root_from_loaded_library_line, finish_master_owned_ctrl_c,
+        loaded_fluxon_pyo3_libs_roots, parse_bundled_ibverbs_driver_name,
+        sanitize_bundled_ld_library_path_entries, set_authoritative_bundled_ld_library_path,
+        validate_single_fluxon_pyo3_libs_root,
     };
+    use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
+    use pyo3::Python;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn master_owned_ctrl_c_consumes_only_keyboard_interrupt() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            assert!(
+                finish_master_owned_ctrl_c(py, Err(PyKeyboardInterrupt::new_err("ctrl-c"))).is_ok()
+            );
+            assert!(finish_master_owned_ctrl_c(py, Err(PyRuntimeError::new_err("other"))).is_err());
+        });
+    }
 
     struct EnvSnapshot {
         key: &'static str,

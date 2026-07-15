@@ -138,6 +138,15 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         self.assertIn("--consumer-count 8", large_job)
         self.assertIn("--metric-warmup-seconds 60", large_job)
         self.assertIn("Install packaged Fluxon wheel", large_job)
+        self.assertNotIn("--no-deps", large_job)
+        self.assertNotIn("--no-index", large_job)
+        self.assertIn('subprocess.run([sys.executable, "-m", "pip", "check"]', large_job)
+        self.assertIn('"-I",', large_job)
+        self.assertIn("import etcd3", large_job)
+        self.assertIn(
+            "from fluxon_py._api_ext_chan.mq_config_check import MIN_TTL",
+            large_job,
+        )
         self.assertNotIn("ci_2_virt_node.py", large_job)
         self.assertNotIn("start_test_bed", large_job)
         self.assertNotIn("test_runner.py", large_job)

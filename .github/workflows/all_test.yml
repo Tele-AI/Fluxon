@@ -302,9 +302,6 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install Python dependencies
-        run: python3 -m pip install PyYAML
-
       - name: Download Fluxon CI release
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
@@ -338,10 +335,23 @@ jobs:
                   "-m",
                   "pip",
                   "install",
-                  "--no-index",
                   "--force-reinstall",
-                  "--no-deps",
                   str(wheels[0]),
+              ],
+              check=True,
+          )
+          subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
+          subprocess.run(
+              [
+                  sys.executable,
+                  "-I",
+                  "-c",
+                  (
+                      "import etcd3; "
+                      "import fluxon_py; "
+                      "from fluxon_py._api_ext_chan.mq_config_check import MIN_TTL; "
+                      "print(f'Fluxon dependency probe passed: {fluxon_py.__file__=} {MIN_TTL=}')"
+                  ),
               ],
               check=True,
           )
