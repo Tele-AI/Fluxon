@@ -127,6 +127,12 @@ Fluxon FS 是一款面向 AI 数据与模型文件、兼容 `S3` 的高性能文
 
 ![](./pics/kv_benchmark_chart.png)
 
+Fluxon KV 还可将 owner 本地 SSD 作为 DRAM 副本的运行期回填层。下图为单机 H100 的 SSD-pressure 实验，以 CUDA event 完成为计数边界；c16 下，Fluxon 在 4/8/16 MiB 组中的 hit payload 吞吐相对两种 Mooncake 拓扑中更快的一种分别达到 3.83×/5.61×/6.73×。
+
+![Fluxon 与 Mooncake 不同 SSD 配置下的 GPU 可用 KV 吞吐和命中率](./pics/kv_ssd_gpu_sweep.png)
+
+完整实验设置、命中率和适用边界见博客：[Fluxon KV SSD 存储：把本地 SSD 接成内存副本的回填层](https://tele-ai.github.io/Fluxon/cn/blog/blog_2_Fluxon_KV_SSD%E5%AD%98%E5%82%A8%EF%BC%9A%E6%8A%8A%E6%9C%AC%E5%9C%B0SSD%E6%8E%A5%E6%88%90%E5%86%85%E5%AD%98%E5%89%AF%E6%9C%AC%E7%9A%84%E5%9B%9E%E5%A1%AB%E5%B1%82)。
+
 ### Fluxon FS 基准测试
 
 测试结果显示，小文件读取和大文件写入性能已显著优于 `Alluxio`，大文件读取性能基本持平，小文件写入性能仍有进一步优化的空间。

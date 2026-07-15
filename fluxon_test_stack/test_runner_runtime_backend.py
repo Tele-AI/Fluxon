@@ -64,8 +64,15 @@ def _prepare_ci_case(
     services_root = (run_dir / "services").resolve()
     services_root.mkdir(parents=True, exist_ok=True)
     (services_root / "share_mem").mkdir(parents=True, exist_ok=True)
-    share_mem_path = ctx._ci_share_mem_path(resolved_case, run_dir=run_dir)
-    Path(share_mem_path).mkdir(parents=True, exist_ok=True)
+    share_mem_path = ctx._ci_share_mem_path(resolved_case, owner_index=0)
+    if ctx._ci_has_instance(resolved_case, instance_id="owner_0"):
+        # One fixed owner slot is reused across all CI cases. Reset only this CI-scoped
+        # directory after stale deployments are gone; never touch the testbed owner's root.
+        ctx._reset_ci_owner_share_mem_dir(
+            resolved_case,
+            owner_index=0,
+            share_mem_path=share_mem_path,
+        )
 
     venv_python = ctx._create_ci_runtime_venv(run_dir=run_dir)
 

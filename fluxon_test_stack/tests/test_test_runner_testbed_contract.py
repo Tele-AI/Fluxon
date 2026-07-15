@@ -123,6 +123,76 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertRegex(first, r"^fluxon_benchmark_[0-9a-f]{12}$")
 
+    def test_ci_owner_share_mem_path_is_global_per_owner_index(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            share_mem_root = Path(td) / "shared-root"
+            first_case = {
+                "runtime": {
+                    "run_dir": "/tmp/results/case-a/run_1",
+                    "stack_identity": {"share_mem_path": str(share_mem_root)},
+                }
+            }
+            second_case = {
+                "runtime": {
+                    "run_dir": "/tmp/results/case-b/run_9",
+                    "stack_identity": {"share_mem_path": str(share_mem_root)},
+                }
+            }
+
+            first_owner_0 = _RUNNER._ci_share_mem_path(first_case, owner_index=0)
+            second_owner_0 = _RUNNER._ci_share_mem_path(second_case, owner_index=0)
+            first_owner_1 = _RUNNER._ci_share_mem_path(first_case, owner_index=1)
+
+            self.assertEqual(first_owner_0, second_owner_0)
+            self.assertEqual(Path(first_owner_0), share_mem_root / "ci" / "owner-0")
+            self.assertEqual(Path(first_owner_1), share_mem_root / "ci" / "owner-1")
+            self.assertNotEqual(first_owner_0, first_owner_1)
+
+    def test_ci_owner_share_mem_cleanup_cannot_touch_testbed_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            share_mem_root = Path(td) / "shared-root"
+            testbed_bundle = share_mem_root / "testbed-cluster"
+            testbed_bundle.mkdir(parents=True)
+            testbed_mmap = testbed_bundle / "mmap.file"
+            testbed_mmap.write_text("testbed-owner", encoding="utf-8")
+            resolved_case = {
+                "runtime": {
+                    "run_dir": "/tmp/results/case-a/run_1",
+                    "stack_identity": {"share_mem_path": str(share_mem_root)},
+                }
+            }
+            owner_path = Path(_RUNNER._ci_share_mem_path(resolved_case, owner_index=0))
+            old_case_bundle = owner_path / "old-ci-cluster"
+            old_case_bundle.mkdir(parents=True)
+            (old_case_bundle / "mmap.file").write_text("old-ci-owner", encoding="utf-8")
+
+            with mock.patch.object(_RUNNER, "_instance_remote_target_access", return_value=None):
+                _RUNNER._reset_ci_owner_share_mem_dir(
+                    resolved_case,
+                    owner_index=0,
+                    share_mem_path=str(owner_path),
+                )
+
+                self.assertTrue(owner_path.is_dir())
+                self.assertEqual(list(owner_path.iterdir()), [])
+                self.assertEqual(testbed_mmap.read_text(encoding="utf-8"), "testbed-owner")
+
+                with self.assertRaisesRegex(ValueError, "unexpected CI owner share_mem_path"):
+                    _RUNNER._cleanup_ci_owner_share_mem_dir(
+                        resolved_case,
+                        owner_index=0,
+                        share_mem_path=str(testbed_bundle),
+                    )
+
+                _RUNNER._cleanup_ci_owner_share_mem_dir(
+                    resolved_case,
+                    owner_index=0,
+                    share_mem_path=str(owner_path),
+                )
+
+            self.assertFalse(owner_path.exists())
+            self.assertEqual(testbed_mmap.read_text(encoding="utf-8"), "testbed-owner")
+
     def test_write_ci_master_owner_configs_emits_owner_large_file_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
@@ -374,6 +444,33 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             )
             cleanup_runtime.assert_called_once_with(resolved_case, timeout_s=120)
 
+    def test_ci_cleanup_runtime_reclaims_only_fixed_ci_owner_slot(self) -> None:
+        cleanup_case = {
+            "runtime": {
+                "stack_identity": {"share_mem_path": "/tmp/testbed-shm"},
+            },
+            "runtime_model": _RUNNER._build_runtime_model(_RUNNER.CASE_FAMILY_CI),
+            "deploy": {
+                "instances": [
+                    {"id": "owner_0", "deployer": {"target": "node-a"}},
+                ]
+            },
+        }
+        expected_path = "/tmp/testbed-shm/ci/owner-0"
+
+        with mock.patch.object(_RUNNER, "_ci_runtime_cleanup_case", return_value=cleanup_case):
+            with mock.patch.object(_RUNNER, "_ci_runtime_current_apply_ids", return_value=[]):
+                with mock.patch.object(_RUNNER, "_wait_ci_ports_free") as wait_ports_free:
+                    with mock.patch.object(_RUNNER, "_cleanup_ci_owner_share_mem_dir") as cleanup_shm:
+                        _RUNNER._ci_cleanup_runtime(cleanup_case, timeout_s=120)
+
+        wait_ports_free.assert_called_once_with(cleanup_case, timeout_s=120)
+        cleanup_shm.assert_called_once_with(
+            cleanup_case,
+            owner_index=0,
+            share_mem_path=expected_path,
+        )
+
     def test_finalize_ci_case_runtime_preserves_structured_instance_ids(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
@@ -514,6 +611,72 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
             )
         )
+
+    def test_cleanup_successful_run_artifacts_keeps_only_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "run_1"
+            run_dir.mkdir()
+            summary = {
+                "schema_version": 1,
+                "outcome": _RUNNER.RUN_OUTCOME_SUCCESS,
+            }
+            (run_dir / "summary.yaml").write_text(
+                yaml.safe_dump(summary, sort_keys=False),
+                encoding="utf-8",
+            )
+            (run_dir / "src" / "nested").mkdir(parents=True)
+            (run_dir / "src" / "nested" / "source.rs").write_text("source", encoding="utf-8")
+            (run_dir / "logs").mkdir()
+            (run_dir / "logs" / "stdout.log").write_text("log", encoding="utf-8")
+            (run_dir / "resolved_case.yaml").write_text("case: {}\n", encoding="utf-8")
+            outside = root / "outside.txt"
+            outside.write_text("keep", encoding="utf-8")
+            (run_dir / "outside-link").symlink_to(outside)
+
+            _RUNNER._cleanup_successful_run_artifacts(run_dir)
+
+            self.assertEqual([path.name for path in run_dir.iterdir()], ["summary.yaml"])
+            self.assertEqual(
+                yaml.safe_load((run_dir / "summary.yaml").read_text(encoding="utf-8")),
+                summary,
+            )
+            self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
+
+    def test_cleanup_successful_run_artifacts_refuses_failed_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            (run_dir / "summary.yaml").write_text(
+                yaml.safe_dump({"outcome": _RUNNER.RUN_OUTCOME_FAILED}),
+                encoding="utf-8",
+            )
+            diagnostic = run_dir / "exception.txt"
+            diagnostic.write_text("traceback", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "summary is not SUCCESS"):
+                _RUNNER._cleanup_successful_run_artifacts(run_dir)
+
+            self.assertEqual(diagnostic.read_text(encoding="utf-8"), "traceback")
+
+    def test_cleanup_successful_run_artifacts_preserves_teardown_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            (run_dir / "summary.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "outcome": _RUNNER.RUN_OUTCOME_SUCCESS,
+                        "teardown_error": "RuntimeError: owner cleanup failed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            diagnostic = run_dir / "logs" / "owner_0" / "stderr.log"
+            diagnostic.parent.mkdir(parents=True)
+            diagnostic.write_text("owner cleanup failed", encoding="utf-8")
+
+            _RUNNER._cleanup_successful_run_artifacts(run_dir)
+
+            self.assertEqual(diagnostic.read_text(encoding="utf-8"), "owner cleanup failed")
 
     def test_write_ci_scene_config_yaml_emits_structured_scene_config(self) -> None:
         with tempfile.TemporaryDirectory() as td:

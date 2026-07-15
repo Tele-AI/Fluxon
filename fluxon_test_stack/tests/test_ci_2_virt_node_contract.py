@@ -514,6 +514,33 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             self.assertTrue((root / "manylinux-cache" / "cargo-registry").is_dir())
             self.assertTrue((root / "manylinux-cache" / "cargo-git").is_dir())
 
+    def test_cleanup_pack_release_runtime_removes_only_owned_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workdir = Path(td) / "ci_workdir"
+            runtime_root = workdir / "pack_release_runtime"
+            nested = runtime_root / "project-data" / "cache"
+            nested.mkdir(parents=True)
+            (nested / "artifact.bin").write_bytes(b"artifact")
+            sibling = workdir / "generated" / "suite.yaml"
+            sibling.parent.mkdir(parents=True)
+            sibling.write_text("schema_version: 1\n", encoding="utf-8")
+
+            _ENTRY._cleanup_pack_release_runtime_after_success(
+                runtime_root=runtime_root,
+                workdir=workdir,
+            )
+
+            self.assertFalse(runtime_root.exists())
+            self.assertEqual(sibling.read_text(encoding="utf-8"), "schema_version: 1\n")
+
+            unexpected = workdir / "unexpected"
+            unexpected.mkdir()
+            with self.assertRaisesRegex(ValueError, "unexpected pack runtime path"):
+                _ENTRY._cleanup_pack_release_runtime_after_success(
+                    runtime_root=unexpected,
+                    workdir=workdir,
+                )
+
     def test_sync_rather_no_git_submodule_uses_canonical_entrypoint(self) -> None:
         calls: list[list[str]] = []
 
@@ -561,6 +588,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 "--skip-pack",
                 "--skip-dispatch",
                 "--skip-start-testbed",
+                "--cleanup-successful-case-artifacts",
             ]
             original_argv = sys.argv[:]
             try:
@@ -578,6 +606,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             runner_argv, runner_env = calls[-1]
             self.assertIsNotNone(runner_env)
             self.assertEqual(runner_argv[1], str((REPO_ROOT / "fluxon_test_stack" / "test_runner.py").resolve()))
+            self.assertIn("--cleanup-successful-case-artifacts", runner_argv)
             self.assertEqual(
                 runner_env[_ENTRY.TEST_STACK_START_TEST_BED_CONFIG_ENV],
                 str((workdir / "generated" / "start_test_bed.local.yaml").resolve()),
@@ -749,6 +778,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 "--skip-dispatch",
                 "--skip-start-testbed",
                 "--skip-runner",
+                "--cleanup-pack-runtime-after-success",
             ]
             original_argv = sys.argv[:]
             try:
@@ -773,6 +803,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 calls[1][0][1],
                 str((REPO_ROOT / "fluxon_test_stack" / "pack_test_stack_rsc.py").resolve()),
             )
+            self.assertFalse((workdir / "pack_release_runtime").exists())
 
     def test_main_passes_explicit_release_dir_to_pack_stage(self) -> None:
         with tempfile.TemporaryDirectory() as td:

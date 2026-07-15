@@ -35,6 +35,7 @@ use fluxon_kv::{
 };
 use fluxon_ops;
 use fluxon_proxy;
+use fluxon_util::etcd::{EtcdEndpointSet, ManagedEtcdClient};
 use fluxon_util::run_async_from_sync::{SyncAsyncBridge, borrow_stable_owner};
 use fluxon_util::{
     FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
@@ -2152,9 +2153,12 @@ fn fluxon_ops_controller_blocking(
             // - If etcd connect/get stalls without returning, the controller would hang forever and never
             //   bring up the HTTP endpoint needed by test_runner/start_test_bed.
             // - Therefore we hard-bound etcd operations so the supervisor can restart on persistent faults.
+            let etcd_backend = ManagedEtcdClient::acquire(EtcdEndpointSet::new(
+                cli_cfg.etcd_endpoints.clone(),
+            )?);
             let mut etcd = tokio::time::timeout(
                 tokio::time::Duration::from_secs(5),
-                etcd_client::Client::connect(cli_cfg.etcd_endpoints.clone(), None),
+                etcd_backend.client(),
             )
             .await
             .map_err(|_| anyhow::anyhow!(

@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use etcd_client as etcd;
 use futures::future::join_all;
 use hyper::body::HttpBody as _;
 use hyper::{Body, Method, Request, Response, StatusCode};
@@ -27,6 +26,7 @@ use fluxon_kv::user_rpc;
 use fluxon_kv::{ConfigArg, Framework, run_client};
 
 use fluxon_proxy::{HeaderKv, PanelProxyMethod, PanelProxyResp};
+use fluxon_util::etcd::{EtcdEndpointSet, ManagedEtcdClient};
 use fluxon_util::{
     FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, display_runtime_log_path,
     fluxon_cli_proxy_desc_etcd_key_v2, resolve_readable_log_path,
@@ -13024,7 +13024,9 @@ pub async fn run_controller_blocking(
         let etcd_endpoints =
             fluxon_kv::config::normalize_etcd_addresses(&client_cfg.etcd_addresses_raw)
                 .map_err(|e| anyhow::anyhow!("normalize_etcd_addresses failed: {}", e))?;
-        let mut client = etcd::Client::connect(etcd_endpoints, None)
+        let etcd_backend = ManagedEtcdClient::acquire(EtcdEndpointSet::new(etcd_endpoints)?);
+        let mut client = etcd_backend
+            .client()
             .await
             .with_context(|| {
                 format!(

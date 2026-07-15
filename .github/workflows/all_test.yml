@@ -15,6 +15,31 @@ jobs:
   ci-2-virt-node:
     runs-on: ubuntu-latest
     steps:
+      - name: Reclaim runner disk before CI
+        run: |
+          set -euo pipefail
+          df -h / /mnt
+
+          # ubuntu-latest includes large SDKs that this Rust/Python workflow never uses.
+          sudo rm -rf \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/share/swift
+
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          if command -v docker >/dev/null 2>&1; then
+            sudo systemctl start docker
+            docker system prune --all --force --volumes
+            docker system df
+          fi
+
+          df -h / /mnt
+
       - name: Check out repository
         uses: actions/checkout@v6
         with:
@@ -34,6 +59,8 @@ jobs:
             protobuf-compiler \
             python3-venv \
             rsync
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
 
       - name: Verify Docker availability
         run: |
@@ -243,7 +270,9 @@ jobs:
           python3 fluxon_test_stack/ci_2_virt_node.py \
             --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
             --print-generated \
-            --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy"
+            --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy" \
+            --cleanup-pack-runtime-after-success \
+            --cleanup-successful-case-artifacts
 
       - name: Print ci_2_virt_node failure summary
         if: ${{ failure() }}
@@ -291,7 +320,7 @@ jobs:
           PY
 
       - name: Normalize ci_2_virt_node debug artifact permissions
-        if: ${{ always() }}
+        if: ${{ failure() }}
         run: |
           chmod -R a+rX .dever || true
           chmod -R a+rX fluxon_release || true
@@ -309,7 +338,7 @@ jobs:
             -exec chmod -R a+rX {} + || true
 
       - name: Upload ci_2_virt_node debug artifacts
-        if: ${{ always() }}
+        if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-2-virt-node-debug-${{ github.sha }}
@@ -322,3 +351,9 @@ jobs:
             .dever/**/pack_release_runtime/project-data/**/instances/**/logs/**
             .dever/**/pack_release_runtime/project-data/**/instances/**/release/**
             .dever/**/pack_release_runtime/project-data/**/assemblies/**/profile/**
+
+      - name: Report final runner disk usage
+        if: ${{ always() }}
+        run: |
+          df -h / /mnt
+          docker system df || true

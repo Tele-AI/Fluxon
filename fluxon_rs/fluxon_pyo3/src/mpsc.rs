@@ -25,6 +25,7 @@ use crate::flatdict_zerocopy::{FlatDictDataOwner, decode_flat_dict_to_wrapped_py
 use crate::lease_manager::PyLeaseBackendUid;
 use fluxon_kv::{Framework as KvFramework, KvClientTrait};
 use fluxon_mq::lease_manager::LeaseBackendUid;
+use fluxon_util::etcd::ManagedEtcdClient;
 use fluxon_util::lease_manager::{GLOBAL_LM, LeaseManager};
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use tracing::{debug, warn};
@@ -129,11 +130,10 @@ fn finalize_payload_result(
 // (LeaseManagerHandle and PyLease moved to lease_manager.rs)
 
 /// Shared MPSC context bound to a specific etcd endpoint set.
-/// Holds only the endpoints; runtime and lease managers are
-/// singletons under the hood.
+/// Holds the auto-clean client registry handle for that endpoint set.
 #[pyclass]
 pub struct MpscContext {
-    endpoints: Vec<String>,
+    etcd_backend: ManagedEtcdClient,
     kv_backend_uid: LeaseBackendUid,
     kv_framework: Arc<KvFramework>,
     kv_runtime: Handle,
@@ -144,9 +144,8 @@ pub struct MpscContext {
 impl MpscContext {
     /// Create a new MPSC context from etcd endpoints.
     ///
-    /// The runtime is created lazily on first use and shared
-    /// globally; `LeaseManager::for_endpoints` handles per-endpoint
-    /// singletons internally.
+    /// The endpoint-scoped etcd client is connected lazily on first use and
+    /// shared with other Rust/PyO3 components through `fluxon_util`.
     #[new]
     fn new(
         py: Python<'_>,
@@ -157,8 +156,9 @@ impl MpscContext {
         let uid = kv_backend_uid.borrow(py).backend_uid().clone();
         let kv_client_ref = kv_client.borrow(py);
         let mq_context = crate::new_fluxon_mq_context(&kv_client_ref)?;
+        let endpoints = crate::etcd::endpoint_set_from_raw(etcd_endpoints, "MpscContext")?;
         Ok(Self {
-            endpoints: etcd_endpoints,
+            etcd_backend: ManagedEtcdClient::acquire(endpoints),
             kv_backend_uid: uid,
             kv_framework: mq_context.kv_framework.clone(),
             kv_runtime: mq_context.runtime.clone(),
@@ -205,7 +205,7 @@ impl MpscContext {
             }
         };
 
-        let endpoints = self.endpoints.clone();
+        let etcd_backend = self.etcd_backend.clone();
         let kv_backend_uid = self.kv_backend_uid.clone();
         let self_info = self
             .kv_framework
@@ -237,7 +237,7 @@ impl MpscContext {
                     match chan_id {
                         Some(id) => ChanManager::new_with_chan_id(
                             lease_manager.clone(),
-                            endpoints.clone(),
+                            etcd_backend.clone(),
                             kv_backend_uid.clone(),
                             id,
                             rth.clone(),
@@ -260,7 +260,7 @@ impl MpscContext {
                             };
                             create_mpsc_channel(
                                 &GLOBAL_LM,
-                                endpoints.clone(),
+                                etcd_backend.clone(),
                                 kv_backend_uid.clone(),
                                 cfg,
                                 rth.clone(),
@@ -347,7 +347,7 @@ impl MpscContext {
             }
         };
 
-        let endpoints = self.endpoints.clone();
+        let etcd_backend = self.etcd_backend.clone();
         let kv_backend_uid = self.kv_backend_uid.clone();
         let shutdown = ShutdownCtl::new();
         let shutdown_for_core = shutdown.clone();
@@ -378,7 +378,7 @@ impl MpscContext {
                     match chan_id {
                         Some(id) => ChanManager::new_with_chan_id(
                             lease_manager.clone(),
-                            endpoints.clone(),
+                            etcd_backend.clone(),
                             kv_backend_uid.clone(),
                             id,
                             rth.clone(),
@@ -403,7 +403,7 @@ impl MpscContext {
                             };
                             create_mpsc_channel(
                                 &GLOBAL_LM,
-                                endpoints.clone(),
+                                etcd_backend.clone(),
                                 kv_backend_uid.clone(),
                                 cfg,
                                 rth.clone(),

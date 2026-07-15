@@ -1,14 +1,14 @@
 use anyhow::Context;
 use etcd_client as etcd;
 
-use fluxon_util::etcd::{get_cluster_lease_id, DistributeIdAllocator};
+use fluxon_util::etcd::{DistributeIdAllocator, ManagedEtcdClient, get_cluster_lease_id};
 use fluxon_util::lease_manager::{
-    record_register_by as lm_record_register_by, LeaseBackendUid, LeaseManager, LeaseRegisterKind,
+    LeaseBackendUid, LeaseManager, LeaseRegisterKind, record_register_by as lm_record_register_by,
 };
 
 use crate::error::MpscError;
 use crate::keys;
-use crate::manager::{get_chan_meta_with_version, ChanGlobalMeta, ChanManager};
+use crate::manager::{ChanGlobalMeta, ChanManager, get_chan_meta_with_version};
 
 pub struct ChanCreateConfig {
     pub capacity: i64,
@@ -55,18 +55,17 @@ pub struct ChanCreateConfig {
 /// `payload_lease_id` recorded in channel meta.
 pub async fn create_mpsc_channel(
     lease_manager: &LeaseManager,
-    etcd_endpoints: Vec<String>,
+    etcd_backend: ManagedEtcdClient,
     kv_backend_uid: LeaseBackendUid,
     cfg: ChanCreateConfig,
     rt_handle: tokio::runtime::Handle,
 ) -> Result<ChanManager, MpscError> {
-    // Build etcd client directly from provided endpoints; LeaseManager 仅负责
-    // lease keepalive，不再对外暴露具体 client 实现。
-    let mut client = etcd::Client::connect(etcd_endpoints.clone(), None)
+    let mut client = etcd_backend
+        .client()
         .await
         .map_err(|e| MpscError::Internal(format!("connect etcd failed: {}", e)))?;
 
-    let etcd_backend_uid = LeaseBackendUid::etcd_from(etcd_endpoints.clone());
+    let etcd_backend_uid = LeaseBackendUid::etcd(etcd_backend.endpoints().clone());
 
     // 1) Allocate a new channel id using the global distributed
     // allocator under prefix "channels".
@@ -311,6 +310,7 @@ pub async fn create_mpsc_channel(
         global_lease: global_lease_handle,
         global_long_lease: global_long_lease_handle,
         payload_lease: payload_lease_handle,
+        _etcd_backend: etcd_backend,
         etcd_client,
     })
 }
@@ -322,7 +322,7 @@ impl ChanManager {
     /// id-allocator).
     pub async fn new_with_chan_id(
         lease_manager: LeaseManager,
-        etcd_endpoints: Vec<String>,
+        etcd_backend: ManagedEtcdClient,
         kv_backend_uid: LeaseBackendUid,
         chan_id: i64,
         rt_handle: tokio::runtime::Handle,
@@ -337,8 +337,9 @@ impl ChanManager {
         // 1) 加载全局元数据，获取 TTL 以及（如有）记录下来的
         // global_lease_id / global_long_lease_id，同时记录下等
         // 待后续事务校验使用的 etcd 版本号。
-        let etcd_backend_uid = LeaseBackendUid::etcd_from(etcd_endpoints.clone());
-        let client = etcd::Client::connect(etcd_endpoints, None)
+        let etcd_backend_uid = LeaseBackendUid::etcd(etcd_backend.endpoints().clone());
+        let client = etcd_backend
+            .client()
             .await
             .map_err(|e| anyhow::anyhow!("connect etcd failed: {}", e))?;
         let mut meta_client = client.clone();
@@ -534,6 +535,7 @@ impl ChanManager {
             global_lease,
             global_long_lease,
             payload_lease,
+            _etcd_backend: etcd_backend,
             etcd_client: client,
         })
     }

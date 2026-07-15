@@ -15,7 +15,6 @@ use crate::transfer::{
     TransferLinkRecord as CommuTransferLinkRecord, TransferReadyInfo as CommuTransferReadyInfo,
 };
 use async_trait::async_trait;
-use etcd_client::Client as EtcdClient;
 pub use fluxon_commu_contract::cluster_manager::{
     ClusterManagerNewArg, ClusterManagerRdmaControlInit, IpcBandwidthAttributorHandle,
 };
@@ -32,6 +31,7 @@ use fluxon_framework_compiled::spawn::ViewSpawnExt;
 use fluxon_framework_compiled::upgrade_view_guard::UpgradeViewGuard;
 use fluxon_framework_compiled::util::ViewSpawnHandle;
 use fluxon_observability::kv_metrics_actor::ObserveHandle;
+use fluxon_util::etcd::{EtcdEndpointSet, ManagedEtcdClient};
 use limit_thirdparty::tokio::sync::{abroadcast, ampsc};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -232,6 +232,7 @@ struct ClosedClusterManagerRuntime {
     self_member_id: String,
     cluster_name: String,
     etcd_endpoints: Vec<String>,
+    _etcd_backend: ManagedEtcdClient,
     observe_handle: std::sync::OnceLock<ObserveHandle>,
     ipc_bandwidth_attributor_handle: std::sync::OnceLock<IpcBandwidthAttributorHandle>,
     self_info: Arc<RwLock<crate::ClusterMember>>,
@@ -277,8 +278,21 @@ impl ClosedClusterManagerRuntime {
             .map_err(cluster_manager_closed_sdk_error)?;
         let (event_tx, _) = abroadcast::channel(100);
         let (self_rdma_resolved_tx, _) = watch::channel(current_rdma);
+        let endpoint_set = EtcdEndpointSet::new(arg.etcd_endpoints.clone()).map_err(|error| {
+            crate::ClusterError::EtcdConnection {
+                endpoints: arg.etcd_endpoints.clone(),
+                error: error.to_string(),
+            }
+        })?;
+        let etcd_backend = ManagedEtcdClient::acquire(endpoint_set);
         let transfer_link_p2p_snapshot_source = CommuTransferLinkP2pSnapshotSource::new(
-            connect_transfer_link_client(&arg.etcd_endpoints).await?,
+            etcd_backend
+                .client()
+                .await
+                .map_err(|error| crate::ClusterError::EtcdConnection {
+                    endpoints: arg.etcd_endpoints.clone(),
+                    error: error.to_string(),
+                })?,
             format!("/{}/transfer_link/p2p", cluster_name),
         );
         let transfer_link_writer = make_runtime_transfer_link_writer(handle);
@@ -287,6 +301,7 @@ impl ClosedClusterManagerRuntime {
             self_member_id,
             cluster_name,
             etcd_endpoints: arg.etcd_endpoints,
+            _etcd_backend: etcd_backend,
             observe_handle: std::sync::OnceLock::new(),
             ipc_bandwidth_attributor_handle: std::sync::OnceLock::new(),
             self_info: Arc::new(RwLock::new(self_info)),
@@ -387,17 +402,6 @@ fn cluster_manager_closed_sdk_error(
     error: crate::closed_sdk::ClosedSdkConsumerError,
 ) -> crate::ClusterError {
     crate::ClusterError::Unknown(format!("closed sdk cluster-manager call failed: {error}"))
-}
-
-async fn connect_transfer_link_client(
-    etcd_endpoints: &[String],
-) -> crate::ClusterResult<EtcdClient> {
-    EtcdClient::connect(etcd_endpoints.to_vec(), None)
-        .await
-        .map_err(|error| crate::ClusterError::EtcdConnection {
-            endpoints: etcd_endpoints.to_vec(),
-            error: error.to_string(),
-        })
 }
 
 fn make_runtime_transfer_link_writer(

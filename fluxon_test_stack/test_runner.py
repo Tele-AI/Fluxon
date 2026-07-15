@@ -666,6 +666,14 @@ def main() -> None:
         help="Optional GitOps config YAML. When set with --action ui, test_runner owns the GitOps poller/UI/API as part of the same service.",
     )
     parser.add_argument(
+        "--cleanup-successful-case-artifacts",
+        action="store_true",
+        help=(
+            "After a case and its teardown both succeed, keep only summary.yaml in its run directory. "
+            "Failed cases retain their complete diagnostic artifacts."
+        ),
+    )
+    parser.add_argument(
         "--top-attention-prefix",
         dest="top_attention_prefixes",
         action="append",
@@ -890,6 +898,15 @@ def main() -> None:
                         controller_url=_require_str(stack_identity.get("controller_url"), "stack_identity.controller_url"),
                         case_id=case.case_id,
                     )
+                    if args.cleanup_successful_case_artifacts:
+                        previous_run_index = _require_int(
+                            last_run.get("run_index"),
+                            f"case_runs[{case.case_id}].last_run.run_index",
+                            min_v=1,
+                        )
+                        _cleanup_successful_run_artifacts(
+                            results_root / case.case_id / f"run_{previous_run_index}"
+                        )
                     continue
         _bench_case_preflight_cleanup(
             stack_identity=stack_identity,
@@ -1111,6 +1128,21 @@ def main() -> None:
             except Exception as exc:
                 print(f"ERROR: failed to write/update summary.yaml: {exc}")
                 raise SystemExit(1)
+
+            if (
+                args.cleanup_successful_case_artifacts
+                and outcome == RUN_OUTCOME_SUCCESS
+                and finalize_error is None
+            ):
+                try:
+                    _cleanup_successful_run_artifacts(run_dir)
+                except Exception as exc:
+                    print(
+                        "ERROR: successful case artifact cleanup failed; stopping to avoid exhausting disk: "
+                        f"case_id={case.case_id} run_dir={run_dir} err={type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    raise SystemExit(1)
 
             if fatal_stop_after_finalize:
                 raise SystemExit(1)
@@ -3557,19 +3589,114 @@ def _resolved_run_dir_path(resolved_case: Dict[str, Any]) -> Path:
     return Path(_require_str(runtime.get("run_dir"), "runtime.run_dir")).resolve()
 
 
-def _ci_share_mem_path(resolved_case: Dict[str, Any], *, run_dir: Path) -> str:
+def _ci_share_mem_path(resolved_case: Dict[str, Any], *, owner_index: int) -> str:
     runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
     stack_identity = _require_dict(runtime.get("stack_identity"), "resolved_case.runtime.stack_identity")
     share_mem_root = _require_str(
         stack_identity.get("share_mem_path"),
         "resolved_case.runtime.stack_identity.share_mem_path",
     )
+    owner_index_i = _require_int(owner_index, "owner_index", min_v=0)
     # English note:
     # - iceoryx2 uses share_mem_path as a base for per-node paths (e.g. .../nodes/<id>/iox2_<hash>/.service_tag).
     # - The per-node suffix can be long, and some filesystems enforce a max path length of 255 bytes.
     # - Therefore share_mem_path must be short and must not embed run_dir (which can be deep under repo/workdir).
-    token = hashlib.sha256(str(run_dir.resolve()).encode("utf-8")).hexdigest()[:16]
-    return str((Path(share_mem_root) / "ci" / token).resolve())
+    # - CI owners use a dedicated namespace below the testbed root. This both isolates them from the
+    #   long-lived testbed owner and gives every owner index one stable slot that is reused across cases.
+    return os.path.abspath(os.fspath(Path(share_mem_root) / "ci" / f"owner-{owner_index_i}"))
+
+
+def _mutate_ci_owner_share_mem_dir(
+    resolved_case: Dict[str, Any],
+    *,
+    owner_index: int,
+    share_mem_path: str,
+    recreate: bool,
+) -> None:
+    """Remove one bounded CI owner SHM slot, optionally recreating it empty.
+
+    The exact-path check is intentional: the testbed owner stores its bundle directly below the
+    shared root under its own cluster name, while CI is allowed to mutate only ci/owner-{index}.
+    """
+    owner_index_i = _require_int(owner_index, "owner_index", min_v=0)
+    expected_path = Path(_ci_share_mem_path(resolved_case, owner_index=owner_index_i))
+    actual_path = Path(os.path.abspath(os.fspath(share_mem_path)))
+    expected_namespace = expected_path.parent
+    if actual_path != expected_path:
+        raise ValueError(
+            "refusing to mutate an unexpected CI owner share_mem_path: "
+            f"path={actual_path} expected={expected_path}"
+        )
+    if expected_namespace.name != "ci" or expected_path.name != f"owner-{owner_index_i}":
+        raise ValueError(
+            "refusing to mutate a share-memory path outside the CI owner namespace: "
+            f"path={expected_path}"
+        )
+
+    instance_id = f"owner_{owner_index_i}"
+    remote_access = _instance_remote_target_access(resolved_case, instance_id=instance_id)
+    if remote_access is None:
+        if expected_namespace.is_symlink():
+            raise ValueError(f"CI share-memory namespace must not be a symlink: {expected_namespace}")
+        if expected_path.is_symlink() or expected_path.is_file():
+            expected_path.unlink()
+        elif expected_path.exists():
+            shutil.rmtree(expected_path)
+        if recreate:
+            expected_path.mkdir(parents=True, exist_ok=False)
+    else:
+        target_name, node_cfg, dispatch_mod = remote_access
+        namespace_q = dispatch_mod.sh_quote(str(expected_namespace))
+        owner_path_q = dispatch_mod.sh_quote(str(expected_path))
+        remote_lines = [
+            "set -euo pipefail",
+            f"if [ -L {namespace_q} ]; then",
+            f"  echo 'refusing symlinked CI share-memory namespace: ' {namespace_q} >&2",
+            "  exit 1",
+            "fi",
+            f"rm -rf -- {owner_path_q}",
+        ]
+        if recreate:
+            remote_lines.append(f"mkdir -p -- {owner_path_q}")
+        _run_remote_bash(
+            target_name=target_name,
+            node_cfg=node_cfg,
+            remote_cmd="\n".join(remote_lines),
+        )
+
+    action = "reset" if recreate else "removed"
+    print(
+        f"[CI owner share memory] {action} owner_index={owner_index_i} path={expected_path}",
+        flush=True,
+    )
+
+
+def _reset_ci_owner_share_mem_dir(
+    resolved_case: Dict[str, Any],
+    *,
+    owner_index: int,
+    share_mem_path: str,
+) -> None:
+    _mutate_ci_owner_share_mem_dir(
+        resolved_case,
+        owner_index=owner_index,
+        share_mem_path=share_mem_path,
+        recreate=True,
+    )
+
+
+def _cleanup_ci_owner_share_mem_dir(
+    resolved_case: Dict[str, Any],
+    *,
+    owner_index: int,
+    share_mem_path: str,
+) -> None:
+    _mutate_ci_owner_share_mem_dir(
+        resolved_case,
+        owner_index=owner_index,
+        share_mem_path=share_mem_path,
+        recreate=False,
+    )
 
 
 def _ci_owner_shared_bundle_paths(run_dir: Path, *, owner_config_path: Path) -> List[Path]:
@@ -4678,6 +4805,65 @@ def _clean_workdir(workdir_root: Path) -> None:
         print(f"[clean_workdir] removed: {p}", flush=True)
     if not removed_any:
         print(f"[clean_workdir] nothing to remove under: {workdir_root}", flush=True)
+
+
+def _cleanup_successful_run_artifacts(run_dir: Path) -> None:
+    """Keep the terminal summary and remove bulky artifacts from a successful run."""
+    run_dir = Path(run_dir).resolve()
+    if not run_dir.exists():
+        print(f"[cleanup_successful_run_artifacts] run directory already absent: {run_dir}", flush=True)
+        return
+    if not run_dir.is_dir():
+        raise ValueError(f"successful run path is not a directory: {run_dir}")
+
+    summary_path = run_dir / "summary.yaml"
+    if not summary_path.is_file() or summary_path.is_symlink():
+        raise ValueError(f"successful run must retain a regular summary.yaml before cleanup: {summary_path}")
+    summary = _require_dict(_load_yaml_file(summary_path), "successful run summary")
+    if summary.get("outcome") != RUN_OUTCOME_SUCCESS:
+        raise ValueError(
+            "refusing to clean a run whose summary is not SUCCESS: "
+            f"run_dir={run_dir} outcome={summary.get('outcome')!r}"
+        )
+    test_stack_summary = summary.get("test_stack")
+    has_diagnostic_error = (
+        summary.get("error") is not None
+        or summary.get("teardown_error") is not None
+        or (
+            isinstance(test_stack_summary, dict)
+            and any(
+                test_stack_summary.get(field_name) is not None
+                for field_name in ("error", "collect_error", "teardown_error")
+            )
+        )
+    )
+    if has_diagnostic_error:
+        print(
+            "[cleanup_successful_run_artifacts] preserving run with error diagnostics: "
+            f"{run_dir}",
+            flush=True,
+        )
+        return
+
+    free_before = shutil.disk_usage(run_dir).free
+    removed_entries = 0
+    for path in list(run_dir.iterdir()):
+        if path.name == "summary.yaml":
+            continue
+        if path.is_symlink() or not path.is_dir():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+        removed_entries += 1
+
+    free_after = shutil.disk_usage(run_dir).free
+    reclaimed_bytes = max(0, int(free_after) - int(free_before))
+    print(
+        "[cleanup_successful_run_artifacts] "
+        f"run_dir={run_dir} removed_entries={removed_entries} reclaimed_bytes={reclaimed_bytes} "
+        f"free_bytes={free_after}",
+        flush=True,
+    )
 
 
 def _repair_reserved_last_runs(case_runs: Dict[str, Any], *, results_root: Path) -> List[str]:
@@ -11343,6 +11529,13 @@ def _ci_cleanup_runtime(
             ctx=f"CI cleanup runtime current_deployments {instance_id_text}",
         )
     _wait_ci_ports_free(cleanup_case, timeout_s=timeout_s)
+    if _ci_has_instance(cleanup_case, instance_id="owner_0"):
+        owner_share_mem_path = _ci_share_mem_path(cleanup_case, owner_index=0)
+        _cleanup_ci_owner_share_mem_dir(
+            cleanup_case,
+            owner_index=0,
+            share_mem_path=owner_share_mem_path,
+        )
 
 
 def _http_json_allow_error_status(req: urllib.request.Request) -> Tuple[int, Dict[str, Any]]:

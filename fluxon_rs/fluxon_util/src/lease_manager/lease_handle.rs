@@ -91,7 +91,10 @@ impl Drop for GeneralLease {
     }
 }
 
-/// Endpoint-scoped lease manager, bound to a specific etcd address set.
+/// Stateless facade over the process-wide lease registries.
+///
+/// Etcd backend identity is carried explicitly by `LeaseBackendUid`; client
+/// lifetime and reuse are owned by the managed etcd client registry.
 #[derive(Clone, Default)]
 pub struct LeaseManager;
 

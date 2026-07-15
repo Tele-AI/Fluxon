@@ -1,12 +1,13 @@
 use etcd_client as etcd;
-use fluxon_util::auto_clean_map::{AutoCleanMap, AutoCleanMapEntry};
+use fluxon_util::etcd::{EtcdEndpointSet, ManagedEtcdClient};
+use fluxon_util::lease_manager::{GLOBAL_LM, GeneralLease, LeaseBackendUid, LeaseRegisterKind};
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 use pyo3::{PyErr, PyObject};
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tracing::debug;
@@ -27,7 +28,10 @@ fn normalize_raw_endpoint(endpoint: &str) -> PyResult<String> {
     Ok(format!("http://{}", endpoint))
 }
 
-fn normalize_raw_endpoints(endpoints: Vec<String>, component: &str) -> PyResult<Vec<String>> {
+pub(crate) fn normalize_raw_endpoints(
+    endpoints: Vec<String>,
+    component: &str,
+) -> PyResult<Vec<String>> {
     if endpoints.is_empty() {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
             "{} requires at least one endpoint",
@@ -41,54 +45,12 @@ fn normalize_raw_endpoints(endpoints: Vec<String>, component: &str) -> PyResult<
     Ok(normalized)
 }
 
-struct EtcdKvBackend {
+pub(crate) fn endpoint_set_from_raw(
     endpoints: Vec<String>,
-    client: tokio::sync::RwLock<Option<etcd::Client>>,
-}
-
-impl EtcdKvBackend {
-    fn new(endpoints: Vec<String>) -> Self {
-        Self {
-            endpoints,
-            client: tokio::sync::RwLock::new(None),
-        }
-    }
-
-    async fn client(&self) -> anyhow::Result<etcd::Client> {
-        {
-            let guard = self.client.read().await;
-            if let Some(client) = guard.as_ref() {
-                return Ok(client.clone());
-            }
-        }
-
-        let mut guard = self.client.write().await;
-        if let Some(client) = guard.as_ref() {
-            return Ok(client.clone());
-        }
-
-        let client = etcd::Client::connect(self.endpoints.clone(), None)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to connect etcd endpoints={:?}: {:?}",
-                    self.endpoints,
-                    e
-                )
-            })?;
-        *guard = Some(client.clone());
-        Ok(client)
-    }
-
-    async fn clear_client(&self) {
-        let mut guard = self.client.write().await;
-        *guard = None;
-    }
-}
-
-fn etcd_kv_backend_map() -> &'static AutoCleanMap<Vec<String>, EtcdKvBackend> {
-    static MAP: OnceLock<AutoCleanMap<Vec<String>, EtcdKvBackend>> = OnceLock::new();
-    MAP.get_or_init(|| AutoCleanMap::new())
+    component: &str,
+) -> PyResult<EtcdEndpointSet> {
+    EtcdEndpointSet::new(normalize_raw_endpoints(endpoints, component)?)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
 }
 
 fn is_reconnectable_etcd_error(err: &etcd::Error) -> bool {
@@ -107,7 +69,7 @@ fn is_reconnectable_etcd_error_text(msg: &str) -> bool {
 }
 
 async fn run_etcd_op<T, F, Fut>(
-    backend: AutoCleanMapEntry<Vec<String>, EtcdKvBackend>,
+    backend: ManagedEtcdClient,
     context: String,
     mut op: F,
 ) -> anyhow::Result<T>
@@ -117,14 +79,14 @@ where
 {
     let mut last_err = None;
     for attempt in 1..=2 {
-        let client = backend.client().await?;
-        match op(client).await {
+        let snapshot = backend.snapshot().await?;
+        match op(snapshot.client()).await {
             Ok(value) => return Ok(value),
             Err(err) => {
                 let should_retry = attempt == 1 && is_reconnectable_etcd_error(&err);
                 last_err = Some(err);
                 if should_retry {
-                    backend.clear_client().await;
+                    snapshot.invalidate().await;
                     continue;
                 }
                 let err = last_err.take().expect("etcd error must be recorded");
@@ -140,17 +102,16 @@ where
 #[pyclass(name = "EtcdKvClient")]
 pub struct PyEtcdKvClient {
     rt: Arc<Runtime>,
-    endpoints: Vec<String>,
-    backend: AutoCleanMapEntry<Vec<String>, EtcdKvBackend>,
+    endpoints: EtcdEndpointSet,
+    backend: ManagedEtcdClient,
 }
 
 #[pymethods]
 impl PyEtcdKvClient {
     #[new]
     fn new(endpoints: Vec<String>) -> PyResult<Self> {
-        let endpoints = normalize_raw_endpoints(endpoints, "EtcdKvClient")?;
-        let backend = etcd_kv_backend_map()
-            .get_or_init(endpoints.clone(), || EtcdKvBackend::new(endpoints.clone()));
+        let endpoints = endpoint_set_from_raw(endpoints, "EtcdKvClient")?;
+        let backend = ManagedEtcdClient::acquire(endpoints.clone());
         Ok(Self {
             rt: crate::mpsc::get_global_runtime(),
             endpoints,
@@ -408,19 +369,21 @@ impl PyEtcdKvClient {
     }
 
     fn __repr__(&self) -> String {
-        format!("<EtcdKvClient endpoints={:?}>", self.endpoints)
+        format!("<EtcdKvClient endpoints={:?}>", self.endpoints.as_slice())
     }
 }
 
 #[pyclass(name = "EtcdLock")]
 pub struct PyEtcdLock {
     rt: Arc<Runtime>,
-    endpoints: Vec<String>,
+    endpoints: EtcdEndpointSet,
+    backend: ManagedEtcdClient,
     name: String,
     ttl_seconds: i64,
     timeout_seconds: f64,
     lease_id: Option<i64>,
     lock_key: Option<Vec<u8>>,
+    lease_guard: Option<GeneralLease>,
 }
 
 #[pymethods]
@@ -433,7 +396,7 @@ impl PyEtcdLock {
         ttl_seconds: i64,
         timeout_seconds: Option<f64>,
     ) -> PyResult<Self> {
-        let endpoints = normalize_raw_endpoints(endpoints, "EtcdLock")?;
+        let endpoints = endpoint_set_from_raw(endpoints, "EtcdLock")?;
         if ttl_seconds <= 0 {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                 "EtcdLock ttl_seconds must be > 0, got {}",
@@ -450,12 +413,14 @@ impl PyEtcdLock {
 
         Ok(Self {
             rt: crate::mpsc::get_global_runtime(),
+            backend: ManagedEtcdClient::acquire(endpoints.clone()),
             endpoints,
             name,
             ttl_seconds,
             timeout_seconds,
             lease_id: None,
             lock_key: None,
+            lease_guard: None,
         })
     }
 
@@ -484,9 +449,11 @@ impl PyEtcdLock {
         }
 
         let endpoints = self.endpoints.clone();
+        let backend = self.backend.clone();
         let name = self.name.clone();
         let ttl_seconds = self.ttl_seconds;
         let timeout_duration = Duration::from_secs_f64(timeout_seconds);
+        let rt_handle = self.rt.handle().clone();
         let t0 = Instant::now();
 
         debug!(
@@ -500,7 +467,7 @@ impl PyEtcdLock {
         let outer = py
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
-                    let mut client = etcd::Client::connect(endpoints, None).await.map_err(|e| {
+                    let mut client = backend.client().await.map_err(|e| {
                         anyhow::anyhow!("failed to connect etcd for lock {}: {:?}", name, e)
                     })?;
 
@@ -508,6 +475,29 @@ impl PyEtcdLock {
                         anyhow::anyhow!("failed to grant etcd lease for lock {}: {:?}", name, e)
                     })?;
                     let lease_id = lease_resp.id();
+                    let lease_guard = match GLOBAL_LM
+                        .register_lease_for_keepalive(
+                            LeaseBackendUid::etcd(endpoints),
+                            ttl_seconds,
+                            lease_id as u64,
+                            LeaseRegisterKind::Etcd {
+                                revoke_on_drop: false,
+                            },
+                            rt_handle,
+                        )
+                        .await
+                    {
+                        Ok(lease_guard) => lease_guard,
+                        Err(err) => {
+                            let _ = client.lease_revoke(lease_id).await;
+                            return Err(anyhow::anyhow!(
+                                "failed to start keepalive for etcd lock {} lease {}: {}",
+                                name,
+                                lease_id,
+                                err
+                            ));
+                        }
+                    };
 
                     match tokio::time::timeout(
                         timeout_duration,
@@ -518,8 +508,12 @@ impl PyEtcdLock {
                     )
                     .await
                     {
-                        Ok(Ok(resp)) => Ok(Some((lease_id, resp.key().to_vec()))),
+                        Ok(Ok(resp)) => {
+                            let lock_key = resp.key().to_vec();
+                            Ok(Some((lease_id, lock_key, lease_guard)))
+                        }
                         Ok(Err(err)) => {
+                            drop(lease_guard);
                             let _ = client.lease_revoke(lease_id).await;
                             Err(anyhow::anyhow!(
                                 "failed to acquire etcd lock {}: {:?}",
@@ -528,6 +522,7 @@ impl PyEtcdLock {
                             ))
                         }
                         Err(_) => {
+                            drop(lease_guard);
                             let _ = client.lease_revoke(lease_id).await;
                             Ok(None)
                         }
@@ -541,9 +536,10 @@ impl PyEtcdLock {
             outer.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         match acquire_outcome {
-            Some((lease_id, lock_key)) => {
+            Some((lease_id, lock_key, lease_guard)) => {
                 self.lease_id = Some(lease_id);
                 self.lock_key = Some(lock_key);
+                self.lease_guard = Some(lease_guard);
                 debug!(
                     target: "fluxon_pyo3::etcd",
                     "end etcd lock acquire: name={}, lease_id={}, elapsed_ms={}",
@@ -567,15 +563,19 @@ impl PyEtcdLock {
 
     fn release(&mut self, py: Python<'_>) -> PyResult<bool> {
         let Some(lock_key) = self.lock_key.clone() else {
+            self.lease_id = None;
+            self.lease_guard = None;
             return Ok(false);
         };
         let Some(lease_id) = self.lease_id else {
             self.lock_key = None;
+            self.lease_guard = None;
             return Ok(false);
         };
 
-        let endpoints = self.endpoints.clone();
+        let backend = self.backend.clone();
         let name = self.name.clone();
+        let lease_guard = self.lease_guard.take();
         let t0 = Instant::now();
 
         debug!(
@@ -585,42 +585,48 @@ impl PyEtcdLock {
             lease_id
         );
 
-        let outer = py
-            .allow_threads(|| {
-                self.rt.run_async_from_sync(async move {
-                    let mut client = etcd::Client::connect(endpoints, None).await.map_err(|e| {
-                        anyhow::anyhow!("failed to connect etcd for unlock {}: {:?}", name, e)
-                    })?;
+        let bridge_result = py.allow_threads(|| {
+            self.rt.run_async_from_sync(async move {
+                let lease_guard = lease_guard;
+                let mut client = backend.client().await.map_err(|e| {
+                    anyhow::anyhow!("failed to connect etcd for unlock {}: {:?}", name, e)
+                })?;
 
-                    let unlock_result = client.unlock(lock_key).await.map(|_| true).map_err(|e| {
+                let unlock_result =
+                    client.unlock(lock_key).await.map(|_| true).map_err(|e| {
                         anyhow::anyhow!("failed to unlock etcd lock {}: {:?}", name, e)
                     });
 
-                    let revoke_result = client.lease_revoke(lease_id).await;
-                    match (unlock_result, revoke_result) {
-                        (Ok(unlocked), Ok(_)) => Ok(unlocked),
-                        (Ok(_), Err(err)) => Err(anyhow::anyhow!(
-                            "failed to revoke etcd lease {} for lock {}: {:?}",
-                            lease_id,
-                            name,
-                            err
-                        )),
-                        (Err(err), Ok(_)) => Err(err),
-                        (Err(unlock_err), Err(revoke_err)) => Err(anyhow::anyhow!(
-                            "failed to unlock etcd lock {}: {}; failed to revoke lease {}: {:?}",
-                            name,
-                            unlock_err,
-                            lease_id,
-                            revoke_err
-                        )),
-                    }
-                })
+                // Keep the lease alive until the unlock request finishes, then
+                // unregister it before the final explicit revoke.
+                drop(lease_guard);
+                let revoke_result = client.lease_revoke(lease_id).await;
+                match (unlock_result, revoke_result) {
+                    (Ok(unlocked), Ok(_)) => Ok(unlocked),
+                    (Ok(_), Err(err)) => Err(anyhow::anyhow!(
+                        "failed to revoke etcd lease {} for lock {}: {:?}",
+                        lease_id,
+                        name,
+                        err
+                    )),
+                    (Err(err), Ok(_)) => Err(err),
+                    (Err(unlock_err), Err(revoke_err)) => Err(anyhow::anyhow!(
+                        "failed to unlock etcd lock {}: {}; failed to revoke lease {}: {:?}",
+                        name,
+                        unlock_err,
+                        lease_id,
+                        revoke_err
+                    )),
+                }
             })
-            .map_err(|e| anyhow::anyhow!("runtime bridge failed in EtcdLock.release: {}", e))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        });
 
         self.lock_key = None;
         self.lease_id = None;
+        let outer = bridge_result
+            .map_err(|e| anyhow::anyhow!("runtime bridge failed in EtcdLock.release: {}", e))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
         let released =
             outer.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         debug!(
@@ -671,14 +677,6 @@ impl PyEtcdLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static TEST_KEY_SEQ: AtomicUsize = AtomicUsize::new(1);
-
-    fn unique_test_endpoints() -> Vec<String> {
-        let seq = TEST_KEY_SEQ.fetch_add(1, Ordering::Relaxed);
-        vec![format!("http://unit-test-etcd-backend-{}", seq)]
-    }
 
     #[test]
     fn normalize_raw_endpoint_accepts_raw_host_port() {
@@ -715,7 +713,10 @@ mod tests {
     #[test]
     fn etcd_kv_client_constructor_normalizes_raw_endpoints() {
         let client = PyEtcdKvClient::new(vec!["127.0.0.1:2379".to_string()]).unwrap();
-        assert_eq!(client.endpoints, vec!["http://127.0.0.1:2379"]);
+        assert_eq!(
+            client.endpoints.as_slice(),
+            ["http://127.0.0.1:2379".to_string()]
+        );
     }
 
     #[test]
@@ -727,7 +728,10 @@ mod tests {
             Some(1.0),
         )
         .unwrap();
-        assert_eq!(lock.endpoints, vec!["http://127.0.0.1:2379"]);
+        assert_eq!(
+            lock.endpoints.as_slice(),
+            ["http://127.0.0.1:2379".to_string()]
+        );
     }
 
     #[test]
@@ -741,30 +745,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn etcd_kv_backend_map_reuses_and_auto_cleans_live_entries() {
-        let endpoints = unique_test_endpoints();
-        let map = etcd_kv_backend_map();
-        assert!(map.with_existing(&endpoints, |_| ()).is_none());
-
-        {
-            let entry_a =
-                map.get_or_init(endpoints.clone(), || EtcdKvBackend::new(endpoints.clone()));
-            assert!(map.with_existing(&endpoints, |_| ()).is_some());
-
-            {
-                let entry_b = map.get_or_init(endpoints.clone(), || {
-                    panic!("live backend entry should be reused")
-                });
-                assert!(std::ptr::eq(&*entry_a, &*entry_b));
-            }
-
-            assert!(map.with_existing(&endpoints, |_| ()).is_some());
-        }
-
-        assert!(map.with_existing(&endpoints, |_| ()).is_none());
     }
 
     #[test]

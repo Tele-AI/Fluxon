@@ -10,8 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-use anyhow::{Context, Result as AnyResult};
-use etcd_client::Client;
+use anyhow::Result as AnyResult;
 
 use super::keepalive_actor::{
     self, ActorRegisterInvocation, EtcdState, LeaseKey, OneTtlKeepAliveInner, ensure_inner_running,
@@ -20,6 +19,7 @@ use super::lease_backend_handle::{LeaseBackendHandle, LeaseBackendInner};
 use super::lease_backend_uid::{LeaseBackendUid, LeaseRegisterKind, LeaseType};
 use super::lease_handle::{GeneralLease, LeaseEntry, LeaseEntryKind};
 use crate::auto_clean_map::{AutoCleanMap, AutoCleanMapEntry};
+use crate::etcd::ManagedEtcdClient;
 
 const INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES: usize = 5;
 const INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS: u64 = 60_000;
@@ -97,7 +97,7 @@ fn backend_map() -> &'static AutoCleanMap<LeaseBackendUid, LeaseBackendInner> {
 pub fn acquire_backend_handle(
     uid: LeaseBackendUid,
     kv_cb: Option<Arc<dyn Fn(u64) -> AnyResult<()> + Send + Sync + 'static>>,
-    etcd_client: Option<Client>,
+    etcd_client: Option<ManagedEtcdClient>,
     rt: tokio::runtime::Handle,
 ) -> LeaseBackendHandle {
     let entry: AutoCleanMapEntry<LeaseBackendUid, LeaseBackendInner> =
@@ -115,12 +115,7 @@ pub fn acquire_backend_handle(
             LeaseBackendUid::Etcd(_) => {
                 let client =
                     etcd_client.expect("etcd backend acquire requires client on first creation");
-                let endpoints = uid
-                    .endpoints()
-                    .expect("etcd uid must carry endpoints")
-                    .to_vec();
                 LeaseBackendInner::Etcd {
-                    _endpoints: endpoints,
                     client,
                     states: AutoCleanMap::new(),
                     rt: rt.clone(),
@@ -294,11 +289,22 @@ impl Drop for LeaseEntry {
                 ..
             } => {
                 if *revoke_on_drop {
-                    if let Some(mut cli) = handle.etcd_client() {
+                    if let Some(client) = handle.managed_etcd_client() {
                         let lid = lease_id as i64;
                         // Use the runtime handle carried by the backend handle (LeaseBackendInner)
                         let rt = handle.runtime_handle();
                         rt.spawn(async move {
+                            let mut cli = match client.client().await {
+                                Ok(client) => client,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "failed to acquire etcd client to revoke lease_id={} on drop: {:?}",
+                                        lid,
+                                        e
+                                    );
+                                    return;
+                                }
+                            };
                             if let Err(e) = cli.lease_revoke(lid).await {
                                 tracing::warn!(
                                     "failed to revoke lease_id={} on drop: {:?}",
@@ -312,7 +318,7 @@ impl Drop for LeaseEntry {
                     } else {
                         tracing::warn!(
                             lease_id,
-                            "etcd revoke_on_drop: missing etcd client in backend handle"
+                            "etcd revoke_on_drop: missing managed etcd client in backend handle"
                         );
                     }
                 }
@@ -336,11 +342,10 @@ pub async fn register_lease_for_keepalive(
             LeaseType::Etcd => {
                 record_register_by(lease_id, format!("{:?},ttl={}", &backend_uid, ttl_seconds));
                 let endpoints = backend_uid
-                    .endpoints()
-                    .expect("etcd backend must carry endpoints");
-                let client = Client::connect(endpoints, None).await.with_context(|| {
-                    format!("failed to connect etcd for endpoints {:?}", endpoints)
-                })?;
+                    .etcd_endpoint_set()
+                    .expect("etcd backend must carry endpoints")
+                    .clone();
+                let client = ManagedEtcdClient::acquire(endpoints);
 
                 let backend_handle = acquire_backend_handle(
                     backend_uid.clone(),

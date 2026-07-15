@@ -2,6 +2,8 @@ use anyhow::Result as AnyResult;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::etcd::EtcdEndpointSet;
+
 /// Backend kind for leases supported by the unified lease manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseType {
@@ -11,11 +13,10 @@ pub enum LeaseType {
 
 /// Unique identifier for a lease backend.
 ///
-/// - Etcd: endpoints list (Vec<String>) sorted lexicographically to make
-///   identity stable regardless of input order.
+/// - Etcd: canonical endpoint set.
 /// - KvClient: cluster name; carries allocate/keepalive Rust closures.
 pub enum LeaseBackendUid {
-    Etcd(Vec<String>),
+    Etcd(EtcdEndpointSet),
     KvClientWithCallbacks {
         cluster: String,
         /// Allocate closure: input ttl_seconds -> lease_id
@@ -27,11 +28,7 @@ pub enum LeaseBackendUid {
 }
 
 impl LeaseBackendUid {
-    /// Construct an etcd backend uid from endpoint list; endpoints are sorted
-    /// to ensure identical identity regardless of input order.
-    pub fn etcd_from(mut endpoints: Vec<String>) -> Self {
-        // Sort in-place; caller must pass explicit endpoints, we don't add defaults.
-        endpoints.sort();
+    pub fn etcd(endpoints: EtcdEndpointSet) -> Self {
         LeaseBackendUid::Etcd(endpoints)
     }
 
@@ -55,9 +52,9 @@ impl LeaseBackendUid {
         }
     }
 
-    pub fn endpoints(&self) -> Option<&[String]> {
+    pub fn etcd_endpoint_set(&self) -> Option<&EtcdEndpointSet> {
         match self {
-            LeaseBackendUid::Etcd(v) => Some(v.as_slice()),
+            LeaseBackendUid::Etcd(v) => Some(v),
             _ => None,
         }
     }
@@ -140,11 +137,8 @@ impl std::hash::Hash for LeaseBackendUid {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
             LeaseBackendUid::Etcd(endpoints) => {
-                // tag + endpoints (construction sorted; order is stable)
                 0u8.hash(state);
-                for e in endpoints {
-                    e.hash(state);
-                }
+                endpoints.hash(state);
             }
             LeaseBackendUid::KvClientWithCallbacks { cluster, .. } => {
                 1u8.hash(state);
@@ -157,7 +151,7 @@ impl std::hash::Hash for LeaseBackendUid {
 impl fmt::Debug for LeaseBackendUid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LeaseBackendUid::Etcd(v) => write!(f, "Etcd({:?})", v),
+            LeaseBackendUid::Etcd(v) => write!(f, "Etcd({:?})", v.as_slice()),
             LeaseBackendUid::KvClientWithCallbacks { cluster, .. } => {
                 write!(f, "KvClientWithCallbacks(cluster={})", cluster)
             }

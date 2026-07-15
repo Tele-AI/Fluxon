@@ -1,4 +1,5 @@
 use anyhow::Result as AnyResult;
+use fluxon_util::etcd::ManagedEtcdClient;
 use fluxon_util::lease_manager::GLOBAL_LM;
 use fluxon_util::lease_manager::snapshot_active_lease_debug as lm_snapshot_active_lease_debug;
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
@@ -11,7 +12,6 @@ use tokio::runtime::Runtime;
 use tracing::debug;
 // Use the shared PyO3 helper that submits Python callables to a Python
 // ThreadPoolExecutor and waits without holding the GIL for the whole duration.
-use etcd_client as etcd;
 use fluxon_mq::lease_manager::{LeaseBackendUid, LeaseRegisterKind};
 use fluxon_util::pyo3::run_longtime_py_function;
 
@@ -117,9 +117,12 @@ impl PyLeaseBackendUid {
 
     fn __repr__(&self) -> String {
         match self.inner.kind() {
-            fluxon_util::lease_manager::LeaseType::Etcd => match self.inner.endpoints() {
-                Some(v) if !v.is_empty() => {
-                    format!("<LeaseBackendUid etcd endpoints={}>", v.join(","))
+            fluxon_util::lease_manager::LeaseType::Etcd => match self.inner.etcd_endpoint_set() {
+                Some(v) => {
+                    format!(
+                        "<LeaseBackendUid etcd endpoints={}>",
+                        v.as_slice().join(",")
+                    )
                 }
                 _ => "<LeaseBackendUid etcd>".to_string(),
             },
@@ -187,18 +190,20 @@ impl LeaseManagerHandle {
             "begin allocate_etcd_lease: endpoints={}, ttl_seconds={}, revoke_on_drop={}",
             endpoints.join(","), ttl_seconds, revoke
         );
+        let endpoints = crate::etcd::endpoint_set_from_raw(endpoints, "LeaseManagerHandle")?;
         let rth = self.rt.handle().clone();
         let outer = py
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
-                    let uid = LeaseBackendUid::etcd_from(endpoints.clone());
-                    let mut client = etcd::Client::connect(endpoints, None).await.map_err(|e| {
+                    let uid = LeaseBackendUid::etcd(endpoints.clone());
+                    let backend = ManagedEtcdClient::acquire(endpoints);
+                    let mut client = backend.client().await.map_err(|e| {
                         anyhow::anyhow!("failed to connect etcd when allocating lease: {:?}", e)
                     })?;
                     let resp = client.lease_grant(ttl_seconds, None).await?;
                     let id = resp.id() as u64;
                     let rt = rth;
-                    GLOBAL_LM
+                    match GLOBAL_LM
                         .register_lease_for_keepalive(
                             uid,
                             ttl_seconds,
@@ -209,6 +214,13 @@ impl LeaseManagerHandle {
                             rt,
                         )
                         .await
+                    {
+                        Ok(lease) => Ok(lease),
+                        Err(err) => {
+                            let _ = client.lease_revoke(id as i64).await;
+                            Err(err)
+                        }
+                    }
                 })
             })
             .map_err(|e| anyhow::anyhow!("runtime bridge failed in allocate_etcd_lease: {}", e))
@@ -243,12 +255,13 @@ impl LeaseManagerHandle {
             "begin register_etcd_lease: endpoints={}, ttl_seconds={}, lease_id={}, revoke_on_drop={}, register_by={}",
             endpoints.join(","), ttl_seconds, lease_id, revoke, register_by
         );
+        let endpoints = crate::etcd::endpoint_set_from_raw(endpoints, "LeaseManagerHandle")?;
         fluxon_mq::lease_manager::record_register_by(lease_id, register_by);
         let rth = self.rt.handle().clone();
         let outer = py
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
-                    let uid = LeaseBackendUid::etcd_from(endpoints);
+                    let uid = LeaseBackendUid::etcd(endpoints);
                     let rt = rth;
                     GLOBAL_LM
                         .register_lease_for_keepalive(

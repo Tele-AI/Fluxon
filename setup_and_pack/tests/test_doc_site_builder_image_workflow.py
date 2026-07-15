@@ -50,6 +50,13 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertIn("ci_top_attention_mq_core", workflow_text)
         self.assertIn("doc_site_base_url", workflow_text)
         self.assertIn("rather_no_git_submodule.py", workflow_text)
+        self.assertIn("Reclaim runner disk before CI", workflow_text)
+        self.assertIn("docker system prune --all --force --volumes", workflow_text)
+        self.assertIn("/usr/local/lib/android", workflow_text)
+        self.assertIn("/usr/share/dotnet", workflow_text)
+        self.assertIn("--cleanup-pack-runtime-after-success", workflow_text)
+        self.assertIn("--cleanup-successful-case-artifacts", workflow_text)
+        self.assertIn("if: ${{ failure() }}", workflow_text)
 
     def test_docs_pages_uses_container_entrypoint(self) -> None:
         workflow_text = DOCS_PAGES_WORKFLOW_PATH.read_text(encoding="utf-8")
