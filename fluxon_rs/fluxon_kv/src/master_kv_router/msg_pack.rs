@@ -1,7 +1,7 @@
 use crate::{
     cluster_manager::NodeIDString,
     p2p::msg_pack::{MsgPackSerializePart, RPCReq},
-    rpcresp_kvresult_convert::msg_and_error::{ErrorCode, MsgId},
+    rpcresp_kvresult_convert::msg_and_error::{ErrorCode, MsgId, OK},
 };
 use bitcode::{Decode, Encode};
 use std::collections::HashMap;
@@ -103,6 +103,113 @@ impl RPCReq for GetDoneReq {
     type Resp = GetDoneResp;
 }
 
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetStartReq {
+    pub keys: Vec<String>,
+}
+impl MsgPackSerializePart for BatchGetStartReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchGetStartReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetStartItemResp {
+    pub get_id: u64,
+    pub node_id: NodeIDString,
+    pub put_id: PutIDForAKey,
+    pub target_addr: u64,
+    pub src_addr: u64,
+    pub target_base_addr: u64,
+    pub src_base_addr: u64,
+    pub len: u64,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetStartResp {
+    pub items: Vec<BatchGetStartItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for BatchGetStartResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchGetStartResp as u32
+    }
+}
+impl RPCReq for BatchGetStartReq {
+    type Resp = BatchGetStartResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetRevokeReq {
+    pub get_ids: Vec<u64>,
+}
+impl MsgPackSerializePart for BatchGetRevokeReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchGetRevokeReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetRevokeItemResp {
+    pub get_id: u64,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetRevokeResp {
+    pub items: Vec<BatchGetRevokeItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for BatchGetRevokeResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchGetRevokeResp as u32
+    }
+}
+impl RPCReq for BatchGetRevokeReq {
+    type Resp = BatchGetRevokeResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetDoneReq {
+    pub get_ids: Vec<u64>,
+}
+impl MsgPackSerializePart for BatchGetDoneReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchGetDoneReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetDoneItemResp {
+    pub get_id: u64,
+    pub holder_id: u64,
+    pub allocation_mode: GetAllocationMode,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetDoneResp {
+    pub items: Vec<BatchGetDoneItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for BatchGetDoneResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchGetDoneResp as u32
+    }
+}
+impl RPCReq for BatchGetDoneReq {
+    type Resp = BatchGetDoneResp;
+}
+
 // --- RPC for CountPrefix ---
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -156,6 +263,117 @@ impl RPCReq for GetMasterOnlyMetricPartReq {
     type Resp = GetMasterOnlyMetricPartResp;
 }
 
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ReserveLocalGrantReq;
+impl MsgPackSerializePart for ReserveLocalGrantReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::ReserveLocalGrantReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ReserveLocalGrantResp {
+    pub grant_id: u64,
+    pub node_id: NodeIDString,
+    pub addr: u64,
+    pub base_addr: u64,
+    pub len: u64,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for ReserveLocalGrantResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::ReserveLocalGrantResp as u32
+    }
+}
+impl RPCReq for ReserveLocalGrantReq {
+    type Resp = ReserveLocalGrantResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ReleaseLocalGrantReq {
+    pub grant_id: u64,
+}
+impl MsgPackSerializePart for ReleaseLocalGrantReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::ReleaseLocalGrantReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ReleaseLocalGrantResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for ReleaseLocalGrantResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::ReleaseLocalGrantResp as u32
+    }
+}
+impl RPCReq for ReleaseLocalGrantReq {
+    type Resp = ReleaseLocalGrantResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPreparePutKeyItemReq {
+    pub key: String,
+    pub reject_if_inflight_same_key: bool,
+    pub reject_if_exist_same_key: bool,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPreparePutKeysReq {
+    pub items: Vec<BatchPreparePutKeyItemReq>,
+}
+impl MsgPackSerializePart for BatchPreparePutKeysReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPreparePutKeysReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPreparePutKeysResp {
+    pub reservation_ids: Vec<u64>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for BatchPreparePutKeysResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPreparePutKeysResp as u32
+    }
+}
+impl RPCReq for BatchPreparePutKeysReq {
+    type Resp = BatchPreparePutKeysResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchReleasePutKeyReservationsReq {
+    pub reservation_ids: Vec<u64>,
+}
+impl MsgPackSerializePart for BatchReleasePutKeyReservationsReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchReleasePutKeyReservationsReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchReleasePutKeyReservationsResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for BatchReleasePutKeyReservationsResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchReleasePutKeyReservationsResp as u32
+    }
+}
+impl RPCReq for BatchReleasePutKeyReservationsReq {
+    type Resp = BatchReleasePutKeyReservationsResp;
+}
+
 // --- RPC for Put ---
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -163,6 +381,8 @@ pub struct PutStartReq {
     pub key: String,
     pub len: u64,
     pub reject_if_inflight_same_key: bool,
+    pub reject_if_exist_same_key: bool,
+    pub write_through: bool,
     /// Prefer placing the target allocation on any kvclient within this sub_cluster.
     pub preferred_sub_cluster: Option<String>,
     /// Optional source-node override for side-transfer workers that share an owner's mmap.
@@ -223,11 +443,25 @@ impl RPCReq for PutRevokeReq {
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct PutDoneCommittedSlot {
+    pub grant_id: u64,
+    pub slot_index: u32,
+    pub slot_size: u64,
+    pub addr: u64,
+    pub base_addr: u64,
+    pub len: u64,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct PutDoneReq {
     pub key: String,
     pub put_id: PutIDForAKey,
     /// Optional lease to attach this key to on commit
     pub lease_id: Option<u64>,
+    /// Optional local committed slot descriptor for local-first publish path.
+    pub committed_slot: Option<PutDoneCommittedSlot>,
+    /// Ask master to keep a local read holder for the committing node.
+    pub publish_local_cache: bool,
 }
 impl MsgPackSerializePart for PutDoneReq {
     fn msg_id(&self) -> u32 {
@@ -240,6 +474,8 @@ pub struct PutDoneResp {
     pub error_json: String,
     /// Server-side processing time in microseconds for this RPC handler
     pub server_process_us: i64,
+    /// Holder id for an owner-local cache view, present only when requested.
+    pub local_cache_holder_id: Option<u64>,
 }
 impl MsgPackSerializePart for PutDoneResp {
     fn msg_id(&self) -> u32 {
@@ -248,6 +484,220 @@ impl MsgPackSerializePart for PutDoneResp {
 }
 impl RPCReq for PutDoneReq {
     type Resp = PutDoneResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutStartItemReq {
+    pub key: String,
+    pub len: u64,
+    pub reject_if_inflight_same_key: bool,
+    pub reject_if_exist_same_key: bool,
+    pub write_through: bool,
+    pub preferred_sub_cluster: Option<String>,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutStartReq {
+    pub items: Vec<BatchPutStartItemReq>,
+}
+impl MsgPackSerializePart for BatchPutStartReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPutStartReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutStartItemResp {
+    pub put_id: PutIDForAKey,
+    pub node_id: NodeIDString,
+    pub target_addr: u64,
+    pub src_addr: u64,
+    pub target_base_addr: u64,
+    pub src_base_addr: u64,
+    pub len: u64,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutStartResp {
+    pub items: Vec<BatchPutStartItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for BatchPutStartResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPutStartResp as u32
+    }
+}
+impl RPCReq for BatchPutStartReq {
+    type Resp = BatchPutStartResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutRevokeItemReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutRevokeReq {
+    pub items: Vec<BatchPutRevokeItemReq>,
+}
+impl MsgPackSerializePart for BatchPutRevokeReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPutRevokeReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutRevokeItemResp {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutRevokeResp {
+    pub items: Vec<BatchPutRevokeItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for BatchPutRevokeResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPutRevokeResp as u32
+    }
+}
+impl RPCReq for BatchPutRevokeReq {
+    type Resp = BatchPutRevokeResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutDoneItemReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub lease_id: Option<u64>,
+    pub committed_slot: Option<PutDoneCommittedSlot>,
+    pub publish_local_cache: bool,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutDoneReq {
+    pub items: Vec<BatchPutDoneItemReq>,
+}
+impl MsgPackSerializePart for BatchPutDoneReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPutDoneReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutDoneItemResp {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub local_cache_holder_id: Option<u64>,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutDoneResp {
+    pub items: Vec<BatchPutDoneItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for BatchPutDoneResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPutDoneResp as u32
+    }
+}
+impl RPCReq for BatchPutDoneReq {
+    type Resp = BatchPutDoneResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct PutAppendStartReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub len: u64,
+    pub preferred_sub_cluster: Option<String>,
+}
+impl MsgPackSerializePart for PutAppendStartReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::PutAppendStartReq as u32
+    }
+}
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct PutAppendStartResp {
+    pub scheduled: bool,
+    pub node_id: NodeIDString,
+    pub target_addr: u64,
+    pub target_base_addr: u64,
+    pub len: u64,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for PutAppendStartResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::PutAppendStartResp as u32
+    }
+}
+impl RPCReq for PutAppendStartReq {
+    type Resp = PutAppendStartResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct PutAppendRevokeReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+}
+impl MsgPackSerializePart for PutAppendRevokeReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::PutAppendRevokeReq as u32
+    }
+}
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct PutAppendRevokeResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for PutAppendRevokeResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::PutAppendRevokeResp as u32
+    }
+}
+impl RPCReq for PutAppendRevokeReq {
+    type Resp = PutAppendRevokeResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct PutAppendDoneReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+}
+impl MsgPackSerializePart for PutAppendDoneReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::PutAppendDoneReq as u32
+    }
+}
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct PutAppendDoneResp {
+    pub appended: bool,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for PutAppendDoneResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::PutAppendDoneResp as u32
+    }
+}
+impl RPCReq for PutAppendDoneReq {
+    type Resp = PutAppendDoneResp;
 }
 
 // --- RPC for MemHolder KeepAlive ---
@@ -412,6 +862,31 @@ impl MsgPackSerializePart for GetMetaResp {
 }
 impl RPCReq for GetMetaReq {
     type Resp = GetMetaResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchIsExistReq {
+    pub keys: Vec<String>,
+}
+impl MsgPackSerializePart for BatchIsExistReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchIsExistReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchIsExistResp {
+    pub exists_list: Vec<bool>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for BatchIsExistResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchIsExistResp as u32
+    }
+}
+impl RPCReq for BatchIsExistReq {
+    type Resp = BatchIsExistResp;
 }
 
 // --- RPC for Batch Delete Client KV Meta Cache ---

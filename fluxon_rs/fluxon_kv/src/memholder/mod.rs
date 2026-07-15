@@ -24,6 +24,16 @@ use crate::{cluster_manager::NodeID, external_client_api::ExternalClientApiView}
 
 use bitcode::{Decode, Encode};
 
+#[derive(Clone, Debug)]
+pub enum MemoryInfoDropAction {
+    OwnerDeleteAck,
+    ReleaseLocalReserveResidentSlot {
+        slot_size: u64,
+        grant_id: u64,
+        slot_index: u32,
+    },
+}
+
 /// Memory metadata for owner/client user holders
 #[derive(Clone)]
 pub struct MemoryInfo {
@@ -35,6 +45,7 @@ pub struct MemoryInfo {
     pub key: String,
     pub master_node_id: NodeID,
     pub view: ClientKvApiView,
+    pub drop_action: MemoryInfoDropAction,
 }
 
 impl std::fmt::Debug for MemoryInfo {
@@ -46,6 +57,7 @@ impl std::fmt::Debug for MemoryInfo {
             .field("holder_id", &self.holder_id)
             .field("key", &self.key)
             .field("master_node_id", &self.master_node_id)
+            .field("drop_action", &self.drop_action)
             .finish()
     }
 }
@@ -159,8 +171,50 @@ impl MemoryInfo {
             key,
             master_node_id,
             view,
+            drop_action: MemoryInfoDropAction::OwnerDeleteAck,
         }
     }
+
+    pub async fn new_local_reserve_resident(
+        addr: u64,
+        len: u32,
+        key: String,
+        master_node_id: NodeID,
+        view: ClientKvApiView,
+        slot_size: u64,
+        grant_id: u64,
+        slot_index: u32,
+    ) -> Self {
+        let base_addr = {
+            let base_guard = view
+                .client_seg_pool()
+                .cpu_mem_read_guard()
+                .await
+                .expect("segment cpu mem must be available when creating resident MemoryInfo");
+            base_guard.allocated_addr
+        };
+        assert!(
+            addr >= base_addr,
+            "resident local reserve addr must be within client segment: addr={:#x} base_addr={:#x}",
+            addr,
+            base_addr
+        );
+        Self {
+            offset: addr - base_addr,
+            addr,
+            len,
+            holder_id: 0,
+            key,
+            master_node_id,
+            view,
+            drop_action: MemoryInfoDropAction::ReleaseLocalReserveResidentSlot {
+                slot_size,
+                grant_id,
+                slot_index,
+            },
+        }
+    }
+
     pub fn bytes(&self) -> &[u8] {
         tracing::debug!(
             "MemHolder accessing memory: addr={:#x}, len={}",
@@ -169,16 +223,62 @@ impl MemoryInfo {
         );
         unsafe { std::slice::from_raw_parts(self.addr as *const u8, self.len as usize) }
     }
+
+    pub fn local_reserve_resident_slot_ref(&self) -> Option<(u64, u64, u32)> {
+        match self.drop_action {
+            MemoryInfoDropAction::ReleaseLocalReserveResidentSlot {
+                slot_size,
+                grant_id,
+                slot_index,
+            } => Some((slot_size, grant_id, slot_index)),
+            MemoryInfoDropAction::OwnerDeleteAck => None,
+        }
+    }
 }
+
 /// Represents a memory holder that keeps a reference to transferred data
 impl Drop for MemoryInfo {
     fn drop(&mut self) {
-        let ctx = OwnerDeleteAckCtx {
-            view: self.view.clone(),
-            key: self.key.clone(),
-            holder_id: self.holder_id,
-        };
-        ctx.run_drop_ack();
+        match &self.drop_action {
+            MemoryInfoDropAction::OwnerDeleteAck => {
+                let ctx = OwnerDeleteAckCtx {
+                    view: self.view.clone(),
+                    key: self.key.clone(),
+                    holder_id: self.holder_id,
+                };
+                ctx.run_drop_ack();
+            }
+            MemoryInfoDropAction::ReleaseLocalReserveResidentSlot {
+                slot_size,
+                grant_id,
+                slot_index,
+            } => {
+                let spawn_view = self.view.clone();
+                let release_view = self.view.clone();
+                let key = self.key.clone();
+                let slot_size = *slot_size;
+                let grant_id = *grant_id;
+                let slot_index = *slot_index;
+                let _ = spawn_view.spawn("resident_local_reserve_slot_release", async move {
+                    if let Err(err) = release_view
+                        .client_kv_api()
+                        .inner()
+                        .owner_release_local_reserve_resident_slot_holder(
+                            slot_size, grant_id, slot_index,
+                        )
+                    {
+                        tracing::warn!(
+                            "failed to release resident local reserve slot holder on MemoryInfo drop: key={} slot_size={} grant_id={} slot_index={} err={}",
+                            key,
+                            slot_size,
+                            grant_id,
+                            slot_index,
+                            err
+                        );
+                    }
+                });
+            }
+        }
     }
 }
 

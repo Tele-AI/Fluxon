@@ -59,9 +59,17 @@ print(
 }
 
 fn render_log_shard_helper(repo_root: &Path) -> String {
-    let helper_path = repo_root.join("deployment").join("utils").join("log_shard.py");
-    fs::read_to_string(&helper_path)
-        .unwrap_or_else(|e| panic!("read log shard helper failed: {} ({})", helper_path.display(), e))
+    let helper_path = repo_root
+        .join("deployment")
+        .join("utils")
+        .join("log_shard.py");
+    fs::read_to_string(&helper_path).unwrap_or_else(|e| {
+        panic!(
+            "read log shard helper failed: {} ({})",
+            helper_path.display(),
+            e
+        )
+    })
 }
 
 fn main() {
@@ -87,6 +95,10 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
-        repo_root.join("deployment").join("utils").join("log_shard.py").display()
+        repo_root
+            .join("deployment")
+            .join("utils")
+            .join("log_shard.py")
+            .display()
     );
 }

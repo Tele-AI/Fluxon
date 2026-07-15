@@ -26,6 +26,8 @@ pub struct MetricsHandle {
 
     // Pending put stats captured at put_start to attribute external-owner path at put_end.
     pending_put_stats: DashMap<PutIDForAKey, PendingPutStat>,
+
+    locality_counters: KvLocalityCounters,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +45,7 @@ pub struct PendingPutStat {
     pub transfer_poll_wait_us: i64,
     pub transfer_poll_iters: i64,
     pub transfer_used_fast_path: bool,
+    pub transfer_used_nixl: bool,
     pub transfer_local_noop: bool,
     pub transfer_remote_transfer: bool,
     pub top_emitted: bool,
@@ -52,6 +55,85 @@ pub struct PendingPutStat {
 pub enum OperationKind {
     Put,
     Get,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct KvIoLocalitySnapshot {
+    pub op_count: u64,
+    pub bytes: u64,
+    pub transfer_us: u64,
+}
+
+impl KvIoLocalitySnapshot {
+    pub fn bandwidth_gbps(&self) -> f64 {
+        if self.transfer_us == 0 {
+            return 0.0;
+        }
+        (self.bytes as f64) / (self.transfer_us as f64 / 1_000_000.0) / 1_000_000_000.0
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct KvLocalitySnapshot {
+    pub l2_local_hit_pages: u64,
+    pub l2_local_hit_bytes: u64,
+    pub l2_remote_hit_pages: u64,
+    pub l2_remote_hit_bytes: u64,
+    pub put_local: KvIoLocalitySnapshot,
+    pub put_remote: KvIoLocalitySnapshot,
+    pub get_local: KvIoLocalitySnapshot,
+    pub get_remote: KvIoLocalitySnapshot,
+}
+
+#[derive(Default)]
+struct KvLocalityCounters {
+    l2_local_hit_pages: AtomicU64,
+    l2_local_hit_bytes: AtomicU64,
+    l2_remote_hit_pages: AtomicU64,
+    l2_remote_hit_bytes: AtomicU64,
+    put_local_ops: AtomicU64,
+    put_local_bytes: AtomicU64,
+    put_local_transfer_us: AtomicU64,
+    put_remote_ops: AtomicU64,
+    put_remote_bytes: AtomicU64,
+    put_remote_transfer_us: AtomicU64,
+    get_local_ops: AtomicU64,
+    get_local_bytes: AtomicU64,
+    get_local_transfer_us: AtomicU64,
+    get_remote_ops: AtomicU64,
+    get_remote_bytes: AtomicU64,
+    get_remote_transfer_us: AtomicU64,
+}
+
+impl KvLocalityCounters {
+    fn snapshot(&self) -> KvLocalitySnapshot {
+        KvLocalitySnapshot {
+            l2_local_hit_pages: self.l2_local_hit_pages.load(Ordering::Relaxed),
+            l2_local_hit_bytes: self.l2_local_hit_bytes.load(Ordering::Relaxed),
+            l2_remote_hit_pages: self.l2_remote_hit_pages.load(Ordering::Relaxed),
+            l2_remote_hit_bytes: self.l2_remote_hit_bytes.load(Ordering::Relaxed),
+            put_local: KvIoLocalitySnapshot {
+                op_count: self.put_local_ops.load(Ordering::Relaxed),
+                bytes: self.put_local_bytes.load(Ordering::Relaxed),
+                transfer_us: self.put_local_transfer_us.load(Ordering::Relaxed),
+            },
+            put_remote: KvIoLocalitySnapshot {
+                op_count: self.put_remote_ops.load(Ordering::Relaxed),
+                bytes: self.put_remote_bytes.load(Ordering::Relaxed),
+                transfer_us: self.put_remote_transfer_us.load(Ordering::Relaxed),
+            },
+            get_local: KvIoLocalitySnapshot {
+                op_count: self.get_local_ops.load(Ordering::Relaxed),
+                bytes: self.get_local_bytes.load(Ordering::Relaxed),
+                transfer_us: self.get_local_transfer_us.load(Ordering::Relaxed),
+            },
+            get_remote: KvIoLocalitySnapshot {
+                op_count: self.get_remote_ops.load(Ordering::Relaxed),
+                bytes: self.get_remote_bytes.load(Ordering::Relaxed),
+                transfer_us: self.get_remote_transfer_us.load(Ordering::Relaxed),
+            },
+        }
+    }
 }
 
 impl OperationKind {
@@ -147,6 +229,7 @@ impl MetricsHandle {
             get_metrics_queue: SegQueue::new(),
             latest_metrics_snapshot: RwLock::new(HashMap::new()),
             pending_put_stats: DashMap::new(),
+            locality_counters: KvLocalityCounters::default(),
         }
     }
 
@@ -181,6 +264,78 @@ impl MetricsHandle {
                 tracing::warn!("failed to read latest_metrics_snapshot");
                 HashMap::new()
             }
+        }
+    }
+
+    pub fn get_locality_snapshot(&self) -> KvLocalitySnapshot {
+        self.locality_counters.snapshot()
+    }
+
+    pub fn record_l2_hit_locality(&self, remote: bool, bytes: u64) {
+        if remote {
+            self.locality_counters
+                .l2_remote_hit_pages
+                .fetch_add(1, Ordering::Relaxed);
+            self.locality_counters
+                .l2_remote_hit_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        } else {
+            self.locality_counters
+                .l2_local_hit_pages
+                .fetch_add(1, Ordering::Relaxed);
+            self.locality_counters
+                .l2_local_hit_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_put_io_locality(&self, remote: bool, bytes: u64, transfer_us: i64) {
+        let transfer_us = transfer_us.max(0) as u64;
+        if remote {
+            self.locality_counters
+                .put_remote_ops
+                .fetch_add(1, Ordering::Relaxed);
+            self.locality_counters
+                .put_remote_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            self.locality_counters
+                .put_remote_transfer_us
+                .fetch_add(transfer_us, Ordering::Relaxed);
+        } else {
+            self.locality_counters
+                .put_local_ops
+                .fetch_add(1, Ordering::Relaxed);
+            self.locality_counters
+                .put_local_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            self.locality_counters
+                .put_local_transfer_us
+                .fetch_add(transfer_us, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_get_io_locality(&self, remote: bool, bytes: u64, transfer_us: i64) {
+        let transfer_us = transfer_us.max(0) as u64;
+        if remote {
+            self.locality_counters
+                .get_remote_ops
+                .fetch_add(1, Ordering::Relaxed);
+            self.locality_counters
+                .get_remote_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            self.locality_counters
+                .get_remote_transfer_us
+                .fetch_add(transfer_us, Ordering::Relaxed);
+        } else {
+            self.locality_counters
+                .get_local_ops
+                .fetch_add(1, Ordering::Relaxed);
+            self.locality_counters
+                .get_local_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            self.locality_counters
+                .get_local_transfer_us
+                .fetch_add(transfer_us, Ordering::Relaxed);
         }
     }
 
@@ -250,6 +405,39 @@ impl MetricsHandle {
             device: device.to_string(),
             bytes,
         });
+    }
+
+    pub fn set_kv_holding_entries(&self, scope: &str, entries: u64) {
+        let _ = (scope, entries);
+    }
+
+    pub fn set_kv_holding_bytes(&self, scope: &str, bytes: u64) {
+        let _ = (scope, bytes);
+    }
+
+    pub fn set_kv_external_pending_put_entries(&self, entries: u64) {
+        let _ = entries;
+    }
+
+    pub fn set_kv_replica_cache_entries(&self, owner_node: &str, entries: u64) {
+        let _ = (owner_node, entries);
+    }
+
+    pub fn set_kv_replica_cache_weighted_bytes(&self, owner_node: &str, bytes: u64) {
+        let _ = (owner_node, bytes);
+    }
+
+    pub fn set_kv_replica_cache_capacity_bytes(
+        &self,
+        owner_node: &str,
+        capacity_kind: &str,
+        bytes: u64,
+    ) {
+        let _ = (owner_node, capacity_kind, bytes);
+    }
+
+    pub fn inc_kv_get_done_allocation(&self, allocation_mode: &str) {
+        let _ = allocation_mode;
     }
 
     pub fn set_fs_mount_fs_bytes(
@@ -333,6 +521,7 @@ impl MetricsHandle {
             transfer_poll_wait_us,
             transfer_poll_iters,
             transfer_used_fast_path,
+            transfer_used_nixl,
             transfer_local_noop,
             transfer_remote_transfer,
         } = &metric
@@ -356,7 +545,7 @@ impl MetricsHandle {
 
             if let Some(seq) = sampled_debug_seq(&PUT_METRIC_SUBMIT_SEQ) {
                 tracing::debug!(
-                    "submit kv op metric seq={} kind=put put_id={} key={} whole_us={} start_us={} transfer_us={} end_us={} rpc_us={} start_handle_us={} end_handle_us={} t1_us={} t2_us={} t3_us={} t4_us={} transfer_submit_blocking_us={} transfer_create_xfer_req_us={} transfer_post_xfer_req_us={} transfer_poll_wait_us={} transfer_poll_iters={} transfer_used_fast_path={} transfer_local_noop={} transfer_remote_transfer={}",
+                    "submit kv op metric seq={} kind=put put_id={} key={} whole_us={} start_us={} transfer_us={} end_us={} rpc_us={} start_handle_us={} end_handle_us={} t1_us={} t2_us={} t3_us={} t4_us={} transfer_submit_blocking_us={} transfer_create_xfer_req_us={} transfer_post_xfer_req_us={} transfer_poll_wait_us={} transfer_poll_iters={} transfer_used_fast_path={} transfer_used_nixl={} transfer_local_noop={} transfer_remote_transfer={}",
                     seq,
                     put_id,
                     sanitize_key(key),
@@ -377,6 +566,7 @@ impl MetricsHandle {
                     transfer_poll_wait_us,
                     transfer_poll_iters,
                     transfer_used_fast_path,
+                    transfer_used_nixl,
                     transfer_local_noop,
                     transfer_remote_transfer
                 );
@@ -537,6 +727,7 @@ impl MetricsHandle {
                 transfer_poll_wait_us: 0,
                 transfer_poll_iters: 0,
                 transfer_used_fast_path: false,
+                transfer_used_nixl: false,
                 transfer_local_noop: false,
                 transfer_remote_transfer: false,
                 top_emitted: false,
@@ -580,6 +771,7 @@ impl MetricsHandle {
         transfer_poll_wait_us: i64,
         transfer_poll_iters: i64,
         transfer_used_fast_path: bool,
+        transfer_used_nixl: bool,
         transfer_local_noop: bool,
         transfer_remote_transfer: bool,
     ) {
@@ -593,6 +785,7 @@ impl MetricsHandle {
             guard.transfer_poll_wait_us = transfer_poll_wait_us;
             guard.transfer_poll_iters = transfer_poll_iters;
             guard.transfer_used_fast_path = transfer_used_fast_path;
+            guard.transfer_used_nixl = transfer_used_nixl;
             guard.transfer_local_noop = transfer_local_noop;
             guard.transfer_remote_transfer = transfer_remote_transfer;
         }

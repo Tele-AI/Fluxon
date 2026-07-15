@@ -1,23 +1,31 @@
 use super::{
-    InflightGetInfo, KvRouteInfo, MasterKvRouterView, NodeValueReplicaDesc, OwnerHoldingGetInfo,
     msg_pack::{
-        GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetMetaResp, GetRevokeReq,
-        GetRevokeResp, GetStartReq, GetStartResp,
+        BatchGetDoneItemResp, BatchGetDoneReq, BatchGetDoneResp, BatchGetRevokeItemResp,
+        BatchGetRevokeReq, BatchGetRevokeResp, BatchGetStartItemResp, BatchGetStartReq,
+        BatchGetStartResp, BatchIsExistReq, BatchIsExistResp, GetAllocationMode, GetDoneReq,
+        GetDoneResp, GetMetaReq, GetMetaResp, GetRevokeReq, GetRevokeResp, GetStartReq,
+        GetStartResp, MemHolderKeepAliveReq, MemHolderKeepAliveResp, MemHolderReleaseReq,
+        MemHolderReleaseResp,
     },
+    InflightGetInfo, KvRouteInfo, MasterKvRouterView, NodeValueReplicaDesc, OwnerHoldingGetInfo,
 };
-use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::put::PutIDForAKey;
+use crate::master_kv_router::OneKvNodesRoutes;
 use crate::memholder::MemholderManagerTrait;
 use crate::{
-    cluster_manager::NodeID, master_seg_manager::one_seg_allocator::Allocation,
-    p2p::msg_pack::MsgPack, rpcresp_kvresult_convert::msg_and_error,
+    cluster_manager::NodeID,
+    master_seg_manager::{one_seg_allocator::Allocation, MasterSegManagerAccessTrait},
+    p2p::msg_pack::MsgPack,
+    rpcresp_kvresult_convert::msg_and_error::{self, kv},
 };
-use rand::Rng;
+use dashmap::DashMap;
+use limit_thirdparty::tokio;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use std::collections::HashSet;
 use std::{
     collections::HashMap,
-    sync::{Arc, atomic::Ordering},
+    sync::{atomic::Ordering, Arc},
 };
 
 fn update_moka_for_node(
@@ -32,7 +40,7 @@ fn update_moka_for_node(
         return;
     }
     let view_task = view.clone();
-    let _ = view.spawn("update_moka_for_node", async move {
+    view.spawn("update_moka_for_node", async move {
         if let Some(cache) = view_task
             .master_kv_router()
             .get_node_cache_controller(&node_id)
@@ -66,6 +74,14 @@ fn update_moka_for_node(
             );
         }
     });
+}
+
+fn one_kv_routes_has_live_replica(one_kv_nodes_routes: &OneKvNodesRoutes) -> bool {
+    one_kv_nodes_routes
+        .nodes_replicas
+        .read()
+        .values()
+        .any(|kv_info| !kv_info.tomb_tag.is_tomb())
 }
 
 pub async fn handle_get_start(
@@ -153,15 +169,17 @@ pub async fn handle_get_start(
             tombs.insert(selected_replica_key.to_owned());
             continue;
         }
-        let src_allocation = selected_replica.allocation.clone();
         let src_node_id = selected_replica.node_id.clone();
+        let src_len = selected_replica.backing.len();
+        let src_abs_addr = selected_replica.backing.abs_addr();
+        let src_base = selected_replica.backing.base_addr();
 
-        // 为get调用方分配接收内存作为传输target
-        if target_allocations.is_none() {
-            target_allocations = if let Some(replica_on_recv_node) = replicas.get(&req_node_id) {
-                allocation_mode = GetAllocationMode::ReuseReplica;
-                Some(replica_on_recv_node.allocation.clone())
-            } else {
+        // For committed-slot replicas on the requester node, we still allocate a
+        // normal target buffer here instead of reusing the committed slot as a
+        // MemHolder backing. That keeps the existing get-path carrier stable
+        // and avoids the old None->unwrap panic.
+        let mut allocate_request_target =
+            || -> Result<Arc<Allocation>, (u64, MsgPack<GetStartResp>)> {
                 let target_allocation = {
                     let req_node_allocators =
                         view.master_seg_manager().get_node_allocators(&req_node_id);
@@ -173,12 +191,12 @@ pub async fn handle_get_start(
                         let err = msg_and_error::KvError::Unreachable(
                             msg_and_error::UnreachableError::OwnerNoSeg { detail: "config=0 initializes as external; non-zero initializes as owner; the owner must have memory space (segment)".to_string() }
                         );
-                        return failed_resp_err(
+                        return Err(failed_resp_err(
                             err,
-                            Some((tombs, one_kv_nodes_routes.put_id)),
+                            Some((tombs.clone(), one_kv_nodes_routes.put_id)),
                             &view,
                             &req.serialize_part.key,
-                        );
+                        ));
                     }
 
                     let target_allocator =
@@ -186,7 +204,7 @@ pub async fn handle_get_start(
 
                     let mut allocated_addr: Option<Allocation> = None;
                     for attempt in 1..=3 {
-                        if let Ok(allocation) = target_allocator.allocate(src_allocation.size()) {
+                        if let Ok(allocation) = target_allocator.allocate(src_len) {
                             allocated_addr = Some(allocation);
                             break;
                         } else {
@@ -208,12 +226,12 @@ pub async fn handle_get_start(
                             total_capacity: total,
                             free_capacity: free,
                         });
-                        return failed_resp_err(
+                        return Err(failed_resp_err(
                             err,
-                            Some((tombs, one_kv_nodes_routes.put_id)),
+                            Some((tombs.clone(), one_kv_nodes_routes.put_id)),
                             &view,
                             &req.serialize_part.key,
-                        );
+                        ));
                     }
                     allocated_addr.unwrap()
                 };
@@ -222,15 +240,38 @@ pub async fn handle_get_start(
                 } else {
                     allocation_mode = GetAllocationMode::Temporary;
                 }
-                Some(Arc::new(target_allocation))
+                Ok(Arc::new(target_allocation))
             };
+
+        // 为get调用方分配接收内存作为传输target
+        if target_allocations.is_none() {
+            target_allocations = Some(
+                if let Some(replica_on_recv_node) = replicas.get(&req_node_id) {
+                    match &replica_on_recv_node.backing {
+                        super::KvReplicaBacking::Allocation(allocation) => {
+                            allocation_mode = GetAllocationMode::ReuseReplica;
+                            allocation.clone()
+                        }
+                        super::KvReplicaBacking::CommittedSlot(_) => {
+                            match allocate_request_target() {
+                                Ok(allocation) => allocation,
+                                Err(resp) => return resp,
+                            }
+                        }
+                    }
+                } else {
+                    match allocate_request_target() {
+                        Ok(allocation) => allocation,
+                        Err(resp) => return resp,
+                    }
+                },
+            );
         }
 
         let target_allocation = target_allocations.unwrap();
 
         // Convert to absolute addresses for Mooncake (requires absolute)
         // Use allocation's allocator base directly
-        let src_base = src_allocation.base_addr();
         let target_base = target_allocation.base_addr();
 
         // If we reuse existing target on requesting node, declare src=target on req node
@@ -242,7 +283,7 @@ pub async fn handle_get_start(
             } else {
                 (
                     src_node_id.clone(),
-                    src_base + src_allocation.addr(),
+                    src_abs_addr,
                     target_base + target_allocation.addr(),
                     src_base,
                     target_base,
@@ -257,7 +298,7 @@ pub async fn handle_get_start(
             target_addr: resp_target_addr,
             src_base_addr: resp_src_base,
             target_base_addr: resp_target_base,
-            len: src_allocation.size(),
+            len: src_len,
             error_code: msg_and_error::OK,
             error_json: String::new(),
             server_process_us: 0,
@@ -268,7 +309,7 @@ pub async fn handle_get_start(
             src_node_id: src_node_id.clone(),
             key: req.serialize_part.key.clone(),
             req_node_id,
-            len: src_allocation.size(),
+            len: src_len,
             allocation: target_allocation, // 存储target allocation
             route: one_kv_nodes_routes.clone(),
             allocation_mode,
@@ -411,7 +452,9 @@ pub async fn handle_get_done(
                                 inflight_info.req_node_id.clone(),
                                 KvRouteInfo {
                                     node_id: inflight_info.req_node_id,
-                                    allocation: inflight_info.allocation,
+                                    backing: super::KvReplicaBacking::Allocation(
+                                        inflight_info.allocation,
+                                    ),
                                     tomb_tag,
                                 },
                             );
@@ -490,6 +533,15 @@ pub async fn handle_get_done(
             get_id,
             holder_id
         );
+        view.master_kv_router()
+            .view()
+            .metric_reporter()
+            .metrics()
+            .inc_kv_get_done_allocation(match allocation_mode {
+                GetAllocationMode::Temporary => "temporary",
+                GetAllocationMode::ReuseReplica => "reuse_replica",
+                GetAllocationMode::DurableReplica => "durable_replica",
+            });
 
         MsgPack {
             serialize_part: GetDoneResp {
@@ -621,7 +673,7 @@ pub async fn handle_get_meta(
             if kv_info.tomb_tag.is_tomb() {
                 continue;
             }
-            let len = kv_info.allocation.size();
+            let len = kv_info.backing.len();
             return MsgPack {
                 serialize_part: GetMetaResp {
                     exists: true,
@@ -682,5 +734,145 @@ pub async fn handle_get_meta(
                 raw_bytes: Vec::new(),
             }
         }
+    }
+}
+
+pub async fn handle_batch_is_exist(
+    view: MasterKvRouterView,
+    req: MsgPack<BatchIsExistReq>,
+    _req_node_id: NodeID,
+) -> MsgPack<BatchIsExistResp> {
+    tracing::debug!(
+        "Handling BatchIsExistReq: batch_len={}",
+        req.serialize_part.keys.len()
+    );
+
+    let mut exists_list = Vec::with_capacity(req.serialize_part.keys.len());
+
+    {
+        let _guard = view.master_kv_router().inner().route_lifetime_lock.lock();
+        for key in &req.serialize_part.keys {
+            if let Some(one_kv_nodes_routes) = view.master_kv_router().inner().kv_routes.get(key) {
+                let exists = one_kv_routes_has_live_replica(&one_kv_nodes_routes);
+                exists_list.push(exists);
+            } else {
+                exists_list.push(false);
+            }
+        }
+    }
+
+    MsgPack {
+        serialize_part: BatchIsExistResp {
+            exists_list,
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+        },
+        raw_bytes: Vec::new(),
+    }
+}
+
+pub async fn handle_batch_get_start(
+    view: MasterKvRouterView,
+    req: MsgPack<BatchGetStartReq>,
+    req_node_id: NodeID,
+) -> MsgPack<BatchGetStartResp> {
+    let mut items = Vec::with_capacity(req.serialize_part.keys.len());
+    for key in req.serialize_part.keys {
+        let (_get_id, resp) = handle_get_start(
+            view.clone(),
+            MsgPack {
+                serialize_part: GetStartReq { key },
+                raw_bytes: Vec::new(),
+            },
+            req_node_id.clone(),
+        )
+        .await;
+        let part = resp.serialize_part;
+        items.push(BatchGetStartItemResp {
+            get_id: part.get_id,
+            node_id: part.node_id,
+            put_id: part.put_id,
+            target_addr: part.target_addr,
+            src_addr: part.src_addr,
+            target_base_addr: part.target_base_addr,
+            src_base_addr: part.src_base_addr,
+            len: part.len,
+            error_code: part.error_code,
+            error_json: part.error_json,
+        });
+    }
+    MsgPack {
+        serialize_part: BatchGetStartResp {
+            items,
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+            server_process_us: 0,
+        },
+        raw_bytes: Vec::new(),
+    }
+}
+
+pub async fn handle_batch_get_revoke(
+    view: MasterKvRouterView,
+    req: MsgPack<BatchGetRevokeReq>,
+) -> MsgPack<BatchGetRevokeResp> {
+    let mut items = Vec::with_capacity(req.serialize_part.get_ids.len());
+    for get_id in req.serialize_part.get_ids {
+        let resp = handle_get_revoke(
+            view.clone(),
+            MsgPack {
+                serialize_part: GetRevokeReq { get_id },
+                raw_bytes: Vec::new(),
+            },
+        )
+        .await;
+        let part = resp.serialize_part;
+        items.push(BatchGetRevokeItemResp {
+            get_id,
+            error_code: part.error_code,
+            error_json: part.error_json,
+        });
+    }
+    MsgPack {
+        serialize_part: BatchGetRevokeResp {
+            items,
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+        },
+        raw_bytes: Vec::new(),
+    }
+}
+
+pub async fn handle_batch_get_done(
+    view: MasterKvRouterView,
+    req: MsgPack<BatchGetDoneReq>,
+) -> MsgPack<BatchGetDoneResp> {
+    let mut items = Vec::with_capacity(req.serialize_part.get_ids.len());
+    for get_id in req.serialize_part.get_ids {
+        let resp = handle_get_done(
+            view.clone(),
+            MsgPack {
+                serialize_part: GetDoneReq { get_id },
+                raw_bytes: Vec::new(),
+            },
+        )
+        .await;
+        let part = resp.serialize_part;
+        items.push(BatchGetDoneItemResp {
+            get_id,
+            holder_id: part.holder_id,
+            allocation_mode: part.allocation_mode,
+            error_code: part.error_code,
+            error_json: part.error_json,
+        });
+    }
+    MsgPack {
+        serialize_part: BatchGetDoneResp {
+            items,
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+            server_process_us: 0,
+        },
+        raw_bytes: Vec::new(),
     }
 }

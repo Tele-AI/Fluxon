@@ -1408,13 +1408,24 @@ impl FluxonFsAgent {
             .id
             .to_string();
         let cache_root_base = if self.kv_framework.is_external_mode() {
-            self.kv_framework
+            let shared_file_path = self
+                .kv_framework
                 .external_client_api_view()
                 .external_client_api()
                 .inner()
-                .large_file_paths()
-                .fs_disk_cache_base_dir()
-                .map_err(|err| format!("invalid external large_file_paths: {}", err))?
+                .shared_file_path();
+            if shared_file_path.is_empty() {
+                return Err("external shared_file_path is empty".to_string());
+            }
+            let cache_root = Path::new(&shared_file_path).join("fluxon_fs_disk_cache");
+            fs::create_dir_all(&cache_root).map_err(|err| {
+                format!(
+                    "invalid external shared_file_path for fluxon fs disk cache: {} ({})",
+                    cache_root.display(),
+                    err
+                )
+            })?;
+            cache_root
         } else {
             self.kv_framework
                 .client_seg_pool_view()

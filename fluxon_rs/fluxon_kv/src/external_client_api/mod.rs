@@ -1,19 +1,28 @@
-use crate::SharedJsonMeta;
+use crate::client_kv_api::external_api::{
+    compute_external_get_start_transfer_prefix, normalize_external_get_start_group_lens,
+};
 use crate::client_kv_api::msg_pack::{
-    ExternalInvalidateWeakIndexReq, ExternalInvalidateWeakIndexResp,
+    ExternalInvalidateWeakIndexItem, ExternalInvalidateWeakIndexReq,
+    ExternalInvalidateWeakIndexResp,
 };
 use crate::client_seg_pool::{ClientSegPool, SideTransferPeerFileMeta};
-use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::cluster_manager::{
     META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME,
 };
 use crate::rpcresp_kvresult_convert::ToResult;
+use crate::SharedJsonMeta;
 use crate::{
     client_kv_api::msg_pack::{
-        ExternalDeleteAckReq, ExternalDeleteReq, ExternalGetReq, ExternalIsExistReq,
-        ExternalPutCommitReq, ExternalPutCommitResp, ExternalPutStartReq, ExternalPutStartResp,
-        ExternalPutTransferEndReq, ExternalPutTransferEndResp, SyncKvToFileReq, SyncKvToFileResp,
-        TestPutPhaseTrace,
+        ExternalBatchGetCancelReq, ExternalBatchGetReq, ExternalBatchGetStartReq,
+        ExternalBatchGetStartResp, ExternalBatchGetTransferReq, ExternalBatchGetTransferResp,
+        ExternalBatchIsExistReq, ExternalBatchPutCommitItemReq, ExternalBatchPutCommitReq,
+        ExternalBatchPutCommitResp, ExternalBatchPutStartItemReq, ExternalBatchPutStartReq,
+        ExternalBatchPutStartResp, ExternalBatchPutTransferEndItemReq,
+        ExternalBatchPutTransferEndReq, ExternalBatchPutTransferEndResp, ExternalDeleteAckReq,
+        ExternalDeleteReq, ExternalGetReq, ExternalIsExistReq, ExternalObservabilitySnapshotReq,
+        ExternalPutCommitReq, ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp,
+        ExternalPutStartReq, ExternalPutStartResp, ExternalPutTransferEndReq,
+        ExternalPutTransferEndResp, SyncKvToFileReq, SyncKvToFileResp, TestPutPhaseTrace,
     },
     cluster_manager::{
         ClusterManager, ClusterManagerAccessTrait, IpcBandwidthAttributorHandle, NodeRole,
@@ -22,18 +31,18 @@ use crate::{
     memholder::ExternalMemHolder,
     p2p::{
         msg_pack::{MsgPack, RPCCaller, RPCHandler},
-        p2p_module::{P2pModule, P2pModuleAccessTrait},
+        p2p_module::{P2pModule, P2pModuleAccessTrait, RpcTransportPolicy},
     },
-    rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, SharedMemError},
+    rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, SharedMemError, OK},
 };
 use async_trait::async_trait;
 use core::panic;
 use dashmap::DashMap;
 use fluxon_commu::ShareGroupOwnerRef;
-use fluxon_framework::{LogicalModule, define_module};
+use fluxon_framework::{define_module, LogicalModule};
 use fluxon_observability::kv_metrics_actor::{ObserveComponent, ObserveDirection};
 use fluxon_util::semaphore_map::SemaphoreMap;
-use libc::{MAP_SHARED, PROT_READ, PROT_WRITE, mmap};
+use libc::{mmap, MAP_SHARED, PROT_READ, PROT_WRITE};
 use limit_thirdparty::tokio;
 use limit_thirdparty::tokio::sync::{ARwLock, Notify};
 use limit_thirdparty::tokio::time::sleep;
@@ -42,8 +51,8 @@ use std::{
     fs::File,
     // path::PathBuf, // 不再使用PathBuf
     sync::{
-        Arc, OnceLock, Weak,
         atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock, Weak,
     },
     time::{Duration, Instant},
 };
@@ -62,9 +71,18 @@ const EXTERNAL_PUT_START_RPC_TIMEOUT_SECS: u64 = 30;
 const EXTERNAL_PUT_TRANSFER_END_RPC_TIMEOUT_SECS: u64 = 30;
 const EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS: usize = 3;
 const EXTERNAL_PUT_TRACE_LOG_WINDOW_SECS: u64 = 10;
-const EXTERNAL_INIT_CONTROL_PLANE_READY_TIMEOUT_SECS: u64 = 30;
-const EXTERNAL_INIT_CONTROL_PLANE_READY_POLL_MS: u64 = 100;
-const EXTERNAL_INIT_CONTROL_PLANE_READY_CONSECUTIVE_SUCCESSES: usize = 2;
+
+#[derive(Debug, Clone)]
+pub struct ExternalClientGetStartResp {
+    pub handle: u64,
+    pub raw_prefix_hit_len: usize,
+}
+
+struct PendingExternalGetStart {
+    keys: Vec<String>,
+    transferable_len: usize,
+    first_miss_index: Option<usize>,
+}
 
 fn duration_to_i64_us(duration: std::time::Duration) -> i64 {
     duration.as_micros().min(i64::MAX as u128) as i64
@@ -195,9 +213,9 @@ struct SharedMemoryPtr {
     /// Length of the mapping in bytes
     len: u64,
     /// Base directory of the shared-memory bundle (used to locate shared.json/mmap.file)
-    _path: String,
+    path: String,
     /// Handle to the mmap backing file. Keeping the FD open is harmless and simplifies lifecycle.
-    _file: File,
+    file: File,
     /// Metadata signature read from shared.json for change detection.
     memory_signature: SharedMetaSignature,
 }
@@ -218,8 +236,8 @@ impl SharedMemoryPtr {
             ptr_rw,
             ptr_ro,
             len,
-            _path: path,
-            _file: file,
+            path,
+            file,
             memory_signature,
         }
     }
@@ -251,8 +269,8 @@ define_module!(
 /// External Client configuration parameters
 #[derive(Clone, Debug)]
 pub struct ExternalClientApiNewArg {
-    pub share_mem_path: String,
-    pub large_file_paths: crate::config::LargeFilePaths,
+    pub shared_memory_path: String,
+    pub shared_file_path: String,
     pub expected_cluster_name: String,
     pub expected_protocol_version: String,
     pub enable_side_transfer: bool,
@@ -310,24 +328,35 @@ pub struct ExternalInner {
     initial_sub_cluster: OnceLock<Option<String>>,
     expected_cluster_name: String,
     expected_protocol_version: String,
-    external_share_mem_path: String,
-    external_large_file_paths: crate::config::LargeFilePaths,
-    _enable_side_transfer: bool,
+    external_shared_memory_path: String,
+    external_shared_file_path: String,
+    enable_side_transfer: bool,
     short_circuit_put_payload_path: bool,
     side_rr_next: AtomicUsize,
     side_transfer_put_bindings: moka::sync::SegmentedCache<(u64, u32), (String, u16)>,
     rpc_caller_external_get: RPCCaller<ExternalGetReq>,
+    rpc_caller_external_batch_get: RPCCaller<ExternalBatchGetReq>,
+    rpc_caller_external_batch_get_start: RPCCaller<ExternalBatchGetStartReq>,
+    rpc_caller_external_batch_get_transfer: RPCCaller<ExternalBatchGetTransferReq>,
+    rpc_caller_external_batch_get_cancel: RPCCaller<ExternalBatchGetCancelReq>,
     rpc_caller_external_put_commit: RPCCaller<ExternalPutCommitReq>,
+    rpc_caller_external_batch_put_commit: RPCCaller<ExternalBatchPutCommitReq>,
     rpc_caller_external_put_start: RPCCaller<ExternalPutStartReq>,
+    rpc_caller_external_batch_put_start: RPCCaller<ExternalBatchPutStartReq>,
     rpc_caller_external_put_transfer_end: RPCCaller<ExternalPutTransferEndReq>,
+    rpc_caller_external_batch_put_transfer_end: RPCCaller<ExternalBatchPutTransferEndReq>,
     rpc_caller_external_delete: RPCCaller<ExternalDeleteReq>,
     rpc_caller_external_is_exist: RPCCaller<ExternalIsExistReq>,
+    rpc_caller_external_batch_is_exist: RPCCaller<ExternalBatchIsExistReq>,
+    rpc_caller_external_observability_snapshot: RPCCaller<ExternalObservabilitySnapshotReq>,
     rpc_caller_external_delete_ack: RPCCaller<ExternalDeleteAckReq>,
+    rpc_caller_external_put_revoke: RPCCaller<ExternalPutRevokeReq>,
     /// Lease RPC callers for external mode
-    _rpc_caller_allocate_client_lease: RPCCaller<AllocateClientLeaseReq>,
-    _rpc_caller_client_lease_keepalive: RPCCaller<ClientLeaseKeepaliveReq>,
+    rpc_caller_allocate_client_lease: RPCCaller<AllocateClientLeaseReq>,
+    rpc_caller_client_lease_keepalive: RPCCaller<ClientLeaseKeepaliveReq>,
     /// key -> Weak<ExternalMemHolder> index (dashmap-based)
     key_weak_memholder_index: DashMap<String, Weak<ExternalMemHolder>>,
+    pending_external_get_start: DashMap<u64, PendingExternalGetStart>,
     /// per-key semaphore (permits=1) to ensure single inflight per key
     inflight1_per_key: SemaphoreMap<String>,
     put_trace_log_window: Mutex<ExternalPutTraceLogWindow>,
@@ -350,7 +379,7 @@ impl ExternalClientApi {
     pub async fn construct(arg: ExternalClientApiNewArg) -> Result<Self, KvError> {
         tracing::info!(
             "Constructing ExternalClientApi in ExternalClient mode (PreView): shm_dir={}",
-            arg.share_mem_path
+            arg.shared_memory_path
         );
 
         Ok(Self(ExternalInner {
@@ -361,9 +390,9 @@ impl ExternalClientApi {
             initial_sub_cluster: OnceLock::new(),
             expected_cluster_name: arg.expected_cluster_name,
             expected_protocol_version: arg.expected_protocol_version,
-            external_share_mem_path: arg.share_mem_path,
-            external_large_file_paths: arg.large_file_paths,
-            _enable_side_transfer: arg.enable_side_transfer,
+            external_shared_memory_path: arg.shared_memory_path,
+            external_shared_file_path: arg.shared_file_path,
+            enable_side_transfer: arg.enable_side_transfer,
             short_circuit_put_payload_path: arg.short_circuit_put_payload_path,
             side_rr_next: AtomicUsize::new(0),
             side_transfer_put_bindings: moka::sync::Cache::builder()
@@ -371,15 +400,28 @@ impl ExternalClientApi {
                 .segments(16)
                 .build(),
             rpc_caller_external_get: RPCCaller::<ExternalGetReq>::new(),
+            rpc_caller_external_batch_get: RPCCaller::<ExternalBatchGetReq>::new(),
+            rpc_caller_external_batch_get_start: RPCCaller::<ExternalBatchGetStartReq>::new(),
+            rpc_caller_external_batch_get_transfer: RPCCaller::<ExternalBatchGetTransferReq>::new(),
+            rpc_caller_external_batch_get_cancel: RPCCaller::<ExternalBatchGetCancelReq>::new(),
             rpc_caller_external_put_commit: RPCCaller::<ExternalPutCommitReq>::new(),
+            rpc_caller_external_batch_put_commit: RPCCaller::<ExternalBatchPutCommitReq>::new(),
             rpc_caller_external_put_start: RPCCaller::<ExternalPutStartReq>::new(),
+            rpc_caller_external_batch_put_start: RPCCaller::<ExternalBatchPutStartReq>::new(),
             rpc_caller_external_put_transfer_end: RPCCaller::<ExternalPutTransferEndReq>::new(),
+            rpc_caller_external_batch_put_transfer_end:
+                RPCCaller::<ExternalBatchPutTransferEndReq>::new(),
             rpc_caller_external_delete: RPCCaller::<ExternalDeleteReq>::new(),
             rpc_caller_external_is_exist: RPCCaller::<ExternalIsExistReq>::new(),
+            rpc_caller_external_batch_is_exist: RPCCaller::<ExternalBatchIsExistReq>::new(),
+            rpc_caller_external_observability_snapshot:
+                RPCCaller::<ExternalObservabilitySnapshotReq>::new(),
             rpc_caller_external_delete_ack: RPCCaller::<ExternalDeleteAckReq>::new(),
-            _rpc_caller_allocate_client_lease: RPCCaller::<AllocateClientLeaseReq>::new(),
-            _rpc_caller_client_lease_keepalive: RPCCaller::<ClientLeaseKeepaliveReq>::new(),
+            rpc_caller_external_put_revoke: RPCCaller::<ExternalPutRevokeReq>::new(),
+            rpc_caller_allocate_client_lease: RPCCaller::<AllocateClientLeaseReq>::new(),
+            rpc_caller_client_lease_keepalive: RPCCaller::<ClientLeaseKeepaliveReq>::new(),
             key_weak_memholder_index: DashMap::new(),
+            pending_external_get_start: DashMap::new(),
             inflight1_per_key: SemaphoreMap::new(1, std::time::Duration::from_secs(120)),
             put_trace_log_window: Mutex::new(ExternalPutTraceLogWindow::new()),
         }))
@@ -403,7 +445,8 @@ impl ExternalClientApi {
             let wait_start_ts = i64::MIN;
             let OwnerRestartPayload { meta, signature } = task_wait_owner_restart(
                 ext.view.clone_view(),
-                ext.external_share_mem_path.clone(),
+                ext.external_shared_memory_path.clone(),
+                ext.external_shared_file_path.clone(),
                 None,
                 wait_start_ts,
                 None,
@@ -413,7 +456,7 @@ impl ExternalClientApi {
             .await?;
 
             let shared_memory_ptr = ExternalInner::init_shared_memory_from_meta(
-                &ext.external_share_mem_path,
+                &ext.external_shared_memory_path,
                 &meta,
                 signature,
             )?;
@@ -449,16 +492,36 @@ impl ExternalClientApi {
         // Owner binding (current_owner) is already established by the init resource
         // `owner_shared_mem_bundle_ready`, so handler registration is safe here.
         ext.rpc_caller_external_get.regist(ext.view.p2p_module());
+        ext.rpc_caller_external_batch_get
+            .regist(ext.view.p2p_module());
+        ext.rpc_caller_external_batch_get_start
+            .regist(ext.view.p2p_module());
+        ext.rpc_caller_external_batch_get_transfer
+            .regist(ext.view.p2p_module());
+        ext.rpc_caller_external_batch_get_cancel
+            .regist(ext.view.p2p_module());
         ext.rpc_caller_external_put_commit
+            .regist(ext.view.p2p_module());
+        ext.rpc_caller_external_batch_put_commit
             .regist(ext.view.p2p_module());
         ext.rpc_caller_external_put_start
             .regist(ext.view.p2p_module());
+        ext.rpc_caller_external_batch_put_start
+            .regist(ext.view.p2p_module());
         ext.rpc_caller_external_put_transfer_end
+            .regist(ext.view.p2p_module());
+        ext.rpc_caller_external_batch_put_transfer_end
             .regist(ext.view.p2p_module());
         ext.rpc_caller_external_delete.regist(ext.view.p2p_module());
         ext.rpc_caller_external_is_exist
             .regist(ext.view.p2p_module());
+        ext.rpc_caller_external_batch_is_exist
+            .regist(ext.view.p2p_module());
+        ext.rpc_caller_external_observability_snapshot
+            .regist(ext.view.p2p_module());
         ext.rpc_caller_external_delete_ack
+            .regist(ext.view.p2p_module());
+        ext.rpc_caller_external_put_revoke
             .regist(ext.view.p2p_module());
         crate::key_prefix::init_for_p2p_owner(ext.view.p2p_module());
         crate::kvlease::init_for_p2p_owner(ext.view.p2p_module());
@@ -470,7 +533,7 @@ impl ExternalClientApi {
             move |resp, msg| {
                 let view = view_ext.clone();
                 let view_task = view.clone();
-                let _ = view.spawn("rpc_external_invalidate_weak_index", async move {
+                view.spawn("rpc_external_invalidate_weak_index", async move {
                     let result = handle_external_invalidate_weak_index(&view_task, &msg).await;
                     let _ = resp.send_resp(result).await;
                 });
@@ -483,7 +546,7 @@ impl ExternalClientApi {
         RPCHandler::<SyncKvToFileReq>::new().regist(ext.view.p2p_module(), move |resp, msg| {
             let view = view_ext.clone();
             let view_task = view.clone();
-            let _ = view.spawn("rpc_sync_kv_to_file", async move {
+            view.spawn("rpc_sync_kv_to_file", async move {
                 let result = handle_sync_kv_to_file_external(&view_task, &msg).await;
                 let _ = resp.send_resp(result).await;
             });
@@ -507,7 +570,7 @@ impl ExternalClientApi {
         {
             let view = ext.view.clone_view();
             let view_task = view.clone();
-            let _ = view.spawn("external_owner_remap_actor", async move {
+            view.spawn("external_owner_remap_actor", async move {
                 let shutdown_poller = view_task.register_shutdown_poller();
                 let mut cluster_rx = view_task.cluster_manager().listen();
                 let mut tick = tokio::time::interval(Duration::from_millis(200));
@@ -517,14 +580,6 @@ impl ExternalClientApi {
                         tracing::info!("external owner remap actor stopped by shutdown");
                         break;
                     }
-
-                    let Some(view_guard) = view_task.try_upgrade() else {
-                        tracing::info!(
-                            "external owner remap actor stopped because view was dropped"
-                        );
-                        break;
-                    };
-                    let _keep_view_alive = view_guard;
 
                     if let Err(err) = view_task
                         .external_client_api()
@@ -567,7 +622,7 @@ impl ExternalClientApi {
                 let owner_id_for_task = owner_id.clone();
                 let view_task = ext.view.clone_view();
                 let view_task2 = view_task.clone();
-                let _ = view_task.spawn("ipc_bandwidth_attributor", async move {
+                view_task.spawn("ipc_bandwidth_attributor", async move {
                     let mut shutdown_waiter = view_task2.register_shutdown_waiter();
                     let mut interval = tokio::time::interval(Duration::from_secs(
                         crate::metric_reporter::METRICS_FLUSH_INTERVAL_SECS,
@@ -668,110 +723,6 @@ impl ExternalClientApi {
 }
 
 impl ExternalInner {
-    async fn wait_initial_control_plane_ready(&self, phase: &'static str) -> KvResult<()> {
-        let owner_id = self.shared_storage_node_id().await.expect(
-            "ExternalClientApi expects current_owner to be Some before control-plane readiness wait",
-        );
-        self.wait_peer_send_ready(owner_id, "owner", phase).await?;
-
-        let master_node_id = self
-            .view
-            .cluster_manager()
-            .find_or_wait_master_node()
-            .await?;
-        self.wait_peer_send_ready(master_node_id, "master", phase)
-            .await
-    }
-
-    async fn wait_peer_send_ready(
-        &self,
-        logical_target: String,
-        target_role: &'static str,
-        phase: &'static str,
-    ) -> KvResult<()> {
-        let deadline =
-            Instant::now() + Duration::from_secs(EXTERNAL_INIT_CONTROL_PLANE_READY_TIMEOUT_SECS);
-        let shutdown_poller = self.view.register_shutdown_poller();
-        let mut attempts = 0u64;
-        let mut consecutive_ready = 0usize;
-        let mut last_transient_err = None;
-
-        loop {
-            if !shutdown_poller.is_running() {
-                return Err(KvError::Api(ApiError::SystemShutdown {
-                    detail: format!(
-                        "external control-plane wait stopped during {phase}: target_role={target_role} target={logical_target}"
-                    ),
-                }));
-            }
-
-            let readiness = self
-                .view
-                .p2p_module()
-                .ensure_peer_send_ready(&logical_target.clone().into())
-                .await;
-            match readiness {
-                Ok(()) => {
-                    consecutive_ready += 1;
-                    if consecutive_ready >= EXTERNAL_INIT_CONTROL_PLANE_READY_CONSECUTIVE_SUCCESSES
-                    {
-                        if attempts > 0 {
-                            tracing::info!(
-                                "external control-plane route ready: phase={} target_role={} target={} attempts={}",
-                                phase,
-                                target_role,
-                                logical_target,
-                                attempts + 1,
-                            );
-                        }
-                        return Ok(());
-                    }
-                }
-                Err(err)
-                    if matches!(
-                        err,
-                        crate::p2p::P2PError::NoConnectionReady { .. }
-                            | crate::p2p::P2PError::NodeNotFound { .. }
-                            | crate::p2p::P2PError::NodeNotConnected { .. }
-                            | crate::p2p::P2PError::NodePortNotReady { .. }
-                            | crate::p2p::P2PError::ConnectionError { .. }
-                            | crate::p2p::P2PError::SendFailed { .. }
-                            | crate::p2p::P2PError::Iceoryx2TransportNotStarted {}
-                    ) =>
-                {
-                    consecutive_ready = 0;
-                    last_transient_err = Some(err.to_string());
-                }
-                Err(err) => return Err(KvError::from(err)),
-            }
-
-            attempts += 1;
-            if attempts == 1 || attempts % 20 == 0 {
-                tracing::info!(
-                    "waiting for external control-plane route: phase={} target_role={} target={} attempts={} last_transient_err={:?}",
-                    phase,
-                    target_role,
-                    logical_target,
-                    attempts,
-                    last_transient_err,
-                );
-            }
-
-            if Instant::now() >= deadline {
-                return Err(KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "timed out waiting for external control-plane route during {phase}: target_role={target_role} target={logical_target} attempts={attempts} last_transient_err={last_transient_err:?}"
-                    ),
-                }));
-            }
-
-            sleep(Duration::from_millis(
-                EXTERNAL_INIT_CONTROL_PLANE_READY_POLL_MS,
-            ))
-            .await;
-        }
-    }
-
     fn maybe_log_external_put_trace_window(&self, sample: &TestPutPhaseTrace) {
         let maybe_window = {
             let mut guard = self.put_trace_log_window.lock();
@@ -795,9 +746,28 @@ impl ExternalInner {
         );
     }
 
-    async fn current_owner_start_time(&self) -> i64 {
+    pub async fn current_owner_start_time(&self) -> i64 {
         let g = self.current_owner.read().await;
         g.as_ref().map(|o| o.owner_start_time).unwrap_or_default()
+    }
+
+    pub async fn wait_current_owner_mapped_range(&self) -> KvResult<(String, i64, u64, u64, u64)> {
+        let mut prev_owner_start_time = i64::MIN;
+        let _ = self.ensure_owner_ready(&mut prev_owner_start_time).await?;
+        let guard = self.current_owner.read().await;
+        let owner = guard.as_ref().ok_or_else(|| {
+            KvError::SharedMem(SharedMemError::NotConfigured {
+                node_id: None,
+                detail: Some("Shared memory not ready".to_string()),
+            })
+        })?;
+        Ok((
+            owner.node_id.clone(),
+            owner.owner_start_time,
+            owner.shared_memory.as_ptr() as u64,
+            owner.shared_memory.as_ptr_ro() as u64,
+            owner.shared_memory.len(),
+        ))
     }
 
     async fn current_owner_snapshot(&self) -> Option<(String, i64, SharedMetaSignature)> {
@@ -842,11 +812,13 @@ impl ExternalInner {
             return Ok(false);
         };
 
-        let share_mem_path = self.share_mem_path();
-        let shared_meta_path = format!("{}/shared.json", share_mem_path);
+        let shared_memory_path = self.shared_memory_path();
+        let shared_file_path = self.shared_file_path();
+        let shared_meta_path = format!("{}/shared.json", shared_file_path);
         let probe = probe_owner_restart_payload(
             &self.view.clone_view(),
-            &share_mem_path,
+            &shared_memory_path,
+            &shared_file_path,
             &shared_meta_path,
             Some(&current_signature),
             i64::MIN,
@@ -865,7 +837,7 @@ impl ExternalInner {
             return Ok(false);
         }
 
-        self.finish_owner_recover(&share_mem_path, payload)
+        self.finish_owner_recover(&shared_memory_path, payload)
             .await?;
         Ok(true)
     }
@@ -890,9 +862,16 @@ impl ExternalInner {
         }
         None
     }
+
+    async fn try_get_local_complete_holder(&self, key: &str) -> Option<Arc<ExternalMemHolder>> {
+        if let Some(holder) = self.try_get_from_weak_cache(key).await {
+            return Some(holder);
+        }
+        None
+    }
     // Removed trivial helper: inline-match OwnerStartTimeMismatch directly where needed.
     /// 获取共享内存基址（以 usize 表示的地址）；未就绪时返回 NotConfigured
-    async fn base_ptr(&self) -> KvResult<usize> {
+    pub async fn base_ptr(&self) -> KvResult<usize> {
         let lock = self.current_owner.read().await;
         if let Some(o) = lock.as_ref() {
             return Ok(o.shared_memory.as_ptr() as usize);
@@ -918,7 +897,7 @@ impl ExternalInner {
         match self.base_ptr().await {
             Ok(addr) => Ok(addr),
             Err(_) => {
-                let path = self.share_mem_path();
+                let path = self.shared_memory_path();
                 let (st, addr) = self
                     .wait_owner_recover_only(&path, *prev_owner_start_time)
                     .await?;
@@ -932,10 +911,10 @@ impl ExternalInner {
 
     async fn finish_owner_recover(
         &self,
-        share_mem_path: &str,
+        shared_memory_path: &str,
         payload: OwnerRestartPayload,
     ) -> KvResult<(i64, usize)> {
-        self.remap_shared_memory_with_payload(share_mem_path, &payload)
+        self.remap_shared_memory_with_payload(shared_memory_path, &payload)
             .await?;
         self.view
             .cluster_manager()
@@ -949,18 +928,16 @@ impl ExternalInner {
             .set_self_sub_cluster(payload.meta.sub_cluster.clone())
             .await
             .map_err(KvError::from)?;
-        self.wait_initial_control_plane_ready("owner_recover")
-            .await?;
         let base_addr = self.base_ptr().await?;
         Ok((self.current_owner_start_time().await, base_addr))
     }
 
     async fn wait_owner_recover_only(
         &self,
-        share_mem_path: &str,
+        shared_memory_path: &str,
         prev_owner_start_time: i64,
     ) -> KvResult<(i64, usize)> {
-        self.wait_owner_recover(share_mem_path, prev_owner_start_time)
+        self.wait_owner_recover(shared_memory_path, prev_owner_start_time)
             .await
     }
 
@@ -968,7 +945,7 @@ impl ExternalInner {
         &self,
         prev_owner_start_time: &mut i64,
     ) -> KvResult<usize> {
-        let path = self.share_mem_path();
+        let path = self.shared_memory_path();
         let (st, addr) = self
             .wait_owner_recover_only(&path, *prev_owner_start_time)
             .await?;
@@ -984,7 +961,7 @@ impl ExternalInner {
             return match self.base_ptr().await {
                 Ok(addr) => Ok(addr),
                 Err(_) => {
-                    let path = self.share_mem_path();
+                    let path = self.shared_memory_path();
                     let (st, addr) = self
                         .wait_owner_recover_only(&path, *prev_owner_start_time)
                         .await?;
@@ -994,7 +971,7 @@ impl ExternalInner {
             };
         }
 
-        let path = self.share_mem_path();
+        let path = self.shared_memory_path();
         let (st, addr) = self
             .wait_owner_recover_only(&path, *prev_owner_start_time)
             .await?;
@@ -1006,7 +983,7 @@ impl ExternalInner {
     /// has advanced.
     async fn wait_owner_recover(
         &self,
-        _share_mem_path: &str,
+        _shared_memory_path: &str,
         prev_owner_start_time: i64,
     ) -> KvResult<(i64, usize)> {
         if let Some(res) = self
@@ -1087,11 +1064,11 @@ impl ExternalInner {
 
     async fn remap_shared_memory_with_payload(
         &self,
-        share_mem_path: &str,
+        shared_memory_path: &str,
         payload: &OwnerRestartPayload,
     ) -> KvResult<()> {
         let shared_memory = Self::init_shared_memory_from_meta(
-            share_mem_path,
+            shared_memory_path,
             &payload.meta,
             payload.signature.clone(),
         )?;
@@ -1209,11 +1186,11 @@ impl ExternalInner {
     }
 
     fn init_shared_memory_from_meta(
-        share_mem_path: &str,
+        shared_memory_path: &str,
         meta: &SharedJsonMeta,
         memory_signature: SharedMetaSignature,
     ) -> KvResult<Arc<SharedMemoryPtr>> {
-        let mmap_file_path = format!("{}/mmap.file", share_mem_path);
+        let mmap_file_path = format!("{}/mmap.file", shared_memory_path);
         Self::init_shared_memory(&mmap_file_path, meta.segment_len, memory_signature)
     }
     /// Get the shared storage node ID this client connects to
@@ -1224,12 +1201,14 @@ impl ExternalInner {
 
     /// Get the configured shared-memory base path (external mode).
     /// Non-external modes return empty string.
-    pub fn share_mem_path(&self) -> String {
-        self.external_share_mem_path.clone()
+    pub fn shared_memory_path(&self) -> String {
+        self.external_shared_memory_path.clone()
     }
 
-    pub fn large_file_paths(&self) -> &crate::config::LargeFilePaths {
-        &self.external_large_file_paths
+    /// Get the configured shared-file base path (external mode).
+    /// Non-external modes return empty string.
+    pub fn shared_file_path(&self) -> String {
+        self.external_shared_file_path.clone()
     }
 
     fn should_fallback_side_p2p_error(err: &crate::p2p::P2PError) -> bool {
@@ -1267,7 +1246,7 @@ impl ExternalInner {
         // require an extra enable flag once the owner has published ready lanes.
         let owner_id = self.shared_storage_node_id().await?;
         let owner_start_time = self.current_owner_start_time().await;
-        let peers_dir = ClientSegPool::side_transfer_peers_dir(&self.external_share_mem_path);
+        let peers_dir = ClientSegPool::side_transfer_peers_dir(&self.external_shared_file_path);
         let entries = std::fs::read_dir(&peers_dir).ok()?;
         let mut ready = Vec::new();
         for entry in entries.flatten() {
@@ -1372,8 +1351,149 @@ impl ExternalInner {
         }
     }
 
-    fn short_circuit_put_payload_path_enabled(&self) -> bool {
+    pub fn short_circuit_put_payload_path_enabled(&self) -> bool {
         self.short_circuit_put_payload_path
+    }
+
+    pub async fn external_batch_put_start_rpc(
+        &self,
+        req: ExternalBatchPutStartReq,
+    ) -> KvResult<ExternalBatchPutStartResp> {
+        let owner = self.shared_storage_node_id().await.ok_or_else(|| {
+            KvError::SharedMem(SharedMemError::NotConfigured {
+                node_id: None,
+                detail: Some("Shared storage node id unavailable".to_string()),
+            })
+        })?;
+        let resp = self
+            .rpc_caller_external_batch_put_start
+            .call_with_transport_policy(
+                self.view.p2p_module(),
+                owner.into(),
+                MsgPack {
+                    serialize_part: req,
+                    raw_bytes: Vec::new(),
+                },
+                Some(Duration::from_secs(EXTERNAL_PUT_START_RPC_TIMEOUT_SECS)),
+                RpcTransportPolicy::ForceTransport,
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
+        if resp.serialize_part.error_code != crate::rpcresp_kvresult_convert::msg_and_error::OK {
+            return Err(KvError::from_json(
+                resp.serialize_part.error_code,
+                &resp.serialize_part.error_json,
+            ));
+        }
+        Ok(resp.serialize_part)
+    }
+
+    pub async fn external_batch_put_transfer_end_rpc(
+        &self,
+        req: ExternalBatchPutTransferEndReq,
+    ) -> KvResult<ExternalBatchPutTransferEndResp> {
+        let owner = self.shared_storage_node_id().await.ok_or_else(|| {
+            KvError::SharedMem(SharedMemError::NotConfigured {
+                node_id: None,
+                detail: Some("Shared storage node id unavailable".to_string()),
+            })
+        })?;
+        let resp = self
+            .rpc_caller_external_batch_put_transfer_end
+            .call_with_transport_policy(
+                self.view.p2p_module(),
+                owner.into(),
+                MsgPack {
+                    serialize_part: req,
+                    raw_bytes: Vec::new(),
+                },
+                Some(Duration::from_secs(
+                    EXTERNAL_PUT_TRANSFER_END_RPC_TIMEOUT_SECS,
+                )),
+                RpcTransportPolicy::ForceTransport,
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
+        if resp.serialize_part.error_code != crate::rpcresp_kvresult_convert::msg_and_error::OK {
+            return Err(KvError::from_json(
+                resp.serialize_part.error_code,
+                &resp.serialize_part.error_json,
+            ));
+        }
+        Ok(resp.serialize_part)
+    }
+
+    pub async fn external_batch_put_commit_rpc(
+        &self,
+        req: ExternalBatchPutCommitReq,
+    ) -> KvResult<ExternalBatchPutCommitResp> {
+        let owner = self.shared_storage_node_id().await.ok_or_else(|| {
+            KvError::SharedMem(SharedMemError::NotConfigured {
+                node_id: None,
+                detail: Some("Shared storage node id unavailable".to_string()),
+            })
+        })?;
+        let resp = self
+            .rpc_caller_external_batch_put_commit
+            .call_with_transport_policy(
+                self.view.p2p_module(),
+                owner.into(),
+                MsgPack {
+                    serialize_part: req,
+                    raw_bytes: Vec::new(),
+                },
+                Some(Duration::from_secs(
+                    EXTERNAL_PUT_TRANSFER_END_RPC_TIMEOUT_SECS,
+                )),
+                RpcTransportPolicy::ForceTransport,
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
+        if resp.serialize_part.error_code != crate::rpcresp_kvresult_convert::msg_and_error::OK {
+            return Err(KvError::from_json(
+                resp.serialize_part.error_code,
+                &resp.serialize_part.error_json,
+            ));
+        }
+        Ok(resp.serialize_part)
+    }
+
+    pub async fn external_put_revoke_rpc(
+        &self,
+        req: ExternalPutRevokeReq,
+    ) -> KvResult<ExternalPutRevokeResp> {
+        let owner = self.shared_storage_node_id().await.ok_or_else(|| {
+            KvError::SharedMem(SharedMemError::NotConfigured {
+                node_id: None,
+                detail: Some("Shared storage node id unavailable".to_string()),
+            })
+        })?;
+        let resp = self
+            .rpc_caller_external_put_revoke
+            .call(
+                self.view.p2p_module(),
+                owner.into(),
+                MsgPack {
+                    serialize_part: req,
+                    raw_bytes: Vec::new(),
+                },
+                Some(Duration::from_secs(
+                    EXTERNAL_PUT_TRANSFER_END_RPC_TIMEOUT_SECS,
+                )),
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
+        if resp.serialize_part.error_code != crate::rpcresp_kvresult_convert::msg_and_error::OK {
+            return Err(KvError::from_json(
+                resp.serialize_part.error_code,
+                &resp.serialize_part.error_json,
+            ));
+        }
+        Ok(resp.serialize_part)
     }
 
     async fn call_put_start_with_side_fallback(
@@ -1523,21 +1643,52 @@ impl ExternalInner {
             .map_err(KvError::from)
     }
 
-    /// Check if a key exists in the external storage (loop+wait)
-    pub async fn is_exist(&self, key: &str) -> KvResult<bool> {
-        tracing::debug!("External is_exist request for key: {}", key);
+    /// Check a batch of keys in the external storage (loop+wait).
+    pub async fn batch_is_exist(
+        &self,
+        keys: Vec<String>,
+        allow_local_snapshot: bool,
+    ) -> KvResult<Vec<bool>> {
+        tracing::debug!(
+            "External batch_is_exist request: batch_len={}, allow_local_snapshot={}",
+            keys.len(),
+            allow_local_snapshot
+        );
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut prev_owner_start_time = self.current_owner_start_time().await;
         let mut recover_attempts = 0usize;
         if self.base_ptr().await.is_err() {
-            let path = self.share_mem_path();
-            tracing::info!("ExternalClientApi.is_exist waiting for owner at: {}", path);
+            let path = self.shared_memory_path();
+            tracing::info!(
+                "ExternalClientApi.batch_is_exist waiting for owner at: {}",
+                path
+            );
             let _ = self.ensure_owner_ready(&mut prev_owner_start_time).await?;
         }
 
         loop {
+            let mut results = vec![false; keys.len()];
+            let mut missing_indices = Vec::new();
+            let mut missing_keys = Vec::new();
+            for (idx, key) in keys.iter().enumerate() {
+                if allow_local_snapshot && self.try_get_local_complete_holder(key).await.is_some() {
+                    results[idx] = true;
+                    continue;
+                }
+                missing_indices.push(idx);
+                missing_keys.push(key.clone());
+            }
+            if missing_keys.is_empty() {
+                return Ok(results);
+            }
+
             let req = MsgPack {
-                serialize_part: ExternalIsExistReq {
-                    key: key.to_string(),
+                serialize_part: ExternalBatchIsExistReq {
+                    keys: missing_keys.clone(),
+                    allow_local_snapshot,
                     started_time: self.current_owner_start_time().await,
                 },
                 raw_bytes: Vec::new(),
@@ -1550,7 +1701,7 @@ impl ExternalInner {
                 })
             })?;
             let resp = match self
-                .rpc_caller_external_is_exist
+                .rpc_caller_external_batch_is_exist
                 .call(self.view.p2p_module(), owner.into(), req, None, 0)
                 .await
             {
@@ -1562,8 +1713,8 @@ impl ExternalInner {
                     {
                         recover_attempts += 1;
                         tracing::warn!(
-                            "is_exist: transient P2P error; retrying after owner-state recovery check: key={}, attempt={}/{}, err={}",
-                            key,
+                            "batch_is_exist: transient P2P error; retrying after owner-state recovery check: batch_len={}, attempt={}/{}, err={}",
+                            keys.len(),
                             recover_attempts,
                             EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS,
                             err
@@ -1578,10 +1729,28 @@ impl ExternalInner {
             };
 
             match resp.serialize_part.to_result() {
-                Ok(exists) => break Ok(exists),
+                Ok(exists_list) => {
+                    if exists_list.len() != missing_indices.len() {
+                        break Err(KvError::Api(ApiError::Unknown {
+                            detail: format!(
+                                "external batch_is_exist response length mismatch: expected={} got={}",
+                                missing_indices.len(),
+                                exists_list.len()
+                            ),
+                        }));
+                    }
+                    for (idx, exists) in
+                        missing_indices.iter().copied().zip(exists_list.into_iter())
+                    {
+                        results[idx] = exists;
+                    }
+                    break Ok(results);
+                }
                 Err(e) => {
                     if matches!(&e, KvError::Api(ApiError::OwnerStartTimeMismatch { .. })) {
-                        tracing::warn!("is_exist: OwnerStartTimeMismatch; remapping and retrying");
+                        tracing::warn!(
+                            "batch_is_exist: OwnerStartTimeMismatch; remapping and retrying"
+                        );
                         let _ = self
                             .recover_after_owner_start_time_mismatch(&mut prev_owner_start_time)
                             .await?;
@@ -1592,8 +1761,8 @@ impl ExternalInner {
                     {
                         recover_attempts += 1;
                         tracing::warn!(
-                            "is_exist: transient P2P error; retrying after owner-state recovery check: key={}, attempt={}/{}, err={}",
-                            key,
+                            "batch_is_exist: transient P2P error; retrying after owner-state recovery check: batch_len={}, attempt={}/{}, err={}",
+                            keys.len(),
                             recover_attempts,
                             EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS,
                             e
@@ -1603,11 +1772,648 @@ impl ExternalInner {
                             .await?;
                         continue;
                     }
-                    tracing::warn!("External is_exist failed for key: {}, error: {}", key, e);
+                    tracing::warn!(
+                        "External batch_is_exist failed for batch_len {}: {}",
+                        keys.len(),
+                        e
+                    );
                     break Err(e);
                 }
             }
         }
+    }
+
+    pub async fn observability_snapshot(&self) -> KvResult<crate::metrics::KvLocalitySnapshot> {
+        let mut prev_owner_start_time = self.current_owner_start_time().await;
+        let mut recover_attempts = 0usize;
+        if self.base_ptr_ro().await.is_err() {
+            let path = self.shared_memory_path();
+            tracing::info!(
+                "ExternalClientApi.observability_snapshot waiting for owner at: {}",
+                path
+            );
+            let _ = self.ensure_owner_ready(&mut prev_owner_start_time).await?;
+        }
+
+        loop {
+            let owner = self.shared_storage_node_id().await.ok_or_else(|| {
+                KvError::SharedMem(SharedMemError::NotConfigured {
+                    node_id: None,
+                    detail: Some("Shared storage node id unavailable".to_string()),
+                })
+            })?;
+            let req = MsgPack {
+                serialize_part: ExternalObservabilitySnapshotReq {
+                    started_time: self.current_owner_start_time().await,
+                },
+                raw_bytes: Vec::new(),
+            };
+            let resp = match self
+                .rpc_caller_external_observability_snapshot
+                .call(self.view.p2p_module(), owner.into(), req, None, 0)
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let err = KvError::from(e);
+                    if matches!(&err, KvError::P2p(_))
+                        && recover_attempts < EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS
+                    {
+                        recover_attempts += 1;
+                        tracing::warn!(
+                            "observability_snapshot: transient P2P error; retrying after owner-state recovery check: attempt={}/{}, err={}",
+                            recover_attempts,
+                            EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS,
+                            err
+                        );
+                        let _ = self
+                            .recover_after_p2p_error(&mut prev_owner_start_time)
+                            .await?;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            if resp.serialize_part.error_code != crate::rpcresp_kvresult_convert::msg_and_error::OK
+            {
+                let err = KvError::from_json(
+                    resp.serialize_part.error_code,
+                    &resp.serialize_part.error_json,
+                );
+                if matches!(&err, KvError::Api(ApiError::OwnerStartTimeMismatch { .. })) {
+                    tracing::warn!(
+                        "observability_snapshot: OwnerStartTimeMismatch; remapping and retrying"
+                    );
+                    let _ = self
+                        .recover_after_owner_start_time_mismatch(&mut prev_owner_start_time)
+                        .await?;
+                    continue;
+                }
+                if matches!(&err, KvError::P2p(_))
+                    && recover_attempts < EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS
+                {
+                    recover_attempts += 1;
+                    tracing::warn!(
+                        "observability_snapshot: transient P2P error in response; retrying after owner-state recovery check: attempt={}/{}, err={}",
+                        recover_attempts,
+                        EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS,
+                        err
+                    );
+                    let _ = self
+                        .recover_after_p2p_error(&mut prev_owner_start_time)
+                        .await?;
+                    continue;
+                }
+                return Err(err);
+            }
+            return Ok(resp.serialize_part.into_snapshot());
+        }
+    }
+
+    pub async fn batch_get_start(
+        &self,
+        keys: Vec<String>,
+        prefix_best_effort: bool,
+        atomic_group_lens: Option<Vec<usize>>,
+        transfer_concurrency: usize,
+    ) -> KvResult<ExternalBatchGetStartResp> {
+        tracing::debug!(
+            "External batch_get_start request: batch_len={}, prefix_best_effort={}, transfer_concurrency={}",
+            keys.len(),
+            prefix_best_effort,
+            transfer_concurrency
+        );
+        if keys.is_empty() {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "ExternalClientApi.batch_get_start requires at least one key".to_string(),
+            }));
+        }
+
+        let mut prev_owner_start_time = self.current_owner_start_time().await;
+        let mut recover_attempts = 0usize;
+        if self.base_ptr_ro().await.is_err() {
+            let path = self.shared_memory_path();
+            tracing::info!(
+                "ExternalClientApi.batch_get_start waiting for owner at: {}",
+                path
+            );
+            let _ = self.ensure_owner_ready(&mut prev_owner_start_time).await?;
+        }
+
+        loop {
+            let owner = self.shared_storage_node_id().await.ok_or_else(|| {
+                KvError::SharedMem(SharedMemError::NotConfigured {
+                    node_id: None,
+                    detail: Some("Shared storage node id unavailable".to_string()),
+                })
+            })?;
+            let req = MsgPack {
+                serialize_part: ExternalBatchGetStartReq {
+                    keys: keys.clone(),
+                    req_node_id: self.view.cluster_manager().get_self_info().id.clone(),
+                    started_time: self.current_owner_start_time().await,
+                    prefix_best_effort,
+                    atomic_group_lens: atomic_group_lens.clone(),
+                    transfer_concurrency,
+                },
+                raw_bytes: Vec::new(),
+            };
+            let resp = match self
+                .rpc_caller_external_batch_get_start
+                .call(self.view.p2p_module(), owner.into(), req, None, 0)
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let err = KvError::from(e);
+                    if matches!(&err, KvError::P2p(_))
+                        && recover_attempts < EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS
+                    {
+                        recover_attempts += 1;
+                        tracing::warn!(
+                            "batch_get_start: transient P2P error; retrying after owner-state recovery check: batch_len={}, attempt={}/{}, err={}",
+                            keys.len(),
+                            recover_attempts,
+                            EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS,
+                            err
+                        );
+                        let _ = self
+                            .recover_after_p2p_error(&mut prev_owner_start_time)
+                            .await?;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            if resp.serialize_part.error_code != OK {
+                let err = KvError::from_json(
+                    resp.serialize_part.error_code,
+                    &resp.serialize_part.error_json,
+                );
+                if matches!(&err, KvError::Api(ApiError::OwnerStartTimeMismatch { .. })) {
+                    tracing::warn!(
+                        "batch_get_start: OwnerStartTimeMismatch; remapping and retrying"
+                    );
+                    let _ = self
+                        .recover_after_owner_start_time_mismatch(&mut prev_owner_start_time)
+                        .await?;
+                    continue;
+                }
+                return Err(err);
+            }
+            return Ok(resp.serialize_part);
+        }
+    }
+
+    pub async fn batch_get_transfer(
+        &self,
+        handle: u64,
+        keys: Vec<String>,
+    ) -> KvResult<Vec<KvResult<Option<Arc<ExternalMemHolder>>>>> {
+        tracing::debug!(
+            "External batch_get_transfer request: handle={}, batch_len={}",
+            handle,
+            keys.len()
+        );
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut prev_owner_start_time = self.current_owner_start_time().await;
+        if self.base_ptr_ro().await.is_err() {
+            let path = self.shared_memory_path();
+            tracing::info!(
+                "ExternalClientApi.batch_get_transfer waiting for owner at: {}",
+                path
+            );
+            let _ = self.ensure_owner_ready(&mut prev_owner_start_time).await?;
+        }
+
+        let started_time = self.current_owner_start_time().await;
+        let base_ptr = self.base_ptr_ro().await.expect(
+            "ExternalClientApi.batch_get_transfer requires shared memory to be ready after ensure_owner_ready",
+        ) as u64;
+        let owner = self.shared_storage_node_id().await.ok_or_else(|| {
+            KvError::SharedMem(SharedMemError::NotConfigured {
+                node_id: None,
+                detail: Some("Shared storage node id unavailable".to_string()),
+            })
+        })?;
+        let req = MsgPack {
+            serialize_part: ExternalBatchGetTransferReq {
+                handle,
+                req_node_id: self.view.cluster_manager().get_self_info().id.clone(),
+                started_time,
+            },
+            raw_bytes: Vec::new(),
+        };
+        let resp: MsgPack<ExternalBatchGetTransferResp> = self
+            .rpc_caller_external_batch_get_transfer
+            .call(self.view.p2p_module(), owner.into(), req, None, 0)
+            .await
+            .map_err(KvError::from)?;
+        if resp.serialize_part.error_code != OK {
+            return Err(KvError::from_json(
+                resp.serialize_part.error_code,
+                &resp.serialize_part.error_json,
+            ));
+        }
+        if resp.serialize_part.items.len() != keys.len() {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "external batch_get_transfer response length mismatch: expected={} got={}",
+                    keys.len(),
+                    resp.serialize_part.items.len()
+                ),
+            }));
+        }
+
+        let bandwidth_handle = self
+            .view
+            .cluster_manager()
+            .ipc_bandwidth_attributor_handle()
+            .expect("ExternalClientApi.batch_get_transfer expects IpcBandwidthAttributor handle to be attached");
+        let mut results = Vec::with_capacity(keys.len());
+        for (key, item) in keys.into_iter().zip(resp.serialize_part.items.into_iter()) {
+            if item.error_code == OK {
+                match item.external_memholder_info {
+                    Some(info) => {
+                        if info.len > 0 {
+                            bandwidth_handle.record_tx_bytes(info.len as u64);
+                        }
+                        let holder = Arc::new(ExternalMemHolder::new(
+                            info.offset,
+                            base_ptr + info.offset,
+                            info.len,
+                            info.holder_id,
+                            key.clone(),
+                            self.view.cluster_manager().get_self_info().id.clone(),
+                            self.view.clone(),
+                            started_time,
+                        ));
+                        self.key_weak_memholder_index
+                            .insert(key, Arc::downgrade(&holder));
+                        results.push(Ok(Some(holder)));
+                    }
+                    None => results.push(Ok(None)),
+                }
+                continue;
+            }
+            if item.error_code
+                == crate::rpcresp_kvresult_convert::msg_and_error::codes_api::API_KEY_NOT_FOUND
+            {
+                results.push(Ok(None));
+                continue;
+            }
+            results.push(Err(KvError::from_json(item.error_code, &item.error_json)));
+        }
+        Ok(results)
+    }
+
+    pub async fn cancel_batch_get_start(&self, handle: u64) -> KvResult<()> {
+        tracing::debug!("External cancel_batch_get_start request: handle={}", handle);
+        let started_time = self.current_owner_start_time().await;
+        let owner = self.shared_storage_node_id().await.ok_or_else(|| {
+            KvError::SharedMem(SharedMemError::NotConfigured {
+                node_id: None,
+                detail: Some("Shared storage node id unavailable".to_string()),
+            })
+        })?;
+        let req = MsgPack {
+            serialize_part: ExternalBatchGetCancelReq {
+                handle,
+                req_node_id: self.view.cluster_manager().get_self_info().id.clone(),
+                started_time,
+            },
+            raw_bytes: Vec::new(),
+        };
+        let resp = self
+            .rpc_caller_external_batch_get_cancel
+            .call(self.view.p2p_module(), owner.into(), req, None, 0)
+            .await
+            .map_err(KvError::from)?;
+        if resp.serialize_part.error_code == OK {
+            return Ok(());
+        }
+        let err = KvError::from_json(
+            resp.serialize_part.error_code,
+            &resp.serialize_part.error_json,
+        );
+        if matches!(&err, KvError::Api(ApiError::OwnerStartTimeMismatch { .. })) {
+            tracing::info!(
+                "cancel_batch_get_start: owner start_time mismatch; owner restarted, treating handle as gone"
+            );
+            return Ok(());
+        }
+        Err(err)
+    }
+
+    pub async fn get_start(
+        &self,
+        keys: Vec<String>,
+        prefix_best_effort: bool,
+        atomic_group_lens: Option<Vec<usize>>,
+        transfer_concurrency: usize,
+    ) -> KvResult<ExternalClientGetStartResp> {
+        if keys.is_empty() {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "ExternalClientApi.get_start requires at least one key".to_string(),
+            }));
+        }
+        let started = self
+            .batch_get_start(
+                keys.clone(),
+                prefix_best_effort,
+                atomic_group_lens.clone(),
+                transfer_concurrency,
+            )
+            .await?;
+        if started.raw_prefix_hit_len > keys.len() {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "ExternalClientApi.get_start prefix response out of range: raw_prefix_hit_len={} keys={}",
+                    started.raw_prefix_hit_len,
+                    keys.len()
+                ),
+            }));
+        }
+        let group_lens = normalize_external_get_start_group_lens(keys.len(), atomic_group_lens)?;
+        let transferable_len = compute_external_get_start_transfer_prefix(
+            started.raw_prefix_hit_len,
+            &group_lens,
+            prefix_best_effort,
+        );
+        let first_miss_index = if started.raw_prefix_hit_len < keys.len() {
+            Some(started.raw_prefix_hit_len)
+        } else {
+            None
+        };
+
+        self.pending_external_get_start.insert(
+            started.handle,
+            PendingExternalGetStart {
+                keys: keys.clone(),
+                transferable_len,
+                first_miss_index,
+            },
+        );
+
+        Ok(ExternalClientGetStartResp {
+            handle: started.handle,
+            raw_prefix_hit_len: started.raw_prefix_hit_len,
+        })
+    }
+
+    pub async fn get_transfer(
+        &self,
+        handle: u64,
+    ) -> KvResult<Vec<KvResult<Option<Arc<ExternalMemHolder>>>>> {
+        let Some((_handle, entry)) = self.pending_external_get_start.remove(&handle) else {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!("get_transfer requires a live get-start handle: {}", handle),
+            }));
+        };
+        if entry.transferable_len == 0 {
+            let _ = self.cancel_batch_get_start(handle).await;
+            let key = entry
+                .first_miss_index
+                .and_then(|idx| entry.keys.get(idx).cloned())
+                .unwrap_or_else(|| format!("external_get_start_handle:{}", handle));
+            return Err(KvError::Api(ApiError::KeyNotFound { key }));
+        }
+        if entry.transferable_len > entry.keys.len() {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "get_transfer stored prefix out of range: transferable_len={} keys={}",
+                    entry.transferable_len,
+                    entry.keys.len()
+                ),
+            }));
+        }
+        self.batch_get_transfer(handle, entry.keys[..entry.transferable_len].to_vec())
+            .await
+    }
+
+    pub async fn cancel_get_transfer(&self, handle: u64) -> KvResult<()> {
+        let removed = self.pending_external_get_start.remove(&handle);
+        if removed.is_none() {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "cancel_get_transfer requires a live get-start handle: {}",
+                    handle
+                ),
+            }));
+        }
+        self.cancel_batch_get_start(handle).await
+    }
+
+    pub async fn batch_get(
+        &self,
+        keys: Vec<String>,
+        transfer_concurrency: usize,
+    ) -> KvResult<Vec<KvResult<Option<Arc<ExternalMemHolder>>>>> {
+        tracing::debug!(
+            "External batch_get request: batch_len={}, transfer_concurrency={}",
+            keys.len(),
+            transfer_concurrency
+        );
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut prev_owner_start_time = self.current_owner_start_time().await;
+        let mut recover_attempts = 0usize;
+        if self.base_ptr_ro().await.is_err() {
+            let path = self.shared_memory_path();
+            tracing::info!("ExternalClientApi.batch_get waiting for owner at: {}", path);
+            let _ = self.ensure_owner_ready(&mut prev_owner_start_time).await?;
+        }
+
+        let mut results: Vec<Option<KvResult<Option<Arc<ExternalMemHolder>>>>> =
+            (0..keys.len()).map(|_| None).collect();
+        let mut missing_indices = Vec::new();
+        let mut missing_keys = Vec::new();
+        for (idx, key) in keys.iter().enumerate() {
+            if let Some(holder) = self.try_get_from_weak_cache(key).await {
+                results[idx] = Some(Ok(Some(holder)));
+                continue;
+            }
+            missing_indices.push(idx);
+            missing_keys.push(key.clone());
+        }
+        if missing_keys.is_empty() {
+            return Ok(results
+                .into_iter()
+                .map(|item| {
+                    item.unwrap_or_else(|| {
+                        Err(KvError::Api(ApiError::Unknown {
+                            detail: "external batch_get result slot was not populated".to_string(),
+                        }))
+                    })
+                })
+                .collect());
+        }
+
+        loop {
+            let started_time = self.current_owner_start_time().await;
+            let base_ptr = self.base_ptr_ro().await.expect(
+                "ExternalClientApi.batch_get requires shared memory to be ready after ensure_owner_ready",
+            ) as u64;
+            let req = MsgPack {
+                serialize_part: ExternalBatchGetReq {
+                    keys: missing_keys.clone(),
+                    req_node_id: self.view.cluster_manager().get_self_info().id.clone(),
+                    started_time,
+                    transfer_concurrency,
+                },
+                raw_bytes: Vec::new(),
+            };
+            let owner = self.shared_storage_node_id().await.ok_or_else(|| {
+                KvError::SharedMem(SharedMemError::NotConfigured {
+                    node_id: None,
+                    detail: Some("Shared storage node id unavailable".to_string()),
+                })
+            })?;
+            let resp = match self
+                .rpc_caller_external_batch_get
+                .call(self.view.p2p_module(), owner.into(), req, None, 0)
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let err = KvError::from(e);
+                    if matches!(&err, KvError::P2p(_))
+                        && recover_attempts < EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS
+                    {
+                        recover_attempts += 1;
+                        tracing::warn!(
+                            "batch_get: transient P2P error; retrying after owner-state recovery check: batch_len={}, attempt={}/{}, err={}",
+                            keys.len(),
+                            recover_attempts,
+                            EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS,
+                            err
+                        );
+                        let _ = self
+                            .recover_after_p2p_error(&mut prev_owner_start_time)
+                            .await?;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            if resp.serialize_part.error_code != crate::rpcresp_kvresult_convert::msg_and_error::OK
+            {
+                let err = KvError::from_json(
+                    resp.serialize_part.error_code,
+                    &resp.serialize_part.error_json,
+                );
+                if matches!(&err, KvError::Api(ApiError::OwnerStartTimeMismatch { .. })) {
+                    tracing::warn!("batch_get: OwnerStartTimeMismatch; remapping and retrying");
+                    let _ = self
+                        .recover_after_owner_start_time_mismatch(&mut prev_owner_start_time)
+                        .await?;
+                    continue;
+                }
+                if matches!(&err, KvError::P2p(_))
+                    && recover_attempts < EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS
+                {
+                    recover_attempts += 1;
+                    tracing::warn!(
+                        "batch_get: transient P2P error; retrying after owner-state recovery check: batch_len={}, attempt={}/{}, err={}",
+                        keys.len(),
+                        recover_attempts,
+                        EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS,
+                        err
+                    );
+                    let _ = self
+                        .recover_after_p2p_error(&mut prev_owner_start_time)
+                        .await?;
+                    continue;
+                }
+                return Err(err);
+            }
+            if resp.serialize_part.items.len() != missing_indices.len() {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "external batch_get response length mismatch: expected={} got={}",
+                        missing_indices.len(),
+                        resp.serialize_part.items.len()
+                    ),
+                }));
+            }
+
+            let handle = self
+                .view
+                .cluster_manager()
+                .ipc_bandwidth_attributor_handle()
+                .expect("ExternalClientApi.batch_get expects IpcBandwidthAttributor handle to be attached");
+            for (idx, item) in missing_indices
+                .iter()
+                .copied()
+                .zip(resp.serialize_part.items.into_iter())
+            {
+                if item.error_code == crate::rpcresp_kvresult_convert::msg_and_error::OK {
+                    match item.external_memholder_info {
+                        Some(info) => {
+                            if info.len > 0 {
+                                handle.record_tx_bytes(info.len as u64);
+                            }
+                            let holder = Arc::new(ExternalMemHolder::new(
+                                info.offset,
+                                base_ptr + info.offset,
+                                info.len,
+                                info.holder_id,
+                                keys[idx].clone(),
+                                self.view.cluster_manager().get_self_info().id.clone(),
+                                self.view.clone(),
+                                started_time,
+                            ));
+                            self.key_weak_memholder_index
+                                .insert(keys[idx].clone(), Arc::downgrade(&holder));
+                            results[idx] = Some(Ok(Some(holder)));
+                        }
+                        None => {
+                            results[idx] = Some(Ok(None));
+                        }
+                    }
+                    continue;
+                }
+                if item.error_code
+                    == crate::rpcresp_kvresult_convert::msg_and_error::codes_api::API_KEY_NOT_FOUND
+                {
+                    results[idx] = Some(Ok(None));
+                    continue;
+                }
+                results[idx] = Some(Err(KvError::from_json(item.error_code, &item.error_json)));
+            }
+
+            return Ok(results
+                .into_iter()
+                .map(|item| {
+                    item.unwrap_or_else(|| {
+                        Err(KvError::Api(ApiError::Unknown {
+                            detail: "external batch_get result slot was not populated".to_string(),
+                        }))
+                    })
+                })
+                .collect());
+        }
+    }
+
+    pub async fn is_exist_with_local_snapshot(
+        &self,
+        key: &str,
+        allow_local_snapshot: bool,
+    ) -> KvResult<bool> {
+        let mut results = self
+            .batch_is_exist(vec![key.to_string()], allow_local_snapshot)
+            .await?;
+        Ok(results.pop().unwrap_or(false))
+    }
+
+    /// Check if a key exists in the external storage (loop+wait)
+    pub async fn is_exist(&self, key: &str) -> KvResult<bool> {
+        self.is_exist_with_local_snapshot(key, false).await
     }
 
     /// External Get operation (outer): retry + wait wrapper around get_inner
@@ -1620,7 +2426,7 @@ impl ExternalInner {
         // Ensure external mode configured; if not, block until owner is ready once
         let mut prev_owner_start_time = self.current_owner_start_time().await;
         if self.base_ptr().await.is_err() {
-            let path = self.share_mem_path();
+            let path = self.shared_memory_path();
             tracing::info!(
                 "ExternalClientApi.get detected unmapped shared memory; waiting at: {}",
                 path
@@ -1803,6 +2609,8 @@ key={}, attempt={}/{}, err={}",
     ) -> KvResult<()> {
         let lease_id = opts.lease_id();
         let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
+        let reject_if_exist_same_key = opts.reject_if_exist_same_key();
+        let write_through = opts.write_through();
         let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
         let observe_sink = opts.test_observe_put_phases();
         let observe_enabled = true;
@@ -1816,7 +2624,7 @@ key={}, attempt={}/{}, err={}",
         let mut base_addr: usize = match self.base_ptr().await {
             Ok(addr) => addr,
             Err(_) => {
-                let path = self.share_mem_path();
+                let path = self.shared_memory_path();
                 tracing::info!(
                     "ExternalClientApi.put detected unmapped shared memory; waiting for owner to be ready at path: {}",
                     path
@@ -1838,6 +2646,8 @@ key={}, attempt={}/{}, err={}",
                     base_addr,
                     lease_id,
                     reject_if_inflight_same_key,
+                    reject_if_exist_same_key,
+                    write_through,
                     preferred_sub_cluster.as_deref(),
                     observe_enabled,
                 )
@@ -1890,6 +2700,8 @@ key={}, attempt={}/{}, err={}",
     ) -> KvResult<()> {
         let lease_id = opts.lease_id();
         let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
+        let reject_if_exist_same_key = opts.reject_if_exist_same_key();
+        let write_through = opts.write_through();
         let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
         let observe_sink = opts.test_observe_put_phases();
         let observe_enabled = true;
@@ -1905,7 +2717,7 @@ key={}, attempt={}/{}, err={}",
         let mut base_addr: usize = match self.base_ptr().await {
             Ok(addr) => addr,
             Err(_) => {
-                let path = self.share_mem_path();
+                let path = self.shared_memory_path();
                 tracing::info!(
                     "ExternalClientApi.put_flat_dict_ptrs detected unmapped shared memory; waiting for owner to be ready at path: {}",
                     path
@@ -1924,6 +2736,8 @@ key={}, attempt={}/{}, err={}",
                     base_addr,
                     lease_id,
                     reject_if_inflight_same_key,
+                    reject_if_exist_same_key,
+                    write_through,
                     preferred_sub_cluster.as_deref(),
                     observe_enabled,
                 )
@@ -1963,6 +2777,370 @@ key={}, attempt={}/{}, err={}",
         }
     }
 
+    pub async unsafe fn batch_put_flat_dict_ptrs(
+        &self,
+        keys: Vec<String>,
+        ptrs_groups: Vec<Vec<(u8, usize, u32, u64, u32, Option<u32>)>>,
+        opts: crate::client_kv_api::PutOptionalArgs,
+        transfer_concurrency: usize,
+    ) -> KvResult<Vec<KvResult<()>>> {
+        if keys.len() != ptrs_groups.len() {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "batch_put_flat_dict_ptrs requires keys and ptrs_groups to have the same length: keys={} ptrs_groups={}",
+                    keys.len(),
+                    ptrs_groups.len()
+                ),
+            }));
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let lease_id = opts.lease_id();
+        let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
+        let reject_if_exist_same_key = opts.reject_if_exist_same_key();
+        let write_through = opts.write_through();
+        let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
+        let mut payload_lens = Vec::with_capacity(ptrs_groups.len());
+        for ptrs in ptrs_groups.iter() {
+            payload_lens.push(crate::memholder::kvclient_encode::calc_flat_dict_encoded_len(ptrs)?);
+        }
+
+        let mut prev_owner_start_time = self.current_owner_start_time().await;
+        let mut base_addr: usize = match self.base_ptr().await {
+            Ok(addr) => addr,
+            Err(_) => {
+                let path = self.shared_memory_path();
+                tracing::info!(
+                    "ExternalClientApi.batch_put_flat_dict_ptrs waiting for owner at path: {}",
+                    path
+                );
+                self.ensure_owner_ready(&mut prev_owner_start_time).await?
+            }
+        };
+
+        loop {
+            match unsafe {
+                self.batch_put_inner_flat_dict_ptrs(
+                    &keys,
+                    &ptrs_groups,
+                    &payload_lens,
+                    prev_owner_start_time,
+                    base_addr,
+                    lease_id,
+                    reject_if_inflight_same_key,
+                    reject_if_exist_same_key,
+                    write_through,
+                    preferred_sub_cluster.as_deref(),
+                    transfer_concurrency.max(1),
+                )
+                .await
+            } {
+                Ok(results) => break Ok(results),
+                Err(e) => {
+                    if matches!(&e, KvError::Api(ApiError::OwnerStartTimeMismatch { .. })) {
+                        tracing::warn!(
+                            "batch_put_flat_dict_ptrs: OwnerStartTimeMismatch; remapping and retrying"
+                        );
+                        base_addr = self
+                            .recover_after_owner_start_time_mismatch(&mut prev_owner_start_time)
+                            .await?;
+                        continue;
+                    }
+                    if matches!(&e, KvError::P2p(_)) {
+                        tracing::warn!(
+                            "batch_put_flat_dict_ptrs: P2P error (owner/link likely offline); retrying after owner-state recovery check: {}",
+                            e
+                        );
+                        base_addr = self
+                            .recover_after_p2p_error(&mut prev_owner_start_time)
+                            .await?;
+                        continue;
+                    }
+                    break Err(e);
+                }
+            }
+        }
+    }
+
+    async unsafe fn batch_put_inner_flat_dict_ptrs(
+        &self,
+        keys: &[String],
+        ptrs_groups: &[Vec<(u8, usize, u32, u64, u32, Option<u32>)>],
+        payload_lens: &[u64],
+        started_time: i64,
+        base_addr: usize,
+        lease_id: Option<u64>,
+        reject_if_inflight_same_key: bool,
+        reject_if_exist_same_key: bool,
+        write_through: bool,
+        preferred_sub_cluster: Option<&str>,
+        transfer_concurrency: usize,
+    ) -> KvResult<Vec<KvResult<()>>> {
+        let owner = self.shared_storage_node_id().await.ok_or_else(|| {
+            KvError::SharedMem(SharedMemError::NotConfigured {
+                node_id: None,
+                detail: Some("Shared storage node id unavailable".to_string()),
+            })
+        })?;
+        let start_req = MsgPack {
+            serialize_part: ExternalBatchPutStartReq {
+                items: keys
+                    .iter()
+                    .zip(payload_lens.iter())
+                    .map(|(key, payload_len)| ExternalBatchPutStartItemReq {
+                        key: key.clone(),
+                        len: *payload_len,
+                        reject_if_inflight_same_key,
+                        reject_if_exist_same_key,
+                        write_through,
+                        preferred_sub_cluster: preferred_sub_cluster.map(|s| s.to_string()),
+                    })
+                    .collect(),
+                started_time,
+            },
+            raw_bytes: Vec::new(),
+        };
+        let start_resp = self
+            .rpc_caller_external_batch_put_start
+            .call_with_transport_policy(
+                self.view.p2p_module(),
+                owner.clone().into(),
+                start_req,
+                Some(Duration::from_secs(EXTERNAL_PUT_START_RPC_TIMEOUT_SECS)),
+                RpcTransportPolicy::ForceTransport,
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
+        if start_resp.serialize_part.error_code
+            != crate::rpcresp_kvresult_convert::msg_and_error::OK
+        {
+            return Err(KvError::from_json(
+                start_resp.serialize_part.error_code,
+                &start_resp.serialize_part.error_json,
+            ));
+        }
+        if start_resp.serialize_part.items.len() != keys.len() {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "external batch_put_start response length mismatch: expected={} got={}",
+                    keys.len(),
+                    start_resp.serialize_part.items.len()
+                ),
+            }));
+        }
+
+        let short_circuit_payload = self.short_circuit_put_payload_path_enabled();
+        let mut results: Vec<Option<KvResult<()>>> = (0..keys.len()).map(|_| None).collect();
+        let mut commit_pending = Vec::new();
+        let mut transfer_pending = Vec::new();
+        let mut total_written_payload = 0u64;
+
+        for (idx, (((key, ptrs), payload_len), start_item)) in keys
+            .iter()
+            .zip(ptrs_groups.iter())
+            .zip(payload_lens.iter())
+            .zip(start_resp.serialize_part.items.into_iter())
+            .enumerate()
+        {
+            if start_item.error_code != crate::rpcresp_kvresult_convert::msg_and_error::OK {
+                results[idx] = Some(Err(KvError::from_json(
+                    start_item.error_code,
+                    &start_item.error_json,
+                )));
+                continue;
+            }
+            let Some(put_id) = start_item.put_id else {
+                results[idx] = Some(Err(KvError::Unreachable(
+                    crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::RpcDecodeError {
+                        rpc_input_json: format!(
+                            "missing put_id in external batch_put_start success response; key={}",
+                            key
+                        ),
+                    },
+                )));
+                continue;
+            };
+
+            if short_circuit_payload {
+                commit_pending.push((
+                    idx,
+                    ExternalBatchPutCommitItemReq {
+                        key: key.clone(),
+                        len: *payload_len,
+                        src_offset: start_item.src_offset,
+                        remote_target: start_item.peer_id.is_some(),
+                        put_id: Some(put_id),
+                        lease_id,
+                        write_through,
+                    },
+                ));
+                continue;
+            }
+
+            let write_ptr = (base_addr + start_item.target_offset as usize) as *mut u8;
+            unsafe {
+                crate::memholder::kvclient_encode::write_flat_dict_ptrs_to_ptr(write_ptr, ptrs);
+            }
+            total_written_payload = total_written_payload.saturating_add(*payload_len);
+            transfer_pending.push((
+                idx,
+                ExternalBatchPutTransferEndItemReq {
+                    key: key.clone(),
+                    len: *payload_len,
+                    src_offset: start_item.src_offset,
+                    target_offset: start_item
+                        .transfer_target_offset
+                        .unwrap_or(start_item.target_offset),
+                    peer_id: start_item.peer_id.clone(),
+                    target_base_addr: if start_item.peer_id.is_some() {
+                        Some(start_item.target_base_addr)
+                    } else {
+                        None
+                    },
+                    put_id: Some(put_id),
+                    write_through,
+                    lease_id,
+                },
+            ));
+        }
+
+        if total_written_payload > 0 {
+            let handle = self
+                .view
+                .cluster_manager()
+                .ipc_bandwidth_attributor_handle()
+                .expect("ExternalClientApi.batch_put_flat_dict_ptrs expects IpcBandwidthAttributor handle to be attached");
+            handle.record_rx_bytes(total_written_payload);
+        }
+
+        if short_circuit_payload {
+            if !commit_pending.is_empty() {
+                let commit_resp = self
+                    .rpc_caller_external_batch_put_commit
+                    .call_with_transport_policy(
+                        self.view.p2p_module(),
+                        owner.into(),
+                        MsgPack {
+                            serialize_part: ExternalBatchPutCommitReq {
+                                items: commit_pending
+                                    .iter()
+                                    .map(|(_, item)| item.clone())
+                                    .collect(),
+                                started_time,
+                            },
+                            raw_bytes: Vec::new(),
+                        },
+                        Some(Duration::from_secs(
+                            EXTERNAL_PUT_TRANSFER_END_RPC_TIMEOUT_SECS,
+                        )),
+                        RpcTransportPolicy::ForceTransport,
+                        0,
+                    )
+                    .await
+                    .map_err(KvError::from)?;
+                if commit_resp.serialize_part.error_code
+                    != crate::rpcresp_kvresult_convert::msg_and_error::OK
+                {
+                    return Err(KvError::from_json(
+                        commit_resp.serialize_part.error_code,
+                        &commit_resp.serialize_part.error_json,
+                    ));
+                }
+                if commit_resp.serialize_part.items.len() != commit_pending.len() {
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "external batch_put_commit response length mismatch: expected={} got={}",
+                            commit_pending.len(),
+                            commit_resp.serialize_part.items.len()
+                        ),
+                    }));
+                }
+                for ((idx, _), item_resp) in commit_pending
+                    .into_iter()
+                    .zip(commit_resp.serialize_part.items.into_iter())
+                {
+                    if item_resp.error_code == crate::rpcresp_kvresult_convert::msg_and_error::OK {
+                        results[idx] = Some(Ok(()));
+                    } else {
+                        results[idx] = Some(Err(KvError::from_json(
+                            item_resp.error_code,
+                            &item_resp.error_json,
+                        )));
+                    }
+                }
+            }
+        } else if !transfer_pending.is_empty() {
+            let transfer_resp = self
+                .rpc_caller_external_batch_put_transfer_end
+                .call_with_transport_policy(
+                    self.view.p2p_module(),
+                    owner.into(),
+                    MsgPack {
+                        serialize_part: ExternalBatchPutTransferEndReq {
+                            items: transfer_pending
+                                .iter()
+                                .map(|(_, item)| item.clone())
+                                .collect(),
+                            started_time,
+                            transfer_concurrency,
+                        },
+                        raw_bytes: Vec::new(),
+                    },
+                    Some(Duration::from_secs(
+                        EXTERNAL_PUT_TRANSFER_END_RPC_TIMEOUT_SECS,
+                    )),
+                    RpcTransportPolicy::ForceTransport,
+                    0,
+                )
+                .await
+                .map_err(KvError::from)?;
+            if transfer_resp.serialize_part.error_code
+                != crate::rpcresp_kvresult_convert::msg_and_error::OK
+            {
+                return Err(KvError::from_json(
+                    transfer_resp.serialize_part.error_code,
+                    &transfer_resp.serialize_part.error_json,
+                ));
+            }
+            if transfer_resp.serialize_part.items.len() != transfer_pending.len() {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "external batch_put_transfer_end response length mismatch: expected={} got={}",
+                        transfer_pending.len(),
+                        transfer_resp.serialize_part.items.len()
+                    ),
+                }));
+            }
+            for ((idx, _), item_resp) in transfer_pending
+                .into_iter()
+                .zip(transfer_resp.serialize_part.items.into_iter())
+            {
+                if item_resp.error_code == crate::rpcresp_kvresult_convert::msg_and_error::OK {
+                    results[idx] = Some(Ok(()));
+                } else {
+                    results[idx] = Some(Err(KvError::from_json(
+                        item_resp.error_code,
+                        &item_resp.error_json,
+                    )));
+                }
+            }
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|item| {
+                item.unwrap_or_else(|| {
+                    Err(KvError::Api(ApiError::Unknown {
+                        detail: "external batch_put result slot was not populated".to_string(),
+                    }))
+                })
+            })
+            .collect())
+    }
+
     async unsafe fn put_inner_flat_dict_ptrs(
         &self,
         key: &str,
@@ -1972,6 +3150,8 @@ key={}, attempt={}/{}, err={}",
         base_addr: usize,
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
+        reject_if_exist_same_key: bool,
+        write_through: bool,
         preferred_sub_cluster: Option<&str>,
         observe_enabled: bool,
     ) -> KvResult<TestPutPhaseTrace> {
@@ -1981,6 +3161,8 @@ key={}, attempt={}/{}, err={}",
                 key: key.to_string(),
                 len: payload_len,
                 reject_if_inflight_same_key,
+                reject_if_exist_same_key,
+                write_through,
                 preferred_sub_cluster: preferred_sub_cluster.map(|s| s.to_string()),
                 started_time,
                 test_observe_put_phases: true,
@@ -1995,7 +3177,7 @@ key={}, attempt={}/{}, err={}",
         })?;
         let put_start_rpc_started_at = observe_enabled.then(Instant::now);
         let (put_resp, put_start_side) = self
-            .call_put_start_with_side_fallback(owner, put_start_req)
+            .call_put_start_with_side_fallback(owner.clone(), put_start_req)
             .await?;
         if let Some(started_at) = put_start_rpc_started_at {
             trace.external_put_start_rpc_us = duration_to_i64_us(started_at.elapsed());
@@ -2012,11 +3194,19 @@ key={}, attempt={}/{}, err={}",
         self.remember_side_transfer_binding(put_start_ok.put_id, put_start_side);
 
         if self.short_circuit_put_payload_path_enabled() {
+            let remote_target = put_start_ok
+                .peer_id
+                .as_deref()
+                .is_some_and(|peer| peer != owner.as_str());
             let commit_req = MsgPack {
                 serialize_part: ExternalPutCommitReq {
                     key: key.to_string(),
+                    len: payload_len,
+                    src_offset: put_start_ok.src_offset,
+                    remote_target,
                     put_id: put_start_ok.put_id,
                     lease_id,
+                    write_through,
                     started_time,
                     test_observe_put_phases: true,
                 },
@@ -2085,6 +3275,7 @@ key={}, attempt={}/{}, err={}",
                     None
                 },
                 put_id: put_start_ok.put_id.clone(),
+                write_through,
                 lease_id,
                 started_time,
                 test_observe_put_phases: true,
@@ -2129,6 +3320,8 @@ key={}, attempt={}/{}, err={}",
         base_addr: usize,
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
+        reject_if_exist_same_key: bool,
+        write_through: bool,
         preferred_sub_cluster: Option<&str>,
         observe_enabled: bool,
     ) -> KvResult<TestPutPhaseTrace> {
@@ -2139,6 +3332,8 @@ key={}, attempt={}/{}, err={}",
                 key: key.to_string(),
                 len: value.len() as u64,
                 reject_if_inflight_same_key,
+                reject_if_exist_same_key,
+                write_through,
                 preferred_sub_cluster: preferred_sub_cluster.map(|s| s.to_string()),
                 started_time,
                 test_observe_put_phases: true,
@@ -2153,7 +3348,7 @@ key={}, attempt={}/{}, err={}",
         })?;
         let put_start_rpc_started_at = observe_enabled.then(Instant::now);
         let (put_resp, put_start_side) = self
-            .call_put_start_with_side_fallback(owner, put_start_req)
+            .call_put_start_with_side_fallback(owner.clone(), put_start_req)
             .await?;
         if let Some(started_at) = put_start_rpc_started_at {
             trace.external_put_start_rpc_us = duration_to_i64_us(started_at.elapsed());
@@ -2169,11 +3364,19 @@ key={}, attempt={}/{}, err={}",
         self.remember_side_transfer_binding(put_start_ok.put_id, put_start_side);
 
         if self.short_circuit_put_payload_path_enabled() {
+            let remote_target = put_start_ok
+                .peer_id
+                .as_deref()
+                .is_some_and(|peer| peer != owner.as_str());
             let commit_req = MsgPack {
                 serialize_part: ExternalPutCommitReq {
                     key: key.to_string(),
+                    len: value.len() as u64,
+                    src_offset: put_start_ok.src_offset,
+                    remote_target,
                     put_id: put_start_ok.put_id,
                     lease_id,
+                    write_through,
                     started_time,
                     test_observe_put_phases: true,
                 },
@@ -2256,6 +3459,7 @@ key={}, attempt={}/{}, err={}",
                     None
                 },
                 put_id: put_start_ok.put_id.clone(),
+                write_through,
                 lease_id,
                 started_time,
                 test_observe_put_phases: true,
@@ -2295,7 +3499,7 @@ key={}, attempt={}/{}, err={}",
         let mut prev_owner_start_time = self.current_owner_start_time().await;
         let mut recover_attempts = 0usize;
         if self.base_ptr().await.is_err() {
-            let path = self.share_mem_path();
+            let path = self.shared_memory_path();
             tracing::info!("ExternalClientApi.delete waiting for owner at: {}", path);
             let _ = self.ensure_owner_ready(&mut prev_owner_start_time).await?;
         }
@@ -2473,14 +3677,25 @@ async fn handle_external_invalidate_weak_index(
     let api = view.external_client_api();
     let inner = api.inner();
     let mut removed_total = 0usize;
-    for k in req.keys.iter() {
-        if let Some(_v) = inner.key_weak_memholder_index.remove(k) {
+    let items = if req.items.is_empty() {
+        req.keys
+            .iter()
+            .cloned()
+            .map(|key| ExternalInvalidateWeakIndexItem { key })
+            .collect::<Vec<_>>()
+    } else {
+        req.items.clone()
+    };
+    for item in items.iter() {
+        let key = &item.key;
+        let weak_removed = inner.key_weak_memholder_index.remove(key).is_some();
+        if weak_removed {
             removed_total += 1;
         }
     }
     tracing::debug!(
-        "External invalidated weak_index for keys: {:?} (removed {} entries)",
-        req.keys,
+        "External invalidated weak_index for items: {:?} (removed {} entries)",
+        items,
         removed_total
     );
 
@@ -2659,7 +3874,8 @@ async fn handle_sync_kv_to_file_external(
 
 async fn task_wait_owner_restart(
     view: ExternalClientApiView,
-    share_mem_path: String,
+    shared_memory_path: String,
+    shared_file_path: String,
     current_sig_snapshot: Option<SharedMetaSignature>,
     wait_start_ts: i64,
     old_owner_id: Option<String>,
@@ -2668,7 +3884,7 @@ async fn task_wait_owner_restart(
 ) -> KvResult<OwnerRestartPayload> {
     let shutdown_poller = view.register_shutdown_poller();
     let mut cluster_rx = view.cluster_manager().listen();
-    let shared_meta_path = format!("{}/shared.json", &share_mem_path);
+    let shared_meta_path = format!("{}/shared.json", &shared_file_path);
     let mut waited = 0u64;
     loop {
         if !shutdown_poller.is_running() {
@@ -2679,7 +3895,8 @@ async fn task_wait_owner_restart(
 
         match probe_owner_restart_payload(
             &view,
-            &share_mem_path,
+            &shared_memory_path,
+            &shared_file_path,
             &shared_meta_path,
             current_sig_snapshot.as_ref(),
             wait_start_ts,
@@ -2728,7 +3945,8 @@ fn read_shared_json_snapshot(
 
 async fn probe_owner_restart_payload(
     view: &ExternalClientApiView,
-    share_mem_path: &str,
+    shared_memory_path: &str,
+    shared_file_path: &str,
     shared_meta_path: &str,
     current_sig_snapshot: Option<&SharedMetaSignature>,
     wait_start_ts: i64,
@@ -2736,16 +3954,16 @@ async fn probe_owner_restart_payload(
     expected_cluster_name: &str,
     expected_protocol_version: &str,
 ) -> KvResult<OwnerRestartProbe> {
-    if !fluxon_util::fs_watch::are_files_ready(share_mem_path, &["mmap.file"]) {
+    if !fluxon_util::fs_watch::are_files_ready(shared_memory_path, &["mmap.file"]) {
         return Ok(OwnerRestartProbe::Pending(format!(
             "shared memory mmap.file not ready yet: path={}",
-            share_mem_path
+            shared_memory_path
         )));
     }
-    if !fluxon_util::fs_watch::are_files_ready(share_mem_path, &["shared.json"]) {
+    if !fluxon_util::fs_watch::are_files_ready(shared_file_path, &["shared.json"]) {
         return Ok(OwnerRestartProbe::Pending(format!(
             "shared metadata shared.json not ready yet: path={}",
-            share_mem_path
+            shared_file_path
         )));
     }
 
@@ -2768,13 +3986,13 @@ async fn probe_owner_restart_payload(
     if meta.protocol_version != expected_protocol_version {
         return Ok(OwnerRestartProbe::Pending(format!(
             "shared.json protocol_version mismatch; waiting: shm_dir='{}' shared='{}' local='{}'",
-            share_mem_path, meta.protocol_version, expected_protocol_version
+            shared_memory_path, meta.protocol_version, expected_protocol_version
         )));
     }
     if meta.cluster_name != expected_cluster_name {
         return Ok(OwnerRestartProbe::Pending(format!(
             "shared.json cluster_name mismatch; waiting: shm_dir='{}' shared='{}' local='{}'",
-            share_mem_path, meta.cluster_name, expected_cluster_name
+            shared_memory_path, meta.cluster_name, expected_cluster_name
         )));
     }
     if let Some(old_owner_id) = old_owner_id {
@@ -2844,7 +4062,7 @@ impl LogicalModule for ExternalClientApi {
     async fn shutdown(&self) -> Result<(), Self::Error> {
         // 只在ExternalClient模式下清理共享内存映射
         let ext = &self.0;
-        if ext.share_mem_path().is_empty() {
+        if ext.shared_memory_path().is_empty() {
             tracing::info!("ExternalClientApi shutdown (no shared memory path configured)");
             return Ok(());
         }

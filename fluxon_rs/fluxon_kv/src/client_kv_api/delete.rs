@@ -16,21 +16,6 @@ use crate::{
 };
 use limit_thirdparty::tokio;
 
-fn remove_local_cached_info_for_delete(
-    client_inner: &ClientKvApiInner,
-    delete_item: &DeleteClientKvMetaCacheItem,
-) {
-    client_inner
-        .get_cached_info
-        .remove_if(&delete_item.key, |_, v| {
-            if v.put_time_ms == delete_item.put_time_ms {
-                v.put_version <= delete_item.put_version
-            } else {
-                v.put_time_ms <= delete_item.put_time_ms
-            }
-        });
-}
-
 impl ClientKvApiInner {
     pub async fn delete(&self, key: &str) -> KvResult<()> {
         if !self.view.register_shutdown_poller().is_running() {
@@ -64,14 +49,12 @@ impl ClientKvApiInner {
             resp.serialize_part.error_json.clone(),
         )?;
 
-        remove_local_cached_info_for_delete(
-            self,
-            &DeleteClientKvMetaCacheItem {
-                key: key.to_string(),
-                put_time_ms: resp.serialize_part.deleted_put_time_ms,
-                put_version: resp.serialize_part.deleted_put_version,
-            },
-        );
+        let delete_item = DeleteClientKvMetaCacheItem {
+            key: key.to_string(),
+            put_time_ms: resp.serialize_part.deleted_put_time_ms,
+            put_version: resp.serialize_part.deleted_put_version,
+        };
+        apply_delete_client_kv_meta_cache_item(&self.view, &delete_item).await;
 
         Ok(())
     }
@@ -99,6 +82,59 @@ pub fn spawn_owner_delete_ack_batch(
     });
 }
 
+async fn apply_delete_client_kv_meta_cache_item(
+    view: &ClientKvApiView,
+    delete_item: &DeleteClientKvMetaCacheItem,
+) {
+    let client_api = view.client_kv_api();
+    let client_inner = client_api.inner();
+
+    if let Some((_removed_key, cached_info)) =
+        client_inner
+            .get_cached_info
+            .remove_if(&delete_item.key, |_, v| {
+                let res = if v.put_time_ms == delete_item.put_time_ms {
+                    v.put_version <= delete_item.put_version
+                } else {
+                    v.put_time_ms <= delete_item.put_time_ms
+                };
+                if res {
+                    tracing::debug!("do remove local cache for key: {}", delete_item.key);
+                } else {
+                    tracing::debug!(
+                        "skip remove local cache for key: {}, request ({},{}), local ({},{})",
+                        delete_item.key,
+                        delete_item.put_time_ms,
+                        delete_item.put_version,
+                        v.put_time_ms,
+                        v.put_version
+                    );
+                }
+                res
+            })
+    {
+        client_inner.release_local_reserve_route_for_memory_info(cached_info.mem_holder.as_ref());
+    }
+    let _ = client_inner.remove_local_snapshot_if(
+        &delete_item.key,
+        delete_item.put_time_ms,
+        delete_item.put_version,
+    );
+
+    if let Err(err) = client_inner
+        .external_invalidate_delete
+        .sender()
+        .send(delete_item.clone())
+        .await
+    {
+        tracing::warn!(
+            "Failed to enqueue external weak-index invalidation for key '{}': {}",
+            delete_item.key,
+            err
+        );
+    }
+}
+
 /// 批量删除客户端 KV 元数据缓存的处理函数
 pub async fn handle_batch_delete_client_kv_meta_cache(
     view: &ClientKvApiView,
@@ -111,9 +147,6 @@ pub async fn handle_batch_delete_client_kv_meta_cache(
         req.serialize_part.delete_items.len()
     );
 
-    let client_api = view.client_kv_api();
-    let client_inner = client_api.inner();
-
     let mut deleted_count = 0u32;
 
     for delete_item in &req.serialize_part.delete_items {
@@ -124,21 +157,8 @@ pub async fn handle_batch_delete_client_kv_meta_cache(
             delete_item.put_version
         );
 
-        remove_local_cached_info_for_delete(client_inner, delete_item);
+        apply_delete_client_kv_meta_cache_item(view, delete_item).await;
         deleted_count += 1;
-
-        if let Err(err) = client_inner
-            .external_invalidate_delete
-            .sender()
-            .send(delete_item.clone())
-            .await
-        {
-            tracing::warn!(
-                "Failed to enqueue external weak-index invalidation for key '{}': {}",
-                delete_item.key,
-                err
-            );
-        }
     }
 
     tracing::debug!(
