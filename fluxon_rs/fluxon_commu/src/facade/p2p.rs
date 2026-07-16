@@ -17,7 +17,8 @@ use fluxon_commu_contract::p2p::surface::{
     TierSnapshot as CommuTierSnapshot,
 };
 use fluxon_commu_contract::{
-    ClosedRuntimeHandle, ClosedRuntimeP2pCall, ClosedRuntimeP2pResponse, ClosedRuntimeTierSnapshot,
+    ClosedRuntimeError, ClosedRuntimeHandle, ClosedRuntimeP2pCall, ClosedRuntimeP2pResponse,
+    ClosedRuntimeTierSnapshot,
 };
 use fluxon_framework::LogicalModule;
 use fluxon_framework::{ResourceRegistry, ResourceRegistryAccessTrait};
@@ -35,8 +36,8 @@ use crate::closed_sdk::{
     p2p_register_user_rpc_bytes_handler, p2p_register_user_rpc_bytes_handler_async,
     p2p_send_response_raw, spawn_deferred_drop_runtime_handle,
 };
-use fluxon_commu_closed_sdk_consumer::ClosedRuntimeDispatchRequestRef;
 use fluxon_commu_closed_sdk_consumer::p2p_module_call;
+use fluxon_commu_closed_sdk_consumer::{ClosedRuntimeDispatchRequestRef, ClosedSdkConsumerError};
 
 #[doc(hidden)]
 pub trait P2pModuleAccessTrait: Send + Sync {
@@ -280,9 +281,16 @@ fn default_tier_snapshot(disable_crossowner_ipc: bool) -> CommuTierSnapshot {
     }
 }
 
-fn p2p_closed_sdk_error(error: crate::closed_sdk::ClosedSdkConsumerError) -> crate::p2p::P2pError {
-    crate::p2p::P2pError::Other {
-        detail: format!("closed sdk p2p call failed: {error}"),
+fn p2p_closed_sdk_error(error: ClosedSdkConsumerError) -> crate::p2p::P2pError {
+    match error {
+        ClosedSdkConsumerError::RuntimeError {
+            error: ClosedRuntimeError::P2p { detail },
+        } => crate::p2p::P2pError::SendFailed {
+            detail: format!("closed SDK P2P runtime call failed: {detail}"),
+        },
+        other => crate::p2p::P2pError::Other {
+            detail: format!("closed sdk p2p call failed: {other}"),
+        },
     }
 }
 
@@ -974,6 +982,7 @@ impl LogicalModule for P2pModule {
 }
 
 pub mod rpc {
+    use std::future::Future;
     use std::marker::PhantomData;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1289,39 +1298,35 @@ pub mod rpc {
         });
     }
 
-    pub async fn call_with_retry<REQ: RPCReq>(
-        p2p: &P2pModule,
-        node: NodeID,
-        req: MsgPack<REQ>,
-        retry: usize,
-        timeout: Option<std::time::Duration>,
-        transport_policy: RpcTransportPolicy,
-    ) -> P2PResult<MsgPack<REQ::Resp>> {
-        let mut failed_count = 0;
-        let shutdown_poller = p2p.module_view().register_shutdown_poller();
+    async fn run_rpc_attempts<T, Call, CallFuture>(
+        shutdown_poller: &fluxon_framework_compiled::shutdown::ShutdownPoller,
+        attempts: usize,
+        msg_id: u32,
+        retry_delay: Duration,
+        mut call: Call,
+    ) -> P2PResult<T>
+    where
+        Call: FnMut() -> CallFuture,
+        CallFuture: Future<Output = P2PResult<T>>,
+    {
+        assert!(attempts > 0, "RPC attempt count must be positive");
+        let mut failed_count = 0usize;
+        let mut last_error = None;
 
-        for attempt_idx in 0..retry {
+        for attempt_idx in 0..attempts {
             if !shutdown_poller.is_running() {
                 return Err(P2pError::SystemShutdown {});
             }
             if attempt_idx != 0 {
-                warn!("RPC call retrying, msg_id={}", req.msg_id());
+                warn!("RPC call retrying, msg_id={msg_id}");
             }
-            let resp = call_rpc_with_transport_policy::<REQ>(
-                p2p,
-                node.clone(),
-                req.clone(),
-                timeout,
-                transport_policy,
-            )
-            .await;
-            match resp {
+
+            match call().await {
                 Ok(resp) => {
                     if failed_count > 0 {
                         warn!(
-                            "RPC call succeeded after {} retries, msg_id={}",
-                            failed_count,
-                            req.msg_id()
+                            "RPC call succeeded after {} retries, msg_id={msg_id}",
+                            failed_count
                         );
                     }
                     return Ok(resp);
@@ -1331,25 +1336,49 @@ pub mod rpc {
                         return Err(err);
                     }
                     failed_count += 1;
-                    if attempt_idx + 1 < retry {
+                    if attempt_idx + 1 < attempts {
                         warn!(
-                            "RPC call failed with error={:?}, retrying in 5 seconds, msg_id={}",
-                            err,
-                            req.msg_id()
+                            "RPC call failed with error={:?}, retrying in {:?}, msg_id={msg_id}",
+                            err, retry_delay
                         );
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        last_error = Some(err);
+                        tokio::time::sleep(retry_delay).await;
+                    } else {
+                        last_error = Some(err);
                     }
                 }
             }
         }
 
-        Err(P2pError::Timeout {
-            detail: format!(
-                "RPC call failed after {} attempts, msg_id: {}",
-                retry,
-                req.msg_id()
-            ),
-        })
+        Err(last_error.expect("positive RPC attempt count must produce a terminal error"))
+    }
+
+    pub async fn call_with_retry<REQ: RPCReq>(
+        p2p: &P2pModule,
+        node: NodeID,
+        req: MsgPack<REQ>,
+        retry: usize,
+        timeout: Option<std::time::Duration>,
+        transport_policy: RpcTransportPolicy,
+    ) -> P2PResult<MsgPack<REQ::Resp>> {
+        let shutdown_poller = p2p.module_view().register_shutdown_poller();
+        let msg_id = req.msg_id();
+        run_rpc_attempts(
+            &shutdown_poller,
+            retry,
+            msg_id,
+            Duration::from_secs(5),
+            || {
+                call_rpc_with_transport_policy::<REQ>(
+                    p2p,
+                    node.clone(),
+                    req.clone(),
+                    timeout,
+                    transport_policy,
+                )
+            },
+        )
+        .await
     }
 
     pub async fn call_rpc_with_transport_policy<REQ: RPCReq>(
@@ -1484,6 +1513,85 @@ pub mod rpc {
     ) {
         p2p.register_user_rpc_bytes_handler_async(path, handler);
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[tokio::test]
+        async fn rpc_attempts_recover_after_transient_transport_error() {
+            let shutdown_poller = fluxon_framework_compiled::shutdown::ShutdownPoller::new();
+            let call_count = AtomicUsize::new(0);
+
+            let response = run_rpc_attempts(&shutdown_poller, 3, 4003, Duration::ZERO, || {
+                let attempt = call_count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Err(P2pError::SendFailed {
+                            detail: "transient ICE publisher failure".to_string(),
+                        })
+                    } else {
+                        Ok(17)
+                    }
+                }
+            })
+            .await
+            .expect("a transient transport failure should recover on retry");
+
+            assert_eq!(response, 17);
+            assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn rpc_attempts_preserve_the_last_transport_error() {
+            let shutdown_poller = fluxon_framework_compiled::shutdown::ShutdownPoller::new();
+            let call_count = AtomicUsize::new(0);
+
+            let error =
+                run_rpc_attempts::<(), _, _>(&shutdown_poller, 3, 4003, Duration::ZERO, || {
+                    let attempt = call_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if attempt < 2 {
+                            Err(P2pError::NoConnectionReady {
+                                nodeid: "owner-0".to_string(),
+                            })
+                        } else {
+                            Err(P2pError::SendFailed {
+                                detail: "final ICE publisher failure".to_string(),
+                            })
+                        }
+                    }
+                })
+                .await
+                .expect_err("all injected RPC attempts must fail");
+
+            assert_eq!(call_count.load(Ordering::SeqCst), 3);
+            assert!(matches!(
+                error,
+                P2pError::SendFailed { detail }
+                    if detail == "final ICE publisher failure"
+            ));
+        }
+
+        #[tokio::test]
+        async fn rpc_attempts_stop_before_calling_after_shutdown() {
+            let shutdown_poller = fluxon_framework_compiled::shutdown::ShutdownPoller::new();
+            shutdown_poller.shutdown();
+            let call_count = AtomicUsize::new(0);
+
+            let error =
+                run_rpc_attempts::<(), _, _>(&shutdown_poller, 3, 4003, Duration::ZERO, || {
+                    call_count.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(()) }
+                })
+                .await
+                .expect_err("shutdown must prevent the RPC call");
+
+            assert_eq!(call_count.load(Ordering::SeqCst), 0);
+            assert!(matches!(error, P2pError::SystemShutdown {}));
+        }
+    }
 }
 
 pub mod wire {
@@ -1508,5 +1616,25 @@ pub fn network_transport_kind() -> P2pTransportKind {
             return P2pTransportKind::Tquic;
         }
         P2pTransportKind::Tcp
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_runtime_p2p_error_keeps_its_detail_and_transport_category() {
+        let error = p2p_closed_sdk_error(ClosedSdkConsumerError::RuntimeError {
+            error: ClosedRuntimeError::P2p {
+                detail: "No connection ready: owner-0".to_string(),
+            },
+        });
+
+        assert!(matches!(
+            error,
+            crate::p2p::P2pError::SendFailed { detail }
+                if detail.contains("No connection ready: owner-0")
+        ));
     }
 }
