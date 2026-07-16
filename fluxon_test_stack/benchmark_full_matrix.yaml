@@ -342,17 +342,17 @@ profiles:
             - test_profile_adapter.py
           controller_url: __STACK_CONTROLLER_URL__
           target_ip_map: &upstream_target_ip_map
-            node-1: 10.127.37.2
-            node-2: 10.127.37.40
-            node-3: 10.127.37.6
-            node-4: 10.127.37.5
-            node-5: 10.127.37.75
-            node-6: 10.127.37.4
-            node-7: 10.127.37.118
-            node-8: 10.127.37.1
-            node-9: 10.127.37.22
-            node-10: 10.127.37.91
-            primary-bastion: 10.233.75.142
+            node-1: 192.0.2.11
+            node-2: 192.0.2.12
+            node-3: 192.0.2.13
+            node-4: 192.0.2.14
+            node-5: 192.0.2.15
+            node-6: 192.0.2.16
+            node-7: 192.0.2.17
+            node-8: 192.0.2.18
+            node-9: 192.0.2.19
+            node-10: 192.0.2.20
+            example-bastion: 198.51.100.10
           bootstrap_ready_timeout_seconds: 300
         runtime_config: &common_fluxon_runtime_config
           kv_base: &upstream_test_stack_kv_base

@@ -332,7 +332,7 @@ struct Args {
     instance_name: String,
     #[arg(short, long, default_value_t = String::from("test-cluster"))]
     cluster_name: String,
-    #[arg(long, default_value_t = String::from("http://10.126.126.235:25579"))]
+    #[arg(long, default_value_t = String::from("http://192.0.2.10:2379"))]
     etcd_endpoint: String,
 }
 

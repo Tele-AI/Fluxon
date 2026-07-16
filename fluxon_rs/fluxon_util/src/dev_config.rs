@@ -106,7 +106,7 @@ pub fn read_build_ext_config_value() -> Result<Value> {
 }
 
 /// Read etcd endpoint from build_config_ext.yml and ensure it has http/https scheme.
-/// Accepts either a scalar string like "10.126.126.235:2579" or a YAML list of endpoints.
+/// Accepts either a scalar string like "192.0.2.10:2379" or a YAML list of endpoints.
 pub fn read_etcd_endpoint_from_build_config() -> Result<String> {
     let v = read_build_ext_config_value()?;
     // Try string first
@@ -122,7 +122,7 @@ pub fn read_etcd_endpoint_from_build_config() -> Result<String> {
         }
     }
     Err(anyhow!(
-        "Missing or invalid 'etcd' in build_config_ext.yml; please set e.g. etcd: 10.126.126.235:2579"
+        "Missing or invalid 'etcd' in build_config_ext.yml; please set e.g. etcd: 192.0.2.10:2379"
     ))
 }
 
@@ -334,7 +334,7 @@ mod tests {
         .expect("write outer cargo toml");
         fs::write(
             outer_root.join("build_config_ext.yml"),
-            "etcd: 10.0.0.1:2379\n",
+            "etcd: 192.0.2.10:2379\n",
         )
         .expect("write outer build_config_ext");
 

@@ -1021,11 +1021,11 @@ test_runner_ui:
   gitops_config_path: ./gitops.yaml
 bootstrap_phases:
   - mode: fixed_bare
-    node: infra44-ThinkStation-PX
+    node: example-node-a
     services:
       - etcd
   - mode: fixed_bare
-    node: infra44-ThinkStation-PX
+    node: example-node-a
     services:
       - fluxon_core_controller
 deploy_workloads:
@@ -1047,7 +1047,7 @@ global_envs:
   FLUXON_RELEASE_PYLIB_SRC_TAR: pylib_src.tar.gz
   FLUXON_RELEASE_WHEEL: fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
 cluster_nodes:
-  - hostname: infra44-ThinkStation-PX
+  - hostname: example-node-a
     ip: 127.0.0.1
     hostworkdir: /tmp/fluxon_testbed
     ssh_user: tester
@@ -1056,28 +1056,28 @@ cluster_nodes:
 atomic_groups:
   fluxon_core_controller:
     phase: 1
-    nodes: ["infra44-ThinkStation-PX"]
+    nodes: ["example-node-a"]
     services: ["master", "owner", "ops_controller", "ops_agent"]
 bootstrap_bare_services: ["etcd"]
 service:
   etcd:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
   master:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
   owner:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
   ops_controller:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
   ops_agent:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
   fluxon_fs_agent:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
 """.strip()
             + "\n",
             encoding="utf-8",
@@ -1252,11 +1252,11 @@ test_runner_ui:
   gitops_config_path: ./gitops.yaml
 bootstrap_phases:
   - mode: fixed_bare
-    node: infra44-ThinkStation-PX
+    node: example-node-a
     services:
       - etcd
   - mode: fixed_bare
-    node: infra44-ThinkStation-PX
+    node: example-node-a
     services:
       - fluxon_core_controller
   - mode: coverage_bare
@@ -1282,7 +1282,7 @@ global_envs:
   FLUXON_RELEASE_PYLIB_SRC_TAR: pylib_src.tar.gz
   FLUXON_RELEASE_WHEEL: fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
 cluster_nodes:
-  - hostname: infra44-ThinkStation-PX
+  - hostname: example-node-a
     ip: 127.0.0.1
     hostworkdir: /tmp/fluxon_testbed
     ssh_user: tester
@@ -1291,31 +1291,31 @@ cluster_nodes:
 atomic_groups:
   fluxon_core_controller:
     phase: 1
-    nodes: ["infra44-ThinkStation-PX"]
+    nodes: ["example-node-a"]
     services: ["master", "owner", "ops_controller", "ops_agent"]
 bootstrap_bare_services: ["etcd"]
 service:
   etcd:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
   greptime:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
   master:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
   owner:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
   ops_controller:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
   ops_agent:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
   fluxon_fs_agent:
     node_bind:
-      node: ["infra44-ThinkStation-PX"]
+      node: ["example-node-a"]
 """.strip()
             + "\n",
             encoding="utf-8",
@@ -1414,7 +1414,7 @@ service:
             {
                 "launches": [
                     {
-                        "node": "infra44-ThinkStation-PX",
+                        "node": "example-node-a",
                         "selection_name": "etcd",
                     }
                 ]
@@ -1422,7 +1422,7 @@ service:
             {
                 "launches": [
                     {
-                        "node": "infra44-ThinkStation-PX",
+                        "node": "example-node-a",
                         "selection_name": "fluxon_core_controller",
                     }
                 ]
@@ -1440,7 +1440,7 @@ def test_initial_controller_handover_uses_local_bare_stop() -> None:
     with tempfile.TemporaryDirectory(prefix="test_start_test_bed_controller_handover_stop_") as td:
         workdir = Path(td)
         local_node_cfg = {
-            "hostname": "infra44-ThinkStation-PX-a",
+            "hostname": "example-node-a-a",
             "ip": "127.0.0.1",
             "hostworkdir": str(workdir / "hostworkdir"),
             "execution_mode": "local",
@@ -1452,15 +1452,15 @@ def test_initial_controller_handover_uses_local_bare_stop() -> None:
             "atomic_groups": {
                 "fluxon_core_controller": {
                     "phase": 1,
-                    "nodes": ["infra44-ThinkStation-PX-a"],
+                    "nodes": ["example-node-a-a"],
                     "services": ["master", "owner", "ops_controller", "ops_agent"],
                 }
             },
             "service": {
-                "master": {"node_bind": {"node": ["infra44-ThinkStation-PX-a"]}},
-                "owner": {"node_bind": {"node": ["infra44-ThinkStation-PX-a"]}},
-                "ops_controller": {"node_bind": {"node": ["infra44-ThinkStation-PX-a"]}},
-                "ops_agent": {"node_bind": {"node": ["infra44-ThinkStation-PX-a"]}},
+                "master": {"node_bind": {"node": ["example-node-a-a"]}},
+                "owner": {"node_bind": {"node": ["example-node-a-a"]}},
+                "ops_controller": {"node_bind": {"node": ["example-node-a-a"]}},
+                "ops_agent": {"node_bind": {"node": ["example-node-a-a"]}},
             },
         }
         stop_calls: list[str] = []
@@ -1480,10 +1480,10 @@ def test_initial_controller_handover_uses_local_bare_stop() -> None:
             module._run_local_stop = original_run_local_stop
         assert stopped == ["master", "owner", "ops_controller", "ops_agent"], stopped
         assert stop_calls == [
-            "infra44-ThinkStation-PX-a:master",
-            "infra44-ThinkStation-PX-a:owner",
-            "infra44-ThinkStation-PX-a:ops_controller",
-            "infra44-ThinkStation-PX-a:ops_agent",
+            "example-node-a-a:master",
+            "example-node-a-a:owner",
+            "example-node-a-a:ops_controller",
+            "example-node-a-a:ops_agent",
         ], stop_calls
     print("PASS: test_initial_controller_handover_uses_local_bare_stop")
 

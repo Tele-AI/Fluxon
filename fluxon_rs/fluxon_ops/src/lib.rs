@@ -7368,7 +7368,7 @@ async fn handle_fluxon_embedded_proxy(
             <div class="muted">Query/stop a managed workload on a single node.</div>
             <div style="margin-top:8px;">
               <label>target</label><br />
-              <input id="ctl_target" type="text" class="search-input" placeholder="infra44-ThinkStation-PX" />
+              <input id="ctl_target" type="text" class="search-input" placeholder="example-node-a" />
             </div>
             <div style="margin-top:8px;">
               <label>kind</label><br />

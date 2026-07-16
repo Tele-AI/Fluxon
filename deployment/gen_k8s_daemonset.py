@@ -349,7 +349,7 @@ def _mirror_daemonset_yaml_outdir(*, src_outdir: str, dst_outdir: str) -> None:
     #
     # Causal chain:
     # - Operators often run the generator from the repo workdir, while fluxon-deployer reads
-    #   manifests from a hostworkdir-mounted directory (e.g. /opt/store_team_dev/fluxon_deployer).
+    #   manifests from a hostworkdir-mounted directory (e.g. /tmp/fluxon-example/deploy).
     # - If the two directories drift, deployer applies stale manifests and can crash-loop.
     # - Therefore we provide an explicit opt-in "mirror_outdir" that:
     #   - cleans the destination directory (same semantics as the primary outdir)

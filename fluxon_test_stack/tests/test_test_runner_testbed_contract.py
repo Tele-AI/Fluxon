@@ -2287,7 +2287,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             )
             resolved_case = {
                 "deploy": {
-                    "target_ip_map": {"logic-a": "192.168.1.10", "logic-b": "192.168.1.10"},
+                    "target_ip_map": {"logic-a": "192.0.2.10", "logic-b": "192.0.2.10"},
                 },
                 "profile": {
                     "ci": {

@@ -193,7 +193,7 @@ test_runner_ui:
 
 bootstrap_phases:
   - mode: fixed_bare
-    node: infra44-ThinkStation-PX
+    node: example-node-a
     services: [etcd, greptime, tikv_pd, tikv]
 ```
 
@@ -208,7 +208,7 @@ retention:
 repos:
   - addr: git@github.com:Tele-AI/fluxon.git
     follow:
-      - branch: big_step2
+      - branch: example-feature-branch
         run:
           name_prefix: fluxon_ci
           commands:
@@ -451,11 +451,11 @@ http_listen_addr: 0.0.0.0:18080
 network:
   subnet_whitelist:
     - 127.0.0.0/8
-    - 10.0.0.0/24
+    - 192.0.2.0/24
   primary_ip_to_extended_ips:
-    10.0.0.10:
-      - 10.0.0.11
-      - 10.0.0.12
+    192.0.2.10:
+      - 192.0.2.11
+      - 192.0.2.12
 ```
 
 以及协议/传输分支这两个输入：
