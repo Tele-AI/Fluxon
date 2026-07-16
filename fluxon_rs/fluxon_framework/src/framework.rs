@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use fluxon_util::notify_state;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A runtime init resource latch managed by the framework.
@@ -32,9 +33,7 @@ impl ResourceLatch {
     }
 
     pub async fn wait_ready(&self) {
-        while !self.is_ready() {
-            self.notify.notified().await;
-        }
+        notify_state::wait_until(&self.notify, || self.is_ready()).await;
     }
 }
 

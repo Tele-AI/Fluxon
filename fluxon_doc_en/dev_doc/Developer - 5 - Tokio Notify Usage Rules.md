@@ -1,11 +1,11 @@
 # Developer - 5 - Tokio Notify Usage Rules
 
-For in-process asynchronous state waiting, the persistent state is authoritative and `tokio::sync::Notify` is only a wake-up hint. Fluxon code using `Notify` must follow one protocol:
+For in-process asynchronous state waiting, the persistent state is authoritative and `tokio::sync::Notify` is only a wake-up hint. Ordinary Fluxon call sites must use `fluxon_util::notify_state` so the race-safe protocol has one implementation:
 
 1. Publish the state transition before sending the notification.
-2. In the waiter, check the predicate, create and arm `Notified`, then check the predicate again.
-3. Await notification, shutdown, and any diagnostic timer in one cancellable `tokio::select!`.
-4. After a notification, loop and evaluate the persistent state again.
+2. Use `notify_state::wait_until` for a predicate-only wait or `notify_state::wait_until_or_stopped` for a stop-aware wait.
+3. Keep a custom loop only when the call site adds a real contract such as blocker accounting or a diagnostic timer.
+4. Custom loops must retain `check -> arm -> recheck -> wait` and keep notification, shutdown, and timers in one cancellable `tokio::select!`.
 
 This protocol closes the lost-wakeup window without treating notifications as durable events.
 
@@ -37,7 +37,7 @@ Choose the primitive from the required contract:
 | Notifications may be spurious or coalesced | Always loop after a wake-up and evaluate state again. | Progress depending on one notification per transition. |
 | Locks do not cross suspension points | Drop synchronous mutex guards before `.await`. | Deadlock and executor starvation. |
 
-## 3. Canonical Protocol
+## 3. Canonical Utility
 
 The publisher commits the state first:
 
@@ -50,53 +50,46 @@ fn mark_ready(&self) {
 
 For lock-protected state, mutate the value inside the lock, drop the guard, and then call `notify_one()` or `notify_waiters()`.
 
-The waiter uses the fixed `check -> arm -> recheck -> wait` loop:
+The predicate passed to the utility must synchronously read persistent state, have no side effects, and remain safe when called repeatedly. An asynchronous predicate or custom per-wake accounting requires a specialized loop.
+
+For a predicate-only wait, call the utility directly:
 
 ```rust
-enum WaitOutcome {
-    Ready,
-    Closed,
-}
+use fluxon_util::notify_state;
 
-async fn wait_until_ready(&self, shutdown: &ShutdownCtl) -> WaitOutcome {
-    loop {
-        if shutdown.is_closed() {
-            return WaitOutcome::Closed;
-        }
-        if self.ready.load(Ordering::SeqCst) {
-            return WaitOutcome::Ready;
-        }
+notify_state::wait_until(&self.changed, || {
+    self.ready.load(Ordering::SeqCst)
+})
+.await;
+```
 
-        let notified = self.changed.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
+For a stop-aware wait, use the finite outcome contract:
 
-        if shutdown.is_closed() {
-            return WaitOutcome::Closed;
-        }
-        if self.ready.load(Ordering::SeqCst) {
-            return WaitOutcome::Ready;
-        }
+```rust
+use fluxon_util::notify_state::NotifyStateWaitOutcome;
 
-        tokio::select! {
-            biased;
-            _ = shutdown.wait_closed() => return WaitOutcome::Closed,
-            _ = &mut notified => {}
-        }
-    }
+match notify_state::wait_until_or_stopped(&self.changed, shutdown, || {
+    self.ready.load(Ordering::SeqCst)
+})
+.await
+{
+    NotifyStateWaitOutcome::Ready => handle_ready(),
+    NotifyStateWaitOutcome::Stopped => handle_closed(),
 }
 ```
 
-`Notified::enable()` is the canonical non-awaiting way to arm a pinned notification future. It is especially important when `notify_one()` is used with multiple waiters. The second predicate check remains mandatory because it also covers a transition that completed before the future was armed.
+Do not add a method that only renames one of these calls and returns its result unchanged. A domain method is useful when it validates inputs, maps the outcome into a domain error, adds diagnostics, or owns another lifecycle boundary.
+
+The utility internally owns the fixed `check -> arm -> recheck -> wait` loop. Ordinary call sites must not copy it. `Notified::enable()` is the canonical non-awaiting way to arm a pinned notification future. It is especially important when `notify_one()` is used with multiple waiters. The second predicate check remains mandatory because it also covers a transition that completed before the future was armed.
 
 ```mermaid
 flowchart TD
-    A[Check shutdown and state predicate] -->|terminal or ready| Z[Return]
+    A[Utility checks stop and state predicate] -->|terminal or ready| Z[Return outcome]
     A -->|still waiting| B[Create and pin Notified]
     B --> C[Call enable]
-    C --> D[Recheck shutdown and predicate]
+    C --> D[Recheck stop and predicate]
     D -->|terminal or ready| Z
-    D -->|still waiting| E[Select shutdown, notification, and optional timer]
+    D -->|still waiting| E[Select stop and notification]
     E --> A
 ```
 
@@ -152,11 +145,12 @@ Do not infer an event count from the number of wake-ups. Use `mpsc`, `broadcast`
 - **Wake cardinality**: use `notify_waiters()` when one transition can satisfy or terminate every waiter. Use `notify_one()` only when exactly one waiter should compete to make progress.
 - **Mutex state**: write while holding the mutex, release the guard, and then notify.
 - **Atomic state**: use an ordering that establishes visibility between the publisher and waiter, such as release/acquire or `SeqCst`. `Relaxed` requires a separate, documented synchronization proof.
+- **Stop implementation**: `AsyncStopSignal::is_stopped` is authoritative. `wait_stopped` must be cancellation-safe because `select!` may drop it when another branch wins.
 - **Repeated close**: terminal state should be idempotent. A waiter starting after close must return from the state check without requiring another notification.
 
 ## 6. Required Tests
 
-Every reusable state-and-`Notify` wait helper must have bounded tests for the applicable rows below:
+The shared utility must have bounded tests for the rows below. Ordinary call sites test their business predicate and outcome mapping. Any specialized custom wait helper must also cover every applicable interleaving:
 
 | Case | Required assertion |
 | --- | --- |
@@ -176,6 +170,7 @@ Wrap async wait tests in `tokio::time::timeout` so a regression becomes a bounde
 
 Before approving code that uses `Notify`, verify:
 
+- An ordinary synchronous-predicate wait uses `fluxon_util::notify_state` instead of copying the loop.
 - The predicate or terminal flag is persistent and has one authoritative storage location.
 - The publisher updates state before notifying.
 - The waiter follows `check -> arm -> recheck -> wait` inside a loop.
@@ -187,9 +182,10 @@ Before approving code that uses `Notify`, verify:
 
 Current reference implementations and tests are:
 
-- `fluxon_rs/fluxon_mq/src/consumer.rs`: `CommitSequencer::wait_turn`
-- `fluxon_rs/fluxon_mq/src/shutdown.rs`: `ShutdownCtl::wait_closed`
-- `fluxon_rs/fluxon_mq/src/consumer.rs` and `shutdown.rs`: their `#[cfg(test)]` modules
+- `fluxon_rs/fluxon_util/src/notify_state.rs`: canonical utility, stop contract, and interleaving tests
+- `fluxon_rs/fluxon_mq/src/shutdown.rs`: `ShutdownCtl::wait_closed` as a utility call site
+- `fluxon_rs/fluxon_framework/src/framework.rs`: `ResourceLatch::wait_ready` as a utility call site
+- `fluxon_rs/fluxon_mq/src/consumer.rs`: `CommitSequencer::wait_turn` as a specialized wait with blocker diagnostics and a warning timer
 
 These paths are the current references. Other existing `Notify` usages are not implicitly validated; check them against this protocol when they are modified.
 

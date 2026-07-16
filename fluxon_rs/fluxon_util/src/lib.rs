@@ -7,6 +7,7 @@ pub mod hash;
 pub mod init_dag_compiler;
 pub mod map_lock;
 pub mod merge_recent_async_notifies;
+pub mod notify_state;
 pub mod prefix_scan;
 pub mod prom_remote_write;
 pub mod scoped_future_set;

@@ -1,11 +1,11 @@
 # 开发者 - 5 - Tokio Notify 使用规约
 
-进程内异步状态等待必须以持久状态为准，`tokio::sync::Notify` 只负责提供唤醒提示。Fluxon 中使用 `Notify` 的代码统一遵循以下协议：
+进程内异步状态等待必须以持久状态为准，`tokio::sync::Notify` 只负责提供唤醒提示。Fluxon 中的普通调用点必须使用 `fluxon_util::notify_state`，使竞态安全协议只有一份实现：
 
 1. 先发布状态变化，再发送通知。
-2. 等待方先检查谓词，再创建并激活（arm）`Notified`，然后重新检查谓词。
-3. 通知、关闭信号和诊断计时器必须进入同一个可取消的 `tokio::select!`。
-4. 收到通知后回到循环，重新读取持久状态。
+2. 只等待谓词时调用 `notify_state::wait_until`；还要响应停止信号时调用 `notify_state::wait_until_or_stopped`。
+3. 只有在调用点确实增加 blocker 统计、诊断计时器等契约时，才保留自定义循环。
+4. 自定义循环必须保留 `检查 -> arm -> 重新检查 -> 等待`，并把通知、shutdown 和 timer 放进同一个可取消的 `tokio::select!`。
 
 这套协议可以关闭 lost wake-up 窗口，同时不依赖通知保存历史事件。
 
@@ -37,7 +37,7 @@
 | 通知允许虚假或合并 | 每次唤醒后都回到循环重新读取状态。 | 逻辑依赖“每次状态变化对应一次通知”。 |
 | 锁不跨越挂起点 | 同步 mutex guard 必须在 `.await` 前释放。 | 死锁和 executor starvation。 |
 
-## 3. 标准协议
+## 3. 标准工具函数
 
 发布方先提交状态：
 
@@ -50,53 +50,46 @@ fn mark_ready(&self) {
 
 状态由锁保护时，应在锁内完成修改，释放 guard 后再调用 `notify_one()` 或 `notify_waiters()`。
 
-等待方统一使用 `检查 -> arm -> 重新检查 -> 等待` 循环：
+传给工具函数的谓词必须同步读取持久状态、没有副作用，并且允许重复调用。异步谓词或每次唤醒都要执行的自定义统计需要使用特化循环。
+
+只等待谓词时，直接调用工具函数：
 
 ```rust
-enum WaitOutcome {
-    Ready,
-    Closed,
-}
+use fluxon_util::notify_state;
 
-async fn wait_until_ready(&self, shutdown: &ShutdownCtl) -> WaitOutcome {
-    loop {
-        if shutdown.is_closed() {
-            return WaitOutcome::Closed;
-        }
-        if self.ready.load(Ordering::SeqCst) {
-            return WaitOutcome::Ready;
-        }
+notify_state::wait_until(&self.changed, || {
+    self.ready.load(Ordering::SeqCst)
+})
+.await;
+```
 
-        let notified = self.changed.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
+还要响应停止信号时，使用有限 outcome 契约：
 
-        if shutdown.is_closed() {
-            return WaitOutcome::Closed;
-        }
-        if self.ready.load(Ordering::SeqCst) {
-            return WaitOutcome::Ready;
-        }
+```rust
+use fluxon_util::notify_state::NotifyStateWaitOutcome;
 
-        tokio::select! {
-            biased;
-            _ = shutdown.wait_closed() => return WaitOutcome::Closed,
-            _ = &mut notified => {}
-        }
-    }
+match notify_state::wait_until_or_stopped(&self.changed, shutdown, || {
+    self.ready.load(Ordering::SeqCst)
+})
+.await
+{
+    NotifyStateWaitOutcome::Ready => handle_ready(),
+    NotifyStateWaitOutcome::Stopped => handle_closed(),
 }
 ```
 
-`Notified::enable()` 是在不 await 的情况下 arm 已 pin 通知 future 的标准方式。多个等待方配合 `notify_one()` 时，这一步尤其重要。第二次谓词检查始终不可省略，因为它还覆盖了 future arm 之前已经完成的状态变化。
+不要增加只为这两个调用改名并原样返回结果的方法。只有在完成输入校验、将 outcome 转换成领域错误、增加诊断信息或承接其他生命周期边界时，领域方法才有独立价值。
+
+工具函数内部统一维护 `检查 -> arm -> 重新检查 -> 等待` 固定循环，普通调用点不得复制。`Notified::enable()` 是在不 await 的情况下 arm 已 pin 通知 future 的标准方式。多个等待方配合 `notify_one()` 时，这一步尤其重要。第二次谓词检查始终不可省略，因为它还覆盖了 future arm 之前已经完成的状态变化。
 
 ```mermaid
 flowchart TD
-    A[检查 shutdown 与状态谓词] -->|已经终止或就绪| Z[返回]
+    A[Utility 检查 stop 与状态谓词] -->|已经终止或就绪| Z[返回 outcome]
     A -->|仍需等待| B[创建并 pin Notified]
     B --> C[调用 enable]
-    C --> D[重新检查 shutdown 与谓词]
+    C --> D[重新检查 stop 与谓词]
     D -->|已经终止或就绪| Z
-    D -->|仍需等待| E[select shutdown、通知与可选计时器]
+    D -->|仍需等待| E[select stop 与通知]
     E --> A
 ```
 
@@ -152,11 +145,12 @@ tokio::select! {
 - **唤醒数量**：一次状态变化可以让全部等待方就绪或终止时，使用 `notify_waiters()`。只有一个等待方应竞争执行时，才使用 `notify_one()`。
 - **Mutex 状态**：持锁写入状态，释放 guard，然后通知。
 - **Atomic 状态**：使用能够建立发布方与等待方可见性关系的 ordering，例如 release/acquire 或 `SeqCst`。使用 `Relaxed` 时必须另有明确的同步证明。
+- **Stop 实现**：`AsyncStopSignal::is_stopped` 是判定依据。`wait_stopped` 必须可安全取消，因为其他分支获胜时 `select!` 可能直接 drop 它。
 - **重复关闭**：终止状态应保持幂等。关闭后才开始的等待方必须能从状态检查直接返回，不依赖新的通知。
 
 ## 6. 强制测试矩阵
 
-每个可复用的状态加 `Notify` 等待 helper，都必须针对适用场景提供有界测试：
+共享工具函数必须提供覆盖下表的有界测试。普通调用点只需测试自己的业务谓词和 outcome 转换；任何特化的自定义等待 helper 仍须覆盖所有适用交错：
 
 | 场景 | 必须验证的结果 |
 | --- | --- |
@@ -176,6 +170,7 @@ tokio::select! {
 
 Review 使用 `Notify` 的代码时，至少检查：
 
+- 普通同步谓词等待是否调用 `fluxon_util::notify_state`，避免复制固定循环。
 - 谓词或 terminal flag 是否持久存在并且有唯一权威存储位置。
 - 发布方是否先更新状态，再发送通知。
 - 等待方是否在循环中执行 `检查 -> arm -> 重新检查 -> 等待`。
@@ -187,9 +182,10 @@ Review 使用 `Notify` 的代码时，至少检查：
 
 当前参考实现和测试位于：
 
-- `fluxon_rs/fluxon_mq/src/consumer.rs`：`CommitSequencer::wait_turn`
-- `fluxon_rs/fluxon_mq/src/shutdown.rs`：`ShutdownCtl::wait_closed`
-- `fluxon_rs/fluxon_mq/src/consumer.rs` 和 `shutdown.rs`：各自的 `#[cfg(test)]` 模块
+- `fluxon_rs/fluxon_util/src/notify_state.rs`：标准工具函数、stop 契约与交错时序测试
+- `fluxon_rs/fluxon_mq/src/shutdown.rs`：调用工具函数的 `ShutdownCtl::wait_closed`
+- `fluxon_rs/fluxon_framework/src/framework.rs`：调用工具函数的 `ResourceLatch::wait_ready`
+- `fluxon_rs/fluxon_mq/src/consumer.rs`：带 blocker 诊断和 warning timer 的特化等待 `CommitSequencer::wait_turn`
 
 这些路径是当前参考实现。其他既有 `Notify` 用法不因本文自动视为合规；后续修改相关代码时，应按本文协议逐项检查。
 

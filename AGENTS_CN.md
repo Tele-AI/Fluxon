@@ -56,5 +56,5 @@
 ## 规约索引
 
 - 文档写作：先写稳定结论，明确行为和性能结论的作用范围，并默认保持用户文档与开发文档中英文同步。见 [开发者 - 3 - 文档写作规约](<fluxon_doc_cn/dev_doc/开发者 - 3 - 文档写作规约.md>) 和 [Developer - 3 - Documentation Writing Rules](<fluxon_doc_en/dev_doc/Developer - 3 - Documentation Writing Rules.md>)。
-- Tokio 异步状态通知：持久状态是判定依据，`Notify` 只提供唤醒提示。发布方先更新状态再通知；等待方统一执行 `检查 -> arm Notified -> 重新检查 -> 在同一 select 中等待通知与 shutdown`。单 future 的 `select!` 加 `else` 不能用于非阻塞 poll。见 [开发者 - 5 - Tokio Notify 使用规约](<fluxon_doc_cn/dev_doc/开发者 - 5 - Tokio Notify 使用规约.md>) 和 [Developer - 5 - Tokio Notify Usage Rules](<fluxon_doc_en/dev_doc/Developer - 5 - Tokio Notify Usage Rules.md>)。
+- Tokio 异步状态通知：持久状态是判定依据，`Notify` 只提供唤醒提示。普通同步谓词等待必须调用 `fluxon_util::notify_state`；只有 blocker 诊断、timer 等额外契约才允许保留自定义循环。单 future 的 `select!` 加 `else` 不能用于非阻塞 poll。见 [开发者 - 5 - Tokio Notify 使用规约](<fluxon_doc_cn/dev_doc/开发者 - 5 - Tokio Notify 使用规约.md>) 和 [Developer - 5 - Tokio Notify Usage Rules](<fluxon_doc_en/dev_doc/Developer - 5 - Tokio Notify Usage Rules.md>)。
 - MQ 关闭：用户和测试路径必须先关闭所有公共 producer / consumer 并消费其 `Result`，再关闭底层 `KvClient`。Endpoint `close()` 负责子通道、MQ runtime、keepalive 和后台任务的内部回收；不要访问 MQ 私有生命周期对象。Fluxon KV lease 的分配与 keepalive 必须留在原生 Rust 内，不得通过 Python 回调桥接。见 [用户 - 4 - MQ 接口](<fluxon_doc_cn/user_doc/用户 - 4 - MQ接口.md#关闭生命周期>) 和 [User - 4 - MQ Interface](<fluxon_doc_en/user_doc/User - 4 - MQ Interface.md#shutdown-lifecycle>)。

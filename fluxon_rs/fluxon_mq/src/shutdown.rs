@@ -1,4 +1,4 @@
-use fluxon_util::etcd::AsyncStopSignal;
+use fluxon_util::notify_state::{self, AsyncStopSignal};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,22 +39,7 @@ impl ShutdownCtl {
     }
 
     pub async fn wait_closed(&self) {
-        loop {
-            if self.is_closed() {
-                return;
-            }
-
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            // Recheck after waiter registration so close cannot be missed.
-            if self.is_closed() {
-                return;
-            }
-
-            notified.await;
-        }
+        notify_state::wait_until(&self.notify, || self.is_closed()).await;
     }
 
     /// Expose underlying flag for integration with external code that
