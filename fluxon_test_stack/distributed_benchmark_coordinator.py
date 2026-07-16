@@ -2990,6 +2990,7 @@ class CoordinatorServer:
 
                 if has_producer_result:
                     forced_error_label = "forced_missing_consumer_result_timeout"
+                    forced_completion_ready = False
                     with self.lock:
                         test_id = self.test_config.test_id
                         if test_id not in self.test_results:
@@ -3047,14 +3048,24 @@ class CoordinatorServer:
                             f"reported_nodes={reported_nodes} timeout_s={timeout_s}"
                         )
 
-                        if len({str(node.node_id) for node in self.test_results[test_id]}) >= self.expected_nodes:
-                            self._set_round_gate_terminal(
-                                test_id=test_id,
-                                status=ROUND_GATE_STATUS_COMPLETED,
-                                completion_error=None,
+                        forced_completion_ready = (
+                            len(
+                                {
+                                    str(node.node_id)
+                                    for node in self.test_results[test_id]
+                                }
                             )
-                            self.all_results_received.set()
-                    return True
+                            >= self.expected_nodes
+                        )
+
+                    if forced_completion_ready:
+                        self._set_round_gate_terminal(
+                            test_id=test_id,
+                            status=ROUND_GATE_STATUS_COMPLETED,
+                            completion_error=None,
+                        )
+                        self.all_results_received.set()
+                        return True
 
         if test_id is not None:
             self._set_round_gate_terminal(

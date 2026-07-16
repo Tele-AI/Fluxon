@@ -1441,6 +1441,62 @@ class TestMPMCReadinessContract(unittest.TestCase):
         self.assertEqual(metadata["runtime_ready_node_count"], 2)
         self.assertEqual(metadata["runtime_ready_node_ids"], ["node-a", "node-b"])
 
+    def test_coordinator_force_completes_missing_consumer_without_lock_reentry(self) -> None:
+        coordinator = _new_coordinator_with_temp_config()
+        self.assertIsNotNone(coordinator.test_config)
+        coordinator.expected_nodes = 2
+        coordinator.test_config.test_id = "missing-consumer-regression"
+        coordinator.start_new_test(coordinator.test_config)
+        coordinator.registered_nodes = {
+            "producer-node": {"node_role": "producer"},
+            "consumer-node": {"node_role": "consumer"},
+        }
+
+        producer_report = {
+            "node_id": "producer-node",
+            "results": {
+                "node_id": "producer-node",
+                "node_role": "producer",
+                "p50_latency_us": 0.0,
+                "inflight_max": 0,
+                "inflight_avg": 0.0,
+            },
+        }
+        with mock.patch.object(coordinator, "_send_tcp_response", return_value=True):
+            self.assertTrue(coordinator.handle_report_results(producer_report, object()))
+
+        completion_result = []
+        completion_errors = []
+
+        def wait_for_completion() -> None:
+            try:
+                completion_result.append(coordinator.wait_for_completion(timeout_s=0.01))
+            except BaseException as exc:  # noqa: BLE001
+                completion_errors.append(exc)
+
+        waiter = threading.Thread(target=wait_for_completion, daemon=True)
+        waiter.start()
+        waiter.join(timeout=1.0)
+
+        self.assertFalse(
+            waiter.is_alive(),
+            "wait_for_completion deadlocked while setting round terminal",
+        )
+        self.assertEqual(completion_errors, [])
+        self.assertEqual(completion_result, [True])
+        self.assertTrue(coordinator.all_results_received.is_set())
+
+        results = coordinator.test_results[coordinator.test_config.test_id]
+        placeholders = [result for result in results if result.node_id == "consumer-node"]
+        self.assertEqual(len(placeholders), 1)
+        self.assertEqual(
+            placeholders[0].error_details,
+            {"forced_missing_consumer_result_timeout": 1},
+        )
+        gate = coordinator._round_gate_snapshot(test_id=coordinator.test_config.test_id)
+        self.assertEqual(gate["status"], "completed")
+        self.assertEqual(gate["reported_result_node_count"], 2)
+
     def test_coordinator_assigns_one_prefeed_leader_and_global_consumer_count(self) -> None:
         coordinator = _new_coordinator_with_temp_config()
         self.assertEqual(coordinator.expected_mpmc_consumer_workers, 1)

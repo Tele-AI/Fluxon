@@ -46,15 +46,9 @@ impl ShutdownCtl {
 
             let notified = self.notify.notified();
             tokio::pin!(notified);
+            notified.as_mut().enable();
 
-            // `notify_waiters()` does not retain a permit. Poll once first so a
-            // close racing with this await cannot be missed.
-            tokio::select! {
-                biased;
-                _ = &mut notified => {}
-                else => {}
-            }
-
+            // Recheck after waiter registration so close cannot be missed.
             if self.is_closed() {
                 return;
             }
@@ -77,5 +71,75 @@ impl AsyncStopSignal for ShutdownCtl {
 
     fn wait_stopped(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(self.wait_closed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShutdownCtl;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_closed_returns_when_already_closed() {
+        let shutdown = ShutdownCtl::new();
+        shutdown.close();
+
+        timeout(Duration::from_secs(1), shutdown.wait_closed())
+            .await
+            .expect("wait_closed blocked after close");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_closed_wakes_after_close() {
+        let shutdown = ShutdownCtl::new();
+        let waiter_shutdown = shutdown.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            waiter_shutdown.wait_closed().await;
+        });
+
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        shutdown.close();
+
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("wait_closed ignored close")
+            .expect("wait_closed task panicked");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_wakes_all_waiters() {
+        let shutdown = ShutdownCtl::new();
+        let first = shutdown.clone();
+        let second = shutdown.clone();
+        let first_waiter = tokio::spawn(async move { first.wait_closed().await });
+        let second_waiter = tokio::spawn(async move { second.wait_closed().await });
+
+        tokio::task::yield_now().await;
+        shutdown.close();
+
+        timeout(Duration::from_secs(1), first_waiter)
+            .await
+            .expect("first waiter ignored close")
+            .expect("first waiter task panicked");
+        timeout(Duration::from_secs(1), second_waiter)
+            .await
+            .expect("second waiter ignored close")
+            .expect("second waiter task panicked");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_close_remains_observable() {
+        let shutdown = ShutdownCtl::new();
+        shutdown.close();
+        shutdown.close();
+
+        timeout(Duration::from_secs(1), shutdown.wait_closed())
+            .await
+            .expect("repeated close was not observable");
     }
 }

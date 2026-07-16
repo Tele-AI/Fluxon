@@ -1,6 +1,6 @@
 保持本文档简洁。
 - 核心用户文档、开发文档和设计文档都在仓库内的 `fluxon_doc_cn/` 和 `fluxon_doc_en/` 下
-- 详细的中英文文档写作规约索引见 `fluxon_doc_cn/dev_doc/开发者 - 3 - 文档写作规约.md` 和 `fluxon_doc_en/dev_doc/Developer - 3 - Documentation Writing Rules.md`
+- 仓库级规则和组件契约统一收录在下方的“规约索引”中。`AGENTS` 只保留简明摘要；可复用细则写入索引指向的双语文档，并同步更新中英文索引。
 - `teststack` 有两个步骤：`start testbed` 和 `testrunner`
 - `teststack` 支持 UI；`testrunner` 应负责 UI 的 authority 和 API surface，但 UI 应作为常驻服务运行，并复用下层的 ops 接口
 - 本项目所有 Python 代码都必须兼容 Python `>= 3.10`
@@ -53,6 +53,8 @@
 - 对内部不变量，要快速失败或直接断言。不要像契约不清楚一样静默探测后再回退
 - 对一个语义操作，只保留一条主路径。除非这种区别本身就是契约的一部分，否则不要在同一套公开模式里混用 `foo_blocking()` 和 `foo().wait()`
 
-## 组件契约索引
+## 规约索引
 
+- 文档写作：先写稳定结论，明确行为和性能结论的作用范围，并默认保持用户文档与开发文档中英文同步。见 [开发者 - 3 - 文档写作规约](<fluxon_doc_cn/dev_doc/开发者 - 3 - 文档写作规约.md>) 和 [Developer - 3 - Documentation Writing Rules](<fluxon_doc_en/dev_doc/Developer - 3 - Documentation Writing Rules.md>)。
+- Tokio 异步状态通知：持久状态是判定依据，`Notify` 只提供唤醒提示。发布方先更新状态再通知；等待方统一执行 `检查 -> arm Notified -> 重新检查 -> 在同一 select 中等待通知与 shutdown`。单 future 的 `select!` 加 `else` 不能用于非阻塞 poll。见 [开发者 - 5 - Tokio Notify 使用规约](<fluxon_doc_cn/dev_doc/开发者 - 5 - Tokio Notify 使用规约.md>) 和 [Developer - 5 - Tokio Notify Usage Rules](<fluxon_doc_en/dev_doc/Developer - 5 - Tokio Notify Usage Rules.md>)。
 - MQ 关闭：用户和测试路径必须先关闭所有公共 producer / consumer 并消费其 `Result`，再关闭底层 `KvClient`。Endpoint `close()` 负责子通道、MQ runtime、keepalive 和后台任务的内部回收；不要访问 MQ 私有生命周期对象。Fluxon KV lease 的分配与 keepalive 必须留在原生 Rust 内，不得通过 Python 回调桥接。见 [用户 - 4 - MQ 接口](<fluxon_doc_cn/user_doc/用户 - 4 - MQ接口.md#关闭生命周期>) 和 [User - 4 - MQ Interface](<fluxon_doc_en/user_doc/User - 4 - MQ Interface.md#shutdown-lifecycle>)。
