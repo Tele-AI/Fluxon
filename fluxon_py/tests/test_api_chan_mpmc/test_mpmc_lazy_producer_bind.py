@@ -93,6 +93,19 @@ class _FailOnceCloseable:
         self.closed = True
 
 
+class _BlockingCloseable:
+    def __init__(self):
+        self.close_calls = 0
+        self.close_started = threading.Event()
+        self.allow_close = threading.Event()
+
+    def close(self):
+        self.close_calls += 1
+        self.close_started.set()
+        if not self.allow_close.wait(timeout=2.0):
+            raise RuntimeError("timed out waiting to finish synthetic close")
+
+
 class _FakeShutdownCtl:
     def __init__(self):
         self.closed = False
@@ -107,6 +120,8 @@ def _make_close_test_handle(
     obj = cls.__new__(cls)
     obj._chan_id = chan_id
     obj.chan_id = chan_id
+    obj._close_lock = threading.Lock()
+    obj._close_done = False
     obj._closed_local = False
     obj._membership_cleanup_done = False
     obj._unpublished_rollback_done = False
@@ -823,6 +838,50 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
 
         self.assertEqual(calls, [(["/channels/7/consumer/consumer_11"], [])])
         self.assertTrue(context.closed)
+
+    def test_mpsc_endpoint_concurrent_close_is_linearized(self):
+        for endpoint_type in (MPSCChanProducer, MPSCChanConsumer):
+            with self.subTest(endpoint_type=endpoint_type.__name__):
+                endpoint = _make_close_test_handle(endpoint_type)
+                context = _BlockingCloseable()
+                endpoint._ctx = context
+                delete_calls = []
+                results = []
+                errors = []
+
+                def fake_delete(api, *, keys, prefixes, dbg):
+                    delete_calls.append((list(keys), list(prefixes)))
+                    return Result.new_ok(OkNone())
+
+                def close_endpoint():
+                    try:
+                        results.append(endpoint.close())
+                    except BaseException as exc:  # noqa: BLE001
+                        errors.append(exc)
+
+                with mock.patch.object(
+                    mpsc_module, "_delete_owned_etcd_state", side_effect=fake_delete
+                ):
+                    first = threading.Thread(target=close_endpoint)
+                    second = threading.Thread(target=close_endpoint)
+                    first.start()
+                    self.assertTrue(context.close_started.wait(timeout=1.0))
+                    second.start()
+                    time.sleep(0.05)
+                    self.assertEqual(context.close_calls, 1)
+                    context.allow_close.set()
+                    first.join(timeout=2.0)
+                    second.join(timeout=2.0)
+
+                self.assertFalse(first.is_alive())
+                self.assertFalse(second.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(results), 2)
+                for result in results:
+                    result.unwrap()
+                self.assertEqual(context.close_calls, 1)
+                self.assertEqual(len(delete_calls), 1)
+                self.assertTrue(endpoint._close_done)
 
     def test_subchannel_context_close_error_is_reported_and_retryable(self):
         cases = [

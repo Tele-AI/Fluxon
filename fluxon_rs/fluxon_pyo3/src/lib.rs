@@ -854,21 +854,88 @@ fn require_kv_framework_api(client: &KvClient, py: Python) -> Result<Arc<Framewo
         .ok_or_else(|| new_general_error(py, "Client is closed"))
 }
 
-fn register_mq_shutdown_bridge(kv_framework: &Arc<Framework>, mq_framework: &fluxon_mq::Framework) {
+/// Routes explicit and KV-triggered shutdown through one framework owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MqShutdownRequest {
+    Open,
+    CloseRequested,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MqShutdownCompletion {
+    Pending,
+    Finished(Result<(), String>),
+}
+
+#[derive(Clone)]
+struct MqFrameworkShutdown {
+    request_tx: tokio::sync::watch::Sender<MqShutdownRequest>,
+    completion_rx: tokio::sync::watch::Receiver<MqShutdownCompletion>,
+}
+
+impl MqFrameworkShutdown {
+    fn new(runtime: &tokio::runtime::Handle, mq_framework: fluxon_mq::Framework) -> Self {
+        let (request_tx, mut request_rx) = tokio::sync::watch::channel(MqShutdownRequest::Open);
+        let (completion_tx, completion_rx) =
+            tokio::sync::watch::channel(MqShutdownCompletion::Pending);
+
+        // This task is intentionally outside the MQ task registry so shutdown
+        // never waits for the task that is driving it.
+        let _shutdown_worker = runtime.spawn(async move {
+            loop {
+                if *request_rx.borrow_and_update() == MqShutdownRequest::CloseRequested {
+                    break;
+                }
+                if request_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+
+            let result = mq_framework.shutdown().await.map_err(|err| err.to_string());
+            completion_tx.send_replace(MqShutdownCompletion::Finished(result));
+        });
+
+        Self {
+            request_tx,
+            completion_rx,
+        }
+    }
+
+    fn is_requested(&self) -> bool {
+        *self.request_tx.borrow() == MqShutdownRequest::CloseRequested
+    }
+
+    async fn shutdown(&self) -> Result<(), String> {
+        self.request_tx
+            .send_replace(MqShutdownRequest::CloseRequested);
+        let mut completion_rx = self.completion_rx.clone();
+        loop {
+            match completion_rx.borrow().clone() {
+                MqShutdownCompletion::Pending => {}
+                MqShutdownCompletion::Finished(result) => return result,
+            }
+            if completion_rx.changed().await.is_err() {
+                return Err(
+                    "MQ shutdown worker stopped before publishing its completion result"
+                        .to_string(),
+                );
+            }
+        }
+    }
+}
+
+fn register_mq_shutdown_bridge(kv_framework: &Arc<Framework>, mq_shutdown: &MqFrameworkShutdown) {
     use fluxon_framework_compiled::shutdown::ViewShutdownExt;
     use fluxon_framework_compiled::spawn::ViewSpawnExt;
 
     let mut waiter = kv_framework.register_shutdown_waiter();
-    let mq_fw = mq_framework.clone();
+    let mq_shutdown = mq_shutdown.clone();
     let fut = async move {
         waiter.wait().await;
-        let mq_fw_for_shutdown = mq_fw.clone();
-        let _ = mq_fw.spawn_boxed(Box::pin(async move {
-            mq_fw_for_shutdown
-                .shutdown()
-                .await
-                .expect("mq_framework.shutdown() failed during kv shutdown bridge");
-        }));
+        mq_shutdown
+            .shutdown()
+            .await
+            .expect("mq_framework.shutdown() failed during kv shutdown bridge");
     };
     let handle = kv_framework.spawn_boxed(Box::pin(fut));
     kv_framework.push_join_handle(
@@ -929,6 +996,7 @@ struct FluxonMqContext {
     runtime: tokio::runtime::Handle,
     kv_lease_backend: fluxon_mq::lease_manager::LeaseBackendUid,
     mq_framework: fluxon_mq::Framework,
+    mq_shutdown: MqFrameworkShutdown,
 }
 
 struct FluxonKvLeaseContext {
@@ -991,12 +1059,14 @@ fn new_fluxon_mq_context(client: &KvClient) -> PyResult<FluxonMqContext> {
         let _guard = runtime.enter();
         fluxon_mq::new_mq_framework()
     };
-    register_mq_shutdown_bridge(&kv_framework, &mq_framework);
+    let mq_shutdown = MqFrameworkShutdown::new(&runtime, mq_framework.clone());
+    register_mq_shutdown_bridge(&kv_framework, &mq_shutdown);
     Ok(FluxonMqContext {
         kv_framework,
         runtime,
         kv_lease_backend: lease_context.backend,
         mq_framework,
+        mq_shutdown,
     })
 }
 

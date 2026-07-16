@@ -153,7 +153,8 @@ pub struct MpscContext {
     kv_backend_uid: LeaseBackendUid,
     kv_framework: Arc<KvFramework>,
     kv_runtime: Handle,
-    mq_framework: Option<fluxon_mq::Framework>,
+    mq_framework: fluxon_mq::Framework,
+    mq_shutdown: crate::MqFrameworkShutdown,
 }
 
 #[pymethods]
@@ -182,7 +183,8 @@ impl MpscContext {
             kv_backend_uid: mq_context.kv_lease_backend,
             kv_framework: mq_context.kv_framework.clone(),
             kv_runtime: mq_context.runtime.clone(),
-            mq_framework: Some(mq_context.mq_framework.clone()),
+            mq_framework: mq_context.mq_framework,
+            mq_shutdown: mq_context.mq_shutdown,
         })
     }
 
@@ -240,9 +242,12 @@ impl MpscContext {
             .metric_reporter_view()
             .metric_reporter()
             .metrics_handle();
-        let lifecycle = self.mq_framework.as_ref().cloned().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("MpscContext is closed")
-        })?;
+        if self.mq_shutdown.is_requested() {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "MpscContext is closed",
+            ));
+        }
+        let lifecycle = self.mq_framework.clone();
         let shutdown = match bind_shutdown_ctl {
             Some(bind_shutdown_ctl) => bind_shutdown_ctl.borrow(py).shutdown.clone(),
             None => ShutdownCtl::new(),
@@ -438,9 +443,12 @@ impl MpscContext {
             .metric_reporter_view()
             .metric_reporter()
             .metrics_handle();
-        let lifecycle = self.mq_framework.as_ref().cloned().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("MpscContext is closed")
-        })?;
+        if self.mq_shutdown.is_requested() {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "MpscContext is closed",
+            ));
+        }
+        let lifecycle = self.mq_framework.clone();
         let runtime = self.kv_runtime.clone();
         let rth = runtime.clone();
         let outer = py.allow_threads(|| runtime
@@ -545,14 +553,11 @@ impl MpscContext {
         })
     }
 
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        let mq_framework = match self.mq_framework.take() {
-            Some(v) => v,
-            None => return Ok(()),
-        };
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let mq_shutdown = self.mq_shutdown.clone();
         let runtime = self.kv_runtime.clone();
         let shutdown_res = py.allow_threads(|| {
-            runtime.run_async_from_sync(async move { mq_framework.shutdown().await })
+            runtime.run_async_from_sync(async move { mq_shutdown.shutdown().await })
         });
         match shutdown_res {
             Ok(Ok(())) => Ok(()),
@@ -1966,6 +1971,29 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn mq_framework_shutdown_channel_shares_completion() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        let mq_framework = {
+            let _guard = runtime.enter();
+            fluxon_mq::new_mq_framework()
+        };
+        let shutdown = crate::MqFrameworkShutdown::new(runtime.handle(), mq_framework);
+
+        runtime.block_on(async {
+            let (first_result, second_result) =
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::join!(shutdown.shutdown(), shutdown.shutdown())
+                })
+                .await
+                .expect("concurrent shutdown requests must complete");
+
+            first_result.expect("first shutdown request");
+            second_result.expect("second shutdown request");
+            assert!(shutdown.is_requested());
+        });
     }
 
     #[test]

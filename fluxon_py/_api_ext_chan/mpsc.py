@@ -421,7 +421,9 @@ class MPSCChanProducer(ChannelProducer):
     ) -> None:
         # Lifecycle safety: initialize critical fields first so close() can be
         # invoked without hasattr/getattr checks even if construction fails.
-        self._handle_shutdown_ctl = _RustMpscContext.new_shutdown_ctl()
+        self._close_lock = threading.Lock()
+        self._close_done = False
+        self._handle_shutdown_ctl = _NoopCloseable()
         self._created_new_channel = chan_id is None
         self._parent_mpmc_id = parent_mpmc_id_opt
         self._ctx = _NoopCloseable()
@@ -435,6 +437,7 @@ class MPSCChanProducer(ChannelProducer):
         self._membership_cleanup_done = False
         self._unpublished_rollback_done = False
         self.shutdown_ctl = MqShutdownCtl()
+        self._handle_shutdown_ctl = _RustMpscContext.new_shutdown_ctl()
         # Validate config strictly (no implicit defaults/fallbacks).
         chan_config = validate_mpsc_config(chan_config, role=ChanRole.PRODUCER)
         self.api = api
@@ -675,65 +678,70 @@ class MPSCChanProducer(ChannelProducer):
         return Result[bool, ApiError].new_ok(True)
 
     def close(self) -> Result[OkNone, ApiError]:
-        # Use safe attribute access to tolerate partially-initialized objects
-        chan_id = getattr(self, "_chan_id", None)
-        dbg = getattr(self, "_dbg_tag", "[MPSCChanProducer]")
-        by_gc = bool(getattr(self, "_closing_by_gc", False))
-        producer_id = getattr(self, "_producer_id", None)
-        if not getattr(self, "_closed_local", False):
+        with self._close_lock:
+            if self._close_done:
+                return Result.new_ok(OkNone())
+
+            # Use safe attribute access to tolerate partially-initialized objects
+            chan_id = getattr(self, "_chan_id", None)
+            dbg = getattr(self, "_dbg_tag", "[MPSCChanProducer]")
+            by_gc = bool(getattr(self, "_closing_by_gc", False))
+            producer_id = getattr(self, "_producer_id", None)
+            if not getattr(self, "_closed_local", False):
+                logging.debug(
+                    "%s close begin chan_id=%s parent_mpmc_id=%s",
+                    dbg,
+                    chan_id,
+                    self._parent_mpmc_id,
+                )
+                self._closed_local = True
+                self._signal_shutdown()
+                self._handle_shutdown_ctl = None  # type: ignore[assignment]
+                # In-flight calls retain their own strong reference and unwind
+                # after the independent Rust shutdown signal above.
+                self._handle = None  # type: ignore[assignment]
+                if hasattr(self, "_chan_id") and hasattr(self, "_producer_id"):
+                    tag = f"mpsc:producer:{self._chan_id}:{self._producer_id}"
+                    _record_test_close_marker(tag, by_gc)
+
+            context_close_result = _close_owned_mpsc_context(
+                self._ctx,
+                channel_id=chan_id,
+            )
+            if not context_close_result.is_ok():
+                return context_close_result
+            context_close_result.unwrap()
+            self._ctx = _NoopCloseable()
+
+            if (
+                not by_gc
+                and not getattr(self, "_membership_cleanup_done", False)
+                and isinstance(chan_id, str)
+                and isinstance(producer_id, str)
+                and chan_id != "-1"
+                and producer_id != "unknown"
+            ):
+                cleanup_result = _delete_owned_etcd_state(
+                    self.api,
+                    keys=[
+                        _new_etcd_producer_key(chan_id, producer_id),
+                        _new_etcd_producer_weight_key(chan_id, producer_id),
+                    ],
+                    prefixes=[],
+                    dbg=dbg,
+                )
+                if not cleanup_result.is_ok():
+                    return cleanup_result
+                cleanup_result.unwrap()
+                self._membership_cleanup_done = True
+
             logging.debug(
-                "%s close begin chan_id=%s parent_mpmc_id=%s",
+                "%s close end chan_id=%s",
                 dbg,
                 chan_id,
-                self._parent_mpmc_id,
             )
-            self._closed_local = True
-            self._signal_shutdown()
-            self._handle_shutdown_ctl = None  # type: ignore[assignment]
-            # In-flight calls retain their own strong reference and unwind
-            # after the independent Rust shutdown signal above.
-            self._handle = None  # type: ignore[assignment]
-            if hasattr(self, "_chan_id") and hasattr(self, "_producer_id"):
-                tag = f"mpsc:producer:{self._chan_id}:{self._producer_id}"
-                _record_test_close_marker(tag, by_gc)
-
-        context_close_result = _close_owned_mpsc_context(
-            self._ctx,
-            channel_id=chan_id,
-        )
-        if not context_close_result.is_ok():
-            return context_close_result
-        context_close_result.unwrap()
-        self._ctx = _NoopCloseable()
-
-        if (
-            not by_gc
-            and not getattr(self, "_membership_cleanup_done", False)
-            and isinstance(chan_id, str)
-            and isinstance(producer_id, str)
-            and chan_id != "-1"
-            and producer_id != "unknown"
-        ):
-            cleanup_result = _delete_owned_etcd_state(
-                self.api,
-                keys=[
-                    _new_etcd_producer_key(chan_id, producer_id),
-                    _new_etcd_producer_weight_key(chan_id, producer_id),
-                ],
-                prefixes=[],
-                dbg=dbg,
-            )
-            if not cleanup_result.is_ok():
-                return cleanup_result
-            cleanup_result.unwrap()
-            self._membership_cleanup_done = True
-
-        logging.debug(
-            "%s close end chan_id=%s",
-            dbg,
-            chan_id,
-        )
-        return Result.new_ok(OkNone())
+            self._close_done = True
+            return Result.new_ok(OkNone())
 
     def _rollback_unpublished_channel(self) -> Result[OkNone, ApiError]:
         """Close and remove a newly created channel that was never published."""
@@ -810,6 +818,8 @@ class MPSCChanConsumer(ChannelConsumer):
         parent_mpmc_member_id_opt: Optional[int] = None,
     ) -> None:
         # Lifecycle safety defaults; see producer for rationale
+        self._close_lock = threading.Lock()
+        self._close_done = False
         self._handle_shutdown_ctl = _NoopCloseable()
         self._created_new_channel = chan_id is None
         self._parent_mpmc_id = parent_mpmc_id_opt
@@ -933,61 +943,66 @@ class MPSCChanConsumer(ChannelConsumer):
             logging.debug("%s shutdown signal skipped: %s", self.dbg_tag(), e)
 
     def close(self) -> Result[OkNone, ApiError]:
-        chan_id = getattr(self, "_chan_id", None)
-        dbg = getattr(self, "_dbg_tag", "[MPSCChanConsumer]")
-        by_gc = bool(getattr(self, "_closing_by_gc", False))
-        consumer_id = getattr(self, "_consumer_id", None)
-        if not getattr(self, "_closed_local", False):
+        with self._close_lock:
+            if self._close_done:
+                return Result.new_ok(OkNone())
+
+            chan_id = getattr(self, "_chan_id", None)
+            dbg = getattr(self, "_dbg_tag", "[MPSCChanConsumer]")
+            by_gc = bool(getattr(self, "_closing_by_gc", False))
+            consumer_id = getattr(self, "_consumer_id", None)
+            if not getattr(self, "_closed_local", False):
+                logging.debug(
+                    "%s close begin chan_id=%s parent_mpmc_id=%s",
+                    dbg,
+                    chan_id,
+                    self._parent_mpmc_id,
+                )
+                self._closed_local = True
+                self._signal_shutdown()
+                self._handle_shutdown_ctl = None  # type: ignore[assignment]
+                # The active get keeps the PyO3 object alive until it observes
+                # shutdown and returns; detaching here does not invalidate it.
+                self._handle = None  # type: ignore[assignment]
+                if hasattr(self, "_chan_id") and hasattr(self, "_consumer_id"):
+                    tag = f"mpsc:consumer:{self._chan_id}:{self._consumer_id}"
+                    _record_test_close_marker(tag, by_gc)
+
+            context_close_result = _close_owned_mpsc_context(
+                self._ctx,
+                channel_id=chan_id,
+            )
+            if not context_close_result.is_ok():
+                return context_close_result
+            context_close_result.unwrap()
+            self._ctx = _NoopCloseable()
+
+            if (
+                not by_gc
+                and not getattr(self, "_membership_cleanup_done", False)
+                and isinstance(chan_id, str)
+                and isinstance(consumer_id, str)
+                and chan_id != "-1"
+                and consumer_id != "unknown"
+            ):
+                cleanup_result = _delete_owned_etcd_state(
+                    self.api,
+                    keys=[_new_etcd_consumer_key(chan_id, consumer_id)],
+                    prefixes=[],
+                    dbg=dbg,
+                )
+                if not cleanup_result.is_ok():
+                    return cleanup_result
+                cleanup_result.unwrap()
+                self._membership_cleanup_done = True
+
             logging.debug(
-                "%s close begin chan_id=%s parent_mpmc_id=%s",
+                "%s close end chan_id=%s",
                 dbg,
                 chan_id,
-                self._parent_mpmc_id,
             )
-            self._closed_local = True
-            self._signal_shutdown()
-            self._handle_shutdown_ctl = None  # type: ignore[assignment]
-            # The active get keeps the PyO3 object alive until it observes
-            # shutdown and returns; detaching here does not invalidate it.
-            self._handle = None  # type: ignore[assignment]
-            if hasattr(self, "_chan_id") and hasattr(self, "_consumer_id"):
-                tag = f"mpsc:consumer:{self._chan_id}:{self._consumer_id}"
-                _record_test_close_marker(tag, by_gc)
-
-        context_close_result = _close_owned_mpsc_context(
-            self._ctx,
-            channel_id=chan_id,
-        )
-        if not context_close_result.is_ok():
-            return context_close_result
-        context_close_result.unwrap()
-        self._ctx = _NoopCloseable()
-
-        if (
-            not by_gc
-            and not getattr(self, "_membership_cleanup_done", False)
-            and isinstance(chan_id, str)
-            and isinstance(consumer_id, str)
-            and chan_id != "-1"
-            and consumer_id != "unknown"
-        ):
-            cleanup_result = _delete_owned_etcd_state(
-                self.api,
-                keys=[_new_etcd_consumer_key(chan_id, consumer_id)],
-                prefixes=[],
-                dbg=dbg,
-            )
-            if not cleanup_result.is_ok():
-                return cleanup_result
-            cleanup_result.unwrap()
-            self._membership_cleanup_done = True
-
-        logging.debug(
-            "%s close end chan_id=%s",
-            dbg,
-            chan_id,
-        )
-        return Result.new_ok(OkNone())
+            self._close_done = True
+            return Result.new_ok(OkNone())
 
     def _rollback_unpublished_channel(self) -> Result[OkNone, ApiError]:
         """Close and remove a newly created channel that was never published."""
