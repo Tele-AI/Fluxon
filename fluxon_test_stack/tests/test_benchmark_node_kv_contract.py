@@ -46,13 +46,16 @@ class _FakeKvStore:
     def __init__(self, holder: _FakeHolder) -> None:
         self.holder = holder
         self.put_value = None
+        self.put_keys: list[str] = []
+        self.put_opts: list[object] = []
 
     def get_blocking(self, key: str):
         del key
         return _KV._SimpleResult.ok(self.holder)
 
     def put_blocking(self, key: str, value, *, opts):
-        del key, opts
+        self.put_keys.append(key)
+        self.put_opts.append(opts)
         self.put_value = value
         return _KV._SimpleResult.ok(None)
 
@@ -401,6 +404,9 @@ class TestBenchmarkNodeKvContract(unittest.TestCase):
         adapter._store = store
         adapter._get_output = _KV.KVGetOutput.CUDA
         adapter._phase_profiler = _KV._FluxonPhaseProfiler()
+        adapter._put_dedupe_condition = threading.Condition()
+        adapter._put_confirmed_keys = set()
+        adapter._put_inflight_keys = set()
 
         err = adapter.put_blocking(
             "key",
@@ -411,6 +417,34 @@ class TestBenchmarkNodeKvContract(unittest.TestCase):
 
         self.assertIsNone(err)
         self.assertIsInstance(store.put_value["payload"], _KV.DLPackBytesView)
+
+    def test_put_rejects_existing_keys_and_deduplicates_locally(self) -> None:
+        payload = b"payload-data"
+        store = _FakeKvStore(_FakeHolder(payload))
+        adapter = _KV.KVBenchmarkBlockingStore(
+            store,
+            backend_kind=_KV.BACKEND_KIND_FLUXON,
+            get_output=_KV.KVGetOutput.HOLDER,
+        )
+
+        first_error = adapter.put_blocking(
+            "same-key",
+            payload,
+            deadline_ts=10**10,
+            ctx="first",
+        )
+        duplicate_error = adapter.put_blocking(
+            "same-key",
+            payload,
+            deadline_ts=10**10,
+            ctx="duplicate",
+        )
+
+        self.assertIsNone(first_error)
+        self.assertIsNone(duplicate_error)
+        self.assertEqual(store.put_keys, ["same-key"])
+        self.assertEqual(len(store.put_opts), 1)
+        self.assertTrue(store.put_opts[0].reject_if_exists)
 
     def test_cuda_pipeline_retains_host_reference_until_event_completion(self) -> None:
         runtime = _FakeCudaRuntime()

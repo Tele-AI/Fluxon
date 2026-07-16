@@ -175,6 +175,7 @@ pub struct PutStartReq {
     pub key: String,
     pub len: u64,
     pub reject_if_inflight_same_key: bool,
+    pub reject_if_exists: bool,
     /// Prefer placing the target allocation on any kvclient within this sub_cluster.
     pub preferred_sub_cluster: Option<String>,
     /// Optional source-node override for side-transfer workers that share an owner's mmap.

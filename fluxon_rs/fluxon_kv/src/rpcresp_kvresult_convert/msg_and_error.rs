@@ -708,6 +708,9 @@ crate::define_err_group! {
         ,
         (122, KeyBeingWritten { key: String },
             msg: "Key is currently being written: key={key}")
+        ,
+        (123, KeyAlreadyExists { key: String },
+            msg: "Key already exists: key={key}")
     }
 }
 

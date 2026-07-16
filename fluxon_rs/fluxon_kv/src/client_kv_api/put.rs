@@ -35,6 +35,7 @@ impl ClientKvApiInner {
         payload_len: u64,
         len_for_start: u32,
         reject_if_inflight_same_key: bool,
+        reject_if_exists: bool,
         preferred_sub_cluster: Option<&str>,
         lease_id: Option<u64>,
         _test_payload_len_u32: u32,
@@ -57,6 +58,7 @@ impl ClientKvApiInner {
                     key,
                     len_for_start,
                     reject_if_inflight_same_key,
+                    reject_if_exists,
                     preferred_sub_cluster,
                 )
                 .await
@@ -243,6 +245,7 @@ impl ClientKvApiInner {
     ) -> KvResult<()> {
         let lease_id = opts.lease_id();
         let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
+        let reject_if_exists = opts.reject_if_exists();
         let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
 
         let payload_len = calc_flat_dict_encoded_len(&ptrs)?;
@@ -251,6 +254,7 @@ impl ClientKvApiInner {
             payload_len,
             payload_len as u32,
             reject_if_inflight_same_key,
+            reject_if_exists,
             preferred_sub_cluster.as_deref(),
             lease_id,
             payload_len as u32,
@@ -276,6 +280,7 @@ impl ClientKvApiInner {
     ) -> KvResult<()> {
         let lease_id = opts.lease_id();
         let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
+        let reject_if_exists = opts.reject_if_exists();
         let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
         let payload_len = value.len() as u64;
         self.put_common(
@@ -283,6 +288,7 @@ impl ClientKvApiInner {
             payload_len,
             value.len() as u32,
             reject_if_inflight_same_key,
+            reject_if_exists,
             preferred_sub_cluster.as_deref(),
             lease_id,
             value.len() as u32,
@@ -401,6 +407,7 @@ impl ClientKvApiInner {
         key: &str,
         len: u32,
         reject_if_inflight_same_key: bool,
+        reject_if_exists: bool,
         preferred_sub_cluster: Option<&str>,
         source_node_id: Option<NodeIDString>,
     ) -> KvResult<(PutStartResp, i64)> {
@@ -409,6 +416,7 @@ impl ClientKvApiInner {
                 key: key.to_string(),
                 len: len as u64,
                 reject_if_inflight_same_key,
+                reject_if_exists,
                 preferred_sub_cluster: preferred_sub_cluster.map(|s| s.to_string()),
                 source_node_id,
             },
@@ -458,12 +466,14 @@ impl ClientKvApiInner {
         key: &str,
         len: u32,
         reject_if_inflight_same_key: bool,
+        reject_if_exists: bool,
         preferred_sub_cluster: Option<&str>,
     ) -> KvResult<(PutStartResp, i64)> {
         self.put_start_with_source_node(
             key,
             len,
             reject_if_inflight_same_key,
+            reject_if_exists,
             preferred_sub_cluster,
             None,
         )

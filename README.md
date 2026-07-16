@@ -291,6 +291,8 @@ Contributions are welcome. Before you start, please read the developer docs on G
 - [Developer - 2 - Package middleware and images](https://tele-ai.github.io/Fluxon/dev_doc/Developer---2---Package-Middleware-and-Images/)
 - [Developer - 3 - Documentation Writing Rules](https://tele-ai.github.io/Fluxon/dev_doc/Developer---3---Documentation-Writing-Rules/)
 - [Developer - 4 - Publish a release](https://tele-ai.github.io/Fluxon/dev_doc/Developer---4---Publish-a-Release/)
+- [Developer - 5 - Technical Documentation Copy Editing](https://tele-ai.github.io/Fluxon/dev_doc/Developer---5---Technical-Documentation-Copy-Editing/)
+- [Developer - 6 - Code Review Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---6---Code-Review-Guidelines/)
 
 <a id="contributors"></a>
 

@@ -318,12 +318,11 @@ impl ClosedClusterManagerRuntime {
             transfer_link_writer,
             transfer_link_p2p_snapshot_source,
         };
-        runtime.spawn_event_mirror();
         runtime.spawn_self_rdma_mirror();
         Ok(runtime)
     }
 
-    fn spawn_event_mirror(&self) {
+    fn spawn_event_mirror(&self, stream_handle: ClosedRuntimeHandle) {
         let handle = self.handle;
         let event_tx = self.event_tx.clone();
         let self_member_id = self.self_member_id.clone();
@@ -331,9 +330,6 @@ impl ClosedClusterManagerRuntime {
         let prev_members = Arc::clone(&self.prev_members);
         let self_info = Arc::clone(&self.self_info);
         tokio::spawn(async move {
-            let Ok(stream_handle) = subscribe_cluster_manager_events(handle).await else {
-                return;
-            };
             loop {
                 match recv_cluster_event_stream(stream_handle).await {
                     Ok(ClosedRuntimeClusterEventStreamItem::Event(event)) => {
@@ -730,22 +726,44 @@ impl ClusterManager {
                 ClosedRuntimeClusterManagerCall::Init2ForInitDag,
             )
             .await?;
-            self.closed.is_watching.store(true, Ordering::Relaxed);
-            let self_info = closed_cluster_manager_member_call(
+
+            // Subscribe before taking the initialization snapshot. Events that race with the
+            // snapshot stay buffered in the stream, so the local cache cannot permanently miss
+            // a member between the snapshot and subscription.
+            let stream_handle = subscribe_cluster_manager_events(self.closed.handle)
+                .await
+                .map_err(cluster_manager_closed_sdk_error)?;
+            let self_info = match closed_cluster_manager_member_call(
                 self.closed.handle,
                 ClosedRuntimeClusterManagerCall::GetSelfInfo,
             )
-            .await?;
+            .await
+            {
+                Ok(self_info) => self_info,
+                Err(error) => {
+                    let _ = drop_runtime_handle(stream_handle).await;
+                    return Err(error);
+                }
+            };
             refresh_closed_self_info_cache(&self.closed, self_info);
-            let members = closed_cluster_manager_members_call(
+            let members = match closed_cluster_manager_members_call(
                 self.closed.handle,
                 ClosedRuntimeClusterManagerCall::GetMembers,
             )
-            .await?;
+            .await
+            {
+                Ok(members) => members,
+                Err(error) => {
+                    let _ = drop_runtime_handle(stream_handle).await;
+                    return Err(error);
+                }
+            };
             *self.closed.members.write().expect("members cache poisoned") = members
                 .into_iter()
                 .map(|member| (member.id.to_string(), member))
                 .collect();
+            self.closed.spawn_event_mirror(stream_handle);
+            self.closed.is_watching.store(true, Ordering::Relaxed);
             Ok(())
         }
     }

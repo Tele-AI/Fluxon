@@ -44,7 +44,7 @@ use fluxon_framework::{LogicalModule, define_module};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use limit_thirdparty::tokio::sync::ARwLock;
 use limit_thirdparty::tokio::{self, sync::ampsc};
 use moka::notification::RemovalCause;
@@ -590,8 +590,8 @@ pub struct MasterKvRouterInner {
 
     /// (key, put_time_ms, put_version) -> inflight_put_info
     pub inflight_puts: moka::future::Cache<(String, u64, u32), InflightPutInfo>,
-    /// key -> inflight put count
-    pub inflight_put_key_counts: Arc<DashMap<String, u32>>,
+    /// key -> inflight put admission state
+    pub(crate) inflight_put_key_counts: Arc<DashMap<String, InflightPutKeyAdmission>>,
     pub inflight_gets: moka::future::Cache<u64, InflightGetInfo>,
 
     /// Cache for holding get operations (owned, flattened by (node_id, holder_id))
@@ -633,6 +633,12 @@ pub struct MasterKvRouterInner {
     recent_key_versionid_allocator: moka::sync::SegmentedCache<String, Arc<AtomicU32>>,
 
     pub delete_broadcast: EnsureMemholderMgmtDeleteHandle<DeleteKeyInfo>,
+}
+
+#[derive(Debug)]
+pub(crate) struct InflightPutKeyAdmission {
+    inflight_count: u32,
+    create_only: bool,
 }
 
 impl MasterKvRouterInner {
@@ -718,7 +724,8 @@ impl MasterKvRouter {
         } else {
             INFLIGHT_PUT_TTL_SECONDS
         };
-        let inflight_put_key_counts: Arc<DashMap<String, u32>> = Arc::new(DashMap::new());
+        let inflight_put_key_counts: Arc<DashMap<String, InflightPutKeyAdmission>> =
+            Arc::new(DashMap::new());
         let inflight_put_key_counts_for_listener = inflight_put_key_counts.clone();
         let inflight_puts = moka::future::Cache::builder()
             .time_to_live(Duration::from_secs(inflight_put_ttl_seconds))
@@ -814,13 +821,24 @@ impl MasterKvRouter {
         (put_time_ms, put_version)
     }
 
-    fn release_inflight_put_key_count_map(counts: &DashMap<String, u32>, key: &str) {
-        if let Some(mut entry) = counts.get_mut(key) {
-            if *entry <= 1 {
-                drop(entry);
-                counts.remove(key);
+    fn release_inflight_put_key_count_map(
+        counts: &DashMap<String, InflightPutKeyAdmission>,
+        key: &str,
+    ) {
+        if let Entry::Occupied(mut entry) = counts.entry(key.to_string()) {
+            let admission = entry.get_mut();
+            assert!(
+                admission.inflight_count > 0,
+                "inflight put admission count must remain positive"
+            );
+            if admission.inflight_count == 1 {
+                entry.remove();
             } else {
-                *entry -= 1;
+                assert!(
+                    !admission.create_only,
+                    "create-only put admission must remain exclusive"
+                );
+                admission.inflight_count -= 1;
             }
         }
     }
@@ -829,17 +847,45 @@ impl MasterKvRouter {
         &self,
         key: &str,
         reject_if_inflight_same_key: bool,
+        reject_if_exists: bool,
     ) -> Result<(), KvError> {
         let counts = &self.inner().inflight_put_key_counts;
-        let mut entry = counts.entry(key.to_string()).or_insert(0);
-        if reject_if_inflight_same_key && *entry > 0 {
-            return Err(KvError::Api(
-                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::KeyBeingWritten {
-                    key: key.to_string(),
-                },
-            ));
+        match counts.entry(key.to_string()) {
+            Entry::Occupied(mut entry) => {
+                if reject_if_exists {
+                    return Err(KvError::Api(
+                        crate::rpcresp_kvresult_convert::msg_and_error::ApiError::KeyAlreadyExists {
+                            key: key.to_string(),
+                        },
+                    ));
+                }
+                if reject_if_inflight_same_key || entry.get().create_only {
+                    return Err(KvError::Api(
+                        crate::rpcresp_kvresult_convert::msg_and_error::ApiError::KeyBeingWritten {
+                            key: key.to_string(),
+                        },
+                    ));
+                }
+                let admission = entry.get_mut();
+                admission.inflight_count = admission
+                    .inflight_count
+                    .checked_add(1)
+                    .expect("inflight put admission count overflow");
+            }
+            Entry::Vacant(entry) => {
+                if reject_if_exists && self.inner().kv_routes.contains_key(key) {
+                    return Err(KvError::Api(
+                        crate::rpcresp_kvresult_convert::msg_and_error::ApiError::KeyAlreadyExists {
+                            key: key.to_string(),
+                        },
+                    ));
+                }
+                entry.insert(InflightPutKeyAdmission {
+                    inflight_count: 1,
+                    create_only: reject_if_exists,
+                });
+            }
         }
-        *entry += 1;
         Ok(())
     }
 
@@ -1999,5 +2045,86 @@ mod placement_metrics_tests {
                 .load(Ordering::Relaxed),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod put_admission_tests {
+    use super::{MasterKvRouter, MasterKvRouterNewArg, OneKvNodesRoutes};
+    use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError};
+    use std::sync::Arc;
+
+    #[::tokio::test]
+    async fn reject_if_exists_covers_inflight_and_committed_keys() {
+        let router = MasterKvRouter::construct(MasterKvRouterNewArg::default())
+            .await
+            .expect("router construction must succeed");
+        let key = "create-only-key";
+
+        router
+            .reserve_inflight_put_key(key, false, true)
+            .expect("first create-only reservation must succeed");
+        let inflight_err = router
+            .reserve_inflight_put_key(key, false, true)
+            .expect_err("concurrent create-only reservation must be rejected");
+        assert!(matches!(
+            inflight_err,
+            KvError::Api(ApiError::KeyAlreadyExists { key: ref rejected_key })
+                if rejected_key == key
+        ));
+        let overwrite_err = router
+            .reserve_inflight_put_key(key, false, false)
+            .expect_err("create-only reservation must exclude ordinary overwrites");
+        assert!(matches!(
+            overwrite_err,
+            KvError::Api(ApiError::KeyBeingWritten { key: ref rejected_key })
+                if rejected_key == key
+        ));
+
+        // Commit visibility must precede reservation release. A following create-only put
+        // then observes either state and cannot enter through a transition gap.
+        router.inner().kv_routes.insert(
+            key.to_string(),
+            Arc::new(OneKvNodesRoutes::new((1, 0), None)),
+        );
+        router.release_inflight_put_key(key);
+
+        let committed_err = router
+            .reserve_inflight_put_key(key, false, true)
+            .expect_err("committed key must be rejected");
+        assert!(matches!(
+            committed_err,
+            KvError::Api(ApiError::KeyAlreadyExists { key: ref rejected_key })
+                if rejected_key == key
+        ));
+        assert!(
+            !router.inner().inflight_put_key_counts.contains_key(key),
+            "a committed-key rejection must not leave a zero-count admission entry"
+        );
+    }
+
+    #[::tokio::test]
+    async fn existing_overwrite_and_inflight_only_contracts_remain_distinct() {
+        let router = MasterKvRouter::construct(MasterKvRouterNewArg::default())
+            .await
+            .expect("router construction must succeed");
+        let key = "overwrite-key";
+        router.inner().kv_routes.insert(
+            key.to_string(),
+            Arc::new(OneKvNodesRoutes::new((1, 0), None)),
+        );
+
+        router
+            .reserve_inflight_put_key(key, false, false)
+            .expect("ordinary overwrite must remain allowed");
+        let inflight_err = router
+            .reserve_inflight_put_key(key, true, false)
+            .expect_err("inflight-only admission must retain its typed error");
+        assert!(matches!(
+            inflight_err,
+            KvError::Api(ApiError::KeyBeingWritten { key: ref rejected_key })
+                if rejected_key == key
+        ));
+        router.release_inflight_put_key(key);
     }
 }

@@ -2,6 +2,7 @@ Keep this document concise.
 - Core user, developer, and design docs are in-repo under fluxon_doc_cn/ and fluxon_doc_en/
 - Detailed bilingual doc writing rules are indexed at `fluxon_doc_en/dev_doc/Developer - 3 - Documentation Writing Rules.md` and `fluxon_doc_cn/dev_doc/开发者 - 3 - 文档写作规约.md`
 - The bilingual technical copy-editing workflow and one-shot example are at `fluxon_doc_en/dev_doc/Developer - 5 - Technical Documentation Copy Editing.md` and `fluxon_doc_cn/dev_doc/开发者 - 5 - 技术文档审校.md`
+- Bilingual code review rules, finding levels, and review templates are at `fluxon_doc_en/dev_doc/Developer - 6 - Code Review Guidelines.md` and `fluxon_doc_cn/dev_doc/开发者 - 6 - Code Review 规约.md`
 - teststack has two steps: start testbed and testrunner
 - teststack has UI support; testrunner should own the UI authority and API surface, and the UI should run as a long-lived service that reuses the ops interfaces underneath
 - All Python code in this project must be compatible with Python >=3.10
@@ -10,6 +11,9 @@ Keep this document concise.
 - Git operations are limited to basic `stage`, `unstage`, `commit`, and `push`. Do not use other Git operations.
 - Prefer contraction over compatibility by default. Do not add compatibility layers, deprecated paths, or aliases unless the task explicitly requires them.
 - Prefer one canonical name for one concept. Avoid synonym parameters, duplicated entrypoints, and parallel config surfaces.
+- When a change crosses module boundaries or moves resource cleanup, identify one final-release owner. Keep public layers on contracts, composition layers on ordering, and internal modules on their own state and cleanup; fix the invariant at its owner without adding outer field mutation or a duplicate close path.
+- When a change adds lifecycle dependencies or background work, write the dependency order and implement shutdown as admission stop, scoped wake or cancel, quiescence, dependent release, then dependency release. Keep independent branches parallel and avoid a global lock or coordinator unless the dependency graph requires it.
+- When shutdown intent and cleanup completion can diverge, assign each state a scope and sole writer, keep transitions monotonic, make close repeatable, and treat successful close as a completion barrier. Do not add multiple sources of truth for the same lifecycle fact.
 - Do not use environment variables for ordinary parameter passing. Prefer configuration files first, then explicit command-line arguments.
 - Prefer convention over configuration. When one canonical path or default wiring is sufficient, do not add extra config knobs.
 - Minimize multi-path config delivery. Do not pass the same config through parallel channels such as env vars, CLI flags, and files at the same time.

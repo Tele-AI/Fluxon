@@ -1822,6 +1822,7 @@ key={}, attempt={}/{}, err={}",
     ) -> KvResult<()> {
         let lease_id = opts.lease_id();
         let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
+        let reject_if_exists = opts.reject_if_exists();
         let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
         let observe_sink = opts.test_observe_put_phases();
         let observe_enabled = true;
@@ -1857,6 +1858,7 @@ key={}, attempt={}/{}, err={}",
                     base_addr,
                     lease_id,
                     reject_if_inflight_same_key,
+                    reject_if_exists,
                     preferred_sub_cluster.as_deref(),
                     observe_enabled,
                 )
@@ -1909,6 +1911,7 @@ key={}, attempt={}/{}, err={}",
     ) -> KvResult<()> {
         let lease_id = opts.lease_id();
         let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
+        let reject_if_exists = opts.reject_if_exists();
         let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
         let observe_sink = opts.test_observe_put_phases();
         let observe_enabled = true;
@@ -1943,6 +1946,7 @@ key={}, attempt={}/{}, err={}",
                     base_addr,
                     lease_id,
                     reject_if_inflight_same_key,
+                    reject_if_exists,
                     preferred_sub_cluster.as_deref(),
                     observe_enabled,
                 )
@@ -1991,6 +1995,7 @@ key={}, attempt={}/{}, err={}",
         base_addr: usize,
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
+        reject_if_exists: bool,
         preferred_sub_cluster: Option<&str>,
         observe_enabled: bool,
     ) -> KvResult<TestPutPhaseTrace> {
@@ -2000,6 +2005,7 @@ key={}, attempt={}/{}, err={}",
                 key: key.to_string(),
                 len: payload_len,
                 reject_if_inflight_same_key,
+                reject_if_exists,
                 preferred_sub_cluster: preferred_sub_cluster.map(|s| s.to_string()),
                 started_time,
                 test_observe_put_phases: true,
@@ -2148,6 +2154,7 @@ key={}, attempt={}/{}, err={}",
         base_addr: usize,
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
+        reject_if_exists: bool,
         preferred_sub_cluster: Option<&str>,
         observe_enabled: bool,
     ) -> KvResult<TestPutPhaseTrace> {
@@ -2158,6 +2165,7 @@ key={}, attempt={}/{}, err={}",
                 key: key.to_string(),
                 len: value.len() as u64,
                 reject_if_inflight_same_key,
+                reject_if_exists,
                 preferred_sub_cluster: preferred_sub_cluster.map(|s| s.to_string()),
                 started_time,
                 test_observe_put_phases: true,

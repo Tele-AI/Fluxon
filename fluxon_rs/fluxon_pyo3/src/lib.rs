@@ -2968,13 +2968,14 @@ impl KvClient {
     /// on the caller to keep the pointed-to memory alive until the async call completes.
     ///
     /// The backend encoding/copy runs on the Rust runtime without holding the Python GIL.
-    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, callback=None))]
+    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exists=false, callback=None))]
     fn put(
         &self,
         key: &str,
         ptrs: Vec<(u8, u64, u32, u64, u32, Option<u32>)>,
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
+        reject_if_exists: bool,
         callback: Option<PyObject>,
         py: Python,
     ) -> PyObject {
@@ -2984,6 +2985,7 @@ impl KvClient {
             ptrs: Vec<(u8, usize, u32, u64, u32, Option<u32>)>,
             lease_id: Option<u64>,
             reject_if_inflight_same_key: bool,
+            reject_if_exists: bool,
             callback: Option<PyObject>,
             py: Python,
         ) -> ApiResult<PyObject> {
@@ -3011,6 +3013,9 @@ impl KvClient {
                 }
                 if reject_if_inflight_same_key {
                     o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
+                }
+                if reject_if_exists {
+                    o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExists);
                 }
                 o
             };
@@ -3071,6 +3076,7 @@ impl KvClient {
             ptrs_owned,
             lease_id,
             reject_if_inflight_same_key,
+            reject_if_exists,
             callback,
             py,
         )
@@ -3078,13 +3084,14 @@ impl KvClient {
     }
 
     /// Put a key-value pair and wait for completion before returning.
-    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false))]
+    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exists=false))]
     fn put_blocking(
         &self,
         key: &str,
         ptrs: Vec<(u8, u64, u32, u64, u32, Option<u32>)>,
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
+        reject_if_exists: bool,
         py: Python,
     ) -> PyObject {
         fn put_blocking_inner(
@@ -3093,6 +3100,7 @@ impl KvClient {
             ptrs: Vec<(u8, usize, u32, u64, u32, Option<u32>)>,
             lease_id: Option<u64>,
             reject_if_inflight_same_key: bool,
+            reject_if_exists: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if ptrs.len() > (u32::MAX as usize) {
@@ -3123,6 +3131,11 @@ impl KvClient {
                 put_opts
                     .0
                     .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
+            }
+            if reject_if_exists {
+                put_opts
+                    .0
+                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExists);
             }
             let result = match py.allow_threads(|| {
                 runtime.run_async_from_sync(async {
@@ -3171,6 +3184,7 @@ impl KvClient {
             ptrs_owned,
             lease_id,
             reject_if_inflight_same_key,
+            reject_if_exists,
             py,
         )
         .into_py_object(py)

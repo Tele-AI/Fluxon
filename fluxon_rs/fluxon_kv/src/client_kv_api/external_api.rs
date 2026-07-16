@@ -400,6 +400,7 @@ impl HandlerForExternalClient for ClientKvApi {
                 &req.key,
                 req.len as u32,
                 req.reject_if_inflight_same_key,
+                req.reject_if_exists,
                 req.preferred_sub_cluster.as_deref(),
                 source_node_id,
             )

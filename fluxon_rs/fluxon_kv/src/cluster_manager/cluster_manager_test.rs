@@ -4,7 +4,7 @@ use fluxon_framework::{AnyResult, LogicalModule, define_framework, define_module
 use limit_thirdparty::tokio;
 use limit_thirdparty::tokio::time::sleep;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
@@ -35,6 +35,29 @@ async fn clean_etcd_members(cluster_name: &str) {
         Ok(_) => println!("删除前缀成功"),
         Err(e) => println!("删除前缀{}失败", e),
     };
+}
+
+async fn wait_for_member_ids(
+    cluster_manager: &ClusterManager,
+    expected_ids: &[&str],
+) -> Vec<super::ClusterMember> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut expected_ids: Vec<String> = expected_ids.iter().map(|id| (*id).to_string()).collect();
+    expected_ids.sort();
+
+    loop {
+        let members = cluster_manager.get_members();
+        let mut actual_ids: Vec<String> = members.iter().map(|member| member.id.clone()).collect();
+        actual_ids.sort();
+        if actual_ids == expected_ids {
+            return members;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for cluster members: expected={expected_ids:?}, actual={actual_ids:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// 创建一个测试模块来包装 ClusterManager
@@ -493,12 +516,11 @@ async fn test_cluster_manager_multiple_members() {
     let test_module3 = framework3.0.test_cluster_module.get().unwrap();
     let cluster_manager3 = test_module3.cluster_manager();
 
-    sleep(Duration::from_millis(10000)).await;
-
-    // 验证所有成员都能看到彼此
-    let members1 = cluster_manager1.get_members();
-    let members2 = cluster_manager2.get_members();
-    let members3 = cluster_manager3.get_members();
+    // Wait for the observable contract instead of sampling after a fixed delay.
+    let expected_ids = ["test-member-1", "test-member-2", "test-member-3"];
+    let members1 = wait_for_member_ids(cluster_manager1, &expected_ids).await;
+    let members2 = wait_for_member_ids(cluster_manager2, &expected_ids).await;
+    let members3 = wait_for_member_ids(cluster_manager3, &expected_ids).await;
 
     assert_eq!(members1.len(), 3);
     assert_eq!(members2.len(), 3);

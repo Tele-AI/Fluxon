@@ -92,6 +92,8 @@ pub enum PutOptionalArg {
     LeaseId(u64),
     /// Ask the master to fail-fast when the same key already has an inflight put.
     RejectIfInflightSameKey,
+    /// Ask the master to reject the put when the key exists or is being created.
+    RejectIfExists,
     /// Prefer placing the target allocation on a kvclient within this sub_cluster.
     PreferredSubCluster(String),
     /// Hidden test-only side-channel for collecting per-put phase timings.
@@ -111,6 +113,7 @@ impl PutOptionalArgs {
         self.0.iter().rev().find_map(|a| match a {
             PutOptionalArg::LeaseId(id) => Some(*id),
             PutOptionalArg::RejectIfInflightSameKey
+            | PutOptionalArg::RejectIfExists
             | PutOptionalArg::PreferredSubCluster(_)
             | PutOptionalArg::TestObservePutPhases(_) => None,
         })
@@ -122,12 +125,19 @@ impl PutOptionalArgs {
             .any(|arg| matches!(arg, PutOptionalArg::RejectIfInflightSameKey))
     }
 
+    pub fn reject_if_exists(&self) -> bool {
+        self.0
+            .iter()
+            .any(|arg| matches!(arg, PutOptionalArg::RejectIfExists))
+    }
+
     /// Get the last provided preferred_sub_cluster if any.
     pub fn preferred_sub_cluster(&self) -> Option<&str> {
         self.0.iter().rev().find_map(|a| match a {
             PutOptionalArg::PreferredSubCluster(sc) => Some(sc.as_str()),
             PutOptionalArg::LeaseId(_)
             | PutOptionalArg::RejectIfInflightSameKey
+            | PutOptionalArg::RejectIfExists
             | PutOptionalArg::TestObservePutPhases(_) => None,
         })
     }
@@ -137,6 +147,7 @@ impl PutOptionalArgs {
             PutOptionalArg::TestObservePutPhases(sink) => Some(sink.clone()),
             PutOptionalArg::LeaseId(_)
             | PutOptionalArg::RejectIfInflightSameKey
+            | PutOptionalArg::RejectIfExists
             | PutOptionalArg::PreferredSubCluster(_) => None,
         })
     }

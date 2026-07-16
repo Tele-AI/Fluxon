@@ -2,6 +2,7 @@
 - 核心用户文档、开发文档和设计文档都在仓库内的 `fluxon_doc_cn/` 和 `fluxon_doc_en/` 下
 - 详细的中英文文档写作规约索引见 `fluxon_doc_cn/dev_doc/开发者 - 3 - 文档写作规约.md` 和 `fluxon_doc_en/dev_doc/Developer - 3 - Documentation Writing Rules.md`
 - 中英文技术文档审校流程和 one-shot 示例见 `fluxon_doc_cn/dev_doc/开发者 - 5 - 技术文档审校.md` 和 `fluxon_doc_en/dev_doc/Developer - 5 - Technical Documentation Copy Editing.md`
+- 中英文 Code Review 规约、finding 等级和 Review 模板见 `fluxon_doc_cn/dev_doc/开发者 - 6 - Code Review 规约.md` 和 `fluxon_doc_en/dev_doc/Developer - 6 - Code Review Guidelines.md`
 - `teststack` 有两个步骤：`start testbed` 和 `testrunner`
 - `teststack` 支持 UI；`testrunner` 应负责 UI 的 authority 和 API surface，但 UI 应作为常驻服务运行，并复用下层的 ops 接口
 - 本项目所有 Python 代码都必须兼容 Python `>= 3.10`
@@ -10,6 +11,9 @@
 - Git 操作仅限基础的 `stage`、`unstage`、`commit` 和 `push`。不要使用其他 Git 操作
 - 默认优先收束而不是兼容。除非任务明确要求，否则不要添加兼容层、废弃路径或别名
 - 一个概念优先只保留一个正式名字。避免同义参数、重复入口和并行配置面
+- 当改动跨越模块边界或移动资源清理职责时，必须指定唯一 final-release owner。公共层只依赖契约，组合层只安排顺序，内部模块维护自己的状态和 cleanup；在不变量 owner 处修复，不增加外层字段操作或第二条 close 路径
+- 当改动新增生命周期依赖或后台任务时，必须写明依赖顺序，并按“关闭入口、定向 wake/cancel、建立静默点、释放依赖方、最后释放被依赖方”执行关闭。互不依赖的分支保持并行，依赖图不需要时不引入全局锁或全局 coordinator
+- 当停止意图和清理完成可能分离时，必须为每个状态指定作用域和唯一 writer，保持状态单调、close 可重复，并把 close 成功作为完成屏障。不要为同一个生命周期事实增加多个 source of truth
 - 不要用环境变量传递普通参数。优先使用配置文件，其次使用显式命令行参数
 - 优先约定而不是配置。当一个标准路径或默认连接方式已经足够时，不要增加额外配置项
 - 最小化多路径配置传递。不要同时通过环境变量、CLI 参数和文件等并行通道传递同一份配置

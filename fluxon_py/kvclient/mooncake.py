@@ -433,6 +433,7 @@ class MooncakeStore(KvClient):
                     max_calls=1,
                     period=5,
                 )
+        reject_if_exists = bool(opts.reject_if_exists) if opts is not None else False
 
         if not self._initialized:
             return Result.new_error(
@@ -446,7 +447,7 @@ class MooncakeStore(KvClient):
 
         def put_operation(key: str, values: Tuple[bytes, ...]):
             """
-            Put operations explicitly remove old data before writing new data.
+            Put a value once, removing old data first only when overwrite is enabled.
 
             Args:
                 key(str): The input key.
@@ -467,29 +468,30 @@ class MooncakeStore(KvClient):
                 return values_debug
             
             def try_put(key: str, values: Tuple[bytes, ...]) -> Result[OkNone, ApiError]:
-                """Try one force-delete-then-put Mooncake write attempt."""
+                """Try one Mooncake write attempt."""
                 try:
-                    with self._rwlock.read_lock():
-                        remove_retcode = self._store.remove(key, True)
+                    if not reject_if_exists:
+                        with self._rwlock.read_lock():
+                            remove_retcode = self._store.remove(key, True)
 
-                    logging.debug(
-                        f"[put_operation] Force remove retcode: {remove_retcode} for key: {key}"
-                    )
-                    if remove_retcode != 0:
-                        remove_error = try_new_error_from_mooncake(
-                            remove_retcode,
-                            f"Remove operation failed for key '{key}'",
-                            key=key,
+                        logging.debug(
+                            f"[put_operation] Force remove retcode: {remove_retcode} for key: {key}"
                         )
-                        if not isinstance(remove_error, KeyNotFoundError):
-                            logging.warning(
-                                "=============== Mooncake store delete-before-put failed ===============\n"
-                                f"key: {key}\n"
-                                f"values: {debug_values()}\n"
-                                f"error: {remove_error}\n"
-                                "==============================================================\n"
+                        if remove_retcode != 0:
+                            remove_error = try_new_error_from_mooncake(
+                                remove_retcode,
+                                f"Remove operation failed for key '{key}'",
+                                key=key,
                             )
-                            return Result.new_error(remove_error)
+                            if not isinstance(remove_error, KeyNotFoundError):
+                                logging.warning(
+                                    "=============== Mooncake store delete-before-put failed ===============\n"
+                                    f"key: {key}\n"
+                                    f"values: {debug_values()}\n"
+                                    f"error: {remove_error}\n"
+                                    "==============================================================\n"
+                                )
+                                return Result.new_error(remove_error)
 
                     with self._rwlock.read_lock():
                         if len(values) == 1:

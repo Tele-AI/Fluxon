@@ -160,10 +160,11 @@ pub async fn handle_put_start(
     req_node_id: NodeID,
 ) -> (PutIDForAKey, MsgPack<PutStartResp>) {
     let key = req.serialize_part.key.clone();
-    if let Err(err) = view
-        .master_kv_router()
-        .reserve_inflight_put_key(&key, req.serialize_part.reject_if_inflight_same_key)
-    {
+    if let Err(err) = view.master_kv_router().reserve_inflight_put_key(
+        &key,
+        req.serialize_part.reject_if_inflight_same_key,
+        req.serialize_part.reject_if_exists,
+    ) {
         let resp: PutStartResp = crate::rpcresp_kvresult_convert::FromError::from_error(&err);
         return (
             (0, 0),
@@ -733,7 +734,8 @@ pub async fn handle_put_done(
         .remove(&full_put_id)
         .await
     {
-        view.master_kv_router().release_inflight_put_key(&key);
+        // Keep same-key admission reserved until the new route is visible.
+        let key_reservation = InflightPutKeyReservation::new(view.clone(), key.clone());
         let Some(allocs) = src_target_allocation.lock().take() else {
             tracing::warn!(
                 "Put operation with put_id {:?} not found for completion",
@@ -884,6 +886,9 @@ pub async fn handle_put_done(
                 tomb_tag.clone(),
             );
         }
+        // Publish the route before releasing admission so reject-if-exists observes either
+        // the inflight reservation or the committed route, with no visibility gap.
+        drop(key_reservation);
 
         let cache_weight_bytes = (lease_id_opt.is_none()
             && view.master_kv_router().replica_cache_enabled())

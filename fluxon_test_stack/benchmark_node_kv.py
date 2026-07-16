@@ -378,6 +378,10 @@ def _is_key_being_written_error(error: Any) -> bool:
     return type(error).__name__ == "KeyBeingWrittenError"
 
 
+def _is_key_already_exists_error(error: Any) -> bool:
+    return type(error).__name__ == "KeyAlreadyExistsError"
+
+
 def _is_mooncake_replica_not_ready_error(error: Any) -> bool:
     details = getattr(error, "details", None)
     if not isinstance(details, dict):
@@ -386,7 +390,11 @@ def _is_mooncake_replica_not_ready_error(error: Any) -> bool:
 
 
 def _is_put_compat_success_error(error: Any) -> bool:
-    return _is_key_being_written_error(error) or _is_mooncake_replica_not_ready_error(error)
+    return (
+        _is_key_being_written_error(error)
+        or _is_key_already_exists_error(error)
+        or _is_mooncake_replica_not_ready_error(error)
+    )
 
 
 def normalize_kv_get_error(error_msg: Optional[str]) -> Optional[str]:
@@ -2725,6 +2733,9 @@ class KVBenchmarkBlockingStore:
         self._store = store
         self._get_output = get_output
         self._phase_profiler = _FluxonPhaseProfiler()
+        self._put_dedupe_condition = threading.Condition()
+        self._put_confirmed_keys: set[str] = set()
+        self._put_inflight_keys: set[str] = set()
         self._cuda_pipeline = (
             _CudaHostToDevicePipeline(device_index=cuda_device_index)
             if self._get_output == KVGetOutput.CUDA
@@ -2770,6 +2781,32 @@ class KVBenchmarkBlockingStore:
             return {}
         return sampler.finish()
 
+    def _begin_deduplicated_put(
+        self,
+        key: str,
+        *,
+        deadline_ts: float,
+    ) -> tuple[bool, Optional[str]]:
+        with self._put_dedupe_condition:
+            while key in self._put_inflight_keys:
+                remaining = float(deadline_ts) - time.time()
+                if remaining <= 0.0:
+                    return False, f"PUT timed out waiting for same-key benchmark put: key={key!r}"
+                self._put_dedupe_condition.wait(timeout=remaining)
+            if key in self._put_confirmed_keys:
+                return False, None
+            self._put_inflight_keys.add(key)
+            return True, None
+
+    def _finish_deduplicated_put(self, key: str, *, confirmed: bool) -> None:
+        with self._put_dedupe_condition:
+            if key not in self._put_inflight_keys:
+                raise RuntimeError(f"benchmark PUT key was not inflight: {key!r}")
+            self._put_inflight_keys.remove(key)
+            if confirmed:
+                self._put_confirmed_keys.add(key)
+            self._put_dedupe_condition.notify_all()
+
     def put_blocking(
         self,
         key: str,
@@ -2781,6 +2818,32 @@ class KVBenchmarkBlockingStore:
         try:
             _bench_kv_print(f"{ctx} PUT begin key={key!r} payload_size={len(payload)}", verbose_only=True)
             started_at = time.perf_counter()
+            should_submit, dedupe_error = self._begin_deduplicated_put(
+                key,
+                deadline_ts=deadline_ts,
+            )
+            if not should_submit:
+                done_at = time.perf_counter()
+                phase_sample = _build_fluxon_sync_phase_sample(
+                    started_at=started_at,
+                    done_at=done_at,
+                    deadline_ts=deadline_ts,
+                    wall_done_ts=time.time(),
+                )
+                self._phase_profiler.record(
+                    op_name="PUT",
+                    key=key,
+                    sample=phase_sample,
+                    error_msg=dedupe_error,
+                )
+                if dedupe_error is not None:
+                    return dedupe_error
+                _bench_kv_print(
+                    f"{ctx} PUT deduplicated key={key!r}",
+                    verbose_only=True,
+                )
+                return None
+
             value: Any = payload
             if self._get_output == KVGetOutput.CUDA:
                 value = DLPackBytesView(
@@ -2790,17 +2853,26 @@ class KVBenchmarkBlockingStore:
                     lanes=1,
                     shape=(len(payload),),
                 )
-            result = self._store.put_blocking(
-                key,
-                {"payload": value},
-                opts=PutOptionalArgs(reject_if_inflight_same_key=True),
-            )
+            put_confirmed = False
+            put_error: Optional[Any] = None
+            try:
+                result = self._store.put_blocking(
+                    key,
+                    {"payload": value},
+                    opts=PutOptionalArgs(reject_if_exists=True),
+                )
+                if result.is_ok():
+                    put_confirmed = True
+                else:
+                    put_error = result.unwrap_error()
+                    put_confirmed = _is_key_already_exists_error(put_error)
+            finally:
+                self._finish_deduplicated_put(key, confirmed=put_confirmed)
             done_at = time.perf_counter()
             wall_done_ts = time.time()
             err: Optional[str] = None
             compat_success = False
-            if not result.is_ok():
-                put_error = result.unwrap_error()
+            if put_error is not None:
                 if _is_put_compat_success_error(put_error):
                     _bench_kv_print(
                         f"{ctx} PUT compat-success key={key!r} reason={type(put_error).__name__}",

@@ -88,7 +88,7 @@ async fn test2_rebind_to_new_lease_preserves_until_new_expire() {
     let client_view = client_fw.client_kv_api_view();
     wait_master_ready(&client_view).await;
 
-    let l1 = grant_short_lease_for_test(master_fw.as_ref(), 2).await;
+    let l1 = grant_short_lease_for_test(master_fw.as_ref(), 300).await;
     let keys: Vec<String> = (0..10).map(|i| format!("t2_key_{}", i)).collect();
     let value_a = vec![3u8; 64];
     for k in &keys {
@@ -104,8 +104,8 @@ async fn test2_rebind_to_new_lease_preserves_until_new_expire() {
         keys.len()
     );
 
-    // Rebind to a newer lease with longer TTL
-    let l2 = grant_short_lease_for_test(master_fw.as_ref(), 4).await;
+    // Rebind each key to a new lease and key version.
+    let l2 = grant_short_lease_for_test(master_fw.as_ref(), 300).await;
     let value_b = vec![9u8; 64];
     for k in &keys {
         client_view
@@ -119,8 +119,13 @@ async fn test2_rebind_to_new_lease_preserves_until_new_expire() {
         l2
     );
 
-    // After l1 expiry, keys should still exist due to l2
-    sleep(Duration::from_secs(3)).await;
+    // Expiring the old lease must not delete the newer key versions bound to l2.
+    master_fw
+        .master_lease_manager_view()
+        .master_lease_manager()
+        .expire_lease_for_test(l1)
+        .await
+        .unwrap();
     for k in &keys {
         assert!(
             client_view
@@ -135,8 +140,13 @@ async fn test2_rebind_to_new_lease_preserves_until_new_expire() {
         "[test2-verify-still-present-after-first-expire] keys still exist after first lease expired, held by second lease"
     );
 
-    // After l2 expiry + grace, keys should be gone
-    sleep(Duration::from_secs(3)).await;
+    // Expiring the current lease owns deletion of the current key versions.
+    master_fw
+        .master_lease_manager_view()
+        .master_lease_manager()
+        .expire_lease_for_test(l2)
+        .await
+        .unwrap();
     for k in &keys {
         let exist = client_view
             .client_kv_api()
