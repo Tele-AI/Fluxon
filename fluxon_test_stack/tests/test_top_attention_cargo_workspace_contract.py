@@ -13,15 +13,35 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 INDEX_DIR = REPO_ROOT / "fluxon_test_stack" / "top_attention_test_index"
 
 MODULE_SPECS = {
-    "_cargo_cli.py": "fluxon_rs/fluxon_cli/Cargo.toml",
-    "_cargo_commu.py": "fluxon_rs/fluxon_commu/Cargo.toml",
-    "_cargo_commu_contract.py": "fluxon_rs/fluxon_commu_contract/Cargo.toml",
-    "_cargo_framework.py": "fluxon_rs/fluxon_framework/Cargo.toml",
-    "_cargo_limit_thirdparty.py": "fluxon_rs/limit_thirdparty/Cargo.toml",
-    "_cargo_mq.py": "fluxon_rs/fluxon_mq/Cargo.toml",
-    "_cargo_observability.py": "fluxon_rs/fluxon_observability/Cargo.toml",
-    "_cargo_ops.py": "fluxon_rs/fluxon_ops/Cargo.toml",
-    "_cargo_pyo3.py": "fluxon_rs/fluxon_pyo3/Cargo.toml",
+    "_cargo_cli.py": ["test", "--manifest-path", "fluxon_rs/fluxon_cli/Cargo.toml"],
+    "_cargo_commu.py": [
+        "test",
+        "--manifest-path",
+        "fluxon_rs/Cargo.toml",
+        "-p",
+        "fluxon_commu",
+        "-p",
+        "fluxon_commu_closed_sdk_consumer",
+    ],
+    "_cargo_commu_contract.py": [
+        "test",
+        "--manifest-path",
+        "fluxon_rs/fluxon_commu_contract/Cargo.toml",
+    ],
+    "_cargo_framework.py": ["test", "--manifest-path", "fluxon_rs/fluxon_framework/Cargo.toml"],
+    "_cargo_limit_thirdparty.py": [
+        "test",
+        "--manifest-path",
+        "fluxon_rs/limit_thirdparty/Cargo.toml",
+    ],
+    "_cargo_mq.py": ["test", "--manifest-path", "fluxon_rs/fluxon_mq/Cargo.toml"],
+    "_cargo_observability.py": [
+        "test",
+        "--manifest-path",
+        "fluxon_rs/fluxon_observability/Cargo.toml",
+    ],
+    "_cargo_ops.py": ["test", "--manifest-path", "fluxon_rs/fluxon_ops/Cargo.toml"],
+    "_cargo_pyo3.py": ["test", "--manifest-path", "fluxon_rs/fluxon_pyo3/Cargo.toml"],
 }
 
 
@@ -46,7 +66,7 @@ def _load_module(module_name: str):
 
 class TestTopAttentionCargoWorkspaceContract(unittest.TestCase):
     def test_main_calls_cargo_test_for_expected_manifest(self) -> None:
-        for module_name, manifest_relpath in MODULE_SPECS.items():
+        for module_name, expected_args in MODULE_SPECS.items():
             with self.subTest(module_name=module_name):
                 entry = _load_module(module_name)
                 module_path = INDEX_DIR / module_name
@@ -55,13 +75,13 @@ class TestTopAttentionCargoWorkspaceContract(unittest.TestCase):
                         rc = entry.main()
 
                 self.assertEqual(rc, 0)
+                expected_command = [
+                    str(REPO_ROOT / arg) if arg.endswith("Cargo.toml") else arg
+                    for arg in expected_args
+                ]
                 self.assertEqual(
                     run_cargo.call_args.args[0],
-                    [
-                        "test",
-                        "--manifest-path",
-                        str(REPO_ROOT / manifest_relpath),
-                    ],
+                    expected_command,
                 )
 
     def test_main_rejects_pytest_style_passthrough_flags(self) -> None:

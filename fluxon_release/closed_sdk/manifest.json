@@ -6,9 +6,10 @@
   "required_open_surface_version": "0.2.1",
   "feature_contract": {
     "boundary_mode": "closed-sdk-consumer",
-    "runtime_authority_crate": "fluxon_commu_private_impl"
+    "runtime_authority_crate": "fluxon_commu_private_impl",
+    "transfer_link_snapshot_mode": "watch-v1"
   },
-  "public_workspace_input_sha256": "4728431c40d83879742045361fc6295ebe401d132c964269965212991ff010b0",
+  "public_workspace_input_sha256": "95352d10424fd56d82f15dea7dd66544f213ccbc14aa3292b2cb4523732745d8",
   "layout": {
     "native": "native",
     "lib": "lib"

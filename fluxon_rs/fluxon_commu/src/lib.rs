@@ -53,9 +53,9 @@ pub use p2p::{
 };
 pub use transfer::{
     META_KEY_TRANSFER_BACKEND_EPOCH, META_KEY_TRANSFER_READY, P2pTransportKind,
-    TransferLinkEtcdWrite, TransferLinkEtcdWriterHandle, TransferLinkKeyKind,
-    TransferLinkP2pSnapshotSource, TransferLinkP2pState, TransferLinkRecord, TransferLinkTeState,
-    TransferReadyInfo, transfer_backend_epoch_from_metadata,
+    TransferLinkEtcdWrite, TransferLinkEtcdWriterHandle, TransferLinkKeyKind, TransferLinkP2pState,
+    TransferLinkRecord, TransferLinkTeState, TransferReadyInfo,
+    transfer_backend_epoch_from_metadata,
 };
 pub use transfer_engine::{
     ClientTransferEngineClusterRuntime, ClientTransferEngineComposedRuntime,
