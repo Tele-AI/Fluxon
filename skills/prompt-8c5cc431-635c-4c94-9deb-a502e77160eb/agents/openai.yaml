@@ -1,6 +1,0 @@
-interface:
-  display_name: "关注 dever_yew 开发"
-  short_description: "关注 dever_yew 开发"
-  default_prompt: "Use $prompt-8c5cc431-635c-4c94-9deb-a502e77160eb."
-policy:
-  allow_implicit_invocation: false
