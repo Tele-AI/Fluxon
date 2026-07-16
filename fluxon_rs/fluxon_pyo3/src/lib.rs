@@ -924,26 +924,6 @@ impl MqFrameworkShutdown {
     }
 }
 
-fn register_mq_shutdown_bridge(kv_framework: &Arc<Framework>, mq_shutdown: &MqFrameworkShutdown) {
-    use fluxon_framework_compiled::shutdown::ViewShutdownExt;
-    use fluxon_framework_compiled::spawn::ViewSpawnExt;
-
-    let mut waiter = kv_framework.register_shutdown_waiter();
-    let mq_shutdown = mq_shutdown.clone();
-    let fut = async move {
-        waiter.wait().await;
-        mq_shutdown
-            .shutdown()
-            .await
-            .expect("mq_framework.shutdown() failed during kv shutdown bridge");
-    };
-    let handle = kv_framework.spawn_boxed(Box::pin(fut));
-    kv_framework.push_join_handle(
-        "pyo3.kv_shutdown_bridge_to_mq_framework".to_string(),
-        handle,
-    );
-}
-
 fn register_fs_shutdown_bridge(kv_framework: &Arc<Framework>, fs_framework: &fluxon_fs::Framework) {
     use fluxon_framework_compiled::shutdown::ViewShutdownExt;
     use fluxon_framework_compiled::spawn::ViewSpawnExt;
@@ -1060,7 +1040,6 @@ fn new_fluxon_mq_context(client: &KvClient) -> PyResult<FluxonMqContext> {
         fluxon_mq::new_mq_framework()
     };
     let mq_shutdown = MqFrameworkShutdown::new(&runtime, mq_framework.clone());
-    register_mq_shutdown_bridge(&kv_framework, &mq_shutdown);
     Ok(FluxonMqContext {
         kv_framework,
         runtime,

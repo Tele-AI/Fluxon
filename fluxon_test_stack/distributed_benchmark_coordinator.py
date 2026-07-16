@@ -106,6 +106,9 @@ COMPLETION_STATUS_RESULT_TIMEOUT = "RESULT_TIMEOUT"
 ROUND_GATE_STATUS_WAITING = "waiting"
 ROUND_GATE_STATUS_COMPLETED = "completed"
 ROUND_GATE_STATUS_FAILED = "failed"
+ROUND_GATE_TERMINAL_STATUSES = frozenset(
+    (ROUND_GATE_STATUS_COMPLETED, ROUND_GATE_STATUS_FAILED)
+)
 P2P_RECV_PROM_COMPONENT_RPC_TRANSPORT = "rpc_transport"
 P2P_RECV_PROM_COMPONENT_LOCAL_IPC = "local_ipc"
 P2P_RECV_PROM_METRIC_RECV_COMPLETED = "recv_completed"
@@ -725,6 +728,33 @@ class NodeMetrics:
     tcp_thread_transport_summary: Dict[str, Any]
     p2p_receive_transport_summary: Dict[str, Any]
     p2p_rpc_completion_summary: Dict[str, Any]
+
+
+class _ResultRecordDisposition(Enum):
+    RECORDED_WAITING = "recorded_waiting"
+    RECORDED_COMPLETED = "recorded_completed"
+    IGNORED_TERMINAL = "ignored_terminal"
+
+
+@dataclass(frozen=True)
+class _ResultRecordOutcome:
+    disposition: _ResultRecordDisposition
+    reported_result_node_count: int
+    terminal_status: Optional[str]
+
+
+class _RoundCompletionDisposition(Enum):
+    COMPLETED = "completed"
+    FORCED_MISSING_CONSUMERS = "forced_missing_consumers"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class _RoundCompletionOutcome:
+    disposition: _RoundCompletionDisposition
+    reported_node_ids: Tuple[str, ...]
+    missing_node_ids: Tuple[str, ...]
+    forced_consumer_node_ids: Tuple[str, ...] = ()
 
 
 def _describe_value_size_config(
@@ -2607,21 +2637,24 @@ class CoordinatorServer:
                 ),
             )
 
-            reported_result_node_count = self._upsert_test_result(metrics)
-            logger.info(f"📊 收到节点 {node_id} 的测试结果")
-            self._update_round_gate_waiting(
-                test_id=metrics.test_id,
-                completion_error=None,
-            )
-
-            # Count completion by unique node_id, not raw message count.
-            if reported_result_node_count >= self.expected_nodes:
-                logger.info("🎉 所有节点都已上报结果")
-                self._set_round_gate_terminal(
-                    test_id=metrics.test_id,
-                    status=ROUND_GATE_STATUS_COMPLETED,
-                    completion_error=None,
+            record_outcome = self._record_test_result(metrics)
+            if (
+                record_outcome.disposition
+                == _ResultRecordDisposition.IGNORED_TERMINAL
+            ):
+                logger.info(
+                    "Ignored result reported after round termination: "
+                    f"test_id={metrics.test_id} node_id={node_id} "
+                    f"terminal_status={record_outcome.terminal_status}"
                 )
+            else:
+                logger.info(f"📊 收到节点 {node_id} 的测试结果")
+
+            if (
+                record_outcome.disposition
+                == _ResultRecordDisposition.RECORDED_COMPLETED
+            ):
+                logger.info("🎉 所有节点都已上报结果")
                 self.all_results_received.set()
 
             # Send ack response
@@ -2659,54 +2692,63 @@ class CoordinatorServer:
                 return None
             return str(self.test_config.test_id)
 
-    def _update_round_gate_waiting(
-        self,
-        *,
-        test_id: str,
-        completion_error: Optional[str],
-    ) -> None:
-        with self.lock:
-            state = self.round_gate_states.setdefault(
-                str(test_id),
-                {
-                    "status": ROUND_GATE_STATUS_WAITING,
-                    "expected_nodes": int(self.expected_nodes),
-                    "reported_result_node_count": 0,
-                    "completion_error": None,
-                },
-            )
-            results = self.test_results.get(str(test_id), [])
-            state["status"] = ROUND_GATE_STATUS_WAITING
-            state["expected_nodes"] = int(self.expected_nodes)
-            state["reported_result_node_count"] = len(
-                {str(node.node_id) for node in results}
-            )
-            state["completion_error"] = completion_error
+    def _round_gate_state_locked(self, *, test_id: str) -> Dict[str, Any]:
+        return self.round_gate_states.setdefault(
+            str(test_id),
+            {
+                "status": ROUND_GATE_STATUS_WAITING,
+                "expected_nodes": int(self.expected_nodes),
+                "reported_result_node_count": 0,
+                "completion_error": None,
+            },
+        )
 
-    def _set_round_gate_terminal(
-        self,
-        *,
-        test_id: str,
-        status: str,
-        completion_error: Optional[str],
-    ) -> None:
+    def _upsert_test_result_locked(self, metrics: NodeMetrics) -> int:
+        test_id = str(metrics.test_id)
+        results = self.test_results.setdefault(test_id, [])
+        node_id = str(metrics.node_id)
+        for idx, existing in enumerate(results):
+            if str(existing.node_id) == node_id:
+                results[idx] = metrics
+                break
+        else:
+            results.append(metrics)
+        return len({str(node.node_id) for node in results})
+
+    def _record_test_result(self, metrics: NodeMetrics) -> _ResultRecordOutcome:
+        """Record one result unless the round has already reached a terminal state."""
+        test_id = str(metrics.test_id)
         with self.lock:
-            state = self.round_gate_states.setdefault(
-                str(test_id),
-                {
-                    "status": ROUND_GATE_STATUS_WAITING,
-                    "expected_nodes": int(self.expected_nodes),
-                    "reported_result_node_count": 0,
-                    "completion_error": None,
-                },
-            )
-            results = self.test_results.get(str(test_id), [])
+            state = self._round_gate_state_locked(test_id=test_id)
+            status = str(state["status"])
+            if status in ROUND_GATE_TERMINAL_STATUSES:
+                return _ResultRecordOutcome(
+                    disposition=_ResultRecordDisposition.IGNORED_TERMINAL,
+                    reported_result_node_count=int(
+                        state["reported_result_node_count"]
+                    ),
+                    terminal_status=status,
+                )
+
+            reported_result_node_count = self._upsert_test_result_locked(metrics)
+            expected_nodes = int(state["expected_nodes"])
+            if reported_result_node_count >= expected_nodes:
+                status = ROUND_GATE_STATUS_COMPLETED
+                disposition = _ResultRecordDisposition.RECORDED_COMPLETED
+            else:
+                status = ROUND_GATE_STATUS_WAITING
+                disposition = _ResultRecordDisposition.RECORDED_WAITING
+
             state["status"] = status
-            state["expected_nodes"] = int(self.expected_nodes)
-            state["reported_result_node_count"] = len(
-                {str(node.node_id) for node in results}
+            state["reported_result_node_count"] = reported_result_node_count
+            state["completion_error"] = None
+            return _ResultRecordOutcome(
+                disposition=disposition,
+                reported_result_node_count=reported_result_node_count,
+                terminal_status=(
+                    status if status in ROUND_GATE_TERMINAL_STATUSES else None
+                ),
             )
-            state["completion_error"] = completion_error
 
     def _round_gate_snapshot(self, *, test_id: str) -> Dict[str, Any]:
         with self.lock:
@@ -2919,161 +2961,225 @@ class CoordinatorServer:
                 aggregated[str(error_key)] = aggregated.get(str(error_key), 0) + int(count)
         return aggregated
 
-    def _upsert_test_result(self, metrics: NodeMetrics) -> int:
+    @staticmethod
+    def _missing_consumer_placeholder(
+        *,
+        test_id: str,
+        node_id: str,
+        node_role: str,
+    ) -> NodeMetrics:
+        return NodeMetrics(
+            test_id=test_id,
+            node_id=node_id,
+            node_role=node_role,
+            total_operations=1,
+            successful_operations=0,
+            failed_operations=1,
+            get_total_operations=0,
+            get_hit_operations=0,
+            get_miss_operations=0,
+            get_error_operations=0,
+            avg_latency_us=0.0,
+            p50_latency_us=0.0,
+            p99_latency_us=0.0,
+            p95_latency_us=0.0,
+            throughput_ops_per_sec=0.0,
+            total_throughput_ops_per_sec=0.0,
+            get_total_throughput_ops_per_sec=0.0,
+            get_hit_throughput_ops_per_sec=0.0,
+            get_miss_throughput_ops_per_sec=0.0,
+            total_bytes_processed=0,
+            total_duration_seconds=0.0,
+            error_details={"forced_missing_consumer_result_timeout": 1},
+            top_slowest_operations=[],
+            inflight_max=0,
+            inflight_avg=0.0,
+            observed_value_size_histogram={},
+            observed_value_size_avg=0.0,
+            observed_value_size_min=0,
+            observed_value_size_max=0,
+            fluxon_phase_summary={},
+            network_bandwidth={},
+            tcp_thread_transport_summary={},
+            p2p_receive_transport_summary={},
+            p2p_rpc_completion_summary={},
+        )
+
+    def _finalize_round_after_result_wait(
+        self,
+        *,
+        test_id: str,
+        test_mode: str,
+        wait_completed: bool,
+        completion_error: str,
+    ) -> _RoundCompletionOutcome:
+        """Finalize one result snapshot while holding the result/gate lock."""
         with self.lock:
-            test_id = metrics.test_id
-            if test_id not in self.test_results:
-                self.test_results[test_id] = []
-            results = self.test_results[test_id]
-            node_id = str(metrics.node_id)
-            for idx, existing in enumerate(results):
-                if str(existing.node_id) == node_id:
-                    results[idx] = metrics
-                    break
-            else:
-                results.append(metrics)
-            return len({str(node.node_id) for node in results})
+            state = self._round_gate_state_locked(test_id=test_id)
+            status = str(state["status"])
+            if status not in (
+                ROUND_GATE_STATUS_WAITING,
+                ROUND_GATE_STATUS_COMPLETED,
+                ROUND_GATE_STATUS_FAILED,
+            ):
+                raise RuntimeError(
+                    f"unknown round gate status for test_id={test_id}: {status}"
+                )
+
+            results = self.test_results.setdefault(test_id, [])
+            reported_node_ids = tuple(
+                sorted({str(node.node_id) for node in results})
+            )
+            registered_nodes = {
+                str(node_id): metadata
+                for node_id, metadata in self.registered_nodes.items()
+            }
+            missing_node_ids = tuple(
+                sorted(
+                    node_id
+                    for node_id in registered_nodes
+                    if node_id not in reported_node_ids
+                )
+            )
+
+            if status == ROUND_GATE_STATUS_COMPLETED:
+                return _RoundCompletionOutcome(
+                    disposition=_RoundCompletionDisposition.COMPLETED,
+                    reported_node_ids=reported_node_ids,
+                    missing_node_ids=missing_node_ids,
+                )
+            if status == ROUND_GATE_STATUS_FAILED:
+                return _RoundCompletionOutcome(
+                    disposition=_RoundCompletionDisposition.FAILED,
+                    reported_node_ids=reported_node_ids,
+                    missing_node_ids=missing_node_ids,
+                )
+
+            expected_nodes = int(state["expected_nodes"])
+            if len(reported_node_ids) >= expected_nodes:
+                state["status"] = ROUND_GATE_STATUS_COMPLETED
+                state["reported_result_node_count"] = len(reported_node_ids)
+                state["completion_error"] = None
+                return _RoundCompletionOutcome(
+                    disposition=_RoundCompletionDisposition.COMPLETED,
+                    reported_node_ids=reported_node_ids,
+                    missing_node_ids=missing_node_ids,
+                )
+
+            if wait_completed:
+                raise RuntimeError(
+                    "all_results_received was set before the round had enough "
+                    f"unique results: test_id={test_id} "
+                    f"reported={len(reported_node_ids)} expected={expected_nodes}"
+                )
+
+            missing_consumers = tuple(
+                node_id
+                for node_id in missing_node_ids
+                if str((registered_nodes[node_id] or {}).get("node_role"))
+                == "consumer"
+            )
+            missing_non_consumers = tuple(
+                node_id
+                for node_id in missing_node_ids
+                if node_id not in missing_consumers
+            )
+            has_producer_result = any(
+                isinstance(result, NodeMetrics) and result.node_role == "producer"
+                for result in results
+            )
+            can_force_missing_consumers = (
+                test_mode == TestMode.MPMC.value
+                and bool(missing_consumers)
+                and not missing_non_consumers
+                and has_producer_result
+                and len(reported_node_ids) + len(missing_consumers)
+                >= expected_nodes
+            )
+
+            if can_force_missing_consumers:
+                for node_id in missing_consumers:
+                    metadata = registered_nodes[node_id] or {}
+                    role = metadata.get("node_role")
+                    node_role = str(role) if isinstance(role, str) else "consumer"
+                    self._upsert_test_result_locked(
+                        self._missing_consumer_placeholder(
+                            test_id=test_id,
+                            node_id=node_id,
+                            node_role=node_role,
+                        )
+                    )
+
+                reported_node_ids = tuple(
+                    sorted({str(node.node_id) for node in results})
+                )
+                state["status"] = ROUND_GATE_STATUS_COMPLETED
+                state["reported_result_node_count"] = len(reported_node_ids)
+                state["completion_error"] = None
+                return _RoundCompletionOutcome(
+                    disposition=(
+                        _RoundCompletionDisposition.FORCED_MISSING_CONSUMERS
+                    ),
+                    reported_node_ids=reported_node_ids,
+                    missing_node_ids=missing_node_ids,
+                    forced_consumer_node_ids=missing_consumers,
+                )
+
+            state["status"] = ROUND_GATE_STATUS_FAILED
+            state["reported_result_node_count"] = len(reported_node_ids)
+            state["completion_error"] = completion_error
+            return _RoundCompletionOutcome(
+                disposition=_RoundCompletionDisposition.FAILED,
+                reported_node_ids=reported_node_ids,
+                missing_node_ids=missing_node_ids,
+            )
 
     def wait_for_completion(self, *, timeout_s: float) -> bool:
         """Wait for all node results with a config-derived deadline."""
         if timeout_s <= 0:
             raise ValueError(f"wait_for_completion timeout_s must be > 0, got {timeout_s}")
-        test_id = self._current_test_id()
-        completed = self.all_results_received.wait(timeout=timeout_s)
-        if completed:
-            if test_id is not None:
-                self._set_round_gate_terminal(
-                    test_id=test_id,
-                    status=ROUND_GATE_STATUS_COMPLETED,
-                    completion_error=None,
-                )
-            return True
-        missing_nodes = self._missing_result_node_ids()
-        reported_nodes = self._reported_result_node_ids()
+        with self.lock:
+            if self.test_config is None:
+                raise RuntimeError("wait_for_completion requires active test_config")
+            test_id = str(self.test_config.test_id)
+            test_mode = str(self.test_config.test_mode)
+
+        wait_completed = self.all_results_received.wait(timeout=timeout_s)
         completion_error = (
             "benchmark result wait timed out after "
             f"{timeout_s:.1f}s"
         )
-        logger.error(
-            "❌ benchmark result wait timed out: "
-            f"timeout_s={timeout_s} expected_nodes={self.expected_nodes} "
-            f"reported_nodes={reported_nodes} missing_nodes={missing_nodes}"
+        outcome = self._finalize_round_after_result_wait(
+            test_id=test_id,
+            test_mode=test_mode,
+            wait_completed=wait_completed,
+            completion_error=completion_error,
         )
 
-        # English note:
-        # - In MPMC mode, producer/consumer are separate logical nodes.
-        # - If only consumer nodes are missing results, we force a placeholder metrics
-        #   record for each missing consumer so the run can converge deterministically,
-        #   while keeping the anomaly visible in error_details.
-        # - If any non-consumer node is missing (e.g. producer), we still fail the run.
-        if self.test_config and self.test_config.test_mode == TestMode.MPMC.value:
-            missing_non_consumer: list[str] = []
-            missing_consumers: list[str] = []
-            with self.lock:
-                for node_id in missing_nodes:
-                    meta = self.registered_nodes.get(node_id) or {}
-                    role = meta.get("node_role")
-                    role_s = str(role) if isinstance(role, str) else "unknown"
-                    if role_s == "consumer":
-                        missing_consumers.append(str(node_id))
-                    else:
-                        missing_non_consumer.append(str(node_id))
-
-            if not missing_non_consumer and missing_consumers:
-                # Only force-complete if we have at least one producer result.
-                has_producer_result = False
-                with self.lock:
-                    for raw in self.test_results.get(self.test_config.test_id, []):
-                        if isinstance(raw, NodeMetrics) and raw.node_role == "producer":
-                            has_producer_result = True
-                            break
-
-                if has_producer_result:
-                    forced_error_label = "forced_missing_consumer_result_timeout"
-                    forced_completion_ready = False
-                    with self.lock:
-                        test_id = self.test_config.test_id
-                        if test_id not in self.test_results:
-                            self.test_results[test_id] = []
-                        for node_id in missing_consumers:
-                            meta = self.registered_nodes.get(node_id) or {}
-                            role = meta.get("node_role")
-                            role_s = str(role) if isinstance(role, str) else "consumer"
-                            # Force a placeholder result with explicit error_details so downstream
-                            # can surface the anomaly without stalling the whole suite.
-                            self.test_results[test_id].append(
-                                NodeMetrics(
-                                    test_id=test_id,
-                                    node_id=str(node_id),
-                                    node_role=role_s,
-                                    total_operations=1,
-                                    successful_operations=0,
-                                    failed_operations=1,
-                                    get_total_operations=0,
-                                    get_hit_operations=0,
-                                    get_miss_operations=0,
-                                    get_error_operations=0,
-                                    avg_latency_us=0.0,
-                                    p50_latency_us=0.0,
-                                    p99_latency_us=0.0,
-                                    p95_latency_us=0.0,
-                                    throughput_ops_per_sec=0.0,
-                                    total_throughput_ops_per_sec=0.0,
-                                    get_total_throughput_ops_per_sec=0.0,
-                                    get_hit_throughput_ops_per_sec=0.0,
-                                    get_miss_throughput_ops_per_sec=0.0,
-                                    total_bytes_processed=0,
-                                    total_duration_seconds=0.0,
-                                    error_details={
-                                        forced_error_label: 1,
-                                    },
-                                    top_slowest_operations=[],
-                                    inflight_max=0,
-                                    inflight_avg=0.0,
-                                    observed_value_size_histogram={},
-                                    observed_value_size_avg=0.0,
-                                    observed_value_size_min=0,
-                                    observed_value_size_max=0,
-                                    fluxon_phase_summary={},
-                                    network_bandwidth={},
-                                    tcp_thread_transport_summary={},
-                                    p2p_receive_transport_summary={},
-                                    p2p_rpc_completion_summary={},
-                                )
-                            )
-
-                        logger.error(
-                            "⚠️ force-completed MPMC run by inserting placeholder results for missing consumer nodes: "
-                            f"test_id={test_id} missing_consumers={missing_consumers} "
-                            f"reported_nodes={reported_nodes} timeout_s={timeout_s}"
-                        )
-
-                        forced_completion_ready = (
-                            len(
-                                {
-                                    str(node.node_id)
-                                    for node in self.test_results[test_id]
-                                }
-                            )
-                            >= self.expected_nodes
-                        )
-
-                    if forced_completion_ready:
-                        self._set_round_gate_terminal(
-                            test_id=test_id,
-                            status=ROUND_GATE_STATUS_COMPLETED,
-                            completion_error=None,
-                        )
-                        self.all_results_received.set()
-                        return True
-
-        if test_id is not None:
-            self._set_round_gate_terminal(
-                test_id=test_id,
-                status=ROUND_GATE_STATUS_FAILED,
-                completion_error=completion_error,
+        if outcome.disposition == _RoundCompletionDisposition.FAILED:
+            logger.error(
+                "❌ benchmark result wait timed out: "
+                f"timeout_s={timeout_s} expected_nodes={self.expected_nodes} "
+                f"reported_nodes={list(outcome.reported_node_ids)} "
+                f"missing_nodes={list(outcome.missing_node_ids)}"
             )
-        return False
+            return False
+
+        # Signal only after the result snapshot and terminal gate were committed.
+        self.all_results_received.set()
+        if (
+            outcome.disposition
+            == _RoundCompletionDisposition.FORCED_MISSING_CONSUMERS
+        ):
+            logger.error(
+                "⚠️ force-completed MPMC run by inserting placeholder results "
+                "for missing consumer nodes: "
+                f"test_id={test_id} "
+                f"missing_consumers={list(outcome.forced_consumer_node_ids)} "
+                f"reported_nodes={list(outcome.reported_node_ids)} "
+                f"timeout_s={timeout_s}"
+            )
+        return True
 
     def build_incomplete_run_summary(
         self,

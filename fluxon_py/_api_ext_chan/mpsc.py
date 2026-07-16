@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import ctypes
 import etcd3
 
-from ..kvclient.kvclient_interface import KvClient
+from ..kvclient.kvclient_interface import KvClient, KvCloseRegistration
 from ..kvclient.kvclient_interface import DLPacked
 from ..kvclient import fluxon as _fluxon_kv
 from ..api_error import (
@@ -52,7 +52,7 @@ from ..api_error import (
 )
 from fluxon_py.logging import init_logger
 from .mq_config_check import validate_mpsc_config
-from .mq_lifecycle import MqShutdownCtl
+from .mq_lifecycle import MqShutdownCtl, publish_mq_construction
 from . import ChannelProducer, ChannelConsumer
 
 
@@ -473,6 +473,9 @@ class MPSCChanProducer(ChannelProducer):
     should be implemented on the Rust side and wired through here.
     """
 
+    _kv_close_registration = KvCloseRegistration.noop()
+
+    @publish_mq_construction
     def __init__(
         self,
         api: KvClient,
@@ -491,6 +494,7 @@ class MPSCChanProducer(ChannelProducer):
         # invoked without hasattr/getattr checks even if construction fails.
         self._close_lock = threading.Lock()
         self._close_done = False
+        self._kv_close_registration = KvCloseRegistration.noop()
         self._handle_shutdown_ctl = _NoopCloseable()
         self._created_new_channel = chan_id is None
         self._parent_mpmc_id = parent_mpmc_id_opt
@@ -510,6 +514,10 @@ class MPSCChanProducer(ChannelProducer):
         chan_config = validate_mpsc_config(chan_config, role=ChanRole.PRODUCER)
         self.api = api
         self.chan_config = chan_config
+        if parent_mpmc_id_opt is None:
+            self._kv_close_registration = api.register_child_close(
+                self._close_from_kv
+            )
         # Use MpscContext to manage etcd/cluster and the unified KV backend.
         ctx = MpscContext(api)
         self._ctx = ctx
@@ -610,6 +618,10 @@ class MPSCChanProducer(ChannelProducer):
 
     def is_closed(self) -> bool:
         return self.shutdown_ctl.closed
+
+    def _close_from_kv(self) -> Result[OkNone, ApiError]:
+        self._kv_child_construction_done.wait()
+        return self.close()
 
     def _signal_shutdown(self) -> None:
         self.shutdown_ctl.close()
@@ -808,6 +820,7 @@ class MPSCChanProducer(ChannelProducer):
                 chan_id,
             )
             self._close_done = True
+            self._kv_close_registration.unregister()
             return Result.new_ok(OkNone())
 
     def _rollback_unpublished_channel(self) -> Result[OkNone, ApiError]:
@@ -871,6 +884,9 @@ class MPSCChanConsumer(ChannelConsumer):
     and be exposed via fluxon_pyo3.
     """
 
+    _kv_close_registration = KvCloseRegistration.noop()
+
+    @publish_mq_construction
     def __init__(
         self,
         api: KvClient,
@@ -887,6 +903,7 @@ class MPSCChanConsumer(ChannelConsumer):
         # Lifecycle safety defaults; see producer for rationale
         self._close_lock = threading.Lock()
         self._close_done = False
+        self._kv_close_registration = KvCloseRegistration.noop()
         self._handle_shutdown_ctl = _NoopCloseable()
         self._created_new_channel = chan_id is None
         self._parent_mpmc_id = parent_mpmc_id_opt
@@ -911,6 +928,10 @@ class MPSCChanConsumer(ChannelConsumer):
         self.chan_config = chan_config
         self.override_member_lease = override_member_lease
         self.override_chan_lease = override_chan_lease
+        if parent_mpmc_id_opt is None:
+            self._kv_close_registration = api.register_child_close(
+                self._close_from_kv
+            )
 
 
         # Same as producer: manage etcd/cluster and kv backend via MpscContext.
@@ -982,7 +1003,6 @@ class MPSCChanConsumer(ChannelConsumer):
             self._consumer_id,
             payload_backend,
         )
-
     def dbg_tag(self) -> str:
         return self._dbg_tag
 
@@ -1001,6 +1021,10 @@ class MPSCChanConsumer(ChannelConsumer):
 
     def is_closed(self) -> bool:
         return self.shutdown_ctl.closed
+
+    def _close_from_kv(self) -> Result[OkNone, ApiError]:
+        self._kv_child_construction_done.wait()
+        return self.close()
 
     def _signal_shutdown(self) -> None:
         self.shutdown_ctl.close()
@@ -1068,6 +1092,7 @@ class MPSCChanConsumer(ChannelConsumer):
                 chan_id,
             )
             self._close_done = True
+            self._kv_close_registration.unregister()
             return Result.new_ok(OkNone())
 
     def membership_cleanup_completed(self) -> bool:

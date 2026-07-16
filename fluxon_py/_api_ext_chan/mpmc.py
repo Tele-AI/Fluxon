@@ -15,7 +15,7 @@ except ImportError:
 
 import io
 import msgpack
-from ..kvclient.kvclient_interface import KvClient, KvLeaseApi
+from ..kvclient.kvclient_interface import KvClient, KvCloseRegistration, KvLeaseApi
 from ..kvclient.factory_only import FactoryOnly
 from ..api_error import Result, ApiError, OkNone, OK_NONE, ApiTimeoutError
 from ..api_error import InvalidArgumentError
@@ -67,7 +67,7 @@ from ..api_error import (
 )
 from ..api_error import NetworkError, PayloadLeaseNotFoundError
 from enum import Enum
-from .mq_lifecycle import MqShutdownCtl
+from .mq_lifecycle import MqShutdownCtl, publish_mq_construction
 from . import ChannelProducer, ChannelConsumer
 from .utils import TimedPriorityQueue
 from fluxon_py.logging import init_logger
@@ -2103,7 +2103,10 @@ class MPMCChanProducer(ChannelProducer):
     """
     MPMC Producer that can produce messages to multiple MPSC channels.
     """
-    
+
+    _kv_close_registration = KvCloseRegistration.noop()
+
+    @publish_mq_construction
     def __init__(
         self,
         api: KvClient,
@@ -2121,7 +2124,8 @@ class MPMCChanProducer(ChannelProducer):
             chan_config(Dict[str, int]): Channel configuration
             etcd_client(Optional[etcd3.Etcd3Client]): Etcd client
         """
-        assert isinstance(api, KvLeaseApi)
+        if not isinstance(api, KvClient) or not isinstance(api, KvLeaseApi):
+            raise TypeError("MPMC producer requires a KvClient with KvLeaseApi")
 
         # Enforce zero-contribution store for channel usage via config
         api.ensure_zero_contribution_for_channel()
@@ -2139,6 +2143,12 @@ class MPMCChanProducer(ChannelProducer):
         self.shutdown_ctl = MqShutdownCtl()
         self._close_done = False
         self._close_lock = threading.Lock()
+        self._kv_close_registration = KvCloseRegistration.noop()
+        self.mpsc_producers: Dict[str, MPSCChanProducer] = {}
+        self.mpmc_channel: Optional[MPMCChannel] = None
+        self._kv_close_registration = api.register_child_close(
+            self._close_from_kv
+        )
         # Shared shutdown controller: used both by this producer and
         # the internal MPMCChannel instance to coordinate close/ops.
         
@@ -2183,8 +2193,6 @@ class MPMCChanProducer(ChannelProducer):
 
         # Cache per-owner sub-MPSC producers locally so repeated routing within
         # one MPMC producer does not rebind the same sub-channel.
-        self.mpsc_producers: Dict[str, MPSCChanProducer] = {}
-
         # Priority queue for fair channel selection
         self._channel_queue = TimedPriorityQueue()
         self._channel_queue_lock = threading.Lock()
@@ -2194,6 +2202,10 @@ class MPMCChanProducer(ChannelProducer):
         # the ready-channel watch to keep its local routing snapshot warm.
         self._initialize_priority_queue()
         self.mpmc_channel.start_watching()
+
+    def _close_from_kv(self) -> Result[OkNone, ApiError]:
+        self._kv_child_construction_done.wait()
+        return self.close()
         
     # close() is defined later in the class to follow the concurrency pattern
     # (set closed, acquire op-lock, verify closed), see around line ~1386.
@@ -2548,6 +2560,7 @@ class MPMCChanProducer(ChannelProducer):
                 channel_close_result.unwrap()
                 self.mpmc_channel = None  # type: ignore[assignment]
             self._close_done = True
+            self._kv_close_registration.unregister()
             return Result.new_ok(OK_NONE)
 
             # Payload lease keepalive is managed by MPMCChannel; nothing to drop here
@@ -2587,7 +2600,10 @@ class MPMCChanConsumer(ChannelConsumer):
     """
     MPMC Consumer that binds to a specific MPSC channel.
     """
-    
+
+    _kv_close_registration = KvCloseRegistration.noop()
+
+    @publish_mq_construction
     def __init__(
         self,
         api: KvClient,
@@ -2605,6 +2621,9 @@ class MPMCChanConsumer(ChannelConsumer):
             chan_config(Dict[str, int]): Channel configuration
             etcd_client(Optional[etcd3.Etcd3Client]): Etcd client
         """
+        if not isinstance(api, KvClient) or not isinstance(api, KvLeaseApi):
+            raise TypeError("MPMC consumer requires a KvClient with KvLeaseApi")
+
         # Enforce zero-contribution store for channel usage via config
         api.ensure_zero_contribution_for_channel()
 
@@ -2621,6 +2640,13 @@ class MPMCChanConsumer(ChannelConsumer):
         self.shutdown_ctl = MqShutdownCtl()
         self._close_done = False
         self._close_lock = threading.Lock()
+        self._kv_close_registration = KvCloseRegistration.noop()
+        self.mpsc_consumer: Optional[MPSCChanConsumer] = None
+        self.bound_mpsc_id: Optional[str] = None
+        self.mpmc_channel: Optional[MPMCChannel] = None
+        self._kv_close_registration = api.register_child_close(
+            self._close_from_kv
+        )
         
         if etcd_client is None:
             result: Result[etcd3.Etcd3Client, ApiError] = new_etcd_client(api)
@@ -2661,9 +2687,6 @@ class MPMCChanConsumer(ChannelConsumer):
             self.mpmc_id = self.mpmc_channel.mpmc_id
         
         # Initialize optional fields to avoid hasattr checks later
-        self.mpsc_consumer: Optional[MPSCChanConsumer] = None
-        self.bound_mpsc_id: Optional[str] = None
-
         # Get next available channel and bind to it
         fails=[]
         for i in range(10):
@@ -2703,7 +2726,7 @@ class MPMCChanConsumer(ChannelConsumer):
                     self.mpsc_consumer = next_channel
                     self.bound_mpsc_id = next_channel.get_chan_id()
                     logging.debug(f"Binded mpmc consumer to mpsc {self.bound_mpsc_id}, mpmc_id: {self.mpmc_id} successfully")
-                    
+
                     return
                 else:
                     logging.warning(f"Failed to mark channel ready by condition, retry {i}")
@@ -2718,6 +2741,10 @@ class MPMCChanConsumer(ChannelConsumer):
                 raise ValueError(f"Unexpected channel type: {type(next_channel)}")
             
         raise ValueError(f"Failed to mark channel ready with {len(fails)} fails: {fails}")
+
+    def _close_from_kv(self) -> Result[OkNone, ApiError]:
+        self._kv_child_construction_done.wait()
+        return self.close()
 
     def get_chan_id(self) -> str:
         """
@@ -2829,7 +2856,6 @@ class MPMCChanConsumer(ChannelConsumer):
                 pass
 
             mpmc_id = self.mpmc_id
-            assert mpmc_id is not None, "MPMC channel ID is None"
             member_id = None
             if self.mpmc_channel is not None:
                 member_id = self.mpmc_channel.mpmc_member_id
@@ -2839,13 +2865,13 @@ class MPMCChanConsumer(ChannelConsumer):
                     "the eager membership delete pass did not complete",
                     member_id if isinstance(member_id, int) else "unknown",
                 )
-            elif isinstance(member_id, int):
+            elif isinstance(member_id, int) and mpmc_id is not None:
                 _best_effort_delete_ready_keys_for_member(
                     self.api,
                     mpmc_id,
                     member_id,
                 )
-            elif self.bound_mpsc_id is not None:
+            elif mpmc_id is not None and self.bound_mpsc_id is not None:
                 ready_key = _new_mpmc_ready_channel_key(mpmc_id, self.bound_mpsc_id)
                 _best_effort_delete_leased_etcd_state(
                     self.api,
@@ -2871,6 +2897,7 @@ class MPMCChanConsumer(ChannelConsumer):
                 channel_close_result.unwrap()
             self.mpmc_channel = None  # type: ignore[assignment]
             self._close_done = True
+            self._kv_close_registration.unregister()
 
             return Result.new_ok(OK_NONE)
 

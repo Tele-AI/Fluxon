@@ -1013,6 +1013,9 @@ def _validate_benchmark_result(result: dict[str, Any], *, expected_nodes: int) -
             and observed["total_ops"] > 0
             and isinstance(observed["total_successful_ops"], int)
             and observed["total_successful_ops"] > 0
+            and isinstance(observed["total_failed_ops"], int)
+            and not isinstance(observed["total_failed_ops"], bool)
+            and observed["total_failed_ops"] == 0
         )
         if not valid:
             failures.append(f"run[{run_index}]={observed}")

@@ -296,6 +296,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
     """
 
     def __init__(self, config: FluxonKvClientConfig):
+        super().__init__()
         self._client: Optional[fluxon_pyo3.KvClient] = None
         self._close_lock = threading.Lock()
         self._config = config
@@ -778,16 +779,23 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         """Close and tear down the store."""
         with self._close_lock:
             if self._client is None:
+                self._finish_registered_child_close()
                 unregister_store_from_cleanup(self)
                 return Result.new_ok(OkNone())
 
             try:
+                child_close_result = self._close_registered_children()
+                if not child_close_result.is_ok():
+                    return Result.new_error(child_close_result.unwrap_error())
+                child_close_result.unwrap()
+
                 # Keep the mutable PyO3 borrow behind one lock until shutdown
                 # completes. Concurrent close callers wait and then observe None.
                 res = self._client.close()
                 if not res.is_ok():
                     return Result.new_error(res.unwrap_error())
                 _ = res.unwrap()
+                self._finish_registered_child_close()
                 unregister_store_from_cleanup(self)
                 self._client = None
                 return Result.new_ok(OkNone())

@@ -44,6 +44,33 @@ static GLOBAL_RUNTIME: OnceLock<Arc<Runtime>> = OnceLock::new();
 
 static CONSUMED_MESSAGE_CLASS: OnceLock<Py<PyAny>> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MpmcSubchannelLeaseIds {
+    global: i64,
+    member: i64,
+    payload: i64,
+}
+
+fn require_mpmc_subchannel_lease_ids(
+    global: Option<i64>,
+    member: Option<i64>,
+    payload: Option<i64>,
+) -> anyhow::Result<MpmcSubchannelLeaseIds> {
+    fn require_positive(name: &str, value: Option<i64>) -> anyhow::Result<i64> {
+        match value {
+            Some(value) if value > 0 => Ok(value),
+            Some(value) => anyhow::bail!("{name} must be positive, got {value}"),
+            None => anyhow::bail!("{name} is required for MPMC subchannel bind"),
+        }
+    }
+
+    Ok(MpmcSubchannelLeaseIds {
+        global: require_positive("override_global_lease_id", global)?,
+        member: require_positive("override_member_lease_id", member)?,
+        payload: require_positive("override_payload_lease_id", payload)?,
+    })
+}
+
 const SUB_CLUSTER_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const RUST_KV_GET_TIMEOUT: Duration = Duration::from_secs(10);
 const RUST_KV_DELETE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -63,7 +90,7 @@ where
     tokio::select! {
         biased;
         _ = shutdown.wait_closed() => {
-            Err(anyhow::anyhow!("MPMC sub-producer construction stopped by shutdown"))
+            Err(anyhow::anyhow!("MPMC subchannel construction stopped by shutdown"))
         }
         result = &mut load => result,
     }
@@ -271,34 +298,24 @@ impl MpscContext {
                                 {
                                     return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None"));
                                 }
-                                let global_lease_id = override_global_lease_id.ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "override_global_lease_id is required for MPMC sub-producer bind"
-                                    )
-                                })?;
-                                let member_lease_id = override_member_lease_id.ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "override_member_lease_id is required for MPMC sub-producer bind"
-                                    )
-                                })?;
-                                let payload_lease_id = override_payload_lease_id.ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "override_payload_lease_id is required for MPMC sub-producer bind"
-                                    )
-                                })?;
+                                let leases = require_mpmc_subchannel_lease_ids(
+                                    override_global_lease_id,
+                                    override_member_lease_id,
+                                    override_payload_lease_id,
+                                )?;
                                 // This loader only reads channel metadata and acquires RAII
                                 // keepalive guards. It does not publish membership or channel
                                 // state, so dropping it on shutdown cannot leave remote state.
                                 await_cancel_safe_mpmc_subchannel_load(
                                     &shutdown_for_core,
-                                    ChanManager::new_mpmc_sub_producer_with_chan_id(
+                                    ChanManager::new_mpmc_subchannel_with_chan_id(
                                         lease_manager.clone(),
                                         endpoints.clone(),
                                         kv_backend_uid.clone(),
                                         id,
-                                        global_lease_id,
-                                        member_lease_id,
-                                        payload_lease_id,
+                                        leases.global,
+                                        leases.member,
+                                        leases.payload,
                                         rth.clone(),
                                     ),
                                 )
@@ -457,15 +474,43 @@ impl MpscContext {
 
                 let chan_mgr: anyhow::Result<ChanManager> = async {
                     match chan_id {
-                        Some(id) => ChanManager::new_with_chan_id(
-                            lease_manager.clone(),
-                            endpoints.clone(),
-                            kv_backend_uid.clone(),
-                            id,
-                            rth.clone(),
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e.to_string())),
+                        Some(id) => {
+                            if parent_mpmc_id_opt.is_some() || parent_mpmc_member_id_opt.is_some()
+                            {
+                                if parent_mpmc_id_opt.is_none()
+                                    || parent_mpmc_member_id_opt.is_none()
+                                {
+                                    return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None"));
+                                }
+                                let leases = require_mpmc_subchannel_lease_ids(
+                                    override_global_lease_id,
+                                    override_member_lease_id,
+                                    override_payload_lease_id,
+                                )?;
+                                ChanManager::new_mpmc_subchannel_with_chan_id(
+                                    lease_manager.clone(),
+                                    endpoints.clone(),
+                                    kv_backend_uid.clone(),
+                                    id,
+                                    leases.global,
+                                    leases.member,
+                                    leases.payload,
+                                    rth.clone(),
+                                )
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            } else {
+                                ChanManager::new_with_chan_id(
+                                    lease_manager.clone(),
+                                    endpoints.clone(),
+                                    kv_backend_uid.clone(),
+                                    id,
+                                    rth.clone(),
+                                )
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            }
+                        }
                         None => {
                             let cap = capacity.ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -1971,6 +2016,29 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn mpmc_subchannel_lease_contract_preserves_parent_member_lease() {
+        let leases = require_mpmc_subchannel_lease_ids(Some(101), Some(202), Some(303))
+            .expect("complete MPMC lease set");
+
+        assert_eq!(
+            leases,
+            MpmcSubchannelLeaseIds {
+                global: 101,
+                member: 202,
+                payload: 303,
+            }
+        );
+    }
+
+    #[test]
+    fn mpmc_subchannel_lease_contract_rejects_missing_member_lease() {
+        let error = require_mpmc_subchannel_lease_ids(Some(101), None, Some(303))
+            .expect_err("MPMC subchannel bind requires the parent member lease");
+
+        assert!(error.to_string().contains("override_member_lease_id"));
     }
 
     #[test]

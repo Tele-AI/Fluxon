@@ -13,6 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = REPO_ROOT / "fluxon_test_stack" / "ci_2_virt_node.py"
@@ -344,6 +346,110 @@ class TestCi2VirtNodeContract(unittest.TestCase):
                 "etcd=1 greptime=1 ops_controller=1",
                 output.getvalue(),
             )
+
+    def test_codex_context_redacts_yaml_credentials_and_omits_invalid_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo_root = root / "repository"
+            runner_temp = root / "runner-temp"
+            config_root = repo_root / ".dever" / "ci_2_virt_node" / "runner_run" / "configs"
+            config_root.mkdir(parents=True)
+            runner_temp.mkdir()
+
+            source = runner_temp / "ci_test_list.ci.yaml"
+            source.write_text(
+                "service_name: benchmark\n"
+                "database:\n"
+                "  username: operator\n"
+                "  password: db-password-value\n"
+                "object_store:\n"
+                "  access_key: access-key-value\n"
+                "  secret_key: secret-key-value\n"
+                "callback_url: https://user:url-password@example.invalid/path\n"
+                "callback_query_url: https://example.invalid/path?token=query-token-value\n",
+                encoding="utf-8",
+            )
+            invalid_source = config_root / "invalid.yaml"
+            invalid_source.write_text(
+                "password: malformed-password-value\nbroken: [\n",
+                encoding="utf-8",
+            )
+
+            context_root = runner_temp / "codex-failure-context"
+            _CODEX_HELPER._collect_context(
+                mock.Mock(
+                    repo_root=repo_root,
+                    runner_temp=runner_temp,
+                    context_root=context_root,
+                )
+            )
+
+            copied_path = (
+                context_root
+                / "repository"
+                / "runner-temp"
+                / "ci_test_list.ci.yaml"
+            )
+            copied = yaml.safe_load(copied_path.read_text(encoding="utf-8"))
+            self.assertEqual(copied["service_name"], "benchmark")
+            self.assertEqual(copied["database"]["username"], "operator")
+            self.assertEqual(copied["database"]["password"], "[REDACTED]")
+            self.assertEqual(copied["object_store"]["access_key"], "[REDACTED]")
+            self.assertEqual(copied["object_store"]["secret_key"], "[REDACTED]")
+            self.assertEqual(
+                copied["callback_url"],
+                "https://[REDACTED]@example.invalid/path",
+            )
+            self.assertEqual(
+                copied["callback_query_url"],
+                "https://example.invalid/path?token=[REDACTED]",
+            )
+            self.assertFalse(
+                (
+                    context_root
+                    / "repository"
+                    / ".dever"
+                    / "ci_2_virt_node"
+                    / "runner_run"
+                    / "configs"
+                    / "invalid.yaml"
+                ).exists()
+            )
+
+            manifest = json.loads(
+                (context_root / "manifest.json").read_text(encoding="utf-8")
+            )
+            copied_entry = next(
+                item
+                for item in manifest["copied"]
+                if item["artifact_path"].endswith("/ci_test_list.ci.yaml")
+            )
+            self.assertEqual(
+                copied_entry["sanitization"],
+                "credential_fields_redacted",
+            )
+            self.assertEqual(copied_entry["redacted_value_count"], 5)
+            self.assertTrue(
+                any(
+                    item["source"] == str(invalid_source)
+                    and item["reason"].startswith("YAML sanitization failed; file omitted")
+                    for item in manifest["skipped"]
+                )
+            )
+            context_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in context_root.rglob("*")
+                if path.is_file()
+            )
+            for secret in (
+                "db-password-value",
+                "access-key-value",
+                "secret-key-value",
+                "url-password",
+                "query-token-value",
+                "malformed-password-value",
+            ):
+                self.assertNotIn(secret, context_text)
 
     def test_generated_suite_is_public_dual_local_nodes_ci_only(self) -> None:
         suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")

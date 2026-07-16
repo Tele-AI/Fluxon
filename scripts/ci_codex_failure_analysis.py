@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import stat
 import subprocess
@@ -17,6 +18,8 @@ import zipfile
 
 
 LOG_SUFFIXES = frozenset({".err", ".log", ".out", ".stderr", ".stdout"})
+YAML_SUFFIXES = frozenset({".yaml", ".yml"})
+REDACTED_VALUE = "[REDACTED]"
 TESTBED_HOSTWORKDIR_DIRNAME = "fluxon_deploy"
 TESTBED_SERVICE_LOG_NAMES = ("etcd", "greptime", "ops_controller")
 DIAGNOSTIC_NAMES = frozenset(
@@ -41,6 +44,36 @@ DIAGNOSTIC_NAMES = frozenset(
         "summary.json",
         "summary.yaml",
     }
+)
+
+_SENSITIVE_YAML_KEY_PARTS = frozenset(
+    {
+        "auth",
+        "authentication",
+        "authorization",
+        "cookie",
+        "credential",
+        "credentials",
+        "passwd",
+        "password",
+        "pwd",
+        "secret",
+        "token",
+    }
+)
+_SENSITIVE_YAML_KEY_PAIRS = frozenset(
+    {
+        ("access", "key"),
+        ("account", "key"),
+        ("api", "key"),
+        ("private", "key"),
+        ("signing", "key"),
+    }
+)
+_URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/\s@]+)@")
+_URL_QUERY_CREDENTIAL_RE = re.compile(
+    r"(?i)([?&](?:access[_-]?key|api[_-]?key|auth|credential|passwd|password|"
+    r"secret(?:[_-]?key)?|token)=)([^&#\s]+)"
 )
 
 
@@ -96,6 +129,83 @@ def _should_collect(path: Path) -> bool:
     )
 
 
+def _yaml_key_is_sensitive(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+    parts = tuple(
+        part
+        for part in re.split(r"[^a-z0-9]+", camel_split.lower())
+        if part
+    )
+    if any(part in _SENSITIVE_YAML_KEY_PARTS for part in parts):
+        return True
+    return any(pair in _SENSITIVE_YAML_KEY_PAIRS for pair in zip(parts, parts[1:]))
+
+
+def _redact_yaml_string(value: str) -> tuple[str, int]:
+    redacted, userinfo_count = _URL_USERINFO_RE.subn(
+        lambda match: f"{match.group(1)}{REDACTED_VALUE}@",
+        value,
+    )
+    redacted, query_count = _URL_QUERY_CREDENTIAL_RE.subn(
+        lambda match: f"{match.group(1)}{REDACTED_VALUE}",
+        redacted,
+    )
+    return redacted, userinfo_count + query_count
+
+
+def _redact_yaml_credentials(value: object, *, seen: set[int]) -> tuple[object, int]:
+    if isinstance(value, dict):
+        object_id = id(value)
+        if object_id in seen:
+            return value, 0
+        seen.add(object_id)
+        redacted_count = 0
+        for key, child in list(value.items()):
+            if _yaml_key_is_sensitive(key):
+                value[key] = REDACTED_VALUE
+                redacted_count += 1
+                continue
+            value[key], child_count = _redact_yaml_credentials(child, seen=seen)
+            redacted_count += child_count
+        return value, redacted_count
+    if isinstance(value, list):
+        object_id = id(value)
+        if object_id in seen:
+            return value, 0
+        seen.add(object_id)
+        redacted_count = 0
+        for index, child in enumerate(value):
+            value[index], child_count = _redact_yaml_credentials(child, seen=seen)
+            redacted_count += child_count
+        return value, redacted_count
+    if isinstance(value, str):
+        return _redact_yaml_string(value)
+    return value, 0
+
+
+def _write_sanitized_yaml_diagnostic(source: Path, destination: Path) -> int:
+    try:
+        import yaml
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("PyYAML is unavailable") from exc
+
+    documents = list(yaml.safe_load_all(source.read_text(encoding="utf-8")))
+    redacted_count = 0
+    for index, document in enumerate(documents):
+        documents[index], document_count = _redact_yaml_credentials(document, seen=set())
+        redacted_count += document_count
+    rendered = yaml.safe_dump_all(
+        documents,
+        allow_unicode=True,
+        explicit_start=len(documents) > 1,
+        sort_keys=False,
+    )
+    destination.write_text(rendered, encoding="utf-8")
+    return redacted_count
+
+
 def _testbed_service_log_name(path: Path) -> str | None:
     """Return the canonical service name for a collected testbed log."""
     if path.parent.name.lower() != "log" or path.suffix.lower() != ".log":
@@ -143,19 +253,41 @@ def _collect_context(args: argparse.Namespace) -> None:
                 skipped.append({"source": str(source), "reason": "binary content detected"})
                 return False
 
-            sha256, byte_count, line_count = _file_digest(source)
             destination = repository_root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
-            copied.append(
+            copied_entry: dict[str, object] = {
+                "source": str(source),
+                "artifact_path": str(destination.relative_to(context_root)),
+            }
+            if source.suffix.lower() in YAML_SUFFIXES:
+                try:
+                    redacted_count = _write_sanitized_yaml_diagnostic(source, destination)
+                except Exception as exc:
+                    destination.unlink(missing_ok=True)
+                    skipped.append(
+                        {
+                            "source": str(source),
+                            "reason": (
+                                "YAML sanitization failed; file omitted "
+                                f"({type(exc).__name__})"
+                            ),
+                        }
+                    )
+                    return False
+                copied_entry["sanitization"] = "credential_fields_redacted"
+                copied_entry["redacted_value_count"] = redacted_count
+            else:
+                shutil.copy2(source, destination)
+
+            sha256, byte_count, line_count = _file_digest(destination)
+            copied_entry.update(
                 {
-                    "source": str(source),
-                    "artifact_path": str(destination.relative_to(context_root)),
                     "bytes": byte_count,
                     "lines": line_count,
                     "sha256": sha256,
                 }
             )
+            copied.append(copied_entry)
             return True
         except Exception as exc:
             skipped.append(
@@ -216,7 +348,11 @@ def _collect_context(args: argparse.Namespace) -> None:
         copy_text_diagnostic(source, relative)
 
     manifest = {
-        "contract": "Files are copied in full without tail truncation.",
+        "contract": (
+            "Text diagnostics are copied without tail truncation. YAML diagnostics are parsed "
+            "and credential-bearing values are replaced with [REDACTED]; YAML is omitted when "
+            "safe sanitization fails."
+        ),
         "source_roots": [str(path) for path in source_roots],
         "testbed_service_logs": {
             "contract": (
@@ -241,7 +377,7 @@ def _collect_context(args: argparse.Namespace) -> None:
         encoding="utf-8",
     )
     print(
-        f"Collected {manifest['copied_file_count']} complete text diagnostics "
+        f"Collected {manifest['copied_file_count']} text diagnostics "
         f"({manifest['copied_total_bytes']} bytes) in {context_root}"
     )
     print(
@@ -252,7 +388,10 @@ def _collect_context(args: argparse.Namespace) -> None:
         )
     )
     if skipped:
-        print(f"Recorded {len(skipped)} missing, binary, or unreadable paths in manifest.json")
+        print(
+            f"Recorded {len(skipped)} missing, binary, unsafe YAML, or unreadable "
+            "paths in manifest.json"
+        )
 
 
 def _validate_openai_base_url(base_url: str) -> str:
@@ -763,7 +902,10 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Manage Codex CI failure-analysis evidence and reports.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    collect = subparsers.add_parser("collect-context", help="Collect complete text diagnostics.")
+    collect = subparsers.add_parser(
+        "collect-context",
+        help="Collect text diagnostics with credential redaction for YAML.",
+    )
     collect.add_argument("--repo-root", type=Path, required=True)
     collect.add_argument("--runner-temp", type=Path, required=True)
     collect.add_argument("--context-root", type=Path, required=True)

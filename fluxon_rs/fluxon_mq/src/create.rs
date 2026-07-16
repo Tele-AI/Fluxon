@@ -27,9 +27,9 @@ pub struct ChanCreateConfig {
     pub override_global_lease_id: Option<i64>,
     /// Optional override for the per-channel member lease id.
     ///
-    /// 当 MPSC 被 MPMC 作为子模块使用时，可以将 MPMC 的全局
-    /// lease 复用为 member lease，使得整个子链路在同一个
-    /// lease 生命周期内存在。此时本组件仅贡献 keepalive。
+    /// MPMC subchannels reuse the parent MPMC member lease so their role
+    /// membership and ready key share one failure lifecycle. This component
+    /// only contributes keepalive for the caller-owned lease.
     pub override_member_lease_id: Option<i64>,
     /// Optional kvclient payload lease id used for backend payload keys.
     /// 当存在时，create_mpsc_channel 会直接将该 id 写入 channel
@@ -308,13 +308,13 @@ pub async fn create_mpsc_channel(
 }
 
 impl ChanManager {
-    /// Bind an existing MPSC channel as an MPMC sub-producer.
+    /// Bind an existing MPSC channel as an MPMC subchannel.
     ///
     /// The caller must supply leases from a live parent MPMC endpoint and a
     /// ready subchannel. This constructor matches those ids against channel
     /// metadata and installs periodic keepalive contributors without repeating
     /// synchronous probes for every local subchannel handle.
-    pub async fn new_mpmc_sub_producer_with_chan_id(
+    pub async fn new_mpmc_subchannel_with_chan_id(
         lease_manager: LeaseManager,
         etcd_endpoints: Vec<String>,
         kv_backend_uid: LeaseBackendUid,
@@ -327,7 +327,7 @@ impl ChanManager {
         let etcd_backend_uid = LeaseBackendUid::etcd_from(etcd_endpoints.clone());
         let client = registered_etcd_client(&etcd_backend_uid).map_err(|e| {
             anyhow::anyhow!(
-                "MPMC sub-producer requires its parent to register the etcd backend first: {}",
+                "MPMC subchannel requires its parent to register the etcd backend first: {}",
                 e
             )
         })?;
@@ -349,7 +349,7 @@ impl ChanManager {
 
         if meta.global_lease_id != override_global_lease_id {
             anyhow::bail!(
-                "mpmc sub-producer global lease mismatch for chan_id={}: meta={} override={}",
+                "mpmc subchannel global lease mismatch for chan_id={}: meta={} override={}",
                 chan_id,
                 meta.global_lease_id,
                 override_global_lease_id
@@ -360,7 +360,7 @@ impl ChanManager {
             Some(id) if id == override_payload_lease_id && id > 0 => id,
             Some(id) => {
                 anyhow::bail!(
-                    "mpmc sub-producer payload lease mismatch for chan_id={}: meta={} override={}",
+                    "mpmc subchannel payload lease mismatch for chan_id={}: meta={} override={}",
                     chan_id,
                     id,
                     override_payload_lease_id
@@ -368,7 +368,7 @@ impl ChanManager {
             }
             None => {
                 anyhow::bail!(
-                    "payload_lease_id missing in meta for chan_id={}, cannot bind MPMC sub-producer",
+                    "payload_lease_id missing in meta for chan_id={}, cannot bind MPMC subchannel",
                     chan_id
                 );
             }
@@ -385,7 +385,7 @@ impl ChanManager {
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "register mpmc sub-producer member lease failed for chan_id={} lease_id={}: {}",
+                    "register mpmc subchannel member lease failed for chan_id={} lease_id={}: {}",
                     chan_id,
                     override_member_lease_id,
                     e
@@ -393,7 +393,7 @@ impl ChanManager {
             })?;
         lm_record_register_by(
             override_member_lease_id as u64,
-            format!("mpmc_sub_producer_member:chan_id={}", chan_id),
+            format!("mpmc_subchannel_member:chan_id={}", chan_id),
         );
 
         let global_lease = lease_manager
@@ -407,7 +407,7 @@ impl ChanManager {
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "register mpmc sub-producer global lease failed for chan_id={} lease_id={}: {}",
+                    "register mpmc subchannel global lease failed for chan_id={} lease_id={}: {}",
                     chan_id,
                     meta.global_lease_id,
                     e
@@ -415,7 +415,7 @@ impl ChanManager {
             })?;
         lm_record_register_by(
             meta.global_lease_id as u64,
-            format!("mpmc_sub_producer_global:chan_id={}", chan_id),
+            format!("mpmc_subchannel_global:chan_id={}", chan_id),
         );
 
         let global_long_lease = lease_manager
@@ -429,7 +429,7 @@ impl ChanManager {
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "register mpmc sub-producer global-long lease failed for chan_id={} lease_id={}: {}",
+                    "register mpmc subchannel global-long lease failed for chan_id={} lease_id={}: {}",
                     chan_id,
                     meta.global_long_lease_id,
                     e
@@ -437,7 +437,7 @@ impl ChanManager {
             })?;
         lm_record_register_by(
             meta.global_long_lease_id as u64,
-            format!("mpmc_sub_producer_global_long:chan_id={}", chan_id),
+            format!("mpmc_subchannel_global_long:chan_id={}", chan_id),
         );
 
         let payload_lease = lease_manager
@@ -446,14 +446,14 @@ impl ChanManager {
                 meta.ttl_seconds,
                 payload_lease_id as u64,
                 LeaseRegisterKind::KvClientValidated {
-                    register_by: format!("mpmc_sub_producer_payload:chan_id={}", chan_id),
+                    register_by: format!("mpmc_subchannel_payload:chan_id={}", chan_id),
                 },
                 rt_handle,
             )
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "register mpmc sub-producer payload lease failed for chan_id={} lease_id={}: {}",
+                    "register mpmc subchannel payload lease failed for chan_id={} lease_id={}: {}",
                     chan_id,
                     payload_lease_id,
                     e

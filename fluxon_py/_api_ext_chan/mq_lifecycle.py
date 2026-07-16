@@ -1,12 +1,28 @@
 from __future__ import annotations
 
+from functools import wraps
 import threading
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from ..logging import init_logger
 
 
 logging = init_logger(__name__)
+
+
+def publish_mq_construction(init: Callable[..., None]) -> Callable[..., None]:
+    """Publish constructor completion to a KvClient-triggered close callback."""
+
+    @wraps(init)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> None:
+        construction_done = threading.Event()
+        self._kv_child_construction_done = construction_done
+        try:
+            init(self, *args, **kwargs)
+        finally:
+            construction_done.set()
+
+    return wrapped
 
 
 class MqShutdownCtl:

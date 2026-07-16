@@ -126,6 +126,7 @@ class MooncakeStore(KvClient):
     """Mooncake implementation of the KV Cache Store interface."""
     def __init__(self, config: "FluxonKvClientConfig"):
         """Initialize the Mooncake store wrapper."""
+        super().__init__()
         self._store = MooncakeDistributedStore()
         self._config = config
         self._initialized = False
@@ -689,13 +690,20 @@ class MooncakeStore(KvClient):
             Result[Success, ApiError]
         """
         with self._close_lock:
+            child_close_result = self._close_registered_children()
+            if not child_close_result.is_ok():
+                return Result.new_error(child_close_result.unwrap_error())
+            child_close_result.unwrap()
+
             if not self._initialized:
                 logging.info("Mooncake store not initialized, nothing to close.")
+                self._finish_registered_child_close()
                 unregister_store_from_cleanup(self)
                 return Result.new_ok(OkNone())
 
             if self._closed:
                 logging.info("Mooncake store already closed, no need to close again.")
+                self._finish_registered_child_close()
                 unregister_store_from_cleanup(self)
                 return Result.new_ok(OkNone())
 
@@ -709,6 +717,7 @@ class MooncakeStore(KvClient):
                     self._closed = True
                     self._initialized = False
                     self._instance_key = None
+                    self._finish_registered_child_close()
                     logging.info("Mooncake store closed")
                     unregister_store_from_cleanup(self)
                     return Result.new_ok(OkNone())

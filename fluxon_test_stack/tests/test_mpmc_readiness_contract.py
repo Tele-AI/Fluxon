@@ -1497,6 +1497,163 @@ class TestMPMCReadinessContract(unittest.TestCase):
         self.assertEqual(gate["status"], "completed")
         self.assertEqual(gate["reported_result_node_count"], 2)
 
+        late_consumer_report = {
+            "node_id": "consumer-node",
+            "results": {
+                "node_id": "consumer-node",
+                "node_role": "consumer",
+                "total_operations": 99,
+                "successful_operations": 99,
+                "p50_latency_us": 1.0,
+                "inflight_max": 1,
+                "inflight_avg": 1.0,
+            },
+        }
+        responses = []
+        with mock.patch.object(
+            coordinator,
+            "_send_tcp_response",
+            side_effect=lambda _sock, response: responses.append(response) or True,
+        ):
+            self.assertTrue(
+                coordinator.handle_report_results(late_consumer_report, object())
+            )
+
+        self.assertEqual(responses[-1]["status"], "success")
+        results = coordinator.test_results[coordinator.test_config.test_id]
+        placeholders = [
+            result for result in results if result.node_id == "consumer-node"
+        ]
+        self.assertEqual(len(placeholders), 1)
+        self.assertEqual(placeholders[0].total_operations, 1)
+        self.assertEqual(
+            placeholders[0].error_details,
+            {"forced_missing_consumer_result_timeout": 1},
+        )
+        gate = coordinator._round_gate_snapshot(test_id=coordinator.test_config.test_id)
+        self.assertEqual(gate["status"], "completed")
+
+    def test_coordinator_timeout_boundary_accepts_completed_real_results(self) -> None:
+        coordinator = _new_coordinator_with_temp_config()
+        self.assertIsNotNone(coordinator.test_config)
+        coordinator.expected_nodes = 2
+        coordinator.test_config.test_id = "timeout-boundary-real-results"
+        coordinator.start_new_test(coordinator.test_config)
+        coordinator.registered_nodes = {
+            "producer-node": {"node_role": "producer"},
+            "consumer-node": {"node_role": "consumer"},
+        }
+
+        producer_report = {
+            "node_id": "producer-node",
+            "results": {
+                "node_id": "producer-node",
+                "node_role": "producer",
+                "p50_latency_us": 0.0,
+                "inflight_max": 0,
+                "inflight_avg": 0.0,
+            },
+        }
+        consumer_report = {
+            "node_id": "consumer-node",
+            "results": {
+                "node_id": "consumer-node",
+                "node_role": "consumer",
+                "total_operations": 7,
+                "successful_operations": 7,
+                "p50_latency_us": 2.0,
+                "inflight_max": 1,
+                "inflight_avg": 1.0,
+            },
+        }
+        with mock.patch.object(coordinator, "_send_tcp_response", return_value=True):
+            self.assertTrue(coordinator.handle_report_results(producer_report, object()))
+
+            def report_consumer_then_return_timeout(*, timeout):
+                self.assertGreater(timeout, 0)
+                self.assertTrue(
+                    coordinator.handle_report_results(consumer_report, object())
+                )
+                return False
+
+            with mock.patch.object(
+                coordinator.all_results_received,
+                "wait",
+                side_effect=report_consumer_then_return_timeout,
+            ):
+                self.assertTrue(coordinator.wait_for_completion(timeout_s=0.01))
+
+        results = coordinator.test_results[coordinator.test_config.test_id]
+        consumer_results = [
+            result for result in results if result.node_id == "consumer-node"
+        ]
+        self.assertEqual(len(consumer_results), 1)
+        self.assertEqual(consumer_results[0].total_operations, 7)
+        self.assertNotIn(
+            "forced_missing_consumer_result_timeout",
+            consumer_results[0].error_details,
+        )
+        gate = coordinator._round_gate_snapshot(test_id=coordinator.test_config.test_id)
+        self.assertEqual(gate["status"], "completed")
+        self.assertEqual(gate["reported_result_node_count"], 2)
+
+    def test_coordinator_late_report_cannot_reopen_failed_round(self) -> None:
+        coordinator = _new_coordinator_with_temp_config()
+        self.assertIsNotNone(coordinator.test_config)
+        coordinator.expected_nodes = 3
+        coordinator.test_config.test_id = "failed-round-remains-terminal"
+        coordinator.start_new_test(coordinator.test_config)
+        coordinator.registered_nodes = {
+            "producer-a": {"node_role": "producer"},
+            "producer-b": {"node_role": "producer"},
+            "consumer-node": {"node_role": "consumer"},
+        }
+
+        producer_report = {
+            "node_id": "producer-a",
+            "results": {
+                "node_id": "producer-a",
+                "node_role": "producer",
+                "p50_latency_us": 0.0,
+                "inflight_max": 0,
+                "inflight_avg": 0.0,
+            },
+        }
+        late_consumer_report = {
+            "node_id": "consumer-node",
+            "results": {
+                "node_id": "consumer-node",
+                "node_role": "consumer",
+                "p50_latency_us": 1.0,
+                "inflight_max": 1,
+                "inflight_avg": 1.0,
+            },
+        }
+        with mock.patch.object(coordinator, "_send_tcp_response", return_value=True):
+            self.assertTrue(coordinator.handle_report_results(producer_report, object()))
+            self.assertFalse(coordinator.wait_for_completion(timeout_s=0.01))
+
+            gate = coordinator._round_gate_snapshot(
+                test_id=coordinator.test_config.test_id
+            )
+            self.assertEqual(gate["status"], "failed")
+            self.assertTrue(
+                coordinator.handle_report_results(late_consumer_report, object())
+            )
+
+        gate = coordinator._round_gate_snapshot(test_id=coordinator.test_config.test_id)
+        self.assertEqual(gate["status"], "failed")
+        self.assertEqual(gate["reported_result_node_count"], 1)
+        self.assertEqual(
+            [
+                result.node_id
+                for result in coordinator.test_results[
+                    coordinator.test_config.test_id
+                ]
+            ],
+            ["producer-a"],
+        )
+
     def test_coordinator_assigns_one_prefeed_leader_and_global_consumer_count(self) -> None:
         coordinator = _new_coordinator_with_temp_config()
         self.assertEqual(coordinator.expected_mpmc_consumer_workers, 1)

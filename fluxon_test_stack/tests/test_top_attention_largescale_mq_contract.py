@@ -220,6 +220,15 @@ class TestTopAttentionLargescaleMqContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "did not complete on every worker"):
             entry._validate_benchmark_result(result, expected_nodes=168)
 
+    def test_result_contract_rejects_failed_operations(self) -> None:
+        entry = _load_module()
+        result = _success_result(168)
+        result["runs"][0]["total_ops"] = 101
+        result["runs"][0]["total_failed_ops"] = 1
+
+        with self.assertRaisesRegex(ValueError, "total_failed_ops.*1"):
+            entry._validate_benchmark_result(result, expected_nodes=168)
+
     def test_large_runtime_cleanup_preserves_text_diagnostics(self) -> None:
         entry = _load_module()
         with tempfile.TemporaryDirectory() as td:
