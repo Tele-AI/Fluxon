@@ -268,6 +268,16 @@ store.close().unwrap("close KV store failed")
 
 同一个 `store` 上有多个 MQ handle 时，必须先调用所有 handle 的 `close()` 并消费结果，再调用 `store.close()`。两层 `close()` 都返回 `Result[OkNone, ApiError]`；关闭错误必须记录或向上传播，不能静默丢弃。
 
+MQ endpoint 的关闭结果按资源类型区分：
+
+| 关闭动作 | 失败语义 |
+| --- | --- |
+| 停止数据路径、MQ runtime、后台任务和本地 handle | 必须完成；失败时 `close()` 返回 `ApiError`。 |
+| 删除绑定了 lease 的 role、ready、membership、weight key | 只做一次尽力删除；失败时记录 WARN、继续释放 keepalive handle，并由 backend lease TTL 回收。 |
+| 创建、绑定、发布、ready claim、消息确认和 offset 更新等运行中 etcd 操作 | 保持强契约；失败时当前操作返回错误。 |
+
+因此，leased key 的删除告警表示显式回收延后到 TTL，不表示本地 endpoint 仍未关闭。调用方仍应消费 `close()` 的 `Result`，但不需要读取私有对象或自行重试分布式 key 删除。
+
 ```mermaid
 sequenceDiagram
     participant App as 用户 / 测试代码
@@ -277,7 +287,7 @@ sequenceDiagram
 
     App->>Endpoint: close()
     Endpoint->>Internal: 停止数据路径并回收内部资源
-    Internal-->>Endpoint: 关闭完成
+    Internal-->>Endpoint: 本地关闭完成；leased key 已删除或交给 TTL
     Endpoint-->>App: Result[OkNone, ApiError]
     App->>Store: close()
     Store-->>App: Result[OkNone, ApiError]
@@ -288,7 +298,7 @@ sequenceDiagram
 | 责任方 | 负责内容 |
 | --- | --- |
 | 用户 / 测试代码 | 调用公共 `producer.close()` / `consumer.close()`，检查返回的 `Result`，然后调用 `store.close()`。 |
-| MQ endpoint | 在 `close()` 内部停止收发路径，关闭所属子通道和 MQ runtime，并结束由该 endpoint 持有的 keepalive 与后台任务。Fluxon KV lease keepalive 始终留在 Rust 生命周期内。 |
+| MQ endpoint | 在 `close()` 内部停止收发路径，关闭所属子通道和 MQ runtime，并结束由该 endpoint 持有的 keepalive 与后台任务；leased key 删除失败时记录 WARN 并启动 TTL 兜底。Fluxon KV lease keepalive 始终留在 Rust 生命周期内。 |
 | `KvClient` | 在 MQ endpoint 全部关闭后回收 KV client 资源。 |
 
 MQ endpoint 的内部生命周期对调用方不可见。用户代码、示例和测试都不应创建 lease manager 对象或 Python keepalive 回调，也不应访问私有字段、原始 shutdown controller 或 MQ framework。等待、强制退出或静默丢弃 `close()` 的 `Result` 都不能代替上述两步。

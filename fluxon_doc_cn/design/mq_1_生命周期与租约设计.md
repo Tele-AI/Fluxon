@@ -79,14 +79,14 @@ Lease 把这些对象的存活状态映射到 backend TTL：
 
 | 生命周期对象 | 典型状态 | Lease 的作用 |
 | --- | --- | --- |
-| MQ role membership | role、ready、producer / consumer membership | Member lease 随本地角色存活；正常 close 主动 delete，异常退出由 TTL 回收。 |
+| MQ role membership | role、ready、producer / consumer membership | Member lease 随本地角色存活；正常 close 尽力主动 delete，失败或异常退出由 TTL 回收。 |
 | MQ channel shared state | metadata / global、payload、ID allocator | Shared / long lease 由实际使用 channel 的 handle 续租；没有 contributor 后按 TTL 回收。 |
 | 本地 MQ handle | Rust / PyO3 / Python 对象 | 持有 keepalive guard。Drop 只停止当前 handle 的续租贡献。 |
 
 当前 MQ lease 模型收敛为两条规则：
 
 - 所有拿到 lease id 的本地 handle 都可以注册 keepalive；注册成功并保留 guard 后，它才成为本进程内的 keepalive contributor。`GeneralLease::Drop` 只释放本地 guard，不执行 delete 或 revoke。
-- 有明确语义 owner 的分布式 key 在正常 close 路径显式 delete。Shared key、进程崩溃、GC close 跳过 delete 和持续网络断开在有效 keepalive 停止后由 lease TTL 兜底回收。
+- 有明确语义 owner 的 leased key 在正常 close 路径做一次尽力 delete。失败时记录 WARN 并继续释放本地 handle；shared key、进程崩溃、GC close 跳过 delete 和持续网络断开在最后一个有效 keepalive contributor 停止后由 lease TTL 兜底回收。
 
 因此 `GeneralLease::Borrowed` 已经不再需要。子 MPSC handle 持有真实 `GeneralLease` 并贡献 keepalive。MQ owner 语义决定它是否有权 delete 某些 key；lease handle 类型只区分 backend 与 keepalive 实现。
 
@@ -102,13 +102,13 @@ Lease 把这些对象的存活状态映射到 backend TTL：
 
 ## Lease 设计结论
 
-Lease 生命周期拆成两类职责。keepalive contributor 持有真实 lease handle 并维持 lease 存活；cleanup owner 在正常关闭时及时删除自己独占的分布式 key。释放 lease handle 只停止当前本地对象的续租贡献。有明确 owner 的 key 在正常路径显式删除；shared key 和异常路径在有效 keepalive 停止后由 backend TTL 兜底。
+Lease 生命周期拆成两类职责。keepalive contributor 持有真实 lease handle 并维持 lease 存活；cleanup owner 在正常关闭时尽力删除自己独占的分布式 key。释放 lease handle 只停止当前本地对象的续租贡献。显式删除失败只影响回收时延，记录 WARN 后继续释放 handle；shared key 和异常路径在有效 keepalive 停止后由 backend TTL 兜底。
 
 这个模型带来三条稳定结论：
 
 1. `GeneralLease` 只表达 keepalive contribution，不表达 delete 或 revoke 权限。
 2. 同一个 lease id 可以有多个进程内、跨进程 contributor；backend 不感知这些 contributor 的引用计数。
-3. 子 MPSC handle 的公开 `close()` 删除它自己拥有的 membership / weight，不删除 shared key；这个 cleanup ownership 与它持有哪一种 `GeneralLease` 无关。
+3. 子 MPSC handle 的公开 `close()` 尽力删除它自己拥有的 membership / weight，不删除 shared key；delete 失败不阻止本地关闭和 lease handle 释放，这个 cleanup ownership 与它持有哪一种 `GeneralLease` 无关。
 
 后文先给出角色与 lease 的静态关系，再说明创建、运行、关闭三个阶段，最后按 MPSC、MPMC creator、MPMC existing attach 的复杂度递增顺序展开具体路径。
 
@@ -167,11 +167,11 @@ sequenceDiagram
 | Lease | Backend | 典型字段 / key | 当前生命周期 |
 | --- | --- | --- | --- |
 | MPSC global lease | `etcd` | `ChanGlobalMeta.global_lease_id`，`/channels/meta/{chan_id}` | MPSC channel 元数据生命周期。创建者、直接绑定者以及已注册该 id 的子 MPSC handle 都可以成为 contributor。 |
-| MPSC member lease | `etcd` | `ChanManager.member_lease`，`/channels/{chan_id}/producer/*` 或 `/consumer/*` | 单个 MPSC producer / consumer membership 生命周期。直接 MPSC 和 MPMC 子通道都在正常 `close()` 中显式 delete，异常退出由 TTL 兜底。 |
+| MPSC member lease | `etcd` | `ChanManager.member_lease`，`/channels/{chan_id}/producer/*` 或 `/consumer/*` | 单个 MPSC producer / consumer membership 生命周期。直接 MPSC 和 MPMC 子通道都在正常 `close()` 中做一次尽力 delete，失败或异常退出由 TTL 兜底。 |
 | MPSC global-long lease | `etcd` | `ChanGlobalMeta.global_long_lease_id`，per-channel producer / consumer ID allocator | 单个 MPSC 的 ID allocator 生命周期，当前 TTL 为 30 分钟。每个恢复该 channel 的 `ChanManager` 都注册该 id。 |
 | MPSC payload lease | `KvClient` | `ChanGlobalMeta.payload_lease_id`，MQ payload KV key | MPSC payload 生命周期。producer 把该 id 传给 KV put；lease 丢失后由后续 KV 操作向上层返回错误。 |
 | MPMC metadata lease | `etcd` | `metadata_lease_id`，`/mpmc_channels/{mpmc_id}/meta`、`next_channel_id` | MPMC creator 注册 keepalive；复用该 id 作为 MPSC global lease 的子 MPSC handle 也会贡献 keepalive。顶层 existing attach 本身当前不注册。 |
-| MPMC member lease | `etcd` | `MPMCChannel.mpmc_member_lease`，role key、ready key，以及采用 override 路径的子 MPSC membership | 单个 MPMC member 生命周期。role / ready key 正常关闭时显式 delete；采用该 override 的 membership 在异常路径由此 lease 回收。 |
+| MPMC member lease | `etcd` | `MPMCChannel.mpmc_member_lease`，role key、ready key，以及采用 override 路径的子 MPSC membership | 单个 MPMC member 生命周期。role / ready key 正常关闭时做一次尽力 delete；失败和采用该 override 的 membership 异常路径由此 lease 回收。 |
 | MPMC id-allocator cluster lease | `etcd` | `id_allocator_cluster_lease_id` | MPMC member ID allocator 生命周期，当前 TTL 为 30 分钟。当前只有 creator 保留其 keepalive handle；existing attach 只校验存活。 |
 | MPMC shared payload lease | `KvClient` | MPMC meta 的 `payload_lease_id` | 整个 MPMC 及其子 MPSC 复用同一个 payload lease id。creator 和实际注册该 id 的子 MPSC handle 贡献 keepalive；顶层 existing attach 本身当前不注册。 |
 
@@ -199,7 +199,7 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | 创建 / 绑定 | 分配或读取 lease id，调用 `register_lease_for_keepalive`，保留返回的 RAII guard | 创建或绑定自己负责的 key，并把 key 关联到明确的 lease id | 必需 lease 无法校验或首次 keepalive 失败时，当前入口返回错误；部分入口还会清理已确认失效的 stale meta。 |
 | 运行 | 每个已注册的本地 guard 独立维持同一 registry entry；跨进程各自续租 | owner 只管理自己独占的 role、ready、membership、weight 等 key | 短暂 keepalive 失败由 actor 重试；持续失败超过 backend TTL 后，lease 与关联 key 过期。 |
-| 关闭 | 本地 handle Drop，最后一个 guard 释放后 registry 停止后续 keepalive | 正常 close 尽快 delete 独占 key；shared key 等待最后一个 contributor 停止后由 TTL 回收 | 进程崩溃、GC 已释放 handle 或显式 delete 失败时，已绑定 lease 的 key 仍由 TTL 兜底。 |
+| 关闭 | 本地 handle Drop，最后一个 guard 释放后 registry 停止后续 keepalive | 正常 close 对独占 leased key 做一次尽力 delete；shared key 等待最后一个 contributor 停止后由 TTL 回收 | 进程崩溃、GC 已释放 handle 或显式 delete 失败时，已绑定 lease 的 key 仍由 TTL 兜底。 |
 
 ## Lease 生命周期关系
 
@@ -262,9 +262,9 @@ sequenceDiagram
         S->>E: put weight with shared global lease
     end
     S->>S: close endpoint-owned MPSC context
-    S->>E: delete owned membership / weight
+    S->>E: best-effort delete owned membership / weight
     Note over S,E: shared meta, payload, and allocator state stay intact
-    P->>E: close, delete owned role / ready key
+    P->>E: close, best-effort delete owned role / ready key
     P-->>PM: drop parent member guard
     E-->>E: TTL removes residual keys after abnormal cleanup
 ```
@@ -277,7 +277,7 @@ sequenceDiagram
 | MPMC id-allocator cluster | 当前为 creator `MPMCChannel` | 无逐 key close owner | creator handle 释放后，30 分钟 TTL 回收；existing attach 当前不延长此范围。 |
 | metadata / global | creator、直接 MPSC attach、已绑定并注册该 id 的子 MPSC handle | shared meta 无单个 member delete owner | 最后一个实际 contributor 停止后，由 TTL 删除 meta。 |
 | payload | creator与已绑定并注册 payload id 的 MPSC handle | payload key 由 payload lease 统一回收 | 最后一个实际 contributor 停止后，由 KvClient lease TTL 回收。 |
-| member | 当前 MPSC / MPMC member，以及复用该 id 的子 handle | 当前 member | 正常 close 删除 owner key；剩余 leased key 在最后一个 contributor 停止后按 TTL 回收。 |
+| member | 当前 MPSC / MPMC member，以及复用该 id 的子 handle | 当前 member | 正常 close 尽力删除 owner key；失败或剩余 leased key 在最后一个 contributor 停止后按 TTL 回收。 |
 
 ## Lease 所有权
 
@@ -290,10 +290,10 @@ sequenceDiagram
 
 `GeneralLease` 不再表达 cleanup 权限。cleanup 权限由 MQ 对象的语义 owner 决定：
 
-- 独立 MPSC producer：正常 close 删除自己的 producer membership key 和 producer weight key。
-- 独立 MPSC consumer：正常 close 删除自己的 consumer membership key。
-- MPMC producer：每个子 MPSC 正常 close 时关闭自己的 `MpscContext`，删除 producer membership / weight；`MPMCChannel.close()` 再删除当前 MPMC member 的 role key。Producer membership 使用 parent member lease，weight 使用 shared/global lease。
-- MPMC consumer：子 MPSC 正常 close 时关闭自己的 `MpscContext` 并删除 consumer membership；外层随后删除当前 member 的 ready key，`MPMCChannel.close()` 再删除 role key。新建子 MPSC 的 membership 可使用 parent member lease；绑定 existing 子 MPSC 时，当前通用路径使用本地 MPSC member lease。
+- 独立 MPSC producer：正常 close 尽力删除自己的 producer membership key 和 producer weight key。
+- 独立 MPSC consumer：正常 close 尽力删除自己的 consumer membership key。
+- MPMC producer：每个子 MPSC 正常 close 时关闭自己的 `MpscContext`，尽力删除 producer membership / weight；`MPMCChannel.close()` 再尽力删除当前 MPMC member 的 role key。Producer membership 使用 parent member lease，weight 使用 shared/global lease。
+- MPMC consumer：子 MPSC 正常 close 时关闭自己的 `MpscContext` 并尽力删除 consumer membership；确认 membership 删除后，外层再尽力删除当前 member 的 ready key，`MPMCChannel.close()` 最后尽力删除 role key。membership 未确认删除时保留 ready key，让二者随 member lease 一起过期，避免提前 handoff。新建子 MPSC 的 membership 可使用 parent member lease；绑定 existing 子 MPSC 时，当前通用路径使用本地 MPSC member lease。
 - Shared meta / payload / long lease：close 只释放当前实例实际持有的 keepalive guard，不显式 delete shared meta、payload key 或 allocator state；最后一个 contributor 停止后由 TTL 回收。
 
 ### 设计权衡
@@ -305,7 +305,7 @@ Parent MPMC 身份只改变 membership 和 shared lease 的绑定来源，不改
 | 资源 | 正常关闭责任 | 异常路径 |
 | --- | --- | --- |
 | 子 MPSC 本地 context / handle | 子 MPSC `close()` | 进程退出时尝试 GC 关闭 |
-| 子 MPSC membership / producer weight | 子 MPSC `close()` 删除并校验 | 对应 member / global lease TTL |
+| 子 MPSC membership / producer weight | 子 MPSC `close()` 做一次尽力删除 | 对应 member / global lease TTL |
 | Shared meta / payload / allocator state | 不由单个子 handle 删除 | 最后一个 contributor 停止后由 TTL 回收 |
 
 尚未发布到 parent 的临时子通道是创建事务回滚对象。内部 `_rollback_unpublished_channel()` 先复用公共 `close()` 路径，再删除未发布 channel 的 channel-scoped 状态；该回滚方法不是第二个公开关闭入口。
@@ -472,7 +472,7 @@ Existing sub-producer 专用绑定需要四类 id：
 
 这些 id 都对应真实 `GeneralLease` handle。existing sub-consumer 当前没有对称的专用 constructor：它走 `new_with_chan_id`，因此 member lease 是新 grant 的本地 MPSC member lease；global、global-long、payload 仍从 MPSC meta 恢复并注册。
 
-两类子 handle 都复用 MPSC 的唯一公开 `close()` 路径：关闭自己的 `MpscContext`，删除并校验 membership，producer 还会删除自己的 weight。子 handle 不删除 shared meta、payload key 或 allocator state；这些 shared 状态仍由实际 contributor 和 TTL 决定生命周期。
+两类子 handle 都复用 MPSC 的唯一公开 `close()` 路径：关闭自己的 `MpscContext`，对 membership 做一次尽力删除，producer 同时尽力删除自己的 weight。子 handle 不删除 shared meta、payload key 或 allocator state；这些 shared 状态仍由实际 contributor 和 TTL 决定生命周期。
 
 ## 关闭路径
 
@@ -480,7 +480,7 @@ Existing sub-producer 专用绑定需要四类 id：
 
 #### 正常路径
 
-MPSC producer / consumer 只有一条 `close()` 路径，直接 MPSC 和 MPMC 子通道共用该路径。它先发布关闭信号并释放 PyO3 handle，再调用 endpoint 持有的 `MpscContext.close()` 关闭 MQ framework 并等待内部任务结束。之后，Python wrapper 通过 `_delete_owned_etcd_state()` 删除并校验 producer membership / weight 或 consumer membership。Rust handle 释放时，`ChanManager` 与它持有的 `GeneralLease` guard 随之释放。
+MPSC producer / consumer 只有一条 `close()` 路径，直接 MPSC 和 MPMC 子通道共用该路径。它先发布关闭信号并释放 PyO3 handle，再调用 endpoint 持有的 `MpscContext.close()` 关闭 MQ framework 并等待内部任务结束。之后，Python wrapper 通过 `_best_effort_delete_leased_etcd_state()` 对 producer membership / weight 或 consumer membership 做一次 delete pass；失败记录 WARN。Rust handle 释放时，`ChanManager` 与它持有的 `GeneralLease` guard 随之释放。
 
 ```mermaid
 sequenceDiagram
@@ -508,7 +508,7 @@ sequenceDiagram
     end
     Py->>FW: MpscContext.close()
     FW-->>Py: shutdown joined
-    Py->>E: delete and verify owned membership/weight keys
+    Py->>E: one best-effort delete pass for owned membership/weight keys
 ```
 
 Parent MPMC 身份不会改变这条本地关闭契约。外层 MPMC producer / consumer 只调用子 MPSC 的公开 `close()`，不访问 `MpscContext` 或原始 shutdown controller。未发布子通道的 `_rollback_unpublished_channel()` 在标准 `close()` 后额外删除未发布 channel 状态，不形成第二个公开关闭入口。
@@ -517,14 +517,14 @@ Parent MPMC 身份不会改变这条本地关闭契约。外层 MPMC producer / 
 
 - **进程退出或 GC 关闭**：`__del__` 会尽力发布关闭并释放 handle；GC 标记存在时跳过显式 distributed-key delete，剩余 key 依赖 lease TTL。对象尚未被 GC 且 keepalive 仍成功时，lease 会继续存活，TTL 回收尚未开始。
 - **`MpscContext.close()` 失败**：对外返回 `ResourceCleanupError`，并保留 context，下一次调用同一公开 `close()` 时可重试。调用方不需要、也不应自行调用内部 context。
-- **显式 delete 失败**：`_delete_owned_etcd_state()` 最多尝试 3 次，并重新读取状态确认删除结果。仍失败时，`close()` 返回 `ResourceCleanupError`；member 或 global lease TTL 负责最终回收。
+- **显式 delete 失败**：正常 `close()` 只做一次 leased-key delete pass，当前单次 RPC timeout 为 1 秒；失败时记录 WARN、继续释放 keepalive handle，member 或 global lease TTL 负责最终回收。未发布 channel 的事务回滚仍使用 `_delete_and_verify_owned_etcd_state()` 做最多 3 次、单次 5 秒的删除与读取校验，失败时返回 `ResourceCleanupError`。
 - **持续网络中断**：本地 actor 无法成功 keepalive。若中断跨过 backend TTL，lease 与关联 key 过期；短于 TTL 的中断不等同于 lease 已回收。
 
 ### MPMC 关闭
 
 #### 正常路径
 
-MPMC 关闭由外层 producer / consumer 发起。Producer 关闭所有本地缓存的子 MPSC producer；consumer 先唤醒并关闭底层 MPSC consumer，再删除 ready key。每个子 MPSC 的公开 `close()` 内部关闭其 `MpscContext` 并删除 role-specific membership / weight。最后二者都关闭 `MPMCChannel`，删除自己的 role key，并释放这个实例实际登记过的 keepalive handle。
+MPMC 关闭由外层 producer / consumer 发起。Producer 关闭所有本地缓存的子 MPSC producer；consumer 先唤醒并关闭底层 MPSC consumer，membership 已确认删除时再尽力删除 ready key。每个子 MPSC 的公开 `close()` 内部必须关闭其 `MpscContext`，并对 role-specific membership / weight 做一次尽力删除。最后二者都关闭 `MPMCChannel`，尽力删除自己的 role key，并释放这个实例实际登记过的 keepalive handle。
 
 懒绑定 producer 时，MPSC 层在进入 Rust bind 前把自己的构造取消回调注册到 parent shutdown controller。MPMC 只调用外层 `close()`；关闭信号由 MPSC 层转换成 Rust bind 取消，不向 MPMC 暴露 `MpscContext` 或原始 shutdown controller。
 
@@ -544,7 +544,7 @@ sequenceDiagram
     Outer->>Sub: close()
     Sub->>Sub: signal shutdown and release local handle
     Sub->>Sub: close owned MpscContext
-    Sub->>E: delete and verify owned membership / weight
+    Sub->>E: one best-effort delete pass for membership / weight
     alt consumer close
         Outer->>E: delete ready keys for this member
     end
@@ -552,7 +552,7 @@ sequenceDiagram
     Note over Sub,E: shared meta, payload, and allocator state stay intact
     Outer->>Ch: close()
     Ch->>Ch: stop ready-channel watcher
-    Ch->>E: delete own role key
+    Ch->>E: one best-effort delete pass for own role key
     alt creator MPMCChannel
         Ch->>LM: drop member, metadata, cluster, and payload handles
     else existing attach MPMCChannel
@@ -564,9 +564,9 @@ sequenceDiagram
 
 #### 异常路径
 
-- **子 MPSC 关闭失败**：外层 producer / consumer 直接返回子 handle 的 `ApiError`，不把外层实例标记为已完成关闭；后续调用同一公开 `close()` 可重试未完成的清理。
-- **Ready key 删除失败**：consumer 的 `stable_delete_ready_keys_for_member()` 最多尝试 3 次，每次删除后重新扫描确认；仍失败时返回 `NetworkError`，ready key 继续受 MPMC member lease TTL 保护。
-- **Role key 删除失败**：`MPMCChannel.close()` 通过 `_delete_owned_etcd_state()` 最多尝试 3 次并校验结果；仍失败时返回 `ResourceCleanupError`，member lease TTL 负责兜底。
+- **子 MPSC 本地关闭失败**：`MpscContext` 或本地任务未能停止时，外层 producer / consumer 直接返回子 handle 的 `ApiError`，不把外层实例标记为已完成关闭；后续调用同一公开 `close()` 可重试。leased-key delete 失败只记录 WARN，不进入该硬失败分支。
+- **Ready key 删除失败**：consumer 记录 WARN 并继续关闭 `MPMCChannel`、释放 member lease handle；ready key 由 MPMC member lease TTL 回收。若底层 membership 删除未确认，外层不主动删除 ready key，避免在旧 membership 仍可见时提前 handoff。
+- **Role key 删除失败**：`MPMCChannel.close()` 记录 WARN，继续释放 member 和其他实际持有的 lease handle；member lease TTL 负责兜底。
 - **进程崩溃或持续断网**：本地 handle 不再产生有效 keepalive；每个 key 按自己实际绑定的 member、global、metadata 或 payload lease 到期。
 - **Payload lease 丢失**：后续 put / get 通过 KV 错误暴露给上层，当前实现不隐式创建新 lease 或重建 channel。
 
@@ -574,9 +574,9 @@ sequenceDiagram
 
 | 分布式状态 | 正常路径 | 异常或 delete 失败 |
 | --- | --- | --- |
-| MPMC role / ready key | owner 显式 delete | MPMC member lease TTL |
-| 子 MPSC membership | 子 handle 显式 delete 并校验 | parent member lease TTL，或 existing sub-consumer 的本地 MPSC member lease TTL |
-| 子 MPSC producer weight | 子 producer 显式 delete 并校验 | shared/global lease TTL |
+| MPMC role / ready key | owner 做一次尽力 delete | MPMC member lease TTL |
+| 子 MPSC membership | 子 handle 做一次尽力 delete | parent member lease TTL，或 existing sub-consumer 的本地 MPSC member lease TTL |
+| 子 MPSC producer weight | 子 producer 做一次尽力 delete | shared/global lease TTL |
 | MPMC / MPSC meta | 实例只释放自己的 contribution | metadata/global lease TTL |
 | Payload key | 不逐 key 做 channel-close 清理 | KvClient payload lease TTL |
 | ID allocator state | 不在 member close 中删除 | 对应 30 分钟 long lease TTL |
@@ -592,13 +592,13 @@ sequenceDiagram
 - [ ] MPMC creator 与 existing attach 的 `keep_shared_mpmc_leases` 分支经过显式评估，未把 member 存活误当成所有 shared lease 都存活。
 - [ ] Existing sub-producer 专用绑定与 existing sub-consumer 通用绑定分别覆盖，member lease 来源没有被概括成同一条路径。
 - [ ] Python `close()` 保持幂等；共享 `shutdown_ctl.closed` 只负责停止信号，资源释放去重仍由 `_close_done` 或 `_closed_local` 控制。
-- [ ] 显式 delete、首次 keepalive 或 lease 校验失败时，错误路径与 TTL fallback 都有测试；没有隐式重建 payload lease 或 channel。
+- [ ] leased-key delete 失败时有 WARN、handle 释放与 TTL fallback 测试；本地 teardown、首次 keepalive 或 lease 校验失败仍走强错误路径；没有隐式重建 payload lease 或 channel。
 
 ## 关键结论
 
 Fluxon MQ 的生命周期从 KV External 开始：一个 KV External 是一个 KV member，这个 member 以 producer 或 consumer 角色加入具体 channel。Channel、queue-scoped role membership 和本地 handle 是三个不同的生命周期对象。
 
-`GeneralLease::Borrowed` 已经被移除。当前 lease handle 的单一职责是贡献 keepalive；释放 handle 表示当前本地对象停止续租。具有 cleanup ownership 的 MQ 对象在正常关闭时显式 delete 自己的 key，shared key 与异常路径由 TTL 回收。
+`GeneralLease::Borrowed` 已经被移除。当前 lease handle 的单一职责是贡献 keepalive；释放 handle 表示当前本地对象停止续租。具有 cleanup ownership 的 MQ 对象在正常关闭时尽力 delete 自己的 leased key；失败记录 WARN，shared key 与异常路径由 TTL 回收。
 
 Contributor 范围必须按实际注册路径判断。当前 MPMC creator 持有 shared lease handle，顶层 existing attach 只持有 member handle；后续子 MPSC handle 可以为 metadata/global 与 payload lease 增加 contribution。这个实现边界不能简化为“所有顶层 member 都保持所有 shared lease 存活”。
 
@@ -615,9 +615,9 @@ Contributor 范围必须按实际注册路径判断。当前 MPMC creator 持有
 | `fluxon_rs/fluxon_mq/src/consumer.rs` | `MpscConsumer::bind_mpsc` | Consumer membership、`external_client_id`、ID allocator 与运行 actor。 |
 | `fluxon_rs/fluxon_mq/src/shutdown.rs` | `ShutdownCtl` | Rust actor 与等待操作的关闭信号。 |
 | `fluxon_rs/fluxon_pyo3/src/lib.rs`、`mpsc.rs` | `new_fluxon_kv_lease_context`、`MpscContext::new_producer`、`new_consumer`、`close` | 从原生 KV framework 构造 lease backend，承接 Python 到 Rust 的创建 / 绑定分支和 MQ framework 关闭。 |
-| `fluxon_py/_api_ext_chan/mpsc.py` | `MPSCChanProducer.close`、`MPSCChanConsumer.close`、`_close_owned_mpsc_context`、`_delete_owned_etcd_state` | 直接 MPSC / MPMC 子通道的统一关闭路径，以及 GC 关闭语义。 |
+| `fluxon_py/_api_ext_chan/mpsc.py` | `MPSCChanProducer.close`、`MPSCChanConsumer.close`、`_close_owned_mpsc_context`、`_best_effort_delete_leased_etcd_state`、`_delete_and_verify_owned_etcd_state` | 直接 MPSC / MPMC 子通道的统一关闭路径，以及 best-effort leased-key 清理、严格回滚和 GC 关闭语义。 |
 | `fluxon_py/_api_ext_chan/mpmc.py` | `MPMCChannel.new_global_mpmc_channel`、`new_existed_global_mpmc_channel`、`MPMCChannel.close` | MPMC creator / attach、shared handle 选择、member 与 role 生命周期。 |
-| `fluxon_py/_api_ext_chan/mpmc.py` | `stable_delete_ready_keys_for_member`、`MPMCChanProducer.close`、`MPMCChanConsumer.close` | Ready key 重试删除与外层 MPMC 关闭顺序。 |
+| `fluxon_py/_api_ext_chan/mpmc.py` | `_best_effort_delete_ready_keys_for_member`、`MPMCChanProducer.close`、`MPMCChanConsumer.close` | Ready key 单次尽力删除、membership/ready handoff 顺序与外层 MPMC 关闭。 |
 
 ## 常见问题
 
@@ -627,11 +627,11 @@ Contributor 范围必须按实际注册路径判断。当前 MPMC creator 持有
 
 ### 所有 contributor 都停止后，owner 还没 delete 会怎样？
 
-Backend 在 TTL 到期后使 lease 失效，并删除绑定到该 lease 的 key。正常 close 的显式 delete 用于缩短清理延迟；TTL 仍是 delete 失败、GC 和崩溃路径的最终保障。
+Backend 在 TTL 到期后使 lease 失效，并删除绑定到该 lease 的 key。正常 close 的单次尽力 delete 用于缩短清理延迟；TTL 仍是 delete 失败、GC 和崩溃路径的最终保障。
 
 ### 子 MPSC membership 由谁回收？
 
-正常路径由子 MPSC 的公开 `close()` 显式删除并校验。异常或 delete 失败时由实际绑定的 member lease TTL 回收：新建子 MPSC 和 existing sub-producer 使用 parent MPMC member lease；existing sub-consumer 当前通用绑定使用本地 MPSC member lease。
+正常路径由子 MPSC 的公开 `close()` 做一次尽力删除。delete 失败或异常退出时由实际绑定的 member lease TTL 回收：新建子 MPSC 和 existing sub-producer 使用 parent MPMC member lease；existing sub-consumer 当前通用绑定使用本地 MPSC member lease。
 
 ### 顶层 MPMC existing attach 会保持所有 shared lease 存活吗？
 

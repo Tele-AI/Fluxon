@@ -25,7 +25,8 @@ from .mpsc import (
     MPSCChanProducer,
     MPSCChanConsumer,
     ChanRole,
-    _delete_owned_etcd_state,
+    _BEST_EFFORT_LEASED_CLEANUP_RPC_TIMEOUT_SECONDS,
+    _best_effort_delete_leased_etcd_state,
     _require_fluxon_raw_client,
 )
 from ..api_error import (
@@ -89,19 +90,41 @@ MPMC_WATCH_RPC_TIMEOUT_SECONDS = 5
 MPMC_WATCH_STOP_TIMEOUT_SECONDS = 10.0
 
 
-def new_etcd_client(api: KvClient) -> Result[etcd3.Etcd3Client, ApiError]:
+def new_etcd_client(
+    api: KvClient,
+    *,
+    timeout_seconds: float = MPMC_ETCD_RPC_TIMEOUT_SECONDS,
+) -> Result[etcd3.Etcd3Client, ApiError]:
     """Create etcd client"""
-    etcd_config: List[str] = api.get_etcd_config()
-    first_address: str = etcd_config[0]
-    host: str
-    port_str: str
-    host, port_str = first_address.split(":")
-    print(f"new_etcd_client: {host}:{port_str}")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
     try:
+        etcd_config: List[str] = api.get_etcd_config()
+    except Exception as e:  # noqa: BLE001
+        return Result.new_error(
+            EtcdError(
+                message=f"Cannot read etcd endpoint list: {type(e).__name__}: {e}",
+                component="mpmc.new_etcd_client",
+                transport=TransportName.GRPC,
+                transport_user=TransportUser.ETCD,
+            )
+        )
+    if not etcd_config:
+        return Result.new_error(
+            EtcdError(
+                message="Cannot create etcd grpc client: empty endpoint list",
+                component="mpmc.new_etcd_client",
+                transport=TransportName.GRPC,
+                transport_user=TransportUser.ETCD,
+            )
+        )
+    first_address = etcd_config[0]
+    try:
+        host, port_str = first_address.split(":")
         client: etcd3.Etcd3Client = etcd3.client(
             host=host,
             port=int(port_str),
-            timeout=MPMC_ETCD_RPC_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
         return Result.new_ok(client)
     except Exception as e:
@@ -116,76 +139,57 @@ def new_etcd_client(api: KvClient) -> Result[etcd3.Etcd3Client, ApiError]:
             )
         )
 
-def stable_delete_ready_keys_for_member(
+def _best_effort_delete_ready_keys_for_member(
     api: KvClient, mpmc_id: str, member_id: int
-) -> Result[OkNone, ApiError]:
+) -> bool:
     if not isinstance(mpmc_id, str) or not mpmc_id.isdigit() or int(mpmc_id) <= 0:
         raise ValueError(f"invalid mpmc_id: {mpmc_id!r}")
     if not isinstance(member_id, int) or member_id <= 0:
         raise ValueError(f"invalid member_id: {member_id!r}")
 
-    endpoints = api.get_etcd_config()
-    endpoint = endpoints[0] if endpoints else None
     prefix = _new_mpmc_ready_channels_prefix(mpmc_id)
     member_id_str = str(member_id)
-
-    errors: List[str] = []
-    for attempt in range(3):
-        client_res = new_etcd_client(api)
-        if not client_res.is_ok():
-            err = client_res.unwrap_error()
-            errors.append(str(err))
-            continue
-
-        client = client_res.unwrap()
-        try:
-            keys_to_delete: List[bytes] = []
-            for value, meta in client.get_prefix(prefix):
-                if value is None:
-                    continue
-                if value.decode() != member_id_str:
-                    continue
-                keys_to_delete.append(meta.key)
-
-            for key in keys_to_delete:
-                client.delete(key)
-
-            # Verify: keys should be gone immediately after delete on the same prefix.
-            remaining: List[bytes] = []
-            for value, meta in client.get_prefix(prefix):
-                if value is None:
-                    continue
-                if value.decode() != member_id_str:
-                    continue
-                remaining.append(meta.key)
-
-            if len(remaining) == 0:
-                return Result.new_ok(OK_NONE)
-
-            errors.append(
-                f"attempt={attempt}: remaining ready keys after delete: {remaining!r}"
-            )
-            time.sleep(0.1)
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"attempt={attempt}: {e}")
-            time.sleep(0.1)
-        finally:
-            try:
-                client.close()
-            except Exception as e:  # noqa: BLE001
-                logging.warning(
-                    f"stable_delete_ready_keys_for_member failed to close etcd client: {e}"
-                )
-
-    return Result.new_error(
-        NetworkError(
-            message=(
-                "stable_delete_ready_keys_for_member failed for "
-                f"mpmc_id={mpmc_id}, member_id={member_id}, errors={errors}"
-            ),
-            endpoint=endpoint,
-        )
+    client_res = new_etcd_client(
+        api,
+        timeout_seconds=_BEST_EFFORT_LEASED_CLEANUP_RPC_TIMEOUT_SECONDS,
     )
+    if not client_res.is_ok():
+        error = client_res.unwrap_error()
+        logging.warning(
+            "MPMC ready-key cleanup deferred to member lease TTL: "
+            "mpmc_id=%s member_id=%s err=%s",
+            mpmc_id,
+            member_id,
+            error,
+        )
+        return False
+
+    client = client_res.unwrap()
+    try:
+        keys_to_delete: List[bytes] = []
+        for value, meta in client.get_prefix(prefix):
+            if value is None or value.decode() != member_id_str:
+                continue
+            keys_to_delete.append(meta.key)
+
+        for key in keys_to_delete:
+            client.delete(key)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.warning(
+            "MPMC ready-key cleanup deferred to member lease TTL: "
+            "mpmc_id=%s member_id=%s err=%s: %s",
+            mpmc_id,
+            member_id,
+            type(e).__name__,
+            e,
+        )
+        return False
+    finally:
+        try:
+            client.close()
+        except Exception as e:  # noqa: BLE001
+            logging.debug("MPMC ready-key cleanup client close failed: %s", e)
 
 
 def _local_member_id_cache_path(kv_api: KvClient, mpmc_id: str, role: ChanRole) -> str:
@@ -2080,15 +2084,12 @@ class MPMCChannel(FactoryOnly):
 
             if isinstance(self.mpmc_member_id, int):
                 role_key = _new_mpmc_role_key(self.mpmc_id, self.role, self.mpmc_member_id)
-                role_cleanup = _delete_owned_etcd_state(
+                _best_effort_delete_leased_etcd_state(
                     self.kv_api,
                     keys=[role_key],
                     prefixes=[],
                     dbg=f"MPMCChannel role cleanup mpmc_id={self.mpmc_id}",
                 )
-                if not role_cleanup.is_ok():
-                    return Result.new_error(role_cleanup.unwrap_error())
-                role_cleanup.unwrap()
 
             self._lm_mpmc_member = None  # type: ignore[assignment]
             self._lm_mpmc_global = None  # type: ignore[assignment]
@@ -2810,15 +2811,18 @@ class MPMCChanConsumer(ChannelConsumer):
                 return Result.new_ok(OK_NONE)
             self.shutdown_ctl.close()
 
-            # Inner close first wakes any active get and verifies that this exact
-            # consumer membership is gone. The ready key must remain owned until
-            # that deletion succeeds, otherwise another consumer can bind while
-            # producers still observe the old membership.
+            # Inner close first wakes any active get and attempts eager membership
+            # deletion. If that pass cannot complete, keep the ready key until the
+            # same member lifecycle expires so another consumer cannot bind early.
+            membership_cleanup_completed = True
             if self.mpsc_consumer is not None:
                 close_result = self.mpsc_consumer.close()
                 if not close_result.is_ok():
                     return Result.new_error(close_result.unwrap_error())
                 close_result.unwrap()
+                membership_cleanup_completed = (
+                    self.mpsc_consumer.membership_cleanup_completed()
+                )
 
             # Wait until an in-flight outer get has observed the shutdown signal.
             with self.shutdown_ctl._op_lock:
@@ -2829,25 +2833,26 @@ class MPMCChanConsumer(ChannelConsumer):
             member_id = None
             if self.mpmc_channel is not None:
                 member_id = self.mpmc_channel.mpmc_member_id
-            if isinstance(member_id, int):
-                delete_res = stable_delete_ready_keys_for_member(self.api, mpmc_id, member_id)
-                if not delete_res.is_ok():
-                    return Result.new_error(delete_res.unwrap_error())
-                delete_res.unwrap()
+            if not membership_cleanup_completed:
+                logging.warning(
+                    "MPMC consumer %s keeps ready key until member lease TTL because "
+                    "the eager membership delete pass did not complete",
+                    member_id if isinstance(member_id, int) else "unknown",
+                )
+            elif isinstance(member_id, int):
+                _best_effort_delete_ready_keys_for_member(
+                    self.api,
+                    mpmc_id,
+                    member_id,
+                )
             elif self.bound_mpsc_id is not None:
                 ready_key = _new_mpmc_ready_channel_key(mpmc_id, self.bound_mpsc_id)
-                try:
-                    self.etcd_client.delete(ready_key)
-                    if self.etcd_client.get(ready_key)[0] is not None:
-                        raise RuntimeError(f"ready key still exists after delete: {ready_key}")
-                except Exception as e:  # noqa: BLE001
-                    return Result.new_error(
-                        ResourceCleanupError(
-                            message=f"failed to delete ready key {ready_key}: {e}",
-                            resource_type="mpmc_ready_key",
-                            resource_id=ready_key,
-                        )
-                    )
+                _best_effort_delete_leased_etcd_state(
+                    self.api,
+                    keys=[ready_key],
+                    prefixes=[],
+                    dbg=f"MPMC ready cleanup key={ready_key}",
+                )
 
             self.mpsc_consumer = None
 

@@ -70,6 +70,7 @@ _TEST_CLOSE_MARKERS: Dict[str, bool] = {}
 _CLOSE_DURING_PUT_DETAIL = "producer closed during put_with_payload"
 _DISTRIBUTED_CLEANUP_ATTEMPTS = 3
 _DISTRIBUTED_CLEANUP_RPC_TIMEOUT_SECONDS = 5
+_BEST_EFFORT_LEASED_CLEANUP_RPC_TIMEOUT_SECONDS = 1
 
 def _record_test_close_marker(tag: str, by_gc: bool) -> None:
     _TEST_CLOSE_MARKERS[tag] = by_gc
@@ -191,18 +192,27 @@ def _new_produce_offset_of_all_producer_key(chan_id: str) -> str:
     return f"/channels/{chan_id}/producer_offset_of_all_producer/"
 
 
-def _delete_owned_etcd_state(
+def _delete_and_verify_owned_etcd_state(
     api: KvClient,
     *,
     keys: List[str],
     prefixes: List[str],
     dbg: str,
 ) -> Result[OkNone, ApiError]:
-    """Delete and verify etcd state owned by one graceful lifecycle action."""
+    """Delete and verify etcd state for a strict construction rollback."""
 
     if not keys and not prefixes:
         return Result.new_ok(OkNone())
-    endpoints = api.get_etcd_config()
+    try:
+        endpoints = api.get_etcd_config()
+    except Exception as e:  # noqa: BLE001
+        return Result.new_error(
+            ResourceCleanupError(
+                message=f"cannot read etcd endpoints for strict cleanup: {e}",
+                resource_type="mq_etcd_state",
+                resource_id=dbg,
+            )
+        )
     if not endpoints:
         return Result.new_error(
             ResourceCleanupError(
@@ -260,6 +270,64 @@ def _delete_owned_etcd_state(
     )
 
 
+def _best_effort_delete_leased_etcd_state(
+    api: KvClient,
+    *,
+    keys: List[str],
+    prefixes: List[str],
+    dbg: str,
+) -> bool:
+    """Attempt one eager delete pass and defer failures to lease TTL."""
+
+    if not keys and not prefixes:
+        return True
+    try:
+        endpoints = api.get_etcd_config()
+    except Exception as e:  # noqa: BLE001
+        logging.warning(
+            "%s leased etcd cleanup deferred to lease TTL: cannot read endpoints: %s",
+            dbg,
+            e,
+        )
+        return False
+    if not endpoints:
+        logging.warning(
+            "%s leased etcd cleanup deferred to lease TTL: empty endpoint list",
+            dbg,
+        )
+        return False
+
+    endpoint = endpoints[0]
+    client: Optional[etcd3.Etcd3Client] = None
+    try:
+        host, port_str = endpoint.split(":")
+        client = etcd3.client(
+            host=host,
+            port=int(port_str),
+            timeout=_BEST_EFFORT_LEASED_CLEANUP_RPC_TIMEOUT_SECONDS,
+        )
+        for key in keys:
+            client.delete(key)
+        for prefix in prefixes:
+            client.delete_prefix(prefix)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.warning(
+            "%s leased etcd cleanup deferred to lease TTL: endpoint=%s err=%s: %s",
+            dbg,
+            endpoint,
+            type(e).__name__,
+            e,
+        )
+        return False
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception as e:  # noqa: BLE001
+                logging.debug("%s failed to close cleanup etcd client: %s", dbg, e)
+
+
 def _rollback_unpublished_channel_state(
     api: KvClient,
     chan_id: str,
@@ -275,7 +343,7 @@ def _rollback_unpublished_channel_state(
                 resource_id=str(chan_id),
             )
         )
-    return _delete_owned_etcd_state(
+    return _delete_and_verify_owned_etcd_state(
         api,
         keys=[
             _new_etcd_meta_key(chan_id),
@@ -684,9 +752,12 @@ class MPSCChanProducer(ChannelProducer):
 
             # Use safe attribute access to tolerate partially-initialized objects
             chan_id = getattr(self, "_chan_id", None)
-            dbg = getattr(self, "_dbg_tag", "[MPSCChanProducer]")
             by_gc = bool(getattr(self, "_closing_by_gc", False))
             producer_id = getattr(self, "_producer_id", None)
+            dbg = (
+                f"[MPSCChanProducer chan_id={chan_id or 'unknown'} "
+                f"producer_idx={producer_id or 'unknown'}]"
+            )
             if not getattr(self, "_closed_local", False):
                 logging.debug(
                     "%s close begin chan_id=%s parent_mpmc_id=%s",
@@ -721,7 +792,7 @@ class MPSCChanProducer(ChannelProducer):
                 and chan_id != "-1"
                 and producer_id != "unknown"
             ):
-                cleanup_result = _delete_owned_etcd_state(
+                self._membership_cleanup_done = _best_effort_delete_leased_etcd_state(
                     self.api,
                     keys=[
                         _new_etcd_producer_key(chan_id, producer_id),
@@ -730,10 +801,6 @@ class MPSCChanProducer(ChannelProducer):
                     prefixes=[],
                     dbg=dbg,
                 )
-                if not cleanup_result.is_ok():
-                    return cleanup_result
-                cleanup_result.unwrap()
-                self._membership_cleanup_done = True
 
             logging.debug(
                 "%s close end chan_id=%s",
@@ -948,9 +1015,12 @@ class MPSCChanConsumer(ChannelConsumer):
                 return Result.new_ok(OkNone())
 
             chan_id = getattr(self, "_chan_id", None)
-            dbg = getattr(self, "_dbg_tag", "[MPSCChanConsumer]")
             by_gc = bool(getattr(self, "_closing_by_gc", False))
             consumer_id = getattr(self, "_consumer_id", None)
+            dbg = (
+                f"[MPSCChanConsumer chan_id={chan_id or 'unknown'} "
+                f"consumer_idx={consumer_id or 'unknown'}]"
+            )
             if not getattr(self, "_closed_local", False):
                 logging.debug(
                     "%s close begin chan_id=%s parent_mpmc_id=%s",
@@ -985,16 +1055,12 @@ class MPSCChanConsumer(ChannelConsumer):
                 and chan_id != "-1"
                 and consumer_id != "unknown"
             ):
-                cleanup_result = _delete_owned_etcd_state(
+                self._membership_cleanup_done = _best_effort_delete_leased_etcd_state(
                     self.api,
                     keys=[_new_etcd_consumer_key(chan_id, consumer_id)],
                     prefixes=[],
                     dbg=dbg,
                 )
-                if not cleanup_result.is_ok():
-                    return cleanup_result
-                cleanup_result.unwrap()
-                self._membership_cleanup_done = True
 
             logging.debug(
                 "%s close end chan_id=%s",
@@ -1003,6 +1069,11 @@ class MPSCChanConsumer(ChannelConsumer):
             )
             self._close_done = True
             return Result.new_ok(OkNone())
+
+    def membership_cleanup_completed(self) -> bool:
+        """Return whether the eager membership delete pass completed."""
+
+        return self._membership_cleanup_done
 
     def _rollback_unpublished_channel(self) -> Result[OkNone, ApiError]:
         """Close and remove a newly created channel that was never published."""

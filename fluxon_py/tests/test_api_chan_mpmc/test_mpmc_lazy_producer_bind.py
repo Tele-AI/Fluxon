@@ -464,10 +464,10 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
         self.assertIsInstance(errors[0], RuntimeError)
         self.assertEqual(producer.mpsc_producers, {})
 
-    def test_shutdown_bind_cleanup_failure_retains_subproducer_for_close_retry(self):
+    def test_shutdown_bind_local_cleanup_failure_retains_subproducer_for_close_retry(self):
         cleanup_error = ResourceCleanupError(
-            message="membership cleanup failed",
-            resource_type="mq_etcd_state",
+            message="MPSC context cleanup failed",
+            resource_type="mpsc_context",
             resource_id="11",
         )
 
@@ -574,11 +574,22 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
             cleanup_calls.append((list(keys), list(prefixes)))
             return Result.new_ok(OkNone())
 
+        def fake_best_effort_delete(api, *, keys, prefixes, dbg):
+            cleanup_calls.append((list(keys), list(prefixes)))
+            return True
+
         try:
-            with mock.patch.object(
-                mpsc_module,
-                "_delete_owned_etcd_state",
-                side_effect=fake_delete,
+            with (
+                mock.patch.object(
+                    mpsc_module,
+                    "_best_effort_delete_leased_etcd_state",
+                    side_effect=fake_best_effort_delete,
+                ),
+                mock.patch.object(
+                    mpsc_module,
+                    "_delete_and_verify_owned_etcd_state",
+                    side_effect=fake_delete,
+                ),
             ):
                 worker = threading.Thread(
                     target=lambda: self._capture_mpsc_construction_error(
@@ -650,8 +661,8 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
         close_results = []
         with mock.patch.object(
             mpsc_module,
-            "_delete_owned_etcd_state",
-            return_value=Result.new_ok(OkNone()),
+            "_best_effort_delete_leased_etcd_state",
+            return_value=True,
         ):
             closer = threading.Thread(
                 target=lambda: close_results.append(consumer.close()),
@@ -704,8 +715,8 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
             mock.patch.object(mpsc_module, "_fluxon_kv", fake_pyo3),
             mock.patch.object(
                 mpsc_module,
-                "_delete_owned_etcd_state",
-                return_value=Result.new_ok(OkNone()),
+                "_best_effort_delete_leased_etcd_state",
+                return_value=True,
             ),
         ):
             worker = threading.Thread(
@@ -761,10 +772,12 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
         calls = []
         def fake_delete(api, *, keys, prefixes, dbg):
             calls.append((list(keys), list(prefixes)))
-            return Result.new_ok(OkNone())
+            return True
 
         with mock.patch.object(
-            mpsc_module, "_delete_owned_etcd_state", side_effect=fake_delete
+            mpsc_module,
+            "_best_effort_delete_leased_etcd_state",
+            side_effect=fake_delete,
         ):
             producer = _make_close_test_handle(
                 MPSCChanProducer,
@@ -786,10 +799,12 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
         calls = []
         def fake_delete(api, *, keys, prefixes, dbg):
             calls.append((list(keys), list(prefixes)))
-            return Result.new_ok(OkNone())
+            return True
 
         with mock.patch.object(
-            mpsc_module, "_delete_owned_etcd_state", side_effect=fake_delete
+            mpsc_module,
+            "_best_effort_delete_leased_etcd_state",
+            side_effect=fake_delete,
         ):
             producer = _make_close_test_handle(MPSCChanProducer)
             context = producer._ctx
@@ -808,10 +823,12 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
         calls = []
         def fake_delete(api, *, keys, prefixes, dbg):
             calls.append((list(keys), list(prefixes)))
-            return Result.new_ok(OkNone())
+            return True
 
         with mock.patch.object(
-            mpsc_module, "_delete_owned_etcd_state", side_effect=fake_delete
+            mpsc_module,
+            "_best_effort_delete_leased_etcd_state",
+            side_effect=fake_delete,
         ):
             consumer = _make_close_test_handle(
                 MPSCChanConsumer,
@@ -827,10 +844,12 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
         calls = []
         def fake_delete(api, *, keys, prefixes, dbg):
             calls.append((list(keys), list(prefixes)))
-            return Result.new_ok(OkNone())
+            return True
 
         with mock.patch.object(
-            mpsc_module, "_delete_owned_etcd_state", side_effect=fake_delete
+            mpsc_module,
+            "_best_effort_delete_leased_etcd_state",
+            side_effect=fake_delete,
         ):
             consumer = _make_close_test_handle(MPSCChanConsumer)
             context = consumer._ctx
@@ -838,6 +857,98 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
 
         self.assertEqual(calls, [(["/channels/7/consumer/consumer_11"], [])])
         self.assertTrue(context.closed)
+
+    def test_endpoint_close_defers_leased_cleanup_failure_to_ttl(self):
+        for endpoint_type in (MPSCChanProducer, MPSCChanConsumer):
+            with self.subTest(endpoint_type=endpoint_type.__name__):
+                endpoint = _make_close_test_handle(endpoint_type, subchannel=True)
+                context = endpoint._ctx
+                with mock.patch.object(
+                    mpsc_module,
+                    "_best_effort_delete_leased_etcd_state",
+                    return_value=False,
+                ) as delete_state:
+                    endpoint.close().unwrap()
+
+                self.assertTrue(context.closed)
+                self.assertTrue(endpoint._close_done)
+                self.assertFalse(endpoint._membership_cleanup_done)
+                delete_state.assert_called_once()
+                self.assertIn("chan_id=7", delete_state.call_args.kwargs["dbg"])
+
+    def test_best_effort_leased_cleanup_uses_one_delete_pass(self):
+        class Api:
+            def get_etcd_config(self):
+                return ["127.0.0.1:2379"]
+
+        class Client:
+            def __init__(self):
+                self.deleted_keys = []
+                self.deleted_prefixes = []
+                self.closed = False
+
+            def delete(self, key):
+                self.deleted_keys.append(key)
+
+            def delete_prefix(self, prefix):
+                self.deleted_prefixes.append(prefix)
+
+            def get(self, _key):
+                raise AssertionError("best-effort cleanup must not verify with get")
+
+            def get_prefix(self, _prefix):
+                raise AssertionError("best-effort cleanup must not verify with get_prefix")
+
+            def close(self):
+                self.closed = True
+
+        client = Client()
+        with mock.patch.object(
+            mpsc_module.etcd3,
+            "client",
+            return_value=client,
+        ) as client_factory:
+            completed = mpsc_module._best_effort_delete_leased_etcd_state(
+                Api(),
+                keys=["key-a", "key-b"],
+                prefixes=["prefix-a"],
+                dbg="test cleanup",
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(client_factory.call_args.kwargs["timeout"], 1)
+        self.assertEqual(client.deleted_keys, ["key-a", "key-b"])
+        self.assertEqual(client.deleted_prefixes, ["prefix-a"])
+        self.assertTrue(client.closed)
+
+        class FailingClient:
+            def __init__(self):
+                self.delete_calls = 0
+                self.closed = False
+
+            def delete(self, _key):
+                self.delete_calls += 1
+                raise TimeoutError("etcd timeout")
+
+            def close(self):
+                self.closed = True
+
+        failing_client = FailingClient()
+        with mock.patch.object(
+            mpsc_module.etcd3,
+            "client",
+            return_value=failing_client,
+        ):
+            completed = mpsc_module._best_effort_delete_leased_etcd_state(
+                Api(),
+                keys=["key-a", "key-b"],
+                prefixes=[],
+                dbg="test cleanup failure",
+            )
+
+        self.assertFalse(completed)
+        self.assertEqual(failing_client.delete_calls, 1)
+        self.assertTrue(failing_client.closed)
 
     def test_mpsc_endpoint_concurrent_close_is_linearized(self):
         for endpoint_type in (MPSCChanProducer, MPSCChanConsumer):
@@ -851,7 +962,7 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
 
                 def fake_delete(api, *, keys, prefixes, dbg):
                     delete_calls.append((list(keys), list(prefixes)))
-                    return Result.new_ok(OkNone())
+                    return True
 
                 def close_endpoint():
                     try:
@@ -860,7 +971,9 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
                         errors.append(exc)
 
                 with mock.patch.object(
-                    mpsc_module, "_delete_owned_etcd_state", side_effect=fake_delete
+                    mpsc_module,
+                    "_best_effort_delete_leased_etcd_state",
+                    side_effect=fake_delete,
                 ):
                     first = threading.Thread(target=close_endpoint)
                     second = threading.Thread(target=close_endpoint)
@@ -900,10 +1013,12 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
                 calls = []
                 def fake_delete(api, *, keys, prefixes, dbg):
                     calls.append(list(keys))
-                    return Result.new_ok(OkNone())
+                    return True
 
                 with mock.patch.object(
-                    mpsc_module, "_delete_owned_etcd_state", side_effect=fake_delete
+                    mpsc_module,
+                    "_best_effort_delete_leased_etcd_state",
+                    side_effect=fake_delete,
                 ):
                     endpoint = _make_close_test_handle(
                         endpoint_type,
@@ -938,8 +1053,21 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
             calls.append((list(keys), list(prefixes)))
             return Result.new_ok(OkNone())
 
-        with mock.patch.object(
-            mpsc_module, "_delete_owned_etcd_state", side_effect=fake_delete
+        def fake_best_effort_delete(api, *, keys, prefixes, dbg):
+            calls.append((list(keys), list(prefixes)))
+            return True
+
+        with (
+            mock.patch.object(
+                mpsc_module,
+                "_best_effort_delete_leased_etcd_state",
+                side_effect=fake_best_effort_delete,
+            ),
+            mock.patch.object(
+                mpsc_module,
+                "_delete_and_verify_owned_etcd_state",
+                side_effect=fake_delete,
+            ),
         ):
             endpoint._rollback_unpublished_channel().unwrap()
 
@@ -969,6 +1097,9 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
                 events.append("membership")
                 return Result.new_ok(OkNone())
 
+            def membership_cleanup_completed(self):
+                return True
+
         class InnerChannel:
             mpmc_member_id = 11
 
@@ -988,52 +1119,95 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
 
         def delete_ready(*_args, **_kwargs):
             events.append("ready")
-            return Result.new_ok(OkNone())
+            return True
 
         with mock.patch.object(
             mpmc_module,
-            "stable_delete_ready_keys_for_member",
+            "_best_effort_delete_ready_keys_for_member",
             side_effect=delete_ready,
         ):
             consumer.close().unwrap()
 
         self.assertEqual(events, ["membership", "ready", "channel"])
 
-    def test_mpmc_consumer_keeps_ready_key_when_membership_cleanup_fails(self):
-        cleanup_error = ResourceCleanupError(
-            message="membership delete failed",
-            resource_type="mq_etcd_state",
-            resource_id="consumer-11",
-        )
-
+    def test_mpmc_consumer_keeps_ready_key_when_membership_cleanup_is_deferred(self):
         class InnerConsumer:
             def close(self):
-                return Result.new_error(cleanup_error)
+                return Result.new_ok(OkNone())
+
+            def membership_cleanup_completed(self):
+                return False
+
+        class InnerChannel:
+            mpmc_member_id = 11
+
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                return Result.new_ok(OkNone())
 
         consumer = MPMCChanConsumer.__new__(MPMCChanConsumer)
         consumer.shutdown_ctl = MqShutdownCtl()
         consumer._close_lock = threading.Lock()
         consumer._close_done = False
         consumer.mpsc_consumer = InnerConsumer()
-        consumer.mpmc_channel = object()
+        inner_channel = InnerChannel()
+        consumer.mpmc_channel = inner_channel
         consumer.mpmc_id = "1"
         consumer.bound_mpsc_id = "7"
         consumer.api = object()
 
         with mock.patch.object(
             mpmc_module,
-            "stable_delete_ready_keys_for_member",
+            "_best_effort_delete_ready_keys_for_member",
         ) as delete_ready:
             close_result = consumer.close()
 
-        self.assertFalse(close_result.is_ok())
-        returned_error = close_result.unwrap_error()
-        self.assertIsInstance(returned_error, ResourceCleanupError)
-        self.assertEqual(returned_error.message, cleanup_error.message)
-        self.assertEqual(returned_error.resource_id, cleanup_error.resource_id)
+        close_result.unwrap()
         delete_ready.assert_not_called()
-        self.assertFalse(consumer._close_done)
-        consumer._close_done = True
+        self.assertTrue(inner_channel.closed)
+        self.assertTrue(consumer._close_done)
+
+    def test_mpmc_consumer_ready_cleanup_failure_falls_back_to_member_lease(self):
+        class InnerConsumer:
+            def close(self):
+                return Result.new_ok(OkNone())
+
+            def membership_cleanup_completed(self):
+                return True
+
+        class InnerChannel:
+            mpmc_member_id = 11
+
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                return Result.new_ok(OkNone())
+
+        consumer = MPMCChanConsumer.__new__(MPMCChanConsumer)
+        consumer.shutdown_ctl = MqShutdownCtl()
+        consumer._close_lock = threading.Lock()
+        consumer._close_done = False
+        consumer.mpsc_consumer = InnerConsumer()
+        inner_channel = InnerChannel()
+        consumer.mpmc_channel = inner_channel
+        consumer.mpmc_id = "1"
+        consumer.bound_mpsc_id = "7"
+        consumer.api = object()
+
+        with mock.patch.object(
+            mpmc_module,
+            "_best_effort_delete_ready_keys_for_member",
+            return_value=False,
+        ):
+            consumer.close().unwrap()
+
+        self.assertTrue(inner_channel.closed)
+        self.assertTrue(consumer._close_done)
 
     def test_watch_stop_is_bounded_when_cancel_contract_breaks(self):
         class StuckThread:
@@ -1163,6 +1337,37 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
             lifecycle_events,
             ["stream-cancel", "stream-exit", "client-close"],
         )
+
+    def test_mpmc_channel_role_cleanup_failure_releases_leases(self):
+        channel = MPMCChannel.__new__(MPMCChannel)
+        channel.mpmc_id = "1"
+        channel.role = ChanRole.PRODUCER
+        channel.kv_api = object()
+        channel.shutdown_ctl = MqShutdownCtl()
+        channel._close_lock = threading.Lock()
+        channel._close_done = False
+        channel.mpmc_member_id = 11
+        channel._lm_mpmc_member = object()
+        channel._lm_mpmc_global = object()
+        channel._lm_cluster_long = object()
+        channel._lm_kv_payload = object()
+
+        with (
+            mock.patch.object(MPMCChannel, "stop_watching", autospec=True),
+            mock.patch.object(
+                mpmc_module,
+                "_best_effort_delete_leased_etcd_state",
+                return_value=False,
+            ) as delete_role,
+        ):
+            channel.close().unwrap()
+
+        delete_role.assert_called_once()
+        self.assertIsNone(channel._lm_mpmc_member)
+        self.assertIsNone(channel._lm_mpmc_global)
+        self.assertIsNone(channel._lm_cluster_long)
+        self.assertIsNone(channel._lm_kv_payload)
+        self.assertTrue(channel._close_done)
 
     def test_watch_stop_timeout_preserves_channel_owned_leases(self):
         class StuckThread:
