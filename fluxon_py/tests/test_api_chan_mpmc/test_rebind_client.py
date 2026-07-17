@@ -11,8 +11,9 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional
 
 # Bootstrap import path to project root so absolute imports always work
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -50,6 +51,16 @@ from setup_and_pack.utils.repo_config_utils import (  # noqa: E402
 from fluxon_py.kvclient import KvClientType, new_store  # noqa: E402
 from fluxon_py.kvclient.kvclient_interface import KvClient  # noqa: E402
 from fluxon_py.config import FluxonKvClientConfig  # noqa: E402
+from fluxon_py.tests.test_api_chan_mpmc.rebind_coordinator import (  # noqa: E402
+    BarrierTarget,
+    RebindRoundActions,
+    WorkerProcess,
+    WorkerRole,
+    coordinate_rebind_rounds,
+    pause_ack_key,
+    ready_key,
+    wait_for_barrier,
+)
 
 
 logging = init_logger()
@@ -62,10 +73,20 @@ LOOPS = 5  # number of consumer restart cycles
 PRODUCER_MESSAGE_COUNT = 80  # per producer, should exceed total active windows
 ACTIVE_WINDOW_SEC = 3  # each consumer stays active for this many seconds
 INACTIVE_GAP_SEC = 1   # gap between stopping current and starting next consumer
-DRAIN_SEC = 5  # final draining time before stopping last consumer
+READY_TIMEOUT_SEC = 120
+PAUSE_ACK_TIMEOUT_SEC = 60
+CONSUMER_EXIT_TIMEOUT_SEC = 600
+PRODUCER_EXIT_TIMEOUT_SEC = 60
+PROCESS_CLEANUP_GRACE_SEC = 5
 
 
-def _producer_cmd(backend_type: str, ip: str, producer_id: str, message_count: int) -> List[str]:
+def _producer_cmd(
+    backend_type: str,
+    ip: str,
+    producer_id: str,
+    message_count: int,
+    session_id: str,
+) -> List[str]:
     return [
         sys.executable,
         str(SCRIPT_PATH_SELF),
@@ -84,10 +105,18 @@ def _producer_cmd(backend_type: str, ip: str, producer_id: str, message_count: i
         producer_id,
         "--message_count",
         str(message_count),
+        "--session_id",
+        session_id,
     ]
 
 
-def _consumer_cmd(backend_type: str, ip: str, consumer_id: str, prefetch: int = 0) -> List[str]:
+def _consumer_cmd(
+    backend_type: str,
+    ip: str,
+    consumer_id: str,
+    session_id: str,
+    prefetch: int = 0,
+) -> List[str]:
     return [
         sys.executable,
         str(SCRIPT_PATH_SELF),
@@ -106,6 +135,8 @@ def _consumer_cmd(backend_type: str, ip: str, consumer_id: str, prefetch: int = 
         consumer_id,
         "--prefetch",
         str(prefetch),
+        "--session_id",
+        session_id,
     ]
 
 def _wait_fluxon_member_absent(instance_key: str, *, timeout_s: int = 45) -> None:
@@ -148,6 +179,7 @@ def _build_parser() -> argparse.ArgumentParser:
     producer_parser.add_argument("--chan_type", required=True, type=str)
     producer_parser.add_argument("--producer_id", required=True, type=str)
     producer_parser.add_argument("--message_count", required=True, type=int)
+    producer_parser.add_argument("--session_id", required=True, type=str)
 
     consumer_parser = subparsers.add_parser("run_consumer", help="Run consumer")
     consumer_parser.add_argument("--backend_type", required=True, type=str)
@@ -157,6 +189,7 @@ def _build_parser() -> argparse.ArgumentParser:
     consumer_parser.add_argument("--chan_type", required=True, type=str)
     consumer_parser.add_argument("--consumer_id", required=True, type=str)
     consumer_parser.add_argument("--prefetch", required=False, type=int, default=0)
+    consumer_parser.add_argument("--session_id", required=True, type=str)
     return parser
 
 
@@ -298,15 +331,108 @@ def _read_log_tail(path: str, *, max_lines: int = 80) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+def _close_endpoint(endpoint: Any, *, label: str) -> None:
+    close_result = endpoint.close()
+    if not close_result.is_ok():
+        raise RuntimeError(f"{label} close failed: {close_result.unwrap_error()}")
+    close_result.unwrap()
+
+
+def _wait_for_worker_exit(worker: WorkerProcess, *, timeout_s: float) -> None:
+    try:
+        return_code = worker.process.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{worker.role.value} {worker.identifier} did not exit within "
+            f"{timeout_s:.1f}s; log={worker.log_file}\n"
+            "--- child log tail ---\n"
+            f"{_read_log_tail(worker.log_file)}\n"
+            "--- end child log tail ---"
+        ) from exc
+    if return_code != 0:
+        raise RuntimeError(
+            f"{worker.role.value} {worker.identifier} failed with return code "
+            f"{return_code}; log={worker.log_file}\n"
+            "--- child log tail ---\n"
+            f"{_read_log_tail(worker.log_file)}\n"
+            "--- end child log tail ---"
+        )
+
+
+def _cleanup_owned_workers(workers: List[WorkerProcess]) -> None:
+    alive = [worker for worker in workers if worker.process.poll() is None]
+    if not alive:
+        return
+
+    try:
+        _etcd_put("/test_mpmc_stop_producer", b"cleanup")
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("[RBD-CTL-CLEANUP] failed to signal producers: %s", exc)
+    for worker in alive:
+        if worker.role is not WorkerRole.CONSUMER:
+            continue
+        try:
+            _etcd_put(
+                f"/test_mpmc_stop_consumer/{worker.identifier}",
+                b"cleanup",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning(
+                "[RBD-CTL-CLEANUP] failed to signal consumer %s: %s",
+                worker.identifier,
+                exc,
+            )
+
+    deadline = time.monotonic() + PROCESS_CLEANUP_GRACE_SEC
+    for worker in alive:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or worker.process.poll() is not None:
+            continue
+        try:
+            worker.process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            pass
+
+    alive = [worker for worker in workers if worker.process.poll() is None]
+    for worker in alive:
+        logging.warning(
+            "[RBD-CTL-CLEANUP] terminating %s %s",
+            worker.role.value,
+            worker.identifier,
+        )
+        worker.process.terminate()
+
+    deadline = time.monotonic() + PROCESS_CLEANUP_GRACE_SEC
+    for worker in alive:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or worker.process.poll() is not None:
+            continue
+        try:
+            worker.process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            pass
+
+    for worker in workers:
+        if worker.process.poll() is None:
+            logging.warning(
+                "[RBD-CTL-CLEANUP] killing %s %s",
+                worker.role.value,
+                worker.identifier,
+            )
+            worker.process.kill()
+            worker.process.wait()
+
+
 def verify_production_consumption_counts(
-    subprocesses: List[tuple[str, subprocess.Popen, str]]
+    subprocesses: List[WorkerProcess],
 ) -> None:
     print("=== Verifying Production and Consumption Counts ===")
     total_produced = 0
     total_consumed = 0
     produced_messages = set()
     consumed_messages = set()
-    for process_type, _, log_file in subprocesses:
+    for worker in subprocesses:
+        log_file = worker.log_file
         try:
             with open(log_file, "r", encoding="utf-8") as handle:
                 for raw_line in handle:
@@ -346,12 +472,13 @@ def verify_production_consumption_counts(
 
 
 def verify_exit_status(
-    subprocesses: List[tuple[str, subprocess.Popen, str]]
+    subprocesses: List[WorkerProcess],
 ) -> None:
     print("=== Verifying Exit Status ===")
     normal_exits: list[str] = []
     crashes: list[str] = []
-    for process_type, _, log_file in subprocesses:
+    for worker in subprocesses:
+        log_file = worker.log_file
         try:
             with open(log_file, "r", encoding="utf-8") as handle:
                 content = handle.read()
@@ -397,49 +524,97 @@ def run_producer(env, args: argparse.Namespace) -> None:
     store_key = f"rebind_producer_{args.producer_id}"
     prev_type, prev_ip = env.backend_type, env.backend_ip
     configure_backend(env, backend_type=args.backend_type, backend_ip=args.ip)
+    producer = None
     try:
-        setup_test_environment(logging)
-        # Precondition: ensure the member key for this instance_key is absent before creating the store.
-        _wait_fluxon_member_absent(f"{store_key}_main")
-        store = require_store(env, store_key)
-        # Precondition: allow P2P/master handshake to settle before binding.
-        time.sleep(10.0)
-        producer = new_test_producer(
-            args.construct_type,
-            store,
-            None,
-            CHAN_CONFIG_TEST,
-            args.new_or_bind_key,
-            chan_type,
-        )
-        logging.info(
-            f"[RBD-INIT] Producer-{args.producer_id} started (chan_type={chan_type})"
-        )
-        print(f"[Producer-{args.producer_id}] Started", flush=True)
         try:
-            import uuid, random
+            setup_test_environment(logging)
+            # Keep the existing P2P settle precondition; readiness below is the
+            # authoritative controller barrier.
+            _wait_fluxon_member_absent(f"{store_key}_main")
+            store = require_store(env, store_key)
+            time.sleep(10.0)
+            producer = new_test_producer(
+                args.construct_type,
+                store,
+                None,
+                CHAN_CONFIG_TEST,
+                args.new_or_bind_key,
+                chan_type,
+            )
+            producer_lease_id = int(
+                producer.mpmc_channel.mpmc_global_lease.id
+            )
+            _etcd_put(
+                ready_key(
+                    args.session_id,
+                    WorkerRole.PRODUCER,
+                    args.producer_id,
+                ),
+                str(os.getpid()).encode(),
+                lease_id=producer_lease_id,
+            )
+            logging.info(
+                "[RBD-READY] Producer-%s ready session=%s",
+                args.producer_id,
+                args.session_id,
+            )
+            print(f"[Producer-{args.producer_id}] Started", flush=True)
+
+            import random
+
             index = 0
+            acknowledged_pause_generation = 0
 
             while True:
-                # Check stop first
                 stop_flag = _etcd_get("/test_mpmc_stop_producer")
                 if stop_flag:
                     logging.info(
                         f"[RBD-STOP] Producer-{args.producer_id} stop flag detected"
                     )
                     break
-                # Honor pause during per-loop draining
-                i=0
+
+                pause_poll_count = 0
                 while True:
-                    i+=1
+                    pause_poll_count += 1
                     pause_flag = _etcd_get(PRODUCER_PAUSE_KEY)
                     if not pause_flag:
                         logging.info(
                             f"[RBD-RESUME] Producer-{args.producer_id} resumed"
                         )
                         break
-                    logging.info(f"[RBD-PAUSE] Producer-{args.producer_id} paused, loop i {i}")
-                    # allow quick reaction to stop while paused
+
+                    pause_generation_text = (
+                        pause_flag.decode()
+                        if isinstance(pause_flag, (bytes, bytearray))
+                        else str(pause_flag)
+                    )
+                    if pause_generation_text.isdigit():
+                        pause_generation = int(pause_generation_text)
+                        if (
+                            pause_generation > 0
+                            and pause_generation
+                            != acknowledged_pause_generation
+                        ):
+                            _etcd_put(
+                                pause_ack_key(
+                                    args.session_id,
+                                    args.producer_id,
+                                    pause_generation,
+                                ),
+                                b"paused",
+                                lease_id=producer_lease_id,
+                            )
+                            acknowledged_pause_generation = pause_generation
+                            logging.info(
+                                "[RBD-PAUSE-ACK] Producer-%s generation=%s",
+                                args.producer_id,
+                                pause_generation,
+                            )
+                    logging.info(
+                        "[RBD-PAUSE] Producer-%s paused, poll=%s",
+                        args.producer_id,
+                        pause_poll_count,
+                    )
                     stop_flag = _etcd_get("/test_mpmc_stop_producer")
                     if stop_flag:
                         logging.info(
@@ -449,7 +624,7 @@ def run_producer(env, args: argparse.Namespace) -> None:
                     time.sleep(0.1)
                 if stop_flag:
                     break
-                # Read current loop index to embed into message key for verification per loop
+
                 try:
                     loop_val = _etcd_get(REBIND_LOOP_KEY)
                     loop_idx = int(loop_val.decode()) if loop_val else -1
@@ -475,9 +650,9 @@ def run_producer(env, args: argparse.Namespace) -> None:
                         flush=True,
                     )
                     print(f"PRODUCE_MARKER: {args.producer_id}:{msg_id}")
-                    # Track production per loop in etcd for gating
                     _etcd_put(
-                        f"/test_mpmc_rebind/produced/{loop_idx}/{args.producer_id}/{unique_id}",
+                        f"/test_mpmc_rebind/sessions/{args.session_id}/produced/"
+                        f"{loop_idx}/{args.producer_id}/{unique_id}",
                         b"",
                     )
                 else:
@@ -489,26 +664,28 @@ def run_producer(env, args: argparse.Namespace) -> None:
                     raise RuntimeError(err)
                 index += 1
                 time.sleep(random.uniform(0.1, 1))
-        except Exception as exc:  # noqa: BLE001
-            logging.info(
-                f"[RBD-ERROR] Producer-{args.producer_id} exception: {exc}"
-            )
-            print(f"[Producer-{args.producer_id}] Error: {exc}")
-            print(f"{PRODUCER_CRASH_MARKER} {args.producer_id}")
-            raise
         finally:
             logging.info(
                 f"[RBD-FINISH] Producer-{args.producer_id} finished and closing"
             )
-            print(f"[Producer-{args.producer_id}] Finished", flush=True)
-            print(f"{PRODUCER_NORMAL_EXIT_MARKER} {args.producer_id}", flush=True)
-            # Avoid running Python/Rust finalizers after success. Some Fluxon background
-            # tasks (keepalive, P2P) can still be active during interpreter teardown and
-            # may abort the process even after printing the success marker.
-            os._exit(0)
+            if producer is not None:
+                _close_endpoint(
+                    producer,
+                    label=f"Producer-{args.producer_id}",
+                )
+            release(env, store_key)
+    except Exception as exc:  # noqa: BLE001
+        logging.info(
+            f"[RBD-ERROR] Producer-{args.producer_id} exception: {exc}"
+        )
+        print(f"[Producer-{args.producer_id}] Error: {exc}")
+        print(f"{PRODUCER_CRASH_MARKER} {args.producer_id}", flush=True)
+        raise
+    else:
+        print(f"[Producer-{args.producer_id}] Finished", flush=True)
+        print(f"{PRODUCER_NORMAL_EXIT_MARKER} {args.producer_id}", flush=True)
     finally:
         configure_backend(env, backend_type=prev_type, backend_ip=prev_ip)
-    release(env, store_key)
 
 
 def run_consumer(env, args: argparse.Namespace) -> None:
@@ -516,40 +693,57 @@ def run_consumer(env, args: argparse.Namespace) -> None:
     store_key = f"rebind_consumer_{args.consumer_id}"
     prev_type, prev_ip = env.backend_type, env.backend_ip
     configure_backend(env, backend_type=args.backend_type, backend_ip=args.ip)
+    consumer = None
+    consumed_count = 0
+    draining = False
     try:
-        setup_test_environment(logging)
-        # Precondition: ensure the member key for this instance_key is absent before creating the store.
-        _wait_fluxon_member_absent(f"{store_key}_main")
-        store = require_store(env, store_key)
-        # Precondition: allow P2P/master handshake to settle before binding.
-        time.sleep(10.0)
-        consumer = new_test_consumer(
-            args.construct_type,
-            store,
-            None,
-            CHAN_CONFIG_TEST,
-            args.new_or_bind_key,
-            chan_type,
-        )
-        logging.info(
-            f"[RBD-INIT] Consumer-{args.consumer_id} started with member {consumer.mpmc_channel.mpmc_member_id} prefetch={int(getattr(args, 'prefetch', 0))}"
-        )
-        print(
-            f"[Consumer-{args.consumer_id}] Started with mpmc consumer {consumer.mpmc_channel.mpmc_member_id}",
-            flush=True,
-        )
-        _etcd_put(
-            f"/test_mpmc_consumer/{args.consumer_id}",
-            b"dummy_value",
-            lease_id=int(consumer.mpmc_channel.mpmc_global_lease.id),
-        )
-        logging.info(
-            f"[RBD-REGISTER] Consumer-{args.consumer_id} registered in etcd"
-        )
-        consumed_count = 0
         try:
+            setup_test_environment(logging)
+            # Keep the existing P2P settle precondition; readiness below is the
+            # authoritative controller barrier.
+            _wait_fluxon_member_absent(f"{store_key}_main")
+            store = require_store(env, store_key)
+            time.sleep(10.0)
+            consumer = new_test_consumer(
+                args.construct_type,
+                store,
+                None,
+                CHAN_CONFIG_TEST,
+                args.new_or_bind_key,
+                chan_type,
+            )
+            consumer_lease_id = int(
+                consumer.mpmc_channel.mpmc_global_lease.id
+            )
+            logging.info(
+                f"[RBD-INIT] Consumer-{args.consumer_id} started with member {consumer.mpmc_channel.mpmc_member_id} prefetch={int(getattr(args, 'prefetch', 0))}"
+            )
+            print(
+                f"[Consumer-{args.consumer_id}] Started with mpmc consumer {consumer.mpmc_channel.mpmc_member_id}",
+                flush=True,
+            )
+            _etcd_put(
+                f"/test_mpmc_consumer/{args.consumer_id}",
+                b"dummy_value",
+                lease_id=consumer_lease_id,
+            )
+            _etcd_put(
+                ready_key(
+                    args.session_id,
+                    WorkerRole.CONSUMER,
+                    args.consumer_id,
+                ),
+                str(os.getpid()).encode(),
+                lease_id=consumer_lease_id,
+            )
+            logging.info(
+                "[RBD-READY] Consumer-%s ready session=%s",
+                args.consumer_id,
+                args.session_id,
+            )
+
             import random
-            draining = False
+
             consecutive_no_data = 0
             no_data_required = 10  # break as soon as one timed-out get occurs during draining
             while True:
@@ -591,7 +785,8 @@ def run_consumer(env, args: argparse.Namespace) -> None:
                                     li = int(li_str)
                             if li >= 0:
                                 _etcd_put(
-                                    f"/test_mpmc_rebind/consumed/{li}/{args.consumer_id}/{unique_id_str}",
+                                    f"/test_mpmc_rebind/sessions/{args.session_id}/"
+                                    f"consumed/{li}/{args.consumer_id}/{unique_id_str}",
                                     b"",
                                 )
                             # Random delay after each successful consumption to simulate slow processing
@@ -638,13 +833,6 @@ def run_consumer(env, args: argparse.Namespace) -> None:
                             f"[RBD-DRAIN-START] Consumer-{args.consumer_id} stop flag; start draining"
                         )
                     draining = True
-        except Exception as exc:  # noqa: BLE001
-            logging.info(
-                f"[RBD-ERROR] Consumer-{args.consumer_id} exception: {exc}"
-            )
-            print(f"[Consumer-{args.consumer_id}] Error: {exc}")
-            print(f"{CONSUMER_CRASH_MARKER} {args.consumer_id}")
-            raise
         finally:
             if draining:
                 logging.info(
@@ -653,16 +841,27 @@ def run_consumer(env, args: argparse.Namespace) -> None:
             logging.info(
                 f"[RBD-FINISH] Consumer-{args.consumer_id} finished, consumed={consumed_count}"
             )
-            print(
-                f"[Consumer-{args.consumer_id}] Finished, consumed {consumed_count} messages",
-                flush=True,
-            )
-            print(f"{CONSUMER_NORMAL_EXIT_MARKER} {args.consumer_id}", flush=True)
-            # Same rationale as producer: hard-exit after printing success marker.
-            os._exit(0)
+            if consumer is not None:
+                _close_endpoint(
+                    consumer,
+                    label=f"Consumer-{args.consumer_id}",
+                )
+            release(env, store_key)
+    except Exception as exc:  # noqa: BLE001
+        logging.info(
+            f"[RBD-ERROR] Consumer-{args.consumer_id} exception: {exc}"
+        )
+        print(f"[Consumer-{args.consumer_id}] Error: {exc}")
+        print(f"{CONSUMER_CRASH_MARKER} {args.consumer_id}", flush=True)
+        raise
+    else:
+        print(
+            f"[Consumer-{args.consumer_id}] Finished, consumed {consumed_count} messages",
+            flush=True,
+        )
+        print(f"{CONSUMER_NORMAL_EXIT_MARKER} {args.consumer_id}", flush=True)
     finally:
         configure_backend(env, backend_type=prev_type, backend_ip=prev_ip)
-    release(env, store_key)
 
 
 def test_mpmc_rebind_client() -> None:
@@ -675,6 +874,9 @@ def test_mpmc_rebind_client() -> None:
         print(f"[rebind_client] starting test... prefetch={prefetch}", flush=True)
         env = create_channel_env()
         prev_type, prev_ip = env.backend_type, env.backend_ip
+        session_id = uuid.uuid4().hex
+        subprocesses: List[WorkerProcess] = []
+        workers_by_identity: dict[tuple[WorkerRole, str], WorkerProcess] = {}
         configure_backend(
             env,
             backend_type=env.default_backend_type,
@@ -698,132 +900,250 @@ def test_mpmc_rebind_client() -> None:
             print("[rebind_client] spawned logs/ with 777 perms", flush=True)
             logging.info("[RBD-CTL-LOGDIR] logs/ prepared with 777 perms")
 
-            subprocesses: List[Tuple[str, subprocess.Popen, str]] = []
-
-            def spawn(process_type: str, cmd: List[str], identifier: str) -> None:
+            def spawn(
+                role: WorkerRole,
+                cmd: List[str],
+                identifier: str,
+            ) -> WorkerProcess:
                 log_file = (
                     f"logs/mpmc_producer_{identifier}.log"
-                    if process_type == "producer"
+                    if role is WorkerRole.PRODUCER
                     else f"logs/mpmc_consumer_{identifier}.log"
                 )
                 logging.info(
-                    f"[RBD-CTL-SPAWN] type={process_type} id={identifier} log={log_file}"
+                    "[RBD-CTL-SPAWN] type=%s id=%s log=%s session=%s",
+                    role.value,
+                    identifier,
+                    log_file,
+                    session_id,
                 )
                 with open(log_file, "w", encoding="utf-8") as log_f:
                     proc = subprocess.Popen(cmd, stdout=log_f, stderr=log_f, text=True)
-                subprocesses.append((process_type, proc, log_file))
+                worker = WorkerProcess(role, identifier, proc, log_file)
+                identity = (role, identifier)
+                if identity in workers_by_identity:
+                    raise RuntimeError(f"worker spawned twice: {identity!r}")
+                subprocesses.append(worker)
+                workers_by_identity[identity] = worker
+                return worker
 
-            # Start two long-running producers and initial consumer C0
-            spawn(
-                "producer",
-                _producer_cmd(
-                    env.backend_type, env.backend_ip, "P0", PRODUCER_MESSAGE_COUNT
-                ),
-                "P0",
-            )
-            spawn(
-                "producer",
-                _producer_cmd(
-                    env.backend_type, env.backend_ip, "P1", PRODUCER_MESSAGE_COUNT
-                ),
-                "P1",
-            )
-            current_consumer = "C0"
-            spawn(
-                "consumer",
-                _consumer_cmd(env.backend_type, env.backend_ip, current_consumer, prefetch),
-                current_consumer,
-            )
-
-            # Repeatedly stop and restart a single consumer while producers keep producing
-            # initialize loop index for producers to tag messages
-            _etcd_put(REBIND_LOOP_KEY, b"0")
-            logging.info("[RBD-CTL-LOOPKEY] set loop_idx=0")
-
-            for i in range(LOOPS - 1):
-                logging.info(f"[RBD-CTL-LOOP] round={i} active_window={ACTIVE_WINDOW_SEC}s")
-                # Soft window to allow production
-                time.sleep(ACTIVE_WINDOW_SEC)
-
-                # Pause producers and stop current consumer to drain until last get_data times out
-                _etcd_put(PRODUCER_PAUSE_KEY, b"1")
-                logging.info("[RBD-CTL-PAUSE] producers paused")
-                _etcd_put(f"/test_mpmc_stop_consumer/{current_consumer}", b"dummy_value")
-                logging.info(
-                    f"[RBD-CTL-STOP-CONS] request stop consumer={current_consumer}"
-                )
-                while True:
-                    status = _etcd_get(f"/test_mpmc_consumer/{current_consumer}")
-                    if not status:
-                        break
-                    time.sleep(0.5)
-                logging.info(
-                    f"[RBD-CTL-WAIT-CONS] consumer exited id={current_consumer}"
-                )
-
-                # Switch to next loop index now that previous consumer fully drained and exited
-                _etcd_put(REBIND_LOOP_KEY, str(i + 1).encode())
-                logging.info(f"[RBD-CTL-LOOPKEY] set loop_idx={i+1}")
-
-                # Short gap, then start next consumer for next loop and resume producers
-                time.sleep(INACTIVE_GAP_SEC)
-                next_consumer = f"C{i+1}"
-                print(
-                    f"[rebind_client] starting next consumer {next_consumer}",
-                    flush=True,
-                )
-                spawn(
-                    "consumer",
-                    _consumer_cmd(
-                        env.backend_type, env.backend_ip, next_consumer, prefetch
-                    ),
-                    next_consumer,
-                )
-                current_consumer = next_consumer
-                # Resume producers for next round
+            def resume_producers(*, reason: str) -> None:
                 _etcd_call_with_retry(
                     f"delete producer pause key {PRODUCER_PAUSE_KEY}",
                     lambda client: client.delete(PRODUCER_PAUSE_KEY),
                 )
-                logging.info("[RBD-CTL-RESUME] producers resumed")
+                logging.info("[RBD-CTL-RESUME] producers resumed reason=%s", reason)
 
-            # After last loop index set, stop producers, then stop last consumer (which drains before exit)
-            _etcd_put(PRODUCER_PAUSE_KEY, b"1")
-            logging.info("[RBD-CTL-FINAL-PAUSE] producers paused before shutdown")
-            _etcd_put("/test_mpmc_stop_producer", b"dummy_value")
-            logging.info("[RBD-CTL-STOP-PROD] stop producers signaled")
-            for process_type, proc, log_file in subprocesses:
-                if process_type != "producer":
-                    continue
-                logging.info(f"[RBD-CTL-WAIT-PROD] waiting producer log={log_file}")
-                proc.wait()
-                if proc.returncode != 0:
-                    raise RuntimeError(
-                        f"producer failed with return code {proc.returncode}. Check log: {log_file}\n"
-                        "--- child log tail ---\n"
-                        f"{_read_log_tail(log_file)}\n"
-                        "--- end child log tail ---"
-                    )
-            logging.info("[RBD-CTL-PROD-DONE] producers exited")
-            # Stop the last consumer and wait for consumers to exit (drains until last get timeout)
-            _etcd_put(f"/test_mpmc_stop_consumer/{current_consumer}", b"dummy_value")
+            consumer_ids = tuple(f"C{index}" for index in range(LOOPS))
+            _etcd_put(REBIND_LOOP_KEY, b"0")
+            # Hold admission until P0, P1, and C0 have all completed endpoint setup.
+            _etcd_put(PRODUCER_PAUSE_KEY, b"0")
             logging.info(
-                f"[RBD-CTL-STOP-LAST-CONS] request stop consumer={current_consumer}"
+                "[RBD-CTL-ADMISSION] initial producer pause set session=%s",
+                session_id,
             )
 
-            for process_type, proc, log_file in subprocesses:
-                logging.info(f"[RBD-CTL-WAIT] waiting {process_type} log={log_file}")
-                proc.wait()
-                if proc.returncode != 0:
-                    raise RuntimeError(
-                        f"{process_type} failed with return code {proc.returncode}. Check log: {log_file}\n"
-                        "--- child log tail ---\n"
-                        f"{_read_log_tail(log_file)}\n"
-                        "--- end child log tail ---"
+            producer_p0 = spawn(
+                WorkerRole.PRODUCER,
+                _producer_cmd(
+                    env.backend_type,
+                    env.backend_ip,
+                    "P0",
+                    PRODUCER_MESSAGE_COUNT,
+                    session_id,
+                ),
+                "P0",
+            )
+            producer_p1 = spawn(
+                WorkerRole.PRODUCER,
+                _producer_cmd(
+                    env.backend_type,
+                    env.backend_ip,
+                    "P1",
+                    PRODUCER_MESSAGE_COUNT,
+                    session_id,
+                ),
+                "P1",
+            )
+            consumer_c0 = spawn(
+                WorkerRole.CONSUMER,
+                _consumer_cmd(
+                    env.backend_type,
+                    env.backend_ip,
+                    consumer_ids[0],
+                    session_id,
+                    prefetch,
+                ),
+                consumer_ids[0],
+            )
+            producer_workers = (producer_p0, producer_p1)
+            wait_for_barrier(
+                [
+                    BarrierTarget(
+                        ready_key(session_id, worker.role, worker.identifier),
+                        worker,
                     )
+                    for worker in (producer_p0, producer_p1, consumer_c0)
+                ],
+                label=f"initial worker readiness session={session_id}",
+                read_key=_etcd_get,
+                timeout_s=READY_TIMEOUT_SEC,
+            )
+            logging.info("[RBD-CTL-READY] initial workers ready session=%s", session_id)
+            resume_producers(reason="initial workers ready")
+
+            class _Actions:
+                def run_active_window(
+                    self,
+                    round_index: int,
+                    consumer_id: str,
+                ) -> None:
+                    logging.info(
+                        "[RBD-CTL-LOOP] round=%s consumer=%s active_window=%ss",
+                        round_index,
+                        consumer_id,
+                        ACTIVE_WINDOW_SEC,
+                    )
+                    time.sleep(ACTIVE_WINDOW_SEC)
+
+                def pause_producers(self, generation: int) -> None:
+                    _etcd_put(PRODUCER_PAUSE_KEY, str(generation).encode())
+                    logging.info(
+                        "[RBD-CTL-PAUSE] generation=%s waiting for producers",
+                        generation,
+                    )
+                    wait_for_barrier(
+                        [
+                            BarrierTarget(
+                                pause_ack_key(
+                                    session_id,
+                                    worker.identifier,
+                                    generation,
+                                ),
+                                worker,
+                            )
+                            for worker in producer_workers
+                        ],
+                        label=(
+                            f"producer pause generation={generation} "
+                            f"session={session_id}"
+                        ),
+                        read_key=_etcd_get,
+                        timeout_s=PAUSE_ACK_TIMEOUT_SEC,
+                    )
+                    logging.info(
+                        "[RBD-CTL-PAUSE-ACK] generation=%s complete",
+                        generation,
+                    )
+
+                def stop_consumer(self, consumer_id: str) -> None:
+                    _etcd_put(
+                        f"/test_mpmc_stop_consumer/{consumer_id}",
+                        b"stop",
+                    )
+                    logging.info(
+                        "[RBD-CTL-STOP-CONS] request stop consumer=%s",
+                        consumer_id,
+                    )
+
+                def wait_consumer_exit(self, consumer_id: str) -> None:
+                    worker = workers_by_identity[
+                        (WorkerRole.CONSUMER, consumer_id)
+                    ]
+                    _wait_for_worker_exit(
+                        worker,
+                        timeout_s=CONSUMER_EXIT_TIMEOUT_SEC,
+                    )
+                    logging.info(
+                        "[RBD-CTL-WAIT-CONS] consumer exited id=%s",
+                        consumer_id,
+                    )
+
+                def set_loop_index(self, loop_index: int) -> None:
+                    _etcd_put(REBIND_LOOP_KEY, str(loop_index).encode())
+                    logging.info(
+                        "[RBD-CTL-LOOPKEY] set loop_idx=%s",
+                        loop_index,
+                    )
+
+                def wait_inactive_gap(self) -> None:
+                    time.sleep(INACTIVE_GAP_SEC)
+
+                def start_consumer(self, consumer_id: str) -> None:
+                    print(
+                        f"[rebind_client] starting next consumer {consumer_id}",
+                        flush=True,
+                    )
+                    spawn(
+                        WorkerRole.CONSUMER,
+                        _consumer_cmd(
+                            env.backend_type,
+                            env.backend_ip,
+                            consumer_id,
+                            session_id,
+                            prefetch,
+                        ),
+                        consumer_id,
+                    )
+
+                def wait_consumer_ready(self, consumer_id: str) -> None:
+                    worker = workers_by_identity[
+                        (WorkerRole.CONSUMER, consumer_id)
+                    ]
+                    wait_for_barrier(
+                        [
+                            BarrierTarget(
+                                ready_key(
+                                    session_id,
+                                    worker.role,
+                                    worker.identifier,
+                                ),
+                                worker,
+                            )
+                        ],
+                        label=(
+                            f"replacement consumer {consumer_id} readiness "
+                            f"session={session_id}"
+                        ),
+                        read_key=_etcd_get,
+                        timeout_s=READY_TIMEOUT_SEC,
+                    )
+                    logging.info(
+                        "[RBD-CTL-READY] replacement consumer ready id=%s",
+                        consumer_id,
+                    )
+
+                def resume_producers(
+                    self,
+                    round_index: int,
+                    consumer_id: str,
+                ) -> None:
+                    resume_producers(
+                        reason=(
+                            f"round={round_index} consumer={consumer_id} ready"
+                        )
+                    )
+
+            actions: RebindRoundActions = _Actions()
+            coordinate_rebind_rounds(consumer_ids, actions)
+
+            # Every consumer has drained and exited; producers remain paused at
+            # the final acknowledged generation.
+            _etcd_put("/test_mpmc_stop_producer", b"dummy_value")
+            logging.info("[RBD-CTL-STOP-PROD] stop producers signaled")
+            for worker in producer_workers:
+                logging.info(
+                    "[RBD-CTL-WAIT-PROD] waiting producer id=%s log=%s",
+                    worker.identifier,
+                    worker.log_file,
+                )
+                _wait_for_worker_exit(
+                    worker,
+                    timeout_s=PRODUCER_EXIT_TIMEOUT_SEC,
+                )
+            logging.info("[RBD-CTL-PROD-DONE] producers exited")
             logging.info("[RBD-CTL-ALL-DONE] all subprocesses exited")
 
-            # Verify counts and exits
             logging.info("[RBD-CTL-VERIFY] verify production/consumption counts")
             verify_production_consumption_counts(subprocesses)
             logging.info("[RBD-CTL-VERIFY] verify exit status markers")
@@ -832,6 +1152,23 @@ def test_mpmc_rebind_client() -> None:
             print("=== MPMC Rebind Client Test PASSED ===", flush=True)
         finally:
             logging.info("[RBD-CTL-FINISH] cleanup and restore backend")
+            _cleanup_owned_workers(subprocesses)
+            for prefix in (
+                "/test_mpmc_stop_consumer",
+                "/test_mpmc_consumer",
+                "/test_mpmc_stop_producer",
+                PRODUCER_PAUSE_KEY,
+                REBIND_LOOP_KEY,
+                f"/test_mpmc_rebind/sessions/{session_id}",
+            ):
+                try:
+                    _etcd_delete_prefix(prefix)
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning(
+                        "[RBD-CTL-CLEANUP] failed to delete prefix %s: %s",
+                        prefix,
+                        exc,
+                    )
             configure_backend(env, backend_type=prev_type, backend_ip=prev_ip)
             release(env)
 

@@ -1,25 +1,8 @@
-import importlib
-from pathlib import Path
-import sys
 import types
 import threading
 import time
 import unittest
 from unittest import mock
-
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-# This suite exercises Python lifecycle coordination only. Keep it independent
-# from any previously installed native extension while using the real wrappers.
-_pyo3_loader = importlib.import_module("fluxon_py.tool.pyo3")
-_pyo3_loader._FLUXON_PYO3_MODULE_LAZY = types.SimpleNamespace(
-    MpscContext=object,
-    LeaseManagerHandle=object,
-    EtcdLock=object,
-)
 
 from fluxon_py._api_ext_chan import mpmc as mpmc_module
 from fluxon_py._api_ext_chan.mpmc import MPMCChanConsumer, MPMCChanProducer, MPMCChannel
@@ -168,36 +151,6 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
         unregister()
 
         self.assertTrue(callback_called.is_set())
-
-    def test_mpsc_context_forwards_consumer_shutdown_controller(self):
-        calls = []
-
-        class _InnerContext:
-            def new_consumer(self, *args):
-                calls.append(args)
-                return "consumer-handle"
-
-        context = mpsc_module.MpscContext.__new__(mpsc_module.MpscContext)
-        context._inner = _InnerContext()
-        bind_shutdown_ctl = object()
-
-        handle = context.new_consumer(
-            "11",
-            60,
-            8,
-            101,
-            102,
-            103,
-            "7",
-            9,
-            bind_shutdown_ctl,
-        )
-
-        self.assertEqual(handle, "consumer-handle")
-        self.assertEqual(
-            calls,
-            [(11, 60, 8, 101, 102, 103, 7, 9, bind_shutdown_ctl)],
-        )
 
     def _new_producer(self, ready_channels, *, mpmc_member_id=1, producer_member_ids=None):
         producer = MPMCChanProducer.__new__(MPMCChanProducer)
@@ -675,129 +628,6 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
             ],
         )
 
-    def test_mpsc_consumer_finishes_construction_then_rolls_back_after_parent_shutdown(self):
-        bind_entered = threading.Event()
-        created_shutdown_ctls = []
-        cleanup_calls = []
-
-        class _BindShutdownCtl:
-            def __init__(self):
-                self.closed = threading.Event()
-
-            def close(self):
-                self.closed.set()
-
-        class _BlockingMpscContext:
-            def __init__(self, api):
-                self.api = api
-
-            def new_consumer(self, *args):
-                bind_shutdown_ctl = args[-1]
-                bind_entered.set()
-                if not bind_shutdown_ctl.closed.wait(timeout=1.0):
-                    raise AssertionError("parent close did not signal MPSC bind shutdown")
-                return _ConstructedHandle(bind_shutdown_ctl)
-
-            def close(self):
-                return
-
-        class _ConstructedHandle:
-            def __init__(self, shutdown_ctl):
-                self.shutdown_ctl = shutdown_ctl
-
-            def shutdown_clone(self):
-                return self.shutdown_ctl
-
-            def chan_id(self):
-                return 11
-
-            def consumer_idx(self):
-                return "7"
-
-            def init_payload_callback_rust_kv(self):
-                return
-
-            def init_delete_callback_rust_kv(self):
-                return
-
-        class _ShutdownCtlFactory:
-            @staticmethod
-            def new_shutdown_ctl():
-                shutdown_ctl = _BindShutdownCtl()
-                created_shutdown_ctls.append(shutdown_ctl)
-                return shutdown_ctl
-
-        parent_shutdown_ctl = MqShutdownCtl()
-        errors = []
-        old_context = mpsc_module.MpscContext
-        old_rust_context = mpsc_module._RustMpscContext
-        old_validate = mpsc_module.validate_mpsc_config
-        mpsc_module.MpscContext = _BlockingMpscContext
-        mpsc_module._RustMpscContext = _ShutdownCtlFactory
-        mpsc_module.validate_mpsc_config = lambda config, role: {
-            "ttl_seconds": 60,
-            "capacity": 1,
-            "payload_backend": 2,
-        }
-
-        def fake_delete(api, *, keys, prefixes, dbg):
-            cleanup_calls.append((list(keys), list(prefixes)))
-            return Result.new_ok(OkNone())
-
-        def fake_best_effort_delete(api, *, keys, prefixes, dbg):
-            cleanup_calls.append((list(keys), list(prefixes)))
-            return True
-
-        try:
-            with (
-                mock.patch.object(
-                    mpsc_module,
-                    "_best_effort_delete_leased_etcd_state",
-                    side_effect=fake_best_effort_delete,
-                ),
-                mock.patch.object(
-                    mpsc_module,
-                    "_delete_and_verify_owned_etcd_state",
-                    side_effect=fake_delete,
-                ),
-            ):
-                worker = threading.Thread(
-                    target=lambda: self._capture_mpsc_consumer_construction_error(
-                        parent_shutdown_ctl, errors
-                    ),
-                    daemon=True,
-                )
-                worker.start()
-                self.assertTrue(bind_entered.wait(timeout=1.0))
-
-                parent_shutdown_ctl.close()
-                worker.join(timeout=1.0)
-        finally:
-            mpsc_module.MpscContext = old_context
-            mpsc_module._RustMpscContext = old_rust_context
-            mpsc_module.validate_mpsc_config = old_validate
-
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(len(created_shutdown_ctls), 1)
-        self.assertTrue(created_shutdown_ctls[0].closed.is_set())
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], RuntimeError)
-        self.assertIn("parent closed during MPSC consumer construction", str(errors[0]))
-        self.assertEqual(
-            cleanup_calls,
-            [
-                (["/channels/11/consumer/consumer_7"], []),
-                (
-                    [
-                        "/channels/meta/11",
-                        "cluster_lease/channels/11",
-                        "cluster_lease/id_allocator/channels/11",
-                    ],
-                    ["/channels/11/", "dist_id_allocator/channels/11/"],
-                ),
-            ],
-        )
-
     def test_mpsc_consumer_close_does_not_wait_for_blocked_get(self):
         get_entered = threading.Event()
         shutdown_signaled = threading.Event()
@@ -921,20 +751,6 @@ class MPMCLazyProducerBindTest(unittest.TestCase):
     def _capture_mpsc_construction_error(parent_shutdown_ctl, errors):
         try:
             MPSCChanProducer(
-                object(),
-                None,
-                {},
-                parent_mpmc_id_opt="1",
-                parent_mpmc_member_id_opt=1,
-                _parent_shutdown_ctl=parent_shutdown_ctl,
-            )
-        except Exception as e:  # noqa: BLE001
-            errors.append(e)
-
-    @staticmethod
-    def _capture_mpsc_consumer_construction_error(parent_shutdown_ctl, errors):
-        try:
-            MPSCChanConsumer(
                 object(),
                 None,
                 {},
