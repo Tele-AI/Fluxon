@@ -1,11 +1,11 @@
 use etcd_client as etcd;
 use fluxon_mq::lease_manager::{LeaseBackendUid, LeaseRegisterKind};
 use fluxon_util::etcd::ManagedEtcdClient;
-use fluxon_util::lease_manager::GLOBAL_LM;
 use fluxon_util::lease_manager::snapshot_active_lease_debug as lm_snapshot_active_lease_debug;
+use fluxon_util::lease_manager::GLOBAL_LM;
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
-use pyo3::PyErr;
 use pyo3::prelude::*;
+use pyo3::PyErr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::runtime::Runtime;
@@ -72,7 +72,7 @@ impl LeaseManagerHandle {
         let outer = py
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
-                    let uid = LeaseBackendUid::etcd(endpoints.clone());
+                    let uid = LeaseBackendUid::etcd_from(endpoints.clone());
                     let backend = ManagedEtcdClient::acquire(endpoints);
                     let mut client = backend.client().await.map_err(|e| {
                         anyhow::anyhow!("failed to connect etcd when allocating lease: {:?}", e)
@@ -134,7 +134,7 @@ impl LeaseManagerHandle {
         let outer = py
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
-                    let uid = LeaseBackendUid::etcd(endpoints);
+                    let uid = LeaseBackendUid::etcd_from(endpoints);
                     let rt = rth;
                     GLOBAL_LM
                         .register_lease_for_keepalive(
@@ -184,7 +184,7 @@ impl LeaseManagerHandle {
         let outer = py
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
-                    let uid = LeaseBackendUid::etcd(endpoints);
+                    let uid = LeaseBackendUid::etcd_from(endpoints);
                     let rt = rth;
                     GLOBAL_LM
                         .register_lease_for_keepalive(

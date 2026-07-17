@@ -12,7 +12,7 @@ use fluxon_mq::consumer::{
 use fluxon_mq::{
     ChanManager, MpscConsumer as CoreMpscConsumer, MpscError as CoreMpscError,
     MpscProducer as CoreMpscProducer, ShutdownCtl,
-    create::{ChanCreateConfig, MpscCreateRollback, create_mpsc_channel},
+    create::{ChanCreateConfig, create_mpsc_channel},
 };
 use pyo3::Py;
 use pyo3::PyErr;
@@ -25,7 +25,6 @@ use tokio::runtime::Runtime;
 use crate::flatdict_zerocopy::{FlatDictDataOwner, decode_flat_dict_to_wrapped_py_object};
 use fluxon_kv::{Framework as KvFramework, KvClientTrait};
 use fluxon_mq::lease_manager::LeaseBackendUid;
-use fluxon_util::etcd::ManagedEtcdClient;
 use fluxon_util::lease_manager::GLOBAL_LM;
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use tracing::{debug, warn};
@@ -177,7 +176,7 @@ fn finalize_payload_result(
 /// Owns the native Fluxon KV lease backend used by all child endpoints.
 #[pyclass]
 pub struct MpscContext {
-    etcd_backend: ManagedEtcdClient,
+    endpoints: Vec<String>,
     kv_backend_uid: LeaseBackendUid,
     kv_framework: Arc<KvFramework>,
     kv_runtime: Handle,
@@ -206,9 +205,8 @@ impl MpscContext {
     ) -> PyResult<Self> {
         let kv_client_ref = kv_client.borrow(py);
         let mq_context = crate::new_fluxon_mq_context(&kv_client_ref)?;
-        let endpoints = crate::etcd::endpoint_set_from_raw(etcd_endpoints, "MpscContext")?;
         Ok(Self {
-            etcd_backend: ManagedEtcdClient::acquire(endpoints),
+            endpoints: etcd_endpoints,
             kv_backend_uid: mq_context.kv_lease_backend,
             kv_framework: mq_context.kv_framework.clone(),
             kv_runtime: mq_context.runtime.clone(),
@@ -256,8 +254,7 @@ impl MpscContext {
             }
         };
 
-        let etcd_backend = self.etcd_backend.clone();
-        let endpoints = etcd_backend.endpoints().as_slice().to_vec();
+        let endpoints = self.endpoints.clone();
         let kv_backend_uid = self.kv_backend_uid.clone();
         let self_info = self
             .kv_framework
@@ -288,12 +285,6 @@ impl MpscContext {
         let outer = py.allow_threads(|| runtime
             .run_async_from_sync(async move {
                 let lease_manager = GLOBAL_LM.clone();
-
-                let category = match (parent_mpmc_id_opt, parent_mpmc_member_id_opt) {
-                    (Some(pid), Some(_mid)) => fluxon_mq::keys::MqCategory::MpmcSub { parent_mpmc_id: pid },
-                    (None, None) => fluxon_mq::keys::MqCategory::Mpsc,
-                    _ => return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None")),
-                };
 
                 // Construct channel manager either by creating a new
                 // channel or by binding to an existing one.
@@ -333,7 +324,7 @@ impl MpscContext {
                             } else {
                                 ChanManager::new_with_chan_id(
                                     lease_manager.clone(),
-                                    etcd_backend.clone(),
+                                    endpoints.clone(),
                                     kv_backend_uid.clone(),
                                     id,
                                     rth.clone(),
@@ -358,7 +349,7 @@ impl MpscContext {
                             };
                             create_mpsc_channel(
                                 &GLOBAL_LM,
-                                etcd_backend.clone(),
+                                endpoints.clone(),
                                 kv_backend_uid.clone(),
                                 cfg,
                                 rth.clone(),
@@ -370,13 +361,6 @@ impl MpscContext {
                 }
                 .await;
                 let chan_mgr = chan_mgr?;
-                let rollback = chan_id.is_none().then(|| {
-                    MpscCreateRollback::from_created_manager(
-                        &chan_mgr,
-                        override_global_lease_id,
-                        override_member_lease_id,
-                    )
-                });
 
                 if shutdown_for_core.is_closed() {
                     return Err(anyhow::anyhow!(
@@ -390,7 +374,7 @@ impl MpscContext {
                     _ => return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None")),
                 };
 
-                let bind_result = CoreMpscProducer::bind_mpsc(
+                CoreMpscProducer::bind_mpsc(
                     chan_mgr,
                     ttl_seconds,
                     weight,
@@ -403,22 +387,7 @@ impl MpscContext {
                     observe_node_role,
                     observe,
                 )
-                .await;
-                match bind_result {
-                    Ok(producer) => Ok(producer),
-                    Err(bind_error) => {
-                        if let Some(rollback) = rollback {
-                            if let Err(rollback_error) = rollback.rollback(&etcd_backend).await {
-                                return Err(anyhow::anyhow!(
-                                    "{}; rollback failed for newly created MPSC producer: {:#}",
-                                    bind_error,
-                                    rollback_error
-                                ));
-                            }
-                        }
-                        Err(bind_error)
-                    }
-                }
+                .await
             }))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "runtime bridge failed in new_producer: {}",
@@ -473,8 +442,7 @@ impl MpscContext {
             }
         };
 
-        let etcd_backend = self.etcd_backend.clone();
-        let endpoints = etcd_backend.endpoints().as_slice().to_vec();
+        let endpoints = self.endpoints.clone();
         let kv_backend_uid = self.kv_backend_uid.clone();
         let shutdown = ShutdownCtl::new();
         let shutdown_for_core = shutdown.clone();
@@ -503,12 +471,6 @@ impl MpscContext {
         let outer = py.allow_threads(|| runtime
             .run_async_from_sync(async move {
                 let lease_manager = GLOBAL_LM.clone();
-
-                let category = match (parent_mpmc_id_opt, parent_mpmc_member_id_opt) {
-                    (Some(pid), Some(_mid)) => fluxon_mq::keys::MqCategory::MpmcSub { parent_mpmc_id: pid },
-                    (None, None) => fluxon_mq::keys::MqCategory::Mpsc,
-                    _ => return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None")),
-                };
 
                 let chan_mgr: anyhow::Result<ChanManager> = async {
                     match chan_id {
@@ -540,7 +502,7 @@ impl MpscContext {
                             } else {
                                 ChanManager::new_with_chan_id(
                                     lease_manager.clone(),
-                                    etcd_backend.clone(),
+                                    endpoints.clone(),
                                     kv_backend_uid.clone(),
                                     id,
                                     rth.clone(),
@@ -567,7 +529,7 @@ impl MpscContext {
                             };
                             create_mpsc_channel(
                                 &GLOBAL_LM,
-                                etcd_backend.clone(),
+                                endpoints.clone(),
                                 kv_backend_uid.clone(),
                                 cfg,
                                 rth.clone(),
@@ -579,15 +541,14 @@ impl MpscContext {
                 }
                 .await;
                 let chan_mgr = chan_mgr?;
-                let rollback = chan_id.is_none().then(|| {
-                    MpscCreateRollback::from_created_manager(
-                        &chan_mgr,
-                        override_global_lease_id,
-                        override_member_lease_id,
-                    )
-                });
 
-                let bind_result = CoreMpscConsumer::bind_mpsc(
+                let category = match (parent_mpmc_id_opt, parent_mpmc_member_id_opt) {
+                    (Some(pid), Some(_mid)) => fluxon_mq::keys::MqCategory::MpmcSub { parent_mpmc_id: pid },
+                    (None, None) => fluxon_mq::keys::MqCategory::Mpsc,
+                    _ => return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None")),
+                };
+
+                CoreMpscConsumer::bind_mpsc(
                     chan_mgr,
                     ttl_seconds,
                     lifecycle,
@@ -599,22 +560,7 @@ impl MpscContext {
                     observe_node_role,
                     observe,
                 )
-                .await;
-                match bind_result {
-                    Ok(consumer) => Ok(consumer),
-                    Err(bind_error) => {
-                        if let Some(rollback) = rollback {
-                            if let Err(rollback_error) = rollback.rollback(&etcd_backend).await {
-                                return Err(anyhow::anyhow!(
-                                    "{}; rollback failed for newly created MPSC consumer: {:#}",
-                                    bind_error,
-                                    rollback_error
-                                ));
-                            }
-                        }
-                        Err(bind_error)
-                    }
-                }
+                .await
             }))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "runtime bridge failed in new_consumer: {}",

@@ -1,9 +1,8 @@
 use anyhow::Context;
 use etcd_client as etcd;
-use std::collections::BTreeSet;
 use std::time::Duration;
 
-use fluxon_util::etcd::{get_cluster_lease_id, DistributeIdAllocator, ManagedEtcdClient};
+use fluxon_util::etcd::{get_cluster_lease_id, DistributeIdAllocator};
 use fluxon_util::lease_manager::{
     record_register_by as lm_record_register_by, registered_etcd_client, LeaseBackendUid,
     LeaseManager, LeaseRegisterKind,
@@ -13,7 +12,6 @@ use crate::error::MpscError;
 use crate::keys;
 use crate::manager::{get_chan_meta_with_version, ChanGlobalMeta, ChanManager};
 
-const ROLLBACK_FENCE_TXN_MAX_ATTEMPTS: usize = 5;
 const MPMC_SUBCHANNEL_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct ChanCreateConfig {
@@ -39,211 +37,6 @@ pub struct ChanCreateConfig {
     pub override_payload_lease_id: Option<i64>,
 }
 
-/// Cleanup plan for a channel id allocated by `create_mpsc_channel` but not
-/// successfully exposed to its caller.
-///
-/// Only channel-owned etcd leases are recorded here. Caller-owned override
-/// leases are protected and are never revoked by rollback.
-#[derive(Debug, Clone)]
-pub struct MpscCreateRollback {
-    chan_id: i64,
-    protected_etcd_lease_ids: BTreeSet<i64>,
-    channel_owned_cluster_lease_keys: BTreeSet<String>,
-    channel_owned_etcd_lease_ids: BTreeSet<i64>,
-}
-
-impl MpscCreateRollback {
-    fn new(chan_id: i64, protected_etcd_lease_ids: impl IntoIterator<Item = i64>) -> Self {
-        Self {
-            chan_id,
-            protected_etcd_lease_ids: protected_etcd_lease_ids.into_iter().collect(),
-            channel_owned_cluster_lease_keys: BTreeSet::new(),
-            channel_owned_etcd_lease_ids: BTreeSet::new(),
-        }
-    }
-
-    fn record_channel_owned_cluster_lease_key(&mut self, key: String) {
-        self.channel_owned_cluster_lease_keys.insert(key);
-    }
-
-    fn record_channel_owned_etcd_lease(&mut self, lease_id: i64) {
-        if lease_id > 0 && !self.protected_etcd_lease_ids.contains(&lease_id) {
-            self.channel_owned_etcd_lease_ids.insert(lease_id);
-        }
-    }
-
-    fn fence_cleanup_keys(&self) -> [String; 3] {
-        [
-            keys::etcd_aborted_key(self.chan_id),
-            keys::etcd_meta_key(self.chan_id),
-            format!("/channels/{}/", self.chan_id),
-        ]
-    }
-
-    fn exact_cleanup_keys(&self) -> [String; 3] {
-        [
-            format!("dist_id_allocator/channels/{}", self.chan_id),
-            format!("cluster_lease/channels/{}", self.chan_id),
-            format!("cluster_lease/id_allocator/channels/{}", self.chan_id),
-        ]
-    }
-
-    fn cleanup_prefixes(&self) -> [String; 1] {
-        [format!("dist_id_allocator/channels/{}/", self.chan_id)]
-    }
-
-    /// Capture the rollback information before a newly-created manager is
-    /// consumed by producer/consumer binding.
-    pub fn from_created_manager(
-        chan_mgr: &ChanManager,
-        override_global_lease_id: Option<i64>,
-        override_member_lease_id: Option<i64>,
-    ) -> Self {
-        let mut rollback = Self::new(
-            chan_mgr.chan_id,
-            [override_global_lease_id, override_member_lease_id]
-                .into_iter()
-                .flatten(),
-        );
-        if override_global_lease_id.is_none() {
-            rollback.record_channel_owned_cluster_lease_key(format!(
-                "cluster_lease/channels/{}",
-                chan_mgr.chan_id
-            ));
-            rollback.record_channel_owned_etcd_lease(chan_mgr.global_lease.id() as i64);
-        }
-        rollback.record_channel_owned_cluster_lease_key(format!(
-            "cluster_lease/id_allocator/channels/{}",
-            chan_mgr.chan_id
-        ));
-        rollback.record_channel_owned_etcd_lease(chan_mgr.global_long_lease.id() as i64);
-        if override_member_lease_id.is_none() {
-            rollback.record_channel_owned_etcd_lease(chan_mgr.member_lease.id() as i64);
-        }
-        rollback
-    }
-
-    /// Delete all distributed metadata for the unpublished channel and revoke
-    /// only the etcd leases created exclusively for it.
-    pub async fn rollback(self, etcd_backend: &ManagedEtcdClient) -> anyhow::Result<()> {
-        let mut client = etcd_backend
-            .client()
-            .await
-            .context("connect etcd for new MPSC rollback")?;
-        self.rollback_with_client(&mut client).await
-    }
-
-    async fn rollback_with_client(&self, client: &mut etcd::Client) -> anyhow::Result<()> {
-        self.install_abort_fence_and_delete_channel_state(client)
-            .await?;
-
-        let mut errors = Vec::new();
-        let chan_id = self.chan_id;
-        let mut channel_owned_etcd_lease_ids = self.channel_owned_etcd_lease_ids.clone();
-
-        // A failed cluster-lease helper RPC can be ambiguous: the key may have
-        // been committed even though the lease id was not returned. Recover the
-        // id from the authoritative key before deleting it.
-        for key in &self.channel_owned_cluster_lease_keys {
-            match client.get(key.clone(), None).await {
-                Ok(response) => {
-                    if let Some(kv) = response.kvs().first() {
-                        match std::str::from_utf8(kv.value())
-                            .ok()
-                            .and_then(|value| value.parse::<i64>().ok())
-                        {
-                            Some(lease_id)
-                                if lease_id > 0
-                                    && !self.protected_etcd_lease_ids.contains(&lease_id) =>
-                            {
-                                channel_owned_etcd_lease_ids.insert(lease_id);
-                            }
-                            Some(_) => {}
-                            None => errors.push(format!(
-                                "decode channel-owned cluster lease id from key {key}"
-                            )),
-                        }
-                    }
-                }
-                Err(error) => errors.push(format!("read cluster lease key {key}: {error}")),
-            }
-        }
-
-        for key in self.exact_cleanup_keys() {
-            if let Err(error) = client.delete(key.clone(), None).await {
-                errors.push(format!("delete key {key}: {error}"));
-            }
-        }
-
-        for prefix in self.cleanup_prefixes() {
-            let options = etcd::DeleteOptions::new().with_prefix();
-            if let Err(error) = client.delete(prefix.clone(), Some(options)).await {
-                errors.push(format!("delete prefix {prefix}: {error}"));
-            }
-        }
-
-        for lease_id in &channel_owned_etcd_lease_ids {
-            if let Err(error) = client.lease_revoke(*lease_id).await {
-                let message = error.to_string().to_ascii_lowercase();
-                if !message.contains("lease not found")
-                    && !message.contains("requested lease not found")
-                {
-                    errors.push(format!("revoke lease {lease_id}: {error}"));
-                }
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "rollback for newly allocated MPSC chan_id={} had errors: {}",
-                chan_id,
-                errors.join("; ")
-            )
-        }
-    }
-
-    async fn install_abort_fence_and_delete_channel_state(
-        &self,
-        client: &mut etcd::Client,
-    ) -> anyhow::Result<()> {
-        let [aborted_key, meta_key, channel_prefix] = self.fence_cleanup_keys();
-        let mut last_error = None;
-
-        for attempt in 1..=ROLLBACK_FENCE_TXN_MAX_ATTEMPTS {
-            // This transaction is deliberately unconditional and idempotent. A
-            // lost response can be retried without opening a window in which a
-            // delayed create or bind write resurrects shared-lease metadata.
-            let txn = etcd::Txn::new().and_then(vec![
-                etcd::TxnOp::put(aborted_key.clone(), "1", None),
-                etcd::TxnOp::delete(meta_key.clone(), None),
-                etcd::TxnOp::delete(
-                    channel_prefix.clone(),
-                    Some(etcd::DeleteOptions::new().with_prefix()),
-                ),
-            ]);
-
-            match client.txn(txn).await {
-                Ok(_) => return Ok(()),
-                Err(error) => {
-                    last_error = Some(error.to_string());
-                    if attempt < ROLLBACK_FENCE_TXN_MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
-                    }
-                }
-            }
-        }
-
-        anyhow::bail!(
-            "failed to install permanent abort fence for newly allocated MPSC chan_id={} after {} attempts: {}",
-            self.chan_id,
-            ROLLBACK_FENCE_TXN_MAX_ATTEMPTS,
-            last_error.unwrap_or_else(|| "unknown etcd transaction error".to_string())
-        )
-    }
-}
-
 /// Create a new MPSC channel id and write its metadata into etcd.
 ///
 /// Semantics mirror the Python ChanManager.create_chan design:
@@ -264,15 +57,18 @@ impl MpscCreateRollback {
 /// `payload_lease_id` recorded in channel meta.
 pub async fn create_mpsc_channel(
     lease_manager: &LeaseManager,
-    etcd_backend: ManagedEtcdClient,
+    etcd_endpoints: Vec<String>,
     kv_backend_uid: LeaseBackendUid,
     cfg: ChanCreateConfig,
     rt_handle: tokio::runtime::Handle,
 ) -> Result<ChanManager, MpscError> {
-    let mut client = etcd_backend
-        .client()
+    // Build etcd client directly from provided endpoints; LeaseManager 仅负责
+    // lease keepalive，不再对外暴露具体 client 实现。
+    let mut client = etcd::Client::connect(etcd_endpoints.clone(), None)
         .await
         .map_err(|e| MpscError::Internal(format!("connect etcd failed: {}", e)))?;
+
+    let etcd_backend_uid = LeaseBackendUid::etcd_from(etcd_endpoints.clone());
 
     // 1) Allocate a new channel id using the global distributed
     // allocator under prefix "channels".
@@ -288,56 +84,6 @@ pub async fn create_mpsc_channel(
 
     tracing::debug!("allocated new mpsc chan_id={} ", chan_id);
 
-    let mut rollback = MpscCreateRollback::new(
-        chan_id,
-        [cfg.override_global_lease_id, cfg.override_member_lease_id]
-            .into_iter()
-            .flatten(),
-    );
-    if cfg.override_global_lease_id.is_none() {
-        rollback
-            .record_channel_owned_cluster_lease_key(format!("cluster_lease/channels/{}", chan_id));
-    }
-    rollback.record_channel_owned_cluster_lease_key(format!(
-        "cluster_lease/id_allocator/channels/{}",
-        chan_id
-    ));
-    let create_result = create_mpsc_channel_after_id(
-        lease_manager,
-        etcd_backend,
-        kv_backend_uid,
-        cfg,
-        rt_handle,
-        client.clone(),
-        chan_id,
-        &mut rollback,
-    )
-    .await;
-
-    match create_result {
-        Ok(chan_mgr) => Ok(chan_mgr),
-        Err(create_error) => match rollback.rollback_with_client(&mut client).await {
-            Ok(()) => Err(create_error),
-            Err(rollback_error) => Err(MpscError::Internal(format!(
-                "{}; rollback failed after allocating chan_id={}: {:#}",
-                create_error, chan_id, rollback_error
-            ))),
-        },
-    }
-}
-
-async fn create_mpsc_channel_after_id(
-    lease_manager: &LeaseManager,
-    etcd_backend: ManagedEtcdClient,
-    kv_backend_uid: LeaseBackendUid,
-    cfg: ChanCreateConfig,
-    rt_handle: tokio::runtime::Handle,
-    mut client: etcd::Client,
-    chan_id: i64,
-    rollback: &mut MpscCreateRollback,
-) -> Result<ChanManager, MpscError> {
-    let etcd_backend_uid = LeaseBackendUid::etcd(etcd_backend.endpoints().clone());
-
     // 2) Acquire or reuse global lease for this channel's metadata;
     // this lease will be used to keep `/channels/meta/{chan_id}` and
     // `/channels/{chan_id}/next_producer_id` alive.
@@ -351,9 +97,6 @@ async fn create_mpsc_channel_after_id(
         .await
         .map_err(|e| MpscError::Internal(format!("get_cluster_lease_id(meta) failed: {}", e)))?,
     };
-    if cfg.override_global_lease_id.is_none() {
-        rollback.record_channel_owned_etcd_lease(global_lease_id);
-    }
 
     // 3) Acquire per-channel long-lived global lease id for id
     // allocator; this follows the design in `mpsc.md` where every
@@ -368,7 +111,6 @@ async fn create_mpsc_channel_after_id(
     .map_err(|e| {
         MpscError::Internal(format!("get_cluster_lease_id(id_allocator) failed: {}", e))
     })?;
-    rollback.record_channel_owned_etcd_lease(global_long_lease_id);
 
     // 3.1) If the caller overrides the per-channel member lease, validate that
     // lease before publishing any new channel metadata. Otherwise a dead
@@ -528,17 +270,15 @@ async fn create_mpsc_channel_after_id(
 
     let meta_key = keys::etcd_meta_key(chan_id);
 
-    let aborted_key = keys::etcd_aborted_key(chan_id);
-    let compares = vec![
-        etcd::Compare::create_revision(aborted_key, etcd::CompareOp::Equal, 0),
-        etcd::Compare::create_revision(meta_key.clone(), etcd::CompareOp::Equal, 0),
-    ];
+    let compare = etcd::Compare::create_revision(meta_key.clone(), etcd::CompareOp::Equal, 0);
     let put_meta = etcd::TxnOp::put(
         meta_key.clone(),
         meta_bytes,
         Some(etcd::PutOptions::new().with_lease(global_lease_id)),
     );
-    let txn = etcd::Txn::new().when(compares).and_then(vec![put_meta]);
+    let txn = etcd::Txn::new()
+        .when(vec![compare])
+        .and_then(vec![put_meta]);
     let txn_res = client
         .txn(txn)
         .await
@@ -547,7 +287,7 @@ async fn create_mpsc_channel_after_id(
 
     if !txn_res.succeeded() {
         return Err(MpscError::Internal(format!(
-            "meta create rejected because the key exists or channel creation was aborted, chan_id={}",
+            "meta key already exists for chan_id={}",
             chan_id
         )));
     }
@@ -563,7 +303,6 @@ async fn create_mpsc_channel_after_id(
         global_lease: global_lease_handle,
         global_long_lease: global_long_lease_handle,
         payload_lease: payload_lease_handle,
-        _etcd_backend: etcd_backend,
         etcd_client,
     })
 }
@@ -585,17 +324,13 @@ impl ChanManager {
         override_payload_lease_id: i64,
         rt_handle: tokio::runtime::Handle,
     ) -> anyhow::Result<Self> {
-        let etcd_endpoint_set = fluxon_util::etcd::EtcdEndpointSet::new(etcd_endpoints.clone())?;
-        let etcd_backend_uid = LeaseBackendUid::etcd(etcd_endpoint_set.clone());
-        let client = registered_etcd_client(&etcd_backend_uid)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "MPMC subchannel requires its parent to register the etcd backend first: {}",
-                    e
-                )
-            })?;
-        let etcd_backend = ManagedEtcdClient::acquire(etcd_endpoint_set);
+        let etcd_backend_uid = LeaseBackendUid::etcd_from(etcd_endpoints.clone());
+        let client = registered_etcd_client(&etcd_backend_uid).map_err(|e| {
+            anyhow::anyhow!(
+                "MPMC subchannel requires its parent to register the etcd backend first: {}",
+                e
+            )
+        })?;
         let mut meta_client = client.clone();
         let meta_with_ver = tokio::time::timeout(
             MPMC_SUBCHANNEL_METADATA_TIMEOUT,
@@ -734,7 +469,6 @@ impl ChanManager {
             global_lease,
             global_long_lease,
             payload_lease,
-            _etcd_backend: etcd_backend,
             etcd_client: client,
         })
     }
@@ -745,7 +479,7 @@ impl ChanManager {
     /// id-allocator).
     pub async fn new_with_chan_id(
         lease_manager: LeaseManager,
-        etcd_backend: ManagedEtcdClient,
+        etcd_endpoints: Vec<String>,
         kv_backend_uid: LeaseBackendUid,
         chan_id: i64,
         rt_handle: tokio::runtime::Handle,
@@ -760,9 +494,8 @@ impl ChanManager {
         // 1) 加载全局元数据，获取 TTL 以及（如有）记录下来的
         // global_lease_id / global_long_lease_id，同时记录下等
         // 待后续事务校验使用的 etcd 版本号。
-        let etcd_backend_uid = LeaseBackendUid::etcd(etcd_backend.endpoints().clone());
-        let client = etcd_backend
-            .client()
+        let etcd_backend_uid = LeaseBackendUid::etcd_from(etcd_endpoints.clone());
+        let client = etcd::Client::connect(etcd_endpoints, None)
             .await
             .map_err(|e| anyhow::anyhow!("connect etcd failed: {}", e))?;
         let mut meta_client = client.clone();
@@ -952,59 +685,7 @@ impl ChanManager {
             global_lease,
             global_long_lease,
             payload_lease,
-            _etcd_backend: etcd_backend,
             etcd_client: client,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::MpscCreateRollback;
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn rollback_plan_is_scoped_to_the_allocated_channel() {
-        let rollback = MpscCreateRollback::new(7, []);
-
-        assert_eq!(
-            rollback.fence_cleanup_keys(),
-            [
-                "/channels/aborted/7".to_string(),
-                "/channels/meta/7".to_string(),
-                "/channels/7/".to_string(),
-            ]
-        );
-        assert_eq!(
-            rollback.exact_cleanup_keys(),
-            [
-                "dist_id_allocator/channels/7".to_string(),
-                "cluster_lease/channels/7".to_string(),
-                "cluster_lease/id_allocator/channels/7".to_string(),
-            ]
-        );
-        assert_eq!(
-            rollback.cleanup_prefixes(),
-            ["dist_id_allocator/channels/7/".to_string()]
-        );
-    }
-
-    #[test]
-    fn permanent_abort_marker_survives_channel_prefix_cleanup() {
-        let rollback = MpscCreateRollback::new(7, []);
-        let [aborted_key, _, channel_prefix] = rollback.fence_cleanup_keys();
-
-        assert!(!aborted_key.starts_with(&channel_prefix));
-    }
-
-    #[test]
-    fn rollback_never_records_override_etcd_leases_for_revoke() {
-        let mut rollback = MpscCreateRollback::new(7, [101, 202]);
-        rollback.record_channel_owned_etcd_lease(101);
-        rollback.record_channel_owned_etcd_lease(202);
-        rollback.record_channel_owned_etcd_lease(303);
-        rollback.record_channel_owned_etcd_lease(303);
-
-        assert_eq!(rollback.channel_owned_etcd_lease_ids, BTreeSet::from([303]));
     }
 }

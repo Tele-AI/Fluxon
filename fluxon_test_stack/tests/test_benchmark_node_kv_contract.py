@@ -754,12 +754,13 @@ class TestBenchmarkNodeKvContract(unittest.TestCase):
 class TestFluxonBlockingStoreContract(unittest.TestCase):
     def test_channel_client_remains_the_typed_inner_owner(self) -> None:
         raw_store = _FakeFluxonStore()
-        store = _KV.KVBenchmarkBlockingStore(
+        store = _KV.FluxonBlockingStore(
             raw_store,  # type: ignore[arg-type]
-            backend_kind=_KV.BACKEND_KIND_FLUXON,
             get_output=_KV.KVGetOutput.HOLDER,
         )
 
+        self.assertIsInstance(store, _KV.KVBenchmarkBlockingStore)
+        self.assertEqual(store.backend_kind, _KV.BACKEND_KIND_FLUXON)
         self.assertIs(store.kv_client, raw_store)
         self.assertFalse(hasattr(store, "_client"))
         self.assertFalse(hasattr(store, "get_etcd_config"))

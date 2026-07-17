@@ -66,6 +66,7 @@ try:
         BENCHMARK_KEY_KV_GET_OUTPUT,
         KV_NODE_ROLE_SEED,
         KV_NODE_ROLE_WORKER,
+        FluxonBlockingStore,
         KVBenchmarkBlockingStore,
         KVGetResultKind,
         canonicalize_kv_node_role,
@@ -114,6 +115,7 @@ except ImportError:
         BENCHMARK_KEY_KV_GET_OUTPUT,
         KV_NODE_ROLE_SEED,
         KV_NODE_ROLE_WORKER,
+        FluxonBlockingStore,
         KVBenchmarkBlockingStore,
         KVGetResultKind,
         canonicalize_kv_node_role,
@@ -2935,10 +2937,7 @@ class BenchmarkNode:
                         )
                     self._attach_fluxon_phase_summary_callback(store)
                     self.kv_store = store
-                    if (
-                        not isinstance(store, KVBenchmarkBlockingStore)
-                        or store.backend_kind != BACKEND_KIND_FLUXON
-                    ):
+                    if not isinstance(store, FluxonBlockingStore):
                         raise RuntimeError(
                             "MPMC requires the Fluxon KV backend; benchmark wrapper is missing"
                         )
@@ -4127,8 +4126,7 @@ class BenchmarkNode:
                 self.kv_store = store
                 self.fluxon_client = (
                     store.kv_client
-                    if isinstance(store, KVBenchmarkBlockingStore)
-                    and store.backend_kind == BACKEND_KIND_FLUXON
+                    if isinstance(store, FluxonBlockingStore)
                     else None
                 )
                 self._attach_fluxon_phase_summary_callback(self.kv_store)
@@ -4138,7 +4136,7 @@ class BenchmarkNode:
             if test_mode == TestMode.MPMC.value:
                 if not defer_shared_kv_store and self.fluxon_client is None:
                     raise RuntimeError(
-                        "MPMC requires a Fluxon-backed KVBenchmarkBlockingStore"
+                        "MPMC requires a FluxonBlockingStore-backed KvClient"
                     )
                 logger.info("🔧 MPMC模式，初始化 MPMC 相关配置（每线程独立实例）...")
 

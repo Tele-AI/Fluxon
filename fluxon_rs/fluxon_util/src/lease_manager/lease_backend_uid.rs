@@ -22,8 +22,8 @@ pub enum LeaseType {
 
 /// Unique identifier for a lease backend.
 ///
-/// - Etcd: endpoints list (Vec<String>) sorted lexicographically to make
-///   identity stable regardless of input order.
+/// - Etcd: canonical endpoint set with stable identity regardless of input
+///   order or equivalent endpoint spelling.
 /// - KvClient: cluster and client instance identity; carries native async
 ///   Fluxon KV lease operations.
 pub enum LeaseBackendUid {
@@ -37,7 +37,15 @@ pub enum LeaseBackendUid {
 }
 
 impl LeaseBackendUid {
-    pub fn etcd(endpoints: EtcdEndpointSet) -> Self {
+    /// Construct an etcd backend identity from raw endpoints or a canonical set.
+    pub fn etcd_from<E>(endpoints: E) -> Self
+    where
+        E: TryInto<EtcdEndpointSet>,
+        E::Error: fmt::Display,
+    {
+        let endpoints = endpoints
+            .try_into()
+            .unwrap_or_else(|err| panic!("invalid etcd backend endpoints: {err}"));
         LeaseBackendUid::Etcd(endpoints)
     }
 
@@ -227,5 +235,16 @@ mod tests {
 
         assert_eq!(first, same);
         assert_ne!(first, other_client);
+    }
+
+    #[test]
+    fn etcd_backend_identity_accepts_raw_and_canonical_endpoints() {
+        let raw = vec!["127.0.0.1:2379".to_string()];
+        let canonical = EtcdEndpointSet::from_raw(raw.clone()).unwrap();
+
+        assert_eq!(
+            LeaseBackendUid::etcd_from(raw),
+            LeaseBackendUid::etcd_from(canonical)
+        );
     }
 }

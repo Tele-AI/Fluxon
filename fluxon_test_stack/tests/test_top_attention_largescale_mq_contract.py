@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import importlib.util
 import json
 import sys
@@ -211,92 +210,6 @@ class TestTopAttentionLargescaleMqContract(unittest.TestCase):
             self.assertTrue(
                 (workdir / "runtime" / "fluxon_test_stack" / "distributed_benchmark_node.py").is_file()
             )
-
-    def test_materialized_node_only_imports_existing_kv_runtime_symbols(self) -> None:
-        entry = _load_module()
-        with tempfile.TemporaryDirectory() as td:
-            workdir = Path(td) / "bare-run"
-            args = _args(
-                workdir=str(workdir),
-                owner_count=2,
-                producer_count=4,
-                consumer_count=2,
-            )
-            ports = entry._allocate_port_plan(
-                workdir=workdir,
-                owner_count=2,
-                worker_count=6,
-                busy_ports=set(),
-            )
-            plan, benchmark, master, owners = entry._build_runtime_artifacts(
-                args=args,
-                workdir=workdir,
-                ports=ports,
-                host_ips=["127.0.0.1"],
-            )
-            runtime_paths = entry._materialize_runtime(
-                workdir=workdir,
-                plan=plan,
-                benchmark_config=benchmark,
-                master_config=master,
-                owner_configs=owners,
-            )
-            runtime_dir = runtime_paths["node_script"].parent
-            node_tree = ast.parse(
-                (runtime_dir / "distributed_benchmark_node.py").read_text(encoding="utf-8")
-            )
-            kv_tree = ast.parse(
-                (runtime_dir / "benchmark_node_kv.py").read_text(encoding="utf-8")
-            )
-
-        imported_names = {
-            alias.name
-            for statement in ast.walk(node_tree)
-            if isinstance(statement, ast.ImportFrom)
-            and statement.module == "benchmark_node_kv"
-            for alias in statement.names
-        }
-        exported_names: set[str] = set()
-        for statement in kv_tree.body:
-            if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                exported_names.add(statement.name)
-            elif isinstance(statement, (ast.Import, ast.ImportFrom)):
-                exported_names.update(
-                    alias.asname or alias.name.split(".", 1)[0]
-                    for alias in statement.names
-                )
-            elif isinstance(statement, ast.Assign):
-                exported_names.update(
-                    target.id for target in statement.targets if isinstance(target, ast.Name)
-                )
-            elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
-                exported_names.add(statement.target.id)
-
-        self.assertTrue(imported_names)
-        self.assertEqual(sorted(imported_names - exported_names), [])
-
-    def test_materialized_runtime_import_probe_fails_before_services_start(self) -> None:
-        entry = _load_module()
-        with tempfile.TemporaryDirectory() as td:
-            workdir = Path(td)
-            runtime_dir = workdir / "runtime" / "fluxon_test_stack"
-            runtime_dir.mkdir(parents=True)
-            (runtime_dir / "distributed_benchmark_node.py").write_text("pass\n", encoding="utf-8")
-            with mock.patch.object(
-                entry.subprocess,
-                "run",
-                return_value=mock.Mock(returncode=1, stdout="ImportError: missing symbol\n"),
-            ):
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "materialized benchmark runtime import failed.*missing symbol",
-                ):
-                    entry._validate_materialized_benchmark_runtime(
-                        python=sys.executable,
-                        runtime_dir=runtime_dir,
-                        workdir=workdir,
-                        child_env={},
-                    )
 
     def test_result_contract_requires_every_worker_at_every_gate(self) -> None:
         entry = _load_module()

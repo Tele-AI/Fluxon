@@ -1,9 +1,12 @@
 use crate::keys;
-use etcd_client as etcd;
-use fluxon_util::etcd::ManagedEtcdClient;
-use fluxon_util::lease_manager::{GeneralLease, LeaseBackendUid, LeaseManager};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::debug;
+
+use anyhow::Context;
+use etcd_client as etcd;
+use fluxon_util::etcd::DistributeIdAllocator;
+use fluxon_util::lease_manager::{GeneralLease, LeaseBackendUid, LeaseManager};
 
 /// Initial produce offset when no messages have been produced.
 pub const PRODUCE_OFFSET_BEGIN: i64 = -1;
@@ -166,8 +169,8 @@ pub async fn get_chan_meta(
     Ok(meta)
 }
 
-/// Channel manager that operates on etcd metadata and cooperates with the
-/// managed etcd client registry and the global lease manager.
+/// Channel manager that operates on etcd metadata and cooperates with
+/// the shared endpoints-scoped `LeaseManager` for lease registration.
 ///
 /// Backed by `LeaseManager` and its backend uid, this struct
 /// aggregates the channel id and the three etcd lease handles
@@ -203,9 +206,6 @@ pub struct ChanManager {
     /// 决定好 payload lease id，并通过 LeaseManager 注册
     /// 对应的 kvclient keepalive；此处始终持有一个有效句柄。
     pub payload_lease: GeneralLease,
-    /// Keeps the canonical endpoint-scoped client registry entry alive.
-    pub(crate) _etcd_backend: ManagedEtcdClient,
-    /// Connected clone used by synchronous accessors throughout MQ actors.
     pub(crate) etcd_client: etcd::Client,
 }
 

@@ -83,16 +83,10 @@ class _FakeTransactions:
         return ("delete", key)
 
 
-def _new_fake_fluxon_benchmark_store():
+def _new_fake_fluxon_blocking_store():
     if node_mod is None:
         raise RuntimeError("distributed benchmark node is unavailable")
-    from fluxon_test_stack.benchmark_node_kv import KVGetOutput
-
-    return node_mod.KVBenchmarkBlockingStore(
-        object(),
-        backend_kind=node_mod.BACKEND_KIND_FLUXON,
-        get_output=KVGetOutput.HOLDER,
-    )
+    return node_mod.FluxonBlockingStore(object())
 
 
 def _new_coordinator_with_temp_config():
@@ -1071,7 +1065,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
                 time.sleep(0.05)
                 with active_lock:
                     active_count -= 1
-                return _new_fake_fluxon_benchmark_store(), None
+                return _new_fake_fluxon_blocking_store(), None
 
             def fake_init_mq_channel(*, role, kv_store, chan_config, unique_id, weight):
                 return object(), None, None
@@ -1131,7 +1125,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
 
             def fake_init_kv_store(config, **_kwargs):
                 init_kv_configs.append(config)
-                return _new_fake_fluxon_benchmark_store(), None
+                return _new_fake_fluxon_blocking_store(), None
 
             def fake_init_mq_channel(*, role, kv_store, chan_config, unique_id, weight):
                 init_mq_calls.append(
@@ -1182,7 +1176,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
 
             def fake_init_kv_store(config, **_kwargs):
                 init_kv_configs.append(config)
-                store = _new_fake_fluxon_benchmark_store()
+                store = _new_fake_fluxon_blocking_store()
                 stores.append(store)
                 return store, None
 
@@ -1250,7 +1244,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
                     return None
 
                 def _init_kv_store_with_ready_retry(self, config, **_kwargs):
-                    return _new_fake_fluxon_benchmark_store(), None
+                    return _new_fake_fluxon_blocking_store(), None
 
                 def _prepare_mpmc_endpoint_runtime_from_kv_store(self, **kwargs) -> PreparedWorkerRuntime:
                     nonlocal active_count, max_active_count
@@ -1299,7 +1293,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
             "cluster_ready_timeout_seconds": 5,
             "max_benchmark_seconds": 30,
         }
-        store = _new_fake_fluxon_benchmark_store()
+        store = _new_fake_fluxon_blocking_store()
         node.kv_store = store
         node.fluxon_client = store.kv_client
         node.mq_unique_id = "mpmc-test"
@@ -2546,7 +2540,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
         }
         node._runtime_init_retry_sleep_seconds = lambda attempt: 0.0  # type: ignore[method-assign]
         calls = []
-        sentinel_store = _new_fake_fluxon_benchmark_store()
+        sentinel_store = _new_fake_fluxon_blocking_store()
         original_init_kv_store = node_mod.init_kv_store
 
         def fake_init_kv_store(config, **_kwargs):
@@ -2641,7 +2635,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
 
         events = []
         init_kv_configs = []
-        sentinel_store = _new_fake_fluxon_benchmark_store()
+        sentinel_store = _new_fake_fluxon_blocking_store()
         sentinel_producer = object()
         original_init_mq_channel = node_mod.init_mq_channel
 
@@ -2691,7 +2685,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
 
         init_kv_configs = []
         attach_stores = []
-        sentinel_store = _new_fake_fluxon_benchmark_store()
+        sentinel_store = _new_fake_fluxon_blocking_store()
 
         def fake_init_kv_store(config, **_kwargs):
             init_kv_configs.append(config)
@@ -2738,7 +2732,7 @@ class TestMPMCReadinessContract(unittest.TestCase):
         }
 
         events = []
-        sentinel_store = _new_fake_fluxon_benchmark_store()
+        sentinel_store = _new_fake_fluxon_blocking_store()
         sentinel_producer = object()
         original_init_mq_channel = node_mod.init_mq_channel
 

@@ -363,8 +363,6 @@ impl MpscProducer {
             }
         };
         let key = keys::etcd_producer_key(chan_id, &producer_idx);
-        let meta_key = keys::etcd_meta_key(chan_id);
-        let aborted_key = keys::etcd_aborted_key(chan_id);
 
         let member_meta = ProducerMemberMeta {
             producer_idx: producer_idx.clone(),

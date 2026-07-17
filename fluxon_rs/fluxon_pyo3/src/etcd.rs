@@ -1,6 +1,6 @@
 use etcd_client as etcd;
 use fluxon_util::etcd::{EtcdEndpointSet, ManagedEtcdClient};
-use fluxon_util::lease_manager::{GLOBAL_LM, GeneralLease, LeaseBackendUid, LeaseRegisterKind};
+use fluxon_util::lease_manager::{GeneralLease, LeaseBackendUid, LeaseRegisterKind, GLOBAL_LM};
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
@@ -19,45 +19,12 @@ fn is_lease_not_found_error(err: &etcd::Error) -> bool {
         || msg.contains("code: notfound")
 }
 
-fn normalize_raw_endpoint(endpoint: &str) -> PyResult<String> {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "etcd endpoint must be non-empty raw host:port",
-        ));
-    }
-    if endpoint.contains("://") {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "etcd endpoint must be raw host:port without scheme, got: {}",
-            endpoint
-        )));
-    }
-    Ok(format!("http://{}", endpoint))
-}
-
-pub(crate) fn normalize_raw_endpoints(
-    endpoints: Vec<String>,
-    component: &str,
-) -> PyResult<Vec<String>> {
-    if endpoints.is_empty() {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{} requires at least one endpoint",
-            component
-        )));
-    }
-    let mut normalized = Vec::with_capacity(endpoints.len());
-    for endpoint in endpoints {
-        normalized.push(normalize_raw_endpoint(&endpoint)?);
-    }
-    Ok(normalized)
-}
-
 pub(crate) fn endpoint_set_from_raw(
     endpoints: Vec<String>,
     component: &str,
 ) -> PyResult<EtcdEndpointSet> {
-    EtcdEndpointSet::new(normalize_raw_endpoints(endpoints, component)?)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+    EtcdEndpointSet::from_raw(endpoints)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{component}: {e}")))
 }
 
 fn is_reconnectable_etcd_error(err: &etcd::Error) -> bool {
@@ -484,7 +451,7 @@ impl PyEtcdLock {
                     let lease_id = lease_resp.id();
                     let lease_guard = match GLOBAL_LM
                         .register_lease_for_keepalive(
-                            LeaseBackendUid::etcd(endpoints),
+                            LeaseBackendUid::etcd_from(endpoints),
                             ttl_seconds,
                             lease_id as u64,
                             LeaseRegisterKind::Etcd,
@@ -696,31 +663,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_raw_endpoint_accepts_raw_host_port() {
-        assert_eq!(
-            normalize_raw_endpoint(" 127.0.0.1:2379 ").unwrap(),
-            "http://127.0.0.1:2379"
+    fn endpoint_set_from_raw_validates_and_normalizes() {
+        assert!(endpoint_set_from_raw(Vec::new(), "EtcdKvClient").is_err());
+        assert!(
+            endpoint_set_from_raw(vec!["http://127.0.0.1:2379".to_string()], "EtcdKvClient")
+                .is_err()
         );
-    }
-
-    #[test]
-    fn normalize_raw_endpoint_rejects_empty_or_schemed_endpoint() {
-        assert!(normalize_raw_endpoint("").is_err());
-        assert!(normalize_raw_endpoint("   ").is_err());
-        assert!(normalize_raw_endpoint("http://127.0.0.1:2379").is_err());
-        assert!(normalize_raw_endpoint("https://127.0.0.1:2379").is_err());
-    }
-
-    #[test]
-    fn normalize_raw_endpoints_requires_at_least_one_endpoint() {
-        assert!(normalize_raw_endpoints(Vec::new(), "EtcdKvClient").is_err());
+        let endpoints = endpoint_set_from_raw(
+            vec!["127.0.0.1:2379".to_string(), "localhost:2380".to_string()],
+            "EtcdKvClient",
+        )
+        .unwrap();
         assert_eq!(
-            normalize_raw_endpoints(
-                vec!["127.0.0.1:2379".to_string(), "localhost:2380".to_string()],
-                "EtcdKvClient",
-            )
-            .unwrap(),
-            vec![
+            endpoints.as_slice(),
+            [
                 "http://127.0.0.1:2379".to_string(),
                 "http://localhost:2380".to_string()
             ]
@@ -753,15 +709,13 @@ mod tests {
 
     #[test]
     fn etcd_lock_constructor_rejects_schemed_endpoints() {
-        assert!(
-            PyEtcdLock::new(
-                vec!["http://127.0.0.1:2379".to_string()],
-                "/unit-test/lock".to_string(),
-                10,
-                Some(1.0),
-            )
-            .is_err()
-        );
+        assert!(PyEtcdLock::new(
+            vec!["http://127.0.0.1:2379".to_string()],
+            "/unit-test/lock".to_string(),
+            10,
+            Some(1.0),
+        )
+        .is_err());
     }
 
     #[test]

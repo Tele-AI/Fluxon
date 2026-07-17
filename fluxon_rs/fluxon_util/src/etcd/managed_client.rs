@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use etcd_client::Client;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::RwLock;
@@ -16,6 +16,28 @@ use crate::auto_clean_map::{AutoCleanMap, AutoCleanMapEntry};
 pub struct EtcdEndpointSet(Vec<String>);
 
 impl EtcdEndpointSet {
+    pub fn from_raw(endpoints: Vec<String>) -> Result<Self> {
+        if endpoints.is_empty() {
+            bail!("etcd endpoint set must not be empty");
+        }
+
+        let mut normalized = Vec::with_capacity(endpoints.len());
+        for endpoint in endpoints {
+            let endpoint = endpoint.trim();
+            if endpoint.is_empty() {
+                bail!("etcd endpoint must not be empty");
+            }
+            if endpoint.contains("://") {
+                bail!(
+                    "raw etcd endpoint must not include a URL scheme, got: {}",
+                    endpoint
+                );
+            }
+            normalized.push(format!("http://{endpoint}"));
+        }
+        Self::new(normalized)
+    }
+
     pub fn new(endpoints: Vec<String>) -> Result<Self> {
         if endpoints.is_empty() {
             bail!("etcd endpoint set must not be empty");
@@ -43,6 +65,14 @@ impl EtcdEndpointSet {
     #[inline]
     pub fn as_slice(&self) -> &[String] {
         &self.0
+    }
+}
+
+impl TryFrom<Vec<String>> for EtcdEndpointSet {
+    type Error = anyhow::Error;
+
+    fn try_from(endpoints: Vec<String>) -> Result<Self> {
+        Self::from_raw(endpoints)
     }
 }
 
@@ -169,6 +199,17 @@ impl ManagedEtcdClient {
     pub async fn client(&self) -> Result<Client> {
         Ok(self.snapshot().await?.client)
     }
+
+    pub(crate) fn cached_client(&self) -> Result<Client> {
+        let slot = self
+            .entry
+            .slot
+            .try_read()
+            .map_err(|_| anyhow::anyhow!("managed etcd client cache is being updated"))?;
+        slot.client
+            .clone()
+            .context("managed etcd client has no connected generation")
+    }
 }
 
 /// One connected generation borrowed from a `ManagedEtcdClient`.
@@ -231,10 +272,29 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_set_normalizes_raw_endpoints() {
+        let endpoints = EtcdEndpointSet::from_raw(vec![
+            " b.example:2379 ".to_string(),
+            "a.example:2379".to_string(),
+            "b.example:2379".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            endpoints.as_slice(),
+            [
+                "http://a.example:2379".to_string(),
+                "http://b.example:2379".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn endpoint_set_rejects_raw_or_empty_endpoints() {
         assert!(EtcdEndpointSet::new(Vec::new()).is_err());
         assert!(EtcdEndpointSet::new(vec!["".to_string()]).is_err());
         assert!(EtcdEndpointSet::new(vec!["127.0.0.1:2379".to_string()]).is_err());
+        assert!(EtcdEndpointSet::from_raw(Vec::new()).is_err());
+        assert!(EtcdEndpointSet::from_raw(vec!["http://127.0.0.1:2379".to_string()]).is_err());
     }
 
     #[test]
@@ -287,8 +347,10 @@ mod tests {
         let handle = ManagedEtcdClient::acquire(
             EtcdEndpointSet::new(vec![format!("http://{address}")]).unwrap(),
         );
+        assert!(handle.cached_client().is_err());
         let caller_runtime = Builder::new_current_thread().enable_all().build().unwrap();
         let snapshot = caller_runtime.block_on(handle.snapshot()).unwrap();
+        assert!(handle.cached_client().is_ok());
         drop(caller_runtime);
 
         let request_runtime = Builder::new_current_thread().enable_all().build().unwrap();

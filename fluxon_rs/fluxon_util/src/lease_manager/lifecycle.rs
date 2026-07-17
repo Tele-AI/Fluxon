@@ -14,7 +14,7 @@ use anyhow::Result as AnyResult;
 use etcd_client::Client;
 
 use super::keepalive_actor::{
-    self, ActorRegisterInvocation, EtcdState, LeaseKey, OneTtlKeepAliveInner, ensure_inner_running,
+    self, ensure_inner_running, ActorRegisterInvocation, EtcdState, LeaseKey, OneTtlKeepAliveInner,
 };
 use super::lease_backend_handle::{LeaseBackendHandle, LeaseBackendInner};
 use super::lease_backend_uid::{KvKeepaliveLease, LeaseBackendUid, LeaseRegisterKind, LeaseType};
@@ -142,7 +142,7 @@ fn acquire_existing_backend_handle(uid: &LeaseBackendUid) -> Option<LeaseBackend
 /// MPMC subchannels use this contract after their parent member lease has
 /// registered the backend. Failing here exposes an ownership-ordering bug
 /// instead of silently opening one connection per subchannel.
-pub async fn registered_etcd_client(uid: &LeaseBackendUid) -> AnyResult<Client> {
+pub fn registered_etcd_client(uid: &LeaseBackendUid) -> AnyResult<Client> {
     if uid.kind() != LeaseType::Etcd {
         anyhow::bail!("registered_etcd_client requires an Etcd backend uid");
     }
@@ -156,7 +156,12 @@ pub async fn registered_etcd_client(uid: &LeaseBackendUid) -> AnyResult<Client> 
                     .unwrap_or_default()
             )
         })?;
-    managed.client().await
+    managed.cached_client().map_err(|err| {
+        anyhow::anyhow!(
+            "registered etcd backend has no synchronously available client: {}",
+            err
+        )
+    })
 }
 
 // ---------- Per-TTL Actor Map & Registration Helpers ----------

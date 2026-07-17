@@ -1364,19 +1364,8 @@ impl MpscConsumer {
         // 4) Bind consumer membership key under member lease, storing
         // ChanMemberMeta as JSON for future introspection.
         let consumer_key = keys::etcd_consumer_key(chan_id, &consumer_idx);
-        let compares = vec![
-            etcd::Compare::create_revision(
-                keys::etcd_aborted_key(chan_id),
-                etcd::CompareOp::Equal,
-                0,
-            ),
-            etcd::Compare::create_revision(
-                keys::etcd_meta_key(chan_id),
-                etcd::CompareOp::Greater,
-                0,
-            ),
-            etcd::Compare::create_revision(consumer_key.clone(), etcd::CompareOp::Equal, 0),
-        ];
+        let compare =
+            etcd::Compare::create_revision(consumer_key.clone(), etcd::CompareOp::Equal, 0);
 
         let member_meta = ChanMemberMeta {
             member_id: consumer_idx.clone(),
@@ -1392,16 +1381,13 @@ impl MpscConsumer {
             meta_bytes,
             Some(etcd::PutOptions::new().with_lease(member_lease_id)),
         );
-        let txn = etcd::Txn::new().when(compares).and_then(vec![put_op]);
+        let txn = etcd::Txn::new().when(vec![compare]).and_then(vec![put_op]);
         let txn_res = client
             .txn(txn)
             .await
             .with_context(|| format!("failed to bind consumer membership key {}", consumer_key))?;
         if !txn_res.succeeded() {
-            anyhow::bail!(
-                "consumer membership bind rejected for key {}: channel aborted, meta missing, or membership already exists",
-                consumer_key
-            );
+            anyhow::bail!("consumer membership key {} already exists", consumer_key);
         }
 
         // 5) 创建预取 actor，并通过共享队列与之协作。
@@ -1541,30 +1527,19 @@ impl MpscConsumer {
 
         let member_lease_id = self.chan_mgr.member_lease_id();
         let consumer_key = keys::etcd_consumer_key(self.chan_id, &self.consumer_idx);
-        let compares = vec![
-            etcd::Compare::create_revision(
-                keys::etcd_aborted_key(self.chan_id),
-                etcd::CompareOp::Equal,
-                0,
-            ),
-            etcd::Compare::create_revision(
-                keys::etcd_meta_key(self.chan_id),
-                etcd::CompareOp::Greater,
-                0,
-            ),
-            etcd::Compare::create_revision(consumer_key.clone(), etcd::CompareOp::Greater, 0),
-        ];
+        let compare =
+            etcd::Compare::create_revision(consumer_key.clone(), etcd::CompareOp::Greater, 0);
         let put_op = etcd::TxnOp::put(
             consumer_key.clone(),
             meta_bytes,
             Some(etcd::PutOptions::new().with_lease(member_lease_id)),
         );
-        let txn = etcd::Txn::new().when(compares).and_then(vec![put_op]);
+        let txn = etcd::Txn::new().when(vec![compare]).and_then(vec![put_op]);
         let mut client = self.chan_mgr.etcd_client();
         let txn_res = client.txn(txn).await?;
         if !txn_res.succeeded() {
             return Err(MpscError::Internal(format!(
-                "consumer membership sync rejected for key {}: channel aborted, meta missing, or membership missing",
+                "consumer membership key {} missing while syncing kvclient_sub_cluster",
                 consumer_key
             )));
         }

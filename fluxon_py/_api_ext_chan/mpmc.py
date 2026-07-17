@@ -362,9 +362,9 @@ def _new_mpmc_role_key_prefix(mpmc_id: str, role: ChanRole) -> str:
     Get the key prefix for storing MPMC channel role.
     """
     if role == ChanRole.PRODUCER:
-        return f"/mpmc_channels/producer/{mpmc_id}/"
+        return f"/mpmc_channels/producer/{mpmc_id}"
     elif role == ChanRole.CONSUMER:
-        return f"/mpmc_channels/consumer/{mpmc_id}/"
+        return f"/mpmc_channels/consumer/{mpmc_id}"
     else:
         raise ValueError(f"Invalid role: {role}")
 
@@ -381,7 +381,7 @@ def _new_mpmc_role_key(mpmc_id: str, role: ChanRole, member_id: int) -> str:
 
 def _extract_mpmc_member_id_from_role_key(key: bytes, mpmc_id: str, role: ChanRole) -> int:
     key_str = key.decode()
-    prefix = _new_mpmc_role_key_prefix(mpmc_id, role)
+    prefix = _new_mpmc_role_key_prefix(mpmc_id, role) + "/"
     if not key_str.startswith(prefix):
         raise ValueError(f"Invalid MPMC role key format: {key_str}")
 
@@ -408,28 +408,37 @@ def _new_mpmc_ready_channels_prefix(mpmc_id: str) -> str:
     """
     Get the prefix for all ready channels in MPMC channel.
     """
-    # Keep the trailing slash so ready-key parsing cannot match another MPMC id.
-    return f"/mpmc_channels/ready/{mpmc_id}/"
+    return f"/mpmc_channels/ready/{mpmc_id}/" # we need the / at the end for extracting mpsc_id from key
 
 
 def _extract_mpsc_id_from_ready_key(key: bytes, mpmc_id: str) -> str:
-    """Extract a digit-only MPSC channel ID from an etcd ready key."""
+    """
+    Extract MPSC channel ID from a ready channel key.
+    
+    Args:
+        key(bytes): The key from etcd
+        expected_mpmc_id(int): Expected MPMC channel ID for validation
+        
+    Returns:
+        int: MPSC channel ID
+        
+    Raises:
+        ValueError: If key format is invalid or mpsc_id is not numeric
+        AssertionError: If mpmc_id doesn't match expected value
+    """
     try:
         key_str = key.decode()
         prefix = _new_mpmc_ready_channels_prefix(mpmc_id)
         if not key_str.startswith(prefix):
-            raise ValueError(
-                f"Invalid ready channel key format (wrong structure): {key_str}"
-            )
+            raise ValueError(f"Invalid ready channel key format (wrong structure): {key_str}")
 
-        mpsc_id = key_str[len(prefix) :]
-        if not mpsc_id.isdigit():
-            raise ValueError(f"Invalid ready channel key MPSC id: {key_str}")
+        mpsc_id = key_str[len(prefix):]
+        if len(mpsc_id) == 0:
+            raise ValueError(f"Invalid ready channel key format (empty mpsc_id): {key_str}")
         return mpsc_id
-
+        
     except (ValueError, UnicodeDecodeError) as e:
         raise ValueError(f"Error parsing ready channel key {key}: {e}")
-
 
 def _new_mpmc_next_channel_id_key(mpmc_id: str) -> str:
     """
@@ -822,7 +831,6 @@ class MPMCChannel(FactoryOnly):
             raise ValueError(f"mpmc_member_id is None for mpmc_id={self.mpmc_id}")
 
         ready_key = _new_mpmc_ready_channel_key(self.mpmc_id, mpsc_id)
-        expected_owner = str(self.mpmc_member_id).encode()
         try:
             success, _ = self.etcd_client.transaction(
                 compare=[
@@ -831,7 +839,7 @@ class MPMCChannel(FactoryOnly):
                 success=[
                     self.etcd_client.transactions.put(
                         ready_key,
-                        expected_owner,
+                        str(self.mpmc_member_id).encode(),
                         self.mpmc_member_lease,
                     )
                 ],
@@ -839,38 +847,10 @@ class MPMCChannel(FactoryOnly):
             )
             return Result.new_ok(bool(success))
         except Exception as e:
-            reconciliation_errors: List[str] = []
-            for attempt in range(1, 4):
-                try:
-                    ready_owner, _ = self.etcd_client.get(ready_key)
-                    if ready_owner == expected_owner:
-                        logging.warning(
-                            "Ready claim response was lost but authority confirms ownership: "
-                            "mpmc_id=%s mpsc_id=%s member_id=%s",
-                            self.mpmc_id,
-                            mpsc_id,
-                            self.mpmc_member_id,
-                        )
-                        return Result.new_ok(True)
-                    if ready_owner is not None:
-                        reconciliation_errors.append(
-                            f"attempt={attempt}: observed_other_owner={ready_owner!r}"
-                        )
-                except Exception as read_error:
-                    reconciliation_errors.append(
-                        f"attempt={attempt}: {read_error}"
-                    )
-                if attempt < 3:
-                    time.sleep(0.05 * attempt)
-
-            # An absent read cannot fence the original create-if-absent txn.
-            # Revoke this member lease so a delayed put cannot become live.
-            self._fail_close_member(reason="ambiguous_ready_claim")
             return Result.new_error(
                 ChanBindError(
                     f"Failed to claim ready key for mpmc_id={self.mpmc_id}, "
-                    f"mpsc_id={mpsc_id}: {e}; reconciliation_errors="
-                    f"{reconciliation_errors}"
+                    f"mpsc_id={mpsc_id}: {e}"
                 )
             )
 
@@ -880,24 +860,7 @@ class MPMCChannel(FactoryOnly):
 
         ready_key = _new_mpmc_ready_channel_key(self.mpmc_id, mpsc_id)
         try:
-            expected_owner = str(self.mpmc_member_id).encode()
-            success, _ = self.etcd_client.transaction(
-                compare=[
-                    self.etcd_client.transactions.value(ready_key)
-                    == expected_owner
-                ],
-                success=[self.etcd_client.transactions.delete(ready_key)],
-                failure=[],
-            )
-            if not success:
-                logging.debug(
-                    "Ready key cleanup skipped after %s because ownership changed: "
-                    "mpmc_id=%s mpsc_id=%s member_id=%s",
-                    reason,
-                    self.mpmc_id,
-                    mpsc_id,
-                    self.mpmc_member_id,
-                )
+            self.etcd_client.delete(ready_key)
         except Exception as e:
             logging.warning(
                 "Failed to delete ready key after %s for mpmc_id=%s mpsc_id=%s: %s",
@@ -906,45 +869,6 @@ class MPMCChannel(FactoryOnly):
                 mpsc_id,
                 e,
             )
-
-    def _bind_claimed_existing_unready_consumer(
-        self,
-        api: KvClient,
-        chan_config: Dict[str, int],
-        mpsc_id: str,
-    ) -> Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError]:
-        """Bind a consumer after this member has atomically claimed its ready key."""
-        try:
-            mpsc_consumer = MPSCChanConsumer(
-                api,
-                mpsc_id,
-                chan_config,
-                self.etcd_client,
-                self.mpmc_member_lease,
-                self.mpmc_global_lease,
-                override_payload_lease_id=self.payload_lease_id,
-                parent_mpmc_id_opt=self.mpmc_id,
-                parent_mpmc_member_id_opt=self.mpmc_member_id,
-            )
-        except Exception as e:
-            self._best_effort_delete_ready_channel(
-                mpsc_id,
-                reason="existing_unready_bind_failure",
-            )
-            return Result.new_error(
-                ChanBindError(
-                    f"Failed to bind claimed existing MPSC consumer for "
-                    f"mpmc_id={self.mpmc_id}, mpsc_id={mpsc_id}: {e}"
-                )
-            )
-
-        mpsc_consumer._mpmc_ready_claimed = True
-        logging.debug(
-            "Bound claimed existing unready MPSC consumer for mpmc_id=%s, mpsc_id=%s",
-            self.mpmc_id,
-            mpsc_id,
-        )
-        return Result.new_ok(mpsc_consumer)
 
     def _try_bind_existing_unready_consumer(
         self,
@@ -973,33 +897,39 @@ class MPMCChannel(FactoryOnly):
                 )
                 continue
 
-            return self._bind_claimed_existing_unready_consumer(
-                api,
-                chan_config,
-                mpsc_id,
-            )
-
-        return None
-
-    def _fail_close_member(self, *, reason: str) -> None:
-        """Stop this member after an ambiguous ready-key operation."""
-        self.shutdown_ctl.close()
-        self._lm_mpmc_member = None
-        lease_id = int(self.mpmc_member_lease.id)
-        try:
-            self.etcd_client.revoke_lease(lease_id)
-        except Exception as e:
-            if "requested lease not found" not in str(e).lower():
-                logging.error(
-                    "Failed to revoke MPMC member lease after %s: "
-                    "mpmc_id=%s member_id=%s lease_id=%s error=%s",
-                    reason,
-                    self.mpmc_id,
-                    self.mpmc_member_id,
-                    lease_id,
-                    e,
+            try:
+                mpsc_consumer = MPSCChanConsumer(
+                    api,
+                    mpsc_id,
+                    chan_config,
+                    self.etcd_client,
+                    self.mpmc_member_lease,
+                    self.mpmc_global_lease,
+                    override_payload_lease_id=self.payload_lease_id,
+                    parent_mpmc_id_opt=self.mpmc_id,
+                    parent_mpmc_member_id_opt=self.mpmc_member_id,
+                )
+            except Exception as e:
+                self._best_effort_delete_ready_channel(
+                    mpsc_id,
+                    reason="existing_unready_bind_failure",
+                )
+                return Result.new_error(
+                    ChanBindError(
+                        f"Failed to bind claimed existing MPSC consumer for "
+                        f"mpmc_id={self.mpmc_id}, mpsc_id={mpsc_id}: {e}"
+                    )
                 )
 
+            mpsc_consumer._mpmc_ready_claimed = True
+            logging.debug(
+                "Bound claimed existing unready MPSC consumer for mpmc_id=%s, mpsc_id=%s",
+                self.mpmc_id,
+                mpsc_id,
+            )
+            return Result.new_ok(mpsc_consumer)
+
+        return None
 
     def _ensure_member_lease_alive(self) -> Result[OkNone, ApiError]:
         lease_id = int(self.mpmc_member_lease.id)
@@ -1230,18 +1160,21 @@ class MPMCChannel(FactoryOnly):
             chan_config: Dict[str, int],
             chan_role: ChanRole,
         ) -> Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError]:
-        """Construct and atomically publish a new sub-MPSC under the create lock."""
-        if chan_role not in (ChanRole.PRODUCER, ChanRole.CONSUMER):
-            return Result.new_error(
-                ChanCreateError(f"Invalid channel role: {chan_role}")
-            )
-        if self.mpmc_member_id is None:
-            return Result.new_error(
-                ChanCreateError(
-                    f"Cannot create MPSC for mpmc_id={self.mpmc_id}: member id is missing"
-                )
-            )
-
+        """
+        Try to create a new MPSC channel and add it to this MPMC channel.
+        Uses etcd lock to ensure atomic creation.
+        Producer: only create if this is the first channel
+        Consumer: only create if active consumer count > existing MPSC channels
+        
+        Args:
+            api(KvClient): KV store API (required for creating MPSC objects)
+            api(KvClient): KV store API (required for creating MPSC objects)
+            chan_config(Dict[str, int]): Channel configuration (required for creating MPSC objects)
+            chan_role(ChanRole): Channel role (PRODUCER or CONSUMER)
+            
+        Returns:
+            Result[Union[MPSCChanConsumer, MPSCChanProducer]]: New MPSC object
+        """
         lock_key = f"/mpmc_channels/{self.mpmc_id}/create_lock"
         published_channel: Optional[Union[MPSCChanConsumer, MPSCChanProducer]] = None
         unpublished_channel: Optional[Union[MPSCChanConsumer, MPSCChanProducer]] = None
@@ -1296,24 +1229,31 @@ class MPMCChannel(FactoryOnly):
                 
                 # Role-specific constraints
                 if chan_role == ChanRole.PRODUCER:
+                    # Producer: only create if this is the first channel
                     if current_mpscs:
-                        return Result.new_error(
-                            ChanCreateError("Producer can only create the first channel")
-                        )
-                else:
-                    # Re-check under the lock so a concurrently published
-                    # unready channel wins over allocating another one.
+                        return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(ChanCreateError("Producer can only create the first channel"))
+                elif chan_role == ChanRole.CONSUMER:
+                    # Consumer: lock-free snapshots are not authoritative. Re-read
+                    # under the create lock and claim any existing unready MPSC
+                    # before deciding to allocate a new one.
                     ready_channel_set = set(self.get_remote_ready_channels())
                     current_unready_mpscs = [
                         mpsc_id for mpsc_id in current_mpscs if mpsc_id not in ready_channel_set
                     ]
-                    existing_consumer_res = self._try_bind_existing_unready_consumer(
-                        api,
-                        chan_config,
-                        current_unready_mpscs,
-                    )
-                    if existing_consumer_res is not None:
-                        return existing_consumer_res
+                    if current_unready_mpscs:
+                        logging.debug(
+                            "Consumer create-lock recheck found existing unready MPSCs for "
+                            "mpmc_id=%s: %s",
+                            self.mpmc_id,
+                            current_unready_mpscs,
+                        )
+                        existing_consumer_res = self._try_bind_existing_unready_consumer(
+                            api,
+                            chan_config,
+                            current_unready_mpscs,
+                        )
+                        if existing_consumer_res is not None:
+                            return existing_consumer_res
 
                     # Only create if the lock-protected recheck still found no
                     # claimable unready channel and active consumers outnumber
@@ -1322,11 +1262,9 @@ class MPMCChannel(FactoryOnly):
                         self.get_active_member_ids(ChanRole.CONSUMER)
                     )
                     if active_consumers <= len(current_mpscs):
-                        return Result[
-                            Union[MPSCChanConsumer, MPSCChanProducer], ApiError
-                        ].new_error(
-                            ChanCreateError("Not enough active consumers to create new channel")
-                        )
+                        return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(ChanCreateError("Not enough active consumers to create new channel"))
+                else:
+                    return Result[Union[MPSCChanConsumer, MPSCChanProducer], ApiError].new_error(ChanCreateError(f"Invalid channel role: {chan_role}"))
                 
                 # Create MPSC object (let it handle its own ID allocation)
                 if chan_role == ChanRole.PRODUCER:
@@ -1420,7 +1358,6 @@ class MPMCChannel(FactoryOnly):
                             override_payload_lease_id=self.payload_lease_id,
                             parent_mpmc_id_opt=self.mpmc_id,
                             parent_mpmc_member_id_opt=self.mpmc_member_id,
-                            _parent_shutdown_ctl=self.shutdown_ctl,
                         )
                     except Exception as e:
                         logging.error(f"Fatal error creating MPSC consumer for MPMC channel {self.mpmc_id}: {e}")
@@ -1625,7 +1562,7 @@ class MPMCChannel(FactoryOnly):
     def get_active_member_ids(self, role: ChanRole) -> List[int]:
         """Return active MPMC member ids for one role."""
 
-        role_key_prefix = _new_mpmc_role_key_prefix(self.mpmc_id, role)
+        role_key_prefix = _new_mpmc_role_key_prefix(self.mpmc_id, role) + "/"
         member_ids: List[int] = []
         for _, meta in self.etcd_client.get_prefix(role_key_prefix):
             member_ids.append(

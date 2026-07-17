@@ -3298,6 +3298,24 @@ class KVBenchmarkBlockingStore:
         self._phase_profiler.flush_pending()
 
 
+class FluxonBlockingStore(KVBenchmarkBlockingStore):
+    """Fluxon-backed store that owns the client used by MQ control paths."""
+
+    def __init__(
+        self,
+        store: KvClient,
+        *,
+        get_output: KVGetOutput = KVGetOutput.HOLDER,
+        cuda_device_index: int = 0,
+    ) -> None:
+        super().__init__(
+            store,
+            backend_kind=BACKEND_KIND_FLUXON,
+            get_output=get_output,
+            cuda_device_index=cuda_device_index,
+        )
+
+
 def init_kv_store(
     kvcache_config: dict[str, Any],
     *,
@@ -3365,6 +3383,15 @@ def init_kv_store(
         store = result.unwrap()
         if store is None:
             return None, "Failed to create KVCache store: unwrap() returned None"
+        if backend_kind == BACKEND_KIND_FLUXON:
+            return (
+                FluxonBlockingStore(
+                    store,
+                    get_output=get_output,
+                    cuda_device_index=cuda_device_index,
+                ),
+                None,
+            )
         return (
             KVBenchmarkBlockingStore(
                 store,

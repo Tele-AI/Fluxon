@@ -7,7 +7,6 @@
 // explicitly to avoid implicit singletons.
 
 use anyhow::Result;
-use fluxon_util::etcd::EtcdEndpointSet;
 use fluxon_util::lease_manager;
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use tokio::runtime::Runtime;
@@ -17,8 +16,8 @@ pub use fluxon_util::lease_manager::{debug_keepalive_log, get_register_by, recor
 
 // Re-export actor-based lease types
 pub use fluxon_util::lease_manager::{
-    GeneralLease, KvAllocateLease, KvKeepaliveLease, KvLeaseFuture, LeaseBackendHandle,
-    LeaseBackendUid, LeaseRegisterKind, LeaseType, GLOBAL_LM,
+    GLOBAL_LM, GeneralLease, KvAllocateLease, KvKeepaliveLease, KvLeaseFuture, LeaseBackendHandle,
+    LeaseBackendUid, LeaseRegisterKind, LeaseType,
 };
 
 // Canonicalization is handled by LeaseBackendUid constructor.
@@ -30,14 +29,14 @@ pub use fluxon_util::lease_manager::{
 /// config issues early.
 pub fn register_etcd_lease(
     rt: &Runtime,
-    endpoints: EtcdEndpointSet,
+    endpoints: Vec<String>,
     ttl_seconds: i64,
     lease_id: u64,
 ) -> Result<lease_manager::GeneralLease> {
     let rth = rt.handle().clone();
     let outer = rt
         .run_async_from_sync(async move {
-            let uid = LeaseBackendUid::etcd(endpoints);
+            let uid = LeaseBackendUid::etcd_from(endpoints);
             let mgr = &lease_manager::GLOBAL_LM;
             let gl = mgr
                 .register_lease_for_keepalive(

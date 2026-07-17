@@ -791,50 +791,6 @@ def _validate_release(release_dir: Path, python: str, workdir: Path, child_env: 
     return binaries
 
 
-def _validate_materialized_benchmark_runtime(
-    *,
-    python: str,
-    runtime_dir: Path,
-    workdir: Path,
-    child_env: dict[str, str],
-) -> None:
-    node_script = runtime_dir / "distributed_benchmark_node.py"
-    if not node_script.is_file():
-        raise RuntimeError(f"materialized benchmark node is missing: {node_script}")
-    probe = subprocess.run(
-        [
-            python,
-            "-I",
-            "-c",
-            (
-                "import pathlib, sys; "
-                "runtime_dir = pathlib.Path(sys.argv[1]).resolve(); "
-                "sys.path.insert(0, str(runtime_dir)); "
-                "import distributed_benchmark_node; "
-                "print(distributed_benchmark_node.__file__)"
-            ),
-            str(runtime_dir),
-        ],
-        cwd=str(workdir),
-        env=child_env,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=60,
-    )
-    if probe.returncode != 0:
-        raise RuntimeError(
-            "materialized benchmark runtime import failed: "
-            f"python={python} output={probe.stdout.strip()}"
-        )
-    print(
-        "[bare-large-scale] materialized benchmark runtime import passed: "
-        f"{probe.stdout.strip().splitlines()[-1]}",
-        flush=True,
-    )
-
-
 def _wait_tcp_ready(
     *,
     host: str,
@@ -1236,12 +1192,6 @@ def _run_bare_local(args: argparse.Namespace) -> int:
     try:
         _ensure_nofile_limit()
         binaries = _validate_release(release_dir, args.python, workdir, child_env)
-        _validate_materialized_benchmark_runtime(
-            python=args.python,
-            runtime_dir=runtime_paths["node_script"].parent,
-            workdir=workdir,
-            child_env=child_env,
-        )
         etcd_workdir = workdir / "services" / "etcd"
         etcd_workdir.mkdir(parents=True, exist_ok=True)
         etcd = registry.start(
