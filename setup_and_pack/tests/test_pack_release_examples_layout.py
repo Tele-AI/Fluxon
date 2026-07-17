@@ -36,7 +36,7 @@ _PACK_RELEASE = _load_module()
 class PackReleaseExamplesLayoutTest(unittest.TestCase):
     def test_top_level_release_manifest_relpaths_include_closed_sdk_runtime(self) -> None:
         relpaths = _PACK_RELEASE._top_level_release_manifest_relpaths(
-            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            wheel_name="fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
         )
 
         self.assertIn("closed_sdk/manifest.json", relpaths)
@@ -94,7 +94,7 @@ class PackReleaseExamplesLayoutTest(unittest.TestCase):
                     args = mock.Mock(release_dir=None, rdma_backend="closed_sdk", with_tikv_runtime="true")
                     build_parser.return_value.parse_args.return_value = args
                     release_dir.mkdir(parents=True, exist_ok=True)
-                    wheel = release_dir / "fluxon-0.2.1.whl"
+                    wheel = release_dir / "fluxon_ai-0.2.1.whl"
                     wheel.write_text("", encoding="utf-8")
                     find_single.return_value = wheel
 
@@ -125,11 +125,11 @@ class PackReleaseExamplesLayoutTest(unittest.TestCase):
 
     def test_merged_fluxon_wheel_name_uses_runtime_platform_tag(self) -> None:
         merged = _PACK_RELEASE._merged_fluxon_wheel_name(
-            pure_python_wheel_name="fluxon-0.2.1-py3-none-any.whl",
+            pure_python_wheel_name="fluxon_ai-0.2.1-py3-none-any.whl",
             pyo3_wheel_name="fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
         )
 
-        self.assertEqual(merged, "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl")
+        self.assertEqual(merged, "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl")
 
     def test_run_pack_steps_verifies_built_and_merged_wheels_explicitly(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -140,8 +140,8 @@ class PackReleaseExamplesLayoutTest(unittest.TestCase):
             pack_script.parent.mkdir(parents=True, exist_ok=True)
             pack_script.write_text("print('stub')\n", encoding="utf-8")
             built_pyo3_wheel = release_dir / "fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
-            pure_python_wheel = release_dir / "fluxon-0.2.1-py3-none-any.whl"
-            merged_wheel = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            pure_python_wheel = release_dir / "fluxon_ai-0.2.1-py3-none-any.whl"
+            merged_wheel = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
 
             built_pyo3_wheel.write_text("", encoding="utf-8")
             pure_python_wheel.write_text("", encoding="utf-8")

@@ -459,7 +459,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             primary_node_name="local-node-a",
             secondary_node_name="local-node-b",
             host_ip="10.1.1.119",
-            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            wheel_name="fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
             controller_port=19080,
         )
 
@@ -512,7 +512,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         )
         self.assertEqual(
             generated["artifact_sets"]["fluxon_tcp_thread"]["release_artifacts"],
-            {"wheel": "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"},
+            {"wheel": "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"},
         )
         self.assertEqual(set(generated["artifact_sets"].keys()), {"fluxon_tcp_thread"})
         self.assertEqual(
@@ -576,7 +576,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             primary_node_name="local-node-a",
             secondary_node_name="local-node-b",
             host_ip="10.1.1.119",
-            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            wheel_name="fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
             controller_port=19080,
         )
 
@@ -606,7 +606,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             primary_node_name="local-node-a",
             secondary_node_name="local-node-b",
             host_ip="10.1.1.119",
-            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            wheel_name="fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
             controller_port=19080,
         )
 
@@ -625,7 +625,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             primary_node_name="local-node-a",
             secondary_node_name="local-node-b",
             host_ip="10.1.1.119",
-            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            wheel_name="fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
             controller_port=19080,
         )
 
@@ -657,7 +657,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             primary_node_name="local-node-a",
             secondary_node_name="local-node-b",
             host_ip="10.1.1.119",
-            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            wheel_name="fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
             controller_port=19080,
         )
 
@@ -681,7 +681,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             primary_node_name="local-node-a",
             secondary_node_name="local-node-b",
             host_ip="10.1.1.119",
-            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            wheel_name="fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
             controller_port=19080,
         )
 
@@ -717,7 +717,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             host_ip="10.1.1.119",
             primary_hostworkdir=Path("/tmp/fluxon_testbed/a"),
             secondary_hostworkdir=Path("/tmp/fluxon_testbed/b"),
-            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            wheel_name="fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
             controller_port=19180,
         )
 
@@ -741,11 +741,11 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         self.assertEqual(generated["global_envs"]["FLUXON_CLUSTER_NODE_IDS"], "local-node-a local-node-b")
         self.assertEqual(
             generated["global_envs"]["FLUXON_RELEASE_WHEEL"],
-            "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
         )
         self.assertEqual(
             generated["global_envs"]["FLUXON_RELEASE_WHEEL_PY"],
-            "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
         )
         self.assertEqual(generated["global_envs"]["MASTER__PORT"], "19180")
         self.assertEqual(
@@ -810,7 +810,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             host_ip="10.1.1.119",
             primary_hostworkdir=Path("/tmp/fluxon_testbed/a"),
             secondary_hostworkdir=Path("/tmp/fluxon_testbed/b"),
-            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            wheel_name="fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
             controller_port=19180,
             testbed_ops_cluster_name="fluxon_testbed_mq_large_local",
         )
@@ -991,11 +991,11 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / _ENTRY.PLACEHOLDER_WHEEL_NAME).write_text("", encoding="utf-8")
-            (root / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl").write_text("", encoding="utf-8")
+            (root / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl").write_text("", encoding="utf-8")
 
-            wheel_name = _ENTRY._find_single_wheel(root, pattern="fluxon-*.whl", ctx="wheel")
+            wheel_name = _ENTRY._find_single_wheel(root, pattern="fluxon_ai-*.whl", ctx="wheel")
 
-            self.assertEqual(wheel_name, "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl")
+            self.assertEqual(wheel_name, "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl")
 
     def test_ensure_ci_pack_release_env_generates_explicit_companion_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1117,7 +1117,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             hostworkdir = root / "hostworkdir"
             release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
-            wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
             _ENTRY._write_yaml(
                 workdir / "start_test_bed" / "apply" / "deployconf.with_release_manifest_sha256.yaml",
@@ -1203,7 +1203,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             _ENTRY._write_yaml(suite_path, suite_cfg)
             release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
-            wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
 
             argv = [
@@ -1271,7 +1271,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             hostworkdir = root / "hostworkdir"
             release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
-            wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
 
             argv = [
@@ -1325,7 +1325,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             hostworkdir = root / "hostworkdir"
             release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
-            wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
             calls: list[tuple[list[str], dict[str, str] | None]] = []
 
@@ -1391,7 +1391,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             hostworkdir = root / "hostworkdir"
             release_dir = root / "custom_release"
             release_dir.mkdir(parents=True, exist_ok=True)
-            wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
             calls: list[tuple[list[str], dict[str, str] | None]] = []
 
@@ -1445,7 +1445,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             hostworkdir = root / "hostworkdir"
             release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
-            wheel_path = release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
             calls: list[tuple[list[str], dict[str, str] | None]] = []
 

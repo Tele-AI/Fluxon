@@ -186,13 +186,13 @@ class WheelRuntimeHelperTest(unittest.TestCase):
     def test_merge_binary_wheel_copies_runtime_payload_and_runtime_tag(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            pure_wheel = root / "fluxon-0.2.1-py3-none-any.whl"
+            pure_wheel = root / "fluxon_ai-0.2.1-py3-none-any.whl"
             runtime_wheel = root / "fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
-            output_wheel = root / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            output_wheel = root / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
 
             pure_src = root / "pure_src"
             pure_pkg = pure_src / "fluxon_py"
-            pure_dist = pure_src / "fluxon-0.2.1.dist-info"
+            pure_dist = pure_src / "fluxon_ai-0.2.1.dist-info"
             pure_pkg.mkdir(parents=True)
             pure_dist.mkdir(parents=True)
             (pure_pkg / "__init__.py").write_text("__version__ = '0.2.1'\n", encoding="utf-8")
@@ -201,7 +201,7 @@ class WheelRuntimeHelperTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (pure_dist / "METADATA").write_text(
-                "Metadata-Version: 2.1\nName: fluxon\nVersion: 0.2.1\n",
+                "Metadata-Version: 2.1\nName: fluxon-ai\nVersion: 0.2.1\n",
                 encoding="utf-8",
             )
             _WHEEL_HELPER.create_wheel(str(pure_wheel), str(pure_src))
@@ -236,7 +236,7 @@ class WheelRuntimeHelperTest(unittest.TestCase):
                 self.assertEqual(zip_ref.read("fluxon_py/__init__.py").decode("utf-8"), "__version__ = '0.2.1'\n")
                 self.assertEqual(zip_ref.read("fluxon_pyo3/fluxon_pyo3.abi3.so"), b"runtime-so")
                 self.assertEqual(zip_ref.read("fluxon_pyo3.libs/libruntime.so"), b"runtime-lib")
-                wheel_text = zip_ref.read("fluxon-0.2.1.dist-info/WHEEL").decode("utf-8")
+                wheel_text = zip_ref.read("fluxon_ai-0.2.1.dist-info/WHEEL").decode("utf-8")
                 self.assertIn("Root-Is-Purelib: false", wheel_text)
                 self.assertIn("Tag: cp38-abi3-manylinux_2_28_x86_64", wheel_text)
 

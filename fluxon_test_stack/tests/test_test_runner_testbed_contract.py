@@ -1360,7 +1360,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
             release_root = root / "release_root"
             release_root.mkdir()
-            wheel_name = "fluxon-0.2.1-py3-none-any.whl"
+            wheel_name = "fluxon_ai-0.2.1-py3-none-any.whl"
             (release_root / wheel_name).write_text("wheel\n", encoding="utf-8")
             (release_root / "install.py").write_text("print('install')\n", encoding="utf-8")
             (release_root / "ext_images").mkdir()
@@ -1554,7 +1554,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     "case_id": "ci_top_attention_doc_page_build__n1_kvowner_dram_3gib__fluxon_tcp",
                 },
                 "artifact_set": {
-                    "release_artifacts": {"wheel": "fluxon-0.2.1-py3-none-any.whl"},
+                    "release_artifacts": {"wheel": "fluxon_ai-0.2.1-py3-none-any.whl"},
                     "test_rsc_artifacts": {
                         "ci_src_archive": "src_ci.tar.gz",
                         "ci_ext_rsc_archive": "fluxon_ci_ext_rsc.tar.gz",

@@ -326,7 +326,9 @@ jobs:
           import subprocess
           import sys
 
-          wheels = sorted(Path("fluxon_release").glob("fluxon-*.whl"))
+          from setup_and_pack.package_contract import RELEASE_WHEEL_GLOB
+
+          wheels = sorted(Path("fluxon_release").glob(RELEASE_WHEEL_GLOB))
           if len(wheels) != 1:
               raise SystemExit(f"expected exactly one packaged Fluxon wheel, found {len(wheels)}")
           subprocess.run(

@@ -500,7 +500,7 @@ def test_start_test_bed_release_scope_rejects_missing_ext_images_manifest_refere
     manifest_text = "\n".join(
         [
             "0" * 64 + "  ext_images.tar.gz",
-            "1" * 64 + "  fluxon-0.2.1-py3-none-any.whl",
+            "1" * 64 + "  fluxon_ai-0.2.1-py3-none-any.whl",
             "2" * 64 + "  fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
             "3" * 64 + "  pylib_src.tar.gz",
         ]
@@ -519,7 +519,7 @@ def test_start_test_bed_release_manifest_scope_contract_accepts_ext_manifest() -
     relpaths = [
         "ext_images.tar.gz",
         "ext_images/ext_images.sha256",
-        "fluxon-0.2.1-py3-none-any.whl",
+        "fluxon_ai-0.2.1-py3-none-any.whl",
         "fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
         "pylib_src.tar.gz",
     ]
@@ -548,7 +548,7 @@ def test_start_test_bed_release_scope_dispatches_ext_runtime_files_from_manifest
         tikv_dir.mkdir(parents=True, exist_ok=True)
         etcd_dir.mkdir(parents=True, exist_ok=True)
         (release_dir / "install.py").write_text("print('ok')\n", encoding="utf-8")
-        (release_dir / "fluxon-0.2.1-py3-none-any.whl").write_text("wheel\n", encoding="utf-8")
+        (release_dir / "fluxon_ai-0.2.1-py3-none-any.whl").write_text("wheel\n", encoding="utf-8")
         (release_dir / "fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl").write_text("wheel\n", encoding="utf-8")
         (release_dir / "pylib_src.tar.gz").write_text("tar\n", encoding="utf-8")
         (release_dir / "ext_images.tar.gz").write_text("tarball\n", encoding="utf-8")
@@ -562,7 +562,7 @@ def test_start_test_bed_release_scope_dispatches_ext_runtime_files_from_manifest
         ]
         (ext_dir / "ext_images.sha256").write_text("\n".join(ext_manifest_lines) + "\n", encoding="utf-8")
         release_manifest_lines = [
-            f"{'1'*64}  fluxon-0.2.1-py3-none-any.whl",
+            f"{'1'*64}  fluxon_ai-0.2.1-py3-none-any.whl",
             f"{'2'*64}  fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
             f"{'3'*64}  pylib_src.tar.gz",
             f"{'4'*64}  ext_images.tar.gz",
@@ -1050,7 +1050,7 @@ global_envs:
   FLUXON_CLUSTER_NAME: fluxon_testbed
   FLUXON_RELEASE_SHA256_FILE: fluxon_release.sha256
   FLUXON_RELEASE_PYLIB_SRC_TAR: pylib_src.tar.gz
-  FLUXON_RELEASE_WHEEL: fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
+  FLUXON_RELEASE_WHEEL: fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
 cluster_nodes:
   - hostname: infra44-ThinkStation-PX
     ip: 127.0.0.1
@@ -1285,7 +1285,7 @@ global_envs:
   FLUXON_CLUSTER_NAME: fluxon_testbed
   FLUXON_RELEASE_SHA256_FILE: fluxon_release.sha256
   FLUXON_RELEASE_PYLIB_SRC_TAR: pylib_src.tar.gz
-  FLUXON_RELEASE_WHEEL: fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
+  FLUXON_RELEASE_WHEEL: fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl
 cluster_nodes:
   - hostname: infra44-ThinkStation-PX
     ip: 127.0.0.1
