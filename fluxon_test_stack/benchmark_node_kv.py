@@ -581,10 +581,6 @@ def _empty_fluxon_phase_bucket_counts() -> Dict[str, int]:
     return {"ok": 0, "miss": 0, "timeout": 0, "error": 0}
 
 
-def _positive_ts_diff_us(later_ts_us: float, earlier_ts_us: float) -> float:
-    return max(0.0, float(later_ts_us) - float(earlier_ts_us))
-
-
 def _cross_process_ts_diff_us(
     later_ts_us: Optional[float],
     earlier_ts_us: Optional[float],
@@ -2807,6 +2803,12 @@ class KVBenchmarkBlockingStore:
                 self._put_confirmed_keys.add(key)
             self._put_dedupe_condition.notify_all()
 
+    @property
+    def kv_client(self) -> KvClient:
+        """Return the uniquely owned client for MQ and RPC control paths."""
+
+        return self._store
+
     def put_blocking(
         self,
         key: str,
@@ -3271,32 +3273,6 @@ class KVBenchmarkBlockingStore:
                 error_msg=f"GET exception: {exc}",
                 source_kind=None,
             )
-
-    def rpc_register(self, path: str, handler: Any) -> Any:
-        return self._store.rpc_register(path, handler)
-
-    def rpc_register_bytes(self, path: str, handler: Any) -> Any:
-        return self._store.rpc_register_bytes(path, handler)
-
-    def rpc_call(
-        self,
-        target_instance_key: str,
-        path: str,
-        payload: Dict[str, Any],
-        *,
-        timeout_ms: int,
-    ) -> Any:
-        return self._store.rpc_call(target_instance_key, path, payload, timeout_ms=timeout_ms)
-
-    def rpc_call_bytes(
-        self,
-        target_instance_key: str,
-        path: str,
-        payload: bytes,
-        *,
-        timeout_ms: int,
-    ) -> Any:
-        return self._store.rpc_call_bytes(target_instance_key, path, payload, timeout_ms=timeout_ms)
 
     def close(self) -> _SimpleResult:
         try:
@@ -4152,8 +4128,7 @@ def run_kv_worker(
                         ctx=ctx,
                     )
             else:
-                result = _build_operation_result(
-                    operation_result_cls,
+                result = operation_result_cls(
                     success=False,
                     latency_us=0.0,
                     operation_type="unknown",
@@ -4164,8 +4139,7 @@ def run_kv_worker(
                     error_msg=f"unsupported KV operation kind: {op_kind}",
                 )
         except Exception as exc:  # noqa: BLE001
-            result = _build_operation_result(
-                operation_result_cls,
+            result = operation_result_cls(
                 success=False,
                 latency_us=0.0,
                 operation_type="exception",

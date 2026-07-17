@@ -32,6 +32,9 @@ use tokio::sync::watch;
 use tracing::warn;
 
 const PRODUCE_OFFSET_ETCD_SLOW_WARN_THRESHOLD: Duration = Duration::from_secs(1);
+const PRODUCER_MEMBERSHIP_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const PRODUCER_MEMBERSHIP_RPC_ATTEMPTS: usize = 3;
+const PRODUCER_MEMBERSHIP_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProducerMemberMeta {
@@ -56,6 +59,190 @@ fn map_prefix_scan_error(err: EtcdPrefixScanError<MpscError>) -> MpscError {
         EtcdPrefixScanError::Get { source, .. } => MpscError::Etcd(source),
         EtcdPrefixScanError::Callback(source) => source,
     }
+}
+
+fn producer_membership_txn(
+    key: &str,
+    member_meta_bytes: &[u8],
+    member_lease_id: i64,
+    weight_key: &str,
+    weight_value: &str,
+    global_lease_id: i64,
+) -> etcd::Txn {
+    etcd::Txn::new()
+        .when(vec![etcd::Compare::create_revision(
+            key,
+            etcd::CompareOp::Equal,
+            0,
+        )])
+        .and_then(vec![
+            etcd::TxnOp::put(
+                key,
+                member_meta_bytes,
+                Some(etcd::PutOptions::new().with_lease(member_lease_id)),
+            ),
+            etcd::TxnOp::put(
+                weight_key,
+                weight_value,
+                Some(etcd::PutOptions::new().with_lease(global_lease_id)),
+            ),
+        ])
+        .or_else(vec![
+            etcd::TxnOp::get(key, None),
+            etcd::TxnOp::get(weight_key, None),
+        ])
+}
+
+fn existing_producer_membership_matches(
+    txn_res: &etcd::TxnResponse,
+    member_meta_bytes: &[u8],
+    member_lease_id: i64,
+    weight_value: &str,
+    global_lease_id: i64,
+) -> Result<bool> {
+    let responses = txn_res.op_responses();
+    let [etcd::TxnOpResponse::Get(member_get), etcd::TxnOpResponse::Get(weight_get)] =
+        responses.as_slice()
+    else {
+        anyhow::bail!(
+            "producer membership conflict returned an invalid response shape: operations={}",
+            responses.len()
+        );
+    };
+
+    let member_kvs = member_get.kvs();
+    let weight_kvs = weight_get.kvs();
+    if member_kvs.is_empty() && weight_kvs.is_empty() {
+        return Ok(false);
+    }
+    if member_kvs.len() == 1
+        && weight_kvs.len() == 1
+        && member_kvs[0].value() == member_meta_bytes
+        && member_kvs[0].lease() == member_lease_id
+        && weight_kvs[0].value() == weight_value.as_bytes()
+        && weight_kvs[0].lease() == global_lease_id
+    {
+        return Ok(true);
+    }
+
+    anyhow::bail!(
+        "producer membership key already exists with conflicting state: member_count={} weight_count={}",
+        member_kvs.len(),
+        weight_kvs.len()
+    )
+}
+
+async fn cleanup_producer_membership(
+    client: &mut etcd::Client,
+    key: &str,
+    weight_key: &str,
+) -> Result<()> {
+    let mut last_error = String::new();
+    for attempt in 1..=PRODUCER_MEMBERSHIP_RPC_ATTEMPTS {
+        let txn = etcd::Txn::new().and_then(vec![
+            etcd::TxnOp::delete(key, None),
+            etcd::TxnOp::delete(weight_key, None),
+        ]);
+        match tokio::time::timeout(PRODUCER_MEMBERSHIP_RPC_TIMEOUT, client.txn(txn)).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(err)) => last_error = err.to_string(),
+            Err(_) => {
+                last_error = format!(
+                    "request timed out after {} ms",
+                    PRODUCER_MEMBERSHIP_RPC_TIMEOUT.as_millis()
+                )
+            }
+        }
+        if attempt < PRODUCER_MEMBERSHIP_RPC_ATTEMPTS {
+            tokio::time::sleep(PRODUCER_MEMBERSHIP_RETRY_DELAY).await;
+        }
+    }
+    anyhow::bail!(
+        "failed to delete producer membership and weight keys {}, {} after {} attempts: {}",
+        key,
+        weight_key,
+        PRODUCER_MEMBERSHIP_RPC_ATTEMPTS,
+        last_error
+    )
+}
+
+async fn publish_producer_membership(
+    client: &mut etcd::Client,
+    key: &str,
+    member_meta_bytes: &[u8],
+    member_lease_id: i64,
+    weight_key: &str,
+    weight_value: &str,
+    global_lease_id: i64,
+    shutdown: &ShutdownCtl,
+) -> Result<()> {
+    let mut last_error = String::new();
+    let mut request_started = false;
+    for attempt in 1..=PRODUCER_MEMBERSHIP_RPC_ATTEMPTS {
+        if shutdown.is_closed() {
+            if request_started {
+                cleanup_producer_membership(client, key, weight_key).await?;
+            }
+            anyhow::bail!("producer binding stopped by shutdown during membership publish");
+        }
+
+        request_started = true;
+        let txn = producer_membership_txn(
+            key,
+            member_meta_bytes,
+            member_lease_id,
+            weight_key,
+            weight_value,
+            global_lease_id,
+        );
+        match tokio::time::timeout(PRODUCER_MEMBERSHIP_RPC_TIMEOUT, client.txn(txn)).await {
+            Ok(Ok(txn_res)) if txn_res.succeeded() => return Ok(()),
+            Ok(Ok(txn_res)) => match existing_producer_membership_matches(
+                &txn_res,
+                member_meta_bytes,
+                member_lease_id,
+                weight_value,
+                global_lease_id,
+            ) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    last_error = "membership disappeared while reconciling a retry".to_string()
+                }
+                Err(conflict) => return Err(conflict),
+            },
+            Ok(Err(err)) => last_error = err.to_string(),
+            Err(_) => {
+                last_error = format!(
+                    "request timed out after {} ms",
+                    PRODUCER_MEMBERSHIP_RPC_TIMEOUT.as_millis()
+                )
+            }
+        }
+
+        warn!(
+            chan_membership_key = key,
+            attempt,
+            total = PRODUCER_MEMBERSHIP_RPC_ATTEMPTS,
+            error = %last_error,
+            "producer membership publish did not complete; retrying"
+        );
+        if attempt < PRODUCER_MEMBERSHIP_RPC_ATTEMPTS {
+            tokio::time::sleep(PRODUCER_MEMBERSHIP_RETRY_DELAY).await;
+        }
+    }
+
+    let cleanup = cleanup_producer_membership(client, key, weight_key).await;
+    anyhow::bail!(
+        "failed to publish producer membership and weight keys {}, {} after {} attempts: {}; cleanup={}",
+        key,
+        weight_key,
+        PRODUCER_MEMBERSHIP_RPC_ATTEMPTS,
+        last_error,
+        match cleanup {
+            Ok(()) => "ok".to_string(),
+            Err(err) => err.to_string(),
+        }
+    )
 }
 
 /// MPSC channel producer binding helper.
@@ -108,6 +295,10 @@ impl MpscProducer {
         observe_node_role: String,
         observe: ObserveMetricsHandle,
     ) -> Result<Self> {
+        if shutdown.is_closed() {
+            anyhow::bail!("producer binding stopped by shutdown before it started");
+        }
+
         if let Some(id) = external_client_id.as_deref() {
             if id.trim().is_empty() {
                 anyhow::bail!("external_client_id must be a non-empty string when provided");
@@ -136,8 +327,14 @@ impl MpscProducer {
 
         // 1) Ensure channel meta exists (mirror Python ChanManager.bind step 1)
         let mut meta_client = chan_mgr.etcd_client();
-        let _meta = get_chan_meta(&mut meta_client, chan_id)
-            .await
+        let meta_result = tokio::select! {
+            biased;
+            _ = shutdown.wait_closed() => {
+                anyhow::bail!("producer binding stopped by shutdown while loading channel metadata");
+            }
+            result = get_chan_meta(&mut meta_client, chan_id) => result,
+        };
+        let _meta = meta_result
             .with_context(|| format!("channel meta not found for chan_id={}", chan_id))?;
 
         // 2) Reuse ChanManager's member lease instead of creating a
@@ -176,54 +373,36 @@ impl MpscProducer {
         let member_meta_bytes = serde_json::to_vec(&member_meta)
             .map_err(|e| anyhow::anyhow!("serialize ProducerMemberMeta failed: {}", e))?;
 
-        let compares = vec![
-            etcd::Compare::create_revision(aborted_key.clone(), etcd::CompareOp::Equal, 0),
-            etcd::Compare::create_revision(meta_key.clone(), etcd::CompareOp::Greater, 0),
-            etcd::Compare::create_revision(key.clone(), etcd::CompareOp::Equal, 0),
-        ];
-        let put_op = etcd::TxnOp::put(
-            key.clone(),
-            member_meta_bytes,
-            Some(etcd::PutOptions::new().with_lease(member_lease_id)),
-        );
-        let txn = etcd::Txn::new().when(compares).and_then(vec![put_op]);
-        let txn_res = client
-            .txn(txn)
-            .await
-            .with_context(|| format!("failed to bind producer membership key {}", key))?;
-        if !txn_res.succeeded() {
-            anyhow::bail!(
-                "producer membership bind rejected for key {}: channel aborted, meta missing, or membership already exists",
-                key
-            );
+        if shutdown.is_closed() {
+            anyhow::bail!("producer binding stopped by shutdown before membership publish");
         }
 
-        // 4) Optionally write producer weight (default 1)，挂在
-        // channel 级别的 global lease 上，生命周期与全局 chan 一致。
         let weight = weight.unwrap_or(1);
+        let weight_value = weight.to_string();
         let weight_key = keys::etcd_producer_weight_key(chan_id, &producer_idx);
         let global_lease_id = chan_mgr.global_lease.id() as i64;
-        let weight_compares = vec![
-            etcd::Compare::create_revision(aborted_key, etcd::CompareOp::Equal, 0),
-            etcd::Compare::create_revision(meta_key, etcd::CompareOp::Greater, 0),
-            etcd::Compare::create_revision(key.clone(), etcd::CompareOp::Greater, 0),
-        ];
-        let put_weight = etcd::TxnOp::put(
-            weight_key.clone(),
-            weight.to_string(),
-            Some(etcd::PutOptions::new().with_lease(global_lease_id)),
-        );
-        let weight_txn = etcd::Txn::new()
-            .when(weight_compares)
-            .and_then(vec![put_weight]);
-        let weight_txn_res = client
-            .txn(weight_txn)
-            .await
-            .with_context(|| format!("failed to write producer weight key {}", weight_key))?;
-        if !weight_txn_res.succeeded() {
+        publish_producer_membership(
+            &mut client,
+            &key,
+            &member_meta_bytes,
+            member_lease_id,
+            &weight_key,
+            &weight_value,
+            global_lease_id,
+            &shutdown,
+        )
+        .await?;
+
+        if shutdown.is_closed() {
+            let cleanup = cleanup_producer_membership(&mut client, &key, &weight_key).await;
             anyhow::bail!(
-                "producer weight write rejected for key {}: channel aborted, meta missing, or membership missing",
-                weight_key.clone(),
+                "producer binding stopped by shutdown after membership publish; cleanup for {}, {}: {}",
+                key,
+                weight_key,
+                match cleanup {
+                    Ok(()) => "ok".to_string(),
+                    Err(err) => err.to_string(),
+                }
             );
         }
 

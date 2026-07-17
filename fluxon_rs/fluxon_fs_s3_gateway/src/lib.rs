@@ -985,14 +985,6 @@ impl GatewayState {
         Ok(Some(export))
     }
 
-    pub fn try_begin_transfer_scan_job(&self, job_id: &str) -> bool {
-        self.transfer_scan_scheduler.try_begin_scan_job(job_id)
-    }
-
-    pub fn finish_transfer_scan_job(&self, job_id: &str) {
-        self.transfer_scan_scheduler.finish_scan_job(job_id);
-    }
-
     pub fn transfer_job_live_detail_snapshot(
         &self,
         job_id: &str,
@@ -1922,7 +1914,7 @@ fn load_permission_list_from_db(
     conn: &Connection,
 ) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
     let model = load_access_model_from_db(conn)?;
-    permission_list_from_access_model(&model)
+    s3_permission_list_from_access_model(&model)
 }
 
 fn load_or_bootstrap_permission_list_from_db(
@@ -1940,9 +1932,9 @@ fn persist_access_model_to_db(
     conn: &mut Connection,
     model: &AccessModel,
 ) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
-    let permission_list = permission_list_from_access_model(model)?;
-    let normalized_model = access_model_from_permission_list(&permission_list)?;
-    let normalized_permission_list = permission_list_from_access_model(&normalized_model)?;
+    let permission_list = s3_permission_list_from_access_model(model)?;
+    let normalized_model = access_model_from_s3_permission_list(&permission_list)?;
+    let normalized_permission_list = s3_permission_list_from_access_model(&normalized_model)?;
     // English note: control-plane mutations rewrite the normalized access snapshot inside one
     // transaction. Data-plane authorization reads stay on the in-memory cache, so this does not
     // add per-request DB cost.
@@ -2010,7 +2002,7 @@ fn persist_permission_list_to_db(
     conn: &mut Connection,
     permission_list: &[FluxonFsS3PermissionAccount],
 ) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
-    let model = access_model_from_permission_list(permission_list)?;
+    let model = access_model_from_s3_permission_list(permission_list)?;
     persist_access_model_to_db(conn, &model)
 }
 
@@ -2672,18 +2664,6 @@ fn permission_rule_grants_read(rule: &fluxon_fs_core::config::FluxonFsS3Permissi
     permission_rule_has_action(rule, FluxonFsS3PermissionAction::All)
         || (permission_rule_has_action(rule, FluxonFsS3PermissionAction::ListBucket)
             && permission_rule_has_action(rule, FluxonFsS3PermissionAction::GetObject))
-}
-
-fn access_model_from_permission_list(
-    permission_list: &[FluxonFsS3PermissionAccount],
-) -> Result<AccessModel, String> {
-    access_model_from_s3_permission_list(permission_list)
-}
-
-fn permission_list_from_access_model(
-    model: &AccessModel,
-) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
-    s3_permission_list_from_access_model(model)
 }
 
 fn account_can_manage_permissions(account: &AuthAccount) -> bool {
@@ -10245,7 +10225,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             },
         ];
 
-        let model = super::access_model_from_permission_list(&permission_list).unwrap();
+        let model = super::access_model_from_s3_permission_list(&permission_list).unwrap();
         assert_eq!(
             model.users,
             vec![
@@ -10284,9 +10264,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             ]
         );
 
-        let roundtrip_permission_list = super::permission_list_from_access_model(&model).unwrap();
+        let roundtrip_permission_list =
+            super::s3_permission_list_from_access_model(&model).unwrap();
         let roundtrip_model =
-            super::access_model_from_permission_list(&roundtrip_permission_list).unwrap();
+            super::access_model_from_s3_permission_list(&roundtrip_permission_list).unwrap();
         assert_eq!(roundtrip_model, model);
     }
 
@@ -10300,8 +10281,9 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             }],
             scope_access: Vec::new(),
         };
-        let permission_list = super::permission_list_from_access_model(&model).unwrap();
-        let roundtrip_model = super::access_model_from_permission_list(&permission_list).unwrap();
+        let permission_list = super::s3_permission_list_from_access_model(&model).unwrap();
+        let roundtrip_model =
+            super::access_model_from_s3_permission_list(&permission_list).unwrap();
         assert_eq!(roundtrip_model.users, model.users);
         assert!(roundtrip_model.scope_access.is_empty());
     }

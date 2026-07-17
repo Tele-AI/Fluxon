@@ -18,7 +18,7 @@ class _PriorityItem:
 
 
 class TimedPriorityQueue:
-    """Priority queue that always returns the most recently scheduled channel."""
+    """Priority queue that returns the least recently scheduled channel."""
 
     def __init__(self, now: Optional[Callable[[], float]] = None) -> None:
         self._now = now or time.time
@@ -27,7 +27,7 @@ class TimedPriorityQueue:
         self._sequence = 0
 
     def update(self, chan_id: str, *, timestamp: Optional[float] = None) -> None:
-        """Push a fresh timestamp for ``chan_id`` onto the queue."""
+        """Push a fresh usage timestamp for ``chan_id`` onto the queue."""
 
         self._sequence += 1
         item = _PriorityItem(
@@ -37,6 +37,13 @@ class TimedPriorityQueue:
         )
         self._latest[chan_id] = item
         heapq.heappush(self._heap, item)
+
+    def ensure_tracked(self, chan_ids: Collection[str]) -> None:
+        """Start tracking channels that are not already in the queue."""
+
+        for chan_id in chan_ids:
+            if chan_id not in self._latest:
+                self.update(chan_id)
 
     def pop_ready(self, ready_channels: Collection[str]) -> Optional[str]:
         """Return the next ready channel or ``None`` if none available."""

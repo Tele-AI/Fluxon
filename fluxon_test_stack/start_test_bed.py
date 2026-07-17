@@ -27,12 +27,10 @@ DEPLOYMENT_UTILS_DIR = DEPLOYMENT_DIR / "utils"
 sys.path.insert(0, str(DEPLOYMENT_DIR))
 sys.path.insert(0, str(DEPLOYMENT_UTILS_DIR))
 import manual_dispatch_release
-from utils import log_shard
+import log_shard
 from selection_runtime import (
-    atomic_group_member_authority_name as _selection_atomic_group_member_authority_name,
     atomic_group_member_selection_workload_name as _selection_atomic_group_member_selection_workload_name,
     daemonset_selection_supervisor_label as _selection_daemonset_supervisor_label,
-    plain_selection_authority_name as _selection_plain_selection_authority_name,
     plain_selection_workload_name as _selection_plain_workload_name,
     resolve_coverage_selection_name as _selection_resolve_coverage_selection_name,
     resolve_selection_nodes as _selection_resolve_selection_nodes,
@@ -187,9 +185,9 @@ def main() -> None:
         )
         fixed_bootstrap_batches = _bootstrap_fixed_batches(bootstrap_phases)
         coverage_bootstrap_services = _bootstrap_coverage_services(bootstrap_phases)
-    deploy_workloads = _parse_name_list(
+    deploy_workloads = _require_list_of_str(
         config.get("deploy_workloads"),
-        field_name="deploy_workloads",
+        "deploy_workloads",
     )
     controller_url = _require_str(config.get("controller_url"), "controller_url").rstrip("/")
     _install_controller_basic_auth(
@@ -851,6 +849,7 @@ def _rewrite_same_host_local_multi_node_fixed_ports(
     _set_service_port(tikv_pd_cfg, port=plan["tikv_pd_port"])
     _set_service_port(tikv_cfg, port=plan["tikv_port"])
     _set_service_port(master_cfg, port=plan["master_port"])
+    _set_service_port(ops_controller_cfg, port=plan["ops_controller_http_port"])
 
     etcd_entrypoint = _require_str(etcd_cfg.get("entrypoint"), "deployconf.service.etcd.entrypoint")
     etcd_entrypoint = _replace_expected_substring(
@@ -879,9 +878,9 @@ def _rewrite_same_host_local_multi_node_fixed_ports(
     )
 
     master_entrypoint = _require_str(master_cfg.get("entrypoint"), "deployconf.service.master.entrypoint")
-    master_cfg["entrypoint"] = _replace_expected_substring(
+    master_cfg["entrypoint"] = _replace_expected_regex(
         value=master_entrypoint,
-        old="port: 51051",
+        pattern=r"(?m)^[ \t]*port:\s+\d+\s*$",
         new=f"port: {plan['master_port']}",
         ctx="deployconf.service.master.entrypoint port",
     )
@@ -895,6 +894,12 @@ def _rewrite_same_host_local_multi_node_fixed_ports(
         old="p2p_listen_port: 12102",
         new=f"p2p_listen_port: {plan['ops_controller_kv_p2p_port']}",
         ctx="deployconf.service.ops_controller.entrypoint kv p2p_listen_port",
+    )
+    ops_controller_cfg["entrypoint"] = _replace_expected_substring(
+        value=ops_controller_cfg["entrypoint"],
+        old='http_listen_addr: "0.0.0.0:${OPS_CONTROLLER__PORT}"',
+        new=f'http_listen_addr: "0.0.0.0:{plan["ops_controller_http_port"]}"',
+        ctx="deployconf.service.ops_controller.entrypoint http_listen_addr",
     )
 
     ops_agent_entrypoint = _require_str(
@@ -925,6 +930,7 @@ def _build_same_host_local_multi_node_port_plan(
         for idx in range(node_count)
     ]
     plan = {
+        "ops_controller_http_port": controller_port,
         "master_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_MASTER_PORT_OFFSET,
         "fs_master_panel_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_FS_MASTER_PANEL_PORT_OFFSET,
         "ops_controller_kv_p2p_port": controller_port + SAME_HOST_LOCAL_MULTI_NODE_OPS_CONTROLLER_KV_P2P_PORT_OFFSET,
@@ -940,6 +946,7 @@ def _build_same_host_local_multi_node_port_plan(
     max_port = max(
         int(plan["master_port"]),
         int(plan["fs_master_panel_port"]),
+        int(plan["ops_controller_http_port"]),
         int(plan["ops_controller_kv_p2p_port"]),
         int(plan["etcd_client_port"]),
         int(plan["etcd_peer_port"]),
@@ -993,6 +1000,15 @@ def _replace_expected_substring(*, value: str, old: str, new: str, ctx: str) -> 
     if new in value:
         return value
     raise ValueError(f"{ctx} missing expected fragment: {old!r}")
+
+
+def _replace_expected_regex(*, value: str, pattern: str, new: str, ctx: str) -> str:
+    replaced, count = re.subn(pattern, new, value, count=1)
+    if count == 1:
+        return replaced
+    if new in value:
+        return value
+    raise ValueError(f"{ctx} missing expected pattern: {pattern!r}")
 
 
 def _rewrite_ops_agent_case_ports(
@@ -1826,10 +1842,6 @@ def _bootstrap_coverage_services(bootstrap_phases: list[dict[str, Any]]) -> list
     return _dedup_str_list(out)
 
 
-def _parse_name_list(raw: Any, *, field_name: str) -> list[str]:
-    return _require_list_of_str(raw, field_name)
-
-
 def _resolve_local_node_cfg(cluster_nodes: dict[str, dict[str, Any]]) -> dict[str, Any]:
     local_nodes = [node_cfg for node_cfg in cluster_nodes.values() if _cluster_node_is_local(node_cfg)]
     if local_nodes:
@@ -2056,12 +2068,6 @@ def _resolve_service_nodes(*, services: dict[str, Any], service_name: str) -> li
     return _require_list_of_str(node_bind.get("node"), f"service.{service_name}.node_bind.node")
 
 
-def _resolve_selection_service_name(*, deployconf: dict[str, Any], selection_name: str) -> str:
-    return _selection_resolve_selection_service_name(
-        selection_name=selection_name,
-    )
-
-
 def _resolve_selection_nodes(*, deployconf: dict[str, Any], selection_name: str) -> list[str]:
     services = deployconf.get("service")
     if not isinstance(services, dict):
@@ -2238,7 +2244,7 @@ def _selection_member_keys(
             out.extend(_service_member_keys(service_name=service_name, nodes=eligible_nodes))
         return _dedup_str_list(out)
 
-    service_name = _resolve_selection_service_name(deployconf=deployconf, selection_name=selection_name)
+    service_name = _selection_resolve_selection_service_name(selection_name=selection_name)
     return _service_member_keys(service_name=service_name, nodes=nodes)
 
 
@@ -2975,7 +2981,7 @@ def _selection_service_names(*, deployconf: dict[str, Any], selection_name: str)
     group_cfg = atomic_groups.get(selection_name)
     if isinstance(group_cfg, dict):
         return _require_list_of_str(group_cfg.get("services"), f"atomic_groups.{selection_name}.services")
-    return [_resolve_selection_service_name(deployconf=deployconf, selection_name=selection_name)]
+    return [_selection_resolve_selection_service_name(selection_name=selection_name)]
 
 
 def _selection_service_names_for_target_node(
@@ -3013,7 +3019,7 @@ def _selection_bare_script_name(*, deployconf: dict[str, Any], selection_name: s
         raise ValueError("deployconf.atomic_groups must be a mapping")
     if selection_name in atomic_groups:
         return selection_name
-    return _resolve_selection_service_name(deployconf=deployconf, selection_name=selection_name)
+    return _selection_resolve_selection_service_name(selection_name=selection_name)
 
 
 def _bare_plain_selection_supervisor_identity(

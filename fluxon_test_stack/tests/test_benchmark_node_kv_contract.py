@@ -22,6 +22,8 @@ finally:
         if import_path in sys.path:
             sys.path.remove(import_path)
 
+from fluxon_py.api_error import OkNone, Result
+
 
 class _PutResult:
     def __init__(self, *, success: bool, error_msg: str | None = None) -> None:
@@ -308,6 +310,68 @@ class _FakeBenchmarkNode:
         if len(self.put_keys) <= 3:
             return _PutResult(success=True)
         return _PutResult(success=False, error_msg="StorageFullError: No space left")
+
+
+class _FakeFluxonStore:
+    def __init__(self) -> None:
+        self._client = object()
+        self.zero_contribution_checked = False
+        self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    def _record(self, name: str, *args: object, **kwargs: object) -> str:
+        self.calls.append((name, args, kwargs))
+        return f"{name}-result"
+
+    def put(self, *args: object, **kwargs: object) -> str:
+        return self._record("put", *args, **kwargs)
+
+    def get(self, *args: object, **kwargs: object) -> str:
+        return self._record("get", *args, **kwargs)
+
+    def get_size(self, *args: object, **kwargs: object) -> str:
+        return self._record("get_size", *args, **kwargs)
+
+    def is_exist(self, *args: object, **kwargs: object) -> str:
+        return self._record("is_exist", *args, **kwargs)
+
+    def remove(self, *args: object, **kwargs: object) -> str:
+        return self._record("remove", *args, **kwargs)
+
+    def sync_kv_to_file(self, *args: object, **kwargs: object) -> str:
+        return self._record("sync_kv_to_file", *args, **kwargs)
+
+    def instance_key(self) -> Result[str, object]:
+        return Result.new_ok("bench-instance")
+
+    def config(self) -> str:
+        return "bench-config"
+
+    def get_cluster_name(self) -> str:
+        return "fluxon_benchmark"
+
+    def get_etcd_config(self) -> list[str]:
+        return ["127.0.0.1:2379"]
+
+    def third_party_logs_dir(self) -> Result[str, object]:
+        return Result.new_ok("/tmp/fluxon-logs")
+
+    def ensure_zero_contribution_for_channel(self) -> None:
+        self.zero_contribution_checked = True
+
+    def count_prefix(self, prefix: str) -> Result[int, object]:
+        self.calls.append(("count_prefix", (prefix,), {}))
+        return Result.new_ok(3)
+
+    def allocate_lease(self, ttl_seconds: int) -> Result[int, object]:
+        self.calls.append(("allocate_lease", (ttl_seconds,), {}))
+        return Result.new_ok(42)
+
+    def keepalive_lease(self, lease_id: int) -> Result[OkNone, object]:
+        self.calls.append(("keepalive_lease", (lease_id,), {}))
+        return Result.new_ok(OkNone())
+
+    def close(self) -> Result[OkNone, object]:
+        return Result.new_ok(OkNone())
 
 
 class TestBenchmarkNodeKvContract(unittest.TestCase):
@@ -685,6 +749,22 @@ class TestBenchmarkNodeKvContract(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(node.put_keys, ["bench_k0", "bench_k1", "bench_k2", "bench_k3"])
         self.assertEqual(node.test_config["keyspace_size"], 3)
+
+
+class TestFluxonBlockingStoreContract(unittest.TestCase):
+    def test_channel_client_remains_the_typed_inner_owner(self) -> None:
+        raw_store = _FakeFluxonStore()
+        store = _KV.KVBenchmarkBlockingStore(
+            raw_store,  # type: ignore[arg-type]
+            backend_kind=_KV.BACKEND_KIND_FLUXON,
+            get_output=_KV.KVGetOutput.HOLDER,
+        )
+
+        self.assertIs(store.kv_client, raw_store)
+        self.assertFalse(hasattr(store, "_client"))
+        self.assertFalse(hasattr(store, "get_etcd_config"))
+        self.assertFalse(hasattr(store, "allocate_lease"))
+        self.assertFalse(hasattr(store, "rpc_call"))
 
 
 if __name__ == "__main__":

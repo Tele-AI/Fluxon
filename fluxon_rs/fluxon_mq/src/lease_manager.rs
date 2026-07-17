@@ -17,7 +17,8 @@ pub use fluxon_util::lease_manager::{debug_keepalive_log, get_register_by, recor
 
 // Re-export actor-based lease types
 pub use fluxon_util::lease_manager::{
-    GeneralLease, LeaseBackendHandle, LeaseBackendUid, LeaseRegisterKind, LeaseType, GLOBAL_LM,
+    GLOBAL_LM, GeneralLease, KvAllocateLease, KvKeepaliveLease, KvLeaseFuture, LeaseBackendHandle,
+    LeaseBackendUid, LeaseRegisterKind, LeaseType,
 };
 
 // Canonicalization is handled by LeaseBackendUid constructor.
@@ -32,7 +33,6 @@ pub fn register_etcd_lease(
     endpoints: EtcdEndpointSet,
     ttl_seconds: i64,
     lease_id: u64,
-    revoke_on_drop: bool,
 ) -> Result<lease_manager::GeneralLease> {
     let rth = rt.handle().clone();
     let outer = rt
@@ -44,7 +44,7 @@ pub fn register_etcd_lease(
                     uid,
                     ttl_seconds,
                     lease_id,
-                    lease_manager::LeaseRegisterKind::Etcd { revoke_on_drop },
+                    lease_manager::LeaseRegisterKind::Etcd,
                     rth,
                 )
                 .await?;

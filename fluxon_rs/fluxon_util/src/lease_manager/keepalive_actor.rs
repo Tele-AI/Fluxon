@@ -8,7 +8,7 @@ use etcd_client::{LeaseKeepAliveStream, LeaseKeeper};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::debug;
 
 /// Per-lease keepalive timeout budget for a single task.
@@ -28,16 +28,9 @@ pub(crate) const KEEPALIVE_PER_TASK_BUDGET_MS: u64 = 1500;
 
 /// Per-lease error log rate limit period for keepalive failures.
 ///
-/// 设计说明：
-/// - 单个 lease 在底层 etcd/kvclient 出现持续错误时，如果每次 tick
-///   都直接按错误路径完整打日志，很容易在高 QPS 或大量 lease 场景下
-///   把错误日志刷爆，并放大下游异常信号。
-/// - keepalive actor 的职责是“汇聚并驱动后台心跳”，这里的错误日志只
-///   需要起到“该 lease 正处于异常态”的告警作用，而不需要在每一次
-///   重试上都打印完整堆栈。
-/// - 因此这里按 lease 维度做一个简单的限频：同一个 lease 在该时间窗
-///   内的 keepalive 错误（包括超时、etcd stream 异常以及回调返回 Err）
-///   只允许打一条错误/告警日志，避免重复噪音，占用过多 I/O。
+/// Persistent backend failures can otherwise emit one full error per lease on
+/// every tick. Rate limiting retains the unhealthy-lease signal without
+/// amplifying log I/O at large scale.
 const KEEPALIVE_ERROR_LOG_PERIOD_SECS: u64 = 30;
 const KEEPALIVE_ERROR_LOG_SKIP_FIRST: bool = false;
 const KEEPALIVE_ERROR_LOG_KEY_PREFIX: &str = "lease_keepalive_error:";
@@ -267,7 +260,7 @@ pub struct LeaseKey {
 }
 
 impl LeaseKey {
-    fn new(backend_uid: LeaseBackendUid, lease_id: u64) -> Self {
+    pub(crate) fn new(backend_uid: LeaseBackendUid, lease_id: u64) -> Self {
         Self {
             backend_uid,
             lease_id,
@@ -293,6 +286,12 @@ pub(crate) struct OneTtlKeepAliveInner {
 
 impl OneTtlKeepAliveInner {}
 
+fn new_keepalive_ticker(period: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(Instant::now() + period, period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker
+}
+
 // Spawn the actor loop for a given inner. The loop exits when:
 // - `inner.stop` is true; or
 // - the registry is observed empty on a tick.
@@ -313,10 +312,21 @@ fn spawn_loop(rt: &tokio::runtime::Handle, inner: Arc<OneTtlKeepAliveInner>) {
         if period.as_millis() == 0 {
             period = Duration::from_secs(1);
         }
-        let mut ticker = tokio::time::interval(period);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Registration already validates an existing lease or follows a fresh grant.
+        // Start at the normal TTL cadence so a large batch does not open every
+        // keepalive stream twice immediately after registration.
+        let mut ticker = new_keepalive_ticker(period);
+        let mut retry_after_failure = false;
 
         loop {
+            if retry_after_failure {
+                // A short retry delay keeps failed leases responsive without turning
+                // a backend outage into a tight loop.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } else {
+                ticker.tick().await;
+            }
+
             type SnapItem = (LeaseKey, LeaseBackendHandle);
 
             // snapshot leases; if empty, exit
@@ -364,10 +374,8 @@ fn spawn_loop(rt: &tokio::runtime::Handle, inner: Arc<OneTtlKeepAliveInner>) {
             // Drive keepalive concurrently: spawn one task per lease and join them.
             // Any join failure is unexpected and should be treated as Unreachable.
             //
-            // IMPORTANT: bound the wait time for each keepalive task to avoid
-            // head-of-line blocking in this TTL bucket. If a task exceeds the
-            // budget, abort its join handle (the underlying work may still
-            // complete) and proceed to the next; the next tick will retry.
+            // Bound each keepalive task to avoid head-of-line blocking in this
+            // TTL bucket. Aborting drops the native async operation itself.
             let mut joins: Vec<(u64, tokio::task::JoinHandle<(u64, anyhow::Result<()>)>)> =
                 Vec::with_capacity(snapshot.len());
             for (key, handle) in snapshot.into_iter() {
@@ -433,23 +441,7 @@ fn spawn_loop(rt: &tokio::runtime::Handle, inner: Arc<OneTtlKeepAliveInner>) {
                 }
             }
 
-            if !exist_fail {
-                // Normal path: wait until the next tick according to the TTL-based period.
-                ticker.tick().await;
-            } else {
-                // Failure path: add a small fixed backoff to avoid a tight busy loop when
-                // the backend (etcd / kvclient / network) is already in a bad state.
-                //
-                // Design notes:
-                // - keepalive failures usually indicate downstream problems; immediately
-                //   retrying in a zero-interval loop would just hammer the failing system;
-                // - we choose a fixed, TTL-independent 100ms backoff so that even under
-                //   continuous failure we cap retries at ~10/s per TTL bucket instead of
-                //   spinning as fast as the CPU allows;
-                // - if we ever need more sophisticated backoff (exponential, error-class
-                //   dependent, etc.), this branch is the only place that needs to change.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            retry_after_failure = exist_fail;
         }
     });
 }
@@ -475,20 +467,17 @@ pub(crate) async fn ensure_inner_running(
 
 // unified backend object table now lives in lease_backend_handle.rs
 
-// No global kvclient closure registries here. KvClient callbacks live
-// inside `LeaseBackendUid::KvClientWithCallbacks` and are cloned by
-// the lease manager or provided during backend acquire.
+// Native Fluxon KV lease operations live inside `LeaseBackendUid`.
 
 // ---------- actor register / unregister (KvClient & Etcd) ----------
 #[allow(clippy::large_enum_variant)]
 pub enum ActorRegisterInvocation {
     KvClient {
-        cb: OnKeepalive,
+        keepalive: OnKeepalive,
         label: Option<String>,
     },
     Etcd {
         client: ManagedEtcdClient,
-        revoke_on_drop: bool,
     },
 }
 
@@ -512,4 +501,31 @@ pub fn actor_register_lease(
         },
         rt,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn periodic_keepalive_does_not_tick_immediately_after_registration() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let period = Duration::from_millis(200);
+            let mut ticker = new_keepalive_ticker(period);
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), ticker.tick())
+                    .await
+                    .is_err(),
+                "the first periodic keepalive must wait for its configured cadence"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(400), ticker.tick())
+                    .await
+                    .is_ok(),
+                "the first periodic keepalive must run after the cadence elapses"
+            );
+        });
+    }
 }

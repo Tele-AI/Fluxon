@@ -2,7 +2,6 @@ use pyo3::PyErr;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use fluxon_mq::MpscError as CoreMpscError;
 // Re-export the core MPSC error type for callers who want to depend on a single error hub.
 pub use fluxon_mq::MpscError as CoreMpscErrorReExport;
 
@@ -272,10 +271,6 @@ pub(crate) fn new_file_write_error(
     }
 
     error_class.call((), Some(&kwargs)).unwrap().into()
-}
-
-pub(crate) fn new_store_closed_error(py: Python<'_>, message: &str) -> PyObject {
-    new_api_error_base(py, "StoreClosedError", message)
 }
 
 pub(crate) fn new_result_success(py: Python<'_>, value: PyObject) -> PyObject {

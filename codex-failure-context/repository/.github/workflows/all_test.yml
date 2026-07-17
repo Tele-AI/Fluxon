@@ -1,0 +1,239 @@
+name: ci_2_virt_node
+
+on:
+  push:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  ci-2-virt-node:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Free hosted runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          tool-cache: false
+          swap-storage: false
+
+      - name: Scan and clean temporary data
+        run: >-
+          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_TEMP="$RUNNER_TEMP"
+          "$(command -v python3)"
+          scripts/ci_2_virt_node_workflow.py scan-and-clean-temp
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git \
+            pigz \
+            protobuf-compiler \
+            python3-venv \
+            rsync
+
+      - name: Verify Docker availability
+        run: |
+          command -v docker >/dev/null
+          if ! docker info >/dev/null 2>&1; then
+            sudo systemctl start docker
+            docker info >/dev/null
+          fi
+          docker version
+
+      - name: Install Python dependencies
+        run: python3 -m pip install PyYAML
+
+      - name: Sync rather_no_git_submodule workspace inputs
+        run: python3 fluxon_rs/scripts/rather_no_git_submodule.py
+
+      - name: Write ci_2_virt_node suite
+        run: |
+          python3 scripts/ci_2_virt_node_workflow.py write-suite \
+            --source fluxon_test_stack/ci_test_list.yaml \
+            --output "$RUNNER_TEMP/ci_test_list.ci.yaml" \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Run ci_2_virt_node full flow
+        run: |
+          set +e
+          timeout --preserve-status --signal=INT 17000s \
+            python3 fluxon_test_stack/ci_2_virt_node.py \
+              --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
+              --print-generated \
+              --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy"
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          echo "ci_2_virt_node failed or timed out before GitHub job cancellation: rc=$rc"
+          python3 scripts/ci_2_virt_node_workflow.py print-failure-diagnostics \
+            --workdir .dever/ci_2_virt_node/runner_run
+          exit "$rc"
+
+      - name: Normalize ci_2_virt_node debug artifact permissions
+        if: ${{ always() }}
+        run: |
+          chmod -R a+rX .dever || true
+          chmod -R a+rX fluxon_release || true
+          chmod -R a+rX setup_and_pack/nix/runs || true
+          find .dever -type f -name '*.yaml' -exec chmod a+r {} + || true
+          find .dever -type f -name '*.log' -exec chmod a+r {} + || true
+          find .dever -type f -name '*.json' -exec chmod a+r {} + || true
+          find .dever -type f -name '*.html' -exec chmod a+r {} + || true
+          find .dever -type f -name '*.txt' -exec chmod a+r {} + || true
+          find .dever -type f -name '*.sha256' -exec chmod a+r {} + || true
+          find .dever -type d -path '*/pack_release_runtime/*' -exec chmod a+rx {} + || true
+          find .dever -type d -path '*/pack_release_runtime/project-data/*' -exec chmod a+rx {} + || true
+          find .dever -path '*/pack_release_runtime/project-data/*' \
+            \( -path '*/instances/*/logs' -o -path '*/instances/*/release' -o -path '*/assemblies/*/profile' \) \
+            -exec chmod -R a+rX {} + || true
+
+      - name: Collect Codex failure-analysis context
+        if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+        run: |
+          python3 scripts/ci_codex_failure_analysis.py collect-context \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --runner-temp "$RUNNER_TEMP" \
+            --context-root "$RUNNER_TEMP/codex-failure-context"
+
+      - name: Upload Codex failure-analysis context
+        if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-failure-context-${{ github.run_id }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+          compression-level: 6
+          path: ${{ runner.temp }}/codex-failure-context/**
+
+      - name: Upload ci_2_virt_node debug artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-2-virt-node-debug-${{ github.sha }}
+          if-no-files-found: warn
+          include-hidden-files: true
+          compression-level: 1
+          path: |
+            .dever/**
+            fluxon_release/**
+            setup_and_pack/nix/runs/**
+            .dever/**/pack_release_runtime/project-data/**/instances/**/logs/**
+            .dever/**/pack_release_runtime/project-data/**/instances/**/release/**
+            .dever/**/pack_release_runtime/project-data/**/assemblies/**/profile/**
+
+  codex_failure_analysis:
+    name: Codex failure analysis
+    needs: ci-2-virt-node
+    if: ${{ always() && needs['ci-2-virt-node'].result == 'failure' && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+    environment: OPENAI_API_KEY
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      report: ${{ steps.run_codex.outputs.final-message }}
+    steps:
+      - name: Check out failed revision
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check OpenAI API configuration availability
+        id: api_config
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+        run: python3 scripts/ci_codex_failure_analysis.py check-api-config
+
+      - name: Fetch current and historical failure evidence
+        if: ${{ steps.api_config.outputs.available == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci_codex_failure_analysis.py fetch-evidence \
+            --repository "$GITHUB_REPOSITORY" \
+            --current-run-id "$GITHUB_RUN_ID" \
+            --current-context-artifact-name "codex-failure-context-$GITHUB_RUN_ID" \
+            --workflow-file all_test.yml \
+            --history-failure-limit 5 \
+            --artifact-wait-seconds 60 \
+            --artifact-poll-seconds 5 \
+            --context-root failure-context
+
+      - name: Build complete evidence inventory
+        if: ${{ steps.api_config.outputs.available == 'true' }}
+        run: >-
+          python3 scripts/ci_codex_failure_analysis.py build-inventory
+          --context-root failure-context
+
+      - name: Run Codex failure analysis
+        id: run_codex
+        if: ${{ steps.api_config.outputs.available == 'true' }}
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.11
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          responses-api-endpoint: ${{ format('{0}/responses', secrets.OPENAI_BASE_URL) }}
+          prompt-file: .github/codex/ci-failure-analysis-prompt.md
+          permission-profile: ":read-only"
+          safety-strategy: drop-sudo
+          effort: high
+
+  publish_codex_failure_report:
+    name: Publish Codex failure report
+    needs: codex_failure_analysis
+    if: ${{ always() && needs.codex_failure_analysis.result == 'success' && needs.codex_failure_analysis.outputs.report != '' }}
+    environment: OPENAI_API_KEY
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out failed revision
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Write report
+        env:
+          CODEX_REPORT: ${{ needs.codex_failure_analysis.outputs.report }}
+          FAILED_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+        run: |
+          python3 scripts/ci_codex_failure_analysis.py render-report \
+            --output codex-ci-failure-report.md \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Codex failure report
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-ci-failure-report-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 30
+          path: codex-ci-failure-report.md

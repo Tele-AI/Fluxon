@@ -141,8 +141,8 @@ def main() -> None:
             if shutdown_notified:
                 return
             shutdown_notified = True
-            logger.info(f"[producer] caught {reason}, requesting shutdown...")
-            producer.request_shutdown()
+            logger.info(f"[producer] caught {reason}, closing...")
+            _best_effort_close_result(producer, logger, "producer")
 
         restore_signal_listener = register_ctrlc_callback(_on_ctrlc, thread_name="test-mq-producer-signal")
         logger.info(f"[producer] joined mpmc_id={producer.get_chan_id()}, key={demo_cfg['key']}")
@@ -266,8 +266,8 @@ def main() -> None:
             if shutdown_notified:
                 return
             shutdown_notified = True
-            logger.info(f"[consumer] caught {reason}, requesting shutdown...")
-            consumer.request_shutdown()
+            logger.info(f"[consumer] caught {reason}, closing...")
+            _best_effort_close_result(consumer, logger, "consumer")
 
         restore_signal_listener = register_ctrlc_callback(_on_ctrlc, thread_name="test-mq-consumer-signal")
         logger.info(f"[consumer] joined mpmc_id={consumer.get_chan_id()}, key={demo_cfg['key']}")
@@ -929,7 +929,7 @@ def _run_consumer_sigint_after_producer_exit_case() -> None:
                 producer,
                 producer_output,
                 label="producer",
-                signal_needle="[producer] caught Ctrl-C, requesting shutdown...",
+                signal_needle="[producer] caught Ctrl-C, closing...",
                 other_proc_outputs={consumer: consumer_output},
             )
 
@@ -938,7 +938,7 @@ def _run_consumer_sigint_after_producer_exit_case() -> None:
                 consumer,
                 consumer_output,
                 label="consumer after producer exit",
-                signal_needle="[consumer] caught Ctrl-C, requesting shutdown...",
+                signal_needle="[consumer] caught Ctrl-C, closing...",
             )
         finally:
             _terminate_child(producer, producer_output)
@@ -965,12 +965,12 @@ def test_example_ctrl_c_exit() -> bool:
         _run_sigint_case(
             script_path=producer_script,
             ready_needle="[producer] joined mpmc_id=",
-            signal_needle="[producer] caught Ctrl-C, requesting shutdown...",
+            signal_needle="[producer] caught Ctrl-C, closing...",
         )
         _run_sigint_case(
             script_path=consumer_script,
             ready_needle="[consumer] joined mpmc_id=",
-            signal_needle="[consumer] caught Ctrl-C, requesting shutdown...",
+            signal_needle="[consumer] caught Ctrl-C, closing...",
         )
     _run_consumer_sigint_after_producer_exit_case()
     return True

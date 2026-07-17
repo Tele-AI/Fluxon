@@ -93,6 +93,7 @@ const EMBEDDED_LOG_SHARD_HELPER_SOURCE: &str =
 const OPS_USER_RPC_TIMEOUT_MS: u64 = user_rpc::USER_RPC_MIN_TIMEOUT_MS;
 const OPS_USER_RPC_TIMEOUT_GUARD_MARGIN_MS: u64 = 2_000;
 const OPS_AGENT_PULL_REPAIR_INTERVAL_MS: u64 = 5_000;
+const CURRENT_DEPLOYMENTS_STATUS_RPC_TIMEOUT_MS: u64 = 2_500;
 
 // Fixed wait bound when stopping a managed process before starting a new one.
 //
@@ -1833,10 +1834,20 @@ fn observe_selection_status_for_scope(
     authority: &str,
     scope_key: Option<&str>,
 ) -> anyhow::Result<SelectionSupervisorStatus> {
+    let snapshot = selection_supervisor_proc_snapshot()?;
+    observe_selection_status_for_scope_snapshot(&snapshot, kind, name, authority, scope_key)
+}
+
+fn observe_selection_status_for_scope_snapshot(
+    snapshot: &SelectionSupervisorProcSnapshot,
+    kind: WorkloadKind,
+    name: &str,
+    authority: &str,
+    scope_key: Option<&str>,
+) -> anyhow::Result<SelectionSupervisorStatus> {
     let name = validate_workload_name_for_file(name)?;
     let authority = validate_workload_name_for_file(authority)?;
     let label = selection_supervisor_label_from_workload_name(kind, name.as_str())?;
-    let snapshot = selection_supervisor_proc_snapshot()?;
     let owner = selection_owner_supervisor(&snapshot, label.as_str(), scope_key, None)?;
     let Some(owner) = owner else {
         let container_orphan_zombie_pids = container_orphan_zombie_pids(&snapshot);
@@ -2298,6 +2309,22 @@ impl SupervisorBackedWorkloads {
     }
 
     fn start(&self, req: StartReq) -> StartResp {
+        self.start_with_observation(req, None)
+    }
+
+    fn start_with_snapshot(
+        &self,
+        req: StartReq,
+        snapshot: &SelectionSupervisorProcSnapshot,
+    ) -> StartResp {
+        self.start_with_observation(req, Some(snapshot))
+    }
+
+    fn start_with_observation(
+        &self,
+        req: StartReq,
+        snapshot: Option<&SelectionSupervisorProcSnapshot>,
+    ) -> StartResp {
         let kind = req.kind;
         let name = req.name.trim().to_string();
         let authority = req.authority.trim().to_string();
@@ -2382,12 +2409,22 @@ impl SupervisorBackedWorkloads {
         let label = selection_supervisor_label_from_workload_name(kind, &name)
             .unwrap_or_else(|_| format!("{}/{}", kind.as_str(), name));
 
-        let current = match observe_selection_status_for_scope(
-            kind,
-            &name,
-            &authority,
-            Some(self.scope_key.as_str()),
-        ) {
+        let current = match snapshot {
+            Some(snapshot) => observe_selection_status_for_scope_snapshot(
+                snapshot,
+                kind,
+                &name,
+                &authority,
+                Some(self.scope_key.as_str()),
+            ),
+            None => observe_selection_status_for_scope(
+                kind,
+                &name,
+                &authority,
+                Some(self.scope_key.as_str()),
+            ),
+        };
+        let current = match current {
             Ok(v) => v,
             Err(e) => {
                 return StartResp {
@@ -4488,20 +4525,14 @@ async fn agent_pull_reconcile_tick(
     }
 
     plain.sort_by(|left, right| left.kind.cmp(&right.kind).then(left.name.cmp(&right.name)));
+    let plain_snapshot = if plain.is_empty() {
+        None
+    } else {
+        // Plain workload fan-out can be hundreds of benchmark workers on one host. Reusing one
+        // process snapshot keeps the reconcile tick from rebuilding /proc state per workload.
+        Some(selection_supervisor_proc_snapshot()?)
+    };
     for desired_workload in plain.iter() {
-        if desired_workload_recovery_superseded(workloads.as_ref(), desired_workload)? {
-            if should_log_tick {
-                eprintln!(
-                    "[ops_agent:pull_repair] skip superseded desired instance_key={} kind={} name={} apply_id={} owner_ts_ms={}",
-                    instance_key,
-                    desired_workload.kind.as_str(),
-                    desired_workload.name,
-                    desired_workload.apply_id,
-                    desired_workload.updated_ts_ms
-                );
-            }
-            continue;
-        }
         if should_log_tick {
             eprintln!(
                 "[ops_agent:pull_repair] start plain desired instance_key={} kind={} name={} apply_id={} owner_ts_ms={}",
@@ -4512,7 +4543,16 @@ async fn agent_pull_reconcile_tick(
                 desired_workload.updated_ts_ms
             );
         }
-        let resp = workloads.start(agent_desired_start_req(desired_workload, true));
+        // Plain workloads can be high-cardinality benchmark workers. Waiting for each worker to
+        // become attached here serializes /proc scans inside the pull-repair tick and can prevent
+        // a large apply from publishing all requested supervisors before the benchmark ready
+        // deadline. Publish the requested generation quickly; external deploy/status waits and
+        // the workload-level coordinator remain responsible for proving runtime readiness.
+        let start_req = agent_desired_start_req(desired_workload, false);
+        let resp = match plain_snapshot.as_ref() {
+            Some(snapshot) => workloads.start_with_snapshot(start_req, snapshot),
+            None => workloads.start(start_req),
+        };
         if !resp.ok {
             eprintln!(
                 "[ops_agent:pull_repair] start failed instance_key={} kind={} name={} apply_id={} err={}",
@@ -6225,10 +6265,11 @@ impl DesiredStore {
 
         let apply_path = desired_apply_record_file_path(&self.applies_dir, &apply_id)?;
         if tokio::fs::metadata(&apply_path).await.is_err() {
-            anyhow::bail!(
-                "apply record not found under desired/applies: apply_id={}",
-                apply_id
-            );
+            // Reconcile and wait_delete_apply share finalization ownership. Both
+            // may observe the same drained runtime before either acquires this
+            // persistence guard, so the second finalizer must accept absence as
+            // the already-completed state.
+            return Ok(Vec::new());
         }
 
         let removed: Vec<DesiredWorkload> = {
@@ -11500,6 +11541,7 @@ async fn controller_observe_apply_runtime_targets(
     let mut target_count = 0_u64;
     let mut matching_target_count = 0_u64;
     let mut pending: Vec<String> = Vec::new();
+    let mut status_rpc_failures_by_instance: BTreeMap<String, String> = BTreeMap::new();
     let mut ordered_workloads = desired_workloads.to_vec();
     ordered_workloads.sort_by(|left, right| desired_workload_delete_cmp(left, right));
 
@@ -11534,17 +11576,23 @@ async fn controller_observe_apply_runtime_targets(
                     apply_id, workload_key_text, target
                 )
             })?;
-            let status_resp = user_rpc_call_json::<StatusReq, StatusResp>(
-                state.fw.as_ref(),
-                &instance_key,
-                "fluxon_ops/status",
-                &StatusReq {
-                    kind: desired.kind,
-                    name: desired.name.clone(),
-                    authority: desired_workload_authority(&desired)?,
-                },
-            )
-            .await;
+            if let Some(previous_error) = status_rpc_failures_by_instance.get(&instance_key) {
+                pending.push(format!(
+                    "{}@{}:status_rpc_skipped_after_instance_failure:{}",
+                    workload_key_text, instance_key, previous_error
+                ));
+                continue;
+            }
+            let status_req = StatusReq {
+                kind: desired.kind,
+                name: desired.name.clone(),
+                authority: desired_workload_authority(&desired)?,
+            };
+            let status_resp =
+                controller_current_deployments_status_rpc(state, &instance_key, &status_req).await;
+            if let Err(e) = status_resp.as_ref() {
+                status_rpc_failures_by_instance.insert(instance_key.clone(), e.to_string());
+            }
 
             match goal {
                 ApplyRuntimeGoal::Attached => match status_resp {
@@ -11627,6 +11675,30 @@ async fn controller_observe_apply_runtime_targets(
         matching_target_count,
         pending,
     })
+}
+
+async fn controller_current_deployments_status_rpc(
+    state: &ControllerHttpState,
+    instance_key: &str,
+    req: &StatusReq,
+) -> anyhow::Result<StatusResp> {
+    tokio::time::timeout(
+        Duration::from_millis(CURRENT_DEPLOYMENTS_STATUS_RPC_TIMEOUT_MS),
+        user_rpc_call_json::<StatusReq, StatusResp>(
+            state.fw.as_ref(),
+            instance_key,
+            "fluxon_ops/status",
+            req,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "current_deployments status rpc timed out: instance_key={} timeout_ms={}",
+            instance_key,
+            CURRENT_DEPLOYMENTS_STATUS_RPC_TIMEOUT_MS
+        )
+    })?
 }
 
 fn controller_find_latest_successor_apply_for_delete(
@@ -15270,5 +15342,32 @@ mod tests {
                 offset: 4,
             })
         );
+    }
+
+    #[test]
+    fn remove_apply_accepts_an_already_finalized_record() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let td = tempfile::tempdir().unwrap();
+            let desired = DesiredStore::load(td.path().join("desired")).await.unwrap();
+            desired
+                .persist_apply_record(&DeployApplyRecord {
+                    id: "apply-1".to_string(),
+                    ts_ms: 1,
+                    deployment_yaml: "kind: Deployment\n".to_string(),
+                    namespace: None,
+                    deployment_yaml_sha256: sha256_hex(b"kind: Deployment\n"),
+                    lifecycle_phase: Some(ApplyLifecyclePhase::DeleteNotifying),
+                    lifecycle_phase_updated_ts_ms: Some(2),
+                })
+                .await
+                .unwrap();
+
+            assert!(desired.remove_apply("apply-1").await.unwrap().is_empty());
+            assert!(desired.remove_apply("apply-1").await.unwrap().is_empty());
+        });
     }
 }

@@ -852,10 +852,6 @@ impl ClientSegPool {
         Ok(())
     }
 
-    pub async fn register_segment_partials(&self) -> KvResult<()> {
-        self.register().await
-    }
-
     pub async fn publish_side_transfer_peer(&self) -> KvResult<()> {
         let inner = self.inner();
         if !inner.side_transfer_worker {
@@ -1063,7 +1059,7 @@ impl ClientSegPool {
         let inner = &self.0;
         if inner.cpu_allocated_mem.read().await.is_some() {
             tracing::info!("Client initialized with segments; registering local transfer segment");
-            self.register_segment_partials().await?;
+            self.register().await?;
             if inner.side_transfer_worker {
                 self.publish_side_transfer_peer().await?;
             }

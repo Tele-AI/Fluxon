@@ -458,20 +458,7 @@ fn verify_non_empty_root_path_list(paths: &[String], field_name: &str) -> KvResu
     Ok(out)
 }
 
-fn resolve_compiled_rdma_transfer_engine() -> KvResult<TransferEngineType> {
-    Ok(TransferEngineType::Closed)
-}
-
-fn resolve_transfer_engine_for_test_spec(
-    _test_spec_config: Option<&TestSpecConfig>,
-) -> KvResult<TransferEngineType> {
-    resolve_compiled_rdma_transfer_engine()
-}
-
-fn resolve_transfer_engine_for_protocol_and_test_spec(
-    protocol: &ProtocolConfig,
-    test_spec_config: Option<&TestSpecConfig>,
-) -> KvResult<TransferEngineType> {
+fn resolve_transfer_engine_for_protocol(protocol: &ProtocolConfig) -> KvResult<TransferEngineType> {
     if matches!(protocol.protocol_type, ProtocolType::Tcp) {
         return Err(ConfigError::InvalidClientConfig {
             detail:
@@ -480,7 +467,7 @@ fn resolve_transfer_engine_for_protocol_and_test_spec(
         }
         .into_kverror());
     }
-    resolve_transfer_engine_for_test_spec(test_spec_config)
+    Ok(TransferEngineType::Closed)
 }
 
 // Defaults for `monitoring.otlp_log_api`.
@@ -1355,7 +1342,7 @@ impl ClientConfigYaml {
         let transfer_engine = if is_side_transfer_worker {
             TransferEngineType::P2p
         } else {
-            resolve_transfer_engine_for_protocol_and_test_spec(&protocol, Some(&test_spec_config))?
+            resolve_transfer_engine_for_protocol(&protocol)?
         };
         let enable_transfer_rpc_fast_path = if is_side_transfer_worker {
             false
@@ -1796,8 +1783,7 @@ impl MasterConfigYaml {
             }),
             normalized_rdma_device_names.as_ref(),
         );
-        let transfer_engine =
-            resolve_transfer_engine_for_protocol_and_test_spec(&protocol, Some(&test_spec_config))?;
+        let transfer_engine = resolve_transfer_engine_for_protocol(&protocol)?;
 
         Ok(MasterConfig {
             instance_key: self.instance_key,

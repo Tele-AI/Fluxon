@@ -2988,7 +2988,7 @@ fn handle_s3_stage_object_to_kv(
         .map(|d| (d.as_nanos() as i128).min(i64::MAX as i128) as i64)
         .unwrap_or(0);
     let sig = fluxon_fs_core::s3_gateway::object_sig_string(size, mtime_ns);
-    let chunk_bytes = fluxon_fs_core::s3_gateway::FS_S3_OBJECT_CHUNK_BYTES as i64;
+    let chunk_bytes = fluxon_fs_core::s3_gateway::FS_S3_OBJECT_PIECE_BYTES as i64;
     let manifest_key = fluxon_fs_core::s3_gateway::kv_manifest_key(
         &exp.cache_kv_key_prefix,
         &export,
@@ -3138,7 +3138,7 @@ fn handle_s3_load_part_file_to_kv(
         }));
     }
 
-    let piece_bytes = fluxon_fs_core::s3_gateway::FS_S3_OBJECT_CHUNK_BYTES as i64;
+    let piece_bytes = fluxon_fs_core::s3_gateway::FS_S3_OBJECT_PIECE_BYTES as i64;
     let off = match piece_idx.checked_mul(piece_bytes) {
         Some(v) => v,
         None => {
@@ -3301,7 +3301,7 @@ fn handle_s3_load_part_file_range_to_kv(
         }));
     }
 
-    let piece_bytes = fluxon_fs_core::s3_gateway::FS_S3_OBJECT_CHUNK_BYTES as i64;
+    let piece_bytes = fluxon_fs_core::s3_gateway::FS_S3_OBJECT_PIECE_BYTES as i64;
     let start_off = match start_piece_idx.checked_mul(piece_bytes) {
         Some(v) => v,
         None => {

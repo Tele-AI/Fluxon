@@ -212,7 +212,7 @@ def merge_binary_wheel(
 
             pure_dist_info = _wheel_dist_info_dir(temp_dir)
             runtime_dist_info = _wheel_dist_info_dir(runtime_root)
-            runtime_wheel_text = _read_wheel_file(runtime_dist_info / "WHEEL")
+            runtime_wheel_text = (runtime_dist_info / "WHEEL").read_text(encoding="utf-8")
             pure_wheel_path = pure_dist_info / "WHEEL"
             pure_wheel_path.write_text(
                 _merge_wheel_file_text(
@@ -233,10 +233,6 @@ def _wheel_dist_info_dir(source_root: Path) -> Path:
     if len(dist_info_dirs) != 1:
         raise RuntimeError(f"expected exactly one dist-info directory, found {len(dist_info_dirs)} in {source_root}")
     return dist_info_dirs[0]
-
-
-def _read_wheel_file(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
 
 
 def _merge_wheel_file_text(pure_wheel_text: str, runtime_wheel_text: str) -> str:

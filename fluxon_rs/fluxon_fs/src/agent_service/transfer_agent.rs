@@ -2232,16 +2232,6 @@ fn build_symlink_collect_infos(
     }])
 }
 
-// Collect the full recursive subtree for one scan decision. Symlinks are not
-// followed; they are converted into collect-info records instead.
-fn collect_transfer_tree(
-    root_dir_abs: &str,
-    root_relpath: &str,
-    skip_entries: &[FluxonFsTransferSkipEntryWire],
-) -> Result<TransferTreeCollection, FlatDict> {
-    collect_transfer_tree_with_deadline(root_dir_abs, root_relpath, skip_entries, None)
-}
-
 fn collect_transfer_tree_with_deadline(
     root_dir_abs: &str,
     root_relpath: &str,
@@ -3519,15 +3509,11 @@ impl TransferWorkerRemoteControl {
         self.heartbeat.dedup_expire_unix_ms()
     }
 
-    fn before_heartbeat_retry_attempt(&self) -> Result<(), TransferWorkerExecutionError> {
-        self.heartbeat.before_heartbeat_retry_attempt()
-    }
-
     fn ensure_continue(&self, force: bool) -> Result<(), TransferWorkerExecutionError> {
         let mut last_warn: Option<Instant> = None;
         let mut attempt: u32 = 0;
         loop {
-            self.before_heartbeat_retry_attempt()?;
+            self.heartbeat.before_heartbeat_retry_attempt()?;
             let current_materialized_empty_dirs = self.progress.total_materialized_empty_dirs();
             match self.heartbeat.ensure_continue(
                 force,
@@ -3573,15 +3559,6 @@ impl TransferWorkerRemoteControl {
                 }
             }
         }
-    }
-
-    fn read_chunk_with_retry(
-        &self,
-        file: &FluxonFsTransferManifestEntryWire,
-        read_offset: i64,
-        length: i64,
-    ) -> Result<Vec<u8>, TransferWorkerExecutionError> {
-        self.read_chunk_via_stream_with_retry(file, read_offset, length)
     }
 
     fn open_stream_with_retry(
@@ -4006,7 +3983,7 @@ fn run_transfer_worker_background_task(
                 {
                     let control = control.clone();
                     move |file, read_offset, length| {
-                        control.read_chunk_with_retry(file, read_offset, length)
+                        control.read_chunk_via_stream_with_retry(file, read_offset, length)
                     }
                 },
             ) {
@@ -6388,8 +6365,13 @@ mod tests {
         write_file(&root, "root/a/x.bin", b"xx");
         fs::create_dir_all(root.path().join("root/a/empty")).unwrap();
 
-        let tree =
-            collect_transfer_tree(root.path().to_str().unwrap(), "root", &Vec::new()).unwrap();
+        let tree = collect_transfer_tree_with_deadline(
+            root.path().to_str().unwrap(),
+            "root",
+            &Vec::new(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             tree.files,
             vec![
@@ -6414,7 +6396,7 @@ mod tests {
         write_file(&root, "root/skipdir/a.bin", b"a");
         write_file(&root, "root/keep/skip.bin", b"s");
 
-        let tree = collect_transfer_tree(
+        let tree = collect_transfer_tree_with_deadline(
             root.path().to_str().unwrap(),
             "root",
             &vec![
@@ -6427,6 +6409,7 @@ mod tests {
                     relpath: "root/keep/skip.bin".to_string(),
                 },
             ],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -6448,8 +6431,13 @@ mod tests {
         write_symlink(&root, "root/link-file.bin", "real/file.bin");
         write_symlink(&root, "root/link-dir", "real/sub");
 
-        let tree =
-            collect_transfer_tree(root.path().to_str().unwrap(), "root", &Vec::new()).unwrap();
+        let tree = collect_transfer_tree_with_deadline(
+            root.path().to_str().unwrap(),
+            "root",
+            &Vec::new(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             tree.files,
             vec![

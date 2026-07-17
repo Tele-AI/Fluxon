@@ -9,22 +9,16 @@ use std::sync::Arc;
 pub enum LeaseEntryKind {
     // KvClient keepalive is driven by a backend handle carrying the closure.
     // Keepalive must only accept the lease id and must not mutate TTL.
-    KvClient {
-        handle: LeaseBackendHandle,
-    },
-    // Etcd keepalive uses per-lease EtcdState stored inside the backend handle;
-    // `revoke_on_drop` only influences drop behavior.
-    Etcd {
-        handle: LeaseBackendHandle,
-        revoke_on_drop: bool,
-    },
+    KvClient { handle: LeaseBackendHandle },
+    // Etcd keepalive uses per-lease EtcdState stored inside the backend handle.
+    // Dropping the entry only unregisters local keepalive; it never revokes.
+    Etcd { handle: LeaseBackendHandle },
 }
 
 pub(crate) struct LeaseEntry {
-    // No ref_count: user-side LeaseHandle/GeneralLease Drop must drive
-    // unregister, so a single logical registration corresponds to a single
-    // table entry. Duplicate registrations for the same key are treated as a
-    // logic error and ignored (we only keep the first one).
+    // No separate counter: user-side LeaseHandle/GeneralLease Drop releases its
+    // AutoCleanMapEntry guard. Registrations for the same key reuse the same
+    // table entry; the entry is removed after the last guard is dropped.
     pub(crate) kind: LeaseEntryKind,
     // Guard of `actor_map(): AutoCleanMap<i64, Arc<OneTtlKeepAliveInner>>`, keyed by `ttl_seconds`.
     // Holding this keeps the per-ttl actor (`OneTtlKeepAliveInner`) alive while entries exist.
@@ -70,16 +64,20 @@ impl GeneralLease {
 
 impl Drop for GeneralLease {
     fn drop(&mut self) {
-        // Instrument drop of the high-level lease handle so we can correlate
-        // who released the last user-visible handle.
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+
+        // Backtraces are useful for lifecycle diagnostics but are expensive in
+        // a large MPMC teardown, so capture them only when debug logging is on.
         let lease_id = self.id();
         let kind_str = match self.kind() {
             LeaseType::Etcd => "Etcd",
             LeaseType::KvClient => "KvClient",
         };
         let label = super::lifecycle::get_register_by(lease_id);
-        let bt = std::backtrace::Backtrace::force_capture();
-        tracing::info!(
+        let bt = std::backtrace::Backtrace::capture();
+        tracing::debug!(
             lease_id,
             kind = kind_str,
             label = %label.clone().unwrap_or_else(|| "".to_string()),
@@ -108,7 +106,7 @@ impl LeaseManager {
 
     /// Unified keepalive entrypoint: etcd leases go through the async keepalive
     /// pipeline; kvclient leases are registered into the same TTL actor with a
-    /// Rust callback carried by the backend uid.
+    /// native async operation carried by the backend uid.
     pub async fn register_lease_for_keepalive(
         &self,
         backend_uid: LeaseBackendUid,
@@ -121,11 +119,7 @@ impl LeaseManager {
             .await
     }
 
-    /// Allocate a kvclient lease id via the per-backend allocator closure
-    /// stored inside `LeaseBackendUid::KvClientWithCallbacks`.
-    ///
-    /// The callback may bridge into Python and block waiting for a result, so
-    /// we always isolate it in Tokio's blocking pool.
+    /// Allocate a Fluxon KV lease through the native async backend operation.
     pub async fn allocate_kvclient_lease(
         &self,
         backend_uid: LeaseBackendUid,
@@ -136,21 +130,13 @@ impl LeaseManager {
                 let cluster = backend_uid
                     .cluster()
                     .expect("kvclient backend missing cluster");
-                let cb = backend_uid.kv_allocate_cb().ok_or_else(|| {
+                let allocate = backend_uid.kv_allocate().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "kvclient allocate callback missing in LeaseBackendUid for cluster={}; construct kv backend via kv_client_with_callbacks()",
+                        "Fluxon KV allocate operation missing from lease backend for cluster={}",
                         cluster
                     )
                 })?;
-                match limit_thirdparty::tokio::task::spawn_blocking(move || cb(ttl_seconds)).await {
-                    Ok(Ok(id)) => Ok(id),
-                    Ok(Err(err)) => Err(err),
-                    Err(join_err) => Err(anyhow::anyhow!(
-                        "spawn_blocking join failed while allocating kvclient lease for cluster={}: {:?}",
-                        cluster,
-                        join_err
-                    )),
-                }
+                allocate(ttl_seconds).await
             }
             super::lease_backend_uid::LeaseType::Etcd => {
                 anyhow::bail!("allocate_kvclient_lease requires KvClient backend uid")

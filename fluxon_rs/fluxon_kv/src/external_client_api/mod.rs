@@ -41,6 +41,7 @@ use limit_thirdparty::tokio::time::sleep;
 use parking_lot::Mutex;
 use std::{
     fs::File,
+    future::Future,
     // path::PathBuf, // 不再使用PathBuf
     sync::{
         Arc, OnceLock, Weak,
@@ -66,6 +67,187 @@ const EXTERNAL_PUT_TRACE_LOG_WINDOW_SECS: u64 = 10;
 const EXTERNAL_INIT_CONTROL_PLANE_READY_TIMEOUT_SECS: u64 = 30;
 const EXTERNAL_INIT_CONTROL_PLANE_READY_POLL_MS: u64 = 100;
 const EXTERNAL_INIT_CONTROL_PLANE_READY_CONSECUTIVE_SUCCESSES: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerGenerationState {
+    Same,
+    Changed,
+    Absent,
+}
+
+#[derive(Debug, Default)]
+struct ExternalP2pRecoveryBudget {
+    attempts: usize,
+}
+
+impl ExternalP2pRecoveryBudget {
+    fn begin_attempt(&mut self) -> Option<usize> {
+        if self.attempts >= EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS {
+            return None;
+        }
+        self.attempts += 1;
+        Some(self.attempts)
+    }
+}
+
+fn classify_owner_generation(
+    previous_start_time: i64,
+    observed_start_time: Option<i64>,
+) -> OwnerGenerationState {
+    match observed_start_time {
+        Some(observed) if observed == previous_start_time => OwnerGenerationState::Same,
+        Some(_) => OwnerGenerationState::Changed,
+        None => OwnerGenerationState::Absent,
+    }
+}
+
+fn is_transient_peer_send_readiness_error(error: &crate::p2p::P2PError) -> bool {
+    matches!(
+        error,
+        crate::p2p::P2PError::NoConnectionReady { .. }
+            | crate::p2p::P2PError::NodeNotFound { .. }
+            | crate::p2p::P2PError::NodeNotConnected { .. }
+            | crate::p2p::P2PError::NodePortNotReady { .. }
+            | crate::p2p::P2PError::ConnectionError { .. }
+            | crate::p2p::P2PError::Timeout { .. }
+            | crate::p2p::P2PError::SendFailed { .. }
+            | crate::p2p::P2PError::StartServerError { .. }
+            | crate::p2p::P2PError::Iceoryx2TransportNotStarted {}
+    )
+}
+
+fn peer_send_readiness_timeout(
+    phase: &'static str,
+    target_role: &'static str,
+    logical_target: &str,
+    attempts: u64,
+    last_transient_error: Option<&str>,
+) -> KvError {
+    KvError::P2p(crate::p2p::P2PError::Timeout {
+        detail: format!(
+            "timed out waiting for external control-plane route during {phase}: target_role={target_role} target={logical_target} attempts={attempts} last_transient_error={last_transient_error:?}"
+        ),
+    })
+}
+
+async fn wait_for_peer_send_readiness<EnsureReady, EnsureReadyFuture>(
+    shutdown_poller: &fluxon_framework_compiled::shutdown::ShutdownPoller,
+    logical_target: &str,
+    target_role: &'static str,
+    phase: &'static str,
+    timeout_duration: Duration,
+    poll_interval: Duration,
+    required_consecutive_successes: usize,
+    mut ensure_ready: EnsureReady,
+) -> KvResult<()>
+where
+    EnsureReady: FnMut() -> EnsureReadyFuture,
+    EnsureReadyFuture: Future<Output = Result<(), crate::p2p::P2PError>>,
+{
+    assert!(
+        required_consecutive_successes > 0,
+        "peer readiness requires at least one successful observation"
+    );
+    let deadline = Instant::now() + timeout_duration;
+    let mut attempts = 0u64;
+    let mut consecutive_ready = 0usize;
+    let mut last_transient_error = None;
+
+    loop {
+        if !shutdown_poller.is_running() {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: format!(
+                    "external control-plane wait stopped during {phase}: target_role={target_role} target={logical_target}"
+                ),
+            }));
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(peer_send_readiness_timeout(
+                phase,
+                target_role,
+                logical_target,
+                attempts,
+                last_transient_error.as_deref(),
+            ));
+        }
+
+        let readiness = match tokio::time::timeout(remaining, ensure_ready()).await {
+            Ok(result) => result,
+            Err(_) => {
+                last_transient_error =
+                    Some("readiness check exceeded the route deadline".to_string());
+                return Err(peer_send_readiness_timeout(
+                    phase,
+                    target_role,
+                    logical_target,
+                    attempts,
+                    last_transient_error.as_deref(),
+                ));
+            }
+        };
+        attempts += 1;
+
+        match readiness {
+            Ok(()) => {
+                consecutive_ready += 1;
+                if consecutive_ready >= required_consecutive_successes {
+                    if attempts > required_consecutive_successes as u64 {
+                        tracing::info!(
+                            "external control-plane route ready: phase={} target_role={} target={} attempts={}",
+                            phase,
+                            target_role,
+                            logical_target,
+                            attempts,
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+            Err(error) if is_transient_peer_send_readiness_error(&error) => {
+                consecutive_ready = 0;
+                last_transient_error = Some(error.to_string());
+            }
+            Err(error) => return Err(KvError::from(error)),
+        }
+
+        if attempts == 1 || attempts % 20 == 0 {
+            tracing::info!(
+                "waiting for external control-plane route: phase={} target_role={} target={} attempts={} last_transient_error={:?}",
+                phase,
+                target_role,
+                logical_target,
+                attempts,
+                last_transient_error,
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(peer_send_readiness_timeout(
+                phase,
+                target_role,
+                logical_target,
+                attempts,
+                last_transient_error.as_deref(),
+            ));
+        }
+        sleep(poll_interval.min(remaining)).await;
+    }
+}
+
+fn ensure_external_put_loop_running(
+    shutdown_poller: &fluxon_framework_compiled::shutdown::ShutdownPoller,
+) -> KvResult<()> {
+    if shutdown_poller.is_running() {
+        return Ok(());
+    }
+
+    Err(KvError::Api(ApiError::SystemShutdown {
+        detail: "external put retry loop stopped during framework shutdown".to_string(),
+    }))
+}
 
 fn duration_to_i64_us(duration: std::time::Duration) -> i64 {
     duration.as_micros().min(i64::MAX as u128) as i64
@@ -504,6 +686,8 @@ impl ExternalClientApi {
             .set_self_sub_cluster(ext.initial_sub_cluster.get().unwrap().clone())
             .await
             .map_err(KvError::from)?;
+        ext.wait_initial_control_plane_ready("initial_attach")
+            .await?;
 
         {
             let view = ext.view.clone_view();
@@ -690,87 +874,21 @@ impl ExternalInner {
         target_role: &'static str,
         phase: &'static str,
     ) -> KvResult<()> {
-        let deadline =
-            Instant::now() + Duration::from_secs(EXTERNAL_INIT_CONTROL_PLANE_READY_TIMEOUT_SECS);
         let shutdown_poller = self.view.register_shutdown_poller();
-        let mut attempts = 0u64;
-        let mut consecutive_ready = 0usize;
-        let mut last_transient_err = None;
-
-        loop {
-            if !shutdown_poller.is_running() {
-                return Err(KvError::Api(ApiError::SystemShutdown {
-                    detail: format!(
-                        "external control-plane wait stopped during {phase}: target_role={target_role} target={logical_target}"
-                    ),
-                }));
-            }
-
-            let readiness = self
-                .view
-                .p2p_module()
-                .ensure_peer_send_ready(&logical_target.clone().into())
-                .await;
-            match readiness {
-                Ok(()) => {
-                    consecutive_ready += 1;
-                    if consecutive_ready >= EXTERNAL_INIT_CONTROL_PLANE_READY_CONSECUTIVE_SUCCESSES
-                    {
-                        if attempts > 0 {
-                            tracing::info!(
-                                "external control-plane route ready: phase={} target_role={} target={} attempts={}",
-                                phase,
-                                target_role,
-                                logical_target,
-                                attempts + 1,
-                            );
-                        }
-                        return Ok(());
-                    }
-                }
-                Err(err)
-                    if matches!(
-                        err,
-                        crate::p2p::P2PError::NoConnectionReady { .. }
-                            | crate::p2p::P2PError::NodeNotFound { .. }
-                            | crate::p2p::P2PError::NodeNotConnected { .. }
-                            | crate::p2p::P2PError::NodePortNotReady { .. }
-                            | crate::p2p::P2PError::ConnectionError { .. }
-                            | crate::p2p::P2PError::SendFailed { .. }
-                            | crate::p2p::P2PError::Iceoryx2TransportNotStarted {}
-                    ) =>
-                {
-                    consecutive_ready = 0;
-                    last_transient_err = Some(err.to_string());
-                }
-                Err(err) => return Err(KvError::from(err)),
-            }
-
-            attempts += 1;
-            if attempts == 1 || attempts % 20 == 0 {
-                tracing::info!(
-                    "waiting for external control-plane route: phase={} target_role={} target={} attempts={} last_transient_err={:?}",
-                    phase,
-                    target_role,
-                    logical_target,
-                    attempts,
-                    last_transient_err,
-                );
-            }
-
-            if Instant::now() >= deadline {
-                return Err(KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "timed out waiting for external control-plane route during {phase}: target_role={target_role} target={logical_target} attempts={attempts} last_transient_err={last_transient_err:?}"
-                    ),
-                }));
-            }
-
-            sleep(Duration::from_millis(
-                EXTERNAL_INIT_CONTROL_PLANE_READY_POLL_MS,
-            ))
-            .await;
-        }
+        wait_for_peer_send_readiness(
+            &shutdown_poller,
+            &logical_target,
+            target_role,
+            phase,
+            Duration::from_secs(EXTERNAL_INIT_CONTROL_PLANE_READY_TIMEOUT_SECS),
+            Duration::from_millis(EXTERNAL_INIT_CONTROL_PLANE_READY_POLL_MS),
+            EXTERNAL_INIT_CONTROL_PLANE_READY_CONSECUTIVE_SUCCESSES,
+            || {
+                let target = logical_target.clone().into();
+                async move { self.view.p2p_module().ensure_peer_send_ready(&target).await }
+            },
+        )
+        .await
     }
 
     fn maybe_log_external_put_trace_window(&self, sample: &TestPutPhaseTrace) {
@@ -826,14 +944,19 @@ impl ExternalInner {
         ))
     }
 
-    async fn owner_generation_changed_in_cluster(&self, prev_owner_start_time: i64) -> bool {
+    async fn owner_generation_state_in_cluster(
+        &self,
+        prev_owner_start_time: i64,
+    ) -> OwnerGenerationState {
         let Some(owner_id) = self.shared_storage_node_id().await else {
-            return false;
+            return OwnerGenerationState::Absent;
         };
-        self.view
+        let observed_start_time = self
+            .view
             .cluster_manager()
             .get_member_info_cached(&owner_id)
-            .is_some_and(|member| member.node_start_time != prev_owner_start_time)
+            .map(|member| member.node_start_time);
+        classify_owner_generation(prev_owner_start_time, observed_start_time)
     }
 
     async fn try_background_owner_remap_once(&self) -> KvResult<bool> {
@@ -977,29 +1100,84 @@ impl ExternalInner {
     }
 
     async fn recover_after_p2p_error(&self, prev_owner_start_time: &mut i64) -> KvResult<usize> {
-        if !self
-            .owner_generation_changed_in_cluster(*prev_owner_start_time)
-            .await
-        {
-            return match self.base_ptr().await {
-                Ok(addr) => Ok(addr),
-                Err(_) => {
+        let shutdown_poller = self.view.register_shutdown_poller();
+        let mut absent_polls = 0u64;
+
+        loop {
+            if !shutdown_poller.is_running() {
+                return Err(KvError::Api(ApiError::SystemShutdown {
+                    detail: "external P2P recovery stopped during framework shutdown".to_string(),
+                }));
+            }
+
+            if let Some((start_time, base_addr)) = self
+                .current_owner_base_if_advanced(*prev_owner_start_time)
+                .await
+            {
+                *prev_owner_start_time = start_time;
+                let owner_id = self.shared_storage_node_id().await.ok_or_else(|| {
+                    KvError::SharedMem(SharedMemError::NotConfigured {
+                        node_id: None,
+                        detail: Some(
+                            "owner id disappeared after owner generation advanced".to_string(),
+                        ),
+                    })
+                })?;
+                self.wait_peer_send_ready(owner_id, "owner", "p2p_recover_new_generation")
+                    .await?;
+                return Ok(base_addr);
+            }
+
+            match self
+                .owner_generation_state_in_cluster(*prev_owner_start_time)
+                .await
+            {
+                OwnerGenerationState::Same => {
+                    let base_addr = self.base_ptr().await?;
+                    let owner_id = self.shared_storage_node_id().await.ok_or_else(|| {
+                        KvError::SharedMem(SharedMemError::NotConfigured {
+                            node_id: None,
+                            detail: Some(
+                                "owner id unavailable during same-generation P2P recovery"
+                                    .to_string(),
+                            ),
+                        })
+                    })?;
+                    self.wait_peer_send_ready(owner_id, "owner", "p2p_recover_same_generation")
+                        .await?;
+                    return Ok(base_addr);
+                }
+                OwnerGenerationState::Changed => {
                     let path = self.share_mem_path();
-                    let (st, addr) = self
+                    let (start_time, base_addr) = self
                         .wait_owner_recover_only(&path, *prev_owner_start_time)
                         .await?;
-                    *prev_owner_start_time = st;
-                    Ok(addr)
+                    *prev_owner_start_time = start_time;
+                    let owner_id = self.shared_storage_node_id().await.ok_or_else(|| {
+                        KvError::SharedMem(SharedMemError::NotConfigured {
+                            node_id: None,
+                            detail: Some(
+                                "owner id unavailable after owner generation recovery".to_string(),
+                            ),
+                        })
+                    })?;
+                    self.wait_peer_send_ready(owner_id, "owner", "p2p_recover_new_generation")
+                        .await?;
+                    return Ok(base_addr);
                 }
-            };
+                OwnerGenerationState::Absent => {
+                    absent_polls += 1;
+                    if absent_polls == 1 || absent_polls % 25 == 0 {
+                        tracing::warn!(
+                            "external P2P recovery waiting for owner membership: previous_start_time={} polls={}",
+                            *prev_owner_start_time,
+                            absent_polls,
+                        );
+                    }
+                    sleep(Duration::from_millis(200)).await;
+                }
+            }
         }
-
-        let path = self.share_mem_path();
-        let (st, addr) = self
-            .wait_owner_recover_only(&path, *prev_owner_start_time)
-            .await?;
-        *prev_owner_start_time = st;
-        Ok(addr)
     }
 
     /// Wait for owner recovery until shared memory has been remapped and `owner_start_time`
@@ -1849,7 +2027,10 @@ key={}, attempt={}/{}, err={}",
         // Recoverable conditions:
         // - OwnerStartTimeMismatch (owner restarted)
         // - Any P2P transport error (owner offline / link down): NodeNotConnected, ConnectionError, Timeout, SendFailed, etc.
+        let shutdown_poller = self.view.register_shutdown_poller();
+        let mut p2p_recovery_budget = ExternalP2pRecoveryBudget::default();
         loop {
+            ensure_external_put_loop_running(&shutdown_poller)?;
             match self
                 .put_inner(
                     key,
@@ -1883,13 +2064,43 @@ key={}, attempt={}/{}, err={}",
                     }
                     // If P2P reports connectivity issues, re-check owner generation before retrying.
                     if matches!(&e, KvError::P2p(_)) {
+                        let Some(attempt) = p2p_recovery_budget.begin_attempt() else {
+                            tracing::warn!(
+                                "put: P2P recovery budget exhausted: key={} attempts={} err={}",
+                                key,
+                                EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS,
+                                e,
+                            );
+                            break Err(e);
+                        };
                         tracing::warn!(
-                            "put: P2P error (owner/link likely offline); retrying after owner-state recovery check: {}",
-                            e
+                            "put: P2P error; waiting for owner route before retry: key={} attempt={}/{} err={}",
+                            key,
+                            attempt,
+                            EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS,
+                            e,
                         );
-                        base_addr = self
+                        match self
                             .recover_after_p2p_error(&mut prev_owner_start_time)
-                            .await?;
+                            .await
+                        {
+                            Ok(recovered_base_addr) => base_addr = recovered_base_addr,
+                            Err(recovery_error)
+                                if matches!(
+                                    &recovery_error,
+                                    KvError::P2p(crate::p2p::P2PError::Timeout { .. })
+                                ) =>
+                            {
+                                tracing::warn!(
+                                    "put: owner route recovery timed out; returning original P2P error: key={} recovery_error={} original_error={}",
+                                    key,
+                                    recovery_error,
+                                    e,
+                                );
+                                break Err(e);
+                            }
+                            Err(recovery_error) => break Err(recovery_error),
+                        }
                         continue;
                     }
                     // Non-recoverable error: return immediately
@@ -1936,7 +2147,10 @@ key={}, attempt={}/{}, err={}",
             }
         };
 
+        let shutdown_poller = self.view.register_shutdown_poller();
+        let mut p2p_recovery_budget = ExternalP2pRecoveryBudget::default();
         loop {
+            ensure_external_put_loop_running(&shutdown_poller)?;
             match unsafe {
                 self.put_inner_flat_dict_ptrs(
                     key,
@@ -1971,13 +2185,43 @@ key={}, attempt={}/{}, err={}",
                         continue;
                     }
                     if matches!(&e, KvError::P2p(_)) {
+                        let Some(attempt) = p2p_recovery_budget.begin_attempt() else {
+                            tracing::warn!(
+                                "put_flat_dict_ptrs: P2P recovery budget exhausted: key={} attempts={} err={}",
+                                key,
+                                EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS,
+                                e,
+                            );
+                            break Err(e);
+                        };
                         tracing::warn!(
-                            "put_flat_dict_ptrs: P2P error (owner/link likely offline); retrying after owner-state recovery check: {}",
-                            e
+                            "put_flat_dict_ptrs: P2P error; waiting for owner route before retry: key={} attempt={}/{} err={}",
+                            key,
+                            attempt,
+                            EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS,
+                            e,
                         );
-                        base_addr = self
+                        match self
                             .recover_after_p2p_error(&mut prev_owner_start_time)
-                            .await?;
+                            .await
+                        {
+                            Ok(recovered_base_addr) => base_addr = recovered_base_addr,
+                            Err(recovery_error)
+                                if matches!(
+                                    &recovery_error,
+                                    KvError::P2p(crate::p2p::P2PError::Timeout { .. })
+                                ) =>
+                            {
+                                tracing::warn!(
+                                    "put_flat_dict_ptrs: owner route recovery timed out; returning original P2P error: key={} recovery_error={} original_error={}",
+                                    key,
+                                    recovery_error,
+                                    e,
+                                );
+                                break Err(e);
+                            }
+                            Err(recovery_error) => break Err(recovery_error),
+                        }
                         continue;
                     }
                     break Err(e);
@@ -2898,5 +3142,149 @@ impl LogicalModule for ExternalClientApi {
 
         tracing::info!("ExternalClientApi shutdown completed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ApiError, Duration, EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS, ExternalP2pRecoveryBudget,
+        Instant, KvError, OwnerGenerationState, classify_owner_generation,
+        ensure_external_put_loop_running, wait_for_peer_send_readiness,
+    };
+    use fluxon_framework_compiled::shutdown::ShutdownPoller;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn external_put_retry_loop_rejects_framework_shutdown() {
+        let shutdown_poller = ShutdownPoller::new();
+        assert!(ensure_external_put_loop_running(&shutdown_poller).is_ok());
+
+        shutdown_poller.shutdown();
+        let err = ensure_external_put_loop_running(&shutdown_poller)
+            .expect_err("external put retry loop must stop after framework shutdown");
+        assert!(matches!(err, KvError::Api(ApiError::SystemShutdown { .. })));
+    }
+
+    #[test]
+    fn owner_generation_state_distinguishes_absence_from_replacement() {
+        assert_eq!(
+            classify_owner_generation(17, Some(17)),
+            OwnerGenerationState::Same
+        );
+        assert_eq!(
+            classify_owner_generation(17, Some(18)),
+            OwnerGenerationState::Changed
+        );
+        assert_eq!(
+            classify_owner_generation(17, None),
+            OwnerGenerationState::Absent
+        );
+    }
+
+    #[test]
+    fn external_p2p_recovery_budget_is_bounded() {
+        let mut budget = ExternalP2pRecoveryBudget::default();
+        for expected in 1..=EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS {
+            assert_eq!(budget.begin_attempt(), Some(expected));
+        }
+        assert_eq!(budget.begin_attempt(), None);
+        assert_eq!(budget.begin_attempt(), None);
+    }
+
+    #[::tokio::test]
+    async fn peer_send_readiness_waits_for_two_stable_observations() {
+        let shutdown_poller = ShutdownPoller::new();
+        let checks = AtomicUsize::new(0);
+
+        wait_for_peer_send_readiness(
+            &shutdown_poller,
+            "owner-0",
+            "owner",
+            "test",
+            Duration::from_millis(100),
+            Duration::ZERO,
+            2,
+            || {
+                let check = checks.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if check < 2 {
+                        Err(crate::p2p::P2PError::NoConnectionReady {
+                            nodeid: "owner-0".to_string(),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .expect("route should become stable after two transient failures");
+
+        assert_eq!(checks.load(Ordering::SeqCst), 4);
+    }
+
+    #[::tokio::test]
+    async fn peer_send_readiness_has_a_deadline_and_no_busy_loop() {
+        let shutdown_poller = ShutdownPoller::new();
+        let checks = AtomicUsize::new(0);
+        let started_at = Instant::now();
+
+        let error = wait_for_peer_send_readiness(
+            &shutdown_poller,
+            "owner-0",
+            "owner",
+            "test_timeout",
+            Duration::from_millis(25),
+            Duration::from_millis(5),
+            2,
+            || {
+                checks.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(crate::p2p::P2PError::SendFailed {
+                        detail: "injected ICE route failure".to_string(),
+                    })
+                }
+            },
+        )
+        .await
+        .expect_err("permanently unavailable route must hit its deadline");
+
+        assert!(matches!(
+            error,
+            KvError::P2p(crate::p2p::P2PError::Timeout { detail })
+                if detail.contains("injected ICE route failure")
+        ));
+        assert!(checks.load(Ordering::SeqCst) <= 6);
+        assert!(started_at.elapsed() < Duration::from_millis(250));
+    }
+
+    #[::tokio::test]
+    async fn peer_send_readiness_stops_before_checking_after_shutdown() {
+        let shutdown_poller = ShutdownPoller::new();
+        shutdown_poller.shutdown();
+        let checks = AtomicUsize::new(0);
+
+        let error = wait_for_peer_send_readiness(
+            &shutdown_poller,
+            "owner-0",
+            "owner",
+            "test_shutdown",
+            Duration::from_secs(1),
+            Duration::ZERO,
+            1,
+            || {
+                checks.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .expect_err("shutdown must stop route readiness checks");
+
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            error,
+            KvError::Api(ApiError::SystemShutdown { .. })
+        ));
     }
 }

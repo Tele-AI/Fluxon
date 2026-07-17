@@ -435,7 +435,7 @@ impl KvError {
         })
     }
 
-    /// Back-compat convenience: map to unified numeric error code
+    /// Map every error category to the unified numeric error code.
     pub fn code(&self) -> ErrorCode {
         match self {
             KvError::Api(v) => v.code(),

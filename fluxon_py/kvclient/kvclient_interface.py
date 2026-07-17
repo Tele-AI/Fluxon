@@ -11,14 +11,123 @@ client layer:
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional, Tuple, Union, List, Dict
 from concurrent.futures import Future
+from enum import Enum
+import threading
+import weakref
 
-from ..api_error import ApiError, Result, OkNone
+from ..api_error import ApiError, GeneralError, Result, OkNone
 from ..config import FluxonKvClientConfig
 from .factory_only import FactoryOnly
 from dataclasses import dataclass
 from .nonzerocopy_encode import DLPacked, decode_flat_kv_dict, encode_flat_kv_dict
 
 FlatDict = Dict[str, Union[int, float, bool, str, bytes, DLPacked]]
+
+
+class _KvCloseRegistryState(Enum):
+    OPEN = "open"
+    CLOSING = "closing"
+    CLOSED = "closed"
+
+
+class KvCloseRegistration:
+    """Registration token for one child owned by a KvClient lifecycle."""
+
+    def __init__(
+        self,
+        registry: Optional["_KvChildCloseRegistry"],
+        callback_id: Optional[int],
+    ) -> None:
+        self._registry = registry
+        self._callback_id = callback_id
+
+    @classmethod
+    def noop(cls) -> "KvCloseRegistration":
+        return cls(None, None)
+
+    def unregister(self) -> None:
+        registry = self._registry
+        callback_id = self._callback_id
+        if registry is None or callback_id is None:
+            return
+        registry.unregister(callback_id)
+        self._registry = None
+        self._callback_id = None
+
+
+class _KvChildCloseRegistry:
+    """Linearize child registration against parent KvClient shutdown."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state = _KvCloseRegistryState.OPEN
+        self._next_callback_id = 0
+        self._callbacks: Dict[int, weakref.WeakMethod] = {}
+
+    def register(
+        self,
+        callback: Callable[[], Result[OkNone, ApiError]],
+    ) -> KvCloseRegistration:
+        try:
+            callback_ref = weakref.WeakMethod(callback)
+        except TypeError as exc:
+            raise TypeError(
+                "KvClient child close callback must be a bound method"
+            ) from exc
+
+        with self._lock:
+            if self._state is not _KvCloseRegistryState.OPEN:
+                raise RuntimeError(
+                    "KvClient is closing; new child close callbacks are rejected"
+                )
+            callback_id = self._next_callback_id
+            self._next_callback_id += 1
+            self._callbacks[callback_id] = callback_ref
+        return KvCloseRegistration(self, callback_id)
+
+    def unregister(self, callback_id: int) -> None:
+        with self._lock:
+            self._callbacks.pop(callback_id, None)
+
+    def close_children(self) -> Result[OkNone, ApiError]:
+        with self._lock:
+            if self._state is _KvCloseRegistryState.CLOSED:
+                return Result.new_ok(OkNone())
+            self._state = _KvCloseRegistryState.CLOSING
+            callbacks = list(self._callbacks.items())
+
+        first_error: Optional[ApiError] = None
+        for callback_id, callback_ref in callbacks:
+            callback = callback_ref()
+            if callback is None:
+                self.unregister(callback_id)
+                continue
+            try:
+                close_result = callback()
+                if not isinstance(close_result, Result):
+                    raise TypeError(
+                        "KvClient child close callback must return Result"
+                    )
+                if close_result.is_ok():
+                    close_result.unwrap()
+                else:
+                    close_error = close_result.unwrap_error()
+                    if first_error is None:
+                        first_error = close_error
+            except Exception as exc:  # noqa: BLE001
+                if first_error is None:
+                    first_error = GeneralError(
+                        message=f"KvClient child close callback failed: {exc}"
+                    )
+
+        if first_error is not None:
+            return Result.new_error(first_error)
+        return Result.new_ok(OkNone())
+
+    def finish_close(self) -> None:
+        with self._lock:
+            self._state = _KvCloseRegistryState.CLOSED
+            self._callbacks.clear()
 
 
 @dataclass
@@ -93,6 +202,27 @@ class KvClient(FactoryOnly):
     implementation. The default implementation is a correctness-first
     wrapper around the async path.
     """
+
+    def __init__(self) -> None:
+        self._child_close_registry = _KvChildCloseRegistry()
+
+    def register_child_close(
+        self,
+        callback: Callable[[], Result[OkNone, ApiError]],
+    ) -> KvCloseRegistration:
+        """Register one child public close method with this client lifecycle."""
+
+        return self._child_close_registry.register(callback)
+
+    def _close_registered_children(self) -> Result[OkNone, ApiError]:
+        """Close registered children before tearing down the KV backend."""
+
+        return self._child_close_registry.close_children()
+
+    def _finish_registered_child_close(self) -> None:
+        """Mark the parent lifecycle closed after backend teardown succeeds."""
+
+        self._child_close_registry.finish_close()
 
     @classmethod
     @abstractmethod
@@ -193,7 +323,7 @@ class KvClient(FactoryOnly):
 
     @abstractmethod
     def close(self) -> Result[OkNone, ApiError]:
-        """Close and tear down the store."""
+        """Close registered children, then tear down the store backend."""
         """Whether the store is write-once (keys cannot be overwritten)."""
 
     @abstractmethod
@@ -222,8 +352,13 @@ class KvClient(FactoryOnly):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Context manager exit: best-effort close."""
-        self.close()
+        """Close the client and consume the explicit close result."""
+        close_result = self.close()
+        if close_result.is_ok():
+            close_result.unwrap()
+            return
+        close_error = close_result.unwrap_error()
+        raise RuntimeError(f"KvClient context close failed: {close_error}")
 
 
 class KvLeaseApi(ABC):

@@ -1,16 +1,10 @@
+use crate::notify_state::AsyncStopSignal;
 use etcd_client as etcd;
 use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 use tracing::warn;
 
 pub const ETCD_PREFIX_WATCH_RESTART_SLEEP: Duration = Duration::from_secs(1);
-
-pub trait AsyncStopSignal: Clone + Send + Sync + 'static {
-    fn is_stopped(&self) -> bool;
-
-    fn wait_stopped(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
-}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum EtcdPrefixWatchLoopControl {

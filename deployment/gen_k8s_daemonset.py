@@ -903,20 +903,40 @@ def _render_host_prelude(*, node_ip: Dict[str, str], node_hostworkdir: Dict[str,
     ip_case = "\n".join(ip_case_lines)
     node_case = "\n".join(node_case_lines)
 
-    # NODE_ID is derived from hostname/ip; do not rely on external env injection.
+    # NODE_ID may be preset by a node-local launcher such as ops_agent. This is
+    # required for same-host logical nodes that share one IP address.
     return (
         "set -euo pipefail\n"
         f"{all_nodes_block}\n"
         "\n"
         "LOCAL_HOSTNAME=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)\n"
         "LOCAL_FQDN=$(hostname -f 2>/dev/null || echo \"$LOCAL_HOSTNAME\")\n"
-        "NODE_ID=\"\"\n"
+        "NODE_ID=\"${NODE_ID:-}\"\n"
+        "if [ -n \"$NODE_ID\" ]; then\n"
+        "  _node_id_known=false\n"
+        "  for n in \"${ALL_NODES[@]}\"; do\n"
+        "    if [ \"$n\" = \"$NODE_ID\" ]; then\n"
+        "      _node_id_known=true\n"
+        "      break\n"
+        "    fi\n"
+        "  done\n"
+        "  if [ \"$_node_id_known\" != true ]; then\n"
+        "    echo \"Unknown preset NODE_ID: $NODE_ID\"\n"
+        f"    echo \"Known nodes: {' '.join(all_nodes)}\"\n"
+        "    exit 1\n"
+        "  fi\n"
+        "fi\n"
+        "if [ -z \"$NODE_ID\" ]; then\n"
         "for n in \"${ALL_NODES[@]}\"; do\n"
         "  if [ \"$n\" = \"$LOCAL_HOSTNAME\" ] || [ \"$n\" = \"$LOCAL_FQDN\" ]; then\n"
         "    NODE_ID=\"$n\"\n"
         "    break\n"
         "  fi\n"
         "done\n"
+        "fi\n"
+        "if [ -z \"$NODE_ID\" ] && [ ${#ALL_NODES[@]} -eq 1 ]; then\n"
+        "  NODE_ID=\"${ALL_NODES[0]}\"\n"
+        "fi\n"
         "if [ -z \"$NODE_ID\" ]; then\n"
         "  for ip in $(hostname -I 2>/dev/null); do\n"
         "    for n in \"${ALL_NODES[@]}\"; do\n"

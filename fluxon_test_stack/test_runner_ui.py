@@ -53,6 +53,7 @@ def main() -> None:
         raw_path=Path(args.workdir),
         field_name="workdir",
     )
+    workdir_root.mkdir(parents=True, exist_ok=True)
     test_runner._redirect_process_stdio_to_log(
         workdir_root,
         filename="test_runner_ui.log",

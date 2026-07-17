@@ -43,6 +43,7 @@ class TestTopAttentionMqChannelContract(unittest.TestCase):
                 [
                     "fluxon_py/tests/test_api_chan_mpmc/test_api_chan_mpmc_base.py",
                     "fluxon_py/tests/test_api_chan_mpmc/test_api_chan_mpmc_quick_and_weighted_consume.py",
+                    "fluxon_py/tests/test_api_chan_mpmc/test_mpmc_lazy_producer_bind.py",
                     "fluxon_py/tests/test_api_chan_mpmc/test_rebind_client.py",
                     "fluxon_py/tests/test_api_chan_mpmc/test_ready_channels_access.py",
                     "fluxon_py/tests/test_api_chan_mpmc/test_create_reservation_contract.py",

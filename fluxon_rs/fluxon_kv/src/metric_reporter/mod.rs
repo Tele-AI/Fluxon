@@ -585,7 +585,10 @@ impl MetricReporter {
     }
 
     pub fn metrics_handle(&self) -> ObserveMetricsHandle {
-        self.metrics_actor_handle().clone()
+        self.metrics_actor_handle
+            .get()
+            .cloned()
+            .unwrap_or_else(ObserveMetricsHandle::noop)
     }
 
     pub fn metrics(&self) -> Arc<MetricsHandle> {

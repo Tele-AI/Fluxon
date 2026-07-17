@@ -123,75 +123,177 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertRegex(first, r"^fluxon_benchmark_[0-9a-f]{12}$")
 
-    def test_ci_owner_share_mem_path_is_global_per_owner_index(self) -> None:
+    def test_test_stack_result_cache_waits_for_complete_valid_snapshot(self) -> None:
+        snapshots = iter(
+            [
+                '{"runs":',
+                '{"runs":[{"completion":{"status":"SUCCESS"}}]}',
+            ]
+        )
+
+        class Context:
+            @staticmethod
+            def _instance_read_text_if_present(*_args, **_kwargs):
+                return next(snapshots)
+
+            @staticmethod
+            def _require_dict(value, _label):
+                if not isinstance(value, dict):
+                    raise TypeError("expected dict")
+                return value
+
+            @staticmethod
+            def _require_list(value, _label):
+                if not isinstance(value, list):
+                    raise TypeError("expected list")
+                return value
+
+            @staticmethod
+            def _require_str(value, _label):
+                if not isinstance(value, str):
+                    raise TypeError("expected str")
+                return value
+
         with tempfile.TemporaryDirectory() as td:
-            share_mem_root = Path(td) / "shared-root"
-            first_case = {
-                "runtime": {
-                    "run_dir": "/tmp/results/case-a/run_1",
-                    "stack_identity": {"share_mem_path": str(share_mem_root)},
-                }
-            }
-            second_case = {
-                "runtime": {
-                    "run_dir": "/tmp/results/case-b/run_9",
-                    "stack_identity": {"share_mem_path": str(share_mem_root)},
-                }
-            }
-
-            first_owner_0 = _RUNNER._ci_share_mem_path(first_case, owner_index=0)
-            second_owner_0 = _RUNNER._ci_share_mem_path(second_case, owner_index=0)
-            first_owner_1 = _RUNNER._ci_share_mem_path(first_case, owner_index=1)
-
-            self.assertEqual(first_owner_0, second_owner_0)
-            self.assertEqual(Path(first_owner_0), share_mem_root / "ci" / "owner-0")
-            self.assertEqual(Path(first_owner_1), share_mem_root / "ci" / "owner-1")
-            self.assertNotEqual(first_owner_0, first_owner_1)
-
-    def test_ci_owner_share_mem_cleanup_cannot_touch_testbed_owner(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            share_mem_root = Path(td) / "shared-root"
-            testbed_bundle = share_mem_root / "testbed-cluster"
-            testbed_bundle.mkdir(parents=True)
-            testbed_mmap = testbed_bundle / "mmap.file"
-            testbed_mmap.write_text("testbed-owner", encoding="utf-8")
-            resolved_case = {
-                "runtime": {
-                    "run_dir": "/tmp/results/case-a/run_1",
-                    "stack_identity": {"share_mem_path": str(share_mem_root)},
-                }
-            }
-            owner_path = Path(_RUNNER._ci_share_mem_path(resolved_case, owner_index=0))
-            old_case_bundle = owner_path / "old-ci-cluster"
-            old_case_bundle.mkdir(parents=True)
-            (old_case_bundle / "mmap.file").write_text("old-ci-owner", encoding="utf-8")
-
-            with mock.patch.object(_RUNNER, "_instance_remote_target_access", return_value=None):
-                _RUNNER._reset_ci_owner_share_mem_dir(
-                    resolved_case,
-                    owner_index=0,
-                    share_mem_path=str(owner_path),
+            result_path = Path(td) / "benchmark_result.json"
+            wait_impl = _RUNNER._wait_and_load_test_stack_benchmark_result_json_impl
+            wait_globals = wait_impl.__globals__
+            with mock.patch.object(wait_globals["time"], "sleep", return_value=None):
+                result = wait_impl(
+                    ctx=Context(),
+                    resolved_case={},
+                    result_path=result_path,
+                    timeout_s=5,
+                    case_id="case-a",
+                    writer_instance_id="coordinator",
                 )
 
-                self.assertTrue(owner_path.is_dir())
-                self.assertEqual(list(owner_path.iterdir()), [])
-                self.assertEqual(testbed_mmap.read_text(encoding="utf-8"), "testbed-owner")
+            self.assertEqual(result["runs"][0]["completion"]["status"], "SUCCESS")
+            self.assertEqual(
+                json.loads(result_path.read_text(encoding="utf-8")),
+                result,
+            )
+            self.assertFalse(result_path.with_suffix(".json.tmp").exists())
 
-                with self.assertRaisesRegex(ValueError, "unexpected CI owner share_mem_path"):
-                    _RUNNER._cleanup_ci_owner_share_mem_dir(
-                        resolved_case,
-                        owner_index=0,
-                        share_mem_path=str(testbed_bundle),
-                    )
+    def test_runtime_nofile_prelude_supports_github_hosted_hard_limit(self) -> None:
+        prelude = _RUNNER._test_stack_runtime_nofile_prelude_command()
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                (
+                    "set -euo pipefail\n"
+                    "ulimit -Sn 1024\n"
+                    "ulimit -Hn 65536\n"
+                    f"{prelude}"
+                    "ulimit -Sn\n"
+                ),
+            ],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
 
-                _RUNNER._cleanup_ci_owner_share_mem_dir(
-                    resolved_case,
-                    owner_index=0,
-                    share_mem_path=str(owner_path),
-                )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "65536")
+        self.assertNotIn("1048576", prelude)
 
-            self.assertFalse(owner_path.exists())
-            self.assertEqual(testbed_mmap.read_text(encoding="utf-8"), "testbed-owner")
+    def test_http_get_json_retries_connection_reset(self) -> None:
+        class _Response:
+            status = 200
+
+            def __enter__(self) -> "_Response":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok": true, "running": true}'
+
+        with mock.patch.object(_RUNNER, "_CONTROLLER_BASIC_AUTH_HEADER", "test-auth"):
+            with mock.patch.object(_RUNNER, "_controller_request_via_manifest", return_value=None):
+                with mock.patch.object(
+                    _RUNNER.urllib.request,
+                    "urlopen",
+                    side_effect=[ConnectionResetError("reset by peer"), _Response()],
+                ) as urlopen_mock:
+                    with mock.patch.object(_RUNNER.time, "sleep") as sleep_mock:
+                        payload = _RUNNER._http_get_json("http://controller/api/status?instance_id=master")
+
+        self.assertEqual(payload, {"ok": True, "running": True})
+        self.assertEqual(urlopen_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(1.0)
+
+    def test_local_mpmc_large_fanout_computes_node_start_throttle(self) -> None:
+        producer_targets = [f"node-{idx}" for idx in range(1, 81)]
+        consumer_targets = ["node-81", "node-82"]
+        all_targets = producer_targets + consumer_targets
+        role_plan = {
+            "producer": {"count": len(producer_targets), "targets": producer_targets},
+            "consumer": {"count": len(consumer_targets), "targets": consumer_targets},
+        }
+        target_ip_map = {target: "10.9.0.7" for target in all_targets}
+        cluster_nodes = {target: {"execution_mode": "local"} for target in all_targets}
+
+        max_seconds = _RUNNER._test_stack_local_benchmark_node_start_throttle_max_seconds(
+            scene_mode=_RUNNER.TEST_STACK_MODE_MPMC,
+            node_total=328,
+            role_plan=role_plan,
+            roles_order=["producer", "consumer"],
+            target_ip_map=target_ip_map,
+            cluster_nodes=cluster_nodes,
+            ctx="scale",
+        )
+
+        self.assertAlmostEqual(max_seconds, 158.4)
+        self.assertEqual(
+            _RUNNER._test_stack_local_benchmark_node_start_throttle_delay_seconds(
+                node_ordinal=0,
+                node_total=328,
+                max_seconds=max_seconds,
+            ),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            _RUNNER._test_stack_local_benchmark_node_start_throttle_delay_seconds(
+                node_ordinal=327,
+                node_total=328,
+                max_seconds=max_seconds,
+            ),
+            max_seconds,
+        )
+
+        target_ip_map["node-82"] = "10.9.0.8"
+        self.assertEqual(
+            _RUNNER._test_stack_local_benchmark_node_start_throttle_max_seconds(
+                scene_mode=_RUNNER.TEST_STACK_MODE_MPMC,
+                node_total=328,
+                role_plan=role_plan,
+                roles_order=["producer", "consumer"],
+                target_ip_map=target_ip_map,
+                cluster_nodes=cluster_nodes,
+                ctx="scale",
+            ),
+            0.0,
+        )
+
+    def test_runtime_command_places_pre_exec_shell_before_python_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            command = _RUNNER._test_stack_runtime_command(
+                run_dir=Path(td),
+                venv_python=Path("/opt/venv/bin/python"),
+                script_path="/repo/fluxon_test_stack/distributed_benchmark_node.py",
+                script_args=["--instance-key", "bench__node_0"],
+                runtime_env={},
+                pre_exec_shell="sleep 12.50\n",
+            )
+
+        self.assertIn("sleep 12.50\nexec /opt/venv/bin/python -u ", command)
+        self.assertLess(
+            command.index("sleep 12.50"),
+            command.index("exec /opt/venv/bin/python -u"),
+        )
 
     def test_write_ci_master_owner_configs_emits_owner_large_file_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -252,6 +354,55 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 wait_shared_bundle.call_args.kwargs["timeout_s"],
                 _RUNNER.CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S,
             )
+
+    def test_wait_instance_files_present_tolerates_transient_status_error(self) -> None:
+        paths = [Path("/tmp/shared.json"), Path("/tmp/mmap.file")]
+
+        with mock.patch.object(
+            _RUNNER,
+            "_instance_file_exists",
+            side_effect=[False, False, True, True],
+        ) as file_exists:
+            with mock.patch.object(
+                _RUNNER,
+                "_instance_status",
+                side_effect=[
+                    _RUNNER._HttpGetJsonTransientError("timed out"),
+                    {"ok": True, "running": True},
+                ],
+            ) as instance_status:
+                with mock.patch.object(_RUNNER.time, "sleep") as sleep_mock:
+                    _RUNNER._wait_instance_files_present(
+                        {"deploy": {}},
+                        instance_id="kv_owner_node-1",
+                        paths=paths,
+                        timeout_s=30,
+                        ctx="owner shared bundle wait",
+                    )
+
+        self.assertEqual(file_exists.call_count, 4)
+        instance_status.assert_called_once_with({"deploy": {}}, instance_id="kv_owner_node-1")
+        sleep_mock.assert_called_once_with(2.0)
+
+    def test_test_stack_result_timeout_covers_mpmc_readiness_gates(self) -> None:
+        timeout_s = _RUNNER._test_stack_result_timeout_seconds(
+            max_benchmark_seconds=30,
+            metric_warmup_seconds=0.0,
+            cluster_ready_timeout_seconds=1800,
+            readiness_gate_count=2,
+        )
+
+        self.assertEqual(timeout_s, 4230)
+
+    def test_test_stack_result_timeout_covers_single_readiness_gate(self) -> None:
+        timeout_s = _RUNNER._test_stack_result_timeout_seconds(
+            max_benchmark_seconds=30,
+            metric_warmup_seconds=0.0,
+            cluster_ready_timeout_seconds=1800,
+            readiness_gate_count=1,
+        )
+
+        self.assertEqual(timeout_s, 2430)
 
     def test_ci_runtime_python_executable_requires_python310_on_path(self) -> None:
         with mock.patch.object(_RUNNER.shutil, "which", return_value=None):
@@ -431,20 +582,85 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
             with mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply:
                 with mock.patch.object(_RUNNER, "_ci_cleanup_runtime") as cleanup_runtime:
-                    _RUNNER._finalize_ci_case_runtime(
-                        resolved_case,
-                        run_dir=run_dir,
-                        runtime_tracking=tracking,
-                        outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
-                    )
+                    with mock.patch.object(_RUNNER, "_cleanup_successful_ci_case_data") as cleanup_success_data:
+                        _RUNNER._finalize_ci_case_runtime(
+                            resolved_case,
+                            run_dir=run_dir,
+                            runtime_tracking=tracking,
+                            outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+                        )
 
             self.assertEqual(
                 [call.kwargs["apply_id"] for call in delete_apply.call_args_list],
                 ["apply-runner", "apply-cluster"],
             )
             cleanup_runtime.assert_called_once_with(resolved_case, timeout_s=120)
+            cleanup_success_data.assert_called_once_with(resolved_case, run_dir=run_dir)
 
-    def test_ci_cleanup_runtime_reclaims_only_fixed_ci_owner_slot(self) -> None:
+    def test_ci_success_cleanup_reuses_canonical_root_and_removes_ephemeral_data(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "results" / "case" / "run_1"
+            run_dir.mkdir(parents=True)
+            share_mem_root = root / "shm"
+            resolved_case = {
+                "case": {"case_id": "ci_case"},
+                "runtime": {
+                    "run_dir": str(run_dir),
+                    "stack_identity": {"share_mem_path": str(share_mem_root)},
+                },
+                "deploy": {
+                    "instances": [
+                        {"id": "ci_runner", "deployer": {"target": "local-node-a"}},
+                    ]
+                },
+            }
+            self.assertEqual(
+                _RUNNER._ci_share_mem_path(resolved_case),
+                str((share_mem_root / "ci").resolve()),
+            )
+            bundle_dir = _RUNNER._ci_case_shared_bundle_dir(resolved_case)
+            bundle_dir.mkdir(parents=True)
+            (bundle_dir / "mmap.file").write_bytes(b"payload")
+            for relpath in _RUNNER.CI_SUCCESS_RUNTIME_DATA_RELPATHS:
+                path = run_dir / relpath
+                path.mkdir(parents=True)
+                (path / "payload.bin").write_bytes(b"payload")
+            (run_dir / "logs").mkdir()
+            (run_dir / "logs" / "stdout.log").write_text("ok\n", encoding="utf-8")
+            (run_dir / "summary.yaml").write_text("outcome: SUCCESS\n", encoding="utf-8")
+
+            with mock.patch.object(_RUNNER, "_instance_remote_target_access_opt", return_value=None):
+                _RUNNER._cleanup_successful_ci_case_data(resolved_case, run_dir=run_dir)
+
+            self.assertFalse(bundle_dir.exists())
+            for relpath in _RUNNER.CI_SUCCESS_RUNTIME_DATA_RELPATHS:
+                self.assertFalse((run_dir / relpath).exists())
+            self.assertTrue((run_dir / "logs" / "stdout.log").exists())
+            self.assertTrue((run_dir / "summary.yaml").exists())
+
+    def test_finalize_ci_case_runtime_keeps_failure_data(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_FULL_ONCE,
+                    "case_id": "ci_case",
+                }
+            }
+
+            with mock.patch.object(_RUNNER, "_ci_cleanup_runtime"):
+                with mock.patch.object(_RUNNER, "_cleanup_successful_ci_case_data") as cleanup_success_data:
+                    _RUNNER._finalize_ci_case_runtime(
+                        resolved_case,
+                        run_dir=run_dir,
+                        runtime_tracking=_RUNNER._CaseRuntimeTracking(),
+                        outcome=_RUNNER.RUN_OUTCOME_FAILED,
+                    )
+
+            cleanup_success_data.assert_not_called()
+
+    def test_ci_cleanup_runtime_reclaims_only_case_scoped_bundle(self) -> None:
         cleanup_case = {
             "runtime": {
                 "stack_identity": {"share_mem_path": "/tmp/testbed-shm"},
@@ -456,19 +672,17 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 ]
             },
         }
-        expected_path = "/tmp/testbed-shm/ci/owner-0"
-
         with mock.patch.object(_RUNNER, "_ci_runtime_cleanup_case", return_value=cleanup_case):
             with mock.patch.object(_RUNNER, "_ci_runtime_current_apply_ids", return_value=[]):
                 with mock.patch.object(_RUNNER, "_wait_ci_ports_free") as wait_ports_free:
-                    with mock.patch.object(_RUNNER, "_cleanup_ci_owner_share_mem_dir") as cleanup_shm:
+                    with mock.patch.object(_RUNNER, "_cleanup_ci_case_shared_bundle") as cleanup_shm:
                         _RUNNER._ci_cleanup_runtime(cleanup_case, timeout_s=120)
 
         wait_ports_free.assert_called_once_with(cleanup_case, timeout_s=120)
         cleanup_shm.assert_called_once_with(
             cleanup_case,
-            owner_index=0,
-            share_mem_path=expected_path,
+            timeout_s=120,
+            ctx="CI runtime shared bundle cleanup",
         )
 
     def test_finalize_ci_case_runtime_preserves_structured_instance_ids(self) -> None:
@@ -585,6 +799,154 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 updated_summary["test_stack"]["collect_error"],
                 "RuntimeError: collect boom",
             )
+
+    def test_finalize_test_stack_case_runtime_creates_test_stack_summary_for_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            summary_path = run_dir / "summary.yaml"
+            _RUNNER._write_yaml_file(
+                summary_path,
+                {
+                    "schema_version": _RUNNER.SCHEMA_VERSION,
+                    "case_id": "bench_case",
+                    "case_key": "bench_case_key",
+                    "run_index": 1,
+                    "outcome": _RUNNER.RUN_OUTCOME_FAILED,
+                    "counted": False,
+                    "timing": {
+                        "started_at_unix_s": 100,
+                        "finished_at_unix_s": 100,
+                    },
+                    "error": _RUNNER._RUN_SUMMARY_INCOMPLETE_ERROR,
+                },
+            )
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_DEBUG_ONE_BY_ONE,
+                    "case_id": "bench_case",
+                    "case_key": "bench_case_key",
+                },
+                "deploy": {"instances": []},
+            }
+            tracking = _RUNNER._CaseRuntimeTracking(
+                ts_coord_deploy_attempted=True,
+                ts_coord_apply_id="apply-coord",
+            )
+
+            with mock.patch.object(_RUNNER, "_run_adapter_action", side_effect=RuntimeError("collect boom")):
+                with mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply:
+                    _RUNNER._finalize_test_stack_case_runtime(
+                        resolved_case,
+                        run_dir=run_dir,
+                        runtime_tracking=tracking,
+                        outcome=_RUNNER.RUN_OUTCOME_FAILED,
+                    )
+
+            delete_apply.assert_not_called()
+            updated_summary = yaml.safe_load(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                updated_summary["test_stack"]["collect_error"],
+                "RuntimeError: collect boom",
+            )
+
+    def test_finalize_test_stack_success_removes_ephemeral_run_data(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            resolved_case = {
+                "case": {
+                    "run_mode": _RUNNER.RUN_MODE_FULL_ONCE,
+                    "case_id": "bench_case",
+                }
+            }
+            tracking = _RUNNER._CaseRuntimeTracking(
+                ts_coord_deploy_attempted=True,
+                ts_coord_apply_id="apply-coord",
+                ts_nodes_deploy_attempted=True,
+                ts_nodes_apply_id="apply-nodes",
+            )
+
+            with mock.patch.object(_RUNNER, "_run_adapter_action"):
+                with mock.patch.object(_RUNNER, "_delete_apply_id") as delete_apply:
+                    with mock.patch.object(
+                        _RUNNER,
+                        "_cleanup_successful_test_stack_case_data",
+                    ) as cleanup_success_data:
+                        _RUNNER._finalize_test_stack_case_runtime(
+                            resolved_case,
+                            run_dir=run_dir,
+                            runtime_tracking=tracking,
+                            outcome=_RUNNER.RUN_OUTCOME_SUCCESS,
+                        )
+
+            self.assertEqual(
+                [call.kwargs["apply_id"] for call in delete_apply.call_args_list],
+                ["apply-nodes", "apply-coord"],
+            )
+            cleanup_success_data.assert_called_once_with(run_dir=run_dir)
+
+    def test_test_stack_success_cleanup_keeps_result_and_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            for relpath in _RUNNER.TEST_STACK_SUCCESS_RUNTIME_DATA_RELPATHS:
+                path = run_dir / relpath
+                path.mkdir(parents=True)
+                (path / "payload.bin").write_bytes(b"payload")
+            (run_dir / "logs").mkdir()
+            (run_dir / "logs" / "status.yaml").write_text("ok: true\n", encoding="utf-8")
+            (run_dir / "benchmark_result.json").write_text('{"runs": []}\n', encoding="utf-8")
+
+            _RUNNER._cleanup_successful_test_stack_case_data(run_dir=run_dir)
+
+            for relpath in _RUNNER.TEST_STACK_SUCCESS_RUNTIME_DATA_RELPATHS:
+                self.assertFalse((run_dir / relpath).exists())
+            self.assertTrue((run_dir / "logs" / "status.yaml").exists())
+            self.assertTrue((run_dir / "benchmark_result.json").exists())
+
+    def test_run_adapter_action_allows_collect(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            resolved_case = {
+                "case": {
+                    "case_id": "bench_case",
+                    "profile_id": "fluxon_tcp_thread",
+                },
+                "runtime": {
+                    "config_root": str(run_dir),
+                    "workdir_root": str(run_dir),
+                    "run_dir": str(run_dir),
+                    "stack_identity": {
+                        "cluster_name": "test_cluster",
+                        "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                        "share_mem_path": str(run_dir / "shm"),
+                    },
+                },
+                "artifact_set": {
+                    "release_root": str(run_dir / "release"),
+                    "test_rsc_root": str(run_dir / "test_rsc"),
+                },
+                "deploy": {
+                    "adapter_cmd": ["bash", "-lc", "true"],
+                },
+            }
+            observed: list[str] = []
+
+            def _fake_run_subprocess(argv: list[str], *, cwd: str) -> None:
+                nonlocal observed
+                observed = list(argv)
+                self.assertEqual(cwd, str(_RUNNER._runner_test_stack_root()))
+
+            with mock.patch.object(_RUNNER, "_run_subprocess", side_effect=_fake_run_subprocess):
+                result = _RUNNER._run_adapter_action(
+                    resolved_case,
+                    run_dir=run_dir,
+                    action="collect",
+                )
+
+            self.assertIsNone(result)
+            self.assertIn("--action", observed)
+            self.assertEqual(observed[observed.index("--action") + 1], "collect")
+            self.assertIn("--workdir", observed)
+            self.assertEqual(observed[observed.index("--workdir") + 1], str(run_dir))
 
     def test_finalize_error_preserves_success_for_ci_and_bench(self) -> None:
         self.assertTrue(
@@ -765,7 +1127,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                                 kv_p2p_port_stride=100,
                                 kv_p2p_slot_offset=0,
                                 p2p_ports_per_slot=10,
-                                node_total=1,
+                                owner_p2p_port_offset=1,
                                 run_index=1,
                                 runtime_instance_prefix=runtime_instance_prefix,
                                 kv_base={},
@@ -825,7 +1187,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                                 kv_p2p_port_stride=100,
                                 kv_p2p_slot_offset=0,
                                 p2p_ports_per_slot=10,
-                                node_total=1,
+                                owner_p2p_port_offset=1,
                                 run_index=1,
                                 runtime_instance_prefix=runtime_instance_prefix,
                                 kv_base={},
@@ -1882,7 +2244,9 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     "-m",
                     "pip",
                     "install",
+                    "--no-index",
                     "--force-reinstall",
+                    "--no-deps",
                     str(release_root / wheel_name),
                 ],
             )
@@ -1963,6 +2327,41 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             script_text = script_path.read_text(encoding="utf-8")
             self.assertIn('prepare_env_path="', script_text)
             self.assertIn('. "$prepare_env_path"', script_text)
+            self.assertIn('restart_count_path="$log_dir/restart_count.txt"', script_text)
+            self.assertIn('inflight_path="$log_dir/inflight_attempt.txt"', script_text)
+            self.assertIn('exec >>"$log_dir/stdout.log" 2>&1', script_text)
+            self.assertIn("[ci_runner] start attempt=$restart_count", script_text)
+            self.assertIn("previous attempt did not write exit_code.txt; refusing to rerun", script_text)
+            self.assertIn("write_exit_code -1", script_text)
+            self.assertIn('rm -f "$inflight_path"', script_text)
+            self.assertIn("[ci_runner] STEP 1 start label=", script_text)
+            self.assertIn("[ci_runner] STEP 1 finish label=", script_text)
+            subprocess.run(["bash", "-n", str(script_path)], check=True)
+
+    def test_ci_prepare_exports_testbed_bundle_and_release_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bundle_root = root / "testbed_bundle"
+            bundle_root.mkdir()
+            start_cfg = bundle_root / "start_test_bed.runner.yaml"
+            start_cfg.write_text("schema_version: 6\n", encoding="utf-8")
+            (bundle_root / "manifest.json").write_text("{}", encoding="utf-8")
+            release_root = root / "fluxon_release"
+            release_root.mkdir()
+            env = {
+                **os.environ,
+                _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg),
+                "FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT": str(release_root),
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                exports = _RUNNER._run_ci_prepare_steps(
+                    resolved_case={"scene": {"ci": {}}},
+                    run_dir=root / "run",
+                    src_root=root / "src",
+                )
+
+            self.assertEqual(exports[_RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV], str(start_cfg))
+            self.assertEqual(exports["FLUXON_TEST_STACK_LOCAL_RELEASE_ROOT"], str(release_root))
 
     def test_parse_ci_prepare_steps_accepts_online_docker_image(self) -> None:
         steps = _RUNNER._parse_ci_prepare_steps(
@@ -2092,8 +2491,8 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             manifest_path.write_text(
                 json.dumps(
                     {
-                        "start_config_path": str(start_cfg),
-                        "workdir": str(workdir),
+                        "start_config_path": "start_test_bed.runner.yaml",
+                        "workdir": "bootstrap_workdir",
                         "bootstrap_mode": "apply_only",
                     }
                 ),
@@ -2123,6 +2522,109 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                     "apply_only",
                 ],
             )
+
+    def test_runtime_token_mapping_includes_testbed_bundle_root_when_manifest_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bundle_root = Path(td)
+            start_cfg = bundle_root / "start_test_bed.runner.yaml"
+            start_cfg.write_text("schema_version: 6\n", encoding="utf-8")
+            (bundle_root / "manifest.json").write_text("{}", encoding="utf-8")
+            env = {**os.environ, _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg)}
+            with mock.patch.dict(os.environ, env, clear=True):
+                mapping = _RUNNER._build_runtime_token_mapping(
+                    workdir_root="/tmp/workdir",
+                    run_dir="/tmp/run",
+                    release_root="/tmp/release",
+                    test_rsc_root="/tmp/test_rsc",
+                    case_id="case",
+                    profile_id="profile",
+                    stack_identity={
+                        "cluster_name": "cluster",
+                        "controller_url": "http://127.0.0.1:19080/r/ops/fluxon_testbed",
+                        "share_mem_path": "/tmp/share",
+                    },
+                )
+
+            self.assertEqual(mapping["__TEST_BED_BUNDLE_ROOT__"], str(bundle_root.resolve()))
+
+    def test_direct_local_manifest_remote_bash_uses_local_process_without_bastion(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bundle_root = Path(td)
+            start_cfg = bundle_root / "start_test_bed.runner.yaml"
+            start_cfg.write_text("schema_version: 6\n", encoding="utf-8")
+            (bundle_root / "manifest.json").write_text(
+                json.dumps({"controller_request_mode": "direct"}),
+                encoding="utf-8",
+            )
+            env = {**os.environ, _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg)}
+            node_cfg = {
+                "execution_mode": "local",
+                "ip": "127.0.0.1",
+                "hostworkdir": td,
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                captured = _RUNNER._run_remote_bash_capture(
+                    target_name="logic-a",
+                    node_cfg=node_cfg,
+                    remote_cmd="printf '%s\\n' local-ok",
+                )
+
+            self.assertEqual(captured, "local-ok\n")
+
+    def test_load_test_stack_cluster_nodes_expands_same_host_logical_target_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bundle_root = Path(td)
+            start_cfg = bundle_root / "start_test_bed.runner.yaml"
+            deployconf_path = bundle_root / "deployconf.yaml"
+            start_cfg.write_text(
+                "\n".join(
+                    [
+                        "schema_version: 6",
+                        "deployconf_path: ./deployconf.yaml",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            deployconf_path.write_text(
+                "\n".join(
+                    [
+                        "cluster_nodes:",
+                        "  - hostname: logic-a",
+                        "    ip: 10.1.1.119",
+                        "    hostworkdir: /tmp/logic/a",
+                        "    execution_mode: local",
+                        "    ssh_user: runner",
+                        "    ssh_port: 22",
+                        "    ssh_password: null",
+                        "  - hostname: logic-b",
+                        "    ip: 10.1.1.119",
+                        "    hostworkdir: /tmp/logic/b",
+                        "    execution_mode: local",
+                        "    ssh_user: runner",
+                        "    ssh_port: 22",
+                        "    ssh_password: null",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            resolved_case = {
+                "deploy": {
+                    "target_ip_map": {
+                        "node-1": "10.1.1.119",
+                        "logic-a": "10.1.1.119",
+                        "logic-b": "10.1.1.119",
+                    }
+                }
+            }
+            env = {**os.environ, _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg)}
+            with mock.patch.dict(os.environ, env, clear=True):
+                cluster_nodes, _dispatch = _RUNNER._load_test_stack_cluster_nodes_and_dispatch(resolved_case)
+
+            self.assertIn("node-1", cluster_nodes)
+            self.assertEqual(cluster_nodes["node-1"]["hostname"], "logic-a")
+            self.assertEqual(cluster_nodes["node-1"]["hostworkdir"], "/tmp/logic/a")
 
     def test_load_source_stack_contract_accepts_same_host_dual_local_hostworkdirs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -2186,6 +2688,95 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertEqual(contract["share_mem_hostworkdir"], "${HOSTWORKDIR}/shm1")
             self.assertNotIn("shared_memory_hostworkdir", contract)
             self.assertNotIn("shared_file_hostworkdir", contract)
+
+    def test_testbed_manifest_workdir_normalized_deployconf_is_runtime_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bundle_root = Path(td)
+            start_cfg = bundle_root / "start_test_bed.runner.yaml"
+            deployconf_path = bundle_root / "deployconf.yaml"
+            bootstrap_workdir = bundle_root / "bootstrap_workdir"
+            bootstrap_workdir.mkdir()
+            start_cfg.write_text(
+                "\n".join(
+                    [
+                        "schema_version: 6",
+                        "deployconf_path: ./deployconf.yaml",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            raw_deployconf = [
+                "cluster_nodes:",
+                "  - hostname: logic-a",
+                "    ip: 10.1.1.119",
+                "    hostworkdir: /tmp/logic/a",
+                "    execution_mode: local",
+                "    ssh_user: runner",
+                "    ssh_port: 22",
+                "service:",
+                "  etcd:",
+                "    port: 33579",
+                "    node_bind:",
+                "      node: [logic-a]",
+                "  greptime:",
+                "    port: 35030",
+                "    node_bind:",
+                "      node: [logic-a]",
+                "",
+            ]
+            deployconf_path.write_text("\n".join(raw_deployconf), encoding="utf-8")
+            (bootstrap_workdir / "deployconf.with_release_manifest_sha256.yaml").write_text(
+                "\n".join(
+                    [
+                        "global_envs:",
+                        "  FLUXON_RELEASE_MANIFEST_SHA256: should-not-leak",
+                        "cluster_nodes:",
+                        "  - hostname: logic-a",
+                        "    ip: 10.1.1.119",
+                        "    hostworkdir: /tmp/logic/a",
+                        "    execution_mode: local",
+                        "    ssh_user: runner",
+                        "    ssh_port: 22",
+                        "service:",
+                        "  etcd:",
+                        "    port: 57780",
+                        "    node_bind:",
+                        "      node: [logic-a]",
+                        "  greptime:",
+                        "    port: 57790",
+                        "    node_bind:",
+                        "      node: [logic-a]",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (bundle_root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "deployconf_path": "deployconf.yaml",
+                        "start_config_path": "start_test_bed.runner.yaml",
+                        "ssh_config_path": "start_test_bed.runner.yaml",
+                        "workdir": "bootstrap_workdir",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            resolved_case = {
+                "deploy": {
+                    "target_ip_map": {
+                        "logic-a": "10.1.1.119",
+                    }
+                }
+            }
+            env = {**os.environ, _RUNNER.TEST_STACK_START_TEST_BED_CONFIG_ENV: str(start_cfg)}
+            with mock.patch.dict(os.environ, env, clear=True):
+                etcd_addresses = _RUNNER._test_stack_etcd_addresses(resolved_case)
+                greptime_host, greptime_port = _RUNNER._test_stack_greptime_host_port(resolved_case)
+
+            self.assertEqual(etcd_addresses, ["10.1.1.119:57780"])
+            self.assertEqual((greptime_host, greptime_port), ("10.1.1.119", 57790))
 
     def test_load_source_stack_contract_rejects_multi_hostworkdir_remote_layout(self) -> None:
         with tempfile.TemporaryDirectory() as td:

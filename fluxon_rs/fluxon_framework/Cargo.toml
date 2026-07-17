@@ -12,6 +12,7 @@ limit_thirdparty = { path = "../limit_thirdparty" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 fluxon_framework_compiled = { path = "../fluxon_framework_compiled" }
+fluxon_util = { path = "../fluxon_util" }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

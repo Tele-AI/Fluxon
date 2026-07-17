@@ -1,12 +1,8 @@
-use crate::{
-    ClusterError, ClusterResult, EtcdPrefixScanAction, NodeID, NodeIDString,
-    scan_etcd_prefix_paginated,
-};
+use crate::{ClusterError, ClusterResult, NodeIDString};
 use bitcode::{Decode, Encode};
-use etcd_client::Client;
 use limit_thirdparty::tokio::sync::ampsc;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use tracing::warn;
 
 pub const META_KEY_TRANSFER_READY: &str = "transfer_ready";
@@ -169,103 +165,6 @@ impl TransferLinkRecord {
             return Ok((TransferLinkP2pState::Relay, None));
         }
         Ok((TransferLinkP2pState::Direct, transport))
-    }
-}
-
-#[derive(Clone)]
-pub struct TransferLinkP2pSnapshotSource {
-    client: Client,
-    prefix: String,
-}
-
-impl TransferLinkP2pSnapshotSource {
-    pub fn new(client: Client, prefix: String) -> Self {
-        Self { client, prefix }
-    }
-
-    pub async fn fetch_direct_edges(&self) -> ClusterResult<HashMap<NodeID, Vec<NodeID>>> {
-        let mut client = self.client.clone();
-        let key_prefix = format!("{}/", self.prefix);
-        let mut direct_edges: HashMap<NodeID, BTreeSet<NodeID>> = HashMap::new();
-        scan_etcd_prefix_paginated(&mut client, &self.prefix, |key, value| {
-            let key = match std::str::from_utf8(key) {
-                Ok(value) => value,
-                Err(err) => {
-                    warn!(err = %err, "skipping malformed transfer_link p2p key bytes");
-                    return Ok::<EtcdPrefixScanAction, std::convert::Infallible>(
-                        EtcdPrefixScanAction::Continue,
-                    );
-                }
-            };
-            let value = match std::str::from_utf8(value) {
-                Ok(value) => value,
-                Err(err) => {
-                    warn!(key = %key, err = %err, "skipping malformed transfer_link p2p value bytes");
-                    return Ok::<EtcdPrefixScanAction, std::convert::Infallible>(
-                        EtcdPrefixScanAction::Continue,
-                    );
-                }
-            };
-            let Some(suffix) = key.strip_prefix(&key_prefix) else {
-                warn!(key = %key, prefix = %self.prefix, "skipping transfer_link p2p key outside prefix");
-                return Ok::<EtcdPrefixScanAction, std::convert::Infallible>(
-                    EtcdPrefixScanAction::Continue,
-                );
-            };
-            let mut parts = suffix.split('/');
-            let Some(from) = parts.next() else {
-                return Ok::<EtcdPrefixScanAction, std::convert::Infallible>(
-                    EtcdPrefixScanAction::Continue,
-                );
-            };
-            let Some(to) = parts.next() else {
-                warn!(key = %key, "skipping malformed transfer_link p2p key without target");
-                return Ok::<EtcdPrefixScanAction, std::convert::Infallible>(
-                    EtcdPrefixScanAction::Continue,
-                );
-            };
-            if parts.next().is_some() || from.is_empty() || to.is_empty() {
-                warn!(key = %key, "skipping malformed transfer_link p2p key shape");
-                return Ok::<EtcdPrefixScanAction, std::convert::Infallible>(
-                    EtcdPrefixScanAction::Continue,
-                );
-            }
-
-            let (p2p_state, _transport) = match TransferLinkRecord::parse_etcd_p2p_value(value) {
-                Ok(parsed) => parsed,
-                Err(err) => {
-                    warn!(key = %key, value = %value, err = %err, "skipping malformed transfer_link p2p record");
-                    return Ok::<EtcdPrefixScanAction, std::convert::Infallible>(
-                        EtcdPrefixScanAction::Continue,
-                    );
-                }
-            };
-            if p2p_state != TransferLinkP2pState::Direct {
-                return Ok::<EtcdPrefixScanAction, std::convert::Infallible>(
-                    EtcdPrefixScanAction::Continue,
-                );
-            }
-
-            direct_edges
-                .entry(from.to_string().into())
-                .or_default()
-                .insert(to.to_string().into());
-            Ok::<EtcdPrefixScanAction, std::convert::Infallible>(
-                EtcdPrefixScanAction::Continue,
-            )
-        })
-        .await
-        .map_err(|err| {
-            ClusterError::MemberSync(format!(
-                "Get transfer_link p2p prefix {} failed: {}",
-                self.prefix, err
-            ))
-        })?;
-
-        Ok(direct_edges
-            .into_iter()
-            .map(|(from, tos)| (from, tos.into_iter().collect()))
-            .collect())
     }
 }
 

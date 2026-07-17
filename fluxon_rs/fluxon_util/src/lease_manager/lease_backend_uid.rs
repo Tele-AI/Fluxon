@@ -1,8 +1,17 @@
 use anyhow::Result as AnyResult;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::etcd::EtcdEndpointSet;
+
+/// A cancellable native Rust operation used by the Fluxon KV lease backend.
+pub type KvLeaseFuture<T> = Pin<Box<dyn Future<Output = AnyResult<T>> + Send + 'static>>;
+
+pub type KvAllocateLease = Arc<dyn Fn(i64) -> KvLeaseFuture<u64> + Send + Sync + 'static>;
+
+pub type KvKeepaliveLease = Arc<dyn Fn(u64) -> KvLeaseFuture<()> + Send + Sync + 'static>;
 
 /// Backend kind for leases supported by the unified lease manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,17 +22,17 @@ pub enum LeaseType {
 
 /// Unique identifier for a lease backend.
 ///
-/// - Etcd: canonical endpoint set.
-/// - KvClient: cluster name; carries allocate/keepalive Rust closures.
+/// - Etcd: endpoints list (Vec<String>) sorted lexicographically to make
+///   identity stable regardless of input order.
+/// - KvClient: cluster and client instance identity; carries native async
+///   Fluxon KV lease operations.
 pub enum LeaseBackendUid {
     Etcd(EtcdEndpointSet),
-    KvClientWithCallbacks {
+    KvClient {
         cluster: String,
-        /// Allocate closure: input ttl_seconds -> lease_id
-        allocate_cb: Arc<dyn Fn(i64) -> AnyResult<u64> + Send + Sync + 'static>,
-        /// Keepalive closure: input lease_id; must not alter TTL.
-        /// Must return `AnyResult<()>` to surface errors to the caller.
-        keepalive_cb: Arc<dyn Fn(u64) -> AnyResult<()> + Send + Sync + 'static>,
+        instance_key: String,
+        allocate: KvAllocateLease,
+        keepalive: KvKeepaliveLease,
     },
 }
 
@@ -32,23 +41,25 @@ impl LeaseBackendUid {
         LeaseBackendUid::Etcd(endpoints)
     }
 
-    /// Construct a kvclient backend uid that carries allocate/keepalive callbacks.
-    pub fn kv_client_with_callbacks(
+    /// Construct a Fluxon KV backend with native async lease operations.
+    pub fn kv_client(
         cluster: impl Into<String>,
-        allocate_cb: Arc<dyn Fn(i64) -> AnyResult<u64> + Send + Sync + 'static>,
-        keepalive_cb: Arc<dyn Fn(u64) -> AnyResult<()> + Send + Sync + 'static>,
+        instance_key: impl Into<String>,
+        allocate: KvAllocateLease,
+        keepalive: KvKeepaliveLease,
     ) -> Self {
-        LeaseBackendUid::KvClientWithCallbacks {
+        LeaseBackendUid::KvClient {
             cluster: cluster.into(),
-            allocate_cb,
-            keepalive_cb,
+            instance_key: instance_key.into(),
+            allocate,
+            keepalive,
         }
     }
 
     pub fn kind(&self) -> LeaseType {
         match self {
             LeaseBackendUid::Etcd(_) => LeaseType::Etcd,
-            LeaseBackendUid::KvClientWithCallbacks { .. } => LeaseType::KvClient,
+            LeaseBackendUid::KvClient { .. } => LeaseType::KvClient,
         }
     }
 
@@ -61,29 +72,28 @@ impl LeaseBackendUid {
 
     pub fn cluster(&self) -> Option<&str> {
         match self {
-            LeaseBackendUid::KvClientWithCallbacks { cluster, .. } => Some(cluster.as_str()),
+            LeaseBackendUid::KvClient { cluster, .. } => Some(cluster.as_str()),
             _ => None,
         }
     }
 
-    /// Clone the kvclient allocate callback if present.
-    pub fn kv_allocate_cb(
-        &self,
-    ) -> Option<Arc<dyn Fn(i64) -> AnyResult<u64> + Send + Sync + 'static>> {
+    pub fn instance_key(&self) -> Option<&str> {
         match self {
-            LeaseBackendUid::KvClientWithCallbacks { allocate_cb, .. } => Some(allocate_cb.clone()),
+            LeaseBackendUid::KvClient { instance_key, .. } => Some(instance_key.as_str()),
             _ => None,
         }
     }
 
-    /// Clone the kvclient keepalive callback if present.
-    pub fn kv_keepalive_cb(
-        &self,
-    ) -> Option<Arc<dyn Fn(u64) -> AnyResult<()> + Send + Sync + 'static>> {
+    pub fn kv_allocate(&self) -> Option<KvAllocateLease> {
         match self {
-            LeaseBackendUid::KvClientWithCallbacks { keepalive_cb, .. } => {
-                Some(keepalive_cb.clone())
-            }
+            LeaseBackendUid::KvClient { allocate, .. } => Some(allocate.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn kv_keepalive(&self) -> Option<KvKeepaliveLease> {
+        match self {
+            LeaseBackendUid::KvClient { keepalive, .. } => Some(keepalive.clone()),
             _ => None,
         }
     }
@@ -91,28 +101,44 @@ impl LeaseBackendUid {
 
 /// Keepalive registration payload for the unified lease manager.
 ///
-/// Etcd only needs a `revoke_on_drop` flag; KvClient path uses the
-/// keepalive closure carried by `LeaseBackendUid::KvClientWithCallbacks`.
+/// Etcd registration only contributes keepalive. Cleanup of owned keys must be
+/// performed by the semantic owner explicitly; lease drop never revokes.
 pub enum LeaseRegisterKind {
-    Etcd { revoke_on_drop: bool },
-    KvClient { register_by: String },
+    /// Register an etcd lease id that may already have existed before this call.
+    /// Registration validates the lease with an initial keepalive probe.
+    Etcd,
+    /// Register an etcd lease id whose existence the caller has already validated
+    /// on the same backend. A fresh grant and a parent-owned MPMC lease both satisfy
+    /// this contract, so registration only installs the periodic keepalive actor.
+    EtcdValidated,
+    /// Register a kvclient lease whose existence is guaranteed by the caller's
+    /// owning control plane. Registration installs periodic keepalive without a
+    /// duplicate synchronous probe.
+    KvClientValidated {
+        register_by: String,
+    },
+    KvClient {
+        register_by: String,
+    },
 }
 
 // Manual trait impls so that hashing/equality only consider the backend identity
-// (endpoints for etcd; cluster name for kvclient). Callbacks do not participate
-// in identity and are cloned via dedicated helpers when needed.
+// (endpoints for etcd; cluster and client instance for kvclient). Operations do
+// not participate in identity and are cloned via dedicated helpers when needed.
 impl Clone for LeaseBackendUid {
     fn clone(&self) -> Self {
         match self {
             LeaseBackendUid::Etcd(v) => LeaseBackendUid::Etcd(v.clone()),
-            LeaseBackendUid::KvClientWithCallbacks {
+            LeaseBackendUid::KvClient {
                 cluster,
-                allocate_cb,
-                keepalive_cb,
-            } => LeaseBackendUid::KvClientWithCallbacks {
+                instance_key,
+                allocate,
+                keepalive,
+            } => LeaseBackendUid::KvClient {
                 cluster: cluster.clone(),
-                allocate_cb: allocate_cb.clone(),
-                keepalive_cb: keepalive_cb.clone(),
+                instance_key: instance_key.clone(),
+                allocate: allocate.clone(),
+                keepalive: keepalive.clone(),
             },
         }
     }
@@ -123,9 +149,17 @@ impl PartialEq for LeaseBackendUid {
         match (self, other) {
             (LeaseBackendUid::Etcd(a), LeaseBackendUid::Etcd(b)) => a == b,
             (
-                LeaseBackendUid::KvClientWithCallbacks { cluster: a, .. },
-                LeaseBackendUid::KvClientWithCallbacks { cluster: b, .. },
-            ) => a == b,
+                LeaseBackendUid::KvClient {
+                    cluster: cluster_a,
+                    instance_key: instance_a,
+                    ..
+                },
+                LeaseBackendUid::KvClient {
+                    cluster: cluster_b,
+                    instance_key: instance_b,
+                    ..
+                },
+            ) => cluster_a == cluster_b && instance_a == instance_b,
             _ => false,
         }
     }
@@ -140,9 +174,14 @@ impl std::hash::Hash for LeaseBackendUid {
                 0u8.hash(state);
                 endpoints.hash(state);
             }
-            LeaseBackendUid::KvClientWithCallbacks { cluster, .. } => {
+            LeaseBackendUid::KvClient {
+                cluster,
+                instance_key,
+                ..
+            } => {
                 1u8.hash(state);
                 cluster.hash(state);
+                instance_key.hash(state);
             }
         }
     }
@@ -151,10 +190,42 @@ impl std::hash::Hash for LeaseBackendUid {
 impl fmt::Debug for LeaseBackendUid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LeaseBackendUid::Etcd(v) => write!(f, "Etcd({:?})", v.as_slice()),
-            LeaseBackendUid::KvClientWithCallbacks { cluster, .. } => {
-                write!(f, "KvClientWithCallbacks(cluster={})", cluster)
+            LeaseBackendUid::Etcd(v) => write!(f, "Etcd({:?})", v),
+            LeaseBackendUid::KvClient {
+                cluster,
+                instance_key,
+                ..
+            } => {
+                write!(
+                    f,
+                    "KvClient(cluster={}, instance_key={})",
+                    cluster, instance_key
+                )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kv_backend(cluster: &str, instance_key: &str) -> LeaseBackendUid {
+        LeaseBackendUid::kv_client(
+            cluster,
+            instance_key,
+            Arc::new(|_| Box::pin(async { Ok(1) })),
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        )
+    }
+
+    #[test]
+    fn kv_backend_identity_includes_client_instance() {
+        let first = kv_backend("cluster", "client-a");
+        let same = kv_backend("cluster", "client-a");
+        let other_client = kv_backend("cluster", "client-b");
+
+        assert_eq!(first, same);
+        assert_ne!(first, other_client);
     }
 }

@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -21,9 +22,8 @@ def main() -> None:
 
 
 from fluxon_py.runtime.process_runner import (  # noqa: E402
-    ChildStopMode,
-    ManagedSubprocess,
     build_runtime_singleton_spec,
+    register_ctrlc_callback,
     _stop_existing_processes_if_running,
 )
 
@@ -63,6 +63,87 @@ class TestProcessRunner(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = _new_test_dir("process_runner")
         self.addCleanup(lambda: shutil.rmtree(self._tmp, ignore_errors=False))
+
+    def test_register_ctrlc_callback_runs_outside_signal_frame(self) -> None:
+        script_path = self._tmp / "ctrlc_callback.py"
+        marker_path = self._tmp / "ctrlc_callback.txt"
+        script_path.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import os",
+                    "import signal",
+                    "import sys",
+                    "import threading",
+                    "import time",
+                    "from pathlib import Path",
+                    "",
+                    f"sys.path.insert(0, {str(REPO_ROOT)!r})",
+                    "from fluxon_py.runtime.process_runner import register_ctrlc_callback",
+                    "",
+                    "marker = Path(sys.argv[1]).resolve()",
+                    "operation_lock = threading.Lock()",
+                    "callback_started = threading.Event()",
+                    "callback_finished = threading.Event()",
+                    "callback_state = {}",
+                    "",
+                    "def on_ctrlc(reason):",
+                    "    callback_state['reason'] = reason",
+                    "    callback_state['thread'] = threading.current_thread().name",
+                    "    callback_started.set()",
+                    "    with operation_lock:",
+                    "        pass",
+                    "    callback_finished.set()",
+                    "",
+                    "restore = register_ctrlc_callback(on_ctrlc, thread_name='ctrlc-callback-test')",
+                    "sender = threading.Thread(",
+                    "    target=lambda: (time.sleep(0.1), os.kill(os.getpid(), signal.SIGINT)),",
+                    ")",
+                    "with operation_lock:",
+                    "    sender.start()",
+                    "    if not callback_started.wait(5.0):",
+                    "        raise RuntimeError('signal callback did not start')",
+                    "    time.sleep(0.1)",
+                    "    if callback_finished.is_set():",
+                    "        raise RuntimeError('callback unexpectedly acquired the operation lock')",
+                    "sender.join(timeout=5.0)",
+                    "if sender.is_alive():",
+                    "    raise RuntimeError('signal sender did not exit')",
+                    "if not callback_finished.wait(5.0):",
+                    "    raise RuntimeError('signal callback did not finish after lock release')",
+                    "restore()",
+                    "marker.write_text(",
+                    "    f\"{callback_state['reason']}:{callback_state['thread']}\",",
+                    "    encoding='utf-8',",
+                    ")",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [sys.executable, str(script_path), str(marker_path)],
+            cwd=str(self._tmp),
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(marker_path.read_text(encoding="utf-8"), "Ctrl-C:ctrlc-callback-test")
+
+    def test_register_ctrlc_callback_restore_without_signal_stops_listener(self) -> None:
+        callback_reasons: list[str] = []
+        thread_name = "ctrlc-callback-no-signal-test"
+        restore = register_ctrlc_callback(callback_reasons.append, thread_name=thread_name)
+
+        restore()
+        restore()
+
+        self.assertEqual(callback_reasons, [])
+        self.assertNotIn(thread_name, {thread.name for thread in threading.enumerate()})
 
     def test_stop_existing_processes_if_running_retires_grandchild_tree(self) -> None:
         wrapper_path = self._tmp / "wrapper.py"
@@ -223,7 +304,6 @@ class TestProcessRunner(unittest.TestCase):
                     "",
                     f"sys.path.insert(0, {str(REPO_ROOT)!r})",
                     "from fluxon_py.runtime.process_runner import (",
-                    "    ChildStopMode,",
                     "    ManagedSubprocess,",
                     "    bind_current_process_parent_death_sigterm,",
                     "    wait_subproc_or_ctrlc,",
@@ -236,7 +316,7 @@ class TestProcessRunner(unittest.TestCase):
                     ")",
                     "ready.write_text(f'{os.getpid()} {worker.pid}', encoding='utf-8')",
                     "wait_subproc_or_ctrlc(",
-                    "    [ManagedSubprocess(label='worker', proc=worker, stop_mode=ChildStopMode.PROCESS_GROUP)],",
+                    "    [ManagedSubprocess(label='worker', proc=worker)],",
                     "    on_ctrlc=lambda: None,",
                     ")",
                     "",

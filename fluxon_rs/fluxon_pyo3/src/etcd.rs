@@ -12,6 +12,13 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tracing::debug;
 
+fn is_lease_not_found_error(err: &etcd::Error) -> bool {
+    let msg = format!("{:?}", err).to_ascii_lowercase();
+    msg.contains("requested lease not found")
+        || msg.contains("lease not found")
+        || msg.contains("code: notfound")
+}
+
 fn normalize_raw_endpoint(endpoint: &str) -> PyResult<String> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
@@ -480,9 +487,7 @@ impl PyEtcdLock {
                             LeaseBackendUid::etcd(endpoints),
                             ttl_seconds,
                             lease_id as u64,
-                            LeaseRegisterKind::Etcd {
-                                revoke_on_drop: false,
-                            },
+                            LeaseRegisterKind::Etcd,
                             rt_handle,
                         )
                         .await
@@ -597,12 +602,24 @@ impl PyEtcdLock {
                         anyhow::anyhow!("failed to unlock etcd lock {}: {:?}", name, e)
                     });
 
-                // Keep the lease alive until the unlock request finishes, then
-                // unregister it before the final explicit revoke.
+                // Stop keepalive before the explicit revoke. A concurrent final
+                // tick may otherwise race with lease teardown.
                 drop(lease_guard);
-                let revoke_result = client.lease_revoke(lease_id).await;
+                let revoke_result = match client.lease_revoke(lease_id).await {
+                    Ok(_) => Ok(()),
+                    Err(err) if is_lease_not_found_error(&err) => {
+                        debug!(
+                            target: "fluxon_pyo3::etcd",
+                            "etcd lock release lease already gone: name={}, lease_id={}",
+                            name,
+                            lease_id
+                        );
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                };
                 match (unlock_result, revoke_result) {
-                    (Ok(unlocked), Ok(_)) => Ok(unlocked),
+                    (Ok(unlocked), Ok(())) => Ok(unlocked),
                     (Ok(_), Err(err)) => Err(anyhow::anyhow!(
                         "failed to revoke etcd lease {} for lock {}: {:?}",
                         lease_id,

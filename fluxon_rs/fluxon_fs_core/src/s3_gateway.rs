@@ -35,9 +35,6 @@ pub const FS_S3_KV_LAYOUT_VERSION: &str = "v2";
 // - We keep this as a single shared constant to avoid drift across agent/gateway.
 pub const FS_S3_OBJECT_PIECE_BYTES: usize = 1024 * 1024;
 
-// Back-compat alias for older code that still refers to "chunk".
-pub const FS_S3_OBJECT_CHUNK_BYTES: usize = FS_S3_OBJECT_PIECE_BYTES;
-
 pub fn is_internal_multipart_relpath(relpath: &str) -> bool {
     let trimmed = relpath.trim_start_matches('/');
     trimmed == FS_S3_MULTIPART_DIR_PREFIX
@@ -71,22 +68,6 @@ pub fn kv_manifest_key(
         "{}/manifest/{}",
         kv_object_prefix(export_cache_kv_key_prefix, export_name, relpath),
         sig
-    )
-}
-
-pub fn kv_chunk_key(
-    export_cache_kv_key_prefix: &str,
-    export_name: &str,
-    relpath: &str,
-    sig: &str,
-    chunk_index: i64,
-) -> String {
-    kv_piece_key(
-        export_cache_kv_key_prefix,
-        export_name,
-        relpath,
-        sig,
-        chunk_index,
     )
 }
 
