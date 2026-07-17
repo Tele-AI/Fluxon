@@ -436,6 +436,7 @@ class MpscContext:
         override_payload_lease_id: Optional[int] = None,
         parent_mpmc_id_opt: Optional[str] = None,
         parent_mpmc_member_id_opt: Optional[int] = None,
+        bind_shutdown_ctl: Optional[Any] = None,
     ):
         chan_id_int_opt: Optional[int] = None if chan_id is None else int(chan_id)
         parent_mpmc_id_int_opt: Optional[int] = (
@@ -450,6 +451,7 @@ class MpscContext:
             override_payload_lease_id,
             parent_mpmc_id_int_opt,
             parent_mpmc_member_id_opt,
+            bind_shutdown_ctl,
         )
 
     def close(self) -> None:
@@ -899,6 +901,7 @@ class MPSCChanConsumer(ChannelConsumer):
         override_payload_lease_id: Optional[int] = None,
         parent_mpmc_id_opt: Optional[str] = None,
         parent_mpmc_member_id_opt: Optional[int] = None,
+        _parent_shutdown_ctl: Optional[MqShutdownCtl] = None,
     ) -> None:
         # Lifecycle safety defaults; see producer for rationale
         self._close_lock = threading.Lock()
@@ -922,6 +925,7 @@ class MPSCChanConsumer(ChannelConsumer):
         self._membership_cleanup_done = False
         self._unpublished_rollback_done = False
         self.shutdown_ctl = MqShutdownCtl()
+        self._handle_shutdown_ctl = _RustMpscContext.new_shutdown_ctl()
         # Validate config strictly (no implicit defaults/fallbacks).
         chan_config = validate_mpsc_config(chan_config, role=ChanRole.CONSUMER)
         self.api = api
@@ -952,24 +956,32 @@ class MPSCChanConsumer(ChannelConsumer):
         else:
             override_member_lease_id = override_global_lease_id
 
-        # Pass parent_mpmc_id_opt through to the Rust side when provided so
-        # sub-consumers created by MPMC can tag their parent channel id. Kept
-        # optional to remain source-compatible with direct MPSC usage.
-        handle = ctx.new_consumer(
-            chan_id,
-            chan_config["ttl_seconds"],
-            chan_config.get("capacity"),
-            override_global_lease_id,
-            override_member_lease_id,
-            override_payload_lease_id,
-            parent_mpmc_id_opt,
-            parent_mpmc_member_id_opt,
-        )
+        unregister_parent_close: Callable[[], None] = lambda: None
+        if _parent_shutdown_ctl is not None:
+            if not isinstance(_parent_shutdown_ctl, MqShutdownCtl):
+                raise TypeError("_parent_shutdown_ctl must be MqShutdownCtl")
+            unregister_parent_close = _parent_shutdown_ctl.register_construction_shutdown(
+                self._handle_shutdown_ctl.close
+            )
+        try:
+            handle = ctx.new_consumer(
+                chan_id,
+                chan_config["ttl_seconds"],
+                chan_config.get("capacity"),
+                override_global_lease_id,
+                override_member_lease_id,
+                override_payload_lease_id,
+                parent_mpmc_id_opt,
+                parent_mpmc_member_id_opt,
+                self._handle_shutdown_ctl,
+            )
+        finally:
+            unregister_parent_close()
 
         # Cache chan_id/consumer_idx early to avoid re-entering PyO3 via _handle
         # inside callbacks, which would trigger "Already mutably borrowed".
         self._handle = handle
-        self._handle_shutdown_ctl=handle.shutdown_clone()
+        self._handle_shutdown_ctl = handle.shutdown_clone()
         self._chan_id = str(self._handle.chan_id())  # type: ignore[attr-defined]
         self._consumer_id: str = self._handle.consumer_idx()  # type: ignore[attr-defined]
         self._dbg_tag: str = (
@@ -1003,6 +1015,21 @@ class MPSCChanConsumer(ChannelConsumer):
             self._consumer_id,
             payload_backend,
         )
+
+        if _parent_shutdown_ctl is not None and _parent_shutdown_ctl.closed:
+            cleanup_result = (
+                self._rollback_unpublished_channel()
+                if self._created_new_channel
+                else self.close()
+            )
+            if not cleanup_result.is_ok():
+                raise RuntimeError(
+                    "MPMC parent closed during MPSC consumer construction; "
+                    f"cleanup failed: {cleanup_result.unwrap_error()}"
+                )
+            cleanup_result.unwrap()
+            raise RuntimeError("MPMC parent closed during MPSC consumer construction")
+
     def dbg_tag(self) -> str:
         return self._dbg_tag
 

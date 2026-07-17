@@ -249,12 +249,25 @@ class _FakeMpscState:
         self.fail_constructor = False
         self.rollback_count = 0
         self.on_construct: Optional[Callable[[], None]] = None
+        self.parent_shutdown_ctls: List[object] = []
 
 
 def _new_fake_mpsc_consumer_type(state: _FakeMpscState):
     class _FakeMpscConsumer:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            del kwargs
+        def __init__(
+            self,
+            *args: object,
+            override_payload_lease_id: object,
+            parent_mpmc_id_opt: object,
+            parent_mpmc_member_id_opt: object,
+            _parent_shutdown_ctl: object,
+        ) -> None:
+            del (
+                override_payload_lease_id,
+                parent_mpmc_id_opt,
+                parent_mpmc_member_id_opt,
+            )
+            state.parent_shutdown_ctls.append(_parent_shutdown_ctl)
             state.constructor_lock_depths.append(state.lock_tracker.depth)
             if state.fail_constructor:
                 raise RuntimeError("injected MPSC constructor failure")
@@ -372,6 +385,7 @@ class TestCreateLockContract(unittest.TestCase):
         self.assertTrue(bound._mpmc_ready_claimed)
         self.assertEqual(locks.calls, [])
         self.assertEqual(mpsc_state.constructor_lock_depths, [0])
+        self.assertEqual(mpsc_state.parent_shutdown_ctls, [channel.shutdown_ctl])
 
     def test_new_consumer_is_constructed_and_published_under_one_lock(self) -> None:
         etcd = _FakeEtcd()
@@ -392,6 +406,7 @@ class TestCreateLockContract(unittest.TestCase):
         consumer = result.unwrap()
         self.assertTrue(consumer._mpmc_ready_claimed)
         self.assertEqual(mpsc_state.constructor_lock_depths, [1])
+        self.assertEqual(mpsc_state.parent_shutdown_ctls, [channel.shutdown_ctl])
         self.assertEqual(len(locks.calls), 1)
         self.assertEqual(
             locks.calls[0].timeout_seconds,

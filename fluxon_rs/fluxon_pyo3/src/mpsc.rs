@@ -451,7 +451,7 @@ impl MpscContext {
     /// 同样地，将 `ttl_seconds` 声明为可选并在实现中主动校验。
     ///
     /// 覆写 lease 语义与 `new_producer` 相同。
-    #[pyo3(signature = (chan_id=None, ttl_seconds=None, capacity=None, override_global_lease_id=None, override_member_lease_id=None, override_payload_lease_id=None, parent_mpmc_id_opt=None, parent_mpmc_member_id_opt=None))]
+    #[pyo3(signature = (chan_id=None, ttl_seconds=None, capacity=None, override_global_lease_id=None, override_member_lease_id=None, override_payload_lease_id=None, parent_mpmc_id_opt=None, parent_mpmc_member_id_opt=None, bind_shutdown_ctl=None))]
     fn new_consumer(
         &self,
         chan_id: Option<i64>,
@@ -462,6 +462,7 @@ impl MpscContext {
         override_payload_lease_id: Option<i64>,
         parent_mpmc_id_opt: Option<i64>,
         parent_mpmc_member_id_opt: Option<i64>,
+        bind_shutdown_ctl: Option<Py<PyShutdownCtl>>,
         py: Python<'_>,
     ) -> PyResult<MpscConsumerHandle> {
         let ttl_seconds = match ttl_seconds {
@@ -476,7 +477,10 @@ impl MpscContext {
         let etcd_backend = self.etcd_backend.clone();
         let endpoints = etcd_backend.endpoints().as_slice().to_vec();
         let kv_backend_uid = self.kv_backend_uid.clone();
-        let shutdown = ShutdownCtl::new();
+        let shutdown = match bind_shutdown_ctl {
+            Some(bind_shutdown_ctl) => bind_shutdown_ctl.borrow(py).shutdown.clone(),
+            None => ShutdownCtl::new(),
+        };
         let shutdown_for_core = shutdown.clone();
         let self_info = self
             .kv_framework
@@ -525,15 +529,21 @@ impl MpscContext {
                                     override_member_lease_id,
                                     override_payload_lease_id,
                                 )?;
-                                ChanManager::new_mpmc_subchannel_with_chan_id(
-                                    lease_manager.clone(),
-                                    endpoints.clone(),
-                                    kv_backend_uid.clone(),
-                                    id,
-                                    leases.global,
-                                    leases.member,
-                                    leases.payload,
-                                    rth.clone(),
+                                // This loader only reads channel metadata and acquires RAII
+                                // keepalive guards. It does not publish membership or channel
+                                // state, so dropping it on shutdown cannot leave remote state.
+                                await_cancel_safe_mpmc_subchannel_load(
+                                    &shutdown_for_core,
+                                    ChanManager::new_mpmc_subchannel_with_chan_id(
+                                        lease_manager.clone(),
+                                        endpoints.clone(),
+                                        kv_backend_uid.clone(),
+                                        id,
+                                        leases.global,
+                                        leases.member,
+                                        leases.payload,
+                                        rth.clone(),
+                                    ),
                                 )
                                 .await
                                 .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -586,6 +596,22 @@ impl MpscContext {
                         override_member_lease_id,
                     )
                 });
+
+                if shutdown_for_core.is_closed() {
+                    let shutdown_error = anyhow::anyhow!(
+                        "MPSC consumer construction stopped before membership bind"
+                    );
+                    if let Some(rollback) = rollback {
+                        if let Err(rollback_error) = rollback.rollback(&etcd_backend).await {
+                            return Err(anyhow::anyhow!(
+                                "{}; rollback failed for newly created MPSC consumer: {:#}",
+                                shutdown_error,
+                                rollback_error
+                            ));
+                        }
+                    }
+                    return Err(shutdown_error);
+                }
 
                 let bind_result = CoreMpscConsumer::bind_mpsc(
                     chan_mgr,

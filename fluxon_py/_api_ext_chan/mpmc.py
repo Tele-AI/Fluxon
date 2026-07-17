@@ -925,6 +925,7 @@ class MPMCChannel(FactoryOnly):
                 override_payload_lease_id=self.payload_lease_id,
                 parent_mpmc_id_opt=self.mpmc_id,
                 parent_mpmc_member_id_opt=self.mpmc_member_id,
+                _parent_shutdown_ctl=self.shutdown_ctl,
             )
         except Exception as e:
             self._best_effort_delete_ready_channel(
