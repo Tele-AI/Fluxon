@@ -149,15 +149,6 @@ pub fn assert_current_provider_contract()
     })
 }
 
-pub fn assert_source_provider_contract()
--> Result<CurrentProviderContractSnapshot, CurrentProviderContractError> {
-    assert_current_provider_contract()
-}
-
-pub type SourceProviderContractSnapshot = CurrentProviderContractSnapshot;
-
-pub type SourceProviderContractError = CurrentProviderContractError;
-
 fn assert_runtime_anchor_field(
     field: &'static str,
     expected_by_sdk: usize,

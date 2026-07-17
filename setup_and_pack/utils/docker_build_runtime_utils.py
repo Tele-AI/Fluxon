@@ -22,7 +22,6 @@ __all__ = [
     "_docker_build_optional_string_list",
     "_docker_build_optional_mapping_list",
     "_docker_build_render_run",
-    "_docker_build_quote_args",
     "_docker_build_resolve_host_path",
     "_docker_build_materialize_path",
     "_docker_build_script_executor",
@@ -93,10 +92,6 @@ def _docker_build_render_run(commands: Sequence[str]) -> str:
         return "RUN :"
     body = " && \\\n    ".join(commands)
     return "RUN set -euo pipefail; \\\n    " + body
-
-
-def _docker_build_quote_args(argv: Sequence[str]) -> str:
-    return shlex.join(list(argv))
 
 
 def _docker_build_resolve_host_path(config_dir: Path, raw_path: str, *, field_name: str) -> Path:
@@ -310,7 +305,7 @@ def build_docker_image_from_config(project_root: Union[str, Path], config_yaml: 
                 [
                     "apt-get update",
                     "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
-                    + _docker_build_quote_args(apt_packages),
+                    + shlex.join(apt_packages),
                     "rm -rf /var/lib/apt/lists/*",
                 ]
             )
@@ -320,7 +315,7 @@ def build_docker_image_from_config(project_root: Union[str, Path], config_yaml: 
         dockerfile_lines.append(
             _docker_build_render_run(
                 [
-                    "yum install -y " + _docker_build_quote_args(yum_packages),
+                    "yum install -y " + shlex.join(yum_packages),
                     "yum clean all",
                     "rm -rf /var/cache/yum",
                 ]
@@ -406,7 +401,7 @@ def build_docker_image_from_config(project_root: Union[str, Path], config_yaml: 
             dockerfile_lines.append(
                 _docker_build_render_run(
                     [
-                        "python3 -m pip install --no-cache-dir " + _docker_build_quote_args(pip_packages),
+                        "python3 -m pip install --no-cache-dir " + shlex.join(pip_packages),
                     ]
                 )
             )

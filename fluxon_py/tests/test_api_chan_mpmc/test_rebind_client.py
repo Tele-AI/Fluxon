@@ -38,12 +38,14 @@ from fluxon_py.tests.test_lib import (  # noqa: E402
     new_test_producer,
     new_test_consumer,
     new_shared_stores,
-    load_test_fluxon_cluster_name,
     run_with_argmatrix,
     etcd_control_call_with_retry as _etcd_call_with_retry,
     etcd_control_delete_prefix as _etcd_delete_prefix,
     etcd_control_get as _etcd_get,
     etcd_control_put as _etcd_put,
+)
+from setup_and_pack.utils.repo_config_utils import (  # noqa: E402
+    load_test_fluxon_cluster_name_from_test_config,
 )
 from fluxon_py.kvclient import KvClientType, new_store  # noqa: E402
 from fluxon_py.kvclient.kvclient_interface import KvClient  # noqa: E402
@@ -113,7 +115,7 @@ def _wait_fluxon_member_absent(instance_key: str, *, timeout_s: int = 45) -> Non
     exited abnormally and the member lease has not expired yet. Do not delete keys here;
     only wait for expiry to minimize test intrusion.
     """
-    cluster = load_test_fluxon_cluster_name()
+    cluster = load_test_fluxon_cluster_name_from_test_config()
     key = f"/fluxon_kv_member_base/{cluster}/members/{instance_key}"
     deadline = time.time() + float(timeout_s)
     while True:

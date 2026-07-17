@@ -34,13 +34,18 @@ PUBLIC_TRANSPORT_FEATURE = "tcp_thread_transport"
 DEFAULT_TESTBED_BOOTSTRAP_MODE = "bare_then_apply"
 DEFAULT_TESTBED_UI_PORT = 18080
 DEFAULT_TESTBED_CONTROLLER_PORT = 19080
+DEFAULT_TESTBED_OPS_CLUSTER_NAME = "fluxon_testbed"
 DEFAULT_TESTBED_HOSTWORKDIR = Path("/mnt/nvme0/store_team_dev/fluxon_deploy")
 LOCAL_PRIMARY_NODE_SUFFIX = "a"
 LOCAL_SECONDARY_NODE_SUFFIX = "b"
 TEST_STACK_START_TEST_BED_CONFIG_ENV = "FLUXON_TEST_STACK_START_TEST_BED_CONFIG"
+RELEASE_MANIFEST_SHA256_ENV_KEY = "FLUXON_RELEASE_MANIFEST_SHA256"
 PLACEHOLDER_WHEEL_NAME = "fluxon-0.0.0-ci-placeholder-cp38-abi3-manylinux_2_28_x86_64.whl"
 SAME_HOST_LOCAL_MULTI_NODE_ETCD_CLIENT_PORT_OFFSET = 100
 SAME_HOST_LOCAL_MULTI_NODE_GREPTIME_PORT_OFFSET = 110
+SAME_HOST_LOCAL_MULTI_NODE_TEST_STACK_COORDINATOR_PORT_OFFSET = 1000
+SAME_HOST_LOCAL_MULTI_NODE_TEST_STACK_TOPOLOGY_PORT_SPAN = 100
+EPHEMERAL_CI_TIKV_RESERVE_SPACE = "0KiB"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -148,6 +153,11 @@ def _parse_args() -> argparse.Namespace:
         help="Fluxon Ops controller HTTP port for the generated testbed configs.",
     )
     parser.add_argument(
+        "--testbed-ops-cluster-name",
+        default=DEFAULT_TESTBED_OPS_CLUSTER_NAME,
+        help="Ops cluster namespace/path segment for the generated local testbed.",
+    )
+    parser.add_argument(
         "--print-generated",
         action="store_true",
         help="Print generated config paths before executing commands.",
@@ -219,6 +229,13 @@ def _cidr32_list_for_ips(*, ips: list[str]) -> list[str]:
     if not out:
         raise ValueError("ips must be non-empty")
     return out
+
+
+def _normalize_testbed_ops_cluster_name(raw: str) -> str:
+    name = _require_nonempty_str(str(raw), "testbed_ops_cluster_name")
+    if re.search(r"[\s/]", name):
+        raise ValueError(f"testbed_ops_cluster_name must not contain whitespace or '/': {name!r}")
+    return name
 
 
 def _detect_local_hostname() -> str:
@@ -477,7 +494,68 @@ def _rewrite_suite_for_local_dual_nodes(
                     }
 
     suite["profiles"] = {PUBLIC_PROFILE_ID: generated_profile}
+    _rewrite_test_stack_coordinator_ports_for_local_controller(
+        suite,
+        controller_port=int(controller_port),
+    )
     return suite
+
+
+def _local_test_stack_coordinator_port_base(
+    *,
+    controller_port: int,
+    topology_key: Any,
+) -> int:
+    topology_offset = 0
+    if isinstance(topology_key, int):
+        topology_offset = int(topology_key) * SAME_HOST_LOCAL_MULTI_NODE_TEST_STACK_TOPOLOGY_PORT_SPAN
+    elif isinstance(topology_key, str) and topology_key.isdigit():
+        topology_offset = int(topology_key) * SAME_HOST_LOCAL_MULTI_NODE_TEST_STACK_TOPOLOGY_PORT_SPAN
+    elif topology_key != "DEFAULT":
+        raise ValueError(f"unsupported test_stack port_alloc topology key: {topology_key!r}")
+
+    port = (
+        int(controller_port)
+        + SAME_HOST_LOCAL_MULTI_NODE_TEST_STACK_COORDINATOR_PORT_OFFSET
+        + topology_offset
+    )
+    if port <= 0 or port > 65535:
+        raise ValueError(f"computed local TEST_STACK coordinator_port_base out of range: {port}")
+    return port
+
+
+def _rewrite_test_stack_coordinator_ports_for_local_controller(
+    suite: dict[str, Any],
+    *,
+    controller_port: int,
+) -> None:
+    profiles = suite.get("profiles")
+    if not isinstance(profiles, dict):
+        raise ValueError("suite.profiles must be a mapping")
+    for profile_id, profile in profiles.items():
+        if not isinstance(profile, dict):
+            continue
+        runtime = profile.get("runtime")
+        if not isinstance(runtime, dict):
+            continue
+        test_stack = runtime.get("test_stack")
+        if not isinstance(test_stack, dict):
+            continue
+        port_alloc = test_stack.get("port_alloc")
+        if not isinstance(port_alloc, dict):
+            raise ValueError(f"profile[{profile_id!r}].runtime.test_stack.port_alloc must be a mapping")
+        by_topology = port_alloc.get("by_topology")
+        if not isinstance(by_topology, dict):
+            raise ValueError(f"profile[{profile_id!r}].runtime.test_stack.port_alloc.by_topology must be a mapping")
+        for topology_key, entry in by_topology.items():
+            if not isinstance(entry, dict):
+                continue
+            if "coordinator_port_base" not in entry:
+                continue
+            entry["coordinator_port_base"] = _local_test_stack_coordinator_port_base(
+                controller_port=int(controller_port),
+                topology_key=topology_key,
+            )
 
 
 def _require_mapping_rewritten_template(
@@ -496,6 +574,21 @@ def _require_mapping_rewritten_template(
     return rewritten
 
 
+def _rewrite_tikv_storage_for_ephemeral_ci(entrypoint: str) -> str:
+    marker = "[storage]\n"
+    if entrypoint.count(marker) != 1:
+        raise ValueError("deployconf.service.tikv.entrypoint must contain exactly one [storage] section")
+    if "reserve-space" in entrypoint or "reserve-raft-space" in entrypoint:
+        raise ValueError("deployconf.service.tikv.entrypoint already configures TiKV reserve files")
+    replacement = (
+        marker
+        + "# The ephemeral CI runner cannot dedicate multi-GiB placeholder files to TiKV.\n"
+        + f'reserve-space = "{EPHEMERAL_CI_TIKV_RESERVE_SPACE}"\n'
+        + f'reserve-raft-space = "{EPHEMERAL_CI_TIKV_RESERVE_SPACE}"\n'
+    )
+    return entrypoint.replace(marker, replacement, 1)
+
+
 def _rewrite_deployconf_for_local_dual_nodes(
     *,
     deployconf_cfg: dict[str, Any],
@@ -506,12 +599,15 @@ def _rewrite_deployconf_for_local_dual_nodes(
     secondary_hostworkdir: Path,
     wheel_name: str,
     controller_port: int,
+    testbed_ops_cluster_name: str = DEFAULT_TESTBED_OPS_CLUSTER_NAME,
 ) -> dict[str, Any]:
+    ops_cluster_name = _normalize_testbed_ops_cluster_name(testbed_ops_cluster_name)
     cfg = _require_mapping_rewritten_template(
         deployconf_cfg,
         primary_node_name=primary_node_name,
         secondary_node_name=secondary_node_name,
     )
+    cfg["namespace"] = ops_cluster_name
     cfg["name_prefix"] = "fluxon-ci-2-virt-node-local2"
     cfg["gen_k8s_daemonset_mirror_outdir"] = str((primary_hostworkdir / "gen_k8s_daemonset").resolve())
     cfg["cluster_nodes"] = [
@@ -546,6 +642,7 @@ def _rewrite_deployconf_for_local_dual_nodes(
         raise ValueError("deployconf.global_envs must be a mapping")
     global_envs["FLUXON_RELEASE_WHEEL"] = wheel_name
     global_envs["FLUXON_RELEASE_WHEEL_PY"] = wheel_name
+    global_envs["FLUXON_CLUSTER_NAME"] = ops_cluster_name
     global_envs["FLUXON_CLUSTER_NODE_IDS"] = f"{primary_node_name} {secondary_node_name}"
     global_envs["MASTER__PORT"] = str(int(controller_port))
     global_envs["FLUXON_OPS_UI_BASE_URL"] = f"http://${{OPS_CONTROLLER__NODE_ID__IP}}:{int(controller_port)}"
@@ -563,6 +660,13 @@ def _rewrite_deployconf_for_local_dual_nodes(
     if not isinstance(ops_controller_cfg, dict):
         raise ValueError("deployconf.service.ops_controller must be a mapping")
     ops_controller_cfg["port"] = int(controller_port)
+    tikv_cfg = service_cfg.get("tikv")
+    if not isinstance(tikv_cfg, dict):
+        raise ValueError("deployconf.service.tikv must be a mapping")
+    tikv_entrypoint = tikv_cfg.get("entrypoint")
+    if not isinstance(tikv_entrypoint, str):
+        raise ValueError("deployconf.service.tikv.entrypoint must be a string")
+    tikv_cfg["entrypoint"] = _rewrite_tikv_storage_for_ephemeral_ci(tikv_entrypoint)
     master_cfg = service_cfg.get("master")
     if not isinstance(master_cfg, dict):
         raise ValueError("deployconf.service.master must be a mapping")
@@ -592,10 +696,12 @@ def _rewrite_start_test_bed_for_local_dual_nodes(
     controller_port: int,
     ui_port: int,
     ui_workdir: Path,
+    testbed_ops_cluster_name: str = DEFAULT_TESTBED_OPS_CLUSTER_NAME,
 ) -> dict[str, Any]:
+    ops_cluster_name = _normalize_testbed_ops_cluster_name(testbed_ops_cluster_name)
     cfg = copy.deepcopy(start_cfg)
     cfg["deployconf_path"] = str(generated_deployconf_path)
-    cfg["controller_url"] = f"http://{controller_access_ip}:{controller_port}/r/ops/fluxon_testbed"
+    cfg["controller_url"] = f"http://{controller_access_ip}:{controller_port}/r/ops/{ops_cluster_name}"
     cfg["controller_basic_auth"] = {"username": "ops_admin", "password": "ops_password"}
     ui_cfg = cfg.get("test_runner_ui")
     if not isinstance(ui_cfg, dict):
@@ -639,6 +745,123 @@ def _require_nonempty_str(value: str, field_name: str) -> str:
 def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=False), encoding="utf-8")
+
+
+def _write_ci_testbed_bundle(
+    *,
+    bundle_root: Path,
+    deployconf: dict[str, Any],
+    start_cfg: dict[str, Any],
+    apply_check_start_cfg: dict[str, Any],
+    artifacts_source_root: Path,
+) -> dict[str, Path]:
+    bundle_root = bundle_root.resolve()
+    bundle_root.mkdir(parents=True, exist_ok=True)
+    deployconf_path = bundle_root / "deployconf_testbed.local.yaml"
+    start_cfg_path = bundle_root / "start_test_bed.runner.yaml"
+    apply_check_start_cfg_path = bundle_root / "start_test_bed.apply_check.runner.yaml"
+    ssh_config_path = bundle_root / "ssh_config"
+    bootstrap_workdir = bundle_root / "bootstrap_workdir"
+    mirror_outdir = bundle_root / "gen_k8s_daemonset"
+    artifacts_path = bundle_root / "artifacts"
+
+    bundled_deployconf = copy.deepcopy(deployconf)
+    bundled_deployconf["gen_k8s_daemonset_mirror_outdir"] = str(mirror_outdir)
+    bundled_start_cfg = copy.deepcopy(start_cfg)
+    bundled_start_cfg["deployconf_path"] = "./deployconf_testbed.local.yaml"
+    bundled_apply_check_start_cfg = copy.deepcopy(apply_check_start_cfg)
+    bundled_apply_check_start_cfg["deployconf_path"] = "./deployconf_testbed.local.yaml"
+    _write_yaml(deployconf_path, bundled_deployconf)
+    _write_yaml(start_cfg_path, bundled_start_cfg)
+    _write_yaml(apply_check_start_cfg_path, bundled_apply_check_start_cfg)
+    ssh_config_path.write_text("# same-host local CI testbed\n", encoding="utf-8")
+    bootstrap_workdir.mkdir(parents=True, exist_ok=True)
+    mirror_outdir.mkdir(parents=True, exist_ok=True)
+    artifacts_path.mkdir(parents=True, exist_ok=True)
+    if artifacts_source_root.exists():
+        for child in artifacts_source_root.iterdir():
+            link_path = artifacts_path / child.name
+            if link_path.exists() or link_path.is_symlink():
+                link_path.unlink()
+            os.symlink(child.resolve(), link_path, target_is_directory=child.is_dir())
+
+    manifest_path = bundle_root / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "deployconf_path": "deployconf_testbed.local.yaml",
+                "start_config_path": "start_test_bed.runner.yaml",
+                "ssh_config_path": "ssh_config",
+                "workdir": "bootstrap_workdir",
+                "bootstrap_mode": "apply_only",
+                "controller_request_mode": "direct",
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "bundle_root": bundle_root,
+        "deployconf_path": deployconf_path,
+        "start_config_path": start_cfg_path,
+        "apply_check_start_config_path": apply_check_start_cfg_path,
+        "ssh_config_path": ssh_config_path,
+        "manifest_path": manifest_path,
+        "artifacts_path": artifacts_path,
+    }
+
+
+def _refresh_ci_testbed_bundle_deployconf_from_start_workdir(
+    *,
+    metadata: dict[str, Any],
+    start_workdir: Path,
+) -> None:
+    source_path = (start_workdir / "deployconf.with_release_manifest_sha256.yaml").resolve()
+    if not source_path.is_file():
+        raise RuntimeError(f"missing normalized start_test_bed deployconf: {source_path}")
+
+    bundle_root = Path(metadata["testbed_bundle_path"]).resolve()
+    bundle_deployconf_path = Path(metadata["testbed_bundle_deployconf_path"]).resolve()
+    if bundle_deployconf_path.parent != bundle_root:
+        raise RuntimeError(
+            "testbed bundle deployconf must live directly under testbed_bundle: "
+            f"bundle={bundle_root} deployconf={bundle_deployconf_path}"
+        )
+
+    deployconf = _load_yaml_mapping(source_path, ctx="normalized start_test_bed deployconf")
+    global_envs = deployconf.get("global_envs")
+    if isinstance(global_envs, dict):
+        global_envs.pop(RELEASE_MANIFEST_SHA256_ENV_KEY, None)
+    mirror_outdir = (bundle_root / "gen_k8s_daemonset").resolve()
+    mirror_outdir.mkdir(parents=True, exist_ok=True)
+    deployconf["gen_k8s_daemonset_mirror_outdir"] = str(mirror_outdir)
+    _write_yaml(bundle_deployconf_path, deployconf)
+    print(
+        "synced runner testbed bundle deployconf from normalized start_test_bed output: "
+        f"{source_path} -> {bundle_deployconf_path}",
+        flush=True,
+    )
+
+
+def _prior_normalized_start_workdir_for_skip_start_testbed(*, metadata: dict[str, Any]) -> Path:
+    candidates = [
+        Path(metadata["bootstrap_apply_workdir"]).resolve(),
+        Path(metadata["bootstrap_bare_workdir"]).resolve(),
+    ]
+    for workdir in candidates:
+        if (workdir / "deployconf.with_release_manifest_sha256.yaml").is_file():
+            return workdir
+    checked = ", ".join(
+        str(workdir / "deployconf.with_release_manifest_sha256.yaml")
+        for workdir in candidates
+    )
+    raise RuntimeError(
+        "--skip-start-testbed requires a previous normalized start_test_bed deployconf before running "
+        f"test_runner; checked: {checked}. Rerun without --skip-start-testbed or keep the prior start_test_bed workdir."
+    )
 
 
 def _prepare_pack_release_runtime_dirs(*, project_data_root: Path) -> None:
@@ -742,6 +965,7 @@ def _build_generated_configs(
     wheel_name: str,
 ) -> dict[str, Any]:
     scene_ids = _selected_scene_ids(args, suite_cfg)
+    testbed_ops_cluster_name = _normalize_testbed_ops_cluster_name(args.testbed_ops_cluster_name)
     generated_suite = _rewrite_suite_for_local_dual_nodes(
         suite_cfg=suite_cfg,
         scene_ids=scene_ids,
@@ -760,6 +984,7 @@ def _build_generated_configs(
         secondary_hostworkdir=secondary_hostworkdir,
         wheel_name=wheel_name,
         controller_port=int(args.controller_port),
+        testbed_ops_cluster_name=testbed_ops_cluster_name,
     )
     generated_start_cfg = _rewrite_start_test_bed_for_local_dual_nodes(
         start_cfg=start_test_bed_template,
@@ -769,6 +994,7 @@ def _build_generated_configs(
         controller_port=int(args.controller_port),
         ui_port=int(args.ui_port),
         ui_workdir=workdir / "test_runner_ui_runtime",
+        testbed_ops_cluster_name=testbed_ops_cluster_name,
     )
     generated_apply_check_cfg = _rewrite_start_test_bed_for_apply_check(
         start_cfg=generated_start_cfg,
@@ -785,10 +1011,21 @@ def _build_generated_configs(
 
     runner_workdir = args.runner_workdir.resolve() if args.runner_workdir else (workdir / "runner_run").resolve()
     bootstrap_root = (workdir / "start_test_bed").resolve()
+    testbed_bundle = _write_ci_testbed_bundle(
+        bundle_root=runner_workdir / "testbed_bundle",
+        deployconf=generated_deployconf,
+        start_cfg=generated_start_cfg,
+        apply_check_start_cfg=generated_apply_check_cfg,
+        artifacts_source_root=_resolve_repo_root_cli_path(args.release_dir) / "test_rsc",
+    )
     return {
         "suite_path": suite_path,
         "deployconf_path": deployconf_path,
         "start_test_bed_path": start_cfg_path,
+        "testbed_bundle_path": testbed_bundle["bundle_root"],
+        "testbed_bundle_deployconf_path": testbed_bundle["deployconf_path"],
+        "testbed_bundle_start_config_path": testbed_bundle["start_config_path"],
+        "testbed_bundle_apply_check_start_config_path": testbed_bundle["apply_check_start_config_path"],
         "start_test_bed_apply_check_path": start_apply_check_cfg_path,
         "bootstrap_root": bootstrap_root,
         "bootstrap_bare_workdir": bootstrap_root / "bare",
@@ -937,13 +1174,17 @@ def main() -> int:
             sys.executable,
             str((REPO_ROOT / "fluxon_test_stack" / "start_test_bed.py").resolve()),
             "-c",
-            str(metadata["start_test_bed_path"]),
+            str(metadata["testbed_bundle_start_config_path"]),
             "-w",
             str(metadata["bootstrap_bare_workdir"]),
             "--bootstrap-mode",
             "bare_only" if not args.skip_apply_check else args.bootstrap_mode,
         ]
         _run(start_bare_cmd)
+        _refresh_ci_testbed_bundle_deployconf_from_start_workdir(
+            metadata=metadata,
+            start_workdir=Path(metadata["bootstrap_bare_workdir"]),
+        )
 
         if not args.skip_apply_check:
             metadata["bootstrap_apply_workdir"].mkdir(parents=True, exist_ok=True)
@@ -951,26 +1192,39 @@ def main() -> int:
                 sys.executable,
                 str((REPO_ROOT / "fluxon_test_stack" / "start_test_bed.py").resolve()),
                 "-c",
-                str(metadata["start_test_bed_apply_check_path"]),
+                str(metadata["testbed_bundle_apply_check_start_config_path"]),
                 "-w",
                 str(metadata["bootstrap_apply_workdir"]),
                 "--bootstrap-mode",
                 "apply_only",
             ]
             _run(start_apply_cmd)
+            _refresh_ci_testbed_bundle_deployconf_from_start_workdir(
+                metadata=metadata,
+                start_workdir=Path(metadata["bootstrap_apply_workdir"]),
+            )
         elif args.bootstrap_mode in ("apply_only", "bare_then_apply"):
             metadata["bootstrap_apply_workdir"].mkdir(parents=True, exist_ok=True)
             start_apply_cmd = [
                 sys.executable,
                 str((REPO_ROOT / "fluxon_test_stack" / "start_test_bed.py").resolve()),
                 "-c",
-                str(metadata["start_test_bed_path"]),
+                str(metadata["testbed_bundle_start_config_path"]),
                 "-w",
                 str(metadata["bootstrap_apply_workdir"]),
                 "--bootstrap-mode",
                 args.bootstrap_mode,
             ]
             _run(start_apply_cmd)
+            _refresh_ci_testbed_bundle_deployconf_from_start_workdir(
+                metadata=metadata,
+                start_workdir=Path(metadata["bootstrap_apply_workdir"]),
+            )
+    elif not args.skip_runner:
+        _refresh_ci_testbed_bundle_deployconf_from_start_workdir(
+            metadata=metadata,
+            start_workdir=_prior_normalized_start_workdir_for_skip_start_testbed(metadata=metadata),
+        )
 
     if not args.skip_runner:
         runner_workdir = Path(metadata["runner_workdir"])
@@ -983,7 +1237,13 @@ def main() -> int:
             "-w",
             str(runner_workdir),
         ]
-        _run(runner_cmd, env=_runner_env(release_dir=release_dir, start_cfg_path=Path(metadata["start_test_bed_path"])))
+        _run(
+            runner_cmd,
+            env=_runner_env(
+                release_dir=release_dir,
+                start_cfg_path=Path(metadata["testbed_bundle_start_config_path"]),
+            ),
+        )
 
     return 0
 

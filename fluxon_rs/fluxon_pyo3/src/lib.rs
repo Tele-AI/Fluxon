@@ -18,9 +18,7 @@ use fluxon_kv::client_kv_api::ClientKvApiViewTrait;
 use fluxon_kv::cluster_manager::ClusterManagerViewTrait;
 use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use fluxon_kv::config::{ClientConfigYaml, MasterConfigYaml};
-use fluxon_kv::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
-use fluxon_kv::p2p::msg_pack::{MsgPack, RPCCaller, call_rpc};
-use fluxon_kv::p2p::p2p_module::P2pModuleViewTrait;
+use fluxon_kv::p2p::msg_pack::{MsgPack, call_rpc};
 use fluxon_kv::p2p::p2p_module::{UserRpcHandler, user_rpc_register_handler};
 use fluxon_kv::rpcresp_kvresult_convert::msg_and_error::{
     ApiError as CoreApiError, KvError as CoreKvError, KvResult, OK,
@@ -39,8 +37,9 @@ use fluxon_util::run_async_from_sync::{SyncAsyncBridge, borrow_stable_owner};
 use fluxon_util::{
     FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
 };
-use futures::Future;
-use pyo3::exceptions::{PyOSError, PyPermissionError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{
+    PyKeyboardInterrupt, PyOSError, PyPermissionError, PyRuntimeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule, PyString, PyTuple};
@@ -61,12 +60,16 @@ mod flatdict_zerocopy;
 mod kvfuture;
 pub use kvfuture::KvFuture;
 mod error;
+use error::{
+    new_backend_init_failed_error, new_general_error, new_invalid_argument_error,
+    new_key_not_found_error, new_network_error, new_none_success_instance,
+};
 mod etcd;
 mod mpsc; // Python ApiError constructors and MPSC error mapping
 pub use etcd::{PyEtcdKvClient, PyEtcdLock};
 pub use mpsc::{MpscConsumerHandle, MpscContext, MpscProducerHandle};
 mod lease_manager;
-pub use lease_manager::{LeaseManagerHandle, PyGeneralLease, PyLeaseBackendUid};
+pub use lease_manager::{LeaseManagerHandle, PyGeneralLease};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RdmavDriverEnvUpdate {
@@ -851,27 +854,74 @@ fn require_kv_framework_api(client: &KvClient, py: Python) -> Result<Arc<Framewo
         .ok_or_else(|| new_general_error(py, "Client is closed"))
 }
 
-fn register_mq_shutdown_bridge(kv_framework: &Arc<Framework>, mq_framework: &fluxon_mq::Framework) {
-    use fluxon_framework_compiled::shutdown::ViewShutdownExt;
-    use fluxon_framework_compiled::spawn::ViewSpawnExt;
+/// Routes explicit and KV-triggered shutdown through one framework owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MqShutdownRequest {
+    Open,
+    CloseRequested,
+}
 
-    let mut waiter = kv_framework.register_shutdown_waiter();
-    let mq_fw = mq_framework.clone();
-    let fut = async move {
-        waiter.wait().await;
-        let mq_fw_for_shutdown = mq_fw.clone();
-        let _ = mq_fw.spawn_boxed(Box::pin(async move {
-            mq_fw_for_shutdown
-                .shutdown()
-                .await
-                .expect("mq_framework.shutdown() failed during kv shutdown bridge");
-        }));
-    };
-    let handle = kv_framework.spawn_boxed(Box::pin(fut));
-    kv_framework.push_join_handle(
-        "pyo3.kv_shutdown_bridge_to_mq_framework".to_string(),
-        handle,
-    );
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MqShutdownCompletion {
+    Pending,
+    Finished(Result<(), String>),
+}
+
+#[derive(Clone)]
+struct MqFrameworkShutdown {
+    request_tx: tokio::sync::watch::Sender<MqShutdownRequest>,
+    completion_rx: tokio::sync::watch::Receiver<MqShutdownCompletion>,
+}
+
+impl MqFrameworkShutdown {
+    fn new(runtime: &tokio::runtime::Handle, mq_framework: fluxon_mq::Framework) -> Self {
+        let (request_tx, mut request_rx) = tokio::sync::watch::channel(MqShutdownRequest::Open);
+        let (completion_tx, completion_rx) =
+            tokio::sync::watch::channel(MqShutdownCompletion::Pending);
+
+        // This task is intentionally outside the MQ task registry so shutdown
+        // never waits for the task that is driving it.
+        let _shutdown_worker = runtime.spawn(async move {
+            loop {
+                if *request_rx.borrow_and_update() == MqShutdownRequest::CloseRequested {
+                    break;
+                }
+                if request_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+
+            let result = mq_framework.shutdown().await.map_err(|err| err.to_string());
+            completion_tx.send_replace(MqShutdownCompletion::Finished(result));
+        });
+
+        Self {
+            request_tx,
+            completion_rx,
+        }
+    }
+
+    fn is_requested(&self) -> bool {
+        *self.request_tx.borrow() == MqShutdownRequest::CloseRequested
+    }
+
+    async fn shutdown(&self) -> Result<(), String> {
+        self.request_tx
+            .send_replace(MqShutdownRequest::CloseRequested);
+        let mut completion_rx = self.completion_rx.clone();
+        loop {
+            match completion_rx.borrow().clone() {
+                MqShutdownCompletion::Pending => {}
+                MqShutdownCompletion::Finished(result) => return result,
+            }
+            if completion_rx.changed().await.is_err() {
+                return Err(
+                    "MQ shutdown worker stopped before publishing its completion result"
+                        .to_string(),
+                );
+            }
+        }
+    }
 }
 
 fn register_fs_shutdown_bridge(kv_framework: &Arc<Framework>, fs_framework: &fluxon_fs::Framework) {
@@ -924,26 +974,78 @@ fn new_fluxon_fs_context(client: &KvClient) -> PyResult<FluxonFsContext> {
 struct FluxonMqContext {
     kv_framework: Arc<Framework>,
     runtime: tokio::runtime::Handle,
+    kv_lease_backend: fluxon_mq::lease_manager::LeaseBackendUid,
     mq_framework: fluxon_mq::Framework,
+    mq_shutdown: MqFrameworkShutdown,
 }
 
-fn new_fluxon_mq_context(client: &KvClient) -> PyResult<FluxonMqContext> {
-    let kv_framework = require_kv_framework(client)?;
+struct FluxonKvLeaseContext {
+    backend: fluxon_mq::lease_manager::LeaseBackendUid,
+    runtime: tokio::runtime::Handle,
+}
+
+fn new_fluxon_kv_lease_context(client: &KvClient) -> PyResult<FluxonKvLeaseContext> {
+    let framework = require_kv_framework(client)?;
     let runtime = client
         .runtime
         .as_ref()
         .ok_or_else(|| PyRuntimeError::new_err("KvClient runtime is missing"))?
         .handle()
         .clone();
+    let cluster = client.config.cluster_name.clone();
+    let instance_key = client.config.instance_key.clone();
+
+    let allocate_framework = framework.clone();
+    let allocate: fluxon_mq::lease_manager::KvAllocateLease = Arc::new(move |ttl_seconds| {
+        let framework = allocate_framework.clone();
+        Box::pin(async move {
+            if ttl_seconds <= 0 {
+                anyhow::bail!("Fluxon KV lease TTL must be positive: {}", ttl_seconds);
+            }
+            framework
+                .kv_allocate_lease(ttl_seconds as u64)
+                .await
+                .map_err(|err| anyhow::anyhow!("Fluxon KV lease allocation failed: {}", err))
+        })
+    });
+
+    let keepalive_framework = framework;
+    let keepalive: fluxon_mq::lease_manager::KvKeepaliveLease = Arc::new(move |lease_id| {
+        let framework = keepalive_framework.clone();
+        Box::pin(async move {
+            framework
+                .kv_keepalive_lease(lease_id)
+                .await
+                .map_err(|err| anyhow::anyhow!("Fluxon KV lease keepalive failed: {}", err))
+        })
+    });
+
+    Ok(FluxonKvLeaseContext {
+        backend: fluxon_mq::lease_manager::LeaseBackendUid::kv_client(
+            cluster,
+            instance_key,
+            allocate,
+            keepalive,
+        ),
+        runtime,
+    })
+}
+
+fn new_fluxon_mq_context(client: &KvClient) -> PyResult<FluxonMqContext> {
+    let lease_context = new_fluxon_kv_lease_context(client)?;
+    let kv_framework = require_kv_framework(client)?;
+    let runtime = lease_context.runtime;
     let mq_framework: fluxon_mq::Framework = {
         let _guard = runtime.enter();
         fluxon_mq::new_mq_framework()
     };
-    register_mq_shutdown_bridge(&kv_framework, &mq_framework);
+    let mq_shutdown = MqFrameworkShutdown::new(&runtime, mq_framework.clone());
     Ok(FluxonMqContext {
         kv_framework,
         runtime,
+        kv_lease_backend: lease_context.backend,
         mq_framework,
+        mq_shutdown,
     })
 }
 
@@ -1876,11 +1978,6 @@ impl FluxonFsAgent {
     }
 }
 
-// Compatibility wrappers: delegate to crate::error central helpers.
-fn new_none_success_instance(py: Python) -> PyObject {
-    crate::error::new_none_success_instance(py)
-}
-
 fn py_request_identity_tuple_to_core(
     request_identity: Option<(String, String)>,
 ) -> PyResult<Option<FluxonFsRequestIdentity>> {
@@ -1900,34 +1997,6 @@ fn py_request_identity_tuple_to_core(
         }
         None => Ok(None),
     }
-}
-
-fn new_general_error(py: Python, message: &str) -> PyObject {
-    crate::error::new_general_error(py, message)
-}
-
-fn new_invalid_argument_error(py: Python, message: &str) -> PyObject {
-    crate::error::new_invalid_argument_error(py, message)
-}
-
-fn new_backend_init_failed_error(
-    py: Python,
-    message: &str,
-    backend_name: Option<&str>,
-) -> PyObject {
-    crate::error::new_backend_init_failed_error(py, message, backend_name)
-}
-
-fn new_network_error(py: Python, message: &str, endpoint: Option<&str>) -> PyObject {
-    crate::error::new_network_error(py, message, endpoint)
-}
-
-fn new_key_not_found_error(py: Python, message: &str, key: Option<&str>) -> PyObject {
-    crate::error::new_key_not_found_error(py, message, key)
-}
-
-fn new_store_closed_error(py: Python, message: &str) -> PyObject {
-    crate::error::new_store_closed_error(py, message)
 }
 
 #[pyfunction]
@@ -1979,11 +2048,6 @@ fn monitor_render_web(config_path: String, workdir: String) -> PyResult<String> 
 struct OpsControllerConfigYaml {
     ops_controller: fluxon_ops::ControllerConfigYaml,
     fluxon_cli: fluxon_cli::config::MonitorConfigYaml,
-}
-
-fn ops_panel_proxy_desc_etcd_key(service_name: &str, cluster_name: &str) -> String {
-    // English note: keep this key format consistent with fluxon_cli::server::fluxon_cli_proxy_desc_etcd_key.
-    fluxon_cli_proxy_desc_etcd_key_v2(service_name, cluster_name)
 }
 
 #[pyfunction]
@@ -2120,7 +2184,10 @@ fn fluxon_ops_controller_blocking(
                 Duration::from_secs(60),
             );
 
-            let etcd_key = ops_panel_proxy_desc_etcd_key(fluxon_ops::OPS_SERVICE_NAME, &cli_cfg.cluster_name);
+            let etcd_key = fluxon_cli_proxy_desc_etcd_key_v2(
+                fluxon_ops::OPS_SERVICE_NAME,
+                &cli_cfg.cluster_name,
+            );
             // English note:
             // - Self-host bootstrap can put etcd under heavy load (range reads, linearizable reads).
             // - If etcd connect/get stalls without returning, the controller would hang forever and never
@@ -4016,9 +4083,17 @@ impl Drop for KvMaster {
 
 /// Run master with automatic lifecycle management
 /// This function creates a master, runs it until Ctrl+C, then shuts down
+fn finish_master_owned_ctrl_c(py: Python<'_>, signal_result: PyResult<()>) -> PyResult<()> {
+    match signal_result {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_instance_of::<PyKeyboardInterrupt>(py) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (config=None))]
-fn run_master_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyObject {
+fn run_master_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyResult<PyObject> {
     fn run_master_inner(config: Option<&Bound<'_, PyAny>>, py: Python) -> ApiResult<PyObject> {
         // Debug config
         println!("🛠️  Master init configuration: {:?}", config);
@@ -4140,7 +4215,11 @@ fn run_master_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyObjec
         out
     }
 
-    run_master_inner(config, py).into_py_object(py)
+    let result = run_master_inner(config, py);
+    // This function owns Ctrl+C and has already completed framework shutdown.
+    // Consume Python's duplicate KeyboardInterrupt before constructing Result.ok.
+    finish_master_owned_ctrl_c(py, py.check_signals())?;
+    Ok(result.into_py_object(py))
 }
 
 /// Python module definition
@@ -4162,7 +4241,6 @@ fn fluxon_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEtcdKvClient>()?;
     m.add_class::<PyEtcdLock>()?;
     m.add_class::<PyGeneralLease>()?;
-    m.add_class::<PyLeaseBackendUid>()?;
     m.add_function(wrap_pyfunction!(run_master_blocking, m)?)?;
     m.add_function(wrap_pyfunction!(monitor_render_cli, m)?)?;
     m.add_function(wrap_pyfunction!(monitor_render_web, m)?)?;
@@ -4182,15 +4260,29 @@ mod tests {
     use super::{
         bundled_driver_names_from_entries, configure_bundled_rdmav_driver_env,
         discover_bundled_ibverbs_driver_config,
-        extract_fluxon_pyo3_libs_root_from_loaded_library_line, loaded_fluxon_pyo3_libs_roots,
-        parse_bundled_ibverbs_driver_name, sanitize_bundled_ld_library_path_entries,
-        set_authoritative_bundled_ld_library_path, validate_single_fluxon_pyo3_libs_root,
+        extract_fluxon_pyo3_libs_root_from_loaded_library_line, finish_master_owned_ctrl_c,
+        loaded_fluxon_pyo3_libs_roots, parse_bundled_ibverbs_driver_name,
+        sanitize_bundled_ld_library_path_entries, set_authoritative_bundled_ld_library_path,
+        validate_single_fluxon_pyo3_libs_root,
     };
+    use pyo3::Python;
+    use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn master_owned_ctrl_c_consumes_only_keyboard_interrupt() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            assert!(
+                finish_master_owned_ctrl_c(py, Err(PyKeyboardInterrupt::new_err("ctrl-c"))).is_ok()
+            );
+            assert!(finish_master_owned_ctrl_c(py, Err(PyRuntimeError::new_err("other"))).is_err());
+        });
+    }
 
     struct EnvSnapshot {
         key: &'static str,

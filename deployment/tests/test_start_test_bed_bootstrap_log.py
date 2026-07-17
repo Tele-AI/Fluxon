@@ -793,12 +793,15 @@ def test_normalize_bootstrap_deployconf_rewrites_same_host_local_multi_node_fixe
                 )
             },
             "ops_controller": {
+                "port": 19180,
                 "entrypoint": (
                     'cat > "${WORKDIR}/ops_controller.yaml" <<YAML\n'
                     "ops_controller:\n"
                     "  kv_client:\n"
                     "    fluxonkv_spec:\n"
                     "      p2p_listen_port: 12102\n"
+                    "fluxon_cli:\n"
+                    "  http_listen_addr: \"0.0.0.0:${OPS_CONTROLLER__PORT}\"\n"
                     "YAML\n"
                 )
             },
@@ -835,7 +838,9 @@ def test_normalize_bootstrap_deployconf_rewrites_same_host_local_multi_node_fixe
     assert "port: 19290" in normalized["service"]["master"]["entrypoint"], normalized["service"]["master"]["entrypoint"]
     assert "OPS_AGENT_P2P_LISTEN_PORT=19320" in normalized["service"]["ops_agent"]["entrypoint"], normalized["service"]["ops_agent"]["entrypoint"]
     assert "OPS_AGENT_P2P_LISTEN_PORT=19321" in normalized["service"]["ops_agent"]["entrypoint"], normalized["service"]["ops_agent"]["entrypoint"]
+    assert normalized["service"]["ops_controller"]["port"] == 19280, normalized["service"]["ops_controller"]
     assert "p2p_listen_port: 19310" in normalized["service"]["ops_controller"]["entrypoint"], normalized["service"]["ops_controller"]["entrypoint"]
+    assert 'http_listen_addr: "0.0.0.0:19280"' in normalized["service"]["ops_controller"]["entrypoint"], normalized["service"]["ops_controller"]["entrypoint"]
     assert notes[0] == "same_host_local_multi_node: rewrote fixed host-listen ports from controller anchor 19280", notes
     assert deployconf["service"]["etcd"]["port"] == 33579, deployconf
     assert deployconf["service"]["master"]["entrypoint"].count("51051") == 1, deployconf

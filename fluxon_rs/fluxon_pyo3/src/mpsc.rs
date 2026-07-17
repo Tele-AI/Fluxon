@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -22,10 +23,9 @@ use tokio::runtime::Runtime;
 // (no local payload buffering)
 
 use crate::flatdict_zerocopy::{FlatDictDataOwner, decode_flat_dict_to_wrapped_py_object};
-use crate::lease_manager::PyLeaseBackendUid;
 use fluxon_kv::{Framework as KvFramework, KvClientTrait};
 use fluxon_mq::lease_manager::LeaseBackendUid;
-use fluxon_util::lease_manager::{GLOBAL_LM, LeaseManager};
+use fluxon_util::lease_manager::GLOBAL_LM;
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use tracing::{debug, warn};
 
@@ -44,6 +44,33 @@ static GLOBAL_RUNTIME: OnceLock<Arc<Runtime>> = OnceLock::new();
 
 static CONSUMED_MESSAGE_CLASS: OnceLock<Py<PyAny>> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MpmcSubchannelLeaseIds {
+    global: i64,
+    member: i64,
+    payload: i64,
+}
+
+fn require_mpmc_subchannel_lease_ids(
+    global: Option<i64>,
+    member: Option<i64>,
+    payload: Option<i64>,
+) -> anyhow::Result<MpmcSubchannelLeaseIds> {
+    fn require_positive(name: &str, value: Option<i64>) -> anyhow::Result<i64> {
+        match value {
+            Some(value) if value > 0 => Ok(value),
+            Some(value) => anyhow::bail!("{name} must be positive, got {value}"),
+            None => anyhow::bail!("{name} is required for MPMC subchannel bind"),
+        }
+    }
+
+    Ok(MpmcSubchannelLeaseIds {
+        global: require_positive("override_global_lease_id", global)?,
+        member: require_positive("override_member_lease_id", member)?,
+        payload: require_positive("override_payload_lease_id", payload)?,
+    })
+}
+
 const SUB_CLUSTER_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const RUST_KV_GET_TIMEOUT: Duration = Duration::from_secs(10);
 const RUST_KV_DELETE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,6 +78,23 @@ const RUST_KV_DELETE_JOIN_WARN_INTERVAL: Duration = Duration::from_secs(1);
 const PAYLOAD_STAGE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
 const PAYLOAD_STAGE_SLOW_WARN_THRESHOLD: Duration = Duration::from_secs(1);
 const GET_ONE_PENDING_WARN_INTERVAL: Duration = Duration::from_secs(2);
+
+async fn await_cancel_safe_mpmc_subchannel_load<T, F>(
+    shutdown: &ShutdownCtl,
+    load: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    tokio::pin!(load);
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_closed() => {
+            Err(anyhow::anyhow!("MPMC subchannel construction stopped by shutdown"))
+        }
+        result = &mut load => result,
+    }
+}
 
 /// Global runtime for standalone PyO3 helpers (e.g., lease_manager.rs).
 /// MQ operations should use the KV client's runtime/framework instead.
@@ -129,40 +173,45 @@ fn finalize_payload_result(
 // (LeaseManagerHandle and PyLease moved to lease_manager.rs)
 
 /// Shared MPSC context bound to a specific etcd endpoint set.
-/// Holds only the endpoints; runtime and lease managers are
-/// singletons under the hood.
+/// Owns the native Fluxon KV lease backend used by all child endpoints.
 #[pyclass]
 pub struct MpscContext {
     endpoints: Vec<String>,
     kv_backend_uid: LeaseBackendUid,
     kv_framework: Arc<KvFramework>,
     kv_runtime: Handle,
-    mq_framework: Option<fluxon_mq::Framework>,
+    mq_framework: fluxon_mq::Framework,
+    mq_shutdown: crate::MqFrameworkShutdown,
 }
 
 #[pymethods]
 impl MpscContext {
-    /// Create a new MPSC context from etcd endpoints.
+    #[staticmethod]
+    fn new_shutdown_ctl() -> PyShutdownCtl {
+        PyShutdownCtl {
+            shutdown: ShutdownCtl::new(),
+        }
+    }
+
+    /// Create an MPSC context on the native KV client's runtime.
     ///
-    /// The runtime is created lazily on first use and shared
-    /// globally; `LeaseManager::for_endpoints` handles per-endpoint
-    /// singletons internally.
+    /// The context derives its lease backend directly from the client's Rust
+    /// framework; no Python callback participates in lease operations.
     #[new]
     fn new(
         py: Python<'_>,
         etcd_endpoints: Vec<String>,
-        kv_backend_uid: Py<PyLeaseBackendUid>,
         kv_client: Py<crate::KvClient>,
     ) -> PyResult<Self> {
-        let uid = kv_backend_uid.borrow(py).backend_uid().clone();
         let kv_client_ref = kv_client.borrow(py);
         let mq_context = crate::new_fluxon_mq_context(&kv_client_ref)?;
         Ok(Self {
             endpoints: etcd_endpoints,
-            kv_backend_uid: uid,
+            kv_backend_uid: mq_context.kv_lease_backend,
             kv_framework: mq_context.kv_framework.clone(),
             kv_runtime: mq_context.runtime.clone(),
-            mq_framework: Some(mq_context.mq_framework.clone()),
+            mq_framework: mq_context.mq_framework,
+            mq_shutdown: mq_context.mq_shutdown,
         })
     }
 
@@ -180,9 +229,8 @@ impl MpscContext {
     /// `override_global_lease_id` / `override_member_lease_id`
     /// 允许上层（例如 MPMC）覆写 channel 的 global / member
     /// lease。若提供，则 `create_mpsc_channel` 将复用该 lease
-    /// 而不是新建；生命周期仍由上层控制，本层只负责
-    /// keepalive，并在 drop 时不 revoke。
-    #[pyo3(signature = (chan_id=None, ttl_seconds=None, weight=None, capacity=None, override_global_lease_id=None, override_member_lease_id=None, override_payload_lease_id=None, parent_mpmc_id_opt=None, parent_mpmc_member_id_opt=None))]
+    /// 而不是新建；生命周期仍由上层控制，本层只贡献 keepalive。
+    #[pyo3(signature = (chan_id=None, ttl_seconds=None, weight=None, capacity=None, override_global_lease_id=None, override_member_lease_id=None, override_payload_lease_id=None, parent_mpmc_id_opt=None, parent_mpmc_member_id_opt=None, bind_shutdown_ctl=None))]
     fn new_producer(
         &self,
         chan_id: Option<i64>,
@@ -194,6 +242,7 @@ impl MpscContext {
         override_payload_lease_id: Option<i64>,
         parent_mpmc_id_opt: Option<i64>,
         parent_mpmc_member_id_opt: Option<i64>,
+        bind_shutdown_ctl: Option<Py<PyShutdownCtl>>,
         py: Python<'_>,
     ) -> PyResult<MpscProducerHandle> {
         let ttl_seconds = match ttl_seconds {
@@ -220,10 +269,16 @@ impl MpscContext {
             .metric_reporter_view()
             .metric_reporter()
             .metrics_handle();
-        let lifecycle = self.mq_framework.as_ref().cloned().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("MpscContext is closed")
-        })?;
-        let shutdown = ShutdownCtl::new();
+        if self.mq_shutdown.is_requested() {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "MpscContext is closed",
+            ));
+        }
+        let lifecycle = self.mq_framework.clone();
+        let shutdown = match bind_shutdown_ctl {
+            Some(bind_shutdown_ctl) => bind_shutdown_ctl.borrow(py).shutdown.clone(),
+            None => ShutdownCtl::new(),
+        };
         let shutdown_for_core = shutdown.clone();
         let runtime = self.kv_runtime.clone();
         let rth = runtime.clone();
@@ -235,15 +290,49 @@ impl MpscContext {
                 // channel or by binding to an existing one.
                 let chan_mgr: anyhow::Result<ChanManager> = async {
                     match chan_id {
-                        Some(id) => ChanManager::new_with_chan_id(
-                            lease_manager.clone(),
-                            endpoints.clone(),
-                            kv_backend_uid.clone(),
-                            id,
-                            rth.clone(),
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e.to_string())),
+                        Some(id) => {
+                            if parent_mpmc_id_opt.is_some() || parent_mpmc_member_id_opt.is_some()
+                            {
+                                if parent_mpmc_id_opt.is_none()
+                                    || parent_mpmc_member_id_opt.is_none()
+                                {
+                                    return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None"));
+                                }
+                                let leases = require_mpmc_subchannel_lease_ids(
+                                    override_global_lease_id,
+                                    override_member_lease_id,
+                                    override_payload_lease_id,
+                                )?;
+                                // This loader only reads channel metadata and acquires RAII
+                                // keepalive guards. It does not publish membership or channel
+                                // state, so dropping it on shutdown cannot leave remote state.
+                                await_cancel_safe_mpmc_subchannel_load(
+                                    &shutdown_for_core,
+                                    ChanManager::new_mpmc_subchannel_with_chan_id(
+                                        lease_manager.clone(),
+                                        endpoints.clone(),
+                                        kv_backend_uid.clone(),
+                                        id,
+                                        leases.global,
+                                        leases.member,
+                                        leases.payload,
+                                        rth.clone(),
+                                    ),
+                                )
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            } else {
+                                ChanManager::new_with_chan_id(
+                                    lease_manager.clone(),
+                                    endpoints.clone(),
+                                    kv_backend_uid.clone(),
+                                    id,
+                                    rth.clone(),
+                                )
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            }
+                        }
                         None => {
                             let cap = capacity.ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -272,6 +361,12 @@ impl MpscContext {
                 }
                 .await;
                 let chan_mgr = chan_mgr?;
+
+                if shutdown_for_core.is_closed() {
+                    return Err(anyhow::anyhow!(
+                        "MPSC producer construction stopped before membership bind"
+                    ));
+                }
 
                 let category = match (parent_mpmc_id_opt, parent_mpmc_member_id_opt) {
                     (Some(pid), Some(_mid)) => fluxon_mq::keys::MqCategory::MpmcSub { parent_mpmc_id: pid },
@@ -365,9 +460,12 @@ impl MpscContext {
             .metric_reporter_view()
             .metric_reporter()
             .metrics_handle();
-        let lifecycle = self.mq_framework.as_ref().cloned().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("MpscContext is closed")
-        })?;
+        if self.mq_shutdown.is_requested() {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "MpscContext is closed",
+            ));
+        }
+        let lifecycle = self.mq_framework.clone();
         let runtime = self.kv_runtime.clone();
         let rth = runtime.clone();
         let outer = py.allow_threads(|| runtime
@@ -376,15 +474,43 @@ impl MpscContext {
 
                 let chan_mgr: anyhow::Result<ChanManager> = async {
                     match chan_id {
-                        Some(id) => ChanManager::new_with_chan_id(
-                            lease_manager.clone(),
-                            endpoints.clone(),
-                            kv_backend_uid.clone(),
-                            id,
-                            rth.clone(),
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e.to_string())),
+                        Some(id) => {
+                            if parent_mpmc_id_opt.is_some() || parent_mpmc_member_id_opt.is_some()
+                            {
+                                if parent_mpmc_id_opt.is_none()
+                                    || parent_mpmc_member_id_opt.is_none()
+                                {
+                                    return Err(anyhow::anyhow!("parent_mpmc_id_opt and parent_mpmc_member_id_opt must be both provided or both None"));
+                                }
+                                let leases = require_mpmc_subchannel_lease_ids(
+                                    override_global_lease_id,
+                                    override_member_lease_id,
+                                    override_payload_lease_id,
+                                )?;
+                                ChanManager::new_mpmc_subchannel_with_chan_id(
+                                    lease_manager.clone(),
+                                    endpoints.clone(),
+                                    kv_backend_uid.clone(),
+                                    id,
+                                    leases.global,
+                                    leases.member,
+                                    leases.payload,
+                                    rth.clone(),
+                                )
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            } else {
+                                ChanManager::new_with_chan_id(
+                                    lease_manager.clone(),
+                                    endpoints.clone(),
+                                    kv_backend_uid.clone(),
+                                    id,
+                                    rth.clone(),
+                                )
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            }
+                        }
                         None => {
                             let cap = capacity.ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -472,14 +598,11 @@ impl MpscContext {
         })
     }
 
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        let mq_framework = match self.mq_framework.take() {
-            Some(v) => v,
-            None => return Ok(()),
-        };
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let mq_shutdown = self.mq_shutdown.clone();
         let runtime = self.kv_runtime.clone();
         let shutdown_res = py.allow_threads(|| {
-            runtime.run_async_from_sync(async move { mq_framework.shutdown().await })
+            runtime.run_async_from_sync(async move { mq_shutdown.shutdown().await })
         });
         match shutdown_res {
             Ok(Ok(())) => Ok(()),
@@ -1273,7 +1396,7 @@ impl MpscConsumerHandle {
                     .get_with_payload_retry_wait_timeout(prefetch_target, Duration::from_millis(ms as u64))
                     .await
             } else {
-                guard.inner_mut().get_with_payload_retry(prefetch_target).await
+                guard.inner_mut().get_with_payload(prefetch_target).await
             };
             match &res {
                 Ok(payload) => {
@@ -1661,18 +1784,6 @@ cnt={} recv_calls={} recv_timeouts={} last_prefetch_target={} last_timeout_ms={:
         }
     }
 
-    /// Call Rust-side get API using the callback that was
-    /// previously initialized via `init_payload_callback`.
-    ///
-    /// 为向后兼容，仍保留旧接口签名；内部会先初始化回调，
-    /// 然后调用 `get_one` 返回 payload。
-    #[pyo3(signature = (callback))]
-    fn get_with_payload(&mut self, py: Python<'_>, callback: PyObject) -> PyResult<PyObject> {
-        self.init_payload_callback(callback)?;
-        // Backward-compatible entry: use prefetch_target = 1.
-        self.get_one(py, 1, None)
-    }
-
     /// Mark this consumer as closed. Prefetch actor and retry loops
     /// will observe the flag and abort.
     fn shutdown_clone(&mut self) -> PyShutdownCtl {
@@ -1892,5 +2003,102 @@ impl Drop for ConsumerGuard {
                 inner,
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn mpmc_subchannel_lease_contract_preserves_parent_member_lease() {
+        let leases = require_mpmc_subchannel_lease_ids(Some(101), Some(202), Some(303))
+            .expect("complete MPMC lease set");
+
+        assert_eq!(
+            leases,
+            MpmcSubchannelLeaseIds {
+                global: 101,
+                member: 202,
+                payload: 303,
+            }
+        );
+    }
+
+    #[test]
+    fn mpmc_subchannel_lease_contract_rejects_missing_member_lease() {
+        let error = require_mpmc_subchannel_lease_ids(Some(101), None, Some(303))
+            .expect_err("MPMC subchannel bind requires the parent member lease");
+
+        assert!(error.to_string().contains("override_member_lease_id"));
+    }
+
+    #[test]
+    fn mq_framework_shutdown_channel_shares_completion() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        let mq_framework = {
+            let _guard = runtime.enter();
+            fluxon_mq::new_mq_framework()
+        };
+        let shutdown = crate::MqFrameworkShutdown::new(runtime.handle(), mq_framework);
+
+        runtime.block_on(async {
+            let (first_result, second_result) =
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::join!(shutdown.shutdown(), shutdown.shutdown())
+                })
+                .await
+                .expect("concurrent shutdown requests must complete");
+
+            first_result.expect("first shutdown request");
+            second_result.expect("second shutdown request");
+            assert!(shutdown.is_requested());
+        });
+    }
+
+    #[test]
+    fn mpmc_subchannel_load_releases_raii_state_on_shutdown() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let shutdown = ShutdownCtl::new();
+            let shutdown_from_task = shutdown.clone();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let entered_from_load = entered.clone();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let dropped_from_load = dropped.clone();
+
+            let close_task = tokio::spawn(async move {
+                entered.notified().await;
+                shutdown_from_task.close();
+            });
+            let load = async move {
+                let _drop_signal = DropSignal(dropped_from_load);
+                entered_from_load.notify_one();
+                std::future::pending::<anyhow::Result<()>>().await
+            };
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                await_cancel_safe_mpmc_subchannel_load(&shutdown, load),
+            )
+            .await
+            .expect("shutdown must interrupt the pending MPMC subchannel load");
+            close_task.await.expect("close task");
+
+            let error = result.expect_err("shutdown must return an error");
+            assert!(error.to_string().contains("stopped by shutdown"));
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "cancelling the read-only loader must drop its acquired RAII guards"
+            );
+        });
     }
 }

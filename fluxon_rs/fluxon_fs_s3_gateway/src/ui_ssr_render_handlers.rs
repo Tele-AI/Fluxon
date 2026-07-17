@@ -908,7 +908,7 @@ fn ui_render_scope_access_page(
         }
     };
 
-    let main = match access_model_from_permission_list(&st.permission_list.read()) {
+    let main = match access_model_from_s3_permission_list(&st.permission_list.read()) {
         Ok(model) => {
             let mode_options: Vec<UiSelectOptionView> = [ScopeAccessMode::Read, ScopeAccessMode::ReadWrite]
                 .into_iter()
@@ -1049,7 +1049,7 @@ async fn ui_admin_scope_create(
         }
     };
 
-    let mut model = match access_model_from_permission_list(&st.permission_list.read()) {
+    let mut model = match access_model_from_s3_permission_list(&st.permission_list.read()) {
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
@@ -1106,7 +1106,7 @@ async fn ui_admin_scope_create(
             .then(a.mode.cmp(&b.mode))
     });
 
-    let permission_list = match permission_list_from_access_model(&model) {
+    let permission_list = match s3_permission_list_from_access_model(&model) {
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
@@ -1151,7 +1151,7 @@ async fn ui_admin_scope_update_users(
         }
     };
 
-    let mut model = match access_model_from_permission_list(&st.permission_list.read()) {
+    let mut model = match access_model_from_s3_permission_list(&st.permission_list.read()) {
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
@@ -1195,7 +1195,7 @@ async fn ui_admin_scope_update_users(
     };
     scope.usernames = usernames;
 
-    let permission_list = match permission_list_from_access_model(&model) {
+    let permission_list = match s3_permission_list_from_access_model(&model) {
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
@@ -1228,7 +1228,7 @@ async fn ui_admin_scope_delete(
         return ui_manager_account_forbidden(identity.viewer.username.as_str(), "manage scope_access");
     }
 
-    let mut model = match access_model_from_permission_list(&st.permission_list.read()) {
+    let mut model = match access_model_from_s3_permission_list(&st.permission_list.read()) {
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
@@ -1265,7 +1265,7 @@ async fn ui_admin_scope_delete(
         );
     }
 
-    let permission_list = match permission_list_from_access_model(&model) {
+    let permission_list = match s3_permission_list_from_access_model(&model) {
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
@@ -2106,7 +2106,7 @@ fn ui_render_admin_users_page(
     let scope_access_href = ui_href_with_as("../permissions/", identity.as_user.as_deref());
     let mut warnings: Vec<String> = error_msg.into_iter().map(|msg| msg.to_string()).collect();
 
-    let model = match access_model_from_permission_list(&st.permission_list.read()) {
+    let model = match access_model_from_s3_permission_list(&st.permission_list.read()) {
         Ok(value) => value,
         Err(err) => {
             warnings.push(err);

@@ -11,9 +11,9 @@ use fluxon_commu_contract::{
     ClosedRuntimeCallRawObservedOutputView, ClosedRuntimeClusterEventStreamItem,
     ClosedRuntimeClusterManagerCall, ClosedRuntimeClusterManagerResponse,
     ClosedRuntimeClusterRdmaResolvedConfigStreamItem, ClosedRuntimeDesiredTransferPeer,
-    ClosedRuntimeDispatchRequestView,
-    ClosedRuntimeDispatchResponse, ClosedRuntimeDispatchTransportPolicy, ClosedRuntimeError,
-    ClosedRuntimeHandle, ClosedRuntimeHostCallbackHandle, ClosedRuntimeP2pCall,
+    ClosedRuntimeDispatchRequestView, ClosedRuntimeDispatchResponse,
+    ClosedRuntimeDispatchTransportPolicy, ClosedRuntimeError, ClosedRuntimeHandle,
+    ClosedRuntimeHostCallbackHandle, ClosedRuntimeP2pCall,
     ClosedRuntimeP2pCallRawObservedRequestView, ClosedRuntimeP2pResponse,
     ClosedRuntimeP2pSendResponseRawRequestView, ClosedRuntimePeerGen, ClosedRuntimeRawSlice,
     ClosedRuntimeRequest, ClosedRuntimeResponse, ClosedRuntimeTransferEngineCall,
@@ -491,11 +491,15 @@ impl WireBodyPartsOwner {
         let (raw_lengths, raw_payload) = match raw_bytes.len() {
             0 => (WireBodyRawLengths::Empty, WireBodyRawPayload::Empty),
             1 => {
-                let part = raw_bytes.into_iter().next().expect("single raw part missing");
-                let len =
-                    u32::try_from(part.len()).map_err(|_| ClosedSdkConsumerError::RuntimeDecode {
+                let part = raw_bytes
+                    .into_iter()
+                    .next()
+                    .expect("single raw part missing");
+                let len = u32::try_from(part.len()).map_err(|_| {
+                    ClosedSdkConsumerError::RuntimeDecode {
                         detail: format!("wire raw part too large for u32 length: {}", part.len()),
-                    })?;
+                    }
+                })?;
                 (
                     WireBodyRawLengths::Single([len]),
                     WireBodyRawPayload::Single(part),
@@ -849,8 +853,7 @@ fn decode_call_raw_observed_output_view(
         return Err(ClosedSdkConsumerError::RuntimeDecode {
             detail: format!(
                 "closed SDK call_raw_observed serialize_part overflow: serialize_len={} full_len={}",
-                message_view.body.serialize_part.len,
-                message_view.body.full_body.len,
+                message_view.body.serialize_part.len, message_view.body.full_body.len,
             ),
         });
     }
@@ -860,21 +863,19 @@ fn decode_call_raw_observed_output_view(
         .ok_or_else(|| ClosedSdkConsumerError::RuntimeDecode {
             detail: "closed SDK call_raw_observed raw_bytes length overflow".to_string(),
         })?;
-    let expected_full_len =
-        message_view
-            .body
-            .serialize_part
-            .len
-            .checked_add(raw_total)
-            .ok_or_else(|| ClosedSdkConsumerError::RuntimeDecode {
-                detail: "closed SDK call_raw_observed body length overflow".to_string(),
-            })?;
+    let expected_full_len = message_view
+        .body
+        .serialize_part
+        .len
+        .checked_add(raw_total)
+        .ok_or_else(|| ClosedSdkConsumerError::RuntimeDecode {
+            detail: "closed SDK call_raw_observed body length overflow".to_string(),
+        })?;
     if expected_full_len != message_view.body.full_body.len {
         return Err(ClosedSdkConsumerError::RuntimeDecode {
             detail: format!(
                 "closed SDK call_raw_observed body length mismatch: expected={} full_len={}",
-                expected_full_len,
-                message_view.body.full_body.len,
+                expected_full_len, message_view.body.full_body.len,
             ),
         });
     }
@@ -923,9 +924,7 @@ fn decode_call_raw_observed_output_view(
                 frame_recv_done_ts_us: message_view.local_observe.frame_recv_done_ts_us,
                 dispatch_enqueued_ts_us: message_view.local_observe.dispatch_enqueued_ts_us,
                 dispatch_started_ts_us: message_view.local_observe.dispatch_started_ts_us,
-                complete_pending_call_ts_us: message_view
-                    .local_observe
-                    .complete_pending_call_ts_us,
+                complete_pending_call_ts_us: message_view.local_observe.complete_pending_call_ts_us,
             },
         },
         observe: fluxon_commu_contract::ClosedRuntimeRpcCallTransportObserveTrace {
@@ -1550,8 +1549,8 @@ async fn invoke_completion_async_with_keepalive(
     ) -> i32,
 ) -> Result<(i32, Bytes), ClosedSdkConsumerError> {
     let (sender, receiver) = tokio::sync::oneshot::channel::<(i32, Bytes)>();
-    let user_data = Box::into_raw(Box::new(RuntimeCompletionState { sender, keepalive }))
-        .cast::<c_void>();
+    let user_data =
+        Box::into_raw(Box::new(RuntimeCompletionState { sender, keepalive })).cast::<c_void>();
     let submit_status = submit(user_data, Some(runtime_completion_callback));
     if submit_status != 0 {
         unsafe {
@@ -1594,28 +1593,20 @@ async fn invoke_completion_async_with_post_submit(
         .map_err(|_| ClosedSdkConsumerError::RuntimeCompletionDropped)
 }
 
-async fn invoke_completion_async(
-    submit: impl FnOnce(
-        *mut c_void,
-        Option<extern "C" fn(*mut c_void, FluxonCommuClosedRuntimeCompletionResult)>,
-    ) -> i32,
-) -> Result<(i32, Bytes), ClosedSdkConsumerError> {
-    invoke_completion_async_with_keepalive(None, submit).await
-}
-
 pub async fn runtime_invoke(
     request: &ClosedRuntimeRequest,
 ) -> Result<ClosedRuntimeResponse, ClosedSdkConsumerError> {
     let encoded_request = bitcode::encode(request);
-    let (status_code, payload) = invoke_completion_async(|user_data, callback| unsafe {
-        fluxon_commu_closed_runtime_call_async(
-            encoded_request.as_ptr(),
-            encoded_request.len(),
-            user_data,
-            callback,
-        )
-    })
-    .await?;
+    let (status_code, payload) =
+        invoke_completion_async_with_keepalive(None, |user_data, callback| unsafe {
+            fluxon_commu_closed_runtime_call_async(
+                encoded_request.as_ptr(),
+                encoded_request.len(),
+                user_data,
+                callback,
+            )
+        })
+        .await?;
     match status_code {
         FLUXON_COMMU_CLOSED_RUNTIME_RESULT_OK => {
             bitcode::decode::<ClosedRuntimeResponse>(payload.as_ref()).map_err(|error| {
@@ -2082,7 +2073,9 @@ pub async fn p2p_call_raw_observed(
     )
     .await?;
     match status_code {
-        FLUXON_COMMU_CLOSED_RUNTIME_RESULT_OK => decode_call_raw_observed_output_view(payload.as_ref()),
+        FLUXON_COMMU_CLOSED_RUNTIME_RESULT_OK => {
+            decode_call_raw_observed_output_view(payload.as_ref())
+        }
         FLUXON_COMMU_CLOSED_RUNTIME_RESULT_ERR => {
             let error = bitcode::decode::<ClosedRuntimeError>(payload.as_ref()).map_err(
                 |decode_error| ClosedSdkConsumerError::RuntimeDecode {
@@ -2308,5 +2301,16 @@ pub async fn drop_runtime_handle(
         other => Err(ClosedSdkConsumerError::RuntimeUnexpectedResponse {
             detail: format!("{other:?}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bundled_sdk_declares_watch_backed_transfer_link_snapshot() {
+        assert_eq!(
+            env!("FLUXON_COMMU_CLOSED_TRANSFER_LINK_SNAPSHOT_MODE"),
+            "watch-v1"
+        );
     }
 }

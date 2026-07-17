@@ -326,17 +326,17 @@ impl CommitSequencer {
 
             let notified = self.notify.notified();
             tokio::pin!(notified);
+            notified.as_mut().enable();
+
             let wait_warn_sleep = tokio::time::sleep(COMMIT_WAIT_WARN_INTERVAL);
             tokio::pin!(wait_warn_sleep);
 
-            // NOTE: `Notify::notify_waiters()` does not store a permit, and the waiter is only
-            // registered when the `Notified` future is polled. Poll once here to avoid missing
-            // a wake-up between the seq check and the actual await.
-            tokio::select! {
-                _ = &mut notified => {}
-                else => {}
+            // Recheck both state sources after registering the waiter.
+            if shutdown.is_closed() {
+                return Err(MpscError::Internal(
+                    "consumer closed during consume-offset commit wait".to_string(),
+                ));
             }
-
             let observed_next_seq = self.next_seq.load(Ordering::SeqCst);
             if observed_next_seq == seq {
                 let wait_end = Instant::now();
@@ -352,6 +352,11 @@ impl CommitSequencer {
 
             tokio::select! {
                 biased;
+                _ = shutdown.wait_closed() => {
+                    return Err(MpscError::Internal(
+                        "consumer closed during consume-offset commit wait".to_string(),
+                    ));
+                }
                 _ = &mut notified => {}
                 _ = &mut wait_warn_sleep => {
                     let blocker_seq = self.next_seq.load(Ordering::SeqCst);
@@ -364,11 +369,6 @@ impl CommitSequencer {
                         blocker_seq,
                         self.describe_progress_at(blocker_seq, Instant::now()),
                     );
-                }
-                _ = shutdown.wait_closed() => {
-                    return Err(MpscError::Internal(
-                        "consumer closed during consume-offset commit wait".to_string(),
-                    ));
                 }
             }
         }
@@ -1489,14 +1489,6 @@ impl MpscConsumer {
         self.shutdown.clone()
     }
 
-    fn record_nonblocking_get_success(&self, unix_ms: i64) {
-        self.nonblocking_monitor.try_record_nonblocking(unix_ms);
-    }
-
-    fn record_blocking_get_observed(&self, unix_ms: i64) {
-        self.nonblocking_monitor.try_record_blocking(unix_ms);
-    }
-
     /// Sync the consumer membership metadata in etcd with the given kvclient
     /// sub-cluster.
     ///
@@ -1612,7 +1604,8 @@ impl MpscConsumer {
             match timeout(dur, self.recv_next_inflight_handle_with_idle_warn()).await {
                 Ok(v) => v,
                 Err(_) => {
-                    self.record_blocking_get_observed(get_handle_begin_unix_ms);
+                    self.nonblocking_monitor
+                        .try_record_blocking(get_handle_begin_unix_ms);
                     return Err(MpscError::NoMessage);
                 }
             }
@@ -1773,9 +1766,11 @@ impl MpscConsumer {
         self.prefetch_latency_etcd_put_first_poll_to_ready_window
             .push(latest_etcd_put_first_poll_to_ready_ns);
         if nonblocking_hit {
-            self.record_nonblocking_get_success(get_handle_end_unix_ms);
+            self.nonblocking_monitor
+                .try_record_nonblocking(get_handle_end_unix_ms);
         } else {
-            self.record_blocking_get_observed(get_handle_begin_unix_ms);
+            self.nonblocking_monitor
+                .try_record_blocking(get_handle_begin_unix_ms);
         }
 
         let parent_mpmc_id = match self.category {
@@ -1870,18 +1865,6 @@ impl MpscConsumer {
             payload: fetched.payload,
             nonblocking_hit,
         })
-    }
-
-    /// Variant of get_with_payload that treats回调返回码 `1` 为可重试
-    /// 错误，并在 actor 内部进行重试。调用方只会看到成功或
-    /// 不可恢复错误（包括返回码为 2 的情况）。
-    pub async fn get_with_payload_retry(
-        &mut self,
-        prefetch_target: usize,
-    ) -> Result<ConsumedPayload, MpscError> {
-        // 底层 prefetch_actor 始终以带重试语义执行 get，
-        // 这里直接复用统一实现。
-        self.get_with_payload(prefetch_target).await
     }
 
     pub async fn get_with_payload_retry_wait_timeout(
@@ -3623,8 +3606,22 @@ impl ConsumerActor {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_monotonic_offset, merge_offset_cache_monotonic};
+    use super::{
+        merge_monotonic_offset, merge_offset_cache_monotonic, CommitSequencer, MpscError,
+        ShutdownCtl,
+    };
     use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    fn prepare_sequence_for_advance(sequencer: &CommitSequencer, seq: usize) {
+        sequencer.begin_payload(seq, "producer", seq as i64);
+        sequencer.mark_wait_turn_begin(seq);
+        sequencer.mark_commit_begin(seq);
+        sequencer.mark_ready_to_advance(seq);
+        sequencer.mark_popped(seq);
+    }
 
     #[test]
     fn merge_monotonic_offset_keeps_cached_when_probe_missing() {
@@ -3653,6 +3650,95 @@ mod tests {
         assert_eq!(current.get("producer_a"), Some(&62));
         assert_eq!(current.get("producer_b"), Some(&41));
         assert_eq!(current.get("producer_c"), Some(&7));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_wait_turn_wakes_when_prior_sequence_advances() {
+        let sequencer = CommitSequencer::new(1);
+        prepare_sequence_for_advance(&sequencer, 0);
+        let shutdown = ShutdownCtl::new();
+        let waiter_sequencer = sequencer.clone();
+        let waiter_shutdown = shutdown.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            waiter_sequencer.wait_turn(1, &waiter_shutdown).await
+        });
+
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        sequencer.advance(0);
+
+        let outcome = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("commit waiter did not wake after advance")
+            .expect("commit waiter task panicked")
+            .expect("commit waiter returned an error");
+        assert_eq!(outcome.blocker_count, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_wait_turn_is_interrupted_by_shutdown() {
+        let sequencer = CommitSequencer::new(2);
+        let shutdown = ShutdownCtl::new();
+        let waiter_sequencer = sequencer.clone();
+        let waiter_shutdown = shutdown.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            waiter_sequencer.wait_turn(1, &waiter_shutdown).await
+        });
+
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        shutdown.close();
+
+        let result = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("commit waiter ignored shutdown")
+            .expect("commit waiter task panicked");
+        assert!(matches!(
+            result,
+            Err(MpscError::Internal(message))
+                if message == "consumer closed during consume-offset commit wait"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_wait_turn_prefers_shutdown_when_advance_races_close() {
+        let sequencer = CommitSequencer::new(3);
+        prepare_sequence_for_advance(&sequencer, 0);
+        let shutdown = ShutdownCtl::new();
+        let waiter_sequencer = sequencer.clone();
+        let waiter_shutdown = shutdown.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            waiter_sequencer.wait_turn(1, &waiter_shutdown).await
+        });
+
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        shutdown.close();
+        sequencer.advance(0);
+
+        let result = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("commit waiter did not resolve after close and advance")
+            .expect("commit waiter task panicked");
+        assert!(matches!(result, Err(MpscError::Internal(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_wait_turn_returns_promptly_when_already_closed() {
+        let sequencer = CommitSequencer::new(4);
+        let shutdown = ShutdownCtl::new();
+        shutdown.close();
+
+        let result = timeout(Duration::from_secs(1), sequencer.wait_turn(1, &shutdown))
+            .await
+            .expect("already-closed commit waiter did not return");
+        assert!(matches!(result, Err(MpscError::Internal(_))));
     }
 }
 

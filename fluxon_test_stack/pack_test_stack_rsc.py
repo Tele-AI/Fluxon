@@ -34,7 +34,6 @@ from source_selection_profiles import (
     SOURCE_SELECTION_PROFILE_SOURCE_PACK,
     collect_source_profile_relpaths,
     get_source_profile_source_roots,
-    source_profile_relpath_excluded,
 )
 
 
@@ -931,13 +930,6 @@ def _compute_ci_source_digest(*, repo_root: Path) -> str:
         ignored_dir_names=(),
         ignored_file_names=(),
         ignored_file_suffixes=(),
-    )
-
-
-def _ci_source_relpath_excluded(relpath: str) -> bool:
-    return source_profile_relpath_excluded(
-        profile=SOURCE_SELECTION_PROFILE_SOURCE_PACK,
-        relpath=relpath,
     )
 
 

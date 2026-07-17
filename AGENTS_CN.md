@@ -1,6 +1,6 @@
 保持本文档简洁。
 - 核心用户文档、开发文档和设计文档都在仓库内的 `fluxon_doc_cn/` 和 `fluxon_doc_en/` 下
-- 详细的中英文文档写作规约索引见 `fluxon_doc_cn/dev_doc/开发者 - 3 - 文档写作规约.md` 和 `fluxon_doc_en/dev_doc/Developer - 3 - Documentation Writing Rules.md`
+- 仓库级规则和组件契约统一收录在下方的“规约索引”中。`AGENTS` 只保留简明摘要；可复用细则写入索引指向的双语文档，并同步更新中英文索引。
 - `teststack` 有两个步骤：`start testbed` 和 `testrunner`
 - `teststack` 支持 UI；`testrunner` 应负责 UI 的 authority 和 API surface，但 UI 应作为常驻服务运行，并复用下层的 ops 接口
 - 本项目所有 Python 代码都必须兼容 Python `>= 3.10`
@@ -9,6 +9,7 @@
 - Git 操作仅限基础的 `stage`、`unstage`、`commit` 和 `push`。不要使用其他 Git 操作
 - 默认优先收束而不是兼容。除非任务明确要求，否则不要添加兼容层、废弃路径或别名
 - 一个概念优先只保留一个正式名字。避免同义参数、重复入口和并行配置面
+- 不要添加只做调用改名、参数透传或结果拆包 / 重包，却不增加契约、校验、转换或所有权边界的转发包装；应直接调用唯一的标准实现
 - 不要用环境变量传递普通参数。优先使用配置文件，其次使用显式命令行参数
 - 优先约定而不是配置。当一个标准路径或默认连接方式已经足够时，不要增加额外配置项
 - 最小化多路径配置传递。不要同时通过环境变量、CLI 参数和文件等并行通道传递同一份配置
@@ -51,3 +52,9 @@
 - 类型签名、文档和运行时行为必须一致。如果 API 说它返回 `MemHolder`，那它就必须返回 `MemHolder`
 - 对内部不变量，要快速失败或直接断言。不要像契约不清楚一样静默探测后再回退
 - 对一个语义操作，只保留一条主路径。除非这种区别本身就是契约的一部分，否则不要在同一套公开模式里混用 `foo_blocking()` 和 `foo().wait()`
+
+## 规约索引
+
+- 文档写作：先写稳定结论，明确行为和性能结论的作用范围，并默认保持用户文档与开发文档中英文同步。见 [开发者 - 3 - 文档写作规约](<fluxon_doc_cn/dev_doc/开发者 - 3 - 文档写作规约.md>) 和 [Developer - 3 - Documentation Writing Rules](<fluxon_doc_en/dev_doc/Developer - 3 - Documentation Writing Rules.md>)。
+- Tokio 异步状态通知：持久状态是判定依据，`Notify` 只提供唤醒提示。普通同步谓词等待必须调用 `fluxon_util::notify_state`；只有 blocker 诊断、timer 等额外契约才允许保留自定义循环。单 future 的 `select!` 加 `else` 不能用于非阻塞 poll。见 [开发者 - 5 - Tokio Notify 使用规约](<fluxon_doc_cn/dev_doc/开发者 - 5 - Tokio Notify 使用规约.md>) 和 [Developer - 5 - Tokio Notify Usage Rules](<fluxon_doc_en/dev_doc/Developer - 5 - Tokio Notify Usage Rules.md>)。
+- MQ 关闭：用户和测试路径必须先关闭所有公共 producer / consumer 并消费其 `Result`，再关闭底层 `KvClient`。Endpoint `close()` 必须完成本地 runtime、任务、keepalive 和 handle 回收；绑定 lease 的 key 只做尽力删除，失败记 WARN 并由 backend TTL 兜底。运行中的 etcd 状态转换继续使用强错误契约。不要访问 MQ 私有生命周期对象；Fluxon KV lease 的分配与 keepalive 必须留在原生 Rust 内，不得通过 Python 回调桥接。见 [用户 - 4 - MQ 接口](<fluxon_doc_cn/user_doc/用户 - 4 - MQ接口.md#关闭生命周期>) 和 [User - 4 - MQ Interface](<fluxon_doc_en/user_doc/User - 4 - MQ Interface.md#shutdown-lifecycle>)。

@@ -19,7 +19,7 @@ def _prepare_ci_case(
 ) -> Any:
     _ = ctx._require_dict(resolved_case.get("deploy"), "resolved_case.deploy")
     ci_checkout_root = ctx._runner_repo_root()
-    runtime_tracking.ci_lock_fp = ctx._acquire_ci_lock()
+    runtime_tracking.ci_lock_fp = ctx._acquire_ci_lock(resolved_case=resolved_case)
     ctx._ensure_deployer_online(resolved_case)
     out_cluster_name = ctx._ci_cluster_name(resolved_case)
 
@@ -64,7 +64,7 @@ def _prepare_ci_case(
     services_root = (run_dir / "services").resolve()
     services_root.mkdir(parents=True, exist_ok=True)
     (services_root / "share_mem").mkdir(parents=True, exist_ok=True)
-    share_mem_path = ctx._ci_share_mem_path(resolved_case, run_dir=run_dir)
+    share_mem_path = ctx._ci_share_mem_path(resolved_case)
     Path(share_mem_path).mkdir(parents=True, exist_ok=True)
 
     venv_python = ctx._create_ci_runtime_venv(run_dir=run_dir)
@@ -164,6 +164,11 @@ def _prepare_test_stack_case(
     metric_warmup_seconds = ctx._require_number(
         benchmark_scale.get("metric_warmup_seconds"),
         "resolved_case.scale.benchmark.metric_warmup_seconds",
+    )
+    cluster_ready_timeout_seconds = ctx._require_int(
+        benchmark_scale.get("cluster_ready_timeout_seconds"),
+        "resolved_case.scale.benchmark.cluster_ready_timeout_seconds",
+        min_v=1,
     )
     profile = ctx._require_dict(resolved_case.get("profile"), "resolved_case.profile")
     profile_test_stack = ctx._require_dict(profile.get("test_stack"), "resolved_case.profile.test_stack")
@@ -302,11 +307,6 @@ def _prepare_test_stack_case(
             ctx._require_dict(resolved_case.get("scale"), "resolved_case.scale").get("benchmark"),
             "scale.benchmark",
         )
-        cluster_ready_timeout_seconds = ctx._require_int(
-            bench.get("cluster_ready_timeout_seconds"),
-            "scale.benchmark.cluster_ready_timeout_seconds",
-            min_v=1,
-        )
         for owner_id in owner_instance_ids:
             owner_target = ctx._instance_target_name(resolved_case, instance_id=owner_id)
             shared_bundle_paths = ctx._test_stack_external_owner_shared_bundle_paths(
@@ -339,6 +339,8 @@ def _prepare_test_stack_case(
         test_stack_result_timeout_s=_test_stack_result_timeout_seconds(
             max_benchmark_seconds=int(max_secs),
             metric_warmup_seconds=float(metric_warmup_seconds),
+            cluster_ready_timeout_seconds=int(cluster_ready_timeout_seconds),
+            readiness_gate_count=2 if mode == ctx.TEST_STACK_MODE_MPMC else 1,
         ),
     )
 
@@ -500,10 +502,15 @@ def _wait_and_load_test_stack_benchmark_result_json(
             completion = ctx._require_dict(run0.get("completion"), "benchmark_result.runs[0].completion")
             _ = ctx._require_str(completion.get("status"), "benchmark_result.runs[0].completion.status")
             if not result_path.exists() or result_path.read_text(encoding="utf-8") != raw:
-                result_path.write_text(raw, encoding="utf-8")
+                tmp_path = result_path.with_suffix(result_path.suffix + ".tmp")
+                tmp_path.write_text(raw, encoding="utf-8")
+                tmp_path.replace(result_path)
             return result_obj
         except Exception as exc:  # noqa: BLE001
-            last_err = f"{type(exc).__name__}: {exc}"
+            raw_err = str(exc)
+            if len(raw_err) > 1000:
+                raw_err = raw_err[:1000] + "...<truncated>"
+            last_err = f"{type(exc).__name__}: {raw_err}"
             if time.time() >= deadline:
                 raise ValueError(
                     f"benchmark result json did not become readable/valid within timeout: "
@@ -584,6 +591,8 @@ def _finalize_ci_case_runtime(
                 ctx=f"CI {instance_id_text} apply",
             )
         ctx._ci_cleanup_runtime(resolved_case, timeout_s=120)
+        if outcome == ctx.RUN_OUTCOME_SUCCESS:
+            ctx._cleanup_successful_ci_case_data(resolved_case, run_dir=run_dir)
         return
     if not ci_preserved_apply_ids:
         return
@@ -605,6 +614,14 @@ def _finalize_ci_case_runtime(
     )
 
 
+def _ensure_test_stack_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    test_stack_summary = summary.get("test_stack")
+    if not isinstance(test_stack_summary, dict):
+        test_stack_summary = {}
+        summary["test_stack"] = test_stack_summary
+    return test_stack_summary
+
+
 def _finalize_test_stack_case_runtime(
     *,
     ctx: Any,
@@ -624,7 +641,7 @@ def _finalize_test_stack_case_runtime(
         collect_error_detail = f"{type(exc).__name__}: {exc}"
         summary_path = (run_dir / "summary.yaml").resolve()
         summary = ctx._require_dict(ctx._load_yaml_file(summary_path), "summary.yaml")
-        test_stack_summary = ctx._require_dict(summary.get("test_stack"), "summary.yaml.test_stack")
+        test_stack_summary = _ensure_test_stack_summary(summary)
         test_stack_summary["collect_error"] = collect_error_detail
         ctx._write_yaml_file(summary_path, summary)
 
@@ -651,6 +668,8 @@ def _finalize_test_stack_case_runtime(
                 apply_id=ctx._require_str(runtime_tracking.ts_coord_apply_id, "TEST_STACK coordinator apply_id"),
                 ctx="TEST_STACK coordinator apply",
             )
+        if outcome == ctx.RUN_OUTCOME_SUCCESS:
+            ctx._cleanup_successful_test_stack_case_data(run_dir=run_dir)
         return
     if not ts_preserved_apply_ids:
         return
@@ -682,6 +701,8 @@ def _test_stack_result_timeout_seconds(
     *,
     max_benchmark_seconds: int,
     metric_warmup_seconds: float,
+    cluster_ready_timeout_seconds: int,
+    readiness_gate_count: int,
 ) -> int:
     if max_benchmark_seconds <= 0:
         raise ValueError(
@@ -691,8 +712,18 @@ def _test_stack_result_timeout_seconds(
         raise ValueError(
             f"metric_warmup_seconds must be >= 0, got: {metric_warmup_seconds}"
         )
+    if cluster_ready_timeout_seconds <= 0:
+        raise ValueError(
+            "cluster_ready_timeout_seconds must be > 0, "
+            f"got: {cluster_ready_timeout_seconds}"
+        )
+    if readiness_gate_count <= 0:
+        raise ValueError(
+            f"readiness_gate_count must be > 0, got: {readiness_gate_count}"
+        )
     return int(
         float(max_benchmark_seconds)
         + float(metric_warmup_seconds)
+        + float(cluster_ready_timeout_seconds) * float(readiness_gate_count)
         + 600.0
     )

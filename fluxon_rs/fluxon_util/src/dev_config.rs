@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde_yaml::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -253,12 +253,6 @@ pub fn load_tsdb_host_port() -> Result<(String, u16)> {
         .parse()
         .map_err(|_| anyhow!("端口应为整数: {}", port_str))?;
     Ok((host.to_string(), port))
-}
-
-/// Name aligned with setup_and_pack/utils/repo_config_utils.py: load_tsdb_remote_write_url.
-/// Wraps read_prom_remote_write_url_from_build_config for compatibility with Python tooling.
-pub fn load_tsdb_remote_write_url() -> Result<String> {
-    read_prom_remote_write_url_from_build_config()
 }
 
 #[cfg(test)]

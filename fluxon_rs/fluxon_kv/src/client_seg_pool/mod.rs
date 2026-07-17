@@ -237,10 +237,7 @@ impl ClientSegPool {
         std::path::Path::new(share_mem_path).join(SIDE_TRANSFER_PEERS_DIRNAME)
     }
 
-    pub fn side_transfer_peer_file_path(
-        share_mem_path: &str,
-        side_id: &str,
-    ) -> std::path::PathBuf {
+    pub fn side_transfer_peer_file_path(share_mem_path: &str, side_id: &str) -> std::path::PathBuf {
         Self::side_transfer_peers_dir(share_mem_path).join(format!("{side_id}.json"))
     }
 
@@ -399,17 +396,13 @@ impl ClientSegPool {
                 crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
                     path: String::new(),
                     len: map_len as u64,
-                    detail: "share_mem_path is empty; explicit configuration required"
-                        .to_string(),
+                    detail: "share_mem_path is empty; explicit configuration required".to_string(),
                 },
             ));
         }
 
         let base_path = &share_mem_path;
-        tracing::info!(
-            "Using share_mem_path: {} for memory-mapped file",
-            base_path
-        );
+        tracing::info!("Using share_mem_path: {} for memory-mapped file", base_path);
         std::fs::create_dir_all(base_path).map_err(|e| {
             KvError::SharedMem(
                 crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
@@ -859,10 +852,6 @@ impl ClientSegPool {
         Ok(())
     }
 
-    pub async fn register_segment_partials(&self) -> KvResult<()> {
-        self.register().await
-    }
-
     pub async fn publish_side_transfer_peer(&self) -> KvResult<()> {
         let inner = self.inner();
         if !inner.side_transfer_worker {
@@ -1070,7 +1059,7 @@ impl ClientSegPool {
         let inner = &self.0;
         if inner.cpu_allocated_mem.read().await.is_some() {
             tracing::info!("Client initialized with segments; registering local transfer segment");
-            self.register_segment_partials().await?;
+            self.register().await?;
             if inner.side_transfer_worker {
                 self.publish_side_transfer_peer().await?;
             }

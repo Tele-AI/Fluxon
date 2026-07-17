@@ -7,6 +7,7 @@ pub mod hash;
 pub mod init_dag_compiler;
 pub mod map_lock;
 pub mod merge_recent_async_notifies;
+pub mod notify_state;
 pub mod prefix_scan;
 pub mod prom_remote_write;
 pub mod scoped_future_set;
@@ -37,10 +38,9 @@ pub mod limitrate;
 pub mod pyo3;
 // Re-export for stable public API: existing call sites can keep using `fluxon_util::init_log`.
 pub use log::{
-    current_daily_sharded_log_path, current_log_file_path, daily_sharded_log_path,
-    display_runtime_log_path, init_log, init_log_test, init_log_with_extra_layer,
-    latest_existing_daily_sharded_log_path, resolve_readable_log_path,
-    DEFAULT_DAILY_LOG_RETENTION_DAYS,
+    DEFAULT_DAILY_LOG_RETENTION_DAYS, current_daily_sharded_log_path, current_log_file_path,
+    daily_sharded_log_path, display_runtime_log_path, init_log, init_log_test,
+    init_log_with_extra_layer, latest_existing_daily_sharded_log_path, resolve_readable_log_path,
 };
 #[cfg(test)]
 mod test_util_test;
@@ -251,7 +251,12 @@ mod tests {
             );
             assert_logged_text(
                 &active_log_path,
-                &["debug message", "info message", "warning message", "error message"],
+                &[
+                    "debug message",
+                    "info message",
+                    "warning message",
+                    "error message",
+                ],
             );
         }
     }

@@ -78,10 +78,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
-
-
 def strip_inline_comment(raw_line: str) -> str:
     in_single_quote = False
     in_double_quote = False
@@ -425,10 +421,6 @@ def get_target_dir() -> Path:
     if target_dir.is_absolute():
         return target_dir.resolve()
     return (PROJECT_ROOT / "fluxon_rs" / target_dir).resolve()
-
-
-def ensure_dirs(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
 
 
 def copytree_replace(src: Path, dst: Path) -> None:
@@ -993,10 +985,6 @@ def ensure_meson(target_dir: Path) -> None:
     )
 
 
-def ensure_build_tools(target_dir: Path) -> None:
-    ensure_meson(target_dir)
-
-
 def materialize_prepare_target(target_cfg: dict, target_dir: Path) -> Path:
     target_kind = str(target_cfg.get("kind", "")).strip()
     install_root = target_dir / str(target_cfg["dir_name"]).strip()
@@ -1040,7 +1028,7 @@ def resolve_binary_path(install_root: Path, binary_name: str) -> Path:
 
 def main() -> int:
     args = parse_args()
-    cfg = parse_yaml_subset(read_text(YAML_PATH))
+    cfg = parse_yaml_subset(YAML_PATH.read_text(encoding="utf-8"))
     scenario_cfg = resolve_scenario(cfg, args.scenario)
     if args.print_cache_steps_json:
         print(json.dumps(resolve_cache_steps(cfg, args.scenario), ensure_ascii=True))
@@ -1057,12 +1045,12 @@ def main() -> int:
         )
         return 0
     target_dir = get_target_dir()
-    ensure_dirs(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
     prepared_targets: dict[str, Path] = {}
     for target_name in scenario_cfg["targets"]:
         target_cfg = resolve_target(cfg, target_name)
         prepared_targets[target_name] = materialize_prepare_target(target_cfg, target_dir)
-    ensure_build_tools(target_dir)
+    ensure_meson(target_dir)
     binary_target_name = str(scenario_cfg["binary_target"])
     if args.print_binary_path is not None:
         binary_path = resolve_binary_path(prepared_targets[binary_target_name], args.print_binary_path)

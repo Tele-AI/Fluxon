@@ -19,6 +19,7 @@ This page defines how Fluxon user docs, developer docs, and design docs should b
 - Do not lift a local fact into a system-level conclusion without tracing the full path at the same abstraction level.
 - If the opening enumerates pain points, goals, evaluation dimensions, or explicit questions, the later sections should answer against that same list. Do not open on one axis and expand on another.
 - Keep one canonical name, spelling, and capitalization for one concept across a page and across the doc set. Roles, component names, and acronyms should stay consistent.
+- Put reusable repository-level implementation rules in synchronized bilingual developer docs. Add one concise entry under `Contract Index` in both `AGENTS.md` and `AGENTS_CN.md`; do not duplicate the full rule in the index.
 
 ## 2. Design Docs
 
@@ -103,3 +104,4 @@ Before landing a doc, check at least these items:
 - Mixed-script spacing, backticks, terminology spelling, and capitalization are consistent.
 - Table-of-contents links, anchors, image paths, and external links all resolve correctly.
 - Code fences declare the right language, such as `bash`, `python`, or `yaml`.
+- New repository-level implementation rules have synchronized entries in the `AGENTS.md` and `AGENTS_CN.md` contract indexes.

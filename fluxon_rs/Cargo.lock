@@ -1093,6 +1093,7 @@ version = "0.2.1"
 dependencies = [
  "async-trait",
  "fluxon_framework_compiled",
+ "fluxon_util",
  "limit_thirdparty",
  "parking_lot",
  "paste",

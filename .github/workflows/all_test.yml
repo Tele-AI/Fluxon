@@ -9,10 +9,12 @@ on:
       - reopened
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
-  ci-2-virt-node:
+  package-wheel:
+    name: package-wheel
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -20,8 +22,26 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Free hosted runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          tool-cache: false
+          swap-storage: false
+
+      - name: Scan and clean temporary data
+        run: >-
+          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_TEMP="$RUNNER_TEMP"
+          "$(command -v python3)"
+          scripts/ci_2_virt_node_workflow.py scan-and-clean-temp
+
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
@@ -50,266 +70,426 @@ jobs:
       - name: Sync rather_no_git_submodule workspace inputs
         run: python3 fluxon_rs/scripts/rather_no_git_submodule.py
 
-      - name: Write ci_2_virt_node suite
+      - name: Write package input suite
         run: |
-          python3 - <<'PY'
-          import copy
-          from pathlib import Path
-          import yaml
+          python3 scripts/ci_2_virt_node_workflow.py write-suite \
+            --source fluxon_test_stack/ci_test_list.yaml \
+            --output "$RUNNER_TEMP/ci_test_list.ci.yaml" \
+            --repository "$GITHUB_REPOSITORY"
 
-          repo_root = Path.cwd()
-          src_path = repo_root / "fluxon_test_stack" / "ci_test_list.yaml"
-          out_path = Path("${{ runner.temp }}") / "ci_test_list.ci.yaml"
-          suite = yaml.safe_load(src_path.read_text(encoding="utf-8"))
-
-          top_attention_scene_prefix = "ci_top_attention_"
-
-          def top_attention_command(scene_id, *, case_config, timeout_seconds=21600):
-              if not scene_id.startswith(top_attention_scene_prefix):
-                  raise ValueError(f"not a top-attention CI scene id: {scene_id}")
-              suffix = scene_id[len(top_attention_scene_prefix):]
-              command = (
-                  "__RUN_DIR__/venv/bin/python3 -u "
-                  f"__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_{suffix}.py"
-              )
-              if case_config:
-                  command += " --case-config __RUN_DIR__/configs/ci_scene_config.yaml"
-              return {
-                  "id": f"top_attention_{suffix}",
-                  "command": command,
-                  "timeout_seconds": timeout_seconds,
-              }
-
-          top_attention_ci_scenes = {
-              "ci_top_attention_doc_page_build": {
-                  "subject": "doc_page",
-                  "runtime_contract": "rust_self_managed",
-                  "scale": "n1_kvowner_dram_3gib",
-                  "case_config": True,
-                  "timeout_seconds": 10800,
-                  "scene_config": {
-                      "doc_site_base_url": "${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}",
-                  },
-              },
-              "ci_top_attention_bin_kvtest": {
-                  "subject": "rust",
-                  "runtime_contract": "rust_self_managed",
-                  "scale": "n1_kvowner_dram_20gib",
-                  "case_config": True,
-                  "scene_config": {
-                      "kv_test_rounds": "p2p_only",
-                  },
-              },
-              "ci_top_attention_log_mgmt": {
-                  "subject": "rust",
-                  "runtime_contract": "rust_self_managed",
-                  "scale": "n1_kvowner_dram_20gib",
-                  "case_config": True,
-                  "scene_config": {
-                      "enabled": True,
-                  },
-              },
-              "ci_top_attention_ctrl_c_kv": {
-                  "subject": "rust",
-                  "runtime_contract": "rust_self_managed",
-                  "scale": "n1_kvowner_dram_3gib",
-                  "case_config": False,
-                  "scene_config": {},
-              },
-              "ci_top_attention_ctrl_c_mq": {
-                  "subject": "mq",
-                  "runtime_contract": "rust_self_managed",
-                  "scale": "n1_kvowner_dram_20gib",
-                  "case_config": False,
-                  "scene_config": {},
-              },
-              "ci_top_attention_mq_core": {
-                  "subject": "mq",
-                  "runtime_contract": "cluster_kv_owner",
-                  "scale": "n1_kvowner_dram_20gib",
-                  "case_config": True,
-                  "scene_config": {},
-              },
-              "ci_top_attention_mq_mpsc": {
-                  "subject": "mq",
-                  "runtime_contract": "cluster_kv_owner",
-                  "scale": "n1_kvowner_dram_20gib",
-                  "case_config": True,
-                  "scene_config": {},
-              },
-              "ci_top_attention_mq_mpmc": {
-                  "subject": "mq",
-                  "runtime_contract": "cluster_kv_owner",
-                  "scale": "n1_kvowner_dram_20gib",
-                  "case_config": True,
-                  "scene_config": {},
-              },
-              "ci_top_attention_mq_mpmc_bench": {
-                  "subject": "mq",
-                  "runtime_contract": "cluster_kv_owner",
-                  "scale": "n1_kvowner_dram_20gib",
-                  "case_config": True,
-                  "scene_config": {},
-              },
-          }
-
-          for scene_id, scene_def in top_attention_ci_scenes.items():
-              commands = [
-                  top_attention_command(
-                      scene_id,
-                      case_config=scene_def["case_config"],
-                      timeout_seconds=scene_def.get("timeout_seconds", 21600),
-                  )
-              ]
-              existing_scene = suite["scenes"].get(scene_id)
-              if existing_scene is None:
-                  suite["scenes"][scene_id] = {
-                      "ci": {
-                          "subject": scene_def["subject"],
-                          "runtime_contract": scene_def["runtime_contract"],
-                          "commands": commands,
-                      },
-                      "select": {
-                          "scales": [scene_def["scale"]],
-                          "profiles": ["fluxon_tcp"],
-                      },
-                  }
-                  continue
-              existing_scene["ci"]["subject"] = scene_def["subject"]
-              existing_scene["ci"]["runtime_contract"] = scene_def["runtime_contract"]
-              existing_scene["ci"]["commands"] = commands
-
-          # Scene selection:
-          # - ci_top_attention_doc_page_build validates doc build through the prebuilt Docker image.
-          # - ci_top_attention_bin_kvtest keeps the Rust kv_test entry under the testbed scene contract.
-          # - ci_top_attention_log_mgmt keeps log rolling/sharding coverage under the same CI testbed contract.
-          # - ci_top_attention_ctrl_c_kv keeps runtime child-retirement Ctrl-C coverage in this workflow.
-          # - ci_top_attention_ctrl_c_mq keeps MQ Ctrl-C exit coverage in this workflow.
-          # - ci_top_attention_mq_core keeps MQ correctness coverage inside the same CI testbed contract.
-          # - ci_top_attention_mq_mpsc keeps MPSC API channel coverage inside the same CI testbed contract.
-          # - ci_top_attention_mq_mpmc keeps MPMC API channel coverage inside the same CI testbed contract.
-          # - ci_top_attention_mq_mpmc_bench keeps heavier MPMC benchmark-style coverage in this workflow.
-          suite["scenes"] = {
-              key: value
-              for key, value in suite["scenes"].items()
-              if key in top_attention_ci_scenes
-          }
-
-          # Profile selection:
-          # - Keep one Fluxon transport profile in this workflow to constrain matrix size.
-          # - ci_2_virt_node will still rewrite the selected public profile into the local same-host CI profile.
-          suite["profiles"] = {
-              "fluxon_tcp": copy.deepcopy(suite["profiles"]["fluxon_tcp"])
-          }
-          suite["run"]["selectors"]["profile_ids"] = ["fluxon_tcp"]
-
-          # Scene-local workload config:
-          # - Restrict kv_test to one round in CI for runtime control.
-          # - Keep the doc-site base URL in scene_configs instead of workflow env.
-          scene_configs = suite["profiles"]["fluxon_tcp"]["runtime"]["ci"].setdefault("scene_configs", {})
-          for scene_id, scene_def in top_attention_ci_scenes.items():
-              scene_configs[scene_id] = copy.deepcopy(scene_def["scene_config"])
-
-          # Scale selection:
-          # - Keep the original per-scene scales from ci_test_list.yaml.
-          # - ci_top_attention_doc_page_build stays on n1_kvowner_dram_3gib.
-          # - ci_top_attention_bin_kvtest stays on n1_kvowner_dram_20gib.
-          # - ci_top_attention_log_mgmt stays on n1_kvowner_dram_20gib.
-          # - ci_top_attention_ctrl_c_kv stays on n1_kvowner_dram_3gib.
-          # - ci_top_attention_ctrl_c_mq stays on n1_kvowner_dram_20gib.
-          # - ci_top_attention_mq_core stays on n1_kvowner_dram_20gib.
-          # - ci_top_attention_mq_mpsc stays on n1_kvowner_dram_20gib.
-          # - ci_top_attention_mq_mpmc stays on n1_kvowner_dram_20gib.
-          # - ci_top_attention_mq_mpmc_bench stays on n1_kvowner_dram_20gib.
-
-          out_path.write_text(
-              yaml.safe_dump(suite, sort_keys=False, allow_unicode=False),
-              encoding="utf-8",
-          )
-          print(out_path)
-          PY
-
-      - name: Run ci_2_virt_node full flow
+      - name: Package Fluxon wheel and CI release
         run: |
-          python3 fluxon_test_stack/ci_2_virt_node.py \
-            --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
-            --print-generated \
-            --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy"
+          timeout --preserve-status --signal=INT 10800s \
+            python3 fluxon_test_stack/ci_2_virt_node.py \
+              --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
+              --workdir .dever/ci_2_virt_node \
+              --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy" \
+              --skip-dispatch \
+              --skip-start-testbed \
+              --skip-runner \
+              --print-generated
 
-      - name: Print ci_2_virt_node failure summary
-        if: ${{ failure() }}
+      - name: Archive Fluxon CI release
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import yaml
+          tar -I 'pigz -p 4' \
+            --exclude='fluxon_release/ext_images' \
+            -cf "$RUNNER_TEMP/fluxon-ci-release.tar.gz" \
+            fluxon_release
 
-          workdir = Path(".dever/ci_2_virt_node/runner_run")
-          case_runs_path = workdir / "case_runs.yaml"
-          if not case_runs_path.exists():
-              print(f"missing {case_runs_path}")
-              raise SystemExit(0)
+      - name: Upload Fluxon CI release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fluxon-ci-release-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          path: ${{ runner.temp }}/fluxon-ci-release.tar.gz
 
-          case_runs = yaml.safe_load(case_runs_path.read_text(encoding="utf-8"))
-          print("=== case_runs.yaml ===")
-          print(yaml.safe_dump(case_runs, sort_keys=False, allow_unicode=False))
+      - name: Collect package failure-analysis context
+        if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+        run: |
+          python3 scripts/ci_codex_failure_analysis.py collect-context \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --runner-temp "$RUNNER_TEMP" \
+            --context-root "$RUNNER_TEMP/codex-failure-context"
 
-          for case in case_runs.get("cases", []):
-              last_run = case.get("last_run", {})
-              if last_run.get("outcome") != "SUCCESS":
-                  case_id = case.get("case_id")
-                  run_index = last_run.get("run_index")
-                  print(f"=== failed case: {case_id} run_{run_index} ===")
-                  run_dir = workdir / "results" / str(case_id) / f"run_{run_index}"
-                  for rel in (
-                      "summary.yaml",
-                      "exception.txt",
-                      "logs/ci_runner/exit_code.txt",
-                  ):
-                      path = run_dir / rel
-                      print(f"=== {path} ===")
-                      if path.exists():
-                          print(path.read_text(encoding="utf-8", errors="replace"))
-                      else:
-                          print(f"missing {path}")
+      - name: Upload package failure-analysis context
+        if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-failure-context-${{ github.run_id }}-package-wheel
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+          compression-level: 6
+          path: ${{ runner.temp }}/codex-failure-context/**
 
-                  stdout_path = run_dir / "logs" / "ci_runner" / "stdout.log"
-                  print(f"=== {stdout_path} tail ===")
-                  if stdout_path.exists():
-                      lines = stdout_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                      print("\n".join(lines[-240:]))
-                  else:
-                      print(f"missing {stdout_path}")
-          PY
+  ci-2-virt-node:
+    name: ci-2-virt-node
+    needs: package-wheel
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Free hosted runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          tool-cache: false
+          swap-storage: false
+
+      - name: Scan and clean temporary data
+        run: >-
+          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_TEMP="$RUNNER_TEMP"
+          "$(command -v python3)"
+          scripts/ci_2_virt_node_workflow.py scan-and-clean-temp
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git \
+            pigz \
+            protobuf-compiler \
+            python3-venv \
+            rsync
+
+      - name: Verify Docker availability
+        run: |
+          command -v docker >/dev/null
+          if ! docker info >/dev/null 2>&1; then
+            sudo systemctl start docker
+            docker info >/dev/null
+          fi
+          docker version
+
+      - name: Install Python dependencies
+        run: python3 -m pip install PyYAML
+
+      - name: Sync rather_no_git_submodule workspace inputs
+        run: python3 fluxon_rs/scripts/rather_no_git_submodule.py
+
+      - name: Download Fluxon CI release
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: fluxon-ci-release-${{ github.sha }}
+          path: ${{ runner.temp }}/fluxon-ci-release
+
+      - name: Materialize Fluxon CI release
+        run: |
+          rm -rf fluxon_release
+          tar -xzf "$RUNNER_TEMP/fluxon-ci-release/fluxon-ci-release.tar.gz"
+          test -f fluxon_release/ext_images.tar.gz
+          tar -xzf fluxon_release/ext_images.tar.gz -C fluxon_release
+          test -f fluxon_release/fluxon_release.sha256
+          test -f fluxon_release/profiles/fluxon_tcp_thread/fluxon_release.sha256
+          test -f fluxon_release/test_rsc/fluxon_tcp_thread/fluxon_test_rsc.sha256
+          test -f fluxon_release/ext_images/ext_images.sha256
+
+      - name: Write test-all suite
+        run: |
+          python3 scripts/ci_2_virt_node_workflow.py write-suite \
+            --source fluxon_test_stack/ci_test_list.yaml \
+            --output "$RUNNER_TEMP/ci_test_list.ci.yaml" \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Run test-all flow
+        run: |
+          set +e
+          timeout --preserve-status --signal=INT 17000s \
+            python3 fluxon_test_stack/ci_2_virt_node.py \
+              --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
+              --print-generated \
+              --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy" \
+              --skip-pack
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          echo "test-all failed or timed out before GitHub job cancellation: rc=$rc"
+          python3 scripts/ci_2_virt_node_workflow.py print-failure-diagnostics \
+            --workdir .dever/ci_2_virt_node/runner_run
+          exit "$rc"
 
       - name: Normalize ci_2_virt_node debug artifact permissions
         if: ${{ always() }}
         run: |
-          chmod -R a+rX .dever || true
-          chmod -R a+rX fluxon_release || true
-          chmod -R a+rX setup_and_pack/nix/runs || true
-          find .dever -type f -name '*.yaml' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.log' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.json' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.html' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.txt' -exec chmod a+r {} + || true
-          find .dever -type f -name '*.sha256' -exec chmod a+r {} + || true
-          find .dever -type d -path '*/pack_release_runtime/*' -exec chmod a+rx {} + || true
-          find .dever -type d -path '*/pack_release_runtime/project-data/*' -exec chmod a+rx {} + || true
-          find .dever -path '*/pack_release_runtime/project-data/*' \
+          chmod -R a+rX .dever/ci_2_virt_node || true
+          find .dever/ci_2_virt_node -type f -name '*.yaml' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.log' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.json' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.html' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.txt' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -type f -name '*.sha256' -exec chmod a+r {} + || true
+          find .dever/ci_2_virt_node -path '*/pack_release_runtime/project-data/*' \
             \( -path '*/instances/*/logs' -o -path '*/instances/*/release' -o -path '*/assemblies/*/profile' \) \
             -exec chmod -R a+rX {} + || true
 
+      - name: Collect Codex failure-analysis context
+        if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+        run: |
+          python3 scripts/ci_codex_failure_analysis.py collect-context \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --runner-temp "$RUNNER_TEMP" \
+            --context-root "$RUNNER_TEMP/codex-failure-context"
+
+      - name: Upload Codex failure-analysis context
+        if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-failure-context-${{ github.run_id }}-test-all
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+          compression-level: 6
+          path: ${{ runner.temp }}/codex-failure-context/**
+
       - name: Upload ci_2_virt_node debug artifacts
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-2-virt-node-debug-${{ github.sha }}
           if-no-files-found: warn
+          include-hidden-files: true
           compression-level: 1
           path: |
-            .dever/**
-            fluxon_release/**
-            setup_and_pack/nix/runs/**
-            .dever/**/pack_release_runtime/project-data/**/instances/**/logs/**
-            .dever/**/pack_release_runtime/project-data/**/instances/**/release/**
-            .dever/**/pack_release_runtime/project-data/**/assemblies/**/profile/**
+            .dever/ci_2_virt_node/**
+
+  ci-large-scale-mq:
+    name: ci-large-scale-mq
+    needs: package-wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Free hosted runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          tool-cache: false
+          swap-storage: false
+
+      - name: Scan and clean temporary data
+        run: >-
+          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_TEMP="$RUNNER_TEMP"
+          "$(command -v python3)"
+          scripts/ci_2_virt_node_workflow.py scan-and-clean-temp
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+
+      - name: Download Fluxon CI release
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: fluxon-ci-release-${{ github.sha }}
+          path: ${{ runner.temp }}/fluxon-ci-release
+
+      - name: Materialize Fluxon CI release
+        run: |
+          rm -rf fluxon_release
+          tar -xzf "$RUNNER_TEMP/fluxon-ci-release/fluxon-ci-release.tar.gz"
+          test -f fluxon_release/ext_images.tar.gz
+          tar -xzf fluxon_release/ext_images.tar.gz -C fluxon_release
+          test -f fluxon_release/fluxon_release.sha256
+          test -f fluxon_release/profiles/fluxon_tcp_thread/fluxon_release.sha256
+          test -f fluxon_release/test_rsc/fluxon_tcp_thread/fluxon_test_rsc.sha256
+          test -f fluxon_release/ext_images/ext_images.sha256
+
+      - name: Install packaged Fluxon wheel
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          wheels = sorted(Path("fluxon_release").glob("fluxon-*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected exactly one packaged Fluxon wheel, found {len(wheels)}")
+          subprocess.run(
+              [
+                  sys.executable,
+                  "-m",
+                  "pip",
+                  "install",
+                  "--force-reinstall",
+                  str(wheels[0]),
+              ],
+              check=True,
+          )
+          subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
+          subprocess.run(
+              [
+                  sys.executable,
+                  "-I",
+                  "-c",
+                  (
+                      "import etcd3; "
+                      "import fluxon_py; "
+                      "from fluxon_py._api_ext_chan.mq_config_check import MIN_TTL; "
+                      "print(f'Fluxon dependency probe passed: {fluxon_py.__file__=} {MIN_TTL=}')"
+                  ),
+              ],
+              check=True,
+          )
+          PY
+
+      - name: Run bare-local large-scale MQ
+        run: |
+          python3 -u fluxon_test_stack/top_attention_test_index/_largescale_mq.py \
+            --release-dir fluxon_release \
+            --workdir .dever/ci_large_scale_mq \
+            --owner-count 2 \
+            --owner-dram-gib 1 \
+            --producer-count 80 \
+            --consumer-count 8 \
+            --threads-per-process 1 \
+            --duration-seconds 90 \
+            --metric-warmup-seconds 60 \
+            --value-size 256 \
+            --op-timeout-seconds 5 \
+            --cluster-ready-timeout-seconds 1800 \
+            --consumer-sim-min-ms 1 \
+            --consumer-sim-max-ms 1
+
+      - name: Normalize large-scale MQ debug artifact permissions
+        if: ${{ always() }}
+        run: |
+          chmod -R a+rX .dever/ci_large_scale_mq || true
+          find .dever/ci_large_scale_mq -type f -name '*.yaml' -exec chmod a+r {} + || true
+          find .dever/ci_large_scale_mq -type f -name '*.log' -exec chmod a+r {} + || true
+          find .dever/ci_large_scale_mq -type f -name '*.json' -exec chmod a+r {} + || true
+          find .dever/ci_large_scale_mq -type f -name '*.jsonl' -exec chmod a+r {} + || true
+
+      - name: Collect large-scale MQ failure-analysis context
+        if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+        run: |
+          python3 scripts/ci_codex_failure_analysis.py collect-context \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --runner-temp "$RUNNER_TEMP" \
+            --context-root "$RUNNER_TEMP/codex-failure-context"
+
+      - name: Upload large-scale MQ failure-analysis context
+        if: ${{ failure() && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-failure-context-${{ github.run_id }}-large-scale
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+          compression-level: 6
+          path: ${{ runner.temp }}/codex-failure-context/**
+
+      - name: Upload large-scale MQ debug artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-large-scale-mq-debug-${{ github.sha }}
+          if-no-files-found: warn
+          include-hidden-files: true
+          compression-level: 1
+          path: |
+            .dever/ci_large_scale_mq/*.json
+            .dever/ci_large_scale_mq/*.jsonl
+            .dever/ci_large_scale_mq/benchmark_config.py
+            .dever/ci_large_scale_mq/configs/*.yaml
+            .dever/ci_large_scale_mq/logs/**/*.log
+            .dever/ci_large_scale_mq/services/**/*.log
+            .dever/ci_large_scale_mq/services/**/shared.json
+
+  codex_failure_analysis:
+    name: Codex failure analysis
+    needs:
+      - package-wheel
+      - ci-2-virt-node
+      - ci-large-scale-mq
+    if: ${{ always() && (needs['package-wheel'].result == 'failure' || needs['ci-2-virt-node'].result == 'failure' || needs['ci-large-scale-mq'].result == 'failure') && vars.CODEX_FAILURE_ANALYSIS_ENABLED == 'true' }}
+    environment: OPENAI_API_KEY
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out failed revision
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check OpenAI API configuration availability
+        id: api_config
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+        run: python3 scripts/ci_codex_failure_analysis.py check-api-config
+
+      - name: Fetch current and historical failure evidence
+        if: ${{ steps.api_config.outputs.available == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_JOB_NAME: ${{ needs['ci-large-scale-mq'].result == 'failure' && 'ci-large-scale-mq' || needs['ci-2-virt-node'].result == 'failure' && 'ci-2-virt-node' || 'package-wheel' }}
+          CURRENT_CONTEXT_ARTIFACT_NAME: ${{ needs['ci-large-scale-mq'].result == 'failure' && format('codex-failure-context-{0}-large-scale', github.run_id) || needs['ci-2-virt-node'].result == 'failure' && format('codex-failure-context-{0}-test-all', github.run_id) || format('codex-failure-context-{0}-package-wheel', github.run_id) }}
+        run: |
+          python3 scripts/ci_codex_failure_analysis.py fetch-evidence \
+            --repository "$GITHUB_REPOSITORY" \
+            --current-run-id "$GITHUB_RUN_ID" \
+            --current-job-name "$CURRENT_JOB_NAME" \
+            --current-context-artifact-name "$CURRENT_CONTEXT_ARTIFACT_NAME" \
+            --workflow-file all_test.yml \
+            --history-failure-limit 5 \
+            --artifact-wait-seconds 60 \
+            --artifact-poll-seconds 5 \
+            --context-root failure-context
+
+      - name: Build complete evidence inventory
+        if: ${{ steps.api_config.outputs.available == 'true' }}
+        run: >-
+          python3 scripts/ci_codex_failure_analysis.py build-inventory
+          --context-root failure-context
+
+      - name: Run Codex failure analysis
+        id: run_codex
+        if: ${{ steps.api_config.outputs.available == 'true' }}
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.11
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          responses-api-endpoint: ${{ format('{0}/responses', secrets.OPENAI_BASE_URL) }}
+          prompt-file: .github/codex/ci-failure-analysis-prompt.md
+          permission-profile: ":read-only"
+          safety-strategy: drop-sudo
+          effort: high
+
+      - name: Print Codex failure report
+        if: ${{ steps.api_config.outputs.available == 'true' && steps.run_codex.outputs.final-message != '' }}
+        env:
+          CODEX_REPORT: ${{ steps.run_codex.outputs.final-message }}
+          FAILED_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+        run: >-
+          python3 scripts/ci_codex_failure_analysis.py print-report
+          --summary "$GITHUB_STEP_SUMMARY"

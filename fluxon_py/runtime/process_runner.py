@@ -5,8 +5,8 @@ from collections.abc import Mapping
 import atexit
 import ctypes
 from dataclasses import dataclass
-import enum
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -43,19 +43,10 @@ class RuntimeSingletonSpec:
     workdir_path: Path
 
 
-class ChildStopMode(enum.Enum):
-    # Keep this compatibility surface for installed scripts that still import
-    # the old stop-mode API while the runtime converges on the attached-child
-    # model. Child shutdown no longer branches on this enum.
-    PROCESS = "process"
-    PROCESS_GROUP = "process_group"
-
-
 @dataclass(frozen=True)
 class ManagedSubprocess:
     label: str
     proc: subprocess.Popen[Any]
-    stop_mode: ChildStopMode = ChildStopMode.PROCESS
 
 
 def resolve_runtime_config_path(
@@ -236,21 +227,48 @@ def register_ctrlc_callback(
     *,
     thread_name: str,
 ) -> Callable[[], None]:
+    """Run one SIGINT/SIGTERM callback on a dedicated listener thread."""
+
     signal_set = {signal.SIGINT, signal.SIGTERM}
 
     if threading.current_thread() is threading.main_thread():
         old_sigint = signal.getsignal(signal.SIGINT)
         old_sigterm = signal.getsignal(signal.SIGTERM)
+        callback_requests: queue.SimpleQueue[str | None] = queue.SimpleQueue()
+        callback_requested = False
+
+        def _listener() -> None:
+            reason = callback_requests.get()
+            if reason is not None:
+                on_ctrlc(reason)
+
+        listener = threading.Thread(target=_listener, name=thread_name, daemon=True)
+        listener.start()
 
         def _handler(signum: int, _frame: object) -> None:
-            on_ctrlc(_signal_reason(signum))
+            nonlocal callback_requested
+            if callback_requested:
+                return
+            callback_requested = True
+            # A Python signal frame can interrupt PyO3 while the main thread owns
+            # MQ operation locks. Run potentially blocking cleanup on the listener.
+            callback_requests.put(_signal_reason(signum))
 
         signal.signal(signal.SIGINT, _handler)
         signal.signal(signal.SIGTERM, _handler)
 
+        restored = False
+
         def _restore() -> None:
+            nonlocal restored
+            if restored:
+                return
+            restored = True
             signal.signal(signal.SIGINT, old_sigint)
             signal.signal(signal.SIGTERM, old_sigterm)
+            if not callback_requested:
+                callback_requests.put(None)
+            listener.join()
 
         return _restore
 

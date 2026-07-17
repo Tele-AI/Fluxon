@@ -499,10 +499,6 @@ def _empty_fluxon_phase_bucket_counts() -> Dict[str, int]:
     return {"ok": 0, "miss": 0, "timeout": 0, "error": 0}
 
 
-def _positive_ts_diff_us(later_ts_us: float, earlier_ts_us: float) -> float:
-    return max(0.0, float(later_ts_us) - float(earlier_ts_us))
-
-
 def _cross_process_ts_diff_us(
     later_ts_us: Optional[float],
     earlier_ts_us: Optional[float],
@@ -1871,6 +1867,12 @@ class FluxonBlockingStore:
         self._store = store
         self._phase_profiler = _FluxonPhaseProfiler()
 
+    @property
+    def kv_client(self) -> KvClient:
+        """Return the uniquely owned client for MQ and RPC control paths."""
+
+        return self._store
+
     def put_blocking(
         self,
         key: str,
@@ -1970,32 +1972,6 @@ class FluxonBlockingStore:
         except Exception as exc:
             _bench_kv_print(f"{ctx} GET exception key={key!r} err={exc}")
             return f"GET exception: {exc}"
-
-    def rpc_register(self, path: str, handler: Any) -> Any:
-        return self._store.rpc_register(path, handler)
-
-    def rpc_register_bytes(self, path: str, handler: Any) -> Any:
-        return self._store.rpc_register_bytes(path, handler)
-
-    def rpc_call(
-        self,
-        target_instance_key: str,
-        path: str,
-        payload: Dict[str, Any],
-        *,
-        timeout_ms: int,
-    ) -> Any:
-        return self._store.rpc_call(target_instance_key, path, payload, timeout_ms=timeout_ms)
-
-    def rpc_call_bytes(
-        self,
-        target_instance_key: str,
-        path: str,
-        payload: bytes,
-        *,
-        timeout_ms: int,
-    ) -> Any:
-        return self._store.rpc_call_bytes(target_instance_key, path, payload, timeout_ms=timeout_ms)
 
     def close(self) -> _SimpleResult:
         try:
@@ -2356,30 +2332,6 @@ def _kv_bootstrap_before_ready_enabled(test_config: Mapping[str, Any]) -> bool:
     raise ValueError("kv_bootstrap_before_ready must be bool when present")
 
 
-def _build_operation_result(
-    operation_result_cls: Any,
-    *,
-    success: bool,
-    latency_us: float,
-    operation_type: str,
-    key: str,
-    data_size: int,
-    inflight_at_start: int,
-    outcome_kind: Any,
-    error_msg: Optional[str],
-) -> Any:
-    return operation_result_cls(
-        success=success,
-        latency_us=latency_us,
-        operation_type=operation_type,
-        key=key,
-        data_size=data_size,
-        inflight_at_start=inflight_at_start,
-        outcome_kind=outcome_kind,
-        error_msg=error_msg,
-    )
-
-
 def merge_kv_benchmark_extras(
     node_config: Mapping[str, Any],
     benchmark_cfg: Mapping[str, Any],
@@ -2595,8 +2547,7 @@ def run_kv_worker(
                     ),
                 )
             else:
-                result = _build_operation_result(
-                    operation_result_cls,
+                result = operation_result_cls(
                     success=False,
                     latency_us=0.0,
                     operation_type="unknown",
@@ -2607,8 +2558,7 @@ def run_kv_worker(
                     error_msg=f"unsupported KV operation kind: {op_kind}",
                 )
         except Exception as exc:  # noqa: BLE001
-            result = _build_operation_result(
-                operation_result_cls,
+            result = operation_result_cls(
                 success=False,
                 latency_us=0.0,
                 operation_type="exception",

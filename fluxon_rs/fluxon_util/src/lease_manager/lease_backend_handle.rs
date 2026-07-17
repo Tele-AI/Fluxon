@@ -1,11 +1,10 @@
-use anyhow::Result as AnyResult;
 use etcd_client::Client;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
 use super::keepalive_actor::EtcdState;
-use super::lease_backend_uid::LeaseBackendUid;
+use super::lease_backend_uid::{KvKeepaliveLease, LeaseBackendUid};
 use super::lifecycle::debug_keepalive_log;
 use crate::auto_clean_map::AutoCleanMap;
 use crate::auto_clean_map::AutoCleanMapEntry;
@@ -21,13 +20,13 @@ pub enum LeaseBackendInner {
         /// Per-lease keepalive state keyed by lease_id. Auto-evicts when the last
         /// guard (AutoCleanMapEntry) for that lease is dropped.
         states: AutoCleanMap<u64, Arc<Mutex<EtcdState>>>,
-        /// Runtime handle to schedule background tasks (keepalive/revoke).
+        /// Runtime handle to schedule background keepalive tasks.
         rt: tokio::runtime::Handle,
     },
     KvClient {
         _cluster: String,
-        /// Keepalive closure: input lease_id; must not alter TTL.
-        keepalive_cb: Arc<dyn Fn(u64) -> AnyResult<()> + Send + Sync + 'static>,
+        _instance_key: String,
+        keepalive: KvKeepaliveLease,
         /// Runtime handle to schedule background tasks.
         rt: tokio::runtime::Handle,
     },
@@ -64,11 +63,9 @@ impl LeaseBackendHandle {
     }
 
     #[inline]
-    pub fn kv_keepalive_cb(
-        &self,
-    ) -> Option<Arc<dyn Fn(u64) -> AnyResult<()> + Send + Sync + 'static>> {
+    pub fn kv_keepalive(&self) -> Option<KvKeepaliveLease> {
         match &*self.entry {
-            LeaseBackendInner::KvClient { keepalive_cb, .. } => Some(keepalive_cb.clone()),
+            LeaseBackendInner::KvClient { keepalive, .. } => Some(keepalive.clone()),
             _ => None,
         }
     }
@@ -103,39 +100,14 @@ impl LeaseBackendHandle {
     }
 
     /// Drive one keepalive tick according to backend kind.
-    /// - KvClient: invoke the keepalive callback with `lease_id`.
+    /// - KvClient: await the native Fluxon KV keepalive operation.
     /// - Etcd: lock the per-lease state and run `keepalive_once()`.
-    pub(crate) async fn keepalive(&self, lease_id: u64) -> AnyResult<()> {
+    pub(crate) async fn keepalive(&self, lease_id: u64) -> anyhow::Result<()> {
         match &*self.entry {
-            LeaseBackendInner::KvClient { keepalive_cb, .. } => {
-                // Execute the Python-bridged callback on a blocking thread.
-                // Rationale: the callback typically enters the PyO3 layer
-                // (fluxon_pyo3), which then bridges back into Rust and performs
-                // a blocking wait on the underlying runtime. Running such code
-                // directly on a Tokio worker thread would cause a panic, so we
-                // consistently use `spawn_blocking` here to isolate this call
-                // in the dedicated blocking thread pool.
-                let cb = keepalive_cb.clone();
-                match limit_thirdparty::tokio::task::spawn_blocking(move || (cb)(lease_id)).await {
-                    Ok(Ok(())) => {
-                        super::lifecycle::debug_keepalive_log(
-                            lease_id as u64,
-                            "kvclient lease keepalive tick",
-                        );
-                        Ok(())
-                    }
-                    Ok(Err(err)) => {
-                        // Return as error so caller can classify (e.g., Unreachable) and log.
-                        Err(err)
-                    }
-                    Err(join_err) => {
-                        // Propagate join error as failure.
-                        Err(anyhow::anyhow!(
-                            "spawn_blocking join failed: {:?}",
-                            join_err
-                        ))
-                    }
-                }
+            LeaseBackendInner::KvClient { keepalive, .. } => {
+                (keepalive)(lease_id).await?;
+                super::lifecycle::debug_keepalive_log(lease_id, "kvclient lease keepalive tick");
+                Ok(())
             }
             LeaseBackendInner::Etcd { .. } => {
                 if let Some(state) = self.get_etcd_state(lease_id) {
@@ -174,3 +146,63 @@ impl LeaseBackendHandle {
 
 // Backend map and acquisition live in lifecycle.rs;
 // this module only defines the handle/inner types and accessors.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_keepalive_drops_native_operation() {
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started_in_operation = started.clone();
+        let dropped_in_operation = dropped.clone();
+        let keepalive: KvKeepaliveLease = Arc::new(move |_| {
+            let started = started_in_operation.clone();
+            let dropped = dropped_in_operation.clone();
+            Box::pin(async move {
+                let _probe = DropProbe(dropped);
+                started.notify_one();
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        });
+        let backend = LeaseBackendUid::kv_client(
+            "native_keepalive_cancellation_test",
+            "native_keepalive_cancellation_client",
+            Arc::new(|_| Box::pin(async { Ok(1) })),
+            keepalive.clone(),
+        );
+        let handle = super::super::lifecycle::acquire_backend_handle(
+            backend,
+            Some(keepalive),
+            None,
+            tokio::runtime::Handle::current(),
+        );
+
+        let task = tokio::spawn(async move { handle.keepalive(1).await });
+        started.notified().await;
+        task.abort();
+        let join_result = task.await;
+
+        assert!(
+            join_result
+                .expect_err("keepalive task must be cancelled")
+                .is_cancelled()
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "aborting the join must drop the native keepalive future"
+        );
+    }
+}

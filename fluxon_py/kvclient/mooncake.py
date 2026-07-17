@@ -42,7 +42,6 @@ from .kvclient_interface import encode_flat_kv_dict
 from ..logging import init_logger, update_log_level
 import time
 import typing
-from threading import Lock
 from readerwriterlock import rwlock
 
 logging = init_logger()
@@ -127,6 +126,7 @@ class MooncakeStore(KvClient):
     """Mooncake implementation of the KV Cache Store interface."""
     def __init__(self, config: "FluxonKvClientConfig"):
         """Initialize the Mooncake store wrapper."""
+        super().__init__()
         self._store = MooncakeDistributedStore()
         self._config = config
         self._initialized = False
@@ -134,6 +134,7 @@ class MooncakeStore(KvClient):
         self._thread_pool = ThreadPoolExecutor(max_workers=10, thread_name_prefix="mooncake-kv")
         self._rwlock = ReadWriteLock()
         self._renew_lock = threading.Lock()
+        self._close_lock = threading.Lock()
         self._closed = False
         # config = self._config
         device_name = ""
@@ -154,68 +155,19 @@ class MooncakeStore(KvClient):
             f"==============================================================\n"
         )
 
-        shared = {
-            "lock": Lock(),
-            "cur_thread": -1,
-            "fails": [],
-            "ok": False,
-        }
+        retcode = self._store.setup(
+            server_name,
+            config.mooncake_spec_metadata_server,
+            config.contribute_to_cluster_pool_size["dram"],  # Use DRAM only
+            config.mooncake_spec_local_buffer_size,
+            config.protocol_type,
+            device_name,
+            config.mooncake_spec_master_server_address,
+        )
+        if retcode != 0:
+            raise RuntimeError(f"Mooncake store setup failed: retcode={retcode}")
 
-        for i in range(1):
-
-            def setup_store() -> None:
-                try:
-                    retcode = self._store.setup(
-                        server_name,
-                        config.mooncake_spec_metadata_server,
-                        config.contribute_to_cluster_pool_size["dram"],  # Use DRAM only
-                        config.mooncake_spec_local_buffer_size,
-                        config.protocol_type,
-                        device_name,
-                        config.mooncake_spec_master_server_address,
-                    )
-                except Exception as e:  # pragma: no cover - defensive
-                    retcode = -1
-                    errmsg = f"init_mooncake setup raised exception: {e}"
-                    logging.error(errmsg)
-                    with shared["lock"]:
-                        shared["fails"].append(errmsg)
-                    return
-
-                with shared["lock"]:
-                    if f"fail_{i}" in shared:
-                        return
-                    if i > shared["cur_thread"] and not shared["ok"]:
-                        shared["cur_thread"] = i
-                        if retcode == 0:
-                            logging.info("Mooncake store setup successful")
-                            shared["ok"] = True
-                        else:
-                            errmsg = (
-                                f"init_mooncake timeout for {i} times, setup ret code={retcode}"
-                            )
-                            logging.error(errmsg)
-                            shared["fails"].append(errmsg)
-
-            t = threading.Thread(target=setup_store, daemon=True)
-            t.start()
-            logging.debug("start noblock setup")
-            t.join(timeout=30)
-            logging.debug("noblock setup for 30s, starting check")
-            with shared["lock"]:
-                if not shared["ok"]:
-                    logging.warning(
-                        f"Thread {i} is still alive after 30 seconds, continuing to next iteration"
-                    )
-                    shared[f"fail_{i}"] = True
-                else:
-                    break
-
-        if not shared["ok"]:
-            raise RuntimeError(
-                f"init_mooncake timeout for 5 times, fails: {shared['fails']}"
-            )
-
+        logging.info("Mooncake store setup successful")
         logging.info("RECEIVED Mooncake store setup successful")
         # Mark store initialized and set a stable instance identity for API callers.
         self._initialized = True
@@ -229,40 +181,6 @@ class MooncakeStore(KvClient):
             return Result.new_error(exception_to_error(e))
 
 
-    def close_noblock(self, timeout: float = 30.0) -> None:
-        """
-        Close the store in a non-blocking way with timeout.
-        
-        Args:
-            timeout: Maximum time to wait for close operation (default: 30 seconds)
-        """
-        close_result: List[Optional[Exception]] = [None]  # Use list to store result from thread
-        close_exception: List[Optional[Exception]] = [None]  # Use list to store exception from thread
-        
-        def close_store():
-            try:
-                logging.debug("closing the store...")
-                with self._rwlock.write_lock():
-                    ret_code = self._store.close()
-                close_result[0] = ret_code
-                if ret_code == 0:
-                    logging.info("The store successfully closed.")
-                else:
-                    logging.warning(f"The store isn't closed properly.\n\terror code:{ret_code}, error:{try_new_error_from_mooncake(ret_code)}")
-            except Exception as e:
-                close_exception[0] = e
-                logging.error(f"During closing the store, exception {e} occurred!")
-        
-        close_thread = threading.Thread(target=close_store, daemon=True)
-        close_thread.start()
-        close_thread.join(timeout=timeout)
-        
-        if close_thread.is_alive():
-            logging.error(f"Store close operation timed out after {timeout} seconds. Proceeding anyway.")
-            # Thread is still running, but we proceed anyway
-        elif close_exception[0] is not None:
-            logging.error(f"Store close operation failed with exception: {close_exception[0]}. Proceeding anyway.")
-    
     def renew_store(self) -> Result[MooncakeDistributedStore, ApiError]:
         """
         Renew the store only.
@@ -270,8 +188,20 @@ class MooncakeStore(KvClient):
         - First, try to close the old store.
         - Then, renew one.
         """
-        # Close the old store with timeout
-        self.close_noblock(timeout=30.0)
+        try:
+            with self._rwlock.write_lock():
+                close_retcode = self._store.close()
+        except Exception as e:
+            return Result.new_error(
+                BackendUnavailableError(message=f"Mooncake store close failed: {e}")
+            )
+        if close_retcode != 0:
+            return Result.new_error(
+                try_new_error_from_mooncake(
+                    close_retcode,
+                    "Mooncake store close before renew failed",
+                )
+            )
 
         try:
             MooncakeStore._allow_init = True
@@ -759,38 +689,46 @@ class MooncakeStore(KvClient):
         Returns:
             Result[Success, ApiError]
         """
-        if not self._initialized:
-            logging.info("Mooncake store not initialized, nothing to close.")
-            unregister_store_from_cleanup(self)
-            return Result.new_ok(OkNone())
+        with self._close_lock:
+            child_close_result = self._close_registered_children()
+            if not child_close_result.is_ok():
+                return Result.new_error(child_close_result.unwrap_error())
+            child_close_result.unwrap()
 
-        if self._closed:
-            logging.info("Mooncake store already closed, no need to close again.")
-            unregister_store_from_cleanup(self)
-            return Result.new_ok(OkNone())
-        
-        logging.info("Mooncake store closing...")
-        self._closed = True
-        try:
-            # Shutdown thread pool
-            self._thread_pool.shutdown(wait=True)
-
-            with self._rwlock.write_lock():
-                retcode = self._store.close()
-            if retcode == 0:
-                self._initialized = False
-                self._instance_key = None
-                logging.info("Mooncake store closed")
+            if not self._initialized:
+                logging.info("Mooncake store not initialized, nothing to close.")
+                self._finish_registered_child_close()
                 unregister_store_from_cleanup(self)
                 return Result.new_ok(OkNone())
-            else:
+
+            if self._closed:
+                logging.info("Mooncake store already closed, no need to close again.")
+                self._finish_registered_child_close()
+                unregister_store_from_cleanup(self)
+                return Result.new_ok(OkNone())
+
+            logging.info("Mooncake store closing...")
+            try:
+                self._thread_pool.shutdown(wait=True)
+
+                with self._rwlock.write_lock():
+                    retcode = self._store.close()
+                if retcode == 0:
+                    self._closed = True
+                    self._initialized = False
+                    self._instance_key = None
+                    self._finish_registered_child_close()
+                    logging.info("Mooncake store closed")
+                    unregister_store_from_cleanup(self)
+                    return Result.new_ok(OkNone())
+
                 error = try_new_error_from_mooncake(retcode, "Close operation failed")
                 logging.warning(f"Mooncake store close failed: {error}")
                 return Result.new_error(error)
-        except Exception as e:
-            error = exception_to_error(e)
-            logging.warning(f"Mooncake store close failed: {error}")
-            return Result.new_error(error)
+            except Exception as e:
+                error = exception_to_error(e)
+                logging.warning(f"Mooncake store close failed: {error}")
+                return Result.new_error(error)
     
     def is_write_once(self) -> bool:
         """
