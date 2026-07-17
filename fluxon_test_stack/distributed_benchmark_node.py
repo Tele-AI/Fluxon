@@ -68,7 +68,6 @@ try:
         KV_NODE_ROLE_WORKER,
         KVBenchmarkBlockingStore,
         KVGetResultKind,
-        FluxonBlockingStore,
         canonicalize_kv_node_role,
         classify_kv_get_result,
         init_kv_store,
@@ -117,7 +116,6 @@ except ImportError:
         KV_NODE_ROLE_WORKER,
         KVBenchmarkBlockingStore,
         KVGetResultKind,
-        FluxonBlockingStore,
         canonicalize_kv_node_role,
         classify_kv_get_result,
         init_kv_store,
@@ -2937,7 +2935,10 @@ class BenchmarkNode:
                         )
                     self._attach_fluxon_phase_summary_callback(store)
                     self.kv_store = store
-                    if not isinstance(store, FluxonBlockingStore):
+                    if (
+                        not isinstance(store, KVBenchmarkBlockingStore)
+                        or store.backend_kind != BACKEND_KIND_FLUXON
+                    ):
                         raise RuntimeError(
                             "MPMC requires the Fluxon KV backend; benchmark wrapper is missing"
                         )
@@ -4125,7 +4126,10 @@ class BenchmarkNode:
                     return False
                 self.kv_store = store
                 self.fluxon_client = (
-                    store.kv_client if isinstance(store, FluxonBlockingStore) else None
+                    store.kv_client
+                    if isinstance(store, KVBenchmarkBlockingStore)
+                    and store.backend_kind == BACKEND_KIND_FLUXON
+                    else None
                 )
                 self._attach_fluxon_phase_summary_callback(self.kv_store)
                 logger.info("✅ KVCache存储实例创建成功")
@@ -4133,7 +4137,9 @@ class BenchmarkNode:
             # 2) Initialize MPMC components based on test mode
             if test_mode == TestMode.MPMC.value:
                 if not defer_shared_kv_store and self.fluxon_client is None:
-                    raise RuntimeError("MPMC requires a FluxonBlockingStore-backed KvClient")
+                    raise RuntimeError(
+                        "MPMC requires a Fluxon-backed KVBenchmarkBlockingStore"
+                    )
                 logger.info("🔧 MPMC模式，初始化 MPMC 相关配置（每线程独立实例）...")
 
                 node_role = (self.mq_state.role or node_role) if self.mq_state else node_role
