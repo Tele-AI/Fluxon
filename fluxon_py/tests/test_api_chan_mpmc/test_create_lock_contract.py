@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract tests for MPMC sub-channel creation reservations."""
+"""Contract tests for MPMC ready claims and lock-scoped sub-channel creation."""
 
 from __future__ import annotations
 
@@ -247,6 +247,7 @@ class _FakeMpscState:
         self.instances: List[object] = []
         self.next_channel_id = 1000
         self.fail_constructor = False
+        self.rollback_count = 0
         self.on_construct: Optional[Callable[[], None]] = None
 
 
@@ -279,6 +280,10 @@ def _new_fake_mpsc_consumer_type(state: _FakeMpscState):
             self.release_count += 1
             return _ReleaseResult()
 
+        def _rollback_unpublished_channel(self):
+            state.rollback_count += 1
+            return mpmc.Result.new_ok(mpmc.OK_NONE)
+
     return _FakeMpscConsumer
 
 
@@ -297,7 +302,7 @@ def _new_channel(etcd: _FakeEtcd, member_id: int) -> mpmc.MPMCChannel:
     channel._lm_mpmc_member = None
     channel.mpmc_global_lease = _FakeLease(1)
     channel.payload_lease_id = 10
-    channel.shutdown_ctl = types.SimpleNamespace(closed=False)
+    channel.shutdown_ctl = mpmc.MqShutdownCtl()
     channel.ready_channels = []
     channel.unready_channels = []
     channel._ready_channels_lock = threading.Lock()
@@ -312,12 +317,9 @@ def _add_active_consumers(etcd: _FakeEtcd, count: int) -> None:
         etcd.values[f"{prefix}{member_id}"] = b"active"
 
 
-def _reservation_keys(etcd: _FakeEtcd) -> List[str]:
-    prefix = mpmc._new_mpmc_create_reservations_prefix("7")
-    return sorted(key for key in etcd.values if key.startswith(prefix))
 
 
-class TestCreateReservationContract(unittest.TestCase):
+class TestCreateLockContract(unittest.TestCase):
     def test_ready_claim_response_loss_reconciles_owned_key(self) -> None:
         etcd = _FakeEtcd()
         etcd.raise_after_ready_claim_commit = True
@@ -371,83 +373,38 @@ class TestCreateReservationContract(unittest.TestCase):
         self.assertEqual(locks.calls, [])
         self.assertEqual(mpsc_state.constructor_lock_depths, [0])
 
-    def test_reservation_caps_concurrent_create_and_success_cleans_it(self) -> None:
+    def test_new_consumer_is_constructed_and_published_under_one_lock(self) -> None:
         etcd = _FakeEtcd()
         _add_active_consumers(etcd, 1)
-        primary = _new_channel(etcd, member_id=11)
-        contender = _new_channel(etcd, member_id=12)
+        channel = _new_channel(etcd, member_id=11)
         locks = _LockTracker()
         mpsc_state = _FakeMpscState(locks)
         fake_consumer = _new_fake_mpsc_consumer_type(mpsc_state)
-        contender_results: List[Any] = []
 
-        def try_contending_create() -> None:
-            contender_results.append(
-                contender.try_create_mpsc_channel(
-                    object(), {}, mpmc.ChanRole.CONSUMER
-                )
-            )
-
-        mpsc_state.on_construct = try_contending_create
         with mock.patch.object(mpmc, "EtcdLock", locks.new_lock), mock.patch.object(
             mpmc, "MPSCChanConsumer", fake_consumer
         ):
-            result = primary.try_create_mpsc_channel(
+            result = channel.try_create_mpsc_channel(
                 object(), {}, mpmc.ChanRole.CONSUMER
             )
 
         self.assertTrue(result.is_ok())
-        _ = result.unwrap()
-        self.assertEqual(len(contender_results), 1)
-        self.assertFalse(contender_results[0].is_ok())
+        consumer = result.unwrap()
+        self.assertTrue(consumer._mpmc_ready_claimed)
+        self.assertEqual(mpsc_state.constructor_lock_depths, [1])
+        self.assertEqual(len(locks.calls), 1)
         self.assertEqual(
-            contender_results[0].unwrap_error().message,
-            mpmc._MPMC_CREATE_IN_PROGRESS_MESSAGE,
+            locks.calls[0].timeout_seconds,
+            mpmc.MPMC_CREATE_LOCK_TIMEOUT_SECONDS,
         )
-        self.assertEqual(mpsc_state.constructor_lock_depths, [0])
-        self.assertEqual(len(mpsc_state.instances), 1)
-        self.assertEqual(_reservation_keys(etcd), [])
         channels_value = etcd.values[mpmc._new_mpmc_mpsc_channels_key("7")]
         self.assertEqual(json.loads(channels_value.decode()), ["1001"])
-        self.assertEqual(locks.depth, 0)
-
-    def test_waiter_retries_when_capacity_opens_with_other_reservations_alive(self) -> None:
-        etcd = _FakeEtcd()
-        channel = _new_channel(etcd, member_id=11)
-        expected_consumer = types.SimpleNamespace(chan_id="1001")
-        first_result = mpmc.Result.new_error(
-            mpmc.ChanCreateError(mpmc._MPMC_CREATE_IN_PROGRESS_MESSAGE)
+        self.assertEqual(
+            etcd.values[mpmc._new_mpmc_ready_channel_key("7", "1001")],
+            b"11",
         )
-        second_result = mpmc.Result.new_ok(expected_consumer)
 
-        with mock.patch.object(
-            channel,
-            "_ensure_member_lease_alive",
-            return_value=mpmc.Result.new_ok(mpmc.OK_NONE),
-        ), mock.patch.object(
-            channel,
-            "_refresh_local_ready_state",
-            return_value=None,
-        ), mock.patch.object(
-            channel,
-            "_get_create_reservation_count",
-            return_value=1,
-        ), mock.patch.object(
-            channel,
-            "_get_active_consumer_count",
-            return_value=2,
-        ), mock.patch.object(
-            channel,
-            "try_create_mpsc_channel",
-            side_effect=[first_result, second_result],
-        ) as try_create:
-            result = channel.get_next_available_channel(object(), {})
-
-        self.assertTrue(result.is_ok())
-        self.assertIs(result.unwrap(), expected_consumer)
-        self.assertEqual(try_create.call_count, 2)
-
-    def test_constructor_failure_cleans_reservation(self) -> None:
+    def test_constructor_failure_leaves_no_published_channel(self) -> None:
         etcd = _FakeEtcd()
         _add_active_consumers(etcd, 1)
         channel = _new_channel(etcd, member_id=11)
@@ -464,38 +421,11 @@ class TestCreateReservationContract(unittest.TestCase):
             )
 
         self.assertFalse(result.is_ok())
-        error = result.unwrap_error()
-        self.assertIn("injected MPSC constructor failure", error.message)
-        self.assertEqual(mpsc_state.constructor_lock_depths, [0])
-        self.assertEqual(_reservation_keys(etcd), [])
+        self.assertIn("injected MPSC constructor failure", result.unwrap_error().message)
+        self.assertEqual(mpsc_state.constructor_lock_depths, [1])
         self.assertNotIn(mpmc._new_mpmc_mpsc_channels_key("7"), etcd.values)
 
-    def test_ambiguous_reservation_create_revokes_member_lease(self) -> None:
-        etcd = _FakeEtcd()
-        etcd.defer_reservation_create_until_revoke = True
-        _add_active_consumers(etcd, 1)
-        channel = _new_channel(etcd, member_id=11)
-        locks = _LockTracker()
-        mpsc_state = _FakeMpscState(locks)
-        fake_consumer = _new_fake_mpsc_consumer_type(mpsc_state)
-
-        with mock.patch.object(mpmc, "EtcdLock", locks.new_lock), mock.patch.object(
-            mpmc, "MPSCChanConsumer", fake_consumer
-        ):
-            result = channel.try_create_mpsc_channel(
-                object(), {}, mpmc.ChanRole.CONSUMER
-            )
-
-        self.assertFalse(result.is_ok())
-        error = result.unwrap_error()
-        self.assertIn("Failed to reserve MPSC channel creation", error.message)
-        self.assertTrue(channel.shutdown_ctl.closed)
-        self.assertEqual(etcd.revoked_lease_ids, [111])
-        self.assertIsNone(etcd.pending_reservation_ops)
-        self.assertEqual(_reservation_keys(etcd), [])
-        self.assertEqual(mpsc_state.instances, [])
-
-    def test_publish_failure_releases_handle_and_cleans_reservation(self) -> None:
+    def test_channel_list_cas_failure_rolls_back_unpublished_consumer(self) -> None:
         etcd = _FakeEtcd()
         etcd.fail_publish = True
         _add_active_consumers(etcd, 1)
@@ -503,17 +433,6 @@ class TestCreateReservationContract(unittest.TestCase):
         locks = _LockTracker()
         mpsc_state = _FakeMpscState(locks)
         fake_consumer = _new_fake_mpsc_consumer_type(mpsc_state)
-
-        def seed_new_mpsc_metadata() -> None:
-            mpsc_id = mpsc_state.instances[-1].chan_id
-            etcd.values[mpmc._new_etcd_meta_key(mpsc_id)] = json.dumps(
-                {"global_long_lease_id": 501}
-            ).encode()
-            etcd.values[f"/channels/{mpsc_id}/consumer/consumer_1"] = b"member"
-            etcd.values[f"dist_id_allocator/channels/{mpsc_id}/consumers"] = b"1"
-            etcd.values[f"cluster_lease/id_allocator/channels/{mpsc_id}"] = b"501"
-
-        mpsc_state.on_construct = seed_new_mpsc_metadata
 
         with mock.patch.object(mpmc, "EtcdLock", locks.new_lock), mock.patch.object(
             mpmc, "MPSCChanConsumer", fake_consumer
@@ -524,96 +443,8 @@ class TestCreateReservationContract(unittest.TestCase):
 
         self.assertFalse(result.is_ok())
         _ = result.unwrap_error()
-        self.assertEqual(etcd.publish_attempts, 1)
-        self.assertEqual(len(mpsc_state.instances), 1)
-        self.assertEqual(mpsc_state.instances[0].release_count, 1)
-        self.assertEqual(_reservation_keys(etcd), [])
+        self.assertEqual(mpsc_state.rollback_count, 1)
         self.assertNotIn(mpmc._new_mpmc_mpsc_channels_key("7"), etcd.values)
-        self.assertNotIn(mpmc._new_etcd_meta_key("1001"), etcd.values)
-        self.assertFalse(any(key.startswith("/channels/1001/") for key in etcd.values))
-        self.assertFalse(
-            any(
-                key.startswith("dist_id_allocator/channels/1001/")
-                for key in etcd.values
-            )
-        )
-        self.assertEqual(etcd.values["/channels/aborted/1001"], b"1")
-        self.assertEqual(etcd.revoked_lease_ids, [501])
-
-    def test_committed_publish_response_loss_is_reconciled_as_success(self) -> None:
-        etcd = _FakeEtcd()
-        etcd.raise_after_publish_commit = True
-        _add_active_consumers(etcd, 1)
-        channel = _new_channel(etcd, member_id=11)
-        locks = _LockTracker()
-        mpsc_state = _FakeMpscState(locks)
-        fake_consumer = _new_fake_mpsc_consumer_type(mpsc_state)
-
-        with mock.patch.object(mpmc, "EtcdLock", locks.new_lock), mock.patch.object(
-            mpmc, "MPSCChanConsumer", fake_consumer
-        ):
-            result = channel.try_create_mpsc_channel(
-                object(), {}, mpmc.ChanRole.CONSUMER
-            )
-
-        self.assertTrue(result.is_ok())
-        consumer = result.unwrap()
-        self.assertEqual(consumer.release_count, 0)
-        self.assertTrue(consumer._mpmc_ready_claimed)
-        self.assertEqual(_reservation_keys(etcd), [])
-        channels_value = etcd.values[mpmc._new_mpmc_mpsc_channels_key("7")]
-        self.assertEqual(json.loads(channels_value.decode()), ["1001"])
-        ready_key = mpmc._new_mpmc_ready_channel_key("7", "1001")
-        self.assertEqual(etcd.values[ready_key], b"11")
-
-    def test_late_publish_commit_before_cleanup_fence_is_not_aborted(self) -> None:
-        etcd = _FakeEtcd()
-        etcd.defer_publish_until_cleanup = True
-        _add_active_consumers(etcd, 1)
-        channel = _new_channel(etcd, member_id=11)
-        locks = _LockTracker()
-        mpsc_state = _FakeMpscState(locks)
-        fake_consumer = _new_fake_mpsc_consumer_type(mpsc_state)
-
-        with mock.patch.object(mpmc, "EtcdLock", locks.new_lock), mock.patch.object(
-            mpmc, "MPSCChanConsumer", fake_consumer
-        ):
-            result = channel.try_create_mpsc_channel(
-                object(), {}, mpmc.ChanRole.CONSUMER
-            )
-
-        self.assertTrue(result.is_ok())
-        consumer = result.unwrap()
-        self.assertEqual(consumer.release_count, 0)
-        self.assertTrue(consumer._mpmc_ready_claimed)
-        self.assertIsNone(etcd.pending_publish_ops)
-        channels_value = etcd.values[mpmc._new_mpmc_mpsc_channels_key("7")]
-        self.assertEqual(json.loads(channels_value.decode()), ["1001"])
-        ready_key = mpmc._new_mpmc_ready_channel_key("7", "1001")
-        self.assertEqual(etcd.values[ready_key], b"11")
-
-    def test_successful_create_uses_30_second_timeout_for_both_lock_phases(self) -> None:
-        etcd = _FakeEtcd()
-        _add_active_consumers(etcd, 1)
-        channel = _new_channel(etcd, member_id=11)
-        locks = _LockTracker()
-        mpsc_state = _FakeMpscState(locks)
-        fake_consumer = _new_fake_mpsc_consumer_type(mpsc_state)
-
-        with mock.patch.object(mpmc, "EtcdLock", locks.new_lock), mock.patch.object(
-            mpmc, "MPSCChanConsumer", fake_consumer
-        ):
-            result = channel.try_create_mpsc_channel(
-                object(), {}, mpmc.ChanRole.CONSUMER
-            )
-
-        self.assertTrue(result.is_ok())
-        _ = result.unwrap()
-        self.assertEqual(mpmc.MPMC_CREATE_LOCK_TIMEOUT_SECONDS, 30.0)
-        self.assertEqual(len(locks.calls), 2)
-        self.assertEqual([call.timeout_seconds for call in locks.calls], [30.0, 30.0])
-        self.assertEqual(mpsc_state.constructor_lock_depths, [0])
-        self.assertEqual(_reservation_keys(etcd), [])
 
 
 if __name__ == "__main__":

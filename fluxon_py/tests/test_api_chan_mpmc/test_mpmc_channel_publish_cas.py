@@ -1,8 +1,31 @@
+#!/usr/bin/env python3
+"""Contract tests for atomic MPMC channel publication."""
+
+from __future__ import annotations
+
+import importlib
 import json
+import sys
 import threading
+import types
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# These tests exercise Python publication logic and replace every native
+# entrypoint reached by the imported channel module.
+_pyo3_loader = importlib.import_module("fluxon_py.tool.pyo3")
+_pyo3_loader._FLUXON_PYO3_MODULE_LAZY = types.SimpleNamespace(
+    MpscContext=object,
+    LeaseManagerHandle=object,
+    EtcdLock=object,
+)
 
 from fluxon_py._api_ext_chan import mpmc as mpmc_module
 from fluxon_py._api_ext_chan.mpmc import (
@@ -162,6 +185,7 @@ def _new_channel(etcd_client, *, member_id, active_consumers):
     channel.mpmc_member_lease = SimpleNamespace(id=member_id)
     channel.mpmc_global_lease = SimpleNamespace(id=900)
     channel.payload_lease_id = 901
+    channel.shutdown_ctl = object()
     channel.get_active_member_ids = lambda role: list(range(1, active_consumers + 1))
     return channel
 

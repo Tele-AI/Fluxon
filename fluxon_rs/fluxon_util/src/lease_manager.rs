@@ -9,7 +9,7 @@ pub use lease_backend_uid::{
     KvAllocateLease, KvKeepaliveLease, KvLeaseFuture, LeaseBackendUid, LeaseRegisterKind, LeaseType,
 };
 pub use lease_handle::GeneralLease;
-pub use lease_handle::{LeaseManager, GLOBAL_LM};
+pub use lease_handle::{GLOBAL_LM, LeaseManager};
 pub use lifecycle::{
     debug_keepalive_log, get_register_by, record_register_by, registered_etcd_client,
     snapshot_active_lease_debug,
