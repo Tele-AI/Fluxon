@@ -1,8 +1,9 @@
 use super::{
-    ClientKvApiInner, OwnerHotEvictionEvent, OwnerLocalReserveClassState,
-    OwnerLocalReserveGrantState, OwnerLocalReservePoolState, OwnerLocalReserveSlotLease,
-    OwnerLocalReserveSlotRef, ReplicaTaskJob, ReplicaTaskTarget,
+    ClientKvApiInner, OwnerHotEvictionEvent, OwnerHotEvictionPreparation, OwnerHotSelectionDebt,
+    OwnerLocalReserveClassState, OwnerLocalReserveGrantState, OwnerLocalReservePoolState,
+    OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef, ReplicaTaskJob, ReplicaTaskTarget,
     local_reserve_rebalance::{owner_local_reserve_timeout_config, wait_owner_local_reserve_ready},
+    owner_hot_weight_bytes,
 };
 use crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
 use crate::cluster_manager::NodeIDString;
@@ -16,16 +17,20 @@ use crate::observe_kvope::{
 use crate::{
     client_kv_api::ClientKvApiView,
     master_kv_router::msg_pack::{
-        BatchEnqueueReplicaTaskReq, BatchEnqueueReplicaTaskResp, BatchPreparePutKeyItemReq,
-        BatchPreparePutKeysReq, BatchPreparePutKeysResp, BatchPutDoneItemReq, BatchPutDoneReq,
+        BatchEnqueueReplicaTaskReq, BatchEnqueueReplicaTaskResp, BatchEvictOwnerSourceReq,
+        BatchEvictOwnerSourceResp, BatchPreparePutKeyItemReq, BatchPreparePutKeysReq,
+        BatchPreparePutKeysResp, BatchPutAppendDoneItemReq, BatchPutAppendDoneReq,
+        BatchPutAppendDoneResp, BatchPutAppendStartItemReq, BatchPutAppendStartReq,
+        BatchPutAppendStartResp, BatchPutDoneItemReq, BatchPutDoneItemResp, BatchPutDoneReq,
         BatchPutDoneResp, BatchPutRevokeItemReq, BatchPutRevokeReq, BatchPutRevokeResp,
         BatchPutStartItemReq, BatchPutStartReq, BatchPutStartResp,
         BatchReleasePutKeyReservationsReq, BatchReleasePutKeyReservationsResp,
         EnqueueReplicaTaskItemResp, GroupedBatchPutDoneItemReq, GroupedBatchPutDoneReq,
-        GroupedBatchPutDoneResp, PutAppendDoneReq, PutAppendDoneResp, PutAppendRevokeReq,
-        PutAppendStartReq, PutAppendStartResp, PutAtomicGroup, PutDoneCommittedSlot, PutDoneReq,
-        PutRevokeReq, PutStartReq, PutStartResp, ReleaseLocalGrantReq, ReserveLocalGrantOutcome,
-        ReserveLocalGrantReq,
+        GroupedBatchPutDoneResp, OwnerReclaimBacking, OwnerSourceEvictionCohort,
+        OwnerSourceEvictionMember, OwnerSourceEvictionOutcome, PutAppendDoneReq, PutAppendDoneResp,
+        PutAppendRevokeReq, PutAppendStartOutcome, PutAppendStartReq, PutAppendStartResp,
+        PutAtomicGroup, PutDoneCommittedSlot, PutDoneReq, PutRevokeReq, PutStartReq, PutStartResp,
+        ReleaseLocalGrantReq, ReserveLocalGrantOutcome, ReserveLocalGrantReq,
     },
     memholder::{UserMemHolder, UserMemHolderExposeKind},
     p2p::msg_pack::MsgPack,
@@ -34,7 +39,7 @@ use crate::{
 };
 use chrono::Utc;
 use fluxon_commu::TransferBreakdown;
-use fluxon_util::semaphore_map::SemaphoreMap;
+use futures::future::join_all;
 use limit_thirdparty::tokio;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
@@ -78,7 +83,7 @@ fn owner_local_reserve_install_grant(
         class_state.slots_per_grant == slots_per_grant,
         "slots_per_grant drift detected while installing local reserve grant"
     );
-    class_state.grants.push(grant);
+    class_state.install_grant(grant);
 }
 
 fn owner_local_reserve_try_claim(
@@ -120,18 +125,7 @@ fn owner_local_reserve_claim_available(
         .entry(slot_size)
         .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
     let claim_count = class_state.free_slot_count().min(max_slots);
-    let mut slots = Vec::with_capacity(claim_count);
-    for grant in class_state.grants.iter_mut() {
-        while slots.len() < claim_count {
-            match grant.claim_prepared_slot() {
-                Some(slot) => slots.push(slot),
-                None => break,
-            }
-        }
-        if slots.len() == claim_count {
-            break;
-        }
-    }
+    let slots = class_state.claim_available(max_slots);
     assert_eq!(
         slots.len(),
         claim_count,
@@ -241,6 +235,125 @@ mod local_reserve_claim_tests {
         assert_eq!(pool.classes.get(&8).unwrap().free_slot_count(), 0);
     }
 
+    #[test]
+    fn grant_index_and_cached_counters_survive_swap_remove_and_reinstall() {
+        const SLOT_SIZE: u64 = 8;
+        const SLOTS_PER_GRANT: u32 = 4;
+        let mut pool = OwnerLocalReservePoolState::default();
+        for grant_id in 1..=3 {
+            owner_local_reserve_install_grant(
+                &mut pool,
+                SLOT_SIZE,
+                SLOTS_PER_GRANT,
+                OwnerLocalReserveGrantState::new(
+                    grant_id,
+                    grant_id * 1000,
+                    grant_id * 1000,
+                    SLOT_SIZE * u64::from(SLOTS_PER_GRANT),
+                    SLOT_SIZE,
+                    SLOTS_PER_GRANT,
+                ),
+            );
+        }
+
+        let class = pool.classes.get_mut(&SLOT_SIZE).unwrap();
+        assert_eq!(class.free_slot_count(), 12);
+        assert_eq!(class.used_slot_count(), 0);
+        let detached = class
+            .detach_fully_free_grant(2)
+            .expect("middle grant must be indexed");
+        assert_eq!(class.free_slot_count(), 8);
+        assert_eq!(class.grant_count(), 2);
+
+        // Removing the middle Vec entry swap-moves grant 3. A subsequent state
+        // transition by grant id proves that its repaired index is authoritative.
+        let claimed = class.claim_available(1);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].grant_id, 3);
+        assert_eq!(class.free_slot_count(), 7);
+        assert_eq!(class.prepared_slot_count(), 1);
+        assert!(class.release_prepared_slot(3, claimed[0].slot_index));
+        assert_eq!(class.free_slot_count(), 8);
+        assert_eq!(class.prepared_slot_count(), 0);
+
+        class.install_grant(detached);
+        assert_eq!(class.free_slot_count(), 12);
+        assert_eq!(class.used_slot_count(), 0);
+        assert_eq!(class.grant_count(), 3);
+    }
+
+    #[test]
+    fn committed_slots_are_reclaimed_and_reused_independently_across_grants() {
+        const SLOT_SIZE: u64 = 8;
+        const SLOTS_PER_GRANT: u32 = 4;
+
+        let mut pool = OwnerLocalReservePoolState::default();
+        for (grant_id, addr) in [(1, 1000), (2, 2000)] {
+            owner_local_reserve_install_grant(
+                &mut pool,
+                SLOT_SIZE,
+                SLOTS_PER_GRANT,
+                OwnerLocalReserveGrantState::new(
+                    grant_id,
+                    addr,
+                    addr,
+                    SLOT_SIZE * u64::from(SLOTS_PER_GRANT),
+                    SLOT_SIZE,
+                    SLOTS_PER_GRANT,
+                ),
+            );
+        }
+
+        let initial = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOTS_PER_GRANT, 8);
+        assert_eq!(initial.len(), 8);
+        {
+            let class = pool.classes.get_mut(&SLOT_SIZE).unwrap();
+            for slot in &initial {
+                assert!(class.mark_prepared_slot_pending_visible(slot.grant_id, slot.slot_index));
+                assert!(class.retain_resident_slot_holder(slot.grant_id, slot.slot_index));
+                assert!(
+                    class.promote_pending_visible_slot_to_committed(slot.grant_id, slot.slot_index)
+                );
+            }
+        }
+
+        let victims = [initial[1].clone(), initial[5].clone()];
+        {
+            let class = pool.classes.get_mut(&SLOT_SIZE).unwrap();
+            for victim in &victims {
+                assert!(class.release_committed_slot_route(victim.grant_id, victim.slot_index));
+                assert!(class.release_resident_slot_holder(victim.grant_id, victim.slot_index));
+            }
+            assert_eq!(class.free_slot_count(), 2);
+            assert_eq!(class.grant_count(), 2);
+            assert!(class.grants.iter().all(|grant| !grant.is_fully_free()));
+            assert!(class.grants.iter().all(|grant| grant.free_slots.len() == 1));
+        }
+
+        for cycle in 0..10 {
+            let reused =
+                owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOTS_PER_GRANT, 2);
+            assert_eq!(reused.len(), 2, "cycle {cycle} did not reuse both slots");
+            let mut reused_grant_ids = reused.iter().map(|slot| slot.grant_id).collect::<Vec<_>>();
+            reused_grant_ids.sort_unstable();
+            assert_eq!(reused_grant_ids, vec![1, 2]);
+
+            let class = pool.classes.get_mut(&SLOT_SIZE).unwrap();
+            for slot in reused {
+                assert!(class.mark_prepared_slot_pending_visible(slot.grant_id, slot.slot_index));
+                assert!(class.retain_resident_slot_holder(slot.grant_id, slot.slot_index));
+                assert!(
+                    class.promote_pending_visible_slot_to_committed(slot.grant_id, slot.slot_index)
+                );
+                assert!(class.release_committed_slot_route(slot.grant_id, slot.slot_index));
+                assert!(class.release_resident_slot_holder(slot.grant_id, slot.slot_index));
+            }
+            assert_eq!(class.free_slot_count(), 2);
+            assert_eq!(class.grant_count(), 2);
+            assert!(class.grants.iter().all(|grant| !grant.is_fully_free()));
+        }
+    }
+
     #[limit_thirdparty::tokio::test]
     async fn later_waiter_cannot_steal_slot_before_current_claim_turn_completes() {
         const SLOT_SIZE: u64 = 4 * 1024;
@@ -272,7 +385,8 @@ mod local_reserve_claim_tests {
         }
 
         // Model a five-slot waiter that has made partial progress while owning the claim turn.
-        let current_claim_turn = api.inner().owner_local_reserve_claim_lock.lock().await;
+        let claim_lock = api.inner().owner_local_reserve_claim_lock(SLOT_SIZE);
+        let current_claim_turn = claim_lock.lock().await;
         let first_partial = {
             let mut pool = api.inner().owner_local_reserve_pool.lock();
             owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOTS_PER_GRANT, 3)
@@ -336,9 +450,8 @@ mod local_reserve_claim_tests {
     }
 
     #[limit_thirdparty::tokio::test]
-    async fn queued_claims_publish_aggregate_demand_and_cancel_cleanly() {
+    async fn same_class_claim_waiters_complete_in_fifo_order() {
         const SLOT_SIZE: u64 = 4 * 1024;
-        const SLOTS_PER_GRANT: u32 = 4;
 
         let api = Arc::new(
             ClientKvApi::construct(ClientKvApiNewArg {
@@ -348,7 +461,109 @@ mod local_reserve_claim_tests {
             .await
             .expect("construct test ClientKvApi"),
         );
-        let claim_turn = api.inner().owner_local_reserve_claim_lock.lock().await;
+        let claim_lock = api.inner().owner_local_reserve_claim_lock(SLOT_SIZE);
+        let claim_turn = claim_lock.lock().await;
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let first_queued = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_lock = api.inner().owner_local_reserve_claim_lock(SLOT_SIZE);
+        let first_order = Arc::clone(&order);
+        let first_queued_task = Arc::clone(&first_queued);
+        let first = tokio::spawn(async move {
+            first_queued_task.store(true, std::sync::atomic::Ordering::Release);
+            let _turn = first_lock.lock_owned().await;
+            first_order.lock().unwrap().push(1u8);
+        });
+        while !first_queued.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        let second_queued = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_lock = api.inner().owner_local_reserve_claim_lock(SLOT_SIZE);
+        let second_order = Arc::clone(&order);
+        let second_queued_task = Arc::clone(&second_queued);
+        let second = tokio::spawn(async move {
+            second_queued_task.store(true, std::sync::atomic::Ordering::Release);
+            let _turn = second_lock.lock_owned().await;
+            second_order.lock().unwrap().push(2u8);
+        });
+        while !second_queued.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        drop(claim_turn);
+
+        limit_thirdparty::tokio::time::timeout(Duration::from_secs(1), async {
+            first.await.expect("first same-class waiter panicked");
+            second.await.expect("second same-class waiter panicked");
+        })
+        .await
+        .expect("same-class FIFO waiters did not complete");
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn pressured_class_does_not_block_an_unrelated_slot_class() {
+        const BLOCKED_SLOT_SIZE: u64 = 4 * 1024;
+        const READY_SLOT_SIZE: u64 = 8 * 1024;
+        let ready_slots_per_grant = owner_local_reserve_slots_per_grant(READY_SLOT_SIZE);
+
+        let api = Arc::new(
+            ClientKvApi::construct(ClientKvApiNewArg {
+                test_spec_config: TestSpecConfig::default(),
+                owner_hot_cache_capacity_bytes: None,
+            })
+            .await
+            .expect("construct test ClientKvApi"),
+        );
+        let blocked_lock = api
+            .inner()
+            .owner_local_reserve_claim_lock(BLOCKED_SLOT_SIZE);
+        let _blocked_turn = blocked_lock.lock().await;
+        {
+            let mut pool = api.inner().owner_local_reserve_pool.lock();
+            owner_local_reserve_install_grant(
+                &mut pool,
+                READY_SLOT_SIZE,
+                ready_slots_per_grant,
+                OwnerLocalReserveGrantState::new(
+                    1,
+                    1000,
+                    1000,
+                    READY_SLOT_SIZE * u64::from(ready_slots_per_grant),
+                    READY_SLOT_SIZE,
+                    ready_slots_per_grant,
+                ),
+            );
+        }
+
+        let ready_api = Arc::clone(&api);
+        let ready_lease = limit_thirdparty::tokio::time::timeout(
+            Duration::from_secs(1),
+            ready_api
+                .inner()
+                .owner_claim_local_reserve_slot_lease(READY_SLOT_SIZE, 1),
+        )
+        .await
+        .expect("an unrelated slot class was head-of-line blocked")
+        .expect("ready slot class claim failed");
+        assert_eq!(ready_lease.slot_size, READY_SLOT_SIZE);
+        assert_eq!(ready_lease.slots.len(), 1);
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn queued_claims_publish_aggregate_demand_and_cancel_cleanly() {
+        const SLOT_SIZE: u64 = 4 * 1024;
+
+        let api = Arc::new(
+            ClientKvApi::construct(ClientKvApiNewArg {
+                test_spec_config: TestSpecConfig::default(),
+                owner_hot_cache_capacity_bytes: None,
+            })
+            .await
+            .expect("construct test ClientKvApi"),
+        );
+        let claim_lock = api.inner().owner_local_reserve_claim_lock(SLOT_SIZE);
+        let claim_turn = claim_lock.lock().await;
 
         let first_api = Arc::clone(&api);
         let first = tokio::spawn(async move {
@@ -435,6 +650,10 @@ pub struct OwnerLocalPublishItem {
 pub struct OwnerLocalPublishJob {
     pub items: Vec<OwnerLocalPublishItem>,
     pub key_reservation_ids: Vec<u64>,
+    /// External local-first requests keep their owner reclaim fences here until
+    /// the grouped master terminal response and all local promotions complete.
+    /// Native/Pyo3 jobs use master key reservations instead and leave this empty.
+    pub external_pending_contexts: Vec<super::ExternalPendingPutCtx>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -525,12 +744,8 @@ impl ClientKvApiInner {
                 request_started_at,
             ));
         };
-        let _claim_turn = match tokio::time::timeout(
-            remaining_for_turn,
-            self.owner_local_reserve_claim_lock.lock(),
-        )
-        .await
-        {
+        let claim_lock = self.owner_local_reserve_claim_lock(slot_size);
+        let _claim_turn = match tokio::time::timeout(remaining_for_turn, claim_lock.lock()).await {
             Ok(claim_turn) => claim_turn,
             Err(_) => {
                 return Err(owner_local_reserve_timeout_error(
@@ -611,19 +826,14 @@ impl ClientKvApiInner {
                 }));
             };
             for slot_ref in &lease.slots {
-                let Some(grant) = class_state
-                    .grants
-                    .iter_mut()
-                    .find(|grant| grant.grant_id == slot_ref.grant_id)
-                else {
+                if !class_state.release_prepared_slot(slot_ref.grant_id, slot_ref.slot_index) {
                     return Err(KvError::Api(ApiError::Unknown {
                         detail: format!(
                             "resident local reserve grant missing while releasing slot lease: grant_id={}",
                             slot_ref.grant_id
                         ),
                     }));
-                };
-                grant.release_prepared_slot(slot_ref.slot_index);
+                }
             }
         }
         self.owner_local_reserve_rebalance_notify().notify_waiters();
@@ -645,19 +855,14 @@ impl ClientKvApiInner {
                 ),
             }));
         };
-        let Some(grant) = class_state
-            .grants
-            .iter_mut()
-            .find(|grant| grant.grant_id == grant_id)
-        else {
+        if !class_state.mark_prepared_slot_pending_visible(grant_id, slot_index) {
             return Err(KvError::Api(ApiError::Unknown {
                 detail: format!(
                     "local reserve grant missing while marking pending slot: grant_id={}",
                     grant_id
                 ),
             }));
-        };
-        grant.mark_prepared_slot_pending_visible(slot_index);
+        }
         Ok(())
     }
 
@@ -676,19 +881,14 @@ impl ClientKvApiInner {
                 ),
             }));
         };
-        let Some(grant) = class_state
-            .grants
-            .iter_mut()
-            .find(|grant| grant.grant_id == grant_id)
-        else {
+        if !class_state.promote_pending_visible_slot_to_committed(grant_id, slot_index) {
             return Err(KvError::Api(ApiError::Unknown {
                 detail: format!(
                     "local reserve grant missing while promoting pending slot: grant_id={}",
                     grant_id
                 ),
             }));
-        };
-        grant.promote_pending_visible_slot_to_committed(slot_index);
+        }
         Ok(())
     }
 
@@ -707,19 +907,14 @@ impl ClientKvApiInner {
                 ),
             }));
         };
-        let Some(grant) = class_state
-            .grants
-            .iter_mut()
-            .find(|grant| grant.grant_id == grant_id)
-        else {
+        if !class_state.retain_resident_slot_holder(grant_id, slot_index) {
             return Err(KvError::Api(ApiError::Unknown {
                 detail: format!(
                     "local reserve grant missing while retaining resident slot holder: grant_id={}",
                     grant_id
                 ),
             }));
-        };
-        grant.retain_resident_slot_holder(slot_index);
+        }
         Ok(())
     }
 
@@ -739,19 +934,14 @@ impl ClientKvApiInner {
                     ),
                 }));
             };
-            let Some(grant) = class_state
-                .grants
-                .iter_mut()
-                .find(|grant| grant.grant_id == grant_id)
-            else {
+            if !class_state.release_resident_slot_holder(grant_id, slot_index) {
                 return Err(KvError::Api(ApiError::Unknown {
                     detail: format!(
                         "local reserve grant missing while releasing resident slot holder: grant_id={}",
                         grant_id
                     ),
                 }));
-            };
-            grant.release_resident_slot_holder(slot_index);
+            }
         }
         self.owner_local_reserve_rebalance_notify().notify_waiters();
         Ok(())
@@ -773,19 +963,43 @@ impl ClientKvApiInner {
                     ),
                 }));
             };
-            let Some(grant) = class_state
-                .grants
-                .iter_mut()
-                .find(|grant| grant.grant_id == grant_id)
-            else {
+            if !class_state.release_committed_slot_route(grant_id, slot_index) {
                 return Err(KvError::Api(ApiError::Unknown {
                     detail: format!(
                         "local reserve grant missing while releasing committed slot route: grant_id={}",
                         grant_id
                     ),
                 }));
+            }
+        }
+        self.owner_local_reserve_rebalance_notify().notify_waiters();
+        Ok(())
+    }
+
+    pub fn owner_release_local_reserve_committed_resident_slot(
+        &self,
+        slot_size: u64,
+        grant_id: u64,
+        slot_index: u32,
+    ) -> KvResult<()> {
+        {
+            let mut pool = self.owner_local_reserve_pool.lock();
+            let Some(class_state) = pool.classes.get_mut(&slot_size) else {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "local reserve class missing while reclaiming committed resident slot: slot_size={}",
+                        slot_size
+                    ),
+                }));
             };
-            grant.release_committed_slot_route(slot_index);
+            if !class_state.release_committed_resident_slot(grant_id, slot_index) {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "local reserve grant missing while reclaiming committed resident slot: grant_id={}",
+                        grant_id
+                    ),
+                }));
+            }
         }
         self.owner_local_reserve_rebalance_notify().notify_waiters();
         Ok(())
@@ -795,8 +1009,8 @@ impl ClientKvApiInner {
         let grants = {
             let mut pool = self.owner_local_reserve_pool.lock();
             let mut detached = Vec::new();
-            for (_slot_size, class_state) in pool.classes.drain() {
-                detached.extend(class_state.grants);
+            for (_slot_size, mut class_state) in pool.classes.drain() {
+                detached.extend(class_state.take_all_grants());
             }
             detached
         };
@@ -1263,10 +1477,9 @@ impl ClientKvApiInner {
             .send(ReplicaTaskJob {
                 key: key.to_string(),
                 put_id,
-                holder,
+                holder: Some(holder),
                 target: Some(target),
                 preferred_sub_cluster: None,
-                hot_replica_guard: None,
                 protect_source_on_remote_complete: true,
             })
             .await
@@ -1314,10 +1527,9 @@ impl ClientKvApiInner {
             .send(ReplicaTaskJob {
                 key: key.to_string(),
                 put_id,
-                holder,
+                holder: Some(holder),
                 target: None,
                 preferred_sub_cluster,
-                hot_replica_guard: None,
                 protect_source_on_remote_complete,
             })
             .await
@@ -1808,23 +2020,14 @@ impl ClientKvApiInner {
         .await
     }
 
-    pub async fn reserve_local_grant(
-        &self,
-        slot_size: u64,
-        required_free_slots: u32,
-        reclaim_before_grow: bool,
-    ) -> KvResult<ReserveLocalGrantOutcome> {
+    pub async fn reserve_local_grant(&self) -> KvResult<ReserveLocalGrantOutcome> {
         if !self.view.register_shutdown_poller().is_running() {
             return Err(KvError::Api(ApiError::SystemShutdown {
                 detail: "ClientKvApi is shutting down; rejecting reserve_local_grant".to_string(),
             }));
         }
         let req = MsgPack {
-            serialize_part: ReserveLocalGrantReq {
-                slot_size,
-                required_free_slots,
-                reclaim_before_grow,
-            },
+            serialize_part: ReserveLocalGrantReq {},
             raw_bytes: Vec::new(),
         };
         let master_node_id = self
@@ -1933,7 +2136,6 @@ impl ClientKvApiInner {
         put_id: PutIDForAKey,
         len: u32,
         preferred_sub_cluster: Option<&str>,
-        demote_source_on_remote_complete: bool,
         protect_source_on_remote_complete: bool,
     ) -> KvResult<PutAppendStartResp> {
         if !self.view.register_shutdown_poller().is_running() {
@@ -1947,7 +2149,6 @@ impl ClientKvApiInner {
                 put_id,
                 len: len as u64,
                 preferred_sub_cluster: preferred_sub_cluster.map(|s| s.to_string()),
-                demote_source_on_remote_complete,
                 protect_source_on_remote_complete,
             },
             raw_bytes: Vec::new(),
@@ -1972,6 +2173,113 @@ impl ClientKvApiInner {
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
         )?;
+        Ok(resp.serialize_part)
+    }
+
+    pub async fn batch_put_append_start(
+        &self,
+        items: Vec<BatchPutAppendStartItemReq>,
+    ) -> KvResult<BatchPutAppendStartResp> {
+        if items.is_empty() {
+            return Ok(BatchPutAppendStartResp {
+                items: Vec::new(),
+                error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
+                error_json: String::new(),
+                server_process_us: 0,
+            });
+        }
+        if !self.view.register_shutdown_poller().is_running() {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: "ClientKvApi is shutting down; rejecting batch_put_append_start"
+                    .to_string(),
+            }));
+        }
+        let req = MsgPack {
+            serialize_part: BatchPutAppendStartReq { items },
+            raw_bytes: Vec::new(),
+        };
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let resp = self
+            .rpc_caller_batch_put_append_start
+            .call_with_transport_policy(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                req,
+                Some(std::time::Duration::from_secs(60)),
+                RpcTransportPolicy::ForceTransport,
+                2,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json.clone(),
+        )?;
+        Ok(resp.serialize_part)
+    }
+
+    pub async fn batch_evict_owner_source(
+        &self,
+        cohorts: Vec<OwnerSourceEvictionCohort>,
+    ) -> KvResult<BatchEvictOwnerSourceResp> {
+        if cohorts.is_empty() {
+            return Ok(BatchEvictOwnerSourceResp {
+                operation_id: 0,
+                cohorts: Vec::new(),
+                error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
+                error_json: String::new(),
+            });
+        }
+        if !self.view.register_shutdown_poller().is_running() {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: "ClientKvApi is shutting down; rejecting owner source eviction".to_string(),
+            }));
+        }
+        let operation_id = self
+            .next_owner_source_eviction_operation_id
+            .fetch_add(1, Ordering::Relaxed);
+        let self_info = self.view.cluster_manager().get_self_info();
+        let req = MsgPack {
+            serialize_part: BatchEvictOwnerSourceReq {
+                operation_id,
+                owner_node_start_time: self_info.node_start_time,
+                cohorts,
+            },
+            raw_bytes: Vec::new(),
+        };
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let resp = self
+            .rpc_caller_batch_evict_owner_source
+            .call_with_transport_policy(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                req,
+                Some(Duration::from_secs(60)),
+                RpcTransportPolicy::ForceTransport,
+                2,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json.clone(),
+        )?;
+        if resp.serialize_part.operation_id != operation_id {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "owner source-eviction operation id mismatch: requested={} response={}",
+                    operation_id, resp.serialize_part.operation_id
+                ),
+            }));
+        }
         Ok(resp.serialize_part)
     }
 
@@ -2036,6 +2344,51 @@ impl ClientKvApiInner {
                 master_node_id.into(),
                 req,
                 Some(std::time::Duration::from_secs(60)),
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json.clone(),
+        )?;
+        Ok(resp.serialize_part)
+    }
+
+    pub async fn batch_put_append_done(
+        &self,
+        items: Vec<BatchPutAppendDoneItemReq>,
+    ) -> KvResult<BatchPutAppendDoneResp> {
+        if items.is_empty() {
+            return Ok(BatchPutAppendDoneResp {
+                items: Vec::new(),
+                error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
+                error_json: String::new(),
+                server_process_us: 0,
+            });
+        }
+        if !self.view.register_shutdown_poller().is_running() {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: "ClientKvApi is shutting down; rejecting batch_put_append_done".to_string(),
+            }));
+        }
+        let req = MsgPack {
+            serialize_part: BatchPutAppendDoneReq { items },
+            raw_bytes: Vec::new(),
+        };
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let resp = self
+            .rpc_caller_batch_put_append_done
+            .call_with_transport_policy(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                req,
+                Some(std::time::Duration::from_secs(60)),
+                RpcTransportPolicy::ForceTransport,
                 0,
             )
             .await
@@ -2486,29 +2839,19 @@ impl ClientKvApiInner {
     }
 }
 
-const OWNER_HOT_APPEND_START_MAX_ATTEMPTS: usize = 3;
-
-fn replica_append_demotes_source_on_remote_complete(is_owner_hot: bool) -> bool {
-    // Owner-hot eviction is an exclusive tier transition after the remote cohort is recoverable.
-    // Ordinary replica and tier-1 append tasks remain inclusive.
-    is_owner_hot
-}
+const REPLICA_TASK_BATCH_MERGE_WINDOW: Duration = Duration::from_millis(2);
+const OWNER_LOCAL_PUBLISH_RETRY_INITIAL: Duration = Duration::from_millis(25);
+const OWNER_LOCAL_PUBLISH_RETRY_MAX: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 mod owner_hot_replica_policy_tests {
     use super::{
         OwnerLocalPublishItem, complete_owner_local_publish_group_lens,
-        replica_append_demotes_source_on_remote_complete,
+        owner_local_publish_cohort_complete,
     };
     use crate::master_kv_router::msg_pack::{
         PutAtomicGroup, PutAtomicGroupMember, PutDoneCommittedSlot,
     };
-
-    #[test]
-    fn owner_hot_replication_is_exclusive_after_remote_completion() {
-        assert!(replica_append_demotes_source_on_remote_complete(true));
-        assert!(!replica_append_demotes_source_on_remote_complete(false));
-    }
 
     fn publish_item(
         key: &str,
@@ -2562,6 +2905,33 @@ mod owner_hot_replica_policy_tests {
         ];
         assert_eq!(complete_owner_local_publish_group_lens(&partial), None);
     }
+
+    #[test]
+    fn hot_admission_waits_for_every_atomic_group_member_to_publish() {
+        let group = PutAtomicGroup {
+            members: vec![
+                PutAtomicGroupMember {
+                    key: "a".to_string(),
+                    put_id: (1, 0),
+                },
+                PutAtomicGroupMember {
+                    key: "b".to_string(),
+                    put_id: (1, 1),
+                },
+            ],
+        };
+        let items = vec![
+            publish_item("a", (1, 0), Some(group.clone())),
+            publish_item("b", (1, 1), Some(group)),
+            publish_item("single", (2, 0), None),
+        ];
+        let partial = vec![&items[0]];
+        assert!(!owner_local_publish_cohort_complete(&items[0], &partial));
+        let complete = vec![&items[0], &items[1]];
+        assert!(owner_local_publish_cohort_complete(&items[0], &complete));
+        assert!(owner_local_publish_cohort_complete(&items[1], &complete));
+        assert!(owner_local_publish_cohort_complete(&items[2], &partial));
+    }
 }
 
 async fn start_replica_append_with_retry(
@@ -2569,116 +2939,411 @@ async fn start_replica_append_with_retry(
     job: &ReplicaTaskJob,
     len: u32,
 ) -> KvResult<PutAppendStartResp> {
-    let max_attempts = if job.hot_replica_guard.is_some() {
-        OWNER_HOT_APPEND_START_MAX_ATTEMPTS
-    } else {
-        1
-    };
-    let mut attempt = 1usize;
-    loop {
-        match inner
-            .put_append_start(
-                &job.key,
-                job.put_id,
-                len,
-                job.preferred_sub_cluster.as_deref(),
-                replica_append_demotes_source_on_remote_complete(job.hot_replica_guard.is_some()),
-                job.protect_source_on_remote_complete,
-            )
-            .await
-        {
-            Ok(resp) => return Ok(resp),
-            Err(err)
-                if attempt < max_attempts
-                    && matches!(err, KvError::Api(ApiError::KeyBeingWritten { .. })) =>
-            {
-                tracing::warn!(
-                    "owner hot replica append start failed; retrying: key={} put_id=({},{}) attempt={}/{} err={}",
-                    job.key,
-                    job.put_id.0,
-                    job.put_id.1,
-                    attempt,
-                    max_attempts,
-                    err
-                );
-                let delay_ms = 25u64.saturating_mul(1u64 << (attempt - 1));
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                attempt += 1;
-            }
-            Err(err) => return Err(err),
+    inner
+        .put_append_start(
+            &job.key,
+            job.put_id,
+            len,
+            job.preferred_sub_cluster.as_deref(),
+            job.protect_source_on_remote_complete,
+        )
+        .await
+}
+
+fn owner_source_eviction_identity(
+    member: &OwnerSourceEvictionMember,
+) -> super::OwnerHotReplicaIdentity {
+    super::OwnerHotReplicaIdentity {
+        key: member.key.clone(),
+        put_time_ms: member.put_id.0,
+        put_version: member.put_id.1,
+    }
+}
+
+fn owner_source_eviction_member(
+    identity: &super::OwnerHotReplicaIdentity,
+    memory_info: &crate::memholder::MemoryInfo,
+) -> Option<OwnerSourceEvictionMember> {
+    let (slot_size, grant_id, slot_index) = memory_info.local_reserve_resident_slot_ref()?;
+    Some(OwnerSourceEvictionMember {
+        key: identity.key.clone(),
+        put_id: (identity.put_time_ms, identity.put_version),
+        backing: OwnerReclaimBacking::CommittedSlot {
+            grant_id,
+            slot_index,
+            slot_size,
+        },
+    })
+}
+
+fn finish_owner_source_selection(
+    inner: &ClientKvApiInner,
+    cohort: &OwnerSourceEvictionCohort,
+    restore_current: bool,
+    reason: &str,
+) {
+    for member in &cohort.members {
+        let identity = owner_source_eviction_identity(member);
+        if let Some((_identity, debt)) = inner.owner_source_eviction_selected.remove(&identity) {
+            debt.release();
+            inner
+                .owner_hot_counters
+                .source_evict_restored_members
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        inner.owner_hot_retry_queue.remove(&identity);
+        if !restore_current {
+            continue;
+        }
+        let group = inner
+            .owner_hot_atomic_groups
+            .get(&identity)
+            .map(|entry| entry.value().clone());
+        if inner.owner_hot_admit_published_committed(&member.key, member.put_id, group.as_deref()) {
+            tracing::warn!(
+                key = member.key,
+                put_time_ms = member.put_id.0,
+                put_version = member.put_id.1,
+                reason,
+                "restored current source to owner-hot after source eviction did not enter reclaim"
+            );
         }
     }
 }
 
-pub fn spawn_owner_hot_replica_dispatcher(
-    view: ClientKvApiView,
-    mut rx: tokio::sync::ampsc::Receiver<OwnerHotEvictionEvent>,
+fn schedule_owner_source_eviction_retry(
+    inner: &ClientKvApiInner,
+    mut event: OwnerHotEvictionEvent,
+    cohort: Arc<OwnerSourceEvictionCohort>,
+    reason: &'static str,
 ) {
+    event.retry = true;
+    event.source_eviction_cohort = Some(cohort);
+    inner.owner_hot_retry_queue.schedule(event, reason);
+}
+
+fn prepare_owner_source_eviction_event(
+    inner: &ClientKvApiInner,
+    mut event: OwnerHotEvictionEvent,
+) -> Option<(OwnerHotEvictionEvent, Arc<OwnerSourceEvictionCohort>)> {
+    let trigger = super::OwnerHotReplicaIdentity {
+        key: event.key.clone(),
+        put_time_ms: event.put_id.0,
+        put_version: event.put_id.1,
+    };
+
+    if event.retry {
+        let _ = inner.owner_hot_retry_queue.take_for_inflight(&trigger);
+    }
+    if let Some(cohort) = event.source_eviction_cohort.clone() {
+        if cohort.members.iter().all(|member| {
+            inner
+                .owner_source_eviction_selected
+                .contains_key(&owner_source_eviction_identity(member))
+        }) {
+            return Some((event, cohort));
+        }
+        // Commit/invalidation may win the race with a due retry. Any remaining
+        // selected members are restored rather than leaving false projected credit.
+        finish_owner_source_selection(inner, &cohort, true, "retry cohort lost selected identity");
+        event.selection_debt.release();
+        return None;
+    }
+
+    if inner.owner_source_eviction_selected.contains_key(&trigger) {
+        event.selection_debt.release();
+        inner
+            .owner_hot_counters
+            .group_trigger_duplicates
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+
+    let (resolved_trigger, sources) = match inner.owner_hot_prepare_eviction(&event) {
+        OwnerHotEvictionPreparation::Ready { trigger, sources } => (trigger, sources),
+        OwnerHotEvictionPreparation::RetryableReclaimFence => {
+            inner.owner_hot_retry_queue.schedule(
+                event,
+                "owner reclaim fence busy before exact source selection",
+            );
+            return None;
+        }
+        OwnerHotEvictionPreparation::RetryableIncompleteCohort => {
+            inner
+                .owner_hot_retry_queue
+                .schedule(event, "owner source cohort is temporarily incomplete");
+            return None;
+        }
+        OwnerHotEvictionPreparation::Obsolete => {
+            event.selection_debt.release();
+            inner
+                .owner_hot_counters
+                .source_evict_obsolete
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    debug_assert_eq!(resolved_trigger, trigger);
+
+    let members = sources
+        .iter()
+        .map(|(identity, memory_info)| owner_source_eviction_member(identity, memory_info.as_ref()))
+        .collect::<Option<Vec<_>>>();
+    let Some(members) = members else {
+        event.selection_debt.release();
+        inner
+            .owner_hot_counters
+            .group_trigger_incomplete
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            key = event.key,
+            put_time_ms = event.put_id.0,
+            put_version = event.put_id.1,
+            "owner-hot selected a source without exact CommittedSlot backing"
+        );
+        return None;
+    };
+    let cohort = Arc::new(OwnerSourceEvictionCohort { members });
+
+    if cohort.members.iter().any(|member| {
+        inner
+            .owner_source_eviction_selected
+            .contains_key(&owner_source_eviction_identity(member))
+    }) {
+        event.selection_debt.release();
+        inner
+            .owner_hot_counters
+            .group_trigger_duplicates
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+
+    let mut installed = Vec::with_capacity(cohort.members.len());
+    for ((identity, memory_info), member) in sources.iter().zip(cohort.members.iter()) {
+        debug_assert_eq!(identity, &owner_source_eviction_identity(member));
+        let debt = if identity == &trigger {
+            event.selection_debt.clone()
+        } else {
+            OwnerHotSelectionDebt::new(
+                u64::from(owner_hot_weight_bytes(memory_info.as_ref())),
+                inner.owner_hot_counters.selection_debt_bytes.clone(),
+            )
+        };
+        if inner
+            .owner_source_eviction_selected
+            .insert(identity.clone(), debt.clone())
+            .is_some()
+        {
+            debt.release();
+            for installed_identity in installed {
+                if let Some((_identity, installed_debt)) = inner
+                    .owner_source_eviction_selected
+                    .remove(&installed_identity)
+                {
+                    installed_debt.release();
+                }
+            }
+            event.selection_debt.release();
+            return None;
+        }
+        installed.push(identity.clone());
+    }
+    event.source_eviction_cohort = Some(cohort.clone());
+    Some((event, cohort))
+}
+
+async fn process_owner_source_eviction_events(
+    view: &ClientKvApiView,
+    events: Vec<OwnerHotEvictionEvent>,
+) {
+    let inner = view.client_kv_api().inner();
+    let prepared = events
+        .into_iter()
+        .filter_map(|event| prepare_owner_source_eviction_event(inner, event))
+        .collect::<Vec<_>>();
+    if prepared.is_empty() {
+        return;
+    }
+    let cohorts = prepared
+        .iter()
+        .map(|(_, cohort)| cohort.as_ref().clone())
+        .collect::<Vec<_>>();
+    let response = inner.batch_evict_owner_source(cohorts).await;
+    let Ok(response) = response else {
+        for (event, cohort) in prepared {
+            schedule_owner_source_eviction_retry(
+                inner,
+                event,
+                cohort,
+                "owner source-eviction RPC failed",
+            );
+        }
+        return;
+    };
+    if response.cohorts.len() != prepared.len() {
+        for (event, cohort) in prepared {
+            schedule_owner_source_eviction_retry(
+                inner,
+                event,
+                cohort,
+                "owner source-eviction response length mismatch",
+            );
+        }
+        return;
+    }
+
+    for (index, ((event, cohort), result)) in prepared
+        .into_iter()
+        .zip(response.cohorts.into_iter())
+        .enumerate()
+    {
+        if result.cohort_index != u32::try_from(index).unwrap_or(u32::MAX) {
+            schedule_owner_source_eviction_retry(
+                inner,
+                event,
+                cohort,
+                "owner source-eviction response identity mismatch",
+            );
+            continue;
+        }
+        match result.outcome {
+            OwnerSourceEvictionOutcome::Accepted
+            | OwnerSourceEvictionOutcome::AlreadyInProgress => {
+                inner
+                    .owner_hot_counters
+                    .source_evict_handoff_members
+                    .fetch_add(cohort.members.len() as u64, Ordering::Relaxed);
+                // Selected debt stays live until owner reclaim Commit calls
+                // owner_hot_invalidate_version for every exact member.
+            }
+            OwnerSourceEvictionOutcome::Completed => {
+                finish_owner_source_selection(
+                    inner,
+                    &cohort,
+                    true,
+                    "master reported source deletion already completed",
+                );
+            }
+            OwnerSourceEvictionOutcome::RetryableBusy | OwnerSourceEvictionOutcome::Unspecified => {
+                schedule_owner_source_eviction_retry(
+                    inner,
+                    event,
+                    cohort,
+                    "master source reclaim is temporarily busy",
+                );
+            }
+            OwnerSourceEvictionOutcome::Stale => {
+                finish_owner_source_selection(
+                    inner,
+                    &cohort,
+                    true,
+                    "master rejected stale source identity",
+                );
+            }
+            OwnerSourceEvictionOutcome::RejectedNotEvictable => {
+                tracing::error!(
+                    cohort_members = cohort.members.len(),
+                    detail = result.detail,
+                    "owner selected a source cohort that master declared non-evictable"
+                );
+                finish_owner_source_selection(
+                    inner,
+                    &cohort,
+                    true,
+                    "master rejected non-evictable source cohort",
+                );
+            }
+        }
+    }
+}
+
+pub fn spawn_owner_source_eviction_dispatcher(
+    view: ClientKvApiView,
+    mut rx: tokio::sync::ampsc::UnboundedReceiver<OwnerHotEvictionEvent>,
+) {
+    const MAX_COHORTS_PER_RPC: usize = 128;
+    const MERGE_WINDOW: Duration = Duration::from_millis(2);
+
     let view_task = view.clone();
-    let _ = view.spawn("owner_hot_replica_dispatcher", async move {
+    let _ = view.spawn("owner_source_eviction_dispatcher", async move {
         let mut shutdown_waiter = view_task.register_shutdown_waiter();
         loop {
-            let event = tokio::select! {
+            let first = tokio::select! {
                 _ = shutdown_waiter.wait() => {
-                    tracing::info!("owner_hot_replica_dispatcher stopping due to shutdown signal");
+                    tracing::info!("owner source-eviction dispatcher stopping due to shutdown");
                     break;
                 }
                 event = rx.recv() => {
-                    match event {
-                        Some(event) => event,
-                        None => break,
-                    }
+                    let Some(event) = event else { break; };
+                    event
                 }
             };
-            let inner = view_task.client_kv_api().inner();
-            let Some(memory_info) = event.memory_info.upgrade() else {
-                event.guard.mark_obsolete();
-                continue;
-            };
-            if !inner.owner_hot_source_is_current(
-                &event.key,
-                event.put_id,
-                &memory_info,
-            ) {
-                event.guard.mark_obsolete();
+            let mut events = Vec::with_capacity(MAX_COHORTS_PER_RPC);
+            events.push(first);
+            let merge_window = tokio::time::sleep(MERGE_WINDOW);
+            tokio::pin!(merge_window);
+            while events.len() < MAX_COHORTS_PER_RPC {
+                tokio::select! {
+                    _ = &mut merge_window => break,
+                    event = rx.recv() => {
+                        let Some(event) = event else { break; };
+                        events.push(event);
+                    }
+                }
+            }
+            process_owner_source_eviction_events(&view_task, events).await;
+        }
+    });
+}
+
+pub fn spawn_owner_hot_retry_actor(view: ClientKvApiView) {
+    const RETRY_EMIT_BATCH: usize = 128;
+    const RETRY_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+    let view_task = view.clone();
+    let _ = view.spawn("owner_hot_retry_actor", async move {
+        let mut shutdown_waiter = view_task.register_shutdown_waiter();
+        let retry_queue = view_task
+            .client_kv_api()
+            .inner()
+            .owner_hot_retry_queue
+            .clone();
+        let notify = retry_queue.notify.clone();
+        let mut tick = tokio::time::interval(RETRY_POLL_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = shutdown_waiter.wait() => return,
+                _ = tick.tick() => {},
+                _ = notify.notified() => {},
+            }
+            let events = retry_queue.take_due_batch(Instant::now(), RETRY_EMIT_BATCH);
+            if events.is_empty() {
                 continue;
             }
-            let holder = Arc::new(UserMemHolder::new(
-                memory_info,
-                inner.get_or_init_all_memholder_refcount(),
-                UserMemHolderExposeKind::SegPtr,
-            ));
-            let key = event.key.clone();
-            let put_id = event.put_id;
-            if let Err(err) = inner
-                .replica_task_tx
-                .send(ReplicaTaskJob {
-                    key: event.key,
-                    put_id: event.put_id,
-                    holder,
-                    target: None,
-                    preferred_sub_cluster: None,
-                    hot_replica_guard: Some(event.guard),
-                    protect_source_on_remote_complete: false,
-                })
-                .await
-            {
-                tracing::warn!(
-                    "replica task actor queue closed for owner hot eviction: key={} put_id=({},{}) err={}",
-                    key,
-                    put_id.0,
-                    put_id.1,
-                    err
-                );
+            let inner = view_task.client_kv_api().inner();
+            for event in events {
+                if let Err(err) = inner.owner_hot_eviction_tx.send(event) {
+                    let event = err.0;
+                    retry_queue.schedule(event, "retry dispatcher closed");
+                    return;
+                }
+                inner
+                    .owner_hot_counters
+                    .source_evict_retry_emitted
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     });
 }
 
-async fn process_replica_task(view_task: ClientKvApiView, job: ReplicaTaskJob) {
+async fn process_replica_task(view_task: ClientKvApiView, mut job: ReplicaTaskJob) {
     let inner = view_task.client_kv_api().inner();
-    let src_offset = job.holder.memory_info().offset;
-    let len = job.holder.get_length() as u64;
+    let holder = job
+        .holder
+        .as_ref()
+        .expect("replica task source must be pinned before transfer");
+    let src_offset = holder.memory_info().offset;
+    let len = holder.get_length() as u64;
     let target = if let Some(target) = job.target.clone() {
         target
     } else {
@@ -2708,17 +3373,19 @@ async fn process_replica_task(view_task: ClientKvApiView, job: ReplicaTaskJob) {
                 return;
             }
         };
-        if !append_start.scheduled {
-            tracing::debug!(
-                "replica append task not scheduled: key={} put_id=({},{})",
-                job.key,
-                job.put_id.0,
-                job.put_id.1
-            );
-            if let Some(guard) = job.hot_replica_guard.as_ref() {
-                guard.mark_already_satisfied();
+        match append_start.outcome {
+            PutAppendStartOutcome::Scheduled => {}
+            PutAppendStartOutcome::AlreadySatisfied | PutAppendStartOutcome::Obsolete => return,
+            PutAppendStartOutcome::RetryableNoSpace | PutAppendStartOutcome::Unspecified => {
+                tracing::debug!(
+                    outcome = ?append_start.outcome,
+                    "replica append task deferred: key={} put_id=({},{})",
+                    job.key,
+                    job.put_id.0,
+                    job.put_id.1
+                );
+                return;
             }
-            return;
         }
         ReplicaTaskTarget {
             node_id: append_start.node_id,
@@ -2763,7 +3430,7 @@ async fn process_replica_task(view_task: ClientKvApiView, job: ReplicaTaskJob) {
     }
     // Append-done may reclaim the source synchronously. Release the transfer-only holder first so
     // this task does not make its own reclaim look busy.
-    drop(job.holder);
+    drop(job.holder.take());
     match inner.put_append_done(&job.key, job.put_id).await {
         Ok(resp) => {
             tracing::debug!(
@@ -2773,13 +3440,6 @@ async fn process_replica_task(view_task: ClientKvApiView, job: ReplicaTaskJob) {
                 job.put_id.1,
                 resp.appended
             );
-            if let Some(guard) = job.hot_replica_guard.as_ref() {
-                if resp.appended {
-                    guard.mark_completed();
-                } else {
-                    guard.mark_already_satisfied();
-                }
-            }
         }
         Err(err) => {
             tracing::warn!(
@@ -2793,6 +3453,349 @@ async fn process_replica_task(view_task: ClientKvApiView, job: ReplicaTaskJob) {
     }
 }
 
+struct ReplicaAppendDoneJob {
+    key: String,
+    put_id: PutIDForAKey,
+}
+
+async fn finish_replica_append_jobs_individually(
+    inner: &ClientKvApiInner,
+    jobs: Vec<ReplicaAppendDoneJob>,
+) {
+    let results = join_all(jobs.into_iter().map(|job| async move {
+        let result = inner.put_append_done(&job.key, job.put_id).await;
+        (job, result)
+    }))
+    .await;
+    for (job, result) in results {
+        match result {
+            Ok(_resp) => {}
+            Err(err) => {
+                tracing::warn!(
+                    "replica task append done fallback failed: key={} put_id=({},{}) err={}",
+                    job.key,
+                    job.put_id.0,
+                    job.put_id.1,
+                    err
+                );
+            }
+        }
+    }
+}
+
+async fn process_replica_append_batch(view_task: ClientKvApiView, jobs: Vec<ReplicaTaskJob>) {
+    if jobs.is_empty() {
+        return;
+    }
+    let inner = view_task.client_kv_api().inner();
+    let mut valid_jobs = Vec::with_capacity(jobs.len());
+    let mut start_items = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let len = job
+            .holder
+            .as_ref()
+            .expect("batch replica source must be pinned")
+            .get_length() as u64;
+        if u32::try_from(len).is_err() {
+            tracing::warn!(
+                "replica append task length does not fit u32: key={} put_id=({},{}) len={}",
+                job.key,
+                job.put_id.0,
+                job.put_id.1,
+                len
+            );
+            continue;
+        }
+        start_items.push(BatchPutAppendStartItemReq {
+            key: job.key.clone(),
+            put_id: job.put_id,
+            len,
+            preferred_sub_cluster: job.preferred_sub_cluster.clone(),
+            protect_source_on_remote_complete: job.protect_source_on_remote_complete,
+        });
+        valid_jobs.push(job);
+    }
+    if valid_jobs.is_empty() {
+        return;
+    }
+
+    let requested = valid_jobs.len();
+    let start_time = Instant::now();
+    let start_resp = match inner.batch_put_append_start(start_items).await {
+        Ok(resp) if resp.items.len() == requested => resp,
+        Ok(resp) => {
+            tracing::warn!(
+                "batch replica append start response length mismatch: expected={} got={}",
+                requested,
+                resp.items.len()
+            );
+            for job in valid_jobs {
+                spawn_replica_task_revoke(
+                    view_task.clone(),
+                    job.key,
+                    job.put_id,
+                    "batch start response mismatch",
+                );
+            }
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(
+                "batch replica append start RPC failed; falling back per item: items={} err={}",
+                requested,
+                err
+            );
+            join_all(
+                valid_jobs
+                    .into_iter()
+                    .map(|job| process_replica_task(view_task.clone(), job)),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let mut scheduled = Vec::new();
+    let mut already_satisfied = 0usize;
+    let mut start_failed = 0usize;
+    for (job, item) in valid_jobs.into_iter().zip(start_resp.items.into_iter()) {
+        if item.key != job.key || item.put_id != job.put_id {
+            tracing::warn!(
+                "batch replica append start identity mismatch: request_key={} request_put_id=({},{}) response_key={} response_put_id=({},{})",
+                job.key,
+                job.put_id.0,
+                job.put_id.1,
+                item.key,
+                item.put_id.0,
+                item.put_id.1
+            );
+            spawn_replica_task_revoke(
+                view_task.clone(),
+                job.key,
+                job.put_id,
+                "batch start identity mismatch",
+            );
+            start_failed += 1;
+            continue;
+        }
+        if let Err(err) =
+            crate::rpcresp_kvresult_convert::try_from_code(item.error_code, item.error_json.clone())
+        {
+            tracing::warn!(
+                "batch replica append start item failed: key={} put_id=({},{}) err={}",
+                job.key,
+                job.put_id.0,
+                job.put_id.1,
+                err
+            );
+            start_failed += 1;
+            continue;
+        }
+        match item.outcome {
+            PutAppendStartOutcome::Scheduled => {}
+            PutAppendStartOutcome::AlreadySatisfied => {
+                already_satisfied += 1;
+                continue;
+            }
+            PutAppendStartOutcome::Obsolete => continue,
+            PutAppendStartOutcome::RetryableNoSpace | PutAppendStartOutcome::Unspecified => {
+                start_failed += 1;
+                continue;
+            }
+        }
+        let target = ReplicaTaskTarget {
+            node_id: item.node_id,
+            target_offset: item.target_addr - item.target_base_addr,
+            target_base_addr: item.target_base_addr,
+            len: item.len,
+        };
+        let source_len = job
+            .holder
+            .as_ref()
+            .expect("scheduled batch replica source must remain pinned")
+            .get_length() as u64;
+        if source_len != target.len {
+            tracing::warn!(
+                "batch replica task length mismatch: key={} put_id=({},{}) src_len={} target_len={}",
+                job.key,
+                job.put_id.0,
+                job.put_id.1,
+                source_len,
+                target.len
+            );
+            spawn_replica_task_revoke(
+                view_task.clone(),
+                job.key,
+                job.put_id,
+                "batch length mismatch",
+            );
+            start_failed += 1;
+            continue;
+        }
+        scheduled.push((job, target));
+    }
+    tracing::info!(
+        requested,
+        scheduled = scheduled.len(),
+        already_satisfied,
+        failed = start_failed,
+        rpc_us = duration_to_i64_us(start_time.elapsed()),
+        "replica writeback batch start complete"
+    );
+
+    let transfer_results = join_all(scheduled.into_iter().map(|(job, target)| {
+        let transfer_view = view_task.clone();
+        async move {
+            let inner = transfer_view.client_kv_api().inner();
+            let src_offset = job
+                .holder
+                .as_ref()
+                .expect("scheduled batch replica source must remain pinned")
+                .memory_info()
+                .offset;
+            let result = inner
+                .put_transfer(
+                    &job.key,
+                    job.put_id,
+                    src_offset,
+                    target.target_offset,
+                    target.len,
+                    Some(target.node_id),
+                    Some(target.target_base_addr),
+                )
+                .await;
+            (job, result)
+        }
+    }))
+    .await;
+
+    let mut done_jobs = Vec::new();
+    for (job, result) in transfer_results {
+        match result {
+            Ok(_) => {
+                let ReplicaTaskJob {
+                    key,
+                    put_id,
+                    holder,
+                    ..
+                } = job;
+                drop(holder);
+                done_jobs.push(ReplicaAppendDoneJob { key, put_id });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "batch replica task transfer failed: key={} put_id=({},{}) err={}",
+                    job.key,
+                    job.put_id.0,
+                    job.put_id.1,
+                    err
+                );
+                spawn_replica_task_revoke(
+                    view_task.clone(),
+                    job.key,
+                    job.put_id,
+                    "batch transfer error",
+                );
+            }
+        }
+    }
+    if done_jobs.is_empty() {
+        return;
+    }
+
+    let done_requested = done_jobs.len();
+    let done_items = done_jobs
+        .iter()
+        .map(|job| BatchPutAppendDoneItemReq {
+            key: job.key.clone(),
+            put_id: job.put_id,
+        })
+        .collect();
+    let done_time = Instant::now();
+    let done_resp = match inner.batch_put_append_done(done_items).await {
+        Ok(resp) if resp.items.len() == done_requested => resp,
+        Ok(resp) => {
+            tracing::warn!(
+                "batch replica append done response length mismatch: expected={} got={}; falling back per item",
+                done_requested,
+                resp.items.len()
+            );
+            finish_replica_append_jobs_individually(inner, done_jobs).await;
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(
+                "batch replica append done RPC failed; falling back per item: items={} err={}",
+                done_requested,
+                err
+            );
+            finish_replica_append_jobs_individually(inner, done_jobs).await;
+            return;
+        }
+    };
+
+    let mut appended = 0usize;
+    let mut already_done = 0usize;
+    let mut done_failed = 0usize;
+    for (job, item) in done_jobs.into_iter().zip(done_resp.items.into_iter()) {
+        let identity_matches = item.key == job.key && item.put_id == job.put_id;
+        let item_result = crate::rpcresp_kvresult_convert::try_from_code(
+            item.error_code,
+            item.error_json.clone(),
+        );
+        if !identity_matches || item_result.is_err() {
+            tracing::warn!(
+                "batch replica append done item failed: key={} put_id=({},{}) identity_matches={} err={:?}",
+                job.key,
+                job.put_id.0,
+                job.put_id.1,
+                identity_matches,
+                item_result.err()
+            );
+            spawn_replica_task_revoke(
+                view_task.clone(),
+                job.key,
+                job.put_id,
+                "batch done item error",
+            );
+            done_failed += 1;
+            continue;
+        }
+        if item.appended {
+            appended += 1;
+        } else {
+            already_done += 1;
+        }
+    }
+    tracing::info!(
+        requested = done_requested,
+        appended,
+        already_satisfied = already_done,
+        failed = done_failed,
+        rpc_us = duration_to_i64_us(done_time.elapsed()),
+        "replica writeback batch done complete"
+    );
+}
+
+async fn process_replica_task_batch(view_task: ClientKvApiView, jobs: Vec<ReplicaTaskJob>) {
+    let mut append_jobs = Vec::new();
+    let mut reserved_target_jobs = Vec::new();
+    for job in jobs {
+        if job.target.is_some() {
+            reserved_target_jobs.push(job);
+        } else {
+            append_jobs.push(job);
+        }
+    }
+    let append = process_replica_append_batch(view_task.clone(), append_jobs);
+    let reserved = join_all(
+        reserved_target_jobs
+            .into_iter()
+            .map(|job| process_replica_task(view_task.clone(), job)),
+    );
+    let (_, _) = futures::join!(append, reserved);
+}
+
 pub fn spawn_replica_task_actor(
     view: ClientKvApiView,
     mut rx: tokio::sync::ampsc::Receiver<ReplicaTaskJob>,
@@ -2801,15 +3804,14 @@ pub fn spawn_replica_task_actor(
     let view_task = view.clone();
     let _ = view.spawn("replica_task_actor", async move {
         let max_inflight = max_inflight.max(1);
-        let semaphore = Arc::new(::tokio::sync::Semaphore::new(max_inflight));
-        let per_key = Arc::new(SemaphoreMap::new(1, Duration::from_secs(10 * 60)));
         tracing::info!(
             max_inflight,
-            "replica task actor started with bounded cross-key concurrency"
+            merge_window_ms = REPLICA_TASK_BATCH_MERGE_WINDOW.as_millis(),
+            "replica task actor started with time-window batching"
         );
         let mut shutdown_waiter = view_task.register_shutdown_waiter();
         loop {
-            let job = tokio::select! {
+            let first = tokio::select! {
                 _ = shutdown_waiter.wait() => {
                     tracing::info!("replica_task_actor stopping due to shutdown signal");
                     break;
@@ -2821,24 +3823,23 @@ pub fn spawn_replica_task_actor(
                     }
                 }
             };
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(permit) => permit,
-                Err(err) => {
-                    tracing::warn!(
-                        "replica task actor semaphore closed; dropping queued work: err={}",
-                        err
-                    );
-                    break;
+            let mut batch = Vec::with_capacity(max_inflight);
+            batch.push(first);
+            let merge_window = tokio::time::sleep(REPLICA_TASK_BATCH_MERGE_WINDOW);
+            tokio::pin!(merge_window);
+            while batch.len() < max_inflight {
+                tokio::select! {
+                    _ = &mut merge_window => break,
+                    job = rx.recv() => {
+                        match job {
+                            Some(job) => batch.push(job),
+                            None => break,
+                        }
+                    }
                 }
-            };
-            let spawn_view = view_task.clone();
-            let worker_view = view_task.clone();
-            let worker_per_key = per_key.clone();
-            spawn_view.spawn("replica_task_worker", async move {
-                let _permit = permit;
-                let _key_permit = worker_per_key.acquire(job.key.clone()).await;
-                process_replica_task(worker_view, job).await;
-            });
+            }
+            tracing::info!(items = batch.len(), "replica writeback batch flushed");
+            process_replica_task_batch(view_task.clone(), batch).await;
         }
     });
 }
@@ -2962,7 +3963,20 @@ fn complete_owner_local_publish_group_lens(items: &[OwnerLocalPublishItem]) -> O
     Some(group_lens)
 }
 
-async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLocalPublishJob) {
+fn owner_local_publish_cohort_complete(
+    item: &OwnerLocalPublishItem,
+    promoted_items: &[&OwnerLocalPublishItem],
+) -> bool {
+    item.atomic_group.as_ref().map_or(true, |group| {
+        group.members.iter().all(|member| {
+            promoted_items
+                .iter()
+                .any(|published| published.key == member.key && published.put_id == member.put_id)
+        })
+    })
+}
+
+pub(crate) async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLocalPublishJob) {
     let inner = view.client_kv_api().inner();
     if job.items.is_empty() {
         release_owner_local_publish_reservations(inner, job.key_reservation_ids).await;
@@ -2970,104 +3984,208 @@ async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLocalPublishJo
     }
 
     let group_lens = complete_owner_local_publish_group_lens(&job.items);
-    let done_items = if let Some(atomic_group_lens) = group_lens {
-        inner
-            .owner_hot_counters
-            .grouped_put_done_batches
-            .fetch_add(1, Ordering::Relaxed);
-        inner
-            .owner_hot_counters
-            .grouped_put_done_items
-            .fetch_add(job.items.len() as u64, Ordering::Relaxed);
-        let items = job
-            .items
-            .iter()
-            .map(|item| GroupedBatchPutDoneItemReq {
-                key: item.key.clone(),
-                put_id: item.put_id,
-                lease_id: item.lease_id,
-                committed_slot: Some(item.committed_slot.clone()),
-                publish_local_cache: false,
-            })
-            .collect::<Vec<_>>();
-        inner
-            .grouped_batch_put_done(items, atomic_group_lens)
-            .await
-            .map(|resp| resp.items)
-    } else {
-        inner
-            .owner_hot_counters
-            .legacy_put_done_batches
-            .fetch_add(1, Ordering::Relaxed);
-        inner
-            .owner_hot_counters
-            .legacy_put_done_items
-            .fetch_add(job.items.len() as u64, Ordering::Relaxed);
-        let items = job
-            .items
-            .iter()
-            .map(|item| BatchPutDoneItemReq {
-                key: item.key.clone(),
-                put_id: item.put_id,
-                lease_id: item.lease_id,
-                committed_slot: Some(item.committed_slot.clone()),
-                publish_local_cache: false,
-                atomic_group: item.atomic_group.clone(),
-            })
-            .collect::<Vec<_>>();
-        inner.batch_put_done(items).await.map(|resp| resp.items)
-    };
+    let incomplete_declared_group =
+        group_lens.is_none() && job.items.iter().any(|item| item.atomic_group.is_some());
+    let mut shutdown_waiter = view.register_shutdown_waiter();
+    let mut retry_delay = OWNER_LOCAL_PUBLISH_RETRY_INITIAL;
+    let mut published = false;
 
-    match done_items {
-        Ok(done_items) if done_items.len() == job.items.len() => {
-            for (item, done_item) in job.items.iter().zip(done_items.into_iter()) {
-                if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
+    loop {
+        let attempt: Result<(), String> = async {
+            if incomplete_declared_group {
+                return Err(
+                    "declared atomic group is incomplete or non-contiguous in publish job"
+                        .to_string(),
+                );
+            }
+            let done_items: Vec<BatchPutDoneItemResp> =
+                if let Some(atomic_group_lens) = group_lens.clone() {
+                    inner
+                        .owner_hot_counters
+                        .grouped_put_done_batches
+                        .fetch_add(1, Ordering::Relaxed);
+                    inner
+                        .owner_hot_counters
+                        .grouped_put_done_items
+                        .fetch_add(job.items.len() as u64, Ordering::Relaxed);
+                    let items = job
+                        .items
+                        .iter()
+                        .map(|item| GroupedBatchPutDoneItemReq {
+                            key: item.key.clone(),
+                            put_id: item.put_id,
+                            lease_id: item.lease_id,
+                            committed_slot: Some(item.committed_slot.clone()),
+                            publish_local_cache: false,
+                        })
+                        .collect::<Vec<_>>();
+                    inner
+                        .grouped_batch_put_done(items, atomic_group_lens)
+                        .await
+                        .map(|resp| resp.items)
+                        .map_err(|err| format!("PutDone RPC uncertain: {err}"))?
+                } else {
+                    inner
+                        .owner_hot_counters
+                        .legacy_put_done_batches
+                        .fetch_add(1, Ordering::Relaxed);
+                    inner
+                        .owner_hot_counters
+                        .legacy_put_done_items
+                        .fetch_add(job.items.len() as u64, Ordering::Relaxed);
+                    let items = job
+                        .items
+                        .iter()
+                        .map(|item| BatchPutDoneItemReq {
+                            key: item.key.clone(),
+                            put_id: item.put_id,
+                            lease_id: item.lease_id,
+                            committed_slot: Some(item.committed_slot.clone()),
+                            publish_local_cache: false,
+                            atomic_group: item.atomic_group.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    inner
+                        .batch_put_done(items)
+                        .await
+                        .map(|resp| resp.items)
+                        .map_err(|err| format!("PutDone RPC uncertain: {err}"))?
+                };
+
+            if done_items.len() != job.items.len() {
+                return Err(format!(
+                    "PutDone response length mismatch: expected={} got={}",
+                    job.items.len(),
+                    done_items.len()
+                ));
+            }
+            for (item, done_item) in job.items.iter().zip(done_items.iter()) {
+                if done_item.key != item.key || done_item.put_id != item.put_id {
+                    return Err(format!(
+                        "PutDone identity mismatch: request=({},({},{}) response=({},({},{}))",
+                        item.key,
+                        item.put_id.0,
+                        item.put_id.1,
+                        done_item.key,
+                        done_item.put_id.0,
+                        done_item.put_id.1,
+                    ));
+                }
+                crate::rpcresp_kvresult_convert::try_from_code(
                     done_item.error_code,
                     done_item.error_json.clone(),
+                )
+                .map_err(|err| {
+                    format!(
+                        "PutDone item unresolved: key={} put_id=({},{}) err={}",
+                        item.key, item.put_id.0, item.put_id.1, err
+                    )
+                })?;
+            }
+
+            // Do not expose only part of an atomic/TP cohort to owner-hot.
+            // First prove every master route terminal, then roll all local
+            // precommit slots forward. Replayed attempts accept members that
+            // were already promoted before a cancellation or partial local
+            // failure.
+            for item in &job.items {
+                if inner.committed_local_reserve_slot_is_current(
+                    &item.key,
+                    item.put_id,
+                    &item.committed_slot,
                 ) {
+                    continue;
+                }
+                let memory_info = inner
+                    .precommit_local_visible_memory_info(&item.key)
+                    .ok_or_else(|| {
+                        format!(
+                            "precommit slot missing before promotion: key={} put_id=({},{})",
+                            item.key, item.put_id.0, item.put_id.1
+                        )
+                    })?;
+                inner
+                    .promote_precommit_local_reserve_resident_slot_if_same(
+                        &item.key,
+                        item.put_id,
+                        memory_info,
+                        item.atomic_group.as_ref(),
+                    )
+                    .map_err(|err| {
+                        format!(
+                            "local promotion unresolved: key={} put_id=({},{}) err={}",
+                            item.key, item.put_id.0, item.put_id.1, err
+                        )
+                    })?;
+            }
+            Ok(())
+        }
+        .await;
+
+        match attempt {
+            Ok(()) => {
+                published = true;
+                break;
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    "owner local publish retained full cohort for retry: key_count={} external_fences={} retry_ms={} reason={}",
+                    job.items.len(),
+                    job.external_pending_contexts.len(),
+                    retry_delay.as_millis(),
+                    reason,
+                );
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(retry_delay) => {}
+            _ = shutdown_waiter.wait() => break,
+        }
+        retry_delay = retry_delay
+            .saturating_mul(2)
+            .min(OWNER_LOCAL_PUBLISH_RETRY_MAX);
+    }
+
+    if published {
+        let promoted_items = job.items.iter().collect::<Vec<_>>();
+        for item in &promoted_items {
+            if !owner_local_publish_cohort_complete(item, &promoted_items) {
+                tracing::warn!(
+                    "owner local publish skipped hot admission for incomplete atomic group: key={} put_id=({},{})",
+                    item.key,
+                    item.put_id.0,
+                    item.put_id.1
+                );
+                continue;
+            }
+            let _ = inner.owner_hot_admit_published_committed(
+                &item.key,
+                item.put_id,
+                item.atomic_group.as_ref(),
+            );
+        }
+
+        for item in promoted_items {
+            if item.make_replica_task {
+                if let Err(err) = inner
+                    .make_replica_append_task(
+                        &item.key,
+                        item.put_id,
+                        item.preferred_sub_cluster.clone(),
+                        true,
+                    )
+                    .await
+                {
                     tracing::warn!(
-                        "owner local publish failed: key={} put_id=({},{}) err={}",
+                        "owner local publish enqueue replica append failed: key={} put_id=({},{}) err={}",
                         item.key,
                         item.put_id.0,
                         item.put_id.1,
                         err
                     );
-                    continue;
-                }
-                if item.make_replica_task {
-                    if let Err(err) = inner
-                        .make_replica_append_task(
-                            &item.key,
-                            item.put_id,
-                            item.preferred_sub_cluster.clone(),
-                            true,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            "owner local publish enqueue replica append failed: key={} put_id=({},{}) err={}",
-                            item.key,
-                            item.put_id.0,
-                            item.put_id.1,
-                            err
-                        );
-                    }
                 }
             }
-        }
-        Ok(done_items) => {
-            tracing::warn!(
-                "owner local publish response length mismatch: expected={} got={}",
-                job.items.len(),
-                done_items.len()
-            );
-        }
-        Err(err) => {
-            tracing::warn!(
-                "owner local publish batch_put_done rpc failed: key_count={} err={}",
-                job.items.len(),
-                err
-            );
         }
     }
 

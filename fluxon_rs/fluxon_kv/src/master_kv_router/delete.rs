@@ -31,7 +31,7 @@ use std::time::Duration;
 ///
 /// It removes the key from `kv_routes`, then asynchronously:
 /// - emits a `DeleteKeyInfo` to the shared delete broadcast actor for clients
-/// - removes the key from every node's local `node_kv_cache_controller`
+/// - point-removes the exact version from ring-B and tier1 metadata caches
 pub fn do_delete_one_kv_all_replicas(
     view: &MasterKvRouterView,
     key: String,
@@ -67,21 +67,9 @@ pub fn do_delete_one_kv_all_replicas(
                     tracing::warn!("Failed to send delete broadcast: {}", err);
                 }
 
-                // Remove from all node caches that hold replicas of this key
-                let nodes_replicas = kv_route_info.nodes_replicas.read();
-                for (node_id, _kv_info) in nodes_replicas.iter() {
-                    if let Some(cache) = view.master_kv_router().get_node_cache_controller(node_id)
-                    {
-                        let _ = cache.remove(&key_clone);
-                        view.master_kv_router()
-                            .remove_node_writeback_tier1_entry(node_id, &key_clone);
-                        tracing::debug!(
-                            "Removed key {} from node cache controller: {}",
-                            key_clone,
-                            node_id
-                        );
-                    }
-                }
+                view.master_kv_router()
+                    .remove_route_cache_entries_exact(&key_clone, &kv_route_info)
+                    .await;
             }
         });
 
@@ -99,7 +87,6 @@ pub fn evict_one_kv_replica_for_node(
     node_id: NodeID,
     put_id: PutIDForAKey,
 ) -> Result<(), msg_and_error::ErrorCode> {
-    let _guard = view.master_kv_router().inner().route_lifetime_lock.lock();
     let route = if let Some(route) = view.master_kv_router().inner().kv_routes.get(&key) {
         route.clone()
     } else {
@@ -146,7 +133,11 @@ pub fn evict_one_kv_replica_for_node(
             .master_kv_router()
             .inner()
             .kv_routes
-            .remove_if(&key, |_, current| current.put_id == put_id)
+            .remove_if(&key, |_, current| {
+                Arc::ptr_eq(current, &route)
+                    && current.put_id == put_id
+                    && current.nodes_replicas.read().is_empty()
+            })
             .is_some();
         if removed && view.master_kv_router().prefix_index_enabled() {
             let view_task = view.clone();

@@ -1,7 +1,7 @@
 use super::{MasterKvRouterView, NodeValueReplicaDesc, put::PutIDForAKey};
 use crate::cluster_manager::NodeID;
 use limit_thirdparty::tokio;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 const POST_ROUTE_MAINTENANCE_MAX_BATCH: usize = 512;
@@ -73,12 +73,6 @@ fn saturating_moka_weight_bytes(key: &str, put_id: PutIDForAKey, capacity_bytes:
     }
 }
 
-fn projected_batch_weight(current_weight: u64, replaced_weight: u64, incoming_weight: u64) -> u64 {
-    current_weight
-        .saturating_sub(replaced_weight)
-        .saturating_add(incoming_weight)
-}
-
 fn deduplicate_owner_events(
     events: Vec<(usize, String, NodeValueReplicaDesc)>,
 ) -> Vec<(String, NodeValueReplicaDesc)> {
@@ -95,7 +89,7 @@ fn deduplicate_owner_events(
 }
 
 /// Applies index and cache work after route guards have been released.
-async fn apply_post_route_maintenance_batch(
+pub(super) async fn apply_post_route_maintenance_batch(
     view: &MasterKvRouterView,
     events: Vec<RoutePublishEvent>,
 ) {
@@ -126,7 +120,10 @@ async fn apply_post_route_maintenance_batch(
     if !view.master_kv_router().replica_cache_enabled() {
         return;
     }
-    let mut events_by_owner = HashMap::<String, Vec<(usize, String, NodeValueReplicaDesc)>>::new();
+    let mut ring_b_events_by_owner =
+        HashMap::<String, Vec<(usize, String, NodeValueReplicaDesc)>>::new();
+    let mut tier1_events_by_owner =
+        HashMap::<String, Vec<(usize, String, NodeValueReplicaDesc)>>::new();
     for (sequence, event) in events.into_iter().enumerate() {
         if event.lease_id.is_some() {
             continue;
@@ -137,21 +134,39 @@ async fn apply_post_route_maintenance_batch(
             weight_bytes,
             put_id: event.put_id,
         };
-        if !view.master_kv_router().eviction_cache_entry_is_current(
+        if view.master_kv_router().eviction_cache_entry_is_current(
             event.node_id.as_ref(),
             &event.key,
             &desc,
         ) {
-            continue;
+            ring_b_events_by_owner
+                .entry(event.node_id.as_ref().to_string())
+                .or_default()
+                .push((sequence, event.key.clone(), desc.clone()));
         }
-        events_by_owner
-            .entry(event.node_id.as_ref().to_string())
-            .or_default()
-            .push((sequence, event.key, desc));
+        if view.master_kv_router().tier1_writeback_entry_is_current(
+            event.node_id.as_ref(),
+            &event.key,
+            &desc,
+        ) {
+            tier1_events_by_owner
+                .entry(event.node_id.as_ref().to_string())
+                .or_default()
+                .push((sequence, event.key, desc));
+        }
     }
 
-    for (owner_node_id, owner_events) in events_by_owner {
+    for (owner_node_id, owner_events) in ring_b_events_by_owner {
         let entries = deduplicate_owner_events(owner_events);
+        // Moka's sync housekeeper uses a blocking mutex. Serialize before
+        // entering it with an async owner-level gate so waiting route-publish
+        // tasks yield instead of occupying every Tokio worker thread.
+        let owner_cache_lock = view
+            .master_kv_router()
+            .inner()
+            .owner_cache_operation_locks
+            .get_lock(owner_node_id.clone());
+        let _owner_cache_guard = owner_cache_lock.lock().await;
         let Some(cache) = view
             .master_kv_router()
             .get_node_cache_controller(&owner_node_id)
@@ -163,84 +178,57 @@ async fn apply_post_route_maintenance_batch(
             continue;
         };
 
-        // Drain prior writes once, then admit this owner batch as one unit. This exposes the
-        // aggregate incoming weight to the explicit resident-capacity policy.
+        // Drain prior writes once, then admit this owner batch as one unit.
+        // Every node's controller is the bounded authority for that node's
+        // unindexed Allocation domain; placement role is irrelevant.
         cache.run_pending_tasks();
-        let weighted_size_before = cache.weighted_size();
-        let replaced_weight = entries
-            .iter()
-            .filter_map(|(key, _)| cache.get(key))
-            .map(|existing| u64::from(existing.weight_bytes))
-            .fold(0u64, u64::saturating_add);
-        let incoming_weight = entries
-            .iter()
-            .map(|(_, desc)| u64::from(desc.weight_bytes))
-            .fold(0u64, u64::saturating_add);
-        let projected_weight =
-            projected_batch_weight(weighted_size_before, replaced_weight, incoming_weight);
-        let node_space_size = view
-            .master_seg_manager()
-            .get_node_space_size(&owner_node_id);
-        let capacity = view
-            .master_kv_router()
-            .replica_cache_effective_capacity(&owner_node_id, node_space_size);
-        let requested_weight = projected_weight.saturating_sub(capacity);
-        let incoming_keys = entries
-            .iter()
-            .map(|(key, _)| key.clone())
-            .collect::<HashSet<_>>();
-
-        let recoverable_selected_weight = view
-            .master_kv_router()
-            .evict_recoverable_cache_weight_excluding(
-                &owner_node_id,
-                requested_weight,
-                &incoming_keys,
-            );
-        let fallback_requested_weight =
-            requested_weight.saturating_sub(recoverable_selected_weight);
-        let fallback_selected_weight = if view
-            .master_kv_router()
-            .owner_cache_allows_unrecoverable_eviction(&owner_node_id)
-        {
-            cache.evict_some_if(fallback_requested_weight, |key, _desc| {
-                !incoming_keys.contains(key)
-            })
-        } else {
-            0
-        };
-        if requested_weight != 0 {
-            tracing::debug!(
-                "recoverable-first batch admission: owner={} entries={} weighted_size_before={} replaced_weight={} incoming_weight={} projected_weight={} capacity={} requested_weight={} recoverable_selected_weight={} fallback_requested_weight={} fallback_selected_weight={} shortfall_weight={}",
-                owner_node_id,
-                entries.len(),
-                weighted_size_before,
-                replaced_weight,
-                incoming_weight,
-                projected_weight,
-                capacity,
-                requested_weight,
-                recoverable_selected_weight,
-                fallback_requested_weight,
-                fallback_selected_weight,
-                fallback_requested_weight.saturating_sub(fallback_selected_weight),
-            );
-        }
-
-        let tier1_cache = view
-            .master_kv_router()
-            .get_node_writeback_tier1_controller(&owner_node_id);
         for (key, desc) in entries {
+            if !view
+                .master_kv_router()
+                .eviction_cache_entry_is_current(&owner_node_id, &key, &desc)
+            {
+                continue;
+            }
             tracing::debug!("Inserting key: {:?} into cache", key);
             cache.insert(key.clone(), desc.clone());
-            if let Some(tier1_cache) = tier1_cache.as_ref() {
-                tier1_cache.insert(key.clone(), desc);
-            }
             tracing::debug!(
                 "Inserted key: {:?} into cache, current cache size: {}",
                 key,
                 cache.weighted_size()
             );
+        }
+        // Do not search Moka for a recoverable victim here. CPU append Done
+        // already carries the exact source key/cohort and performs a validated
+        // point demotion. Local-reserve Free/Prepared/Pending/Committed state is
+        // the physical capacity authority while that writeback is in flight.
+    }
+
+    // Tier1 is a separate pre-writeback policy.  Its admission rules remain
+    // owner-route based and must not be coupled to ring-B backing admission.
+    for (owner_node_id, owner_events) in tier1_events_by_owner {
+        let entries = deduplicate_owner_events(owner_events);
+        let owner_cache_lock = view
+            .master_kv_router()
+            .inner()
+            .owner_cache_operation_locks
+            .get_lock(owner_node_id.clone());
+        let _owner_cache_guard = owner_cache_lock.lock().await;
+        let Some(tier1_cache) = view
+            .master_kv_router()
+            .get_node_writeback_tier1_controller(&owner_node_id)
+        else {
+            continue;
+        };
+        tier1_cache.run_pending_tasks();
+        for (key, desc) in entries {
+            if !view.master_kv_router().tier1_writeback_entry_is_current(
+                &owner_node_id,
+                &key,
+                &desc,
+            ) {
+                continue;
+            }
+            tier1_cache.insert(key, desc);
         }
     }
 }
@@ -306,7 +294,7 @@ pub(super) async fn enqueue_post_route_maintenance(
 
 #[cfg(test)]
 mod tests {
-    use super::{deduplicate_owner_events, projected_batch_weight, saturating_moka_weight_bytes};
+    use super::{deduplicate_owner_events, saturating_moka_weight_bytes};
     use crate::master_kv_router::NodeValueReplicaDesc;
 
     #[test]
@@ -319,12 +307,6 @@ mod tests {
             saturating_moka_weight_bytes("key", (1, 2), u32::MAX as u64 + 1),
             u32::MAX
         );
-    }
-
-    #[test]
-    fn projected_weight_accounts_for_batch_replacements_once() {
-        assert_eq!(projected_batch_weight(90, 30, 50), 110);
-        assert_eq!(projected_batch_weight(10, 20, 5), 5);
     }
 
     #[test]

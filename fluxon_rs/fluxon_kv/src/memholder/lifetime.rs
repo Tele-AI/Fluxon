@@ -721,6 +721,86 @@ pub struct OwnerExternalMemMgr {
     inner: MemholderManagerInner<NodeHolderKey, ExternalHoldingGetInfo>,
 }
 
+impl OwnerExternalMemMgr {
+    /// Remove only holdings owned by the departed membership generation.
+    /// Node ids are reusable, so node-only cleanup can release memory still in
+    /// use by a reconnected external requester.
+    pub fn cleanup_node_generation(&self, node_id: &str, node_start_time: i64) -> usize {
+        let keys = self
+            .inner
+            .as_map()
+            .iter()
+            .filter_map(|entry| {
+                owner_external_holding_matches_generation(
+                    &entry.value().req_node_id,
+                    entry.value().requester_node_start_time,
+                    node_id,
+                    node_start_time,
+                )
+                .then(|| entry.key().clone())
+            })
+            .collect::<Vec<_>>();
+
+        keys.into_iter()
+            .filter(|key| {
+                self.inner
+                    .as_map()
+                    .remove_if(key, |_, holding| {
+                        owner_external_holding_matches_generation(
+                            &holding.req_node_id,
+                            holding.requester_node_start_time,
+                            node_id,
+                            node_start_time,
+                        )
+                    })
+                    .is_some()
+            })
+            .count()
+    }
+}
+
+fn owner_external_holding_matches_generation(
+    holding_node_id: &str,
+    holding_node_start_time: Option<i64>,
+    departed_node_id: &str,
+    departed_node_start_time: i64,
+) -> bool {
+    holding_node_id == departed_node_id && holding_node_start_time == Some(departed_node_start_time)
+}
+
+#[cfg(test)]
+mod owner_external_generation_tests {
+    use super::owner_external_holding_matches_generation;
+
+    #[test]
+    fn holding_cleanup_never_matches_reconnected_or_unknown_generation() {
+        assert!(owner_external_holding_matches_generation(
+            "external-a",
+            Some(11),
+            "external-a",
+            11,
+        ));
+        assert!(!owner_external_holding_matches_generation(
+            "external-a",
+            Some(12),
+            "external-a",
+            11,
+        ));
+        assert!(!owner_external_holding_matches_generation(
+            "external-a",
+            None,
+            "external-a",
+            11,
+        ));
+        assert!(!owner_external_holding_matches_generation(
+            "external-b",
+            Some(11),
+            "external-a",
+            11,
+        ));
+    }
+}
+
 impl Default for OwnerExternalMemMgr {
     fn default() -> Self {
         Self {
@@ -762,15 +842,21 @@ impl MemholderManagerTrait for OwnerExternalMemMgr {
             if holding.key != task.key {
                 continue;
             }
+            let Some(holding_epoch) = holding.requester_node_start_time else {
+                continue;
+            };
             let Some(member) = ctx
                 .cluster_manager()
                 .get_member_info_cached(&holding.req_node_id)
             else {
                 continue;
             };
+            if member.node_start_time != holding_epoch {
+                continue;
+            }
             targets.insert(DeleteTargetMember::new(
                 holding.req_node_id.clone(),
-                member.node_start_time,
+                holding_epoch,
             ));
         }
         targets.into_iter().collect()

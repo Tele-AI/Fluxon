@@ -21,24 +21,26 @@ use self::{
     },
     msg_pack::{
         BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchEnqueueReplicaTaskReq,
-        BatchGetDoneReq, BatchGetRevokeReq, BatchGetStartReq, BatchIsExistReq,
-        BatchOwnerReclaimReq, BatchPreparePutKeysReq, BatchPutDoneReq, BatchPutRevokeReq,
-        BatchPutStartReq, BatchReleasePutKeyReservationsReq, CountPrefixReq, CountPrefixResp,
-        DeleteAckReq, DeleteReq, GetAllocationMode, GetDoneReq, GetMasterOnlyMetricPartReq,
-        GetMasterOnlyMetricPartResp, GetMetaReq, GetRevokeReq, GetStartReq, GroupedBatchPutDoneReq,
-        MemHolderKeepAliveReq, MemHolderReleaseReq, OwnerReclaimBacking, OwnerReclaimItem,
+        BatchEvictOwnerSourceReq, BatchGetDoneReq, BatchGetRevokeReq, BatchGetStartReq,
+        BatchIsExistReq, BatchOwnerReclaimReq, BatchPreparePutKeysReq, BatchPutAppendDoneReq,
+        BatchPutAppendStartReq, BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq,
+        BatchReleasePutKeyReservationsReq, CountPrefixReq, CountPrefixResp, DeleteAckReq,
+        DeleteReq, GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetRevokeReq,
+        GetStartReq, GroupedBatchPutDoneReq, OwnerReclaimBacking, OwnerReclaimItem,
         OwnerReclaimReason, PutAppendDoneReq, PutAppendRevokeReq, PutAppendStartReq,
         PutAtomicGroup, PutDoneReq, PutRevokeReq, PutStartReq, ReleaseLocalGrantReq,
         ReserveLocalGrantReq,
     },
     placement::{PlacementPolicy, build_placement_policy},
     put::{
-        handle_batch_prepare_put_keys, handle_batch_put_done, handle_batch_put_revoke,
-        handle_batch_put_start, handle_batch_release_put_key_reservations,
-        handle_grouped_batch_put_done, handle_put_append_done, handle_put_append_revoke,
-        handle_put_append_start, handle_put_done, handle_put_revoke, handle_put_start,
-        handle_release_local_grant, handle_reserve_local_grant,
+        handle_batch_prepare_put_keys, handle_batch_put_append_done, handle_batch_put_append_start,
+        handle_batch_put_done, handle_batch_put_revoke, handle_batch_put_start,
+        handle_batch_release_put_key_reservations, handle_grouped_batch_put_done,
+        handle_put_append_done, handle_put_append_revoke, handle_put_append_start, handle_put_done,
+        handle_put_revoke, handle_put_start, handle_release_local_grant,
+        handle_reserve_local_grant,
     },
+    reclaim::handle_batch_evict_owner_source,
 };
 use crate::ClientKvApiAccessTrait;
 use crate::client_kv_api::ClientKvApi;
@@ -53,31 +55,26 @@ use crate::master_seg_manager::MasterSegManager;
 use crate::master_seg_manager::MasterSegManagerAccessTrait;
 use crate::master_seg_manager::NodeTombTag;
 use crate::master_seg_manager::one_seg_allocator::Allocation;
-use crate::memholder::{
-    EnsureMemholderMgmtDeleteHandle, MasterOwnerMemMgr, MemholderManagerTrait, NodeHolderKey,
-};
+use crate::memholder::{EnsureMemholderMgmtDeleteHandle, MasterOwnerMemMgr, MemholderManagerTrait};
 use crate::metric_reporter::{MetricReporter, MetricReporterAccessTrait};
 use crate::p2p::msg_pack::{MsgPack, RPCCaller, RPCHandler};
 use crate::p2p::p2p_module::{P2pModule, P2pModuleAccessTrait};
-use crate::rpcresp_kvresult_convert;
 use crate::rpcresp_kvresult_convert::msg_and_error::{KvError, OK};
 use fluxon_framework::{LogicalModule, define_module};
-use fluxon_framework_compiled::upgrade_view_guard::UpgradeViewGuard;
 use fluxon_util::map_lock::AMapLock;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use dashmap::DashMap;
-use limit_thirdparty::tokio::sync::{ARwLock, abroadcast};
+use dashmap::{DashMap, DashSet};
+use limit_thirdparty::tokio::sync::ARwLock;
 use limit_thirdparty::tokio::{self, sync::ampsc};
 use moka::notification::RemovalCause;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
-use std::borrow::Cow;
+use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
@@ -85,7 +82,6 @@ const MAX_GET_DURABLE_REPLICA_SLOTS: u32 = 2;
 const PLACEMENT_REPORT_INTERVAL_SECS: u64 = 10;
 const INFLIGHT_PUT_TTL_SECONDS: u64 = 60;
 const INFLIGHT_PUT_TTL_SECONDS_SKIP_PUT_END_COMMIT: u64 = 5;
-const EVICTION_RECLAIM_QUEUE_CAPACITY: usize = 4096;
 const POST_ROUTE_MAINTENANCE_QUEUE_CAPACITY: usize = 512;
 const TIER1_WRITEBACK_QUEUE_CAPACITY: usize = 4096;
 
@@ -109,26 +105,39 @@ fn subtract_pending_eviction_weight(
         });
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UnrecoverableCacheEvictionContext {
-    NormalCapacity,
-    OwnerLocalReserveNoSpace,
+fn try_install_eviction_reclaim_identities(
+    inflight: &DashSet<reclaim::EvictionReclaimIdentity>,
+    identities: Vec<reclaim::EvictionReclaimIdentity>,
+) -> bool {
+    let mut installed = Vec::with_capacity(identities.len());
+    for identity in identities {
+        if inflight.insert(identity.clone()) {
+            installed.push(identity);
+        } else {
+            for identity in installed {
+                assert!(inflight.remove(&identity).is_some());
+            }
+            return false;
+        }
+    }
+    true
 }
 
-fn allow_unrecoverable_cache_eviction(
-    owner_is_remote_only: bool,
-    has_ready_remote_only_owner: bool,
-    context: UnrecoverableCacheEvictionContext,
-) -> bool {
-    // A normal active-tier eviction must preserve the remote copy whenever a remote-only tier is
-    // available. Physical local-reserve exhaustion is the liveness boundary: if that remote tier
-    // has filled and no recoverable active-tier entry remains, refusing to evict the last cached
-    // copy prevents the owner from accepting any subsequent write-back. The existing three-phase
-    // owner reclaim transaction removes the route and slot atomically, so dropping that cold cache
-    // entry is safe and a future lookup simply recomputes it.
-    context == UnrecoverableCacheEvictionContext::OwnerLocalReserveNoSpace
-        || owner_is_remote_only
-        || !has_ready_remote_only_owner
+fn classify_existing_eviction_reclaim(
+    inflight: &DashSet<reclaim::EvictionReclaimIdentity>,
+    identities: &[reclaim::EvictionReclaimIdentity],
+) -> reclaim::EnqueueEvictionReclaimResult {
+    let inflight_count = identities
+        .iter()
+        .filter(|identity| inflight.contains(identity))
+        .count();
+    if inflight_count == identities.len() {
+        reclaim::EnqueueEvictionReclaimResult::AlreadyInProgress
+    } else if inflight_count == 0 {
+        reclaim::EnqueueEvictionReclaimResult::NotInProgress
+    } else {
+        reclaim::EnqueueEvictionReclaimResult::PartialOverlap
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -139,21 +148,45 @@ pub enum PutPlacementMode {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ReservedCapacityReason {
+    LocalReserveGrant,
+    OwnerIndexedAllocation,
     LeaseBoundKv,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NodeCacheReservedCapacity {
+    /// Exact node registration generation owning these counters.
+    generation: NodeTombTag,
     pub total_bytes: AtomicU64,
+    pub local_reserve_grant_bytes: AtomicU64,
+    pub owner_indexed_allocation_bytes: AtomicU64,
     pub lease_bound_kv_bytes: AtomicU64,
 }
 
 impl NodeCacheReservedCapacity {
+    fn new(generation: NodeTombTag) -> Self {
+        Self {
+            generation,
+            total_bytes: AtomicU64::new(0),
+            local_reserve_grant_bytes: AtomicU64::new(0),
+            owner_indexed_allocation_bytes: AtomicU64::new(0),
+            lease_bound_kv_bytes: AtomicU64::new(0),
+        }
+    }
+
     fn apply_delta(&self, reason: ReservedCapacityReason, delta_bytes: i64) {
         if delta_bytes >= 0 {
             let delta = delta_bytes as u64;
             self.total_bytes.fetch_add(delta, Ordering::Relaxed);
             match reason {
+                ReservedCapacityReason::LocalReserveGrant => {
+                    self.local_reserve_grant_bytes
+                        .fetch_add(delta, Ordering::Relaxed);
+                }
+                ReservedCapacityReason::OwnerIndexedAllocation => {
+                    self.owner_indexed_allocation_bytes
+                        .fetch_add(delta, Ordering::Relaxed);
+                }
                 ReservedCapacityReason::LeaseBoundKv => {
                     self.lease_bound_kv_bytes
                         .fetch_add(delta, Ordering::Relaxed);
@@ -163,6 +196,14 @@ impl NodeCacheReservedCapacity {
             let delta = (-delta_bytes) as u64;
             self.total_bytes.fetch_sub(delta, Ordering::Relaxed);
             match reason {
+                ReservedCapacityReason::LocalReserveGrant => {
+                    self.local_reserve_grant_bytes
+                        .fetch_sub(delta, Ordering::Relaxed);
+                }
+                ReservedCapacityReason::OwnerIndexedAllocation => {
+                    self.owner_indexed_allocation_bytes
+                        .fetch_sub(delta, Ordering::Relaxed);
+                }
                 ReservedCapacityReason::LeaseBoundKv => {
                     self.lease_bound_kv_bytes
                         .fetch_sub(delta, Ordering::Relaxed);
@@ -173,6 +214,57 @@ impl NodeCacheReservedCapacity {
 
     fn total_reserved_bytes(&self) -> u64 {
         self.total_bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// Version-scoped reservation that reduces the usable resident-cache capacity
+/// while a lease-bound route is alive.  The token owns the exact counter Arc;
+/// dropping an old Allocation/route can therefore never decrement a newly
+/// reconnected node's counters merely because it reused the same node id.
+pub struct NodeCacheCapacityReservation {
+    view: MasterKvRouterView,
+    node_id: NodeIDString,
+    generation: NodeTombTag,
+    reserved_capacity: Arc<NodeCacheReservedCapacity>,
+    reason: ReservedCapacityReason,
+    bytes: u64,
+    released: AtomicBool,
+}
+
+impl std::fmt::Debug for NodeCacheCapacityReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCacheCapacityReservation")
+            .field("node_id", &self.node_id)
+            .field("bytes", &self.bytes)
+            .field("released", &self.released.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl Drop for NodeCacheCapacityReservation {
+    fn drop(&mut self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(_view_guard) = self.view.try_upgrade() else {
+            return;
+        };
+        if let Err(err) = self
+            .view
+            .master_kv_router()
+            .adjust_node_cache_reserved_capacity_identity(
+                &self.node_id,
+                &self.generation,
+                &self.reserved_capacity,
+                self.reason,
+                -(self.bytes as i64),
+            )
+        {
+            warn!(
+                "failed to release generation-scoped cache reservation: node={} bytes={} err={}",
+                self.node_id, self.bytes, err
+            );
+        }
     }
 }
 
@@ -198,7 +290,6 @@ pub struct ReplicaCacheNodeObserveSnapshot {
     pub writeback_tier1_owner_accepted: u64,
     pub writeback_tier1_failed: u64,
     pub reclaim_master_activity_deferred: u64,
-    pub reclaim_master_get_holder_observed: u64,
     pub reclaim_owner_holder_deferred: u64,
     pub reclaim_owner_other_deferred: u64,
     pub reclaim_route_changed: u64,
@@ -206,21 +297,18 @@ pub struct ReplicaCacheNodeObserveSnapshot {
     pub reclaim_retry_completed: u64,
     pub reclaim_retry_restored: u64,
     pub reclaim_completed: u64,
-    pub owner_hot_demotion_attempts: u64,
-    pub owner_hot_demotion_cohorts: u64,
-    pub owner_hot_demotion_selected_bytes: u64,
-    pub owner_hot_demotion_precheck_rejected: u64,
-    pub owner_hot_demotion_partial_mismatch: u64,
-    pub recoverable_first_requested_bytes: u64,
-    pub recoverable_first_selected_bytes: u64,
-    pub recoverable_first_shortfall_bytes: u64,
-    pub recoverable_first_eligible_checks: u64,
-    pub recoverable_first_route_absent_checks: u64,
-    pub recoverable_first_version_changed_checks: u64,
-    pub recoverable_first_route_ineligible_checks: u64,
-    pub recoverable_first_cpu_route_absent_checks: u64,
-    pub recoverable_first_atomic_group_incomplete_checks: u64,
-    pub recoverable_first_tp_cohort_incomplete_checks: u64,
+    pub source_evict_rpc_requests: u64,
+    pub source_evict_cohorts: u64,
+    pub source_evict_requested_bytes: u64,
+    pub source_evict_accepted: u64,
+    pub source_evict_in_progress: u64,
+    pub source_evict_completed: u64,
+    pub source_evict_retryable_busy: u64,
+    pub source_evict_stale: u64,
+    pub source_evict_rejected: u64,
+    pub capacity_eviction_non_ring_b_entry_total: u64,
+    pub capacity_eviction_hit_committed_slot: u64,
+    pub eviction_reclaim_deduplicated: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -267,6 +355,8 @@ pub enum InflightPutAllocation {
 #[derive(Clone)]
 pub struct InflightPutCommitInfo {
     pub node_id: NodeID,
+    /// Exact target registration generation captured while the allocation was current.
+    pub target_tomb_tag: NodeTombTag,
     pub src_target_allocation: Arc<Mutex<Option<InflightPutAllocation>>>,
     pub replica_target: Option<InflightReplicaTaskInfo>,
 }
@@ -284,11 +374,12 @@ pub struct InflightPutInfo {
 #[derive(Clone)]
 pub struct InflightReplicaTaskInfo {
     pub node_id: NodeID,
+    /// Exact target registration generation that owns `target_allocation`.
+    pub target_tomb_tag: NodeTombTag,
     pub source_node_id: NodeID,
     pub key: String,
     pub put_id: PutIDForAKey,
     pub target_allocation: Arc<Mutex<Option<Allocation>>>,
-    pub demote_source_on_remote_complete: bool,
     /// Protect the source-owner copy only after this inclusive replica has been
     /// published successfully.  Backend-admitted replicas set this bit; tiered
     /// write-back and owner-hot exclusive demotion deliberately do not.
@@ -304,17 +395,57 @@ pub struct InflightGetInfo {
     pub key: String,
     pub req_node_id: NodeID,
     pub len: u64,
-    pub allocation: Arc<Allocation>,
+    pub target: InflightGetTarget,
+    /// Exact requester registration generation that owns `target`.
+    pub target_tomb_tag: NodeTombTag,
     pub route: Arc<OneKvNodesRoutes>,
     pub allocation_mode: GetAllocationMode,
+    pub durable_reservation: Option<Arc<GetDurableSlotReservation>>,
     pub(crate) _activity_lease: Arc<MasterKeyActivityLease>,
+    /// Requester-scoped guard for prepared local-reserve Gets.  Different GPU
+    /// owners may fetch the same key concurrently, but one owner must never
+    /// materialize two candidate committed slots for the same key.
+    pub(crate) _prepared_requester_lease: Option<Arc<PreparedGetRequesterLease>>,
+}
+
+#[derive(Clone)]
+pub struct CompletedGetInfo {
+    pub req_node_id: NodeID,
+    pub response: GetDoneResp,
+}
+
+#[derive(Clone, Debug)]
+pub enum InflightGetTarget {
+    Allocation(Arc<Allocation>),
+    PreparedLocalReserveSlot(CommittedSlotReplica),
+}
+
+impl InflightGetTarget {
+    pub fn abs_addr(&self) -> u64 {
+        match self {
+            Self::Allocation(allocation) => allocation.base_addr() + allocation.addr(),
+            Self::PreparedLocalReserveSlot(slot) => slot.addr,
+        }
+    }
+
+    pub fn base_addr(&self) -> u64 {
+        match self {
+            Self::Allocation(allocation) => allocation.base_addr(),
+            Self::PreparedLocalReserveSlot(slot) => slot.base_addr,
+        }
+    }
+
+    pub fn capacity(&self) -> u64 {
+        match self {
+            Self::Allocation(allocation) => allocation.capcity(),
+            Self::PreparedLocalReserveSlot(slot) => slot.slot_size,
+        }
+    }
 }
 
 impl InflightGetInfo {
     pub fn release_durable_slot_if_needed(&self) {
-        if self.allocation_mode == GetAllocationMode::DurableReplica {
-            self.route.release_get_durable_slot();
-        }
+        // Durable-slot capacity is returned by the reservation token's Drop.
     }
 }
 
@@ -329,7 +460,11 @@ pub struct OwnerHoldingGetInfo {
 
 pub struct LocalReserveGrantInfo {
     pub owner_node_id: NodeID,
+    /// Exact owner registration generation that owns the grant allocation.
+    pub tomb_tag: NodeTombTag,
     pub allocation: Allocation,
+    /// Excludes this whole grant from the master unindexed-Allocation domain.
+    pub capacity_reservation: Option<Arc<NodeCacheCapacityReservation>>,
 }
 
 pub struct PreparedPutKeyReservationInfo {
@@ -341,7 +476,6 @@ pub struct PreparedPutKeyReservationInfo {
 #[derive(Default)]
 pub(crate) struct EvictionReclaimCounters {
     pub master_activity_deferred: AtomicU64,
-    pub master_get_holder_observed: AtomicU64,
     pub owner_holder_deferred: AtomicU64,
     pub owner_other_deferred: AtomicU64,
     pub route_changed: AtomicU64,
@@ -349,21 +483,24 @@ pub(crate) struct EvictionReclaimCounters {
     pub retry_completed: AtomicU64,
     pub retry_restored: AtomicU64,
     pub completed: AtomicU64,
-    pub owner_hot_demotion_attempts: AtomicU64,
-    pub owner_hot_demotion_cohorts: AtomicU64,
-    pub owner_hot_demotion_selected_bytes: AtomicU64,
-    pub owner_hot_demotion_precheck_rejected: AtomicU64,
-    pub owner_hot_demotion_partial_mismatch: AtomicU64,
-    pub recoverable_first_requested_bytes: AtomicU64,
-    pub recoverable_first_selected_bytes: AtomicU64,
-    pub recoverable_first_shortfall_bytes: AtomicU64,
-    pub recoverable_first_eligible_checks: AtomicU64,
-    pub recoverable_first_route_absent_checks: AtomicU64,
-    pub recoverable_first_version_changed_checks: AtomicU64,
-    pub recoverable_first_route_ineligible_checks: AtomicU64,
-    pub recoverable_first_cpu_route_absent_checks: AtomicU64,
-    pub recoverable_first_atomic_group_incomplete_checks: AtomicU64,
-    pub recoverable_first_tp_cohort_incomplete_checks: AtomicU64,
+    pub source_evict_rpc_requests: AtomicU64,
+    pub source_evict_cohorts: AtomicU64,
+    pub source_evict_requested_bytes: AtomicU64,
+    pub source_evict_accepted: AtomicU64,
+    pub source_evict_in_progress: AtomicU64,
+    pub source_evict_completed: AtomicU64,
+    pub source_evict_retryable_busy: AtomicU64,
+    pub source_evict_stale: AtomicU64,
+    pub source_evict_rejected: AtomicU64,
+    /// A Size event from the ring-B controller resolved to any current route
+    /// outside `Allocation && !owner_local_indexed`.
+    pub capacity_eviction_non_ring_b_entry_total: AtomicU64,
+    /// More specific subset retained for diagnostics/backward-compatible
+    /// metrics: the non-ring-B route used a CommittedSlot backing.
+    pub capacity_eviction_hit_committed_slot: AtomicU64,
+    /// Duplicate listener/cohort events suppressed while the same physical
+    /// cache version already has an outstanding reclaim lifecycle.
+    pub eviction_reclaim_deduplicated: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -421,6 +558,82 @@ impl Drop for MasterKeyActivityLease {
 
 pub(crate) struct MasterKeyActivityCompletionGuard {
     lease: Option<Arc<MasterKeyActivityLease>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PreparedGetRequesterKey {
+    key: String,
+    requester: NodeID,
+}
+
+#[derive(Default)]
+pub(crate) struct PreparedGetRequesterTable {
+    active: Mutex<HashMap<PreparedGetRequesterKey, u64>>,
+}
+
+pub(crate) struct PreparedGetRequesterLease {
+    table: Arc<PreparedGetRequesterTable>,
+    identity: PreparedGetRequesterKey,
+    get_id: u64,
+    released: AtomicBool,
+}
+
+impl PreparedGetRequesterTable {
+    fn reserve(
+        self: &Arc<Self>,
+        key: &str,
+        requester: &NodeID,
+        get_id: u64,
+    ) -> Option<Arc<PreparedGetRequesterLease>> {
+        let identity = PreparedGetRequesterKey {
+            key: key.to_string(),
+            requester: requester.clone(),
+        };
+        let mut active = self.active.lock();
+        if active.contains_key(&identity) {
+            return None;
+        }
+        active.insert(identity.clone(), get_id);
+        Some(Arc::new(PreparedGetRequesterLease {
+            table: self.clone(),
+            identity,
+            get_id,
+            released: AtomicBool::new(false),
+        }))
+    }
+
+    #[cfg(test)]
+    fn active_get_id(&self, key: &str, requester: &NodeID) -> Option<u64> {
+        self.active
+            .lock()
+            .get(&PreparedGetRequesterKey {
+                key: key.to_string(),
+                requester: requester.clone(),
+            })
+            .copied()
+    }
+}
+
+impl PreparedGetRequesterLease {
+    pub(crate) fn release_now(&self) {
+        if self
+            .released
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let mut active = self.table.active.lock();
+        if active.get(&self.identity) == Some(&self.get_id) {
+            active.remove(&self.identity);
+        }
+    }
+}
+
+impl Drop for PreparedGetRequesterLease {
+    fn drop(&mut self) {
+        self.release_now();
+    }
 }
 
 impl MasterKeyActivityCompletionGuard {
@@ -640,6 +853,17 @@ impl KvReplicaBacking {
             Self::CommittedSlot(slot) => slot.len,
         }
     }
+
+    /// Bytes owned by the physical backing.  Capacity accounting must use
+    /// this value rather than the logical payload length: an Allocation owns
+    /// its allocator capacity and a committed local-reserve slot owns the
+    /// whole slot.
+    pub fn capacity_bytes(&self) -> u64 {
+        match self {
+            Self::Allocation(allocation) => allocation.capcity(),
+            Self::CommittedSlot(slot) => slot.slot_size,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -650,7 +874,38 @@ pub struct KvRouteInfo {
     /// Replica-task and remote-put targets are raw master-owned allocations and have no
     /// owner-side key entry to fence during capacity eviction.
     pub owner_local_indexed: bool,
+    /// Present only for an allocation replica created by GetDone. The shared
+    /// token returns the per-key durable-replica budget when this route entry's
+    /// final clone is dropped.
+    pub get_durable_reservation: Option<Arc<GetDurableSlotReservation>>,
+    /// Excludes a non-ring-B backing from the unindexed-Allocation budget and
+    /// is released with the exact route lifetime.
+    pub capacity_reservation: Option<Arc<NodeCacheCapacityReservation>>,
     pub tomb_tag: NodeTombTag,
+}
+
+pub struct GetDurableSlotReservation {
+    route: Weak<OneKvNodesRoutes>,
+    released: AtomicBool,
+}
+
+impl std::fmt::Debug for GetDurableSlotReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GetDurableSlotReservation")
+            .field("released", &self.released.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl Drop for GetDurableSlotReservation {
+    fn drop(&mut self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(route) = self.route.upgrade() {
+            route.release_get_durable_slot();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -705,7 +960,7 @@ impl OneKvNodesRoutes {
         return true;
     }
 
-    fn try_reserve_get_durable_slot(&self) -> bool {
+    fn try_reserve_get_durable_slot(self: &Arc<Self>) -> Option<Arc<GetDurableSlotReservation>> {
         self.get_durable_slots_used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if current < MAX_GET_DURABLE_REPLICA_SLOTS {
@@ -714,7 +969,13 @@ impl OneKvNodesRoutes {
                     None
                 }
             })
-            .is_ok()
+            .ok()
+            .map(|_| {
+                Arc::new(GetDurableSlotReservation {
+                    route: Arc::downgrade(self),
+                    released: AtomicBool::new(false),
+                })
+            })
     }
 
     fn release_get_durable_slot(&self) {
@@ -726,40 +987,288 @@ impl OneKvNodesRoutes {
     }
 }
 
-fn route_has_live_replica_on_node(route: &OneKvNodesRoutes, node_id: &str) -> bool {
-    route
-        .nodes_replicas
-        .read()
-        .iter()
-        .any(|(candidate, replica)| candidate.as_ref() == node_id && !replica.tomb_tag.is_tomb())
+/// Ring B contains exactly master-only, unindexed Allocation routes.  Node
+/// role is deliberately absent from this predicate: placement and capacity
+/// ownership are orthogonal.
+fn ring_b_route_replica_desc(
+    route: &OneKvNodesRoutes,
+    node_id: &str,
+) -> Option<NodeValueReplicaDesc> {
+    if route.lease_id.is_some() {
+        return None;
+    }
+    let replicas = route.nodes_replicas.read();
+    let replica = replicas.get(node_id)?;
+    if replica.tomb_tag.is_tomb()
+        || replica.owner_local_indexed
+        || !matches!(&replica.backing, KvReplicaBacking::Allocation(_))
+    {
+        return None;
+    }
+    Some(NodeValueReplicaDesc {
+        weight_bytes: u32::try_from(replica.backing.capacity_bytes()).unwrap_or(u32::MAX),
+        put_id: route.put_id,
+    })
 }
 
-fn route_live_remote_cache_nodes(
+/// True only while `tag` is the live registration generation currently bound to `node_id`.
+/// Completion paths must validate their captured tag instead of borrowing the tag of a later
+/// registration that happens to reuse the same node id.
+pub(crate) fn node_generation_is_current_live(
     view: &MasterKvRouterView,
+    node_id: &NodeID,
+    tag: &NodeTombTag,
+) -> bool {
+    !tag.is_tomb()
+        && view
+            .master_seg_manager()
+            .get_node_tomb_tag(node_id)
+            .is_some_and(|current| !current.is_tomb() && current.same_generation(tag))
+}
+
+/// Publish one replica under the route-local lock and close the MemberLeft snapshot race.
+///
+/// There are only two possible linearizations:
+/// - publication wins the final tag check, so a later MemberLeft snapshot observes the route;
+/// - MemberLeft marks the shared tag first, so this function rolls back the exact generation
+///   before releasing the route lock.
+///
+/// A previous live generation is never overwritten on rollback.  In normal operation such a
+/// generation cannot coexist with `replica` (registration replacement tombs the old tag first),
+/// but preserving it makes the identity rule explicit and keeps tests resistant to ABA setup.
+pub(crate) fn publish_route_replica_tomb_fenced(
     route: &OneKvNodesRoutes,
-) -> HashSet<String> {
-    route
-        .nodes_replicas
-        .read()
-        .iter()
-        .filter_map(|(node_id, replica)| {
-            if replica.tomb_tag.is_tomb() {
-                return None;
+    node_id: NodeID,
+    replica: KvRouteInfo,
+) -> bool {
+    let publish_tag = replica.tomb_tag.clone();
+    if publish_tag.is_tomb() {
+        return false;
+    }
+
+    let mut replicas = route.nodes_replicas.write();
+    if publish_tag.is_tomb() {
+        return false;
+    }
+    // A completion pre-check is necessarily racy with another completion for
+    // the same requester.  Never replace a live replica here: only a tombed
+    // generation may be superseded.
+    if replicas
+        .get(&node_id)
+        .is_some_and(|current| !current.tomb_tag.is_tomb())
+    {
+        return false;
+    }
+    let previous = replicas.insert(node_id.clone(), replica);
+
+    if publish_tag.is_tomb() {
+        let published_is_current = replicas.get(&node_id).is_some_and(|current| {
+            current.node_id == node_id && current.tomb_tag.same_generation(&publish_tag)
+        });
+        if published_is_current {
+            replicas.remove(&node_id);
+            if let Some(previous) = previous.filter(|old| !old.tomb_tag.is_tomb()) {
+                replicas.insert(node_id, previous);
             }
-            let member = view
-                .cluster_manager()
-                .get_member_info_cached(node_id.as_ref());
-            placement::member_matches_roles(
-                member.as_ref(),
-                &view
-                    .master_kv_router()
-                    .inner()
-                    .replica_task_placement
-                    .remote_only_node_roles,
-            )
-            .then(|| node_id.as_ref().to_string())
+        }
+        return false;
+    }
+    true
+}
+
+/// Replace one key's primary route while closing the MemberLeft snapshot race.
+///
+/// The DashMap entry guard is held through the final tomb check.  Therefore a
+/// MemberLeft cleanup that starts after a successful check must observe the new
+/// route, while a MemberLeft that marks the generation first causes the exact
+/// replacement to be rolled back.  Restoring `previous` also protects a newer
+/// key version from being lost when a stale completion races node departure.
+pub(crate) fn publish_primary_route_tomb_fenced(
+    routes: &DashMap<String, Arc<OneKvNodesRoutes>>,
+    key: &str,
+    new_route: Arc<OneKvNodesRoutes>,
+    publish_tag: &NodeTombTag,
+) -> Result<Option<Arc<OneKvNodesRoutes>>, ()> {
+    if publish_tag.is_tomb() {
+        return Err(());
+    }
+
+    let mut inserted = false;
+    let mut current = routes.entry(key.to_string()).or_insert_with(|| {
+        inserted = true;
+        new_route.clone()
+    });
+    let previous = if inserted {
+        None
+    } else {
+        Some(std::mem::replace(&mut *current, new_route.clone()))
+    };
+
+    if publish_tag.is_tomb() {
+        if let Some(previous) = previous {
+            *current = previous;
+        } else {
+            // DashMap's vacant-entry guard cannot remove itself.  Drop the
+            // shard guard first, then remove only our exact Arc.  The route is
+            // tombed throughout this tiny window, so readers cannot use it.
+            drop(current);
+            routes.remove_if(key, |_, route| Arc::ptr_eq(route, &new_route));
+        }
+        return Err(());
+    }
+
+    Ok(previous)
+}
+
+fn member_left_can_forward_to_registration_actor(current_node_start_time: Option<i64>) -> bool {
+    // MemberLeft carries only a node id. If membership already exposes a live generation,
+    // forwarding the ambiguous old leave would cancel that generation's registration actor.
+    current_node_start_time.is_none()
+}
+
+/// Remove one departed node generation from a single route.
+///
+/// The route map and replica map deliberately use their normal fine-grained locking only:
+/// MemberLeft is a cold path and must not introduce a process-wide lock around a full-table scan.
+/// The tomb-tag identity fences a delayed cleanup from deleting a live replica published by a
+/// reconnected generation that reused the same node id.
+fn remove_departed_generation_from_route(
+    routes: &DashMap<String, Arc<OneKvNodesRoutes>>,
+    key: &str,
+    route: &Arc<OneKvNodesRoutes>,
+    node_id: &str,
+    departed_tag: &NodeTombTag,
+) -> Option<PutIDForAKey> {
+    let became_empty = {
+        let mut replicas = route.nodes_replicas.write();
+        let remove = replicas.get(node_id).is_some_and(|replica| {
+            replica.node_id.as_ref() == node_id
+                && replica.tomb_tag.is_tomb()
+                && replica.tomb_tag.same_generation(departed_tag)
+        });
+        if !remove {
+            return None;
+        }
+        replicas.remove(node_id);
+        replicas.is_empty()
+    };
+
+    if !became_empty {
+        return None;
+    }
+
+    routes
+        .remove_if(key, |_, current| {
+            // `Arc::ptr_eq` prevents an old cleanup from removing a replacement route (ABA).
+            // Recheck emptiness under the per-route read lock because another replica may have
+            // joined after the write lock above was released.
+            Arc::ptr_eq(current, route) && current.nodes_replicas.read().is_empty()
         })
-        .collect()
+        .map(|(_, removed)| removed.put_id)
+}
+
+const MEMBER_LEFT_ROUTE_CLEANUP_BATCH: usize = 512;
+
+async fn cleanup_departed_generation_routes(
+    view: MasterKvRouterView,
+    node_id: NodeIDString,
+    departed_tag: NodeTombTag,
+) {
+    // Grants own master-side Allocation guards and therefore must be released
+    // for the exact departed generation as well.  Collect ids without keeping
+    // DashMap guards across a removal or yield.
+    let departed_grant_ids: Vec<u64> = view
+        .master_kv_router()
+        .inner()
+        .local_reserve_grants
+        .iter()
+        .filter_map(|entry| {
+            (entry.value().owner_node_id.as_ref() == node_id.as_str()
+                && entry.value().tomb_tag.is_tomb()
+                && entry.value().tomb_tag.same_generation(&departed_tag))
+            .then_some(*entry.key())
+        })
+        .collect();
+    let mut removed_grants = 0usize;
+    for grant_id in departed_grant_ids {
+        if view
+            .master_kv_router()
+            .inner()
+            .local_reserve_grants
+            .remove_if(&grant_id, |_, grant| {
+                grant.owner_node_id.as_ref() == node_id.as_str()
+                    && grant.tomb_tag.is_tomb()
+                    && grant.tomb_tag.same_generation(&departed_tag)
+            })
+            .is_some()
+        {
+            removed_grants = removed_grants.saturating_add(1);
+        }
+    }
+
+    // Weak snapshots avoid pinning every route Allocation for the duration of a large scan.
+    // No DashMap guard or replica lock is held across an await.
+    let route_snapshot: Vec<(String, Weak<OneKvNodesRoutes>)> = view
+        .master_kv_router()
+        .inner()
+        .kv_routes
+        .iter()
+        .map(|entry| (entry.key().clone(), Arc::downgrade(entry.value())))
+        .collect();
+    let mut removed_empty_routes = Vec::new();
+    let mut removed_replicas = 0usize;
+
+    for batch in route_snapshot.chunks(MEMBER_LEFT_ROUTE_CLEANUP_BATCH) {
+        for (key, weak_route) in batch {
+            let Some(route) = weak_route.upgrade() else {
+                continue;
+            };
+            let had_departed_replica = route
+                .nodes_replicas
+                .read()
+                .get(node_id.as_str())
+                .is_some_and(|replica| {
+                    replica.node_id.as_ref() == node_id.as_str()
+                        && replica.tomb_tag.is_tomb()
+                        && replica.tomb_tag.same_generation(&departed_tag)
+                });
+            if !had_departed_replica {
+                continue;
+            }
+            if let Some(put_id) = remove_departed_generation_from_route(
+                &view.master_kv_router().inner().kv_routes,
+                key,
+                &route,
+                node_id.as_str(),
+                &departed_tag,
+            ) {
+                removed_empty_routes.push((key.clone(), put_id));
+            }
+            removed_replicas = removed_replicas.saturating_add(1);
+        }
+        tokio::task::yield_now().await;
+    }
+
+    if view.master_kv_router().prefix_index_enabled() {
+        // Prefix cleanup is batched so one MemberLeft does not spawn one task or acquire one
+        // async write lock per key.
+        for batch in removed_empty_routes.chunks(MEMBER_LEFT_ROUTE_CLEANUP_BATCH) {
+            let mut tree = view.master_kv_router().inner().prefix_index.write().await;
+            for (key, put_id) in batch {
+                tree.remove(key, *put_id);
+            }
+            drop(tree);
+            tokio::task::yield_now().await;
+        }
+    }
+
+    info!(
+        "MemberLeft route cleanup completed: node={} removed_grants={} removed_replicas={} removed_empty_routes={}",
+        node_id,
+        removed_grants,
+        removed_replicas,
+        removed_empty_routes.len()
+    );
 }
 
 const MAX_INFERRED_TP_COHORT_SIZE: usize = 256;
@@ -806,63 +1315,69 @@ pub(crate) fn infer_sglang_tp_key(key: &str) -> Option<InferredTpKey<'_>> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RecoverableReplicaStatus {
-    Recoverable,
-    RouteAbsent,
-    VersionChanged,
-    RouteIneligible,
-    CpuRouteAbsent,
+enum CohortExpansionError {
     AtomicGroupIncomplete,
     TpCohortIncomplete,
 }
 
-fn recoverable_cohort_weight<F>(
+fn take_exact_cache_entries(
+    cache: &moka::sync::SegmentedCache<String, NodeValueReplicaDesc>,
     expected_entries: &HashMap<String, NodeValueReplicaDesc>,
-    mut recoverable_status: F,
-) -> Option<u64>
-where
-    F: FnMut(&str, &NodeValueReplicaDesc) -> RecoverableReplicaStatus,
-{
-    let mut expected_weight = 0u64;
-    for (key, desc) in expected_entries {
-        if recoverable_status(key, desc) != RecoverableReplicaStatus::Recoverable {
-            return None;
+) -> Option<Vec<(String, NodeValueReplicaDesc)>> {
+    let mut removed_entries = Vec::with_capacity(expected_entries.len());
+    for (candidate_key, expected_desc) in expected_entries {
+        let result = cache
+            .entry(candidate_key.clone())
+            .and_compute_with(|current| {
+                if current.as_ref().is_some_and(|entry| {
+                    entry.value().put_id == expected_desc.put_id
+                        && entry.value().weight_bytes == expected_desc.weight_bytes
+                }) {
+                    moka::ops::compute::Op::Remove
+                } else {
+                    moka::ops::compute::Op::Nop
+                }
+            });
+        match result {
+            moka::ops::compute::CompResult::Removed(entry) => {
+                removed_entries.push((candidate_key.clone(), entry.into_value()));
+            }
+            _ => {
+                for (removed_key, removed_desc) in removed_entries {
+                    cache.insert(removed_key, removed_desc);
+                }
+                return None;
+            }
         }
-        expected_weight = expected_weight.checked_add(u64::from(desc.weight_bytes))?;
     }
-    (expected_weight != 0).then_some(expected_weight)
+    Some(removed_entries)
 }
 
-impl EvictionReclaimCounters {
-    fn record_recoverable_first_status(&self, status: RecoverableReplicaStatus) {
-        let counter = match status {
-            RecoverableReplicaStatus::Recoverable => &self.recoverable_first_eligible_checks,
-            RecoverableReplicaStatus::RouteAbsent => &self.recoverable_first_route_absent_checks,
-            RecoverableReplicaStatus::VersionChanged => {
-                &self.recoverable_first_version_changed_checks
+fn remove_exact_cache_entry(
+    cache: &moka::sync::SegmentedCache<String, NodeValueReplicaDesc>,
+    key: &str,
+    expected_desc: &NodeValueReplicaDesc,
+) -> bool {
+    matches!(
+        cache.entry(key.to_string()).and_compute_with(|current| {
+            if current.as_ref().is_some_and(|entry| {
+                entry.value().put_id == expected_desc.put_id
+                    && entry.value().weight_bytes == expected_desc.weight_bytes
+            }) {
+                moka::ops::compute::Op::Remove
+            } else {
+                moka::ops::compute::Op::Nop
             }
-            RecoverableReplicaStatus::RouteIneligible => {
-                &self.recoverable_first_route_ineligible_checks
-            }
-            RecoverableReplicaStatus::CpuRouteAbsent => {
-                &self.recoverable_first_cpu_route_absent_checks
-            }
-            RecoverableReplicaStatus::AtomicGroupIncomplete => {
-                &self.recoverable_first_atomic_group_incomplete_checks
-            }
-            RecoverableReplicaStatus::TpCohortIncomplete => {
-                &self.recoverable_first_tp_cohort_incomplete_checks
-            }
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
+        }),
+        moka::ops::compute::CompResult::Removed(_)
+    )
 }
 
 fn current_atomic_group_members(
     key: &str,
     route: &OneKvNodesRoutes,
     desc: &NodeValueReplicaDesc,
-) -> Result<Vec<msg_pack::PutAtomicGroupMember>, RecoverableReplicaStatus> {
+) -> Result<Vec<msg_pack::PutAtomicGroupMember>, CohortExpansionError> {
     let Some(group) = route.atomic_group.as_ref() else {
         return Ok(vec![msg_pack::PutAtomicGroupMember {
             key: key.to_string(),
@@ -874,7 +1389,7 @@ fn current_atomic_group_members(
         .iter()
         .any(|member| member.key == key && member.put_id == desc.put_id)
     {
-        return Err(RecoverableReplicaStatus::AtomicGroupIncomplete);
+        return Err(CohortExpansionError::AtomicGroupIncomplete);
     }
     Ok(group.members.clone())
 }
@@ -883,7 +1398,7 @@ fn current_tp_cohort_keys(
     key: &str,
     route: &OneKvNodesRoutes,
     desc: &NodeValueReplicaDesc,
-) -> Result<Vec<String>, RecoverableReplicaStatus> {
+) -> Result<Vec<String>, CohortExpansionError> {
     let current_members = current_atomic_group_members(key, route, desc)?;
     let Some(key_tp) = infer_sglang_tp_key(key) else {
         return Ok(current_members
@@ -901,10 +1416,10 @@ fn current_tp_cohort_keys(
     let mut logical_members = Vec::with_capacity(current_members.len());
     for member in current_members {
         let Some(member_tp) = infer_sglang_tp_key(&member.key) else {
-            return Err(RecoverableReplicaStatus::TpCohortIncomplete);
+            return Err(CohortExpansionError::TpCohortIncomplete);
         };
         if member_tp.rank != key_tp.rank || member_tp.size != key_tp.size {
-            return Err(RecoverableReplicaStatus::TpCohortIncomplete);
+            return Err(CohortExpansionError::TpCohortIncomplete);
         }
         logical_members.push(member_tp.logical_prefix.to_string());
     }
@@ -920,270 +1435,6 @@ fn current_tp_cohort_keys(
     Ok(cohort_keys)
 }
 
-fn intersect_remote_nodes(
-    common_remote_nodes: &mut Option<HashSet<String>>,
-    mut member_remote_nodes: HashSet<String>,
-    owner_node_id: &str,
-) -> Result<(), RecoverableReplicaStatus> {
-    member_remote_nodes.remove(owner_node_id);
-    if member_remote_nodes.is_empty() {
-        return Err(RecoverableReplicaStatus::CpuRouteAbsent);
-    }
-    match common_remote_nodes.as_mut() {
-        Some(common) => common.retain(|node_id| member_remote_nodes.contains(node_id)),
-        None => *common_remote_nodes = Some(member_remote_nodes),
-    }
-    if common_remote_nodes.as_ref().is_some_and(HashSet::is_empty) {
-        return Err(RecoverableReplicaStatus::AtomicGroupIncomplete);
-    }
-    Ok(())
-}
-
-fn validate_recoverable_group(
-    owner_node_id: &str,
-    expected_keys: &[String],
-    expected_put_ids: Option<&[PutIDForAKey]>,
-    route_lookup: &dyn Fn(&str) -> Option<Arc<OneKvNodesRoutes>>,
-    live_remote_nodes: &dyn Fn(&OneKvNodesRoutes) -> HashSet<String>,
-) -> Result<HashSet<String>, RecoverableReplicaStatus> {
-    if expected_put_ids.is_some_and(|put_ids| put_ids.len() != expected_keys.len()) {
-        return Err(RecoverableReplicaStatus::AtomicGroupIncomplete);
-    }
-    let Some(first_key) = expected_keys.first() else {
-        return Err(RecoverableReplicaStatus::AtomicGroupIncomplete);
-    };
-    let Some(first_route) = route_lookup(first_key) else {
-        return Err(RecoverableReplicaStatus::RouteAbsent);
-    };
-
-    if expected_keys.len() == 1 {
-        if expected_put_ids.is_some_and(|put_ids| first_route.put_id != put_ids[0]) {
-            return Err(RecoverableReplicaStatus::VersionChanged);
-        }
-        if first_route.lease_id.is_some() || first_route.atomic_group.is_some() {
-            return Err(RecoverableReplicaStatus::AtomicGroupIncomplete);
-        }
-        let mut common_remote_nodes = None;
-        intersect_remote_nodes(
-            &mut common_remote_nodes,
-            live_remote_nodes(&first_route),
-            owner_node_id,
-        )?;
-        return common_remote_nodes.ok_or(RecoverableReplicaStatus::CpuRouteAbsent);
-    }
-
-    let Some(group) = first_route.atomic_group.as_ref() else {
-        return Err(RecoverableReplicaStatus::AtomicGroupIncomplete);
-    };
-    if group.members.len() != expected_keys.len()
-        || group
-            .members
-            .iter()
-            .zip(expected_keys)
-            .any(|(member, expected_key)| member.key != *expected_key)
-        || expected_put_ids.is_some_and(|put_ids| {
-            group
-                .members
-                .iter()
-                .zip(put_ids)
-                .any(|(member, expected_put_id)| member.put_id != *expected_put_id)
-        })
-    {
-        return Err(RecoverableReplicaStatus::AtomicGroupIncomplete);
-    }
-
-    let mut common_remote_nodes = None;
-    for member in &group.members {
-        let Some(member_route) = route_lookup(&member.key) else {
-            return Err(RecoverableReplicaStatus::RouteAbsent);
-        };
-        if member_route.put_id != member.put_id
-            || member_route.lease_id.is_some()
-            || member_route.atomic_group.as_deref() != Some(group.as_ref())
-        {
-            return Err(RecoverableReplicaStatus::AtomicGroupIncomplete);
-        }
-        intersect_remote_nodes(
-            &mut common_remote_nodes,
-            live_remote_nodes(&member_route),
-            owner_node_id,
-        )?;
-    }
-    common_remote_nodes.ok_or(RecoverableReplicaStatus::CpuRouteAbsent)
-}
-
-fn validate_current_recoverable_group(
-    owner_node_id: &str,
-    route: &OneKvNodesRoutes,
-    current_members: &[msg_pack::PutAtomicGroupMember],
-    route_lookup: &dyn Fn(&str) -> Option<Arc<OneKvNodesRoutes>>,
-    live_remote_nodes: &dyn Fn(&OneKvNodesRoutes) -> HashSet<String>,
-) -> Result<HashSet<String>, RecoverableReplicaStatus> {
-    if current_members.len() == 1 {
-        let mut common_remote_nodes = None;
-        intersect_remote_nodes(
-            &mut common_remote_nodes,
-            live_remote_nodes(route),
-            owner_node_id,
-        )?;
-        return common_remote_nodes.ok_or(RecoverableReplicaStatus::CpuRouteAbsent);
-    }
-    let current_keys = current_members
-        .iter()
-        .map(|member| member.key.clone())
-        .collect::<Vec<_>>();
-    let current_put_ids = current_members
-        .iter()
-        .map(|member| member.put_id)
-        .collect::<Vec<_>>();
-    validate_recoverable_group(
-        owner_node_id,
-        &current_keys,
-        Some(&current_put_ids),
-        route_lookup,
-        live_remote_nodes,
-    )
-}
-
-fn route_recoverable_replica_status_with(
-    owner_node_id: &str,
-    key: &str,
-    route: &OneKvNodesRoutes,
-    desc: &NodeValueReplicaDesc,
-    route_lookup: &dyn Fn(&str) -> Option<Arc<OneKvNodesRoutes>>,
-    live_remote_nodes: &dyn Fn(&OneKvNodesRoutes) -> HashSet<String>,
-) -> RecoverableReplicaStatus {
-    if route.put_id != desc.put_id {
-        return RecoverableReplicaStatus::VersionChanged;
-    }
-    if route.lease_id.is_some() || !route_has_live_replica_on_node(route, owner_node_id) {
-        return RecoverableReplicaStatus::RouteIneligible;
-    }
-
-    let current_members = match current_atomic_group_members(key, route, desc) {
-        Ok(members) => members,
-        Err(status) => return status,
-    };
-    let Some(key_tp) = infer_sglang_tp_key(key) else {
-        return match validate_current_recoverable_group(
-            owner_node_id,
-            route,
-            &current_members,
-            route_lookup,
-            live_remote_nodes,
-        ) {
-            Ok(_) => RecoverableReplicaStatus::Recoverable,
-            Err(status) => status,
-        };
-    };
-    if key_tp.size == 1 {
-        return match validate_current_recoverable_group(
-            owner_node_id,
-            route,
-            &current_members,
-            route_lookup,
-            live_remote_nodes,
-        ) {
-            Ok(_) => RecoverableReplicaStatus::Recoverable,
-            Err(status) => status,
-        };
-    }
-
-    let mut logical_members = Vec::with_capacity(current_members.len());
-    for member in &current_members {
-        let Some(member_tp) = infer_sglang_tp_key(&member.key) else {
-            return RecoverableReplicaStatus::TpCohortIncomplete;
-        };
-        if member_tp.rank != key_tp.rank || member_tp.size != key_tp.size {
-            return RecoverableReplicaStatus::TpCohortIncomplete;
-        }
-        logical_members.push(member_tp.logical_prefix.to_string());
-    }
-
-    let mut cohort_remote_nodes: Option<HashSet<String>> = None;
-    for rank in 0..key_tp.size {
-        let peer_keys = logical_members
-            .iter()
-            .map(|logical_prefix| format!("{logical_prefix}_{rank}_{}", key_tp.size))
-            .collect::<Vec<_>>();
-        let rank_result = if rank == key_tp.rank {
-            validate_current_recoverable_group(
-                owner_node_id,
-                route,
-                &current_members,
-                route_lookup,
-                live_remote_nodes,
-            )
-        } else {
-            validate_recoverable_group(
-                owner_node_id,
-                &peer_keys,
-                None,
-                route_lookup,
-                live_remote_nodes,
-            )
-        };
-        let rank_remote_nodes = match rank_result {
-            Ok(nodes) => nodes,
-            Err(_) => return RecoverableReplicaStatus::TpCohortIncomplete,
-        };
-        match cohort_remote_nodes.as_mut() {
-            Some(common) => common.retain(|node_id| rank_remote_nodes.contains(node_id)),
-            None => cohort_remote_nodes = Some(rank_remote_nodes),
-        }
-        if cohort_remote_nodes.as_ref().is_some_and(HashSet::is_empty) {
-            return RecoverableReplicaStatus::TpCohortIncomplete;
-        }
-    }
-    if cohort_remote_nodes.is_some_and(|nodes| !nodes.is_empty()) {
-        RecoverableReplicaStatus::Recoverable
-    } else {
-        RecoverableReplicaStatus::TpCohortIncomplete
-    }
-}
-
-#[cfg(test)]
-fn route_has_recoverable_replica_with(
-    owner_node_id: &str,
-    key: &str,
-    route: &OneKvNodesRoutes,
-    desc: &NodeValueReplicaDesc,
-    route_lookup: &dyn Fn(&str) -> Option<Arc<OneKvNodesRoutes>>,
-    live_remote_nodes: &dyn Fn(&OneKvNodesRoutes) -> HashSet<String>,
-) -> bool {
-    route_recoverable_replica_status_with(
-        owner_node_id,
-        key,
-        route,
-        desc,
-        route_lookup,
-        live_remote_nodes,
-    ) == RecoverableReplicaStatus::Recoverable
-}
-
-fn route_recoverable_replica_status(
-    view: &MasterKvRouterView,
-    owner_node_id: &str,
-    key: &str,
-    route: &OneKvNodesRoutes,
-    desc: &NodeValueReplicaDesc,
-) -> RecoverableReplicaStatus {
-    route_recoverable_replica_status_with(
-        owner_node_id,
-        key,
-        route,
-        desc,
-        &|member_key| {
-            view.master_kv_router()
-                .inner()
-                .kv_routes
-                .get(member_key)
-                .map(|entry| entry.clone())
-        },
-        &|member_route| route_live_remote_cache_nodes(view, member_route),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1192,20 +1443,85 @@ mod tests {
 
     #[test]
     fn one_kv_nodes_routes_only_reserves_two_get_durable_slots() {
-        let routes = OneKvNodesRoutes {
+        let routes = Arc::new(OneKvNodesRoutes {
             put_id: (1, 0),
             lease_id: None,
             atomic_group: None,
             nodes_replicas: RwLock::new(HashMap::new()),
             get_durable_slots_used: AtomicU32::new(0),
-        };
+        });
 
-        assert!(routes.try_reserve_get_durable_slot());
-        assert!(routes.try_reserve_get_durable_slot());
-        assert!(!routes.try_reserve_get_durable_slot());
+        let first = routes.try_reserve_get_durable_slot().unwrap();
+        let second = routes.try_reserve_get_durable_slot().unwrap();
+        assert!(routes.try_reserve_get_durable_slot().is_none());
 
-        routes.release_get_durable_slot();
-        assert!(routes.try_reserve_get_durable_slot());
+        drop(first);
+        assert!(routes.try_reserve_get_durable_slot().is_some());
+        drop(second);
+    }
+
+    #[test]
+    fn durable_slot_token_returns_capacity_across_ten_fill_demote_cycles() {
+        let routes = Arc::new(OneKvNodesRoutes {
+            put_id: (1, 0),
+            lease_id: None,
+            atomic_group: None,
+            nodes_replicas: RwLock::new(HashMap::new()),
+            get_durable_slots_used: AtomicU32::new(0),
+        });
+
+        for cycle in 0..10 {
+            let reservation = routes
+                .try_reserve_get_durable_slot()
+                .expect("each fill must reacquire durable capacity after demotion");
+            assert_eq!(routes.get_durable_slots_used.load(Ordering::Acquire), 1);
+            let route_clone = reservation.clone();
+            drop(reservation);
+            assert_eq!(
+                routes.get_durable_slots_used.load(Ordering::Acquire),
+                1,
+                "route clone must retain the token during cycle {cycle}"
+            );
+            drop(route_clone);
+            assert_eq!(
+                routes.get_durable_slots_used.load(Ordering::Acquire),
+                0,
+                "demotion must return durable capacity during cycle {cycle}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_get_singleflight_is_same_owner_only_and_aba_safe() {
+        let table = Arc::new(PreparedGetRequesterTable::default());
+        let gpu0: NodeID = "gpu-owner-0".to_string().into();
+        let gpu1: NodeID = "gpu-owner-1".to_string().into();
+
+        let gpu0_first = table
+            .reserve("shared-key", &gpu0, 11)
+            .expect("first prepared Get on gpu0 must lead");
+        assert!(
+            table.reserve("shared-key", &gpu0, 12).is_none(),
+            "same owner cannot materialize a second candidate slot"
+        );
+        let gpu1_first = table
+            .reserve("shared-key", &gpu1, 13)
+            .expect("different requester owners remain parallel");
+        assert_eq!(table.active_get_id("shared-key", &gpu0), Some(11));
+        assert_eq!(table.active_get_id("shared-key", &gpu1), Some(13));
+
+        gpu0_first.release_now();
+        let gpu0_second = table
+            .reserve("shared-key", &gpu0, 14)
+            .expect("released owner identity can be reused");
+        // A delayed Drop/release of the old generation must not delete get 14.
+        gpu0_first.release_now();
+        assert_eq!(table.active_get_id("shared-key", &gpu0), Some(14));
+
+        drop(gpu0_second);
+        drop(gpu1_first);
+        assert_eq!(table.active_get_id("shared-key", &gpu0), None);
+        assert_eq!(table.active_get_id("shared-key", &gpu1), None);
     }
 
     #[test]
@@ -1220,7 +1536,7 @@ mod tests {
                 slot_index: 17,
                 slot_size: 8 * 1024 * 1024,
             },
-            reason: OwnerReclaimReason::Reserve,
+            reason: OwnerReclaimReason::OwnerCapacityEviction,
         };
 
         let get_lease = table
@@ -1284,11 +1600,7 @@ mod tests {
         assert!(table.is_quiescent("retired-clone"));
     }
 
-    fn test_route_info(node_id: &str, tomb: bool) -> KvRouteInfo {
-        let tomb_tag = NodeTombTag::new();
-        if tomb {
-            tomb_tag.set_tomb();
-        }
+    fn test_route_info_with_tag(node_id: &str, tomb_tag: NodeTombTag) -> KvRouteInfo {
         KvRouteInfo {
             node_id: node_id.to_string().into(),
             backing: KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
@@ -1301,7 +1613,38 @@ mod tests {
                 base_addr: 0,
             }),
             owner_local_indexed: true,
+            get_durable_reservation: None,
+            capacity_reservation: None,
             tomb_tag,
+        }
+    }
+
+    fn test_route_info(node_id: &str, tomb: bool) -> KvRouteInfo {
+        let tomb_tag = NodeTombTag::new();
+        if tomb {
+            tomb_tag.set_tomb();
+        }
+        test_route_info_with_tag(node_id, tomb_tag)
+    }
+
+    fn test_allocation_route_info(node_id: &str, owner_local_indexed: bool) -> KvRouteInfo {
+        let allocator = Arc::new(
+            crate::master_seg_manager::one_seg_allocator::OneSegAllocator::new(
+                format!("{node_id}-segment"),
+                crate::master_seg_manager::msg_pack::SegmentDeviceDescription::Cpu,
+                0,
+                4096,
+            )
+            .unwrap(),
+        );
+        let allocation = allocator.allocate(1024).unwrap();
+        KvRouteInfo {
+            node_id: node_id.to_string().into(),
+            backing: KvReplicaBacking::Allocation(Arc::new(allocation)),
+            owner_local_indexed,
+            get_durable_reservation: None,
+            capacity_reservation: None,
+            tomb_tag: NodeTombTag::new(),
         }
     }
 
@@ -1326,123 +1669,279 @@ mod tests {
         }
     }
 
-    fn test_remote_nodes(route: &OneKvNodesRoutes) -> HashSet<String> {
-        route
-            .nodes_replicas
-            .read()
-            .iter()
-            .filter_map(|(node_id, replica)| {
-                (!replica.tomb_tag.is_tomb() && node_id.as_ref().starts_with("cpu"))
-                    .then(|| node_id.as_ref().to_string())
-            })
-            .collect()
+    #[test]
+    fn ring_b_admission_depends_on_backing_and_local_index_not_node_role() {
+        let node: NodeID = "same-node".to_string().into();
+        let make_route = |lease_id, replica| OneKvNodesRoutes {
+            put_id: (91, 3),
+            lease_id,
+            atomic_group: None,
+            nodes_replicas: RwLock::new(HashMap::from([(node.clone(), replica)])),
+            get_durable_slots_used: AtomicU32::new(0),
+        };
+
+        let unindexed = make_route(None, test_allocation_route_info("same-node", false));
+        let desc = ring_b_route_replica_desc(&unindexed, "same-node")
+            .expect("unindexed Allocation must enter ring B on any node role");
+        assert_eq!(desc.put_id, (91, 3));
+        assert_eq!(desc.weight_bytes, 4096);
+
+        let indexed = make_route(None, test_allocation_route_info("same-node", true));
+        assert!(ring_b_route_replica_desc(&indexed, "same-node").is_none());
+
+        let leased = make_route(Some(7), test_allocation_route_info("same-node", false));
+        assert!(ring_b_route_replica_desc(&leased, "same-node").is_none());
+
+        let mut committed = test_route_info("same-node", false);
+        committed.owner_local_indexed = false;
+        let committed = make_route(None, committed);
+        assert!(ring_b_route_replica_desc(&committed, "same-node").is_none());
     }
 
     #[test]
-    fn recoverable_route_requires_live_local_and_live_remote_cache_same_version() {
-        let desc = NodeValueReplicaDesc {
-            weight_bytes: 1024,
-            put_id: (7, 3),
-        };
-        let no_lookup = |_key: &str| None;
-        let recoverable = |route: &OneKvNodesRoutes| {
-            route_has_recoverable_replica_with(
-                "gpu0",
-                "k",
-                route,
-                &desc,
-                &no_lookup,
-                &test_remote_nodes,
-            )
-        };
+    fn member_left_cleanup_removes_only_the_exact_tomb_generation() {
+        let routes = DashMap::new();
+        let departed_tag = NodeTombTag::new();
+        departed_tag.set_tomb();
+        let live_reconnect_tag = NodeTombTag::new();
+        let newer_tomb_tag = NodeTombTag::new();
+        newer_tomb_tag.set_tomb();
 
-        let cpu_copy = test_route((7, 3), None, vec![("gpu0", false), ("cpu0", false)]);
-        assert!(recoverable(&cpu_copy));
-
-        let local_only = test_route((7, 3), None, vec![("gpu0", false)]);
-        assert!(!recoverable(&local_only));
-
-        let gpu_copy = test_route((7, 3), None, vec![("gpu0", false), ("gpu1", false)]);
-        assert!(!recoverable(&gpu_copy));
-
-        let remote_tomb = test_route((7, 3), None, vec![("gpu0", false), ("cpu0", true)]);
-        assert!(!recoverable(&remote_tomb));
-
-        let local_tomb = test_route((7, 3), None, vec![("gpu0", true), ("cpu0", false)]);
-        assert!(!recoverable(&local_tomb));
-
-        let stale = test_route((8, 0), None, vec![("gpu0", false), ("cpu0", false)]);
-        assert!(!recoverable(&stale));
-
-        let leased = test_route((7, 3), Some(11), vec![("gpu0", false), ("cpu0", false)]);
-        assert!(!recoverable(&leased));
-    }
-
-    #[test]
-    fn recoverable_atomic_group_requires_one_common_remote_cache_owner() {
-        let group = Arc::new(PutAtomicGroup {
-            members: vec![
-                msg_pack::PutAtomicGroupMember {
-                    key: "k0".to_string(),
-                    put_id: (7, 0),
-                },
-                msg_pack::PutAtomicGroupMember {
-                    key: "k1".to_string(),
-                    put_id: (7, 1),
-                },
-            ],
+        let departed_route = Arc::new(OneKvNodesRoutes {
+            put_id: (10, 0),
+            lease_id: None,
+            atomic_group: None,
+            nodes_replicas: RwLock::new(HashMap::from([(
+                "owner".to_string().into(),
+                test_route_info_with_tag("owner", departed_tag.clone()),
+            )])),
+            get_durable_slots_used: AtomicU32::new(0),
         });
-        let make_route = |put_id, remote_node: Option<&str>| {
-            let mut replicas = vec![("gpu0", false)];
-            if let Some(remote_node) = remote_node {
-                replicas.push((remote_node, false));
-            }
-            let mut route = test_route(put_id, None, replicas);
-            route.atomic_group = Some(group.clone());
-            Arc::new(route)
-        };
-        let desc = NodeValueReplicaDesc {
-            weight_bytes: 1024,
-            put_id: (7, 0),
-        };
+        let live_route = Arc::new(OneKvNodesRoutes {
+            put_id: (11, 0),
+            lease_id: None,
+            atomic_group: None,
+            nodes_replicas: RwLock::new(HashMap::from([(
+                "owner".to_string().into(),
+                test_route_info_with_tag("owner", live_reconnect_tag),
+            )])),
+            get_durable_slots_used: AtomicU32::new(0),
+        });
+        let newer_tomb_route = Arc::new(OneKvNodesRoutes {
+            put_id: (12, 0),
+            lease_id: None,
+            atomic_group: None,
+            nodes_replicas: RwLock::new(HashMap::from([(
+                "owner".to_string().into(),
+                test_route_info_with_tag("owner", newer_tomb_tag),
+            )])),
+            get_durable_slots_used: AtomicU32::new(0),
+        });
+        routes.insert("departed".to_string(), departed_route.clone());
+        routes.insert("live".to_string(), live_route.clone());
+        routes.insert("newer-tomb".to_string(), newer_tomb_route.clone());
 
-        let k0 = make_route((7, 0), Some("cpu0"));
-        let k1 = make_route((7, 1), Some("cpu0"));
-        let routes = HashMap::from([("k0".to_string(), k0.clone()), ("k1".to_string(), k1)]);
-        assert!(route_has_recoverable_replica_with(
-            "gpu0",
-            "k0",
-            &k0,
-            &desc,
-            &|key| routes.get(key).cloned(),
-            &test_remote_nodes,
-        ));
+        assert_eq!(
+            remove_departed_generation_from_route(
+                &routes,
+                "departed",
+                &departed_route,
+                "owner",
+                &departed_tag,
+            ),
+            Some((10, 0))
+        );
+        assert!(routes.get("departed").is_none());
+        assert_eq!(
+            remove_departed_generation_from_route(
+                &routes,
+                "live",
+                &live_route,
+                "owner",
+                &departed_tag,
+            ),
+            None
+        );
+        assert!(
+            live_route
+                .nodes_replicas
+                .read()
+                .get("owner")
+                .is_some_and(|replica| !replica.tomb_tag.is_tomb())
+        );
+        assert_eq!(
+            remove_departed_generation_from_route(
+                &routes,
+                "newer-tomb",
+                &newer_tomb_route,
+                "owner",
+                &departed_tag,
+            ),
+            None
+        );
+        assert!(newer_tomb_route.nodes_replicas.read().contains_key("owner"));
+    }
 
-        let split_k1 = make_route((7, 1), Some("cpu1"));
-        let split_routes =
-            HashMap::from([("k0".to_string(), k0.clone()), ("k1".to_string(), split_k1)]);
-        assert!(!route_has_recoverable_replica_with(
-            "gpu0",
-            "k0",
-            &k0,
-            &desc,
-            &|key| split_routes.get(key).cloned(),
-            &test_remote_nodes,
-        ));
+    #[test]
+    fn member_left_empty_route_removal_is_arc_identity_aba_safe() {
+        let routes = DashMap::new();
+        let departed_tag = NodeTombTag::new();
+        departed_tag.set_tomb();
+        let old_route = Arc::new(OneKvNodesRoutes {
+            put_id: (20, 0),
+            lease_id: None,
+            atomic_group: None,
+            nodes_replicas: RwLock::new(HashMap::from([(
+                "owner".to_string().into(),
+                test_route_info_with_tag("owner", departed_tag.clone()),
+            )])),
+            get_durable_slots_used: AtomicU32::new(0),
+        });
+        let replacement = Arc::new(test_route((21, 0), None, vec![("peer", false)]));
+        routes.insert("aba".to_string(), old_route.clone());
+        routes.insert("aba".to_string(), replacement.clone());
 
-        let partial_k1 = make_route((7, 1), None);
-        let partial_routes = HashMap::from([
-            ("k0".to_string(), k0.clone()),
-            ("k1".to_string(), partial_k1),
-        ]);
-        assert!(!route_has_recoverable_replica_with(
-            "gpu0",
-            "k0",
-            &k0,
-            &desc,
-            &|key| partial_routes.get(key).cloned(),
-            &test_remote_nodes,
+        assert_eq!(
+            remove_departed_generation_from_route(
+                &routes,
+                "aba",
+                &old_route,
+                "owner",
+                &departed_tag,
+            ),
+            None
+        );
+        let current = routes.get("aba").expect("replacement route must survive");
+        assert!(Arc::ptr_eq(current.value(), &replacement));
+        assert!(
+            current
+                .nodes_replicas
+                .read()
+                .get("peer")
+                .is_some_and(|replica| !replica.tomb_tag.is_tomb())
+        );
+    }
+
+    #[test]
+    fn replica_publish_fence_never_overwrites_live_or_publishes_tomb_generation() {
+        let old_tag = NodeTombTag::new();
+        let route = test_route((30, 0), None, vec![]);
+        route.nodes_replicas.write().insert(
+            "owner".to_string().into(),
+            test_route_info_with_tag("owner", old_tag.clone()),
+        );
+
+        let contender_tag = NodeTombTag::new();
+        assert!(!publish_route_replica_tomb_fenced(
+            &route,
+            "owner".to_string().into(),
+            test_route_info_with_tag("owner", contender_tag),
         ));
+        assert!(
+            route
+                .nodes_replicas
+                .read()
+                .get("owner")
+                .is_some_and(|replica| replica.tomb_tag.same_generation(&old_tag))
+        );
+
+        old_tag.set_tomb();
+        let replacement_tag = NodeTombTag::new();
+        assert!(publish_route_replica_tomb_fenced(
+            &route,
+            "owner".to_string().into(),
+            test_route_info_with_tag("owner", replacement_tag.clone()),
+        ));
+        assert!(
+            route
+                .nodes_replicas
+                .read()
+                .get("owner")
+                .is_some_and(|replica| replica.tomb_tag.same_generation(&replacement_tag))
+        );
+
+        let departed_tag = NodeTombTag::new();
+        departed_tag.set_tomb();
+        assert!(!publish_route_replica_tomb_fenced(
+            &route,
+            "departed".to_string().into(),
+            test_route_info_with_tag("departed", departed_tag),
+        ));
+        assert!(!route.nodes_replicas.read().contains_key("departed"));
+    }
+
+    #[test]
+    fn primary_publish_fence_restores_previous_route_on_tomb_generation() {
+        let routes = DashMap::new();
+        let previous = Arc::new(test_route((40, 0), None, vec![("peer", false)]));
+        routes.insert("key".to_string(), previous.clone());
+
+        let departed_tag = NodeTombTag::new();
+        departed_tag.set_tomb();
+        let rejected = Arc::new(OneKvNodesRoutes {
+            put_id: (41, 0),
+            lease_id: None,
+            atomic_group: None,
+            nodes_replicas: RwLock::new(HashMap::from([(
+                "owner".to_string().into(),
+                test_route_info_with_tag("owner", departed_tag.clone()),
+            )])),
+            get_durable_slots_used: AtomicU32::new(0),
+        });
+        assert!(
+            publish_primary_route_tomb_fenced(&routes, "key", rejected, &departed_tag).is_err()
+        );
+        assert!(
+            routes
+                .get("key")
+                .is_some_and(|route| Arc::ptr_eq(route.value(), &previous))
+        );
+
+        let live_tag = NodeTombTag::new();
+        let accepted = Arc::new(OneKvNodesRoutes {
+            put_id: (42, 0),
+            lease_id: None,
+            atomic_group: None,
+            nodes_replicas: RwLock::new(HashMap::from([(
+                "owner".to_string().into(),
+                test_route_info_with_tag("owner", live_tag.clone()),
+            )])),
+            get_durable_slots_used: AtomicU32::new(0),
+        });
+        let replaced =
+            publish_primary_route_tomb_fenced(&routes, "key", accepted.clone(), &live_tag)
+                .expect("live generation must publish")
+                .expect("previous route must be returned");
+        assert!(Arc::ptr_eq(&replaced, &previous));
+        assert!(
+            routes
+                .get("key")
+                .is_some_and(|route| Arc::ptr_eq(route.value(), &accepted))
+        );
+    }
+
+    #[test]
+    fn reserved_capacity_counters_are_generation_and_arc_scoped() {
+        let old_tag = NodeTombTag::new();
+        let new_tag = NodeTombTag::new();
+        let old = Arc::new(NodeCacheReservedCapacity::new(old_tag.clone()));
+        let new = Arc::new(NodeCacheReservedCapacity::new(new_tag.clone()));
+
+        old.apply_delta(ReservedCapacityReason::LeaseBoundKv, 4096);
+        new.apply_delta(ReservedCapacityReason::LeaseBoundKv, 8192);
+        old_tag.set_tomb();
+        old.apply_delta(ReservedCapacityReason::LeaseBoundKv, -4096);
+
+        assert_eq!(old.total_reserved_bytes(), 0);
+        assert_eq!(new.total_reserved_bytes(), 8192);
+        assert!(!old.generation.same_generation(&new.generation));
+        assert!(!new_tag.is_tomb());
+    }
+
+    #[test]
+    fn delayed_member_left_is_not_forwarded_to_a_live_generation_actor() {
+        assert!(member_left_can_forward_to_registration_actor(None));
+        assert!(!member_left_can_forward_to_registration_actor(Some(17)));
     }
 
     #[test]
@@ -1462,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_atomic_group_requires_complete_tp_cohort_on_one_cpu_owner() {
+    fn tp_cohort_expansion_preserves_every_atomic_member_across_ranks() {
         let rank0_group = Arc::new(PutAtomicGroup {
             members: vec![
                 msg_pack::PutAtomicGroupMember {
@@ -1475,37 +1974,8 @@ mod tests {
                 },
             ],
         });
-        let rank1_group = Arc::new(PutAtomicGroup {
-            members: vec![
-                msg_pack::PutAtomicGroupMember {
-                    key: "page0_model_1_2".to_string(),
-                    put_id: (11, 0),
-                },
-                msg_pack::PutAtomicGroupMember {
-                    key: "page1_model_1_2".to_string(),
-                    put_id: (11, 1),
-                },
-            ],
-        });
-        let make_route = |put_id, group: Arc<PutAtomicGroup>, remote_node: Option<&str>| {
-            let mut replicas = vec![("gpu0", false)];
-            if let Some(remote_node) = remote_node {
-                replicas.push((remote_node, false));
-            }
-            let mut route = test_route(put_id, None, replicas);
-            route.atomic_group = Some(group);
-            Arc::new(route)
-        };
-        let rank0_page0 = make_route((10, 0), rank0_group.clone(), Some("cpu0"));
-        let rank0_page1 = make_route((10, 1), rank0_group.clone(), Some("cpu0"));
-        let rank1_page0 = make_route((11, 0), rank1_group.clone(), Some("cpu0"));
-        let rank1_page1 = make_route((11, 1), rank1_group.clone(), Some("cpu0"));
-        let routes = HashMap::from([
-            ("page0_model_0_2".to_string(), rank0_page0.clone()),
-            ("page1_model_0_2".to_string(), rank0_page1),
-            ("page0_model_1_2".to_string(), rank1_page0),
-            ("page1_model_1_2".to_string(), rank1_page1),
-        ]);
+        let mut rank0_page0 = test_route((10, 0), None, vec![("gpu0", false)]);
+        rank0_page0.atomic_group = Some(rank0_group);
         let desc = NodeValueReplicaDesc {
             weight_bytes: 1024,
             put_id: (10, 0),
@@ -1519,95 +1989,16 @@ mod tests {
                 "page1_model_1_2",
             ]
         );
-        assert!(route_has_recoverable_replica_with(
-            "gpu0",
-            "page0_model_0_2",
-            &rank0_page0,
-            &desc,
-            &|key| routes.get(key).cloned(),
-            &test_remote_nodes,
-        ));
-
-        let missing_peer_routes = routes
-            .iter()
-            .filter(|(key, _)| key.as_str() != "page1_model_1_2")
-            .map(|(key, route)| (key.clone(), route.clone()))
-            .collect::<HashMap<_, _>>();
-        assert_eq!(
-            route_recoverable_replica_status_with(
-                "gpu0",
-                "page0_model_0_2",
-                &rank0_page0,
-                &desc,
-                &|key| missing_peer_routes.get(key).cloned(),
-                &test_remote_nodes,
-            ),
-            RecoverableReplicaStatus::TpCohortIncomplete
-        );
-
-        let rank1_page0_cpu1 = make_route((11, 0), rank1_group.clone(), Some("cpu1"));
-        let rank1_page1_cpu1 = make_route((11, 1), rank1_group, Some("cpu1"));
-        let split_cpu_routes = routes
-            .iter()
-            .map(|(key, route)| (key.clone(), route.clone()))
-            .chain([
-                ("page0_model_1_2".to_string(), rank1_page0_cpu1),
-                ("page1_model_1_2".to_string(), rank1_page1_cpu1),
-            ])
-            .collect::<HashMap<_, _>>();
-        assert!(!route_has_recoverable_replica_with(
-            "gpu0",
-            "page0_model_0_2",
-            &rank0_page0,
-            &desc,
-            &|key| split_cpu_routes.get(key).cloned(),
-            &test_remote_nodes,
-        ));
     }
 
     #[test]
-    fn recoverable_single_page_requires_all_tp_ranks() {
-        let rank0 = Arc::new(test_route(
-            (20, 0),
-            None,
-            vec![("gpu0", false), ("cpu0", false)],
-        ));
-        let rank1 = Arc::new(test_route(
-            (21, 0),
-            None,
-            vec![("gpu0", false), ("cpu0", false)],
-        ));
-        let desc = NodeValueReplicaDesc {
-            weight_bytes: 1024,
-            put_id: (20, 0),
-        };
-        let complete = HashMap::from([
-            ("page_model_0_2".to_string(), rank0.clone()),
-            ("page_model_1_2".to_string(), rank1),
-        ]);
-        assert!(route_has_recoverable_replica_with(
-            "gpu0",
-            "page_model_0_2",
-            &rank0,
-            &desc,
-            &|key| complete.get(key).cloned(),
-            &test_remote_nodes,
-        ));
-
-        let rank0_only = HashMap::from([("page_model_0_2".to_string(), rank0.clone())]);
-        assert!(!route_has_recoverable_replica_with(
-            "gpu0",
-            "page_model_0_2",
-            &rank0,
-            &desc,
-            &|key| rank0_only.get(key).cloned(),
-            &test_remote_nodes,
-        ));
-    }
-
-    #[test]
-    fn owner_hot_demotion_rejects_the_whole_cohort_before_moka_selection() {
-        let expected_entries = HashMap::from([
+    fn exact_cache_detach_rolls_back_identity_mismatch() {
+        let cache = moka::sync::SegmentedCache::builder(8)
+            .weigher(Box::new(|_key: &String, desc: &NodeValueReplicaDesc| {
+                desc.weight_bytes
+            }))
+            .build();
+        let actual = HashMap::from([
             (
                 "rank0".to_string(),
                 NodeValueReplicaDesc {
@@ -1623,77 +2014,48 @@ mod tests {
                 },
             ),
         ]);
-        let cache = moka::sync::SegmentedCache::builder(8)
-            .weigher(Box::new(|_key: &String, desc: &NodeValueReplicaDesc| {
-                desc.weight_bytes
-            }))
-            .build();
-        for (key, desc) in &expected_entries {
+        for (key, desc) in &actual {
             cache.insert(key.clone(), desc.clone());
         }
-        cache.run_pending_tasks();
+        let mut stale_expected = actual.clone();
+        stale_expected.get_mut("rank1").unwrap().put_id = (999, 0);
 
-        let selected_weight = recoverable_cohort_weight(&expected_entries, |key, _desc| {
-            if key == "rank0" {
-                RecoverableReplicaStatus::Recoverable
-            } else {
-                RecoverableReplicaStatus::TpCohortIncomplete
-            }
-        })
-        .map_or(0, |expected_weight| {
-            cache.evict_some_if(expected_weight, |candidate_key, candidate_desc| {
-                expected_entries.get(candidate_key).is_some_and(|expected| {
-                    expected.put_id == candidate_desc.put_id
-                        && expected.weight_bytes == candidate_desc.weight_bytes
-                })
-            })
-        });
+        assert!(take_exact_cache_entries(&cache, &stale_expected).is_none());
+        assert_eq!(cache.get("rank0").unwrap().put_id, (30, 0));
+        assert_eq!(cache.get("rank1").unwrap().put_id, (31, 0));
 
-        assert_eq!(selected_weight, 0);
-        assert!(cache.get("rank0").is_some());
-        assert!(cache.get("rank1").is_some());
+        let removed = take_exact_cache_entries(&cache, &actual).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(cache.get("rank0").is_none());
+        assert!(cache.get("rank1").is_none());
     }
 
     #[test]
-    fn unrecoverable_fallback_is_only_for_last_level_or_no_remote_tier() {
-        assert!(allow_unrecoverable_cache_eviction(
-            false,
-            false,
-            UnrecoverableCacheEvictionContext::NormalCapacity,
-        ));
-        assert!(!allow_unrecoverable_cache_eviction(
-            false,
-            true,
-            UnrecoverableCacheEvictionContext::NormalCapacity,
-        ));
-        assert!(allow_unrecoverable_cache_eviction(
-            true,
-            true,
-            UnrecoverableCacheEvictionContext::NormalCapacity,
-        ));
-        assert!(allow_unrecoverable_cache_eviction(
-            false,
-            true,
-            UnrecoverableCacheEvictionContext::OwnerLocalReserveNoSpace,
-        ));
-    }
-
-    #[test]
-    fn unbounded_segmented_metadata_cache_only_evicts_when_requested() {
+    fn ring_b_cache_is_bounded_for_every_node_role() {
         let cache = moka::sync::SegmentedCache::builder(8)
+            .max_capacity(64)
             .weigher(Box::new(|_key: &u64, weight: &u32| *weight))
             .build();
-        assert_eq!(cache.policy().max_capacity(), None);
+        assert_eq!(cache.policy().max_capacity(), Some(64));
 
         for key in 0..128 {
             cache.insert(key, 8);
         }
         cache.run_pending_tasks();
-        assert_eq!(cache.weighted_size(), 1024);
+        assert!(cache.weighted_size() <= 64);
+    }
 
-        let evicted = cache.evict_some_if(64, |_key, _weight| true);
-        assert!(evicted >= 64);
-        assert_eq!(cache.weighted_size(), 1024 - evicted);
+    #[test]
+    fn ring_b_live_capacity_update_never_clears_boundary() {
+        let cache = moka::sync::SegmentedCache::builder(8)
+            .max_capacity(1024)
+            .weigher(Box::new(|_key: &u64, weight: &u32| *weight))
+            .build();
+        assert_eq!(cache.policy().max_capacity(), Some(1024));
+        cache.set_max_capacity(512).unwrap();
+        assert_eq!(cache.policy().max_capacity(), Some(512));
+        cache.set_max_capacity(2048).unwrap();
+        assert_eq!(cache.policy().max_capacity(), Some(2048));
     }
 
     #[test]
@@ -1709,6 +2071,139 @@ mod tests {
 
         subtract_pending_eviction_weight(&pending, "owner", weight);
         assert_eq!(pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cohort_reclaim_identity_registration_is_all_or_nothing() {
+        let request = |keys: &[&str]| reclaim::EvictionReclaimRequest {
+            owner_node_id: "cpu0".to_string(),
+            owner_node_start_time: None,
+            members: keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| reclaim::EvictionReclaimMember {
+                    key: (*key).to_string(),
+                    desc: NodeValueReplicaDesc {
+                        weight_bytes: 1024,
+                        put_id: (7, index as u32),
+                    },
+                    expected_backing: None,
+                })
+                .collect(),
+            origin: reclaim::EvictionReclaimOrigin::MasterAllocationCapacity,
+            retry_count: 0,
+        };
+        let inflight = DashSet::new();
+        let first = request(&["a", "b"]);
+        assert!(try_install_eviction_reclaim_identities(
+            &inflight,
+            first.identities(),
+        ));
+        assert_eq!(inflight.len(), 2);
+        assert_eq!(
+            classify_existing_eviction_reclaim(&inflight, &first.identities()),
+            reclaim::EnqueueEvictionReclaimResult::AlreadyInProgress
+        );
+
+        // `c` is tentatively installed before the collision on `a`; failure
+        // must roll it back and preserve only the original cohort.
+        let overlapping = reclaim::EvictionReclaimRequest {
+            members: vec![
+                reclaim::EvictionReclaimMember {
+                    key: "c".to_string(),
+                    desc: NodeValueReplicaDesc {
+                        weight_bytes: 1024,
+                        put_id: (7, 2),
+                    },
+                    expected_backing: None,
+                },
+                first.members[0].clone(),
+            ],
+            ..request(&[])
+        };
+        let tentative_identity = overlapping.identities()[0].clone();
+        assert!(!try_install_eviction_reclaim_identities(
+            &inflight,
+            overlapping.identities(),
+        ));
+        assert_eq!(inflight.len(), 2);
+        assert!(!inflight.contains(&tentative_identity));
+        assert_eq!(
+            classify_existing_eviction_reclaim(&inflight, &overlapping.identities()),
+            reclaim::EnqueueEvictionReclaimResult::PartialOverlap
+        );
+
+        for identity in first.identities() {
+            assert!(inflight.remove(&identity).is_some());
+        }
+        assert_eq!(
+            classify_existing_eviction_reclaim(&inflight, &first.identities()),
+            reclaim::EnqueueEvictionReclaimResult::NotInProgress
+        );
+    }
+
+    #[test]
+    fn eviction_reclaim_metadata_channel_does_not_drop_at_old_queue_limit() {
+        let (tx, mut rx) = ampsc::unbounded_channel();
+        let count = 4096 * 2 + 1;
+        for index in 0..count {
+            tx.send(reclaim::EvictionReclaimRequest {
+                owner_node_id: "cpu0".to_string(),
+                owner_node_start_time: None,
+                members: vec![reclaim::EvictionReclaimMember {
+                    key: format!("key-{index}"),
+                    desc: NodeValueReplicaDesc {
+                        weight_bytes: 4096,
+                        put_id: (7, index as u32),
+                    },
+                    expected_backing: None,
+                }],
+                origin: reclaim::EvictionReclaimOrigin::MasterAllocationCapacity,
+                retry_count: 0,
+            })
+            .unwrap();
+        }
+        assert_eq!((0..count).filter(|_| rx.try_recv().is_ok()).count(), count);
+    }
+
+    #[test]
+    fn closed_lossless_channel_rolls_back_identity_accounting_and_metadata() {
+        let cache = moka::sync::SegmentedCache::builder(8).build();
+        let request = reclaim::EvictionReclaimRequest {
+            owner_node_id: "cpu0".to_string(),
+            owner_node_start_time: None,
+            members: vec![reclaim::EvictionReclaimMember {
+                key: "closed-channel".to_string(),
+                desc: NodeValueReplicaDesc {
+                    weight_bytes: 4096,
+                    put_id: (7, 1),
+                },
+                expected_backing: None,
+            }],
+            origin: reclaim::EvictionReclaimOrigin::MasterAllocationCapacity,
+            retry_count: 0,
+        };
+        let inflight = DashSet::new();
+        assert!(try_install_eviction_reclaim_identities(
+            &inflight,
+            request.identities(),
+        ));
+        let pending = AtomicU64::new(request.weight_bytes());
+        let (tx, rx) = ampsc::unbounded_channel();
+        drop(rx);
+
+        let returned = tx.send(request).unwrap_err().0;
+        for identity in returned.identities() {
+            assert!(inflight.remove(&identity).is_some());
+        }
+        subtract_pending_eviction_weight(&pending, "cpu0", returned.weight_bytes());
+        for member in returned.members {
+            cache.insert(member.key, member.desc);
+        }
+
+        assert!(inflight.is_empty());
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert!(cache.get("closed-channel").is_some());
     }
 
     fn new_test_member(metadata: HashMap<String, String>) -> ClusterMember {
@@ -1795,7 +2290,11 @@ pub struct MasterKvRouterInner {
     pub inflight_puts: moka::future::Cache<(String, u64, u32), InflightPutInfo>,
     pub inflight_replica_tasks: moka::future::Cache<(String, u64, u32), InflightReplicaTaskInfo>,
     pub inflight_gets: moka::future::Cache<u64, InflightGetInfo>,
+    /// Idempotent terminal GetDone results retained across response loss/retry.
+    pub completed_gets: moka::future::Cache<u64, CompletedGetInfo>,
+    pub get_done_locks: AMapLock<u64>,
     pub(crate) key_activity: Arc<MasterKeyActivityTable>,
+    pub(crate) prepared_get_requesters: Arc<PreparedGetRequesterTable>,
 
     /// Cache for holding get operations (owned, flattened by (node_id, holder_id))
     pub get_holding: MasterOwnerMemMgr,
@@ -1821,11 +2320,6 @@ pub struct MasterKvRouterInner {
     /// Interns recent multi-key put groups so all member routes share one descriptor.
     put_atomic_groups: moka::sync::SegmentedCache<(String, u64, u32), Arc<PutAtomicGroup>>,
 
-    /// Serializes route-level existence checks with cache-eviction route cleanup.
-    /// This protects route metadata consistency only; it does not create MemHolders
-    /// or move payload data.
-    pub route_lifetime_lock: Mutex<()>,
-
     /// Grants reserved for owner-local hot-path staging.
     pub local_reserve_grants: DashMap<u64, LocalReserveGrantInfo>,
 
@@ -1839,8 +2333,9 @@ pub struct MasterKvRouterInner {
     pub node_kv_cache_controller:
         DashMap<NodeIDString, Arc<moka::sync::SegmentedCache<String, NodeValueReplicaDesc>>>,
 
-    /// Inclusive hot tier. L1 eviction starts a remote-only replica task while the owner copy
-    /// remains governed by `node_kv_cache_controller` at its unchanged resident capacity.
+    /// Independent pre-writeback tier. Its Size eviction starts a replica task
+    /// while owner residency remains governed by the owner's local hot cache;
+    /// `node_kv_cache_controller` tracks ring B only.
     pub node_writeback_tier1_controller:
         DashMap<NodeIDString, Arc<moka::sync::SegmentedCache<String, NodeValueReplicaDesc>>>,
 
@@ -1852,14 +2347,21 @@ pub struct MasterKvRouterInner {
     /// Moka weight already removed and queued for owner-side safe reclaim.
     pub eviction_reclaim_pending_weight: DashMap<NodeIDString, Arc<AtomicU64>>,
 
+    /// Exact, versioned metadata identities currently owned by the lossless
+    /// eviction-reclaim pipeline.  This bounds duplicate Size/cohort events;
+    /// payload memory is not retained here.
+    pub(crate) eviction_reclaim_inflight: DashSet<reclaim::EvictionReclaimIdentity>,
+
     /// Per-owner reclaim lifecycle counters. These distinguish transient holder/activity
     /// deferrals from terminal route changes and bounded retry restoration.
     pub(crate) eviction_reclaim_counters: DashMap<NodeIDString, Arc<EvictionReclaimCounters>>,
 
-    /// Serializes all append completions for one logical TP/atomic cohort. Without this lock,
-    /// several member completions can pass the recoverability precheck together and concurrently
-    /// select overlapping subsets from Moka.
-    owner_hot_demotion_locks: AMapLock<String>,
+    /// Async admission gate in front of Moka's synchronous housekeeper lock.
+    /// Bounded maintenance can still process a batch of Size evictions; without
+    /// this gate, concurrent async tasks can park multiple Tokio workers on the
+    /// same blocking Moka lock. It is a scheduling gate, not a correctness or
+    /// cohort lock, and no cache/global scan occurs under it.
+    pub(crate) owner_cache_operation_locks: AMapLock<String>,
 
     /// Historical final put placement decisions by target node.
     pub put_target_decision_counts: DashMap<NodeIDString, Arc<AtomicU64>>,
@@ -1884,8 +2386,8 @@ pub struct MasterKvRouterInner {
     pub delete_broadcast: EnsureMemholderMgmtDeleteHandle<DeleteKeyInfo>,
     post_route_maintenance_tx: ampsc::Sender<route_maintenance::RoutePublishEvent>,
     post_route_maintenance_rx: Mutex<Option<ampsc::Receiver<route_maintenance::RoutePublishEvent>>>,
-    eviction_reclaim_tx: ampsc::Sender<reclaim::EvictionReclaimRequest>,
-    eviction_reclaim_rx: Mutex<Option<ampsc::Receiver<reclaim::EvictionReclaimRequest>>>,
+    eviction_reclaim_tx: ampsc::UnboundedSender<reclaim::EvictionReclaimRequest>,
+    eviction_reclaim_rx: Mutex<Option<ampsc::UnboundedReceiver<reclaim::EvictionReclaimRequest>>>,
     tier1_writeback_tx: ampsc::Sender<tiered_writeback::Tier1WritebackRequest>,
     tier1_writeback_rx: Mutex<Option<ampsc::Receiver<tiered_writeback::Tier1WritebackRequest>>>,
     tier1_writeback_dedupe: moka::sync::SegmentedCache<(String, u64, u32), ()>,
@@ -1978,6 +2480,7 @@ impl MasterKvRouter {
             INFLIGHT_PUT_TTL_SECONDS
         };
         let key_activity = Arc::new(MasterKeyActivityTable::default());
+        let prepared_get_requesters = Arc::new(PreparedGetRequesterTable::default());
         let inflight_puts = moka::future::Cache::builder()
             .time_to_live(Duration::from_secs(inflight_put_ttl_seconds))
             .eviction_listener(|_put_id, inflight_info: InflightPutInfo, cause| {
@@ -1999,6 +2502,9 @@ impl MasterKvRouter {
                 }
             })
             .build();
+        let completed_gets = moka::future::Cache::builder()
+            .time_to_live(Duration::from_secs(120))
+            .build();
         let inflight_replica_tasks = moka::future::Cache::builder()
             .time_to_live(Duration::from_secs(60))
             .eviction_listener(|_put_id, inflight_info: InflightReplicaTaskInfo, cause| {
@@ -2007,8 +2513,10 @@ impl MasterKvRouter {
                 }
             })
             .build();
-        let (eviction_reclaim_tx, eviction_reclaim_rx) =
-            ampsc::channel(EVICTION_RECLAIM_QUEUE_CAPACITY);
+        // A synchronous Moka listener must perform only constant-size metadata
+        // work and must never block or drop an Allocation reclaim event.  The
+        // versioned inflight set deduplicates this unbounded channel.
+        let (eviction_reclaim_tx, eviction_reclaim_rx) = ampsc::unbounded_channel();
         let (post_route_maintenance_tx, post_route_maintenance_rx) =
             ampsc::channel(POST_ROUTE_MAINTENANCE_QUEUE_CAPACITY);
         let (tier1_writeback_tx, tier1_writeback_rx) =
@@ -2023,7 +2531,10 @@ impl MasterKvRouter {
             inflight_puts,
             inflight_replica_tasks,
             inflight_gets,
+            completed_gets,
+            get_done_locks: AMapLock::new(Duration::from_secs(10 * 60)),
             key_activity,
+            prepared_get_requesters,
             get_holding: MasterOwnerMemMgr::default(),
             next_get_id: AtomicU64::new(0),
             next_holder_id: AtomicU64::new(0),
@@ -2035,7 +2546,6 @@ impl MasterKvRouter {
                 .max_capacity(262_144)
                 .time_to_idle(Duration::from_secs(30 * 60))
                 .build(),
-            route_lifetime_lock: Mutex::new(()),
             local_reserve_grants: DashMap::new(),
             prepared_put_key_reservations: DashMap::new(),
             prefix_index: ARwLock::new(PrefixRadixTree::new()),
@@ -2043,8 +2553,9 @@ impl MasterKvRouter {
             node_writeback_tier1_controller: DashMap::new(),
             node_cache_reserved_capacity: DashMap::new(),
             eviction_reclaim_pending_weight: DashMap::new(),
+            eviction_reclaim_inflight: DashSet::new(),
             eviction_reclaim_counters: DashMap::new(),
-            owner_hot_demotion_locks: AMapLock::new(Duration::from_secs(10 * 60)),
+            owner_cache_operation_locks: AMapLock::new(Duration::from_secs(10 * 60)),
             put_target_decision_counts: DashMap::new(),
             put_requester_target_decision_counts: DashMap::new(),
             put_placement_mode_counts: DashMap::new(),
@@ -2131,62 +2642,56 @@ impl MasterKvRouter {
             .inner()
             .node_cache_reserved_capacity
             .get(node_id)
+            .filter(|reserved| !reserved.generation.is_tomb())
             .map(|reserved| reserved.total_reserved_bytes())
             .unwrap_or(0);
         self.replica_cache_base_capacity(node_space_size)
             .saturating_sub(reserved_capacity)
     }
 
-    fn owner_cache_allows_unrecoverable_eviction_in_context(
-        &self,
-        owner_node_id: &str,
-        context: UnrecoverableCacheEvictionContext,
-    ) -> bool {
-        let remote_only_roles = &self.inner().replica_task_placement.remote_only_node_roles;
-        let owner = self
+    /// Refresh an already-created node controller after segment metadata or
+    /// reservation inputs change. The boundary is derived only from physical
+    /// node space and generation-scoped reservations, never placement roles.
+    fn reconcile_node_cache_capacity(&self, node_id: &str) {
+        let node_space_size = self
             .inner()
             .view()
-            .cluster_manager()
-            .get_member_info_cached(owner_node_id);
-        let owner_is_remote_only =
-            placement::member_matches_roles(owner.as_ref(), remote_only_roles);
-        let has_ready_remote_only_owner = self
+            .master_seg_manager()
+            .get_node_space_size(node_id);
+        if node_space_size == 0 {
+            return;
+        }
+        let capacity = self.replica_cache_effective_capacity(node_id, node_space_size);
+        if let Some(cache) = self
             .inner()
-            .view()
-            .cluster_manager()
-            .get_members()
-            .into_iter()
-            .any(|member| {
-                placement::member_matches_roles(Some(&member), remote_only_roles)
-                    && self
-                        .inner()
-                        .view()
-                        .master_seg_manager()
-                        .get_node_space_size(member.id.as_str())
-                        != 0
-            });
-        allow_unrecoverable_cache_eviction(
-            owner_is_remote_only,
-            has_ready_remote_only_owner,
-            context,
-        )
-    }
-
-    pub(crate) fn owner_cache_allows_unrecoverable_eviction(&self, owner_node_id: &str) -> bool {
-        self.owner_cache_allows_unrecoverable_eviction_in_context(
-            owner_node_id,
-            UnrecoverableCacheEvictionContext::NormalCapacity,
-        )
-    }
-
-    pub(crate) fn owner_cache_allows_unrecoverable_reserve_pressure_eviction(
-        &self,
-        owner_node_id: &str,
-    ) -> bool {
-        self.owner_cache_allows_unrecoverable_eviction_in_context(
-            owner_node_id,
-            UnrecoverableCacheEvictionContext::OwnerLocalReserveNoSpace,
-        )
+            .node_kv_cache_controller
+            .get(node_id)
+            .map(|entry| entry.value().clone())
+        {
+            if let Err(err) = cache.set_max_capacity(capacity) {
+                error!(
+                    "failed to refresh ring-B cache capacity: node={} capacity={} err={}",
+                    node_id, capacity, err,
+                );
+            }
+        }
+        if let Some(cache) = self
+            .inner()
+            .node_writeback_tier1_controller
+            .get(node_id)
+            .map(|entry| entry.value().clone())
+        {
+            let tier1_capacity = self
+                .writeback_tier1_base_capacity(node_space_size)
+                .unwrap_or(0)
+                .min(capacity);
+            if let Err(err) = cache.set_max_capacity(tier1_capacity) {
+                error!(
+                    "failed to refresh tier1 cache capacity: node={} capacity={} err={}",
+                    node_id, tier1_capacity, err,
+                );
+            }
+        }
     }
 
     fn writeback_tier1_base_capacity(&self, node_space_size: u64) -> Option<u64> {
@@ -2259,6 +2764,24 @@ impl MasterKvRouter {
             .ok_or_else(|| {
                 KvError::Api(
                     crate::rpcresp_kvresult_convert::msg_and_error::ApiError::KeyNotFound {
+                        key: key.to_string(),
+                    },
+                )
+            })
+    }
+
+    pub(crate) fn reserve_prepared_get_requester(
+        &self,
+        key: &str,
+        requester: &NodeID,
+        get_id: u64,
+    ) -> Result<Arc<PreparedGetRequesterLease>, KvError> {
+        self.inner()
+            .prepared_get_requesters
+            .reserve(key, requester, get_id)
+            .ok_or_else(|| {
+                KvError::Api(
+                    crate::rpcresp_kvresult_convert::msg_and_error::ApiError::KeyBeingWritten {
                         key: key.to_string(),
                     },
                 )
@@ -2376,40 +2899,151 @@ impl MasterKvRouter {
         owner_node_id: NodeIDString,
         key: String,
         desc: NodeValueReplicaDesc,
-    ) {
-        let weight_bytes = desc.weight_bytes;
+        origin: reclaim::EvictionReclaimOrigin,
+    ) -> bool {
+        self.enqueue_eviction_reclaim_cohort(
+            owner_node_id,
+            vec![reclaim::EvictionReclaimMember {
+                key,
+                desc,
+                expected_backing: None,
+            }],
+            origin,
+        )
+    }
+
+    fn enqueue_eviction_reclaim_cohort(
+        &self,
+        owner_node_id: NodeIDString,
+        members: Vec<reclaim::EvictionReclaimMember>,
+        origin: reclaim::EvictionReclaimOrigin,
+    ) -> bool {
+        matches!(
+            self.enqueue_eviction_reclaim_cohort_exact(owner_node_id, None, members, origin, true,),
+            reclaim::EnqueueEvictionReclaimResult::Accepted
+                | reclaim::EnqueueEvictionReclaimResult::AlreadyInProgress
+        )
+    }
+
+    pub(crate) fn enqueue_owner_capacity_eviction_cohort(
+        &self,
+        owner_node_id: NodeIDString,
+        owner_node_start_time: i64,
+        members: Vec<reclaim::EvictionReclaimMember>,
+        allow_new_request: bool,
+    ) -> reclaim::EnqueueEvictionReclaimResult {
+        self.enqueue_eviction_reclaim_cohort_exact(
+            owner_node_id,
+            Some(owner_node_start_time),
+            members,
+            reclaim::EvictionReclaimOrigin::OwnerCapacityEviction,
+            allow_new_request,
+        )
+    }
+
+    fn enqueue_eviction_reclaim_cohort_exact(
+        &self,
+        owner_node_id: NodeIDString,
+        owner_node_start_time: Option<i64>,
+        members: Vec<reclaim::EvictionReclaimMember>,
+        origin: reclaim::EvictionReclaimOrigin,
+        allow_new_request: bool,
+    ) -> reclaim::EnqueueEvictionReclaimResult {
+        if members.is_empty() {
+            return reclaim::EnqueueEvictionReclaimResult::PartialOverlap;
+        }
+        let request = reclaim::EvictionReclaimRequest {
+            owner_node_id,
+            owner_node_start_time,
+            members,
+            origin,
+            retry_count: 0,
+        };
+        if !allow_new_request {
+            let identities = request.identities();
+            return classify_existing_eviction_reclaim(
+                &self.inner().eviction_reclaim_inflight,
+                &identities,
+            );
+        }
+        if !self.register_eviction_reclaim(&request) {
+            self.eviction_reclaim_counters(&request.owner_node_id)
+                .eviction_reclaim_deduplicated
+                .fetch_add(1, Ordering::Relaxed);
+            // An idempotent retry is accepted only when the complete cohort
+            // is already owned by the pipeline. A partial overlap is not a
+            // valid source handoff.
+            return if request
+                .identities()
+                .iter()
+                .all(|identity| self.inner().eviction_reclaim_inflight.contains(identity))
+            {
+                reclaim::EnqueueEvictionReclaimResult::AlreadyInProgress
+            } else {
+                reclaim::EnqueueEvictionReclaimResult::PartialOverlap
+            };
+        }
+        if let Err(err) = self.inner().eviction_reclaim_tx.send(request) {
+            let request = err.0;
+            self.complete_eviction_reclaim(&request);
+            if request.origin == reclaim::EvictionReclaimOrigin::MasterAllocationCapacity {
+                // This branch can run inside Moka's synchronous Size listener.
+                // Never re-enter that cache while its housekeeper lock is
+                // held; restore by key after yielding out of the callback.
+                let restore_view = self.inner().view().clone();
+                let restore_request = request.clone();
+                let spawn_view = restore_view.clone();
+                let _ = spawn_view.spawn("closed_eviction_reclaim_restore", async move {
+                    tokio::task::yield_now().await;
+                    let mut restored = 0usize;
+                    for member in &restore_request.members {
+                        if restore_view.master_kv_router().restore_eviction_cache_entry_if_current(
+                            &restore_request.owner_node_id,
+                            member.key.clone(),
+                            member.desc.clone(),
+                        ) {
+                            restored += 1;
+                        }
+                    }
+                    warn!(
+                        "restored master Allocation metadata after reclaim actor closed: owner={} members={} restored={}",
+                        restore_request.owner_node_id,
+                        restore_request.members.len(),
+                        restored,
+                    );
+                });
+            }
+            warn!(
+                "lossless eviction reclaim actor is closed: owner={} members={} origin={:?} restore_deferred={}",
+                request.owner_node_id,
+                request.members.len(),
+                request.origin,
+                request.origin == reclaim::EvictionReclaimOrigin::MasterAllocationCapacity,
+            );
+            return reclaim::EnqueueEvictionReclaimResult::Closed;
+        }
+        reclaim::EnqueueEvictionReclaimResult::Accepted
+    }
+
+    pub(crate) fn register_eviction_reclaim(
+        &self,
+        request: &reclaim::EvictionReclaimRequest,
+    ) -> bool {
+        if !try_install_eviction_reclaim_identities(
+            &self.inner().eviction_reclaim_inflight,
+            request.identities(),
+        ) {
+            return false;
+        }
         let pending_weight = self
             .inner()
             .eviction_reclaim_pending_weight
-            .entry(owner_node_id.clone())
+            .entry(request.owner_node_id.clone())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .value()
             .clone();
-        pending_weight.fetch_add(u64::from(weight_bytes), Ordering::AcqRel);
-        let request = reclaim::EvictionReclaimRequest {
-            owner_node_id,
-            key,
-            desc,
-            retry_count: 0,
-        };
-        if let Err(err) = self.inner().eviction_reclaim_tx.try_send(request) {
-            let queue_error = err.to_string();
-            let request = err.into_inner();
-            subtract_pending_eviction_weight(
-                pending_weight.as_ref(),
-                request.owner_node_id.as_str(),
-                u64::from(weight_bytes),
-            );
-            let restored = self.restore_eviction_cache_entry_if_current(
-                request.owner_node_id.as_str(),
-                request.key,
-                request.desc,
-            );
-            warn!(
-                "safe eviction reclaim queue is full or closed: {}; restored={}",
-                queue_error, restored
-            );
-        }
+        pending_weight.fetch_add(request.weight_bytes(), Ordering::AcqRel);
+        true
     }
 
     pub(crate) fn eviction_reclaim_pending_weight(&self, owner_node_id: &str) -> u64 {
@@ -2432,27 +3066,31 @@ impl MasterKvRouter {
             .clone()
     }
 
-    pub(crate) fn complete_eviction_reclaim_weight(
-        &self,
-        owner_node_id: &str,
-        completed_weight: u64,
-    ) {
-        if completed_weight == 0 {
-            return;
+    pub(crate) fn complete_eviction_reclaim(&self, request: &reclaim::EvictionReclaimRequest) {
+        for identity in request.identities() {
+            assert!(
+                self.inner()
+                    .eviction_reclaim_inflight
+                    .remove(&identity)
+                    .is_some(),
+                "eviction reclaim identity completed without registration: {:?}",
+                identity,
+            );
         }
+        let completed_weight = request.weight_bytes();
         let pending_weight = self
             .inner()
             .eviction_reclaim_pending_weight
-            .get(owner_node_id)
+            .get(&request.owner_node_id)
             .unwrap_or_else(|| {
                 panic!(
                     "eviction reclaim pending weight missing for owner {}",
-                    owner_node_id
+                    request.owner_node_id
                 )
             });
         subtract_pending_eviction_weight(
             pending_weight.value().as_ref(),
-            owner_node_id,
+            &request.owner_node_id,
             completed_weight,
         );
     }
@@ -2476,221 +3114,70 @@ impl MasterKvRouter {
         desc: &NodeValueReplicaDesc,
     ) -> bool {
         self.inner().kv_routes.get(key).is_some_and(|route| {
-            route.put_id == desc.put_id
-                && route.lease_id.is_none()
-                && route
-                    .nodes_replicas
-                    .read()
-                    .iter()
-                    .any(|(node_id, replica)| {
-                        node_id.as_ref() == owner_node_id && !replica.tomb_tag.is_tomb()
-                    })
+            ring_b_route_replica_desc(&route, owner_node_id).is_some_and(|current| {
+                current.put_id == desc.put_id && current.weight_bytes == desc.weight_bytes
+            })
         })
     }
 
-    fn eviction_cache_entry_recoverable_status(
+    /// Point-remove one exact ring-B metadata identity.  Callers use the
+    /// async per-node gate before entering Moka's synchronous housekeeper, so
+    /// route conversion never falls back to a cache scan.
+    pub(crate) async fn remove_node_cache_entry_exact(
         &self,
         owner_node_id: &str,
         key: &str,
         desc: &NodeValueReplicaDesc,
-    ) -> RecoverableReplicaStatus {
-        let Some(route) = self.inner().kv_routes.get(key).map(|route| route.clone()) else {
-            return RecoverableReplicaStatus::RouteAbsent;
-        };
-        route_recoverable_replica_status(self.inner().view(), owner_node_id, key, &route, desc)
-    }
-
-    pub(crate) fn evict_recoverable_cache_weight(
-        &self,
-        owner_node_id: &str,
-        requested_weight: u64,
-    ) -> u64 {
-        self.evict_recoverable_cache_weight_excluding(
-            owner_node_id,
-            requested_weight,
-            &HashSet::new(),
-        )
-    }
-
-    pub(crate) fn evict_recoverable_cache_weight_excluding(
-        &self,
-        owner_node_id: &str,
-        requested_weight: u64,
-        excluded_keys: &HashSet<String>,
-    ) -> u64 {
-        if requested_weight == 0 {
-            return 0;
-        }
-        let Some(cache) = self.get_node_cache_controller(owner_node_id) else {
-            return 0;
-        };
-        let counters = self.eviction_reclaim_counters(owner_node_id);
-        counters
-            .recoverable_first_requested_bytes
-            .fetch_add(requested_weight, Ordering::Relaxed);
-        let selected_weight = cache.evict_some_if(requested_weight, |key, desc| {
-            if excluded_keys.contains(key) {
-                return false;
-            }
-            let status = self.eviction_cache_entry_recoverable_status(owner_node_id, key, desc);
-            counters.record_recoverable_first_status(status);
-            status == RecoverableReplicaStatus::Recoverable
-        });
-        counters
-            .recoverable_first_selected_bytes
-            .fetch_add(selected_weight, Ordering::Relaxed);
-        counters.recoverable_first_shortfall_bytes.fetch_add(
-            requested_weight.saturating_sub(selected_weight),
-            Ordering::Relaxed,
-        );
-        selected_weight
-    }
-
-    pub(crate) async fn demote_owner_hot_cohort_if_recoverable(
-        &self,
-        owner_node_id: &str,
-        key: &str,
-        put_id: PutIDForAKey,
-    ) -> u64 {
-        let counters = self.eviction_reclaim_counters(owner_node_id);
-        counters
-            .owner_hot_demotion_attempts
-            .fetch_add(1, Ordering::Relaxed);
-
-        let Some(cache) = self.get_node_cache_controller(owner_node_id) else {
-            return 0;
-        };
-        cache.run_pending_tasks();
-        let Some(anchor_desc) = cache.get(key) else {
-            return 0;
-        };
-        if anchor_desc.put_id != put_id {
-            return 0;
-        }
-        let Some(anchor_route) = self.inner().kv_routes.get(key).map(|route| route.clone()) else {
-            return 0;
-        };
-        let Ok(cohort_keys) = current_tp_cohort_keys(key, &anchor_route, &anchor_desc) else {
-            return 0;
-        };
-        let Some(cohort_anchor) = cohort_keys.iter().min() else {
-            return 0;
-        };
-        let cohort_lock = self
+    ) -> bool {
+        let owner_cache_lock = self
             .inner()
-            .owner_hot_demotion_locks
-            .get_lock(format!("{owner_node_id}\0{cohort_anchor}"));
-        let _cohort_guard = cohort_lock.lock().await;
+            .owner_cache_operation_locks
+            .get_lock(owner_node_id.to_string());
+        let _owner_cache_guard = owner_cache_lock.lock().await;
+        self.inner()
+            .node_kv_cache_controller
+            .get(owner_node_id)
+            .is_some_and(|cache| remove_exact_cache_entry(cache.value(), key, desc))
+    }
 
-        // The route and Moka state may have changed while another member completion held the
-        // cohort lock. Recompute the complete cohort under the lock before selecting anything.
-        cache.run_pending_tasks();
-        let Some(anchor_desc) = cache.get(key) else {
-            return 0;
-        };
-        if anchor_desc.put_id != put_id {
-            return 0;
-        }
-        let Some(anchor_route) = self.inner().kv_routes.get(key).map(|route| route.clone()) else {
-            return 0;
-        };
-        let Ok(locked_cohort_keys) = current_tp_cohort_keys(key, &anchor_route, &anchor_desc)
-        else {
-            return 0;
-        };
-        if locked_cohort_keys != cohort_keys {
-            counters
-                .owner_hot_demotion_precheck_rejected
-                .fetch_add(1, Ordering::Relaxed);
-            return 0;
-        }
-
-        // Demotion is an all-or-nothing TP/atomic-cohort transition.  Do not
-        // silently shrink the cohort when one of its source entries has
-        // already disappeared from this owner's cache: doing so can recreate
-        // the mixed local/remote layout that made the prefix unrecoverable in
-        // E23.
-        let expected_cohort_len = locked_cohort_keys.len();
-        let expected_entries = locked_cohort_keys
-            .into_iter()
-            .map(|cohort_key| cache.get(&cohort_key).map(|desc| (cohort_key, desc)))
-            .collect::<Option<HashMap<_, _>>>();
-        let Some(expected_entries) = expected_entries else {
-            counters
-                .owner_hot_demotion_precheck_rejected
-                .fetch_add(1, Ordering::Relaxed);
-            return 0;
-        };
-        if expected_entries.len() != expected_cohort_len || expected_entries.is_empty() {
-            counters
-                .owner_hot_demotion_precheck_rejected
-                .fetch_add(1, Ordering::Relaxed);
-            return 0;
-        }
-
-        // Validate the whole TP/atomic cohort before asking Moka to select anything.  Performing
-        // this check in the eviction predicate allowed one recoverable member to be selected even
-        // when a later member was not recoverable, which turned an intended exclusive transition
-        // into a partial source demotion.
-        let Some(expected_weight) =
-            recoverable_cohort_weight(&expected_entries, |candidate_key, candidate_desc| {
-                let status = self.eviction_cache_entry_recoverable_status(
-                    owner_node_id,
-                    candidate_key,
-                    candidate_desc,
-                );
-                counters.record_recoverable_first_status(status);
-                status
+    /// Remove one superseded route version from both metadata policies using
+    /// only the route's own replica list.  This is O(replica count), never a
+    /// Moka or global-route scan, and cannot delete a newer same-key version.
+    pub(crate) async fn remove_route_cache_entries_exact(
+        &self,
+        key: &str,
+        route: &OneKvNodesRoutes,
+    ) {
+        let replicas = route
+            .nodes_replicas
+            .read()
+            .iter()
+            .filter_map(|(node_id, replica)| {
+                (!replica.tomb_tag.is_tomb()).then(|| {
+                    (
+                        node_id.as_ref().to_string(),
+                        NodeValueReplicaDesc {
+                            weight_bytes: u32::try_from(replica.backing.capacity_bytes())
+                                .unwrap_or(u32::MAX),
+                            put_id: route.put_id,
+                        },
+                    )
+                })
             })
-        else {
-            counters
-                .owner_hot_demotion_precheck_rejected
-                .fetch_add(1, Ordering::Relaxed);
-            return 0;
-        };
-
-        let selected_weight =
-            cache.evict_some_if(expected_weight, |candidate_key, candidate_desc| {
-                expected_entries
-                    .get(candidate_key)
-                    .is_some_and(|expected_desc| {
-                        expected_desc.put_id == candidate_desc.put_id
-                            && expected_desc.weight_bytes == candidate_desc.weight_bytes
-                    })
-            });
-        if selected_weight != expected_weight {
-            counters
-                .owner_hot_demotion_partial_mismatch
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::error!(
-                "owner hot TP-cohort demotion selected a partial cohort: owner={} key={} put_id=({},{}) cohort_entries={} expected_weight={} selected_weight={}",
-                owner_node_id,
-                key,
-                put_id.0,
-                put_id.1,
-                expected_entries.len(),
-                expected_weight,
-                selected_weight
-            );
+            .collect::<Vec<_>>();
+        for (node_id, desc) in replicas {
+            let owner_cache_lock = self
+                .inner()
+                .owner_cache_operation_locks
+                .get_lock(node_id.clone());
+            let _owner_cache_guard = owner_cache_lock.lock().await;
+            if let Some(cache) = self.inner().node_kv_cache_controller.get(&node_id) {
+                let _ = remove_exact_cache_entry(cache.value(), key, &desc);
+            }
+            if let Some(cache) = self.inner().node_writeback_tier1_controller.get(&node_id) {
+                let _ = remove_exact_cache_entry(cache.value(), key, &desc);
+            }
         }
-        if selected_weight == expected_weight {
-            counters
-                .owner_hot_demotion_cohorts
-                .fetch_add(1, Ordering::Relaxed);
-            counters
-                .owner_hot_demotion_selected_bytes
-                .fetch_add(selected_weight, Ordering::Relaxed);
-            tracing::debug!(
-                "owner hot complete TP-cohort demotion selected: owner={} key={} put_id=({},{}) cohort_entries={} selected_weight={}",
-                owner_node_id,
-                key,
-                put_id.0,
-                put_id.1,
-                expected_entries.len(),
-                selected_weight
-            );
-        }
-        selected_weight
     }
 
     pub(crate) fn insert_node_cache_entry(
@@ -2702,45 +3189,8 @@ impl MasterKvRouter {
         let Some(cache) = self.get_node_cache_controller(owner_node_id) else {
             return false;
         };
-        cache.run_pending_tasks();
-        let existing_weight = cache
-            .get(&key)
-            .map(|existing| u64::from(existing.weight_bytes))
-            .unwrap_or(0);
-        let projected_weight = cache
-            .weighted_size()
-            .saturating_sub(existing_weight)
-            .saturating_add(u64::from(desc.weight_bytes));
-        let node_space_size = self
-            .inner()
-            .view()
-            .master_seg_manager()
-            .get_node_space_size(owner_node_id);
-        let capacity = self.replica_cache_effective_capacity(owner_node_id, node_space_size);
-        let requested_weight = projected_weight.saturating_sub(capacity);
-        if requested_weight != 0 {
-            let recoverable_selected_weight =
-                self.evict_recoverable_cache_weight(owner_node_id, requested_weight);
-            let fallback_requested_weight =
-                requested_weight.saturating_sub(recoverable_selected_weight);
-            let fallback_selected_weight =
-                if self.owner_cache_allows_unrecoverable_eviction(owner_node_id) {
-                    cache.evict_some(fallback_requested_weight)
-                } else {
-                    0
-                };
-            tracing::debug!(
-                "recoverable-first cache admission: owner={} key={} requested_weight={} recoverable_selected_weight={} fallback_requested_weight={} fallback_selected_weight={} projected_weight={} capacity={}",
-                owner_node_id,
-                key,
-                requested_weight,
-                recoverable_selected_weight,
-                fallback_requested_weight,
-                fallback_selected_weight,
-                projected_weight,
-                capacity
-            );
-        }
+        // Restoration is an exact metadata repair after a failed reclaim
+        // dispatch. It must never search for or evict an unrelated victim.
         cache.insert(key, desc);
         true
     }
@@ -2792,8 +3242,9 @@ impl MasterKvRouter {
             let view = view.clone();
             let view2 = view.clone();
             let view_task = view2.clone();
+            let req_node_id = resp.node_id().clone();
             let _ = view.spawn("rpc_get_revoke", async move {
-                let ack = handle_get_revoke(view_task, msg).await;
+                let ack = handle_get_revoke(view_task, msg, req_node_id).await;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send GetRevokeResp: {:?}", e);
                 }
@@ -2806,9 +3257,10 @@ impl MasterKvRouter {
             let view = view.clone();
             let view2 = view.clone();
             let view_task = view2.clone();
+            let req_node_id = resp.node_id().clone();
             let _ = view.spawn("rpc_get_done", async move {
                 let t0 = Utc::now().timestamp_micros();
-                let mut ack = handle_get_done(view_task, msg).await;
+                let mut ack = handle_get_done(view_task, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send GetDoneResp: {:?}", e);
@@ -3071,6 +3523,20 @@ impl MasterKvRouter {
         });
 
         let view = self.0.view().clone();
+        RPCHandler::<BatchEvictOwnerSourceReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let owner = resp.node_id().clone();
+            let view_task = view.clone();
+            let _ = view.spawn("rpc_batch_evict_owner_source", async move {
+                let ack = handle_batch_evict_owner_source(&view_task, msg, owner).await;
+                if let Err(err) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchEvictOwnerSourceResp: {:?}", err);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
         RPCHandler::<PutAppendStartReq>::new().regist(p2p, move |resp, msg| {
             let view = view.clone();
             let view2 = view.clone();
@@ -3082,6 +3548,23 @@ impl MasterKvRouter {
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send PutAppendStartResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchPutAppendStartReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
+            let view_task = view2.clone();
+            let _ = view.spawn("rpc_batch_put_append_start", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack = handle_batch_put_append_start(view_task, msg, req_node_id).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchPutAppendStartResp: {:?}", e);
                 }
             });
             Ok(())
@@ -3112,6 +3595,22 @@ impl MasterKvRouter {
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send PutAppendDoneResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchPutAppendDoneReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let view_task = view2.clone();
+            let _ = view.spawn("rpc_batch_put_append_done", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack = handle_batch_put_append_done(view_task, msg).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchPutAppendDoneResp: {:?}", e);
                 }
             });
             Ok(())
@@ -3247,8 +3746,9 @@ impl MasterKvRouter {
         RPCHandler::<BatchGetRevokeReq>::new().regist(p2p, move |resp, msg| {
             let view = view.clone();
             let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
             view.spawn("rpc_batch_get_revoke", async move {
-                let ack = handle_batch_get_revoke(view2, msg).await;
+                let ack = handle_batch_get_revoke(view2, msg, req_node_id).await;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send BatchGetRevokeResp: {:?}", e);
                 }
@@ -3260,9 +3760,10 @@ impl MasterKvRouter {
         RPCHandler::<BatchGetDoneReq>::new().regist(p2p, move |resp, msg| {
             let view = view.clone();
             let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
             view.spawn("rpc_batch_get_done", async move {
                 let t0 = Utc::now().timestamp_micros();
-                let mut ack = handle_batch_get_done(view2, msg).await;
+                let mut ack = handle_batch_get_done(view2, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send BatchGetDoneResp: {:?}", e);
@@ -3270,6 +3771,65 @@ impl MasterKvRouter {
             });
             Ok(())
         });
+    }
+
+    /// Start cleanup for one exact departed membership generation.
+    ///
+    /// Tomb publication and O(1) controller detachment happen synchronously in the cluster
+    /// listener. The potentially large route scan is then performed by a yielding async task.
+    fn begin_departed_generation_cleanup(
+        &self,
+        node_id: &str,
+        expected_node_start_time: Option<i64>,
+    ) -> bool {
+        let node: NodeID = node_id.to_string().into();
+        let Some(departed_tag) = self
+            .inner()
+            .view()
+            .master_seg_manager()
+            .mark_node_tomb_generation(&node, expected_node_start_time)
+        else {
+            debug!(
+                "MemberLeft generation cleanup skipped because the registered generation changed or no segment was registered: node={} expected_node_start_time={:?}",
+                node_id, expected_node_start_time
+            );
+            return false;
+        };
+
+        // Detach generation-scoped controllers before starting the full route scan. A tombed
+        // segment reports zero usable space, so old-generation work cannot recreate the caches.
+        let resident_cache_detached = self
+            .inner()
+            .node_kv_cache_controller
+            .remove(node_id)
+            .is_some();
+        let tier1_cache_detached = self
+            .inner()
+            .node_writeback_tier1_controller
+            .remove(node_id)
+            .is_some();
+        self.inner()
+            .node_cache_reserved_capacity
+            .remove_if(node_id, |_, reserved| {
+                reserved.generation.same_generation(&departed_tag)
+            });
+
+        let removed_holdings = self.inner().get_holding.cleanup_node(node_id);
+        let view = self.inner().view().clone();
+        let node_id_owned = node_id.to_string();
+        let _ = view.clone().spawn("member_left_route_cleanup", async move {
+            cleanup_departed_generation_routes(view, node_id_owned, departed_tag).await;
+        });
+
+        info!(
+            "MemberLeft generation marked and controllers detached: node={} expected_node_start_time={:?} resident_cache_detached={} tier1_cache_detached={} removed_holdings={}",
+            node_id,
+            expected_node_start_time,
+            resident_cache_detached,
+            tier1_cache_detached,
+            removed_holdings
+        );
+        true
     }
 
     fn spawn_node_segement_registration_caller(&self) -> ampsc::Sender<ClusterEvent> {
@@ -3338,8 +3898,8 @@ impl MasterKvRouter {
 	                let epoch = member.node_start_time;
 	                if let Some(prev) = *last_seen_epoch {
 	                    if prev != epoch {
-	                        view.master_seg_manager()
-	                            .mark_node_tomb(&node_id.clone().into());
+	                        view.master_kv_router()
+	                            .begin_departed_generation_cleanup(&node_id, Some(prev));
 	                    }
 	                }
 	                *last_seen_epoch = Some(epoch);
@@ -3397,10 +3957,9 @@ impl MasterKvRouter {
                                     inflight = None;
 
                                     debug!(
-                                        "MasterKvRouter received node leave event: {:?}, mark it as tomb",
+                                        "MasterKvRouter registration actor canceled departed node: {:?}",
                                         node_id
                                     );
-                                    view_task.master_seg_manager().mark_node_tomb(&node_id.into());
                                 }
                             }
                         }
@@ -3476,10 +4035,9 @@ impl MasterKvRouter {
                                     inflight = None;
 
                                     debug!(
-                                        "MasterKvRouter received node leave event: {:?}, mark it as tomb",
+                                        "MasterKvRouter registration actor canceled departed node: {:?}",
                                         node_id
                                     );
-                                    view_task.master_seg_manager().mark_node_tomb(&node_id.into());
                                 }
                             }
                         }
@@ -3504,6 +4062,11 @@ impl MasterKvRouter {
                                     registered_epoch = Some(epoch);
                                     desired_epoch = None;
                                     backoff = INITIAL_BACKOFF;
+                                    if let Some(node_id) = actor_node_id.as_deref() {
+                                        view_task
+                                            .master_kv_router()
+                                            .reconcile_node_cache_capacity(node_id);
+                                    }
                                     info!(
                                         "Successfully requested segment registration from client {}",
                                         actor_node_id.clone().unwrap_or_default()
@@ -3561,10 +4124,9 @@ impl MasterKvRouter {
                                     inflight = None;
 
                                     debug!(
-                                        "MasterKvRouter received node leave event: {:?}, mark it as tomb",
+                                        "MasterKvRouter registration actor canceled departed node: {:?}",
                                         node_id
                                     );
-                                    view_task.master_seg_manager().mark_node_tomb(&node_id.into());
                                 }
                             }
                         }
@@ -3630,17 +4192,66 @@ impl MasterKvRouter {
                 event: ClusterEvent,
             ) {
                 match &event {
+                    ClusterEvent::MemberJoined(member) | ClusterEvent::MemberUpdated(member) => {
+                        view.master_kv_router()
+                            .reconcile_node_cache_capacity(&member.id);
+                    }
                     ClusterEvent::MemberLeft(node_id) => {
-                        let removed = view
+                        let departed_epoch = view
+                            .cluster_manager()
+                            .get_prev_member_info(node_id)
+                            .map(|member| member.node_start_time);
+                        let current_member = view
+                            .cluster_manager()
+                            .get_member_info_cached(node_id);
+                        let current_epoch = current_member
+                            .as_ref()
+                            .map(|member| member.node_start_time);
+
+                        // MemberLeft has no epoch. Once a live generation is visible, this leave
+                        // is ambiguous and must neither clean state nor reach the per-node actor:
+                        // forwarding it would clear desired/registered_epoch for the reconnect.
+                        if !member_left_can_forward_to_registration_actor(current_epoch) {
+                            debug!(
+                                "ignoring delayed MemberLeft after reconnect: node={} current_node_start_time={}",
+                                node_id,
+                                current_epoch.unwrap_or_default()
+                            );
+                            return;
+                        }
+
+                        let registered_tag_before = view
+                            .master_seg_manager()
+                            .get_node_tomb_tag(&node_id.clone().into());
+                        if !view
                             .master_kv_router()
-                            .inner()
-                            .get_holding
-                            .cleanup_node(&node_id);
-                        if removed > 0 {
-                            info!("Cleaned up {} holdings for left member {}", removed, node_id);
+                            .begin_departed_generation_cleanup(node_id, departed_epoch)
+                        {
+                            // A registered segment exists but did not match `departed_epoch`:
+                            // preserve it and do not forward the old leave to the actor.
+                            if registered_tag_before.is_some() {
+                                debug!(
+                                    "ignoring generation-mismatched MemberLeft: node={} departed_epoch={:?}",
+                                    node_id, departed_epoch
+                                );
+                                return;
+                            }
+
+                            // External/zero-contribution members do not register a segment or
+                            // own route backing, but they can still own get holdings.
+                            let removed = view
+                                .master_kv_router()
+                                .inner()
+                                .get_holding
+                                .cleanup_node(node_id);
+                            if removed > 0 {
+                                info!(
+                                    "Cleaned up {} holdings for segmentless left member {}",
+                                    removed, node_id
+                                );
+                            }
                         }
                     }
-                    _ => {}
                 }
 
                 let node_id = event.node_id();
@@ -3787,6 +4398,7 @@ impl MasterKvRouter {
             GetAllocationMode::Temporary => "temporary",
             GetAllocationMode::ReuseReplica => "reuse_replica",
             GetAllocationMode::DurableReplica => "durable_replica",
+            GetAllocationMode::LocalCommittedSlot => "local_committed_slot",
         };
         let mode_count = self
             .inner()
@@ -3901,6 +4513,11 @@ impl MasterKvRouter {
         if node_space_size == 0 {
             return None;
         }
+        // Ring B is a backing/index domain, not a placement-role domain.  A
+        // GPU owner can also hold master-only Allocation replicas, so every
+        // live segment gets the same bounded controller.  Non-ring-B bytes
+        // are subtracted through generation-scoped reservation tokens.
+        let allocation_capacity = self.replica_cache_effective_capacity(node_id, node_space_size);
         let view = self.inner().view().clone();
         let node_id_owned = node_id.to_string();
         Some(
@@ -3910,46 +4527,32 @@ impl MasterKvRouter {
                 .or_insert_with(move || {
                     let view = view.clone();
                     let cache_node_id = node_id_owned.clone();
-                    Arc::new(
-                        moka::sync::SegmentedCache::builder(8)
-                            // The resident cache is a metadata/LRU controller. Its aggregate
-                            // effective capacity is enforced explicitly with `evict_some_if`.
-                            // Leaving the Moka segments unbounded prevents per-segment hash skew
-                            // from performing an independent Size eviction outside that policy.
-                            // Use the actual allocated/rounded size as weight to
-                            // make eviction reflect real memory usage.
-                            .weigher(Box::new(|_key: &String, value: &NodeValueReplicaDesc| {
-                                value.weight_bytes
-                            }))
-                            .eviction_listener(Box::new(
-                                move |key: Arc<String>,
-                                      _value: NodeValueReplicaDesc,
-                                      cause: RemovalCause| {
-                                    debug!("Evicted key: {:?}, caused by: {:?}", key, cause);
-                                    match cause {
-                                        // timeout or size exceed
-                                        RemovalCause::Size | RemovalCause::Expired => {
-                                            let k = (*key).clone();
-                                            let evicted_put_id = _value.put_id;
-                                            tracing::debug!(
-                                                "Eviction-triggered local replica cleanup for key {} on node {} put_id=({},{})",
-                                                k,
-                                                cache_node_id,
-                                                evicted_put_id.0,
-                                                evicted_put_id.1
-                                            );
-                                            view.master_kv_router().enqueue_eviction_reclaim(
-                                                cache_node_id.clone(),
-                                                k,
-                                                _value,
-                                            );
-                                        }
-                                        _ => {}
-                                    }
-                                },
-                            ))
-                            .build(),
-                    )
+                    let builder = moka::sync::SegmentedCache::builder(8)
+                        // Admission is restricted to unindexed Allocation
+                        // routes. CommittedSlot and owner-indexed Allocation
+                        // entries belong to ring A and never enter this cache.
+                        .weigher(Box::new(|_key: &String, value: &NodeValueReplicaDesc| {
+                            value.weight_bytes
+                        }))
+                        .eviction_listener(Box::new(
+                            move |key: Arc<String>,
+                                  _value: NodeValueReplicaDesc,
+                                  cause: RemovalCause| {
+                                if cause == RemovalCause::Size {
+                                    // Listener work is deliberately O(1):
+                                    // clone fixed metadata, dedupe, and send
+                                    // to a lossless channel.  Route/cohort
+                                    // lookup belongs to the async actor.
+                                    let _ = view.master_kv_router().enqueue_eviction_reclaim(
+                                        cache_node_id.clone(),
+                                        (*key).clone(),
+                                        _value,
+                                        reclaim::EvictionReclaimOrigin::MasterAllocationCapacity,
+                                    );
+                                }
+                            },
+                        ));
+                    Arc::new(builder.max_capacity(allocation_capacity).build())
                 })
                 .value()
                 .clone(),
@@ -4032,17 +4635,6 @@ impl MasterKvRouter {
                 .value()
                 .clone(),
         )
-    }
-
-    pub fn remove_node_writeback_tier1_entry(&self, node_id: &str, key: &str) {
-        if let Some(cache) = self
-            .inner()
-            .node_writeback_tier1_controller
-            .get(node_id)
-            .map(|entry| entry.value().clone())
-        {
-            let _ = cache.remove(key);
-        }
     }
 
     pub(crate) fn tier1_writeback_entry_is_current(
@@ -4160,27 +4752,66 @@ impl MasterKvRouter {
         ));
     }
 
-    /// Atomically adjust a node's moka usable-capacity reservation by `delta_bytes`.
-    /// Positive delta reserves capacity (fetch_sub from usable capacity),
-    /// negative delta releases reservation (fetch_add back to usable capacity).
-    pub fn adjust_node_cache_reserved_capacity(
+    /// Adjust one exact generation/counter identity and refresh its live cache
+    /// boundary.  Negative releases always stay applied to the captured Arc,
+    /// even when the node has already left and its controller was detached.
+    fn adjust_node_cache_reserved_capacity_identity(
         &self,
         node_id: &str,
+        generation: &NodeTombTag,
+        reserved_capacity: &Arc<NodeCacheReservedCapacity>,
         reason: ReservedCapacityReason,
         delta_bytes: i64,
     ) -> crate::rpcresp_kvresult_convert::msg_and_error::KvResult<()> {
         if !self.replica_cache_enabled() {
             return Ok(());
         }
-        let reserved_capacity = self
-            .inner()
-            .node_cache_reserved_capacity
-            .entry(node_id.to_string())
-            .or_insert_with(|| Arc::new(NodeCacheReservedCapacity::default()))
-            .value()
-            .clone();
+        if !reserved_capacity.generation.same_generation(generation) {
+            return Err(
+                crate::rpcresp_kvresult_convert::msg_and_error::KvError::Api(
+                    crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidPutMasterState {
+                        detail: format!(
+                            "cache reservation generation/counter identity mismatch: node_id={}",
+                            node_id
+                        ),
+                    },
+                ),
+            );
+        }
 
         reserved_capacity.apply_delta(reason, delta_bytes);
+
+        let current_identity = self
+            .inner()
+            .node_cache_reserved_capacity
+            .get(node_id)
+            .is_some_and(|current| {
+                Arc::ptr_eq(current.value(), reserved_capacity)
+                    && current.generation.same_generation(generation)
+            })
+            && node_generation_is_current_live(
+                self.inner().view(),
+                &node_id.to_string().into(),
+                generation,
+            );
+        if !current_identity {
+            if delta_bytes >= 0 {
+                reserved_capacity.apply_delta(reason, -delta_bytes);
+                return Err(
+                    crate::rpcresp_kvresult_convert::msg_and_error::KvError::Api(
+                        crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidPutMasterState {
+                            detail: format!(
+                                "cache reservation target generation changed: node_id={}",
+                                node_id
+                            ),
+                        },
+                    ),
+                );
+            }
+            // The old generation has been detached.  Its exact counter Arc is
+            // now balanced, and no live controller must be modified.
+            return Ok(());
+        }
 
         // Recompute target capacity from the configured base ratio minus live reservations.
         let reserved_total = reserved_capacity.total_reserved_bytes();
@@ -4190,9 +4821,9 @@ impl MasterKvRouter {
             .master_seg_manager()
             .get_node_space_size(node_id);
         if node_space_size == 0 {
-            // Node not ready: this should not happen in a successful put_done path.
-            // Revert the counter delta before returning error.
-            reserved_capacity.apply_delta(reason, -delta_bytes);
+            if delta_bytes >= 0 {
+                reserved_capacity.apply_delta(reason, -delta_bytes);
+            }
             return Err(
                 crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
                     crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::OwnerNoSeg {
@@ -4219,7 +4850,9 @@ impl MasterKvRouter {
                     .unwrap_or(0)
                     .min(new_capacity);
                 if let Err(e) = tier1_cache.set_max_capacity(tier1_capacity) {
-                    reserved_capacity.apply_delta(reason, -delta_bytes);
+                    if delta_bytes >= 0 {
+                        reserved_capacity.apply_delta(reason, -delta_bytes);
+                    }
                     return Err(
                         crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
                             crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::RpcDecodeError {
@@ -4232,33 +4865,26 @@ impl MasterKvRouter {
                     );
                 }
             }
-            cache.run_pending_tasks();
-            let requested_weight = cache.weighted_size().saturating_sub(new_capacity);
-            let recoverable_selected_weight =
-                self.evict_recoverable_cache_weight(node_id, requested_weight);
-            let fallback_requested_weight =
-                requested_weight.saturating_sub(recoverable_selected_weight);
-            let fallback_selected_weight =
-                if self.owner_cache_allows_unrecoverable_eviction(node_id) {
-                    cache.evict_some(fallback_requested_weight)
-                } else {
-                    0
-                };
-            if requested_weight != 0 {
-                tracing::debug!(
-                    "resident cache effective-capacity adjustment: owner={} effective_capacity={} requested_weight={} recoverable_selected_weight={} fallback_requested_weight={} fallback_selected_weight={}",
-                    node_id,
-                    new_capacity,
-                    requested_weight,
-                    recoverable_selected_weight,
-                    fallback_requested_weight,
-                    fallback_selected_weight
+            if let Err(e) = cache.set_max_capacity(new_capacity) {
+                if delta_bytes >= 0 {
+                    reserved_capacity.apply_delta(reason, -delta_bytes);
+                }
+                return Err(
+                    crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
+                        crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::RpcDecodeError {
+                            rpc_input_json: format!(
+                                "ring-B allocation moka.set_max_capacity failed: node_id={}, new_capacity={}, err={}",
+                                node_id, new_capacity, e
+                            ),
+                        },
+                    ),
                 );
             }
             Ok(())
         } else {
-            // Revert counter and return error.
-            reserved_capacity.apply_delta(reason, -delta_bytes);
+            if delta_bytes >= 0 {
+                reserved_capacity.apply_delta(reason, -delta_bytes);
+            }
             Err(
                 crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
                     crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::OwnerNoSeg {
@@ -4267,6 +4893,83 @@ impl MasterKvRouter {
                 ),
             )
         }
+    }
+
+    /// Reserve cache capacity for one exact live node generation.  The returned
+    /// route-lifetime token releases the same counter identity on Drop.
+    pub fn reserve_node_cache_capacity(
+        &self,
+        node_id: &NodeID,
+        generation: &NodeTombTag,
+        reason: ReservedCapacityReason,
+        bytes: u64,
+    ) -> crate::rpcresp_kvresult_convert::msg_and_error::KvResult<
+        Option<Arc<NodeCacheCapacityReservation>>,
+    > {
+        if !self.replica_cache_enabled() {
+            return Ok(None);
+        }
+        if !node_generation_is_current_live(self.inner().view(), node_id, generation) {
+            return Err(
+                crate::rpcresp_kvresult_convert::msg_and_error::KvError::Api(
+                    crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidPutMasterState {
+                        detail: format!(
+                            "cannot reserve cache capacity for departed generation: node_id={}",
+                            node_id
+                        ),
+                    },
+                ),
+            );
+        }
+
+        let reserved_capacity = match self
+            .inner()
+            .node_cache_reserved_capacity
+            .entry(node_id.to_string())
+        {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if entry.get().generation.same_generation(generation) {
+                    entry.get().clone()
+                } else if entry.get().generation.is_tomb() {
+                    let replacement = Arc::new(NodeCacheReservedCapacity::new(generation.clone()));
+                    entry.insert(replacement.clone());
+                    replacement
+                } else {
+                    return Err(
+                        crate::rpcresp_kvresult_convert::msg_and_error::KvError::Api(
+                            crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidPutMasterState {
+                                detail: format!(
+                                    "live cache reservation counter belongs to another generation: node_id={}",
+                                    node_id
+                                ),
+                            },
+                        ),
+                    );
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let counter = Arc::new(NodeCacheReservedCapacity::new(generation.clone()));
+                entry.insert(counter.clone());
+                counter
+            }
+        };
+
+        self.adjust_node_cache_reserved_capacity_identity(
+            node_id.as_ref(),
+            generation,
+            &reserved_capacity,
+            reason,
+            bytes as i64,
+        )?;
+        Ok(Some(Arc::new(NodeCacheCapacityReservation {
+            view: self.inner().view().clone(),
+            node_id: node_id.to_string(),
+            generation: generation.clone(),
+            reserved_capacity,
+            reason,
+            bytes,
+            released: AtomicBool::new(false),
+        })))
     }
 
     pub fn next_local_reserve_grant_id(&self) -> u64 {
@@ -4350,10 +5053,15 @@ impl MasterKvRouter {
                 .inner()
                 .node_cache_reserved_capacity
                 .get(owner_node.as_str())
+                .filter(|reserved| !reserved.generation.is_tomb())
                 .map(|reserved| reserved.total_reserved_bytes())
                 .unwrap_or(0);
-            let effective_capacity_bytes =
-                self.replica_cache_effective_capacity(owner_node.as_str(), node_space_size);
+            // Every live node's ring-B controller is bounded, independent of
+            // its placement role.
+            let effective_capacity_bytes = cache
+                .policy()
+                .max_capacity()
+                .expect("ring-B controller must always be bounded");
             let pending_eviction_reclaim_bytes =
                 self.eviction_reclaim_pending_weight(owner_node.as_str());
             let reclaim_counters = self.eviction_reclaim_counters(owner_node.as_str());
@@ -4397,9 +5105,6 @@ impl MasterKvRouter {
                 reclaim_master_activity_deferred: reclaim_counters
                     .master_activity_deferred
                     .load(Ordering::Relaxed),
-                reclaim_master_get_holder_observed: reclaim_counters
-                    .master_get_holder_observed
-                    .load(Ordering::Relaxed),
                 reclaim_owner_holder_deferred: reclaim_counters
                     .owner_holder_deferred
                     .load(Ordering::Relaxed),
@@ -4411,50 +5116,39 @@ impl MasterKvRouter {
                 reclaim_retry_completed: reclaim_counters.retry_completed.load(Ordering::Relaxed),
                 reclaim_retry_restored: reclaim_counters.retry_restored.load(Ordering::Relaxed),
                 reclaim_completed: reclaim_counters.completed.load(Ordering::Relaxed),
-                owner_hot_demotion_attempts: reclaim_counters
-                    .owner_hot_demotion_attempts
+                source_evict_rpc_requests: reclaim_counters
+                    .source_evict_rpc_requests
                     .load(Ordering::Relaxed),
-                owner_hot_demotion_cohorts: reclaim_counters
-                    .owner_hot_demotion_cohorts
+                source_evict_cohorts: reclaim_counters
+                    .source_evict_cohorts
                     .load(Ordering::Relaxed),
-                owner_hot_demotion_selected_bytes: reclaim_counters
-                    .owner_hot_demotion_selected_bytes
+                source_evict_requested_bytes: reclaim_counters
+                    .source_evict_requested_bytes
                     .load(Ordering::Relaxed),
-                owner_hot_demotion_precheck_rejected: reclaim_counters
-                    .owner_hot_demotion_precheck_rejected
+                source_evict_accepted: reclaim_counters
+                    .source_evict_accepted
                     .load(Ordering::Relaxed),
-                owner_hot_demotion_partial_mismatch: reclaim_counters
-                    .owner_hot_demotion_partial_mismatch
+                source_evict_in_progress: reclaim_counters
+                    .source_evict_in_progress
                     .load(Ordering::Relaxed),
-                recoverable_first_requested_bytes: reclaim_counters
-                    .recoverable_first_requested_bytes
+                source_evict_completed: reclaim_counters
+                    .source_evict_completed
                     .load(Ordering::Relaxed),
-                recoverable_first_selected_bytes: reclaim_counters
-                    .recoverable_first_selected_bytes
+                source_evict_retryable_busy: reclaim_counters
+                    .source_evict_retryable_busy
                     .load(Ordering::Relaxed),
-                recoverable_first_shortfall_bytes: reclaim_counters
-                    .recoverable_first_shortfall_bytes
+                source_evict_stale: reclaim_counters.source_evict_stale.load(Ordering::Relaxed),
+                source_evict_rejected: reclaim_counters
+                    .source_evict_rejected
                     .load(Ordering::Relaxed),
-                recoverable_first_eligible_checks: reclaim_counters
-                    .recoverable_first_eligible_checks
+                capacity_eviction_non_ring_b_entry_total: reclaim_counters
+                    .capacity_eviction_non_ring_b_entry_total
                     .load(Ordering::Relaxed),
-                recoverable_first_route_absent_checks: reclaim_counters
-                    .recoverable_first_route_absent_checks
+                capacity_eviction_hit_committed_slot: reclaim_counters
+                    .capacity_eviction_hit_committed_slot
                     .load(Ordering::Relaxed),
-                recoverable_first_version_changed_checks: reclaim_counters
-                    .recoverable_first_version_changed_checks
-                    .load(Ordering::Relaxed),
-                recoverable_first_route_ineligible_checks: reclaim_counters
-                    .recoverable_first_route_ineligible_checks
-                    .load(Ordering::Relaxed),
-                recoverable_first_cpu_route_absent_checks: reclaim_counters
-                    .recoverable_first_cpu_route_absent_checks
-                    .load(Ordering::Relaxed),
-                recoverable_first_atomic_group_incomplete_checks: reclaim_counters
-                    .recoverable_first_atomic_group_incomplete_checks
-                    .load(Ordering::Relaxed),
-                recoverable_first_tp_cohort_incomplete_checks: reclaim_counters
-                    .recoverable_first_tp_cohort_incomplete_checks
+                eviction_reclaim_deduplicated: reclaim_counters
+                    .eviction_reclaim_deduplicated
                     .load(Ordering::Relaxed),
             });
         }
@@ -4493,7 +5187,7 @@ impl MasterKvRouter {
                         );
                         for node in snapshot.replica_cache_nodes {
                             tracing::info!(
-                                "replica cache runtime: owner={} entries={} weighted_bytes={} effective_capacity_bytes={} base_capacity_bytes={} reserved_capacity_bytes={} pending_eviction_reclaim_bytes={} writeback_tier1_entries={} writeback_tier1_weighted_bytes={} writeback_tier1_capacity_bytes={} writeback_tier1_triggered={} writeback_tier1_owner_accepted={} writeback_tier1_failed={} reclaim_master_activity_deferred={} reclaim_master_get_holder_observed={} reclaim_owner_holder_deferred={} reclaim_owner_other_deferred={} reclaim_route_changed={} reclaim_retry_queued={} reclaim_retry_completed={} reclaim_retry_restored={} reclaim_completed={} owner_hot_demotion_attempts={} owner_hot_demotion_cohorts={} owner_hot_demotion_selected_bytes={} owner_hot_demotion_precheck_rejected={} owner_hot_demotion_partial_mismatch={} recoverable_first_requested_bytes={} recoverable_first_selected_bytes={} recoverable_first_shortfall_bytes={} recoverable_first_eligible_checks={} recoverable_first_route_absent_checks={} recoverable_first_version_changed_checks={} recoverable_first_route_ineligible_checks={} recoverable_first_cpu_route_absent_checks={} recoverable_first_atomic_group_incomplete_checks={} recoverable_first_tp_cohort_incomplete_checks={}",
+                                "replica cache runtime: owner={} entries={} weighted_bytes={} effective_capacity_bytes={} base_capacity_bytes={} reserved_capacity_bytes={} pending_eviction_reclaim_bytes={} writeback_tier1_entries={} writeback_tier1_weighted_bytes={} writeback_tier1_capacity_bytes={} writeback_tier1_triggered={} writeback_tier1_owner_accepted={} writeback_tier1_failed={} reclaim_master_activity_deferred={} reclaim_owner_holder_deferred={} reclaim_owner_other_deferred={} reclaim_route_changed={} reclaim_retry_queued={} reclaim_retry_completed={} reclaim_retry_restored={} reclaim_completed={} source_evict_rpc_requests={} source_evict_cohorts={} source_evict_requested_bytes={} source_evict_accepted={} source_evict_in_progress={} source_evict_completed={} source_evict_retryable_busy={} source_evict_stale={} source_evict_rejected={} capacity_eviction_non_ring_b_entry_total={} capacity_eviction_hit_committed_slot={} eviction_reclaim_deduplicated={}",
                                 node.owner_node,
                                 node.entries,
                                 node.weighted_bytes,
@@ -4508,7 +5202,6 @@ impl MasterKvRouter {
                                 node.writeback_tier1_owner_accepted,
                                 node.writeback_tier1_failed,
                                 node.reclaim_master_activity_deferred,
-                                node.reclaim_master_get_holder_observed,
                                 node.reclaim_owner_holder_deferred,
                                 node.reclaim_owner_other_deferred,
                                 node.reclaim_route_changed,
@@ -4516,21 +5209,18 @@ impl MasterKvRouter {
                                 node.reclaim_retry_completed,
                                 node.reclaim_retry_restored,
                                 node.reclaim_completed,
-                                node.owner_hot_demotion_attempts,
-                                node.owner_hot_demotion_cohorts,
-                                node.owner_hot_demotion_selected_bytes,
-                                node.owner_hot_demotion_precheck_rejected,
-                                node.owner_hot_demotion_partial_mismatch,
-                                node.recoverable_first_requested_bytes,
-                                node.recoverable_first_selected_bytes,
-                                node.recoverable_first_shortfall_bytes,
-                                node.recoverable_first_eligible_checks,
-                                node.recoverable_first_route_absent_checks,
-                                node.recoverable_first_version_changed_checks,
-                                node.recoverable_first_route_ineligible_checks,
-                                node.recoverable_first_cpu_route_absent_checks,
-                                node.recoverable_first_atomic_group_incomplete_checks,
-                                node.recoverable_first_tp_cohort_incomplete_checks
+                                node.source_evict_rpc_requests,
+                                node.source_evict_cohorts,
+                                node.source_evict_requested_bytes,
+                                node.source_evict_accepted,
+                                node.source_evict_in_progress,
+                                node.source_evict_completed,
+                                node.source_evict_retryable_busy,
+                                node.source_evict_stale,
+                                node.source_evict_rejected,
+                                node.capacity_eviction_non_ring_b_entry_total,
+                                node.capacity_eviction_hit_committed_slot,
+                                node.eviction_reclaim_deduplicated,
                             );
                             metrics.set_kv_replica_cache_entries(
                                 node.owner_node.as_str(),

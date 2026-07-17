@@ -146,6 +146,15 @@ impl Lease {
         Ok(())
     }
 
+    /// Remove only the exact version installed by a failed route publication.
+    /// A newer Put may already have rebound the same key, so key-only removal
+    /// would be an ABA bug.
+    pub fn detach_key_if_version(&self, key: &str, put_id: PutIDForAKey) -> bool {
+        self.keys
+            .remove_if(key, |_, current_put_id| *current_put_id == put_id)
+            .is_some()
+    }
+
     // Note: no detach_all_keys semantics; deletion paths iterate keys directly.
 
     /// Get all keys with their put_id information

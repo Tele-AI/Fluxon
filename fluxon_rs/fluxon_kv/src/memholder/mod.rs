@@ -194,6 +194,30 @@ impl MemoryInfo {
                 .expect("segment cpu mem must be available when creating resident MemoryInfo");
             base_guard.allocated_addr
         };
+        Self::new_local_reserve_resident_with_base(
+            addr,
+            base_addr,
+            len,
+            key,
+            master_node_id,
+            view,
+            slot_size,
+            grant_id,
+            slot_index,
+        )
+    }
+
+    pub fn new_local_reserve_resident_with_base(
+        addr: u64,
+        base_addr: u64,
+        len: u32,
+        key: String,
+        master_node_id: NodeID,
+        view: ClientKvApiView,
+        slot_size: u64,
+        grant_id: u64,
+        slot_index: u32,
+    ) -> Self {
         assert!(
             addr >= base_addr,
             "resident local reserve addr must be within client segment: addr={:#x} base_addr={:#x}",

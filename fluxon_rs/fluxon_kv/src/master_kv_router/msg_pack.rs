@@ -17,11 +17,22 @@ pub enum GetAllocationMode {
     Temporary = 0,
     ReuseReplica = 1,
     DurableReplica = 2,
+    LocalCommittedSlot = 3,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct GetPreparedLocalReserveTarget {
+    pub grant_id: u64,
+    pub slot_index: u32,
+    pub slot_size: u64,
+    pub addr: u64,
+    pub base_addr: u64,
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct GetStartReq {
     pub key: String,
+    pub prepared_target: Option<GetPreparedLocalReserveTarget>,
 }
 impl MsgPackSerializePart for GetStartReq {
     fn msg_id(&self) -> u32 {
@@ -40,6 +51,9 @@ pub struct GetStartResp {
     pub target_base_addr: u64,
     pub src_base_addr: u64,
     pub len: u64,
+    /// Echoes the owner-local slot accepted as this Get's target.
+    pub prepared_target: Option<GetPreparedLocalReserveTarget>,
+    pub atomic_group: Option<PutAtomicGroup>,
     pub error_code: ErrorCode,
     pub error_json: String,
     /// Server-side processing time in microseconds for this RPC handler
@@ -107,6 +121,9 @@ impl RPCReq for GetDoneReq {
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct BatchGetStartReq {
     pub keys: Vec<String>,
+    /// Empty selects ordinary master allocations. Otherwise this must contain
+    /// exactly one entry per key.
+    pub prepared_targets: Vec<Option<GetPreparedLocalReserveTarget>>,
 }
 impl MsgPackSerializePart for BatchGetStartReq {
     fn msg_id(&self) -> u32 {
@@ -124,6 +141,8 @@ pub struct BatchGetStartItemResp {
     pub target_base_addr: u64,
     pub src_base_addr: u64,
     pub len: u64,
+    pub prepared_target: Option<GetPreparedLocalReserveTarget>,
+    pub atomic_group: Option<PutAtomicGroup>,
     pub error_code: ErrorCode,
     pub error_json: String,
 }
@@ -265,15 +284,7 @@ impl RPCReq for GetMasterOnlyMetricPartReq {
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct ReserveLocalGrantReq {
-    /// Slot class that needs capacity. Zero means a raw grant request with no reclaim fallback.
-    pub slot_size: u64,
-    /// Number of slots the owner is currently short of in this class.
-    pub required_free_slots: u32,
-    /// Reclaim committed slots before growing the physical grant pool. This keeps owner-local
-    /// free-slot headroom without changing the owner's advertised capacity.
-    pub reclaim_before_grow: bool,
-}
+pub struct ReserveLocalGrantReq {}
 impl MsgPackSerializePart for ReserveLocalGrantReq {
     fn msg_id(&self) -> u32 {
         MsgId::ReserveLocalGrantReq as u32
@@ -291,10 +302,6 @@ pub enum ReserveLocalGrantOutcome {
         addr: u64,
         base_addr: u64,
         len: u64,
-    },
-    Reclaimed {
-        slot_size: u64,
-        reclaimed_slots: u32,
     },
 }
 
@@ -334,7 +341,7 @@ pub enum OwnerReclaimItemState {
     Stale,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Default, Debug, Clone, Hash, PartialEq, Eq, Encode, Decode)]
 pub enum OwnerReclaimBacking {
     #[default]
     Allocation,
@@ -351,8 +358,73 @@ pub enum OwnerReclaimBacking {
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum OwnerReclaimReason {
     #[default]
-    Reserve,
-    CapacityEviction,
+    OwnerCapacityEviction,
+    MasterAllocationCapacity,
+}
+
+/// One exact owner-local source selected for capacity eviction.
+#[derive(Default, Debug, Clone, Hash, PartialEq, Eq, Encode, Decode)]
+pub struct OwnerSourceEvictionMember {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub backing: OwnerReclaimBacking,
+}
+
+/// Atomic/TP members which must enter the reclaim pipeline together.
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct OwnerSourceEvictionCohort {
+    pub members: Vec<OwnerSourceEvictionMember>,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchEvictOwnerSourceReq {
+    pub operation_id: u64,
+    /// Membership generation of the authenticated source owner.
+    pub owner_node_start_time: i64,
+    pub cohorts: Vec<OwnerSourceEvictionCohort>,
+}
+
+impl MsgPackSerializePart for BatchEvictOwnerSourceReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchEvictOwnerSourceReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum OwnerSourceEvictionOutcome {
+    #[default]
+    Unspecified,
+    Accepted,
+    AlreadyInProgress,
+    Completed,
+    RetryableBusy,
+    Stale,
+    RejectedNotEvictable,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct OwnerSourceEvictionCohortResp {
+    pub cohort_index: u32,
+    pub outcome: OwnerSourceEvictionOutcome,
+    pub detail: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchEvictOwnerSourceResp {
+    pub operation_id: u64,
+    pub cohorts: Vec<OwnerSourceEvictionCohortResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for BatchEvictOwnerSourceResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchEvictOwnerSourceResp as u32
+    }
+}
+
+impl RPCReq for BatchEvictOwnerSourceReq {
+    type Resp = BatchEvictOwnerSourceResp;
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -919,7 +991,6 @@ pub struct PutAppendStartReq {
     pub put_id: PutIDForAKey,
     pub len: u64,
     pub preferred_sub_cluster: Option<String>,
-    pub demote_source_on_remote_complete: bool,
     pub protect_source_on_remote_complete: bool,
 }
 impl MsgPackSerializePart for PutAppendStartReq {
@@ -927,9 +998,26 @@ impl MsgPackSerializePart for PutAppendStartReq {
         MsgId::PutAppendStartReq as u32
     }
 }
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum PutAppendStartOutcome {
+    /// Missing/old peers must not accidentally interpret a zero value as
+    /// successful completion.
+    #[default]
+    Unspecified,
+    Scheduled,
+    /// A complete non-source replica already exists for this exact put_id.
+    AlreadySatisfied,
+    /// The source route/version no longer exists; retry would target stale data.
+    Obsolete,
+    /// No remote allocation is available now. The owner keeps its local slot
+    /// and retries with backoff; this is never a demotion/drop instruction.
+    RetryableNoSpace,
+}
+
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct PutAppendStartResp {
-    pub scheduled: bool,
+    pub outcome: PutAppendStartOutcome,
     pub node_id: NodeIDString,
     pub target_addr: u64,
     pub target_base_addr: u64,
@@ -945,6 +1033,54 @@ impl MsgPackSerializePart for PutAppendStartResp {
 }
 impl RPCReq for PutAppendStartReq {
     type Resp = PutAppendStartResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutAppendStartItemReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub len: u64,
+    pub preferred_sub_cluster: Option<String>,
+    pub protect_source_on_remote_complete: bool,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutAppendStartReq {
+    pub items: Vec<BatchPutAppendStartItemReq>,
+}
+impl MsgPackSerializePart for BatchPutAppendStartReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPutAppendStartReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutAppendStartItemResp {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub outcome: PutAppendStartOutcome,
+    pub node_id: NodeIDString,
+    pub target_addr: u64,
+    pub target_base_addr: u64,
+    pub len: u64,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutAppendStartResp {
+    pub items: Vec<BatchPutAppendStartItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for BatchPutAppendStartResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPutAppendStartResp as u32
+    }
+}
+impl RPCReq for BatchPutAppendStartReq {
+    type Resp = BatchPutAppendStartResp;
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -995,6 +1131,47 @@ impl MsgPackSerializePart for PutAppendDoneResp {
 }
 impl RPCReq for PutAppendDoneReq {
     type Resp = PutAppendDoneResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutAppendDoneItemReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutAppendDoneReq {
+    pub items: Vec<BatchPutAppendDoneItemReq>,
+}
+impl MsgPackSerializePart for BatchPutAppendDoneReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPutAppendDoneReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutAppendDoneItemResp {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub appended: bool,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPutAppendDoneResp {
+    pub items: Vec<BatchPutAppendDoneItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for BatchPutAppendDoneResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPutAppendDoneResp as u32
+    }
+}
+impl RPCReq for BatchPutAppendDoneReq {
+    type Resp = BatchPutAppendDoneResp;
 }
 
 // --- RPC for MemHolder KeepAlive ---

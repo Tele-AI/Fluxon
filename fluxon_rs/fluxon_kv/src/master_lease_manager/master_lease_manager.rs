@@ -503,6 +503,21 @@ impl MasterLeaseManager {
         }
     }
 
+    /// Roll back one exact lease binding when its route publication did not
+    /// linearize.  This is synchronous because it only touches the lease's
+    /// DashMap and is used from completion rollback paths.
+    pub fn detach_key_if_version(
+        &self,
+        lease_id: LeaseID,
+        key: &str,
+        put_id: PutIDForAKey,
+    ) -> bool {
+        self.inner()
+            .leases
+            .get(&lease_id)
+            .is_some_and(|lease| lease.detach_key_if_version(key, put_id))
+    }
+
     /// Get lease information
     /// pub fn get_lease(&self, lease_id: LeaseID) -> Option<Arc<Lease>> {
     ///    let leases_guard = self.leases.read();

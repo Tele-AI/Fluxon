@@ -3481,7 +3481,7 @@ impl KvClient {
                         .client_kv_api_view()
                         .client_kv_api()
                         .inner()
-                        .reserve_local_grant(0, 0, false)
+                        .reserve_local_grant()
                         .await
                 })
             }) {
@@ -3501,12 +3501,6 @@ impl KvClient {
                     base_addr,
                     len,
                 }) => ApiResult::new_success((grant_id, addr, base_addr, len).into_py(py)),
-                Ok(ReserveLocalGrantOutcome::Reclaimed { .. }) => {
-                    ApiResult::new_error(new_general_error(
-                        py,
-                        "raw reserve_local_grant request unexpectedly reclaimed class slots",
-                    ))
-                }
                 Ok(ReserveLocalGrantOutcome::None) => {
                     unreachable!("reserve_local_grant filters empty successful outcomes")
                 }
@@ -4202,55 +4196,38 @@ impl KvClient {
                                     slot_ref.slot_index,
                                 )
                                 .await;
-                            inner.install_precommit_local_visible_memory_info(
-                                key,
-                                memory_info.clone(),
-                            );
+                            inner.install_precommit_local_visible_memory_info(key, memory_info);
                             let put_id = put_ids[idx];
-                            let promote = inner
-                                .promote_precommit_local_reserve_resident_slot_if_same(
-                                    key,
-                                    put_id,
-                                    memory_info.clone(),
-                                    atomic_groups[idx].as_ref(),
-                                );
-                            match promote {
-                                Ok(()) => {
-                                    inner.record_put_locality(false, owner_data.value_len, 0);
-                                    publish_items.push(OwnerLocalPublishItem {
-                                        key: key.clone(),
-                                        put_id,
-                                        value_len: owner_data.value_len,
-                                        lease_id: None,
-                                        committed_slot: PutDoneCommittedSlot {
-                                            grant_id: slot_ref.grant_id,
-                                            slot_index: slot_ref.slot_index,
-                                            slot_size,
-                                            addr: slot_ref.ptr,
-                                            base_addr: slot_ref.base_addr,
-                                            len: owner_data.value_len,
-                                        },
-                                        make_replica_task: *make_replica_task,
-                                        preferred_sub_cluster: None,
-                                        atomic_group: atomic_groups[idx].clone(),
-                                    });
-                                    ret_codes.push(0);
-                                }
-                                Err(err) => {
-                                    let _ = inner
-                                        .remove_precommit_local_reserve_resident_slot_if_same(
-                                            key,
-                                            &memory_info,
-                                        );
-                                    ret_codes.push(kv_error_to_ret_code(&err));
-                                }
-                            }
+                            inner.record_put_locality(false, owner_data.value_len, 0);
+                            publish_items.push(OwnerLocalPublishItem {
+                                key: key.clone(),
+                                put_id,
+                                value_len: owner_data.value_len,
+                                lease_id: None,
+                                committed_slot: PutDoneCommittedSlot {
+                                    grant_id: slot_ref.grant_id,
+                                    slot_index: slot_ref.slot_index,
+                                    slot_size,
+                                    addr: slot_ref.ptr,
+                                    base_addr: slot_ref.base_addr,
+                                    len: owner_data.value_len,
+                                },
+                                make_replica_task: *make_replica_task,
+                                preferred_sub_cluster: None,
+                                atomic_group: atomic_groups[idx].clone(),
+                            });
+                            ret_codes.push(0);
                         }
                         if !publish_items.is_empty() {
+                            let publish_keys = publish_items
+                                .iter()
+                                .map(|item| item.key.clone())
+                                .collect::<Vec<_>>();
                             if let Err(err) = inner
                                 .enqueue_owner_local_publish(OwnerLocalPublishJob {
                                     items: publish_items,
                                     key_reservation_ids: owner_data.key_reservation_ids.clone(),
+                                    external_pending_contexts: Vec::new(),
                                 })
                                 .await
                             {
@@ -4258,6 +4235,17 @@ impl KvClient {
                                     "local_fast_put_commit owner local publish enqueue failed after local commit: {}",
                                     err
                                 );
+                                for key in publish_keys {
+                                    if let Some(memory_info) =
+                                        inner.precommit_local_visible_memory_info(&key)
+                                    {
+                                        let _ = inner
+                                            .remove_precommit_local_reserve_resident_slot_if_same(
+                                                &key,
+                                                &memory_info,
+                                            );
+                                    }
+                                }
                                 if let Err(cleanup_err) = release_put_key_reservations_only(
                                     inner,
                                     owner_data.key_reservation_ids,

@@ -10,10 +10,17 @@ const OWNER_LOCAL_RESERVE_REBALANCE_INTERVAL: Duration = Duration::from_millis(2
 const OWNER_LOCAL_RESERVE_SHRINK_IDLE_COOLDOWN: Duration = Duration::from_secs(5);
 const OWNER_LOCAL_RESERVE_SHRINK_GROW_COOLDOWN: Duration = Duration::from_secs(1);
 const OWNER_LOCAL_RESERVE_DEFAULT_SOFT_WAIT_TIMEOUT: Duration = Duration::from_millis(10);
-const OWNER_LOCAL_RESERVE_DEFAULT_HARD_TIMEOUT: Duration = Duration::from_secs(10);
+// Cohort-safe master route deletion plus owner slot release is asynchronous.
+// Thirty seconds turns a recoverable pressure burst into a storage exception that
+// can wedge SGLang's detokenizer.  This remains well below the external request
+// timeout while allowing bounded backpressure to finish reclaiming slots.
+const OWNER_LOCAL_RESERVE_DEFAULT_HARD_TIMEOUT: Duration = Duration::from_secs(30);
 const OWNER_LOCAL_RESERVE_MIN_GRANTS_PER_CLASS: usize = 0;
 const OWNER_LOCAL_RESERVE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 const OWNER_LOCAL_RESERVE_FREE_SLOT_HEADROOM_GRANTS: usize = 4;
+const OWNER_SLOT_PRESSURE_INTERVAL: Duration = Duration::from_millis(10);
+const OWNER_SLOT_PRESSURE_MIN_KICK_INTERVAL: Duration = Duration::from_millis(200);
+const OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct ExpectedCapacityLayout {
@@ -32,6 +39,7 @@ struct RebalanceClassSnapshot {
     free_slots: usize,
     grant_count: usize,
     pending_slot_demand: usize,
+    max_observed_claim_slots: usize,
     expected_grant_count: usize,
 }
 
@@ -49,7 +57,43 @@ fn owner_local_reserve_target_grant_count(
     let slots_per_grant = slots_per_grant as usize;
     let demand_grants =
         required_slots / slots_per_grant + usize::from(required_slots % slots_per_grant != 0);
-    demand_grants.max(expected_grant_count)
+    if expected_grant_count == 0 {
+        demand_grants
+    } else {
+        // A configured expected capacity is the owner's physical slot budget,
+        // not a minimum that demand may grow past.  Once all expected grants
+        // are installed, additional demand must be served by owner-local
+        // source eviction/reclaim; asking the master for another grant silently
+        // changes the configured owner capacity and can starve the remote
+        // allocation domain.
+        expected_grant_count
+    }
+}
+
+fn owner_slot_pressure_request_bytes(
+    snapshot: RebalanceClassSnapshot,
+    outstanding_selection_debt_bytes: u64,
+) -> u64 {
+    let low_watermark = (snapshot.slots_per_grant as usize)
+        .saturating_mul(2)
+        .max(snapshot.max_observed_claim_slots);
+    let high_watermark = (snapshot.slots_per_grant as usize)
+        .saturating_mul(OWNER_LOCAL_RESERVE_FREE_SLOT_HEADROOM_GRANTS);
+    let projected_eviction_slots =
+        usize::try_from(outstanding_selection_debt_bytes / snapshot.slot_size.max(1))
+            .unwrap_or(usize::MAX);
+    let projected_free_slots = snapshot.free_slots.saturating_add(projected_eviction_slots);
+    let pressure_active =
+        snapshot.pending_slot_demand > snapshot.free_slots || projected_free_slots < low_watermark;
+    if !pressure_active {
+        return 0;
+    }
+    let desired_free_slots = snapshot.pending_slot_demand.saturating_add(high_watermark);
+    let selection_slots = desired_free_slots.saturating_sub(projected_free_slots);
+    u64::try_from(selection_slots)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(snapshot.slot_size)
+        .min(OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES)
 }
 
 fn owner_local_reserve_desired_free_slots(snapshot: RebalanceClassSnapshot) -> usize {
@@ -111,6 +155,7 @@ fn snapshot_rebalance_classes(pool: &OwnerLocalReservePoolState) -> Vec<Rebalanc
             free_slots: class_state.free_slot_count(),
             grant_count: class_state.grant_count(),
             pending_slot_demand: class_state.pending_slot_demand,
+            max_observed_claim_slots: class_state.max_observed_claim_slots,
             expected_grant_count: class_state.expected_grant_count,
         })
         .collect()
@@ -156,17 +201,8 @@ async fn try_refill_once(inner: &ClientKvApiInner, snapshot: RebalanceClassSnaps
     let mut total_rpc_latency = Duration::ZERO;
     let mut max_rpc_latency = Duration::ZERO;
     for _ in 0..additional_grants {
-        let missing_slots = desired_free_slots
-            .saturating_sub(snapshot.free_slots)
-            .max(1);
-        let required_free_slots = u32::try_from(missing_slots).unwrap_or(u32::MAX);
-        let reclaim_before_grow = snapshot.expected_grant_count != 0
-            && snapshot.grant_count >= snapshot.expected_grant_count;
         let rpc_started_at = Instant::now();
-        let outcome = match inner
-            .reserve_local_grant(snapshot.slot_size, required_free_slots, reclaim_before_grow)
-            .await
-        {
+        let outcome = match inner.reserve_local_grant().await {
             Ok(outcome) => {
                 let rpc_latency = rpc_started_at.elapsed();
                 total_rpc_latency = total_rpc_latency.saturating_add(rpc_latency);
@@ -197,22 +233,6 @@ async fn try_refill_once(inner: &ClientKvApiInner, snapshot: RebalanceClassSnaps
                 base_addr,
                 len,
             } => (grant_id, base_addr, addr, len),
-            ReserveLocalGrantOutcome::Reclaimed {
-                slot_size,
-                reclaimed_slots,
-            } => {
-                assert_eq!(slot_size, snapshot.slot_size);
-                tracing::info!(
-                    "owner local reserve reused reclaimed slots: slot_size={} reclaimed_slots={} pending_slots={}",
-                    slot_size,
-                    reclaimed_slots,
-                    snapshot.pending_slot_demand
-                );
-                inner
-                    .owner_local_reserve_rebalance_notify()
-                    .notify_waiters();
-                return;
-            }
             ReserveLocalGrantOutcome::None => {
                 unreachable!("reserve_local_grant filters empty successful outcomes")
             }
@@ -246,7 +266,7 @@ async fn try_refill_once(inner: &ClientKvApiInner, snapshot: RebalanceClassSnaps
                 OwnerLocalReserveClassState::new(snapshot.slot_size, snapshot.slots_per_grant)
             });
             class_state.last_grow_at = Some(Instant::now());
-            class_state.grants.push(detached_grant);
+            class_state.install_grant(detached_grant);
         }
         added_grants += 1;
         inner
@@ -272,16 +292,13 @@ async fn try_refill_once(inner: &ClientKvApiInner, snapshot: RebalanceClassSnaps
 
 fn detach_excess_fully_free_grant(
     class_state: &mut OwnerLocalReserveClassState,
-    get_target_pressure: bool,
-) -> Option<(usize, super::OwnerLocalReserveGrantState)> {
-    if !get_target_pressure {
-        let grow_cooldown_ok = class_state
-            .last_grow_at
-            .map(|last_grow_at| last_grow_at.elapsed() >= OWNER_LOCAL_RESERVE_SHRINK_GROW_COOLDOWN)
-            .unwrap_or(true);
-        if !grow_cooldown_ok {
-            return None;
-        }
+) -> Option<super::OwnerLocalReserveGrantState> {
+    let grow_cooldown_ok = class_state
+        .last_grow_at
+        .map(|last_grow_at| last_grow_at.elapsed() >= OWNER_LOCAL_RESERVE_SHRINK_GROW_COOLDOWN)
+        .unwrap_or(true);
+    if !grow_cooldown_ok {
+        return None;
     }
     let shrink_keep_grants = owner_local_reserve_target_grant_count(
         class_state.slots_per_grant,
@@ -290,30 +307,19 @@ fn detach_excess_fully_free_grant(
         class_state.expected_grant_count,
     )
     .max(OWNER_LOCAL_RESERVE_MIN_GRANTS_PER_CLASS);
-    if class_state.grants.len() <= shrink_keep_grants {
+    if class_state.grant_count() <= shrink_keep_grants {
         return None;
     }
 
-    let candidate_index = if get_target_pressure {
-        // A physical Get-target allocation can be blocked while reclaimed slots remain trapped in
-        // a detached 512-MiB reserve grant. Under explicit pressure, any fully-free excess grant is
-        // safe to return; restricting the actor to the tail would leave allocator space stranded.
-        class_state
-            .grants
-            .iter()
-            .rposition(super::OwnerLocalReserveGrantState::is_fully_free)
-    } else {
-        let tail_index = class_state.grants.len().checked_sub(1)?;
-        class_state.grants.get(tail_index).and_then(|grant| {
-            (grant.is_fully_free()
-                && grant
-                    .fully_free_since
-                    .map(|since| since.elapsed() >= OWNER_LOCAL_RESERVE_SHRINK_IDLE_COOLDOWN)
-                    .unwrap_or(false))
-            .then_some(tail_index)
-        })
-    }?;
-    Some((candidate_index, class_state.grants.remove(candidate_index)))
+    let candidate_grant_id = class_state.grants.last().and_then(|grant| {
+        (grant.is_fully_free()
+            && grant
+                .fully_free_since
+                .map(|since| since.elapsed() >= OWNER_LOCAL_RESERVE_SHRINK_IDLE_COOLDOWN)
+                .unwrap_or(false))
+        .then_some(grant.grant_id)
+    })?;
+    class_state.detach_fully_free_grant(candidate_grant_id)
 }
 
 async fn try_shrink_once(inner: &ClientKvApiInner, snapshot: RebalanceClassSnapshot) {
@@ -322,10 +328,10 @@ async fn try_shrink_once(inner: &ClientKvApiInner, snapshot: RebalanceClassSnaps
         let Some(class_state) = pool.classes.get_mut(&snapshot.slot_size) else {
             return;
         };
-        detach_excess_fully_free_grant(class_state, false)
+        detach_excess_fully_free_grant(class_state)
     };
 
-    let Some((grant_index, grant)) = detached else {
+    let Some(grant) = detached else {
         return;
     };
 
@@ -339,9 +345,7 @@ async fn try_shrink_once(inner: &ClientKvApiInner, snapshot: RebalanceClassSnaps
         let class_state = pool.classes.entry(snapshot.slot_size).or_insert_with(|| {
             OwnerLocalReserveClassState::new(snapshot.slot_size, snapshot.slots_per_grant)
         });
-        class_state
-            .grants
-            .insert(grant_index.min(class_state.grants.len()), grant);
+        class_state.install_grant(grant);
     } else {
         tracing::info!(
             "owner local reserve released excess grant: slot_size={} grant_id={} pending_slots={}",
@@ -352,71 +356,9 @@ async fn try_shrink_once(inner: &ClientKvApiInner, snapshot: RebalanceClassSnaps
     }
 }
 
-/// Return one fully-free reserve grant immediately when an ordinary local Get-target allocation
-/// reports physical NoSpace. This never shrinks below the configured/active reserve target and does
-/// not evict a live slot; it only makes already-free physical capacity visible to the master
-/// allocator without waiting for the periodic idle cooldown.
-pub(crate) async fn release_one_excess_reserve_grant_for_get_target_pressure(
-    inner: &ClientKvApiInner,
-) -> bool {
-    let detached = {
-        let mut pool = inner.owner_local_reserve_pool.lock();
-        let mut detached = None;
-        for class_state in pool.classes.values_mut() {
-            if let Some((grant_index, grant)) = detach_excess_fully_free_grant(class_state, true) {
-                detached = Some((
-                    class_state.slot_size,
-                    class_state.slots_per_grant,
-                    class_state.pending_slot_demand,
-                    grant_index,
-                    grant,
-                ));
-                break;
-            }
-        }
-        detached
-    };
-    let Some((slot_size, slots_per_grant, pending_slots, grant_index, grant)) = detached else {
-        return false;
-    };
-    let grant_id = grant.grant_id;
-
-    if let Err(err) = inner.release_local_grant(grant_id).await {
-        tracing::warn!(
-            "owner local reserve get-target pressure failed to release grant_id={} err={}",
-            grant_id,
-            err
-        );
-        let mut pool = inner.owner_local_reserve_pool.lock();
-        let class_state = pool
-            .classes
-            .entry(slot_size)
-            .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
-        class_state
-            .grants
-            .insert(grant_index.min(class_state.grants.len()), grant);
-        inner
-            .owner_local_reserve_rebalance_notify()
-            .notify_waiters();
-        false
-    } else {
-        tracing::info!(
-            "owner local reserve released excess grant for get-target pressure: slot_size={} grant_id={} pending_slots={}",
-            slot_size,
-            grant_id,
-            pending_slots
-        );
-        inner
-            .owner_local_reserve_rebalance_notify()
-            .notify_waiters();
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_kv_api::OwnerLocalReserveGrantState;
 
     const SLOT_SIZE: u64 = 8 * 1024 * 1024;
 
@@ -456,10 +398,10 @@ mod tests {
     }
 
     #[test]
-    fn default_hard_timeout_covers_pressure_reclaim_transaction() {
+    fn default_hard_timeout_covers_owner_source_eviction_transaction() {
         assert_eq!(
             OWNER_LOCAL_RESERVE_DEFAULT_HARD_TIMEOUT,
-            Duration::from_secs(10)
+            Duration::from_secs(30)
         );
         assert!(
             OWNER_LOCAL_RESERVE_DEFAULT_HARD_TIMEOUT > OWNER_LOCAL_RESERVE_SHRINK_IDLE_COOLDOWN
@@ -475,6 +417,7 @@ mod tests {
             free_slots: 64 * 4,
             grant_count: 232,
             pending_slot_demand: 0,
+            max_observed_claim_slots: 0,
             expected_grant_count: 232,
         };
         assert_eq!(owner_local_reserve_desired_free_slots(snapshot), 64 * 4);
@@ -500,62 +443,71 @@ mod tests {
                 owner_local_reserve_desired_free_slots(pressured),
                 pressured.expected_grant_count,
             ),
-            233
+            232
         );
     }
 
     #[test]
-    fn get_target_pressure_can_detach_a_non_tail_fully_free_excess_grant() {
-        let mut class_state = OwnerLocalReserveClassState::new(SLOT_SIZE, 2);
-        class_state.expected_grant_count = 1;
-        for grant_id in 1..=3 {
-            class_state.grants.push(OwnerLocalReserveGrantState::new(
-                grant_id,
-                0,
-                grant_id * 1024,
-                1024,
-                SLOT_SIZE,
-                2,
-            ));
-        }
-        class_state.grants[0]
-            .claim_prepared_slot()
-            .expect("first grant must have a slot");
-        class_state.grants[2]
-            .claim_prepared_slot()
-            .expect("tail grant must have a slot");
-
-        assert!(detach_excess_fully_free_grant(&mut class_state, false).is_none());
-        let (index, grant) = detach_excess_fully_free_grant(&mut class_state, true)
-            .expect("pressure shrink must find the free middle grant");
-        assert_eq!(index, 1);
-        assert_eq!(grant.grant_id, 2);
-        assert_eq!(class_state.grants.len(), 2);
+    fn configured_expected_grants_are_a_hard_upper_bound() {
+        assert_eq!(
+            owner_local_reserve_target_grant_count(64, 64 * 300, 64, 232),
+            232
+        );
+        assert_eq!(
+            owner_local_reserve_target_grant_count(64, 64 * 300, 64, 0),
+            301
+        );
     }
 
     #[test]
-    fn get_target_pressure_never_shrinks_below_active_or_expected_target() {
-        let mut class_state = OwnerLocalReserveClassState::new(SLOT_SIZE, 2);
-        class_state.expected_grant_count = 2;
-        for grant_id in 1..=2 {
-            class_state.grants.push(OwnerLocalReserveGrantState::new(
-                grant_id,
+    fn owner_slot_pressure_targets_pending_plus_high_watermark() {
+        let snapshot = RebalanceClassSnapshot {
+            slot_size: 1024 * 1024,
+            slots_per_grant: 4,
+            used_slots: 4,
+            free_slots: 1,
+            grant_count: 1,
+            pending_slot_demand: 3,
+            max_observed_claim_slots: 3,
+            expected_grant_count: 1,
+        };
+        assert_eq!(
+            owner_slot_pressure_request_bytes(snapshot, 0),
+            18 * 1024 * 1024,
+            "3 pending slots plus 16 slots of retained headroom minus one physical Free"
+        );
+        assert_eq!(
+            owner_slot_pressure_request_bytes(snapshot, 10 * 1024 * 1024),
+            8 * 1024 * 1024,
+            "exact selected debt contributes projected slots of the same class"
+        );
+        assert_eq!(
+            owner_slot_pressure_request_bytes(
+                RebalanceClassSnapshot {
+                    free_slots: 16,
+                    pending_slot_demand: 0,
+                    ..snapshot
+                },
                 0,
-                grant_id * 1024,
-                1024,
-                SLOT_SIZE,
-                2,
-            ));
-        }
-        assert!(detach_excess_fully_free_grant(&mut class_state, true).is_none());
+            ),
+            0,
+            "pressure stops after the high watermark is physically available"
+        );
 
-        class_state.expected_grant_count = 0;
-        for grant in &mut class_state.grants {
-            grant
-                .claim_prepared_slot()
-                .expect("each grant must have a slot");
-        }
-        assert!(detach_excess_fully_free_grant(&mut class_state, true).is_none());
+        let clamped = RebalanceClassSnapshot {
+            slot_size: 8 * 1024 * 1024,
+            slots_per_grant: 64,
+            used_slots: 64,
+            free_slots: 1,
+            grant_count: 1,
+            pending_slot_demand: 100,
+            max_observed_claim_slots: 100,
+            expected_grant_count: 1,
+        };
+        assert_eq!(
+            owner_slot_pressure_request_bytes(clamped, 0),
+            OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES
+        );
     }
 }
 
@@ -646,6 +598,107 @@ pub fn spawn_owner_local_reserve_rebalance_actor(view: ClientKvApiView) {
                 report_owner_local_reserve_state(view_task.client_kv_api().inner());
                 last_report_at = Instant::now();
             }
+        }
+    });
+}
+
+/// Drive owner slot pressure outside RPC handlers and outside Tokio's worker
+/// threads.  This is the sole production call site for Moka's synchronous
+/// `evict_some`: selection is deliberately bounded, and the returned weight
+/// means only "source-eviction candidates selected", never "slots reclaimed".
+pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
+    let view_task = view.clone();
+    view.spawn("owner_slot_pressure_actor", async move {
+        let shutdown_poller = view_task.register_shutdown_poller();
+        let mut shutdown_waiter = view_task.register_shutdown_waiter();
+        let notify = view_task
+            .client_kv_api()
+            .inner()
+            .owner_local_reserve_rebalance_notify();
+        let mut tick = tokio::time::interval(OWNER_SLOT_PRESSURE_INTERVAL);
+        let mut last_kick_at: Option<Instant> = None;
+        let mut last_unsupported_class_report_at: Option<Instant> = None;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_waiter.wait() => {
+                    tracing::info!("owner slot pressure actor stopped by shutdown");
+                    return;
+                }
+                _ = tick.tick() => {}
+                _ = notify.notified() => {}
+            }
+            if !shutdown_poller.is_running() {
+                return;
+            }
+
+            let inner = view_task.client_kv_api().inner();
+            if last_kick_at
+                .is_some_and(|last| last.elapsed() < OWNER_SLOT_PRESSURE_MIN_KICK_INTERVAL)
+            {
+                continue;
+            }
+            let outstanding_selection_debt_bytes = inner
+                .owner_hot_counters
+                .selection_debt_bytes
+                .load(std::sync::atomic::Ordering::Acquire);
+            let requested_bytes = {
+                let pool = inner.owner_local_reserve_pool.lock();
+                let snapshots = snapshot_rebalance_classes(&pool);
+                match snapshots.as_slice() {
+                    // No local allocation class has been observed yet.  This is
+                    // the normal idle state, not a configuration error.
+                    [] => 0,
+                    [snapshot] => owner_slot_pressure_request_bytes(
+                        *snapshot,
+                        outstanding_selection_debt_bytes,
+                    ),
+                    _ => {
+                        // Selection is intentionally disabled until the victim
+                        // cache is class-indexed.  Rate-limit the diagnostic so
+                        // an unsupported configuration cannot become a 100 Hz
+                        // logging/CPU loop.
+                        if last_unsupported_class_report_at.is_none_or(|last| {
+                            last.elapsed() >= OWNER_LOCAL_RESERVE_REPORT_INTERVAL
+                        }) {
+                            tracing::error!(
+                                active_classes = snapshots.len(),
+                                "owner slot pressure requires a class-indexed victim domain when more than one size class is active"
+                            );
+                            last_unsupported_class_report_at = Some(Instant::now());
+                        }
+                        0
+                    }
+                }
+            };
+            if requested_bytes == 0 {
+                continue;
+            }
+            let Some(cache) = inner.owner_hot_cache.clone() else {
+                continue;
+            };
+            let selected_bytes = match limit_thirdparty::tokio::task::spawn_blocking(move || {
+                cache.evict_some(requested_bytes)
+            })
+            .await
+            {
+                Ok(selected_bytes) => selected_bytes,
+                Err(err) => {
+                    tracing::warn!(
+                        requested_bytes,
+                        err = ?err,
+                        "owner slot pressure Moka selection task failed"
+                    );
+                    continue;
+                }
+            };
+            last_kick_at = Some(Instant::now());
+            tracing::debug!(
+                requested_bytes,
+                selected_bytes,
+                "owner slot pressure selected bounded source-eviction candidates"
+            );
         }
     });
 }

@@ -89,8 +89,8 @@ async fn apply_delete_client_kv_meta_cache_item(
     let client_api = view.client_kv_api();
     let client_inner = client_api.inner();
 
-    let cached_info = {
-        let controls = client_inner.owner_key_control.lock();
+    let (cached_info, pending_get) = {
+        let controls = client_inner.owner_key_control.lock_key(&delete_item.key);
         if controls
             .get(&delete_item.key)
             .is_some_and(|state| state.reclaim.is_some())
@@ -133,8 +133,19 @@ async fn apply_delete_client_kv_meta_cache_item(
                     snapshot.put_time_ms <= delete_item.put_time_ms
                 }
             });
-        cached_info
+        let pending_get = client_inner
+            .pending_local_get_info
+            .remove_if(&delete_item.key, |_, pending| {
+                if pending.put_id.0 == delete_item.put_time_ms {
+                    pending.put_id.1 <= delete_item.put_version
+                } else {
+                    pending.put_id.0 <= delete_item.put_time_ms
+                }
+            })
+            .map(|(_, pending)| pending);
+        (cached_info, pending_get)
     };
+    drop(pending_get);
     if let Some(cached_info) = cached_info {
         client_inner.owner_hot_invalidate_version(
             &delete_item.key,

@@ -1,5 +1,7 @@
 use crate::client_kv_api::delete::handle_batch_delete_client_kv_meta_cache;
-use crate::client_kv_api::local_reserve_rebalance::spawn_owner_local_reserve_rebalance_actor;
+use crate::client_kv_api::local_reserve_rebalance::{
+    spawn_owner_local_reserve_rebalance_actor, spawn_owner_slot_pressure_actor,
+};
 use crate::client_kv_api::msg_pack::{
     ExternalBatchGetCancelReq, ExternalBatchGetCancelResp, ExternalBatchGetReq,
     ExternalBatchGetResp, ExternalBatchGetStartReq, ExternalBatchGetStartResp,
@@ -18,10 +20,11 @@ use crate::cluster_manager::{NodeID, NodeIDString};
 use crate::config::TestSpecConfig;
 use crate::master_kv_router::msg_pack::{
     BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchEnqueueReplicaTaskReq,
-    BatchGetDoneReq, BatchGetRevokeReq, BatchGetStartItemResp, BatchGetStartReq, BatchIsExistReq,
-    BatchOwnerReclaimReq, BatchPreparePutKeysReq, BatchPutDoneReq, BatchPutRevokeReq,
-    BatchPutStartReq, BatchReleasePutKeyReservationsReq, CountPrefixReq,
-    DeleteClientKvMetaCacheItem, GroupedBatchPutDoneReq,
+    BatchEvictOwnerSourceReq, BatchGetDoneReq, BatchGetRevokeReq, BatchGetStartItemResp,
+    BatchGetStartReq, BatchIsExistReq, BatchOwnerReclaimReq, BatchPreparePutKeysReq,
+    BatchPutAppendDoneReq, BatchPutAppendStartReq, BatchPutDoneReq, BatchPutRevokeReq,
+    BatchPutStartReq, BatchReleasePutKeyReservationsReq, DeleteClientKvMetaCacheItem,
+    GroupedBatchPutDoneReq,
 };
 use crate::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
 use crate::memholder::{AllMemholderRefCount, ExternalMemHolderInfo, MemoryInfo, UserMemHolder};
@@ -32,14 +35,11 @@ use crate::memholder::{
 use crate::{
     client_seg_pool::{ClientSegPool, ClientSegPoolAccessTrait, ResolveSideTransferLaneReq},
     client_transfer_engine::{ClientTransferEngine, ClientTransferEngineAccessTrait},
-    cluster_manager::{
-        ClusterEvent, ClusterManager, ClusterManagerAccessTrait,
-        app_logic_ext::{ClusterManagerAppLogicExt, ClusterManagerExtError},
-    },
+    cluster_manager::{ClusterEvent, ClusterManager, ClusterManagerAccessTrait},
     master_kv_router::msg_pack::{
-        DeleteAckReq, DeleteReq, GetDoneReq, GetMetaReq, GetRevokeReq, GetStartReq,
-        MemHolderKeepAliveReq, PutAppendDoneReq, PutAppendRevokeReq, PutAppendStartReq, PutDoneReq,
-        PutRevokeReq, PutStartReq, ReleaseLocalGrantReq, ReserveLocalGrantReq,
+        DeleteReq, GetDoneReq, GetMetaReq, GetRevokeReq, GetStartReq, PutAppendDoneReq,
+        PutAppendRevokeReq, PutAppendStartReq, PutDoneReq, PutRevokeReq, PutStartReq,
+        ReleaseLocalGrantReq, ReserveLocalGrantReq,
     },
     metric_reporter::{MetricReporter, MetricReporterAccessTrait},
     metrics::{KvLocalitySnapshot, MetricsHandle, OperationKind, RequestStage},
@@ -50,17 +50,16 @@ use crate::{
     rpcresp_kvresult_convert::msg_and_error::{ApiError, ErrorCode, KvError, KvResult},
 };
 use async_trait::async_trait;
-use crossbeam::queue::SegQueue;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use fluxon_framework::{LogicalModule, define_module};
-use fluxon_framework_compiled::upgrade_view_guard::UpgradeViewGuard;
 use fluxon_util::map_lock::AMapLock;
 use limit_thirdparty::tokio;
 use moka::notification::RemovalCause;
 use moka::ops::compute::Op as MokaComputeOp;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::sync::Weak;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -71,7 +70,6 @@ const REPLICA_TASK_QUEUE_CAPACITY: usize = 128;
 // Queue only weak source references. This preserves a deep policy backlog without turning queued
 // write-back work into non-reclaimable owner memory; the dispatcher pins a still-current source
 // immediately before handing it to the bounded replica-task actor.
-const OWNER_HOT_EVICTION_QUEUE_CAPACITY: usize = 4096;
 const OWNER_LOCAL_PUBLISH_QUEUE_CAPACITY: usize = 4096;
 const OWNER_LOCAL_PUBLISH_MAX_INFLIGHT: usize = 64;
 
@@ -80,6 +78,10 @@ const OWNER_LOCAL_PUBLISH_MAX_INFLIGHT: usize = 64;
 pub struct ExternalHoldingGetInfo {
     pub key: String,
     pub req_node_id: String,
+    /// Requester membership generation observed when this holding was
+    /// installed. Unknown generations are never removed by generation-scoped
+    /// MemberLeft cleanup.
+    pub requester_node_start_time: Option<i64>,
     pub memory_info: Arc<MemoryInfo>, // The actual memholder being held
 }
 
@@ -87,25 +89,35 @@ pub struct ExternalHoldingGetInfo {
 pub struct OwnerRuntimeObserveSnapshot {
     pub external_get_holding_entries: u64,
     pub external_get_holding_bytes: u64,
+    pub external_get_start_handles: u64,
+    pub external_get_flights: u64,
+    pub external_get_flights_starting: u64,
+    pub external_get_flights_finishing: u64,
+    pub external_get_flights_revoking: u64,
+    pub external_get_undecided_interests: u64,
+    pub external_get_retained_interests: u64,
     pub external_pending_put_entries: u64,
+    pub local_reserve_slots_free: u64,
+    pub local_reserve_slots_prepared: u64,
+    pub local_reserve_slots_pending_visible: u64,
+    pub local_reserve_slots_committed: u64,
     pub hot_cache_capacity_bytes: u64,
     pub hot_cache_entries: u64,
     pub hot_cache_weighted_bytes: u64,
     pub hot_size_evictions: u64,
-    pub hot_replica_enqueued: u64,
-    pub hot_replica_completed: u64,
-    pub hot_replica_already_satisfied: u64,
-    pub hot_replica_failed: u64,
-    pub hot_replica_obsolete: u64,
-    pub hot_replica_dispatch_failed: u64,
-    pub hot_replica_inflight: u64,
+    pub hot_source_evict_handoff_members: u64,
+    pub hot_source_evict_committed_members: u64,
+    pub hot_source_evict_restored_members: u64,
+    pub hot_source_evict_obsolete: u64,
+    pub hot_source_evict_dispatch_failed: u64,
+    pub hot_source_eviction_selected: u64,
+    pub hot_source_evict_retry_entries: u64,
+    pub hot_source_evict_retry_scheduled: u64,
+    pub hot_source_evict_retry_emitted: u64,
+    pub hot_selection_debt_bytes: u64,
     pub hot_eviction_skipped_stale: u64,
     pub hot_eviction_skipped_reclaim: u64,
-    pub hot_eviction_skipped_duplicate: u64,
     pub hot_group_registry_entries: u64,
-    pub hot_group_replica_triggered: u64,
-    pub hot_group_replica_triggers: u64,
-    pub hot_group_members_enqueued: u64,
     pub hot_group_trigger_duplicates: u64,
     pub hot_group_trigger_incomplete: u64,
     pub grouped_put_done_batches: u64,
@@ -125,20 +137,128 @@ pub type ExternalGetStartTransferOutput =
     Vec<KvResult<Option<(Arc<UserMemHolder>, Option<RemoteGetInfo>)>>>;
 
 pub enum ExternalGetStartOwnerItem {
-    Local {
-        memory_info: Arc<MemoryInfo>,
-    },
+    Local { memory_info: Arc<MemoryInfo> },
+    Shared { interest: ExternalGetKeyInterest },
+}
+
+/// One request's interest in a per-key Get flight.
+///
+/// A pending prefix decision is owned by this guard, not by control flow.  If
+/// the request future is cancelled at any await point, Drop retires the
+/// undecided count so the cohort task can still choose Finish or Revoke.
+pub struct ExternalGetKeyInterest {
+    op: Arc<ExternalGetKeySharedOp>,
+    decision_pending: bool,
+}
+
+impl ExternalGetKeyInterest {
+    pub fn new(op: Arc<ExternalGetKeySharedOp>, decision_pending: bool) -> Self {
+        Self {
+            op,
+            decision_pending,
+        }
+    }
+
+    pub fn op(&self) -> &Arc<ExternalGetKeySharedOp> {
+        &self.op
+    }
+
+    pub fn decide(&mut self, retain: bool) {
+        if !self.decision_pending {
+            return;
+        }
+        self.decision_pending = false;
+
+        let wake = {
+            let mut state = self.op.state.lock();
+            if state.undecided == 0 {
+                tracing::error!(
+                    "external Get interest observed undecided underflow: key={}",
+                    self.op.key
+                );
+                return;
+            }
+            state.undecided -= 1;
+            if retain
+                && matches!(
+                    state.phase,
+                    ExternalGetKeySharedPhase::Starting | ExternalGetKeySharedPhase::Started { .. }
+                )
+            {
+                state.retained = state
+                    .retained
+                    .checked_add(1)
+                    .expect("external Get singleflight retained overflow");
+            }
+            state.undecided == 0
+        };
+        if wake {
+            self.op.notify.notify_waiters();
+        }
+    }
+}
+
+impl Drop for ExternalGetKeyInterest {
+    fn drop(&mut self) {
+        self.decide(false);
+    }
+}
+
+#[derive(Clone)]
+pub enum ExternalGetKeySharedPhase {
+    Starting,
     Started {
-        key: String,
         item: BatchGetStartItemResp,
+    },
+    /// At least one request plan's prefix retained this key.  The leader cohort is
+    /// transferring/completing it and later publishes one canonical result.
+    Finishing {
+        item: BatchGetStartItemResp,
+    },
+    /// No request plan's prefix retained this prepared Get.  Keep the marker in
+    /// the owner key fence until BatchGetRevoke and local-slot release finish,
+    /// so a new overlapping batch cannot race the revoke.
+    Revoking {
+        /// Keep the exact master operation and prepared target reachable until
+        /// Revoke reaches a definite terminal response.
+        item: BatchGetStartItemResp,
+    },
+    Ready {
+        result: ExternalGetStartSharedItemResult,
+    },
+    Failed {
+        error_code: ErrorCode,
+        error_json: String,
     },
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct ExternalGetStartDedupKey {
-    pub keys: Vec<String>,
-    pub atomic_group_lens: Vec<usize>,
-    pub prefix_best_effort: bool,
+pub struct ExternalGetKeySharedState {
+    /// Exact-batch operations which joined while the key was Starting/Started
+    /// and have not yet applied their own atomic-prefix decision.
+    pub undecided: usize,
+    /// Number of those operations whose transferable prefix retained the key.
+    pub retained: usize,
+    pub phase: ExternalGetKeySharedPhase,
+}
+
+pub struct ExternalGetKeySharedOp {
+    pub key: String,
+    pub state: Mutex<ExternalGetKeySharedState>,
+    pub notify: Arc<limit_thirdparty::tokio::sync::Notify>,
+}
+
+impl ExternalGetKeySharedOp {
+    pub fn new(key: String) -> Self {
+        Self {
+            key,
+            state: Mutex::new(ExternalGetKeySharedState {
+                undecided: 1,
+                retained: 0,
+                phase: ExternalGetKeySharedPhase::Starting,
+            }),
+            notify: Arc::new(limit_thirdparty::tokio::sync::Notify::new()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -161,55 +281,15 @@ pub enum ExternalGetStartSharedItemResult {
     },
 }
 
-pub enum ExternalGetStartSharedPhase {
-    Starting,
-    Running {
-        prefix: ExternalGetStartPrefixResult,
-        keys: Vec<String>,
-    },
-    Ready {
-        prefix: ExternalGetStartPrefixResult,
-        keys: Vec<String>,
-        items: Vec<ExternalGetStartSharedItemResult>,
-    },
-    Failed {
-        error_code: ErrorCode,
-        error_json: String,
-    },
-}
-
-pub struct ExternalGetStartSharedState {
-    pub waiter_count: usize,
-    pub phase: ExternalGetStartSharedPhase,
-}
-
-pub struct ExternalGetStartSharedOp {
-    pub dedup_key: ExternalGetStartDedupKey,
-    pub transfer_concurrency: usize,
-    /// Set only when every requested page is already owner-local.
-    pub inline_local_memory_infos: OnceLock<Vec<Arc<MemoryInfo>>>,
-    pub state: Mutex<ExternalGetStartSharedState>,
-    pub notify: Arc<limit_thirdparty::tokio::sync::Notify>,
-}
-
-impl ExternalGetStartSharedOp {
-    pub fn new(dedup_key: ExternalGetStartDedupKey, transfer_concurrency: usize) -> Self {
-        Self {
-            dedup_key,
-            transfer_concurrency,
-            inline_local_memory_infos: OnceLock::new(),
-            state: Mutex::new(ExternalGetStartSharedState {
-                waiter_count: 1,
-                phase: ExternalGetStartSharedPhase::Starting,
-            }),
-            notify: Arc::new(limit_thirdparty::tokio::sync::Notify::new()),
-        }
-    }
-}
-
 pub struct ExternalGetStartEntry {
     pub req_node_id: String,
-    pub shared_op: Arc<ExternalGetStartSharedOp>,
+    /// Requester membership generation observed when this handle was created.
+    /// `None` is retained only for compatibility with a temporarily incomplete
+    /// cluster cache; generation cleanup must never guess in that case.
+    pub requester_node_start_time: Option<i64>,
+    pub keys: Vec<String>,
+    pub items: Vec<ExternalGetStartOwnerItem>,
+    pub created_at: Instant,
 }
 
 /// Optional arguments for put operations
@@ -1134,6 +1214,13 @@ pub struct PrecommitLocalVisibleInfo {
 }
 
 #[derive(Debug)]
+pub(crate) struct PendingLocalGetInfo {
+    get_id: u64,
+    put_id: crate::master_kv_router::put::PutIDForAKey,
+    mem_holder: Arc<MemoryInfo>,
+}
+
+#[derive(Debug)]
 pub(crate) struct LocalSnapshotInfo {
     put_time_ms: u64,
     put_version: u32,
@@ -1146,8 +1233,8 @@ struct OwnerHotCacheEntry {
     weight_bytes: u32,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct OwnerHotReplicaIdentity {
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OwnerHotReplicaIdentity {
     key: String,
     put_time_ms: u64,
     put_version: u32,
@@ -1166,17 +1253,16 @@ impl OwnerHotReplicaIdentity {
 #[derive(Default)]
 struct OwnerHotCacheCounters {
     size_evictions: AtomicU64,
-    replica_enqueued: AtomicU64,
-    replica_completed: AtomicU64,
-    replica_already_satisfied: AtomicU64,
-    replica_failed: AtomicU64,
-    replica_obsolete: AtomicU64,
-    replica_dispatch_failed: AtomicU64,
+    source_evict_handoff_members: AtomicU64,
+    source_evict_committed_members: AtomicU64,
+    source_evict_restored_members: AtomicU64,
+    source_evict_obsolete: AtomicU64,
+    source_evict_dispatch_failed: AtomicU64,
+    source_evict_retry_scheduled: AtomicU64,
+    source_evict_retry_emitted: AtomicU64,
+    selection_debt_bytes: Arc<AtomicU64>,
     skipped_stale: AtomicU64,
     skipped_reclaim: AtomicU64,
-    skipped_duplicate: AtomicU64,
-    group_replica_triggers: AtomicU64,
-    group_members_enqueued: AtomicU64,
     group_trigger_duplicates: AtomicU64,
     group_trigger_incomplete: AtomicU64,
     grouped_put_done_batches: AtomicU64,
@@ -1185,128 +1271,224 @@ struct OwnerHotCacheCounters {
     legacy_put_done_items: AtomicU64,
 }
 
-const OWNER_HOT_REPLICA_OUTCOME_PENDING: u32 = 0;
-const OWNER_HOT_REPLICA_OUTCOME_RECORDED: u32 = 1;
-
-pub(crate) struct OwnerHotReplicaGuard {
-    identity: OwnerHotReplicaIdentity,
-    inflight: Arc<DashSet<OwnerHotReplicaIdentity>>,
-    counters: Arc<OwnerHotCacheCounters>,
-    group_trigger: Option<OwnerHotReplicaIdentity>,
-    group_replica_triggered: Arc<DashSet<OwnerHotReplicaIdentity>>,
-    outcome: AtomicU32,
+struct OwnerHotSelectionDebt {
+    weight_bytes: u64,
+    outstanding_bytes: Arc<AtomicU64>,
+    released: AtomicU32,
 }
 
-impl OwnerHotReplicaGuard {
-    fn new(
-        identity: OwnerHotReplicaIdentity,
-        inflight: Arc<DashSet<OwnerHotReplicaIdentity>>,
-        counters: Arc<OwnerHotCacheCounters>,
-        group_trigger: Option<OwnerHotReplicaIdentity>,
-        group_replica_triggered: Arc<DashSet<OwnerHotReplicaIdentity>>,
-    ) -> Self {
-        Self {
-            identity,
-            inflight,
-            counters,
-            group_trigger,
-            group_replica_triggered,
-            outcome: AtomicU32::new(OWNER_HOT_REPLICA_OUTCOME_PENDING),
-        }
+impl OwnerHotSelectionDebt {
+    fn new(weight_bytes: u64, outstanding_bytes: Arc<AtomicU64>) -> Arc<Self> {
+        outstanding_bytes.fetch_add(weight_bytes, Ordering::AcqRel);
+        Arc::new(Self {
+            weight_bytes,
+            outstanding_bytes,
+            released: AtomicU32::new(0),
+        })
     }
 
-    fn release_group_trigger(&self) {
-        if let Some(group_trigger) = self.group_trigger.as_ref() {
-            self.group_replica_triggered.remove(group_trigger);
-        }
-    }
-
-    pub(crate) fn mark_completed(&self) {
+    fn release(&self) {
         if self
-            .outcome
-            .compare_exchange(
-                OWNER_HOT_REPLICA_OUTCOME_PENDING,
-                OWNER_HOT_REPLICA_OUTCOME_RECORDED,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
+            .released
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.counters
-                .replica_completed
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    pub(crate) fn mark_already_satisfied(&self) {
-        if self
-            .outcome
-            .compare_exchange(
-                OWNER_HOT_REPLICA_OUTCOME_PENDING,
-                OWNER_HOT_REPLICA_OUTCOME_RECORDED,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-        {
-            self.counters
-                .replica_already_satisfied
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    pub(crate) fn mark_obsolete(&self) {
-        if self
-            .outcome
-            .compare_exchange(
-                OWNER_HOT_REPLICA_OUTCOME_PENDING,
-                OWNER_HOT_REPLICA_OUTCOME_RECORDED,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-        {
-            self.counters
-                .replica_obsolete
-                .fetch_add(1, Ordering::Relaxed);
-            self.release_group_trigger();
-        }
-    }
-
-    fn mark_dispatch_failed(&self) {
-        if self
-            .outcome
-            .compare_exchange(
-                OWNER_HOT_REPLICA_OUTCOME_PENDING,
-                OWNER_HOT_REPLICA_OUTCOME_RECORDED,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-        {
-            self.counters
-                .replica_dispatch_failed
-                .fetch_add(1, Ordering::Relaxed);
-            self.release_group_trigger();
+            self.outstanding_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_sub(self.weight_bytes))
+                })
+                .expect("owner hot selection debt update cannot fail");
         }
     }
 }
 
-impl Drop for OwnerHotReplicaGuard {
-    fn drop(&mut self) {
-        if self.outcome.load(Ordering::Relaxed) == OWNER_HOT_REPLICA_OUTCOME_PENDING {
-            self.counters.replica_failed.fetch_add(1, Ordering::Relaxed);
-            self.release_group_trigger();
-        }
-        self.inflight.remove(&self.identity);
-    }
-}
-
+#[derive(Clone)]
 pub(crate) struct OwnerHotEvictionEvent {
     key: String,
     put_id: crate::master_kv_router::put::PutIDForAKey,
     memory_info: Weak<MemoryInfo>,
-    guard: OwnerHotReplicaGuard,
+    selection_debt: Arc<OwnerHotSelectionDebt>,
+    /// Retry events already own one exact source-delete cohort.
+    retry: bool,
+    /// Exact owner source-delete cohort retained across RPC retries. Once set,
+    /// retries never re-expand or re-pin the local cohort.
+    source_eviction_cohort:
+        Option<Arc<crate::master_kv_router::msg_pack::OwnerSourceEvictionCohort>>,
+    /// Failure count follows the event while it is dispatched, preserving
+    /// exponential backoff across queue take/reinsert cycles.
+    retry_failures: u32,
+}
+
+pub(crate) enum OwnerHotEvictionPreparation {
+    Ready {
+        trigger: OwnerHotReplicaIdentity,
+        sources: Vec<(OwnerHotReplicaIdentity, Arc<MemoryInfo>)>,
+    },
+    RetryableReclaimFence,
+    RetryableIncompleteCohort,
+    Obsolete,
+}
+
+struct OwnerHotRetryEntry {
+    event: OwnerHotEvictionEvent,
+    failures: u32,
+    next_attempt_at: Instant,
+    dispatched: bool,
+}
+
+#[derive(Default)]
+struct OwnerHotRetryState {
+    entries: HashMap<OwnerHotReplicaIdentity, OwnerHotRetryEntry>,
+    /// Exactly one deadline for each non-dispatched entry.  Unlike a lazy
+    /// generation heap, rescheduling replaces the old tuple, so both memory
+    /// and lock-held work are bounded by the live retry set, not its history.
+    deadlines: BTreeSet<(Instant, OwnerHotReplicaIdentity)>,
+}
+
+/// Exactly-once owner-local retry state.  It is physically bounded by the
+/// owner committed-slot pool: one identity can occupy at most one entry, and
+/// obsolete identities are removed when their local version is invalidated.
+/// The actor emits only a small due batch and applies exponential backoff.
+struct OwnerHotRetryQueue {
+    state: Mutex<OwnerHotRetryState>,
+    notify: Arc<limit_thirdparty::tokio::sync::Notify>,
+    counters: Arc<OwnerHotCacheCounters>,
+}
+
+impl OwnerHotRetryQueue {
+    fn new(counters: Arc<OwnerHotCacheCounters>) -> Self {
+        Self {
+            state: Mutex::new(OwnerHotRetryState::default()),
+            notify: Arc::new(limit_thirdparty::tokio::sync::Notify::new()),
+            counters,
+        }
+    }
+
+    fn retry_delay(failures: u32) -> Duration {
+        let shift = failures.saturating_sub(1).min(8);
+        Duration::from_millis(25u64.saturating_mul(1u64 << shift)).min(Duration::from_secs(5))
+    }
+
+    fn schedule(&self, mut event: OwnerHotEvictionEvent, reason: &'static str) {
+        let identity = OwnerHotReplicaIdentity {
+            key: event.key.clone(),
+            put_time_ms: event.put_id.0,
+            put_version: event.put_id.1,
+        };
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        let previous_deadline = state
+            .entries
+            .get(&identity)
+            .and_then(|entry| (!entry.dispatched).then_some(entry.next_attempt_at));
+        if let Some(previous_deadline) = previous_deadline {
+            state
+                .deadlines
+                .remove(&(previous_deadline, identity.clone()));
+        }
+        let entry = state
+            .entries
+            .entry(identity.clone())
+            .or_insert_with(|| OwnerHotRetryEntry {
+                event: event.clone(),
+                failures: event.retry_failures,
+                next_attempt_at: now,
+                dispatched: false,
+            });
+        if !Arc::ptr_eq(&entry.event.selection_debt, &event.selection_debt) {
+            entry.event.selection_debt.release();
+        }
+        if event.source_eviction_cohort.is_none() {
+            event.source_eviction_cohort = entry.event.source_eviction_cohort.clone();
+        }
+        entry.failures = entry.failures.max(event.retry_failures).saturating_add(1);
+        event.retry = true;
+        event.retry_failures = entry.failures;
+        entry.event = event;
+        entry.next_attempt_at = now + Self::retry_delay(entry.failures);
+        entry.dispatched = false;
+        let next_attempt_at = entry.next_attempt_at;
+        let inserted = state.deadlines.insert((next_attempt_at, identity.clone()));
+        debug_assert!(inserted, "owner retry deadline must be unique per identity");
+        drop(state);
+        self.counters
+            .source_evict_retry_scheduled
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            key = identity.key,
+            put_time_ms = identity.put_time_ms,
+            put_version = identity.put_version,
+            reason,
+            "owner writeback entered retryable local state"
+        );
+        self.notify.notify_waiters();
+    }
+
+    fn take_due_batch(&self, now: Instant, limit: usize) -> Vec<OwnerHotEvictionEvent> {
+        let mut state = self.state.lock();
+        let mut due = Vec::with_capacity(limit);
+        while due.len() < limit {
+            let Some((deadline, identity)) = state.deadlines.iter().next().cloned() else {
+                break;
+            };
+            if deadline > now {
+                break;
+            }
+            state.deadlines.remove(&(deadline, identity.clone()));
+            let Some(entry) = state.entries.get_mut(&identity) else {
+                debug_assert!(false, "owner retry deadline must reference a live entry");
+                continue;
+            };
+            if entry.dispatched || entry.next_attempt_at != deadline {
+                debug_assert!(false, "owner retry deadline and entry must agree");
+                continue;
+            }
+            due.push(entry.event.clone());
+            // Keep the authoritative retry record until the dispatcher has
+            // atomically pinned the source and installed an inflight guard,
+            // but emit it only once. A failed dispatcher attempt explicitly
+            // reschedules it with the next backoff.
+            entry.dispatched = true;
+        }
+        due
+    }
+
+    fn remove(&self, identity: &OwnerHotReplicaIdentity) {
+        let entry = {
+            let mut state = self.state.lock();
+            let entry = state.entries.remove(identity);
+            if let Some(entry) = entry.as_ref()
+                && !entry.dispatched
+            {
+                state
+                    .deadlines
+                    .remove(&(entry.next_attempt_at, identity.clone()));
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.event.selection_debt.release();
+        }
+    }
+
+    fn take_for_inflight(
+        &self,
+        identity: &OwnerHotReplicaIdentity,
+    ) -> Option<OwnerHotEvictionEvent> {
+        // The inflight guard takes over the same debt token; do not release it.
+        let mut state = self.state.lock();
+        let entry = state.entries.remove(identity)?;
+        if !entry.dispatched {
+            state
+                .deadlines
+                .remove(&(entry.next_attempt_at, identity.clone()));
+        }
+        Some(entry.event)
+    }
+
+    fn len(&self) -> usize {
+        self.state.lock().entries.len()
+    }
 }
 
 pub(crate) struct OwnerPreparedReclaim {
@@ -1317,32 +1499,237 @@ pub(crate) struct OwnerPreparedReclaim {
 
 pub(crate) enum OwnerReclaimRecord {
     Prepared(OwnerPreparedReclaim),
+    /// The local index is fenced and the Commit handler owns the detached
+    /// backing while it updates the slot pool. Keeping this marker in the
+    /// per-key table lets that O(1) pool update happen without nesting the
+    /// pool mutex under the key-shard mutex.
+    Releasing(crate::master_kv_router::msg_pack::OwnerReclaimItem),
     Committed(crate::master_kv_router::msg_pack::OwnerReclaimItem),
 }
 
 #[derive(Default)]
 pub(crate) struct OwnerKeyControlState {
     local_puts: u32,
+    /// External Put contexts that may still expose or commit owner-local
+    /// backing for this key.  This counter is maintained by an Arc-backed
+    /// guard stored in every context, so cache invalidation cannot clear the
+    /// reclaim fence while a cloned context is still in use.
+    external_pending_puts: u32,
     reclaim: Option<OwnerReclaimRecord>,
+    /// Per-key owner-side Get singleflight marker.  It deliberately lives in
+    /// the same fence as local visibility and reclaim so `R ∩ local`,
+    /// `R ∩ inflight`, and new leaders are classified atomically.
+    external_get: Option<Arc<ExternalGetKeySharedOp>>,
 }
 
-fn resolve_local_visible_batch<T>(
-    keys: &[String],
-    controls: &HashMap<String, OwnerKeyControlState>,
-    mut resolve_unfenced: impl FnMut(&str) -> Option<T>,
-) -> Vec<Option<T>> {
-    keys.iter()
-        .map(|key| {
-            if controls
-                .get(key)
-                .is_some_and(|state| state.reclaim.is_some())
-            {
-                None
-            } else {
-                resolve_unfenced(key)
+impl OwnerKeyControlState {
+    fn is_idle(&self) -> bool {
+        self.local_puts == 0
+            && self.external_pending_puts == 0
+            && self.reclaim.is_none()
+            && self.external_get.is_none()
+    }
+}
+
+const OWNER_KEY_CONTROL_SHARDS: usize = 256;
+
+/// Per-key owner fencing without a process-wide mutex.
+///
+/// Every operation for one key hashes to the same shard, so local index
+/// publication, Get singleflight registration, and reclaim remain linearized.
+/// Callers must hold a shard only for one key and must not await, perform RPC,
+/// or walk a request batch while holding it.  Unrelated keys normally proceed
+/// on independent shards; a hash collision only adds a short O(1) critical
+/// section and does not change correctness.
+pub(crate) struct OwnerKeyControlTable {
+    shards: Box<[Mutex<HashMap<String, OwnerKeyControlState>>]>,
+}
+
+impl Default for OwnerKeyControlTable {
+    fn default() -> Self {
+        Self {
+            shards: (0..OWNER_KEY_CONTROL_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+        }
+    }
+}
+
+impl OwnerKeyControlTable {
+    fn shard_index(key: &str) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % OWNER_KEY_CONTROL_SHARDS
+    }
+
+    pub(crate) fn lock_key(
+        &self,
+        key: &str,
+    ) -> parking_lot::MutexGuard<'_, HashMap<String, OwnerKeyControlState>> {
+        self.shards[Self::shard_index(key)].lock()
+    }
+}
+
+pub(crate) struct ExternalPendingPutFenceGuard {
+    key: String,
+    owner_key_control: Arc<OwnerKeyControlTable>,
+    owns_local_put: bool,
+    local_slot_cleanup_view: Option<ClientKvApiView>,
+    local_slot_lease: Mutex<Option<OwnerLocalReserveSlotLease>>,
+    local_slot_release_failed: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for ExternalPendingPutFenceGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalPendingPutFenceGuard")
+            .field("key", &self.key)
+            .field("owns_local_put", &self.owns_local_put)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExternalPendingPutFenceGuard {
+    pub(crate) fn attach_local_slot_lease(&self, lease: OwnerLocalReserveSlotLease) {
+        assert!(
+            self.owns_local_put,
+            "only local-first Put owns a slot lease"
+        );
+        assert_eq!(
+            lease.slots.len(),
+            1,
+            "a pending local-first Put fence must own exactly one slot"
+        );
+        let mut current = self.local_slot_lease.lock();
+        assert!(
+            current.is_none(),
+            "a pending local-first Put fence cannot replace its slot lease"
+        );
+        *current = Some(lease);
+    }
+
+    /// Transfer the prepared slot to the precommit/committed MemoryInfo.  Once
+    /// disarmed, dropping the pending context must not return that resident slot
+    /// to the free list.
+    pub(crate) fn disarm_local_slot_lease(&self) {
+        assert!(
+            self.local_slot_lease.lock().take().is_some(),
+            "pending local-first Put slot lease is absent while committing"
+        );
+    }
+
+    pub(crate) async fn release_local_slot_lease_now(
+        &self,
+        inner: &ClientKvApiInner,
+    ) -> KvResult<()> {
+        let lease = self.local_slot_lease.lock().take();
+        if let Some(lease) = lease {
+            if let Err(err) = inner.owner_release_local_reserve_slot_lease(lease).await {
+                // The lease object has been consumed and the physical state is
+                // now uncertain.  Keep the per-key fence permanently rather
+                // than allow reclaim to cross a possibly-live prepared slot.
+                self.local_slot_release_failed
+                    .store(true, Ordering::Release);
+                return Err(err);
             }
-        })
-        .collect()
+        }
+        Ok(())
+    }
+}
+
+fn release_external_pending_put_counts(
+    owner_key_control: &Arc<OwnerKeyControlTable>,
+    key: &str,
+    owns_local_put: bool,
+) {
+    let mut controls = owner_key_control.lock_key(key);
+    let remove = {
+        let state = controls
+            .get_mut(key)
+            .expect("external pending Put fence state missing on release");
+        state.external_pending_puts = state
+            .external_pending_puts
+            .checked_sub(1)
+            .expect("external pending Put fence counter underflow");
+        if owns_local_put {
+            state.local_puts = state
+                .local_puts
+                .checked_sub(1)
+                .expect("owner local-first Put fence counter underflow");
+        }
+        state.is_idle()
+    };
+    if remove {
+        controls.remove(key);
+    }
+}
+
+fn acquire_external_pending_put_fence_for_key(
+    owner_key_control: &Arc<OwnerKeyControlTable>,
+    key: &str,
+) -> KvResult<Arc<ExternalPendingPutFenceGuard>> {
+    let mut controls = owner_key_control.lock_key(key);
+    if controls
+        .get(key)
+        .is_some_and(|state| state.reclaim.is_some())
+    {
+        return Err(KvError::Api(ApiError::KeyBeingWritten {
+            key: key.to_string(),
+        }));
+    }
+    let state = controls.entry(key.to_string()).or_default();
+    state.external_pending_puts = state
+        .external_pending_puts
+        .checked_add(1)
+        .expect("external pending Put fence counter overflow");
+    Ok(Arc::new(ExternalPendingPutFenceGuard {
+        key: key.to_string(),
+        owner_key_control: owner_key_control.clone(),
+        owns_local_put: false,
+        local_slot_cleanup_view: None,
+        local_slot_lease: Mutex::new(None),
+        local_slot_release_failed: std::sync::atomic::AtomicBool::new(false),
+    }))
+}
+
+impl Drop for ExternalPendingPutFenceGuard {
+    fn drop(&mut self) {
+        let abandoned_slot_lease = self.local_slot_lease.get_mut().take();
+        if let Some(lease) = abandoned_slot_lease {
+            let view = self
+                .local_slot_cleanup_view
+                .as_ref()
+                .expect("local-first Put slot cleanup requires an attached owner view")
+                .clone();
+            let worker_view = view.clone();
+            let key = self.key.clone();
+            let owner_key_control = self.owner_key_control.clone();
+            let owns_local_put = self.owns_local_put;
+            view.spawn("external_pending_put_slot_drop_cleanup", async move {
+                if let Err(err) = worker_view
+                    .client_kv_api()
+                    .inner()
+                    .owner_release_local_reserve_slot_lease(lease)
+                    .await
+                {
+                    tracing::error!("pending local-first Put slot Drop cleanup failed: {}", err);
+                    return;
+                }
+                release_external_pending_put_counts(&owner_key_control, &key, owns_local_put);
+            });
+        } else if !self.local_slot_release_failed.load(Ordering::Acquire) {
+            release_external_pending_put_counts(
+                &self.owner_key_control,
+                &self.key,
+                self.owns_local_put,
+            );
+        } else {
+            tracing::error!(
+                "retaining pending Put fence after local slot release failure: key={}",
+                self.key
+            );
+        }
+    }
 }
 
 fn allocate_external_holding_id(counter: &AtomicU64) -> u64 {
@@ -1371,39 +1758,67 @@ fn clone_if_owner_hot_entry_matches<T>(
         .then(|| current.clone())
 }
 
+enum OwnerHotPinResult<T> {
+    Pinned(Arc<T>),
+    ReclaimBusy,
+    Stale,
+}
+
+fn pin_current_owner_hot_source_from_index<T>(
+    entry_put_id: crate::master_kv_router::put::PutIDForAKey,
+    entry: &Weak<T>,
+    resolve_current: impl FnOnce() -> Option<(crate::master_kv_router::put::PutIDForAKey, Arc<T>)>,
+) -> OwnerHotPinResult<T> {
+    let Some((current_put_id, current)) = resolve_current() else {
+        // Do not upgrade the listener's Weak after the local index has
+        // disappeared.  A reclaim Prepare may already own the sole Arc and
+        // Commit relies on that ownership.  A still-live Weak therefore means
+        // "retry after the transient owner transition"; a dead Weak is
+        // definitively obsolete.
+        return if entry.strong_count() == 0 {
+            OwnerHotPinResult::Stale
+        } else {
+            OwnerHotPinResult::ReclaimBusy
+        };
+    };
+    let Some(pinned) =
+        clone_if_owner_hot_entry_matches(current_put_id, &current, entry_put_id, entry)
+    else {
+        return OwnerHotPinResult::Stale;
+    };
+
+    // `resolve_current` clones from the DashMap entry while its shard read
+    // guard is held. Reclaim Prepare cannot remove that entry until the clone
+    // exists, and its strong-count check will consequently return Busy. This
+    // gives us the required per-key pin without the global owner-control lock.
+    Some(pinned).map_or(OwnerHotPinResult::Stale, OwnerHotPinResult::Pinned)
+}
+
 fn pin_current_owner_hot_source(
     key: &str,
     entry: &OwnerHotCacheEntry,
-    owner_key_control: &Mutex<HashMap<String, OwnerKeyControlState>>,
     get_cached_info: &DashMap<String, GetCachedInfo>,
     counters: &OwnerHotCacheCounters,
-) -> Option<Arc<MemoryInfo>> {
-    let controls = owner_key_control.lock();
-    if controls
-        .get(key)
-        .is_some_and(|state| state.reclaim.is_some())
-    {
-        counters.skipped_reclaim.fetch_add(1, Ordering::Relaxed);
-        return None;
+) -> OwnerHotPinResult<MemoryInfo> {
+    let result = pin_current_owner_hot_source_from_index(entry.put_id, &entry.memory_info, || {
+        get_cached_info.get(key).map(|cached| {
+            (
+                (cached.put_time_ms, cached.put_version),
+                cached.mem_holder.clone(),
+            )
+        })
+    });
+    match result {
+        OwnerHotPinResult::Pinned(pinned) => OwnerHotPinResult::Pinned(pinned),
+        OwnerHotPinResult::ReclaimBusy => {
+            counters.skipped_reclaim.fetch_add(1, Ordering::Relaxed);
+            OwnerHotPinResult::ReclaimBusy
+        }
+        OwnerHotPinResult::Stale => {
+            counters.skipped_stale.fetch_add(1, Ordering::Relaxed);
+            OwnerHotPinResult::Stale
+        }
     }
-    let Some(cached) = get_cached_info.get(key) else {
-        counters.skipped_stale.fetch_add(1, Ordering::Relaxed);
-        return None;
-    };
-    let Some(pinned) = clone_if_owner_hot_entry_matches(
-        (cached.put_time_ms, cached.put_version),
-        &cached.mem_holder,
-        entry.put_id,
-        &entry.memory_info,
-    ) else {
-        counters.skipped_stale.fetch_add(1, Ordering::Relaxed);
-        return None;
-    };
-
-    // This clone is made under the same key fence used by reclaim. If reclaim
-    // wins first the source is absent/fenced; if this clone wins, reclaim sees
-    // the additional strong reference and returns Busy.
-    Some(pinned)
 }
 
 fn owner_hot_group_anchor_identity(
@@ -1454,7 +1869,6 @@ fn forget_owner_hot_atomic_group(
         OwnerHotReplicaIdentity,
         Arc<crate::master_kv_router::msg_pack::PutAtomicGroup>,
     >,
-    group_replica_triggered: &DashSet<OwnerHotReplicaIdentity>,
     identity: &OwnerHotReplicaIdentity,
 ) {
     let group = atomic_groups
@@ -1463,9 +1877,6 @@ fn forget_owner_hot_atomic_group(
     let Some(group) = group else {
         return;
     };
-    if let Some(anchor) = owner_hot_group_anchor_identity(group.as_ref()) {
-        group_replica_triggered.remove(&anchor);
-    }
     for member in &group.members {
         atomic_groups.remove(&OwnerHotReplicaIdentity::from_group_member(member));
     }
@@ -1473,22 +1884,13 @@ fn forget_owner_hot_atomic_group(
 
 fn pin_current_owner_hot_group_sources(
     group: &crate::master_kv_router::msg_pack::PutAtomicGroup,
-    owner_key_control: &Mutex<HashMap<String, OwnerKeyControlState>>,
     get_cached_info: &DashMap<String, GetCachedInfo>,
     counters: &OwnerHotCacheCounters,
 ) -> Option<Vec<(OwnerHotReplicaIdentity, Arc<MemoryInfo>)>> {
-    let controls = owner_key_control.lock();
     let mut sources = Vec::with_capacity(group.members.len());
     for member in &group.members {
-        if controls
-            .get(&member.key)
-            .is_some_and(|state| state.reclaim.is_some())
-        {
-            counters.skipped_reclaim.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
         let Some(cached) = get_cached_info.get(&member.key) else {
-            counters.skipped_stale.fetch_add(1, Ordering::Relaxed);
+            counters.skipped_reclaim.fetch_add(1, Ordering::Relaxed);
             return None;
         };
         if (cached.put_time_ms, cached.put_version) != member.put_id {
@@ -1555,7 +1957,6 @@ fn owner_hot_tp_cohort_key_rows(
 fn pin_current_owner_hot_tp_cohort_sources(
     cohort_key_rows: &[Vec<String>],
     expect_atomic_group: bool,
-    owner_key_control: &Mutex<HashMap<String, OwnerKeyControlState>>,
     get_cached_info: &DashMap<String, GetCachedInfo>,
     atomic_groups: &DashMap<
         OwnerHotReplicaIdentity,
@@ -1563,7 +1964,6 @@ fn pin_current_owner_hot_tp_cohort_sources(
     >,
     counters: &OwnerHotCacheCounters,
 ) -> Option<Vec<(OwnerHotReplicaIdentity, Arc<MemoryInfo>)>> {
-    let controls = owner_key_control.lock();
     let mut cohort_sources = Vec::new();
     for rank_keys in cohort_key_rows {
         if rank_keys.is_empty() {
@@ -1571,15 +1971,8 @@ fn pin_current_owner_hot_tp_cohort_sources(
         }
         let mut rank_sources = Vec::with_capacity(rank_keys.len());
         for key in rank_keys {
-            if controls
-                .get(key)
-                .is_some_and(|state| state.reclaim.is_some())
-            {
-                counters.skipped_reclaim.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
             let Some(cached) = get_cached_info.get(key) else {
-                counters.skipped_stale.fetch_add(1, Ordering::Relaxed);
+                counters.skipped_reclaim.fetch_add(1, Ordering::Relaxed);
                 return None;
             };
             rank_sources.push((
@@ -1625,61 +2018,11 @@ fn pin_current_owner_hot_tp_cohort_sources(
     Some(cohort_sources)
 }
 
-fn try_enqueue_owner_hot_replica_event(
-    identity: OwnerHotReplicaIdentity,
-    memory_info: Arc<MemoryInfo>,
-    group_trigger: Option<OwnerHotReplicaIdentity>,
-    inflight: &Arc<DashSet<OwnerHotReplicaIdentity>>,
-    group_replica_triggered: &Arc<DashSet<OwnerHotReplicaIdentity>>,
-    counters: &Arc<OwnerHotCacheCounters>,
-    eviction_tx: &tokio::sync::ampsc::Sender<OwnerHotEvictionEvent>,
-) -> bool {
-    if !inflight.insert(identity.clone()) {
-        counters.skipped_duplicate.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    let event = OwnerHotEvictionEvent {
-        key: identity.key.clone(),
-        put_id: (identity.put_time_ms, identity.put_version),
-        memory_info: Arc::downgrade(&memory_info),
-        guard: OwnerHotReplicaGuard::new(
-            identity,
-            inflight.clone(),
-            counters.clone(),
-            group_trigger,
-            group_replica_triggered.clone(),
-        ),
-    };
-    match eviction_tx.try_send(event) {
-        Ok(()) => {
-            counters.replica_enqueued.fetch_add(1, Ordering::Relaxed);
-            true
-        }
-        Err(err) => {
-            let event = err.into_inner();
-            tracing::warn!(
-                "owner hot-cache eviction actor is closed; replica event dropped: key={} put_id=({},{})",
-                event.key,
-                event.put_id.0,
-                event.put_id.1
-            );
-            event.guard.mark_dispatch_failed();
-            false
-        }
-    }
-}
-
 fn build_owner_hot_cache(
     capacity_bytes: u64,
-    owner_key_control: Arc<Mutex<HashMap<String, OwnerKeyControlState>>>,
-    get_cached_info: Arc<DashMap<String, GetCachedInfo>>,
-    inflight: Arc<DashSet<OwnerHotReplicaIdentity>>,
-    atomic_groups: Arc<
-        DashMap<OwnerHotReplicaIdentity, Arc<crate::master_kv_router::msg_pack::PutAtomicGroup>>,
-    >,
-    group_replica_triggered: Arc<DashSet<OwnerHotReplicaIdentity>>,
     counters: Arc<OwnerHotCacheCounters>,
-    eviction_tx: tokio::sync::ampsc::Sender<OwnerHotEvictionEvent>,
+    retry_queue: Arc<OwnerHotRetryQueue>,
+    eviction_tx: tokio::sync::ampsc::UnboundedSender<OwnerHotEvictionEvent>,
 ) -> moka::sync::Cache<String, OwnerHotCacheEntry> {
     assert!(
         capacity_bytes > 0,
@@ -1693,90 +2036,31 @@ fn build_owner_hot_cache(
                 return;
             }
             counters.size_evictions.fetch_add(1, Ordering::Relaxed);
-            let Some(memory_info) = pin_current_owner_hot_source(
-                key.as_str(),
-                &entry,
-                owner_key_control.as_ref(),
-                get_cached_info.as_ref(),
-                counters.as_ref(),
-            ) else {
-                return;
-            };
             let identity = OwnerHotReplicaIdentity {
                 key: (*key).clone(),
                 put_time_ms: entry.put_id.0,
                 put_version: entry.put_id.1,
             };
-            let group = atomic_groups
-                .get(&identity)
-                .map(|entry| entry.value().clone());
-            let cohort_sources = match owner_hot_tp_cohort_key_rows(&identity, group.as_deref()) {
-                Ok(Some(cohort_key_rows)) => pin_current_owner_hot_tp_cohort_sources(
-                    &cohort_key_rows,
-                    group.is_some(),
-                    owner_key_control.as_ref(),
-                    get_cached_info.as_ref(),
-                    atomic_groups.as_ref(),
-                    counters.as_ref(),
-                ),
-                Ok(None) => match group.as_deref() {
-                    Some(group) => pin_current_owner_hot_group_sources(
-                        group,
-                        owner_key_control.as_ref(),
-                        get_cached_info.as_ref(),
-                        counters.as_ref(),
-                    ),
-                    None => Some(vec![(identity.clone(), memory_info)]),
-                },
-                Err(()) => None,
-            };
-            let Some(cohort_sources) = cohort_sources else {
-                counters
-                    .group_trigger_incomplete
-                    .fetch_add(1, Ordering::Relaxed);
-                return;
-            };
-            if cohort_sources.len() > 1 {
-                counters
-                    .group_replica_triggers
-                    .fetch_add(1, Ordering::Relaxed);
-                let mut enqueued = 0u64;
-                for (member_identity, member_memory_info) in cohort_sources {
-                    if try_enqueue_owner_hot_replica_event(
-                        member_identity,
-                        member_memory_info,
-                        None,
-                        &inflight,
-                        &group_replica_triggered,
-                        &counters,
-                        &eviction_tx,
-                    ) {
-                        enqueued = enqueued.saturating_add(1);
-                    }
-                }
-                counters
-                    .group_members_enqueued
-                    .fetch_add(enqueued, Ordering::Relaxed);
-                if enqueued == 0 {
-                    counters
-                        .group_trigger_duplicates
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                return;
-            }
-            let (identity, memory_info) = cohort_sources
-                .into_iter()
-                .next()
-                .expect("owner hot cohort must contain its trigger source");
-            let _ = try_enqueue_owner_hot_replica_event(
-                identity,
-                memory_info,
-                None,
-                &inflight,
-                &group_replica_triggered,
-                &counters,
-                &eviction_tx,
+            let selection_debt = OwnerHotSelectionDebt::new(
+                u64::from(entry.weight_bytes),
+                counters.selection_debt_bytes.clone(),
             );
+            let event = OwnerHotEvictionEvent {
+                key: identity.key.clone(),
+                put_id: entry.put_id,
+                memory_info: entry.memory_info.clone(),
+                selection_debt,
+                retry: false,
+                source_eviction_cohort: None,
+                retry_failures: 0,
+            };
+            if let Err(err) = eviction_tx.send(event) {
+                let event = err.0;
+                counters
+                    .source_evict_dispatch_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                retry_queue.schedule(event, "eviction dispatcher closed");
+            }
         })
         .build()
 }
@@ -1833,31 +2117,42 @@ pub struct ClientKvApiInner {
     get_cached_info: Arc<DashMap<String, GetCachedInfo>>,
     /// key -> locally readable resident slot before backend put_start/put_done finishes.
     precommit_local_visible_info: DashMap<String, PrecommitLocalVisibleInfo>,
+    /// Transferred Get targets awaiting an idempotent master GetDone result.
+    /// These entries fence reclaim but are never visible to readers.
+    pending_local_get_info: DashMap<String, PendingLocalGetInfo>,
     /// key -> local replica version remembered from local put/get durable-replica success.
     /// This authority is positive-only: hit means "can answer exists=true immediately when
     /// allow_local_snapshot is enabled"; miss does not imply non-existence.
     local_snapshot_info: DashMap<String, LocalSnapshotInfo>,
     /// KvOwner-managed resident staging grants for hostless put_start.
     owner_local_reserve_pool: Mutex<OwnerLocalReservePoolState>,
-    /// Serialize reserve claims so a later waiter cannot steal slots reclaimed for the
-    /// waiter currently assembling a lease. Tokio's mutex provides FIFO acquisition order.
-    owner_local_reserve_claim_lock: limit_thirdparty::tokio::sync::AMutex<()>,
+    /// Serialize claims only within one slot-size class. Tokio's mutex provides FIFO
+    /// acquisition order for equal-size waiters without making an unrelated class wait
+    /// behind a pressured class.
+    owner_local_reserve_claim_locks: DashMap<u64, Arc<limit_thirdparty::tokio::sync::AMutex<()>>>,
     /// Wake the background reserve actor after demand/free-slot changes.
     owner_local_reserve_rebalance_notify: Arc<limit_thirdparty::tokio::sync::Notify>,
     /// Owner-local write-back put ids for external local-first path.
     external_local_first_put_id_counter: AtomicU32,
-    /// Atomic owner-side gate for local-first puts, local index access, and reclaim fencing.
-    owner_key_control: Arc<Mutex<HashMap<String, OwnerKeyControlState>>>,
+    /// Correlates idempotent owner source-eviction batches in logs and RPC responses.
+    next_owner_source_eviction_operation_id: AtomicU64,
+    /// Sharded per-key gate for local-first puts, local index access, and reclaim fencing.
+    owner_key_control: Arc<OwnerKeyControlTable>,
     /// A weak-value admission/recency tier. It never owns resident memory and
     /// therefore cannot become a second physical-reclaim authority.
     owner_hot_cache: Option<moka::sync::Cache<String, OwnerHotCacheEntry>>,
-    owner_hot_replica_inflight: Arc<DashSet<OwnerHotReplicaIdentity>>,
+    /// Exact selected identities remain here until their backing is physically
+    /// Free or the source is restored to owner-hot.
+    owner_source_eviction_selected:
+        Arc<DashMap<OwnerHotReplicaIdentity, Arc<OwnerHotSelectionDebt>>>,
     owner_hot_atomic_groups: Arc<
         DashMap<OwnerHotReplicaIdentity, Arc<crate::master_kv_router::msg_pack::PutAtomicGroup>>,
     >,
-    owner_hot_group_replica_triggered: Arc<DashSet<OwnerHotReplicaIdentity>>,
     owner_hot_counters: Arc<OwnerHotCacheCounters>,
-    owner_hot_eviction_rx: Mutex<Option<tokio::sync::ampsc::Receiver<OwnerHotEvictionEvent>>>,
+    owner_hot_retry_queue: Arc<OwnerHotRetryQueue>,
+    owner_hot_eviction_tx: tokio::sync::ampsc::UnboundedSender<OwnerHotEvictionEvent>,
+    owner_hot_eviction_rx:
+        Mutex<Option<tokio::sync::ampsc::UnboundedReceiver<OwnerHotEvictionEvent>>>,
 
     /// Shared delete actor input for owner -> external weak-index invalidation.
     pub external_invalidate_delete: EnsureMemholderMgmtDeleteHandle<DeleteClientKvMetaCacheItem>,
@@ -1868,8 +2163,11 @@ pub struct ClientKvApiInner {
 
     // record external_client get_holding info (owned, flattened manager)
     pub external_get_holding: OwnerExternalMemMgr,
-    pub external_get_start_registry: DashMap<u64, Arc<ExternalGetStartEntry>>,
-    pub external_get_start_by_key: DashMap<ExternalGetStartDedupKey, Arc<ExternalGetStartSharedOp>>,
+    pub external_get_start_registry: DashMap<u64, ExternalGetStartEntry>,
+    /// Metrics-only weak index of active per-key Get flights. Correctness
+    /// remains in the sharded key-control table; observing metrics must never
+    /// scan or hold those fences.
+    external_get_flight_registry: DashMap<String, Weak<ExternalGetKeySharedOp>>,
     next_external_get_start_handle: AtomicU64,
     /// External holding identities are independent from upstream and resident holder ids.
     next_external_holding_id: AtomicU64,
@@ -1901,8 +2199,11 @@ pub struct ClientKvApiInner {
     rpc_caller_batch_prepare_put_keys: RPCCaller<BatchPreparePutKeysReq>,
     rpc_caller_batch_release_put_key_reservations: RPCCaller<BatchReleasePutKeyReservationsReq>,
     rpc_caller_put_append_start: RPCCaller<PutAppendStartReq>,
+    rpc_caller_batch_put_append_start: RPCCaller<BatchPutAppendStartReq>,
     rpc_caller_put_append_revoke: RPCCaller<PutAppendRevokeReq>,
     rpc_caller_put_append_done: RPCCaller<PutAppendDoneReq>,
+    rpc_caller_batch_put_append_done: RPCCaller<BatchPutAppendDoneReq>,
+    rpc_caller_batch_evict_owner_source: RPCCaller<BatchEvictOwnerSourceReq>,
     rpc_caller_reserve_local_grant: RPCCaller<ReserveLocalGrantReq>,
     rpc_caller_release_local_grant: RPCCaller<ReleaseLocalGrantReq>,
     rpc_caller_delete: RPCCaller<DeleteReq>,
@@ -1933,6 +2234,34 @@ impl ClientKvApiInner {
         &self.view
     }
 
+    pub(crate) fn track_external_get_flight(&self, op: &Arc<ExternalGetKeySharedOp>) {
+        self.external_get_flight_registry
+            .insert(op.key.clone(), Arc::downgrade(op));
+    }
+
+    pub(crate) fn untrack_external_get_flight(&self, op: &Arc<ExternalGetKeySharedOp>) {
+        let weak = Arc::downgrade(op);
+        self.external_get_flight_registry
+            .remove_if(&op.key, |_, current| Weak::ptr_eq(current, &weak));
+    }
+
+    fn external_get_flight_snapshot(&self) -> Vec<Arc<ExternalGetKeySharedOp>> {
+        let mut ops = Vec::new();
+        let mut stale = Vec::new();
+        for entry in &self.external_get_flight_registry {
+            if let Some(op) = entry.value().upgrade() {
+                ops.push(op);
+            } else {
+                stale.push(entry.key().clone());
+            }
+        }
+        for key in stale {
+            self.external_get_flight_registry
+                .remove_if(&key, |_, weak| weak.strong_count() == 0);
+        }
+        ops
+    }
+
     fn owner_hot_register_atomic_group(
         &self,
         group: &crate::master_kv_router::msg_pack::PutAtomicGroup,
@@ -1941,11 +2270,84 @@ impl ClientKvApiInner {
     }
 
     fn owner_hot_forget_atomic_group_for_member(&self, identity: &OwnerHotReplicaIdentity) {
-        forget_owner_hot_atomic_group(
-            self.owner_hot_atomic_groups.as_ref(),
-            self.owner_hot_group_replica_triggered.as_ref(),
-            identity,
-        );
+        forget_owner_hot_atomic_group(self.owner_hot_atomic_groups.as_ref(), identity);
+    }
+
+    pub(crate) fn owner_hot_prepare_eviction(
+        &self,
+        event: &OwnerHotEvictionEvent,
+    ) -> OwnerHotEvictionPreparation {
+        let trigger = OwnerHotReplicaIdentity {
+            key: event.key.clone(),
+            put_time_ms: event.put_id.0,
+            put_version: event.put_id.1,
+        };
+        let cache_entry = OwnerHotCacheEntry {
+            put_id: event.put_id,
+            memory_info: event.memory_info.clone(),
+            weight_bytes: 0,
+        };
+        let memory_info = match pin_current_owner_hot_source(
+            event.key.as_str(),
+            &cache_entry,
+            self.get_cached_info.as_ref(),
+            self.owner_hot_counters.as_ref(),
+        ) {
+            OwnerHotPinResult::Pinned(memory_info) => memory_info,
+            OwnerHotPinResult::ReclaimBusy => {
+                return OwnerHotEvictionPreparation::RetryableReclaimFence;
+            }
+            OwnerHotPinResult::Stale => return OwnerHotEvictionPreparation::Obsolete,
+        };
+
+        // A retry is authoritative for exactly one previously selected key.
+        // Re-expanding it would pin every cohort member again while the safe
+        // reclaim pipeline is waiting for those very pins to disappear.
+        if event.retry {
+            return OwnerHotEvictionPreparation::Ready {
+                trigger: trigger.clone(),
+                sources: vec![(trigger, memory_info)],
+            };
+        }
+
+        // Cohort lookup and pinning deliberately happen here, after the
+        // synchronous Moka listener has returned. Each source Arc is cloned
+        // directly from its current DashMap entry. A concurrent reclaim must
+        // wait for that shard read guard and then observes the extra strong
+        // reference, so no global owner-control lock is needed.
+        let group = self
+            .owner_hot_atomic_groups
+            .get(&trigger)
+            .map(|entry| entry.value().clone());
+        let cohort_sources = match owner_hot_tp_cohort_key_rows(&trigger, group.as_deref()) {
+            Ok(Some(cohort_key_rows)) => pin_current_owner_hot_tp_cohort_sources(
+                &cohort_key_rows,
+                group.is_some(),
+                self.get_cached_info.as_ref(),
+                self.owner_hot_atomic_groups.as_ref(),
+                self.owner_hot_counters.as_ref(),
+            ),
+            Ok(None) => match group.as_deref() {
+                Some(group) => pin_current_owner_hot_group_sources(
+                    group,
+                    self.get_cached_info.as_ref(),
+                    self.owner_hot_counters.as_ref(),
+                ),
+                None => Some(vec![(trigger.clone(), memory_info)]),
+            },
+            Err(()) => None,
+        };
+        match cohort_sources {
+            Some(sources) if !sources.is_empty() => {
+                OwnerHotEvictionPreparation::Ready { trigger, sources }
+            }
+            _ => {
+                self.owner_hot_counters
+                    .group_trigger_incomplete
+                    .fetch_add(1, Ordering::Relaxed);
+                OwnerHotEvictionPreparation::RetryableIncompleteCohort
+            }
+        }
     }
 
     fn owner_hot_track_committed(
@@ -1977,6 +2379,22 @@ impl ClientKvApiInner {
         }
     }
 
+    pub(crate) fn owner_hot_admit_published_committed(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        atomic_group: Option<&crate::master_kv_router::msg_pack::PutAtomicGroup>,
+    ) -> bool {
+        let memory_info = self.get_cached_info.get(key).and_then(|cached| {
+            ((cached.put_time_ms, cached.put_version) == put_id).then(|| cached.mem_holder.clone())
+        });
+        let Some(memory_info) = memory_info else {
+            return false;
+        };
+        self.owner_hot_track_committed(key, put_id, &memory_info, atomic_group);
+        true
+    }
+
     fn owner_hot_touch_or_promote(
         &self,
         key: &str,
@@ -2000,7 +2418,7 @@ impl ClientKvApiInner {
         put_id: crate::master_kv_router::put::PutIDForAKey,
         memory_info: &Arc<MemoryInfo>,
     ) -> bool {
-        let controls = self.owner_key_control.lock();
+        let controls = self.owner_key_control.lock_key(key);
         if controls
             .get(key)
             .is_some_and(|state| state.reclaim.is_some())
@@ -2019,24 +2437,31 @@ impl ClientKvApiInner {
         key: &str,
         put_id: crate::master_kv_router::put::PutIDForAKey,
     ) {
-        let Some(cache) = self.owner_hot_cache.as_ref() else {
-            return;
-        };
-        let _ = cache.entry(key.to_string()).and_compute_with(|entry| {
-            if entry
-                .as_ref()
-                .is_some_and(|entry| entry.value().put_id == put_id)
-            {
-                MokaComputeOp::Remove
-            } else {
-                MokaComputeOp::Nop
-            }
-        });
-        self.owner_hot_forget_atomic_group_for_member(&OwnerHotReplicaIdentity {
+        let identity = OwnerHotReplicaIdentity {
             key: key.to_string(),
             put_time_ms: put_id.0,
             put_version: put_id.1,
-        });
+        };
+        if let Some(cache) = self.owner_hot_cache.as_ref() {
+            let _ = cache.entry(key.to_string()).and_compute_with(|entry| {
+                if entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.value().put_id == put_id)
+                {
+                    MokaComputeOp::Remove
+                } else {
+                    MokaComputeOp::Nop
+                }
+            });
+        }
+        if let Some((_identity, debt)) = self.owner_source_eviction_selected.remove(&identity) {
+            debt.release();
+            self.owner_hot_counters
+                .source_evict_committed_members
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.owner_hot_retry_queue.remove(&identity);
+        self.owner_hot_forget_atomic_group_for_member(&identity);
     }
 
     pub(crate) fn release_local_reserve_route_for_memory_info(&self, memory_info: &MemoryInfo) {
@@ -2103,8 +2528,8 @@ impl ClientKvApiInner {
         key: &str,
         reject_if_inflight_same_key: bool,
         reject_if_exist_same_key: bool,
-    ) -> KvResult<()> {
-        let mut controls = self.owner_key_control.lock();
+    ) -> KvResult<Arc<ExternalPendingPutFenceGuard>> {
+        let mut controls = self.owner_key_control.lock_key(key);
         if controls
             .get(key)
             .is_some_and(|state| state.reclaim.is_some())
@@ -2115,6 +2540,7 @@ impl ClientKvApiInner {
         }
         if reject_if_exist_same_key
             && (self.precommit_local_visible_info.contains_key(key)
+                || self.pending_local_get_info.contains_key(key)
                 || self.get_cached_info.contains_key(key)
                 || self.local_snapshot_info.contains_key(key))
         {
@@ -2132,24 +2558,25 @@ impl ClientKvApiInner {
             .local_puts
             .checked_add(1)
             .expect("owner local-first put counter overflow");
-        Ok(())
+        state.external_pending_puts = state
+            .external_pending_puts
+            .checked_add(1)
+            .expect("external pending Put fence counter overflow");
+        Ok(Arc::new(ExternalPendingPutFenceGuard {
+            key: key.to_string(),
+            owner_key_control: self.owner_key_control.clone(),
+            owns_local_put: true,
+            local_slot_cleanup_view: Some(self.view.clone_view()),
+            local_slot_lease: Mutex::new(None),
+            local_slot_release_failed: std::sync::atomic::AtomicBool::new(false),
+        }))
     }
 
-    pub(crate) fn release_external_local_first_put_key(&self, key: &str) {
-        let mut controls = self.owner_key_control.lock();
-        let remove = {
-            let state = controls
-                .get_mut(key)
-                .expect("owner local-first put state missing on release");
-            state.local_puts = state
-                .local_puts
-                .checked_sub(1)
-                .expect("owner local-first put counter underflow");
-            state.local_puts == 0 && state.reclaim.is_none()
-        };
-        if remove {
-            controls.remove(key);
-        }
+    pub(crate) fn acquire_external_pending_put_fence(
+        &self,
+        key: &str,
+    ) -> KvResult<Arc<ExternalPendingPutFenceGuard>> {
+        acquire_external_pending_put_fence_for_key(&self.owner_key_control, key)
     }
 
     pub(crate) fn remember_local_snapshot(
@@ -2157,7 +2584,7 @@ impl ClientKvApiInner {
         key: &str,
         put_id: crate::master_kv_router::put::PutIDForAKey,
     ) {
-        let controls = self.owner_key_control.lock();
+        let controls = self.owner_key_control.lock_key(key);
         if controls
             .get(key)
             .is_some_and(|state| state.reclaim.is_some())
@@ -2180,7 +2607,7 @@ impl ClientKvApiInner {
     }
 
     pub(crate) fn has_local_snapshot(&self, key: &str) -> bool {
-        let controls = self.owner_key_control.lock();
+        let controls = self.owner_key_control.lock_key(key);
         if controls
             .get(key)
             .is_some_and(|state| state.reclaim.is_some())
@@ -2194,7 +2621,7 @@ impl ClientKvApiInner {
 
     pub(crate) fn local_visible_mem_holder(&self, key: &str) -> Option<Arc<MemoryInfo>> {
         let (memory_info, hot_put_id) = {
-            let controls = self.owner_key_control.lock();
+            let controls = self.owner_key_control.lock_key(key);
             if controls
                 .get(key)
                 .is_some_and(|state| state.reclaim.is_some())
@@ -2227,7 +2654,7 @@ impl ClientKvApiInner {
         key: &str,
         put_id: crate::master_kv_router::put::PutIDForAKey,
     ) -> Option<Arc<MemoryInfo>> {
-        let controls = self.owner_key_control.lock();
+        let controls = self.owner_key_control.lock_key(key);
         if controls
             .get(key)
             .is_some_and(|state| state.reclaim.is_some())
@@ -2253,13 +2680,19 @@ impl ClientKvApiInner {
         &self,
         keys: &[String],
     ) -> Vec<Option<Arc<MemoryInfo>>> {
-        // A hostless get_start commonly checks hundreds of pages from one
-        // local prefix. Take one coherent reclaim-fence snapshot instead of
-        // locking owner_key_control once per page. The MemoryInfo Arcs keep
-        // any selected backing alive if reclaim begins after this snapshot.
-        let resolved = {
-            let controls = self.owner_key_control.lock();
-            resolve_local_visible_batch(keys, &controls, |key| {
+        // Resolve each page under only its own short sharded fence.  The batch
+        // itself never owns a synchronous lock.  A cloned MemoryInfo pins the
+        // selected backing if reclaim starts after this point.
+        let resolved = keys
+            .iter()
+            .map(|key| {
+                let controls = self.owner_key_control.lock_key(key);
+                if controls
+                    .get(key)
+                    .is_some_and(|state| state.reclaim.is_some())
+                {
+                    return None;
+                }
                 let memory_info = self.local_visible_mem_holder_unfenced(key)?;
                 let hot_put_id = self
                     .get_cached_info
@@ -2268,7 +2701,7 @@ impl ClientKvApiInner {
                     .map(|cached| (cached.put_time_ms, cached.put_version));
                 Some((memory_info, hot_put_id))
             })
-        };
+            .collect::<Vec<_>>();
         resolved
             .into_iter()
             .zip(keys)
@@ -2299,6 +2732,11 @@ impl ClientKvApiInner {
             ExternalHoldingGetInfo {
                 key: memory_info.key.clone(),
                 req_node_id: req_node_id.to_string(),
+                requester_node_start_time: self
+                    .view
+                    .cluster_manager()
+                    .get_member_info_cached(req_node_id)
+                    .map(|member| member.node_start_time),
                 memory_info,
             },
         );
@@ -2334,6 +2772,140 @@ impl ClientKvApiInner {
         )
     }
 
+    pub(crate) fn install_hidden_pending_local_get(
+        &self,
+        key: &str,
+        get_id: u64,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        addr: u64,
+        base_addr: u64,
+        len: u32,
+        slot_size: u64,
+        grant_id: u64,
+        slot_index: u32,
+    ) -> KvResult<Arc<MemoryInfo>> {
+        let controls = self.owner_key_control.lock_key(key);
+        if controls
+            .get(key)
+            .is_some_and(|state| state.reclaim.is_some())
+            || self.pending_local_get_info.contains_key(key)
+        {
+            return Err(KvError::Api(ApiError::KeyBeingWritten {
+                key: key.to_string(),
+            }));
+        }
+        self.owner_mark_local_reserve_slot_pending_visible(slot_size, grant_id, slot_index)?;
+        self.owner_retain_local_reserve_resident_slot_holder(slot_size, grant_id, slot_index)?;
+        let resident_owner_node_id: NodeID = self.view.cluster_manager().get_self_info().id.into();
+        let memory_info = Arc::new(MemoryInfo::new_local_reserve_resident_with_base(
+            addr,
+            base_addr,
+            len,
+            key.to_string(),
+            resident_owner_node_id,
+            self.view.clone(),
+            slot_size,
+            grant_id,
+            slot_index,
+        ));
+        let previous = self.pending_local_get_info.insert(
+            key.to_string(),
+            PendingLocalGetInfo {
+                get_id,
+                put_id,
+                mem_holder: memory_info.clone(),
+            },
+        );
+        assert!(
+            previous.is_none(),
+            "pending local Get must be unique per key"
+        );
+        drop(controls);
+        Ok(memory_info)
+    }
+
+    pub(crate) fn abort_hidden_pending_local_get(&self, key: &str, get_id: u64) -> bool {
+        let _controls = self.owner_key_control.lock_key(key);
+        self.pending_local_get_info
+            .remove_if(key, |_, pending| pending.get_id == get_id)
+            .is_some()
+    }
+
+    pub(crate) fn promote_hidden_pending_local_get(
+        &self,
+        key: &str,
+        get_id: u64,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+    ) -> KvResult<Arc<MemoryInfo>> {
+        let memory_info = {
+            let controls = self.owner_key_control.lock_key(key);
+            if controls
+                .get(key)
+                .is_some_and(|state| state.reclaim.is_some())
+            {
+                return Err(KvError::Api(ApiError::KeyBeingWritten {
+                    key: key.to_string(),
+                }));
+            }
+            let Some(pending_memory_info) =
+                self.pending_local_get_info.get(key).and_then(|pending| {
+                    (pending.get_id == get_id && pending.put_id == put_id)
+                        .then(|| pending.mem_holder.clone())
+                })
+            else {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "hidden pending local Get is absent: key={} get_id={}",
+                        key, get_id
+                    ),
+                }));
+            };
+            let (slot_size, grant_id, slot_index) = pending_memory_info
+                .local_reserve_resident_slot_ref()
+                .expect("pending local Get must carry a local-reserve slot");
+            self.owner_promote_local_reserve_pending_slot_to_committed(
+                slot_size, grant_id, slot_index,
+            )?;
+            let removed = self
+                .pending_local_get_info
+                .remove_if(key, |_, pending| {
+                    pending.get_id == get_id
+                        && pending.put_id == put_id
+                        && Arc::ptr_eq(&pending.mem_holder, &pending_memory_info)
+                })
+                .is_some();
+            if !removed {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "hidden pending local Get changed while promoting: key={} get_id={}",
+                        key, get_id
+                    ),
+                }));
+            }
+            let replaced = self.get_cached_info.insert(
+                key.to_string(),
+                GetCachedInfo {
+                    put_time_ms: put_id.0,
+                    put_version: put_id.1,
+                    mem_holder: pending_memory_info.clone(),
+                },
+            );
+            if let Some(previous) = replaced {
+                self.release_local_reserve_route_for_memory_info(previous.mem_holder.as_ref());
+            }
+            self.local_snapshot_info.insert(
+                key.to_string(),
+                LocalSnapshotInfo {
+                    put_time_ms: put_id.0,
+                    put_version: put_id.1,
+                },
+            );
+            drop(controls);
+            pending_memory_info
+        };
+        Ok(memory_info)
+    }
+
     pub async fn install_local_committed_memory_info(
         &self,
         key: &str,
@@ -2355,7 +2927,7 @@ impl ClientKvApiInner {
             .await,
         );
         {
-            let controls = self.owner_key_control.lock();
+            let controls = self.owner_key_control.lock_key(key);
             if controls
                 .get(key)
                 .is_some_and(|state| state.reclaim.is_some())
@@ -2394,7 +2966,7 @@ impl ClientKvApiInner {
         memory_info: Arc<MemoryInfo>,
     ) -> bool {
         {
-            let controls = self.owner_key_control.lock();
+            let controls = self.owner_key_control.lock_key(key);
             if controls
                 .get(key)
                 .is_some_and(|state| state.reclaim.is_some())
@@ -2435,7 +3007,7 @@ impl ClientKvApiInner {
         key: &str,
         memory_info: Arc<MemoryInfo>,
     ) {
-        let controls = self.owner_key_control.lock();
+        let controls = self.owner_key_control.lock_key(key);
         assert!(
             !controls
                 .get(key)
@@ -2466,7 +3038,7 @@ impl ClientKvApiInner {
         key: &str,
         expected_mem_holder: &Arc<MemoryInfo>,
     ) -> bool {
-        let _controls = self.owner_key_control.lock();
+        let _controls = self.owner_key_control.lock_key(key);
         self.precommit_local_visible_info
             .remove_if(key, |_, info| {
                 Arc::ptr_eq(&info.mem_holder, expected_mem_holder)
@@ -2474,15 +3046,34 @@ impl ClientKvApiInner {
             .is_some()
     }
 
+    pub fn precommit_local_visible_memory_info(&self, key: &str) -> Option<Arc<MemoryInfo>> {
+        self.precommit_local_visible_info
+            .get(key)
+            .map(|info| info.mem_holder.clone())
+    }
+
+    pub(crate) fn committed_local_reserve_slot_is_current(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        expected: &crate::master_kv_router::msg_pack::PutDoneCommittedSlot,
+    ) -> bool {
+        self.get_cached_info.get(key).is_some_and(|cached| {
+            (cached.put_time_ms, cached.put_version) == put_id
+                && cached.mem_holder.local_reserve_resident_slot_ref()
+                    == Some((expected.slot_size, expected.grant_id, expected.slot_index))
+        })
+    }
+
     pub fn promote_precommit_local_reserve_resident_slot_if_same(
         &self,
         key: &str,
         put_id: crate::master_kv_router::put::PutIDForAKey,
         memory_info: Arc<MemoryInfo>,
-        atomic_group: Option<&crate::master_kv_router::msg_pack::PutAtomicGroup>,
+        _atomic_group: Option<&crate::master_kv_router::msg_pack::PutAtomicGroup>,
     ) -> KvResult<()> {
         {
-            let controls = self.owner_key_control.lock();
+            let controls = self.owner_key_control.lock_key(key);
             if controls
                 .get(key)
                 .is_some_and(|state| state.reclaim.is_some())
@@ -2541,7 +3132,6 @@ impl ClientKvApiInner {
                 },
             );
         }
-        self.owner_hot_track_committed(key, put_id, &memory_info, atomic_group);
         Ok(())
     }
 }
@@ -2559,6 +3149,9 @@ pub struct ExternalPendingPutCtx {
     pub local_reserve_slot: Option<OwnerLocalReserveSlotRef>,
     pub local_reserve_slot_size: Option<u64>,
     pub atomic_group: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
+    /// Keep the per-key reclaim fence alive for every cache/user clone of this
+    /// pending context.  The counter is released only by the final Arc drop.
+    pub(crate) _pending_fence: Arc<ExternalPendingPutFenceGuard>,
 }
 
 #[derive(Debug, Clone)]
@@ -2572,10 +3165,12 @@ pub(crate) struct ReplicaTaskTarget {
 pub(crate) struct ReplicaTaskJob {
     pub key: String,
     pub put_id: crate::master_kv_router::put::PutIDForAKey,
-    pub holder: Arc<UserMemHolder>,
+    /// Replica tasks are independent hit-rate work and keep their transfer
+    /// source alive until the transfer finishes. Capacity eviction never enters
+    /// this queue.
+    pub holder: Option<Arc<UserMemHolder>>,
     pub target: Option<ReplicaTaskTarget>,
     pub preferred_sub_cluster: Option<String>,
-    pub hot_replica_guard: Option<OwnerHotReplicaGuard>,
     pub protect_source_on_remote_complete: bool,
 }
 
@@ -2827,8 +3422,21 @@ pub(crate) struct OwnerLocalReserveClassState {
     pub slot_size: u64,
     pub slots_per_grant: u32,
     pub grants: Vec<OwnerLocalReserveGrantState>,
+    /// Stable grant identity -> current index in `grants`. Every vector removal uses
+    /// swap-remove and repairs the one moved entry, so per-slot state transitions never
+    /// scan all grants.
+    grant_indices: HashMap<u64, usize>,
+    /// Dense set of grants which currently contain at least one free slot. This avoids
+    /// scanning full grants while assembling a lease.
+    claimable_grant_ids: Vec<u64>,
+    claimable_grant_indices: HashMap<u64, usize>,
+    free_slots: usize,
+    prepared_slots: usize,
+    pending_visible_slots: usize,
+    committed_slots: usize,
     pub last_grow_at: Option<Instant>,
     pub pending_slot_demand: usize,
+    pub max_observed_claim_slots: usize,
     pub expected_grant_count: usize,
 }
 
@@ -2838,45 +3446,533 @@ impl OwnerLocalReserveClassState {
             slot_size,
             slots_per_grant,
             grants: Vec::new(),
+            grant_indices: HashMap::new(),
+            claimable_grant_ids: Vec::new(),
+            claimable_grant_indices: HashMap::new(),
+            free_slots: 0,
+            prepared_slots: 0,
+            pending_visible_slots: 0,
+            committed_slots: 0,
             last_grow_at: None,
             pending_slot_demand: 0,
+            max_observed_claim_slots: 0,
             expected_grant_count: 0,
         }
     }
 
     pub fn free_slot_count(&self) -> usize {
-        self.grants.iter().map(|grant| grant.free_slots.len()).sum()
+        self.free_slots
     }
 
     pub fn used_slot_count(&self) -> usize {
-        self.grants
-            .iter()
-            .map(|grant| grant.used_slot_count())
-            .sum()
+        self.prepared_slots
+            .saturating_add(self.pending_visible_slots)
+            .saturating_add(self.committed_slots)
     }
 
     pub fn grant_count(&self) -> usize {
         self.grants.len()
+    }
+
+    pub fn prepared_slot_count(&self) -> usize {
+        self.prepared_slots
+    }
+
+    pub fn pending_visible_slot_count(&self) -> usize {
+        self.pending_visible_slots
+    }
+
+    pub fn committed_slot_count(&self) -> usize {
+        self.committed_slots
+    }
+
+    fn add_claimable_grant(&mut self, grant_id: u64) {
+        if self.claimable_grant_indices.contains_key(&grant_id) {
+            return;
+        }
+        let index = self.claimable_grant_ids.len();
+        self.claimable_grant_ids.push(grant_id);
+        let previous = self.claimable_grant_indices.insert(grant_id, index);
+        assert!(
+            previous.is_none(),
+            "duplicate claimable local-reserve grant"
+        );
+    }
+
+    fn remove_claimable_grant(&mut self, grant_id: u64) {
+        let Some(index) = self.claimable_grant_indices.remove(&grant_id) else {
+            return;
+        };
+        let removed = self.claimable_grant_ids.swap_remove(index);
+        assert_eq!(removed, grant_id, "claimable grant index drift");
+        if let Some(moved_grant_id) = self.claimable_grant_ids.get(index).copied() {
+            let moved_index = self
+                .claimable_grant_indices
+                .get_mut(&moved_grant_id)
+                .expect("moved claimable grant must remain indexed");
+            *moved_index = index;
+        }
+    }
+
+    pub fn install_grant(&mut self, grant: OwnerLocalReserveGrantState) {
+        assert_eq!(grant.slot_size, self.slot_size, "grant slot-size drift");
+        assert_eq!(
+            grant.slot_count, self.slots_per_grant,
+            "grant slot-count drift"
+        );
+        assert!(
+            !self.grant_indices.contains_key(&grant.grant_id),
+            "duplicate local-reserve grant id"
+        );
+
+        let mut free = 0usize;
+        let mut prepared = 0usize;
+        let mut pending_visible = 0usize;
+        let mut committed = 0usize;
+        for state in &grant.slot_states {
+            match state {
+                OwnerLocalReserveSlotState::Free => free += 1,
+                OwnerLocalReserveSlotState::Prepared => prepared += 1,
+                OwnerLocalReserveSlotState::PendingLocalVisible { .. } => pending_visible += 1,
+                OwnerLocalReserveSlotState::Committed { .. } => committed += 1,
+            }
+        }
+        assert_eq!(free, grant.free_slots.len(), "grant free-slot index drift");
+
+        let grant_id = grant.grant_id;
+        let index = self.grants.len();
+        self.grants.push(grant);
+        let previous = self.grant_indices.insert(grant_id, index);
+        assert!(previous.is_none(), "duplicate local-reserve grant id");
+        if free != 0 {
+            self.add_claimable_grant(grant_id);
+        }
+        self.free_slots = self
+            .free_slots
+            .checked_add(free)
+            .expect("free slot overflow");
+        self.prepared_slots = self
+            .prepared_slots
+            .checked_add(prepared)
+            .expect("prepared slot overflow");
+        self.pending_visible_slots = self
+            .pending_visible_slots
+            .checked_add(pending_visible)
+            .expect("pending-visible slot overflow");
+        self.committed_slots = self
+            .committed_slots
+            .checked_add(committed)
+            .expect("committed slot overflow");
+    }
+
+    pub fn claim_available(&mut self, max_slots: usize) -> Vec<OwnerLocalReserveSlotRef> {
+        let claim_count = self.free_slots.min(max_slots);
+        let mut slots = Vec::with_capacity(claim_count);
+        while slots.len() < claim_count {
+            let grant_id = *self
+                .claimable_grant_ids
+                .last()
+                .expect("free-slot counter requires a claimable grant");
+            let grant_index = *self
+                .grant_indices
+                .get(&grant_id)
+                .expect("claimable grant must be installed");
+            let (slot, exhausted) = {
+                let grant = &mut self.grants[grant_index];
+                let slot = grant
+                    .claim_prepared_slot()
+                    .expect("claimable grant must contain a free slot");
+                (slot, grant.free_slots.is_empty())
+            };
+            self.free_slots = self
+                .free_slots
+                .checked_sub(1)
+                .expect("free slot counter underflow");
+            self.prepared_slots = self
+                .prepared_slots
+                .checked_add(1)
+                .expect("prepared slot overflow");
+            if exhausted {
+                self.remove_claimable_grant(grant_id);
+            }
+            slots.push(slot);
+        }
+        slots
+    }
+
+    fn grant_index(&self, grant_id: u64) -> Option<usize> {
+        self.grant_indices.get(&grant_id).copied()
+    }
+
+    pub fn grant(&self, grant_id: u64) -> Option<&OwnerLocalReserveGrantState> {
+        self.grant_index(grant_id)
+            .and_then(|index| self.grants.get(index))
+    }
+
+    pub fn release_prepared_slot(&mut self, grant_id: u64, slot_index: u32) -> bool {
+        let Some(grant_index) = self.grant_index(grant_id) else {
+            return false;
+        };
+        let was_exhausted = self.grants[grant_index].free_slots.is_empty();
+        self.grants[grant_index].release_prepared_slot(slot_index);
+        self.prepared_slots = self
+            .prepared_slots
+            .checked_sub(1)
+            .expect("prepared slot counter underflow");
+        self.free_slots = self.free_slots.checked_add(1).expect("free slot overflow");
+        if was_exhausted {
+            self.add_claimable_grant(grant_id);
+        }
+        true
+    }
+
+    pub fn mark_prepared_slot_pending_visible(&mut self, grant_id: u64, slot_index: u32) -> bool {
+        let Some(grant_index) = self.grant_index(grant_id) else {
+            return false;
+        };
+        self.grants[grant_index].mark_prepared_slot_pending_visible(slot_index);
+        self.prepared_slots = self
+            .prepared_slots
+            .checked_sub(1)
+            .expect("prepared slot counter underflow");
+        self.pending_visible_slots = self
+            .pending_visible_slots
+            .checked_add(1)
+            .expect("pending-visible slot overflow");
+        true
+    }
+
+    pub fn promote_pending_visible_slot_to_committed(
+        &mut self,
+        grant_id: u64,
+        slot_index: u32,
+    ) -> bool {
+        let Some(grant_index) = self.grant_index(grant_id) else {
+            return false;
+        };
+        self.grants[grant_index].promote_pending_visible_slot_to_committed(slot_index);
+        self.pending_visible_slots = self
+            .pending_visible_slots
+            .checked_sub(1)
+            .expect("pending-visible slot counter underflow");
+        self.committed_slots = self
+            .committed_slots
+            .checked_add(1)
+            .expect("committed slot overflow");
+        true
+    }
+
+    pub fn retain_resident_slot_holder(&mut self, grant_id: u64, slot_index: u32) -> bool {
+        let Some(grant_index) = self.grant_index(grant_id) else {
+            return false;
+        };
+        self.grants[grant_index].retain_resident_slot_holder(slot_index);
+        true
+    }
+
+    pub fn release_resident_slot_holder(&mut self, grant_id: u64, slot_index: u32) -> bool {
+        let Some(grant_index) = self.grant_index(grant_id) else {
+            return false;
+        };
+        let (was_exhausted, prior_state, became_free) = {
+            let grant = &mut self.grants[grant_index];
+            let was_exhausted = grant.free_slots.is_empty();
+            let prior_state = grant
+                .slot_states
+                .get(slot_index as usize)
+                .expect("slot state index out of range")
+                .clone();
+            let free_before = grant.free_slots.len();
+            grant.release_resident_slot_holder(slot_index);
+            (
+                was_exhausted,
+                prior_state,
+                grant.free_slots.len() != free_before,
+            )
+        };
+        if became_free {
+            match prior_state {
+                OwnerLocalReserveSlotState::PendingLocalVisible { .. } => {
+                    self.pending_visible_slots = self
+                        .pending_visible_slots
+                        .checked_sub(1)
+                        .expect("pending-visible slot counter underflow");
+                }
+                OwnerLocalReserveSlotState::Committed { .. } => {
+                    self.committed_slots = self
+                        .committed_slots
+                        .checked_sub(1)
+                        .expect("committed slot counter underflow");
+                }
+                _ => unreachable!("resident holder must belong to a resident slot"),
+            }
+            self.free_slots = self.free_slots.checked_add(1).expect("free slot overflow");
+            if was_exhausted {
+                self.add_claimable_grant(grant_id);
+            }
+        }
+        true
+    }
+
+    pub fn release_committed_slot_route(&mut self, grant_id: u64, slot_index: u32) -> bool {
+        let Some(grant_index) = self.grant_index(grant_id) else {
+            return false;
+        };
+        let (was_exhausted, became_free) = {
+            let grant = &mut self.grants[grant_index];
+            let was_exhausted = grant.free_slots.is_empty();
+            let free_before = grant.free_slots.len();
+            grant.release_committed_slot_route(slot_index);
+            (was_exhausted, grant.free_slots.len() != free_before)
+        };
+        if became_free {
+            self.committed_slots = self
+                .committed_slots
+                .checked_sub(1)
+                .expect("committed slot counter underflow");
+            self.free_slots = self.free_slots.checked_add(1).expect("free slot overflow");
+            if was_exhausted {
+                self.add_claimable_grant(grant_id);
+            }
+        }
+        true
+    }
+
+    /// Drop the route reference and the resident `MemoryInfo` reference as one
+    /// slot-pool transaction. This is the normal owner-reclaim transition and
+    /// avoids exposing an intermediate state across two pool lock acquisitions.
+    pub fn release_committed_resident_slot(&mut self, grant_id: u64, slot_index: u32) -> bool {
+        if self.grant_index(grant_id).is_none() {
+            return false;
+        }
+        assert!(self.release_committed_slot_route(grant_id, slot_index));
+        assert!(self.release_resident_slot_holder(grant_id, slot_index));
+        true
+    }
+
+    pub fn detach_fully_free_grant(
+        &mut self,
+        grant_id: u64,
+    ) -> Option<OwnerLocalReserveGrantState> {
+        let grant_index = self.grant_indices.remove(&grant_id)?;
+        assert!(
+            self.grants[grant_index].is_fully_free(),
+            "only a fully-free grant may be detached"
+        );
+        self.remove_claimable_grant(grant_id);
+        let grant = self.grants.swap_remove(grant_index);
+        assert_eq!(grant.grant_id, grant_id, "grant index drift");
+        if let Some(moved_grant) = self.grants.get(grant_index) {
+            let moved_index = self
+                .grant_indices
+                .get_mut(&moved_grant.grant_id)
+                .expect("moved grant must remain indexed");
+            *moved_index = grant_index;
+        }
+        self.free_slots = self
+            .free_slots
+            .checked_sub(grant.slot_count as usize)
+            .expect("free slot counter underflow");
+        Some(grant)
+    }
+
+    pub fn take_all_grants(&mut self) -> Vec<OwnerLocalReserveGrantState> {
+        self.grant_indices.clear();
+        self.claimable_grant_ids.clear();
+        self.claimable_grant_indices.clear();
+        self.free_slots = 0;
+        self.prepared_slots = 0;
+        self.pending_visible_slots = 0;
+        self.committed_slots = 0;
+        std::mem::take(&mut self.grants)
     }
 }
 
 #[cfg(test)]
 mod owner_reclaim_slot_tests {
     use super::{
-        GetCachedInfo, OwnerHotCacheCounters, OwnerHotCacheEntry, OwnerHotReplicaGuard,
-        OwnerHotReplicaIdentity, OwnerKeyControlState, OwnerLocalReserveGrantState,
-        OwnerReclaimRecord, allocate_external_holding_id, build_owner_hot_cache,
-        clone_if_owner_hot_entry_matches, forget_owner_hot_atomic_group,
-        owner_hot_tp_cohort_key_rows, register_owner_hot_atomic_group, resolve_local_visible_batch,
+        ExternalPendingPutCtx, ExternalPendingPutFenceGuard, OwnerHotCacheCounters,
+        OwnerHotCacheEntry, OwnerHotEvictionEvent, OwnerHotReplicaIdentity, OwnerHotRetryQueue,
+        OwnerHotSelectionDebt, OwnerKeyControlState, OwnerKeyControlTable,
+        OwnerLocalReserveGrantState, OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef,
+        OwnerLocalReserveSlotState, OwnerReclaimRecord, acquire_external_pending_put_fence_for_key,
+        allocate_external_holding_id, build_owner_hot_cache, clone_if_owner_hot_entry_matches,
+        forget_owner_hot_atomic_group, owner_hot_tp_cohort_key_rows,
+        pin_current_owner_hot_source_from_index, register_owner_hot_atomic_group,
     };
     use crate::master_kv_router::msg_pack::{
         OwnerReclaimItem, PutAtomicGroup, PutAtomicGroupMember,
     };
-    use dashmap::{DashMap, DashSet};
+    use dashmap::DashMap;
     use parking_lot::Mutex;
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Weak};
+    use std::time::{Duration, Instant};
+
+    fn pending_put_count(controls: &Arc<OwnerKeyControlTable>, key: &str) -> Option<u32> {
+        controls
+            .lock_key(key)
+            .get(key)
+            .map(|state| state.external_pending_puts)
+    }
+
+    fn controls_with_state(key: &str, state: OwnerKeyControlState) -> Arc<OwnerKeyControlTable> {
+        let controls = Arc::new(OwnerKeyControlTable::default());
+        controls.lock_key(key).insert(key.to_string(), state);
+        controls
+    }
+
+    #[test]
+    fn external_pending_put_guard_clone_releases_only_after_last_drop() {
+        let controls = Arc::new(OwnerKeyControlTable::default());
+        let guard = acquire_external_pending_put_fence_for_key(&controls, "clone-key")
+            .expect("pending fence acquisition must succeed");
+        let clone = guard.clone();
+        assert_eq!(pending_put_count(&controls, "clone-key"), Some(1));
+
+        drop(guard);
+        assert_eq!(pending_put_count(&controls, "clone-key"), Some(1));
+        drop(clone);
+        assert_eq!(pending_put_count(&controls, "clone-key"), None);
+    }
+
+    #[test]
+    fn stale_pending_put_guard_drop_cannot_erase_new_generation() {
+        let controls = Arc::new(OwnerKeyControlTable::default());
+        let old = acquire_external_pending_put_fence_for_key(&controls, "aba-key")
+            .expect("old pending fence acquisition must succeed");
+        let new = acquire_external_pending_put_fence_for_key(&controls, "aba-key")
+            .expect("new pending fence acquisition must succeed");
+        assert_eq!(pending_put_count(&controls, "aba-key"), Some(2));
+
+        drop(old);
+        assert_eq!(pending_put_count(&controls, "aba-key"), Some(1));
+        drop(new);
+        assert_eq!(pending_put_count(&controls, "aba-key"), None);
+    }
+
+    #[test]
+    fn local_first_pending_guard_releases_both_key_counters() {
+        let controls = controls_with_state(
+            "local-key",
+            OwnerKeyControlState {
+                local_puts: 1,
+                external_pending_puts: 1,
+                reclaim: None,
+                external_get: None,
+            },
+        );
+        let guard = Arc::new(ExternalPendingPutFenceGuard {
+            key: "local-key".to_string(),
+            owner_key_control: controls.clone(),
+            owns_local_put: true,
+            local_slot_cleanup_view: None,
+            local_slot_lease: Mutex::new(None),
+            local_slot_release_failed: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        drop(guard);
+        assert!(controls.lock_key("local-key").get("local-key").is_none());
+    }
+
+    #[test]
+    fn failed_local_slot_release_keeps_key_fence_closed() {
+        let controls = controls_with_state(
+            "failed-slot",
+            OwnerKeyControlState {
+                local_puts: 1,
+                external_pending_puts: 1,
+                reclaim: None,
+                external_get: None,
+            },
+        );
+        let guard = Arc::new(ExternalPendingPutFenceGuard {
+            key: "failed-slot".to_string(),
+            owner_key_control: controls.clone(),
+            owns_local_put: true,
+            local_slot_cleanup_view: None,
+            local_slot_lease: Mutex::new(None),
+            local_slot_release_failed: std::sync::atomic::AtomicBool::new(true),
+        });
+
+        drop(guard);
+        let controls = controls.lock_key("failed-slot");
+        assert_eq!(controls["failed-slot"].local_puts, 1);
+        assert_eq!(controls["failed-slot"].external_pending_puts, 1);
+    }
+
+    #[test]
+    fn committed_local_first_slot_disarms_drop_cleanup_before_fence_release() {
+        let controls = controls_with_state(
+            "committed-slot",
+            OwnerKeyControlState {
+                local_puts: 1,
+                external_pending_puts: 1,
+                reclaim: None,
+                external_get: None,
+            },
+        );
+        let guard = Arc::new(ExternalPendingPutFenceGuard {
+            key: "committed-slot".to_string(),
+            owner_key_control: controls.clone(),
+            owns_local_put: true,
+            local_slot_cleanup_view: None,
+            local_slot_lease: Mutex::new(None),
+            local_slot_release_failed: std::sync::atomic::AtomicBool::new(false),
+        });
+        guard.attach_local_slot_lease(OwnerLocalReserveSlotLease {
+            value_len: 8,
+            slot_size: 8,
+            slots: vec![OwnerLocalReserveSlotRef {
+                grant_id: 7,
+                slot_index: 2,
+                ptr: 0x1008,
+                base_addr: 0x1000,
+            }],
+        });
+
+        guard.disarm_local_slot_lease();
+        drop(guard);
+        assert!(
+            controls
+                .lock_key("committed-slot")
+                .get("committed-slot")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_ctx_clone_keeps_fence_after_explicit_cache_invalidation() {
+        let controls = Arc::new(OwnerKeyControlTable::default());
+        let fence = acquire_external_pending_put_fence_for_key(&controls, "cached-key")
+            .expect("pending fence acquisition must succeed");
+        let cache = moka::sync::Cache::new(1);
+        let identity = ("cached-key".to_string(), 10, 2);
+        cache.insert(
+            identity.clone(),
+            ExternalPendingPutCtx {
+                peer_id: None,
+                src_offset: 0,
+                target_base_addr: 0,
+                target_offset: 0,
+                len: 1,
+                make_replica_task: false,
+                preferred_sub_cluster: None,
+                replica_target: None,
+                local_reserve_slot: None,
+                local_reserve_slot_size: None,
+                atomic_group: None,
+                _pending_fence: fence,
+            },
+        );
+        let clone = cache.get(&identity).expect("pending ctx must exist");
+        cache.invalidate(&identity);
+        cache.run_pending_tasks();
+        assert_eq!(pending_put_count(&controls, "cached-key"), Some(1));
+
+        drop(clone);
+        assert_eq!(pending_put_count(&controls, "cached-key"), None);
+    }
 
     #[test]
     fn external_holding_ids_are_nonzero_and_unique_for_resident_pages() {
@@ -2910,30 +4006,162 @@ mod owner_reclaim_slot_tests {
     }
 
     #[test]
-    fn hot_replica_guard_keeps_dedup_until_terminal_outcome() {
-        let identity = OwnerHotReplicaIdentity {
-            key: "hot-key".to_string(),
-            put_time_ms: 10,
-            put_version: 2,
-        };
-        let inflight = Arc::new(DashSet::new());
-        assert!(inflight.insert(identity.clone()));
-        let counters = Arc::new(OwnerHotCacheCounters::default());
-        let group_replica_triggered = Arc::new(DashSet::new());
-        let guard = OwnerHotReplicaGuard::new(
-            identity.clone(),
-            inflight.clone(),
-            counters.clone(),
-            None,
-            group_replica_triggered,
-        );
-        assert!(inflight.contains(&identity));
+    fn dispatcher_pin_and_reclaim_prepare_are_serialized_by_the_current_index() {
+        let current = Mutex::new(Some(((10, 2), Arc::new(7u64))));
+        let weak = Arc::downgrade(&current.lock().as_ref().unwrap().1);
 
-        guard.mark_completed();
-        drop(guard);
-        assert!(!inflight.contains(&identity));
-        assert_eq!(counters.replica_completed.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.replica_failed.load(Ordering::Relaxed), 0);
+        let pinned = match pin_current_owner_hot_source_from_index((10, 2), &weak, || {
+            current
+                .lock()
+                .as_ref()
+                .map(|(put_id, value)| (*put_id, value.clone()))
+        }) {
+            super::OwnerHotPinResult::Pinned(pinned) => pinned,
+            _ => panic!("current source must pin under the owner fence"),
+        };
+        let prepared_after_pin = current.lock().take().unwrap().1;
+        assert_eq!(Arc::strong_count(&prepared_after_pin), 2);
+        drop(pinned);
+        assert_eq!(Arc::strong_count(&prepared_after_pin), 1);
+
+        // If Prepare wins and moves the sole Arc out of the local index, the
+        // dispatcher observes an absent current entry. It must not upgrade the
+        // Weak that now points into Prepared, or Commit's try_unwrap could race
+        // an unexpected second holder.
+        let current = Mutex::new(Some(((11, 3), Arc::new(9u64))));
+        let weak = Arc::downgrade(&current.lock().as_ref().unwrap().1);
+        let prepared_before_pin = current.lock().take().unwrap().1;
+        assert!(matches!(
+            pin_current_owner_hot_source_from_index((11, 3), &weak, || {
+                current
+                    .lock()
+                    .as_ref()
+                    .map(|(put_id, value)| (*put_id, value.clone()))
+            }),
+            super::OwnerHotPinResult::ReclaimBusy
+        ));
+        assert_eq!(Arc::strong_count(&prepared_before_pin), 1);
+
+        drop(prepared_before_pin);
+        assert!(matches!(
+            pin_current_owner_hot_source_from_index((11, 3), &weak, || None),
+            super::OwnerHotPinResult::Stale
+        ));
+    }
+
+    #[test]
+    fn owner_hot_retry_queue_is_exactly_once_and_keeps_selection_debt() {
+        let counters = Arc::new(OwnerHotCacheCounters::default());
+        let retry_queue = OwnerHotRetryQueue::new(counters.clone());
+        let identity = OwnerHotReplicaIdentity {
+            key: "retry-key".to_string(),
+            put_time_ms: 12,
+            put_version: 3,
+        };
+        let debt = OwnerHotSelectionDebt::new(64, counters.selection_debt_bytes.clone());
+        let event = OwnerHotEvictionEvent {
+            key: identity.key.clone(),
+            put_id: (identity.put_time_ms, identity.put_version),
+            memory_info: Weak::new(),
+            selection_debt: debt,
+            retry: true,
+            source_eviction_cohort: None,
+            retry_failures: 0,
+        };
+        retry_queue.schedule(event.clone(), "first failure");
+        retry_queue.schedule(event, "duplicate failure");
+        assert_eq!(retry_queue.len(), 1);
+        assert_eq!(counters.selection_debt_bytes.load(Ordering::Acquire), 64);
+
+        let due = retry_queue.take_due_batch(Instant::now() + Duration::from_secs(10), 128);
+        assert_eq!(due.len(), 1);
+        assert_eq!(retry_queue.len(), 1);
+        assert_eq!(counters.selection_debt_bytes.load(Ordering::Acquire), 64);
+        assert!(
+            retry_queue
+                .take_due_batch(Instant::now() + Duration::from_secs(30), 128)
+                .is_empty(),
+            "a dispatched retry stays exactly once until dispatcher acknowledgement"
+        );
+        let accepted = retry_queue
+            .take_for_inflight(&identity)
+            .expect("dispatcher acknowledgement must take the authoritative event");
+        accepted.selection_debt.release();
+        assert_eq!(retry_queue.len(), 0);
+        assert_eq!(counters.selection_debt_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn owner_hot_retry_queue_deadlines_stay_bounded_under_high_churn() {
+        const CHURN: usize = 20_000;
+
+        let counters = Arc::new(OwnerHotCacheCounters::default());
+        let retry_queue = OwnerHotRetryQueue::new(counters.clone());
+        let identity = OwnerHotReplicaIdentity {
+            key: "retry-churn".to_string(),
+            put_time_ms: 21,
+            put_version: 5,
+        };
+        let debt = OwnerHotSelectionDebt::new(64, counters.selection_debt_bytes.clone());
+        let event = OwnerHotEvictionEvent {
+            key: identity.key.clone(),
+            put_id: (identity.put_time_ms, identity.put_version),
+            memory_info: Weak::new(),
+            selection_debt: debt,
+            retry: true,
+            source_eviction_cohort: None,
+            retry_failures: 0,
+        };
+
+        for _ in 0..CHURN {
+            retry_queue.schedule(event.clone(), "repeated failure");
+        }
+        assert_eq!(retry_queue.len(), 1);
+        assert_eq!(retry_queue.state.lock().deadlines.len(), 1);
+
+        let due = retry_queue.take_due_batch(Instant::now() + Duration::from_secs(10), 1);
+        assert_eq!(due.len(), 1);
+        assert_eq!(retry_queue.len(), 1);
+        assert_eq!(retry_queue.state.lock().deadlines.len(), 0);
+
+        for _ in 0..CHURN {
+            retry_queue.schedule(due[0].clone(), "repeated dispatcher failure");
+        }
+        assert_eq!(retry_queue.len(), 1);
+        assert_eq!(retry_queue.state.lock().deadlines.len(), 1);
+
+        let event = retry_queue
+            .take_for_inflight(&identity)
+            .expect("live retry must remain available to the dispatcher");
+        assert_eq!(retry_queue.len(), 0);
+        assert_eq!(retry_queue.state.lock().deadlines.len(), 0);
+        event.selection_debt.release();
+        assert_eq!(counters.selection_debt_bytes.load(Ordering::Acquire), 0);
+
+        let remove_identity = OwnerHotReplicaIdentity {
+            key: "retry-remove-churn".to_string(),
+            put_time_ms: 22,
+            put_version: 6,
+        };
+        let remove_debt = OwnerHotSelectionDebt::new(32, counters.selection_debt_bytes.clone());
+        let remove_event = OwnerHotEvictionEvent {
+            key: remove_identity.key.clone(),
+            put_id: (remove_identity.put_time_ms, remove_identity.put_version),
+            memory_info: Weak::new(),
+            selection_debt: remove_debt,
+            retry: true,
+            source_eviction_cohort: None,
+            retry_failures: 0,
+        };
+        for _ in 0..CHURN {
+            retry_queue.schedule(remove_event.clone(), "remove churn");
+        }
+        assert_eq!(retry_queue.len(), 1);
+        assert_eq!(retry_queue.state.lock().deadlines.len(), 1);
+        retry_queue.remove(&remove_identity);
+        assert_eq!(retry_queue.len(), 0);
+        assert_eq!(retry_queue.state.lock().deadlines.len(), 0);
+        assert_eq!(counters.selection_debt_bytes.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -2961,11 +4189,8 @@ mod owner_reclaim_slot_tests {
         let second_group = atomic_groups.get(&second).unwrap().value().clone();
         assert!(Arc::ptr_eq(&first_group, &second_group));
 
-        let triggered = DashSet::new();
-        assert!(triggered.insert(first.clone()));
-        forget_owner_hot_atomic_group(&atomic_groups, &triggered, &second);
+        forget_owner_hot_atomic_group(&atomic_groups, &second);
         assert!(atomic_groups.is_empty());
-        assert!(!triggered.contains(&first));
     }
 
     #[test]
@@ -3011,70 +4236,11 @@ mod owner_reclaim_slot_tests {
     }
 
     #[test]
-    fn hot_group_trigger_is_persistent_on_success_and_retryable_on_failure() {
-        let member = OwnerHotReplicaIdentity {
-            key: "member".to_string(),
-            put_time_ms: 10,
-            put_version: 2,
-        };
-        let group_trigger = OwnerHotReplicaIdentity {
-            key: "anchor".to_string(),
-            put_time_ms: 10,
-            put_version: 1,
-        };
-        let inflight = Arc::new(DashSet::new());
-        let triggered = Arc::new(DashSet::new());
-        let counters = Arc::new(OwnerHotCacheCounters::default());
-
-        assert!(inflight.insert(member.clone()));
-        assert!(triggered.insert(group_trigger.clone()));
-        let failed_guard = OwnerHotReplicaGuard::new(
-            member.clone(),
-            inflight.clone(),
-            counters.clone(),
-            Some(group_trigger.clone()),
-            triggered.clone(),
-        );
-        drop(failed_guard);
-        assert!(!inflight.contains(&member));
-        assert!(!triggered.contains(&group_trigger));
-        assert_eq!(counters.replica_failed.load(Ordering::Relaxed), 1);
-
-        assert!(inflight.insert(member.clone()));
-        assert!(triggered.insert(group_trigger.clone()));
-        let completed_guard = OwnerHotReplicaGuard::new(
-            member.clone(),
-            inflight.clone(),
-            counters.clone(),
-            Some(group_trigger.clone()),
-            triggered.clone(),
-        );
-        completed_guard.mark_completed();
-        drop(completed_guard);
-        assert!(!inflight.contains(&member));
-        assert!(triggered.contains(&group_trigger));
-        assert_eq!(counters.replica_completed.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
     fn hot_cache_only_dispatches_size_removals_and_keeps_capacity() {
-        let controls = Arc::new(Mutex::new(HashMap::new()));
-        let cached = Arc::new(DashMap::<String, GetCachedInfo>::new());
-        let inflight = Arc::new(DashSet::new());
-        let atomic_groups = Arc::new(DashMap::new());
-        let group_replica_triggered = Arc::new(DashSet::new());
         let counters = Arc::new(OwnerHotCacheCounters::default());
-        let (tx, mut rx) = limit_thirdparty::tokio::sync::ampsc::channel(8);
-        let cache = build_owner_hot_cache(
-            10,
-            controls,
-            cached,
-            inflight,
-            atomic_groups,
-            group_replica_triggered,
-            counters.clone(),
-            tx,
-        );
+        let retry_queue = Arc::new(OwnerHotRetryQueue::new(counters.clone()));
+        let (tx, mut rx) = limit_thirdparty::tokio::sync::ampsc::unbounded_channel();
+        let cache = build_owner_hot_cache(10, counters.clone(), retry_queue, tx);
         let entry = |put_version| OwnerHotCacheEntry {
             put_id: (10, put_version),
             memory_info: Weak::new(),
@@ -3092,36 +4258,45 @@ mod owner_reclaim_slot_tests {
         cache.run_pending_tasks();
         assert!(counters.size_evictions.load(Ordering::Relaxed) >= 1);
         assert_eq!(cache.policy().max_capacity(), Some(10));
-        assert!(
-            rx.try_recv().is_err(),
-            "stale weak entries must not dispatch"
-        );
+        let event = rx
+            .try_recv()
+            .expect("the Moka listener must emit lightweight metadata without pinning");
+        assert!(event.memory_info.upgrade().is_none());
     }
 
     #[test]
-    fn batch_local_visibility_skips_reclaim_fenced_keys() {
+    fn pointwise_batch_visibility_skips_reclaim_fenced_keys() {
         let keys = vec![
             "local-a".to_string(),
             "fenced".to_string(),
             "local-b".to_string(),
         ];
-        let mut controls = HashMap::new();
-        controls.insert(
+        let controls = OwnerKeyControlTable::default();
+        controls.lock_key("fenced").insert(
             "fenced".to_string(),
             OwnerKeyControlState {
                 local_puts: 0,
+                external_pending_puts: 0,
                 reclaim: Some(OwnerReclaimRecord::Committed(OwnerReclaimItem {
                     key: "fenced".to_string(),
                     ..OwnerReclaimItem::default()
                 })),
+                external_get: None,
             },
         );
         let mut resolved_keys = Vec::new();
-
-        let visible = resolve_local_visible_batch(&keys, &controls, |key| {
-            resolved_keys.push(key.to_string());
-            Some(key.to_string())
-        });
+        let visible = keys
+            .iter()
+            .map(|key| {
+                let shard = controls.lock_key(key);
+                if shard.get(key).is_some_and(|state| state.reclaim.is_some()) {
+                    None
+                } else {
+                    resolved_keys.push(key.to_string());
+                    Some(key.to_string())
+                }
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(
             visible,
@@ -3132,6 +4307,29 @@ mod owner_reclaim_slot_tests {
             ]
         );
         assert_eq!(resolved_keys, vec!["local-a", "local-b"]);
+    }
+
+    #[test]
+    fn sharded_owner_control_does_not_globally_block_unrelated_keys() {
+        let controls = OwnerKeyControlTable::default();
+        let first = "shard-key-a";
+        let first_shard = OwnerKeyControlTable::shard_index(first);
+        let second = (0..10_000)
+            .map(|idx| format!("shard-key-b-{idx}"))
+            .find(|key| OwnerKeyControlTable::shard_index(key) != first_shard)
+            .expect("a key on another owner-control shard must exist");
+
+        let _first_guard = controls.lock_key(first);
+        assert!(
+            controls.shards[OwnerKeyControlTable::shard_index(&second)]
+                .try_lock()
+                .is_some(),
+            "one key fence must not block an unrelated shard"
+        );
+        assert!(
+            controls.shards[first_shard].try_lock().is_none(),
+            "the same shard must remain serialized while its guard is held"
+        );
     }
 
     #[test]
@@ -3148,6 +4346,43 @@ mod owner_reclaim_slot_tests {
         grant.release_resident_slot_holder(slot.slot_index);
         assert_eq!(grant.free_slots.len(), 2);
         assert!(grant.is_fully_free());
+    }
+
+    #[test]
+    fn owner_reclaim_releases_committed_route_and_resident_holder_as_one_pool_update() {
+        let mut class = super::OwnerLocalReserveClassState::new(8, 2);
+        class.install_grant(OwnerLocalReserveGrantState::new(7, 0, 0, 16, 8, 2));
+        let slot = class.claim_available(1).pop().expect("slot should be free");
+        assert!(class.mark_prepared_slot_pending_visible(slot.grant_id, slot.slot_index));
+        assert!(class.retain_resident_slot_holder(slot.grant_id, slot.slot_index));
+        assert!(class.promote_pending_visible_slot_to_committed(slot.grant_id, slot.slot_index));
+        assert_eq!(class.committed_slot_count(), 1);
+        assert_eq!(class.free_slot_count(), 1);
+
+        assert!(class.release_committed_resident_slot(slot.grant_id, slot.slot_index));
+        assert_eq!(class.committed_slot_count(), 0);
+        assert_eq!(class.free_slot_count(), 2);
+    }
+
+    #[test]
+    fn failed_pending_get_releases_only_its_slot() {
+        let mut grant = OwnerLocalReserveGrantState::new(7, 0, 0, 24, 8, 3);
+        let failed = grant.claim_prepared_slot().expect("first slot");
+        let unrelated = grant.claim_prepared_slot().expect("second slot");
+        grant.mark_prepared_slot_pending_visible(failed.slot_index);
+        grant.retain_resident_slot_holder(failed.slot_index);
+
+        grant.release_resident_slot_holder(failed.slot_index);
+
+        assert!(matches!(
+            grant.slot_states[failed.slot_index as usize],
+            OwnerLocalReserveSlotState::Free
+        ));
+        assert!(matches!(
+            grant.slot_states[unrelated.slot_index as usize],
+            OwnerLocalReserveSlotState::Prepared
+        ));
+        assert_eq!(grant.free_slots.len(), 2);
     }
 }
 
@@ -3339,6 +4574,16 @@ fn format_metrics_snapshot_prometheus(
 }
 
 impl ClientKvApiInner {
+    pub(crate) fn owner_local_reserve_claim_lock(
+        &self,
+        slot_size: u64,
+    ) -> Arc<limit_thirdparty::tokio::sync::AMutex<()>> {
+        self.owner_local_reserve_claim_locks
+            .entry(slot_size)
+            .or_insert_with(|| Arc::new(limit_thirdparty::tokio::sync::AMutex::new(())))
+            .clone()
+    }
+
     pub fn get_holding_len(&self) -> usize {
         self.external_get_holding.total()
     }
@@ -3360,10 +4605,83 @@ impl ClientKvApiInner {
                 )
             })
             .unwrap_or_default();
+        let (
+            external_get_flights,
+            external_get_flights_starting,
+            external_get_flights_finishing,
+            external_get_flights_revoking,
+            external_get_undecided_interests,
+            external_get_retained_interests,
+        ) = {
+            let mut flights = 0u64;
+            let mut starting = 0u64;
+            let mut finishing = 0u64;
+            let mut revoking = 0u64;
+            let mut undecided = 0u64;
+            let mut retained = 0u64;
+            // Metrics use a weak side index and never scan correctness fences.
+            for op in self.external_get_flight_snapshot() {
+                flights = flights.saturating_add(1);
+                let state = op.state.lock();
+                undecided = undecided.saturating_add(state.undecided as u64);
+                retained = retained.saturating_add(state.retained as u64);
+                match &state.phase {
+                    ExternalGetKeySharedPhase::Starting
+                    | ExternalGetKeySharedPhase::Started { .. } => {
+                        starting = starting.saturating_add(1)
+                    }
+                    ExternalGetKeySharedPhase::Finishing { .. } => {
+                        finishing = finishing.saturating_add(1)
+                    }
+                    ExternalGetKeySharedPhase::Revoking { .. } => {
+                        revoking = revoking.saturating_add(1)
+                    }
+                    ExternalGetKeySharedPhase::Ready { .. }
+                    | ExternalGetKeySharedPhase::Failed { .. } => {}
+                }
+            }
+            (flights, starting, finishing, revoking, undecided, retained)
+        };
+        let (
+            local_reserve_slots_free,
+            local_reserve_slots_prepared,
+            local_reserve_slots_pending_visible,
+            local_reserve_slots_committed,
+        ) = {
+            let pool = self.owner_local_reserve_pool.lock();
+            let mut free = 0u64;
+            let mut prepared = 0u64;
+            let mut pending_visible = 0u64;
+            let mut committed = 0u64;
+            for class in pool.classes.values() {
+                free =
+                    free.saturating_add(u64::try_from(class.free_slot_count()).unwrap_or(u64::MAX));
+                prepared = prepared
+                    .saturating_add(u64::try_from(class.prepared_slot_count()).unwrap_or(u64::MAX));
+                pending_visible = pending_visible.saturating_add(
+                    u64::try_from(class.pending_visible_slot_count()).unwrap_or(u64::MAX),
+                );
+                committed = committed.saturating_add(
+                    u64::try_from(class.committed_slot_count()).unwrap_or(u64::MAX),
+                );
+            }
+            (free, prepared, pending_visible, committed)
+        };
         OwnerRuntimeObserveSnapshot {
             external_get_holding_entries: self.external_get_holding.total() as u64,
             external_get_holding_bytes,
+            external_get_start_handles: self.external_get_start_registry.len() as u64,
+            external_get_flights,
+            external_get_flights_starting,
+            external_get_flights_finishing,
+            external_get_flights_revoking,
+            external_get_undecided_interests,
+            external_get_retained_interests,
             external_pending_put_entries: self.external_pending_puts.entry_count(),
+            local_reserve_slots_free,
+            local_reserve_slots_prepared,
+            local_reserve_slots_pending_visible,
+            local_reserve_slots_committed,
             hot_cache_capacity_bytes,
             hot_cache_entries,
             hot_cache_weighted_bytes,
@@ -3371,31 +4689,40 @@ impl ClientKvApiInner {
                 .owner_hot_counters
                 .size_evictions
                 .load(Ordering::Relaxed),
-            hot_replica_enqueued: self
+            hot_source_evict_handoff_members: self
                 .owner_hot_counters
-                .replica_enqueued
+                .source_evict_handoff_members
                 .load(Ordering::Relaxed),
-            hot_replica_completed: self
+            hot_source_evict_committed_members: self
                 .owner_hot_counters
-                .replica_completed
+                .source_evict_committed_members
                 .load(Ordering::Relaxed),
-            hot_replica_already_satisfied: self
+            hot_source_evict_restored_members: self
                 .owner_hot_counters
-                .replica_already_satisfied
+                .source_evict_restored_members
                 .load(Ordering::Relaxed),
-            hot_replica_failed: self
+            hot_source_evict_obsolete: self
                 .owner_hot_counters
-                .replica_failed
+                .source_evict_obsolete
                 .load(Ordering::Relaxed),
-            hot_replica_obsolete: self
+            hot_source_evict_dispatch_failed: self
                 .owner_hot_counters
-                .replica_obsolete
+                .source_evict_dispatch_failed
                 .load(Ordering::Relaxed),
-            hot_replica_dispatch_failed: self
+            hot_source_eviction_selected: self.owner_source_eviction_selected.len() as u64,
+            hot_source_evict_retry_entries: self.owner_hot_retry_queue.len() as u64,
+            hot_source_evict_retry_scheduled: self
                 .owner_hot_counters
-                .replica_dispatch_failed
+                .source_evict_retry_scheduled
                 .load(Ordering::Relaxed),
-            hot_replica_inflight: self.owner_hot_replica_inflight.len() as u64,
+            hot_source_evict_retry_emitted: self
+                .owner_hot_counters
+                .source_evict_retry_emitted
+                .load(Ordering::Relaxed),
+            hot_selection_debt_bytes: self
+                .owner_hot_counters
+                .selection_debt_bytes
+                .load(Ordering::Relaxed),
             hot_eviction_skipped_stale: self
                 .owner_hot_counters
                 .skipped_stale
@@ -3404,20 +4731,7 @@ impl ClientKvApiInner {
                 .owner_hot_counters
                 .skipped_reclaim
                 .load(Ordering::Relaxed),
-            hot_eviction_skipped_duplicate: self
-                .owner_hot_counters
-                .skipped_duplicate
-                .load(Ordering::Relaxed),
             hot_group_registry_entries: self.owner_hot_atomic_groups.len() as u64,
-            hot_group_replica_triggered: self.owner_hot_group_replica_triggered.len() as u64,
-            hot_group_replica_triggers: self
-                .owner_hot_counters
-                .group_replica_triggers
-                .load(Ordering::Relaxed),
-            hot_group_members_enqueued: self
-                .owner_hot_counters
-                .group_members_enqueued
-                .load(Ordering::Relaxed),
             hot_group_trigger_duplicates: self
                 .owner_hot_counters
                 .group_trigger_duplicates
@@ -3905,6 +5219,8 @@ impl ClientKvApiInner {
             .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
         class_state.pending_slot_demand =
             class_state.pending_slot_demand.saturating_add(demand_slots);
+        class_state.max_observed_claim_slots =
+            class_state.max_observed_claim_slots.max(demand_slots);
     }
 
     pub(crate) fn owner_local_reserve_consume_pending_demand(
@@ -3950,33 +5266,46 @@ impl ClientKvApi {
                         metrics.set_kv_external_pending_put_entries(
                             snapshot.external_pending_put_entries,
                         );
+                        tracing::info!(
+                            active_handles = snapshot.external_get_start_handles,
+                            active_flights = snapshot.external_get_flights,
+                            starting_flights = snapshot.external_get_flights_starting,
+                            finishing_flights = snapshot.external_get_flights_finishing,
+                            revoking_flights = snapshot.external_get_flights_revoking,
+                            undecided_interests = snapshot.external_get_undecided_interests,
+                            retained_interests = snapshot.external_get_retained_interests,
+                            reserve_free = snapshot.local_reserve_slots_free,
+                            reserve_prepared = snapshot.local_reserve_slots_prepared,
+                            reserve_pending_visible = snapshot.local_reserve_slots_pending_visible,
+                            reserve_committed = snapshot.local_reserve_slots_committed,
+                            "owner Get lifecycle snapshot"
+                        );
                         if snapshot.hot_cache_capacity_bytes > 0 {
                             tracing::info!(
                                 capacity_bytes = snapshot.hot_cache_capacity_bytes,
                                 entries = snapshot.hot_cache_entries,
                                 weighted_bytes = snapshot.hot_cache_weighted_bytes,
                                 size_evictions = snapshot.hot_size_evictions,
-                                replica_enqueued = snapshot.hot_replica_enqueued,
-                                replica_completed = snapshot.hot_replica_completed,
-                                replica_already_satisfied = snapshot.hot_replica_already_satisfied,
-                                replica_failed = snapshot.hot_replica_failed,
-                                replica_obsolete = snapshot.hot_replica_obsolete,
-                                replica_dispatch_failed = snapshot.hot_replica_dispatch_failed,
-                                replica_inflight = snapshot.hot_replica_inflight,
+                                source_evict_handoff_members = snapshot.hot_source_evict_handoff_members,
+                                source_evict_committed_members = snapshot.hot_source_evict_committed_members,
+                                source_evict_restored_members = snapshot.hot_source_evict_restored_members,
+                                source_evict_obsolete = snapshot.hot_source_evict_obsolete,
+                                source_evict_dispatch_failed = snapshot.hot_source_evict_dispatch_failed,
+                                source_eviction_selected = snapshot.hot_source_eviction_selected,
+                                source_evict_retry_entries = snapshot.hot_source_evict_retry_entries,
+                                source_evict_retry_scheduled = snapshot.hot_source_evict_retry_scheduled,
+                                source_evict_retry_emitted = snapshot.hot_source_evict_retry_emitted,
+                                selection_debt_bytes = snapshot.hot_selection_debt_bytes,
                                 skipped_stale = snapshot.hot_eviction_skipped_stale,
                                 skipped_reclaim = snapshot.hot_eviction_skipped_reclaim,
-                                skipped_duplicate = snapshot.hot_eviction_skipped_duplicate,
                                 group_registry_entries = snapshot.hot_group_registry_entries,
-                                group_replica_triggered = snapshot.hot_group_replica_triggered,
-                                group_replica_triggers = snapshot.hot_group_replica_triggers,
-                                group_members_enqueued = snapshot.hot_group_members_enqueued,
                                 group_trigger_duplicates = snapshot.hot_group_trigger_duplicates,
                                 group_trigger_incomplete = snapshot.hot_group_trigger_incomplete,
                                 grouped_put_done_batches = snapshot.grouped_put_done_batches,
                                 grouped_put_done_items = snapshot.grouped_put_done_items,
                                 legacy_put_done_batches = snapshot.legacy_put_done_batches,
                                 legacy_put_done_items = snapshot.legacy_put_done_items,
-                                "owner hot replica policy snapshot"
+                                "owner hot source-eviction policy snapshot"
                             );
                         }
                     }
@@ -3999,24 +5328,25 @@ impl ClientKvApi {
             tokio::sync::ampsc::channel(REPLICA_TASK_QUEUE_CAPACITY);
         let (owner_local_publish_tx, owner_local_publish_rx) =
             tokio::sync::ampsc::channel(OWNER_LOCAL_PUBLISH_QUEUE_CAPACITY);
+        // The Moka eviction listener is synchronous and must never block while
+        // holding Moka's housekeeper lock. Events contain only weak payload
+        // references and are deduplicated by exact selected identities, so use
+        // a lossless metadata channel instead of dropping cohorts when the old
+        // bounded queue briefly filled under cache pressure.
         let (owner_hot_eviction_tx, owner_hot_eviction_rx) =
-            tokio::sync::ampsc::channel(OWNER_HOT_EVICTION_QUEUE_CAPACITY);
+            tokio::sync::ampsc::unbounded_channel();
         let get_cached_info = Arc::new(DashMap::new());
-        let owner_key_control = Arc::new(Mutex::new(HashMap::new()));
-        let owner_hot_replica_inflight = Arc::new(DashSet::new());
+        let owner_key_control = Arc::new(OwnerKeyControlTable::default());
+        let owner_source_eviction_selected = Arc::new(DashMap::new());
         let owner_hot_atomic_groups = Arc::new(DashMap::new());
-        let owner_hot_group_replica_triggered = Arc::new(DashSet::new());
         let owner_hot_counters = Arc::new(OwnerHotCacheCounters::default());
+        let owner_hot_retry_queue = Arc::new(OwnerHotRetryQueue::new(owner_hot_counters.clone()));
         let owner_hot_cache = owner_hot_cache_capacity_bytes.map(|capacity_bytes| {
             build_owner_hot_cache(
                 capacity_bytes,
-                owner_key_control.clone(),
-                get_cached_info.clone(),
-                owner_hot_replica_inflight.clone(),
-                owner_hot_atomic_groups.clone(),
-                owner_hot_group_replica_triggered.clone(),
                 owner_hot_counters.clone(),
-                owner_hot_eviction_tx,
+                owner_hot_retry_queue.clone(),
+                owner_hot_eviction_tx.clone(),
             )
         });
 
@@ -4028,19 +5358,22 @@ impl ClientKvApi {
             get_remote_kv_lock: AMapLock::new(Duration::from_secs(60)),
             get_cached_info,
             precommit_local_visible_info: DashMap::new(),
+            pending_local_get_info: DashMap::new(),
             local_snapshot_info: DashMap::new(),
             owner_local_reserve_pool: Mutex::new(OwnerLocalReservePoolState::default()),
-            owner_local_reserve_claim_lock: limit_thirdparty::tokio::sync::AMutex::new(()),
+            owner_local_reserve_claim_locks: DashMap::new(),
             owner_local_reserve_rebalance_notify: Arc::new(
                 limit_thirdparty::tokio::sync::Notify::new(),
             ),
             external_local_first_put_id_counter: AtomicU32::new(0),
+            next_owner_source_eviction_operation_id: AtomicU64::new(1),
             owner_key_control,
             owner_hot_cache,
-            owner_hot_replica_inflight,
+            owner_source_eviction_selected,
             owner_hot_atomic_groups,
-            owner_hot_group_replica_triggered,
             owner_hot_counters,
+            owner_hot_retry_queue,
+            owner_hot_eviction_tx,
             owner_hot_eviction_rx: Mutex::new(Some(owner_hot_eviction_rx)),
             external_invalidate_delete: EnsureMemholderMgmtDeleteHandle::new(
                 OwnerExternalMemMgr::DELETE_SUBMIT_QUEUE_CAPACITY,
@@ -4051,7 +5384,7 @@ impl ClientKvApi {
             owner_delete_ack_mgr: OwnerDeleteAckMemMgr::default(),
             external_get_holding: OwnerExternalMemMgr::default(),
             external_get_start_registry: DashMap::new(),
-            external_get_start_by_key: DashMap::new(),
+            external_get_flight_registry: DashMap::new(),
             next_external_get_start_handle: AtomicU64::new(1),
             next_external_holding_id: AtomicU64::new(1),
             external_pending_puts: moka::sync::Cache::builder()
@@ -4076,8 +5409,11 @@ impl ClientKvApi {
             rpc_caller_batch_prepare_put_keys: RPCCaller::new(),
             rpc_caller_batch_release_put_key_reservations: RPCCaller::new(),
             rpc_caller_put_append_start: RPCCaller::new(),
+            rpc_caller_batch_put_append_start: RPCCaller::new(),
             rpc_caller_put_append_revoke: RPCCaller::new(),
             rpc_caller_put_append_done: RPCCaller::new(),
+            rpc_caller_batch_put_append_done: RPCCaller::new(),
+            rpc_caller_batch_evict_owner_source: RPCCaller::new(),
             rpc_caller_reserve_local_grant: RPCCaller::new(),
             rpc_caller_release_local_grant: RPCCaller::new(),
             rpc_caller_delete: RPCCaller::new(),
@@ -4143,10 +5479,19 @@ impl ClientKvApi {
             .rpc_caller_put_append_start
             .regist(inner.view.p2p_module());
         inner
+            .rpc_caller_batch_put_append_start
+            .regist(inner.view.p2p_module());
+        inner
             .rpc_caller_put_append_revoke
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_put_append_done
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_put_append_done
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_evict_owner_source
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_reserve_local_grant
@@ -4179,6 +5524,8 @@ impl ClientKvApi {
         RPCCaller::<BatchIsExistReq>::new().regist(inner.view.p2p_module());
         RPCCaller::<BatchDeleteClientKvMetaCacheReq>::new().regist(inner.view.p2p_module());
         spawn_owner_local_reserve_rebalance_actor(inner.view.clone_view());
+        spawn_owner_slot_pressure_actor(inner.view.clone_view());
+        external_api::spawn_external_get_start_handle_sweeper(inner.view.clone_view());
         self.spawn_runtime_observe_reporter();
 
         // External RPC handlers
@@ -4533,10 +5880,11 @@ impl ClientKvApi {
         }
         if inner.owner_hot_cache.is_some() {
             if let Some(owner_hot_eviction_rx) = inner.owner_hot_eviction_rx.lock().take() {
-                put::spawn_owner_hot_replica_dispatcher(
+                put::spawn_owner_source_eviction_dispatcher(
                     inner.view.clone_view(),
                     owner_hot_eviction_rx,
                 );
+                put::spawn_owner_hot_retry_actor(inner.view.clone_view());
             } else {
                 tracing::warn!("owner_hot_eviction_rx already taken for ClientKvApi");
             }
@@ -4551,7 +5899,7 @@ impl ClientKvApi {
             tracing::warn!("owner_local_publish_rx already taken for ClientKvApi");
         }
 
-        // Spawn cluster listener to clean up get_holding when external_client leaves
+        // Spawn cluster listener to retire generation-scoped external requester state.
         let view = inner.view.clone_view();
         let view2 = view.clone();
         let view_task = view2.clone();
@@ -4566,15 +5914,43 @@ impl ClientKvApi {
                             Ok(event) => {
                                 match event {
                                     ClusterEvent::MemberLeft(node_id) => {
-                                        let removed = view_task
-                                            .client_kv_api()
-                                            .inner()
+                                        let departed_epoch = view_task
+                                            .cluster_manager()
+                                            .get_prev_member_info(&node_id)
+                                            .map(|member| member.node_start_time);
+                                        let current_epoch = view_task
+                                            .cluster_manager()
+                                            .get_member_info_cached(&node_id)
+                                            .map(|member| member.node_start_time);
+                                        let Some(departed_epoch) = external_api::external_member_left_departed_epoch(
+                                            departed_epoch,
+                                            current_epoch,
+                                        ) else {
+                                            tracing::debug!(
+                                                "Ignoring ambiguous/delayed external MemberLeft: node={} departed_epoch={:?} current_epoch={:?}",
+                                                node_id,
+                                                departed_epoch,
+                                                current_epoch,
+                                            );
+                                            continue;
+                                        };
+
+                                        let inner = view_task.client_kv_api().inner();
+                                        let removed_handles = external_api::cleanup_external_get_start_handles_for_generation(
+                                            &inner.external_get_start_registry,
+                                            &node_id,
+                                            departed_epoch,
+                                        );
+                                        let removed_holdings = inner
                                             .external_get_holding
-                                            .cleanup_node(&node_id);
-                                        if removed > 0 {
+                                            .cleanup_node_generation(&node_id, departed_epoch);
+                                        if removed_handles > 0 || removed_holdings > 0 {
                                             tracing::info!(
-                                                "Cleaned up get_holding for external_client: {} (removed {} holdings)",
-                                                node_id, removed
+                                                "Cleaned up departed external requester state: node={} epoch={} handles={} holdings={}",
+                                                node_id,
+                                                departed_epoch,
+                                                removed_handles,
+                                                removed_holdings,
                                             );
                                         }
                                     }
@@ -4582,8 +5958,11 @@ impl ClientKvApi {
                                 }
                             }
                             Err(e) => {
-                                tracing::error!("Failed to receive cluster event: {}", e);
-                                break;
+                                tracing::warn!(
+                                    "Client cluster event receiver error (will resubscribe): {}",
+                                    e
+                                );
+                                listen_cluster_event = view_task.cluster_manager().listen();
                             }
                         }
                     }

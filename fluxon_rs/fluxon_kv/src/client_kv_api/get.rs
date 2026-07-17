@@ -1,4 +1,7 @@
-use super::{ClientKvApiInner, KvMetrics};
+use super::{
+    ClientKvApiInner, ClientKvApiView, KvMetrics, OwnerLocalReserveSlotLease,
+    OwnerLocalReserveSlotRef,
+};
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::memholder::{MemoryInfo, UserMemHolder, UserMemHolderExposeKind};
 // no StageScope; timestamps-based metrics only
@@ -13,18 +16,185 @@ use crate::{
     master_kv_router::msg_pack::{
         BatchGetDoneReq, BatchGetDoneResp, BatchGetRevokeReq, BatchGetRevokeResp,
         BatchGetStartItemResp, BatchGetStartReq, BatchGetStartResp, BatchIsExistReq,
-        GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetMetaResp, GetRevokeReq,
-        GetStartReq, GetStartResp,
+        GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetMetaResp,
+        GetPreparedLocalReserveTarget, GetRevokeReq, GetStartReq, GetStartResp,
     },
     p2p::msg_pack::MsgPack,
     rpcresp_kvresult_convert::msg_and_error::codes_api,
     rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, OK},
 };
+use ::tokio::sync::Semaphore;
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
 use limit_thirdparty::tokio;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
 use std::time::Instant;
+
+const BATCH_GET_DONE_MAX_INFLIGHT: usize = 4;
+
+fn batch_get_done_rpc_limiter() -> &'static Semaphore {
+    static LIMITER: OnceLock<Semaphore> = OnceLock::new();
+    LIMITER.get_or_init(|| Semaphore::new(BATCH_GET_DONE_MAX_INFLIGHT))
+}
+
+async fn release_prepared_get_target(
+    inner: &ClientKvApiInner,
+    target: &GetPreparedLocalReserveTarget,
+) -> KvResult<()> {
+    inner
+        .owner_release_local_reserve_slot_lease(OwnerLocalReserveSlotLease {
+            value_len: target.slot_size,
+            slot_size: target.slot_size,
+            slots: vec![OwnerLocalReserveSlotRef {
+                grant_id: target.grant_id,
+                slot_index: target.slot_index,
+                ptr: target.addr,
+                base_addr: target.base_addr,
+            }],
+        })
+        .await
+}
+
+fn batch_get_done_response_matches(get_ids: &[u64], response: &BatchGetDoneResp) -> bool {
+    response.items.len() == get_ids.len()
+        && response
+            .items
+            .iter()
+            .zip(get_ids)
+            .all(|(item, expected_get_id)| item.get_id == *expected_get_id)
+}
+
+#[derive(Clone)]
+pub(crate) struct StartedGetRevokeCleanup {
+    pub(crate) get_id: u64,
+    pub(crate) prepared_target: Option<GetPreparedLocalReserveTarget>,
+}
+
+async fn run_started_get_revoke_cleanup(
+    view: ClientKvApiView,
+    pending: Vec<StartedGetRevokeCleanup>,
+    context: &'static str,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut attempt = 1u32;
+    loop {
+        let get_ids = pending.iter().map(|item| item.get_id).collect::<Vec<_>>();
+        let response = view.client_kv_api().inner().batch_get_revoke(get_ids).await;
+        let resp = match response {
+            Ok(resp)
+                if resp.items.len() == pending.len()
+                    && resp
+                        .items
+                        .iter()
+                        .zip(&pending)
+                        .all(|(resp, expected)| resp.get_id == expected.get_id) =>
+            {
+                resp
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    "{} Revoke response shape/identity mismatch; retaining prepared slots for retry: expected={} got={} attempt={}",
+                    context,
+                    pending.len(),
+                    resp.items.len(),
+                    attempt
+                );
+                tokio::time::sleep(Duration::from_millis(
+                    (50u64.saturating_mul(1u64 << attempt.min(6))).min(2_000),
+                ))
+                .await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+            Err(err) => {
+                if matches!(&err, KvError::Api(ApiError::SystemShutdown { .. })) {
+                    tracing::warn!(
+                        "{} Revoke cleanup stopped during owner shutdown: items={}",
+                        context,
+                        pending.len()
+                    );
+                    return;
+                }
+                tracing::warn!(
+                    "{} Revoke uncertain; retaining get ids and prepared slots for retry: items={} attempt={} err={}",
+                    context,
+                    pending.len(),
+                    attempt,
+                    err
+                );
+                tokio::time::sleep(Duration::from_millis(
+                    (50u64.saturating_mul(1u64 << attempt.min(6))).min(2_000),
+                ))
+                .await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        };
+
+        for (expected, item_resp) in pending.iter().zip(resp.items) {
+            if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
+                item_resp.error_code,
+                item_resp.error_json,
+            ) {
+                // A terminal Done may have won.  Never release a possibly
+                // committed slot from the losing Revoke path.
+                tracing::warn!(
+                    "{} Revoke reached non-releasable terminal: get_id={} err={}",
+                    context,
+                    expected.get_id,
+                    err
+                );
+                continue;
+            }
+            let Some(target) = expected.prepared_target.as_ref() else {
+                continue;
+            };
+            let mut release_attempt = 1u32;
+            loop {
+                match release_prepared_get_target(view.client_kv_api().inner(), target).await {
+                    Ok(()) => break,
+                    Err(err) => {
+                        tracing::error!(
+                            "{} Revoke confirmed but prepared slot release failed; retrying: get_id={} attempt={} err={}",
+                            context,
+                            expected.get_id,
+                            release_attempt,
+                            err
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        release_attempt = release_attempt.saturating_add(1);
+                    }
+                }
+            }
+        }
+        return;
+    }
+}
+
+/// Move cleanup ownership to a registered task before awaiting it.  If the
+/// caller future is cancelled, the task still drives Revoke to a definite
+/// terminal and releases only confirmed-uncommitted prepared slots.
+pub(crate) async fn finish_started_get_revoke_cleanup(
+    inner: &ClientKvApiInner,
+    pending: Vec<StartedGetRevokeCleanup>,
+    context: &'static str,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let (done_tx, done_rx) = ::tokio::sync::oneshot::channel::<()>();
+    let spawn_view = inner.view.clone_view();
+    let worker_view = spawn_view.clone();
+    spawn_view.spawn("started_get_revoke_cleanup", async move {
+        run_started_get_revoke_cleanup(worker_view, pending, context).await;
+        let _ = done_tx.send(());
+    });
+    let _ = done_rx.await;
+}
 
 #[derive(Debug, Clone)]
 pub struct RemoteGetInfo {
@@ -94,6 +264,7 @@ impl ClientKvApiInner {
             start_item: BatchGetStartItemResp,
             peer_is_remote: bool,
             transfer_us: i64,
+            prepared_memory_info: Option<Arc<MemoryInfo>>,
         }
 
         let transfer_concurrency = transfer_concurrency.max(1);
@@ -106,11 +277,14 @@ impl ClientKvApiInner {
             Option<KvResult<Option<(Arc<UserMemHolder>, Option<RemoteGetInfo>)>>>,
         > = (0..keys.len()).map(|_| None).collect();
         let mut done_pending = Vec::new();
-        let mut revoke_get_ids = Vec::new();
+        let mut transfer_error_cleanup = Vec::new();
         let mut transfer_futures = Vec::new();
 
         for (idx, (key, start_item)) in keys.into_iter().zip(start_items.into_iter()).enumerate() {
             if start_item.error_code == codes_api::API_KEY_NOT_FOUND {
+                if let Some(target) = start_item.prepared_target.as_ref() {
+                    release_prepared_get_target(self, target).await?;
+                }
                 results[idx] = Some(Ok(None));
                 continue;
             }
@@ -118,6 +292,9 @@ impl ClientKvApiInner {
                 start_item.error_code,
                 start_item.error_json.clone(),
             ) {
+                if let Some(target) = start_item.prepared_target.as_ref() {
+                    release_prepared_get_target(self, target).await?;
+                }
                 results[idx] = Some(Err(err));
                 continue;
             }
@@ -140,6 +317,7 @@ impl ClientKvApiInner {
                     start_item,
                     peer_is_remote,
                     transfer_us: 0,
+                    prepared_memory_info: None,
                 });
                 continue;
             }
@@ -186,50 +364,156 @@ impl ClientKvApiInner {
                         start_item,
                         peer_is_remote,
                         transfer_us,
+                        prepared_memory_info: None,
                     });
                 }
-                (idx, _key, _start_item, _peer_is_remote, get_id, _transfer_us, Err(err)) => {
+                (idx, _key, start_item, _peer_is_remote, get_id, _transfer_us, Err(err)) => {
                     results[idx] = Some(Err(err));
-                    revoke_get_ids.push(get_id);
+                    transfer_error_cleanup.push(StartedGetRevokeCleanup {
+                        get_id,
+                        prepared_target: start_item.prepared_target,
+                    });
                 }
             }
         }
 
-        if !revoke_get_ids.is_empty() {
-            if let Err(err) = self.batch_get_revoke(revoke_get_ids).await {
-                tracing::warn!("batch_get_revoke failed after transfer errors: {}", err);
+        finish_started_get_revoke_cleanup(
+            self,
+            transfer_error_cleanup,
+            "batch_get transfer failure",
+        )
+        .await;
+
+        let mut ready_done_pending = Vec::with_capacity(done_pending.len());
+        let mut install_failed_cleanup = Vec::new();
+        for mut pending in done_pending {
+            let install_result = if let Some(target) = pending.start_item.prepared_target.as_ref() {
+                match u32::try_from(pending.start_item.len) {
+                    Ok(len) => self
+                        .install_hidden_pending_local_get(
+                            &pending.key,
+                            pending.start_item.get_id,
+                            pending.start_item.put_id,
+                            target.addr,
+                            target.base_addr,
+                            len,
+                            target.slot_size,
+                            target.grant_id,
+                            target.slot_index,
+                        )
+                        .map(Some),
+                    Err(_) => Err(KvError::Api(ApiError::InvalidArgument {
+                        detail: format!(
+                            "local-reserve Get value length exceeds u32: key={} len={}",
+                            pending.key, pending.start_item.len
+                        ),
+                    })),
+                }
+            } else {
+                Ok(None)
+            };
+            match install_result {
+                Ok(memory_info) => {
+                    pending.prepared_memory_info = memory_info;
+                    ready_done_pending.push(pending);
+                }
+                Err(err) => {
+                    install_failed_cleanup.push(StartedGetRevokeCleanup {
+                        get_id: pending.start_item.get_id,
+                        prepared_target: pending.start_item.prepared_target.clone(),
+                    });
+                    results[pending.idx] = Some(Err(err));
+                }
             }
         }
+        done_pending = ready_done_pending;
 
-        let done_resp = self
-            .batch_get_done(
-                done_pending
-                    .iter()
-                    .map(|pending| pending.start_item.get_id)
-                    .collect(),
-            )
-            .await?;
-        if done_resp.items.len() != done_pending.len() {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "batch_get_done response length mismatch: expected={} got={}",
-                    done_pending.len(),
-                    done_resp.items.len()
-                ),
-            }));
-        }
+        finish_started_get_revoke_cleanup(
+            self,
+            install_failed_cleanup,
+            "batch_get pending install failure",
+        )
+        .await;
+
+        let done_get_ids = done_pending
+            .iter()
+            .map(|pending| pending.start_item.get_id)
+            .collect::<Vec<_>>();
+        let done_first_get_id = done_get_ids.first().copied();
+        let done_last_get_id = done_get_ids.last().copied();
+        let mut done_attempt = 1u32;
+        let done_resp = loop {
+            match self.batch_get_done(done_get_ids.clone()).await {
+                Ok(resp) if batch_get_done_response_matches(&done_get_ids, &resp) => break resp,
+                Ok(resp) => {
+                    tracing::warn!(
+                        "batch_get_done response shape/identity mismatch; retaining pending-visible slots and retrying the same idempotent get_ids: items={} first_get_id={:?} last_get_id={:?} got_items={} got_first_get_id={:?} got_last_get_id={:?} attempt={}",
+                        done_get_ids.len(),
+                        done_first_get_id,
+                        done_last_get_id,
+                        resp.items.len(),
+                        resp.items.first().map(|item| item.get_id),
+                        resp.items.last().map(|item| item.get_id),
+                        done_attempt
+                    );
+                }
+                Err(err) => {
+                    if matches!(&err, KvError::Api(ApiError::SystemShutdown { .. })) {
+                        return Err(err);
+                    }
+                    tracing::warn!(
+                        "batch_get_done transport uncertain; retaining pending-visible slots and retrying the same idempotent get_ids: items={} first_get_id={:?} last_get_id={:?} attempt={} err={}",
+                        done_get_ids.len(),
+                        done_first_get_id,
+                        done_last_get_id,
+                        done_attempt,
+                        err
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(
+                (10u64.saturating_mul(1u64 << done_attempt.min(8))).min(2_000),
+            ))
+            .await;
+            done_attempt = done_attempt.saturating_add(1);
+        };
         let master_node_id: NodeID = self
             .view
             .cluster_manager()
             .find_or_wait_master_node()
             .await?
             .into();
+        let mut local_hot_admissions = Vec::new();
 
         for (pending, done_item) in done_pending.into_iter().zip(done_resp.items.into_iter()) {
             if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
                 done_item.error_code,
                 done_item.error_json.clone(),
             ) {
+                if let Some(target) = pending.start_item.prepared_target.as_ref() {
+                    self.abort_hidden_pending_local_get(&pending.key, pending.start_item.get_id);
+                    let canonical = self.local_committed_mem_holder_for_put_id(
+                        &pending.key,
+                        pending.start_item.put_id,
+                    );
+                    if let Err(release_err) = release_prepared_get_target(self, target).await {
+                        results[pending.idx] = Some(Err(release_err));
+                        continue;
+                    }
+                    // A same-version PutDone/GetDone may have won while this
+                    // transfer was in flight.  Converge on the owner's
+                    // canonical local backing instead of turning an already
+                    // available KV page into a prefix miss.
+                    if let Some(memory_info) = canonical {
+                        let user_mem_holder = Arc::new(UserMemHolder::new(
+                            memory_info,
+                            self.get_or_init_all_memholder_refcount(),
+                            UserMemHolderExposeKind::SegPtr,
+                        ));
+                        results[pending.idx] = Some(Ok(Some((user_mem_holder, None))));
+                        continue;
+                    }
+                }
                 results[pending.idx] = Some(Err(err));
                 continue;
             }
@@ -238,7 +522,6 @@ impl ClientKvApiInner {
             } else {
                 UserMemHolderExposeKind::SegPtr
             };
-            let offset = pending.start_item.target_addr - pending.start_item.target_base_addr;
             let data_len = pending.start_item.len as usize;
             metrics.record_l2_hit_locality(pending.peer_is_remote, data_len as u64);
             metrics.record_get_io_locality(
@@ -246,17 +529,78 @@ impl ClientKvApiInner {
                 data_len as u64,
                 pending.transfer_us,
             );
-            let memory_info = Arc::new(
-                MemoryInfo::new(
-                    offset,
-                    pending.start_item.len as u32,
-                    done_item.holder_id,
+            let memory_info = if pending.start_item.prepared_target.is_some() {
+                if done_item.allocation_mode != GetAllocationMode::LocalCommittedSlot {
+                    self.abort_hidden_pending_local_get(&pending.key, pending.start_item.get_id);
+                    results[pending.idx] = Some(Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "prepared local-reserve Get completed with unexpected allocation mode: key={} mode={:?}",
+                            pending.key, done_item.allocation_mode
+                        ),
+                    })));
+                    continue;
+                }
+                let memory_info = match self.promote_hidden_pending_local_get(
+                    &pending.key,
+                    pending.start_item.get_id,
+                    pending.start_item.put_id,
+                ) {
+                    Ok(memory_info) => memory_info,
+                    Err(err) => {
+                        results[pending.idx] = Some(Err(err));
+                        continue;
+                    }
+                };
+                if let Some(prepared) = pending.prepared_memory_info.as_ref() {
+                    assert!(
+                        Arc::ptr_eq(prepared, &memory_info),
+                        "Get promotion must retain the unique prepared MemoryInfo"
+                    );
+                }
+                local_hot_admissions.push((
                     pending.key.clone(),
-                    master_node_id.clone(),
-                    self.view.clone(),
-                )
-                .await,
-            );
+                    pending.start_item.put_id,
+                    memory_info.clone(),
+                    pending.start_item.atomic_group.clone(),
+                ));
+                memory_info
+            } else {
+                if done_item.allocation_mode == GetAllocationMode::LocalCommittedSlot {
+                    results[pending.idx] = Some(Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "master returned local committed-slot mode without a prepared target: key={}",
+                            pending.key
+                        ),
+                    })));
+                    continue;
+                }
+                let offset = pending.start_item.target_addr - pending.start_item.target_base_addr;
+                let memory_info = Arc::new(
+                    MemoryInfo::new(
+                        offset,
+                        pending.start_item.len as u32,
+                        done_item.holder_id,
+                        pending.key.clone(),
+                        master_node_id.clone(),
+                        self.view.clone(),
+                    )
+                    .await,
+                );
+                if done_item.allocation_mode != GetAllocationMode::Temporary
+                    && self.install_get_cached_info_if_unfenced(
+                        &pending.key,
+                        pending.start_item.put_id,
+                        memory_info.clone(),
+                    )
+                {
+                    metrics.observe_cache_value_size(
+                        &client_id,
+                        node_role.as_str(),
+                        data_len as u64,
+                    );
+                }
+                memory_info
+            };
             let get_info = RemoteGetInfo {
                 get_id: pending.start_item.get_id,
                 data_len,
@@ -265,18 +609,8 @@ impl ClientKvApiInner {
                 node_id: pending.start_item.node_id.clone().into(),
                 peer_is_src_or_target: pending.peer_is_remote,
             };
-            if done_item.allocation_mode != GetAllocationMode::Temporary {
-                if self.install_get_cached_info_if_unfenced(
-                    &pending.key,
-                    pending.start_item.put_id,
-                    memory_info.clone(),
-                ) {
-                    metrics.observe_cache_value_size(
-                        &client_id,
-                        node_role.as_str(),
-                        data_len as u64,
-                    );
-                }
+            if done_item.allocation_mode == GetAllocationMode::LocalCommittedSlot {
+                metrics.observe_cache_value_size(&client_id, node_role.as_str(), data_len as u64);
             }
             let user_mem_holder = Arc::new(UserMemHolder::new(
                 memory_info,
@@ -284,6 +618,12 @@ impl ClientKvApiInner {
                 expose_kind,
             ));
             results[pending.idx] = Some(Ok(Some((user_mem_holder, Some(get_info)))));
+        }
+
+        // All members are in get_cached_info before any hot admission can evict one of them.
+        // This keeps atomic/TP cohort write-back decisions complete.
+        for (key, put_id, memory_info, atomic_group) in local_hot_admissions {
+            self.owner_hot_track_committed(&key, put_id, &memory_info, atomic_group.as_ref());
         }
 
         Ok(results
@@ -994,6 +1334,7 @@ impl ClientKvApiInner {
         let req = MsgPack {
             serialize_part: GetStartReq {
                 key: key.to_string(),
+                prepared_target: None,
             },
             raw_bytes: Vec::new(),
         };
@@ -1016,13 +1357,25 @@ impl ClientKvApiInner {
     }
 
     pub async fn batch_get_start(&self, keys: Vec<String>) -> KvResult<BatchGetStartResp> {
+        self.batch_get_start_with_prepared_targets(keys, Vec::new())
+            .await
+    }
+
+    pub(crate) async fn batch_get_start_with_prepared_targets(
+        &self,
+        keys: Vec<String>,
+        prepared_targets: Vec<Option<GetPreparedLocalReserveTarget>>,
+    ) -> KvResult<BatchGetStartResp> {
         if !self.view.register_shutdown_poller().is_running() {
             return Err(KvError::Api(ApiError::SystemShutdown {
                 detail: "ClientKvApi is shutting down; rejecting batch_get_start".to_string(),
             }));
         }
         let req = MsgPack {
-            serialize_part: BatchGetStartReq { keys },
+            serialize_part: BatchGetStartReq {
+                keys,
+                prepared_targets,
+            },
             raw_bytes: Vec::new(),
         };
         let master_node_id = self
@@ -1073,6 +1426,11 @@ impl ClientKvApiInner {
                 error_code: OK,
                 error_json: String::new(),
             });
+        }
+        if !self.view.register_shutdown_poller().is_running() {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: "ClientKvApi is shutting down; rejecting batch_get_revoke".to_string(),
+            }));
         }
         let req = MsgPack {
             serialize_part: BatchGetRevokeReq { get_ids },
@@ -1128,6 +1486,20 @@ impl ClientKvApiInner {
                 server_process_us: 0,
             });
         }
+        if !self.view.register_shutdown_poller().is_running() {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: "ClientKvApi is shutting down; rejecting batch_get_done".to_string(),
+            }));
+        }
+        // The master performs synchronous Moka policy work before acknowledging
+        // committed-slot Done.  Bound the number of callers entering that path
+        // so a capacity scan cannot park every master Tokio worker on Moka's
+        // blocking housekeeper lock.  The permit covers one RPC attempt only;
+        // idempotent retry backoff releases it and lets other cohorts converge.
+        let _done_rpc_permit = batch_get_done_rpc_limiter()
+            .acquire()
+            .await
+            .expect("the process-wide BatchGetDone limiter is never closed");
         let req = MsgPack {
             serialize_part: BatchGetDoneReq { get_ids },
             raw_bytes: Vec::new(),
@@ -1139,7 +1511,7 @@ impl ClientKvApiInner {
             .await?;
         let resp = self
             .rpc_caller_batch_get_done
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
+            .call(self.view.p2p_module(), master_node_id.into(), req, None, 2)
             .await
             .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
@@ -1147,5 +1519,40 @@ impl ClientKvApiInner {
             resp.serialize_part.error_json.clone(),
         )?;
         Ok(resp.serialize_part)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::batch_get_done_response_matches;
+    use crate::master_kv_router::msg_pack::{BatchGetDoneItemResp, BatchGetDoneResp};
+
+    fn response(get_ids: &[u64]) -> BatchGetDoneResp {
+        BatchGetDoneResp {
+            items: get_ids
+                .iter()
+                .map(|get_id| BatchGetDoneItemResp {
+                    get_id: *get_id,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn batch_get_done_requires_exact_response_identity() {
+        assert!(batch_get_done_response_matches(
+            &[11, 22],
+            &response(&[11, 22])
+        ));
+        assert!(!batch_get_done_response_matches(
+            &[11, 22],
+            &response(&[22, 11])
+        ));
+        assert!(!batch_get_done_response_matches(
+            &[11, 22],
+            &response(&[11])
+        ));
     }
 }

@@ -24,6 +24,7 @@ fn item_resp(
 fn record_item(record: &OwnerReclaimRecord) -> &OwnerReclaimItem {
     match record {
         OwnerReclaimRecord::Prepared(prepared) => &prepared.item,
+        OwnerReclaimRecord::Releasing(item) => item,
         OwnerReclaimRecord::Committed(item) => item,
     }
 }
@@ -49,15 +50,23 @@ fn memory_matches_reclaim_backing(
     }
 }
 
+fn reclaim_key_control_busy_detail(state: &super::OwnerKeyControlState) -> Option<&'static str> {
+    if state.local_puts != 0 {
+        Some("owner local put is inflight")
+    } else if state.external_pending_puts != 0 {
+        Some("owner external put context is still pending")
+    } else if state.external_get.is_some() {
+        Some("owner external Get is inflight")
+    } else {
+        None
+    }
+}
+
 fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
-    let mut controls = inner.owner_key_control.lock();
+    let mut controls = inner.owner_key_control.lock_key(&item.key);
     if let Some(state) = controls.get(&item.key) {
-        if state.local_puts != 0 {
-            return item_resp(
-                item,
-                OwnerReclaimItemState::Busy,
-                "owner local put is inflight",
-            );
+        if let Some(detail) = reclaim_key_control_busy_detail(state) {
+            return item_resp(item, OwnerReclaimItemState::Busy, detail);
         }
         if let Some(record) = state.reclaim.as_ref() {
             if record_item(record) == item {
@@ -65,6 +74,7 @@ fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclai
                     item,
                     match record {
                         OwnerReclaimRecord::Prepared(_) => OwnerReclaimItemState::Prepared,
+                        OwnerReclaimRecord::Releasing(_) => OwnerReclaimItemState::Busy,
                         OwnerReclaimRecord::Committed(_) => OwnerReclaimItemState::Committed,
                     },
                     "reclaim phase already applied",
@@ -84,18 +94,13 @@ fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclai
             "owner precommit local index is still visible",
         );
     }
-    if inner
-        .external_pending_puts
-        .iter()
-        .any(|(pending_key, _)| pending_key.0 == item.key)
-    {
+    if inner.pending_local_get_info.contains_key(&item.key) {
         return item_resp(
             item,
             OwnerReclaimItemState::Busy,
-            "owner external put context is still pending",
+            "owner local Get commit is pending",
         );
     }
-
     let Some((_key, cached_info)) = inner.get_cached_info.remove_if(&item.key, |_, cached| {
         cached.put_time_ms == item.put_id.0
             && cached.put_version == item.put_id.1
@@ -130,7 +135,12 @@ fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclai
         })
         .map(|(_, snapshot)| snapshot);
     let state = controls.entry(item.key.clone()).or_default();
-    assert!(state.reclaim.is_none() && state.local_puts == 0);
+    assert!(
+        state.reclaim.is_none()
+            && state.local_puts == 0
+            && state.external_pending_puts == 0
+            && state.external_get.is_none()
+    );
     state.reclaim = Some(OwnerReclaimRecord::Prepared(OwnerPreparedReclaim {
         item: item.clone(),
         cached_info,
@@ -173,26 +183,33 @@ fn release_prepared_backing_now(inner: &ClientKvApiInner, prepared: OwnerPrepare
             assert_eq!(actual_slot_index, *slot_index);
 
             inner
-                .owner_release_local_reserve_committed_slot_route(
+                .owner_release_local_reserve_committed_resident_slot(
                     actual_slot_size,
                     actual_grant_id,
                     actual_slot_index,
                 )
-                .expect("owner reclaim committed route release must succeed");
-            inner
-                .owner_release_local_reserve_resident_slot_holder(
-                    actual_slot_size,
-                    actual_grant_id,
-                    actual_slot_index,
-                )
-                .expect("owner reclaim resident holder release must succeed");
+                .expect("owner reclaim committed resident slot release must succeed");
         }
     }
     drop(memory_info);
 }
 
+fn reclaim_release_fence_is_intact(
+    state: &super::OwnerKeyControlState,
+    item: &OwnerReclaimItem,
+) -> bool {
+    // Prepare hides the local index before installing the reclaim fence. A
+    // later external Get may share this key state, but it can only take the
+    // remote path and therefore does not hold the detached local backing.
+    matches!(
+        state.reclaim.as_ref(),
+        Some(OwnerReclaimRecord::Releasing(releasing)) if releasing == item
+    ) && state.local_puts == 0
+        && state.external_pending_puts == 0
+}
+
 fn commit_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
-    let mut controls = inner.owner_key_control.lock();
+    let mut controls = inner.owner_key_control.lock_key(&item.key);
     let Some(state) = controls.get_mut(&item.key) else {
         return item_resp(
             item,
@@ -208,7 +225,18 @@ fn commit_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaim
         );
     };
     let prepared = match record {
-        OwnerReclaimRecord::Prepared(prepared) if prepared.item == *item => prepared,
+        OwnerReclaimRecord::Prepared(prepared) if prepared.item == *item => {
+            state.reclaim = Some(OwnerReclaimRecord::Releasing(item.clone()));
+            prepared
+        }
+        OwnerReclaimRecord::Releasing(releasing) if releasing == *item => {
+            state.reclaim = Some(OwnerReclaimRecord::Releasing(releasing));
+            return item_resp(
+                item,
+                OwnerReclaimItemState::Busy,
+                "owner reclaim slot release is already in progress",
+            );
+        }
         OwnerReclaimRecord::Committed(committed) if committed == *item => {
             state.reclaim = Some(OwnerReclaimRecord::Committed(committed));
             return item_resp(
@@ -227,9 +255,19 @@ fn commit_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaim
         }
     };
 
-    // Keep the owner fence installed by holding the control lock until the slot is fully free.
+    // The Releasing marker keeps local Put/Get out. Drop the key-shard lock
+    // before touching the slot pool so no synchronous locks are nested.
+    drop(controls);
     release_prepared_backing_now(inner, prepared);
-    assert!(state.reclaim.is_none() && state.local_puts == 0);
+
+    let mut controls = inner.owner_key_control.lock_key(&item.key);
+    let state = controls
+        .get_mut(&item.key)
+        .expect("owner reclaim releasing fence disappeared");
+    assert!(
+        reclaim_release_fence_is_intact(state, item),
+        "a local put crossed an owner reclaim fence"
+    );
     state.reclaim = Some(OwnerReclaimRecord::Committed(item.clone()));
     drop(controls);
     inner.owner_hot_invalidate_version(&item.key, item.put_id);
@@ -240,8 +278,65 @@ fn commit_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaim
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{reclaim_key_control_busy_detail, reclaim_release_fence_is_intact};
+    use crate::client_kv_api::{
+        ExternalGetKeySharedOp, OwnerKeyControlState, OwnerKeyControlTable, OwnerReclaimRecord,
+        acquire_external_pending_put_fence_for_key,
+    };
+    use crate::master_kv_router::msg_pack::{
+        OwnerReclaimBacking, OwnerReclaimItem, OwnerReclaimReason,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn pending_external_put_rejects_reclaim_prepare_precheck() {
+        let controls = Arc::new(OwnerKeyControlTable::default());
+        let _guard = acquire_external_pending_put_fence_for_key(&controls, "pending-key")
+            .expect("pending fence acquisition must succeed");
+        let controls = controls.lock_key("pending-key");
+        assert_eq!(
+            reclaim_key_control_busy_detail(&controls["pending-key"]),
+            Some("owner external put context is still pending")
+        );
+    }
+
+    #[test]
+    fn remote_get_marker_can_overlap_reclaim_commit() {
+        let item = OwnerReclaimItem {
+            key: "remote-during-reclaim".to_string(),
+            put_id: (7, 1),
+            epoch: 9,
+            backing: OwnerReclaimBacking::CommittedSlot {
+                grant_id: 3,
+                slot_index: 4,
+                slot_size: 4096,
+            },
+            reason: OwnerReclaimReason::OwnerCapacityEviction,
+        };
+        let state = OwnerKeyControlState {
+            local_puts: 0,
+            external_pending_puts: 0,
+            reclaim: Some(OwnerReclaimRecord::Releasing(item.clone())),
+            external_get: Some(Arc::new(ExternalGetKeySharedOp::new(
+                "remote-during-reclaim".to_string(),
+            ))),
+        };
+        assert!(reclaim_release_fence_is_intact(&state, &item));
+
+        let local_put_state = OwnerKeyControlState {
+            local_puts: 1,
+            external_pending_puts: 0,
+            reclaim: Some(OwnerReclaimRecord::Releasing(item.clone())),
+            external_get: state.external_get,
+        };
+        assert!(!reclaim_release_fence_is_intact(&local_put_state, &item));
+    }
+}
+
 fn abort_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
-    let mut controls = inner.owner_key_control.lock();
+    let mut controls = inner.owner_key_control.lock_key(&item.key);
     let Some(state) = controls.get_mut(&item.key) else {
         return item_resp(
             item,
@@ -272,13 +367,21 @@ fn abort_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimI
                     "owner reclaim abort must restore an empty local snapshot slot"
                 );
             }
-            if state.local_puts == 0 {
+            if state.is_idle() {
                 controls.remove(&item.key);
             }
             item_resp(
                 item,
                 OwnerReclaimItemState::Aborted,
                 "owner local index fence rolled back",
+            )
+        }
+        OwnerReclaimRecord::Releasing(releasing) if releasing == *item => {
+            state.reclaim = Some(OwnerReclaimRecord::Releasing(releasing));
+            item_resp(
+                item,
+                OwnerReclaimItemState::Busy,
+                "owner slot release is already in progress and cannot be aborted",
             )
         }
         OwnerReclaimRecord::Committed(committed) if committed == *item => {
@@ -301,7 +404,7 @@ fn abort_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimI
 }
 
 fn finalize_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
-    let mut controls = inner.owner_key_control.lock();
+    let mut controls = inner.owner_key_control.lock_key(&item.key);
     let Some(state) = controls.get_mut(&item.key) else {
         return item_resp(
             item,
@@ -311,13 +414,21 @@ fn finalize_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerRecla
     };
     match state.reclaim.take() {
         Some(OwnerReclaimRecord::Committed(committed)) if committed == *item => {
-            if state.local_puts == 0 {
+            if state.is_idle() {
                 controls.remove(&item.key);
             }
             item_resp(
                 item,
                 OwnerReclaimItemState::Finalized,
                 "owner reclaim fence cleared",
+            )
+        }
+        Some(OwnerReclaimRecord::Releasing(releasing)) if releasing == *item => {
+            state.reclaim = Some(OwnerReclaimRecord::Releasing(releasing));
+            item_resp(
+                item,
+                OwnerReclaimItemState::Busy,
+                "owner slot release is still in progress",
             )
         }
         Some(other) => {

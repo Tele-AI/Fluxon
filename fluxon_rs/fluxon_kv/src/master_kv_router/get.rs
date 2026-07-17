@@ -1,22 +1,24 @@
 use super::{
-    InflightGetInfo, KvRouteInfo, MasterKeyActivityCompletionGuard, MasterKvRouterView,
-    OwnerHoldingGetInfo,
+    CommittedSlotReplica, CompletedGetInfo, InflightGetInfo, InflightGetTarget, KvRouteInfo,
+    MasterKeyActivityCompletionGuard, MasterKvRouterView, OwnerHoldingGetInfo,
+    ReservedCapacityReason,
     msg_pack::{
         BatchGetDoneItemResp, BatchGetDoneReq, BatchGetDoneResp, BatchGetRevokeItemResp,
         BatchGetRevokeReq, BatchGetRevokeResp, BatchGetStartItemResp, BatchGetStartReq,
         BatchGetStartResp, BatchIsExistReq, BatchIsExistResp, GetAllocationMode, GetDoneReq,
-        GetDoneResp, GetMetaReq, GetMetaResp, GetRevokeReq, GetRevokeResp, GetStartReq,
-        GetStartResp, MemHolderKeepAliveReq, MemHolderKeepAliveResp, MemHolderReleaseReq,
-        MemHolderReleaseResp,
+        GetDoneResp, GetMetaReq, GetMetaResp, GetPreparedLocalReserveTarget, GetRevokeReq,
+        GetRevokeResp, GetStartReq, GetStartResp, MemHolderKeepAliveReq, MemHolderKeepAliveResp,
+        MemHolderReleaseReq, MemHolderReleaseResp,
     },
-    route_maintenance::{RoutePublishEvent, enqueue_post_route_maintenance},
+    node_generation_is_current_live, publish_route_replica_tomb_fenced,
+    route_maintenance::{RoutePublishEvent, apply_post_route_maintenance_batch},
 };
 use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::memholder::MemholderManagerTrait;
 use crate::{
     cluster_manager::NodeID,
-    master_seg_manager::{MasterSegManagerAccessTrait, one_seg_allocator::Allocation},
+    master_seg_manager::{MasterSegManagerAccessTrait, NodeTombTag, one_seg_allocator::Allocation},
     p2p::msg_pack::MsgPack,
     rpcresp_kvresult_convert::msg_and_error::{self, kv},
 };
@@ -28,6 +30,7 @@ use std::collections::HashSet;
 use std::{
     collections::HashMap,
     sync::{Arc, atomic::Ordering},
+    time::Instant,
 };
 
 fn touch_moka_for_node(view: MasterKvRouterView, node_id: String, key: String) {
@@ -36,16 +39,27 @@ fn touch_moka_for_node(view: MasterKvRouterView, node_id: String, key: String) {
     }
     let view_task = view.clone();
     view.spawn("touch_moka_for_node", async move {
+        let owner_cache_lock = view_task
+            .master_kv_router()
+            .inner()
+            .owner_cache_operation_locks
+            .get_lock(node_id.clone());
+        let _owner_cache_guard = owner_cache_lock.lock().await;
         if let Some(cache) = view_task
             .master_kv_router()
             .get_node_cache_controller(&node_id)
         {
-            if let Some(desc) = cache.get(&key)
-                && let Some(tier1_cache) = view_task
-                    .master_kv_router()
-                    .get_node_writeback_tier1_controller(&node_id)
+            // A get is a hit signal for ring B when the source is an
+            // unindexed Allocation. Owner-indexed routes are intentionally
+            // absent from this cache.
+            let _ = cache.get(&key);
+            if let Some(tier1_cache) = view_task
+                .master_kv_router()
+                .get_node_writeback_tier1_controller(&node_id)
             {
-                tier1_cache.insert(key.clone(), desc);
+                // Tier1 has independent admission and replacement state; a
+                // hit only touches an already-admitted entry.
+                let _ = tier1_cache.get(&key);
             }
             tracing::debug!(
                 "Touched key: {:?} on node cache: {} (TTL refresh)",
@@ -67,6 +81,93 @@ fn one_kv_routes_has_live_replica(one_kv_nodes_routes: &OneKvNodesRoutes) -> boo
         .read()
         .values()
         .any(|kv_info| !kv_info.tomb_tag.is_tomb())
+}
+
+fn validate_prepared_local_reserve_target(
+    view: &MasterKvRouterView,
+    req_node_id: &NodeID,
+    target: &GetPreparedLocalReserveTarget,
+    value_len: u64,
+) -> Result<(CommittedSlotReplica, NodeTombTag), msg_and_error::KvError> {
+    let invalid = |detail: String| {
+        msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument { detail })
+    };
+    if target.slot_size == 0 {
+        return Err(invalid(
+            "prepared local-reserve Get target has zero slot_size".to_string(),
+        ));
+    }
+    if value_len > target.slot_size {
+        return Err(invalid(format!(
+            "prepared local-reserve Get target is too small: value_len={} slot_size={}",
+            value_len, target.slot_size
+        )));
+    }
+    let Some(grant) = view
+        .master_kv_router()
+        .inner()
+        .local_reserve_grants
+        .get(&target.grant_id)
+    else {
+        return Err(invalid(format!(
+            "prepared local-reserve Get target references unknown grant_id={}",
+            target.grant_id
+        )));
+    };
+    if grant.owner_node_id != *req_node_id {
+        return Err(invalid(format!(
+            "prepared local-reserve Get target owner mismatch: grant_id={} owner={} requester={}",
+            target.grant_id, grant.owner_node_id, req_node_id
+        )));
+    }
+    let tomb_tag = grant.tomb_tag.clone();
+    if !node_generation_is_current_live(view, req_node_id, &tomb_tag) {
+        return Err(invalid(format!(
+            "prepared local-reserve Get target belongs to a departed owner generation: grant_id={} requester={}",
+            target.grant_id, req_node_id
+        )));
+    }
+    let grant_base_addr = grant.allocation.base_addr();
+    let grant_addr = grant_base_addr
+        .checked_add(grant.allocation.addr())
+        .ok_or_else(|| invalid("local-reserve grant address overflow".to_string()))?;
+    let slot_offset = target
+        .slot_size
+        .checked_mul(u64::from(target.slot_index))
+        .ok_or_else(|| invalid("prepared local-reserve Get slot offset overflow".to_string()))?;
+    let slot_end = slot_offset
+        .checked_add(target.slot_size)
+        .ok_or_else(|| invalid("prepared local-reserve Get slot end overflow".to_string()))?;
+    if slot_end > grant.allocation.capcity() {
+        return Err(invalid(format!(
+            "prepared local-reserve Get target is outside grant: grant_id={} slot_index={} slot_size={} grant_len={}",
+            target.grant_id,
+            target.slot_index,
+            target.slot_size,
+            grant.allocation.capcity()
+        )));
+    }
+    let expected_addr = grant_addr
+        .checked_add(slot_offset)
+        .ok_or_else(|| invalid("prepared local-reserve Get target address overflow".to_string()))?;
+    if target.base_addr != grant_base_addr || target.addr != expected_addr {
+        return Err(invalid(format!(
+            "prepared local-reserve Get target geometry mismatch: grant_id={} expected_base={:#x} got_base={:#x} expected_addr={:#x} got_addr={:#x}",
+            target.grant_id, grant_base_addr, target.base_addr, expected_addr, target.addr
+        )));
+    }
+    Ok((
+        CommittedSlotReplica {
+            owner_node_id: req_node_id.clone(),
+            grant_id: target.grant_id,
+            slot_index: target.slot_index,
+            slot_size: target.slot_size,
+            addr: target.addr,
+            len: value_len,
+            base_addr: target.base_addr,
+        },
+        tomb_tag,
+    ))
 }
 
 pub async fn handle_get_start(
@@ -130,6 +231,18 @@ pub async fn handle_get_start(
         .inner()
         .next_get_id
         .fetch_add(1, Ordering::Relaxed);
+    let prepared_requester_lease = if req.serialize_part.prepared_target.is_some() {
+        match view.master_kv_router().reserve_prepared_get_requester(
+            &req.serialize_part.key,
+            &req_node_id,
+            get_id,
+        ) {
+            Ok(lease) => Some(lease),
+            Err(err) => return failed_resp_err(err, None, &view, &req.serialize_part.key),
+        }
+    } else {
+        None
+    };
 
     let one_kv_nodes_routes: Arc<OneKvNodesRoutes> = if let Some(one_kv_nodes_routes) = view
         .master_kv_router()
@@ -140,7 +253,7 @@ pub async fn handle_get_start(
         one_kv_nodes_routes.clone()
     } else {
         // Key not found
-        tracing::info!("Key not found: {}", req.serialize_part.key);
+        tracing::debug!("Key not found: {}", req.serialize_part.key);
         let err = msg_and_error::KvError::Api(msg_and_error::ApiError::KeyNotFound {
             key: req.serialize_part.key.clone(),
         });
@@ -148,12 +261,14 @@ pub async fn handle_get_start(
     };
 
     let replicas: HashMap<NodeID, KvRouteInfo> = one_kv_nodes_routes.nodes_replicas.read().clone();
+    let prepared_target = req.serialize_part.prepared_target.clone();
     // Currently we are holding the lock with `replicas`
     // 选择一个replica (这里可以实现更复杂的选择逻辑)
     let mut replica_keys = replicas.keys().collect::<Vec<_>>();
     let mut tombs = HashSet::new();
-    let mut target_allocations = None;
+    let mut target = None;
     let mut allocation_mode = GetAllocationMode::Temporary;
+    let mut durable_reservation = None;
     for _ in 0..replicas.len() {
         let to_remove_idx = rand::thread_rng().gen_range(0..replica_keys.len());
         let selected_replica_key = replica_keys.remove(to_remove_idx);
@@ -172,7 +287,7 @@ pub async fn handle_get_start(
         // MemHolder backing. That keeps the existing get-path carrier stable
         // and avoids the old None->unwrap panic.
         let mut allocate_request_target =
-            || -> Result<Arc<Allocation>, (u64, MsgPack<GetStartResp>)> {
+            || -> Result<InflightGetTarget, (u64, MsgPack<GetStartResp>)> {
                 let target_allocation = {
                     let req_node_allocators =
                         view.master_seg_manager().get_node_allocators(&req_node_id);
@@ -228,56 +343,127 @@ pub async fn handle_get_start(
                     }
                     allocated_addr.unwrap()
                 };
-                if one_kv_nodes_routes.try_reserve_get_durable_slot() {
+                if let Some(reservation) = one_kv_nodes_routes.try_reserve_get_durable_slot() {
                     allocation_mode = GetAllocationMode::DurableReplica;
+                    durable_reservation = Some(reservation);
                 } else {
                     allocation_mode = GetAllocationMode::Temporary;
                 }
-                Ok(Arc::new(target_allocation))
+                Ok(InflightGetTarget::Allocation(Arc::new(target_allocation)))
             };
 
         // 为get调用方分配接收内存作为传输target
-        if target_allocations.is_none() {
-            target_allocations = Some(
-                if let Some(replica_on_recv_node) = replicas.get(&req_node_id) {
-                    match &replica_on_recv_node.backing {
-                        super::KvReplicaBacking::Allocation(allocation) => {
-                            allocation_mode = GetAllocationMode::ReuseReplica;
-                            allocation.clone()
-                        }
-                        super::KvReplicaBacking::CommittedSlot(_) => {
-                            match allocate_request_target() {
-                                Ok(allocation) => allocation,
-                                Err(resp) => return resp,
-                            }
-                        }
+        if target.is_none() {
+            target = Some(if let Some(prepared_target) = prepared_target.as_ref() {
+                if replicas
+                    .get(&req_node_id)
+                    .is_some_and(|replica| !replica.tomb_tag.is_tomb())
+                {
+                    let err = msg_and_error::KvError::Api(
+                        msg_and_error::ApiError::InvalidArgument {
+                            detail: format!(
+                                "prepared local-reserve Get target cannot replace a live replica: key={} requester={}",
+                                req.serialize_part.key, req_node_id
+                            ),
+                        },
+                    );
+                    return failed_resp_err(
+                        err,
+                        Some((tombs.clone(), one_kv_nodes_routes.put_id)),
+                        &view,
+                        &req.serialize_part.key,
+                    );
+                }
+                let (slot, _prepared_tomb_tag) = match validate_prepared_local_reserve_target(
+                    &view,
+                    &req_node_id,
+                    prepared_target,
+                    src_len,
+                ) {
+                    Ok(slot) => slot,
+                    Err(err) => {
+                        return failed_resp_err(
+                            err,
+                            Some((tombs.clone(), one_kv_nodes_routes.put_id)),
+                            &view,
+                            &req.serialize_part.key,
+                        );
                     }
-                } else {
-                    match allocate_request_target() {
+                };
+                allocation_mode = GetAllocationMode::LocalCommittedSlot;
+                InflightGetTarget::PreparedLocalReserveSlot(slot)
+            } else if let Some(replica_on_recv_node) = replicas.get(&req_node_id) {
+                match &replica_on_recv_node.backing {
+                    super::KvReplicaBacking::Allocation(allocation) => {
+                        allocation_mode = GetAllocationMode::ReuseReplica;
+                        InflightGetTarget::Allocation(allocation.clone())
+                    }
+                    super::KvReplicaBacking::CommittedSlot(_) => match allocate_request_target() {
                         Ok(allocation) => allocation,
                         Err(resp) => return resp,
-                    }
-                },
-            );
+                    },
+                }
+            } else {
+                match allocate_request_target() {
+                    Ok(allocation) => allocation,
+                    Err(resp) => return resp,
+                }
+            });
         }
 
-        let target_allocation = target_allocations.unwrap();
+        let target = target
+            .as_ref()
+            .expect("Get target must be selected before building response")
+            .clone();
+
+        // Bind the target to the exact registration generation that owns its
+        // allocator/grant.  Looking up only by node id at GetDone would allow
+        // an old completion to publish addresses into a reconnected node.
+        let target_tomb_tag = match &target {
+            InflightGetTarget::Allocation(allocation) => view
+                .master_seg_manager()
+                .get_allocation_tomb_tag(&req_node_id, allocation),
+            InflightGetTarget::PreparedLocalReserveSlot(slot) => view
+                .master_kv_router()
+                .inner()
+                .local_reserve_grants
+                .get(&slot.grant_id)
+                .and_then(|grant| {
+                    (grant.owner_node_id == req_node_id
+                        && node_generation_is_current_live(&view, &req_node_id, &grant.tomb_tag))
+                    .then(|| grant.tomb_tag.clone())
+                }),
+        };
+        let Some(target_tomb_tag) = target_tomb_tag else {
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+                detail: format!(
+                    "Get target generation changed before start publication: get_id={} key={} requester={}",
+                    get_id, req.serialize_part.key, req_node_id
+                ),
+            });
+            return failed_resp_err(
+                err,
+                Some((tombs.clone(), one_kv_nodes_routes.put_id)),
+                &view,
+                &req.serialize_part.key,
+            );
+        };
 
         // Convert to absolute addresses for Mooncake (requires absolute)
         // Use allocation's allocator base directly
-        let target_base = target_allocation.base_addr();
+        let target_base = target.base_addr();
 
         // If we reuse existing target on requesting node, declare src=target on req node
         let (resp_node_id, resp_src_addr, resp_target_addr, resp_src_base, resp_target_base) =
             if allocation_mode == GetAllocationMode::ReuseReplica {
-                let addr = target_base + target_allocation.addr();
+                let addr = target.abs_addr();
                 // both src/target are on requesting node's allocation in this reuse case
                 (req_node_id.clone(), addr, addr, target_base, target_base)
             } else {
                 (
                     src_node_id.clone(),
                     src_abs_addr,
-                    target_base + target_allocation.addr(),
+                    target.abs_addr(),
                     src_base,
                     target_base,
                 )
@@ -292,6 +478,10 @@ pub async fn handle_get_start(
             src_base_addr: resp_src_base,
             target_base_addr: resp_target_base,
             len: src_len,
+            prepared_target: (allocation_mode == GetAllocationMode::LocalCommittedSlot)
+                .then(|| prepared_target.clone())
+                .flatten(),
+            atomic_group: one_kv_nodes_routes.atomic_group.as_deref().cloned(),
             error_code: msg_and_error::OK,
             error_json: String::new(),
             server_process_us: 0,
@@ -309,10 +499,13 @@ pub async fn handle_get_start(
             key: req.serialize_part.key.clone(),
             req_node_id,
             len: src_len,
-            allocation: target_allocation, // 存储target allocation
+            target,
+            target_tomb_tag,
             route: one_kv_nodes_routes.clone(),
             allocation_mode,
+            durable_reservation,
             _activity_lease: activity_lease,
+            _prepared_requester_lease: prepared_requester_lease,
         };
 
         view.master_kv_router()
@@ -346,7 +539,7 @@ pub async fn handle_get_start(
             },
         );
     }
-    tracing::info!("Key not found: {}", req.serialize_part.key);
+    tracing::debug!("Key not found: {}", req.serialize_part.key);
     {
         let err = msg_and_error::KvError::Api(msg_and_error::ApiError::KeyNotFound {
             key: req.serialize_part.key.clone(),
@@ -363,10 +556,61 @@ pub async fn handle_get_start(
 pub async fn handle_get_revoke(
     view: MasterKvRouterView,
     req: MsgPack<GetRevokeReq>,
+    req_node_id: NodeID,
 ) -> MsgPack<GetRevokeResp> {
     tracing::debug!("Handling GetRevokeReq: {:?}", req.serialize_part);
 
     let get_id = req.serialize_part.get_id;
+    let done_lock = view
+        .master_kv_router()
+        .inner()
+        .get_done_locks
+        .get_lock(get_id);
+    let _done_guard = done_lock.lock().await;
+
+    if let Some(inflight_info) = view
+        .master_kv_router()
+        .inner()
+        .inflight_gets
+        .get(&get_id)
+        .await
+    {
+        if inflight_info.req_node_id != req_node_id {
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                detail: format!(
+                    "GetRevoke requester mismatch: get_id={} expected={} got={}",
+                    get_id, inflight_info.req_node_id, req_node_id
+                ),
+            });
+            return MsgPack {
+                serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                raw_bytes: Vec::new(),
+            };
+        }
+    } else if let Some(completed) = view
+        .master_kv_router()
+        .inner()
+        .completed_gets
+        .get(&get_id)
+        .await
+    {
+        let detail = if completed.req_node_id != req_node_id {
+            format!(
+                "GetRevoke requester mismatch after completion: get_id={} expected={} got={}",
+                get_id, completed.req_node_id, req_node_id
+            )
+        } else {
+            format!(
+                "GetRevoke lost the Done race; committed target must not be released: get_id={}",
+                get_id
+            )
+        };
+        let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument { detail });
+        return MsgPack {
+            serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+            raw_bytes: Vec::new(),
+        };
+    }
 
     // Remove from inflight_gets
     if let Some(inflight_info) = view
@@ -378,8 +622,7 @@ pub async fn handle_get_revoke(
     {
         let _activity_completion =
             MasterKeyActivityCompletionGuard::new(inflight_info._activity_lease.clone());
-        inflight_info.release_durable_slot_if_needed();
-        tracing::info!("Revoked get operation with get_id: {}", get_id);
+        tracing::debug!("Revoked get operation with get_id: {}", get_id);
     } else {
         tracing::warn!("Get operation with get_id {} not found for revoke", get_id);
     }
@@ -393,13 +636,59 @@ pub async fn handle_get_revoke(
     }
 }
 
-pub async fn handle_get_done(
+async fn handle_get_done_locked(
     view: MasterKvRouterView,
     req: MsgPack<GetDoneReq>,
+    req_node_id: NodeID,
+    mut deferred_route_events: Option<&mut Vec<RoutePublishEvent>>,
+    mut deferred_terminals: Option<&mut Vec<(u64, CompletedGetInfo)>>,
 ) -> MsgPack<GetDoneResp> {
     tracing::debug!("Handling GetDoneReq: {:?}", req.serialize_part);
 
     let get_id = req.serialize_part.get_id;
+    if let Some(inflight_info) = view
+        .master_kv_router()
+        .inner()
+        .inflight_gets
+        .get(&get_id)
+        .await
+    {
+        if inflight_info.req_node_id != req_node_id {
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                detail: format!(
+                    "GetDone requester mismatch: get_id={} expected={} got={}",
+                    get_id, inflight_info.req_node_id, req_node_id
+                ),
+            });
+            return MsgPack {
+                serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                raw_bytes: Vec::new(),
+            };
+        }
+    } else if let Some(completed) = view
+        .master_kv_router()
+        .inner()
+        .completed_gets
+        .get(&get_id)
+        .await
+    {
+        if completed.req_node_id != req_node_id {
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                detail: format!(
+                    "GetDone requester mismatch after completion: get_id={} expected={} got={}",
+                    get_id, completed.req_node_id, req_node_id
+                ),
+            });
+            return MsgPack {
+                serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                raw_bytes: Vec::new(),
+            };
+        }
+        return MsgPack {
+            serialize_part: completed.response,
+            raw_bytes: Vec::new(),
+        };
+    }
     // Remove from inflight_gets and transfer to get_holding
     if let Some(inflight_info) = view
         .master_kv_router()
@@ -411,77 +700,163 @@ pub async fn handle_get_done(
         let _activity_completion =
             MasterKeyActivityCompletionGuard::new(inflight_info._activity_lease.clone());
         let mut allocation_mode = inflight_info.allocation_mode;
-        let route = inflight_info.route.clone();
         // clone req_node_id to avoid borrow/move conflict when inserting into kv_routes
         let req_node_id = inflight_info.req_node_id.clone();
-        // capture allocation capacity before moving it
-        let alloc_cap = inflight_info.allocation.capcity();
-        // Generate holder_id
-        let holder_id = view
-            .master_kv_router()
-            .inner()
-            .next_holder_id
-            .fetch_add(1, Ordering::Relaxed);
-
-        let src_node_id = inflight_info.src_node_id;
         let key = inflight_info.key;
-
-        // Create holding info
-        let holding_info = OwnerHoldingGetInfo {
-            key: key.clone(),
-            holding_node_id: inflight_info.req_node_id.clone(),
-            len: inflight_info.len,
-            allocation: inflight_info.allocation.clone(),
+        let target_cap = inflight_info.target.capacity();
+        if !node_generation_is_current_live(&view, &req_node_id, &inflight_info.target_tomb_tag) {
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+                detail: format!(
+                    "GetDone target generation departed: get_id={} key={} requester={}",
+                    get_id, key, req_node_id
+                ),
+            });
+            let terminal: GetDoneResp =
+                crate::rpcresp_kvresult_convert::FromError::from_error(&err);
+            let completed = CompletedGetInfo {
+                req_node_id: req_node_id.clone(),
+                response: terminal.clone(),
+            };
+            if let Some(terminals) = deferred_terminals.as_deref_mut() {
+                terminals.push((get_id, completed));
+            } else {
+                view.master_kv_router()
+                    .inner()
+                    .completed_gets
+                    .insert(get_id, completed)
+                    .await;
+            }
+            return MsgPack {
+                serialize_part: terminal,
+                raw_bytes: Vec::new(),
+            };
+        }
+        // Allocation-backed Gets need a master holder to keep their allocator guard alive.
+        // Local-reserve slots instead carry independent route and holder references in the
+        // owner's slot state, so they deliberately do not create a master Allocation holder.
+        let mut inserted_holder_key = None;
+        let holder_id = match &inflight_info.target {
+            InflightGetTarget::Allocation(allocation) => {
+                let holder_id = view
+                    .master_kv_router()
+                    .inner()
+                    .next_holder_id
+                    .fetch_add(1, Ordering::Relaxed);
+                let holder_key =
+                    crate::memholder::NodeHolderKey::new(req_node_id.to_string(), holder_id);
+                view.master_kv_router().inner().get_holding.insert(
+                    holder_key.clone(),
+                    OwnerHoldingGetInfo {
+                        key: key.clone(),
+                        holding_node_id: inflight_info.req_node_id.clone(),
+                        len: inflight_info.len,
+                        allocation: allocation.clone(),
+                    },
+                );
+                inserted_holder_key = Some(holder_key);
+                holder_id
+            }
+            InflightGetTarget::PreparedLocalReserveSlot(_) => 0,
         };
 
-        // Store in get_holding cache (owned manager, flattened key)
-        view.master_kv_router().inner().get_holding.insert(
-            crate::memholder::NodeHolderKey::new(req_node_id.to_string(), holder_id),
-            holding_info,
-        );
+        // Close the insertion-vs-MemberLeft cleanup race for the holder.  If
+        // MemberLeft marked the shared tag before this check, remove the exact
+        // holder we just inserted.  Otherwise its later cleanup must observe it.
+        if inflight_info.target_tomb_tag.is_tomb() {
+            if let Some(holder_key) = inserted_holder_key.as_ref() {
+                view.master_kv_router()
+                    .inner()
+                    .get_holding
+                    .remove(holder_key);
+            }
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+                detail: format!(
+                    "GetDone target generation departed during holder publication: get_id={} key={} requester={}",
+                    get_id, key, req_node_id
+                ),
+            });
+            let terminal: GetDoneResp =
+                crate::rpcresp_kvresult_convert::FromError::from_error(&err);
+            let completed = CompletedGetInfo {
+                req_node_id: req_node_id.clone(),
+                response: terminal.clone(),
+            };
+            if let Some(terminals) = deferred_terminals.as_deref_mut() {
+                terminals.push((get_id, completed));
+            } else {
+                view.master_kv_router()
+                    .inner()
+                    .completed_gets
+                    .insert(get_id, completed)
+                    .await;
+            }
+            return MsgPack {
+                serialize_part: terminal,
+                raw_bytes: Vec::new(),
+            };
+        }
 
         if allocation_mode == GetAllocationMode::DurableReplica {
             let mut promote_committed = false;
             let mut route_publish_event = None;
-            if let Some(one_kv_nodes_routes) = view.master_kv_router().inner().kv_routes.get(&key) {
+            if let Some(one_kv_nodes_routes) = view
+                .master_kv_router()
+                .inner()
+                .kv_routes
+                .get(&key)
+                .map(|route| route.clone())
+            {
                 if one_kv_nodes_routes.put_id == inflight_info.put_id {
-                    let mut nodes_replicas = one_kv_nodes_routes.nodes_replicas.write();
-                    if let Some(tomb_tag) =
-                        view.master_seg_manager().get_node_tomb_tag(&src_node_id)
-                    {
-                        if !tomb_tag.is_tomb() {
-                            nodes_replicas.insert(
-                                inflight_info.req_node_id.clone(),
-                                KvRouteInfo {
-                                    node_id: inflight_info.req_node_id,
-                                    backing: super::KvReplicaBacking::Allocation(
-                                        inflight_info.allocation,
-                                    ),
-                                    owner_local_indexed: true,
-                                    tomb_tag,
-                                },
-                            );
-                            promote_committed = true;
-                            route_publish_event = Some(RoutePublishEvent::replica_append(
-                                key.clone(),
-                                inflight_info.put_id,
-                                one_kv_nodes_routes.lease_id,
+                    match view.master_kv_router().reserve_node_cache_capacity(
+                        &req_node_id,
+                        &inflight_info.target_tomb_tag,
+                        ReservedCapacityReason::OwnerIndexedAllocation,
+                        target_cap,
+                    ) {
+                        Ok(capacity_reservation) => {
+                            let replica = KvRouteInfo {
+                                node_id: req_node_id.clone(),
+                                backing: super::KvReplicaBacking::Allocation(match &inflight_info
+                                    .target
+                                {
+                                    InflightGetTarget::Allocation(allocation) => allocation.clone(),
+                                    InflightGetTarget::PreparedLocalReserveSlot(_) => {
+                                        unreachable!("durable Get mode must use Allocation target")
+                                    }
+                                }),
+                                owner_local_indexed: true,
+                                get_durable_reservation: inflight_info.durable_reservation.clone(),
+                                capacity_reservation,
+                                tomb_tag: inflight_info.target_tomb_tag.clone(),
+                            };
+                            if publish_route_replica_tomb_fenced(
+                                &one_kv_nodes_routes,
                                 req_node_id.clone(),
-                                alloc_cap,
-                            ));
-                        } else {
-                            tracing::warn!(
-                                "get node is tomb, get_id: {}, put_id: {:?}",
-                                get_id,
-                                one_kv_nodes_routes.put_id
-                            );
+                                replica,
+                            ) {
+                                promote_committed = true;
+                                route_publish_event = Some(RoutePublishEvent::replica_append(
+                                    key.clone(),
+                                    inflight_info.put_id,
+                                    one_kv_nodes_routes.lease_id,
+                                    req_node_id.clone(),
+                                    target_cap,
+                                ));
+                            } else {
+                                tracing::warn!(
+                                    "durable Get replica publication rejected by generation/live-replica fence: get_id={} put_id={:?}",
+                                    get_id,
+                                    one_kv_nodes_routes.put_id
+                                );
+                            }
                         }
-                    } else {
-                        tracing::warn!(
-                            "get node is tomb, get_id: {}, put_id: {:?}",
+                        Err(err) => tracing::warn!(
+                            "durable Get could not reserve owner-indexed Allocation capacity; keeping temporary: get_id={} key={} owner={} err={}",
                             get_id,
-                            one_kv_nodes_routes.put_id
-                        );
+                            key,
+                            req_node_id,
+                            err,
+                        ),
                     }
                 } else {
                     tracing::warn!(
@@ -499,29 +874,91 @@ pub async fn handle_get_done(
                 );
             }
             if let Some(event) = route_publish_event {
-                enqueue_post_route_maintenance(&view, event).await;
+                if let Some(events) = deferred_route_events.as_deref_mut() {
+                    events.push(event);
+                } else {
+                    apply_post_route_maintenance_batch(&view, vec![event]).await;
+                }
             }
             if !promote_committed {
                 allocation_mode = GetAllocationMode::Temporary;
-                route.release_get_durable_slot();
             }
         } else if allocation_mode == GetAllocationMode::ReuseReplica {
             let mut local_index_published = false;
-            if let Some(current_route) = view.master_kv_router().inner().kv_routes.get(&key) {
-                if current_route.put_id == inflight_info.put_id {
-                    let mut replicas = current_route.nodes_replicas.write();
-                    if let Some(replica) = replicas.get_mut(&req_node_id) {
-                        local_index_published = !replica.tomb_tag.is_tomb()
-                            && matches!(
-                                &replica.backing,
-                                super::KvReplicaBacking::Allocation(allocation)
-                                    if Arc::ptr_eq(allocation, &inflight_info.allocation)
-                            );
-                        if local_index_published {
-                            replica.owner_local_indexed = true;
+            let mut route_lease_id = None;
+            let capacity_reservation = view.master_kv_router().reserve_node_cache_capacity(
+                &req_node_id,
+                &inflight_info.target_tomb_tag,
+                ReservedCapacityReason::OwnerIndexedAllocation,
+                target_cap,
+            );
+            match capacity_reservation {
+                Ok(capacity_reservation) => {
+                    if let Some(current_route) = view
+                        .master_kv_router()
+                        .inner()
+                        .kv_routes
+                        .get(&key)
+                        .map(|route| route.clone())
+                    {
+                        if current_route.put_id == inflight_info.put_id {
+                            route_lease_id = current_route.lease_id;
+                            let mut replicas = current_route.nodes_replicas.write();
+                            if let Some(replica) = replicas.get_mut(&req_node_id) {
+                                local_index_published = !replica.tomb_tag.is_tomb()
+                                    && replica
+                                        .tomb_tag
+                                        .same_generation(&inflight_info.target_tomb_tag)
+                                    && matches!(
+                                        &replica.backing,
+                                        super::KvReplicaBacking::Allocation(allocation)
+                                            if matches!(
+                                                &inflight_info.target,
+                                                InflightGetTarget::Allocation(target)
+                                                    if Arc::ptr_eq(allocation, target)
+                                            )
+                                    );
+                                if local_index_published {
+                                    replica.owner_local_indexed = true;
+                                    replica.capacity_reservation = capacity_reservation;
+                                }
+                            }
+                        }
+                    }
+                    if local_index_published {
+                        let old_ring_b_desc = super::NodeValueReplicaDesc {
+                            weight_bytes: u32::try_from(target_cap).unwrap_or(u32::MAX),
+                            put_id: inflight_info.put_id,
+                        };
+                        let _ = view
+                            .master_kv_router()
+                            .remove_node_cache_entry_exact(
+                                req_node_id.as_ref(),
+                                &key,
+                                &old_ring_b_desc,
+                            )
+                            .await;
+                        let event = RoutePublishEvent::replica_append(
+                            key.clone(),
+                            inflight_info.put_id,
+                            route_lease_id,
+                            req_node_id.clone(),
+                            target_cap,
+                        );
+                        if let Some(events) = deferred_route_events.as_deref_mut() {
+                            events.push(event);
+                        } else {
+                            apply_post_route_maintenance_batch(&view, vec![event]).await;
                         }
                     }
                 }
+                Err(err) => tracing::warn!(
+                    "reused Get allocation could not reserve owner-indexed capacity; keeping temporary: get_id={} key={} owner={} err={}",
+                    get_id,
+                    key,
+                    req_node_id,
+                    err,
+                ),
             }
             if !local_index_published {
                 tracing::warn!(
@@ -534,9 +971,78 @@ pub async fn handle_get_done(
                 );
                 allocation_mode = GetAllocationMode::Temporary;
             }
+        } else if allocation_mode == GetAllocationMode::LocalCommittedSlot {
+            let slot = match &inflight_info.target {
+                InflightGetTarget::PreparedLocalReserveSlot(slot) => slot.clone(),
+                InflightGetTarget::Allocation(_) => {
+                    unreachable!("local committed-slot Get mode must use a prepared slot")
+                }
+            };
+            let mut published = false;
+            let mut route_publish_event = None;
+            if let Some(current_route) = view.master_kv_router().inner().kv_routes.get(&key) {
+                if current_route.put_id == inflight_info.put_id {
+                    let replica = KvRouteInfo {
+                        node_id: req_node_id.clone(),
+                        backing: super::KvReplicaBacking::CommittedSlot(slot),
+                        owner_local_indexed: true,
+                        get_durable_reservation: None,
+                        capacity_reservation: None,
+                        tomb_tag: inflight_info.target_tomb_tag.clone(),
+                    };
+                    if publish_route_replica_tomb_fenced(
+                        &current_route,
+                        req_node_id.clone(),
+                        replica,
+                    ) {
+                        published = true;
+                        route_publish_event = Some(RoutePublishEvent::replica_append(
+                            key.clone(),
+                            inflight_info.put_id,
+                            current_route.lease_id,
+                            req_node_id.clone(),
+                            target_cap,
+                        ));
+                    }
+                }
+            }
+            if !published {
+                let err = msg_and_error::KvError::Api(msg_and_error::ApiError::Unknown {
+                    detail: format!(
+                        "prepared local-reserve Get target could not publish current route: get_id={} key={} put_id=({},{}) owner={}",
+                        get_id, key, inflight_info.put_id.0, inflight_info.put_id.1, req_node_id
+                    ),
+                });
+                let terminal: GetDoneResp =
+                    crate::rpcresp_kvresult_convert::FromError::from_error(&err);
+                let completed = CompletedGetInfo {
+                    req_node_id: req_node_id.clone(),
+                    response: terminal.clone(),
+                };
+                if let Some(terminals) = deferred_terminals.as_deref_mut() {
+                    terminals.push((get_id, completed));
+                } else {
+                    view.master_kv_router()
+                        .inner()
+                        .completed_gets
+                        .insert(get_id, completed)
+                        .await;
+                }
+                return MsgPack {
+                    serialize_part: terminal,
+                    raw_bytes: Vec::new(),
+                };
+            }
+            if let Some(event) = route_publish_event {
+                if let Some(events) = deferred_route_events.as_deref_mut() {
+                    events.push(event);
+                } else {
+                    apply_post_route_maintenance_batch(&view, vec![event]).await;
+                }
+            }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Completed get operation with get_id: {}, assigned holder_id: {}",
             get_id,
             holder_id
@@ -549,19 +1055,58 @@ pub async fn handle_get_done(
                 GetAllocationMode::Temporary => "temporary",
                 GetAllocationMode::ReuseReplica => "reuse_replica",
                 GetAllocationMode::DurableReplica => "durable_replica",
+                GetAllocationMode::LocalCommittedSlot => "local_committed_slot",
             });
 
+        let terminal = GetDoneResp {
+            holder_id,
+            allocation_mode,
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+            server_process_us: 0,
+        };
+        let completed = CompletedGetInfo {
+            req_node_id: req_node_id.clone(),
+            response: terminal.clone(),
+        };
+        if let Some(terminals) = deferred_terminals.as_deref_mut() {
+            terminals.push((get_id, completed));
+        } else {
+            view.master_kv_router()
+                .inner()
+                .completed_gets
+                .insert(get_id, completed)
+                .await;
+        }
         MsgPack {
-            serialize_part: GetDoneResp {
-                holder_id,
-                allocation_mode,
-                error_code: msg_and_error::OK,
-                error_json: String::new(),
-                server_process_us: 0,
-            },
+            serialize_part: terminal,
             raw_bytes: Vec::new(),
         }
     } else {
+        if let Some(completed) = view
+            .master_kv_router()
+            .inner()
+            .completed_gets
+            .get(&get_id)
+            .await
+        {
+            if completed.req_node_id != req_node_id {
+                let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                    detail: format!(
+                        "GetDone requester mismatch after completion: get_id={} expected={} got={}",
+                        get_id, completed.req_node_id, req_node_id
+                    ),
+                });
+                return MsgPack {
+                    serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                    raw_bytes: Vec::new(),
+                };
+            }
+            return MsgPack {
+                serialize_part: completed.response,
+                raw_bytes: Vec::new(),
+            };
+        }
         tracing::warn!(
             "Get operation with get_id {} not found for completion",
             get_id
@@ -581,6 +1126,20 @@ pub async fn handle_get_done(
             raw_bytes: Vec::new(),
         }
     }
+}
+
+pub async fn handle_get_done(
+    view: MasterKvRouterView,
+    req: MsgPack<GetDoneReq>,
+    req_node_id: NodeID,
+) -> MsgPack<GetDoneResp> {
+    let done_lock = view
+        .master_kv_router()
+        .inner()
+        .get_done_locks
+        .get_lock(req.serialize_part.get_id);
+    let _done_guard = done_lock.lock().await;
+    handle_get_done_locked(view, req, req_node_id, None, None).await
 }
 
 // --- MemHolder Handler Functions ---
@@ -757,15 +1316,12 @@ pub async fn handle_batch_is_exist(
 
     let mut exists_list = Vec::with_capacity(req.serialize_part.keys.len());
 
-    {
-        let _guard = view.master_kv_router().inner().route_lifetime_lock.lock();
-        for key in &req.serialize_part.keys {
-            if let Some(one_kv_nodes_routes) = view.master_kv_router().inner().kv_routes.get(key) {
-                let exists = one_kv_routes_has_live_replica(&one_kv_nodes_routes);
-                exists_list.push(exists);
-            } else {
-                exists_list.push(false);
-            }
+    for key in &req.serialize_part.keys {
+        if let Some(one_kv_nodes_routes) = view.master_kv_router().inner().kv_routes.get(key) {
+            let exists = one_kv_routes_has_live_replica(&one_kv_nodes_routes);
+            exists_list.push(exists);
+        } else {
+            exists_list.push(false);
         }
     }
 
@@ -784,12 +1340,43 @@ pub async fn handle_batch_get_start(
     req: MsgPack<BatchGetStartReq>,
     req_node_id: NodeID,
 ) -> MsgPack<BatchGetStartResp> {
-    let mut items = Vec::with_capacity(req.serialize_part.keys.len());
-    for key in req.serialize_part.keys {
+    let BatchGetStartReq {
+        keys,
+        prepared_targets,
+    } = req.serialize_part;
+    if !prepared_targets.is_empty() && prepared_targets.len() != keys.len() {
+        let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+            detail: format!(
+                "batch_get_start prepared target length mismatch: keys={} targets={}",
+                keys.len(),
+                prepared_targets.len()
+            ),
+        });
+        let error: GetStartResp = crate::rpcresp_kvresult_convert::FromError::from_error(&err);
+        return MsgPack {
+            serialize_part: BatchGetStartResp {
+                items: Vec::new(),
+                error_code: error.error_code,
+                error_json: error.error_json,
+                server_process_us: 0,
+            },
+            raw_bytes: Vec::new(),
+        };
+    }
+    let prepared_targets = if prepared_targets.is_empty() {
+        vec![None; keys.len()]
+    } else {
+        prepared_targets
+    };
+    let mut items = Vec::with_capacity(keys.len());
+    for (key, prepared_target) in keys.into_iter().zip(prepared_targets) {
         let (_get_id, resp) = handle_get_start(
             view.clone(),
             MsgPack {
-                serialize_part: GetStartReq { key },
+                serialize_part: GetStartReq {
+                    key,
+                    prepared_target,
+                },
                 raw_bytes: Vec::new(),
             },
             req_node_id.clone(),
@@ -805,6 +1392,8 @@ pub async fn handle_batch_get_start(
             target_base_addr: part.target_base_addr,
             src_base_addr: part.src_base_addr,
             len: part.len,
+            prepared_target: part.prepared_target,
+            atomic_group: part.atomic_group,
             error_code: part.error_code,
             error_json: part.error_json,
         });
@@ -823,6 +1412,7 @@ pub async fn handle_batch_get_start(
 pub async fn handle_batch_get_revoke(
     view: MasterKvRouterView,
     req: MsgPack<BatchGetRevokeReq>,
+    req_node_id: NodeID,
 ) -> MsgPack<BatchGetRevokeResp> {
     let mut items = Vec::with_capacity(req.serialize_part.get_ids.len());
     for get_id in req.serialize_part.get_ids {
@@ -832,6 +1422,7 @@ pub async fn handle_batch_get_revoke(
                 serialize_part: GetRevokeReq { get_id },
                 raw_bytes: Vec::new(),
             },
+            req_node_id.clone(),
         )
         .await;
         let part = resp.serialize_part;
@@ -854,18 +1445,50 @@ pub async fn handle_batch_get_revoke(
 pub async fn handle_batch_get_done(
     view: MasterKvRouterView,
     req: MsgPack<BatchGetDoneReq>,
+    req_node_id: NodeID,
 ) -> MsgPack<BatchGetDoneResp> {
-    let mut items = Vec::with_capacity(req.serialize_part.get_ids.len());
-    for get_id in req.serialize_part.get_ids {
-        let resp = handle_get_done(
-            view.clone(),
-            MsgPack {
-                serialize_part: GetDoneReq { get_id },
-                raw_bytes: Vec::new(),
-            },
-        )
-        .await;
-        let part = resp.serialize_part;
+    let started_at = Instant::now();
+    let get_ids = req.serialize_part.get_ids;
+
+    // Hold every per-get terminal lock until the combined route-maintenance
+    // batch and idempotency records are durable. Sorting gives overlapping
+    // retries one global acquisition order and avoids lock cycles.
+    let mut unique_get_ids = get_ids.clone();
+    unique_get_ids.sort_unstable();
+    unique_get_ids.dedup();
+    let mut _done_guards = Vec::with_capacity(unique_get_ids.len());
+    for get_id in unique_get_ids {
+        let lock = view
+            .master_kv_router()
+            .inner()
+            .get_done_locks
+            .get_lock(get_id);
+        _done_guards.push(lock.lock_owned().await);
+    }
+
+    let mut items = Vec::with_capacity(get_ids.len());
+    let mut route_events = Vec::new();
+    let mut deferred_terminals = Vec::new();
+    let mut response_by_get_id = HashMap::<u64, GetDoneResp>::new();
+    for get_id in get_ids {
+        let part = if let Some(part) = response_by_get_id.get(&get_id) {
+            part.clone()
+        } else {
+            let part = handle_get_done_locked(
+                view.clone(),
+                MsgPack {
+                    serialize_part: GetDoneReq { get_id },
+                    raw_bytes: Vec::new(),
+                },
+                req_node_id.clone(),
+                Some(&mut route_events),
+                Some(&mut deferred_terminals),
+            )
+            .await
+            .serialize_part;
+            response_by_get_id.insert(get_id, part.clone());
+            part
+        };
         items.push(BatchGetDoneItemResp {
             get_id,
             holder_id: part.holder_id,
@@ -873,6 +1496,33 @@ pub async fn handle_batch_get_done(
             error_code: part.error_code,
             error_json: part.error_json,
         });
+    }
+
+    let route_event_count = route_events.len();
+    let maintenance_started_at = Instant::now();
+    if !route_events.is_empty() {
+        // One Moka capacity decision for the entire Done RPC replaces the old
+        // per-key full-LRU scan while preserving the rule that no success ACK
+        // is visible before every route is admitted to resident policy state.
+        apply_post_route_maintenance_batch(&view, route_events).await;
+    }
+    let maintenance_elapsed = maintenance_started_at.elapsed();
+    for (get_id, completed) in deferred_terminals {
+        view.master_kv_router()
+            .inner()
+            .completed_gets
+            .insert(get_id, completed)
+            .await;
+    }
+    let elapsed = started_at.elapsed();
+    if elapsed.as_millis() >= 100 {
+        tracing::warn!(
+            "slow BatchGetDone convergence: items={} route_events={} maintenance_ms={} total_ms={}",
+            items.len(),
+            route_event_count,
+            maintenance_elapsed.as_millis(),
+            elapsed.as_millis()
+        );
     }
     MsgPack {
         serialize_part: BatchGetDoneResp {

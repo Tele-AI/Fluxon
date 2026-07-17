@@ -350,6 +350,36 @@ async fn test5_eviction_when_lease_consumes_space() {
         leased_success_keys.len()
     );
 
+    // Rounded allocations and the three reclaimable normal keys mean that a
+    // fixed 19 * 5MiB loop does not itself prove the physical segment is full.
+    // Establish the precondition explicitly before asserting later NoSpace
+    // behavior; otherwise the first post-check lease put can legitimately use
+    // the final free 5MiB slot.
+    let mut reached_lease_full = false;
+    for i in 0..32u32 {
+        let k = format!("t5_lease_topoff_{}", i);
+        match client_view
+            .client_kv_api()
+            .put(&k, &leased_value, Some(lease_id))
+            .await
+        {
+            Ok(()) => leased_success_keys.push(k),
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("NoSpace"),
+                    "expected top-off to end in NoSpace, got: {}",
+                    e
+                );
+                reached_lease_full = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        reached_lease_full,
+        "lease top-off did not establish a full physical segment"
+    );
+
     // Canvas assertion: assert 放成功的所有 lease key 都存在（TTL 尚未到期）
     tracing::info!(
         "[test5-assert-all-leased-keys-exist] verifying all successfully stored leased keys still exist before TTL expiry"

@@ -2,7 +2,7 @@ pub mod msg_pack;
 pub mod one_seg_allocator;
 use self::msg_pack::RequestSegmentRegistrationReq;
 use self::msg_pack::SegmentDeviceDescription;
-use self::one_seg_allocator::OneSegAllocator;
+use self::one_seg_allocator::{Allocation, OneSegAllocator};
 use crate::cluster_manager::NodeID;
 use crate::p2p::p2p_module::P2pModuleAccessTrait;
 use crate::rpcresp_kvresult_convert::msg_and_error::OK;
@@ -27,6 +27,7 @@ use std::time::Duration;
 fn register_node_segments(
     view: &MasterSegManagerView,
     node_id: NodeID,
+    node_start_time: i64,
     seg_map: std::collections::HashMap<
         SegmentDeviceID,
         (SegmentDeviceDescription, msg_pack::SegmentDeviceMemInfo),
@@ -72,13 +73,29 @@ fn register_node_segments(
                 device_id_2_allocator.insert(device_id, Arc::new(allocator));
             }
 
-            v.insert(NodeSegmentsManager::new(total_size, device_id_2_allocator));
+            v.insert(NodeSegmentsManager::new(
+                node_start_time,
+                total_size,
+                device_id_2_allocator,
+            ));
         }
         dashmap::mapref::entry::Entry::Occupied(mut occ) => {
             let node_segments_manager = occ.get_mut();
 
             // Tomb means the previous instance has left/restarted; replace the full segment set.
             if node_segments_manager.tomb_tag.is_tomb() {
+                // An RPC response already in flight at MemberLeft must not resurrect the
+                // departed generation. Only a genuinely newer epoch may replace a tomb.
+                if node_segments_manager.node_start_time == node_start_time {
+                    return Err(KvError::Api(
+                        crate::rpcresp_kvresult_convert::msg_and_error::ApiError::RegisterSegmentFailed {
+                            detail: format!(
+                                "stale segment registration for tombed node generation: node={} node_start_time={}",
+                                node_id, node_start_time
+                            ),
+                        },
+                    ));
+                }
                 let mut total_size: u64 = 0;
                 let mut device_id_2_allocator: HashMap<SegmentDeviceID, Arc<OneSegAllocator>> =
                     HashMap::new();
@@ -100,12 +117,24 @@ fn register_node_segments(
                 }
 
                 *node_segments_manager =
-                    NodeSegmentsManager::new(total_size, device_id_2_allocator);
+                    NodeSegmentsManager::new(node_start_time, total_size, device_id_2_allocator);
                 tracing::info!("RegisterSegment replaced tombed node: {}", node_id);
                 return Ok(());
             }
 
-            // Non-tomb: allow re-entrant registration (idempotent) to tolerate transient retries.
+            if node_segments_manager.node_start_time != node_start_time {
+                return Err(KvError::Api(
+                    crate::rpcresp_kvresult_convert::msg_and_error::ApiError::RegisterSegmentFailed {
+                        detail: format!(
+                            "new segment generation attempted to replace a live generation: node={} live_node_start_time={} requested_node_start_time={}",
+                            node_id, node_segments_manager.node_start_time, node_start_time
+                        ),
+                    },
+                ));
+            }
+
+            // Non-tomb, same generation: allow re-entrant registration (idempotent) to
+            // tolerate transient retries.
             for (device_id, (seg_device_desc, seg_mem_info)) in seg_map {
                 if let Some(existing) = node_segments_manager.device_id_2_allocator.get(&device_id)
                 {
@@ -181,9 +210,15 @@ impl NodeTombTag {
     pub fn set_tomb(&self) {
         self.0.store(true, Ordering::Release);
     }
+
+    /// True only when both tags belong to the same node registration generation.
+    pub fn same_generation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 pub struct NodeSegmentsManager {
+    node_start_time: i64,
     total_size: u64,
     device_id_2_allocator: HashMap<SegmentDeviceID, Arc<OneSegAllocator>>,
     tomb_tag: NodeTombTag,
@@ -191,10 +226,12 @@ pub struct NodeSegmentsManager {
 
 impl NodeSegmentsManager {
     pub fn new(
+        node_start_time: i64,
         total_size: u64,
         device_id_2_allocator: HashMap<SegmentDeviceID, Arc<OneSegAllocator>>,
     ) -> Self {
         Self {
+            node_start_time,
             total_size,
             device_id_2_allocator,
             tomb_tag: NodeTombTag::new(),
@@ -298,11 +335,30 @@ impl MasterSegManager {
     //     allocator.clone().allocate(size)
     // }
 
-    pub fn mark_node_tomb(&self, node_id: &NodeID) {
+    pub fn mark_node_tomb(&self, node_id: &NodeID) -> Option<NodeTombTag> {
+        self.mark_node_tomb_generation(node_id, None)
+    }
+
+    /// Mark one exact membership generation as departed and return its shared tomb tag.
+    /// A delayed leave for an older epoch must not tomb a newly registered generation that
+    /// happens to reuse the same node id.
+    pub fn mark_node_tomb_generation(
+        &self,
+        node_id: &NodeID,
+        expected_node_start_time: Option<i64>,
+    ) -> Option<NodeTombTag> {
         if let Some(allocators_and_tomb_tag) =
             self.inner().node_allocators_and_tomb_tag.get(node_id)
         {
+            if expected_node_start_time
+                .is_some_and(|expected| allocators_and_tomb_tag.node_start_time != expected)
+            {
+                return None;
+            }
             allocators_and_tomb_tag.tomb_tag.set_tomb();
+            Some(allocators_and_tomb_tag.tomb_tag.clone())
+        } else {
+            None
         }
     }
 
@@ -314,6 +370,28 @@ impl MasterSegManager {
         } else {
             None
         }
+    }
+
+    /// Resolve the registration generation that owns an already-created allocation.
+    ///
+    /// A plain `get_node_tomb_tag(node_id)` is insufficient: the node may have left and
+    /// re-registered between allocation and completion.  In that case the current tag belongs
+    /// to a different allocator set and must never be attached to the old allocation.
+    pub fn get_allocation_tomb_tag(
+        &self,
+        node_id: &NodeID,
+        allocation: &Allocation,
+    ) -> Option<NodeTombTag> {
+        let node = self.inner().node_allocators_and_tomb_tag.get(node_id)?;
+        if node.tomb_tag.is_tomb()
+            || !node
+                .device_id_2_allocator
+                .values()
+                .any(|allocator| allocation.belongs_to_allocator(allocator))
+        {
+            return None;
+        }
+        Some(node.tomb_tag.clone())
     }
 
     pub fn get_node_allocators(&self, node_id: &NodeID) -> Vec<Arc<OneSegAllocator>> {
@@ -417,7 +495,12 @@ impl MasterSegManager {
         );
 
         // Now, register these segments in the master.
-        match register_node_segments(inner.view(), node_id.clone(), resp.serialize_part.seg_map) {
+        match register_node_segments(
+            inner.view(),
+            node_id.clone(),
+            expected_node_start_time,
+            resp.serialize_part.seg_map,
+        ) {
             Ok(()) => {
                 tracing::info!("Successfully registered segments for node {}", node_id);
             }
@@ -434,6 +517,7 @@ impl MasterSegManager {
         self.inner()
             .node_allocators_and_tomb_tag
             .get(node_id)
+            .filter(|node_segments_manager| !node_segments_manager.tomb_tag.is_tomb())
             .map(|node_segments_manager| node_segments_manager.total_size)
             .unwrap_or(0)
     }

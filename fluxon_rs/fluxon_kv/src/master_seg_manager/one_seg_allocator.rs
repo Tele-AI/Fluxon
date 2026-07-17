@@ -72,6 +72,15 @@ impl Allocation {
         self.allocator.base_addr
     }
 
+    /// Returns whether this allocation was created by the exact allocator instance.
+    ///
+    /// Segment names and node ids are reusable after a node reconnects.  Pointer identity is
+    /// therefore the only safe way for master-side completion paths to bind an allocation back
+    /// to the registration generation that created it.
+    pub(crate) fn belongs_to_allocator(&self, allocator: &Arc<OneSegAllocator>) -> bool {
+        Arc::ptr_eq(&self.allocator, allocator)
+    }
+
     /// Attach an on-drop callback. It will be executed exactly once
     /// when this allocation is dropped.
     pub fn set_on_drop<F>(&mut self, f: F)
