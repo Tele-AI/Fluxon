@@ -93,7 +93,7 @@ async fn apply_delete_client_kv_meta_cache_item(
         let controls = client_inner.owner_key_control.lock_key(&delete_item.key);
         if controls
             .get(&delete_item.key)
-            .is_some_and(|state| state.reclaim.is_some())
+            .is_some_and(|state| state.local_access_fenced())
         {
             tracing::debug!(
                 "skip legacy local-index delete while owner reclaim fence is active: key={}",

@@ -1132,6 +1132,7 @@ mod external_get_start_batch_tests {
             OwnerKeyControlState {
                 local_puts: 0,
                 external_pending_puts: 0,
+                source_eviction_selection: None,
                 reclaim: None,
                 external_get: Some(old.clone()),
             },
@@ -1159,6 +1160,7 @@ mod external_get_start_batch_tests {
             OwnerKeyControlState {
                 local_puts: 0,
                 external_pending_puts: 0,
+                source_eviction_selection: None,
                 reclaim: None,
                 external_get: Some(op.clone()),
             },
@@ -1422,7 +1424,7 @@ async fn plan_external_get_key_items(
                 } else {
                     let fenced = controls
                         .get(key)
-                        .is_some_and(|state| state.reclaim.is_some());
+                        .is_some_and(|state| state.local_access_fenced());
                     if !fenced {
                         if let Some(memory_info) = inner.local_visible_mem_holder_unfenced(key) {
                             let hot_touch = inner.get_cached_info.get(key).and_then(|cached| {
@@ -2000,7 +2002,7 @@ async fn finish_external_get_key_leaders(
         match finish_result {
             Ok(results) if results.len() == batch.len() => {
                 // Publish each confirmed sub-batch immediately. A different
-                // uncertain Done cohort therefore cannot retain these flights
+                // uncertain Done atomic_batch therefore cannot retain these flights
                 // or their pending-visible slots.
                 for ((op, _), result) in batch.into_iter().zip(results) {
                     let phase = match result {

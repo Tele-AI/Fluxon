@@ -10,7 +10,7 @@ const OWNER_LOCAL_RESERVE_REBALANCE_INTERVAL: Duration = Duration::from_millis(2
 const OWNER_LOCAL_RESERVE_SHRINK_IDLE_COOLDOWN: Duration = Duration::from_secs(5);
 const OWNER_LOCAL_RESERVE_SHRINK_GROW_COOLDOWN: Duration = Duration::from_secs(1);
 const OWNER_LOCAL_RESERVE_DEFAULT_SOFT_WAIT_TIMEOUT: Duration = Duration::from_millis(10);
-// Cohort-safe master route deletion plus owner slot release is asynchronous.
+// AtomicBatch-safe master route deletion plus owner slot release is asynchronous.
 // Thirty seconds turns a recoverable pressure burst into a storage exception that
 // can wedge SGLang's detokenizer.  This remains well below the external request
 // timeout while allowing bounded backpressure to finish reclaiming slots.
@@ -19,8 +19,17 @@ const OWNER_LOCAL_RESERVE_MIN_GRANTS_PER_CLASS: usize = 0;
 const OWNER_LOCAL_RESERVE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 const OWNER_LOCAL_RESERVE_FREE_SLOT_HEADROOM_GRANTS: usize = 4;
 const OWNER_SLOT_PRESSURE_INTERVAL: Duration = Duration::from_millis(10);
-const OWNER_SLOT_PRESSURE_MIN_KICK_INTERVAL: Duration = Duration::from_millis(200);
-const OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES: u64 = 256 * 1024 * 1024;
+// Source deletion now has an exact, idempotent owner -> master transaction and
+// selection debt accounts for candidates until their slots are physically Free.
+// Keep pressure retries responsive: a 200 ms gate used to surface directly as
+// local_fast_put_start tail latency whenever one bounded kick was insufficient.
+const OWNER_SLOT_PRESSURE_MIN_KICK_INTERVAL: Duration = Duration::from_millis(25);
+// One 512 MiB grant contains 113 production KV slots.  The old 256 MiB cap was
+// smaller than a single grant and could never refill the configured four-grant
+// high watermark in one pass.  Bound a kick at eight grants so it covers the
+// four-grant retained headroom plus a normal large claimant, while selection
+// debt still prevents repeated over-selection before physical reclaim lands.
+const OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES: u64 = OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES * 8;
 
 #[derive(Debug, Clone, Copy)]
 struct ExpectedCapacityLayout {
@@ -72,7 +81,7 @@ fn owner_local_reserve_target_grant_count(
 
 fn owner_slot_pressure_request_bytes(
     snapshot: RebalanceClassSnapshot,
-    outstanding_selection_debt_bytes: u64,
+    source_eviction_selected_bytes: u64,
 ) -> u64 {
     let low_watermark = (snapshot.slots_per_grant as usize)
         .saturating_mul(2)
@@ -80,7 +89,7 @@ fn owner_slot_pressure_request_bytes(
     let high_watermark = (snapshot.slots_per_grant as usize)
         .saturating_mul(OWNER_LOCAL_RESERVE_FREE_SLOT_HEADROOM_GRANTS);
     let projected_eviction_slots =
-        usize::try_from(outstanding_selection_debt_bytes / snapshot.slot_size.max(1))
+        usize::try_from(source_eviction_selected_bytes / snapshot.slot_size.max(1))
             .unwrap_or(usize::MAX);
     let projected_free_slots = snapshot.free_slots.saturating_add(projected_eviction_slots);
     let pressure_active =
@@ -94,6 +103,17 @@ fn owner_slot_pressure_request_bytes(
         .unwrap_or(u64::MAX)
         .saturating_mul(snapshot.slot_size)
         .min(OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES)
+}
+
+fn owner_slot_pressure_projected_reclaim_bytes(inner: &ClientKvApiInner) -> u64 {
+    // Candidate debt starts in Moka's synchronous eviction listener. A
+    // candidate that is incomplete, pinned, or waiting in the retry queue has
+    // no installed owner fence and cannot release a slot. Only exact selected
+    // source debt is valid projected reclaim credit.
+    inner
+        .owner_hot_counters
+        .source_eviction_selected_bytes
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 fn owner_local_reserve_desired_free_slots(snapshot: RebalanceClassSnapshot) -> usize {
@@ -359,6 +379,8 @@ async fn try_shrink_once(inner: &ClientKvApiInner, snapshot: RebalanceClassSnaps
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_kv_api::OwnerHotCacheCounters;
+    use std::sync::atomic::Ordering;
 
     const SLOT_SIZE: u64 = 8 * 1024 * 1024;
 
@@ -500,14 +522,92 @@ mod tests {
             used_slots: 64,
             free_slots: 1,
             grant_count: 1,
-            pending_slot_demand: 100,
-            max_observed_claim_slots: 100,
+            pending_slot_demand: 1_000,
+            max_observed_claim_slots: 1_000,
             expected_grant_count: 1,
         };
         assert_eq!(
             owner_slot_pressure_request_bytes(clamped, 0),
             OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES
         );
+    }
+
+    #[test]
+    fn retry_candidate_debt_is_not_projected_reclaim_credit() {
+        let snapshot = RebalanceClassSnapshot {
+            slot_size: 1024 * 1024,
+            slots_per_grant: 4,
+            used_slots: 4,
+            free_slots: 1,
+            grant_count: 1,
+            pending_slot_demand: 3,
+            max_observed_claim_slots: 3,
+            expected_grant_count: 1,
+        };
+        let counters = OwnerHotCacheCounters::default();
+        counters
+            .selection_debt_bytes
+            .store(10 * 1024 * 1024, Ordering::Release);
+
+        assert_eq!(
+            counters
+                .source_eviction_selected_bytes
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            owner_slot_pressure_request_bytes(
+                snapshot,
+                counters
+                    .source_eviction_selected_bytes
+                    .load(Ordering::Acquire),
+            ),
+            18 * 1024 * 1024,
+            "retry-only candidate debt must not suppress physical victim selection"
+        );
+
+        counters.add_source_eviction_selected_bytes(10 * 1024 * 1024);
+        assert_eq!(
+            owner_slot_pressure_request_bytes(
+                snapshot,
+                counters
+                    .source_eviction_selected_bytes
+                    .load(Ordering::Acquire),
+            ),
+            8 * 1024 * 1024,
+            "only installed source-selection debt is valid projected reclaim credit"
+        );
+        counters.remove_source_eviction_selected_bytes(10 * 1024 * 1024);
+        assert_eq!(
+            counters
+                .source_eviction_selected_bytes
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn production_pressure_fills_high_watermark_in_one_kick() {
+        const VALUE_LEN: u64 = 4_718_592;
+        let slots_per_grant = crate::owner_local_reserve_slots_per_grant(VALUE_LEN).unwrap();
+        assert_eq!(slots_per_grant, 113);
+        let snapshot = RebalanceClassSnapshot {
+            slot_size: VALUE_LEN,
+            slots_per_grant,
+            used_slots: 113 * 174 - 8,
+            free_slots: 8,
+            grant_count: 174,
+            pending_slot_demand: 128,
+            max_observed_claim_slots: 128,
+            expected_grant_count: 174,
+        };
+        let requested = owner_slot_pressure_request_bytes(snapshot, 0);
+        assert_eq!(
+            requested,
+            u64::from(128_u32 + slots_per_grant * 4 - 8) * VALUE_LEN,
+            "one pressure kick must cover the claimant and retained four-grant headroom"
+        );
+        assert!(requested < OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES);
     }
 }
 
@@ -639,10 +739,8 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
             {
                 continue;
             }
-            let outstanding_selection_debt_bytes = inner
-                .owner_hot_counters
-                .selection_debt_bytes
-                .load(std::sync::atomic::Ordering::Acquire);
+            let source_eviction_selected_bytes =
+                owner_slot_pressure_projected_reclaim_bytes(inner);
             let requested_bytes = {
                 let pool = inner.owner_local_reserve_pool.lock();
                 let snapshots = snapshot_rebalance_classes(&pool);
@@ -652,7 +750,7 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
                     [] => 0,
                     [snapshot] => owner_slot_pressure_request_bytes(
                         *snapshot,
-                        outstanding_selection_debt_bytes,
+                        source_eviction_selected_bytes,
                     ),
                     _ => {
                         // Selection is intentionally disabled until the victim

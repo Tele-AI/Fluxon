@@ -372,7 +372,7 @@ pub struct OwnerSourceEvictionMember {
 
 /// Atomic/TP members which must enter the reclaim pipeline together.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct OwnerSourceEvictionCohort {
+pub struct OwnerSourceEvictionAtomicBatch {
     pub members: Vec<OwnerSourceEvictionMember>,
 }
 
@@ -381,7 +381,7 @@ pub struct BatchEvictOwnerSourceReq {
     pub operation_id: u64,
     /// Membership generation of the authenticated source owner.
     pub owner_node_start_time: i64,
-    pub cohorts: Vec<OwnerSourceEvictionCohort>,
+    pub atomic_batches: Vec<OwnerSourceEvictionAtomicBatch>,
 }
 
 impl MsgPackSerializePart for BatchEvictOwnerSourceReq {
@@ -403,8 +403,8 @@ pub enum OwnerSourceEvictionOutcome {
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct OwnerSourceEvictionCohortResp {
-    pub cohort_index: u32,
+pub struct OwnerSourceEvictionAtomicBatchResp {
+    pub atomic_batch_index: u32,
     pub outcome: OwnerSourceEvictionOutcome,
     pub detail: String,
 }
@@ -412,7 +412,7 @@ pub struct OwnerSourceEvictionCohortResp {
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct BatchEvictOwnerSourceResp {
     pub operation_id: u64,
-    pub cohorts: Vec<OwnerSourceEvictionCohortResp>,
+    pub atomic_batches: Vec<OwnerSourceEvictionAtomicBatchResp>,
     pub error_code: ErrorCode,
     pub error_json: String,
 }

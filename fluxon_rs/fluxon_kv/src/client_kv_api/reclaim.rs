@@ -55,6 +55,8 @@ fn reclaim_key_control_busy_detail(state: &super::OwnerKeyControlState) -> Optio
         Some("owner local put is inflight")
     } else if state.external_pending_puts != 0 {
         Some("owner external put context is still pending")
+    } else if state.source_eviction_selection.is_some() {
+        Some("owner source eviction selection fence is active")
     } else if state.external_get.is_some() {
         Some("owner external Get is inflight")
     } else {
@@ -64,6 +66,76 @@ fn reclaim_key_control_busy_detail(state: &super::OwnerKeyControlState) -> Optio
 
 fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
     let mut controls = inner.owner_key_control.lock_key(&item.key);
+    if controls
+        .get(&item.key)
+        .is_some_and(|state| state.source_eviction_selection.is_some())
+    {
+        let state = controls
+            .get_mut(&item.key)
+            .expect("owner source selection control state disappeared");
+        let selection_matches = state
+            .source_eviction_selection
+            .as_ref()
+            .is_some_and(|selection| {
+                selection.put_id == item.put_id
+                    && memory_matches_reclaim_backing(
+                        selection.cached_info.mem_holder.as_ref(),
+                        &item.backing,
+                    )
+            });
+        if !selection_matches {
+            return item_resp(
+                item,
+                OwnerReclaimItemState::Busy,
+                "another owner source selection owns the key fence",
+            );
+        }
+        if state.local_puts != 0 || state.external_pending_puts != 0 {
+            return item_resp(
+                item,
+                OwnerReclaimItemState::Busy,
+                "owner put crossed the source selection fence",
+            );
+        }
+        if inner.precommit_local_visible_info.contains_key(&item.key)
+            || inner.pending_local_get_info.contains_key(&item.key)
+        {
+            return item_resp(
+                item,
+                OwnerReclaimItemState::Busy,
+                "owner local publication crossed the source selection fence",
+            );
+        }
+        let selection = state
+            .source_eviction_selection
+            .take()
+            .expect("matching owner source selection must exist");
+        if Arc::strong_count(&selection.cached_info.mem_holder) != 1 {
+            state.source_eviction_selection = Some(selection);
+            return item_resp(
+                item,
+                OwnerReclaimItemState::Busy,
+                "owner local memory still has active holders",
+            );
+        }
+        let local_snapshot = inner
+            .local_snapshot_info
+            .remove_if(&item.key, |_, snapshot| {
+                snapshot.put_time_ms == item.put_id.0 && snapshot.put_version == item.put_id.1
+            })
+            .map(|(_, snapshot)| snapshot);
+        assert!(state.reclaim.is_none());
+        state.reclaim = Some(OwnerReclaimRecord::Prepared(OwnerPreparedReclaim {
+            item: item.clone(),
+            cached_info: selection.cached_info,
+            local_snapshot,
+        }));
+        return item_resp(
+            item,
+            OwnerReclaimItemState::Prepared,
+            "owner source selection promoted to reclaim fence",
+        );
+    }
     if let Some(state) = controls.get(&item.key) {
         if let Some(detail) = reclaim_key_control_busy_detail(state) {
             return item_resp(item, OwnerReclaimItemState::Busy, detail);
@@ -206,6 +278,7 @@ fn reclaim_release_fence_is_intact(
         Some(OwnerReclaimRecord::Releasing(releasing)) if releasing == item
     ) && state.local_puts == 0
         && state.external_pending_puts == 0
+        && state.source_eviction_selection.is_none()
 }
 
 fn commit_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
@@ -318,6 +391,7 @@ mod tests {
         let state = OwnerKeyControlState {
             local_puts: 0,
             external_pending_puts: 0,
+            source_eviction_selection: None,
             reclaim: Some(OwnerReclaimRecord::Releasing(item.clone())),
             external_get: Some(Arc::new(ExternalGetKeySharedOp::new(
                 "remote-during-reclaim".to_string(),
@@ -328,6 +402,7 @@ mod tests {
         let local_put_state = OwnerKeyControlState {
             local_puts: 1,
             external_pending_puts: 0,
+            source_eviction_selection: None,
             reclaim: Some(OwnerReclaimRecord::Releasing(item.clone())),
             external_get: state.external_get,
         };

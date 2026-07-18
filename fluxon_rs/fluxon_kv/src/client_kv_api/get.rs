@@ -621,7 +621,7 @@ impl ClientKvApiInner {
         }
 
         // All members are in get_cached_info before any hot admission can evict one of them.
-        // This keeps atomic/TP cohort write-back decisions complete.
+        // This keeps atomic/TP atomic_batch write-back decisions complete.
         for (key, put_id, memory_info, atomic_group) in local_hot_admissions {
             self.owner_hot_track_committed(&key, put_id, &memory_info, atomic_group.as_ref());
         }
@@ -1495,7 +1495,7 @@ impl ClientKvApiInner {
         // committed-slot Done.  Bound the number of callers entering that path
         // so a capacity scan cannot park every master Tokio worker on Moka's
         // blocking housekeeper lock.  The permit covers one RPC attempt only;
-        // idempotent retry backoff releases it and lets other cohorts converge.
+        // idempotent retry backoff releases it and lets other atomic_batches converge.
         let _done_rpc_permit = batch_get_done_rpc_limiter()
             .acquire()
             .await

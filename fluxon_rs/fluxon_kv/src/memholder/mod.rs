@@ -23,6 +23,7 @@ use crate::client_kv_api::ClientKvApiView;
 use crate::{cluster_manager::NodeID, external_client_api::ExternalClientApiView};
 
 use bitcode::{Decode, Encode};
+use fluxon_util::pin_aware_moka::PinGuard;
 
 #[derive(Clone, Debug)]
 pub enum MemoryInfoDropAction {
@@ -91,6 +92,7 @@ pub struct UserMemHolder {
     pub memory_info: Arc<MemoryInfo>,
     pub refcount: Arc<AllMemholderRefCount>,
     expose_kind: UserMemHolderExposeKind,
+    _owner_hot_pin: Option<PinGuard>,
 }
 impl UserMemHolder {
     pub fn holder_id(&self) -> u64 {
@@ -117,6 +119,14 @@ impl UserMemHolder {
         refcount: Arc<AllMemholderRefCount>,
         expose_kind: UserMemHolderExposeKind,
     ) -> Self {
+        let owner_hot_pin = match expose_kind {
+            UserMemHolderExposeKind::SegPtr => refcount
+                .view
+                .client_kv_api()
+                .inner()
+                .owner_hot_pin_memory_info(&memory_info),
+            UserMemHolderExposeKind::OwnedCopy => None,
+        };
         tracing::debug!(
             "Creating UserMemHolder for key '{}', _holder_id_ {}, expose_kind={:?}.",
             memory_info.key,
@@ -127,6 +137,7 @@ impl UserMemHolder {
             memory_info,
             refcount,
             expose_kind,
+            _owner_hot_pin: owner_hot_pin,
         }
     }
     pub fn memory_info(&self) -> Arc<MemoryInfo> {

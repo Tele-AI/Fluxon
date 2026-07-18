@@ -190,7 +190,7 @@ pub(super) async fn apply_post_route_maintenance_batch(
                 continue;
             }
             tracing::debug!("Inserting key: {:?} into cache", key);
-            cache.insert(key.clone(), desc.clone());
+            super::insert_master_cache_entry(cache.as_ref(), key.clone(), desc.clone());
             tracing::debug!(
                 "Inserted key: {:?} into cache, current cache size: {}",
                 key,
@@ -198,7 +198,7 @@ pub(super) async fn apply_post_route_maintenance_batch(
             );
         }
         // Do not search Moka for a recoverable victim here. CPU append Done
-        // already carries the exact source key/cohort and performs a validated
+        // already carries the exact source key/atomic_batch and performs a validated
         // point demotion. Local-reserve Free/Prepared/Pending/Committed state is
         // the physical capacity authority while that writeback is in flight.
     }
@@ -228,7 +228,7 @@ pub(super) async fn apply_post_route_maintenance_batch(
             ) {
                 continue;
             }
-            tier1_cache.insert(key, desc);
+            super::insert_master_cache_entry(tier1_cache.as_ref(), key, desc);
         }
     }
 }

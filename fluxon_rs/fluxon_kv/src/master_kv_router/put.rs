@@ -487,6 +487,13 @@ fn reserve_replica_task_excluding(
     protect_source_on_remote_complete: bool,
 ) -> msg_and_error::KvResult<InflightReplicaTaskInfo> {
     let activity_lease = view.master_kv_router().reserve_inflight_replica_key(key)?;
+    view.master_kv_router()
+        .pin_current_master_cache_identity_for_activity(
+            &activity_lease,
+            source_node_id.as_ref(),
+            key,
+            put_id,
+        );
     let (target_node_id, target_allocation) = view
         .master_kv_router()
         .inner()
