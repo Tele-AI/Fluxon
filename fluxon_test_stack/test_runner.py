@@ -14782,7 +14782,9 @@ def _ci_prepare_env_path(*, run_dir: Path) -> Path:
 
 def _write_ci_prepare_env_script(*, run_dir: Path, exports: Dict[str, str]) -> Path:
     out_path = _ci_prepare_env_path(run_dir=run_dir)
-    lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
+    # This file is sourced by ci_runner.sh. It owns environment exports only;
+    # changing the caller's shell options would break explicit rc capture.
+    lines = ["#!/usr/bin/env bash"]
     for name, value in sorted(exports.items()):
         lines.append(f"export {name}={_shell_quote(value)}")
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -15092,6 +15094,9 @@ if [ -f "$prepare_env_path" ]; then
   # CI case prepare writes explicit environment exports here.
   . "$prepare_env_path"
 fi
+# The runner owns error handling even if a supplied prepare file changes shell options.
+set +e
+set -uo pipefail
 
 # Run from src_root so repo-local test commands execute inside the prepared runtime source tree.
 cd {src_root.as_posix()}

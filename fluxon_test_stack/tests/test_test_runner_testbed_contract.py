@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2337,6 +2338,112 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertIn("[ci_runner] STEP 1 start label=", script_text)
             self.assertIn("[ci_runner] STEP 1 finish label=", script_text)
             subprocess.run(["bash", "-n", str(script_path)], check=True)
+
+    def test_ci_runner_persists_workload_rc_after_sourcing_prepare_env(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            src_root = run_dir / "src"
+            src_root.mkdir(parents=True)
+            resolved_case = {
+                "case": {
+                    "family": "ci",
+                    "case_id": "ci_runner_exit_code_contract",
+                },
+                "scene": {
+                    "ci": {
+                        "subject": "exit_code_contract",
+                        "runtime_contract": "rust_self_managed",
+                        "commands": [
+                            {
+                                "id": "exit_7",
+                                "command": (
+                                    "/bin/bash -c 'if [ \"$CI_PREPARE_SENTINEL\" = ready ]; "
+                                    "then exit 7; else exit 8; fi'"
+                                ),
+                                "timeout_seconds": 10,
+                            }
+                        ],
+                    }
+                },
+                "runtime_model": {
+                    "test_bed": {},
+                    "base_runtime": {},
+                    "case_runtime": {"instance_ids": ["ci_runner"]},
+                },
+            }
+
+            prepare_path = _RUNNER._write_ci_prepare_env_script(
+                run_dir=run_dir,
+                exports={"CI_PREPARE_SENTINEL": "ready"},
+            )
+            self.assertNotIn(
+                "set -",
+                prepare_path.read_text(encoding="utf-8"),
+            )
+            # Exercise the runner boundary against a legacy/external prepare file
+            # that enables errexit. ci_runner must still persist the real rc.
+            prepare_path.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "export CI_PREPARE_SENTINEL=ready\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                _RUNNER,
+                "_subst_runtime_tokens",
+                side_effect=lambda _case, text: text,
+            ):
+                script_path = _RUNNER._write_ci_runner_script(
+                    resolved_case,
+                    run_dir=run_dir,
+                    src_root=src_root,
+                    share_mem_path="/tmp/shm",
+                )
+
+            proc = subprocess.Popen(["bash", str(script_path)], cwd=src_root)
+            exit_code_path = run_dir / "logs" / "ci_runner" / "exit_code.txt"
+            inflight_path = run_dir / "logs" / "ci_runner" / "inflight_attempt.txt"
+            try:
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    if exit_code_path.exists() and not inflight_path.exists():
+                        break
+                    return_code = proc.poll()
+                    if return_code is not None:
+                        self.fail(
+                            "ci_runner exited before persisting workload rc: "
+                            f"return_code={return_code}"
+                        )
+                    time.sleep(0.05)
+                else:
+                    self.fail("timed out waiting for ci_runner exit_code.txt")
+
+                self.assertEqual(exit_code_path.read_text(encoding="utf-8").strip(), "7")
+                self.assertFalse(inflight_path.exists())
+                self.assertEqual(
+                    (run_dir / "logs" / "ci_runner" / "restart_count.txt")
+                    .read_text(encoding="utf-8")
+                    .strip(),
+                    "1",
+                )
+                runner_log = (
+                    run_dir / "logs" / "ci_runner" / "stdout.log"
+                ).read_text(encoding="utf-8")
+                self.assertIn("STEP 1 finish", runner_log)
+                self.assertIn("rc=7", runner_log)
+                self.assertIn("wrote exit_code=7", runner_log)
+                self.assertIsNone(
+                    proc.poll(),
+                    "ci_runner must hold after persisting the terminal rc",
+                )
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
 
     def test_ci_prepare_exports_testbed_bundle_and_release_authority(self) -> None:
         with tempfile.TemporaryDirectory() as td:
