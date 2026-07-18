@@ -4,8 +4,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::etcd::EtcdEndpointSet;
-
 /// A cancellable native Rust operation used by the Fluxon KV lease backend.
 pub type KvLeaseFuture<T> = Pin<Box<dyn Future<Output = AnyResult<T>> + Send + 'static>>;
 
@@ -22,12 +20,12 @@ pub enum LeaseType {
 
 /// Unique identifier for a lease backend.
 ///
-/// - Etcd: canonical endpoint set with stable identity regardless of input
-///   order or equivalent endpoint spelling.
+/// - Etcd: endpoints list (Vec<String>) sorted lexicographically to make
+///   identity stable regardless of input order.
 /// - KvClient: cluster and client instance identity; carries native async
 ///   Fluxon KV lease operations.
 pub enum LeaseBackendUid {
-    Etcd(EtcdEndpointSet),
+    Etcd(Vec<String>),
     KvClient {
         cluster: String,
         instance_key: String,
@@ -37,15 +35,11 @@ pub enum LeaseBackendUid {
 }
 
 impl LeaseBackendUid {
-    /// Construct an etcd backend identity from raw endpoints or a canonical set.
-    pub fn etcd_from<E>(endpoints: E) -> Self
-    where
-        E: TryInto<EtcdEndpointSet>,
-        E::Error: fmt::Display,
-    {
-        let endpoints = endpoints
-            .try_into()
-            .unwrap_or_else(|err| panic!("invalid etcd backend endpoints: {err}"));
+    /// Construct an etcd backend uid from endpoint list; endpoints are sorted
+    /// to ensure identical identity regardless of input order.
+    pub fn etcd_from(mut endpoints: Vec<String>) -> Self {
+        // Sort in-place; caller must pass explicit endpoints, we don't add defaults.
+        endpoints.sort();
         LeaseBackendUid::Etcd(endpoints)
     }
 
@@ -71,9 +65,9 @@ impl LeaseBackendUid {
         }
     }
 
-    pub fn etcd_endpoint_set(&self) -> Option<&EtcdEndpointSet> {
+    pub fn endpoints(&self) -> Option<&[String]> {
         match self {
-            LeaseBackendUid::Etcd(v) => Some(v),
+            LeaseBackendUid::Etcd(v) => Some(v.as_slice()),
             _ => None,
         }
     }
@@ -179,8 +173,11 @@ impl std::hash::Hash for LeaseBackendUid {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
             LeaseBackendUid::Etcd(endpoints) => {
+                // tag + endpoints (construction sorted; order is stable)
                 0u8.hash(state);
-                endpoints.hash(state);
+                for e in endpoints {
+                    e.hash(state);
+                }
             }
             LeaseBackendUid::KvClient {
                 cluster,
@@ -235,16 +232,5 @@ mod tests {
 
         assert_eq!(first, same);
         assert_ne!(first, other_client);
-    }
-
-    #[test]
-    fn etcd_backend_identity_accepts_raw_and_canonical_endpoints() {
-        let raw = vec!["127.0.0.1:2379".to_string()];
-        let canonical = EtcdEndpointSet::from_raw(raw.clone()).unwrap();
-
-        assert_eq!(
-            LeaseBackendUid::etcd_from(raw),
-            LeaseBackendUid::etcd_from(canonical)
-        );
     }
 }

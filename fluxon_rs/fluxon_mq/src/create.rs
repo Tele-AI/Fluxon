@@ -2,7 +2,7 @@ use anyhow::Context;
 use etcd_client as etcd;
 use std::time::Duration;
 
-use fluxon_util::etcd::{get_cluster_lease_id, DistributeIdAllocator};
+use fluxon_util::etcd::{etcd_clients_pool, get_cluster_lease_id, DistributeIdAllocator};
 use fluxon_util::lease_manager::{
     record_register_by as lm_record_register_by, registered_etcd_client, LeaseBackendUid,
     LeaseManager, LeaseRegisterKind,
@@ -62,9 +62,11 @@ pub async fn create_mpsc_channel(
     cfg: ChanCreateConfig,
     rt_handle: tokio::runtime::Handle,
 ) -> Result<ChanManager, MpscError> {
-    // Build etcd client directly from provided endpoints; LeaseManager 仅负责
-    // lease keepalive，不再对外暴露具体 client 实现。
-    let mut client = etcd::Client::connect(etcd_endpoints.clone(), None)
+    // Acquire the root client from the process-wide pool, then keep passing the
+    // concrete client through the existing MQ ownership chain.
+    let etcd_pool_entry = etcd_clients_pool().acquire(etcd_endpoints.clone());
+    let mut client = etcd_pool_entry
+        .client()
         .await
         .map_err(|e| MpscError::Internal(format!("connect etcd failed: {}", e)))?;
 
@@ -495,7 +497,9 @@ impl ChanManager {
         // global_lease_id / global_long_lease_id，同时记录下等
         // 待后续事务校验使用的 etcd 版本号。
         let etcd_backend_uid = LeaseBackendUid::etcd_from(etcd_endpoints.clone());
-        let client = etcd::Client::connect(etcd_endpoints, None)
+        let etcd_pool_entry = etcd_clients_pool().acquire(etcd_endpoints);
+        let client = etcd_pool_entry
+            .client()
             .await
             .map_err(|e| anyhow::anyhow!("connect etcd failed: {}", e))?;
         let mut meta_client = client.clone();

@@ -47,18 +47,12 @@ use fluxon_commu::{
     RdmaLinkLayer, RdmaPhysState, RdmaPortSnapshot, RdmaPortState, cluster_member_base_prefix,
     cluster_member_ext_prefix, cluster_owner_rdma_control_prefix, scan_etcd_prefix_paginated,
 };
-use fluxon_util::etcd::{EtcdEndpointSet, ManagedEtcdClient};
+use fluxon_util::etcd::etcd_clients_pool;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, Read, Write};
 
 const MQ_META_KEY_PREFIX: &str = "/channels/meta/";
-
-fn managed_etcd_backend(endpoints: &[String]) -> anyhow::Result<ManagedEtcdClient> {
-    Ok(ManagedEtcdClient::acquire(EtcdEndpointSet::new(
-        endpoints.to_vec(),
-    )?))
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -238,8 +232,8 @@ pub async fn load_transfer_engine_edges_for_cluster(
     etcd_endpoints: &[String],
     cluster_name: &str,
 ) -> anyhow::Result<Vec<TransferEngineEdge>> {
-    let etcd_backend = managed_etcd_backend(etcd_endpoints)?;
-    let mut etcd = etcd_backend
+    let etcd_pool_entry = etcd_clients_pool().acquire(etcd_endpoints.to_vec());
+    let mut etcd = etcd_pool_entry
         .client()
         .await
         .with_context(|| "connect etcd (transfer_link scan)".to_string())?;
@@ -1194,8 +1188,8 @@ async fn build_fs_cluster_snapshot(
     cfg: &MonitorConfig,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<ClusterSnapshot> {
-    let etcd_backend = managed_etcd_backend(&cfg.etcd_endpoints)?;
-    let mut etcd = etcd_backend
+    let etcd_pool_entry = etcd_clients_pool().acquire(cfg.etcd_endpoints.clone());
+    let mut etcd = etcd_pool_entry
         .client()
         .await
         .with_context(|| "connect etcd".to_string())?;
@@ -1481,8 +1475,8 @@ pub async fn build_cluster_snapshot_with_prom_query_time(
 ) -> anyhow::Result<ClusterSnapshot> {
     let mut warnings: Vec<String> = Vec::new();
     if cfg.member_kind == MemberKind::Mq {
-        let etcd_backend = managed_etcd_backend(&cfg.etcd_endpoints)?;
-        let mut etcd = etcd_backend
+        let etcd_pool_entry = etcd_clients_pool().acquire(cfg.etcd_endpoints.clone());
+        let mut etcd = etcd_pool_entry
             .client()
             .await
             .with_context(|| "connect etcd".to_string())?;
@@ -1601,8 +1595,8 @@ pub async fn build_cluster_snapshot_with_prom_query_time(
     if cfg.member_kind == MemberKind::Fs {
         return build_fs_cluster_snapshot(cfg, &mut warnings).await;
     }
-    let etcd_backend = managed_etcd_backend(&cfg.etcd_endpoints)?;
-    let mut etcd = etcd_backend
+    let etcd_pool_entry = etcd_clients_pool().acquire(cfg.etcd_endpoints.clone());
+    let mut etcd = etcd_pool_entry
         .client()
         .await
         .with_context(|| "connect etcd".to_string())?;

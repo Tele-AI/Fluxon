@@ -36,7 +36,7 @@ use fluxon_kv::{
     ClusterEvent, ClusterMember, ConfigArg, MembershipEventReceiver,
     run_client_with_startup_member_metadata,
 };
-use fluxon_util::etcd::{EtcdEndpointSet, ManagedEtcdClient};
+use fluxon_util::etcd::{PooledEtcdClient, etcd_clients_pool};
 use fluxon_util::run_async_from_sync::spawn_blocking_allow_sync_async_bridge;
 use fluxon_util::{FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2};
 use futures::future::BoxFuture;
@@ -942,7 +942,7 @@ async fn async_main(
         .cluster_manager_view()
         .cluster_manager()
         .etcd_endpoints();
-    let etcd_backend = ManagedEtcdClient::acquire(EtcdEndpointSet::new(endpoints.clone())?);
+    let etcd_pool_entry = etcd_clients_pool().acquire(endpoints.clone());
 
     let rt_handle = rt.handle().clone();
     let api = Arc::new(
@@ -972,7 +972,7 @@ async fn async_main(
     let s3_backend = Arc::new(FsS3BackendAgent::new(s3_agent, s3_kv_miss_policy));
 
     let etcd2 = Arc::new(tokio::sync::Mutex::new(
-        etcd_backend
+        etcd_pool_entry
             .client()
             .await
             .with_context(|| "connect etcd (panel runtime)")?,
@@ -1047,7 +1047,7 @@ async fn async_main(
     register_mount_registry_rpc(
         rt_handle.clone(),
         &cluster_name,
-        etcd_backend.clone(),
+        etcd_pool_entry.clone(),
         api.clone(),
         s3_state.clone(),
     )?;
@@ -1057,11 +1057,11 @@ async fn async_main(
         api.clone(),
         export_registry.clone(),
         cluster_name.clone(),
-        etcd_backend.clone(),
+        etcd_pool_entry.clone(),
         s3_state.clone(),
     )?;
 
-    let mut etcd = etcd_backend
+    let mut etcd = etcd_pool_entry
         .client()
         .await
         .with_context(|| "connect etcd")?;
@@ -1073,7 +1073,7 @@ async fn async_main(
         kv_framework.clone(),
         export_registry.clone(),
         cluster_name.clone(),
-        etcd_backend,
+        etcd_pool_entry,
         s3_state.clone(),
         FLUXON_FS_CONTROL_SCHEMA_VERSION,
         pull_interval_ms,
@@ -1441,7 +1441,7 @@ fn build_mount_exports_from_registry_locked(
 fn register_mount_registry_rpc(
     rt: Handle,
     cluster_name: &str,
-    etcd_backend: ManagedEtcdClient,
+    etcd_pool_entry: PooledEtcdClient,
     api: Arc<FluxonUserApi>,
     s3_state: Arc<fluxon_fs_s3_gateway::GatewayState>,
 ) -> KvResult<()> {
@@ -1532,7 +1532,7 @@ fn register_mount_registry_rpc(
             //   the filesystem data-plane mount itself.
             //
             // Therefore we spawn the etcd write asynchronously and return ok immediately.
-            let etcd_backend = etcd_backend.clone();
+            let etcd_pool_entry = etcd_pool_entry.clone();
             let key2 = key.clone();
             let value2 = value.clone();
             let s3_state2 = s3_state.clone();
@@ -1548,7 +1548,7 @@ fn register_mount_registry_rpc(
                 }
             });
             rt.spawn(async move {
-                let mut etcd = match etcd_backend.client().await {
+                let mut etcd = match etcd_pool_entry.client().await {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(
@@ -1665,7 +1665,7 @@ fn register_agent_exports_push_rpc(
     api: Arc<FluxonUserApi>,
     export_registry: Arc<Mutex<ExportRegistry>>,
     cluster_name: String,
-    etcd_backend: ManagedEtcdClient,
+    etcd_pool_entry: PooledEtcdClient,
     s3_state: Arc<fluxon_fs_s3_gateway::GatewayState>,
 ) -> KvResult<()> {
     let path = FS_MASTER_AGENT_EXPORTS_PUSH_RPC_PATH.to_string();
@@ -1764,7 +1764,7 @@ fn register_agent_exports_push_rpc(
                 export_registry.clone(),
                 FLUXON_FS_CONTROL_SCHEMA_VERSION,
                 cluster_name.clone(),
-                etcd_backend.clone(),
+                etcd_pool_entry.clone(),
             );
 
             let mut out: FlatDict = FlatDict::new();
@@ -1855,7 +1855,7 @@ fn start_export_registry_manager(
     framework: Arc<fluxon_kv::Framework>,
     export_registry: Arc<Mutex<ExportRegistry>>,
     cluster_name: String,
-    etcd_backend: ManagedEtcdClient,
+    etcd_pool_entry: PooledEtcdClient,
     s3_state: Arc<fluxon_fs_s3_gateway::GatewayState>,
     schema_version: i64,
     pull_interval_ms: u64,
@@ -1882,7 +1882,7 @@ fn start_export_registry_manager(
             framework.clone(),
             export_registry.clone(),
             cluster_name.clone(),
-            etcd_backend.clone(),
+            etcd_pool_entry.clone(),
             s3_state.clone(),
             schema_version,
             pull_interval_ms,
@@ -1914,7 +1914,7 @@ fn start_export_registry_manager(
                         framework.clone(),
                         export_registry.clone(),
                         cluster_name.clone(),
-                        etcd_backend.clone(),
+                        etcd_pool_entry.clone(),
                         s3_state.clone(),
                         schema_version,
                         pull_interval_ms,
@@ -1936,7 +1936,7 @@ fn start_export_registry_manager(
                             &member_id,
                             schema_version,
                             &cluster_name,
-                            &etcd_backend,
+                            &etcd_pool_entry,
                         );
                     }
                 }
@@ -1959,7 +1959,7 @@ fn remove_agent_exports_and_persist_snapshot(
     agent_instance_key: &str,
     schema_version: i64,
     cluster_name: &str,
-    etcd_backend: &ManagedEtcdClient,
+    etcd_pool_entry: &PooledEtcdClient,
 ) {
     {
         let mut reg = export_registry.lock();
@@ -1970,7 +1970,7 @@ fn remove_agent_exports_and_persist_snapshot(
         export_registry,
         schema_version,
         cluster_name.to_string(),
-        etcd_backend.clone(),
+        etcd_pool_entry.clone(),
     );
     if let Err(e) = s3_state.delete_fs_export_registry_for_agent(agent_instance_key) {
         tracing::warn!(
@@ -1987,7 +1987,7 @@ fn spawn_sync_agent_exports_until_ready(
     framework: Arc<fluxon_kv::Framework>,
     export_registry: Arc<Mutex<ExportRegistry>>,
     cluster_name: String,
-    etcd_backend: ManagedEtcdClient,
+    etcd_pool_entry: PooledEtcdClient,
     s3_state: Arc<fluxon_fs_s3_gateway::GatewayState>,
     schema_version: i64,
     pull_interval_ms: u64,
@@ -2109,7 +2109,7 @@ fn spawn_sync_agent_exports_until_ready(
                         export_registry.clone(),
                         schema_version,
                         cluster_name.clone(),
-                        etcd_backend.clone(),
+                        etcd_pool_entry.clone(),
                     );
                     break;
                 }
@@ -2237,7 +2237,7 @@ fn spawn_persist_export_registry_snapshot_to_etcd(
     export_registry: Arc<Mutex<ExportRegistry>>,
     schema_version: i64,
     cluster_name: String,
-    etcd_backend: ManagedEtcdClient,
+    etcd_pool_entry: PooledEtcdClient,
 ) {
     let snapshot = {
         let reg = export_registry.lock();
@@ -2265,7 +2265,7 @@ fn spawn_persist_export_registry_snapshot_to_etcd(
 
     let key = export_registry_snapshot_etcd_key(&cluster_name);
     rt.spawn(async move {
-        let mut etcd = match etcd_backend.client().await {
+        let mut etcd = match etcd_pool_entry.client().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(

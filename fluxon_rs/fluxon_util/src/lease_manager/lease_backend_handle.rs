@@ -1,3 +1,4 @@
+use etcd_client::Client;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -7,7 +8,7 @@ use super::lease_backend_uid::{KvKeepaliveLease, LeaseBackendUid};
 use super::lifecycle::debug_keepalive_log;
 use crate::auto_clean_map::AutoCleanMap;
 use crate::auto_clean_map::AutoCleanMapEntry;
-use crate::etcd::ManagedEtcdClient;
+use crate::etcd::PooledEtcdClient;
 
 /// Backend resources actually used by keepalive actors.
 ///
@@ -15,7 +16,10 @@ use crate::etcd::ManagedEtcdClient;
 /// types when the handle also carries the map guard (AutoCleanMapEntry).
 pub enum LeaseBackendInner {
     Etcd {
-        client: ManagedEtcdClient,
+        _endpoints: Vec<String>,
+        /// Final-release owner that keeps this backend's pool entry alive.
+        _pool_entry: PooledEtcdClient,
+        client: Client,
         /// Per-lease keepalive state keyed by lease_id. Auto-evicts when the last
         /// guard (AutoCleanMapEntry) for that lease is dropped.
         states: AutoCleanMap<u64, Arc<Mutex<EtcdState>>>,
@@ -54,7 +58,7 @@ impl LeaseBackendHandle {
     }
 
     #[inline]
-    pub fn managed_etcd_client(&self) -> Option<ManagedEtcdClient> {
+    pub fn etcd_client(&self) -> Option<Client> {
         match &*self.entry {
             LeaseBackendInner::Etcd { client, .. } => Some(client.clone()),
             _ => None,
@@ -185,6 +189,7 @@ mod tests {
         let handle = super::super::lifecycle::acquire_backend_handle(
             backend,
             Some(keepalive),
+            None,
             None,
             tokio::runtime::Handle::current(),
         );

@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use fluxon_proxy;
 use fluxon_util::{
-    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2,
-    etcd::{EtcdEndpointSet, ManagedEtcdClient},
+    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, etcd::etcd_clients_pool,
     fluxon_cli_proxy_desc_etcd_key_v2,
 };
 
@@ -174,9 +173,8 @@ async fn run_serve(config: &Path, workdir: &Path) -> anyhow::Result<()> {
 
     let etcd_key =
         fluxon_cli_proxy_desc_etcd_key_v2(fluxon_ops::OPS_SERVICE_NAME, &cli_cfg.cluster_name);
-    let etcd_backend =
-        ManagedEtcdClient::acquire(EtcdEndpointSet::new(cli_cfg.etcd_endpoints.clone())?);
-    let mut etcd = etcd_backend.client().await.map_err(|e| {
+    let etcd_pool_entry = etcd_clients_pool().acquire(cli_cfg.etcd_endpoints.clone());
+    let mut etcd = etcd_pool_entry.client().await.map_err(|e| {
         anyhow::anyhow!(
             "etcd connect failed while waiting for ops panel: key={} err={}",
             etcd_key,

@@ -3,8 +3,7 @@ use super::lease_backend_uid::LeaseBackendUid;
 use super::lease_handle::{LeaseEntry, LeaseEntryKind};
 use super::lifecycle::OnKeepalive;
 use crate::auto_clean_map::{AutoCleanMap, AutoCleanMapEntry};
-use crate::etcd::ManagedEtcdClient;
-use etcd_client::{LeaseKeepAliveStream, LeaseKeeper};
+use etcd_client::{Client, LeaseKeepAliveStream, LeaseKeeper};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -64,7 +63,7 @@ where
 // ---------- OneTtlKeepAliveActor & registry ----------
 
 pub(crate) struct EtcdState {
-    pub(crate) client: ManagedEtcdClient,
+    pub(crate) client: Client,
     pub(crate) lease_id: i64,
     pub(crate) keeper: Option<LeaseKeeper>,
     pub(crate) stream: Option<LeaseKeepAliveStream>,
@@ -89,14 +88,7 @@ impl EtcdState {
         let mut last_err: Option<String> = None;
         for attempts in 0..10 {
             self.last_stage = "ensure_stream.open_stream";
-            let mut client = match self.client.client().await {
-                Ok(client) => client,
-                Err(e) => {
-                    last_err = Some(e.to_string());
-                    continue;
-                }
-            };
-            match client.lease_keep_alive(lease_id).await {
+            match self.client.lease_keep_alive(lease_id).await {
                 Ok((keeper, stream)) => {
                     debug!(
                         "renewed keepalive stream for lease_id={} attempts={}",
@@ -477,7 +469,7 @@ pub enum ActorRegisterInvocation {
         label: Option<String>,
     },
     Etcd {
-        client: ManagedEtcdClient,
+        client: Client,
     },
 }
 
