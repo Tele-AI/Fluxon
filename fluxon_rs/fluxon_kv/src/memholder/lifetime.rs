@@ -115,6 +115,15 @@ impl MemholderDropAck for OwnerDeleteAckCtx {
             self.on_view_dropped();
             return;
         };
+        let node_id = v.cluster_manager().get_self_info().id;
+        v.client_kv_api()
+            .inner()
+            .owner_delete_ack_mgr
+            .track(OwnerDeleteAckItem {
+                key: self.key.clone(),
+                client_id: node_id,
+                holder_id: self.holder_id,
+            });
         if !<Self as MemholderDropAck>::is_running(&v) {
             self.on_skip_shutdown();
             return;
@@ -601,7 +610,7 @@ impl Default for MasterOwnerMemMgr {
 }
 
 pub struct OwnerDeleteAckMemMgr {
-    inner: MemholderManagerInner<NodeHolderKey, ()>,
+    inner: MemholderManagerInner<NodeHolderKey, OwnerDeleteAckItem>,
 }
 
 impl Default for OwnerDeleteAckMemMgr {
@@ -612,10 +621,36 @@ impl Default for OwnerDeleteAckMemMgr {
     }
 }
 
+impl OwnerDeleteAckMemMgr {
+    pub(crate) fn track(&self, item: OwnerDeleteAckItem) {
+        self.inner.as_map().insert(
+            NodeHolderKey::new(item.client_id.clone(), item.holder_id),
+            item,
+        );
+    }
+
+    pub(crate) fn pending_items(&self) -> Vec<OwnerDeleteAckItem> {
+        self.inner
+            .as_map()
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    pub(crate) async fn send_shutdown_batch(
+        &self,
+        ctx: &ClientKvApiView,
+        tasks: Vec<OwnerDeleteAckItem>,
+    ) -> Result<(), String> {
+        <Self as MemholderManagerTrait>::send_delete_tasks(self, ctx, OwnerDeleteAckTarget, tasks)
+            .await
+    }
+}
+
 #[async_trait]
 impl MemholderManagerTrait for OwnerDeleteAckMemMgr {
     type Key = NodeHolderKey;
-    type Value = ();
+    type Value = OwnerDeleteAckItem;
     type DeleteCtx = ClientKvApiView;
     type DeleteTask = OwnerDeleteAckItem;
     type DeleteTarget = OwnerDeleteAckTarget;
@@ -666,6 +701,11 @@ impl MemholderManagerTrait for OwnerDeleteAckMemMgr {
             return Ok(());
         }
 
+        let completed_keys = delete_acks
+            .iter()
+            .map(|item| NodeHolderKey::new(item.client_id.clone(), item.holder_id))
+            .collect::<Vec<_>>();
+
         let master_node_id = ctx
             .cluster_manager()
             .find_or_wait_master_node()
@@ -695,6 +735,10 @@ impl MemholderManagerTrait for OwnerDeleteAckMemMgr {
                 "code={} error={}",
                 resp.serialize_part.error_code, resp.serialize_part.error_json
             ));
+        }
+
+        for key in completed_keys {
+            self.inner.as_map().remove(&key);
         }
 
         Ok(())

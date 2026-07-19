@@ -63,11 +63,7 @@ impl ClientKvApiInner {
         &self,
         key: &str,
     ) -> KvResult<Option<(Arc<UserMemHolder>, Option<RemoteGetInfo>)>> {
-        if !self.view.register_shutdown_poller().is_running() {
-            return Err(KvError::Api(ApiError::SystemShutdown {
-                detail: "ClientKvApi is shutting down; rejecting get".to_string(),
-            }));
-        }
+        let _operation = self.begin_operation("get")?;
         let metrics = self.metrics_handle();
         let client_id = self.client_id_str();
         let node_role = self.node_role();

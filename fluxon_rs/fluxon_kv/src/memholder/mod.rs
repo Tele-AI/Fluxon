@@ -17,6 +17,7 @@ pub mod kvclient_encode;
 #[cfg(any(test, feature = "test_bins"))]
 pub mod memholder_test;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::client_kv_api::ClientKvApiView;
@@ -25,7 +26,6 @@ use crate::{cluster_manager::NodeID, external_client_api::ExternalClientApiView}
 use bitcode::{Decode, Encode};
 
 /// Memory metadata for owner/client user holders
-#[derive(Clone)]
 pub struct MemoryInfo {
     pub offset: u64,
     /// Computed absolute address (base + offset) at creation
@@ -35,6 +35,7 @@ pub struct MemoryInfo {
     pub key: String,
     pub master_node_id: NodeID,
     pub view: ClientKvApiView,
+    delete_ack_claimed: AtomicBool,
 }
 
 impl std::fmt::Debug for MemoryInfo {
@@ -159,8 +160,16 @@ impl MemoryInfo {
             key,
             master_node_id,
             view,
+            delete_ack_claimed: AtomicBool::new(false),
         }
     }
+
+    pub(crate) fn try_claim_delete_ack(&self) -> bool {
+        self.delete_ack_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     pub fn bytes(&self) -> &[u8] {
         tracing::debug!(
             "MemHolder accessing memory: addr={:#x}, len={}",
@@ -173,6 +182,9 @@ impl MemoryInfo {
 /// Represents a memory holder that keeps a reference to transferred data
 impl Drop for MemoryInfo {
     fn drop(&mut self) {
+        if !self.try_claim_delete_ack() {
+            return;
+        }
         let ctx = OwnerDeleteAckCtx {
             view: self.view.clone(),
             key: self.key.clone(),

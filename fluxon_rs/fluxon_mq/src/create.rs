@@ -9,10 +9,90 @@ use fluxon_util::lease_manager::{
 };
 
 use crate::error::MpscError;
+use crate::etcd_retry::is_transient_etcd_error;
 use crate::keys;
-use crate::manager::{get_chan_meta_with_version, ChanGlobalMeta, ChanManager};
+use crate::manager::{
+    get_chan_meta_with_version, ChanGlobalMeta, ChanManager, ChanMetaWithVersion,
+    MpscError as ManagerMpscError,
+};
+use crate::shutdown::ShutdownCtl;
 
 const MPMC_SUBCHANNEL_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+const MPMC_SUBCHANNEL_METADATA_ATTEMPTS: usize = 3;
+const MPMC_SUBCHANNEL_METADATA_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+async fn load_mpmc_subchannel_metadata(
+    client: &mut etcd::Client,
+    chan_id: i64,
+    shutdown: &ShutdownCtl,
+) -> anyhow::Result<ChanMetaWithVersion> {
+    for attempt in 1..=MPMC_SUBCHANNEL_METADATA_ATTEMPTS {
+        let attempt_started = std::time::Instant::now();
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.wait_closed() => {
+                anyhow::bail!(
+                    "get_chan_meta stopped by shutdown for chan_id={} attempt={}",
+                    chan_id,
+                    attempt
+                );
+            }
+            result = tokio::time::timeout(
+                MPMC_SUBCHANNEL_METADATA_TIMEOUT,
+                get_chan_meta_with_version(client, chan_id),
+            ) => result,
+        };
+
+        let retry_reason = match result {
+            Ok(Ok(meta)) => return Ok(meta),
+            Ok(Err(ManagerMpscError::Etcd(error))) if is_transient_etcd_error(&error) => {
+                format!("transient etcd error: {error}")
+            }
+            Ok(Err(error)) => {
+                return Err(anyhow::anyhow!(
+                    "get_chan_meta failed for chan_id={}: {}",
+                    chan_id,
+                    error
+                ));
+            }
+            Err(_) => format!(
+                "timed out after {} ms",
+                MPMC_SUBCHANNEL_METADATA_TIMEOUT.as_millis()
+            ),
+        };
+
+        if attempt == MPMC_SUBCHANNEL_METADATA_ATTEMPTS {
+            anyhow::bail!(
+                "get_chan_meta failed after {} attempts for chan_id={}: {}",
+                attempt,
+                chan_id,
+                retry_reason
+            );
+        }
+
+        tracing::warn!(
+            chan_id,
+            attempt,
+            max_attempts = MPMC_SUBCHANNEL_METADATA_ATTEMPTS,
+            elapsed_ms = attempt_started.elapsed().as_millis(),
+            reason = %retry_reason,
+            "Retrying MPMC subchannel metadata read"
+        );
+        tokio::select! {
+            biased;
+            _ = shutdown.wait_closed() => {
+                anyhow::bail!(
+                    "get_chan_meta retry stopped by shutdown for chan_id={} attempt={}",
+                    chan_id,
+                    attempt
+                );
+            }
+            _ = tokio::time::sleep(MPMC_SUBCHANNEL_METADATA_RETRY_DELAY) => {}
+        }
+    }
+
+    unreachable!("bounded metadata retry loop must return")
+}
 
 pub struct ChanCreateConfig {
     pub capacity: i64,
@@ -325,6 +405,7 @@ impl ChanManager {
         override_member_lease_id: i64,
         override_payload_lease_id: i64,
         rt_handle: tokio::runtime::Handle,
+        shutdown: ShutdownCtl,
     ) -> anyhow::Result<Self> {
         let etcd_backend_uid = LeaseBackendUid::etcd_from(etcd_endpoints.clone());
         let client = registered_etcd_client(&etcd_backend_uid).map_err(|e| {
@@ -334,19 +415,8 @@ impl ChanManager {
             )
         })?;
         let mut meta_client = client.clone();
-        let meta_with_ver = tokio::time::timeout(
-            MPMC_SUBCHANNEL_METADATA_TIMEOUT,
-            get_chan_meta_with_version(&mut meta_client, chan_id),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "get_chan_meta timed out after {} ms for chan_id={}",
-                MPMC_SUBCHANNEL_METADATA_TIMEOUT.as_millis(),
-                chan_id
-            )
-        })?
-        .map_err(|e| anyhow::anyhow!("get_chan_meta failed for chan_id={}: {}", chan_id, e))?;
+        let meta_with_ver =
+            load_mpmc_subchannel_metadata(&mut meta_client, chan_id, &shutdown).await?;
         let meta = meta_with_ver.meta;
 
         if meta.global_lease_id != override_global_lease_id {

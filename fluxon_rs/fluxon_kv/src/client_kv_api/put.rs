@@ -1,6 +1,6 @@
 use super::ClientKvApiInner;
-use crate::cluster_manager::NodeIDString;
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
+use crate::cluster_manager::NodeIDString;
 use crate::master_kv_router::put::PutIDForAKey;
 // no StageScope; timestamps-based metrics only
 use crate::memholder::kvclient_encode::{calc_flat_dict_encoded_len, write_flat_dict_ptrs_to_ptr};
@@ -47,6 +47,7 @@ impl ClientKvApiInner {
     where
         F: FnOnce(u64),
     {
+        let _operation = self.begin_operation("put")?;
         let client_id = self.client_id_str();
         let node_role = self.node_role();
         let metrics = self.metrics_handle();

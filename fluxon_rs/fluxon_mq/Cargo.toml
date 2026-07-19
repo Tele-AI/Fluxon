@@ -18,6 +18,7 @@ paste = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 etcd-client = { workspace = true }
+tonic = { workspace = true }
 fluxon_util = { path = "../fluxon_util" }
 fluxon_observability = { path = "../fluxon_observability" }
 fluxon_commu = { package = "fluxon_commu", path = "../fluxon_commu", default-features = false }

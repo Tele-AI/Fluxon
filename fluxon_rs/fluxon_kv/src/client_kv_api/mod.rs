@@ -7,12 +7,12 @@ use crate::client_kv_api::msg_pack::{
     SsdReplicaPersistReq, SsdReplicaPersistResp, SsdStageReadReq, SsdStageReadResp,
     SyncKvToFileReq, SyncKvToFileResp, TestPutPhaseTrace,
 };
-use crate::cluster_manager::NodeIDString;
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
+use crate::cluster_manager::NodeIDString;
 use crate::config::TestSpecConfig;
 use crate::kv_ssd_storage::{
-    DEFAULT_READ_TRANSFER_PIPELINE_CHUNK_BYTES, DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT,
     KvSsdPersistGuard, KvSsdStorage, KvSsdStorageInit, SsdLoadedChunk,
+    DEFAULT_READ_TRANSFER_PIPELINE_CHUNK_BYTES, DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT,
 };
 use crate::master_kv_router::msg_pack::{
     BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchSsdReplicaEvictReq,
@@ -42,20 +42,79 @@ use crate::{
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
-use fluxon_framework::{LogicalModule, define_module};
+use fluxon_framework::{define_module, LogicalModule};
 use fluxon_util::map_lock::AMapLock;
+use fluxon_util::notify_state;
 use futures::stream::{FuturesUnordered, StreamExt};
 use limit_thirdparty::tokio;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Weak;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 const SSD_EVICTION_BATCH_MAX_ITEMS: usize = 256;
 const SSD_EVICTION_BATCH_MAX_DELAY: Duration = Duration::from_millis(10);
 const SSD_EVICTION_BATCH_RETRY_DELAY: Duration = Duration::from_millis(100);
+const OWNER_DELETE_ACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct ClientKvApiLifecycle {
+    accepting_operations: AtomicBool,
+    active_operations: AtomicUsize,
+    quiesced: tokio::sync::Notify,
+}
+
+impl ClientKvApiLifecycle {
+    fn new() -> Self {
+        Self {
+            accepting_operations: AtomicBool::new(true),
+            active_operations: AtomicUsize::new(0),
+            quiesced: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn try_enter(&self) -> bool {
+        if !self.accepting_operations.load(Ordering::Acquire) {
+            return false;
+        }
+
+        self.active_operations.fetch_add(1, Ordering::AcqRel);
+        if self.accepting_operations.load(Ordering::Acquire) {
+            true
+        } else {
+            self.leave();
+            false
+        }
+    }
+
+    fn leave(&self) {
+        let previous = self.active_operations.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous > 0, "ClientKvApi active operation count underflow");
+        if previous == 1 {
+            self.quiesced.notify_waiters();
+        }
+    }
+
+    async fn stop_admission_and_wait(&self) {
+        self.accepting_operations.store(false, Ordering::Release);
+        notify_state::wait_until(&self.quiesced, || {
+            self.active_operations.load(Ordering::Acquire) == 0
+        })
+        .await;
+    }
+}
+
+pub(crate) struct ClientKvApiOperationGuard<'a> {
+    lifecycle: &'a ClientKvApiLifecycle,
+}
+
+impl Drop for ClientKvApiOperationGuard<'_> {
+    fn drop(&mut self) {
+        self.lifecycle.leave();
+    }
+}
 
 /// Information about a memholder held by external client
 #[derive(Clone)]
@@ -958,6 +1017,7 @@ fn spawn_ssd_replica_eviction_batch(
 
 pub struct ClientKvApiInner {
     view: ClientKvApiViewHolder,
+    lifecycle: ClientKvApiLifecycle,
     test_spec_config: TestSpecConfig,
     ssd_storage: Option<Arc<KvSsdStorage>>,
     metrics: OnceLock<Arc<MetricsHandle>>,
@@ -1017,6 +1077,21 @@ pub struct ClientKvApiInner {
 }
 
 impl ClientKvApiInner {
+    pub(crate) fn begin_operation(
+        &self,
+        operation: &'static str,
+    ) -> KvResult<ClientKvApiOperationGuard<'_>> {
+        if !self.view.register_shutdown_poller().is_running() || !self.lifecycle.try_enter() {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: format!("ClientKvApi is shutting down; rejecting {operation}"),
+            }));
+        }
+
+        Ok(ClientKvApiOperationGuard {
+            lifecycle: &self.lifecycle,
+        })
+    }
+
     fn should_replace_cached_info(
         current: &GetCachedInfo,
         put_time_ms: u64,
@@ -1535,6 +1610,84 @@ impl ClientKvApiInner {
     pub fn get_cache_len(&self) -> usize {
         self.get_cached_info.len()
     }
+
+    async fn release_cached_holders_for_shutdown(&self) -> KvResult<usize> {
+        let mut memory_infos = Vec::new();
+        {
+            for entry in self.get_cached_info.iter() {
+                if let CachedValue::LocalReplica(memory_info) = &entry.value().value {
+                    memory_infos.push(memory_info.clone());
+                }
+            }
+        }
+        {
+            for entry in self.external_get_holding.inner().iter() {
+                memory_infos.push(entry.value().memory_info.clone());
+            }
+        }
+
+        let client_id = self.view.cluster_manager().get_self_info().id;
+        let mut claimed = Vec::new();
+        for memory_info in memory_infos {
+            if memory_info.try_claim_delete_ack() {
+                let item = OwnerDeleteAckItem {
+                    key: memory_info.key.clone(),
+                    client_id: client_id.clone(),
+                    holder_id: memory_info.holder_id,
+                };
+                self.owner_delete_ack_mgr.track(item);
+                claimed.push(memory_info);
+            }
+        }
+
+        let released = claimed.len();
+        self.external_get_holding.inner().clear();
+        self.get_cached_info.clear();
+        drop(claimed);
+
+        let deadline = Instant::now() + OWNER_DELETE_ACK_SHUTDOWN_TIMEOUT;
+        loop {
+            let pending_delete_acks = self.owner_delete_ack_mgr.pending_items();
+            if pending_delete_acks.is_empty() {
+                break;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "timed out after {} ms draining owner delete-acks during shutdown",
+                        OWNER_DELETE_ACK_SHUTDOWN_TIMEOUT.as_millis()
+                    ),
+                }));
+            }
+            let send_result = tokio::time::timeout(
+                remaining,
+                self.owner_delete_ack_mgr
+                    .send_shutdown_batch(&self.view, pending_delete_acks),
+            )
+            .await;
+            match send_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!("failed to drain owner delete-acks during shutdown: {err}"),
+                    }));
+                }
+                Err(_) => {
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "timed out after {} ms draining owner delete-acks during shutdown",
+                            OWNER_DELETE_ACK_SHUTDOWN_TIMEOUT.as_millis()
+                        ),
+                    }));
+                }
+            }
+        }
+
+        Ok(released)
+    }
+
     fn metrics_handle(&self) -> Arc<MetricsHandle> {
         self.metrics
             .get()
@@ -1988,6 +2141,7 @@ impl ClientKvApi {
 
         let inner = ClientKvApiInner {
             view: ClientKvApiViewHolder::new(),
+            lifecycle: ClientKvApiLifecycle::new(),
             test_spec_config: arg.test_spec_config,
             ssd_storage,
             metrics: OnceLock::new(),
@@ -2451,9 +2605,10 @@ impl LogicalModule for ClientKvApi {
         ClientKvApi::attach_view(self, view);
     }
 
-    async fn before_shutdown(&self) -> Result<(), Self::Error> {
-        // High cohesion: handle KV client drop readiness here
-        tracing::info!("ClientKvApi before_shutdown: waiting until safe to drop");
+    async fn prepare_shutdown(&self) -> Result<(), Self::Error> {
+        tracing::info!("ClientKvApi prepare_shutdown: stopping operation admission");
+        self.inner().lifecycle.stop_admission_and_wait().await;
+        tracing::info!("ClientKvApi prepare_shutdown: waiting until safe to drop");
         loop {
             if self.can_be_dropped() {
                 tracing::info!("ClientKvApi can be dropped");
@@ -2464,6 +2619,12 @@ impl LogicalModule for ClientKvApi {
             );
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
+
+        let released = self.inner().release_cached_holders_for_shutdown().await?;
+        tracing::info!(
+            released,
+            "ClientKvApi prepare_shutdown: cached memholders released and acknowledged"
+        );
         Ok(())
     }
     async fn shutdown(&self) -> Result<(), Self::Error> {
@@ -2481,5 +2642,36 @@ impl ClientKvApiInner {
     #[cfg(any(test, feature = "test_bins"))]
     pub fn get_view(&self) -> &ClientKvApiView {
         &self.view
+    }
+}
+
+#[cfg(test)]
+mod shutdown_lifecycle_tests {
+    use super::ClientKvApiLifecycle;
+    use limit_thirdparty::tokio;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn stop_admission_waits_for_active_operations_and_is_repeatable() {
+        let lifecycle = ClientKvApiLifecycle::new();
+        assert!(lifecycle.try_enter());
+
+        let waiter = lifecycle.stop_admission_and_wait();
+        tokio::pin!(waiter);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), waiter.as_mut())
+                .await
+                .is_err()
+        );
+
+        lifecycle.leave();
+        tokio::time::timeout(Duration::from_secs(1), waiter.as_mut())
+            .await
+            .expect("quiescence waiter timed out");
+        assert!(!lifecycle.try_enter());
+
+        tokio::time::timeout(Duration::from_secs(1), lifecycle.stop_admission_and_wait())
+            .await
+            .expect("repeated shutdown wait timed out");
     }
 }
