@@ -1,6 +1,6 @@
 use limit_thirdparty::tokio;
 use limit_thirdparty::tokio::time::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::kvcore_test_lib::{start_master_and_client, stop_master_and_client, wait_master_ready};
 
@@ -17,6 +17,8 @@ async fn grant_short_lease_for_test(master_fw: &crate::Framework, ttl_seconds: u
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test1_lease_expire_removes_keys() {
+    const LEASE_TTL_SECONDS: u64 = 3;
+
     let _test_guard = crate::kvcore_test_lib::integration_test_lock().await;
     // 控制日志级别：生产日志由 run_master/run_client 落盘，测试仅需设置环境变量
     unsafe {
@@ -27,8 +29,9 @@ async fn test1_lease_expire_removes_keys() {
     let client_view = client_fw.client_kv_api_view();
     wait_master_ready(&client_view).await;
 
-    // Allocate a lease with a short TTL so we can observe expiry quickly.
-    let lease_id = grant_short_lease_for_test(master_fw.as_ref(), 3).await;
+    // Record the grant completion time so expiry is checked one second past TTL.
+    let lease_id = grant_short_lease_for_test(master_fw.as_ref(), LEASE_TTL_SECONDS).await;
+    let lease_granted_at = Instant::now();
 
     let keys: Vec<String> = (0..10).map(|i| format!("t1_key_{}", i)).collect();
     let value = vec![7u8; 128];
@@ -45,24 +48,25 @@ async fn test1_lease_expire_removes_keys() {
         keys.len()
     );
 
-    // Within TTL, keys should exist
+    // Verify the setup invariant once while the lease has ample remaining time.
     tracing::info!("[test1-verify-present-during-ttl] verifying keys exist within TTL window");
-    for _ in 0..3 {
-        for k in &keys {
-            assert!(
-                client_view
-                    .client_kv_api()
-                    .inner()
-                    .is_exist(k)
-                    .await
-                    .unwrap()
-            );
-        }
-        sleep(Duration::from_millis(500)).await;
+    for k in &keys {
+        assert!(
+            client_view
+                .client_kv_api()
+                .inner()
+                .is_exist(k)
+                .await
+                .unwrap(),
+            "key should exist before lease expiry: {}",
+            k
+        );
     }
 
-    // After TTL+grace, keys should be removed by lease expiry (expected behavior)
-    sleep(Duration::from_secs(10)).await;
+    // Check once at TTL+1s. Cleanup taking longer than this remains a failure.
+    let expiry_check_at =
+        lease_granted_at + Duration::from_secs(LEASE_TTL_SECONDS + 1);
+    sleep(expiry_check_at.saturating_duration_since(Instant::now())).await;
     for k in &keys {
         let exist = client_view
             .client_kv_api()
@@ -70,7 +74,11 @@ async fn test1_lease_expire_removes_keys() {
             .is_exist(k)
             .await
             .unwrap();
-        assert!(!exist, "key should be removed after lease expire: {}", k);
+        assert!(
+            !exist,
+            "key still exists one second after lease expiry: lease_id={}, key={}",
+            lease_id, k
+        );
     }
     tracing::info!("[test1-verify-missing-after-ttl] verified keys removed after TTL expiration");
 
