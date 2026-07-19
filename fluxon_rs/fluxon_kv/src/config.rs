@@ -2214,8 +2214,12 @@ fluxonkv_spec:
         assert_eq!(
             dirs,
             vec![
-                first_root.join("test_cluster_cluster_kv_ssd_storage/owner_a_b"),
-                second_root.join("test_cluster_cluster_kv_ssd_storage/owner_a_b"),
+                first_root.join(
+                    "test_cluster_cluster_kv_ssd_storage/v1-a2c1effab8d74aa90b8f7b43f9afa10f4c9f5899dd880fc176d33cc06cf7200a"
+                ),
+                second_root.join(
+                    "test_cluster_cluster_kv_ssd_storage/v1-a2c1effab8d74aa90b8f7b43f9afa10f4c9f5899dd880fc176d33cc06cf7200a"
+                ),
             ]
         );
         assert!(dirs.iter().all(|dir| dir.exists()));

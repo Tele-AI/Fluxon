@@ -28,6 +28,7 @@ The reviewer routes change signals to relevant rules instead of mechanically app
 | Multiple participants share `closed`, an event, a lease, or cleanup state | R1 responsibility and ownership, R3 state authority |
 | New adapter, backend replacement, or parent wrapping a child | R1 responsibility and ownership, R4 composable contracts, R5 minimal-side-effect fix |
 | Close races with an in-flight operation, or an outer lock spans an inner blocking call | R2 dependency lifecycle, R3 state authority |
+| Source, configuration, docs, logs, screenshots, fixtures, or generated artifacts touch authentication material or real environment identifiers | R6 sensitive information and environment sanitization |
 | A purely local algorithm change does not alter boundaries, resources, or lifecycle | Do not force a complete lifecycle model; review local correctness and tests |
 
 ## 3. Executable rules
@@ -87,6 +88,17 @@ The reviewer routes change signals to relevant rules instead of mechanically app
 | Side-effect boundary | Do not rewrite unrelated modules or expand migration under “architecture unification.” If a public contract must change, describe migration and impact separately instead of hiding it in an internal fix. |
 | Evidence | A pre-fix counterexample, post-fix invariant tests, affected-caller regression, and review showing that the diff adds no bypass. |
 
+### R6: Repositories and published artifacts do not expose sensitive information or private environment identifiers
+
+| Field | Rule |
+| --- | --- |
+| Trigger | A change includes source, configuration, examples, docs, CI, logs, stack traces, screenshots, recordings, test fixtures, reports, or other generated artifacts that may carry data from a real personal environment or development, test, or production cluster, or may contain authentication material. |
+| Required action | Identify and remove passwords, tokens, API keys, access keys, private keys, cookies, sessions, credential-bearing connection strings, and other authentication secrets. Sanitize real IP addresses, domains, hostnames, user names, node names, cluster IDs, port mappings, storage paths, and cluster topology unless publication is explicitly approved. Documentation and examples use reserved placeholders such as `example.com`, `example-node-a`, and the RFC 5737 ranges `192.0.2.0/24`, `198.51.100.0/24`, and `203.0.113.0/24`. Runtime secrets use the project's existing canonical secret or configuration mechanism. Logs, screenshots, and generated artifacts are sanitized before tracking or upload. |
+| Acceptance criteria | The tracked diff, binary assets, and pending publication artifacts contain no valid or plausibly valid authentication secret and no unapproved real private-environment identifier. Errors and logs omit or mask sensitive values, and placeholders remain internally consistent within an example. If a valid secret entered a commit or published artifact, revoke or rotate it first and handle history and caches through the project's security process before approval. |
+| Expected benefit | Prevent credential misuse and disclosure of private networks or cluster topology while keeping docs, tests, and diagnostic artifacts safe to share. |
+| Side-effect boundary | Preserve diagnostic field names, error classes, and causal structure; use stable, correlatable fake values instead of erasing useful context. Explicitly approved public endpoints may remain. Do not create a parallel configuration channel for sanitization, and do not replace real values with values that merely look fictitious while remaining routable or authenticatable. |
+| Evidence | Manually inspect the complete diff and every image or generated artifact, run the repository-approved secret scanner, and perform targeted checks for IPs, hostnames, paths, and log output. When redaction logic changes, add tests proving the raw sensitive value cannot reach output. |
+
 ## 4. Review output and merge criteria
 
 A finding cites the rule and includes the trigger, violated acceptance criterion, impact, and side-effect boundary:
@@ -106,6 +118,8 @@ Side-effect boundary: do not add a second public close API or let the outer laye
 | `[major]` | A critical scenario lacks a constraint or evidence; implement or verify before merge. |
 | `[minor]` | A local maintainability or diagnostic issue does not affect acceptance criteria and may be explicitly deferred. |
 | `[question]` | Trigger, authority, or contract is unclear; classify after clarification. |
+
+R6 uses stricter severity: valid or plausibly valid credentials or private keys, and real IPs, hostnames, or cluster topology without publication approval, are always `[blocking]`. If permission to publish an environment identifier is unclear, label it `[question]` and do not approve until resolved.
 
 - **Request changes**: an unresolved `[blocking]` or `[major]` remains, or the applicable rule's owner, dependency, or acceptance criteria cannot be determined.
 - **Approve**: required actions for all matched rules are complete, evidence satisfies acceptance criteria, expected benefits hold, and side effects stay inside the declared boundary.

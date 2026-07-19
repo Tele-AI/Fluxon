@@ -5,7 +5,7 @@ use crate::client_kv_api::msg_pack::{
     ExternalPutTransferEndResp, TestPutPhaseTrace,
 };
 use crate::client_kv_api::{ClientKvApi, ExternalHoldingGetInfo, ExternalPendingPutCtx};
-use crate::client_seg_pool::{parse_side_transfer_worker_lane_idx, ResolveSideTransferLaneReq};
+use crate::client_seg_pool::{ResolveSideTransferLaneReq, parse_side_transfer_worker_lane_idx};
 use crate::cluster_manager::NodeIDString;
 use crate::cluster_manager::{
     META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME,
@@ -15,9 +15,9 @@ use crate::memholder::ExternalMemHolderInfo;
 use crate::memholder::MemholderManagerTrait;
 use crate::memholder::NodeHolderKey;
 use crate::p2p::msg_pack::MsgPack;
-use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, OK};
 use crate::rpcresp_kvresult_convert::FromError;
 use crate::rpcresp_kvresult_convert::ToResult;
+use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, OK};
 use async_trait::async_trait;
 use std::time::Duration;
 use std::time::Instant;
@@ -337,7 +337,7 @@ impl HandlerForExternalClient for ClientKvApi {
             return Err(Self::side_transfer_unsupported("external_get"));
         }
         let inner = self.inner();
-        let _operation = inner.begin_operation("external_get")?;
+        let _shutdown_guard = inner.shutdown_guard("external_get")?;
 
         self.validate_requester_owner_status_updated(req.started_time)?;
 

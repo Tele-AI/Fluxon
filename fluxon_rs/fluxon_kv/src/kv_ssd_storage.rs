@@ -4,12 +4,14 @@ use crate::master_kv_router::msg_pack::SsdReplicaEviction;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult};
 use ::tokio::{
-    sync::{Notify, mpsc as tokio_mpsc, oneshot},
+    sync::{Mutex as TokioMutex, Notify, mpsc as tokio_mpsc, oneshot, watch},
     task,
 };
+use fluxon_framework_compiled::shutdown::{ShutdownGate, ShutdownGuard};
 use futures::stream::{FuturesUnordered, StreamExt};
 use io_uring::{IoUring, opcode, types::Fd};
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -56,8 +58,11 @@ pub struct KvSsdStorage {
     next_write_device: AtomicUsize,
     inner: Arc<Mutex<KvSsdStorageInner>>,
     space_notify: Arc<Notify>,
+    shutdown_gate: ShutdownGate,
+    shutdown_tx: watch::Sender<bool>,
+    worker_close_state: TokioMutex<SsdWorkerCloseState>,
     eviction_rx: Mutex<Option<tokio_mpsc::Receiver<Vec<SsdReplicaEviction>>>>,
-    _eviction_tx_guard: Option<tokio_mpsc::Sender<Vec<SsdReplicaEviction>>>,
+    eviction_tx_guard: Mutex<Option<tokio_mpsc::Sender<Vec<SsdReplicaEviction>>>>,
     foyer: Option<FoyerKvSsdStorage>,
 }
 
@@ -67,10 +72,23 @@ struct SsdDeviceWorker {
     root_dir: PathBuf,
     shard_ids: Vec<usize>,
     max_shard_capacity: u64,
-    _files: Vec<std::fs::File>,
-    _io: Arc<UringIoEngine>,
+    runtime: Mutex<Option<SsdDeviceRuntime>>,
+}
+
+#[derive(Debug)]
+struct SsdDeviceRuntime {
+    io: Arc<UringIoEngine>,
     write_tx: tokio_mpsc::Sender<WriteCommand>,
     read_tx: tokio_mpsc::Sender<ReadCommand>,
+    writer_handle: task::JoinHandle<()>,
+    reader_handle: task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+enum SsdWorkerCloseState {
+    Open,
+    Closing(task::JoinHandle<Result<(), String>>),
+    Closed(Result<(), String>),
 }
 
 #[derive(Clone, Debug)]
@@ -518,19 +536,7 @@ enum SsdReadPath {
 }
 
 pub fn safe_path_component(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len().max(1));
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "unnamed".to_string()
-    } else {
-        out
-    }
+    format!("v1-{}", hex::encode(Sha256::digest(raw.as_bytes())))
 }
 
 impl KvSsdStorage {
@@ -572,6 +578,7 @@ impl KvSsdStorage {
             let foyer = FoyerKvSsdStorage::new(root_limit).await?;
             let root_dirs = vec![foyer.root_dir().to_path_buf()];
             let (eviction_tx, eviction_rx) = tokio_mpsc::channel(DEFAULT_EVICTION_QUEUE_DEPTH);
+            let (shutdown_tx, _) = watch::channel(false);
             return Ok(Self {
                 root_dirs,
                 devices: Vec::new(),
@@ -581,8 +588,11 @@ impl KvSsdStorage {
                     ring: SsdRingBuffer::new(vec![dummy_capacity]),
                 })),
                 space_notify: Arc::new(Notify::new()),
+                shutdown_gate: ShutdownGate::new(),
+                shutdown_tx,
+                worker_close_state: TokioMutex::new(SsdWorkerCloseState::Open),
                 eviction_rx: Mutex::new(Some(eviction_rx)),
-                _eviction_tx_guard: Some(eviction_tx),
+                eviction_tx_guard: Mutex::new(Some(eviction_tx)),
                 foyer: Some(foyer),
             });
         }
@@ -604,6 +614,7 @@ impl KvSsdStorage {
         }));
         let space_notify = Arc::new(Notify::new());
         let (eviction_tx, eviction_rx) = tokio_mpsc::channel(DEFAULT_EVICTION_QUEUE_DEPTH);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let shard_count = shard_specs.len();
         let mut shard_to_device = vec![0usize; shard_count];
         let mut device_shards = device_roots
@@ -641,12 +652,8 @@ impl KvSsdStorage {
                         ),
                     })
                 })?;
-            let fds = shard_files
-                .iter()
-                .map(|(shard_id, file)| (*shard_id, file.as_raw_fd()))
-                .collect::<Vec<_>>();
             let io = Arc::new(UringIoEngine::new_multi(
-                fds,
+                shard_files,
                 UringConfig {
                     threads: DEFAULT_URING_THREADS,
                     io_depth: DEFAULT_URING_IO_DEPTH,
@@ -656,7 +663,7 @@ impl KvSsdStorage {
             let (write_tx, write_rx) = tokio_mpsc::channel(DEFAULT_WRITE_QUEUE_DEPTH);
             let (read_tx, read_rx) = tokio_mpsc::channel(DEFAULT_READ_QUEUE_DEPTH);
 
-            task::spawn(ssd_writer_loop(
+            let writer_handle = task::spawn(ssd_writer_loop(
                 Arc::clone(&inner),
                 write_rx,
                 Arc::clone(&io),
@@ -664,8 +671,9 @@ impl KvSsdStorage {
                 DEFAULT_WRITE_INFLIGHT,
                 shard_ids.clone(),
                 eviction_tx.clone(),
+                shutdown_rx.clone(),
             ));
-            task::spawn(ssd_reader_loop(
+            let reader_handle = task::spawn(ssd_reader_loop(
                 Arc::clone(&inner),
                 read_rx,
                 Arc::clone(&io),
@@ -677,13 +685,13 @@ impl KvSsdStorage {
                 root_dir: device_root.root_dir,
                 shard_ids,
                 max_shard_capacity,
-                _files: shard_files
-                    .into_iter()
-                    .map(|(_, file)| file)
-                    .collect::<Vec<_>>(),
-                _io: io,
-                write_tx,
-                read_tx,
+                runtime: Mutex::new(Some(SsdDeviceRuntime {
+                    io,
+                    write_tx,
+                    read_tx,
+                    writer_handle,
+                    reader_handle,
+                })),
             });
         }
 
@@ -694,8 +702,11 @@ impl KvSsdStorage {
             next_write_device: AtomicUsize::new(0),
             inner,
             space_notify,
+            shutdown_gate: ShutdownGate::new(),
+            shutdown_tx,
+            worker_close_state: TokioMutex::new(SsdWorkerCloseState::Open),
             eviction_rx: Mutex::new(Some(eviction_rx)),
-            _eviction_tx_guard: None,
+            eviction_tx_guard: Mutex::new(None),
             foyer: None,
         })
     }
@@ -747,6 +758,55 @@ impl KvSsdStorage {
         self.eviction_rx.lock().take()
     }
 
+    fn shutdown_guard(&self, operation: &'static str) -> KvResult<ShutdownGuard> {
+        self.shutdown_gate.try_guard().ok_or_else(|| {
+            KvError::Api(ApiError::SystemShutdown {
+                detail: format!("KvSsdStorage is closed; rejecting {operation}"),
+            })
+        })
+    }
+
+    pub(crate) fn stop_admission(&self) {
+        self.shutdown_gate.stop_admission();
+        self.shutdown_tx.send_replace(true);
+    }
+
+    pub async fn close(&self) -> KvResult<()> {
+        self.stop_admission();
+        self.shutdown_gate.wait_for_quiescence().await;
+        let worker_result = {
+            let mut state = self.worker_close_state.lock().await;
+            if matches!(*state, SsdWorkerCloseState::Open) {
+                let runtimes = self
+                    .devices
+                    .iter()
+                    .filter_map(|device| device.runtime.lock().take())
+                    .collect::<Vec<_>>();
+                self.space_notify.notify_waiters();
+                *state =
+                    SsdWorkerCloseState::Closing(task::spawn(close_ssd_device_runtimes(runtimes)));
+            }
+
+            let result = match &mut *state {
+                SsdWorkerCloseState::Closing(handle) => match handle.await {
+                    Ok(result) => result,
+                    Err(err) => Err(format!("kv ssd worker shutdown task failed: {err}")),
+                },
+                SsdWorkerCloseState::Closed(result) => result.clone(),
+                SsdWorkerCloseState::Open => unreachable!("SSD close task must be installed"),
+            };
+            *state = SsdWorkerCloseState::Closed(result.clone());
+            result
+        };
+
+        if let Some(foyer) = self.foyer.as_ref() {
+            foyer.close().await?;
+        }
+        self.eviction_tx_guard.lock().take();
+
+        worker_result.map_err(|detail| KvError::Api(ApiError::Unknown { detail }))
+    }
+
     fn next_write_tx(&self, entry_len: u64) -> KvResult<tokio_mpsc::Sender<WriteCommand>> {
         if self.devices.is_empty() {
             return Err(KvError::Api(ApiError::InvalidArgument {
@@ -775,7 +835,16 @@ impl KvSsdStorage {
                 .compare_exchange_weak(start_idx, next_idx, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
-                return Ok(self.devices[device_idx].write_tx.clone());
+                return self.devices[device_idx]
+                    .runtime
+                    .lock()
+                    .as_ref()
+                    .map(|runtime| runtime.write_tx.clone())
+                    .ok_or_else(|| {
+                        KvError::Api(ApiError::SystemShutdown {
+                            detail: "kv ssd write worker is closed".to_string(),
+                        })
+                    });
             }
         }
     }
@@ -805,7 +874,16 @@ impl KvSsdStorage {
                 ),
             }));
         }
-        Ok(device.read_tx.clone())
+        device
+            .runtime
+            .lock()
+            .as_ref()
+            .map(|runtime| runtime.read_tx.clone())
+            .ok_or_else(|| {
+                KvError::Api(ApiError::SystemShutdown {
+                    detail: "kv ssd read worker is closed".to_string(),
+                })
+            })
     }
 
     pub(crate) async fn persist_from_addr(
@@ -815,6 +893,7 @@ impl KvSsdStorage {
         addr: u64,
         len: u64,
     ) -> KvResult<KvSsdPersistGuard> {
+        let _shutdown_guard = self.shutdown_guard("persist_from_addr")?;
         validate_key(key)?;
         if let Some(foyer) = self.foyer.as_ref() {
             return foyer
@@ -836,6 +915,7 @@ impl KvSsdStorage {
     }
 
     pub async fn persist(&self, key: &str, put_id: PutIDForAKey, data: &[u8]) -> KvResult<()> {
+        let _shutdown_guard = self.shutdown_guard("persist")?;
         validate_key(key)?;
         if let Some(foyer) = self.foyer.as_ref() {
             let guard = foyer.persist(key, put_id, data).await?;
@@ -894,6 +974,7 @@ impl KvSsdStorage {
         len: u64,
         target_len: u64,
     ) -> KvResult<()> {
+        let _shutdown_guard = self.shutdown_guard("load_into_addr")?;
         validate_key(key)?;
         if let Some(foyer) = self.foyer.as_ref() {
             return foyer
@@ -985,6 +1066,7 @@ impl KvSsdStorage {
         max_read_inflight: usize,
         ready_tx: tokio_mpsc::Sender<SsdLoadedChunk>,
     ) -> KvResult<()> {
+        let _shutdown_guard = self.shutdown_guard("load_into_addr_chunks")?;
         validate_key(key)?;
         if let Some(foyer) = self.foyer.as_ref() {
             return foyer
@@ -1197,6 +1279,39 @@ impl KvSsdStorage {
     }
 }
 
+async fn close_ssd_device_runtimes(runtimes: Vec<SsdDeviceRuntime>) -> Result<(), String> {
+    let mut joins = FuturesUnordered::new();
+    let mut io_engines = Vec::with_capacity(runtimes.len());
+    for runtime in runtimes {
+        let SsdDeviceRuntime {
+            io,
+            write_tx,
+            read_tx,
+            writer_handle,
+            reader_handle,
+        } = runtime;
+        drop(write_tx);
+        drop(read_tx);
+        joins.push(writer_handle);
+        joins.push(reader_handle);
+        io_engines.push(io);
+    }
+
+    let mut worker_error = None;
+    while let Some(result) = joins.next().await {
+        if let Err(err) = result {
+            worker_error.get_or_insert_with(|| err.to_string());
+        }
+    }
+
+    task::spawn_blocking(move || drop(io_engines))
+        .await
+        .map_err(|err| format!("kv ssd io_uring shutdown task failed: {err}"))?;
+    worker_error.map_or(Ok(()), |detail| {
+        Err(format!("kv ssd worker failed during shutdown: {detail}"))
+    })
+}
+
 fn prepare_ssd_write(
     inner: &Arc<Mutex<KvSsdStorageInner>>,
     space_notify: &Arc<Notify>,
@@ -1232,6 +1347,7 @@ async fn ssd_writer_loop(
     write_inflight: usize,
     shard_ids: Vec<usize>,
     eviction_tx: tokio_mpsc::Sender<Vec<SsdReplicaEviction>>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut pending: VecDeque<WriteCommand> = VecDeque::new();
     let mut inflight = FuturesUnordered::new();
@@ -1246,7 +1362,7 @@ async fn ssd_writer_loop(
                 prepare_ssd_write(&inner, &space_notify, &cmd.key, cmd.entry_len, &shard_ids);
             match prepared {
                 Ok(SsdPreparedWrite::Ready { entry, evicted }) => {
-                    publish_ssd_evictions(&eviction_tx, evicted);
+                    publish_ssd_evictions(&eviction_tx, &mut shutdown_rx, evicted).await;
                     inflight.push(execute_write(
                         WriteTask {
                             key: cmd.key,
@@ -1302,7 +1418,7 @@ async fn ssd_writer_loop(
                 prepare_ssd_write(&inner, &space_notify, &cmd.key, cmd.entry_len, &shard_ids);
             match prepared {
                 Ok(SsdPreparedWrite::Ready { entry, evicted }) => {
-                    publish_ssd_evictions(&eviction_tx, evicted);
+                    publish_ssd_evictions(&eviction_tx, &mut shutdown_rx, evicted).await;
                     inflight.push(execute_write(
                         WriteTask {
                             key: cmd.key,
@@ -1339,8 +1455,9 @@ async fn ssd_writer_loop(
     }
 }
 
-fn publish_ssd_evictions(
+async fn publish_ssd_evictions(
     eviction_tx: &tokio_mpsc::Sender<Vec<SsdReplicaEviction>>,
+    shutdown_rx: &mut watch::Receiver<bool>,
     evicted: Vec<KvSsdKey>,
 ) {
     if evicted.is_empty() {
@@ -1353,10 +1470,23 @@ fn publish_ssd_evictions(
             put_id: key.put_id,
         })
         .collect();
-    if let Err(err) = eviction_tx.try_send(replicas) {
-        tracing::warn!(
-            "Dropping SSD eviction notification because its queue is unavailable: {err}"
-        );
+    if *shutdown_rx.borrow() {
+        tracing::debug!("Skipping SSD eviction publication during storage shutdown");
+        return;
+    }
+    tokio::select! {
+        result = eviction_tx.send(replicas) => {
+            if let Err(err) = result {
+                tracing::warn!("SSD eviction receiver is closed; notification cannot be delivered: {err}");
+            }
+        }
+        changed = shutdown_rx.changed() => {
+            if changed.is_err() || !*shutdown_rx.borrow() {
+                tracing::warn!("SSD eviction shutdown signal closed unexpectedly");
+            } else {
+                tracing::debug!("Cancelled SSD eviction publication during storage shutdown");
+            }
+        }
     }
 }
 
@@ -1869,6 +1999,7 @@ fn next_submission_token(next_token: &mut u64, submitted: &HashMap<u64, IoCtx>) 
 
 #[derive(Debug)]
 struct UringIoEngine {
+    _files: Vec<std::fs::File>,
     fds: HashMap<usize, RawFd>,
     read_txs: Vec<crossbeam::channel::Sender<IoCtx>>,
     write_txs: Vec<crossbeam::channel::Sender<IoCtx>>,
@@ -1877,20 +2008,27 @@ struct UringIoEngine {
 }
 
 impl UringIoEngine {
-    fn new_multi(shard_fds: Vec<(usize, RawFd)>, cfg: UringConfig) -> io::Result<Self> {
+    fn new_multi(shard_files: Vec<(usize, std::fs::File)>, cfg: UringConfig) -> io::Result<Self> {
         if cfg.threads == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "threads must be > 0",
             ));
         }
-        if shard_fds.is_empty() {
+        if shard_files.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "at least one fd is required",
             ));
         }
-        let fds = shard_fds.into_iter().collect::<HashMap<_, _>>();
+        let fds = shard_files
+            .iter()
+            .map(|(shard_id, file)| (*shard_id, file.as_raw_fd()))
+            .collect::<HashMap<_, _>>();
+        let files = shard_files
+            .into_iter()
+            .map(|(_, file)| file)
+            .collect::<Vec<_>>();
         let mut read_txs = Vec::with_capacity(cfg.threads);
         let mut write_txs = Vec::with_capacity(cfg.threads);
         let mut handles = Vec::with_capacity(cfg.threads);
@@ -1915,6 +2053,7 @@ impl UringIoEngine {
             handles.push(handle);
         }
         Ok(Self {
+            _files: files,
             fds,
             read_txs,
             write_txs,
@@ -2436,6 +2575,122 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[::tokio::test]
+    async fn close_is_repeatable_joins_workers_and_rejects_new_operations() {
+        let store = new_store(4 * SSD_ALIGNMENT as u64).await;
+        store
+            .persist("before-close", (1, 0), &[7u8; 500])
+            .await
+            .unwrap();
+
+        ::tokio::time::timeout(Duration::from_secs(5), store.close())
+            .await
+            .expect("SSD close must complete")
+            .unwrap();
+        assert!(
+            store
+                .devices
+                .iter()
+                .all(|device| device.runtime.lock().is_none())
+        );
+        assert!(matches!(
+            &*store.worker_close_state.lock().await,
+            SsdWorkerCloseState::Closed(Ok(()))
+        ));
+
+        store.close().await.unwrap();
+        let err = store
+            .persist("after-close", (2, 0), &[8u8; 500])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KvError::Api(ApiError::SystemShutdown { .. })));
+    }
+
+    #[::tokio::test]
+    async fn close_resumes_worker_join_after_waiting_caller_is_cancelled() {
+        let store = Arc::new(new_store(4 * SSD_ALIGNMENT as u64).await);
+        let write_tx = store.devices[0]
+            .runtime
+            .lock()
+            .as_ref()
+            .expect("test store must have an open writer")
+            .write_tx
+            .clone();
+
+        let store_for_close = Arc::clone(&store);
+        let close_task = task::spawn(async move { store_for_close.close().await });
+        ::tokio::time::timeout(Duration::from_secs(1), async {
+            while store.devices[0].runtime.lock().is_some() {
+                task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close must install its background worker join");
+        assert!(!close_task.is_finished());
+
+        close_task.abort();
+        assert!(close_task.await.unwrap_err().is_cancelled());
+        drop(write_tx);
+
+        ::tokio::time::timeout(Duration::from_secs(5), store.close())
+            .await
+            .expect("a later close must resume the installed worker join")
+            .unwrap();
+        assert!(matches!(
+            &*store.worker_close_state.lock().await,
+            SsdWorkerCloseState::Closed(Ok(()))
+        ));
+    }
+
+    #[::tokio::test]
+    async fn eviction_publication_backpressures_instead_of_dropping_when_full() {
+        let (tx, mut rx) = tokio_mpsc::channel(1);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        tx.send(vec![SsdReplicaEviction {
+            key: "first".to_string(),
+            put_id: (1, 0),
+        }])
+        .await
+        .unwrap();
+
+        let publish = publish_ssd_evictions(&tx, &mut shutdown_rx, vec![test_key("second", 2)]);
+        tokio::pin!(publish);
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(10), publish.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(rx.recv().await.unwrap()[0].key, "first");
+        ::tokio::time::timeout(Duration::from_secs(1), publish)
+            .await
+            .expect("eviction publish must resume when capacity is available");
+        assert_eq!(rx.recv().await.unwrap()[0].key, "second");
+    }
+
+    #[::tokio::test]
+    async fn eviction_publication_unblocks_when_storage_shutdown_starts() {
+        let (tx, _rx) = tokio_mpsc::channel(1);
+        tx.send(vec![SsdReplicaEviction {
+            key: "first".to_string(),
+            put_id: (1, 0),
+        }])
+        .await
+        .unwrap();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let publish = publish_ssd_evictions(&tx, &mut shutdown_rx, vec![test_key("second", 2)]);
+        tokio::pin!(publish);
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(10), publish.as_mut())
+                .await
+                .is_err()
+        );
+        shutdown_tx.send_replace(true);
+        ::tokio::time::timeout(Duration::from_secs(1), publish)
+            .await
+            .expect("shutdown must unblock eviction publication");
     }
 
     #[::tokio::test]
@@ -3690,7 +3945,20 @@ mod tests {
     }
 
     #[test]
-    fn safe_component_replaces_path_separators() {
-        assert_eq!(safe_path_component("owner/a:b"), "owner_a_b");
+    fn safe_component_is_stable_collision_resistant_and_has_no_dot_segments() {
+        assert_eq!(
+            safe_path_component("owner/a:b"),
+            "v1-a2c1effab8d74aa90b8f7b43f9afa10f4c9f5899dd880fc176d33cc06cf7200a"
+        );
+        assert_ne!(
+            safe_path_component("owner/a:b"),
+            safe_path_component("owner_a_b")
+        );
+        for raw in ["", ".", "..", "owner/name"] {
+            let component = safe_path_component(raw);
+            assert_eq!(component.len(), 67);
+            assert!(!matches!(component.as_str(), "." | ".."));
+            assert!(!component.contains('/'));
+        }
     }
 }

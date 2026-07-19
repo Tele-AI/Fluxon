@@ -23,6 +23,7 @@ import json
 import os
 import random
 import re
+import stat
 import statistics
 import sys
 import threading
@@ -39,7 +40,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-DEFAULT_MANIFEST = "/mayukuo/flow-lite/runs/dualpointer/cached_metadata/parquets_list.txt"
+DEFAULT_MANIFEST = ""
 
 TIMEOUT_RE = re.compile(
     r"Timeout loading data at index (?P<idx>\d+):.*?"
@@ -236,6 +237,12 @@ class FluxonBenchmarkRuntime:
         from fluxon_py.kvclient import new_store
 
         kv_cfg = load_yaml_mapping(args.fluxon_kv_config, "fluxon kv config")
+        request_password = None
+        if args.fluxon_request_username:
+            request_password = load_secret_file(
+                args.fluxon_request_password_file,
+                "fluxon request password file",
+            )
         suffix = f"{os.getpid()}_{int(time.time() * 1000)}"
         client_key = args.fluxon_client_instance_key or f"dataloader_perf_client_{suffix}"
         agent_node_id = resolve_fluxon_agent_node_id(args)
@@ -271,7 +278,8 @@ class FluxonBenchmarkRuntime:
         patcher.set_cache_config_yaml(cache_yaml)
         patcher.wait_cache_config_loaded()
         if args.fluxon_request_username:
-            patcher.set_request_identity(args.fluxon_request_username, args.fluxon_request_password)
+            assert request_password is not None
+            patcher.set_request_identity(args.fluxon_request_username, request_password)
         video_reader_pool = patcher.open_video_reader_pool(
             max_readers=int(args.fluxon_reader_cache_size),
         )
@@ -918,6 +926,31 @@ def require_abs_existing_dir(path: str, name: str) -> Path:
     return resolved
 
 
+def load_secret_file(path: str, name: str) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        detail = os.strerror(exc.errno) if exc.errno is not None else type(exc).__name__
+        raise ValueError(f"failed to open {name}: {detail}") from None
+
+    with os.fdopen(fd, "r", encoding="utf-8") as secret_file:
+        file_stat = os.fstat(secret_file.fileno())
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError(f"{name} must be a regular file")
+        if file_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            raise ValueError(f"{name} must not grant group or world permissions")
+        value = secret_file.read()
+
+    if value.endswith("\r\n"):
+        value = value[:-2]
+    elif value.endswith("\n"):
+        value = value[:-1]
+    if not value or "\n" in value or "\r" in value:
+        raise ValueError(f"{name} must contain exactly one non-empty line")
+    return value
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if args.rounds <= 0:
         raise ValueError("--rounds must be positive")
@@ -940,9 +973,9 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--fluxon-kv-config is required for the Fluxon backend")
         if not args.fluxon_remote_root:
             raise ValueError("--fluxon-remote-root is required for the Fluxon backend")
-        if bool(args.fluxon_request_username) != bool(args.fluxon_request_password):
+        if bool(args.fluxon_request_username) != bool(args.fluxon_request_password_file):
             raise ValueError(
-                "--fluxon-request-username and --fluxon-request-password must be provided together"
+                "--fluxon-request-username and --fluxon-request-password-file must be provided together"
             )
 
 
@@ -1003,9 +1036,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="FluxonFS username used to sign file RPC tokens.",
     )
     fluxon_group.add_argument(
-        "--fluxon-request-password",
+        "--fluxon-request-password-file",
         default="",
-        help="FluxonFS password used to sign file RPC tokens.",
+        help="Owner-only regular file containing the FluxonFS request password.",
     )
 
     output_group = parser.add_argument_group("output")
@@ -1116,8 +1149,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 def sanitized_args(args: argparse.Namespace) -> dict[str, Any]:
     out = dict(vars(args))
-    if out.get("fluxon_request_password"):
-        out["fluxon_request_password"] = "<redacted>"
+    if out.get("fluxon_request_password_file"):
+        out["fluxon_request_password_file"] = "<redacted>"
     return out
 
 

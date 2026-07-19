@@ -11,12 +11,15 @@ use self::{
     delete::handle_delete,
     delete::handle_delete_ack,
     delete::{handle_batch_delete_ack, handle_batch_ssd_replica_evict},
-    get::{handle_get_done, handle_get_meta, handle_get_revoke, handle_get_start},
+    get::{
+        handle_get_done, handle_get_meta, handle_get_revoke, handle_get_start,
+        handle_ssd_stage_begin, handle_ssd_stage_end,
+    },
     msg_pack::{
         BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchSsdReplicaEvictReq,
         CountPrefixReq, CountPrefixResp, DeleteAckReq, DeleteReq, GetAllocationMode, GetDoneReq,
         GetMetaReq, GetRevokeReq, GetSourceKind, GetStartReq, PutDoneReq, PutRevokeReq,
-        PutStartReq, SsdReplicaCommitReq,
+        PutStartReq, SsdReplicaCommitReq, SsdStageBeginReq, SsdStageEndReq,
     },
     placement::{PlacementDefault, PlacementPolicy},
     put::{handle_put_done, handle_put_revoke, handle_put_start, handle_ssd_replica_commit},
@@ -35,12 +38,15 @@ use crate::master_seg_manager::MasterSegManager;
 use crate::master_seg_manager::MasterSegManagerAccessTrait;
 use crate::master_seg_manager::NodeTombTag;
 use crate::master_seg_manager::one_seg_allocator::Allocation;
-use crate::memholder::{EnsureMemholderMgmtDeleteHandle, MasterOwnerMemMgr, MemholderManagerTrait};
+use crate::memholder::{
+    EnsureMemholderMgmtDeleteHandle, MasterOwnerMemMgr, MemholderManagerTrait, NodeHolderKey,
+};
 use crate::metric_reporter::{MetricReporter, MetricReporterAccessTrait};
 use crate::p2p::msg_pack::{MsgPack, RPCCaller, RPCHandler};
 use crate::p2p::p2p_module::{P2pModule, P2pModuleAccessTrait};
 use crate::rpcresp_kvresult_convert::msg_and_error::{KvError, OK};
 use fluxon_framework::{LogicalModule, define_module};
+use fluxon_util::map_lock::AMapLock;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -64,6 +70,7 @@ const MAX_GET_DURABLE_REPLICA_SLOTS: u32 = 2;
 const PLACEMENT_REPORT_INTERVAL_SECS: u64 = 10;
 const INFLIGHT_PUT_TTL_SECONDS: u64 = 60;
 const INFLIGHT_PUT_TTL_SECONDS_SKIP_PUT_END_COMMIT: u64 = 5;
+const GET_COMPLETION_REPLAY_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Copy, Debug)]
 pub enum PutPlacementMode {
@@ -123,7 +130,104 @@ pub struct InflightGetInfo {
     pub route: Arc<OneKvNodesRoutes>,
     pub allocation_mode: GetAllocationMode,
     pub source_kind: GetSourceKind,
+    pub(crate) ssd_stage_lifecycle: Option<Arc<Mutex<SsdStageLifecycle>>>,
     pub(crate) cache_capacity_reservation: Option<Arc<NodeCacheCapacityReservation>>,
+}
+
+#[derive(Default)]
+struct InflightGetMemberIndex {
+    by_member: DashMap<NodeIDString, HashSet<u64>>,
+}
+
+impl InflightGetMemberIndex {
+    fn insert(&self, member_id: &str, get_id: u64) {
+        self.by_member
+            .entry(member_id.to_string())
+            .or_default()
+            .insert(get_id);
+    }
+
+    fn remove(&self, member_id: &str, get_id: u64) {
+        let Entry::Occupied(mut entry) = self.by_member.entry(member_id.to_string()) else {
+            return;
+        };
+        entry.get_mut().remove(&get_id);
+        if entry.get().is_empty() {
+            entry.remove();
+        }
+    }
+
+    fn take(&self, member_id: &str) -> HashSet<u64> {
+        self.by_member
+            .remove(member_id)
+            .map(|(_, get_ids)| get_ids)
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SsdStagePhase {
+    NotStarted,
+    Active,
+    Quiescent,
+}
+
+#[derive(Debug)]
+pub(crate) struct SsdStageLifecycle {
+    pub(crate) phase: SsdStagePhase,
+    pub(crate) revoke_requested: bool,
+    pub(crate) drop_ssd_source: bool,
+}
+
+impl SsdStageLifecycle {
+    pub(crate) fn new() -> Self {
+        Self {
+            phase: SsdStagePhase::NotStarted,
+            revoke_requested: false,
+            drop_ssd_source: false,
+        }
+    }
+
+    pub(crate) fn begin(&mut self) -> bool {
+        match self.phase {
+            SsdStagePhase::NotStarted => {
+                self.phase = SsdStagePhase::Active;
+                true
+            }
+            SsdStagePhase::Active => true,
+            SsdStagePhase::Quiescent => false,
+        }
+    }
+
+    pub(crate) fn request_revoke(&mut self, drop_ssd_source: bool) -> bool {
+        if self.phase != SsdStagePhase::Active {
+            return false;
+        }
+        self.revoke_requested = true;
+        self.drop_ssd_source |= drop_ssd_source;
+        true
+    }
+
+    pub(crate) fn mark_quiescent(&mut self) -> Option<(bool, bool)> {
+        if self.phase == SsdStagePhase::NotStarted {
+            return None;
+        }
+        self.phase = SsdStagePhase::Quiescent;
+        Some((self.revoke_requested, self.drop_ssd_source))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CompletedGetInfo {
+    pub(crate) requester_node_id: NodeID,
+    pub(crate) holder_key: NodeHolderKey,
+    pub(crate) response: msg_pack::GetDoneResp,
+}
+
+impl CompletedGetInfo {
+    pub(crate) fn replay_for(&self, requester_node_id: &NodeID) -> Option<msg_pack::GetDoneResp> {
+        (&self.requester_node_id == requester_node_id).then(|| self.response.clone())
+    }
 }
 
 impl InflightGetInfo {
@@ -463,6 +567,62 @@ mod tests {
     }
 
     #[test]
+    fn remote_ssd_stage_defers_revoke_until_quiescent() {
+        let mut lifecycle = SsdStageLifecycle::new();
+        assert!(!lifecycle.request_revoke(true));
+        assert!(lifecycle.begin());
+        assert!(lifecycle.begin());
+        assert!(lifecycle.request_revoke(false));
+        assert!(lifecycle.request_revoke(true));
+        assert_eq!(lifecycle.mark_quiescent(), Some((true, true)));
+        assert_eq!(lifecycle.mark_quiescent(), Some((true, true)));
+        assert!(!lifecycle.begin());
+    }
+
+    #[test]
+    fn completed_get_replays_the_same_holder_for_duplicate_done() {
+        let requester: NodeID = "requester-a".to_string().into();
+        let holder_key = NodeHolderKey::new(requester.to_string(), 73);
+        let completed = CompletedGetInfo {
+            requester_node_id: requester.clone(),
+            holder_key,
+            response: msg_pack::GetDoneResp {
+                holder_id: 73,
+                allocation_mode: GetAllocationMode::Temporary,
+                error_code: OK,
+                error_json: String::new(),
+                server_process_us: 0,
+            },
+        };
+        let cache = moka::sync::Cache::builder()
+            .time_to_live(GET_COMPLETION_REPLAY_TTL)
+            .build();
+        cache.insert(9, completed);
+
+        let first = cache.get(&9).unwrap().replay_for(&requester).unwrap();
+        let second = cache.get(&9).unwrap().replay_for(&requester).unwrap();
+        assert_eq!(first.holder_id, 73);
+        assert_eq!(second.holder_id, first.holder_id);
+        let other: NodeID = "requester-b".to_string().into();
+        assert!(cache.get(&9).unwrap().replay_for(&other).is_none());
+    }
+
+    #[test]
+    fn inflight_get_member_index_takes_only_the_left_member() {
+        let index = InflightGetMemberIndex::default();
+        index.insert("requester-a", 7);
+        index.insert("source-b", 7);
+        index.insert("requester-a", 9);
+        index.insert("source-c", 11);
+        index.remove("source-c", 11);
+
+        assert_eq!(index.take("requester-a"), HashSet::from([7_u64, 9_u64]));
+        assert!(index.take("requester-a").is_empty());
+        assert_eq!(index.take("source-b"), HashSet::from([7_u64]));
+        assert!(index.take("source-c").is_empty());
+    }
+
+    #[test]
     fn one_kv_nodes_routes_updates_memory_and_ssd_independently() {
         let routes = OneKvNodesRoutes::new((1, 0), None);
         let node_id: NodeID = "node-a".to_string().into();
@@ -592,7 +752,11 @@ pub struct MasterKvRouterInner {
     pub inflight_puts: moka::future::Cache<(String, u64, u32), InflightPutInfo>,
     /// key -> inflight put admission state
     pub(crate) inflight_put_key_counts: Arc<DashMap<String, InflightPutKeyAdmission>>,
-    pub inflight_gets: moka::future::Cache<u64, InflightGetInfo>,
+    inflight_gets: DashMap<u64, InflightGetInfo>,
+    /// Requester and remote SSD source member -> their active GET ids.
+    inflight_gets_by_member: InflightGetMemberIndex,
+    pub(crate) get_transition_locks: AMapLock<u64>,
+    pub(crate) completed_gets: moka::sync::Cache<u64, CompletedGetInfo>,
 
     /// Cache for holding get operations (owned, flattened by (node_id, holder_id))
     pub get_holding: MasterOwnerMemMgr,
@@ -644,6 +808,40 @@ pub(crate) struct InflightPutKeyAdmission {
 impl MasterKvRouterInner {
     fn view(&self) -> &MasterKvRouterView {
         self.view.get().unwrap()
+    }
+
+    pub(crate) fn insert_inflight_get(&self, get_id: u64, info: InflightGetInfo) {
+        let Entry::Vacant(entry) = self.inflight_gets.entry(get_id) else {
+            panic!("duplicate inflight get_id={get_id}");
+        };
+        self.inflight_gets_by_member
+            .insert(info.req_node_id.as_ref(), get_id);
+        if info.ssd_stage_lifecycle.is_some() {
+            self.inflight_gets_by_member
+                .insert(info.src_node_id.as_ref(), get_id);
+        }
+        entry.insert(info);
+    }
+
+    pub(crate) fn get_inflight_get(&self, get_id: u64) -> Option<InflightGetInfo> {
+        self.inflight_gets
+            .get(&get_id)
+            .map(|inflight| inflight.value().clone())
+    }
+
+    pub(crate) fn remove_inflight_get(&self, get_id: u64) -> Option<InflightGetInfo> {
+        let (_, info) = self.inflight_gets.remove(&get_id)?;
+        self.inflight_gets_by_member
+            .remove(info.req_node_id.as_ref(), get_id);
+        if info.ssd_stage_lifecycle.is_some() {
+            self.inflight_gets_by_member
+                .remove(info.src_node_id.as_ref(), get_id);
+        }
+        Some(info)
+    }
+
+    fn take_member_inflight_get_ids(&self, member_id: &str) -> HashSet<u64> {
+        self.inflight_gets_by_member.take(member_id)
     }
 }
 
@@ -738,14 +936,10 @@ impl MasterKvRouter {
                 }
             })
             .build();
-        let inflight_gets = moka::future::Cache::builder()
-            .time_to_live(Duration::from_secs(60))
-            .eviction_listener(|_get_id, inflight_info: InflightGetInfo, cause| {
-                if cause == RemovalCause::Expired {
-                    inflight_info.release_durable_slot_if_needed();
-                }
-            })
-            .build();
+        // In-flight GET allocations contain raw transfer addresses. They must only be
+        // released by GetDone/GetRevoke or member-left cleanup after all users are quiescent;
+        // a wall-clock TTL cannot prove that a remote DMA or SSD stage has stopped.
+        let inflight_gets = DashMap::new();
         let inner = MasterKvRouterInner {
             view: std::sync::OnceLock::new(),
             policy: policy_impl,
@@ -753,8 +947,14 @@ impl MasterKvRouter {
             inflight_puts,
             inflight_put_key_counts,
             inflight_gets,
+            inflight_gets_by_member: InflightGetMemberIndex::default(),
+            get_transition_locks: AMapLock::new(GET_COMPLETION_REPLAY_TTL),
+            completed_gets: moka::sync::Cache::builder()
+                .time_to_live(GET_COMPLETION_REPLAY_TTL)
+                .build(),
             get_holding: MasterOwnerMemMgr::default(),
-            next_get_id: AtomicU64::new(0),
+            // Zero is reserved by GetStart failure paths and response-send cleanup.
+            next_get_id: AtomicU64::new(1),
             next_holder_id: AtomicU64::new(0),
             kv_routes: DashMap::new(),
             prefix_index: ARwLock::new(PrefixRadixTree::new()),
@@ -916,14 +1116,26 @@ impl MasterKvRouter {
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send GetStartResp: {:?}", e);
                     if get_id != 0 {
-                        if let Some(inflight_info) = cleanup_view
+                        let transition_lock = cleanup_view
                             .master_kv_router()
                             .inner()
-                            .inflight_gets
-                            .remove(&get_id)
-                            .await
-                        {
-                            inflight_info.release_durable_slot_if_needed();
+                            .get_transition_locks
+                            .get_lock(get_id);
+                        let _transition = transition_lock.lock().await;
+                        let defer_release = cleanup_view
+                            .master_kv_router()
+                            .inner()
+                            .get_inflight_get(get_id)
+                            .and_then(|inflight| inflight.ssd_stage_lifecycle.clone())
+                            .is_some_and(|lifecycle| lifecycle.lock().request_revoke(false));
+                        if !defer_release {
+                            if let Some(inflight_info) = cleanup_view
+                                .master_kv_router()
+                                .inner()
+                                .remove_inflight_get(get_id)
+                            {
+                                inflight_info.release_durable_slot_if_needed();
+                            }
                         }
                     }
                 }
@@ -936,8 +1148,9 @@ impl MasterKvRouter {
             let view = view.clone();
             let view2 = view.clone();
             let view_task = view2.clone();
+            let requester_node_id = resp.node_id();
             let _ = view.spawn("rpc_get_revoke", async move {
-                let ack = handle_get_revoke(view_task, msg).await;
+                let ack = handle_get_revoke(view_task, msg, requester_node_id).await;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send GetRevokeResp: {:?}", e);
                 }
@@ -950,12 +1163,41 @@ impl MasterKvRouter {
             let view = view.clone();
             let view2 = view.clone();
             let view_task = view2.clone();
+            let requester_node_id = resp.node_id();
             let _ = view.spawn("rpc_get_done", async move {
                 let t0 = Utc::now().timestamp_micros();
-                let mut ack = handle_get_done(view_task, msg).await;
+                let mut ack = handle_get_done(view_task, msg, requester_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send GetDoneResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<SsdStageBeginReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view_task = view.clone();
+            let source_node_id = resp.node_id();
+            let _ = view.spawn("rpc_ssd_stage_begin", async move {
+                let ack = handle_ssd_stage_begin(view_task, msg, source_node_id).await;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send SsdStageBeginResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<SsdStageEndReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view_task = view.clone();
+            let source_node_id = resp.node_id();
+            let _ = view.spawn("rpc_ssd_stage_end", async move {
+                let ack = handle_ssd_stage_end(view_task, msg, source_node_id).await;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send SsdStageEndResp: {:?}", e);
                 }
             });
             Ok(())
@@ -1536,6 +1778,47 @@ impl MasterKvRouter {
                         if removed > 0 {
                             info!("Cleaned up {} holdings for left member {}", removed, node_id);
                         }
+
+                        let left_node: NodeID = node_id.clone().into();
+                        let inflight_ids = view
+                            .master_kv_router()
+                            .inner()
+                            .take_member_inflight_get_ids(node_id);
+                        for get_id in inflight_ids {
+                            let transition_lock = view
+                                .master_kv_router()
+                                .inner()
+                                .get_transition_locks
+                                .get_lock(get_id);
+                            let _transition = transition_lock.lock().await;
+                            let Some(inflight) = view
+                                .master_kv_router()
+                                .inner()
+                                .get_inflight_get(get_id)
+                            else {
+                                continue;
+                            };
+                            let source_left = inflight.src_node_id == left_node;
+                            let defer_remote_stage = !source_left
+                                && inflight.ssd_stage_lifecycle.as_ref().is_some_and(|lifecycle| {
+                                    lifecycle.lock().request_revoke(false)
+                                });
+                            if defer_remote_stage {
+                                info!(
+                                    get_id,
+                                    member = %node_id,
+                                    "Deferred member-left GET cleanup until SSD source quiesces"
+                                );
+                                continue;
+                            }
+                            if let Some(inflight) = view
+                                .master_kv_router()
+                                .inner()
+                                .remove_inflight_get(get_id)
+                            {
+                                inflight.release_durable_slot_if_needed();
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1919,6 +2202,7 @@ mod cache_capacity_reservation_tests {
             route,
             allocation_mode: GetAllocationMode::DurableReplica,
             source_kind: GetSourceKind::Memory,
+            ssd_stage_lifecycle: None,
             cache_capacity_reservation: Some(reservation),
         };
 

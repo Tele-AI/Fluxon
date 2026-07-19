@@ -140,10 +140,22 @@ class TestDataloaderPerfContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "start fluxon_py.runtime.start_fs_agent"):
             DL.resolve_fluxon_agent_node_id(args)
 
-    def test_sanitized_args_redacts_fluxon_password(self) -> None:
+    def test_cli_has_no_inline_fluxon_password_argument(self) -> None:
+        parser = DL.build_arg_parser()
+        option_strings = {
+            option
+            for action in parser._actions
+            for option in action.option_strings
+        }
+
+        self.assertNotIn("--fluxon-request-password", option_strings)
+        self.assertIn("--fluxon-request-password-file", option_strings)
+        self.assertEqual(parser.get_default("manifest"), "")
+
+    def test_sanitized_args_redacts_fluxon_password_file_path(self) -> None:
         args = DL.argparse.Namespace(
             fluxon_request_username="bench",
-            fluxon_request_password="secret",
+            fluxon_request_password_file="/run/secrets/fluxonfs-password",
             other="value",
         )
 
@@ -151,10 +163,57 @@ class TestDataloaderPerfContract(unittest.TestCase):
             DL.sanitized_args(args),
             {
                 "fluxon_request_username": "bench",
-                "fluxon_request_password": "<redacted>",
+                "fluxon_request_password_file": "<redacted>",
                 "other": "value",
             },
         )
+
+    def test_load_secret_file_requires_private_single_line_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            secret_path = Path(tmp_s) / "password"
+            secret_path.write_text("secret\n", encoding="utf-8")
+            secret_path.chmod(0o600)
+
+            self.assertEqual(
+                DL.load_secret_file(str(secret_path), "test password file"),
+                "secret",
+            )
+
+            secret_path.chmod(0o640)
+            with self.assertRaisesRegex(ValueError, "group or world"):
+                DL.load_secret_file(str(secret_path), "test password file")
+
+            secret_path.chmod(0o600)
+            secret_path.write_text("first\nsecond\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                DL.load_secret_file(str(secret_path), "test password file")
+
+            symlink_path = Path(tmp_s) / "password-link"
+            symlink_path.symlink_to(secret_path)
+            with self.assertRaisesRegex(ValueError, "failed to open"):
+                DL.load_secret_file(str(symlink_path), "test password file")
+
+            missing_path = Path(tmp_s) / "private-password-location"
+            with self.assertRaises(ValueError) as raised:
+                DL.load_secret_file(str(missing_path), "test password file")
+            self.assertNotIn(str(missing_path), str(raised.exception))
+
+    def test_validate_args_pairs_username_with_password_file(self) -> None:
+        args = DL.build_arg_parser().parse_args(
+            [
+                "--backend",
+                "fluxon",
+                "--fluxon-kv-config",
+                "/tmp/client.yaml",
+                "--fluxon-remote-root",
+                "/tmp/video-root",
+                "--fluxon-request-username",
+                "bench",
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "password-file"):
+            DL.validate_args(args)
 
     def test_run_jobs_uses_decode_batch_windows(self) -> None:
         class BatchBackend:

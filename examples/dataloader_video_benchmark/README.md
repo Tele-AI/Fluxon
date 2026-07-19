@@ -70,10 +70,15 @@ python3 examples/dataloader_video_benchmark/benchmark.py \
   --fluxon-agent-instance-key fs-agent-1 \
   --fluxon-reader-cache-size 32 \
   --fluxon-request-username bench \
-  --fluxon-request-password bench \
+  --fluxon-request-password-file /run/secrets/fluxonfs-password \
   --output-csv /tmp/fluxon.csv \
   --output-json /tmp/fluxon.summary.json
 ```
+
+The password file must be a regular file containing one non-empty line and
+must not grant group or world permissions (for example, mode `0600`). The
+benchmark deliberately has no inline password argument, so the credential is
+not exposed through the process command line.
 
 `--decode-batch-size` controls the benchmark's sample-batch window. The Fluxon
 backend passes that window to `FluxonFsVideoReaderPool.read_many_numpy_with_stats`.

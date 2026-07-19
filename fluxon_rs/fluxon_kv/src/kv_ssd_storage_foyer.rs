@@ -133,6 +133,13 @@ impl FoyerKvSsdStorage {
             .min(self.capacity_bytes)
     }
 
+    pub(crate) async fn close(&self) -> KvResult<()> {
+        self.cache
+            .close()
+            .await
+            .map_err(|err| foyer_error("close", err))
+    }
+
     #[cfg(test)]
     pub(crate) fn contains(&self, key: &str, put_id: PutIDForAKey) -> bool {
         self.cache.contains(&FoyerKvSsdKey {

@@ -1,4 +1,3 @@
-use crate::master_kv_router::msg_pack::GetAllocationMode;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::p2p::msg_pack::{MsgPackSerializePart, RPCReq};
 use crate::rpcresp_kvresult_convert::msg_and_error::ErrorCode;
@@ -115,11 +114,6 @@ impl RPCReq for SsdStageReadReq {
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct SsdStageReadResp {
-    pub done_holder_id: u64,
-    pub done_allocation_mode: GetAllocationMode,
-    pub done_error_code: ErrorCode,
-    pub done_error_json: String,
-    pub done_server_process_us: i64,
     pub error_code: ErrorCode,
     pub error_json: String,
 }

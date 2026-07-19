@@ -63,7 +63,7 @@ impl ClientKvApiInner {
         &self,
         key: &str,
     ) -> KvResult<Option<(Arc<UserMemHolder>, Option<RemoteGetInfo>)>> {
-        let _operation = self.begin_operation("get")?;
+        let _shutdown_guard = self.shutdown_guard("get")?;
         let metrics = self.metrics_handle();
         let client_id = self.client_id_str();
         let node_role = self.node_role();
@@ -185,7 +185,6 @@ impl ClientKvApiInner {
                 );
             }
 
-            let mut ssd_done_resp = None;
             if resp.source_kind == GetSourceKind::Ssd {
                 let ssd_stage_len = resp.ssd_stage_len;
                 if ssd_stage_len < data_len as u64 {
@@ -213,7 +212,7 @@ impl ClientKvApiInner {
                     }
                     return Err(err);
                 }
-                let done_resp = match self
+                match self
                     .stage_kv_from_ssd_source(
                         &resp.node_id,
                         key,
@@ -226,7 +225,7 @@ impl ClientKvApiInner {
                     )
                     .await
                 {
-                    Ok(done_resp) => done_resp,
+                    Ok(()) => {}
                     Err(err) => {
                         tracing::warn!(
                             "kv get ssd stage failed: key={}, source_node={}, stage={:#x}, target={:#x}, len={}, ssd_stage_len={}, err={}",
@@ -264,8 +263,7 @@ impl ClientKvApiInner {
                         }
                         return Err(err);
                     }
-                };
-                ssd_done_resp = Some(done_resp);
+                }
                 tracing::debug!(
                     "kv get ssd staged and pushed: key={}, source_node={}, stage={:#x}, target={:#x}, len={}, ssd_stage_len={}",
                     key,
@@ -356,23 +354,20 @@ impl ClientKvApiInner {
 
             // Removed post-transfer zero-header verification per request.
 
-            // Complete the get operation and get holder_id. SSD source already called
-            // get_done after pushing into the requester target.
-            let done_resp = if let Some(done_resp) = ssd_done_resp {
-                done_resp
-            } else {
-                match self.get_done(get_id).await {
-                    Ok(resp) => resp,
-                    Err(err) => {
-                        obe_get_end_error_rpc(
-                            &metrics,
-                            &client_id,
-                            &node_role,
-                            key,
-                            data_len as u64,
+            // The requester commits completion only after every source has stopped
+            // touching the target. GetDone is idempotent, so response loss can be retried.
+            let done_resp = match self.get_done(get_id).await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    obe_get_end_error_rpc(&metrics, &client_id, &node_role, key, data_len as u64);
+                    if let Err(revoke_err) = self.get_revoke(get_id).await {
+                        tracing::warn!(
+                            get_id,
+                            error = %revoke_err,
+                            "Failed to revoke get after GetDone RPC failure"
                         );
-                        return Err(err);
                     }
+                    return Err(err);
                 }
             };
             let end_handle_us = done_resp.server_process_us;
@@ -384,11 +379,19 @@ impl ClientKvApiInner {
                     self.test_record.remove_transfering_get(get_id);
                 }
 
-                crate::rpcresp_kvresult_convert::try_from_code(
+                let err = crate::rpcresp_kvresult_convert::try_from_code(
                     done_resp.error_code,
                     done_resp.error_json.clone(),
-                )?;
-                unreachable!("error path should have returned above");
+                )
+                .expect_err("non-OK GetDone response must convert to an error");
+                if let Err(revoke_err) = self.get_revoke(get_id).await {
+                    tracing::warn!(
+                        get_id,
+                        error = %revoke_err,
+                        "Failed to revoke get after GetDone status failure"
+                    );
+                }
+                return Err(err);
             }
             // end/done stage success and push detailed metrics
             obe_get_done_success(
@@ -579,13 +582,15 @@ impl ClientKvApiInner {
             .await?;
 
         // 调用 RPC
-        let _resp = self
+        let resp = self
             .rpc_caller_get_revoke
             .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
             .await
             .map_err(KvError::from)?;
-
-        Ok(())
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json,
+        )
     }
 
     /// 完成 Get 操作，清理资源
@@ -605,7 +610,13 @@ impl ClientKvApiInner {
         // 调用 RPC
         let resp = self
             .rpc_caller_get_done
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
+            .call(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                req,
+                Some(std::time::Duration::from_secs(60)),
+                3,
+            )
             .await
             .map_err(KvError::from)?;
 
