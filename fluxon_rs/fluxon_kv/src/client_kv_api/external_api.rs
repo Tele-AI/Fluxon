@@ -17,7 +17,8 @@ use crate::client_kv_api::msg_pack::{
 use crate::client_kv_api::{
     self, ExternalGetKeyInterest, ExternalGetKeySharedOp, ExternalGetKeySharedPhase,
     ExternalGetStartEntry, ExternalGetStartOwnerItem, ExternalGetStartPrefixResult,
-    ExternalGetStartSharedItemResult, ExternalGetStartTransferOutput, ExternalPendingPutCtx,
+    ExternalGetStartSharedItemResult, ExternalGetStartTransferOutput,
+    ExternalLocalFirstPutKeyReservation, ExternalPendingPutCtx, ExternalPutKeyOutcome,
     OwnerLocalPublishItem, OwnerLocalPublishJob, OwnerLocalReserveSlotLease,
     OwnerLocalReserveSlotRef, ReplicaTaskTarget,
 };
@@ -1132,6 +1133,7 @@ mod external_get_start_batch_tests {
             OwnerKeyControlState {
                 local_puts: 0,
                 external_pending_puts: 0,
+                external_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: Some(old.clone()),
@@ -1160,6 +1162,7 @@ mod external_get_start_batch_tests {
             OwnerKeyControlState {
                 local_puts: 0,
                 external_pending_puts: 0,
+                external_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: Some(op.clone()),
@@ -2909,29 +2912,82 @@ impl HandlerForExternalClient for ClientKvApi {
             }));
         }
 
-        let mut pending_fences = Vec::with_capacity(req.items.len());
-        for item in &req.items {
-            let pending_fence = match inner.reserve_external_local_first_put_key(
-                &item.key,
-                item.reject_if_inflight_same_key,
-                item.reject_if_exist_same_key,
-            ) {
-                Ok(pending_fence) => pending_fence,
-                Err(err) => {
-                    let items = req
-                        .items
-                        .iter()
-                        .map(|_| external_local_first_error_item(&err))
-                        .collect();
+        let pending_fences = loop {
+            let mut pending_fences = Vec::with_capacity(req.items.len());
+            let mut wait_for = None;
+            for item in &req.items {
+                match inner.reserve_external_local_first_put_key(
+                    &item.key,
+                    item.reject_if_inflight_same_key,
+                    item.reject_if_exist_same_key,
+                ) {
+                    Ok(ExternalLocalFirstPutKeyReservation::Leader(pending_fence)) => {
+                        pending_fences.push(pending_fence);
+                    }
+                    Ok(ExternalLocalFirstPutKeyReservation::Wait(op)) => {
+                        if atomic_group_lens.len() != 1 {
+                            let err = KvError::Api(ApiError::KeyBeingWritten {
+                                key: item.key.clone(),
+                            });
+                            return Ok(ExternalBatchPutStartResp {
+                                items: req
+                                    .items
+                                    .iter()
+                                    .map(|_| external_local_first_error_item(&err))
+                                    .collect(),
+                                error_code: OK,
+                                error_json: String::new(),
+                            });
+                        }
+                        wait_for = Some((item.key.clone(), op));
+                        break;
+                    }
+                    Err(err) => {
+                        let items = req
+                            .items
+                            .iter()
+                            .map(|_| external_local_first_error_item(&err))
+                            .collect();
+                        return Ok(ExternalBatchPutStartResp {
+                            items,
+                            error_code: OK,
+                            error_json: String::new(),
+                        });
+                    }
+                }
+            }
+            let Some((joined_key, op)) = wait_for else {
+                break pending_fences;
+            };
+
+            // Never retain a partial atomic_batch while waiting for another
+            // key. Two overlapping requests with different key order must not
+            // each hold one leader fence and wait forever on the other.
+            drop(pending_fences);
+            match op.wait().await {
+                ExternalPutKeyOutcome::Succeeded => {
+                    tracing::info!(
+                        joined_key,
+                        items = req.items.len(),
+                        "external local-first Put reused an inflight leader result"
+                    );
+                    let err = KvError::Api(ApiError::KeyAlreadyExists { key: joined_key });
                     return Ok(ExternalBatchPutStartResp {
-                        items,
+                        items: req
+                            .items
+                            .iter()
+                            .map(|_| external_local_first_error_item(&err))
+                            .collect(),
                         error_code: OK,
                         error_json: String::new(),
                     });
                 }
-            };
-            pending_fences.push(pending_fence);
-        }
+                ExternalPutKeyOutcome::Failed => continue,
+                ExternalPutKeyOutcome::InFlight => {
+                    unreachable!("shared Put wait must return a terminal outcome")
+                }
+            }
+        };
 
         // Finish every fallible, purely logical derivation before claiming
         // physical slots.  The per-key fences above are RAII-owned, so any

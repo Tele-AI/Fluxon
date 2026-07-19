@@ -1,10 +1,9 @@
 use super::{
-    ClientKvApiInner, OwnerHotEvictionEvent, OwnerHotEvictionPreparation, OwnerHotSelectionDebt,
+    ClientKvApiInner, OwnerHotEvictionEvent, OwnerHotEvictionPreparation,
     OwnerHotSelectionFenceOutcome, OwnerLocalReserveClassState, OwnerLocalReserveGrantState,
     OwnerLocalReservePoolState, OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef,
     ReplicaTaskJob, ReplicaTaskTarget,
     local_reserve_rebalance::{owner_local_reserve_timeout_config, wait_owner_local_reserve_ready},
-    owner_hot_weight_bytes,
 };
 use crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
 use crate::cluster_manager::NodeIDString;
@@ -27,11 +26,12 @@ use crate::{
         BatchPutStartItemReq, BatchPutStartReq, BatchPutStartResp,
         BatchReleasePutKeyReservationsReq, BatchReleasePutKeyReservationsResp,
         EnqueueReplicaTaskItemResp, GroupedBatchPutDoneItemReq, GroupedBatchPutDoneReq,
-        GroupedBatchPutDoneResp, OwnerReclaimBacking, OwnerSourceEvictionAtomicBatch,
-        OwnerSourceEvictionMember, OwnerSourceEvictionOutcome, PutAppendDoneReq, PutAppendDoneResp,
-        PutAppendRevokeReq, PutAppendStartOutcome, PutAppendStartReq, PutAppendStartResp,
-        PutAtomicGroup, PutDoneCommittedSlot, PutDoneReq, PutRevokeReq, PutStartReq, PutStartResp,
+        GroupedBatchPutDoneResp, OwnerReclaimBacking, OwnerSourceEvictionOutcome,
+        OwnerSourceEvictionVictim, PutAppendDoneReq, PutAppendDoneResp, PutAppendRevokeReq,
+        PutAppendStartOutcome, PutAppendStartReq, PutAppendStartResp, PutAtomicGroup,
+        PutDoneCommittedSlot, PutDoneReq, PutRevokeReq, PutStartReq, PutStartResp,
         ReleaseLocalGrantReq, ReserveLocalGrantOutcome, ReserveLocalGrantReq,
+        owner_source_eviction_epoch,
     },
     memholder::{UserMemHolder, UserMemHolderExposeKind},
     p2p::msg_pack::MsgPack,
@@ -2225,12 +2225,12 @@ impl ClientKvApiInner {
 
     pub async fn batch_evict_owner_source(
         &self,
-        atomic_batches: Vec<OwnerSourceEvictionAtomicBatch>,
+        victims: Vec<OwnerSourceEvictionVictim>,
     ) -> KvResult<BatchEvictOwnerSourceResp> {
-        if atomic_batches.is_empty() {
+        if victims.is_empty() {
             return Ok(BatchEvictOwnerSourceResp {
                 operation_id: 0,
-                atomic_batches: Vec::new(),
+                victims: Vec::new(),
                 error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
                 error_json: String::new(),
             });
@@ -2248,7 +2248,7 @@ impl ClientKvApiInner {
             serialize_part: BatchEvictOwnerSourceReq {
                 operation_id,
                 owner_node_start_time: self_info.node_start_time,
-                atomic_batches,
+                victims,
             },
             raw_bytes: Vec::new(),
         };
@@ -2960,21 +2960,21 @@ async fn start_replica_append_with_retry(
 }
 
 fn owner_source_eviction_identity(
-    member: &OwnerSourceEvictionMember,
+    victim: &OwnerSourceEvictionVictim,
 ) -> super::OwnerHotReplicaIdentity {
     super::OwnerHotReplicaIdentity {
-        key: member.key.clone(),
-        put_time_ms: member.put_id.0,
-        put_version: member.put_id.1,
+        key: victim.key.clone(),
+        put_time_ms: victim.put_id.0,
+        put_version: victim.put_id.1,
     }
 }
 
-fn owner_source_eviction_member(
+fn owner_source_eviction_victim(
     identity: &super::OwnerHotReplicaIdentity,
     memory_info: &crate::memholder::MemoryInfo,
-) -> Option<OwnerSourceEvictionMember> {
+) -> Option<OwnerSourceEvictionVictim> {
     let (slot_size, grant_id, slot_index) = memory_info.local_reserve_resident_slot_ref()?;
-    Some(OwnerSourceEvictionMember {
+    Some(OwnerSourceEvictionVictim {
         key: identity.key.clone(),
         put_id: (identity.put_time_ms, identity.put_version),
         backing: OwnerReclaimBacking::CommittedSlot {
@@ -2987,55 +2987,49 @@ fn owner_source_eviction_member(
 
 fn finish_owner_source_selection(
     inner: &ClientKvApiInner,
-    atomic_batch: &OwnerSourceEvictionAtomicBatch,
+    victim: &OwnerSourceEvictionVictim,
     restore_current: bool,
     reason: &str,
 ) {
-    for member in &atomic_batch.members {
-        let identity = owner_source_eviction_identity(member);
-        if let Some(debt) = inner.owner_hot_remove_source_selection_debt(&identity) {
-            debt.release();
-            inner
-                .owner_hot_counters
-                .source_evict_restored_members
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        inner.owner_hot_retry_queue.remove(&identity);
-        if !restore_current {
-            continue;
-        }
-        inner.owner_hot_restore_source_selection(&identity);
-        let group = inner
-            .owner_hot_atomic_groups
-            .get(&identity)
-            .map(|entry| entry.value().clone());
-        if inner.owner_hot_admit_published_committed(&member.key, member.put_id, group.as_deref()) {
-            tracing::warn!(
-                key = member.key,
-                put_time_ms = member.put_id.0,
-                put_version = member.put_id.1,
-                reason,
-                "restored current source to owner-hot after source eviction did not enter reclaim"
-            );
-        }
+    let identity = owner_source_eviction_identity(victim);
+    if let Some(debt) = inner.owner_hot_remove_source_selection_debt(&identity) {
+        debt.release();
+        inner
+            .owner_hot_counters
+            .source_evict_restored_members
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    inner.owner_hot_retry_queue.remove(&identity);
+    if !restore_current {
+        return;
+    }
+    inner.owner_hot_restore_source_selection(&identity);
+    if inner.owner_hot_admit_published_committed(&victim.key, victim.put_id) {
+        tracing::warn!(
+            key = victim.key,
+            put_time_ms = victim.put_id.0,
+            put_version = victim.put_id.1,
+            reason,
+            "restored current source to owner-hot after source eviction did not enter reclaim"
+        );
     }
 }
 
 fn schedule_owner_source_eviction_retry(
     inner: &ClientKvApiInner,
     mut event: OwnerHotEvictionEvent,
-    atomic_batch: Arc<OwnerSourceEvictionAtomicBatch>,
+    victim: Arc<OwnerSourceEvictionVictim>,
     reason: &'static str,
 ) {
     event.retry = true;
-    event.source_eviction_atomic_batch = Some(atomic_batch);
+    event.source_eviction_victim = Some(victim);
     inner.owner_hot_retry_queue.schedule(event, reason);
 }
 
 fn prepare_owner_source_eviction_event(
     inner: &ClientKvApiInner,
     mut event: OwnerHotEvictionEvent,
-) -> Option<(OwnerHotEvictionEvent, Arc<OwnerSourceEvictionAtomicBatch>)> {
+) -> Option<(OwnerHotEvictionEvent, Arc<OwnerSourceEvictionVictim>)> {
     let trigger = super::OwnerHotReplicaIdentity {
         key: event.key.clone(),
         put_time_ms: event.put_id.0,
@@ -3045,22 +3039,15 @@ fn prepare_owner_source_eviction_event(
     if event.retry {
         let _ = inner.owner_hot_retry_queue.take_for_inflight(&trigger);
     }
-    if let Some(atomic_batch) = event.source_eviction_atomic_batch.clone() {
-        if atomic_batch.members.iter().all(|member| {
-            inner
-                .owner_source_eviction_selected
-                .contains_key(&owner_source_eviction_identity(member))
-        }) {
-            return Some((event, atomic_batch));
+    if let Some(victim) = event.source_eviction_victim.clone() {
+        if inner
+            .owner_source_eviction_selected
+            .contains_key(&owner_source_eviction_identity(&victim))
+        {
+            return Some((event, victim));
         }
-        // Commit/invalidation may win the race with a due retry. Any remaining
-        // selected members are restored rather than leaving false projected credit.
-        finish_owner_source_selection(
-            inner,
-            &atomic_batch,
-            true,
-            "retry atomic_batch lost selected identity",
-        );
+        // Commit/invalidation may win the race with a due retry.
+        finish_owner_source_selection(inner, &victim, true, "retry victim lost selected identity");
         event.selection_debt.release();
         return None;
     }
@@ -3069,13 +3056,13 @@ fn prepare_owner_source_eviction_event(
         event.selection_debt.release();
         inner
             .owner_hot_counters
-            .group_trigger_duplicates
+            .victim_duplicates
             .fetch_add(1, Ordering::Relaxed);
         return None;
     }
 
-    let (resolved_trigger, sources) = match inner.owner_hot_prepare_eviction(&event) {
-        OwnerHotEvictionPreparation::Ready { trigger, sources } => (trigger, sources),
+    let (resolved_trigger, source) = match inner.owner_hot_prepare_eviction(&event) {
+        OwnerHotEvictionPreparation::Ready { trigger, source } => (trigger, source),
         OwnerHotEvictionPreparation::RetryableReclaimFence => {
             inner.owner_hot_retry_queue.schedule(
                 event,
@@ -3083,39 +3070,24 @@ fn prepare_owner_source_eviction_event(
             );
             return None;
         }
-        OwnerHotEvictionPreparation::RetryableIncompleteAtomicBatch => {
-            inner
-                .owner_hot_retry_queue
-                .schedule(event, "owner source atomic_batch is temporarily incomplete");
-            return None;
-        }
-        OwnerHotEvictionPreparation::TemporarilyPinned { active_members } => {
-            // This event was removed from Moka, but its source atomic_batch is still
+        OwnerHotEvictionPreparation::TemporarilyPinned => {
+            // This event was removed from Moka, but its source is still
             // serving a local reader. Do not hand it to the master's reclaim
             // loop and do not retain projected selection credit. Re-admission
             // refreshes the trigger's recency so the next pressure kick can
             // choose a different, currently reclaimable victim.
             event.selection_debt.release();
-            inner.owner_hot_counters.skipped_active_holders.fetch_add(
-                u64::try_from(active_members).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-            let group = inner
-                .owner_hot_atomic_groups
-                .get(&trigger)
-                .map(|entry| entry.value().clone());
-            let restored = inner.owner_hot_admit_published_committed(
-                &event.key,
-                event.put_id,
-                group.as_deref(),
-            );
+            inner
+                .owner_hot_counters
+                .skipped_active_holders
+                .fetch_add(1, Ordering::Relaxed);
+            let restored = inner.owner_hot_admit_published_committed(&event.key, event.put_id);
             tracing::debug!(
                 key = event.key,
                 put_time_ms = event.put_id.0,
                 put_version = event.put_id.1,
-                active_members,
                 restored,
-                "owner pressure eviction skipped an actively held source atomic_batch"
+                "owner pressure eviction skipped an actively held source"
             );
             return None;
         }
@@ -3130,15 +3102,11 @@ fn prepare_owner_source_eviction_event(
     };
     debug_assert_eq!(resolved_trigger, trigger);
 
-    let members = sources
-        .iter()
-        .map(|(identity, memory_info)| owner_source_eviction_member(identity, memory_info.as_ref()))
-        .collect::<Option<Vec<_>>>();
-    let Some(members) = members else {
+    let Some(victim) = owner_source_eviction_victim(&trigger, source.as_ref()) else {
         event.selection_debt.release();
         inner
             .owner_hot_counters
-            .group_trigger_incomplete
+            .victim_invalid_backing
             .fetch_add(1, Ordering::Relaxed);
         tracing::error!(
             key = event.key,
@@ -3148,9 +3116,9 @@ fn prepare_owner_source_eviction_event(
         );
         return None;
     };
-    let atomic_batch = Arc::new(OwnerSourceEvictionAtomicBatch { members });
+    let victim = Arc::new(victim);
 
-    match inner.owner_hot_install_source_selection_fences(&sources) {
+    match inner.owner_hot_install_source_selection_fence(&trigger, &source) {
         OwnerHotSelectionFenceOutcome::Fenced => {}
         OwnerHotSelectionFenceOutcome::Retryable => {
             inner
@@ -3158,17 +3126,13 @@ fn prepare_owner_source_eviction_event(
                 .schedule(event, "owner source selection fence is temporarily busy");
             return None;
         }
-        OwnerHotSelectionFenceOutcome::TemporarilyPinned { active_members } => {
+        OwnerHotSelectionFenceOutcome::TemporarilyPinned => {
             event.selection_debt.release();
-            inner.owner_hot_counters.skipped_active_holders.fetch_add(
-                u64::try_from(active_members).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-            let group = inner
-                .owner_hot_atomic_groups
-                .get(&trigger)
-                .map(|entry| entry.value().clone());
-            inner.owner_hot_admit_published_committed(&event.key, event.put_id, group.as_deref());
+            inner
+                .owner_hot_counters
+                .skipped_active_holders
+                .fetch_add(1, Ordering::Relaxed);
+            inner.owner_hot_admit_published_committed(&event.key, event.put_id);
             return None;
         }
         OwnerHotSelectionFenceOutcome::Obsolete => {
@@ -3181,52 +3145,24 @@ fn prepare_owner_source_eviction_event(
         }
     }
 
-    if atomic_batch.members.iter().any(|member| {
-        inner
-            .owner_source_eviction_selected
-            .contains_key(&owner_source_eviction_identity(member))
-    }) {
-        for member in &atomic_batch.members {
-            inner.owner_hot_restore_source_selection(&owner_source_eviction_identity(member));
-        }
+    if inner.owner_source_eviction_selected.contains_key(&trigger) {
+        inner.owner_hot_restore_source_selection(&trigger);
         event.selection_debt.release();
         inner
             .owner_hot_counters
-            .group_trigger_duplicates
+            .victim_duplicates
             .fetch_add(1, Ordering::Relaxed);
         return None;
     }
 
-    let mut installed = Vec::with_capacity(atomic_batch.members.len());
-    for ((identity, memory_info), member) in sources.iter().zip(atomic_batch.members.iter()) {
-        debug_assert_eq!(identity, &owner_source_eviction_identity(member));
-        let debt = if identity == &trigger {
-            event.selection_debt.clone()
-        } else {
-            OwnerHotSelectionDebt::new(
-                u64::from(owner_hot_weight_bytes(memory_info.as_ref())),
-                inner.owner_hot_counters.selection_debt_bytes.clone(),
-            )
-        };
-        if !inner.owner_hot_install_source_selection_debt(identity.clone(), debt.clone()) {
-            debt.release();
-            for installed_identity in installed {
-                if let Some(installed_debt) =
-                    inner.owner_hot_remove_source_selection_debt(&installed_identity)
-                {
-                    installed_debt.release();
-                }
-            }
-            for member in &atomic_batch.members {
-                inner.owner_hot_restore_source_selection(&owner_source_eviction_identity(member));
-            }
-            event.selection_debt.release();
-            return None;
-        }
-        installed.push(identity.clone());
+    if !inner.owner_hot_install_source_selection_debt(trigger.clone(), event.selection_debt.clone())
+    {
+        inner.owner_hot_restore_source_selection(&trigger);
+        event.selection_debt.release();
+        return None;
     }
-    event.source_eviction_atomic_batch = Some(atomic_batch.clone());
-    Some((event, atomic_batch))
+    event.source_eviction_victim = Some(victim.clone());
+    Some((event, victim))
 }
 
 async fn process_owner_source_eviction_events(
@@ -3241,44 +3177,44 @@ async fn process_owner_source_eviction_events(
     if prepared.is_empty() {
         return;
     }
-    let atomic_batches = prepared
+    let victims = prepared
         .iter()
-        .map(|(_, atomic_batch)| atomic_batch.as_ref().clone())
+        .map(|(_, victim)| victim.as_ref().clone())
         .collect::<Vec<_>>();
-    let response = inner.batch_evict_owner_source(atomic_batches).await;
+    let response = inner.batch_evict_owner_source(victims).await;
     let Ok(response) = response else {
-        for (event, atomic_batch) in prepared {
+        for (event, victim) in prepared {
             schedule_owner_source_eviction_retry(
                 inner,
                 event,
-                atomic_batch,
+                victim,
                 "owner source-eviction RPC failed",
             );
         }
         return;
     };
-    if response.atomic_batches.len() != prepared.len() {
-        for (event, atomic_batch) in prepared {
+    if response.victims.len() != prepared.len() {
+        for (event, victim) in prepared {
             schedule_owner_source_eviction_retry(
                 inner,
                 event,
-                atomic_batch,
+                victim,
                 "owner source-eviction response length mismatch",
             );
         }
         return;
     }
 
-    for (index, ((event, atomic_batch), result)) in prepared
+    for (index, ((event, victim), result)) in prepared
         .into_iter()
-        .zip(response.atomic_batches.into_iter())
+        .zip(response.victims.into_iter())
         .enumerate()
     {
-        if result.atomic_batch_index != u32::try_from(index).unwrap_or(u32::MAX) {
+        if result.victim_index != u32::try_from(index).unwrap_or(u32::MAX) {
             schedule_owner_source_eviction_retry(
                 inner,
                 event,
-                atomic_batch,
+                victim,
                 "owner source-eviction response identity mismatch",
             );
             continue;
@@ -3289,45 +3225,63 @@ async fn process_owner_source_eviction_events(
                 inner
                     .owner_hot_counters
                     .source_evict_handoff_members
-                    .fetch_add(atomic_batch.members.len() as u64, Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed);
                 // Selected debt stays live until owner reclaim Commit calls
-                // owner_hot_invalidate_version for every exact member.
+                // owner_hot_invalidate_version for the exact victim.
             }
             OwnerSourceEvictionOutcome::Completed => {
-                finish_owner_source_selection(
-                    inner,
-                    &atomic_batch,
-                    true,
-                    "master reported source deletion already completed",
-                );
+                let epoch = owner_source_eviction_epoch(response.operation_id, index);
+                match super::reclaim::complete_owner_source_eviction(inner, &victim, epoch) {
+                    Ok(()) => {
+                        inner
+                            .owner_hot_counters
+                            .source_evict_handoff_members
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(detail) => {
+                        tracing::warn!(
+                            key = victim.key,
+                            put_time_ms = victim.put_id.0,
+                            put_version = victim.put_id.1,
+                            detail,
+                            "master deleted source route but owner slot release must retry"
+                        );
+                        schedule_owner_source_eviction_retry(
+                            inner,
+                            event,
+                            victim,
+                            "owner slot release after master direct-delete is temporarily busy",
+                        );
+                    }
+                }
             }
             OwnerSourceEvictionOutcome::RetryableBusy | OwnerSourceEvictionOutcome::Unspecified => {
                 schedule_owner_source_eviction_retry(
                     inner,
                     event,
-                    atomic_batch,
+                    victim,
                     "master source reclaim is temporarily busy",
                 );
             }
             OwnerSourceEvictionOutcome::Stale => {
                 finish_owner_source_selection(
                     inner,
-                    &atomic_batch,
+                    &victim,
                     true,
                     "master rejected stale source identity",
                 );
             }
             OwnerSourceEvictionOutcome::RejectedNotEvictable => {
                 tracing::error!(
-                    atomic_batch_members = atomic_batch.members.len(),
+                    key = victim.key,
                     detail = result.detail,
-                    "owner selected a source atomic_batch that master declared non-evictable"
+                    "owner selected a source victim that master declared non-evictable"
                 );
                 finish_owner_source_selection(
                     inner,
-                    &atomic_batch,
+                    &victim,
                     true,
-                    "master rejected non-evictable source atomic_batch",
+                    "master rejected non-evictable source victim",
                 );
             }
         }
@@ -3336,39 +3290,87 @@ async fn process_owner_source_eviction_events(
 
 pub fn spawn_owner_source_eviction_dispatcher(
     view: ClientKvApiView,
-    mut rx: tokio::sync::ampsc::UnboundedReceiver<OwnerHotEvictionEvent>,
+    mut rx: tokio::sync::ampsc::UnboundedReceiver<super::OwnerHotEvictionDispatch>,
 ) {
-    const MAX_ATOMIC_BATCHES_PER_RPC: usize = 128;
-    const MERGE_WINDOW: Duration = Duration::from_millis(2);
+    const ORPHAN_MERGE_WINDOW: Duration = Duration::from_millis(2);
 
     let view_task = view.clone();
     let _ = view.spawn("owner_source_eviction_dispatcher", async move {
         let mut shutdown_waiter = view_task.register_shutdown_waiter();
+        let mut events = Vec::new();
+        let mut pressure_open = false;
         loop {
-            let first = tokio::select! {
-                _ = shutdown_waiter.wait() => {
-                    tracing::info!("owner source-eviction dispatcher stopping due to shutdown");
-                    break;
+            let dispatch = if events.is_empty() || pressure_open {
+                tokio::select! {
+                    _ = shutdown_waiter.wait() => {
+                        tracing::info!("owner source-eviction dispatcher stopping due to shutdown");
+                        break;
+                    }
+                    dispatch = rx.recv() => dispatch,
                 }
-                event = rx.recv() => {
-                    let Some(event) = event else { break; };
-                    event
+            } else {
+                tokio::select! {
+                    _ = shutdown_waiter.wait() => {
+                        tracing::info!("owner source-eviction dispatcher stopping due to shutdown");
+                        break;
+                    }
+                    dispatch = rx.recv() => dispatch,
+                    _ = tokio::time::sleep(ORPHAN_MERGE_WINDOW) => {
+                        process_owner_source_eviction_events(
+                            &view_task,
+                            std::mem::take(&mut events),
+                        )
+                        .await;
+                        continue;
+                    }
                 }
             };
-            let mut events = Vec::with_capacity(MAX_ATOMIC_BATCHES_PER_RPC);
-            events.push(first);
-            let merge_window = tokio::time::sleep(MERGE_WINDOW);
-            tokio::pin!(merge_window);
-            while events.len() < MAX_ATOMIC_BATCHES_PER_RPC {
-                tokio::select! {
-                    _ = &mut merge_window => break,
-                    event = rx.recv() => {
-                        let Some(event) = event else { break; };
-                        events.push(event);
+            let Some(dispatch) = dispatch else {
+                if !events.is_empty() {
+                    process_owner_source_eviction_events(&view_task, std::mem::take(&mut events))
+                        .await;
+                }
+                break;
+            };
+            match dispatch {
+                super::OwnerHotEvictionDispatch::Victim(event) => events.push(event),
+                super::OwnerHotEvictionDispatch::BeginPressure { requested_bytes } => {
+                    if pressure_open {
+                        tracing::error!(
+                            requested_bytes,
+                            "nested owner pressure selection batch is not allowed"
+                        );
+                    }
+                    if !events.is_empty() {
+                        process_owner_source_eviction_events(
+                            &view_task,
+                            std::mem::take(&mut events),
+                        )
+                        .await;
+                    }
+                    pressure_open = true;
+                }
+                super::OwnerHotEvictionDispatch::EndPressure { selected_bytes } => {
+                    if !pressure_open {
+                        tracing::warn!(
+                            selected_bytes,
+                            "owner pressure selection ended without a matching begin marker"
+                        );
+                    }
+                    pressure_open = false;
+                    process_owner_source_eviction_events(&view_task, std::mem::take(&mut events))
+                        .await;
+                }
+                super::OwnerHotEvictionDispatch::Flush => {
+                    if !pressure_open && !events.is_empty() {
+                        process_owner_source_eviction_events(
+                            &view_task,
+                            std::mem::take(&mut events),
+                        )
+                        .await;
                     }
                 }
             }
-            process_owner_source_eviction_events(&view_task, events).await;
         }
     });
 }
@@ -3399,8 +3401,13 @@ pub fn spawn_owner_hot_retry_actor(view: ClientKvApiView) {
             }
             let inner = view_task.client_kv_api().inner();
             for event in events {
-                if let Err(err) = inner.owner_hot_eviction_tx.send(event) {
-                    let event = err.0;
+                if let Err(err) = inner
+                    .owner_hot_eviction_tx
+                    .send(super::OwnerHotEvictionDispatch::Victim(event))
+                {
+                    let super::OwnerHotEvictionDispatch::Victim(event) = err.0 else {
+                        unreachable!("the retry actor only sends victim events")
+                    };
                     retry_queue.schedule(event, "retry dispatcher closed");
                     return;
                 }
@@ -3408,6 +3415,13 @@ pub fn spawn_owner_hot_retry_actor(view: ClientKvApiView) {
                     .owner_hot_counters
                     .source_evict_retry_emitted
                     .fetch_add(1, Ordering::Relaxed);
+            }
+            if inner
+                .owner_hot_eviction_tx
+                .send(super::OwnerHotEvictionDispatch::Flush)
+                .is_err()
+            {
+                return;
             }
         }
     });
@@ -4236,11 +4250,7 @@ pub(crate) async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLoc
                 );
                 continue;
             }
-            let _ = inner.owner_hot_admit_published_committed(
-                &item.key,
-                item.put_id,
-                item.atomic_group.as_ref(),
-            );
+            let _ = inner.owner_hot_admit_published_committed(&item.key, item.put_id);
         }
 
         for item in promoted_items {
@@ -4263,6 +4273,10 @@ pub(crate) async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLoc
                     );
                 }
             }
+        }
+
+        for context in &job.external_pending_contexts {
+            context._pending_fence.mark_local_put_succeeded();
         }
     }
 

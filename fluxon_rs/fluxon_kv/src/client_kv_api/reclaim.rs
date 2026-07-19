@@ -2,7 +2,8 @@ use super::{ClientKvApiInner, ClientKvApiView, OwnerPreparedReclaim, OwnerReclai
 use crate::cluster_manager::{NodeID, NodeRole};
 use crate::master_kv_router::msg_pack::{
     BatchOwnerReclaimReq, BatchOwnerReclaimResp, OwnerReclaimBacking, OwnerReclaimItem,
-    OwnerReclaimItemResp, OwnerReclaimItemState, OwnerReclaimPhase,
+    OwnerReclaimItemResp, OwnerReclaimItemState, OwnerReclaimPhase, OwnerReclaimReason,
+    OwnerSourceEvictionVictim,
 };
 use crate::p2p::msg_pack::MsgPack;
 use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, OK};
@@ -391,6 +392,7 @@ mod tests {
         let state = OwnerKeyControlState {
             local_puts: 0,
             external_pending_puts: 0,
+            external_put: None,
             source_eviction_selection: None,
             reclaim: Some(OwnerReclaimRecord::Releasing(item.clone())),
             external_get: Some(Arc::new(ExternalGetKeySharedOp::new(
@@ -402,6 +404,7 @@ mod tests {
         let local_put_state = OwnerKeyControlState {
             local_puts: 1,
             external_pending_puts: 0,
+            external_put: None,
             source_eviction_selection: None,
             reclaim: Some(OwnerReclaimRecord::Releasing(item.clone())),
             external_get: state.external_get,
@@ -520,6 +523,41 @@ fn finalize_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerRecla
             "owner reclaim was already finalized",
         ),
     }
+}
+
+pub(crate) fn complete_owner_source_eviction(
+    inner: &ClientKvApiInner,
+    victim: &OwnerSourceEvictionVictim,
+    epoch: u64,
+) -> Result<(), String> {
+    let item = OwnerReclaimItem {
+        key: victim.key.clone(),
+        put_id: victim.put_id,
+        epoch,
+        backing: victim.backing.clone(),
+        reason: OwnerReclaimReason::OwnerCapacityEviction,
+    };
+    let prepared = prepare_one(inner, &item);
+    match prepared.state {
+        OwnerReclaimItemState::Prepared => {}
+        OwnerReclaimItemState::Committed => {
+            let finalized = finalize_one(inner, &item);
+            return (finalized.state == OwnerReclaimItemState::Finalized)
+                .then_some(())
+                .ok_or(finalized.detail);
+        }
+        OwnerReclaimItemState::Finalized => return Ok(()),
+        _ => return Err(prepared.detail),
+    }
+
+    let committed = commit_one(inner, &item);
+    if committed.state != OwnerReclaimItemState::Committed {
+        return Err(committed.detail);
+    }
+    let finalized = finalize_one(inner, &item);
+    (finalized.state == OwnerReclaimItemState::Finalized)
+        .then_some(())
+        .ok_or(finalized.detail)
 }
 
 pub async fn handle_batch_owner_reclaim(

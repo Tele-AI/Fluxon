@@ -26,10 +26,9 @@ use self::{
         BatchPutAppendStartReq, BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq,
         BatchReleasePutKeyReservationsReq, CountPrefixReq, CountPrefixResp, DeleteAckReq,
         DeleteReq, GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetRevokeReq,
-        GetStartReq, GroupedBatchPutDoneReq, OwnerReclaimBacking, OwnerReclaimItem,
-        OwnerReclaimReason, PutAppendDoneReq, PutAppendRevokeReq, PutAppendStartReq,
-        PutAtomicGroup, PutDoneReq, PutRevokeReq, PutStartReq, ReleaseLocalGrantReq,
-        ReserveLocalGrantReq,
+        GetStartReq, GroupedBatchPutDoneReq, OwnerReclaimItem, PutAppendDoneReq,
+        PutAppendRevokeReq, PutAppendStartReq, PutAtomicGroup, PutDoneReq, PutRevokeReq,
+        PutStartReq, ReleaseLocalGrantReq, ReserveLocalGrantReq,
     },
     placement::{PlacementPolicy, build_placement_policy},
     put::{
@@ -299,7 +298,7 @@ pub struct ReplicaCacheNodeObserveSnapshot {
     pub reclaim_retry_restored: u64,
     pub reclaim_completed: u64,
     pub source_evict_rpc_requests: u64,
-    pub source_evict_atomic_batches: u64,
+    pub source_evict_victims: u64,
     pub source_evict_requested_bytes: u64,
     pub source_evict_accepted: u64,
     pub source_evict_in_progress: u64,
@@ -487,7 +486,7 @@ pub(crate) struct EvictionReclaimCounters {
     pub retry_restored: AtomicU64,
     pub completed: AtomicU64,
     pub source_evict_rpc_requests: AtomicU64,
-    pub source_evict_atomic_batches: AtomicU64,
+    pub source_evict_victims: AtomicU64,
     pub source_evict_requested_bytes: AtomicU64,
     pub source_evict_accepted: AtomicU64,
     pub source_evict_in_progress: AtomicU64,
@@ -505,7 +504,7 @@ pub(crate) struct EvictionReclaimCounters {
     /// More specific subset retained for diagnostics/backward-compatible
     /// metrics: the non-ring-B route used a CommittedSlot backing.
     pub capacity_eviction_hit_committed_slot: AtomicU64,
-    /// Duplicate listener/atomic_batch events suppressed while the same physical
+    /// Duplicate listener/victim events suppressed while the same physical
     /// cache version already has an outstanding reclaim lifecycle.
     pub eviction_reclaim_deduplicated: AtomicU64,
 }
@@ -1307,76 +1306,6 @@ async fn cleanup_departed_generation_routes(
     );
 }
 
-const MAX_INFERRED_TP_ATOMIC_BATCH_SIZE: usize = 256;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct InferredTpKey<'a> {
-    pub(crate) logical_prefix: &'a str,
-    pub(crate) rank: usize,
-    pub(crate) size: usize,
-}
-
-/// Decode the canonical SGLang HiCache suffix `_<tp_rank>_<tp_size>`.
-///
-/// This is deliberately strict and is only used to make owner reclaim more
-/// conservative. A key that cannot be decoded keeps the existing non-TP
-/// behavior; a decoded TP key whose peer routes are absent or inconsistent is
-/// never considered recoverable.
-pub(crate) fn infer_sglang_tp_key(key: &str) -> Option<InferredTpKey<'_>> {
-    let (before_size, raw_size) = key.rsplit_once('_')?;
-    let (logical_prefix, raw_rank) = before_size.rsplit_once('_')?;
-    if logical_prefix.is_empty()
-        || raw_rank.is_empty()
-        || raw_size.is_empty()
-        || !raw_rank.bytes().all(|byte| byte.is_ascii_digit())
-        || !raw_size.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    let rank = raw_rank.parse::<usize>().ok()?;
-    let size = raw_size.parse::<usize>().ok()?;
-    if size == 0
-        || size > MAX_INFERRED_TP_ATOMIC_BATCH_SIZE
-        || rank >= size
-        || raw_rank != rank.to_string()
-        || raw_size != size.to_string()
-    {
-        return None;
-    }
-    Some(InferredTpKey {
-        logical_prefix,
-        rank,
-        size,
-    })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AtomicBatchExpansionError {
-    AtomicGroupIncomplete,
-    TpAtomicBatchIncomplete,
-}
-
-fn take_exact_cache_entries(
-    cache: &MasterNodeCache,
-    expected_entries: &HashMap<String, NodeValueReplicaDesc>,
-) -> Option<Vec<(String, NodeValueReplicaDesc)>> {
-    let mut removed_entries = Vec::with_capacity(expected_entries.len());
-    for (candidate_key, expected_desc) in expected_entries {
-        let removed = cache.take_if(candidate_key, |entry| {
-            entry.put_id == expected_desc.put_id && entry.weight_bytes == expected_desc.weight_bytes
-        });
-        if let Some(removed) = removed {
-            removed_entries.push((candidate_key.clone(), removed));
-        } else {
-            for (removed_key, removed_desc) in removed_entries {
-                insert_master_cache_entry(cache, removed_key, removed_desc);
-            }
-            return None;
-        }
-    }
-    Some(removed_entries)
-}
-
 fn remove_exact_cache_entry(
     cache: &MasterNodeCache,
     key: &str,
@@ -1394,72 +1323,11 @@ fn insert_master_cache_entry(cache: &MasterNodeCache, key: String, desc: NodeVal
     cache.insert(key, [alias], desc);
 }
 
-fn current_atomic_group_members(
-    key: &str,
-    route: &OneKvNodesRoutes,
-    desc: &NodeValueReplicaDesc,
-) -> Result<Vec<msg_pack::PutAtomicGroupMember>, AtomicBatchExpansionError> {
-    let Some(group) = route.atomic_group.as_ref() else {
-        return Ok(vec![msg_pack::PutAtomicGroupMember {
-            key: key.to_string(),
-            put_id: desc.put_id,
-        }]);
-    };
-    if !group
-        .members
-        .iter()
-        .any(|member| member.key == key && member.put_id == desc.put_id)
-    {
-        return Err(AtomicBatchExpansionError::AtomicGroupIncomplete);
-    }
-    Ok(group.members.clone())
-}
-
-fn current_tp_atomic_batch_keys(
-    key: &str,
-    route: &OneKvNodesRoutes,
-    desc: &NodeValueReplicaDesc,
-) -> Result<Vec<String>, AtomicBatchExpansionError> {
-    let current_members = current_atomic_group_members(key, route, desc)?;
-    let Some(key_tp) = infer_sglang_tp_key(key) else {
-        return Ok(current_members
-            .into_iter()
-            .map(|member| member.key)
-            .collect());
-    };
-    if key_tp.size == 1 {
-        return Ok(current_members
-            .into_iter()
-            .map(|member| member.key)
-            .collect());
-    }
-
-    let mut logical_members = Vec::with_capacity(current_members.len());
-    for member in current_members {
-        let Some(member_tp) = infer_sglang_tp_key(&member.key) else {
-            return Err(AtomicBatchExpansionError::TpAtomicBatchIncomplete);
-        };
-        if member_tp.rank != key_tp.rank || member_tp.size != key_tp.size {
-            return Err(AtomicBatchExpansionError::TpAtomicBatchIncomplete);
-        }
-        logical_members.push(member_tp.logical_prefix.to_string());
-    }
-
-    let mut atomic_batch_keys = Vec::with_capacity(logical_members.len() * key_tp.size);
-    for rank in 0..key_tp.size {
-        atomic_batch_keys.extend(
-            logical_members
-                .iter()
-                .map(|logical_prefix| format!("{logical_prefix}_{rank}_{}", key_tp.size)),
-        );
-    }
-    Ok(atomic_batch_keys)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cluster_manager::ClusterMember;
+    use crate::master_kv_router::msg_pack::{OwnerReclaimBacking, OwnerReclaimReason};
     use std::collections::HashMap;
 
     #[test]
@@ -1966,90 +1834,6 @@ mod tests {
     }
 
     #[test]
-    fn infer_sglang_tp_key_accepts_only_canonical_suffix() {
-        assert_eq!(
-            infer_sglang_tp_key("prefix:page_model_1_2"),
-            Some(InferredTpKey {
-                logical_prefix: "prefix:page_model",
-                rank: 1,
-                size: 2,
-            })
-        );
-        assert!(infer_sglang_tp_key("prefix:page_model_2_2").is_none());
-        assert!(infer_sglang_tp_key("prefix:page_model_01_2").is_none());
-        assert!(infer_sglang_tp_key("prefix:page_model_x_2").is_none());
-        assert!(infer_sglang_tp_key("prefix:page_model_0_0").is_none());
-    }
-
-    #[test]
-    fn tp_atomic_batch_expansion_preserves_every_atomic_member_across_ranks() {
-        let rank0_group = Arc::new(PutAtomicGroup {
-            members: vec![
-                msg_pack::PutAtomicGroupMember {
-                    key: "page0_model_0_2".to_string(),
-                    put_id: (10, 0),
-                },
-                msg_pack::PutAtomicGroupMember {
-                    key: "page1_model_0_2".to_string(),
-                    put_id: (10, 1),
-                },
-            ],
-        });
-        let mut rank0_page0 = test_route((10, 0), None, vec![("gpu0", false)]);
-        rank0_page0.atomic_group = Some(rank0_group);
-        let desc = NodeValueReplicaDesc {
-            weight_bytes: 1024,
-            put_id: (10, 0),
-        };
-        assert_eq!(
-            current_tp_atomic_batch_keys("page0_model_0_2", &rank0_page0, &desc).unwrap(),
-            vec![
-                "page0_model_0_2",
-                "page1_model_0_2",
-                "page0_model_1_2",
-                "page1_model_1_2",
-            ]
-        );
-    }
-
-    #[test]
-    fn exact_cache_detach_rolls_back_identity_mismatch() {
-        let cache = MasterNodeCache::builder(1024 * 1024)
-            .weigher(|_key: &String, desc: &NodeValueReplicaDesc| desc.weight_bytes)
-            .build();
-        let actual = HashMap::from([
-            (
-                "rank0".to_string(),
-                NodeValueReplicaDesc {
-                    weight_bytes: 1024,
-                    put_id: (30, 0),
-                },
-            ),
-            (
-                "rank1".to_string(),
-                NodeValueReplicaDesc {
-                    weight_bytes: 1024,
-                    put_id: (31, 0),
-                },
-            ),
-        ]);
-        for (key, desc) in &actual {
-            insert_master_cache_entry(&cache, key.clone(), desc.clone());
-        }
-        let mut stale_expected = actual.clone();
-        stale_expected.get_mut("rank1").unwrap().put_id = (999, 0);
-
-        assert!(take_exact_cache_entries(&cache, &stale_expected).is_none());
-        assert_eq!(cache.get(&"rank0".to_string()).unwrap().put_id, (30, 0));
-        assert_eq!(cache.get(&"rank1".to_string()).unwrap().put_id, (31, 0));
-
-        let removed = take_exact_cache_entries(&cache, &actual).unwrap();
-        assert_eq!(removed.len(), 2);
-        assert!(cache.get(&"rank0".to_string()).is_none());
-        assert!(cache.get(&"rank1".to_string()).is_none());
-    }
-
-    #[test]
     fn ring_b_cache_is_bounded_for_every_node_role() {
         let cache = MasterNodeCache::builder(64)
             .weigher(|_key: &String, desc: &NodeValueReplicaDesc| desc.weight_bytes)
@@ -2098,7 +1882,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_batch_reclaim_identity_registration_is_all_or_nothing() {
+    fn multi_identity_registration_rolls_back_partial_insert() {
         let request = |keys: &[&str]| reclaim::EvictionReclaimRequest {
             owner_node_id: "cpu0".to_string(),
             owner_node_start_time: None,
@@ -2130,7 +1914,7 @@ mod tests {
         );
 
         // `c` is tentatively installed before the collision on `a`; failure
-        // must roll it back and preserve only the original atomic_batch.
+        // must roll it back and preserve only the original request.
         let overlapping = reclaim::EvictionReclaimRequest {
             members: vec![
                 reclaim::EvictionReclaimMember {
@@ -2370,7 +2154,7 @@ pub struct MasterKvRouterInner {
     pub eviction_reclaim_pending_weight: DashMap<NodeIDString, Arc<AtomicU64>>,
 
     /// Exact, versioned metadata identities currently owned by the lossless
-    /// eviction-reclaim pipeline.  This bounds duplicate Size/atomic_batch events;
+    /// eviction-reclaim pipeline. This bounds duplicate Size/victim events;
     /// payload memory is not retained here.
     pub(crate) eviction_reclaim_inflight: DashSet<reclaim::EvictionReclaimIdentity>,
 
@@ -2382,7 +2166,7 @@ pub struct MasterKvRouterInner {
     /// Bounded maintenance can still process a batch of Size evictions; without
     /// this gate, concurrent async tasks can park multiple Tokio workers on the
     /// same blocking Moka lock. It is a scheduling gate, not a correctness or
-    /// atomic_batch lock, and no cache/global scan occurs under it.
+    /// request lock, and no cache/global scan occurs under it.
     pub(crate) owner_cache_operation_locks: AMapLock<String>,
 
     /// Historical final put placement decisions by target node.
@@ -3022,7 +2806,7 @@ impl MasterKvRouter {
         desc: NodeValueReplicaDesc,
         origin: reclaim::EvictionReclaimOrigin,
     ) -> bool {
-        self.enqueue_eviction_reclaim_atomic_batch(
+        self.enqueue_eviction_reclaim_request(
             owner_node_id,
             vec![reclaim::EvictionReclaimMember {
                 key,
@@ -3033,14 +2817,14 @@ impl MasterKvRouter {
         )
     }
 
-    fn enqueue_eviction_reclaim_atomic_batch(
+    fn enqueue_eviction_reclaim_request(
         &self,
         owner_node_id: NodeIDString,
         members: Vec<reclaim::EvictionReclaimMember>,
         origin: reclaim::EvictionReclaimOrigin,
     ) -> bool {
         matches!(
-            self.enqueue_eviction_reclaim_atomic_batch_exact(
+            self.enqueue_eviction_reclaim_request_exact(
                 owner_node_id,
                 None,
                 members,
@@ -3052,23 +2836,22 @@ impl MasterKvRouter {
         )
     }
 
-    pub(crate) fn enqueue_owner_capacity_eviction_atomic_batch(
+    pub(crate) fn enqueue_owner_capacity_eviction_victim(
         &self,
         owner_node_id: NodeIDString,
         owner_node_start_time: i64,
-        members: Vec<reclaim::EvictionReclaimMember>,
-        allow_new_request: bool,
+        victim: reclaim::EvictionReclaimMember,
     ) -> reclaim::EnqueueEvictionReclaimResult {
-        self.enqueue_eviction_reclaim_atomic_batch_exact(
+        self.enqueue_eviction_reclaim_request_exact(
             owner_node_id,
             Some(owner_node_start_time),
-            members,
+            vec![victim],
             reclaim::EvictionReclaimOrigin::OwnerCapacityEviction,
-            allow_new_request,
+            true,
         )
     }
 
-    fn enqueue_eviction_reclaim_atomic_batch_exact(
+    fn enqueue_eviction_reclaim_request_exact(
         &self,
         owner_node_id: NodeIDString,
         owner_node_start_time: Option<i64>,
@@ -3076,7 +2859,7 @@ impl MasterKvRouter {
         origin: reclaim::EvictionReclaimOrigin,
         allow_new_request: bool,
     ) -> reclaim::EnqueueEvictionReclaimResult {
-        if members.is_empty() {
+        if members.len() != 1 {
             return reclaim::EnqueueEvictionReclaimResult::PartialOverlap;
         }
         let request = reclaim::EvictionReclaimRequest {
@@ -3097,9 +2880,8 @@ impl MasterKvRouter {
             self.eviction_reclaim_counters(&request.owner_node_id)
                 .eviction_reclaim_deduplicated
                 .fetch_add(1, Ordering::Relaxed);
-            // An idempotent retry is accepted only when the complete atomic_batch
-            // is already owned by the pipeline. A partial overlap is not a
-            // valid source handoff.
+            // An idempotent retry is accepted only when the exact victim is
+            // already owned by the pipeline.
             return if request
                 .identities()
                 .iter()
@@ -4663,7 +4445,7 @@ impl MasterKvRouter {
                                 if cause == RemovalCause::Size {
                                     // Listener work is deliberately O(1):
                                     // clone fixed metadata, dedupe, and send
-                                    // to a lossless channel.  Route/atomic_batch
+                                    // to a lossless channel. Route/victim
                                     // lookup belongs to the async actor.
                                     let _ = view.master_kv_router().enqueue_eviction_reclaim(
                                         cache_node_id.clone(),
@@ -5239,8 +5021,8 @@ impl MasterKvRouter {
                 source_evict_rpc_requests: reclaim_counters
                     .source_evict_rpc_requests
                     .load(Ordering::Relaxed),
-                source_evict_atomic_batches: reclaim_counters
-                    .source_evict_atomic_batches
+                source_evict_victims: reclaim_counters
+                    .source_evict_victims
                     .load(Ordering::Relaxed),
                 source_evict_requested_bytes: reclaim_counters
                     .source_evict_requested_bytes
@@ -5313,7 +5095,7 @@ impl MasterKvRouter {
                         );
                         for node in snapshot.replica_cache_nodes {
                             tracing::info!(
-                                "replica cache runtime: owner={} entries={} weighted_bytes={} effective_capacity_bytes={} base_capacity_bytes={} reserved_capacity_bytes={} pending_eviction_reclaim_bytes={} writeback_tier1_entries={} writeback_tier1_weighted_bytes={} writeback_tier1_capacity_bytes={} writeback_tier1_triggered={} writeback_tier1_owner_accepted={} writeback_tier1_failed={} reclaim_master_activity_deferred={} reclaim_owner_holder_deferred={} reclaim_owner_other_deferred={} reclaim_route_changed={} reclaim_retry_queued={} reclaim_retry_completed={} reclaim_retry_restored={} reclaim_completed={} source_evict_rpc_requests={} source_evict_atomic_batches={} source_evict_requested_bytes={} source_evict_accepted={} source_evict_in_progress={} source_evict_completed={} source_evict_retryable_busy={} source_evict_stale={} source_evict_rejected={} last_route_removed_members={} last_route_removed_bytes={} capacity_eviction_non_ring_b_entry_total={} capacity_eviction_hit_committed_slot={} eviction_reclaim_deduplicated={}",
+                                "replica cache runtime: owner={} entries={} weighted_bytes={} effective_capacity_bytes={} base_capacity_bytes={} reserved_capacity_bytes={} pending_eviction_reclaim_bytes={} writeback_tier1_entries={} writeback_tier1_weighted_bytes={} writeback_tier1_capacity_bytes={} writeback_tier1_triggered={} writeback_tier1_owner_accepted={} writeback_tier1_failed={} reclaim_master_activity_deferred={} reclaim_owner_holder_deferred={} reclaim_owner_other_deferred={} reclaim_route_changed={} reclaim_retry_queued={} reclaim_retry_completed={} reclaim_retry_restored={} reclaim_completed={} source_evict_rpc_requests={} source_evict_victims={} source_evict_requested_bytes={} source_evict_accepted={} source_evict_in_progress={} source_evict_completed={} source_evict_retryable_busy={} source_evict_stale={} source_evict_rejected={} last_route_removed_members={} last_route_removed_bytes={} capacity_eviction_non_ring_b_entry_total={} capacity_eviction_hit_committed_slot={} eviction_reclaim_deduplicated={}",
                                 node.owner_node,
                                 node.entries,
                                 node.weighted_bytes,
@@ -5336,7 +5118,7 @@ impl MasterKvRouter {
                                 node.reclaim_retry_restored,
                                 node.reclaim_completed,
                                 node.source_evict_rpc_requests,
-                                node.source_evict_atomic_batches,
+                                node.source_evict_victims,
                                 node.source_evict_requested_bytes,
                                 node.source_evict_accepted,
                                 node.source_evict_in_progress,

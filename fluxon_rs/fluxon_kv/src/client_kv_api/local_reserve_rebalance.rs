@@ -1,5 +1,6 @@
 use super::{
-    ClientKvApiInner, ClientKvApiView, OwnerLocalReserveClassState, OwnerLocalReservePoolState,
+    ClientKvApiInner, ClientKvApiView, OwnerHotEvictionDispatch, OwnerLocalReserveClassState,
+    OwnerLocalReservePoolState,
 };
 use crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
 use crate::master_kv_router::msg_pack::ReserveLocalGrantOutcome;
@@ -107,7 +108,7 @@ fn owner_slot_pressure_request_bytes(
 
 fn owner_slot_pressure_projected_reclaim_bytes(inner: &ClientKvApiInner) -> u64 {
     // Candidate debt starts in Moka's synchronous eviction listener. A
-    // candidate that is incomplete, pinned, or waiting in the retry queue has
+    // candidate that is stale, pinned, or waiting in the retry queue has
     // no installed owner fence and cannot release a slot. Only exact selected
     // source debt is valid projected reclaim credit.
     inner
@@ -533,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_candidate_debt_is_not_projected_reclaim_credit() {
+    fn pre_fence_candidate_debt_is_not_projected_reclaim_credit() {
         let snapshot = RebalanceClassSnapshot {
             slot_size: 1024 * 1024,
             slots_per_grant: 4,
@@ -776,6 +777,17 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
             let Some(cache) = inner.owner_hot_cache.clone() else {
                 continue;
             };
+            if inner
+                .owner_hot_eviction_tx
+                .send(OwnerHotEvictionDispatch::BeginPressure { requested_bytes })
+                .is_err()
+            {
+                tracing::warn!(
+                    requested_bytes,
+                    "owner slot pressure dispatcher is closed before Moka selection"
+                );
+                return;
+            }
             let selected_bytes = match limit_thirdparty::tokio::task::spawn_blocking(move || {
                 cache.evict_some(requested_bytes)
             })
@@ -788,9 +800,21 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
                         err = ?err,
                         "owner slot pressure Moka selection task failed"
                     );
-                    continue;
+                    0
                 }
             };
+            if inner
+                .owner_hot_eviction_tx
+                .send(OwnerHotEvictionDispatch::EndPressure { selected_bytes })
+                .is_err()
+            {
+                tracing::warn!(
+                    requested_bytes,
+                    selected_bytes,
+                    "owner slot pressure dispatcher closed after Moka selection"
+                );
+                return;
+            }
             last_kick_at = Some(Instant::now());
             tracing::debug!(
                 requested_bytes,

@@ -3,8 +3,8 @@ use crate::cluster_manager::{NodeID, NodeIDString};
 use crate::master_kv_router::msg_pack::{
     BatchEvictOwnerSourceReq, BatchEvictOwnerSourceResp, BatchOwnerReclaimReq, OwnerReclaimBacking,
     OwnerReclaimItem, OwnerReclaimItemResp, OwnerReclaimItemState, OwnerReclaimPhase,
-    OwnerReclaimReason, OwnerSourceEvictionAtomicBatch, OwnerSourceEvictionAtomicBatchResp,
-    OwnerSourceEvictionOutcome,
+    OwnerReclaimReason, OwnerSourceEvictionOutcome, OwnerSourceEvictionVictim,
+    OwnerSourceEvictionVictimResp, owner_source_eviction_epoch,
 };
 use crate::p2p::msg_pack::{MIN_EXPLICIT_RPC_TIMEOUT_SECS, MsgPack, RPCCaller};
 use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, OK};
@@ -66,10 +66,10 @@ mod timeout_contract_tests {
 }
 
 #[cfg(test)]
-mod atomic_batch_transaction_tests {
+mod single_victim_transaction_tests {
     use super::*;
     use crate::master_kv_router::msg_pack::{
-        OwnerSourceEvictionMember, PutAtomicGroup, PutAtomicGroupMember,
+        OwnerSourceEvictionVictim, PutAtomicGroup, PutAtomicGroupMember,
     };
     use crate::master_kv_router::{
         CommittedSlotReplica, KvRouteInfo, MasterKeyActivityKind, MasterKeyActivityTable,
@@ -79,7 +79,7 @@ mod atomic_batch_transaction_tests {
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
 
     fn item(key: &str, epoch: u64) -> OwnerReclaimItem {
         OwnerReclaimItem {
@@ -96,26 +96,24 @@ mod atomic_batch_transaction_tests {
     }
 
     #[test]
-    fn atomic_batch_master_fences_roll_back_all_members_when_one_is_busy() {
+    fn single_victim_master_fence_rejects_a_busy_key() {
         let activity = Arc::new(MasterKeyActivityTable::default());
-        let items = vec![item("rank0", 1), item("rank1", 2)];
+        let items = vec![item("victim", 1)];
         let _busy = activity
-            .reserve("rank1", MasterKeyActivityKind::Get, false)
+            .reserve("victim", MasterKeyActivityKind::Get, false)
             .unwrap();
 
-        assert!(try_install_atomic_batch_master_fences(&activity, &items).is_err());
-        assert!(!activity.has_reclaim("rank0"));
-        assert!(!activity.has_reclaim("rank1"));
+        assert!(try_install_master_fences(&activity, &items).is_err());
+        assert!(!activity.has_reclaim("victim"));
     }
 
     #[test]
-    fn atomic_batch_master_fences_install_and_clear_as_one_set() {
+    fn single_victim_master_fence_installs_and_clears() {
         let activity = Arc::new(MasterKeyActivityTable::default());
-        let items = vec![item("rank0", 1), item("rank1", 2)];
+        let items = vec![item("victim", 1)];
 
-        try_install_atomic_batch_master_fences(&activity, &items).unwrap();
-        assert!(activity.has_reclaim("rank0"));
-        assert!(activity.has_reclaim("rank1"));
+        try_install_master_fences(&activity, &items).unwrap();
+        assert!(activity.has_reclaim("victim"));
         for item in &items {
             assert!(activity.clear_reclaim(item));
         }
@@ -138,13 +136,13 @@ mod atomic_batch_transaction_tests {
         );
     }
 
-    fn source_member(
+    fn source_victim(
         key: &str,
         put_id: (u64, u32),
         grant_id: u64,
         slot_index: u32,
-    ) -> OwnerSourceEvictionMember {
-        OwnerSourceEvictionMember {
+    ) -> OwnerSourceEvictionVictim {
+        OwnerSourceEvictionVictim {
             key: key.to_string(),
             put_id,
             backing: OwnerReclaimBacking::CommittedSlot {
@@ -157,7 +155,7 @@ mod atomic_batch_transaction_tests {
 
     fn source_route(
         owner: &NodeID,
-        member: &OwnerSourceEvictionMember,
+        member: &OwnerSourceEvictionVictim,
         atomic_group: Option<Arc<PutAtomicGroup>>,
         include_cpu_replica: bool,
     ) -> Arc<OneKvNodesRoutes> {
@@ -217,7 +215,7 @@ mod atomic_batch_transaction_tests {
         })
     }
 
-    fn source_reclaim_item(member: &OwnerSourceEvictionMember) -> OwnerReclaimItem {
+    fn source_reclaim_item(member: &OwnerSourceEvictionVictim) -> OwnerReclaimItem {
         OwnerReclaimItem {
             key: member.key.clone(),
             put_id: member.put_id,
@@ -230,25 +228,17 @@ mod atomic_batch_transaction_tests {
     #[test]
     fn exact_source_plan_accepts_with_or_without_a_cpu_replica() {
         let owner: NodeID = "gpu0".to_string().into();
-        let member = source_member("single", (10, 1), 7, 3);
-        let atomic_batch = OwnerSourceEvictionAtomicBatch {
-            members: vec![member.clone()],
-        };
+        let member = source_victim("single", (10, 1), 7, 3);
 
         for include_cpu_replica in [false, true] {
             let route = source_route(&owner, &member, None, include_cpu_replica);
-            let plan = plan_exact_owner_source_atomic_batch_with(&owner, &atomic_batch, &|key| {
+            let plan = plan_exact_owner_source_victim_with(&owner, &member, &|key| {
                 (key == "single").then(|| route.clone())
             });
             match plan {
-                OwnerSourceAtomicBatchPlan::Ready {
-                    members,
-                    all_sources_present,
-                } => {
-                    assert!(all_sources_present);
-                    assert_eq!(members.len(), 1);
-                    assert_eq!(members[0].key, "single");
-                    assert_eq!(members[0].expected_backing, Some(member.backing.clone()));
+                OwnerSourceVictimPlan::Ready(planned) => {
+                    assert_eq!(planned.key, "single");
+                    assert_eq!(planned.expected_backing, Some(member.backing.clone()));
                 }
                 _ => panic!("exact current owner source must be accepted"),
             }
@@ -258,7 +248,7 @@ mod atomic_batch_transaction_tests {
     #[test]
     fn exact_source_removal_deletes_only_gpu_when_cpu_exists_and_last_route_otherwise() {
         let owner: NodeID = "gpu0".to_string().into();
-        let member = source_member("with-cpu", (10, 2), 7, 4);
+        let member = source_victim("with-cpu", (10, 2), 7, 4);
         let routes = dashmap::DashMap::new();
         routes.insert(
             member.key.clone(),
@@ -279,7 +269,7 @@ mod atomic_batch_transaction_tests {
         assert!(!remaining.nodes_replicas.read().contains_key(&owner));
         assert!(remaining.nodes_replicas.read().contains_key("cpu0"));
 
-        let last = source_member("last", (10, 3), 7, 5);
+        let last = source_victim("last", (10, 3), 7, 5);
         routes.insert(last.key.clone(), source_route(&owner, &last, None, false));
         let removed = remove_exact_owner_source_route(&routes, &owner, &source_reclaim_item(&last))
             .expect("last exact GPU source must be removed");
@@ -295,9 +285,9 @@ mod atomic_batch_transaction_tests {
             removed.capacity_bytes
         );
 
-        let stale = source_member("stale", (10, 4), 8, 6);
+        let stale = source_victim("stale", (10, 4), 8, 6);
         routes.insert(stale.key.clone(), source_route(&owner, &stale, None, false));
-        let wrong_identity = source_member("stale", stale.put_id, 999, 6);
+        let wrong_identity = source_victim("stale", stale.put_id, 999, 6);
         assert!(
             remove_exact_owner_source_route(
                 &routes,
@@ -310,52 +300,10 @@ mod atomic_batch_transaction_tests {
     }
 
     #[test]
-    fn partial_source_absence_is_replay_only_and_all_absent_is_completed() {
+    fn singleton_source_is_independent_of_atomic_group_siblings() {
         let owner: NodeID = "gpu0".to_string().into();
-        let a = source_member("a", (11, 0), 8, 0);
-        let b = source_member("b", (11, 1), 8, 1);
-        let atomic_batch = OwnerSourceEvictionAtomicBatch {
-            members: vec![a.clone(), b.clone()],
-        };
-        let group = Arc::new(PutAtomicGroup {
-            members: vec![
-                PutAtomicGroupMember {
-                    key: a.key.clone(),
-                    put_id: a.put_id,
-                },
-                PutAtomicGroupMember {
-                    key: b.key.clone(),
-                    put_id: b.put_id,
-                },
-            ],
-        });
-        let route_a = source_route(&owner, &a, Some(group), false);
-
-        match plan_exact_owner_source_atomic_batch_with(&owner, &atomic_batch, &|key| {
-            (key == "a").then(|| route_a.clone())
-        }) {
-            OwnerSourceAtomicBatchPlan::Ready {
-                all_sources_present,
-                ..
-            } => assert!(!all_sources_present),
-            _ => panic!(
-                "a partially removed accepted atomic_batch must be recognized as replay-only"
-            ),
-        }
-        assert!(matches!(
-            plan_exact_owner_source_atomic_batch_with(&owner, &atomic_batch, &|_| None),
-            OwnerSourceAtomicBatchPlan::Completed(_)
-        ));
-    }
-
-    #[test]
-    fn one_stale_or_inconsistent_member_rejects_the_whole_source_atomic_batch() {
-        let owner: NodeID = "gpu0".to_string().into();
-        let a = source_member("a", (12, 0), 9, 0);
-        let b = source_member("b", (12, 1), 9, 1);
-        let atomic_batch = OwnerSourceEvictionAtomicBatch {
-            members: vec![a.clone(), b.clone()],
-        };
+        let a = source_victim("a", (12, 0), 9, 0);
+        let b = source_victim("b", (12, 1), 9, 1);
         let group = Arc::new(PutAtomicGroup {
             members: vec![
                 PutAtomicGroupMember {
@@ -369,31 +317,99 @@ mod atomic_batch_transaction_tests {
             ],
         });
         let route_a = source_route(&owner, &a, Some(group.clone()), false);
-        let changed_b = source_member("b", b.put_id, 99, 1);
-        let route_b_with_changed_backing =
-            source_route(&owner, &changed_b, Some(group.clone()), false);
-        let stale_backing_plan =
-            plan_exact_owner_source_atomic_batch_with(&owner, &atomic_batch, &|key| match key {
-                "a" => Some(route_a.clone()),
-                "b" => Some(route_b_with_changed_backing.clone()),
-                _ => None,
-            });
-        assert!(matches!(
-            stale_backing_plan,
-            OwnerSourceAtomicBatchPlan::Stale(_)
-        ));
+        match plan_exact_owner_source_victim_with(&owner, &a, &|key| {
+            (key == "a").then(|| route_a.clone())
+        }) {
+            OwnerSourceVictimPlan::Ready(planned) => assert_eq!(planned.key, "a"),
+            _ => panic!("one current key must be reclaimable without its siblings"),
+        }
 
-        let route_b_without_group = source_route(&owner, &b, None, false);
-        let inconsistent_group_plan =
-            plan_exact_owner_source_atomic_batch_with(&owner, &atomic_batch, &|key| match key {
-                "a" => Some(route_a.clone()),
-                "b" => Some(route_b_without_group.clone()),
-                _ => None,
-            });
+        let changed_a = source_victim("a", a.put_id, 99, 0);
+        let changed_route = source_route(&owner, &changed_a, Some(group), false);
         assert!(matches!(
-            inconsistent_group_plan,
-            OwnerSourceAtomicBatchPlan::Rejected(_)
+            plan_exact_owner_source_victim_with(&owner, &a, &|key| {
+                (key == "a").then(|| changed_route.clone())
+            }),
+            OwnerSourceVictimPlan::Stale(_)
         ));
+    }
+
+    #[test]
+    fn absent_single_source_is_already_completed() {
+        let owner: NodeID = "gpu0".to_string().into();
+        let victim = source_victim("gone", (13, 0), 10, 0);
+        assert!(matches!(
+            plan_exact_owner_source_victim_with(&owner, &victim, &|_| None),
+            OwnerSourceVictimPlan::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn direct_delete_batch_keeps_results_independent_and_replay_idempotent() {
+        let owner: NodeID = "gpu0".to_string().into();
+        let ready = source_victim("ready", (14, 0), 11, 0);
+        let busy = source_victim("busy", (14, 1), 11, 1);
+        let stale = source_victim("stale", (14, 2), 11, 2);
+        let routes = dashmap::DashMap::new();
+        for victim in [&ready, &busy, &stale] {
+            routes.insert(
+                victim.key.clone(),
+                source_route(&owner, victim, None, false),
+            );
+        }
+        let activity = Arc::new(MasterKeyActivityTable::default());
+        let _busy_get = activity
+            .reserve(&busy.key, MasterKeyActivityKind::Get, false)
+            .expect("busy victim must hold a master Get lease");
+        let stale_request = source_victim("stale", stale.put_id, 999, 2);
+        let victims = vec![ready.clone(), busy.clone(), stale_request];
+        let responses = direct_delete_exact_owner_source_batch_with(
+            activity.as_ref(),
+            &owner,
+            77,
+            &victims,
+            &|key| routes.get(key).map(|route| route.clone()),
+            |item| remove_exact_owner_source_route(&routes, &owner, item).is_some(),
+        );
+
+        assert_eq!(
+            responses
+                .iter()
+                .map(|response| response.outcome)
+                .collect::<Vec<_>>(),
+            vec![
+                OwnerSourceEvictionOutcome::Completed,
+                OwnerSourceEvictionOutcome::RetryableBusy,
+                OwnerSourceEvictionOutcome::Stale,
+            ]
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .map(|response| response.victim_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "one batch response vector must stay aligned with every input victim"
+        );
+        assert!(!routes.contains_key(&ready.key));
+        assert!(routes.contains_key(&busy.key));
+        assert!(routes.contains_key(&stale.key));
+        assert!(!activity.has_reclaim(&ready.key));
+
+        let replay_delete_called = AtomicBool::new(false);
+        let replay = direct_delete_exact_owner_source_with(
+            activity.as_ref(),
+            &owner,
+            &ready,
+            owner_source_eviction_epoch(77, 0),
+            &|key| routes.get(key).map(|route| route.clone()),
+            |_| {
+                replay_delete_called.store(true, Ordering::Relaxed);
+                false
+            },
+        );
+        assert_eq!(replay.0, OwnerSourceEvictionOutcome::Completed);
+        assert!(!replay_delete_called.load(Ordering::Relaxed));
     }
 }
 
@@ -469,7 +485,6 @@ impl EvictionReclaimRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MasterCapacityPlanError {
     RouteChanged,
-    InvalidAtomicBatch,
     WrongRole,
     CommittedSlot,
 }
@@ -529,84 +544,25 @@ fn allocation_member_from_route(
     ))
 }
 
-/// Expand one master Size event by point-looking up its atomic/TP atomic_batch.
-/// This function never iterates the resident cache or global route table.
-fn plan_master_allocation_capacity_atomic_batch(
+/// Validate one exact key popped by the master Allocation Moka.
+fn plan_master_allocation_capacity_victim(
     view: &MasterKvRouterView,
     request: &EvictionReclaimRequest,
-) -> Result<Vec<EvictionReclaimMember>, MasterCapacityPlanError> {
+) -> Result<EvictionReclaimMember, MasterCapacityPlanError> {
     if request.origin != EvictionReclaimOrigin::MasterAllocationCapacity
-        || request.members.is_empty()
+        || request.members.len() != 1
     {
         return Err(MasterCapacityPlanError::WrongRole);
     }
     let owner: NodeID = request.owner_node_id.clone().into();
     let anchor = &request.members[0];
-    let (current_anchor, anchor_route) = allocation_member_from_route(view, &owner, &anchor.key)?;
+    let (current_anchor, _route) = allocation_member_from_route(view, &owner, &anchor.key)?;
     if current_anchor.desc.put_id != anchor.desc.put_id
         || current_anchor.desc.weight_bytes != anchor.desc.weight_bytes
     {
         return Err(MasterCapacityPlanError::RouteChanged);
     }
-    let mut atomic_batch_keys =
-        super::current_tp_atomic_batch_keys(&anchor.key, &anchor_route, &current_anchor.desc)
-            .map_err(|_| MasterCapacityPlanError::InvalidAtomicBatch)?;
-    atomic_batch_keys.sort_unstable();
-    atomic_batch_keys.dedup();
-    if atomic_batch_keys.is_empty() {
-        return Err(MasterCapacityPlanError::InvalidAtomicBatch);
-    }
-
-    let mut members = Vec::with_capacity(atomic_batch_keys.len());
-    for key in &atomic_batch_keys {
-        let (member, route) = allocation_member_from_route(view, &owner, key)?;
-        let mut peer_keys = super::current_tp_atomic_batch_keys(key, &route, &member.desc)
-            .map_err(|_| MasterCapacityPlanError::InvalidAtomicBatch)?;
-        peer_keys.sort_unstable();
-        peer_keys.dedup();
-        if peer_keys != atomic_batch_keys {
-            return Err(MasterCapacityPlanError::InvalidAtomicBatch);
-        }
-        members.push(member);
-    }
-    Ok(members)
-}
-
-fn detach_present_capacity_atomic_batch_siblings(
-    view: &MasterKvRouterView,
-    owner_node_id: &str,
-    members: &[EvictionReclaimMember],
-) -> Result<Vec<EvictionReclaimMember>, MasterCapacityPlanError> {
-    let cache = view
-        .master_kv_router()
-        .get_node_cache_controller(owner_node_id)
-        .ok_or(MasterCapacityPlanError::RouteChanged)?;
-    let mut expected = HashMap::new();
-    for member in members {
-        if let Some(cached) = cache.get(&member.key) {
-            if cached.put_id != member.desc.put_id
-                || cached.weight_bytes != member.desc.weight_bytes
-            {
-                return Err(MasterCapacityPlanError::RouteChanged);
-            }
-            expected.insert(member.key.clone(), member.desc.clone());
-        }
-    }
-    if expected.is_empty() {
-        return Ok(Vec::new());
-    }
-    super::take_exact_cache_entries(&cache, &expected)
-        .map(|removed| {
-            removed
-                .into_iter()
-                .map(|(key, desc)| EvictionReclaimMember {
-                    key,
-                    desc,
-                    expected_backing: None,
-                })
-                .collect()
-        })
-        .ok_or(MasterCapacityPlanError::RouteChanged)
+    Ok(current_anchor)
 }
 
 fn route_item(
@@ -879,152 +835,170 @@ fn owner_source_member_weight(backing: &OwnerReclaimBacking) -> Option<u32> {
     }
 }
 
-enum OwnerSourceAtomicBatchPlan {
-    Ready {
-        members: Vec<EvictionReclaimMember>,
-        all_sources_present: bool,
-    },
+enum OwnerSourceVictimPlan {
+    Ready(EvictionReclaimMember),
     Completed(&'static str),
     Stale(String),
     Rejected(String),
 }
 
-fn plan_exact_owner_source_atomic_batch(
-    view: &MasterKvRouterView,
+fn plan_exact_owner_source_victim_with(
     owner: &NodeID,
-    atomic_batch: &OwnerSourceEvictionAtomicBatch,
-) -> OwnerSourceAtomicBatchPlan {
-    plan_exact_owner_source_atomic_batch_with(owner, atomic_batch, &|key| {
-        view.master_kv_router()
-            .inner()
-            .kv_routes
-            .get(key)
-            .map(|entry| entry.clone())
-    })
-}
-
-fn plan_exact_owner_source_atomic_batch_with(
-    owner: &NodeID,
-    atomic_batch: &OwnerSourceEvictionAtomicBatch,
+    victim: &OwnerSourceEvictionVictim,
     route_lookup: &dyn Fn(&str) -> Option<Arc<super::OneKvNodesRoutes>>,
-) -> OwnerSourceAtomicBatchPlan {
-    if atomic_batch.members.is_empty() {
-        return OwnerSourceAtomicBatchPlan::Rejected(
-            "empty source-eviction atomic_batch".to_string(),
-        );
+) -> OwnerSourceVictimPlan {
+    let Some(weight_bytes) = owner_source_member_weight(&victim.backing) else {
+        return OwnerSourceVictimPlan::Rejected(format!(
+            "source backing is not an exact committed slot: key={}",
+            victim.key
+        ));
+    };
+    let desc = NodeValueReplicaDesc {
+        weight_bytes,
+        put_id: victim.put_id,
+    };
+    let planned = EvictionReclaimMember {
+        key: victim.key.clone(),
+        desc: desc.clone(),
+        expected_backing: Some(victim.backing.clone()),
+    };
+
+    let Some(route) = route_lookup(&victim.key) else {
+        return OwnerSourceVictimPlan::Completed("exact source replica is already absent");
+    };
+    if route.put_id != victim.put_id {
+        return OwnerSourceVictimPlan::Stale(format!(
+            "route version changed: key={} expected=({},{}) current=({},{})",
+            victim.key, victim.put_id.0, victim.put_id.1, route.put_id.0, route.put_id.1,
+        ));
     }
-
-    let mut expected_keys = atomic_batch
-        .members
-        .iter()
-        .map(|member| member.key.clone())
-        .collect::<Vec<_>>();
-    expected_keys.sort_unstable();
-    expected_keys.dedup();
-    if expected_keys.len() != atomic_batch.members.len() {
-        return OwnerSourceAtomicBatchPlan::Rejected(
-            "source-eviction atomic_batch contains duplicate keys".to_string(),
-        );
+    if route.lease_id.is_some() {
+        return OwnerSourceVictimPlan::Rejected(format!(
+            "leased route is not cache-evictable: key={}",
+            victim.key
+        ));
     }
-
-    let mut planned = Vec::with_capacity(atomic_batch.members.len());
-    let mut absent_sources = 0usize;
-    for member in &atomic_batch.members {
-        let Some(weight_bytes) = owner_source_member_weight(&member.backing) else {
-            return OwnerSourceAtomicBatchPlan::Rejected(format!(
-                "source backing is not an exact committed slot: key={}",
-                member.key
-            ));
-        };
-        let desc = NodeValueReplicaDesc {
-            weight_bytes,
-            put_id: member.put_id,
-        };
-        planned.push(EvictionReclaimMember {
-            key: member.key.clone(),
-            desc: desc.clone(),
-            expected_backing: Some(member.backing.clone()),
-        });
-
-        let Some(route) = route_lookup(&member.key) else {
-            absent_sources += 1;
-            continue;
-        };
-        if route.put_id != member.put_id {
-            return OwnerSourceAtomicBatchPlan::Stale(format!(
-                "route version changed: key={} expected=({},{}) current=({},{})",
-                member.key, member.put_id.0, member.put_id.1, route.put_id.0, route.put_id.1,
-            ));
-        }
-        if route.lease_id.is_some() {
-            return OwnerSourceAtomicBatchPlan::Rejected(format!(
-                "leased route is not cache-evictable: key={}",
-                member.key
-            ));
-        }
-        let replica_matches = {
-            let replicas = route.nodes_replicas.read();
-            match replicas.get(owner) {
-                Some(replica) if !replica.tomb_tag.is_tomb() => {
-                    if !replica.owner_local_indexed {
-                        return OwnerSourceAtomicBatchPlan::Rejected(format!(
-                            "source route is not owner-local indexed: key={}",
-                            member.key
-                        ));
-                    }
-                    reclaim_backing_matches(replica, &member.backing)
-                }
-                _ => {
-                    absent_sources += 1;
-                    continue;
-                }
-            }
-        };
-        if !replica_matches {
-            return OwnerSourceAtomicBatchPlan::Stale(format!(
-                "source backing changed: key={} put_id=({},{})",
-                member.key, member.put_id.0, member.put_id.1
-            ));
-        }
-
-        let mut route_atomic_batch =
-            match super::current_tp_atomic_batch_keys(&member.key, &route, &desc) {
-                Ok(keys) => keys,
-                Err(_) => {
-                    return OwnerSourceAtomicBatchPlan::Rejected(format!(
-                        "master route has an invalid TP/atomic atomic_batch: key={}",
-                        member.key
+    let replica_matches = {
+        let replicas = route.nodes_replicas.read();
+        match replicas.get(owner) {
+            Some(replica) if !replica.tomb_tag.is_tomb() => {
+                if !replica.owner_local_indexed {
+                    return OwnerSourceVictimPlan::Rejected(format!(
+                        "source route is not owner-local indexed: key={}",
+                        victim.key
                     ));
                 }
-            };
-        route_atomic_batch.sort_unstable();
-        route_atomic_batch.dedup();
-        if route_atomic_batch != expected_keys {
-            return OwnerSourceAtomicBatchPlan::Rejected(format!(
-                "owner did not submit the complete TP/atomic atomic_batch: key={} expected_members={} route_members={}",
-                member.key,
-                expected_keys.len(),
-                route_atomic_batch.len(),
-            ));
+                reclaim_backing_matches(replica, &victim.backing)
+            }
+            _ => {
+                return OwnerSourceVictimPlan::Completed("exact source replica is already absent");
+            }
         }
+    };
+    if !replica_matches {
+        return OwnerSourceVictimPlan::Stale(format!(
+            "source backing changed: key={} put_id=({},{})",
+            victim.key, victim.put_id.0, victim.put_id.1
+        ));
+    }
+    OwnerSourceVictimPlan::Ready(planned)
+}
+
+fn direct_delete_exact_owner_source_with(
+    activity: &super::MasterKeyActivityTable,
+    owner: &NodeID,
+    victim: &OwnerSourceEvictionVictim,
+    epoch: u64,
+    route_lookup: &dyn Fn(&str) -> Option<Arc<super::OneKvNodesRoutes>>,
+    delete: impl FnOnce(&OwnerReclaimItem) -> bool,
+) -> (OwnerSourceEvictionOutcome, String) {
+    let member = match plan_exact_owner_source_victim_with(owner, victim, route_lookup) {
+        OwnerSourceVictimPlan::Ready(member) => member,
+        OwnerSourceVictimPlan::Completed(detail) => {
+            return (OwnerSourceEvictionOutcome::Completed, detail.to_string());
+        }
+        OwnerSourceVictimPlan::Stale(detail) => {
+            return (OwnerSourceEvictionOutcome::Stale, detail);
+        }
+        OwnerSourceVictimPlan::Rejected(detail) => {
+            return (OwnerSourceEvictionOutcome::RejectedNotEvictable, detail);
+        }
+    };
+    let item = OwnerReclaimItem {
+        key: member.key,
+        put_id: member.desc.put_id,
+        epoch,
+        backing: member
+            .expected_backing
+            .expect("exact owner source plan must retain its backing"),
+        reason: OwnerReclaimReason::OwnerCapacityEviction,
+    };
+    if let Err(snapshot) = activity.try_install_reclaim(&item) {
+        return (
+            OwnerSourceEvictionOutcome::RetryableBusy,
+            format!(
+                "master key activity is busy: puts={} gets={} replicas={} reclaim_installed={}",
+                snapshot.puts, snapshot.gets, snapshot.replicas, snapshot.reclaim_installed
+            ),
+        );
     }
 
-    if absent_sources == atomic_batch.members.len() {
-        OwnerSourceAtomicBatchPlan::Completed("all exact source replicas are already absent")
-    } else if absent_sources != 0 {
-        // This can be observed while an accepted atomic_batch is between individual
-        // route removals. The exact inflight registration below distinguishes
-        // that case from a malformed new request.
-        OwnerSourceAtomicBatchPlan::Ready {
-            members: planned,
-            all_sources_present: false,
+    let result = match plan_exact_owner_source_victim_with(owner, victim, route_lookup) {
+        OwnerSourceVictimPlan::Ready(_) => {
+            if delete(&item) {
+                (
+                    OwnerSourceEvictionOutcome::Completed,
+                    "exact source route deleted by batch handler".to_string(),
+                )
+            } else {
+                (
+                    OwnerSourceEvictionOutcome::RetryableBusy,
+                    "exact source route could not be deleted under its master fence".to_string(),
+                )
+            }
         }
-    } else {
-        OwnerSourceAtomicBatchPlan::Ready {
-            members: planned,
-            all_sources_present: true,
+        OwnerSourceVictimPlan::Completed(detail) => {
+            (OwnerSourceEvictionOutcome::Completed, detail.to_string())
         }
-    }
+        OwnerSourceVictimPlan::Stale(detail) => (OwnerSourceEvictionOutcome::Stale, detail),
+        OwnerSourceVictimPlan::Rejected(detail) => {
+            (OwnerSourceEvictionOutcome::RejectedNotEvictable, detail)
+        }
+    };
+    assert!(
+        activity.clear_reclaim(&item),
+        "direct-delete master fence must remain installed until route deletion completes"
+    );
+    result
+}
+
+fn direct_delete_exact_owner_source_batch_with(
+    activity: &super::MasterKeyActivityTable,
+    owner: &NodeID,
+    operation_id: u64,
+    victims: &[OwnerSourceEvictionVictim],
+    route_lookup: &dyn Fn(&str) -> Option<Arc<super::OneKvNodesRoutes>>,
+    delete: impl Fn(&OwnerReclaimItem) -> bool,
+) -> Vec<OwnerSourceEvictionVictimResp> {
+    victims
+        .iter()
+        .enumerate()
+        .map(|(index, victim)| {
+            let (outcome, detail) = direct_delete_exact_owner_source_with(
+                activity,
+                owner,
+                victim,
+                owner_source_eviction_epoch(operation_id, index),
+                route_lookup,
+                |item| delete(item),
+            );
+            OwnerSourceEvictionVictimResp {
+                victim_index: u32::try_from(index).unwrap_or(u32::MAX),
+                outcome,
+                detail,
+            }
+        })
+        .collect()
 }
 
 pub(crate) async fn handle_batch_evict_owner_source(
@@ -1039,16 +1013,15 @@ pub(crate) async fn handle_batch_evict_owner_source(
     counters
         .source_evict_rpc_requests
         .fetch_add(1, Ordering::Relaxed);
-    counters.source_evict_atomic_batches.fetch_add(
-        u64::try_from(req.serialize_part.atomic_batches.len()).unwrap_or(u64::MAX),
+    counters.source_evict_victims.fetch_add(
+        u64::try_from(req.serialize_part.victims.len()).unwrap_or(u64::MAX),
         Ordering::Relaxed,
     );
     let requested_bytes = req
         .serialize_part
-        .atomic_batches
+        .victims
         .iter()
-        .flat_map(|atomic_batch| atomic_batch.members.iter())
-        .filter_map(|member| owner_source_member_weight(&member.backing))
+        .filter_map(|victim| owner_source_member_weight(&victim.backing))
         .map(u64::from)
         .fold(0u64, u64::saturating_add);
     counters
@@ -1060,7 +1033,7 @@ pub(crate) async fn handle_batch_evict_owner_source(
         .map(|member| member.node_start_time);
     if current_generation != Some(req.serialize_part.owner_node_start_time) {
         counters.source_evict_rejected.fetch_add(
-            u64::try_from(req.serialize_part.atomic_batches.len()).unwrap_or(u64::MAX),
+            u64::try_from(req.serialize_part.victims.len()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
         let err = KvError::Api(ApiError::InvalidArgument {
@@ -1072,7 +1045,7 @@ pub(crate) async fn handle_batch_evict_owner_source(
         return MsgPack {
             serialize_part: BatchEvictOwnerSourceResp {
                 operation_id,
-                atomic_batches: Vec::new(),
+                victims: Vec::new(),
                 error_code: err.code(),
                 error_json: err.to_json(),
             },
@@ -1080,57 +1053,22 @@ pub(crate) async fn handle_batch_evict_owner_source(
         };
     }
 
-    let mut responses = Vec::with_capacity(req.serialize_part.atomic_batches.len());
-    for (index, atomic_batch) in req.serialize_part.atomic_batches.iter().enumerate() {
-        let (outcome, detail) =
-            match plan_exact_owner_source_atomic_batch(view, &owner, atomic_batch) {
-                OwnerSourceAtomicBatchPlan::Completed(detail) => {
-                    (OwnerSourceEvictionOutcome::Completed, detail.to_string())
-                }
-                OwnerSourceAtomicBatchPlan::Stale(detail) => {
-                    (OwnerSourceEvictionOutcome::Stale, detail)
-                }
-                OwnerSourceAtomicBatchPlan::Rejected(detail) => {
-                    (OwnerSourceEvictionOutcome::RejectedNotEvictable, detail)
-                }
-                OwnerSourceAtomicBatchPlan::Ready {
-                    members,
-                    all_sources_present,
-                } => {
-                    match view
-                        .master_kv_router()
-                        .enqueue_owner_capacity_eviction_atomic_batch(
-                            owner.as_ref().to_string(),
-                            req.serialize_part.owner_node_start_time,
-                            members,
-                            all_sources_present,
-                        ) {
-                        EnqueueEvictionReclaimResult::Accepted => (
-                            OwnerSourceEvictionOutcome::Accepted,
-                            "exact source atomic_batch accepted by reclaim pipeline".to_string(),
-                        ),
-                        EnqueueEvictionReclaimResult::AlreadyInProgress => (
-                            OwnerSourceEvictionOutcome::AlreadyInProgress,
-                            "same exact source atomic_batch is already in progress".to_string(),
-                        ),
-                        EnqueueEvictionReclaimResult::PartialOverlap => (
-                            OwnerSourceEvictionOutcome::RetryableBusy,
-                            "source atomic_batch partially overlaps another reclaim transaction"
-                                .to_string(),
-                        ),
-                        EnqueueEvictionReclaimResult::NotInProgress => (
-                            OwnerSourceEvictionOutcome::Stale,
-                            "partially absent source atomic_batch is not an in-progress replay"
-                                .to_string(),
-                        ),
-                        EnqueueEvictionReclaimResult::Closed => (
-                            OwnerSourceEvictionOutcome::RetryableBusy,
-                            "source reclaim actor is unavailable".to_string(),
-                        ),
-                    }
-                }
-            };
-        let outcome_counter = match outcome {
+    let responses = direct_delete_exact_owner_source_batch_with(
+        &view.master_kv_router().inner().key_activity,
+        &owner,
+        operation_id,
+        &req.serialize_part.victims,
+        &|key| {
+            view.master_kv_router()
+                .inner()
+                .kv_routes
+                .get(key)
+                .map(|route| route.clone())
+        },
+        |item| remove_reclaimed_replica(view, &owner, item),
+    );
+    for response in &responses {
+        let outcome_counter = match response.outcome {
             OwnerSourceEvictionOutcome::Accepted => &counters.source_evict_accepted,
             OwnerSourceEvictionOutcome::AlreadyInProgress => &counters.source_evict_in_progress,
             OwnerSourceEvictionOutcome::Completed => &counters.source_evict_completed,
@@ -1141,17 +1079,29 @@ pub(crate) async fn handle_batch_evict_owner_source(
             OwnerSourceEvictionOutcome::RejectedNotEvictable => &counters.source_evict_rejected,
         };
         outcome_counter.fetch_add(1, Ordering::Relaxed);
-        responses.push(OwnerSourceEvictionAtomicBatchResp {
-            atomic_batch_index: u32::try_from(index).unwrap_or(u32::MAX),
-            outcome,
-            detail,
-        });
     }
+
+    let completed = responses
+        .iter()
+        .filter(|response| response.outcome == OwnerSourceEvictionOutcome::Completed)
+        .count();
+    let retryable = responses
+        .iter()
+        .filter(|response| response.outcome == OwnerSourceEvictionOutcome::RetryableBusy)
+        .count();
+    tracing::info!(
+        owner = %owner,
+        operation_id,
+        victims = responses.len(),
+        completed,
+        retryable,
+        "owner source direct-delete batch completed"
+    );
 
     MsgPack {
         serialize_part: BatchEvictOwnerSourceResp {
             operation_id,
-            atomic_batches: responses,
+            victims: responses,
             error_code: OK,
             error_json: String::new(),
         },
@@ -1566,7 +1516,7 @@ fn clear_master_fences(view: &MasterKvRouterView, items: &[OwnerReclaimItem]) {
     }
 }
 
-fn try_install_atomic_batch_master_fences(
+fn try_install_master_fences(
     activity: &super::MasterKeyActivityTable,
     items: &[OwnerReclaimItem],
 ) -> Result<(), (usize, super::MasterKeyActivitySnapshot)> {
@@ -1585,33 +1535,31 @@ fn try_install_atomic_batch_master_fences(
     Ok(())
 }
 
-/// Reclaim one TP/atomic atomic_batch as a transaction.
-///
-/// Before the first owner Commit, any failed fence/validation/Prepare rolls
-/// the entire atomic_batch back.  Once a response (including an Abort response)
-/// proves that any member was committed, rollback is impossible; the same
-/// transaction retains every master fence and keeps driving the remaining
-/// members until all are committed, then removes/finalizes the whole atomic_batch.
-async fn reclaim_atomic_batch_items(
+/// Reclaim one independently selected key.
+async fn reclaim_single_victim(
     view: &MasterKvRouterView,
     owner: &NodeID,
     items: Vec<OwnerReclaimItem>,
 ) -> u32 {
-    if items.is_empty() {
+    if items.len() != 1 {
+        tracing::error!(
+            owner = %owner,
+            victims = items.len(),
+            "single-key reclaim received a non-singleton request"
+        );
         return 0;
     }
     let counters = view
         .master_kv_router()
         .eviction_reclaim_counters(owner.as_ref());
-    if let Err((failed_index, activity)) = try_install_atomic_batch_master_fences(
-        &view.master_kv_router().inner().key_activity,
-        &items,
-    ) {
+    if let Err((failed_index, activity)) =
+        try_install_master_fences(&view.master_kv_router().inner().key_activity, &items)
+    {
         counters
             .master_activity_deferred
             .fetch_add(1, Ordering::Relaxed);
         tracing::trace!(
-            "atomic_batch reclaim deferred by master activity: owner={} key={} puts={} gets={} replicas={} reclaim_installed={}",
+            "single-key reclaim deferred by master activity: owner={} key={} puts={} gets={} replicas={} reclaim_installed={}",
             owner,
             items[failed_index].key,
             activity.puts,
@@ -1650,7 +1598,7 @@ async fn reclaim_atomic_batch_items(
     }
     if !master_only.is_empty() || owner_coordinated.len() != fenced.len() {
         tracing::error!(
-            "BUG: one reclaim atomic_batch mixed master-only and owner-coordinated backings: owner={} atomic_batch={} master_only={} owner_coordinated={}",
+            "BUG: one single-key reclaim mixed master-only and owner-coordinated backings: owner={} victims={} master_only={} owner_coordinated={}",
             owner,
             fenced.len(),
             master_only.len(),
@@ -1762,7 +1710,7 @@ async fn reclaim_atomic_batch_items(
 
         if rounds == 8 && !committed_keys.is_empty() {
             tracing::warn!(
-                "owner atomic_batch reclaim is rolling forward after partial/uncertain commit: owner={} atomic_batch={} committed={}",
+                "owner single-key reclaim is rolling forward after uncertain commit: owner={} victims={} committed={}",
                 owner,
                 owner_coordinated.len(),
                 committed_keys.len(),
@@ -2152,11 +2100,11 @@ pub(crate) fn spawn_eviction_reclaim_actor(
                             OwnerReclaimReason::OwnerCapacityEviction,
                         ),
                         EvictionReclaimOrigin::MasterAllocationCapacity => {
-                            let members = match plan_master_allocation_capacity_atomic_batch(
+                            let member = match plan_master_allocation_capacity_victim(
                                 &view_task,
                                 &request,
                             ) {
-                                Ok(members) => members,
+                                Ok(member) => member,
                                 Err(MasterCapacityPlanError::CommittedSlot) => {
                                     counters
                                         .capacity_eviction_non_ring_b_entry_total
@@ -2183,10 +2131,6 @@ pub(crate) fn spawn_eviction_reclaim_actor(
                                     counters.route_changed.fetch_add(1, Ordering::Relaxed);
                                     continue;
                                 }
-                                Err(MasterCapacityPlanError::InvalidAtomicBatch) => {
-                                    retry_requests.push(request);
-                                    continue;
-                                }
                                 Err(MasterCapacityPlanError::WrongRole) => {
                                     counters
                                         .capacity_eviction_non_ring_b_entry_total
@@ -2204,80 +2148,9 @@ pub(crate) fn spawn_eviction_reclaim_actor(
                                     continue;
                                 }
                             };
-                            let owner_cache_lock = view_task
-                                .master_kv_router()
-                                .inner()
-                                .owner_cache_operation_locks
-                                .get_lock(owner_node_id.clone());
-                            let owner_cache_guard = owner_cache_lock.lock().await;
-                            let detach_result = detach_present_capacity_atomic_batch_siblings(
-                                &view_task,
-                                &owner_node_id,
-                                &members,
-                            );
-                            drop(owner_cache_guard);
-                            if detach_result.is_err() {
-                                retry_requests.push(request);
-                                continue;
-                            }
-
-                            let planned = members
-                                .iter()
-                                .map(|member| {
-                                    (
-                                        member.key.clone(),
-                                        member.desc.put_id,
-                                        member.desc.weight_bytes,
-                                    )
-                                })
-                                .collect::<HashSet<_>>();
-                            let mut accounting_requests = vec![request];
-                            let mut retained = std::collections::VecDeque::new();
-                            while let Some(other) = pending.pop_front() {
-                                let belongs = other.origin
-                                    == EvictionReclaimOrigin::MasterAllocationCapacity
-                                    && other.members.iter().all(|member| {
-                                        planned.contains(&(
-                                            member.key.clone(),
-                                            member.desc.put_id,
-                                            member.desc.weight_bytes,
-                                        ))
-                                    });
-                                if belongs {
-                                    accounting_requests.push(other);
-                                } else {
-                                    retained.push_back(other);
-                                }
-                            }
-                            pending = retained;
-
-                            let mut accounted = accounting_requests
-                                .iter()
-                                .flat_map(EvictionReclaimRequest::identities)
-                                .collect::<HashSet<_>>();
-                            for member in &members {
-                                let synthetic = EvictionReclaimRequest {
-                                    owner_node_id: owner_node_id.clone(),
-                                    owner_node_start_time: None,
-                                    members: vec![member.clone()],
-                                    origin: EvictionReclaimOrigin::MasterAllocationCapacity,
-                                    retry_count: 0,
-                                };
-                                let identity = synthetic.identities().pop().unwrap();
-                                if accounted.contains(&identity) {
-                                    continue;
-                                }
-                                if view_task
-                                    .master_kv_router()
-                                    .register_eviction_reclaim(&synthetic)
-                                {
-                                    accounted.insert(identity);
-                                    accounting_requests.push(synthetic);
-                                }
-                            }
                             (
-                                members,
-                                accounting_requests,
+                                vec![member],
+                                vec![request],
                                 OwnerReclaimReason::MasterAllocationCapacity,
                             )
                         }
@@ -2306,7 +2179,7 @@ pub(crate) fn spawn_eviction_reclaim_actor(
                         })
                         .collect::<Option<Vec<_>>>();
                     if let Some(items) = items {
-                        let _ = reclaim_atomic_batch_items(&view_task, &owner, items).await;
+                        let _ = reclaim_single_victim(&view_task, &owner, items).await;
                     }
                     for accounting_request in accounting_requests.drain(..) {
                         if request_is_current(&view_task, &accounting_request) {
@@ -2325,7 +2198,7 @@ pub(crate) fn spawn_eviction_reclaim_actor(
                 let retry_count = retry_requests.len();
                 spawn_eviction_reclaim_retry(view_task.clone(), retry_requests);
                 tracing::trace!(
-                    "safe atomic_batch eviction reclaim batch completed: owner={} retry_deferred={}",
+                    "single-key eviction reclaim batch completed: owner={} retry_deferred={}",
                     owner_node_id,
                     retry_count,
                 );

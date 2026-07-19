@@ -620,10 +620,10 @@ impl ClientKvApiInner {
             results[pending.idx] = Some(Ok(Some((user_mem_holder, Some(get_info)))));
         }
 
-        // All members are in get_cached_info before any hot admission can evict one of them.
-        // This keeps atomic/TP atomic_batch write-back decisions complete.
-        for (key, put_id, memory_info, atomic_group) in local_hot_admissions {
-            self.owner_hot_track_committed(&key, put_id, &memory_info, atomic_group.as_ref());
+        // Publish every local index before Moka admission starts selecting
+        // individual capacity victims.
+        for (key, put_id, memory_info, _atomic_group) in local_hot_admissions {
+            self.owner_hot_track_committed(&key, put_id, &memory_info);
         }
 
         Ok(results
