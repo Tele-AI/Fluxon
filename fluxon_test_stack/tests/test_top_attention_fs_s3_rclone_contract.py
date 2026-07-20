@@ -5,9 +5,12 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -54,9 +57,74 @@ def _load_e2e_module():
 
 
 _E2E = _load_e2e_module()
+_S3_SUPPORT = sys.modules["fluxon_fs_s3_test_support"]
 
 
 class TestTopAttentionFsS3RcloneContract(unittest.TestCase):
+    def test_entry_requires_s3_runtime_without_tikv(self) -> None:
+        self.assertEqual(
+            _ENTRY.TEST_REQUIREMENTS,
+            [
+                "docker",
+                "etcd",
+                "fluxon-pyo3",
+                "fluxon-release",
+                "ops",
+                "submodules",
+            ],
+        )
+
+    def test_e2e_imports_s3_only_harness(self) -> None:
+        self.assertEqual(
+            _E2E.FluxonFsS3Harness.__module__,
+            "fluxon_fs_s3_test_support",
+        )
+
+    def test_s3_harness_config_has_no_transfer_state_store(self) -> None:
+        etcd = mock.Mock(endpoint="127.0.0.1:12379")
+        monitor = mock.Mock(
+            prometheus_base_url="http://127.0.0.1:14000/v1/prometheus"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            export_root = root / "export"
+            export_root.mkdir()
+            with mock.patch.object(
+                _S3_SUPPORT,
+                "_EtcdHarness",
+                return_value=etcd,
+            ), mock.patch.object(
+                _S3_SUPPORT,
+                "_DummyMonitoringHarness",
+                return_value=monitor,
+            ), mock.patch.object(
+                _S3_SUPPORT.FluxonFsS3Harness,
+                "_start_stack",
+            ):
+                harness = _S3_SUPPORT.FluxonFsS3Harness(
+                    tag="contract",
+                    work_root=root / "stack",
+                    export_root=export_root,
+                )
+                try:
+                    config = yaml.safe_load(
+                        harness._fs_master_config_path.read_text(encoding="utf-8")
+                    )
+                finally:
+                    harness.close()
+
+        panel = config["fluxon_fs"]["master_panel"]
+        self.assertNotIn("transfer_state_store", panel)
+        self.assertEqual(
+            config["fluxon_fs"]["cache"]["exports"],
+            {
+                "src": {
+                    "remote_root_dir_abs": str(export_root.resolve()),
+                    "cache_max_bytes": 1024 * 1024 * 1024,
+                }
+            },
+        )
+
     def test_complex_fixture_stays_below_one_s3_list_page(self) -> None:
         files = _E2E._build_complex_fixture_files()
 

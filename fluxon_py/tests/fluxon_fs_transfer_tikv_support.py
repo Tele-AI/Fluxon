@@ -1571,22 +1571,6 @@ class FluxonFsRemoteWholeHarness:
             raise RuntimeError("store_config is unavailable before harness init")
         return self._store_config
 
-    @property
-    def s3_endpoint(self) -> str:
-        return self._fs_s3_base_url
-
-    @property
-    def s3_access_key(self) -> str:
-        return self._admin_username
-
-    @property
-    def s3_secret_key(self) -> str:
-        return self._admin_password
-
-    @property
-    def source_export_name(self) -> str:
-        return "src"
-
     def _cluster_scoped_share_mem_dir(self) -> Path:
         return self._share_mem_root / self._cluster_name
 

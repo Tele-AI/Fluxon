@@ -15,7 +15,6 @@ TEST_REQUIREMENTS = [
     "fluxon-release",
     "ops",
     "submodules",
-    "tikv",
 ]
 RCLONE_IMAGE_ENV = "FLUXON_RCLONE_DOCKER_IMAGE_REF"
 RCLONE_IMAGE_REF = "rclone/rclone:1.60.1"

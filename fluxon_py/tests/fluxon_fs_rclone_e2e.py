@@ -11,12 +11,14 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from fluxon_fs_s3_test_support import FluxonFsS3Harness
 
 RCLONE_IMAGE_REF = "rclone/rclone:1.60.1"
 RCLONE_VERSION_LINE = "rclone v1.60.1"
@@ -29,10 +31,6 @@ RCLONE_LIST_READY_TIMEOUT_SECS = 30.0
 COMPLEX_GROUP_COUNT = 8
 COMPLEX_FILES_PER_GROUP = 50
 COMPLEX_EXPECTED_FILE_COUNT = 405
-
-
-if TYPE_CHECKING:
-    from fluxon_fs_transfer_tikv_support import FluxonFsRemoteWholeHarness
 
 
 FileSignature = tuple[int, str]
@@ -156,7 +154,7 @@ def _assert_rclone_version(*, image_ref: str, work_root: Path) -> None:
         )
 
 
-def _write_rclone_config(path: Path, harness: FluxonFsRemoteWholeHarness) -> None:
+def _write_rclone_config(path: Path, harness: FluxonFsS3Harness) -> None:
     path.write_text(
         "\n".join(
             [
@@ -249,13 +247,8 @@ def _build_complex_fixture_files() -> dict[str, bytes]:
 
 
 def run_e2e(*, image_ref: str) -> None:
-    from fluxon_fs_transfer_tikv_support import (
-        FluxonFsRemoteWholeHarness,
-        PreparedTransferFixture,
-    )
-
     work_root = Path(tempfile.mkdtemp(prefix="fluxon_fs_rclone_e2e_"))
-    harness: FluxonFsRemoteWholeHarness | None = None
+    harness: FluxonFsS3Harness | None = None
     try:
         _assert_rclone_version(image_ref=image_ref, work_root=work_root)
 
@@ -269,20 +262,10 @@ def run_e2e(*, image_ref: str) -> None:
                 "nested/deeper/grandchild.txt": b"deep object\n",
             },
         )
-        dst_root = work_root / "unused-dst"
-        dst_root.mkdir()
-        fixture = PreparedTransferFixture(
-            src_root=export_root,
-            skip_entries=[],
-            expected_entries={relpath: signature[0] for relpath, signature in source_signatures.items()},
-            expected_sha256={relpath: signature[1] for relpath, signature in source_signatures.items()},
-            expected_empty_dirs=[],
-        )
-        harness = FluxonFsRemoteWholeHarness(
+        harness = FluxonFsS3Harness(
             tag="fluxon_fs_rclone_e2e",
             work_root=work_root / "stack",
-            fixture=fixture,
-            dst_root=dst_root,
+            export_root=export_root,
         )
         _write_rclone_config(work_root / "rclone.conf", harness)
 
