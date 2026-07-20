@@ -267,7 +267,6 @@ impl RPCReq for PutDoneReq {
 pub struct SsdReplicaCommitReq {
     pub key: String,
     pub put_id: PutIDForAKey,
-    pub node_id: NodeIDString,
     pub len: u64,
 }
 impl MsgPackSerializePart for SsdReplicaCommitReq {

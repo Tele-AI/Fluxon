@@ -12,7 +12,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use io_uring::{IoUring, opcode, types::Fd};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
@@ -171,6 +171,8 @@ struct SsdShardRing {
     capacity: u64,
     head: u64,
     tail: u64,
+    used_bytes: u64,
+    busy_begins: BTreeMap<u64, usize>,
     order: VecDeque<KvSsdKey>,
 }
 
@@ -213,6 +215,8 @@ impl SsdRingBuffer {
                     capacity,
                     head: 0,
                     tail: 0,
+                    used_bytes: 0,
+                    busy_begins: BTreeMap::new(),
                     order: VecDeque::new(),
                 })
                 .collect(),
@@ -237,14 +241,18 @@ impl SsdRingBuffer {
             Some(SsdEntryState::Committed(entry)) if self.is_offset_valid(entry) => entry.clone(),
             _ => return None,
         };
-        let pin = self
-            .read_pins
-            .entry(key.clone())
-            .or_insert_with(|| SsdReadPinInfo {
-                entry: entry.clone(),
-                count: 0,
-            });
-        pin.count += 1;
+        if let Some(pin) = self.read_pins.get_mut(key) {
+            pin.count += 1;
+        } else {
+            self.read_pins.insert(
+                key.clone(),
+                SsdReadPinInfo {
+                    entry: entry.clone(),
+                    count: 1,
+                },
+            );
+            self.mark_busy(&entry);
+        }
         Some(entry)
     }
 
@@ -252,10 +260,62 @@ impl SsdRingBuffer {
         match self.read_pins.get_mut(key) {
             Some(pin) if pin.count > 1 => pin.count -= 1,
             Some(_) => {
-                self.read_pins.remove(key);
+                let pin = self
+                    .read_pins
+                    .remove(key)
+                    .expect("kv ssd read pin disappeared while unpinning");
+                self.unmark_busy(&pin.entry);
             }
             None => debug_assert!(false, "missing kv ssd read pin for key={key:?}"),
         }
+    }
+
+    fn mark_busy(&mut self, entry: &SsdIndexEntry) {
+        let count = self.shards[entry.shard_id]
+            .busy_begins
+            .entry(entry.begin)
+            .or_default();
+        *count += 1;
+    }
+
+    fn unmark_busy(&mut self, entry: &SsdIndexEntry) {
+        let shard = &mut self.shards[entry.shard_id];
+        let remove_begin = match shard.busy_begins.get_mut(&entry.begin) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => true,
+            None => {
+                debug_assert!(false, "missing kv ssd busy entry for {entry:?}");
+                false
+            }
+        };
+        if remove_begin {
+            shard.busy_begins.remove(&entry.begin);
+        }
+    }
+
+    fn account_entry_inserted(&mut self, entry: &SsdIndexEntry) {
+        let shard = &mut self.shards[entry.shard_id];
+        shard.used_bytes = shard.used_bytes.saturating_add(entry.aligned_len);
+        debug_assert!(shard.used_bytes <= shard.capacity);
+    }
+
+    fn account_entry_removed(&mut self, entry: &SsdIndexEntry) {
+        let shard = &mut self.shards[entry.shard_id];
+        debug_assert!(shard.used_bytes >= entry.aligned_len);
+        shard.used_bytes = shard.used_bytes.saturating_sub(entry.aligned_len);
+    }
+
+    fn remove_entry(&mut self, key: &KvSsdKey) -> Option<SsdEntryState> {
+        let state = self.entries.remove(key)?;
+        let entry = state.entry().clone();
+        self.account_entry_removed(&entry);
+        if matches!(state, SsdEntryState::Writing(_)) {
+            self.unmark_busy(&entry);
+        }
+        Some(state)
     }
 
     #[cfg(test)]
@@ -288,6 +348,9 @@ impl SsdRingBuffer {
                     }));
                 }
             });
+        }
+        if self.read_pins.contains_key(&key) {
+            return Ok(SsdPreparedWrite::BlockedByBusyIo);
         }
         let aligned_len = align_up_u64(len, SSD_ALIGNMENT as u64)?;
         let max_capacity = self
@@ -339,6 +402,8 @@ impl SsdRingBuffer {
             };
             self.entries
                 .insert(key.clone(), SsdEntryState::Writing(entry.clone()));
+            self.account_entry_inserted(&entry);
+            self.mark_busy(&entry);
             self.shards[shard_id].order.push_back(key);
             return Ok(SsdPreparedWrite::Ready { entry, evicted });
         }
@@ -390,7 +455,7 @@ impl SsdRingBuffer {
                         .order
                         .pop_front()
                         .expect("front key exists");
-                    if matches!(self.entries.remove(&key), Some(SsdEntryState::Committed(_))) {
+                    if matches!(self.remove_entry(&key), Some(SsdEntryState::Committed(_))) {
                         evicted.push(key);
                     }
                 }
@@ -408,16 +473,17 @@ impl SsdRingBuffer {
             SsdEntryState::Committed(_) => return true,
         };
         if !self.is_offset_valid(&entry) || !success {
-            self.entries.remove(key);
+            self.remove_entry(key);
             return false;
         }
         self.entries
-            .insert(key.clone(), SsdEntryState::Committed(entry));
+            .insert(key.clone(), SsdEntryState::Committed(entry.clone()));
+        self.unmark_busy(&entry);
         true
     }
 
     fn remove(&mut self, key: &KvSsdKey) {
-        self.entries.remove(key);
+        self.remove_entry(key);
     }
 
     fn is_offset_valid(&self, entry: &SsdIndexEntry) -> bool {
@@ -427,30 +493,17 @@ impl SsdRingBuffer {
     }
 
     fn used_bytes_by_shard(&self) -> Vec<u64> {
-        let mut out = vec![0u64; self.shards.len()];
-        for state in self.entries.values() {
-            let entry = state.entry();
-            if self.is_offset_valid(entry) {
-                out[entry.shard_id] = out[entry.shard_id].saturating_add(entry.aligned_len);
-            }
-        }
-        out
+        self.shards.iter().map(|shard| shard.used_bytes).collect()
     }
 
     fn has_busy_entries_before(&self, shard_id: usize, new_tail: u64) -> bool {
         if new_tail <= self.shards[shard_id].tail {
             return false;
         }
-        let writing_busy = self.entries.values().any(|state| match state {
-            SsdEntryState::Writing(entry) => entry.shard_id == shard_id && entry.begin < new_tail,
-            SsdEntryState::Committed(_) => false,
-        });
-        if writing_busy {
-            return true;
-        }
-        self.read_pins
-            .values()
-            .any(|pin| pin.entry.shard_id == shard_id && pin.entry.begin < new_tail)
+        self.shards[shard_id]
+            .busy_begins
+            .first_key_value()
+            .is_some_and(|(begin, _)| *begin < new_tail)
     }
 }
 
@@ -1123,11 +1176,19 @@ impl KvSsdStorage {
         let mut next_offset = 0u64;
         let mut inflight = FuturesUnordered::new();
         let max_read_inflight = max_read_inflight.max(1);
+        let mut first_error = None;
 
         loop {
-            while next_offset < len && inflight.len() < max_read_inflight {
+            while first_error.is_none() && next_offset < len && inflight.len() < max_read_inflight {
                 let payload_len = chunk_bytes.min(len - next_offset);
-                let stage_addr = checked_add_u64(target_addr, next_offset, "chunk stage addr")?;
+                let stage_addr = match checked_add_u64(target_addr, next_offset, "chunk stage addr")
+                {
+                    Ok(stage_addr) => stage_addr,
+                    Err(err) => {
+                        first_error = Some(err);
+                        break;
+                    }
+                };
                 let remaining_target_len = target_len - next_offset;
                 inflight.push(self.load_entry_range_into_addr(
                     key.clone(),
@@ -1143,14 +1204,25 @@ impl KvSsdStorage {
             let Some(chunk) = inflight.next().await else {
                 break;
             };
-            let chunk = chunk?;
-            ready_tx.send(chunk).await.map_err(|err| {
-                KvError::Api(ApiError::InvalidArgument {
-                    detail: format!("kv ssd chunk ready queue closed: {}", err),
-                })
-            })?;
+            match chunk {
+                Ok(chunk) if first_error.is_none() => {
+                    if let Err(err) = ready_tx.send(chunk).await {
+                        first_error = Some(KvError::Api(ApiError::InvalidArgument {
+                            detail: format!("kv ssd chunk ready queue closed: {err}"),
+                        }));
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
         }
-        Ok(())
+        if let Some(err) = first_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
     async fn load_entry_range_into_addr(
@@ -1349,15 +1421,15 @@ async fn ssd_writer_loop(
     eviction_tx: tokio_mpsc::Sender<Vec<SsdReplicaEviction>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let mut pending: VecDeque<WriteCommand> = VecDeque::new();
+    let mut pending: Option<WriteCommand> = None;
     let mut inflight = FuturesUnordered::new();
     let max_inflight = write_inflight.max(1);
+    let mut rx_open = true;
 
     loop {
-        while inflight.len() < max_inflight {
-            let Some(cmd) = pending.pop_front() else {
-                break;
-            };
+        if inflight.len() < max_inflight
+            && let Some(cmd) = pending.take()
+        {
             let (prepared, existing_guard) =
                 prepare_ssd_write(&inner, &space_notify, &cmd.key, cmd.entry_len, &shard_ids);
             match prepared {
@@ -1382,75 +1454,31 @@ async fn ssd_writer_loop(
                     let _ = cmd.done_tx.send(result);
                 }
                 Ok(SsdPreparedWrite::BlockedByBusyIo) => {
-                    pending.push_front(cmd);
-                    break;
+                    pending = Some(cmd);
                 }
                 Err(err) => {
                     let _ = cmd.done_tx.send(Err(err));
                 }
             }
+        }
+
+        if !rx_open && pending.is_none() && inflight.is_empty() {
+            break;
         }
 
         tokio::select! {
             Some(completion) = inflight.next(), if !inflight.is_empty() => {
                 finish_write_completion(&inner, &space_notify, completion);
             }
-            Some(cmd) = rx.recv() => {
-                pending.push_back(cmd);
+            maybe_cmd = rx.recv(), if rx_open && pending.is_none() && inflight.len() < max_inflight => {
+                match maybe_cmd {
+                    Some(cmd) => pending = Some(cmd),
+                    None => rx_open = false,
+                }
             }
-            _ = space_notify.notified(), if !pending.is_empty() => {
+            _ = space_notify.notified(), if pending.is_some() => {
                 // Retry pending commands after an active read/write releases a ring position.
             }
-            else => {
-                if pending.is_empty() && inflight.is_empty() {
-                    break;
-                }
-            },
-        }
-    }
-
-    while !pending.is_empty() || !inflight.is_empty() {
-        while inflight.len() < max_inflight {
-            let Some(cmd) = pending.pop_front() else {
-                break;
-            };
-            let (prepared, existing_guard) =
-                prepare_ssd_write(&inner, &space_notify, &cmd.key, cmd.entry_len, &shard_ids);
-            match prepared {
-                Ok(SsdPreparedWrite::Ready { entry, evicted }) => {
-                    publish_ssd_evictions(&eviction_tx, &mut shutdown_rx, evicted).await;
-                    inflight.push(execute_write(
-                        WriteTask {
-                            key: cmd.key,
-                            entry,
-                            data: cmd.data,
-                            done_tx: cmd.done_tx,
-                        },
-                        Arc::clone(&io),
-                    ));
-                }
-                Ok(SsdPreparedWrite::Existing) => {
-                    let result = existing_guard.ok_or_else(|| {
-                        KvError::Api(ApiError::KeyNotFound {
-                            key: cmd.key.key.clone(),
-                        })
-                    });
-                    let _ = cmd.done_tx.send(result);
-                }
-                Ok(SsdPreparedWrite::BlockedByBusyIo) => {
-                    pending.push_front(cmd);
-                    break;
-                }
-                Err(err) => {
-                    let _ = cmd.done_tx.send(Err(err));
-                }
-            }
-        }
-
-        if let Some(completion) = inflight.next().await {
-            finish_write_completion(&inner, &space_notify, completion);
-        } else if !pending.is_empty() {
-            space_notify.notified().await;
         }
     }
 }
@@ -3005,6 +3033,63 @@ mod tests {
         assert_eq!(out_slice, data.as_slice());
     }
 
+    #[::tokio::test]
+    async fn chunked_load_drains_issued_reads_after_a_chunk_error() {
+        let store = new_store(1024 * 1024).await;
+        let data = (0..2500).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
+        let put_id = (13, 2);
+        store.persist("chunk-error", put_id, &data).await.unwrap();
+
+        let mut out = AlignedBuffer::zeroed(2560).unwrap();
+        let (ready_tx, _ready_rx) = ::tokio::sync::mpsc::channel(3);
+        let err = store
+            .load_into_addr_chunks(
+                "chunk-error",
+                put_id,
+                out.as_mut_ptr() as u64,
+                data.len() as u64,
+                data.len() as u64,
+                1024,
+                3,
+                ready_tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("chunk target capacity too small"));
+
+        let out_slice = unsafe { std::slice::from_raw_parts(out.as_ptr(), 2048) };
+        assert_eq!(out_slice, &data[..2048]);
+    }
+
+    #[::tokio::test]
+    async fn chunked_load_drains_issued_reads_when_ready_receiver_closes() {
+        let store = new_store(1024 * 1024).await;
+        let data = (0..2500).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
+        let put_id = (13, 3);
+        store.persist("chunk-closed", put_id, &data).await.unwrap();
+
+        let mut out = AlignedBuffer::zeroed(2560).unwrap();
+        let (ready_tx, ready_rx) = ::tokio::sync::mpsc::channel(1);
+        drop(ready_rx);
+        let err = store
+            .load_into_addr_chunks(
+                "chunk-closed",
+                put_id,
+                out.as_mut_ptr() as u64,
+                data.len() as u64,
+                out.len() as u64,
+                1024,
+                3,
+                ready_tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("chunk ready queue closed"));
+
+        let out_slice = unsafe { std::slice::from_raw_parts(out.as_ptr(), data.len()) };
+        assert_eq!(out_slice, data.as_slice());
+    }
+
     #[test]
     fn read_path_uses_direct_for_aligned_target_with_enough_capacity() {
         let aligned = SsdIndexEntry {
@@ -3895,6 +3980,70 @@ mod tests {
         assert_eq!(evicted[0].put_id, (1, 0));
     }
 
+    #[::tokio::test]
+    async fn blocked_writer_keeps_backpressure_in_the_bounded_channel() {
+        let store = Arc::new(new_store(512).await);
+        let old_data = vec![1u8; 500];
+        let guard = store
+            .persist_from_addr(
+                "old",
+                (1, 0),
+                old_data.as_ptr() as u64,
+                old_data.len() as u64,
+            )
+            .await
+            .unwrap();
+
+        let mut writes = Vec::new();
+        for idx in 0..(DEFAULT_WRITE_QUEUE_DEPTH + 2) {
+            let store = Arc::clone(&store);
+            writes.push(::tokio::spawn(async move {
+                store
+                    .persist(&format!("queued-{idx}"), (idx as u64 + 2, 0), &[2u8; 500])
+                    .await
+            }));
+        }
+
+        ::tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let capacity = store.devices[0]
+                    .runtime
+                    .lock()
+                    .as_ref()
+                    .expect("SSD runtime must remain open")
+                    .write_tx
+                    .capacity();
+                if capacity == 0 {
+                    break;
+                }
+                ::tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked writer must leave excess work in the bounded channel");
+        ::tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            store.devices[0]
+                .runtime
+                .lock()
+                .as_ref()
+                .expect("SSD runtime must remain open")
+                .write_tx
+                .capacity(),
+            0,
+            "the writer must not drain blocked commands into an unbounded local queue"
+        );
+
+        drop(guard);
+        for write in writes {
+            ::tokio::time::timeout(Duration::from_secs(2), write)
+                .await
+                .expect("queued write must resume")
+                .expect("queued write task must not panic")
+                .expect("queued write must succeed");
+        }
+    }
+
     #[test]
     fn ring_read_pin_blocks_overwrite_until_unpinned() {
         let mut ring = SsdRingBuffer::new(vec![1024]);
@@ -3942,6 +4091,69 @@ mod tests {
         assert!(ring.commit(&old, true));
         let new_entry = prepare_ready(&mut ring, &new);
         assert_eq!(new_entry.file_offset, 0);
+    }
+
+    #[test]
+    fn ring_tracks_used_bytes_and_busy_offsets_incrementally() {
+        let mut ring = SsdRingBuffer::new(vec![1024]);
+        let old = test_key("old", 1);
+        let filler = test_key("filler", 2);
+        let new = test_key("new", 3);
+
+        assert_eq!(ring.used_bytes_by_shard(), vec![0]);
+        let old_entry = prepare_ready(&mut ring, &old);
+        assert_eq!(ring.used_bytes_by_shard(), vec![512]);
+        assert_eq!(ring.shards[0].busy_begins.get(&old_entry.begin), Some(&1));
+
+        assert!(ring.commit(&old, true));
+        assert!(ring.shards[0].busy_begins.is_empty());
+        ring.pin_read(&old).unwrap();
+        ring.pin_read(&old).unwrap();
+        assert_eq!(ring.shards[0].busy_begins.get(&old_entry.begin), Some(&1));
+        ring.unpin_read(&old);
+        assert_eq!(ring.shards[0].busy_begins.get(&old_entry.begin), Some(&1));
+        ring.unpin_read(&old);
+        assert!(ring.shards[0].busy_begins.is_empty());
+
+        prepare_ready(&mut ring, &filler);
+        assert!(ring.commit(&filler, true));
+        assert_eq!(ring.used_bytes_by_shard(), vec![1024]);
+        prepare_ready(&mut ring, &new);
+        assert_eq!(ring.used_bytes_by_shard(), vec![1024]);
+        assert!(ring.get(&old).is_none());
+    }
+
+    #[test]
+    fn ring_failed_write_releases_incremental_accounting() {
+        let mut ring = SsdRingBuffer::new(vec![1024]);
+        let key = test_key("failed", 1);
+        let entry = prepare_ready(&mut ring, &key);
+
+        assert_eq!(ring.used_bytes_by_shard(), vec![512]);
+        assert_eq!(ring.shards[0].busy_begins.get(&entry.begin), Some(&1));
+        assert!(!ring.commit(&key, false));
+        assert_eq!(ring.used_bytes_by_shard(), vec![0]);
+        assert!(ring.shards[0].busy_begins.is_empty());
+    }
+
+    #[test]
+    fn ring_does_not_reuse_a_key_while_its_removed_entry_is_pinned() {
+        let mut ring = SsdRingBuffer::new(vec![1024]);
+        let key = test_key("same-key", 1);
+        prepare_ready(&mut ring, &key);
+        assert!(ring.commit(&key, true));
+        ring.pin_read(&key).unwrap();
+        ring.remove(&key);
+
+        assert!(matches!(
+            ring.prepare_write(key.clone(), 500).unwrap(),
+            SsdPreparedWrite::BlockedByBusyIo
+        ));
+        ring.unpin_read(&key);
+        assert!(matches!(
+            ring.prepare_write(key, 500).unwrap(),
+            SsdPreparedWrite::Ready { .. }
+        ));
     }
 
     #[test]

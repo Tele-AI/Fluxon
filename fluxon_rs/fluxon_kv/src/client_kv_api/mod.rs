@@ -516,7 +516,7 @@ async fn handle_ssd_stage_read(
         Ok(()) => match inner.get_done(req.get_id).await {
             Ok(done) => Ok(done),
             Err(done_err) => {
-                if let Err(revoke_err) = inner.get_revoke(req.get_id).await {
+                if let Err(revoke_err) = inner.finish_ssd_source_revoke(req.get_id, false).await {
                     tracing::warn!(
                         get_id = req.get_id,
                         error = %revoke_err,
@@ -527,7 +527,7 @@ async fn handle_ssd_stage_read(
             }
         },
         Err(transfer_err) => {
-            if let Err(revoke_err) = inner.get_revoke_ssd_source(req.get_id).await {
+            if let Err(revoke_err) = inner.finish_ssd_source_revoke(req.get_id, true).await {
                 tracing::warn!(
                     get_id = req.get_id,
                     error = %revoke_err,
@@ -1176,12 +1176,10 @@ impl ClientKvApiInner {
         put_id: crate::master_kv_router::put::PutIDForAKey,
         len: u64,
     ) -> KvResult<()> {
-        let node_id = self.view.cluster_manager().get_self_info().id.clone();
         let req = MsgPack {
             serialize_part: SsdReplicaCommitReq {
                 key: key.to_string(),
                 put_id,
-                node_id,
                 len,
             },
             raw_bytes: Vec::new(),
@@ -1302,57 +1300,26 @@ impl ClientKvApiInner {
         &self,
         peer_id: Option<NodeIDString>,
         target_addr: u64,
-        mut chunk_rx: ::tokio::sync::mpsc::Receiver<SsdLoadedChunk>,
+        chunk_rx: ::tokio::sync::mpsc::Receiver<SsdLoadedChunk>,
     ) -> KvResult<()> {
-        let mut inflight = FuturesUnordered::new();
-        let mut rx_open = true;
-
-        loop {
-            tokio::select! {
-                maybe_chunk = chunk_rx.recv(), if rx_open && inflight.len() < DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT => {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            let chunk_target_addr = target_addr.checked_add(chunk.offset).ok_or_else(|| {
-                                KvError::Api(ApiError::InvalidArgument {
-                                    detail: format!(
-                                        "kv ssd transfer target addr overflow: target_addr={:#x} offset={}",
-                                        target_addr,
-                                        chunk.offset
-                                    ),
-                                })
-                            })?;
-                            let transfer_engine = self.view.client_transfer_engine();
-                            let peer_id = peer_id.clone();
-                            inflight.push(async move {
-                                transfer_engine
-                                    .transfer_data_no_copy(
-                                        peer_id,
-                                        false,
-                                        chunk.stage_addr,
-                                        chunk_target_addr,
-                                        chunk.len,
-                                        None,
-                                    )
-                                    .await?;
-                                Ok::<(), KvError>(())
-                            });
-                        }
-                        None => {
-                            rx_open = false;
-                        }
-                    }
-                }
-                Some(result) = inflight.next(), if !inflight.is_empty() => {
-                    result?;
-                }
-                else => {
-                    if !rx_open && inflight.is_empty() {
-                        break;
-                    }
-                }
+        drain_loaded_ssd_chunk_transfers(target_addr, chunk_rx, |chunk, chunk_target_addr| {
+            let transfer_engine = self.view.client_transfer_engine();
+            let peer_id = peer_id.clone();
+            async move {
+                transfer_engine
+                    .transfer_data_no_copy(
+                        peer_id,
+                        false,
+                        chunk.stage_addr,
+                        chunk_target_addr,
+                        chunk.len,
+                        None,
+                    )
+                    .await?;
+                Ok(())
             }
-        }
-        Ok(())
+        })
+        .await
     }
 
     pub(crate) async fn stage_kv_from_ssd_source(
@@ -1440,6 +1407,66 @@ impl ClientKvApiInner {
             resp.serialize_part.error_code,
             resp.serialize_part.error_json,
         )
+    }
+}
+
+async fn drain_loaded_ssd_chunk_transfers<F, Fut>(
+    target_addr: u64,
+    mut chunk_rx: ::tokio::sync::mpsc::Receiver<SsdLoadedChunk>,
+    mut transfer: F,
+) -> KvResult<()>
+where
+    F: FnMut(SsdLoadedChunk, u64) -> Fut,
+    Fut: std::future::Future<Output = KvResult<()>>,
+{
+    let mut inflight = FuturesUnordered::new();
+    let mut rx_open = true;
+    let mut first_error = None;
+
+    loop {
+        tokio::select! {
+            maybe_chunk = chunk_rx.recv(), if rx_open && first_error.is_none() && inflight.len() < DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT => {
+                match maybe_chunk {
+                    Some(chunk) => {
+                        let Some(chunk_target_addr) = target_addr.checked_add(chunk.offset) else {
+                            first_error = Some(KvError::Api(ApiError::InvalidArgument {
+                                detail: format!(
+                                    "kv ssd transfer target addr overflow: target_addr={:#x} offset={}",
+                                    target_addr,
+                                    chunk.offset
+                                ),
+                            }));
+                            rx_open = false;
+                            chunk_rx.close();
+                            continue;
+                        };
+                        inflight.push(transfer(chunk, chunk_target_addr));
+                    }
+                    None => {
+                        rx_open = false;
+                    }
+                }
+            }
+            Some(result) = inflight.next(), if !inflight.is_empty() => {
+                if let Err(err) = result {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                        rx_open = false;
+                        chunk_rx.close();
+                    }
+                }
+            }
+            else => {
+                if !rx_open && inflight.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(err) = first_error {
+        Err(err)
+    } else {
+        Ok(())
     }
 }
 
@@ -2668,7 +2695,14 @@ impl ClientKvApiInner {
 
 #[cfg(test)]
 mod ssd_stage_rpc_contract_tests {
-    use super::*;
+    use super::{
+        ApiError, Duration, KvError, MIN_EXPLICIT_RPC_TIMEOUT_SECS,
+        SSD_STAGE_MASTER_LOOKUP_TIMEOUT, SSD_STAGE_READ_RPC_TIMEOUT, SSD_STAGE_RPC_TIMEOUT,
+        SsdLoadedChunk, drain_loaded_ssd_chunk_transfers,
+    };
+    use ::tokio::sync::Notify;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn explicit_timeouts_respect_p2p_contract_and_outer_budget() {
@@ -2676,5 +2710,81 @@ mod ssd_stage_rpc_contract_tests {
         assert!(
             SSD_STAGE_MASTER_LOOKUP_TIMEOUT + SSD_STAGE_RPC_TIMEOUT < SSD_STAGE_READ_RPC_TIMEOUT
         );
+    }
+
+    #[::tokio::test]
+    async fn transfer_pipeline_drains_started_siblings_after_first_error() {
+        let (chunk_tx, chunk_rx) = ::tokio::sync::mpsc::channel::<SsdLoadedChunk>(4);
+        for offset in 0..4 {
+            chunk_tx
+                .try_send(SsdLoadedChunk {
+                    offset,
+                    stage_addr: 0x1000 + offset,
+                    len: 1,
+                })
+                .unwrap();
+        }
+        drop(chunk_tx);
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let started_notify = Arc::new(Notify::new());
+        let fail_gate = Arc::new(Notify::new());
+        let finish_gate = Arc::new(Notify::new());
+        let mut task = ::tokio::spawn({
+            let started = Arc::clone(&started);
+            let completed = Arc::clone(&completed);
+            let started_notify = Arc::clone(&started_notify);
+            let fail_gate = Arc::clone(&fail_gate);
+            let finish_gate = Arc::clone(&finish_gate);
+            async move {
+                drain_loaded_ssd_chunk_transfers(0x2000, chunk_rx, move |chunk, _| {
+                    let started = Arc::clone(&started);
+                    let completed = Arc::clone(&completed);
+                    let started_notify = Arc::clone(&started_notify);
+                    let fail_gate = Arc::clone(&fail_gate);
+                    let finish_gate = Arc::clone(&finish_gate);
+                    async move {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        started_notify.notify_one();
+                        if chunk.offset == 0 {
+                            fail_gate.notified().await;
+                            Err(KvError::Api(ApiError::InvalidArgument {
+                                detail: "injected transfer failure".to_string(),
+                            }))
+                        } else {
+                            finish_gate.notified().await;
+                            completed.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    }
+                })
+                .await
+            }
+        });
+
+        ::tokio::time::timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) != 4 {
+                started_notify.notified().await;
+            }
+        })
+        .await
+        .expect("all transfers must start");
+
+        fail_gate.notify_waiters();
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(50), &mut task)
+                .await
+                .is_err(),
+            "the pipeline must wait for already-started sibling transfers"
+        );
+
+        finish_gate.notify_waiters();
+        let result = ::tokio::time::timeout(Duration::from_secs(1), &mut task)
+            .await
+            .expect("transfer pipeline must finish after siblings drain")
+            .expect("transfer pipeline task must not panic");
+        assert!(result.is_err());
+        assert_eq!(completed.load(Ordering::SeqCst), 3);
     }
 }

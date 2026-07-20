@@ -1132,10 +1132,27 @@ pub async fn handle_get_done(
 
         // Store in get_holding cache (owned manager, flattened key)
         let holder_key = crate::memholder::NodeHolderKey::new(req_node_id.to_string(), holder_id);
-        view.master_kv_router()
+        let holding_inserted = view
+            .master_kv_router()
             .inner()
             .get_holding
-            .insert(holder_key.clone(), holding_info);
+            .insert_if_member_active(holder_key.clone(), holding_info);
+        if !holding_inserted {
+            if allocation_mode == GetAllocationMode::DurableReplica {
+                route.release_get_durable_slot();
+            }
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::GetTimeout {
+                timeout_ms: 0,
+                detail: format!(
+                    "requester {} left before get_id={get_id} could commit its holding",
+                    req_node_id
+                ),
+            });
+            return MsgPack {
+                serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                raw_bytes: Vec::new(),
+            };
+        }
 
         if allocation_mode == GetAllocationMode::DurableReplica {
             let mut promote_committed = false;

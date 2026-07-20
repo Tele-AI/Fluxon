@@ -21,6 +21,7 @@ use crate::{
 };
 use chrono::Utc;
 use std::sync::Arc;
+use std::time::Duration;
 
 const MAX_STALE_SSD_ROUTE_RETRIES: usize = 3;
 
@@ -574,6 +575,39 @@ impl ClientKvApiInner {
 
     pub(super) async fn get_revoke_ssd_source(&self, get_id: u64) -> KvResult<()> {
         self.get_revoke_inner(get_id, true).await
+    }
+
+    pub(super) async fn finish_ssd_source_revoke(
+        &self,
+        get_id: u64,
+        drop_ssd_source: bool,
+    ) -> KvResult<()> {
+        let shutdown_poller = self.view.register_shutdown_poller();
+        let mut attempt = 0u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            match self.get_revoke_inner(get_id, drop_ssd_source).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if !self.shutdown_gate.is_accepting() || !shutdown_poller.is_running() {
+                        return Err(err);
+                    }
+                    if attempt == 1 || attempt.is_multiple_of(10) {
+                        tracing::warn!(
+                            get_id,
+                            attempt,
+                            error = %err,
+                            "Retrying source-owned SSD GetRevoke terminal report"
+                        );
+                    }
+                }
+            }
+
+            let backoff_ms = 100u64
+                .saturating_mul(1u64 << attempt.saturating_sub(1).min(3))
+                .min(1_000);
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
     }
 
     async fn get_revoke_inner(&self, get_id: u64, drop_ssd_source: bool) -> KvResult<()> {

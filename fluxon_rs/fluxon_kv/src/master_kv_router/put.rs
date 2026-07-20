@@ -646,16 +646,16 @@ fn ok_ssd_replica_commit_resp() -> MsgPack<SsdReplicaCommitResp> {
 pub async fn handle_ssd_replica_commit(
     view: MasterKvRouterView,
     req: MsgPack<SsdReplicaCommitReq>,
+    req_node_id: NodeID,
 ) -> MsgPack<SsdReplicaCommitResp> {
     let req = req.serialize_part;
-    let node_id: NodeID = req.node_id.clone().into();
     let Some(route_ref) = view.master_kv_router().inner().kv_routes.get(&req.key) else {
         tracing::debug!(
             "Ignoring SSD replica commit for missing key: key={} put_id=({},{}) node={}",
             req.key,
             req.put_id.0,
             req.put_id.1,
-            req.node_id
+            req_node_id
         );
         return ok_ssd_replica_commit_resp();
     };
@@ -670,19 +670,19 @@ pub async fn handle_ssd_replica_commit(
             req.put_id.1,
             route.put_id.0,
             route.put_id.1,
-            req.node_id
+            req_node_id
         );
         return ok_ssd_replica_commit_resp();
     }
 
-    match route.commit_ssd_replica(&node_id, req.len) {
+    match route.commit_ssd_replica(&req_node_id, req.len) {
         SsdReplicaCommitStatus::MissingMemory => {
             tracing::debug!(
                 "Ignoring SSD replica commit without matching memory replica: key={} put_id=({},{}) node={}",
                 req.key,
                 req.put_id.0,
                 req.put_id.1,
-                req.node_id
+                req_node_id
             );
             return ok_ssd_replica_commit_resp();
         }
@@ -692,7 +692,7 @@ pub async fn handle_ssd_replica_commit(
                 req.key,
                 req.put_id.0,
                 req.put_id.1,
-                req.node_id
+                req_node_id
             );
             return ok_ssd_replica_commit_resp();
         }
@@ -703,7 +703,7 @@ pub async fn handle_ssd_replica_commit(
         req.key,
         req.put_id.0,
         req.put_id.1,
-        req.node_id,
+        req_node_id,
         req.len
     );
     ok_ssd_replica_commit_resp()

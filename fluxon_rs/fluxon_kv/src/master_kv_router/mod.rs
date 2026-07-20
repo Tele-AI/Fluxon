@@ -657,6 +657,50 @@ mod tests {
     }
 
     #[test]
+    fn owner_holding_member_index_rejects_departed_members_without_scanning() {
+        let allocator = Arc::new(
+            OneSegAllocator::new(
+                "holding-index-test".to_string(),
+                SegmentDeviceDescription::Cpu,
+                0,
+                4096,
+            )
+            .expect("test allocator must be created"),
+        );
+        let allocation = Arc::new(
+            allocator
+                .allocate(512)
+                .expect("test allocation must be created"),
+        );
+        let holding = |key: &str, node_id: &str| OwnerHoldingGetInfo {
+            key: key.to_string(),
+            holding_node_id: NodeID::from(node_id.to_string()),
+            len: 512,
+            allocation: Arc::clone(&allocation),
+        };
+        let manager = MasterOwnerMemMgr::default();
+        let a1 = NodeHolderKey::new("node-a".to_string(), 1);
+        let a2 = NodeHolderKey::new("node-a".to_string(), 2);
+        let b1 = NodeHolderKey::new("node-b".to_string(), 3);
+
+        assert!(manager.insert_if_member_active(a1.clone(), holding("a1", "node-a")));
+        assert!(manager.insert_if_member_active(a2.clone(), holding("a2", "node-a")));
+        assert!(manager.insert_if_member_active(b1.clone(), holding("b1", "node-b")));
+        assert_eq!(manager.total(), 3);
+
+        assert_eq!(manager.mark_member_left_and_cleanup("node-a"), 2);
+        assert_eq!(manager.total(), 1);
+        assert!(!manager.insert_if_member_active(a1.clone(), holding("late", "node-a")));
+        assert!(manager.inner().contains_key(&b1));
+
+        manager.mark_member_active("node-a");
+        assert!(manager.insert_if_member_active(a1.clone(), holding("joined", "node-a")));
+        assert_eq!(manager.mark_member_left_and_cleanup("node-a"), 1);
+        assert!(manager.remove(&b1).is_some());
+        assert_eq!(manager.total(), 0);
+    }
+
+    #[test]
     fn one_kv_nodes_routes_updates_memory_and_ssd_independently() {
         let routes = OneKvNodesRoutes::new((1, 0), None);
         let node_id: NodeID = "node-a".to_string().into();
@@ -1320,11 +1364,11 @@ impl MasterKvRouter {
         let view = self.0.view().clone();
         RPCHandler::<SsdReplicaCommitReq>::new().regist(p2p, move |resp, msg| {
             let view = view.clone();
-            let view2 = view.clone();
-            let view_task = view2.clone();
+            let req_node_id = resp.node_id().clone();
+            let view_task = view.clone();
             let _ = view.spawn("rpc_ssd_replica_commit", async move {
                 let t0 = Utc::now().timestamp_micros();
-                let mut ack = handle_ssd_replica_commit(view_task, msg).await;
+                let mut ack = handle_ssd_replica_commit(view_task, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send SsdReplicaCommitResp: {:?}", e);
@@ -1789,16 +1833,13 @@ impl MasterKvRouter {
                 event: ClusterEvent,
             ) {
                 match &event {
-                    ClusterEvent::MemberLeft(node_id) => {
-                        let removed = view
-                            .master_kv_router()
+                    ClusterEvent::MemberJoined(member) | ClusterEvent::MemberUpdated(member) => {
+                        view.master_kv_router()
                             .inner()
                             .get_holding
-                            .cleanup_node(&node_id);
-                        if removed > 0 {
-                            info!("Cleaned up {} holdings for left member {}", removed, node_id);
-                        }
-
+                            .mark_member_active(&member.id);
+                    }
+                    ClusterEvent::MemberLeft(node_id) => {
                         let left_node: NodeID = node_id.clone().into();
                         let inflight_ids = view
                             .master_kv_router()
@@ -1839,8 +1880,16 @@ impl MasterKvRouter {
                                 inflight.release_durable_slot_if_needed();
                             }
                         }
+
+                        let removed = view
+                            .master_kv_router()
+                            .inner()
+                            .get_holding
+                            .mark_member_left_and_cleanup(node_id);
+                        if removed > 0 {
+                            info!("Cleaned up {} holdings for left member {}", removed, node_id);
+                        }
                     }
-                    _ => {}
                 }
 
                 let node_id = event.node_id();

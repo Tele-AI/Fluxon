@@ -11,7 +11,7 @@ use crate::master_kv_router::{MasterKvRouterView, OwnerHoldingGetInfo};
 use crate::p2p::msg_pack::{MsgPack, RPCCaller};
 use crate::rpcresp_kvresult_convert::msg_and_error;
 use async_trait::async_trait;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use fluxon_framework_compiled::shutdown::{ShutdownPoller, ShutdownWaiter};
 use fluxon_framework_compiled::upgrade_view_guard::UpgradeViewGuard;
 use std::collections::HashSet;
@@ -445,6 +445,63 @@ pub(crate) trait MemholderManagerTrait: Sync {
 /// 具体 mgr：绑定 inner + trait，对外固定能力；无需 new，使用 Default。
 pub struct MasterOwnerMemMgr {
     inner: MemholderManagerInner<NodeHolderKey, OwnerHoldingGetInfo>,
+    by_member: DashMap<String, MemberHoldingState>,
+}
+
+#[derive(Default)]
+struct MemberHoldingState {
+    departed: bool,
+    keys: HashSet<NodeHolderKey>,
+}
+
+impl MasterOwnerMemMgr {
+    pub(crate) fn insert_if_member_active(
+        &self,
+        key: NodeHolderKey,
+        value: OwnerHoldingGetInfo,
+    ) -> bool {
+        let mut state = self.by_member.entry(key.node_id.clone()).or_default();
+        if state.departed {
+            return false;
+        }
+        self.inner.as_map().insert(key.clone(), value);
+        state.keys.insert(key);
+        true
+    }
+
+    pub(crate) fn mark_member_active(&self, node_id: &str) {
+        let Entry::Occupied(mut state) = self.by_member.entry(node_id.to_string()) else {
+            return;
+        };
+        if state.get().keys.is_empty() {
+            state.remove();
+        } else {
+            state.get_mut().departed = false;
+        }
+    }
+
+    pub(crate) fn mark_member_left_and_cleanup(&self, node_id: &str) -> usize {
+        let mut state = self.by_member.entry(node_id.to_string()).or_default();
+        state.departed = true;
+        let keys = std::mem::take(&mut state.keys);
+        let mut removed = 0usize;
+        for key in keys {
+            if self.inner.as_map().remove(&key).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    fn remove_member_key(&self, key: &NodeHolderKey) {
+        let Entry::Occupied(mut state) = self.by_member.entry(key.node_id.clone()) else {
+            return;
+        };
+        state.get_mut().keys.remove(key);
+        if state.get().keys.is_empty() && !state.get().departed {
+            state.remove();
+        }
+    }
 }
 
 #[async_trait]
@@ -463,6 +520,12 @@ impl MemholderManagerTrait for MasterOwnerMemMgr {
     #[inline]
     fn inner_map(&self) -> &DashMap<Self::Key, Self::Value> {
         self.inner.as_map()
+    }
+
+    fn remove(&self, key: &Self::Key) -> Option<Self::Value> {
+        let value = self.inner.as_map().remove(key).map(|(_, value)| value)?;
+        self.remove_member_key(key);
+        Some(value)
     }
 
     fn delete_manager(ctx: &Self::DeleteCtx) -> &Self {
@@ -605,6 +668,7 @@ impl Default for MasterOwnerMemMgr {
     fn default() -> Self {
         Self {
             inner: Default::default(),
+            by_member: Default::default(),
         }
     }
 }
