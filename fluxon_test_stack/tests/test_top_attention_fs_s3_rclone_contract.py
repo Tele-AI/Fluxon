@@ -116,6 +116,10 @@ class TestTopAttentionFsS3RcloneContract(unittest.TestCase):
         panel = config["fluxon_fs"]["master_panel"]
         self.assertNotIn("transfer_state_store", panel)
         self.assertEqual(
+            panel["prometheus_base_url"],
+            monitor.prometheus_base_url,
+        )
+        self.assertEqual(
             config["fluxon_fs"]["cache"]["exports"],
             {
                 "src": {

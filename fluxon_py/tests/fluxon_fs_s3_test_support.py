@@ -461,6 +461,7 @@ class FluxonFsS3Harness:
                     "master_panel": {
                         "listen_addr": f"127.0.0.1:{self._ui_port}",
                         "public_base_url": self._ui_base_url,
+                        "prometheus_base_url": self._monitor.prometheus_base_url,
                         "auto_refresh_interval_secs": 2,
                         "access_db_path": str(
                             (self._fs_master_workdir / "access.db").resolve()
