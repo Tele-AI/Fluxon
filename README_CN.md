@@ -305,6 +305,7 @@ ui
 - [开发者 - 5 - 技术文档审校](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---5---%E6%8A%80%E6%9C%AF%E6%96%87%E6%A1%A3%E5%AE%A1%E6%A0%A1/)
 - [开发者 - 6 - Code Review 规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---6---Code-Review-%E8%A7%84%E7%BA%A6/)
 - [开发者 - 7 - 事件订阅与全量快照规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---7---%E4%BA%8B%E4%BB%B6%E8%AE%A2%E9%98%85%E4%B8%8E%E5%85%A8%E9%87%8F%E5%BF%AB%E7%85%A7%E8%A7%84%E7%BA%A6/)
+- [开发者 - 8 - 数据结构与索引设计规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---8---%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84%E4%B8%8E%E7%B4%A2%E5%BC%95%E8%AE%BE%E8%AE%A1%E8%A7%84%E7%BA%A6/)
 
 <a id="contributors"></a>
 

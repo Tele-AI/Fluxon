@@ -6,12 +6,12 @@ use super::{
         GetRevokeResp, GetSourceKind, GetStartReq, GetStartResp, SsdStageBeginReq,
         SsdStageBeginResp,
     },
+    reconcile_inflight_member_generation,
 };
 use crate::kv_ssd_storage::{SSD_ALIGNMENT, align_ssd_io_len};
 use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::delete::remove_one_ssd_replica_for_node;
 use crate::master_kv_router::put::PutIDForAKey;
-use crate::memholder::MemholderManagerTrait;
 use crate::{
     cluster_manager::NodeID, master_seg_manager::one_seg_allocator::Allocation,
     master_seg_manager::one_seg_allocator::OneSegAllocator, p2p::msg_pack::MsgPack,
@@ -21,7 +21,7 @@ use rand::Rng;
 use rand::seq::SliceRandom;
 use std::collections::HashSet;
 use std::future::Future;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 const GET_ALLOCATION_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -326,6 +326,23 @@ pub async fn handle_get_start(
 
     tracing::debug!("Handling GetStartReq: {:?}", req.serialize_part);
 
+    let Some(requester_member) = view
+        .cluster_manager()
+        .get_member_info_cached(req_node_id.as_ref())
+    else {
+        let err = msg_and_error::KvError::Api(msg_and_error::ApiError::GetTimeout {
+            timeout_ms: 0,
+            detail: format!(
+                "requester {} is absent from the master member cache during GET admission",
+                req_node_id
+            ),
+        });
+        return failed_resp_err(err, None, &view, &req.serialize_part.key);
+    };
+    let requester_generation = requester_member.node_start_time;
+    reconcile_inflight_member_generation(&view, req_node_id.as_ref(), requester_generation, false)
+        .await;
+
     let get_id = view
         .master_kv_router()
         .inner()
@@ -454,7 +471,7 @@ pub async fn handle_get_start(
             server_process_us: 0,
         };
         // 创建在途的Get操作信息
-        let info = InflightGetInfo {
+        let info = Arc::new(InflightGetInfo {
             put_id: one_kv_nodes_routes.put_id,
             src_node_id: src_node_id.clone(),
             key: req.serialize_part.key.clone(),
@@ -466,13 +483,30 @@ pub async fn handle_get_start(
             route: one_kv_nodes_routes.clone(),
             allocation_mode,
             source_kind: GetSourceKind::Memory,
+            requester_generation,
+            remote_ssd_source_generation: None,
             ssd_stage_lifecycle: None,
-            cache_capacity_reservation: target_capacity_reservation,
-        };
+            cache_capacity_reservation: parking_lot::Mutex::new(target_capacity_reservation),
+            terminal_claimed: AtomicBool::new(false),
+        });
 
-        view.master_kv_router()
+        if let Err(detail) = view
+            .master_kv_router()
             .inner()
-            .insert_inflight_get(get_id, info);
+            .insert_inflight_get(get_id, Arc::clone(&info))
+        {
+            info.release_durable_slot_if_needed();
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::GetTimeout {
+                timeout_ms: 0,
+                detail: format!("GET admission failed for get_id={get_id}: {detail}"),
+            });
+            return failed_resp_err(
+                err,
+                Some((tombs, one_kv_nodes_routes.put_id)),
+                &view,
+                &req.serialize_part.key,
+            );
+        }
 
         // After selecting source and allocating target, optionally touch the
         // source node's moka to keep the kv alive during transfer (weight=0 => touch).
@@ -516,6 +550,25 @@ pub async fn handle_get_start(
         if selected_node_replicas.tomb_tag.is_tomb() {
             tombs.insert(selected_ssd_key.to_owned());
         } else {
+            let remote_ssd_source_generation = if selected_ssd_key == &req_node_id {
+                None
+            } else {
+                let Some(source_member) = view
+                    .cluster_manager()
+                    .get_member_info_cached(selected_ssd_key.as_ref())
+                else {
+                    tombs.insert(selected_ssd_key.to_owned());
+                    continue;
+                };
+                reconcile_inflight_member_generation(
+                    &view,
+                    selected_ssd_key.as_ref(),
+                    source_member.node_start_time,
+                    false,
+                )
+                .await;
+                Some(source_member.node_start_time)
+            };
             let ssd_replica = selected_node_replicas
                 .ssd
                 .as_ref()
@@ -684,7 +737,7 @@ pub async fn handle_get_start(
                 error_json: String::new(),
                 server_process_us: 0,
             };
-            let info = InflightGetInfo {
+            let info = Arc::new(InflightGetInfo {
                 put_id: one_kv_nodes_routes.put_id,
                 src_node_id: selected_ssd_key.to_owned(),
                 key: req.serialize_part.key.clone(),
@@ -695,14 +748,31 @@ pub async fn handle_get_start(
                 route: one_kv_nodes_routes.clone(),
                 allocation_mode,
                 source_kind: GetSourceKind::Ssd,
+                requester_generation,
+                remote_ssd_source_generation,
                 ssd_stage_lifecycle: (!local_ssd_read)
                     .then(|| Arc::new(parking_lot::Mutex::new(super::SsdStageLifecycle::new()))),
-                cache_capacity_reservation,
-            };
+                cache_capacity_reservation: parking_lot::Mutex::new(cache_capacity_reservation),
+                terminal_claimed: AtomicBool::new(false),
+            });
 
-            view.master_kv_router()
+            if let Err(detail) = view
+                .master_kv_router()
                 .inner()
-                .insert_inflight_get(get_id, info);
+                .insert_inflight_get(get_id, Arc::clone(&info))
+            {
+                info.release_durable_slot_if_needed();
+                let err = msg_and_error::KvError::Api(msg_and_error::ApiError::GetTimeout {
+                    timeout_ms: 0,
+                    detail: format!("GET admission failed for get_id={get_id}: {detail}"),
+                });
+                return failed_resp_err(
+                    err,
+                    Some((tombs, one_kv_nodes_routes.put_id)),
+                    &view,
+                    &req.serialize_part.key,
+                );
+            }
 
             clean_up_tombs(
                 &view,
@@ -778,7 +848,7 @@ fn drop_failed_ssd_source(view: &MasterKvRouterView, inflight_info: &InflightGet
 fn finish_revoked_get(
     view: &MasterKvRouterView,
     get_id: u64,
-    inflight_info: InflightGetInfo,
+    inflight_info: &InflightGetInfo,
     drop_ssd_source: bool,
 ) {
     if drop_ssd_source {
@@ -832,7 +902,7 @@ pub async fn handle_ssd_stage_begin(
         let inflight = view
             .master_kv_router()
             .inner()
-            .get_inflight_get(get_id)
+            .get_inflight_get(source_node_id.as_ref(), get_id)
             .ok_or_else(|| {
                 msg_and_error::KvError::Api(msg_and_error::ApiError::GetTimeout {
                     timeout_ms: 0,
@@ -921,17 +991,23 @@ pub async fn handle_get_revoke(
                 &caller_node_id,
             ))
         }
-    } else if let Some(inflight) = view.master_kv_router().inner().get_inflight_get(get_id) {
+    } else if let Some(inflight) = view
+        .master_kv_router()
+        .inner()
+        .get_inflight_get(caller_node_id.as_ref(), get_id)
+    {
         if let Some(lifecycle) = &inflight.ssd_stage_lifecycle {
             if inflight.src_node_id == caller_node_id {
                 let drop_ssd_source = lifecycle
                     .lock()
                     .finish_revoke_from_source(req.serialize_part.drop_ssd_source);
                 if let Some(drop_ssd_source) = drop_ssd_source {
-                    if let Some(inflight) =
-                        view.master_kv_router().inner().remove_inflight_get(get_id)
+                    if view
+                        .master_kv_router()
+                        .inner()
+                        .claim_terminal_inflight_get(get_id, &inflight)
                     {
-                        finish_revoked_get(&view, get_id, inflight, drop_ssd_source);
+                        finish_revoked_get(&view, get_id, &inflight, drop_ssd_source);
                     }
                     Ok(())
                 } else {
@@ -950,10 +1026,17 @@ pub async fn handle_get_revoke(
                         get_id,
                         "Deferred requester GetRevoke until remote SSD source finalizes"
                     );
-                } else if let Some(inflight) =
-                    view.master_kv_router().inner().remove_inflight_get(get_id)
+                } else if view
+                    .master_kv_router()
+                    .inner()
+                    .claim_terminal_inflight_get(get_id, &inflight)
                 {
-                    finish_revoked_get(&view, get_id, inflight, req.serialize_part.drop_ssd_source);
+                    finish_revoked_get(
+                        &view,
+                        get_id,
+                        &inflight,
+                        req.serialize_part.drop_ssd_source,
+                    );
                 }
                 Ok(())
             } else {
@@ -973,8 +1056,12 @@ pub async fn handle_get_revoke(
                 &caller_node_id,
             ))
         } else {
-            if let Some(inflight) = view.master_kv_router().inner().remove_inflight_get(get_id) {
-                finish_revoked_get(&view, get_id, inflight, req.serialize_part.drop_ssd_source);
+            if view
+                .master_kv_router()
+                .inner()
+                .claim_terminal_inflight_get(get_id, &inflight)
+            {
+                finish_revoked_get(&view, get_id, &inflight, req.serialize_part.drop_ssd_source);
             }
             Ok(())
         }
@@ -1037,7 +1124,11 @@ pub async fn handle_get_done(
         };
     }
 
-    let Some(inflight) = view.master_kv_router().inner().get_inflight_get(get_id) else {
+    let Some(inflight) = view
+        .master_kv_router()
+        .inner()
+        .get_inflight_get(caller_node_id.as_ref(), get_id)
+    else {
         tracing::warn!(get_id, "Get operation not found for completion");
         let err = msg_and_error::KvError::Api(msg_and_error::ApiError::GetTimeout {
             timeout_ms: 0,
@@ -1077,8 +1168,12 @@ pub async fn handle_get_done(
         };
 
         if revoke_requested {
-            if let Some(inflight) = view.master_kv_router().inner().remove_inflight_get(get_id) {
-                finish_revoked_get(&view, get_id, inflight, drop_ssd_source);
+            if view
+                .master_kv_router()
+                .inner()
+                .claim_terminal_inflight_get(get_id, &inflight)
+            {
+                finish_revoked_get(&view, get_id, &inflight, drop_ssd_source);
             }
             let err = msg_and_error::KvError::Api(msg_and_error::ApiError::GetTimeout {
                 timeout_ms: 0,
@@ -1105,8 +1200,13 @@ pub async fn handle_get_done(
     };
 
     // Remove from inflight_gets and transfer to get_holding
-    if let Some(mut inflight_info) = view.master_kv_router().inner().remove_inflight_get(get_id) {
-        let mut cache_capacity_reservation = inflight_info.cache_capacity_reservation.take();
+    if view
+        .master_kv_router()
+        .inner()
+        .claim_terminal_inflight_get(get_id, &inflight)
+    {
+        let inflight_info = inflight;
+        let mut cache_capacity_reservation = inflight_info.cache_capacity_reservation.lock().take();
         let mut allocation_mode = inflight_info.allocation_mode;
         let route = inflight_info.route.clone();
         // clone req_node_id to avoid borrow/move conflict when inserting into kv_routes
@@ -1120,7 +1220,7 @@ pub async fn handle_get_done(
             .next_holder_id
             .fetch_add(1, Ordering::Relaxed);
 
-        let key = inflight_info.key;
+        let key = inflight_info.key.clone();
 
         // Create holding info
         let holding_info = OwnerHoldingGetInfo {
@@ -1130,7 +1230,7 @@ pub async fn handle_get_done(
             allocation: inflight_info.allocation.clone(),
         };
 
-        // Store in get_holding cache (owned manager, flattened key)
+        // Hand the allocation to the requester's member/holder bucket.
         let holder_key = crate::memholder::NodeHolderKey::new(req_node_id.to_string(), holder_id);
         let holding_inserted = view
             .master_kv_router()
@@ -1170,7 +1270,7 @@ pub async fn handle_get_done(
                         if !tomb_tag.is_tomb() {
                             one_kv_nodes_routes.insert_memory_replica(
                                 inflight_info.req_node_id.clone(),
-                                inflight_info.allocation,
+                                inflight_info.allocation.clone(),
                                 tomb_tag,
                             );
                             promote_committed = true;

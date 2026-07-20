@@ -14,8 +14,9 @@ use async_trait::async_trait;
 use dashmap::{DashMap, mapref::entry::Entry};
 use fluxon_framework_compiled::shutdown::{ShutdownPoller, ShutdownWaiter};
 use fluxon_framework_compiled::upgrade_view_guard::UpgradeViewGuard;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 const EXTERNAL_DELETE_ACK_TIMEOUT_SECS: u64 = 5;
@@ -262,18 +263,6 @@ impl NodeHolderKey {
     }
 }
 
-/// Crate-local helper trait used by the default node-scope cleanup path.
-pub(crate) trait HoldByNodeKey {
-    fn hold_by_node(&self, node_id: &str) -> bool;
-}
-
-impl HoldByNodeKey for NodeHolderKey {
-    #[inline]
-    fn hold_by_node(&self, node_id: &str) -> bool {
-        self.hold_by_node(node_id)
-    }
-}
-
 /// Owned, flattened inner that stores the generic map only.
 pub struct MemholderManagerInner<K, V>
 where
@@ -321,7 +310,7 @@ where
     }
 }
 
-/// Unified manager trait for memholder authority plus delete delivery control.
+/// Delete-delivery contract independent of each manager's authority storage shape.
 pub(crate) trait DeleteShutdownCtx: Clone + Send + Sync + 'static {
     fn delete_shutdown_waiter(&self) -> ShutdownWaiter;
     fn delete_shutdown_poller(&self) -> ShutdownPoller;
@@ -349,8 +338,6 @@ impl DeleteShutdownCtx for ClientKvApiView {
 
 #[async_trait]
 pub(crate) trait MemholderManagerTrait: Sync {
-    type Key: Eq + Hash + Send + Sync + Clone + 'static;
-    type Value: Send + Sync + 'static;
     type DeleteCtx: DeleteShutdownCtx;
     type DeleteTask: Clone + Send + Sync + 'static;
     type DeleteTarget: Eq + Hash + Clone + std::fmt::Display + Send + Sync + 'static;
@@ -359,9 +346,6 @@ pub(crate) trait MemholderManagerTrait: Sync {
     const DELETE_TARGET_QUEUE_CAPACITY: usize;
     const DELETE_MERGE_WINDOW_MILLIS: u64;
     const DELETE_RETRY_INTERVAL_MILLIS: u64;
-
-    /// Return the authority map of current memholder holdings.
-    fn inner_map(&self) -> &DashMap<Self::Key, Self::Value>;
 
     /// Resolve the concrete manager instance from the running delete context.
     fn delete_manager(ctx: &Self::DeleteCtx) -> &Self;
@@ -396,62 +380,18 @@ pub(crate) trait MemholderManagerTrait: Sync {
     fn is_delete_shutdown_task(_task: &Self::DeleteTask) -> bool {
         false
     }
-
-    #[inline]
-    fn insert(&self, key: Self::Key, value: Self::Value) {
-        self.inner_map().insert(key, value);
-    }
-
-    #[inline]
-    fn remove(&self, key: &Self::Key) -> Option<Self::Value> {
-        self.inner_map().remove(key).map(|(_k, v)| v)
-    }
-
-    fn cleanup_node(&self, node_id: &str) -> usize
-    where
-        Self::Key: HoldByNodeKey,
-    {
-        // 收集后删除，避免持有引用期间修改
-        let mut keys = Vec::new();
-        for e in self.inner_map().iter() {
-            if HoldByNodeKey::hold_by_node(e.key(), node_id) {
-                keys.push(e.key().clone());
-            }
-        }
-        let mut removed = 0usize;
-        for k in keys {
-            if self
-                .inner_map()
-                .remove_if(&k, |kk, _| HoldByNodeKey::hold_by_node(kk, node_id))
-                .is_some()
-            {
-                removed += 1;
-            }
-        }
-        removed
-    }
-
-    #[inline]
-    fn total(&self) -> usize {
-        self.inner_map().len()
-    }
-
-    #[inline]
-    fn inner(&self) -> &DashMap<Self::Key, Self::Value> {
-        self.inner_map()
-    }
 }
 
-/// 具体 mgr：绑定 inner + trait，对外固定能力；无需 new，使用 Default。
+/// Master-owned holdings grouped by their natural member/holder hierarchy.
 pub struct MasterOwnerMemMgr {
-    inner: MemholderManagerInner<NodeHolderKey, OwnerHoldingGetInfo>,
     by_member: DashMap<String, MemberHoldingState>,
+    total: AtomicUsize,
 }
 
 #[derive(Default)]
 struct MemberHoldingState {
     departed: bool,
-    keys: HashSet<NodeHolderKey>,
+    by_holder_id: HashMap<u64, OwnerHoldingGetInfo>,
 }
 
 impl MasterOwnerMemMgr {
@@ -464,8 +404,13 @@ impl MasterOwnerMemMgr {
         if state.departed {
             return false;
         }
-        self.inner.as_map().insert(key.clone(), value);
-        state.keys.insert(key);
+        assert!(
+            state.by_holder_id.insert(key.holder_id, value).is_none(),
+            "duplicate master holding for member={} holder_id={}",
+            key.node_id,
+            key.holder_id
+        );
+        self.total.fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -473,7 +418,7 @@ impl MasterOwnerMemMgr {
         let Entry::Occupied(mut state) = self.by_member.entry(node_id.to_string()) else {
             return;
         };
-        if state.get().keys.is_empty() {
+        if state.get().by_holder_id.is_empty() {
             state.remove();
         } else {
             state.get_mut().departed = false;
@@ -483,31 +428,49 @@ impl MasterOwnerMemMgr {
     pub(crate) fn mark_member_left_and_cleanup(&self, node_id: &str) -> usize {
         let mut state = self.by_member.entry(node_id.to_string()).or_default();
         state.departed = true;
-        let keys = std::mem::take(&mut state.keys);
-        let mut removed = 0usize;
-        for key in keys {
-            if self.inner.as_map().remove(&key).is_some() {
-                removed += 1;
-            }
-        }
+        let removed = state.by_holder_id.len();
+        state.by_holder_id.clear();
+        self.decrement_total(removed);
         removed
     }
 
-    fn remove_member_key(&self, key: &NodeHolderKey) {
+    pub(crate) fn remove(&self, key: &NodeHolderKey) -> Option<OwnerHoldingGetInfo> {
         let Entry::Occupied(mut state) = self.by_member.entry(key.node_id.clone()) else {
-            return;
+            return None;
         };
-        state.get_mut().keys.remove(key);
-        if state.get().keys.is_empty() && !state.get().departed {
+        let value = state.get_mut().by_holder_id.remove(&key.holder_id)?;
+        if state.get().by_holder_id.is_empty() && !state.get().departed {
             state.remove();
         }
+        self.decrement_total(1);
+        Some(value)
+    }
+
+    #[cfg(any(test, feature = "test_bins"))]
+    pub(crate) fn get(&self, key: &NodeHolderKey) -> Option<OwnerHoldingGetInfo> {
+        let state = self.by_member.get(&key.node_id)?;
+        state.by_holder_id.get(&key.holder_id).cloned()
+    }
+
+    #[cfg(any(test, feature = "test_bins"))]
+    pub(crate) fn total(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    fn decrement_total(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(count)
+            })
+            .unwrap_or_else(|_| panic!("master holding total underflow indicates a logic bug"));
     }
 }
 
 #[async_trait]
 impl MemholderManagerTrait for MasterOwnerMemMgr {
-    type Key = NodeHolderKey;
-    type Value = OwnerHoldingGetInfo;
     type DeleteCtx = MasterKvRouterView;
     type DeleteTask = DeleteKeyInfo;
     type DeleteTarget = DeleteTargetMember;
@@ -516,17 +479,6 @@ impl MemholderManagerTrait for MasterOwnerMemMgr {
     const DELETE_TARGET_QUEUE_CAPACITY: usize = 1000;
     const DELETE_MERGE_WINDOW_MILLIS: u64 = 1000;
     const DELETE_RETRY_INTERVAL_MILLIS: u64 = 1000;
-
-    #[inline]
-    fn inner_map(&self) -> &DashMap<Self::Key, Self::Value> {
-        self.inner.as_map()
-    }
-
-    fn remove(&self, key: &Self::Key) -> Option<Self::Value> {
-        let value = self.inner.as_map().remove(key).map(|(_, value)| value)?;
-        self.remove_member_key(key);
-        Some(value)
-    }
 
     fn delete_manager(ctx: &Self::DeleteCtx) -> &Self {
         &ctx.master_kv_router().inner().get_holding
@@ -667,8 +619,8 @@ impl MemholderManagerTrait for MasterOwnerMemMgr {
 impl Default for MasterOwnerMemMgr {
     fn default() -> Self {
         Self {
-            inner: Default::default(),
             by_member: Default::default(),
+            total: AtomicUsize::new(0),
         }
     }
 }
@@ -713,8 +665,6 @@ impl OwnerDeleteAckMemMgr {
 
 #[async_trait]
 impl MemholderManagerTrait for OwnerDeleteAckMemMgr {
-    type Key = NodeHolderKey;
-    type Value = OwnerDeleteAckItem;
     type DeleteCtx = ClientKvApiView;
     type DeleteTask = OwnerDeleteAckItem;
     type DeleteTarget = OwnerDeleteAckTarget;
@@ -723,11 +673,6 @@ impl MemholderManagerTrait for OwnerDeleteAckMemMgr {
     const DELETE_TARGET_QUEUE_CAPACITY: usize = 1000;
     const DELETE_MERGE_WINDOW_MILLIS: u64 = 10;
     const DELETE_RETRY_INTERVAL_MILLIS: u64 = 200;
-
-    #[inline]
-    fn inner_map(&self) -> &DashMap<Self::Key, Self::Value> {
-        self.inner.as_map()
-    }
 
     fn delete_manager(ctx: &Self::DeleteCtx) -> &Self {
         &ctx.client_kv_api().inner().owner_delete_ack_mgr
@@ -835,10 +780,30 @@ impl Default for OwnerExternalMemMgr {
     }
 }
 
+impl OwnerExternalMemMgr {
+    pub(crate) fn insert(&self, key: NodeHolderKey, value: ExternalHoldingGetInfo) {
+        self.inner.as_map().insert(key, value);
+    }
+
+    pub(crate) fn remove(&self, key: &NodeHolderKey) -> Option<ExternalHoldingGetInfo> {
+        self.inner.as_map().remove(key).map(|(_, value)| value)
+    }
+
+    pub(crate) fn cleanup_node(&self, node_id: &str) -> usize {
+        self.inner.cleanup_with(|key| key.hold_by_node(node_id))
+    }
+
+    pub(crate) fn total(&self) -> usize {
+        self.inner.as_map().len()
+    }
+
+    pub(crate) fn inner(&self) -> &DashMap<NodeHolderKey, ExternalHoldingGetInfo> {
+        self.inner.as_map()
+    }
+}
+
 #[async_trait]
 impl MemholderManagerTrait for OwnerExternalMemMgr {
-    type Key = NodeHolderKey;
-    type Value = ExternalHoldingGetInfo;
     type DeleteCtx = ClientKvApiView;
     type DeleteTask = DeleteClientKvMetaCacheItem;
     type DeleteTarget = DeleteTargetMember;
@@ -847,11 +812,6 @@ impl MemholderManagerTrait for OwnerExternalMemMgr {
     const DELETE_TARGET_QUEUE_CAPACITY: usize = 1000;
     const DELETE_MERGE_WINDOW_MILLIS: u64 = 1000;
     const DELETE_RETRY_INTERVAL_MILLIS: u64 = 1000;
-
-    #[inline]
-    fn inner_map(&self) -> &DashMap<Self::Key, Self::Value> {
-        self.inner.as_map()
-    }
 
     fn delete_manager(ctx: &Self::DeleteCtx) -> &Self {
         &ctx.client_kv_api().inner().external_get_holding

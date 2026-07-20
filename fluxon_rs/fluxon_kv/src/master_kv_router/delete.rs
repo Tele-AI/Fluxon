@@ -8,9 +8,7 @@ use super::{
 };
 use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::put::PutIDForAKey;
-use crate::memholder::{
-    EnsureMemholderMgmtDeleteActorOwned, MasterOwnerMemMgr, MemholderManagerTrait,
-};
+use crate::memholder::{EnsureMemholderMgmtDeleteActorOwned, MasterOwnerMemMgr};
 use crate::{
     cluster_manager::NodeID,
     p2p::msg_pack::{MsgPack, RPCCaller},

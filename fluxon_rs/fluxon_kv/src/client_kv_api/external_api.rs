@@ -12,7 +12,6 @@ use crate::cluster_manager::{
 };
 use crate::master_kv_router::msg_pack::GetSourceKind;
 use crate::memholder::ExternalMemHolderInfo;
-use crate::memholder::MemholderManagerTrait;
 use crate::memholder::NodeHolderKey;
 use crate::p2p::msg_pack::MsgPack;
 use crate::rpcresp_kvresult_convert::FromError;

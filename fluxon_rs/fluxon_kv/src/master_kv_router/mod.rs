@@ -59,7 +59,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
@@ -118,7 +118,6 @@ pub struct InflightPutInfo {
 }
 
 /// Information about a `get` operation that is currently in progress.
-#[derive(Clone)]
 pub struct InflightGetInfo {
     pub put_id: PutIDForAKey,
     pub src_node_id: NodeID,
@@ -130,38 +129,235 @@ pub struct InflightGetInfo {
     pub route: Arc<OneKvNodesRoutes>,
     pub allocation_mode: GetAllocationMode,
     pub source_kind: GetSourceKind,
+    pub(crate) requester_generation: i64,
+    pub(crate) remote_ssd_source_generation: Option<i64>,
     pub(crate) ssd_stage_lifecycle: Option<Arc<Mutex<SsdStageLifecycle>>>,
-    pub(crate) cache_capacity_reservation: Option<Arc<NodeCacheCapacityReservation>>,
+    pub(crate) cache_capacity_reservation: Mutex<Option<Arc<NodeCacheCapacityReservation>>>,
+    terminal_claimed: AtomicBool,
+}
+
+#[derive(Clone)]
+struct InflightGetParticipant {
+    member_id: NodeIDString,
+    generation: i64,
+}
+
+struct MemberInflightGetBucket {
+    state: Mutex<MemberInflightGetState>,
+}
+
+struct MemberInflightGetState {
+    generation: Option<i64>,
+    departed: bool,
+    by_get_id: HashMap<u64, Arc<InflightGetInfo>>,
 }
 
 #[derive(Default)]
-struct InflightGetMemberIndex {
-    by_member: DashMap<NodeIDString, HashSet<u64>>,
+struct InflightGetTable {
+    by_member: DashMap<NodeIDString, Arc<MemberInflightGetBucket>>,
 }
 
-impl InflightGetMemberIndex {
-    fn insert(&self, member_id: &str, get_id: u64) {
-        self.by_member
-            .entry(member_id.to_string())
-            .or_default()
-            .insert(get_id);
-    }
-
-    fn remove(&self, member_id: &str, get_id: u64) {
-        let Entry::Occupied(mut entry) = self.by_member.entry(member_id.to_string()) else {
-            return;
-        };
-        entry.get_mut().remove(&get_id);
-        if entry.get().is_empty() {
-            entry.remove();
+impl MemberInflightGetBucket {
+    fn new(generation: i64) -> Self {
+        Self {
+            state: Mutex::new(MemberInflightGetState {
+                generation: Some(generation),
+                departed: false,
+                by_get_id: HashMap::new(),
+            }),
         }
     }
 
-    fn take(&self, member_id: &str) -> HashSet<u64> {
-        self.by_member
-            .remove(member_id)
-            .map(|(_, get_ids)| get_ids)
-            .unwrap_or_default()
+    fn departed() -> Self {
+        Self {
+            state: Mutex::new(MemberInflightGetState {
+                generation: None,
+                departed: true,
+                by_get_id: HashMap::new(),
+            }),
+        }
+    }
+}
+
+impl InflightGetTable {
+    /// Seed a missing bucket from admission, or authoritatively advance/reactivate
+    /// it from the ordered membership-event path when `reactivate` is true.
+    fn observe_member_generation(
+        &self,
+        member_id: &str,
+        generation: i64,
+        reactivate: bool,
+    ) -> Vec<(u64, Arc<InflightGetInfo>)> {
+        let bucket = match self.by_member.entry(member_id.to_string()) {
+            Entry::Occupied(entry) => Arc::clone(entry.get()),
+            Entry::Vacant(entry) => {
+                let bucket = Arc::new(MemberInflightGetBucket::new(generation));
+                entry.insert(Arc::clone(&bucket));
+                bucket
+            }
+        };
+        let mut state = bucket.state.lock();
+        if state.generation == Some(generation) {
+            if reactivate {
+                state.departed = false;
+            }
+            return Vec::new();
+        }
+
+        // Admission only seeds a previously unseen member bucket. Once a
+        // bucket exists, only the ordered membership-event path may replace
+        // its generation; otherwise a request that captured stale cluster
+        // metadata could roll a newer bucket back to an older incarnation.
+        if !reactivate {
+            return Vec::new();
+        }
+
+        let displaced = state.by_get_id.drain().collect();
+        state.generation = Some(generation);
+        state.departed = false;
+        displaced
+    }
+
+    fn insert(&self, get_id: u64, info: Arc<InflightGetInfo>) -> Result<(), String> {
+        let mut participants = info.participants();
+        participants.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+        let buckets = participants
+            .iter()
+            .map(|participant| {
+                let bucket = self
+                    .by_member
+                    .get(&participant.member_id)
+                    .map(|entry| Arc::clone(entry.value()))
+                    .ok_or_else(|| {
+                        format!(
+                            "member {} generation {} has no inflight bucket",
+                            participant.member_id, participant.generation
+                        )
+                    })?;
+                Ok((participant, bucket))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        match buckets.as_slice() {
+            [(participant, bucket)] => {
+                let mut state = bucket.state.lock();
+                Self::validate_admission(&state, participant)?;
+                assert!(state.by_get_id.insert(get_id, info).is_none());
+            }
+            [
+                (first_participant, first_bucket),
+                (second_participant, second_bucket),
+            ] => {
+                let mut first = first_bucket.state.lock();
+                let mut second = second_bucket.state.lock();
+                Self::validate_admission(&first, first_participant)?;
+                Self::validate_admission(&second, second_participant)?;
+                assert!(first.by_get_id.insert(get_id, Arc::clone(&info)).is_none());
+                assert!(second.by_get_id.insert(get_id, info).is_none());
+            }
+            _ => unreachable!("an inflight GET must have one or two member participants"),
+        }
+        Ok(())
+    }
+
+    fn validate_admission(
+        state: &MemberInflightGetState,
+        participant: &InflightGetParticipant,
+    ) -> Result<(), String> {
+        if state.generation != Some(participant.generation) {
+            return Err(format!(
+                "member {} generation changed during inflight admission: expected={} actual={:?}",
+                participant.member_id, participant.generation, state.generation
+            ));
+        }
+        if state.departed {
+            return Err(format!(
+                "member {} generation {} departed during inflight admission",
+                participant.member_id, participant.generation
+            ));
+        }
+        Ok(())
+    }
+
+    fn get(&self, member_id: &str, get_id: u64) -> Option<Arc<InflightGetInfo>> {
+        let bucket = self
+            .by_member
+            .get(member_id)
+            .map(|entry| Arc::clone(entry.value()))?;
+        let state = bucket.state.lock();
+        if state.departed {
+            return None;
+        }
+        state.by_get_id.get(&get_id).cloned()
+    }
+
+    fn mark_member_left(&self, member_id: &str) -> Vec<(u64, Arc<InflightGetInfo>)> {
+        let bucket = match self.by_member.entry(member_id.to_string()) {
+            Entry::Occupied(entry) => Arc::clone(entry.get()),
+            Entry::Vacant(entry) => {
+                let bucket = Arc::new(MemberInflightGetBucket::departed());
+                entry.insert(Arc::clone(&bucket));
+                bucket
+            }
+        };
+        let mut state = bucket.state.lock();
+        state.departed = true;
+        state
+            .by_get_id
+            .iter()
+            .map(|(get_id, info)| (*get_id, Arc::clone(info)))
+            .collect()
+    }
+
+    fn claim_terminal_and_remove(&self, get_id: u64, info: &Arc<InflightGetInfo>) -> bool {
+        if !info.try_claim_terminal() {
+            return false;
+        }
+
+        let mut participants = info.participants();
+        participants.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+        let buckets = participants
+            .iter()
+            .filter_map(|participant| {
+                self.by_member
+                    .get(&participant.member_id)
+                    .map(|entry| (participant, Arc::clone(entry.value())))
+            })
+            .collect::<Vec<_>>();
+        match buckets.as_slice() {
+            [(participant, bucket)] => {
+                let mut state = bucket.state.lock();
+                Self::remove_current(&mut state, participant, get_id, info);
+            }
+            [
+                (first_participant, first_bucket),
+                (second_participant, second_bucket),
+            ] => {
+                let mut first = first_bucket.state.lock();
+                let mut second = second_bucket.state.lock();
+                Self::remove_current(&mut first, first_participant, get_id, info);
+                Self::remove_current(&mut second, second_participant, get_id, info);
+            }
+            [] => {}
+            _ => unreachable!("an inflight GET must have one or two member participants"),
+        }
+        true
+    }
+
+    fn remove_current(
+        state: &mut MemberInflightGetState,
+        participant: &InflightGetParticipant,
+        get_id: u64,
+        info: &Arc<InflightGetInfo>,
+    ) {
+        let is_current = state.generation == Some(participant.generation)
+            && state
+                .by_get_id
+                .get(&get_id)
+                .is_some_and(|current| Arc::ptr_eq(current, info));
+        if is_current {
+            state.by_get_id.remove(&get_id);
+        }
     }
 }
 
@@ -242,6 +438,26 @@ impl CompletedGetInfo {
 }
 
 impl InflightGetInfo {
+    fn participants(&self) -> Vec<InflightGetParticipant> {
+        let mut participants = vec![InflightGetParticipant {
+            member_id: self.req_node_id.to_string(),
+            generation: self.requester_generation,
+        }];
+        if let Some(generation) = self.remote_ssd_source_generation
+            && self.src_node_id != self.req_node_id
+        {
+            participants.push(InflightGetParticipant {
+                member_id: self.src_node_id.to_string(),
+                generation,
+            });
+        }
+        participants
+    }
+
+    fn try_claim_terminal(&self) -> bool {
+        !self.terminal_claimed.swap(true, Ordering::AcqRel)
+    }
+
     pub fn release_durable_slot_if_needed(&self) {
         if self.allocation_mode == GetAllocationMode::DurableReplica {
             self.route.release_get_durable_slot();
@@ -641,23 +857,146 @@ mod tests {
         assert!(cache.get(&9).unwrap().replay_for(&other).is_none());
     }
 
-    #[test]
-    fn inflight_get_member_index_takes_only_the_left_member() {
-        let index = InflightGetMemberIndex::default();
-        index.insert("requester-a", 7);
-        index.insert("source-b", 7);
-        index.insert("requester-a", 9);
-        index.insert("source-c", 11);
-        index.remove("source-c", 11);
-
-        assert_eq!(index.take("requester-a"), HashSet::from([7_u64, 9_u64]));
-        assert!(index.take("requester-a").is_empty());
-        assert_eq!(index.take("source-b"), HashSet::from([7_u64]));
-        assert!(index.take("source-c").is_empty());
+    fn test_inflight_get(
+        requester_generation: i64,
+        remote_ssd_source_generation: Option<i64>,
+    ) -> Arc<InflightGetInfo> {
+        let allocator = Arc::new(
+            OneSegAllocator::new(
+                format!("inflight-table-{requester_generation}"),
+                SegmentDeviceDescription::Cpu,
+                0,
+                4096,
+            )
+            .expect("test allocator must be created"),
+        );
+        let allocation = Arc::new(
+            allocator
+                .allocate(512)
+                .expect("test allocation must be created"),
+        );
+        Arc::new(InflightGetInfo {
+            put_id: (1, 0),
+            src_node_id: "source-b".to_string().into(),
+            key: "key-a".to_string(),
+            req_node_id: "requester-a".to_string().into(),
+            len: 512,
+            allocation,
+            source_allocation: None,
+            route: Arc::new(OneKvNodesRoutes::new((1, 0), None)),
+            allocation_mode: GetAllocationMode::Temporary,
+            source_kind: GetSourceKind::Ssd,
+            requester_generation,
+            remote_ssd_source_generation,
+            ssd_stage_lifecycle: remote_ssd_source_generation
+                .map(|_| Arc::new(Mutex::new(SsdStageLifecycle::new()))),
+            cache_capacity_reservation: Mutex::new(None),
+            terminal_claimed: AtomicBool::new(false),
+        })
     }
 
     #[test]
-    fn owner_holding_member_index_rejects_departed_members_without_scanning() {
+    fn inflight_get_is_shared_by_requester_and_remote_ssd_source_buckets() {
+        let table = InflightGetTable::default();
+        assert!(
+            table
+                .observe_member_generation("requester-a", 1, false)
+                .is_empty()
+        );
+        assert!(
+            table
+                .observe_member_generation("source-b", 3, false)
+                .is_empty()
+        );
+        let inflight = test_inflight_get(1, Some(3));
+        table.insert(7, Arc::clone(&inflight)).unwrap();
+
+        let from_requester = table.get("requester-a", 7).unwrap();
+        let from_source = table.get("source-b", 7).unwrap();
+        assert!(Arc::ptr_eq(&from_requester, &from_source));
+
+        let left = table.mark_member_left("requester-a");
+        assert_eq!(left.len(), 1);
+        assert!(table.get("requester-a", 7).is_none());
+        assert!(table.get("source-b", 7).is_some());
+        assert!(table.claim_terminal_and_remove(7, &inflight));
+        assert!(table.get("source-b", 7).is_none());
+    }
+
+    #[test]
+    fn old_generation_terminal_cannot_delete_new_generation_entry() {
+        let table = InflightGetTable::default();
+        table.observe_member_generation("requester-a", 1, false);
+        let old = test_inflight_get(1, None);
+        table.insert(7, Arc::clone(&old)).unwrap();
+
+        let displaced = table.observe_member_generation("requester-a", 2, true);
+        assert_eq!(displaced.len(), 1);
+        assert!(Arc::ptr_eq(&displaced[0].1, &old));
+        let current = test_inflight_get(2, None);
+        table.insert(7, Arc::clone(&current)).unwrap();
+
+        assert!(table.claim_terminal_and_remove(7, &old));
+        let still_current = table.get("requester-a", 7).unwrap();
+        assert!(Arc::ptr_eq(&still_current, &current));
+    }
+
+    #[test]
+    fn stale_admission_observation_cannot_roll_back_member_generation() {
+        let table = InflightGetTable::default();
+        table.observe_member_generation("requester-a", 2, false);
+        let current = test_inflight_get(2, None);
+        table.insert(7, Arc::clone(&current)).unwrap();
+
+        assert!(
+            table
+                .observe_member_generation("requester-a", 1, false)
+                .is_empty()
+        );
+        let stale = test_inflight_get(1, None);
+        assert!(table.insert(8, stale).is_err());
+
+        let still_current = table.get("requester-a", 7).unwrap();
+        assert!(Arc::ptr_eq(&still_current, &current));
+        assert!(table.get("requester-a", 8).is_none());
+    }
+
+    #[test]
+    fn member_left_before_first_bucket_blocks_late_admission() {
+        let table = InflightGetTable::default();
+        assert!(table.mark_member_left("requester-a").is_empty());
+
+        table.observe_member_generation("requester-a", 1, false);
+        let late = test_inflight_get(1, None);
+        assert!(table.insert(7, Arc::clone(&late)).is_err());
+        assert!(table.get("requester-a", 7).is_none());
+
+        assert!(
+            table
+                .observe_member_generation("requester-a", 1, true)
+                .is_empty()
+        );
+        table.insert(7, Arc::clone(&late)).unwrap();
+        assert!(Arc::ptr_eq(&table.get("requester-a", 7).unwrap(), &late));
+    }
+
+    #[test]
+    fn two_member_admission_does_not_publish_to_only_one_bucket() {
+        let table = InflightGetTable::default();
+        table.observe_member_generation("requester-a", 1, false);
+        assert!(table.mark_member_left("source-b").is_empty());
+        table.observe_member_generation("source-b", 3, false);
+
+        let inflight = test_inflight_get(1, Some(3));
+        assert!(table.insert(7, inflight).is_err());
+        assert!(table.get("requester-a", 7).is_none());
+
+        table.observe_member_generation("source-b", 3, true);
+        assert!(table.get("source-b", 7).is_none());
+    }
+
+    #[test]
+    fn owner_holding_two_level_map_rejects_departed_members_without_scanning() {
         let allocator = Arc::new(
             OneSegAllocator::new(
                 "holding-index-test".to_string(),
@@ -691,7 +1030,7 @@ mod tests {
         assert_eq!(manager.mark_member_left_and_cleanup("node-a"), 2);
         assert_eq!(manager.total(), 1);
         assert!(!manager.insert_if_member_active(a1.clone(), holding("late", "node-a")));
-        assert!(manager.inner().contains_key(&b1));
+        assert!(manager.get(&b1).is_some());
 
         manager.mark_member_active("node-a");
         assert!(manager.insert_if_member_active(a1.clone(), holding("joined", "node-a")));
@@ -830,13 +1169,12 @@ pub struct MasterKvRouterInner {
     pub inflight_puts: moka::future::Cache<(String, u64, u32), InflightPutInfo>,
     /// key -> inflight put admission state
     pub(crate) inflight_put_key_counts: Arc<DashMap<String, InflightPutKeyAdmission>>,
-    inflight_gets: DashMap<u64, InflightGetInfo>,
-    /// Requester and remote SSD source member -> their active GET ids.
-    inflight_gets_by_member: InflightGetMemberIndex,
+    /// Requester or remote SSD source -> generation-scoped active GET states.
+    inflight_gets: InflightGetTable,
     pub(crate) get_transition_locks: AMapLock<u64>,
     pub(crate) completed_gets: moka::sync::Cache<u64, CompletedGetInfo>,
 
-    /// Cache for holding get operations (owned, flattened by (node_id, holder_id))
+    /// Completed GET allocations grouped by requester member and holder id.
     pub get_holding: MasterOwnerMemMgr,
 
     /// Counter for get_id
@@ -888,39 +1226,92 @@ impl MasterKvRouterInner {
         self.view.get().unwrap()
     }
 
-    pub(crate) fn insert_inflight_get(&self, get_id: u64, info: InflightGetInfo) {
-        let Entry::Vacant(entry) = self.inflight_gets.entry(get_id) else {
-            panic!("duplicate inflight get_id={get_id}");
-        };
-        self.inflight_gets_by_member
-            .insert(info.req_node_id.as_ref(), get_id);
-        if info.ssd_stage_lifecycle.is_some() {
-            self.inflight_gets_by_member
-                .insert(info.src_node_id.as_ref(), get_id);
-        }
-        entry.insert(info);
+    pub(crate) fn insert_inflight_get(
+        &self,
+        get_id: u64,
+        info: Arc<InflightGetInfo>,
+    ) -> Result<(), String> {
+        self.inflight_gets.insert(get_id, info)
     }
 
-    pub(crate) fn get_inflight_get(&self, get_id: u64) -> Option<InflightGetInfo> {
+    pub(crate) fn get_inflight_get(
+        &self,
+        member_id: &str,
+        get_id: u64,
+    ) -> Option<Arc<InflightGetInfo>> {
+        self.inflight_gets.get(member_id, get_id)
+    }
+
+    pub(crate) fn claim_terminal_inflight_get(
+        &self,
+        get_id: u64,
+        info: &Arc<InflightGetInfo>,
+    ) -> bool {
+        self.inflight_gets.claim_terminal_and_remove(get_id, info)
+    }
+
+    fn observe_inflight_member_generation(
+        &self,
+        member_id: &str,
+        generation: i64,
+        reactivate: bool,
+    ) -> Vec<(u64, Arc<InflightGetInfo>)> {
         self.inflight_gets
-            .get(&get_id)
-            .map(|inflight| inflight.value().clone())
+            .observe_member_generation(member_id, generation, reactivate)
     }
 
-    pub(crate) fn remove_inflight_get(&self, get_id: u64) -> Option<InflightGetInfo> {
-        let (_, info) = self.inflight_gets.remove(&get_id)?;
-        self.inflight_gets_by_member
-            .remove(info.req_node_id.as_ref(), get_id);
-        if info.ssd_stage_lifecycle.is_some() {
-            self.inflight_gets_by_member
-                .remove(info.src_node_id.as_ref(), get_id);
+    fn mark_inflight_member_left(&self, member_id: &str) -> Vec<(u64, Arc<InflightGetInfo>)> {
+        self.inflight_gets.mark_member_left(member_id)
+    }
+}
+
+async fn cleanup_inflight_gets_for_member(
+    view: &MasterKvRouterView,
+    member_id: &str,
+    inflight_gets: Vec<(u64, Arc<InflightGetInfo>)>,
+) {
+    for (get_id, inflight) in inflight_gets {
+        let transition_lock = view
+            .master_kv_router()
+            .inner()
+            .get_transition_locks
+            .get_lock(get_id);
+        let _transition = transition_lock.lock().await;
+        let source_left = inflight.src_node_id.as_ref() == member_id;
+        let defer_remote_stage = !source_left
+            && inflight
+                .ssd_stage_lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| lifecycle.lock().request_revoke(false));
+        if defer_remote_stage {
+            info!(
+                get_id,
+                member = %member_id,
+                "Deferred member cleanup until SSD source quiesces"
+            );
+            continue;
         }
-        Some(info)
+        if view
+            .master_kv_router()
+            .inner()
+            .claim_terminal_inflight_get(get_id, &inflight)
+        {
+            inflight.release_durable_slot_if_needed();
+        }
     }
+}
 
-    fn take_member_inflight_get_ids(&self, member_id: &str) -> HashSet<u64> {
-        self.inflight_gets_by_member.take(member_id)
-    }
+pub(crate) async fn reconcile_inflight_member_generation(
+    view: &MasterKvRouterView,
+    member_id: &str,
+    generation: i64,
+    reactivate: bool,
+) {
+    let displaced = view
+        .master_kv_router()
+        .inner()
+        .observe_inflight_member_generation(member_id, generation, reactivate);
+    cleanup_inflight_gets_for_member(view, member_id, displaced).await;
 }
 
 pub struct MasterKvRouter(MasterKvRouterInner);
@@ -1017,7 +1408,7 @@ impl MasterKvRouter {
         // In-flight GET allocations contain raw transfer addresses. They must only be
         // released by GetDone/GetRevoke or member-left cleanup after all users are quiescent;
         // a wall-clock TTL cannot prove that a remote DMA or SSD stage has stopped.
-        let inflight_gets = DashMap::new();
+        let inflight_gets = InflightGetTable::default();
         let inner = MasterKvRouterInner {
             view: std::sync::OnceLock::new(),
             policy: policy_impl,
@@ -1025,7 +1416,6 @@ impl MasterKvRouter {
             inflight_puts,
             inflight_put_key_counts,
             inflight_gets,
-            inflight_gets_by_member: InflightGetMemberIndex::default(),
             get_transition_locks: AMapLock::new(GET_COMPLETION_REPLAY_TTL),
             completed_gets: moka::sync::Cache::builder()
                 .time_to_live(GET_COMPLETION_REPLAY_TTL)
@@ -1186,10 +1576,11 @@ impl MasterKvRouter {
             let view2 = view.clone();
             let view_task = view2.clone();
             let cleanup_view = view.clone();
+            let requester_node_id = resp.node_id().clone();
             let _ = view.spawn("rpc_get_start", async move {
                 let t0 = Utc::now().timestamp_micros();
                 let (get_id, mut ack) =
-                    handle_get_start(view_task, msg, resp.node_id().clone()).await;
+                    handle_get_start(view_task, msg, requester_node_id.clone()).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send GetStartResp: {:?}", e);
@@ -1200,20 +1591,22 @@ impl MasterKvRouter {
                             .get_transition_locks
                             .get_lock(get_id);
                         let _transition = transition_lock.lock().await;
-                        let defer_release = cleanup_view
+                        let inflight = cleanup_view
                             .master_kv_router()
                             .inner()
-                            .get_inflight_get(get_id)
-                            .and_then(|inflight| inflight.ssd_stage_lifecycle.clone())
+                            .get_inflight_get(requester_node_id.as_ref(), get_id);
+                        let defer_release = inflight
+                            .as_ref()
+                            .and_then(|inflight| inflight.ssd_stage_lifecycle.as_ref())
                             .is_some_and(|lifecycle| lifecycle.lock().request_revoke(false));
-                        if !defer_release {
-                            if let Some(inflight_info) = cleanup_view
+                        if !defer_release
+                            && let Some(inflight) = inflight
+                            && cleanup_view
                                 .master_kv_router()
                                 .inner()
-                                .remove_inflight_get(get_id)
-                            {
-                                inflight_info.release_durable_slot_if_needed();
-                            }
+                                .claim_terminal_inflight_get(get_id, &inflight)
+                        {
+                            inflight.release_durable_slot_if_needed();
                         }
                     }
                 }
@@ -1834,52 +2227,24 @@ impl MasterKvRouter {
             ) {
                 match &event {
                     ClusterEvent::MemberJoined(member) | ClusterEvent::MemberUpdated(member) => {
+                        reconcile_inflight_member_generation(
+                            view,
+                            &member.id,
+                            member.node_start_time,
+                            true,
+                        )
+                        .await;
                         view.master_kv_router()
                             .inner()
                             .get_holding
                             .mark_member_active(&member.id);
                     }
                     ClusterEvent::MemberLeft(node_id) => {
-                        let left_node: NodeID = node_id.clone().into();
-                        let inflight_ids = view
+                        let inflight_gets = view
                             .master_kv_router()
                             .inner()
-                            .take_member_inflight_get_ids(node_id);
-                        for get_id in inflight_ids {
-                            let transition_lock = view
-                                .master_kv_router()
-                                .inner()
-                                .get_transition_locks
-                                .get_lock(get_id);
-                            let _transition = transition_lock.lock().await;
-                            let Some(inflight) = view
-                                .master_kv_router()
-                                .inner()
-                                .get_inflight_get(get_id)
-                            else {
-                                continue;
-                            };
-                            let source_left = inflight.src_node_id == left_node;
-                            let defer_remote_stage = !source_left
-                                && inflight.ssd_stage_lifecycle.as_ref().is_some_and(|lifecycle| {
-                                    lifecycle.lock().request_revoke(false)
-                                });
-                            if defer_remote_stage {
-                                info!(
-                                    get_id,
-                                    member = %node_id,
-                                    "Deferred member-left GET cleanup until SSD source quiesces"
-                                );
-                                continue;
-                            }
-                            if let Some(inflight) = view
-                                .master_kv_router()
-                                .inner()
-                                .remove_inflight_get(get_id)
-                            {
-                                inflight.release_durable_slot_if_needed();
-                            }
-                        }
+                            .mark_inflight_member_left(node_id);
+                        cleanup_inflight_gets_for_member(view, node_id, inflight_gets).await;
 
                         let removed = view
                             .master_kv_router()
@@ -2260,7 +2625,7 @@ mod cache_capacity_reservation_tests {
                 .expect("test allocation must be created"),
         );
         let route = Arc::new(OneKvNodesRoutes::new((1, 0), None));
-        let mut inflight = InflightGetInfo {
+        let inflight = InflightGetInfo {
             put_id: (1, 0),
             src_node_id: "node-b".to_string().into(),
             key: "key-a".to_string(),
@@ -2271,14 +2636,17 @@ mod cache_capacity_reservation_tests {
             route,
             allocation_mode: GetAllocationMode::DurableReplica,
             source_kind: GetSourceKind::Memory,
+            requester_generation: 1,
+            remote_ssd_source_generation: None,
             ssd_stage_lifecycle: None,
-            cache_capacity_reservation: Some(reservation),
+            cache_capacity_reservation: Mutex::new(Some(reservation)),
+            terminal_claimed: AtomicBool::new(false),
         };
 
         assert_eq!(*reserved_bytes.lock(), 120);
         assert_eq!(cache.policy().max_capacity(), Some(680));
 
-        let handoff = inflight.cache_capacity_reservation.take();
+        let handoff = inflight.cache_capacity_reservation.lock().take();
         drop(inflight);
         assert_eq!(*reserved_bytes.lock(), 120);
 

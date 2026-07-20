@@ -1,4 +1,4 @@
-use super::ClientKvApiInner;
+use super::{ClientKvApiInner, SSD_SOURCE_TERMINAL_ATTEMPT_TIMEOUT, SSD_STAGE_RPC_TIMEOUT};
 use crate::client_kv_api::CachedValue;
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::memholder::{MemoryInfo, UserMemHolder, UserMemHolderExposeKind};
@@ -21,9 +21,10 @@ use crate::{
 };
 use chrono::Utc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_STALE_SSD_ROUTE_RETRIES: usize = 3;
+const GET_TERMINAL_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct RemoteGetInfo {
@@ -570,26 +571,88 @@ impl ClientKvApiInner {
 
     /// 撤销 Get 操作，释放已分配的资源
     pub async fn get_revoke(&self, get_id: u64) -> KvResult<()> {
-        self.get_revoke_inner(get_id, false).await
+        self.get_revoke_inner(get_id, false, GET_TERMINAL_RPC_TIMEOUT, 0)
+            .await
     }
 
     pub(super) async fn get_revoke_ssd_source(&self, get_id: u64) -> KvResult<()> {
-        self.get_revoke_inner(get_id, true).await
+        self.get_revoke_inner(get_id, true, GET_TERMINAL_RPC_TIMEOUT, 0)
+            .await
+    }
+
+    pub(super) async fn finish_ssd_source_done(
+        &self,
+        get_id: u64,
+        deadline: Instant,
+    ) -> KvResult<GetDoneResp> {
+        let shutdown_poller = self.view.register_shutdown_poller();
+        if !self.shutdown_gate.is_accepting() || !shutdown_poller.is_running() {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: format!("shutdown interrupted source-owned GetDone for get_id={get_id}"),
+            }));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Self::ssd_terminal_timeout(
+                get_id,
+                "GetDone",
+                Duration::ZERO,
+            ));
+        }
+        let attempt_timeout = remaining.min(SSD_SOURCE_TERMINAL_ATTEMPT_TIMEOUT);
+        let done = tokio::time::timeout(
+            attempt_timeout,
+            self.get_done_inner(get_id, SSD_STAGE_RPC_TIMEOUT, 0),
+        )
+        .await
+        .map_err(|_| Self::ssd_terminal_timeout(get_id, "GetDone", attempt_timeout))??;
+        crate::rpcresp_kvresult_convert::try_from_code(done.error_code, done.error_json.clone())?;
+        Ok(done)
     }
 
     pub(super) async fn finish_ssd_source_revoke(
         &self,
         get_id: u64,
         drop_ssd_source: bool,
+        deadline: Instant,
     ) -> KvResult<()> {
         let shutdown_poller = self.view.register_shutdown_poller();
         let mut attempt = 0u32;
+        let mut last_error = None;
         loop {
+            if !self.shutdown_gate.is_accepting() || !shutdown_poller.is_running() {
+                return Err(last_error.unwrap_or_else(|| {
+                    KvError::Api(ApiError::SystemShutdown {
+                        detail: format!(
+                            "shutdown interrupted source-owned GetRevoke for get_id={get_id}"
+                        ),
+                    })
+                }));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(last_error.unwrap_or_else(|| {
+                    Self::ssd_terminal_timeout(get_id, "GetRevoke", Duration::ZERO)
+                }));
+            }
+
             attempt = attempt.saturating_add(1);
-            match self.get_revoke_inner(get_id, drop_ssd_source).await {
+            let attempt_timeout = remaining.min(SSD_SOURCE_TERMINAL_ATTEMPT_TIMEOUT);
+            let result = tokio::time::timeout(
+                attempt_timeout,
+                self.get_revoke_inner(get_id, drop_ssd_source, SSD_STAGE_RPC_TIMEOUT, 0),
+            )
+            .await
+            .map_err(|_| Self::ssd_terminal_timeout(get_id, "GetRevoke", attempt_timeout))
+            .and_then(|result| result);
+            match result {
                 Ok(()) => return Ok(()),
                 Err(err) => {
-                    if !self.shutdown_gate.is_accepting() || !shutdown_poller.is_running() {
+                    if matches!(
+                        &err,
+                        KvError::P2p(crate::p2p::P2PError::InvalidRpcTimeout { .. })
+                            | KvError::Api(ApiError::InvalidArgument { .. })
+                    ) {
                         return Err(err);
                     }
                     if attempt == 1 || attempt.is_multiple_of(10) {
@@ -600,17 +663,35 @@ impl ClientKvApiInner {
                             "Retrying source-owned SSD GetRevoke terminal report"
                         );
                     }
+                    last_error = Some(err);
                 }
             }
 
             let backoff_ms = 100u64
                 .saturating_mul(1u64 << attempt.saturating_sub(1).min(3))
                 .min(1_000);
-            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                continue;
+            }
+            tokio::time::sleep(Duration::from_millis(backoff_ms).min(remaining)).await;
         }
     }
 
-    async fn get_revoke_inner(&self, get_id: u64, drop_ssd_source: bool) -> KvResult<()> {
+    fn ssd_terminal_timeout(get_id: u64, operation: &str, timeout: Duration) -> KvError {
+        KvError::Api(ApiError::GetTimeout {
+            timeout_ms: timeout.as_millis() as u64,
+            detail: format!("source-owned SSD {operation} timed out for get_id={get_id}"),
+        })
+    }
+
+    async fn get_revoke_inner(
+        &self,
+        get_id: u64,
+        drop_ssd_source: bool,
+        rpc_timeout: Duration,
+        max_retries: usize,
+    ) -> KvResult<()> {
         let req = MsgPack {
             serialize_part: GetRevokeReq {
                 get_id,
@@ -629,7 +710,13 @@ impl ClientKvApiInner {
         // 调用 RPC
         let resp = self
             .rpc_caller_get_revoke
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
+            .call(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                req,
+                Some(rpc_timeout),
+                max_retries,
+            )
             .await
             .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
@@ -640,6 +727,16 @@ impl ClientKvApiInner {
 
     /// 完成 Get 操作，清理资源
     pub async fn get_done(&self, get_id: u64) -> KvResult<GetDoneResp> {
+        self.get_done_inner(get_id, GET_TERMINAL_RPC_TIMEOUT, 3)
+            .await
+    }
+
+    async fn get_done_inner(
+        &self,
+        get_id: u64,
+        rpc_timeout: Duration,
+        max_retries: usize,
+    ) -> KvResult<GetDoneResp> {
         let req = MsgPack {
             serialize_part: GetDoneReq { get_id },
             raw_bytes: Vec::new(),
@@ -659,8 +756,8 @@ impl ClientKvApiInner {
                 self.view.p2p_module(),
                 master_node_id.into(),
                 req,
-                Some(std::time::Duration::from_secs(60)),
-                3,
+                Some(rpc_timeout),
+                max_retries,
             )
             .await
             .map_err(KvError::from)?;

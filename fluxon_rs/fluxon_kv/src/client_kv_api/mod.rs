@@ -61,6 +61,9 @@ const OWNER_DELETE_ACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 const SSD_STAGE_MASTER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SSD_STAGE_RPC_TIMEOUT: Duration = Duration::from_secs(MIN_EXPLICIT_RPC_TIMEOUT_SECS);
 const SSD_STAGE_READ_RPC_TIMEOUT: Duration = Duration::from_secs(60);
+const SSD_SOURCE_TERMINAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+const SSD_REPLICA_COMMIT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const SSD_REPLICA_COMMIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Information about a memholder held by external client
 #[derive(Clone)]
@@ -486,6 +489,7 @@ async fn handle_ssd_stage_read(
 ) -> MsgPack<SsdStageReadResp> {
     let req = msg.serialize_part.clone();
     let inner = view.client_kv_api().inner();
+    let terminal_deadline = Instant::now() + SSD_STAGE_READ_RPC_TIMEOUT;
     let _shutdown_guard = match inner.shutdown_guard("ssd_stage_read") {
         Ok(operation) => operation,
         Err(err) => {
@@ -513,10 +517,16 @@ async fn handle_ssd_stage_read(
         Err(err) => Err(err),
     };
     let done_result = match transfer_result {
-        Ok(()) => match inner.get_done(req.get_id).await {
+        Ok(()) => match inner
+            .finish_ssd_source_done(req.get_id, terminal_deadline)
+            .await
+        {
             Ok(done) => Ok(done),
             Err(done_err) => {
-                if let Err(revoke_err) = inner.finish_ssd_source_revoke(req.get_id, false).await {
+                if let Err(revoke_err) = inner
+                    .finish_ssd_source_revoke(req.get_id, false, terminal_deadline)
+                    .await
+                {
                     tracing::warn!(
                         get_id = req.get_id,
                         error = %revoke_err,
@@ -527,7 +537,10 @@ async fn handle_ssd_stage_read(
             }
         },
         Err(transfer_err) => {
-            if let Err(revoke_err) = inner.finish_ssd_source_revoke(req.get_id, true).await {
+            if let Err(revoke_err) = inner
+                .finish_ssd_source_revoke(req.get_id, true, terminal_deadline)
+                .await
+            {
                 tracing::warn!(
                     get_id = req.get_id,
                     error = %revoke_err,
@@ -1157,6 +1170,11 @@ impl ClientKvApiInner {
         let Some(store) = self.ssd_storage.as_ref() else {
             return Ok(None);
         };
+        let _local_segment_guard = self
+            .view
+            .client_seg_pool()
+            .guard_readable_range(abs_addr, len)
+            .await?;
         let guard = store.persist_from_addr(key, put_id, abs_addr, len).await?;
         Ok(Some(guard))
     }
@@ -1184,26 +1202,37 @@ impl ClientKvApiInner {
             },
             raw_bytes: Vec::new(),
         };
-        let master_node_id = self
-            .view
-            .cluster_manager()
-            .find_or_wait_master_node()
-            .await?;
-        let resp = self
-            .rpc_caller_ssd_replica_commit
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                req,
-                Some(Duration::from_secs(60)),
-                2,
+        tokio::time::timeout(SSD_REPLICA_COMMIT_TOTAL_TIMEOUT, async {
+            let master_node_id = self
+                .view
+                .cluster_manager()
+                .find_or_wait_master_node()
+                .await?;
+            let resp = self
+                .rpc_caller_ssd_replica_commit
+                .call(
+                    self.view.p2p_module(),
+                    master_node_id.into(),
+                    req,
+                    Some(SSD_REPLICA_COMMIT_RPC_TIMEOUT),
+                    2,
+                )
+                .await
+                .map_err(KvError::from)?;
+            crate::rpcresp_kvresult_convert::try_from_code(
+                resp.serialize_part.error_code,
+                resp.serialize_part.error_json,
             )
-            .await
-            .map_err(KvError::from)?;
-        crate::rpcresp_kvresult_convert::try_from_code(
-            resp.serialize_part.error_code,
-            resp.serialize_part.error_json,
-        )
+        })
+        .await
+        .map_err(|_| {
+            KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "SSD replica commit exceeded total timeout of {} ms",
+                    SSD_REPLICA_COMMIT_TOTAL_TIMEOUT.as_millis()
+                ),
+            })
+        })?
     }
 
     async fn evict_ssd_replicas_from_master(
@@ -1260,6 +1289,11 @@ impl ClientKvApiInner {
             Some(target_node_id.clone())
         };
         if peer_id.is_none() && stage_addr == target_addr {
+            let _target_segment_guard = self
+                .view
+                .client_seg_pool()
+                .guard_writable_range(target_addr, stage_len)
+                .await?;
             tracing::debug!(
                 "Loading local SSD replica directly into target: key={} target={:#x} len={} capacity={}",
                 key,
@@ -1272,6 +1306,11 @@ impl ClientKvApiInner {
                 .await;
         }
 
+        let _stage_segment_guard = self
+            .view
+            .client_seg_pool()
+            .guard_writable_range(stage_addr, stage_len)
+            .await?;
         let (chunk_tx, chunk_rx) = ::tokio::sync::mpsc::channel(
             DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT
                 .saturating_mul(2)
@@ -2696,7 +2735,8 @@ impl ClientKvApiInner {
 #[cfg(test)]
 mod ssd_stage_rpc_contract_tests {
     use super::{
-        ApiError, Duration, KvError, MIN_EXPLICIT_RPC_TIMEOUT_SECS,
+        ApiError, Duration, KvError, MIN_EXPLICIT_RPC_TIMEOUT_SECS, SSD_REPLICA_COMMIT_RPC_TIMEOUT,
+        SSD_REPLICA_COMMIT_TOTAL_TIMEOUT, SSD_SOURCE_TERMINAL_ATTEMPT_TIMEOUT,
         SSD_STAGE_MASTER_LOOKUP_TIMEOUT, SSD_STAGE_READ_RPC_TIMEOUT, SSD_STAGE_RPC_TIMEOUT,
         SsdLoadedChunk, drain_loaded_ssd_chunk_transfers,
     };
@@ -2710,6 +2750,12 @@ mod ssd_stage_rpc_contract_tests {
         assert!(
             SSD_STAGE_MASTER_LOOKUP_TIMEOUT + SSD_STAGE_RPC_TIMEOUT < SSD_STAGE_READ_RPC_TIMEOUT
         );
+        assert!(SSD_SOURCE_TERMINAL_ATTEMPT_TIMEOUT >= SSD_STAGE_RPC_TIMEOUT);
+        assert!(SSD_SOURCE_TERMINAL_ATTEMPT_TIMEOUT < SSD_STAGE_READ_RPC_TIMEOUT);
+        assert!(
+            SSD_REPLICA_COMMIT_RPC_TIMEOUT >= Duration::from_secs(MIN_EXPLICIT_RPC_TIMEOUT_SECS)
+        );
+        assert!(SSD_REPLICA_COMMIT_RPC_TIMEOUT <= SSD_REPLICA_COMMIT_TOTAL_TIMEOUT);
     }
 
     #[::tokio::test]

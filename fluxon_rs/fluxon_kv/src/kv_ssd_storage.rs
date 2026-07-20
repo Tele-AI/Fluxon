@@ -4,7 +4,10 @@ use crate::master_kv_router::msg_pack::SsdReplicaEviction;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult};
 use ::tokio::{
-    sync::{Mutex as TokioMutex, Notify, mpsc as tokio_mpsc, oneshot, watch},
+    sync::{
+        Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc as tokio_mpsc, oneshot,
+        watch,
+    },
     task,
 };
 use fluxon_framework_compiled::shutdown::{ShutdownGate, ShutdownGuard};
@@ -33,6 +36,8 @@ const DEFAULT_WRITE_QUEUE_DEPTH: usize = 8;
 const DEFAULT_READ_QUEUE_DEPTH: usize = 16;
 const DEFAULT_WRITE_INFLIGHT: usize = 2;
 const DEFAULT_READ_INFLIGHT: usize = 16;
+const DEFAULT_READ_MAX_INFLIGHT_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_READ_MAX_INFLIGHT_OPS: usize = 256;
 const DEFAULT_EVICTION_QUEUE_DEPTH: usize = 1024;
 pub(crate) const DEFAULT_READ_TRANSFER_PIPELINE_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const DEFAULT_READ_TRANSFER_PIPELINE_INFLIGHT: usize = 4;
@@ -56,6 +61,7 @@ pub struct KvSsdStorage {
     devices: Vec<SsdDeviceWorker>,
     shard_to_device: Vec<usize>,
     next_write_device: AtomicUsize,
+    read_admission: Arc<SsdReadAdmission>,
     inner: Arc<Mutex<KvSsdStorageInner>>,
     space_notify: Arc<Notify>,
     shutdown_gate: ShutdownGate,
@@ -173,7 +179,13 @@ struct SsdShardRing {
     tail: u64,
     used_bytes: u64,
     busy_begins: BTreeMap<u64, usize>,
-    order: VecDeque<KvSsdKey>,
+    order: VecDeque<SsdOrderEntry>,
+}
+
+#[derive(Debug)]
+struct SsdOrderEntry {
+    key: KvSsdKey,
+    begin: u64,
 }
 
 #[derive(Debug)]
@@ -404,7 +416,9 @@ impl SsdRingBuffer {
                 .insert(key.clone(), SsdEntryState::Writing(entry.clone()));
             self.account_entry_inserted(&entry);
             self.mark_busy(&entry);
-            self.shards[shard_id].order.push_back(key);
+            self.shards[shard_id]
+                .order
+                .push_back(SsdOrderEntry { key, begin });
             return Ok(SsdPreparedWrite::Ready { entry, evicted });
         }
 
@@ -447,18 +461,26 @@ impl SsdRingBuffer {
         self.shards[shard_id].tail = new_tail;
         let mut evicted = Vec::new();
 
-        while let Some(key) = self.shards[shard_id].order.front() {
-            match self.entries.get(key) {
-                Some(state) if state.entry().begin >= new_tail => break,
-                _ => {
-                    let key = self.shards[shard_id]
-                        .order
-                        .pop_front()
-                        .expect("front key exists");
-                    if matches!(self.remove_entry(&key), Some(SsdEntryState::Committed(_))) {
-                        evicted.push(key);
-                    }
-                }
+        while self.shards[shard_id]
+            .order
+            .front()
+            .is_some_and(|ordered| ordered.begin < new_tail)
+        {
+            let ordered = self.shards[shard_id]
+                .order
+                .pop_front()
+                .expect("front order entry exists");
+            let is_current_generation = self.entries.get(&ordered.key).is_some_and(|state| {
+                let entry = state.entry();
+                entry.shard_id == shard_id && entry.begin == ordered.begin
+            });
+            if is_current_generation
+                && matches!(
+                    self.remove_entry(&ordered.key),
+                    Some(SsdEntryState::Committed(_))
+                )
+            {
+                evicted.push(ordered.key);
             }
         }
         evicted
@@ -537,6 +559,7 @@ struct ReadCommand {
     entry: SsdIndexEntry,
     file_offset: u64,
     target: ReadTarget,
+    _admission: SsdReadAdmissionPermit,
     _read_pin: Option<SsdReadPin>,
     done_tx: oneshot::Sender<KvResult<ReadOutput>>,
 }
@@ -553,8 +576,23 @@ struct ReadTask {
     entry: SsdIndexEntry,
     file_offset: u64,
     target: ReadTarget,
+    _admission: SsdReadAdmissionPermit,
     _read_pin: Option<SsdReadPin>,
     done_tx: oneshot::Sender<KvResult<ReadOutput>>,
+}
+
+impl From<ReadCommand> for ReadTask {
+    fn from(command: ReadCommand) -> Self {
+        Self {
+            key: command.key,
+            entry: command.entry,
+            file_offset: command.file_offset,
+            target: command.target,
+            _admission: command._admission,
+            _read_pin: command._read_pin,
+            done_tx: command.done_tx,
+        }
+    }
 }
 
 struct WriteCompletion {
@@ -568,13 +606,64 @@ struct ReadCompletion {
     key: KvSsdKey,
     entry: SsdIndexEntry,
     result: KvResult<ReadOutput>,
+    _admission: SsdReadAdmissionPermit,
     _read_pin: Option<SsdReadPin>,
     done_tx: oneshot::Sender<KvResult<ReadOutput>>,
 }
 
 enum ReadTarget {
-    Scratch(AlignedBuffer),
+    Scratch { len: usize },
     Direct { target_addr: u64, len: usize },
+}
+
+impl ReadTarget {
+    fn io_len(&self) -> usize {
+        match self {
+            Self::Scratch { len } | Self::Direct { len, .. } => *len,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SsdReadAdmission {
+    bytes: Arc<Semaphore>,
+    ops: Arc<Semaphore>,
+    max_bytes: usize,
+}
+
+impl SsdReadAdmission {
+    fn new(max_bytes: usize, max_ops: usize) -> Self {
+        assert!(max_bytes > 0 && max_bytes <= u32::MAX as usize);
+        assert!(max_ops > 0);
+        Self {
+            bytes: Arc::new(Semaphore::new(max_bytes)),
+            ops: Arc::new(Semaphore::new(max_ops)),
+            max_bytes,
+        }
+    }
+
+    async fn acquire(&self, io_len: usize) -> SsdReadAdmissionPermit {
+        let charged_bytes = io_len.min(self.max_bytes);
+        // Take the operation slot first so requests waiting on the ops limit do
+        // not consume byte permits and silently grow beyond max_ops.
+        let op_permit = Arc::clone(&self.ops)
+            .acquire_owned()
+            .await
+            .expect("kv ssd read op admission semaphore remains open");
+        let byte_permit = Arc::clone(&self.bytes)
+            .acquire_many_owned(charged_bytes as u32)
+            .await
+            .expect("kv ssd read byte admission semaphore remains open");
+        SsdReadAdmissionPermit {
+            _bytes: byte_permit,
+            _op: op_permit,
+        }
+    }
+}
+
+struct SsdReadAdmissionPermit {
+    _bytes: OwnedSemaphorePermit,
+    _op: OwnedSemaphorePermit,
 }
 
 enum ReadOutput {
@@ -637,6 +726,10 @@ impl KvSsdStorage {
                 devices: Vec::new(),
                 shard_to_device: Vec::new(),
                 next_write_device: AtomicUsize::new(0),
+                read_admission: Arc::new(SsdReadAdmission::new(
+                    DEFAULT_READ_MAX_INFLIGHT_BYTES,
+                    DEFAULT_READ_MAX_INFLIGHT_OPS,
+                )),
                 inner: Arc::new(Mutex::new(KvSsdStorageInner {
                     ring: SsdRingBuffer::new(vec![dummy_capacity]),
                 })),
@@ -753,6 +846,10 @@ impl KvSsdStorage {
             devices,
             shard_to_device,
             next_write_device: AtomicUsize::new(0),
+            read_admission: Arc::new(SsdReadAdmission::new(
+                DEFAULT_READ_MAX_INFLIGHT_BYTES,
+                DEFAULT_READ_MAX_INFLIGHT_OPS,
+            )),
             inner,
             space_notify,
             shutdown_gate: ShutdownGate::new(),
@@ -1089,7 +1186,9 @@ impl KvSsdStorage {
                 target_addr,
                 len: aligned_len_usize,
             },
-            SsdReadPath::Scratch => ReadTarget::Scratch(AlignedBuffer::zeroed(aligned_len_usize)?),
+            SsdReadPath::Scratch => ReadTarget::Scratch {
+                len: aligned_len_usize,
+            },
         };
         let output = self
             .submit_read_command(
@@ -1285,7 +1384,9 @@ impl KvSsdStorage {
                 target_addr,
                 len: read_len_usize,
             },
-            SsdReadPath::Scratch => ReadTarget::Scratch(AlignedBuffer::zeroed(read_len_usize)?),
+            SsdReadPath::Scratch => ReadTarget::Scratch {
+                len: read_len_usize,
+            },
         };
         let output = self
             .submit_read_command(key, entry, file_offset, target, None)
@@ -1314,6 +1415,7 @@ impl KvSsdStorage {
         target: ReadTarget,
         read_pin: Option<SsdReadPin>,
     ) -> KvResult<ReadOutput> {
+        let admission = self.read_admission.acquire(target.io_len()).await;
         let (done_tx, done_rx) = oneshot::channel();
         let read_tx = self.read_tx_for_shard(entry.shard_id)?;
         read_tx
@@ -1322,6 +1424,7 @@ impl KvSsdStorage {
                 entry,
                 file_offset,
                 target,
+                _admission: admission,
                 _read_pin: read_pin,
                 done_tx,
             })
@@ -1590,16 +1693,20 @@ async fn ssd_reader_loop(
     io: Arc<UringIoEngine>,
     read_inflight: usize,
 ) {
-    let mut pending = VecDeque::new();
     let mut inflight = FuturesUnordered::new();
     let max_inflight = read_inflight.max(1);
+    let mut rx_open = true;
 
     loop {
-        while inflight.len() < max_inflight {
-            let Some(task) = pending.pop_front() else {
+        if inflight.is_empty() {
+            if !rx_open {
                 break;
-            };
-            inflight.push(execute_read(task, Arc::clone(&io)));
+            }
+            match rx.recv().await {
+                Some(cmd) => inflight.push(execute_read(cmd.into(), Arc::clone(&io))),
+                None => rx_open = false,
+            }
+            continue;
         }
 
         tokio::select! {
@@ -1615,31 +1722,13 @@ async fn ssd_reader_loop(
                 };
                 let _ = completion.done_tx.send(result);
             }
-            Some(cmd) = rx.recv() => {
-                pending.push_back(ReadTask {
-                    key: cmd.key,
-                    entry: cmd.entry,
-                    file_offset: cmd.file_offset,
-                    target: cmd.target,
-                    _read_pin: cmd._read_pin,
-                    done_tx: cmd.done_tx,
-                });
+            maybe_cmd = rx.recv(), if rx_open && inflight.len() < max_inflight => {
+                match maybe_cmd {
+                    Some(cmd) => inflight.push(execute_read(cmd.into(), Arc::clone(&io))),
+                    None => rx_open = false,
+                }
             }
-            else => break,
         }
-    }
-
-    while let Some(completion) = inflight.next().await {
-        let valid = inner.lock().ring.is_offset_valid(&completion.entry);
-        let result = if valid {
-            completion.result
-        } else {
-            inner.lock().ring.remove(&completion.key);
-            Err(KvError::Api(ApiError::KeyNotFound {
-                key: completion.key.key.clone(),
-            }))
-        };
-        let _ = completion.done_tx.send(result);
     }
 }
 
@@ -1649,30 +1738,38 @@ async fn execute_read(task: ReadTask, io: Arc<UringIoEngine>) -> ReadCompletion 
         entry,
         file_offset,
         target,
+        _admission,
         _read_pin,
         done_tx,
     } = task;
     let shard_id = entry.shard_id;
-    let result = async move {
-        match target {
-            ReadTarget::Scratch(mut buffer) => {
+    let result = match target {
+        ReadTarget::Scratch { len } => match AlignedBuffer::zeroed(len) {
+            Ok(mut buffer) => {
                 let buffer_len = buffer.len();
-                let rx = {
-                    let buffer_ptr = buffer.as_mut_ptr();
-                    io.read_at_async(shard_id, buffer_ptr, buffer_len, file_offset)?
-                };
-                let read = rx
-                    .await
-                    .map_err(|_| io::Error::other("kv ssd read completion dropped"))??;
-                if read != buffer_len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!("short kv ssd read: {} != {}", read, buffer_len),
-                    ));
+                let io_result: io::Result<ReadOutput> = async {
+                    let rx = {
+                        let buffer_ptr = buffer.as_mut_ptr();
+                        io.read_at_async(shard_id, buffer_ptr, buffer_len, file_offset)?
+                    };
+                    let read = rx
+                        .await
+                        .map_err(|_| io::Error::other("kv ssd read completion dropped"))??;
+                    if read != buffer_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!("short kv ssd read: {} != {}", read, buffer_len),
+                        ));
+                    }
+                    Ok(ReadOutput::Scratch(buffer))
                 }
-                Ok(ReadOutput::Scratch(buffer))
+                .await;
+                io_result.map_err(|err| file_error_for_entry(&key, file_offset, err))
             }
-            ReadTarget::Direct { target_addr, len } => {
+            Err(err) => Err(err),
+        },
+        ReadTarget::Direct { target_addr, len } => {
+            let io_result: io::Result<ReadOutput> = async {
                 let rx = io.read_at_async(shard_id, target_addr as *mut u8, len, file_offset)?;
                 let read = rx
                     .await
@@ -1685,14 +1782,15 @@ async fn execute_read(task: ReadTask, io: Arc<UringIoEngine>) -> ReadCompletion 
                 }
                 Ok(ReadOutput::Direct)
             }
+            .await;
+            io_result.map_err(|err| file_error_for_entry(&key, file_offset, err))
         }
-    }
-    .await
-    .map_err(|err| file_error_for_entry(&key, file_offset, err));
+    };
     ReadCompletion {
         key,
         entry,
         result,
+        _admission,
         _read_pin,
         done_tx,
     }
@@ -2719,6 +2817,102 @@ mod tests {
         ::tokio::time::timeout(Duration::from_secs(1), publish)
             .await
             .expect("shutdown must unblock eviction publication");
+    }
+
+    #[::tokio::test]
+    async fn read_admission_enforces_byte_and_op_budgets() {
+        let admission = SsdReadAdmission::new(1024, 2);
+        let first = admission.acquire(512).await;
+        let second = admission.acquire(512).await;
+        assert_eq!(admission.bytes.available_permits(), 0);
+        assert_eq!(admission.ops.available_permits(), 0);
+
+        let blocked = admission.acquire(1);
+        tokio::pin!(blocked);
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(10), blocked.as_mut())
+                .await
+                .is_err()
+        );
+
+        drop(first);
+        let third = ::tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("read admission must resume when both budgets are available");
+        assert_eq!(admission.bytes.available_permits(), 511);
+        assert_eq!(admission.ops.available_permits(), 0);
+
+        drop(second);
+        drop(third);
+        assert_eq!(admission.bytes.available_permits(), 1024);
+        assert_eq!(admission.ops.available_permits(), 2);
+    }
+
+    #[::tokio::test]
+    async fn oversized_read_uses_the_full_byte_budget_exclusively() {
+        let admission = SsdReadAdmission::new(1024, 2);
+        let existing = admission.acquire(512).await;
+
+        let oversized = admission.acquire(2048);
+        tokio::pin!(oversized);
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(10), oversized.as_mut())
+                .await
+                .is_err()
+        );
+        drop(existing);
+
+        let oversized = ::tokio::time::timeout(Duration::from_secs(1), oversized)
+            .await
+            .expect("oversized read must proceed after earlier reads finish");
+        assert_eq!(admission.bytes.available_permits(), 0);
+
+        let small = admission.acquire(1);
+        tokio::pin!(small);
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(10), small.as_mut())
+                .await
+                .is_err()
+        );
+        drop(oversized);
+        let small = ::tokio::time::timeout(Duration::from_secs(1), small)
+            .await
+            .expect("small read must resume after the oversized read finishes");
+        drop(small);
+        assert_eq!(admission.bytes.available_permits(), 1024);
+    }
+
+    #[::tokio::test]
+    async fn op_limited_waiter_does_not_consume_byte_budget() {
+        let admission = SsdReadAdmission::new(1024, 1);
+        let first = admission.acquire(1).await;
+
+        let blocked = admission.acquire(1);
+        tokio::pin!(blocked);
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(10), blocked.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(admission.ops.available_permits(), 0);
+        assert_eq!(admission.bytes.available_permits(), 1023);
+
+        drop(first);
+        let second = ::tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("read admission must resume when an operation slot is released");
+        drop(second);
+        assert_eq!(admission.ops.available_permits(), 1);
+        assert_eq!(admission.bytes.available_permits(), 1024);
+    }
+
+    #[test]
+    fn staged_read_byte_budget_covers_128_full_chunks() {
+        assert_eq!(
+            DEFAULT_READ_MAX_INFLIGHT_BYTES
+                / usize::try_from(DEFAULT_READ_TRANSFER_PIPELINE_CHUNK_BYTES).unwrap(),
+            128
+        );
     }
 
     #[::tokio::test]
@@ -4134,6 +4328,34 @@ mod tests {
         assert!(!ring.commit(&key, false));
         assert_eq!(ring.used_bytes_by_shard(), vec![0]);
         assert!(ring.shards[0].busy_begins.is_empty());
+    }
+
+    #[test]
+    fn ring_stale_failed_reservation_cannot_remove_same_key_retry() {
+        let mut ring = SsdRingBuffer::new(vec![512, 512]);
+        let retried = test_key("retried", 1);
+        let wrap = test_key("wrap", 2);
+
+        let failed = prepare_ready(&mut ring, &retried);
+        assert_eq!((failed.shard_id, failed.begin), (0, 0));
+        assert!(!ring.commit(&retried, false));
+
+        let current = prepare_ready(&mut ring, &retried);
+        assert_eq!((current.shard_id, current.begin), (1, 0));
+        assert!(ring.commit(&retried, true));
+
+        let wrapped = match ring.prepare_write(wrap.clone(), 500).unwrap() {
+            SsdPreparedWrite::Ready { entry, evicted } => {
+                assert!(evicted.is_empty());
+                entry
+            }
+            other => panic!("expected ready SSD write, got {other:?}"),
+        };
+        assert_eq!((wrapped.shard_id, wrapped.begin), (0, 512));
+        assert!(ring.commit(&wrap, true));
+
+        assert_eq!(ring.get(&retried).unwrap().shard_id, 1);
+        assert_eq!(ring.used_bytes_by_shard(), vec![512, 512]);
     }
 
     #[test]
