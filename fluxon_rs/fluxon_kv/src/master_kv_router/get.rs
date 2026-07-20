@@ -1,10 +1,10 @@
 use super::{
     CompletedGetInfo, InflightGetInfo, MasterKvRouterView, NodeCacheCapacityReservation,
-    NodeValueReplicaDesc, OwnerHoldingGetInfo, SsdStagePhase,
+    NodeValueReplicaDesc, OwnerHoldingGetInfo,
     msg_pack::{
         GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetMetaResp, GetRevokeReq,
         GetRevokeResp, GetSourceKind, GetStartReq, GetStartResp, SsdStageBeginReq,
-        SsdStageBeginResp, SsdStageEndReq, SsdStageEndResp,
+        SsdStageBeginResp,
     },
 };
 use crate::kv_ssd_storage::{SSD_ALIGNMENT, align_ssd_io_len};
@@ -801,6 +801,20 @@ fn invalid_get_caller(
     })
 }
 
+fn invalid_get_source_or_requester(
+    operation: &str,
+    get_id: u64,
+    source: &NodeID,
+    requester: &NodeID,
+    actual: &NodeID,
+) -> msg_and_error::KvError {
+    msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+        detail: format!(
+            "{operation} caller mismatch for get_id={get_id}: expected source={source} or requester={requester}, actual={actual}"
+        ),
+    })
+}
+
 pub async fn handle_ssd_stage_begin(
     view: MasterKvRouterView,
     req: MsgPack<SsdStageBeginReq>,
@@ -864,71 +878,10 @@ pub async fn handle_ssd_stage_begin(
     }
 }
 
-pub async fn handle_ssd_stage_end(
-    view: MasterKvRouterView,
-    req: MsgPack<SsdStageEndReq>,
-    source_node_id: NodeID,
-) -> MsgPack<SsdStageEndResp> {
-    let get_id = req.serialize_part.get_id;
-    let transition_lock = view
-        .master_kv_router()
-        .inner()
-        .get_transition_locks
-        .get_lock(get_id);
-    let _transition = transition_lock.lock().await;
-
-    let result = async {
-        let Some(inflight) = view.master_kv_router().inner().get_inflight_get(get_id) else {
-            // End is idempotent. A prior revoke may already have released the entry.
-            return Ok(());
-        };
-        if inflight.src_node_id != source_node_id {
-            return Err(invalid_get_caller(
-                "SSD stage end",
-                get_id,
-                &inflight.src_node_id,
-                &source_node_id,
-            ));
-        }
-        let lifecycle = inflight.ssd_stage_lifecycle.as_ref().ok_or_else(|| {
-            msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
-                detail: format!("get_id={get_id} has no remote SSD stage"),
-            })
-        })?;
-        let (revoke_requested, drop_ssd_source) = {
-            let mut lifecycle = lifecycle.lock();
-            lifecycle.mark_quiescent().ok_or_else(|| {
-                msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
-                    detail: format!("SSD stage end arrived before begin for get_id={get_id}"),
-                })
-            })?
-        };
-        if revoke_requested {
-            if let Some(inflight) = view.master_kv_router().inner().remove_inflight_get(get_id) {
-                finish_revoked_get(&view, get_id, inflight, drop_ssd_source);
-            }
-        }
-        Ok(())
-    }
-    .await;
-
-    let response = match result {
-        Ok(()) => SsdStageEndResp {
-            error_code: msg_and_error::OK,
-            error_json: String::new(),
-        },
-        Err(err) => crate::rpcresp_kvresult_convert::FromError::from_error(&err),
-    };
-    MsgPack {
-        serialize_part: response,
-        raw_bytes: Vec::new(),
-    }
-}
-
 pub async fn handle_get_revoke(
     view: MasterKvRouterView,
     req: MsgPack<GetRevokeReq>,
-    requester_node_id: NodeID,
+    caller_node_id: NodeID,
 ) -> MsgPack<GetRevokeResp> {
     tracing::debug!("Handling GetRevokeReq: {:?}", req.serialize_part);
 
@@ -943,14 +896,7 @@ pub async fn handle_get_revoke(
     let result = if let Some(completed) =
         view.master_kv_router().inner().completed_gets.get(&get_id)
     {
-        if completed.requester_node_id != requester_node_id {
-            Err(invalid_get_caller(
-                "GetRevoke",
-                get_id,
-                &completed.requester_node_id,
-                &requester_node_id,
-            ))
-        } else {
+        if completed.requester_node_id == caller_node_id {
             view.master_kv_router()
                 .inner()
                 .completed_gets
@@ -961,32 +907,73 @@ pub async fn handle_get_revoke(
                 .remove(&completed.holder_key);
             tracing::info!(get_id, "Revoked completed-but-undelivered get holding");
             Ok(())
+        } else if completed.committer_node_id == caller_node_id {
+            // GetDone may have committed even when its response was lost. A source
+            // fallback revoke confirms quiescence but must not delete requester state.
+            tracing::debug!(get_id, "Ignored source revoke after committed GetDone");
+            Ok(())
+        } else {
+            Err(invalid_get_source_or_requester(
+                "GetRevoke",
+                get_id,
+                &completed.committer_node_id,
+                &completed.requester_node_id,
+                &caller_node_id,
+            ))
         }
     } else if let Some(inflight) = view.master_kv_router().inner().get_inflight_get(get_id) {
-        if inflight.req_node_id != requester_node_id {
+        if let Some(lifecycle) = &inflight.ssd_stage_lifecycle {
+            if inflight.src_node_id == caller_node_id {
+                let drop_ssd_source = lifecycle
+                    .lock()
+                    .finish_revoke_from_source(req.serialize_part.drop_ssd_source);
+                if let Some(drop_ssd_source) = drop_ssd_source {
+                    if let Some(inflight) =
+                        view.master_kv_router().inner().remove_inflight_get(get_id)
+                    {
+                        finish_revoked_get(&view, get_id, inflight, drop_ssd_source);
+                    }
+                    Ok(())
+                } else {
+                    Err(msg_and_error::KvError::Api(
+                        msg_and_error::ApiError::InvalidArgument {
+                            detail: format!("remote SSD source already finalized get_id={get_id}"),
+                        },
+                    ))
+                }
+            } else if inflight.req_node_id == caller_node_id {
+                let defer_release = lifecycle
+                    .lock()
+                    .request_revoke(req.serialize_part.drop_ssd_source);
+                if defer_release {
+                    tracing::info!(
+                        get_id,
+                        "Deferred requester GetRevoke until remote SSD source finalizes"
+                    );
+                } else if let Some(inflight) =
+                    view.master_kv_router().inner().remove_inflight_get(get_id)
+                {
+                    finish_revoked_get(&view, get_id, inflight, req.serialize_part.drop_ssd_source);
+                }
+                Ok(())
+            } else {
+                Err(invalid_get_source_or_requester(
+                    "GetRevoke",
+                    get_id,
+                    &inflight.src_node_id,
+                    &inflight.req_node_id,
+                    &caller_node_id,
+                ))
+            }
+        } else if inflight.req_node_id != caller_node_id {
             Err(invalid_get_caller(
                 "GetRevoke",
                 get_id,
                 &inflight.req_node_id,
-                &requester_node_id,
+                &caller_node_id,
             ))
         } else {
-            let defer_release = inflight
-                .ssd_stage_lifecycle
-                .as_ref()
-                .is_some_and(|lifecycle| {
-                    lifecycle
-                        .lock()
-                        .request_revoke(req.serialize_part.drop_ssd_source)
-                });
-            if defer_release {
-                tracing::info!(
-                    get_id,
-                    "Deferred GetRevoke until remote SSD stage reports quiescence"
-                );
-            } else if let Some(inflight) =
-                view.master_kv_router().inner().remove_inflight_get(get_id)
-            {
+            if let Some(inflight) = view.master_kv_router().inner().remove_inflight_get(get_id) {
                 finish_revoked_get(&view, get_id, inflight, req.serialize_part.drop_ssd_source);
             }
             Ok(())
@@ -1018,7 +1005,7 @@ pub async fn handle_get_revoke(
 pub async fn handle_get_done(
     view: MasterKvRouterView,
     req: MsgPack<GetDoneReq>,
-    requester_node_id: NodeID,
+    caller_node_id: NodeID,
 ) -> MsgPack<GetDoneResp> {
     tracing::debug!("Handling GetDoneReq: {:?}", req.serialize_part);
 
@@ -1031,12 +1018,13 @@ pub async fn handle_get_done(
     let _transition = transition_lock.lock().await;
 
     if let Some(completed) = view.master_kv_router().inner().completed_gets.get(&get_id) {
-        let Some(response) = completed.replay_for(&requester_node_id) else {
-            let err = invalid_get_caller(
+        let Some(response) = completed.replay_for(&caller_node_id) else {
+            let err = invalid_get_source_or_requester(
                 "GetDone",
                 get_id,
+                &completed.committer_node_id,
                 &completed.requester_node_id,
-                &requester_node_id,
+                &caller_node_id,
             );
             return MsgPack {
                 serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
@@ -1049,29 +1037,72 @@ pub async fn handle_get_done(
         };
     }
 
-    if let Some(inflight) = view.master_kv_router().inner().get_inflight_get(get_id) {
-        if inflight.req_node_id != requester_node_id {
-            let err =
-                invalid_get_caller("GetDone", get_id, &inflight.req_node_id, &requester_node_id);
+    let Some(inflight) = view.master_kv_router().inner().get_inflight_get(get_id) else {
+        tracing::warn!(get_id, "Get operation not found for completion");
+        let err = msg_and_error::KvError::Api(msg_and_error::ApiError::GetTimeout {
+            timeout_ms: 0,
+            detail: format!(
+                "Get operation with get_id {get_id} is no longer active and has no replayable completion"
+            ),
+        });
+        let mut response: GetDoneResp =
+            crate::rpcresp_kvresult_convert::FromError::from_error(&err);
+        response.holder_id = 0;
+        return MsgPack {
+            serialize_part: response,
+            raw_bytes: Vec::new(),
+        };
+    };
+
+    let committer_node_id = if let Some(lifecycle) = &inflight.ssd_stage_lifecycle {
+        if inflight.src_node_id != caller_node_id {
+            let err = invalid_get_caller("GetDone", get_id, &inflight.src_node_id, &caller_node_id);
             return MsgPack {
                 serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
                 raw_bytes: Vec::new(),
             };
         }
-        if inflight
-            .ssd_stage_lifecycle
-            .as_ref()
-            .is_some_and(|lifecycle| lifecycle.lock().phase != SsdStagePhase::Quiescent)
-        {
+
+        let Some((revoke_requested, drop_ssd_source)) = lifecycle.lock().finish_done_from_source()
+        else {
             let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
-                detail: format!("remote SSD stage is not quiescent for get_id={get_id}"),
+                detail: format!(
+                    "remote SSD source cannot complete get_id={get_id} before stage begin"
+                ),
+            });
+            return MsgPack {
+                serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                raw_bytes: Vec::new(),
+            };
+        };
+
+        if revoke_requested {
+            if let Some(inflight) = view.master_kv_router().inner().remove_inflight_get(get_id) {
+                finish_revoked_get(&view, get_id, inflight, drop_ssd_source);
+            }
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::GetTimeout {
+                timeout_ms: 0,
+                detail: format!(
+                    "requester revoked get_id={get_id} before the SSD source completed transfer"
+                ),
             });
             return MsgPack {
                 serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
                 raw_bytes: Vec::new(),
             };
         }
-    }
+
+        inflight.src_node_id.clone()
+    } else {
+        if inflight.req_node_id != caller_node_id {
+            let err = invalid_get_caller("GetDone", get_id, &inflight.req_node_id, &caller_node_id);
+            return MsgPack {
+                serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                raw_bytes: Vec::new(),
+            };
+        }
+        inflight.req_node_id.clone()
+    };
 
     // Remove from inflight_gets and transfer to get_holding
     if let Some(mut inflight_info) = view.master_kv_router().inner().remove_inflight_get(get_id) {
@@ -1215,6 +1246,7 @@ pub async fn handle_get_done(
             get_id,
             CompletedGetInfo {
                 requester_node_id: req_node_id,
+                committer_node_id,
                 holder_key,
                 response: response.clone(),
             },

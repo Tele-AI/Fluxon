@@ -9,7 +9,7 @@ use crate::master_kv_router::msg_pack::{
     BatchDeleteAckResp, BatchDeleteClientKvMetaCacheResp, BatchSsdReplicaEvictResp, DeleteAckResp,
     DeleteResp, GetDoneResp, GetMasterOnlyMetricPartResp, GetMetaResp, GetRevokeResp, GetStartResp,
     MemHolderKeepAliveResp, MemHolderReleaseResp, PutDoneResp, PutRevokeResp, PutStartResp,
-    SsdReplicaCommitResp, SsdStageBeginResp, SsdStageEndResp,
+    SsdReplicaCommitResp, SsdStageBeginResp,
 };
 use crate::master_seg_manager::msg_pack::RequestSegmentRegistrationResp;
 use crate::memholder::ExternalMemHolderInfo;
@@ -287,15 +287,6 @@ impl FromError for GetDoneResp {
     }
 }
 impl FromError for SsdStageBeginResp {
-    fn from_error(e: &KvError) -> Self {
-        let code = e.code();
-        Self {
-            error_code: code,
-            error_json: e.to_json(),
-        }
-    }
-}
-impl FromError for SsdStageEndResp {
     fn from_error(e: &KvError) -> Self {
         let code = e.code();
         Self {

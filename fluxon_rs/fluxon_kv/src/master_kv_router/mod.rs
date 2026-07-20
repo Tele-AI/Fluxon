@@ -13,13 +13,13 @@ use self::{
     delete::{handle_batch_delete_ack, handle_batch_ssd_replica_evict},
     get::{
         handle_get_done, handle_get_meta, handle_get_revoke, handle_get_start,
-        handle_ssd_stage_begin, handle_ssd_stage_end,
+        handle_ssd_stage_begin,
     },
     msg_pack::{
         BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchSsdReplicaEvictReq,
         CountPrefixReq, CountPrefixResp, DeleteAckReq, DeleteReq, GetAllocationMode, GetDoneReq,
         GetMetaReq, GetRevokeReq, GetSourceKind, GetStartReq, PutDoneReq, PutRevokeReq,
-        PutStartReq, SsdReplicaCommitReq, SsdStageBeginReq, SsdStageEndReq,
+        PutStartReq, SsdReplicaCommitReq, SsdStageBeginReq,
     },
     placement::{PlacementDefault, PlacementPolicy},
     put::{handle_put_done, handle_put_revoke, handle_put_start, handle_ssd_replica_commit},
@@ -208,25 +208,36 @@ impl SsdStageLifecycle {
         true
     }
 
-    pub(crate) fn mark_quiescent(&mut self) -> Option<(bool, bool)> {
-        if self.phase == SsdStagePhase::NotStarted {
+    pub(crate) fn finish_done_from_source(&mut self) -> Option<(bool, bool)> {
+        if self.phase != SsdStagePhase::Active {
             return None;
         }
         self.phase = SsdStagePhase::Quiescent;
         Some((self.revoke_requested, self.drop_ssd_source))
+    }
+
+    pub(crate) fn finish_revoke_from_source(&mut self, drop_ssd_source: bool) -> Option<bool> {
+        if self.phase == SsdStagePhase::Quiescent {
+            return None;
+        }
+        self.phase = SsdStagePhase::Quiescent;
+        self.drop_ssd_source |= drop_ssd_source;
+        Some(self.drop_ssd_source)
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct CompletedGetInfo {
     pub(crate) requester_node_id: NodeID,
+    pub(crate) committer_node_id: NodeID,
     pub(crate) holder_key: NodeHolderKey,
     pub(crate) response: msg_pack::GetDoneResp,
 }
 
 impl CompletedGetInfo {
-    pub(crate) fn replay_for(&self, requester_node_id: &NodeID) -> Option<msg_pack::GetDoneResp> {
-        (&self.requester_node_id == requester_node_id).then(|| self.response.clone())
+    pub(crate) fn replay_for(&self, caller_node_id: &NodeID) -> Option<msg_pack::GetDoneResp> {
+        (&self.requester_node_id == caller_node_id || &self.committer_node_id == caller_node_id)
+            .then(|| self.response.clone())
     }
 }
 
@@ -574,17 +585,31 @@ mod tests {
         assert!(lifecycle.begin());
         assert!(lifecycle.request_revoke(false));
         assert!(lifecycle.request_revoke(true));
-        assert_eq!(lifecycle.mark_quiescent(), Some((true, true)));
-        assert_eq!(lifecycle.mark_quiescent(), Some((true, true)));
+        assert_eq!(lifecycle.finish_done_from_source(), Some((true, true)));
+        assert_eq!(lifecycle.finish_done_from_source(), None);
         assert!(!lifecycle.begin());
+    }
+
+    #[test]
+    fn remote_ssd_source_revoke_can_finish_before_or_after_begin() {
+        let mut before_begin = SsdStageLifecycle::new();
+        assert_eq!(before_begin.finish_revoke_from_source(true), Some(true));
+        assert_eq!(before_begin.finish_revoke_from_source(false), None);
+
+        let mut after_begin = SsdStageLifecycle::new();
+        assert!(after_begin.begin());
+        assert!(after_begin.request_revoke(true));
+        assert_eq!(after_begin.finish_revoke_from_source(false), Some(true));
     }
 
     #[test]
     fn completed_get_replays_the_same_holder_for_duplicate_done() {
         let requester: NodeID = "requester-a".to_string().into();
+        let committer: NodeID = "source-a".to_string().into();
         let holder_key = NodeHolderKey::new(requester.to_string(), 73);
         let completed = CompletedGetInfo {
             requester_node_id: requester.clone(),
+            committer_node_id: committer.clone(),
             holder_key,
             response: msg_pack::GetDoneResp {
                 holder_id: 73,
@@ -603,6 +628,15 @@ mod tests {
         let second = cache.get(&9).unwrap().replay_for(&requester).unwrap();
         assert_eq!(first.holder_id, 73);
         assert_eq!(second.holder_id, first.holder_id);
+        assert_eq!(
+            cache
+                .get(&9)
+                .unwrap()
+                .replay_for(&committer)
+                .unwrap()
+                .holder_id,
+            73
+        );
         let other: NodeID = "requester-b".to_string().into();
         assert!(cache.get(&9).unwrap().replay_for(&other).is_none());
     }
@@ -1184,20 +1218,6 @@ impl MasterKvRouter {
                 let ack = handle_ssd_stage_begin(view_task, msg, source_node_id).await;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send SsdStageBeginResp: {:?}", e);
-                }
-            });
-            Ok(())
-        });
-
-        let view = self.0.view().clone();
-        RPCHandler::<SsdStageEndReq>::new().regist(p2p, move |resp, msg| {
-            let view = view.clone();
-            let view_task = view.clone();
-            let source_node_id = resp.node_id();
-            let _ = view.spawn("rpc_ssd_stage_end", async move {
-                let ack = handle_ssd_stage_end(view_task, msg, source_node_id).await;
-                if let Err(e) = resp.send_resp(ack).await {
-                    error!("Failed to send SsdStageEndResp: {:?}", e);
                 }
             });
             Ok(())

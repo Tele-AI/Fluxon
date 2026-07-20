@@ -185,6 +185,7 @@ impl ClientKvApiInner {
                 );
             }
 
+            let mut ssd_done_resp = None;
             if resp.source_kind == GetSourceKind::Ssd {
                 let ssd_stage_len = resp.ssd_stage_len;
                 if ssd_stage_len < data_len as u64 {
@@ -225,7 +226,7 @@ impl ClientKvApiInner {
                     )
                     .await
                 {
-                    Ok(()) => {}
+                    Ok(done_resp) => ssd_done_resp = Some(done_resp),
                     Err(err) => {
                         tracing::warn!(
                             "kv get ssd stage failed: key={}, source_node={}, stage={:#x}, target={:#x}, len={}, ssd_stage_len={}, err={}",
@@ -354,20 +355,30 @@ impl ClientKvApiInner {
 
             // Removed post-transfer zero-header verification per request.
 
-            // The requester commits completion only after every source has stopped
-            // touching the target. GetDone is idempotent, so response loss can be retried.
-            let done_resp = match self.get_done(get_id).await {
-                Ok(resp) => resp,
-                Err(err) => {
-                    obe_get_end_error_rpc(&metrics, &client_id, &node_role, key, data_len as u64);
-                    if let Err(revoke_err) = self.get_revoke(get_id).await {
-                        tracing::warn!(
-                            get_id,
-                            error = %revoke_err,
-                            "Failed to revoke get after GetDone RPC failure"
+            // Remote SSD source owns transfer finalization. Other paths still commit
+            // from the requester after their transfer has stopped touching the target.
+            let done_resp = if let Some(done_resp) = ssd_done_resp {
+                done_resp
+            } else {
+                match self.get_done(get_id).await {
+                    Ok(resp) => resp,
+                    Err(err) => {
+                        obe_get_end_error_rpc(
+                            &metrics,
+                            &client_id,
+                            &node_role,
+                            key,
+                            data_len as u64,
                         );
+                        if let Err(revoke_err) = self.get_revoke(get_id).await {
+                            tracing::warn!(
+                                get_id,
+                                error = %revoke_err,
+                                "Failed to revoke get after GetDone RPC failure"
+                            );
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
                 }
             };
             let end_handle_us = done_resp.server_process_us;
@@ -561,7 +572,7 @@ impl ClientKvApiInner {
         self.get_revoke_inner(get_id, false).await
     }
 
-    async fn get_revoke_ssd_source(&self, get_id: u64) -> KvResult<()> {
+    pub(super) async fn get_revoke_ssd_source(&self, get_id: u64) -> KvResult<()> {
         self.get_revoke_inner(get_id, true).await
     }
 

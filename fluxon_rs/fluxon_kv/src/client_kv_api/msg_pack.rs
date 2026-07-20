@@ -1,3 +1,4 @@
+use crate::master_kv_router::msg_pack::GetDoneResp;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::p2p::msg_pack::{MsgPackSerializePart, RPCReq};
 use crate::rpcresp_kvresult_convert::msg_and_error::ErrorCode;
@@ -114,6 +115,7 @@ impl RPCReq for SsdStageReadReq {
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct SsdStageReadResp {
+    pub done: GetDoneResp,
     pub error_code: ErrorCode,
     pub error_json: String,
 }

@@ -29,13 +29,13 @@ use crate::{
     client_transfer_engine::{ClientTransferEngine, ClientTransferEngineAccessTrait},
     cluster_manager::{ClusterEvent, ClusterManager, ClusterManagerAccessTrait},
     master_kv_router::msg_pack::{
-        DeleteReq, GetDoneReq, GetMetaReq, GetRevokeReq, GetStartReq, PutDoneReq, PutRevokeReq,
-        PutStartReq, SsdReplicaCommitReq, SsdStageBeginReq, SsdStageEndReq,
+        DeleteReq, GetDoneReq, GetDoneResp, GetMetaReq, GetRevokeReq, GetStartReq, PutDoneReq,
+        PutRevokeReq, PutStartReq, SsdReplicaCommitReq, SsdStageBeginReq,
     },
     metric_reporter::{MetricReporter, MetricReporterAccessTrait},
     metrics::{MetricsHandle, OperationKind, RequestStage},
     p2p::{
-        msg_pack::{RPCCaller, RPCHandler},
+        msg_pack::{MIN_EXPLICIT_RPC_TIMEOUT_SECS, RPCCaller, RPCHandler},
         p2p_module::{P2pModule, P2pModuleAccessTrait},
     },
     rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult},
@@ -58,6 +58,9 @@ const SSD_EVICTION_BATCH_MAX_ITEMS: usize = 256;
 const SSD_EVICTION_BATCH_MAX_DELAY: Duration = Duration::from_millis(10);
 const SSD_EVICTION_BATCH_RETRY_DELAY: Duration = Duration::from_millis(100);
 const OWNER_DELETE_ACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+const SSD_STAGE_MASTER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+const SSD_STAGE_RPC_TIMEOUT: Duration = Duration::from_secs(MIN_EXPLICIT_RPC_TIMEOUT_SECS);
+const SSD_STAGE_READ_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Information about a memholder held by external client
 #[derive(Clone)]
@@ -493,7 +496,7 @@ async fn handle_ssd_stage_read(
         }
     };
 
-    let stage_result = match inner.begin_remote_ssd_stage(req.get_id).await {
+    let transfer_result = match inner.begin_remote_ssd_stage(req.get_id).await {
         Ok(()) => {
             inner
                 .load_and_push_kv_from_ssd(
@@ -509,18 +512,36 @@ async fn handle_ssd_stage_read(
         }
         Err(err) => Err(err),
     };
-    // End is sent even when Begin had an ambiguous transport failure. It is the
-    // master-owned proof that this source task will no longer touch stage/target addresses.
-    let end_result = inner.end_remote_ssd_stage(req.get_id).await;
-    let result = match (stage_result, end_result) {
-        (Err(stage_err), _) => Err(stage_err),
-        (Ok(()), Err(end_err)) => Err(end_err),
-        (Ok(()), Ok(())) => Ok(()),
+    let done_result = match transfer_result {
+        Ok(()) => match inner.get_done(req.get_id).await {
+            Ok(done) => Ok(done),
+            Err(done_err) => {
+                if let Err(revoke_err) = inner.get_revoke(req.get_id).await {
+                    tracing::warn!(
+                        get_id = req.get_id,
+                        error = %revoke_err,
+                        "Failed to finalize source-owned SSD get after GetDone failure"
+                    );
+                }
+                Err(done_err)
+            }
+        },
+        Err(transfer_err) => {
+            if let Err(revoke_err) = inner.get_revoke_ssd_source(req.get_id).await {
+                tracing::warn!(
+                    get_id = req.get_id,
+                    error = %revoke_err,
+                    "Failed to revoke source-owned SSD get after transfer failure"
+                );
+            }
+            Err(transfer_err)
+        }
     };
 
-    match result {
-        Ok(()) => MsgPack {
+    match done_result {
+        Ok(done) => MsgPack {
             serialize_part: SsdStageReadResp {
+                done,
                 error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
                 error_json: String::new(),
             },
@@ -1031,7 +1052,6 @@ pub struct ClientKvApiInner {
     rpc_caller_resolve_side_transfer_lane: RPCCaller<ResolveSideTransferLaneReq>,
     rpc_caller_ssd_stage_read: RPCCaller<SsdStageReadReq>,
     rpc_caller_ssd_stage_begin: RPCCaller<SsdStageBeginReq>,
-    rpc_caller_ssd_stage_end: RPCCaller<SsdStageEndReq>,
     rpc_caller_ssd_replica_commit: RPCCaller<SsdReplicaCommitReq>,
     rpc_caller_batch_ssd_replica_evict: RPCCaller<BatchSsdReplicaEvictReq>,
 
@@ -1345,20 +1365,20 @@ impl ClientKvApiInner {
         target_addr: u64,
         len: u64,
         stage_len: u64,
-    ) -> KvResult<()> {
+    ) -> KvResult<GetDoneResp> {
         let self_node_id = self.view.cluster_manager().get_self_info().id.clone();
         if source_node_id == &self_node_id {
-            return self
-                .load_and_push_kv_from_ssd(
-                    key,
-                    put_id,
-                    stage_addr,
-                    stage_len,
-                    &self_node_id,
-                    target_addr,
-                    len,
-                )
-                .await;
+            self.load_and_push_kv_from_ssd(
+                key,
+                put_id,
+                stage_addr,
+                stage_len,
+                &self_node_id,
+                target_addr,
+                len,
+            )
+            .await?;
+            return self.get_done(get_id).await;
         }
 
         let req = MsgPack {
@@ -1380,25 +1400,25 @@ impl ClientKvApiInner {
                 self.view.p2p_module(),
                 source_node_id.clone().into(),
                 req,
-                Some(Duration::from_secs(60)),
+                Some(SSD_STAGE_READ_RPC_TIMEOUT),
                 0,
             )
             .await
             .map_err(KvError::from)?;
         let resp = resp.serialize_part;
         crate::rpcresp_kvresult_convert::try_from_code(resp.error_code, resp.error_json)?;
-        Ok(())
+        Ok(resp.done)
     }
 
     async fn begin_remote_ssd_stage(&self, get_id: u64) -> KvResult<()> {
         let master_node_id = tokio::time::timeout(
-            Duration::from_secs(5),
+            SSD_STAGE_MASTER_LOOKUP_TIMEOUT,
             self.view.cluster_manager().find_or_wait_master_node(),
         )
         .await
         .map_err(|_| {
             KvError::Api(ApiError::GetTimeout {
-                timeout_ms: 5_000,
+                timeout_ms: SSD_STAGE_MASTER_LOOKUP_TIMEOUT.as_millis() as u64,
                 detail: format!("timed out locating master for SSD stage begin: get_id={get_id}"),
             })
         })??;
@@ -1411,8 +1431,8 @@ impl ClientKvApiInner {
                     serialize_part: SsdStageBeginReq { get_id },
                     raw_bytes: Vec::new(),
                 },
-                Some(Duration::from_secs(5)),
-                2,
+                Some(SSD_STAGE_RPC_TIMEOUT),
+                0,
             )
             .await
             .map_err(KvError::from)?;
@@ -1420,67 +1440,6 @@ impl ClientKvApiInner {
             resp.serialize_part.error_code,
             resp.serialize_part.error_json,
         )
-    }
-
-    async fn end_remote_ssd_stage(&self, get_id: u64) -> KvResult<()> {
-        loop {
-            if !self.shutdown_gate.is_accepting()
-                || !self.view.register_shutdown_poller().is_running()
-            {
-                return Err(KvError::Api(ApiError::SystemShutdown {
-                    detail: format!(
-                        "shutdown interrupted SSD stage quiescence acknowledgement for get_id={get_id}"
-                    ),
-                }));
-            }
-            let master_node_id = match tokio::time::timeout(
-                Duration::from_secs(1),
-                self.view.cluster_manager().find_or_wait_master_node(),
-            )
-            .await
-            {
-                Ok(Ok(node_id)) => node_id,
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        get_id,
-                        error = %err,
-                        "Waiting to report SSD stage quiescence to the master"
-                    );
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-                Err(_) => continue,
-            };
-            let result = self
-                .rpc_caller_ssd_stage_end
-                .call(
-                    self.view.p2p_module(),
-                    master_node_id.into(),
-                    MsgPack {
-                        serialize_part: SsdStageEndReq { get_id },
-                        raw_bytes: Vec::new(),
-                    },
-                    Some(Duration::from_secs(5)),
-                    0,
-                )
-                .await;
-            match result {
-                Ok(resp) => {
-                    return crate::rpcresp_kvresult_convert::try_from_code(
-                        resp.serialize_part.error_code,
-                        resp.serialize_part.error_json,
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        get_id,
-                        error = ?err,
-                        "Retrying SSD stage quiescence acknowledgement"
-                    );
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
     }
 }
 
@@ -2228,7 +2187,6 @@ impl ClientKvApi {
             rpc_caller_resolve_side_transfer_lane: RPCCaller::new(),
             rpc_caller_ssd_stage_read: RPCCaller::new(),
             rpc_caller_ssd_stage_begin: RPCCaller::new(),
-            rpc_caller_ssd_stage_end: RPCCaller::new(),
             rpc_caller_ssd_replica_commit: RPCCaller::new(),
             rpc_caller_batch_ssd_replica_evict: RPCCaller::new(),
             default_lease_id: parking_lot::RwLock::new(None),
@@ -2269,9 +2227,6 @@ impl ClientKvApi {
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_ssd_stage_begin
-            .regist(inner.view.p2p_module());
-        inner
-            .rpc_caller_ssd_stage_end
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_ssd_replica_commit
@@ -2708,5 +2663,18 @@ impl ClientKvApiInner {
     #[cfg(any(test, feature = "test_bins"))]
     pub fn get_view(&self) -> &ClientKvApiView {
         &self.view
+    }
+}
+
+#[cfg(test)]
+mod ssd_stage_rpc_contract_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_timeouts_respect_p2p_contract_and_outer_budget() {
+        assert!(SSD_STAGE_RPC_TIMEOUT >= Duration::from_secs(MIN_EXPLICIT_RPC_TIMEOUT_SECS));
+        assert!(
+            SSD_STAGE_MASTER_LOOKUP_TIMEOUT + SSD_STAGE_RPC_TIMEOUT < SSD_STAGE_READ_RPC_TIMEOUT
+        );
     }
 }

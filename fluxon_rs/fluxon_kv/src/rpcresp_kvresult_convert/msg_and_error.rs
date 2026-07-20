@@ -41,8 +41,6 @@ pub enum MsgId {
     BatchSsdReplicaEvictResp = 3034,
     SsdStageBeginReq = 3035,
     SsdStageBeginResp = 3036,
-    SsdStageEndReq = 3037,
-    SsdStageEndResp = 3038,
     GetMetaReq = 3019,
     GetMetaResp = 3020,
     BatchDeleteClientKvMetaCacheReq = 3021,

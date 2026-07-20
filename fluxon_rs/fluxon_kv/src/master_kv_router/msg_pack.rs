@@ -349,33 +349,6 @@ impl RPCReq for SsdStageBeginReq {
     type Resp = SsdStageBeginResp;
 }
 
-#[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct SsdStageEndReq {
-    pub get_id: u64,
-}
-
-impl MsgPackSerializePart for SsdStageEndReq {
-    fn msg_id(&self) -> u32 {
-        MsgId::SsdStageEndReq as u32
-    }
-}
-
-#[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct SsdStageEndResp {
-    pub error_code: ErrorCode,
-    pub error_json: String,
-}
-
-impl MsgPackSerializePart for SsdStageEndResp {
-    fn msg_id(&self) -> u32 {
-        MsgId::SsdStageEndResp as u32
-    }
-}
-
-impl RPCReq for SsdStageEndReq {
-    type Resp = SsdStageEndResp;
-}
-
 // --- RPC for MemHolder KeepAlive ---
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
