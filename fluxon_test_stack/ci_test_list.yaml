@@ -101,6 +101,18 @@ scenes:
       scales: [n1_kvowner_dram_20gib]
       profiles: [fluxon_tcp]
 
+  ci_top_attention_fs_s3_rclone:
+    ci:
+      subject: fs
+      runtime_contract: rust_self_managed
+      prepare:
+        - kind: online_docker_image
+          image_ref: rclone/rclone:1.60.1
+          env: FLUXON_RCLONE_DOCKER_IMAGE_REF
+    select:
+      scales: [n1_kvowner_dram_20gib]
+      profiles: [fluxon_tcp]
+
   ci_top_attention_cargo_limit_thirdparty:
     ci:
       subject: rust

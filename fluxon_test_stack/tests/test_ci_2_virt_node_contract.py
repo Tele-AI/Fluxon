@@ -79,6 +79,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
     _CARGO_OPS_SCENE_ID = "ci_top_attention_cargo_ops"
     _CARGO_PYO3_SCENE_ID = "ci_top_attention_cargo_pyo3"
     _DOC_SCENE_ID = "ci_top_attention_doc_page_build"
+    _FS_S3_RCLONE_SCENE_ID = "ci_top_attention_fs_s3_rclone"
     _LOG_MGMT_SCENE_ID = "ci_top_attention_log_mgmt"
     _MQ_SCENE_ID = "ci_top_attention_mq_core"
 
@@ -168,6 +169,17 @@ class TestCi2VirtNodeContract(unittest.TestCase):
         )
 
         self.assertNotIn("ci_top_attention_largescale_mq", all_scenes)
+        self.assertEqual(
+            all_scenes[self._FS_S3_RCLONE_SCENE_ID],
+            {
+                "subject": "fs",
+                "runtime_contract": "rust_self_managed",
+                "scale": "n1_kvowner_dram_20gib",
+                "case_config": False,
+                "timeout_seconds": 3600,
+                "scene_config": {},
+            },
+        )
         self.assertTrue(all_scenes)
 
     def test_scan_and_clean_temp_is_scoped_and_preserves_runner_control_paths(self) -> None:
@@ -707,6 +719,35 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             ["n1_kvowner_dram_3gib"],
         )
         self.assertEqual(set(generated["scales"].keys()), {"n1_kvowner_dram_3gib"})
+
+    def test_generated_suite_supports_fs_s3_rclone_ci_scene(self) -> None:
+        suite_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_SUITE_PATH, ctx="suite")
+        generated = _ENTRY._rewrite_suite_for_local_dual_nodes(
+            suite_cfg=suite_cfg,
+            scene_ids=[self._FS_S3_RCLONE_SCENE_ID],
+            primary_node_name="local-node-a",
+            secondary_node_name="local-node-b",
+            host_ip="10.1.1.119",
+            wheel_name="fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+            controller_port=19080,
+        )
+
+        self.assertEqual(set(generated["scenes"].keys()), {self._FS_S3_RCLONE_SCENE_ID})
+        scene = generated["scenes"][self._FS_S3_RCLONE_SCENE_ID]
+        self.assertEqual(scene["ci"]["subject"], "fs")
+        self.assertEqual(scene["ci"]["runtime_contract"], "rust_self_managed")
+        self.assertEqual(
+            scene["ci"]["prepare"],
+            [
+                {
+                    "kind": "online_docker_image",
+                    "image_ref": "rclone/rclone:1.60.1",
+                    "env": "FLUXON_RCLONE_DOCKER_IMAGE_REF",
+                }
+            ],
+        )
+        self.assertEqual(scene["select"]["scales"], ["n1_kvowner_dram_20gib"])
+        self.assertNotIn("commands", scene["ci"])
 
     def test_generated_deployconf_rewrites_to_dual_local_nodes(self) -> None:
         deployconf_cfg = _ENTRY._load_yaml_mapping(_ENTRY.DEFAULT_DEPLOYCONF_TEMPLATE, ctx="deployconf")

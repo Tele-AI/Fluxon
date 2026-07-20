@@ -1337,6 +1337,54 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             ],
         )
 
+    def test_fs_s3_rclone_ci_execution_plan_uses_pinned_image(self) -> None:
+        suite_cfg = _suite_cfg_with_declared_ci_commands(
+            {
+                "ci_top_attention_fs_s3_rclone": [
+                    _top_attention_command(
+                        command_id="top_attention_fs_s3_rclone",
+                        script_name="_fs_s3_rclone.py",
+                        timeout_seconds=3600,
+                    )
+                ]
+            }
+        )
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+        case = next(
+            item
+            for item in cases
+            if item.scene_id == "ci_top_attention_fs_s3_rclone"
+            and item.profile_id == "fluxon_tcp"
+        )
+        planned = _RUNNER._build_ci_execution_plan(case, suite)
+
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(
+            planned[0].ci_commands,
+            [
+                {
+                    "id": "top_attention_fs_s3_rclone",
+                    "command": (
+                        "__RUN_DIR__/venv/bin/python3 -u "
+                        "__RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/"
+                        "_fs_s3_rclone.py"
+                    ),
+                    "timeout_seconds": 3600,
+                }
+            ],
+        )
+        self.assertEqual(
+            planned[0].ci_prepare_steps,
+            [
+                {
+                    "kind": "online_docker_image",
+                    "image_ref": "rclone/rclone:1.60.1",
+                    "env": "FLUXON_RCLONE_DOCKER_IMAGE_REF",
+                }
+            ],
+        )
+
     def test_ci_prepare_run_inputs_rebuilds_release_view_without_reusing_source_test_rsc(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
