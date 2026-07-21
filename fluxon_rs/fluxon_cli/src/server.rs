@@ -24,6 +24,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{RwLock, watch};
 
+use fluxon_util::etcd::{PooledEtcdClient, etcd_clients_pool};
 use fluxon_util::{
     FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
     fluxon_cli_proxy_desc_etcd_service_prefix_v2,
@@ -343,6 +344,7 @@ fn available_member_kind_query_strs() -> Vec<&'static str> {
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<MonitorConfig>,
+    etcd_pool_entry: PooledEtcdClient,
     log_schema_cache: Arc<LogSchemaCache>,
     proxy_client: hyper::Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
     registered_panel_proxy_backend: Option<RegisteredPanelProxyBackend>,
@@ -1146,7 +1148,7 @@ async fn index(State(st): State<Arc<AppState>>, req: Request<Body>) -> Response 
 }
 
 async fn landing(State(st): State<Arc<AppState>>) -> Response {
-    let mut etcd = match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+    let mut etcd = match st.etcd_pool_entry.client().await {
         Ok(c) => c,
         Err(e) => {
             return text_response(
@@ -1169,7 +1171,7 @@ async fn landing(State(st): State<Arc<AppState>>) -> Response {
 }
 
 async fn api_clusters(State(st): State<Arc<AppState>>) -> Response {
-    let mut etcd = match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+    let mut etcd = match st.etcd_pool_entry.client().await {
         Ok(c) => c,
         Err(e) => {
             return text_response(
@@ -1314,7 +1316,7 @@ async fn topology_page(
                 }
 
                 let prefix = format!("/fluxon_fs_mount_registry/{}/mounts/", cluster_name);
-                match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+                match st.etcd_pool_entry.client().await {
                     Ok(mut etcd) => {
                         let mut mounts: Vec<crate::model::FsMountRegistryRecordSnapshot> =
                             Vec::new();
@@ -1401,7 +1403,7 @@ async fn topology_page(
                 }
 
                 let key = format!("/fluxon_fs_export_registry/{}/snapshot", cluster_name);
-                match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+                match st.etcd_pool_entry.client().await {
                     Ok(mut etcd) => match etcd.get(key.clone(), None).await {
                         Ok(resp) => {
                             let mut exports: Vec<crate::model::FsExportRegistryRecordSnapshot> =
@@ -1525,7 +1527,7 @@ async fn ops_fluxon_kv_update_rdma_devices(
         }
     };
 
-    let mut etcd = match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+    let mut etcd = match st.etcd_pool_entry.client().await {
         Ok(client) => client,
         Err(err) => {
             return text_response(
@@ -1752,7 +1754,7 @@ async fn cli(
     Query(q): Query<ClusterQuery>,
 ) -> Response {
     let Some(cluster_name) = q.cluster_name.as_ref() else {
-        let mut etcd = match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+        let mut etcd = match st.etcd_pool_entry.client().await {
             Ok(c) => c,
             Err(e) => {
                 return text_response(
@@ -2902,7 +2904,7 @@ async fn proxy_registered_service_impl(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "".to_string());
 
-    let mut etcd = match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+    let mut etcd = match st.etcd_pool_entry.client().await {
         Ok(c) => c,
         Err(e) => {
             return text_response(
@@ -3338,11 +3340,13 @@ pub async fn serve_http_from_tcp(
     listener: std::net::TcpListener,
     registered_panel_proxy_backend: Option<RegisteredPanelProxyBackend>,
 ) -> anyhow::Result<()> {
+    let etcd_pool_entry = etcd_clients_pool().acquire(cfg.etcd_endpoints.clone());
     let cfg = Arc::new(cfg);
     let log_schema_cache = Arc::new(LogSchemaCache::new());
     let proxy_client = new_proxy_client();
     let app = build_router(Arc::new(AppState {
         cfg,
+        etcd_pool_entry,
         log_schema_cache,
         proxy_client,
         registered_panel_proxy_backend,
@@ -3364,6 +3368,7 @@ pub async fn serve_http_with_shutdown_from_tcp<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    let etcd_pool_entry = etcd_clients_pool().acquire(cfg.etcd_endpoints.clone());
     let cfg = Arc::new(cfg);
     let log_schema_cache = Arc::new(LogSchemaCache::new());
     let proxy_client = new_proxy_client();
@@ -3375,6 +3380,7 @@ where
 
     let app = build_router(Arc::new(AppState {
         cfg,
+        etcd_pool_entry,
         log_schema_cache,
         proxy_client,
         registered_panel_proxy_backend,

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -70,6 +71,59 @@ def _suite_cfg_with_declared_ci_commands(command_map: dict[str, list[dict]]) -> 
 
 
 class TestTestRunnerTestbedContract(unittest.TestCase):
+    def test_normalize_test_spec_config_accepts_foyer_ssd_backend(self) -> None:
+        self.assertEqual(
+            _RUNNER._normalize_test_spec_config(
+                {"kv_ssd_storage_backend": "foyer"},
+                "test_spec_config",
+            )["kv_ssd_storage_backend"],
+            "foyer",
+        )
+        with self.assertRaisesRegex(ValueError, "kv_ssd_uring_mode is only valid"):
+            _RUNNER._normalize_test_spec_config(
+                {
+                    "kv_ssd_storage_backend": "foyer",
+                    "kv_ssd_uring_mode": "iovec",
+                },
+                "test_spec_config",
+            )
+
+    def test_unresolved_runtime_tokens_exclude_numeric_run_scopes(self) -> None:
+        self.assertEqual(
+            _RUNNER._find_unresolved_runtime_tokens(
+                "bench__750222457007__worker __STACK_CONTROLLER_URL__"
+            ),
+            ["__STACK_CONTROLLER_URL__"],
+        )
+
+    def test_benchmark_threads_per_process_uses_bounded_values(self) -> None:
+        for value in (2, 4):
+            self.assertEqual(
+                _RUNNER._require_test_stack_benchmark_threads_per_process(
+                    value,
+                    "scale.benchmark.threads_per_process",
+                ),
+                value,
+            )
+
+        for value in (1, 3, 8):
+            with self.assertRaisesRegex(ValueError, "must be one of: 2, 4"):
+                _RUNNER._require_test_stack_benchmark_threads_per_process(
+                    value,
+                    "scale.benchmark.threads_per_process",
+                )
+
+    def test_suite_cluster_name_is_workdir_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first = _RUNNER._suite_cluster_name_for_workdir(root / "run_a")
+            first_again = _RUNNER._suite_cluster_name_for_workdir(root / "run_a")
+            second = _RUNNER._suite_cluster_name_for_workdir(root / "run_b")
+
+        self.assertEqual(first, first_again)
+        self.assertNotEqual(first, second)
+        self.assertRegex(first, r"^fluxon_benchmark_[0-9a-f]{12}$")
+
     def test_test_stack_result_cache_waits_for_complete_valid_snapshot(self) -> None:
         snapshots = iter(
             [
@@ -607,6 +661,31 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
 
             cleanup_success_data.assert_not_called()
 
+    def test_ci_cleanup_runtime_reclaims_only_case_scoped_bundle(self) -> None:
+        cleanup_case = {
+            "runtime": {
+                "stack_identity": {"share_mem_path": "/tmp/testbed-shm"},
+            },
+            "runtime_model": _RUNNER._build_runtime_model(_RUNNER.CASE_FAMILY_CI),
+            "deploy": {
+                "instances": [
+                    {"id": "owner_0", "deployer": {"target": "node-a"}},
+                ]
+            },
+        }
+        with mock.patch.object(_RUNNER, "_ci_runtime_cleanup_case", return_value=cleanup_case):
+            with mock.patch.object(_RUNNER, "_ci_runtime_current_apply_ids", return_value=[]):
+                with mock.patch.object(_RUNNER, "_wait_ci_ports_free") as wait_ports_free:
+                    with mock.patch.object(_RUNNER, "_cleanup_ci_case_shared_bundle") as cleanup_shm:
+                        _RUNNER._ci_cleanup_runtime(cleanup_case, timeout_s=120)
+
+        wait_ports_free.assert_called_once_with(cleanup_case, timeout_s=120)
+        cleanup_shm.assert_called_once_with(
+            cleanup_case,
+            timeout_s=120,
+            ctx="CI runtime shared bundle cleanup",
+        )
+
     def test_finalize_ci_case_runtime_preserves_structured_instance_ids(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
@@ -896,6 +975,72 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             )
         )
 
+    def test_cleanup_successful_run_artifacts_keeps_only_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "run_1"
+            run_dir.mkdir()
+            summary = {
+                "schema_version": 1,
+                "outcome": _RUNNER.RUN_OUTCOME_SUCCESS,
+            }
+            (run_dir / "summary.yaml").write_text(
+                yaml.safe_dump(summary, sort_keys=False),
+                encoding="utf-8",
+            )
+            (run_dir / "src" / "nested").mkdir(parents=True)
+            (run_dir / "src" / "nested" / "source.rs").write_text("source", encoding="utf-8")
+            (run_dir / "logs").mkdir()
+            (run_dir / "logs" / "stdout.log").write_text("log", encoding="utf-8")
+            (run_dir / "resolved_case.yaml").write_text("case: {}\n", encoding="utf-8")
+            outside = root / "outside.txt"
+            outside.write_text("keep", encoding="utf-8")
+            (run_dir / "outside-link").symlink_to(outside)
+
+            _RUNNER._cleanup_successful_run_artifacts(run_dir)
+
+            self.assertEqual([path.name for path in run_dir.iterdir()], ["summary.yaml"])
+            self.assertEqual(
+                yaml.safe_load((run_dir / "summary.yaml").read_text(encoding="utf-8")),
+                summary,
+            )
+            self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
+
+    def test_cleanup_successful_run_artifacts_refuses_failed_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            (run_dir / "summary.yaml").write_text(
+                yaml.safe_dump({"outcome": _RUNNER.RUN_OUTCOME_FAILED}),
+                encoding="utf-8",
+            )
+            diagnostic = run_dir / "exception.txt"
+            diagnostic.write_text("traceback", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "summary is not SUCCESS"):
+                _RUNNER._cleanup_successful_run_artifacts(run_dir)
+
+            self.assertEqual(diagnostic.read_text(encoding="utf-8"), "traceback")
+
+    def test_cleanup_successful_run_artifacts_preserves_teardown_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            (run_dir / "summary.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "outcome": _RUNNER.RUN_OUTCOME_SUCCESS,
+                        "teardown_error": "RuntimeError: owner cleanup failed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            diagnostic = run_dir / "logs" / "owner_0" / "stderr.log"
+            diagnostic.parent.mkdir(parents=True)
+            diagnostic.write_text("owner cleanup failed", encoding="utf-8")
+
+            _RUNNER._cleanup_successful_run_artifacts(run_dir)
+
+            self.assertEqual(diagnostic.read_text(encoding="utf-8"), "owner cleanup failed")
+
     def test_write_ci_scene_config_yaml_emits_structured_scene_config(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
@@ -947,7 +1092,12 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             target_slug = "local-node-a"
             runtime_instance_prefix = "case1"
             coord_tpl = {"deployer": {"target": ""}}
-            cluster_nodes = {"local-node-a": {"python_abi": "cpython3.10"}}
+            cluster_nodes = {
+                "local-node-a": {
+                    "python_abi": "cpython3.10",
+                    "ip": "192.0.2.10",
+                }
+            }
             resolved_case = {
                 "runtime": {
                     "run_dir": str(run_dir),
@@ -987,6 +1137,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                                 runtime_env={},
                                 owner_group_processes=None,
                                 owner_cpu_core_by_target={},
+                                owner_kv_ssd=None,
                             )
 
             self.assertEqual(len(owner_instances), 1)
@@ -995,6 +1146,565 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertEqual(
                 owner_cfg["fluxonkv_spec"]["large_file_paths"],
                 [str((run_dir / "services" / "kv_owner" / target_slug / "large").resolve())],
+            )
+
+    def test_generated_test_stack_owner_config_emits_owner_kv_ssd_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            cfg_dir = run_dir / "configs"
+            cfg_dir.mkdir(parents=True)
+            owner_target = "local-node-a"
+            target_slug = "local-node-a"
+            runtime_instance_prefix = "case1"
+            coord_tpl = {"deployer": {"target": ""}}
+            cluster_nodes = {"local-node-a": {"python_abi": "cpython3.10"}}
+            resolved_case = {
+                "runtime": {
+                    "run_dir": str(run_dir),
+                    "stack_identity": {
+                        "cluster_name": "bench_cluster",
+                        "share_mem_path": "/tmp/bench_shm",
+                    },
+                }
+            }
+
+            with mock.patch.object(_RUNNER, "_test_stack_runtime_required_python_abi", return_value="cpython3.10"):
+                with mock.patch.object(_RUNNER, "_test_stack_etcd_addresses", return_value=["127.0.0.1:19180"]):
+                    with mock.patch.object(_RUNNER, "_test_stack_target_host_venv_python", return_value="/tmp/venv/bin/python3"):
+                        with mock.patch.object(_RUNNER, "_test_stack_runtime_module_command", return_value="owner-cmd"):
+                            owner_instances = _RUNNER._build_test_stack_external_kv_owner_instances(
+                                scene_mode="KVSTORE",
+                                resolved_case=resolved_case,
+                                scale={"owner": {"owner_count": 1, "owner_dram_bytes": 1073741824}},
+                                runtime=resolved_case["runtime"],
+                                run_dir=run_dir,
+                                cfg_dir=cfg_dir,
+                                coord_tpl=coord_tpl,
+                                test_stack_runtime={},
+                                cluster_nodes=cluster_nodes,
+                                owner_targets=[owner_target],
+                                needs_kv_master=True,
+                                kv_p2p_port_base=31000,
+                                kv_p2p_port_stride=100,
+                                kv_p2p_slot_offset=0,
+                                p2p_ports_per_slot=10,
+                                owner_p2p_port_offset=1,
+                                run_index=1,
+                                runtime_instance_prefix=runtime_instance_prefix,
+                                kv_base={},
+                                test_spec_config={},
+                                perf_config=None,
+                                runtime_env={},
+                                owner_group_processes=None,
+                                owner_cpu_core_by_target={},
+                                owner_kv_ssd={"large_limit_size": [17179869184]},
+                            )
+
+            self.assertEqual(len(owner_instances), 1)
+            owner_cfg_path = cfg_dir / f"test_stack_kv_owner__{target_slug}.yaml"
+            owner_cfg = yaml.safe_load(owner_cfg_path.read_text(encoding="utf-8"))
+            self.assertEqual(owner_cfg["fluxonkv_spec"]["large_limit_size"], [17179869184])
+            self.assertEqual(
+                owner_cfg["fluxonkv_spec"]["large_file_paths"],
+                [str((run_dir / "services" / "kv_owner" / target_slug / "large").resolve())],
+            )
+
+    def test_generated_mooncake_owner_config_emits_owner_ssd_offload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            cfg_dir = run_dir / "configs"
+            cfg_dir.mkdir(parents=True)
+            owner_target = "local-node-a"
+            target_slug = "local-node-a"
+            runtime_instance_prefix = "case1"
+            coord_tpl = {"deployer": {"target": ""}}
+            cluster_nodes = {
+                "local-node-a": {
+                    "python_abi": "cpython3.10",
+                    "ip": "192.0.2.10",
+                }
+            }
+            resolved_case = {"runtime": {"run_dir": str(run_dir)}}
+            offload_root = "/tmp/mooncake-offload-contract"
+            offload_path = f"{offload_root}/{target_slug}"
+
+            with mock.patch.object(_RUNNER, "_test_stack_runtime_required_python_abi", return_value="cpython3.10"):
+                with mock.patch.object(_RUNNER, "_test_stack_target_host_venv_python", return_value="/tmp/venv/bin/python3"):
+                    with mock.patch.object(_RUNNER, "_test_stack_runtime_module_command", return_value="owner-cmd") as module_cmd:
+                        owner_instances = _RUNNER._build_test_stack_mooncake_owner_instances(
+                            resolved_case=resolved_case,
+                            scale={"owner": {"owner_count": 1, "owner_dram_bytes": 1073741824}},
+                            run_dir=run_dir,
+                            cfg_dir=cfg_dir,
+                            coord_tpl=coord_tpl,
+                            cluster_nodes=cluster_nodes,
+                            owner_targets=[owner_target],
+                            runtime_instance_prefix=runtime_instance_prefix,
+                            kv_base={
+                                "mooncake_spec": {
+                                    "local_buffer_size": 1073741824,
+                                    "metadata_server": "http://127.0.0.1:34000/metadata",
+                                    "master_server_address": "127.0.0.1:33000",
+                                    "etcd_addresses": ["127.0.0.1:2379"],
+                                },
+                                "protocol": {"protocol_type": "tcp"},
+                            },
+                            test_spec_config={},
+                            perf_config=None,
+                            runtime_env={},
+                            testbed_mooncake_storage={
+                                "mode": "DEDICATED_OWNER",
+                                "ssd_offload_root": offload_root,
+                                "ssd_capacity_bytes": 17179869184,
+                            },
+                        )
+
+            self.assertEqual(len(owner_instances), 1)
+            owner_cfg_path = cfg_dir / f"test_stack_kv_owner__{target_slug}.yaml"
+            owner_cfg = yaml.safe_load(owner_cfg_path.read_text(encoding="utf-8"))
+            self.assertEqual(owner_cfg["mooncake_spec"]["enable_ssd_offload"], True)
+            self.assertEqual(owner_cfg["mooncake_spec"]["ssd_offload_path"], offload_path)
+            self.assertEqual(owner_cfg["mooncake_spec"]["local_hostname"], "192.0.2.10")
+            self.assertIn("mkdir -p", module_cmd.call_args.kwargs["pre_exec_shell"])
+            self.assertIn(offload_path, module_cmd.call_args.kwargs["pre_exec_shell"])
+            self.assertEqual(
+                module_cmd.call_args.kwargs["runtime_env"][
+                    _RUNNER.TEST_STACK_MOONCAKE_SSD_LIMIT_ENV
+                ],
+                "17179869184",
+            )
+            self.assertEqual(module_cmd.call_args.kwargs["require_unlimited_memlock"], False)
+
+    def test_mooncake_memlock_is_required_only_for_rdma_protocol(self) -> None:
+        self.assertEqual(_RUNNER._test_stack_protocol_requires_unlimited_memlock({"protocol_type": "tcp"}), False)
+        self.assertEqual(_RUNNER._test_stack_protocol_requires_unlimited_memlock({"protocol_type": "rdma"}), True)
+        cmd = _RUNNER._test_stack_runtime_command(
+            run_dir=Path("/tmp/run"),
+            venv_python=Path("/tmp/venv/bin/python"),
+            script_path="/tmp/script.py",
+            script_args=[],
+            runtime_env={},
+            require_unlimited_memlock=False,
+        )
+        self.assertNotIn("ulimit -l unlimited", cmd)
+        cmd = _RUNNER._test_stack_runtime_command(
+            run_dir=Path("/tmp/run"),
+            venv_python=Path("/tmp/venv/bin/python"),
+            script_path="/tmp/script.py",
+            script_args=[],
+            runtime_env={},
+            require_unlimited_memlock=True,
+        )
+        self.assertIn("ulimit -l unlimited", cmd)
+
+    def test_mooncake_storage_modes_and_capacity_split_are_bounded(self) -> None:
+        dedicated = _RUNNER._normalize_testbed_mooncake_storage_config(
+            {
+                "mode": "DEDICATED_OWNER",
+                "ssd_offload_root": "/tmp/mooncake-dedicated",
+                "ssd_capacity_bytes": 17179869184,
+            },
+            "storage",
+        )
+        self.assertEqual(dedicated["mode"], "DEDICATED_OWNER")
+
+        per_process = _RUNNER._normalize_testbed_mooncake_storage_config(
+            {"mode": "PER_BENCHMARK_PROCESS"},
+            "storage",
+        )
+        self.assertEqual(per_process, {"mode": "PER_BENCHMARK_PROCESS"})
+        self.assertEqual(
+            _RUNNER._split_testbed_mooncake_capacity(
+                total_bytes=2147483648,
+                instance_count=4,
+                alignment_bytes=16777216,
+                ctx="dram",
+            ),
+            536870912,
+        )
+        with self.assertRaisesRegex(ValueError, "must be set together"):
+            _RUNNER._normalize_testbed_mooncake_storage_config(
+                {
+                    "mode": "PER_BENCHMARK_PROCESS",
+                    "ssd_offload_root": "/tmp/mooncake-per-process",
+                },
+                "storage",
+            )
+        with self.assertRaisesRegex(ValueError, "divide evenly"):
+            _RUNNER._split_testbed_mooncake_capacity(
+                total_bytes=1073741824,
+                instance_count=3,
+                alignment_bytes=16777216,
+                ctx="dram",
+            )
+
+    def test_benchmark_full_matrix_includes_kv_ssd_pressure_comparison(self) -> None:
+        suite_cfg = yaml.safe_load(
+            (_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "benchmark_full_matrix.yaml").read_text(encoding="utf-8")
+        )
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = _RUNNER._expand_cases(suite)
+
+        scene = suite.scenes["kv_ssd_pressure_zipf"]
+        self.assertEqual(scene["select"]["scales"], ["n1_kvowner_dram_1gib", "n2_kvowner_dram_1gib"])
+        self.assertEqual(scene["select"]["profiles"], ["fluxon_tcp_kv_ssd", "fluxon_tcp", "mooncake_tcp"])
+        self.assertEqual(
+            suite.profiles["fluxon_tcp_kv_ssd"]["runtime"]["test_stack"]["runtime_config"]["owner_kv_ssd"],
+            {"large_limit_size": [17179869184]},
+        )
+        self.assertEqual(
+            suite.profiles["mooncake_tcp"]["runtime"]["test_stack"]["runtime_config"][
+                "testbed_mooncake_storage"
+            ],
+            {"mode": "DEDICATED_OWNER"},
+        )
+        self.assertEqual(
+            suite.scales["n1_kvowner_dram_1gib"]["owner"]["owner_dram_bytes"],
+            1073741824,
+        )
+        self.assertEqual(
+            sorted(case.case_id for case in cases if case.scene_id == "kv_ssd_pressure_zipf"),
+            [
+                "kv_ssd_pressure_zipf__n1_kvowner_dram_1gib__fluxon_tcp",
+                "kv_ssd_pressure_zipf__n1_kvowner_dram_1gib__fluxon_tcp_kv_ssd",
+                "kv_ssd_pressure_zipf__n1_kvowner_dram_1gib__mooncake_tcp",
+                "kv_ssd_pressure_zipf__n2_kvowner_dram_1gib__fluxon_tcp",
+                "kv_ssd_pressure_zipf__n2_kvowner_dram_1gib__fluxon_tcp_kv_ssd",
+                "kv_ssd_pressure_zipf__n2_kvowner_dram_1gib__mooncake_tcp",
+            ],
+        )
+
+    def test_mooncake_benchmark_defaults_skip_get_size_on_get(self) -> None:
+        suite_cfg = yaml.safe_load(
+            (_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "benchmark_full_matrix.yaml").read_text(encoding="utf-8")
+        )
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        case = next(
+            item
+            for item in _RUNNER._expand_cases(suite)
+            if item.scene_id == "kv_ssd_pressure_zipf"
+            and item.scale_id == "n1_kvowner_dram_1gib"
+            and item.profile_id == "mooncake_tcp"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            workdir_root = Path(td)
+            run_dir = workdir_root / case.case_id / "run_1"
+            run_dir.mkdir(parents=True)
+            resolved_case = _RUNNER._build_resolved_case_yaml(
+                case,
+                suite,
+                config_root=str(_RUNNER.RUNNER_REPO_ROOT),
+                workdir_root=str(workdir_root),
+                run_dir=str(run_dir),
+                ci_commands=None,
+                ci_prepare_steps=None,
+                execution_label=case.case_id,
+                command_id=None,
+                test_id=None,
+                stack_identity={
+                    "cluster_name": "test-cluster",
+                    "share_mem_path": "/tmp/test-share",
+                    "controller_url": "http://127.0.0.1:18080",
+                },
+            )
+            target_ip_map = resolved_case["deploy"]["target_ip_map"]
+            cluster_nodes = {
+                target: {
+                    "python_abi": "cpython3.10",
+                    "ip": ip,
+                    "hostworkdir": "/tmp/test-hostworkdir",
+                }
+                for target, ip in target_ip_map.items()
+            }
+
+            with mock.patch.object(
+                _RUNNER,
+                "_prepare_test_stack_runtime",
+                return_value={"coordinator_script": "/tmp/coordinator.py", "node_script": "/tmp/node.py"},
+            ):
+                with mock.patch.object(
+                    _RUNNER,
+                    "_load_test_stack_cluster_nodes_and_dispatch",
+                    return_value=(cluster_nodes, None),
+                ):
+                    with mock.patch.object(_RUNNER, "_test_stack_runtime_required_python_abi", return_value="cpython3.10"):
+                        with mock.patch.object(
+                            _RUNNER,
+                            "_test_stack_target_host_venv_python",
+                            return_value=Path("/tmp/venv/bin/python3"),
+                        ):
+                            with mock.patch.object(_RUNNER, "_test_stack_runtime_module_command", return_value="module-cmd"):
+                                with mock.patch.object(
+                                    _RUNNER,
+                                    "_test_stack_etcd_addresses",
+                                    return_value=["127.0.0.1:2379"],
+                                ):
+                                    _RUNNER._compile_test_stack_case(resolved_case, run_index=1)
+
+            benchmark_cfg = _RUNNER._load_test_stack_benchmark_config(run_dir)
+            self.assertEqual(
+                benchmark_cfg["kv_base"]["mooncake_spec"]["skip_get_size_on_get"],
+                True,
+            )
+            self.assertEqual(
+                benchmark_cfg["node_overrides"][0]["kv"]["mooncake_spec"]["local_hostname"],
+                _RUNNER._test_stack_target_advertise_host(
+                    cluster_nodes=cluster_nodes,
+                    target_name=next(iter(target_ip_map)),
+                    local_ipv4_addrs=_RUNNER._local_ipv4_addresses(),
+                ),
+            )
+
+    def test_mooncake_per_benchmark_process_compilation_splits_total_capacity(self) -> None:
+        suite_cfg = yaml.safe_load(
+            (_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "benchmark_full_matrix.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        case = next(
+            item
+            for item in _RUNNER._expand_cases(suite)
+            if item.scene_id == "kv_ssd_pressure_zipf"
+            and item.scale_id == "n1_kvowner_dram_1gib"
+            and item.profile_id == "mooncake_tcp"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            workdir_root = Path(td)
+            run_dir = workdir_root / case.case_id / "run_1"
+            run_dir.mkdir(parents=True)
+            resolved_case = _RUNNER._build_resolved_case_yaml(
+                case,
+                suite,
+                config_root=str(_RUNNER.RUNNER_REPO_ROOT),
+                workdir_root=str(workdir_root),
+                run_dir=str(run_dir),
+                ci_commands=None,
+                ci_prepare_steps=None,
+                execution_label=case.case_id,
+                command_id=None,
+                test_id=None,
+                stack_identity={
+                    "cluster_name": "test-cluster",
+                    "share_mem_path": "/tmp/test-share",
+                    "controller_url": "http://127.0.0.1:18080",
+                },
+            )
+            resolved_case["scale"]["benchmark"]["processes_per_target"] = 4
+            mooncake_runtime = resolved_case["profile"]["test_stack"]["runtime_config"]
+            mooncake_runtime["testbed_mooncake_storage"] = {
+                "mode": "PER_BENCHMARK_PROCESS",
+                "ssd_offload_root": str(workdir_root / "mooncake-ssd"),
+                "ssd_capacity_bytes": 17179869184,
+            }
+            target_ip_map = resolved_case["deploy"]["target_ip_map"]
+            cluster_nodes = {
+                target: {
+                    "python_abi": "cpython3.10",
+                    "ip": ip,
+                    "hostworkdir": "/tmp/test-hostworkdir",
+                }
+                for target, ip in target_ip_map.items()
+            }
+
+            with mock.patch.object(
+                _RUNNER,
+                "_prepare_test_stack_runtime",
+                return_value={"coordinator_script": "/tmp/coordinator.py", "node_script": "/tmp/node.py"},
+            ):
+                with mock.patch.object(
+                    _RUNNER,
+                    "_load_test_stack_cluster_nodes_and_dispatch",
+                    return_value=(cluster_nodes, None),
+                ):
+                    with mock.patch.object(
+                        _RUNNER,
+                        "_test_stack_runtime_required_python_abi",
+                        return_value="cpython3.10",
+                    ):
+                        with mock.patch.object(
+                            _RUNNER,
+                            "_test_stack_target_host_venv_python",
+                            return_value=Path("/tmp/venv/bin/python3"),
+                        ):
+                            with mock.patch.object(
+                                _RUNNER,
+                                "_test_stack_runtime_module_command",
+                                return_value="module-cmd",
+                            ):
+                                with mock.patch.object(
+                                    _RUNNER,
+                                    "_test_stack_etcd_addresses",
+                                    return_value=["127.0.0.1:2379"],
+                                ):
+                                    _RUNNER._compile_test_stack_case(resolved_case, run_index=1)
+
+            benchmark_cfg = _RUNNER._load_test_stack_benchmark_config(run_dir)
+            overrides = benchmark_cfg["node_overrides"]
+            self.assertEqual(len(overrides), 4)
+            self.assertEqual(
+                {
+                    item["kv"]["contribute_to_cluster_pool_size"]["dram"]
+                    for item in overrides
+                },
+                {268435456},
+            )
+            ssd_paths = {
+                item["kv"]["mooncake_spec"]["ssd_offload_path"]
+                for item in overrides
+            }
+            self.assertEqual(len(ssd_paths), 4)
+            instance_ids = {
+                item["id"] for item in resolved_case["deploy"]["instances"]
+            }
+            self.assertFalse(
+                any(
+                    instance_id.startswith(_RUNNER.TEST_STACK_KV_OWNER_INSTANCE_ID_PREFIX)
+                    for instance_id in instance_ids
+                )
+            )
+            node_commands = [
+                item["deployer"]["args"][0]
+                for item in resolved_case["deploy"]["instances"]
+                if item["id"].startswith("worker_")
+            ]
+            self.assertEqual(len(node_commands), 4)
+            self.assertTrue(
+                all(
+                    f"export {_RUNNER.TEST_STACK_MOONCAKE_SSD_LIMIT_ENV}=4294967296"
+                    in command
+                    for command in node_commands
+                )
+            )
+
+    def test_mooncake_same_host_endpoint_uses_loopback(self) -> None:
+        cluster_nodes = {
+            "local": {"ip": "192.0.2.10"},
+            "remote": {"ip": "192.0.2.11"},
+        }
+        local_ipv4_addrs = {"127.0.0.1", "192.0.2.10"}
+
+        self.assertEqual(
+            _RUNNER._test_stack_target_advertise_host(
+                cluster_nodes=cluster_nodes,
+                target_name="local",
+                local_ipv4_addrs=local_ipv4_addrs,
+            ),
+            "127.0.0.1",
+        )
+        self.assertEqual(
+            _RUNNER._test_stack_target_advertise_host(
+                cluster_nodes=cluster_nodes,
+                target_name="remote",
+                local_ipv4_addrs=local_ipv4_addrs,
+            ),
+            "192.0.2.11",
+        )
+
+    def test_kv_keyspace_capacity_guard_can_be_disabled_for_ssd_pressure(self) -> None:
+        ts_scene = {
+            "keyspace_size": 512,
+            "value_size_mode": "FIXED",
+        }
+        scale = {
+            "owner": {
+                "owner_count": 1,
+                "owner_dram_bytes": 512 * 1024 * 1024,
+            }
+        }
+
+        guarded = _RUNNER._test_stack_effective_kv_keyspace_size(
+            case_id="guarded",
+            ts_scene=ts_scene,
+            scale=scale,
+            bench_value_size=4 * 1024 * 1024,
+        )
+        unguarded = _RUNNER._test_stack_effective_kv_keyspace_size(
+            case_id="unguarded",
+            ts_scene={
+                **ts_scene,
+                _RUNNER.TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD: False,
+            },
+            scale=scale,
+            bench_value_size=4 * 1024 * 1024,
+        )
+
+        self.assertLess(guarded, ts_scene["keyspace_size"])
+        self.assertEqual(unguarded, ts_scene["keyspace_size"])
+
+    def test_kv_bootstrap_pressure_controls_parse(self) -> None:
+        scene = _RUNNER._parse_scene(
+            {
+                "test_stack": {
+                    "mode": "KVSTORE",
+                    "read_ratio": 0.9,
+                    "write_ratio": 0.1,
+                    "request_distribution": "zipfian",
+                    "keyspace_size": 512,
+                    "kv_bootstrap_concurrency": 1,
+                    "kv_bootstrap_put_gap_ms": 10.5,
+                    "kv_bootstrap_storage_full_policy": "stop",
+                    "kv_get_output": "CUDA",
+                    "kv_cuda_device_index": 6,
+                    "value_size_mode": "FIXED",
+                },
+                "select": {"scales": ["n1"], "profiles": ["fluxon"]},
+            },
+            "scenes.kv_ssd_pressure_zipf",
+        )
+
+        self.assertEqual(
+            scene["test_stack"][_RUNNER.TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY],
+            1,
+        )
+        self.assertEqual(
+            scene["test_stack"][_RUNNER.TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS],
+            10.5,
+        )
+        self.assertEqual(
+            scene["test_stack"][_RUNNER.TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY],
+            "stop",
+        )
+        self.assertEqual(
+            scene["test_stack"][_RUNNER.TEST_STACK_SCENE_KEY_KV_GET_OUTPUT],
+            "cuda",
+        )
+        self.assertEqual(
+            scene["test_stack"][_RUNNER.TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX],
+            6,
+        )
+
+    def test_kv_get_output_rejects_unbounded_variants(self) -> None:
+        with self.assertRaisesRegex(ValueError, "kv_get_output invalid"):
+            _RUNNER._parse_scene(
+                {
+                    "test_stack": {
+                        "mode": "KVSTORE",
+                        "read_ratio": 1.0,
+                        "write_ratio": 0.0,
+                        "kv_get_output": "custom_callback",
+                        "value_size_mode": "FIXED",
+                    },
+                    "select": {"scales": ["n1"], "profiles": ["fluxon"]},
+                },
+                "scenes.kv_ssd_pressure_zipf",
+            )
+
+    def test_cuda_device_index_requires_cuda_output(self) -> None:
+        with self.assertRaisesRegex(ValueError, "kv_cuda_device_index requires kv_get_output=cuda"):
+            _RUNNER._parse_scene(
+                {
+                    "test_stack": {
+                        "mode": "KVSTORE",
+                        "read_ratio": 1.0,
+                        "write_ratio": 0.0,
+                        "kv_get_output": "holder",
+                        "kv_cuda_device_index": 6,
+                        "value_size_mode": "FIXED",
+                    },
+                    "select": {"scales": ["n1"], "profiles": ["fluxon"]},
+                },
+                "scenes.kv_ssd_pressure_zipf",
             )
 
     def test_ci_source_overlay_includes_fluxon_test_stack(self) -> None:
@@ -1677,6 +2387,112 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertIn("[ci_runner] STEP 1 finish label=", script_text)
             subprocess.run(["bash", "-n", str(script_path)], check=True)
 
+    def test_ci_runner_persists_workload_rc_after_sourcing_prepare_env(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            src_root = run_dir / "src"
+            src_root.mkdir(parents=True)
+            resolved_case = {
+                "case": {
+                    "family": "ci",
+                    "case_id": "ci_runner_exit_code_contract",
+                },
+                "scene": {
+                    "ci": {
+                        "subject": "exit_code_contract",
+                        "runtime_contract": "rust_self_managed",
+                        "commands": [
+                            {
+                                "id": "exit_7",
+                                "command": (
+                                    "/bin/bash -c 'if [ \"$CI_PREPARE_SENTINEL\" = ready ]; "
+                                    "then exit 7; else exit 8; fi'"
+                                ),
+                                "timeout_seconds": 10,
+                            }
+                        ],
+                    }
+                },
+                "runtime_model": {
+                    "test_bed": {},
+                    "base_runtime": {},
+                    "case_runtime": {"instance_ids": ["ci_runner"]},
+                },
+            }
+
+            prepare_path = _RUNNER._write_ci_prepare_env_script(
+                run_dir=run_dir,
+                exports={"CI_PREPARE_SENTINEL": "ready"},
+            )
+            self.assertNotIn(
+                "set -",
+                prepare_path.read_text(encoding="utf-8"),
+            )
+            # Exercise the runner boundary against a legacy/external prepare file
+            # that enables errexit. ci_runner must still persist the real rc.
+            prepare_path.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "export CI_PREPARE_SENTINEL=ready\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                _RUNNER,
+                "_subst_runtime_tokens",
+                side_effect=lambda _case, text: text,
+            ):
+                script_path = _RUNNER._write_ci_runner_script(
+                    resolved_case,
+                    run_dir=run_dir,
+                    src_root=src_root,
+                    share_mem_path="/tmp/shm",
+                )
+
+            proc = subprocess.Popen(["bash", str(script_path)], cwd=src_root)
+            exit_code_path = run_dir / "logs" / "ci_runner" / "exit_code.txt"
+            inflight_path = run_dir / "logs" / "ci_runner" / "inflight_attempt.txt"
+            try:
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    if exit_code_path.exists() and not inflight_path.exists():
+                        break
+                    return_code = proc.poll()
+                    if return_code is not None:
+                        self.fail(
+                            "ci_runner exited before persisting workload rc: "
+                            f"return_code={return_code}"
+                        )
+                    time.sleep(0.05)
+                else:
+                    self.fail("timed out waiting for ci_runner exit_code.txt")
+
+                self.assertEqual(exit_code_path.read_text(encoding="utf-8").strip(), "7")
+                self.assertFalse(inflight_path.exists())
+                self.assertEqual(
+                    (run_dir / "logs" / "ci_runner" / "restart_count.txt")
+                    .read_text(encoding="utf-8")
+                    .strip(),
+                    "1",
+                )
+                runner_log = (
+                    run_dir / "logs" / "ci_runner" / "stdout.log"
+                ).read_text(encoding="utf-8")
+                self.assertIn("STEP 1 finish", runner_log)
+                self.assertIn("rc=7", runner_log)
+                self.assertIn("wrote exit_code=7", runner_log)
+                self.assertIsNone(
+                    proc.poll(),
+                    "ci_runner must hold after persisting the terminal rc",
+                )
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+
     def test_ci_prepare_exports_testbed_bundle_and_release_authority(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2217,7 +3033,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             )
             resolved_case = {
                 "deploy": {
-                    "target_ip_map": {"logic-a": "192.168.1.10", "logic-b": "192.168.1.10"},
+                    "target_ip_map": {"logic-a": "192.0.2.10", "logic-b": "192.0.2.10"},
                 },
                 "profile": {
                     "ci": {

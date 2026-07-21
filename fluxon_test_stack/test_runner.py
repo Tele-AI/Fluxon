@@ -262,6 +262,7 @@ TEST_STACK_KV_OWNER_INSTANCE_ID_PREFIX = "kv_owner_"
 TEST_STACK_REDIS_INSTANCE_ID_PREFIX = "redis_node_"
 TEST_STACK_ALLUXIO_INSTANCE_ID_PREFIX = "alluxio_node_"
 TEST_STACK_MOONCAKE_MASTER_INSTANCE_ID = "mooncake_master"
+TEST_STACK_BENCHMARK_THREADS_PER_PROCESS_VALUES = (2, 4)
 # Owner-mode Fluxon KV configs in CI / TEST_STACK share the same canonical label.
 FLUXON_KV_OWNER_SUB_CLUSTER = "owner"
 
@@ -275,6 +276,14 @@ TEST_STACK_BACKENDS_ALLOWED = {
     TEST_STACK_BACKEND_ALLUXIO,
     TEST_STACK_BACKEND_MOONCAKE,
 }
+TEST_STACK_MOONCAKE_STORAGE_MODE_DEDICATED_OWNER = "DEDICATED_OWNER"
+TEST_STACK_MOONCAKE_STORAGE_MODE_PER_BENCHMARK_PROCESS = "PER_BENCHMARK_PROCESS"
+TEST_STACK_MOONCAKE_STORAGE_MODES_ALLOWED = {
+    TEST_STACK_MOONCAKE_STORAGE_MODE_DEDICATED_OWNER,
+    TEST_STACK_MOONCAKE_STORAGE_MODE_PER_BENCHMARK_PROCESS,
+}
+TEST_STACK_MOONCAKE_SEGMENT_ALIGNMENT_BYTES = 16 * 1024 * 1024
+TEST_STACK_MOONCAKE_SSD_LIMIT_ENV = "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES"
 
 TEST_STACK_COMPLETION_STATUS_SUCCESS = "SUCCESS"
 RUN_MODE_DEBUG_ONE_BY_ONE = "debug_one_by_one"
@@ -388,14 +397,25 @@ TEST_STACK_REQUEST_DISTRIBUTIONS_ALLOWED = {
     TEST_STACK_REQUEST_DISTRIBUTION_ZIPFIAN,
 }
 TEST_STACK_SCENE_KEY_AFFINITY_LOCALITY_RATIO = "affinity_locality_ratio"
+TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD = "keyspace_capacity_guard"
+TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY = "kv_bootstrap_concurrency"
+TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS = "kv_bootstrap_put_gap_ms"
+TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY = "kv_bootstrap_storage_full_policy"
+TEST_STACK_SCENE_KEY_KV_GET_OUTPUT = "kv_get_output"
+TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX = "kv_cuda_device_index"
+TEST_STACK_KV_BOOTSTRAP_STORAGE_FULL_POLICIES_ALLOWED = {"fail", "stop"}
+TEST_STACK_KV_GET_OUTPUTS_ALLOWED = {"holder", "bytes", "cuda"}
 TEST_STACK_BENCHMARK_KEY_AFFINITY_SLOT_COUNT = "affinity_slot_count"
+SCENE_ID_KV_DRAM_RESIDENT_ZIPF = "kv_dram_resident_zipf"
 SCENE_ID_KV_READ_HEAVY_AFFINITY = "kv_read_heavy_affinity"
 SCENE_ENUMS_ALLOWED = {
     "bench_mq",
     "fs_open_read_close_smallfiles",
     "fs_write_close_commit",
+    SCENE_ID_KV_DRAM_RESIDENT_ZIPF,
     "kv_read_heavy_zipf",
     SCENE_ID_KV_READ_HEAVY_AFFINITY,
+    "kv_ssd_pressure_zipf",
     "kv_write_heavy_large_value",
     "rpc_echo_small_payload",
     "rpc_echo_small_payload_zerorpc",
@@ -616,6 +636,14 @@ def main() -> None:
         "--gitops-config",
         required=False,
         help="Optional GitOps config YAML. When set with --action ui, test_runner owns the GitOps poller/UI/API as part of the same service.",
+    )
+    parser.add_argument(
+        "--cleanup-successful-case-artifacts",
+        action="store_true",
+        help=(
+            "After a case and its teardown both succeed, keep only summary.yaml in its run directory. "
+            "Failed cases retain their complete diagnostic artifacts."
+        ),
     )
     parser.add_argument(
         "--top-attention-prefix",
@@ -842,6 +870,15 @@ def main() -> None:
                         controller_url=_require_str(stack_identity.get("controller_url"), "stack_identity.controller_url"),
                         case_id=case.case_id,
                     )
+                    if args.cleanup_successful_case_artifacts:
+                        previous_run_index = _require_int(
+                            last_run.get("run_index"),
+                            f"case_runs[{case.case_id}].last_run.run_index",
+                            min_v=1,
+                        )
+                        _cleanup_successful_run_artifacts(
+                            results_root / case.case_id / f"run_{previous_run_index}"
+                        )
                     continue
         _bench_case_preflight_cleanup(
             stack_identity=stack_identity,
@@ -1067,6 +1104,21 @@ def main() -> None:
             except Exception as exc:
                 print(f"ERROR: failed to write/update summary.yaml: {exc}")
                 raise SystemExit(1)
+
+            if (
+                args.cleanup_successful_case_artifacts
+                and outcome == RUN_OUTCOME_SUCCESS
+                and finalize_error is None
+            ):
+                try:
+                    _cleanup_successful_run_artifacts(run_dir)
+                except Exception as exc:
+                    print(
+                        "ERROR: successful case artifact cleanup failed; stopping to avoid exhausting disk: "
+                        f"case_id={case.case_id} run_dir={run_dir} err={type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    raise SystemExit(1)
 
             if fatal_stop_after_finalize:
                 raise SystemExit(1)
@@ -2335,7 +2387,7 @@ def _is_runtime_token_placeholder(raw: str) -> bool:
 
 
 def _find_unresolved_runtime_tokens(raw: str) -> List[str]:
-    return sorted(set(re.findall(r"__[A-Z0-9_]+__", raw)))
+    return sorted(set(re.findall(r"__[A-Z][A-Z0-9_]*__", raw)))
 
 
 def _resolved_case_runtime_token_mapping(resolved_case: Dict[str, Any]) -> Dict[str, str]:
@@ -4110,6 +4162,16 @@ def _require_int(v: Any, ctx: str, *, min_v: int, max_v: int | None = None) -> i
     return v
 
 
+def _require_test_stack_benchmark_threads_per_process(v: Any, ctx: str) -> int:
+    threads_per_process = _require_int(v, ctx, min_v=1)
+    if threads_per_process not in TEST_STACK_BENCHMARK_THREADS_PER_PROCESS_VALUES:
+        supported = ", ".join(
+            str(value) for value in TEST_STACK_BENCHMARK_THREADS_PER_PROCESS_VALUES
+        )
+        raise ValueError(f"{ctx} must be one of: {supported}")
+    return threads_per_process
+
+
 def _require_bool(v: Any, ctx: str) -> bool:
     if not isinstance(v, bool):
         raise ValueError(f"{ctx} must be bool")
@@ -4193,6 +4255,8 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             "side_transfer_worker_count",
             "side_transfer_worker_p2p_port_base",
             "side_transfer_role",
+            "kv_ssd_storage_backend",
+            "kv_ssd_uring_mode",
         },
         ctx,
     )
@@ -4221,6 +4285,30 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
                 f"{ctx}.p2p_transport_impl must be one of {sorted(allowed_p2p_transport_impls)}, got {p2p_transport_impl!r}"
             )
         out["p2p_transport_impl"] = p2p_transport_impl
+    if "kv_ssd_storage_backend" in cfg:
+        kv_ssd_storage_backend = _require_str(
+            cfg.get("kv_ssd_storage_backend"), f"{ctx}.kv_ssd_storage_backend"
+        )
+        allowed_kv_ssd_storage_backends = {"native", "foyer"}
+        if kv_ssd_storage_backend not in allowed_kv_ssd_storage_backends:
+            raise ValueError(
+                f"{ctx}.kv_ssd_storage_backend must be one of {sorted(allowed_kv_ssd_storage_backends)}, got {kv_ssd_storage_backend!r}"
+            )
+        out["kv_ssd_storage_backend"] = kv_ssd_storage_backend
+    if "kv_ssd_uring_mode" in cfg:
+        kv_ssd_uring_mode = _require_str(cfg.get("kv_ssd_uring_mode"), f"{ctx}.kv_ssd_uring_mode")
+        allowed_kv_ssd_uring_modes = {"single_buffer", "iovec"}
+        if kv_ssd_uring_mode not in allowed_kv_ssd_uring_modes:
+            raise ValueError(
+                f"{ctx}.kv_ssd_uring_mode must be one of {sorted(allowed_kv_ssd_uring_modes)}, got {kv_ssd_uring_mode!r}"
+            )
+        out["kv_ssd_uring_mode"] = kv_ssd_uring_mode
+    if out.get("kv_ssd_storage_backend") == "foyer" and out.get(
+        "kv_ssd_uring_mode", "single_buffer"
+    ) != "single_buffer":
+        raise ValueError(
+            f"{ctx}.kv_ssd_uring_mode is only valid with {ctx}.kv_ssd_storage_backend=native"
+        )
     transport_mode_was_explicit = "transport_mode" in cfg
     side_transfer_role_raw = cfg.get("side_transfer_role")
     default_transport_mode = None if side_transfer_role_raw == "worker" else "transfer_with_rpc"
@@ -4352,6 +4440,13 @@ def _resolve_test_stack_fluxon_protocol_cfg(
     if raw_protocol is None:
         return None
     return copy.deepcopy(_require_dict(raw_protocol, f"{ctx}.protocol"))
+
+
+def _test_stack_protocol_requires_unlimited_memlock(protocol_cfg: Optional[Dict[str, Any]]) -> bool:
+    if protocol_cfg is None:
+        return False
+    protocol_type = _require_str(protocol_cfg.get("protocol_type"), "protocol.protocol_type").strip().lower()
+    return protocol_type == "rdma"
 
 
 def _rewrite_artifact_set_transport_impl(
@@ -4740,6 +4835,65 @@ def _clean_workdir(workdir_root: Path) -> None:
         print(f"[clean_workdir] nothing to remove under: {workdir_root}", flush=True)
 
 
+def _cleanup_successful_run_artifacts(run_dir: Path) -> None:
+    """Keep the terminal summary and remove bulky artifacts from a successful run."""
+    run_dir = Path(run_dir).resolve()
+    if not run_dir.exists():
+        print(f"[cleanup_successful_run_artifacts] run directory already absent: {run_dir}", flush=True)
+        return
+    if not run_dir.is_dir():
+        raise ValueError(f"successful run path is not a directory: {run_dir}")
+
+    summary_path = run_dir / "summary.yaml"
+    if not summary_path.is_file() or summary_path.is_symlink():
+        raise ValueError(f"successful run must retain a regular summary.yaml before cleanup: {summary_path}")
+    summary = _require_dict(_load_yaml_file(summary_path), "successful run summary")
+    if summary.get("outcome") != RUN_OUTCOME_SUCCESS:
+        raise ValueError(
+            "refusing to clean a run whose summary is not SUCCESS: "
+            f"run_dir={run_dir} outcome={summary.get('outcome')!r}"
+        )
+    test_stack_summary = summary.get("test_stack")
+    has_diagnostic_error = (
+        summary.get("error") is not None
+        or summary.get("teardown_error") is not None
+        or (
+            isinstance(test_stack_summary, dict)
+            and any(
+                test_stack_summary.get(field_name) is not None
+                for field_name in ("error", "collect_error", "teardown_error")
+            )
+        )
+    )
+    if has_diagnostic_error:
+        print(
+            "[cleanup_successful_run_artifacts] preserving run with error diagnostics: "
+            f"{run_dir}",
+            flush=True,
+        )
+        return
+
+    free_before = shutil.disk_usage(run_dir).free
+    removed_entries = 0
+    for path in list(run_dir.iterdir()):
+        if path.name == "summary.yaml":
+            continue
+        if path.is_symlink() or not path.is_dir():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+        removed_entries += 1
+
+    free_after = shutil.disk_usage(run_dir).free
+    reclaimed_bytes = max(0, int(free_after) - int(free_before))
+    print(
+        "[cleanup_successful_run_artifacts] "
+        f"run_dir={run_dir} removed_entries={removed_entries} reclaimed_bytes={reclaimed_bytes} "
+        f"free_bytes={free_after}",
+        flush=True,
+    )
+
+
 def _repair_reserved_last_runs(case_runs: Dict[str, Any], *, results_root: Path) -> List[str]:
     """Repair reserved-only `last_run` entries based on existing run_dir artifacts.
 
@@ -4959,11 +5113,20 @@ def _test_stack_backend_uses_external_fluxon_kv(*, backend_kind: str, mode: str)
     )
 
 
-def _test_stack_backend_uses_dedicated_kv_owners(*, backend_kind: str, mode: str) -> bool:
+def _test_stack_backend_uses_dedicated_kv_owners(
+    *,
+    backend_kind: str,
+    mode: str,
+    mooncake_storage_mode: Optional[str] = None,
+) -> bool:
     if backend_kind == TEST_STACK_BACKEND_FLUXON:
         return _test_stack_backend_uses_external_fluxon_kv(backend_kind=backend_kind, mode=mode)
     if backend_kind == TEST_STACK_BACKEND_MOONCAKE:
-        return mode in (
+        if mooncake_storage_mode is None:
+            raise ValueError("Mooncake TEST_STACK requires an explicit storage mode")
+        if mooncake_storage_mode not in TEST_STACK_MOONCAKE_STORAGE_MODES_ALLOWED:
+            raise ValueError(f"invalid Mooncake TEST_STACK storage mode: {mooncake_storage_mode!r}")
+        return mooncake_storage_mode == TEST_STACK_MOONCAKE_STORAGE_MODE_DEDICATED_OWNER and mode in (
             TEST_STACK_MODE_KVSTORE,
             TEST_STACK_MODE_KVSTORE_WITH_LOCAL_CACHE,
             TEST_STACK_MODE_RPC,
@@ -5514,6 +5677,12 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
             "write_ratio",
             "request_distribution",
             "keyspace_size",
+            TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY,
+            TEST_STACK_SCENE_KEY_KV_GET_OUTPUT,
+            TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX,
             TEST_STACK_SCENE_KEY_AFFINITY_LOCALITY_RATIO,
             "value_size_mode",
             "value_size_weighted_set",
@@ -5582,6 +5751,78 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
                 keyspace_size,
                 f"{ctx}.test_stack.keyspace_size",
                 min_v=1,
+            )
+
+        keyspace_capacity_guard = ts.get(TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD)
+        if keyspace_capacity_guard is not None:
+            if not isinstance(keyspace_capacity_guard, bool):
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD} must be bool"
+                )
+            out_ts[TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD] = bool(keyspace_capacity_guard)
+
+        bootstrap_concurrency = ts.get(TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY)
+        if bootstrap_concurrency is not None:
+            out_ts[TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY] = _require_int(
+                bootstrap_concurrency,
+                f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY}",
+                min_v=1,
+            )
+
+        bootstrap_put_gap_ms = ts.get(TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS)
+        if bootstrap_put_gap_ms is not None:
+            if not isinstance(bootstrap_put_gap_ms, (int, float)):
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS} must be number"
+                )
+            if float(bootstrap_put_gap_ms) < 0.0:
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS} must be >= 0"
+                )
+            out_ts[TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS] = float(bootstrap_put_gap_ms)
+
+        bootstrap_storage_full_policy = ts.get(TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY)
+        if bootstrap_storage_full_policy is not None:
+            policy = _require_str(
+                bootstrap_storage_full_policy,
+                f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY}",
+            ).strip().lower()
+            if policy not in TEST_STACK_KV_BOOTSTRAP_STORAGE_FULL_POLICIES_ALLOWED:
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY} invalid: {policy!r}"
+                )
+            out_ts[TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY] = policy
+
+        kv_get_output_raw = ts.get(TEST_STACK_SCENE_KEY_KV_GET_OUTPUT)
+        kv_get_output = None
+        if kv_get_output_raw is not None:
+            if mode not in (TEST_STACK_MODE_KVSTORE, TEST_STACK_MODE_KVSTORE_WITH_LOCAL_CACHE):
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_GET_OUTPUT} "
+                    "is only allowed for KV modes"
+                )
+            kv_get_output = _require_str(
+                kv_get_output_raw,
+                f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_GET_OUTPUT}",
+            ).strip().lower()
+            if kv_get_output not in TEST_STACK_KV_GET_OUTPUTS_ALLOWED:
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_GET_OUTPUT} "
+                    f"invalid: {kv_get_output!r}"
+                )
+            out_ts[TEST_STACK_SCENE_KEY_KV_GET_OUTPUT] = kv_get_output
+
+        kv_cuda_device_index = ts.get(TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX)
+        if kv_cuda_device_index is not None:
+            if kv_get_output != "cuda":
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX} "
+                    f"requires {TEST_STACK_SCENE_KEY_KV_GET_OUTPUT}=cuda"
+                )
+            out_ts[TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX] = _require_int(
+                kv_cuda_device_index,
+                f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX}",
+                min_v=0,
             )
 
         affinity_locality_ratio = ts.get(TEST_STACK_SCENE_KEY_AFFINITY_LOCALITY_RATIO)
@@ -5729,6 +5970,11 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
             "write_ratio",
             "request_distribution",
             "keyspace_size",
+            TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS,
+            TEST_STACK_SCENE_KEY_KV_GET_OUTPUT,
+            TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX,
             "value_size_mode",
             "value_size_weighted_set",
             *TEST_STACK_RPC_SCENE_KEYS,
@@ -5836,10 +6082,9 @@ def _parse_scale(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
             f"{ctx}.benchmark.processes_per_target",
             min_v=1,
         )
-        threads_per_process = _require_int(
+        _ = _require_test_stack_benchmark_threads_per_process(
             bench.get("threads_per_process"),
             f"{ctx}.benchmark.threads_per_process",
-            min_v=1,
         )
         owner_group_processes = bench.get("owner_group_processes")
         if owner_group_processes is not None:
@@ -6137,10 +6382,106 @@ def _validate_profile_test_stack_monitoring_config(raw: Any, ctx: str) -> None:
         _ = _require_str(table_name, f"{ctx}.otlp_log_api.table_name")
 
 
+def _normalize_test_stack_owner_kv_ssd_config(raw: Any, ctx: str) -> Optional[Dict[str, Any]]:
+    if raw is None:
+        return None
+    cfg = _require_dict(raw, ctx)
+    _forbid_unknown_keys(cfg, {"large_limit_size"}, ctx)
+    large_limit_size_raw = _require_list(cfg.get("large_limit_size"), f"{ctx}.large_limit_size")
+    if not large_limit_size_raw:
+        raise ValueError(f"{ctx}.large_limit_size must be non-empty")
+    large_limit_size: List[int] = []
+    for index, raw_limit in enumerate(large_limit_size_raw):
+        large_limit_size.append(
+            _require_int(
+                raw_limit,
+                f"{ctx}.large_limit_size[{index}]",
+                min_v=512,
+            )
+        )
+    return {"large_limit_size": large_limit_size}
+
+
+def _normalize_testbed_mooncake_storage_config(raw: Any, ctx: str) -> Dict[str, Any]:
+    cfg = _require_dict(raw, ctx)
+    _forbid_unknown_keys(
+        cfg,
+        {"mode", "ssd_offload_root", "ssd_capacity_bytes"},
+        ctx,
+    )
+    mode = _require_str(cfg.get("mode"), f"{ctx}.mode").strip().upper()
+    if mode not in TEST_STACK_MOONCAKE_STORAGE_MODES_ALLOWED:
+        raise ValueError(
+            f"{ctx}.mode must be one of {sorted(TEST_STACK_MOONCAKE_STORAGE_MODES_ALLOWED)}, "
+            f"got {mode!r}"
+        )
+
+    raw_ssd_root = cfg.get("ssd_offload_root")
+    raw_ssd_capacity = cfg.get("ssd_capacity_bytes")
+    if raw_ssd_root is None and raw_ssd_capacity is None:
+        return {"mode": mode}
+    if raw_ssd_root is None or raw_ssd_capacity is None:
+        raise ValueError(
+            f"{ctx}.ssd_offload_root and {ctx}.ssd_capacity_bytes must be set together"
+        )
+    ssd_offload_root = _require_str(
+        raw_ssd_root,
+        f"{ctx}.ssd_offload_root",
+    ).strip()
+    if not ssd_offload_root:
+        raise ValueError(f"{ctx}.ssd_offload_root must be non-empty")
+    if not Path(ssd_offload_root).is_absolute():
+        raise ValueError(f"{ctx}.ssd_offload_root must be absolute")
+    ssd_capacity_bytes = _require_int(
+        raw_ssd_capacity,
+        f"{ctx}.ssd_capacity_bytes",
+        min_v=1,
+    )
+    return {
+        "mode": mode,
+        "ssd_offload_root": ssd_offload_root,
+        "ssd_capacity_bytes": int(ssd_capacity_bytes),
+    }
+
+
+def _split_testbed_mooncake_capacity(
+    *,
+    total_bytes: int,
+    instance_count: int,
+    alignment_bytes: int,
+    ctx: str,
+) -> int:
+    if instance_count <= 0:
+        raise ValueError(f"{ctx} instance_count must be > 0")
+    if total_bytes <= 0:
+        raise ValueError(f"{ctx} total_bytes must be > 0")
+    if total_bytes % instance_count != 0:
+        raise ValueError(
+            f"{ctx} total capacity must divide evenly across instances: "
+            f"total_bytes={total_bytes} instance_count={instance_count}"
+        )
+    per_instance_bytes = total_bytes // instance_count
+    if alignment_bytes > 1 and per_instance_bytes % alignment_bytes != 0:
+        raise ValueError(
+            f"{ctx} per-instance capacity must be {alignment_bytes}-byte aligned: "
+            f"total_bytes={total_bytes} instance_count={instance_count} "
+            f"per_instance_bytes={per_instance_bytes}"
+        )
+    return int(per_instance_bytes)
+
+
 def _validate_profile_test_stack_fluxon_runtime_config(rc: Dict[str, Any], ctx: str) -> None:
     _forbid_unknown_keys(
         rc,
-        {"kv_base", "mq_base", "kv_node_patch_template", "runtime_env", "monitoring", "owner_cpu_core_by_target"},
+        {
+            "kv_base",
+            "mq_base",
+            "kv_node_patch_template",
+            "runtime_env",
+            "monitoring",
+            "owner_cpu_core_by_target",
+            "owner_kv_ssd",
+        },
         ctx,
     )
     kv_base = _require_dict(rc.get("kv_base"), f"{ctx}.kv_base")
@@ -6156,6 +6497,7 @@ def _validate_profile_test_stack_fluxon_runtime_config(rc: Dict[str, Any], ctx: 
         rc.get("owner_cpu_core_by_target"),
         f"{ctx}.owner_cpu_core_by_target",
     )
+    _ = _normalize_test_stack_owner_kv_ssd_config(rc.get("owner_kv_ssd"), f"{ctx}.owner_kv_ssd")
 
 
 def _validate_profile_test_stack_redis_runtime_config(rc: Dict[str, Any], ctx: str) -> None:
@@ -6206,7 +6548,7 @@ def _validate_profile_test_stack_redis_runtime_config(rc: Dict[str, Any], ctx: s
 
 
 def _validate_profile_test_stack_mooncake_runtime_config(rc: Dict[str, Any], ctx: str) -> None:
-    _forbid_unknown_keys(rc, {"kv_base", "master"}, ctx)
+    _forbid_unknown_keys(rc, {"kv_base", "master", "testbed_mooncake_storage"}, ctx)
     kv_base = _require_dict(rc.get("kv_base"), f"{ctx}.kv_base")
     if "rdma_device_names" in kv_base:
         raise ValueError(f"{ctx}.kv_base.rdma_device_names has been removed from Fluxon KV config")
@@ -6218,10 +6560,12 @@ def _validate_profile_test_stack_mooncake_runtime_config(rc: Dict[str, Any], ctx
     _forbid_unknown_keys(
         mooncake_spec,
         {
+            "local_hostname",
             "local_buffer_size",
             "metadata_server",
             "master_server_address",
             "etcd_addresses",
+            "skip_get_size_on_get",
         },
         f"{ctx}.kv_base.mooncake_spec",
     )
@@ -6230,6 +6574,10 @@ def _validate_profile_test_stack_mooncake_runtime_config(rc: Dict[str, Any], ctx
         f"{ctx}.kv_base.mooncake_spec.local_buffer_size",
         min_v=1,
     )
+    if "local_hostname" in mooncake_spec:
+        raise ValueError(
+            f"{ctx}.kv_base.mooncake_spec.local_hostname is generated per TEST_STACK node; do not set it"
+        )
     if "metadata_server" in mooncake_spec:
         raise ValueError(
             f"{ctx}.kv_base.mooncake_spec.metadata_server is generated by TEST_STACK Mooncake master; do not set it"
@@ -6237,6 +6585,11 @@ def _validate_profile_test_stack_mooncake_runtime_config(rc: Dict[str, Any], ctx
     if "master_server_address" in mooncake_spec:
         raise ValueError(
             f"{ctx}.kv_base.mooncake_spec.master_server_address is generated by TEST_STACK Mooncake master; do not set it"
+        )
+    if "skip_get_size_on_get" in mooncake_spec:
+        _ = _require_bool(
+            mooncake_spec.get("skip_get_size_on_get"),
+            f"{ctx}.kv_base.mooncake_spec.skip_get_size_on_get",
         )
     raw_etcd_addresses = mooncake_spec.get("etcd_addresses")
     if raw_etcd_addresses is not None:
@@ -6260,6 +6613,10 @@ def _validate_profile_test_stack_mooncake_runtime_config(rc: Dict[str, Any], ctx
     _ = _normalize_test_spec_config(
         kv_base.get("benchmark_fast_path"),
         f"{ctx}.kv_base.benchmark_fast_path",
+    )
+    _ = _normalize_testbed_mooncake_storage_config(
+        rc.get("testbed_mooncake_storage"),
+        f"{ctx}.testbed_mooncake_storage",
     )
     pprof_duration_seconds = kv_base.get("pprof_duration_seconds")
     if pprof_duration_seconds is not None:
@@ -8254,6 +8611,11 @@ def _test_stack_effective_kv_keyspace_size(
     if raw_keyspace_size is None:
         raise ValueError("scene.test_stack.keyspace_size is required for KV capacity sizing")
     requested_keyspace_size = _require_int(raw_keyspace_size, "scene.test_stack.keyspace_size", min_v=1)
+    raw_guard = ts_scene.get(TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD, True)
+    if not isinstance(raw_guard, bool):
+        raise ValueError(f"scene.test_stack.{TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD} must be bool")
+    if not bool(raw_guard):
+        return int(requested_keyspace_size)
     owner_scale = _require_dict(scale.get("owner"), "resolved_case.scale.owner")
     owner_count = _require_int(owner_scale.get("owner_count"), "resolved_case.scale.owner.owner_count", min_v=1)
     owner_dram_bytes = _require_int(
@@ -8552,6 +8914,7 @@ def _build_test_stack_external_kv_owner_instances(
     runtime_env: Dict[str, str],
     owner_group_processes: Optional[int],
     owner_cpu_core_by_target: Dict[str, int],
+    owner_kv_ssd: Optional[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     required_python_abi = _test_stack_runtime_required_python_abi(
         resolved_case=resolved_case,
@@ -8602,6 +8965,25 @@ def _build_test_stack_external_kv_owner_instances(
             )
         owner_services_dir = run_dir / "services" / "kv_owner" / target_slug
         owner_large_file_paths = _fluxon_kv_owner_large_file_paths(owner_work_root=owner_services_dir)
+        owner_fluxonkv_spec = {
+            "etcd_addresses": list(etcd_endpoints),
+            "cluster_name": cluster_name,
+            "share_mem_path": owner_share_mem_path,
+            "large_file_paths": owner_large_file_paths,
+            "sub_cluster": FLUXON_KV_OWNER_SUB_CLUSTER,
+            "p2p_listen_port": int(owner_p2p_listen_port),
+        }
+        if owner_kv_ssd is not None:
+            owner_large_limit_size = _require_list(
+                owner_kv_ssd.get("large_limit_size"),
+                "profile.test_stack.runtime_config.owner_kv_ssd.large_limit_size",
+            )
+            if len(owner_large_limit_size) != len(owner_large_file_paths):
+                raise ValueError(
+                    "profile.test_stack.runtime_config.owner_kv_ssd.large_limit_size length must match "
+                    "generated owner large_file_paths length"
+                )
+            owner_fluxonkv_spec["large_limit_size"] = copy.deepcopy(owner_large_limit_size)
         owner_cfg = {
             "instance_key": _test_stack_kv_owner_runtime_instance_key(
                 runtime_instance_prefix=runtime_instance_prefix,
@@ -8609,14 +8991,7 @@ def _build_test_stack_external_kv_owner_instances(
                 ctx="external kv owner",
             ),
             "contribute_to_cluster_pool_size": {"dram": int(owner_dram_bytes), "vram": {}},
-            "fluxonkv_spec": {
-                "etcd_addresses": list(etcd_endpoints),
-                "cluster_name": cluster_name,
-                "share_mem_path": owner_share_mem_path,
-                "large_file_paths": owner_large_file_paths,
-                "sub_cluster": FLUXON_KV_OWNER_SUB_CLUSTER,
-                "p2p_listen_port": int(owner_p2p_listen_port),
-            },
+            "fluxonkv_spec": owner_fluxonkv_spec,
         }
         owner_protocol = kv_base.get("protocol")
         if owner_protocol is not None:
@@ -8689,6 +9064,7 @@ def _build_test_stack_mooncake_owner_instances(
     test_spec_config: Dict[str, Any],
     perf_config: Optional[Dict[str, Any]],
     runtime_env: Dict[str, str],
+    testbed_mooncake_storage: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     required_python_abi = _test_stack_runtime_required_python_abi(
         resolved_case=resolved_case,
@@ -8700,6 +9076,15 @@ def _build_test_stack_mooncake_owner_instances(
         raise ValueError(
             "TEST_STACK Mooncake requires owner_count to match owner target list length: "
             f"owner_count={owner_count} targets={len(owner_targets)}"
+        )
+    storage_mode = _require_str(
+        testbed_mooncake_storage.get("mode"),
+        "profile.test_stack.runtime_config.testbed_mooncake_storage.mode",
+    )
+    if storage_mode != TEST_STACK_MOONCAKE_STORAGE_MODE_DEDICATED_OWNER:
+        raise ValueError(
+            "Mooncake owner instances require testbed_mooncake_storage.mode="
+            f"{TEST_STACK_MOONCAKE_STORAGE_MODE_DEDICATED_OWNER}, got {storage_mode!r}"
         )
     owner_dram_bytes = _require_int(
         owner_scale.get("owner_dram_bytes"),
@@ -8735,9 +9120,36 @@ def _build_test_stack_mooncake_owner_instances(
         "profile.test_stack.runtime_config.kv_base.mooncake_spec.local_buffer_size",
         min_v=16777216,
     )
+    require_unlimited_memlock = _test_stack_protocol_requires_unlimited_memlock(
+        _require_dict(
+            kv_base.get("protocol"),
+            "profile.test_stack.runtime_config.kv_base.protocol",
+        )
+    )
 
     owner_instances: List[Dict[str, Any]] = []
+    local_ipv4_addrs = _local_ipv4_addresses()
+    ssd_offload_root_raw = testbed_mooncake_storage.get("ssd_offload_root")
+    ssd_capacity_raw = testbed_mooncake_storage.get("ssd_capacity_bytes")
+    per_owner_ssd_capacity: Optional[int] = None
+    if ssd_offload_root_raw is not None:
+        per_owner_ssd_capacity = _split_testbed_mooncake_capacity(
+            total_bytes=_require_int(
+                ssd_capacity_raw,
+                "profile.test_stack.runtime_config.testbed_mooncake_storage.ssd_capacity_bytes",
+                min_v=1,
+            ),
+            instance_count=owner_count,
+            alignment_bytes=1,
+            ctx="Mooncake dedicated-owner SSD",
+        )
     for target in owner_targets:
+        target_node_cfg = _require_dict(cluster_nodes.get(target), f"cluster_nodes[{target}]")
+        target_endpoint_host = _test_stack_target_advertise_host(
+            cluster_nodes=cluster_nodes,
+            target_name=target,
+            local_ipv4_addrs=local_ipv4_addrs,
+        )
         target_slug, instance_id = _test_stack_kv_owner_instance_id(
             owner_target=target,
             ctx="mooncake owner",
@@ -8753,6 +9165,7 @@ def _build_test_stack_mooncake_owner_instances(
             "mooncake_spec": {
                 # Mooncake owner/server should contribute storage capacity only.
                 # The benchmark node keeps the local transfer buffer; owner stays pure server mode.
+                "local_hostname": target_endpoint_host,
                 "local_buffer_size": 0,
                 "metadata_server": metadata_server,
                 "master_server_address": master_server_address,
@@ -8765,6 +9178,27 @@ def _build_test_stack_mooncake_owner_instances(
                 )
             ),
         }
+        owner_pre_exec_shell = ""
+        owner_runtime_env = copy.deepcopy(runtime_env)
+        if ssd_offload_root_raw is not None:
+            owner_ssd_path = str(
+                (Path(_require_str(ssd_offload_root_raw, "ssd_offload_root")) / target_slug).resolve()
+            )
+            owner_cfg["mooncake_spec"].update(
+                {
+                    "enable_ssd_offload": True,
+                    "ssd_offload_path": owner_ssd_path,
+                }
+            )
+            owner_pre_exec_shell = (
+                "mkdir -p "
+                + _shell_quote(owner_ssd_path)
+                + "\n"
+            )
+            assert per_owner_ssd_capacity is not None
+            owner_runtime_env[TEST_STACK_MOONCAKE_SSD_LIMIT_ENV] = str(
+                per_owner_ssd_capacity
+            )
         pprof_duration_seconds = kv_base.get("pprof_duration_seconds")
         if pprof_duration_seconds is not None:
             owner_cfg["pprof_duration_seconds"] = int(pprof_duration_seconds)
@@ -8797,7 +9231,9 @@ def _build_test_stack_mooncake_owner_instances(
                 "-w",
                 str(owner_services_dir.resolve()),
             ],
-            runtime_env=runtime_env,
+            runtime_env=owner_runtime_env,
+            pre_exec_shell=owner_pre_exec_shell,
+            require_unlimited_memlock=require_unlimited_memlock,
         )
         if perf_config is not None and "owner" in _require_list(perf_config.get("targets"), "perf_config.targets"):
             owner_cmd = _test_stack_perf_wrapper_command(
@@ -8998,7 +9434,11 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
     else:
         coord_target_str = _require_str(raw_coord_target, "coordinator_template.deployer.target")
         coord_target = coordinator_target if coord_target_str == "__TARGET__" else coord_target_str
-    coord_ip = _require_str(target_ip_map.get(coord_target), "deploy.target_ip_map[coordinator_target]")
+    coord_ip = _test_stack_target_advertise_host(
+        cluster_nodes=cluster_nodes,
+        target_name=coord_target,
+        local_ipv4_addrs=_local_ipv4_addresses(),
+    )
     coordinator_addr = f"{coord_ip}:{coordinator_port}"
 
     bench = _require_dict(scale.get("benchmark"), "scale.benchmark")
@@ -9007,10 +9447,9 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         "scale.benchmark.processes_per_target",
         min_v=1,
     )
-    threads_per_process = _require_int(
+    threads_per_process = _require_test_stack_benchmark_threads_per_process(
         bench.get("threads_per_process"),
         "scale.benchmark.threads_per_process",
-        min_v=1,
     )
     value_size = _require_int(bench.get("value_size"), "scale.benchmark.value_size", min_v=0)
     warmup = bench.get("metric_warmup_seconds")
@@ -9100,11 +9539,24 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         target_ip_map=target_ip_map,
         ctx="resolved_case.scale.owner.targets",
     )
+    rc = _require_dict(ts_profile.get("runtime_config"), "profile.test_stack.runtime_config")
+    testbed_mooncake_storage: Optional[Dict[str, Any]] = None
+    mooncake_storage_mode: Optional[str] = None
+    if backend_kind == TEST_STACK_BACKEND_MOONCAKE:
+        testbed_mooncake_storage = _normalize_testbed_mooncake_storage_config(
+            rc.get("testbed_mooncake_storage"),
+            "profile.test_stack.runtime_config.testbed_mooncake_storage",
+        )
+        mooncake_storage_mode = _require_str(
+            testbed_mooncake_storage.get("mode"),
+            "profile.test_stack.runtime_config.testbed_mooncake_storage.mode",
+        )
     needs_kv_master = _test_stack_backend_requires_fluxon_kv_master(backend_kind=backend_kind, mode=scene_mode)
     uses_external_fluxon_kv = _test_stack_backend_uses_external_fluxon_kv(backend_kind=backend_kind, mode=scene_mode)
     uses_dedicated_kv_owners = _test_stack_backend_uses_dedicated_kv_owners(
         backend_kind=backend_kind,
         mode=scene_mode,
+        mooncake_storage_mode=mooncake_storage_mode,
     )
     _require_explicit_owner_group_processes_for_multi_owner_same_machine(
         owner_targets_by_machine=owner_targets_by_machine,
@@ -9151,6 +9603,11 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         cluster_nodes=cluster_nodes,
         ctx="resolved_case.scale",
     )
+    mooncake_local_ipv4_addrs = (
+        _local_ipv4_addresses()
+        if backend_kind == TEST_STACK_BACKEND_MOONCAKE
+        else set()
+    )
     stack_cluster_name: Optional[str] = None
     stack_share_mem_path: Optional[str] = None
     if backend_kind == TEST_STACK_BACKEND_FLUXON:
@@ -9164,13 +9621,15 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             "runtime.stack_identity.share_mem_path",
         )
 
-    rc = _require_dict(ts_profile.get("runtime_config"), "profile.test_stack.runtime_config")
     kv_base: Dict[str, Any]
     kv_node_patch_template: Dict[str, Any] = {}
     mq_base: Optional[Any] = None
     rc_redis: Optional[Dict[str, Any]] = None
     rc_alluxio: Optional[Dict[str, Any]] = None
     rc_mooncake_master: Optional[Dict[str, Any]] = None
+    owner_kv_ssd: Optional[Dict[str, Any]] = None
+    mooncake_per_benchmark_process_dram_bytes: Optional[int] = None
+    mooncake_per_benchmark_process_ssd_capacity_bytes: Optional[int] = None
     owner_cpu_core_by_target: Dict[str, int] = {}
     alluxio_mount_root_by_target: Dict[str, str] = {}
     redis_instances: List[Dict[str, Any]] = []
@@ -9179,6 +9638,10 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
     mooncake_metadata_port: Optional[int] = None
     mooncake_metrics_port: Optional[int] = None
     if backend_kind == TEST_STACK_BACKEND_FLUXON:
+        owner_kv_ssd = _normalize_test_stack_owner_kv_ssd_config(
+            rc.get("owner_kv_ssd"),
+            "profile.test_stack.runtime_config.owner_kv_ssd",
+        )
         owner_cpu_core_by_target = _normalize_owner_cpu_core_by_target(
             rc.get("owner_cpu_core_by_target"),
             "profile.test_stack.runtime_config.owner_cpu_core_by_target",
@@ -9337,6 +9800,8 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         )
         kv_base["instance_key"] = f"{runtime_instance_prefix}__bench_base"
     elif backend_kind == TEST_STACK_BACKEND_MOONCAKE:
+        assert testbed_mooncake_storage is not None
+        assert mooncake_storage_mode is not None
         kv_base = copy.deepcopy(_require_dict(rc.get("kv_base"), "profile.test_stack.runtime_config.kv_base"))
         if "fluxonkv_spec" in kv_base:
             raise ValueError(
@@ -9360,6 +9825,35 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         )
         kv_base["backend_kind"] = TEST_STACK_BACKEND_MOONCAKE
         kv_base["instance_key"] = f"{runtime_instance_prefix}__bench_base"
+        if mooncake_storage_mode == TEST_STACK_MOONCAKE_STORAGE_MODE_PER_BENCHMARK_PROCESS:
+            owner_scale = _require_dict(scale.get("owner"), "resolved_case.scale.owner")
+            owner_count = _require_int(
+                owner_scale.get("owner_count"),
+                "resolved_case.scale.owner.owner_count",
+                min_v=1,
+            )
+            owner_dram_bytes = _require_int(
+                owner_scale.get("owner_dram_bytes"),
+                "resolved_case.scale.owner.owner_dram_bytes",
+                min_v=TEST_STACK_MOONCAKE_SEGMENT_ALIGNMENT_BYTES,
+            )
+            mooncake_per_benchmark_process_dram_bytes = _split_testbed_mooncake_capacity(
+                total_bytes=int(owner_count) * int(owner_dram_bytes),
+                instance_count=node_total,
+                alignment_bytes=TEST_STACK_MOONCAKE_SEGMENT_ALIGNMENT_BYTES,
+                ctx="Mooncake per-benchmark-process DRAM",
+            )
+            if testbed_mooncake_storage.get("ssd_offload_root") is not None:
+                mooncake_per_benchmark_process_ssd_capacity_bytes = _split_testbed_mooncake_capacity(
+                    total_bytes=_require_int(
+                        testbed_mooncake_storage.get("ssd_capacity_bytes"),
+                        "profile.test_stack.runtime_config.testbed_mooncake_storage.ssd_capacity_bytes",
+                        min_v=1,
+                    ),
+                    instance_count=node_total,
+                    alignment_bytes=1,
+                    ctx="Mooncake per-benchmark-process SSD",
+                )
         mooncake_rpc_port_base = _require_int(
             port_alloc.get("mooncake_rpc_port_base"),
             "profile.test_stack.port_alloc.mooncake_rpc_port_base",
@@ -9428,6 +9922,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         mooncake_spec["metadata_server"] = f"http://{mooncake_host}:{int(mooncake_metadata_port)}/metadata"
         mooncake_spec["master_server_address"] = f"{mooncake_host}:{int(mooncake_rpc_port)}"
         mooncake_spec["etcd_addresses"] = list(etcd_endpoints)
+        mooncake_spec.setdefault("skip_get_size_on_get", True)
         raw_protocol = kv_base.get("protocol")
         if raw_protocol is None:
             kv_base["protocol"] = {"protocol_type": "tcp"}
@@ -9492,6 +9987,15 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         kv_base["test_spec_config"] = copy.deepcopy(runtime_test_spec_config)
     if runtime_protocol_cfg is not None:
         kv_base["protocol"] = runtime_protocol_cfg
+    mooncake_requires_unlimited_memlock = (
+        backend_kind == TEST_STACK_BACKEND_MOONCAKE
+        and _test_stack_protocol_requires_unlimited_memlock(
+            _require_dict(
+                kv_base.get("protocol"),
+                "profile.test_stack.runtime_config.kv_base.protocol",
+            )
+        )
+    )
     # mq_new_or_bind_unique_key is used to derive etcd keys for MPMC channel creation,
     # including a distributed lock key "<unique_id>_lock".
     #
@@ -9651,6 +10155,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             module_name="mooncake.cli",
             module_args=mooncake_args,
             runtime_env=runtime_env,
+            require_unlimited_memlock=mooncake_requires_unlimited_memlock,
         )
         if perf_config is not None and TEST_STACK_MOONCAKE_MASTER_INSTANCE_ID in _require_list(
             perf_config.get("targets"),
@@ -9738,8 +10243,10 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             runtime_env=runtime_env,
             owner_group_processes=owner_group_processes,
             owner_cpu_core_by_target=owner_cpu_core_by_target,
+            owner_kv_ssd=owner_kv_ssd,
         )
     elif backend_kind == TEST_STACK_BACKEND_MOONCAKE and uses_dedicated_kv_owners:
+        assert testbed_mooncake_storage is not None
         owner_instances = _build_test_stack_mooncake_owner_instances(
             resolved_case=resolved_case,
             scale=scale,
@@ -9753,6 +10260,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             test_spec_config=runtime_test_spec_config,
             perf_config=perf_config,
             runtime_env=runtime_env,
+            testbed_mooncake_storage=testbed_mooncake_storage,
         )
 
     rpc_server_instance_keys: List[str] = []
@@ -9816,6 +10324,32 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                     "__COORDINATOR__": coordinator_addr,
                     "__TARGET__": target,
                 }
+                node_runtime_env = copy.deepcopy(runtime_env)
+                node_pre_exec_shell = node_start_throttle_prelude
+                mooncake_node_ssd_path: Optional[str] = None
+                if (
+                    backend_kind == TEST_STACK_BACKEND_MOONCAKE
+                    and mooncake_storage_mode
+                    == TEST_STACK_MOONCAKE_STORAGE_MODE_PER_BENCHMARK_PROCESS
+                ):
+                    assert testbed_mooncake_storage is not None
+                    ssd_offload_root = testbed_mooncake_storage.get("ssd_offload_root")
+                    if ssd_offload_root is not None:
+                        mooncake_node_ssd_path = str(
+                            (
+                                Path(_require_str(ssd_offload_root, "ssd_offload_root"))
+                                / runtime_instance_key
+                            ).resolve()
+                        )
+                        node_pre_exec_shell += (
+                            "mkdir -p "
+                            + _shell_quote(mooncake_node_ssd_path)
+                            + "\n"
+                        )
+                        assert mooncake_per_benchmark_process_ssd_capacity_bytes is not None
+                        node_runtime_env[TEST_STACK_MOONCAKE_SSD_LIMIT_ENV] = str(
+                            mooncake_per_benchmark_process_ssd_capacity_bytes
+                        )
                 inst = _require_dict(_subst_obj_tokens(node_tpl, mapping, "node_template"), "node_template.compiled")
                 inst["id"] = instance_key
                 inst_deployer = _require_dict(inst.get("deployer"), f"node_template[{instance_key}].deployer")
@@ -9841,8 +10375,9 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                             "--coordinator",
                             coordinator_addr,
                         ],
-                        runtime_env=runtime_env,
-                        pre_exec_shell=node_start_throttle_prelude,
+                        runtime_env=node_runtime_env,
+                        pre_exec_shell=node_pre_exec_shell,
+                        require_unlimited_memlock=mooncake_requires_unlimited_memlock,
                     )
                 ]
                 node_instances.append(inst)
@@ -9917,6 +10452,31 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                             f"profile.test_stack.runtime_config.alluxio.mount_root_by_target[{target!r}]",
                         )
                     }
+                elif backend_kind == TEST_STACK_BACKEND_MOONCAKE:
+                    mooncake_spec_override: Dict[str, Any] = {
+                        "local_hostname": _test_stack_target_advertise_host(
+                            cluster_nodes=cluster_nodes,
+                            target_name=target,
+                            local_ipv4_addrs=mooncake_local_ipv4_addrs,
+                        )
+                    }
+                    if (
+                        mooncake_storage_mode
+                        == TEST_STACK_MOONCAKE_STORAGE_MODE_PER_BENCHMARK_PROCESS
+                    ):
+                        assert mooncake_per_benchmark_process_dram_bytes is not None
+                        kv["contribute_to_cluster_pool_size"] = {
+                            "dram": mooncake_per_benchmark_process_dram_bytes,
+                            "vram": {},
+                        }
+                        if mooncake_node_ssd_path is not None:
+                            mooncake_spec_override.update(
+                                {
+                                    "enable_ssd_offload": True,
+                                    "ssd_offload_path": mooncake_node_ssd_path,
+                                }
+                            )
+                    kv["mooncake_spec"] = mooncake_spec_override
                 rec: Dict[str, Any] = {"kv": kv}
                 if scene_mode == TEST_STACK_MODE_MPMC:
                     rec["mq_role"] = role
@@ -9979,6 +10539,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             script_path=test_stack_runtime["coordinator_script"],
             script_args=[],
             runtime_env=runtime_env,
+            require_unlimited_memlock=mooncake_requires_unlimited_memlock,
         )
     ]
 
@@ -10034,6 +10595,11 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             "read_ratio",
             "write_ratio",
             "request_distribution",
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY,
+            TEST_STACK_SCENE_KEY_KV_GET_OUTPUT,
+            TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX,
             TEST_STACK_SCENE_KEY_AFFINITY_LOCALITY_RATIO,
         ):
             if optional_key in ts_scene:
@@ -10323,6 +10889,22 @@ def _cluster_node_is_local_host(
     if ssh_host and ssh_host in local_ipv4_addrs:
         return True
     return False
+
+
+def _test_stack_target_advertise_host(
+    *,
+    cluster_nodes: Dict[str, Dict[str, Any]],
+    target_name: str,
+    local_ipv4_addrs: set[str],
+) -> str:
+    node_cfg = _require_dict(cluster_nodes.get(target_name), f"cluster_nodes[{target_name}]")
+    if _cluster_node_is_local_host(
+        node_cfg,
+        target_name=target_name,
+        local_ipv4_addrs=local_ipv4_addrs,
+    ):
+        return "127.0.0.1"
+    return _require_str(node_cfg.get("ip"), f"cluster_nodes[{target_name}].ip")
 
 
 def _ensure_path_symlink(*, link_path: Path, target_path: Path) -> None:
@@ -11058,6 +11640,11 @@ def _ci_cleanup_runtime(
             ctx=f"CI cleanup runtime current_deployments {instance_id_text}",
         )
     _wait_ci_ports_free(cleanup_case, timeout_s=timeout_s)
+    _cleanup_ci_case_shared_bundle(
+        cleanup_case,
+        timeout_s=timeout_s,
+        ctx="CI runtime shared bundle cleanup",
+    )
 
 
 def _http_json_allow_error_status(req: urllib.request.Request) -> Tuple[int, Dict[str, Any]]:
@@ -12533,13 +13120,19 @@ def _test_stack_runtime_command(
     script_args: List[str],
     runtime_env: Dict[str, str],
     pre_exec_shell: str = "",
+    require_unlimited_memlock: bool = False,
     exec_wrapper_argv: Optional[List[str]] = None,
 ) -> str:
+    mooncake_wheel = _test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir)
     assert_env_cmd = _test_stack_runtime_env_assert_command(
         venv_python=venv_python,
-        require_mooncake=_test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir) is not None,
+        require_mooncake=mooncake_wheel is not None,
     )
-    require_unlimited_memlock = _test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir) is not None
+    mooncake_ld_library_path_cmd = (
+        _test_stack_mooncake_cuda_runtime_ld_library_path_command(venv_python=venv_python)
+        if mooncake_wheel is not None
+        else ""
+    )
     vendor_site_packages = (
         run_dir / _TEST_STACK_RUNTIME_DIRNAME / _TEST_STACK_RUNTIME_VENDOR_SITE_PACKAGES_DIRNAME
     ).resolve()
@@ -12583,6 +13176,7 @@ def _test_stack_runtime_command(
         + "export PYTHONPATH="
         + _shell_quote(str(vendor_site_packages))
         + ":${PYTHONPATH:-}\n"
+        + mooncake_ld_library_path_cmd
         + _test_stack_runtime_env_prelude_command()
         + runtime_env_exports
         + assert_env_cmd
@@ -12601,13 +13195,19 @@ def _test_stack_runtime_module_command(
     module_args: List[str],
     runtime_env: Dict[str, str],
     pre_exec_shell: str = "",
+    require_unlimited_memlock: bool = False,
     exec_wrapper_argv: Optional[List[str]] = None,
 ) -> str:
+    mooncake_wheel = _test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir)
     assert_env_cmd = _test_stack_runtime_env_assert_command(
         venv_python=venv_python,
-        require_mooncake=_test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir) is not None,
+        require_mooncake=mooncake_wheel is not None,
     )
-    require_unlimited_memlock = _test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir) is not None
+    mooncake_ld_library_path_cmd = (
+        _test_stack_mooncake_cuda_runtime_ld_library_path_command(venv_python=venv_python)
+        if mooncake_wheel is not None
+        else ""
+    )
     vendor_site_packages = (
         run_dir / _TEST_STACK_RUNTIME_DIRNAME / _TEST_STACK_RUNTIME_VENDOR_SITE_PACKAGES_DIRNAME
     ).resolve()
@@ -12652,6 +13252,7 @@ def _test_stack_runtime_module_command(
         + "export PYTHONPATH="
         + _shell_quote(str(vendor_site_packages))
         + ":${PYTHONPATH:-}\n"
+        + mooncake_ld_library_path_cmd
         + _test_stack_runtime_env_prelude_command()
         + runtime_env_exports
         + assert_env_cmd
@@ -12852,6 +13453,36 @@ def _test_stack_runtime_env_prelude_command() -> str:
     return ""
 
 
+def _test_stack_mooncake_cuda_runtime_ld_library_path_command(*, venv_python: Path) -> str:
+    return (
+        "CUDA_RUNTIME_LIB_DIR=\"$("
+        + _shell_quote(str(venv_python))
+        + " - <<'PY'\n"
+        + "from pathlib import Path\n"
+        + "import site\n"
+        + "roots = []\n"
+        + "for getter in (site.getsitepackages,):\n"
+        + "    try:\n"
+        + "        roots.extend(getter())\n"
+        + "    except Exception:\n"
+        + "        pass\n"
+        + "try:\n"
+        + "    roots.append(site.getusersitepackages())\n"
+        + "except Exception:\n"
+        + "    pass\n"
+        + "for root in roots:\n"
+        + "    candidate = Path(root) / 'nvidia' / 'cuda_runtime' / 'lib'\n"
+        + "    if (candidate / 'libcudart.so.12').exists():\n"
+        + "        print(candidate)\n"
+        + "        break\n"
+        + "PY\n"
+        + ")\"\n"
+        + "if [ -n \"${CUDA_RUNTIME_LIB_DIR}\" ]; then\n"
+        + "  export LD_LIBRARY_PATH=\"${CUDA_RUNTIME_LIB_DIR}:${LD_LIBRARY_PATH:-}\"\n"
+        + "fi\n"
+    )
+
+
 def _test_stack_runtime_env_import_probe(*, require_mooncake: bool) -> str:
     probe = _TEST_STACK_HOST_VENV_IMPORT_PROBE_BASE
     if require_mooncake:
@@ -12928,6 +13559,11 @@ def _test_stack_runtime_env_prepare_command(
         venv_python=venv_python,
         required_python_abi=required_python_abi,
         require_mooncake=mooncake_wheel is not None,
+    )
+    mooncake_ld_library_path_cmd = (
+        _test_stack_mooncake_cuda_runtime_ld_library_path_command(venv_python=venv_python)
+        if mooncake_wheel is not None
+        else ""
     )
     python_bin_name = "python" + required_python_abi.removeprefix("cpython")
     venv_root = venv_python.parent.parent
@@ -13033,6 +13669,7 @@ def _test_stack_runtime_env_prepare_command(
         + _shell_quote(str(marker_path))
         + "\n"
         + "fi\n"
+        + mooncake_ld_library_path_cmd
         + assert_env_cmd
     )
 
@@ -14145,7 +14782,9 @@ def _ci_prepare_env_path(*, run_dir: Path) -> Path:
 
 def _write_ci_prepare_env_script(*, run_dir: Path, exports: Dict[str, str]) -> Path:
     out_path = _ci_prepare_env_path(run_dir=run_dir)
-    lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
+    # This file is sourced by ci_runner.sh. It owns environment exports only;
+    # changing the caller's shell options would break explicit rc capture.
+    lines = ["#!/usr/bin/env bash"]
     for name, value in sorted(exports.items()):
         lines.append(f"export {name}={_shell_quote(value)}")
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -14455,6 +15094,9 @@ if [ -f "$prepare_env_path" ]; then
   # CI case prepare writes explicit environment exports here.
   . "$prepare_env_path"
 fi
+# The runner owns error handling even if a supplied prepare file changes shell options.
+set +e
+set -uo pipefail
 
 # Run from src_root so repo-local test commands execute inside the prepared runtime source tree.
 cd {src_root.as_posix()}
@@ -14636,7 +15278,7 @@ def _run_remote_bash_capture(
             argv=argv,
             password=None,
             ctx=ctx,
-            timeout_seconds=None,
+            timeout_seconds=_SSH_TRANSPORT_TIMEOUT_SECONDS,
             emit_output=False,
             max_attempts=1,
         )
@@ -15209,7 +15851,12 @@ def _instance_remove_directory_and_verify_absent(
         time.sleep(0.5)
 
 
-def _cleanup_successful_ci_case_data(resolved_case: Dict[str, Any], *, run_dir: Path) -> None:
+def _cleanup_ci_case_shared_bundle(
+    resolved_case: Dict[str, Any],
+    *,
+    timeout_s: int,
+    ctx: str,
+) -> None:
     bundle_dir = _ci_case_shared_bundle_dir(resolved_case)
     bundle_instance_id = (
         "owner_0"
@@ -15217,13 +15864,21 @@ def _cleanup_successful_ci_case_data(resolved_case: Dict[str, Any], *, run_dir: 
         else "ci_runner"
     )
     print(
-        f"[CI success cleanup] shared_bundle={bundle_dir} instance_id={bundle_instance_id}",
+        f"[{ctx}] shared_bundle={bundle_dir} instance_id={bundle_instance_id}",
         flush=True,
     )
     _instance_remove_directory_and_verify_absent(
         resolved_case,
         instance_id=bundle_instance_id,
         path=bundle_dir,
+        timeout_s=timeout_s,
+        ctx=ctx,
+    )
+
+
+def _cleanup_successful_ci_case_data(resolved_case: Dict[str, Any], *, run_dir: Path) -> None:
+    _cleanup_ci_case_shared_bundle(
+        resolved_case,
         timeout_s=30,
         ctx="CI success shared bundle cleanup",
     )

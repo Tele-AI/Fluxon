@@ -134,6 +134,12 @@ The `TCP Benchmark` shows that Fluxon outperforms `MooncakeStore` and `Redis` on
 
 ![](./pics/kv_benchmark_chart.png)
 
+Fluxon KV can also use an owner's local SSD as a runtime backing layer for DRAM replicas. The chart below shows a single-node H100 SSD-pressure experiment measured through CUDA event completion. At c16, Fluxon's hit payload throughput for 4/8/16 MiB payloads was 3.83×/5.61×/6.73× that of the faster of the two Mooncake topologies.
+
+![GPU-ready KV throughput and hit rate across Fluxon and Mooncake SSD configurations](./pics/kv_ssd_gpu_sweep.png)
+
+See the Chinese deep dive, [Fluxon KV SSD Storage: Using Local SSD as a Backing Layer for In-Memory Replicas](https://tele-ai.github.io/Fluxon/cn/blog/blog_2_Fluxon_KV_SSD%E5%AD%98%E5%82%A8%EF%BC%9A%E6%8A%8A%E6%9C%AC%E5%9C%B0SSD%E6%8E%A5%E6%88%90%E5%86%85%E5%AD%98%E5%89%AF%E6%9C%AC%E7%9A%84%E5%9B%9E%E5%A1%AB%E5%B1%82), for the full setup, hit rates, and scope.
+
 ### Fluxon FS Benchmark
 
 The benchmark results show that small-file reads and large-file writes already outperform `Alluxio`, large-file read performance is broadly on par, and small-file write performance still has further room to improve.
@@ -294,6 +300,10 @@ Contributions are welcome. Before you start, please read the developer docs on G
 - [Developer - 2 - Package middleware and images](https://tele-ai.github.io/Fluxon/dev_doc/Developer---2---Package-Middleware-and-Images/)
 - [Developer - 3 - Documentation Writing Rules](https://tele-ai.github.io/Fluxon/dev_doc/Developer---3---Documentation-Writing-Rules/)
 - [Developer - 4 - Publish a release](https://tele-ai.github.io/Fluxon/dev_doc/Developer---4---Publish-a-Release/)
+- [Developer - 5 - Technical Documentation Copy Editing](https://tele-ai.github.io/Fluxon/dev_doc/Developer---5---Technical-Documentation-Copy-Editing/)
+- [Developer - 6 - Code Review Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---6---Code-Review-Guidelines/)
+- [Developer - 7 - Event Subscription and Full Snapshot Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---7---Event-Subscription-and-Full-Snapshot-Guidelines/)
+- [Developer - 8 - Data Structure and Index Design Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---8---Data-Structure-and-Index-Design-Guidelines/)
 
 <a id="contributors"></a>
 

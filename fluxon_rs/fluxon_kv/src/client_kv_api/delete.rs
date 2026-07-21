@@ -124,6 +124,13 @@ pub async fn handle_batch_delete_client_kv_meta_cache(
             delete_item.put_version
         );
 
+        // A remote GET holds this per-key lock until it has installed the
+        // MemoryInfo returned by GetDone. Waiting here prevents an eviction
+        // from arriving before that install and leaving a stale holder cached.
+        let get_lock = client_inner
+            .get_remote_kv_lock
+            .get_lock(delete_item.key.clone());
+        let _get_guard = get_lock.lock().await;
         remove_local_cached_info_for_delete(client_inner, delete_item);
         deleted_count += 1;
 

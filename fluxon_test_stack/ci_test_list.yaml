@@ -307,7 +307,7 @@ scales:
     duration_seconds: 60
     topology: 1
     targets:
-      hosts: [infra44-ThinkStation-PX]
+      hosts: [example-node-a]
     owner:
       owner_count: 1
       owner_dram_bytes: 3221225472
@@ -325,7 +325,7 @@ scales:
     duration_seconds: 60
     topology: 1
     targets:
-      hosts: [infra44-ThinkStation-PX]
+      hosts: [example-node-a]
     owner:
       owner_count: 1
       owner_dram_bytes: 21474836480
@@ -335,7 +335,7 @@ scales:
     duration_seconds: 60
     topology: 2
     targets:
-      hosts: [infra44-ThinkStation-PX, infra46-ThinkStation-PX]
+      hosts: [example-node-a, example-node-b]
     owner:
       owner_count: 2
       owner_dram_bytes: 3221225472
@@ -345,7 +345,7 @@ scales:
     duration_seconds: 60
     topology: 2
     targets:
-      hosts: [infra44-ThinkStation-PX, infra46-ThinkStation-PX]
+      hosts: [example-node-a, example-node-b]
     owner:
       owner_count: 2
       owner_dram_bytes: 21474836480
@@ -443,8 +443,8 @@ profiles:
             - test_profile_adapter.py
           controller_url: __STACK_CONTROLLER_URL__
           target_ip_map:
-            infra44-ThinkStation-PX: 192.168.151.44
-            infra46-ThinkStation-PX: 192.168.151.46
+            example-node-a: 192.0.2.10
+            example-node-b: 192.0.2.11
           bootstrap_ready_timeout_seconds: 300
         scene_configs:
           ci_top_attention_doc_page_build:
@@ -463,12 +463,12 @@ profiles:
           cluster_kv_owner: &cluster_kv_owner_runtime
             base_runtime:
               etcd:
-                target: infra44-ThinkStation-PX
+                target: example-node-a
                 endpoint:
                   scheme: HTTP
                   host_port: 32579
               greptime:
-                target: infra44-ThinkStation-PX
+                target: example-node-a
                 endpoint:
                   scheme: HTTP
                   host_port: 34030
@@ -477,7 +477,7 @@ profiles:
                 lifecycle: service
                 k8s_ref: deployment/master
                 deployer:
-                  target: infra44-ThinkStation-PX
+                  target: example-node-a
                   command: [/bin/bash, -lc]
                   args:
                     - |
@@ -512,12 +512,12 @@ profiles:
           rust_self_managed:
             base_runtime:
               etcd:
-                target: infra44-ThinkStation-PX
+                target: example-node-a
                 endpoint:
                   scheme: HTTP
                   host_port: 32579
               greptime:
-                target: infra44-ThinkStation-PX
+                target: example-node-a
                 endpoint:
                   scheme: HTTP
                   host_port: 34030
@@ -552,8 +552,8 @@ profiles:
             - test_profile_adapter.py
           controller_url: __STACK_CONTROLLER_URL__
           target_ip_map:
-            infra44-ThinkStation-PX: 192.168.151.44
-            infra46-ThinkStation-PX: 192.168.151.46
+            example-node-a: 192.0.2.10
+            example-node-b: 192.0.2.11
           bootstrap_ready_timeout_seconds: 300
         runtime_config:
           # This config is passed through into run_dir/benchmark_config.py.
@@ -564,7 +564,7 @@ profiles:
             fluxonkv_spec:
               cluster_name: __STACK_CLUSTER_NAME__
               # Self-host benchmark nodes are launched by the host-side deployer, not inside a
-              # container with /hostworkdir mounted. Use the real host path so both infra44/46
+              # container with /hostworkdir mounted. Use the real host path so both example-node-a/example-node-b
               # benchmark nodes can open the same self-host shared-memory root directly.
               share_mem_path: __STACK_SHARE_MEM_PATH__
           mq_base:
@@ -576,7 +576,7 @@ profiles:
             lifecycle: service
             k8s_ref: deployment/test_stack_coord
             deployer:
-              target: infra44-ThinkStation-PX
+              target: example-node-a
               command: [/bin/bash, -lc]
               args:
                 - |
@@ -677,8 +677,8 @@ profiles:
             - test_profile_adapter.py
           controller_url: __STACK_CONTROLLER_URL__
           target_ip_map:
-            infra44-ThinkStation-PX: 192.168.151.44
-            infra46-ThinkStation-PX: 192.168.151.46
+            example-node-a: 192.0.2.10
+            example-node-b: 192.0.2.11
           bootstrap_ready_timeout_seconds: 300
         runtime_config:
           redis:
@@ -693,7 +693,7 @@ profiles:
             lifecycle: service
             k8s_ref: deployment/test_stack_coord
             deployer:
-              target: infra44-ThinkStation-PX
+              target: example-node-a
               command: [/bin/bash, -lc]
               args:
                 - |
@@ -730,16 +730,16 @@ profiles:
             - test_profile_adapter.py
           controller_url: __STACK_CONTROLLER_URL__
           target_ip_map:
-            infra44-ThinkStation-PX: 192.168.151.44
-            infra46-ThinkStation-PX: 192.168.151.46
+            example-node-a: 192.0.2.10
+            example-node-b: 192.0.2.11
           bootstrap_ready_timeout_seconds: 300
         runtime_config:
           alluxio:
             bundle_test_rsc_relpath: baselines/alluxio/alluxio_bundle.tar.gz
             bundle_root_relpath: baselines/alluxio/alluxio_bundle
             mount_root_by_target:
-              infra44-ThinkStation-PX: /mnt/alluxio
-              infra46-ThinkStation-PX: /mnt/alluxio
+              example-node-a: /mnt/alluxio
+              example-node-b: /mnt/alluxio
             namespace_prefix: fluxon_test_stack/alluxio
             mount_command_template: |
               cd __ALLUXIO_BUNDLE_ROOT__
@@ -749,7 +749,7 @@ profiles:
             lifecycle: service
             k8s_ref: deployment/test_stack_coord
             deployer:
-              target: infra44-ThinkStation-PX
+              target: example-node-a
               command: [/bin/bash, -lc]
               args:
                 - |

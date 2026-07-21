@@ -350,6 +350,8 @@
 	          <label><input type="checkbox" class="col_toggle" value="get_avg" checked />get_avg</label>
 	          <label><input type="checkbox" class="col_toggle" value="seg_used" checked />seg_used</label>
 	          <label><input type="checkbox" class="col_toggle" value="seg_cap" checked />seg_cap</label>
+	          <label><input type="checkbox" class="col_toggle" value="ssd_used" checked />ssd_used</label>
+	          <label><input type="checkbox" class="col_toggle" value="ssd_cap" checked />ssd_cap</label>
           {% endif %}
 	      </span>
 	      <button type="button" id="clear_filter">Clear</button>
@@ -373,6 +375,8 @@
 	        <option value="get_avg">get_avg</option>
 	        <option value="seg_used">seg_used</option>
 	        <option value="seg_cap">seg_cap</option>
+	        <option value="ssd_used">ssd_used</option>
+	        <option value="ssd_cap">ssd_cap</option>
 	      </select>
 	      <select id="sort_1_dir">
 	        <option value="asc">asc</option>
@@ -398,6 +402,8 @@
 	        <option value="get_avg">get_avg</option>
 	        <option value="seg_used">seg_used</option>
 	        <option value="seg_cap">seg_cap</option>
+	        <option value="ssd_used">ssd_used</option>
+	        <option value="ssd_cap">ssd_cap</option>
 	      </select>
 	      <select id="sort_2_dir">
 	        <option value="asc">asc</option>
@@ -423,6 +429,8 @@
 	        <option value="get_avg">get_avg</option>
 	        <option value="seg_used">seg_used</option>
 	        <option value="seg_cap">seg_cap</option>
+	        <option value="ssd_used">ssd_used</option>
+	        <option value="ssd_cap">ssd_cap</option>
 	      </select>
 	      <select id="sort_3_dir">
 	        <option value="asc">asc</option>
@@ -448,6 +456,8 @@
 	        <option value="get_avg">get_avg</option>
 	        <option value="seg_used">seg_used</option>
 	        <option value="seg_cap">seg_cap</option>
+	        <option value="ssd_used">ssd_used</option>
+	        <option value="ssd_cap">ssd_cap</option>
 	      </select>
 	      <select id="sort_4_dir">
 	        <option value="asc">asc</option>
@@ -487,6 +497,8 @@
 	          <th data-col="get_avg">get_avg</th>
 	          <th data-col="seg_used">seg_used</th>
 	          <th data-col="seg_cap">seg_cap</th>
+	          <th data-col="ssd_used">ssd_used</th>
+	          <th data-col="ssd_cap">ssd_cap</th>
 	        </tr>
 	        <tr>
 	          <th data-col="node_key"><input id="f_node_key" type="text" placeholder="filter" /></th>
@@ -530,6 +542,8 @@
 	          <th data-col="get_avg"><input id="f_get_avg" type="text" placeholder="filter" /></th>
 	          <th data-col="seg_used"><input id="f_seg_used" type="text" placeholder="filter" /></th>
 	          <th data-col="seg_cap"><input id="f_seg_cap" type="text" placeholder="filter" /></th>
+	          <th data-col="ssd_used"><input id="f_ssd_used" type="text" placeholder="filter" /></th>
+	          <th data-col="ssd_cap"><input id="f_ssd_cap" type="text" placeholder="filter" /></th>
 	        </tr>
 	      </thead>
       <tbody id="member_rows">
@@ -557,6 +571,8 @@
             data-get-avg-text="{{ row.get_avg_text }}"
             data-seg-used-text="{{ row.seg_used_text }}"
             data-seg-cap-text="{{ row.seg_cap_text }}"
+            data-ssd-used-text="{{ row.ssd_used_text }}"
+            data-ssd-cap-text="{{ row.ssd_cap_text }}"
             data-sort-node-key="{{ row.node_key }}"
             data-sort-member-id="{{ row.member_id }}"
             data-sort-role="{{ row.role_rank }}"
@@ -571,7 +587,9 @@
             data-sort-put-avg="{{ row.put_avg_sort }}"
             data-sort-get-avg="{{ row.get_avg_sort }}"
             data-sort-seg-used="{{ row.seg_used_sort }}"
-            data-sort-seg-cap="{{ row.seg_cap_sort }}">
+            data-sort-seg-cap="{{ row.seg_cap_sort }}"
+            data-sort-ssd-used="{{ row.ssd_used_sort }}"
+            data-sort-ssd-cap="{{ row.ssd_cap_sort }}">
 	            <td data-col="node_key" class="mono">{{ row.node_key }}</td>
 	            <td data-col="member_id" class="mono">{{ row.member_id }}</td>
 	            <td data-col="logs" class="mono"><a href="{{ row.logs_href }}" target="_blank">log</a></td>
@@ -606,6 +624,8 @@
 	            <td data-col="get_avg" class="mono">{{ row.get_avg_text }}</td>
 	            <td data-col="seg_used" class="mono">{{ row.seg_used_text }}</td>
 	            <td data-col="seg_cap" class="mono">{{ row.seg_cap_text }}</td>
+	            <td data-col="ssd_used" class="mono">{{ row.ssd_used_text }}</td>
+	            <td data-col="ssd_cap" class="mono">{{ row.ssd_cap_text }}</td>
 	          </tr>
         {% endfor %}
       </tbody>
@@ -614,7 +634,7 @@
 
   {% if owner_seg.owner_rows.len() > 0 %}
     <details class="card" open data-state-key="owner_segments">
-      <summary><b>Owner segment usage</b></summary>
+      <summary><b>Owner storage usage</b></summary>
       <div class="tablewrap">
         <table>
           <thead>
@@ -637,12 +657,13 @@
           </tbody>
         </table>
       </div>
-      <div class="row muted tiny">Device breakdown</div>
+      <div class="row muted tiny">Resource breakdown</div>
       <div class="tablewrap">
         <table>
           <thead>
             <tr>
               <th>owner_id</th>
+              <th>resource</th>
               <th>device</th>
               <th>used</th>
               <th>cap</th>
@@ -653,6 +674,7 @@
             {% for d in owner_seg.device_rows %}
               <tr>
                 <td class="mono">{{ d.owner_id }}</td>
+                <td class="mono">{{ d.resource_kind }}</td>
                 <td class="mono">{{ d.device }}</td>
                 <td class="mono">{{ d.used }}</td>
                 <td class="mono">{{ d.cap }}</td>
@@ -1011,12 +1033,12 @@
   const clusterName = '{{ header.cluster_name }}';
   const memberKind = '{{ header.member_kind_query }}';
 
-  const storageKey = 'fluxon_cli.table_state.v2:' + '{{ header.cluster_name_encoded }}' + ':' + '{{ header.member_kind_query }}';
+  const storageKey = 'fluxon_cli.table_state.v3:' + '{{ header.cluster_name_encoded }}' + ':' + '{{ header.member_kind_query }}';
   const metricStorageKey = 'fluxon_cli.metric_panel.v1:' + '{{ header.cluster_name_encoded }}';
 
   const ALL_COLS = [
     'node_key','member_id','role','pid','cmd','start_time','hostname','accessible_ip','shared_mem_dir','p2p_listen_port',
-    'rdma','cpu','mem_used','rss','tx','rx','put_rps','get_rps','put_avg','get_avg','seg_used','seg_cap',
+    'rdma','cpu','mem_used','rss','tx','rx','put_rps','get_rps','put_avg','get_avg','seg_used','seg_cap','ssd_used','ssd_cap',
   ];
 
   function requireEl(id) {
@@ -1081,6 +1103,8 @@
       get_avg: requireEl('f_get_avg')?.value || '',
       seg_used: requireEl('f_seg_used')?.value || '',
       seg_cap: requireEl('f_seg_cap')?.value || '',
+      ssd_used: requireEl('f_ssd_used')?.value || '',
+      ssd_cap: requireEl('f_ssd_cap')?.value || '',
     };
     return filterSpec;
   }
@@ -1138,6 +1162,8 @@
     if (requireEl('f_get_avg')) requireEl('f_get_avg').value = spec.get_avg || '';
     if (requireEl('f_seg_used')) requireEl('f_seg_used').value = spec.seg_used || '';
     if (requireEl('f_seg_cap')) requireEl('f_seg_cap').value = spec.seg_cap || '';
+    if (requireEl('f_ssd_used')) requireEl('f_ssd_used').value = spec.ssd_used || '';
+    if (requireEl('f_ssd_cap')) requireEl('f_ssd_cap').value = spec.ssd_cap || '';
   }
 
   function restoreSortLevels(levels) {
@@ -1400,6 +1426,8 @@
         (getText(spec.get_avg) === '' || getText(r.getAttribute('data-get-avg-text')).includes(getText(spec.get_avg))) &&
         (getText(spec.seg_used) === '' || getText(r.getAttribute('data-seg-used-text')).includes(getText(spec.seg_used))) &&
         (getText(spec.seg_cap) === '' || getText(r.getAttribute('data-seg-cap-text')).includes(getText(spec.seg_cap))) &&
+        (getText(spec.ssd_used) === '' || getText(r.getAttribute('data-ssd-used-text')).includes(getText(spec.ssd_used))) &&
+        (getText(spec.ssd_cap) === '' || getText(r.getAttribute('data-ssd-cap-text')).includes(getText(spec.ssd_cap))) &&
         (startMin === null || Number(r.getAttribute('data-start-time')) >= startMin) &&
         (startMax === null || Number(r.getAttribute('data-start-time')) <= startMax);
       r.style.display = ok ? '' : 'none';
@@ -1418,7 +1446,7 @@
   function clearFilter() {
     const ids = [
       'f_node_key','f_member_id','f_pid','f_cmd','f_start_time_min','f_start_time_max','f_hostname','f_accessible_ip','f_shared_mem_dir','f_p2p_listen_port',
-      'f_cpu','f_mem_used','f_rss','f_tx','f_rx','f_put_rps','f_get_rps','f_put_avg','f_get_avg','f_seg_used','f_seg_cap',
+      'f_cpu','f_mem_used','f_rss','f_tx','f_rx','f_put_rps','f_get_rps','f_put_avg','f_get_avg','f_seg_used','f_seg_cap','f_ssd_used','f_ssd_cap',
     ];
     for (const id of ids) {
       const el = requireEl(id);
@@ -1445,7 +1473,7 @@
     // Immediate UI response: filter runs on local data only.
     const inputIds = [
       'f_node_key','f_member_id','f_pid','f_cmd','f_start_time_min','f_start_time_max','f_hostname','f_accessible_ip','f_shared_mem_dir','f_p2p_listen_port',
-      'f_cpu','f_mem_used','f_rss','f_tx','f_rx','f_put_rps','f_get_rps','f_put_avg','f_get_avg','f_seg_used','f_seg_cap',
+      'f_cpu','f_mem_used','f_rss','f_tx','f_rx','f_put_rps','f_get_rps','f_put_avg','f_get_avg','f_seg_used','f_seg_cap','f_ssd_used','f_ssd_cap',
     ];
     for (const id of inputIds) {
       const el = requireEl(id);

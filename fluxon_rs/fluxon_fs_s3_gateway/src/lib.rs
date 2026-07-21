@@ -5324,10 +5324,9 @@ mod tests {
     };
     use crate::transfer::encode_transfer_manifest_blob_with_empty_dirs;
     use fluxon_fs_core::config::{
-        FS_CACHE_DEFAULT_WRITE_SESSION_TARGET_INFLIGHT_BYTES_V1,
-        FS_EXPORT_DEFAULT_INLINE_BYTES_MAX_BYTES_V1,
-        FS_EXPORT_DEFAULT_METADATA_CACHE_TTL_MS_V1,
         FLUXON_FS_LOCAL_TRANSFER_CHECK_DST_EXPORT, FLUXON_FS_LOCAL_TRANSFER_CHECK_SRC_EXPORT,
+        FS_CACHE_DEFAULT_WRITE_SESSION_TARGET_INFLIGHT_BYTES_V1,
+        FS_EXPORT_DEFAULT_INLINE_BYTES_MAX_BYTES_V1, FS_EXPORT_DEFAULT_METADATA_CACHE_TTL_MS_V1,
         FluxonFsAccessModel, FluxonFsAccessUser, FluxonFsExport, FluxonFsExportRoutingMode,
         FluxonFsGlobalConfig, FluxonFsLocalTransferCheckJobSpecWire, FluxonFsRequestIdentity,
         FluxonFsS3GatewayConfig, FluxonFsS3KvMissPolicy, FluxonFsS3PermissionAccount,
@@ -5344,7 +5343,7 @@ mod tests {
     use std::sync::OnceLock;
     use uuid::Uuid;
 
-    const TEST_TIKV_WORK_ROOT: &str = "/mnt/nvme0/fluxon_fs_transfer_tikv/rust_gateway";
+    const TEST_TIKV_WORK_ROOT: &str = "/tmp/fluxon-example/fluxon_fs_transfer_tikv/rust_gateway";
     const TEST_TIKV_READY_TIMEOUT_SECS: u64 = 180;
     const TEST_TIKV_PD_LEASE_SECS: u64 = 60;
     const TEST_TIKV_UNIFIED_READPOOL_MAX_THREADS: u64 = 4;
@@ -6733,29 +6732,29 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
     #[test]
     fn test_build_fs_master_admin_managed_agent_exports_uses_runtime_and_overlay_per_agent() {
         let online_agent_ids = BTreeSet::from([
-            "fluxon_fs_agent_infra44-ThinkStation-PX".to_string(),
-            "fluxon_fs_agent_infra46-ThinkStation-PX".to_string(),
+            "fluxon_fs_agent_example-node-a".to_string(),
+            "fluxon_fs_agent_example-node-b".to_string(),
         ]);
         let runtime_agent_exports = vec![
             super::FsMasterAdminRuntimeAgentExports {
-                agent_instance_key: "fluxon_fs_agent_infra44-ThinkStation-PX".to_string(),
+                agent_instance_key: "fluxon_fs_agent_example-node-a".to_string(),
                 runtime_exports: vec![
                     super::FsMasterAdminRuntimeExportRecord {
-                        export_name: "deployer-runtime-infra44".to_string(),
-                        remote_root_dir_abs: "/mnt/nvme0/store_team_dev/fluxon_deploy".to_string(),
+                        export_name: "deployer-runtime-example-node-a".to_string(),
+                        remote_root_dir_abs: "/tmp/fluxon-example/deploy".to_string(),
                     },
                     super::FsMasterAdminRuntimeExportRecord {
                         export_name: "fluxon-release".to_string(),
-                        remote_root_dir_abs:
-                            "/mnt/nvme0/store_team_dev/fluxon_deploy/fluxon_release".to_string(),
+                        remote_root_dir_abs: "/tmp/fluxon-example/deploy/fluxon_release"
+                            .to_string(),
                     },
                 ],
             },
             super::FsMasterAdminRuntimeAgentExports {
-                agent_instance_key: "fluxon_fs_agent_infra46-ThinkStation-PX".to_string(),
+                agent_instance_key: "fluxon_fs_agent_example-node-b".to_string(),
                 runtime_exports: vec![super::FsMasterAdminRuntimeExportRecord {
-                    export_name: "deployer-runtime-infra46".to_string(),
-                    remote_root_dir_abs: "/mnt/nvme0/store_team_dev/fluxon_deploy".to_string(),
+                    export_name: "deployer-runtime-example-node-b".to_string(),
+                    remote_root_dir_abs: "/tmp/fluxon-example/deploy".to_string(),
                 }],
             },
         ];
@@ -6773,7 +6772,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
                 .iter()
                 .map(|record| record.export_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["deployer-runtime-infra44", "fluxon-release"]
+            vec!["deployer-runtime-example-node-a", "fluxon-release"]
         );
         assert_eq!(
             managed_agent_exports[1]
@@ -6781,7 +6780,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
                 .iter()
                 .map(|record| record.export_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["deployer-runtime-infra46"]
+            vec!["deployer-runtime-example-node-b"]
         );
     }
 
@@ -6789,12 +6788,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
     async fn test_snapshot_fs_master_admin_filters_offline_agents() {
         let fs_master_admin_backend = StaticFsMasterAdminBackend {
             members: vec![
-                test_agent_member("fluxon_fs_agent_infra44-ThinkStation-PX"),
-                test_agent_member("fluxon_fs_agent_infra46-ThinkStation-PX"),
+                test_agent_member("fluxon_fs_agent_example-node-a"),
+                test_agent_member("fluxon_fs_agent_example-node-b"),
             ],
-            online_member_ids: BTreeSet::from([
-                "fluxon_fs_agent_infra44-ThinkStation-PX".to_string()
-            ]),
+            online_member_ids: BTreeSet::from(["fluxon_fs_agent_example-node-a".to_string()]),
         };
         let st = GatewayState::new(
             "test_cluster".to_string(),
@@ -6818,28 +6815,28 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         )
         .unwrap();
         st.replace_fs_export_registry_for_agent(
-            "fluxon_fs_agent_infra44-ThinkStation-PX",
+            "fluxon_fs_agent_example-node-a",
             &[super::FsExportRegistryRecord {
-                export_name: "deployer-runtime-infra44".to_string(),
-                agent_instance_key: "fluxon_fs_agent_infra44-ThinkStation-PX".to_string(),
-                remote_root_dir_abs: "/mnt/nvme0/store_team_dev/fluxon_deploy".to_string(),
+                export_name: "deployer-runtime-example-node-a".to_string(),
+                agent_instance_key: "fluxon_fs_agent_example-node-a".to_string(),
+                remote_root_dir_abs: "/tmp/fluxon-example/deploy".to_string(),
                 export: super::agent_registry_export_for_name_and_root_v1(
-                    "deployer-runtime-infra44",
-                    "/mnt/nvme0/store_team_dev/fluxon_deploy",
+                    "deployer-runtime-example-node-a",
+                    "/tmp/fluxon-example/deploy",
                 ),
                 updated_unix_ms: 1,
             }],
         )
         .unwrap();
         st.replace_fs_export_registry_for_agent(
-            "fluxon_fs_agent_infra46-ThinkStation-PX",
+            "fluxon_fs_agent_example-node-b",
             &[super::FsExportRegistryRecord {
-                export_name: "deployer-runtime-infra46".to_string(),
-                agent_instance_key: "fluxon_fs_agent_infra46-ThinkStation-PX".to_string(),
-                remote_root_dir_abs: "/mnt/nvme0/store_team_dev/fluxon_deploy".to_string(),
+                export_name: "deployer-runtime-example-node-b".to_string(),
+                agent_instance_key: "fluxon_fs_agent_example-node-b".to_string(),
+                remote_root_dir_abs: "/tmp/fluxon-example/deploy".to_string(),
                 export: super::agent_registry_export_for_name_and_root_v1(
-                    "deployer-runtime-infra46",
-                    "/mnt/nvme0/store_team_dev/fluxon_deploy",
+                    "deployer-runtime-example-node-b",
+                    "/tmp/fluxon-example/deploy",
                 ),
                 updated_unix_ms: 1,
             }],
@@ -6851,12 +6848,12 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert_eq!(snapshot.runtime_agent_exports.len(), 1);
         assert_eq!(
             snapshot.runtime_agent_exports[0].agent_instance_key,
-            "fluxon_fs_agent_infra44-ThinkStation-PX"
+            "fluxon_fs_agent_example-node-a"
         );
         assert_eq!(snapshot.managed_agent_exports.len(), 1);
         assert_eq!(
             snapshot.managed_agent_exports[0].agent_instance_key,
-            "fluxon_fs_agent_infra44-ThinkStation-PX"
+            "fluxon_fs_agent_example-node-a"
         );
     }
 
@@ -10661,13 +10658,13 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
     #[tokio::test]
     async fn test_bucket_root_put_is_noop_success_for_existing_export() {
         let backend = Arc::new(ObjectBackend::default());
-        let st = test_state_with_buckets(backend, &["deployer-runtime-infra44"]);
+        let st = test_state_with_buckets(backend, &["deployer-runtime-example-node-a"]);
         let resp = super::handle_any_authed_impl(
             st.clone(),
             test_auth_ctx(&st),
             Method::PUT,
-            "deployer-runtime-infra44".to_string(),
-            "/deployer-runtime-infra44".parse().unwrap(),
+            "deployer-runtime-example-node-a".to_string(),
+            "/deployer-runtime-example-node-a".parse().unwrap(),
             HeaderMap::new(),
             Body::empty(),
         )
@@ -10723,14 +10720,14 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
     #[tokio::test]
     async fn test_put_object_after_bucket_root_put_writes_object() {
         let backend = Arc::new(ObjectBackend::default());
-        let st = test_state_with_buckets(backend.clone(), &["deployer-runtime-infra44"]);
+        let st = test_state_with_buckets(backend.clone(), &["deployer-runtime-example-node-a"]);
 
         let bucket_resp = super::handle_any_authed_impl(
             st.clone(),
             test_auth_ctx(&st),
             Method::PUT,
-            "deployer-runtime-infra44".to_string(),
-            "/deployer-runtime-infra44".parse().unwrap(),
+            "deployer-runtime-example-node-a".to_string(),
+            "/deployer-runtime-example-node-a".parse().unwrap(),
             HeaderMap::new(),
             Body::empty(),
         )
@@ -10742,8 +10739,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             st.clone(),
             test_auth_ctx(&st),
             Method::PUT,
-            "deployer-runtime-infra44/download/rclone-e2e.txt".to_string(),
-            "/deployer-runtime-infra44/download/rclone-e2e.txt"
+            "deployer-runtime-example-node-a/download/rclone-e2e.txt".to_string(),
+            "/deployer-runtime-example-node-a/download/rclone-e2e.txt"
                 .parse()
                 .unwrap(),
             HeaderMap::new(),
@@ -10755,7 +10752,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert_eq!(object_resp.status(), StatusCode::OK);
         assert_eq!(
             backend
-                .get("deployer-runtime-infra44", "download/rclone-e2e.txt")
+                .get("deployer-runtime-example-node-a", "download/rclone-e2e.txt")
                 .unwrap(),
             b"fluxon-rclone-e2e\n".to_vec()
         );

@@ -63,10 +63,24 @@ pub struct OneKvNodesRoutes {
     pub put_id: PutIDForAKey,
     // 这个 key-version 绑定的 lease；None 表示非 lease key。
     pub lease_id: Option<u64>,
-    // 这个已提交版本当前所有 live replica。
-    pub nodes_replicas: RwLock<HashMap<NodeID, KvRouteInfo>>,
+    // 按 owner 索引这个版本的内存与 SSD 副本。
+    pub node_replicas: RwLock<HashMap<NodeID, KvNodeReplicas>>,
     // 限制 get 驱动的 durable replica 提升并发数。
     pub get_durable_slots_used: AtomicU32,
+}
+
+pub struct KvNodeReplicas {
+    // 标识当前 NodeID 对应的节点实例。
+    pub tomb_tag: NodeTombTag,
+    // 当前内存副本；驱逐后独立设为 None。
+    pub memory: Option<Arc<Allocation>>,
+    // 当前 SSD 副本；失败或驱逐后独立设为 None。
+    pub ssd: Option<KvSsdReplicaInfo>,
+}
+
+pub struct KvSsdReplicaInfo {
+    // SSD 中真实 payload 的长度。
+    pub len: u64,
 }
 
 pub struct InflightPutInfo {
@@ -106,7 +120,7 @@ pub struct InflightGetInfo {
 
 - `put_id`：当前实现里用于区分同一 key 不同版本的版本标识，形状是 `(put_time_ms, put_version)`，不是数学意义上的全局唯一 ID。
 - `lease_id`：这个版本是否绑定 lease。`None` 表示非 lease key，`Some(id)` 表示受 lease 管理。
-- `nodes_replicas`：该版本当前有哪些副本，每个副本对应哪个 node、哪块 allocation、当前 tomb 状态如何。
+- `node_replicas`：按 node 保存一份公共 tomb tag，并用 `memory` / `ssd` 两个 `Option` 独立记录两层副本。内存或 SSD 单独驱逐时只清理自己的字段；两个字段都为空时删除该 node entry。
 
 这意味着：
 

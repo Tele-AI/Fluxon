@@ -617,13 +617,13 @@ pub fn render_cluster(snapshot: &ClusterSnapshot) -> String {
                 ));
                 for d in &o.devices {
                     lines.push(format!(
-                        "|-- device: {} used={} cap={} util={}",
-                        d.device, d.used, d.cap, d.util
+                        "|-- resource={} device={} used={} cap={} util={}",
+                        d.resource_kind, d.device, d.used, d.cap, d.util
                     ));
                 }
             }
         }
-        push_box(&mut out, "Owner segment usage", &lines);
+        push_box(&mut out, "Owner storage usage", &lines);
         out.push('\n');
     }
 

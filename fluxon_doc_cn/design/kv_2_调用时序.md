@@ -35,8 +35,8 @@ pub struct OneKvNodesRoutes {
     pub put_id: PutIDForAKey,
     // 该版本是否绑定 lease。
     pub lease_id: Option<u64>,
-    // 该版本当前所有 live replica。
-    pub nodes_replicas: RwLock<HashMap<NodeID, KvRouteInfo>>,
+    // 按 owner 索引该版本的内存与 SSD 副本。
+    pub node_replicas: RwLock<HashMap<NodeID, KvNodeReplicas>>,
     ...
 }
 ```
@@ -126,8 +126,8 @@ pub struct OwnerHoldingGetInfo {
 pub struct OneKvNodesRoutes {
     pub put_id: PutIDForAKey,
     pub lease_id: Option<u64>,
-    // get_start 从这里挑选源副本。
-    pub nodes_replicas: RwLock<HashMap<NodeID, KvRouteInfo>>,
+    // get_start 先选 memory，再从同一快照选择 SSD。
+    pub node_replicas: RwLock<HashMap<NodeID, KvNodeReplicas>>,
     // 限制 DurableReplica 提升并发数。
     pub get_durable_slots_used: AtomicU32,
     ...
@@ -218,8 +218,8 @@ pub enum DeleteKeyInfo {
 
 pub struct OneKvNodesRoutes {
     pub put_id: PutIDForAKey,
-    // delete 后需要按旧路由枚举哪些节点仍有 replica / cache。
-    pub nodes_replicas: RwLock<HashMap<NodeID, KvRouteInfo>>,
+    // delete 后按旧路由枚举仍有内存 replica / cache 的节点。
+    pub node_replicas: RwLock<HashMap<NodeID, KvNodeReplicas>>,
     ...
 }
 ```

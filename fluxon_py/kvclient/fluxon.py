@@ -283,6 +283,10 @@ class FluxonMemHolder(MemHolder):
             return Result.new_error(res.unwrap_error())
         return Result.new_ok(res.unwrap())
 
+    def _benchmark_source_kind(self) -> str:
+        """Return the storage source selected for this benchmark GET."""
+        return str(self._inner_holder._benchmark_source_kind())
+
     # release() intentionally omitted for now.
 
 
@@ -370,11 +374,13 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             reject_if_inflight_same_key = (
                 bool(opts.reject_if_inflight_same_key) if opts is not None else False
             )
+            reject_if_exists = bool(opts.reject_if_exists) if opts is not None else False
             inner_res = self._client.put(
                 key,
                 ptrs,
                 lease_id=lease_id,
                 reject_if_inflight_same_key=reject_if_inflight_same_key,
+                reject_if_exists=reject_if_exists,
             )
             if not inner_res.is_ok():
                 err = inner_res.unwrap_error()
@@ -418,11 +424,13 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             reject_if_inflight_same_key = (
                 bool(opts.reject_if_inflight_same_key) if opts is not None else False
             )
+            reject_if_exists = bool(opts.reject_if_exists) if opts is not None else False
             inner_res = self._client.put_blocking(
                 key,
                 ptrs,
                 lease_id=lease_id,
                 reject_if_inflight_same_key=reject_if_inflight_same_key,
+                reject_if_exists=reject_if_exists,
             )
             if not inner_res.is_ok():
                 return Result.new_error(inner_res.unwrap_error())
@@ -471,11 +479,13 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             reject_if_inflight_same_key = (
                 bool(opts.reject_if_inflight_same_key) if opts is not None else False
             )
+            reject_if_exists = bool(opts.reject_if_exists) if opts is not None else False
             inner_res = self._client.put_blocking(
                 key,
                 ptrs,
                 lease_id=lease_id,
                 reject_if_inflight_same_key=reject_if_inflight_same_key,
+                reject_if_exists=reject_if_exists,
             )
             if not inner_res.is_ok():
                 return Result.new_error(inner_res.unwrap_error())

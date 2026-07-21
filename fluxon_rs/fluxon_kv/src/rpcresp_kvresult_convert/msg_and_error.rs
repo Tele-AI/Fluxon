@@ -35,6 +35,12 @@ pub enum MsgId {
     DeleteAckResp = 3024,
     BatchDeleteAckReq = 3029,
     BatchDeleteAckResp = 3030,
+    SsdReplicaCommitReq = 3031,
+    SsdReplicaCommitResp = 3032,
+    BatchSsdReplicaEvictReq = 3033,
+    BatchSsdReplicaEvictResp = 3034,
+    SsdStageBeginReq = 3035,
+    SsdStageBeginResp = 3036,
     GetMetaReq = 3019,
     GetMetaResp = 3020,
     BatchDeleteClientKvMetaCacheReq = 3021,
@@ -704,6 +710,9 @@ crate::define_err_group! {
         ,
         (122, KeyBeingWritten { key: String },
             msg: "Key is currently being written: key={key}")
+        ,
+        (123, KeyAlreadyExists { key: String },
+            msg: "Key already exists: key={key}")
     }
 }
 

@@ -280,6 +280,8 @@ pub struct PromSnapshotMaps {
 
     pub seg_capacity_bytes_by_node_device: HashMap<(String, String), f64>,
     pub seg_used_bytes_by_node_device: HashMap<(String, String), f64>,
+    pub kv_ssd_capacity_bytes_by_node_device: HashMap<(String, String), f64>,
+    pub kv_ssd_used_bytes_by_node_device: HashMap<(String, String), f64>,
 }
 
 impl PromSnapshotMaps {
@@ -323,6 +325,8 @@ impl PromSnapshotMaps {
             get_latency_p99_us: HashMap::new(),
             seg_capacity_bytes_by_node_device: HashMap::new(),
             seg_used_bytes_by_node_device: HashMap::new(),
+            kv_ssd_capacity_bytes_by_node_device: HashMap::new(),
+            kv_ssd_used_bytes_by_node_device: HashMap::new(),
         }
     }
 }
@@ -1401,6 +1405,25 @@ pub async fn collect_prom_snapshot(
             warnings,
             "seg_used_bytes_by_node_device",
             "kvcache_segment_used_bytes",
+        )
+        .await,
+    );
+
+    out.kv_ssd_capacity_bytes_by_node_device = take_node_device_metric(
+        &q(
+            prom,
+            warnings,
+            "kv_ssd_capacity_bytes_by_node_device",
+            fluxon_observability::keys::PROM_METRIC_KV_SSD_CAPACITY_BYTES,
+        )
+        .await,
+    );
+    out.kv_ssd_used_bytes_by_node_device = take_node_device_metric(
+        &q(
+            prom,
+            warnings,
+            "kv_ssd_used_bytes_by_node_device",
+            fluxon_observability::keys::PROM_METRIC_KV_SSD_USED_BYTES,
         )
         .await,
     );

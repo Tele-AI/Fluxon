@@ -20,6 +20,7 @@ use super::lease_backend_handle::{LeaseBackendHandle, LeaseBackendInner};
 use super::lease_backend_uid::{KvKeepaliveLease, LeaseBackendUid, LeaseRegisterKind, LeaseType};
 use super::lease_handle::{GeneralLease, LeaseEntry, LeaseEntryKind};
 use crate::auto_clean_map::{AutoCleanMap, AutoCleanMapEntry};
+use crate::etcd::{PooledEtcdClient, etcd_clients_pool};
 
 const INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES: usize = 5;
 const INITIAL_ETCD_KEEPALIVE_PROBE_TOTAL_BUDGET_MS: u64 = 60_000;
@@ -98,6 +99,7 @@ pub fn acquire_backend_handle(
     uid: LeaseBackendUid,
     kv_keepalive: Option<KvKeepaliveLease>,
     etcd_client: Option<Client>,
+    etcd_pool_entry: Option<PooledEtcdClient>,
     rt: tokio::runtime::Handle,
 ) -> LeaseBackendHandle {
     let entry: AutoCleanMapEntry<LeaseBackendUid, LeaseBackendInner> =
@@ -126,6 +128,8 @@ pub fn acquire_backend_handle(
                     .to_vec();
                 LeaseBackendInner::Etcd {
                     _endpoints: endpoints,
+                    _pool_entry: etcd_pool_entry
+                        .expect("etcd backend acquire requires pool entry on first creation"),
                     client,
                     states: AutoCleanMap::new(),
                     rt: rt.clone(),
@@ -189,6 +193,7 @@ pub(crate) fn actor_register_entry(
                     key.backend_uid().clone(),
                     Some(keepalive.clone()),
                     None,
+                    None,
                     rt.clone(),
                 );
                 LeaseEntry {
@@ -210,10 +215,16 @@ pub(crate) fn actor_register_entry(
         ActorRegisterInvocation::Etcd { client } => {
             let registry = &(**actor_guard).registry;
             let (entry, created) = registry.get_or_init_with(key.clone(), || {
+                let endpoints = key
+                    .backend_uid()
+                    .endpoints()
+                    .expect("etcd backend uid must carry endpoints")
+                    .to_vec();
                 let handle = acquire_backend_handle(
                     key.backend_uid().clone(),
                     None,
                     Some(client.clone()),
+                    Some(etcd_clients_pool().acquire(endpoints)),
                     rt.clone(),
                 );
                 let lid = key.lease_id();
@@ -338,10 +349,17 @@ pub async fn register_lease_for_keepalive(
                 let backend_handle = match acquire_existing_backend_handle(&backend_uid) {
                     Some(handle) => handle,
                     None => {
-                        let client = Client::connect(endpoints, None).await.with_context(|| {
+                        let pool_entry = etcd_clients_pool().acquire(endpoints.to_vec());
+                        let client = pool_entry.client().await.with_context(|| {
                             format!("failed to connect etcd for endpoints {:?}", endpoints)
                         })?;
-                        acquire_backend_handle(backend_uid.clone(), None, Some(client), rt.clone())
+                        acquire_backend_handle(
+                            backend_uid.clone(),
+                            None,
+                            Some(client),
+                            Some(pool_entry),
+                            rt.clone(),
+                        )
                     }
                 };
                 let client = backend_handle
@@ -651,6 +669,42 @@ mod tests {
 
             drop(validated);
             drop(regular);
+        });
+    }
+
+    #[test]
+    fn pooled_etcd_registration_exposes_parent_client_immediately() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let endpoints = vec![format!("http://127.0.0.1:{}", 10_000 + id % 50_000)];
+        let backend_uid = LeaseBackendUid::etcd_from(endpoints.clone());
+
+        rt.block_on(async {
+            let lease = register_lease_for_keepalive(
+                backend_uid.clone(),
+                120_000,
+                id,
+                LeaseRegisterKind::EtcdValidated,
+                rt.handle().clone(),
+            )
+            .await
+            .expect("caller-validated pooled etcd registration");
+
+            registered_etcd_client(&backend_uid)
+                .expect("MPMC subchannels must synchronously reuse the parent etcd client");
+
+            let expected_pool_entry = etcd_clients_pool().acquire(endpoints);
+            let backend_handle = acquire_existing_backend_handle(&backend_uid)
+                .expect("registered etcd backend handle");
+            match &*backend_handle.entry {
+                LeaseBackendInner::Etcd { _pool_entry, .. } => assert!(
+                    _pool_entry.shares_entry_with(&expected_pool_entry),
+                    "lease backend must retain the connected pool entry"
+                ),
+                LeaseBackendInner::KvClient { .. } => panic!("expected etcd backend"),
+            }
+
+            drop(lease);
         });
     }
 }

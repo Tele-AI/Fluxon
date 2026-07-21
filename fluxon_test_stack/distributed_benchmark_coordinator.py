@@ -39,7 +39,11 @@ try:
         canonicalize_kv_node_role,
     )
     from .benchmark_node_kv import (
+        BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX,
+        BENCHMARK_KEY_KV_GET_OUTPUT,
         merge_kv_benchmark_extras,
+        normalize_kv_cuda_device_index,
+        normalize_kv_get_output,
     )
     from .benchmark_node_rpc import (
         FLUXON_PHASE_PATH_BUCKET_FAST,
@@ -57,7 +61,11 @@ except ImportError:
         canonicalize_kv_node_role,
     )
     from benchmark_node_kv import (
+        BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX,
+        BENCHMARK_KEY_KV_GET_OUTPUT,
         merge_kv_benchmark_extras,
+        normalize_kv_cuda_device_index,
+        normalize_kv_get_output,
     )
     from benchmark_node_rpc import (
         FLUXON_PHASE_PATH_BUCKET_FAST,
@@ -282,6 +290,20 @@ def get_op_timeout_seconds(config_path: str) -> float:
     return op_timeout_seconds
 
 
+def get_kv_get_output(config_path: str) -> str:
+    benchmark_cfg = _load_benchmark_section(config_path)
+    return normalize_kv_get_output(
+        benchmark_cfg.get(BENCHMARK_KEY_KV_GET_OUTPUT)
+    ).value
+
+
+def get_kv_cuda_device_index(config_path: str) -> int:
+    benchmark_cfg = _load_benchmark_section(config_path)
+    return normalize_kv_cuda_device_index(
+        benchmark_cfg.get(BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX)
+    )
+
+
 def _parse_value_size_weighted_set(
     raw_val: Any,
     *,
@@ -366,6 +388,8 @@ VALUE_SIZE_SWEEP_LIST = get_benchmark_value_size_sweep_list(
     KVCACHE_CONFIG_PATH
 )
 OP_TIMEOUT_SECONDS = get_op_timeout_seconds(KVCACHE_CONFIG_PATH)
+KV_GET_OUTPUT = get_kv_get_output(KVCACHE_CONFIG_PATH)
+KV_CUDA_DEVICE_INDEX = get_kv_cuda_device_index(KVCACHE_CONFIG_PATH)
 print(
     f"ℹ️ 从配置加载 THREADS_PER_PROCESS={THREADS_PER_PROCESS}, MAX_BENCHMARK_SECONDS={MAX_BENCHMARK_SECONDS}, "
     f"METRIC_WARMUP_SECONDS={METRIC_WARMUP_SECONDS}, START_IDLE_SECONDS={START_IDLE_SECONDS}"
@@ -374,6 +398,8 @@ print(
     f"ℹ️ 从配置加载 value_size_list={VALUE_SIZE_SWEEP_LIST}"
 )
 print(f"ℹ️ 从配置加载 OP_TIMEOUT_SECONDS: {OP_TIMEOUT_SECONDS}")
+print(f"ℹ️ 从配置加载 KV_GET_OUTPUT: {KV_GET_OUTPUT}")
+print(f"ℹ️ 从配置加载 KV_CUDA_DEVICE_INDEX: {KV_CUDA_DEVICE_INDEX}")
 
 
 def get_consumer_sim_handle_ms_range(config_path: str) -> Optional[Tuple[int, int]]:
@@ -488,6 +514,8 @@ def _write_benchmark_result_file(all_summaries: List[Dict[str, Any]]) -> None:
         "value_size_weighted_set": VALUE_SIZE_WEIGHTED_SET,
         "max_benchmark_seconds": MAX_BENCHMARK_SECONDS,
         "metric_warmup_seconds": METRIC_WARMUP_SECONDS,
+        BENCHMARK_KEY_KV_GET_OUTPUT: KV_GET_OUTPUT,
+        BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX: KV_CUDA_DEVICE_INDEX,
         "runs": all_summaries,
     }
     out_p = Path(out_path)
@@ -703,6 +731,7 @@ class NodeMetrics:
     get_hit_operations: int
     get_miss_operations: int
     get_error_operations: int
+    get_source_summary: Dict[str, Any]
     avg_latency_us: float
     p50_latency_us: float
     p99_latency_us: float
@@ -1479,6 +1508,85 @@ def _aggregate_p2p_rpc_completion_summary(
     )
 
 
+def _aggregate_get_source_summary(results: List[NodeMetrics]) -> Dict[str, Any]:
+    """Aggregate per-node GET source observations without inventing attribution."""
+    memory_hits = 0
+    ssd_hits = 0
+    unknown_hits = 0
+    observed_hits = 0
+    complete_node_count = 0
+    observation_kinds: set[str] = set()
+
+    for result in results:
+        hit_count = max(0, int(result.get_hit_operations))
+        raw_summary = result.get_source_summary
+        if not isinstance(raw_summary, dict):
+            unknown_hits += hit_count
+            observed_hits += hit_count
+            observation_kinds.add("unavailable")
+            continue
+
+        raw_observation_kind = raw_summary.get("observation_kind")
+        observation_kind = (
+            str(raw_observation_kind).strip()
+            if isinstance(raw_observation_kind, str)
+            else ""
+        )
+        observation_kinds.add(observation_kind or "unavailable")
+
+        count_keys = (
+            "get_memory_hit_operations",
+            "get_ssd_hit_operations",
+            "get_unknown_source_operations",
+            "get_observed_hit_operations",
+        )
+        raw_counts = [raw_summary.get(key) for key in count_keys]
+        counts_are_valid = all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in raw_counts
+        )
+        if not counts_are_valid:
+            unknown_hits += hit_count
+            observed_hits += hit_count
+            continue
+
+        node_memory_hits, node_ssd_hits, node_unknown_hits, node_observed_hits = (
+            int(value) for value in raw_counts
+        )
+        counts_are_consistent = (
+            node_observed_hits == hit_count
+            and node_memory_hits + node_ssd_hits + node_unknown_hits
+            == node_observed_hits
+        )
+        if not counts_are_consistent:
+            unknown_hits += hit_count
+            observed_hits += hit_count
+            continue
+
+        memory_hits += node_memory_hits
+        ssd_hits += node_ssd_hits
+        unknown_hits += node_unknown_hits
+        observed_hits += node_observed_hits
+        if bool(raw_summary.get("complete")) and node_unknown_hits == 0:
+            complete_node_count += 1
+
+    node_count = len(results)
+    return {
+        "observation_kinds": sorted(observation_kinds),
+        "get_memory_hit_operations": memory_hits,
+        "get_ssd_hit_operations": ssd_hits,
+        "get_unknown_source_operations": unknown_hits,
+        "get_observed_hit_operations": observed_hits,
+        "complete": (
+            node_count > 0
+            and complete_node_count == node_count
+            and unknown_hits == 0
+        ),
+        "node_count": node_count,
+        "complete_node_count": complete_node_count,
+    }
+
+
 def _build_aggregated_bench_points(results: List[NodeMetrics]) -> Dict[str, Any]:
     total_ops = sum(r.total_operations for r in results)
     total_successful_ops = sum(r.successful_operations for r in results)
@@ -1519,6 +1627,7 @@ def _build_aggregated_bench_points(results: List[NodeMetrics]) -> Dict[str, Any]
         [(float(r.inflight_avg), int(r.total_operations)) for r in results]
     )
     inflight_max = max((int(r.inflight_max) for r in results), default=0)
+    get_source_summary = _aggregate_get_source_summary(results)
     return {
         "total_ops": total_ops,
         "total_successful_ops": total_successful_ops,
@@ -1527,6 +1636,7 @@ def _build_aggregated_bench_points(results: List[NodeMetrics]) -> Dict[str, Any]
         "get_hit_operations": get_hit_operations,
         "get_miss_operations": get_miss_operations,
         "get_error_operations": get_error_operations,
+        "get_source_summary": get_source_summary,
         "total_duration_seconds": total_duration,
         "throughput_ops_per_sec": throughput_ops_per_sec,
         "total_throughput_ops_per_sec": total_throughput_ops_per_sec,
@@ -2605,6 +2715,9 @@ class CoordinatorServer:
                 get_hit_operations=results_data.get("get_hit_operations", 0),
                 get_miss_operations=results_data.get("get_miss_operations", 0),
                 get_error_operations=results_data.get("get_error_operations", 0),
+                get_source_summary=copy.deepcopy(
+                    results_data.get("get_source_summary", {})
+                ),
                 avg_latency_us=results_data.get("avg_latency_us", 0.0),
                 p50_latency_us=results_data.get("p50_latency_us", 0.0),
                 p99_latency_us=results_data.get("p99_latency_us", 0.0),
@@ -2979,6 +3092,7 @@ class CoordinatorServer:
             get_hit_operations=0,
             get_miss_operations=0,
             get_error_operations=0,
+            get_source_summary={},
             avg_latency_us=0.0,
             p50_latency_us=0.0,
             p99_latency_us=0.0,
@@ -3201,6 +3315,16 @@ class CoordinatorServer:
                 "get_hit_operations": 0,
                 "get_miss_operations": 0,
                 "get_error_operations": 0,
+                "get_source_summary": {
+                    "observation_kinds": [],
+                    "get_memory_hit_operations": 0,
+                    "get_ssd_hit_operations": 0,
+                    "get_unknown_source_operations": 0,
+                    "get_observed_hit_operations": 0,
+                    "complete": False,
+                    "node_count": 0,
+                    "complete_node_count": 0,
+                },
                 "total_duration_seconds": 0.0,
                 "total_bytes": 0,
                 "overall_success_rate": 0.0,
@@ -3238,6 +3362,7 @@ class CoordinatorServer:
                 "get_hit_operations": int(overall["get_hit_operations"]),
                 "get_miss_operations": int(overall["get_miss_operations"]),
                 "get_error_operations": int(overall["get_error_operations"]),
+                "get_source_summary": copy.deepcopy(overall["get_source_summary"]),
                 "total_duration_seconds": float(overall["total_duration_seconds"]),
                 "throughput_ops_per_sec": float(overall["overall_tps"]),
                 "total_throughput_ops_per_sec": float(overall["overall_total_tps"]),
@@ -3775,6 +3900,7 @@ class CoordinatorServer:
             "get_hit_operations": int(bench_points["get_hit_operations"]),
             "get_miss_operations": int(bench_points["get_miss_operations"]),
             "get_error_operations": int(bench_points["get_error_operations"]),
+            "get_source_summary": copy.deepcopy(bench_points["get_source_summary"]),
             "total_duration_seconds": total_duration,
             "total_bytes": total_bytes,
             "overall_success_rate": overall_success_rate,
@@ -3823,6 +3949,7 @@ class CoordinatorServer:
                     "get_hit_operations": node.get_hit_operations,
                     "get_miss_operations": node.get_miss_operations,
                     "get_error_operations": node.get_error_operations,
+                    "get_source_summary": copy.deepcopy(node.get_source_summary),
                     "avg_latency_us": node.avg_latency_us,
                     "p50_latency_us": node.p50_latency_us,
                     "p95_latency_us": node.p95_latency_us,

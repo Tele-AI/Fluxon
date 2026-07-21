@@ -16,6 +16,7 @@ fastws_transport = ["fluxon_kv/fastws_transport"]
 sockudo_ws_transport = ["fluxon_kv/sockudo_ws_transport"]
 tcp_transport = ["fluxon_kv/tcp_transport"]
 tcp_thread_transport = ["fluxon_kv/tcp_thread_transport"]
+fluxon_fs_video_ffmpeg = []
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
@@ -47,3 +48,7 @@ fluxon_cli = { path = "../fluxon_cli" }
 fluxon_ops = { path = "../fluxon_ops" }
 fluxon_fs = { path = "../fluxon_fs" }
 fluxon_proxy = { path = "../fluxon_proxy" }
+
+[build-dependencies]
+cc = { workspace = true }
+pkg-config = "0.3"

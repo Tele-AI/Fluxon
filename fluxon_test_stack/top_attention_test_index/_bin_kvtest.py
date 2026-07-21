@@ -15,7 +15,13 @@ from _common import (
 
 TEST_REQUIREMENTS = ["cargo", "etcd", "ops", "submodules"]
 SCENE_ID = "ci_top_attention_bin_kvtest"
-KV_TEST_ROUND_NAMES = ("p2p_only", "rdma_transfer_only", "rdma_transfer_with_rpc")
+KV_TEST_ROUND_NAMES = (
+    "p2p_only",
+    "p2p_only_ssd",
+    "p2p_only_memory_ssd",
+    "rdma_transfer_only",
+    "rdma_transfer_with_rpc",
+)
 
 
 def _parse_kv_test_rounds(raw: object) -> str:

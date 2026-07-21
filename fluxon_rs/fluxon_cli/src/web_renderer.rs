@@ -3167,6 +3167,7 @@ mod tests {
                     test_member("ext-a", MemberRole::ExternalClient, false),
                 ],
                 segment_devices: Vec::new(),
+                storage_devices: Vec::new(),
             }],
             mq: None,
             total_put_rps: None,

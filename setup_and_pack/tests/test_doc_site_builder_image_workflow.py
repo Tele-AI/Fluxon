@@ -9,6 +9,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "doc-site-builder-image.yml"
 ALL_TEST_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "all_test.yml"
+ALL_TEST_SUITE_HELPER_PATH = REPO_ROOT / "scripts" / "ci_2_virt_node_workflow.py"
 DOCS_PAGES_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "docs-pages.yml"
 STANDALONE_LARGESCALE_MQ_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "largescale-mq.yml"
 
@@ -40,6 +41,7 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
 
     def test_main_testbed_workflow_builds_release_before_parallel_test_jobs(self) -> None:
         workflow_text = ALL_TEST_WORKFLOW_PATH.read_text(encoding="utf-8")
+        suite_helper_text = ALL_TEST_SUITE_HELPER_PATH.read_text(encoding="utf-8")
         workflow = yaml.load(workflow_text, Loader=yaml.BaseLoader)
         jobs = workflow["jobs"]
 
@@ -66,6 +68,14 @@ class DocSiteBuilderImageWorkflowTest(unittest.TestCase):
         self.assertIn("test-all failed or timed out before GitHub job cancellation", workflow_text)
         self.assertNotIn("large-scale MQ failed or timed out before GitHub job cancellation", workflow_text)
         self.assertIn("rather_no_git_submodule.py", workflow_text)
+        self.assertNotIn("Reclaim runner disk before CI", workflow_text)
+        self.assertNotIn("/usr/local/lib/android", workflow_text)
+        self.assertNotIn("/usr/share/dotnet", workflow_text)
+        self.assertIn("--cleanup-pack-runtime-after-success", workflow_text)
+        self.assertIn("--cleanup-successful-case-artifacts", workflow_text)
+        self.assertIn("if: ${{ failure() }}", workflow_text)
+        self.assertIn("ci_top_attention_cargo_kv_unit", suite_helper_text)
+        self.assertIn('"kv_test_rounds": "p2p_only,p2p_only_ssd"', suite_helper_text)
 
     def test_docs_pages_uses_container_entrypoint(self) -> None:
         workflow_text = DOCS_PAGES_WORKFLOW_PATH.read_text(encoding="utf-8")

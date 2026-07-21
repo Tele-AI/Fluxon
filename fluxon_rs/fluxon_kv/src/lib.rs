@@ -7,6 +7,10 @@ pub mod external_client_api;
 pub mod panel_proxy;
 // #[cfg(test)]
 pub mod key_prefix;
+pub mod kv_ssd_storage;
+#[cfg(test)]
+mod kv_ssd_storage2;
+mod kv_ssd_storage_foyer;
 #[cfg(feature = "test_bins")]
 pub mod kv_test;
 pub mod kvlease;
@@ -56,6 +60,7 @@ use crate::external_client_api::ExternalClientApiViewTrait;
 use crate::master_kv_router::MasterKvRouterAccessTrait;
 use crate::master_kv_router::MasterKvRouterView;
 use crate::master_kv_router::MasterKvRouterViewTrait;
+use crate::master_kv_router::msg_pack::GetSourceKind;
 use crate::master_lease_manager::MasterLeaseManager;
 use crate::master_lease_manager::master_lease_manager::MasterLeaseManagerNewArg;
 use crate::master_lease_manager::{
@@ -76,7 +81,9 @@ use clap::{Parser, Subcommand};
 use client_kv_api::ClientKvApiNewArg;
 use client_seg_pool::{ClientSegPool, ClientSegPoolNewArg};
 use client_transfer_engine::ClientTransferEngine;
-use cluster_manager::{ClusterManager, ClusterManagerNewArg, ClusterManagerRdmaControlInit};
+use cluster_manager::{
+    ClusterManager, ClusterManagerNewArg, ClusterManagerRdmaControlInit, META_KEY_KV_SSD_STORAGE,
+};
 use config::{
     ClientConfig, ClientConfigYaml, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig,
     MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole, TestSpecConfig,
@@ -194,6 +201,24 @@ pub enum KvGetResult {
     External(Option<Arc<ExtMemHolder>>),
 }
 
+/// Internal GET result that preserves the source selected for this operation.
+#[derive(Clone)]
+pub enum KvGetResultWithSource {
+    Owner(Option<(Arc<UserMemHolder>, GetSourceKind)>),
+    External(Option<(Arc<ExtMemHolder>, GetSourceKind)>),
+}
+
+impl KvGetResultWithSource {
+    fn without_source(self) -> KvGetResult {
+        match self {
+            Self::Owner(result) => KvGetResult::Owner(result.map(|(holder, _source_kind)| holder)),
+            Self::External(result) => {
+                KvGetResult::External(result.map(|(holder, _source_kind)| holder))
+            }
+        }
+    }
+}
+
 /// A thin trait on `Framework` to route KV ops by role.
 ///
 /// Rules:
@@ -236,8 +261,14 @@ pub trait KvClientTrait {
         opts: crate::client_kv_api::PutOptionalArgs,
     ) -> KvResult<()>;
 
-    /// Get by role; returns role-tagged holder
-    async fn kv_get(&self, key: &str) -> KvResult<KvGetResult>;
+    /// Get by role; returns role-tagged holder.
+    async fn kv_get(&self, key: &str) -> KvResult<KvGetResult> {
+        Ok(self.kv_get_with_source(key).await?.without_source())
+    }
+
+    /// Benchmark instrumentation path that also returns the selected storage source.
+    #[doc(hidden)]
+    async fn kv_get_with_source(&self, key: &str) -> KvResult<KvGetResultWithSource>;
 
     /// Delete by role
     async fn kv_delete(&self, key: &str) -> KvResult<()>;
@@ -342,15 +373,15 @@ impl KvClientTrait for Framework {
         }
     }
 
-    async fn kv_get(&self, key: &str) -> KvResult<KvGetResult> {
+    async fn kv_get_with_source(&self, key: &str) -> KvResult<KvGetResultWithSource> {
         if self.is_external_mode() {
             let r = self
                 .external_client_api_view()
                 .external_client_api()
                 .inner()
-                .get(key)
+                .get_with_source(key)
                 .await?;
-            Ok(KvGetResult::External(r))
+            Ok(KvGetResultWithSource::External(r))
         } else {
             let r = self
                 .client_kv_api_view()
@@ -358,7 +389,12 @@ impl KvClientTrait for Framework {
                 .inner()
                 .get(key)
                 .await?;
-            Ok(KvGetResult::Owner(r.map(|(h, _)| h)))
+            Ok(KvGetResultWithSource::Owner(r.map(|(holder, get_info)| {
+                let source_kind = get_info
+                    .map(|info| info.source_kind())
+                    .unwrap_or(GetSourceKind::Memory);
+                (holder, source_kind)
+            })))
         }
     }
 
@@ -788,6 +824,7 @@ fn build_side_transfer_worker_config(
         },
         share_mem_path: owner_config.share_mem_path.clone(),
         large_file_paths: owner_config.large_file_paths.clone(),
+        ssd_storage: None,
         test_spec_config,
     })
 }
@@ -832,6 +869,7 @@ fn build_side_transfer_worker_config_yaml(
             cluster_name: side_config.cluster_name,
             share_mem_path: side_config.share_mem_path,
             large_file_paths: None,
+            large_limit_size: None,
             p2p_listen_port: side_config.fluxonkv_spec.p2p_listen_port,
             redis_compat: None,
             sub_cluster: None,
@@ -1927,6 +1965,9 @@ async fn run_client_impl(
     if is_side_transfer_worker {
         metadata.insert("side_transfer_worker".to_string(), "true".to_string());
     }
+    if !is_external && !is_side_transfer_worker && config.ssd_storage.is_some() {
+        metadata.insert(META_KEY_KV_SSD_STORAGE.to_string(), "true".to_string());
+    }
 
     // Local IPC routing requires both share-group owner id and the local IPC root.
     // The owner id is also published via a dedicated share-group key; we denormalize it into
@@ -2023,6 +2064,33 @@ async fn run_client_impl(
         )
         .await?;
     } else {
+        let ssd_storage = if is_side_transfer_worker {
+            None
+        } else if let Some(ssd_cfg) = config.ssd_storage.as_ref() {
+            let root_limits = config
+                .large_file_paths
+                .kv_ssd_storage_root_limits(
+                    &config.cluster_name,
+                    &config.instance_key,
+                    &ssd_cfg.large_limit_size,
+                )
+                .map_err(|err| anyhow::anyhow!("invalid kv ssd storage dirs: {}", err))?;
+            Some(crate::kv_ssd_storage::KvSsdStorageInit {
+                root_limits: root_limits
+                    .into_iter()
+                    .map(
+                        |(root_dir, limit_bytes)| crate::kv_ssd_storage::KvSsdStorageRootLimit {
+                            root_dir,
+                            limit_bytes,
+                        },
+                    )
+                    .collect(),
+                uring_mode: config.test_spec_config.kv_ssd_uring_mode,
+                backend: config.test_spec_config.kv_ssd_storage_backend,
+            })
+        } else {
+            None
+        };
         let init_args = InitArgsOwner {
             cluster_manager_arg: ClusterManagerNewArg {
                 etcd_endpoints: config.fluxonkv_spec.etcd_addresses.clone(),
@@ -2055,6 +2123,7 @@ async fn run_client_impl(
             },
             client_kv_api_arg: ClientKvApiNewArg {
                 test_spec_config: config.test_spec_config.clone(),
+                ssd_storage,
             },
             client_seg_pool_arg: ClientSegPoolNewArg {
                 contribute_size: config.contribute_to_cluster_pool_size.clone(),
@@ -2489,6 +2558,7 @@ mod tests {
             large_file_paths: crate::config::LargeFilePaths {
                 paths: vec!["/tmp/fluxon_side_transfer_test_large".to_string()],
             },
+            ssd_storage: None,
             test_spec_config: TestSpecConfig {
                 enable_side_transfer: true,
                 side_transfer_worker_count: 4,
@@ -2794,6 +2864,7 @@ mod tests {
             },
             share_mem_path: share_mem_root.to_string_lossy().into_owned(),
             large_file_paths: crate::config::LargeFilePaths { paths: Vec::new() },
+            ssd_storage: None,
             test_spec_config: TestSpecConfig::default(),
         };
 
