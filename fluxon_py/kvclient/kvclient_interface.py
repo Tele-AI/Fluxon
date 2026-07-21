@@ -30,7 +30,8 @@ class GetStartResult:
     - ``keys`` is the caller-provided ordered page-key sequence.
     - ``raw_prefix_hit_len`` is the page-level continuous hit prefix.
     - ``transferable_len`` is rounded down to complete atomic groups and is the
-      only prefix that can be consumed by get_transfer().
+      maximum prefix that can be consumed by get_transfer(). A caller may
+      consume a shorter prefix only at an atomic-group boundary.
     """
 
     keys: Tuple[str, ...]
@@ -301,9 +302,12 @@ class KvClient(FactoryOnly):
         self,
         handle: GetStartHandle,
         concurrency: Optional[int] = None,
+        *,
+        consume_prefix_len: Optional[int] = None,
     ) -> int:
         _ = handle
         _ = concurrency
+        _ = consume_prefix_len
         raise NotImplementedError(
             "get_transfer is only implemented by backends with native prefix get support"
         )

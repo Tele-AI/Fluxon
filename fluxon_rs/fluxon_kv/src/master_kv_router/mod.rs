@@ -153,6 +153,29 @@ pub enum ReservedCapacityReason {
     LeaseBoundKv,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NodeCacheCapacityBoundaries {
+    ring_b_bytes: u64,
+    tier1_bytes: Option<u64>,
+}
+
+fn node_cache_capacity_boundaries(
+    node_space_size: u64,
+    replica_cache_capacity_ratio: f64,
+    replica_writeback_tier1_capacity_ratio: Option<f64>,
+    reserved_capacity_bytes: u64,
+) -> NodeCacheCapacityBoundaries {
+    let ring_b_base = (node_space_size as f64 * replica_cache_capacity_ratio).floor() as u64;
+    NodeCacheCapacityBoundaries {
+        ring_b_bytes: ring_b_base.saturating_sub(reserved_capacity_bytes),
+        // Tier1 contains only metadata and defines when pre-writeback starts.
+        // It is inclusive of owner residency, so physical ring-B reservations
+        // never reduce this logical policy window.
+        tier1_bytes: replica_writeback_tier1_capacity_ratio
+            .map(|ratio| (node_space_size as f64 * ratio).floor() as u64),
+    }
+}
+
 #[derive(Debug)]
 pub struct NodeCacheReservedCapacity {
     /// Exact node registration generation owning these counters.
@@ -375,6 +398,11 @@ pub struct InflightPutInfo {
 
 #[derive(Clone)]
 pub struct InflightReplicaTaskInfo {
+    /// Distinguishes repeated remote-copy attempts for the same `(key,
+    /// put_id)` generation.  A generation may lose its remote route and need
+    /// another append while the previous attempt's replayable terminal result
+    /// is still cached.
+    pub operation_id: u64,
     pub node_id: NodeID,
     /// Exact target registration generation that owns `target_allocation`.
     pub target_tomb_tag: NodeTombTag,
@@ -387,6 +415,11 @@ pub struct InflightReplicaTaskInfo {
     /// write-back and owner-hot exclusive demotion deliberately do not.
     pub protect_source_on_remote_complete: bool,
     pub(crate) _activity_lease: Arc<MasterKeyActivityLease>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompletedReplicaTaskInfo {
+    pub appended: bool,
 }
 
 /// Information about a `get` operation that is currently in progress.
@@ -515,6 +548,18 @@ pub(crate) struct MasterKeyActivitySnapshot {
     pub gets: u32,
     pub replicas: u32,
     pub reclaim_installed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MasterKeyActivityObserveSnapshot {
+    active_keys: u64,
+    put_keys: u64,
+    get_keys: u64,
+    replica_keys: u64,
+    reclaim_keys: u64,
+    inflight_puts: u64,
+    inflight_gets: u64,
+    inflight_replicas: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -748,6 +793,26 @@ impl MasterKeyActivityTable {
                 state.puts == 0 && state.gets == 0 && state.replicas == 0 && state.reclaim.is_none()
             }
         }
+    }
+
+    fn observe_snapshot(&self) -> MasterKeyActivityObserveSnapshot {
+        let states = self.states.lock();
+        let mut snapshot = MasterKeyActivityObserveSnapshot {
+            active_keys: u64::try_from(states.len()).unwrap_or(u64::MAX),
+            ..Default::default()
+        };
+        for state in states.values() {
+            snapshot.put_keys += u64::from(state.puts != 0);
+            snapshot.get_keys += u64::from(state.gets != 0);
+            snapshot.replica_keys += u64::from(state.replicas != 0);
+            snapshot.reclaim_keys += u64::from(state.reclaim.is_some());
+            snapshot.inflight_puts = snapshot.inflight_puts.saturating_add(u64::from(state.puts));
+            snapshot.inflight_gets = snapshot.inflight_gets.saturating_add(u64::from(state.gets));
+            snapshot.inflight_replicas = snapshot
+                .inflight_replicas
+                .saturating_add(u64::from(state.replicas));
+        }
+        snapshot
     }
 
     pub(crate) fn reclaim_matches(&self, item: &OwnerReclaimItem) -> bool {
@@ -1473,6 +1538,61 @@ mod tests {
     }
 
     #[test]
+    fn master_key_activity_observe_snapshot_counts_keys_and_leases() {
+        let table = Arc::new(MasterKeyActivityTable::default());
+        let put = table
+            .reserve("shared", MasterKeyActivityKind::Put, false)
+            .expect("put activity must be admitted");
+        let get_a = table
+            .reserve("shared", MasterKeyActivityKind::Get, false)
+            .expect("first get activity must be admitted");
+        let get_b = table
+            .reserve("shared", MasterKeyActivityKind::Get, false)
+            .expect("second get activity must be admitted");
+        let replica = table
+            .reserve("replica", MasterKeyActivityKind::Replica, false)
+            .expect("replica activity must be admitted");
+        let reclaim = OwnerReclaimItem {
+            key: "reclaim".to_string(),
+            put_id: (9, 1),
+            epoch: 17,
+            backing: OwnerReclaimBacking::CommittedSlot {
+                grant_id: 19,
+                slot_index: 23,
+                slot_size: 8 * 1024 * 1024,
+            },
+            reason: OwnerReclaimReason::OwnerCapacityEviction,
+        };
+        table
+            .try_install_reclaim(&reclaim)
+            .expect("idle key must accept reclaim fence");
+
+        assert_eq!(
+            table.observe_snapshot(),
+            MasterKeyActivityObserveSnapshot {
+                active_keys: 3,
+                put_keys: 1,
+                get_keys: 1,
+                replica_keys: 1,
+                reclaim_keys: 1,
+                inflight_puts: 1,
+                inflight_gets: 2,
+                inflight_replicas: 1,
+            }
+        );
+
+        drop(put);
+        drop(get_a);
+        drop(get_b);
+        drop(replica);
+        assert!(table.clear_reclaim(&reclaim));
+        assert_eq!(
+            table.observe_snapshot(),
+            MasterKeyActivityObserveSnapshot::default()
+        );
+    }
+
+    #[test]
     fn explicit_activity_completion_is_idempotent_with_retired_cache_clones() {
         let table = Arc::new(MasterKeyActivityTable::default());
         let lease = table
@@ -1487,6 +1607,35 @@ mod tests {
         drop(lease);
         drop(retired_cache_clone);
         assert!(table.is_quiescent("retired-clone"));
+    }
+
+    #[test]
+    fn replica_terminal_result_is_scoped_to_one_append_attempt() {
+        let terminals = moka::sync::Cache::builder()
+            .time_to_live(Duration::from_secs(120))
+            .build();
+        let key = "same-kv-generation".to_string();
+        let put_id = (17, 3);
+        let first_operation_id = 41;
+        let second_operation_id = 42;
+
+        terminals.insert(
+            (key.clone(), put_id.0, put_id.1, first_operation_id),
+            CompletedReplicaTaskInfo { appended: true },
+        );
+
+        assert!(
+            terminals
+                .get(&(key.clone(), put_id.0, put_id.1, first_operation_id))
+                .is_some(),
+            "a retry of the same append attempt must replay its terminal result"
+        );
+        assert!(
+            terminals
+                .get(&(key, put_id.0, put_id.1, second_operation_id))
+                .is_none(),
+            "an old terminal result must not complete a later remote-copy attempt"
+        );
     }
 
     fn test_route_info_with_tag(node_id: &str, tomb_tag: NodeTombTag) -> KvRouteInfo {
@@ -1828,6 +1977,17 @@ mod tests {
     }
 
     #[test]
+    fn tier1_capacity_is_independent_of_ring_b_reservations() {
+        let node_space_size = 128 * 1024 * 1024 * 1024;
+        let boundaries =
+            node_cache_capacity_boundaries(node_space_size, 0.95, Some(0.75), 124_554_051_584);
+
+        assert_eq!(boundaries.ring_b_bytes, 6_012_954_214);
+        assert_eq!(boundaries.tier1_bytes, Some(96 * 1024 * 1024 * 1024));
+        assert!(boundaries.tier1_bytes.unwrap() > boundaries.ring_b_bytes);
+    }
+
+    #[test]
     fn delayed_member_left_is_not_forwarded_to_a_live_generation_actor() {
         assert!(member_left_can_forward_to_registration_actor(None));
         assert!(!member_left_can_forward_to_registration_actor(Some(17)));
@@ -2097,6 +2257,14 @@ pub struct MasterKvRouterInner {
     /// (key, put_time_ms, put_version) -> inflight_put_info
     pub inflight_puts: moka::future::Cache<(String, u64, u32), InflightPutInfo>,
     pub inflight_replica_tasks: moka::future::Cache<(String, u64, u32), InflightReplicaTaskInfo>,
+    /// Idempotent terminal PutAppendDone results retained across response
+    /// loss and batch-to-individual fallback.
+    pub completed_replica_tasks:
+        moka::future::Cache<(String, u64, u32, u64), CompletedReplicaTaskInfo>,
+    /// Serializes Start/Done/Revoke for one replica operation identity. The
+    /// lock is per `(key, put_id)`, so unrelated remote writes never share a
+    /// queue or actor.
+    pub replica_operation_locks: AMapLock<(String, u64, u32)>,
     pub inflight_gets: moka::future::Cache<u64, InflightGetInfo>,
     /// Idempotent terminal GetDone results retained across response loss/retry.
     pub completed_gets: moka::future::Cache<u64, CompletedGetInfo>,
@@ -2118,6 +2286,11 @@ pub struct MasterKvRouterInner {
 
     /// Counter for prepared put-key reservation identifiers.
     pub next_prepared_put_key_reservation_id: AtomicU64,
+
+    /// Counter for concrete replica append attempts.  This is separate from
+    /// `put_id`: one KV generation may legitimately be copied remotely again
+    /// after its previous remote route is reclaimed.
+    pub next_replica_operation_id: AtomicU64,
 
     /// Counter for two-sided owner reclaim epochs.
     pub next_owner_reclaim_epoch: AtomicU64,
@@ -2180,6 +2353,9 @@ pub struct MasterKvRouterInner {
 
     /// Historical accepted replica task reservations by target node.
     pub replica_task_target_counts: DashMap<NodeIDString, Arc<AtomicU64>>,
+    /// PutAppendDone responses served from the terminal cache after an RPC
+    /// replay or batch fallback.
+    pub replica_done_terminal_replay_count: AtomicU64,
 
     /// Historical get source choices by requester->source pair.
     pub get_requester_source_counts: DashMap<RequesterTargetPair, Arc<AtomicU64>>,
@@ -2319,6 +2495,9 @@ impl MasterKvRouter {
                 }
             })
             .build();
+        let completed_replica_tasks = moka::future::Cache::builder()
+            .time_to_live(Duration::from_secs(120))
+            .build();
         // A synchronous Moka listener must perform only constant-size metadata
         // work and must never block or drop an Allocation reclaim event.  The
         // versioned inflight set deduplicates this unbounded channel.
@@ -2336,6 +2515,8 @@ impl MasterKvRouter {
             replica_writeback_tier1_capacity_ratio: arg.replica_writeback_tier1_capacity_ratio,
             inflight_puts,
             inflight_replica_tasks,
+            completed_replica_tasks,
+            replica_operation_locks: AMapLock::new(Duration::from_secs(10 * 60)),
             inflight_gets,
             completed_gets,
             get_done_locks: AMapLock::new(Duration::from_secs(10 * 60)),
@@ -2346,6 +2527,7 @@ impl MasterKvRouter {
             next_holder_id: AtomicU64::new(0),
             next_local_reserve_grant_id: AtomicU64::new(1),
             next_prepared_put_key_reservation_id: AtomicU64::new(1),
+            next_replica_operation_id: AtomicU64::new(1),
             next_owner_reclaim_epoch: AtomicU64::new(1),
             kv_routes: DashMap::new(),
             put_atomic_groups: moka::sync::SegmentedCache::builder(8)
@@ -2366,6 +2548,7 @@ impl MasterKvRouter {
             put_requester_target_decision_counts: DashMap::new(),
             put_placement_mode_counts: DashMap::new(),
             replica_task_target_counts: DashMap::new(),
+            replica_done_terminal_replay_count: AtomicU64::new(0),
             get_requester_source_counts: DashMap::new(),
             get_requester_source_bytes: DashMap::new(),
             get_allocation_mode_counts: DashMap::new(),
@@ -2440,7 +2623,13 @@ impl MasterKvRouter {
     }
 
     fn replica_cache_base_capacity(&self, node_space_size: u64) -> u64 {
-        (node_space_size as f64 * self.inner().replica_cache_capacity_ratio).floor() as u64
+        node_cache_capacity_boundaries(
+            node_space_size,
+            self.inner().replica_cache_capacity_ratio,
+            self.inner().replica_writeback_tier1_capacity_ratio,
+            0,
+        )
+        .ring_b_bytes
     }
 
     fn replica_cache_effective_capacity(&self, node_id: &str, node_space_size: u64) -> u64 {
@@ -2451,13 +2640,19 @@ impl MasterKvRouter {
             .filter(|reserved| !reserved.generation.is_tomb())
             .map(|reserved| reserved.total_reserved_bytes())
             .unwrap_or(0);
-        self.replica_cache_base_capacity(node_space_size)
-            .saturating_sub(reserved_capacity)
+        node_cache_capacity_boundaries(
+            node_space_size,
+            self.inner().replica_cache_capacity_ratio,
+            self.inner().replica_writeback_tier1_capacity_ratio,
+            reserved_capacity,
+        )
+        .ring_b_bytes
     }
 
-    /// Refresh an already-created node controller after segment metadata or
-    /// reservation inputs change. The boundary is derived only from physical
-    /// node space and generation-scoped reservations, never placement roles.
+    /// Refresh already-created node controllers after segment metadata or
+    /// reservation inputs change. Generation-scoped reservations reduce only
+    /// the physical ring-B allocation boundary. Tier1 is an inclusive metadata
+    /// policy window and always remains ratio-derived from the owner segment.
     fn reconcile_node_cache_capacity(&self, node_id: &str) {
         let node_space_size = self
             .inner()
@@ -2489,8 +2684,7 @@ impl MasterKvRouter {
         {
             let tier1_capacity = self
                 .writeback_tier1_base_capacity(node_space_size)
-                .unwrap_or(0)
-                .min(capacity);
+                .unwrap_or(0);
             if let Err(err) = cache.set_max_capacity(tier1_capacity) {
                 error!(
                     "failed to refresh tier1 cache capacity: node={} capacity={} err={}",
@@ -2501,9 +2695,13 @@ impl MasterKvRouter {
     }
 
     fn writeback_tier1_base_capacity(&self, node_space_size: u64) -> Option<u64> {
-        self.inner()
-            .replica_writeback_tier1_capacity_ratio
-            .map(|ratio| (node_space_size as f64 * ratio).floor() as u64)
+        node_cache_capacity_boundaries(
+            node_space_size,
+            self.inner().replica_cache_capacity_ratio,
+            self.inner().replica_writeback_tier1_capacity_ratio,
+            0,
+        )
+        .tier1_bytes
     }
 
     pub fn tiered_writeback_enabled(&self) -> bool {
@@ -4363,6 +4561,10 @@ impl MasterKvRouter {
                             .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
                             .collect();
                         replica_task_target_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                        let replica_done_terminal_replays = router
+                            .inner()
+                            .replica_done_terminal_replay_count
+                            .load(Ordering::Relaxed);
 
                         let mut get_source_counts: Vec<(String, u64)> = router
                             .inner()
@@ -4389,11 +4591,12 @@ impl MasterKvRouter {
                         get_allocation_mode_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
                         info!(
-                            "placement historical distribution | put_target_counts={:?} | put_mode_counts={:?} | put_requester_target_counts={:?} | replica_task_target_counts={:?} | get_requester_source_counts={:?} | get_requester_source_bytes={:?} | get_allocation_mode_counts={:?}",
+                            "placement historical distribution | put_target_counts={:?} | put_mode_counts={:?} | put_requester_target_counts={:?} | replica_task_target_counts={:?} | replica_done_terminal_replays={} | get_requester_source_counts={:?} | get_requester_source_bytes={:?} | get_allocation_mode_counts={:?}",
                             target_counts,
                             mode_counts,
                             requester_target_counts,
                             replica_task_target_counts,
+                            replica_done_terminal_replays,
                             get_source_counts,
                             get_source_bytes,
                             get_allocation_mode_counts,
@@ -4738,8 +4941,13 @@ impl MasterKvRouter {
                 ),
             );
         }
-        let base_capacity = self.replica_cache_base_capacity(node_space_size);
-        let new_capacity = base_capacity.saturating_sub(reserved_total);
+        let boundaries = node_cache_capacity_boundaries(
+            node_space_size,
+            self.inner().replica_cache_capacity_ratio,
+            self.inner().replica_writeback_tier1_capacity_ratio,
+            reserved_total,
+        );
+        let new_capacity = boundaries.ring_b_bytes;
 
         if let Some(cache) = self.get_node_cache_controller(node_id) {
             if let Some(tier1_cache) = self
@@ -4748,10 +4956,10 @@ impl MasterKvRouter {
                 .get(node_id)
                 .map(|entry| entry.value().clone())
             {
-                let tier1_capacity = self
-                    .writeback_tier1_base_capacity(node_space_size)
-                    .unwrap_or(0)
-                    .min(new_capacity);
+                // Local-reserve and owner-indexed reservations consume the
+                // physical ring-B allocation domain. They must not collapse
+                // the independent inclusive tier1 metadata window.
+                let tier1_capacity = boundaries.tier1_bytes.unwrap_or(0);
                 if let Err(e) = tier1_cache.set_max_capacity(tier1_capacity) {
                     if delta_bytes >= 0 {
                         reserved_capacity.apply_delta(reason, -delta_bytes);
@@ -5079,6 +5287,11 @@ impl MasterKvRouter {
                     _ = shutdown_waiter.wait() => break,
                     _ = interval.tick() => {
                         let snapshot = view_task.master_kv_router().runtime_observe_snapshot();
+                        let activity = view_task
+                            .master_kv_router()
+                            .inner()
+                            .key_activity
+                            .observe_snapshot();
                         let metrics = view_task.metric_reporter().metrics();
                         metrics.set_kv_holding_entries(
                             "master_get_holding",
@@ -5092,6 +5305,17 @@ impl MasterKvRouter {
                             "master get holding runtime: entries={} bytes={}",
                             snapshot.get_holding_entries,
                             snapshot.get_holding_bytes
+                        );
+                        tracing::info!(
+                            active_keys = activity.active_keys,
+                            put_keys = activity.put_keys,
+                            get_keys = activity.get_keys,
+                            replica_keys = activity.replica_keys,
+                            reclaim_keys = activity.reclaim_keys,
+                            inflight_puts = activity.inflight_puts,
+                            inflight_gets = activity.inflight_gets,
+                            inflight_replicas = activity.inflight_replicas,
+                            "master key activity runtime"
                         );
                         for node in snapshot.replica_cache_nodes {
                             tracing::info!(

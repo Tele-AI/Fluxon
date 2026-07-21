@@ -3,10 +3,10 @@ use super::msg_and_error::{
     ApiError, ConfigError, ErrorCode, KvError, KvResult, SharedMemError, UnreachableError,
 };
 use crate::client_kv_api::msg_pack::{
-    ExternalBatchGetCancelResp, ExternalBatchGetItemResp, ExternalBatchGetResp,
-    ExternalBatchGetStartResp, ExternalBatchGetTransferResp, ExternalBatchIsExistResp,
-    ExternalBatchPutCommitItemResp, ExternalBatchPutCommitResp, ExternalBatchPutStartItemResp,
-    ExternalBatchPutStartResp, ExternalBatchPutTransferEndItemResp,
+    ExternalBatchDeleteAckResp, ExternalBatchGetCancelResp, ExternalBatchGetItemResp,
+    ExternalBatchGetResp, ExternalBatchGetStartResp, ExternalBatchGetTransferResp,
+    ExternalBatchIsExistResp, ExternalBatchPutCommitItemResp, ExternalBatchPutCommitResp,
+    ExternalBatchPutStartItemResp, ExternalBatchPutStartResp, ExternalBatchPutTransferEndItemResp,
     ExternalBatchPutTransferEndResp, ExternalDeleteAckResp, ExternalDeleteResp, ExternalGetResp,
     ExternalIsExistResp, ExternalObservabilitySnapshotResp, ExternalPutCommitResp,
     ExternalPutRevokeResp, ExternalPutStartResp, ExternalPutTransferEndResp,
@@ -148,6 +148,17 @@ impl ToResult for ExternalDeleteAckResp {
             return Ok(());
         }
         Err(KvError::from_json(self.error_code, &self.error_json))
+    }
+}
+
+impl ToResult for ExternalBatchDeleteAckResp {
+    type Ok = ExternalBatchDeleteAckResp;
+    fn to_result(self) -> KvResult<Self::Ok> {
+        if self.error_code == OK {
+            Ok(self)
+        } else {
+            Err(KvError::from_json(self.error_code, &self.error_json))
+        }
     }
 }
 
@@ -382,6 +393,16 @@ impl FromError for ExternalObservabilitySnapshotResp {
     }
 }
 impl FromError for ExternalDeleteAckResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for ExternalBatchDeleteAckResp {
     fn from_error(e: &KvError) -> Self {
         let code = e.code();
         Self {

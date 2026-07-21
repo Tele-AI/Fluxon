@@ -20,8 +20,6 @@ use std::collections::HashSet;
 use std::hash::Hash;
 use std::time::Duration;
 
-const EXTERNAL_DELETE_ACK_TIMEOUT_SECS: u64 = 5;
-
 pub type OwnerDeleteAckItem = DeleteAckItem;
 
 /// Spawn an async task only if the framework/view is still running.
@@ -128,7 +126,6 @@ impl MemholderDropAck for OwnerDeleteAckCtx {
 
 pub struct ExternalDeleteAckCtx {
     pub view: ExternalClientApiView,
-    pub key: String,
     pub external_client_id: String,
     pub holder_id: u64,
     pub started_time: i64,
@@ -148,75 +145,25 @@ impl MemholderDropAck for ExternalDeleteAckCtx {
     }
     fn ack_future(
         &self,
-        guard: Self::Guard,
+        _guard: Self::Guard,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let v = self.view.clone();
-        let key = self.key.clone();
-        let external_client_id = self.external_client_id.clone();
-        let holder_id = self.holder_id;
-        let started_time = self.started_time;
-        Box::pin(async move {
-            let _keep = guard;
-            // Best-effort drop ACK must not outlive framework shutdown.
-            // During step8 teardown, the owner/external peers can already be concurrently exiting,
-            // and the ACK RPC can otherwise stall long enough to block task_registry shutdown.
-            match tokio::time::timeout(
-                Duration::from_secs(EXTERNAL_DELETE_ACK_TIMEOUT_SECS),
-                v.external_client_api().inner().send_external_delete_ack(
-                    &key,
-                    &external_client_id,
-                    holder_id,
-                    started_time,
-                ),
-            )
-            .await
-            {
-                Err(_) => {
-                    tracing::warn!(
-                        "Timed out sending external_delete_ack for key={}, holder_id={}, external_client_id={} after {}s",
-                        key,
-                        holder_id,
-                        external_client_id,
-                        EXTERNAL_DELETE_ACK_TIMEOUT_SECS
-                    );
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        "Failed to send external_delete_ack for key={}, holder_id={}, external_client_id={}: {}",
-                        key,
-                        holder_id,
-                        external_client_id,
-                        e
-                    );
-                }
-                Ok(Ok(())) => {
-                    tracing::debug!(
-                        "Successfully sent external_delete_ack for key={}, holder_id={}, external_client_id={}",
-                        key,
-                        holder_id,
-                        external_client_id
-                    );
-                }
-            }
-        })
+        Box::pin(async { unreachable!("external holder ACKs are enqueued synchronously") })
     }
     fn on_view_dropped(&self) {
         tracing::warn!(
-            "ExternalClientApiView has been dropped, cannot send external_delete_ack for key='{}', holder_id {}.",
-            self.key,
+            "ExternalClientApiView has been dropped, cannot enqueue external_delete_ack for holder_id {}.",
             self.holder_id
         );
     }
     fn on_skip_shutdown(&self) {
         tracing::info!(
-            "Skipping external_delete_ack for key={}, holder_id={} due to shutdown",
-            self.key,
+            "Skipping external_delete_ack for holder_id={} due to shutdown",
             self.holder_id
         );
     }
     fn run_drop_ack(&self) {
         let v = self.view().clone();
-        let Some(g) = <Self as MemholderDropAck>::try_upgrade(&v) else {
+        let Some(_guard) = <Self as MemholderDropAck>::try_upgrade(&v) else {
             self.on_view_dropped();
             return;
         };
@@ -224,8 +171,18 @@ impl MemholderDropAck for ExternalDeleteAckCtx {
             self.on_skip_shutdown();
             return;
         }
-        let fut = self.ack_future(g);
-        let _ = v.spawn("memholder_drop_ack_external", async move { fut.await });
+        if let Err(err) = v.external_client_api().inner().enqueue_external_delete_ack(
+            self.external_client_id.clone(),
+            self.holder_id,
+            self.started_time,
+        ) {
+            tracing::warn!(
+                holder_id = self.holder_id,
+                external_client_id = %self.external_client_id,
+                error = %err,
+                "failed to enqueue external holder ACK"
+            );
+        }
     }
 }
 

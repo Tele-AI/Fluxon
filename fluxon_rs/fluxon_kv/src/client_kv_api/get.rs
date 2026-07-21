@@ -256,6 +256,8 @@ impl ClientKvApiInner {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        let lifecycle_started_at = Instant::now();
+        let lifecycle_requested_keys = keys.len();
 
         #[derive(Clone)]
         struct DonePending {
@@ -279,6 +281,11 @@ impl ClientKvApiInner {
         let mut done_pending = Vec::new();
         let mut transfer_error_cleanup = Vec::new();
         let mut transfer_futures = Vec::new();
+        let mut lifecycle_zero_copy_items = 0usize;
+        let mut lifecycle_transfer_items = 0usize;
+        let mut lifecycle_remote_transfer_items = 0usize;
+        let mut lifecycle_transfer_bytes = 0u64;
+        let mut lifecycle_remote_transfer_bytes = 0u64;
 
         for (idx, (key, start_item)) in keys.into_iter().zip(start_items.into_iter()).enumerate() {
             if start_item.error_code == codes_api::API_KEY_NOT_FOUND {
@@ -311,6 +318,7 @@ impl ClientKvApiInner {
             let len = start_item.len;
 
             if peer_id.is_none() && src_addr == target_addr {
+                lifecycle_zero_copy_items = lifecycle_zero_copy_items.saturating_add(1);
                 done_pending.push(DonePending {
                     idx,
                     key,
@@ -320,6 +328,14 @@ impl ClientKvApiInner {
                     prepared_memory_info: None,
                 });
                 continue;
+            }
+
+            lifecycle_transfer_items = lifecycle_transfer_items.saturating_add(1);
+            lifecycle_transfer_bytes = lifecycle_transfer_bytes.saturating_add(len);
+            if peer_is_remote {
+                lifecycle_remote_transfer_items = lifecycle_remote_transfer_items.saturating_add(1);
+                lifecycle_remote_transfer_bytes =
+                    lifecycle_remote_transfer_bytes.saturating_add(len);
             }
 
             transfer_futures.push(async move {
@@ -353,11 +369,22 @@ impl ClientKvApiInner {
             });
         }
 
+        let lifecycle_plan_us = lifecycle_started_at
+            .elapsed()
+            .as_micros()
+            .min(i64::MAX as u128) as i64;
+        let transfer_wall_started_at = Instant::now();
+        let mut lifecycle_transfer_sum_us = 0u64;
+        let mut lifecycle_transfer_max_us = 0u64;
         let mut transfer_stream =
             stream::iter(transfer_futures).buffer_unordered(transfer_concurrency);
         while let Some(joined) = transfer_stream.next().await {
             match joined {
                 (idx, key, start_item, peer_is_remote, _get_id, transfer_us, Ok(_breakdown)) => {
+                    let transfer_us_u64 = transfer_us.max(0) as u64;
+                    lifecycle_transfer_sum_us =
+                        lifecycle_transfer_sum_us.saturating_add(transfer_us_u64);
+                    lifecycle_transfer_max_us = lifecycle_transfer_max_us.max(transfer_us_u64);
                     done_pending.push(DonePending {
                         idx,
                         key,
@@ -376,14 +403,24 @@ impl ClientKvApiInner {
                 }
             }
         }
+        let lifecycle_transfer_wall_us = transfer_wall_started_at
+            .elapsed()
+            .as_micros()
+            .min(i64::MAX as u128) as i64;
 
+        let transfer_cleanup_started_at = Instant::now();
         finish_started_get_revoke_cleanup(
             self,
             transfer_error_cleanup,
             "batch_get transfer failure",
         )
         .await;
+        let lifecycle_transfer_cleanup_us = transfer_cleanup_started_at
+            .elapsed()
+            .as_micros()
+            .min(i64::MAX as u128) as i64;
 
+        let install_started_at = Instant::now();
         let mut ready_done_pending = Vec::with_capacity(done_pending.len());
         let mut install_failed_cleanup = Vec::new();
         for mut pending in done_pending {
@@ -434,14 +471,20 @@ impl ClientKvApiInner {
             "batch_get pending install failure",
         )
         .await;
+        let lifecycle_install_us = install_started_at
+            .elapsed()
+            .as_micros()
+            .min(i64::MAX as u128) as i64;
 
         let done_get_ids = done_pending
             .iter()
             .map(|pending| pending.start_item.get_id)
             .collect::<Vec<_>>();
+        let lifecycle_done_items = done_get_ids.len();
         let done_first_get_id = done_get_ids.first().copied();
         let done_last_get_id = done_get_ids.last().copied();
         let mut done_attempt = 1u32;
+        let done_started_at = Instant::now();
         let done_resp = loop {
             match self.batch_get_done(done_get_ids.clone()).await {
                 Ok(resp) if batch_get_done_response_matches(&done_get_ids, &resp) => break resp,
@@ -477,6 +520,8 @@ impl ClientKvApiInner {
             .await;
             done_attempt = done_attempt.saturating_add(1);
         };
+        let lifecycle_done_us = done_started_at.elapsed().as_micros().min(i64::MAX as u128) as i64;
+        let publish_started_at = Instant::now();
         let master_node_id: NodeID = self
             .view
             .cluster_manager()
@@ -622,11 +667,12 @@ impl ClientKvApiInner {
 
         // Publish every local index before Moka admission starts selecting
         // individual capacity victims.
+        let lifecycle_local_hot_admissions = local_hot_admissions.len();
         for (key, put_id, memory_info, _atomic_group) in local_hot_admissions {
             self.owner_hot_track_committed(&key, put_id, &memory_info);
         }
 
-        Ok(results
+        let output = results
             .into_iter()
             .map(|item| {
                 item.unwrap_or_else(|| {
@@ -636,7 +682,50 @@ impl ClientKvApiInner {
                     }))
                 })
             })
-            .collect())
+            .collect::<Vec<_>>();
+        let lifecycle_hits = output
+            .iter()
+            .filter(|item| matches!(item, Ok(Some(_))))
+            .count();
+        let lifecycle_misses = output
+            .iter()
+            .filter(|item| matches!(item, Ok(None)))
+            .count();
+        let lifecycle_errors = output.iter().filter(|item| matches!(item, Err(_))).count();
+        let lifecycle_publish_us = publish_started_at
+            .elapsed()
+            .as_micros()
+            .min(i64::MAX as u128) as i64;
+        let lifecycle_total_us = lifecycle_started_at
+            .elapsed()
+            .as_micros()
+            .min(i64::MAX as u128) as i64;
+        tracing::info!(
+            "external Get finish lifecycle: requested={} transfer_concurrency={} zero_copy_items={} transfer_items={} remote_transfer_items={} transfer_bytes={} remote_transfer_bytes={} plan_us={} transfer_wall_us={} transfer_sum_us={} transfer_max_us={} transfer_cleanup_us={} install_us={} done_items={} done_attempts={} done_us={} local_hot_admissions={} publish_us={} hits={} misses={} errors={} total_us={}",
+            lifecycle_requested_keys,
+            transfer_concurrency,
+            lifecycle_zero_copy_items,
+            lifecycle_transfer_items,
+            lifecycle_remote_transfer_items,
+            lifecycle_transfer_bytes,
+            lifecycle_remote_transfer_bytes,
+            lifecycle_plan_us,
+            lifecycle_transfer_wall_us,
+            lifecycle_transfer_sum_us,
+            lifecycle_transfer_max_us,
+            lifecycle_transfer_cleanup_us,
+            lifecycle_install_us,
+            lifecycle_done_items,
+            done_attempt,
+            lifecycle_done_us,
+            lifecycle_local_hot_admissions,
+            lifecycle_publish_us,
+            lifecycle_hits,
+            lifecycle_misses,
+            lifecycle_errors,
+            lifecycle_total_us,
+        );
+        Ok(output)
     }
 
     pub async fn batch_get(

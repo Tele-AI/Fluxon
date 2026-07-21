@@ -93,7 +93,7 @@ test_spec_config:                      # Test-only config overrides (dict(option
   tcp_thread_bulk_lane_count:          # tcp_thread bulk lane count, 1..8 (int(optional))
   tcp_thread_control_lane_count:       # tcp_thread control lane count, 1..8 (int(optional))
   user_rpc_sync_handler_thread_count:  # Owner-dedicated sync user-RPC worker thread count, >0 (int(optional))
-  replica_task_max_inflight:           # Concurrent replica append pipelines, 1..64; per-key order stays serialized (int(optional))
+  replica_task_max_inflight:           # Deprecated compatibility field, still validated as 1..64; direct remote-Put singleflight does not use a global actor queue (int(optional))
   require_transfer_rpc_fast_path_ready_timeout_seconds: # Require owner-owner transfer-rpc fast path before owner ready/shared.json publication (int(optional))
   rdma_device_names:                   # Explicit RDMA devices for benchmark/test fast-path fanout (['{str}'](optional))
   enable_side_transfer: false          # Enable TCP side-transfer fast-path (bool(optional))

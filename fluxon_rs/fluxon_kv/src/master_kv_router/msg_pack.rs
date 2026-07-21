@@ -1018,6 +1018,13 @@ pub enum PutAppendStartOutcome {
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct PutAppendStartResp {
     pub outcome: PutAppendStartOutcome,
+    /// Master-issued identity for this concrete replica append attempt.
+    ///
+    /// `put_id` identifies the KV generation, but one generation may need to
+    /// be copied remotely more than once after an earlier remote route is
+    /// reclaimed.  Done/Revoke must echo this value so an old replayable
+    /// terminal result cannot complete a later reservation.
+    pub operation_id: u64,
     pub node_id: NodeIDString,
     pub target_addr: u64,
     pub target_base_addr: u64,
@@ -1059,6 +1066,7 @@ pub struct BatchPutAppendStartItemResp {
     pub key: String,
     pub put_id: PutIDForAKey,
     pub outcome: PutAppendStartOutcome,
+    pub operation_id: u64,
     pub node_id: NodeIDString,
     pub target_addr: u64,
     pub target_base_addr: u64,
@@ -1087,6 +1095,7 @@ impl RPCReq for BatchPutAppendStartReq {
 pub struct PutAppendRevokeReq {
     pub key: String,
     pub put_id: PutIDForAKey,
+    pub operation_id: u64,
 }
 impl MsgPackSerializePart for PutAppendRevokeReq {
     fn msg_id(&self) -> u32 {
@@ -1111,6 +1120,7 @@ impl RPCReq for PutAppendRevokeReq {
 pub struct PutAppendDoneReq {
     pub key: String,
     pub put_id: PutIDForAKey,
+    pub operation_id: u64,
 }
 impl MsgPackSerializePart for PutAppendDoneReq {
     fn msg_id(&self) -> u32 {
@@ -1137,6 +1147,7 @@ impl RPCReq for PutAppendDoneReq {
 pub struct BatchPutAppendDoneItemReq {
     pub key: String,
     pub put_id: PutIDForAKey,
+    pub operation_id: u64,
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]

@@ -158,8 +158,10 @@ pub struct TestSpecConfig {
     pub tcp_thread_control_lane_count: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_rpc_sync_handler_thread_count: Option<u16>,
-    /// Maximum number of replica append pipelines in flight on an owner. Different keys may run
-    /// concurrently; each key remains strictly serialized by the replica dispatcher.
+    /// Deprecated compatibility field. Remote Put now uses direct per-generation singleflight:
+    /// the elected leader starts immediately and followers await its terminal result, without a
+    /// replica dispatcher or a global inflight queue. The value is still parsed and validated so
+    /// existing configurations remain loadable, but it no longer throttles remote Put execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica_task_max_inflight: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

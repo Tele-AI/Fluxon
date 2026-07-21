@@ -1,9 +1,10 @@
 use crate::SharedJsonMeta;
 use crate::client_kv_api::external_api::{
     compute_external_get_start_transfer_prefix, normalize_external_get_start_group_lens,
+    validate_external_get_consume_prefix,
 };
 use crate::client_kv_api::msg_pack::{
-    ExternalInvalidateWeakIndexItem, ExternalInvalidateWeakIndexReq,
+    ExternalBatchDeleteAckReq, ExternalInvalidateWeakIndexItem, ExternalInvalidateWeakIndexReq,
     ExternalInvalidateWeakIndexResp,
 };
 use crate::client_seg_pool::{ClientSegPool, SideTransferPeerFileMeta};
@@ -64,6 +65,12 @@ pub mod external_client_test;
 
 type SharedMetaSignature = fluxon_util::fs_watch::FileSignature;
 
+mod delete_ack_batch;
+pub(crate) use delete_ack_batch::{
+    ExternalDeleteAckBatchHandle, ExternalDeleteAckBatchSnapshot, ExternalDeleteAckItem,
+    spawn_external_delete_ack_batch,
+};
+
 // External->Owner staged put consists of multiple potentially slow components:
 // - ExternalPutStartReq triggers owner->master PutStart RPC (60s timeout).
 // - ExternalPutTransferEndReq executes transfer (can be slow) and then owner->master PutEnd RPC (60s timeout).
@@ -72,6 +79,12 @@ const EXTERNAL_PUT_START_RPC_TIMEOUT_SECS: u64 = 30;
 const EXTERNAL_PUT_TRANSFER_END_RPC_TIMEOUT_SECS: u64 = 30;
 const EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS: usize = 3;
 const EXTERNAL_PUT_TRACE_LOG_WINDOW_SECS: u64 = 10;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExternalDeleteAckBatchSendResult {
+    Applied { released: u32, missing: u32 },
+    OwnerGenerationChanged { items: u64 },
+}
 
 #[derive(Debug, Clone)]
 pub struct ExternalClientGetStartResp {
@@ -82,6 +95,7 @@ pub struct ExternalClientGetStartResp {
 struct PendingExternalGetStart {
     keys: Vec<String>,
     transferable_len: usize,
+    atomic_group_lens: Vec<usize>,
     first_miss_index: Option<usize>,
 }
 
@@ -133,10 +147,43 @@ fn validate_inline_external_get_owner_generation(
     }))
 }
 
+fn inline_external_get_tail_holder_ids(
+    items: &[ExternalBatchGetItemResp],
+    consume_prefix_len: usize,
+) -> KvResult<Vec<u64>> {
+    if consume_prefix_len == 0 || consume_prefix_len > items.len() {
+        return Err(KvError::Api(ApiError::InvalidArgument {
+            detail: format!(
+                "inline get_transfer consume prefix is out of range: consume={} items={}",
+                consume_prefix_len,
+                items.len()
+            ),
+        }));
+    }
+    items[consume_prefix_len..]
+        .iter()
+        .enumerate()
+        .map(|(tail_idx, item)| {
+            item.external_memholder_info
+                .as_ref()
+                .map(|info| info.holder_id)
+                .ok_or_else(|| {
+                    KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "inline get_transfer tail item has no holder: index={}",
+                            consume_prefix_len + tail_idx
+                        ),
+                    })
+                })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod inline_external_get_start_tests {
     use super::{
-        validate_inline_external_get_owner_generation, validate_inline_external_get_start_plan,
+        inline_external_get_tail_holder_ids, validate_inline_external_get_owner_generation,
+        validate_inline_external_get_start_plan,
     };
     use crate::client_kv_api::msg_pack::ExternalBatchGetItemResp;
     use crate::memholder::ExternalMemHolderInfo;
@@ -177,6 +224,22 @@ mod inline_external_get_start_tests {
                 got: 17
             })
         ));
+    }
+
+    #[test]
+    fn inline_partial_consume_returns_only_tail_holder_ids() {
+        let items = vec![inline_hit(11), inline_hit(12), inline_hit(13)];
+        assert_eq!(
+            inline_external_get_tail_holder_ids(&items, 2).unwrap(),
+            vec![13]
+        );
+        assert!(
+            inline_external_get_tail_holder_ids(&items, 3)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(inline_external_get_tail_holder_ids(&items, 0).is_err());
+        assert!(inline_external_get_tail_holder_ids(&items, 4).is_err());
     }
 }
 
@@ -446,6 +509,7 @@ pub struct ExternalInner {
     rpc_caller_external_batch_is_exist: RPCCaller<ExternalBatchIsExistReq>,
     rpc_caller_external_observability_snapshot: RPCCaller<ExternalObservabilitySnapshotReq>,
     rpc_caller_external_delete_ack: RPCCaller<ExternalDeleteAckReq>,
+    rpc_caller_external_batch_delete_ack: RPCCaller<ExternalBatchDeleteAckReq>,
     rpc_caller_external_put_revoke: RPCCaller<ExternalPutRevokeReq>,
     /// Lease RPC callers for external mode
     rpc_caller_allocate_client_lease: RPCCaller<AllocateClientLeaseReq>,
@@ -458,6 +522,7 @@ pub struct ExternalInner {
     /// per-key semaphore (permits=1) to ensure single inflight per key
     inflight1_per_key: SemaphoreMap<String>,
     put_trace_log_window: Mutex<ExternalPutTraceLogWindow>,
+    pub(crate) external_delete_ack_batch: ExternalDeleteAckBatchHandle,
 }
 
 pub struct ExternalClientApi(ExternalInner);
@@ -515,6 +580,7 @@ impl ExternalClientApi {
             rpc_caller_external_observability_snapshot:
                 RPCCaller::<ExternalObservabilitySnapshotReq>::new(),
             rpc_caller_external_delete_ack: RPCCaller::<ExternalDeleteAckReq>::new(),
+            rpc_caller_external_batch_delete_ack: RPCCaller::<ExternalBatchDeleteAckReq>::new(),
             rpc_caller_external_put_revoke: RPCCaller::<ExternalPutRevokeReq>::new(),
             rpc_caller_allocate_client_lease: RPCCaller::<AllocateClientLeaseReq>::new(),
             rpc_caller_client_lease_keepalive: RPCCaller::<ClientLeaseKeepaliveReq>::new(),
@@ -523,6 +589,7 @@ impl ExternalClientApi {
             pending_inline_external_get_start: DashMap::new(),
             inflight1_per_key: SemaphoreMap::new(1, std::time::Duration::from_secs(120)),
             put_trace_log_window: Mutex::new(ExternalPutTraceLogWindow::new()),
+            external_delete_ack_batch: ExternalDeleteAckBatchHandle::new(),
         }))
     }
 
@@ -620,11 +687,19 @@ impl ExternalClientApi {
             .regist(ext.view.p2p_module());
         ext.rpc_caller_external_delete_ack
             .regist(ext.view.p2p_module());
+        ext.rpc_caller_external_batch_delete_ack
+            .regist(ext.view.p2p_module());
         ext.rpc_caller_external_put_revoke
             .regist(ext.view.p2p_module());
         crate::key_prefix::init_for_p2p_owner(ext.view.p2p_module());
         crate::kvlease::init_for_p2p_owner(ext.view.p2p_module());
         crate::metrics::client::init_for_p2p_owner(ext.view.p2p_module());
+
+        let external_delete_ack_rx = ext
+            .external_delete_ack_batch
+            .take_rx()
+            .expect("external holder ACK batch worker initialized twice");
+        spawn_external_delete_ack_batch(ext.view.clone_view(), external_delete_ack_rx);
 
         let view_ext = ext.view.clone_view();
         RPCHandler::<ExternalInvalidateWeakIndexReq>::new().regist(
@@ -2086,22 +2161,35 @@ impl ExternalInner {
         &self,
         handle: u64,
         keys: Vec<String>,
+        consume_prefix_len: usize,
     ) -> KvResult<Vec<KvResult<Option<Arc<ExternalMemHolder>>>>> {
         tracing::debug!(
-            "External batch_get_transfer request: handle={}, batch_len={}",
+            "External batch_get_transfer request: handle={}, batch_len={}, consume_prefix_len={}",
             handle,
-            keys.len()
+            keys.len(),
+            consume_prefix_len
         );
+        if consume_prefix_len == 0 || keys.len() != consume_prefix_len {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "batch_get_transfer keys must equal the non-empty consumed prefix: keys={} consume_prefix_len={}",
+                    keys.len(),
+                    consume_prefix_len
+                ),
+            }));
+        }
         if let Some((_handle, inline_plan)) = self.pending_inline_external_get_start.remove(&handle)
         {
-            if keys != inline_plan.keys {
+            if consume_prefix_len > inline_plan.keys.len()
+                || keys.as_slice() != &inline_plan.keys[..consume_prefix_len]
+            {
                 let expected_keys = inline_plan.keys.clone();
                 self.pending_inline_external_get_start
                     .insert(handle, inline_plan);
                 return Err(KvError::Api(ApiError::InvalidArgument {
                     detail: format!(
-                        "inline external batch_get_transfer keys mismatch: handle={} expected={:?} got={:?}",
-                        handle, expected_keys, keys
+                        "inline external batch_get_transfer prefix mismatch: handle={} consume_prefix_len={} available_keys={:?} got={:?}",
+                        handle, consume_prefix_len, expected_keys, keys
                     ),
                 }));
             }
@@ -2115,32 +2203,78 @@ impl ExternalInner {
                 }
             };
             let (_, current_owner_start_time, _, base_ptr_ro, mapped_len) = owner_snapshot;
-            validate_inline_external_get_owner_generation(
+            if let Err(err) = validate_inline_external_get_owner_generation(
                 inline_plan.owner_start_time,
                 current_owner_start_time,
-            )?;
-            validate_inline_external_get_start_plan(keys.len(), &inline_plan.items)?;
-            for (idx, item) in inline_plan.items.iter().enumerate() {
-                let info = item
-                    .external_memholder_info
-                    .as_ref()
-                    .expect("inline plan was validated above");
-                let end = info.offset.checked_add(u64::from(info.len)).ok_or_else(|| {
-                    KvError::Api(ApiError::Unknown {
-                        detail: format!(
-                            "inline external get_start item range overflow: index={} offset={} len={}",
-                            idx, info.offset, info.len
-                        ),
-                    })
-                })?;
-                if end > mapped_len {
-                    return Err(KvError::Api(ApiError::Unknown {
-                        detail: format!(
-                            "inline external get_start item exceeds owner mapping: index={} end={} mapped_len={}",
-                            idx, end, mapped_len
-                        ),
-                    }));
+            ) {
+                return Err(err);
+            }
+            if let Err(err) =
+                validate_inline_external_get_start_plan(inline_plan.keys.len(), &inline_plan.items)
+            {
+                self.pending_inline_external_get_start
+                    .insert(handle, inline_plan);
+                return Err(err);
+            }
+            let range_validation = inline_plan.items.iter().enumerate().try_for_each(
+                |(idx, item)| -> KvResult<()> {
+                    let info = item
+                        .external_memholder_info
+                        .as_ref()
+                        .expect("inline plan was validated above");
+                    let end = info.offset.checked_add(u64::from(info.len)).ok_or_else(|| {
+                        KvError::Api(ApiError::Unknown {
+                            detail: format!(
+                                "inline external get_start item range overflow: index={} offset={} len={}",
+                                idx, info.offset, info.len
+                            ),
+                        })
+                    })?;
+                    if end > mapped_len {
+                        return Err(KvError::Api(ApiError::Unknown {
+                            detail: format!(
+                                "inline external get_start item exceeds owner mapping: index={} end={} mapped_len={}",
+                                idx, end, mapped_len
+                            ),
+                        }));
+                    }
+                    Ok(())
+                },
+            );
+            if let Err(err) = range_validation {
+                self.pending_inline_external_get_start
+                    .insert(handle, inline_plan);
+                return Err(err);
+            }
+
+            let tail_holder_ids =
+                inline_external_get_tail_holder_ids(&inline_plan.items, consume_prefix_len)
+                    .expect("validated inline plan must yield tail holder ids");
+            if !tail_holder_ids.is_empty() {
+                let external_client_id = self.view.cluster_manager().get_self_info().id.clone();
+                let mut enqueue_failures = 0usize;
+                for holder_id in tail_holder_ids.iter().copied() {
+                    if let Err(err) = self.enqueue_external_delete_ack(
+                        external_client_id.clone(),
+                        holder_id,
+                        inline_plan.owner_start_time,
+                    ) {
+                        enqueue_failures += 1;
+                        tracing::warn!(
+                            "External inline get_transfer could not enqueue tail holder release: handle={} holder_id={} error={}",
+                            handle,
+                            holder_id,
+                            err
+                        );
+                    }
                 }
+                tracing::info!(
+                    "External inline get_transfer enqueued tail release: handle={}, consumed={}, released_tail={}, enqueue_failures={}",
+                    handle,
+                    consume_prefix_len,
+                    tail_holder_ids.len(),
+                    enqueue_failures
+                );
             }
 
             let bandwidth_handle = self
@@ -2150,7 +2284,10 @@ impl ExternalInner {
                 .expect("ExternalClientApi.batch_get_transfer expects IpcBandwidthAttributor handle to be attached");
             let external_client_id = self.view.cluster_manager().get_self_info().id.clone();
             let mut results = Vec::with_capacity(keys.len());
-            for (key, item) in keys.into_iter().zip(inline_plan.items.into_iter()) {
+            for (key, item) in keys
+                .into_iter()
+                .zip(inline_plan.items.into_iter().take(consume_prefix_len))
+            {
                 let info = item
                     .external_memholder_info
                     .expect("inline plan was validated above");
@@ -2202,6 +2339,7 @@ impl ExternalInner {
                 handle,
                 req_node_id: self.view.cluster_manager().get_self_info().id.clone(),
                 started_time,
+                consume_prefix_len,
             },
             raw_bytes: Vec::new(),
         };
@@ -2268,6 +2406,51 @@ impl ExternalInner {
         Ok(results)
     }
 
+    async fn send_batch_get_cancel_plan(
+        &self,
+        handle: u64,
+        started_time: i64,
+        transfer_plan: ExternalBatchGetCancelPlan,
+    ) -> KvResult<()> {
+        let owner = self.shared_storage_node_id().await.ok_or_else(|| {
+            KvError::SharedMem(SharedMemError::NotConfigured {
+                node_id: None,
+                detail: Some("Shared storage node id unavailable".to_string()),
+            })
+        })?;
+        let req = MsgPack {
+            serialize_part: ExternalBatchGetCancelReq {
+                handle,
+                req_node_id: self.view.cluster_manager().get_self_info().id.clone(),
+                started_time,
+                transfer_plan,
+            },
+            raw_bytes: Vec::new(),
+        };
+        let resp = match self
+            .rpc_caller_external_batch_get_cancel
+            .call(self.view.p2p_module(), owner.into(), req, None, 0)
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => return Err(KvError::from(err)),
+        };
+        if resp.serialize_part.error_code == OK {
+            return Ok(());
+        }
+        let err = KvError::from_json(
+            resp.serialize_part.error_code,
+            &resp.serialize_part.error_json,
+        );
+        if matches!(&err, KvError::Api(ApiError::OwnerStartTimeMismatch { .. })) {
+            tracing::info!(
+                "send_batch_get_cancel_plan: owner start_time mismatch; owner restarted, treating handle as gone"
+            );
+            return Ok(());
+        }
+        Err(err)
+    }
+
     pub async fn cancel_batch_get_start(&self, handle: u64) -> KvResult<()> {
         tracing::debug!("External cancel_batch_get_start request: handle={}", handle);
         let inline_plan = self
@@ -2302,57 +2485,15 @@ impl ExternalInner {
             },
             None => ExternalBatchGetCancelPlan::OwnerRpc,
         };
-        let owner = match self.shared_storage_node_id().await {
-            Some(owner) => owner,
-            None => {
-                if let Some(plan) = inline_plan {
-                    self.pending_inline_external_get_start.insert(handle, plan);
-                }
-                return Err(KvError::SharedMem(SharedMemError::NotConfigured {
-                    node_id: None,
-                    detail: Some("Shared storage node id unavailable".to_string()),
-                }));
+        let cancel_result = self
+            .send_batch_get_cancel_plan(handle, started_time, transfer_plan)
+            .await;
+        if cancel_result.is_err() {
+            if let Some(plan) = inline_plan {
+                self.pending_inline_external_get_start.insert(handle, plan);
             }
-        };
-        let req = MsgPack {
-            serialize_part: ExternalBatchGetCancelReq {
-                handle,
-                req_node_id: self.view.cluster_manager().get_self_info().id.clone(),
-                started_time,
-                transfer_plan,
-            },
-            raw_bytes: Vec::new(),
-        };
-        let resp = match self
-            .rpc_caller_external_batch_get_cancel
-            .call(self.view.p2p_module(), owner.into(), req, None, 0)
-            .await
-        {
-            Ok(resp) => resp,
-            Err(err) => {
-                if let Some(plan) = inline_plan {
-                    self.pending_inline_external_get_start.insert(handle, plan);
-                }
-                return Err(KvError::from(err));
-            }
-        };
-        if resp.serialize_part.error_code == OK {
-            return Ok(());
         }
-        let err = KvError::from_json(
-            resp.serialize_part.error_code,
-            &resp.serialize_part.error_json,
-        );
-        if matches!(&err, KvError::Api(ApiError::OwnerStartTimeMismatch { .. })) {
-            tracing::info!(
-                "cancel_batch_get_start: owner start_time mismatch; owner restarted, treating handle as gone"
-            );
-            return Ok(());
-        }
-        if let Some(plan) = inline_plan {
-            self.pending_inline_external_get_start.insert(handle, plan);
-        }
-        Err(err)
+        cancel_result
     }
 
     pub async fn get_start(
@@ -2401,6 +2542,7 @@ impl ExternalInner {
             PendingExternalGetStart {
                 keys: keys.clone(),
                 transferable_len,
+                atomic_group_lens: group_lens,
                 first_miss_index,
             },
         );
@@ -2414,6 +2556,7 @@ impl ExternalInner {
     pub async fn get_transfer(
         &self,
         handle: u64,
+        consume_prefix_len: Option<usize>,
     ) -> KvResult<Vec<KvResult<Option<Arc<ExternalMemHolder>>>>> {
         let Some((_handle, entry)) = self.pending_external_get_start.remove(&handle) else {
             return Err(KvError::Api(ApiError::InvalidArgument {
@@ -2437,8 +2580,21 @@ impl ExternalInner {
                 ),
             }));
         }
-        self.batch_get_transfer(handle, entry.keys[..entry.transferable_len].to_vec())
-            .await
+        let consume_prefix_len = consume_prefix_len.unwrap_or(entry.transferable_len);
+        if let Err(err) = validate_external_get_consume_prefix(
+            consume_prefix_len,
+            entry.transferable_len,
+            &entry.atomic_group_lens,
+        ) {
+            self.pending_external_get_start.insert(handle, entry);
+            return Err(err);
+        }
+        self.batch_get_transfer(
+            handle,
+            entry.keys[..consume_prefix_len].to_vec(),
+            consume_prefix_len,
+        )
+        .await
     }
 
     pub async fn cancel_get_transfer(&self, handle: u64) -> KvResult<()> {
@@ -3880,6 +4036,72 @@ key={}, attempt={}/{}, err={}",
             holder_id
         );
         Ok(())
+    }
+
+    pub(crate) fn enqueue_external_delete_ack(
+        &self,
+        external_client_id: String,
+        holder_id: u64,
+        owner_start_time: i64,
+    ) -> Result<(), String> {
+        self.external_delete_ack_batch
+            .enqueue(ExternalDeleteAckItem {
+                external_client_id,
+                holder_id,
+                owner_start_time,
+            })
+    }
+
+    pub(crate) fn external_delete_ack_batch_snapshot(&self) -> ExternalDeleteAckBatchSnapshot {
+        self.external_delete_ack_batch.snapshot()
+    }
+
+    pub(crate) async fn send_external_delete_ack_batch(
+        &self,
+        external_client_id: &str,
+        owner_start_time: i64,
+        holder_ids: Vec<u64>,
+    ) -> KvResult<ExternalDeleteAckBatchSendResult> {
+        let item_count = u64::try_from(holder_ids.len()).unwrap_or(u64::MAX);
+        let req = MsgPack {
+            serialize_part: ExternalBatchDeleteAckReq {
+                external_client_id: external_client_id.to_string(),
+                holder_ids,
+                started_time: owner_start_time,
+            },
+            raw_bytes: Vec::new(),
+        };
+        let owner = self.shared_storage_node_id().await.ok_or_else(|| {
+            KvError::SharedMem(SharedMemError::NotConfigured {
+                node_id: None,
+                detail: Some("Shared storage node id unavailable".to_string()),
+            })
+        })?;
+        let resp = self
+            .rpc_caller_external_batch_delete_ack
+            .call(self.view.p2p_module(), owner.into(), req, None, 0)
+            .await
+            .map_err(KvError::from)?;
+        match resp.serialize_part.to_result() {
+            Ok(resp) => {
+                let accounted = u64::from(resp.released_count) + u64::from(resp.missing_count);
+                if accounted != item_count {
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "external holder ACK batch accounted for {accounted} of {item_count} items"
+                        ),
+                    }));
+                }
+                Ok(ExternalDeleteAckBatchSendResult::Applied {
+                    released: resp.released_count,
+                    missing: resp.missing_count,
+                })
+            }
+            Err(KvError::Api(ApiError::OwnerStartTimeMismatch { .. })) => {
+                Ok(ExternalDeleteAckBatchSendResult::OwnerGenerationChanged { items: item_count })
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Allocate a client lease (external role): send request to master via P2P.

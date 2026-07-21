@@ -405,7 +405,6 @@ impl Drop for ExternalMemHolder {
 
         let ctx = ExternalDeleteAckCtx {
             view: self.view.clone(),
-            key: self.key.clone(),
             external_client_id: self.external_client_id.clone(),
             holder_id: self.holder_id,
             started_time: self.owner_start_time,

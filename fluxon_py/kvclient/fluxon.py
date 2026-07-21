@@ -1713,6 +1713,8 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         self,
         handle: GetStartHandle,
         concurrency: Optional[int] = None,
+        *,
+        consume_prefix_len: Optional[int] = None,
     ) -> int:
         if not isinstance(handle, GetStartHandle):
             raise TypeError(f"get_transfer requires GetStartHandle, got {type(handle)}")
@@ -1729,12 +1731,48 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 f"first_miss_index={result.first_miss_index} "
                 f"first_miss_group_index={result.first_miss_group_index}"
             )
+        if consume_prefix_len is None:
+            normalized_consume_prefix_len = result.transferable_len
+        else:
+            if isinstance(consume_prefix_len, bool) or not isinstance(
+                consume_prefix_len, int
+            ):
+                raise TypeError(
+                    "get_transfer consume_prefix_len must be an int or None, got "
+                    f"{type(consume_prefix_len)}"
+                )
+            normalized_consume_prefix_len = int(consume_prefix_len)
+        if (
+            normalized_consume_prefix_len <= 0
+            or normalized_consume_prefix_len > result.transferable_len
+        ):
+            raise ValueError(
+                "get_transfer consume_prefix_len must be within the live "
+                "transferable prefix: "
+                f"consume={normalized_consume_prefix_len} "
+                f"transferable={result.transferable_len}"
+            )
+        group_lens = result.atomic_group_lens or (len(result.keys),)
+        group_end = 0
+        for group_len in group_lens:
+            group_end += int(group_len)
+            if group_end >= normalized_consume_prefix_len:
+                break
+        if group_end != normalized_consume_prefix_len:
+            raise ValueError(
+                "get_transfer consume_prefix_len must end at an atomic-group "
+                "boundary: "
+                f"consume={normalized_consume_prefix_len} "
+                f"atomic_group_lens={group_lens}"
+            )
         if self._client is None:
             raise RuntimeError(
                 "Store not initialized when get_transfer(). Call setup() first."
             )
         _ = concurrency
-        inner_res = self._client.get_transfer(handle.backend_handle)
+        inner_res = self._client.get_transfer(
+            handle.backend_handle, normalized_consume_prefix_len
+        )
         if not inner_res.is_ok():
             handle.closed = True
             raise RuntimeError(f"get_transfer backend error: {inner_res.unwrap_error()}")

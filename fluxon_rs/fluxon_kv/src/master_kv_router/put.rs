@@ -1,6 +1,6 @@
 use super::{
-    CommittedSlotReplica, InflightPutAllocation, InflightPutCommitInfo, InflightPutInfo,
-    InflightReplicaTaskInfo, KvReplicaBacking, KvRouteInfo, LocalReserveGrantInfo,
+    CommittedSlotReplica, CompletedReplicaTaskInfo, InflightPutAllocation, InflightPutCommitInfo,
+    InflightPutInfo, InflightReplicaTaskInfo, KvReplicaBacking, KvRouteInfo, LocalReserveGrantInfo,
     MasterKeyActivityCompletionGuard, MasterKvRouterView, NodeCacheCapacityReservation,
     OwnerHoldingGetInfo, PreparedPutKeyReservationInfo, PutPlacementMode, ReservedCapacityReason,
     msg_pack::{
@@ -487,6 +487,15 @@ fn reserve_replica_task_excluding(
     protect_source_on_remote_complete: bool,
 ) -> msg_and_error::KvResult<InflightReplicaTaskInfo> {
     let activity_lease = view.master_kv_router().reserve_inflight_replica_key(key)?;
+    let operation_id = view
+        .master_kv_router()
+        .inner()
+        .next_replica_operation_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert_ne!(
+        operation_id, 0,
+        "master replica operation identifier overflow"
+    );
     view.master_kv_router()
         .pin_current_master_cache_identity_for_activity(
             &activity_lease,
@@ -519,16 +528,18 @@ fn reserve_replica_task_excluding(
         ));
     };
     tracing::debug!(
-        "replica task reserved: key={} put_id=({},{}) source_node_id={} target_node_id={} preferred_sub_cluster={:?} len={}",
+        "replica task reserved: key={} put_id=({},{}) operation_id={} source_node_id={} target_node_id={} preferred_sub_cluster={:?} len={}",
         key,
         put_id.0,
         put_id.1,
+        operation_id,
         source_node_id,
         target_node_id,
         preferred_sub_cluster,
         len
     );
     Ok(InflightReplicaTaskInfo {
+        operation_id,
         node_id: target_node_id,
         target_tomb_tag,
         source_node_id: source_node_id.clone(),
@@ -2109,6 +2120,13 @@ async fn handle_put_append_start_inner(
 ) -> MsgPack<PutAppendStartResp> {
     let key = req.serialize_part.key.clone();
     let put_id = req.serialize_part.put_id;
+    let append_key = (key.clone(), put_id.0, put_id.1);
+    let operation_lock = view
+        .master_kv_router()
+        .inner()
+        .replica_operation_locks
+        .get_lock(append_key.clone());
+    let _operation_guard = operation_lock.lock().await;
     let route_snapshot = view
         .master_kv_router()
         .inner()
@@ -2140,7 +2158,6 @@ async fn handle_put_append_start_inner(
         };
     }
 
-    let append_key = (key.clone(), put_id.0, put_id.1);
     let inflight = if let Some(existing) = view
         .master_kv_router()
         .inner()
@@ -2245,6 +2262,7 @@ async fn handle_put_append_start_inner(
     MsgPack {
         serialize_part: PutAppendStartResp {
             outcome: PutAppendStartOutcome::Scheduled,
+            operation_id: inflight.operation_id,
             node_id: inflight.node_id.clone().into(),
             target_addr,
             target_base_addr,
@@ -2294,6 +2312,7 @@ pub async fn handle_batch_put_append_start(
             key: item.key,
             put_id: item.put_id,
             outcome: part.outcome,
+            operation_id: part.operation_id,
             node_id: part.node_id,
             target_addr: part.target_addr,
             target_base_addr: part.target_base_addr,
@@ -2319,14 +2338,50 @@ pub async fn handle_put_append_revoke(
 ) -> MsgPack<PutAppendRevokeResp> {
     let put_id = req.serialize_part.put_id;
     let key = req.serialize_part.key;
-    if let Some(inflight) = view
+    let operation_id = req.serialize_part.operation_id;
+    let generation_identity = (key.clone(), put_id.0, put_id.1);
+    let operation_identity = (key.clone(), put_id.0, put_id.1, operation_id);
+    let operation_lock = view
+        .master_kv_router()
+        .inner()
+        .replica_operation_locks
+        .get_lock(generation_identity.clone());
+    let _operation_guard = operation_lock.lock().await;
+    if view
+        .master_kv_router()
+        .inner()
+        .completed_replica_tasks
+        .get(&operation_identity)
+        .await
+        .is_some()
+    {
+        return MsgPack {
+            serialize_part: PutAppendRevokeResp {
+                error_code: msg_and_error::OK,
+                error_json: String::new(),
+            },
+            raw_bytes: Vec::new(),
+        };
+    }
+    let inflight = view
         .master_kv_router()
         .inner()
         .inflight_replica_tasks
-        .remove(&(key, put_id.0, put_id.1))
-        .await
+        .get(&generation_identity)
+        .await;
+    if inflight
+        .as_ref()
+        .is_some_and(|inflight| inflight.operation_id == operation_id)
     {
-        inflight._activity_lease.release_now();
+        if let Some(inflight) = view
+            .master_kv_router()
+            .inner()
+            .inflight_replica_tasks
+            .remove(&generation_identity)
+            .await
+        {
+            inflight._activity_lease.release_now();
+        }
     }
     MsgPack {
         serialize_part: PutAppendRevokeResp {
@@ -2343,17 +2398,77 @@ async fn handle_put_append_done_inner(
 ) -> MsgPack<PutAppendDoneResp> {
     let put_id = req.serialize_part.put_id;
     let key = req.serialize_part.key.clone();
-    let Some(inflight) = view
+    let operation_id = req.serialize_part.operation_id;
+    let generation_identity = (key.clone(), put_id.0, put_id.1);
+    let operation_identity = (key.clone(), put_id.0, put_id.1, operation_id);
+    let operation_lock = view
+        .master_kv_router()
+        .inner()
+        .replica_operation_locks
+        .get_lock(generation_identity.clone());
+    let _operation_guard = operation_lock.lock().await;
+    if let Some(completed) = view
+        .master_kv_router()
+        .inner()
+        .completed_replica_tasks
+        .get(&operation_identity)
+        .await
+    {
+        view.master_kv_router()
+            .inner()
+            .replica_done_terminal_replay_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return MsgPack {
+            serialize_part: PutAppendDoneResp {
+                appended: completed.appended,
+                error_code: msg_and_error::OK,
+                error_json: String::new(),
+                server_process_us: 0,
+            },
+            raw_bytes: Vec::new(),
+        };
+    }
+    let Some(current) = view
         .master_kv_router()
         .inner()
         .inflight_replica_tasks
-        .remove(&(key.clone(), put_id.0, put_id.1))
+        .get(&generation_identity)
         .await
     else {
         let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
             detail: format!(
-                "Put append operation not found for completion: key={} put_id=({},{})",
-                key, put_id.0, put_id.1
+                "Put append operation not found for completion: key={} put_id=({},{}) operation_id={}",
+                key, put_id.0, put_id.1, operation_id
+            ),
+        });
+        return MsgPack {
+            serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+            raw_bytes: Vec::new(),
+        };
+    };
+    if current.operation_id != operation_id {
+        let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+            detail: format!(
+                "Put append operation generation mismatch: key={} put_id=({},{}) requested_operation_id={} current_operation_id={}",
+                key, put_id.0, put_id.1, operation_id, current.operation_id
+            ),
+        });
+        return MsgPack {
+            serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+            raw_bytes: Vec::new(),
+        };
+    }
+    let Some(inflight) = view
+        .master_kv_router()
+        .inner()
+        .inflight_replica_tasks
+        .remove(&generation_identity)
+        .await
+    else {
+        let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+            detail: format!(
+                "Put append operation disappeared during completion: key={} put_id=({},{}) operation_id={}",
+                key, put_id.0, put_id.1, operation_id
             ),
         });
         return MsgPack {
@@ -2384,6 +2499,11 @@ async fn handle_put_append_done_inner(
         allocation,
     );
     let appended = published.is_some();
+    view.master_kv_router()
+        .inner()
+        .completed_replica_tasks
+        .insert(operation_identity, CompletedReplicaTaskInfo { appended })
+        .await;
     if let Some(event) = published {
         enqueue_post_route_maintenance(&view, event).await;
     }
@@ -2413,10 +2533,15 @@ pub async fn handle_batch_put_append_done(
     for item in req.serialize_part.items {
         let key = item.key.clone();
         let put_id = item.put_id;
+        let operation_id = item.operation_id;
         let resp = handle_put_append_done_inner(
             view.clone(),
             MsgPack {
-                serialize_part: PutAppendDoneReq { key, put_id },
+                serialize_part: PutAppendDoneReq {
+                    key,
+                    put_id,
+                    operation_id,
+                },
                 raw_bytes: Vec::new(),
             },
         )

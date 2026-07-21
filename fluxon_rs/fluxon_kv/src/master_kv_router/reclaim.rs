@@ -363,7 +363,7 @@ mod single_victim_transaction_tests {
             .expect("busy victim must hold a master Get lease");
         let stale_request = source_victim("stale", stale.put_id, 999, 2);
         let victims = vec![ready.clone(), busy.clone(), stale_request];
-        let responses = direct_delete_exact_owner_source_batch_with(
+        let (responses, busy_summary) = direct_delete_exact_owner_source_batch_with(
             activity.as_ref(),
             &owner,
             77,
@@ -391,6 +391,15 @@ mod single_victim_transaction_tests {
             vec![0, 1, 2],
             "one batch response vector must stay aligned with every input victim"
         );
+        assert_eq!(
+            busy_summary,
+            DirectDeleteBatchBusySummary {
+                activity_busy_items: 1,
+                get_busy_items: 1,
+                inflight_gets: 1,
+                ..Default::default()
+            }
+        );
         assert!(!routes.contains_key(&ready.key));
         assert!(routes.contains_key(&busy.key));
         assert!(routes.contains_key(&stale.key));
@@ -408,7 +417,8 @@ mod single_victim_transaction_tests {
                 false
             },
         );
-        assert_eq!(replay.0, OwnerSourceEvictionOutcome::Completed);
+        assert_eq!(replay.outcome, OwnerSourceEvictionOutcome::Completed);
+        assert_eq!(replay.busy_cause, None);
         assert!(!replay_delete_called.load(Ordering::Relaxed));
     }
 }
@@ -904,6 +914,92 @@ fn plan_exact_owner_source_victim_with(
     OwnerSourceVictimPlan::Ready(planned)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectDeleteBusyCause {
+    MasterActivity(super::MasterKeyActivitySnapshot),
+    DeleteUnderFence,
+}
+
+struct DirectDeleteResult {
+    outcome: OwnerSourceEvictionOutcome,
+    detail: String,
+    busy_cause: Option<DirectDeleteBusyCause>,
+}
+
+impl DirectDeleteResult {
+    fn terminal(outcome: OwnerSourceEvictionOutcome, detail: impl Into<String>) -> Self {
+        Self {
+            outcome,
+            detail: detail.into(),
+            busy_cause: None,
+        }
+    }
+
+    fn activity_busy(snapshot: super::MasterKeyActivitySnapshot) -> Self {
+        Self {
+            outcome: OwnerSourceEvictionOutcome::RetryableBusy,
+            detail: format!(
+                "master key activity is busy: puts={} gets={} replicas={} reclaim_installed={}",
+                snapshot.puts, snapshot.gets, snapshot.replicas, snapshot.reclaim_installed
+            ),
+            busy_cause: Some(DirectDeleteBusyCause::MasterActivity(snapshot)),
+        }
+    }
+
+    fn delete_under_fence_busy() -> Self {
+        Self {
+            outcome: OwnerSourceEvictionOutcome::RetryableBusy,
+            detail: "exact source route could not be deleted under its master fence".to_string(),
+            busy_cause: Some(DirectDeleteBusyCause::DeleteUnderFence),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DirectDeleteBatchBusySummary {
+    activity_busy_items: u64,
+    put_busy_items: u64,
+    get_busy_items: u64,
+    replica_busy_items: u64,
+    reclaim_busy_items: u64,
+    inflight_puts: u64,
+    inflight_gets: u64,
+    inflight_replicas: u64,
+    delete_under_fence_busy_items: u64,
+}
+
+impl DirectDeleteBatchBusySummary {
+    fn record(&mut self, cause: Option<DirectDeleteBusyCause>) {
+        match cause {
+            Some(DirectDeleteBusyCause::MasterActivity(snapshot)) => {
+                self.activity_busy_items = self.activity_busy_items.saturating_add(1);
+                self.put_busy_items = self
+                    .put_busy_items
+                    .saturating_add(u64::from(snapshot.puts != 0));
+                self.get_busy_items = self
+                    .get_busy_items
+                    .saturating_add(u64::from(snapshot.gets != 0));
+                self.replica_busy_items = self
+                    .replica_busy_items
+                    .saturating_add(u64::from(snapshot.replicas != 0));
+                self.reclaim_busy_items = self
+                    .reclaim_busy_items
+                    .saturating_add(u64::from(snapshot.reclaim_installed));
+                self.inflight_puts = self.inflight_puts.saturating_add(u64::from(snapshot.puts));
+                self.inflight_gets = self.inflight_gets.saturating_add(u64::from(snapshot.gets));
+                self.inflight_replicas = self
+                    .inflight_replicas
+                    .saturating_add(u64::from(snapshot.replicas));
+            }
+            Some(DirectDeleteBusyCause::DeleteUnderFence) => {
+                self.delete_under_fence_busy_items =
+                    self.delete_under_fence_busy_items.saturating_add(1);
+            }
+            None => {}
+        }
+    }
+}
+
 fn direct_delete_exact_owner_source_with(
     activity: &super::MasterKeyActivityTable,
     owner: &NodeID,
@@ -911,17 +1007,20 @@ fn direct_delete_exact_owner_source_with(
     epoch: u64,
     route_lookup: &dyn Fn(&str) -> Option<Arc<super::OneKvNodesRoutes>>,
     delete: impl FnOnce(&OwnerReclaimItem) -> bool,
-) -> (OwnerSourceEvictionOutcome, String) {
+) -> DirectDeleteResult {
     let member = match plan_exact_owner_source_victim_with(owner, victim, route_lookup) {
         OwnerSourceVictimPlan::Ready(member) => member,
         OwnerSourceVictimPlan::Completed(detail) => {
-            return (OwnerSourceEvictionOutcome::Completed, detail.to_string());
+            return DirectDeleteResult::terminal(OwnerSourceEvictionOutcome::Completed, detail);
         }
         OwnerSourceVictimPlan::Stale(detail) => {
-            return (OwnerSourceEvictionOutcome::Stale, detail);
+            return DirectDeleteResult::terminal(OwnerSourceEvictionOutcome::Stale, detail);
         }
         OwnerSourceVictimPlan::Rejected(detail) => {
-            return (OwnerSourceEvictionOutcome::RejectedNotEvictable, detail);
+            return DirectDeleteResult::terminal(
+                OwnerSourceEvictionOutcome::RejectedNotEvictable,
+                detail,
+            );
         }
     };
     let item = OwnerReclaimItem {
@@ -934,35 +1033,28 @@ fn direct_delete_exact_owner_source_with(
         reason: OwnerReclaimReason::OwnerCapacityEviction,
     };
     if let Err(snapshot) = activity.try_install_reclaim(&item) {
-        return (
-            OwnerSourceEvictionOutcome::RetryableBusy,
-            format!(
-                "master key activity is busy: puts={} gets={} replicas={} reclaim_installed={}",
-                snapshot.puts, snapshot.gets, snapshot.replicas, snapshot.reclaim_installed
-            ),
-        );
+        return DirectDeleteResult::activity_busy(snapshot);
     }
 
     let result = match plan_exact_owner_source_victim_with(owner, victim, route_lookup) {
         OwnerSourceVictimPlan::Ready(_) => {
             if delete(&item) {
-                (
+                DirectDeleteResult::terminal(
                     OwnerSourceEvictionOutcome::Completed,
-                    "exact source route deleted by batch handler".to_string(),
+                    "exact source route deleted by batch handler",
                 )
             } else {
-                (
-                    OwnerSourceEvictionOutcome::RetryableBusy,
-                    "exact source route could not be deleted under its master fence".to_string(),
-                )
+                DirectDeleteResult::delete_under_fence_busy()
             }
         }
         OwnerSourceVictimPlan::Completed(detail) => {
-            (OwnerSourceEvictionOutcome::Completed, detail.to_string())
+            DirectDeleteResult::terminal(OwnerSourceEvictionOutcome::Completed, detail)
         }
-        OwnerSourceVictimPlan::Stale(detail) => (OwnerSourceEvictionOutcome::Stale, detail),
+        OwnerSourceVictimPlan::Stale(detail) => {
+            DirectDeleteResult::terminal(OwnerSourceEvictionOutcome::Stale, detail)
+        }
         OwnerSourceVictimPlan::Rejected(detail) => {
-            (OwnerSourceEvictionOutcome::RejectedNotEvictable, detail)
+            DirectDeleteResult::terminal(OwnerSourceEvictionOutcome::RejectedNotEvictable, detail)
         }
     };
     assert!(
@@ -979,26 +1071,29 @@ fn direct_delete_exact_owner_source_batch_with(
     victims: &[OwnerSourceEvictionVictim],
     route_lookup: &dyn Fn(&str) -> Option<Arc<super::OneKvNodesRoutes>>,
     delete: impl Fn(&OwnerReclaimItem) -> bool,
-) -> Vec<OwnerSourceEvictionVictimResp> {
-    victims
-        .iter()
-        .enumerate()
-        .map(|(index, victim)| {
-            let (outcome, detail) = direct_delete_exact_owner_source_with(
-                activity,
-                owner,
-                victim,
-                owner_source_eviction_epoch(operation_id, index),
-                route_lookup,
-                |item| delete(item),
-            );
-            OwnerSourceEvictionVictimResp {
-                victim_index: u32::try_from(index).unwrap_or(u32::MAX),
-                outcome,
-                detail,
-            }
-        })
-        .collect()
+) -> (
+    Vec<OwnerSourceEvictionVictimResp>,
+    DirectDeleteBatchBusySummary,
+) {
+    let mut responses = Vec::with_capacity(victims.len());
+    let mut busy = DirectDeleteBatchBusySummary::default();
+    for (index, victim) in victims.iter().enumerate() {
+        let result = direct_delete_exact_owner_source_with(
+            activity,
+            owner,
+            victim,
+            owner_source_eviction_epoch(operation_id, index),
+            route_lookup,
+            |item| delete(item),
+        );
+        busy.record(result.busy_cause);
+        responses.push(OwnerSourceEvictionVictimResp {
+            victim_index: u32::try_from(index).unwrap_or(u32::MAX),
+            outcome: result.outcome,
+            detail: result.detail,
+        });
+    }
+    (responses, busy)
 }
 
 pub(crate) async fn handle_batch_evict_owner_source(
@@ -1053,7 +1148,7 @@ pub(crate) async fn handle_batch_evict_owner_source(
         };
     }
 
-    let responses = direct_delete_exact_owner_source_batch_with(
+    let (responses, busy) = direct_delete_exact_owner_source_batch_with(
         &view.master_kv_router().inner().key_activity,
         &owner,
         operation_id,
@@ -1095,6 +1190,15 @@ pub(crate) async fn handle_batch_evict_owner_source(
         victims = responses.len(),
         completed,
         retryable,
+        activity_busy_items = busy.activity_busy_items,
+        put_busy_items = busy.put_busy_items,
+        get_busy_items = busy.get_busy_items,
+        replica_busy_items = busy.replica_busy_items,
+        reclaim_busy_items = busy.reclaim_busy_items,
+        inflight_puts = busy.inflight_puts,
+        inflight_gets = busy.inflight_gets,
+        inflight_replicas = busy.inflight_replicas,
+        delete_under_fence_busy_items = busy.delete_under_fence_busy_items,
         "owner source direct-delete batch completed"
     );
 

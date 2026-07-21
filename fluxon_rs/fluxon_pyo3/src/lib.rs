@@ -4615,9 +4615,14 @@ impl KvClient {
         .into_py_object(py)
     }
 
-    #[pyo3(signature = (handle))]
-    fn get_transfer(&self, handle: u64, py: Python) -> PyObject {
-        fn get_transfer_inner(client: &KvClient, handle: u64, py: Python) -> ApiResult<PyObject> {
+    #[pyo3(signature = (handle, consume_prefix_len=None))]
+    fn get_transfer(&self, handle: u64, consume_prefix_len: Option<usize>, py: Python) -> PyObject {
+        fn get_transfer_inner(
+            client: &KvClient,
+            handle: u64,
+            consume_prefix_len: Option<usize>,
+            py: Python,
+        ) -> ApiResult<PyObject> {
             let runtime = match client.runtime.as_ref() {
                 Some(v) => v,
                 None => {
@@ -4644,7 +4649,7 @@ impl KvClient {
                         .external_client_api_view()
                         .external_client_api()
                         .inner()
-                        .get_transfer(handle)
+                        .get_transfer(handle, consume_prefix_len)
                         .await
                 })
             }) {
@@ -4704,7 +4709,7 @@ impl KvClient {
             ApiResult::new_success((plan_ptr as u64).into_py(py))
         }
 
-        get_transfer_inner(self, handle, py).into_py_object(py)
+        get_transfer_inner(self, handle, consume_prefix_len, py).into_py_object(py)
     }
 
     #[pyo3(signature = (handle))]

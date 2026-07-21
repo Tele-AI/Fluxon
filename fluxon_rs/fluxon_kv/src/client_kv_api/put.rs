@@ -2,7 +2,7 @@ use super::{
     ClientKvApiInner, OwnerHotEvictionEvent, OwnerHotEvictionPreparation,
     OwnerHotSelectionFenceOutcome, OwnerLocalReserveClassState, OwnerLocalReserveGrantState,
     OwnerLocalReservePoolState, OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef,
-    ReplicaTaskJob, ReplicaTaskTarget,
+    OwnerRemotePutOutcome, OwnerRemotePutReservation, OwnerRemotePutSharedOp,
     local_reserve_rebalance::{owner_local_reserve_timeout_config, wait_owner_local_reserve_ready},
 };
 use crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
@@ -40,7 +40,6 @@ use crate::{
 };
 use chrono::Utc;
 use fluxon_commu::TransferBreakdown;
-use futures::future::join_all;
 use limit_thirdparty::tokio;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
@@ -632,7 +631,7 @@ pub struct OwnerReservedPutItem {
     pub peer_node_id: Option<NodeIDString>,
     pub remember_local_snapshot: bool,
     pub make_replica_task: bool,
-    pub replica_target: Option<ReplicaTaskTarget>,
+    pub preferred_sub_cluster: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1078,16 +1077,7 @@ impl ClientKvApiInner {
             } else {
                 Some(start_item.node_id.clone())
             };
-            let replica_target =
-                start_item
-                    .replica_target
-                    .as_ref()
-                    .map(|target| ReplicaTaskTarget {
-                        node_id: target.node_id.clone(),
-                        target_offset: target.target_addr - target.target_base_addr,
-                        target_base_addr: target.target_base_addr,
-                        len: target.len,
-                    });
+            let replica_admitted = start_item.replica_target.is_some();
             revoke_items.push(BatchPutRevokeItemReq {
                 key: start_req.key.clone(),
                 put_id: start_item.put_id,
@@ -1103,8 +1093,8 @@ impl ClientKvApiInner {
                 lease_id,
                 peer_node_id: peer_node_id.clone(),
                 remember_local_snapshot: true,
-                make_replica_task: start_req.make_replica_task && replica_target.is_some(),
-                replica_target,
+                make_replica_task: start_req.make_replica_task && replica_admitted,
+                preferred_sub_cluster: start_req.preferred_sub_cluster,
             });
         }
 
@@ -1198,13 +1188,13 @@ impl ClientKvApiInner {
                 self.remember_local_snapshot(&pending.item.key, pending.item.put_id);
             }
             if pending.item.make_replica_task {
-                let target = pending
-                    .item
-                    .replica_target
-                    .clone()
-                    .expect("make_replica_task requires pre-reserved replica target");
                 if let Err(err) = self
-                    .make_replica_task(&pending.item.key, pending.item.put_id, target)
+                    .ensure_remote_put(
+                        &pending.item.key,
+                        pending.item.put_id,
+                        pending.item.preferred_sub_cluster.clone(),
+                        true,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -1315,7 +1305,7 @@ impl ClientKvApiInner {
             lease_id: Option<u64>,
             remember_local_snapshot: bool,
             make_replica_task: bool,
-            replica_target: Option<ReplicaTaskTarget>,
+            preferred_sub_cluster: Option<String>,
         }
 
         let mut results: Vec<Option<KvResult<()>>> = (0..keys.len()).map(|_| None).collect();
@@ -1323,7 +1313,7 @@ impl ClientKvApiInner {
         let short_circuit_payload = self.short_circuit_put_payload_path_enabled();
         let skip_put_end_commit = self.skip_put_end_commit_enabled();
 
-        for (idx, (((key, ptrs), payload_len), start_item)) in keys
+        for (idx, (((key, ptrs), _payload_len), start_item)) in keys
             .into_iter()
             .zip(ptrs_groups.into_iter())
             .zip(payload_lens.into_iter())
@@ -1340,16 +1330,7 @@ impl ClientKvApiInner {
 
             let put_id = start_item.put_id;
             let remember_local_snapshot = true;
-            let replica_target =
-                start_item
-                    .replica_target
-                    .as_ref()
-                    .map(|target| ReplicaTaskTarget {
-                        node_id: target.node_id.clone(),
-                        target_offset: target.target_addr - target.target_base_addr,
-                        target_base_addr: target.target_base_addr,
-                        len: target.len,
-                    });
+            let replica_admitted = start_item.replica_target.is_some();
 
             if !short_circuit_payload {
                 unsafe {
@@ -1363,8 +1344,8 @@ impl ClientKvApiInner {
                 put_id,
                 lease_id,
                 remember_local_snapshot,
-                make_replica_task: make_replica_task && replica_target.is_some(),
-                replica_target,
+                make_replica_task: make_replica_task && replica_admitted,
+                preferred_sub_cluster: preferred_sub_cluster.clone(),
             });
         }
 
@@ -1417,12 +1398,13 @@ impl ClientKvApiInner {
                 self.remember_local_snapshot(&pending.key, pending.put_id);
             }
             if pending.make_replica_task {
-                let target = pending
-                    .replica_target
-                    .clone()
-                    .expect("make_replica_task requires pre-reserved replica target");
                 if let Err(err) = self
-                    .make_replica_task(&pending.key, pending.put_id, target)
+                    .ensure_remote_put(
+                        &pending.key,
+                        pending.put_id,
+                        pending.preferred_sub_cluster.clone(),
+                        true,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -1449,102 +1431,71 @@ impl ClientKvApiInner {
             .collect())
     }
 
-    pub async fn make_replica_task(
-        &self,
-        key: &str,
-        put_id: PutIDForAKey,
-        target: ReplicaTaskTarget,
-    ) -> KvResult<()> {
-        let Some(memory_info) = self.local_committed_mem_holder_for_put_id(key, put_id) else {
-            tracing::warn!(
-                "replica task source holder is unavailable or version-mismatched after local commit; dropping replica task: key={} put_id=({},{})",
-                key,
-                put_id.0,
-                put_id.1
-            );
-            return Ok(());
-        };
-
-        let holder = Arc::new(UserMemHolder::new(
-            memory_info,
-            self.get_or_init_all_memholder_refcount(),
-            UserMemHolderExposeKind::SegPtr,
-        ));
-
-        // A full queue must apply backpressure. Dropping a promised replica task leaves a
-        // local-only committed slot that reserve reclaim cannot safely release.
-        match self
-            .replica_task_tx
-            .send(ReplicaTaskJob {
-                key: key.to_string(),
-                put_id,
-                holder: Some(holder),
-                target: Some(target),
-                preferred_sub_cluster: None,
-                protect_source_on_remote_complete: true,
-            })
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                tracing::warn!(
-                    "replica task actor queue closed; local-only commit remains valid: key={} put_id=({},{}) err={}",
-                    key,
-                    put_id.0,
-                    put_id.1,
-                    err
-                );
-                Ok(())
-            }
-        }
-    }
-
-    pub async fn make_replica_append_task(
+    /// Ensure one remote backing exists for an exact owner-local generation.
+    ///
+    /// Normal Put, pre-reserved replica, proactive write-back, and tier1 all
+    /// enter here.  Only the flight leader pins the source and immediately
+    /// launches Start/transfer/Done in its own async task; there is no actor or
+    /// intermediate work queue. Followers wait for and reuse that terminal
+    /// result instead of acquiring their own holder.
+    pub async fn ensure_remote_put(
         &self,
         key: &str,
         put_id: PutIDForAKey,
         preferred_sub_cluster: Option<String>,
         protect_source_on_remote_complete: bool,
     ) -> KvResult<bool> {
-        let Some(memory_info) = self.local_committed_mem_holder_for_put_id(key, put_id) else {
-            tracing::warn!(
-                "replica append task source holder is unavailable or version-mismatched after local publish; dropping replica task: key={} put_id=({},{})",
+        let mut follower_takeover_attempted = false;
+        loop {
+            match self.begin_owner_remote_put(
                 key,
-                put_id.0,
-                put_id.1
-            );
-            return Ok(false);
-        };
-
-        let holder = Arc::new(UserMemHolder::new(
-            memory_info,
-            self.get_or_init_all_memholder_refcount(),
-            UserMemHolderExposeKind::SegPtr,
-        ));
-
-        // Preserve append tasks under burst load for the same reclaim-safety reason above.
-        match self
-            .replica_task_tx
-            .send(ReplicaTaskJob {
-                key: key.to_string(),
                 put_id,
-                holder: Some(holder),
-                target: None,
-                preferred_sub_cluster,
+                preferred_sub_cluster.clone(),
                 protect_source_on_remote_complete,
-            })
-            .await
-        {
-            Ok(()) => Ok(true),
-            Err(err) => {
-                tracing::warn!(
-                    "replica append task actor queue closed; local-only commit remains valid: key={} put_id=({},{}) err={}",
-                    key,
-                    put_id.0,
-                    put_id.1,
-                    err
-                );
-                Ok(false)
+            ) {
+                OwnerRemotePutReservation::Leader { op, memory_info } => {
+                    let holder = Arc::new(UserMemHolder::new(
+                        memory_info,
+                        self.get_or_init_all_memholder_refcount(),
+                        UserMemHolderExposeKind::SegPtr,
+                    ));
+                    let spawn_view = self.view.clone_view();
+                    let task_view = spawn_view.clone();
+                    let _ = spawn_view.spawn("owner_remote_put_leader", async move {
+                        run_owner_remote_put(task_view, op, holder).await;
+                    });
+                    return Ok(true);
+                }
+                OwnerRemotePutReservation::Follower(op) => {
+                    tracing::debug!(
+                        "owner remote Put joined existing flight: key={} put_id=({},{})",
+                        op.key,
+                        op.put_id.0,
+                        op.put_id.1
+                    );
+                    match op.wait().await {
+                        OwnerRemotePutOutcome::Published
+                        | OwnerRemotePutOutcome::AlreadySatisfied => return Ok(true),
+                        OwnerRemotePutOutcome::Obsolete => return Ok(false),
+                        OwnerRemotePutOutcome::Failed if !follower_takeover_attempted => {
+                            follower_takeover_attempted = true;
+                            continue;
+                        }
+                        OwnerRemotePutOutcome::Failed => return Ok(false),
+                        OwnerRemotePutOutcome::InFlight => {
+                            unreachable!("remote Put wait must return a terminal outcome")
+                        }
+                    }
+                }
+                OwnerRemotePutReservation::SourceUnavailable => {
+                    tracing::warn!(
+                        "owner remote Put source is unavailable, fenced, or version-mismatched: key={} put_id=({},{})",
+                        key,
+                        put_id.0,
+                        put_id.1
+                    );
+                    return Ok(false);
+                }
             }
         }
     }
@@ -1609,15 +1560,7 @@ impl ClientKvApiInner {
         };
         let abs_src = resp.src_addr;
         let abs_target = resp.target_addr;
-        let replica_target = resp
-            .replica_target
-            .as_ref()
-            .map(|target| ReplicaTaskTarget {
-                node_id: target.node_id.clone(),
-                target_offset: target.target_addr - target.target_base_addr,
-                target_base_addr: target.target_base_addr,
-                len: target.len,
-            });
+        let replica_admitted = resp.replica_target.is_some();
 
         #[cfg(test)]
         {
@@ -1662,15 +1605,9 @@ impl ClientKvApiInner {
             );
             self.put_end(key, put_id, lease_id).await?;
             self.remember_local_snapshot(key, put_id);
-            if make_replica_task && replica_target.is_some() {
+            if make_replica_task && replica_admitted {
                 if let Err(err) = self
-                    .make_replica_task(
-                        key,
-                        put_id,
-                        replica_target
-                            .clone()
-                            .expect("make_replica_task requires pre-reserved replica target"),
-                    )
+                    .ensure_remote_put(key, put_id, preferred_sub_cluster.map(str::to_string), true)
                     .await
                 {
                     tracing::warn!(
@@ -1739,15 +1676,9 @@ impl ClientKvApiInner {
 
         self.put_end(key, put_id, lease_id).await?;
         self.remember_local_snapshot(key, put_id);
-        if make_replica_task && replica_target.is_some() {
+        if make_replica_task && replica_admitted {
             if let Err(err) = self
-                .make_replica_task(
-                    key,
-                    put_id,
-                    replica_target
-                        .clone()
-                        .expect("make_replica_task requires pre-reserved replica target"),
-                )
+                .ensure_remote_put(key, put_id, preferred_sub_cluster.map(str::to_string), true)
                 .await
             {
                 tracing::warn!(
@@ -2284,7 +2215,12 @@ impl ClientKvApiInner {
         Ok(resp.serialize_part)
     }
 
-    pub async fn put_append_revoke(&self, key: &str, put_id: PutIDForAKey) -> KvResult<()> {
+    pub async fn put_append_revoke(
+        &self,
+        key: &str,
+        put_id: PutIDForAKey,
+        operation_id: u64,
+    ) -> KvResult<()> {
         if !self.view.register_shutdown_poller().is_running() {
             return Err(KvError::Api(ApiError::SystemShutdown {
                 detail: "ClientKvApi is shutting down; rejecting put_append_revoke".to_string(),
@@ -2294,6 +2230,7 @@ impl ClientKvApiInner {
             serialize_part: PutAppendRevokeReq {
                 key: key.to_string(),
                 put_id,
+                operation_id,
             },
             raw_bytes: Vec::new(),
         };
@@ -2320,6 +2257,7 @@ impl ClientKvApiInner {
         &self,
         key: &str,
         put_id: PutIDForAKey,
+        operation_id: u64,
     ) -> KvResult<PutAppendDoneResp> {
         if !self.view.register_shutdown_poller().is_running() {
             return Err(KvError::Api(ApiError::SystemShutdown {
@@ -2330,6 +2268,7 @@ impl ClientKvApiInner {
             serialize_part: PutAppendDoneReq {
                 key: key.to_string(),
                 put_id,
+                operation_id,
             },
             raw_bytes: Vec::new(),
         };
@@ -2840,7 +2779,6 @@ impl ClientKvApiInner {
     }
 }
 
-const REPLICA_TASK_BATCH_MERGE_WINDOW: Duration = Duration::from_millis(2);
 const OWNER_LOCAL_PUBLISH_RETRY_INITIAL: Duration = Duration::from_millis(25);
 const OWNER_LOCAL_PUBLISH_RETRY_MAX: Duration = Duration::from_secs(1);
 
@@ -2945,18 +2883,27 @@ mod owner_hot_replica_policy_tests {
 
 async fn start_replica_append_with_retry(
     inner: &ClientKvApiInner,
-    job: &ReplicaTaskJob,
+    op: &OwnerRemotePutSharedOp,
     len: u32,
 ) -> KvResult<PutAppendStartResp> {
+    let request = op.request();
     inner
         .put_append_start(
-            &job.key,
-            job.put_id,
+            &op.key,
+            op.put_id,
             len,
-            job.preferred_sub_cluster.as_deref(),
-            job.protect_source_on_remote_complete,
+            request.preferred_sub_cluster.as_deref(),
+            request.protect_source_on_remote_complete,
         )
         .await
+}
+
+struct RemotePutTarget {
+    operation_id: u64,
+    node_id: String,
+    target_offset: u64,
+    target_base_addr: u64,
+    len: u64,
 }
 
 fn owner_source_eviction_identity(
@@ -3205,6 +3152,38 @@ async fn process_owner_source_eviction_events(
         return;
     }
 
+    let retryable = response
+        .victims
+        .iter()
+        .filter(|result| {
+            matches!(
+                result.outcome,
+                OwnerSourceEvictionOutcome::RetryableBusy | OwnerSourceEvictionOutcome::Unspecified
+            )
+        })
+        .count();
+    if retryable != 0
+        && let Some((index, result)) = response.victims.iter().enumerate().find(|(_, result)| {
+            matches!(
+                result.outcome,
+                OwnerSourceEvictionOutcome::RetryableBusy | OwnerSourceEvictionOutcome::Unspecified
+            )
+        })
+    {
+        let victim = &prepared[index].1;
+        tracing::warn!(
+            operation_id = response.operation_id,
+            victims = response.victims.len(),
+            retryable,
+            first_victim_index = result.victim_index,
+            key = %victim.key,
+            put_time_ms = victim.put_id.0,
+            put_version = victim.put_id.1,
+            detail = %result.detail,
+            "owner source direct-delete batch has retryable victims"
+        );
+    }
+
     for (index, ((event, victim), result)) in prepared
         .into_iter()
         .zip(response.victims.into_iter())
@@ -3427,512 +3406,177 @@ pub fn spawn_owner_hot_retry_actor(view: ClientKvApiView) {
     });
 }
 
-async fn process_replica_task(view_task: ClientKvApiView, mut job: ReplicaTaskJob) {
-    let inner = view_task.client_kv_api().inner();
-    let holder = job
-        .holder
-        .as_ref()
-        .expect("replica task source must be pinned before transfer");
+async fn fail_owner_remote_put(
+    view: &ClientKvApiView,
+    op: Arc<OwnerRemotePutSharedOp>,
+    operation_id: Option<u64>,
+    reason: &'static str,
+) {
+    let inner = view.client_kv_api().inner();
+    if let Some(operation_id) = operation_id {
+        if let Err(revoke_err) = inner
+            .put_append_revoke(&op.key, op.put_id, operation_id)
+            .await
+        {
+            tracing::warn!(
+                "owner remote Put revoke failed after {}: key={} put_id=({},{}) operation_id={} err={}",
+                reason,
+                op.key,
+                op.put_id.0,
+                op.put_id.1,
+                operation_id,
+                revoke_err
+            );
+        }
+    }
+    inner.finish_owner_remote_put(&op, OwnerRemotePutOutcome::Failed);
+}
+
+async fn run_owner_remote_put(
+    view: ClientKvApiView,
+    op: Arc<OwnerRemotePutSharedOp>,
+    holder: Arc<UserMemHolder>,
+) {
+    let inner = view.client_kv_api().inner();
     let src_offset = holder.memory_info().offset;
     let len = holder.get_length() as u64;
-    let target = if let Some(target) = job.target.clone() {
-        target
-    } else {
-        let len_u32 = match u32::try_from(len) {
-            Ok(len_u32) => len_u32,
-            Err(_) => {
-                tracing::warn!(
-                    "replica append task length does not fit u32: key={} put_id=({},{}) len={}",
-                    job.key,
-                    job.put_id.0,
-                    job.put_id.1,
-                    len
-                );
-                return;
-            }
-        };
-        let append_start = match start_replica_append_with_retry(inner, &job, len_u32).await {
-            Ok(resp) => resp,
-            Err(err) => {
-                tracing::warn!(
-                    "replica append task start failed: key={} put_id=({},{}) err={}",
-                    job.key,
-                    job.put_id.0,
-                    job.put_id.1,
-                    err
-                );
-                return;
-            }
-        };
-        match append_start.outcome {
-            PutAppendStartOutcome::Scheduled => {}
-            PutAppendStartOutcome::AlreadySatisfied | PutAppendStartOutcome::Obsolete => return,
-            PutAppendStartOutcome::RetryableNoSpace | PutAppendStartOutcome::Unspecified => {
-                tracing::debug!(
-                    outcome = ?append_start.outcome,
-                    "replica append task deferred: key={} put_id=({},{})",
-                    job.key,
-                    job.put_id.0,
-                    job.put_id.1
-                );
-                return;
-            }
+    let len_u32 = match u32::try_from(len) {
+        Ok(len_u32) => len_u32,
+        Err(_) => {
+            tracing::warn!(
+                "owner remote Put length does not fit u32: key={} put_id=({},{}) len={}",
+                op.key,
+                op.put_id.0,
+                op.put_id.1,
+                len
+            );
+            drop(holder);
+            fail_owner_remote_put(&view, op, None, "length does not fit u32").await;
+            return;
         }
-        ReplicaTaskTarget {
-            node_id: append_start.node_id,
-            target_offset: append_start.target_addr - append_start.target_base_addr,
-            target_base_addr: append_start.target_base_addr,
-            len: append_start.len,
+    };
+
+    let append_start = match start_replica_append_with_retry(inner, &op, len_u32).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::warn!(
+                "owner remote Put start failed: key={} put_id=({},{}) err={}",
+                op.key,
+                op.put_id.0,
+                op.put_id.1,
+                err
+            );
+            drop(holder);
+            fail_owner_remote_put(&view, op, None, "start error").await;
+            return;
         }
+    };
+    match append_start.outcome {
+        PutAppendStartOutcome::Scheduled => {}
+        PutAppendStartOutcome::AlreadySatisfied => {
+            drop(holder);
+            inner.finish_owner_remote_put(&op, OwnerRemotePutOutcome::AlreadySatisfied);
+            return;
+        }
+        PutAppendStartOutcome::Obsolete => {
+            drop(holder);
+            inner.finish_owner_remote_put(&op, OwnerRemotePutOutcome::Obsolete);
+            return;
+        }
+        PutAppendStartOutcome::RetryableNoSpace | PutAppendStartOutcome::Unspecified => {
+            tracing::debug!(
+                outcome = ?append_start.outcome,
+                "owner remote Put deferred: key={} put_id=({},{})",
+                op.key,
+                op.put_id.0,
+                op.put_id.1
+            );
+            drop(holder);
+            inner.finish_owner_remote_put(&op, OwnerRemotePutOutcome::Failed);
+            return;
+        }
+    }
+
+    let target = RemotePutTarget {
+        operation_id: append_start.operation_id,
+        node_id: append_start.node_id,
+        target_offset: append_start.target_addr - append_start.target_base_addr,
+        target_base_addr: append_start.target_base_addr,
+        len: append_start.len,
     };
     if len != target.len {
         tracing::warn!(
-            "replica task length mismatch: key={} put_id=({},{}) src_len={} target_len={}",
-            job.key,
-            job.put_id.0,
-            job.put_id.1,
+            "owner remote Put length mismatch: key={} put_id=({},{}) src_len={} target_len={}",
+            op.key,
+            op.put_id.0,
+            op.put_id.1,
             len,
             target.len
         );
-        spawn_replica_task_revoke(view_task.clone(), job.key, job.put_id, "length mismatch");
+        drop(holder);
+        fail_owner_remote_put(&view, op, Some(target.operation_id), "length mismatch").await;
         return;
     }
+
+    inner.record_owner_remote_put_transfer();
     if let Err(err) = inner
         .put_transfer(
-            &job.key,
-            job.put_id,
+            &op.key,
+            op.put_id,
             src_offset,
             target.target_offset,
             len,
-            Some(target.node_id.clone()),
+            Some(target.node_id),
             Some(target.target_base_addr),
         )
         .await
     {
         tracing::warn!(
-            "replica task transfer failed: key={} put_id=({},{}) err={}",
-            job.key,
-            job.put_id.0,
-            job.put_id.1,
+            "owner remote Put transfer failed: key={} put_id=({},{}) err={}",
+            op.key,
+            op.put_id.0,
+            op.put_id.1,
             err
         );
-        spawn_replica_task_revoke(view_task.clone(), job.key, job.put_id, "transfer error");
+        drop(holder);
+        fail_owner_remote_put(&view, op, Some(target.operation_id), "transfer error").await;
         return;
     }
-    // Append-done may reclaim the source synchronously. Release the transfer-only holder first so
-    // this task does not make its own reclaim look busy.
-    drop(job.holder.take());
-    match inner.put_append_done(&job.key, job.put_id).await {
+
+    // The payload is no longer read after transfer.  Keep the generation
+    // flight installed through Done so eviction cannot cross the completion
+    // protocol even though the physical source holder is now releasable.
+    drop(holder);
+    match inner
+        .put_append_done(&op.key, op.put_id, target.operation_id)
+        .await
+    {
         Ok(resp) => {
+            let outcome = if resp.appended {
+                OwnerRemotePutOutcome::Published
+            } else {
+                OwnerRemotePutOutcome::AlreadySatisfied
+            };
             tracing::debug!(
-                "replica task append done: key={} put_id=({},{}) appended={}",
-                job.key,
-                job.put_id.0,
-                job.put_id.1,
+                "owner remote Put done: key={} put_id=({},{}) appended={}",
+                op.key,
+                op.put_id.0,
+                op.put_id.1,
                 resp.appended
             );
+            inner.finish_owner_remote_put(&op, outcome);
         }
         Err(err) => {
             tracing::warn!(
-                "replica task append done failed: key={} put_id=({},{}) err={}",
-                job.key,
-                job.put_id.0,
-                job.put_id.1,
+                "owner remote Put done failed: key={} put_id=({},{}) err={}",
+                op.key,
+                op.put_id.0,
+                op.put_id.1,
                 err
             );
+            fail_owner_remote_put(&view, op, Some(target.operation_id), "done error").await;
         }
     }
-}
-
-struct ReplicaAppendDoneJob {
-    key: String,
-    put_id: PutIDForAKey,
-}
-
-async fn finish_replica_append_jobs_individually(
-    inner: &ClientKvApiInner,
-    jobs: Vec<ReplicaAppendDoneJob>,
-) {
-    let results = join_all(jobs.into_iter().map(|job| async move {
-        let result = inner.put_append_done(&job.key, job.put_id).await;
-        (job, result)
-    }))
-    .await;
-    for (job, result) in results {
-        match result {
-            Ok(_resp) => {}
-            Err(err) => {
-                tracing::warn!(
-                    "replica task append done fallback failed: key={} put_id=({},{}) err={}",
-                    job.key,
-                    job.put_id.0,
-                    job.put_id.1,
-                    err
-                );
-            }
-        }
-    }
-}
-
-async fn process_replica_append_batch(view_task: ClientKvApiView, jobs: Vec<ReplicaTaskJob>) {
-    if jobs.is_empty() {
-        return;
-    }
-    let inner = view_task.client_kv_api().inner();
-    let mut valid_jobs = Vec::with_capacity(jobs.len());
-    let mut start_items = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        let len = job
-            .holder
-            .as_ref()
-            .expect("batch replica source must be pinned")
-            .get_length() as u64;
-        if u32::try_from(len).is_err() {
-            tracing::warn!(
-                "replica append task length does not fit u32: key={} put_id=({},{}) len={}",
-                job.key,
-                job.put_id.0,
-                job.put_id.1,
-                len
-            );
-            continue;
-        }
-        start_items.push(BatchPutAppendStartItemReq {
-            key: job.key.clone(),
-            put_id: job.put_id,
-            len,
-            preferred_sub_cluster: job.preferred_sub_cluster.clone(),
-            protect_source_on_remote_complete: job.protect_source_on_remote_complete,
-        });
-        valid_jobs.push(job);
-    }
-    if valid_jobs.is_empty() {
-        return;
-    }
-
-    let requested = valid_jobs.len();
-    let start_time = Instant::now();
-    let start_resp = match inner.batch_put_append_start(start_items).await {
-        Ok(resp) if resp.items.len() == requested => resp,
-        Ok(resp) => {
-            tracing::warn!(
-                "batch replica append start response length mismatch: expected={} got={}",
-                requested,
-                resp.items.len()
-            );
-            for job in valid_jobs {
-                spawn_replica_task_revoke(
-                    view_task.clone(),
-                    job.key,
-                    job.put_id,
-                    "batch start response mismatch",
-                );
-            }
-            return;
-        }
-        Err(err) => {
-            tracing::warn!(
-                "batch replica append start RPC failed; falling back per item: items={} err={}",
-                requested,
-                err
-            );
-            join_all(
-                valid_jobs
-                    .into_iter()
-                    .map(|job| process_replica_task(view_task.clone(), job)),
-            )
-            .await;
-            return;
-        }
-    };
-
-    let mut scheduled = Vec::new();
-    let mut already_satisfied = 0usize;
-    let mut start_failed = 0usize;
-    for (job, item) in valid_jobs.into_iter().zip(start_resp.items.into_iter()) {
-        if item.key != job.key || item.put_id != job.put_id {
-            tracing::warn!(
-                "batch replica append start identity mismatch: request_key={} request_put_id=({},{}) response_key={} response_put_id=({},{})",
-                job.key,
-                job.put_id.0,
-                job.put_id.1,
-                item.key,
-                item.put_id.0,
-                item.put_id.1
-            );
-            spawn_replica_task_revoke(
-                view_task.clone(),
-                job.key,
-                job.put_id,
-                "batch start identity mismatch",
-            );
-            start_failed += 1;
-            continue;
-        }
-        if let Err(err) =
-            crate::rpcresp_kvresult_convert::try_from_code(item.error_code, item.error_json.clone())
-        {
-            tracing::warn!(
-                "batch replica append start item failed: key={} put_id=({},{}) err={}",
-                job.key,
-                job.put_id.0,
-                job.put_id.1,
-                err
-            );
-            start_failed += 1;
-            continue;
-        }
-        match item.outcome {
-            PutAppendStartOutcome::Scheduled => {}
-            PutAppendStartOutcome::AlreadySatisfied => {
-                already_satisfied += 1;
-                continue;
-            }
-            PutAppendStartOutcome::Obsolete => continue,
-            PutAppendStartOutcome::RetryableNoSpace | PutAppendStartOutcome::Unspecified => {
-                start_failed += 1;
-                continue;
-            }
-        }
-        let target = ReplicaTaskTarget {
-            node_id: item.node_id,
-            target_offset: item.target_addr - item.target_base_addr,
-            target_base_addr: item.target_base_addr,
-            len: item.len,
-        };
-        let source_len = job
-            .holder
-            .as_ref()
-            .expect("scheduled batch replica source must remain pinned")
-            .get_length() as u64;
-        if source_len != target.len {
-            tracing::warn!(
-                "batch replica task length mismatch: key={} put_id=({},{}) src_len={} target_len={}",
-                job.key,
-                job.put_id.0,
-                job.put_id.1,
-                source_len,
-                target.len
-            );
-            spawn_replica_task_revoke(
-                view_task.clone(),
-                job.key,
-                job.put_id,
-                "batch length mismatch",
-            );
-            start_failed += 1;
-            continue;
-        }
-        scheduled.push((job, target));
-    }
-    tracing::info!(
-        requested,
-        scheduled = scheduled.len(),
-        already_satisfied,
-        failed = start_failed,
-        rpc_us = duration_to_i64_us(start_time.elapsed()),
-        "replica writeback batch start complete"
-    );
-
-    let transfer_results = join_all(scheduled.into_iter().map(|(job, target)| {
-        let transfer_view = view_task.clone();
-        async move {
-            let inner = transfer_view.client_kv_api().inner();
-            let src_offset = job
-                .holder
-                .as_ref()
-                .expect("scheduled batch replica source must remain pinned")
-                .memory_info()
-                .offset;
-            let result = inner
-                .put_transfer(
-                    &job.key,
-                    job.put_id,
-                    src_offset,
-                    target.target_offset,
-                    target.len,
-                    Some(target.node_id),
-                    Some(target.target_base_addr),
-                )
-                .await;
-            (job, result)
-        }
-    }))
-    .await;
-
-    let mut done_jobs = Vec::new();
-    for (job, result) in transfer_results {
-        match result {
-            Ok(_) => {
-                let ReplicaTaskJob {
-                    key,
-                    put_id,
-                    holder,
-                    ..
-                } = job;
-                drop(holder);
-                done_jobs.push(ReplicaAppendDoneJob { key, put_id });
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "batch replica task transfer failed: key={} put_id=({},{}) err={}",
-                    job.key,
-                    job.put_id.0,
-                    job.put_id.1,
-                    err
-                );
-                spawn_replica_task_revoke(
-                    view_task.clone(),
-                    job.key,
-                    job.put_id,
-                    "batch transfer error",
-                );
-            }
-        }
-    }
-    if done_jobs.is_empty() {
-        return;
-    }
-
-    let done_requested = done_jobs.len();
-    let done_items = done_jobs
-        .iter()
-        .map(|job| BatchPutAppendDoneItemReq {
-            key: job.key.clone(),
-            put_id: job.put_id,
-        })
-        .collect();
-    let done_time = Instant::now();
-    let done_resp = match inner.batch_put_append_done(done_items).await {
-        Ok(resp) if resp.items.len() == done_requested => resp,
-        Ok(resp) => {
-            tracing::warn!(
-                "batch replica append done response length mismatch: expected={} got={}; falling back per item",
-                done_requested,
-                resp.items.len()
-            );
-            finish_replica_append_jobs_individually(inner, done_jobs).await;
-            return;
-        }
-        Err(err) => {
-            tracing::warn!(
-                "batch replica append done RPC failed; falling back per item: items={} err={}",
-                done_requested,
-                err
-            );
-            finish_replica_append_jobs_individually(inner, done_jobs).await;
-            return;
-        }
-    };
-
-    let mut appended = 0usize;
-    let mut already_done = 0usize;
-    let mut done_failed = 0usize;
-    for (job, item) in done_jobs.into_iter().zip(done_resp.items.into_iter()) {
-        let identity_matches = item.key == job.key && item.put_id == job.put_id;
-        let item_result = crate::rpcresp_kvresult_convert::try_from_code(
-            item.error_code,
-            item.error_json.clone(),
-        );
-        if !identity_matches || item_result.is_err() {
-            tracing::warn!(
-                "batch replica append done item failed: key={} put_id=({},{}) identity_matches={} err={:?}",
-                job.key,
-                job.put_id.0,
-                job.put_id.1,
-                identity_matches,
-                item_result.err()
-            );
-            spawn_replica_task_revoke(
-                view_task.clone(),
-                job.key,
-                job.put_id,
-                "batch done item error",
-            );
-            done_failed += 1;
-            continue;
-        }
-        if item.appended {
-            appended += 1;
-        } else {
-            already_done += 1;
-        }
-    }
-    tracing::info!(
-        requested = done_requested,
-        appended,
-        already_satisfied = already_done,
-        failed = done_failed,
-        rpc_us = duration_to_i64_us(done_time.elapsed()),
-        "replica writeback batch done complete"
-    );
-}
-
-async fn process_replica_task_batch(view_task: ClientKvApiView, jobs: Vec<ReplicaTaskJob>) {
-    let mut append_jobs = Vec::new();
-    let mut reserved_target_jobs = Vec::new();
-    for job in jobs {
-        if job.target.is_some() {
-            reserved_target_jobs.push(job);
-        } else {
-            append_jobs.push(job);
-        }
-    }
-    let append = process_replica_append_batch(view_task.clone(), append_jobs);
-    let reserved = join_all(
-        reserved_target_jobs
-            .into_iter()
-            .map(|job| process_replica_task(view_task.clone(), job)),
-    );
-    let (_, _) = futures::join!(append, reserved);
-}
-
-pub fn spawn_replica_task_actor(
-    view: ClientKvApiView,
-    mut rx: tokio::sync::ampsc::Receiver<ReplicaTaskJob>,
-    max_inflight: usize,
-) {
-    let view_task = view.clone();
-    let _ = view.spawn("replica_task_actor", async move {
-        let max_inflight = max_inflight.max(1);
-        tracing::info!(
-            max_inflight,
-            merge_window_ms = REPLICA_TASK_BATCH_MERGE_WINDOW.as_millis(),
-            "replica task actor started with time-window batching"
-        );
-        let mut shutdown_waiter = view_task.register_shutdown_waiter();
-        loop {
-            let first = tokio::select! {
-                _ = shutdown_waiter.wait() => {
-                    tracing::info!("replica_task_actor stopping due to shutdown signal");
-                    break;
-                }
-                job = rx.recv() => {
-                    match job {
-                        Some(job) => job,
-                        None => break,
-                    }
-                }
-            };
-            let mut batch = Vec::with_capacity(max_inflight);
-            batch.push(first);
-            let merge_window = tokio::time::sleep(REPLICA_TASK_BATCH_MERGE_WINDOW);
-            tokio::pin!(merge_window);
-            while batch.len() < max_inflight {
-                tokio::select! {
-                    _ = &mut merge_window => break,
-                    job = rx.recv() => {
-                        match job {
-                            Some(job) => batch.push(job),
-                            None => break,
-                        }
-                    }
-                }
-            }
-            tracing::info!(items = batch.len(), "replica writeback batch flushed");
-            process_replica_task_batch(view_task.clone(), batch).await;
-        }
-    });
 }
 
 pub async fn handle_batch_enqueue_replica_tasks(
@@ -3943,7 +3587,7 @@ pub async fn handle_batch_enqueue_replica_tasks(
     let mut items = Vec::with_capacity(req.serialize_part.items.len());
     for item in req.serialize_part.items {
         let accepted = match inner
-            .make_replica_append_task(&item.key, item.put_id, None, false)
+            .ensure_remote_put(&item.key, item.put_id, None, false)
             .await
         {
             Ok(accepted) => accepted,
@@ -4256,7 +3900,7 @@ pub(crate) async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLoc
         for item in promoted_items {
             if item.make_replica_task {
                 if let Err(err) = inner
-                    .make_replica_append_task(
+                    .ensure_remote_put(
                         &item.key,
                         item.put_id,
                         item.preferred_sub_cluster.clone(),
@@ -4296,25 +3940,4 @@ async fn release_owner_local_publish_reservations(
             err
         );
     }
-}
-
-fn spawn_replica_task_revoke(
-    view: ClientKvApiView,
-    key: String,
-    put_id: PutIDForAKey,
-    reason: &'static str,
-) {
-    let _ = view.clone().spawn("replica_task_revoke", async move {
-        let inner = view.client_kv_api().inner();
-        if let Err(revoke_err) = inner.put_append_revoke(&key, put_id).await {
-            tracing::warn!(
-                "replica task append revoke failed after {}: key={} put_id=({},{}) err={}",
-                reason,
-                key,
-                put_id.0,
-                put_id.1,
-                revoke_err
-            );
-        }
-    });
 }

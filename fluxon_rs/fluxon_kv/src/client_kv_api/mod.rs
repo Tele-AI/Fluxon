@@ -3,17 +3,18 @@ use crate::client_kv_api::local_reserve_rebalance::{
     spawn_owner_local_reserve_rebalance_actor, spawn_owner_slot_pressure_actor,
 };
 use crate::client_kv_api::msg_pack::{
-    ExternalBatchGetCancelReq, ExternalBatchGetCancelResp, ExternalBatchGetReq,
-    ExternalBatchGetResp, ExternalBatchGetStartReq, ExternalBatchGetStartResp,
-    ExternalBatchGetTransferReq, ExternalBatchGetTransferResp, ExternalBatchIsExistReq,
-    ExternalBatchIsExistResp, ExternalBatchPutCommitReq, ExternalBatchPutCommitResp,
-    ExternalBatchPutStartReq, ExternalBatchPutStartResp, ExternalBatchPutTransferEndReq,
-    ExternalBatchPutTransferEndResp, ExternalDeleteAckReq, ExternalDeleteAckResp,
-    ExternalDeleteReq, ExternalDeleteResp, ExternalGetReq, ExternalGetResp, ExternalIsExistReq,
-    ExternalIsExistResp, ExternalObservabilitySnapshotReq, ExternalObservabilitySnapshotResp,
-    ExternalPutCommitReq, ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp,
-    ExternalPutStartReq, ExternalPutStartResp, ExternalPutTransferEndReq,
-    ExternalPutTransferEndResp, SyncKvToFileReq, SyncKvToFileResp, TestPutPhaseTrace,
+    ExternalBatchDeleteAckReq, ExternalBatchDeleteAckResp, ExternalBatchGetCancelReq,
+    ExternalBatchGetCancelResp, ExternalBatchGetReq, ExternalBatchGetResp,
+    ExternalBatchGetStartReq, ExternalBatchGetStartResp, ExternalBatchGetTransferReq,
+    ExternalBatchGetTransferResp, ExternalBatchIsExistReq, ExternalBatchIsExistResp,
+    ExternalBatchPutCommitReq, ExternalBatchPutCommitResp, ExternalBatchPutStartReq,
+    ExternalBatchPutStartResp, ExternalBatchPutTransferEndReq, ExternalBatchPutTransferEndResp,
+    ExternalDeleteAckReq, ExternalDeleteAckResp, ExternalDeleteReq, ExternalDeleteResp,
+    ExternalGetReq, ExternalGetResp, ExternalIsExistReq, ExternalIsExistResp,
+    ExternalObservabilitySnapshotReq, ExternalObservabilitySnapshotResp, ExternalPutCommitReq,
+    ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp, ExternalPutStartReq,
+    ExternalPutStartResp, ExternalPutTransferEndReq, ExternalPutTransferEndResp, SyncKvToFileReq,
+    SyncKvToFileResp, TestPutPhaseTrace,
 };
 use crate::client_kv_api::reclaim::handle_batch_owner_reclaim;
 use crate::cluster_manager::{NodeID, NodeIDString};
@@ -59,18 +60,14 @@ use limit_thirdparty::tokio;
 use moka::notification::RemovalCause;
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Weak;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
-const REPLICA_TASK_QUEUE_CAPACITY: usize = 128;
-// Queue only weak source references. This preserves a deep policy backlog without turning queued
-// write-back work into non-reclaimable owner memory; the dispatcher pins a still-current source
-// immediately before handing it to the bounded replica-task actor.
 const OWNER_LOCAL_PUBLISH_QUEUE_CAPACITY: usize = 4096;
 const OWNER_LOCAL_PUBLISH_MAX_INFLIGHT: usize = 64;
 
@@ -99,6 +96,18 @@ pub struct OwnerRuntimeObserveSnapshot {
     pub external_get_undecided_interests: u64,
     pub external_get_retained_interests: u64,
     pub external_pending_put_entries: u64,
+    pub remote_put_flights_active: u64,
+    pub remote_put_flight_leaders: u64,
+    pub remote_put_flight_followers: u64,
+    pub remote_put_source_unavailable: u64,
+    pub remote_put_source_fenced: u64,
+    pub remote_put_source_missing: u64,
+    pub remote_put_source_version_mismatch: u64,
+    pub remote_put_transfers: u64,
+    pub remote_put_published: u64,
+    pub remote_put_already_satisfied: u64,
+    pub remote_put_obsolete: u64,
+    pub remote_put_failed: u64,
     pub local_reserve_slots_free: u64,
     pub local_reserve_slots_prepared: u64,
     pub local_reserve_slots_pending_visible: u64,
@@ -242,6 +251,10 @@ pub struct ExternalGetKeySharedState {
     /// Number of those operations whose transferable prefix retained the key.
     pub retained: usize,
     pub phase: ExternalGetKeySharedPhase,
+    /// Monotonic publication time for Ready/Failed.  Observation-only users
+    /// compare this with the later handle-consume time to distinguish data
+    /// that was already ready from time actually spent waiting in Transfer.
+    pub terminal_at: Option<Instant>,
 }
 
 pub struct ExternalGetKeySharedOp {
@@ -258,6 +271,7 @@ impl ExternalGetKeySharedOp {
                 undecided: 1,
                 retained: 0,
                 phase: ExternalGetKeySharedPhase::Starting,
+                terminal_at: None,
             }),
             notify: Arc::new(limit_thirdparty::tokio::sync::Notify::new()),
         }
@@ -292,6 +306,7 @@ pub struct ExternalGetStartEntry {
     pub requester_node_start_time: Option<i64>,
     pub keys: Vec<String>,
     pub items: Vec<ExternalGetStartOwnerItem>,
+    pub atomic_group_lens: Vec<usize>,
     pub created_at: Instant,
 }
 
@@ -924,6 +939,89 @@ async fn handle_external_delete_ack(
         raw_bytes: Vec::new(),
     }
 }
+
+fn release_external_holder_ids_with(
+    holder_ids: Vec<u64>,
+    mut remove: impl FnMut(u64) -> bool,
+) -> (u32, u32) {
+    let mut seen = HashSet::with_capacity(holder_ids.len());
+    let mut released = 0u32;
+    let mut missing = 0u32;
+    for holder_id in holder_ids {
+        if !seen.insert(holder_id) {
+            continue;
+        }
+        if remove(holder_id) {
+            released = released.saturating_add(1);
+        } else {
+            missing = missing.saturating_add(1);
+        }
+    }
+    (released, missing)
+}
+
+async fn handle_external_batch_delete_ack(
+    view: &ClientKvApiView,
+    msg: &MsgPack<ExternalBatchDeleteAckReq>,
+) -> MsgPack<ExternalBatchDeleteAckResp> {
+    let req = msg.serialize_part.clone();
+    let expected = view.cluster_manager().get_self_info().node_start_time;
+    if req.started_time != 0 && req.started_time != expected {
+        let err = crate::rpcresp_kvresult_convert::msg_and_error::KvError::Api(
+            crate::rpcresp_kvresult_convert::msg_and_error::ApiError::OwnerStartTimeMismatch {
+                expected,
+                got: req.started_time,
+            },
+        );
+        return MsgPack {
+            serialize_part: ExternalBatchDeleteAckResp::from_error(&err),
+            raw_bytes: Vec::new(),
+        };
+    }
+
+    let inner = view.client_kv_api().inner();
+    let external_client_id = req.external_client_id;
+    let requested_count = req.holder_ids.len();
+    let (released_count, missing_count) =
+        release_external_holder_ids_with(req.holder_ids, |holder_id| {
+            inner
+                .external_get_holding
+                .remove(&NodeHolderKey::new(external_client_id.clone(), holder_id))
+                .is_some()
+        });
+    tracing::debug!(
+        external_client_id,
+        requested_count,
+        released_count,
+        missing_count,
+        "processed external holder ACK batch"
+    );
+    MsgPack {
+        serialize_part: ExternalBatchDeleteAckResp {
+            released_count,
+            missing_count,
+            error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
+            error_json: String::new(),
+        },
+        raw_bytes: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod external_delete_ack_batch_tests {
+    use super::release_external_holder_ids_with;
+    use std::collections::HashSet;
+
+    #[test]
+    fn duplicate_and_missing_holder_ids_are_idempotent() {
+        let mut live = HashSet::from([3u64, 5u64]);
+        let (released, missing) =
+            release_external_holder_ids_with(vec![3, 3, 4, 5], |holder_id| live.remove(&holder_id));
+        assert_eq!((released, missing), (2, 1));
+        assert!(live.is_empty());
+    }
+}
+
 async fn handle_external_delete(
     view: &ClientKvApiView,
     msg: &MsgPack<ExternalDeleteReq>,
@@ -1285,6 +1383,22 @@ struct OwnerHotCacheCounters {
     legacy_put_done_items: AtomicU64,
 }
 
+#[derive(Default)]
+struct OwnerRemotePutCounters {
+    active: AtomicU64,
+    leaders: AtomicU64,
+    followers: AtomicU64,
+    source_unavailable: AtomicU64,
+    source_fenced: AtomicU64,
+    source_missing: AtomicU64,
+    source_version_mismatch: AtomicU64,
+    transfers: AtomicU64,
+    published: AtomicU64,
+    already_satisfied: AtomicU64,
+    obsolete: AtomicU64,
+    failed: AtomicU64,
+}
+
 struct OwnerHotSelectionDebt {
     weight_bytes: u64,
     outstanding_bytes: Arc<AtomicU64>,
@@ -1568,6 +1682,110 @@ pub(crate) struct ExternalPutKeySharedOp {
     outcome: watch::Sender<ExternalPutKeyOutcome>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerRemotePutOutcome {
+    InFlight,
+    Published,
+    AlreadySatisfied,
+    Obsolete,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OwnerRemotePutRequest {
+    pub preferred_sub_cluster: Option<String>,
+    pub protect_source_on_remote_complete: bool,
+}
+
+/// One owner-initiated remote write for an exact local generation.
+///
+/// Every trigger (normal Put, pre-reserved replica, proactive write-back, and
+/// tier1) joins this same operation.  The trigger is deliberately absent from
+/// the identity so policy labels cannot create a second payload transfer.
+pub(crate) struct OwnerRemotePutSharedOp {
+    pub key: String,
+    pub put_id: crate::master_kv_router::put::PutIDForAKey,
+    request: Mutex<OwnerRemotePutRequest>,
+    outcome: watch::Sender<OwnerRemotePutOutcome>,
+    completed: AtomicBool,
+}
+
+impl OwnerRemotePutSharedOp {
+    fn new(
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        preferred_sub_cluster: Option<String>,
+        protect_source_on_remote_complete: bool,
+    ) -> Arc<Self> {
+        let (outcome, _receiver) = watch::channel(OwnerRemotePutOutcome::InFlight);
+        Arc::new(Self {
+            key: key.to_string(),
+            put_id,
+            request: Mutex::new(OwnerRemotePutRequest {
+                preferred_sub_cluster,
+                protect_source_on_remote_complete,
+            }),
+            outcome,
+            completed: AtomicBool::new(false),
+        })
+    }
+
+    fn merge_request(
+        &self,
+        preferred_sub_cluster: Option<String>,
+        protect_source_on_remote_complete: bool,
+    ) {
+        let mut request = self.request.lock();
+        if request.preferred_sub_cluster.is_none() {
+            request.preferred_sub_cluster = preferred_sub_cluster;
+        }
+        request.protect_source_on_remote_complete |= protect_source_on_remote_complete;
+    }
+
+    pub(crate) fn request(&self) -> OwnerRemotePutRequest {
+        self.request.lock().clone()
+    }
+
+    pub(crate) fn outcome(&self) -> OwnerRemotePutOutcome {
+        *self.outcome.borrow()
+    }
+
+    fn complete(&self, outcome: OwnerRemotePutOutcome) -> bool {
+        debug_assert_ne!(outcome, OwnerRemotePutOutcome::InFlight);
+        if self
+            .completed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.outcome.send_replace(outcome);
+        true
+    }
+
+    pub(crate) async fn wait(&self) -> OwnerRemotePutOutcome {
+        let mut outcome = self.outcome.subscribe();
+        loop {
+            let current = *outcome.borrow_and_update();
+            if current != OwnerRemotePutOutcome::InFlight {
+                return current;
+            }
+            if outcome.changed().await.is_err() {
+                return OwnerRemotePutOutcome::Failed;
+            }
+        }
+    }
+}
+
+pub(crate) enum OwnerRemotePutReservation {
+    Leader {
+        op: Arc<OwnerRemotePutSharedOp>,
+        memory_info: Arc<MemoryInfo>,
+    },
+    Follower(Arc<OwnerRemotePutSharedOp>),
+    SourceUnavailable,
+}
+
 impl ExternalPutKeySharedOp {
     fn new() -> Arc<Self> {
         let (outcome, _receiver) = watch::channel(ExternalPutKeyOutcome::InFlight);
@@ -1598,6 +1816,11 @@ impl ExternalPutKeySharedOp {
 pub(crate) enum ExternalLocalFirstPutKeyReservation {
     Leader(Arc<ExternalPendingPutFenceGuard>),
     Wait(Arc<ExternalPutKeySharedOp>),
+    /// A committed owner-local source is between precise source selection and
+    /// reclaim completion/rollback.  The caller owns only a watch receiver:
+    /// it holds no key fence or physical slot while asynchronously waiting to
+    /// re-evaluate the complete atomic_batch.
+    WaitForLocalAccess(watch::Receiver<bool>),
 }
 
 #[derive(Default)]
@@ -1611,6 +1834,10 @@ pub(crate) struct OwnerKeyControlState {
     /// The reject-on-inflight local-first Put leader for this key. Followers
     /// subscribe to its terminal result without claiming another slot.
     external_put: Option<Arc<ExternalPutKeySharedOp>>,
+    /// Exact-generation owner-side remote Put singleflight.  Unlike
+    /// `external_put`, this remains active after local publication until the
+    /// remote Start/transfer/Done state machine reaches a terminal outcome.
+    remote_put: Option<Arc<OwnerRemotePutSharedOp>>,
     /// Owner-local pre-Prepare fence installed by the Moka source-eviction
     /// dispatcher.  The matching committed index is moved into this record,
     /// so a new local Get cannot acquire the source between victim selection
@@ -1621,6 +1848,10 @@ pub(crate) struct OwnerKeyControlState {
     /// the same fence as local visibility and reclaim so `R ∩ local`,
     /// `R ∩ inflight`, and new leaders are classified atomically.
     external_get: Option<Arc<ExternalGetKeySharedOp>>,
+    /// Completion channel for the exact source-selection/reclaim fence.  A
+    /// receiver subscribed under the key-shard lock cannot miss completion,
+    /// even if the fence clears before the waiter is first polled.
+    local_access_fence: Option<watch::Sender<bool>>,
 }
 
 impl OwnerKeyControlState {
@@ -1632,9 +1863,50 @@ impl OwnerKeyControlState {
         self.local_puts == 0
             && self.external_pending_puts == 0
             && self.external_put.is_none()
+            && self.remote_put.is_none()
             && self.source_eviction_selection.is_none()
             && self.reclaim.is_none()
             && self.external_get.is_none()
+            && self.local_access_fence.is_none()
+    }
+
+    fn begin_local_access_fence(&mut self) {
+        assert!(
+            self.local_access_fence.is_none(),
+            "one key cannot install two owner local-access fence generations"
+        );
+        let (completion, _receiver) = watch::channel(false);
+        self.local_access_fence = Some(completion);
+    }
+
+    fn subscribe_local_access_fence(&self) -> watch::Receiver<bool> {
+        assert!(
+            self.local_access_fenced(),
+            "local-access waiter requires an active source/reclaim fence"
+        );
+        self.local_access_fence
+            .as_ref()
+            .expect("active source/reclaim fence must own a completion channel")
+            .subscribe()
+    }
+
+    fn finish_local_access_fence(&mut self) {
+        assert!(
+            !self.local_access_fenced(),
+            "local-access completion cannot publish before the source/reclaim fence clears"
+        );
+        if let Some(completion) = self.local_access_fence.take() {
+            completion.send_replace(true);
+        }
+    }
+
+    fn install_remote_put_leader(&mut self, op: Arc<OwnerRemotePutSharedOp>) {
+        if let Some(displaced) = self.remote_put.replace(op.clone()) {
+            assert_ne!(
+                displaced.put_id, op.put_id,
+                "a matching remote Put generation must join instead of being replaced"
+            );
+        }
     }
 }
 
@@ -2109,6 +2381,7 @@ pub struct ClientKvApiInner {
     owner_source_eviction_selected:
         Arc<DashMap<OwnerHotReplicaIdentity, Arc<OwnerHotSelectionDebt>>>,
     owner_hot_counters: Arc<OwnerHotCacheCounters>,
+    owner_remote_put_counters: Arc<OwnerRemotePutCounters>,
     owner_hot_retry_queue: Arc<OwnerHotRetryQueue>,
     owner_hot_eviction_tx: tokio::sync::ampsc::UnboundedSender<OwnerHotEvictionDispatch>,
     owner_hot_eviction_rx:
@@ -2185,8 +2458,6 @@ pub struct ClientKvApiInner {
     external_pending_puts: moka::sync::SegmentedCache<(String, u64, u32), ExternalPendingPutCtx>,
     owner_local_publish_tx: tokio::sync::ampsc::Sender<OwnerLocalPublishJob>,
     owner_local_publish_rx: Mutex<Option<tokio::sync::ampsc::Receiver<OwnerLocalPublishJob>>>,
-    replica_task_tx: tokio::sync::ampsc::Sender<ReplicaTaskJob>,
-    replica_task_rx: Mutex<Option<tokio::sync::ampsc::Receiver<ReplicaTaskJob>>>,
 }
 
 impl ClientKvApiInner {
@@ -2287,6 +2558,7 @@ impl ClientKvApiInner {
             replaced.is_none(),
             "rolling back an owner source selection must restore an empty local index"
         );
+        state.finish_local_access_fence();
         if state.is_idle() {
             controls.remove(&identity.key);
         }
@@ -2331,6 +2603,7 @@ impl ClientKvApiInner {
         let control_busy = controls.get(&identity.key).is_some_and(|state| {
             state.local_puts != 0
                 || state.external_pending_puts != 0
+                || state.remote_put.is_some()
                 || state.external_get.is_some()
                 || state.local_access_fenced()
         });
@@ -2357,6 +2630,8 @@ impl ClientKvApiInner {
 
         let state = controls.entry(identity.key.clone()).or_default();
         assert!(state.source_eviction_selection.is_none());
+        assert!(state.reclaim.is_none());
+        state.begin_local_access_fence();
         state.source_eviction_selection = Some(OwnerSourceEvictionSelection {
             put_id: (identity.put_time_ms, identity.put_version),
             cached_info,
@@ -2552,13 +2827,19 @@ impl ClientKvApiInner {
         reject_if_exist_same_key: bool,
     ) -> KvResult<ExternalLocalFirstPutKeyReservation> {
         let mut controls = self.owner_key_control.lock_key(key);
-        if controls
-            .get(key)
-            .is_some_and(|state| state.local_access_fenced())
+        let reusable_singleflight = reject_if_inflight_same_key && reject_if_exist_same_key;
+        if let Some(state) = controls.get(key)
+            && state.local_access_fenced()
         {
-            return Err(KvError::Api(ApiError::KeyBeingWritten {
-                key: key.to_string(),
-            }));
+            return if reusable_singleflight {
+                Ok(ExternalLocalFirstPutKeyReservation::WaitForLocalAccess(
+                    state.subscribe_local_access_fence(),
+                ))
+            } else {
+                Err(KvError::Api(ApiError::KeyBeingWritten {
+                    key: key.to_string(),
+                }))
+            };
         }
         if reject_if_exist_same_key
             && (self.precommit_local_visible_info.contains_key(key)
@@ -2571,7 +2852,6 @@ impl ClientKvApiInner {
             }));
         }
         let state = controls.entry(key.to_string()).or_default();
-        let reusable_singleflight = reject_if_inflight_same_key && reject_if_exist_same_key;
         if reject_if_inflight_same_key && state.local_puts > 0 {
             return (reusable_singleflight)
                 .then(|| state.external_put.clone())
@@ -2707,6 +2987,144 @@ impl ClientKvApiInner {
             (info.put_time_ms == put_id.0 && info.put_version == put_id.1)
                 .then(|| info.mem_holder.clone())
         })
+    }
+
+    pub(crate) fn begin_owner_remote_put(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        preferred_sub_cluster: Option<String>,
+        protect_source_on_remote_complete: bool,
+    ) -> OwnerRemotePutReservation {
+        let mut controls = self.owner_key_control.lock_key(key);
+
+        if let Some(existing) = controls.get(key).and_then(|state| state.remote_put.clone()) {
+            if existing.put_id == put_id && existing.outcome() == OwnerRemotePutOutcome::InFlight {
+                existing.merge_request(preferred_sub_cluster, protect_source_on_remote_complete);
+                self.owner_remote_put_counters
+                    .followers
+                    .fetch_add(1, Ordering::Relaxed);
+                return OwnerRemotePutReservation::Follower(existing);
+            }
+            if existing.outcome() != OwnerRemotePutOutcome::InFlight {
+                let state = controls
+                    .get_mut(key)
+                    .expect("terminal remote Put flight control state disappeared");
+                if state
+                    .remote_put
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &existing))
+                {
+                    state.remote_put = None;
+                }
+            }
+            // A newer local generation may publish before the old remote task
+            // observes Obsolete.  The new generation may replace the visible
+            // per-key flight slot after its exact source is verified below;
+            // the displaced task keeps its own holder and its pointer-checked
+            // completion cannot clear the replacement.
+        }
+
+        if controls
+            .get(key)
+            .is_some_and(|state| state.local_access_fenced())
+        {
+            self.owner_remote_put_counters
+                .source_unavailable
+                .fetch_add(1, Ordering::Relaxed);
+            self.owner_remote_put_counters
+                .source_fenced
+                .fetch_add(1, Ordering::Relaxed);
+            return OwnerRemotePutReservation::SourceUnavailable;
+        }
+        let memory_info = match self.get_cached_info.get(key) {
+            Some(info) if (info.put_time_ms, info.put_version) == put_id => info.mem_holder.clone(),
+            Some(_) => {
+                self.owner_remote_put_counters
+                    .source_unavailable
+                    .fetch_add(1, Ordering::Relaxed);
+                self.owner_remote_put_counters
+                    .source_version_mismatch
+                    .fetch_add(1, Ordering::Relaxed);
+                return OwnerRemotePutReservation::SourceUnavailable;
+            }
+            None => {
+                self.owner_remote_put_counters
+                    .source_unavailable
+                    .fetch_add(1, Ordering::Relaxed);
+                self.owner_remote_put_counters
+                    .source_missing
+                    .fetch_add(1, Ordering::Relaxed);
+                return OwnerRemotePutReservation::SourceUnavailable;
+            }
+        };
+
+        let op = OwnerRemotePutSharedOp::new(
+            key,
+            put_id,
+            preferred_sub_cluster,
+            protect_source_on_remote_complete,
+        );
+        let state = controls.entry(key.to_string()).or_default();
+        state.install_remote_put_leader(op.clone());
+        self.owner_remote_put_counters
+            .active
+            .fetch_add(1, Ordering::Relaxed);
+        self.owner_remote_put_counters
+            .leaders
+            .fetch_add(1, Ordering::Relaxed);
+        OwnerRemotePutReservation::Leader { op, memory_info }
+    }
+
+    pub(crate) fn finish_owner_remote_put(
+        &self,
+        op: &Arc<OwnerRemotePutSharedOp>,
+        outcome: OwnerRemotePutOutcome,
+    ) -> bool {
+        if !op.complete(outcome) {
+            return false;
+        }
+
+        let mut controls = self.owner_key_control.lock_key(&op.key);
+        let remove_control = if let Some(state) = controls.get_mut(&op.key) {
+            if state
+                .remote_put
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, op))
+            {
+                state.remote_put = None;
+            }
+            state.is_idle()
+        } else {
+            false
+        };
+        if remove_control {
+            controls.remove(&op.key);
+        }
+        drop(controls);
+
+        self.owner_remote_put_counters
+            .active
+            .fetch_sub(1, Ordering::Relaxed);
+        let terminal_counter = match outcome {
+            OwnerRemotePutOutcome::InFlight => {
+                unreachable!("remote Put cannot finish with an inflight outcome")
+            }
+            OwnerRemotePutOutcome::Published => &self.owner_remote_put_counters.published,
+            OwnerRemotePutOutcome::AlreadySatisfied => {
+                &self.owner_remote_put_counters.already_satisfied
+            }
+            OwnerRemotePutOutcome::Obsolete => &self.owner_remote_put_counters.obsolete,
+            OwnerRemotePutOutcome::Failed => &self.owner_remote_put_counters.failed,
+        };
+        terminal_counter.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    pub(crate) fn record_owner_remote_put_transfer(&self) {
+        self.owner_remote_put_counters
+            .transfers
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn local_visible_mem_holder_unfenced(&self, key: &str) -> Option<Arc<MemoryInfo>> {
@@ -3189,33 +3607,12 @@ pub struct ExternalPendingPutCtx {
     pub len: u64,
     pub make_replica_task: bool,
     pub preferred_sub_cluster: Option<String>,
-    pub replica_target: Option<ReplicaTaskTarget>,
     pub local_reserve_slot: Option<OwnerLocalReserveSlotRef>,
     pub local_reserve_slot_size: Option<u64>,
     pub atomic_group: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
     /// Keep the per-key reclaim fence alive for every cache/user clone of this
     /// pending context.  The counter is released only by the final Arc drop.
     pub(crate) _pending_fence: Arc<ExternalPendingPutFenceGuard>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ReplicaTaskTarget {
-    pub node_id: String,
-    pub target_offset: u64,
-    pub target_base_addr: u64,
-    pub len: u64,
-}
-
-pub(crate) struct ReplicaTaskJob {
-    pub key: String,
-    pub put_id: crate::master_kv_router::put::PutIDForAKey,
-    /// Replica tasks are independent hit-rate work and keep their transfer
-    /// source alive until the transfer finishes. Capacity eviction never enters
-    /// this queue.
-    pub holder: Option<Arc<UserMemHolder>>,
-    pub target: Option<ReplicaTaskTarget>,
-    pub preferred_sub_cluster: Option<String>,
-    pub protect_source_on_remote_complete: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -3835,16 +4232,19 @@ impl OwnerLocalReserveClassState {
 #[cfg(test)]
 mod owner_reclaim_slot_tests {
     use super::{
-        ExternalLocalFirstPutKeyReservation, ExternalPendingPutCtx, ExternalPendingPutFenceGuard,
-        ExternalPutKeyOutcome, ExternalPutKeySharedOp, OwnerHotCacheCounters, OwnerHotCacheEntry,
+        ApiError, ClientKvApi, ClientKvApiNewArg, ExternalLocalFirstPutKeyReservation,
+        ExternalPendingPutCtx, ExternalPendingPutFenceGuard, ExternalPutKeyOutcome,
+        ExternalPutKeySharedOp, KvError, OwnerHotCacheCounters, OwnerHotCacheEntry,
         OwnerHotEvictionDispatch, OwnerHotEvictionEvent, OwnerHotPinAlias, OwnerHotReplicaIdentity,
         OwnerHotRetryQueue, OwnerHotSelectionDebt, OwnerHotSelectionFenceOutcome,
         OwnerKeyControlState, OwnerKeyControlTable, OwnerLocalReserveGrantState,
         OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef, OwnerLocalReserveSlotState,
-        OwnerReclaimRecord, acquire_external_pending_put_fence_for_key,
+        OwnerReclaimRecord, OwnerRemotePutOutcome, OwnerRemotePutReservation,
+        OwnerRemotePutSharedOp, acquire_external_pending_put_fence_for_key,
         allocate_external_holding_id, build_owner_hot_cache, clone_if_owner_hot_entry_matches,
         owner_hot_source_has_active_holders, pin_current_owner_hot_source_from_index,
     };
+    use crate::config::TestSpecConfig;
     use crate::master_kv_router::msg_pack::{
         BatchOwnerReclaimReq, OwnerReclaimBacking, OwnerReclaimItem, OwnerReclaimItemState,
         OwnerReclaimPhase, OwnerReclaimReason, OwnerSourceEvictionVictim,
@@ -3905,9 +4305,11 @@ mod owner_reclaim_slot_tests {
                 local_puts: 1,
                 external_pending_puts: 1,
                 external_put: None,
+                remote_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
+                local_access_fence: None,
             },
         );
         let guard = Arc::new(ExternalPendingPutFenceGuard {
@@ -3935,9 +4337,11 @@ mod owner_reclaim_slot_tests {
                 local_puts: 1,
                 external_pending_puts: 1,
                 external_put: Some(op.clone()),
+                remote_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
+                local_access_fence: None,
             },
         );
         let leader = Arc::new(ExternalPendingPutFenceGuard {
@@ -3972,9 +4376,11 @@ mod owner_reclaim_slot_tests {
                 local_puts: 1,
                 external_pending_puts: 1,
                 external_put: Some(op.clone()),
+                remote_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
+                local_access_fence: None,
             },
         );
         let leader = Arc::new(ExternalPendingPutFenceGuard {
@@ -3998,6 +4404,182 @@ mod owner_reclaim_slot_tests {
         assert!(controls.lock_key(key).get(key).is_none());
     }
 
+    #[limit_thirdparty::tokio::test]
+    async fn every_remote_put_trigger_joins_one_owner_generation_flight() {
+        let key = "remote-put-singleflight";
+        let put_id = (77, 3);
+        let api = ClientKvApi::construct(ClientKvApiNewArg {
+            test_spec_config: TestSpecConfig::default(),
+            owner_hot_cache_capacity_bytes: None,
+        })
+        .await
+        .expect("construct test ClientKvApi");
+        let op = OwnerRemotePutSharedOp::new(key, put_id, None, false);
+        api.inner().owner_key_control.lock_key(key).insert(
+            key.to_string(),
+            OwnerKeyControlState {
+                remote_put: Some(op.clone()),
+                ..Default::default()
+            },
+        );
+        api.inner()
+            .owner_remote_put_counters
+            .active
+            .store(1, Ordering::Relaxed);
+        api.inner()
+            .owner_remote_put_counters
+            .leaders
+            .store(1, Ordering::Relaxed);
+
+        for follower in 0..64 {
+            let preferred = (follower == 0).then(|| "tier1".to_string());
+            let protect_source = follower == 63;
+            match api
+                .inner()
+                .begin_owner_remote_put(key, put_id, preferred, protect_source)
+            {
+                OwnerRemotePutReservation::Follower(joined) => {
+                    assert!(Arc::ptr_eq(&joined, &op));
+                }
+                OwnerRemotePutReservation::Leader { .. } => {
+                    panic!("a follower created a second remote Put leader")
+                }
+                OwnerRemotePutReservation::SourceUnavailable => {
+                    panic!("a matching active remote Put flight was not reusable")
+                }
+            }
+        }
+
+        let request = op.request();
+        assert_eq!(request.preferred_sub_cluster.as_deref(), Some("tier1"));
+        assert!(request.protect_source_on_remote_complete);
+        assert_eq!(
+            api.inner()
+                .owner_remote_put_counters
+                .followers
+                .load(Ordering::Relaxed),
+            64
+        );
+        assert!(matches!(
+            api.inner()
+                .begin_owner_remote_put(key, (78, 0), None, false),
+            OwnerRemotePutReservation::SourceUnavailable
+        ));
+
+        assert!(
+            api.inner()
+                .finish_owner_remote_put(&op, OwnerRemotePutOutcome::Published)
+        );
+        assert!(
+            !api.inner()
+                .finish_owner_remote_put(&op, OwnerRemotePutOutcome::Failed)
+        );
+        assert_eq!(
+            ::tokio::time::timeout(Duration::from_secs(1), op.wait())
+                .await
+                .expect("remote Put followers must observe the terminal result"),
+            OwnerRemotePutOutcome::Published
+        );
+        assert!(
+            api.inner()
+                .owner_key_control
+                .lock_key(key)
+                .get(key)
+                .is_none()
+        );
+        assert_eq!(
+            api.inner()
+                .owner_remote_put_counters
+                .active
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn new_remote_put_generation_replaces_old_without_aba_cleanup() {
+        let key = "remote-put-generation-aba";
+        let api = ClientKvApi::construct(ClientKvApiNewArg {
+            test_spec_config: TestSpecConfig::default(),
+            owner_hot_cache_capacity_bytes: None,
+        })
+        .await
+        .expect("construct test ClientKvApi");
+        let old = OwnerRemotePutSharedOp::new(key, (80, 0), None, false);
+        let new = OwnerRemotePutSharedOp::new(key, (81, 0), None, false);
+        api.inner().owner_key_control.lock_key(key).insert(
+            key.to_string(),
+            OwnerKeyControlState {
+                remote_put: Some(old.clone()),
+                ..Default::default()
+            },
+        );
+        api.inner()
+            .owner_remote_put_counters
+            .active
+            .store(2, Ordering::Relaxed);
+        api.inner()
+            .owner_key_control
+            .lock_key(key)
+            .get_mut(key)
+            .expect("old generation control state")
+            .install_remote_put_leader(new.clone());
+        let current = api
+            .inner()
+            .owner_key_control
+            .lock_key(key)
+            .get(key)
+            .and_then(|state| state.remote_put.clone())
+            .expect("new generation must own the visible flight slot");
+        assert!(Arc::ptr_eq(&current, &new));
+        assert_eq!(
+            api.inner()
+                .owner_remote_put_counters
+                .active
+                .load(Ordering::Relaxed),
+            2
+        );
+
+        assert!(
+            api.inner()
+                .finish_owner_remote_put(&old, OwnerRemotePutOutcome::Obsolete)
+        );
+        let current = api
+            .inner()
+            .owner_key_control
+            .lock_key(key)
+            .get(key)
+            .and_then(|state| state.remote_put.clone())
+            .expect("old completion must retain the new generation flight");
+        assert!(Arc::ptr_eq(&current, &new));
+        assert_eq!(
+            api.inner()
+                .owner_remote_put_counters
+                .active
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        assert!(
+            api.inner()
+                .finish_owner_remote_put(&new, OwnerRemotePutOutcome::Published)
+        );
+        assert!(
+            api.inner()
+                .owner_key_control
+                .lock_key(key)
+                .get(key)
+                .is_none()
+        );
+        assert_eq!(
+            api.inner()
+                .owner_remote_put_counters
+                .active
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
     #[test]
     fn failed_local_slot_release_keeps_key_fence_closed() {
         let controls = controls_with_state(
@@ -4006,9 +4588,11 @@ mod owner_reclaim_slot_tests {
                 local_puts: 1,
                 external_pending_puts: 1,
                 external_put: None,
+                remote_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
+                local_access_fence: None,
             },
         );
         let guard = Arc::new(ExternalPendingPutFenceGuard {
@@ -4036,9 +4620,11 @@ mod owner_reclaim_slot_tests {
                 local_puts: 1,
                 external_pending_puts: 1,
                 external_put: None,
+                remote_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
+                local_access_fence: None,
             },
         );
         let guard = Arc::new(ExternalPendingPutFenceGuard {
@@ -4089,7 +4675,6 @@ mod owner_reclaim_slot_tests {
                 len: 1,
                 make_replica_task: false,
                 preferred_sub_cluster: None,
-                replica_target: None,
                 local_reserve_slot: None,
                 local_reserve_slot_size: None,
                 atomic_group: None,
@@ -4177,6 +4762,9 @@ mod owner_reclaim_slot_tests {
             ExternalLocalFirstPutKeyReservation::Wait(_) => {
                 panic!("the first same-key Put cannot be a follower")
             }
+            ExternalLocalFirstPutKeyReservation::WaitForLocalAccess(_) => {
+                panic!("an unfenced key cannot wait for local access")
+            }
         };
         let join_probe_waiter = match inner
             .reserve_external_local_first_put_key("put-join-probe", true, true)
@@ -4185,6 +4773,9 @@ mod owner_reclaim_slot_tests {
             ExternalLocalFirstPutKeyReservation::Wait(waiter) => waiter,
             ExternalLocalFirstPutKeyReservation::Leader(_) => {
                 panic!("the second same-key Put must not claim a second leader fence")
+            }
+            ExternalLocalFirstPutKeyReservation::WaitForLocalAccess(_) => {
+                panic!("a local-Put follower must wait on the leader result")
             }
         };
         join_probe_leader.mark_local_put_succeeded();
@@ -4252,6 +4843,40 @@ mod owner_reclaim_slot_tests {
             acquire_external_pending_put_fence_for_key(&inner.owner_key_control, key).is_err(),
             "a new local Put must not cross a source-selection fence"
         );
+        let rollback_waiter = match inner
+            .reserve_external_local_first_put_key(key, true, true)
+            .expect("idempotent local-first Put must asynchronously wait for source selection")
+        {
+            ExternalLocalFirstPutKeyReservation::WaitForLocalAccess(waiter) => waiter,
+            ExternalLocalFirstPutKeyReservation::Leader(_) => {
+                panic!("a source-fenced key cannot claim a local-Put leader")
+            }
+            ExternalLocalFirstPutKeyReservation::Wait(_) => {
+                panic!("a source-fenced key has no local-Put leader to join")
+            }
+        };
+        let second_rollback_waiter = match inner
+            .reserve_external_local_first_put_key(key, true, true)
+            .expect("all idempotent local-first Puts must share the fence completion")
+        {
+            ExternalLocalFirstPutKeyReservation::WaitForLocalAccess(waiter) => waiter,
+            _ => panic!("a second source-fence waiter must not claim a Put fence"),
+        };
+        let cancelled_rollback_waiter = match inner
+            .reserve_external_local_first_put_key(key, true, true)
+            .expect("a cancellable Put may subscribe to the same fence completion")
+        {
+            ExternalLocalFirstPutKeyReservation::WaitForLocalAccess(waiter) => waiter,
+            _ => panic!("a cancellable source-fence waiter must not claim a Put fence"),
+        };
+        // Simulate an external RPC being cancelled before reclaim completes.
+        // Dropping one receiver must neither retain the physical source nor
+        // prevent the shared generation from waking the remaining waiters.
+        drop(cancelled_rollback_waiter);
+        assert!(matches!(
+            inner.reserve_external_local_first_put_key(key, true, false),
+            Err(KvError::Api(ApiError::KeyBeingWritten { .. }))
+        ));
         drop(source);
         let master_id = master
             .cluster_manager_view()
@@ -4333,6 +4958,25 @@ mod owner_reclaim_slot_tests {
             inner.local_visible_mem_holder(key).is_some(),
             "Abort must restore the exact committed local index"
         );
+        for mut waiter in [rollback_waiter, second_rollback_waiter] {
+            ::tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if *waiter.borrow_and_update() {
+                        break;
+                    }
+                    waiter
+                        .changed()
+                        .await
+                        .expect("rollback completion sender must remain live");
+                }
+            })
+            .await
+            .expect("Abort must wake every live source-fence Put waiter");
+        }
+        assert!(matches!(
+            inner.reserve_external_local_first_put_key(key, true, true),
+            Err(KvError::Api(ApiError::KeyAlreadyExists { .. }))
+        ));
 
         let trigger_weak = {
             let cached = inner
@@ -4382,6 +5026,13 @@ mod owner_reclaim_slot_tests {
                 ),
             )
         );
+        let mut direct_delete_waiter = match inner
+            .reserve_external_local_first_put_key(key, true, true)
+            .expect("direct-delete source fence must expose an async waiter")
+        {
+            ExternalLocalFirstPutKeyReservation::WaitForLocalAccess(waiter) => waiter,
+            _ => panic!("direct-delete source fence must not admit a local Put"),
+        };
         super::reclaim::complete_owner_source_eviction(
             inner,
             &OwnerSourceEvictionVictim {
@@ -4398,6 +5049,27 @@ mod owner_reclaim_slot_tests {
             inner.owner_key_control.lock_key(key).get(key).is_none(),
             "direct local completion must clear the source fence in one call"
         );
+        ::tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if *direct_delete_waiter.borrow_and_update() {
+                    break;
+                }
+                direct_delete_waiter
+                    .changed()
+                    .await
+                    .expect("finalize completion sender must remain live");
+            }
+        })
+        .await
+        .expect("direct-delete Finalize must wake the source-fence Put waiter");
+        let post_delete_leader = match inner
+            .reserve_external_local_first_put_key(key, true, true)
+            .expect("a physically reclaimed key must be eligible for a new local Put")
+        {
+            ExternalLocalFirstPutKeyReservation::Leader(leader) => leader,
+            _ => panic!("a reclaimed key must re-evaluate to a fresh leader"),
+        };
+        drop(post_delete_leader);
 
         stop_master_and_client(master, client).await;
     }
@@ -4611,12 +5283,14 @@ mod owner_reclaim_slot_tests {
                 local_puts: 0,
                 external_pending_puts: 0,
                 external_put: None,
+                remote_put: None,
                 source_eviction_selection: None,
                 reclaim: Some(OwnerReclaimRecord::Committed(OwnerReclaimItem {
                     key: "fenced".to_string(),
                     ..OwnerReclaimItem::default()
                 })),
                 external_get: None,
+                local_access_fence: Some(::tokio::sync::watch::channel(false).0),
             },
         );
         let mut resolved_keys = Vec::new();
@@ -5016,6 +5690,54 @@ impl ClientKvApiInner {
             external_get_undecided_interests,
             external_get_retained_interests,
             external_pending_put_entries: self.external_pending_puts.entry_count(),
+            remote_put_flights_active: self
+                .owner_remote_put_counters
+                .active
+                .load(Ordering::Relaxed),
+            remote_put_flight_leaders: self
+                .owner_remote_put_counters
+                .leaders
+                .load(Ordering::Relaxed),
+            remote_put_flight_followers: self
+                .owner_remote_put_counters
+                .followers
+                .load(Ordering::Relaxed),
+            remote_put_source_unavailable: self
+                .owner_remote_put_counters
+                .source_unavailable
+                .load(Ordering::Relaxed),
+            remote_put_source_fenced: self
+                .owner_remote_put_counters
+                .source_fenced
+                .load(Ordering::Relaxed),
+            remote_put_source_missing: self
+                .owner_remote_put_counters
+                .source_missing
+                .load(Ordering::Relaxed),
+            remote_put_source_version_mismatch: self
+                .owner_remote_put_counters
+                .source_version_mismatch
+                .load(Ordering::Relaxed),
+            remote_put_transfers: self
+                .owner_remote_put_counters
+                .transfers
+                .load(Ordering::Relaxed),
+            remote_put_published: self
+                .owner_remote_put_counters
+                .published
+                .load(Ordering::Relaxed),
+            remote_put_already_satisfied: self
+                .owner_remote_put_counters
+                .already_satisfied
+                .load(Ordering::Relaxed),
+            remote_put_obsolete: self
+                .owner_remote_put_counters
+                .obsolete
+                .load(Ordering::Relaxed),
+            remote_put_failed: self
+                .owner_remote_put_counters
+                .failed
+                .load(Ordering::Relaxed),
             local_reserve_slots_free,
             local_reserve_slots_prepared,
             local_reserve_slots_pending_visible,
@@ -5625,6 +6347,21 @@ impl ClientKvApi {
                             reserve_committed = snapshot.local_reserve_slots_committed,
                             "owner Get lifecycle snapshot"
                         );
+                        tracing::info!(
+                            active = snapshot.remote_put_flights_active,
+                            leaders = snapshot.remote_put_flight_leaders,
+                            followers = snapshot.remote_put_flight_followers,
+                            source_unavailable = snapshot.remote_put_source_unavailable,
+                            source_fenced = snapshot.remote_put_source_fenced,
+                            source_missing = snapshot.remote_put_source_missing,
+                            source_version_mismatch = snapshot.remote_put_source_version_mismatch,
+                            transfers = snapshot.remote_put_transfers,
+                            published = snapshot.remote_put_published,
+                            already_satisfied = snapshot.remote_put_already_satisfied,
+                            obsolete = snapshot.remote_put_obsolete,
+                            failed = snapshot.remote_put_failed,
+                            "owner unified remote Put flight snapshot"
+                        );
                         if snapshot.hot_cache_capacity_bytes > 0 {
                             tracing::info!(
                                 capacity_bytes = snapshot.hot_cache_capacity_bytes,
@@ -5670,8 +6407,6 @@ impl ClientKvApi {
             test_spec_config,
             owner_hot_cache_capacity_bytes,
         } = arg;
-        let (replica_task_tx, replica_task_rx) =
-            tokio::sync::ampsc::channel(REPLICA_TASK_QUEUE_CAPACITY);
         let (owner_local_publish_tx, owner_local_publish_rx) =
             tokio::sync::ampsc::channel(OWNER_LOCAL_PUBLISH_QUEUE_CAPACITY);
         // The Moka eviction listener is synchronous and must never block while
@@ -5685,6 +6420,7 @@ impl ClientKvApi {
         let owner_key_control = Arc::new(OwnerKeyControlTable::default());
         let owner_source_eviction_selected = Arc::new(DashMap::new());
         let owner_hot_counters = Arc::new(OwnerHotCacheCounters::default());
+        let owner_remote_put_counters = Arc::new(OwnerRemotePutCounters::default());
         let owner_hot_retry_queue = Arc::new(OwnerHotRetryQueue::new(owner_hot_counters.clone()));
         let owner_hot_cache = owner_hot_cache_capacity_bytes.map(|capacity_bytes| {
             build_owner_hot_cache(
@@ -5716,6 +6452,7 @@ impl ClientKvApi {
             owner_hot_cache,
             owner_source_eviction_selected,
             owner_hot_counters,
+            owner_remote_put_counters,
             owner_hot_retry_queue,
             owner_hot_eviction_tx,
             owner_hot_eviction_rx: Mutex::new(Some(owner_hot_eviction_rx)),
@@ -5772,8 +6509,6 @@ impl ClientKvApi {
             default_lease_id: parking_lot::RwLock::new(None),
             owner_local_publish_tx,
             owner_local_publish_rx: Mutex::new(Some(owner_local_publish_rx)),
-            replica_task_tx,
-            replica_task_rx: Mutex::new(Some(replica_task_rx)),
         };
         Ok(Self(inner))
     }
@@ -6129,6 +6864,20 @@ impl ClientKvApi {
             },
         );
 
+        let view_ext = inner.view.clone_view();
+        RPCHandler::<ExternalBatchDeleteAckReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_external_batch_delete_ack", async move {
+                    let result = handle_external_batch_delete_ack(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
         // KV->file sync RPC (bytes field -> file@offset)
         RPCCaller::<SyncKvToFileReq>::new().regist(inner.view.p2p_module());
         let view_ext = inner.view.clone_view();
@@ -6210,18 +6959,6 @@ impl ClientKvApi {
             .expect("delete_ack_batch rx already taken, that's impossible");
         delete::spawn_owner_delete_ack_batch(inner.view.clone_view(), delete_ack_batch_rx);
 
-        if let Some(replica_task_rx) = inner.replica_task_rx.lock().take() {
-            put::spawn_replica_task_actor(
-                inner.view.clone_view(),
-                replica_task_rx,
-                inner
-                    .test_spec_config
-                    .replica_task_max_inflight
-                    .unwrap_or(1) as usize,
-            );
-        } else {
-            tracing::warn!("replica_task_rx already taken for ClientKvApi");
-        }
         if inner.owner_hot_cache.is_some() {
             if let Some(owner_hot_eviction_rx) = inner.owner_hot_eviction_rx.lock().take() {
                 put::spawn_owner_source_eviction_dispatcher(

@@ -173,6 +173,9 @@ pub struct ExternalBatchGetTransferReq {
     pub req_node_id: String,
     /// Owner node_start_time observed by external when request starts
     pub started_time: i64,
+    /// Complete atomic-group prefix selected by the consumer from the live
+    /// get-start handle.
+    pub consume_prefix_len: usize,
 }
 impl MsgPackSerializePart for ExternalBatchGetTransferReq {
     fn msg_id(&self) -> u32 {
@@ -236,7 +239,7 @@ impl MsgPackSerializePart for ExternalBatchGetCancelResp {
 mod external_batch_get_plan_wire_tests {
     use super::{
         ExternalBatchGetCancelPlan, ExternalBatchGetCancelReq, ExternalBatchGetItemResp,
-        ExternalBatchGetStartResp, ExternalBatchGetStartTransferPlan,
+        ExternalBatchGetStartResp, ExternalBatchGetStartTransferPlan, ExternalBatchGetTransferReq,
     };
     use crate::memholder::ExternalMemHolderInfo;
     use crate::rpcresp_kvresult_convert::msg_and_error::OK;
@@ -272,6 +275,16 @@ mod external_batch_get_plan_wire_tests {
                         .as_ref()
                         .is_some_and(|info| info.holder_id == 23)
         ));
+
+        let transfer = ExternalBatchGetTransferReq {
+            handle: 19,
+            req_node_id: "external-a".to_string(),
+            started_time: 29,
+            consume_prefix_len: 1,
+        };
+        let decoded_transfer: ExternalBatchGetTransferReq =
+            bitcode::decode(&bitcode::encode(&transfer)).expect("decode transfer request");
+        assert_eq!(decoded_transfer.consume_prefix_len, 1);
 
         let cancel = ExternalBatchGetCancelReq {
             handle: 19,
@@ -799,6 +812,54 @@ pub struct ExternalDeleteAckResp {
 impl MsgPackSerializePart for ExternalDeleteAckResp {
     fn msg_id(&self) -> u32 {
         4014
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchDeleteAckReq {
+    pub external_client_id: String,
+    pub holder_ids: Vec<u64>,
+    /// Owner node_start_time observed when these holders were created.
+    pub started_time: i64,
+}
+impl MsgPackSerializePart for ExternalBatchDeleteAckReq {
+    fn msg_id(&self) -> u32 {
+        4036
+    }
+}
+impl RPCReq for ExternalBatchDeleteAckReq {
+    type Resp = ExternalBatchDeleteAckResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchDeleteAckResp {
+    pub released_count: u32,
+    pub missing_count: u32,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for ExternalBatchDeleteAckResp {
+    fn msg_id(&self) -> u32 {
+        4037
+    }
+}
+
+#[cfg(test)]
+mod external_batch_delete_ack_wire_tests {
+    use super::ExternalBatchDeleteAckReq;
+
+    #[test]
+    fn compact_holder_id_batch_round_trips() {
+        let request = ExternalBatchDeleteAckReq {
+            external_client_id: "external-a".to_string(),
+            holder_ids: vec![3, 5, 8],
+            started_time: 17,
+        };
+        let decoded: ExternalBatchDeleteAckReq =
+            bitcode::decode(&bitcode::encode(&request)).expect("decode holder ACK batch");
+        assert_eq!(decoded.external_client_id, "external-a");
+        assert_eq!(decoded.holder_ids, vec![3, 5, 8]);
+        assert_eq!(decoded.started_time, 17);
     }
 }
 

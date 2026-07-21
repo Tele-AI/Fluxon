@@ -185,7 +185,7 @@ flowchart LR
 | `GetStartResult` | SGLang hostless 读取 | 描述连续命中前缀、可传输长度、atomic group 命中数和第一个 miss 位置。 |
 | `GetStartHandle` | SGLang hostless 读取 | 持有一次 get-start 结果和 backend handle；必须被 `get_transfer` 消费或被 `cancel_get_transfer` 取消。 |
 | `get_start(keys, prefix_best_effort, atomic_group_lens)` | SGLang hostless 读取 | 按 key 顺序计算连续命中的 prefix，并返回 `GetStartHandle`。 |
-| `get_transfer(handle)` | SGLang hostless 读取 | 消费 handle 的可传输前缀，执行必要 transfer，并返回 readable `plan_ptr`。 |
+| `get_transfer(handle, *, consume_prefix_len=None)` | SGLang hostless 读取 | 消费 handle 的全部可传输前缀，或消费由 `consume_prefix_len` 选定的更短完整 atomic-group 前缀；释放 tail，执行必要 transfer，并返回 readable `plan_ptr`。 |
 | `cancel_get_transfer(handle)` | SGLang hostless 读取 | 放弃未 transfer 的 `GetStartHandle`，释放 get-start 期间持有的 owner/external 资源。 |
 | `release_views(plan_ptr)` | SGLang hostless 读取 | 释放 get-transfer 产生的 readable plan，丢弃其持有的 holder 引用。 |
 
@@ -475,7 +475,7 @@ hostless restore 的核心约束是：SGLang 只能恢复有序 page keys 的连
 因此读取侧分成 prefetch 和 restore 两段。当前实现把 start-to-transfer 计划显式限定为两个分支：
 
 - Prefetch：`get_start(keys, prefix_best_effort, atomic_group_lens)` 按 key 顺序做 local visible check / owner get start，计算 page 级连续命中前缀 `raw_prefix_hit_len`，再按 `atomic_group_lens` 向下收敛成 `transferable_len`。全 owner-local 批次返回 `InlineLocal { items }`：owner 为每个导出 page 安装独立 external holding，并把 offset、len、holding ID 和 owner generation 随 start response 返回；该分支不创建 transfer registry，也不启动后台 transfer。混合命中、master fallback 或需要远端 materialization 的批次返回 `OwnerRpc`，继续由 shared op 保存后台 prefetch 的 holder / transfer result。
-- Restore：SGLang 拿到 `transferable_len` 后再决定是否分配 GPU KV pages 并继续恢复。`get_transfer(handle)` 消费 `get_start` 返回的 handle。`InlineLocal` 分支在 external 进程校验 owner generation 和 mmap 范围后直接构造 holders；`OwnerRpc` 分支等待或取得原有 prefetch 结果。两个分支最终都生成持有 holder 引用的 readable `plan_ptr`，随后 SGLang native kernel 使用 `restore_*_from_fluxon_values(...)` 把 Fluxon value memory 拷回 GPU KV cache。
+- Restore：SGLang 拿到 `transferable_len` 后再决定是否分配 GPU KV pages 并继续恢复。`get_transfer(handle, consume_prefix_len=...)` 可以消费不超过 `transferable_len` 的更短完整 atomic-group 前缀；省略该参数时消费全部可传输前缀。`InlineLocal` 分支在 external 进程校验 owner generation 和 mmap 范围后，只为消费前缀构造 holders，tail holding IDs 进入现有 holder-ACK 合批队列；`OwnerRpc` 分支在同一 transfer handler 内 drop tail items，只等待或取得消费前缀的 prefetch 结果。两个分支最终都生成持有 holder 引用的 readable `plan_ptr`，随后 SGLang native kernel 使用 `restore_*_from_fluxon_values(...)` 把 Fluxon value memory 拷回 GPU KV cache。
 
 读取阶段拆成 prefetch 和 restore 两步，主要是为了保证：
 
@@ -513,14 +513,17 @@ sequenceDiagram
     B-->>U: transferable_len / prefix_hit_groups / first_miss_index
     U->>U: allocate GPU KV pages for transferable prefix
     alt transferable_len > 0 and caller chooses restore
-        U->>B: get_transfer(handle)
-        B->>F: get_transfer(handle)
-        F->>E: batch_get_transfer(handle, transferable keys)
+        U->>B: get_transfer(handle, consume_prefix_len)
+        B->>F: get_transfer(handle, consume_prefix_len)
+        F->>E: batch_get_transfer(handle, consumed prefix)
         alt InlineLocal
-            E->>E: validate generation and mmap range, construct holders
+            E->>E: validate generation and mmap range
+            E->>E: enqueue tail holding IDs to batched ACK
+            E->>E: construct consumed-prefix holders
         else OwnerRpc
-            E->>O: ExternalBatchGetTransferReq
-            O-->>E: prefetched holders / transfer results
+            E->>O: ExternalBatchGetTransferReq(consume_prefix_len)
+            O->>O: validate atomic boundary and drop tail items
+            O-->>E: consumed-prefix holders / transfer results
         end
         E-->>F: plan_ptr(value_ptrs, holders kept alive)
         F-->>B: plan_ptr
@@ -547,7 +550,7 @@ sequenceDiagram
 | 字段 | 含义 |
 | --- | --- |
 | `raw_prefix_hit_len` | 按 key 顺序连续命中的 page 数，未按 atomic group 收敛。 |
-| `transferable_len` | 可以交给 `get_transfer` 的 page 数；它不会切开 atomic group。 |
+| `transferable_len` | `get_transfer` 最多可消费的 page 数；它不会切开 atomic group。 |
 | `prefix_hit_groups` | 完整命中的 atomic group 数。 |
 | `first_miss_index` | 第一个 miss page 的 index；全部命中时为 `None`。 |
 | `first_miss_group_index` | 第一个 miss 所在 atomic group；全部命中时为 `None`。 |
@@ -556,9 +559,10 @@ sequenceDiagram
 生命周期规则：
 
 - `get_start` 成功后，调用方必须二选一：`get_transfer(handle)` 或 `cancel_get_transfer(handle)`；放弃 restore 时必须取消 handle，释放可能已经启动的 prefetch 资源。
-- `get_transfer(handle)` 成功后，handle 已被消费；后续由 returned `plan_ptr` 和 `release_views(plan_ptr)` 管理。
+- `get_transfer(handle, consume_prefix_len=...)` 的值必须大于 0、不超过 `transferable_len`，并精确落在 atomic-group 边界；参数校验失败时 handle 仍可 cancel 或用合法长度重试。
+- `get_transfer` 成功后，handle 已被消费；tail 资源同时移交给 owner 直接 drop 或 external holder-ACK 合批队列，后续只由 returned `plan_ptr` 和 `release_views(plan_ptr)` 管理消费前缀。
 - `release_views(plan_ptr)` 必须在 native restore 完成后执行，即使 native restore 失败也要释放。
-- `InlineLocal` holding 从 owner 返回 start response 前已经安装；`get_transfer` 把它移交给 returned plan，`cancel_get_transfer` 则携带 holding IDs 精确释放。owner 重启或 generation 不匹配时不能继续使用旧 inline plan。
+- `InlineLocal` holding 从 owner 返回 start response 前已经安装；全量 `get_transfer` 把它们移交给 returned plan，部分前缀 `get_transfer` 只移交前缀并将 tail holding IDs 无等待送入 holder-ACK 合批队列，`cancel_get_transfer` 则携带全部 holding IDs 精确释放。owner 重启或 generation 不匹配时不能继续使用旧 inline plan。
 - `get_start` 只命中部分前缀时，SGLang 只能恢复 `transferable_len` 覆盖的完整 atomic groups，不能构造半个 atomic group 的 GPU KV 状态。
 - `get_transfer` 返回 miss / KeyNotFound 时，SGLang 必须放弃本次 restore 并执行 rollback。
 - owner 必须为未被 `get_transfer/cancel_get_transfer` 消费的 handle 设置有界 TTL；TTL 回收与

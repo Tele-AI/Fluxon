@@ -56,6 +56,8 @@ fn reclaim_key_control_busy_detail(state: &super::OwnerKeyControlState) -> Optio
         Some("owner local put is inflight")
     } else if state.external_pending_puts != 0 {
         Some("owner external put context is still pending")
+    } else if state.remote_put.is_some() {
+        Some("owner remote put transfer is inflight")
     } else if state.source_eviction_selection.is_some() {
         Some("owner source eviction selection fence is active")
     } else if state.external_get.is_some() {
@@ -91,7 +93,7 @@ fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclai
                 "another owner source selection owns the key fence",
             );
         }
-        if state.local_puts != 0 || state.external_pending_puts != 0 {
+        if state.local_puts != 0 || state.external_pending_puts != 0 || state.remote_put.is_some() {
             return item_resp(
                 item,
                 OwnerReclaimItemState::Busy,
@@ -126,6 +128,10 @@ fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclai
             })
             .map(|(_, snapshot)| snapshot);
         assert!(state.reclaim.is_none());
+        assert!(
+            state.local_access_fence.is_some(),
+            "source-selection promotion must retain its local-access completion generation"
+        );
         state.reclaim = Some(OwnerReclaimRecord::Prepared(OwnerPreparedReclaim {
             item: item.clone(),
             cached_info: selection.cached_info,
@@ -214,6 +220,7 @@ fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclai
             && state.external_pending_puts == 0
             && state.external_get.is_none()
     );
+    state.begin_local_access_fence();
     state.reclaim = Some(OwnerReclaimRecord::Prepared(OwnerPreparedReclaim {
         item: item.clone(),
         cached_info,
@@ -279,7 +286,9 @@ fn reclaim_release_fence_is_intact(
         Some(OwnerReclaimRecord::Releasing(releasing)) if releasing == item
     ) && state.local_puts == 0
         && state.external_pending_puts == 0
+        && state.remote_put.is_none()
         && state.source_eviction_selection.is_none()
+        && state.local_access_fence.is_some()
 }
 
 fn commit_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
@@ -389,26 +398,23 @@ mod tests {
             },
             reason: OwnerReclaimReason::OwnerCapacityEviction,
         };
-        let state = OwnerKeyControlState {
-            local_puts: 0,
-            external_pending_puts: 0,
-            external_put: None,
-            source_eviction_selection: None,
-            reclaim: Some(OwnerReclaimRecord::Releasing(item.clone())),
+        let mut state = OwnerKeyControlState {
             external_get: Some(Arc::new(ExternalGetKeySharedOp::new(
                 "remote-during-reclaim".to_string(),
             ))),
+            ..Default::default()
         };
+        state.reclaim = Some(OwnerReclaimRecord::Releasing(item.clone()));
+        state.begin_local_access_fence();
         assert!(reclaim_release_fence_is_intact(&state, &item));
 
-        let local_put_state = OwnerKeyControlState {
+        let mut local_put_state = OwnerKeyControlState {
             local_puts: 1,
-            external_pending_puts: 0,
-            external_put: None,
-            source_eviction_selection: None,
-            reclaim: Some(OwnerReclaimRecord::Releasing(item.clone())),
             external_get: state.external_get,
+            ..Default::default()
         };
+        local_put_state.reclaim = Some(OwnerReclaimRecord::Releasing(item.clone()));
+        local_put_state.begin_local_access_fence();
         assert!(!reclaim_release_fence_is_intact(&local_put_state, &item));
     }
 }
@@ -445,6 +451,7 @@ fn abort_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimI
                     "owner reclaim abort must restore an empty local snapshot slot"
                 );
             }
+            state.finish_local_access_fence();
             if state.is_idle() {
                 controls.remove(&item.key);
             }
@@ -492,6 +499,7 @@ fn finalize_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerRecla
     };
     match state.reclaim.take() {
         Some(OwnerReclaimRecord::Committed(committed)) if committed == *item => {
+            state.finish_local_access_fence();
             if state.is_idle() {
                 controls.remove(&item.key);
             }
