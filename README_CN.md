@@ -136,6 +136,12 @@ Fluxon FS 是一款面向 AI 数据与模型文件、兼容 `S3` 的高性能文
 
 ![](./pics/kv_benchmark_chart.png)
 
+Fluxon KV 还可将 owner 本地 SSD 作为 DRAM 副本的运行期回填层。下图为单机 H100 的 SSD-pressure 实验，以 CUDA event 完成为计数边界；c16 下，Fluxon 在 4/8/16 MiB 组中的 hit payload 吞吐相对两种 Mooncake 拓扑中更快的一种分别达到 3.83×/5.61×/6.73×。
+
+![Fluxon 与 Mooncake 不同 SSD 配置下的 GPU 可用 KV 吞吐和命中率](./pics/kv_ssd_gpu_sweep.png)
+
+完整实验设置、命中率和适用边界见博客：[Fluxon KV SSD 存储：把本地 SSD 接成内存副本的回填层](https://tele-ai.github.io/Fluxon/cn/blog/blog_2_Fluxon_KV_SSD%E5%AD%98%E5%82%A8%EF%BC%9A%E6%8A%8A%E6%9C%AC%E5%9C%B0SSD%E6%8E%A5%E6%88%90%E5%86%85%E5%AD%98%E5%89%AF%E6%9C%AC%E7%9A%84%E5%9B%9E%E5%A1%AB%E5%B1%82)。
+
 ### Fluxon FS 基准测试
 
 测试结果显示，小文件读取和大文件写入性能已显著优于 `Alluxio`，大文件读取性能基本持平，小文件写入性能仍有进一步优化的空间。
@@ -296,6 +302,10 @@ ui
 - [开发者 - 2 - 打包中间件和镜像](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---2---%E6%89%93%E5%8C%85%E4%B8%AD%E9%97%B4%E4%BB%B6%E5%92%8C%E9%95%9C%E5%83%8F/)
 - [开发者 - 3 - 文档写作规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---3---%E6%96%87%E6%A1%A3%E5%86%99%E4%BD%9C%E8%A7%84%E7%BA%A6/)
 - [开发者 - 4 - 发布 Release](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---4---%E5%8F%91%E5%B8%83-Release/)
+- [开发者 - 5 - 技术文档审校](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---5---%E6%8A%80%E6%9C%AF%E6%96%87%E6%A1%A3%E5%AE%A1%E6%A0%A1/)
+- [开发者 - 6 - Code Review 规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---6---Code-Review-%E8%A7%84%E7%BA%A6/)
+- [开发者 - 7 - 事件订阅与全量快照规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---7---%E4%BA%8B%E4%BB%B6%E8%AE%A2%E9%98%85%E4%B8%8E%E5%85%A8%E9%87%8F%E5%BF%AB%E7%85%A7%E8%A7%84%E7%BA%A6/)
+- [开发者 - 8 - 数据结构与索引设计规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---8---%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84%E4%B8%8E%E7%B4%A2%E5%BC%95%E8%AE%BE%E8%AE%A1%E8%A7%84%E7%BA%A6/)
 
 <a id="contributors"></a>
 

@@ -178,7 +178,7 @@ TRANSPORT_BACKEND_FEATURES = {
 # Public fluxon_pyo3 only accepts its own transport toggles. Closed SDK linkage is
 # provided through fluxon_commu_closed_sdk_consumer via FLUXON_COMMU_CLOSED_SDK_ROOT,
 # so the wheel build must not inject closed-only feature names into the open crate.
-PYO3_BASE_FEATURES = ("p2p_transfer",)
+PYO3_BASE_FEATURES = ("p2p_transfer", "fluxon_fs_video_ffmpeg")
 RDMA_BACKEND_FEATURES = {
     "closed_sdk": [],
 }
@@ -223,7 +223,11 @@ def _wheel_variant_key(transport_backend: str, rdma_backend: str) -> str:
 
 
 def _transport_backend_feature_csv(transport_backend: str, rdma_backend: str) -> str:
-    features = TRANSPORT_BACKEND_FEATURES[transport_backend] + RDMA_BACKEND_FEATURES[rdma_backend]
+    features = (
+        list(PYO3_BASE_FEATURES)
+        + TRANSPORT_BACKEND_FEATURES[transport_backend]
+        + RDMA_BACKEND_FEATURES[rdma_backend]
+    )
     return ",".join(features)
 
 

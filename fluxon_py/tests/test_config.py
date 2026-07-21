@@ -48,6 +48,8 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("fluxonkv_sub_cluster_config", test_fluxonkv_sub_cluster_config),
         ("fluxonkv_owner_requires_sub_cluster", test_fluxonkv_owner_requires_sub_cluster),
         ("fluxonkv_owner_requires_large_file_paths", test_fluxonkv_owner_requires_large_file_paths),
+        ("fluxonkv_large_limit_size_contract", test_fluxonkv_large_limit_size_contract),
+        ("fluxonkv_size_string_contract", test_fluxonkv_size_string_contract),
         ("fluxonkv_external_forbids_large_file_paths", test_fluxonkv_external_forbids_large_file_paths),
         ("fluxonkv_p2p_relay_removed", test_fluxonkv_p2p_relay_removed),
         ("fluxon_client_config_yaml_shape", test_fluxon_client_config_yaml_shape),
@@ -55,6 +57,7 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("fluxonkv_runtime_defaults_are_internal", test_fluxonkv_runtime_defaults_are_internal),
         ("fluxonkv_removed_rdma_config_keys", test_fluxonkv_removed_rdma_config_keys),
         ("fluxonkv_test_spec_config", test_fluxonkv_test_spec_config),
+        ("mooncake_ssd_offload_config", test_mooncake_ssd_offload_config),
         ("fluxon_pyo3_import_authority", test_fluxon_pyo3_import_authority),
     ]
     if selected_test_id is None:
@@ -310,6 +313,76 @@ def test_fluxonkv_owner_requires_large_file_paths():
         print(f"❌ FAIL: test_fluxonkv_owner_requires_large_file_paths - {e}")
 
 
+def test_fluxonkv_large_limit_size_contract():
+    """Ensure KV SSD limits align one-to-one with large_file_paths."""
+    try:
+        valid = _owner_fluxonkv_base_config(tag="large_limit_size_valid")
+        valid["fluxonkv_spec"]["large_limit_size"] = [1048576]
+        rendered = FluxonKvClientConfig(valid).to_fluxon_kv_client_config_yaml_str()
+        loaded = yaml.safe_load(rendered)
+        assert loaded["fluxonkv_spec"]["large_limit_size"] == [1048576]
+
+        mismatch = _owner_fluxonkv_base_config(tag="large_limit_size_mismatch")
+        mismatch["fluxonkv_spec"]["large_file_paths"] = [
+            "/tmp/kvcache_large/large_limit_size_mismatch_a",
+            "/tmp/kvcache_large/large_limit_size_mismatch_b",
+        ]
+        mismatch["fluxonkv_spec"]["large_limit_size"] = [1048576]
+        try:
+            FluxonKvClientConfig(mismatch)
+            print("❌ FAIL: test_fluxonkv_large_limit_size_contract - length mismatch should be rejected")
+            return
+        except ValueError:
+            pass
+
+        too_small = _owner_fluxonkv_base_config(tag="large_limit_size_too_small")
+        too_small["fluxonkv_spec"]["large_limit_size"] = [1]
+        try:
+            FluxonKvClientConfig(too_small)
+            print("❌ FAIL: test_fluxonkv_large_limit_size_contract - value below 512 should be rejected")
+            return
+        except ValueError:
+            pass
+
+        external = {
+            "instance_key": "test_external",
+            "contribute_to_cluster_pool_size": {"dram": 0, "vram": {}},
+            "fluxonkv_spec": {
+                "cluster_name": "test_cluster",
+                "share_mem_path": "/tmp/kvcache_shared_memory/test",
+                "large_limit_size": [1048576],
+            },
+        }
+        try:
+            FluxonKvClientConfig(external)
+            print("❌ FAIL: test_fluxonkv_large_limit_size_contract - external large_limit_size should be rejected")
+            return
+        except ValueError:
+            pass
+
+        print("✅ PASS: test_fluxonkv_large_limit_size_contract")
+    except Exception as e:
+        print(f"❌ FAIL: test_fluxonkv_large_limit_size_contract - {e}")
+
+
+def test_fluxonkv_size_string_contract():
+    """Ensure memory contribution and KV SSD limits accept size strings."""
+    try:
+        cfg = _owner_fluxonkv_base_config(tag="size_string")
+        cfg["contribute_to_cluster_pool_size"]["dram"] = "1.1GB"
+        cfg["contribute_to_cluster_pool_size"]["vram"] = {"0": "0.5GB"}
+        cfg["fluxonkv_spec"]["large_limit_size"] = ["512.9B"]
+        config = FluxonKvClientConfig(copy.deepcopy(cfg))
+        loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
+        assert loaded["contribute_to_cluster_pool_size"]["dram"] == 70 * 16 * 1024 * 1024
+        assert loaded["contribute_to_cluster_pool_size"]["vram"]["0"] == 512 * 1024 * 1024
+        assert loaded["fluxonkv_spec"]["large_limit_size"] == [512]
+
+        print("✅ PASS: test_fluxonkv_size_string_contract")
+    except Exception as e:
+        print(f"❌ FAIL: test_fluxonkv_size_string_contract - {e}")
+
+
 def test_fluxonkv_external_forbids_large_file_paths():
     """Ensure zero-contribution external config cannot declare owner-only large_file_paths."""
     try:
@@ -504,6 +577,23 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["enable_iceoryx_logs"] is True
         assert "transport_mode" not in loaded["test_spec_config"]
 
+        foyer_backend = copy.deepcopy(base)
+        foyer_backend["test_spec_config"] = {"kv_ssd_storage_backend": "foyer"}
+        config = FluxonKvClientConfig(foyer_backend)
+        loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
+        assert loaded["test_spec_config"]["kv_ssd_storage_backend"] == "foyer"
+
+        invalid_foyer_uring = copy.deepcopy(foyer_backend)
+        invalid_foyer_uring["test_spec_config"]["kv_ssd_uring_mode"] = "iovec"
+        try:
+            FluxonKvClientConfig(invalid_foyer_uring)
+            print(
+                "❌ FAIL: test_fluxonkv_test_spec_config - foyer with iovec should be rejected"
+            )
+            return
+        except ValueError:
+            pass
+
         closed_backend = copy.deepcopy(base)
         closed_backend["test_spec_config"]["transport_mode"] = "transfer_only"
         closed_backend["test_spec_config"]["rdma_device_names"] = ["mlx5_0"]
@@ -636,6 +726,36 @@ def test_fluxonkv_test_spec_config():
         print(f"❌ FAIL: test_fluxonkv_test_spec_config - {e}")
 
 
+def test_mooncake_ssd_offload_config():
+    """Test Mooncake SSD offload fields are accepted and preserved."""
+    try:
+        cfg = config_dict()
+        cfg["mooncake_spec"]["enable_ssd_offload"] = True
+        cfg["mooncake_spec"]["ssd_offload_path"] = "/tmp/mooncake-offload"
+        cfg["mooncake_spec"]["skip_get_size_on_get"] = True
+        cfg["mooncake_spec"]["local_hostname"] = "192.0.2.10"
+        config = FluxonKvClientConfig(cfg)
+        assert config.mooncake_spec_enable_ssd_offload is True
+        assert config.mooncake_spec_ssd_offload_path == "/tmp/mooncake-offload"
+        assert config.mooncake_spec_skip_get_size_on_get is True
+        assert config.mooncake_spec_local_hostname == "192.0.2.10"
+        loaded = yaml.safe_load(config.to_yaml_str())
+        assert loaded["mooncake_spec"]["enable_ssd_offload"] is True
+        assert loaded["mooncake_spec"]["ssd_offload_path"] == "/tmp/mooncake-offload"
+        assert loaded["mooncake_spec"]["skip_get_size_on_get"] is True
+        assert loaded["mooncake_spec"]["local_hostname"] == "192.0.2.10"
+
+        default_cfg = config_dict()
+        default_config = FluxonKvClientConfig(default_cfg)
+        assert default_config.mooncake_spec_enable_ssd_offload is False
+        assert default_config.mooncake_spec_ssd_offload_path == ""
+        assert default_config.mooncake_spec_skip_get_size_on_get is False
+        assert default_config.mooncake_spec_local_hostname == "test_instance"
+        print("✅ PASS: test_mooncake_ssd_offload_config")
+    except Exception as e:
+        print(f"❌ FAIL: test_mooncake_ssd_offload_config - {e}")
+
+
 def config_dict():
     return {
         "instance_key": "test_instance",
@@ -718,12 +838,13 @@ def test_to_yaml_str_roundtrip(cfg: dict):
 def test_verification(cfg):
     """Test configuration verification for invalid values."""
     try:
-        invalid_config = copy.deepcopy(cfg)
-        invalid_config["contribute_to_cluster_pool_size"]["dram"] = 16777217
-        FluxonKvClientConfig(invalid_config)
-        print("❌ FAIL: Invalid dram size should be rejected")
-    except ValueError:
-        print("✅ PASS: Invalid dram size correctly rejected")
+        aligned_config = copy.deepcopy(cfg)
+        aligned_config["contribute_to_cluster_pool_size"]["dram"] = 16777217
+        config = FluxonKvClientConfig(aligned_config)
+        assert config.contribute_to_cluster_pool_size["dram"] == 16777216
+        print("✅ PASS: Unaligned dram size correctly aligned")
+    except Exception as e:
+        print(f"❌ FAIL: Unaligned dram size should be aligned - {e}")
 
     try:
         invalid_config = copy.deepcopy(cfg)
@@ -814,12 +935,13 @@ def test_verification(cfg):
         print(f"❌ FAIL: Valid GPU configuration should be accepted - {e}")
 
     try:
-        invalid_gpu_config = copy.deepcopy(cfg)
-        invalid_gpu_config["contribute_to_cluster_pool_size"]["vram"] = {"0": 16777217}
-        FluxonKvClientConfig(invalid_gpu_config)
-        print("❌ FAIL: Invalid GPU configuration should be rejected")
-    except ValueError:
-        print("✅ PASS: Invalid GPU configuration correctly rejected")
+        aligned_gpu_config = copy.deepcopy(cfg)
+        aligned_gpu_config["contribute_to_cluster_pool_size"]["vram"] = {"0": 16777217}
+        config = FluxonKvClientConfig(aligned_gpu_config)
+        assert config.contribute_to_cluster_pool_size["vram"]["0"] == 16777216
+        print("✅ PASS: Unaligned GPU configuration correctly aligned")
+    except Exception as e:
+        print(f"❌ FAIL: Unaligned GPU configuration should be aligned - {e}")
 
 
 if __name__ == "__main__":

@@ -22,7 +22,6 @@ async-trait = { workspace = true }
 bitcode = { workspace = true }
 bytes = { workspace = true }
 crossbeam = "0.8"
-etcd-client = { workspace = true }
 fluxon_commu_contract = { path = "../fluxon_commu_contract" }
 fluxon_commu_closed_sdk_consumer = { path = "../fluxon_commu_closed_sdk_consumer" }
 fluxon_framework = { path = "../fluxon_framework" }

@@ -6,7 +6,7 @@ retention:
 repos:
   - addr: git@github.com:Tele-AI/fluxon.git
     follow:
-      - branch: big_step2
+      - branch: example-feature-branch
         run:
           name_prefix: fluxon_ci
           commands:
@@ -39,20 +39,20 @@ repos:
                         "fluxon_pyo3": fluxon_pyo3_wheels[0],
                     },
                     "cluster": {
-                        "etcd_endpoints": ["10.126.126.231:2379"],
+                        "etcd_endpoints": ["192.0.2.10:2379"],
                         "cluster_name": "fluxon_deployer_cluster",
                         "monitoring": {
-                            "prometheus_base_url": "http://10.126.126.231:4010/v1/prometheus",
+                            "prometheus_base_url": "http://192.0.2.10:4010/v1/prometheus",
                         },
                     },
                     "nodes": [
                         {
-                            "name": "infra44-ThinkStation-PX",
-                            "host": "10.126.126.231",
+                            "name": "example-node-a",
+                            "host": "192.0.2.10",
                             "ssh": {
                                 "local": True,
                                 "port": 22,
-                                "user": "zyc",
+                                "user": "example_user",
                                 # Intentionally no password by default.
                                 # If your SSH requires a password, set ssh.password explicitly.
                                 # If you use an SSH key, set ssh.identity_file explicitly.

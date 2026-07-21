@@ -3,11 +3,13 @@ use super::msg_and_error::{ErrorCode, KvError, KvResult};
 use crate::client_kv_api::msg_pack::{
     ExternalDeleteAckResp, ExternalDeleteResp, ExternalGetResp, ExternalIsExistResp,
     ExternalPutCommitResp, ExternalPutRevokeResp, ExternalPutStartResp, ExternalPutTransferEndResp,
+    SsdReplicaPersistResp, SsdStageReadResp,
 };
 use crate::master_kv_router::msg_pack::{
-    BatchDeleteAckResp, BatchDeleteClientKvMetaCacheResp, DeleteAckResp, DeleteResp, GetDoneResp,
-    GetMasterOnlyMetricPartResp, GetMetaResp, GetRevokeResp, GetStartResp, MemHolderKeepAliveResp,
-    MemHolderReleaseResp, PutDoneResp, PutRevokeResp, PutStartResp,
+    BatchDeleteAckResp, BatchDeleteClientKvMetaCacheResp, BatchSsdReplicaEvictResp, DeleteAckResp,
+    DeleteResp, GetDoneResp, GetMasterOnlyMetricPartResp, GetMetaResp, GetRevokeResp, GetStartResp,
+    MemHolderKeepAliveResp, MemHolderReleaseResp, PutDoneResp, PutRevokeResp, PutStartResp,
+    SsdReplicaCommitResp, SsdStageBeginResp,
 };
 use crate::master_seg_manager::msg_pack::RequestSegmentRegistrationResp;
 use crate::memholder::ExternalMemHolderInfo;
@@ -232,6 +234,26 @@ impl FromError for ExternalDeleteAckResp {
         }
     }
 }
+impl FromError for SsdStageReadResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for SsdReplicaPersistResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
 
 // ---- FromError for Master KV Router Resps ----
 impl FromError for GetStartResp {
@@ -264,6 +286,15 @@ impl FromError for GetDoneResp {
         }
     }
 }
+impl FromError for SsdStageBeginResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+        }
+    }
+}
 impl FromError for PutStartResp {
     fn from_error(e: &KvError) -> Self {
         let code = e.code();
@@ -285,6 +316,26 @@ impl FromError for PutRevokeResp {
     }
 }
 impl FromError for PutDoneResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for SsdReplicaCommitResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for BatchSsdReplicaEvictResp {
     fn from_error(e: &KvError) -> Self {
         let code = e.code();
         Self {

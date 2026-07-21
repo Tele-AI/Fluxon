@@ -1,25 +1,26 @@
 use super::NodeValueReplicaDesc;
 use super::{
-    InflightPutAllocation, InflightPutInfo, KvRouteInfo, MasterKvRouterView, PutPlacementMode,
-    msg_pack::{PutDoneReq, PutDoneResp, PutRevokeReq, PutRevokeResp, PutStartReq, PutStartResp},
+    InflightPutAllocation, InflightPutInfo, MasterKvRouterView, NodeCacheCapacityReservation,
+    PutPlacementMode, SsdReplicaCommitStatus,
+    msg_pack::{
+        PutDoneReq, PutDoneResp, PutRevokeReq, PutRevokeResp, PutStartReq, PutStartResp,
+        SsdReplicaCommitReq, SsdReplicaCommitResp,
+    },
     placement::PutPlacementTarget,
 };
+use crate::client_kv_api::msg_pack::SsdReplicaPersistReq;
 use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::delete::DeleteKeyInfo;
 use crate::{
     cluster_manager::{META_KEY_LOCAL_IPC_ROOT, NodeID},
     master_seg_manager::one_seg_allocator::Allocation,
-    p2p::msg_pack::MsgPack,
+    p2p::msg_pack::{MsgPack, RPCCaller},
     rpcresp_kvresult_convert::msg_and_error,
 };
 use fluxon_commu::{META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME};
 use parking_lot::Mutex;
-use parking_lot::RwLock;
 use rand::seq::SliceRandom;
-use std::{
-    collections::HashMap,
-    sync::{Arc, atomic::AtomicU32},
-};
+use std::{sync::Arc, time::Duration};
 
 pub type PutIDForAKey = (u64, u32);
 
@@ -159,10 +160,11 @@ pub async fn handle_put_start(
     req_node_id: NodeID,
 ) -> (PutIDForAKey, MsgPack<PutStartResp>) {
     let key = req.serialize_part.key.clone();
-    if let Err(err) = view
-        .master_kv_router()
-        .reserve_inflight_put_key(&key, req.serialize_part.reject_if_inflight_same_key)
-    {
+    if let Err(err) = view.master_kv_router().reserve_inflight_put_key(
+        &key,
+        req.serialize_part.reject_if_inflight_same_key,
+        req.serialize_part.reject_if_exists,
+    ) {
         let resp: PutStartResp = crate::rpcresp_kvresult_convert::FromError::from_error(&err);
         return (
             (0, 0),
@@ -267,6 +269,7 @@ pub async fn handle_put_start(
     let mut src_allocation = Some(src_allocation);
 
     let finalize = |node_id: NodeID,
+                    persist_to_ssd: bool,
                     inflight_alloc: InflightPutAllocation,
                     src_addr: u64,
                     target_addr: u64,
@@ -278,6 +281,7 @@ pub async fn handle_put_start(
             key: key.clone(),
             len,
             req_node_id: req_node_id.clone(),
+            persist_to_ssd,
             src_target_allocation: Arc::new(Mutex::new(Some(inflight_alloc))),
         };
 
@@ -327,7 +331,10 @@ pub async fn handle_put_start(
         .await;
 
     match put_target {
-        Ok(PutPlacementTarget::Local { node_id }) => {
+        Ok(PutPlacementTarget::Local {
+            node_id,
+            persist_to_ssd,
+        }) => {
             if node_id != source_node_id {
                 unreachable!(
                     "Local placement must be the resolved source node; got node_id={} source_node_id={} requester_node_id={}",
@@ -336,14 +343,15 @@ pub async fn handle_put_start(
             }
 
             tracing::debug!(
-                "put_start placement decided: local; put_id={:?} key={} requester_node_id={} source_node_id={} target_node_id={} preferred_sub_cluster={:?} len={}",
+                "put_start placement decided: local; put_id={:?} key={} requester_node_id={} source_node_id={} target_node_id={} preferred_sub_cluster={:?} len={} persist_to_ssd={}",
                 put_id,
                 key,
                 req_node_id,
                 source_node_id,
                 node_id,
                 req.serialize_part.preferred_sub_cluster,
-                req.serialize_part.len
+                req.serialize_part.len,
+                persist_to_ssd
             );
             view.master_kv_router().record_put_placement_decision(
                 req_node_id.as_ref(),
@@ -364,6 +372,7 @@ pub async fn handle_put_start(
                 .expect("src_allocation must exist when finalizing local put");
             let fut = finalize(
                 node_id,
+                persist_to_ssd,
                 InflightPutAllocation::Local(src),
                 abs,
                 abs,
@@ -378,6 +387,7 @@ pub async fn handle_put_start(
         Ok(PutPlacementTarget::Remote {
             node_id,
             allocation: target_allocation,
+            persist_to_ssd,
             ..
         }) => {
             let src_ref = src_allocation
@@ -391,7 +401,7 @@ pub async fn handle_put_start(
             let allocation_size = target_allocation.size();
 
             tracing::debug!(
-                "put_start placement decided: remote; put_id={:?} key={} requester_node_id={} source_node_id={} target_node_id={} preferred_sub_cluster={:?} len={} target_base_addr={} target_offset={} allocation_size={}",
+                "put_start placement decided: remote; put_id={:?} key={} requester_node_id={} source_node_id={} target_node_id={} preferred_sub_cluster={:?} len={} target_base_addr={} target_offset={} allocation_size={} persist_to_ssd={}",
                 put_id,
                 key,
                 req_node_id,
@@ -401,7 +411,8 @@ pub async fn handle_put_start(
                 req.serialize_part.len,
                 target_base,
                 target_offset,
-                allocation_size
+                allocation_size,
+                persist_to_ssd
             );
             view.master_kv_router().record_put_placement_decision(
                 req_node_id.as_ref(),
@@ -414,6 +425,7 @@ pub async fn handle_put_start(
                 .expect("src_allocation must exist when finalizing remote put");
             let fut = finalize(
                 node_id,
+                persist_to_ssd,
                 InflightPutAllocation::Remote {
                     src,
                     target: target_allocation,
@@ -474,6 +486,229 @@ pub async fn handle_put_revoke(
     }
 }
 
+fn insert_memory_replica_into_cache_if_current(
+    view: &MasterKvRouterView,
+    key: &str,
+    put_id: PutIDForAKey,
+    node_id: &NodeID,
+    weight_bytes: u32,
+) {
+    let Some(route_ref) = view.master_kv_router().inner().kv_routes.get(key) else {
+        tracing::debug!(
+            "Skipping delayed cache insertion for missing key: key={} put_id=({},{}) node={}",
+            key,
+            put_id.0,
+            put_id.1,
+            node_id
+        );
+        return;
+    };
+    let route = route_ref.value().clone();
+    drop(route_ref);
+
+    if route.put_id != put_id || !route.has_memory_replica(node_id) {
+        tracing::debug!(
+            "Skipping delayed cache insertion for stale replica: key={} put_id=({},{}) node={}",
+            key,
+            put_id.0,
+            put_id.1,
+            node_id
+        );
+        return;
+    }
+
+    let Some(cache) = view
+        .master_kv_router()
+        .get_node_cache_controller(node_id.as_ref())
+    else {
+        tracing::warn!(
+            "No cache controller found for node: {}, node is not ready",
+            node_id
+        );
+        return;
+    };
+    let desc = NodeValueReplicaDesc {
+        weight_bytes,
+        put_id,
+    };
+    tracing::debug!("Inserting key: {:?} into cache", key);
+    cache.insert(key.to_string(), desc);
+    tracing::debug!(
+        "Inserted key: {:?} into cache, current cache size: {}",
+        key,
+        cache.weighted_size()
+    );
+}
+
+fn spawn_ssd_replica_persist_request(
+    view: &MasterKvRouterView,
+    key: String,
+    put_id: PutIDForAKey,
+    node_id: NodeID,
+    len: u64,
+    allocation: Arc<Allocation>,
+    cache_weight_bytes: Option<u32>,
+    pending_persist_reservation: Option<NodeCacheCapacityReservation>,
+) {
+    let target_addr = allocation.base_addr() + allocation.addr();
+    let view = view.clone();
+    let view_task = view.clone();
+    let _ = view.spawn("post_put_ssd_replica_persist", async move {
+        let _allocation_guard = allocation;
+        let req = MsgPack {
+            serialize_part: SsdReplicaPersistReq {
+                key: key.clone(),
+                put_id,
+                target_addr,
+                len,
+            },
+            raw_bytes: Vec::new(),
+        };
+        let resp = RPCCaller::<SsdReplicaPersistReq>::new()
+            .call(
+                view_task.p2p_module(),
+                node_id.clone(),
+                req,
+                Some(Duration::from_secs(60)),
+                2,
+            )
+            .await;
+        match resp {
+            Ok(resp) => {
+                if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
+                    resp.serialize_part.error_code,
+                    resp.serialize_part.error_json,
+                ) {
+                    tracing::warn!(
+                        "SSD replica persist failed: key={} put_id=({},{}) node={} err={}",
+                        key,
+                        put_id.0,
+                        put_id.1,
+                        node_id,
+                        err
+                    );
+                } else if resp.serialize_part.persisted {
+                    tracing::debug!(
+                        "SSD replica persist completed: key={} put_id=({},{}) node={}",
+                        key,
+                        put_id.0,
+                        put_id.1,
+                        node_id
+                    );
+                } else {
+                    tracing::debug!(
+                        "SSD replica persist skipped because owner has no SSD store: key={} put_id=({},{}) node={}",
+                        key,
+                        put_id.0,
+                        put_id.1,
+                        node_id
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "SSD replica persist RPC failed: key={} put_id=({},{}) node={} err={:?}",
+                    key,
+                    put_id.0,
+                    put_id.1,
+                    node_id,
+                    err
+                );
+            }
+        }
+
+        // The allocation becomes Moka-managed only after the persist attempt.
+        // Release its temporary reservation before inserting the same bytes.
+        drop(pending_persist_reservation);
+        if let Some(weight_bytes) = cache_weight_bytes {
+            insert_memory_replica_into_cache_if_current(
+                &view_task,
+                &key,
+                put_id,
+                &node_id,
+                weight_bytes,
+            );
+        }
+    });
+}
+
+fn ok_ssd_replica_commit_resp() -> MsgPack<SsdReplicaCommitResp> {
+    MsgPack {
+        serialize_part: SsdReplicaCommitResp {
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+            server_process_us: 0,
+        },
+        raw_bytes: Vec::new(),
+    }
+}
+
+pub async fn handle_ssd_replica_commit(
+    view: MasterKvRouterView,
+    req: MsgPack<SsdReplicaCommitReq>,
+    req_node_id: NodeID,
+) -> MsgPack<SsdReplicaCommitResp> {
+    let req = req.serialize_part;
+    let Some(route_ref) = view.master_kv_router().inner().kv_routes.get(&req.key) else {
+        tracing::debug!(
+            "Ignoring SSD replica commit for missing key: key={} put_id=({},{}) node={}",
+            req.key,
+            req.put_id.0,
+            req.put_id.1,
+            req_node_id
+        );
+        return ok_ssd_replica_commit_resp();
+    };
+    let route = route_ref.value().clone();
+    drop(route_ref);
+
+    if route.put_id != req.put_id {
+        tracing::debug!(
+            "Ignoring stale SSD replica commit: key={} req_put_id=({},{}) current_put_id=({},{}) node={}",
+            req.key,
+            req.put_id.0,
+            req.put_id.1,
+            route.put_id.0,
+            route.put_id.1,
+            req_node_id
+        );
+        return ok_ssd_replica_commit_resp();
+    }
+
+    match route.commit_ssd_replica(&req_node_id, req.len) {
+        SsdReplicaCommitStatus::MissingMemory => {
+            tracing::debug!(
+                "Ignoring SSD replica commit without matching memory replica: key={} put_id=({},{}) node={}",
+                req.key,
+                req.put_id.0,
+                req.put_id.1,
+                req_node_id
+            );
+            return ok_ssd_replica_commit_resp();
+        }
+        SsdReplicaCommitStatus::TombedNode => {
+            tracing::debug!(
+                "Ignoring SSD replica commit for tombed node: key={} put_id=({},{}) node={}",
+                req.key,
+                req.put_id.0,
+                req.put_id.1,
+                req_node_id
+            );
+            return ok_ssd_replica_commit_resp();
+        }
+        SsdReplicaCommitStatus::Committed => {}
+    }
+    tracing::debug!(
+        "Committed SSD replica route: key={} put_id=({},{}) node={} len={}",
+        req.key,
+        req.put_id.0,
+        req.put_id.1,
+        req_node_id,
+        req.len
+    );
+    ok_ssd_replica_commit_resp()
+}
+
 pub async fn handle_put_done(
     view: MasterKvRouterView,
     req: MsgPack<PutDoneReq>,
@@ -488,6 +723,8 @@ pub async fn handle_put_done(
     if let Some(InflightPutInfo {
         node_id,
         key,
+        len,
+        persist_to_ssd,
         src_target_allocation,
         ..
     }) = view
@@ -497,7 +734,8 @@ pub async fn handle_put_done(
         .remove(&full_put_id)
         .await
     {
-        view.master_kv_router().release_inflight_put_key(&key);
+        // Keep same-key admission reserved until the new route is visible.
+        let key_reservation = InflightPutKeyReservation::new(view.clone(), key.clone());
         let Some(allocs) = src_target_allocation.lock().take() else {
             tracing::warn!(
                 "Put operation with put_id {:?} not found for completion",
@@ -574,10 +812,23 @@ pub async fn handle_put_done(
         } else {
             target_cap_bytes as u32
         };
-        // Note: moka cache insertion happens after commit in a spawned task
-        // using the same saturated weight; avoid unused local here.
-        // If lease is provided, attach first and fail fast on error
+        let mut pending_persist_reservation = None;
         if let Some(lease_id) = lease_id_opt {
+            let lease_cache_reservation = match view
+                .master_kv_router()
+                .reserve_node_cache_capacity(node_id.as_ref(), target_cap_bytes)
+            {
+                Ok(reservation) => reservation,
+                Err(e) => {
+                    let kv_err: crate::rpcresp_kvresult_convert::msg_and_error::KvError = e.into();
+                    return MsgPack {
+                        serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(
+                            &kv_err,
+                        ),
+                        raw_bytes: Vec::new(),
+                    };
+                }
+            };
             if let Err(e) = view
                 .master_lease_manager()
                 .attach_key(lease_id, key.clone(), put_id)
@@ -589,50 +840,27 @@ pub async fn handle_put_done(
                     raw_bytes: Vec::new(),
                 };
             }
-            // Reserve cache capacity on this node for the leased allocation now (fetch_sub semantics)
-            if let Err(e) = view
+            target_allocation.set_on_drop(move || drop(lease_cache_reservation));
+        } else {
+            pending_persist_reservation = match view
                 .master_kv_router()
-                .adjust_node_cache_capacity_for_lease(node_id.as_ref(), target_cap_bytes as i64)
+                .reserve_node_cache_capacity(node_id.as_ref(), target_cap_bytes)
             {
-                let kv_err: crate::rpcresp_kvresult_convert::msg_and_error::KvError = e.into();
-                return MsgPack {
-                    serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&kv_err),
-                    raw_bytes: Vec::new(),
-                };
-            }
-            // And attach an on-drop hook to restore it (fetch_add on Allocation drop)
-            let view_clone = view.clone();
-            let node_id_string = node_id.as_ref().to_string();
-            target_allocation.set_on_drop(move || {
-                match view_clone.try_adjust_node_cache_capacity_for_lease(
-                    &node_id_string,
-                    -(target_cap_bytes as i64),
-                ) {
-                    Some(Ok(())) => {}
-                    Some(Err(e)) => {
-                        tracing::warn!(
-                            "Failed to restore moka capacity on drop: node_id={}, bytes={}, err={}",
-                            node_id_string,
-                            target_cap_bytes,
-                            e
-                        );
-                    }
-                    None => {
-                        tracing::debug!(
-                            "Skipped restoring moka capacity on drop because MasterKvRouterView is gone: node_id={}, bytes={}",
-                            node_id_string,
-                            target_cap_bytes
-                        );
-                    }
+                Ok(reservation) => reservation,
+                Err(e) => {
+                    let kv_err: crate::rpcresp_kvresult_convert::msg_and_error::KvError = e.into();
+                    return MsgPack {
+                        serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(
+                            &kv_err,
+                        ),
+                        raw_bytes: Vec::new(),
+                    };
                 }
-            });
+            };
         }
 
-        let completed_info = KvRouteInfo {
-            node_id: node_id.clone(),
-            allocation: Arc::new(target_allocation),
-            tomb_tag,
-        };
+        let target_allocation = Arc::new(target_allocation);
+        let target_allocation_for_ssd = persist_to_ssd.then(|| Arc::clone(&target_allocation));
 
         // Insert into kv_routes with replica support
         let mut old_one_kv_routes: Option<Arc<OneKvNodesRoutes>> = None;
@@ -645,27 +873,48 @@ pub async fn handle_put_done(
                 .entry(key.clone())
                 .or_insert_with(|| {
                     inserted = true;
-                    Arc::new(OneKvNodesRoutes {
-                        put_id,
-                        lease_id: lease_id_opt,
-                        nodes_replicas: RwLock::new(HashMap::new()),
-                        get_durable_slots_used: AtomicU32::new(0),
-                    })
+                    Arc::new(OneKvNodesRoutes::new(put_id, lease_id_opt))
                 });
             // we need to take out old one_kv_routes if it is not inserted
             if !inserted {
                 old_one_kv_routes = Some(one_kv_routes.clone());
-                *one_kv_routes = Arc::new(OneKvNodesRoutes {
-                    put_id,
-                    lease_id: lease_id_opt,
-                    nodes_replicas: RwLock::new(HashMap::new()),
-                    get_durable_slots_used: AtomicU32::new(0),
-                });
+                *one_kv_routes = Arc::new(OneKvNodesRoutes::new(put_id, lease_id_opt));
             }
-            one_kv_routes
-                .nodes_replicas
-                .write()
-                .insert(node_id.clone(), completed_info);
+            one_kv_routes.insert_memory_replica(
+                node_id.clone(),
+                target_allocation,
+                tomb_tag.clone(),
+            );
+        }
+        // Publish the route before releasing admission so reject-if-exists observes either
+        // the inflight reservation or the committed route, with no visibility gap.
+        drop(key_reservation);
+
+        let cache_weight_bytes = (lease_id_opt.is_none()
+            && view.master_kv_router().replica_cache_enabled())
+        .then_some(saturated_weight_u32);
+        if let Some(target_allocation_for_ssd) = target_allocation_for_ssd {
+            spawn_ssd_replica_persist_request(
+                &view,
+                key.clone(),
+                put_id,
+                node_id.clone(),
+                len,
+                target_allocation_for_ssd,
+                cache_weight_bytes,
+                pending_persist_reservation,
+            );
+        } else {
+            drop(pending_persist_reservation);
+            if let Some(weight_bytes) = cache_weight_bytes {
+                insert_memory_replica_into_cache_if_current(
+                    &view,
+                    &key,
+                    put_id,
+                    &node_id,
+                    weight_bytes,
+                );
+            }
         }
 
         if let Some(old) = old_one_kv_routes {
@@ -684,53 +933,17 @@ pub async fn handle_put_done(
             }
         }
 
-        // Post-commit maintenance: update prefix-count index (for CountPrefix RPC)
-        // and, if applicable, update per-node cache controller. Run both in a
-        // spawned task to keep the PutDone RPC path lean and consistent with
-        // other async cache control operations. Deletion path already removes
-        // the index entry in delete.rs (do_delete_one_kv_all_replicas).
+        // Update the prefix-count index asynchronously to keep PutDone lean.
+        // SSD-backed targets delay cache insertion until the persist request completes.
         {
             let view_task = view.clone();
             let key_for_spawn = key.clone();
-            let node_for_spawn = node_id.clone();
             let do_prefix_index_update = view.master_kv_router().prefix_index_enabled();
-            let do_cache_insert =
-                lease_id_opt.is_none() && view.master_kv_router().replica_cache_enabled();
-            // Reuse the saturated weight computed above for moka insertion
-            let cap_bytes_u32 = saturated_weight_u32;
             let _ = view.spawn("post_put_done_maintenance", async move {
-                // 1) Update the derived prefix-counting index asynchronously.
-                //    This keeps PutDone lean, but also means CountPrefix visibility
-                //    is not an immediate strong-consistency signal for this put.
                 if do_prefix_index_update {
                     let inner = view_task.master_kv_router().inner();
                     let mut tree = inner.prefix_index.write().await;
                     tree.insert(&key_for_spawn);
-                }
-
-                // 2) Optionally update node cache controller (non-leased keys)
-                if do_cache_insert {
-                    let cache = view_task
-                        .master_kv_router()
-                        .get_node_cache_controller(&node_for_spawn);
-                    if let Some(cache) = cache {
-                        let desc = NodeValueReplicaDesc {
-                            weight_bytes: cap_bytes_u32,
-                            put_id,
-                        };
-                        tracing::debug!("Inserting key: {:?} into cache", key_for_spawn);
-                        cache.insert(key_for_spawn.clone(), desc);
-                        tracing::debug!(
-                            "Inserted key: {:?} into cache, current cache size: {}",
-                            key_for_spawn,
-                            cache.weighted_size()
-                        );
-                    } else {
-                        tracing::warn!(
-                            "No cache controller found for node: {}, node is not ready",
-                            node_for_spawn
-                        );
-                    }
                 }
             });
         }

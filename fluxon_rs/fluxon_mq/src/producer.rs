@@ -20,6 +20,7 @@ use fluxon_util::lease_manager::LeaseManager;
 use fluxon_util::prom_remote_write::{Label, Sample, TimeSeries, LABEL_NAME as RW_LABEL_NAME};
 
 use crate::error::MpscError;
+use crate::etcd_retry::is_transient_etcd_error;
 use crate::keys::{self, MqCategory};
 use crate::lifecycle::spawn_named;
 use crate::manager::{get_chan_meta, ChanManager, ChanMemberMeta, ChanRole, PRODUCE_OFFSET_BEGIN};
@@ -32,6 +33,9 @@ use tokio::sync::watch;
 use tracing::warn;
 
 const PRODUCE_OFFSET_ETCD_SLOW_WARN_THRESHOLD: Duration = Duration::from_secs(1);
+const PRODUCE_OFFSET_PUT_TIMEOUT: Duration = Duration::from_secs(5);
+const PRODUCE_OFFSET_PUT_ATTEMPTS: usize = 3;
+const PRODUCE_OFFSET_PUT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const PRODUCER_MEMBERSHIP_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const PRODUCER_MEMBERSHIP_RPC_ATTEMPTS: usize = 3;
 const PRODUCER_MEMBERSHIP_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -654,27 +658,85 @@ impl MpscProducer {
         // 与 Python 版保持一致（等价于 self.chan_lease）。
         let global_lease_id = self.chan_mgr.global_lease.id() as i64;
         let offset_put_begin = Instant::now();
-        client
-            .put(
+        let mut committed_attempt = 0usize;
+        for attempt in 1..=PRODUCE_OFFSET_PUT_ATTEMPTS {
+            let put = client.put(
                 offset_key.clone(),
                 next_id.to_string(),
                 Some(etcd::PutOptions::new().with_lease(global_lease_id)),
-            )
-            .await
-            .map_err(|e| {
-                MpscError::Internal(format!(
-                    "failed to update produce offset for key {}, leaseid: {}, err:{}",
-                    offset_key, global_lease_id, e
-                ))
-            })?;
-        let offset_put_elapsed = offset_put_begin.elapsed();
-        if offset_put_elapsed >= PRODUCE_OFFSET_ETCD_SLOW_WARN_THRESHOLD {
+            );
+            let result = tokio::select! {
+                biased;
+                _ = self.shutdown.wait_closed() => {
+                    return Err(MpscError::Internal(format!(
+                        "producer closed while committing produce offset for key {} msg_id={}",
+                        offset_key, next_id
+                    )));
+                }
+                result = tokio::time::timeout(PRODUCE_OFFSET_PUT_TIMEOUT, put) => result,
+            };
+
+            let retry_reason = match result {
+                Ok(Ok(_)) => {
+                    committed_attempt = attempt;
+                    break;
+                }
+                Ok(Err(error)) if is_transient_etcd_error(&error) => {
+                    format!("transient etcd error: {error}")
+                }
+                Ok(Err(error)) => {
+                    return Err(MpscError::Internal(format!(
+                        "failed to update produce offset for key {}, leaseid: {}, attempt: {}, err: {}",
+                        offset_key, global_lease_id, attempt, error
+                    )));
+                }
+                Err(_) => format!(
+                    "timed out after {} ms",
+                    PRODUCE_OFFSET_PUT_TIMEOUT.as_millis()
+                ),
+            };
+
+            if attempt == PRODUCE_OFFSET_PUT_ATTEMPTS {
+                return Err(MpscError::Internal(format!(
+                    "failed to update produce offset for key {}, leaseid: {}, msg_id: {} after {} attempts: {}",
+                    offset_key, global_lease_id, next_id, attempt, retry_reason
+                )));
+            }
+
             warn!(
-                "[MpscProducer chan_id={} producer_idx={}] produce_offset put slow: msg_id={} offset_key={} elapsed_ms={}",
+                chan_id = self.chan_id,
+                producer_idx = %self.producer_idx,
+                msg_id = next_id,
+                offset_key = %offset_key,
+                attempt,
+                max_attempts = PRODUCE_OFFSET_PUT_ATTEMPTS,
+                reason = %retry_reason,
+                "Retrying produce-offset commit"
+            );
+            tokio::select! {
+                biased;
+                _ = self.shutdown.wait_closed() => {
+                    return Err(MpscError::Internal(format!(
+                        "producer closed during produce-offset retry for key {} msg_id={}",
+                        offset_key, next_id
+                    )));
+                }
+                _ = sleep(PRODUCE_OFFSET_PUT_RETRY_DELAY) => {}
+            }
+        }
+        assert!(
+            committed_attempt > 0,
+            "bounded produce-offset commit did not finish"
+        );
+        let offset_put_elapsed = offset_put_begin.elapsed();
+        if committed_attempt > 1 || offset_put_elapsed >= PRODUCE_OFFSET_ETCD_SLOW_WARN_THRESHOLD {
+            warn!(
+                "[MpscProducer chan_id={} producer_idx={}] produce_offset committed: msg_id={} offset_key={} attempts={} elapsed_ms={}",
                 self.chan_id,
                 self.producer_idx,
                 next_id,
                 offset_key,
+                committed_attempt,
                 offset_put_elapsed.as_millis(),
             );
         }

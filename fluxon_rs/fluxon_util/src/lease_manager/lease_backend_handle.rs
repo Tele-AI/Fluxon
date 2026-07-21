@@ -8,6 +8,7 @@ use super::lease_backend_uid::{KvKeepaliveLease, LeaseBackendUid};
 use super::lifecycle::debug_keepalive_log;
 use crate::auto_clean_map::AutoCleanMap;
 use crate::auto_clean_map::AutoCleanMapEntry;
+use crate::etcd::PooledEtcdClient;
 
 /// Backend resources actually used by keepalive actors.
 ///
@@ -16,6 +17,8 @@ use crate::auto_clean_map::AutoCleanMapEntry;
 pub enum LeaseBackendInner {
     Etcd {
         _endpoints: Vec<String>,
+        /// Final-release owner that keeps this backend's pool entry alive.
+        _pool_entry: PooledEtcdClient,
         client: Client,
         /// Per-lease keepalive state keyed by lease_id. Auto-evicts when the last
         /// guard (AutoCleanMapEntry) for that lease is dropped.
@@ -186,6 +189,7 @@ mod tests {
         let handle = super::super::lifecycle::acquire_backend_handle(
             backend,
             Some(keepalive),
+            None,
             None,
             tokio::runtime::Handle::current(),
         );

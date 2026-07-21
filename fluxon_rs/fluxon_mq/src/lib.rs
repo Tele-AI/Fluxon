@@ -1,6 +1,7 @@
 pub mod consumer;
 pub mod create;
 pub mod error;
+mod etcd_retry;
 pub mod framework;
 pub mod keys;
 pub mod lease_manager;

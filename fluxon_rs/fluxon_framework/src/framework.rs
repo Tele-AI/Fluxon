@@ -100,6 +100,12 @@ pub trait LogicalModule: Send + Sync {
     /// The default implementation is a no-op for modules that don't store the view.
     fn attach_view(&self, _view: Self::View) {}
 
+    /// Stop module-local admission and release dependents that still require live framework services.
+    /// The framework calls this before broadcasting the shared shutdown signal.
+    async fn prepare_shutdown(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Hook that runs before modules are finally closed.
     /// The framework broadcasts shutdown signals first, then calls this.
     /// Default no-op implementation for modules that don't need it.
@@ -599,14 +605,31 @@ macro_rules! define_framework {
 
 	                pub async fn shutdown(&self) -> AnyResult<()> {
 	                    tracing::info!(framework=%self.name(), "shutdown begin");
-	                    // Broadcast shutdown to background tasks and pollers first.
-	                    self.0.shutdown_notifier.shutdown();
-                    self.0.shutdown_poller.shutdown();
 
                     // Only shut down modules that were actually constructed in the selected init-DAG variant.
                     //
                     // Rationale: with tag/variant-based init DAG, a Framework type may contain modules that are
                     // intentionally absent (OnceLock unset) for a given runtime role.
+                    // First stop module-local admission, quiesce work, and release dependents while shared
+                    // framework services such as P2P are still available.
+                    if let Some(m) = self.0.[<$first_type:snake>].get() {
+                        m.prepare_shutdown()
+                            .await
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    }
+                    $(
+                        if let Some(m) = self.0.[<$rest_type:snake>].get() {
+                            m.prepare_shutdown()
+                                .await
+                                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                        }
+                    )*
+
+                    // Then wake or cancel shared background work. Module before_shutdown hooks run after
+                    // this transition; final module shutdown releases the remaining dependencies.
+	                    self.0.shutdown_notifier.shutdown();
+                    self.0.shutdown_poller.shutdown();
+
                     if let Some(m) = self.0.[<$first_type:snake>].get() {
                         m.before_shutdown()
                             .await
@@ -687,8 +710,9 @@ macro_rules! define_framework {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxon_framework_compiled::shutdown::{ShutdownPoller, ViewShutdownExt};
     use limit_thirdparty::tokio;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
     use thiserror::Error;
 
     // 定义测试模块的错误类型
@@ -731,7 +755,9 @@ mod tests {
     pub struct TestModuleA {
         _phantom: std::marker::PhantomData<()>,
         pub initialized: Mutex<bool>,
+        pub prepared_while_running: Mutex<Option<bool>>,
         pub shutdown: Mutex<bool>,
+        shutdown_poller: OnceLock<ShutdownPoller>,
     }
 
     #[async_trait]
@@ -742,6 +768,22 @@ mod tests {
 
         fn name(&self) -> &str {
             "TestModuleA"
+        }
+
+        fn attach_view(&self, view: Self::View) {
+            self.shutdown_poller
+                .set(view.register_shutdown_poller())
+                .unwrap_or_else(|_| panic!("TestModuleA view attached twice"));
+        }
+
+        async fn prepare_shutdown(&self) -> Result<(), Self::Error> {
+            let running = self
+                .shutdown_poller
+                .get()
+                .expect("TestModuleA view not attached")
+                .is_running();
+            *self.prepared_while_running.lock().unwrap() = Some(running);
+            Ok(())
         }
 
         async fn shutdown(&self) -> Result<(), Self::Error> {
@@ -786,7 +828,9 @@ mod tests {
         fw.init_set_test_module_a(std::sync::Arc::new(TestModuleA {
             _phantom: std::marker::PhantomData,
             initialized: Mutex::new(true),
+            prepared_while_running: Mutex::new(None),
             shutdown: Mutex::new(false),
+            shutdown_poller: OnceLock::new(),
         }));
         fw.init_set_test_module_b(std::sync::Arc::new(TestModuleB {
             _phantom: std::marker::PhantomData,
@@ -818,5 +862,9 @@ mod tests {
         let view = fw.a_view();
         assert!(*view.test_module_a().shutdown.lock().unwrap());
         assert!(*view.test_module_b().shutdown.lock().unwrap());
+        assert_eq!(
+            *view.test_module_a().prepared_while_running.lock().unwrap(),
+            Some(true)
+        );
     }
 }

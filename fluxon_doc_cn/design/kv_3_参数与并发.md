@@ -108,13 +108,14 @@ client 侧 `get` 的热路径是：
 
 ### master 路由访问：短读锁 + 复制快照
 
-当前 `kv_routes` 是 `DashMap<String, Arc<OneKvNodesRoutes>>`，而 `nodes_replicas` 是 `RwLock<HashMap<...>>`。
+当前 `kv_routes` 是 `DashMap<String, Arc<OneKvNodesRoutes>>`，而 `node_replicas` 是 `RwLock<HashMap<NodeID, KvNodeReplicas>>`。每个 node entry 用独立的 `memory` / `ssd` 选项表示两层副本。
 
 典型做法是：
 
 - 先从 `kv_routes` 取出 `Arc<OneKvNodesRoutes>`。
-- 用很短的读锁把 `nodes_replicas` clone 成局部 `HashMap` 快照。
-- 后续选源副本、处理 tomb、决定分配模式时都基于快照继续。
+- 用很短的读锁把 `node_replicas` clone 成局部 `HashMap` 快照。
+- 后续先选择 `memory` 副本；没有可用内存副本时，再从同一快照选择 `ssd` 副本。
+- tomb 清理删除整个 node entry；内存和 SSD 驱逐只更新各自的 `Option`，两个字段都为空时才删除 entry。
 
 这样做的目的不是绝对无锁，而是：
 

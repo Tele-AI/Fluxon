@@ -807,6 +807,36 @@ class FluxonFsPatcher:
     ) -> None:
         self._agent.mount_remote_dir(local_mount_dir_abs, export_name)
 
+    def open_video_reader(
+        self,
+        *,
+        export_name: str,
+        relpath: str,
+        height: int,
+        width: int,
+        num_threads: int = 8,
+    ) -> Any:
+        from .video import FluxonFsVideoReader
+
+        return FluxonFsVideoReader._open(
+            agent=self._agent,
+            export_name=export_name,
+            relpath=relpath,
+            height=height,
+            width=width,
+            num_threads=num_threads,
+            request_identity=self._request_identity,
+        )
+
+    def open_video_reader_pool(self, *, max_readers: int = 32) -> Any:
+        from .video import FluxonFsVideoReaderPool
+
+        return FluxonFsVideoReaderPool(
+            agent=self._agent,
+            request_identity=self._request_identity,
+            max_readers=max_readers,
+        )
+
     def publish_export(
         self,
         *,

@@ -1,12 +1,12 @@
 use etcd_client as etcd;
-use fluxon_util::auto_clean_map::{AutoCleanMap, AutoCleanMapEntry};
+use fluxon_util::etcd::{PooledEtcdClient, etcd_clients_pool};
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 use pyo3::{PyErr, PyObject};
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tracing::debug;
@@ -48,56 +48,6 @@ fn normalize_raw_endpoints(endpoints: Vec<String>, component: &str) -> PyResult<
     Ok(normalized)
 }
 
-struct EtcdKvBackend {
-    endpoints: Vec<String>,
-    client: tokio::sync::RwLock<Option<etcd::Client>>,
-}
-
-impl EtcdKvBackend {
-    fn new(endpoints: Vec<String>) -> Self {
-        Self {
-            endpoints,
-            client: tokio::sync::RwLock::new(None),
-        }
-    }
-
-    async fn client(&self) -> anyhow::Result<etcd::Client> {
-        {
-            let guard = self.client.read().await;
-            if let Some(client) = guard.as_ref() {
-                return Ok(client.clone());
-            }
-        }
-
-        let mut guard = self.client.write().await;
-        if let Some(client) = guard.as_ref() {
-            return Ok(client.clone());
-        }
-
-        let client = etcd::Client::connect(self.endpoints.clone(), None)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to connect etcd endpoints={:?}: {:?}",
-                    self.endpoints,
-                    e
-                )
-            })?;
-        *guard = Some(client.clone());
-        Ok(client)
-    }
-
-    async fn clear_client(&self) {
-        let mut guard = self.client.write().await;
-        *guard = None;
-    }
-}
-
-fn etcd_kv_backend_map() -> &'static AutoCleanMap<Vec<String>, EtcdKvBackend> {
-    static MAP: OnceLock<AutoCleanMap<Vec<String>, EtcdKvBackend>> = OnceLock::new();
-    MAP.get_or_init(|| AutoCleanMap::new())
-}
-
 fn is_reconnectable_etcd_error(err: &etcd::Error) -> bool {
     is_reconnectable_etcd_error_text(&format!("{:?}", err))
 }
@@ -114,7 +64,7 @@ fn is_reconnectable_etcd_error_text(msg: &str) -> bool {
 }
 
 async fn run_etcd_op<T, F, Fut>(
-    backend: AutoCleanMapEntry<Vec<String>, EtcdKvBackend>,
+    pool_entry: PooledEtcdClient,
     context: String,
     mut op: F,
 ) -> anyhow::Result<T>
@@ -124,14 +74,14 @@ where
 {
     let mut last_err = None;
     for attempt in 1..=2 {
-        let client = backend.client().await?;
-        match op(client).await {
+        let snapshot = pool_entry.snapshot().await?;
+        match op(snapshot.client()).await {
             Ok(value) => return Ok(value),
             Err(err) => {
                 let should_retry = attempt == 1 && is_reconnectable_etcd_error(&err);
                 last_err = Some(err);
                 if should_retry {
-                    backend.clear_client().await;
+                    snapshot.invalidate().await;
                     continue;
                 }
                 let err = last_err.take().expect("etcd error must be recorded");
@@ -148,7 +98,7 @@ where
 pub struct PyEtcdKvClient {
     rt: Arc<Runtime>,
     endpoints: Vec<String>,
-    backend: AutoCleanMapEntry<Vec<String>, EtcdKvBackend>,
+    pool_entry: PooledEtcdClient,
 }
 
 #[pymethods]
@@ -156,12 +106,11 @@ impl PyEtcdKvClient {
     #[new]
     fn new(endpoints: Vec<String>) -> PyResult<Self> {
         let endpoints = normalize_raw_endpoints(endpoints, "EtcdKvClient")?;
-        let backend = etcd_kv_backend_map()
-            .get_or_init(endpoints.clone(), || EtcdKvBackend::new(endpoints.clone()));
+        let pool_entry = etcd_clients_pool().acquire(endpoints.clone());
         Ok(Self {
             rt: crate::mpsc::get_global_runtime(),
             endpoints,
-            backend,
+            pool_entry,
         })
     }
 
@@ -172,13 +121,13 @@ impl PyEtcdKvClient {
             ));
         }
 
-        let backend = self.backend.clone();
+        let pool_entry = self.pool_entry.clone();
         let key_for_op = key.clone();
         let value = py
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
                     let resp = run_etcd_op(
-                        backend,
+                        pool_entry,
                         format!("etcd get failed for key={}", key),
                         move |mut client| {
                             let key = key_for_op.clone();
@@ -205,13 +154,13 @@ impl PyEtcdKvClient {
             ));
         }
 
-        let backend = self.backend.clone();
+        let pool_entry = self.pool_entry.clone();
         let prefix_for_op = prefix.clone();
         let rows = py
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
                     let resp = run_etcd_op(
-                        backend,
+                        pool_entry,
                         format!("etcd get_prefix failed for prefix={}", prefix),
                         move |mut client| {
                             let prefix = prefix_for_op.clone();
@@ -271,13 +220,13 @@ impl PyEtcdKvClient {
             }
         }
 
-        let backend = self.backend.clone();
+        let pool_entry = self.pool_entry.clone();
         let key_for_op = key.clone();
         let value = value.as_ref().to_vec();
         py.allow_threads(|| {
             self.rt.run_async_from_sync(async move {
                 run_etcd_op(
-                    backend,
+                    pool_entry,
                     format!("etcd put failed for key={}", key),
                     move |mut client| {
                         let key = key_for_op.clone();
@@ -304,12 +253,12 @@ impl PyEtcdKvClient {
             ));
         }
 
-        let backend = self.backend.clone();
+        let pool_entry = self.pool_entry.clone();
         let key_for_op = key.clone();
         py.allow_threads(|| {
             self.rt.run_async_from_sync(async move {
                 run_etcd_op(
-                    backend,
+                    pool_entry,
                     format!("etcd delete failed for key={}", key),
                     move |mut client| {
                         let key = key_for_op.clone();
@@ -336,12 +285,12 @@ impl PyEtcdKvClient {
             ));
         }
 
-        let backend = self.backend.clone();
+        let pool_entry = self.pool_entry.clone();
         let prefix_for_op = prefix.clone();
         py.allow_threads(|| {
             self.rt.run_async_from_sync(async move {
                 run_etcd_op(
-                    backend,
+                    pool_entry,
                     format!("etcd delete_prefix failed for prefix={}", prefix),
                     move |mut client| {
                         let prefix = prefix_for_op.clone();
@@ -369,11 +318,11 @@ impl PyEtcdKvClient {
             )));
         }
 
-        let backend = self.backend.clone();
+        let pool_entry = self.pool_entry.clone();
         py.allow_threads(|| {
             self.rt.run_async_from_sync(async move {
                 run_etcd_op(
-                    backend,
+                    pool_entry,
                     format!("etcd lease_ttl failed for lease_id={}", lease_id),
                     move |mut client| async move {
                         client
@@ -398,11 +347,11 @@ impl PyEtcdKvClient {
             )));
         }
 
-        let backend = self.backend.clone();
+        let pool_entry = self.pool_entry.clone();
         py.allow_threads(|| {
             self.rt.run_async_from_sync(async move {
                 run_etcd_op(
-                    backend,
+                    pool_entry,
                     format!("etcd revoke_lease failed for lease_id={}", lease_id),
                     move |mut client| async move { client.lease_revoke(lease_id).await.map(|_| ()) },
                 )
@@ -422,7 +371,7 @@ impl PyEtcdKvClient {
 #[pyclass(name = "EtcdLock")]
 pub struct PyEtcdLock {
     rt: Arc<Runtime>,
-    endpoints: Vec<String>,
+    pool_entry: PooledEtcdClient,
     name: String,
     ttl_seconds: i64,
     timeout_seconds: f64,
@@ -455,9 +404,10 @@ impl PyEtcdLock {
             )));
         }
 
+        let pool_entry = etcd_clients_pool().acquire(endpoints.clone());
         Ok(Self {
             rt: crate::mpsc::get_global_runtime(),
-            endpoints,
+            pool_entry,
             name,
             ttl_seconds,
             timeout_seconds,
@@ -490,7 +440,7 @@ impl PyEtcdLock {
             )));
         }
 
-        let endpoints = self.endpoints.clone();
+        let pool_entry = self.pool_entry.clone();
         let name = self.name.clone();
         let ttl_seconds = self.ttl_seconds;
         let timeout_duration = Duration::from_secs_f64(timeout_seconds);
@@ -507,7 +457,7 @@ impl PyEtcdLock {
         let outer = py
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
-                    let mut client = etcd::Client::connect(endpoints, None).await.map_err(|e| {
+                    let mut client = pool_entry.client().await.map_err(|e| {
                         anyhow::anyhow!("failed to connect etcd for lock {}: {:?}", name, e)
                     })?;
 
@@ -581,7 +531,7 @@ impl PyEtcdLock {
             return Ok(false);
         };
 
-        let endpoints = self.endpoints.clone();
+        let pool_entry = self.pool_entry.clone();
         let name = self.name.clone();
         let t0 = Instant::now();
 
@@ -595,7 +545,7 @@ impl PyEtcdLock {
         let outer = py
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
-                    let mut client = etcd::Client::connect(endpoints, None).await.map_err(|e| {
+                    let mut client = pool_entry.client().await.map_err(|e| {
                         anyhow::anyhow!("failed to connect etcd for unlock {}: {:?}", name, e)
                     })?;
 
@@ -690,14 +640,6 @@ impl PyEtcdLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static TEST_KEY_SEQ: AtomicUsize = AtomicUsize::new(1);
-
-    fn unique_test_endpoints() -> Vec<String> {
-        let seq = TEST_KEY_SEQ.fetch_add(1, Ordering::Relaxed);
-        vec![format!("http://unit-test-etcd-backend-{}", seq)]
-    }
 
     #[test]
     fn normalize_raw_endpoint_accepts_raw_host_port() {
@@ -746,42 +688,23 @@ mod tests {
             Some(1.0),
         )
         .unwrap();
-        assert_eq!(lock.endpoints, vec!["http://127.0.0.1:2379"]);
+        assert_eq!(
+            lock.pool_entry.endpoints(),
+            ["http://127.0.0.1:2379".to_string()]
+        );
     }
 
     #[test]
     fn etcd_lock_constructor_rejects_schemed_endpoints() {
-        assert!(PyEtcdLock::new(
-            vec!["http://127.0.0.1:2379".to_string()],
-            "/unit-test/lock".to_string(),
-            10,
-            Some(1.0),
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn etcd_kv_backend_map_reuses_and_auto_cleans_live_entries() {
-        let endpoints = unique_test_endpoints();
-        let map = etcd_kv_backend_map();
-        assert!(map.with_existing(&endpoints, |_| ()).is_none());
-
-        {
-            let entry_a =
-                map.get_or_init(endpoints.clone(), || EtcdKvBackend::new(endpoints.clone()));
-            assert!(map.with_existing(&endpoints, |_| ()).is_some());
-
-            {
-                let entry_b = map.get_or_init(endpoints.clone(), || {
-                    panic!("live backend entry should be reused")
-                });
-                assert!(std::ptr::eq(&*entry_a, &*entry_b));
-            }
-
-            assert!(map.with_existing(&endpoints, |_| ()).is_some());
-        }
-
-        assert!(map.with_existing(&endpoints, |_| ()).is_none());
+        assert!(
+            PyEtcdLock::new(
+                vec!["http://127.0.0.1:2379".to_string()],
+                "/unit-test/lock".to_string(),
+                10,
+                Some(1.0),
+            )
+            .is_err()
+        );
     }
 
     #[test]

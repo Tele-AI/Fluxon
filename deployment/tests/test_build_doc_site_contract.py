@@ -99,6 +99,16 @@ class TestBuildDocSiteContract(unittest.TestCase):
             "../fluxon_rs/rust-toolchain.toml",
         )
 
+    def test_rewrite_variant_repo_image_for_quartz_route(self) -> None:
+        for language in ("en", "cn"):
+            with self.subTest(language=language):
+                self.assertEqual(
+                    _DOC_SITE.rewrite_variant_target_path(
+                        "../../pics/kv_ssd_cpu_sweep.png", language=language
+                    ),
+                    "../pics/kv_ssd_cpu_sweep.png",
+                )
+
     def test_stage_cn_only_design_into_en_root_when_english_design_missing(self) -> None:
         tmpdir = Path(tempfile.mkdtemp(prefix="fluxon_doc_site_contract_"))
         old_stage_root = _DOC_SITE.STAGE_DOCS_ROOT

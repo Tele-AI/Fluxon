@@ -866,6 +866,16 @@ pub enum ObserveOp {
         device: String,
         bytes: u64,
     },
+    SetKvSsdCapacityBytes {
+        node: String,
+        device: String,
+        bytes: u64,
+    },
+    SetKvSsdUsedBytes {
+        node: String,
+        device: String,
+        bytes: u64,
+    },
     SetFsMountFsBytes {
         mount_kind: FsMountKind,
         target_dir_abs: String,
@@ -1170,6 +1180,8 @@ pub struct KvMetricsActorOwned {
     node_uptime_counter: CounterVec,
     segment_capacity_gauge: GaugeVec,
     segment_used_gauge: GaugeVec,
+    kv_ssd_capacity_gauge: GaugeVec,
+    kv_ssd_used_gauge: GaugeVec,
     node_network_transmit_bytes_counter: CounterVec,
     node_network_receive_bytes_counter: CounterVec,
     rdma_probe_port_count_gauge: GaugeVec,
@@ -1624,6 +1636,24 @@ impl KvMetricsActorOwned {
         )
         .expect("segment used gauge");
 
+        let kv_ssd_capacity_gauge = GaugeVec::new(
+            Opts::new(
+                crate::keys::PROM_METRIC_KV_SSD_CAPACITY_BYTES,
+                "Total capacity in bytes for each owner-local KV SSD device",
+            ),
+            &["node", "device"],
+        )
+        .expect("kv ssd capacity gauge");
+
+        let kv_ssd_used_gauge = GaugeVec::new(
+            Opts::new(
+                crate::keys::PROM_METRIC_KV_SSD_USED_BYTES,
+                "Used bytes for each owner-local KV SSD device",
+            ),
+            &["node", "device"],
+        )
+        .expect("kv ssd used gauge");
+
         let node_network_transmit_bytes_counter = CounterVec::new(
             Opts::new(
                 "node_network_transmit_bytes_total",
@@ -1837,6 +1867,8 @@ impl KvMetricsActorOwned {
         register_collector(&registry, Box::new(node_uptime_counter.clone()));
         register_collector(&registry, Box::new(segment_capacity_gauge.clone()));
         register_collector(&registry, Box::new(segment_used_gauge.clone()));
+        register_collector(&registry, Box::new(kv_ssd_capacity_gauge.clone()));
+        register_collector(&registry, Box::new(kv_ssd_used_gauge.clone()));
         register_collector(
             &registry,
             Box::new(node_network_transmit_bytes_counter.clone()),
@@ -1911,6 +1943,8 @@ impl KvMetricsActorOwned {
             node_uptime_counter,
             segment_capacity_gauge,
             segment_used_gauge,
+            kv_ssd_capacity_gauge,
+            kv_ssd_used_gauge,
             node_network_transmit_bytes_counter,
             node_network_receive_bytes_counter,
             rdma_probe_port_count_gauge,
@@ -2171,6 +2205,24 @@ impl KvMetricsActorOwned {
                 bytes,
             } => {
                 self.segment_used_gauge
+                    .with_label_values(&[&node, &device])
+                    .set(bytes as f64);
+            }
+            ObserveOp::SetKvSsdCapacityBytes {
+                node,
+                device,
+                bytes,
+            } => {
+                self.kv_ssd_capacity_gauge
+                    .with_label_values(&[&node, &device])
+                    .set(bytes as f64);
+            }
+            ObserveOp::SetKvSsdUsedBytes {
+                node,
+                device,
+                bytes,
+            } => {
+                self.kv_ssd_used_gauge
                     .with_label_values(&[&node, &device])
                     .set(bytes as f64);
             }

@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import bisect
 import copy
+import ctypes
+import ctypes.util
 import hashlib
+import importlib.util
 import json
 import os
 import socket
+import struct
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum, unique
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
 
 from benchmark_role_names import (
@@ -26,6 +32,10 @@ from benchmark_role_names import (
 from fluxon_py import FluxonKvClientConfig as KVCacheConfig
 from fluxon_py import new_store
 from fluxon_py.kvclient.kvclient_interface import KvClient, PutOptionalArgs
+from fluxon_py.kvclient.nonzerocopy_encode import (
+    DLPackBytesView,
+    _dlpack_cpu_tensor_info,
+)
 
 TEST_MODE_MPMC = "MPMC"
 TEST_MODE_KVSTORE = "KVSTORE"
@@ -42,6 +52,7 @@ KV_OPERATION_PUT = "PUT"
 KV_OPERATION_GET = "GET"
 
 BACKEND_KIND_FLUXON = "FLUXON"
+BACKEND_KIND_MOONCAKE = "MOONCAKE"
 BACKEND_KIND_REDIS = "REDIS"
 BACKEND_KIND_ALLUXIO = "ALLUXIO"
 REDIS_BENCH_INFLIGHT_GUARD_PREFIX = "__fluxon_bench_inflight_guard__"
@@ -56,11 +67,23 @@ BENCHMARK_KEY_REQUEST_DISTRIBUTION = "request_distribution"
 BENCHMARK_KEY_KEYSPACE_SIZE = "keyspace_size"
 BENCHMARK_KEY_AFFINITY_LOCALITY_RATIO = "affinity_locality_ratio"
 BENCHMARK_KEY_AFFINITY_SLOT_COUNT = "affinity_slot_count"
+BENCHMARK_KEY_KV_BOOTSTRAP_CONCURRENCY = "kv_bootstrap_concurrency"
+BENCHMARK_KEY_KV_BOOTSTRAP_PUT_GAP_MS = "kv_bootstrap_put_gap_ms"
+BENCHMARK_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY = "kv_bootstrap_storage_full_policy"
+BENCHMARK_KEY_KV_GET_OUTPUT = "kv_get_output"
+BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX = "kv_cuda_device_index"
+KV_BOOTSTRAP_STORAGE_FULL_POLICY_FAIL = "fail"
+KV_BOOTSTRAP_STORAGE_FULL_POLICY_STOP = "stop"
+KV_BOOTSTRAP_STORAGE_FULL_POLICIES = {
+    KV_BOOTSTRAP_STORAGE_FULL_POLICY_FAIL,
+    KV_BOOTSTRAP_STORAGE_FULL_POLICY_STOP,
+}
 
 DEFAULT_KV_KEYSPACE_SIZE = 101
 DEFAULT_ZIPFIAN_THETA = 0.99
 STABLE_HASH_MODULUS = float(1 << 64)
 KV_SEED_BOOTSTRAP_MAX_CONCURRENCY = 16
+CUDA_H2D_PIPELINE_DEPTH = 2
 KV_VERBOSE_PER_OP_LOG = str(os.environ.get("FLUXON_BENCH_KV_VERBOSE", "")).strip().lower() not in ("", "0", "false", "no")
 FLUXON_PHASE_LOG_INTERVAL_OPS = 128
 FLUXON_PHASE_SLOW_OP_THRESHOLD_US = 50_000.0
@@ -254,6 +277,8 @@ FLUXON_PHASE_PATH_METRIC_NAMES = (
     FLUXON_PHASE_PATH_METRIC_OWNER_HANDLE_TO_RESP_SEND_US,
 )
 _BENCHMARK_CLIENT_STRIP_TEST_SPEC_KEYS = (
+    "kv_ssd_storage_backend",
+    "kv_ssd_uring_mode",
     "side_transfer_worker_count",
     "side_transfer_worker_p2p_port_base",
     "side_transfer_role",
@@ -268,6 +293,11 @@ KV_BENCHMARK_EXTRA_KEYS = (
     BENCHMARK_KEY_AFFINITY_LOCALITY_RATIO,
     BENCHMARK_KEY_AFFINITY_SLOT_COUNT,
     "kv_bootstrap_before_ready",
+    BENCHMARK_KEY_KV_BOOTSTRAP_CONCURRENCY,
+    BENCHMARK_KEY_KV_BOOTSTRAP_PUT_GAP_MS,
+    BENCHMARK_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY,
+    BENCHMARK_KEY_KV_GET_OUTPUT,
+    BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX,
 )
 
 
@@ -276,6 +306,50 @@ class KVGetResultKind(Enum):
     CACHE_HIT = "cache_hit"
     CACHE_MISS = "cache_miss"
     ERROR = "error"
+
+
+@unique
+class KVGetSourceKind(Enum):
+    MEMORY = "memory"
+    SSD = "ssd"
+
+
+@unique
+class KVGetOutput(Enum):
+    HOLDER = "holder"
+    BYTES = "bytes"
+    CUDA = "cuda"
+
+
+def normalize_kv_get_output(raw: Any) -> KVGetOutput:
+    value = KVGetOutput.HOLDER.value if raw is None else str(raw).strip().lower()
+    try:
+        return KVGetOutput(value)
+    except ValueError as exc:
+        supported = ", ".join(output.value for output in KVGetOutput)
+        raise ValueError(
+            f"{BENCHMARK_KEY_KV_GET_OUTPUT} must be one of: {supported}; got {raw!r}"
+        ) from exc
+
+
+def normalize_kv_get_source_kind(raw: Any) -> KVGetSourceKind:
+    value = str(raw).strip().lower()
+    try:
+        return KVGetSourceKind(value)
+    except ValueError as exc:
+        supported = ", ".join(source.value for source in KVGetSourceKind)
+        raise ValueError(
+            f"GET source must be one of: {supported}; got {raw!r}"
+        ) from exc
+
+
+def normalize_kv_cuda_device_index(raw: Any) -> int:
+    value = 0 if raw is None else raw
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"{BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX} must be a non-negative integer; got {raw!r}"
+        )
+    return int(value)
 
 
 def classify_kv_get_result(error_msg: Optional[str]) -> KVGetResultKind:
@@ -304,6 +378,10 @@ def _is_key_being_written_error(error: Any) -> bool:
     return type(error).__name__ == "KeyBeingWrittenError"
 
 
+def _is_key_already_exists_error(error: Any) -> bool:
+    return type(error).__name__ == "KeyAlreadyExistsError"
+
+
 def _is_mooncake_replica_not_ready_error(error: Any) -> bool:
     details = getattr(error, "details", None)
     if not isinstance(details, dict):
@@ -312,7 +390,11 @@ def _is_mooncake_replica_not_ready_error(error: Any) -> bool:
 
 
 def _is_put_compat_success_error(error: Any) -> bool:
-    return _is_key_being_written_error(error) or _is_mooncake_replica_not_ready_error(error)
+    return (
+        _is_key_being_written_error(error)
+        or _is_key_already_exists_error(error)
+        or _is_mooncake_replica_not_ready_error(error)
+    )
 
 
 def normalize_kv_get_error(error_msg: Optional[str]) -> Optional[str]:
@@ -1513,10 +1595,12 @@ class _NoopBenchmarkStore:
         *,
         deadline_ts: float,
         ctx: str,
+        expected_payload_size: int,
     ) -> Optional[str]:
         _ = key
         _ = deadline_ts
         _ = ctx
+        _ = expected_payload_size
         return f"GET failed: backend {self.backend_kind} does not expose KV operations"
 
     def close(self) -> _SimpleResult:
@@ -1799,6 +1883,7 @@ class RedisShardClient:
         *,
         deadline_ts: float,
         ctx: str,
+        expected_payload_size: int,
     ) -> Optional[str]:
         _ = deadline_ts
         _ = ctx
@@ -1806,6 +1891,11 @@ class RedisShardClient:
             payload = self.get(key)
             if payload is None:
                 return KV_GET_MISS_ERROR
+            if len(payload) != int(expected_payload_size):
+                return (
+                    "GET failed: payload length mismatch: "
+                    f"expected={expected_payload_size} actual={len(payload)}"
+                )
             return None
         except Exception as exc:
             return normalize_kv_get_error(f"GET failed: {exc}")
@@ -1861,11 +1951,857 @@ def _sanitize_benchmark_client_kvcache_config(kvcache_config: dict[str, Any]) ->
     return sanitized
 
 
-class FluxonBlockingStore:
-    def __init__(self, store: KvClient) -> None:
-        self.backend_kind = BACKEND_KIND_FLUXON
+_FLAT_KV_TYPE_BYTES = 5
+_DLPACK_DTYPE_UINT = 1
+_CUDA_MEMCPY_HOST_TO_DEVICE = 1
+_CUDA_STREAM_NON_BLOCKING = 1
+_CUDA_ERROR_NOT_READY = 600
+
+
+def _flat_dict_payload_range(
+    data: memoryview,
+    expected_payload_size: int,
+) -> tuple[memoryview, int, int]:
+    view = data if data.format == "B" and data.ndim == 1 else data.cast("B")
+    total_len = len(view)
+    if total_len < 4:
+        raise ValueError("flat dict payload is missing its entry-count header")
+
+    (entry_count,) = struct.unpack_from("<I", view, 0)
+    pos = 4
+    for _ in range(entry_count):
+        if pos + 4 > total_len:
+            raise ValueError("flat dict payload has a truncated key length")
+        (key_len,) = struct.unpack_from("<I", view, pos)
+        pos += 4
+        if pos + key_len > total_len:
+            raise ValueError("flat dict payload has truncated key bytes")
+        key = bytes(view[pos : pos + key_len]).decode("utf-8")
+        pos += key_len
+        if pos + 5 > total_len:
+            raise ValueError("flat dict payload has a truncated value header")
+        type_id = int(view[pos])
+        pos += 1
+        (value_len,) = struct.unpack_from("<I", view, pos)
+        pos += 4
+        if pos + value_len > total_len:
+            raise ValueError("flat dict payload has truncated value bytes")
+        if key == "payload":
+            if type_id != _FLAT_KV_TYPE_BYTES:
+                raise TypeError(f"payload field must be bytes-compatible, got type id {type_id}")
+            if value_len != int(expected_payload_size):
+                raise ValueError(
+                    "payload length mismatch: "
+                    f"expected={expected_payload_size} actual={value_len}"
+                )
+            return view, pos, value_len
+        pos += value_len
+    raise KeyError("flat dict payload field is missing")
+
+
+def _flat_dict_payload_view(data: memoryview, expected_payload_size: int) -> memoryview:
+    view, offset, size = _flat_dict_payload_range(data, expected_payload_size)
+    return view[offset : offset + size]
+
+
+def _mooncake_payload_view(buffer_handle: Any, expected_payload_size: int) -> memoryview:
+    return _flat_dict_payload_view(memoryview(buffer_handle), expected_payload_size)
+
+
+def _cudart_library_candidates() -> list[str]:
+    candidates: list[str] = []
+    discovered = ctypes.util.find_library("cudart")
+    if discovered:
+        candidates.append(discovered)
+    candidates.append("libcudart.so.12")
+
+    try:
+        spec = importlib.util.find_spec("nvidia.cuda_runtime")
+    except (ImportError, ModuleNotFoundError):
+        spec = None
+    if spec is not None and spec.submodule_search_locations:
+        for package_dir in spec.submodule_search_locations:
+            candidates.append(str(Path(package_dir) / "lib" / "libcudart.so.12"))
+
+    candidates.extend(
+        [
+            "/usr/local/cuda/lib64/libcudart.so.12",
+            "/usr/local/cuda-12/lib64/libcudart.so.12",
+        ]
+    )
+    return list(dict.fromkeys(candidates))
+
+
+class _CudaRuntime:
+    def __init__(self) -> None:
+        self._lib = self._load_library()
+        self._configure_functions()
+
+    @staticmethod
+    def _load_library() -> Any:
+        failures: list[str] = []
+        for candidate in _cudart_library_candidates():
+            try:
+                return ctypes.CDLL(candidate)
+            except OSError as exc:
+                failures.append(f"{candidate}: {exc}")
+        raise RuntimeError("unable to load CUDA runtime: " + "; ".join(failures))
+
+    def _configure_functions(self) -> None:
+        self._lib.cudaSetDevice.argtypes = [ctypes.c_int]
+        self._lib.cudaSetDevice.restype = ctypes.c_int
+        self._lib.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+        self._lib.cudaMalloc.restype = ctypes.c_int
+        self._lib.cudaFree.argtypes = [ctypes.c_void_p]
+        self._lib.cudaFree.restype = ctypes.c_int
+        self._lib.cudaHostAlloc.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
+        self._lib.cudaHostAlloc.restype = ctypes.c_int
+        self._lib.cudaFreeHost.argtypes = [ctypes.c_void_p]
+        self._lib.cudaFreeHost.restype = ctypes.c_int
+        self._lib.cudaStreamCreateWithFlags.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint,
+        ]
+        self._lib.cudaStreamCreateWithFlags.restype = ctypes.c_int
+        self._lib.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+        self._lib.cudaStreamSynchronize.restype = ctypes.c_int
+        self._lib.cudaStreamDestroy.argtypes = [ctypes.c_void_p]
+        self._lib.cudaStreamDestroy.restype = ctypes.c_int
+        self._lib.cudaEventCreateWithFlags.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint,
+        ]
+        self._lib.cudaEventCreateWithFlags.restype = ctypes.c_int
+        self._lib.cudaEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self._lib.cudaEventRecord.restype = ctypes.c_int
+        self._lib.cudaEventQuery.argtypes = [ctypes.c_void_p]
+        self._lib.cudaEventQuery.restype = ctypes.c_int
+        self._lib.cudaEventSynchronize.argtypes = [ctypes.c_void_p]
+        self._lib.cudaEventSynchronize.restype = ctypes.c_int
+        self._lib.cudaEventElapsedTime.argtypes = [
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self._lib.cudaEventElapsedTime.restype = ctypes.c_int
+        self._lib.cudaEventDestroy.argtypes = [ctypes.c_void_p]
+        self._lib.cudaEventDestroy.restype = ctypes.c_int
+        self._lib.cudaMemcpyAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        self._lib.cudaMemcpyAsync.restype = ctypes.c_int
+        self._lib.cudaGetErrorString.argtypes = [ctypes.c_int]
+        self._lib.cudaGetErrorString.restype = ctypes.c_char_p
+
+    def _check(self, code: int, operation: str) -> None:
+        if int(code) == 0:
+            return
+        raw_message = self._lib.cudaGetErrorString(int(code))
+        message = raw_message.decode("utf-8", errors="replace") if raw_message else "unknown"
+        raise RuntimeError(f"{operation} failed: cuda_error={code} message={message}")
+
+    def set_device(self, device_index: int) -> None:
+        self._check(self._lib.cudaSetDevice(int(device_index)), "cudaSetDevice")
+
+    def malloc(self, size: int) -> int:
+        ptr = ctypes.c_void_p()
+        self._check(
+            self._lib.cudaMalloc(ctypes.byref(ptr), ctypes.c_size_t(size)),
+            "cudaMalloc",
+        )
+        if not ptr.value:
+            raise RuntimeError("cudaMalloc returned a null device pointer")
+        return int(ptr.value)
+
+    def free(self, ptr: int) -> None:
+        self._check(self._lib.cudaFree(ctypes.c_void_p(ptr)), "cudaFree")
+
+    def host_alloc(self, size: int) -> int:
+        ptr = ctypes.c_void_p()
+        self._check(
+            self._lib.cudaHostAlloc(
+                ctypes.byref(ptr),
+                ctypes.c_size_t(size),
+                ctypes.c_uint(0),
+            ),
+            "cudaHostAlloc",
+        )
+        if not ptr.value:
+            raise RuntimeError("cudaHostAlloc returned a null host pointer")
+        return int(ptr.value)
+
+    def host_free(self, ptr: int) -> None:
+        self._check(self._lib.cudaFreeHost(ctypes.c_void_p(ptr)), "cudaFreeHost")
+
+    def stream_create(self) -> int:
+        stream = ctypes.c_void_p()
+        self._check(
+            self._lib.cudaStreamCreateWithFlags(
+                ctypes.byref(stream),
+                ctypes.c_uint(_CUDA_STREAM_NON_BLOCKING),
+            ),
+            "cudaStreamCreateWithFlags",
+        )
+        if not stream.value:
+            raise RuntimeError("cudaStreamCreateWithFlags returned a null stream")
+        return int(stream.value)
+
+    def stream_synchronize(self, stream: int) -> None:
+        self._check(
+            self._lib.cudaStreamSynchronize(ctypes.c_void_p(stream)),
+            "cudaStreamSynchronize",
+        )
+
+    def stream_destroy(self, stream: int) -> None:
+        self._check(
+            self._lib.cudaStreamDestroy(ctypes.c_void_p(stream)),
+            "cudaStreamDestroy",
+        )
+
+    def event_create(self) -> int:
+        event = ctypes.c_void_p()
+        self._check(
+            self._lib.cudaEventCreateWithFlags(
+                ctypes.byref(event),
+                ctypes.c_uint(0),
+            ),
+            "cudaEventCreateWithFlags",
+        )
+        if not event.value:
+            raise RuntimeError("cudaEventCreateWithFlags returned a null event")
+        return int(event.value)
+
+    def event_record(self, event: int, stream: int) -> None:
+        self._check(
+            self._lib.cudaEventRecord(
+                ctypes.c_void_p(event),
+                ctypes.c_void_p(stream),
+            ),
+            "cudaEventRecord",
+        )
+
+    def event_query(self, event: int) -> bool:
+        code = int(self._lib.cudaEventQuery(ctypes.c_void_p(event)))
+        if code == 0:
+            return True
+        if code == _CUDA_ERROR_NOT_READY:
+            return False
+        self._check(code, "cudaEventQuery")
+        raise AssertionError("cudaEventQuery error handling must return or raise")
+
+    def event_synchronize(self, event: int) -> None:
+        self._check(
+            self._lib.cudaEventSynchronize(ctypes.c_void_p(event)),
+            "cudaEventSynchronize",
+        )
+
+    def event_elapsed_us(self, start_event: int, done_event: int) -> float:
+        elapsed_ms = ctypes.c_float()
+        self._check(
+            self._lib.cudaEventElapsedTime(
+                ctypes.byref(elapsed_ms),
+                ctypes.c_void_p(start_event),
+                ctypes.c_void_p(done_event),
+            ),
+            "cudaEventElapsedTime",
+        )
+        return max(0.0, float(elapsed_ms.value) * 1000.0)
+
+    def event_destroy(self, event: int) -> None:
+        self._check(
+            self._lib.cudaEventDestroy(ctypes.c_void_p(event)),
+            "cudaEventDestroy",
+        )
+
+    def memcpy_host_to_device_async(
+        self,
+        *,
+        device_ptr: int,
+        host_ptr: int,
+        size: int,
+        stream: int,
+    ) -> None:
+        self._check(
+            self._lib.cudaMemcpyAsync(
+                ctypes.c_void_p(device_ptr),
+                ctypes.c_void_p(host_ptr),
+                ctypes.c_size_t(size),
+                _CUDA_MEMCPY_HOST_TO_DEVICE,
+                ctypes.c_void_p(stream),
+            ),
+            "cudaMemcpyAsync(host_to_device)",
+        )
+
+
+@dataclass
+class _CudaPendingCopy:
+    token: Any
+    # Keep the native holder alive through the operation completion boundary.
+    keepalive: Any
+    enqueued_at: float
+    host_stage_us: float
+    submit_us: float
+
+
+@dataclass(frozen=True)
+class _CudaCopyCompletion:
+    token: Any
+    error_msg: Optional[str]
+    completed_at: float
+    completed_wall_ts: float
+    host_stage_us: float
+    submit_us: float
+    h2d_us: float
+    pipeline_residence_us: float
+    completion_wait_us: float
+
+
+@dataclass
+class _CudaPipelineSlot:
+    stream: int
+    start_event: int
+    done_event: int
+    host_ptr: int = 0
+    host_capacity: int = 0
+    device_ptr: int = 0
+    device_capacity: int = 0
+    pending: Optional[_CudaPendingCopy] = None
+
+
+@dataclass
+class _CudaThreadPipeline:
+    slots: list[_CudaPipelineSlot]
+    pending_slot_indexes: deque[int] = field(default_factory=deque)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+class _CudaHostToDevicePipeline:
+    def __init__(
+        self,
+        *,
+        device_index: int = 0,
+        depth: int = CUDA_H2D_PIPELINE_DEPTH,
+        runtime: Optional[Any] = None,
+    ) -> None:
+        if int(depth) <= 0:
+            raise ValueError(f"CUDA H2D pipeline depth must be > 0, got {depth}")
+        self._device_index = int(device_index)
+        self._depth = int(depth)
+        self._runtime = _CudaRuntime() if runtime is None else runtime
+        self._lock = threading.Lock()
+        self._states: dict[int, _CudaThreadPipeline] = {}
+        self._closed = False
+
+    def _new_thread_state(self) -> _CudaThreadPipeline:
+        slots: list[_CudaPipelineSlot] = []
+        try:
+            for _ in range(self._depth):
+                stream = self._runtime.stream_create()
+                start_event = 0
+                done_event = 0
+                try:
+                    start_event = self._runtime.event_create()
+                    done_event = self._runtime.event_create()
+                except Exception:
+                    if start_event:
+                        self._runtime.event_destroy(start_event)
+                    self._runtime.stream_destroy(stream)
+                    raise
+                slots.append(
+                    _CudaPipelineSlot(
+                        stream=stream,
+                        start_event=start_event,
+                        done_event=done_event,
+                    )
+                )
+        except Exception:
+            for slot in reversed(slots):
+                self._runtime.event_destroy(slot.done_event)
+                self._runtime.event_destroy(slot.start_event)
+                self._runtime.stream_destroy(slot.stream)
+            raise
+        return _CudaThreadPipeline(slots=slots)
+
+    def _state_for_current_thread(self) -> _CudaThreadPipeline:
+        thread_id = threading.get_ident()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("CUDA H2D pipeline is already closed")
+            state = self._states.get(thread_id)
+            if state is None:
+                self._runtime.set_device(self._device_index)
+                state = self._new_thread_state()
+                self._states[thread_id] = state
+            return state
+
+    def _ensure_slot_capacity(self, slot: _CudaPipelineSlot, size: int) -> None:
+        if slot.host_capacity >= size and slot.device_capacity >= size:
+            return
+        new_host_ptr = self._runtime.host_alloc(size)
+        try:
+            new_device_ptr = self._runtime.malloc(size)
+        except Exception:
+            self._runtime.host_free(new_host_ptr)
+            raise
+
+        old_host_ptr = slot.host_ptr
+        old_device_ptr = slot.device_ptr
+        slot.host_ptr = new_host_ptr
+        slot.host_capacity = int(size)
+        slot.device_ptr = new_device_ptr
+        slot.device_capacity = int(size)
+        if old_device_ptr:
+            self._runtime.free(old_device_ptr)
+        if old_host_ptr:
+            self._runtime.host_free(old_host_ptr)
+
+    def _complete_front(
+        self,
+        state: _CudaThreadPipeline,
+        *,
+        block: bool,
+    ) -> Optional[_CudaCopyCompletion]:
+        if not state.pending_slot_indexes:
+            return None
+        slot_index = state.pending_slot_indexes[0]
+        slot = state.slots[slot_index]
+        pending = slot.pending
+        if pending is None:
+            raise RuntimeError("CUDA pipeline pending queue points to an empty slot")
+
+        wait_started_at = time.perf_counter()
+        error_msg: Optional[str] = None
+        h2d_us = 0.0
+        try:
+            if block:
+                self._runtime.event_synchronize(slot.done_event)
+            elif not self._runtime.event_query(slot.done_event):
+                return None
+            h2d_us = self._runtime.event_elapsed_us(
+                slot.start_event,
+                slot.done_event,
+            )
+        except Exception as exc:
+            error_msg = str(exc)
+            try:
+                self._runtime.stream_synchronize(slot.stream)
+            except Exception as sync_exc:
+                error_msg = f"{error_msg}; stream cleanup failed: {sync_exc}"
+        wait_done_at = time.perf_counter()
+        completed_at = wait_done_at
+        completed_wall_ts = time.time()
+
+        state.pending_slot_indexes.popleft()
+        slot.pending = None
+        return _CudaCopyCompletion(
+            token=pending.token,
+            error_msg=error_msg,
+            completed_at=completed_at,
+            completed_wall_ts=completed_wall_ts,
+            host_stage_us=pending.host_stage_us,
+            submit_us=pending.submit_us,
+            h2d_us=h2d_us,
+            pipeline_residence_us=max(
+                0.0,
+                (completed_at - pending.enqueued_at) * 1_000_000.0,
+            ),
+            completion_wait_us=max(
+                0.0,
+                (wait_done_at - wait_started_at) * 1_000_000.0,
+            ),
+        )
+
+    def _poll_locked(self, state: _CudaThreadPipeline) -> list[_CudaCopyCompletion]:
+        completions: list[_CudaCopyCompletion] = []
+        while state.pending_slot_indexes:
+            completion = self._complete_front(state, block=False)
+            if completion is None:
+                break
+            completions.append(completion)
+        return completions
+
+    def submit_from_host(
+        self,
+        *,
+        source_ptr: int,
+        size: int,
+        keepalive: Any,
+        token: Any,
+    ) -> list[_CudaCopyCompletion]:
+        if source_ptr <= 0:
+            raise ValueError(f"CUDA copy source pointer must be positive, got {source_ptr}")
+        if size <= 0:
+            raise ValueError(f"CUDA copy size must be positive, got {size}")
+
+        state = self._state_for_current_thread()
+        with state.lock:
+            completions: list[_CudaCopyCompletion] = []
+            if len(state.pending_slot_indexes) >= self._depth:
+                completion = self._complete_front(state, block=True)
+                if completion is None:
+                    raise RuntimeError("full CUDA H2D pipeline has no pending completion")
+                completions.append(completion)
+
+            slot_index = next(
+                (
+                    index
+                    for index, slot in enumerate(state.slots)
+                    if slot.pending is None
+                ),
+                None,
+            )
+            if slot_index is None:
+                raise RuntimeError("CUDA H2D pipeline has no reusable slot")
+            slot = state.slots[slot_index]
+            enqueued_at = time.perf_counter()
+            try:
+                self._ensure_slot_capacity(slot, int(size))
+                # Stage pageable backend memory into this slot's pinned buffer.
+                stage_started_at = time.perf_counter()
+                ctypes.memmove(
+                    ctypes.c_void_p(slot.host_ptr),
+                    ctypes.c_void_p(source_ptr),
+                    ctypes.c_size_t(size),
+                )
+                stage_done_at = time.perf_counter()
+                self._runtime.event_record(slot.start_event, slot.stream)
+                submit_started_at = time.perf_counter()
+                self._runtime.memcpy_host_to_device_async(
+                    device_ptr=slot.device_ptr,
+                    host_ptr=slot.host_ptr,
+                    size=int(size),
+                    stream=slot.stream,
+                )
+                submit_done_at = time.perf_counter()
+                # Completion is collected by event polling or the final drain.
+                self._runtime.event_record(slot.done_event, slot.stream)
+            except Exception:
+                try:
+                    self._runtime.stream_synchronize(slot.stream)
+                except Exception:
+                    pass
+                raise
+            slot.pending = _CudaPendingCopy(
+                token=token,
+                keepalive=keepalive,
+                enqueued_at=enqueued_at,
+                host_stage_us=max(
+                    0.0,
+                    (stage_done_at - stage_started_at) * 1_000_000.0,
+                ),
+                submit_us=max(
+                    0.0,
+                    (submit_done_at - submit_started_at) * 1_000_000.0,
+                ),
+            )
+            state.pending_slot_indexes.append(slot_index)
+            return completions
+
+    def poll_current_thread(self) -> list[_CudaCopyCompletion]:
+        state = self._state_for_current_thread()
+        with state.lock:
+            return self._poll_locked(state)
+
+    def drain_current_thread(self) -> list[_CudaCopyCompletion]:
+        state = self._state_for_current_thread()
+        with state.lock:
+            completions: list[_CudaCopyCompletion] = []
+            while state.pending_slot_indexes:
+                completion = self._complete_front(state, block=True)
+                if completion is None:
+                    raise RuntimeError("CUDA pipeline drain lost a pending completion")
+                completions.append(completion)
+            return completions
+
+    def copy_from_host(self, source_ptr: int, size: int, *, keepalive: Any) -> None:
+        token = object()
+        completions = self.submit_from_host(
+            source_ptr=source_ptr,
+            size=size,
+            keepalive=keepalive,
+            token=token,
+        )
+        completions.extend(self.drain_current_thread())
+        matching = [completion for completion in completions if completion.token is token]
+        if len(matching) != 1:
+            raise RuntimeError(
+                "synchronous CUDA H2D copy did not produce exactly one completion"
+            )
+        if matching[0].error_msg is not None:
+            raise RuntimeError(matching[0].error_msg)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            states = list(self._states.values())
+            self._states.clear()
+
+        errors: list[str] = []
+        self._runtime.set_device(self._device_index)
+        for state in states:
+            with state.lock:
+                while state.pending_slot_indexes:
+                    try:
+                        self._complete_front(state, block=True)
+                    except Exception as exc:
+                        errors.append(str(exc))
+                        break
+                for slot in reversed(state.slots):
+                    for operation, value in (
+                        (self._runtime.free, slot.device_ptr),
+                        (self._runtime.host_free, slot.host_ptr),
+                        (self._runtime.event_destroy, slot.done_event),
+                        (self._runtime.event_destroy, slot.start_event),
+                        (self._runtime.stream_destroy, slot.stream),
+                    ):
+                        if not value:
+                            continue
+                        try:
+                            operation(value)
+                        except Exception as exc:
+                            errors.append(str(exc))
+        if errors:
+            raise RuntimeError("CUDA H2D pipeline close failed: " + "; ".join(errors))
+
+
+@dataclass(frozen=True)
+class _CudaHostPayload:
+    source_ptr: int
+    size: int
+    keepalive: Any
+
+
+@dataclass(frozen=True)
+class _PendingCudaGet:
+    token: Any
+    key: str
+    ctx: str
+    deadline_ts: float
+    expected_payload_size: int
+    started_at: float
+    host_ready_at: float
+    source_kind: Optional[KVGetSourceKind]
+
+
+@dataclass(frozen=True)
+class _PipelinedCudaGetCompletion:
+    token: Any
+    error_msg: Optional[str]
+    latency_us: float
+    finish_ts: float
+    expected_payload_size: int
+    source_kind: Optional[KVGetSourceKind]
+
+
+@dataclass(frozen=True)
+class KVBlockingGetCompletion:
+    error_msg: Optional[str]
+    source_kind: Optional[KVGetSourceKind]
+
+
+@dataclass(frozen=True)
+class _CudaWorkerGetToken:
+    op_idx: int
+    key: str
+    expected_data_size: int
+    inflight_at_start: int
+
+
+class _MooncakeOffloadReadCounterWindow:
+    """Sample Mooncake's cumulative offload-RPC counter at window boundaries."""
+
+    def __init__(self, store: Any, *, start_ts: float, end_ts: float) -> None:
+        if end_ts < start_ts:
+            raise ValueError(
+                f"source counter window end precedes start: {end_ts} < {start_ts}"
+            )
         self._store = store
+        self._start_ts = float(start_ts)
+        self._end_ts = float(end_ts)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="mooncake-offload-read-counter-window",
+            daemon=True,
+        )
+        self._lock = threading.Lock()
+        self._start_count: Optional[int] = None
+        self._end_count: Optional[int] = None
+        self._start_sample_ts: Optional[float] = None
+        self._end_sample_ts: Optional[float] = None
+        self._error: Optional[str] = None
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _wait_until(self, deadline_ts: float) -> bool:
+        delay = max(0.0, float(deadline_ts) - time.time())
+        return self._stop.wait(timeout=delay)
+
+    def _read_counter(self) -> int:
+        return self._store._benchmark_offload_rpc_read_count()
+
+    def _run(self) -> None:
+        try:
+            if self._wait_until(self._start_ts):
+                return
+            start_count = self._read_counter()
+            start_sample_ts = time.time()
+            with self._lock:
+                self._start_count = start_count
+                self._start_sample_ts = start_sample_ts
+
+            if self._wait_until(self._end_ts):
+                return
+            end_count = self._read_counter()
+            end_sample_ts = time.time()
+            with self._lock:
+                self._end_count = end_count
+                self._end_sample_ts = end_sample_ts
+        except Exception as exc:
+            with self._lock:
+                self._error = f"{type(exc).__name__}: {exc}"
+
+    def finish(self) -> Dict[str, Any]:
+        self._thread.join(timeout=5.0)
+        if self._thread.is_alive():
+            self._stop.set()
+            self._thread.join(timeout=1.0)
+            with self._lock:
+                if self._error is None:
+                    self._error = "counter sampler did not reach the end boundary"
+
+        with self._lock:
+            start_count = self._start_count
+            end_count = self._end_count
+            error = self._error
+            start_sample_ts = self._start_sample_ts
+            end_sample_ts = self._end_sample_ts
+
+        delta: Optional[int] = None
+        if start_count is not None and end_count is not None:
+            delta = int(end_count) - int(start_count)
+            if delta < 0:
+                error = (
+                    "Mooncake offload counter decreased during the measurement window: "
+                    f"start={start_count} end={end_count}"
+                )
+                delta = None
+        return {
+            "observation_kind": "mooncake_offload_rpc_counter_window",
+            "counter_unit": "single_key_get_buffer_offload_rpc",
+            "window_start_ts": self._start_ts,
+            "window_end_ts": self._end_ts,
+            "start_sample_ts": start_sample_ts,
+            "end_sample_ts": end_sample_ts,
+            "start_count": start_count,
+            "end_count": end_count,
+            "ssd_read_count": delta,
+            "complete": delta is not None and error is None,
+            "error": error,
+        }
+
+    def cancel(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+
+class KVBenchmarkBlockingStore:
+    def __init__(
+        self,
+        store: KvClient,
+        *,
+        backend_kind: str,
+        get_output: KVGetOutput,
+        cuda_device_index: int = 0,
+    ) -> None:
+        self.backend_kind = str(backend_kind).strip().upper()
+        self._store = store
+        self._get_output = get_output
         self._phase_profiler = _FluxonPhaseProfiler()
+        self._put_dedupe_condition = threading.Condition()
+        self._put_confirmed_keys: set[str] = set()
+        self._put_inflight_keys: set[str] = set()
+        self._cuda_pipeline = (
+            _CudaHostToDevicePipeline(device_index=cuda_device_index)
+            if self._get_output == KVGetOutput.CUDA
+            else None
+        )
+        self._mooncake_store: Optional[Any] = None
+        self._source_counter_window: Optional[
+            _MooncakeOffloadReadCounterWindow
+        ] = None
+        if self.backend_kind == BACKEND_KIND_MOONCAKE:
+            from fluxon_py.kvclient.mooncake import MooncakeStore
+
+            if not isinstance(store, MooncakeStore):
+                raise TypeError(
+                    "Mooncake benchmark backend must be backed by MooncakeStore; "
+                    f"got {type(store)}"
+                )
+            self._mooncake_store = store
+
+    def begin_get_source_counter_window(
+        self,
+        *,
+        start_ts: float,
+        end_ts: float,
+    ) -> None:
+        if self._source_counter_window is not None:
+            raise RuntimeError("GET source counter window is already active")
+        if self.backend_kind != BACKEND_KIND_MOONCAKE:
+            return
+        assert self._mooncake_store is not None
+        sampler = _MooncakeOffloadReadCounterWindow(
+            self._mooncake_store,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        self._source_counter_window = sampler
+        sampler.start()
+
+    def finish_get_source_counter_window(self) -> Dict[str, Any]:
+        sampler = self._source_counter_window
+        self._source_counter_window = None
+        if sampler is None:
+            return {}
+        return sampler.finish()
+
+    def _begin_deduplicated_put(
+        self,
+        key: str,
+        *,
+        deadline_ts: float,
+    ) -> tuple[bool, Optional[str]]:
+        with self._put_dedupe_condition:
+            while key in self._put_inflight_keys:
+                remaining = float(deadline_ts) - time.time()
+                if remaining <= 0.0:
+                    return False, f"PUT timed out waiting for same-key benchmark put: key={key!r}"
+                self._put_dedupe_condition.wait(timeout=remaining)
+            if key in self._put_confirmed_keys:
+                return False, None
+            self._put_inflight_keys.add(key)
+            return True, None
+
+    def _finish_deduplicated_put(self, key: str, *, confirmed: bool) -> None:
+        with self._put_dedupe_condition:
+            if key not in self._put_inflight_keys:
+                raise RuntimeError(f"benchmark PUT key was not inflight: {key!r}")
+            self._put_inflight_keys.remove(key)
+            if confirmed:
+                self._put_confirmed_keys.add(key)
+            self._put_dedupe_condition.notify_all()
 
     @property
     def kv_client(self) -> KvClient:
@@ -1884,17 +2820,61 @@ class FluxonBlockingStore:
         try:
             _bench_kv_print(f"{ctx} PUT begin key={key!r} payload_size={len(payload)}", verbose_only=True)
             started_at = time.perf_counter()
-            result = self._store.put_blocking(
+            should_submit, dedupe_error = self._begin_deduplicated_put(
                 key,
-                {"payload": payload},
-                opts=PutOptionalArgs(reject_if_inflight_same_key=True),
+                deadline_ts=deadline_ts,
             )
+            if not should_submit:
+                done_at = time.perf_counter()
+                phase_sample = _build_fluxon_sync_phase_sample(
+                    started_at=started_at,
+                    done_at=done_at,
+                    deadline_ts=deadline_ts,
+                    wall_done_ts=time.time(),
+                )
+                self._phase_profiler.record(
+                    op_name="PUT",
+                    key=key,
+                    sample=phase_sample,
+                    error_msg=dedupe_error,
+                )
+                if dedupe_error is not None:
+                    return dedupe_error
+                _bench_kv_print(
+                    f"{ctx} PUT deduplicated key={key!r}",
+                    verbose_only=True,
+                )
+                return None
+
+            value: Any = payload
+            if self._get_output == KVGetOutput.CUDA:
+                value = DLPackBytesView(
+                    payload,
+                    dtype_code=_DLPACK_DTYPE_UINT,
+                    bits=8,
+                    lanes=1,
+                    shape=(len(payload),),
+                )
+            put_confirmed = False
+            put_error: Optional[Any] = None
+            try:
+                result = self._store.put_blocking(
+                    key,
+                    {"payload": value},
+                    opts=PutOptionalArgs(reject_if_exists=True),
+                )
+                if result.is_ok():
+                    put_confirmed = True
+                else:
+                    put_error = result.unwrap_error()
+                    put_confirmed = _is_key_already_exists_error(put_error)
+            finally:
+                self._finish_deduplicated_put(key, confirmed=put_confirmed)
             done_at = time.perf_counter()
             wall_done_ts = time.time()
             err: Optional[str] = None
             compat_success = False
-            if not result.is_ok():
-                put_error = result.unwrap_error()
+            if put_error is not None:
                 if _is_put_compat_success_error(put_error):
                     _bench_kv_print(
                         f"{ctx} PUT compat-success key={key!r} reason={type(put_error).__name__}",
@@ -1934,24 +2914,336 @@ class FluxonBlockingStore:
             _bench_kv_print(f"{ctx} PUT exception key={key!r} err={exc}")
             return f"PUT exception: {exc}"
 
+    def _get_native_holder(self, key: str) -> Any:
+        if self.backend_kind == BACKEND_KIND_MOONCAKE:
+            assert self._mooncake_store is not None
+            return self._mooncake_store.get_buffer_blocking(key)
+        return self._store.get_blocking(key)
+
+    def _get_source_kind(self, holder: Any) -> Optional[KVGetSourceKind]:
+        if self.backend_kind == BACKEND_KIND_MOONCAKE:
+            return None
+        return normalize_kv_get_source_kind(holder._benchmark_source_kind())
+
+    def _cuda_host_payload(
+        self,
+        holder: Any,
+        *,
+        expected_payload_size: int,
+    ) -> _CudaHostPayload:
+        if self.backend_kind == BACKEND_KIND_MOONCAKE:
+            raw_view, payload_offset, payload_size = _flat_dict_payload_range(
+                memoryview(holder),
+                expected_payload_size,
+            )
+            if len(raw_view) != int(holder.size()):
+                raise ValueError(
+                    "Mooncake buffer protocol size differs from BufferHandle.size(): "
+                    f"view={len(raw_view)} handle={holder.size()}"
+                )
+            return _CudaHostPayload(
+                source_ptr=int(holder.ptr()) + payload_offset,
+                size=payload_size,
+                keepalive=(holder, raw_view),
+            )
+
+        access_result = holder.access()
+        if not access_result.is_ok():
+            raise RuntimeError(
+                f"MemHolder.access() failed: {access_result.unwrap_error()}"
+            )
+        value = access_result.unwrap()
+        payload_view = value.get("payload")
+        dlpack_info = _dlpack_cpu_tensor_info(payload_view)
+        if not dlpack_info.is_ok():
+            raise RuntimeError(
+                "Fluxon CUDA output requires a CPU DLPack payload: "
+                f"{dlpack_info.unwrap_error()}"
+            )
+        (
+            source_ptr,
+            payload_size,
+            dlpack_capsule,
+            _,
+            _,
+            _,
+            _,
+        ) = dlpack_info.unwrap()
+        if payload_size != int(expected_payload_size):
+            raise ValueError(
+                "DLPack payload length mismatch: "
+                f"expected={expected_payload_size} actual={payload_size}"
+            )
+        return _CudaHostPayload(
+            source_ptr=int(source_ptr),
+            size=int(payload_size),
+            keepalive=(holder, value, payload_view, dlpack_capsule),
+        )
+
+    def _immediate_cuda_get_completion(
+        self,
+        *,
+        token: Any,
+        key: str,
+        deadline_ts: float,
+        expected_payload_size: int,
+        started_at: float,
+        error_msg: str,
+    ) -> _PipelinedCudaGetCompletion:
+        completed_at = time.perf_counter()
+        completed_wall_ts = time.time()
+        phase_sample = _build_fluxon_sync_phase_sample(
+            started_at=started_at,
+            done_at=completed_at,
+            deadline_ts=deadline_ts,
+            wall_done_ts=completed_wall_ts,
+        )
+        self._phase_profiler.record(
+            op_name="GET",
+            key=key,
+            sample=phase_sample,
+            error_msg=error_msg,
+        )
+        return _PipelinedCudaGetCompletion(
+            token=token,
+            error_msg=error_msg,
+            latency_us=max(0.0, (completed_at - started_at) * 1_000_000.0),
+            finish_ts=completed_wall_ts,
+            expected_payload_size=int(expected_payload_size),
+            source_kind=None,
+        )
+
+    def _finalize_cuda_copy_completion(
+        self,
+        completion: _CudaCopyCompletion,
+    ) -> _PipelinedCudaGetCompletion:
+        pending = completion.token
+        if not isinstance(pending, _PendingCudaGet):
+            raise TypeError(
+                "CUDA H2D pipeline returned an unknown completion token: "
+                f"{type(pending)}"
+            )
+
+        error_msg: Optional[str] = None
+        if completion.error_msg is not None:
+            error_msg = f"GET CUDA H2D failed: {completion.error_msg}"
+        elif completion.completed_wall_ts > pending.deadline_ts:
+            error_msg = (
+                "GET timed out after CUDA H2D completion: "
+                f"deadline_ts={pending.deadline_ts:.3f} "
+                f"now_ts={completion.completed_wall_ts:.3f} "
+                f"now_ms={completion.completed_wall_ts * 1000.0:.1f}"
+            )
+
+        phase_sample = _build_fluxon_sync_phase_sample(
+            started_at=pending.started_at,
+            done_at=completion.completed_at,
+            deadline_ts=pending.deadline_ts,
+            wall_done_ts=completion.completed_wall_ts,
+            extra_payload={
+                "cuda_backend_get_us": max(
+                    0.0,
+                    (pending.host_ready_at - pending.started_at) * 1_000_000.0,
+                ),
+                "cuda_host_stage_us": completion.host_stage_us,
+                "cuda_submit_us": completion.submit_us,
+                "cuda_h2d_event_us": completion.h2d_us,
+                "cuda_pipeline_residence_us": completion.pipeline_residence_us,
+                "cuda_completion_wait_us": completion.completion_wait_us,
+            },
+        )
+        self._phase_profiler.record(
+            op_name="GET",
+            key=pending.key,
+            sample=phase_sample,
+            error_msg=error_msg,
+        )
+        if error_msg is not None:
+            _bench_kv_print(
+                f"{pending.ctx} GET failed-after-CUDA key={pending.key!r} err={error_msg}"
+            )
+        else:
+            _bench_kv_print(
+                f"{pending.ctx} GET CUDA done key={pending.key!r}",
+                verbose_only=True,
+            )
+        return _PipelinedCudaGetCompletion(
+            token=pending.token,
+            error_msg=error_msg,
+            latency_us=max(
+                0.0,
+                (completion.completed_at - pending.started_at) * 1_000_000.0,
+            ),
+            finish_ts=completion.completed_wall_ts,
+            expected_payload_size=pending.expected_payload_size,
+            source_kind=pending.source_kind,
+        )
+
+    def _finalize_cuda_copy_completions(
+        self,
+        completions: Sequence[_CudaCopyCompletion],
+    ) -> list[_PipelinedCudaGetCompletion]:
+        return [
+            self._finalize_cuda_copy_completion(completion)
+            for completion in completions
+        ]
+
+    def submit_cuda_get(
+        self,
+        key: str,
+        *,
+        deadline_ts: float,
+        ctx: str,
+        expected_payload_size: int,
+        token: Any,
+    ) -> list[_PipelinedCudaGetCompletion]:
+        if self._get_output != KVGetOutput.CUDA or self._cuda_pipeline is None:
+            raise RuntimeError("submit_cuda_get requires kv_get_output=cuda")
+
+        _bench_kv_print(f"{ctx} GET begin key={key!r}", verbose_only=True)
+        started_at = time.perf_counter()
+        try:
+            result = self._get_native_holder(key)
+            if not result.is_ok():
+                error_msg = normalize_kv_get_error(
+                    f"GET failed: {result.unwrap_error()}"
+                )
+                assert error_msg is not None
+                return [
+                    self._immediate_cuda_get_completion(
+                        token=token,
+                        key=key,
+                        deadline_ts=deadline_ts,
+                        expected_payload_size=expected_payload_size,
+                        started_at=started_at,
+                        error_msg=error_msg,
+                    )
+                ]
+
+            holder = result.unwrap()
+            source_kind = self._get_source_kind(holder)
+            host_payload = self._cuda_host_payload(
+                holder,
+                expected_payload_size=expected_payload_size,
+            )
+            host_ready_at = time.perf_counter()
+            pending = _PendingCudaGet(
+                token=token,
+                key=key,
+                ctx=ctx,
+                deadline_ts=float(deadline_ts),
+                expected_payload_size=int(expected_payload_size),
+                started_at=started_at,
+                host_ready_at=host_ready_at,
+                source_kind=source_kind,
+            )
+            copy_completions = self._cuda_pipeline.submit_from_host(
+                source_ptr=host_payload.source_ptr,
+                size=host_payload.size,
+                keepalive=host_payload.keepalive,
+                token=pending,
+            )
+            return self._finalize_cuda_copy_completions(copy_completions)
+        except Exception as exc:
+            error_msg = f"GET exception: {exc}"
+            _bench_kv_print(f"{ctx} GET exception key={key!r} err={exc}")
+            return [
+                self._immediate_cuda_get_completion(
+                    token=token,
+                    key=key,
+                    deadline_ts=deadline_ts,
+                    expected_payload_size=expected_payload_size,
+                    started_at=started_at,
+                    error_msg=error_msg,
+                )
+            ]
+
+    def poll_cuda_gets(self) -> list[_PipelinedCudaGetCompletion]:
+        if self._get_output != KVGetOutput.CUDA or self._cuda_pipeline is None:
+            return []
+        return self._finalize_cuda_copy_completions(
+            self._cuda_pipeline.poll_current_thread()
+        )
+
+    def drain_cuda_gets(self) -> list[_PipelinedCudaGetCompletion]:
+        if self._get_output != KVGetOutput.CUDA or self._cuda_pipeline is None:
+            return []
+        return self._finalize_cuda_copy_completions(
+            self._cuda_pipeline.drain_current_thread()
+        )
+
     def get_blocking(
         self,
         key: str,
         *,
         deadline_ts: float,
         ctx: str,
-    ) -> Optional[str]:
+        expected_payload_size: int,
+    ) -> KVBlockingGetCompletion:
+        if self._get_output == KVGetOutput.CUDA:
+            token = object()
+            completions = self.submit_cuda_get(
+                key,
+                deadline_ts=deadline_ts,
+                ctx=ctx,
+                expected_payload_size=expected_payload_size,
+                token=token,
+            )
+            completions.extend(self.drain_cuda_gets())
+            matching = [completion for completion in completions if completion.token is token]
+            if len(matching) != 1:
+                return KVBlockingGetCompletion(
+                    error_msg=(
+                        "GET exception: synchronous CUDA GET did not produce exactly "
+                        "one completion"
+                    ),
+                    source_kind=None,
+                )
+            return KVBlockingGetCompletion(
+                error_msg=matching[0].error_msg,
+                source_kind=matching[0].source_kind,
+            )
+
         try:
             _bench_kv_print(f"{ctx} GET begin key={key!r}", verbose_only=True)
             started_at = time.perf_counter()
-            result = self._store.get_blocking(key)
-            done_at = time.perf_counter()
-            wall_done_ts = time.time()
+            result = self._get_native_holder(key)
             err: Optional[str] = None
+            source_kind: Optional[KVGetSourceKind] = None
             if not result.is_ok():
                 err = normalize_kv_get_error(f"GET failed: {result.unwrap_error()}")
             else:
-                _ = result.unwrap()
+                holder = result.unwrap()
+                source_kind = self._get_source_kind(holder)
+                if self._get_output == KVGetOutput.BYTES:
+                    if self.backend_kind == BACKEND_KIND_MOONCAKE:
+                        payload = bytes(
+                            _mooncake_payload_view(holder, expected_payload_size)
+                        )
+                    else:
+                        access_result = holder.access()
+                        if not access_result.is_ok():
+                            raise RuntimeError(
+                                f"MemHolder.access() failed: {access_result.unwrap_error()}"
+                            )
+                        value = access_result.unwrap()
+                        payload = value.get("payload")
+                        if not isinstance(payload, bytes):
+                            raise TypeError(
+                                "bytes output requires MemHolder payload to be bytes; "
+                                f"got {type(payload)}"
+                            )
+                    if len(payload) != int(expected_payload_size):
+                        raise ValueError(
+                            "materialized payload length mismatch: "
+                            f"expected={expected_payload_size} actual={len(payload)}"
+                        )
+                    if payload:
+                        _ = payload[0] ^ payload[-1]
+
+            done_at = time.perf_counter()
+            wall_done_ts = time.time()
+            if err is None:
                 if wall_done_ts > deadline_ts:
                     err = (
                         f"GET timed out after blocking wait: deadline_ts={deadline_ts:.3f} "
@@ -1966,15 +3258,29 @@ class FluxonBlockingStore:
             self._phase_profiler.record(op_name="GET", key=key, sample=phase_sample, error_msg=err)
             if err is not None:
                 _bench_kv_print(f"{ctx} GET failed-after-block key={key!r} err={err}")
-                return err
+                return KVBlockingGetCompletion(
+                    error_msg=err,
+                    source_kind=source_kind,
+                )
             _bench_kv_print(f"{ctx} GET done key={key!r}", verbose_only=True)
-            return None
+            return KVBlockingGetCompletion(
+                error_msg=None,
+                source_kind=source_kind,
+            )
         except Exception as exc:
             _bench_kv_print(f"{ctx} GET exception key={key!r} err={exc}")
-            return f"GET exception: {exc}"
+            return KVBlockingGetCompletion(
+                error_msg=f"GET exception: {exc}",
+                source_kind=None,
+            )
 
     def close(self) -> _SimpleResult:
         try:
+            if self._source_counter_window is not None:
+                self._source_counter_window.cancel()
+                self._source_counter_window = None
+            if self._cuda_pipeline is not None:
+                self._cuda_pipeline.close()
             return self._store.close()
         except Exception as exc:
             return _SimpleResult.err(str(exc))
@@ -1992,8 +3298,39 @@ class FluxonBlockingStore:
         self._phase_profiler.flush_pending()
 
 
-def init_kv_store(kvcache_config: dict[str, Any]) -> tuple[Optional[Any], Optional[str]]:
+class FluxonBlockingStore(KVBenchmarkBlockingStore):
+    """Fluxon-backed store that owns the client used by MQ control paths."""
+
+    def __init__(
+        self,
+        store: KvClient,
+        *,
+        get_output: KVGetOutput = KVGetOutput.HOLDER,
+        cuda_device_index: int = 0,
+    ) -> None:
+        super().__init__(
+            store,
+            backend_kind=BACKEND_KIND_FLUXON,
+            get_output=get_output,
+            cuda_device_index=cuda_device_index,
+        )
+
+
+def init_kv_store(
+    kvcache_config: dict[str, Any],
+    *,
+    kv_get_output: Any = KVGetOutput.HOLDER.value,
+    kv_cuda_device_index: Any = 0,
+) -> tuple[Optional[Any], Optional[str]]:
     backend_kind = str(kvcache_config.get("backend_kind", BACKEND_KIND_FLUXON)).strip().upper()
+    try:
+        get_output = normalize_kv_get_output(kv_get_output)
+    except ValueError as exc:
+        return None, str(exc)
+    try:
+        cuda_device_index = normalize_kv_cuda_device_index(kv_cuda_device_index)
+    except ValueError as exc:
+        return None, str(exc)
     if backend_kind == BACKEND_KIND_REDIS:
         try:
             redis_cfg = kvcache_config.get("redis")
@@ -2046,7 +3383,24 @@ def init_kv_store(kvcache_config: dict[str, Any]) -> tuple[Optional[Any], Option
         store = result.unwrap()
         if store is None:
             return None, "Failed to create KVCache store: unwrap() returned None"
-        return FluxonBlockingStore(store), None
+        if backend_kind == BACKEND_KIND_FLUXON:
+            return (
+                FluxonBlockingStore(
+                    store,
+                    get_output=get_output,
+                    cuda_device_index=cuda_device_index,
+                ),
+                None,
+            )
+        return (
+            KVBenchmarkBlockingStore(
+                store,
+                backend_kind=backend_kind,
+                get_output=get_output,
+                cuda_device_index=cuda_device_index,
+            ),
+            None,
+        )
     except Exception as exc:
         return None, f"Exception while creating KVCache store: {exc}"
 
@@ -2070,14 +3424,39 @@ def kv_put_once(
     return store.put_blocking(key, bytes(payload), deadline_ts=deadline_ts, ctx=ctx)
 
 
-def kv_get_once(store: Any, key: str, *, deadline_ts: float, ctx: str) -> Optional[str]:
+def kv_get_once(
+    store: Any,
+    key: str,
+    *,
+    deadline_ts: float,
+    ctx: str,
+    expected_payload_size: int,
+) -> KVBlockingGetCompletion:
     if store is None:
-        return "KV store is not initialized"
+        return KVBlockingGetCompletion(
+            error_msg="KV store is not initialized",
+            source_kind=None,
+        )
     if not hasattr(store, "get_blocking"):
         backend_kind = getattr(store, "backend_kind", type(store).__name__)
-        return f"GET failed: backend {backend_kind} does not expose get_blocking"
-    return normalize_kv_get_error(
-        store.get_blocking(key, deadline_ts=deadline_ts, ctx=ctx)
+        return KVBlockingGetCompletion(
+            error_msg=f"GET failed: backend {backend_kind} does not expose get_blocking",
+            source_kind=None,
+        )
+    completion = store.get_blocking(
+        key,
+        deadline_ts=deadline_ts,
+        ctx=ctx,
+        expected_payload_size=expected_payload_size,
+    )
+    if not isinstance(completion, KVBlockingGetCompletion):
+        raise TypeError(
+            "benchmark get_blocking() must return KVBlockingGetCompletion; "
+            f"got {type(completion)}"
+        )
+    return KVBlockingGetCompletion(
+        error_msg=normalize_kv_get_error(completion.error_msg),
+        source_kind=completion.source_kind,
     )
 
 
@@ -2332,6 +3711,74 @@ def _kv_bootstrap_before_ready_enabled(test_config: Mapping[str, Any]) -> bool:
     raise ValueError("kv_bootstrap_before_ready must be bool when present")
 
 
+def _kv_bootstrap_concurrency(test_config: Mapping[str, Any], *, keyspace_size: int) -> int:
+    raw = test_config.get(BENCHMARK_KEY_KV_BOOTSTRAP_CONCURRENCY)
+    if raw is None:
+        return min(KV_SEED_BOOTSTRAP_MAX_CONCURRENCY, int(keyspace_size))
+    concurrency = int(raw)
+    if concurrency <= 0:
+        raise ValueError(f"{BENCHMARK_KEY_KV_BOOTSTRAP_CONCURRENCY} must be > 0")
+    return min(concurrency, int(keyspace_size))
+
+
+def _kv_bootstrap_put_gap_seconds(test_config: Mapping[str, Any]) -> float:
+    raw = test_config.get(BENCHMARK_KEY_KV_BOOTSTRAP_PUT_GAP_MS, 0)
+    if not isinstance(raw, (int, float)):
+        raise ValueError(f"{BENCHMARK_KEY_KV_BOOTSTRAP_PUT_GAP_MS} must be number")
+    gap_ms = float(raw)
+    if gap_ms < 0.0:
+        raise ValueError(f"{BENCHMARK_KEY_KV_BOOTSTRAP_PUT_GAP_MS} must be >= 0")
+    return gap_ms / 1000.0
+
+
+def _kv_bootstrap_storage_full_policy(test_config: Mapping[str, Any]) -> str:
+    raw = test_config.get(
+        BENCHMARK_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY,
+        KV_BOOTSTRAP_STORAGE_FULL_POLICY_FAIL,
+    )
+    if not isinstance(raw, str):
+        raise ValueError(f"{BENCHMARK_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY} must be string")
+    policy = raw.strip().lower()
+    if policy not in KV_BOOTSTRAP_STORAGE_FULL_POLICIES:
+        raise ValueError(
+            f"{BENCHMARK_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY} must be one of "
+            f"{sorted(KV_BOOTSTRAP_STORAGE_FULL_POLICIES)}"
+        )
+    return policy
+
+
+def _is_kv_storage_full_error(error_msg: Optional[str]) -> bool:
+    if not error_msg:
+        return False
+    return "StorageFullError" in error_msg or "No space left" in error_msg
+
+
+def _build_operation_result(
+    operation_result_cls: Any,
+    *,
+    success: bool,
+    latency_us: float,
+    operation_type: str,
+    key: str,
+    data_size: int,
+    inflight_at_start: int,
+    outcome_kind: Any,
+    error_msg: Optional[str],
+    get_source_kind: Optional[str] = None,
+) -> Any:
+    return operation_result_cls(
+        success=success,
+        latency_us=latency_us,
+        operation_type=operation_type,
+        key=key,
+        data_size=data_size,
+        inflight_at_start=inflight_at_start,
+        outcome_kind=outcome_kind,
+        error_msg=error_msg,
+        get_source_kind=get_source_kind,
+    )
+
+
 def merge_kv_benchmark_extras(
     node_config: Mapping[str, Any],
     benchmark_cfg: Mapping[str, Any],
@@ -2383,15 +3830,34 @@ def prepare_kv_before_ready(benchmark_node: Any, *, logger: Any) -> bool:
         if fixed_value_size > 0:
             fixed_value = benchmark_node._generate_test_data(fixed_value_size)
 
+    bootstrap_concurrency = _kv_bootstrap_concurrency(
+        test_config,
+        keyspace_size=runtime_cfg.keyspace_size,
+    )
+    bootstrap_put_gap_s = _kv_bootstrap_put_gap_seconds(test_config)
+    storage_full_policy = _kv_bootstrap_storage_full_policy(test_config)
+    if (
+        storage_full_policy == KV_BOOTSTRAP_STORAGE_FULL_POLICY_STOP
+        and bootstrap_concurrency != 1
+    ):
+        raise ValueError(
+            f"{BENCHMARK_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY}=stop requires "
+            f"{BENCHMARK_KEY_KV_BOOTSTRAP_CONCURRENCY}=1"
+        )
+
     logger.info(
-        "🧱 KV bootstrap before READY: mode=%s key_prefix=%s keyspace_size=%s distribution=%s",
+        "🧱 KV bootstrap before READY: mode=%s key_prefix=%s keyspace_size=%s distribution=%s "
+        "concurrency=%s put_gap_ms=%.3f storage_full_policy=%s",
         test_mode,
         runtime_cfg.key_prefix,
         runtime_cfg.keyspace_size,
         runtime_cfg.request_distribution,
+        bootstrap_concurrency,
+        bootstrap_put_gap_s * 1000.0,
+        storage_full_policy,
     )
 
-    def _bootstrap_one_key(key_idx: int) -> None:
+    def _bootstrap_one_key(key_idx: int) -> bool:
         key = f"{runtime_cfg.key_prefix}_k{key_idx}"
         kv_value_size = _resolve_kv_value_size_for_key(benchmark_node, key_idx)
         value = (
@@ -2411,12 +3877,29 @@ def prepare_kv_before_ready(benchmark_node: Any, *, logger: Any) -> bool:
             ),
         )
         if not result.success:
+            if (
+                storage_full_policy == KV_BOOTSTRAP_STORAGE_FULL_POLICY_STOP
+                and _is_kv_storage_full_error(result.error_msg)
+            ):
+                logger.warning(
+                    "🧱 KV bootstrap stopped on storage full: key=%s key_idx=%s requested_keys=%s err=%s",
+                    key,
+                    key_idx,
+                    runtime_cfg.keyspace_size,
+                    result.error_msg,
+                )
+                return False
             raise RuntimeError(f"KV bootstrap PUT failed: key={key} err={result.error_msg}")
+        if bootstrap_put_gap_s > 0.0:
+            time.sleep(bootstrap_put_gap_s)
+        return True
 
-    bootstrap_concurrency = min(KV_SEED_BOOTSTRAP_MAX_CONCURRENCY, runtime_cfg.keyspace_size)
+    completed_keys = 0
     if bootstrap_concurrency <= 1:
         for key_idx in range(runtime_cfg.keyspace_size):
-            _bootstrap_one_key(key_idx)
+            if not _bootstrap_one_key(key_idx):
+                break
+            completed_keys += 1
     else:
         logger.info(
             "🧱 KV bootstrap using parallel shards: concurrency=%s",
@@ -2430,7 +3913,6 @@ def prepare_kv_before_ready(benchmark_node: Any, *, logger: Any) -> bool:
                 completed += 1
             return completed
 
-        completed_keys = 0
         with ThreadPoolExecutor(max_workers=bootstrap_concurrency) as executor:
             futures = [
                 executor.submit(_bootstrap_shard, shard_idx)
@@ -2443,8 +3925,19 @@ def prepare_kv_before_ready(benchmark_node: Any, *, logger: Any) -> bool:
                     completed_keys,
                     runtime_cfg.keyspace_size,
                 )
+    if completed_keys <= 0:
+        raise RuntimeError("KV bootstrap before READY did not insert any keys")
+    if completed_keys < runtime_cfg.keyspace_size:
+        test_config[BENCHMARK_KEY_KEYSPACE_SIZE] = int(completed_keys)
+        logger.warning(
+            "🧱 KV bootstrap using partial keyspace after storage pressure: requested_keys=%s "
+            "effective_keyspace_size=%s",
+            runtime_cfg.keyspace_size,
+            completed_keys,
+        )
     logger.info(
-        "✅ KV bootstrap before READY completed: keys=%d",
+        "✅ KV bootstrap before READY completed: keys=%d requested_keys=%d",
+        completed_keys,
         runtime_cfg.keyspace_size,
     )
     return True
@@ -2477,15 +3970,102 @@ def run_kv_worker(
         key_prefix=key_prefix.strip(),
     )
 
+    cuda_store: Optional[KVBenchmarkBlockingStore] = None
+    if normalize_kv_get_output(
+        test_config.get(BENCHMARK_KEY_KV_GET_OUTPUT)
+    ) == KVGetOutput.CUDA:
+        candidate_store = getattr(benchmark_node, "kv_store", None)
+        if not isinstance(candidate_store, KVBenchmarkBlockingStore):
+            raise TypeError(
+                "kv_get_output=cuda requires KVBenchmarkBlockingStore; "
+                f"got {type(candidate_store)}"
+            )
+        cuda_store = candidate_store
+
     results: list[Any] = []
     op_idx = 0
+    outstanding_cuda_tokens: set[_CudaWorkerGetToken] = set()
     fixed_value = None
     if benchmark_node.value_size_mode == VALUE_SIZE_MODE_FIXED:
         fixed_value_size = int(test_config.get("value_size", 0))
         if fixed_value_size > 0:
             fixed_value = benchmark_node._generate_test_data(fixed_value_size)
 
+    def _record_result(result: Any, *, result_op_idx: int, finish_ts: float) -> None:
+        result.node_id = benchmark_node.node_id
+        result.worker_id = thread_id
+        result.finish_ts = float(finish_ts)
+
+        if benchmark_node.start_time is not None:
+            warmup_deadline_ts = benchmark_node.start_time + metric_warmup_seconds
+            if result.finish_ts < warmup_deadline_ts:
+                benchmark_node._mark_progress(
+                    thread_id=thread_id,
+                    op_idx=result_op_idx,
+                    finish_ts=result.finish_ts,
+                    latency_us=result.latency_us,
+                )
+                return
+
+        benchmark_node._mark_progress(
+            thread_id=thread_id,
+            op_idx=result_op_idx,
+            finish_ts=result.finish_ts,
+            latency_us=result.latency_us,
+        )
+        results.append(result)
+
+    def _consume_cuda_completions(
+        completions: Sequence[_PipelinedCudaGetCompletion],
+    ) -> None:
+        for completion in completions:
+            token = completion.token
+            if not isinstance(token, _CudaWorkerGetToken):
+                raise TypeError(
+                    "CUDA GET completion returned an unknown worker token: "
+                    f"{type(token)}"
+                )
+            if token not in outstanding_cuda_tokens:
+                raise RuntimeError(
+                    "CUDA GET completion is duplicated or was never submitted: "
+                    f"op_idx={token.op_idx} key={token.key!r}"
+                )
+            outstanding_cuda_tokens.remove(token)
+            benchmark_node._inflight_end()
+
+            error_msg = normalize_kv_get_error(completion.error_msg)
+            success = error_msg is None
+            if success:
+                outcome_kind = operation_outcome.CACHE_HIT
+            elif classify_kv_get_result(error_msg) == KVGetResultKind.CACHE_MISS:
+                outcome_kind = operation_outcome.CACHE_MISS
+            else:
+                outcome_kind = operation_outcome.ERROR
+            result = _build_operation_result(
+                operation_result_cls,
+                success=success,
+                latency_us=completion.latency_us,
+                operation_type=KV_OPERATION_GET,
+                key=token.key,
+                data_size=token.expected_data_size if success else 0,
+                inflight_at_start=token.inflight_at_start,
+                outcome_kind=outcome_kind,
+                error_msg=error_msg,
+                get_source_kind=(
+                    completion.source_kind.value
+                    if success and completion.source_kind is not None
+                    else None
+                ),
+            )
+            _record_result(
+                result,
+                result_op_idx=token.op_idx,
+                finish_ts=completion.finish_ts,
+            )
+
     while True:
+        if cuda_store is not None:
+            _consume_cuda_completions(cuda_store.poll_cuda_gets())
         if benchmark_node._benchmark_stop.is_set():
             debug_print(
                 f"thread {thread_id} observed benchmark stop intent, "
@@ -2497,6 +4077,7 @@ def run_kv_worker(
             break
 
         inflight_at_start = benchmark_node._inflight_begin()
+        defer_inflight_end = False
         try:
             op_timeout_s = float(test_config["op_timeout_seconds"])
             op_deadline_ts = min(float(deadline_ts), time.time() + op_timeout_s)
@@ -2519,6 +4100,14 @@ def run_kv_worker(
                 thread_id=thread_id,
                 op_idx=op_idx,
             )
+            ctx = (
+                f"node={benchmark_node.node_id} role={node_role} thread={thread_id} "
+                f"op={op_idx} key_idx={key_idx} op_kind={op_kind.lower()}"
+            )
+
+            if cuda_store is not None and op_kind != KV_OPERATION_GET:
+                _consume_cuda_completions(cuda_store.drain_cuda_gets())
+
             if op_kind == KV_OPERATION_PUT:
                 value = (
                     fixed_value
@@ -2530,22 +4119,41 @@ def run_kv_worker(
                     value,
                     inflight_at_start,
                     deadline_ts=op_deadline_ts,
-                    ctx=(
-                        f"node={benchmark_node.node_id} role={node_role} thread={thread_id} "
-                        f"op={op_idx} key_idx={key_idx} op_kind={op_kind.lower()}"
-                    ),
+                    ctx=ctx,
                 )
             elif op_kind == KV_OPERATION_GET:
-                result = benchmark_node._get_single_operation(
-                    key,
-                    inflight_at_start,
-                    deadline_ts=op_deadline_ts,
-                    expected_data_size=kv_value_size,
-                    ctx=(
-                        f"node={benchmark_node.node_id} role={node_role} thread={thread_id} "
-                        f"op={op_idx} key_idx={key_idx} op_kind={op_kind.lower()}"
-                    ),
-                )
+                if cuda_store is not None:
+                    cuda_token = _CudaWorkerGetToken(
+                        op_idx=op_idx,
+                        key=key,
+                        expected_data_size=kv_value_size,
+                        inflight_at_start=inflight_at_start,
+                    )
+                    outstanding_cuda_tokens.add(cuda_token)
+                    try:
+                        completions = cuda_store.submit_cuda_get(
+                            key,
+                            deadline_ts=op_deadline_ts,
+                            ctx=ctx,
+                            expected_payload_size=kv_value_size,
+                            token=cuda_token,
+                        )
+                    except Exception:
+                        outstanding_cuda_tokens.discard(cuda_token)
+                        raise
+                    # Completion owns the in-flight decrement for pipelined GETs.
+                    defer_inflight_end = True
+                    _consume_cuda_completions(completions)
+                    op_idx += 1
+                    continue
+                else:
+                    result = benchmark_node._get_single_operation(
+                        key,
+                        inflight_at_start,
+                        deadline_ts=op_deadline_ts,
+                        expected_data_size=kv_value_size,
+                        ctx=ctx,
+                    )
             else:
                 result = operation_result_cls(
                     success=False,
@@ -2569,33 +4177,39 @@ def run_kv_worker(
                 error_msg=str(exc),
             )
         finally:
-            benchmark_node._inflight_end()
+            if not defer_inflight_end:
+                benchmark_node._inflight_end()
 
-        result.node_id = benchmark_node.node_id
-        result.worker_id = thread_id
-        result.finish_ts = time.time()
-        op_finish_ts = result.finish_ts
-
-        if benchmark_node.start_time is not None:
-            warmup_deadline_ts = benchmark_node.start_time + metric_warmup_seconds
-            if op_finish_ts < warmup_deadline_ts:
-                benchmark_node._mark_progress(
-                    thread_id=thread_id,
-                    op_idx=op_idx,
-                    finish_ts=op_finish_ts,
-                    latency_us=result.latency_us,
-                )
-                op_idx += 1
-                continue
-
-        benchmark_node._mark_progress(
-            thread_id=thread_id,
-            op_idx=op_idx,
-            finish_ts=op_finish_ts,
-            latency_us=result.latency_us,
+        _record_result(
+            result,
+            result_op_idx=op_idx,
+            finish_ts=time.time(),
         )
-        results.append(result)
         op_idx += 1
+
+    if cuda_store is not None:
+        _consume_cuda_completions(cuda_store.drain_cuda_gets())
+        if outstanding_cuda_tokens:
+            lost_tokens = sorted(outstanding_cuda_tokens, key=lambda token: token.op_idx)
+            outstanding_cuda_tokens.clear()
+            for token in lost_tokens:
+                benchmark_node._inflight_end()
+                result = _build_operation_result(
+                    operation_result_cls,
+                    success=False,
+                    latency_us=0.0,
+                    operation_type=KV_OPERATION_GET,
+                    key=token.key,
+                    data_size=0,
+                    inflight_at_start=token.inflight_at_start,
+                    outcome_kind=operation_outcome.ERROR,
+                    error_msg="CUDA GET pipeline lost its completion",
+                )
+                _record_result(
+                    result,
+                    result_op_idx=token.op_idx,
+                    finish_ts=time.time(),
+                )
 
     debug_print(
         f"thread {thread_id} exit kv run loop, total_ops={len(results)}, last_op_idx={op_idx}"

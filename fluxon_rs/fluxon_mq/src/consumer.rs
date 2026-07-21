@@ -105,7 +105,20 @@ fn prefetch_job_stage_name(stage: u8) -> &'static str {
         4 => "ready_to_advance",
         5 => "popped_to_advance",
         6 => "advanced",
+        7 => "failed",
         _ => "unknown",
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OffsetSnapshotState {
+    Pending,
+    Initialized,
+}
+
+impl OffsetSnapshotState {
+    fn needs_refresh(self) -> bool {
+        matches!(self, Self::Pending)
     }
 }
 
@@ -171,12 +184,34 @@ struct CommitSeqProgress {
     ready_to_advance_at: Option<Instant>,
     popped_at: Option<Instant>,
     advanced_at: Option<Instant>,
+    failed_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct CommitSequencerFailure {
+    seq: usize,
+    source_code: i32,
+    source_message: String,
+}
+
+impl CommitSequencerFailure {
+    fn as_error(&self) -> MpscError {
+        MpscError::Internal(format!(
+            "commit sequencer failed: seq={} source_code={} source={}",
+            self.seq, self.source_code, self.source_message
+        ))
+    }
+}
+
+struct CommitSequencerState {
+    next_seq: usize,
+    failure: Option<CommitSequencerFailure>,
 }
 
 #[derive(Clone)]
 struct CommitSequencer {
     instance_id: usize,
-    next_seq: Arc<AtomicUsize>,
+    state: Arc<Mutex<CommitSequencerState>>,
     notify: Arc<Notify>,
     progress: Arc<Mutex<HashMap<usize, CommitSeqProgress>>>,
 }
@@ -185,13 +220,25 @@ impl CommitSequencer {
     fn new(instance_id: usize) -> Self {
         Self {
             instance_id,
-            next_seq: Arc::new(AtomicUsize::new(0)),
+            state: Arc::new(Mutex::new(CommitSequencerState {
+                next_seq: 0,
+                failure: None,
+            })),
             notify: Arc::new(Notify::new()),
             progress: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    fn begin_payload(&self, seq: usize, producer_id: &str, consume_offset: i64) {
+    fn begin_payload(
+        &self,
+        seq: usize,
+        producer_id: &str,
+        consume_offset: i64,
+    ) -> Result<(), MpscError> {
+        let state = self.state.lock().unwrap();
+        if let Some(failure) = state.failure.as_ref() {
+            return Err(failure.as_error());
+        }
         let mut progress = self.progress.lock().unwrap();
         let prev = progress.insert(
             seq,
@@ -204,6 +251,7 @@ impl CommitSequencer {
                 ready_to_advance_at: None,
                 popped_at: None,
                 advanced_at: None,
+                failed_at: None,
             },
         );
         assert!(
@@ -211,6 +259,72 @@ impl CommitSequencer {
             "duplicate commit progress registration for seq={}",
             seq
         );
+        Ok(())
+    }
+
+    fn failure(&self) -> Option<CommitSequencerFailure> {
+        self.state.lock().unwrap().failure.clone()
+    }
+
+    fn ensure_running(&self) -> Result<(), MpscError> {
+        match self.failure() {
+            Some(failure) => Err(failure.as_error()),
+            None => Ok(()),
+        }
+    }
+
+    fn is_failed(&self) -> bool {
+        self.state.lock().unwrap().failure.is_some()
+    }
+
+    async fn wait_failed(&self) {
+        loop {
+            if self.is_failed() {
+                return;
+            }
+
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self.is_failed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn fail(&self, seq: usize, error: &MpscError) {
+        let failure = CommitSequencerFailure {
+            seq,
+            source_code: error.code(),
+            source_message: error.to_string(),
+        };
+        let first_failure = {
+            let mut state = self.state.lock().unwrap();
+            if state.failure.is_some() {
+                false
+            } else {
+                state.failure = Some(failure.clone());
+                true
+            }
+        };
+
+        {
+            let mut progress = self.progress.lock().unwrap();
+            let entry = progress
+                .get_mut(&seq)
+                .unwrap_or_else(|| panic!("missing commit progress for failed seq={}", seq));
+            entry.failed_at = Some(Instant::now());
+        }
+
+        if first_failure {
+            warn!(
+                "[CommitSequencer instance_id={}] terminal failure: seq={} source_code={} source={}",
+                self.instance_id, failure.seq, failure.source_code, failure.source_message,
+            );
+            self.notify.notify_waiters();
+        }
     }
 
     fn mark_wait_turn_begin(&self, seq: usize) {
@@ -260,13 +374,17 @@ impl CommitSequencer {
 
     fn advance(&self, seq: usize) {
         let now = Instant::now();
-        let prev = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(
-            prev, seq,
-            "commit sequencer advanced unexpected seq: expected={} actual={}",
-            seq, prev
-        );
-        let new_next_seq = prev + 1;
+        let (prev, new_next_seq) = {
+            let mut state = self.state.lock().unwrap();
+            let prev = state.next_seq;
+            assert_eq!(
+                prev, seq,
+                "commit sequencer advanced unexpected seq: expected={} actual={}",
+                seq, prev
+            );
+            state.next_seq += 1;
+            (prev, state.next_seq)
+        };
         {
             let mut progress = self.progress.lock().unwrap();
             let entry = progress
@@ -285,6 +403,18 @@ impl CommitSequencer {
         self.notify.notify_waiters();
     }
 
+    fn next_seq(&self) -> usize {
+        self.state.lock().unwrap().next_seq
+    }
+
+    fn next_seq_if_running(&self) -> Result<usize, MpscError> {
+        let state = self.state.lock().unwrap();
+        match state.failure.as_ref() {
+            Some(failure) => Err(failure.as_error()),
+            None => Ok(state.next_seq),
+        }
+    }
+
     async fn wait_turn(
         &self,
         seq: usize,
@@ -300,7 +430,7 @@ impl CommitSequencer {
                     "consumer closed during consume-offset commit wait".to_string(),
                 ));
             }
-            let observed_next_seq = self.next_seq.load(Ordering::SeqCst);
+            let observed_next_seq = self.next_seq_if_running()?;
             if observed_next_seq == seq {
                 let wait_end = Instant::now();
                 if let Some(blocker_seq) = current_blocker_seq.take() {
@@ -337,7 +467,7 @@ impl CommitSequencer {
                     "consumer closed during consume-offset commit wait".to_string(),
                 ));
             }
-            let observed_next_seq = self.next_seq.load(Ordering::SeqCst);
+            let observed_next_seq = self.next_seq_if_running()?;
             if observed_next_seq == seq {
                 let wait_end = Instant::now();
                 if let Some(blocker_seq) = current_blocker_seq.take() {
@@ -359,7 +489,7 @@ impl CommitSequencer {
                 }
                 _ = &mut notified => {}
                 _ = &mut wait_warn_sleep => {
-                    let blocker_seq = self.next_seq.load(Ordering::SeqCst);
+                    let blocker_seq = self.next_seq();
                     warn!(
                         "[CommitSequencer instance_id={}] still waiting for commit turn: seq={} next_seq={} waited_ms={} blocker_seq={} blocker={}",
                         self.instance_id,
@@ -383,14 +513,14 @@ impl CommitSequencer {
         let latency_ns = wait_end.duration_since(wait_begin).as_nanos();
         let mut breakdown = CommitWaitBreakdownNs::default();
         let mut dominant_blocker: Option<CommitWaitDominantBlocker> = None;
+        let current_next_seq = self.next_seq();
         {
             let progress = self.progress.lock().unwrap();
             for segment in blocker_segments.iter() {
                 let entry = progress.get(&segment.blocker_seq).unwrap_or_else(|| {
                     panic!(
                         "missing commit progress for blocked seq={} blocker_seq={}",
-                        self.next_seq.load(Ordering::SeqCst),
-                        segment.blocker_seq
+                        current_next_seq, segment.blocker_seq
                     )
                 });
                 let segment_breakdown = entry.segment_breakdown(segment.begin_at, segment.end_at);
@@ -452,6 +582,11 @@ impl CommitSequencer {
 
 impl CommitSeqProgress {
     fn stage_at(&self, at: Instant) -> u8 {
+        if let Some(failed_at) = self.failed_at {
+            if at >= failed_at {
+                return 7;
+            }
+        }
         if let Some(advanced_at) = self.advanced_at {
             if at >= advanced_at {
                 return 6;
@@ -2110,6 +2245,7 @@ impl MpscConsumer {
         });
 
         let result = async {
+            commit_seq.ensure_running()?;
             stage.store(1, Ordering::Relaxed);
             let mut fetched = MpscConsumer::run_single_get(
                 chan_id,
@@ -2154,6 +2290,12 @@ impl MpscConsumer {
         }
         .await;
 
+        if let Err(error) = result.as_ref() {
+            if !shutdown.is_closed() {
+                stage.store(7, Ordering::Relaxed);
+                commit_seq.fail(seq, error);
+            }
+        }
         done.store(true, Ordering::Relaxed);
         result
     }
@@ -2446,6 +2588,9 @@ struct ConsumerActor {
     produce_cache: HashMap<String, i64>,
     /// 本地缓存的 consume offset（来自 etcd）。
     consume_cache: HashMap<String, i64>,
+    /// The first authoritative produce/consume offset snapshot is a distinct
+    /// initialization state. Watch-populated caches do not satisfy it.
+    offset_snapshot_state: OffsetSnapshotState,
     /// 本地缓存的 producer 元数据存在性集合（来自 etcd
     /// `/channels/{chan}/producer/producer_` 前缀）。
     producer_meta_cache: HashSet<String>,
@@ -2779,9 +2924,11 @@ impl ConsumerActor {
         produce_offset_rx: &mut mpsc::Receiver<Vec<ProducerOffsetUpdate>>,
         duration: Duration,
     ) {
+        let commit_seq = self.commit_seq.clone();
         tokio::select! {
             biased;
             _ = self.shutdown.wait_closed() => {}
+            _ = commit_seq.wait_failed() => {}
             cmd = rx.recv() => {
                 self.handle_cmd_msg(cmd);
             }
@@ -2801,9 +2948,11 @@ impl ConsumerActor {
         meta_rx: &mut mpsc::Receiver<HashSet<String>>,
         produce_offset_rx: &mut mpsc::Receiver<Vec<ProducerOffsetUpdate>>,
     ) {
+        let commit_seq = self.commit_seq.clone();
         tokio::select! {
             biased;
             _ = self.shutdown.wait_closed() => {}
+            _ = commit_seq.wait_failed() => {}
             cmd = rx.recv() => {
                 self.handle_cmd_msg(cmd);
             }
@@ -2825,10 +2974,12 @@ impl ConsumerActor {
         let inflight_consume_notify = self.inflight_consume_notify.clone();
         let notify = inflight_consume_notify.notified();
         tokio::pin!(notify);
+        let commit_seq = self.commit_seq.clone();
 
         tokio::select! {
             biased;
             _ = self.shutdown.wait_closed() => {}
+            _ = commit_seq.wait_failed() => {}
             cmd = rx.recv() => {
                 self.handle_cmd_msg(cmd);
             }
@@ -2890,6 +3041,7 @@ impl ConsumerActor {
             prefetch_offset_map: HashMap::new(),
             produce_cache: HashMap::new(),
             consume_cache: HashMap::new(),
+            offset_snapshot_state: OffsetSnapshotState::Pending,
             producer_meta_cache: HashSet::new(),
             ready_producers: HashSet::new(),
             ready_trace_history: HashMap::new(),
@@ -3096,7 +3248,7 @@ impl ConsumerActor {
         mut produce_offset_rx: mpsc::Receiver<Vec<ProducerOffsetUpdate>>,
     ) {
         loop {
-            if self.shutdown.is_closed() {
+            if self.shutdown.is_closed() || self.commit_seq.is_failed() {
                 break;
             }
 
@@ -3208,6 +3360,7 @@ impl ConsumerActor {
         if self.shutdown.is_closed() {
             return Err(MpscError::Internal("consumer closed".to_string()));
         }
+        self.commit_seq.ensure_running()?;
         let cb = self
             .payload_cb
             .as_ref()
@@ -3215,6 +3368,7 @@ impl ConsumerActor {
             .clone();
 
         let (producer_id, consume_offset) = self.select_next_message().await?;
+        self.commit_seq.ensure_running()?;
 
         let chan_id = self.chan_id;
         let instance_id = self.instance_id;
@@ -3232,7 +3386,7 @@ impl ConsumerActor {
         let producer_id_for_name = producer_id.clone();
         let producer_id_for_queue = producer_id.clone();
         self.commit_seq
-            .begin_payload(seq, &producer_id_for_queue, consume_offset);
+            .begin_payload(seq, &producer_id_for_queue, consume_offset)?;
         spawn_named(
             &lifecycle,
             format!(
@@ -3313,10 +3467,11 @@ impl ConsumerActor {
         let select_begin = Instant::now();
         let mut trace = SelectNextMessageTrace::new();
 
-        // Cold start still needs one authoritative snapshot to bootstrap the
-        // local ready set before watch-driven updates take over.
-        if self.produce_cache.is_empty() && self.consume_cache.is_empty() {
+        // Cache contents can arrive from the produce-offset watch before the
+        // consume-offset snapshot. Only this explicit state completes startup.
+        if self.offset_snapshot_state.needs_refresh() {
             self.refresh_offsets_from_etcd_timed(&mut trace).await?;
+            self.offset_snapshot_state = OffsetSnapshotState::Initialized;
         }
 
         let result = self.select_next_message_from_cache(&mut trace).await;
@@ -3608,7 +3763,7 @@ impl ConsumerActor {
 mod tests {
     use super::{
         merge_monotonic_offset, merge_offset_cache_monotonic, CommitSequencer, MpscError,
-        ShutdownCtl,
+        OffsetSnapshotState, ShutdownCtl,
     };
     use std::collections::HashMap;
     use std::time::Duration;
@@ -3616,7 +3771,9 @@ mod tests {
     use tokio::time::timeout;
 
     fn prepare_sequence_for_advance(sequencer: &CommitSequencer, seq: usize) {
-        sequencer.begin_payload(seq, "producer", seq as i64);
+        sequencer
+            .begin_payload(seq, "producer", seq as i64)
+            .unwrap();
         sequencer.mark_wait_turn_begin(seq);
         sequencer.mark_commit_begin(seq);
         sequencer.mark_ready_to_advance(seq);
@@ -3652,6 +3809,28 @@ mod tests {
         assert_eq!(current.get("producer_c"), Some(&7));
     }
 
+    #[test]
+    fn offset_snapshot_initialization_is_independent_of_watch_cache_contents() {
+        let mut produce_cache = HashMap::from([("producer_a".to_string(), 4)]);
+        let mut consume_cache = HashMap::new();
+        let mut state = OffsetSnapshotState::Pending;
+
+        assert!(state.needs_refresh());
+        merge_offset_cache_monotonic(
+            &mut produce_cache,
+            HashMap::from([("producer_a".to_string(), 3)]),
+        );
+        merge_offset_cache_monotonic(
+            &mut consume_cache,
+            HashMap::from([("producer_a".to_string(), 5)]),
+        );
+        state = OffsetSnapshotState::Initialized;
+
+        assert!(!state.needs_refresh());
+        assert_eq!(produce_cache.get("producer_a"), Some(&4));
+        assert_eq!(consume_cache.get("producer_a"), Some(&5));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn commit_wait_turn_wakes_when_prior_sequence_advances() {
         let sequencer = CommitSequencer::new(1);
@@ -3675,6 +3854,79 @@ mod tests {
             .expect("commit waiter task panicked")
             .expect("commit waiter returned an error");
         assert_eq!(outcome.blocker_count, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_failure_wakes_existing_and_future_waiters() {
+        let sequencer = CommitSequencer::new(5);
+        sequencer.begin_payload(0, "producer", 0).unwrap();
+        sequencer.begin_payload(1, "producer", 1).unwrap();
+        sequencer.begin_payload(10, "producer", 10).unwrap();
+        let shutdown = ShutdownCtl::new();
+
+        let waiter_one_sequencer = sequencer.clone();
+        let waiter_one_shutdown = shutdown.clone();
+        let waiter_one = tokio::spawn(async move {
+            waiter_one_sequencer
+                .wait_turn(1, &waiter_one_shutdown)
+                .await
+        });
+        let waiter_ten_sequencer = sequencer.clone();
+        let waiter_ten_shutdown = shutdown.clone();
+        let waiter_ten = tokio::spawn(async move {
+            waiter_ten_sequencer
+                .wait_turn(10, &waiter_ten_shutdown)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let source = MpscError::GetPayloadNonRetryable {
+            message: "missing payload".to_string(),
+        };
+        sequencer.fail(0, &source);
+
+        let expected =
+            "commit sequencer failed: seq=0 source_code=4000 source=get payload returned non-retryable: missing payload";
+        for waiter in [waiter_one, waiter_ten] {
+            let result = timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("commit waiter did not wake after terminal failure")
+                .expect("commit waiter task panicked");
+            assert!(matches!(
+                result,
+                Err(MpscError::Internal(message)) if message == expected
+            ));
+        }
+
+        let future_waiter_result =
+            timeout(Duration::from_secs(1), sequencer.wait_turn(10, &shutdown))
+                .await
+                .expect("future commit waiter did not observe terminal failure");
+        assert!(matches!(
+            future_waiter_result,
+            Err(MpscError::Internal(message)) if message == expected
+        ));
+    }
+
+    #[test]
+    fn commit_failure_is_monotonic_and_stops_new_admission() {
+        let sequencer = CommitSequencer::new(6);
+        sequencer.begin_payload(0, "producer", 0).unwrap();
+        sequencer.begin_payload(1, "producer", 1).unwrap();
+        sequencer.fail(
+            0,
+            &MpscError::GetPayloadNonRetryable {
+                message: "first".to_string(),
+            },
+        );
+        sequencer.fail(1, &MpscError::Internal("second".to_string()));
+
+        let result = sequencer.begin_payload(2, "producer", 2);
+        assert!(matches!(
+            result,
+            Err(MpscError::Internal(message))
+                if message == "commit sequencer failed: seq=0 source_code=4000 source=get payload returned non-retryable: first"
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

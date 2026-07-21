@@ -27,12 +27,13 @@ use fluxon_kv::user_api::FlatDict;
 use fluxon_kv::user_api::FlatValue;
 use fluxon_kv::user_api::FluxonUserApi;
 use fluxon_kv::{
-    ConfigArg, Framework, KvClientTrait, KvGetResult,
+    ConfigArg, Framework, KvClientTrait, KvGetResultWithSource,
     config::{ClientConfig, MasterConfig},
     run_client, run_master,
 };
 use fluxon_ops;
 use fluxon_proxy;
+use fluxon_util::etcd::etcd_clients_pool;
 use fluxon_util::run_async_from_sync::{SyncAsyncBridge, borrow_stable_owner};
 use fluxon_util::{
     FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
@@ -70,6 +71,9 @@ pub use etcd::{PyEtcdKvClient, PyEtcdLock};
 pub use mpsc::{MpscConsumerHandle, MpscContext, MpscProducerHandle};
 mod lease_manager;
 pub use lease_manager::{LeaseManagerHandle, PyGeneralLease};
+mod video_reader;
+#[cfg(feature = "fluxon_fs_video_ffmpeg")]
+pub use video_reader::FluxonFsVideoReader;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RdmavDriverEnvUpdate {
@@ -1184,6 +1188,29 @@ impl FluxonFsAgent {
         res.map_err(pyerr_from_fs_agent_error)
     }
 
+    #[pyo3(signature = (export_name, relpath, height, width, num_threads, request_identity=None))]
+    fn open_video_reader(
+        &self,
+        export_name: String,
+        relpath: String,
+        height: i64,
+        width: i64,
+        num_threads: i64,
+        request_identity: Option<(String, String)>,
+        py: Python,
+    ) -> PyResult<PyObject> {
+        video_reader::open_video_reader_from_agent(
+            py,
+            self.inner.clone(),
+            export_name,
+            relpath,
+            height,
+            width,
+            num_threads,
+            request_identity,
+        )
+    }
+
     #[pyo3(signature = (file_abs, mode))]
     fn open_plan(&self, file_abs: String, mode: String, py: Python) -> PyResult<PyObject> {
         let panic_ctx = format!("open_plan panic: file_abs={} mode={}", file_abs, mode,);
@@ -2193,9 +2220,11 @@ fn fluxon_ops_controller_blocking(
             // - If etcd connect/get stalls without returning, the controller would hang forever and never
             //   bring up the HTTP endpoint needed by test_runner/start_test_bed.
             // - Therefore we hard-bound etcd operations so the supervisor can restart on persistent faults.
+            let etcd_pool_entry =
+                etcd_clients_pool().acquire(cli_cfg.etcd_endpoints.clone());
             let mut etcd = tokio::time::timeout(
                 tokio::time::Duration::from_secs(5),
-                etcd_client::Client::connect(cli_cfg.etcd_endpoints.clone(), None),
+                etcd_pool_entry.client(),
             )
             .await
             .map_err(|_| anyhow::anyhow!(
@@ -3005,13 +3034,14 @@ impl KvClient {
     /// on the caller to keep the pointed-to memory alive until the async call completes.
     ///
     /// The backend encoding/copy runs on the Rust runtime without holding the Python GIL.
-    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, callback=None))]
+    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exists=false, callback=None))]
     fn put(
         &self,
         key: &str,
         ptrs: Vec<(u8, u64, u32, u64, u32, Option<u32>)>,
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
+        reject_if_exists: bool,
         callback: Option<PyObject>,
         py: Python,
     ) -> PyObject {
@@ -3021,6 +3051,7 @@ impl KvClient {
             ptrs: Vec<(u8, usize, u32, u64, u32, Option<u32>)>,
             lease_id: Option<u64>,
             reject_if_inflight_same_key: bool,
+            reject_if_exists: bool,
             callback: Option<PyObject>,
             py: Python,
         ) -> ApiResult<PyObject> {
@@ -3048,6 +3079,9 @@ impl KvClient {
                 }
                 if reject_if_inflight_same_key {
                     o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
+                }
+                if reject_if_exists {
+                    o.0.push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExists);
                 }
                 o
             };
@@ -3108,6 +3142,7 @@ impl KvClient {
             ptrs_owned,
             lease_id,
             reject_if_inflight_same_key,
+            reject_if_exists,
             callback,
             py,
         )
@@ -3115,13 +3150,14 @@ impl KvClient {
     }
 
     /// Put a key-value pair and wait for completion before returning.
-    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false))]
+    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exists=false))]
     fn put_blocking(
         &self,
         key: &str,
         ptrs: Vec<(u8, u64, u32, u64, u32, Option<u32>)>,
         lease_id: Option<u64>,
         reject_if_inflight_same_key: bool,
+        reject_if_exists: bool,
         py: Python,
     ) -> PyObject {
         fn put_blocking_inner(
@@ -3130,6 +3166,7 @@ impl KvClient {
             ptrs: Vec<(u8, usize, u32, u64, u32, Option<u32>)>,
             lease_id: Option<u64>,
             reject_if_inflight_same_key: bool,
+            reject_if_exists: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if ptrs.len() > (u32::MAX as usize) {
@@ -3160,6 +3197,11 @@ impl KvClient {
                 put_opts
                     .0
                     .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfInflightSameKey);
+            }
+            if reject_if_exists {
+                put_opts
+                    .0
+                    .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExists);
             }
             let result = match py.allow_threads(|| {
                 runtime.run_async_from_sync(async {
@@ -3208,6 +3250,7 @@ impl KvClient {
             ptrs_owned,
             lease_id,
             reject_if_inflight_same_key,
+            reject_if_exists,
             py,
         )
         .into_py_object(py)
@@ -3229,53 +3272,20 @@ impl KvClient {
 
             let future = async move {
                 tracing::debug!("KvClient.get future start: key={}", key);
-                let result = framework.kv_get(&key).await;
-                tracing::debug!("KvClient.get framework.kv_get returned: key={}", key);
+                let result = framework.kv_get_with_source(&key).await;
+                tracing::debug!(
+                    "KvClient.get framework.kv_get_with_source returned: key={}",
+                    key
+                );
                 match result {
-                    Ok(KvGetResult::Owner(Some(rust_holder))) => Python::with_gil(|py| {
-                        tracing::debug!(
-                            "KvClient.get entering Python::with_gil owner path: key={}",
-                            key
-                        );
-                        let mem_holder = MemHolder::new(rust_holder);
-                        let py_result = match mem_holder.into_py_mem_holder(py) {
-                            ApiResult::Success(py_holder) => {
-                                if let Some(cb) = callback {
-                                    let args = PyTuple::new_bound(py, &[py_holder.bind(py)]);
-                                    match cb.call1(py, args) {
-                                        Ok(result) => ApiResult::new_success(result),
-                                        Err(e) => ApiResult::new_error(new_general_error(
-                                            py,
-                                            &format!("Callback failed: {}", e),
-                                        )),
-                                    }
-                                } else {
-                                    ApiResult::new_success(py_holder.into_any())
-                                }
-                            }
-                            err => err,
-                        };
-                        tracing::debug!(
-                            "KvClient.get leaving Python::with_gil owner path: key={}",
-                            key
-                        );
-                        py_result
-                    }),
-                    Ok(KvGetResult::Owner(None)) => Python::with_gil(|py| {
-                        ApiResult::new_error(new_key_not_found_error(
-                            py,
-                            &format!("Key not found: {}", key),
-                            Some(&key),
-                        ))
-                    }),
-                    Ok(KvGetResult::External(Some(external_mem_holder))) => {
+                    Ok(KvGetResultWithSource::Owner(Some((rust_holder, source_kind)))) => {
                         Python::with_gil(|py| {
                             tracing::debug!(
-                                "KvClient.get entering Python::with_gil external path: key={}",
+                                "KvClient.get entering Python::with_gil owner path: key={}",
                                 key
                             );
-                            let pyo3_external = ExternalMemHolder::new(external_mem_holder);
-                            let py_result = match pyo3_external.into_py_mem_holder(py) {
+                            let mem_holder = MemHolder::new(rust_holder, source_kind);
+                            let py_result = match mem_holder.into_py_mem_holder(py) {
                                 ApiResult::Success(py_holder) => {
                                     if let Some(cb) = callback {
                                         let args = PyTuple::new_bound(py, &[py_holder.bind(py)]);
@@ -3293,13 +3303,53 @@ impl KvClient {
                                 err => err,
                             };
                             tracing::debug!(
-                                "KvClient.get leaving Python::with_gil external path: key={}",
+                                "KvClient.get leaving Python::with_gil owner path: key={}",
                                 key
                             );
                             py_result
                         })
                     }
-                    Ok(KvGetResult::External(None)) => Python::with_gil(|py| {
+                    Ok(KvGetResultWithSource::Owner(None)) => Python::with_gil(|py| {
+                        ApiResult::new_error(new_key_not_found_error(
+                            py,
+                            &format!("Key not found: {}", key),
+                            Some(&key),
+                        ))
+                    }),
+                    Ok(KvGetResultWithSource::External(Some((
+                        external_mem_holder,
+                        source_kind,
+                    )))) => Python::with_gil(|py| {
+                        tracing::debug!(
+                            "KvClient.get entering Python::with_gil external path: key={}",
+                            key
+                        );
+                        let pyo3_external =
+                            ExternalMemHolder::new(external_mem_holder, source_kind);
+                        let py_result = match pyo3_external.into_py_mem_holder(py) {
+                            ApiResult::Success(py_holder) => {
+                                if let Some(cb) = callback {
+                                    let args = PyTuple::new_bound(py, &[py_holder.bind(py)]);
+                                    match cb.call1(py, args) {
+                                        Ok(result) => ApiResult::new_success(result),
+                                        Err(e) => ApiResult::new_error(new_general_error(
+                                            py,
+                                            &format!("Callback failed: {}", e),
+                                        )),
+                                    }
+                                } else {
+                                    ApiResult::new_success(py_holder.into_any())
+                                }
+                            }
+                            err => err,
+                        };
+                        tracing::debug!(
+                            "KvClient.get leaving Python::with_gil external path: key={}",
+                            key
+                        );
+                        py_result
+                    }),
+                    Ok(KvGetResultWithSource::External(None)) => Python::with_gil(|py| {
                         ApiResult::new_error(new_key_not_found_error(
                             py,
                             &format!("Key not found: {}", key),
@@ -3354,31 +3404,27 @@ impl KvClient {
             let framework = borrow_stable_owner(&framework);
 
             let result = match py.allow_threads(|| {
-                runtime.run_async_from_sync(async { framework.kv_get(&key).await })
+                runtime.run_async_from_sync(async { framework.kv_get_with_source(&key).await })
             }) {
                 Ok(v) => v,
                 Err(e) => Err(anyhow::anyhow!("runtime bridge failed: {}", e).into()),
             };
 
             match result {
-                Ok(KvGetResult::Owner(Some(rust_holder))) => {
-                    let mem_holder = MemHolder::new(rust_holder);
+                Ok(KvGetResultWithSource::Owner(Some((rust_holder, source_kind)))) => {
+                    let mem_holder = MemHolder::new(rust_holder, source_kind);
                     mem_holder.into_py_mem_holder(py)
                 }
-                Ok(KvGetResult::Owner(None)) => ApiResult::new_error(new_key_not_found_error(
-                    py,
-                    &format!("Key not found: {}", key),
-                    Some(&key),
-                )),
-                Ok(KvGetResult::External(Some(external_mem_holder))) => {
-                    let pyo3_external = ExternalMemHolder::new(external_mem_holder);
+                Ok(KvGetResultWithSource::Owner(None)) => ApiResult::new_error(
+                    new_key_not_found_error(py, &format!("Key not found: {}", key), Some(&key)),
+                ),
+                Ok(KvGetResultWithSource::External(Some((external_mem_holder, source_kind)))) => {
+                    let pyo3_external = ExternalMemHolder::new(external_mem_holder, source_kind);
                     pyo3_external.into_py_mem_holder(py)
                 }
-                Ok(KvGetResult::External(None)) => ApiResult::new_error(new_key_not_found_error(
-                    py,
-                    &format!("Key not found: {}", key),
-                    Some(&key),
-                )),
+                Ok(KvGetResultWithSource::External(None)) => ApiResult::new_error(
+                    new_key_not_found_error(py, &format!("Key not found: {}", key), Some(&key)),
+                ),
                 Err(e) => {
                     let err_obj = crate::error::py_error_from_kv_error(py, &e, "Get failed");
                     ApiResult::new_error(err_obj)
@@ -4233,6 +4279,8 @@ fn fluxon_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MemHolder>()?;
     m.add_class::<ExternalMemHolder>()?;
     m.add_class::<FluxonFsAgent>()?;
+    #[cfg(feature = "fluxon_fs_video_ffmpeg")]
+    m.add_class::<FluxonFsVideoReader>()?;
     m.add_class::<MpscContext>()?;
     m.add_class::<MpscProducerHandle>()?;
     m.add_class::<MpscConsumerHandle>()?;

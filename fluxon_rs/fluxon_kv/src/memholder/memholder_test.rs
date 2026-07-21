@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use crate::memholder::lifetime::MemholderManagerTrait;
 use limit_thirdparty::tokio::time::sleep;
 
 use crate::config::{
@@ -101,6 +100,7 @@ fn new_client_config_with_size(
         large_file_paths: crate::config::LargeFilePaths {
             paths: vec![format!("/tmp/kvcache_large/{}", instance_key)],
         },
+        ssd_storage: None,
         test_spec_config: TestSpecConfig::default(),
     }
 }
@@ -134,6 +134,7 @@ fn new_zero_contribution_client_config(
         },
         share_mem_path: format!("/tmp/kvcache_shared_memory/{}", owner_instance_key),
         large_file_paths: crate::config::LargeFilePaths { paths: Vec::new() },
+        ssd_storage: None,
         test_spec_config: TestSpecConfig::default(),
     }
 }
@@ -176,9 +177,8 @@ fn capture_master_holding_allocation(
         .master_kv_router()
         .inner()
         .get_holding
-        .inner_map()
         .get(&key)
-        .map(|entry| Arc::downgrade(&entry.value().allocation))
+        .map(|holding| Arc::downgrade(&holding.allocation))
 }
 
 // Helper: drive the same master-side local replica eviction path Moka uses, but
@@ -192,10 +192,12 @@ fn evict_all_replicas_for_key(master_view: &MasterKvRouterView, key: &str) -> us
             .get(key)
             .map(|route| {
                 let node_ids = route
-                    .nodes_replicas
+                    .node_replicas
                     .read()
-                    .keys()
-                    .cloned()
+                    .iter()
+                    .filter_map(|(node_id, replicas)| {
+                        replicas.memory.is_some().then(|| node_id.clone())
+                    })
                     .collect::<Vec<_>>();
                 (route.put_id, node_ids)
             })
