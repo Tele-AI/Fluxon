@@ -136,26 +136,31 @@ class MooncakeStore(KvClient):
         self._renew_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._closed = False
+        self._skip_get_size_on_get = config.mooncake_spec_skip_get_size_on_get
         # config = self._config
         device_name = ""
         if config.protocol_type == "rdma":
             device_name = config.protocol_rdma_device_names
 
-        server_name = config.instance_key
+        server_name = config.mooncake_spec_local_hostname
 
         logging.info(
             "=============== Mooncake store setup args ===============\n"
+            f"instance_key: {config.instance_key}\n"
             f"server_name: {server_name}\n"
             f"metadata_server: {config.mooncake_spec_metadata_server}\n"
             f"master_server_address: {config.mooncake_spec_master_server_address}\n"
             f"contribute_to_cluster_pool_size: {config.contribute_to_cluster_pool_size}\n"
             f"local_buffer_size: {config.mooncake_spec_local_buffer_size}\n"
+            f"enable_ssd_offload: {config.mooncake_spec_enable_ssd_offload}\n"
+            f"ssd_offload_path: {config.mooncake_spec_ssd_offload_path}\n"
+            f"skip_get_size_on_get: {config.mooncake_spec_skip_get_size_on_get}\n"
             f"protocol_type: {config.protocol_type}\n"
             f"device_name: {device_name}\n"
             f"==============================================================\n"
         )
 
-        retcode = self._store.setup(
+        setup_args = [
             server_name,
             config.mooncake_spec_metadata_server,
             config.contribute_to_cluster_pool_size["dram"],  # Use DRAM only
@@ -163,7 +168,19 @@ class MooncakeStore(KvClient):
             config.protocol_type,
             device_name,
             config.mooncake_spec_master_server_address,
-        )
+        ]
+        if (
+            config.mooncake_spec_enable_ssd_offload
+            or config.mooncake_spec_ssd_offload_path
+        ):
+            setup_args.extend(
+                [
+                    None,
+                    config.mooncake_spec_enable_ssd_offload,
+                    config.mooncake_spec_ssd_offload_path,
+                ]
+            )
+        retcode = self._store.setup(*setup_args)
         if retcode != 0:
             raise RuntimeError(f"Mooncake store setup failed: retcode={retcode}")
 
@@ -346,6 +363,7 @@ class MooncakeStore(KvClient):
                     max_calls=1,
                     period=5,
                 )
+        reject_if_exists = bool(opts.reject_if_exists) if opts is not None else False
 
         if not self._initialized:
             return Result.new_error(
@@ -359,7 +377,7 @@ class MooncakeStore(KvClient):
 
         def put_operation(key: str, values: Tuple[bytes, ...]):
             """
-            Put operations explicitly remove old data before writing new data.
+            Put a value once, removing old data first only when overwrite is enabled.
 
             Args:
                 key(str): The input key.
@@ -380,29 +398,30 @@ class MooncakeStore(KvClient):
                 return values_debug
             
             def try_put(key: str, values: Tuple[bytes, ...]) -> Result[OkNone, ApiError]:
-                """Try one force-delete-then-put Mooncake write attempt."""
+                """Try one Mooncake write attempt."""
                 try:
-                    with self._rwlock.read_lock():
-                        remove_retcode = self._store.remove(key, True)
+                    if not reject_if_exists:
+                        with self._rwlock.read_lock():
+                            remove_retcode = self._store.remove(key, True)
 
-                    logging.debug(
-                        f"[put_operation] Force remove retcode: {remove_retcode} for key: {key}"
-                    )
-                    if remove_retcode != 0:
-                        remove_error = try_new_error_from_mooncake(
-                            remove_retcode,
-                            f"Remove operation failed for key '{key}'",
-                            key=key,
+                        logging.debug(
+                            f"[put_operation] Force remove retcode: {remove_retcode} for key: {key}"
                         )
-                        if not isinstance(remove_error, KeyNotFoundError):
-                            logging.warning(
-                                "=============== Mooncake store delete-before-put failed ===============\n"
-                                f"key: {key}\n"
-                                f"values: {debug_values()}\n"
-                                f"error: {remove_error}\n"
-                                "==============================================================\n"
+                        if remove_retcode != 0:
+                            remove_error = try_new_error_from_mooncake(
+                                remove_retcode,
+                                f"Remove operation failed for key '{key}'",
+                                key=key,
                             )
-                            return Result.new_error(remove_error)
+                            if not isinstance(remove_error, KeyNotFoundError):
+                                logging.warning(
+                                    "=============== Mooncake store delete-before-put failed ===============\n"
+                                    f"key: {key}\n"
+                                    f"values: {debug_values()}\n"
+                                    f"error: {remove_error}\n"
+                                    "==============================================================\n"
+                                )
+                                return Result.new_error(remove_error)
 
                     with self._rwlock.read_lock():
                         if len(values) == 1:
@@ -503,15 +522,28 @@ class MooncakeStore(KvClient):
                 try:
                     # https://github.com/kvcache-ai/Mooncake/blob/e475a369fe45d528135b2b318d7e9464e1846222/docs/source/mooncake-store-api/python-binding.md?plain=1#L682
                     with self._rwlock.read_lock():
-                        datasize = self._store.get_size(key)
-                        if datasize < 0:
-                            logging.warning(f"[get_operation] Get failed with retcode:{datasize}")
+                        if self._skip_get_size_on_get:
+                            data: Optional[bytes] = self._store.get(key)
+                            if data is None:
+                                return Result.new_error(
+                                    KeyNotFoundError(
+                                        f"Get failed for key '{key}': Mooncake returned no bytes",
+                                        details={"key": key},
+                                        key=key,
+                                    )
+                                )
+                            mem_holder = SimpleMemHolder(data)
+                            return Result.new_ok(mem_holder)
+                        else:
+                            datasize = self._store.get_size(key)
+                            if datasize < 0:
+                                logging.warning(f"[get_operation] Get failed with retcode:{datasize}")
 
-                            return Result.new_error(
-                                try_new_error_from_mooncake(
-                                    datasize, f"Get failed for key '{key}'"))
-                        logging.debug("[get_operation] The key exists.")
-                        data: Optional[bytes] = self._store.get(key)
+                                return Result.new_error(
+                                    try_new_error_from_mooncake(
+                                        datasize, f"Get failed for key '{key}'"))
+                            logging.debug("[get_operation] The key exists.")
+                            data = self._store.get(key)
 
                     # mooncake store always return bytes
                     assert data is not None, "Data should have bytes after exists checking!"
@@ -547,6 +579,47 @@ class MooncakeStore(KvClient):
         if not get_result.is_ok():
             return Result.new_error(get_result.unwrap_error())
         return get_result.unwrap().wait()
+
+    def get_buffer_blocking(self, key: str) -> Result[Any, ApiError]:
+        """Return Mooncake's lifetime-bound native host buffer for a key."""
+        if not self._initialized:
+            return Result.new_error(
+                GeneralError(
+                    message="Store not initialized when get_buffer_blocking(). Call setup() first."
+                )
+            )
+
+        def try_get_buffer(buffer_key: str) -> Result[Any, ApiError]:
+            try:
+                with self._rwlock.read_lock():
+                    buffer_handle = self._store.get_buffer(buffer_key)
+                if buffer_handle is None:
+                    return Result.new_error(
+                        KeyNotFoundError(
+                            f"Get failed for key '{buffer_key}': Mooncake returned no buffer",
+                            details={"key": buffer_key},
+                            key=buffer_key,
+                        )
+                    )
+                return Result.new_ok(buffer_handle)
+            except Exception as exc:
+                return Result.new_error(exception_to_error(exc))
+
+        return self.retry_operation(try_get_buffer, key)
+
+    def _benchmark_offload_rpc_read_count(self) -> int:
+        """Return Mooncake's cumulative peer offload-RPC read count."""
+        if not self._initialized:
+            raise RuntimeError(
+                "Store not initialized when reading the benchmark offload counter"
+            )
+        count = self._store.get_offload_rpc_read_count()
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise TypeError(
+                "Mooncake get_offload_rpc_read_count() must return a non-negative int; "
+                f"got {count!r}"
+            )
+        return int(count)
 
     
     def get_size(self, key: str) -> Result[int, ApiError]:

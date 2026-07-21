@@ -32,6 +32,41 @@ def _load_module(script_name: str):
 
 
 class TestTopAttentionMqChannelContract(unittest.TestCase):
+    def test_mpmc_rebind_waits_for_ready_progress_and_process_exit(self) -> None:
+        source = (
+            REPO_ROOT
+            / "fluxon_py"
+            / "tests"
+            / "test_api_chan_mpmc"
+            / "test_rebind_client.py"
+        ).read_text(encoding="utf-8")
+        controller = source[source.index("def test_mpmc_rebind_client()") :]
+        initial_ready = controller.index(
+            '_wait_for_worker_state(\n                    process_index,\n                    "producer"'
+        )
+        active_loops = controller.index("for i in range(LOOPS - 1):")
+
+        self.assertLess(initial_ready, active_loops)
+        self.assertIn("_wait_for_producer_progress(process_index, i)", controller)
+        self.assertIn("_wait_for_producer_pause_ack(process_index, paused=True)", controller)
+        self.assertIn("_wait_for_process_exit(", controller)
+        self.assertNotIn(
+            'status = _etcd_get(f"/test_mpmc_consumer/{current_consumer}")',
+            controller,
+        )
+        self.assertNotIn("os._exit(", source)
+
+        producer = source[
+            source.index("def run_producer(") : source.index("def run_consumer(")
+        ]
+        consumer = source[
+            source.index("def run_consumer(") : source.index(
+                "def test_mpmc_rebind_client()"
+            )
+        ]
+        self.assertLess(producer.index("_close_endpoint("), producer.index("release(env, store_key)"))
+        self.assertLess(consumer.index("_close_endpoint("), consumer.index("release(env, store_key)"))
+
     def test_mq_channel_wrappers_accept_case_config_and_run_script_processes(self) -> None:
         cases = {
             "_mq_mpsc.py": (

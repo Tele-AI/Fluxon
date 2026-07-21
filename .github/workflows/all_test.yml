@@ -54,6 +54,8 @@ jobs:
             protobuf-compiler \
             python3-venv \
             rsync
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
 
       - name: Verify Docker availability
         run: |
@@ -87,6 +89,7 @@ jobs:
               --skip-dispatch \
               --skip-start-testbed \
               --skip-runner \
+              --cleanup-pack-runtime-after-success \
               --print-generated
 
       - name: Archive Fluxon CI release
@@ -214,6 +217,7 @@ jobs:
               --suite-path "$RUNNER_TEMP/ci_test_list.ci.yaml" \
               --print-generated \
               --testbed-hostworkdir "$RUNNER_TEMP/fluxon_deploy" \
+              --cleanup-successful-case-artifacts \
               --skip-pack
           rc=$?
           if [ "$rc" -eq 0 ]; then
@@ -225,7 +229,7 @@ jobs:
           exit "$rc"
 
       - name: Normalize ci_2_virt_node debug artifact permissions
-        if: ${{ always() }}
+        if: ${{ failure() }}
         run: |
           chmod -R a+rX .dever/ci_2_virt_node || true
           find .dever/ci_2_virt_node -type f -name '*.yaml' -exec chmod a+r {} + || true
@@ -258,7 +262,7 @@ jobs:
           path: ${{ runner.temp }}/codex-failure-context/**
 
       - name: Upload ci_2_virt_node debug artifacts
-        if: ${{ always() }}
+        if: ${{ failure() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-2-virt-node-debug-${{ github.sha }}

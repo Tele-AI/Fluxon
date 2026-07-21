@@ -6,7 +6,7 @@ image: fluxon_quick_start:0.2.1
 # English note:
 # - fluxon-deployer reads manifests from hostworkdir (outside this repo).
 # - Mirroring generated DaemonSet YAMLs prevents "repo output updated but deployer still applies stale YAMLs".
-gen_k8s_daemonset_mirror_outdir: /mnt/nvme0/store_team_dev/fluxon_deploy/gen_k8s_daemonset
+gen_k8s_daemonset_mirror_outdir: /tmp/fluxon-example/deploy/gen_k8s_daemonset
 
 cluster_nodes:
   - hostname: example-node-a
@@ -302,7 +302,7 @@ service:
       p2p_listen_port: 31100
       network:
         subnet_whitelist:
-          - "192.168.151.0/24"
+          - "192.0.2.0/24"
       monitoring:
         prometheus_base_url: "${FLUXON_PROMETHEUS_BASE_URL}"
         prom_remote_write_url:

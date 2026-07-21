@@ -1,5 +1,5 @@
-use etcd_client as etcd;
 use fluxon_mq::lease_manager::{LeaseBackendUid, LeaseRegisterKind};
+use fluxon_util::etcd::etcd_clients_pool;
 use fluxon_util::lease_manager::GLOBAL_LM;
 use fluxon_util::lease_manager::snapshot_active_lease_debug as lm_snapshot_active_lease_debug;
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
@@ -71,7 +71,8 @@ impl LeaseManagerHandle {
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
                     let uid = LeaseBackendUid::etcd_from(endpoints.clone());
-                    let mut client = etcd::Client::connect(endpoints, None).await.map_err(|e| {
+                    let etcd_pool_entry = etcd_clients_pool().acquire(endpoints);
+                    let mut client = etcd_pool_entry.client().await.map_err(|e| {
                         anyhow::anyhow!("failed to connect etcd when allocating lease: {:?}", e)
                     })?;
                     let resp = client.lease_grant(ttl_seconds, None).await?;

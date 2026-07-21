@@ -11,10 +11,11 @@
 
 use crate::cluster_manager::ClusterManagerRdmaControlInit;
 use crate::config::{
-    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, LargeFilePaths, MasterConfig,
-    MonitoringConfig, ProtocolConfig, ProtocolType, TestSpecConfig, TestSpecTransportMode,
-    TransferEngineType,
+    ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, KvSsdStorageConfig, LargeFilePaths,
+    MasterConfig, MonitoringConfig, ProtocolConfig, ProtocolType, TestSpecConfig,
+    TestSpecTransportMode, TransferEngineType,
 };
+use crate::master_kv_router::msg_pack::GetSourceKind;
 use crate::run_master_with_test_overrides;
 use crate::{ClientRunTestOverrides, MasterRunTestOverrides, run_client_with_test_overrides};
 // external client runs via run_client when contribution is zero
@@ -39,6 +40,8 @@ const CLIENT_COMMUNICATION_VALUE: &[u8] = b"message_from_client1_to_client2";
 const TRANSFER_DATA_PROBE_VALUE_LEN: usize = 256 * 1024;
 const KV_TEST_TRANSFER_PROBE_IO_TIMEOUT_SECS: u64 = 10;
 const KV_TEST_SHUTDOWN_TIMEOUT_SECS: u64 = 60;
+const KV_TEST_SSD_STORAGE_BYTES: u64 = 64 * 1024 * 1024;
+const KV_TEST_STORAGE_PROFILE_SSD_ROUTE_TIMEOUT_SECS: u64 = 30;
 
 fn kv_test_run_scope() -> &'static str {
     static RUN_SCOPE: OnceLock<String> = OnceLock::new();
@@ -611,6 +614,7 @@ struct KvTestClientOptions {
     enable_transfer_rpc_fast_path: Option<bool>,
     contribute_to_cluster_pool_size: Option<ContributeToClusterPoolSize>,
     share_mem_path: Option<String>,
+    ssd_storage: Option<KvSsdStorageConfig>,
     etcd_mode: Option<KvTestEtcdMode>,
 }
 
@@ -643,11 +647,49 @@ impl KvTestClientOptions {
                 .share_mem_path
                 .clone()
                 .or_else(|| self.share_mem_path.clone()),
+            ssd_storage: overrides
+                .ssd_storage
+                .clone()
+                .or_else(|| self.ssd_storage.clone()),
             etcd_mode: overrides
                 .etcd_mode
                 .clone()
                 .or_else(|| self.etcd_mode.clone()),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KvTestStorageProfile {
+    Memory,
+    Ssd,
+    MemorySsd,
+}
+
+impl KvTestStorageProfile {
+    fn round_suffix(self) -> &'static str {
+        match self {
+            Self::Memory => "",
+            Self::Ssd => "_ssd",
+            Self::MemorySsd => "_memory_ssd",
+        }
+    }
+
+    fn ssd_storage(self) -> Option<KvSsdStorageConfig> {
+        match self {
+            Self::Memory => None,
+            Self::Ssd | Self::MemorySsd => Some(KvSsdStorageConfig {
+                large_limit_size: vec![KV_TEST_SSD_STORAGE_BYTES],
+            }),
+        }
+    }
+
+    fn requires_memory_source(self) -> bool {
+        matches!(self, Self::Memory | Self::MemorySsd)
+    }
+
+    fn requires_ssd_source(self) -> bool {
+        matches!(self, Self::Ssd | Self::MemorySsd)
     }
 }
 
@@ -761,6 +803,7 @@ fn kv_test_round_test_spec_config(round_profile: KvTestRoundProfile) -> TestSpec
 #[derive(Clone, Debug)]
 struct KvTestRoundOptions {
     round_profile: KvTestRoundProfile,
+    storage_profile: KvTestStorageProfile,
     round_name: String,
     cluster_name: String,
     master_port: Option<u16>,
@@ -802,6 +845,10 @@ impl KvTestRoundOptions {
             self.round_name,
             kv_test_run_scope()
         )
+    }
+
+    fn owner_sub_cluster(&self) -> String {
+        format!("{}_owners", self.round_name)
     }
 }
 
@@ -851,7 +898,10 @@ fn default_client_large_file_paths(
     }
 }
 
-fn default_owner_test_client_options(round_profile: KvTestRoundProfile) -> KvTestClientOptions {
+fn default_owner_test_client_options(
+    round_profile: KvTestRoundProfile,
+    storage_profile: KvTestStorageProfile,
+) -> KvTestClientOptions {
     KvTestClientOptions {
         protocol_config: Some(round_profile.protocol_config()),
         transfer_engine: Some(round_profile.owner_transfer_engine()),
@@ -860,6 +910,7 @@ fn default_owner_test_client_options(round_profile: KvTestRoundProfile) -> KvTes
         enable_transfer_rpc_fast_path: Some(round_profile.enable_transfer_rpc_fast_path()),
         contribute_to_cluster_pool_size: Some(default_owner_contribute_to_cluster_pool_size()),
         share_mem_path: None,
+        ssd_storage: storage_profile.ssd_storage(),
         etcd_mode: Some(KvTestEtcdMode::Enabled),
     }
 }
@@ -873,6 +924,7 @@ fn default_master_test_client_options(round_profile: KvTestRoundProfile) -> KvTe
         enable_transfer_rpc_fast_path: Some(round_profile.enable_transfer_rpc_fast_path()),
         contribute_to_cluster_pool_size: None,
         share_mem_path: None,
+        ssd_storage: None,
         etcd_mode: None,
     }
 }
@@ -886,22 +938,31 @@ fn default_external_test_client_options() -> KvTestClientOptions {
         enable_transfer_rpc_fast_path: Some(false),
         contribute_to_cluster_pool_size: Some(default_external_contribute_to_cluster_pool_size()),
         share_mem_path: None,
+        ssd_storage: None,
         etcd_mode: Some(KvTestEtcdMode::Disabled),
     }
 }
 
-fn new_kv_test_round(round_profile: KvTestRoundProfile) -> KvTestRoundOptions {
-    let round_name = round_profile.round_name();
+fn new_kv_test_round(
+    round_profile: KvTestRoundProfile,
+    storage_profile: KvTestStorageProfile,
+) -> KvTestRoundOptions {
+    let round_name = format!(
+        "{}{}",
+        round_profile.round_name(),
+        storage_profile.round_suffix()
+    );
     KvTestRoundOptions {
         round_profile,
-        round_name: round_name.to_string(),
+        storage_profile,
+        round_name: round_name.clone(),
         // Keep each process run on its own cluster namespace so a crashed/aborted previous run
         // cannot poison the next rerun with stale members.
         cluster_name: format!("test_cluster_{}_{}", round_name, kv_test_run_scope()),
         master_port: None,
         step8_master_port: None,
         master_options: default_master_test_client_options(round_profile),
-        owner_client_options: default_owner_test_client_options(round_profile),
+        owner_client_options: default_owner_test_client_options(round_profile, storage_profile),
         external_client_options: default_external_test_client_options(),
     }
 }
@@ -918,15 +979,35 @@ fn default_kv_test_run_options() -> KvTestRunOptions {
             .filter(|item| !item.is_empty())
         {
             let profile = match round_name {
-                "p2p_only" => KvTestRoundProfile::P2pOnly,
+                "p2p_only" => {
+                    rounds.push(new_kv_test_round(
+                        KvTestRoundProfile::P2pOnly,
+                        KvTestStorageProfile::Memory,
+                    ));
+                    continue;
+                }
+                "p2p_only_ssd" => {
+                    rounds.push(new_kv_test_round(
+                        KvTestRoundProfile::P2pOnly,
+                        KvTestStorageProfile::Ssd,
+                    ));
+                    continue;
+                }
+                "p2p_only_memory_ssd" => {
+                    rounds.push(new_kv_test_round(
+                        KvTestRoundProfile::P2pOnly,
+                        KvTestStorageProfile::MemorySsd,
+                    ));
+                    continue;
+                }
                 "rdma_transfer_only" => KvTestRoundProfile::RdmaTransferOnly,
                 "rdma_transfer_with_rpc" => KvTestRoundProfile::RdmaTransferWithRpc,
                 other => panic!(
-                    "unsupported FLUXON_KV_TEST_ROUNDS entry '{}'; expected one of: p2p_only, rdma_transfer_only, rdma_transfer_with_rpc",
+                    "unsupported FLUXON_KV_TEST_ROUNDS entry '{}'; expected one of: p2p_only, p2p_only_ssd, p2p_only_memory_ssd, rdma_transfer_only, rdma_transfer_with_rpc",
                     other
                 ),
             };
-            rounds.push(new_kv_test_round(profile));
+            rounds.push(new_kv_test_round(profile, KvTestStorageProfile::Memory));
         }
         if rounds.is_empty() {
             panic!("FLUXON_KV_TEST_ROUNDS was set but produced no valid rounds");
@@ -936,9 +1017,17 @@ fn default_kv_test_run_options() -> KvTestRunOptions {
 
     KvTestRunOptions {
         rounds: vec![
-            new_kv_test_round(KvTestRoundProfile::P2pOnly),
-            new_kv_test_round(KvTestRoundProfile::RdmaTransferOnly),
-            new_kv_test_round(KvTestRoundProfile::RdmaTransferWithRpc),
+            new_kv_test_round(KvTestRoundProfile::P2pOnly, KvTestStorageProfile::Memory),
+            new_kv_test_round(KvTestRoundProfile::P2pOnly, KvTestStorageProfile::Ssd),
+            new_kv_test_round(KvTestRoundProfile::P2pOnly, KvTestStorageProfile::MemorySsd),
+            new_kv_test_round(
+                KvTestRoundProfile::RdmaTransferOnly,
+                KvTestStorageProfile::Memory,
+            ),
+            new_kv_test_round(
+                KvTestRoundProfile::RdmaTransferWithRpc,
+                KvTestStorageProfile::Memory,
+            ),
         ],
     }
 }
@@ -1021,6 +1110,8 @@ fn build_client_launch(
     let contribute_to_cluster_pool_size = options
         .contribute_to_cluster_pool_size
         .unwrap_or(default_owner_contribute_to_cluster_pool_size());
+    let is_external = contribute_to_cluster_pool_size.dram == 0
+        && contribute_to_cluster_pool_size.vram.is_empty();
     let share_mem_path = options
         .share_mem_path
         .unwrap_or_else(|| format!("/tmp/kvcache_shared_memory/{}", instance_key));
@@ -1042,7 +1133,11 @@ fn build_client_launch(
             enable_transfer_rpc_fast_path: options
                 .enable_transfer_rpc_fast_path
                 .expect("kv_test requires enable_transfer_rpc_fast_path to be set explicitly"),
-            sub_cluster: None,
+            sub_cluster: if is_external {
+                None
+            } else {
+                Some(round.owner_sub_cluster())
+            },
         },
         // English note:
         // kv_test uses a per-instance shared memory path by default so each owner/external share
@@ -1053,6 +1148,7 @@ fn build_client_launch(
             &instance_key,
             &contribute_to_cluster_pool_size,
         ),
+        ssd_storage: options.ssd_storage,
         // Mirror round intent into the generated config so logs and runtime behavior
         // agree on whether this launch is transfer_only vs transfer_with_rpc.
         test_spec_config: kv_test_round_test_spec_config(round.round_profile),
@@ -1579,6 +1675,321 @@ async fn shutdown_framework_with_timeout(label: &str, framework: &crate::Framewo
             );
         }
     }
+}
+
+fn build_storage_profile_probe_value(tag: &str) -> Vec<u8> {
+    const STORAGE_PROFILE_PROBE_VALUE_LEN: usize = 64 * 1024;
+    build_storage_profile_probe_value_with_len(tag, STORAGE_PROFILE_PROBE_VALUE_LEN)
+}
+
+fn build_storage_profile_probe_value_with_len(tag: &str, len: usize) -> Vec<u8> {
+    let pattern = format!("kv_test_storage_profile:{tag}:").into_bytes();
+    let mut value = Vec::with_capacity(len);
+    while value.len() < len {
+        value.extend_from_slice(pattern.as_slice());
+    }
+    value.truncate(len);
+    value
+}
+
+async fn force_evict_memory_replicas_for_storage_probe(
+    master_framework: &crate::Framework,
+    key: &str,
+) {
+    let master_view = master_framework.master_kv_router_view();
+    let deadline =
+        Instant::now() + Duration::from_secs(KV_TEST_STORAGE_PROFILE_SSD_ROUTE_TIMEOUT_SECS);
+    let (put_id, memory_replica_nodes) = loop {
+        if let Some(route) = master_view.master_kv_router().inner().kv_routes.get(key) {
+            let put_id = route.put_id;
+            let memory_replica_nodes = route
+                .node_replicas
+                .read()
+                .iter()
+                .filter_map(|(node_id, replicas)| {
+                    replicas.memory.is_some().then(|| node_id.clone())
+                })
+                .collect::<Vec<_>>();
+            let ssd_replica_count = route
+                .node_replicas
+                .read()
+                .values()
+                .filter(|replicas| replicas.ssd.is_some())
+                .count();
+            if ssd_replica_count > 0 {
+                break (put_id, memory_replica_nodes);
+            }
+        }
+
+        if Instant::now() >= deadline {
+            panic!(
+                "storage profile probe expected at least one SSD replica before memory eviction: key={} timeout={}s",
+                key, KV_TEST_STORAGE_PROFILE_SSD_ROUTE_TIMEOUT_SECS
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
+
+    for node_id in memory_replica_nodes {
+        crate::master_kv_router::delete::evict_one_kv_replica_for_node(
+            &master_view,
+            key.to_string(),
+            node_id.clone(),
+            put_id,
+        )
+        .unwrap_or_else(|code| {
+            panic!(
+                "storage profile probe failed to evict memory replica: key={} node={} put_id=({},{}) code={}",
+                key, node_id, put_id.0, put_id.1, code
+            )
+        });
+    }
+
+    let Some(route) = master_view.master_kv_router().inner().kv_routes.get(key) else {
+        panic!("storage profile probe route disappeared after memory replicas eviction: key={key}");
+    };
+    assert!(
+        route
+            .node_replicas
+            .read()
+            .values()
+            .all(|replicas| replicas.memory.is_none()),
+        "storage profile probe memory replicas still exist after eviction: key={}",
+        key
+    );
+    assert!(
+        route
+            .node_replicas
+            .read()
+            .values()
+            .any(|replicas| replicas.ssd.is_some()),
+        "storage profile probe SSD replica disappeared after memory replicas eviction: key={}",
+        key
+    );
+}
+
+async fn assert_owner_get_source_kind(
+    reader_framework: &crate::Framework,
+    key: &str,
+    expected_value: &[u8],
+    expected_source_kind: GetSourceKind,
+) {
+    let reader_view = reader_framework.client_kv_api_view().clone();
+    let reader_api = reader_view.client_kv_api();
+    let (mem_holder, get_info) = reader_api
+        .inner()
+        .get(key)
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "storage profile probe get failed: key={} expected_source={:?} err={}",
+                key, expected_source_kind, err
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "storage profile probe get returned None: key={} expected_source={:?}",
+                key, expected_source_kind
+            )
+        });
+    assert_eq!(
+        mem_holder.bytes(),
+        expected_value,
+        "storage profile probe value mismatch for key={key}"
+    );
+    let Some(get_info) = get_info else {
+        panic!(
+            "storage profile probe expected remote get info for key={} source={:?}",
+            key, expected_source_kind
+        );
+    };
+    assert_eq!(
+        get_info.source_kind(),
+        expected_source_kind,
+        "storage profile probe source kind mismatch for key={key}"
+    );
+}
+
+fn invalidate_ssd_route_len_for_storage_probe(master_framework: &crate::Framework, key: &str) {
+    let master_view = master_framework.master_kv_router_view();
+    let route = master_view
+        .master_kv_router()
+        .inner()
+        .kv_routes
+        .get(key)
+        .unwrap_or_else(|| panic!("stale SSD route probe is missing key={key}"));
+    let mut node_replicas = route.node_replicas.write();
+    for replicas in node_replicas.values_mut() {
+        if let Some(ssd) = replicas.ssd.as_mut() {
+            ssd.len = ssd
+                .len
+                .checked_add(1)
+                .expect("stale SSD route probe length must not overflow");
+            return;
+        }
+    }
+    panic!("stale SSD route probe found no SSD replica for key={key}");
+}
+
+async fn assert_stale_ssd_route_retries_to_miss(
+    master_framework: &crate::Framework,
+    reader_framework: &crate::Framework,
+    key: &str,
+) {
+    let reader_view = reader_framework.client_kv_api_view().clone();
+    let result = reader_view
+        .client_kv_api()
+        .inner()
+        .get(key)
+        .await
+        .unwrap_or_else(|err| {
+            panic!("stale SSD route probe returned an error: key={key} err={err}")
+        });
+    assert!(
+        result.is_none(),
+        "stale SSD route probe must retry and converge to a miss: key={key}"
+    );
+    assert!(
+        !master_framework
+            .master_kv_router_view()
+            .master_kv_router()
+            .inner()
+            .kv_routes
+            .contains_key(key),
+        "stale SSD route probe must remove the empty route: key={key}"
+    );
+}
+
+async fn run_non_rdma_storage_profile_coverage(
+    round: &KvTestRoundOptions,
+    master_framework: &crate::Framework,
+    writer_framework: &crate::Framework,
+) -> Option<Arc<crate::Framework>> {
+    if round.round_profile != KvTestRoundProfile::P2pOnly {
+        return None;
+    }
+
+    info!(
+        "📋 Storage profile coverage: round={} storage={:?}",
+        round.round_name, round.storage_profile
+    );
+
+    let writer_view = writer_framework.client_kv_api_view().clone();
+    let writer_api = writer_view.client_kv_api();
+    let storage_probe_put_opts = || {
+        crate::client_kv_api::PutOptionalArgs(vec![
+            crate::client_kv_api::PutOptionalArg::PreferredSubCluster(round.owner_sub_cluster()),
+        ])
+    };
+
+    let memory_key = format!("storage_profile_memory_key_{}", round.round_name);
+    let memory_value = build_storage_profile_probe_value(&format!("{}:memory", round.round_name));
+    if round.storage_profile.requires_memory_source() {
+        writer_api
+            .inner()
+            .put(&memory_key, &memory_value, storage_probe_put_opts())
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "storage profile memory probe put failed: key={} err={}",
+                    memory_key, err
+                )
+            });
+    }
+
+    let ssd_key = format!("storage_profile_ssd_key_{}", round.round_name);
+    let ssd_value = build_storage_profile_probe_value_with_len(
+        &format!("{}:ssd", round.round_name),
+        64 * 1024 + 123,
+    );
+    let local_small_ssd_key = format!("storage_profile_local_small_ssd_key_{}", round.round_name);
+    let local_small_ssd_value = build_storage_profile_probe_value_with_len(
+        &format!("{}:local_small_ssd", round.round_name),
+        123,
+    );
+    let stale_ssd_key = format!("storage_profile_stale_ssd_key_{}", round.round_name);
+    let stale_ssd_value = build_storage_profile_probe_value_with_len(
+        &format!("{}:stale_ssd", round.round_name),
+        64 * 1024 + 321,
+    );
+    if round.storage_profile.requires_ssd_source() {
+        writer_api
+            .inner()
+            .put(&ssd_key, &ssd_value, storage_probe_put_opts())
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "storage profile SSD probe put failed: key={} err={}",
+                    ssd_key, err
+                )
+            });
+        force_evict_memory_replicas_for_storage_probe(master_framework, &ssd_key).await;
+
+        writer_api
+            .inner()
+            .put(
+                &local_small_ssd_key,
+                &local_small_ssd_value,
+                storage_probe_put_opts(),
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "storage profile local small SSD probe put failed: key={} err={}",
+                    local_small_ssd_key, err
+                )
+            });
+        force_evict_memory_replicas_for_storage_probe(master_framework, &local_small_ssd_key).await;
+
+        writer_api
+            .inner()
+            .put(&stale_ssd_key, &stale_ssd_value, storage_probe_put_opts())
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "storage profile stale SSD probe put failed: key={} err={}",
+                    stale_ssd_key, err
+                )
+            });
+        force_evict_memory_replicas_for_storage_probe(master_framework, &stale_ssd_key).await;
+        invalidate_ssd_route_len_for_storage_probe(master_framework, &stale_ssd_key);
+    }
+
+    let reader_launch = new_client_launch(round, "test_storage_profile_reader", None);
+    let (reader_framework, _) = run_kv_test_client(reader_launch)
+        .await
+        .expect("Failed to start storage profile reader");
+
+    sleep(Duration::from_secs(10)).await;
+
+    if round.storage_profile.requires_memory_source() {
+        assert_owner_get_source_kind(
+            &reader_framework,
+            &memory_key,
+            &memory_value,
+            GetSourceKind::Memory,
+        )
+        .await;
+    }
+    if round.storage_profile.requires_ssd_source() {
+        assert_owner_get_source_kind(
+            writer_framework,
+            &local_small_ssd_key,
+            &local_small_ssd_value,
+            GetSourceKind::Ssd,
+        )
+        .await;
+        assert_owner_get_source_kind(&reader_framework, &ssd_key, &ssd_value, GetSourceKind::Ssd)
+            .await;
+        assert_stale_ssd_route_retries_to_miss(master_framework, &reader_framework, &stale_ssd_key)
+            .await;
+    }
+
+    info!(
+        "✅ Storage profile coverage passed: round={} storage={:?}",
+        round.round_name, round.storage_profile
+    );
+    Some(reader_framework)
 }
 
 async fn run_kv_step8(round: &KvTestRoundOptions) {
@@ -2466,10 +2877,10 @@ async fn run_kv_round(round: &KvTestRoundOptions) {
             .kv_routes
             .get(CLIENT_COMMUNICATION_KEY)
         {
-            let replicas = one_kv_nodes_routes.nodes_replicas.read();
+            let replicas = one_kv_nodes_routes.node_replicas.read();
             let active_replica_count = replicas
                 .iter()
-                .filter(|(_, kv_info)| !kv_info.tomb_tag.is_tomb())
+                .filter(|(_, replicas)| !replicas.tomb_tag.is_tomb() && replicas.memory.is_some())
                 .count();
 
             info!(
@@ -2724,6 +3135,9 @@ async fn run_kv_round(round: &KvTestRoundOptions) {
         info!("✅ Key meta cache testing completed");
     }
 
+    let storage_profile_reader_framework =
+        run_non_rdma_storage_profile_coverage(round, &master_framework, &client1_framework).await;
+
     // 清理旧资源
     {
         info!("🧹 Cleaning up resources");
@@ -2746,6 +3160,14 @@ async fn run_kv_round(round: &KvTestRoundOptions) {
             .await
             .unwrap_or_else(|e| panic!("Client 1 framework shutdown failed: {}", e));
         info!("✅ Client 1 framework shutdown successfully");
+
+        if let Some(storage_profile_reader_framework) = storage_profile_reader_framework {
+            shutdown_framework_with_timeout(
+                "storage profile reader",
+                &storage_profile_reader_framework,
+            )
+            .await;
+        }
 
         master_framework
             .shutdown()

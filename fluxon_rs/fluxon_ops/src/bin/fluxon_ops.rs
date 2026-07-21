@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use fluxon_proxy;
 use fluxon_util::{
-    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
+    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, etcd::etcd_clients_pool,
+    fluxon_cli_proxy_desc_etcd_key_v2,
 };
 
 #[derive(Parser)]
@@ -172,15 +173,14 @@ async fn run_serve(config: &Path, workdir: &Path) -> anyhow::Result<()> {
 
     let etcd_key =
         fluxon_cli_proxy_desc_etcd_key_v2(fluxon_ops::OPS_SERVICE_NAME, &cli_cfg.cluster_name);
-    let mut etcd = etcd_client::Client::connect(cli_cfg.etcd_endpoints.clone(), None)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "etcd connect failed while waiting for ops panel: key={} err={}",
-                etcd_key,
-                e
-            )
-        })?;
+    let etcd_pool_entry = etcd_clients_pool().acquire(cli_cfg.etcd_endpoints.clone());
+    let mut etcd = etcd_pool_entry.client().await.map_err(|e| {
+        anyhow::anyhow!(
+            "etcd connect failed while waiting for ops panel: key={} err={}",
+            etcd_key,
+            e
+        )
+    })?;
 
     let ready_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
     loop {

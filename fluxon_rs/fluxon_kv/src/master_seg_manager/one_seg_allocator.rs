@@ -21,7 +21,7 @@ pub struct Allocation {
     allocator: Arc<OneSegAllocator>,
     /// Optional callback invoked when this allocation is dropped.
     /// Used by upper layers to perform side effects (e.g., capacity restoration).
-    on_drop: Option<Box<dyn Fn() + Send + Sync + 'static>>,
+    on_drop: Option<Box<dyn FnOnce() + Send + Sync + 'static>>,
 }
 
 // Custom Debug to avoid requiring Debug on the callback closure.
@@ -76,7 +76,7 @@ impl Allocation {
     /// when this allocation is dropped.
     pub fn set_on_drop<F>(&mut self, f: F)
     where
-        F: Fn() + Send + Sync + 'static,
+        F: FnOnce() + Send + Sync + 'static,
     {
         self.on_drop = Some(Box::new(f));
     }

@@ -138,9 +138,11 @@ class PutOptionalArgs:
     - lease_id: attach the written key to a lease on commit.
     - reject_if_inflight_same_key: ask Fluxon to fail-fast when the same key is already
       being written by another inflight put.
+    - reject_if_exists: create the key only when it does not already exist.
     """
     lease_id: Optional[int] = None
     reject_if_inflight_same_key: bool = False
+    reject_if_exists: bool = False
 
     def support_mooncake(self) -> Tuple[bool, List[str]]:
         """
@@ -150,7 +152,7 @@ class PutOptionalArgs:
             (supported: bool, unsupported_fields: list[str])
 
         Notes:
-            - Mooncake is write-once; currently does not support lease binding.
+            - Mooncake natively supports reject_if_exists and does not support lease binding.
         """
         unsupported: List[str] = []
         if self.lease_id is not None:

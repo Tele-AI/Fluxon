@@ -1021,6 +1021,14 @@ pub struct SegmentDeviceSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageDeviceSnapshot {
+    pub resource_kind: String,
+    pub device: String,
+    pub capacity_bytes: Option<f64>,
+    pub used_bytes: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSnapshot {
     pub node_key: String,
     pub hostname: Option<String>,
@@ -1035,6 +1043,8 @@ pub struct NodeSnapshot {
     pub container_memory_limit_bytes: Option<f64>,
     pub members: Vec<MemberSnapshot>,
     pub segment_devices: Vec<SegmentDeviceSnapshot>,
+    #[serde(default)]
+    pub storage_devices: Vec<StorageDeviceSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1226,6 +1236,7 @@ pub struct OwnerSegmentUsageViewModel {
 
 #[derive(Debug, Clone)]
 pub struct OwnerSegmentDeviceUsageViewModel {
+    pub resource_kind: String,
     pub device: String,
     pub used: String,
     pub cap: String,
@@ -1554,6 +1565,10 @@ pub struct MemberTableRowView {
     pub seg_used_sort: String,
     pub seg_cap_text: String,
     pub seg_cap_sort: String,
+    pub ssd_used_text: String,
+    pub ssd_used_sort: String,
+    pub ssd_cap_text: String,
+    pub ssd_cap_sort: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1567,6 +1582,7 @@ pub struct OwnerSegmentOwnerRowView {
 #[derive(Debug, Clone)]
 pub struct OwnerSegmentDeviceRowView {
     pub owner_id: String,
+    pub resource_kind: String,
     pub device: String,
     pub used: String,
     pub cap: String,
@@ -1732,26 +1748,30 @@ pub fn build_cluster_view_model(snapshot: &ClusterSnapshot) -> ClusterViewModel 
             };
 
             let total_used_bytes =
-                sum_opt_f64_complete(n.segment_devices.iter().map(|d| d.seg_used_bytes));
+                sum_opt_f64_complete(n.storage_devices.iter().map(|d| d.used_bytes));
             let total_cap_bytes =
-                sum_opt_f64_complete(n.segment_devices.iter().map(|d| d.seg_capacity_bytes));
+                sum_opt_f64_complete(n.storage_devices.iter().map(|d| d.capacity_bytes));
             let (total_used, _total_used_status) = fmt_bytes_auto(total_used_bytes, false);
             let (total_cap, _total_cap_status) = fmt_bytes_auto(total_cap_bytes, false);
             let total_util = fmt_util_percent(total_used_bytes, total_cap_bytes);
 
             let mut devices: Vec<OwnerSegmentDeviceUsageViewModel> =
-                Vec::with_capacity(n.segment_devices.len());
-            for d in &n.segment_devices {
-                let (used, _used_status) = fmt_bytes_auto(d.seg_used_bytes, false);
-                let (cap, _cap_status) = fmt_bytes_auto(d.seg_capacity_bytes, false);
+                Vec::with_capacity(n.storage_devices.len());
+            for d in &n.storage_devices {
+                let (used, _used_status) = fmt_bytes_auto(d.used_bytes, false);
+                let (cap, _cap_status) = fmt_bytes_auto(d.capacity_bytes, false);
                 devices.push(OwnerSegmentDeviceUsageViewModel {
+                    resource_kind: d.resource_kind.clone(),
                     device: d.device.clone(),
                     used,
                     cap,
-                    util: fmt_util_percent(d.seg_used_bytes, d.seg_capacity_bytes),
+                    util: fmt_util_percent(d.used_bytes, d.capacity_bytes),
                 });
             }
-            devices.sort_by(|a, b| a.device.cmp(&b.device));
+            devices.sort_by(|a, b| match a.resource_kind.cmp(&b.resource_kind) {
+                std::cmp::Ordering::Equal => a.device.cmp(&b.device),
+                o => o,
+            });
 
             owners.push(OwnerSegmentUsageViewModel {
                 owner_id,
@@ -1847,6 +1867,28 @@ pub fn build_member_table_rows(snapshot: &ClusterSnapshot) -> Vec<MemberTableRow
             .unwrap_or_else(|| "NaN".to_string())
     }
 
+    fn sum_storage_devices_by_kind(
+        devices: &[StorageDeviceSnapshot],
+        resource_kind: &str,
+        use_used_bytes: bool,
+    ) -> Option<f64> {
+        let mut sum = 0f64;
+        let mut seen = false;
+        for d in devices.iter().filter(|d| d.resource_kind == resource_kind) {
+            let value = if use_used_bytes {
+                d.used_bytes
+            } else {
+                d.capacity_bytes
+            };
+            let Some(value) = value else {
+                return None;
+            };
+            sum += value;
+            seen = true;
+        }
+        if seen { Some(sum) } else { None }
+    }
+
     let visible_roles = snapshot.visible_member_roles.as_ref();
     let mut rows: Vec<MemberTableRowView> = Vec::new();
     for node in &snapshot.nodes {
@@ -1882,6 +1924,18 @@ pub fn build_member_table_rows(snapshot: &ClusterSnapshot) -> Vec<MemberTableRow
             let (get_avg_text, _get_avg_status) = fmt_ms_from_us(m.kv_get_latency_mean_us);
             let (seg_used_text, _seg_used_status) = fmt_bytes_auto(m.seg_used_bytes, false);
             let (seg_cap_text, _seg_cap_status) = fmt_bytes_auto(m.seg_capacity_bytes, false);
+            let ssd_used_bytes = if m.role == MemberRole::OwnerClient {
+                sum_storage_devices_by_kind(&node.storage_devices, "kv_ssd", true)
+            } else {
+                None
+            };
+            let ssd_cap_bytes = if m.role == MemberRole::OwnerClient {
+                sum_storage_devices_by_kind(&node.storage_devices, "kv_ssd", false)
+            } else {
+                None
+            };
+            let (ssd_used_text, _ssd_used_status) = fmt_bytes_auto(ssd_used_bytes, false);
+            let (ssd_cap_text, _ssd_cap_status) = fmt_bytes_auto(ssd_cap_bytes, false);
             let pid_text = m
                 .pid
                 .map(|v| v.to_string())
@@ -2003,6 +2057,10 @@ pub fn build_member_table_rows(snapshot: &ClusterSnapshot) -> Vec<MemberTableRow
                 seg_used_sort: sort_value_opt(m.seg_used_bytes),
                 seg_cap_text,
                 seg_cap_sort: sort_value_opt(m.seg_capacity_bytes),
+                ssd_used_text,
+                ssd_used_sort: sort_value_opt(ssd_used_bytes),
+                ssd_cap_text,
+                ssd_cap_sort: sort_value_opt(ssd_cap_bytes),
             });
         }
     }
@@ -2053,10 +2111,9 @@ pub fn build_owner_segment_tables(snapshot: &ClusterSnapshot) -> OwnerSegmentTab
             continue;
         };
 
-        let total_used_bytes =
-            sum_opt_f64_complete(n.segment_devices.iter().map(|d| d.seg_used_bytes));
+        let total_used_bytes = sum_opt_f64_complete(n.storage_devices.iter().map(|d| d.used_bytes));
         let total_cap_bytes =
-            sum_opt_f64_complete(n.segment_devices.iter().map(|d| d.seg_capacity_bytes));
+            sum_opt_f64_complete(n.storage_devices.iter().map(|d| d.capacity_bytes));
         let (total_used, _total_used_status) = fmt_bytes_auto(total_used_bytes, false);
         let (total_cap, _total_cap_status) = fmt_bytes_auto(total_cap_bytes, false);
         let total_util = fmt_util_percent(total_used_bytes, total_cap_bytes);
@@ -2068,27 +2125,180 @@ pub fn build_owner_segment_tables(snapshot: &ClusterSnapshot) -> OwnerSegmentTab
             total_util,
         });
 
-        for d in &n.segment_devices {
-            let (used, _used_status) = fmt_bytes_auto(d.seg_used_bytes, false);
-            let (cap, _cap_status) = fmt_bytes_auto(d.seg_capacity_bytes, false);
+        for d in &n.storage_devices {
+            let (used, _used_status) = fmt_bytes_auto(d.used_bytes, false);
+            let (cap, _cap_status) = fmt_bytes_auto(d.capacity_bytes, false);
             device_rows.push(OwnerSegmentDeviceRowView {
                 owner_id: owner_id.clone(),
+                resource_kind: d.resource_kind.clone(),
                 device: d.device.clone(),
                 used,
                 cap,
-                util: fmt_util_percent(d.seg_used_bytes, d.seg_capacity_bytes),
+                util: fmt_util_percent(d.used_bytes, d.capacity_bytes),
             });
         }
     }
 
     owner_rows.sort_by(|a, b| a.owner_id.cmp(&b.owner_id));
     device_rows.sort_by(|a, b| match a.owner_id.cmp(&b.owner_id) {
-        std::cmp::Ordering::Equal => a.device.cmp(&b.device),
+        std::cmp::Ordering::Equal => match a.resource_kind.cmp(&b.resource_kind) {
+            std::cmp::Ordering::Equal => a.device.cmp(&b.device),
+            o => o,
+        },
         o => o,
     });
 
     OwnerSegmentTablesView {
         owner_rows,
         device_rows,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner_member(member_id: &str) -> MemberSnapshot {
+        MemberSnapshot {
+            member_id: member_id.to_string(),
+            role: MemberRole::OwnerClient,
+            node_start_time: 0,
+            is_side_transfer_worker: false,
+            hostname: None,
+            accessible_ip: None,
+            shared_mem_dir: None,
+            p2p_listen_port: None,
+            is_p2p_relay: false,
+            rdma_runtime_reported: false,
+            rdma_probe_error: None,
+            rdma_devices: Vec::new(),
+            rdma_ports: Vec::new(),
+            rdma_transfer_engine: None,
+            process_pid: None,
+            process_cmd: None,
+            sub_cluster: None,
+            product_uuid: None,
+            node_cpu_usage_percent: None,
+            node_cpu_logical_cores: None,
+            node_memory_usage_bytes: None,
+            node_memory_total_bytes: None,
+            container_memory_usage_bytes: None,
+            container_memory_limit_bytes: None,
+            process_resident_memory_bytes: None,
+            process_cpu_usage_percent: None,
+            tokio_num_workers: None,
+            tokio_alive_tasks: None,
+            tokio_global_queue_depth: None,
+            tokio_busy_percent: None,
+            tokio_max_worker_busy_percent: None,
+            tokio_park_unpark_rate_hz: None,
+            process_net_tx_mbps: None,
+            process_net_rx_mbps: None,
+            kv_put_rps: None,
+            kv_get_rps: None,
+            kv_put_bps: None,
+            kv_get_bps: None,
+            kv_put_latency_mean_us: None,
+            kv_put_latency_p95_us: None,
+            kv_put_latency_p99_us: None,
+            kv_get_latency_mean_us: None,
+            kv_get_latency_p95_us: None,
+            kv_get_latency_p99_us: None,
+            seg_capacity_bytes: None,
+            seg_used_bytes: None,
+            fs_read_rps: None,
+            fs_write_rps: None,
+        }
+    }
+
+    fn minimal_kv_snapshot(node: NodeSnapshot) -> ClusterSnapshot {
+        ClusterSnapshot {
+            cluster_name: "test".to_string(),
+            member_kind: MemberKind::Kv,
+            etcd_endpoints: Vec::new(),
+            prometheus_base_url: "http://127.0.0.1:9090".to_string(),
+            warnings: Vec::new(),
+            visible_member_roles: None,
+            master_id: None,
+            master_network: None,
+            transfer_engine_edges: Vec::new(),
+            kv_peer_network: Vec::new(),
+            rdma_netdev_network: Vec::new(),
+            fs_mount_fs: Vec::new(),
+            shm_files: Vec::new(),
+            fs_export_registry: Vec::new(),
+            fs_mount_registry: Vec::new(),
+            kv_topology_owner_external_max: Vec::new(),
+            kv_topology_machine_external_max: Vec::new(),
+            kv_topology_sub_cluster_owner_owner_max: Vec::new(),
+            nodes: vec![node],
+            mq: None,
+            total_put_rps: None,
+            total_get_rps: None,
+            total_put_bps: None,
+            total_get_bps: None,
+            total_put_latency_mean_us: None,
+            total_put_latency_p95_us: None,
+            total_put_latency_p99_us: None,
+            total_get_latency_mean_us: None,
+            total_get_latency_p95_us: None,
+            total_get_latency_p99_us: None,
+        }
+    }
+
+    #[test]
+    fn owner_storage_tables_include_memory_segment_and_kv_ssd() {
+        let snapshot = minimal_kv_snapshot(NodeSnapshot {
+            node_key: "node-a".to_string(),
+            hostname: None,
+            accessible_ip: None,
+            shared_mem_dir: None,
+            is_p2p_relay: false,
+            node_cpu_usage_percent: None,
+            node_cpu_logical_cores: None,
+            node_memory_usage_bytes: None,
+            node_memory_total_bytes: None,
+            container_memory_usage_bytes: None,
+            container_memory_limit_bytes: None,
+            members: vec![owner_member("owner-a")],
+            segment_devices: Vec::new(),
+            storage_devices: vec![
+                StorageDeviceSnapshot {
+                    resource_kind: "memory_segment".to_string(),
+                    device: "seg0".to_string(),
+                    capacity_bytes: Some(100.0),
+                    used_bytes: Some(40.0),
+                },
+                StorageDeviceSnapshot {
+                    resource_kind: "kv_ssd".to_string(),
+                    device: "dev:1:/ssd".to_string(),
+                    capacity_bytes: Some(900.0),
+                    used_bytes: Some(60.0),
+                },
+            ],
+        });
+
+        let tables = build_owner_segment_tables(&snapshot);
+
+        assert_eq!(tables.owner_rows.len(), 1);
+        assert_eq!(tables.owner_rows[0].owner_id, "owner-a");
+        assert_eq!(tables.owner_rows[0].total_used, "100B");
+        assert_eq!(tables.owner_rows[0].total_cap, "1.0KB");
+        assert_eq!(tables.owner_rows[0].total_util, "10.0%");
+
+        let kinds = tables
+            .device_rows
+            .iter()
+            .map(|row| (row.resource_kind.as_str(), row.device.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![("kv_ssd", "dev:1:/ssd"), ("memory_segment", "seg0")]
+        );
+
+        let rows = build_member_table_rows(&snapshot);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ssd_used_text, "60B");
+        assert_eq!(rows[0].ssd_cap_text, "900B");
     }
 }

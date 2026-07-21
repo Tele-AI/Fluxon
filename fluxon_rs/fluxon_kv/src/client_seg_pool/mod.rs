@@ -226,6 +226,102 @@ fn range_contains(base: u64, size: u64, addr: u64, len: u64) -> bool {
     addr >= base && end <= seg_end
 }
 
+#[derive(Clone, Copy)]
+enum ClientMappedRangeAccess {
+    Readable,
+    Writable,
+}
+
+impl ClientMappedRangeAccess {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Readable => "readable",
+            Self::Writable => "writable",
+        }
+    }
+}
+
+fn mapped_range_contains(
+    rw_base: u64,
+    ro_base: u64,
+    size: u64,
+    addr: u64,
+    len: u64,
+    access: ClientMappedRangeAccess,
+) -> bool {
+    match access {
+        ClientMappedRangeAccess::Readable => {
+            range_contains(rw_base, size, addr, len) || range_contains(ro_base, size, addr, len)
+        }
+        ClientMappedRangeAccess::Writable => range_contains(rw_base, size, addr, len),
+    }
+}
+
+#[cfg(test)]
+mod range_guard_tests {
+    use super::{
+        ARwLock, AtomicBool, ClientMappedMem, ClientSegPool, ClientSegPoolInner, CpuAllocatedMem,
+    };
+    use std::fs::File;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn test_pool(rw_base: u64, ro_base: u64, size: u64) -> ClientSegPool {
+        ClientSegPool(ClientSegPoolInner {
+            cpu_allocated_mem: Arc::new(ARwLock::new(Some(ClientMappedMem {
+                registered_mem: CpuAllocatedMem {
+                    _file: File::open("/dev/null").unwrap(),
+                    allocated_addr: rw_base,
+                    allocated_size: size,
+                },
+                allocated_addr_ro: ro_base,
+                layout_validated: AtomicBool::new(false),
+            }))),
+            view: std::sync::OnceLock::new(),
+            share_mem_path: String::new(),
+            large_file_paths: crate::config::LargeFilePaths { paths: Vec::new() },
+            side_transfer_worker: false,
+            attach_owner_ref: None,
+            cluster_name: String::new(),
+            etcd_addresses: Vec::new(),
+            require_transfer_rpc_fast_path_ready_timeout: None,
+            ready_notified: AtomicBool::new(false),
+        })
+    }
+
+    #[::tokio::test]
+    async fn range_guard_checks_full_range_and_mapping_permissions() {
+        let pool = test_pool(0x1000, 0x2000, 0x100);
+
+        assert!(pool.guard_readable_range(0x2080, 0x80).await.is_ok());
+        assert!(pool.guard_writable_range(0x1080, 0x80).await.is_ok());
+        assert!(pool.guard_writable_range(0x2080, 0x80).await.is_err());
+        assert!(pool.guard_readable_range(0x20ff, 2).await.is_err());
+        assert!(pool.guard_readable_range(u64::MAX, 2).await.is_err());
+    }
+
+    #[::tokio::test]
+    async fn range_guard_blocks_segment_slot_removal_until_io_finishes() {
+        let pool = test_pool(0x1000, 0x2000, 0x100);
+        let guard = pool.guard_writable_range(0x1000, 0x100).await.unwrap();
+        let segment_slot = Arc::clone(&pool.0.cpu_allocated_mem);
+
+        let mut removal = ::tokio::spawn(async move { segment_slot.write().await.take() });
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(10), &mut removal)
+                .await
+                .is_err()
+        );
+
+        drop(guard);
+        let removed = ::tokio::time::timeout(Duration::from_secs(1), removal)
+            .await
+            .expect("segment removal must resume after the range guard is dropped")
+            .expect("segment removal task must not panic");
+        assert!(removed.is_some());
+    }
+}
+
 impl ClientSegPoolInner {
     fn view(&self) -> &ClientSegPoolView {
         self.view.get().unwrap()
@@ -711,49 +807,79 @@ impl ClientSegPool {
         Ok(ClientCpuMemReadGuard::new(guard))
     }
 
-    pub async fn get_guard_of_address(&self, addr: u64) -> KvResult<ClientCpuMemReadGuard> {
+    pub(crate) async fn guard_readable_range(
+        &self,
+        addr: u64,
+        len: u64,
+    ) -> KvResult<ClientCpuMemReadGuard> {
+        self.guard_mapped_range(addr, len, ClientMappedRangeAccess::Readable)
+            .await
+    }
+
+    pub(crate) async fn guard_writable_range(
+        &self,
+        addr: u64,
+        len: u64,
+    ) -> KvResult<ClientCpuMemReadGuard> {
+        self.guard_mapped_range(addr, len, ClientMappedRangeAccess::Writable)
+            .await
+    }
+
+    async fn guard_mapped_range(
+        &self,
+        addr: u64,
+        len: u64,
+        access: ClientMappedRangeAccess,
+    ) -> KvResult<ClientCpuMemReadGuard> {
         let guard = self.cpu_mem_read_guard().await?;
         let rw_base = guard.allocated_addr;
         let ro_base = guard.allocated_addr_ro;
         let seg_len = guard.allocated_size;
-        let Some(rw_end) = rw_base.checked_add(seg_len) else {
-            return Err(KvError::SharedMem(
-                crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::InvalidAddress {
-                    address: rw_base,
-                    detail: Some(format!(
-                        "segment range overflow: rw_base={:#x}, seg_len={}",
-                        rw_base, seg_len
-                    )),
-                },
-            ));
-        };
-        let Some(ro_end) = ro_base.checked_add(seg_len) else {
-            return Err(KvError::SharedMem(
-                crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::InvalidAddress {
-                    address: ro_base,
-                    detail: Some(format!(
-                        "segment range overflow: ro_base={:#x}, seg_len={}",
-                        ro_base, seg_len
-                    )),
-                },
-            ));
-        };
-
-        let in_rw = addr >= rw_base && addr < rw_end;
-        let in_ro = addr >= ro_base && addr < ro_end;
-        if !in_rw && !in_ro {
-            return Err(KvError::SharedMem(
+        let invalid_address = |detail| {
+            KvError::SharedMem(
                 crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::InvalidAddress {
                     address: addr,
-                    detail: Some(format!(
-                        "not in segment range: rw=[{:#x},{:#x}), ro=[{:#x},{:#x})",
-                        rw_base, rw_end, ro_base, ro_end
-                    )),
+                    detail: Some(detail),
                 },
-            ));
+            )
+        };
+        let range_end = addr.checked_add(len).ok_or_else(|| {
+            invalid_address(format!(
+                "local {} range overflow: addr={:#x}, len={}",
+                access.as_str(),
+                addr,
+                len
+            ))
+        })?;
+        let rw_end = rw_base.checked_add(seg_len).ok_or_else(|| {
+            invalid_address(format!(
+                "local RW segment range overflow: base={:#x}, len={}",
+                rw_base, seg_len
+            ))
+        })?;
+        let ro_end = ro_base.checked_add(seg_len).ok_or_else(|| {
+            invalid_address(format!(
+                "local RO segment range overflow: base={:#x}, len={}",
+                ro_base, seg_len
+            ))
+        })?;
+        if !mapped_range_contains(rw_base, ro_base, seg_len, addr, len, access) {
+            return Err(invalid_address(format!(
+                "local {} range [{:#x},{:#x}) is outside segment mappings: rw=[{:#x},{:#x}), ro=[{:#x},{:#x})",
+                access.as_str(),
+                addr,
+                range_end,
+                rw_base,
+                rw_end,
+                ro_base,
+                ro_end
+            )));
         }
-
         Ok(guard)
+    }
+
+    pub async fn get_guard_of_address(&self, addr: u64) -> KvResult<ClientCpuMemReadGuard> {
+        self.guard_readable_range(addr, 1).await
     }
 
     pub async fn copy_into_segment(&self, target_addr: u64, payload: &[u8]) -> Result<(), String> {

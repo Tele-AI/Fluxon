@@ -46,7 +46,7 @@ struct Args {
     instance_name: String,
 
     /// etcd endpoint
-    #[arg(long, default_value = "127.0.0.1:2379")]
+    #[arg(long, default_value = "http://127.0.0.1:2379")]
     etcd_endpoint: String,
 
     /// Cluster name

@@ -60,6 +60,7 @@ print("\n".join(args))
 
 fn main() {
     emit_python_test_embed_link_args();
+    build_fluxon_fs_video_ffmpeg_shim();
 
     let target_dir = get_target_dir();
     let runtime_search_subdirs = load_runtime_search_subdirs();
@@ -102,8 +103,98 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/");
+    println!("cargo:rerun-if-changed=src/video_reader_ffi.c");
     println!("cargo:rerun-if-changed=../target/debug/");
     println!("cargo:rerun-if-changed=../target/release/");
+}
+
+fn build_fluxon_fs_video_ffmpeg_shim() {
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_FLUXON_FS_VIDEO_FFMPEG");
+    if env::var_os("CARGO_FEATURE_FLUXON_FS_VIDEO_FFMPEG").is_none() {
+        return;
+    }
+
+    let ffmpeg_libs = ["libavformat", "libavcodec", "libavutil", "libswscale"];
+    let mut build = cc::Build::new();
+    build
+        .file("src/video_reader_ffi.c")
+        .flag_if_supported("-Wno-deprecated-declarations");
+
+    let mut pkg_config_ok = true;
+    let mut link_paths = Vec::new();
+    let mut link_libs = Vec::new();
+    let mut framework_paths = Vec::new();
+    let mut frameworks = Vec::new();
+    for lib_name in ffmpeg_libs {
+        let mut config = pkg_config::Config::new();
+        config.cargo_metadata(false);
+        match config.probe(lib_name) {
+            Ok(lib) => {
+                for include_path in lib.include_paths {
+                    build.include(include_path);
+                }
+                link_paths.extend(lib.link_paths);
+                link_libs.extend(lib.libs);
+                framework_paths.extend(lib.framework_paths);
+                frameworks.extend(lib.frameworks);
+            }
+            Err(err) => {
+                pkg_config_ok = false;
+                println!(
+                    "cargo:warning=pkg-config could not find {} for FluxonFS VideoReader: {}. Falling back to default compiler/linker paths.",
+                    lib_name, err
+                );
+                break;
+            }
+        }
+    }
+
+    build.compile("fluxon_fs_video_reader_ffi");
+
+    if pkg_config_ok {
+        emit_unique_link_searches("native", link_paths);
+        emit_unique_link_searches("framework", framework_paths);
+        emit_unique_link_libs(link_libs);
+        emit_unique_frameworks(frameworks);
+    } else {
+        println!("cargo:rustc-link-lib=avformat");
+        println!("cargo:rustc-link-lib=avcodec");
+        println!("cargo:rustc-link-lib=avutil");
+        println!("cargo:rustc-link-lib=swscale");
+    }
+}
+
+fn emit_unique_link_searches(kind: &str, paths: Vec<PathBuf>) {
+    let mut seen = Vec::new();
+    for path in paths {
+        if seen.iter().any(|existing| existing == &path) {
+            continue;
+        }
+        println!("cargo:rustc-link-search={kind}={}", path.display());
+        seen.push(path);
+    }
+}
+
+fn emit_unique_link_libs(libs: Vec<String>) {
+    let mut seen = Vec::new();
+    for lib in libs {
+        if seen.iter().any(|existing| existing == &lib) {
+            continue;
+        }
+        println!("cargo:rustc-link-lib={lib}");
+        seen.push(lib);
+    }
+}
+
+fn emit_unique_frameworks(frameworks: Vec<String>) {
+    let mut seen = Vec::new();
+    for framework in frameworks {
+        if seen.iter().any(|existing| existing == &framework) {
+            continue;
+        }
+        println!("cargo:rustc-link-lib=framework={framework}");
+        seen.push(framework);
+    }
 }
 
 fn emit_python_test_embed_link_args() {

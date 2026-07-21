@@ -7,6 +7,7 @@ This module handles reading configuration from YAML files only.
 from typing import Dict, Any, List, Union, Tuple
 from abc import abstractmethod
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 import sys
 import yaml
@@ -24,6 +25,86 @@ def debug_print(*args):
 
 _YAML_KEY_TYPES = (str, int, float, bool)
 _YAML_SCALAR_TYPES = (str, int, float, bool, type(None))
+_U64_MAX = 2**64 - 1
+_SIZE_BYTE_UNITS = {
+    "": 1,
+    "b": 1,
+    "byte": 1,
+    "bytes": 1,
+    "kb": 1024,
+    "kib": 1024,
+    "mb": 1024**2,
+    "mib": 1024**2,
+    "gb": 1024**3,
+    "gib": 1024**3,
+    "tb": 1024**4,
+    "tib": 1024**4,
+}
+_CAPACITY_ALIGNMENT_BYTES = 16 * 1024 * 1024
+
+
+def _parse_size_bytes(value: Any, path: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{path} must be bytes or a size string, got bool")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"{path} must be >= 0")
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"{path} must be bytes or a size string, got {type(value).__name__}")
+
+    raw = value
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?|\.[0-9]+)\s*([A-Za-z]*)\s*", raw)
+    if match is None:
+        raise ValueError(f"{path} size must look like 16777216, 512MB, or 1.5GB")
+    number_text, unit_text = match.groups()
+    unit = unit_text.lower()
+    multiplier = _SIZE_BYTE_UNITS.get(unit)
+    if multiplier is None:
+        raise ValueError(
+            f"{path} size unit must be one of B, KB, MB, GB, TB, KiB, MiB, GiB, TiB"
+        )
+
+    try:
+        byte_value = Decimal(number_text) * Decimal(multiplier)
+    except InvalidOperation as exc:
+        raise ValueError(f"{path} size has invalid number: {raw}") from exc
+    bytes_int = int(byte_value)
+    if bytes_int < 0:
+        raise ValueError(f"{path} must be >= 0")
+    if bytes_int > _U64_MAX:
+        raise ValueError(f"{path} exceeds u64 bytes")
+    return bytes_int
+
+
+def _align_capacity_down(value: int) -> int:
+    return value // _CAPACITY_ALIGNMENT_BYTES * _CAPACITY_ALIGNMENT_BYTES
+
+
+def _normalize_size_bytes_fields(cfg: Dict[str, Any]) -> None:
+    contrib = cfg.get("contribute_to_cluster_pool_size")
+    if isinstance(contrib, dict):
+        if "dram" in contrib and contrib["dram"] is not None:
+            contrib["dram"] = _align_capacity_down(
+                _parse_size_bytes(contrib["dram"], "contribute_to_cluster_pool_size.dram")
+            )
+        vram = contrib.get("vram")
+        if isinstance(vram, dict):
+            for gpu_id, size in list(vram.items()):
+                vram[gpu_id] = _align_capacity_down(
+                    _parse_size_bytes(size, f"contribute_to_cluster_pool_size.vram.{gpu_id}")
+                )
+
+    spec = cfg.get("fluxonkv_spec")
+    if isinstance(spec, dict):
+        large_limit_size = spec.get("large_limit_size")
+        if large_limit_size is not None:
+            if not isinstance(large_limit_size, list):
+                raise ValueError("fluxonkv_spec.large_limit_size must be a list in owner mode")
+            spec["large_limit_size"] = [
+                _parse_size_bytes(size, f"fluxonkv_spec.large_limit_size[{idx}]")
+                for idx, size in enumerate(large_limit_size)
+            ]
 
 
 def _to_plain_yaml_obj(value: Any, path: str) -> Any:
@@ -67,9 +148,9 @@ protocol:                              # Transport protocol override (dict(optio
   rdma_device_names:                   # Explicit RDMA devices for protocol config (['{str}'](optional))
 pprof_duration_seconds:                # Dump pprof flamegraph after N seconds (int(optional))
 contribute_to_cluster_pool_size:       # Capacity contributed to cluster pool (dict(optional))
-  dram: 1677721600                     # - DRAM contribution (int(multiple of 16777216))
+  dram: 1677721600                     # - DRAM contribution (size_bytes(multiple of 16777216))
   vram:                                # - VRAM contribution per GPU (dict(dynamic_key))
-    '{gpu_id}': 1677721600             # - Capacity for a given GPU id (int(multiple of 16777216))
+    '{gpu_id}': 1677721600             # - Capacity for a given GPU id (size_bytes(multiple of 16777216))
 test_spec_config:                      # Test-only config overrides (dict(optional))
   disable_observability: false         # Disable observe / OTLP background tasks (bool(optional))
   disable_master_replica_cache: false  # Disable master replica cache maintenance (bool(optional))
@@ -93,6 +174,8 @@ test_spec_config:                      # Test-only config overrides (dict(option
   side_transfer_worker_count: 0        # Owner-side worker count for side-transfer fanout (int(optional))
   side_transfer_worker_p2p_port_base:  # Optional owner-side worker port base (int(optional))
   side_transfer_role:                  # worker (str(optional))
+  kv_ssd_storage_backend:              # native|foyer (str(optional))
+  kv_ssd_uring_mode:                   # single_buffer|iovec; native backend only (str(optional))
 # Notes:
 # - Zero-contribution mode is selected when contribute_to_cluster_pool_size is missing,
 #   or when dram is 0 and all VRAM entries are 0.
@@ -100,16 +183,21 @@ test_spec_config:                      # Test-only config overrides (dict(option
 
 # specific part, only one of [mooncake_spec,fluxonkv_spec] is required
 mooncake_spec:                         # mooncake 特定配置 (dict(optional))
+  local_hostname:                     # Mooncake transfer/offload endpoint host (str(optional))
   local_buffer_size:                   # 本地缓冲区大小 (int(multiple of 16777216))
   metadata_server:                     # 元数据服务器地址 ('{str}://{str}:{int}/metadata')
   master_server_address:               # 主服务器地址 ('{str}:{int}')
   etcd_addresses:                      # etcd地址列表, 注意是列表!!! (['{str}:{int}'])
+  enable_ssd_offload: false            # Enable Mooncake SSD offload for this store (bool(optional))
+  ssd_offload_path:                    # Local SSD offload directory path (str(optional))
+  skip_get_size_on_get: false           # Skip Mooncake get_size() before get(); intended for benchmark reads (bool(optional))
   
 fluxonkv_spec:                        # fluxon kv specific config (dict(optional))
   etcd_addresses:                     # Etcd address list ((None|['{str}:{int}']))
   cluster_name:                       # Cluster name (str)
   share_mem_path:                     # Shared bundle path for mmap.file/shared.json/peer metadata (str)
   large_file_paths:                   # Owner-mode ordered large-file roots (['{str}'](optional))
+  large_limit_size:                   # Owner-mode KV SSD byte limits aligned with large_file_paths (['{size_bytes}'](optional))
   p2p_listen_port:                    # P2P QUIC listen port override (int(optional))
   redis_compat:                       # Enable Redis protocol shim (dict(optional))
     listen_addr:                      # TCP listen addr, e.g. "127.0.0.1:16379" (str)
@@ -146,6 +234,8 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         "side_transfer_worker_count",
         "side_transfer_worker_p2p_port_base",
         "side_transfer_role",
+        "kv_ssd_storage_backend",
+        "kv_ssd_uring_mode",
     }
     unknown = sorted(set(raw.keys()) - allowed_keys)
     if unknown:
@@ -171,6 +261,35 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             if not isinstance(value, bool):
                 raise ValueError(f"{ctx}.{key} must be a bool")
             out[key] = value
+
+    kv_ssd_storage_backend = raw.get("kv_ssd_storage_backend")
+    if kv_ssd_storage_backend is not None:
+        if not isinstance(kv_ssd_storage_backend, str):
+            raise ValueError(f"{ctx}.kv_ssd_storage_backend must be a string")
+        allowed_kv_ssd_storage_backends = {"native", "foyer"}
+        if kv_ssd_storage_backend not in allowed_kv_ssd_storage_backends:
+            raise ValueError(
+                f"{ctx}.kv_ssd_storage_backend must be one of {sorted(allowed_kv_ssd_storage_backends)}, got {kv_ssd_storage_backend!r}"
+            )
+        out["kv_ssd_storage_backend"] = kv_ssd_storage_backend
+
+    kv_ssd_uring_mode = raw.get("kv_ssd_uring_mode")
+    if kv_ssd_uring_mode is not None:
+        if not isinstance(kv_ssd_uring_mode, str):
+            raise ValueError(f"{ctx}.kv_ssd_uring_mode must be a string")
+        allowed_kv_ssd_uring_modes = {"single_buffer", "iovec"}
+        if kv_ssd_uring_mode not in allowed_kv_ssd_uring_modes:
+            raise ValueError(
+                f"{ctx}.kv_ssd_uring_mode must be one of {sorted(allowed_kv_ssd_uring_modes)}, got {kv_ssd_uring_mode!r}"
+            )
+        out["kv_ssd_uring_mode"] = kv_ssd_uring_mode
+
+    if out.get("kv_ssd_storage_backend") == "foyer" and out.get(
+        "kv_ssd_uring_mode", "single_buffer"
+    ) != "single_buffer":
+        raise ValueError(
+            f"{ctx}.kv_ssd_uring_mode is only valid with {ctx}.kv_ssd_storage_backend=native"
+        )
 
     transport_mode = raw.get("transport_mode")
     transport_mode_was_explicit = transport_mode is not None
@@ -311,7 +430,7 @@ def _is_zero_contribution_fluxonkv_config(cfg: Dict[str, Any]) -> bool:
     if not isinstance(contrib, dict):
         raise ValueError("contribute_to_cluster_pool_size must be a mapping when provided")
 
-    dram = int(contrib["dram"])
+    dram = _parse_size_bytes(contrib["dram"], "contribute_to_cluster_pool_size.dram")
     vram_raw = contrib.get("vram")
     # Missing vram is normalized to "no GPU contribution".
     if vram_raw is None:
@@ -322,8 +441,8 @@ def _is_zero_contribution_fluxonkv_config(cfg: Dict[str, Any]) -> bool:
         vram = vram_raw
 
     vram_is_zero = True
-    for _, value in vram.items():
-        if int(value) != 0:
+    for gpu_id, value in vram.items():
+        if _parse_size_bytes(value, f"contribute_to_cluster_pool_size.vram.{gpu_id}") != 0:
             vram_is_zero = False
             break
     if dram == 0 and not vram_is_zero:
@@ -365,6 +484,7 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
             "redis_compat",
             "sub_cluster",
             "large_file_paths",
+            "large_limit_size",
         ]
         for key in forbidden_spec_keys:
             if key in spec:
@@ -376,7 +496,7 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
         raise ValueError(
             "contribute_to_cluster_pool_size is required for owner mode (non-zero contribution)"
         )
-    if int(contrib["dram"]) == 0:
+    if _parse_size_bytes(contrib["dram"], "contribute_to_cluster_pool_size.dram") == 0:
         raise ValueError("owner mode requires non-zero contribute_to_cluster_pool_size.dram")
 
     if "etcd_addresses" not in spec:
@@ -404,6 +524,19 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
                 f"fluxonkv_spec.large_file_paths[{idx}] must be a non-empty string in owner mode"
             )
 
+    if "large_limit_size" in spec and spec["large_limit_size"] is not None:
+        large_limit_size = spec["large_limit_size"]
+        if not isinstance(large_limit_size, list):
+            raise ValueError("fluxonkv_spec.large_limit_size must be a list in owner mode")
+        if len(large_limit_size) != len(large_file_paths):
+            raise ValueError(
+                "fluxonkv_spec.large_limit_size length must match fluxonkv_spec.large_file_paths length"
+            )
+        for idx, limit in enumerate(large_limit_size):
+            limit_bytes = _parse_size_bytes(limit, f"fluxonkv_spec.large_limit_size[{idx}]")
+            if limit_bytes < 512:
+                raise ValueError(f"fluxonkv_spec.large_limit_size[{idx}] must be >= 512")
+
 
 class FluxonKvClientConfig():
     """Configuration class for KV Cache stores that reads from YAML config files."""
@@ -424,6 +557,7 @@ class FluxonKvClientConfig():
         plain["test_spec_config"] = _normalize_test_spec_config(
             plain.get("test_spec_config"), "test_spec_config"
         )
+        _normalize_size_bytes_fields(plain)
 
         # Backend selection contract:
         # - Exactly one backend spec must be provided (no fallback inference).
@@ -491,6 +625,15 @@ class FluxonKvClientConfig():
         if "mooncake_spec" not in self.config_dict:
             return None
         return self.config_dict["mooncake_spec"]["local_buffer_size"]
+
+    @property
+    def mooncake_spec_local_hostname(self) -> str:
+        if "mooncake_spec" not in self.config_dict:
+            return self.instance_key
+        raw = self.config_dict["mooncake_spec"].get("local_hostname")
+        if raw is None:
+            return self.instance_key
+        return str(raw)
     
     @property
     def mooncake_spec_metadata_server(self):
@@ -509,6 +652,25 @@ class FluxonKvClientConfig():
         if "mooncake_spec" not in self.config_dict:
             return None
         return self.config_dict["mooncake_spec"]["etcd_addresses"]
+
+    @property
+    def mooncake_spec_enable_ssd_offload(self) -> bool:
+        if "mooncake_spec" not in self.config_dict:
+            return False
+        return bool(self.config_dict["mooncake_spec"].get("enable_ssd_offload", False))
+
+    @property
+    def mooncake_spec_ssd_offload_path(self) -> str:
+        if "mooncake_spec" not in self.config_dict:
+            return ""
+        raw = self.config_dict["mooncake_spec"].get("ssd_offload_path", "")
+        return "" if raw is None else str(raw)
+
+    @property
+    def mooncake_spec_skip_get_size_on_get(self) -> bool:
+        if "mooncake_spec" not in self.config_dict:
+            return False
+        return bool(self.config_dict["mooncake_spec"].get("skip_get_size_on_get", False))
     
     @property
     def fluxonkv_spec_etcd_addresses(self):
@@ -656,7 +818,7 @@ class FluxonKvClientConfig():
                 f"got {type(cfg).__name__}"
             )
 
-        dram = int(cfg["dram"])
+        dram = _parse_size_bytes(cfg["dram"], "contribute_to_cluster_pool_size.dram")
         vram_raw = cfg.get("vram")
         if vram_raw is None:
             vram = {}
@@ -671,7 +833,7 @@ class FluxonKvClientConfig():
                 "Message-queue semantics require dynamic join/leave; non-zero contribution causes instability."
             )
         for gpu_id, size in vram.items():
-            if int(size) != 0:
+            if _parse_size_bytes(size, f"contribute_to_cluster_pool_size.vram.{gpu_id}") != 0:
                 raise ValueError(
                     f"For channel storage, contribute_to_cluster_pool_size must be zero-contribution. Current value: {cfg}. "
                     f"Non-zero vram entry detected: gpu_id={gpu_id}. "
@@ -750,8 +912,8 @@ def _parse_type_annotation(comment: str) -> Optional[Tuple[str, Dict[str, Any]]]
                         return parsed_type_name, merged_params
                     return type_name, {"constraint": constraint}
         
-        # 6) Primitive types: str, int, bool, None
-        if type_str in ["str", "int", "bool", "None"]:
+        # 6) Primitive types: str, int, bool, size_bytes, None
+        if type_str in ["str", "int", "bool", "size_bytes", "None"]:
             return type_str, {}
         
         debug_print("type_str ", type_str, "not matched to any type")
@@ -871,6 +1033,15 @@ def _validate_value_by_type(value: Any, type_info: Tuple[str, Dict[str, Any]], p
                             raise_validation_error(f"Value must be multiple of {multiple}, got {value}")
                         else:
                             return None
+
+    elif type_name == "size_bytes":
+        try:
+            bytes_value = _parse_size_bytes(value, path)
+        except ValueError as exc:
+            if raise_err:
+                raise_validation_error(str(exc))
+            return None
+        return bytes_value
     
     elif type_name == "bool":
         if not isinstance(value, bool):
@@ -944,6 +1115,25 @@ def _validate_value_by_type(value: Any, type_info: Tuple[str, Dict[str, Any]], p
                 return None
         
         format_str = params["format"]
+        if format_str == "{int}":
+            for i, item in enumerate(value):
+                if not isinstance(item, int) or isinstance(item, bool):
+                    if raise_err:
+                        raise_validation_error(f"Expected int in list at index {i}, got {type(item).__name__}")
+                    else:
+                        return None
+            return value
+        if format_str == "{size_bytes}":
+            for i, item in enumerate(value):
+                try:
+                    _parse_size_bytes(item, f"{path}[{i}]")
+                except ValueError as exc:
+                    if raise_err:
+                        raise_validation_error(str(exc))
+                    else:
+                        return None
+            return value
+
         regex_pattern = _convert_format_to_regex_pattern(format_str)
         for i, item in enumerate(value):
             if not isinstance(item, str):

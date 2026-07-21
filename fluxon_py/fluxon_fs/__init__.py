@@ -20,6 +20,12 @@ from .config_types import (
 )
 from .patcher import FluxonFsPatcher
 from .bootstrap import install_patcher_from_master
+from .video import (
+    FluxonFsVideoReadRequest,
+    FluxonFsVideoReadResult,
+    FluxonFsVideoReader,
+    FluxonFsVideoReaderPool,
+)
 
 
 def publish_export(
@@ -91,6 +97,10 @@ __all__ = [
     "parse_master_config_from_file",
     "parse_master_panel_config_from_file",
     "FluxonFsPatcher",
+    "FluxonFsVideoReadRequest",
+    "FluxonFsVideoReadResult",
+    "FluxonFsVideoReader",
+    "FluxonFsVideoReaderPool",
     "install_patcher_from_master",
     "publish_export",
     "unpublish_export",

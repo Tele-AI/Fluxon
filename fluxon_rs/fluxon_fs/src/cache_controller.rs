@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 
 use fluxon_fs_core::config::{FluxonFsCacheControllerConfig, FluxonFsRequestIdentity};
+use fluxon_util::run_async_from_sync::spawn_blocking_allow_sync_async_bridge;
 
 /// Key of a single cacheable piece of an S3-gateway object. See design §4.1.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -128,7 +129,6 @@ impl CacheController {
             let rx = shared_rx.clone();
             let inflight_clone = inflight.clone();
             let fn_clone = stage_piece_fn.clone();
-            let rt = rt_handle.clone();
             let queue_depth_clone = queue_depth.clone();
             let stage_success_count_clone = stage_success_count.clone();
             let stage_fail_count_clone = stage_fail_count.clone();
@@ -142,7 +142,6 @@ impl CacheController {
                     inflight_clone,
                     fn_clone,
                     stage_piece_range_fn_clone,
-                    rt,
                     queue_depth_clone,
                     stage_success_count_clone,
                     stage_fail_count_clone,
@@ -280,7 +279,6 @@ async fn stage_worker_loop(
     inflight: Arc<DashMap<PieceKey, ()>>,
     stage_piece_fn: StagePieceFn,
     stage_piece_range_fn: StagePieceRangeFn,
-    rt_handle: tokio::runtime::Handle,
     queue_depth: Arc<AtomicUsize>,
     stage_success_count: Arc<AtomicU64>,
     stage_fail_count: Arc<AtomicU64>,
@@ -355,19 +353,18 @@ async fn stage_worker_loop(
         let identity_clone = task.identity.clone();
         let fn_clone = stage_piece_fn.clone();
         let fn_range_clone = stage_piece_range_fn.clone();
-        let result = rt_handle
-            .spawn_blocking(move || {
-                if staged_piece_count_clone > 1 {
-                    fn_range_clone(
-                        &key_clone,
-                        staged_piece_count_clone,
-                        identity_clone.as_ref(),
-                    )
-                } else {
-                    fn_clone(&key_clone, identity_clone.as_ref())
-                }
-            })
-            .await;
+        let result = spawn_blocking_allow_sync_async_bridge(move || {
+            if staged_piece_count_clone > 1 {
+                fn_range_clone(
+                    &key_clone,
+                    staged_piece_count_clone,
+                    identity_clone.as_ref(),
+                )
+            } else {
+                fn_clone(&key_clone, identity_clone.as_ref())
+            }
+        })
+        .await;
 
         // Always release inflight.
         for piece_key in &staged_piece_keys {
@@ -411,8 +408,9 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
+    use fluxon_util::run_async_from_sync::SyncAsyncBridge;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::mpsc;
     use std::sync::{Condvar, Mutex};
     use tokio::time::{Duration, sleep};
 
@@ -463,6 +461,54 @@ mod tests {
         assert_eq!(snapshot.suggest_enqueued_count, 1);
         assert_eq!(snapshot.stage_success_count, 1);
         assert_eq!(snapshot.queue_depth, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stage_worker_allows_sync_async_bridge_in_blocking_callback() {
+        let handle = tokio::runtime::Handle::current();
+        let (stage_result_tx, stage_result_rx) = mpsc::sync_channel(1);
+        let stage_piece_fn: StagePieceFn = Arc::new(move |_key, _identity| {
+            let value = handle
+                .run_async_from_sync(async { 7_usize })
+                .map_err(|err| err.to_string())?;
+            let _ = stage_result_tx.send(value);
+            Ok(())
+        });
+        let stage_piece_range_fn: StagePieceRangeFn =
+            Arc::new(move |_key, _count, _identity| Ok(()));
+        let ctrl = CacheController::start(
+            FluxonFsCacheControllerConfig {
+                stage_worker_count: 1,
+                ..FluxonFsCacheControllerConfig::default()
+            },
+            stage_piece_fn,
+            stage_piece_range_fn,
+            tokio::runtime::Handle::current(),
+        );
+
+        assert_eq!(
+            ctrl.handle_suggest(sample_key(), None),
+            SuggestOutcome::Enqueued
+        );
+        assert_eq!(
+            stage_result_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("stage worker did not run within 5s"),
+            7
+        );
+
+        for _ in 0..50 {
+            let snapshot = ctrl.stats_snapshot();
+            if snapshot.stage_success_count == 1 && snapshot.stage_fail_count == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        let snapshot = ctrl.stats_snapshot();
+        assert_eq!(snapshot.stage_success_count, 1);
+        assert_eq!(snapshot.stage_fail_count, 0);
+        assert_eq!(snapshot.stage_panic_count, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

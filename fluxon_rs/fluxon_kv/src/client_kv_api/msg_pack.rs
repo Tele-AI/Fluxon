@@ -1,8 +1,10 @@
+use crate::master_kv_router::msg_pack::GetDoneResp;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::p2p::msg_pack::{MsgPackSerializePart, RPCReq};
 use crate::rpcresp_kvresult_convert::msg_and_error::ErrorCode;
 use bitcode::{Decode, Encode};
 
+use crate::cluster_manager::NodeIDString;
 use crate::memholder::ExternalMemHolderInfo;
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -89,6 +91,72 @@ impl MsgPackSerializePart for ExternalGetResp {
     }
 }
 
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdStageReadReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub get_id: u64,
+    pub stage_addr: u64,
+    pub stage_len: u64,
+    pub target_node_id: NodeIDString,
+    pub target_addr: u64,
+    pub len: u64,
+}
+
+impl MsgPackSerializePart for SsdStageReadReq {
+    fn msg_id(&self) -> u32 {
+        4020
+    }
+}
+
+impl RPCReq for SsdStageReadReq {
+    type Resp = SsdStageReadResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdStageReadResp {
+    pub done: GetDoneResp,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for SsdStageReadResp {
+    fn msg_id(&self) -> u32 {
+        4021
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdReplicaPersistReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub target_addr: u64,
+    pub len: u64,
+}
+
+impl MsgPackSerializePart for SsdReplicaPersistReq {
+    fn msg_id(&self) -> u32 {
+        4022
+    }
+}
+
+impl RPCReq for SsdReplicaPersistReq {
+    type Resp = SsdReplicaPersistResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdReplicaPersistResp {
+    pub persisted: bool,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for SsdReplicaPersistResp {
+    fn msg_id(&self) -> u32 {
+        4023
+    }
+}
+
 // #[derive(Default, Debug, Clone, Encode, Decode)]
 // pub struct ExternalPutReq {
 //     pub key: String,
@@ -114,6 +182,7 @@ pub struct ExternalPutStartReq {
     pub key: String,
     pub len: u64,
     pub reject_if_inflight_same_key: bool,
+    pub reject_if_exists: bool,
     /// Prefer placing the target allocation on any kvclient within this sub_cluster.
     pub preferred_sub_cluster: Option<String>,
     /// Owner node_start_time observed by external when request starts

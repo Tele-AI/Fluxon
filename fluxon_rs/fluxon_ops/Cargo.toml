@@ -16,7 +16,6 @@ uuid = { workspace = true }
 hyper = { workspace = true }
 libc = { workspace = true }
 askama = { workspace = true }
-etcd-client = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
 hex = "0.4"

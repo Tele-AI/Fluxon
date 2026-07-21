@@ -4,7 +4,7 @@ run:
   mode: full_once
   selectors:
     case_ids: ALL
-    profile_ids: [fluxon_fastws, fluxon_tquic, fluxon_sockudo_ws, fluxon_tcp, redis_sharded, alluxio_posix]
+    profile_ids: [fluxon_fastws, fluxon_tquic, fluxon_sockudo_ws, fluxon_tcp, fluxon_tcp_kv_ssd, mooncake_tcp, redis_sharded, alluxio_posix]
     command_ids: ALL
     test_ids: ALL
 
@@ -51,6 +51,27 @@ scenes:
     select:
       scales: [n2_kvowner_dram_20gib, n5_kvowner_dram_20gib, n9_kvowner_dram_20gib]
       profiles: [fluxon_fastws, fluxon_tquic, fluxon_sockudo_ws, fluxon_tcp, redis_sharded]
+
+  kv_ssd_pressure_zipf:
+    test_stack:
+      mode: KVSTORE
+      read_ratio: 0.9
+      write_ratio: 0.1
+      request_distribution: zipfian
+      keyspace_size: 2048
+      value_size_mode: RANDOM_WEIGHTED_SET
+      value_size_weighted_set:
+        - size_bytes: 1048576
+          weight: 0.15
+        - size_bytes: 2097152
+          weight: 0.35
+        - size_bytes: 4194304
+          weight: 0.35
+        - size_bytes: 8388608
+          weight: 0.15
+    select:
+      scales: [n1_kvowner_dram_1gib, n2_kvowner_dram_1gib]
+      profiles: [fluxon_tcp_kv_ssd, fluxon_tcp, mooncake_tcp]
 
   kv_write_heavy_large_value:
     test_stack:
@@ -183,6 +204,31 @@ scales:
       owner_dram_bytes: 21474836480
     benchmark: *bench_benchmark
 
+  n1_kvowner_dram_1gib:
+    duration_seconds: 60
+    topology: 1
+    owner:
+      owner_count: 1
+      owner_dram_bytes: 1073741824
+    benchmark: &ssd_pressure_benchmark
+      processes_per_target: 1
+      threads_per_process: 4
+      value_size: 1048576
+      metric_warmup_seconds: 5
+      start_idle_seconds: 10
+      op_timeout_seconds: 60
+      cluster_ready_timeout_seconds: 900
+      value_size_list: []
+      consumer_sim_handle_ms_range: [700, 1500]
+
+  n2_kvowner_dram_1gib:
+    duration_seconds: 60
+    topology: 2
+    owner:
+      owner_count: 2
+      owner_dram_bytes: 1073741824
+    benchmark: *ssd_pressure_benchmark
+
 artifact_sets:
   fluxon_fastws:
     release_source: &release_source_fastws
@@ -296,19 +342,19 @@ profiles:
             - test_profile_adapter.py
           controller_url: __STACK_CONTROLLER_URL__
           target_ip_map: &upstream_target_ip_map
-            node-1: 10.127.37.2
-            node-2: 10.127.37.40
-            node-3: 10.127.37.6
-            node-4: 10.127.37.5
-            node-5: 10.127.37.75
-            node-6: 10.127.37.4
-            node-7: 10.127.37.118
-            node-8: 10.127.37.1
-            node-9: 10.127.37.22
-            node-10: 10.127.37.91
-            primary-bastion: 10.233.75.142
+            node-1: 192.0.2.11
+            node-2: 192.0.2.12
+            node-3: 192.0.2.13
+            node-4: 192.0.2.14
+            node-5: 192.0.2.15
+            node-6: 192.0.2.16
+            node-7: 192.0.2.17
+            node-8: 192.0.2.18
+            node-9: 192.0.2.19
+            node-10: 192.0.2.20
+            example-bastion: 198.51.100.10
           bootstrap_ready_timeout_seconds: 300
-        runtime_config:
+        runtime_config: &common_fluxon_runtime_config
           kv_base: &upstream_test_stack_kv_base
             instance_key: bench_base
             contribute_to_cluster_pool_size: {dram: 0, vram: {}}
@@ -362,6 +408,89 @@ profiles:
     runtime:
       test_stack:
         <<: *common_test_stack_runtime
+
+  fluxon_tcp_kv_ssd:
+    artifact_set: fluxon_tcp
+    runtime:
+      test_stack:
+        <<: *common_test_stack_runtime
+        runtime_config:
+          <<: *common_fluxon_runtime_config
+          owner_kv_ssd:
+            large_limit_size: [17179869184]
+
+  mooncake_tcp:
+    artifact_set: fluxon_tcp
+    runtime:
+      test_stack:
+        kind: MOONCAKE
+        coordinator_ready_timeout_seconds: 300
+        port_alloc:
+          by_topology:
+            1:
+              coordinator_port_base: 23779
+              coordinator_port_stride: 10
+              mooncake_rpc_port_base: 33000
+              mooncake_rpc_port_stride: 10
+              mooncake_metadata_port_base: 34000
+              mooncake_metadata_port_stride: 10
+              mooncake_metrics_port_base: 35000
+              mooncake_metrics_port_stride: 10
+            DEFAULT:
+              coordinator_port_base: 24779
+              coordinator_port_stride: 10
+              mooncake_rpc_port_base: 33100
+              mooncake_rpc_port_stride: 10
+              mooncake_metadata_port_base: 34100
+              mooncake_metadata_port_stride: 10
+              mooncake_metrics_port_base: 35100
+              mooncake_metrics_port_stride: 10
+        deploy:
+          adapter_cmd:
+            - test_profile_adapter.py
+          controller_url: __STACK_CONTROLLER_URL__
+          target_ip_map: *upstream_target_ip_map
+          bootstrap_ready_timeout_seconds: 300
+        runtime_config:
+          testbed_mooncake_storage:
+            mode: DEDICATED_OWNER
+          kv_base:
+            instance_key: bench_base
+            contribute_to_cluster_pool_size: {dram: 0, vram: {}}
+            protocol:
+              protocol_type: tcp
+            test_spec_config:
+              disable_observability: true
+              disable_master_replica_cache: true
+              disable_prefix_index: true
+            mooncake_spec:
+              local_buffer_size: 1073741824
+          master:
+            wheel_name: mooncake_transfer_engine-0.3.0-cp310-cp310-linux_x86_64.whl
+            python_abi: cpython3.10
+            cluster_id_prefix: fluxon-test-stack-mooncake
+            rpc_thread_num: 4
+        deploy_templates:
+          coordinator:
+            lifecycle: service
+            k8s_ref: deployment/test_stack_coord
+            deployer:
+              command: [/bin/bash, -lc]
+              args:
+                - |
+                  # Placeholder only. test_runner.py rewrites the actual TEST_STACK
+                  # launch command and resolves the interpreter from target hostworkdir.
+                  :
+          node:
+            lifecycle: job
+            k8s_ref: deployment/test_stack_node___INSTANCE_KEY__
+            deployer:
+              command: [/bin/bash, -lc]
+              args:
+                - |
+                  # Placeholder only. test_runner.py rewrites the actual TEST_STACK
+                  # launch command and resolves the interpreter from target hostworkdir.
+                  : "__INSTANCE_KEY__ __COORDINATOR__"
 
   redis_sharded:
     artifact_set: fluxon_fastws

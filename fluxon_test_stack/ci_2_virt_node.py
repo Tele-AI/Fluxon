@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -42,7 +43,7 @@ DEFAULT_TESTBED_BOOTSTRAP_MODE = "bare_then_apply"
 DEFAULT_TESTBED_UI_PORT = 18080
 DEFAULT_TESTBED_CONTROLLER_PORT = 19080
 DEFAULT_TESTBED_OPS_CLUSTER_NAME = "fluxon_testbed"
-DEFAULT_TESTBED_HOSTWORKDIR = Path("/mnt/nvme0/store_team_dev/fluxon_deploy")
+DEFAULT_TESTBED_HOSTWORKDIR = Path("/tmp/fluxon-example/deploy")
 LOCAL_PRIMARY_NODE_SUFFIX = "a"
 LOCAL_SECONDARY_NODE_SUFFIX = "b"
 TEST_STACK_START_TEST_BED_CONFIG_ENV = "FLUXON_TEST_STACK_START_TEST_BED_CONFIG"
@@ -170,6 +171,19 @@ def _parse_args() -> argparse.Namespace:
         "--print-generated",
         action="store_true",
         help="Print generated config paths before executing commands.",
+    )
+    parser.add_argument(
+        "--cleanup-pack-runtime-after-success",
+        action="store_true",
+        help=(
+            "Delete the temporary pack_release_runtime tree after packaging succeeds. "
+            "The published release artifacts remain under --release-dir."
+        ),
+    )
+    parser.add_argument(
+        "--cleanup-successful-case-artifacts",
+        action="store_true",
+        help="Forward successful-case artifact cleanup to test_runner.",
     )
     return parser.parse_args()
 
@@ -883,6 +897,44 @@ def _prepare_pack_release_runtime_dirs(*, project_data_root: Path) -> None:
         (root / relpath).mkdir(parents=True, exist_ok=True)
 
 
+def _cleanup_pack_release_runtime_after_success(*, runtime_root: Path, workdir: Path) -> None:
+    workdir = workdir.resolve()
+    runtime_root = Path(os.path.abspath(os.fspath(runtime_root)))
+    expected_root = workdir / "pack_release_runtime"
+    if runtime_root != expected_root:
+        raise ValueError(
+            "refusing to clean an unexpected pack runtime path: "
+            f"runtime_root={runtime_root} expected={expected_root}"
+        )
+    if not runtime_root.exists():
+        print(f"[cleanup_pack_runtime] already absent: {runtime_root}", flush=True)
+        return
+    if runtime_root.is_symlink() or not runtime_root.is_dir():
+        raise ValueError(f"pack runtime cleanup requires a regular directory: {runtime_root}")
+
+    free_before = shutil.disk_usage(workdir).free
+    try:
+        shutil.rmtree(runtime_root)
+    except PermissionError:
+        # Containerized packaging can leave root-owned cache entries. The cleanup
+        # flag is explicit, and the path equality check above bounds sudo to the
+        # generated pack runtime owned by this CI invocation.
+        sudo = shutil.which("sudo")
+        if sudo is None:
+            raise
+        subprocess.check_call([sudo, "-n", "rm", "-rf", "--", str(runtime_root)])
+    if runtime_root.exists():
+        raise RuntimeError(f"pack runtime still exists after cleanup: {runtime_root}")
+
+    free_after = shutil.disk_usage(workdir).free
+    reclaimed_bytes = max(0, int(free_after) - int(free_before))
+    print(
+        "[cleanup_pack_runtime] "
+        f"removed={runtime_root} reclaimed_bytes={reclaimed_bytes} free_bytes={free_after}",
+        flush=True,
+    )
+
+
 def _run(argv: list[str], *, env: dict[str, str] | None = None) -> None:
     print("RUN: " + " ".join(_shell_quote(part) for part in argv), flush=True)
     subprocess.check_call(argv, cwd=str(REPO_ROOT), env=env)
@@ -1030,12 +1082,10 @@ def _build_generated_configs(
     return {
         "suite_path": suite_path,
         "deployconf_path": deployconf_path,
-        "start_test_bed_path": start_cfg_path,
         "testbed_bundle_path": testbed_bundle["bundle_root"],
         "testbed_bundle_deployconf_path": testbed_bundle["deployconf_path"],
         "testbed_bundle_start_config_path": testbed_bundle["start_config_path"],
         "testbed_bundle_apply_check_start_config_path": testbed_bundle["apply_check_start_config_path"],
-        "start_test_bed_apply_check_path": start_apply_check_cfg_path,
         "bootstrap_root": bootstrap_root,
         "bootstrap_bare_workdir": bootstrap_root / "bare",
         "bootstrap_apply_workdir": bootstrap_root / "apply",
@@ -1138,6 +1188,11 @@ def main() -> int:
         pack_env = os.environ.copy()
         pack_env["FLUXON_PACK_RELEASE_NIX_CONFIG"] = str(ci_nix_pack_config_path)
         _run(pack_cmd, env=pack_env)
+        if args.cleanup_pack_runtime_after_success:
+            _cleanup_pack_release_runtime_after_success(
+                runtime_root=pack_release_runtime_root,
+                workdir=workdir,
+            )
 
     wheel_name = _find_single_wheel(release_dir, pattern=RELEASE_WHEEL_GLOB, ctx="top-level release wheel")
 
@@ -1246,6 +1301,8 @@ def main() -> int:
             "-w",
             str(runner_workdir),
         ]
+        if args.cleanup_successful_case_artifacts:
+            runner_cmd.append("--cleanup-successful-case-artifacts")
         _run(
             runner_cmd,
             env=_runner_env(

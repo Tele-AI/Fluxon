@@ -47,14 +47,14 @@ test_runner_ui:
 #   deployconf.bootstrap_bare_services before launch-only bare start.
 bootstrap_phases:
   - mode: fixed_bare
-    node: infra44-ThinkStation-PX
+    node: example-node-a
     services:
       - etcd
       - greptime
       - tikv_pd
       - tikv
   - mode: fixed_bare
-    node: infra44-ThinkStation-PX
+    node: example-node-a
     services:
       - fluxon_core_controller
   - mode: coverage_bare

@@ -18,6 +18,13 @@ pub enum GetAllocationMode {
     DurableReplica = 2,
 }
 
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum GetSourceKind {
+    #[default]
+    Memory = 0,
+    Ssd = 1,
+}
+
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct GetStartReq {
     pub key: String,
@@ -32,6 +39,7 @@ pub struct GetStartResp {
     pub get_id: u64,
     pub node_id: NodeIDString,
     pub put_id: PutIDForAKey,
+    pub source_kind: GetSourceKind,
     // absolute addresses because Mooncake transfer engine requires absolute addresses (not offsets)
     pub target_addr: u64,
     pub src_addr: u64,
@@ -39,6 +47,8 @@ pub struct GetStartResp {
     pub target_base_addr: u64,
     pub src_base_addr: u64,
     pub len: u64,
+    /// SSD source staging bytes available at src_addr. Zero for memory sources.
+    pub ssd_stage_len: u64,
     pub error_code: ErrorCode,
     pub error_json: String,
     /// Server-side processing time in microseconds for this RPC handler
@@ -56,6 +66,8 @@ impl RPCReq for GetStartReq {
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct GetRevokeReq {
     pub get_id: u64,
+    /// True only when an SSD stage failed and the source must be removed from routing.
+    pub drop_ssd_source: bool,
 }
 impl MsgPackSerializePart for GetRevokeReq {
     fn msg_id(&self) -> u32 {
@@ -163,6 +175,7 @@ pub struct PutStartReq {
     pub key: String,
     pub len: u64,
     pub reject_if_inflight_same_key: bool,
+    pub reject_if_exists: bool,
     /// Prefer placing the target allocation on any kvclient within this sub_cluster.
     pub preferred_sub_cluster: Option<String>,
     /// Optional source-node override for side-transfer workers that share an owner's mmap.
@@ -248,6 +261,91 @@ impl MsgPackSerializePart for PutDoneResp {
 }
 impl RPCReq for PutDoneReq {
     type Resp = PutDoneResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdReplicaCommitReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub len: u64,
+}
+impl MsgPackSerializePart for SsdReplicaCommitReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::SsdReplicaCommitReq as u32
+    }
+}
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdReplicaCommitResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    /// Server-side processing time in microseconds for this RPC handler
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for SsdReplicaCommitResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::SsdReplicaCommitResp as u32
+    }
+}
+impl RPCReq for SsdReplicaCommitReq {
+    type Resp = SsdReplicaCommitResp;
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct SsdReplicaEviction {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchSsdReplicaEvictReq {
+    pub evictions: Vec<SsdReplicaEviction>,
+}
+impl MsgPackSerializePart for BatchSsdReplicaEvictReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchSsdReplicaEvictReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchSsdReplicaEvictResp {
+    pub removed_count: u32,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for BatchSsdReplicaEvictResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchSsdReplicaEvictResp as u32
+    }
+}
+impl RPCReq for BatchSsdReplicaEvictReq {
+    type Resp = BatchSsdReplicaEvictResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdStageBeginReq {
+    pub get_id: u64,
+}
+
+impl MsgPackSerializePart for SsdStageBeginReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::SsdStageBeginReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdStageBeginResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for SsdStageBeginResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::SsdStageBeginResp as u32
+    }
+}
+
+impl RPCReq for SsdStageBeginReq {
+    type Resp = SsdStageBeginResp;
 }
 
 // --- RPC for MemHolder KeepAlive ---

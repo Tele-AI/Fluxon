@@ -1725,9 +1725,9 @@ mod tests {
     const LOCAL_TRANSFER_TEST_CHILD_TRANSFER_STATE_STORE_JSON_ENV: &str =
         "FLUXON_FS_TEST_CHILD_TRANSFER_STATE_STORE_JSON";
     const LOCAL_TRANSFER_TEST_IO_ROOT: &str =
-        "/mnt/nvme0/fluxon_fs_transfer_tikv/rust_local_checker_io";
+        "/tmp/fluxon-example/fluxon_fs_transfer_tikv/rust_local_checker_io";
     const LOCAL_TRANSFER_TEST_TIKV_WORK_ROOT: &str =
-        "/mnt/nvme0/fluxon_fs_transfer_tikv/rust_local_checker";
+        "/tmp/fluxon-example/fluxon_fs_transfer_tikv/rust_local_checker";
     const LOCAL_TRANSFER_TEST_TIKV_READY_TIMEOUT_SECS: u64 = 180;
     const LOCAL_TRANSFER_TEST_TIKV_PD_LEASE_SECS: u64 = 60;
     const LOCAL_TRANSFER_TEST_TIKV_UNIFIED_READPOOL_MAX_THREADS: u64 = 4;
