@@ -153,6 +153,14 @@ def _top_attention_ci_scenes(doc_site_base_url: str) -> dict[str, dict[str, obje
             "case_config": True,
             "scene_config": {},
         },
+        "ci_top_attention_fs_s3_rclone": {
+            "subject": "fs",
+            "runtime_contract": "rust_self_managed",
+            "scale": "n1_kvowner_dram_20gib",
+            "case_config": False,
+            "timeout_seconds": 3600,
+            "scene_config": {},
+        },
         "ci_top_attention_log_mgmt": {
             "subject": "rust",
             "runtime_contract": "rust_self_managed",
