@@ -25,7 +25,7 @@ repos:
                 out_path = out_dir / "cluster_ssh_bootstrap.yaml"
 
                 # These wheels are required by examples/fluxon_deployer/cluster_ssh_bootstrap.py.
-                fluxon_wheels = sorted(glob.glob(str(workdir_root / "fluxon_release" / "fluxon-*.whl")))
+                fluxon_wheels = sorted(glob.glob(str(workdir_root / "fluxon_release" / "fluxon_ai-*.whl")))
                 fluxon_pyo3_wheels = sorted(glob.glob(str(workdir_root / "fluxon_release" / "fluxon_pyo3-*.whl")))
                 if len(fluxon_wheels) != 1:
                     raise RuntimeError(f"expected exactly one fluxon wheel, got: {fluxon_wheels}")

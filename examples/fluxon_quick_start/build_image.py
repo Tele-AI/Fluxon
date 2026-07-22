@@ -12,6 +12,13 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
+repo_root_str = str(REPO_ROOT)
+if repo_root_str not in sys.path:
+    sys.path.insert(0, repo_root_str)
+
+from setup_and_pack.package_contract import RELEASE_WHEEL_GLOB
+
+
 SCRIPTS_DIR = REPO_ROOT / "setup_and_pack"
 DOCKERFILE_PATH = SCRIPT_DIR / "Dockerfile"
 IMAGE_NAME = "fluxon_quick_start"
@@ -62,7 +69,7 @@ def _run(cmd: list[str]) -> None:
 
 
 def _validate_existing_release(*, release_dir: Path) -> None:
-    required_globs = ("fluxon-*.whl",)
+    required_globs = (RELEASE_WHEEL_GLOB,)
     required_relpaths = ("ext_images/etcd/etcd", "ext_images/etcd/etcdctl", "ext_images/greptime/greptime")
     if not release_dir.is_dir():
         raise FileNotFoundError(f"missing quick_start release directory: {release_dir}")

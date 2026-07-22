@@ -66,7 +66,7 @@ FS 用户进程的共享前置链路如下：
 
 `examples/start_kv_and_fs_svc.py` 只启动 Fluxon 自己的角色。`etcd` / `greptime` 仍按服务平面文档单独启动；如果需要 `/ui/transfers/` 和预扫描，还要先启动 `transfer_state_store` 对应的 `pd` / `tikv`：
 
-- 当前 `python3` 所在环境已经安装 `fluxon-*.whl` 和 `fluxon_pyo3-*.whl`；安装方式见 [用户 - 0 - 安装](./用户%20-%200%20-%20安装.md)
+- 当前 `python3` 所在环境已经安装统一的 `fluxon_ai-*.whl`；安装方式见 [用户 - 0 - 安装](./用户%20-%200%20-%20安装.md)
 
 这个脚本支持两种启动方式：
 

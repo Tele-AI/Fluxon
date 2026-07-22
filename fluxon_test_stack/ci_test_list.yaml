@@ -361,7 +361,7 @@ artifact_sets:
       region: us-east-1
       key_prefix: profiles/fluxon_fastws
     release_artifacts:
-      wheel: fluxon-0.2.1-py3-none-any.whl
+      wheel: fluxon_ai-0.2.1-py3-none-any.whl
     test_rsc_source: &test_rsc_source_fastws
       kind: FLUXON_OPS_FS_S3
       bucket: fluxon-release
@@ -381,7 +381,7 @@ artifact_sets:
       region: us-east-1
       key_prefix: profiles/fluxon_tquic
     release_artifacts:
-      wheel: fluxon-0.2.1-py3-none-any.whl
+      wheel: fluxon_ai-0.2.1-py3-none-any.whl
     test_rsc_source: &test_rsc_source_tquic
       kind: FLUXON_OPS_FS_S3
       bucket: fluxon-release
@@ -401,7 +401,7 @@ artifact_sets:
       region: us-east-1
       key_prefix: profiles/fluxon_sockudo_ws
     release_artifacts:
-      wheel: fluxon-0.2.1-py3-none-any.whl
+      wheel: fluxon_ai-0.2.1-py3-none-any.whl
     test_rsc_source: &test_rsc_source_sockudo_ws
       kind: FLUXON_OPS_FS_S3
       bucket: fluxon-release
@@ -421,7 +421,7 @@ artifact_sets:
       region: us-east-1
       key_prefix: profiles/fluxon_tcp
     release_artifacts:
-      wheel: fluxon-0.2.1-py3-none-any.whl
+      wheel: fluxon_ai-0.2.1-py3-none-any.whl
     test_rsc_source: &test_rsc_source_tcp
       kind: FLUXON_OPS_FS_S3
       bucket: fluxon-release

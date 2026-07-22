@@ -18,6 +18,13 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+repo_root_str = str(REPO_ROOT)
+if repo_root_str not in sys.path:
+    sys.path.insert(0, repo_root_str)
+
+from setup_and_pack.package_contract import RELEASE_WHEEL_GLOB, PYTHON_WHEEL_DISTRIBUTION
+
+
 DEFAULT_SUITE_PATH = REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml"
 DEFAULT_DEPLOYCONF_TEMPLATE = REPO_ROOT / "fluxon_test_stack" / "deployconf_testbed.yml"
 DEFAULT_START_TEST_BED_TEMPLATE = REPO_ROOT / "fluxon_test_stack" / "start_test_bed.yaml"
@@ -41,7 +48,9 @@ LOCAL_PRIMARY_NODE_SUFFIX = "a"
 LOCAL_SECONDARY_NODE_SUFFIX = "b"
 TEST_STACK_START_TEST_BED_CONFIG_ENV = "FLUXON_TEST_STACK_START_TEST_BED_CONFIG"
 RELEASE_MANIFEST_SHA256_ENV_KEY = "FLUXON_RELEASE_MANIFEST_SHA256"
-PLACEHOLDER_WHEEL_NAME = "fluxon-0.0.0-ci-placeholder-cp38-abi3-manylinux_2_28_x86_64.whl"
+PLACEHOLDER_WHEEL_NAME = (
+    f"{PYTHON_WHEEL_DISTRIBUTION}-0.0.0-ci-placeholder-cp38-abi3-manylinux_2_28_x86_64.whl"
+)
 SAME_HOST_LOCAL_MULTI_NODE_ETCD_CLIENT_PORT_OFFSET = 100
 SAME_HOST_LOCAL_MULTI_NODE_GREPTIME_PORT_OFFSET = 110
 SAME_HOST_LOCAL_MULTI_NODE_TEST_STACK_COORDINATOR_PORT_OFFSET = 1000
@@ -1185,7 +1194,7 @@ def main() -> int:
                 workdir=workdir,
             )
 
-    wheel_name = _find_single_wheel(release_dir, pattern="fluxon-*.whl", ctx="top-level release wheel")
+    wheel_name = _find_single_wheel(release_dir, pattern=RELEASE_WHEEL_GLOB, ctx="top-level release wheel")
 
     metadata = _build_generated_configs(
         args=args,

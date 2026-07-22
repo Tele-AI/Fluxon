@@ -30,6 +30,7 @@ if scripts_dir_str in sys.path:
 sys.path.insert(0, scripts_dir_str)
 
 import utils as script_utils
+from package_contract import RELEASE_WHEEL_GLOB
 from source_selection_profiles import (
     SOURCE_SELECTION_PROFILE_SOURCE_PACK,
     collect_source_profile_relpaths,
@@ -816,7 +817,7 @@ def _validate_existing_release_dir(*, release_dir: Path) -> None:
     if not release_dir.exists() or not release_dir.is_dir():
         raise RuntimeError(f"pack_test_stack_rsc requires an existing release dir: {release_dir}")
 
-    required_file_globs = ("fluxon-*.whl",)
+    required_file_globs = (RELEASE_WHEEL_GLOB,)
     required_relpaths = (
         "install.py",
         RELEASE_MANIFEST_FILENAME,

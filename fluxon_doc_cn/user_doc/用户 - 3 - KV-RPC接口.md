@@ -25,7 +25,7 @@ Python 业务代码优先直接在代码里写 Python dict，并传给 `FluxonKv
 
 - `etcd` 在 `127.0.0.1:2379`
 - `greptime` HTTP 在 `127.0.0.1:34030`
-- 当前 `python3` 所在环境已经安装 `fluxon-*.whl` 和 `fluxon_pyo3-*.whl`；安装方式见 [用户 - 0 - 安装](./用户%20-%200%20-%20安装.md)
+- 当前 `python3` 所在环境已经安装统一的 `fluxon_ai-*.whl`；安装方式见 [用户 - 0 - 安装](./用户%20-%200%20-%20安装.md)
 
 对应示例脚本：`examples/start_master_owner.py`
 

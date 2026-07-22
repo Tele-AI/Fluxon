@@ -1,0 +1,158 @@
+name: publish_pypi
+
+on:
+  workflow_run:
+    workflows:
+      - ci_2_virt_node
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: publish-pypi-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  prepare-wheel:
+    name: Validate tested wheel
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.path == '.github/workflows/all_test.yml' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+    env:
+      CI_SHA: ${{ github.event.workflow_run.head_sha }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+    steps:
+      - name: Check out trusted publishing helpers
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Verify tag and default-branch ancestry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          object_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type')"
+          object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          for _ in 1 2 3 4 5; do
+            if [[ "$object_type" == "commit" ]]; then
+              break
+            fi
+            if [[ "$object_type" != "tag" ]]; then
+              echo "Unexpected git object type for $RELEASE_TAG: $object_type" >&2
+              exit 1
+            fi
+            object_type="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.type')"
+            object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.sha')"
+          done
+          if [[ "$object_type" != "commit" || "$object_sha" != "$CI_SHA" ]]; then
+            echo "Tag/CI commit mismatch: tag=$object_sha ci=$CI_SHA type=$object_type" >&2
+            exit 1
+          fi
+
+          compare_status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$CI_SHA...$DEFAULT_BRANCH" --jq '.status')"
+          if [[ "$compare_status" != "ahead" && "$compare_status" != "identical" ]]; then
+            echo "Tagged commit is not in the default-branch history: status=$compare_status" >&2
+            exit 1
+          fi
+
+      - name: Check out tagged release metadata
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Verify repository release metadata
+        run: |
+          python3 release-source/fluxon_release/resolve_release_meta.py \
+            --git-ref "refs/tags/$RELEASE_TAG"
+
+      - name: Download tested CI release
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: fluxon-ci-release-${{ github.event.workflow_run.head_sha }}
+          path: ${{ runner.temp }}/fluxon-ci-artifact
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Extract tested CI release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/fluxon-pypi-release"
+          tar -xzf "$RUNNER_TEMP/fluxon-ci-artifact/fluxon-ci-release.tar.gz" \
+            -C "$RUNNER_TEMP/fluxon-pypi-release"
+          test -d "$RUNNER_TEMP/fluxon-pypi-release/fluxon_release"
+
+      - name: Validate wheel contract
+        id: wheel
+        run: |
+          python3 setup_and_pack/validate_pypi_wheel.py \
+            --release-dir "$RUNNER_TEMP/fluxon-pypi-release/fluxon_release" \
+            --release-tag "$RELEASE_TAG" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Check wheel metadata rendering
+        run: |
+          python3 -m pip install --disable-pip-version-check twine==6.2.0
+          python3 -m twine check "${{ steps.wheel.outputs.wheel_path }}"
+
+      - name: Stage validated wheel
+        env:
+          WHEEL_PATH: ${{ steps.wheel.outputs.wheel_path }}
+          WHEEL_SHA256: ${{ steps.wheel.outputs.wheel_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pypi-dist"
+          cp "$WHEEL_PATH" "$RUNNER_TEMP/pypi-dist/"
+          cd "$RUNNER_TEMP/pypi-dist"
+          echo "$WHEEL_SHA256  $(basename "$WHEEL_PATH")" | sha256sum --check -
+
+      - name: Upload validated PyPI wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pypi-wheel-${{ github.event.workflow_run.head_sha }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          path: ${{ runner.temp }}/pypi-dist/*.whl
+
+  publish-wheel:
+    name: Publish wheel to PyPI
+    needs: prepare-wheel
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/fluxon-ai/
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Download validated PyPI wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: pypi-wheel-${{ github.event.workflow_run.head_sha }}
+          path: pypi-dist
+
+      - name: Publish wheel with trusted identity
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: pypi-dist/

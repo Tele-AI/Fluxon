@@ -55,13 +55,13 @@ class QuickStartReleaseOnlyTest(unittest.TestCase):
             (release_dir / "ext_images" / "etcd" / "etcd").write_text("etcd", encoding="utf-8")
             (release_dir / "ext_images" / "etcd" / "etcdctl").write_text("etcdctl", encoding="utf-8")
             (release_dir / "ext_images" / "greptime" / "greptime").write_text("greptime", encoding="utf-8")
-            (release_dir / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl").write_text("wheel", encoding="utf-8")
+            (release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl").write_text("wheel", encoding="utf-8")
 
             dockerfile_path = _BUILD_IMAGE._stage_build_context(release_dir=release_dir, context_root=context_root)
 
             self.assertEqual(dockerfile_path, context_root / "examples" / "fluxon_quick_start" / "Dockerfile")
             self.assertTrue(
-                (context_root / "fluxon_release" / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl").is_file()
+                (context_root / "fluxon_release" / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl").is_file()
             )
             self.assertFalse((context_root / "fluxon_py").exists())
             self.assertFalse((context_root / "setup.py").exists())

@@ -41,8 +41,11 @@ RUNNER_REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNNER_DEPLOYMENT_DIR = RUNNER_REPO_ROOT / "deployment"
 RUNNER_DEPLOYMENT_UTILS_DIR = RUNNER_DEPLOYMENT_DIR / "utils"
 RUNNER_TEMPLATE_DIR = (RUNNER_REPO_ROOT / "fluxon_test_stack" / "test_runner_templates").resolve()
+sys.path.insert(0, str(RUNNER_REPO_ROOT))
 sys.path.insert(0, str(RUNNER_DEPLOYMENT_DIR))
 sys.path.insert(0, str(RUNNER_DEPLOYMENT_UTILS_DIR))
+
+from setup_and_pack.package_contract import RELEASE_WHEEL_GLOB
 
 from benchmark_role_names import (
     KV_NODE_ROLE_SEED,
@@ -13395,7 +13398,7 @@ def _test_stack_target_host_venv_python(
 
 def _test_stack_runtime_wheel_paths(*, run_dir: Path) -> Tuple[Path]:
     wheels_root = (run_dir / _TEST_STACK_RUNTIME_DIRNAME / _TEST_STACK_RUNTIME_WHEEL_DIRNAME).resolve()
-    wheel_candidates = sorted(path for path in wheels_root.glob("fluxon-*.whl") if path.is_file())
+    wheel_candidates = sorted(path for path in wheels_root.glob(RELEASE_WHEEL_GLOB) if path.is_file())
     if len(wheel_candidates) != 1:
         raise ValueError(
             "TEST_STACK runtime must contain exactly one Fluxon wheel: "

@@ -175,6 +175,14 @@ The benchmark results show that small-file reads and large-file writes already o
 
 Quick Start is the shortest path to try Fluxon. For formal installation, deployment, and operations, see [User Docs](https://tele-ai.github.io/Fluxon/user_doc/).
 
+For a Linux x86_64 Python process that connects to an existing service plane, install the public distribution directly:
+
+```bash
+python3 -m pip install fluxon-ai
+```
+
+The distribution installs the `fluxon_py` import package. Service-plane runtimes and the complete release bundle remain available from GitHub Releases.
+
 ### KV Quick Start
 
 ```bash

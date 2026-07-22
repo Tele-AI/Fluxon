@@ -4,12 +4,28 @@
 
 If you use Fluxon directly, you usually deal with two install bundles:
 
-- Fluxon core artifacts: `fluxon-*.whl`, `fluxon_pyo3-*.whl`, `pylib_src.tar.gz`, `install.py`, `fluxon_release.sha256`
+- Fluxon core artifacts: the unified `fluxon_ai-*.whl`, `pylib_src.tar.gz`, `install.py`, and `fluxon_release.sha256`
 - Runtime packages for `etcd / Greptime / TiKV`: `ext_images.tar.gz`
 
 If your Python process only attaches to an existing service plane, you normally only need the Fluxon core package. If you also need to start the KV / MQ / FS service plane yourself, prepare the `etcd / Greptime / TiKV` runtime package as well. See [Architecture and Concepts](<./User - 1 - Architecture and Concepts.md>) for the role model.
 
-### Download from GitHub Releases
+### Install the Python Package from PyPI
+
+If the Python process attaches to an existing service plane, install the `fluxon-ai` distribution directly from PyPI:
+
+```bash
+python3 -m pip install fluxon-ai
+```
+
+The distribution name uses a hyphen; the installed Python import path remains:
+
+```python
+import fluxon_py
+```
+
+The current PyPI wheel targets Linux x86_64 with a `manylinux_2_28` baseline. It does not include the `etcd / Greptime / TiKV` service-plane runtime; use the complete GitHub Release below when those objects are required.
+
+### Download Complete Artifacts from GitHub Releases
 
 <!-- TODO: add the real release URL after the Releases page is public -->
 
@@ -22,7 +38,7 @@ https://github.com/<org>/fluxon/releases
 ```bash
 tar xzf fluxon_release.tar.gz
 cd fluxon_release
-pip install fluxon-*.whl fluxon_pyo3-*.whl
+python3 -m pip install fluxon_ai-*.whl
 ```
 
 #### Unpack `etcd / Greptime / TiKV`
@@ -64,8 +80,7 @@ Related docs:
 
 | File | Description |
 |---|---|
-| `fluxon-*.whl` | Fluxon Python package |
-| `fluxon_pyo3-*.whl` | Fluxon Rust bindings (PyO3) |
+| `fluxon_ai-*.whl` | Unified Fluxon Python package with the PyO3 runtime embedded |
 | `pylib_src.tar.gz` | Python source bundle |
 | `install.py` | Release runtime entrypoint |
 | `fluxon_release.sha256` | SHA256 checksum file for all release artifacts |

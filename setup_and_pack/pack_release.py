@@ -28,6 +28,7 @@ repo_root_str = str(REPO_ROOT)
 if repo_root_str not in sys.path:
     sys.path.insert(0, repo_root_str)
 
+from setup_and_pack.package_contract import RELEASE_WHEEL_GLOB, PYTHON_WHEEL_DISTRIBUTION
 from setup_and_pack.utils import wheel_runtime_helper
 
 
@@ -141,7 +142,7 @@ def main() -> int:
         with script_utils.stage("Seeding profile cache compatibility entries"):
             _seed_profile_cache_compat_entries(release_dir=release_dir)
 
-        wheel = _find_single(release_dir, "fluxon-*.whl", "release wheel")
+        wheel = _find_single(release_dir, RELEASE_WHEEL_GLOB, "release wheel")
         try:
             manylinux_version = load_manylinux_version_static(repo_root=repo_root)
         except Exception as e:
@@ -227,7 +228,7 @@ def _run_pack_steps(
 
     _remove_release_wheels(
         release_dir=release_dir,
-        pattern="fluxon-*.whl",
+        pattern=RELEASE_WHEEL_GLOB,
         ignore_predicate=lambda path: "pyo3" in path.name,
     )
 
@@ -241,7 +242,7 @@ def _run_pack_steps(
             cwd=str(repo_root),
         )
 
-    wheel_py = _find_single(release_dir, "fluxon-*.whl", "pure python wheel")
+    wheel_py = _find_single(release_dir, RELEASE_WHEEL_GLOB, "pure python wheel")
     with script_utils.stage("Assembling unified release wheel"):
         merged_wheel = _assemble_unified_release_wheel(
             release_dir=release_dir,
@@ -380,9 +381,19 @@ def _merged_fluxon_wheel_name(*, pure_python_wheel_name: str, pyo3_wheel_name: s
         raise RuntimeError(f"invalid pure-python wheel filename: {pure_python_wheel_name}")
     if len(pyo3_parts) < 5:
         raise RuntimeError(f"invalid pyo3 wheel filename: {pyo3_wheel_name}")
+    if pure_parts[0] != PYTHON_WHEEL_DISTRIBUTION:
+        raise RuntimeError(
+            f"unexpected pure-python wheel distribution: {pure_parts[0]}, expected {PYTHON_WHEEL_DISTRIBUTION}"
+        )
+    if pyo3_parts[0] != "fluxon_pyo3":
+        raise RuntimeError(f"unexpected pyo3 wheel distribution: {pyo3_parts[0]}")
     version = pure_parts[1]
+    if pyo3_parts[1] != version:
+        raise RuntimeError(
+            f"wheel version mismatch: pure-python={version}, pyo3={pyo3_parts[1]}"
+        )
     tag_parts = pyo3_parts[-3:]
-    return "-".join(["fluxon", version, *tag_parts])
+    return "-".join([PYTHON_WHEEL_DISTRIBUTION, version, *tag_parts])
 
 
 def _assert_no_top_level_pyo3_wheel(*, release_dir: Path, manylinux_version: str) -> None:

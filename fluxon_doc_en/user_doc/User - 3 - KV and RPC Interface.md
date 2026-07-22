@@ -25,7 +25,7 @@ The minimal local startup example is `examples/start_master_owner.py`. It only s
 
 - `etcd` at `127.0.0.1:2379`
 - `Greptime` HTTP at `127.0.0.1:34030`
-- the current Python environment already installed `fluxon-*.whl` and `fluxon_pyo3-*.whl`
+- the current Python environment already installed the unified `fluxon_ai-*.whl`
 
 ### Minimal Role Startup Example
 
