@@ -431,8 +431,10 @@ pub struct InflightGetInfo {
     pub req_node_id: NodeID,
     pub len: u64,
     pub target: InflightGetTarget,
-    /// Exact requester registration generation that owns `target`.
-    pub target_tomb_tag: NodeTombTag,
+    /// Exact requester segment-registration generation that owns an
+    /// allocator-backed target. External sinks are caller-owned and instead
+    /// carry their membership generation inside `InflightGetTarget`.
+    pub target_tomb_tag: Option<NodeTombTag>,
     pub route: Arc<OneKvNodesRoutes>,
     pub allocation_mode: GetAllocationMode,
     pub durable_reservation: Option<Arc<GetDurableSlotReservation>>,
@@ -453,6 +455,7 @@ pub struct CompletedGetInfo {
 pub enum InflightGetTarget {
     Allocation(Arc<Allocation>),
     PreparedLocalReserveSlot(CommittedSlotReplica),
+    ExternalSink(crate::master_kv_router::msg_pack::GetExternalSinkTarget),
 }
 
 impl InflightGetTarget {
@@ -460,6 +463,7 @@ impl InflightGetTarget {
         match self {
             Self::Allocation(allocation) => allocation.base_addr() + allocation.addr(),
             Self::PreparedLocalReserveSlot(slot) => slot.addr,
+            Self::ExternalSink(target) => target.addr,
         }
     }
 
@@ -467,6 +471,7 @@ impl InflightGetTarget {
         match self {
             Self::Allocation(allocation) => allocation.base_addr(),
             Self::PreparedLocalReserveSlot(slot) => slot.base_addr,
+            Self::ExternalSink(target) => target.addr,
         }
     }
 
@@ -474,6 +479,7 @@ impl InflightGetTarget {
         match self {
             Self::Allocation(allocation) => allocation.capcity(),
             Self::PreparedLocalReserveSlot(slot) => slot.slot_size,
+            Self::ExternalSink(target) => target.capacity,
         }
     }
 }
@@ -4506,6 +4512,7 @@ impl MasterKvRouter {
             GetAllocationMode::ReuseReplica => "reuse_replica",
             GetAllocationMode::DurableReplica => "durable_replica",
             GetAllocationMode::LocalCommittedSlot => "local_committed_slot",
+            GetAllocationMode::ExternalSink => "external_sink",
         };
         let mode_count = self
             .inner()

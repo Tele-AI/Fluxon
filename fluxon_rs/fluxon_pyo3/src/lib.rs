@@ -25,6 +25,7 @@ use fluxon_kv::client_kv_api::{
     ClientKvApiInner, OwnerLocalPublishItem, OwnerLocalPublishJob, OwnerLocalReserveSlotLease,
 };
 use fluxon_kv::client_seg_pool::ClientSegPoolViewTrait;
+use fluxon_kv::client_transfer_engine::ClientTransferEngineAccessTrait;
 use fluxon_kv::cluster_manager::ClusterManagerViewTrait;
 use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use fluxon_kv::config::{ClientConfigYaml, MasterConfigYaml};
@@ -4770,6 +4771,263 @@ impl KvClient {
         cancel_get_transfer_inner(self, handle, py).into_py_object(py)
     }
 
+    /// Start background RDMA pulls directly into caller-owned GPU destinations.
+    #[pyo3(signature = (keys, destinations, prefix_best_effort=true, atomic_group_lens=None, concurrency=None))]
+    fn get_start_gpu(
+        &self,
+        keys: Vec<String>,
+        destinations: Vec<(u64, u64, u64)>,
+        prefix_best_effort: bool,
+        atomic_group_lens: Option<Vec<usize>>,
+        concurrency: Option<usize>,
+        py: Python,
+    ) -> PyObject {
+        fn get_start_gpu_inner(
+            client: &KvClient,
+            keys: Vec<String>,
+            destinations: Vec<(u64, u64, u64)>,
+            prefix_best_effort: bool,
+            atomic_group_lens: Option<Vec<usize>>,
+            concurrency: Option<usize>,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            if keys.is_empty() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "get_start_gpu requires at least one key",
+                ));
+            }
+            if keys.len() != destinations.len() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "get_start_gpu requires one destination per key",
+                ));
+            }
+            let batch_concurrency = match concurrency.unwrap_or(DEFAULT_PYO3_BATCH_CONCURRENCY) {
+                0 => {
+                    return ApiResult::new_error(new_invalid_argument_error(
+                        py,
+                        "get_start_gpu concurrency must be > 0",
+                    ));
+                }
+                value => value,
+            };
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(value) => value,
+                Err(err) => return ApiResult::new_error(err),
+            };
+            if !framework.is_external_mode() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "get_start_gpu is supported only in external-client mode",
+                ));
+            }
+            let runtime = match client.runtime.as_ref() {
+                Some(value) => value,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let destinations = destinations
+                .into_iter()
+                .map(|(registration_id, addr, capacity)| {
+                    fluxon_kv::external_client_api::ExternalGpuDestination {
+                        registration_id,
+                        addr,
+                        capacity,
+                    }
+                })
+                .collect();
+            let framework_for_start = framework.clone();
+            let result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_start
+                        .external_client_api_view()
+                        .external_client_api()
+                        .inner()
+                        .get_start_gpu(
+                            keys,
+                            destinations,
+                            prefix_best_effort,
+                            atomic_group_lens,
+                            batch_concurrency,
+                        )
+                        .await
+                })
+            }) {
+                Ok(value) => value,
+                Err(err) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {err}"),
+                    ));
+                }
+            };
+            match result {
+                Ok(started) => {
+                    let out = PyDict::new_bound(py);
+                    out.set_item("handle", started.handle).expect("set handle");
+                    out.set_item("raw_prefix_hit_len", started.raw_prefix_hit_len as u64)
+                        .expect("set raw_prefix_hit_len");
+                    ApiResult::new_success(out.into_py(py))
+                }
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "get_start_gpu failed",
+                )),
+            }
+        }
+
+        get_start_gpu_inner(
+            self,
+            keys,
+            destinations,
+            prefix_best_effort,
+            atomic_group_lens,
+            concurrency,
+            py,
+        )
+        .into_py_object(py)
+    }
+
+    /// Wait for a GPU Get terminal and consume an atomic prefix.
+    #[pyo3(signature = (handle, consume_prefix_len=None))]
+    fn get_transfer_gpu(
+        &self,
+        handle: u64,
+        consume_prefix_len: Option<usize>,
+        py: Python,
+    ) -> PyObject {
+        fn get_transfer_gpu_inner(
+            client: &KvClient,
+            handle: u64,
+            consume_prefix_len: Option<usize>,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(value) => value,
+                Err(err) => return ApiResult::new_error(err),
+            };
+            if !framework.is_external_mode() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "get_transfer_gpu is supported only in external-client mode",
+                ));
+            }
+            let runtime = match client.runtime.as_ref() {
+                Some(value) => value,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let framework_for_transfer = framework.clone();
+            let result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_transfer
+                        .external_client_api_view()
+                        .external_client_api()
+                        .inner()
+                        .get_transfer_gpu(handle, consume_prefix_len)
+                        .await
+                })
+            }) {
+                Ok(value) => value,
+                Err(err) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {err}"),
+                    ));
+                }
+            };
+            match result {
+                Ok(terminal) => {
+                    let out = PyDict::new_bound(py);
+                    out.set_item(
+                        "transferred_prefix_len",
+                        terminal.transferred_prefix_len as u64,
+                    )
+                    .expect("set transferred_prefix_len");
+                    out.set_item("consumed_prefix_len", terminal.consumed_prefix_len as u64)
+                        .expect("set consumed_prefix_len");
+                    ApiResult::new_success(out.into_py(py))
+                }
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "get_transfer_gpu failed",
+                )),
+            }
+        }
+
+        get_transfer_gpu_inner(self, handle, consume_prefix_len, py).into_py_object(py)
+    }
+
+    /// Cancel a live GPU Get handle and wait until master cleanup is terminal.
+    #[pyo3(signature = (handle))]
+    fn cancel_get_transfer_gpu(&self, handle: u64, py: Python) -> PyObject {
+        fn cancel_get_transfer_gpu_inner(
+            client: &KvClient,
+            handle: u64,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(value) => value,
+                Err(err) => return ApiResult::new_error(err),
+            };
+            if !framework.is_external_mode() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "cancel_get_transfer_gpu is supported only in external-client mode",
+                ));
+            }
+            let runtime = match client.runtime.as_ref() {
+                Some(value) => value,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let framework_for_cancel = framework.clone();
+            let result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_cancel
+                        .external_client_api_view()
+                        .external_client_api()
+                        .inner()
+                        .cancel_get_transfer_gpu(handle)
+                        .await
+                })
+            }) {
+                Ok(value) => value,
+                Err(err) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {err}"),
+                    ));
+                }
+            };
+            match result {
+                Ok(()) => ApiResult::new_success(0i32.into_py(py)),
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "cancel_get_transfer_gpu failed",
+                )),
+            }
+        }
+
+        cancel_get_transfer_gpu_inner(self, handle, py).into_py_object(py)
+    }
+
     /// Allocate a fluxon-kv lease id synchronously.
     /// Always allocate a new lease id (no reuse by requested id).
     /// Allocate with the provided TTL seconds (must be >= MIN_CLIENT_TTL_SECONDS).
@@ -5369,6 +5627,176 @@ impl KvClient {
             py,
         )
         .into_py_object(py)
+    }
+
+    /// Register one caller-owned GPU staging range with the transfer engine.
+    #[pyo3(signature = (ptr, len, device_id))]
+    fn register_gpu_buffer(&self, ptr: u64, len: u64, device_id: u32, py: Python) -> PyObject {
+        fn register_gpu_buffer_inner(
+            client: &KvClient,
+            ptr: u64,
+            len: u64,
+            device_id: u32,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            if !framework.is_external_mode() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "register_gpu_buffer is supported only in external-client mode",
+                ));
+            }
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let framework_for_register = framework.clone();
+            let result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_register
+                        .client_seg_pool_view()
+                        .client_transfer_engine()
+                        .register_gpu_memory(ptr, len, device_id)
+                        .await
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+            match result {
+                Ok(registration) => {
+                    let out = PyDict::new_bound(py);
+                    out.set_item("registration_id", registration.registration_id)
+                        .expect("set registration_id");
+                    out.set_item("ptr", registration.addr).expect("set ptr");
+                    out.set_item("len", registration.len).expect("set len");
+                    out.set_item("device_id", registration.device_id)
+                        .expect("set device_id");
+                    ApiResult::new_success(out.into_py(py))
+                }
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "register_gpu_buffer failed",
+                )),
+            }
+        }
+
+        register_gpu_buffer_inner(self, ptr, len, device_id, py).into_py_object(py)
+    }
+
+    /// Unregister a GPU staging range after every destination guard is released.
+    #[pyo3(signature = (registration_id))]
+    fn unregister_gpu_buffer(&self, registration_id: u64, py: Python) -> PyObject {
+        fn unregister_gpu_buffer_inner(
+            client: &KvClient,
+            registration_id: u64,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            if !framework.is_external_mode() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "unregister_gpu_buffer is supported only in external-client mode",
+                ));
+            }
+            let runtime = match client.runtime.as_ref() {
+                Some(v) => v,
+                None => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        "Client runtime is missing",
+                    ));
+                }
+            };
+            let framework_for_unregister = framework.clone();
+            let result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_unregister
+                        .client_seg_pool_view()
+                        .client_transfer_engine()
+                        .unregister_gpu_memory(registration_id)
+                        .await
+                })
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {}", e),
+                    ));
+                }
+            };
+            match result {
+                Ok(()) => ApiResult::new_success(0i32.into_py(py)),
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "unregister_gpu_buffer failed",
+                )),
+            }
+        }
+
+        unregister_gpu_buffer_inner(self, registration_id, py).into_py_object(py)
+    }
+
+    /// Validate one destination against the exact GPU registration generation.
+    #[pyo3(signature = (registration_id, ptr, capacity))]
+    fn validate_gpu_destination(
+        &self,
+        registration_id: u64,
+        ptr: u64,
+        capacity: u64,
+        py: Python,
+    ) -> PyObject {
+        fn validate_gpu_destination_inner(
+            client: &KvClient,
+            registration_id: u64,
+            ptr: u64,
+            capacity: u64,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(v) => v,
+                Err(e) => return ApiResult::new_error(e),
+            };
+            if !framework.is_external_mode() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "validate_gpu_destination is supported only in external-client mode",
+                ));
+            }
+            match framework
+                .client_seg_pool_view()
+                .client_transfer_engine()
+                .validate_gpu_destination(registration_id, ptr, capacity)
+            {
+                Ok(_guard) => ApiResult::new_success(0i32.into_py(py)),
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "validate_gpu_destination failed",
+                )),
+            }
+        }
+
+        validate_gpu_destination_inner(self, registration_id, ptr, capacity, py).into_py_object(py)
     }
 
     /// Register a caller-owned host buffer range used by batch zero-copy paths.

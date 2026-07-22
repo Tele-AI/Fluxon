@@ -1424,6 +1424,7 @@ impl ClientKvApiInner {
             serialize_part: GetStartReq {
                 key: key.to_string(),
                 prepared_target: None,
+                external_sink_target: None,
             },
             raw_bytes: Vec::new(),
         };
@@ -1464,6 +1465,7 @@ impl ClientKvApiInner {
             serialize_part: BatchGetStartReq {
                 keys,
                 prepared_targets,
+                external_sink_targets: Vec::new(),
             },
             raw_bytes: Vec::new(),
         };

@@ -224,6 +224,78 @@ class _RegisteredBufferDescriptor:
         }
 
 
+@dataclass(frozen=True)
+class GpuBufferRegistration:
+    registration_id: int
+    ptr: int
+    size: int
+    device_id: int
+
+    def __post_init__(self) -> None:
+        if type(self.registration_id) is not int or self.registration_id <= 0:
+            raise ValueError("registration_id must be a positive int")
+        if type(self.ptr) is not int or self.ptr <= 0:
+            raise ValueError("GPU registration ptr must be a positive int")
+        if type(self.size) is not int or self.size <= 0:
+            raise ValueError("GPU registration size must be a positive int")
+        if type(self.device_id) is not int or self.device_id < 0:
+            raise ValueError("GPU device_id must be a non-negative int")
+        if self.end > (1 << 64):
+            raise ValueError("GPU registration range overflows u64")
+
+    @property
+    def end(self) -> int:
+        return self.ptr + self.size
+
+    def destination(self, ptr: int, capacity: int) -> "GpuDestination":
+        destination = GpuDestination(
+            registration_id=self.registration_id,
+            ptr=ptr,
+            capacity=capacity,
+        )
+        if destination.ptr < self.ptr or destination.end > self.end:
+            raise ValueError(
+                "GPU destination is outside its registration: "
+                f"registration=[{self.ptr:#x},{self.end:#x}) "
+                f"destination=[{destination.ptr:#x},{destination.end:#x})"
+            )
+        return destination
+
+
+@dataclass(frozen=True)
+class GpuDestination:
+    registration_id: int
+    ptr: int
+    capacity: int
+
+    def __post_init__(self) -> None:
+        if type(self.registration_id) is not int or self.registration_id <= 0:
+            raise ValueError("registration_id must be a positive int")
+        if type(self.ptr) is not int or self.ptr <= 0:
+            raise ValueError("GPU destination ptr must be a positive int")
+        if type(self.capacity) is not int or self.capacity <= 0:
+            raise ValueError("GPU destination capacity must be a positive int")
+        if self.end > (1 << 64):
+            raise ValueError("GPU destination range overflows u64")
+
+    @property
+    def end(self) -> int:
+        return self.ptr + self.capacity
+
+
+@dataclass
+class GpuGetStartHandle:
+    """One-shot handle for a background RDMA pull into GPU staging."""
+
+    keys: Tuple[str, ...]
+    destinations: Tuple[GpuDestination, ...]
+    result: GetStartResult
+    created_at_ns: int
+    backend_token: int
+    backend_handle: int
+    closed: bool = False
+
+
 def _map_nospace_to_storagefull(err: ApiError) -> ApiError:
     """Normalize storage-capacity errors without depending on backend internals."""
     return err
@@ -461,6 +533,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         self._config = config
         self._init_error: Optional[ApiError] = None
         self._registered_buffer_descriptors: List[_RegisteredBufferDescriptor] = []
+        self._gpu_buffer_registration: Optional[GpuBufferRegistration] = None
         cluster_name = config.fluxonkv_spec_cluster_name
         self._batch_concurrency = 128
         if self._batch_concurrency <= 0:
@@ -997,6 +1070,15 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                     message=f"device_kind must be str; got {type(device_kind)}"
                 )
             )
+        if device_kind.strip().lower() != "host":
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=(
+                        "register_buffer supports host memory only; "
+                        "use register_gpu_buffer for a CUDA staging range"
+                    )
+                )
+            )
         if not isinstance(device_id, str):
             return Result.new_error(
                 InvalidArgumentError(
@@ -1030,6 +1112,164 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                     metadata=dict(metadata or {}),
                 )
             )
+            return Result.new_ok(OkNone())
+        except ApiError as e:
+            return Result.new_error(e)
+
+    def register_gpu_buffer(
+        self,
+        ptr: int,
+        size: int,
+        device_id: int,
+    ) -> Result[GpuBufferRegistration, ApiError]:
+        if self._client is None:
+            return Result.new_error(
+                GeneralError(
+                    message="Store not initialized when register_gpu_buffer(). Call setup() first."
+                )
+            )
+        if isinstance(ptr, bool) or not isinstance(ptr, int) or ptr <= 0:
+            return Result.new_error(
+                InvalidArgumentError(message=f"GPU ptr must be a positive int; got {ptr!r}")
+            )
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            return Result.new_error(
+                InvalidArgumentError(message=f"GPU size must be a positive int; got {size!r}")
+            )
+        if (
+            isinstance(device_id, bool)
+            or not isinstance(device_id, int)
+            or device_id < 0
+        ):
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=f"GPU device_id must be a non-negative int; got {device_id!r}"
+                )
+            )
+        if ptr + size > (1 << 64):
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=f"GPU registration range overflows u64: ptr={ptr:#x} size={size}"
+                )
+            )
+        if self._gpu_buffer_registration is not None:
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=(
+                        "one GPU buffer is already registered: "
+                        f"registration_id={self._gpu_buffer_registration.registration_id}"
+                    )
+                )
+            )
+        try:
+            inner_res = self._client.register_gpu_buffer(ptr, size, device_id)
+            if not inner_res.is_ok():
+                return Result.new_error(inner_res.unwrap_error())
+            payload = inner_res.unwrap()
+            if not isinstance(payload, dict):
+                return Result.new_error(
+                    GeneralError(
+                        message=f"register_gpu_buffer returned non-dict payload: {type(payload)}"
+                    )
+                )
+            registration = GpuBufferRegistration(
+                registration_id=int(payload["registration_id"]),
+                ptr=int(payload["ptr"]),
+                size=int(payload["len"]),
+                device_id=int(payload["device_id"]),
+            )
+            if (
+                registration.registration_id <= 0
+                or registration.ptr != ptr
+                or registration.size != size
+                or registration.device_id != device_id
+            ):
+                return Result.new_error(
+                    GeneralError(
+                        message=(
+                            "register_gpu_buffer returned a mismatched registration: "
+                            f"{registration!r}"
+                        )
+                    )
+                )
+            self._gpu_buffer_registration = registration
+            return Result.new_ok(registration)
+        except ApiError as e:
+            return Result.new_error(e)
+
+    def validate_gpu_destination(
+        self,
+        destination: GpuDestination,
+    ) -> Result[OkNone, ApiError]:
+        if self._client is None:
+            return Result.new_error(
+                GeneralError(
+                    message="Store not initialized when validate_gpu_destination()."
+                )
+            )
+        if not isinstance(destination, GpuDestination):
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=(
+                        "validate_gpu_destination requires GpuDestination; "
+                        f"got {type(destination)}"
+                    )
+                )
+            )
+        if destination.capacity <= 0 or destination.ptr <= 0:
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=f"invalid GPU destination: {destination!r}"
+                )
+            )
+        try:
+            inner_res = self._client.validate_gpu_destination(
+                destination.registration_id,
+                destination.ptr,
+                destination.capacity,
+            )
+            if not inner_res.is_ok():
+                return Result.new_error(inner_res.unwrap_error())
+            _ = inner_res.unwrap()
+            return Result.new_ok(OkNone())
+        except ApiError as e:
+            return Result.new_error(e)
+
+    def unregister_gpu_buffer(
+        self,
+        registration: GpuBufferRegistration,
+    ) -> Result[OkNone, ApiError]:
+        if self._client is None:
+            return Result.new_error(
+                GeneralError(
+                    message="Store not initialized when unregister_gpu_buffer()."
+                )
+            )
+        if not isinstance(registration, GpuBufferRegistration):
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=(
+                        "unregister_gpu_buffer requires GpuBufferRegistration; "
+                        f"got {type(registration)}"
+                    )
+                )
+            )
+        active = self._gpu_buffer_registration
+        if active != registration:
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=(
+                        "GPU registration is not active on this store: "
+                        f"requested={registration!r} active={active!r}"
+                    )
+                )
+            )
+        try:
+            inner_res = self._client.unregister_gpu_buffer(registration.registration_id)
+            if not inner_res.is_ok():
+                return Result.new_error(inner_res.unwrap_error())
+            _ = inner_res.unwrap()
+            self._gpu_buffer_registration = None
             return Result.new_ok(OkNone())
         except ApiError as e:
             return Result.new_error(e)
@@ -1443,6 +1683,13 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
     def close(self) -> Result[OkNone, ApiError]:
         """Close and tear down the store."""
         try:
+            if self._gpu_buffer_registration is not None:
+                unregister_result = self.unregister_gpu_buffer(
+                    self._gpu_buffer_registration
+                )
+                if not unregister_result.is_ok():
+                    return Result.new_error(unregister_result.unwrap_error())
+                _ = unregister_result.unwrap()
             # Backend returns a Result; MUST be explicitly consumed to avoid
             # leaking an unconsumed Result that triggers __del__ assertion.
             res = self._client.close()
@@ -1781,6 +2028,205 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         if not isinstance(plan_ptr, int) or plan_ptr <= 0:
             raise RuntimeError(f"get_transfer returned invalid plan_ptr: {plan_ptr!r}")
         return int(plan_ptr)
+
+    def get_start_gpu(
+        self,
+        keys: List[str],
+        destinations: List[GpuDestination],
+        prefix_best_effort: bool = True,
+        atomic_group_lens: Optional[List[int]] = None,
+    ) -> GpuGetStartHandle:
+        """Start background remote reads directly into caller-owned GPU staging."""
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when get_start_gpu(). Call setup() first."
+            )
+        if len(keys) == 0:
+            raise ValueError("get_start_gpu requires at least one key")
+        if len(keys) != len(destinations):
+            raise ValueError(
+                "get_start_gpu requires one destination per key: "
+                f"keys={len(keys)} destinations={len(destinations)}"
+            )
+        active_registration = self._gpu_buffer_registration
+        if active_registration is None:
+            raise RuntimeError("get_start_gpu requires an active GPU registration")
+        for index, destination in enumerate(destinations):
+            if not isinstance(destination, GpuDestination):
+                raise TypeError(
+                    "get_start_gpu destinations must be GpuDestination: "
+                    f"index={index} got={type(destination)}"
+                )
+            if destination.registration_id != active_registration.registration_id:
+                raise ValueError(
+                    "get_start_gpu destination uses a stale registration: "
+                    f"index={index} destination_id={destination.registration_id} "
+                    f"active_id={active_registration.registration_id}"
+                )
+            if (
+                destination.ptr < active_registration.ptr
+                or destination.end > active_registration.end
+            ):
+                raise ValueError(
+                    "get_start_gpu destination is outside the active registration: "
+                    f"index={index} destination={destination!r} "
+                    f"registration={active_registration!r}"
+                )
+
+        normalized_group_lens: Optional[List[int]] = None
+        if atomic_group_lens is not None:
+            normalized_group_lens = [int(length) for length in atomic_group_lens]
+            if any(length <= 0 for length in normalized_group_lens):
+                raise ValueError("get_start_gpu atomic_group_lens entries must be > 0")
+            if sum(normalized_group_lens) != len(keys):
+                raise ValueError(
+                    "get_start_gpu atomic_group_lens must sum to keys length: "
+                    f"sum={sum(normalized_group_lens)} keys={len(keys)}"
+                )
+
+        started_at_ns = time.monotonic_ns()
+        inner_res = self._client.get_start_gpu(
+            list(keys),
+            [
+                (
+                    destination.registration_id,
+                    destination.ptr,
+                    destination.capacity,
+                )
+                for destination in destinations
+            ],
+            bool(prefix_best_effort),
+            normalized_group_lens,
+            self._batch_concurrency,
+        )
+        if not inner_res.is_ok():
+            raise RuntimeError(f"get_start_gpu backend error: {inner_res.unwrap_error()}")
+        payload = inner_res.unwrap()
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"get_start_gpu returned non-dict payload: {type(payload)}"
+            )
+        backend_handle = int(payload["handle"])
+        try:
+            result = _build_get_start_result_from_backend_payload(
+                payload,
+                list(keys),
+                bool(prefix_best_effort),
+                normalized_group_lens,
+            )
+        except Exception:
+            cancel_res = self._client.cancel_get_transfer_gpu(backend_handle)
+            if not cancel_res.is_ok():
+                logging.exception(
+                    "get_start_gpu payload validation failed and cleanup also failed: %s",
+                    cancel_res.unwrap_error(),
+                )
+            raise
+        return GpuGetStartHandle(
+            keys=tuple(keys),
+            destinations=tuple(destinations),
+            result=result,
+            created_at_ns=started_at_ns,
+            backend_token=id(self),
+            backend_handle=backend_handle,
+        )
+
+    def cancel_get_transfer_gpu(self, handle: GpuGetStartHandle) -> None:
+        if not isinstance(handle, GpuGetStartHandle):
+            raise TypeError(
+                f"cancel_get_transfer_gpu requires GpuGetStartHandle, got {type(handle)}"
+            )
+        if handle.backend_token != id(self):
+            raise RuntimeError(
+                "cancel_get_transfer_gpu handle belongs to a different FluxonKVCacheStore"
+            )
+        if handle.closed:
+            return
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when cancel_get_transfer_gpu(). Call setup() first."
+            )
+        inner_res = self._client.cancel_get_transfer_gpu(handle.backend_handle)
+        handle.closed = True
+        if not inner_res.is_ok():
+            raise RuntimeError(
+                f"cancel_get_transfer_gpu backend error: {inner_res.unwrap_error()}"
+            )
+
+    def get_transfer_gpu(
+        self,
+        handle: GpuGetStartHandle,
+        *,
+        consume_prefix_len: Optional[int] = None,
+    ) -> None:
+        """Wait for the GPU transfer terminal; destinations already contain the bytes."""
+        if not isinstance(handle, GpuGetStartHandle):
+            raise TypeError(
+                f"get_transfer_gpu requires GpuGetStartHandle, got {type(handle)}"
+            )
+        if handle.backend_token != id(self):
+            raise RuntimeError(
+                "get_transfer_gpu handle belongs to a different FluxonKVCacheStore"
+            )
+        if handle.closed:
+            raise RuntimeError("get_transfer_gpu handle has been closed")
+        result = handle.result
+        normalized_consume_prefix_len = (
+            result.transferable_len
+            if consume_prefix_len is None
+            else consume_prefix_len
+        )
+        if (
+            isinstance(normalized_consume_prefix_len, bool)
+            or not isinstance(normalized_consume_prefix_len, int)
+            or normalized_consume_prefix_len <= 0
+            or normalized_consume_prefix_len > result.transferable_len
+        ):
+            raise ValueError(
+                "get_transfer_gpu consume_prefix_len must be within the live prefix: "
+                f"consume={normalized_consume_prefix_len!r} "
+                f"transferable={result.transferable_len}"
+            )
+        group_lens = result.atomic_group_lens or (len(result.keys),)
+        group_end = 0
+        for group_len in group_lens:
+            group_end += int(group_len)
+            if group_end >= normalized_consume_prefix_len:
+                break
+        if group_end != normalized_consume_prefix_len:
+            raise ValueError(
+                "get_transfer_gpu consume_prefix_len must end at an atomic-group boundary: "
+                f"consume={normalized_consume_prefix_len} groups={group_lens}"
+            )
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when get_transfer_gpu(). Call setup() first."
+            )
+        inner_res = self._client.get_transfer_gpu(
+            handle.backend_handle,
+            normalized_consume_prefix_len,
+        )
+        handle.closed = True
+        if not inner_res.is_ok():
+            raise RuntimeError(
+                f"get_transfer_gpu backend error: {inner_res.unwrap_error()}"
+            )
+        payload = inner_res.unwrap()
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"get_transfer_gpu returned non-dict payload: {type(payload)}"
+            )
+        transferred_prefix_len = int(payload["transferred_prefix_len"])
+        consumed_prefix_len = int(payload["consumed_prefix_len"])
+        if (
+            transferred_prefix_len != result.transferable_len
+            or consumed_prefix_len != normalized_consume_prefix_len
+        ):
+            raise RuntimeError(
+                "get_transfer_gpu returned inconsistent terminal lengths: "
+                f"transferred={transferred_prefix_len}/{result.transferable_len} "
+                f"consumed={consumed_prefix_len}/{normalized_consume_prefix_len}"
+            )
 
     def get_etcd_config(self) -> List[str]:
         if self._client is None:

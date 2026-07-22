@@ -62,8 +62,8 @@ module_tags:
   MasterKvRouter: [master]
   MetricReporter: [master, owner, external]
   ClientKvApi: [owner]
-  ClientSegPool: [owner]
-  ClientTransferEngine: [master, owner]
+  ClientSegPool: [owner, external]
+  ClientTransferEngine: [master, owner, external]
   ExternalClientApi: [external]
   MasterLeaseManager: [master]
 

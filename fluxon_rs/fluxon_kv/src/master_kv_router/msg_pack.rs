@@ -18,6 +18,9 @@ pub enum GetAllocationMode {
     ReuseReplica = 1,
     DurableReplica = 2,
     LocalCommittedSlot = 3,
+    /// Caller-owned memory used only as the terminal data sink. The master
+    /// neither allocates it nor publishes it as a cache route on GetDone.
+    ExternalSink = 4,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -29,10 +32,24 @@ pub struct GetPreparedLocalReserveTarget {
     pub base_addr: u64,
 }
 
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct GetExternalSinkTarget {
+    /// Exact destination address in the requester's registered memory.
+    pub addr: u64,
+    /// Caller-validated writable bytes starting at `addr`.
+    pub capacity: u64,
+    /// Opaque requester-side registration generation, retained for identity
+    /// and observability. The requester remains authoritative for MR lifetime.
+    pub registration_id: u64,
+    /// Requester membership generation captured with the GPU registration.
+    pub requester_node_start_time: i64,
+}
+
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct GetStartReq {
     pub key: String,
     pub prepared_target: Option<GetPreparedLocalReserveTarget>,
+    pub external_sink_target: Option<GetExternalSinkTarget>,
 }
 impl MsgPackSerializePart for GetStartReq {
     fn msg_id(&self) -> u32 {
@@ -124,6 +141,9 @@ pub struct BatchGetStartReq {
     /// Empty selects ordinary master allocations. Otherwise this must contain
     /// exactly one entry per key.
     pub prepared_targets: Vec<Option<GetPreparedLocalReserveTarget>>,
+    /// Empty selects no external sinks. Otherwise this must contain exactly
+    /// one entry per key and is mutually exclusive with prepared targets.
+    pub external_sink_targets: Vec<Option<GetExternalSinkTarget>>,
 }
 impl MsgPackSerializePart for BatchGetStartReq {
     fn msg_id(&self) -> u32 {

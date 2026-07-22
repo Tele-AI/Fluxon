@@ -1,3 +1,4 @@
+use crate::ClientTransferEngineAccessTrait;
 use crate::SharedJsonMeta;
 use crate::client_kv_api::external_api::{
     compute_external_get_start_transfer_prefix, normalize_external_get_start_group_lens,
@@ -8,8 +9,15 @@ use crate::client_kv_api::msg_pack::{
     ExternalInvalidateWeakIndexResp,
 };
 use crate::client_seg_pool::{ClientSegPool, SideTransferPeerFileMeta};
+use crate::client_transfer_engine::{ClientTransferEngine, GpuMemoryGuard};
+use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::cluster_manager::{
     META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME,
+};
+use crate::master_kv_router::msg_pack::{
+    BatchGetDoneReq, BatchGetDoneResp, BatchGetRevokeReq, BatchGetRevokeResp,
+    BatchGetStartItemResp, BatchGetStartReq, BatchGetStartResp, GetAllocationMode,
+    GetExternalSinkTarget,
 };
 use crate::rpcresp_kvresult_convert::ToResult;
 use crate::{
@@ -37,6 +45,7 @@ use crate::{
     },
     rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, OK, SharedMemError},
 };
+use ::tokio::sync::watch;
 use async_trait::async_trait;
 use core::panic;
 use dashmap::DashMap;
@@ -44,6 +53,7 @@ use fluxon_commu::ShareGroupOwnerRef;
 use fluxon_framework::{LogicalModule, define_module};
 use fluxon_observability::kv_metrics_actor::{ObserveComponent, ObserveDirection};
 use fluxon_util::semaphore_map::SemaphoreMap;
+use futures::{StreamExt, stream};
 use libc::{MAP_SHARED, PROT_READ, PROT_WRITE, mmap};
 use limit_thirdparty::tokio;
 use limit_thirdparty::tokio::sync::{ARwLock, Notify};
@@ -54,7 +64,7 @@ use std::{
     // path::PathBuf, // 不再使用PathBuf
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -79,6 +89,7 @@ const EXTERNAL_PUT_START_RPC_TIMEOUT_SECS: u64 = 30;
 const EXTERNAL_PUT_TRANSFER_END_RPC_TIMEOUT_SECS: u64 = 30;
 const EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS: usize = 3;
 const EXTERNAL_PUT_TRACE_LOG_WINDOW_SECS: u64 = 10;
+const EXTERNAL_OWNER_INTRA_RPC_READY_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExternalDeleteAckBatchSendResult {
@@ -90,6 +101,52 @@ pub(crate) enum ExternalDeleteAckBatchSendResult {
 pub struct ExternalClientGetStartResp {
     pub handle: u64,
     pub raw_prefix_hit_len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalGpuDestination {
+    pub registration_id: u64,
+    pub addr: u64,
+    pub capacity: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalGpuGetStartResp {
+    pub handle: u64,
+    pub raw_prefix_hit_len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalGpuGetTransferResp {
+    pub transferred_prefix_len: usize,
+    pub consumed_prefix_len: usize,
+}
+
+fn external_gpu_transfer_plan_geometry_is_valid(
+    item: &BatchGetStartItemResp,
+    destination: &ExternalGpuDestination,
+    registered_generation: u64,
+) -> bool {
+    item.len != 0
+        && item.target_addr == destination.addr
+        && item.target_base_addr == destination.addr
+        && item.len <= destination.capacity
+        && item.prepared_target.is_none()
+        && registered_generation == destination.registration_id
+}
+
+#[derive(Clone, Debug)]
+enum ExternalGpuGetTerminal {
+    Completed,
+    Revoked { transfer_error: Option<String> },
+    Failed { detail: String },
+}
+
+struct PendingExternalGpuGet {
+    transferable_len: usize,
+    atomic_group_lens: Vec<usize>,
+    cancel_requested: Arc<AtomicBool>,
+    terminal_rx: watch::Receiver<Option<ExternalGpuGetTerminal>>,
 }
 
 struct PendingExternalGetStart {
@@ -182,10 +239,12 @@ fn inline_external_get_tail_holder_ids(
 #[cfg(test)]
 mod inline_external_get_start_tests {
     use super::{
+        ExternalGpuDestination, external_gpu_transfer_plan_geometry_is_valid,
         inline_external_get_tail_holder_ids, validate_inline_external_get_owner_generation,
         validate_inline_external_get_start_plan,
     };
     use crate::client_kv_api::msg_pack::ExternalBatchGetItemResp;
+    use crate::master_kv_router::msg_pack::BatchGetStartItemResp;
     use crate::memholder::ExternalMemHolderInfo;
     use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, OK};
 
@@ -240,6 +299,28 @@ mod inline_external_get_start_tests {
         );
         assert!(inline_external_get_tail_holder_ids(&items, 0).is_err());
         assert!(inline_external_get_tail_holder_ids(&items, 4).is_err());
+    }
+
+    #[test]
+    fn gpu_transfer_plan_accepts_zero_as_the_first_master_get_id() {
+        let destination = ExternalGpuDestination {
+            registration_id: 7,
+            addr: 0x1000,
+            capacity: 4096,
+        };
+        let item = BatchGetStartItemResp {
+            get_id: 0,
+            target_addr: destination.addr,
+            target_base_addr: destination.addr,
+            len: destination.capacity,
+            ..Default::default()
+        };
+
+        assert!(external_gpu_transfer_plan_geometry_is_valid(
+            &item,
+            &destination,
+            destination.registration_id,
+        ));
     }
 }
 
@@ -422,7 +503,8 @@ define_module!(
     ExternalClientApi,
     (external_client_api, ExternalClientApi),
     (p2p, P2pModule),
-    (cluster_manager, ClusterManager)
+    (cluster_manager, ClusterManager),
+    (client_transfer_engine, ClientTransferEngine)
 );
 
 /// External Client configuration parameters
@@ -498,6 +580,9 @@ pub struct ExternalInner {
     rpc_caller_external_batch_get_start: RPCCaller<ExternalBatchGetStartReq>,
     rpc_caller_external_batch_get_transfer: RPCCaller<ExternalBatchGetTransferReq>,
     rpc_caller_external_batch_get_cancel: RPCCaller<ExternalBatchGetCancelReq>,
+    rpc_caller_master_batch_get_start: RPCCaller<BatchGetStartReq>,
+    rpc_caller_master_batch_get_done: RPCCaller<BatchGetDoneReq>,
+    rpc_caller_master_batch_get_revoke: RPCCaller<BatchGetRevokeReq>,
     rpc_caller_external_put_commit: RPCCaller<ExternalPutCommitReq>,
     rpc_caller_external_batch_put_commit: RPCCaller<ExternalBatchPutCommitReq>,
     rpc_caller_external_put_start: RPCCaller<ExternalPutStartReq>,
@@ -519,6 +604,8 @@ pub struct ExternalInner {
     pending_external_get_start: DashMap<u64, PendingExternalGetStart>,
     /// Fully local plans consumed without a follow-up owner transfer RPC.
     pending_inline_external_get_start: DashMap<u64, PendingInlineExternalGetStart>,
+    next_gpu_get_handle: AtomicU64,
+    pending_external_gpu_get: DashMap<u64, PendingExternalGpuGet>,
     /// per-key semaphore (permits=1) to ensure single inflight per key
     inflight1_per_key: SemaphoreMap<String>,
     put_trace_log_window: Mutex<ExternalPutTraceLogWindow>,
@@ -526,6 +613,133 @@ pub struct ExternalInner {
 }
 
 pub struct ExternalClientApi(ExternalInner);
+
+async fn wait_external_gpu_get_terminal(
+    mut terminal_rx: watch::Receiver<Option<ExternalGpuGetTerminal>>,
+) -> KvResult<ExternalGpuGetTerminal> {
+    loop {
+        if let Some(terminal) = terminal_rx.borrow().clone() {
+            return Ok(terminal);
+        }
+        if terminal_rx.changed().await.is_err() {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: "GPU Get transfer task ended without publishing a terminal state"
+                    .to_string(),
+            }));
+        }
+    }
+}
+
+async fn run_external_gpu_get_transfer(
+    view: ExternalClientApiView,
+    transfer_items: Vec<(BatchGetStartItemResp, GpuMemoryGuard)>,
+    skipped_get_ids: Vec<u64>,
+    transfer_concurrency: usize,
+    cancel_requested: Arc<AtomicBool>,
+) -> ExternalGpuGetTerminal {
+    let transfer_get_ids = transfer_items
+        .iter()
+        .map(|(item, _)| item.get_id)
+        .collect::<Vec<_>>();
+    let mut all_get_ids = skipped_get_ids.clone();
+    all_get_ids.extend(transfer_get_ids.iter().copied());
+
+    let skipped_revoke_error = view
+        .external_client_api()
+        .inner()
+        .master_batch_gpu_get_revoke(skipped_get_ids)
+        .await
+        .err()
+        .map(|err| err.to_string());
+
+    if transfer_items.is_empty() {
+        return match skipped_revoke_error {
+            Some(detail) => ExternalGpuGetTerminal::Failed {
+                detail: format!("GPU Get could not revoke non-transferable starts: {detail}"),
+            },
+            None => ExternalGpuGetTerminal::Revoked {
+                transfer_error: None,
+            },
+        };
+    }
+
+    let transfer_futures = transfer_items.into_iter().map(|(item, gpu_guard)| {
+        let transfer_view = view.clone();
+        let cancel_requested = cancel_requested.clone();
+        async move {
+            if cancel_requested.load(Ordering::Acquire) {
+                return None;
+            }
+            transfer_view
+                .client_transfer_engine()
+                .transfer_data_no_copy_to_gpu(
+                    item.node_id.clone(),
+                    item.src_addr,
+                    item.target_addr,
+                    item.len,
+                    gpu_guard,
+                )
+                .await
+                .err()
+                .map(|err| {
+                    format!(
+                        "GPU Get transfer failed: get_id={} source={} src={:#x} target={:#x} len={} error={}",
+                        item.get_id,
+                        item.node_id,
+                        item.src_addr,
+                        item.target_addr,
+                        item.len,
+                        err
+                    )
+                })
+        }
+    });
+    let mut transfer_stream =
+        stream::iter(transfer_futures).buffer_unordered(transfer_concurrency.max(1));
+    let mut transfer_error = None;
+    while let Some(item_error) = transfer_stream.next().await {
+        if transfer_error.is_none() {
+            transfer_error = item_error;
+        }
+    }
+
+    let cancelled = cancel_requested.load(Ordering::Acquire);
+    if cancelled || transfer_error.is_some() || skipped_revoke_error.is_some() {
+        if let Err(err) = view
+            .external_client_api()
+            .inner()
+            .master_batch_gpu_get_revoke(all_get_ids)
+            .await
+        {
+            return ExternalGpuGetTerminal::Failed {
+                detail: format!(
+                    "GPU Get cleanup failed after transfer/cancel: transfer_error={:?} skipped_revoke_error={:?} revoke_error={}",
+                    transfer_error, skipped_revoke_error, err
+                ),
+            };
+        }
+        if let Some(detail) = skipped_revoke_error {
+            return ExternalGpuGetTerminal::Failed {
+                detail: format!(
+                    "GPU Get initially failed to revoke non-transferable starts: {detail}"
+                ),
+            };
+        }
+        return ExternalGpuGetTerminal::Revoked { transfer_error };
+    }
+
+    match view
+        .external_client_api()
+        .inner()
+        .master_batch_gpu_get_done(transfer_get_ids)
+        .await
+    {
+        Ok(()) => ExternalGpuGetTerminal::Completed,
+        Err(err) => ExternalGpuGetTerminal::Failed {
+            detail: format!("GPU Get BatchDone failed: {err}"),
+        },
+    }
+}
 
 impl ExternalClientApi {
     /// Access inner external-only API. Safe to unwrap in external role.
@@ -567,6 +781,9 @@ impl ExternalClientApi {
             rpc_caller_external_batch_get_start: RPCCaller::<ExternalBatchGetStartReq>::new(),
             rpc_caller_external_batch_get_transfer: RPCCaller::<ExternalBatchGetTransferReq>::new(),
             rpc_caller_external_batch_get_cancel: RPCCaller::<ExternalBatchGetCancelReq>::new(),
+            rpc_caller_master_batch_get_start: RPCCaller::<BatchGetStartReq>::new(),
+            rpc_caller_master_batch_get_done: RPCCaller::<BatchGetDoneReq>::new(),
+            rpc_caller_master_batch_get_revoke: RPCCaller::<BatchGetRevokeReq>::new(),
             rpc_caller_external_put_commit: RPCCaller::<ExternalPutCommitReq>::new(),
             rpc_caller_external_batch_put_commit: RPCCaller::<ExternalBatchPutCommitReq>::new(),
             rpc_caller_external_put_start: RPCCaller::<ExternalPutStartReq>::new(),
@@ -587,6 +804,8 @@ impl ExternalClientApi {
             key_weak_memholder_index: DashMap::new(),
             pending_external_get_start: DashMap::new(),
             pending_inline_external_get_start: DashMap::new(),
+            next_gpu_get_handle: AtomicU64::new(1),
+            pending_external_gpu_get: DashMap::new(),
             inflight1_per_key: SemaphoreMap::new(1, std::time::Duration::from_secs(120)),
             put_trace_log_window: Mutex::new(ExternalPutTraceLogWindow::new()),
             external_delete_ack_batch: ExternalDeleteAckBatchHandle::new(),
@@ -666,6 +885,12 @@ impl ExternalClientApi {
             .regist(ext.view.p2p_module());
         ext.rpc_caller_external_batch_get_cancel
             .regist(ext.view.p2p_module());
+        ext.rpc_caller_master_batch_get_start
+            .regist(ext.view.p2p_module());
+        ext.rpc_caller_master_batch_get_done
+            .regist(ext.view.p2p_module());
+        ext.rpc_caller_master_batch_get_revoke
+            .regist(ext.view.p2p_module());
         ext.rpc_caller_external_put_commit
             .regist(ext.view.p2p_module());
         ext.rpc_caller_external_batch_put_commit
@@ -740,6 +965,11 @@ impl ExternalClientApi {
             .set_self_sub_cluster(ext.initial_sub_cluster.get().unwrap().clone())
             .await
             .map_err(KvError::from)?;
+        // Publishing the share-group binding changes the desired local-owner route from the
+        // pre-binding direct lane to intra-machine-only.  Do not announce external init complete
+        // until that topology transition has converged for the exact owner generation.
+        self.wait_current_owner_intra_rpc_ready_after_binding()
+            .await?;
 
         {
             let view = ext.view.clone_view();
@@ -892,6 +1122,61 @@ impl ExternalClientApi {
                     }));
                 }
             }
+        }
+    }
+
+    async fn wait_current_owner_intra_rpc_ready_after_binding(&self) -> Result<(), KvError> {
+        let ext = &self.0;
+        let owner_id = ext
+            .shared_storage_node_id()
+            .await
+            .expect("external role expects current_owner to be Some after init2");
+        let owner_node_id = owner_id.clone().into();
+        let owner_start_time = ext.current_owner_start_time().await;
+        let expected_binding = ShareGroupOwnerRef {
+            owner_id: owner_id.clone(),
+            owner_start_time,
+        };
+        let started_at = Instant::now();
+        let timeout = Duration::from_secs(EXTERNAL_OWNER_INTRA_RPC_READY_TIMEOUT_SECS);
+
+        tracing::info!(
+            owner_id = %owner_id,
+            owner_start_time,
+            "External init: waiting for current owner intra-machine RPC route after share-group binding"
+        );
+        loop {
+            let snapshot = ext.view.p2p_module().tier_snapshot();
+            let self_binding_ready = snapshot
+                .share_group_owner(&snapshot.self_peer_gen.peer_id)
+                == Some(&expected_binding);
+            if self_binding_ready
+                && let Some(peer_gen) = snapshot.peer_gen(&owner_node_id)
+                && peer_gen.node_start_time == owner_start_time
+                && snapshot.is_send_ready_intra_effective(&peer_gen)
+            {
+                tracing::info!(
+                    owner_id = %owner_id,
+                    owner_start_time,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "External init: current owner intra-machine RPC route ready after share-group binding"
+                );
+                return Ok(());
+            }
+
+            if started_at.elapsed() >= timeout {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "timed out waiting for current owner intra-machine RPC route after share-group binding: owner_id={} owner_start_time={} timeout_s={} self_binding={:?} peer={:?}",
+                        owner_id,
+                        owner_start_time,
+                        EXTERNAL_OWNER_INTRA_RPC_READY_TIMEOUT_SECS,
+                        snapshot.share_group_owner(&snapshot.self_peer_gen.peer_id),
+                        snapshot.peers.get(owner_id.as_str()),
+                    ),
+                }));
+            }
+            sleep(Duration::from_millis(20)).await;
         }
     }
 }
@@ -2041,6 +2326,404 @@ impl ExternalInner {
                 return Err(err);
             }
             return Ok(resp.serialize_part.into_snapshot());
+        }
+    }
+
+    async fn master_batch_gpu_get_revoke(&self, get_ids: Vec<u64>) -> KvResult<()> {
+        if get_ids.is_empty() {
+            return Ok(());
+        }
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let expected_get_ids = get_ids.clone();
+        let resp: MsgPack<BatchGetRevokeResp> = self
+            .rpc_caller_master_batch_get_revoke
+            .call(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                MsgPack {
+                    serialize_part: BatchGetRevokeReq { get_ids },
+                    raw_bytes: Vec::new(),
+                },
+                None,
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json.clone(),
+        )?;
+        if resp.serialize_part.items.len() != expected_get_ids.len() {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "GPU Get BatchRevoke response length mismatch: expected={} got={}",
+                    expected_get_ids.len(),
+                    resp.serialize_part.items.len()
+                ),
+            }));
+        }
+        for (expected_get_id, item) in expected_get_ids
+            .into_iter()
+            .zip(resp.serialize_part.items.into_iter())
+        {
+            if item.get_id != expected_get_id {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "GPU Get BatchRevoke response identity mismatch: expected={} got={}",
+                        expected_get_id, item.get_id
+                    ),
+                }));
+            }
+            crate::rpcresp_kvresult_convert::try_from_code(item.error_code, item.error_json)?;
+        }
+        Ok(())
+    }
+
+    async fn master_batch_gpu_get_done(&self, get_ids: Vec<u64>) -> KvResult<()> {
+        if get_ids.is_empty() {
+            return Ok(());
+        }
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let expected_get_ids = get_ids.clone();
+        let resp: MsgPack<BatchGetDoneResp> = self
+            .rpc_caller_master_batch_get_done
+            .call(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                MsgPack {
+                    serialize_part: BatchGetDoneReq { get_ids },
+                    raw_bytes: Vec::new(),
+                },
+                None,
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json.clone(),
+        )?;
+        if resp.serialize_part.items.len() != expected_get_ids.len() {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "GPU Get BatchDone response length mismatch: expected={} got={}",
+                    expected_get_ids.len(),
+                    resp.serialize_part.items.len()
+                ),
+            }));
+        }
+        for (expected_get_id, item) in expected_get_ids
+            .into_iter()
+            .zip(resp.serialize_part.items.into_iter())
+        {
+            if item.get_id != expected_get_id {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "GPU Get BatchDone response identity mismatch: expected={} got={}",
+                        expected_get_id, item.get_id
+                    ),
+                }));
+            }
+            crate::rpcresp_kvresult_convert::try_from_code(item.error_code, item.error_json)?;
+            if item.holder_id != 0 || item.allocation_mode != GetAllocationMode::ExternalSink {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "GPU Get BatchDone returned a cache-owned target: get_id={} holder_id={} allocation_mode={:?}",
+                        item.get_id, item.holder_id, item.allocation_mode
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn get_start_gpu(
+        &self,
+        keys: Vec<String>,
+        destinations: Vec<ExternalGpuDestination>,
+        prefix_best_effort: bool,
+        atomic_group_lens: Option<Vec<usize>>,
+        transfer_concurrency: usize,
+    ) -> KvResult<ExternalGpuGetStartResp> {
+        if keys.is_empty() {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "get_start_gpu requires at least one key".to_string(),
+            }));
+        }
+        if keys.len() != destinations.len() {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "get_start_gpu keys/destinations length mismatch: keys={} destinations={}",
+                    keys.len(),
+                    destinations.len()
+                ),
+            }));
+        }
+        if transfer_concurrency == 0 {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "get_start_gpu transfer_concurrency must be > 0".to_string(),
+            }));
+        }
+        let group_lens = normalize_external_get_start_group_lens(keys.len(), atomic_group_lens)?;
+        let self_info = self.view.cluster_manager().get_self_info();
+        if self_info.node_role() != NodeRole::External {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "get_start_gpu requires an external node membership".to_string(),
+            }));
+        }
+
+        let mut destination_guards = Vec::with_capacity(destinations.len());
+        let mut external_sink_targets = Vec::with_capacity(destinations.len());
+        for destination in &destinations {
+            let guard = self
+                .view
+                .client_transfer_engine()
+                .validate_gpu_destination(
+                    destination.registration_id,
+                    destination.addr,
+                    destination.capacity,
+                )?;
+            destination_guards.push(guard);
+            external_sink_targets.push(Some(GetExternalSinkTarget {
+                addr: destination.addr,
+                capacity: destination.capacity,
+                registration_id: destination.registration_id,
+                requester_node_start_time: self_info.node_start_time,
+            }));
+        }
+
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let resp: MsgPack<BatchGetStartResp> = self
+            .rpc_caller_master_batch_get_start
+            .call(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                MsgPack {
+                    serialize_part: BatchGetStartReq {
+                        keys: keys.clone(),
+                        prepared_targets: Vec::new(),
+                        external_sink_targets,
+                    },
+                    raw_bytes: Vec::new(),
+                },
+                None,
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json.clone(),
+        )?;
+
+        let start_items = resp.serialize_part.items;
+        let started_get_ids = start_items
+            .iter()
+            .filter(|item| item.error_code == OK)
+            .map(|item| item.get_id)
+            .collect::<Vec<_>>();
+        if start_items.len() != keys.len() {
+            let cleanup = self
+                .master_batch_gpu_get_revoke(started_get_ids)
+                .await
+                .err()
+                .map(|err| err.to_string());
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "get_start_gpu response length mismatch: expected={} got={} cleanup_error={:?}",
+                    keys.len(),
+                    start_items.len(),
+                    cleanup
+                ),
+            }));
+        }
+
+        for item in &start_items {
+            if item.error_code != OK
+                && item.error_code
+                    != crate::rpcresp_kvresult_convert::msg_and_error::codes_api::API_KEY_NOT_FOUND
+            {
+                let err = crate::rpcresp_kvresult_convert::try_from_code(
+                    item.error_code,
+                    item.error_json.clone(),
+                )
+                .expect_err("non-OK GPU GetStart item must decode as an error");
+                let cleanup = self
+                    .master_batch_gpu_get_revoke(started_get_ids)
+                    .await
+                    .err()
+                    .map(|cleanup_err| cleanup_err.to_string());
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "get_start_gpu item failed: error={} cleanup_error={:?}",
+                        err, cleanup
+                    ),
+                }));
+            }
+        }
+
+        for (idx, ((item, destination), guard)) in start_items
+            .iter()
+            .zip(destinations.iter())
+            .zip(destination_guards.iter())
+            .enumerate()
+        {
+            if item.error_code != OK {
+                continue;
+            }
+            let geometry_is_valid = external_gpu_transfer_plan_geometry_is_valid(
+                item,
+                destination,
+                guard.registration().registration_id,
+            );
+            if !geometry_is_valid || item.node_id == self_info.id {
+                let cleanup = self
+                    .master_batch_gpu_get_revoke(started_get_ids)
+                    .await
+                    .err()
+                    .map(|cleanup_err| cleanup_err.to_string());
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "get_start_gpu invalid master transfer plan: index={} get_id={} source={} target={:#x} base={:#x} len={} destination={:?} cleanup_error={:?}",
+                        idx,
+                        item.get_id,
+                        item.node_id,
+                        item.target_addr,
+                        item.target_base_addr,
+                        item.len,
+                        destination,
+                        cleanup
+                    ),
+                }));
+            }
+        }
+
+        let raw_prefix_hit_len = start_items
+            .iter()
+            .take_while(|item| item.error_code == OK)
+            .count();
+        let transferable_len = compute_external_get_start_transfer_prefix(
+            raw_prefix_hit_len,
+            &group_lens,
+            prefix_best_effort,
+        );
+        let mut transfer_items = Vec::with_capacity(transferable_len);
+        let mut skipped_get_ids = Vec::new();
+        for (idx, (item, guard)) in start_items
+            .into_iter()
+            .zip(destination_guards.into_iter())
+            .enumerate()
+        {
+            if item.error_code != OK {
+                continue;
+            }
+            if idx < transferable_len {
+                transfer_items.push((item, guard));
+            } else {
+                skipped_get_ids.push(item.get_id);
+            }
+        }
+
+        let handle = self.next_gpu_get_handle.fetch_add(1, Ordering::Relaxed);
+        if handle == 0 {
+            let mut all_get_ids = skipped_get_ids.clone();
+            all_get_ids.extend(transfer_items.iter().map(|(item, _)| item.get_id));
+            let _ = self.master_batch_gpu_get_revoke(all_get_ids).await;
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: "get_start_gpu local handle space exhausted".to_string(),
+            }));
+        }
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let (terminal_tx, terminal_rx) = watch::channel(None);
+        self.pending_external_gpu_get.insert(
+            handle,
+            PendingExternalGpuGet {
+                transferable_len,
+                atomic_group_lens: group_lens,
+                cancel_requested: cancel_requested.clone(),
+                terminal_rx,
+            },
+        );
+        let view = self.view.clone_view();
+        let view_task = view.clone();
+        view.spawn(format!("external_gpu_get_transfer_{handle}"), async move {
+            let terminal = run_external_gpu_get_transfer(
+                view_task,
+                transfer_items,
+                skipped_get_ids,
+                transfer_concurrency,
+                cancel_requested,
+            )
+            .await;
+            let _ = terminal_tx.send(Some(terminal));
+        });
+        Ok(ExternalGpuGetStartResp {
+            handle,
+            raw_prefix_hit_len,
+        })
+    }
+
+    pub async fn get_transfer_gpu(
+        &self,
+        handle: u64,
+        consume_prefix_len: Option<usize>,
+    ) -> KvResult<ExternalGpuGetTransferResp> {
+        let Some((_, pending)) = self.pending_external_gpu_get.remove(&handle) else {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!("get_transfer_gpu requires a live handle: {handle}"),
+            }));
+        };
+        let consumed_prefix_len = consume_prefix_len.unwrap_or(pending.transferable_len);
+        if let Err(err) = validate_external_get_consume_prefix(
+            consumed_prefix_len,
+            pending.transferable_len,
+            &pending.atomic_group_lens,
+        ) {
+            self.pending_external_gpu_get.insert(handle, pending);
+            return Err(err);
+        }
+        let terminal = wait_external_gpu_get_terminal(pending.terminal_rx).await?;
+        match terminal {
+            ExternalGpuGetTerminal::Completed => Ok(ExternalGpuGetTransferResp {
+                transferred_prefix_len: pending.transferable_len,
+                consumed_prefix_len,
+            }),
+            ExternalGpuGetTerminal::Revoked { transfer_error } => {
+                Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "get_transfer_gpu was revoked: handle={} transfer_error={:?}",
+                        handle, transfer_error
+                    ),
+                }))
+            }
+            ExternalGpuGetTerminal::Failed { detail } => {
+                Err(KvError::Api(ApiError::Unknown { detail }))
+            }
+        }
+    }
+
+    pub async fn cancel_get_transfer_gpu(&self, handle: u64) -> KvResult<()> {
+        let Some((_, pending)) = self.pending_external_gpu_get.remove(&handle) else {
+            return Ok(());
+        };
+        pending.cancel_requested.store(true, Ordering::Release);
+        match wait_external_gpu_get_terminal(pending.terminal_rx).await? {
+            ExternalGpuGetTerminal::Completed | ExternalGpuGetTerminal::Revoked { .. } => Ok(()),
+            ExternalGpuGetTerminal::Failed { detail } => {
+                Err(KvError::Api(ApiError::Unknown { detail }))
+            }
         }
     }
 

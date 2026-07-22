@@ -1,7 +1,7 @@
 use crate::ClientKvApiAccessTrait;
 use crate::client_kv_api::ClientKvApi;
 use crate::client_transfer_engine::{ClientTransferEngine, ClientTransferEngineAccessTrait};
-use crate::cluster_manager::ClusterManagerAccessTrait;
+use crate::cluster_manager::{ClusterManagerAccessTrait, NodeRole};
 use crate::config::ContributeToClusterPoolSize;
 use crate::master_seg_manager::msg_pack::SegmentDeviceMemInfo;
 use crate::p2p::p2p_module::P2pModule;
@@ -968,15 +968,24 @@ impl LogicalModule for ClientSegPool {
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
         let _ = self.remove_side_transfer_peer().await;
-        loop {
-            if self.inner().view().client_kv_api().can_be_dropped() {
-                tracing::info!("ClientSegPool can be dropped");
-                break;
+        if !matches!(
+            self.inner()
+                .view()
+                .cluster_manager()
+                .get_self_info()
+                .node_role(),
+            NodeRole::External
+        ) {
+            loop {
+                if self.inner().view().client_kv_api().can_be_dropped() {
+                    tracing::info!("ClientSegPool can be dropped");
+                    break;
+                }
+                tracing::info!(
+                    "ClientSegPool waiting ClientKvApi can not be dropped , will try again after 3s (some user memholder may still be in use)"
+                );
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
-            tracing::info!(
-                "ClientSegPool waiting ClientKvApi can not be dropped , will try again after 3s (some user memholder may still be in use)"
-            );
-            tokio::time::sleep(Duration::from_secs(3)).await;
         }
 
         if self.0.cpu_allocated_mem.read().await.is_some() {
@@ -989,6 +998,15 @@ impl LogicalModule for ClientSegPool {
 impl ClientSegPool {
     pub async fn init2_for_init_dag(&self) -> KvResult<()> {
         let inner = &self.0;
+        if matches!(
+            inner.view().cluster_manager().get_self_info().node_role(),
+            NodeRole::External
+        ) {
+            // External clients contribute no cache segment. They construct this
+            // module only to provide lifetime guards for an explicitly
+            // registered GPU staging range.
+            return Ok(());
+        }
 
         // English note:
         // - Invariant: register inbound RPC handlers before any awaited etcd operations that

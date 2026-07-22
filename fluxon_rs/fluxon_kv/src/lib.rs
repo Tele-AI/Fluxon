@@ -2057,6 +2057,29 @@ async fn run_client_impl(
             metric_reporter_arg: MetricReporterNewArg {
                 test_spec_config: config.test_spec_config.clone(),
             },
+            client_seg_pool_arg: ClientSegPoolNewArg {
+                contribute_size: config.contribute_to_cluster_pool_size.clone(),
+                share_mem_path: config.share_mem_path.clone(),
+                large_file_paths: config.large_file_paths.clone(),
+                cluster_name: config.cluster_name.clone(),
+                etcd_addresses: config.etcd_addresses_raw.clone(),
+                attach_existing_meta: None,
+                side_transfer_worker: false,
+                require_transfer_rpc_fast_path_ready_timeout: None,
+            },
+            client_transfer_engine_arg: ClientTransferEngineNewArg {
+                metadata_uri: config.fluxonkv_spec.etcd_addresses[0].clone(),
+                instance_name: config.instance_key.clone(),
+                enable_transfer_rpc_fast_path: config.fluxonkv_spec.enable_transfer_rpc_fast_path,
+                rpc_port: 12345,
+                protocol_type: config.protocol.protocol_type.clone(),
+                rdma_device_names: transfer_engine_rdma_device_names_from_config(
+                    &config.protocol,
+                    Some(&config.test_spec_config),
+                ),
+                backend_activation_mode: transfer_backend_activation_mode,
+                transfer_engine: config.fluxonkv_spec.transfer_engine.clone(),
+            },
             external_client_api_arg: ExternalClientApiNewArg {
                 shared_memory_path: config.share_mem_path.clone(),
                 shared_file_path: config.share_mem_path.clone(),

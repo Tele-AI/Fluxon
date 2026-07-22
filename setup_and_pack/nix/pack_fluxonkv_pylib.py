@@ -198,6 +198,11 @@ MANYLINUX_CXX_RUNTIME_LIBRARY_NAMES = (
     "libstdc++.so.6",
     "libgomp.so.1",
 )
+EXTERNAL_DRIVER_RUNTIME_LIBRARY_NAMES = (
+    # libcuda is supplied by the NVIDIA kernel-driver installation on the target GPU node.
+    # Packaging the build-time stub would make the wheel non-functional at runtime.
+    "libcuda.so.1",
+)
 
 def _dedupe_relative_paths(relative_paths: tuple[str, ...]) -> tuple[str, ...]:
     ordered_relative_paths: list[str] = []
@@ -2273,6 +2278,10 @@ def _is_core_system_runtime_lib(lib_name: str) -> bool:
     return any(lib_name.startswith(prefix) for prefix in CORE_SYSTEM_RUNTIME_LIB_PREFIXES)
 
 
+def _is_external_driver_runtime_lib(lib_name: str) -> bool:
+    return lib_name in EXTERNAL_DRIVER_RUNTIME_LIBRARY_NAMES
+
+
 def _read_runtime_dependency_entries(
     path: Path,
     *,
@@ -2314,6 +2323,12 @@ def _read_runtime_dependency_entries(
         if "=>" in line:
             needed_name, raw_target = (part.strip() for part in line.split("=>", 1))
             if raw_target == "not found":
+                if _is_external_driver_runtime_lib(needed_name):
+                    print(
+                        "wheel finalize: leaving target-driver dependency external: "
+                        f"{path} -> {needed_name}"
+                    )
+                    continue
                 raise RuntimeError(f"runtime dependency not found for {path}: {needed_name}")
             dep_path_str = raw_target.split(" ", 1)[0].strip()
         else:
