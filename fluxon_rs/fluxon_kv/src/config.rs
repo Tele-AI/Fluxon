@@ -106,6 +106,19 @@ pub enum SideTransferRole {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum TcpThreadReactorWaitMode {
+    BusyPoll,
+    EventDriven,
+}
+
+impl Default for TcpThreadReactorWaitMode {
+    fn default() -> Self {
+        Self::BusyPoll
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum KvSsdUringMode {
     SingleBuffer,
     Iovec,
@@ -170,6 +183,8 @@ pub struct TestSpecConfig {
     pub transport_mode: Option<TestSpecTransportMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_thread_reactor_shard_count: Option<u8>,
+    #[serde(default)]
+    pub tcp_thread_reactor_wait_mode: TcpThreadReactorWaitMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_thread_bulk_lane_count: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,6 +225,7 @@ impl Default for TestSpecConfig {
             skip_put_end_commit: false,
             transport_mode: None,
             tcp_thread_reactor_shard_count: None,
+            tcp_thread_reactor_wait_mode: TcpThreadReactorWaitMode::default(),
             tcp_thread_bulk_lane_count: None,
             tcp_thread_control_lane_count: None,
             user_rpc_sync_handler_thread_count: None,
@@ -1844,6 +1860,7 @@ test_spec_config:
   enable_iceoryx_logs: true
   iceoryx_external_busy_poll: true
   iceoryx_owner_client_busy_poll: false
+  tcp_thread_reactor_wait_mode: busy_poll
   transport_mode: transfer_only
   rdma_device_names: ["mlx5_0"]
 "#,
@@ -1855,6 +1872,10 @@ test_spec_config:
         assert!(verified.test_spec_config.enable_iceoryx_logs);
         assert!(verified.test_spec_config.iceoryx_external_busy_poll);
         assert!(!verified.test_spec_config.iceoryx_owner_client_busy_poll);
+        assert_eq!(
+            verified.test_spec_config.tcp_thread_reactor_wait_mode,
+            TcpThreadReactorWaitMode::BusyPoll
+        );
         assert_eq!(verified.share_mem_path, "/tmp/test_owner/test_cluster");
         assert_eq!(
             verified.test_spec_config.transport_mode,
@@ -1888,6 +1909,10 @@ fluxonkv_spec:
         assert_eq!(
             verified.test_spec_config.transport_mode,
             Some(TestSpecTransportMode::TransferWithRpc)
+        );
+        assert_eq!(
+            verified.test_spec_config.tcp_thread_reactor_wait_mode,
+            TcpThreadReactorWaitMode::BusyPoll
         );
         assert!(verified.fluxonkv_spec.enable_transfer_rpc_fast_path);
     }

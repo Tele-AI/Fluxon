@@ -86,8 +86,8 @@ use cluster_manager::{
 };
 use config::{
     ClientConfig, ClientConfigYaml, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig,
-    MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole, TestSpecConfig,
-    TestSpecTransportMode, TransferEngineType, normalize_etcd_addresses,
+    MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole, TcpThreadReactorWaitMode,
+    TestSpecConfig, TestSpecTransportMode, TransferEngineType, normalize_etcd_addresses,
 };
 use external_client_api::{ExternalClientApi, ExternalClientApiNewArg};
 use fluxon_commu::TransferBackendActivationMode;
@@ -101,7 +101,9 @@ use metric_reporter::{
     register_greptime_otlp_log_proxy_rpc, serialize_master_observe_broadcast,
     wait_master_observe_broadcast,
 };
-use p2p::p2p_module::{P2pModule, P2pModuleNewArg, P2pTcpThreadTransportTuning};
+use p2p::p2p_module::{
+    P2pModule, P2pModuleNewArg, P2pTcpThreadReactorWaitMode, P2pTcpThreadTransportTuning,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -616,6 +618,10 @@ fn tcp_thread_transport_tuning_from_test_spec_config(
 ) -> P2pTcpThreadTransportTuning {
     P2pTcpThreadTransportTuning {
         reactor_shard_count: test_spec_config.tcp_thread_reactor_shard_count,
+        reactor_wait_mode: match test_spec_config.tcp_thread_reactor_wait_mode {
+            TcpThreadReactorWaitMode::BusyPoll => P2pTcpThreadReactorWaitMode::BusyPoll,
+            TcpThreadReactorWaitMode::EventDriven => P2pTcpThreadReactorWaitMode::EventDriven,
+        },
         bulk_lane_count: test_spec_config.tcp_thread_bulk_lane_count,
         control_lane_count: test_spec_config.tcp_thread_control_lane_count,
     }
@@ -2736,6 +2742,26 @@ mod tests {
         assert_eq!(side_cfg.test_spec_config.rdma_device_names, None);
         assert!(side_cfg.test_spec_config.enable_side_transfer);
         assert!(!side_cfg.test_spec_config.disable_local_ipc);
+    }
+
+    #[test]
+    fn tcp_thread_reactor_wait_mode_maps_to_p2p_tuning() {
+        let default_tuning =
+            tcp_thread_transport_tuning_from_test_spec_config(&TestSpecConfig::default());
+        assert_eq!(
+            default_tuning.reactor_wait_mode,
+            P2pTcpThreadReactorWaitMode::BusyPoll
+        );
+
+        let event_driven_tuning =
+            tcp_thread_transport_tuning_from_test_spec_config(&TestSpecConfig {
+                tcp_thread_reactor_wait_mode: TcpThreadReactorWaitMode::EventDriven,
+                ..Default::default()
+            });
+        assert_eq!(
+            event_driven_tuning.reactor_wait_mode,
+            P2pTcpThreadReactorWaitMode::EventDriven
+        );
     }
 
     #[test]

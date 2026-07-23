@@ -544,6 +544,7 @@ def test_fluxonkv_test_spec_config():
         rdma_devices["test_spec_config"]["iceoryx_external_busy_poll"] = True
         rdma_devices["test_spec_config"]["iceoryx_owner_client_busy_poll"] = True
         rdma_devices["test_spec_config"]["tcp_thread_reactor_shard_count"] = 2
+        rdma_devices["test_spec_config"]["tcp_thread_reactor_wait_mode"] = "event_driven"
         rdma_devices["test_spec_config"]["tcp_thread_bulk_lane_count"] = 4
         rdma_devices["test_spec_config"]["tcp_thread_control_lane_count"] = 3
         rdma_devices["test_spec_config"][
@@ -558,6 +559,7 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["iceoryx_owner_client_busy_poll"] is True
         assert loaded["test_spec_config"]["rdma_device_names"] == ["mlx5_0", "mlx5_4"]
         assert loaded["test_spec_config"]["tcp_thread_reactor_shard_count"] == 2
+        assert loaded["test_spec_config"]["tcp_thread_reactor_wait_mode"] == "event_driven"
         assert loaded["test_spec_config"]["tcp_thread_bulk_lane_count"] == 4
         assert loaded["test_spec_config"]["tcp_thread_control_lane_count"] == 3
         assert (
@@ -576,6 +578,24 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["disable_observability"] is True
         assert loaded["test_spec_config"]["enable_iceoryx_logs"] is True
         assert "transport_mode" not in loaded["test_spec_config"]
+        assert "tcp_thread_reactor_wait_mode" not in loaded["test_spec_config"]
+
+        busy_poll = copy.deepcopy(implicit_transport)
+        busy_poll["test_spec_config"]["tcp_thread_reactor_wait_mode"] = "busy_poll"
+        config = FluxonKvClientConfig(busy_poll)
+        loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
+        assert loaded["test_spec_config"]["tcp_thread_reactor_wait_mode"] == "busy_poll"
+
+        invalid_wait_mode = copy.deepcopy(implicit_transport)
+        invalid_wait_mode["test_spec_config"]["tcp_thread_reactor_wait_mode"] = "epoll"
+        try:
+            FluxonKvClientConfig(invalid_wait_mode)
+            print(
+                "❌ FAIL: test_fluxonkv_test_spec_config - invalid tcp_thread_reactor_wait_mode should be rejected"
+            )
+            return
+        except ValueError:
+            pass
 
         foyer_backend = copy.deepcopy(base)
         foyer_backend["test_spec_config"] = {"kv_ssd_storage_backend": "foyer"}

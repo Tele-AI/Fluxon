@@ -326,6 +326,7 @@ fluxonkv_spec:
 - `fluxonkv_spec.large_limit_size` 只允许 owner 配置；出现时必须和 `large_file_paths` 长度一致，每项解析后必须大于或等于 512 bytes。
 - zero-contribution `external` 模式禁止再写 owner 专属字段；运行时会从 owner `shared.json` 补齐这部分信息。
 - `share_mem_path` 会拼成 `cluster_name` 作用域路径；`mmap.file`、`shared.json` 和 peer metadata 都位于这个 cluster-scoped 目录下。
+- `test_spec_config.tcp_thread_reactor_wait_mode` 控制当前进程的 TCP reactor 等待方式，可选 `busy_poll` / `event_driven`，默认 `busy_poll`；同一进程内全部 `tcp_thread` P2P 连接共用该值，通信对端的设置不受影响。
 - `test_spec_config.side_transfer_role = worker` 不是第三套 YAML，而是 zero-contribution client 的子分支；它强制 `TransferEngineType::P2p`，并关闭 transfer RPC fast path。
 - `test_spec_config.side_transfer_worker_count` 只允许出现在 owner 配置里，用来控制 owner 拉起的 worker 数量。
 

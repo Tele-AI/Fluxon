@@ -164,6 +164,7 @@ test_spec_config:                      # Test-only config overrides (dict(option
   short_circuit_put_payload_path: false # Keep large put_start allocation but skip payload memcpy + transfer (bool(optional))
   skip_put_end_commit: false           # Return success after payload transfer without put_done commit; inflight_put TTL cleanup only (bool(optional))
   transport_mode:                      # transfer_only|transfer_with_rpc (str(optional))
+  tcp_thread_reactor_wait_mode:        # event_driven|busy_poll; defaults to busy_poll (str(optional))
   tcp_thread_reactor_shard_count:      # tcp_thread reactor shard count, 1..16 (int(optional))
   tcp_thread_bulk_lane_count:          # tcp_thread bulk lane count, 1..8 (int(optional))
   tcp_thread_control_lane_count:       # tcp_thread control lane count, 1..8 (int(optional))
@@ -224,6 +225,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         "short_circuit_put_payload_path",
         "skip_put_end_commit",
         "transport_mode",
+        "tcp_thread_reactor_wait_mode",
         "tcp_thread_reactor_shard_count",
         "tcp_thread_bulk_lane_count",
         "tcp_thread_control_lane_count",
@@ -304,6 +306,18 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
                 f"{ctx}.transport_mode must be one of {sorted(allowed_transport_modes)}, got {transport_mode!r}"
             )
         out["transport_mode"] = transport_mode
+
+    tcp_thread_reactor_wait_mode = raw.get("tcp_thread_reactor_wait_mode")
+    if tcp_thread_reactor_wait_mode is not None:
+        if not isinstance(tcp_thread_reactor_wait_mode, str):
+            raise ValueError(f"{ctx}.tcp_thread_reactor_wait_mode must be a string")
+        allowed_wait_modes = {"busy_poll", "event_driven"}
+        if tcp_thread_reactor_wait_mode not in allowed_wait_modes:
+            raise ValueError(
+                f"{ctx}.tcp_thread_reactor_wait_mode must be one of "
+                f"{sorted(allowed_wait_modes)}, got {tcp_thread_reactor_wait_mode!r}"
+            )
+        out["tcp_thread_reactor_wait_mode"] = tcp_thread_reactor_wait_mode
 
     rdma_device_names = raw.get("rdma_device_names")
     if rdma_device_names is not None:

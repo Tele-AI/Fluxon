@@ -13,7 +13,7 @@ use fluxon_commu_contract::{
     ClosedRuntimeClusterRdmaResolvedConfigStreamItem, ClosedRuntimeDesiredTransferPeer,
     ClosedRuntimeDispatchRequestView, ClosedRuntimeDispatchResponse,
     ClosedRuntimeDispatchTransportPolicy, ClosedRuntimeError, ClosedRuntimeHandle,
-    ClosedRuntimeHostCallbackHandle, ClosedRuntimeP2pCall,
+    ClosedRuntimeHostCallbackHandle, ClosedRuntimeLocalMemoryKind, ClosedRuntimeP2pCall,
     ClosedRuntimeP2pCallRawObservedRequestView, ClosedRuntimeP2pResponse,
     ClosedRuntimeP2pSendResponseRawRequestView, ClosedRuntimePeerGen, ClosedRuntimeRawSlice,
     ClosedRuntimeRequest, ClosedRuntimeResponse, ClosedRuntimeTransferEngineCall,
@@ -26,8 +26,8 @@ use fluxon_commu_contract::{
 
 pub mod rdma_probe;
 
-pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 5;
-pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 8;
+pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 7;
+pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 9;
 pub const FLUXON_COMMU_CLOSED_HOST_CALLBACKS_ABI_VERSION: u32 = 8;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_OK: i32 = 0;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_ERR: i32 = 1;
@@ -1858,12 +1858,14 @@ pub async fn transfer_engine_register_local_segment(
     handle: ClosedRuntimeHandle,
     allocated_addr: u64,
     allocated_size: u64,
+    memory_kind: ClosedRuntimeLocalMemoryKind,
 ) -> Result<(), ClosedSdkConsumerError> {
     match transfer_engine_call(
         handle,
         ClosedRuntimeTransferEngineCall::RegisterLocalSegment {
             allocated_addr,
             allocated_size,
+            memory_kind,
         },
     )
     .await?
@@ -1879,12 +1881,14 @@ pub async fn transfer_engine_unregister_local_segment(
     handle: ClosedRuntimeHandle,
     allocated_addr: u64,
     allocated_size: u64,
+    memory_kind: ClosedRuntimeLocalMemoryKind,
 ) -> Result<(), ClosedSdkConsumerError> {
     match transfer_engine_call(
         handle,
         ClosedRuntimeTransferEngineCall::UnregisterLocalSegment {
             allocated_addr,
             allocated_size,
+            memory_kind,
         },
     )
     .await?
@@ -1904,6 +1908,7 @@ pub async fn transfer_engine_transfer_data_no_copy(
     target_addr: u64,
     len: u64,
     initial_local_segment_guard_handle: Option<u64>,
+    require_fast_path: bool,
 ) -> Result<fluxon_commu_contract::TransferBreakdown, ClosedSdkConsumerError> {
     match transfer_engine_call(
         handle,
@@ -1914,6 +1919,7 @@ pub async fn transfer_engine_transfer_data_no_copy(
             target_addr,
             len,
             initial_local_segment_guard_handle,
+            require_fast_path,
         },
     )
     .await?
