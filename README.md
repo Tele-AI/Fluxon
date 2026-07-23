@@ -23,6 +23,14 @@ Add the project administrator on WeChat to join the open-source community group.
 
 </div>
 
+Fluxon is a high-performance distributed data acceleration plane for AI workloads, providing unified caching, communication, and storage acceleration for inference KV Cache, training & data processing. Built on the unified Rust-based transport and caching foundation, Fluxon exposes three standardized interfaces that target the core bottlenecks in AI systems:
+
+- **KV/RPC (Unified key-value and RPC)**: Breaks data silos and enables efficient cross-process, cross-node reuse of inference-side `KV Cache` and `latent cache`
+- **MQ (Elastic message queue)**: Decouples system dependencies and supports elastic message transport across heterogeneous resource pools
+- **FS (`S3`-compatible file, object, and cache acceleration system)**: Unifies multi-form storage so one system can cache key-value, file, and object data, while supporting remote access, `S3` forwarding, and large-scale cross-cluster migration for AI data and model files
+
+## Backgroud
+
 As GPU compute power continues to scale, bottlenecks in AI systems are expanding from individual operators into the data plane. Inference services need cross-node `KV Cache` reuse. Training pipelines need to pass intermediate state across heterogeneous resource pools. Model files and `Checkpoint` data need to move reliably between remote access paths and local caches.
 
 Most existing systems, however, are still specialized components built for narrow scenarios, such as `MooncakeStore` for `KV Cache`. Many AI workloads still lack mature `AI-native` infrastructure components, so algorithm teams often assemble temporary data transfer modules just to validate ideas quickly. As model scale and cluster elasticity grow together, the cost of this patchwork data plane keeps expanding, consuming CPU, I/O, memory, and operational effort, and exposing seven critical engineering pain points:
@@ -35,11 +43,7 @@ Most existing systems, however, are still specialized components built for narro
 - **Fragmented object lifecycle management:** caches, messages, and files each maintain their own reference and eviction state, and those states easily fragment across business frameworks, cache layers, and transport layers
 - **Fragmented observability pipelines:** cache hits, transport paths, and object materialization are scattered across separate systems, so performance debugging becomes an exercise in stitching clues together from multiple metric sets
 
-Fluxon is designed around these problems. It separates data-plane resources, object lifecycles, cross-node transport, and business integration into explicit abstractions, then governs them on one unified storage and transport foundation so more system budget goes to model computation instead of data-plane assembly and movement. Built on that unified Rust-based storage and transport foundation, Fluxon exposes three standardized interfaces that target the core bottlenecks in AI systems:
 
-- **KV/RPC (Unified key-value and RPC)**: Breaks data silos and enables efficient cross-process, cross-node reuse of inference-side `KV Cache` and `latent cache`
-- **MQ (Elastic message queue)**: Decouples system dependencies and supports elastic message transport across heterogeneous resource pools
-- **FS (`S3`-compatible file, object, and cache acceleration system)**: Unifies multi-form storage so one system can cache key-value, file, and object data, while supporting remote access, `S3` forwarding, and large-scale cross-cluster migration for AI data and model files
 
 ![](./pics/fluxon架构图20260423.png)
 
