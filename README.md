@@ -4,6 +4,8 @@
 
 <div align="center">
 
+One unified system for high performance RPC, KV Cache, Message Queue, and File & Object Acceleration. 
+
 [![Linux Only](https://img.shields.io/badge/Linux-Only-2ea44f)](#runtime-requirements)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB)](#runtime-requirements)
 [![Rust](https://img.shields.io/badge/Rust-1.93.0-000000)](./fluxon_rs/rust-toolchain.toml)
@@ -21,9 +23,10 @@ Add the project administrator on WeChat to join the open-source community group.
 
 [English](./README.md) | [中文](./README_CN.md) | [Docs](https://tele-ai.github.io/Fluxon/) | [中文文档](https://tele-ai.github.io/Fluxon/cn/) | <a href="https://github.com/Tele-AI/Fluxon" title="GitHub Repository"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
 
+
 </div>
 
-Fluxon is a high-performance distributed data acceleration plane for AI workloads, providing unified caching, communication, and storage acceleration for inference KV Cache, training & data processing. Built on the unified Rust-based transport and caching foundation, Fluxon exposes three standardized interfaces that target the core bottlenecks in AI systems:
+Built on the unified Rust-based transport and caching foundation, Fluxon exposes three standardized interfaces that target the core bottlenecks in AI systems:
 
 - **KV/RPC (Unified key-value and RPC)**: Breaks data silos and enables efficient cross-process, cross-node reuse of inference-side `KV Cache` and `latent cache`
 - **MQ (Elastic message queue)**: Decouples system dependencies and supports elastic message transport across heterogeneous resource pools
