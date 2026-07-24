@@ -14,10 +14,11 @@ use crate::observe_kvope::{
 use crate::{
     cluster_manager::NodeID,
     master_kv_router::msg_pack::{
-        BatchGetDoneReq, BatchGetDoneResp, BatchGetRevokeReq, BatchGetRevokeResp,
-        BatchGetStartItemResp, BatchGetStartReq, BatchGetStartResp, BatchIsExistReq,
-        GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetMetaResp,
-        GetPreparedLocalReserveTarget, GetRevokeReq, GetStartReq, GetStartResp,
+        BatchGetBindItemReq, BatchGetBindReq, BatchGetBindResp, BatchGetDoneReq, BatchGetDoneResp,
+        BatchGetRevokeReq, BatchGetRevokeResp, BatchGetStartItemResp, BatchGetStartReq,
+        BatchGetStartResp, BatchIsExistReq, GetAllocationMode, GetBindTarget, GetDoneReq,
+        GetDoneResp, GetMetaReq, GetMetaResp, GetPreparedLocalReserveTarget, GetRevokeReq,
+        GetStartReq, GetStartResp,
     },
     p2p::msg_pack::MsgPack,
     rpcresp_kvresult_convert::msg_and_error::codes_api,
@@ -1477,6 +1478,54 @@ impl ClientKvApiInner {
         let resp = self
             .rpc_caller_batch_get_start
             .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json.clone(),
+        )?;
+        Ok(resp.serialize_part)
+    }
+
+    pub(crate) async fn batch_get_bind_prepared_targets(
+        &self,
+        get_ids: Vec<u64>,
+        prepared_targets: Vec<GetPreparedLocalReserveTarget>,
+    ) -> KvResult<BatchGetBindResp> {
+        if get_ids.len() != prepared_targets.len() {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "batch_get_bind_prepared_targets length mismatch: get_ids={} targets={}",
+                    get_ids.len(),
+                    prepared_targets.len()
+                ),
+            }));
+        }
+        let items = get_ids
+            .into_iter()
+            .zip(prepared_targets)
+            .map(|(get_id, target)| BatchGetBindItemReq {
+                get_id,
+                target: GetBindTarget::PreparedLocalReserve(target),
+            })
+            .collect();
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let resp = self
+            .rpc_caller_batch_get_bind
+            .call(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                MsgPack {
+                    serialize_part: BatchGetBindReq { items },
+                    raw_bytes: Vec::new(),
+                },
+                None,
+                0,
+            )
             .await
             .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(

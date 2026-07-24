@@ -3,12 +3,13 @@ use super::{
     MasterKeyActivityCompletionGuard, MasterKvRouterView, OwnerHoldingGetInfo,
     ReservedCapacityReason,
     msg_pack::{
-        BatchGetDoneItemResp, BatchGetDoneReq, BatchGetDoneResp, BatchGetRevokeItemResp,
-        BatchGetRevokeReq, BatchGetRevokeResp, BatchGetStartItemResp, BatchGetStartReq,
-        BatchGetStartResp, BatchIsExistReq, BatchIsExistResp, GetAllocationMode, GetDoneReq,
-        GetDoneResp, GetExternalSinkTarget, GetMetaReq, GetMetaResp, GetPreparedLocalReserveTarget,
-        GetRevokeReq, GetRevokeResp, GetStartReq, GetStartResp, MemHolderKeepAliveReq,
-        MemHolderKeepAliveResp, MemHolderReleaseReq, MemHolderReleaseResp,
+        BatchGetBindItemReq, BatchGetBindReq, BatchGetBindResp, BatchGetDoneItemResp,
+        BatchGetDoneReq, BatchGetDoneResp, BatchGetPlanItemResp, BatchGetPlanReq, BatchGetPlanResp,
+        BatchGetRevokeItemResp, BatchGetRevokeReq, BatchGetRevokeResp, BatchGetStartItemResp,
+        BatchGetStartReq, BatchGetStartResp, BatchIsExistReq, BatchIsExistResp, GetAllocationMode,
+        GetBindTarget, GetDoneReq, GetDoneResp, GetExternalSinkTarget, GetMetaReq, GetMetaResp,
+        GetPreparedLocalReserveTarget, GetRevokeReq, GetRevokeResp, GetStartReq, GetStartResp,
+        MemHolderKeepAliveReq, MemHolderKeepAliveResp, MemHolderReleaseReq, MemHolderReleaseResp,
     },
     node_generation_is_current_live, publish_route_replica_tomb_fenced,
     route_maintenance::{RoutePublishEvent, apply_post_route_maintenance_batch},
@@ -238,6 +239,631 @@ fn validate_external_sink_target(
         )));
     }
     Ok(())
+}
+
+fn get_plan_item_error(err: &msg_and_error::KvError) -> BatchGetPlanItemResp {
+    let response: GetStartResp = crate::rpcresp_kvresult_convert::FromError::from_error(err);
+    BatchGetPlanItemResp {
+        error_code: response.error_code,
+        error_json: response.error_json,
+        ..Default::default()
+    }
+}
+
+fn get_bind_item_error(get_id: u64, err: &msg_and_error::KvError) -> BatchGetStartItemResp {
+    let response: GetStartResp = crate::rpcresp_kvresult_convert::FromError::from_error(err);
+    BatchGetStartItemResp {
+        get_id,
+        error_code: response.error_code,
+        error_json: response.error_json,
+        ..Default::default()
+    }
+}
+
+#[derive(Clone)]
+struct PlannedGetSourceSnapshot {
+    node_id: NodeID,
+    tomb_tag: crate::master_seg_manager::NodeTombTag,
+    len: u64,
+    addr: u64,
+    base_addr: u64,
+}
+
+fn snapshot_live_get_sources(route: &OneKvNodesRoutes) -> Vec<PlannedGetSourceSnapshot> {
+    route
+        .nodes_replicas
+        .read()
+        .values()
+        .filter(|replica| !replica.tomb_tag.is_tomb())
+        .map(|replica| PlannedGetSourceSnapshot {
+            node_id: replica.node_id.clone(),
+            tomb_tag: replica.tomb_tag.clone(),
+            len: replica.backing.len(),
+            addr: replica.backing.abs_addr(),
+            base_addr: replica.backing.base_addr(),
+        })
+        .collect()
+}
+
+fn planned_get_source_is_current(
+    planned: &super::PlannedGetInfo,
+    route: &Arc<OneKvNodesRoutes>,
+) -> bool {
+    if planned.src_tomb_tag.is_tomb() || route.put_id != planned.put_id {
+        return false;
+    }
+    route
+        .nodes_replicas
+        .read()
+        .get(&planned.src_node_id)
+        .is_some_and(|replica| {
+            !replica.tomb_tag.is_tomb()
+                && replica.tomb_tag.same_generation(&planned.src_tomb_tag)
+                && replica.backing.abs_addr() == planned.src_addr
+                && replica.backing.base_addr() == planned.src_base_addr
+                && replica.backing.len() == planned.len
+        })
+}
+
+#[cfg(test)]
+mod planned_get_tests {
+    use super::{planned_get_source_is_current, snapshot_live_get_sources};
+    use crate::cluster_manager::NodeID;
+    use crate::master_kv_router::{
+        CommittedSlotReplica, KvReplicaBacking, KvRouteInfo, OneKvNodesRoutes, PlannedGetInfo,
+    };
+    use crate::master_seg_manager::NodeTombTag;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    fn planned_route() -> (PlannedGetInfo, Arc<OneKvNodesRoutes>, NodeTombTag) {
+        let source: NodeID = "source".to_string().into();
+        let source_tag = NodeTombTag::new();
+        let route = Arc::new(OneKvNodesRoutes {
+            put_id: (7, 3),
+            lease_id: None,
+            atomic_group: None,
+            nodes_replicas: RwLock::new(HashMap::from([(
+                source.clone(),
+                KvRouteInfo {
+                    node_id: source.clone(),
+                    backing: KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
+                        owner_node_id: source.clone(),
+                        grant_id: 11,
+                        slot_index: 2,
+                        slot_size: 8192,
+                        addr: 0x3000,
+                        len: 4096,
+                        base_addr: 0x1000,
+                    }),
+                    owner_local_indexed: true,
+                    get_durable_reservation: None,
+                    capacity_reservation: None,
+                    tomb_tag: source_tag.clone(),
+                },
+            )])),
+            get_durable_slots_used: AtomicU32::new(0),
+        });
+        let planned = PlannedGetInfo {
+            put_id: route.put_id,
+            src_node_id: source,
+            src_tomb_tag: source_tag.clone(),
+            key: "key".to_string(),
+            controller_node_id: "external".to_string().into(),
+            controller_node_start_time: 17,
+            len: 4096,
+            src_addr: 0x3000,
+            src_base_addr: 0x1000,
+            atomic_group: None,
+        };
+        (planned, route, source_tag)
+    }
+
+    #[test]
+    fn bind_revalidation_accepts_only_the_exact_source_generation() {
+        let (planned, route, source_tag) = planned_route();
+        assert!(planned_get_source_is_current(&planned, &route));
+
+        route
+            .nodes_replicas
+            .write()
+            .get_mut(&planned.src_node_id)
+            .unwrap()
+            .backing = KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
+            owner_node_id: planned.src_node_id.clone(),
+            grant_id: 11,
+            slot_index: 2,
+            slot_size: 8192,
+            addr: 0x4000,
+            len: 4096,
+            base_addr: 0x1000,
+        });
+        assert!(!planned_get_source_is_current(&planned, &route));
+
+        route
+            .nodes_replicas
+            .write()
+            .get_mut(&planned.src_node_id)
+            .unwrap()
+            .backing = KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
+            owner_node_id: planned.src_node_id.clone(),
+            grant_id: 11,
+            slot_index: 2,
+            slot_size: 8192,
+            addr: 0x3000,
+            len: 4096,
+            base_addr: 0x1000,
+        });
+        source_tag.set_tomb();
+        assert!(!planned_get_source_is_current(&planned, &route));
+    }
+
+    #[test]
+    fn bind_revalidation_rejects_a_replacement_route_generation() {
+        let (planned, route, _) = planned_route();
+        let replacement_tag = NodeTombTag::new();
+        route
+            .nodes_replicas
+            .write()
+            .get_mut(&planned.src_node_id)
+            .unwrap()
+            .tomb_tag = replacement_tag;
+        assert!(!planned_get_source_is_current(&planned, &route));
+    }
+
+    #[test]
+    fn metadata_plan_does_not_retain_the_route() {
+        let (planned, route, _) = planned_route();
+        let weak_route = Arc::downgrade(&route);
+        let sources = snapshot_live_get_sources(&route);
+        drop(route);
+        assert!(weak_route.upgrade().is_none());
+        assert_eq!(sources.len(), 1);
+        assert_eq!(planned.key, "key");
+    }
+}
+
+async fn handle_get_plan_item(
+    view: MasterKvRouterView,
+    key: String,
+    controller_node_id: NodeID,
+) -> BatchGetPlanItemResp {
+    view.master_kv_router()
+        .inner()
+        .planned_get_counters
+        .plan_items
+        .fetch_add(1, Ordering::Relaxed);
+    let Some(controller) = view
+        .cluster_manager()
+        .get_member_info_cached(controller_node_id.as_ref())
+    else {
+        return get_plan_item_error(&msg_and_error::KvError::Api(
+            msg_and_error::ApiError::InvalidArgument {
+                detail: format!(
+                    "GetPlan controller is not a current member: {}",
+                    controller_node_id
+                ),
+            },
+        ));
+    };
+    if controller.node_role() != NodeRole::External {
+        return get_plan_item_error(&msg_and_error::KvError::Api(
+            msg_and_error::ApiError::InvalidArgument {
+                detail: format!(
+                    "GetPlan is supported only for external controllers: {}",
+                    controller_node_id
+                ),
+            },
+        ));
+    }
+
+    let Some(route) = view
+        .master_kv_router()
+        .inner()
+        .kv_routes
+        .get(&key)
+        .map(|route| route.clone())
+    else {
+        view.master_kv_router()
+            .inner()
+            .planned_get_counters
+            .plan_misses
+            .fetch_add(1, Ordering::Relaxed);
+        return get_plan_item_error(&msg_and_error::KvError::Api(
+            msg_and_error::ApiError::KeyNotFound { key },
+        ));
+    };
+
+    let local_owner =
+        external_sink_local_owner_id(&view, &controller_node_id, controller.node_start_time);
+    let mut candidates = snapshot_live_get_sources(&route);
+    candidates.shuffle(&mut rand::thread_rng());
+    candidates.sort_by_key(|replica| {
+        local_owner
+            .as_deref()
+            .is_some_and(|owner| replica.node_id.as_ref() == owner)
+    });
+    let Some(source) = candidates.into_iter().next() else {
+        view.master_kv_router()
+            .inner()
+            .planned_get_counters
+            .plan_misses
+            .fetch_add(1, Ordering::Relaxed);
+        return get_plan_item_error(&msg_and_error::KvError::Api(
+            msg_and_error::ApiError::KeyNotFound { key },
+        ));
+    };
+
+    let get_id = view
+        .master_kv_router()
+        .inner()
+        .next_get_id
+        .fetch_add(1, Ordering::Relaxed);
+    let gpu_direct_eligible = local_owner
+        .as_deref()
+        .is_none_or(|owner| source.node_id.as_ref() != owner);
+    let planned = super::PlannedGetInfo {
+        put_id: route.put_id,
+        src_node_id: source.node_id.clone(),
+        src_tomb_tag: source.tomb_tag.clone(),
+        key: key.clone(),
+        controller_node_id: controller_node_id.clone(),
+        controller_node_start_time: controller.node_start_time,
+        len: source.len,
+        src_addr: source.addr,
+        src_base_addr: source.base_addr,
+        atomic_group: route.atomic_group.as_deref().cloned(),
+    };
+    drop(route);
+    view.master_kv_router()
+        .inner()
+        .planned_gets
+        .insert(get_id, planned.clone())
+        .await;
+    view.master_kv_router()
+        .inner()
+        .planned_get_counters
+        .plan_hits
+        .fetch_add(1, Ordering::Relaxed);
+    BatchGetPlanItemResp {
+        get_id,
+        node_id: source.node_id.into(),
+        put_id: planned.put_id,
+        src_addr: planned.src_addr,
+        src_base_addr: planned.src_base_addr,
+        len: planned.len,
+        atomic_group: planned.atomic_group,
+        gpu_direct_eligible,
+        error_code: msg_and_error::OK,
+        error_json: String::new(),
+    }
+}
+
+fn bound_get_matches_target(info: &InflightGetInfo, target: &GetBindTarget) -> bool {
+    match (target, &info.target) {
+        (GetBindTarget::ExternalSink(expected), InflightGetTarget::ExternalSink(actual)) => {
+            expected == actual
+        }
+        (
+            GetBindTarget::PreparedLocalReserve(expected),
+            InflightGetTarget::PreparedLocalReserveSlot(actual),
+        ) => {
+            expected.grant_id == actual.grant_id
+                && expected.slot_index == actual.slot_index
+                && expected.slot_size == actual.slot_size
+                && expected.addr == actual.addr
+                && expected.base_addr == actual.base_addr
+        }
+        _ => false,
+    }
+}
+
+fn bound_get_start_item(get_id: u64, info: &InflightGetInfo) -> BatchGetStartItemResp {
+    BatchGetStartItemResp {
+        get_id,
+        node_id: info.src_node_id.to_string().into(),
+        put_id: info.put_id,
+        target_addr: info.target.abs_addr(),
+        src_addr: info.src_addr,
+        target_base_addr: info.target.base_addr(),
+        src_base_addr: info.src_base_addr,
+        len: info.len,
+        prepared_target: match &info.target {
+            InflightGetTarget::PreparedLocalReserveSlot(slot) => {
+                Some(GetPreparedLocalReserveTarget {
+                    grant_id: slot.grant_id,
+                    slot_index: slot.slot_index,
+                    slot_size: slot.slot_size,
+                    addr: slot.addr,
+                    base_addr: slot.base_addr,
+                })
+            }
+            _ => None,
+        },
+        atomic_group: info.atomic_group.clone(),
+        error_code: msg_and_error::OK,
+        error_json: String::new(),
+    }
+}
+
+async fn handle_get_bind_item(
+    view: MasterKvRouterView,
+    request: BatchGetBindItemReq,
+    req_node_id: NodeID,
+) -> BatchGetStartItemResp {
+    let get_id = request.get_id;
+    let operation_lock = view
+        .master_kv_router()
+        .inner()
+        .get_done_locks
+        .get_lock(get_id);
+    let _operation_guard = operation_lock.lock().await;
+
+    if let Some(bound) = view
+        .master_kv_router()
+        .inner()
+        .inflight_gets
+        .get(&get_id)
+        .await
+    {
+        if bound.req_node_id != req_node_id || !bound_get_matches_target(&bound, &request.target) {
+            return get_bind_item_error(
+                get_id,
+                &msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                    detail: format!(
+                        "GetBind replay identity/target mismatch: get_id={} requester={}",
+                        get_id, req_node_id
+                    ),
+                }),
+            );
+        }
+        return bound_get_start_item(get_id, &bound);
+    }
+
+    let Some(planned) = view
+        .master_kv_router()
+        .inner()
+        .planned_gets
+        .get(&get_id)
+        .await
+    else {
+        return get_bind_item_error(
+            get_id,
+            &msg_and_error::KvError::Api(msg_and_error::ApiError::KeyNotFound {
+                key: format!("planned_get_id:{get_id}"),
+            }),
+        );
+    };
+    let (target, target_tomb_tag, allocation_mode, prepared_requester_lease) = match &request.target
+    {
+        GetBindTarget::ExternalSink(target) => {
+            if req_node_id != planned.controller_node_id {
+                return get_bind_item_error(
+                    get_id,
+                    &msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                        detail: format!(
+                            "external GetBind controller mismatch: get_id={} expected={} got={}",
+                            get_id, planned.controller_node_id, req_node_id
+                        ),
+                    }),
+                );
+            }
+            if let Err(err) =
+                validate_external_sink_target(&view, &req_node_id, target, planned.len)
+            {
+                return get_bind_item_error(get_id, &err);
+            }
+            (
+                InflightGetTarget::ExternalSink(target.clone()),
+                None,
+                GetAllocationMode::ExternalSink,
+                None,
+            )
+        }
+        GetBindTarget::PreparedLocalReserve(target) => {
+            let expected_owner = external_sink_local_owner_id(
+                &view,
+                &planned.controller_node_id,
+                planned.controller_node_start_time,
+            );
+            if expected_owner.as_deref() != Some(req_node_id.as_ref()) {
+                return get_bind_item_error(
+                    get_id,
+                    &msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                        detail: format!(
+                            "prepared GetBind executor is not the controller's owner: get_id={} controller={} expected_owner={:?} got={}",
+                            get_id, planned.controller_node_id, expected_owner, req_node_id
+                        ),
+                    }),
+                );
+            }
+            let requester_lease = match view.master_kv_router().reserve_prepared_get_requester(
+                &planned.key,
+                &req_node_id,
+                get_id,
+            ) {
+                Ok(lease) => lease,
+                Err(err) => return get_bind_item_error(get_id, &err),
+            };
+            let (slot, tomb_tag) = match validate_prepared_local_reserve_target(
+                &view,
+                &req_node_id,
+                target,
+                planned.len,
+            ) {
+                Ok(value) => value,
+                Err(err) => return get_bind_item_error(get_id, &err),
+            };
+            (
+                InflightGetTarget::PreparedLocalReserveSlot(slot),
+                Some(tomb_tag),
+                GetAllocationMode::LocalCommittedSlot,
+                Some(requester_lease),
+            )
+        }
+        GetBindTarget::Invalid => {
+            return get_bind_item_error(
+                get_id,
+                &msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                    detail: format!("GetBind requires a concrete target: get_id={get_id}"),
+                }),
+            );
+        }
+    };
+
+    let activity_lease = match view
+        .master_kv_router()
+        .reserve_inflight_get_key(&planned.key)
+    {
+        Ok(lease) => lease,
+        Err(err) => {
+            view.master_kv_router()
+                .inner()
+                .planned_get_counters
+                .bind_activity_busy
+                .fetch_add(1, Ordering::Relaxed);
+            return get_bind_item_error(get_id, &err);
+        }
+    };
+    let current_route = view
+        .master_kv_router()
+        .inner()
+        .kv_routes
+        .get(&planned.key)
+        .map(|route| route.clone());
+    let Some(current_route) =
+        current_route.filter(|route| planned_get_source_is_current(&planned, route))
+    else {
+        view.master_kv_router()
+            .inner()
+            .planned_get_counters
+            .bind_stale
+            .fetch_add(1, Ordering::Relaxed);
+        return get_bind_item_error(
+            get_id,
+            &msg_and_error::KvError::Api(msg_and_error::ApiError::StaleGetPlan {
+                get_id,
+                key: planned.key.clone(),
+                detail: format!(
+                    "source route changed before Bind: source={}",
+                    planned.src_node_id
+                ),
+            }),
+        );
+    };
+    if matches!(&request.target, GetBindTarget::PreparedLocalReserve(_))
+        && current_route
+            .nodes_replicas
+            .read()
+            .get(&req_node_id)
+            .is_some_and(|replica| !replica.tomb_tag.is_tomb())
+    {
+        return get_bind_item_error(
+            get_id,
+            &msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                detail: format!(
+                    "prepared GetBind cannot replace a live owner replica: get_id={} key={} owner={}",
+                    get_id, planned.key, req_node_id
+                ),
+            }),
+        );
+    }
+
+    let Some(planned) = view
+        .master_kv_router()
+        .inner()
+        .planned_gets
+        .remove(&get_id)
+        .await
+    else {
+        return get_bind_item_error(
+            get_id,
+            &msg_and_error::KvError::Api(msg_and_error::ApiError::KeyNotFound {
+                key: format!("planned_get_id:{get_id}"),
+            }),
+        );
+    };
+    let inflight = InflightGetInfo {
+        put_id: planned.put_id,
+        src_node_id: planned.src_node_id.clone(),
+        key: planned.key.clone(),
+        req_node_id: req_node_id.clone(),
+        controller_node_id: Some(planned.controller_node_id),
+        len: planned.len,
+        src_addr: planned.src_addr,
+        src_base_addr: planned.src_base_addr,
+        atomic_group: planned.atomic_group,
+        target,
+        target_tomb_tag,
+        route: current_route.clone(),
+        allocation_mode,
+        durable_reservation: None,
+        _activity_lease: activity_lease,
+        _prepared_requester_lease: prepared_requester_lease,
+    };
+    let response = bound_get_start_item(get_id, &inflight);
+    view.master_kv_router().record_get_source_selection(
+        req_node_id.as_ref(),
+        inflight.src_node_id.as_ref(),
+        inflight.len,
+        allocation_mode,
+    );
+    view.master_kv_router()
+        .inner()
+        .inflight_gets
+        .insert(get_id, inflight)
+        .await;
+    view.master_kv_router()
+        .inner()
+        .planned_get_counters
+        .bind_succeeded
+        .fetch_add(1, Ordering::Relaxed);
+    if current_route.lease_id.is_none() {
+        touch_moka_for_node(view, response.node_id.to_string(), planned.key);
+    }
+    response
+}
+
+pub async fn handle_batch_get_plan(
+    view: MasterKvRouterView,
+    req: MsgPack<BatchGetPlanReq>,
+    req_node_id: NodeID,
+) -> MsgPack<BatchGetPlanResp> {
+    let mut items = Vec::with_capacity(req.serialize_part.keys.len());
+    for key in req.serialize_part.keys {
+        items.push(handle_get_plan_item(view.clone(), key, req_node_id.clone()).await);
+    }
+    MsgPack {
+        serialize_part: BatchGetPlanResp {
+            items,
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+            server_process_us: 0,
+        },
+        raw_bytes: Vec::new(),
+    }
+}
+
+pub async fn handle_batch_get_bind(
+    view: MasterKvRouterView,
+    req: MsgPack<BatchGetBindReq>,
+    req_node_id: NodeID,
+) -> MsgPack<BatchGetBindResp> {
+    let mut items = Vec::with_capacity(req.serialize_part.items.len());
+    for item in req.serialize_part.items {
+        items.push(handle_get_bind_item(view.clone(), item, req_node_id.clone()).await);
+    }
+    MsgPack {
+        serialize_part: BatchGetBindResp {
+            items,
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+            server_process_us: 0,
+        },
+        raw_bytes: Vec::new(),
+    }
 }
 
 pub async fn handle_get_start(
@@ -613,7 +1239,11 @@ pub async fn handle_get_start(
             src_node_id: src_node_id.clone(),
             key: req.serialize_part.key.clone(),
             req_node_id,
+            controller_node_id: None,
             len: src_len,
+            src_addr: resp_src_addr,
+            src_base_addr: resp_src_base,
+            atomic_group: one_kv_nodes_routes.atomic_group.as_deref().cloned(),
             target,
             target_tomb_tag,
             route: one_kv_nodes_routes.clone(),
@@ -683,6 +1313,56 @@ pub async fn handle_get_revoke(
         .get_lock(get_id);
     let _done_guard = done_lock.lock().await;
 
+    if let Some(planned) = view
+        .master_kv_router()
+        .inner()
+        .planned_gets
+        .get(&get_id)
+        .await
+    {
+        let controller_owner = external_sink_local_owner_id(
+            &view,
+            &planned.controller_node_id,
+            planned.controller_node_start_time,
+        );
+        let authorized = planned.controller_node_id == req_node_id
+            || controller_owner.as_deref() == Some(req_node_id.as_ref());
+        if !authorized {
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                detail: format!(
+                    "GetRevoke planned-operation requester mismatch: get_id={} controller={} got={}",
+                    get_id, planned.controller_node_id, req_node_id
+                ),
+            });
+            return MsgPack {
+                serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                raw_bytes: Vec::new(),
+            };
+        }
+        drop(planned);
+        if view
+            .master_kv_router()
+            .inner()
+            .planned_gets
+            .remove(&get_id)
+            .await
+            .is_some()
+        {
+            view.master_kv_router()
+                .inner()
+                .planned_get_counters
+                .plan_revoked
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        return MsgPack {
+            serialize_part: GetRevokeResp {
+                error_code: msg_and_error::OK,
+                error_json: String::new(),
+            },
+            raw_bytes: Vec::new(),
+        };
+    }
+
     if let Some(inflight_info) = view
         .master_kv_router()
         .inner()
@@ -690,7 +1370,9 @@ pub async fn handle_get_revoke(
         .get(&get_id)
         .await
     {
-        if inflight_info.req_node_id != req_node_id {
+        if inflight_info.req_node_id != req_node_id
+            && inflight_info.controller_node_id.as_ref() != Some(&req_node_id)
+        {
             let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
                 detail: format!(
                     "GetRevoke requester mismatch: get_id={} expected={} got={}",

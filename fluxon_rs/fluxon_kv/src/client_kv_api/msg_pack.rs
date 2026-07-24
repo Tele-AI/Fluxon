@@ -3,7 +3,7 @@ use crate::p2p::msg_pack::{MsgPackSerializePart, RPCReq};
 use crate::rpcresp_kvresult_convert::msg_and_error::{ErrorCode, OK};
 use bitcode::{Decode, Encode};
 
-use crate::memholder::{ExternalMemHolder, ExternalMemHolderInfo};
+use crate::memholder::ExternalMemHolderInfo;
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct TestPutPhaseTrace {
@@ -119,6 +119,78 @@ pub struct ExternalBatchGetResp {
     pub error_code: ErrorCode,
     pub error_json: String,
 }
+
+/// Probe only the requester's share-group owner. A `Some` item is pinned
+/// owner-local data; `None` must be resolved through the remote directory.
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchGetLocalProbeReq {
+    pub plan_handle: u64,
+    pub keys: Vec<String>,
+    pub req_node_id: String,
+    pub started_time: i64,
+}
+impl MsgPackSerializePart for ExternalBatchGetLocalProbeReq {
+    fn msg_id(&self) -> u32 {
+        4040
+    }
+}
+impl RPCReq for ExternalBatchGetLocalProbeReq {
+    type Resp = ExternalBatchGetLocalProbeResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchGetLocalProbeResp {
+    pub items: Vec<Option<ExternalMemHolderInfo>>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for ExternalBatchGetLocalProbeResp {
+    fn msg_id(&self) -> u32 {
+        4041
+    }
+}
+
+#[cfg(test)]
+mod external_batch_get_local_probe_wire_tests {
+    use super::{ExternalBatchGetLocalProbeReq, ExternalBatchGetLocalProbeResp};
+    use crate::memholder::ExternalMemHolderInfo;
+    use crate::rpcresp_kvresult_convert::msg_and_error::OK;
+
+    #[test]
+    fn mixed_local_remote_probe_round_trip() {
+        let request = ExternalBatchGetLocalProbeReq {
+            plan_handle: 41,
+            keys: vec!["local".to_string(), "remote".to_string()],
+            req_node_id: "external-a".to_string(),
+            started_time: 17,
+        };
+        let decoded: ExternalBatchGetLocalProbeReq =
+            bitcode::decode(&bitcode::encode(&request)).expect("decode local probe request");
+        assert_eq!(decoded.plan_handle, 41);
+        assert_eq!(decoded.keys, request.keys);
+
+        let response = ExternalBatchGetLocalProbeResp {
+            items: vec![
+                Some(ExternalMemHolderInfo {
+                    offset: 4096,
+                    len: 8192,
+                    holder_id: 23,
+                }),
+                None,
+            ],
+            error_code: OK,
+            error_json: String::new(),
+        };
+        let decoded: ExternalBatchGetLocalProbeResp =
+            bitcode::decode(&bitcode::encode(&response)).expect("decode local probe response");
+        assert_eq!(decoded.items.len(), 2);
+        assert_eq!(
+            decoded.items[0].as_ref().map(|info| info.holder_id),
+            Some(23)
+        );
+        assert!(decoded.items[1].is_none());
+    }
+}
 impl MsgPackSerializePart for ExternalBatchGetResp {
     fn msg_id(&self) -> u32 {
         4021
@@ -228,6 +300,96 @@ impl RPCReq for ExternalBatchGetCancelReq {
 pub struct ExternalBatchGetCancelResp {
     pub error_code: ErrorCode,
     pub error_json: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalPlannedGetItem {
+    pub key: String,
+    pub get_id: u64,
+}
+
+/// Execute a target-free master plan into the requester's owner-local CPU
+/// pool. The stable `(requester generation, plan_handle)` identity makes a
+/// lost response replayable without another lookup or transfer.
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalExecutePlannedGetReq {
+    pub plan_handle: u64,
+    pub items: Vec<ExternalPlannedGetItem>,
+    pub req_node_id: String,
+    pub started_time: i64,
+    pub transfer_concurrency: usize,
+}
+impl MsgPackSerializePart for ExternalExecutePlannedGetReq {
+    fn msg_id(&self) -> u32 {
+        4038
+    }
+}
+impl RPCReq for ExternalExecutePlannedGetReq {
+    type Resp = ExternalExecutePlannedGetResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalExecutePlannedGetResp {
+    pub items: Vec<ExternalBatchGetItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+#[cfg(test)]
+mod external_execute_planned_get_wire_tests {
+    use super::{
+        ExternalBatchGetItemResp, ExternalExecutePlannedGetReq, ExternalExecutePlannedGetResp,
+        ExternalPlannedGetItem,
+    };
+    use crate::memholder::ExternalMemHolderInfo;
+    use crate::rpcresp_kvresult_convert::msg_and_error::OK;
+
+    #[test]
+    fn operation_identity_and_holder_terminal_round_trip() {
+        let request = ExternalExecutePlannedGetReq {
+            plan_handle: 19,
+            items: vec![ExternalPlannedGetItem {
+                key: "page-a".to_string(),
+                get_id: 0,
+            }],
+            req_node_id: "external-a".to_string(),
+            started_time: 23,
+            transfer_concurrency: 32,
+        };
+        let decoded: ExternalExecutePlannedGetReq =
+            bitcode::decode(&bitcode::encode(&request)).expect("decode planned execute request");
+        assert_eq!(decoded.plan_handle, 19);
+        assert_eq!(decoded.items[0].get_id, 0);
+        assert_eq!(decoded.started_time, 23);
+
+        let terminal = ExternalExecutePlannedGetResp {
+            items: vec![ExternalBatchGetItemResp {
+                error_code: OK,
+                error_json: String::new(),
+                external_memholder_info: Some(ExternalMemHolderInfo {
+                    offset: 4096,
+                    len: 8192,
+                    holder_id: 29,
+                }),
+            }],
+            error_code: OK,
+            error_json: String::new(),
+        };
+        let decoded: ExternalExecutePlannedGetResp =
+            bitcode::decode(&bitcode::encode(&terminal)).expect("decode planned execute terminal");
+        assert_eq!(
+            decoded.items[0]
+                .external_memholder_info
+                .as_ref()
+                .map(|info| info.holder_id),
+            Some(29)
+        );
+    }
+}
+impl MsgPackSerializePart for ExternalExecutePlannedGetResp {
+    fn msg_id(&self) -> u32 {
+        4039
+    }
 }
 impl MsgPackSerializePart for ExternalBatchGetCancelResp {
     fn msg_id(&self) -> u32 {

@@ -5,8 +5,9 @@ use crate::client_kv_api::external_api::{
     validate_external_get_consume_prefix,
 };
 use crate::client_kv_api::msg_pack::{
-    ExternalBatchDeleteAckReq, ExternalInvalidateWeakIndexItem, ExternalInvalidateWeakIndexReq,
-    ExternalInvalidateWeakIndexResp,
+    ExternalBatchDeleteAckReq, ExternalExecutePlannedGetReq, ExternalExecutePlannedGetResp,
+    ExternalInvalidateWeakIndexItem, ExternalInvalidateWeakIndexReq,
+    ExternalInvalidateWeakIndexResp, ExternalPlannedGetItem,
 };
 use crate::client_seg_pool::{ClientSegPool, SideTransferPeerFileMeta};
 use crate::client_transfer_engine::{ClientTransferEngine, GpuMemoryGuard};
@@ -15,24 +16,26 @@ use crate::cluster_manager::{
     META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME,
 };
 use crate::master_kv_router::msg_pack::{
-    BatchGetDoneReq, BatchGetDoneResp, BatchGetRevokeReq, BatchGetRevokeResp,
-    BatchGetStartItemResp, BatchGetStartReq, BatchGetStartResp, GetAllocationMode,
+    BatchGetBindItemReq, BatchGetBindReq, BatchGetBindResp, BatchGetDoneReq, BatchGetDoneResp,
+    BatchGetPlanItemResp, BatchGetPlanReq, BatchGetPlanResp, BatchGetRevokeReq, BatchGetRevokeResp,
+    BatchGetStartItemResp, BatchGetStartReq, BatchGetStartResp, GetAllocationMode, GetBindTarget,
     GetExternalSinkTarget,
 };
 use crate::rpcresp_kvresult_convert::ToResult;
 use crate::{
     client_kv_api::msg_pack::{
         ExternalBatchGetCancelPlan, ExternalBatchGetCancelReq, ExternalBatchGetItemResp,
-        ExternalBatchGetReq, ExternalBatchGetStartReq, ExternalBatchGetStartResp,
-        ExternalBatchGetStartTransferPlan, ExternalBatchGetTransferReq,
-        ExternalBatchGetTransferResp, ExternalBatchIsExistReq, ExternalBatchPutCommitItemReq,
-        ExternalBatchPutCommitReq, ExternalBatchPutCommitResp, ExternalBatchPutStartItemReq,
-        ExternalBatchPutStartReq, ExternalBatchPutStartResp, ExternalBatchPutTransferEndItemReq,
-        ExternalBatchPutTransferEndReq, ExternalBatchPutTransferEndResp, ExternalDeleteAckReq,
-        ExternalDeleteReq, ExternalGetReq, ExternalIsExistReq, ExternalObservabilitySnapshotReq,
-        ExternalPutCommitReq, ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp,
-        ExternalPutStartReq, ExternalPutStartResp, ExternalPutTransferEndReq,
-        ExternalPutTransferEndResp, SyncKvToFileReq, SyncKvToFileResp, TestPutPhaseTrace,
+        ExternalBatchGetLocalProbeReq, ExternalBatchGetLocalProbeResp, ExternalBatchGetReq,
+        ExternalBatchGetStartReq, ExternalBatchGetStartResp, ExternalBatchGetStartTransferPlan,
+        ExternalBatchGetTransferReq, ExternalBatchGetTransferResp, ExternalBatchIsExistReq,
+        ExternalBatchPutCommitItemReq, ExternalBatchPutCommitReq, ExternalBatchPutCommitResp,
+        ExternalBatchPutStartItemReq, ExternalBatchPutStartReq, ExternalBatchPutStartResp,
+        ExternalBatchPutTransferEndItemReq, ExternalBatchPutTransferEndReq,
+        ExternalBatchPutTransferEndResp, ExternalDeleteAckReq, ExternalDeleteReq, ExternalGetReq,
+        ExternalIsExistReq, ExternalObservabilitySnapshotReq, ExternalPutCommitReq,
+        ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp, ExternalPutStartReq,
+        ExternalPutStartResp, ExternalPutTransferEndReq, ExternalPutTransferEndResp,
+        SyncKvToFileReq, SyncKvToFileResp, TestPutPhaseTrace,
     },
     cluster_manager::{
         ClusterManager, ClusterManagerAccessTrait, IpcBandwidthAttributorHandle, NodeRole,
@@ -90,6 +93,13 @@ const EXTERNAL_PUT_TRANSFER_END_RPC_TIMEOUT_SECS: u64 = 30;
 const EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS: usize = 3;
 const EXTERNAL_PUT_TRACE_LOG_WINDOW_SECS: u64 = 10;
 const EXTERNAL_OWNER_INTRA_RPC_READY_TIMEOUT_SECS: u64 = 30;
+// This is a foreground scheduler wait, not the owner operation lifetime.
+// Owner finish is cancellation-safe and the uncertain replay below keeps its
+// longer timeout.  Fail the foreground request at the P2P minimum so SGLang
+// can fall back to compute instead of parking a TP scheduler for 300 seconds.
+const EXTERNAL_PLANNED_CPU_GET_FOREGROUND_RPC_TIMEOUT_SECS: u64 =
+    crate::p2p::msg_pack::MIN_EXPLICIT_RPC_TIMEOUT_SECS;
+const EXTERNAL_PLANNED_CPU_GET_REPLAY_RPC_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExternalDeleteAckBatchSendResult {
@@ -117,9 +127,29 @@ pub struct ExternalGpuGetStartResp {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalGetPlanResp {
+    pub handle: u64,
+    pub raw_prefix_hit_len: usize,
+    pub gpu_raw_prefix_hit_len: usize,
+    /// Original key positions that need remote GPU destinations. Owner-local
+    /// positions remain CPU-backed and are absent from this vector.
+    pub gpu_remote_indices: Vec<usize>,
+}
+
 pub struct ExternalGpuGetTransferResp {
     pub transferred_prefix_len: usize,
     pub consumed_prefix_len: usize,
+    pub value_ptrs: Vec<u64>,
+    pub local_holders: Vec<Arc<ExternalMemHolder>>,
+    /// Wall time from publishing the live GPU Get handle until the transfer,
+    /// cleanup, and master Done path reached a terminal state.
+    pub transfer_wall_us: i64,
+    /// Time spent by the consuming call waiting for that terminal state.
+    pub finish_wait_us: i64,
+    /// Whether the terminal state was already available when consumption began.
+    pub terminal_before_consume: bool,
+    /// Ready-but-unconsumed residence when the terminal preceded consumption.
+    pub terminal_to_consume_us: i64,
 }
 
 fn external_gpu_transfer_plan_geometry_is_valid(
@@ -135,6 +165,34 @@ fn external_gpu_transfer_plan_geometry_is_valid(
         && registered_generation == destination.registration_id
 }
 
+fn external_get_plan_raw_prefixes(items: &[BatchGetPlanItemResp]) -> (usize, usize) {
+    external_get_plan_raw_prefixes_from_statuses(
+        items
+            .iter()
+            .map(|item| (item.error_code == OK, item.gpu_direct_eligible)),
+    )
+}
+
+fn external_get_plan_raw_prefixes_from_statuses(
+    statuses: impl IntoIterator<Item = (bool, bool)>,
+) -> (usize, usize) {
+    let mut cpu_prefix = 0usize;
+    let mut gpu_prefix = 0usize;
+    let mut gpu_prefix_open = true;
+    for (hit, gpu_eligible) in statuses {
+        if !hit {
+            break;
+        }
+        cpu_prefix += 1;
+        if gpu_prefix_open && gpu_eligible {
+            gpu_prefix += 1;
+        } else {
+            gpu_prefix_open = false;
+        }
+    }
+    (cpu_prefix, gpu_prefix)
+}
+
 #[derive(Clone, Debug)]
 enum ExternalGpuGetTerminal {
     Completed,
@@ -142,11 +200,90 @@ enum ExternalGpuGetTerminal {
     Failed { detail: String },
 }
 
+#[derive(Clone, Debug)]
+struct ExternalGpuGetTerminalEvent {
+    outcome: ExternalGpuGetTerminal,
+    terminal_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExternalGpuGetConsumeTiming {
+    transfer_wall_us: i64,
+    finish_wait_us: i64,
+    terminal_before_consume: bool,
+    terminal_to_consume_us: i64,
+}
+
+fn observe_external_gpu_get_consume_timing(
+    transfer_started_at: Instant,
+    terminal_at: Instant,
+    consume_started_at: Instant,
+    finish_wait: Duration,
+) -> ExternalGpuGetConsumeTiming {
+    let terminal_to_consume = consume_started_at.checked_duration_since(terminal_at);
+    ExternalGpuGetConsumeTiming {
+        transfer_wall_us: duration_to_i64_us(
+            terminal_at
+                .checked_duration_since(transfer_started_at)
+                .unwrap_or_default(),
+        ),
+        finish_wait_us: duration_to_i64_us(finish_wait),
+        terminal_before_consume: terminal_to_consume.is_some(),
+        terminal_to_consume_us: duration_to_i64_us(terminal_to_consume.unwrap_or_default()),
+    }
+}
+
 struct PendingExternalGpuGet {
     transferable_len: usize,
     atomic_group_lens: Vec<usize>,
+    value_ptrs: Vec<u64>,
+    local_holders: Vec<(usize, Arc<ExternalMemHolder>)>,
     cancel_requested: Arc<AtomicBool>,
-    terminal_rx: watch::Receiver<Option<ExternalGpuGetTerminal>>,
+    transfer_started_at: Instant,
+    terminal_rx: watch::Receiver<Option<ExternalGpuGetTerminalEvent>>,
+}
+
+enum PendingExternalGetPlanItem {
+    Local {
+        holder: Arc<ExternalMemHolder>,
+    },
+    Remote {
+        key: String,
+        plan: BatchGetPlanItemResp,
+    },
+}
+
+struct PendingExternalGetPlan {
+    items: Vec<PendingExternalGetPlanItem>,
+    transferable_len: usize,
+    gpu_transferable_len: usize,
+    gpu_remote_indices: Vec<usize>,
+    atomic_group_lens: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+enum ExternalPlannedCpuGetTerminal {
+    Completed {
+        items: Vec<ExternalBatchGetItemResp>,
+        owner_start_time: i64,
+    },
+    Revoked,
+    Failed {
+        detail: String,
+    },
+}
+
+struct PendingExternalPlannedCpuGet {
+    sources: Vec<PendingExternalCpuSource>,
+    transferable_len: usize,
+    atomic_group_lens: Vec<usize>,
+    cancel_requested: Arc<AtomicBool>,
+    terminal_rx: watch::Receiver<Option<ExternalPlannedCpuGetTerminal>>,
+}
+
+enum PendingExternalCpuSource {
+    Local { holder: Arc<ExternalMemHolder> },
+    Remote { key: String },
 }
 
 struct PendingExternalGetStart {
@@ -154,6 +291,47 @@ struct PendingExternalGetStart {
     transferable_len: usize,
     atomic_group_lens: Vec<usize>,
     first_miss_index: Option<usize>,
+}
+
+/// Keeps ownership in a pending registry across cancellation points.  A
+/// future that is dropped while waiting automatically restores the exact
+/// entry, so a later transfer/cancel call can still drive its terminal
+/// cleanup.  `take()` disarms the guard once no further await can lose the
+/// entry.
+struct PendingRegistryEntryGuard<'a, T> {
+    registry: &'a DashMap<u64, T>,
+    handle: u64,
+    entry: Option<T>,
+}
+
+impl<'a, T> PendingRegistryEntryGuard<'a, T> {
+    fn new(registry: &'a DashMap<u64, T>, handle: u64, entry: T) -> Self {
+        Self {
+            registry,
+            handle,
+            entry: Some(entry),
+        }
+    }
+
+    fn entry(&self) -> &T {
+        self.entry
+            .as_ref()
+            .expect("pending registry guard must be armed")
+    }
+
+    fn take(mut self) -> T {
+        self.entry
+            .take()
+            .expect("pending registry guard must be armed")
+    }
+}
+
+impl<T> Drop for PendingRegistryEntryGuard<'_, T> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            self.registry.insert(self.handle, entry);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -204,6 +382,86 @@ fn validate_inline_external_get_owner_generation(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_external_local_holder_geometry(
+    index: usize,
+    holder_owner_start_time: i64,
+    holder_offset: u64,
+    holder_len: u32,
+    holder_addr: u64,
+    current_owner_start_time: i64,
+    base_ptr: u64,
+    mapped_len: u64,
+) -> KvResult<()> {
+    validate_inline_external_get_owner_generation(
+        holder_owner_start_time,
+        current_owner_start_time,
+    )?;
+    let end = holder_offset
+        .checked_add(u64::from(holder_len))
+        .ok_or_else(|| {
+            KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "mixed Get local holder range overflow: index={} offset={} len={}",
+                    index, holder_offset, holder_len
+                ),
+            })
+        })?;
+    let pointer = base_ptr.checked_add(holder_offset).ok_or_else(|| {
+        KvError::Api(ApiError::Unknown {
+            detail: format!(
+                "mixed Get local holder pointer overflow: index={} base={:#x} offset={}",
+                index, base_ptr, holder_offset
+            ),
+        })
+    })?;
+    if end > mapped_len || pointer != holder_addr {
+        return Err(KvError::Api(ApiError::Unknown {
+            detail: format!(
+                "mixed Get local holder no longer matches owner mapping: index={} end={} mapped_len={} pointer={:#x} expected={:#x}",
+                index, end, mapped_len, pointer, holder_addr
+            ),
+        }));
+    }
+    Ok(())
+}
+
+fn validate_external_local_holder_mapping(
+    index: usize,
+    holder: &ExternalMemHolder,
+    current_owner_start_time: i64,
+    base_ptr: u64,
+    mapped_len: u64,
+) -> KvResult<()> {
+    validate_external_local_holder_geometry(
+        index,
+        holder.owner_start_time,
+        holder.offset,
+        holder.len,
+        holder.addr,
+        current_owner_start_time,
+        base_ptr,
+        mapped_len,
+    )
+}
+
+fn validate_external_local_holders_mapping(
+    holders: &[(usize, Arc<ExternalMemHolder>)],
+    current_owner_start_time: i64,
+    base_ptr: u64,
+    mapped_len: u64,
+) -> KvResult<()> {
+    holders.iter().try_for_each(|(index, holder)| {
+        validate_external_local_holder_mapping(
+            *index,
+            holder,
+            current_owner_start_time,
+            base_ptr,
+            mapped_len,
+        )
+    })
+}
+
 fn inline_external_get_tail_holder_ids(
     items: &[ExternalBatchGetItemResp],
     consume_prefix_len: usize,
@@ -239,14 +497,20 @@ fn inline_external_get_tail_holder_ids(
 #[cfg(test)]
 mod inline_external_get_start_tests {
     use super::{
-        ExternalGpuDestination, external_gpu_transfer_plan_geometry_is_valid,
-        inline_external_get_tail_holder_ids, validate_inline_external_get_owner_generation,
+        EXTERNAL_PLANNED_CPU_GET_FOREGROUND_RPC_TIMEOUT_SECS,
+        EXTERNAL_PLANNED_CPU_GET_REPLAY_RPC_TIMEOUT_SECS, ExternalGpuDestination,
+        PendingRegistryEntryGuard, external_get_plan_raw_prefixes,
+        external_get_plan_raw_prefixes_from_statuses, external_gpu_transfer_plan_geometry_is_valid,
+        inline_external_get_tail_holder_ids, observe_external_gpu_get_consume_timing,
+        validate_external_local_holder_geometry, validate_inline_external_get_owner_generation,
         validate_inline_external_get_start_plan,
     };
     use crate::client_kv_api::msg_pack::ExternalBatchGetItemResp;
-    use crate::master_kv_router::msg_pack::BatchGetStartItemResp;
+    use crate::master_kv_router::msg_pack::{BatchGetPlanItemResp, BatchGetStartItemResp};
     use crate::memholder::ExternalMemHolderInfo;
     use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, OK};
+    use dashmap::DashMap;
+    use std::time::{Duration, Instant};
 
     fn inline_hit(holder_id: u64) -> ExternalBatchGetItemResp {
         ExternalBatchGetItemResp {
@@ -272,6 +536,18 @@ mod inline_external_get_start_tests {
     }
 
     #[test]
+    fn planned_cpu_get_foreground_timeout_is_bounded_below_replay_cleanup() {
+        assert_eq!(
+            EXTERNAL_PLANNED_CPU_GET_FOREGROUND_RPC_TIMEOUT_SECS,
+            crate::p2p::msg_pack::MIN_EXPLICIT_RPC_TIMEOUT_SECS,
+        );
+        assert!(
+            EXTERNAL_PLANNED_CPU_GET_FOREGROUND_RPC_TIMEOUT_SECS
+                < EXTERNAL_PLANNED_CPU_GET_REPLAY_RPC_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
     fn inline_plan_rejects_a_stale_owner_generation() {
         assert!(validate_inline_external_get_owner_generation(17, 17).is_ok());
         let err = validate_inline_external_get_owner_generation(17, 18)
@@ -283,6 +559,41 @@ mod inline_external_get_start_tests {
                 got: 17
             })
         ));
+    }
+
+    #[test]
+    fn mixed_source_local_holder_requires_the_exact_live_mapping() {
+        assert!(
+            validate_external_local_holder_geometry(
+                2, 17, 0x1000, 0x1000, 0x11_000, 17, 0x10_000, 0x4000,
+            )
+            .is_ok()
+        );
+
+        let stale = validate_external_local_holder_geometry(
+            2, 16, 0x1000, 0x1000, 0x11_000, 17, 0x10_000, 0x4000,
+        )
+        .expect_err("an old owner generation must be rejected before GPU Bind");
+        assert!(matches!(
+            stale,
+            KvError::Api(ApiError::OwnerStartTimeMismatch {
+                expected: 17,
+                got: 16
+            })
+        ));
+
+        assert!(
+            validate_external_local_holder_geometry(
+                2, 17, 0x3800, 0x1000, 0x13_800, 17, 0x10_000, 0x4000,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_external_local_holder_geometry(
+                2, 17, 0x1000, 0x1000, 0x21_000, 17, 0x10_000, 0x4000,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -321,6 +632,140 @@ mod inline_external_get_start_tests {
             &destination,
             destination.registration_id,
         ));
+    }
+
+    #[test]
+    fn gpu_prefix_stops_without_shortening_the_cpu_plan() {
+        let items = vec![
+            BatchGetPlanItemResp {
+                error_code: OK,
+                gpu_direct_eligible: true,
+                ..Default::default()
+            },
+            BatchGetPlanItemResp {
+                error_code: OK,
+                gpu_direct_eligible: false,
+                ..Default::default()
+            },
+            BatchGetPlanItemResp {
+                error_code: OK,
+                gpu_direct_eligible: true,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(external_get_plan_raw_prefixes(&items), (3, 1));
+    }
+
+    #[test]
+    fn owner_local_positions_do_not_consume_remote_gpu_destinations() {
+        // local, remote-GPU, local stays a three-page GPU-capable source
+        // prefix, while only the middle page needs a GPU destination.
+        assert_eq!(
+            external_get_plan_raw_prefixes_from_statuses([
+                (true, true),
+                (true, true),
+                (true, true),
+            ]),
+            (3, 3)
+        );
+        // A remote source that cannot bind a GPU sink stops only the mixed
+        // GPU prefix; the CPU plan can still consume later local pages.
+        assert_eq!(
+            external_get_plan_raw_prefixes_from_statuses([
+                (true, true),
+                (true, false),
+                (true, true),
+            ]),
+            (3, 1)
+        );
+        assert_eq!(
+            external_get_plan_raw_prefixes_from_statuses([
+                (true, true),
+                (false, false),
+                (true, true),
+            ]),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn gpu_get_timing_separates_ready_residence_from_real_wait() {
+        let transfer_started_at = Instant::now();
+        let terminal_at = transfer_started_at + Duration::from_millis(20);
+        let consume_after_terminal = terminal_at + Duration::from_millis(30);
+        let ready = observe_external_gpu_get_consume_timing(
+            transfer_started_at,
+            terminal_at,
+            consume_after_terminal,
+            Duration::from_micros(7),
+        );
+        assert_eq!(ready.transfer_wall_us, 20_000);
+        assert!(ready.terminal_before_consume);
+        assert_eq!(ready.terminal_to_consume_us, 30_000);
+        assert_eq!(ready.finish_wait_us, 7);
+
+        let consume_before_terminal = transfer_started_at + Duration::from_millis(5);
+        let waiting = observe_external_gpu_get_consume_timing(
+            transfer_started_at,
+            terminal_at,
+            consume_before_terminal,
+            Duration::from_millis(15),
+        );
+        assert_eq!(waiting.transfer_wall_us, 20_000);
+        assert!(!waiting.terminal_before_consume);
+        assert_eq!(waiting.terminal_to_consume_us, 0);
+        assert_eq!(waiting.finish_wait_us, 15_000);
+    }
+
+    #[test]
+    fn pending_registry_guard_reinserts_on_drop_and_disarms_on_take() {
+        let registry = DashMap::new();
+        let handle = 17;
+
+        {
+            let guard = PendingRegistryEntryGuard::new(&registry, handle, "pending-a");
+            assert_eq!(guard.entry(), &"pending-a");
+            assert!(!registry.contains_key(&handle));
+        }
+        assert_eq!(
+            registry.remove(&handle).map(|(_, value)| value),
+            Some("pending-a")
+        );
+
+        let guard = PendingRegistryEntryGuard::new(&registry, handle, "pending-b");
+        assert_eq!(guard.take(), "pending-b");
+        assert!(!registry.contains_key(&handle));
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn aborted_terminal_waiter_restores_the_pending_entry() {
+        let registry = std::sync::Arc::new(DashMap::new());
+        let handle = 23;
+        registry.insert(handle, "terminal-pending");
+        let task_registry = registry.clone();
+        let (armed_tx, armed_rx) = ::tokio::sync::oneshot::channel();
+        let waiter = ::tokio::spawn(async move {
+            let (_, entry) = task_registry
+                .remove(&handle)
+                .expect("test pending entry must exist");
+            let _guard = PendingRegistryEntryGuard::new(&task_registry, handle, entry);
+            let _ = armed_tx.send(());
+            futures::future::pending::<()>().await;
+        });
+
+        armed_rx.await.expect("waiter armed its guard");
+        assert!(!registry.contains_key(&handle));
+        waiter.abort();
+        assert!(
+            waiter
+                .await
+                .expect_err("waiter must be aborted")
+                .is_cancelled()
+        );
+        assert_eq!(
+            registry.remove(&handle).map(|(_, value)| value),
+            Some("terminal-pending")
+        );
     }
 }
 
@@ -577,12 +1022,16 @@ pub struct ExternalInner {
     side_transfer_put_bindings: moka::sync::SegmentedCache<(u64, u32), (String, u16)>,
     rpc_caller_external_get: RPCCaller<ExternalGetReq>,
     rpc_caller_external_batch_get: RPCCaller<ExternalBatchGetReq>,
+    rpc_caller_external_batch_get_local_probe: RPCCaller<ExternalBatchGetLocalProbeReq>,
     rpc_caller_external_batch_get_start: RPCCaller<ExternalBatchGetStartReq>,
     rpc_caller_external_batch_get_transfer: RPCCaller<ExternalBatchGetTransferReq>,
     rpc_caller_external_batch_get_cancel: RPCCaller<ExternalBatchGetCancelReq>,
     rpc_caller_master_batch_get_start: RPCCaller<BatchGetStartReq>,
+    rpc_caller_master_batch_get_plan: RPCCaller<BatchGetPlanReq>,
+    rpc_caller_master_batch_get_bind: RPCCaller<BatchGetBindReq>,
     rpc_caller_master_batch_get_done: RPCCaller<BatchGetDoneReq>,
     rpc_caller_master_batch_get_revoke: RPCCaller<BatchGetRevokeReq>,
+    rpc_caller_external_execute_planned_get: RPCCaller<ExternalExecutePlannedGetReq>,
     rpc_caller_external_put_commit: RPCCaller<ExternalPutCommitReq>,
     rpc_caller_external_batch_put_commit: RPCCaller<ExternalBatchPutCommitReq>,
     rpc_caller_external_put_start: RPCCaller<ExternalPutStartReq>,
@@ -605,7 +1054,9 @@ pub struct ExternalInner {
     /// Fully local plans consumed without a follow-up owner transfer RPC.
     pending_inline_external_get_start: DashMap<u64, PendingInlineExternalGetStart>,
     next_gpu_get_handle: AtomicU64,
+    pending_external_get_plan: DashMap<u64, PendingExternalGetPlan>,
     pending_external_gpu_get: DashMap<u64, PendingExternalGpuGet>,
+    pending_external_planned_cpu_get: DashMap<u64, PendingExternalPlannedCpuGet>,
     /// per-key semaphore (permits=1) to ensure single inflight per key
     inflight1_per_key: SemaphoreMap<String>,
     put_trace_log_window: Mutex<ExternalPutTraceLogWindow>,
@@ -615,8 +1066,8 @@ pub struct ExternalInner {
 pub struct ExternalClientApi(ExternalInner);
 
 async fn wait_external_gpu_get_terminal(
-    mut terminal_rx: watch::Receiver<Option<ExternalGpuGetTerminal>>,
-) -> KvResult<ExternalGpuGetTerminal> {
+    mut terminal_rx: watch::Receiver<Option<ExternalGpuGetTerminalEvent>>,
+) -> KvResult<ExternalGpuGetTerminalEvent> {
     loop {
         if let Some(terminal) = terminal_rx.borrow().clone() {
             return Ok(terminal);
@@ -627,6 +1078,349 @@ async fn wait_external_gpu_get_terminal(
                     .to_string(),
             }));
         }
+    }
+}
+
+async fn wait_external_planned_cpu_get_terminal(
+    mut terminal_rx: watch::Receiver<Option<ExternalPlannedCpuGetTerminal>>,
+) -> KvResult<ExternalPlannedCpuGetTerminal> {
+    loop {
+        if let Some(terminal) = terminal_rx.borrow().clone() {
+            return Ok(terminal);
+        }
+        if terminal_rx.changed().await.is_err() {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: "planned CPU Get task ended without publishing a terminal state"
+                    .to_string(),
+            }));
+        }
+    }
+}
+
+async fn run_planned_get_revoke_cleanup(
+    view: ExternalClientApiView,
+    get_ids: Vec<u64>,
+    context: &'static str,
+) -> KvResult<()> {
+    if get_ids.is_empty() {
+        return Ok(());
+    }
+    let mut attempt = 1u32;
+    let mut shutdown = view.register_shutdown_waiter();
+    loop {
+        match view
+            .external_client_api()
+            .inner()
+            .master_batch_gpu_get_revoke(get_ids.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) if matches!(&err, KvError::Api(ApiError::SystemShutdown { .. })) => {
+                return Err(err);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "{} planned Get Revoke uncertain; retaining cleanup ownership: items={} attempt={} err={}",
+                    context,
+                    get_ids.len(),
+                    attempt,
+                    err
+                );
+            }
+        }
+        attempt = attempt.saturating_add(1);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(
+                (50u64.saturating_mul(1u64 << attempt.min(6))).min(2_000),
+            )) => {}
+            _ = shutdown.wait() => {
+                return Err(KvError::Api(ApiError::SystemShutdown {
+                    detail: format!(
+                        "{} planned Get Revoke cleanup stopped during shutdown",
+                        context
+                    ),
+                }));
+            }
+        }
+    }
+}
+
+fn spawn_planned_get_revoke_cleanup(
+    view: ExternalClientApiView,
+    get_ids: Vec<u64>,
+    context: &'static str,
+) -> ::tokio::sync::oneshot::Receiver<KvResult<()>> {
+    let (done_tx, done_rx) = ::tokio::sync::oneshot::channel();
+    let spawn_view = view.clone();
+    let worker_view = view;
+    spawn_view.spawn("planned_get_revoke_cleanup", async move {
+        let result = run_planned_get_revoke_cleanup(worker_view, get_ids, context).await;
+        let _ = done_tx.send(result);
+    });
+    done_rx
+}
+
+async fn finish_planned_get_revoke_cleanup(
+    view: ExternalClientApiView,
+    get_ids: Vec<u64>,
+    context: &'static str,
+) -> KvResult<()> {
+    spawn_planned_get_revoke_cleanup(view, get_ids, context)
+        .await
+        .map_err(|_| {
+            KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "{} planned Get Revoke task ended without publishing a terminal",
+                    context
+                ),
+            })
+        })?
+}
+
+/// Owns master plan identities until a durable local pending entry or a
+/// registered cleanup task takes over.  This closes the cancellation window
+/// around late Bind RPCs without adding a normal-path RPC.
+struct PlannedGetRevokeGuard {
+    view: ExternalClientApiView,
+    get_ids: Option<Vec<u64>>,
+    context: &'static str,
+}
+
+impl PlannedGetRevokeGuard {
+    fn new(view: ExternalClientApiView, get_ids: Vec<u64>, context: &'static str) -> Self {
+        Self {
+            view,
+            get_ids: Some(get_ids),
+            context,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.get_ids = None;
+    }
+}
+
+impl Drop for PlannedGetRevokeGuard {
+    fn drop(&mut self) {
+        let Some(get_ids) = self.get_ids.take() else {
+            return;
+        };
+        if get_ids.is_empty() {
+            return;
+        }
+        drop(spawn_planned_get_revoke_cleanup(
+            self.view.clone(),
+            get_ids,
+            self.context,
+        ));
+    }
+}
+
+fn release_planned_cpu_response_holders(
+    inner: &ExternalInner,
+    response: &ExternalExecutePlannedGetResp,
+    owner_start_time: i64,
+) {
+    let external_client_id = inner.view.cluster_manager().get_self_info().id;
+    for holder_id in response.items.iter().filter_map(|item| {
+        item.external_memholder_info
+            .as_ref()
+            .map(|info| info.holder_id)
+    }) {
+        if let Err(err) = inner.enqueue_external_delete_ack(
+            external_client_id.clone(),
+            holder_id,
+            owner_start_time,
+        ) {
+            tracing::warn!(
+                "planned CPU Get could not enqueue unused holder release: holder_id={} err={}",
+                holder_id,
+                err
+            );
+        }
+    }
+}
+
+fn spawn_uncertain_planned_cpu_get_cleanup(
+    view: ExternalClientApiView,
+    owner: String,
+    request: MsgPack<ExternalExecutePlannedGetReq>,
+    owner_start_time: i64,
+) {
+    let spawn_view = view.clone();
+    let task_view = view.clone();
+    spawn_view.spawn("uncertain_planned_cpu_get_cleanup", async move {
+        let mut shutdown = task_view.register_shutdown_waiter();
+        loop {
+            let inner = task_view.external_client_api().inner();
+            if inner.current_owner_start_time().await != owner_start_time {
+                return;
+            }
+            let attempt = inner
+                .rpc_caller_external_execute_planned_get
+                .call(
+                    inner.view.p2p_module(),
+                    owner.clone().into(),
+                    request.clone(),
+                    Some(Duration::from_secs(
+                        EXTERNAL_PLANNED_CPU_GET_REPLAY_RPC_TIMEOUT_SECS,
+                    )),
+                    0,
+                )
+                .await;
+            if let Ok(response) = attempt {
+                release_planned_cpu_response_holders(
+                    inner,
+                    &response.serialize_part,
+                    owner_start_time,
+                );
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                _ = shutdown.wait() => return,
+            }
+        }
+    });
+}
+
+async fn run_external_planned_cpu_get(
+    view: ExternalClientApiView,
+    plan_handle: u64,
+    plan_items: Vec<(String, u64)>,
+    skipped_get_ids: Vec<u64>,
+    transfer_concurrency: usize,
+    cancel_requested: Arc<AtomicBool>,
+) -> ExternalPlannedCpuGetTerminal {
+    let inner = view.external_client_api().inner();
+    let mut all_plan_get_ids = skipped_get_ids.clone();
+    all_plan_get_ids.extend(plan_items.iter().map(|(_, get_id)| *get_id));
+    if let Err(err) = inner.master_batch_gpu_get_revoke(skipped_get_ids).await {
+        let cleanup = finish_planned_get_revoke_cleanup(
+            view.clone(),
+            all_plan_get_ids,
+            "planned CPU tail failure",
+        )
+        .await
+        .err()
+        .map(|cleanup_err| cleanup_err.to_string());
+        return ExternalPlannedCpuGetTerminal::Failed {
+            detail: format!(
+                "planned CPU Get could not revoke its unconsumed tail: {err}; cleanup_error={cleanup:?}"
+            ),
+        };
+    }
+    if cancel_requested.load(Ordering::Acquire) {
+        let get_ids = plan_items.iter().map(|(_, get_id)| *get_id).collect();
+        return match finish_planned_get_revoke_cleanup(
+            view.clone(),
+            get_ids,
+            "planned CPU pre-owner cancel",
+        )
+        .await
+        {
+            Ok(()) => ExternalPlannedCpuGetTerminal::Revoked,
+            Err(err) => ExternalPlannedCpuGetTerminal::Failed {
+                detail: format!("planned CPU Get cancel cleanup failed: {err}"),
+            },
+        };
+    }
+
+    if plan_items.is_empty() {
+        return ExternalPlannedCpuGetTerminal::Completed {
+            items: Vec::new(),
+            owner_start_time: inner.current_owner_start_time().await,
+        };
+    }
+
+    let Some(owner) = inner.shared_storage_node_id().await else {
+        let get_ids = plan_items.iter().map(|(_, get_id)| *get_id).collect();
+        let cleanup =
+            finish_planned_get_revoke_cleanup(view.clone(), get_ids, "planned CPU missing owner")
+                .await
+                .err()
+                .map(|cleanup_err| cleanup_err.to_string());
+        return ExternalPlannedCpuGetTerminal::Failed {
+            detail: format!(
+                "planned CPU Get has no current share-group owner; cleanup_error={cleanup:?}"
+            ),
+        };
+    };
+    let owner_start_time = inner.current_owner_start_time().await;
+    let external_client_id = inner.view.cluster_manager().get_self_info().id;
+    let request = MsgPack {
+        serialize_part: ExternalExecutePlannedGetReq {
+            plan_handle,
+            items: plan_items
+                .iter()
+                .map(|(key, get_id)| ExternalPlannedGetItem {
+                    key: key.clone(),
+                    get_id: *get_id,
+                })
+                .collect(),
+            req_node_id: external_client_id,
+            started_time: owner_start_time,
+            transfer_concurrency,
+        },
+        raw_bytes: Vec::new(),
+    };
+    let response = match inner
+        .rpc_caller_external_execute_planned_get
+        .call(
+            inner.view.p2p_module(),
+            owner.clone().into(),
+            request.clone(),
+            Some(Duration::from_secs(
+                EXTERNAL_PLANNED_CPU_GET_FOREGROUND_RPC_TIMEOUT_SECS,
+            )),
+            0,
+        )
+        .await
+    {
+        Ok(response) => response.serialize_part,
+        Err(err) => {
+            spawn_uncertain_planned_cpu_get_cleanup(view.clone(), owner, request, owner_start_time);
+            return ExternalPlannedCpuGetTerminal::Failed {
+                detail: format!(
+                    "planned CPU Get owner RPC failed; replay cleanup continues in background: error={}",
+                    KvError::from(err)
+                ),
+            };
+        }
+    };
+    if response.error_code != OK || response.items.len() != plan_items.len() {
+        release_planned_cpu_response_holders(inner, &response, owner_start_time);
+        return ExternalPlannedCpuGetTerminal::Failed {
+            detail: format!(
+                "planned CPU Get owner response failed or changed shape: error_code={} expected={} got={} error_json={}",
+                response.error_code,
+                plan_items.len(),
+                response.items.len(),
+                response.error_json
+            ),
+        };
+    }
+    if let Some((index, item)) = response
+        .items
+        .iter()
+        .enumerate()
+        .find(|(_, item)| item.error_code != OK || item.external_memholder_info.is_none())
+    {
+        release_planned_cpu_response_holders(inner, &response, owner_start_time);
+        return ExternalPlannedCpuGetTerminal::Failed {
+            detail: format!(
+                "planned CPU Get item failed: index={} error_code={} error_json={}",
+                index, item.error_code, item.error_json
+            ),
+        };
+    }
+    if cancel_requested.load(Ordering::Acquire) {
+        release_planned_cpu_response_holders(inner, &response, owner_start_time);
+        return ExternalPlannedCpuGetTerminal::Revoked;
+    }
+    ExternalPlannedCpuGetTerminal::Completed {
+        items: response.items,
+        owner_start_time,
     }
 }
 
@@ -741,6 +1535,27 @@ async fn run_external_gpu_get_transfer(
     }
 }
 
+async fn run_external_gpu_get_transfer_timed(
+    view: ExternalClientApiView,
+    transfer_items: Vec<(BatchGetStartItemResp, GpuMemoryGuard)>,
+    skipped_get_ids: Vec<u64>,
+    transfer_concurrency: usize,
+    cancel_requested: Arc<AtomicBool>,
+) -> ExternalGpuGetTerminalEvent {
+    let outcome = run_external_gpu_get_transfer(
+        view,
+        transfer_items,
+        skipped_get_ids,
+        transfer_concurrency,
+        cancel_requested,
+    )
+    .await;
+    ExternalGpuGetTerminalEvent {
+        outcome,
+        terminal_at: Instant::now(),
+    }
+}
+
 impl ExternalClientApi {
     /// Access inner external-only API. Safe to unwrap in external role.
     pub fn inner(&self) -> &ExternalInner {
@@ -778,12 +1593,18 @@ impl ExternalClientApi {
                 .build(),
             rpc_caller_external_get: RPCCaller::<ExternalGetReq>::new(),
             rpc_caller_external_batch_get: RPCCaller::<ExternalBatchGetReq>::new(),
+            rpc_caller_external_batch_get_local_probe:
+                RPCCaller::<ExternalBatchGetLocalProbeReq>::new(),
             rpc_caller_external_batch_get_start: RPCCaller::<ExternalBatchGetStartReq>::new(),
             rpc_caller_external_batch_get_transfer: RPCCaller::<ExternalBatchGetTransferReq>::new(),
             rpc_caller_external_batch_get_cancel: RPCCaller::<ExternalBatchGetCancelReq>::new(),
             rpc_caller_master_batch_get_start: RPCCaller::<BatchGetStartReq>::new(),
+            rpc_caller_master_batch_get_plan: RPCCaller::<BatchGetPlanReq>::new(),
+            rpc_caller_master_batch_get_bind: RPCCaller::<BatchGetBindReq>::new(),
             rpc_caller_master_batch_get_done: RPCCaller::<BatchGetDoneReq>::new(),
             rpc_caller_master_batch_get_revoke: RPCCaller::<BatchGetRevokeReq>::new(),
+            rpc_caller_external_execute_planned_get: RPCCaller::<ExternalExecutePlannedGetReq>::new(
+            ),
             rpc_caller_external_put_commit: RPCCaller::<ExternalPutCommitReq>::new(),
             rpc_caller_external_batch_put_commit: RPCCaller::<ExternalBatchPutCommitReq>::new(),
             rpc_caller_external_put_start: RPCCaller::<ExternalPutStartReq>::new(),
@@ -805,7 +1626,9 @@ impl ExternalClientApi {
             pending_external_get_start: DashMap::new(),
             pending_inline_external_get_start: DashMap::new(),
             next_gpu_get_handle: AtomicU64::new(1),
+            pending_external_get_plan: DashMap::new(),
             pending_external_gpu_get: DashMap::new(),
+            pending_external_planned_cpu_get: DashMap::new(),
             inflight1_per_key: SemaphoreMap::new(1, std::time::Duration::from_secs(120)),
             put_trace_log_window: Mutex::new(ExternalPutTraceLogWindow::new()),
             external_delete_ack_batch: ExternalDeleteAckBatchHandle::new(),
@@ -879,6 +1702,8 @@ impl ExternalClientApi {
         ext.rpc_caller_external_get.regist(ext.view.p2p_module());
         ext.rpc_caller_external_batch_get
             .regist(ext.view.p2p_module());
+        ext.rpc_caller_external_batch_get_local_probe
+            .regist(ext.view.p2p_module());
         ext.rpc_caller_external_batch_get_start
             .regist(ext.view.p2p_module());
         ext.rpc_caller_external_batch_get_transfer
@@ -887,9 +1712,15 @@ impl ExternalClientApi {
             .regist(ext.view.p2p_module());
         ext.rpc_caller_master_batch_get_start
             .regist(ext.view.p2p_module());
+        ext.rpc_caller_master_batch_get_plan
+            .regist(ext.view.p2p_module());
+        ext.rpc_caller_master_batch_get_bind
+            .regist(ext.view.p2p_module());
         ext.rpc_caller_master_batch_get_done
             .regist(ext.view.p2p_module());
         ext.rpc_caller_master_batch_get_revoke
+            .regist(ext.view.p2p_module());
+        ext.rpc_caller_external_execute_planned_get
             .regist(ext.view.p2p_module());
         ext.rpc_caller_external_put_commit
             .regist(ext.view.p2p_module());
@@ -1147,8 +1978,7 @@ impl ExternalClientApi {
         );
         loop {
             let snapshot = ext.view.p2p_module().tier_snapshot();
-            let self_binding_ready = snapshot
-                .share_group_owner(&snapshot.self_peer_gen.peer_id)
+            let self_binding_ready = snapshot.share_group_owner(&snapshot.self_peer_gen.peer_id)
                 == Some(&expected_binding);
             if self_binding_ready
                 && let Some(peer_gen) = snapshot.peer_gen(&owner_node_id)
@@ -2445,6 +3275,730 @@ impl ExternalInner {
         Ok(())
     }
 
+    async fn master_batch_get_bind_external(
+        &self,
+        plan_items: &[BatchGetPlanItemResp],
+        destinations: &[ExternalGpuDestination],
+        requester_node_start_time: i64,
+    ) -> KvResult<Vec<BatchGetStartItemResp>> {
+        if plan_items.len() != destinations.len() {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "external GetBind plan/destination length mismatch: plan={} destinations={}",
+                    plan_items.len(),
+                    destinations.len()
+                ),
+            }));
+        }
+        let items = plan_items
+            .iter()
+            .zip(destinations)
+            .map(|(plan, destination)| BatchGetBindItemReq {
+                get_id: plan.get_id,
+                target: GetBindTarget::ExternalSink(GetExternalSinkTarget {
+                    addr: destination.addr,
+                    capacity: destination.capacity,
+                    registration_id: destination.registration_id,
+                    requester_node_start_time,
+                }),
+            })
+            .collect();
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let response: MsgPack<BatchGetBindResp> = self
+            .rpc_caller_master_batch_get_bind
+            .call(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                MsgPack {
+                    serialize_part: BatchGetBindReq { items },
+                    raw_bytes: Vec::new(),
+                },
+                None,
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            response.serialize_part.error_code,
+            response.serialize_part.error_json.clone(),
+        )?;
+        if response.serialize_part.items.len() != plan_items.len() {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "external GetBind response length mismatch: expected={} got={}",
+                    plan_items.len(),
+                    response.serialize_part.items.len()
+                ),
+            }));
+        }
+        for (plan, bound) in plan_items.iter().zip(&response.serialize_part.items) {
+            if bound.get_id != plan.get_id {
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "external GetBind response identity mismatch: expected={} got={}",
+                        plan.get_id, bound.get_id
+                    ),
+                }));
+            }
+            crate::rpcresp_kvresult_convert::try_from_code(
+                bound.error_code,
+                bound.error_json.clone(),
+            )?;
+        }
+        Ok(response.serialize_part.items)
+    }
+
+    async fn probe_owner_local_gets(
+        &self,
+        plan_handle: u64,
+        keys: &[String],
+    ) -> KvResult<Vec<Option<Arc<ExternalMemHolder>>>> {
+        let mut previous_owner_start_time = self.current_owner_start_time().await;
+        let mut recover_attempts = 0usize;
+        loop {
+            let (owner, owner_start_time, _, base_ptr, mapped_len) =
+                self.wait_current_owner_mapped_range().await?;
+            let request = MsgPack {
+                serialize_part: ExternalBatchGetLocalProbeReq {
+                    plan_handle,
+                    keys: keys.to_vec(),
+                    req_node_id: self.view.cluster_manager().get_self_info().id.clone(),
+                    started_time: owner_start_time,
+                },
+                raw_bytes: Vec::new(),
+            };
+            let response: MsgPack<ExternalBatchGetLocalProbeResp> = match self
+                .rpc_caller_external_batch_get_local_probe
+                .call(self.view.p2p_module(), owner.into(), request, None, 0)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = KvError::from(error);
+                    if matches!(&error, KvError::P2p(_))
+                        && recover_attempts < EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS
+                    {
+                        recover_attempts += 1;
+                        let _ = self
+                            .recover_after_p2p_error(&mut previous_owner_start_time)
+                            .await?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            if response.serialize_part.error_code != OK {
+                let error = KvError::from_json(
+                    response.serialize_part.error_code,
+                    &response.serialize_part.error_json,
+                );
+                if matches!(
+                    &error,
+                    KvError::Api(ApiError::OwnerStartTimeMismatch { .. })
+                ) {
+                    let _ = self
+                        .recover_after_owner_start_time_mismatch(&mut previous_owner_start_time)
+                        .await?;
+                    continue;
+                }
+                return Err(error);
+            }
+            let infos = response.serialize_part.items;
+            let release_infos = |infos: &[Option<crate::memholder::ExternalMemHolderInfo>]| {
+                let external_client_id = self.view.cluster_manager().get_self_info().id.clone();
+                for info in infos.iter().flatten() {
+                    if let Err(error) = self.enqueue_external_delete_ack(
+                        external_client_id.clone(),
+                        info.holder_id,
+                        owner_start_time,
+                    ) {
+                        tracing::warn!(
+                            plan_handle,
+                            holder_id = info.holder_id,
+                            %error,
+                            "owner-local Get probe cleanup enqueue failed"
+                        );
+                    }
+                }
+            };
+            if infos.len() != keys.len() {
+                release_infos(&infos);
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "owner-local Get probe length mismatch: expected={} got={}",
+                        keys.len(),
+                        infos.len()
+                    ),
+                }));
+            }
+            let mut holders = Vec::with_capacity(keys.len());
+            for (index, (key, info)) in keys.iter().zip(&infos).enumerate() {
+                let Some(info) = info else {
+                    holders.push(None);
+                    continue;
+                };
+                let Some(end) = info.offset.checked_add(u64::from(info.len)) else {
+                    release_infos(&infos);
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "owner-local Get probe range overflow: index={} offset={} len={}",
+                            index, info.offset, info.len
+                        ),
+                    }));
+                };
+                if end > mapped_len {
+                    release_infos(&infos);
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "owner-local Get probe exceeds owner mapping: index={} end={} mapped_len={}",
+                            index, end, mapped_len
+                        ),
+                    }));
+                }
+                let Some(pointer) = base_ptr.checked_add(info.offset) else {
+                    release_infos(&infos);
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "owner-local Get probe pointer overflow: index={} base={:#x} offset={}",
+                            index, base_ptr, info.offset
+                        ),
+                    }));
+                };
+                let holder = Arc::new(ExternalMemHolder::new(
+                    info.offset,
+                    pointer,
+                    info.len,
+                    info.holder_id,
+                    key.clone(),
+                    self.view.cluster_manager().get_self_info().id.clone(),
+                    self.view.clone(),
+                    owner_start_time,
+                ));
+                self.key_weak_memholder_index
+                    .insert(key.clone(), Arc::downgrade(&holder));
+                holders.push(Some(holder));
+            }
+            return Ok(holders);
+        }
+    }
+
+    pub async fn get_plan(
+        &self,
+        keys: Vec<String>,
+        prefix_best_effort: bool,
+        atomic_group_lens: Option<Vec<usize>>,
+    ) -> KvResult<ExternalGetPlanResp> {
+        if keys.is_empty() {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "get_plan requires at least one key".to_string(),
+            }));
+        }
+        let group_lens = normalize_external_get_start_group_lens(keys.len(), atomic_group_lens)?;
+        let self_info = self.view.cluster_manager().get_self_info();
+        if self_info.node_role() != NodeRole::External {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "get_plan is supported only in external-client mode".to_string(),
+            }));
+        }
+        let handle = self.next_gpu_get_handle.fetch_add(1, Ordering::Relaxed);
+        if handle == 0 {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: "get_plan local handle space exhausted".to_string(),
+            }));
+        }
+
+        // Resolve and pin owner-local pages before consulting the cluster
+        // directory. Only the remaining positions are remote plan work.
+        let local_holders = self.probe_owner_local_gets(handle, &keys).await?;
+        let remote_keys = keys
+            .iter()
+            .zip(&local_holders)
+            .filter_map(|(key, local)| local.is_none().then_some(key.clone()))
+            .collect::<Vec<_>>();
+        let plan_items = if remote_keys.is_empty() {
+            Vec::new()
+        } else {
+            let master_node_id = self
+                .view
+                .cluster_manager()
+                .find_or_wait_master_node()
+                .await?;
+            let response: MsgPack<BatchGetPlanResp> = self
+                .rpc_caller_master_batch_get_plan
+                .call(
+                    self.view.p2p_module(),
+                    master_node_id.into(),
+                    MsgPack {
+                        serialize_part: BatchGetPlanReq {
+                            keys: remote_keys.clone(),
+                        },
+                        raw_bytes: Vec::new(),
+                    },
+                    None,
+                    0,
+                )
+                .await
+                .map_err(KvError::from)?;
+            crate::rpcresp_kvresult_convert::try_from_code(
+                response.serialize_part.error_code,
+                response.serialize_part.error_json.clone(),
+            )?;
+            response.serialize_part.items
+        };
+        let started_get_ids = plan_items
+            .iter()
+            .filter(|item| item.error_code == OK)
+            .map(|item| item.get_id)
+            .collect::<Vec<_>>();
+        let mut cleanup_guard = PlannedGetRevokeGuard::new(
+            self.view.clone_view(),
+            started_get_ids.clone(),
+            "get_plan abandoned",
+        );
+        if plan_items.len() != remote_keys.len() {
+            let cleanup = finish_planned_get_revoke_cleanup(
+                self.view.clone_view(),
+                started_get_ids,
+                "get_plan shape failure",
+            )
+            .await
+            .err()
+            .map(|err| err.to_string());
+            if cleanup.is_none() {
+                cleanup_guard.disarm();
+            }
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "get_plan response length mismatch: expected={} got={} cleanup_error={cleanup:?}",
+                    remote_keys.len(),
+                    plan_items.len()
+                ),
+            }));
+        }
+        for item in &plan_items {
+            if item.error_code != OK
+                && item.error_code
+                    != crate::rpcresp_kvresult_convert::msg_and_error::codes_api::API_KEY_NOT_FOUND
+            {
+                let error = crate::rpcresp_kvresult_convert::try_from_code(
+                    item.error_code,
+                    item.error_json.clone(),
+                )
+                .expect_err("non-OK GetPlan item must decode as an error");
+                let cleanup = finish_planned_get_revoke_cleanup(
+                    self.view.clone_view(),
+                    started_get_ids,
+                    "get_plan item failure",
+                )
+                .await
+                .err()
+                .map(|err| err.to_string());
+                if cleanup.is_none() {
+                    cleanup_guard.disarm();
+                }
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "get_plan item failed: error={} cleanup_error={cleanup:?}",
+                        error
+                    ),
+                }));
+            }
+        }
+        let mut remote_items = plan_items.into_iter();
+        let mut combined_items = Vec::with_capacity(keys.len());
+        for (key, local) in keys.iter().cloned().zip(local_holders) {
+            if let Some(holder) = local {
+                combined_items.push(PendingExternalGetPlanItem::Local { holder });
+            } else {
+                let plan = remote_items
+                    .next()
+                    .expect("validated remote plan shape must cover every remote key");
+                combined_items.push(PendingExternalGetPlanItem::Remote { key, plan });
+            }
+        }
+        assert!(remote_items.next().is_none());
+        let (raw_prefix_hit_len, gpu_raw_prefix_hit_len) =
+            external_get_plan_raw_prefixes_from_statuses(combined_items.iter().map(
+                |item| match item {
+                    PendingExternalGetPlanItem::Local { .. } => (true, true),
+                    PendingExternalGetPlanItem::Remote { plan, .. } => {
+                        (plan.error_code == OK, plan.gpu_direct_eligible)
+                    }
+                },
+            ));
+        let transferable_len = compute_external_get_start_transfer_prefix(
+            raw_prefix_hit_len,
+            &group_lens,
+            prefix_best_effort,
+        );
+        let gpu_transferable_len = compute_external_get_start_transfer_prefix(
+            gpu_raw_prefix_hit_len,
+            &group_lens,
+            prefix_best_effort,
+        );
+        let kept_ids = combined_items[..transferable_len]
+            .iter()
+            .filter_map(|item| match item {
+                PendingExternalGetPlanItem::Remote { plan, .. } => Some(plan.get_id),
+                PendingExternalGetPlanItem::Local { .. } => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let skipped_get_ids = started_get_ids
+            .iter()
+            .copied()
+            .filter(|get_id| !kept_ids.contains(get_id))
+            .collect::<Vec<_>>();
+        if let Err(err) = self.master_batch_gpu_get_revoke(skipped_get_ids).await {
+            return Err(err);
+        }
+        combined_items.truncate(transferable_len);
+        let gpu_remote_indices = combined_items
+            .iter()
+            .take(gpu_transferable_len)
+            .enumerate()
+            .filter_map(|(index, item)| {
+                matches!(item, PendingExternalGetPlanItem::Remote { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        self.pending_external_get_plan.insert(
+            handle,
+            PendingExternalGetPlan {
+                items: combined_items,
+                transferable_len,
+                gpu_transferable_len,
+                gpu_remote_indices: gpu_remote_indices.clone(),
+                atomic_group_lens: group_lens,
+            },
+        );
+        cleanup_guard.disarm();
+        Ok(ExternalGetPlanResp {
+            handle,
+            raw_prefix_hit_len,
+            gpu_raw_prefix_hit_len,
+            gpu_remote_indices,
+        })
+    }
+
+    pub async fn cancel_get_plan(&self, handle: u64) -> KvResult<()> {
+        let Some((_handle, plan)) = self.pending_external_get_plan.remove(&handle) else {
+            return Ok(());
+        };
+        finish_planned_get_revoke_cleanup(
+            self.view.clone_view(),
+            plan.items
+                .into_iter()
+                .filter_map(|item| match item {
+                    PendingExternalGetPlanItem::Remote { plan, .. } => Some(plan.get_id),
+                    PendingExternalGetPlanItem::Local { .. } => None,
+                })
+                .collect(),
+            "cancel_get_plan",
+        )
+        .await
+    }
+
+    pub async fn execute_get_plan_gpu(
+        &self,
+        handle: u64,
+        destinations: Vec<ExternalGpuDestination>,
+        consume_prefix_len: usize,
+        transfer_concurrency: usize,
+    ) -> KvResult<()> {
+        let Some((_handle, plan)) = self.pending_external_get_plan.remove(&handle) else {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!("execute_get_plan_gpu requires a live plan: {handle}"),
+            }));
+        };
+        let expected_remote_destinations = plan
+            .gpu_remote_indices
+            .iter()
+            .take_while(|index| **index < consume_prefix_len)
+            .count();
+        if transfer_concurrency == 0
+            || expected_remote_destinations == 0
+            || destinations.len() != expected_remote_destinations
+            || validate_external_get_consume_prefix(
+                consume_prefix_len,
+                plan.gpu_transferable_len,
+                &plan.atomic_group_lens,
+            )
+            .is_err()
+        {
+            self.pending_external_get_plan.insert(handle, plan);
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "execute_get_plan_gpu invalid consume/remote-destinations/concurrency: consume={} destinations={} expected_remote={} concurrency={}",
+                    consume_prefix_len,
+                    destinations.len(),
+                    expected_remote_destinations,
+                    transfer_concurrency
+                ),
+            }));
+        }
+        let self_info = self.view.cluster_manager().get_self_info();
+        let mut guards = Vec::with_capacity(destinations.len());
+        for destination in &destinations {
+            match self.view.client_transfer_engine().validate_gpu_destination(
+                destination.registration_id,
+                destination.addr,
+                destination.capacity,
+            ) {
+                Ok(guard) => guards.push(guard),
+                Err(err) => {
+                    self.pending_external_get_plan.insert(handle, plan);
+                    return Err(err);
+                }
+            }
+        }
+        let all_get_ids = plan
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                PendingExternalGetPlanItem::Remote { plan, .. } => Some(plan.get_id),
+                PendingExternalGetPlanItem::Local { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let mut cleanup_guard = PlannedGetRevokeGuard::new(
+            self.view.clone_view(),
+            all_get_ids.clone(),
+            "execute_get_plan_gpu abandoned",
+        );
+        if plan
+            .items
+            .iter()
+            .any(|item| matches!(item, PendingExternalGetPlanItem::Local { .. }))
+        {
+            let (_, current_owner_start_time, _, base_ptr, mapped_len) =
+                self.wait_current_owner_mapped_range().await?;
+            for (index, item) in plan.items.iter().enumerate() {
+                if let PendingExternalGetPlanItem::Local { holder } = item {
+                    validate_external_local_holder_mapping(
+                        index,
+                        holder,
+                        current_owner_start_time,
+                        base_ptr,
+                        mapped_len,
+                    )?;
+                }
+            }
+        }
+        let PendingExternalGetPlan {
+            mut items,
+            atomic_group_lens,
+            ..
+        } = plan;
+        let tail_items = items.split_off(consume_prefix_len);
+        let skipped_get_ids = tail_items
+            .into_iter()
+            .filter_map(|item| match item {
+                PendingExternalGetPlanItem::Remote { plan, .. } => Some(plan.get_id),
+                PendingExternalGetPlanItem::Local { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let mut remote_plans = Vec::with_capacity(destinations.len());
+        let mut local_holders = Vec::new();
+        let mut value_ptrs = Vec::with_capacity(consume_prefix_len);
+        let mut destination_index = 0usize;
+        for (source_index, item) in items.into_iter().enumerate() {
+            match item {
+                PendingExternalGetPlanItem::Local { holder, .. } => {
+                    // The exact owner mapping was validated immediately above.
+                    // Keep the saved address opaque until SGLang submits the
+                    // restore; constructing a slice here would dereference a
+                    // mapping that could become stale after an owner restart.
+                    value_ptrs.push(holder.addr);
+                    local_holders.push((source_index, holder));
+                }
+                PendingExternalGetPlanItem::Remote { plan, .. } => {
+                    let destination = &destinations[destination_index];
+                    value_ptrs.push(destination.addr);
+                    remote_plans.push(plan);
+                    destination_index += 1;
+                }
+            }
+        }
+        assert_eq!(destination_index, destinations.len());
+        let bound_items = match self
+            .master_batch_get_bind_external(&remote_plans, &destinations, self_info.node_start_time)
+            .await
+        {
+            Ok(items) => items,
+            Err(err) => {
+                let cleanup = finish_planned_get_revoke_cleanup(
+                    self.view.clone_view(),
+                    all_get_ids,
+                    "execute_get_plan_gpu bind failure",
+                )
+                .await
+                .err()
+                .map(|cleanup_err| cleanup_err.to_string());
+                if cleanup.is_none() {
+                    cleanup_guard.disarm();
+                }
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "execute_get_plan_gpu bind failed: error={} cleanup_error={cleanup:?}",
+                        err
+                    ),
+                }));
+            }
+        };
+        let mut transfer_items = Vec::with_capacity(destinations.len());
+        for (index, (((planned, bound), destination), guard)) in remote_plans
+            .iter()
+            .zip(bound_items)
+            .zip(destinations.iter())
+            .zip(guards)
+            .enumerate()
+        {
+            if bound.node_id != planned.node_id
+                || bound.src_addr != planned.src_addr
+                || bound.src_base_addr != planned.src_base_addr
+                || bound.len != planned.len
+                || !external_gpu_transfer_plan_geometry_is_valid(
+                    &bound,
+                    destination,
+                    guard.registration().registration_id,
+                )
+                || bound.node_id == self_info.id
+            {
+                let cleanup = finish_planned_get_revoke_cleanup(
+                    self.view.clone_view(),
+                    all_get_ids,
+                    "execute_get_plan_gpu changed bind",
+                )
+                .await
+                .err()
+                .map(|cleanup_err| cleanup_err.to_string());
+                if cleanup.is_none() {
+                    cleanup_guard.disarm();
+                }
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "execute_get_plan_gpu received a changed bind plan at index={index}; cleanup_error={cleanup:?}"
+                    ),
+                }));
+            }
+            transfer_items.push((bound, guard));
+        }
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let (terminal_tx, terminal_rx) = watch::channel(None);
+        let transfer_started_at = Instant::now();
+        self.pending_external_gpu_get.insert(
+            handle,
+            PendingExternalGpuGet {
+                transferable_len: consume_prefix_len,
+                atomic_group_lens,
+                value_ptrs,
+                local_holders,
+                cancel_requested: cancel_requested.clone(),
+                transfer_started_at,
+                terminal_rx,
+            },
+        );
+        let view = self.view.clone_view();
+        let task_view = view.clone();
+        view.spawn(format!("external_gpu_get_execute_{handle}"), async move {
+            let terminal = run_external_gpu_get_transfer_timed(
+                task_view,
+                transfer_items,
+                skipped_get_ids,
+                transfer_concurrency,
+                cancel_requested,
+            )
+            .await;
+            let _ = terminal_tx.send(Some(terminal));
+        });
+        cleanup_guard.disarm();
+        Ok(())
+    }
+
+    pub async fn execute_get_plan_cpu(
+        &self,
+        handle: u64,
+        consume_prefix_len: usize,
+        transfer_concurrency: usize,
+    ) -> KvResult<()> {
+        let Some((_handle, plan)) = self.pending_external_get_plan.remove(&handle) else {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!("execute_get_plan_cpu requires a live plan: {handle}"),
+            }));
+        };
+        if transfer_concurrency == 0
+            || validate_external_get_consume_prefix(
+                consume_prefix_len,
+                plan.transferable_len,
+                &plan.atomic_group_lens,
+            )
+            .is_err()
+        {
+            self.pending_external_get_plan.insert(handle, plan);
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "execute_get_plan_cpu invalid consume/concurrency: consume={} concurrency={}",
+                    consume_prefix_len, transfer_concurrency
+                ),
+            }));
+        }
+        let PendingExternalGetPlan {
+            mut items,
+            atomic_group_lens,
+            ..
+        } = plan;
+        let tail_items = items.split_off(consume_prefix_len);
+        let skipped_get_ids = tail_items
+            .into_iter()
+            .filter_map(|item| match item {
+                PendingExternalGetPlanItem::Remote { plan, .. } => Some(plan.get_id),
+                PendingExternalGetPlanItem::Local { .. } => None,
+            })
+            .collect();
+        let mut plan_items = Vec::new();
+        let mut sources = Vec::with_capacity(consume_prefix_len);
+        for item in items {
+            match item {
+                PendingExternalGetPlanItem::Local { holder, .. } => {
+                    sources.push(PendingExternalCpuSource::Local { holder });
+                }
+                PendingExternalGetPlanItem::Remote { key, plan } => {
+                    plan_items.push((key.clone(), plan.get_id));
+                    sources.push(PendingExternalCpuSource::Remote { key });
+                }
+            }
+        }
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let (terminal_tx, terminal_rx) = watch::channel(None);
+        self.pending_external_planned_cpu_get.insert(
+            handle,
+            PendingExternalPlannedCpuGet {
+                sources,
+                transferable_len: consume_prefix_len,
+                atomic_group_lens,
+                cancel_requested: cancel_requested.clone(),
+                terminal_rx,
+            },
+        );
+        let view = self.view.clone_view();
+        let task_view = view.clone();
+        view.spawn(format!("external_cpu_get_execute_{handle}"), async move {
+            let terminal = run_external_planned_cpu_get(
+                task_view,
+                handle,
+                plan_items,
+                skipped_get_ids,
+                transfer_concurrency,
+                cancel_requested,
+            )
+            .await;
+            let _ = terminal_tx.send(Some(terminal));
+        });
+        Ok(())
+    }
+
     pub async fn get_start_gpu(
         &self,
         keys: Vec<String>,
@@ -2647,19 +4201,27 @@ impl ExternalInner {
         }
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let (terminal_tx, terminal_rx) = watch::channel(None);
+        let transfer_started_at = Instant::now();
         self.pending_external_gpu_get.insert(
             handle,
             PendingExternalGpuGet {
                 transferable_len,
                 atomic_group_lens: group_lens,
+                value_ptrs: destinations
+                    .into_iter()
+                    .take(transferable_len)
+                    .map(|destination| destination.addr)
+                    .collect(),
+                local_holders: Vec::new(),
                 cancel_requested: cancel_requested.clone(),
+                transfer_started_at,
                 terminal_rx,
             },
         );
         let view = self.view.clone_view();
         let view_task = view.clone();
         view.spawn(format!("external_gpu_get_transfer_{handle}"), async move {
-            let terminal = run_external_gpu_get_transfer(
+            let terminal = run_external_gpu_get_transfer_timed(
                 view_task,
                 transfer_items,
                 skipped_get_ids,
@@ -2680,26 +4242,95 @@ impl ExternalInner {
         handle: u64,
         consume_prefix_len: Option<usize>,
     ) -> KvResult<ExternalGpuGetTransferResp> {
+        let consume_started_at = Instant::now();
         let Some((_, pending)) = self.pending_external_gpu_get.remove(&handle) else {
             return Err(KvError::Api(ApiError::InvalidArgument {
                 detail: format!("get_transfer_gpu requires a live handle: {handle}"),
             }));
         };
-        let consumed_prefix_len = consume_prefix_len.unwrap_or(pending.transferable_len);
+        let pending_guard =
+            PendingRegistryEntryGuard::new(&self.pending_external_gpu_get, handle, pending);
+        let consumed_prefix_len =
+            consume_prefix_len.unwrap_or(pending_guard.entry().transferable_len);
         if let Err(err) = validate_external_get_consume_prefix(
             consumed_prefix_len,
-            pending.transferable_len,
-            &pending.atomic_group_lens,
+            pending_guard.entry().transferable_len,
+            &pending_guard.entry().atomic_group_lens,
         ) {
-            self.pending_external_gpu_get.insert(handle, pending);
             return Err(err);
         }
-        let terminal = wait_external_gpu_get_terminal(pending.terminal_rx).await?;
-        match terminal {
-            ExternalGpuGetTerminal::Completed => Ok(ExternalGpuGetTransferResp {
-                transferred_prefix_len: pending.transferable_len,
-                consumed_prefix_len,
-            }),
+        let finish_wait_started_at = Instant::now();
+        let terminal_event =
+            match wait_external_gpu_get_terminal(pending_guard.entry().terminal_rx.clone()).await {
+                Ok(terminal) => terminal,
+                Err(err) => {
+                    let _ = pending_guard.take();
+                    return Err(err);
+                }
+            };
+        let finish_wait = finish_wait_started_at.elapsed();
+        let pending = pending_guard.take();
+        let timing = observe_external_gpu_get_consume_timing(
+            pending.transfer_started_at,
+            terminal_event.terminal_at,
+            consume_started_at,
+            finish_wait,
+        );
+        let outcome = match &terminal_event.outcome {
+            ExternalGpuGetTerminal::Completed => "completed",
+            ExternalGpuGetTerminal::Revoked { .. } => "revoked",
+            ExternalGpuGetTerminal::Failed { .. } => "failed",
+        };
+        tracing::info!(
+            "external GPU Get consume lifecycle: handle={} transferred={} consumed={} outcome={} transfer_wall_us={} terminal_before_consume={} terminal_to_consume_us={} finish_wait_us={}",
+            handle,
+            pending.transferable_len,
+            consumed_prefix_len,
+            outcome,
+            timing.transfer_wall_us,
+            timing.terminal_before_consume,
+            timing.terminal_to_consume_us,
+            timing.finish_wait_us,
+        );
+        match terminal_event.outcome {
+            ExternalGpuGetTerminal::Completed => {
+                assert_eq!(pending.value_ptrs.len(), pending.transferable_len);
+                if !pending.local_holders.is_empty() {
+                    let (_, current_owner_start_time, _, base_ptr, mapped_len) =
+                        self.wait_current_owner_mapped_range().await?;
+                    validate_external_local_holders_mapping(
+                        &pending.local_holders,
+                        current_owner_start_time,
+                        base_ptr,
+                        mapped_len,
+                    )?;
+                }
+                let bandwidth_handle = self
+                    .view
+                    .cluster_manager()
+                    .ipc_bandwidth_attributor_handle()
+                    .expect("GPU get_transfer expects an IPC bandwidth handle");
+                let local_holders = pending
+                    .local_holders
+                    .into_iter()
+                    .filter_map(|(index, holder)| {
+                        (index < consumed_prefix_len).then(|| {
+                            bandwidth_handle.record_tx_bytes(u64::from(holder.len));
+                            holder
+                        })
+                    })
+                    .collect();
+                Ok(ExternalGpuGetTransferResp {
+                    transferred_prefix_len: pending.transferable_len,
+                    consumed_prefix_len,
+                    value_ptrs: pending.value_ptrs[..consumed_prefix_len].to_vec(),
+                    local_holders,
+                    transfer_wall_us: timing.transfer_wall_us,
+                    finish_wait_us: timing.finish_wait_us,
+                    terminal_before_consume: timing.terminal_before_consume,
+                    terminal_to_consume_us: timing.terminal_to_consume_us,
+                })
+            }
             ExternalGpuGetTerminal::Revoked { transfer_error } => {
                 Err(KvError::Api(ApiError::Unknown {
                     detail: format!(
@@ -2719,7 +4350,10 @@ impl ExternalInner {
             return Ok(());
         };
         pending.cancel_requested.store(true, Ordering::Release);
-        match wait_external_gpu_get_terminal(pending.terminal_rx).await? {
+        match wait_external_gpu_get_terminal(pending.terminal_rx)
+            .await?
+            .outcome
+        {
             ExternalGpuGetTerminal::Completed | ExternalGpuGetTerminal::Revoked { .. } => Ok(()),
             ExternalGpuGetTerminal::Failed { detail } => {
                 Err(KvError::Api(ApiError::Unknown { detail }))
@@ -3241,6 +4875,212 @@ impl ExternalInner {
         handle: u64,
         consume_prefix_len: Option<usize>,
     ) -> KvResult<Vec<KvResult<Option<Arc<ExternalMemHolder>>>>> {
+        if let Some((_handle, pending)) = self.pending_external_planned_cpu_get.remove(&handle) {
+            let pending_guard = PendingRegistryEntryGuard::new(
+                &self.pending_external_planned_cpu_get,
+                handle,
+                pending,
+            );
+            let consumed_prefix_len =
+                consume_prefix_len.unwrap_or(pending_guard.entry().transferable_len);
+            if let Err(err) = validate_external_get_consume_prefix(
+                consumed_prefix_len,
+                pending_guard.entry().transferable_len,
+                &pending_guard.entry().atomic_group_lens,
+            ) {
+                return Err(err);
+            }
+            let terminal = match wait_external_planned_cpu_get_terminal(
+                pending_guard.entry().terminal_rx.clone(),
+            )
+            .await
+            {
+                Ok(terminal) => terminal,
+                Err(err) => {
+                    let _ = pending_guard.take();
+                    return Err(err);
+                }
+            };
+            let ExternalPlannedCpuGetTerminal::Completed {
+                items,
+                owner_start_time,
+            } = terminal
+            else {
+                let _ = pending_guard.take();
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: match terminal {
+                        ExternalPlannedCpuGetTerminal::Revoked => {
+                            format!("planned CPU Get was revoked: handle={handle}")
+                        }
+                        ExternalPlannedCpuGetTerminal::Failed { detail } => detail,
+                        ExternalPlannedCpuGetTerminal::Completed { .. } => unreachable!(),
+                    },
+                }));
+            };
+            let response = ExternalExecutePlannedGetResp {
+                items: items.clone(),
+                error_code: OK,
+                error_json: String::new(),
+            };
+            let expected_remote_items = pending_guard
+                .entry()
+                .sources
+                .iter()
+                .filter(|source| matches!(source, PendingExternalCpuSource::Remote { .. }))
+                .count();
+            if items.len() != expected_remote_items {
+                release_planned_cpu_response_holders(self, &response, owner_start_time);
+                let _ = pending_guard.take();
+                return Err(KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "planned CPU Get terminal remote length mismatch: expected={} got={}",
+                        expected_remote_items,
+                        items.len()
+                    ),
+                }));
+            }
+            let owner_snapshot = match self.wait_current_owner_mapped_range().await {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    release_planned_cpu_response_holders(self, &response, owner_start_time);
+                    let _ = pending_guard.take();
+                    return Err(err);
+                }
+            };
+            let (_, current_owner_start_time, _, base_ptr, mapped_len) = owner_snapshot;
+            if let Err(err) = validate_inline_external_get_owner_generation(
+                owner_start_time,
+                current_owner_start_time,
+            ) {
+                release_planned_cpu_response_holders(self, &response, owner_start_time);
+                let _ = pending_guard.take();
+                return Err(err);
+            }
+            if let Some(local) =
+                pending_guard
+                    .entry()
+                    .sources
+                    .iter()
+                    .find_map(|source| match source {
+                        PendingExternalCpuSource::Local { holder }
+                            if holder.owner_start_time != current_owner_start_time =>
+                        {
+                            Some(holder.owner_start_time)
+                        }
+                        _ => None,
+                    })
+            {
+                release_planned_cpu_response_holders(self, &response, owner_start_time);
+                let _ = pending_guard.take();
+                return Err(KvError::Api(ApiError::OwnerStartTimeMismatch {
+                    expected: current_owner_start_time,
+                    got: local,
+                }));
+            }
+            for (index, item) in items.iter().enumerate() {
+                let Some(info) = item.external_memholder_info.as_ref() else {
+                    release_planned_cpu_response_holders(self, &response, owner_start_time);
+                    let _ = pending_guard.take();
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "planned CPU Get terminal remote item has no holder: index={index}"
+                        ),
+                    }));
+                };
+                let Some(end) = info.offset.checked_add(u64::from(info.len)) else {
+                    release_planned_cpu_response_holders(self, &response, owner_start_time);
+                    let _ = pending_guard.take();
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "planned CPU Get holder range overflow: index={} offset={} len={}",
+                            index, info.offset, info.len
+                        ),
+                    }));
+                };
+                if end > mapped_len {
+                    release_planned_cpu_response_holders(self, &response, owner_start_time);
+                    let _ = pending_guard.take();
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "planned CPU Get holder exceeds owner mapping: index={} end={} mapped_len={}",
+                            index, end, mapped_len
+                        ),
+                    }));
+                }
+                if base_ptr.checked_add(info.offset).is_none() {
+                    release_planned_cpu_response_holders(self, &response, owner_start_time);
+                    let _ = pending_guard.take();
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "planned CPU Get holder pointer overflow: index={} base={:#x} offset={}",
+                            index, base_ptr, info.offset
+                        ),
+                    }));
+                }
+            }
+            let mut pending = pending_guard.take();
+            let consumed_remote_items = pending.sources[..consumed_prefix_len]
+                .iter()
+                .filter(|source| matches!(source, PendingExternalCpuSource::Remote { .. }))
+                .count();
+            for item in items.iter().skip(consumed_remote_items) {
+                let info = item
+                    .external_memholder_info
+                    .as_ref()
+                    .expect("validated planned CPU remote item must have a holder");
+                if let Err(detail) = self.enqueue_external_delete_ack(
+                    self.view.cluster_manager().get_self_info().id.clone(),
+                    info.holder_id,
+                    owner_start_time,
+                ) {
+                    release_planned_cpu_response_holders(self, &response, owner_start_time);
+                    return Err(KvError::Api(ApiError::Unknown { detail }));
+                }
+            }
+            pending.sources.truncate(consumed_prefix_len);
+            let bandwidth_handle = self
+                .view
+                .cluster_manager()
+                .ipc_bandwidth_attributor_handle()
+                .expect("planned CPU get_transfer expects an IPC bandwidth handle");
+            let external_client_id = self.view.cluster_manager().get_self_info().id.clone();
+            let mut remote_items = items.into_iter();
+            let mut results = Vec::with_capacity(consumed_prefix_len);
+            for source in pending.sources {
+                match source {
+                    PendingExternalCpuSource::Local { holder } => {
+                        bandwidth_handle.record_tx_bytes(u64::from(holder.len));
+                        results.push(Ok(Some(holder)));
+                    }
+                    PendingExternalCpuSource::Remote { key } => {
+                        let item = remote_items
+                            .next()
+                            .expect("validated remote terminal must match source positions");
+                        let info = item
+                            .external_memholder_info
+                            .expect("validated planned CPU remote item must have a holder");
+                        let holder_ptr = base_ptr
+                            .checked_add(info.offset)
+                            .expect("validated planned CPU holder pointer must not overflow");
+                        bandwidth_handle.record_tx_bytes(u64::from(info.len));
+                        let holder = Arc::new(ExternalMemHolder::new(
+                            info.offset,
+                            holder_ptr,
+                            info.len,
+                            info.holder_id,
+                            key.clone(),
+                            external_client_id.clone(),
+                            self.view.clone(),
+                            owner_start_time,
+                        ));
+                        self.key_weak_memholder_index
+                            .insert(key, Arc::downgrade(&holder));
+                        results.push(Ok(Some(holder)));
+                    }
+                }
+            }
+            return Ok(results);
+        }
         let Some((_handle, entry)) = self.pending_external_get_start.remove(&handle) else {
             return Err(KvError::Api(ApiError::InvalidArgument {
                 detail: format!("get_transfer requires a live get-start handle: {}", handle),
@@ -3281,6 +5121,33 @@ impl ExternalInner {
     }
 
     pub async fn cancel_get_transfer(&self, handle: u64) -> KvResult<()> {
+        if self.pending_external_get_plan.contains_key(&handle) {
+            return self.cancel_get_plan(handle).await;
+        }
+        if let Some((_handle, pending)) = self.pending_external_planned_cpu_get.remove(&handle) {
+            pending.cancel_requested.store(true, Ordering::Release);
+            return match wait_external_planned_cpu_get_terminal(pending.terminal_rx).await? {
+                ExternalPlannedCpuGetTerminal::Revoked => Ok(()),
+                ExternalPlannedCpuGetTerminal::Completed {
+                    items,
+                    owner_start_time,
+                } => {
+                    release_planned_cpu_response_holders(
+                        self,
+                        &ExternalExecutePlannedGetResp {
+                            items,
+                            error_code: OK,
+                            error_json: String::new(),
+                        },
+                        owner_start_time,
+                    );
+                    Ok(())
+                }
+                ExternalPlannedCpuGetTerminal::Failed { detail } => {
+                    Err(KvError::Api(ApiError::Unknown { detail }))
+                }
+            };
+        }
         let removed = self.pending_external_get_start.remove(&handle);
         if removed.is_none() {
             return Err(KvError::Api(ApiError::InvalidArgument {

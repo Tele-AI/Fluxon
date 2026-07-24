@@ -83,6 +83,10 @@ pub enum MsgId {
     BatchPutAppendDoneResp = 3068,
     BatchEvictOwnerSourceReq = 3069,
     BatchEvictOwnerSourceResp = 3070,
+    BatchGetPlanReq = 3071,
+    BatchGetPlanResp = 3072,
+    BatchGetBindReq = 3073,
+    BatchGetBindResp = 3074,
     ExternalGetReq = 4001,
     ExternalGetResp = 4002,
     ExternalPutStartReq = 4003,
@@ -749,6 +753,9 @@ crate::define_err_group! {
         ,
         (123, KeyAlreadyExists { key: String },
             msg: "Key already exists: key={key}")
+        ,
+        (124, StaleGetPlan { get_id: u64, key: String, detail: String },
+            msg: "Get plan is stale: get_id={get_id}, key={key}, detail={detail}")
     }
 }
 

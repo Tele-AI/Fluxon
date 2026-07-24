@@ -4,28 +4,29 @@ use crate::client_kv_api::local_reserve_rebalance::{
 };
 use crate::client_kv_api::msg_pack::{
     ExternalBatchDeleteAckReq, ExternalBatchDeleteAckResp, ExternalBatchGetCancelReq,
-    ExternalBatchGetCancelResp, ExternalBatchGetReq, ExternalBatchGetResp,
-    ExternalBatchGetStartReq, ExternalBatchGetStartResp, ExternalBatchGetTransferReq,
-    ExternalBatchGetTransferResp, ExternalBatchIsExistReq, ExternalBatchIsExistResp,
-    ExternalBatchPutCommitReq, ExternalBatchPutCommitResp, ExternalBatchPutStartReq,
-    ExternalBatchPutStartResp, ExternalBatchPutTransferEndReq, ExternalBatchPutTransferEndResp,
-    ExternalDeleteAckReq, ExternalDeleteAckResp, ExternalDeleteReq, ExternalDeleteResp,
-    ExternalGetReq, ExternalGetResp, ExternalIsExistReq, ExternalIsExistResp,
-    ExternalObservabilitySnapshotReq, ExternalObservabilitySnapshotResp, ExternalPutCommitReq,
-    ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp, ExternalPutStartReq,
-    ExternalPutStartResp, ExternalPutTransferEndReq, ExternalPutTransferEndResp, SyncKvToFileReq,
-    SyncKvToFileResp, TestPutPhaseTrace,
+    ExternalBatchGetCancelResp, ExternalBatchGetLocalProbeReq, ExternalBatchGetLocalProbeResp,
+    ExternalBatchGetReq, ExternalBatchGetResp, ExternalBatchGetStartReq, ExternalBatchGetStartResp,
+    ExternalBatchGetTransferReq, ExternalBatchGetTransferResp, ExternalBatchIsExistReq,
+    ExternalBatchIsExistResp, ExternalBatchPutCommitReq, ExternalBatchPutCommitResp,
+    ExternalBatchPutStartReq, ExternalBatchPutStartResp, ExternalBatchPutTransferEndReq,
+    ExternalBatchPutTransferEndResp, ExternalDeleteAckReq, ExternalDeleteAckResp,
+    ExternalDeleteReq, ExternalDeleteResp, ExternalExecutePlannedGetReq,
+    ExternalExecutePlannedGetResp, ExternalGetReq, ExternalGetResp, ExternalIsExistReq,
+    ExternalIsExistResp, ExternalObservabilitySnapshotReq, ExternalObservabilitySnapshotResp,
+    ExternalPutCommitReq, ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp,
+    ExternalPutStartReq, ExternalPutStartResp, ExternalPutTransferEndReq,
+    ExternalPutTransferEndResp, SyncKvToFileReq, SyncKvToFileResp, TestPutPhaseTrace,
 };
 use crate::client_kv_api::reclaim::handle_batch_owner_reclaim;
 use crate::cluster_manager::{NodeID, NodeIDString};
 use crate::config::TestSpecConfig;
 use crate::master_kv_router::msg_pack::{
     BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchEnqueueReplicaTaskReq,
-    BatchEvictOwnerSourceReq, BatchGetDoneReq, BatchGetRevokeReq, BatchGetStartItemResp,
-    BatchGetStartReq, BatchIsExistReq, BatchOwnerReclaimReq, BatchPreparePutKeysReq,
-    BatchPutAppendDoneReq, BatchPutAppendStartReq, BatchPutDoneReq, BatchPutRevokeReq,
-    BatchPutStartReq, BatchReleasePutKeyReservationsReq, DeleteClientKvMetaCacheItem,
-    GroupedBatchPutDoneReq,
+    BatchEvictOwnerSourceReq, BatchGetBindReq, BatchGetDoneReq, BatchGetRevokeReq,
+    BatchGetStartItemResp, BatchGetStartReq, BatchIsExistReq, BatchOwnerReclaimReq,
+    BatchPreparePutKeysReq, BatchPutAppendDoneReq, BatchPutAppendStartReq, BatchPutDoneReq,
+    BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq,
+    DeleteClientKvMetaCacheItem, GroupedBatchPutDoneReq,
 };
 use crate::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
 use crate::memholder::{AllMemholderRefCount, ExternalMemHolderInfo, MemoryInfo, UserMemHolder};
@@ -95,6 +96,14 @@ pub struct OwnerRuntimeObserveSnapshot {
     pub external_get_flights_revoking: u64,
     pub external_get_undecided_interests: u64,
     pub external_get_retained_interests: u64,
+    pub owner_local_probe_batches: u64,
+    pub owner_local_probe_items: u64,
+    pub owner_local_probe_local_items: u64,
+    pub owner_local_probe_remote_items: u64,
+    pub planned_cpu_get_batches: u64,
+    pub planned_cpu_get_local_items: u64,
+    pub planned_cpu_get_leader_items: u64,
+    pub planned_cpu_get_follower_items: u64,
     pub external_pending_put_entries: u64,
     pub remote_put_flights_active: u64,
     pub remote_put_flight_leaders: u64,
@@ -631,6 +640,33 @@ async fn handle_external_batch_get(
     }
 }
 
+async fn handle_external_batch_get_local_probe(
+    view: &ClientKvApiView,
+    msg: &MsgPack<ExternalBatchGetLocalProbeReq>,
+) -> MsgPack<ExternalBatchGetLocalProbeResp> {
+    let req = msg.serialize_part.clone();
+    let dbg_len = req.keys.len();
+    let resp = view
+        .client_kv_api()
+        .external_batch_get_local_probe(req)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                "handle_external_batch_get_local_probe error: {e}; batch_len={batch_len}",
+                batch_len = dbg_len
+            );
+            ExternalBatchGetLocalProbeResp {
+                items: Vec::new(),
+                error_code: e.code(),
+                error_json: e.to_json(),
+            }
+        });
+    MsgPack {
+        serialize_part: resp,
+        raw_bytes: Vec::new(),
+    }
+}
+
 async fn handle_external_batch_get_start(
     view: &ClientKvApiView,
     msg: &MsgPack<ExternalBatchGetStartReq>,
@@ -673,6 +709,36 @@ async fn handle_external_batch_get_transfer(
                 crate::rpcresp_kvresult_convert::FromError::from_error(&e);
             r.items = Vec::new();
             r
+        });
+    MsgPack {
+        serialize_part: resp,
+        raw_bytes: Vec::new(),
+    }
+}
+
+async fn handle_external_execute_planned_get(
+    view: &ClientKvApiView,
+    msg: &MsgPack<ExternalExecutePlannedGetReq>,
+) -> MsgPack<ExternalExecutePlannedGetResp> {
+    let req = msg.serialize_part.clone();
+    let plan_handle = req.plan_handle;
+    let item_count = req.items.len();
+    let resp = view
+        .client_kv_api()
+        .external_execute_planned_get(req)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::error!(
+                "handle_external_execute_planned_get error: {}; plan_handle={} items={}",
+                err,
+                plan_handle,
+                item_count
+            );
+            ExternalExecutePlannedGetResp {
+                items: Vec::new(),
+                error_code: err.code(),
+                error_json: err.to_json(),
+            }
         });
     MsgPack {
         serialize_part: resp,
@@ -1397,6 +1463,18 @@ struct OwnerRemotePutCounters {
     already_satisfied: AtomicU64,
     obsolete: AtomicU64,
     failed: AtomicU64,
+}
+
+#[derive(Default)]
+struct OwnerPlannedGetCounters {
+    local_probe_batches: AtomicU64,
+    local_probe_items: AtomicU64,
+    local_probe_local_items: AtomicU64,
+    local_probe_remote_items: AtomicU64,
+    batches: AtomicU64,
+    local_items: AtomicU64,
+    leader_items: AtomicU64,
+    follower_items: AtomicU64,
 }
 
 struct OwnerHotSelectionDebt {
@@ -2382,6 +2460,7 @@ pub struct ClientKvApiInner {
         Arc<DashMap<OwnerHotReplicaIdentity, Arc<OwnerHotSelectionDebt>>>,
     owner_hot_counters: Arc<OwnerHotCacheCounters>,
     owner_remote_put_counters: Arc<OwnerRemotePutCounters>,
+    planned_get_counters: OwnerPlannedGetCounters,
     owner_hot_retry_queue: Arc<OwnerHotRetryQueue>,
     owner_hot_eviction_tx: tokio::sync::ampsc::UnboundedSender<OwnerHotEvictionDispatch>,
     owner_hot_eviction_rx:
@@ -2401,6 +2480,12 @@ pub struct ClientKvApiInner {
     /// remains in the sharded key-control table; observing metrics must never
     /// scan or hold those fences.
     external_get_flight_registry: DashMap<String, Weak<ExternalGetKeySharedOp>>,
+    external_get_local_probe_locks: AMapLock<(String, i64, u64)>,
+    completed_external_get_local_probes:
+        moka::future::Cache<(String, i64, u64), (Vec<String>, ExternalBatchGetLocalProbeResp)>,
+    planned_external_get_execute_locks: AMapLock<(String, i64, u64)>,
+    completed_planned_external_get_executes:
+        moka::future::Cache<(String, i64, u64), ExternalExecutePlannedGetResp>,
     next_external_get_start_handle: AtomicU64,
     /// External holding identities are independent from upstream and resident holder ids.
     next_external_holding_id: AtomicU64,
@@ -2420,6 +2505,7 @@ pub struct ClientKvApiInner {
     rpc_caller_get_revoke: RPCCaller<GetRevokeReq>,
     rpc_caller_get_done: RPCCaller<GetDoneReq>,
     rpc_caller_batch_get_start: RPCCaller<BatchGetStartReq>,
+    rpc_caller_batch_get_bind: RPCCaller<BatchGetBindReq>,
     rpc_caller_batch_get_revoke: RPCCaller<BatchGetRevokeReq>,
     rpc_caller_batch_get_done: RPCCaller<BatchGetDoneReq>,
     rpc_caller_put_start: RPCCaller<PutStartReq>,
@@ -5689,6 +5775,35 @@ impl ClientKvApiInner {
             external_get_flights_revoking,
             external_get_undecided_interests,
             external_get_retained_interests,
+            owner_local_probe_batches: self
+                .planned_get_counters
+                .local_probe_batches
+                .load(Ordering::Relaxed),
+            owner_local_probe_items: self
+                .planned_get_counters
+                .local_probe_items
+                .load(Ordering::Relaxed),
+            owner_local_probe_local_items: self
+                .planned_get_counters
+                .local_probe_local_items
+                .load(Ordering::Relaxed),
+            owner_local_probe_remote_items: self
+                .planned_get_counters
+                .local_probe_remote_items
+                .load(Ordering::Relaxed),
+            planned_cpu_get_batches: self.planned_get_counters.batches.load(Ordering::Relaxed),
+            planned_cpu_get_local_items: self
+                .planned_get_counters
+                .local_items
+                .load(Ordering::Relaxed),
+            planned_cpu_get_leader_items: self
+                .planned_get_counters
+                .leader_items
+                .load(Ordering::Relaxed),
+            planned_cpu_get_follower_items: self
+                .planned_get_counters
+                .follower_items
+                .load(Ordering::Relaxed),
             external_pending_put_entries: self.external_pending_puts.entry_count(),
             remote_put_flights_active: self
                 .owner_remote_put_counters
@@ -6341,6 +6456,14 @@ impl ClientKvApi {
                             revoking_flights = snapshot.external_get_flights_revoking,
                             undecided_interests = snapshot.external_get_undecided_interests,
                             retained_interests = snapshot.external_get_retained_interests,
+                            local_probe_batches = snapshot.owner_local_probe_batches,
+                            local_probe_items = snapshot.owner_local_probe_items,
+                            local_probe_local_items = snapshot.owner_local_probe_local_items,
+                            local_probe_remote_items = snapshot.owner_local_probe_remote_items,
+                            planned_cpu_batches = snapshot.planned_cpu_get_batches,
+                            planned_cpu_local_items = snapshot.planned_cpu_get_local_items,
+                            planned_cpu_leader_items = snapshot.planned_cpu_get_leader_items,
+                            planned_cpu_follower_items = snapshot.planned_cpu_get_follower_items,
                             reserve_free = snapshot.local_reserve_slots_free,
                             reserve_prepared = snapshot.local_reserve_slots_prepared,
                             reserve_pending_visible = snapshot.local_reserve_slots_pending_visible,
@@ -6453,6 +6576,7 @@ impl ClientKvApi {
             owner_source_eviction_selected,
             owner_hot_counters,
             owner_remote_put_counters,
+            planned_get_counters: OwnerPlannedGetCounters::default(),
             owner_hot_retry_queue,
             owner_hot_eviction_tx,
             owner_hot_eviction_rx: Mutex::new(Some(owner_hot_eviction_rx)),
@@ -6466,6 +6590,14 @@ impl ClientKvApi {
             external_get_holding: OwnerExternalMemMgr::default(),
             external_get_start_registry: DashMap::new(),
             external_get_flight_registry: DashMap::new(),
+            external_get_local_probe_locks: AMapLock::new(Duration::from_secs(120)),
+            completed_external_get_local_probes: moka::future::Cache::builder()
+                .time_to_live(Duration::from_secs(120))
+                .build(),
+            planned_external_get_execute_locks: AMapLock::new(Duration::from_secs(120)),
+            completed_planned_external_get_executes: moka::future::Cache::builder()
+                .time_to_live(Duration::from_secs(120))
+                .build(),
             next_external_get_start_handle: AtomicU64::new(1),
             next_external_holding_id: AtomicU64::new(1),
             external_pending_puts: moka::sync::Cache::builder()
@@ -6478,6 +6610,7 @@ impl ClientKvApi {
             rpc_caller_get_revoke: RPCCaller::new(),
             rpc_caller_get_done: RPCCaller::new(),
             rpc_caller_batch_get_start: RPCCaller::new(),
+            rpc_caller_batch_get_bind: RPCCaller::new(),
             rpc_caller_batch_get_revoke: RPCCaller::new(),
             rpc_caller_batch_get_done: RPCCaller::new(),
             rpc_caller_put_start: RPCCaller::new(),
@@ -6526,6 +6659,9 @@ impl ClientKvApi {
         inner.rpc_caller_get_done.regist(inner.view.p2p_module());
         inner
             .rpc_caller_batch_get_start
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_get_bind
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_batch_get_revoke
@@ -6634,6 +6770,20 @@ impl ClientKvApi {
         );
 
         let view_ext = inner.view.clone_view();
+        RPCHandler::<ExternalBatchGetLocalProbeReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_external_batch_get_local_probe", async move {
+                    let result = handle_external_batch_get_local_probe(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
+        let view_ext = inner.view.clone_view();
         RPCHandler::<ExternalBatchGetStartReq>::new().regist(
             inner.view.p2p_module(),
             move |resp, msg| {
@@ -6669,6 +6819,20 @@ impl ClientKvApi {
                 let view_task = view.clone();
                 view.spawn("rpc_external_batch_get_cancel", async move {
                     let result = handle_external_batch_get_cancel(&view_task, &msg).await;
+                    let _ = resp.send_resp(result).await;
+                });
+                Ok(())
+            },
+        );
+
+        let view_ext = inner.view.clone_view();
+        RPCHandler::<ExternalExecutePlannedGetReq>::new().regist(
+            inner.view.p2p_module(),
+            move |resp, msg| {
+                let view = view_ext.clone();
+                let view_task = view.clone();
+                view.spawn("rpc_external_execute_planned_get", async move {
+                    let result = handle_external_execute_planned_get(&view_task, &msg).await;
                     let _ = resp.send_resp(result).await;
                 });
                 Ok(())

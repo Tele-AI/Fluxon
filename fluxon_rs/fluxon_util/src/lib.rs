@@ -1,5 +1,6 @@
 pub mod dag_viz_html;
 pub mod dev_config;
+pub mod fixed_slab_allocator;
 pub mod fs_statvfs;
 pub mod fs_watch;
 pub mod git_version_build_record;

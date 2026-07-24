@@ -2,17 +2,18 @@ use crate::client_kv_api::ClientKvApi;
 use crate::client_kv_api::get::{StartedGetRevokeCleanup, finish_started_get_revoke_cleanup};
 use crate::client_kv_api::msg_pack::{
     ExternalBatchGetCancelPlan, ExternalBatchGetCancelReq, ExternalBatchGetCancelResp,
-    ExternalBatchGetItemResp, ExternalBatchGetReq, ExternalBatchGetResp, ExternalBatchGetStartReq,
-    ExternalBatchGetStartResp, ExternalBatchGetStartTransferPlan, ExternalBatchGetTransferReq,
-    ExternalBatchGetTransferResp, ExternalBatchIsExistReq, ExternalBatchIsExistResp,
-    ExternalBatchPutCommitItemResp, ExternalBatchPutCommitReq, ExternalBatchPutCommitResp,
-    ExternalBatchPutStartItemResp, ExternalBatchPutStartReq, ExternalBatchPutStartResp,
-    ExternalBatchPutTransferEndItemResp, ExternalBatchPutTransferEndReq,
-    ExternalBatchPutTransferEndResp, ExternalDeleteReq, ExternalDeleteResp, ExternalGetReq,
-    ExternalGetResp, ExternalIsExistReq, ExternalIsExistResp, ExternalObservabilitySnapshotReq,
-    ExternalObservabilitySnapshotResp, ExternalPutCommitReq, ExternalPutCommitResp,
-    ExternalPutRevokeReq, ExternalPutRevokeResp, ExternalPutStartReq, ExternalPutStartResp,
-    ExternalPutTransferEndReq, ExternalPutTransferEndResp, TestPutPhaseTrace,
+    ExternalBatchGetItemResp, ExternalBatchGetLocalProbeReq, ExternalBatchGetLocalProbeResp,
+    ExternalBatchGetReq, ExternalBatchGetResp, ExternalBatchGetStartReq, ExternalBatchGetStartResp,
+    ExternalBatchGetStartTransferPlan, ExternalBatchGetTransferReq, ExternalBatchGetTransferResp,
+    ExternalBatchIsExistReq, ExternalBatchIsExistResp, ExternalBatchPutCommitItemResp,
+    ExternalBatchPutCommitReq, ExternalBatchPutCommitResp, ExternalBatchPutStartItemResp,
+    ExternalBatchPutStartReq, ExternalBatchPutStartResp, ExternalBatchPutTransferEndItemResp,
+    ExternalBatchPutTransferEndReq, ExternalBatchPutTransferEndResp, ExternalDeleteReq,
+    ExternalDeleteResp, ExternalExecutePlannedGetReq, ExternalExecutePlannedGetResp,
+    ExternalGetReq, ExternalGetResp, ExternalIsExistReq, ExternalIsExistResp,
+    ExternalObservabilitySnapshotReq, ExternalObservabilitySnapshotResp, ExternalPutCommitReq,
+    ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp, ExternalPutStartReq,
+    ExternalPutStartResp, ExternalPutTransferEndReq, ExternalPutTransferEndResp, TestPutPhaseTrace,
 };
 use crate::client_kv_api::{
     self, ExternalGetKeyInterest, ExternalGetKeySharedOp, ExternalGetKeySharedPhase,
@@ -836,6 +837,84 @@ async fn batch_get_start_with_local_reserve_targets(
         }
     }
     Ok(response)
+}
+
+async fn batch_get_bind_with_local_reserve_targets(
+    inner: &client_kv_api::ClientKvApiInner,
+    get_ids: &[u64],
+) -> KvResult<Vec<BatchGetStartItemResp>> {
+    if get_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(value_len) = inner
+        .test_spec_config
+        .owner_local_reserve_expected_capacity
+        .as_ref()
+        .map(|expected| expected.value_len)
+    else {
+        return Err(KvError::Api(ApiError::InvalidArgument {
+            detail: "planned external Get requires owner-local reserve capacity".to_string(),
+        }));
+    };
+    let lease = inner
+        .owner_claim_local_reserve_slot_lease(value_len, get_ids.len())
+        .await?;
+    let mut claim_guard = PreparedGetSlotClaimGuard::new(inner.view.clone_view(), lease);
+    let prepared_targets = claim_guard
+        .lease()
+        .slots
+        .iter()
+        .map(|slot| prepared_target_from_slot(claim_guard.lease().slot_size, slot))
+        .collect::<Vec<_>>();
+    let response = match inner
+        .batch_get_bind_prepared_targets(get_ids.to_vec(), prepared_targets.clone())
+        .await
+    {
+        Ok(response) => {
+            claim_guard.mark_start_response_received();
+            response
+        }
+        Err(err) => return Err(err),
+    };
+    if response.items.len() != get_ids.len() {
+        let started = claim_guard.handoff_started(&response.items);
+        finish_started_get_revoke_cleanup(inner, started, "BatchGetBind length mismatch").await;
+        return Err(KvError::Api(ApiError::Unknown {
+            detail: format!(
+                "planned BatchGetBind response length mismatch: expected={} got={}",
+                get_ids.len(),
+                response.items.len()
+            ),
+        }));
+    }
+    let identities_match = response
+        .items
+        .iter()
+        .zip(get_ids)
+        .all(|(item, get_id)| item.get_id == *get_id);
+    let targets_match =
+        response
+            .items
+            .iter()
+            .zip(prepared_targets.iter())
+            .all(|(item, expected)| {
+                item.error_code != OK || item.prepared_target.as_ref() == Some(expected)
+            });
+    if !identities_match || !targets_match {
+        let started = claim_guard.handoff_started(&response.items);
+        finish_started_get_revoke_cleanup(inner, started, "BatchGetBind identity/target mismatch")
+            .await;
+        return Err(KvError::Api(ApiError::Unknown {
+            detail: "master did not replay the exact planned Get identity and prepared target"
+                .to_string(),
+        }));
+    }
+    for (item, target) in response.items.iter().zip(prepared_targets.iter()) {
+        if item.error_code == OK {
+            claim_guard.disarm_accepted(target);
+        }
+    }
+    Ok(response.items)
 }
 
 #[cfg(test)]
@@ -2626,6 +2705,10 @@ pub trait HandlerForExternalClient {
     fn validate_requester_owner_status_updated(&self, started_time: i64) -> KvResult<()>;
     async fn external_get(&self, req: ExternalGetReq) -> KvResult<ExternalGetResp>;
     async fn external_batch_get(&self, req: ExternalBatchGetReq) -> KvResult<ExternalBatchGetResp>;
+    async fn external_batch_get_local_probe(
+        &self,
+        req: ExternalBatchGetLocalProbeReq,
+    ) -> KvResult<ExternalBatchGetLocalProbeResp>;
     async fn external_batch_get_start(
         &self,
         req: ExternalBatchGetStartReq,
@@ -2638,6 +2721,10 @@ pub trait HandlerForExternalClient {
         &self,
         req: ExternalBatchGetCancelReq,
     ) -> KvResult<ExternalBatchGetCancelResp>;
+    async fn external_execute_planned_get(
+        &self,
+        req: ExternalExecutePlannedGetReq,
+    ) -> KvResult<ExternalExecutePlannedGetResp>;
     async fn external_put_start(&self, req: ExternalPutStartReq) -> KvResult<ExternalPutStartResp>;
     async fn external_batch_put_start(
         &self,
@@ -2761,6 +2848,118 @@ impl HandlerForExternalClient for ClientKvApi {
             error_code: OK,
             error_json: String::new(),
         })
+    }
+
+    async fn external_batch_get_local_probe(
+        &self,
+        req: ExternalBatchGetLocalProbeReq,
+    ) -> KvResult<ExternalBatchGetLocalProbeResp> {
+        if self.is_side_transfer_worker() {
+            return Err(Self::side_transfer_unsupported(
+                "external_batch_get_local_probe",
+            ));
+        }
+        if req.keys.is_empty() {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "external_batch_get_local_probe requires at least one key".to_string(),
+            }));
+        }
+        if req.plan_handle == 0 {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "external_batch_get_local_probe requires a non-zero plan_handle"
+                    .to_string(),
+            }));
+        }
+        self.validate_requester_owner_status_updated(req.started_time)?;
+        let inner = self.inner();
+        let identity = (req.req_node_id.clone(), req.started_time, req.plan_handle);
+        let operation_lock = inner
+            .external_get_local_probe_locks
+            .get_lock(identity.clone());
+        let _operation_guard = operation_lock.lock().await;
+        if let Some((completed_keys, completed)) = inner
+            .completed_external_get_local_probes
+            .get(&identity)
+            .await
+        {
+            if completed_keys != req.keys {
+                return Err(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "external_batch_get_local_probe operation identity was reused with different keys: plan_handle={}",
+                        req.plan_handle
+                    ),
+                }));
+            }
+            return Ok(completed);
+        }
+        let mut items = Vec::with_capacity(req.keys.len());
+        let mut hot_touches = Vec::new();
+        for key in &req.keys {
+            let (item, hot_touch) = {
+                let controls = inner.owner_key_control.lock_key(key);
+                if controls
+                    .get(key)
+                    .is_some_and(|state| state.local_access_fenced())
+                {
+                    (None, None)
+                } else if let Some(memory_info) = inner.local_visible_mem_holder_unfenced(key) {
+                    let hot_touch = inner.get_cached_info.get(key).and_then(|cached| {
+                        Arc::ptr_eq(&cached.mem_holder, &memory_info).then_some((
+                            (cached.put_time_ms, cached.put_version),
+                            memory_info.clone(),
+                        ))
+                    });
+                    // Install the holder under the same per-key fence used for
+                    // local visibility. Reclaim cannot slip between the probe
+                    // decision and the pin that owns this exact backing.
+                    let info = inner.install_external_get_holding(&req.req_node_id, memory_info);
+                    (Some(info), hot_touch)
+                } else {
+                    (None, None)
+                }
+            };
+            if let Some((put_id, memory_info)) = hot_touch {
+                hot_touches.push((key.clone(), put_id, memory_info));
+            }
+            items.push(item);
+        }
+        for (key, put_id, memory_info) in hot_touches {
+            inner.owner_hot_touch_or_promote(&key, put_id, &memory_info);
+        }
+        let local_items = items.iter().filter(|item| item.is_some()).count();
+        let remote_items = items.len().saturating_sub(local_items);
+        inner
+            .planned_get_counters
+            .local_probe_batches
+            .fetch_add(1, Ordering::Relaxed);
+        inner
+            .planned_get_counters
+            .local_probe_items
+            .fetch_add(items.len() as u64, Ordering::Relaxed);
+        inner
+            .planned_get_counters
+            .local_probe_local_items
+            .fetch_add(local_items as u64, Ordering::Relaxed);
+        inner
+            .planned_get_counters
+            .local_probe_remote_items
+            .fetch_add(remote_items as u64, Ordering::Relaxed);
+        tracing::debug!(
+            requested = req.keys.len(),
+            local = local_items,
+            remote = remote_items,
+            "external Get owner-local probe"
+        );
+        let response = ExternalBatchGetLocalProbeResp {
+            items,
+            error_code: OK,
+            error_json: String::new(),
+        };
+        inner
+            .completed_external_get_local_probes
+            .insert(identity, (req.keys, response.clone()))
+            .await;
+        Ok(response)
     }
 
     async fn external_batch_get_start(
@@ -3025,6 +3224,239 @@ impl HandlerForExternalClient for ClientKvApi {
             error_code: OK,
             error_json: String::new(),
         })
+    }
+
+    async fn external_execute_planned_get(
+        &self,
+        req: ExternalExecutePlannedGetReq,
+    ) -> KvResult<ExternalExecutePlannedGetResp> {
+        if self.is_side_transfer_worker() {
+            return Err(Self::side_transfer_unsupported(
+                "external_execute_planned_get",
+            ));
+        }
+        if req.items.is_empty() || req.transfer_concurrency == 0 {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "external_execute_planned_get requires non-empty items and positive concurrency: items={} concurrency={}",
+                    req.items.len(),
+                    req.transfer_concurrency
+                ),
+            }));
+        }
+        let inner = self.inner();
+        self.validate_requester_owner_status_updated(req.started_time)?;
+        let identity = (req.req_node_id.clone(), req.started_time, req.plan_handle);
+        let operation_lock = inner
+            .planned_external_get_execute_locks
+            .get_lock(identity.clone());
+        let _operation_guard = operation_lock.lock().await;
+        if let Some(completed) = inner
+            .completed_planned_external_get_executes
+            .get(&identity)
+            .await
+        {
+            return Ok(completed);
+        }
+
+        let mut requested_by_key = HashMap::with_capacity(req.items.len());
+        for item in &req.items {
+            if item.key.is_empty()
+                || requested_by_key
+                    .insert(item.key.clone(), item.get_id)
+                    .is_some()
+            {
+                return Err(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "external_execute_planned_get requires unique non-empty keys: plan_handle={}",
+                        req.plan_handle
+                    ),
+                }));
+            }
+        }
+        let keys = req
+            .items
+            .iter()
+            .map(|item| item.key.clone())
+            .collect::<Vec<_>>();
+        let (mut owner_items, leaders) = plan_external_get_key_items(inner, &keys).await;
+        let local_items = owner_items
+            .iter()
+            .filter(|item| matches!(item, ExternalGetStartOwnerItem::Local { .. }))
+            .count();
+        let leader_items = leaders.len();
+        let follower_items = owner_items
+            .len()
+            .saturating_sub(local_items)
+            .saturating_sub(leader_items);
+        inner
+            .planned_get_counters
+            .batches
+            .fetch_add(1, Ordering::Relaxed);
+        inner
+            .planned_get_counters
+            .local_items
+            .fetch_add(local_items as u64, Ordering::Relaxed);
+        inner
+            .planned_get_counters
+            .leader_items
+            .fetch_add(leader_items as u64, Ordering::Relaxed);
+        inner
+            .planned_get_counters
+            .follower_items
+            .fetch_add(follower_items as u64, Ordering::Relaxed);
+        tracing::info!(
+            plan_handle = req.plan_handle,
+            items = owner_items.len(),
+            local_items,
+            leader_items,
+            follower_items,
+            "planned CPU Get owner classification"
+        );
+        let leader_get_ids = leaders
+            .iter()
+            .map(|leader| {
+                requested_by_key
+                    .get(&leader.key)
+                    .copied()
+                    .expect("planned leader key must come from the request")
+            })
+            .collect::<Vec<_>>();
+        let leader_id_set = leader_get_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let mut cleanup = req
+            .items
+            .iter()
+            .filter(|item| !leader_id_set.contains(&item.get_id))
+            .map(|item| StartedGetRevokeCleanup {
+                get_id: item.get_id,
+                prepared_target: None,
+            })
+            .collect::<Vec<_>>();
+
+        let bound_items =
+            match batch_get_bind_with_local_reserve_targets(inner, &leader_get_ids).await {
+                Ok(items) => items,
+                Err(err) => {
+                    for leader in &leaders {
+                        publish_external_get_key_failed(inner, leader, &err);
+                    }
+                    cleanup.extend(leader_get_ids.into_iter().map(|get_id| {
+                        StartedGetRevokeCleanup {
+                            get_id,
+                            prepared_target: None,
+                        }
+                    }));
+                    finish_started_get_revoke_cleanup(
+                        inner,
+                        cleanup,
+                        "planned external Get bind failure",
+                    )
+                    .await;
+                    let response = ExternalExecutePlannedGetResp {
+                        items: Vec::new(),
+                        error_code: err.code(),
+                        error_json: err.to_json(),
+                    };
+                    inner
+                        .completed_planned_external_get_executes
+                        .insert(identity, response.clone())
+                        .await;
+                    return Ok(response);
+                }
+            };
+        assert_eq!(leaders.len(), bound_items.len());
+        for (leader, item) in leaders.iter().zip(bound_items) {
+            if item.error_code != OK {
+                cleanup.push(StartedGetRevokeCleanup {
+                    get_id: item.get_id,
+                    prepared_target: None,
+                });
+            }
+            publish_external_get_key_started(leader, item);
+        }
+        for item in &mut owner_items {
+            decide_external_get_key_item(item, true);
+        }
+
+        // From this point on the owner has published Started for every leader,
+        // so it must retain lifecycle ownership independently of the inbound
+        // RPC future.  P2P timeout/cancellation drops the handler future; if
+        // finish lived on that future, the per-key marker would remain in
+        // Finishing forever and every replay would only become a follower.
+        // The registered owner task is process-scoped and therefore continues
+        // both transfer/Done and unused-operation cleanup after caller loss.
+        let spawn_view = inner.view.clone_view();
+        let worker_view = spawn_view.clone();
+        let finish_leaders = leaders;
+        let transfer_concurrency = req.transfer_concurrency;
+        let plan_handle = req.plan_handle;
+        spawn_view.spawn(
+            format!("planned_external_get_finish_{plan_handle}"),
+            async move {
+                let finish_view = worker_view.clone();
+                let cleanup_view = worker_view;
+                let finish = finish_external_get_key_leaders(
+                    finish_view,
+                    finish_leaders,
+                    transfer_concurrency,
+                );
+                let cleanup_future = async move {
+                    finish_started_get_revoke_cleanup(
+                        cleanup_view.client_kv_api().inner(),
+                        cleanup,
+                        "planned external Get unused operation",
+                    )
+                    .await;
+                };
+                tokio::join!(finish, cleanup_future);
+            },
+        );
+
+        let transfer_results =
+            finish_external_get_start_transfer(inner.view.clone_view(), owner_items, 0).await?;
+        if transfer_results.len() != keys.len() {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "planned external Get result length mismatch: expected={} got={}",
+                    keys.len(),
+                    transfer_results.len()
+                ),
+            }));
+        }
+        let mut items = Vec::with_capacity(keys.len());
+        for (key, result) in keys.iter().zip(transfer_results) {
+            match result {
+                Ok(Some((holder, _))) => items.push(ExternalBatchGetItemResp {
+                    error_code: OK,
+                    error_json: String::new(),
+                    external_memholder_info: Some(
+                        inner.install_external_get_holding(&req.req_node_id, holder.memory_info()),
+                    ),
+                }),
+                Ok(None) => items.push(ExternalBatchGetItemResp {
+                    error_code: codes_api::API_KEY_NOT_FOUND,
+                    error_json: format!("Key not found: {key}"),
+                    external_memholder_info: None,
+                }),
+                Err(err) => items.push(ExternalBatchGetItemResp {
+                    external_memholder_info: None,
+                    ..ExternalBatchGetItemResp::from_error(&err)
+                }),
+            }
+        }
+        let response = ExternalExecutePlannedGetResp {
+            items,
+            error_code: OK,
+            error_json: String::new(),
+        };
+        inner
+            .completed_planned_external_get_executes
+            .insert(identity, response.clone())
+            .await;
+        Ok(response)
     }
 
     async fn external_batch_get_cancel(

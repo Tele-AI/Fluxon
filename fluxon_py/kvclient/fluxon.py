@@ -293,6 +293,25 @@ class GpuGetStartHandle:
     created_at_ns: int
     backend_token: int
     backend_handle: int
+    remote_indices: Tuple[int, ...]
+    closed: bool = False
+    transfer_wall_us: Optional[int] = None
+    finish_wait_us: Optional[int] = None
+    terminal_before_consume: Optional[bool] = None
+    terminal_to_consume_us: Optional[int] = None
+
+
+@dataclass
+class GetPlanHandle:
+    """Target-free Get plan that must be executed once or cancelled."""
+
+    keys: Tuple[str, ...]
+    result: GetStartResult
+    gpu_result: GetStartResult
+    created_at_ns: int
+    backend_token: int
+    backend_handle: int
+    gpu_remote_indices: Tuple[int, ...]
     closed: bool = False
 
 
@@ -373,6 +392,34 @@ def _build_get_start_result_from_backend_payload(
         first_miss_index=first_miss_index,
         first_miss_group_index=first_miss_group_index,
         all_hit=transferable_len == len(result_keys),
+    )
+
+
+def _narrow_get_start_result(result: GetStartResult, consume_prefix_len: int) -> GetStartResult:
+    group_lens = result.atomic_group_lens or (len(result.keys),)
+    selected_groups: List[int] = []
+    cursor = 0
+    for group_len in group_lens:
+        if cursor + group_len > consume_prefix_len:
+            break
+        selected_groups.append(int(group_len))
+        cursor += int(group_len)
+    if cursor != consume_prefix_len:
+        raise ValueError(
+            "consume_prefix_len must end at an atomic-group boundary: "
+            f"consume={consume_prefix_len} groups={group_lens}"
+        )
+    keys = result.keys[:consume_prefix_len]
+    return GetStartResult(
+        keys=keys,
+        raw_prefix_hit_len=consume_prefix_len,
+        transferable_len=consume_prefix_len,
+        prefix_hit_groups=len(selected_groups),
+        atomic_group_lens=tuple(selected_groups),
+        prefix_best_effort=result.prefix_best_effort,
+        first_miss_index=None,
+        first_miss_group_index=None,
+        all_hit=True,
     )
 
 
@@ -1935,6 +1982,218 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             backend_handle=backend_handle,
         )
 
+    def get_plan(
+        self,
+        keys: List[str],
+        prefix_best_effort: bool = True,
+        atomic_group_lens: Optional[List[int]] = None,
+    ) -> GetPlanHandle:
+        if self._client is None:
+            raise RuntimeError("Store not initialized when get_plan(). Call setup() first.")
+        if not keys:
+            raise ValueError("get_plan requires at least one key")
+        normalized_group_lens: Optional[List[int]] = None
+        if atomic_group_lens is not None:
+            normalized_group_lens = [int(length) for length in atomic_group_lens]
+            if any(length <= 0 for length in normalized_group_lens):
+                raise ValueError("get_plan atomic_group_lens entries must be > 0")
+            if sum(normalized_group_lens) != len(keys):
+                raise ValueError(
+                    "get_plan atomic_group_lens must sum to keys length: "
+                    f"sum={sum(normalized_group_lens)} keys={len(keys)}"
+                )
+        started_at_ns = time.monotonic_ns()
+        inner_res = self._client.get_plan(
+            list(keys),
+            bool(prefix_best_effort),
+            normalized_group_lens,
+        )
+        if not inner_res.is_ok():
+            raise RuntimeError(f"get_plan backend error: {inner_res.unwrap_error()}")
+        payload = inner_res.unwrap()
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"get_plan returned non-dict payload: {type(payload)}")
+        backend_handle = int(payload["handle"])
+        try:
+            result = _build_get_start_result_from_backend_payload(
+                payload,
+                list(keys),
+                bool(prefix_best_effort),
+                normalized_group_lens,
+            )
+            gpu_payload = dict(payload)
+            gpu_payload["raw_prefix_hit_len"] = payload["gpu_raw_prefix_hit_len"]
+            gpu_result = _build_get_start_result_from_backend_payload(
+                gpu_payload,
+                list(keys),
+                bool(prefix_best_effort),
+                normalized_group_lens,
+            )
+            gpu_remote_indices = tuple(int(index) for index in payload["gpu_remote_indices"])
+            if (
+                tuple(sorted(set(gpu_remote_indices))) != gpu_remote_indices
+                or any(
+                    index < 0 or index >= gpu_result.transferable_len
+                    for index in gpu_remote_indices
+                )
+            ):
+                raise RuntimeError(
+                    "get_plan returned invalid gpu_remote_indices: "
+                    f"indices={gpu_remote_indices} "
+                    f"transferable={gpu_result.transferable_len}"
+                )
+        except Exception:
+            cancel_res = self._client.cancel_get_plan(backend_handle)
+            if not cancel_res.is_ok():
+                logging.exception(
+                    "get_plan payload validation failed and cleanup also failed: %s",
+                    cancel_res.unwrap_error(),
+                )
+            else:
+                _ = cancel_res.unwrap()
+            raise
+        return GetPlanHandle(
+            keys=tuple(keys),
+            result=result,
+            gpu_result=gpu_result,
+            created_at_ns=started_at_ns,
+            backend_token=id(self),
+            backend_handle=backend_handle,
+            gpu_remote_indices=gpu_remote_indices,
+        )
+
+    def cancel_get_plan(self, handle: GetPlanHandle) -> None:
+        if not isinstance(handle, GetPlanHandle):
+            raise TypeError(f"cancel_get_plan requires GetPlanHandle, got {type(handle)}")
+        if handle.backend_token != id(self):
+            raise RuntimeError("cancel_get_plan handle belongs to a different store")
+        if handle.closed:
+            return
+        if self._client is None:
+            raise RuntimeError("Store not initialized when cancel_get_plan().")
+        inner_res = self._client.cancel_get_plan(handle.backend_handle)
+        if not inner_res.is_ok():
+            raise RuntimeError(f"cancel_get_plan backend error: {inner_res.unwrap_error()}")
+        _ = inner_res.unwrap()
+        handle.closed = True
+
+    def execute_get_plan_cpu(
+        self,
+        handle: GetPlanHandle,
+        *,
+        consume_prefix_len: int,
+        concurrency: Optional[int] = None,
+    ) -> GetStartHandle:
+        if not isinstance(handle, GetPlanHandle):
+            raise TypeError(
+                f"execute_get_plan_cpu requires GetPlanHandle, got {type(handle)}"
+            )
+        if handle.backend_token != id(self) or handle.closed:
+            raise RuntimeError("execute_get_plan_cpu requires a live plan from this store")
+        narrowed = _narrow_get_start_result(handle.result, int(consume_prefix_len))
+        if consume_prefix_len <= 0 or consume_prefix_len > handle.result.transferable_len:
+            raise ValueError(
+                "execute_get_plan_cpu consume prefix is outside the CPU plan: "
+                f"consume={consume_prefix_len} transferable={handle.result.transferable_len}"
+            )
+        if self._client is None:
+            raise RuntimeError("Store not initialized when execute_get_plan_cpu().")
+        inner_res = self._client.execute_get_plan_cpu(
+            handle.backend_handle,
+            int(consume_prefix_len),
+            self._batch_concurrency if concurrency is None else int(concurrency),
+        )
+        if not inner_res.is_ok():
+            raise RuntimeError(
+                f"execute_get_plan_cpu backend error: {inner_res.unwrap_error()}"
+            )
+        _ = inner_res.unwrap()
+        handle.closed = True
+        return GetStartHandle(
+            keys=narrowed.keys,
+            result=narrowed,
+            created_at_ns=handle.created_at_ns,
+            backend_token=id(self),
+            backend_handle=handle.backend_handle,
+        )
+
+    def execute_get_plan_gpu(
+        self,
+        handle: GetPlanHandle,
+        destinations: List[GpuDestination],
+        *,
+        consume_prefix_len: int,
+        concurrency: Optional[int] = None,
+    ) -> GpuGetStartHandle:
+        if not isinstance(handle, GetPlanHandle):
+            raise TypeError(
+                f"execute_get_plan_gpu requires GetPlanHandle, got {type(handle)}"
+            )
+        if handle.backend_token != id(self) or handle.closed:
+            raise RuntimeError("execute_get_plan_gpu requires a live plan from this store")
+        remote_indices = tuple(
+            index for index in handle.gpu_remote_indices if index < consume_prefix_len
+        )
+        if not remote_indices:
+            raise ValueError("execute_get_plan_gpu requires at least one remote source")
+        if len(destinations) != len(remote_indices):
+            raise ValueError(
+                "execute_get_plan_gpu requires one exact destination per remote source: "
+                f"destinations={len(destinations)} remote={len(remote_indices)} "
+                f"consume={consume_prefix_len}"
+            )
+        narrowed = _narrow_get_start_result(handle.gpu_result, int(consume_prefix_len))
+        if consume_prefix_len <= 0 or consume_prefix_len > handle.gpu_result.transferable_len:
+            raise ValueError(
+                "execute_get_plan_gpu consume prefix is outside the GPU plan: "
+                f"consume={consume_prefix_len} transferable={handle.gpu_result.transferable_len}"
+            )
+        active_registration = self._gpu_buffer_registration
+        if active_registration is None:
+            raise RuntimeError("execute_get_plan_gpu requires an active GPU registration")
+        for index, destination in enumerate(destinations):
+            if not isinstance(destination, GpuDestination):
+                raise TypeError(
+                    "execute_get_plan_gpu destinations must be GpuDestination: "
+                    f"index={index} got={type(destination)}"
+                )
+            if destination.registration_id != active_registration.registration_id:
+                raise ValueError(
+                    "execute_get_plan_gpu destination uses a stale registration: "
+                    f"index={index}"
+                )
+            if destination.ptr < active_registration.ptr or destination.end > active_registration.end:
+                raise ValueError(
+                    "execute_get_plan_gpu destination is outside the active registration: "
+                    f"index={index}"
+                )
+        if self._client is None:
+            raise RuntimeError("Store not initialized when execute_get_plan_gpu().")
+        inner_res = self._client.execute_get_plan_gpu(
+            handle.backend_handle,
+            [
+                (destination.registration_id, destination.ptr, destination.capacity)
+                for destination in destinations
+            ],
+            int(consume_prefix_len),
+            self._batch_concurrency if concurrency is None else int(concurrency),
+        )
+        if not inner_res.is_ok():
+            raise RuntimeError(
+                f"execute_get_plan_gpu backend error: {inner_res.unwrap_error()}"
+            )
+        _ = inner_res.unwrap()
+        handle.closed = True
+        return GpuGetStartHandle(
+            keys=narrowed.keys,
+            destinations=tuple(destinations),
+            result=narrowed,
+            created_at_ns=handle.created_at_ns,
+            backend_token=id(self),
+            backend_handle=handle.backend_handle,
+            remote_indices=remote_indices,
+        )
+
     def cancel_get_transfer(self, handle: GetStartHandle) -> None:
         if not isinstance(handle, GetStartHandle):
             raise TypeError(f"cancel_get_transfer requires GetStartHandle, got {type(handle)}")
@@ -2121,6 +2380,8 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                     "get_start_gpu payload validation failed and cleanup also failed: %s",
                     cancel_res.unwrap_error(),
                 )
+            else:
+                _ = cancel_res.unwrap()
             raise
         return GpuGetStartHandle(
             keys=tuple(keys),
@@ -2129,6 +2390,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             created_at_ns=started_at_ns,
             backend_token=id(self),
             backend_handle=backend_handle,
+            remote_indices=tuple(range(result.transferable_len)),
         )
 
     def cancel_get_transfer_gpu(self, handle: GpuGetStartHandle) -> None:
@@ -2152,14 +2414,15 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             raise RuntimeError(
                 f"cancel_get_transfer_gpu backend error: {inner_res.unwrap_error()}"
             )
+        _ = inner_res.unwrap()
 
     def get_transfer_gpu(
         self,
         handle: GpuGetStartHandle,
         *,
         consume_prefix_len: Optional[int] = None,
-    ) -> None:
-        """Wait for the GPU transfer terminal; destinations already contain the bytes."""
+    ) -> int:
+        """Wait for GPU transfer and return one ordered CPU/GPU source plan."""
         if not isinstance(handle, GpuGetStartHandle):
             raise TypeError(
                 f"get_transfer_gpu requires GpuGetStartHandle, got {type(handle)}"
@@ -2227,6 +2490,33 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 f"transferred={transferred_prefix_len}/{result.transferable_len} "
                 f"consumed={consumed_prefix_len}/{normalized_consume_prefix_len}"
             )
+        transfer_wall_us = payload["transfer_wall_us"]
+        finish_wait_us = payload["finish_wait_us"]
+        terminal_before_consume = payload["terminal_before_consume"]
+        terminal_to_consume_us = payload["terminal_to_consume_us"]
+        for field_name, value in (
+            ("transfer_wall_us", transfer_wall_us),
+            ("finish_wait_us", finish_wait_us),
+            ("terminal_to_consume_us", terminal_to_consume_us),
+        ):
+            if type(value) is not int or value < 0:
+                raise RuntimeError(
+                    "get_transfer_gpu returned invalid timing: "
+                    f"{field_name}={value!r}"
+                )
+        if type(terminal_before_consume) is not bool:
+            raise RuntimeError(
+                "get_transfer_gpu returned invalid terminal_before_consume: "
+                f"{terminal_before_consume!r}"
+            )
+        handle.transfer_wall_us = transfer_wall_us
+        handle.finish_wait_us = finish_wait_us
+        handle.terminal_before_consume = terminal_before_consume
+        handle.terminal_to_consume_us = terminal_to_consume_us
+        plan_ptr = int(payload["plan_ptr"])
+        if plan_ptr <= 0:
+            raise RuntimeError(f"get_transfer_gpu returned invalid plan_ptr: {plan_ptr}")
+        return plan_ptr
 
     def get_etcd_config(self) -> List[str]:
         if self._client is None:

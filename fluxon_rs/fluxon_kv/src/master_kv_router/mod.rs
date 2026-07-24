@@ -15,20 +15,20 @@ use self::{
     delete::handle_delete,
     delete::handle_delete_ack,
     get::{
-        handle_batch_get_done, handle_batch_get_revoke, handle_batch_get_start,
-        handle_batch_is_exist, handle_get_done, handle_get_meta, handle_get_revoke,
-        handle_get_start,
+        handle_batch_get_bind, handle_batch_get_done, handle_batch_get_plan,
+        handle_batch_get_revoke, handle_batch_get_start, handle_batch_is_exist, handle_get_done,
+        handle_get_meta, handle_get_revoke, handle_get_start,
     },
     msg_pack::{
         BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchEnqueueReplicaTaskReq,
-        BatchEvictOwnerSourceReq, BatchGetDoneReq, BatchGetRevokeReq, BatchGetStartReq,
-        BatchIsExistReq, BatchOwnerReclaimReq, BatchPreparePutKeysReq, BatchPutAppendDoneReq,
-        BatchPutAppendStartReq, BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq,
-        BatchReleasePutKeyReservationsReq, CountPrefixReq, CountPrefixResp, DeleteAckReq,
-        DeleteReq, GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetRevokeReq,
-        GetStartReq, GroupedBatchPutDoneReq, OwnerReclaimItem, PutAppendDoneReq,
-        PutAppendRevokeReq, PutAppendStartReq, PutAtomicGroup, PutDoneReq, PutRevokeReq,
-        PutStartReq, ReleaseLocalGrantReq, ReserveLocalGrantReq,
+        BatchEvictOwnerSourceReq, BatchGetBindReq, BatchGetDoneReq, BatchGetPlanReq,
+        BatchGetRevokeReq, BatchGetStartReq, BatchIsExistReq, BatchOwnerReclaimReq,
+        BatchPreparePutKeysReq, BatchPutAppendDoneReq, BatchPutAppendStartReq, BatchPutDoneReq,
+        BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq, CountPrefixReq,
+        CountPrefixResp, DeleteAckReq, DeleteReq, GetAllocationMode, GetDoneReq, GetDoneResp,
+        GetMetaReq, GetRevokeReq, GetStartReq, GroupedBatchPutDoneReq, OwnerReclaimItem,
+        PutAppendDoneReq, PutAppendRevokeReq, PutAppendStartReq, PutAtomicGroup, PutDoneReq,
+        PutRevokeReq, PutStartReq, ReleaseLocalGrantReq, ReserveLocalGrantReq,
     },
     placement::{PlacementPolicy, build_placement_policy},
     put::{
@@ -429,7 +429,13 @@ pub struct InflightGetInfo {
     pub src_node_id: NodeID,
     pub key: String,
     pub req_node_id: NodeID,
+    /// Optional external controller for a late-bound operation whose executor
+    /// is the share-group owner in `req_node_id`.
+    pub controller_node_id: Option<NodeID>,
     pub len: u64,
+    pub src_addr: u64,
+    pub src_base_addr: u64,
+    pub atomic_group: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
     pub target: InflightGetTarget,
     /// Exact requester segment-registration generation that owns an
     /// allocator-backed target. External sinks are caller-owned and instead
@@ -443,6 +449,25 @@ pub struct InflightGetInfo {
     /// owners may fetch the same key concurrently, but one owner must never
     /// materialize two candidate committed slots for the same key.
     pub(crate) _prepared_requester_lease: Option<Arc<PreparedGetRequesterLease>>,
+}
+
+/// A metadata-only Get source snapshot before caller-owned destination binding.
+///
+/// This type must not own a route, allocation, activity lease, cache pin, or
+/// destination resource. Bind re-reads the current route and installs the real
+/// Get activity before accepting the snapshot.
+#[derive(Clone)]
+pub struct PlannedGetInfo {
+    pub put_id: PutIDForAKey,
+    pub src_node_id: NodeID,
+    pub src_tomb_tag: NodeTombTag,
+    pub key: String,
+    pub controller_node_id: NodeID,
+    pub controller_node_start_time: i64,
+    pub len: u64,
+    pub src_addr: u64,
+    pub src_base_addr: u64,
+    pub atomic_group: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
 }
 
 #[derive(Clone)]
@@ -566,6 +591,17 @@ struct MasterKeyActivityObserveSnapshot {
     inflight_puts: u64,
     inflight_gets: u64,
     inflight_replicas: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct MasterPlannedGetCounters {
+    plan_items: AtomicU64,
+    plan_hits: AtomicU64,
+    plan_misses: AtomicU64,
+    bind_succeeded: AtomicU64,
+    bind_stale: AtomicU64,
+    bind_activity_busy: AtomicU64,
+    plan_revoked: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2272,6 +2308,10 @@ pub struct MasterKvRouterInner {
     /// queue or actor.
     pub replica_operation_locks: AMapLock<(String, u64, u32)>,
     pub inflight_gets: moka::future::Cache<u64, InflightGetInfo>,
+    /// Target-free source plans. Bind atomically moves an entry into
+    /// `inflight_gets` after re-reading and validating the current route.
+    pub planned_gets: moka::future::Cache<u64, PlannedGetInfo>,
+    pub(crate) planned_get_counters: MasterPlannedGetCounters,
     /// Idempotent terminal GetDone results retained across response loss/retry.
     pub completed_gets: moka::future::Cache<u64, CompletedGetInfo>,
     pub get_done_locks: AMapLock<u64>,
@@ -2490,6 +2530,9 @@ impl MasterKvRouter {
                 }
             })
             .build();
+        let planned_gets: moka::future::Cache<u64, PlannedGetInfo> = moka::future::Cache::builder()
+            .time_to_live(Duration::from_secs(60))
+            .build();
         let completed_gets = moka::future::Cache::builder()
             .time_to_live(Duration::from_secs(120))
             .build();
@@ -2524,6 +2567,8 @@ impl MasterKvRouter {
             completed_replica_tasks,
             replica_operation_locks: AMapLock::new(Duration::from_secs(10 * 60)),
             inflight_gets,
+            planned_gets,
+            planned_get_counters: MasterPlannedGetCounters::default(),
             completed_gets,
             get_done_locks: AMapLock::new(Duration::from_secs(10 * 60)),
             key_activity,
@@ -3812,6 +3857,56 @@ impl MasterKvRouter {
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send GroupedBatchPutDoneResp: {:?}", e);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchGetPlanReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let cleanup_view = view.clone();
+            let req_node_id = resp.node_id().clone();
+            view.spawn("rpc_batch_get_plan", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack = handle_batch_get_plan(view2, msg, req_node_id).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                let planned_get_ids = ack
+                    .serialize_part
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        item.error_code == crate::rpcresp_kvresult_convert::msg_and_error::OK
+                    })
+                    .map(|item| item.get_id)
+                    .collect::<Vec<_>>();
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchGetPlanResp: {:?}", e);
+                    for get_id in planned_get_ids {
+                        cleanup_view
+                            .master_kv_router()
+                            .inner()
+                            .planned_gets
+                            .remove(&get_id)
+                            .await;
+                    }
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchGetBindReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
+            view.spawn("rpc_batch_get_bind", async move {
+                let t0 = Utc::now().timestamp_micros();
+                let mut ack = handle_batch_get_bind(view2, msg, req_node_id).await;
+                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
+                if let Err(e) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchGetBindResp: {:?}", e);
                 }
             });
             Ok(())
@@ -5323,6 +5418,56 @@ impl MasterKvRouter {
                             inflight_gets = activity.inflight_gets,
                             inflight_replicas = activity.inflight_replicas,
                             "master key activity runtime"
+                        );
+                        tracing::info!(
+                            active_plans = view_task
+                                .master_kv_router()
+                                .inner()
+                                .planned_gets
+                                .entry_count(),
+                            plan_items = view_task
+                                .master_kv_router()
+                                .inner()
+                                .planned_get_counters
+                                .plan_items
+                                .load(Ordering::Relaxed),
+                            plan_hits = view_task
+                                .master_kv_router()
+                                .inner()
+                                .planned_get_counters
+                                .plan_hits
+                                .load(Ordering::Relaxed),
+                            plan_misses = view_task
+                                .master_kv_router()
+                                .inner()
+                                .planned_get_counters
+                                .plan_misses
+                                .load(Ordering::Relaxed),
+                            bind_succeeded = view_task
+                                .master_kv_router()
+                                .inner()
+                                .planned_get_counters
+                                .bind_succeeded
+                                .load(Ordering::Relaxed),
+                            bind_stale = view_task
+                                .master_kv_router()
+                                .inner()
+                                .planned_get_counters
+                                .bind_stale
+                                .load(Ordering::Relaxed),
+                            bind_activity_busy = view_task
+                                .master_kv_router()
+                                .inner()
+                                .planned_get_counters
+                                .bind_activity_busy
+                                .load(Ordering::Relaxed),
+                            plan_revoked = view_task
+                                .master_kv_router()
+                                .inner()
+                                .planned_get_counters
+                                .plan_revoked
+                                .load(Ordering::Relaxed),
+                            "master metadata-only Get plan runtime"
                         );
                         for node in snapshot.replica_cache_nodes {
                             tracing::info!(

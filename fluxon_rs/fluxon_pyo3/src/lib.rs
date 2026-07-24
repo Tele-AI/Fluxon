@@ -77,6 +77,8 @@ include!(env!("FLUXON_PYO3_TEST_PYTHON_LINK_RS"));
 
 mod memholder;
 pub use memholder::{ExternalMemHolder, MemHolder};
+mod fixed_slab_allocator;
+pub use fixed_slab_allocator::FixedSlabAllocator;
 mod flatdict_zerocopy;
 use flatdict_zerocopy::{FlatDictDataOwner, decode_flat_dict_to_wrapped_py_object};
 mod kvfuture;
@@ -4771,6 +4773,244 @@ impl KvClient {
         cancel_get_transfer_inner(self, handle, py).into_py_object(py)
     }
 
+    /// Plan one generation-fenced Get prefix without allocating a destination.
+    #[pyo3(signature = (keys, prefix_best_effort=true, atomic_group_lens=None))]
+    fn get_plan(
+        &self,
+        keys: Vec<String>,
+        prefix_best_effort: bool,
+        atomic_group_lens: Option<Vec<usize>>,
+        py: Python,
+    ) -> PyObject {
+        fn get_plan_inner(
+            client: &KvClient,
+            keys: Vec<String>,
+            prefix_best_effort: bool,
+            atomic_group_lens: Option<Vec<usize>>,
+            py: Python,
+        ) -> ApiResult<PyObject> {
+            if keys.is_empty() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "get_plan requires at least one key",
+                ));
+            }
+            let framework = match require_kv_framework_api(client, py) {
+                Ok(value) => value,
+                Err(err) => return ApiResult::new_error(err),
+            };
+            if !framework.is_external_mode() {
+                return ApiResult::new_error(new_invalid_argument_error(
+                    py,
+                    "get_plan is supported only in external-client mode",
+                ));
+            }
+            let Some(runtime) = client.runtime.as_ref() else {
+                return ApiResult::new_error(new_general_error(py, "Client runtime is missing"));
+            };
+            let framework_for_plan = framework.clone();
+            let result = match py.allow_threads(|| {
+                runtime.run_async_from_sync(async move {
+                    framework_for_plan
+                        .external_client_api_view()
+                        .external_client_api()
+                        .inner()
+                        .get_plan(keys, prefix_best_effort, atomic_group_lens)
+                        .await
+                })
+            }) {
+                Ok(result) => result,
+                Err(err) => {
+                    return ApiResult::new_error(new_general_error(
+                        py,
+                        &format!("runtime bridge failed: {err}"),
+                    ));
+                }
+            };
+            match result {
+                Ok(plan) => {
+                    let out = PyDict::new_bound(py);
+                    out.set_item("handle", plan.handle).expect("set handle");
+                    out.set_item("raw_prefix_hit_len", plan.raw_prefix_hit_len as u64)
+                        .expect("set raw_prefix_hit_len");
+                    out.set_item("gpu_raw_prefix_hit_len", plan.gpu_raw_prefix_hit_len as u64)
+                        .expect("set gpu_raw_prefix_hit_len");
+                    out.set_item("gpu_remote_indices", plan.gpu_remote_indices)
+                        .expect("set gpu_remote_indices");
+                    ApiResult::new_success(out.into_py(py))
+                }
+                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                    py,
+                    &err,
+                    "get_plan failed",
+                )),
+            }
+        }
+
+        get_plan_inner(self, keys, prefix_best_effort, atomic_group_lens, py).into_py_object(py)
+    }
+
+    #[pyo3(signature = (handle, consume_prefix_len, concurrency=None))]
+    fn execute_get_plan_cpu(
+        &self,
+        handle: u64,
+        consume_prefix_len: usize,
+        concurrency: Option<usize>,
+        py: Python,
+    ) -> PyObject {
+        let batch_concurrency = concurrency.unwrap_or(DEFAULT_PYO3_BATCH_CONCURRENCY);
+        let framework = match require_kv_framework_api(self, py) {
+            Ok(value) => value,
+            Err(err) => return ApiResult::<PyObject>::new_error(err).into_py_object(py),
+        };
+        if !framework.is_external_mode() || batch_concurrency == 0 {
+            return ApiResult::<PyObject>::new_error(new_invalid_argument_error(
+                py,
+                "execute_get_plan_cpu requires external mode and positive concurrency",
+            ))
+            .into_py_object(py);
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return ApiResult::<PyObject>::new_error(new_general_error(
+                py,
+                "Client runtime is missing",
+            ))
+            .into_py_object(py);
+        };
+        let framework_for_execute = framework.clone();
+        let result = py.allow_threads(|| {
+            runtime.run_async_from_sync(async move {
+                framework_for_execute
+                    .external_client_api_view()
+                    .external_client_api()
+                    .inner()
+                    .execute_get_plan_cpu(handle, consume_prefix_len, batch_concurrency)
+                    .await
+            })
+        });
+        match result {
+            Ok(Ok(())) => ApiResult::new_success(0i32.into_py(py)),
+            Ok(Err(err)) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                py,
+                &err,
+                "execute_get_plan_cpu failed",
+            )),
+            Err(err) => ApiResult::new_error(new_general_error(
+                py,
+                &format!("runtime bridge failed: {err}"),
+            )),
+        }
+        .into_py_object(py)
+    }
+
+    #[pyo3(signature = (handle, destinations, consume_prefix_len, concurrency=None))]
+    fn execute_get_plan_gpu(
+        &self,
+        handle: u64,
+        destinations: Vec<(u64, u64, u64)>,
+        consume_prefix_len: usize,
+        concurrency: Option<usize>,
+        py: Python,
+    ) -> PyObject {
+        let batch_concurrency = concurrency.unwrap_or(DEFAULT_PYO3_BATCH_CONCURRENCY);
+        let framework = match require_kv_framework_api(self, py) {
+            Ok(value) => value,
+            Err(err) => return ApiResult::<PyObject>::new_error(err).into_py_object(py),
+        };
+        if !framework.is_external_mode() || batch_concurrency == 0 {
+            return ApiResult::<PyObject>::new_error(new_invalid_argument_error(
+                py,
+                "execute_get_plan_gpu requires external mode and positive concurrency",
+            ))
+            .into_py_object(py);
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return ApiResult::<PyObject>::new_error(new_general_error(
+                py,
+                "Client runtime is missing",
+            ))
+            .into_py_object(py);
+        };
+        let destinations = destinations
+            .into_iter()
+            .map(|(registration_id, addr, capacity)| {
+                fluxon_kv::external_client_api::ExternalGpuDestination {
+                    registration_id,
+                    addr,
+                    capacity,
+                }
+            })
+            .collect();
+        let framework_for_execute = framework.clone();
+        let result = py.allow_threads(|| {
+            runtime.run_async_from_sync(async move {
+                framework_for_execute
+                    .external_client_api_view()
+                    .external_client_api()
+                    .inner()
+                    .execute_get_plan_gpu(
+                        handle,
+                        destinations,
+                        consume_prefix_len,
+                        batch_concurrency,
+                    )
+                    .await
+            })
+        });
+        match result {
+            Ok(Ok(())) => ApiResult::new_success(0i32.into_py(py)),
+            Ok(Err(err)) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                py,
+                &err,
+                "execute_get_plan_gpu failed",
+            )),
+            Err(err) => ApiResult::new_error(new_general_error(
+                py,
+                &format!("runtime bridge failed: {err}"),
+            )),
+        }
+        .into_py_object(py)
+    }
+
+    #[pyo3(signature = (handle))]
+    fn cancel_get_plan(&self, handle: u64, py: Python) -> PyObject {
+        let framework = match require_kv_framework_api(self, py) {
+            Ok(value) => value,
+            Err(err) => return ApiResult::<PyObject>::new_error(err).into_py_object(py),
+        };
+        let Some(runtime) = self.runtime.as_ref() else {
+            return ApiResult::<PyObject>::new_error(new_general_error(
+                py,
+                "Client runtime is missing",
+            ))
+            .into_py_object(py);
+        };
+        let framework_for_cancel = framework.clone();
+        let result = py.allow_threads(|| {
+            runtime.run_async_from_sync(async move {
+                framework_for_cancel
+                    .external_client_api_view()
+                    .external_client_api()
+                    .inner()
+                    .cancel_get_plan(handle)
+                    .await
+            })
+        });
+        match result {
+            Ok(Ok(())) => ApiResult::new_success(0i32.into_py(py)),
+            Ok(Err(err)) => ApiResult::new_error(crate::error::py_error_from_kv_error(
+                py,
+                &err,
+                "cancel_get_plan failed",
+            )),
+            Err(err) => ApiResult::new_error(new_general_error(
+                py,
+                &format!("runtime bridge failed: {err}"),
+            )),
+        }
+        .into_py_object(py)
+    }
+
     /// Start background RDMA pulls directly into caller-owned GPU destinations.
     #[pyo3(signature = (keys, destinations, prefix_best_effort=true, atomic_group_lens=None, concurrency=None))]
     fn get_start_gpu(
@@ -4948,6 +5188,30 @@ impl KvClient {
             };
             match result {
                 Ok(terminal) => {
+                    if terminal.value_ptrs.len() != terminal.consumed_prefix_len {
+                        return ApiResult::new_error(new_general_error(
+                            py,
+                            &format!(
+                                "get_transfer_gpu source plan length mismatch: values={} consumed={}",
+                                terminal.value_ptrs.len(),
+                                terminal.consumed_prefix_len
+                            ),
+                        ));
+                    }
+                    let view_plan = Arc::new(FluxonGetViewsPlan {
+                        blob: build_plan_blob(&terminal.value_ptrs),
+                        _holders: terminal
+                            .local_holders
+                            .into_iter()
+                            .map(|holder| StagedGetViewHolder::External { _holder: holder })
+                            .collect(),
+                    });
+                    let plan_ptr = plan_ptr_from_blob(view_plan.blob.as_ref());
+                    client
+                        .plan_registry
+                        .write()
+                        .expect("plan_registry poisoned")
+                        .insert(plan_ptr, FluxonPlanRegistryEntry::Get(view_plan));
                     let out = PyDict::new_bound(py);
                     out.set_item(
                         "transferred_prefix_len",
@@ -4956,6 +5220,16 @@ impl KvClient {
                     .expect("set transferred_prefix_len");
                     out.set_item("consumed_prefix_len", terminal.consumed_prefix_len as u64)
                         .expect("set consumed_prefix_len");
+                    out.set_item("transfer_wall_us", terminal.transfer_wall_us)
+                        .expect("set transfer_wall_us");
+                    out.set_item("finish_wait_us", terminal.finish_wait_us)
+                        .expect("set finish_wait_us");
+                    out.set_item("terminal_before_consume", terminal.terminal_before_consume)
+                        .expect("set terminal_before_consume");
+                    out.set_item("terminal_to_consume_us", terminal.terminal_to_consume_us)
+                        .expect("set terminal_to_consume_us");
+                    out.set_item("plan_ptr", plan_ptr as u64)
+                        .expect("set plan_ptr");
                     ApiResult::new_success(out.into_py(py))
                 }
                 Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
@@ -7621,6 +7895,7 @@ fn fluxon_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<KvFuture>()?;
     m.add_class::<MemHolder>()?;
     m.add_class::<ExternalMemHolder>()?;
+    m.add_class::<FixedSlabAllocator>()?;
     m.add_class::<FluxonFsAgent>()?;
     m.add_class::<MpscContext>()?;
     m.add_class::<MpscProducerHandle>()?;

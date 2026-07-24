@@ -183,6 +183,143 @@ impl RPCReq for BatchGetStartReq {
     type Resp = BatchGetStartResp;
 }
 
+/// Target-free Get planning. Successful items retain one exact source
+/// generation until Bind, Revoke, or expiry.
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetPlanReq {
+    pub keys: Vec<String>,
+}
+impl MsgPackSerializePart for BatchGetPlanReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchGetPlanReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetPlanItemResp {
+    pub get_id: u64,
+    pub node_id: NodeIDString,
+    pub put_id: PutIDForAKey,
+    pub src_addr: u64,
+    pub src_base_addr: u64,
+    pub len: u64,
+    pub atomic_group: Option<PutAtomicGroup>,
+    /// False when the selected source is the external requester's local
+    /// share-group owner and therefore cannot use the RDMA-only GPU sink.
+    pub gpu_direct_eligible: bool,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetPlanResp {
+    pub items: Vec<BatchGetPlanItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for BatchGetPlanResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchGetPlanResp as u32
+    }
+}
+impl RPCReq for BatchGetPlanReq {
+    type Resp = BatchGetPlanResp;
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub enum GetBindTarget {
+    #[default]
+    Invalid,
+    PreparedLocalReserve(GetPreparedLocalReserveTarget),
+    ExternalSink(GetExternalSinkTarget),
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetBindItemReq {
+    pub get_id: u64,
+    pub target: GetBindTarget,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetBindReq {
+    pub items: Vec<BatchGetBindItemReq>,
+}
+impl MsgPackSerializePart for BatchGetBindReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchGetBindReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetBindResp {
+    pub items: Vec<BatchGetStartItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub server_process_us: i64,
+}
+impl MsgPackSerializePart for BatchGetBindResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchGetBindResp as u32
+    }
+}
+impl RPCReq for BatchGetBindReq {
+    type Resp = BatchGetBindResp;
+}
+
+#[cfg(test)]
+mod planned_get_wire_tests {
+    use super::{
+        BatchGetBindItemReq, BatchGetBindReq, BatchGetPlanItemResp, BatchGetPlanResp,
+        GetBindTarget, GetExternalSinkTarget,
+    };
+    use crate::rpcresp_kvresult_convert::msg_and_error::OK;
+
+    #[test]
+    fn first_get_id_and_late_gpu_binding_round_trip() {
+        let plan = BatchGetPlanResp {
+            items: vec![BatchGetPlanItemResp {
+                get_id: 0,
+                node_id: "source-a".to_string(),
+                src_addr: 0x1000,
+                src_base_addr: 0x800,
+                len: 4096,
+                gpu_direct_eligible: true,
+                error_code: OK,
+                ..Default::default()
+            }],
+            error_code: OK,
+            ..Default::default()
+        };
+        let decoded: BatchGetPlanResp =
+            bitcode::decode(&bitcode::encode(&plan)).expect("decode GetPlan response");
+        assert_eq!(decoded.items[0].get_id, 0);
+        assert!(decoded.items[0].gpu_direct_eligible);
+        assert_eq!(decoded.items[0].src_addr, 0x1000);
+
+        let bind = BatchGetBindReq {
+            items: vec![BatchGetBindItemReq {
+                get_id: 0,
+                target: GetBindTarget::ExternalSink(GetExternalSinkTarget {
+                    addr: 0x2000,
+                    capacity: 4096,
+                    registration_id: 7,
+                    requester_node_start_time: 11,
+                }),
+            }],
+        };
+        let decoded: BatchGetBindReq =
+            bitcode::decode(&bitcode::encode(&bind)).expect("decode GetBind request");
+        assert!(matches!(
+            &decoded.items[0].target,
+            GetBindTarget::ExternalSink(target)
+                if decoded.items[0].get_id == 0
+                    && target.registration_id == 7
+                    && target.requester_node_start_time == 11
+        ));
+    }
+}
+
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct BatchGetRevokeReq {
     pub get_ids: Vec<u64>,
