@@ -86,8 +86,8 @@ use cluster_manager::{
 };
 use config::{
     ClientConfig, ClientConfigYaml, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig,
-    MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole, TestSpecConfig,
-    TestSpecTransportMode, TransferEngineType, normalize_etcd_addresses,
+    MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole, TcpThreadReactorWaitMode,
+    TestSpecConfig, TestSpecTransportMode, TransferEngineType, normalize_etcd_addresses,
 };
 use external_client_api::{ExternalClientApi, ExternalClientApiNewArg};
 use fluxon_commu::TransferBackendActivationMode;
@@ -101,7 +101,9 @@ use metric_reporter::{
     register_greptime_otlp_log_proxy_rpc, serialize_master_observe_broadcast,
     wait_master_observe_broadcast,
 };
-use p2p::p2p_module::{P2pModule, P2pModuleNewArg, P2pTcpThreadTransportTuning};
+use p2p::p2p_module::{
+    P2pModule, P2pModuleNewArg, P2pTcpThreadReactorWaitMode, P2pTcpThreadTransportTuning,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -611,11 +613,16 @@ fn find_default_config_file() -> Option<PathBuf> {
     None
 }
 
-fn tcp_thread_transport_tuning_from_test_spec_config(
+fn tcp_thread_transport_tuning_from_config(
+    protocol_config: &ProtocolConfig,
     test_spec_config: &TestSpecConfig,
 ) -> P2pTcpThreadTransportTuning {
     P2pTcpThreadTransportTuning {
         reactor_shard_count: test_spec_config.tcp_thread_reactor_shard_count,
+        reactor_wait_mode: match protocol_config.tcp_thread_reactor {
+            TcpThreadReactorWaitMode::BusyPoll => P2pTcpThreadReactorWaitMode::BusyPoll,
+            TcpThreadReactorWaitMode::EventDriven => P2pTcpThreadReactorWaitMode::EventDriven,
+        },
         bulk_lane_count: test_spec_config.tcp_thread_bulk_lane_count,
         control_lane_count: test_spec_config.tcp_thread_control_lane_count,
     }
@@ -811,6 +818,7 @@ fn build_side_transfer_worker_config(
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
             rdma_device_names: None,
+            tcp_thread_reactor: owner_config.protocol.tcp_thread_reactor,
         },
         pprof_duration_seconds: owner_config.pprof_duration_seconds,
         redis_compat_listen_addr: None,
@@ -1513,7 +1521,7 @@ async fn run_master_impl(
         },
         p2p_arg: P2pModuleNewArg::new(
             config.port,
-            tcp_thread_transport_tuning_from_test_spec_config(&config.test_spec_config),
+            tcp_thread_transport_tuning_from_config(&config.protocol, &config.test_spec_config),
             config.test_spec_config.disable_crossowner_ipc,
             config.test_spec_config.iceoryx_external_busy_poll,
         )
@@ -2033,7 +2041,7 @@ async fn run_client_impl(
             },
             p2p_arg: P2pModuleNewArg::new(
                 config.fluxonkv_spec.p2p_listen_port,
-                tcp_thread_transport_tuning_from_test_spec_config(&config.test_spec_config),
+                tcp_thread_transport_tuning_from_config(&config.protocol, &config.test_spec_config),
                 config.test_spec_config.disable_crossowner_ipc,
                 config.test_spec_config.iceoryx_external_busy_poll,
             )
@@ -2108,7 +2116,7 @@ async fn run_client_impl(
             },
             p2p_arg: P2pModuleNewArg::new(
                 config.fluxonkv_spec.p2p_listen_port,
-                tcp_thread_transport_tuning_from_test_spec_config(&config.test_spec_config),
+                tcp_thread_transport_tuning_from_config(&config.protocol, &config.test_spec_config),
                 config.test_spec_config.disable_crossowner_ipc,
                 config.test_spec_config.iceoryx_external_busy_poll,
             )
@@ -2543,6 +2551,7 @@ mod tests {
             protocol: ProtocolConfig {
                 protocol_type: ProtocolType::Tcp,
                 rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             },
             pprof_duration_seconds: None,
             redis_compat_listen_addr: None,
@@ -2579,6 +2588,7 @@ mod tests {
                 &ProtocolConfig {
                     protocol_type: ProtocolType::Tcp,
                     rdma_device_names: None,
+                    tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
                 },
                 Some(&cfg),
             ),
@@ -2598,6 +2608,7 @@ mod tests {
                 &ProtocolConfig {
                     protocol_type: ProtocolType::Rdma,
                     rdma_device_names: None,
+                    tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
                 },
                 Some(&cfg),
             ),
@@ -2685,6 +2696,7 @@ mod tests {
         let protocol = ProtocolConfig {
             protocol_type: ProtocolType::Rdma,
             rdma_device_names: Some("mlx5_9:1".to_string()),
+            tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
         };
         let cfg = TestSpecConfig {
             rdma_device_names: Some(vec!["mlx5_1".to_string(), "mlx5_0".to_string()]),
@@ -2702,6 +2714,7 @@ mod tests {
         owner_cfg.protocol = ProtocolConfig {
             protocol_type: ProtocolType::Rdma,
             rdma_device_names: Some("mlx5_2:1".to_string()),
+            tcp_thread_reactor: TcpThreadReactorWaitMode::EventDriven,
         };
         owner_cfg.fluxonkv_spec.transfer_engine = TransferEngineType::Closed;
         owner_cfg.fluxonkv_spec.enable_transfer_rpc_fast_path = true;
@@ -2724,6 +2737,10 @@ mod tests {
         );
         assert!(!side_cfg.fluxonkv_spec.enable_transfer_rpc_fast_path);
         assert_eq!(
+            side_cfg.protocol.tcp_thread_reactor,
+            TcpThreadReactorWaitMode::EventDriven
+        );
+        assert_eq!(
             side_cfg.test_spec_config.side_transfer_role,
             Some(SideTransferRole::Worker)
         );
@@ -2736,6 +2753,35 @@ mod tests {
         assert_eq!(side_cfg.test_spec_config.rdma_device_names, None);
         assert!(side_cfg.test_spec_config.enable_side_transfer);
         assert!(!side_cfg.test_spec_config.disable_local_ipc);
+    }
+
+    #[test]
+    fn tcp_thread_reactor_maps_to_p2p_tuning() {
+        let default_tuning = tcp_thread_transport_tuning_from_config(
+            &ProtocolConfig {
+                protocol_type: ProtocolType::Tcp,
+                rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::BusyPoll,
+            },
+            &TestSpecConfig::default(),
+        );
+        assert_eq!(
+            default_tuning.reactor_wait_mode,
+            P2pTcpThreadReactorWaitMode::BusyPoll
+        );
+
+        let event_driven_tuning = tcp_thread_transport_tuning_from_config(
+            &ProtocolConfig {
+                protocol_type: ProtocolType::Tcp,
+                rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::EventDriven,
+            },
+            &TestSpecConfig::default(),
+        );
+        assert_eq!(
+            event_driven_tuning.reactor_wait_mode,
+            P2pTcpThreadReactorWaitMode::EventDriven
+        );
     }
 
     #[test]
@@ -2790,6 +2836,7 @@ mod tests {
             Some(ProtocolConfig {
                 protocol_type: ProtocolType::Tcp,
                 rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             })
         );
         assert!(side_cfg_yaml.contribute_to_cluster_pool_size.is_none());
@@ -2851,6 +2898,7 @@ mod tests {
             protocol: ProtocolConfig {
                 protocol_type: ProtocolType::Tcp,
                 rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             },
             pprof_duration_seconds: None,
             redis_compat_listen_addr: None,

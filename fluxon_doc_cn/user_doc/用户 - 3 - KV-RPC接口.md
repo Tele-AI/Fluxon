@@ -609,3 +609,27 @@ fluxonkv_spec:
 - `FLUXON_LOG`：用户 Python 进程 console log 的门限，不写时默认 `INFO`
 
 zero-contribution external 模式下有一个硬约束：`fluxonkv_spec.etcd_addresses`、`fluxonkv_spec.sub_cluster`、`fluxonkv_spec.large_file_paths`、`fluxonkv_spec.redis_compat` 这类 owner 侧字段不应出现。
+
+#### 3) TCP thread reactor 等待模式
+
+`tcp_thread_reactor` 控制当前进程中 `tcpthr_reactor_*` 线程的等待方式。字段位于
+`protocol` 配置块；不配置时默认使用 `busy_poll`，需要降低空闲 CPU 占用时可以显式选择
+`event_driven`：
+
+```yaml
+protocol:
+  protocol_type: rdma
+  tcp_thread_reactor: event_driven
+```
+
+| 取值 | 行为与取舍 |
+| --- | --- |
+| `busy_poll`（默认） | reactor 在热窗口内使用零超时 poll，减少唤醒和调度延迟，但会占用更多 CPU。 |
+| `event_driven` | reactor 通过 `mio::Poll` 阻塞等待 socket readiness，并由 `mio::Waker` 响应新命令和发送任务；空闲 CPU 更低，但可能增加少量唤醒和调度延迟。 |
+
+该配置是进程级设置，同一进程内的全部 `tcp_thread` P2P 连接共用一个等待模式，不能分别为
+FS RPC 和 KV RPC 选择不同模式。该配置只控制当前进程的 TCP reactor；通信对端使用哪种
+等待模式不受影响。
+
+连接控制和其他 async 工作仍由 Tokio runtime 执行；握手后的主要 TCP 数据面仍由专用
+`tcpthr_reactor_*` OS 线程处理。

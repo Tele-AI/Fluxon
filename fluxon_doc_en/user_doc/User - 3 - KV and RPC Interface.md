@@ -384,3 +384,27 @@ Keep these roots separate:
 - `FLUXON_LOG`: console log threshold for the user process
 
 In zero-contribution external mode, `Owner Client`-only fields such as `fluxonkv_spec.etcd_addresses`, `fluxonkv_spec.sub_cluster`, `fluxonkv_spec.large_file_paths`, and `fluxonkv_spec.redis_compat` should not appear.
+
+#### TCP thread reactor wait mode
+
+`tcp_thread_reactor` controls how the current process's `tcpthr_reactor_*` threads wait
+for work. The field belongs under the `protocol` configuration block. It defaults to `busy_poll`; select
+`event_driven` explicitly when reducing idle CPU usage is more important:
+
+```yaml
+protocol:
+  protocol_type: rdma
+  tcp_thread_reactor: event_driven
+```
+
+| Value | Behavior and tradeoff |
+| --- | --- |
+| `busy_poll` (default) | Uses zero-timeout polling during the hot window. This reduces wake-up and scheduling latency but consumes more CPU. |
+| `event_driven` | Blocks in `mio::Poll` for socket readiness and uses `mio::Waker` for new commands and send work. This lowers idle CPU usage but may add a small amount of wake-up and scheduling latency. |
+
+This is a process-level setting. All `tcp_thread` P2P connections in one process share the same
+wait mode, so FS RPC and KV RPC cannot select different modes inside that process. The setting
+controls only the local TCP reactor; the communication peer's wait mode is unaffected.
+
+Connection control and other async work continue to run on the Tokio runtime. After the handshake,
+the primary TCP data path continues to run on dedicated `tcpthr_reactor_*` OS threads.

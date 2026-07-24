@@ -106,6 +106,19 @@ pub enum SideTransferRole {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum TcpThreadReactorWaitMode {
+    BusyPoll,
+    EventDriven,
+}
+
+impl Default for TcpThreadReactorWaitMode {
+    fn default() -> Self {
+        Self::BusyPoll
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum KvSsdUringMode {
     SingleBuffer,
     Iovec,
@@ -666,6 +679,8 @@ pub struct ProtocolConfig {
     pub protocol_type: ProtocolType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rdma_device_names: Option<String>,
+    #[serde(default)]
+    pub tcp_thread_reactor: TcpThreadReactorWaitMode,
 }
 
 /// Validated cluster pool size contribution
@@ -1270,6 +1285,7 @@ impl ClientConfigYaml {
             self.protocol.unwrap_or(ProtocolConfig {
                 protocol_type: ProtocolType::Rdma,
                 rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             }),
             normalized_rdma_device_names.as_ref(),
         );
@@ -1780,6 +1796,7 @@ impl MasterConfigYaml {
             self.protocol.unwrap_or(ProtocolConfig {
                 protocol_type: ProtocolType::Rdma,
                 rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             }),
             normalized_rdma_device_names.as_ref(),
         );
@@ -1839,6 +1856,9 @@ fluxonkv_spec:
   share_mem_path: /tmp/test_owner
   large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
+protocol:
+  protocol_type: rdma
+  tcp_thread_reactor: busy_poll
 test_spec_config:
   disable_observability: true
   enable_iceoryx_logs: true
@@ -1855,6 +1875,10 @@ test_spec_config:
         assert!(verified.test_spec_config.enable_iceoryx_logs);
         assert!(verified.test_spec_config.iceoryx_external_busy_poll);
         assert!(!verified.test_spec_config.iceoryx_owner_client_busy_poll);
+        assert_eq!(
+            verified.protocol.tcp_thread_reactor,
+            TcpThreadReactorWaitMode::BusyPoll
+        );
         assert_eq!(verified.share_mem_path, "/tmp/test_owner/test_cluster");
         assert_eq!(
             verified.test_spec_config.transport_mode,
@@ -1889,7 +1913,27 @@ fluxonkv_spec:
             verified.test_spec_config.transport_mode,
             Some(TestSpecTransportMode::TransferWithRpc)
         );
+        assert_eq!(
+            verified.protocol.tcp_thread_reactor,
+            TcpThreadReactorWaitMode::BusyPoll
+        );
         assert!(verified.fluxonkv_spec.enable_transfer_rpc_fast_path);
+    }
+
+    #[test]
+    fn client_config_rejects_reactor_under_test_spec_config() {
+        let err = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_external
+fluxonkv_spec:
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_external
+test_spec_config:
+  tcp_thread_reactor: event_driven
+"#,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("unknown field `tcp_thread_reactor`"));
     }
 
     #[test]
@@ -2713,6 +2757,9 @@ network:
 monitoring:
   prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
 log_dir: /tmp/test_master_logs
+protocol:
+  protocol_type: rdma
+  tcp_thread_reactor: event_driven
 test_spec_config:
   disable_prefix_index: true
   disable_crossowner_ipc: true
@@ -2726,6 +2773,10 @@ test_spec_config:
         assert!(verified.test_spec_config.disable_prefix_index);
         assert!(verified.test_spec_config.disable_crossowner_ipc);
         assert!(!verified.test_spec_config.iceoryx_owner_client_busy_poll);
+        assert_eq!(
+            verified.protocol.tcp_thread_reactor,
+            TcpThreadReactorWaitMode::EventDriven
+        );
         assert_eq!(
             verified.test_spec_config.transport_mode,
             Some(TestSpecTransportMode::TransferWithRpc)

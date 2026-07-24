@@ -744,6 +744,15 @@ pub struct ClosedRuntimeDesiredTransferPeer {
     pub enable_transfer_segment: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum ClosedRuntimeLocalMemoryKind {
+    Host,
+    Gpu { device_id: u32 },
+}
+
+pub const CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER: &str =
+    "fluxon_direct_fast_path_not_ready";
+
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum ClosedRuntimeTransferEngineCall {
     Init2ForInitDag {
@@ -764,10 +773,12 @@ pub enum ClosedRuntimeTransferEngineCall {
     RegisterLocalSegment {
         allocated_addr: u64,
         allocated_size: u64,
+        memory_kind: ClosedRuntimeLocalMemoryKind,
     },
     UnregisterLocalSegment {
         allocated_addr: u64,
         allocated_size: u64,
+        memory_kind: ClosedRuntimeLocalMemoryKind,
     },
     TransferDataNoCopy {
         peer_node: Option<String>,
@@ -776,6 +787,7 @@ pub enum ClosedRuntimeTransferEngineCall {
         target_addr: u64,
         len: u64,
         initial_local_segment_guard_handle: Option<u64>,
+        require_fast_path: bool,
     },
     TrySendWireDirect {
         peer_gen: ClosedRuntimePeerGen,

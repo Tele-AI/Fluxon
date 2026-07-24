@@ -125,8 +125,16 @@ pub struct TierSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub enum P2pTcpThreadReactorWaitMode {
+    #[default]
+    BusyPoll,
+    EventDriven,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct P2pTcpThreadTransportTuning {
     pub reactor_shard_count: Option<u8>,
+    pub reactor_wait_mode: P2pTcpThreadReactorWaitMode,
     pub bulk_lane_count: Option<u8>,
     pub control_lane_count: Option<u8>,
 }
