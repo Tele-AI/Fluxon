@@ -387,13 +387,14 @@ In zero-contribution external mode, `Owner Client`-only fields such as `fluxonkv
 
 #### TCP thread reactor wait mode
 
-`tcp_thread_reactor_wait_mode` controls how the current process's `tcpthr_reactor_*` threads wait
-for work. The field belongs under `test_spec_config`. It defaults to `busy_poll`; select
+`tcp_thread_reactor` controls how the current process's `tcpthr_reactor_*` threads wait
+for work. The field belongs under the `protocol` configuration block. It defaults to `busy_poll`; select
 `event_driven` explicitly when reducing idle CPU usage is more important:
 
 ```yaml
-test_spec_config:
-  tcp_thread_reactor_wait_mode: event_driven
+protocol:
+  protocol_type: rdma
+  tcp_thread_reactor: event_driven
 ```
 
 | Value | Behavior and tradeoff |

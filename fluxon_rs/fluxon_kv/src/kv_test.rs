@@ -861,6 +861,7 @@ fn tcp_protocol_config() -> ProtocolConfig {
     ProtocolConfig {
         protocol_type: ProtocolType::Tcp,
         rdma_device_names: None,
+        tcp_thread_reactor: Default::default(),
     }
 }
 
@@ -868,6 +869,7 @@ fn rdma_protocol_config(device_names: &[String]) -> ProtocolConfig {
     ProtocolConfig {
         protocol_type: ProtocolType::Rdma,
         rdma_device_names: Some(device_names.join(",")),
+        tcp_thread_reactor: Default::default(),
     }
 }
 

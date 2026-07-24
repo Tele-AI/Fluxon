@@ -544,7 +544,10 @@ def test_fluxonkv_test_spec_config():
         rdma_devices["test_spec_config"]["iceoryx_external_busy_poll"] = True
         rdma_devices["test_spec_config"]["iceoryx_owner_client_busy_poll"] = True
         rdma_devices["test_spec_config"]["tcp_thread_reactor_shard_count"] = 2
-        rdma_devices["test_spec_config"]["tcp_thread_reactor_wait_mode"] = "event_driven"
+        rdma_devices["protocol"] = {
+            "protocol_type": "rdma",
+            "tcp_thread_reactor": "event_driven",
+        }
         rdma_devices["test_spec_config"]["tcp_thread_bulk_lane_count"] = 4
         rdma_devices["test_spec_config"]["tcp_thread_control_lane_count"] = 3
         rdma_devices["test_spec_config"][
@@ -559,7 +562,7 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["iceoryx_owner_client_busy_poll"] is True
         assert loaded["test_spec_config"]["rdma_device_names"] == ["mlx5_0", "mlx5_4"]
         assert loaded["test_spec_config"]["tcp_thread_reactor_shard_count"] == 2
-        assert loaded["test_spec_config"]["tcp_thread_reactor_wait_mode"] == "event_driven"
+        assert loaded["protocol"]["tcp_thread_reactor"] == "event_driven"
         assert loaded["test_spec_config"]["tcp_thread_bulk_lane_count"] == 4
         assert loaded["test_spec_config"]["tcp_thread_control_lane_count"] == 3
         assert (
@@ -578,20 +581,63 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["disable_observability"] is True
         assert loaded["test_spec_config"]["enable_iceoryx_logs"] is True
         assert "transport_mode" not in loaded["test_spec_config"]
-        assert "tcp_thread_reactor_wait_mode" not in loaded["test_spec_config"]
+        assert "tcp_thread_reactor" not in loaded["test_spec_config"]
+        assert "protocol" not in loaded
 
         busy_poll = copy.deepcopy(implicit_transport)
-        busy_poll["test_spec_config"]["tcp_thread_reactor_wait_mode"] = "busy_poll"
+        busy_poll["protocol"] = {
+            "protocol_type": "rdma",
+            "tcp_thread_reactor": "busy_poll",
+        }
         config = FluxonKvClientConfig(busy_poll)
         loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
-        assert loaded["test_spec_config"]["tcp_thread_reactor_wait_mode"] == "busy_poll"
+        assert loaded["protocol"]["tcp_thread_reactor"] == "busy_poll"
 
         invalid_wait_mode = copy.deepcopy(implicit_transport)
-        invalid_wait_mode["test_spec_config"]["tcp_thread_reactor_wait_mode"] = "epoll"
+        invalid_wait_mode["protocol"] = {
+            "protocol_type": "rdma",
+            "tcp_thread_reactor": "epoll",
+        }
         try:
             FluxonKvClientConfig(invalid_wait_mode)
             print(
-                "❌ FAIL: test_fluxonkv_test_spec_config - invalid tcp_thread_reactor_wait_mode should be rejected"
+                "❌ FAIL: test_fluxonkv_test_spec_config - invalid tcp_thread_reactor should be rejected"
+            )
+            return
+        except ValueError:
+            pass
+
+        legacy_wait_mode = copy.deepcopy(implicit_transport)
+        legacy_wait_mode["test_spec_config"]["tcp_thread_reactor"] = "event_driven"
+        try:
+            FluxonKvClientConfig(legacy_wait_mode)
+            print(
+                "❌ FAIL: test_fluxonkv_test_spec_config - test_spec_config wait mode should be rejected"
+            )
+            return
+        except ValueError:
+            pass
+
+        legacy_p2p = copy.deepcopy(implicit_transport)
+        legacy_p2p["p2p"] = {"tcp_thread_reactor_wait_mode": "event_driven"}
+        try:
+            FluxonKvClientConfig(legacy_p2p)
+            print(
+                "❌ FAIL: test_fluxonkv_test_spec_config - legacy p2p reactor config should be rejected"
+            )
+            return
+        except ValueError:
+            pass
+
+        legacy_field_name = copy.deepcopy(implicit_transport)
+        legacy_field_name["protocol"] = {
+            "protocol_type": "rdma",
+            "tcp_thread_reactor_wait_mode": "event_driven",
+        }
+        try:
+            FluxonKvClientConfig(legacy_field_name)
+            print(
+                "❌ FAIL: test_fluxonkv_test_spec_config - legacy reactor field name should be rejected"
             )
             return
         except ValueError:

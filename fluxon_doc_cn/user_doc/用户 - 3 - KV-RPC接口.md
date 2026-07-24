@@ -612,13 +612,14 @@ zero-contribution external 模式下有一个硬约束：`fluxonkv_spec.etcd_add
 
 #### 3) TCP thread reactor 等待模式
 
-`tcp_thread_reactor_wait_mode` 控制当前进程中 `tcpthr_reactor_*` 线程的等待方式。字段位于
-`test_spec_config`；不配置时默认使用 `busy_poll`，需要降低空闲 CPU 占用时可以显式选择
+`tcp_thread_reactor` 控制当前进程中 `tcpthr_reactor_*` 线程的等待方式。字段位于
+`protocol` 配置块；不配置时默认使用 `busy_poll`，需要降低空闲 CPU 占用时可以显式选择
 `event_driven`：
 
 ```yaml
-test_spec_config:
-  tcp_thread_reactor_wait_mode: event_driven
+protocol:
+  protocol_type: rdma
+  tcp_thread_reactor: event_driven
 ```
 
 | 取值 | 行为与取舍 |
