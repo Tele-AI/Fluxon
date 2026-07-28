@@ -152,6 +152,7 @@ fn new_client_config_with_cluster_and_dram(
         large_file_paths: crate::config::LargeFilePaths {
             paths: vec![format!("{}/large/{}", base, instance_key)],
         },
+        ssd_storage: None,
         test_spec_config: TestSpecConfig::default(),
     };
     println!("fluxonkv core created client config for test: {:?}", conf);
@@ -221,6 +222,35 @@ pub async fn start_master_and_client_with_client_dram(
     .expect("start client");
 
     // Give a short grace for modules to finish init and connect
+    sleep(Duration::from_secs(3)).await;
+    (master_fw, client_fw)
+}
+
+/// Start a test owner after applying one focused configuration mutation. This
+/// keeps integration tests on the same canonical startup path while allowing
+/// storage-tier tests to enable their local SSD root explicitly.
+pub async fn start_master_and_client_with_client_config(
+    master_key: &str,
+    client_key: &str,
+    configure: impl FnOnce(&mut ClientConfig),
+) -> (Arc<Framework>, Arc<Framework>) {
+    let cluster_name = test_cluster_name(master_key);
+    clean_etcd_members(&cluster_name).await;
+
+    let (master_fw, _) = run_master(ConfigArg::Config(new_master_config_with_cluster(
+        master_key,
+        None,
+        &cluster_name,
+    )))
+    .await
+    .expect("start master");
+    let mut client_config =
+        new_client_config_with_cluster_and_dram(client_key, &cluster_name, 1024 * 1024 * 160);
+    configure(&mut client_config);
+    let (client_fw, _) = run_client(ConfigArg::Config(client_config))
+        .await
+        .expect("start client");
+
     sleep(Duration::from_secs(3)).await;
     (master_fw, client_fw)
 }

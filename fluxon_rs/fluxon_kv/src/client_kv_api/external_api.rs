@@ -1298,6 +1298,7 @@ mod external_get_start_batch_tests {
                 external_pending_puts: 0,
                 external_put: None,
                 remote_put: None,
+                local_ssd_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: Some(old.clone()),
@@ -1329,6 +1330,7 @@ mod external_get_start_batch_tests {
                 external_pending_puts: 0,
                 external_put: None,
                 remote_put: None,
+                local_ssd_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: Some(op.clone()),
@@ -3586,7 +3588,8 @@ impl HandlerForExternalClient for ClientKvApi {
                     remote_offset
                 },
                 len: req.len,
-                make_replica_task: req.make_replica_task && replica_admitted,
+                make_replica_task: req.make_replica_task,
+                remote_replica_admitted: replica_admitted,
                 preferred_sub_cluster: req.preferred_sub_cluster.clone(),
                 local_reserve_slot: None,
                 local_reserve_slot_size: None,
@@ -3838,6 +3841,7 @@ impl HandlerForExternalClient for ClientKvApi {
                     target_offset: src_offset,
                     len: req_item.len,
                     make_replica_task: req_item.make_replica_task,
+                    remote_replica_admitted: true,
                     preferred_sub_cluster: req_item.preferred_sub_cluster.clone(),
                     local_reserve_slot: Some(slot_ref.clone()),
                     local_reserve_slot_size: Some(slot_size),
@@ -3916,7 +3920,8 @@ impl HandlerForExternalClient for ClientKvApi {
                 return Ok(ExternalPutTransferEndResp::from_error(&err));
             }
         };
-        let admitted_replica_task = pending_ctx.make_replica_task;
+        let admitted_replica_task =
+            pending_ctx.make_replica_task && pending_ctx.remote_replica_admitted;
         let self_node_id = inner.view.cluster_manager().get_self_info().id.clone();
         let req_remote_target = req
             .peer_id
@@ -4053,6 +4058,13 @@ impl HandlerForExternalClient for ClientKvApi {
         inner
             .external_pending_puts
             .invalidate(&(req.key.clone(), put_id.0, put_id.1));
+        if pending_ctx.make_replica_task {
+            inner.start_early_owner_local_ssd_put(
+                &req.key,
+                put_id,
+                u64::from(local_cache_publish.len),
+            );
+        }
         if admitted_replica_task {
             if let Err(err) = inner
                 .ensure_remote_put(
@@ -4125,6 +4137,7 @@ impl HandlerForExternalClient for ClientKvApi {
             put_locality: Option<(bool, i64)>,
             local_cache_publish: LocalCommittedCachePublish,
             make_replica_task: bool,
+            remote_replica_admitted: bool,
             // Keep the per-key reclaim fence alive until the master's terminal
             // response has been applied to the owner-local index.
             _pending_ctx: ExternalPendingPutCtx,
@@ -4214,6 +4227,7 @@ impl HandlerForExternalClient for ClientKvApi {
                             lease_id: item.lease_id,
                             committed_slot,
                             make_replica_task: pending_ctx.make_replica_task,
+                            remote_replica_admitted: pending_ctx.remote_replica_admitted,
                             preferred_sub_cluster: pending_ctx.preferred_sub_cluster.clone(),
                             atomic_group: pending_ctx.atomic_group.clone(),
                         });
@@ -4288,6 +4302,7 @@ impl HandlerForExternalClient for ClientKvApi {
                 put_locality: Some((false, 0)),
                 local_cache_publish,
                 make_replica_task: pending_ctx.make_replica_task,
+                remote_replica_admitted: pending_ctx.remote_replica_admitted,
                 _pending_ctx: pending_ctx,
             });
         }
@@ -4380,6 +4395,8 @@ impl HandlerForExternalClient for ClientKvApi {
             }));
         }
 
+        let mut early_ssd_candidates = Vec::new();
+        let mut remote_replica_pending = Vec::new();
         for (pending, done_item) in done_pending.into_iter().zip(done_resp.items.into_iter()) {
             if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
                 done_item.error_code,
@@ -4414,28 +4431,39 @@ impl HandlerForExternalClient for ClientKvApi {
                 pending.put_id.1,
             ));
             if pending.make_replica_task {
-                if let Err(err) = inner
-                    .ensure_remote_put(
-                        &pending.key,
-                        pending.put_id,
-                        pending._pending_ctx.preferred_sub_cluster.clone(),
-                        true,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "external_batch_put_transfer_end make replica task failed after local commit: key={} put_id=({},{}) err={}",
-                        pending.key,
-                        pending.put_id.0,
-                        pending.put_id.1,
-                        err
-                    );
-                }
+                early_ssd_candidates.push((
+                    pending.key.clone(),
+                    pending.put_id,
+                    u64::from(pending.local_cache_publish.len),
+                ));
+            }
+            if pending.make_replica_task && pending.remote_replica_admitted {
+                remote_replica_pending.push((
+                    pending.key.clone(),
+                    pending.put_id,
+                    pending._pending_ctx.preferred_sub_cluster.clone(),
+                ));
             }
             results[pending.idx] = Some(ExternalBatchPutTransferEndItemResp {
                 error_code: OK,
                 error_json: String::new(),
             });
+        }
+
+        inner.start_early_owner_local_ssd_puts(early_ssd_candidates);
+        for (key, put_id, preferred_sub_cluster) in remote_replica_pending {
+            if let Err(err) = inner
+                .ensure_remote_put(&key, put_id, preferred_sub_cluster, true)
+                .await
+            {
+                tracing::warn!(
+                    "external_batch_put_transfer_end make replica task failed after local commit: key={} put_id=({},{}) err={}",
+                    key,
+                    put_id.0,
+                    put_id.1,
+                    err
+                );
+            }
         }
 
         Ok(ExternalBatchPutTransferEndResp {
@@ -4512,7 +4540,8 @@ impl HandlerForExternalClient for ClientKvApi {
             }
             return Ok(ExternalPutCommitResp::from_error(&err));
         }
-        let admitted_replica_task = pending_ctx.make_replica_task;
+        let admitted_replica_task =
+            pending_ctx.make_replica_task && pending_ctx.remote_replica_admitted;
 
         let end_started_at = Instant::now();
         let local_cache_publish = match local_committed_cache_publish(
@@ -4587,6 +4616,13 @@ impl HandlerForExternalClient for ClientKvApi {
         inner
             .external_pending_puts
             .invalidate(&(req.key.clone(), put_id.0, put_id.1));
+        if pending_ctx.make_replica_task {
+            inner.start_early_owner_local_ssd_put(
+                &req.key,
+                put_id,
+                u64::from(local_cache_publish.len),
+            );
+        }
         if admitted_replica_task {
             if let Err(err) = inner
                 .ensure_remote_put(
@@ -4650,6 +4686,7 @@ impl HandlerForExternalClient for ClientKvApi {
             lease_id: Option<u64>,
             local_cache_publish: LocalCommittedCachePublish,
             make_replica_task: bool,
+            remote_replica_admitted: bool,
             _pending_ctx: ExternalPendingPutCtx,
         }
 
@@ -4736,6 +4773,7 @@ impl HandlerForExternalClient for ClientKvApi {
                             lease_id: item.lease_id,
                             committed_slot,
                             make_replica_task: pending_ctx.make_replica_task,
+                            remote_replica_admitted: pending_ctx.remote_replica_admitted,
                             preferred_sub_cluster: pending_ctx.preferred_sub_cluster.clone(),
                             atomic_group: pending_ctx.atomic_group.clone(),
                         });
@@ -4804,6 +4842,7 @@ impl HandlerForExternalClient for ClientKvApi {
                 lease_id: item.lease_id,
                 local_cache_publish,
                 make_replica_task: pending_ctx.make_replica_task,
+                remote_replica_admitted: pending_ctx.remote_replica_admitted,
                 _pending_ctx: pending_ctx,
             });
         }
@@ -4893,6 +4932,8 @@ impl HandlerForExternalClient for ClientKvApi {
             }));
         }
 
+        let mut early_ssd_candidates = Vec::new();
+        let mut remote_replica_pending = Vec::new();
         for (pending, done_item) in done_pending.into_iter().zip(done_resp.items.into_iter()) {
             if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
                 done_item.error_code,
@@ -4924,28 +4965,39 @@ impl HandlerForExternalClient for ClientKvApi {
                 pending.put_id.1,
             ));
             if pending.make_replica_task {
-                if let Err(err) = inner
-                    .ensure_remote_put(
-                        &pending.key,
-                        pending.put_id,
-                        pending._pending_ctx.preferred_sub_cluster.clone(),
-                        true,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "external_batch_put_commit make replica task failed after local commit: key={} put_id=({},{}) err={}",
-                        pending.key,
-                        pending.put_id.0,
-                        pending.put_id.1,
-                        err
-                    );
-                }
+                early_ssd_candidates.push((
+                    pending.key.clone(),
+                    pending.put_id,
+                    u64::from(pending.local_cache_publish.len),
+                ));
+            }
+            if pending.make_replica_task && pending.remote_replica_admitted {
+                remote_replica_pending.push((
+                    pending.key.clone(),
+                    pending.put_id,
+                    pending._pending_ctx.preferred_sub_cluster.clone(),
+                ));
             }
             results[pending.idx] = Some(ExternalBatchPutCommitItemResp {
                 error_code: OK,
                 error_json: String::new(),
             });
+        }
+
+        inner.start_early_owner_local_ssd_puts(early_ssd_candidates);
+        for (key, put_id, preferred_sub_cluster) in remote_replica_pending {
+            if let Err(err) = inner
+                .ensure_remote_put(&key, put_id, preferred_sub_cluster, true)
+                .await
+            {
+                tracing::warn!(
+                    "external_batch_put_commit make replica task failed after local commit: key={} put_id=({},{}) err={}",
+                    key,
+                    put_id.0,
+                    put_id.1,
+                    err
+                );
+            }
         }
 
         Ok(ExternalBatchPutCommitResp {

@@ -7,6 +7,7 @@ pub mod external_client_api;
 pub mod panel_proxy;
 // #[cfg(test)]
 pub mod key_prefix;
+pub mod kv_ssd_storage;
 #[cfg(feature = "test_bins")]
 pub mod kv_test;
 pub mod kvlease;
@@ -86,6 +87,7 @@ use crate::cluster_manager::ClusterManagerViewTrait;
 use crate::external_client_api::ExternalClientApiAccessTrait;
 use crate::external_client_api::ExternalClientApiView;
 use crate::external_client_api::ExternalClientApiViewTrait;
+use crate::kv_ssd_storage::{KvSsdStorageInit, KvSsdStorageRootLimit};
 use crate::master_kv_router::MasterKvRouterAccessTrait;
 use crate::master_kv_router::MasterKvRouterView;
 use crate::master_kv_router::MasterKvRouterViewTrait;
@@ -862,6 +864,7 @@ fn build_side_transfer_worker_config(
         },
         share_mem_path: owner_config.share_mem_path.clone(),
         large_file_paths: owner_config.large_file_paths.clone(),
+        ssd_storage: None,
         test_spec_config,
     })
 }
@@ -907,6 +910,9 @@ fn build_side_transfer_worker_config_yaml(
             cluster_name: side_config.cluster_name,
             share_mem_path: side_config.share_mem_path,
             large_file_paths: None,
+            large_limit_size: None,
+            ssd_write_rate_limit_bytes_per_sec: None,
+            ssd_write_burst_bytes: None,
             p2p_listen_port: side_config.fluxonkv_spec.p2p_listen_port,
             redis_compat: None,
             sub_cluster: None,
@@ -1992,6 +1998,12 @@ async fn run_client_impl(
         // Owner nodes are the global relay set. Keeping a single metadata marker converges
         // route selection, observability proxy eligibility, and ops topology rendering.
         metadata.insert("p2p_relay".to_string(), "true".to_string());
+        if config.ssd_storage.is_some() {
+            metadata.insert(
+                crate::cluster_manager::META_KEY_KV_SSD_STORAGE.to_string(),
+                "true".to_string(),
+            );
+        }
     }
     merge_startup_member_metadata(&mut metadata, startup_member_metadata)?;
 
@@ -2025,6 +2037,24 @@ async fn run_client_impl(
         role, config.cluster_name, config.instance_key
     ));
     info!("Initializing client framework...");
+
+    let ssd_storage_init = config
+        .ssd_storage
+        .as_ref()
+        .map(|ssd| {
+            config
+                .large_file_paths
+                .kv_ssd_storage_root(&config.cluster_name, &config.instance_key)
+                .map(|root_dir| KvSsdStorageInit {
+                    roots: vec![KvSsdStorageRootLimit {
+                        root_dir,
+                        limit_bytes: ssd.limit_bytes,
+                    }],
+                    write_rate_limit_bytes_per_sec: ssd.write_rate_limit_bytes_per_sec,
+                    write_burst_bytes: ssd.write_burst_bytes,
+                })
+        })
+        .transpose()?;
 
     if is_external && !is_side_transfer_worker {
         let init_args = InitArgsExternal {
@@ -2133,6 +2163,7 @@ async fn run_client_impl(
                         (config.contribute_to_cluster_pool_size.dram as f64 * ratio).floor() as u64
                     },
                 ),
+                ssd_storage: ssd_storage_init,
             },
             client_seg_pool_arg: ClientSegPoolNewArg {
                 contribute_size: config.contribute_to_cluster_pool_size.clone(),
@@ -2566,6 +2597,7 @@ mod tests {
             large_file_paths: crate::config::LargeFilePaths {
                 paths: vec!["/tmp/fluxon_side_transfer_test_large".to_string()],
             },
+            ssd_storage: None,
             test_spec_config: TestSpecConfig {
                 enable_side_transfer: true,
                 side_transfer_worker_count: 4,
@@ -2872,6 +2904,7 @@ mod tests {
             },
             share_mem_path: share_mem_root.to_string_lossy().into_owned(),
             large_file_paths: crate::config::LargeFilePaths { paths: Vec::new() },
+            ssd_storage: None,
             test_spec_config: TestSpecConfig::default(),
         };
 

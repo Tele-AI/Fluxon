@@ -60,7 +60,9 @@ use fluxon_util::{
     FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
 };
 use futures::Future;
-use pyo3::exceptions::{PyOSError, PyPermissionError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{
+    PyKeyboardInterrupt, PyOSError, PyPermissionError, PyRuntimeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule, PyString, PyTuple};
@@ -4216,6 +4218,10 @@ impl KvClient {
                                     len: owner_data.value_len,
                                 },
                                 make_replica_task: *make_replica_task,
+                                // This owner-local path has no earlier remote
+                                // reservation. Selected items are admitted to
+                                // run append Start, where allocation occurs.
+                                remote_replica_admitted: *make_replica_task,
                                 preferred_sub_cluster: None,
                                 atomic_group: atomic_groups[idx].clone(),
                             });
@@ -7756,7 +7762,7 @@ impl Drop for KvMaster {
 /// This function creates a master, runs it until Ctrl+C, then shuts down
 #[pyfunction]
 #[pyo3(signature = (config=None))]
-fn run_master_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyObject {
+fn run_master_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyResult<PyObject> {
     fn run_master_inner(config: Option<&Bound<'_, PyAny>>, py: Python) -> ApiResult<PyObject> {
         // Debug config
         println!("🛠️  Master init configuration: {:?}", config);
@@ -7878,7 +7884,20 @@ fn run_master_blocking(config: Option<&Bound<'_, PyAny>>, py: Python) -> PyObjec
         out
     }
 
-    run_master_inner(config, py).into_py_object(py)
+    let result = run_master_inner(config, py);
+    // The same SIGINT wakes Tokio's ctrl_c future and becomes a pending Python
+    // KeyboardInterrupt while the GIL is released. Once the framework has
+    // completed its graceful shutdown, consume only that expected interrupt
+    // before constructing the Python Result object. Other Python exceptions
+    // remain visible to the caller.
+    if let Err(err) = py.check_signals() {
+        if err.is_instance_of::<PyKeyboardInterrupt>(py) {
+            tracing::debug!("consumed KeyboardInterrupt after graceful KV master shutdown");
+        } else {
+            return Err(err);
+        }
+    }
+    Ok(result.into_py_object(py))
 }
 
 /// Python module definition

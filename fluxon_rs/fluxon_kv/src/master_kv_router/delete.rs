@@ -113,8 +113,8 @@ pub fn evict_one_kv_replica_for_node(
     }
 
     let removed_replica = {
-        let mut nodes_replicas = route.nodes_replicas.write();
-        nodes_replicas.remove(&node_id).is_some()
+        let mut node_replicas = route.node_replicas.write();
+        node_replicas.remove(&node_id).is_some()
     };
     if !removed_replica {
         tracing::debug!(
@@ -127,7 +127,7 @@ pub fn evict_one_kv_replica_for_node(
         return Ok(());
     }
 
-    let last_replica_gone = route.nodes_replicas.read().is_empty();
+    let last_replica_gone = route.node_replicas.read().is_empty();
     if last_replica_gone {
         let removed = view
             .master_kv_router()
@@ -136,7 +136,7 @@ pub fn evict_one_kv_replica_for_node(
             .remove_if(&key, |_, current| {
                 Arc::ptr_eq(current, &route)
                     && current.put_id == put_id
-                    && current.nodes_replicas.read().is_empty()
+                    && current.node_replicas.read().is_empty()
             })
             .is_some();
         if removed && view.master_kv_router().prefix_index_enabled() {

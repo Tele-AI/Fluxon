@@ -1,4 +1,7 @@
-use super::{ClientKvApiInner, ClientKvApiView, OwnerPreparedReclaim, OwnerReclaimRecord};
+use super::{
+    ClientKvApiInner, ClientKvApiView, OwnerPreparedReclaim, OwnerPreparedReclaimSource,
+    OwnerPreparedSsdBacking, OwnerReclaimRecord,
+};
 use crate::cluster_manager::{NodeID, NodeRole};
 use crate::master_kv_router::msg_pack::{
     BatchOwnerReclaimReq, BatchOwnerReclaimResp, OwnerReclaimBacking, OwnerReclaimItem,
@@ -7,6 +10,7 @@ use crate::master_kv_router::msg_pack::{
 };
 use crate::p2p::msg_pack::MsgPack;
 use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, OK};
+use limit_thirdparty::tokio;
 use std::{collections::HashMap, sync::Arc};
 
 fn item_resp(
@@ -18,6 +22,7 @@ fn item_resp(
         key: item.key.clone(),
         epoch: item.epoch,
         state,
+        ssd_backing_len: None,
         detail: detail.into(),
     }
 }
@@ -36,7 +41,7 @@ fn memory_matches_reclaim_backing(
 ) -> bool {
     match backing {
         OwnerReclaimBacking::Allocation => memory_info.local_reserve_resident_slot_ref().is_none(),
-        OwnerReclaimBacking::UnindexedAllocation => false,
+        OwnerReclaimBacking::UnindexedAllocation { .. } => false,
         OwnerReclaimBacking::CommittedSlot {
             grant_id,
             slot_index,
@@ -58,6 +63,8 @@ fn reclaim_key_control_busy_detail(state: &super::OwnerKeyControlState) -> Optio
         Some("owner external put context is still pending")
     } else if state.remote_put.is_some() {
         Some("owner remote put transfer is inflight")
+    } else if state.local_ssd_put.is_some() {
+        Some("owner local SSD put is inflight")
     } else if state.source_eviction_selection.is_some() {
         Some("owner source eviction selection fence is active")
     } else if state.external_get.is_some() {
@@ -93,7 +100,11 @@ fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclai
                 "another owner source selection owns the key fence",
             );
         }
-        if state.local_puts != 0 || state.external_pending_puts != 0 || state.remote_put.is_some() {
+        if state.local_puts != 0
+            || state.external_pending_puts != 0
+            || state.remote_put.is_some()
+            || state.local_ssd_put.is_some()
+        {
             return item_resp(
                 item,
                 OwnerReclaimItemState::Busy,
@@ -134,8 +145,13 @@ fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclai
         );
         state.reclaim = Some(OwnerReclaimRecord::Prepared(OwnerPreparedReclaim {
             item: item.clone(),
-            cached_info: selection.cached_info,
-            local_snapshot,
+            source: OwnerPreparedReclaimSource::Indexed {
+                cached_info: selection.cached_info,
+                local_snapshot,
+            },
+            ssd_prepare_lock: Arc::new(tokio::sync::AMutex::new(())),
+            ssd_prepare_complete: false,
+            ssd_backing: None,
         }));
         return item_resp(
             item,
@@ -178,6 +194,58 @@ fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclai
             item,
             OwnerReclaimItemState::Busy,
             "owner local Get commit is pending",
+        );
+    }
+    if let OwnerReclaimBacking::UnindexedAllocation {
+        addr,
+        base_addr,
+        len,
+        capacity_bytes,
+    } = &item.backing
+    {
+        if item.reason != OwnerReclaimReason::MasterAllocationCapacity
+            || *len == 0
+            || *capacity_bytes < *len
+            || *addr < *base_addr
+            || addr.checked_add(*len).is_none()
+        {
+            return item_resp(
+                item,
+                OwnerReclaimItemState::Stale,
+                "invalid unindexed Allocation source identity",
+            );
+        }
+        if inner.get_cached_info.contains_key(&item.key)
+            || inner.local_snapshot_info.contains_key(&item.key)
+        {
+            return item_resp(
+                item,
+                OwnerReclaimItemState::Stale,
+                "unindexed Allocation unexpectedly has an owner-local index",
+            );
+        }
+        let state = controls.entry(item.key.clone()).or_default();
+        assert!(
+            state.reclaim.is_none()
+                && state.local_puts == 0
+                && state.external_pending_puts == 0
+                && state.external_get.is_none()
+        );
+        state.begin_local_access_fence();
+        state.reclaim = Some(OwnerReclaimRecord::Prepared(OwnerPreparedReclaim {
+            item: item.clone(),
+            source: OwnerPreparedReclaimSource::UnindexedAllocation {
+                addr: *addr,
+                len: *len,
+            },
+            ssd_prepare_lock: Arc::new(tokio::sync::AMutex::new(())),
+            ssd_prepare_complete: false,
+            ssd_backing: None,
+        }));
+        return item_resp(
+            item,
+            OwnerReclaimItemState::Prepared,
+            "master-owned Allocation source fenced",
         );
     }
     let Some((_key, cached_info)) = inner.get_cached_info.remove_if(&item.key, |_, cached| {
@@ -223,8 +291,13 @@ fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclai
     state.begin_local_access_fence();
     state.reclaim = Some(OwnerReclaimRecord::Prepared(OwnerPreparedReclaim {
         item: item.clone(),
-        cached_info,
-        local_snapshot,
+        source: OwnerPreparedReclaimSource::Indexed {
+            cached_info,
+            local_snapshot,
+        },
+        ssd_prepare_lock: Arc::new(tokio::sync::AMutex::new(())),
+        ssd_prepare_complete: false,
+        ssd_backing: None,
     }));
     item_resp(
         item,
@@ -233,45 +306,227 @@ fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclai
     )
 }
 
-fn release_prepared_backing_now(inner: &ClientKvApiInner, prepared: OwnerPreparedReclaim) {
-    let mut memory_info = Arc::try_unwrap(prepared.cached_info.mem_holder).unwrap_or_else(|_| {
-        panic!(
-            "owner reclaim prepared memory unexpectedly gained a holder: key={} epoch={}",
-            prepared.item.key, prepared.item.epoch
-        )
-    });
-    match &prepared.item.backing {
-        OwnerReclaimBacking::Allocation => {
-            assert!(
-                memory_info.local_reserve_resident_slot_ref().is_none(),
-                "allocation reclaim must not carry a local-reserve slot"
-            );
-        }
-        OwnerReclaimBacking::UnindexedAllocation => {
-            unreachable!("unindexed allocations must be reclaimed entirely on the master")
-        }
-        OwnerReclaimBacking::CommittedSlot {
-            grant_id,
-            slot_index,
-            slot_size,
-        } => {
-            let (actual_slot_size, actual_grant_id, actual_slot_index) = memory_info
-                .take_local_reserve_resident_slot_ref()
-                .expect("committed-slot reclaim must carry a local-reserve slot");
-            assert_eq!(actual_slot_size, *slot_size);
-            assert_eq!(actual_grant_id, *grant_id);
-            assert_eq!(actual_slot_index, *slot_index);
+/// Persist one bounded master-capacity batch while every exact source remains
+/// fenced. Per-key async locks make an overlapping RPC replay join the first
+/// attempt. The storage layer then admits the whole batch without queueing,
+/// inserts every independent generation, and executes one durability barrier.
+async fn persist_prepared_reclaim_batch_to_ssd(
+    inner: &ClientKvApiInner,
+    items: &[OwnerReclaimItem],
+) -> Vec<Option<u64>> {
+    let mut backing_lens = vec![None; items.len()];
+    if items.is_empty() || inner.ssd_storage.is_none() {
+        return backing_lens;
+    }
 
-            inner
-                .owner_release_local_reserve_committed_resident_slot(
-                    actual_slot_size,
-                    actual_grant_id,
-                    actual_slot_index,
-                )
-                .expect("owner reclaim committed resident slot release must succeed");
+    let mut prepare_locks = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if item.reason != OwnerReclaimReason::MasterAllocationCapacity {
+            continue;
+        }
+        let controls = inner.owner_key_control.lock_key(&item.key);
+        let Some(OwnerReclaimRecord::Prepared(prepared)) = controls
+            .get(&item.key)
+            .and_then(|state| state.reclaim.as_ref())
+        else {
+            continue;
+        };
+        if prepared.item != *item {
+            continue;
+        }
+        if prepared.ssd_prepare_complete {
+            backing_lens[index] = prepared.ssd_backing.as_ref().map(|backing| backing.len);
+            continue;
+        }
+        prepare_locks.push((item.key.clone(), index, prepared.ssd_prepare_lock.clone()));
+    }
+    prepare_locks.sort_by(|left, right| left.0.cmp(&right.0));
+    debug_assert!(
+        prepare_locks
+            .windows(2)
+            .all(|window| window[0].0 != window[1].0)
+    );
+    let mut prepare_guards = Vec::with_capacity(prepare_locks.len());
+    for (_, _, lock) in &prepare_locks {
+        prepare_guards.push(lock.clone().lock_owned().await);
+    }
+
+    let mut sources = Vec::new();
+    let mut source_indices = Vec::new();
+    let mut source_holders = Vec::new();
+    for (_, index, _) in &prepare_locks {
+        let item = &items[*index];
+        let controls = inner.owner_key_control.lock_key(&item.key);
+        let Some(OwnerReclaimRecord::Prepared(prepared)) = controls
+            .get(&item.key)
+            .and_then(|state| state.reclaim.as_ref())
+        else {
+            continue;
+        };
+        if prepared.item != *item {
+            continue;
+        }
+        if prepared.ssd_prepare_complete {
+            backing_lens[*index] = prepared.ssd_backing.as_ref().map(|backing| backing.len);
+            continue;
+        }
+        let (addr, len, holder) = match &prepared.source {
+            OwnerPreparedReclaimSource::Indexed { cached_info, .. } => {
+                let holder = cached_info.mem_holder.clone();
+                (holder.addr, u64::from(holder.len), Some(holder))
+            }
+            OwnerPreparedReclaimSource::UnindexedAllocation { addr, len } => (*addr, *len, None),
+        };
+        sources.push(crate::kv_ssd_storage::KvSsdPersistSource {
+            key: item.key.clone(),
+            put_id: item.put_id,
+            addr,
+            len,
+        });
+        source_indices.push(*index);
+        source_holders.push(holder);
+    }
+
+    let persisted = if sources.is_empty() {
+        Vec::new()
+    } else {
+        match inner.persist_local_kvs_to_ssd(&sources).await {
+            Ok(results) => results,
+            Err(err) => {
+                tracing::warn!(
+                    items = sources.len(),
+                    error = %err,
+                    "master-capacity SSD batch validation failed; continuing DRAM reclaim"
+                );
+                sources
+                    .iter()
+                    .map(|_| None)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(Ok)
+                    .collect()
+            }
+        }
+    };
+    drop(source_holders);
+
+    let mut discard = Vec::new();
+    for ((index, source), outcome) in source_indices
+        .into_iter()
+        .zip(sources.into_iter())
+        .zip(persisted.into_iter())
+    {
+        let item = &items[index];
+        let mut persist_guard = match outcome {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(
+                    key = item.key,
+                    put_time_ms = item.put_id.0,
+                    put_version = item.put_id.1,
+                    epoch = item.epoch,
+                    len = source.len,
+                    error = %err,
+                    "master-capacity victim SSD write-back failed; continuing DRAM reclaim"
+                );
+                None
+            }
+        };
+        let attached = {
+            let mut controls = inner.owner_key_control.lock_key(&item.key);
+            match controls
+                .get_mut(&item.key)
+                .and_then(|state| state.reclaim.as_mut())
+            {
+                Some(OwnerReclaimRecord::Prepared(prepared)) if prepared.item == *item => {
+                    if prepared.ssd_prepare_complete {
+                        Some(prepared.ssd_backing.as_ref().map(|backing| backing.len))
+                    } else {
+                        prepared.ssd_prepare_complete = true;
+                        if let Some(guard) = persist_guard.take() {
+                            prepared.ssd_backing = Some(OwnerPreparedSsdBacking {
+                                len: source.len,
+                                _persist_guard: guard,
+                            });
+                            Some(Some(source.len))
+                        } else {
+                            Some(None)
+                        }
+                    }
+                }
+                _ => None,
+            }
+        };
+        match attached {
+            Some(len) => backing_lens[index] = len,
+            None => {
+                let should_discard = persist_guard.is_some();
+                drop(persist_guard);
+                if should_discard {
+                    discard.push((item.key.clone(), item.put_id));
+                }
+            }
         }
     }
-    drop(memory_info);
+    drop(prepare_guards);
+    for (key, put_id) in discard {
+        inner.discard_local_ssd_replica(&key, put_id).await;
+    }
+    backing_lens
+}
+
+fn release_prepared_backing_now(inner: &ClientKvApiInner, prepared: OwnerPreparedReclaim) {
+    match prepared.source {
+        OwnerPreparedReclaimSource::Indexed { cached_info, .. } => {
+            let mut memory_info = Arc::try_unwrap(cached_info.mem_holder).unwrap_or_else(|_| {
+                panic!(
+                    "owner reclaim prepared memory unexpectedly gained a holder: key={} epoch={}",
+                    prepared.item.key, prepared.item.epoch
+                )
+            });
+            match &prepared.item.backing {
+                OwnerReclaimBacking::Allocation => {
+                    assert!(
+                        memory_info.local_reserve_resident_slot_ref().is_none(),
+                        "allocation reclaim must not carry a local-reserve slot"
+                    );
+                }
+                OwnerReclaimBacking::UnindexedAllocation { .. } => {
+                    unreachable!("indexed reclaim source cannot name an unindexed Allocation")
+                }
+                OwnerReclaimBacking::CommittedSlot {
+                    grant_id,
+                    slot_index,
+                    slot_size,
+                } => {
+                    let (actual_slot_size, actual_grant_id, actual_slot_index) = memory_info
+                        .take_local_reserve_resident_slot_ref()
+                        .expect("committed-slot reclaim must carry a local-reserve slot");
+                    assert_eq!(actual_slot_size, *slot_size);
+                    assert_eq!(actual_grant_id, *grant_id);
+                    assert_eq!(actual_slot_index, *slot_index);
+
+                    inner
+                        .owner_release_local_reserve_committed_resident_slot(
+                            actual_slot_size,
+                            actual_grant_id,
+                            actual_slot_index,
+                        )
+                        .expect("owner reclaim committed resident slot release must succeed");
+                }
+            }
+            drop(memory_info);
+        }
+        OwnerPreparedReclaimSource::UnindexedAllocation { .. } => {
+            assert!(matches!(
+                prepared.item.backing,
+                OwnerReclaimBacking::UnindexedAllocation { .. }
+            ));
+            // The master route still owns the Allocation. It is removed only after this Commit
+            // response, which releases the physical bytes on the master side.
+        }
+    }
 }
 
 fn reclaim_release_fence_is_intact(
@@ -287,6 +542,7 @@ fn reclaim_release_fence_is_intact(
     ) && state.local_puts == 0
         && state.external_pending_puts == 0
         && state.remote_put.is_none()
+        && state.local_ssd_put.is_none()
         && state.source_eviction_selection.is_none()
         && state.local_access_fence.is_some()
 }
@@ -419,73 +675,116 @@ mod tests {
     }
 }
 
-fn abort_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
+struct AbortOneResult {
+    response: OwnerReclaimItemResp,
+    discard_ssd: bool,
+}
+
+fn abort_one_fenced(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> AbortOneResult {
     let mut controls = inner.owner_key_control.lock_key(&item.key);
     let Some(state) = controls.get_mut(&item.key) else {
-        return item_resp(
-            item,
-            OwnerReclaimItemState::Aborted,
-            "owner reclaim was already absent",
-        );
+        return AbortOneResult {
+            response: item_resp(
+                item,
+                OwnerReclaimItemState::Aborted,
+                "owner reclaim was already absent",
+            ),
+            discard_ssd: false,
+        };
     };
     let Some(record) = state.reclaim.take() else {
-        return item_resp(
-            item,
-            OwnerReclaimItemState::Aborted,
-            "owner reclaim was already absent",
-        );
+        return AbortOneResult {
+            response: item_resp(
+                item,
+                OwnerReclaimItemState::Aborted,
+                "owner reclaim was already absent",
+            ),
+            discard_ssd: false,
+        };
     };
     match record {
         OwnerReclaimRecord::Prepared(prepared) if prepared.item == *item => {
-            let replaced = inner
-                .get_cached_info
-                .insert(item.key.clone(), prepared.cached_info);
-            assert!(
-                replaced.is_none(),
-                "owner reclaim abort must restore an empty local index slot"
-            );
-            if let Some(snapshot) = prepared.local_snapshot {
-                let replaced = inner.local_snapshot_info.insert(item.key.clone(), snapshot);
-                assert!(
-                    replaced.is_none(),
-                    "owner reclaim abort must restore an empty local snapshot slot"
-                );
-            }
+            let OwnerPreparedReclaim {
+                source,
+                ssd_backing,
+                ..
+            } = prepared;
+            let detail = match source {
+                OwnerPreparedReclaimSource::Indexed {
+                    cached_info,
+                    local_snapshot,
+                } => {
+                    let replaced = inner.get_cached_info.insert(item.key.clone(), cached_info);
+                    assert!(
+                        replaced.is_none(),
+                        "owner reclaim abort must restore an empty local index slot"
+                    );
+                    if let Some(snapshot) = local_snapshot {
+                        let replaced = inner.local_snapshot_info.insert(item.key.clone(), snapshot);
+                        assert!(
+                            replaced.is_none(),
+                            "owner reclaim abort must restore an empty local snapshot slot"
+                        );
+                    }
+                    "owner local index fence rolled back"
+                }
+                OwnerPreparedReclaimSource::UnindexedAllocation { .. } => {
+                    "master-owned Allocation source fence rolled back"
+                }
+            };
             state.finish_local_access_fence();
             if state.is_idle() {
                 controls.remove(&item.key);
             }
-            item_resp(
-                item,
-                OwnerReclaimItemState::Aborted,
-                "owner local index fence rolled back",
-            )
+            AbortOneResult {
+                response: item_resp(item, OwnerReclaimItemState::Aborted, detail),
+                discard_ssd: ssd_backing.is_some(),
+            }
         }
         OwnerReclaimRecord::Releasing(releasing) if releasing == *item => {
             state.reclaim = Some(OwnerReclaimRecord::Releasing(releasing));
-            item_resp(
-                item,
-                OwnerReclaimItemState::Busy,
-                "owner slot release is already in progress and cannot be aborted",
-            )
+            AbortOneResult {
+                response: item_resp(
+                    item,
+                    OwnerReclaimItemState::Busy,
+                    "owner slot release is already in progress and cannot be aborted",
+                ),
+                discard_ssd: false,
+            }
         }
         OwnerReclaimRecord::Committed(committed) if committed == *item => {
             state.reclaim = Some(OwnerReclaimRecord::Committed(committed));
-            item_resp(
-                item,
-                OwnerReclaimItemState::Committed,
-                "owner slot was already committed and cannot be restored",
-            )
+            AbortOneResult {
+                response: item_resp(
+                    item,
+                    OwnerReclaimItemState::Committed,
+                    "owner slot was already committed and cannot be restored",
+                ),
+                discard_ssd: false,
+            }
         }
         other => {
             state.reclaim = Some(other);
-            item_resp(
-                item,
-                OwnerReclaimItemState::Stale,
-                "owner reclaim epoch or slot identity changed",
-            )
+            AbortOneResult {
+                response: item_resp(
+                    item,
+                    OwnerReclaimItemState::Stale,
+                    "owner reclaim epoch or slot identity changed",
+                ),
+                discard_ssd: false,
+            }
         }
     }
+}
+
+async fn abort_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
+    let outcome = abort_one_fenced(inner, item);
+    if outcome.discard_ssd {
+        inner
+            .discard_local_ssd_replica(&item.key, item.put_id)
+            .await;
+    }
+    outcome.response
 }
 
 fn finalize_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
@@ -595,17 +894,55 @@ pub async fn handle_batch_owner_reclaim(
     }
     let inner = view.client_kv_api().inner();
     let phase = req.serialize_part.phase;
-    let items = req
-        .serialize_part
-        .items
-        .iter()
-        .map(|item| match phase {
-            OwnerReclaimPhase::Prepare => prepare_one(inner, item),
-            OwnerReclaimPhase::Commit => commit_one(inner, item),
-            OwnerReclaimPhase::Abort => abort_one(inner, item),
-            OwnerReclaimPhase::Finalize => finalize_one(inner, item),
-        })
-        .collect::<Vec<_>>();
+    let items = match phase {
+        OwnerReclaimPhase::Prepare => {
+            let mut responses = req
+                .serialize_part
+                .items
+                .iter()
+                .map(|item| prepare_one(inner, item))
+                .collect::<Vec<_>>();
+            let prepared_indices = responses
+                .iter()
+                .enumerate()
+                .filter_map(|(index, response)| {
+                    (response.state == OwnerReclaimItemState::Prepared).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            for indices in prepared_indices.chunks(crate::kv_ssd_storage::MAX_PERSIST_BATCH_ITEMS) {
+                let batch = indices
+                    .iter()
+                    .map(|index| req.serialize_part.items[*index].clone())
+                    .collect::<Vec<_>>();
+                let persisted = persist_prepared_reclaim_batch_to_ssd(inner, &batch).await;
+                for (index, ssd_backing_len) in indices.iter().copied().zip(persisted) {
+                    responses[index].ssd_backing_len = ssd_backing_len;
+                }
+            }
+            responses
+        }
+        OwnerReclaimPhase::Commit => req
+            .serialize_part
+            .items
+            .iter()
+            .map(|item| commit_one(inner, item))
+            .collect(),
+        OwnerReclaimPhase::Abort => {
+            futures::future::join_all(
+                req.serialize_part
+                    .items
+                    .iter()
+                    .map(|item| abort_one(inner, item)),
+            )
+            .await
+        }
+        OwnerReclaimPhase::Finalize => req
+            .serialize_part
+            .items
+            .iter()
+            .map(|item| finalize_one(inner, item))
+            .collect(),
+    };
     let prepared = items
         .iter()
         .filter(|item| item.state == OwnerReclaimItemState::Prepared)
@@ -618,6 +955,14 @@ pub async fn handle_batch_owner_reclaim(
         .iter()
         .filter(|item| item.state == OwnerReclaimItemState::Finalized)
         .count();
+    let ssd_prepared = items
+        .iter()
+        .filter(|item| item.ssd_backing_len.is_some())
+        .count();
+    let ssd_prepared_bytes = items
+        .iter()
+        .filter_map(|item| item.ssd_backing_len)
+        .fold(0_u64, u64::saturating_add);
     let busy_or_stale = items
         .iter()
         .filter(|item| {
@@ -641,12 +986,14 @@ pub async fn handle_batch_owner_reclaim(
     let mut rejection_reason_counts = rejection_reason_counts.into_iter().collect::<Vec<_>>();
     rejection_reason_counts.sort_by(|a, b| a.0.cmp(&b.0));
     tracing::info!(
-        "owner reclaim phase completed: phase={:?} items={} prepared={} committed={} finalized={} busy_or_stale={} rejection_reasons={:?}",
+        "owner reclaim phase completed: phase={:?} items={} prepared={} committed={} finalized={} ssd_prepared={} ssd_prepared_bytes={} busy_or_stale={} rejection_reasons={:?}",
         phase,
         items.len(),
         prepared,
         committed,
         finalized,
+        ssd_prepared,
+        ssd_prepared_bytes,
         busy_or_stale,
         rejection_reason_counts
     );

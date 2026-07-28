@@ -83,6 +83,7 @@ test_spec_config:                      # Test-only config overrides (dict(option
   prefer_local_placement: false        # Prefer placing new KV writes on the requester-local owner when possible (bool(optional))
   short_circuit_put_payload_path: false # Keep large put_start allocation but skip payload memcpy + transfer (bool(optional))
   skip_put_end_commit: false           # Return success after payload transfer without put_done commit; inflight_put TTL cleanup only (bool(optional))
+  ssd_read_source_policy: legacy_remote_first # legacy_remote_first|local_ssd_only_first (str(optional))
   owner_local_reserve_soft_wait_timeout_ms: # Local-reserve polling interval, >0 (int(optional))
   owner_local_reserve_hard_timeout_ms: # Local-reserve end-to-end claim timeout, > soft wait (int(optional))
   owner_local_reserve_expected_capacity: # Owner-only local-reserve prewarm target (dict(optional))
@@ -117,6 +118,9 @@ fluxonkv_spec:                        # fluxon kv specific config (dict(optional
   cluster_name:                       # Cluster name (str)
   share_mem_path:                     # Shared bundle path for mmap.file/shared.json/peer metadata (str)
   large_file_paths:                   # Owner-mode ordered large-file roots (['{str}'](optional))
+  large_limit_size:                   # Optional per-root SSD capacity in bytes (list(optional))
+  ssd_write_rate_limit_bytes_per_sec: # Optional non-queueing SSD write rate (int(optional))
+  ssd_write_burst_bytes:              # Paired immediate SSD write burst (int(optional))
   p2p_listen_port:                    # P2P QUIC listen port override (int(optional))
   redis_compat:                       # Enable Redis protocol shim (dict(optional))
     listen_addr:                      # TCP listen addr, e.g. "127.0.0.1:16379" (str)
@@ -142,6 +146,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         "prefer_local_placement",
         "short_circuit_put_payload_path",
         "skip_put_end_commit",
+        "ssd_read_source_policy",
         "owner_local_reserve_soft_wait_timeout_ms",
         "owner_local_reserve_hard_timeout_ms",
         "owner_local_reserve_expected_capacity",
@@ -182,6 +187,21 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             if not isinstance(value, bool):
                 raise ValueError(f"{ctx}.{key} must be a bool")
             out[key] = value
+
+    ssd_read_source_policy = raw.get("ssd_read_source_policy")
+    if ssd_read_source_policy is not None:
+        if not isinstance(ssd_read_source_policy, str):
+            raise ValueError(f"{ctx}.ssd_read_source_policy must be a string")
+        allowed_ssd_read_source_policies = {
+            "legacy_remote_first",
+            "local_ssd_only_first",
+        }
+        if ssd_read_source_policy not in allowed_ssd_read_source_policies:
+            raise ValueError(
+                f"{ctx}.ssd_read_source_policy must be one of "
+                f"{sorted(allowed_ssd_read_source_policies)}, got {ssd_read_source_policy!r}"
+            )
+        out["ssd_read_source_policy"] = ssd_read_source_policy
 
     transport_mode = raw.get("transport_mode")
     transport_mode_was_explicit = transport_mode is not None
@@ -446,6 +466,9 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
             "redis_compat",
             "sub_cluster",
             "large_file_paths",
+            "large_limit_size",
+            "ssd_write_rate_limit_bytes_per_sec",
+            "ssd_write_burst_bytes",
         ]
         for key in forbidden_spec_keys:
             if key in spec:
@@ -501,6 +524,26 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
             raise ValueError(
                 f"fluxonkv_spec.large_file_paths[{idx}] must be a non-empty string in owner mode"
             )
+
+    write_rate = spec.get("ssd_write_rate_limit_bytes_per_sec")
+    write_burst = spec.get("ssd_write_burst_bytes")
+    if (write_rate is None) != (write_burst is None):
+        raise ValueError(
+            "fluxonkv_spec.ssd_write_rate_limit_bytes_per_sec and "
+            "ssd_write_burst_bytes must be configured together"
+        )
+    if write_rate is not None:
+        if (
+            isinstance(write_rate, bool)
+            or not isinstance(write_rate, int)
+            or write_rate <= 0
+            or isinstance(write_burst, bool)
+            or not isinstance(write_burst, int)
+            or write_burst <= 0
+        ):
+            raise ValueError("SSD write rate and burst must both be positive integers")
+        if "large_limit_size" not in spec:
+            raise ValueError("SSD write admission requires fluxonkv_spec.large_limit_size")
 
 
 class FluxonKvClientConfig():
@@ -852,8 +895,8 @@ def _parse_type_annotation(comment: str) -> Optional[Tuple[str, Dict[str, Any]]]
                         return parsed_type_name, merged_params
                     return type_name, {"constraint": constraint}
         
-        # 6) Primitive types: str, int, float, bool, None
-        if type_str in ["str", "int", "float", "bool", "None"]:
+        # 6) Primitive types: str, int, float, bool, list, None
+        if type_str in ["str", "int", "float", "bool", "list", "None"]:
             return type_str, {}
         
         debug_print("type_str ", type_str, "not matched to any type")
@@ -987,6 +1030,13 @@ def _validate_value_by_type(value: Any, type_info: Tuple[str, Dict[str, Any]], p
         if not isinstance(value, bool):
             if raise_err:
                 raise_validation_error(f"Expected bool, got {type(value).__name__}")
+            else:
+                return None
+
+    elif type_name == "list":
+        if not isinstance(value, list):
+            if raise_err:
+                raise_validation_error(f"Expected list, got {type(value).__name__}")
             else:
                 return None
     

@@ -23,6 +23,13 @@ pub enum GetAllocationMode {
     ExternalSink = 4,
 }
 
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum GetSourceKind {
+    #[default]
+    Memory = 0,
+    Ssd = 1,
+}
+
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct GetPreparedLocalReserveTarget {
     pub grant_id: u64,
@@ -68,6 +75,7 @@ pub struct GetStartResp {
     pub target_base_addr: u64,
     pub src_base_addr: u64,
     pub len: u64,
+    pub source_kind: GetSourceKind,
     /// Echoes the owner-local slot accepted as this Get's target.
     pub prepared_target: Option<GetPreparedLocalReserveTarget>,
     pub atomic_group: Option<PutAtomicGroup>,
@@ -136,6 +144,62 @@ impl RPCReq for GetDoneReq {
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdStageBeginReq {
+    pub get_id: u64,
+}
+
+impl MsgPackSerializePart for SsdStageBeginReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::SsdStageBeginReq as u32
+    }
+}
+
+impl RPCReq for SsdStageBeginReq {
+    type Resp = SsdStageBeginResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdStageBeginResp {
+    pub started: bool,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for SsdStageBeginResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::SsdStageBeginResp as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdStageDoneReq {
+    pub get_id: u64,
+    pub drop_ssd_source: bool,
+}
+
+impl MsgPackSerializePart for SsdStageDoneReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::SsdStageDoneReq as u32
+    }
+}
+
+impl RPCReq for SsdStageDoneReq {
+    type Resp = SsdStageDoneResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdStageDoneResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for SsdStageDoneResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::SsdStageDoneResp as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct BatchGetStartReq {
     pub keys: Vec<String>,
     /// Empty selects ordinary master allocations. Otherwise this must contain
@@ -161,6 +225,7 @@ pub struct BatchGetStartItemResp {
     pub target_base_addr: u64,
     pub src_base_addr: u64,
     pub len: u64,
+    pub source_kind: GetSourceKind,
     pub prepared_target: Option<GetPreparedLocalReserveTarget>,
     pub atomic_group: Option<PutAtomicGroup>,
     pub error_code: ErrorCode,
@@ -203,9 +268,11 @@ pub struct BatchGetPlanItemResp {
     pub src_addr: u64,
     pub src_base_addr: u64,
     pub len: u64,
+    pub source_kind: GetSourceKind,
     pub atomic_group: Option<PutAtomicGroup>,
-    /// False when the selected source is the external requester's local
-    /// share-group owner and therefore cannot use the RDMA-only GPU sink.
+    /// True only for remote memory. Requester-local memory and every SSD
+    /// source must materialize through an owner CPU holder instead of binding
+    /// the RDMA-only GPU sink.
     pub gpu_direct_eligible: bool,
     pub error_code: ErrorCode,
     pub error_json: String,
@@ -507,9 +574,21 @@ pub enum OwnerReclaimBacking {
         slot_index: u32,
         slot_size: u64,
     },
-    /// A master-owned allocation with no owner-side key index. The master reclaims this
-    /// backing directly after installing its key-activity fence and never sends it to the owner.
-    UnindexedAllocation,
+    /// A master-owned allocation with no owner-side key index.
+    ///
+    /// SSD-capable owners use this exact source identity to persist the bytes while the
+    /// master's route and key-activity fence keep the allocation alive. Owners without SSD
+    /// still skip owner coordination and let the master reclaim the allocation directly.
+    UnindexedAllocation {
+        /// Absolute address in the owner's registered CPU segment.
+        addr: u64,
+        /// Base address of the exact registered segment generation.
+        base_addr: u64,
+        /// Logical KV payload length.
+        len: u64,
+        /// Physical allocator capacity released when the master drops the allocation.
+        capacity_bytes: u64,
+    },
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
@@ -519,12 +598,31 @@ pub enum OwnerReclaimReason {
     MasterAllocationCapacity,
 }
 
+/// Per-victim SSD action for owner-local capacity reclaim. Selection and
+/// deletion remain single-KV decisions even when one RPC carries a vector.
+#[derive(Default, Debug, Clone, Copy, Hash, PartialEq, Eq, Encode, Decode)]
+pub enum OwnerSourceSsdPolicy {
+    /// Delete the exact memory source without preserving it on SSD.
+    #[default]
+    Drop,
+    /// Ask the master to return `SsdCandidate` only if this is the last live
+    /// backing. Sources with another backing are deleted immediately.
+    SelectLastLive,
+    /// The owner has durably persisted this generation and supplied its exact
+    /// length in `ssd_backing_len`.
+    Persisted,
+}
+
 /// One exact owner-local source selected for capacity eviction.
 #[derive(Default, Debug, Clone, Hash, PartialEq, Eq, Encode, Decode)]
 pub struct OwnerSourceEvictionVictim {
     pub key: String,
     pub put_id: PutIDForAKey,
     pub backing: OwnerReclaimBacking,
+    /// Durable owner-local SSD bytes prepared under the exact source fence.
+    /// The master installs this backing immediately before deleting `memory`.
+    pub ssd_backing_len: Option<u64>,
+    pub ssd_policy: OwnerSourceSsdPolicy,
 }
 
 pub(crate) fn owner_source_eviction_epoch(operation_id: u64, victim_index: usize) -> u64 {
@@ -554,6 +652,7 @@ pub enum OwnerSourceEvictionOutcome {
     Accepted,
     AlreadyInProgress,
     Completed,
+    SsdCandidate,
     RetryableBusy,
     Stale,
     RejectedNotEvictable,
@@ -563,6 +662,7 @@ pub enum OwnerSourceEvictionOutcome {
 pub struct OwnerSourceEvictionVictimResp {
     pub victim_index: u32,
     pub outcome: OwnerSourceEvictionOutcome,
+    pub ssd_backing_committed: bool,
     pub detail: String,
 }
 
@@ -582,6 +682,63 @@ impl MsgPackSerializePart for BatchEvictOwnerSourceResp {
 
 impl RPCReq for BatchEvictOwnerSourceReq {
     type Resp = BatchEvictOwnerSourceResp;
+}
+
+/// One durable same-owner SSD generation to publish without removing memory.
+#[derive(Default, Debug, Clone, Hash, PartialEq, Eq, Encode, Decode)]
+pub struct OwnerSsdPublishItem {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub len: u64,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPublishOwnerSsdReq {
+    /// Membership generation of the authenticated owner.
+    pub owner_node_start_time: i64,
+    pub items: Vec<OwnerSsdPublishItem>,
+}
+
+impl MsgPackSerializePart for BatchPublishOwnerSsdReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPublishOwnerSsdReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum OwnerSsdPublishOutcome {
+    #[default]
+    Unspecified,
+    Published,
+    AlreadyPresent,
+    RetryableBusy,
+    Obsolete,
+    Rejected,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct OwnerSsdPublishItemResp {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub outcome: OwnerSsdPublishOutcome,
+    pub detail: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchPublishOwnerSsdResp {
+    pub items: Vec<OwnerSsdPublishItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for BatchPublishOwnerSsdResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchPublishOwnerSsdResp as u32
+    }
+}
+
+impl RPCReq for BatchPublishOwnerSsdReq {
+    type Resp = BatchPublishOwnerSsdResp;
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -610,6 +767,10 @@ pub struct OwnerReclaimItemResp {
     pub key: String,
     pub epoch: u64,
     pub state: OwnerReclaimItemState,
+    /// Durable bytes persisted by the owner while the exact memory source is
+    /// hidden behind the Prepare fence.  The master publishes this backing on
+    /// the existing route before it asks the owner to Commit/free DRAM.
+    pub ssd_backing_len: Option<u64>,
     pub detail: String,
 }
 
@@ -1621,6 +1782,22 @@ mod put_atomic_group_tests {
         let decoded: BatchPutDoneReq =
             bitcode::decode(&bitcode::encode(&req)).expect("decode atomic put group");
         assert_eq!(decoded.items[0].atomic_group.as_ref(), Some(&group));
+    }
+
+    #[test]
+    fn owner_ssd_publish_only_batch_round_trips_exact_generation() {
+        let req = BatchPublishOwnerSsdReq {
+            owner_node_start_time: 41,
+            items: vec![OwnerSsdPublishItem {
+                key: "ssd-key".to_string(),
+                put_id: (17, 3),
+                len: 4_718_592,
+            }],
+        };
+        let decoded: BatchPublishOwnerSsdReq =
+            bitcode::decode(&bitcode::encode(&req)).expect("decode owner SSD publication");
+        assert_eq!(decoded.owner_node_start_time, 41);
+        assert_eq!(decoded.items, req.items);
     }
 
     #[test]

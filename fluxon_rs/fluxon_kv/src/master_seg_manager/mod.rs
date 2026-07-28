@@ -2,7 +2,9 @@ pub mod msg_pack;
 pub mod one_seg_allocator;
 use self::msg_pack::RequestSegmentRegistrationReq;
 use self::msg_pack::SegmentDeviceDescription;
-use self::one_seg_allocator::{Allocation, OneSegAllocator};
+use self::one_seg_allocator::{
+    Allocation, NodePoolCapacityBudget, NodePoolCapacitySnapshot, OneSegAllocator,
+};
 use crate::cluster_manager::NodeID;
 use crate::p2p::p2p_module::P2pModuleAccessTrait;
 use crate::rpcresp_kvresult_convert::msg_and_error::OK;
@@ -21,6 +23,46 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+fn build_node_segments_manager(
+    node_start_time: i64,
+    seg_map: std::collections::HashMap<
+        SegmentDeviceID,
+        (SegmentDeviceDescription, msg_pack::SegmentDeviceMemInfo),
+    >,
+) -> KvResult<NodeSegmentsManager> {
+    let total_size = seg_map.values().try_fold(0u64, |total, (_, info)| {
+        total.checked_add(info.len).ok_or_else(|| {
+            KvError::Api(
+                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
+                    detail: "registered node segment capacity overflows u64".to_string(),
+                },
+            )
+        })
+    })?;
+    let capacity_budget = Arc::new(NodePoolCapacityBudget::new(total_size)?);
+    let mut device_id_2_allocator: HashMap<SegmentDeviceID, Arc<OneSegAllocator>> = HashMap::new();
+    for (device_id, (seg_device_desc, seg_mem_info)) in seg_map {
+        let allocator = OneSegAllocator::new_with_capacity_budget(
+            device_id.clone(),
+            seg_device_desc,
+            seg_mem_info.addr,
+            seg_mem_info.len,
+            capacity_budget.clone(),
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to create OneSegAllocator: {}", e);
+            e
+        })?;
+        device_id_2_allocator.insert(device_id, Arc::new(allocator));
+    }
+    Ok(NodeSegmentsManager::new(
+        node_start_time,
+        total_size,
+        device_id_2_allocator,
+        capacity_budget,
+    ))
+}
 
 // --- Handler Functions ---
 /// https://qcnoe3hd7k5c.feishu.cn/wiki/KkeXwBbP4iCRN8kWSDccP5GBnrd#share-AuMbdrSaXoadUbxRmUncooKnnQd
@@ -53,31 +95,7 @@ fn register_node_segments(
 
     match alloc_map.entry(node_id.clone()) {
         dashmap::mapref::entry::Entry::Vacant(v) => {
-            let mut total_size: u64 = 0;
-            let mut device_id_2_allocator: HashMap<SegmentDeviceID, Arc<OneSegAllocator>> =
-                HashMap::new();
-
-            for (device_id, (seg_device_desc, seg_mem_info)) in seg_map {
-                let allocator = OneSegAllocator::new(
-                    device_id.clone(),
-                    seg_device_desc,
-                    seg_mem_info.addr,
-                    seg_mem_info.len,
-                )
-                .map_err(|e| {
-                    tracing::error!("Failed to create OneSegAllocator: {}", e);
-                    e
-                })?;
-
-                total_size = total_size.saturating_add(seg_mem_info.len);
-                device_id_2_allocator.insert(device_id, Arc::new(allocator));
-            }
-
-            v.insert(NodeSegmentsManager::new(
-                node_start_time,
-                total_size,
-                device_id_2_allocator,
-            ));
+            v.insert(build_node_segments_manager(node_start_time, seg_map)?);
         }
         dashmap::mapref::entry::Entry::Occupied(mut occ) => {
             let node_segments_manager = occ.get_mut();
@@ -96,28 +114,7 @@ fn register_node_segments(
                         },
                     ));
                 }
-                let mut total_size: u64 = 0;
-                let mut device_id_2_allocator: HashMap<SegmentDeviceID, Arc<OneSegAllocator>> =
-                    HashMap::new();
-
-                for (device_id, (seg_device_desc, seg_mem_info)) in seg_map {
-                    let allocator = OneSegAllocator::new(
-                        device_id.clone(),
-                        seg_device_desc,
-                        seg_mem_info.addr,
-                        seg_mem_info.len,
-                    )
-                    .map_err(|e| {
-                        tracing::error!("Failed to create OneSegAllocator: {}", e);
-                        e
-                    })?;
-
-                    total_size = total_size.saturating_add(seg_mem_info.len);
-                    device_id_2_allocator.insert(device_id, Arc::new(allocator));
-                }
-
-                *node_segments_manager =
-                    NodeSegmentsManager::new(node_start_time, total_size, device_id_2_allocator);
+                *node_segments_manager = build_node_segments_manager(node_start_time, seg_map)?;
                 tracing::info!("RegisterSegment replaced tombed node: {}", node_id);
                 return Ok(());
             }
@@ -154,11 +151,25 @@ fn register_node_segments(
                     ));
                 }
 
-                let allocator = OneSegAllocator::new(
+                let new_total_size = node_segments_manager
+                    .total_size
+                    .checked_add(seg_mem_info.len)
+                    .ok_or_else(|| {
+                        KvError::Api(
+                            crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
+                                detail: format!(
+                                    "registered node segment capacity overflows u64: node={}",
+                                    node_id
+                                ),
+                            },
+                        )
+                    })?;
+                let allocator = OneSegAllocator::new_with_capacity_budget(
                     device_id.clone(),
                     seg_device_desc,
                     seg_mem_info.addr,
                     seg_mem_info.len,
+                    node_segments_manager.capacity_budget.clone(),
                 )
                 .map_err(|e| {
                     tracing::error!("Failed to create OneSegAllocator: {}", e);
@@ -166,11 +177,12 @@ fn register_node_segments(
                 })?;
 
                 node_segments_manager
+                    .capacity_budget
+                    .extend_physical_capacity(seg_mem_info.len)?;
+                node_segments_manager
                     .device_id_2_allocator
                     .insert(device_id, Arc::new(allocator));
-                node_segments_manager.total_size = node_segments_manager
-                    .total_size
-                    .saturating_add(seg_mem_info.len);
+                node_segments_manager.total_size = new_total_size;
             }
         }
     }
@@ -221,19 +233,22 @@ pub struct NodeSegmentsManager {
     node_start_time: i64,
     total_size: u64,
     device_id_2_allocator: HashMap<SegmentDeviceID, Arc<OneSegAllocator>>,
+    capacity_budget: Arc<NodePoolCapacityBudget>,
     tomb_tag: NodeTombTag,
 }
 
 impl NodeSegmentsManager {
-    pub fn new(
+    fn new(
         node_start_time: i64,
         total_size: u64,
         device_id_2_allocator: HashMap<SegmentDeviceID, Arc<OneSegAllocator>>,
+        capacity_budget: Arc<NodePoolCapacityBudget>,
     ) -> Self {
         Self {
             node_start_time,
             total_size,
             device_id_2_allocator,
+            capacity_budget,
             tomb_tag: NodeTombTag::new(),
         }
     }
@@ -513,12 +528,117 @@ impl MasterSegManager {
         Ok(())
     }
 
-    pub fn get_node_space_size(&self, node_id: &str) -> u64 {
+    pub fn get_node_physical_space_size(&self, node_id: &str) -> u64 {
         self.inner()
             .node_allocators_and_tomb_tag
             .get(node_id)
             .filter(|node_segments_manager| !node_segments_manager.tomb_tag.is_tomb())
             .map(|node_segments_manager| node_segments_manager.total_size)
             .unwrap_or(0)
+    }
+
+    pub fn get_node_active_space_size(&self, node_id: &str) -> u64 {
+        self.get_node_pool_capacity(node_id)
+            .map(|(_, snapshot)| snapshot.active_capacity_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Return the exact live node generation and its shared active/parked capacity state.
+    pub fn get_node_pool_capacity(&self, node_id: &str) -> Option<(i64, NodePoolCapacitySnapshot)> {
+        let node = self.inner().node_allocators_and_tomb_tag.get(node_id)?;
+        if node.tomb_tag.is_tomb() {
+            return None;
+        }
+        Some((node.node_start_time, node.capacity_budget.snapshot()))
+    }
+
+    /// Update one live node generation with optimistic epoch fencing.
+    pub fn set_node_active_capacity(
+        &self,
+        node_id: &NodeID,
+        expected_node_start_time: i64,
+        expected_capacity_epoch: u64,
+        active_capacity_bytes: u64,
+    ) -> KvResult<NodePoolCapacitySnapshot> {
+        let node = self
+            .inner()
+            .node_allocators_and_tomb_tag
+            .get(node_id)
+            .ok_or_else(|| {
+                KvError::Api(
+                    crate::rpcresp_kvresult_convert::msg_and_error::ApiError::NodeNotFound {
+                        desc: node_id.to_string(),
+                    },
+                )
+            })?;
+        if node.tomb_tag.is_tomb() {
+            return Err(KvError::Api(
+                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::NodeNotFound {
+                    desc: format!("{} (departed generation)", node_id),
+                },
+            ));
+        }
+        if node.node_start_time != expected_node_start_time {
+            return Err(KvError::Api(
+                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::OwnerStartTimeMismatch {
+                    expected: expected_node_start_time,
+                    got: node.node_start_time,
+                },
+            ));
+        }
+        node.capacity_budget
+            .set_active_capacity(expected_capacity_epoch, active_capacity_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master_seg_manager::msg_pack::SegmentDeviceMemInfo;
+
+    #[test]
+    fn one_node_generation_shares_one_budget_across_registered_segments() {
+        let manager = build_node_segments_manager(
+            17,
+            HashMap::from([
+                (
+                    "cpu0".to_string(),
+                    (
+                        SegmentDeviceDescription::Cpu,
+                        SegmentDeviceMemInfo {
+                            addr: 0,
+                            len: 8 * 1024,
+                        },
+                    ),
+                ),
+                (
+                    "cpu1".to_string(),
+                    (
+                        SegmentDeviceDescription::Cpu,
+                        SegmentDeviceMemInfo {
+                            addr: 8 * 1024,
+                            len: 8 * 1024,
+                        },
+                    ),
+                ),
+            ]),
+        )
+        .unwrap();
+        let initial = manager.capacity_budget.snapshot();
+        assert_eq!(initial.physical_capacity_bytes, 16 * 1024);
+        assert_eq!(initial.active_capacity_bytes, 16 * 1024);
+
+        let allocators = manager
+            .device_id_2_allocator
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let _first = allocators[0].allocate(8 * 1024).unwrap();
+        let _second = allocators[1].allocate(8 * 1024).unwrap();
+        assert_eq!(
+            manager.capacity_budget.snapshot().used_capacity_bytes,
+            16 * 1024
+        );
+        assert!(allocators[0].allocate(1).is_err());
     }
 }

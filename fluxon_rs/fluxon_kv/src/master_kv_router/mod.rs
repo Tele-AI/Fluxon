@@ -17,27 +17,29 @@ use self::{
     get::{
         handle_batch_get_bind, handle_batch_get_done, handle_batch_get_plan,
         handle_batch_get_revoke, handle_batch_get_start, handle_batch_is_exist, handle_get_done,
-        handle_get_meta, handle_get_revoke, handle_get_start,
+        handle_get_meta, handle_get_revoke, handle_get_start, handle_ssd_stage_begin,
+        handle_ssd_stage_done,
     },
     msg_pack::{
         BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchEnqueueReplicaTaskReq,
         BatchEvictOwnerSourceReq, BatchGetBindReq, BatchGetDoneReq, BatchGetPlanReq,
         BatchGetRevokeReq, BatchGetStartReq, BatchIsExistReq, BatchOwnerReclaimReq,
-        BatchPreparePutKeysReq, BatchPutAppendDoneReq, BatchPutAppendStartReq, BatchPutDoneReq,
-        BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq, CountPrefixReq,
-        CountPrefixResp, DeleteAckReq, DeleteReq, GetAllocationMode, GetDoneReq, GetDoneResp,
-        GetMetaReq, GetRevokeReq, GetStartReq, GroupedBatchPutDoneReq, OwnerReclaimItem,
-        PutAppendDoneReq, PutAppendRevokeReq, PutAppendStartReq, PutAtomicGroup, PutDoneReq,
-        PutRevokeReq, PutStartReq, ReleaseLocalGrantReq, ReserveLocalGrantReq,
+        BatchPreparePutKeysReq, BatchPublishOwnerSsdReq, BatchPutAppendDoneReq,
+        BatchPutAppendStartReq, BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq,
+        BatchReleasePutKeyReservationsReq, CountPrefixReq, CountPrefixResp, DeleteAckReq,
+        DeleteReq, GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetRevokeReq,
+        GetSourceKind, GetStartReq, GroupedBatchPutDoneReq, OwnerReclaimItem, PutAppendDoneReq,
+        PutAppendRevokeReq, PutAppendStartReq, PutAtomicGroup, PutDoneReq, PutRevokeReq,
+        PutStartReq, ReleaseLocalGrantReq, ReserveLocalGrantReq, SsdStageBeginReq, SsdStageDoneReq,
     },
     placement::{PlacementPolicy, build_placement_policy},
     put::{
-        handle_batch_prepare_put_keys, handle_batch_put_append_done, handle_batch_put_append_start,
-        handle_batch_put_done, handle_batch_put_revoke, handle_batch_put_start,
-        handle_batch_release_put_key_reservations, handle_grouped_batch_put_done,
-        handle_put_append_done, handle_put_append_revoke, handle_put_append_start, handle_put_done,
-        handle_put_revoke, handle_put_start, handle_release_local_grant,
-        handle_reserve_local_grant,
+        handle_batch_prepare_put_keys, handle_batch_publish_owner_ssd,
+        handle_batch_put_append_done, handle_batch_put_append_start, handle_batch_put_done,
+        handle_batch_put_revoke, handle_batch_put_start, handle_batch_release_put_key_reservations,
+        handle_grouped_batch_put_done, handle_put_append_done, handle_put_append_revoke,
+        handle_put_append_start, handle_put_done, handle_put_revoke, handle_put_start,
+        handle_release_local_grant, handle_reserve_local_grant,
     },
     reclaim::handle_batch_evict_owner_source,
 };
@@ -53,16 +55,20 @@ use crate::master_lease_manager::{MasterLeaseManager, MasterLeaseManagerAccessTr
 use crate::master_seg_manager::MasterSegManager;
 use crate::master_seg_manager::MasterSegManagerAccessTrait;
 use crate::master_seg_manager::NodeTombTag;
-use crate::master_seg_manager::one_seg_allocator::Allocation;
+use crate::master_seg_manager::one_seg_allocator::{Allocation, NodePoolCapacitySnapshot};
 use crate::memholder::{EnsureMemholderMgmtDeleteHandle, MasterOwnerMemMgr, MemholderManagerTrait};
 use crate::metric_reporter::{MetricReporter, MetricReporterAccessTrait};
 use crate::p2p::msg_pack::{MsgPack, RPCCaller, RPCHandler};
-use crate::p2p::p2p_module::{P2pModule, P2pModuleAccessTrait};
-use crate::rpcresp_kvresult_convert::msg_and_error::{KvError, OK};
+use crate::p2p::p2p_module::{
+    P2pModule, P2pModuleAccessTrait, UserRpcAsyncHandler, UserRpcFuture,
+    user_rpc_register_handler_async,
+};
+use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, OK};
 use fluxon_framework::{LogicalModule, define_module};
 use fluxon_util::map_lock::AMapLock;
 use fluxon_util::pin_aware_moka::{PinAwareMoka, PinGuard};
 
+use ::tokio::sync::watch;
 use async_trait::async_trait;
 use chrono::Utc;
 use dashmap::{DashMap, DashSet};
@@ -71,6 +77,7 @@ use limit_thirdparty::tokio::{self, sync::ampsc};
 use moka::notification::RemovalCause;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -84,6 +91,7 @@ const INFLIGHT_PUT_TTL_SECONDS: u64 = 60;
 const INFLIGHT_PUT_TTL_SECONDS_SKIP_PUT_END_COMMIT: u64 = 5;
 const POST_ROUTE_MAINTENANCE_QUEUE_CAPACITY: usize = 512;
 const TIER1_WRITEBACK_QUEUE_CAPACITY: usize = 4096;
+pub const NODE_POOL_CAPACITY_USER_RPC_PATH: &str = "fluxon_kv/node_pool_capacity";
 
 fn subtract_pending_eviction_weight(
     pending_weight: &AtomicU64,
@@ -300,6 +308,14 @@ pub struct RequesterTargetPair {
 #[derive(Clone, Debug, Default)]
 pub struct ReplicaCacheNodeObserveSnapshot {
     pub owner_node: String,
+    pub owner_node_start_time: i64,
+    pub pool_physical_capacity_bytes: u64,
+    pub pool_active_capacity_bytes: u64,
+    pub pool_used_capacity_bytes: u64,
+    pub pool_parked_capacity_bytes: u64,
+    pub pool_draining_capacity_bytes: u64,
+    pub pool_available_capacity_bytes: u64,
+    pub pool_capacity_epoch: u64,
     pub entries: u64,
     pub weighted_bytes: u64,
     pub effective_capacity_bytes: u64,
@@ -341,6 +357,93 @@ pub struct MasterRuntimeObserveSnapshot {
     pub get_holding_entries: u64,
     pub get_holding_bytes: u64,
     pub replica_cache_nodes: Vec<ReplicaCacheNodeObserveSnapshot>,
+}
+
+/// Generation- and epoch-fenced runtime control request for one owner's preallocated pool.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NodePoolCapacityControlRequest {
+    Get {
+        owner_node_id: String,
+    },
+    SetActive {
+        owner_node_id: String,
+        expected_owner_node_start_time: i64,
+        expected_capacity_epoch: u64,
+        active_capacity_bytes: u64,
+    },
+}
+
+/// One coherent snapshot returned by both query and mutation operations.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodePoolCapacityControlResponse {
+    pub owner_node_id: String,
+    pub owner_node_start_time: i64,
+    pub physical_capacity_bytes: u64,
+    pub active_capacity_bytes: u64,
+    pub used_capacity_bytes: u64,
+    pub parked_capacity_bytes: u64,
+    pub draining_capacity_bytes: u64,
+    pub available_capacity_bytes: u64,
+    pub capacity_epoch: u64,
+    pub ring_b_base_capacity_bytes: u64,
+    pub ring_b_effective_capacity_bytes: u64,
+    pub ring_b_weighted_bytes: u64,
+    pub ring_b_pending_reclaim_bytes: u64,
+    pub tier1_capacity_bytes: u64,
+    pub settled: bool,
+}
+
+struct NodePoolCapacityUserRpcHandler {
+    view: MasterKvRouterView,
+}
+
+impl UserRpcAsyncHandler for NodePoolCapacityUserRpcHandler {
+    fn handle(&self, from_node: NodeID, payload: Vec<u8>) -> UserRpcFuture {
+        let view = self.view.clone();
+        Box::pin(async move {
+            let request: NodePoolCapacityControlRequest = serde_json::from_slice(&payload)
+                .map_err(|err| {
+                    KvError::Api(ApiError::InvalidArgument {
+                        detail: format!("invalid node pool capacity request: {err}"),
+                    })
+                })?;
+            let response = match request {
+                NodePoolCapacityControlRequest::Get { owner_node_id } => view
+                    .master_kv_router()
+                    .node_pool_capacity_control_snapshot(&owner_node_id)?,
+                NodePoolCapacityControlRequest::SetActive {
+                    owner_node_id,
+                    expected_owner_node_start_time,
+                    expected_capacity_epoch,
+                    active_capacity_bytes,
+                } => {
+                    tracing::info!(
+                        caller = %from_node,
+                        owner = %owner_node_id,
+                        expected_owner_node_start_time,
+                        expected_capacity_epoch,
+                        active_capacity_bytes,
+                        "applying node pool active capacity"
+                    );
+                    view.master_kv_router()
+                        .set_node_pool_active_capacity(
+                            owner_node_id.into(),
+                            expected_owner_node_start_time,
+                            expected_capacity_epoch,
+                            active_capacity_bytes,
+                        )
+                        .await?
+                }
+            };
+            serde_json::to_vec(&response).map_err(|err| {
+                KvError::Api(ApiError::Unknown {
+                    detail: format!("serialize node pool capacity response failed: {err}"),
+                })
+            })
+        })
+    }
 }
 
 impl RequesterTargetPair {
@@ -435,6 +538,10 @@ pub struct InflightGetInfo {
     pub len: u64,
     pub src_addr: u64,
     pub src_base_addr: u64,
+    pub source_kind: crate::master_kv_router::msg_pack::GetSourceKind,
+    /// Registered source staging owned by the master only for SSD reads.
+    pub ssd_source_allocation: Option<Arc<Allocation>>,
+    pub(crate) ssd_stage_lifecycle: Option<Arc<SsdStageLifecycle>>,
     pub atomic_group: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
     pub target: InflightGetTarget,
     /// Exact requester segment-registration generation that owns an
@@ -449,6 +556,70 @@ pub struct InflightGetInfo {
     /// owners may fetch the same key concurrently, but one owner must never
     /// materialize two candidate committed slots for the same key.
     pub(crate) _prepared_requester_lease: Option<Arc<PreparedGetRequesterLease>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SsdStagePhase {
+    NotStarted,
+    Active,
+    Quiescent,
+}
+
+pub(crate) struct SsdStageLifecycle {
+    phase: Mutex<SsdStagePhase>,
+    phase_changed: watch::Sender<SsdStagePhase>,
+}
+
+impl SsdStageLifecycle {
+    fn new() -> Self {
+        let (phase_changed, _receiver) = watch::channel(SsdStagePhase::NotStarted);
+        Self {
+            phase: Mutex::new(SsdStagePhase::NotStarted),
+            phase_changed,
+        }
+    }
+
+    pub(crate) fn begin(&self) -> bool {
+        let mut phase = self.phase.lock();
+        match *phase {
+            SsdStagePhase::NotStarted => {
+                *phase = SsdStagePhase::Active;
+                self.phase_changed.send_replace(SsdStagePhase::Active);
+                true
+            }
+            // An RPC response can be lost after the master accepted Begin.
+            // Replaying the exact source/get operation must not make the owner
+            // abandon a stage which the master already considers active.
+            SsdStagePhase::Active => true,
+            SsdStagePhase::Quiescent => false,
+        }
+    }
+
+    pub(crate) fn finish(&self) -> bool {
+        let mut phase = self.phase.lock();
+        if *phase != SsdStagePhase::Active {
+            return false;
+        }
+        *phase = SsdStagePhase::Quiescent;
+        self.phase_changed.send_replace(SsdStagePhase::Quiescent);
+        true
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        *self.phase.lock() == SsdStagePhase::Active
+    }
+
+    pub(crate) async fn wait_until_not_active(&self) {
+        let mut phase_changed = self.phase_changed.subscribe();
+        loop {
+            if *phase_changed.borrow_and_update() != SsdStagePhase::Active {
+                return;
+            }
+            if phase_changed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 /// A metadata-only Get source snapshot before caller-owned destination binding.
@@ -467,6 +638,7 @@ pub struct PlannedGetInfo {
     pub len: u64,
     pub src_addr: u64,
     pub src_base_addr: u64,
+    pub source_kind: crate::master_kv_router::msg_pack::GetSourceKind,
     pub atomic_group: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
 }
 
@@ -602,6 +774,24 @@ pub(crate) struct MasterPlannedGetCounters {
     bind_stale: AtomicU64,
     bind_activity_busy: AtomicU64,
     plan_revoked: AtomicU64,
+    remote_ssd_filtered_items: AtomicU64,
+    remote_ssd_filtered_bytes: AtomicU64,
+}
+
+#[derive(Default)]
+pub(crate) struct MasterSsdTierCounters {
+    local_ssd_selected_with_remote_memory_items: AtomicU64,
+    local_ssd_selected_with_remote_memory_bytes: AtomicU64,
+    local_ssd_selected_without_remote_memory_items: AtomicU64,
+    local_ssd_selected_without_remote_memory_bytes: AtomicU64,
+    local_ssd_published_with_remote_memory_items: AtomicU64,
+    local_ssd_published_with_remote_memory_bytes: AtomicU64,
+    local_ssd_published_without_remote_memory_items: AtomicU64,
+    local_ssd_published_without_remote_memory_bytes: AtomicU64,
+    memory_removed_ssd_survived_items: AtomicU64,
+    memory_removed_ssd_survived_bytes: AtomicU64,
+    memory_removed_ssd_became_only_items: AtomicU64,
+    memory_removed_ssd_became_only_bytes: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1009,8 +1199,7 @@ impl KvReplicaBacking {
 }
 
 #[derive(Clone, Debug)]
-pub struct KvRouteInfo {
-    pub node_id: NodeID,
+pub struct KvMemoryReplica {
     pub backing: KvReplicaBacking,
     /// Whether this owner also published the route backing into its local key index.
     /// Replica-task and remote-put targets are raw master-owned allocations and have no
@@ -1023,7 +1212,44 @@ pub struct KvRouteInfo {
     /// Excludes a non-ring-B backing from the unindexed-Allocation budget and
     /// is released with the exact route lifetime.
     pub capacity_reservation: Option<Arc<NodeCacheCapacityReservation>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct KvSsdReplica {
+    pub len: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SsdReplicaCommitStatus {
+    Committed,
+    MissingMemory,
+    TombedNode,
+    LengthMismatch,
+}
+
+/// All physical backings contributed by one owner generation for one key-version.
+///
+/// Route, version, and owner generation stay common. Storage tiers only own their
+/// medium-specific state, so adding SSD does not create a second route lifecycle.
+#[derive(Clone, Debug)]
+pub struct KvNodeReplicas {
     pub tomb_tag: NodeTombTag,
+    pub memory: Option<KvMemoryReplica>,
+    pub ssd: Option<KvSsdReplica>,
+}
+
+impl KvNodeReplicas {
+    pub fn memory(tomb_tag: NodeTombTag, memory: KvMemoryReplica) -> Self {
+        Self {
+            tomb_tag,
+            memory: Some(memory),
+            ssd: None,
+        }
+    }
+
+    pub fn has_live_backing(&self) -> bool {
+        !self.tomb_tag.is_tomb() && (self.memory.is_some() || self.ssd.is_some())
+    }
 }
 
 pub struct GetDurableSlotReservation {
@@ -1080,24 +1306,55 @@ pub struct OneKvNodesRoutes {
     /// Version-scoped multi-key group supplied by the put caller.
     pub atomic_group: Option<Arc<PutAtomicGroup>>,
 
-    /// node_id -> KvRouteInfo
-    pub nodes_replicas: RwLock<HashMap<NodeID, KvRouteInfo>>,
+    /// node_id -> all backings owned by that exact node generation.
+    pub node_replicas: RwLock<HashMap<NodeID, KvNodeReplicas>>,
     pub get_durable_slots_used: AtomicU32,
 }
 
 impl OneKvNodesRoutes {
+    pub(crate) fn commit_ssd_replica(&self, node_id: &NodeID, len: u64) -> SsdReplicaCommitStatus {
+        let mut replicas = self.node_replicas.write();
+        let Some(node_replicas) = replicas.get_mut(node_id) else {
+            return SsdReplicaCommitStatus::MissingMemory;
+        };
+        if node_replicas.tomb_tag.is_tomb() {
+            return SsdReplicaCommitStatus::TombedNode;
+        }
+        let Some(memory) = node_replicas.memory.as_ref() else {
+            return SsdReplicaCommitStatus::MissingMemory;
+        };
+        if memory.backing.len() != len {
+            return SsdReplicaCommitStatus::LengthMismatch;
+        }
+        node_replicas.ssd = Some(KvSsdReplica { len });
+        SsdReplicaCommitStatus::Committed
+    }
+
+    pub(crate) fn remove_ssd_replica(&self, node_id: &NodeID) -> bool {
+        let mut replicas = self.node_replicas.write();
+        let Some(node_replicas) = replicas.get_mut(node_id) else {
+            return false;
+        };
+        let removed = node_replicas.ssd.take().is_some();
+        if node_replicas.memory.is_none() {
+            replicas.remove(node_id);
+        }
+        removed
+    }
+
     fn clean_up_tomb_nodes_replicas(
         &self,
         verify_put_id: PutIDForAKey,
         tombs: HashSet<NodeID>,
-        view: &MasterKvRouterView,
+        _view: &MasterKvRouterView,
     ) -> bool {
         if self.put_id != verify_put_id {
             return false;
         }
 
-        let mut nodes_replicas = self.nodes_replicas.write();
-        nodes_replicas.retain(|_, kv_info| !tombs.contains(&kv_info.node_id));
+        let mut node_replicas = self.node_replicas.write();
+        node_replicas
+            .retain(|node_id, replicas| !tombs.contains(node_id) || !replicas.tomb_tag.is_tomb());
 
         return true;
     }
@@ -1139,9 +1396,10 @@ fn ring_b_route_replica_desc(
     if route.lease_id.is_some() {
         return None;
     }
-    let replicas = route.nodes_replicas.read();
-    let replica = replicas.get(node_id)?;
-    if replica.tomb_tag.is_tomb()
+    let replicas = route.node_replicas.read();
+    let node_replicas = replicas.get(node_id)?;
+    let replica = node_replicas.memory.as_ref()?;
+    if node_replicas.tomb_tag.is_tomb()
         || replica.owner_local_indexed
         || !matches!(&replica.backing, KvReplicaBacking::Allocation(_))
     {
@@ -1181,32 +1439,41 @@ pub(crate) fn node_generation_is_current_live(
 pub(crate) fn publish_route_replica_tomb_fenced(
     route: &OneKvNodesRoutes,
     node_id: NodeID,
-    replica: KvRouteInfo,
+    replica: KvMemoryReplica,
+    publish_tag: NodeTombTag,
 ) -> bool {
-    let publish_tag = replica.tomb_tag.clone();
     if publish_tag.is_tomb() {
         return false;
     }
 
-    let mut replicas = route.nodes_replicas.write();
+    let mut replicas = route.node_replicas.write();
     if publish_tag.is_tomb() {
         return false;
     }
-    // A completion pre-check is necessarily racy with another completion for
-    // the same requester.  Never replace a live replica here: only a tombed
-    // generation may be superseded.
-    if replicas
-        .get(&node_id)
-        .is_some_and(|current| !current.tomb_tag.is_tomb())
-    {
-        return false;
-    }
-    let previous = replicas.insert(node_id.clone(), replica);
+    let previous = match replicas.get_mut(&node_id) {
+        Some(current)
+            if !current.tomb_tag.is_tomb() && current.tomb_tag.same_generation(&publish_tag) =>
+        {
+            // A completion pre-check is necessarily racy with another completion.
+            // Preserve an already-published memory backing, while allowing the same
+            // generation to regain DRAM from an SSD-only route.
+            if current.memory.is_some() {
+                return false;
+            }
+            current.memory = Some(replica);
+            None
+        }
+        Some(current) if !current.tomb_tag.is_tomb() => return false,
+        _ => replicas.insert(
+            node_id.clone(),
+            KvNodeReplicas::memory(publish_tag.clone(), replica),
+        ),
+    };
 
     if publish_tag.is_tomb() {
-        let published_is_current = replicas.get(&node_id).is_some_and(|current| {
-            current.node_id == node_id && current.tomb_tag.same_generation(&publish_tag)
-        });
+        let published_is_current = replicas
+            .get(&node_id)
+            .is_some_and(|current| current.tomb_tag.same_generation(&publish_tag));
         if published_is_current {
             replicas.remove(&node_id);
             if let Some(previous) = previous.filter(|old| !old.tomb_tag.is_tomb()) {
@@ -1282,11 +1549,9 @@ fn remove_departed_generation_from_route(
     departed_tag: &NodeTombTag,
 ) -> Option<PutIDForAKey> {
     let became_empty = {
-        let mut replicas = route.nodes_replicas.write();
+        let mut replicas = route.node_replicas.write();
         let remove = replicas.get(node_id).is_some_and(|replica| {
-            replica.node_id.as_ref() == node_id
-                && replica.tomb_tag.is_tomb()
-                && replica.tomb_tag.same_generation(departed_tag)
+            replica.tomb_tag.is_tomb() && replica.tomb_tag.same_generation(departed_tag)
         });
         if !remove {
             return None;
@@ -1304,7 +1569,7 @@ fn remove_departed_generation_from_route(
             // `Arc::ptr_eq` prevents an old cleanup from removing a replacement route (ABA).
             // Recheck emptiness under the per-route read lock because another replica may have
             // joined after the write lock above was released.
-            Arc::ptr_eq(current, route) && current.nodes_replicas.read().is_empty()
+            Arc::ptr_eq(current, route) && current.node_replicas.read().is_empty()
         })
         .map(|(_, removed)| removed.put_id)
 }
@@ -1366,13 +1631,11 @@ async fn cleanup_departed_generation_routes(
                 continue;
             };
             let had_departed_replica = route
-                .nodes_replicas
+                .node_replicas
                 .read()
                 .get(node_id.as_str())
                 .is_some_and(|replica| {
-                    replica.node_id.as_ref() == node_id.as_str()
-                        && replica.tomb_tag.is_tomb()
-                        && replica.tomb_tag.same_generation(&departed_tag)
+                    replica.tomb_tag.is_tomb() && replica.tomb_tag.same_generation(&departed_tag)
                 });
             if !had_departed_replica {
                 continue;
@@ -1443,7 +1706,7 @@ mod tests {
             put_id: (1, 0),
             lease_id: None,
             atomic_group: None,
-            nodes_replicas: RwLock::new(HashMap::new()),
+            node_replicas: RwLock::new(HashMap::new()),
             get_durable_slots_used: AtomicU32::new(0),
         });
 
@@ -1457,12 +1720,35 @@ mod tests {
     }
 
     #[test]
+    fn ssd_stage_lifecycle_replays_begin_and_never_loses_quiescence() {
+        futures::executor::block_on(async {
+            let lifecycle = Arc::new(SsdStageLifecycle::new());
+            assert!(lifecycle.begin());
+            assert!(
+                lifecycle.begin(),
+                "a lost Begin response must replay Active as accepted"
+            );
+
+            let waiter = lifecycle.wait_until_not_active();
+            let finisher = async {
+                assert!(lifecycle.is_active());
+                assert!(lifecycle.finish());
+            };
+            futures::future::join(waiter, finisher).await;
+
+            assert!(!lifecycle.finish());
+            assert!(!lifecycle.begin());
+            lifecycle.wait_until_not_active().await;
+        });
+    }
+
+    #[test]
     fn durable_slot_token_returns_capacity_across_ten_fill_demote_cycles() {
         let routes = Arc::new(OneKvNodesRoutes {
             put_id: (1, 0),
             lease_id: None,
             atomic_group: None,
-            nodes_replicas: RwLock::new(HashMap::new()),
+            node_replicas: RwLock::new(HashMap::new()),
             get_durable_slots_used: AtomicU32::new(0),
         });
 
@@ -1680,9 +1966,8 @@ mod tests {
         );
     }
 
-    fn test_route_info_with_tag(node_id: &str, tomb_tag: NodeTombTag) -> KvRouteInfo {
-        KvRouteInfo {
-            node_id: node_id.to_string().into(),
+    fn test_memory_replica(node_id: &str) -> KvMemoryReplica {
+        KvMemoryReplica {
             backing: KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
                 owner_node_id: node_id.to_string().into(),
                 grant_id: 1,
@@ -1695,11 +1980,14 @@ mod tests {
             owner_local_indexed: true,
             get_durable_reservation: None,
             capacity_reservation: None,
-            tomb_tag,
         }
     }
 
-    fn test_route_info(node_id: &str, tomb: bool) -> KvRouteInfo {
+    fn test_route_info_with_tag(node_id: &str, tomb_tag: NodeTombTag) -> KvNodeReplicas {
+        KvNodeReplicas::memory(tomb_tag, test_memory_replica(node_id))
+    }
+
+    fn test_route_info(node_id: &str, tomb: bool) -> KvNodeReplicas {
         let tomb_tag = NodeTombTag::new();
         if tomb {
             tomb_tag.set_tomb();
@@ -1707,7 +1995,7 @@ mod tests {
         test_route_info_with_tag(node_id, tomb_tag)
     }
 
-    fn test_allocation_route_info(node_id: &str, owner_local_indexed: bool) -> KvRouteInfo {
+    fn test_allocation_route_info(node_id: &str, owner_local_indexed: bool) -> KvNodeReplicas {
         let allocator = Arc::new(
             crate::master_seg_manager::one_seg_allocator::OneSegAllocator::new(
                 format!("{node_id}-segment"),
@@ -1718,14 +2006,15 @@ mod tests {
             .unwrap(),
         );
         let allocation = allocator.allocate(1024).unwrap();
-        KvRouteInfo {
-            node_id: node_id.to_string().into(),
-            backing: KvReplicaBacking::Allocation(Arc::new(allocation)),
-            owner_local_indexed,
-            get_durable_reservation: None,
-            capacity_reservation: None,
-            tomb_tag: NodeTombTag::new(),
-        }
+        KvNodeReplicas::memory(
+            NodeTombTag::new(),
+            KvMemoryReplica {
+                backing: KvReplicaBacking::Allocation(Arc::new(allocation)),
+                owner_local_indexed,
+                get_durable_reservation: None,
+                capacity_reservation: None,
+            },
+        )
     }
 
     fn test_route(
@@ -1737,7 +2026,7 @@ mod tests {
             put_id,
             lease_id,
             atomic_group: None,
-            nodes_replicas: RwLock::new(
+            node_replicas: RwLock::new(
                 replicas
                     .into_iter()
                     .map(|(node_id, tomb)| {
@@ -1756,7 +2045,7 @@ mod tests {
             put_id: (91, 3),
             lease_id,
             atomic_group: None,
-            nodes_replicas: RwLock::new(HashMap::from([(node.clone(), replica)])),
+            node_replicas: RwLock::new(HashMap::from([(node.clone(), replica)])),
             get_durable_slots_used: AtomicU32::new(0),
         };
 
@@ -1773,9 +2062,46 @@ mod tests {
         assert!(ring_b_route_replica_desc(&leased, "same-node").is_none());
 
         let mut committed = test_route_info("same-node", false);
-        committed.owner_local_indexed = false;
+        committed
+            .memory
+            .as_mut()
+            .expect("test route has memory")
+            .owner_local_indexed = false;
         let committed = make_route(None, committed);
         assert!(ring_b_route_replica_desc(&committed, "same-node").is_none());
+    }
+
+    #[test]
+    fn ssd_commit_reuses_the_live_owner_route_and_validates_memory_length() {
+        let owner: NodeID = "owner".to_string().into();
+        let route = test_route((92, 1), None, vec![("owner", false)]);
+
+        assert_eq!(
+            route.commit_ssd_replica(&owner, 2048),
+            SsdReplicaCommitStatus::LengthMismatch
+        );
+        assert_eq!(
+            route.commit_ssd_replica(&owner, 1024),
+            SsdReplicaCommitStatus::Committed
+        );
+        {
+            let replicas = route.node_replicas.read();
+            let owner_replicas = replicas.get(&owner).unwrap();
+            assert!(owner_replicas.memory.is_some());
+            assert_eq!(owner_replicas.ssd.as_ref().map(|ssd| ssd.len), Some(1024));
+        }
+
+        route.node_replicas.write().get_mut(&owner).unwrap().memory = None;
+        assert_eq!(
+            route.commit_ssd_replica(&owner, 1024),
+            SsdReplicaCommitStatus::MissingMemory
+        );
+        assert!(route.remove_ssd_replica(&owner));
+        assert!(
+            route.node_replicas.read().is_empty(),
+            "a stale SSD-only owner entry must converge to an empty route"
+        );
+        assert!(!route.remove_ssd_replica(&owner));
     }
 
     #[test]
@@ -1791,7 +2117,7 @@ mod tests {
             put_id: (10, 0),
             lease_id: None,
             atomic_group: None,
-            nodes_replicas: RwLock::new(HashMap::from([(
+            node_replicas: RwLock::new(HashMap::from([(
                 "owner".to_string().into(),
                 test_route_info_with_tag("owner", departed_tag.clone()),
             )])),
@@ -1801,7 +2127,7 @@ mod tests {
             put_id: (11, 0),
             lease_id: None,
             atomic_group: None,
-            nodes_replicas: RwLock::new(HashMap::from([(
+            node_replicas: RwLock::new(HashMap::from([(
                 "owner".to_string().into(),
                 test_route_info_with_tag("owner", live_reconnect_tag),
             )])),
@@ -1811,7 +2137,7 @@ mod tests {
             put_id: (12, 0),
             lease_id: None,
             atomic_group: None,
-            nodes_replicas: RwLock::new(HashMap::from([(
+            node_replicas: RwLock::new(HashMap::from([(
                 "owner".to_string().into(),
                 test_route_info_with_tag("owner", newer_tomb_tag),
             )])),
@@ -1844,7 +2170,7 @@ mod tests {
         );
         assert!(
             live_route
-                .nodes_replicas
+                .node_replicas
                 .read()
                 .get("owner")
                 .is_some_and(|replica| !replica.tomb_tag.is_tomb())
@@ -1859,7 +2185,7 @@ mod tests {
             ),
             None
         );
-        assert!(newer_tomb_route.nodes_replicas.read().contains_key("owner"));
+        assert!(newer_tomb_route.node_replicas.read().contains_key("owner"));
     }
 
     #[test]
@@ -1871,7 +2197,7 @@ mod tests {
             put_id: (20, 0),
             lease_id: None,
             atomic_group: None,
-            nodes_replicas: RwLock::new(HashMap::from([(
+            node_replicas: RwLock::new(HashMap::from([(
                 "owner".to_string().into(),
                 test_route_info_with_tag("owner", departed_tag.clone()),
             )])),
@@ -1895,7 +2221,7 @@ mod tests {
         assert!(Arc::ptr_eq(current.value(), &replacement));
         assert!(
             current
-                .nodes_replicas
+                .node_replicas
                 .read()
                 .get("peer")
                 .is_some_and(|replica| !replica.tomb_tag.is_tomb())
@@ -1906,7 +2232,7 @@ mod tests {
     fn replica_publish_fence_never_overwrites_live_or_publishes_tomb_generation() {
         let old_tag = NodeTombTag::new();
         let route = test_route((30, 0), None, vec![]);
-        route.nodes_replicas.write().insert(
+        route.node_replicas.write().insert(
             "owner".to_string().into(),
             test_route_info_with_tag("owner", old_tag.clone()),
         );
@@ -1915,11 +2241,12 @@ mod tests {
         assert!(!publish_route_replica_tomb_fenced(
             &route,
             "owner".to_string().into(),
-            test_route_info_with_tag("owner", contender_tag),
+            test_memory_replica("owner"),
+            contender_tag,
         ));
         assert!(
             route
-                .nodes_replicas
+                .node_replicas
                 .read()
                 .get("owner")
                 .is_some_and(|replica| replica.tomb_tag.same_generation(&old_tag))
@@ -1930,11 +2257,12 @@ mod tests {
         assert!(publish_route_replica_tomb_fenced(
             &route,
             "owner".to_string().into(),
-            test_route_info_with_tag("owner", replacement_tag.clone()),
+            test_memory_replica("owner"),
+            replacement_tag.clone(),
         ));
         assert!(
             route
-                .nodes_replicas
+                .node_replicas
                 .read()
                 .get("owner")
                 .is_some_and(|replica| replica.tomb_tag.same_generation(&replacement_tag))
@@ -1945,9 +2273,10 @@ mod tests {
         assert!(!publish_route_replica_tomb_fenced(
             &route,
             "departed".to_string().into(),
-            test_route_info_with_tag("departed", departed_tag),
+            test_memory_replica("departed"),
+            departed_tag,
         ));
-        assert!(!route.nodes_replicas.read().contains_key("departed"));
+        assert!(!route.node_replicas.read().contains_key("departed"));
     }
 
     #[test]
@@ -1962,7 +2291,7 @@ mod tests {
             put_id: (41, 0),
             lease_id: None,
             atomic_group: None,
-            nodes_replicas: RwLock::new(HashMap::from([(
+            node_replicas: RwLock::new(HashMap::from([(
                 "owner".to_string().into(),
                 test_route_info_with_tag("owner", departed_tag.clone()),
             )])),
@@ -1982,7 +2311,7 @@ mod tests {
             put_id: (42, 0),
             lease_id: None,
             atomic_group: None,
-            nodes_replicas: RwLock::new(HashMap::from([(
+            node_replicas: RwLock::new(HashMap::from([(
                 "owner".to_string().into(),
                 test_route_info_with_tag("owner", live_tag.clone()),
             )])),
@@ -2066,6 +2395,52 @@ mod tests {
         assert_eq!(cache.max_capacity(), Some(512));
         cache.set_max_capacity(2048).unwrap();
         assert_eq!(cache.max_capacity(), Some(2048));
+    }
+
+    #[test]
+    fn ring_b_shrink_selects_single_entries_to_the_new_active_boundary() {
+        let selected = Arc::new(AtomicU64::new(0));
+        let selected_for_listener = selected.clone();
+        let cache = MasterNodeCache::builder(1024)
+            .weigher(|_key: &String, desc: &NodeValueReplicaDesc| desc.weight_bytes)
+            .eviction_listener(move |_key, _desc, cause| {
+                assert_eq!(cause, RemovalCause::Size);
+                selected_for_listener.fetch_add(1, Ordering::Relaxed);
+            })
+            .build();
+        for key in 0..8 {
+            insert_master_cache_entry(
+                &cache,
+                key.to_string(),
+                NodeValueReplicaDesc {
+                    weight_bytes: 128,
+                    put_id: (10, key),
+                },
+            );
+        }
+        cache.run_pending_tasks();
+        assert_eq!(cache.weighted_size(), 1024);
+
+        cache.set_max_capacity(512).unwrap();
+        cache.run_pending_tasks();
+        assert!(cache.weighted_size() <= 512);
+        assert_eq!(selected.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn node_pool_capacity_control_json_is_a_finite_generation_fenced_contract() {
+        let request = NodePoolCapacityControlRequest::SetActive {
+            owner_node_id: "cpu-owner".to_string(),
+            expected_owner_node_start_time: 17,
+            expected_capacity_epoch: 3,
+            active_capacity_bytes: 240 * 1024 * 1024 * 1024,
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let decoded: NodePoolCapacityControlRequest = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, request);
+        let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["operation"], "set_active");
+        assert_eq!(json["expected_capacity_epoch"], 3);
     }
 
     #[test]
@@ -2312,6 +2687,7 @@ pub struct MasterKvRouterInner {
     /// `inflight_gets` after re-reading and validating the current route.
     pub planned_gets: moka::future::Cache<u64, PlannedGetInfo>,
     pub(crate) planned_get_counters: MasterPlannedGetCounters,
+    pub(crate) ssd_tier_counters: MasterSsdTierCounters,
     /// Idempotent terminal GetDone results retained across response loss/retry.
     pub completed_gets: moka::future::Cache<u64, CompletedGetInfo>,
     pub get_done_locks: AMapLock<u64>,
@@ -2388,6 +2764,11 @@ pub struct MasterKvRouterInner {
     /// request lock, and no cache/global scan occurs under it.
     pub(crate) owner_cache_operation_locks: AMapLock<String>,
 
+    /// Serializes the active pool target, reservation counters, and their derived Moka limits.
+    /// The critical section contains only local metadata/housekeeping and is shared with
+    /// synchronous reservation Drop paths, so it intentionally uses a short parking_lot lock.
+    node_capacity_boundary_locks: DashMap<NodeIDString, Arc<Mutex<()>>>,
+
     /// Historical final put placement decisions by target node.
     pub put_target_decision_counts: DashMap<NodeIDString, Arc<AtomicU64>>,
 
@@ -2406,6 +2787,11 @@ pub struct MasterKvRouterInner {
     /// Historical get source choices by requester->source pair.
     pub get_requester_source_counts: DashMap<RequesterTargetPair, Arc<AtomicU64>>,
     pub get_requester_source_bytes: DashMap<RequesterTargetPair, Arc<AtomicU64>>,
+    /// Source-tier/locality matrix for planned and ordinary Gets. This keeps
+    /// local SSD, remote SSD, local memory, and remote memory separable in
+    /// evidence instead of inferring them from per-owner aggregate loads.
+    pub get_source_class_counts: DashMap<&'static str, Arc<AtomicU64>>,
+    pub get_source_class_bytes: DashMap<&'static str, Arc<AtomicU64>>,
     pub get_allocation_mode_counts: DashMap<&'static str, Arc<AtomicU64>>,
 
     /// Support replicas: key -> version_id
@@ -2569,6 +2955,7 @@ impl MasterKvRouter {
             inflight_gets,
             planned_gets,
             planned_get_counters: MasterPlannedGetCounters::default(),
+            ssd_tier_counters: MasterSsdTierCounters::default(),
             completed_gets,
             get_done_locks: AMapLock::new(Duration::from_secs(10 * 60)),
             key_activity,
@@ -2595,6 +2982,7 @@ impl MasterKvRouter {
             eviction_reclaim_inflight: DashSet::new(),
             eviction_reclaim_counters: DashMap::new(),
             owner_cache_operation_locks: AMapLock::new(Duration::from_secs(10 * 60)),
+            node_capacity_boundary_locks: DashMap::new(),
             put_target_decision_counts: DashMap::new(),
             put_requester_target_decision_counts: DashMap::new(),
             put_placement_mode_counts: DashMap::new(),
@@ -2602,6 +2990,8 @@ impl MasterKvRouter {
             replica_done_terminal_replay_count: AtomicU64::new(0),
             get_requester_source_counts: DashMap::new(),
             get_requester_source_bytes: DashMap::new(),
+            get_source_class_counts: DashMap::new(),
+            get_source_class_bytes: DashMap::new(),
             get_allocation_mode_counts: DashMap::new(),
             recent_key_versionid_allocator: moka::sync::SegmentedCache::builder(8)
                 .time_to_idle(Duration::from_secs(5))
@@ -2700,33 +3090,47 @@ impl MasterKvRouter {
         .ring_b_bytes
     }
 
-    /// Refresh already-created node controllers after segment metadata or
-    /// reservation inputs change. Generation-scoped reservations reduce only
-    /// the physical ring-B allocation boundary. Tier1 is an inclusive metadata
-    /// policy window and always remains ratio-derived from the owner segment.
-    fn reconcile_node_cache_capacity(&self, node_id: &str) {
+    fn node_capacity_boundary_lock(&self, node_id: &str) -> Arc<Mutex<()>> {
+        self.inner()
+            .node_capacity_boundary_locks
+            .entry(node_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .value()
+            .clone()
+    }
+
+    /// Apply the current active pool size to every derived Moka boundary.
+    fn apply_node_cache_capacity_locked(&self, node_id: &str) -> KvResult<()> {
+        if !self.replica_cache_enabled() {
+            return Ok(());
+        }
         let node_space_size = self
             .inner()
             .view()
             .master_seg_manager()
-            .get_node_space_size(node_id);
+            .get_node_active_space_size(node_id);
         if node_space_size == 0 {
-            return;
+            return Err(KvError::Api(ApiError::NodeNotFound {
+                desc: format!("{node_id} (no live active pool)"),
+            }));
         }
         let capacity = self.replica_cache_effective_capacity(node_id, node_space_size);
-        if let Some(cache) = self
-            .inner()
-            .node_kv_cache_controller
-            .get(node_id)
-            .map(|entry| entry.value().clone())
-        {
-            if let Err(err) = cache.set_max_capacity(capacity) {
-                error!(
-                    "failed to refresh ring-B cache capacity: node={} capacity={} err={}",
-                    node_id, capacity, err,
-                );
-            }
-        }
+        let cache = self.get_node_cache_controller(node_id).ok_or_else(|| {
+            KvError::Api(ApiError::NodeNotFound {
+                desc: format!("{node_id} (ring-B controller unavailable)"),
+            })
+        })?;
+        cache.set_max_capacity(capacity).map_err(|err| {
+            KvError::Api(ApiError::Allocator {
+                detail: format!(
+                    "failed to set ring-B capacity: node={} capacity={} err={}",
+                    node_id, capacity, err
+                ),
+            })
+        })?;
+        // Drive Size selection now. Physical release remains asynchronous and continues through
+        // the existing generation-fenced single-KV reclaim actor.
+        cache.run_pending_tasks();
         if let Some(cache) = self
             .inner()
             .node_writeback_tier1_controller
@@ -2736,12 +3140,50 @@ impl MasterKvRouter {
             let tier1_capacity = self
                 .writeback_tier1_base_capacity(node_space_size)
                 .unwrap_or(0);
-            if let Err(err) = cache.set_max_capacity(tier1_capacity) {
-                error!(
-                    "failed to refresh tier1 cache capacity: node={} capacity={} err={}",
-                    node_id, tier1_capacity, err,
-                );
-            }
+            cache.set_max_capacity(tier1_capacity).map_err(|err| {
+                KvError::Api(ApiError::Allocator {
+                    detail: format!(
+                        "failed to set tier1 capacity: node={} capacity={} err={}",
+                        node_id, tier1_capacity, err
+                    ),
+                })
+            })?;
+            cache.run_pending_tasks();
+        }
+        Ok(())
+    }
+
+    fn apply_node_cache_capacity(&self, node_id: &str) -> KvResult<()> {
+        let capacity_lock = self.node_capacity_boundary_lock(node_id);
+        let _capacity_guard = capacity_lock.lock();
+        self.apply_node_cache_capacity_locked(node_id)
+    }
+
+    /// Refresh controllers after registration or reservation changes. Runtime resize uses the
+    /// fallible helper directly so a control response never reports an unapplied target.
+    fn reconcile_node_cache_capacity(&self, node_id: &str) {
+        // Member discovery can precede segment registration. There is no pool boundary to
+        // reconcile during that normal startup window; registration success will call us again.
+        // Keep the fallible runtime-control path strict, but do not emit a false operational
+        // error for this transient internal reconcile.
+        if self
+            .inner()
+            .view()
+            .master_seg_manager()
+            .get_node_active_space_size(node_id)
+            == 0
+        {
+            debug!(
+                "deferring node cache capacity refresh until pool registration: node={}",
+                node_id
+            );
+            return;
+        }
+        if let Err(err) = self.apply_node_cache_capacity(node_id) {
+            error!(
+                "failed to refresh node cache capacity: node={} err={}",
+                node_id, err
+            );
         }
     }
 
@@ -2753,6 +3195,191 @@ impl MasterKvRouter {
             0,
         )
         .tier1_bytes
+    }
+
+    fn node_pool_capacity_response(
+        &self,
+        owner_node_id: &str,
+        owner_node_start_time: i64,
+        pool: NodePoolCapacitySnapshot,
+    ) -> NodePoolCapacityControlResponse {
+        let ring_b_base_capacity_bytes =
+            self.replica_cache_base_capacity(pool.active_capacity_bytes);
+        let reserved_capacity_bytes = self
+            .inner()
+            .node_cache_reserved_capacity
+            .get(owner_node_id)
+            .filter(|reserved| !reserved.generation.is_tomb())
+            .map(|reserved| reserved.total_reserved_bytes())
+            .unwrap_or(0);
+        let derived_effective = ring_b_base_capacity_bytes.saturating_sub(reserved_capacity_bytes);
+        let cache = self
+            .inner()
+            .node_kv_cache_controller
+            .get(owner_node_id)
+            .map(|entry| entry.value().clone());
+        let ring_b_effective_capacity_bytes = cache
+            .as_ref()
+            .and_then(|cache| cache.max_capacity())
+            .unwrap_or(derived_effective);
+        let ring_b_weighted_bytes = cache
+            .as_ref()
+            .map(|cache| cache.weighted_size())
+            .unwrap_or(0);
+        let ring_b_pending_reclaim_bytes = self.eviction_reclaim_pending_weight(owner_node_id);
+        let tier1_capacity_bytes = self
+            .inner()
+            .node_writeback_tier1_controller
+            .get(owner_node_id)
+            .and_then(|entry| entry.value().max_capacity())
+            .unwrap_or_else(|| {
+                self.writeback_tier1_base_capacity(pool.active_capacity_bytes)
+                    .unwrap_or(0)
+            });
+        let settled = pool.draining_capacity_bytes == 0
+            && ring_b_weighted_bytes <= ring_b_effective_capacity_bytes
+            && ring_b_pending_reclaim_bytes == 0;
+        NodePoolCapacityControlResponse {
+            owner_node_id: owner_node_id.to_string(),
+            owner_node_start_time,
+            physical_capacity_bytes: pool.physical_capacity_bytes,
+            active_capacity_bytes: pool.active_capacity_bytes,
+            used_capacity_bytes: pool.used_capacity_bytes,
+            parked_capacity_bytes: pool.parked_capacity_bytes,
+            draining_capacity_bytes: pool.draining_capacity_bytes,
+            available_capacity_bytes: pool.available_capacity_bytes,
+            capacity_epoch: pool.capacity_epoch,
+            ring_b_base_capacity_bytes,
+            ring_b_effective_capacity_bytes,
+            ring_b_weighted_bytes,
+            ring_b_pending_reclaim_bytes,
+            tier1_capacity_bytes,
+            settled,
+        }
+    }
+
+    pub fn node_pool_capacity_control_snapshot(
+        &self,
+        owner_node_id: &str,
+    ) -> KvResult<NodePoolCapacityControlResponse> {
+        let capacity_lock = self.node_capacity_boundary_lock(owner_node_id);
+        let _capacity_guard = capacity_lock.lock();
+        let (owner_node_start_time, pool) = self
+            .inner()
+            .view()
+            .master_seg_manager()
+            .get_node_pool_capacity(owner_node_id)
+            .ok_or_else(|| {
+                KvError::Api(ApiError::NodeNotFound {
+                    desc: owner_node_id.to_string(),
+                })
+            })?;
+        Ok(self.node_pool_capacity_response(owner_node_id, owner_node_start_time, pool))
+    }
+
+    /// Atomically close the allocator admission gate before lowering Moka's derived boundaries.
+    /// The returned response is an initiation snapshot; callers poll `Get` until `settled=true`.
+    pub async fn set_node_pool_active_capacity(
+        &self,
+        owner_node_id: NodeID,
+        expected_owner_node_start_time: i64,
+        expected_capacity_epoch: u64,
+        active_capacity_bytes: u64,
+    ) -> KvResult<NodePoolCapacityControlResponse> {
+        let owner_cache_lock = self
+            .inner()
+            .owner_cache_operation_locks
+            .get_lock(owner_node_id.to_string());
+        let _owner_cache_guard = owner_cache_lock.lock().await;
+        let capacity_lock = self.node_capacity_boundary_lock(owner_node_id.as_ref());
+        let _capacity_guard = capacity_lock.lock();
+
+        let (_, before) = self
+            .inner()
+            .view()
+            .master_seg_manager()
+            .get_node_pool_capacity(owner_node_id.as_ref())
+            .ok_or_else(|| {
+                KvError::Api(ApiError::NodeNotFound {
+                    desc: owner_node_id.to_string(),
+                })
+            })?;
+        let reserved_capacity_bytes = self
+            .inner()
+            .node_cache_reserved_capacity
+            .get(owner_node_id.as_ref())
+            .filter(|reserved| !reserved.generation.is_tomb())
+            .map(|reserved| reserved.total_reserved_bytes())
+            .unwrap_or(0);
+        let prospective_ring_b = node_cache_capacity_boundaries(
+            active_capacity_bytes,
+            self.inner().replica_cache_capacity_ratio,
+            self.inner().replica_writeback_tier1_capacity_ratio,
+            reserved_capacity_bytes,
+        )
+        .ring_b_bytes;
+        if self.replica_cache_enabled() && prospective_ring_b == 0 {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "active capacity leaves no ring-B allocation budget: owner={} active={} reserved={}",
+                    owner_node_id, active_capacity_bytes, reserved_capacity_bytes
+                ),
+            }));
+        }
+
+        let updated = self
+            .inner()
+            .view()
+            .master_seg_manager()
+            .set_node_active_capacity(
+                &owner_node_id,
+                expected_owner_node_start_time,
+                expected_capacity_epoch,
+                active_capacity_bytes,
+            )?;
+        if let Err(apply_err) = self.apply_node_cache_capacity_locked(owner_node_id.as_ref()) {
+            let rollback = self
+                .inner()
+                .view()
+                .master_seg_manager()
+                .set_node_active_capacity(
+                    &owner_node_id,
+                    expected_owner_node_start_time,
+                    updated.capacity_epoch,
+                    before.active_capacity_bytes,
+                )
+                .and_then(|_| self.apply_node_cache_capacity_locked(owner_node_id.as_ref()));
+            error!(
+                owner = %owner_node_id,
+                requested_active_capacity_bytes = active_capacity_bytes,
+                error = %apply_err,
+                rollback = ?rollback,
+                "node pool capacity apply failed"
+            );
+            return Err(apply_err);
+        }
+
+        let response = self.node_pool_capacity_response(
+            owner_node_id.as_ref(),
+            expected_owner_node_start_time,
+            updated,
+        );
+        info!(
+            owner = %owner_node_id,
+            owner_node_start_time = response.owner_node_start_time,
+            capacity_epoch = response.capacity_epoch,
+            physical_capacity_bytes = response.physical_capacity_bytes,
+            active_capacity_bytes = response.active_capacity_bytes,
+            parked_capacity_bytes = response.parked_capacity_bytes,
+            used_capacity_bytes = response.used_capacity_bytes,
+            draining_capacity_bytes = response.draining_capacity_bytes,
+            ring_b_effective_capacity_bytes = response.ring_b_effective_capacity_bytes,
+            ring_b_weighted_bytes = response.ring_b_weighted_bytes,
+            ring_b_pending_reclaim_bytes = response.ring_b_pending_reclaim_bytes,
+            settled = response.settled,
+            "node pool active capacity applied"
+        );
+        Ok(response)
     }
 
     pub fn tiered_writeback_enabled(&self) -> bool {
@@ -2935,20 +3562,21 @@ impl MasterKvRouter {
             .map(|route| {
                 let put_id = route.put_id;
                 route
-                    .nodes_replicas
+                    .node_replicas
                     .read()
                     .iter()
-                    .filter_map(|(node_id, replica)| {
-                        (!replica.tomb_tag.is_tomb()).then(|| {
-                            (
-                                node_id.as_ref().to_string(),
-                                NodeValueReplicaDesc {
-                                    weight_bytes: u32::try_from(replica.backing.capacity_bytes())
-                                        .unwrap_or(u32::MAX),
-                                    put_id,
-                                },
-                            )
-                        })
+                    .filter_map(|(node_id, replicas)| {
+                        let memory = (!replicas.tomb_tag.is_tomb())
+                            .then(|| replicas.memory.as_ref())
+                            .flatten()?;
+                        Some((
+                            node_id.as_ref().to_string(),
+                            NodeValueReplicaDesc {
+                                weight_bytes: u32::try_from(memory.backing.capacity_bytes())
+                                    .unwrap_or(u32::MAX),
+                                put_id,
+                            },
+                        ))
                     })
                     .collect::<Vec<_>>()
             })
@@ -2964,7 +3592,7 @@ impl MasterKvRouter {
             .get(key)
             .map(|one_kv_nodes_routes| {
                 one_kv_nodes_routes
-                    .nodes_replicas
+                    .node_replicas
                     .read()
                     .values()
                     .any(|kv_info| !kv_info.tomb_tag.is_tomb())
@@ -3307,20 +3935,21 @@ impl MasterKvRouter {
         route: &OneKvNodesRoutes,
     ) {
         let replicas = route
-            .nodes_replicas
+            .node_replicas
             .read()
             .iter()
-            .filter_map(|(node_id, replica)| {
-                (!replica.tomb_tag.is_tomb()).then(|| {
-                    (
-                        node_id.as_ref().to_string(),
-                        NodeValueReplicaDesc {
-                            weight_bytes: u32::try_from(replica.backing.capacity_bytes())
-                                .unwrap_or(u32::MAX),
-                            put_id: route.put_id,
-                        },
-                    )
-                })
+            .filter_map(|(node_id, replicas)| {
+                let memory = (!replicas.tomb_tag.is_tomb())
+                    .then(|| replicas.memory.as_ref())
+                    .flatten()?;
+                Some((
+                    node_id.as_ref().to_string(),
+                    NodeValueReplicaDesc {
+                        weight_bytes: u32::try_from(memory.backing.capacity_bytes())
+                            .unwrap_or(u32::MAX),
+                        put_id: route.put_id,
+                    },
+                ))
             })
             .collect::<Vec<_>>();
         for (node_id, desc) in replicas {
@@ -3361,6 +3990,14 @@ impl MasterKvRouter {
 
     fn register_rpc_handlers(&self) {
         let p2p = self.0.view().p2p_module();
+
+        user_rpc_register_handler_async(
+            p2p,
+            NODE_POOL_CAPACITY_USER_RPC_PATH.to_string(),
+            Arc::new(NodePoolCapacityUserRpcHandler {
+                view: self.0.view().clone(),
+            }),
+        );
 
         // --- Get Handlers ---
         let view = self.0.view().clone();
@@ -3423,6 +4060,30 @@ impl MasterKvRouter {
                 if let Err(e) = resp.send_resp(ack).await {
                     error!("Failed to send GetDoneResp: {:?}", e);
                 }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<SsdStageBeginReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let task_view = view.clone();
+            let req_node_id = resp.node_id().clone();
+            view.spawn("rpc_ssd_stage_begin", async move {
+                let ack = handle_ssd_stage_begin(task_view, msg, req_node_id).await;
+                let _ = resp.send_resp(ack).await;
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<SsdStageDoneReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let task_view = view.clone();
+            let req_node_id = resp.node_id().clone();
+            view.spawn("rpc_ssd_stage_done", async move {
+                let ack = handle_ssd_stage_done(task_view, msg, req_node_id).await;
+                let _ = resp.send_resp(ack).await;
             });
             Ok(())
         });
@@ -3689,6 +4350,20 @@ impl MasterKvRouter {
                 let ack = handle_batch_evict_owner_source(&view_task, msg, owner).await;
                 if let Err(err) = resp.send_resp(ack).await {
                     error!("Failed to send BatchEvictOwnerSourceResp: {:?}", err);
+                }
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchPublishOwnerSsdReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let owner = resp.node_id().clone();
+            let view_task = view.clone();
+            let _ = view.spawn("rpc_batch_publish_owner_ssd", async move {
+                let ack = handle_batch_publish_owner_ssd(view_task, msg, owner).await;
+                if let Err(err) = resp.send_resp(ack).await {
+                    error!("Failed to send BatchPublishOwnerSsdResp: {:?}", err);
                 }
             });
             Ok(())
@@ -4582,6 +5257,8 @@ impl MasterKvRouter {
         source_node_id: &str,
         bytes: u64,
         allocation_mode: GetAllocationMode,
+        source_kind: GetSourceKind,
+        source_is_requester_local_owner: bool,
     ) {
         let requester_source_key = RequesterTargetPair::new(requester_node_id, source_node_id);
         let source_count = self
@@ -4601,6 +5278,25 @@ impl MasterKvRouter {
             .value()
             .clone();
         source_bytes.fetch_add(bytes, Ordering::Relaxed);
+
+        let source_class = match (source_kind, source_is_requester_local_owner) {
+            (GetSourceKind::Memory, true) => "local_memory",
+            (GetSourceKind::Memory, false) => "remote_memory",
+            (GetSourceKind::Ssd, true) => "local_ssd",
+            (GetSourceKind::Ssd, false) => "remote_ssd",
+        };
+        self.inner()
+            .get_source_class_counts
+            .entry(source_class)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .value()
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner()
+            .get_source_class_bytes
+            .entry(source_class)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .value()
+            .fetch_add(bytes, Ordering::Relaxed);
 
         let mode_key = match allocation_mode {
             GetAllocationMode::Temporary => "temporary",
@@ -4684,6 +5380,22 @@ impl MasterKvRouter {
                             .collect();
                         get_source_bytes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
+                        let mut get_source_class_counts: Vec<(String, u64)> = router
+                            .inner()
+                            .get_source_class_counts
+                            .iter()
+                            .map(|entry| (entry.key().to_string(), entry.value().load(Ordering::Relaxed)))
+                            .collect();
+                        get_source_class_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+                        let mut get_source_class_bytes: Vec<(String, u64)> = router
+                            .inner()
+                            .get_source_class_bytes
+                            .iter()
+                            .map(|entry| (entry.key().to_string(), entry.value().load(Ordering::Relaxed)))
+                            .collect();
+                        get_source_class_bytes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
                         let mut get_allocation_mode_counts: Vec<(String, u64)> = router
                             .inner()
                             .get_allocation_mode_counts
@@ -4693,7 +5405,7 @@ impl MasterKvRouter {
                         get_allocation_mode_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
                         info!(
-                            "placement historical distribution | put_target_counts={:?} | put_mode_counts={:?} | put_requester_target_counts={:?} | replica_task_target_counts={:?} | replica_done_terminal_replays={} | get_requester_source_counts={:?} | get_requester_source_bytes={:?} | get_allocation_mode_counts={:?}",
+                            "placement historical distribution | put_target_counts={:?} | put_mode_counts={:?} | put_requester_target_counts={:?} | replica_task_target_counts={:?} | replica_done_terminal_replays={} | get_requester_source_counts={:?} | get_requester_source_bytes={:?} | get_source_class_counts={:?} | get_source_class_bytes={:?} | get_allocation_mode_counts={:?}",
                             target_counts,
                             mode_counts,
                             requester_target_counts,
@@ -4701,6 +5413,8 @@ impl MasterKvRouter {
                             replica_done_terminal_replays,
                             get_source_counts,
                             get_source_bytes,
+                            get_source_class_counts,
+                            get_source_class_bytes,
                             get_allocation_mode_counts,
                         );
                     }
@@ -4720,7 +5434,7 @@ impl MasterKvRouter {
             .inner()
             .view()
             .master_seg_manager()
-            .get_node_space_size(node_id);
+            .get_node_active_space_size(node_id);
         if node_space_size == 0 {
             return None;
         }
@@ -4806,7 +5520,7 @@ impl MasterKvRouter {
             .inner()
             .view()
             .master_seg_manager()
-            .get_node_space_size(node_id);
+            .get_node_active_space_size(node_id);
         let base_capacity = self.writeback_tier1_base_capacity(node_space_size)?;
         if base_capacity == 0 {
             return None;
@@ -4862,11 +5576,13 @@ impl MasterKvRouter {
             if route.put_id != desc.put_id || route.lease_id.is_some() {
                 return false;
             }
-            let replicas = route.nodes_replicas.read();
-            replicas.values().any(|replica| {
-                replica.node_id.as_ref() == source_node_id && !replica.tomb_tag.is_tomb()
-            }) && replicas.values().all(|replica| {
-                replica.tomb_tag.is_tomb() || replica.node_id.as_ref() == source_node_id
+            let replicas = route.node_replicas.read();
+            replicas.iter().any(|(node_id, replica)| {
+                node_id.as_ref() == source_node_id
+                    && !replica.tomb_tag.is_tomb()
+                    && replica.memory.is_some()
+            }) && replicas.iter().all(|(node_id, replica)| {
+                !replica.has_live_backing() || node_id.as_ref() == source_node_id
             })
         })
     }
@@ -4974,6 +5690,8 @@ impl MasterKvRouter {
         if !self.replica_cache_enabled() {
             return Ok(());
         }
+        let capacity_lock = self.node_capacity_boundary_lock(node_id);
+        let _capacity_guard = capacity_lock.lock();
         if !reserved_capacity.generation.same_generation(generation) {
             return Err(
                 crate::rpcresp_kvresult_convert::msg_and_error::KvError::Api(
@@ -5021,91 +5739,20 @@ impl MasterKvRouter {
             return Ok(());
         }
 
-        // Recompute target capacity from the configured base ratio minus live reservations.
-        let reserved_total = reserved_capacity.total_reserved_bytes();
-        let node_space_size = self
-            .inner()
-            .view()
-            .master_seg_manager()
-            .get_node_space_size(node_id);
-        if node_space_size == 0 {
+        if let Err(err) = self.apply_node_cache_capacity_locked(node_id) {
             if delta_bytes >= 0 {
                 reserved_capacity.apply_delta(reason, -delta_bytes);
-            }
-            return Err(
-                crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
-                    crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::OwnerNoSeg {
-                        detail: format!(
-                            "node_id={} has no segment (node_space_size=0) while adjusting cache capacity",
-                            node_id
-                        ),
-                    },
-                ),
-            );
-        }
-        let boundaries = node_cache_capacity_boundaries(
-            node_space_size,
-            self.inner().replica_cache_capacity_ratio,
-            self.inner().replica_writeback_tier1_capacity_ratio,
-            reserved_total,
-        );
-        let new_capacity = boundaries.ring_b_bytes;
-
-        if let Some(cache) = self.get_node_cache_controller(node_id) {
-            if let Some(tier1_cache) = self
-                .inner()
-                .node_writeback_tier1_controller
-                .get(node_id)
-                .map(|entry| entry.value().clone())
-            {
-                // Local-reserve and owner-indexed reservations consume the
-                // physical ring-B allocation domain. They must not collapse
-                // the independent inclusive tier1 metadata window.
-                let tier1_capacity = boundaries.tier1_bytes.unwrap_or(0);
-                if let Err(e) = tier1_cache.set_max_capacity(tier1_capacity) {
-                    if delta_bytes >= 0 {
-                        reserved_capacity.apply_delta(reason, -delta_bytes);
-                    }
-                    return Err(
-                        crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
-                            crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::RpcDecodeError {
-                                rpc_input_json: format!(
-                                    "tier1 moka.set_max_capacity failed: node_id={}, new_capacity={}, err={}",
-                                    node_id, tier1_capacity, e
-                                ),
-                            },
-                        ),
+                if let Err(rollback_err) = self.apply_node_cache_capacity_locked(node_id) {
+                    error!(
+                        node = node_id,
+                        error = %rollback_err,
+                        "failed to restore node cache boundary after reservation rollback"
                     );
                 }
             }
-            if let Err(e) = cache.set_max_capacity(new_capacity) {
-                if delta_bytes >= 0 {
-                    reserved_capacity.apply_delta(reason, -delta_bytes);
-                }
-                return Err(
-                    crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
-                        crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::RpcDecodeError {
-                            rpc_input_json: format!(
-                                "ring-B allocation moka.set_max_capacity failed: node_id={}, new_capacity={}, err={}",
-                                node_id, new_capacity, e
-                            ),
-                        },
-                    ),
-                );
-            }
-            Ok(())
-        } else {
-            if delta_bytes >= 0 {
-                reserved_capacity.apply_delta(reason, -delta_bytes);
-            }
-            Err(
-                crate::rpcresp_kvresult_convert::msg_and_error::KvError::Unreachable(
-                    crate::rpcresp_kvresult_convert::msg_and_error::UnreachableError::OwnerNoSeg {
-                        detail: format!("node_id={} cache_controller not found", node_id),
-                    },
-                ),
-            )
+            return Err(err);
         }
+        Ok(())
     }
 
     /// Reserve cache capacity for one exact live node generation.  The returned
@@ -5256,11 +5903,15 @@ impl MasterKvRouter {
         for entry in self.inner().node_kv_cache_controller.iter() {
             let owner_node = entry.key().clone();
             let cache = entry.value().clone();
-            let node_space_size = self
+            let Some((owner_node_start_time, pool_capacity)) = self
                 .inner()
                 .view()
                 .master_seg_manager()
-                .get_node_space_size(owner_node.as_str());
+                .get_node_pool_capacity(owner_node.as_str())
+            else {
+                continue;
+            };
+            let node_space_size = pool_capacity.active_capacity_bytes;
             let base_capacity_bytes = self.replica_cache_base_capacity(node_space_size);
             let reserved_capacity_bytes = self
                 .inner()
@@ -5284,6 +5935,14 @@ impl MasterKvRouter {
                 .map(|entry| entry.value().clone());
             replica_cache_nodes.push(ReplicaCacheNodeObserveSnapshot {
                 owner_node: owner_node.clone(),
+                owner_node_start_time,
+                pool_physical_capacity_bytes: pool_capacity.physical_capacity_bytes,
+                pool_active_capacity_bytes: pool_capacity.active_capacity_bytes,
+                pool_used_capacity_bytes: pool_capacity.used_capacity_bytes,
+                pool_parked_capacity_bytes: pool_capacity.parked_capacity_bytes,
+                pool_draining_capacity_bytes: pool_capacity.draining_capacity_bytes,
+                pool_available_capacity_bytes: pool_capacity.available_capacity_bytes,
+                pool_capacity_epoch: pool_capacity.capacity_epoch,
                 entries: cache.entry_count(),
                 weighted_bytes: cache.weighted_size(),
                 effective_capacity_bytes,
@@ -5467,9 +6126,73 @@ impl MasterKvRouter {
                                 .planned_get_counters
                                 .plan_revoked
                                 .load(Ordering::Relaxed),
+                            remote_ssd_filtered_items = view_task
+                                .master_kv_router()
+                                .inner()
+                                .planned_get_counters
+                                .remote_ssd_filtered_items
+                                .load(Ordering::Relaxed),
+                            remote_ssd_filtered_bytes = view_task
+                                .master_kv_router()
+                                .inner()
+                                .planned_get_counters
+                                .remote_ssd_filtered_bytes
+                                .load(Ordering::Relaxed),
                             "master metadata-only Get plan runtime"
                         );
+                        let ssd_tier = &view_task.master_kv_router().inner().ssd_tier_counters;
+                        tracing::info!(
+                            local_ssd_selected_with_remote_memory_items = ssd_tier
+                                .local_ssd_selected_with_remote_memory_items
+                                .load(Ordering::Relaxed),
+                            local_ssd_selected_with_remote_memory_bytes = ssd_tier
+                                .local_ssd_selected_with_remote_memory_bytes
+                                .load(Ordering::Relaxed),
+                            local_ssd_selected_without_remote_memory_items = ssd_tier
+                                .local_ssd_selected_without_remote_memory_items
+                                .load(Ordering::Relaxed),
+                            local_ssd_selected_without_remote_memory_bytes = ssd_tier
+                                .local_ssd_selected_without_remote_memory_bytes
+                                .load(Ordering::Relaxed),
+                            local_ssd_published_with_remote_memory_items = ssd_tier
+                                .local_ssd_published_with_remote_memory_items
+                                .load(Ordering::Relaxed),
+                            local_ssd_published_with_remote_memory_bytes = ssd_tier
+                                .local_ssd_published_with_remote_memory_bytes
+                                .load(Ordering::Relaxed),
+                            local_ssd_published_without_remote_memory_items = ssd_tier
+                                .local_ssd_published_without_remote_memory_items
+                                .load(Ordering::Relaxed),
+                            local_ssd_published_without_remote_memory_bytes = ssd_tier
+                                .local_ssd_published_without_remote_memory_bytes
+                                .load(Ordering::Relaxed),
+                            memory_removed_ssd_survived_items = ssd_tier
+                                .memory_removed_ssd_survived_items
+                                .load(Ordering::Relaxed),
+                            memory_removed_ssd_survived_bytes = ssd_tier
+                                .memory_removed_ssd_survived_bytes
+                                .load(Ordering::Relaxed),
+                            memory_removed_ssd_became_only_items = ssd_tier
+                                .memory_removed_ssd_became_only_items
+                                .load(Ordering::Relaxed),
+                            memory_removed_ssd_became_only_bytes = ssd_tier
+                                .memory_removed_ssd_became_only_bytes
+                                .load(Ordering::Relaxed),
+                            "master SSD substitution runtime"
+                        );
                         for node in snapshot.replica_cache_nodes {
+                            tracing::info!(
+                                "node pool capacity runtime: owner={} owner_node_start_time={} capacity_epoch={} physical_capacity_bytes={} active_capacity_bytes={} used_capacity_bytes={} parked_capacity_bytes={} draining_capacity_bytes={} available_capacity_bytes={}",
+                                node.owner_node,
+                                node.owner_node_start_time,
+                                node.pool_capacity_epoch,
+                                node.pool_physical_capacity_bytes,
+                                node.pool_active_capacity_bytes,
+                                node.pool_used_capacity_bytes,
+                                node.pool_parked_capacity_bytes,
+                                node.pool_draining_capacity_bytes,
+                                node.pool_available_capacity_bytes,
+                            );
                             tracing::info!(
                                 "replica cache runtime: owner={} entries={} weighted_bytes={} effective_capacity_bytes={} base_capacity_bytes={} reserved_capacity_bytes={} pending_eviction_reclaim_bytes={} writeback_tier1_entries={} writeback_tier1_weighted_bytes={} writeback_tier1_capacity_bytes={} writeback_tier1_triggered={} writeback_tier1_owner_accepted={} writeback_tier1_failed={} reclaim_master_activity_deferred={} reclaim_owner_holder_deferred={} reclaim_owner_other_deferred={} reclaim_route_changed={} reclaim_retry_queued={} reclaim_retry_completed={} reclaim_retry_restored={} reclaim_completed={} source_evict_rpc_requests={} source_evict_victims={} source_evict_requested_bytes={} source_evict_accepted={} source_evict_in_progress={} source_evict_completed={} source_evict_retryable_busy={} source_evict_stale={} source_evict_rejected={} last_route_removed_members={} last_route_removed_bytes={} capacity_eviction_non_ring_b_entry_total={} capacity_eviction_hit_committed_slot={} eviction_reclaim_deduplicated={}",
                                 node.owner_node,
@@ -5540,6 +6263,31 @@ impl MasterKvRouter {
                                 node.owner_node.as_str(),
                                 "writeback_tier1",
                                 node.writeback_tier1_capacity_bytes,
+                            );
+                            metrics.set_kv_replica_cache_capacity_bytes(
+                                node.owner_node.as_str(),
+                                "pool_physical",
+                                node.pool_physical_capacity_bytes,
+                            );
+                            metrics.set_kv_replica_cache_capacity_bytes(
+                                node.owner_node.as_str(),
+                                "pool_active",
+                                node.pool_active_capacity_bytes,
+                            );
+                            metrics.set_kv_replica_cache_capacity_bytes(
+                                node.owner_node.as_str(),
+                                "pool_used",
+                                node.pool_used_capacity_bytes,
+                            );
+                            metrics.set_kv_replica_cache_capacity_bytes(
+                                node.owner_node.as_str(),
+                                "pool_parked",
+                                node.pool_parked_capacity_bytes,
+                            );
+                            metrics.set_kv_replica_cache_capacity_bytes(
+                                node.owner_node.as_str(),
+                                "pool_draining",
+                                node.pool_draining_capacity_bytes,
                             );
                         }
                     }

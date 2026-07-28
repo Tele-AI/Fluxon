@@ -49,6 +49,7 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("fluxonkv_owner_requires_sub_cluster", test_fluxonkv_owner_requires_sub_cluster),
         ("fluxonkv_owner_requires_large_file_paths", test_fluxonkv_owner_requires_large_file_paths),
         ("fluxonkv_external_forbids_large_file_paths", test_fluxonkv_external_forbids_large_file_paths),
+        ("fluxonkv_owner_ssd_capacity", test_fluxonkv_owner_ssd_capacity),
         ("fluxonkv_p2p_relay_removed", test_fluxonkv_p2p_relay_removed),
         ("fluxon_client_config_yaml_shape", test_fluxon_client_config_yaml_shape),
         ("fluxonkv_protocol_field", test_fluxonkv_protocol_field),
@@ -334,6 +335,66 @@ def test_fluxonkv_external_forbids_large_file_paths():
         print(f"❌ FAIL: test_fluxonkv_external_forbids_large_file_paths - {e}")
 
 
+def test_fluxonkv_owner_ssd_capacity():
+    """Ensure the Python schema forwards owner SSD capacity to Rust unchanged."""
+    try:
+        owner = _owner_fluxonkv_base_config(tag="owner_ssd_capacity")
+        owner["fluxonkv_spec"]["large_limit_size"] = [67108864]
+        owner["fluxonkv_spec"]["ssd_write_rate_limit_bytes_per_sec"] = 268435456
+        owner["fluxonkv_spec"]["ssd_write_burst_bytes"] = 67108864
+        config = FluxonKvClientConfig(owner)
+        assert config.to_dict()["fluxonkv_spec"]["large_limit_size"] == [67108864]
+        assert (
+            config.to_dict()["fluxonkv_spec"]["ssd_write_rate_limit_bytes_per_sec"]
+            == 268435456
+        )
+        assert config.to_dict()["fluxonkv_spec"]["ssd_write_burst_bytes"] == 67108864
+        rendered = config.to_fluxon_kv_client_config_yaml_str()
+        assert "large_limit_size:" in rendered
+        assert "- 67108864" in rendered
+        assert "ssd_write_rate_limit_bytes_per_sec: 268435456" in rendered
+        assert "ssd_write_burst_bytes: 67108864" in rendered
+
+        unpaired = _owner_fluxonkv_base_config(tag="owner_ssd_unpaired_limit")
+        unpaired["fluxonkv_spec"]["large_limit_size"] = [67108864]
+        unpaired["fluxonkv_spec"]["ssd_write_rate_limit_bytes_per_sec"] = 1
+        try:
+            FluxonKvClientConfig(unpaired)
+            print("❌ FAIL: test_fluxonkv_owner_ssd_capacity - unpaired rate should be rejected")
+            return
+        except ValueError:
+            pass
+
+        wrong_shape = _owner_fluxonkv_base_config(tag="owner_ssd_capacity_wrong_shape")
+        wrong_shape["fluxonkv_spec"]["large_limit_size"] = 67108864
+        try:
+            FluxonKvClientConfig(wrong_shape)
+            print("❌ FAIL: test_fluxonkv_owner_ssd_capacity - non-list capacity should be rejected")
+            return
+        except ValueError:
+            pass
+
+        external = {
+            "instance_key": "test_external_ssd_capacity",
+            "contribute_to_cluster_pool_size": {"dram": 0, "vram": {}},
+            "fluxonkv_spec": {
+                "cluster_name": "test_cluster",
+                "share_mem_path": "/tmp/kvcache_shared_memory/test",
+                "large_limit_size": [67108864],
+            },
+        }
+        try:
+            FluxonKvClientConfig(external)
+            print("❌ FAIL: test_fluxonkv_owner_ssd_capacity - external capacity should be rejected")
+            return
+        except ValueError:
+            pass
+
+        print("✅ PASS: test_fluxonkv_owner_ssd_capacity")
+    except Exception as e:
+        print(f"❌ FAIL: test_fluxonkv_owner_ssd_capacity - {e}")
+
+
 def test_fluxonkv_p2p_relay_removed():
     """Ensure removed fluxonkv_spec.p2p_relay is rejected as an unknown key."""
     try:
@@ -530,6 +591,9 @@ def test_fluxonkv_test_spec_config():
         rdma_devices["test_spec_config"]["tcp_thread_bulk_lane_count"] = 4
         rdma_devices["test_spec_config"]["tcp_thread_control_lane_count"] = 3
         rdma_devices["test_spec_config"]["replica_task_max_inflight"] = 16
+        rdma_devices["test_spec_config"]["ssd_read_source_policy"] = (
+            "local_ssd_only_first"
+        )
         rdma_devices["test_spec_config"][
             "require_transfer_rpc_fast_path_ready_timeout_seconds"
         ] = 45
@@ -546,10 +610,28 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["tcp_thread_control_lane_count"] == 3
         assert loaded["test_spec_config"]["replica_task_max_inflight"] == 16
         assert (
+            loaded["test_spec_config"]["ssd_read_source_policy"]
+            == "local_ssd_only_first"
+        )
+        assert (
             loaded["test_spec_config"]["require_transfer_rpc_fast_path_ready_timeout_seconds"]
             == 45
         )
         assert config.protocol_rdma_device_names == "mlx5_0,mlx5_4"
+
+        for removed_policy in (
+            "local_ssd_after_memory",
+            "local_ssd_before_remote_memory",
+        ):
+            invalid_policy = copy.deepcopy(rdma_devices)
+            invalid_policy["test_spec_config"]["ssd_read_source_policy"] = removed_policy
+            try:
+                FluxonKvClientConfig(invalid_policy)
+                raise AssertionError(
+                    f"removed SSD read policy must be rejected: {removed_policy}"
+                )
+            except ValueError:
+                pass
 
         expected_capacity = _owner_fluxonkv_base_config(tag="expected_capacity")
         expected_capacity["contribute_to_cluster_pool_size"]["dram"] = 137438953472

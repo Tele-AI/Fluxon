@@ -18,7 +18,7 @@ use crate::{
         BatchGetRevokeReq, BatchGetRevokeResp, BatchGetStartItemResp, BatchGetStartReq,
         BatchGetStartResp, BatchIsExistReq, GetAllocationMode, GetBindTarget, GetDoneReq,
         GetDoneResp, GetMetaReq, GetMetaResp, GetPreparedLocalReserveTarget, GetRevokeReq,
-        GetStartReq, GetStartResp,
+        GetSourceKind, GetStartReq, GetStartResp,
     },
     p2p::msg_pack::MsgPack,
     rpcresp_kvresult_convert::msg_and_error::codes_api,
@@ -28,6 +28,7 @@ use ::tokio::sync::Semaphore;
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
 use limit_thirdparty::tokio;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -287,6 +288,10 @@ impl ClientKvApiInner {
         let mut lifecycle_remote_transfer_items = 0usize;
         let mut lifecycle_transfer_bytes = 0u64;
         let mut lifecycle_remote_transfer_bytes = 0u64;
+        let mut lifecycle_local_ssd_items = 0usize;
+        let mut lifecycle_remote_ssd_items = 0usize;
+        let mut lifecycle_transfer_source_nodes = HashSet::new();
+        let mut lifecycle_ssd_source_nodes = HashSet::new();
 
         for (idx, (key, start_item)) in keys.into_iter().zip(start_items.into_iter()).enumerate() {
             if start_item.error_code == codes_api::API_KEY_NOT_FOUND {
@@ -318,7 +323,20 @@ impl ClientKvApiInner {
             let target_addr = start_item.target_addr;
             let len = start_item.len;
 
-            if peer_id.is_none() && src_addr == target_addr {
+            lifecycle_transfer_source_nodes.insert(start_item.node_id.to_string());
+            if start_item.source_kind == GetSourceKind::Ssd {
+                lifecycle_ssd_source_nodes.insert(start_item.node_id.to_string());
+                if peer_is_remote {
+                    lifecycle_remote_ssd_items = lifecycle_remote_ssd_items.saturating_add(1);
+                } else {
+                    lifecycle_local_ssd_items = lifecycle_local_ssd_items.saturating_add(1);
+                }
+            }
+
+            if start_item.source_kind == GetSourceKind::Memory
+                && peer_id.is_none()
+                && src_addr == target_addr
+            {
                 lifecycle_zero_copy_items = lifecycle_zero_copy_items.saturating_add(1);
                 done_pending.push(DonePending {
                     idx,
@@ -341,19 +359,33 @@ impl ClientKvApiInner {
 
             transfer_futures.push(async move {
                 let transfer_started_at = Instant::now();
-                let transfer_result = self
-                    .view
-                    .client_transfer_engine()
-                    .transfer_data_no_copy(peer_id, true, src_addr, target_addr, len, None)
+                let transfer_result = if start_item.source_kind == GetSourceKind::Ssd {
+                    self.stage_kv_from_ssd_source(
+                        &start_item.node_id,
+                        &key,
+                        start_item.put_id,
+                        get_id,
+                        src_addr,
+                        len,
+                        target_addr,
+                        len,
+                    )
                     .await
-                    .map_err(|err| {
-                        KvError::Api(ApiError::Transfer {
-                            from_addr: src_addr,
-                            to_addr: target_addr,
-                            len,
-                            error: err.to_string(),
+                } else {
+                    self.view
+                        .client_transfer_engine()
+                        .transfer_data_no_copy(peer_id, true, src_addr, target_addr, len, None)
+                        .await
+                        .map(|_| ())
+                        .map_err(|err| {
+                            KvError::Api(ApiError::Transfer {
+                                from_addr: src_addr,
+                                to_addr: target_addr,
+                                len,
+                                error: err.to_string(),
+                            })
                         })
-                    });
+                };
                 let transfer_us = transfer_started_at
                     .elapsed()
                     .as_micros()
@@ -702,12 +734,16 @@ impl ClientKvApiInner {
             .as_micros()
             .min(i64::MAX as u128) as i64;
         tracing::info!(
-            "external Get finish lifecycle: requested={} transfer_concurrency={} zero_copy_items={} transfer_items={} remote_transfer_items={} transfer_bytes={} remote_transfer_bytes={} plan_us={} transfer_wall_us={} transfer_sum_us={} transfer_max_us={} transfer_cleanup_us={} install_us={} done_items={} done_attempts={} done_us={} local_hot_admissions={} publish_us={} hits={} misses={} errors={} total_us={}",
+            "external Get finish lifecycle: requested={} transfer_concurrency={} zero_copy_items={} transfer_items={} remote_transfer_items={} local_ssd_items={} remote_ssd_items={} transfer_source_nodes={} ssd_source_nodes={} transfer_bytes={} remote_transfer_bytes={} plan_us={} transfer_wall_us={} transfer_sum_us={} transfer_max_us={} transfer_cleanup_us={} install_us={} done_items={} done_attempts={} done_us={} local_hot_admissions={} publish_us={} hits={} misses={} errors={} total_us={}",
             lifecycle_requested_keys,
             transfer_concurrency,
             lifecycle_zero_copy_items,
             lifecycle_transfer_items,
             lifecycle_remote_transfer_items,
+            lifecycle_local_ssd_items,
+            lifecycle_remote_ssd_items,
+            lifecycle_transfer_source_nodes.len(),
+            lifecycle_ssd_source_nodes.len(),
             lifecycle_transfer_bytes,
             lifecycle_remote_transfer_bytes,
             lifecycle_plan_us,
@@ -847,7 +883,10 @@ impl ClientKvApiInner {
             let target_addr = start_item.target_addr;
             let len = start_item.len;
 
-            if peer_id.is_none() && src_addr == target_addr {
+            if start_item.source_kind == GetSourceKind::Memory
+                && peer_id.is_none()
+                && src_addr == target_addr
+            {
                 done_pending.push(DonePending {
                     idx,
                     key,
@@ -860,19 +899,33 @@ impl ClientKvApiInner {
 
             transfer_futures.push(async move {
                 let transfer_started_at = Instant::now();
-                let transfer_result = self
-                    .view
-                    .client_transfer_engine()
-                    .transfer_data_no_copy(peer_id, true, src_addr, target_addr, len, None)
+                let transfer_result = if start_item.source_kind == GetSourceKind::Ssd {
+                    self.stage_kv_from_ssd_source(
+                        &start_item.node_id,
+                        &key,
+                        start_item.put_id,
+                        get_id,
+                        src_addr,
+                        len,
+                        target_addr,
+                        len,
+                    )
                     .await
-                    .map_err(|err| {
-                        KvError::Api(ApiError::Transfer {
-                            from_addr: src_addr,
-                            to_addr: target_addr,
-                            len,
-                            error: err.to_string(),
+                } else {
+                    self.view
+                        .client_transfer_engine()
+                        .transfer_data_no_copy(peer_id, true, src_addr, target_addr, len, None)
+                        .await
+                        .map(|_| ())
+                        .map_err(|err| {
+                            KvError::Api(ApiError::Transfer {
+                                from_addr: src_addr,
+                                to_addr: target_addr,
+                                len,
+                                error: err.to_string(),
+                            })
                         })
-                    });
+                };
                 let transfer_us = transfer_started_at
                     .elapsed()
                     .as_micros()
@@ -1209,18 +1262,26 @@ impl ClientKvApiInner {
             );
         }
 
-        // transfer data (skip if local and src==target to avoid redundant copy)
-        if peer_id.is_none() && abs_src == abs_target {
+        let transfer_result = if resp.source_kind == GetSourceKind::Ssd {
+            self.stage_kv_from_ssd_source(
+                &resp.node_id,
+                key,
+                put_id,
+                get_id,
+                abs_src,
+                data_len as u64,
+                abs_target,
+                data_len as u64,
+            )
+            .await
+        } else if peer_id.is_none() && abs_src == abs_target {
             tracing::debug!(
                 "kv get local no-op: src==target {:#x}, len={} (skip transfer)",
                 abs_target,
                 data_len
             );
+            Ok(())
         } else {
-            // tracing::debug!(
-            //     "kv get transfer in transfer engine path from {}",
-            //     peer_id.as_ref().map(|v| &**v).unwrap_or("self")
-            // );
             tracing::debug!(
                 "p2p get transfer: key={}, remote_src={:#x} -> local_target={:#x}, len={}, peer={:?}",
                 key,
@@ -1229,8 +1290,7 @@ impl ClientKvApiInner {
                 data_len,
                 peer_id
             );
-            if let Err(e) = self
-                .view
+            self.view
                 .client_transfer_engine()
                 .transfer_data_no_copy(
                     peer_id.clone(),
@@ -1241,33 +1301,32 @@ impl ClientKvApiInner {
                     None,
                 )
                 .await
-            {
-                tracing::warn!("transfer data failed: {:?}", e);
-
-                #[cfg(test)]
-                {
-                    self.test_record.remove_transfering_get(get_id);
-                }
-
-                obe_get_transfer_error(&metrics, &client_id, &node_role, key, data_len as u64);
-                self.get_revoke(get_id).await?;
-                return Err(KvError::Api(ApiError::Transfer {
-                    from_addr: abs_src,
-                    to_addr: abs_target,
-                    len: data_len as u64,
-                    error: e.to_string(),
-                }));
-            } else {
-                tracing::debug!(
-                    "get_transfer success key={}, src_addr={:#x}, target_addr={:#x}, len={}, peer_id={:?}",
-                    key,
-                    abs_src,
-                    abs_target,
-                    data_len,
-                    peer_id
-                );
-            }
+                .map(|_| ())
+                .map_err(|err| {
+                    KvError::Api(ApiError::Transfer {
+                        from_addr: abs_src,
+                        to_addr: abs_target,
+                        len: data_len as u64,
+                        error: err.to_string(),
+                    })
+                })
+        };
+        if let Err(err) = transfer_result {
+            tracing::warn!("transfer data failed: {:?}", err);
+            #[cfg(test)]
+            self.test_record.remove_transfering_get(get_id);
+            obe_get_transfer_error(&metrics, &client_id, &node_role, key, data_len as u64);
+            self.get_revoke(get_id).await?;
+            return Err(err);
         }
+        tracing::debug!(
+            "get_transfer success key={}, src_addr={:#x}, target_addr={:#x}, len={}, peer_id={:?}",
+            key,
+            abs_src,
+            abs_target,
+            data_len,
+            peer_id
+        );
         let t3 = Utc::now().timestamp_micros();
         obe_get_transfer_success(
             &metrics,

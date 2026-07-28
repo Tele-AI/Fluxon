@@ -97,6 +97,23 @@ pub enum SideTransferRole {
     Worker,
 }
 
+/// Experimental source ordering for an external planned Get when SSD routes
+/// are present. The default preserves the sealed r89 behavior so a new
+/// release does not silently change an existing baseline.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SsdReadSourcePolicy {
+    /// Any memory source wins over any SSD source; within a tier a remote
+    /// source wins over the requester-local owner. This is the r89 order.
+    #[default]
+    LegacyRemoteFirst,
+    /// Treat SSD as a requester-local tier, never as a cross-node source.
+    /// The eligible order is local memory, local SSD, then remote memory.
+    /// A remote owner's SSD route is deliberately excluded rather than used
+    /// as a fallback.
+    LocalSsdOnlyFirst,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerLocalReserveExpectedCapacity {
@@ -142,6 +159,8 @@ pub struct TestSpecConfig {
     pub short_circuit_put_payload_path: bool,
     #[serde(default)]
     pub skip_put_end_commit: bool,
+    #[serde(default)]
+    pub ssd_read_source_policy: SsdReadSourcePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_local_reserve_soft_wait_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +211,7 @@ impl Default for TestSpecConfig {
             prefer_local_placement: false,
             short_circuit_put_payload_path: false,
             skip_put_end_commit: false,
+            ssd_read_source_policy: SsdReadSourcePolicy::default(),
             owner_local_reserve_soft_wait_timeout_ms: None,
             owner_local_reserve_hard_timeout_ms: None,
             owner_local_reserve_expected_capacity: None,
@@ -891,6 +911,19 @@ pub struct FluxonKvSpecYaml {
     pub share_mem_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub large_file_paths: Option<LargeFilePathsYaml>,
+    /// Optional per-owner SSD capacity. When present, it must contain one
+    /// value matching the single local `large_file_paths` root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub large_limit_size: Option<YamlNullable<Vec<u64>>>,
+    /// Optional sustained SSD write admission rate. This is a load-shedding
+    /// limit, not a queue: owner-local victims beyond the available budget are
+    /// reclaimed without an SSD copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssd_write_rate_limit_bytes_per_sec: Option<u64>,
+    /// Maximum immediately admissible SSD bytes. It must be paired with
+    /// `ssd_write_rate_limit_bytes_per_sec`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssd_write_burst_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p2p_listen_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -902,6 +935,13 @@ pub struct FluxonKvSpecYaml {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct LargeFilePathsYaml(pub Vec<String>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvSsdStorageConfig {
+    pub limit_bytes: u64,
+    pub write_rate_limit_bytes_per_sec: Option<u64>,
+    pub write_burst_bytes: Option<u64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1029,6 +1069,14 @@ impl LargeFilePaths {
             "fluxon fs disk cache",
         )
     }
+
+    pub fn kv_ssd_storage_root(&self, cluster_name: &str, instance_key: &str) -> KvResult<PathBuf> {
+        let relative_dir = PathBuf::from(format!(
+            "{cluster_name}_cluster_kv_ssd_storage/{}",
+            crate::kv_ssd_storage::safe_path_component(instance_key)
+        ));
+        self.resolve_preferred_root_subdir(&relative_dir, "kv ssd storage")
+    }
 }
 
 /// KV client backend types supported by the system
@@ -1051,6 +1099,7 @@ pub struct ClientConfig {
     pub fluxonkv_spec: FluxonKvSpec,
     pub share_mem_path: String,           // Mandatory shared bundle path
     pub large_file_paths: LargeFilePaths, // Mandatory large-file roots for logs and caches
+    pub ssd_storage: Option<KvSsdStorageConfig>,
     pub test_spec_config: TestSpecConfig,
 }
 
@@ -1398,6 +1447,13 @@ impl ClientConfigYaml {
                 }
                 .into_kverror());
             }
+            if self.fluxonkv_spec.large_limit_size.is_some() {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "fluxonkv_spec.large_limit_size is forbidden in zero-contribution mode"
+                        .to_string(),
+                }
+                .into_kverror());
+            }
         }
 
         // Preserve historical behavior for configs that omit `protocol`, but allow
@@ -1576,6 +1632,81 @@ impl ClientConfigYaml {
             }
         };
 
+        let ssd_write_rate_limit_bytes_per_sec =
+            self.fluxonkv_spec.ssd_write_rate_limit_bytes_per_sec;
+        let ssd_write_burst_bytes = self.fluxonkv_spec.ssd_write_burst_bytes;
+        let write_limit = match (ssd_write_rate_limit_bytes_per_sec, ssd_write_burst_bytes) {
+            (None, None) => None,
+            (Some(rate), Some(burst)) if rate > 0 && burst > 0 => Some((rate, burst)),
+            (Some(_), Some(_)) => {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "fluxonkv_spec SSD write rate and burst must both be positive"
+                        .to_string(),
+                }
+                .into_kverror());
+            }
+            _ => {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "fluxonkv_spec.ssd_write_rate_limit_bytes_per_sec and ssd_write_burst_bytes must be configured together"
+                        .to_string(),
+                }
+                .into_kverror());
+            }
+        };
+
+        let ssd_storage = if is_external {
+            if write_limit.is_some() {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "SSD write admission is only valid on owner configs".to_string(),
+                }
+                .into_kverror());
+            }
+            None
+        } else {
+            match std::mem::take(&mut self.fluxonkv_spec.large_limit_size) {
+                None | Some(YamlNullable::Null) => {
+                    if write_limit.is_some() {
+                        return Err(ConfigError::InvalidClientConfig {
+                            detail: "SSD write admission requires fluxonkv_spec.large_limit_size"
+                                .to_string(),
+                        }
+                        .into_kverror());
+                    }
+                    None
+                }
+                Some(YamlNullable::Value(limits)) => {
+                    if large_file_paths.paths.len() != 1 || limits.len() != 1 {
+                        return Err(ConfigError::InvalidClientConfig {
+                            detail: format!(
+                                "SSD-enabled owners require exactly one local large_file_paths root and one large_limit_size value: roots={} limits={}",
+                                large_file_paths.paths.len(),
+                                limits.len()
+                            ),
+                        }
+                        .into_kverror());
+                    }
+                    let limit_bytes = limits[0];
+                    if limit_bytes < crate::kv_ssd_storage::MIN_CAPACITY_BYTES {
+                        return Err(ConfigError::InvalidClientConfig {
+                            detail: format!(
+                                "fluxonkv_spec.large_limit_size[0] must be at least {} bytes",
+                                crate::kv_ssd_storage::MIN_CAPACITY_BYTES
+                            ),
+                        }
+                        .into_kverror());
+                    }
+                    let (write_rate_limit_bytes_per_sec, write_burst_bytes) = write_limit
+                        .map(|(rate, burst)| (Some(rate), Some(burst)))
+                        .unwrap_or((None, None));
+                    Some(KvSsdStorageConfig {
+                        limit_bytes,
+                        write_rate_limit_bytes_per_sec,
+                        write_burst_bytes,
+                    })
+                }
+            }
+        };
+
         Ok(ClientConfig {
             cluster_name: fluxonkv_spec.cluster_name.clone(),
             etcd_addresses_raw,
@@ -1588,6 +1719,7 @@ impl ClientConfigYaml {
             fluxonkv_spec,
             share_mem_path,
             large_file_paths,
+            ssd_storage,
             test_spec_config,
         })
     }
@@ -2261,6 +2393,114 @@ fluxonkv_spec:
         let text = format!("{err}");
         assert!(
             text.contains("fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode")
+        );
+    }
+
+    #[test]
+    fn owner_ssd_config_requires_one_local_root_and_one_capacity() {
+        let valid = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_ssd_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /mnt/nvme0/mjq_build/fluxon_config_ssd_share
+  large_file_paths: [/mnt/nvme0/mjq_build/fluxon_config_ssd_local]
+  large_limit_size: [67108864]
+  ssd_write_rate_limit_bytes_per_sec: 268435456
+  ssd_write_burst_bytes: 67108864
+  sub_cluster: rack-a
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(
+            valid.ssd_storage.as_ref().map(|ssd| ssd.limit_bytes),
+            Some(crate::kv_ssd_storage::MIN_CAPACITY_BYTES)
+        );
+        assert_eq!(
+            valid
+                .ssd_storage
+                .as_ref()
+                .and_then(|ssd| ssd.write_rate_limit_bytes_per_sec),
+            Some(268435456)
+        );
+        assert_eq!(
+            valid
+                .ssd_storage
+                .as_ref()
+                .and_then(|ssd| ssd.write_burst_bytes),
+            Some(67108864)
+        );
+
+        let multiple_roots = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_ssd_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /mnt/nvme0/mjq_build/fluxon_config_ssd_share
+  large_file_paths:
+    - /mnt/nvme0/mjq_build/fluxon_config_ssd_local_a
+    - /mnt/nvme0/mjq_build/fluxon_config_ssd_local_b
+  large_limit_size: [67108864]
+  sub_cluster: rack-a
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap_err();
+        assert!(
+            multiple_roots
+                .to_string()
+                .contains("SSD-enabled owners require exactly one local large_file_paths root")
+        );
+
+        let too_small = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_ssd_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /mnt/nvme0/mjq_build/fluxon_config_ssd_share
+  large_file_paths: [/mnt/nvme0/mjq_build/fluxon_config_ssd_local]
+  large_limit_size: [67108863]
+  sub_cluster: rack-a
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap_err();
+        assert!(too_small.to_string().contains("must be at least 67108864"));
+    }
+
+    #[test]
+    fn zero_contribution_rejects_owner_ssd_capacity() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_external
+fluxonkv_spec:
+  cluster_name: test_cluster
+  share_mem_path: /mnt/nvme0/mjq_build/fluxon_config_ssd_external
+  large_limit_size: [67108864]
+"#,
+        )
+        .unwrap();
+        assert!(
+            cfg.verify()
+                .unwrap_err()
+                .to_string()
+                .contains("large_limit_size is forbidden in zero-contribution mode")
         );
     }
 

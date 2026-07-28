@@ -1057,6 +1057,7 @@ fn build_client_launch(
             &instance_key,
             &contribute_to_cluster_pool_size,
         ),
+        ssd_storage: None,
         // Mirror round intent into the generated config so logs and runtime behavior
         // agree on whether this launch is transfer_only vs transfer_with_rpc.
         test_spec_config: kv_test_round_test_spec_config(round.round_profile),
@@ -2470,7 +2471,7 @@ async fn run_kv_round(round: &KvTestRoundOptions) {
             .kv_routes
             .get(CLIENT_COMMUNICATION_KEY)
         {
-            let replicas = one_kv_nodes_routes.nodes_replicas.read();
+            let replicas = one_kv_nodes_routes.node_replicas.read();
             let active_replica_count = replicas
                 .iter()
                 .filter(|(_, kv_info)| !kv_info.tomb_tag.is_tomb())

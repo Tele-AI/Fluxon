@@ -105,7 +105,7 @@ pub(super) async fn apply_post_route_maintenance_batch(
                 let event_is_current = inner.kv_routes.get(&event.key).is_some_and(|route| {
                     route.put_id == event.put_id
                         && route
-                            .nodes_replicas
+                            .node_replicas
                             .read()
                             .values()
                             .any(|replica| !replica.tomb_tag.is_tomb())

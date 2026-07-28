@@ -1,19 +1,21 @@
 use super::{
     CommittedSlotReplica, CompletedReplicaTaskInfo, InflightPutAllocation, InflightPutCommitInfo,
-    InflightPutInfo, InflightReplicaTaskInfo, KvReplicaBacking, KvRouteInfo, LocalReserveGrantInfo,
-    MasterKeyActivityCompletionGuard, MasterKvRouterView, NodeCacheCapacityReservation,
-    OwnerHoldingGetInfo, PreparedPutKeyReservationInfo, PutPlacementMode, ReservedCapacityReason,
+    InflightPutInfo, InflightReplicaTaskInfo, KvMemoryReplica, KvNodeReplicas, KvReplicaBacking,
+    LocalReserveGrantInfo, MasterKeyActivityCompletionGuard, MasterKvRouterView,
+    NodeCacheCapacityReservation, OwnerHoldingGetInfo, PreparedPutKeyReservationInfo,
+    PutPlacementMode, ReservedCapacityReason, SsdReplicaCommitStatus,
     msg_pack::{
-        BatchPreparePutKeysReq, BatchPreparePutKeysResp, BatchPutAppendDoneItemResp,
-        BatchPutAppendDoneReq, BatchPutAppendDoneResp, BatchPutAppendStartItemResp,
-        BatchPutAppendStartReq, BatchPutAppendStartResp, BatchPutDoneItemResp, BatchPutDoneReq,
-        BatchPutDoneResp, BatchPutRevokeItemResp, BatchPutRevokeReq, BatchPutRevokeResp,
-        BatchPutStartItemResp, BatchPutStartReq, BatchPutStartResp,
-        BatchReleasePutKeyReservationsReq, BatchReleasePutKeyReservationsResp,
-        GroupedBatchPutDoneReq, GroupedBatchPutDoneResp, PutAppendDoneReq, PutAppendDoneResp,
-        PutAppendRevokeReq, PutAppendRevokeResp, PutAppendStartOutcome, PutAppendStartReq,
-        PutAppendStartResp, PutAtomicGroup, PutDoneCommittedSlot, PutDoneReq, PutDoneResp,
-        PutRevokeReq, PutRevokeResp, PutStartReq, PutStartResp, ReleaseLocalGrantReq,
+        BatchPreparePutKeysReq, BatchPreparePutKeysResp, BatchPublishOwnerSsdReq,
+        BatchPublishOwnerSsdResp, BatchPutAppendDoneItemResp, BatchPutAppendDoneReq,
+        BatchPutAppendDoneResp, BatchPutAppendStartItemResp, BatchPutAppendStartReq,
+        BatchPutAppendStartResp, BatchPutDoneItemResp, BatchPutDoneReq, BatchPutDoneResp,
+        BatchPutRevokeItemResp, BatchPutRevokeReq, BatchPutRevokeResp, BatchPutStartItemResp,
+        BatchPutStartReq, BatchPutStartResp, BatchReleasePutKeyReservationsReq,
+        BatchReleasePutKeyReservationsResp, GroupedBatchPutDoneReq, GroupedBatchPutDoneResp,
+        OwnerSsdPublishItem, OwnerSsdPublishItemResp, OwnerSsdPublishOutcome, PutAppendDoneReq,
+        PutAppendDoneResp, PutAppendRevokeReq, PutAppendRevokeResp, PutAppendStartOutcome,
+        PutAppendStartReq, PutAppendStartResp, PutAtomicGroup, PutDoneCommittedSlot, PutDoneReq,
+        PutDoneResp, PutRevokeReq, PutRevokeResp, PutStartReq, PutStartResp, ReleaseLocalGrantReq,
         ReleaseLocalGrantResp, ReserveLocalGrantOutcome, ReserveLocalGrantReq,
         ReserveLocalGrantResp, build_shared_put_atomic_group_assignments,
     },
@@ -44,10 +46,167 @@ use parking_lot::RwLock;
 use rand::seq::SliceRandom;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, atomic::AtomicU32},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 pub type PutIDForAKey = (u64, u32);
+
+fn publish_owner_ssd_item(
+    view: &MasterKvRouterView,
+    owner: &NodeID,
+    item: OwnerSsdPublishItem,
+) -> OwnerSsdPublishItemResp {
+    let response = |outcome, detail: String| OwnerSsdPublishItemResp {
+        key: item.key.clone(),
+        put_id: item.put_id,
+        outcome,
+        detail,
+    };
+    let _activity = match view
+        .master_kv_router()
+        .reserve_inflight_replica_key(&item.key)
+    {
+        Ok(activity) => activity,
+        Err(err) => {
+            return response(
+                OwnerSsdPublishOutcome::RetryableBusy,
+                format!("master key activity is busy: {err}"),
+            );
+        }
+    };
+
+    let Some(route) = view.master_kv_router().inner().kv_routes.get(&item.key) else {
+        return response(
+            OwnerSsdPublishOutcome::Obsolete,
+            "route is absent".to_string(),
+        );
+    };
+    if route.put_id != item.put_id {
+        return response(
+            OwnerSsdPublishOutcome::Obsolete,
+            format!(
+                "route generation changed: current=({},{})",
+                route.put_id.0, route.put_id.1
+            ),
+        );
+    }
+
+    let has_remote_memory = {
+        let replicas = route.node_replicas.read();
+        let Some(owner_replicas) = replicas.get(owner) else {
+            return response(
+                OwnerSsdPublishOutcome::Obsolete,
+                "same-owner route entry is absent".to_string(),
+            );
+        };
+        if owner_replicas.tomb_tag.is_tomb() {
+            return response(
+                OwnerSsdPublishOutcome::Obsolete,
+                "same-owner generation is tombed".to_string(),
+            );
+        }
+        if let Some(existing) = owner_replicas.ssd.as_ref() {
+            return if existing.len == item.len {
+                response(
+                    OwnerSsdPublishOutcome::AlreadyPresent,
+                    "same-owner SSD backing is already published".to_string(),
+                )
+            } else {
+                response(
+                    OwnerSsdPublishOutcome::Rejected,
+                    format!(
+                        "existing SSD length mismatch: existing={} requested={}",
+                        existing.len, item.len
+                    ),
+                )
+            };
+        }
+        replicas.iter().any(|(node_id, replicas)| {
+            node_id != owner && !replicas.tomb_tag.is_tomb() && replicas.memory.is_some()
+        })
+    };
+
+    match route.commit_ssd_replica(owner, item.len) {
+        SsdReplicaCommitStatus::Committed => {
+            let counters = &view.master_kv_router().inner().ssd_tier_counters;
+            let (items, bytes) = if has_remote_memory {
+                (
+                    &counters.local_ssd_published_with_remote_memory_items,
+                    &counters.local_ssd_published_with_remote_memory_bytes,
+                )
+            } else {
+                (
+                    &counters.local_ssd_published_without_remote_memory_items,
+                    &counters.local_ssd_published_without_remote_memory_bytes,
+                )
+            };
+            items.fetch_add(1, Ordering::Relaxed);
+            bytes.fetch_add(item.len, Ordering::Relaxed);
+            response(
+                OwnerSsdPublishOutcome::Published,
+                "same-owner SSD backing published while memory remains live".to_string(),
+            )
+        }
+        SsdReplicaCommitStatus::MissingMemory | SsdReplicaCommitStatus::TombedNode => response(
+            OwnerSsdPublishOutcome::Obsolete,
+            "exact live same-owner memory generation is absent".to_string(),
+        ),
+        SsdReplicaCommitStatus::LengthMismatch => response(
+            OwnerSsdPublishOutcome::Rejected,
+            format!(
+                "SSD length does not match same-owner memory: requested={}",
+                item.len
+            ),
+        ),
+    }
+}
+
+/// Publish durable same-owner SSD bytes onto the current route without
+/// deleting or replacing the memory backing.
+pub async fn handle_batch_publish_owner_ssd(
+    view: MasterKvRouterView,
+    req: MsgPack<BatchPublishOwnerSsdReq>,
+    owner: NodeID,
+) -> MsgPack<BatchPublishOwnerSsdResp> {
+    let current_generation = view
+        .cluster_manager()
+        .get_member_info_cached(owner.as_ref())
+        .map(|member| member.node_start_time);
+    if current_generation != Some(req.serialize_part.owner_node_start_time) {
+        let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+            detail: format!(
+                "owner SSD publication generation mismatch: owner={} requested={} current={:?}",
+                owner, req.serialize_part.owner_node_start_time, current_generation
+            ),
+        });
+        return MsgPack {
+            serialize_part: BatchPublishOwnerSsdResp {
+                items: Vec::new(),
+                error_code: err.code(),
+                error_json: err.to_json(),
+            },
+            raw_bytes: Vec::new(),
+        };
+    }
+
+    let items = req
+        .serialize_part
+        .items
+        .into_iter()
+        .map(|item| publish_owner_ssd_item(&view, &owner, item))
+        .collect();
+    MsgPack {
+        serialize_part: BatchPublishOwnerSsdResp {
+            items,
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+        },
+        raw_bytes: Vec::new(),
+    }
+}
 
 fn validate_put_start_source_node_override(
     view: &MasterKvRouterView,
@@ -155,10 +314,10 @@ fn current_route_append_outcome(
     verify_put_id: PutIDForAKey,
 ) -> PutAppendStartOutcome {
     let has_complete_remote = route
-        .nodes_replicas
+        .node_replicas
         .read()
-        .values()
-        .any(|replica| !replica.tomb_tag.is_tomb() && replica.node_id != *source_node_id);
+        .iter()
+        .any(|(node_id, replicas)| node_id != source_node_id && replicas.has_live_backing());
     classify_put_append_start_outcome(route.put_id == verify_put_id, has_complete_remote)
 }
 
@@ -265,14 +424,13 @@ fn append_current_route_replica_if_matching(
     let published = publish_route_replica_tomb_fenced(
         &one_kv_nodes_routes,
         node_id.clone(),
-        KvRouteInfo {
-            node_id: node_id.clone(),
+        KvMemoryReplica {
             backing: KvReplicaBacking::Allocation(Arc::new(allocation)),
             owner_local_indexed: false,
             get_durable_reservation: None,
             capacity_reservation,
-            tomb_tag: target_tomb_tag,
         },
+        target_tomb_tag,
     );
     if !published {
         tracing::warn!(
@@ -326,15 +484,13 @@ fn allocate_from_node_local_segment(
         );
     }
 
-    let total = allocator.total_size_bytes();
-    let used = allocator.used_size_bytes();
-    let free = total.saturating_sub(used);
+    let capacity = allocator.node_pool_capacity_snapshot();
     Err(msg_and_error::KvError::Api(
         msg_and_error::ApiError::NoSpace {
             node: node_id.as_ref().to_string(),
             segment: allocator.seg_device_id.clone(),
-            total_capacity: total,
-            free_capacity: free,
+            total_capacity: capacity.active_capacity_bytes,
+            free_capacity: capacity.available_capacity_bytes,
         },
     ))
 }
@@ -558,22 +714,25 @@ async fn publish_completed_put_route(
     lease_id_opt: Option<u64>,
     atomic_group: Option<Arc<super::msg_pack::PutAtomicGroup>>,
     node_id: NodeID,
-    completed_info: KvRouteInfo,
+    publish_tag: crate::master_seg_manager::NodeTombTag,
+    completed_info: KvMemoryReplica,
     target_cap_bytes: u64,
     local_cache_holder_id: Option<u64>,
 ) -> MsgPack<PutDoneResp> {
-    let publish_tag = completed_info.tomb_tag.clone();
     let new_route = Arc::new(OneKvNodesRoutes {
         put_id,
         lease_id: lease_id_opt,
         atomic_group: atomic_group.clone(),
-        nodes_replicas: RwLock::new(HashMap::from([(node_id.clone(), completed_info)])),
+        node_replicas: RwLock::new(HashMap::from([(
+            node_id.clone(),
+            KvNodeReplicas::memory(publish_tag.clone(), completed_info),
+        )])),
         get_durable_slots_used: AtomicU32::new(0),
     });
     let old_one_kv_routes = match publish_primary_route_tomb_fenced(
         &view.master_kv_router().inner().kv_routes,
         &key,
-        new_route,
+        new_route.clone(),
         &publish_tag,
     ) {
         Ok(previous) => previous,
@@ -1485,13 +1644,11 @@ async fn handle_put_done_with_resolved_group(
                     drop(target_allocation);
                     (
                         target_cap_bytes,
-                        KvRouteInfo {
-                            node_id: node_id.clone(),
+                        KvMemoryReplica {
                             backing: KvReplicaBacking::CommittedSlot(committed_slot),
                             owner_local_indexed: true,
                             get_durable_reservation: None,
                             capacity_reservation,
-                            tomb_tag: slot_tomb_tag,
                         },
                         false,
                     )
@@ -1527,13 +1684,11 @@ async fn handle_put_done_with_resolved_group(
                     };
                     (
                         target_cap_bytes,
-                        KvRouteInfo {
-                            node_id: node_id.clone(),
+                        KvMemoryReplica {
                             backing: KvReplicaBacking::Allocation(Arc::new(target_allocation)),
                             owner_local_indexed: req.serialize_part.publish_local_cache,
                             get_durable_reservation: None,
                             capacity_reservation,
-                            tomb_tag,
                         },
                         true,
                     )
@@ -1565,13 +1720,11 @@ async fn handle_put_done_with_resolved_group(
                 };
                 (
                     target_cap_bytes,
-                    KvRouteInfo {
-                        node_id: node_id.clone(),
+                    KvMemoryReplica {
                         backing: KvReplicaBacking::Allocation(Arc::new(target)),
                         owner_local_indexed: false,
                         get_durable_reservation: None,
                         capacity_reservation,
-                        tomb_tag,
                     },
                     false,
                 )
@@ -1602,13 +1755,11 @@ async fn handle_put_done_with_resolved_group(
                 };
                 (
                     target_cap_bytes,
-                    KvRouteInfo {
-                        node_id: node_id.clone(),
+                    KvMemoryReplica {
                         backing: KvReplicaBacking::CommittedSlot(slot),
                         owner_local_indexed: true,
                         get_durable_reservation: None,
                         capacity_reservation,
-                        tomb_tag,
                     },
                     false,
                 )
@@ -1666,18 +1817,21 @@ async fn handle_put_done_with_resolved_group(
         // Publish the primary route under the node-generation fence.  This
         // closes the gap where MemberLeft marked/snapshotted routes between a
         // pre-check and a later DashMap insert.
-        let publish_tag = completed_info.tomb_tag.clone();
+        let publish_tag = tomb_tag.clone();
         let new_route = Arc::new(OneKvNodesRoutes {
             put_id,
             lease_id: lease_id_opt,
             atomic_group: atomic_group.clone(),
-            nodes_replicas: RwLock::new(HashMap::from([(node_id.clone(), completed_info)])),
+            node_replicas: RwLock::new(HashMap::from([(
+                node_id.clone(),
+                KvNodeReplicas::memory(publish_tag.clone(), completed_info),
+            )])),
             get_durable_slots_used: AtomicU32::new(0),
         });
         let old_one_kv_routes = match publish_primary_route_tomb_fenced(
             &view.master_kv_router().inner().kv_routes,
             &key,
-            new_route,
+            new_route.clone(),
             &publish_tag,
         ) {
             Ok(previous) => previous,
@@ -1830,13 +1984,11 @@ async fn handle_put_done_with_resolved_group(
                     };
                 }
             };
-            let completed_info = KvRouteInfo {
-                node_id: node_id.clone(),
+            let completed_info = KvMemoryReplica {
                 backing: KvReplicaBacking::CommittedSlot(committed_slot),
                 owner_local_indexed: true,
                 get_durable_reservation: None,
                 capacity_reservation,
-                tomb_tag,
             };
             return publish_completed_put_route(
                 view,
@@ -1845,6 +1997,7 @@ async fn handle_put_done_with_resolved_group(
                 lease_id_opt,
                 atomic_group,
                 node_id,
+                tomb_tag,
                 completed_info,
                 target_cap_bytes,
                 None,
@@ -2171,11 +2324,11 @@ async fn handle_put_append_start_inner(
             .as_ref()
             .map(|route| {
                 route
-                    .nodes_replicas
+                    .node_replicas
                     .read()
-                    .values()
-                    .filter_map(|replica| {
-                        (!replica.tomb_tag.is_tomb()).then_some(replica.node_id.clone())
+                    .iter()
+                    .filter_map(|(node_id, replicas)| {
+                        replicas.has_live_backing().then_some(node_id.clone())
                     })
                     .collect::<HashSet<_>>()
             })

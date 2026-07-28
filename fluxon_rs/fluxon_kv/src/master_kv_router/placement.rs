@@ -119,9 +119,9 @@ impl PlacementPolicy for LocalFirstPlacementPolicy {
                         continue;
                     };
 
-                    let total = allocator.total_size_bytes();
-                    let used = allocator.used_size_bytes();
-                    let free = total.saturating_sub(used);
+                    let capacity = allocator.node_pool_capacity_snapshot();
+                    let total = capacity.active_capacity_bytes;
+                    let free = capacity.available_capacity_bytes;
                     last_no_space_ctx = Some((
                         node_id.as_ref().to_string(),
                         allocator.seg_device_id.clone(),
@@ -152,9 +152,9 @@ impl PlacementPolicy for LocalFirstPlacementPolicy {
             let all_segs = seg_manager.get_all_segments_allocator();
             if let Some((nodeid, allocator)) = all_segs.choose(&mut rand::thread_rng()).cloned() {
                 let node_id: NodeID = nodeid.into();
-                let total = allocator.total_size_bytes();
-                let used = allocator.used_size_bytes();
-                let free = total.saturating_sub(used);
+                let capacity = allocator.node_pool_capacity_snapshot();
+                let total = capacity.active_capacity_bytes;
+                let free = capacity.available_capacity_bytes;
                 last_no_space_ctx = Some((
                     node_id.as_ref().to_string(),
                     allocator.seg_device_id.clone(),
@@ -260,9 +260,9 @@ impl PlacementPolicy for RandomPlacementPolicy {
                         continue;
                     };
 
-                    let total = allocator.total_size_bytes();
-                    let used = allocator.used_size_bytes();
-                    let free = total.saturating_sub(used);
+                    let capacity = allocator.node_pool_capacity_snapshot();
+                    let total = capacity.active_capacity_bytes;
+                    let free = capacity.available_capacity_bytes;
                     last_no_space_ctx = Some((
                         node_id.as_ref().to_string(),
                         allocator.seg_device_id.clone(),
@@ -294,9 +294,9 @@ impl PlacementPolicy for RandomPlacementPolicy {
                     continue;
                 }
 
-                let total = allocator.total_size_bytes();
-                let used = allocator.used_size_bytes();
-                let free = total.saturating_sub(used);
+                let capacity = allocator.node_pool_capacity_snapshot();
+                let total = capacity.active_capacity_bytes;
+                let free = capacity.available_capacity_bytes;
                 last_no_space_ctx = Some((
                     node_id.as_ref().to_string(),
                     allocator.seg_device_id.clone(),
@@ -449,9 +449,10 @@ fn collect_remote_candidates(
             continue;
         }
 
-        let total = allocator.total_size_bytes();
-        let used = allocator.used_size_bytes();
-        let free = total.saturating_sub(used);
+        let capacity = allocator.node_pool_capacity_snapshot();
+        let total = capacity.active_capacity_bytes;
+        let used = capacity.used_capacity_bytes;
+        let free = capacity.available_capacity_bytes;
         let node_key = node_id.as_ref().to_string();
         let node_write_count = view
             .master_kv_router()
@@ -798,9 +799,9 @@ fn choose_random_remote_target_with_allocator(
             let Some(allocator) = node_allocators.choose(&mut rand::thread_rng()).cloned() else {
                 continue;
             };
-            let total = allocator.total_size_bytes();
-            let used = allocator.used_size_bytes();
-            let free = total.saturating_sub(used);
+            let capacity = allocator.node_pool_capacity_snapshot();
+            let total = capacity.active_capacity_bytes;
+            let free = capacity.available_capacity_bytes;
             last_no_space_ctx = Some((
                 node_id.as_ref().to_string(),
                 allocator.seg_device_id.clone(),
@@ -825,9 +826,9 @@ fn choose_random_remote_target_with_allocator(
         .collect();
     candidates.shuffle(&mut rand::thread_rng());
     for (node_id, allocator) in candidates {
-        let total = allocator.total_size_bytes();
-        let used = allocator.used_size_bytes();
-        let free = total.saturating_sub(used);
+        let capacity = allocator.node_pool_capacity_snapshot();
+        let total = capacity.active_capacity_bytes;
+        let free = capacity.available_capacity_bytes;
         last_no_space_ctx = Some((
             node_id.as_ref().to_string(),
             allocator.seg_device_id.clone(),

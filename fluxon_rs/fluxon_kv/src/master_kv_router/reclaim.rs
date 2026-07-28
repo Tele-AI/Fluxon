@@ -4,7 +4,7 @@ use crate::master_kv_router::msg_pack::{
     BatchEvictOwnerSourceReq, BatchEvictOwnerSourceResp, BatchOwnerReclaimReq, OwnerReclaimBacking,
     OwnerReclaimItem, OwnerReclaimItemResp, OwnerReclaimItemState, OwnerReclaimPhase,
     OwnerReclaimReason, OwnerSourceEvictionOutcome, OwnerSourceEvictionVictim,
-    OwnerSourceEvictionVictimResp, owner_source_eviction_epoch,
+    OwnerSourceEvictionVictimResp, OwnerSourceSsdPolicy, owner_source_eviction_epoch,
 };
 use crate::p2p::msg_pack::{MIN_EXPLICIT_RPC_TIMEOUT_SECS, MsgPack, RPCCaller};
 use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, OK};
@@ -17,6 +17,10 @@ use std::time::Duration;
 
 const OWNER_RECLAIM_RPC_TIMEOUT: Duration = Duration::from_secs(MIN_EXPLICIT_RPC_TIMEOUT_SECS);
 const OWNER_RECLAIM_MAX_BATCH: usize = 256;
+// Keep each transport/SSD transaction small enough to release physical slots
+// continuously.  Every entry remains an independently fenced single-KV
+// victim; this is only an RPC and bounded-I/O aggregation limit.
+const OWNER_RECLAIM_RPC_BATCH: usize = 32;
 const OWNER_RECLAIM_MERGE_WINDOW: Duration = Duration::from_millis(5);
 const EVICTION_RECLAIM_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const EVICTION_RECLAIM_RETRY_MAX: Duration = Duration::from_secs(1);
@@ -72,8 +76,8 @@ mod single_victim_transaction_tests {
         OwnerSourceEvictionVictim, PutAtomicGroup, PutAtomicGroupMember,
     };
     use crate::master_kv_router::{
-        CommittedSlotReplica, KvRouteInfo, MasterKeyActivityKind, MasterKeyActivityTable,
-        OneKvNodesRoutes,
+        CommittedSlotReplica, KvMemoryReplica, KvNodeReplicas, KvSsdReplica, MasterKeyActivityKind,
+        MasterKeyActivityTable, OneKvNodesRoutes,
     };
     use crate::master_seg_manager::NodeTombTag;
     use parking_lot::RwLock;
@@ -150,6 +154,8 @@ mod single_victim_transaction_tests {
                 slot_index,
                 slot_size: 4096,
             },
+            ssd_backing_len: None,
+            ssd_policy: OwnerSourceSsdPolicy::Drop,
         }
     }
 
@@ -167,50 +173,52 @@ mod single_victim_transaction_tests {
         else {
             unreachable!()
         };
-        let owner_replica = KvRouteInfo {
-            node_id: owner.clone(),
-            backing: KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
-                owner_node_id: owner.clone(),
-                grant_id: *grant_id,
-                slot_index: *slot_index,
-                slot_size: *slot_size,
-                addr: 0,
-                len: *slot_size,
-                base_addr: 0,
-            }),
-            owner_local_indexed: true,
-            get_durable_reservation: None,
-            capacity_reservation: None,
-            tomb_tag: NodeTombTag::new(),
-        };
+        let owner_replica = KvNodeReplicas::memory(
+            NodeTombTag::new(),
+            KvMemoryReplica {
+                backing: KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
+                    owner_node_id: owner.clone(),
+                    grant_id: *grant_id,
+                    slot_index: *slot_index,
+                    slot_size: *slot_size,
+                    addr: 0,
+                    len: *slot_size,
+                    base_addr: 0,
+                }),
+                owner_local_indexed: true,
+                get_durable_reservation: None,
+                capacity_reservation: None,
+            },
+        );
         let mut replicas = HashMap::from([(owner.clone(), owner_replica)]);
         if include_cpu_replica {
             let cpu: NodeID = "cpu0".to_string().into();
             replicas.insert(
                 cpu.clone(),
-                KvRouteInfo {
-                    node_id: cpu.clone(),
-                    backing: KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
-                        owner_node_id: cpu,
-                        grant_id: 900 + *grant_id,
-                        slot_index: *slot_index,
-                        slot_size: *slot_size,
-                        addr: 0,
-                        len: *slot_size,
-                        base_addr: 0,
-                    }),
-                    owner_local_indexed: false,
-                    get_durable_reservation: None,
-                    capacity_reservation: None,
-                    tomb_tag: NodeTombTag::new(),
-                },
+                KvNodeReplicas::memory(
+                    NodeTombTag::new(),
+                    KvMemoryReplica {
+                        backing: KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
+                            owner_node_id: cpu,
+                            grant_id: 900 + *grant_id,
+                            slot_index: *slot_index,
+                            slot_size: *slot_size,
+                            addr: 0,
+                            len: *slot_size,
+                            base_addr: 0,
+                        }),
+                        owner_local_indexed: false,
+                        get_durable_reservation: None,
+                        capacity_reservation: None,
+                    },
+                ),
             );
         }
         Arc::new(OneKvNodesRoutes {
             put_id: member.put_id,
             lease_id: None,
             atomic_group,
-            nodes_replicas: RwLock::new(replicas),
+            node_replicas: RwLock::new(replicas),
             get_durable_slots_used: AtomicU32::new(0),
         })
     }
@@ -260,14 +268,16 @@ mod single_victim_transaction_tests {
         let counters = crate::master_kv_router::EvictionReclaimCounters::default();
         record_last_route_removal(&counters, &removed);
         assert!(!removed.removed_last_route);
+        assert!(!removed.ssd_survived);
+        assert!(!removed.ssd_became_only_backing);
         assert_eq!(
             counters.last_route_removed_members.load(Ordering::Relaxed),
             0
         );
         assert_eq!(counters.last_route_removed_bytes.load(Ordering::Relaxed), 0);
         let remaining = routes.get(&member.key).expect("CPU route must remain");
-        assert!(!remaining.nodes_replicas.read().contains_key(&owner));
-        assert!(remaining.nodes_replicas.read().contains_key("cpu0"));
+        assert!(!remaining.node_replicas.read().contains_key(&owner));
+        assert!(remaining.node_replicas.read().contains_key("cpu0"));
 
         let last = source_victim("last", (10, 3), 7, 5);
         routes.insert(last.key.clone(), source_route(&owner, &last, None, false));
@@ -297,6 +307,141 @@ mod single_victim_transaction_tests {
             .is_none()
         );
         assert!(routes.contains_key(&stale.key));
+    }
+
+    #[test]
+    fn exact_source_memory_removal_preserves_same_owner_ssd_backing() {
+        let owner: NodeID = "gpu0".to_string().into();
+        let member = source_victim("ssd-backed", (10, 5), 7, 7);
+        let route = source_route(&owner, &member, None, false);
+        route
+            .node_replicas
+            .write()
+            .get_mut(&owner)
+            .expect("owner route must exist")
+            .ssd = Some(KvSsdReplica { len: 4096 });
+        let routes = dashmap::DashMap::new();
+        routes.insert(member.key.clone(), route.clone());
+
+        let removed =
+            remove_exact_owner_source_route(&routes, &owner, &source_reclaim_item(&member))
+                .expect("exact memory backing must be removed");
+
+        assert!(!removed.removed_last_route);
+        assert!(removed.ssd_survived);
+        assert!(removed.ssd_became_only_backing);
+        let current = routes
+            .get(&member.key)
+            .expect("SSD backing must keep the key route alive");
+        let replicas = current.node_replicas.read();
+        let owner_backings = replicas.get(&owner).expect("owner route must remain");
+        assert!(owner_backings.memory.is_none());
+        assert_eq!(owner_backings.ssd.as_ref().map(|ssd| ssd.len), Some(4096));
+    }
+
+    #[test]
+    fn ssd_preservation_selects_only_an_exact_last_live_backing() {
+        let owner: NodeID = "gpu0".to_string().into();
+        let last = source_victim("last-for-ssd", (20, 1), 11, 1);
+        let last_route = source_route(&owner, &last, None, false);
+        let last_item = source_reclaim_item(&last);
+        assert!(exact_memory_reclaim_needs_ssd_with(
+            &owner,
+            &last_item,
+            &|key| (key == last.key).then(|| last_route.clone()),
+        ));
+
+        let with_other = source_victim("other-live", (20, 2), 12, 2);
+        let with_other_route = source_route(&owner, &with_other, None, true);
+        let with_other_item = source_reclaim_item(&with_other);
+        assert!(!exact_memory_reclaim_needs_ssd_with(
+            &owner,
+            &with_other_item,
+            &|key| (key == with_other.key).then(|| with_other_route.clone()),
+        ));
+
+        let already_on_ssd = source_victim("already-on-ssd", (20, 3), 13, 3);
+        let already_on_ssd_route = source_route(&owner, &already_on_ssd, None, false);
+        already_on_ssd_route
+            .node_replicas
+            .write()
+            .get_mut(&owner)
+            .expect("owner route must exist")
+            .ssd = Some(KvSsdReplica { len: 4096 });
+        let already_on_ssd_item = source_reclaim_item(&already_on_ssd);
+        assert!(!exact_memory_reclaim_needs_ssd_with(
+            &owner,
+            &already_on_ssd_item,
+            &|key| (key == already_on_ssd.key).then(|| already_on_ssd_route.clone()),
+        ));
+
+        let stale = source_victim("stale-for-ssd", (20, 4), 14, 4);
+        let stale_route = source_route(&owner, &stale, None, false);
+        let wrong_identity = source_victim("stale-for-ssd", stale.put_id, 999, 4);
+        assert!(!exact_memory_reclaim_needs_ssd_with(
+            &owner,
+            &source_reclaim_item(&wrong_identity),
+            &|key| (key == stale.key).then(|| stale_route.clone()),
+        ));
+    }
+
+    #[test]
+    fn direct_delete_filters_before_ssd_and_drop_finishes_without_waiting() {
+        let owner: NodeID = "gpu0".to_string().into();
+        let mut last = source_victim("last-candidate", (21, 1), 15, 1);
+        last.ssd_policy = OwnerSourceSsdPolicy::SelectLastLive;
+        let mut backed = source_victim("already-backed", (21, 2), 16, 2);
+        backed.ssd_policy = OwnerSourceSsdPolicy::SelectLastLive;
+        let routes = dashmap::DashMap::new();
+        routes.insert(last.key.clone(), source_route(&owner, &last, None, false));
+        routes.insert(
+            backed.key.clone(),
+            source_route(&owner, &backed, None, true),
+        );
+        let activity = MasterKeyActivityTable::default();
+        let (responses, busy) = direct_delete_exact_owner_source_batch_with(
+            &activity,
+            &owner,
+            81,
+            &[last.clone(), backed.clone()],
+            &|key| routes.get(key).map(|route| route.clone()),
+            |item| remove_exact_owner_source_route(&routes, &owner, item).is_some(),
+        );
+        assert_eq!(busy, DirectDeleteBatchBusySummary::default());
+        assert_eq!(
+            responses
+                .iter()
+                .map(|response| response.outcome)
+                .collect::<Vec<_>>(),
+            vec![
+                OwnerSourceEvictionOutcome::SsdCandidate,
+                OwnerSourceEvictionOutcome::Completed,
+            ]
+        );
+        assert!(routes.contains_key(&last.key));
+        assert!(
+            routes
+                .get(&backed.key)
+                .unwrap()
+                .node_replicas
+                .read()
+                .contains_key("cpu0")
+        );
+        assert!(!activity.has_reclaim(&last.key));
+
+        last.ssd_policy = OwnerSourceSsdPolicy::Drop;
+        let dropped = direct_delete_exact_owner_source_with(
+            &activity,
+            &owner,
+            &last,
+            owner_source_eviction_epoch(82, 0),
+            &|key| routes.get(key).map(|route| route.clone()),
+            |item| remove_exact_owner_source_route(&routes, &owner, item).is_some(),
+        );
+        assert_eq!(dropped.outcome, OwnerSourceEvictionOutcome::Completed);
+        assert!(!dropped.ssd_backing_committed);
+        assert!(!routes.contains_key(&last.key));
+        assert!(!activity.has_reclaim(&last.key));
     }
 
     #[test]
@@ -347,8 +492,12 @@ mod single_victim_transaction_tests {
     #[test]
     fn direct_delete_batch_keeps_results_independent_and_replay_idempotent() {
         let owner: NodeID = "gpu0".to_string().into();
-        let ready = source_victim("ready", (14, 0), 11, 0);
-        let busy = source_victim("busy", (14, 1), 11, 1);
+        let mut ready = source_victim("ready", (14, 0), 11, 0);
+        ready.ssd_backing_len = Some(4096);
+        ready.ssd_policy = OwnerSourceSsdPolicy::Persisted;
+        let mut busy = source_victim("busy", (14, 1), 11, 1);
+        busy.ssd_backing_len = Some(4096);
+        busy.ssd_policy = OwnerSourceSsdPolicy::Persisted;
         let stale = source_victim("stale", (14, 2), 11, 2);
         let routes = dashmap::DashMap::new();
         for victim in [&ready, &busy, &stale] {
@@ -361,7 +510,9 @@ mod single_victim_transaction_tests {
         let _busy_get = activity
             .reserve(&busy.key, MasterKeyActivityKind::Get, false)
             .expect("busy victim must hold a master Get lease");
-        let stale_request = source_victim("stale", stale.put_id, 999, 2);
+        let mut stale_request = source_victim("stale", stale.put_id, 999, 2);
+        stale_request.ssd_backing_len = Some(4096);
+        stale_request.ssd_policy = OwnerSourceSsdPolicy::Persisted;
         let victims = vec![ready.clone(), busy.clone(), stale_request];
         let (responses, busy_summary) = direct_delete_exact_owner_source_batch_with(
             activity.as_ref(),
@@ -392,6 +543,14 @@ mod single_victim_transaction_tests {
             "one batch response vector must stay aligned with every input victim"
         );
         assert_eq!(
+            responses
+                .iter()
+                .map(|response| response.ssd_backing_committed)
+                .collect::<Vec<_>>(),
+            vec![true, false, false],
+            "only the exact fenced write-back victim may publish SSD backing"
+        );
+        assert_eq!(
             busy_summary,
             DirectDeleteBatchBusySummary {
                 activity_busy_items: 1,
@@ -400,9 +559,43 @@ mod single_victim_transaction_tests {
                 ..Default::default()
             }
         );
-        assert!(!routes.contains_key(&ready.key));
+        let ready_route = routes
+            .get(&ready.key)
+            .expect("SSD write-back must keep the ready route alive");
+        let ready_replicas = ready_route.node_replicas.read();
+        let ready_backings = ready_replicas
+            .get(&owner)
+            .expect("same-owner SSD backing must remain");
+        assert!(ready_backings.memory.is_none());
+        assert_eq!(ready_backings.ssd.as_ref().map(|ssd| ssd.len), Some(4096));
+        drop(ready_replicas);
+        drop(ready_route);
         assert!(routes.contains_key(&busy.key));
         assert!(routes.contains_key(&stale.key));
+        assert!(
+            routes
+                .get(&busy.key)
+                .unwrap()
+                .node_replicas
+                .read()
+                .get(&owner)
+                .unwrap()
+                .ssd
+                .is_none(),
+            "a busy key must not publish SSD backing before its master fence"
+        );
+        assert!(
+            routes
+                .get(&stale.key)
+                .unwrap()
+                .node_replicas
+                .read()
+                .get(&owner)
+                .unwrap()
+                .ssd
+                .is_none(),
+            "a stale exact backing must not publish SSD backing"
+        );
         assert!(!activity.has_reclaim(&ready.key));
 
         let replay_delete_called = AtomicBool::new(false);
@@ -418,6 +611,10 @@ mod single_victim_transaction_tests {
             },
         );
         assert_eq!(replay.outcome, OwnerSourceEvictionOutcome::Completed);
+        assert!(
+            replay.ssd_backing_committed,
+            "a lost direct-delete response must replay the already-published SSD terminal"
+        );
         assert_eq!(replay.busy_cause, None);
         assert!(!replay_delete_called.load(Ordering::Relaxed));
     }
@@ -531,10 +728,14 @@ fn allocation_member_from_route(
     if route.lease_id.is_some() {
         return Err(MasterCapacityPlanError::RouteChanged);
     }
-    let replicas = route.nodes_replicas.read();
-    let replica = replicas
+    let replicas = route.node_replicas.read();
+    let node_replicas = replicas
         .get(owner)
-        .filter(|replica| !replica.tomb_tag.is_tomb())
+        .filter(|replicas| !replicas.tomb_tag.is_tomb())
+        .ok_or(MasterCapacityPlanError::RouteChanged)?;
+    let replica = node_replicas
+        .memory
+        .as_ref()
         .ok_or(MasterCapacityPlanError::RouteChanged)?;
     if replica.owner_local_indexed {
         return Err(MasterCapacityPlanError::WrongRole);
@@ -588,17 +789,23 @@ fn route_item(
     if expected_put_id.is_some_and(|put_id| put_id != route.put_id) || route.lease_id.is_some() {
         return None;
     }
-    let replicas = route.nodes_replicas.read();
-    let target = replicas.get(owner_node_id)?;
-    if target.tomb_tag.is_tomb() {
+    let replicas = route.node_replicas.read();
+    let node_replicas = replicas.get(owner_node_id)?;
+    if node_replicas.tomb_tag.is_tomb() {
         return None;
     }
+    let target = node_replicas.memory.as_ref()?;
     let backing = match &target.backing {
-        KvReplicaBacking::Allocation(_) if required_slot_size.is_none() => {
+        KvReplicaBacking::Allocation(allocation) if required_slot_size.is_none() => {
             if target.owner_local_indexed {
                 OwnerReclaimBacking::Allocation
             } else {
-                OwnerReclaimBacking::UnindexedAllocation
+                OwnerReclaimBacking::UnindexedAllocation {
+                    addr: allocation.base_addr().checked_add(allocation.addr())?,
+                    base_addr: allocation.base_addr(),
+                    len: allocation.size(),
+                    capacity_bytes: allocation.capcity(),
+                }
             }
         }
         KvReplicaBacking::Allocation(_) => return None,
@@ -639,13 +846,90 @@ fn item_still_valid(view: &MasterKvRouterView, owner: &NodeID, item: &OwnerRecla
         &item.key,
         Some(item.put_id),
         match &item.backing {
-            OwnerReclaimBacking::Allocation | OwnerReclaimBacking::UnindexedAllocation => None,
+            OwnerReclaimBacking::Allocation | OwnerReclaimBacking::UnindexedAllocation { .. } => {
+                None
+            }
             OwnerReclaimBacking::CommittedSlot { slot_size, .. } => Some(*slot_size),
         },
         item.reason,
         item.epoch,
     )
     .is_some_and(|current| current.backing == item.backing && current.reason == item.reason)
+}
+
+/// Publish bytes already persisted by the owner onto the existing route while
+/// both master and owner Prepare fences still protect the exact memory
+/// generation.  Memory remains present until the subsequent Commit succeeds,
+/// so Get never observes a route gap between DRAM and SSD.
+fn publish_prepared_ssd_backing(
+    view: &MasterKvRouterView,
+    owner: &NodeID,
+    item: &OwnerReclaimItem,
+    ssd_backing_len: Option<u64>,
+) -> Result<bool, String> {
+    let Some(len) = ssd_backing_len else {
+        return Ok(false);
+    };
+    if !item_still_valid(view, owner, item) {
+        return Err(format!(
+            "exact memory route changed before SSD publication: key={} epoch={}",
+            item.key, item.epoch
+        ));
+    }
+    let route = view
+        .master_kv_router()
+        .inner()
+        .kv_routes
+        .get(&item.key)
+        .map(|route| route.clone())
+        .ok_or_else(|| format!("route disappeared before SSD publication: key={}", item.key))?;
+    let existing_ssd_len = route
+        .node_replicas
+        .read()
+        .get(owner)
+        .and_then(|replicas| replicas.ssd.as_ref())
+        .map(|ssd| ssd.len);
+    if let Some(existing_len) = existing_ssd_len {
+        return if existing_len == len {
+            Ok(false)
+        } else {
+            Err(format!(
+                "existing SSD backing length mismatch: key={} existing={} prepared={}",
+                item.key, existing_len, len
+            ))
+        };
+    }
+    match route.commit_ssd_replica(owner, len) {
+        super::SsdReplicaCommitStatus::Committed => Ok(true),
+        super::SsdReplicaCommitStatus::MissingMemory => Err(format!(
+            "memory backing disappeared before SSD publication: key={}",
+            item.key
+        )),
+        super::SsdReplicaCommitStatus::TombedNode => Err(format!(
+            "owner generation was tombed before SSD publication: owner={} key={}",
+            owner, item.key
+        )),
+        super::SsdReplicaCommitStatus::LengthMismatch => Err(format!(
+            "persisted SSD length mismatches memory route: key={} len={}",
+            item.key, len
+        )),
+    }
+}
+
+fn rollback_new_ssd_backing(
+    view: &MasterKvRouterView,
+    owner: &NodeID,
+    item: &OwnerReclaimItem,
+) -> bool {
+    if !item_still_valid(view, owner, item) {
+        return false;
+    }
+    view.master_kv_router()
+        .inner()
+        .kv_routes
+        .get(&item.key)
+        .filter(|route| route.put_id == item.put_id)
+        .is_some_and(|route| route.remove_ssd_replica(owner))
 }
 
 async fn call_owner_phase(
@@ -657,11 +941,12 @@ async fn call_owner_phase(
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    debug_assert!(
-        items
-            .iter()
-            .all(|item| item.backing != OwnerReclaimBacking::UnindexedAllocation)
-    );
+    debug_assert!(items.iter().all(|item| {
+        !matches!(
+            &item.backing,
+            OwnerReclaimBacking::UnindexedAllocation { .. }
+        ) || item.reason == OwnerReclaimReason::MasterAllocationCapacity
+    }));
     let caller = RPCCaller::<BatchOwnerReclaimReq>::new();
     caller.regist(view.p2p_module());
     let resp = caller
@@ -719,11 +1004,11 @@ fn clear_master_fence(view: &MasterKvRouterView, item: &OwnerReclaimItem) {
     }
 }
 
-#[cfg(test)]
 async fn abort_prepared(
     view: &MasterKvRouterView,
     owner: &NodeID,
     items: Vec<OwnerReclaimItem>,
+    newly_published_ssd: HashSet<(String, u64)>,
 ) -> Vec<OwnerReclaimItem> {
     if items.is_empty() {
         return Vec::new();
@@ -734,9 +1019,22 @@ async fn abort_prepared(
             for (item, response) in items.into_iter().zip(responses.into_iter()) {
                 match response.state {
                     OwnerReclaimItemState::Committed => already_committed.push(item),
-                    OwnerReclaimItemState::Aborted
-                    | OwnerReclaimItemState::Stale
-                    | OwnerReclaimItemState::Finalized => clear_master_fence(view, &item),
+                    OwnerReclaimItemState::Aborted => {
+                        if newly_published_ssd.contains(&(item.key.clone(), item.epoch))
+                            && !rollback_new_ssd_backing(view, owner, &item)
+                        {
+                            tracing::warn!(
+                                owner = %owner,
+                                key = %item.key,
+                                epoch = item.epoch,
+                                "new SSD backing was not removable after owner reclaim abort"
+                            );
+                        }
+                        clear_master_fence(view, &item);
+                    }
+                    OwnerReclaimItemState::Stale | OwnerReclaimItemState::Finalized => {
+                        clear_master_fence(view, &item)
+                    }
                     state => tracing::warn!(
                         "owner reclaim abort returned unresolved state: key={} epoch={} state={:?} detail={}",
                         item.key,
@@ -755,14 +1053,18 @@ async fn abort_prepared(
                 items.len(),
                 err
             );
-            spawn_abort_retry(view.clone(), owner.clone(), items);
+            spawn_abort_retry(view.clone(), owner.clone(), items, newly_published_ssd);
             Vec::new()
         }
     }
 }
 
-#[cfg(test)]
-fn spawn_abort_retry(view: MasterKvRouterView, owner: NodeID, items: Vec<OwnerReclaimItem>) {
+fn spawn_abort_retry(
+    view: MasterKvRouterView,
+    owner: NodeID,
+    items: Vec<OwnerReclaimItem>,
+    newly_published_ssd: HashSet<(String, u64)>,
+) {
     if items.is_empty() {
         return;
     }
@@ -779,9 +1081,22 @@ fn spawn_abort_retry(view: MasterKvRouterView, owner: NodeID, items: Vec<OwnerRe
                     for (item, response) in pending.into_iter().zip(responses.into_iter()) {
                         match response.state {
                             OwnerReclaimItemState::Committed => committed.push(item),
-                            OwnerReclaimItemState::Aborted
-                            | OwnerReclaimItemState::Stale
-                            | OwnerReclaimItemState::Finalized => clear_master_fence(&view, &item),
+                            OwnerReclaimItemState::Aborted => {
+                                if newly_published_ssd.contains(&(item.key.clone(), item.epoch))
+                                    && !rollback_new_ssd_backing(&view, &owner, &item)
+                                {
+                                    tracing::warn!(
+                                        owner = %owner,
+                                        key = %item.key,
+                                        epoch = item.epoch,
+                                        "new SSD backing was not removable after retried owner reclaim abort"
+                                    );
+                                }
+                                clear_master_fence(&view, &item);
+                            }
+                            OwnerReclaimItemState::Stale | OwnerReclaimItemState::Finalized => {
+                                clear_master_fence(&view, &item)
+                            }
                             _ => next.push(item),
                         }
                     }
@@ -812,13 +1127,28 @@ fn spawn_abort_retry(view: MasterKvRouterView, owner: NodeID, items: Vec<OwnerRe
     });
 }
 
-fn reclaim_backing_matches(replica: &super::KvRouteInfo, expected: &OwnerReclaimBacking) -> bool {
+fn reclaim_backing_matches(
+    replica: &super::KvMemoryReplica,
+    expected: &OwnerReclaimBacking,
+) -> bool {
     match (&replica.backing, expected) {
         (KvReplicaBacking::Allocation(_), OwnerReclaimBacking::Allocation) => {
             replica.owner_local_indexed
         }
-        (KvReplicaBacking::Allocation(_), OwnerReclaimBacking::UnindexedAllocation) => {
+        (
+            KvReplicaBacking::Allocation(allocation),
+            OwnerReclaimBacking::UnindexedAllocation {
+                addr,
+                base_addr,
+                len,
+                capacity_bytes,
+            },
+        ) => {
             !replica.owner_local_indexed
+                && allocation.base_addr().checked_add(allocation.addr()) == Some(*addr)
+                && allocation.base_addr() == *base_addr
+                && allocation.size() == *len
+                && allocation.capcity() == *capacity_bytes
         }
         (
             KvReplicaBacking::CommittedSlot(slot),
@@ -841,7 +1171,7 @@ fn owner_source_member_weight(backing: &OwnerReclaimBacking) -> Option<u32> {
         OwnerReclaimBacking::CommittedSlot { slot_size, .. } => u32::try_from(*slot_size).ok(),
         // Allocation does not carry an address/generation identity in the
         // current wire contract, so accepting it would not be an exact delete.
-        OwnerReclaimBacking::Allocation | OwnerReclaimBacking::UnindexedAllocation => None,
+        OwnerReclaimBacking::Allocation | OwnerReclaimBacking::UnindexedAllocation { .. } => None,
     }
 }
 
@@ -889,9 +1219,14 @@ fn plan_exact_owner_source_victim_with(
         ));
     }
     let replica_matches = {
-        let replicas = route.nodes_replicas.read();
+        let replicas = route.node_replicas.read();
         match replicas.get(owner) {
-            Some(replica) if !replica.tomb_tag.is_tomb() => {
+            Some(node_replicas) if !node_replicas.tomb_tag.is_tomb() => {
+                let Some(replica) = node_replicas.memory.as_ref() else {
+                    return OwnerSourceVictimPlan::Completed(
+                        "exact source memory replica is already absent",
+                    );
+                };
                 if !replica.owner_local_indexed {
                     return OwnerSourceVictimPlan::Rejected(format!(
                         "source route is not owner-local indexed: key={}",
@@ -922,6 +1257,7 @@ enum DirectDeleteBusyCause {
 
 struct DirectDeleteResult {
     outcome: OwnerSourceEvictionOutcome,
+    ssd_backing_committed: bool,
     detail: String,
     busy_cause: Option<DirectDeleteBusyCause>,
 }
@@ -930,6 +1266,7 @@ impl DirectDeleteResult {
     fn terminal(outcome: OwnerSourceEvictionOutcome, detail: impl Into<String>) -> Self {
         Self {
             outcome,
+            ssd_backing_committed: false,
             detail: detail.into(),
             busy_cause: None,
         }
@@ -938,6 +1275,7 @@ impl DirectDeleteResult {
     fn activity_busy(snapshot: super::MasterKeyActivitySnapshot) -> Self {
         Self {
             outcome: OwnerSourceEvictionOutcome::RetryableBusy,
+            ssd_backing_committed: false,
             detail: format!(
                 "master key activity is busy: puts={} gets={} replicas={} reclaim_installed={}",
                 snapshot.puts, snapshot.gets, snapshot.replicas, snapshot.reclaim_installed
@@ -949,10 +1287,41 @@ impl DirectDeleteResult {
     fn delete_under_fence_busy() -> Self {
         Self {
             outcome: OwnerSourceEvictionOutcome::RetryableBusy,
+            ssd_backing_committed: false,
             detail: "exact source route could not be deleted under its master fence".to_string(),
             busy_cause: Some(DirectDeleteBusyCause::DeleteUnderFence),
         }
     }
+}
+
+fn exact_ssd_writeback_is_published(
+    owner: &NodeID,
+    victim: &OwnerSourceEvictionVictim,
+    route_lookup: &dyn Fn(&str) -> Option<Arc<super::OneKvNodesRoutes>>,
+) -> bool {
+    if victim.ssd_policy != OwnerSourceSsdPolicy::Persisted {
+        return false;
+    }
+    let Some(expected_len) = victim.ssd_backing_len else {
+        return false;
+    };
+    let Some(route) = route_lookup(&victim.key) else {
+        return false;
+    };
+    if route.put_id != victim.put_id {
+        return false;
+    }
+    route
+        .node_replicas
+        .read()
+        .get(owner)
+        .is_some_and(|replicas| {
+            !replicas.tomb_tag.is_tomb()
+                && replicas
+                    .ssd
+                    .as_ref()
+                    .is_some_and(|ssd| ssd.len == expected_len)
+        })
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1011,7 +1380,11 @@ fn direct_delete_exact_owner_source_with(
     let member = match plan_exact_owner_source_victim_with(owner, victim, route_lookup) {
         OwnerSourceVictimPlan::Ready(member) => member,
         OwnerSourceVictimPlan::Completed(detail) => {
-            return DirectDeleteResult::terminal(OwnerSourceEvictionOutcome::Completed, detail);
+            let mut result =
+                DirectDeleteResult::terminal(OwnerSourceEvictionOutcome::Completed, detail);
+            result.ssd_backing_committed =
+                exact_ssd_writeback_is_published(owner, victim, route_lookup);
+            return result;
         }
         OwnerSourceVictimPlan::Stale(detail) => {
             return DirectDeleteResult::terminal(OwnerSourceEvictionOutcome::Stale, detail);
@@ -1038,17 +1411,97 @@ fn direct_delete_exact_owner_source_with(
 
     let result = match plan_exact_owner_source_victim_with(owner, victim, route_lookup) {
         OwnerSourceVictimPlan::Ready(_) => {
-            if delete(&item) {
-                DirectDeleteResult::terminal(
-                    OwnerSourceEvictionOutcome::Completed,
-                    "exact source route deleted by batch handler",
-                )
-            } else {
-                DirectDeleteResult::delete_under_fence_busy()
+            let ssd_ready = match victim.ssd_policy {
+                OwnerSourceSsdPolicy::Drop => {
+                    if victim.ssd_backing_len.is_none() {
+                        Ok(())
+                    } else {
+                        Err(DirectDeleteResult::terminal(
+                            OwnerSourceEvictionOutcome::RejectedNotEvictable,
+                            format!("drop policy must not carry SSD bytes: key={}", victim.key),
+                        ))
+                    }
+                }
+                OwnerSourceSsdPolicy::SelectLastLive => {
+                    if victim.ssd_backing_len.is_some() {
+                        Err(DirectDeleteResult::terminal(
+                            OwnerSourceEvictionOutcome::RejectedNotEvictable,
+                            format!(
+                                "SSD selection policy must not carry prepared bytes: key={}",
+                                victim.key
+                            ),
+                        ))
+                    } else if exact_memory_reclaim_needs_ssd_with(owner, &item, route_lookup) {
+                        Err(DirectDeleteResult::terminal(
+                            OwnerSourceEvictionOutcome::SsdCandidate,
+                            "exact source is the last live backing; owner SSD admission required",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+                OwnerSourceSsdPolicy::Persisted => match victim.ssd_backing_len {
+                    None => Err(DirectDeleteResult::terminal(
+                        OwnerSourceEvictionOutcome::RejectedNotEvictable,
+                        format!(
+                            "persisted SSD policy requires exact bytes: key={}",
+                            victim.key
+                        ),
+                    )),
+                    Some(len) => match route_lookup(&victim.key)
+                        .map(|route| route.commit_ssd_replica(owner, len))
+                    {
+                        Some(super::SsdReplicaCommitStatus::Committed) => Ok(()),
+                        Some(super::SsdReplicaCommitStatus::LengthMismatch) => {
+                            Err(DirectDeleteResult::terminal(
+                                OwnerSourceEvictionOutcome::RejectedNotEvictable,
+                                format!(
+                                    "SSD write-back length does not match the exact source: key={} len={}",
+                                    victim.key, len
+                                ),
+                            ))
+                        }
+                        Some(
+                            super::SsdReplicaCommitStatus::MissingMemory
+                            | super::SsdReplicaCommitStatus::TombedNode,
+                        )
+                        | None => Err(DirectDeleteResult::terminal(
+                            OwnerSourceEvictionOutcome::Stale,
+                            format!(
+                                "exact source changed before SSD write-back publication: key={}",
+                                victim.key
+                            ),
+                        )),
+                    },
+                },
+            };
+            match ssd_ready {
+                Err(result) => result,
+                Ok(()) => {
+                    let mut result = if delete(&item) {
+                        DirectDeleteResult::terminal(
+                            OwnerSourceEvictionOutcome::Completed,
+                            if victim.ssd_policy == OwnerSourceSsdPolicy::Persisted {
+                                "SSD backing published and exact memory source deleted by batch handler"
+                            } else {
+                                "exact source route deleted by batch handler"
+                            },
+                        )
+                    } else {
+                        DirectDeleteResult::delete_under_fence_busy()
+                    };
+                    result.ssd_backing_committed =
+                        victim.ssd_policy == OwnerSourceSsdPolicy::Persisted;
+                    result
+                }
             }
         }
         OwnerSourceVictimPlan::Completed(detail) => {
-            DirectDeleteResult::terminal(OwnerSourceEvictionOutcome::Completed, detail)
+            let mut result =
+                DirectDeleteResult::terminal(OwnerSourceEvictionOutcome::Completed, detail);
+            result.ssd_backing_committed =
+                exact_ssd_writeback_is_published(owner, victim, route_lookup);
+            result
         }
         OwnerSourceVictimPlan::Stale(detail) => {
             DirectDeleteResult::terminal(OwnerSourceEvictionOutcome::Stale, detail)
@@ -1090,6 +1543,7 @@ fn direct_delete_exact_owner_source_batch_with(
         responses.push(OwnerSourceEvictionVictimResp {
             victim_index: u32::try_from(index).unwrap_or(u32::MAX),
             outcome: result.outcome,
+            ssd_backing_committed: result.ssd_backing_committed,
             detail: result.detail,
         });
     }
@@ -1167,6 +1621,7 @@ pub(crate) async fn handle_batch_evict_owner_source(
             OwnerSourceEvictionOutcome::Accepted => &counters.source_evict_accepted,
             OwnerSourceEvictionOutcome::AlreadyInProgress => &counters.source_evict_in_progress,
             OwnerSourceEvictionOutcome::Completed => &counters.source_evict_completed,
+            OwnerSourceEvictionOutcome::SsdCandidate => &counters.source_evict_accepted,
             OwnerSourceEvictionOutcome::RetryableBusy | OwnerSourceEvictionOutcome::Unspecified => {
                 &counters.source_evict_retryable_busy
             }
@@ -1184,11 +1639,16 @@ pub(crate) async fn handle_batch_evict_owner_source(
         .iter()
         .filter(|response| response.outcome == OwnerSourceEvictionOutcome::RetryableBusy)
         .count();
+    let ssd_candidates = responses
+        .iter()
+        .filter(|response| response.outcome == OwnerSourceEvictionOutcome::SsdCandidate)
+        .count();
     tracing::info!(
         owner = %owner,
         operation_id,
         victims = responses.len(),
         completed,
+        ssd_candidates,
         retryable,
         activity_busy_items = busy.activity_busy_items,
         put_busy_items = busy.put_busy_items,
@@ -1216,7 +1676,10 @@ pub(crate) async fn handle_batch_evict_owner_source(
 struct RemovedOwnerSource {
     desc: NodeValueReplicaDesc,
     capacity_bytes: u64,
+    logical_bytes: u64,
     removed_last_route: bool,
+    ssd_survived: bool,
+    ssd_became_only_backing: bool,
 }
 
 fn record_last_route_removal(
@@ -1244,28 +1707,56 @@ fn remove_exact_owner_source_route(
         return None;
     }
     let removed_desc = {
-        let mut replicas = route.nodes_replicas.write();
-        let Some(replica) = replicas.get(owner) else {
+        let mut replicas = route.node_replicas.write();
+        let Some(node_replicas) = replicas.get_mut(owner) else {
+            return None;
+        };
+        if node_replicas.tomb_tag.is_tomb() {
+            return None;
+        }
+        let Some(replica) = node_replicas.memory.as_ref() else {
             return None;
         };
         if !reclaim_backing_matches(replica, &item.backing) {
             return None;
         }
         let capacity_bytes = replica.backing.capacity_bytes();
+        let logical_bytes = replica.backing.len();
         let desc = NodeValueReplicaDesc {
             weight_bytes: u32::try_from(capacity_bytes).unwrap_or(u32::MAX),
             put_id: route.put_id,
         };
-        replicas.remove(owner).map(|_| (desc, capacity_bytes))
+        node_replicas.memory.take();
+        let ssd_survived = node_replicas.ssd.is_some();
+        let remove_node_entry = !ssd_survived;
+        if remove_node_entry {
+            replicas.remove(owner);
+        }
+        let live_backings = replicas
+            .values()
+            .filter(|replicas| !replicas.tomb_tag.is_tomb())
+            .map(|replicas| {
+                usize::from(replicas.memory.is_some()) + usize::from(replicas.ssd.is_some())
+            })
+            .sum::<usize>();
+        let ssd_became_only_backing = ssd_survived && live_backings == 1;
+        Some((
+            desc,
+            capacity_bytes,
+            logical_bytes,
+            ssd_survived,
+            ssd_became_only_backing,
+        ))
     };
-    let (removed_desc, capacity_bytes) = removed_desc?;
+    let (removed_desc, capacity_bytes, logical_bytes, ssd_survived, ssd_became_only_backing) =
+        removed_desc?;
 
-    let removed_last_route = if route.nodes_replicas.read().is_empty() {
+    let removed_last_route = if route.node_replicas.read().is_empty() {
         routes
             .remove_if(&item.key, |_, current| {
                 Arc::ptr_eq(current, &route)
                     && current.put_id == item.put_id
-                    && current.nodes_replicas.read().is_empty()
+                    && current.node_replicas.read().is_empty()
             })
             .is_some()
     } else {
@@ -1274,7 +1765,10 @@ fn remove_exact_owner_source_route(
     Some(RemovedOwnerSource {
         desc: removed_desc,
         capacity_bytes,
+        logical_bytes,
         removed_last_route,
+        ssd_survived,
+        ssd_became_only_backing,
     })
 }
 
@@ -1294,6 +1788,23 @@ fn remove_reclaimed_replica(
     let removed =
         remove_exact_owner_source_route(&view.master_kv_router().inner().kv_routes, owner, item);
     if let Some(removed) = removed {
+        let ssd_tier = &view.master_kv_router().inner().ssd_tier_counters;
+        if removed.ssd_survived {
+            ssd_tier
+                .memory_removed_ssd_survived_items
+                .fetch_add(1, Ordering::Relaxed);
+            ssd_tier
+                .memory_removed_ssd_survived_bytes
+                .fetch_add(removed.logical_bytes, Ordering::Relaxed);
+        }
+        if removed.ssd_became_only_backing {
+            ssd_tier
+                .memory_removed_ssd_became_only_items
+                .fetch_add(1, Ordering::Relaxed);
+            ssd_tier
+                .memory_removed_ssd_became_only_bytes
+                .fetch_add(removed.logical_bytes, Ordering::Relaxed);
+        }
         let counters = view
             .master_kv_router()
             .eviction_reclaim_counters(owner.as_ref());
@@ -1340,7 +1851,10 @@ fn finish_unindexed_allocations(
 ) -> u32 {
     let mut reclaimed = 0u32;
     for item in items {
-        debug_assert_eq!(item.backing, OwnerReclaimBacking::UnindexedAllocation);
+        debug_assert!(matches!(
+            &item.backing,
+            OwnerReclaimBacking::UnindexedAllocation { .. }
+        ));
         if remove_reclaimed_replica(view, owner, &item) {
             clear_master_fence(view, &item);
             reclaimed = reclaimed.saturating_add(1);
@@ -1356,12 +1870,86 @@ fn finish_unindexed_allocations(
     reclaimed
 }
 
-fn partition_reclaim_coordination(
+/// Return true only when removing this exact memory source would leave the key
+/// with no live backing. The caller holds the per-key master reclaim fence, so
+/// this route snapshot cannot race another Put/Get/replica/reclaim mutation.
+fn exact_memory_reclaim_needs_ssd_with(
+    owner: &NodeID,
+    item: &OwnerReclaimItem,
+    route_lookup: &dyn Fn(&str) -> Option<Arc<super::OneKvNodesRoutes>>,
+) -> bool {
+    let Some(route) = route_lookup(&item.key) else {
+        return false;
+    };
+    if route.put_id != item.put_id || route.lease_id.is_some() {
+        return false;
+    }
+    let replicas = route.node_replicas.read();
+    let Some(target) = replicas.get(owner) else {
+        return false;
+    };
+    if target.tomb_tag.is_tomb()
+        || !target
+            .memory
+            .as_ref()
+            .is_some_and(|memory| reclaim_backing_matches(memory, &item.backing))
+    {
+        return false;
+    }
+
+    replicas.iter().all(|(node_id, node_replicas)| {
+        if node_replicas.tomb_tag.is_tomb() {
+            return true;
+        }
+        if node_id == owner {
+            // The exact memory above is the source being removed. An existing
+            // same-owner SSD backing already preserves this route.
+            node_replicas.ssd.is_none()
+        } else {
+            !node_replicas.has_live_backing()
+        }
+    })
+}
+
+fn exact_memory_reclaim_needs_ssd(
+    view: &MasterKvRouterView,
+    owner: &NodeID,
+    item: &OwnerReclaimItem,
+) -> bool {
+    exact_memory_reclaim_needs_ssd_with(owner, item, &|key| {
+        view.master_kv_router()
+            .inner()
+            .kv_routes
+            .get(key)
+            .map(|route| route.clone())
+    })
+}
+
+fn partition_reclaim_coordination<F>(
     items: Vec<OwnerReclaimItem>,
-) -> (Vec<OwnerReclaimItem>, Vec<OwnerReclaimItem>) {
-    items
-        .into_iter()
-        .partition(|item| item.backing == OwnerReclaimBacking::UnindexedAllocation)
+    should_coordinate_unindexed: F,
+) -> (Vec<OwnerReclaimItem>, Vec<OwnerReclaimItem>)
+where
+    F: Fn(&OwnerReclaimItem) -> bool,
+{
+    items.into_iter().partition(|item| {
+        matches!(
+            &item.backing,
+            OwnerReclaimBacking::UnindexedAllocation { .. }
+        ) && !should_coordinate_unindexed(item)
+    })
+}
+
+fn owner_has_ssd_storage(view: &MasterKvRouterView, owner: &NodeID) -> bool {
+    view.cluster_manager()
+        .get_member_info_cached(owner.as_ref())
+        .and_then(|member| {
+            member
+                .metadata
+                .get(crate::cluster_manager::META_KEY_KV_SSD_STORAGE)
+                .cloned()
+        })
+        .is_some_and(|value| value == "true")
 }
 
 async fn finish_committed(
@@ -1465,7 +2053,6 @@ fn spawn_finalize_retry(view: MasterKvRouterView, owner: NodeID, items: Vec<Owne
     });
 }
 
-#[cfg(test)]
 async fn reclaim_items(
     view: &MasterKvRouterView,
     owner: &NodeID,
@@ -1510,7 +2097,10 @@ async fn reclaim_items(
         return 0;
     }
 
-    let (master_only, owner_coordinated) = partition_reclaim_coordination(fenced);
+    let owner_has_ssd = owner_has_ssd_storage(view, owner);
+    let (master_only, owner_coordinated) = partition_reclaim_coordination(fenced, |item| {
+        owner_has_ssd && exact_memory_reclaim_needs_ssd(view, owner, item)
+    });
     let master_reclaimed = finish_unindexed_allocations(view, owner, master_only);
     if owner_coordinated.is_empty() {
         counters
@@ -1535,7 +2125,7 @@ async fn reclaim_items(
                 owner_coordinated.len(),
                 err
             );
-            let _ = abort_prepared(view, owner, owner_coordinated).await;
+            let _ = abort_prepared(view, owner, owner_coordinated, HashSet::new()).await;
             counters
                 .completed
                 .fetch_add(u64::from(master_reclaimed), Ordering::Relaxed);
@@ -1544,12 +2134,34 @@ async fn reclaim_items(
     };
     let mut prepared = Vec::new();
     let mut committed = Vec::new();
+    let mut ssd_publish_failed = Vec::new();
+    let mut newly_published_ssd = HashSet::new();
     for (item, response) in owner_coordinated
         .into_iter()
         .zip(prepare_responses.into_iter())
     {
         match response.state {
-            OwnerReclaimItemState::Prepared => prepared.push(item),
+            OwnerReclaimItemState::Prepared => {
+                match publish_prepared_ssd_backing(view, owner, &item, response.ssd_backing_len) {
+                    Ok(newly_published) => {
+                        if newly_published {
+                            newly_published_ssd.insert((item.key.clone(), item.epoch));
+                        }
+                        prepared.push(item);
+                    }
+                    Err(detail) => {
+                        counters.route_changed.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            owner = %owner,
+                            key = %item.key,
+                            epoch = item.epoch,
+                            detail = %detail,
+                            "aborting owner reclaim after SSD backing publication validation failed"
+                        );
+                        ssd_publish_failed.push(item);
+                    }
+                }
+            }
             OwnerReclaimItemState::Committed => committed.push(item),
             OwnerReclaimItemState::Busy => {
                 if response.detail == "owner local memory still has active holders" {
@@ -1571,6 +2183,7 @@ async fn reclaim_items(
             }
         }
     }
+    committed.extend(abort_prepared(view, owner, ssd_publish_failed, HashSet::new()).await);
 
     let mut invalid_prepared = Vec::new();
     prepared.retain(|item| {
@@ -1581,7 +2194,14 @@ async fn reclaim_items(
         }
         valid
     });
-    committed.extend(abort_prepared(view, owner, invalid_prepared).await);
+    let invalid_published = invalid_prepared
+        .iter()
+        .filter_map(|item| {
+            let identity = (item.key.clone(), item.epoch);
+            newly_published_ssd.contains(&identity).then_some(identity)
+        })
+        .collect();
+    committed.extend(abort_prepared(view, owner, invalid_prepared, invalid_published).await);
 
     if !prepared.is_empty() {
         match call_owner_phase(view, owner, OwnerReclaimPhase::Commit, prepared.clone()).await {
@@ -1594,7 +2214,15 @@ async fn reclaim_items(
                         unresolved.push(item);
                     }
                 }
-                committed.extend(abort_prepared(view, owner, unresolved).await);
+                let unresolved_published = unresolved
+                    .iter()
+                    .filter_map(|item| {
+                        let identity = (item.key.clone(), item.epoch);
+                        newly_published_ssd.contains(&identity).then_some(identity)
+                    })
+                    .collect();
+                committed
+                    .extend(abort_prepared(view, owner, unresolved, unresolved_published).await);
             }
             Err(err) => {
                 tracing::warn!(
@@ -1603,7 +2231,14 @@ async fn reclaim_items(
                     prepared.len(),
                     err
                 );
-                committed.extend(abort_prepared(view, owner, prepared).await);
+                let prepared_published = prepared
+                    .iter()
+                    .filter_map(|item| {
+                        let identity = (item.key.clone(), item.epoch);
+                        newly_published_ssd.contains(&identity).then_some(identity)
+                    })
+                    .collect();
+                committed.extend(abort_prepared(view, owner, prepared, prepared_published).await);
             }
         }
     }
@@ -1682,7 +2317,10 @@ async fn reclaim_single_victim(
         return 0;
     }
 
-    let (master_only, owner_coordinated) = partition_reclaim_coordination(fenced.clone());
+    let owner_has_ssd = owner_has_ssd_storage(view, owner);
+    let (master_only, owner_coordinated) = partition_reclaim_coordination(fenced.clone(), |item| {
+        owner_has_ssd && exact_memory_reclaim_needs_ssd(view, owner, item)
+    });
     if owner_coordinated.is_empty() {
         // All master-owned allocations are fenced and revalidated before the
         // first route mutation, so no member can be admitted independently.
@@ -1765,7 +2403,23 @@ async fn reclaim_single_victim(
         let mut blocked = false;
         for (item, response) in pending.iter().cloned().zip(prepare_responses) {
             match response.state {
-                OwnerReclaimItemState::Prepared => prepared.push(item),
+                OwnerReclaimItemState::Prepared => {
+                    match publish_prepared_ssd_backing(view, owner, &item, response.ssd_backing_len)
+                    {
+                        Ok(_) => prepared.push(item),
+                        Err(detail) => {
+                            counters.route_changed.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                owner = %owner,
+                                key = %item.key,
+                                epoch = item.epoch,
+                                detail = %detail,
+                                "single-key reclaim SSD publication validation failed"
+                            );
+                            blocked = true;
+                        }
+                    }
+                }
                 OwnerReclaimItemState::Committed => {
                     committed_keys.insert(item.key);
                 }
@@ -1851,22 +2505,35 @@ mod reclaim_partition_tests {
         indexed_allocation.backing = OwnerReclaimBacking::Allocation;
         indexed_allocation.reason = OwnerReclaimReason::OwnerCapacityEviction;
         let mut unindexed_allocation = candidate(2);
-        unindexed_allocation.backing = OwnerReclaimBacking::UnindexedAllocation;
+        unindexed_allocation.backing = OwnerReclaimBacking::UnindexedAllocation {
+            addr: 0x2000,
+            base_addr: 0x1000,
+            len: 4096,
+            capacity_bytes: 4096,
+        };
         unindexed_allocation.reason = OwnerReclaimReason::MasterAllocationCapacity;
         let committed_slot = candidate(3);
 
-        let (master_only, owner_coordinated) = partition_reclaim_coordination(vec![
-            indexed_allocation,
+        let candidates = vec![
+            indexed_allocation.clone(),
             unindexed_allocation.clone(),
-            committed_slot,
-        ]);
+            committed_slot.clone(),
+        ];
+        let (master_only, owner_coordinated) =
+            partition_reclaim_coordination(candidates.clone(), |_| false);
 
-        assert_eq!(master_only, vec![unindexed_allocation]);
+        assert_eq!(master_only, vec![unindexed_allocation.clone()]);
         assert_eq!(owner_coordinated.len(), 2);
-        assert!(
-            owner_coordinated
-                .iter()
-                .all(|item| item.backing != OwnerReclaimBacking::UnindexedAllocation)
+        assert!(owner_coordinated.iter().all(|item| !matches!(
+            &item.backing,
+            OwnerReclaimBacking::UnindexedAllocation { .. }
+        )));
+
+        let (master_only, owner_coordinated) = partition_reclaim_coordination(candidates, |_| true);
+        assert!(master_only.is_empty());
+        assert_eq!(
+            owner_coordinated,
+            vec![indexed_allocation, unindexed_allocation, committed_slot]
         );
     }
 }
@@ -1875,10 +2542,17 @@ mod reclaim_partition_tests {
 mod owner_get_holding_reclaim_tests {
     use super::{OwnerReclaimBacking, OwnerReclaimReason, reclaim_items, route_item};
     use crate::client_kv_api::PutOptionalArgs;
+    use crate::config::KvSsdStorageConfig;
+    use crate::kv_ssd_storage::MIN_CAPACITY_BYTES;
     use crate::kvcore_test_lib::{
-        integration_test_lock, start_master_and_client, stop_master_and_client,
+        integration_test_lock, start_master_and_client, start_master_and_client_with_client_config,
+        stop_master_and_client,
     };
+    use crate::master_kv_router::msg_pack::{PutDoneReq, PutStartReq};
+    use crate::master_kv_router::put::{handle_put_done, handle_put_start};
     use crate::memholder::{MemholderManagerTrait, NodeHolderKey};
+    use crate::p2p::msg_pack::MsgPack;
+    use crate::rpcresp_kvresult_convert::msg_and_error::OK;
     use std::time::{Duration, Instant};
 
     #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1927,7 +2601,7 @@ mod owner_get_holding_reclaim_tests {
                 .is_quiescent(key),
             "completed get must release its master key-activity lease"
         );
-        let owner_node = owner_id.clone().into();
+        let owner_node: crate::cluster_manager::NodeID = owner_id.clone().into();
         let busy_item = route_item(
             &master_view,
             &owner_node,
@@ -2001,6 +2675,183 @@ mod owner_get_holding_reclaim_tests {
 
         stop_master_and_client(master, client).await;
     }
+
+    #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn master_unindexed_allocation_reclaim_publishes_ssd_and_reloads_exact_bytes() {
+        let _test_guard = integration_test_lock().await;
+        let (master, client) = start_master_and_client_with_client_config(
+            "master_capacity_ssd_reclaim_master",
+            "master_capacity_ssd_reclaim_owner",
+            |config| {
+                config.ssd_storage = Some(KvSsdStorageConfig {
+                    limit_bytes: MIN_CAPACITY_BYTES,
+                    write_rate_limit_bytes_per_sec: None,
+                    write_burst_bytes: None,
+                });
+                let target = std::env::var("CARGO_TARGET_DIR")
+                    .expect("SSD integration test requires the NVMe Cargo target");
+                let root = format!(
+                    "{target}/kv_ssd_integration/master_capacity_reclaim-{}",
+                    std::process::id()
+                );
+                config.share_mem_path = format!("{root}/sharemem");
+                config.large_file_paths.paths = vec![format!("{root}/large")];
+            },
+        )
+        .await;
+        let key = "master_capacity_ssd_reclaim_key";
+        let payload = vec![0x5au8; 4096];
+        let owner_view = client.client_kv_api_view();
+        let owner_api = owner_view.client_kv_api();
+        let owner_info = client
+            .cluster_manager_view()
+            .cluster_manager()
+            .get_self_info();
+        let owner_id = owner_info.id;
+        let owner_node: crate::cluster_manager::NodeID = owner_id.clone().into();
+        let master_view = master.master_kv_router_view().clone();
+        assert!(
+            master_view
+                .cluster_manager()
+                .get_member_info_cached(&owner_id)
+                .and_then(|member| {
+                    member
+                        .metadata
+                        .get(crate::cluster_manager::META_KEY_KV_SSD_STORAGE)
+                        .cloned()
+                })
+                .is_some_and(|value| value == "true"),
+            "master must observe the owner's SSD capability before selecting coordination"
+        );
+
+        let (_put_id, start) = handle_put_start(
+            master_view.clone(),
+            MsgPack {
+                serialize_part: PutStartReq {
+                    key: key.to_string(),
+                    len: payload.len() as u64,
+                    reject_if_inflight_same_key: false,
+                    reject_if_exist_same_key: false,
+                    make_replica_task: true,
+                    preferred_sub_cluster: None,
+                    source_node_id: None,
+                },
+                raw_bytes: Vec::new(),
+            },
+            owner_node.clone(),
+        )
+        .await;
+        assert_eq!(
+            start.serialize_part.error_code, OK,
+            "PutStart failed: {}",
+            start.serialize_part.error_json
+        );
+        assert_eq!(start.serialize_part.node_id, owner_id);
+        owner_view
+            .client_seg_pool()
+            .copy_into_segment(start.serialize_part.target_addr, &payload)
+            .await
+            .expect("copy payload into the master-owned owner segment Allocation");
+        let done = handle_put_done(
+            master_view.clone(),
+            MsgPack {
+                serialize_part: PutDoneReq {
+                    key: key.to_string(),
+                    put_id: start.serialize_part.put_id,
+                    lease_id: None,
+                    committed_slot: None,
+                    publish_local_cache: false,
+                    atomic_group: None,
+                },
+                raw_bytes: Vec::new(),
+            },
+            owner_node.clone(),
+        )
+        .await;
+        assert_eq!(done.serialize_part.error_code, OK);
+        assert_eq!(done.serialize_part.local_cache_holder_id, None);
+        let route = master_view
+            .master_kv_router()
+            .inner()
+            .kv_routes
+            .get(key)
+            .map(|route| route.clone())
+            .expect("PutDone must publish the production unindexed Allocation route");
+        assert!(
+            route
+                .node_replicas
+                .read()
+                .get(&owner_node)
+                .and_then(|replicas| replicas.memory.as_ref())
+                .is_some_and(|memory| !memory.owner_local_indexed),
+            "production remote backing must have no owner-local key index"
+        );
+        drop(route);
+
+        let item = route_item(
+            &master_view,
+            &owner_node,
+            key,
+            None,
+            None,
+            OwnerReclaimReason::MasterAllocationCapacity,
+            master_view.master_kv_router().next_owner_reclaim_epoch(),
+        )
+        .expect("master-capacity victim must resolve to the current owner Allocation");
+        assert!(matches!(
+            item.backing,
+            OwnerReclaimBacking::UnindexedAllocation { .. }
+        ));
+        assert_eq!(
+            reclaim_items(&master_view, &owner_node, vec![item]).await,
+            1
+        );
+
+        let route = master_view
+            .master_kv_router()
+            .inner()
+            .kv_routes
+            .get(key)
+            .map(|route| route.clone())
+            .expect("SSD backing must keep the route alive after DRAM reclaim");
+        {
+            let replicas = route.node_replicas.read();
+            let owner_backings = replicas
+                .get(&owner_node)
+                .expect("the SSD-only owner route must remain");
+            assert!(owner_backings.memory.is_none());
+            assert_eq!(
+                owner_backings.ssd.as_ref().map(|ssd| ssd.len),
+                Some(payload.len() as u64)
+            );
+        }
+        let persisted = owner_api
+            .inner()
+            .kv_ssd_storage_usage_snapshot()
+            .expect("test owner SSD must be configured");
+        assert_eq!(persisted.persist_successes, 1);
+        assert_eq!(persisted.persist_failures, 0);
+        assert_eq!(persisted.used_bytes, payload.len() as u64);
+
+        let (holder, _get_info) = owner_api
+            .inner()
+            .get(key)
+            .await
+            .expect("SSD-backed get")
+            .expect("SSD-only route must be readable");
+        assert_eq!(holder.bytes(), payload);
+        drop(holder);
+        let loaded = owner_api
+            .inner()
+            .kv_ssd_storage_usage_snapshot()
+            .expect("test owner SSD must remain configured");
+        assert_eq!(loaded.load_successes, 1);
+        assert_eq!(loaded.load_failures, 0);
+        assert_eq!(loaded.load_bytes, payload.len() as u64);
+        assert_eq!(loaded.memory_hits + loaded.disk_hits + loaded.outer_hits, 1);
+
+        stop_master_and_client(master, client).await;
+    }
 }
 
 fn request_is_current(view: &MasterKvRouterView, request: &EvictionReclaimRequest) -> bool {
@@ -2040,13 +2891,15 @@ fn request_is_current(view: &MasterKvRouterView, request: &EvictionReclaimReques
                     return false;
                 }
                 route
-                    .nodes_replicas
+                    .node_replicas
                     .read()
                     .get(&owner)
-                    .is_some_and(|replica| {
-                        !replica.tomb_tag.is_tomb()
-                            && replica.owner_local_indexed
-                            && reclaim_backing_matches(replica, expected_backing)
+                    .is_some_and(|node_replicas| {
+                        !node_replicas.tomb_tag.is_tomb()
+                            && node_replicas.memory.as_ref().is_some_and(|replica| {
+                                replica.owner_local_indexed
+                                    && reclaim_backing_matches(replica, expected_backing)
+                            })
                     })
             })
         }
@@ -2196,96 +3049,105 @@ pub(crate) fn spawn_eviction_reclaim_actor(
                     .eviction_reclaim_counters(&owner_node_id);
                 let mut pending = std::collections::VecDeque::from(requests);
                 let mut retry_requests = Vec::new();
-                while let Some(request) = pending.pop_front() {
-                    let (members, mut accounting_requests, reason) = match request.origin {
-                        EvictionReclaimOrigin::OwnerCapacityEviction => (
-                            request.members.clone(),
-                            vec![request],
-                            OwnerReclaimReason::OwnerCapacityEviction,
-                        ),
-                        EvictionReclaimOrigin::MasterAllocationCapacity => {
-                            let member = match plan_master_allocation_capacity_victim(
-                                &view_task,
-                                &request,
-                            ) {
-                                Ok(member) => member,
-                                Err(MasterCapacityPlanError::CommittedSlot) => {
-                                    counters
-                                        .capacity_eviction_non_ring_b_entry_total
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    counters
-                                        .capacity_eviction_hit_committed_slot
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    view_task
-                                        .master_kv_router()
-                                        .complete_eviction_reclaim(&request);
-                                    let restored = restore_request_entries(&view_task, &request);
-                                    tracing::error!(
-                                        "BUG: master Allocation capacity event resolved to CommittedSlot; restored metadata: owner={} members={} restored={}",
-                                        owner_node_id,
-                                        request.members.len(),
-                                        restored,
-                                    );
-                                    continue;
-                                }
-                                Err(MasterCapacityPlanError::RouteChanged) => {
-                                    view_task
-                                        .master_kv_router()
-                                        .complete_eviction_reclaim(&request);
-                                    counters.route_changed.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-                                Err(MasterCapacityPlanError::WrongRole) => {
-                                    counters
-                                        .capacity_eviction_non_ring_b_entry_total
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    view_task
-                                        .master_kv_router()
-                                        .complete_eviction_reclaim(&request);
-                                    let restored = restore_request_entries(&view_task, &request);
-                                    tracing::error!(
-                                        "BUG: master Allocation Size event resolved to a non-ring-B route; restored metadata: owner={} members={} restored={}",
-                                        owner_node_id,
-                                        request.members.len(),
-                                        restored,
-                                    );
-                                    continue;
-                                }
-                            };
-                            (
-                                vec![member],
-                                vec![request],
-                                OwnerReclaimReason::MasterAllocationCapacity,
-                            )
-                        }
-                    };
-
-                    let items = members
-                        .iter()
-                        .map(|member| {
-                            let item = route_item(
-                                &view_task,
-                                &owner,
-                                &member.key,
-                                Some(member.desc.put_id),
-                                None,
-                                reason,
-                                view_task.master_kv_router().next_owner_reclaim_epoch(),
-                            )?;
-                            if member
-                                .expected_backing
-                                .as_ref()
-                                .is_some_and(|expected| expected != &item.backing)
-                            {
-                                return None;
+                while !pending.is_empty() {
+                    let mut accounting_requests = Vec::with_capacity(OWNER_RECLAIM_RPC_BATCH);
+                    let mut items = Vec::with_capacity(OWNER_RECLAIM_RPC_BATCH);
+                    for _ in 0..OWNER_RECLAIM_RPC_BATCH {
+                        let Some(request) = pending.pop_front() else {
+                            break;
+                        };
+                        let (members, reason) = match request.origin {
+                            EvictionReclaimOrigin::OwnerCapacityEviction => (
+                                request.members.clone(),
+                                OwnerReclaimReason::OwnerCapacityEviction,
+                            ),
+                            EvictionReclaimOrigin::MasterAllocationCapacity => {
+                                let member = match plan_master_allocation_capacity_victim(
+                                    &view_task,
+                                    &request,
+                                ) {
+                                    Ok(member) => member,
+                                    Err(MasterCapacityPlanError::CommittedSlot) => {
+                                        counters
+                                            .capacity_eviction_non_ring_b_entry_total
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        counters
+                                            .capacity_eviction_hit_committed_slot
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        view_task
+                                            .master_kv_router()
+                                            .complete_eviction_reclaim(&request);
+                                        let restored =
+                                            restore_request_entries(&view_task, &request);
+                                        tracing::error!(
+                                            "BUG: master Allocation capacity event resolved to CommittedSlot; restored metadata: owner={} members={} restored={}",
+                                            owner_node_id,
+                                            request.members.len(),
+                                            restored,
+                                        );
+                                        continue;
+                                    }
+                                    Err(MasterCapacityPlanError::RouteChanged) => {
+                                        view_task
+                                            .master_kv_router()
+                                            .complete_eviction_reclaim(&request);
+                                        counters.route_changed.fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    }
+                                    Err(MasterCapacityPlanError::WrongRole) => {
+                                        counters
+                                            .capacity_eviction_non_ring_b_entry_total
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        view_task
+                                            .master_kv_router()
+                                            .complete_eviction_reclaim(&request);
+                                        let restored =
+                                            restore_request_entries(&view_task, &request);
+                                        tracing::error!(
+                                            "BUG: master Allocation Size event resolved to a non-ring-B route; restored metadata: owner={} members={} restored={}",
+                                            owner_node_id,
+                                            request.members.len(),
+                                            restored,
+                                        );
+                                        continue;
+                                    }
+                                };
+                                (vec![member], OwnerReclaimReason::MasterAllocationCapacity)
                             }
-                            Some(item)
-                        })
-                        .collect::<Option<Vec<_>>>();
-                    if let Some(items) = items {
-                        let _ = reclaim_single_victim(&view_task, &owner, items).await;
+                        };
+
+                        let planned = members
+                            .iter()
+                            .map(|member| {
+                                let item = route_item(
+                                    &view_task,
+                                    &owner,
+                                    &member.key,
+                                    Some(member.desc.put_id),
+                                    None,
+                                    reason,
+                                    view_task.master_kv_router().next_owner_reclaim_epoch(),
+                                )?;
+                                if member
+                                    .expected_backing
+                                    .as_ref()
+                                    .is_some_and(|expected| expected != &item.backing)
+                                {
+                                    return None;
+                                }
+                                Some(item)
+                            })
+                            .collect::<Option<Vec<_>>>();
+                        if let Some(mut planned) = planned {
+                            items.append(&mut planned);
+                        }
+                        accounting_requests.push(request);
                     }
-                    for accounting_request in accounting_requests.drain(..) {
+
+                    if !items.is_empty() {
+                        let _ = reclaim_items(&view_task, &owner, items).await;
+                    }
+                    for accounting_request in accounting_requests {
                         if request_is_current(&view_task, &accounting_request) {
                             retry_requests.push(accounting_request);
                         } else {
@@ -2302,7 +3164,7 @@ pub(crate) fn spawn_eviction_reclaim_actor(
                 let retry_count = retry_requests.len();
                 spawn_eviction_reclaim_retry(view_task.clone(), retry_requests);
                 tracing::trace!(
-                    "single-key eviction reclaim batch completed: owner={} retry_deferred={}",
+                    "batched single-key eviction reclaim completed: owner={} retry_deferred={}",
                     owner_node_id,
                     retry_count,
                 );

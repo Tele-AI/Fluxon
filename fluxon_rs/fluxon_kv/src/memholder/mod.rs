@@ -305,30 +305,39 @@ impl Drop for MemoryInfo {
                 grant_id,
                 slot_index,
             } => {
-                let spawn_view = self.view.clone();
-                let release_view = self.view.clone();
-                let key = self.key.clone();
-                let slot_size = *slot_size;
-                let grant_id = *grant_id;
-                let slot_index = *slot_index;
-                let _ = spawn_view.spawn("resident_local_reserve_slot_release", async move {
-                    if let Err(err) = release_view
-                        .client_kv_api()
-                        .inner()
-                        .owner_release_local_reserve_resident_slot_holder(
-                            slot_size, grant_id, slot_index,
-                        )
-                    {
-                        tracing::warn!(
-                            "failed to release resident local reserve slot holder on MemoryInfo drop: key={} slot_size={} grant_id={} slot_index={} err={}",
-                            key,
-                            slot_size,
-                            grant_id,
-                            slot_index,
-                            err
-                        );
-                    }
-                });
+                let Some(_view_guard) = self.view.try_upgrade() else {
+                    tracing::debug!(
+                        key = self.key,
+                        "skipping resident local reserve slot release after view drop"
+                    );
+                    return;
+                };
+                if !self.view.register_shutdown_poller().is_running() {
+                    tracing::debug!(
+                        key = self.key,
+                        "skipping resident local reserve slot release during shutdown"
+                    );
+                    return;
+                }
+                if let Err(err) = self
+                    .view
+                    .client_kv_api()
+                    .inner()
+                    .owner_release_local_reserve_resident_slot_holder(
+                        *slot_size,
+                        *grant_id,
+                        *slot_index,
+                    )
+                {
+                    tracing::warn!(
+                        "failed to release resident local reserve slot holder on MemoryInfo drop: key={} slot_size={} grant_id={} slot_index={} err={}",
+                        self.key,
+                        slot_size,
+                        grant_id,
+                        slot_index,
+                        err
+                    );
+                }
             }
         }
     }

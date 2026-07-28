@@ -59,6 +59,38 @@ impl TestPutPhaseTrace {
         merge_i64_field!(owner_master_put_end_server_us);
     }
 }
+
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct SsdStageReadReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub get_id: u64,
+    pub stage_addr: u64,
+    pub stage_capacity: u64,
+    pub len: u64,
+}
+
+impl MsgPackSerializePart for SsdStageReadReq {
+    fn msg_id(&self) -> u32 {
+        4044
+    }
+}
+
+impl RPCReq for SsdStageReadReq {
+    type Resp = SsdStageReadResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdStageReadResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for SsdStageReadResp {
+    fn msg_id(&self) -> u32 {
+        4045
+    }
+}
 // --- RPC for Physical Node Shared Memory ---
 
 #[derive(Default, Debug, Clone, Encode, Decode)]

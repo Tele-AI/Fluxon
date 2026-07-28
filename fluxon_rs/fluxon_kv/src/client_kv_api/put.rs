@@ -2,6 +2,7 @@ use super::{
     ClientKvApiInner, OwnerHotEvictionEvent, OwnerHotEvictionPreparation,
     OwnerHotSelectionFenceOutcome, OwnerLocalReserveClassState, OwnerLocalReserveGrantState,
     OwnerLocalReservePoolState, OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef,
+    OwnerLocalSsdPutOutcome, OwnerLocalSsdPutReservation, OwnerLocalSsdPutSharedOp,
     OwnerRemotePutOutcome, OwnerRemotePutReservation, OwnerRemotePutSharedOp,
     local_reserve_rebalance::{owner_local_reserve_timeout_config, wait_owner_local_reserve_ready},
 };
@@ -19,19 +20,20 @@ use crate::{
     master_kv_router::msg_pack::{
         BatchEnqueueReplicaTaskReq, BatchEnqueueReplicaTaskResp, BatchEvictOwnerSourceReq,
         BatchEvictOwnerSourceResp, BatchPreparePutKeyItemReq, BatchPreparePutKeysReq,
-        BatchPreparePutKeysResp, BatchPutAppendDoneItemReq, BatchPutAppendDoneReq,
-        BatchPutAppendDoneResp, BatchPutAppendStartItemReq, BatchPutAppendStartReq,
-        BatchPutAppendStartResp, BatchPutDoneItemReq, BatchPutDoneItemResp, BatchPutDoneReq,
-        BatchPutDoneResp, BatchPutRevokeItemReq, BatchPutRevokeReq, BatchPutRevokeResp,
-        BatchPutStartItemReq, BatchPutStartReq, BatchPutStartResp,
-        BatchReleasePutKeyReservationsReq, BatchReleasePutKeyReservationsResp,
-        EnqueueReplicaTaskItemResp, GroupedBatchPutDoneItemReq, GroupedBatchPutDoneReq,
-        GroupedBatchPutDoneResp, OwnerReclaimBacking, OwnerSourceEvictionOutcome,
-        OwnerSourceEvictionVictim, PutAppendDoneReq, PutAppendDoneResp, PutAppendRevokeReq,
-        PutAppendStartOutcome, PutAppendStartReq, PutAppendStartResp, PutAtomicGroup,
-        PutDoneCommittedSlot, PutDoneReq, PutRevokeReq, PutStartReq, PutStartResp,
-        ReleaseLocalGrantReq, ReserveLocalGrantOutcome, ReserveLocalGrantReq,
-        owner_source_eviction_epoch,
+        BatchPreparePutKeysResp, BatchPublishOwnerSsdReq, BatchPublishOwnerSsdResp,
+        BatchPutAppendDoneItemReq, BatchPutAppendDoneReq, BatchPutAppendDoneResp,
+        BatchPutAppendStartItemReq, BatchPutAppendStartReq, BatchPutAppendStartResp,
+        BatchPutDoneItemReq, BatchPutDoneItemResp, BatchPutDoneReq, BatchPutDoneResp,
+        BatchPutRevokeItemReq, BatchPutRevokeReq, BatchPutRevokeResp, BatchPutStartItemReq,
+        BatchPutStartReq, BatchPutStartResp, BatchReleasePutKeyReservationsReq,
+        BatchReleasePutKeyReservationsResp, EnqueueReplicaTaskItemResp, GroupedBatchPutDoneItemReq,
+        GroupedBatchPutDoneReq, GroupedBatchPutDoneResp, OwnerReclaimBacking,
+        OwnerSourceEvictionOutcome, OwnerSourceEvictionVictim, OwnerSourceEvictionVictimResp,
+        OwnerSourceSsdPolicy, OwnerSsdPublishItem, OwnerSsdPublishOutcome, PutAppendDoneReq,
+        PutAppendDoneResp, PutAppendRevokeReq, PutAppendStartOutcome, PutAppendStartReq,
+        PutAppendStartResp, PutAtomicGroup, PutDoneCommittedSlot, PutDoneReq, PutRevokeReq,
+        PutStartReq, PutStartResp, ReleaseLocalGrantReq, ReserveLocalGrantOutcome,
+        ReserveLocalGrantReq, owner_source_eviction_epoch,
     },
     memholder::{UserMemHolder, UserMemHolderExposeKind},
     p2p::msg_pack::MsgPack,
@@ -41,6 +43,7 @@ use crate::{
 use chrono::Utc;
 use fluxon_commu::TransferBreakdown;
 use limit_thirdparty::tokio;
+use std::future::Future;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -363,6 +366,7 @@ mod local_reserve_claim_tests {
             ClientKvApi::construct(ClientKvApiNewArg {
                 test_spec_config: TestSpecConfig::default(),
                 owner_hot_cache_capacity_bytes: None,
+                ssd_storage: None,
             })
             .await
             .expect("construct test ClientKvApi"),
@@ -457,6 +461,7 @@ mod local_reserve_claim_tests {
             ClientKvApi::construct(ClientKvApiNewArg {
                 test_spec_config: TestSpecConfig::default(),
                 owner_hot_cache_capacity_bytes: None,
+                ssd_storage: None,
             })
             .await
             .expect("construct test ClientKvApi"),
@@ -511,6 +516,7 @@ mod local_reserve_claim_tests {
             ClientKvApi::construct(ClientKvApiNewArg {
                 test_spec_config: TestSpecConfig::default(),
                 owner_hot_cache_capacity_bytes: None,
+                ssd_storage: None,
             })
             .await
             .expect("construct test ClientKvApi"),
@@ -558,6 +564,7 @@ mod local_reserve_claim_tests {
             ClientKvApi::construct(ClientKvApiNewArg {
                 test_spec_config: TestSpecConfig::default(),
                 owner_hot_cache_capacity_bytes: None,
+                ssd_storage: None,
             })
             .await
             .expect("construct test ClientKvApi"),
@@ -630,7 +637,10 @@ pub struct OwnerReservedPutItem {
     pub lease_id: Option<u64>,
     pub peer_node_id: Option<NodeIDString>,
     pub remember_local_snapshot: bool,
+    /// Original caller/content selection, independent of remote capacity.
     pub make_replica_task: bool,
+    /// The master pre-reserved a remote memory target for this Put.
+    pub remote_replica_admitted: bool,
     pub preferred_sub_cluster: Option<String>,
 }
 
@@ -641,7 +651,12 @@ pub struct OwnerLocalPublishItem {
     pub value_len: u64,
     pub lease_id: Option<u64>,
     pub committed_slot: PutDoneCommittedSlot,
+    /// Original caller/content selection, independent of remote capacity.
     pub make_replica_task: bool,
+    /// This Put path admitted a remote trigger. Pre-reserved paths set this
+    /// only when a target exists; owner-local fast Put admits selected items
+    /// here and performs allocation inside the later append Start.
+    pub remote_replica_admitted: bool,
     pub preferred_sub_cluster: Option<String>,
     pub atomic_group: Option<PutAtomicGroup>,
 }
@@ -654,6 +669,40 @@ pub struct OwnerLocalPublishJob {
     /// the grouped master terminal response and all local promotions complete.
     /// Native/Pyo3 jobs use master key reservations instead and leave this empty.
     pub external_pending_contexts: Vec<super::ExternalPendingPutCtx>,
+}
+
+fn owner_local_publish_starts_remote(item: &OwnerLocalPublishItem) -> bool {
+    item.make_replica_task && item.remote_replica_admitted
+}
+
+#[derive(Clone)]
+struct OwnerLocalSsdPutCandidate {
+    key: String,
+    put_id: PutIDForAKey,
+    /// Exact logical value bytes known by the publishing Put path. Early SSD
+    /// writes use this to reject over-budget candidates before installing a
+    /// generation flight or acquiring a source holder. A zero value is kept
+    /// only for legacy allocation-backed last-backing candidates whose
+    /// resource admission already happened upstream.
+    value_len: u64,
+    selected_victim: Option<Arc<OwnerSourceEvictionVictim>>,
+}
+
+struct OwnerLocalSsdPutLeader {
+    op: Arc<OwnerLocalSsdPutSharedOp>,
+    memory_info: Arc<crate::memholder::MemoryInfo>,
+    /// Bytes actually charged by the caller's admission pass. This can be
+    /// zero for a legacy allocation-backed last-backing candidate, so gate
+    /// failure must refund this value rather than minting credit from the
+    /// subsequently discovered source length.
+    admission_len: u64,
+}
+
+fn owner_reclaim_backing_len(backing: &OwnerReclaimBacking) -> u64 {
+    match backing {
+        OwnerReclaimBacking::CommittedSlot { slot_size, .. } => *slot_size,
+        OwnerReclaimBacking::Allocation | OwnerReclaimBacking::UnindexedAllocation { .. } => 0,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1093,7 +1142,8 @@ impl ClientKvApiInner {
                 lease_id,
                 peer_node_id: peer_node_id.clone(),
                 remember_local_snapshot: true,
-                make_replica_task: start_req.make_replica_task && replica_admitted,
+                make_replica_task: start_req.make_replica_task,
+                remote_replica_admitted: replica_admitted,
                 preferred_sub_cluster: start_req.preferred_sub_cluster,
             });
         }
@@ -1176,6 +1226,8 @@ impl ClientKvApiInner {
             }));
         }
 
+        let mut early_ssd_candidates = Vec::new();
+        let mut remote_replica_pending = Vec::new();
         for (pending, done_item) in done_pending.into_iter().zip(done_resp.items.into_iter()) {
             if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
                 done_item.error_code,
@@ -1188,25 +1240,36 @@ impl ClientKvApiInner {
                 self.remember_local_snapshot(&pending.item.key, pending.item.put_id);
             }
             if pending.item.make_replica_task {
-                if let Err(err) = self
-                    .ensure_remote_put(
-                        &pending.item.key,
-                        pending.item.put_id,
-                        pending.item.preferred_sub_cluster.clone(),
-                        true,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "owner_batch_put_commit_reserved make replica task failed after local commit: key={} put_id=({},{}) err={}",
-                        pending.item.key,
-                        pending.item.put_id.0,
-                        pending.item.put_id.1,
-                        err
-                    );
-                }
+                early_ssd_candidates.push((
+                    pending.item.key.clone(),
+                    pending.item.put_id,
+                    pending.item.value_len,
+                ));
+            }
+            if pending.item.make_replica_task && pending.item.remote_replica_admitted {
+                remote_replica_pending.push((
+                    pending.item.key.clone(),
+                    pending.item.put_id,
+                    pending.item.preferred_sub_cluster.clone(),
+                ));
             }
             results[pending.idx] = Some(Ok(()));
+        }
+
+        self.start_early_owner_local_ssd_puts(early_ssd_candidates);
+        for (key, put_id, preferred_sub_cluster) in remote_replica_pending {
+            if let Err(err) = self
+                .ensure_remote_put(&key, put_id, preferred_sub_cluster, true)
+                .await
+            {
+                tracing::warn!(
+                    "owner_batch_put_commit_reserved make replica task failed after local commit: key={} put_id=({},{}) err={}",
+                    key,
+                    put_id.0,
+                    put_id.1,
+                    err
+                );
+            }
         }
 
         Ok(results
@@ -1302,9 +1365,11 @@ impl ClientKvApiInner {
             idx: usize,
             key: String,
             put_id: PutIDForAKey,
+            value_len: u64,
             lease_id: Option<u64>,
             remember_local_snapshot: bool,
             make_replica_task: bool,
+            remote_replica_admitted: bool,
             preferred_sub_cluster: Option<String>,
         }
 
@@ -1313,7 +1378,7 @@ impl ClientKvApiInner {
         let short_circuit_payload = self.short_circuit_put_payload_path_enabled();
         let skip_put_end_commit = self.skip_put_end_commit_enabled();
 
-        for (idx, (((key, ptrs), _payload_len), start_item)) in keys
+        for (idx, (((key, ptrs), payload_len), start_item)) in keys
             .into_iter()
             .zip(ptrs_groups.into_iter())
             .zip(payload_lens.into_iter())
@@ -1342,9 +1407,11 @@ impl ClientKvApiInner {
                 idx,
                 key,
                 put_id,
+                value_len: payload_len,
                 lease_id,
                 remember_local_snapshot,
-                make_replica_task: make_replica_task && replica_admitted,
+                make_replica_task,
+                remote_replica_admitted: replica_admitted,
                 preferred_sub_cluster: preferred_sub_cluster.clone(),
             });
         }
@@ -1386,6 +1453,8 @@ impl ClientKvApiInner {
                 ),
             }));
         }
+        let mut early_ssd_candidates = Vec::new();
+        let mut remote_replica_pending = Vec::new();
         for (pending, done_item) in done_pending.into_iter().zip(done_resp.items.into_iter()) {
             if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
                 done_item.error_code,
@@ -1398,25 +1467,32 @@ impl ClientKvApiInner {
                 self.remember_local_snapshot(&pending.key, pending.put_id);
             }
             if pending.make_replica_task {
-                if let Err(err) = self
-                    .ensure_remote_put(
-                        &pending.key,
-                        pending.put_id,
-                        pending.preferred_sub_cluster.clone(),
-                        true,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "batch make replica task failed after local commit: key={} put_id=({},{}) err={}",
-                        pending.key,
-                        pending.put_id.0,
-                        pending.put_id.1,
-                        err
-                    );
-                }
+                early_ssd_candidates.push((pending.key.clone(), pending.put_id, pending.value_len));
+            }
+            if pending.make_replica_task && pending.remote_replica_admitted {
+                remote_replica_pending.push((
+                    pending.key.clone(),
+                    pending.put_id,
+                    pending.preferred_sub_cluster.clone(),
+                ));
             }
             results[pending.idx] = Some(Ok(()));
+        }
+
+        self.start_early_owner_local_ssd_puts(early_ssd_candidates);
+        for (key, put_id, preferred_sub_cluster) in remote_replica_pending {
+            if let Err(err) = self
+                .ensure_remote_put(&key, put_id, preferred_sub_cluster, true)
+                .await
+            {
+                tracing::warn!(
+                    "batch make replica task failed after local commit: key={} put_id=({},{}) err={}",
+                    key,
+                    put_id.0,
+                    put_id.1,
+                    err
+                );
+            }
         }
 
         Ok(results
@@ -1429,6 +1505,148 @@ impl ClientKvApiInner {
                 })
             })
             .collect())
+    }
+
+    fn start_owner_local_ssd_puts(
+        &self,
+        candidates: Vec<OwnerLocalSsdPutCandidate>,
+        resources_pre_admitted: bool,
+    ) -> Vec<Option<Arc<OwnerLocalSsdPutSharedOp>>> {
+        // Early backing is optional work. Apply its independent byte budget
+        // before touching the per-key generation table or pinning a source.
+        // Last-backing callers have already performed the same admission while
+        // deciding which capacity victims may enter durability, so they pass
+        // resources_pre_admitted=true and must not be charged twice.
+        let admission = if resources_pre_admitted {
+            vec![true; candidates.len()]
+        } else {
+            let lengths = candidates
+                .iter()
+                .map(|candidate| candidate.value_len)
+                .collect::<Vec<_>>();
+            self.ssd_storage
+                .as_ref()
+                .map(|store| store.admit_owner_write_candidates(&lengths))
+                .unwrap_or_else(|| vec![false; candidates.len()])
+        };
+        let mut operations = std::iter::repeat_with(|| None)
+            .take(candidates.len())
+            .collect::<Vec<_>>();
+        let mut leaders = Vec::new();
+        let mut unused_pre_admission_lengths = Vec::new();
+        for (index, (candidate, admitted_by_resource)) in
+            candidates.into_iter().zip(admission).enumerate()
+        {
+            if !admitted_by_resource {
+                continue;
+            }
+            let pre_admitted_len = candidate.value_len;
+            match self.begin_owner_local_ssd_put(
+                &candidate.key,
+                candidate.put_id,
+                candidate.selected_victim.as_deref(),
+            ) {
+                OwnerLocalSsdPutReservation::Leader { op, memory_info } => {
+                    operations[index] = Some(op.clone());
+                    if pre_admitted_len != 0 && u64::from(memory_info.len) != pre_admitted_len {
+                        tracing::warn!(
+                            key = %candidate.key,
+                            put_id_time = candidate.put_id.0,
+                            put_id_version = candidate.put_id.1,
+                            admitted_len = pre_admitted_len,
+                            source_len = memory_info.len,
+                            "owner local SSD pre-admission length no longer matches exact source"
+                        );
+                        unused_pre_admission_lengths.push(pre_admitted_len);
+                        self.finish_owner_local_ssd_put(&op, OwnerLocalSsdPutOutcome::Failed);
+                        continue;
+                    }
+                    leaders.push(OwnerLocalSsdPutLeader {
+                        op,
+                        memory_info,
+                        admission_len: pre_admitted_len,
+                    });
+                }
+                OwnerLocalSsdPutReservation::Follower(op) => {
+                    operations[index] = Some(op);
+                    unused_pre_admission_lengths.push(pre_admitted_len);
+                }
+                OwnerLocalSsdPutReservation::SourceUnavailable => {
+                    unused_pre_admission_lengths.push(pre_admitted_len);
+                }
+            }
+        }
+        if let Some(store) = self.ssd_storage.as_ref() {
+            store.refund_owner_write_admission(&unused_pre_admission_lengths);
+        }
+        if leaders.is_empty() {
+            return operations;
+        }
+
+        let admitted_lengths = leaders
+            .iter()
+            .map(|leader| leader.admission_len)
+            .collect::<Vec<_>>();
+        let permit = match self.try_acquire_local_ssd_persist_batch(leaders.len()) {
+            Ok(Some(permit)) => permit,
+            Ok(None) => {
+                if let Some(store) = self.ssd_storage.as_ref() {
+                    store.refund_owner_write_admission(&admitted_lengths);
+                }
+                for leader in leaders {
+                    self.finish_owner_local_ssd_put(&leader.op, OwnerLocalSsdPutOutcome::Dropped);
+                }
+                return operations;
+            }
+            Err(err) => {
+                if let Some(store) = self.ssd_storage.as_ref() {
+                    store.refund_owner_write_admission(&admitted_lengths);
+                }
+                tracing::warn!(
+                    items = leaders.len(),
+                    error = %err,
+                    "owner local SSD durability batch admission failed"
+                );
+                for leader in leaders {
+                    self.finish_owner_local_ssd_put(&leader.op, OwnerLocalSsdPutOutcome::Failed);
+                }
+                return operations;
+            }
+        };
+
+        let spawn_view = self.view.clone_view();
+        let task_view = spawn_view.clone();
+        let _ = spawn_view.spawn("owner_local_ssd_put_batch", async move {
+            run_owner_local_ssd_put_batch(task_view, leaders, permit).await;
+        });
+        operations
+    }
+
+    pub(crate) fn start_early_owner_local_ssd_puts(
+        &self,
+        candidates: Vec<(String, PutIDForAKey, u64)>,
+    ) {
+        let _ = self.start_owner_local_ssd_puts(
+            candidates
+                .into_iter()
+                .map(|(key, put_id, value_len)| OwnerLocalSsdPutCandidate {
+                    key,
+                    put_id,
+                    value_len,
+                    selected_victim: None,
+                })
+                .collect(),
+            false,
+        );
+    }
+
+    pub(crate) fn start_early_owner_local_ssd_put(
+        &self,
+        key: &str,
+        put_id: PutIDForAKey,
+        value_len: u64,
+    ) {
+        self.start_early_owner_local_ssd_puts(vec![(key.to_string(), put_id, value_len)]);
     }
 
     /// Ensure one remote backing exists for an exact owner-local generation.
@@ -1605,6 +1823,9 @@ impl ClientKvApiInner {
             );
             self.put_end(key, put_id, lease_id).await?;
             self.remember_local_snapshot(key, put_id);
+            if make_replica_task {
+                self.start_early_owner_local_ssd_put(key, put_id, payload_len);
+            }
             if make_replica_task && replica_admitted {
                 if let Err(err) = self
                     .ensure_remote_put(key, put_id, preferred_sub_cluster.map(str::to_string), true)
@@ -1676,6 +1897,9 @@ impl ClientKvApiInner {
 
         self.put_end(key, put_id, lease_id).await?;
         self.remember_local_snapshot(key, put_id);
+        if make_replica_task {
+            self.start_early_owner_local_ssd_put(key, put_id, payload_len);
+        }
         if make_replica_task && replica_admitted {
             if let Err(err) = self
                 .ensure_remote_put(key, put_id, preferred_sub_cluster.map(str::to_string), true)
@@ -2212,6 +2436,54 @@ impl ClientKvApiInner {
                 ),
             }));
         }
+        Ok(resp.serialize_part)
+    }
+
+    async fn batch_publish_owner_ssd(
+        &self,
+        items: Vec<OwnerSsdPublishItem>,
+    ) -> KvResult<BatchPublishOwnerSsdResp> {
+        if items.is_empty() {
+            return Ok(BatchPublishOwnerSsdResp {
+                items: Vec::new(),
+                error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
+                error_json: String::new(),
+            });
+        }
+        if !self.view.register_shutdown_poller().is_running() {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: "ClientKvApi is shutting down; rejecting owner SSD publication".to_string(),
+            }));
+        }
+        let self_info = self.view.cluster_manager().get_self_info();
+        let req = MsgPack {
+            serialize_part: BatchPublishOwnerSsdReq {
+                owner_node_start_time: self_info.node_start_time,
+                items,
+            },
+            raw_bytes: Vec::new(),
+        };
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let resp = self
+            .rpc_caller_batch_publish_owner_ssd
+            .call_with_transport_policy(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                req,
+                Some(Duration::from_secs(60)),
+                RpcTransportPolicy::ForceTransport,
+                2,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json.clone(),
+        )?;
         Ok(resp.serialize_part)
     }
 
@@ -2786,7 +3058,7 @@ const OWNER_LOCAL_PUBLISH_RETRY_MAX: Duration = Duration::from_secs(1);
 mod owner_hot_replica_policy_tests {
     use super::{
         OwnerLocalPublishItem, complete_owner_local_publish_group_lens,
-        owner_local_publish_atomic_batch_complete,
+        owner_local_publish_atomic_batch_complete, owner_local_publish_starts_remote,
     };
     use crate::master_kv_router::msg_pack::{
         PutAtomicGroup, PutAtomicGroupMember, PutDoneCommittedSlot,
@@ -2804,6 +3076,7 @@ mod owner_hot_replica_policy_tests {
             lease_id: None,
             committed_slot: PutDoneCommittedSlot::default(),
             make_replica_task: false,
+            remote_replica_admitted: false,
             preferred_sub_cluster: None,
             atomic_group,
         }
@@ -2843,6 +3116,19 @@ mod owner_hot_replica_policy_tests {
             publish_item("b", (1, 1), Some(group)),
         ];
         assert_eq!(complete_owner_local_publish_group_lens(&partial), None);
+    }
+
+    #[test]
+    fn local_ssd_content_selection_does_not_bypass_remote_resource_admission() {
+        let mut item = publish_item("key", (1, 0), None);
+        item.make_replica_task = true;
+        assert!(!owner_local_publish_starts_remote(&item));
+
+        item.remote_replica_admitted = true;
+        assert!(owner_local_publish_starts_remote(&item));
+
+        item.make_replica_task = false;
+        assert!(!owner_local_publish_starts_remote(&item));
     }
 
     #[test]
@@ -2919,6 +3205,7 @@ fn owner_source_eviction_identity(
 fn owner_source_eviction_victim(
     identity: &super::OwnerHotReplicaIdentity,
     memory_info: &crate::memholder::MemoryInfo,
+    ssd_enabled: bool,
 ) -> Option<OwnerSourceEvictionVictim> {
     let (slot_size, grant_id, slot_index) = memory_info.local_reserve_resident_slot_ref()?;
     Some(OwnerSourceEvictionVictim {
@@ -2928,6 +3215,12 @@ fn owner_source_eviction_victim(
             grant_id,
             slot_index,
             slot_size,
+        },
+        ssd_backing_len: None,
+        ssd_policy: if ssd_enabled {
+            OwnerSourceSsdPolicy::SelectLastLive
+        } else {
+            OwnerSourceSsdPolicy::Drop
         },
     })
 }
@@ -3049,7 +3342,9 @@ fn prepare_owner_source_eviction_event(
     };
     debug_assert_eq!(resolved_trigger, trigger);
 
-    let Some(victim) = owner_source_eviction_victim(&trigger, source.as_ref()) else {
+    let Some(victim) =
+        owner_source_eviction_victim(&trigger, source.as_ref(), inner.ssd_storage.is_some())
+    else {
         event.selection_debt.release();
         inner
             .owner_hot_counters
@@ -3112,6 +3407,194 @@ fn prepare_owner_source_eviction_event(
     Some((event, victim))
 }
 
+async fn finish_owner_source_eviction_result(
+    inner: &ClientKvApiInner,
+    operation_id: u64,
+    index: usize,
+    event: OwnerHotEvictionEvent,
+    victim: Arc<OwnerSourceEvictionVictim>,
+    result: OwnerSourceEvictionVictimResp,
+) {
+    if victim.ssd_policy == OwnerSourceSsdPolicy::Persisted
+        && !result.ssd_backing_committed
+        && matches!(
+            result.outcome,
+            OwnerSourceEvictionOutcome::Completed
+                | OwnerSourceEvictionOutcome::Stale
+                | OwnerSourceEvictionOutcome::RejectedNotEvictable
+        )
+    {
+        inner
+            .discard_local_ssd_replica(&victim.key, victim.put_id)
+            .await;
+    }
+    match result.outcome {
+        OwnerSourceEvictionOutcome::Accepted | OwnerSourceEvictionOutcome::AlreadyInProgress => {
+            inner
+                .owner_hot_counters
+                .source_evict_handoff_members
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        OwnerSourceEvictionOutcome::Completed => {
+            let epoch = owner_source_eviction_epoch(operation_id, index);
+            match super::reclaim::complete_owner_source_eviction(inner, &victim, epoch) {
+                Ok(()) => {
+                    inner
+                        .owner_hot_counters
+                        .source_evict_handoff_members
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(detail) => {
+                    tracing::warn!(
+                        key = victim.key,
+                        put_time_ms = victim.put_id.0,
+                        put_version = victim.put_id.1,
+                        detail,
+                        "master deleted source route but owner slot release must retry"
+                    );
+                    schedule_owner_source_eviction_retry(
+                        inner,
+                        event,
+                        victim,
+                        "owner slot release after master direct-delete is temporarily busy",
+                    );
+                }
+            }
+        }
+        OwnerSourceEvictionOutcome::SsdCandidate => {
+            tracing::error!(
+                key = victim.key,
+                policy = ?victim.ssd_policy,
+                "master returned an SSD candidate outside the selection phase"
+            );
+            schedule_owner_source_eviction_retry(
+                inner,
+                event,
+                victim,
+                "unexpected repeated SSD candidate response",
+            );
+        }
+        OwnerSourceEvictionOutcome::RetryableBusy | OwnerSourceEvictionOutcome::Unspecified => {
+            schedule_owner_source_eviction_retry(
+                inner,
+                event,
+                victim,
+                "master source reclaim is temporarily busy",
+            );
+        }
+        OwnerSourceEvictionOutcome::Stale => {
+            finish_owner_source_selection(
+                inner,
+                &victim,
+                true,
+                "master rejected stale source identity",
+            );
+        }
+        OwnerSourceEvictionOutcome::RejectedNotEvictable => {
+            tracing::error!(
+                key = victim.key,
+                detail = result.detail,
+                "owner selected a source victim that master declared non-evictable"
+            );
+            finish_owner_source_selection(
+                inner,
+                &victim,
+                true,
+                "master rejected non-evictable source victim",
+            );
+        }
+    }
+}
+
+async fn submit_owner_source_eviction_decisions(
+    inner: &ClientKvApiInner,
+    prepared: Vec<(OwnerHotEvictionEvent, Arc<OwnerSourceEvictionVictim>)>,
+    rpc_failure_reason: &'static str,
+    response_length_reason: &'static str,
+    response_identity_reason: &'static str,
+) {
+    if prepared.is_empty() {
+        return;
+    }
+    let response = inner
+        .batch_evict_owner_source(
+            prepared
+                .iter()
+                .map(|(_, victim)| victim.as_ref().clone())
+                .collect(),
+        )
+        .await;
+    let Ok(response) = response else {
+        for (event, victim) in prepared {
+            schedule_owner_source_eviction_retry(inner, event, victim, rpc_failure_reason);
+        }
+        return;
+    };
+    if response.victims.len() != prepared.len() {
+        for (event, victim) in prepared {
+            schedule_owner_source_eviction_retry(inner, event, victim, response_length_reason);
+        }
+        return;
+    }
+    let operation_id = response.operation_id;
+    for (index, ((event, victim), result)) in prepared.into_iter().zip(response.victims).enumerate()
+    {
+        if result.victim_index != u32::try_from(index).unwrap_or(u32::MAX) {
+            schedule_owner_source_eviction_retry(inner, event, victim, response_identity_reason);
+            continue;
+        }
+        finish_owner_source_eviction_result(inner, operation_id, index, event, victim, result)
+            .await;
+    }
+}
+
+async fn reclaim_admission_drops_before_ssd_persist<T, DropFuture, PersistFn, PersistFuture>(
+    drop_reclaim: DropFuture,
+    persist: PersistFn,
+) -> T
+where
+    DropFuture: Future<Output = ()>,
+    PersistFn: FnOnce() -> PersistFuture,
+    PersistFuture: Future<Output = T>,
+{
+    drop_reclaim.await;
+    persist().await
+}
+
+#[cfg(test)]
+mod owner_ssd_fast_drop_tests {
+    use super::reclaim_admission_drops_before_ssd_persist;
+    use std::sync::{Arc, Mutex};
+
+    #[limit_thirdparty::tokio::test]
+    async fn admission_drops_finish_before_ssd_persist_starts() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let drop_order = order.clone();
+        let persist_order = order.clone();
+
+        let result = reclaim_admission_drops_before_ssd_persist(
+            async move {
+                drop_order.lock().unwrap().push("drop-start");
+                limit_thirdparty::tokio::task::yield_now().await;
+                drop_order.lock().unwrap().push("drop-finished");
+            },
+            move || async move {
+                let mut order = persist_order.lock().unwrap();
+                assert_eq!(order.last(), Some(&"drop-finished"));
+                order.push("persist-start");
+                17
+            },
+        )
+        .await;
+
+        assert_eq!(result, 17);
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["drop-start", "drop-finished", "persist-start"]
+        );
+    }
+}
+
 async fn process_owner_source_eviction_events(
     view: &ClientKvApiView,
     events: Vec<OwnerHotEvictionEvent>,
@@ -3124,11 +3607,16 @@ async fn process_owner_source_eviction_events(
     if prepared.is_empty() {
         return;
     }
-    let victims = prepared
-        .iter()
-        .map(|(_, victim)| victim.as_ref().clone())
-        .collect::<Vec<_>>();
-    let response = inner.batch_evict_owner_source(victims).await;
+    // The first pass never touches SSD. Master deletes sources that already
+    // have another live backing and returns only exact last-copy candidates.
+    let response = inner
+        .batch_evict_owner_source(
+            prepared
+                .iter()
+                .map(|(_, victim)| victim.as_ref().clone())
+                .collect(),
+        )
+        .await;
     let Ok(response) = response else {
         for (event, victim) in prepared {
             schedule_owner_source_eviction_retry(
@@ -3184,6 +3672,8 @@ async fn process_owner_source_eviction_events(
         );
     }
 
+    let first_operation_id = response.operation_id;
+    let mut candidates = Vec::new();
     for (index, ((event, victim), result)) in prepared
         .into_iter()
         .zip(response.victims.into_iter())
@@ -3198,73 +3688,120 @@ async fn process_owner_source_eviction_events(
             );
             continue;
         }
-        match result.outcome {
-            OwnerSourceEvictionOutcome::Accepted
-            | OwnerSourceEvictionOutcome::AlreadyInProgress => {
-                inner
-                    .owner_hot_counters
-                    .source_evict_handoff_members
-                    .fetch_add(1, Ordering::Relaxed);
-                // Selected debt stays live until owner reclaim Commit calls
-                // owner_hot_invalidate_version for the exact victim.
-            }
-            OwnerSourceEvictionOutcome::Completed => {
-                let epoch = owner_source_eviction_epoch(response.operation_id, index);
-                match super::reclaim::complete_owner_source_eviction(inner, &victim, epoch) {
-                    Ok(()) => {
-                        inner
-                            .owner_hot_counters
-                            .source_evict_handoff_members
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(detail) => {
-                        tracing::warn!(
-                            key = victim.key,
-                            put_time_ms = victim.put_id.0,
-                            put_version = victim.put_id.1,
-                            detail,
-                            "master deleted source route but owner slot release must retry"
-                        );
-                        schedule_owner_source_eviction_retry(
-                            inner,
-                            event,
-                            victim,
-                            "owner slot release after master direct-delete is temporarily busy",
-                        );
-                    }
-                }
-            }
-            OwnerSourceEvictionOutcome::RetryableBusy | OwnerSourceEvictionOutcome::Unspecified => {
-                schedule_owner_source_eviction_retry(
-                    inner,
-                    event,
-                    victim,
-                    "master source reclaim is temporarily busy",
-                );
-            }
-            OwnerSourceEvictionOutcome::Stale => {
-                finish_owner_source_selection(
-                    inner,
-                    &victim,
-                    true,
-                    "master rejected stale source identity",
-                );
-            }
-            OwnerSourceEvictionOutcome::RejectedNotEvictable => {
-                tracing::error!(
-                    key = victim.key,
-                    detail = result.detail,
-                    "owner selected a source victim that master declared non-evictable"
-                );
-                finish_owner_source_selection(
-                    inner,
-                    &victim,
-                    true,
-                    "master rejected non-evictable source victim",
-                );
-            }
+        if result.outcome == OwnerSourceEvictionOutcome::SsdCandidate
+            && victim.ssd_policy == OwnerSourceSsdPolicy::SelectLastLive
+        {
+            candidates.push((event, victim));
+            continue;
+        }
+        finish_owner_source_eviction_result(
+            inner,
+            first_operation_id,
+            index,
+            event,
+            victim,
+            result,
+        )
+        .await;
+    }
+
+    if candidates.is_empty() {
+        return;
+    }
+    let candidate_lengths = candidates
+        .iter()
+        .map(|(_, victim)| owner_reclaim_backing_len(&victim.backing))
+        .collect::<Vec<_>>();
+    let admission = inner
+        .ssd_storage
+        .as_ref()
+        .map(|store| store.admit_owner_write_candidates(&candidate_lengths))
+        .unwrap_or_else(|| vec![false; candidates.len()]);
+    let candidate_items = candidates.len();
+    let mut dropped = Vec::new();
+    let mut admitted_candidates = Vec::new();
+    for ((mut event, victim), is_admitted) in candidates.into_iter().zip(admission) {
+        let mut request = victim.as_ref().clone();
+        request.ssd_backing_len = None;
+        request.ssd_policy = OwnerSourceSsdPolicy::Drop;
+        let request = Arc::new(request);
+        event.source_eviction_victim = Some(request.clone());
+        if is_admitted {
+            admitted_candidates.push((event, request));
+        } else {
+            dropped.push((event, request));
         }
     }
+
+    // Candidates rejected by the byte budget must release their DRAM slots
+    // before the admitted durability batch starts. Otherwise one slow SSD
+    // flush makes every intentional Drop in the same pressure batch wait,
+    // recreating a reclaim backlog even though no SSD queue exists.
+    let dropped_items = dropped.len();
+    let admitted_items = admitted_candidates.len();
+    // Both early Put and last-backing fallback enter the same per-generation
+    // local_ssd_put flight. The fallback starts only after explicit admission
+    // Drops have released their DRAM slots.
+    let operations = reclaim_admission_drops_before_ssd_persist(
+        submit_owner_source_eviction_decisions(
+            inner,
+            dropped,
+            "owner SSD admission-drop direct-delete RPC failed",
+            "owner SSD admission-drop response length mismatch",
+            "owner SSD admission-drop response identity mismatch",
+        ),
+        || async {
+            inner.start_owner_local_ssd_puts(
+                admitted_candidates
+                    .iter()
+                    .map(|(_, victim)| OwnerLocalSsdPutCandidate {
+                        key: victim.key.clone(),
+                        put_id: victim.put_id,
+                        value_len: owner_reclaim_backing_len(&victim.backing),
+                        selected_victim: Some(victim.clone()),
+                    })
+                    .collect(),
+                true,
+            )
+        },
+    )
+    .await;
+    let mut admitted_decisions = Vec::with_capacity(admitted_candidates.len());
+    let mut persisted_items = 0usize;
+    for ((mut event, victim), operation) in admitted_candidates.into_iter().zip(operations) {
+        let outcome = match operation {
+            Some(operation) => operation.wait().await,
+            None => OwnerLocalSsdPutOutcome::Failed,
+        };
+        if matches!(
+            outcome,
+            OwnerLocalSsdPutOutcome::Published | OwnerLocalSsdPutOutcome::AlreadyPresent
+        ) {
+            persisted_items += 1;
+        }
+        // Publication, when successful, already attached SSD to the exact
+        // route. Direct-delete now removes only memory. Failed/Drop outcomes
+        // retain the cache's existing fail-open eviction behavior.
+        event.source_eviction_victim = Some(victim.clone());
+        admitted_decisions.push((event, victim));
+    }
+    tracing::info!(
+        candidates = candidate_items,
+        admitted = admitted_items,
+        persisted = persisted_items,
+        admission_dropped = dropped_items,
+        persist_dropped = admitted_items.saturating_sub(persisted_items),
+        "owner last-backing SSD admission completed without queueing excess victims"
+    );
+
+    submit_owner_source_eviction_decisions(
+        inner,
+        admitted_decisions,
+        "owner SSD persisted decision direct-delete RPC failed",
+        "owner SSD persisted decision response length mismatch",
+        "owner SSD persisted decision response identity mismatch",
+    )
+    .await;
 }
 
 pub fn spawn_owner_source_eviction_dispatcher(
@@ -3404,6 +3941,167 @@ pub fn spawn_owner_hot_retry_actor(view: ClientKvApiView) {
             }
         }
     });
+}
+
+async fn run_owner_local_ssd_put_batch(
+    view: ClientKvApiView,
+    leaders: Vec<OwnerLocalSsdPutLeader>,
+    permit: crate::kv_ssd_storage::KvSsdPersistBatchPermit,
+) {
+    let inner = view.client_kv_api().inner();
+    let mut holders = Vec::with_capacity(leaders.len());
+    let mut sources = Vec::with_capacity(leaders.len());
+    for leader in &leaders {
+        let holder = Arc::new(UserMemHolder::new(
+            leader.memory_info.clone(),
+            inner.get_or_init_all_memholder_refcount(),
+            UserMemHolderExposeKind::SegPtr,
+        ));
+        sources.push(crate::kv_ssd_storage::KvSsdPersistSource {
+            key: leader.op.key.clone(),
+            put_id: leader.op.put_id,
+            addr: holder.memory_info.addr,
+            len: u64::from(holder.memory_info.len),
+        });
+        holders.push(holder);
+    }
+
+    let copies = match inner.copy_local_kvs_for_ssd(&sources).await {
+        Ok(copies) => copies,
+        Err(err) => {
+            drop(holders);
+            tracing::warn!(
+                items = leaders.len(),
+                error = %err,
+                "owner local SSD source copy validation failed"
+            );
+            for leader in leaders {
+                inner.finish_owner_local_ssd_put(&leader.op, OwnerLocalSsdPutOutcome::Failed);
+            }
+            return;
+        }
+    };
+    // Durability now reads only owner-owned copies. The source Moka pins may
+    // be released while this flight remains installed through route publish.
+    drop(holders);
+
+    let persisted = match inner.persist_copied_local_kvs_to_ssd(permit, copies).await {
+        Ok(persisted) => persisted,
+        Err(err) => {
+            tracing::warn!(
+                items = leaders.len(),
+                error = %err,
+                "owner local SSD durability setup failed"
+            );
+            for leader in leaders {
+                inner.finish_owner_local_ssd_put(&leader.op, OwnerLocalSsdPutOutcome::Failed);
+            }
+            return;
+        }
+    };
+
+    let mut publish = Vec::new();
+    for ((leader, source), outcome) in leaders
+        .into_iter()
+        .zip(sources.into_iter())
+        .zip(persisted.into_iter())
+    {
+        match outcome {
+            Ok(Some(guard)) => {
+                publish.push((leader, source, guard));
+            }
+            Ok(None) => {
+                inner.finish_owner_local_ssd_put(&leader.op, OwnerLocalSsdPutOutcome::Dropped);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    key = leader.op.key,
+                    put_time_ms = leader.op.put_id.0,
+                    put_version = leader.op.put_id.1,
+                    error = %err,
+                    "owner local SSD persist failed"
+                );
+                inner.finish_owner_local_ssd_put(&leader.op, OwnerLocalSsdPutOutcome::Failed);
+            }
+        }
+    }
+    if publish.is_empty() {
+        return;
+    }
+
+    let response = match inner
+        .batch_publish_owner_ssd(
+            publish
+                .iter()
+                .map(|(leader, source, _)| OwnerSsdPublishItem {
+                    key: leader.op.key.clone(),
+                    put_id: leader.op.put_id,
+                    len: source.len,
+                })
+                .collect(),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(
+                items = publish.len(),
+                error = %err,
+                "owner local SSD publication was uncertain; retaining durable bytes for replay"
+            );
+            for (leader, _, _guard) in publish {
+                inner.finish_owner_local_ssd_put(&leader.op, OwnerLocalSsdPutOutcome::Failed);
+            }
+            return;
+        }
+    };
+    if response.items.len() != publish.len() {
+        tracing::warn!(
+            requested = publish.len(),
+            received = response.items.len(),
+            "owner local SSD publication response length mismatch; retaining bytes for replay"
+        );
+        for (leader, _, _guard) in publish {
+            inner.finish_owner_local_ssd_put(&leader.op, OwnerLocalSsdPutOutcome::Failed);
+        }
+        return;
+    }
+
+    for ((leader, _, _guard), result) in publish.into_iter().zip(response.items) {
+        if result.key != leader.op.key || result.put_id != leader.op.put_id {
+            tracing::warn!(
+                expected_key = leader.op.key,
+                expected_put_time_ms = leader.op.put_id.0,
+                expected_put_version = leader.op.put_id.1,
+                response_key = result.key,
+                response_put_time_ms = result.put_id.0,
+                response_put_version = result.put_id.1,
+                "owner local SSD publication identity mismatch; retaining bytes for replay"
+            );
+            inner.finish_owner_local_ssd_put(&leader.op, OwnerLocalSsdPutOutcome::Failed);
+            continue;
+        }
+        let outcome = match result.outcome {
+            OwnerSsdPublishOutcome::Published => OwnerLocalSsdPutOutcome::Published,
+            OwnerSsdPublishOutcome::AlreadyPresent => OwnerLocalSsdPutOutcome::AlreadyPresent,
+            OwnerSsdPublishOutcome::Obsolete => {
+                inner
+                    .discard_local_ssd_replica(&leader.op.key, leader.op.put_id)
+                    .await;
+                OwnerLocalSsdPutOutcome::Obsolete
+            }
+            OwnerSsdPublishOutcome::Rejected => {
+                inner
+                    .discard_local_ssd_replica(&leader.op.key, leader.op.put_id)
+                    .await;
+                OwnerLocalSsdPutOutcome::Failed
+            }
+            OwnerSsdPublishOutcome::RetryableBusy | OwnerSsdPublishOutcome::Unspecified => {
+                OwnerLocalSsdPutOutcome::Failed
+            }
+        };
+        inner.finish_owner_local_ssd_put(&leader.op, outcome);
+    }
 }
 
 async fn fail_owner_remote_put(
@@ -3897,8 +4595,22 @@ pub(crate) async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLoc
             let _ = inner.owner_hot_admit_published_committed(&item.key, item.put_id);
         }
 
+        let _ = inner.start_owner_local_ssd_puts(
+            promoted_items
+                .iter()
+                .filter(|item| item.make_replica_task)
+                .map(|item| OwnerLocalSsdPutCandidate {
+                    key: item.key.clone(),
+                    put_id: item.put_id,
+                    value_len: item.value_len,
+                    selected_victim: None,
+                })
+                .collect(),
+            false,
+        );
+
         for item in promoted_items {
-            if item.make_replica_task {
+            if owner_local_publish_starts_remote(item) {
                 if let Err(err) = inner
                     .ensure_remote_put(
                         &item.key,

@@ -130,9 +130,13 @@ pub struct ExternalGpuGetStartResp {
 pub struct ExternalGetPlanResp {
     pub handle: u64,
     pub raw_prefix_hit_len: usize,
+    /// Prefix that can be executed by the mixed GPU path. CPU-backed sources
+    /// inside this prefix remain holder/H2D sources; only indices listed in
+    /// `gpu_remote_indices` consume GPU destinations.
     pub gpu_raw_prefix_hit_len: usize,
-    /// Original key positions that need remote GPU destinations. Owner-local
-    /// positions remain CPU-backed and are absent from this vector.
+    /// Original key positions that can bind remote GPU destinations. Local
+    /// DRAM, requester-local SSD, and other CPU-only positions remain
+    /// holder/H2D sources and are absent from this vector.
     pub gpu_remote_indices: Vec<usize>,
 }
 
@@ -177,27 +181,30 @@ fn external_get_plan_raw_prefixes_from_statuses(
     statuses: impl IntoIterator<Item = (bool, bool)>,
 ) -> (usize, usize) {
     let mut cpu_prefix = 0usize;
-    let mut gpu_prefix = 0usize;
-    let mut gpu_prefix_open = true;
-    for (hit, gpu_eligible) in statuses {
+    for (hit, _gpu_eligible) in statuses {
         if !hit {
             break;
         }
         cpu_prefix += 1;
-        if gpu_prefix_open && gpu_eligible {
-            gpu_prefix += 1;
-        } else {
-            gpu_prefix_open = false;
-        }
     }
-    (cpu_prefix, gpu_prefix)
+    // The GPU execution path is mixed: CPU-only sources are materialized as
+    // holders while later eligible remote-memory sources still bind GPU
+    // destinations. Therefore one CPU-only hit no longer truncates the plan.
+    (cpu_prefix, cpu_prefix)
 }
 
 #[derive(Clone, Debug)]
 enum ExternalGpuGetTerminal {
-    Completed,
-    Revoked { transfer_error: Option<String> },
-    Failed { detail: String },
+    Completed {
+        planned_cpu_items: Vec<ExternalBatchGetItemResp>,
+        planned_cpu_owner_start_time: Option<i64>,
+    },
+    Revoked {
+        transfer_error: Option<String>,
+    },
+    Failed {
+        detail: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -238,6 +245,7 @@ struct PendingExternalGpuGet {
     atomic_group_lens: Vec<usize>,
     value_ptrs: Vec<u64>,
     local_holders: Vec<(usize, Arc<ExternalMemHolder>)>,
+    planned_cpu_sources: Vec<(usize, String)>,
     cancel_requested: Arc<AtomicBool>,
     transfer_started_at: Instant,
     terminal_rx: watch::Receiver<Option<ExternalGpuGetTerminalEvent>>,
@@ -503,7 +511,7 @@ mod inline_external_get_start_tests {
         external_get_plan_raw_prefixes_from_statuses, external_gpu_transfer_plan_geometry_is_valid,
         inline_external_get_tail_holder_ids, observe_external_gpu_get_consume_timing,
         validate_external_local_holder_geometry, validate_inline_external_get_owner_generation,
-        validate_inline_external_get_start_plan,
+        validate_inline_external_get_start_plan, validate_mixed_planned_cpu_terminal,
     };
     use crate::client_kv_api::msg_pack::ExternalBatchGetItemResp;
     use crate::master_kv_router::msg_pack::{BatchGetPlanItemResp, BatchGetStartItemResp};
@@ -597,6 +605,29 @@ mod inline_external_get_start_tests {
     }
 
     #[test]
+    fn mixed_planned_cpu_terminal_requires_exact_owner_mapping() {
+        let items = vec![inline_hit(1), inline_hit(2)];
+        assert!(
+            validate_mixed_planned_cpu_terminal(&items, 2, Some(17), 17, 0x10_000, 0x10_000,)
+                .is_ok()
+        );
+        assert!(
+            validate_mixed_planned_cpu_terminal(&items, 1, Some(17), 17, 0x10_000, 0x10_000)
+                .is_err()
+        );
+        assert!(
+            validate_mixed_planned_cpu_terminal(&items, 2, None, 17, 0x10_000, 0x10_000).is_err()
+        );
+        assert!(
+            validate_mixed_planned_cpu_terminal(&items, 2, Some(16), 17, 0x10_000, 0x10_000,)
+                .is_err()
+        );
+        assert!(
+            validate_mixed_planned_cpu_terminal(&items, 2, Some(17), 17, 0x10_000, 4096).is_err()
+        );
+    }
+
+    #[test]
     fn inline_partial_consume_returns_only_tail_holder_ids() {
         let items = vec![inline_hit(11), inline_hit(12), inline_hit(13)];
         assert_eq!(
@@ -635,7 +666,7 @@ mod inline_external_get_start_tests {
     }
 
     #[test]
-    fn gpu_prefix_stops_without_shortening_the_cpu_plan() {
+    fn mixed_gpu_prefix_keeps_cpu_only_sources_and_later_gpu_sources() {
         let items = vec![
             BatchGetPlanItemResp {
                 error_code: OK,
@@ -653,7 +684,7 @@ mod inline_external_get_start_tests {
                 ..Default::default()
             },
         ];
-        assert_eq!(external_get_plan_raw_prefixes(&items), (3, 1));
+        assert_eq!(external_get_plan_raw_prefixes(&items), (3, 3));
     }
 
     #[test]
@@ -668,15 +699,15 @@ mod inline_external_get_start_tests {
             ]),
             (3, 3)
         );
-        // A remote source that cannot bind a GPU sink stops only the mixed
-        // GPU prefix; the CPU plan can still consume later local pages.
+        // A CPU-only source is materialized through the existing planned CPU
+        // holder path and does not hide a later GPU-eligible source.
         assert_eq!(
             external_get_plan_raw_prefixes_from_statuses([
                 (true, true),
                 (true, false),
                 (true, true),
             ]),
-            (3, 1)
+            (3, 3)
         );
         assert_eq!(
             external_get_plan_raw_prefixes_from_statuses([
@@ -1221,8 +1252,16 @@ fn release_planned_cpu_response_holders(
     response: &ExternalExecutePlannedGetResp,
     owner_start_time: i64,
 ) {
+    release_planned_cpu_item_holders(inner, &response.items, owner_start_time);
+}
+
+fn release_planned_cpu_item_holders(
+    inner: &ExternalInner,
+    items: &[ExternalBatchGetItemResp],
+    owner_start_time: i64,
+) {
     let external_client_id = inner.view.cluster_manager().get_self_info().id;
-    for holder_id in response.items.iter().filter_map(|item| {
+    for holder_id in items.iter().filter_map(|item| {
         item.external_memholder_info
             .as_ref()
             .map(|info| info.holder_id)
@@ -1239,6 +1278,84 @@ fn release_planned_cpu_response_holders(
             );
         }
     }
+}
+
+fn release_optional_planned_cpu_item_holders(
+    inner: &ExternalInner,
+    items: &[ExternalBatchGetItemResp],
+    owner_start_time: Option<i64>,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let Some(owner_start_time) = owner_start_time else {
+        tracing::error!(
+            items = items.len(),
+            "mixed Get terminal lost the owner generation needed to release CPU holders"
+        );
+        return;
+    };
+    release_planned_cpu_item_holders(inner, items, owner_start_time);
+}
+
+fn validate_mixed_planned_cpu_terminal(
+    items: &[ExternalBatchGetItemResp],
+    expected_items: usize,
+    owner_start_time: Option<i64>,
+    current_owner_start_time: i64,
+    base_ptr: u64,
+    mapped_len: u64,
+) -> KvResult<i64> {
+    if items.len() != expected_items {
+        return Err(KvError::Api(ApiError::Unknown {
+            detail: format!(
+                "mixed Get planned CPU terminal length mismatch: expected={} got={}",
+                expected_items,
+                items.len()
+            ),
+        }));
+    }
+    let owner_start_time = owner_start_time.ok_or_else(|| {
+        KvError::Api(ApiError::Unknown {
+            detail: "mixed Get planned CPU terminal omitted its owner generation".to_string(),
+        })
+    })?;
+    validate_inline_external_get_owner_generation(owner_start_time, current_owner_start_time)?;
+    for (index, item) in items.iter().enumerate() {
+        if item.error_code != OK {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "mixed Get planned CPU item failed: index={} error_code={} error_json={}",
+                    index, item.error_code, item.error_json
+                ),
+            }));
+        }
+        let Some(info) = item.external_memholder_info.as_ref() else {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!("mixed Get planned CPU item has no holder: index={index}"),
+            }));
+        };
+        let end = info
+            .offset
+            .checked_add(u64::from(info.len))
+            .ok_or_else(|| {
+                KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "mixed Get planned CPU holder range overflow: index={} offset={} len={}",
+                        index, info.offset, info.len
+                    ),
+                })
+            })?;
+        if end > mapped_len || base_ptr.checked_add(info.offset).is_none() {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "mixed Get planned CPU holder is outside owner mapping: index={} end={} mapped_len={} base={:#x} offset={}",
+                    index, end, mapped_len, base_ptr, info.offset
+                ),
+            }));
+        }
+    }
+    Ok(owner_start_time)
 }
 
 fn spawn_uncertain_planned_cpu_get_cleanup(
@@ -1528,7 +1645,10 @@ async fn run_external_gpu_get_transfer(
         .master_batch_gpu_get_done(transfer_get_ids)
         .await
     {
-        Ok(()) => ExternalGpuGetTerminal::Completed,
+        Ok(()) => ExternalGpuGetTerminal::Completed {
+            planned_cpu_items: Vec::new(),
+            planned_cpu_owner_start_time: None,
+        },
         Err(err) => ExternalGpuGetTerminal::Failed {
             detail: format!("GPU Get BatchDone failed: {err}"),
         },
@@ -1550,6 +1670,104 @@ async fn run_external_gpu_get_transfer_timed(
         cancel_requested,
     )
     .await;
+    ExternalGpuGetTerminalEvent {
+        outcome,
+        terminal_at: Instant::now(),
+    }
+}
+
+async fn run_external_mixed_gpu_get_transfer_timed(
+    view: ExternalClientApiView,
+    plan_handle: u64,
+    gpu_transfer_items: Vec<(BatchGetStartItemResp, GpuMemoryGuard)>,
+    planned_cpu_items: Vec<(String, u64)>,
+    skipped_get_ids: Vec<u64>,
+    transfer_concurrency: usize,
+    cancel_requested: Arc<AtomicBool>,
+) -> ExternalGpuGetTerminalEvent {
+    if planned_cpu_items.is_empty() {
+        return run_external_gpu_get_transfer_timed(
+            view,
+            gpu_transfer_items,
+            skipped_get_ids,
+            transfer_concurrency,
+            cancel_requested,
+        )
+        .await;
+    }
+
+    // The GPU branch owns tail Revoke. The planned CPU branch receives an
+    // empty tail so every master operation identity is finalized exactly
+    // once while both source classes still execute concurrently.
+    let gpu_future = run_external_gpu_get_transfer(
+        view.clone(),
+        gpu_transfer_items,
+        skipped_get_ids,
+        transfer_concurrency,
+        cancel_requested.clone(),
+    );
+    let cpu_future = run_external_planned_cpu_get(
+        view.clone(),
+        plan_handle,
+        planned_cpu_items,
+        Vec::new(),
+        transfer_concurrency,
+        cancel_requested,
+    );
+    let (gpu_terminal, cpu_terminal) = futures::future::join(gpu_future, cpu_future).await;
+
+    let outcome = match (gpu_terminal, cpu_terminal) {
+        (
+            ExternalGpuGetTerminal::Completed { .. },
+            ExternalPlannedCpuGetTerminal::Completed {
+                items,
+                owner_start_time,
+            },
+        ) => ExternalGpuGetTerminal::Completed {
+            planned_cpu_items: items,
+            planned_cpu_owner_start_time: Some(owner_start_time),
+        },
+        (gpu_terminal, cpu_terminal) => {
+            if let ExternalPlannedCpuGetTerminal::Completed {
+                items,
+                owner_start_time,
+            } = &cpu_terminal
+            {
+                release_planned_cpu_item_holders(
+                    view.external_client_api().inner(),
+                    items,
+                    *owner_start_time,
+                );
+            }
+            match (&gpu_terminal, &cpu_terminal) {
+                (
+                    ExternalGpuGetTerminal::Failed { detail: gpu_detail },
+                    ExternalPlannedCpuGetTerminal::Failed { detail: cpu_detail },
+                ) => ExternalGpuGetTerminal::Failed {
+                    detail: format!(
+                        "mixed Get GPU and CPU branches failed: gpu={gpu_detail}; cpu={cpu_detail}"
+                    ),
+                },
+                (ExternalGpuGetTerminal::Failed { detail }, _) => ExternalGpuGetTerminal::Failed {
+                    detail: format!("mixed Get GPU branch failed: {detail}"),
+                },
+                (_, ExternalPlannedCpuGetTerminal::Failed { detail }) => {
+                    ExternalGpuGetTerminal::Failed {
+                        detail: format!("mixed Get CPU branch failed: {detail}"),
+                    }
+                }
+                (ExternalGpuGetTerminal::Revoked { transfer_error }, _) => {
+                    ExternalGpuGetTerminal::Revoked {
+                        transfer_error: transfer_error.clone(),
+                    }
+                }
+                (_, ExternalPlannedCpuGetTerminal::Revoked) => ExternalGpuGetTerminal::Revoked {
+                    transfer_error: Some("mixed Get CPU branch was revoked".to_string()),
+                },
+                _ => unreachable!("mixed Get non-completed branches must fail or revoke"),
+            }
+        }
+    };
     ExternalGpuGetTerminalEvent {
         outcome,
         terminal_at: Instant::now(),
@@ -3660,8 +3878,11 @@ impl ExternalInner {
             .iter()
             .take(gpu_transferable_len)
             .enumerate()
-            .filter_map(|(index, item)| {
-                matches!(item, PendingExternalGetPlanItem::Remote { .. }).then_some(index)
+            .filter_map(|(index, item)| match item {
+                PendingExternalGetPlanItem::Remote { plan, .. } if plan.gpu_direct_eligible => {
+                    Some(index)
+                }
+                _ => None,
             })
             .collect::<Vec<_>>();
         self.pending_external_get_plan.insert(
@@ -3800,6 +4021,8 @@ impl ExternalInner {
             })
             .collect::<Vec<_>>();
         let mut remote_plans = Vec::with_capacity(destinations.len());
+        let mut planned_cpu_items = Vec::new();
+        let mut planned_cpu_sources = Vec::new();
         let mut local_holders = Vec::new();
         let mut value_ptrs = Vec::with_capacity(consume_prefix_len);
         let mut destination_index = 0usize;
@@ -3813,11 +4036,19 @@ impl ExternalInner {
                     value_ptrs.push(holder.addr);
                     local_holders.push((source_index, holder));
                 }
-                PendingExternalGetPlanItem::Remote { plan, .. } => {
-                    let destination = &destinations[destination_index];
-                    value_ptrs.push(destination.addr);
-                    remote_plans.push(plan);
-                    destination_index += 1;
+                PendingExternalGetPlanItem::Remote { key, plan } => {
+                    if plan.gpu_direct_eligible {
+                        let destination = &destinations[destination_index];
+                        value_ptrs.push(destination.addr);
+                        remote_plans.push(plan);
+                        destination_index += 1;
+                    } else {
+                        // Filled with the owner-mapped holder pointer after the
+                        // planned CPU branch reaches its terminal.
+                        value_ptrs.push(0);
+                        planned_cpu_sources.push((source_index, key.clone()));
+                        planned_cpu_items.push((key, plan.get_id));
+                    }
                 }
             }
         }
@@ -3895,6 +4126,7 @@ impl ExternalInner {
                 atomic_group_lens,
                 value_ptrs,
                 local_holders,
+                planned_cpu_sources,
                 cancel_requested: cancel_requested.clone(),
                 transfer_started_at,
                 terminal_rx,
@@ -3903,9 +4135,11 @@ impl ExternalInner {
         let view = self.view.clone_view();
         let task_view = view.clone();
         view.spawn(format!("external_gpu_get_execute_{handle}"), async move {
-            let terminal = run_external_gpu_get_transfer_timed(
+            let terminal = run_external_mixed_gpu_get_transfer_timed(
                 task_view,
+                handle,
                 transfer_items,
+                planned_cpu_items,
                 skipped_get_ids,
                 transfer_concurrency,
                 cancel_requested,
@@ -4213,6 +4447,7 @@ impl ExternalInner {
                     .map(|destination| destination.addr)
                     .collect(),
                 local_holders: Vec::new(),
+                planned_cpu_sources: Vec::new(),
                 cancel_requested: cancel_requested.clone(),
                 transfer_started_at,
                 terminal_rx,
@@ -4269,7 +4504,7 @@ impl ExternalInner {
                 }
             };
         let finish_wait = finish_wait_started_at.elapsed();
-        let pending = pending_guard.take();
+        let mut pending = pending_guard.take();
         let timing = observe_external_gpu_get_consume_timing(
             pending.transfer_started_at,
             terminal_event.terminal_at,
@@ -4277,15 +4512,24 @@ impl ExternalInner {
             finish_wait,
         );
         let outcome = match &terminal_event.outcome {
-            ExternalGpuGetTerminal::Completed => "completed",
+            ExternalGpuGetTerminal::Completed { .. } => "completed",
             ExternalGpuGetTerminal::Revoked { .. } => "revoked",
             ExternalGpuGetTerminal::Failed { .. } => "failed",
         };
+        let local_source_count = pending.local_holders.len();
+        let planned_cpu_source_count = pending.planned_cpu_sources.len();
+        let gpu_direct_source_count = pending
+            .transferable_len
+            .saturating_sub(local_source_count)
+            .saturating_sub(planned_cpu_source_count);
         tracing::info!(
-            "external GPU Get consume lifecycle: handle={} transferred={} consumed={} outcome={} transfer_wall_us={} terminal_before_consume={} terminal_to_consume_us={} finish_wait_us={}",
+            "external GPU Get consume lifecycle: handle={} transferred={} consumed={} local_sources={} planned_cpu_sources={} gpu_direct_sources={} outcome={} transfer_wall_us={} terminal_before_consume={} terminal_to_consume_us={} finish_wait_us={}",
             handle,
             pending.transferable_len,
             consumed_prefix_len,
+            local_source_count,
+            planned_cpu_source_count,
+            gpu_direct_source_count,
             outcome,
             timing.transfer_wall_us,
             timing.terminal_before_consume,
@@ -4293,17 +4537,159 @@ impl ExternalInner {
             timing.finish_wait_us,
         );
         match terminal_event.outcome {
-            ExternalGpuGetTerminal::Completed => {
+            ExternalGpuGetTerminal::Completed {
+                planned_cpu_items,
+                planned_cpu_owner_start_time,
+            } => {
                 assert_eq!(pending.value_ptrs.len(), pending.transferable_len);
-                if !pending.local_holders.is_empty() {
-                    let (_, current_owner_start_time, _, base_ptr, mapped_len) =
-                        self.wait_current_owner_mapped_range().await?;
-                    validate_external_local_holders_mapping(
+                let planned_cpu_sources = std::mem::take(&mut pending.planned_cpu_sources);
+                let cpu_terminal_shape_is_valid = planned_cpu_sources.len()
+                    == planned_cpu_items.len()
+                    && planned_cpu_sources.iter().enumerate().all(
+                        |(source_order, (source_index, _))| {
+                            *source_index < pending.value_ptrs.len()
+                                && pending.value_ptrs[*source_index] == 0
+                                && source_order.checked_sub(1).is_none_or(|previous_order| {
+                                    planned_cpu_sources[previous_order].0 < *source_index
+                                })
+                        },
+                    );
+                if !cpu_terminal_shape_is_valid {
+                    release_optional_planned_cpu_item_holders(
+                        self,
+                        &planned_cpu_items,
+                        planned_cpu_owner_start_time,
+                    );
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "mixed Get CPU source/terminal shape mismatch: sources={} items={} values={}",
+                            planned_cpu_sources.len(),
+                            planned_cpu_items.len(),
+                            pending.value_ptrs.len()
+                        ),
+                    }));
+                }
+
+                let needs_owner_mapping =
+                    !pending.local_holders.is_empty() || !planned_cpu_sources.is_empty();
+                let owner_mapping = if needs_owner_mapping {
+                    match self.wait_current_owner_mapped_range().await {
+                        Ok(mapping) => Some(mapping),
+                        Err(err) => {
+                            release_optional_planned_cpu_item_holders(
+                                self,
+                                &planned_cpu_items,
+                                planned_cpu_owner_start_time,
+                            );
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some((_, current_owner_start_time, _, base_ptr, mapped_len)) = owner_mapping
+                {
+                    if let Err(err) = validate_external_local_holders_mapping(
                         &pending.local_holders,
                         current_owner_start_time,
                         base_ptr,
                         mapped_len,
-                    )?;
+                    ) {
+                        release_optional_planned_cpu_item_holders(
+                            self,
+                            &planned_cpu_items,
+                            planned_cpu_owner_start_time,
+                        );
+                        return Err(err);
+                    }
+                    if !planned_cpu_sources.is_empty() {
+                        let owner_start_time = match validate_mixed_planned_cpu_terminal(
+                            &planned_cpu_items,
+                            planned_cpu_sources.len(),
+                            planned_cpu_owner_start_time,
+                            current_owner_start_time,
+                            base_ptr,
+                            mapped_len,
+                        ) {
+                            Ok(owner_start_time) => owner_start_time,
+                            Err(err) => {
+                                release_optional_planned_cpu_item_holders(
+                                    self,
+                                    &planned_cpu_items,
+                                    planned_cpu_owner_start_time,
+                                );
+                                return Err(err);
+                            }
+                        };
+                        for ((source_index, _), item) in
+                            planned_cpu_sources.iter().zip(&planned_cpu_items)
+                        {
+                            if *source_index >= consumed_prefix_len {
+                                let info = item
+                                    .external_memholder_info
+                                    .as_ref()
+                                    .expect("validated mixed CPU item must have a holder");
+                                if let Err(detail) = self.enqueue_external_delete_ack(
+                                    self.view.cluster_manager().get_self_info().id.clone(),
+                                    info.holder_id,
+                                    owner_start_time,
+                                ) {
+                                    release_optional_planned_cpu_item_holders(
+                                        self,
+                                        &planned_cpu_items,
+                                        planned_cpu_owner_start_time,
+                                    );
+                                    return Err(KvError::Api(ApiError::Unknown { detail }));
+                                }
+                            }
+                        }
+                        let external_client_id =
+                            self.view.cluster_manager().get_self_info().id.clone();
+                        for ((source_index, key), item) in planned_cpu_sources
+                            .into_iter()
+                            .zip(planned_cpu_items.iter())
+                            .take_while(|((source_index, _), _)| {
+                                *source_index < consumed_prefix_len
+                            })
+                        {
+                            let info = item
+                                .external_memholder_info
+                                .as_ref()
+                                .expect("validated mixed CPU item must have a holder");
+                            let holder_ptr = base_ptr
+                                .checked_add(info.offset)
+                                .expect("validated mixed CPU holder pointer must not overflow");
+                            let holder = Arc::new(ExternalMemHolder::new(
+                                info.offset,
+                                holder_ptr,
+                                info.len,
+                                info.holder_id,
+                                key.clone(),
+                                external_client_id.clone(),
+                                self.view.clone(),
+                                owner_start_time,
+                            ));
+                            pending.value_ptrs[source_index] = holder_ptr;
+                            self.key_weak_memholder_index
+                                .insert(key, Arc::downgrade(&holder));
+                            pending.local_holders.push((source_index, holder));
+                        }
+                    }
+                }
+                if let Some(index) = pending.value_ptrs[..consumed_prefix_len]
+                    .iter()
+                    .position(|pointer| *pointer == 0)
+                {
+                    release_optional_planned_cpu_item_holders(
+                        self,
+                        &planned_cpu_items,
+                        planned_cpu_owner_start_time,
+                    );
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "mixed Get left a consumed source pointer unresolved: index={index}"
+                        ),
+                    }));
                 }
                 let bandwidth_handle = self
                     .view
@@ -4354,7 +4740,18 @@ impl ExternalInner {
             .await?
             .outcome
         {
-            ExternalGpuGetTerminal::Completed | ExternalGpuGetTerminal::Revoked { .. } => Ok(()),
+            ExternalGpuGetTerminal::Completed {
+                planned_cpu_items,
+                planned_cpu_owner_start_time,
+            } => {
+                release_optional_planned_cpu_item_holders(
+                    self,
+                    &planned_cpu_items,
+                    planned_cpu_owner_start_time,
+                );
+                Ok(())
+            }
+            ExternalGpuGetTerminal::Revoked { .. } => Ok(()),
             ExternalGpuGetTerminal::Failed { detail } => {
                 Err(KvError::Api(ApiError::Unknown { detail }))
             }

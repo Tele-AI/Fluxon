@@ -15,17 +15,22 @@ use crate::client_kv_api::msg_pack::{
     ExternalIsExistResp, ExternalObservabilitySnapshotReq, ExternalObservabilitySnapshotResp,
     ExternalPutCommitReq, ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp,
     ExternalPutStartReq, ExternalPutStartResp, ExternalPutTransferEndReq,
-    ExternalPutTransferEndResp, SyncKvToFileReq, SyncKvToFileResp, TestPutPhaseTrace,
+    ExternalPutTransferEndResp, SsdStageReadReq, SsdStageReadResp, SyncKvToFileReq,
+    SyncKvToFileResp, TestPutPhaseTrace,
 };
 use crate::client_kv_api::reclaim::handle_batch_owner_reclaim;
+use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::cluster_manager::{NodeID, NodeIDString};
 use crate::config::TestSpecConfig;
+use crate::kv_ssd_storage::{
+    KvSsdPersistBatchPermit, KvSsdPersistCopy, KvSsdPersistSource, KvSsdStorage, KvSsdStorageInit,
+};
 use crate::master_kv_router::msg_pack::{
     BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchEnqueueReplicaTaskReq,
     BatchEvictOwnerSourceReq, BatchGetBindReq, BatchGetDoneReq, BatchGetRevokeReq,
     BatchGetStartItemResp, BatchGetStartReq, BatchIsExistReq, BatchOwnerReclaimReq,
-    BatchPreparePutKeysReq, BatchPutAppendDoneReq, BatchPutAppendStartReq, BatchPutDoneReq,
-    BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq,
+    BatchPreparePutKeysReq, BatchPublishOwnerSsdReq, BatchPutAppendDoneReq, BatchPutAppendStartReq,
+    BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq,
     DeleteClientKvMetaCacheItem, GroupedBatchPutDoneReq,
 };
 use crate::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
@@ -41,13 +46,13 @@ use crate::{
     master_kv_router::msg_pack::{
         DeleteReq, GetDoneReq, GetMetaReq, GetRevokeReq, GetStartReq, PutAppendDoneReq,
         PutAppendRevokeReq, PutAppendStartReq, PutDoneReq, PutRevokeReq, PutStartReq,
-        ReleaseLocalGrantReq, ReserveLocalGrantReq,
+        ReleaseLocalGrantReq, ReserveLocalGrantReq, SsdStageBeginReq, SsdStageDoneReq,
     },
     metric_reporter::{MetricReporter, MetricReporterAccessTrait},
     metrics::{KvLocalitySnapshot, MetricsHandle, OperationKind, RequestStage},
     p2p::{
         msg_pack::{RPCCaller, RPCHandler},
-        p2p_module::{P2pModule, P2pModuleAccessTrait},
+        p2p_module::{P2pModule, P2pModuleAccessTrait, RpcTransportPolicy},
     },
     rpcresp_kvresult_convert::msg_and_error::{ApiError, ErrorCode, KvError, KvResult},
 };
@@ -71,6 +76,129 @@ use tracing::warn;
 
 const OWNER_LOCAL_PUBLISH_QUEUE_CAPACITY: usize = 4096;
 const OWNER_LOCAL_PUBLISH_MAX_INFLIGHT: usize = 64;
+const SSD_STAGE_RPC_TIMEOUT: Duration = Duration::from_secs(300);
+const SSD_STAGE_TERMINAL_TTL: Duration = Duration::from_secs(10 * 60);
+const SSD_STAGE_DONE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+const SSD_STAGE_DONE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug)]
+struct CompletedSsdStage {
+    request: SsdStageReadReq,
+    response: SsdStageReadResp,
+}
+
+struct SsdStageSharedOp {
+    request: SsdStageReadReq,
+    terminal: watch::Sender<Option<SsdStageReadResp>>,
+    completed: AtomicBool,
+}
+
+impl SsdStageSharedOp {
+    fn new(request: SsdStageReadReq) -> Arc<Self> {
+        let (terminal, _receiver) = watch::channel(None);
+        Arc::new(Self {
+            request,
+            terminal,
+            completed: AtomicBool::new(false),
+        })
+    }
+
+    fn complete(&self, response: SsdStageReadResp) -> bool {
+        if self
+            .completed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.terminal.send_replace(Some(response));
+        true
+    }
+
+    async fn wait(&self) -> SsdStageReadResp {
+        let mut terminal = self.terminal.subscribe();
+        loop {
+            if let Some(response) = terminal.borrow_and_update().clone() {
+                return response;
+            }
+            if terminal.changed().await.is_err() {
+                let err = KvError::Api(ApiError::Unknown {
+                    detail: format!(
+                        "SSD stage singleflight closed without a terminal result: get_id={}",
+                        self.request.get_id
+                    ),
+                });
+                return ssd_stage_error_response(err);
+            }
+        }
+    }
+}
+
+fn ssd_stage_error_response(err: KvError) -> SsdStageReadResp {
+    SsdStageReadResp {
+        error_code: err.code(),
+        error_json: err.to_json(),
+    }
+}
+
+fn ssd_stage_request_mismatch_response(
+    expected: &SsdStageReadReq,
+    actual: &SsdStageReadReq,
+) -> SsdStageReadResp {
+    ssd_stage_error_response(KvError::Api(ApiError::InvalidArgument {
+        detail: format!(
+            "SSD stage get_id was reused with a different operation identity: get_id={} expected={:?} actual={:?}",
+            actual.get_id, expected, actual
+        ),
+    }))
+}
+
+#[cfg(test)]
+mod ssd_stage_singleflight_tests {
+    use super::{SsdStageReadReq, SsdStageReadResp, SsdStageSharedOp};
+    use crate::rpcresp_kvresult_convert::msg_and_error::OK;
+    use std::sync::Arc;
+
+    fn request(get_id: u64) -> SsdStageReadReq {
+        SsdStageReadReq {
+            key: "ssd-key".to_string(),
+            put_id: (17, 2),
+            get_id,
+            stage_addr: 0x1000,
+            stage_capacity: 8192,
+            len: 4096,
+        }
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn all_ssd_stage_followers_reuse_one_terminal_result() {
+        let op = SsdStageSharedOp::new(request(91));
+        let waiters = futures::future::join_all((0..64).map(|_| {
+            let waiter = op.clone();
+            async move { waiter.wait().await }
+        }));
+        let leader = async {
+            assert!(op.complete(SsdStageReadResp {
+                error_code: OK,
+                error_json: String::new(),
+            }));
+            assert!(
+                !op.complete(SsdStageReadResp {
+                    error_code: 1,
+                    error_json: "second terminal".to_string(),
+                }),
+                "the source operation must publish only one terminal result"
+            );
+        };
+        let (responses, ()) = futures::future::join(waiters, leader).await;
+
+        for response in responses {
+            assert_eq!(response.error_code, OK);
+            assert!(response.error_json.is_empty());
+        }
+        assert_eq!(Arc::strong_count(&op), 1);
+    }
+}
 
 /// Information about a memholder held by external client
 #[derive(Clone)]
@@ -87,6 +215,60 @@ pub struct ExternalHoldingGetInfo {
 
 #[derive(Clone, Debug, Default)]
 pub struct OwnerRuntimeObserveSnapshot {
+    pub ssd_capacity_bytes: u64,
+    pub ssd_used_bytes: u64,
+    pub ssd_persist_requests: u64,
+    pub ssd_persist_successes: u64,
+    pub ssd_persist_failures: u64,
+    pub ssd_persist_bytes: u64,
+    pub ssd_persist_duration_us: u64,
+    pub ssd_persist_batch_requests: u64,
+    pub ssd_persist_batch_items: u64,
+    pub ssd_persist_flush_batches: u64,
+    pub ssd_persist_busy_batches: u64,
+    pub ssd_persist_admission_skips: u64,
+    pub ssd_persist_batch_duration_us: u64,
+    pub ssd_write_candidate_items: u64,
+    pub ssd_write_candidate_bytes: u64,
+    pub ssd_write_admitted_items: u64,
+    pub ssd_write_admitted_bytes: u64,
+    pub ssd_write_dropped_items: u64,
+    pub ssd_write_dropped_bytes: u64,
+    pub ssd_write_refunded_items: u64,
+    pub ssd_write_refunded_bytes: u64,
+    pub ssd_load_requests: u64,
+    pub ssd_load_successes: u64,
+    pub ssd_load_misses: u64,
+    pub ssd_load_failures: u64,
+    pub ssd_load_bytes: u64,
+    pub ssd_load_duration_us: u64,
+    pub ssd_memory_hits: u64,
+    pub ssd_disk_hits: u64,
+    pub ssd_outer_hits: u64,
+    pub ssd_removals: u64,
+    pub ssd_stage_flights: u64,
+    pub ssd_stage_terminals: u64,
+    pub ssd_stage_ready_requests: u64,
+    pub ssd_stage_ready_successes: u64,
+    pub ssd_stage_ready_failures: u64,
+    pub ssd_stage_ready_duration_us: u64,
+    pub ssd_stage_execute_completions: u64,
+    pub ssd_stage_terminal_published: u64,
+    pub ssd_stage_terminal_cache_inserts: u64,
+    pub ssd_stage_terminal_cache_duration_us: u64,
+    pub ssd_stage_response_send_attempts: u64,
+    pub ssd_stage_response_send_successes: u64,
+    pub ssd_stage_response_send_failures: u64,
+    pub ssd_stage_response_send_duration_us: u64,
+    pub ssd_source_ready_wait_requests: u64,
+    pub ssd_source_ready_wait_successes: u64,
+    pub ssd_source_ready_wait_failures: u64,
+    pub ssd_source_ready_wait_duration_us: u64,
+    pub ssd_target_pull_requests: u64,
+    pub ssd_target_pull_successes: u64,
+    pub ssd_target_pull_failures: u64,
+    pub ssd_target_pull_duration_us: u64,
+    pub ssd_stage_done_detached: u64,
     pub external_get_holding_entries: u64,
     pub external_get_holding_bytes: u64,
     pub external_get_start_handles: u64,
@@ -117,6 +299,15 @@ pub struct OwnerRuntimeObserveSnapshot {
     pub remote_put_already_satisfied: u64,
     pub remote_put_obsolete: u64,
     pub remote_put_failed: u64,
+    pub local_ssd_put_flights_active: u64,
+    pub local_ssd_put_flight_leaders: u64,
+    pub local_ssd_put_flight_followers: u64,
+    pub local_ssd_put_source_unavailable: u64,
+    pub local_ssd_put_published: u64,
+    pub local_ssd_put_already_present: u64,
+    pub local_ssd_put_dropped: u64,
+    pub local_ssd_put_obsolete: u64,
+    pub local_ssd_put_failed: u64,
     pub local_reserve_slots_free: u64,
     pub local_reserve_slots_prepared: u64,
     pub local_reserve_slots_pending_visible: u64,
@@ -956,6 +1147,20 @@ async fn handle_external_put_revoke(
     }
 }
 
+async fn handle_ssd_stage_read(
+    view: &ClientKvApiView,
+    msg: &MsgPack<SsdStageReadReq>,
+) -> MsgPack<SsdStageReadResp> {
+    MsgPack {
+        serialize_part: view
+            .client_kv_api()
+            .inner()
+            .execute_ssd_stage(&msg.serialize_part)
+            .await,
+        raw_bytes: Vec::new(),
+    }
+}
+
 async fn handle_external_delete_ack(
     view: &ClientKvApiView,
     msg: &MsgPack<ExternalDeleteAckReq>,
@@ -1364,6 +1569,7 @@ pub struct ClientKvApiNewArg {
     pub test_spec_config: TestSpecConfig,
     /// Logical hot-tier capacity only. This does not resize the owner segment.
     pub owner_hot_cache_capacity_bytes: Option<u64>,
+    pub ssd_storage: Option<KvSsdStorageInit>,
 }
 
 pub struct ClientKvApi(ClientKvApiInner);
@@ -1466,6 +1672,19 @@ struct OwnerRemotePutCounters {
 }
 
 #[derive(Default)]
+struct OwnerLocalSsdPutCounters {
+    active: AtomicU64,
+    leaders: AtomicU64,
+    followers: AtomicU64,
+    source_unavailable: AtomicU64,
+    published: AtomicU64,
+    already_present: AtomicU64,
+    dropped: AtomicU64,
+    obsolete: AtomicU64,
+    failed: AtomicU64,
+}
+
+#[derive(Default)]
 struct OwnerPlannedGetCounters {
     local_probe_batches: AtomicU64,
     local_probe_items: AtomicU64,
@@ -1475,6 +1694,31 @@ struct OwnerPlannedGetCounters {
     local_items: AtomicU64,
     leader_items: AtomicU64,
     follower_items: AtomicU64,
+}
+
+#[derive(Default)]
+struct OwnerSsdStageCounters {
+    ready_requests: AtomicU64,
+    ready_successes: AtomicU64,
+    ready_failures: AtomicU64,
+    ready_duration_us: AtomicU64,
+    execute_completions: AtomicU64,
+    terminal_published: AtomicU64,
+    terminal_cache_inserts: AtomicU64,
+    terminal_cache_duration_us: AtomicU64,
+    response_send_attempts: AtomicU64,
+    response_send_successes: AtomicU64,
+    response_send_failures: AtomicU64,
+    response_send_duration_us: AtomicU64,
+    source_ready_wait_requests: AtomicU64,
+    source_ready_wait_successes: AtomicU64,
+    source_ready_wait_failures: AtomicU64,
+    source_ready_wait_duration_us: AtomicU64,
+    target_pull_requests: AtomicU64,
+    target_pull_successes: AtomicU64,
+    target_pull_failures: AtomicU64,
+    target_pull_duration_us: AtomicU64,
+    done_detached: AtomicU64,
 }
 
 struct OwnerHotSelectionDebt {
@@ -1730,8 +1974,26 @@ impl OwnerHotRetryQueue {
 
 pub(crate) struct OwnerPreparedReclaim {
     item: crate::master_kv_router::msg_pack::OwnerReclaimItem,
-    cached_info: GetCachedInfo,
-    local_snapshot: Option<LocalSnapshotInfo>,
+    source: OwnerPreparedReclaimSource,
+    ssd_prepare_lock: Arc<tokio::sync::AMutex<()>>,
+    ssd_prepare_complete: bool,
+    ssd_backing: Option<OwnerPreparedSsdBacking>,
+}
+
+pub(crate) enum OwnerPreparedReclaimSource {
+    /// An owner-indexed source detached from the local Moka while the reclaim fence is active.
+    Indexed {
+        cached_info: GetCachedInfo,
+        local_snapshot: Option<LocalSnapshotInfo>,
+    },
+    /// A master-owned allocation that has no owner-local key index. The master route owns the
+    /// physical allocation through Commit; the owner only reads it under the reclaim fence.
+    UnindexedAllocation { addr: u64, len: u64 },
+}
+
+pub(crate) struct OwnerPreparedSsdBacking {
+    len: u64,
+    _persist_guard: crate::kv_ssd_storage::KvSsdPersistGuard,
 }
 
 pub(crate) struct OwnerSourceEvictionSelection {
@@ -1769,6 +2031,51 @@ pub(crate) enum OwnerRemotePutOutcome {
     Failed,
 }
 
+/// Shared leader/follower terminal publication used by owner backing writes.
+/// Target-specific requests and executors stay outside this type.
+struct OwnerTargetPutFlight<T: Copy> {
+    terminal: watch::Sender<Option<T>>,
+    completed: AtomicBool,
+}
+
+impl<T: Copy> OwnerTargetPutFlight<T> {
+    fn new() -> Self {
+        let (terminal, _receiver) = watch::channel(None);
+        Self {
+            terminal,
+            completed: AtomicBool::new(false),
+        }
+    }
+
+    fn terminal(&self) -> Option<T> {
+        *self.terminal.borrow()
+    }
+
+    fn complete(&self, terminal: T) -> bool {
+        if self
+            .completed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.terminal.send_replace(Some(terminal));
+        true
+    }
+
+    async fn wait(&self) -> Option<T> {
+        let mut terminal = self.terminal.subscribe();
+        loop {
+            if let Some(terminal) = *terminal.borrow_and_update() {
+                return Some(terminal);
+            }
+            if terminal.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct OwnerRemotePutRequest {
     pub preferred_sub_cluster: Option<String>,
@@ -1784,8 +2091,7 @@ pub(crate) struct OwnerRemotePutSharedOp {
     pub key: String,
     pub put_id: crate::master_kv_router::put::PutIDForAKey,
     request: Mutex<OwnerRemotePutRequest>,
-    outcome: watch::Sender<OwnerRemotePutOutcome>,
-    completed: AtomicBool,
+    flight: OwnerTargetPutFlight<OwnerRemotePutOutcome>,
 }
 
 impl OwnerRemotePutSharedOp {
@@ -1795,7 +2101,6 @@ impl OwnerRemotePutSharedOp {
         preferred_sub_cluster: Option<String>,
         protect_source_on_remote_complete: bool,
     ) -> Arc<Self> {
-        let (outcome, _receiver) = watch::channel(OwnerRemotePutOutcome::InFlight);
         Arc::new(Self {
             key: key.to_string(),
             put_id,
@@ -1803,8 +2108,7 @@ impl OwnerRemotePutSharedOp {
                 preferred_sub_cluster,
                 protect_source_on_remote_complete,
             }),
-            outcome,
-            completed: AtomicBool::new(false),
+            flight: OwnerTargetPutFlight::new(),
         })
     }
 
@@ -1825,33 +2129,21 @@ impl OwnerRemotePutSharedOp {
     }
 
     pub(crate) fn outcome(&self) -> OwnerRemotePutOutcome {
-        *self.outcome.borrow()
+        self.flight
+            .terminal()
+            .unwrap_or(OwnerRemotePutOutcome::InFlight)
     }
 
     fn complete(&self, outcome: OwnerRemotePutOutcome) -> bool {
         debug_assert_ne!(outcome, OwnerRemotePutOutcome::InFlight);
-        if self
-            .completed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return false;
-        }
-        self.outcome.send_replace(outcome);
-        true
+        self.flight.complete(outcome)
     }
 
     pub(crate) async fn wait(&self) -> OwnerRemotePutOutcome {
-        let mut outcome = self.outcome.subscribe();
-        loop {
-            let current = *outcome.borrow_and_update();
-            if current != OwnerRemotePutOutcome::InFlight {
-                return current;
-            }
-            if outcome.changed().await.is_err() {
-                return OwnerRemotePutOutcome::Failed;
-            }
-        }
+        self.flight
+            .wait()
+            .await
+            .unwrap_or(OwnerRemotePutOutcome::Failed)
     }
 }
 
@@ -1861,6 +2153,58 @@ pub(crate) enum OwnerRemotePutReservation {
         memory_info: Arc<MemoryInfo>,
     },
     Follower(Arc<OwnerRemotePutSharedOp>),
+    SourceUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerLocalSsdPutOutcome {
+    Published,
+    AlreadyPresent,
+    Dropped,
+    Obsolete,
+    Failed,
+}
+
+/// One same-owner SSD write for an exact local generation. The common flight
+/// owns only terminal publication; admission, copy, durability, and route
+/// publication remain in the SSD executor.
+pub(crate) struct OwnerLocalSsdPutSharedOp {
+    pub key: String,
+    pub put_id: crate::master_kv_router::put::PutIDForAKey,
+    flight: OwnerTargetPutFlight<OwnerLocalSsdPutOutcome>,
+}
+
+impl OwnerLocalSsdPutSharedOp {
+    fn new(key: &str, put_id: crate::master_kv_router::put::PutIDForAKey) -> Arc<Self> {
+        Arc::new(Self {
+            key: key.to_string(),
+            put_id,
+            flight: OwnerTargetPutFlight::new(),
+        })
+    }
+
+    fn outcome(&self) -> Option<OwnerLocalSsdPutOutcome> {
+        self.flight.terminal()
+    }
+
+    fn complete(&self, outcome: OwnerLocalSsdPutOutcome) -> bool {
+        self.flight.complete(outcome)
+    }
+
+    pub(crate) async fn wait(&self) -> OwnerLocalSsdPutOutcome {
+        self.flight
+            .wait()
+            .await
+            .unwrap_or(OwnerLocalSsdPutOutcome::Failed)
+    }
+}
+
+pub(crate) enum OwnerLocalSsdPutReservation {
+    Leader {
+        op: Arc<OwnerLocalSsdPutSharedOp>,
+        memory_info: Arc<MemoryInfo>,
+    },
+    Follower(Arc<OwnerLocalSsdPutSharedOp>),
     SourceUnavailable,
 }
 
@@ -1916,6 +2260,9 @@ pub(crate) struct OwnerKeyControlState {
     /// `external_put`, this remains active after local publication until the
     /// remote Start/transfer/Done state machine reaches a terminal outcome.
     remote_put: Option<Arc<OwnerRemotePutSharedOp>>,
+    /// Exact-generation same-owner SSD write. This is independent from
+    /// `remote_put`, so both backing writes may run concurrently.
+    local_ssd_put: Option<Arc<OwnerLocalSsdPutSharedOp>>,
     /// Owner-local pre-Prepare fence installed by the Moka source-eviction
     /// dispatcher.  The matching committed index is moved into this record,
     /// so a new local Get cannot acquire the source between victim selection
@@ -1942,6 +2289,7 @@ impl OwnerKeyControlState {
             && self.external_pending_puts == 0
             && self.external_put.is_none()
             && self.remote_put.is_none()
+            && self.local_ssd_put.is_none()
             && self.source_eviction_selection.is_none()
             && self.reclaim.is_none()
             && self.external_get.is_none()
@@ -1983,6 +2331,15 @@ impl OwnerKeyControlState {
             assert_ne!(
                 displaced.put_id, op.put_id,
                 "a matching remote Put generation must join instead of being replaced"
+            );
+        }
+    }
+
+    fn install_local_ssd_put_leader(&mut self, op: Arc<OwnerLocalSsdPutSharedOp>) {
+        if let Some(displaced) = self.local_ssd_put.replace(op.clone()) {
+            assert_ne!(
+                displaced.put_id, op.put_id,
+                "a matching local SSD Put generation must join instead of being replaced"
             );
         }
     }
@@ -2421,6 +2778,7 @@ impl std::ops::Deref for ClientKvApiViewHolder {
 pub struct ClientKvApiInner {
     view: ClientKvApiViewHolder,
     test_spec_config: TestSpecConfig,
+    ssd_storage: Option<Arc<KvSsdStorage>>,
     metrics: OnceLock<Arc<MetricsHandle>>,
 
     /// make sure each remote kv get run in order
@@ -2460,7 +2818,9 @@ pub struct ClientKvApiInner {
         Arc<DashMap<OwnerHotReplicaIdentity, Arc<OwnerHotSelectionDebt>>>,
     owner_hot_counters: Arc<OwnerHotCacheCounters>,
     owner_remote_put_counters: Arc<OwnerRemotePutCounters>,
+    owner_local_ssd_put_counters: Arc<OwnerLocalSsdPutCounters>,
     planned_get_counters: OwnerPlannedGetCounters,
+    ssd_stage_counters: OwnerSsdStageCounters,
     owner_hot_retry_queue: Arc<OwnerHotRetryQueue>,
     owner_hot_eviction_tx: tokio::sync::ampsc::UnboundedSender<OwnerHotEvictionDispatch>,
     owner_hot_eviction_rx:
@@ -2486,6 +2846,12 @@ pub struct ClientKvApiInner {
     planned_external_get_execute_locks: AMapLock<(String, i64, u64)>,
     completed_planned_external_get_executes:
         moka::future::Cache<(String, i64, u64), ExternalExecutePlannedGetResp>,
+    /// Exact `get_id` SSD source operations. RPC retransmits and concurrent
+    /// callers join one disk read plus one payload transfer.
+    ssd_stage_flights: DashMap<u64, Arc<SsdStageSharedOp>>,
+    /// Short-lived terminal replay closes the active-map removal race and
+    /// prevents a lost response from re-reading or re-transferring the value.
+    completed_ssd_stages: moka::future::Cache<u64, CompletedSsdStage>,
     next_external_get_start_handle: AtomicU64,
     /// External holding identities are independent from upstream and resident holder ids.
     next_external_holding_id: AtomicU64,
@@ -2523,6 +2889,7 @@ pub struct ClientKvApiInner {
     rpc_caller_put_append_done: RPCCaller<PutAppendDoneReq>,
     rpc_caller_batch_put_append_done: RPCCaller<BatchPutAppendDoneReq>,
     rpc_caller_batch_evict_owner_source: RPCCaller<BatchEvictOwnerSourceReq>,
+    rpc_caller_batch_publish_owner_ssd: RPCCaller<BatchPublishOwnerSsdReq>,
     rpc_caller_reserve_local_grant: RPCCaller<ReserveLocalGrantReq>,
     rpc_caller_release_local_grant: RPCCaller<ReleaseLocalGrantReq>,
     rpc_caller_delete: RPCCaller<DeleteReq>,
@@ -2531,6 +2898,9 @@ pub struct ClientKvApiInner {
     rpc_caller_get_meta: RPCCaller<GetMetaReq>,
     rpc_caller_allocate_client_lease: RPCCaller<AllocateClientLeaseReq>,
     rpc_caller_client_lease_keepalive: RPCCaller<ClientLeaseKeepaliveReq>,
+    rpc_caller_ssd_stage_read: RPCCaller<SsdStageReadReq>,
+    rpc_caller_ssd_stage_begin: RPCCaller<SsdStageBeginReq>,
+    rpc_caller_ssd_stage_done: RPCCaller<SsdStageDoneReq>,
     rpc_caller_external_put_commit: RPCCaller<ExternalPutCommitReq>,
     rpc_caller_external_put_revoke: RPCCaller<ExternalPutRevokeReq>,
     rpc_caller_resolve_side_transfer_lane: RPCCaller<ResolveSideTransferLaneReq>,
@@ -2549,6 +2919,469 @@ pub struct ClientKvApiInner {
 impl ClientKvApiInner {
     fn view(&self) -> &ClientKvApiView {
         &self.view
+    }
+
+    pub(crate) async fn persist_local_kvs_to_ssd(
+        &self,
+        sources: &[KvSsdPersistSource],
+    ) -> KvResult<Vec<KvResult<Option<crate::kv_ssd_storage::KvSsdPersistGuard>>>> {
+        let Some(store) = self.ssd_storage.as_ref() else {
+            return Ok(sources.iter().map(|_| Ok(None)).collect());
+        };
+        let segment_guard = self.view.client_seg_pool().cpu_mem_read_guard().await?;
+        for source in sources {
+            if !segment_guard.contains_rw_or_ro(source.addr, source.len) {
+                return Err(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "SSD persist source is outside the local segment: key={} put_id=({},{}) addr={:#x} len={}",
+                        source.key, source.put_id.0, source.put_id.1, source.addr, source.len
+                    ),
+                }));
+            }
+        }
+        let results = store.persist_batch_from_addrs(sources).await;
+        drop(segment_guard);
+        Ok(results)
+    }
+
+    pub(crate) async fn copy_local_kvs_for_ssd(
+        &self,
+        sources: &[KvSsdPersistSource],
+    ) -> KvResult<Vec<KvResult<KvSsdPersistCopy>>> {
+        if self.ssd_storage.is_none() {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "local SSD storage is disabled".to_string(),
+            }));
+        }
+        let segment_guard = self.view.client_seg_pool().cpu_mem_read_guard().await?;
+        for source in sources {
+            if !segment_guard.contains_rw_or_ro(source.addr, source.len) {
+                return Err(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "SSD persist source is outside the local segment: key={} put_id=({},{}) addr={:#x} len={}",
+                        source.key, source.put_id.0, source.put_id.1, source.addr, source.len
+                    ),
+                }));
+            }
+        }
+        let copies = KvSsdStorage::copy_batch_from_addrs(sources);
+        drop(segment_guard);
+        Ok(copies)
+    }
+
+    pub(crate) async fn persist_copied_local_kvs_to_ssd(
+        &self,
+        permit: KvSsdPersistBatchPermit,
+        copies: Vec<KvResult<KvSsdPersistCopy>>,
+    ) -> KvResult<Vec<KvResult<Option<crate::kv_ssd_storage::KvSsdPersistGuard>>>> {
+        let Some(store) = self.ssd_storage.as_ref() else {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "local SSD storage is disabled".to_string(),
+            }));
+        };
+        Ok(store
+            .persist_batch_from_copies_with_permit(permit, copies)
+            .await)
+    }
+
+    pub(crate) fn try_acquire_local_ssd_persist_batch(
+        &self,
+        item_count: usize,
+    ) -> KvResult<Option<KvSsdPersistBatchPermit>> {
+        let Some(store) = self.ssd_storage.as_ref() else {
+            return Ok(None);
+        };
+        store.try_acquire_persist_batch(item_count)
+    }
+
+    async fn discard_local_ssd_replica(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+    ) -> bool {
+        let Some(store) = self.ssd_storage.as_ref() else {
+            return false;
+        };
+        store.remove_exact(key, put_id).await
+    }
+
+    async fn begin_ssd_stage(&self, get_id: u64) -> KvResult<bool> {
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let response = self
+            .rpc_caller_ssd_stage_begin
+            .call(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                MsgPack {
+                    serialize_part: SsdStageBeginReq { get_id },
+                    raw_bytes: Vec::new(),
+                },
+                Some(SSD_STAGE_RPC_TIMEOUT),
+                2,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            response.serialize_part.error_code,
+            response.serialize_part.error_json,
+        )?;
+        Ok(response.serialize_part.started)
+    }
+
+    async fn finish_ssd_stage_once(&self, get_id: u64, drop_ssd_source: bool) -> KvResult<()> {
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let response = self
+            .rpc_caller_ssd_stage_done
+            .call(
+                self.view.p2p_module(),
+                master_node_id.into(),
+                MsgPack {
+                    serialize_part: SsdStageDoneReq {
+                        get_id,
+                        drop_ssd_source,
+                    },
+                    raw_bytes: Vec::new(),
+                },
+                Some(SSD_STAGE_RPC_TIMEOUT),
+                2,
+            )
+            .await
+            .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            response.serialize_part.error_code,
+            response.serialize_part.error_json,
+        )
+    }
+
+    async fn finish_ssd_stage_until_acked(&self, get_id: u64, drop_ssd_source: bool) {
+        let mut attempt = 0_u64;
+        let mut backoff = SSD_STAGE_DONE_RETRY_INITIAL_BACKOFF;
+        loop {
+            attempt = attempt.saturating_add(1);
+            match self.finish_ssd_stage_once(get_id, drop_ssd_source).await {
+                Ok(()) => return,
+                Err(err) => {
+                    if attempt == 1 || attempt.is_power_of_two() {
+                        tracing::warn!(
+                            get_id,
+                            drop_ssd_source,
+                            attempt,
+                            retry_delay_ms = backoff.as_millis(),
+                            error = %err,
+                            "SSD StageDone failed; retaining the source flight and retrying"
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = backoff
+                .saturating_mul(2)
+                .min(SSD_STAGE_DONE_RETRY_MAX_BACKOFF);
+        }
+    }
+
+    fn finish_ssd_stage_detached(&self, get_id: u64) {
+        self.ssd_stage_counters
+            .done_detached
+            .fetch_add(1, Ordering::Relaxed);
+        let spawn_view = self.view.clone_view();
+        let task_view = spawn_view.clone();
+        spawn_view.spawn("ssd_stage_done_retry", async move {
+            task_view
+                .client_kv_api()
+                .inner()
+                .finish_ssd_stage_until_acked(get_id, false)
+                .await;
+        });
+    }
+
+    async fn run_ssd_stage_once(&self, req: &SsdStageReadReq) -> SsdStageReadResp {
+        self.ssd_stage_counters
+            .ready_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let ready_started_at = Instant::now();
+        match self.begin_ssd_stage(req.get_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let response = ssd_stage_error_response(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!("SSD stage is not startable: get_id={}", req.get_id),
+                }));
+                self.ssd_stage_counters
+                    .ready_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                self.ssd_stage_counters.ready_duration_us.fetch_add(
+                    u64::try_from(ready_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                return response;
+            }
+            Err(err) => {
+                let response = ssd_stage_error_response(err);
+                self.ssd_stage_counters
+                    .ready_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                self.ssd_stage_counters.ready_duration_us.fetch_add(
+                    u64::try_from(ready_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                return response;
+            }
+        }
+
+        let load_result = async {
+            let Some(store) = self.ssd_storage.as_ref() else {
+                return Err(KvError::Api(ApiError::KeyNotFound {
+                    key: req.key.clone(),
+                }));
+            };
+            let segment_guard = self.view.client_seg_pool().cpu_mem_read_guard().await?;
+            if !segment_guard.contains_rw(req.stage_addr, req.stage_capacity) {
+                return Err(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "SSD stage is outside the local writable segment: get_id={} addr={:#x} capacity={}",
+                        req.get_id, req.stage_addr, req.stage_capacity
+                    ),
+                }));
+            }
+            store
+                .load_into_addr(
+                    &req.key,
+                    req.put_id,
+                    req.stage_addr,
+                    req.len,
+                    req.stage_capacity,
+                )
+                .await?;
+            drop(segment_guard);
+            Ok(())
+        }
+        .await;
+
+        let response = match load_result {
+            Ok(()) => SsdStageReadResp {
+                error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
+                error_json: String::new(),
+            },
+            Err(load_err) => {
+                let stale_ssd_source =
+                    matches!(&load_err, KvError::Api(ApiError::KeyNotFound { .. }));
+                // A failed load never becomes pull-ready. The source owner is
+                // therefore the only side that can safely close the stage. A
+                // true miss also removes the exact stale SSD route.
+                self.finish_ssd_stage_until_acked(req.get_id, stale_ssd_source)
+                    .await;
+                ssd_stage_error_response(load_err)
+            }
+        };
+        self.ssd_stage_counters.ready_duration_us.fetch_add(
+            u64::try_from(ready_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if response.error_code == crate::rpcresp_kvresult_convert::msg_and_error::OK {
+            self.ssd_stage_counters
+                .ready_successes
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.ssd_stage_counters
+                .ready_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        response
+    }
+
+    async fn execute_ssd_stage(&self, req: &SsdStageReadReq) -> SsdStageReadResp {
+        if let Some(completed) = self.completed_ssd_stages.get(&req.get_id).await {
+            return if completed.request == *req {
+                completed.response
+            } else {
+                ssd_stage_request_mismatch_response(&completed.request, req)
+            };
+        }
+
+        let (op, is_leader) = match self.ssd_stage_flights.entry(req.get_id) {
+            DashMapEntry::Occupied(entry) => (entry.get().clone(), false),
+            DashMapEntry::Vacant(entry) => {
+                let op = SsdStageSharedOp::new(req.clone());
+                entry.insert(op.clone());
+                (op, true)
+            }
+        };
+        if op.request != *req {
+            return ssd_stage_request_mismatch_response(&op.request, req);
+        }
+
+        if is_leader {
+            let spawn_view = self.view.clone_view();
+            let task_view = spawn_view.clone();
+            let task_op = op.clone();
+            spawn_view.spawn("ssd_stage_singleflight", async move {
+                let inner = task_view.client_kv_api().inner();
+                let response = inner.run_ssd_stage_once(&task_op.request).await;
+                inner
+                    .ssd_stage_counters
+                    .execute_completions
+                    .fetch_add(1, Ordering::Relaxed);
+                assert!(
+                    task_op.complete(response.clone()),
+                    "one SSD stage flight must publish exactly one terminal result"
+                );
+                inner
+                    .ssd_stage_counters
+                    .terminal_published
+                    .fetch_add(1, Ordering::Relaxed);
+
+                // Wake the foreground RPC before maintaining the replay cache.
+                // The completed flight remains indexed until the cache insert
+                // finishes, so retransmits cannot start a second disk read.
+                let cache_started_at = Instant::now();
+                inner
+                    .completed_ssd_stages
+                    .insert(
+                        task_op.request.get_id,
+                        CompletedSsdStage {
+                            request: task_op.request.clone(),
+                            response: response.clone(),
+                        },
+                    )
+                    .await;
+                inner
+                    .ssd_stage_counters
+                    .terminal_cache_duration_us
+                    .fetch_add(
+                        u64::try_from(cache_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
+                inner
+                    .ssd_stage_counters
+                    .terminal_cache_inserts
+                    .fetch_add(1, Ordering::Relaxed);
+                inner
+                    .ssd_stage_flights
+                    .remove_if(&task_op.request.get_id, |_, current| {
+                        Arc::ptr_eq(current, &task_op)
+                    });
+            });
+        }
+        op.wait().await
+    }
+
+    pub(crate) async fn stage_kv_from_ssd_source(
+        &self,
+        source_node_id: &NodeIDString,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        get_id: u64,
+        stage_addr: u64,
+        stage_capacity: u64,
+        target_addr: u64,
+        len: u64,
+    ) -> KvResult<()> {
+        let req = SsdStageReadReq {
+            key: key.to_string(),
+            put_id,
+            get_id,
+            stage_addr,
+            stage_capacity,
+            len,
+        };
+        let self_node_id = self.view.cluster_manager().get_self_info().id.clone();
+        self.ssd_stage_counters
+            .source_ready_wait_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let ready_wait_started_at = Instant::now();
+        let response_result: KvResult<SsdStageReadResp> = if source_node_id == &self_node_id {
+            Ok(self.execute_ssd_stage(&req).await)
+        } else {
+            self.rpc_caller_ssd_stage_read
+                .call_with_transport_policy(
+                    self.view.p2p_module(),
+                    source_node_id.clone().into(),
+                    MsgPack {
+                        serialize_part: req,
+                        raw_bytes: Vec::new(),
+                    },
+                    Some(SSD_STAGE_RPC_TIMEOUT),
+                    RpcTransportPolicy::ForceTransport,
+                    1,
+                )
+                .await
+                .map(|response| response.serialize_part)
+                .map_err(KvError::from)
+        };
+        self.ssd_stage_counters
+            .source_ready_wait_duration_us
+            .fetch_add(
+                u64::try_from(ready_wait_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        let ready_result = response_result.and_then(|response| {
+            crate::rpcresp_kvresult_convert::try_from_code(response.error_code, response.error_json)
+        });
+        if ready_result.is_ok() {
+            self.ssd_stage_counters
+                .source_ready_wait_successes
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.ssd_stage_counters
+                .source_ready_wait_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        ready_result?;
+
+        self.ssd_stage_counters
+            .target_pull_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let pull_started_at = Instant::now();
+        let peer_id = (source_node_id != &self_node_id).then(|| source_node_id.clone());
+        let transfer_result = self
+            .view
+            .client_transfer_engine()
+            .transfer_data_no_copy(peer_id, true, stage_addr, target_addr, len, None)
+            .await
+            .map(|_| ())
+            .map_err(|err| {
+                KvError::Api(ApiError::Transfer {
+                    from_addr: stage_addr,
+                    to_addr: target_addr,
+                    len,
+                    error: err.to_string(),
+                })
+            });
+        self.ssd_stage_counters.target_pull_duration_us.fetch_add(
+            u64::try_from(pull_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if transfer_result.is_ok() {
+            self.ssd_stage_counters
+                .target_pull_successes
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.ssd_stage_counters
+                .target_pull_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Payload completion is the ownership hand-off point: the target no
+        // longer reads the source stage, so master may release it. Do not put
+        // this control-plane ACK on the foreground Get latency path.
+        self.finish_ssd_stage_detached(get_id);
+        transfer_result
+    }
+
+    pub(crate) fn kv_ssd_storage_usage_snapshot(
+        &self,
+    ) -> Option<crate::kv_ssd_storage::KvSsdStorageDeviceUsage> {
+        self.ssd_storage
+            .as_ref()
+            .map(|store| store.usage_snapshot())
     }
 
     pub(crate) fn track_external_get_flight(&self, op: &Arc<ExternalGetKeySharedOp>) {
@@ -2690,6 +3523,7 @@ impl ClientKvApiInner {
             state.local_puts != 0
                 || state.external_pending_puts != 0
                 || state.remote_put.is_some()
+                || state.local_ssd_put.is_some()
                 || state.external_get.is_some()
                 || state.local_access_fenced()
         });
@@ -3207,6 +4041,140 @@ impl ClientKvApiInner {
         true
     }
 
+    pub(crate) fn begin_owner_local_ssd_put(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        selected_victim: Option<&crate::master_kv_router::msg_pack::OwnerSourceEvictionVictim>,
+    ) -> OwnerLocalSsdPutReservation {
+        if self.ssd_storage.is_none() {
+            return OwnerLocalSsdPutReservation::SourceUnavailable;
+        }
+        let mut controls = self.owner_key_control.lock_key(key);
+
+        if let Some(existing) = controls
+            .get(key)
+            .and_then(|state| state.local_ssd_put.clone())
+        {
+            if existing.put_id == put_id && existing.outcome().is_none() {
+                self.owner_local_ssd_put_counters
+                    .followers
+                    .fetch_add(1, Ordering::Relaxed);
+                return OwnerLocalSsdPutReservation::Follower(existing);
+            }
+            if existing.outcome().is_some() {
+                let state = controls
+                    .get_mut(key)
+                    .expect("terminal local SSD Put control state disappeared");
+                if state
+                    .local_ssd_put
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &existing))
+                {
+                    state.local_ssd_put = None;
+                }
+            }
+        }
+
+        let memory_info = if let Some(victim) = selected_victim {
+            let selected = controls
+                .get(key)
+                .and_then(|state| state.source_eviction_selection.as_ref())
+                .filter(|selection| selection.put_id == put_id)
+                .map(|selection| selection.cached_info.mem_holder.clone());
+            selected.filter(|source| {
+                source.local_reserve_resident_slot_ref().is_some_and(
+                    |(slot_size, grant_id, slot_index)| {
+                        matches!(
+                            &victim.backing,
+                            crate::master_kv_router::msg_pack::OwnerReclaimBacking::CommittedSlot {
+                                grant_id: expected_grant_id,
+                                slot_index: expected_slot_index,
+                                slot_size: expected_slot_size,
+                            } if *expected_grant_id == grant_id
+                                && *expected_slot_index == slot_index
+                                && *expected_slot_size == slot_size
+                        )
+                    },
+                )
+            })
+        } else {
+            if controls
+                .get(key)
+                .is_some_and(|state| state.local_access_fenced())
+            {
+                None
+            } else {
+                self.get_cached_info.get(key).and_then(|info| {
+                    ((info.put_time_ms, info.put_version) == put_id)
+                        .then(|| info.mem_holder.clone())
+                })
+            }
+        };
+        let Some(memory_info) = memory_info else {
+            self.owner_local_ssd_put_counters
+                .source_unavailable
+                .fetch_add(1, Ordering::Relaxed);
+            return OwnerLocalSsdPutReservation::SourceUnavailable;
+        };
+
+        let op = OwnerLocalSsdPutSharedOp::new(key, put_id);
+        controls
+            .entry(key.to_string())
+            .or_default()
+            .install_local_ssd_put_leader(op.clone());
+        self.owner_local_ssd_put_counters
+            .active
+            .fetch_add(1, Ordering::Relaxed);
+        self.owner_local_ssd_put_counters
+            .leaders
+            .fetch_add(1, Ordering::Relaxed);
+        OwnerLocalSsdPutReservation::Leader { op, memory_info }
+    }
+
+    pub(crate) fn finish_owner_local_ssd_put(
+        &self,
+        op: &Arc<OwnerLocalSsdPutSharedOp>,
+        outcome: OwnerLocalSsdPutOutcome,
+    ) -> bool {
+        if !op.complete(outcome) {
+            return false;
+        }
+
+        let mut controls = self.owner_key_control.lock_key(&op.key);
+        let remove_control = if let Some(state) = controls.get_mut(&op.key) {
+            if state
+                .local_ssd_put
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, op))
+            {
+                state.local_ssd_put = None;
+            }
+            state.is_idle()
+        } else {
+            false
+        };
+        if remove_control {
+            controls.remove(&op.key);
+        }
+        drop(controls);
+
+        self.owner_local_ssd_put_counters
+            .active
+            .fetch_sub(1, Ordering::Relaxed);
+        let terminal_counter = match outcome {
+            OwnerLocalSsdPutOutcome::Published => &self.owner_local_ssd_put_counters.published,
+            OwnerLocalSsdPutOutcome::AlreadyPresent => {
+                &self.owner_local_ssd_put_counters.already_present
+            }
+            OwnerLocalSsdPutOutcome::Dropped => &self.owner_local_ssd_put_counters.dropped,
+            OwnerLocalSsdPutOutcome::Obsolete => &self.owner_local_ssd_put_counters.obsolete,
+            OwnerLocalSsdPutOutcome::Failed => &self.owner_local_ssd_put_counters.failed,
+        };
+        terminal_counter.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     pub(crate) fn record_owner_remote_put_transfer(&self) {
         self.owner_remote_put_counters
             .transfers
@@ -3691,7 +4659,11 @@ pub struct ExternalPendingPutCtx {
     pub target_base_addr: u64,
     pub target_offset: u64,
     pub len: u64,
+    /// Original content-selection signal from the caller/adapter.
     pub make_replica_task: bool,
+    /// A remote memory target was pre-reserved, or this local-first path may
+    /// perform normal append-time remote admission.
+    pub remote_replica_admitted: bool,
     pub preferred_sub_cluster: Option<String>,
     pub local_reserve_slot: Option<OwnerLocalReserveSlotRef>,
     pub local_reserve_slot_size: Option<u64>,
@@ -4325,18 +5297,22 @@ mod owner_reclaim_slot_tests {
         OwnerHotRetryQueue, OwnerHotSelectionDebt, OwnerHotSelectionFenceOutcome,
         OwnerKeyControlState, OwnerKeyControlTable, OwnerLocalReserveGrantState,
         OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef, OwnerLocalReserveSlotState,
-        OwnerReclaimRecord, OwnerRemotePutOutcome, OwnerRemotePutReservation,
-        OwnerRemotePutSharedOp, acquire_external_pending_put_fence_for_key,
-        allocate_external_holding_id, build_owner_hot_cache, clone_if_owner_hot_entry_matches,
+        OwnerLocalSsdPutOutcome, OwnerLocalSsdPutSharedOp, OwnerReclaimRecord,
+        OwnerRemotePutOutcome, OwnerRemotePutReservation, OwnerRemotePutSharedOp,
+        acquire_external_pending_put_fence_for_key, allocate_external_holding_id,
+        build_owner_hot_cache, clone_if_owner_hot_entry_matches,
         owner_hot_source_has_active_holders, pin_current_owner_hot_source_from_index,
     };
     use crate::config::TestSpecConfig;
+    use crate::kv_ssd_storage::{KvSsdStorageInit, KvSsdStorageRootLimit, MIN_CAPACITY_BYTES};
     use crate::master_kv_router::msg_pack::{
         BatchOwnerReclaimReq, OwnerReclaimBacking, OwnerReclaimItem, OwnerReclaimItemState,
-        OwnerReclaimPhase, OwnerReclaimReason, OwnerSourceEvictionVictim,
+        OwnerReclaimPhase, OwnerReclaimReason, OwnerSourceEvictionVictim, OwnerSourceSsdPolicy,
     };
     use crate::p2p::msg_pack::MsgPack;
     use parking_lot::Mutex;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Weak};
     use std::time::{Duration, Instant};
@@ -4392,6 +5368,7 @@ mod owner_reclaim_slot_tests {
                 external_pending_puts: 1,
                 external_put: None,
                 remote_put: None,
+                local_ssd_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
@@ -4424,6 +5401,7 @@ mod owner_reclaim_slot_tests {
                 external_pending_puts: 1,
                 external_put: Some(op.clone()),
                 remote_put: None,
+                local_ssd_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
@@ -4463,6 +5441,7 @@ mod owner_reclaim_slot_tests {
                 external_pending_puts: 1,
                 external_put: Some(op.clone()),
                 remote_put: None,
+                local_ssd_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
@@ -4497,6 +5476,7 @@ mod owner_reclaim_slot_tests {
         let api = ClientKvApi::construct(ClientKvApiNewArg {
             test_spec_config: TestSpecConfig::default(),
             owner_hot_cache_capacity_bytes: None,
+            ssd_storage: None,
         })
         .await
         .expect("construct test ClientKvApi");
@@ -4588,6 +5568,7 @@ mod owner_reclaim_slot_tests {
         let api = ClientKvApi::construct(ClientKvApiNewArg {
             test_spec_config: TestSpecConfig::default(),
             owner_hot_cache_capacity_bytes: None,
+            ssd_storage: None,
         })
         .await
         .expect("construct test ClientKvApi");
@@ -4666,6 +5647,136 @@ mod owner_reclaim_slot_tests {
         );
     }
 
+    #[limit_thirdparty::tokio::test]
+    async fn remote_and_local_ssd_flights_publish_independent_terminals() {
+        let key = "parallel-backing-flights";
+        let put_id = (82, 4);
+        let api = ClientKvApi::construct(ClientKvApiNewArg {
+            test_spec_config: TestSpecConfig::default(),
+            owner_hot_cache_capacity_bytes: None,
+            ssd_storage: None,
+        })
+        .await
+        .expect("construct test ClientKvApi");
+        let remote = OwnerRemotePutSharedOp::new(key, put_id, None, false);
+        let local_ssd = OwnerLocalSsdPutSharedOp::new(key, put_id);
+        api.inner().owner_key_control.lock_key(key).insert(
+            key.to_string(),
+            OwnerKeyControlState {
+                remote_put: Some(remote.clone()),
+                local_ssd_put: Some(local_ssd.clone()),
+                ..Default::default()
+            },
+        );
+        api.inner()
+            .owner_remote_put_counters
+            .active
+            .store(1, Ordering::Relaxed);
+        api.inner()
+            .owner_local_ssd_put_counters
+            .active
+            .store(1, Ordering::Relaxed);
+
+        assert!(
+            api.inner()
+                .finish_owner_remote_put(&remote, OwnerRemotePutOutcome::Published)
+        );
+        {
+            let controls = api.inner().owner_key_control.lock_key(key);
+            let state = controls.get(key).expect("SSD flight must remain installed");
+            assert!(state.remote_put.is_none());
+            assert!(
+                state
+                    .local_ssd_put
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &local_ssd))
+            );
+        }
+        assert_eq!(
+            local_ssd.outcome(),
+            None,
+            "remote completion must not publish the SSD terminal"
+        );
+        assert!(
+            api.inner()
+                .finish_owner_local_ssd_put(&local_ssd, OwnerLocalSsdPutOutcome::Published)
+        );
+        assert_eq!(local_ssd.wait().await, OwnerLocalSsdPutOutcome::Published);
+        assert!(
+            api.inner()
+                .owner_key_control
+                .lock_key(key)
+                .get(key)
+                .is_none()
+        );
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn early_ssd_byte_rejection_does_not_install_generation_flight() {
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/mnt/nvme0/mjq_build/push_sglang_fluxon_target"));
+        let root = target.join("kv_ssd_tests").join(format!(
+            "early-pre-admission-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let api = ClientKvApi::construct(ClientKvApiNewArg {
+            test_spec_config: TestSpecConfig::default(),
+            owner_hot_cache_capacity_bytes: None,
+            ssd_storage: Some(KvSsdStorageInit {
+                roots: vec![KvSsdStorageRootLimit {
+                    root_dir: root.clone(),
+                    limit_bytes: MIN_CAPACITY_BYTES,
+                }],
+                write_rate_limit_bytes_per_sec: Some(1),
+                write_burst_bytes: Some(4),
+            }),
+        })
+        .await
+        .expect("construct SSD-enabled test ClientKvApi");
+        let key = "early-pre-admission-drop";
+
+        api.inner()
+            .start_early_owner_local_ssd_puts(vec![(key.to_string(), (83, 1), 8)]);
+
+        let usage = api
+            .inner()
+            .ssd_storage
+            .as_ref()
+            .expect("SSD store")
+            .usage_snapshot();
+        assert_eq!(usage.write_candidate_items, 1);
+        assert_eq!(usage.write_admitted_items, 0);
+        assert_eq!(usage.write_dropped_items, 1);
+        assert_eq!(
+            api.inner()
+                .owner_local_ssd_put_counters
+                .leaders
+                .load(Ordering::Relaxed),
+            0,
+            "a byte-rejected early candidate must never enter singleflight"
+        );
+        assert!(
+            api.inner()
+                .owner_key_control
+                .lock_key(key)
+                .get(key)
+                .is_none(),
+            "a byte-rejected early candidate must not create per-key state"
+        );
+
+        api.inner()
+            .ssd_storage
+            .as_ref()
+            .expect("SSD store")
+            .close()
+            .await
+            .expect("close SSD store");
+        drop(api);
+        fs::remove_dir_all(root).expect("remove SSD test root");
+    }
+
     #[test]
     fn failed_local_slot_release_keeps_key_fence_closed() {
         let controls = controls_with_state(
@@ -4675,6 +5786,7 @@ mod owner_reclaim_slot_tests {
                 external_pending_puts: 1,
                 external_put: None,
                 remote_put: None,
+                local_ssd_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
@@ -4707,6 +5819,7 @@ mod owner_reclaim_slot_tests {
                 external_pending_puts: 1,
                 external_put: None,
                 remote_put: None,
+                local_ssd_put: None,
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
@@ -4760,6 +5873,7 @@ mod owner_reclaim_slot_tests {
                 target_offset: 0,
                 len: 1,
                 make_replica_task: false,
+                remote_replica_admitted: false,
                 preferred_sub_cluster: None,
                 local_reserve_slot: None,
                 local_reserve_slot_size: None,
@@ -5125,6 +6239,8 @@ mod owner_reclaim_slot_tests {
                 key: key.to_string(),
                 put_id: (identity.put_time_ms, identity.put_version),
                 backing: OwnerReclaimBacking::Allocation,
+                ssd_backing_len: None,
+                ssd_policy: OwnerSourceSsdPolicy::Drop,
             },
             101,
         )
@@ -5370,6 +6486,7 @@ mod owner_reclaim_slot_tests {
                 external_pending_puts: 0,
                 external_put: None,
                 remote_put: None,
+                local_ssd_put: None,
                 source_eviction_selection: None,
                 reclaim: Some(OwnerReclaimRecord::Committed(OwnerReclaimItem {
                     key: "fenced".to_string(),
@@ -5687,6 +6804,7 @@ impl ClientKvApiInner {
     }
 
     pub fn runtime_observe_snapshot(&self) -> OwnerRuntimeObserveSnapshot {
+        let ssd = self.kv_ssd_storage_usage_snapshot().unwrap_or_default();
         let mut external_get_holding_bytes = 0u64;
         for entry in self.external_get_holding.inner().iter() {
             external_get_holding_bytes =
@@ -5766,6 +6884,123 @@ impl ClientKvApiInner {
             (free, prepared, pending_visible, committed)
         };
         OwnerRuntimeObserveSnapshot {
+            ssd_capacity_bytes: ssd.capacity_bytes,
+            ssd_used_bytes: ssd.used_bytes,
+            ssd_persist_requests: ssd.persist_requests,
+            ssd_persist_successes: ssd.persist_successes,
+            ssd_persist_failures: ssd.persist_failures,
+            ssd_persist_bytes: ssd.persist_bytes,
+            ssd_persist_duration_us: ssd.persist_duration_us,
+            ssd_persist_batch_requests: ssd.persist_batch_requests,
+            ssd_persist_batch_items: ssd.persist_batch_items,
+            ssd_persist_flush_batches: ssd.persist_flush_batches,
+            ssd_persist_busy_batches: ssd.persist_busy_batches,
+            ssd_persist_admission_skips: ssd.persist_admission_skips,
+            ssd_persist_batch_duration_us: ssd.persist_batch_duration_us,
+            ssd_write_candidate_items: ssd.write_candidate_items,
+            ssd_write_candidate_bytes: ssd.write_candidate_bytes,
+            ssd_write_admitted_items: ssd.write_admitted_items,
+            ssd_write_admitted_bytes: ssd.write_admitted_bytes,
+            ssd_write_dropped_items: ssd.write_dropped_items,
+            ssd_write_dropped_bytes: ssd.write_dropped_bytes,
+            ssd_write_refunded_items: ssd.write_refunded_items,
+            ssd_write_refunded_bytes: ssd.write_refunded_bytes,
+            ssd_load_requests: ssd.load_requests,
+            ssd_load_successes: ssd.load_successes,
+            ssd_load_misses: ssd.load_misses,
+            ssd_load_failures: ssd.load_failures,
+            ssd_load_bytes: ssd.load_bytes,
+            ssd_load_duration_us: ssd.load_duration_us,
+            ssd_memory_hits: ssd.memory_hits,
+            ssd_disk_hits: ssd.disk_hits,
+            ssd_outer_hits: ssd.outer_hits,
+            ssd_removals: ssd.removals,
+            ssd_stage_flights: self.ssd_stage_flights.len() as u64,
+            ssd_stage_terminals: self.completed_ssd_stages.entry_count(),
+            ssd_stage_ready_requests: self
+                .ssd_stage_counters
+                .ready_requests
+                .load(Ordering::Relaxed),
+            ssd_stage_ready_successes: self
+                .ssd_stage_counters
+                .ready_successes
+                .load(Ordering::Relaxed),
+            ssd_stage_ready_failures: self
+                .ssd_stage_counters
+                .ready_failures
+                .load(Ordering::Relaxed),
+            ssd_stage_ready_duration_us: self
+                .ssd_stage_counters
+                .ready_duration_us
+                .load(Ordering::Relaxed),
+            ssd_stage_execute_completions: self
+                .ssd_stage_counters
+                .execute_completions
+                .load(Ordering::Relaxed),
+            ssd_stage_terminal_published: self
+                .ssd_stage_counters
+                .terminal_published
+                .load(Ordering::Relaxed),
+            ssd_stage_terminal_cache_inserts: self
+                .ssd_stage_counters
+                .terminal_cache_inserts
+                .load(Ordering::Relaxed),
+            ssd_stage_terminal_cache_duration_us: self
+                .ssd_stage_counters
+                .terminal_cache_duration_us
+                .load(Ordering::Relaxed),
+            ssd_stage_response_send_attempts: self
+                .ssd_stage_counters
+                .response_send_attempts
+                .load(Ordering::Relaxed),
+            ssd_stage_response_send_successes: self
+                .ssd_stage_counters
+                .response_send_successes
+                .load(Ordering::Relaxed),
+            ssd_stage_response_send_failures: self
+                .ssd_stage_counters
+                .response_send_failures
+                .load(Ordering::Relaxed),
+            ssd_stage_response_send_duration_us: self
+                .ssd_stage_counters
+                .response_send_duration_us
+                .load(Ordering::Relaxed),
+            ssd_source_ready_wait_requests: self
+                .ssd_stage_counters
+                .source_ready_wait_requests
+                .load(Ordering::Relaxed),
+            ssd_source_ready_wait_successes: self
+                .ssd_stage_counters
+                .source_ready_wait_successes
+                .load(Ordering::Relaxed),
+            ssd_source_ready_wait_failures: self
+                .ssd_stage_counters
+                .source_ready_wait_failures
+                .load(Ordering::Relaxed),
+            ssd_source_ready_wait_duration_us: self
+                .ssd_stage_counters
+                .source_ready_wait_duration_us
+                .load(Ordering::Relaxed),
+            ssd_target_pull_requests: self
+                .ssd_stage_counters
+                .target_pull_requests
+                .load(Ordering::Relaxed),
+            ssd_target_pull_successes: self
+                .ssd_stage_counters
+                .target_pull_successes
+                .load(Ordering::Relaxed),
+            ssd_target_pull_failures: self
+                .ssd_stage_counters
+                .target_pull_failures
+                .load(Ordering::Relaxed),
+            ssd_target_pull_duration_us: self
+                .ssd_stage_counters
+                .target_pull_duration_us
+                .load(Ordering::Relaxed),
+            ssd_stage_done_detached: self
+                .ssd_stage_counters
+                .done_detached
+                .load(Ordering::Relaxed),
             external_get_holding_entries: self.external_get_holding.total() as u64,
             external_get_holding_bytes,
             external_get_start_handles: self.external_get_start_registry.len() as u64,
@@ -5851,6 +7086,42 @@ impl ClientKvApiInner {
                 .load(Ordering::Relaxed),
             remote_put_failed: self
                 .owner_remote_put_counters
+                .failed
+                .load(Ordering::Relaxed),
+            local_ssd_put_flights_active: self
+                .owner_local_ssd_put_counters
+                .active
+                .load(Ordering::Relaxed),
+            local_ssd_put_flight_leaders: self
+                .owner_local_ssd_put_counters
+                .leaders
+                .load(Ordering::Relaxed),
+            local_ssd_put_flight_followers: self
+                .owner_local_ssd_put_counters
+                .followers
+                .load(Ordering::Relaxed),
+            local_ssd_put_source_unavailable: self
+                .owner_local_ssd_put_counters
+                .source_unavailable
+                .load(Ordering::Relaxed),
+            local_ssd_put_published: self
+                .owner_local_ssd_put_counters
+                .published
+                .load(Ordering::Relaxed),
+            local_ssd_put_already_present: self
+                .owner_local_ssd_put_counters
+                .already_present
+                .load(Ordering::Relaxed),
+            local_ssd_put_dropped: self
+                .owner_local_ssd_put_counters
+                .dropped
+                .load(Ordering::Relaxed),
+            local_ssd_put_obsolete: self
+                .owner_local_ssd_put_counters
+                .obsolete
+                .load(Ordering::Relaxed),
+            local_ssd_put_failed: self
+                .owner_local_ssd_put_counters
                 .failed
                 .load(Ordering::Relaxed),
             local_reserve_slots_free,
@@ -6436,6 +7707,44 @@ impl ClientKvApi {
                     _ = shutdown_waiter.wait() => break,
                     _ = interval.tick() => {
                         let snapshot = view_task.client_kv_api().inner().runtime_observe_snapshot();
+                        if snapshot.ssd_capacity_bytes > 0 {
+                            tracing::info!(
+                                capacity_bytes = snapshot.ssd_capacity_bytes,
+                                used_bytes = snapshot.ssd_used_bytes,
+                                persist_requests = snapshot.ssd_persist_requests,
+                                persist_successes = snapshot.ssd_persist_successes,
+                                persist_failures = snapshot.ssd_persist_failures,
+                                persist_bytes = snapshot.ssd_persist_bytes,
+                                persist_duration_us = snapshot.ssd_persist_duration_us,
+                                persist_batch_requests = snapshot.ssd_persist_batch_requests,
+                                persist_batch_items = snapshot.ssd_persist_batch_items,
+                                persist_flush_batches = snapshot.ssd_persist_flush_batches,
+                                persist_busy_batches = snapshot.ssd_persist_busy_batches,
+                                persist_admission_skips = snapshot.ssd_persist_admission_skips,
+                                persist_batch_duration_us = snapshot.ssd_persist_batch_duration_us,
+                                write_candidate_items = snapshot.ssd_write_candidate_items,
+                                write_candidate_bytes = snapshot.ssd_write_candidate_bytes,
+                                write_admitted_items = snapshot.ssd_write_admitted_items,
+                                write_admitted_bytes = snapshot.ssd_write_admitted_bytes,
+                                write_dropped_items = snapshot.ssd_write_dropped_items,
+                                write_dropped_bytes = snapshot.ssd_write_dropped_bytes,
+                                write_refunded_items = snapshot.ssd_write_refunded_items,
+                                write_refunded_bytes = snapshot.ssd_write_refunded_bytes,
+                                load_requests = snapshot.ssd_load_requests,
+                                load_successes = snapshot.ssd_load_successes,
+                                load_misses = snapshot.ssd_load_misses,
+                                load_failures = snapshot.ssd_load_failures,
+                                load_bytes = snapshot.ssd_load_bytes,
+                                load_duration_us = snapshot.ssd_load_duration_us,
+                                memory_hits = snapshot.ssd_memory_hits,
+                                disk_hits = snapshot.ssd_disk_hits,
+                                outer_hits = snapshot.ssd_outer_hits,
+                                removals = snapshot.ssd_removals,
+                                active_stage_flights = snapshot.ssd_stage_flights,
+                                retained_stage_terminals = snapshot.ssd_stage_terminals,
+                                "owner KV SSD storage snapshot"
+                            );
+                        }
                         let metrics = view_task.metric_reporter().metrics();
                         metrics.set_kv_holding_entries(
                             "owner_external_get_holding",
@@ -6464,6 +7773,27 @@ impl ClientKvApi {
                             planned_cpu_local_items = snapshot.planned_cpu_get_local_items,
                             planned_cpu_leader_items = snapshot.planned_cpu_get_leader_items,
                             planned_cpu_follower_items = snapshot.planned_cpu_get_follower_items,
+                            ssd_stage_ready_requests = snapshot.ssd_stage_ready_requests,
+                            ssd_stage_ready_successes = snapshot.ssd_stage_ready_successes,
+                            ssd_stage_ready_failures = snapshot.ssd_stage_ready_failures,
+                            ssd_stage_ready_duration_us = snapshot.ssd_stage_ready_duration_us,
+                            ssd_stage_execute_completions = snapshot.ssd_stage_execute_completions,
+                            ssd_stage_terminal_published = snapshot.ssd_stage_terminal_published,
+                            ssd_stage_terminal_cache_inserts = snapshot.ssd_stage_terminal_cache_inserts,
+                            ssd_stage_terminal_cache_duration_us = snapshot.ssd_stage_terminal_cache_duration_us,
+                            ssd_stage_response_send_attempts = snapshot.ssd_stage_response_send_attempts,
+                            ssd_stage_response_send_successes = snapshot.ssd_stage_response_send_successes,
+                            ssd_stage_response_send_failures = snapshot.ssd_stage_response_send_failures,
+                            ssd_stage_response_send_duration_us = snapshot.ssd_stage_response_send_duration_us,
+                            ssd_source_ready_wait_requests = snapshot.ssd_source_ready_wait_requests,
+                            ssd_source_ready_wait_successes = snapshot.ssd_source_ready_wait_successes,
+                            ssd_source_ready_wait_failures = snapshot.ssd_source_ready_wait_failures,
+                            ssd_source_ready_wait_duration_us = snapshot.ssd_source_ready_wait_duration_us,
+                            ssd_target_pull_requests = snapshot.ssd_target_pull_requests,
+                            ssd_target_pull_successes = snapshot.ssd_target_pull_successes,
+                            ssd_target_pull_failures = snapshot.ssd_target_pull_failures,
+                            ssd_target_pull_duration_us = snapshot.ssd_target_pull_duration_us,
+                            ssd_stage_done_detached = snapshot.ssd_stage_done_detached,
                             reserve_free = snapshot.local_reserve_slots_free,
                             reserve_prepared = snapshot.local_reserve_slots_prepared,
                             reserve_pending_visible = snapshot.local_reserve_slots_pending_visible,
@@ -6484,6 +7814,18 @@ impl ClientKvApi {
                             obsolete = snapshot.remote_put_obsolete,
                             failed = snapshot.remote_put_failed,
                             "owner unified remote Put flight snapshot"
+                        );
+                        tracing::info!(
+                            active = snapshot.local_ssd_put_flights_active,
+                            leaders = snapshot.local_ssd_put_flight_leaders,
+                            followers = snapshot.local_ssd_put_flight_followers,
+                            source_unavailable = snapshot.local_ssd_put_source_unavailable,
+                            published = snapshot.local_ssd_put_published,
+                            already_present = snapshot.local_ssd_put_already_present,
+                            dropped = snapshot.local_ssd_put_dropped,
+                            obsolete = snapshot.local_ssd_put_obsolete,
+                            failed = snapshot.local_ssd_put_failed,
+                            "owner local SSD Put flight snapshot"
                         );
                         if snapshot.hot_cache_capacity_bytes > 0 {
                             tracing::info!(
@@ -6529,7 +7871,12 @@ impl ClientKvApi {
         let ClientKvApiNewArg {
             test_spec_config,
             owner_hot_cache_capacity_bytes,
+            ssd_storage,
         } = arg;
+        let ssd_storage = match ssd_storage {
+            Some(init) => Some(Arc::new(KvSsdStorage::new(init).await?)),
+            None => None,
+        };
         let (owner_local_publish_tx, owner_local_publish_rx) =
             tokio::sync::ampsc::channel(OWNER_LOCAL_PUBLISH_QUEUE_CAPACITY);
         // The Moka eviction listener is synchronous and must never block while
@@ -6544,6 +7891,7 @@ impl ClientKvApi {
         let owner_source_eviction_selected = Arc::new(DashMap::new());
         let owner_hot_counters = Arc::new(OwnerHotCacheCounters::default());
         let owner_remote_put_counters = Arc::new(OwnerRemotePutCounters::default());
+        let owner_local_ssd_put_counters = Arc::new(OwnerLocalSsdPutCounters::default());
         let owner_hot_retry_queue = Arc::new(OwnerHotRetryQueue::new(owner_hot_counters.clone()));
         let owner_hot_cache = owner_hot_cache_capacity_bytes.map(|capacity_bytes| {
             build_owner_hot_cache(
@@ -6557,6 +7905,7 @@ impl ClientKvApi {
         let inner = ClientKvApiInner {
             view: ClientKvApiViewHolder::new(),
             test_spec_config,
+            ssd_storage,
             metrics: OnceLock::new(),
             all_memholder_refcount: OnceLock::new(),
             get_remote_kv_lock: AMapLock::new(Duration::from_secs(60)),
@@ -6576,7 +7925,9 @@ impl ClientKvApi {
             owner_source_eviction_selected,
             owner_hot_counters,
             owner_remote_put_counters,
+            owner_local_ssd_put_counters,
             planned_get_counters: OwnerPlannedGetCounters::default(),
+            ssd_stage_counters: OwnerSsdStageCounters::default(),
             owner_hot_retry_queue,
             owner_hot_eviction_tx,
             owner_hot_eviction_rx: Mutex::new(Some(owner_hot_eviction_rx)),
@@ -6597,6 +7948,10 @@ impl ClientKvApi {
             planned_external_get_execute_locks: AMapLock::new(Duration::from_secs(120)),
             completed_planned_external_get_executes: moka::future::Cache::builder()
                 .time_to_live(Duration::from_secs(120))
+                .build(),
+            ssd_stage_flights: DashMap::new(),
+            completed_ssd_stages: moka::future::Cache::builder()
+                .time_to_live(SSD_STAGE_TERMINAL_TTL)
                 .build(),
             next_external_get_start_handle: AtomicU64::new(1),
             next_external_holding_id: AtomicU64::new(1),
@@ -6628,6 +7983,7 @@ impl ClientKvApi {
             rpc_caller_put_append_done: RPCCaller::new(),
             rpc_caller_batch_put_append_done: RPCCaller::new(),
             rpc_caller_batch_evict_owner_source: RPCCaller::new(),
+            rpc_caller_batch_publish_owner_ssd: RPCCaller::new(),
             rpc_caller_reserve_local_grant: RPCCaller::new(),
             rpc_caller_release_local_grant: RPCCaller::new(),
             rpc_caller_delete: RPCCaller::new(),
@@ -6636,6 +7992,9 @@ impl ClientKvApi {
             rpc_caller_get_meta: RPCCaller::new(),
             rpc_caller_allocate_client_lease: RPCCaller::new(),
             rpc_caller_client_lease_keepalive: RPCCaller::new(),
+            rpc_caller_ssd_stage_read: RPCCaller::new(),
+            rpc_caller_ssd_stage_begin: RPCCaller::new(),
+            rpc_caller_ssd_stage_done: RPCCaller::new(),
             rpc_caller_external_put_commit: RPCCaller::new(),
             rpc_caller_external_put_revoke: RPCCaller::new(),
             rpc_caller_resolve_side_transfer_lane: RPCCaller::new(),
@@ -6709,6 +8068,9 @@ impl ClientKvApi {
             .rpc_caller_batch_evict_owner_source
             .regist(inner.view.p2p_module());
         inner
+            .rpc_caller_batch_publish_owner_ssd
+            .regist(inner.view.p2p_module());
+        inner
             .rpc_caller_reserve_local_grant
             .regist(inner.view.p2p_module());
         inner
@@ -6722,6 +8084,15 @@ impl ClientKvApi {
             .rpc_caller_batch_is_exist
             .regist(inner.view.p2p_module());
         inner.rpc_caller_get_meta.regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_ssd_stage_read
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_ssd_stage_begin
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_ssd_stage_done
+            .regist(inner.view.p2p_module());
         inner
             .rpc_caller_external_put_commit
             .regist(inner.view.p2p_module());
@@ -6742,6 +8113,53 @@ impl ClientKvApi {
         spawn_owner_slot_pressure_actor(inner.view.clone_view());
         external_api::spawn_external_get_start_handle_sweeper(inner.view.clone_view());
         self.spawn_runtime_observe_reporter();
+
+        let view_ssd = inner.view.clone_view();
+        RPCHandler::<SsdStageReadReq>::new().regist(inner.view.p2p_module(), move |resp, msg| {
+            let view = view_ssd.clone();
+            let task_view = view.clone();
+            view.spawn("rpc_ssd_stage_read", async move {
+                let get_id = msg.serialize_part.get_id;
+                let peer = resp.node_id();
+                let task_id = resp.task_id();
+                let result = handle_ssd_stage_read(&task_view, &msg).await;
+                let inner = task_view.client_kv_api().inner();
+                inner
+                    .ssd_stage_counters
+                    .response_send_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                let send_started_at = Instant::now();
+                let send_result = resp
+                    .send_resp_with_transport_policy(result, RpcTransportPolicy::ForceTransport)
+                    .await;
+                inner
+                    .ssd_stage_counters
+                    .response_send_duration_us
+                    .fetch_add(
+                        u64::try_from(send_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
+                if let Err(err) = send_result {
+                    inner
+                        .ssd_stage_counters
+                        .response_send_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        get_id,
+                        peer = %peer,
+                        task_id,
+                        error = ?err,
+                        "SSD stage-ready response send failed"
+                    );
+                } else {
+                    inner
+                        .ssd_stage_counters
+                        .response_send_successes
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            Ok(())
+        });
 
         // External RPC handlers
         let view_ext = inner.view.clone_view();
@@ -7357,6 +8775,9 @@ impl LogicalModule for ClientKvApi {
     }
     async fn shutdown(&self) -> Result<(), Self::Error> {
         tracing::info!("ClientKvApi shutting down...");
+        if let Some(store) = self.0.ssd_storage.as_ref() {
+            store.close().await?;
+        }
         tracing::info!(
             "ClientKvApi final: holding_len={} , cache_len={}",
             self.0.get_holding_len(),
