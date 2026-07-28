@@ -6,16 +6,17 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use equivalent::Equivalent;
 use fluxon_commu::p2p::RpcTransportPolicy;
+use fluxon_commu::{NodeRole, ShareGroupOwnerRef, share_group_owner_ref_from_metadata};
 use hashbrown::HashMap;
 use parking_lot::{Condvar, Mutex, RwLock};
-use prost::bytes::{Bytes, BytesMut};
+use prost::bytes::{Buf, Bytes, BytesMut};
 use sha2::{Digest, Sha256};
 
 use fluxon_framework_compiled::shutdown::ViewShutdownExt;
@@ -29,6 +30,7 @@ use fluxon_fs_core::s3_gateway::{
 };
 use fluxon_kv::Framework as KvFramework;
 use fluxon_kv::KvClientTrait;
+use fluxon_kv::client_kv_api::{PutOptionalArg, PutOptionalArgs};
 use fluxon_kv::cluster_manager::NodeID;
 use fluxon_kv::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult};
 use fluxon_kv::user_api::FluxonUserApi;
@@ -37,7 +39,12 @@ use fluxon_kv::user_api::{
     USER_RPC_DEFAULT_TIMEOUT_MS, decode_flat_dict_bytes, encode_flat_dict_bytes,
 };
 use fluxon_kv::user_rpc::user_rpc_call;
-use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc};
+use fluxon_util::lease_manager::{
+    LeaseKeepaliveActor, LeaseKeepaliveFailure, LeaseKeepaliveFailurePolicy,
+    LeaseKeepaliveOperation, LeaseKeepaliveRegistration,
+};
+use fluxon_util::notify_state;
+use tokio::sync::{Mutex as TokioMutex, Notify, mpsc as tokio_mpsc};
 
 use crate::cache_controller::{CacheController, PieceKey, StagePieceFn, StagePieceRangeFn};
 use crate::config::{
@@ -56,8 +63,8 @@ use crate::retry::{
     BackoffConfig, DEFAULT_WARN_INTERVAL_SECS, WarnConfig, next_backoff, should_warn,
 };
 use crate::write_session_rpc::{
-    self, FsAbortWriteSessionReq, FsCloseWriteSessionReq, FsOpenWriteSessionReq,
-    FsWriteSessionChunkReq, FsWriteSessionDataAck, FsWriteSessionDataFrame,
+    self, FsAbortWriteSessionReq, FsCloseWriteSessionReq, FsFinalizeWriteSessionReq,
+    FsOpenWriteSessionReq, FsWriteSessionChunkReq, FsWriteSessionDataAck, FsWriteSessionDataFrame,
 };
 use fluxon_util::run_async_from_sync::{SyncAsyncBridge, spawn_blocking_allow_sync_async_bridge};
 
@@ -67,11 +74,20 @@ pub const REMOTE_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const REMOTE_WRITE_SESSION_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const REMOTE_WRITE_SESSION_SEND_BATCH_MAX_FRAMES: usize = 4;
 fn remote_write_session_peer_sender_workers() -> usize {
-    4
+    8
 }
 const REMOTE_WRITE_SESSION_RPC_TIMEOUT_MAX_MS: u64 = 240_000;
 const REMOTE_WRITE_SESSION_RPC_TIMEOUT_PER_MIB_MS: u64 = 1_000;
 const REMOTE_WRITE_SESSION_CONTROL_RPC_TIMEOUT_MS: u64 = 240_000;
+const REMOTE_WRITE_SESSION_KV_LEASE_TTL_SECS: u64 = 180;
+const REMOTE_WRITE_SESSION_KV_LEASE_KEEPALIVE_SECS: u64 =
+    REMOTE_WRITE_SESSION_KV_LEASE_TTL_SECS / 3;
+const REMOTE_WRITE_SESSION_KV_LEASE_KEEPALIVE_JITTER_MS: u64 = 5_000;
+const REMOTE_WRITE_SESSION_KV_LEASE_KEEPALIVE_MAX_CONCURRENCY: usize = 32;
+const REMOTE_WRITE_SESSION_KV_OPERATION_TIMEOUT_SECS: u64 = 10;
+const REMOTE_WRITE_SESSION_KV_CLEANUP_TIMEOUT_MS: u64 = 1_000;
+const REMOTE_WRITE_SESSION_SOURCE_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+const KV_SSD_STORAGE_METADATA_KEY: &str = "kv_ssd_storage";
 const REMOTE_INLINE_FD_CACHE_MAX_RESIDENT_BYTES: usize = 64 * 1024 * 1024;
 const REMOTE_INLINE_FD_CACHE_MAX_ENTRIES: usize = 256;
 
@@ -225,6 +241,9 @@ pub struct FluxonFsAgent {
     remote_write_sessions_by_remote:
         Arc<RwLock<HashMap<String, Arc<RemoteWriteSessionClientEntry>>>>,
     remote_write_peer_senders: RwLock<HashMap<String, Arc<RemoteWriteSessionPeerSender>>>,
+    remote_write_session_source: Arc<RemoteWriteSessionSourceLifecycle>,
+    remote_write_session_kv_keepalive: Arc<LeaseKeepaliveActor<u64>>,
+    remote_write_session_shared_kv_lease: Arc<RemoteWriteSessionSharedKvLeaseManager>,
     remote_write_session_next_id: AtomicU64,
     remote_open_cache_resident_bytes: AtomicUsize,
     remote_open_cache_access_seq: AtomicU64,
@@ -269,8 +288,23 @@ struct RemoteWriteSessionClientSubmit {
 struct RemoteWriteSessionClientFrame {
     seq_no: u64,
     offset: i64,
-    data: Bytes,
+    submit_base_seq_no: u64,
+    submit_data: Bytes,
+    data_start: usize,
+    data_end: usize,
     enqueued_at: Instant,
+}
+
+impl RemoteWriteSessionClientFrame {
+    fn data_len(&self) -> usize {
+        self.data_end
+            .checked_sub(self.data_start)
+            .expect("write-session frame range must be ordered")
+    }
+
+    fn data(&self) -> Bytes {
+        self.submit_data.slice(self.data_start..self.data_end)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -284,10 +318,64 @@ struct RemoteWriteSessionClientPendingBatch {
 struct RemoteWriteSessionClientSendBatch {
     seq_no: u64,
     offset: i64,
+    data: Bytes,
     data_parts: Vec<Bytes>,
+    part_lengths: Vec<u32>,
     frame_count: u64,
     total_bytes: usize,
     enqueued_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteWriteSessionKvSharedConfig {
+    owner: ShareGroupOwnerRef,
+    owner_sub_cluster: String,
+    lease_id: u64,
+    lease_generation: u64,
+    source_node_start_time: i64,
+    target_node_start_time: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteWriteSessionKvSharedCandidate {
+    owner: ShareGroupOwnerRef,
+    owner_sub_cluster: String,
+    source_node_start_time: i64,
+    target_node_start_time: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemoteWriteSessionSharedKvLeaseIdentity {
+    lease_id: u64,
+    generation: u64,
+}
+
+type RemoteWriteSessionSharedKvLeaseAllocate =
+    Arc<dyn Fn() -> Result<u64, String> + Send + Sync + 'static>;
+
+enum RemoteWriteSessionSharedKvLeaseState {
+    Vacant,
+    Allocating {
+        generation: u64,
+    },
+    Active {
+        identity: RemoteWriteSessionSharedKvLeaseIdentity,
+        registration: LeaseKeepaliveRegistration<u64>,
+    },
+    Failed {
+        detail: String,
+    },
+    Closed,
+}
+
+struct RemoteWriteSessionSharedKvLeaseManager {
+    actor: Arc<LeaseKeepaliveActor<u64>>,
+    keepalive: LeaseKeepaliveOperation<u64>,
+    allocate: RemoteWriteSessionSharedKvLeaseAllocate,
+    sessions: Weak<RwLock<HashMap<String, Arc<RemoteWriteSessionClientEntry>>>>,
+    state: Mutex<RemoteWriteSessionSharedKvLeaseState>,
+    changed: Condvar,
+    next_generation: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -303,6 +391,232 @@ struct RemoteWriteSessionPeerSender {
 }
 
 #[derive(Debug)]
+struct RemoteWriteSessionTrackedTask {
+    kind: &'static str,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct RemoteWriteSessionSourceLifecycle {
+    stop: RemoteWriteSessionStopSignal,
+    in_flight_operations: Mutex<usize>,
+    operations_drained: Notify,
+    tasks: Mutex<Vec<RemoteWriteSessionTrackedTask>>,
+}
+
+struct RemoteWriteSessionSourceOperationGuard {
+    source: Arc<RemoteWriteSessionSourceLifecycle>,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteWriteSessionStopSignal {
+    stopped: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl RemoteWriteSessionStopSignal {
+    fn new() -> Self {
+        Self {
+            stopped: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    fn stop(&self) {
+        if !self.stopped.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn wait_stopped(&self) {
+        notify_state::wait_until(&self.notify, || self.is_stopped()).await;
+    }
+}
+
+impl RemoteWriteSessionSourceLifecycle {
+    fn new() -> Self {
+        Self {
+            stop: RemoteWriteSessionStopSignal::new(),
+            in_flight_operations: Mutex::new(0),
+            operations_drained: Notify::new(),
+            tasks: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn is_accepting(&self) -> bool {
+        !self.stop.is_stopped()
+    }
+
+    fn try_enter_operation(self: &Arc<Self>) -> Option<RemoteWriteSessionSourceOperationGuard> {
+        let mut in_flight = self.in_flight_operations.lock();
+        if self.stop.is_stopped() {
+            return None;
+        }
+        *in_flight = in_flight
+            .checked_add(1)
+            .expect("write-session source operation counter overflow");
+        Some(RemoteWriteSessionSourceOperationGuard {
+            source: self.clone(),
+        })
+    }
+
+    async fn wait_for_operations(&self, timeout_duration: Duration) -> Result<(), String> {
+        tokio::time::timeout(
+            timeout_duration,
+            notify_state::wait_until(&self.operations_drained, || {
+                *self.in_flight_operations.lock() == 0
+            }),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "write-session source operations did not drain within {}s",
+                timeout_duration.as_secs_f64()
+            )
+        })
+    }
+
+    fn spawn_on<F, Fut>(
+        &self,
+        rt_handle: &tokio::runtime::Handle,
+        kind: &'static str,
+        build: F,
+    ) -> bool
+    where
+        F: FnOnce(RemoteWriteSessionStopSignal) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = self.tasks.lock();
+        if !self.is_accepting() {
+            return false;
+        }
+        tasks.retain(|task| !task.handle.is_finished());
+        let handle = rt_handle.spawn(build(self.stop.clone()));
+        tasks.push(RemoteWriteSessionTrackedTask { kind, handle });
+        true
+    }
+
+    fn spawn_current<F, Fut>(&self, kind: &'static str, build: F) -> bool
+    where
+        F: FnOnce(RemoteWriteSessionStopSignal) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = self.tasks.lock();
+        if !self.is_accepting() {
+            return false;
+        }
+        tasks.retain(|task| !task.handle.is_finished());
+        let handle = tokio::spawn(build(self.stop.clone()));
+        tasks.push(RemoteWriteSessionTrackedTask { kind, handle });
+        true
+    }
+
+    fn stop(&self) {
+        self.stop.stop();
+    }
+
+    fn take_tasks(&self) -> Vec<RemoteWriteSessionTrackedTask> {
+        std::mem::take(&mut *self.tasks.lock())
+    }
+
+    fn stop_and_abort(&self) {
+        self.stop();
+        // Keep the handles registered after requesting cancellation. A later graceful
+        // shutdown must still await them before it can claim a completion barrier.
+        for task in self.tasks.lock().iter() {
+            task.handle.abort();
+        }
+    }
+
+    async fn stop_join_and_abort(&self, timeout_duration: Duration) -> Result<(), String> {
+        self.stop();
+        let tasks = self.take_tasks();
+        let deadline = Instant::now() + timeout_duration;
+        let mut remaining_tasks = Vec::new();
+        let mut tasks = tasks.into_iter();
+        while let Some(mut task) = tasks.next() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                remaining_tasks.push(task);
+                remaining_tasks.extend(tasks);
+                break;
+            }
+            match tokio::time::timeout(remaining, &mut task.handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) if err.is_cancelled() => {}
+                Ok(Err(err)) => tracing::warn!(
+                    "write-session source background task failed during shutdown: kind={} err={}",
+                    task.kind,
+                    err
+                ),
+                Err(_) => {
+                    remaining_tasks.push(task);
+                    remaining_tasks.extend(tasks);
+                    break;
+                }
+            }
+        }
+        if remaining_tasks.is_empty() {
+            return Ok(());
+        }
+        tracing::warn!(
+            "write-session source background task shutdown timed out after {}s; aborting remaining tasks",
+            timeout_duration.as_secs_f64()
+        );
+        for task in &remaining_tasks {
+            task.handle.abort();
+        }
+
+        // Successful shutdown is a completion barrier. Await every aborted handle so all task
+        // futures (including KV holders) are dropped before the KV framework can be released.
+        let abort_deadline = Instant::now() + timeout_duration;
+        for mut task in remaining_tasks {
+            let remaining = abort_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "write-session source task abort did not complete: kind={}",
+                    task.kind
+                ));
+            }
+            match tokio::time::timeout(remaining, &mut task.handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) if err.is_cancelled() => {}
+                Ok(Err(err)) => tracing::warn!(
+                    "write-session source task failed while aborting: kind={} err={}",
+                    task.kind,
+                    err
+                ),
+                Err(_) => {
+                    return Err(format!(
+                        "write-session source task abort timed out: kind={}",
+                        task.kind
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RemoteWriteSessionSourceOperationGuard {
+    fn drop(&mut self) {
+        let drained = {
+            let mut in_flight = self.source.in_flight_operations.lock();
+            assert!(*in_flight > 0, "write-session source operation underflow");
+            *in_flight -= 1;
+            *in_flight == 0
+        };
+        if drained {
+            self.source.operations_drained.notify_waiters();
+        }
+    }
+}
+
+#[derive(Debug)]
 struct RemoteWriteSessionClientEntry {
     node_id: String,
     remote_session_id: String,
@@ -310,8 +624,255 @@ struct RemoteWriteSessionClientEntry {
     relpath_rpc: String,
     fs_rpc_token: Option<String>,
     allow_s3_internal_multipart: bool,
-    peer_sender: Arc<RemoteWriteSessionPeerSender>,
+    kv_shared: Option<RemoteWriteSessionKvSharedConfig>,
+    kv_shared_enabled: AtomicBool,
+    peer_sender: Weak<RemoteWriteSessionPeerSender>,
     state: Arc<RemoteWriteSessionClientState>,
+}
+
+impl RemoteWriteSessionClientEntry {
+    fn active_kv_shared(&self) -> Option<RemoteWriteSessionKvSharedConfig> {
+        if !self.kv_shared_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        self.kv_shared.clone()
+    }
+
+    fn downgrade_kv_shared(&self) {
+        self.kv_shared_enabled.store(false, Ordering::Release);
+    }
+
+    fn downgrade_matching_kv_shared(
+        &self,
+        identity: RemoteWriteSessionSharedKvLeaseIdentity,
+    ) -> bool {
+        let matches = self.kv_shared.as_ref().is_some_and(|config| {
+            config.lease_id == identity.lease_id && config.lease_generation == identity.generation
+        });
+        matches && self.kv_shared_enabled.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl RemoteWriteSessionSharedKvLeaseManager {
+    fn new(
+        actor: Arc<LeaseKeepaliveActor<u64>>,
+        keepalive: LeaseKeepaliveOperation<u64>,
+        allocate: RemoteWriteSessionSharedKvLeaseAllocate,
+        sessions: Weak<RwLock<HashMap<String, Arc<RemoteWriteSessionClientEntry>>>>,
+    ) -> Self {
+        Self {
+            actor,
+            keepalive,
+            allocate,
+            sessions,
+            state: Mutex::new(RemoteWriteSessionSharedKvLeaseState::Vacant),
+            changed: Condvar::new(),
+            next_generation: AtomicU64::new(1),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> Result<RemoteWriteSessionSharedKvLeaseIdentity, String> {
+        let generation = loop {
+            let mut state = self.state.lock();
+            match &*state {
+                RemoteWriteSessionSharedKvLeaseState::Active { identity, .. } => {
+                    return Ok(*identity);
+                }
+                RemoteWriteSessionSharedKvLeaseState::Closed => {
+                    return Err("write-session shared KV lease manager is closed".to_string());
+                }
+                RemoteWriteSessionSharedKvLeaseState::Failed { detail } => {
+                    return Err(detail.clone());
+                }
+                RemoteWriteSessionSharedKvLeaseState::Allocating { .. } => {
+                    self.changed.wait(&mut state);
+                }
+                RemoteWriteSessionSharedKvLeaseState::Vacant => {
+                    let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                    *state = RemoteWriteSessionSharedKvLeaseState::Allocating { generation };
+                    break generation;
+                }
+            }
+        };
+
+        let lease_id = match (self.allocate)() {
+            Ok(lease_id) => lease_id,
+            Err(err) => {
+                self.finish_failed_allocation(generation, err.clone());
+                return Err(err);
+            }
+        };
+        let identity = RemoteWriteSessionSharedKvLeaseIdentity {
+            lease_id,
+            generation,
+        };
+        let weak_self = Arc::downgrade(self);
+        let on_failure = Arc::new(move |failure| {
+            if let Some(manager) = weak_self.upgrade() {
+                manager.handle_keepalive_failure(identity, failure);
+            }
+        });
+        let registration = match self.actor.register(
+            lease_id,
+            self.keepalive.clone(),
+            LeaseKeepaliveFailurePolicy::Unregister,
+            on_failure,
+        ) {
+            Ok(registration) => registration,
+            Err(err) => {
+                let detail = format!(
+                    "register shared write-session KV lease keepalive failed: {}",
+                    err
+                );
+                self.finish_failed_allocation(generation, detail.clone());
+                return Err(detail);
+            }
+        };
+
+        let mut state = self.state.lock();
+        let can_publish = matches!(
+            &*state,
+            RemoteWriteSessionSharedKvLeaseState::Allocating {
+                generation: current_generation
+            } if *current_generation == generation
+        );
+        if !can_publish {
+            drop(state);
+            drop(registration);
+            return Err(
+                "write-session shared KV lease manager closed during allocation".to_string(),
+            );
+        }
+        *state = RemoteWriteSessionSharedKvLeaseState::Active {
+            identity,
+            registration,
+        };
+        drop(state);
+        self.changed.notify_all();
+        Ok(identity)
+    }
+
+    fn finish_failed_allocation(&self, generation: u64, detail: String) {
+        let mut state = self.state.lock();
+        if matches!(
+            &*state,
+            RemoteWriteSessionSharedKvLeaseState::Allocating {
+                generation: current_generation
+            } if *current_generation == generation
+        ) {
+            *state = RemoteWriteSessionSharedKvLeaseState::Failed { detail };
+        }
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn is_current(&self, identity: RemoteWriteSessionSharedKvLeaseIdentity) -> bool {
+        matches!(
+            &*self.state.lock(),
+            RemoteWriteSessionSharedKvLeaseState::Active {
+                identity: current,
+                ..
+            } if *current == identity
+        )
+    }
+
+    fn handle_keepalive_failure(
+        &self,
+        identity: RemoteWriteSessionSharedKvLeaseIdentity,
+        failure: LeaseKeepaliveFailure,
+    ) {
+        let failure_detail = match &failure {
+            LeaseKeepaliveFailure::Operation(err) => {
+                format!("shared write-session KV lease keepalive failed: {}", err)
+            }
+            LeaseKeepaliveFailure::Timeout { timeout } => format!(
+                "shared write-session KV lease keepalive timed out after {}s",
+                timeout.as_secs_f64()
+            ),
+        };
+        let registration = {
+            let mut state = self.state.lock();
+            let matches_current = matches!(
+                &*state,
+                RemoteWriteSessionSharedKvLeaseState::Active {
+                    identity: current,
+                    ..
+                } if *current == identity
+            );
+            if !matches_current {
+                return;
+            }
+            let RemoteWriteSessionSharedKvLeaseState::Active { registration, .. } =
+                std::mem::replace(
+                    &mut *state,
+                    RemoteWriteSessionSharedKvLeaseState::Failed {
+                        detail: failure_detail,
+                    },
+                )
+            else {
+                unreachable!("matching shared KV lease state must be active");
+            };
+            registration
+        };
+        drop(registration);
+        self.changed.notify_all();
+
+        let sessions = self
+            .sessions
+            .upgrade()
+            .map(|sessions| sessions.read().values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let downgraded_sessions = sessions
+            .iter()
+            .filter(|session| session.downgrade_matching_kv_shared(identity))
+            .count();
+        match failure {
+            LeaseKeepaliveFailure::Operation(err) => tracing::warn!(
+                "shared write-session KV lease keepalive failed; downgrading matching sessions to raw: lease_id={} generation={} sessions={} err={}",
+                identity.lease_id,
+                identity.generation,
+                downgraded_sessions,
+                err
+            ),
+            LeaseKeepaliveFailure::Timeout { timeout } => tracing::warn!(
+                "shared write-session KV lease keepalive timed out after {}s; downgrading matching sessions to raw: lease_id={} generation={} sessions={}",
+                timeout.as_secs_f64(),
+                identity.lease_id,
+                identity.generation,
+                downgraded_sessions
+            ),
+        }
+    }
+
+    fn close(&self) {
+        let registration = {
+            let mut state = self.state.lock();
+            let previous =
+                std::mem::replace(&mut *state, RemoteWriteSessionSharedKvLeaseState::Closed);
+            match previous {
+                RemoteWriteSessionSharedKvLeaseState::Active { registration, .. } => {
+                    Some(registration)
+                }
+                RemoteWriteSessionSharedKvLeaseState::Vacant
+                | RemoteWriteSessionSharedKvLeaseState::Allocating { .. }
+                | RemoteWriteSessionSharedKvLeaseState::Failed { .. }
+                | RemoteWriteSessionSharedKvLeaseState::Closed => None,
+            }
+        };
+        drop(registration);
+        self.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    fn active_identity(&self) -> Option<RemoteWriteSessionSharedKvLeaseIdentity> {
+        match &*self.state.lock() {
+            RemoteWriteSessionSharedKvLeaseState::Active { identity, .. } => Some(*identity),
+            RemoteWriteSessionSharedKvLeaseState::Vacant
+            | RemoteWriteSessionSharedKvLeaseState::Allocating { .. }
+            | RemoteWriteSessionSharedKvLeaseState::Failed { .. }
+            | RemoteWriteSessionSharedKvLeaseState::Closed => None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -330,6 +891,7 @@ struct RemoteWriteSessionClientProgress {
     sending_frames: u64,
     buffered_off: Option<i64>,
     buffer: BytesMut,
+    next_append_off: Option<i64>,
     max_inflight_chunks: usize,
     queued_frames: VecDeque<RemoteWriteSessionClientFrame>,
     queued_frame_bytes: usize,
@@ -492,12 +1054,181 @@ fn remote_write_session_frame_seq(
         .saturating_add(chunk_idx as u64)
 }
 
+fn member_metadata_true(member: &fluxon_commu::ClusterMember, key: &str) -> bool {
+    member
+        .metadata
+        .get(key)
+        .is_some_and(|value| value == "true")
+}
+
+fn remote_write_session_kv_shared_candidate(
+    kv_framework: &KvFramework,
+    target_node_id: &str,
+) -> Option<RemoteWriteSessionKvSharedCandidate> {
+    let cluster_manager_view = kv_framework.cluster_manager_view();
+    let cluster_manager = cluster_manager_view.cluster_manager();
+    let self_info = cluster_manager.get_self_info();
+    let members = cluster_manager.get_members();
+    let target_info = members.iter().find(|member| member.id == target_node_id)?;
+    if !member_metadata_true(
+        target_info,
+        write_session_rpc::FS_WRITE_SESSION_KV_REF_CAPABILITY_METADATA_KEY,
+    ) {
+        return None;
+    }
+
+    let self_owner = share_group_owner_ref_from_metadata(&self_info.metadata)?;
+    let target_owner = share_group_owner_ref_from_metadata(&target_info.metadata)?;
+    if self_owner != target_owner {
+        return None;
+    }
+
+    let self_node: NodeID = self_info.id.clone().into();
+    let target_node: NodeID = target_info.id.clone().into();
+    let tier_snapshot = kv_framework.p2p_view().p2p_module().tier_snapshot();
+    if tier_snapshot.self_peer_gen.peer_id != self_node
+        || tier_snapshot.self_peer_gen.node_start_time != self_info.node_start_time
+        || !tier_snapshot.same_share_group(&self_node, &target_node)
+    {
+        return None;
+    }
+    let target_peer_gen = tier_snapshot.peer_gen(&target_node)?;
+    if target_peer_gen.node_start_time != target_info.node_start_time {
+        return None;
+    }
+
+    let owner_info = members.iter().find(|member| {
+        member.id == self_owner.owner_id && member.node_start_time == self_owner.owner_start_time
+    })?;
+    if owner_info.node_role() != NodeRole::Client {
+        return None;
+    }
+    let owner_sub_cluster = owner_info.sub_cluster.as_ref()?.trim();
+    if owner_sub_cluster.is_empty() {
+        return None;
+    }
+
+    // PreferredSubCluster is local-first only when the source owner is eligible for the
+    // cluster-wide SSD placement scope. Otherwise the KV router may select another owner.
+    let cluster_requires_ssd = members
+        .iter()
+        .filter(|member| member.node_role() == NodeRole::Client)
+        .any(|member| member_metadata_true(member, KV_SSD_STORAGE_METADATA_KEY));
+    if cluster_requires_ssd && !member_metadata_true(owner_info, KV_SSD_STORAGE_METADATA_KEY) {
+        return None;
+    }
+
+    Some(RemoteWriteSessionKvSharedCandidate {
+        owner: self_owner,
+        owner_sub_cluster: owner_sub_cluster.to_string(),
+        source_node_start_time: self_info.node_start_time,
+        target_node_start_time: target_info.node_start_time,
+    })
+}
+
+fn remote_write_session_kv_shared_is_current(
+    kv_framework: &KvFramework,
+    target_node_id: &str,
+    config: &RemoteWriteSessionKvSharedConfig,
+) -> bool {
+    remote_write_session_kv_shared_candidate(kv_framework, target_node_id).is_some_and(
+        |candidate| {
+            candidate.owner == config.owner
+                && candidate.owner_sub_cluster == config.owner_sub_cluster
+                && candidate.source_node_start_time == config.source_node_start_time
+                && candidate.target_node_start_time == config.target_node_start_time
+        },
+    )
+}
+
 fn remote_write_session_remote_key(node_id: &str, remote_session_id: &str) -> String {
     format!("{}\0{}", node_id, remote_session_id)
 }
 
+fn remote_write_session_remove_client_entry(
+    sessions: &RwLock<HashMap<String, Arc<RemoteWriteSessionClientEntry>>>,
+    sessions_by_remote: &RwLock<HashMap<String, Arc<RemoteWriteSessionClientEntry>>>,
+    client_session_id: &str,
+) -> Option<Arc<RemoteWriteSessionClientEntry>> {
+    let removed = {
+        let mut sessions = sessions.write();
+        let mut sessions_by_remote = sessions_by_remote.write();
+        let removed = sessions.remove(client_session_id);
+        if let Some(entry) = removed.as_ref() {
+            let key = remote_write_session_remote_key(&entry.node_id, &entry.remote_session_id);
+            sessions_by_remote.remove(&key);
+        }
+        removed
+    };
+    if let Some(entry) = removed.as_ref() {
+        entry.downgrade_kv_shared();
+    }
+    removed
+}
+
+fn remote_write_session_abort_local_entry(
+    sessions: &RwLock<HashMap<String, Arc<RemoteWriteSessionClientEntry>>>,
+    sessions_by_remote: &RwLock<HashMap<String, Arc<RemoteWriteSessionClientEntry>>>,
+    client_session_id: &str,
+    detail: &str,
+) -> Option<Arc<RemoteWriteSessionClientEntry>> {
+    let removed = {
+        let mut sessions = sessions.write();
+        let mut sessions_by_remote = sessions_by_remote.write();
+        let removed = sessions.remove(client_session_id);
+        if let Some(entry) = removed.as_ref() {
+            let key = remote_write_session_remote_key(&entry.node_id, &entry.remote_session_id);
+            sessions_by_remote.remove(&key);
+        }
+        removed
+    };
+    if let Some(entry) = removed.as_ref() {
+        entry.state.fail(detail.to_string());
+        entry.downgrade_kv_shared();
+    }
+    removed
+}
+
+fn remote_write_session_abort_all_local_entries(
+    sessions: &RwLock<HashMap<String, Arc<RemoteWriteSessionClientEntry>>>,
+    sessions_by_remote: &RwLock<HashMap<String, Arc<RemoteWriteSessionClientEntry>>>,
+    detail: &str,
+) -> Vec<Arc<RemoteWriteSessionClientEntry>> {
+    let removed = {
+        let mut sessions = sessions.write();
+        let mut sessions_by_remote = sessions_by_remote.write();
+        let removed = sessions.drain().map(|(_, entry)| entry).collect::<Vec<_>>();
+        sessions_by_remote.clear();
+        removed
+    };
+    for entry in &removed {
+        entry.state.fail(detail.to_string());
+        entry.downgrade_kv_shared();
+    }
+    removed
+}
+
+fn remote_write_session_fail_all_local_entries(
+    sessions: &RwLock<HashMap<String, Arc<RemoteWriteSessionClientEntry>>>,
+    detail: &str,
+) -> usize {
+    let entries = sessions.read().values().cloned().collect::<Vec<_>>();
+    for entry in &entries {
+        entry.state.fail(detail.to_string());
+        entry.downgrade_kv_shared();
+    }
+    entries.len()
+}
+
 fn remote_write_session_schedule_entry(session: &Arc<RemoteWriteSessionClientEntry>) {
-    if session.peer_sender.ready_tx.send(session.clone()).is_err() {
+    let Some(peer_sender) = session.peer_sender.upgrade() else {
+        session.state.fail(format!(
+            "remote write-session peer sender stopped: session_id={} node_id={}",
+            session.remote_session_id, session.node_id
+        ));
+        return;
+    };
+    if peer_sender.ready_tx.send(session.clone()).is_err() {
         session.state.fail(format!(
             "remote write-session peer sender closed unexpectedly: session_id={} node_id={}",
             session.remote_session_id, session.node_id
@@ -524,7 +1255,31 @@ fn remote_write_session_should_schedule_locked(
     if schedulable_frames == 0 {
         return 0;
     }
-    schedulable_frames.div_ceil(REMOTE_WRITE_SESSION_SEND_BATCH_MAX_FRAMES)
+
+    // A send batch may not cross a submit boundary because the batch keeps one contiguous
+    // `Bytes` owner for the KV shared-memory put. Count the batches using the same grouping rules
+    // as `take_next_batch_for_send`; dividing the frame count by the maximum batch size would
+    // under-schedule multiple short submits and serialize them behind ACKs.
+    let mut batch_count = 0usize;
+    let mut frames_in_batch = 0usize;
+    let mut previous: Option<&RemoteWriteSessionClientFrame> = None;
+    for frame in progress.queued_frames.iter().take(schedulable_frames) {
+        let continues_batch = previous.is_some_and(|prev| {
+            frames_in_batch < REMOTE_WRITE_SESSION_SEND_BATCH_MAX_FRAMES
+                && frame.seq_no == prev.seq_no.saturating_add(1)
+                && frame.offset == prev.offset.saturating_add(prev.data_len() as i64)
+                && frame.submit_base_seq_no == prev.submit_base_seq_no
+                && frame.data_start == prev.data_end
+        });
+        if continues_batch {
+            frames_in_batch += 1;
+        } else {
+            batch_count += 1;
+            frames_in_batch = 1;
+        }
+        previous = Some(frame);
+    }
+    batch_count
 }
 
 fn remote_write_session_fill_schedule_locked(
@@ -534,6 +1289,16 @@ fn remote_write_session_fill_schedule_locked(
     let additional = desired.saturating_sub(progress.scheduled_sends);
     progress.scheduled_sends = progress.scheduled_sends.saturating_add(additional);
     additional
+}
+
+fn remote_write_session_max_queued_frame_bytes(
+    max_inflight_chunks: usize,
+    submit_len: usize,
+) -> usize {
+    max_inflight_chunks
+        .max(1)
+        .saturating_mul(REMOTE_WRITE_SESSION_CHUNK_BYTES)
+        .max(submit_len)
 }
 
 fn remote_write_session_stall_confirm_seq_locked(
@@ -587,7 +1352,6 @@ impl RemoteWriteSessionClientState {
         Ok(progress.acked_frames >= expected_frames)
     }
 
-    #[cfg(test)]
     fn wait_for_acked_frames(&self, expected_frames: u64) -> Result<(), String> {
         let mut progress = self.progress.lock();
         loop {
@@ -604,18 +1368,38 @@ impl RemoteWriteSessionClientState {
     fn buffer_append(
         &self,
         start_off: i64,
-        data: Bytes,
+        mut data: Bytes,
         submit_bytes: usize,
         max_inflight_chunks: usize,
     ) -> Result<Vec<RemoteWriteSessionClientSubmit>, String> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
+        if start_off < 0 {
+            return Err("write-session payload offset must be non-negative".to_string());
+        }
+        let data_len = i64::try_from(data.len())
+            .map_err(|_| "write-session payload length exceeds i64".to_string())?;
+        let end_off = start_off
+            .checked_add(data_len)
+            .ok_or_else(|| "write-session payload offset overflow".to_string())?;
         let submit_bytes = std::cmp::max(1, submit_bytes);
         let mut progress = self.progress.lock();
         if let Some(detail) = progress.fatal_error.clone() {
             return Err(detail);
         }
+        if progress
+            .next_append_off
+            .is_some_and(|expected_off| expected_off != start_off)
+            && !remote_write_session_delivery_is_idle_locked(&progress)
+        {
+            return Err(format!(
+                "write-session payloads must be contiguous until a delivery barrier: expected_offset={} got_offset={}",
+                progress.next_append_off.unwrap_or(start_off),
+                start_off
+            ));
+        }
+        progress.next_append_off = Some(end_off);
         let mut submits = Vec::new();
         progress.max_inflight_chunks = std::cmp::max(1, max_inflight_chunks);
         let live_len = progress.buffer.len();
@@ -631,11 +1415,53 @@ impl RemoteWriteSessionClientState {
         } else {
             progress.buffered_off = Some(start_off);
         }
-        progress.buffer.extend_from_slice(data.as_ref());
+
+        // Complete an existing partial submit first. Whole submits can then retain the
+        // caller's Bytes allocation instead of copying it through the staging buffer.
         while progress.buffer.len() >= submit_bytes {
             if let Some(submit) = take_buffered_submit_locked(&mut progress, submit_bytes) {
                 submits.push(submit);
             }
+        }
+        let mut data_off = start_off;
+        if !progress.buffer.is_empty() {
+            let needed = submit_bytes.saturating_sub(progress.buffer.len());
+            let copy_len = needed.min(data.len());
+            progress
+                .buffer
+                .extend_from_slice(&data.as_ref()[..copy_len]);
+            data.advance(copy_len);
+            data_off = data_off
+                .checked_add(i64::try_from(copy_len).expect("copy length must fit i64"))
+                .expect("validated write-session payload offset must not overflow");
+            if progress.buffer.len() >= submit_bytes {
+                if let Some(submit) = take_buffered_submit_locked(&mut progress, submit_bytes) {
+                    submits.push(submit);
+                }
+            }
+        }
+
+        while data.len() >= submit_bytes {
+            let payload = data.split_to(submit_bytes);
+            let payload_len = payload.len();
+            submits.push(new_write_session_submit_locked(
+                &mut progress,
+                data_off,
+                payload,
+            ));
+            data_off = data_off
+                .checked_add(i64::try_from(payload_len).expect("payload length must fit i64"))
+                .expect("validated write-session payload offset must not overflow");
+        }
+
+        if data.is_empty() {
+            if progress.buffer.is_empty() {
+                progress.buffered_off = None;
+            }
+        } else {
+            debug_assert!(progress.buffer.is_empty());
+            progress.buffered_off = Some(data_off);
+            progress.buffer.extend_from_slice(data.as_ref());
         }
         Ok(submits)
     }
@@ -662,6 +1488,20 @@ impl RemoteWriteSessionClientState {
             return Ok(RemoteWriteSessionClientFollowup::default());
         }
         let mut progress = self.progress.lock();
+        let max_queued_frame_bytes = remote_write_session_max_queued_frame_bytes(
+            progress.max_inflight_chunks,
+            submit.data.len(),
+        );
+        while progress
+            .queued_frame_bytes
+            .saturating_add(submit.data.len())
+            > max_queued_frame_bytes
+        {
+            if let Some(detail) = progress.fatal_error.clone() {
+                return Err(detail);
+            }
+            self.cv.wait(&mut progress);
+        }
         if let Some(detail) = progress.fatal_error.clone() {
             return Err(detail);
         }
@@ -681,7 +1521,10 @@ impl RemoteWriteSessionClientState {
                 .push_back(RemoteWriteSessionClientFrame {
                     seq_no: next_seq_no,
                     offset: next_offset,
-                    data: frame_data,
+                    submit_base_seq_no: submit.base_seq_no,
+                    submit_data: submit.data.clone(),
+                    data_start: frame_start,
+                    data_end: frame_end,
                     enqueued_at: submit.enqueued_at,
                 });
             next_seq_no = next_seq_no.saturating_add(1);
@@ -712,7 +1555,8 @@ impl RemoteWriteSessionClientState {
         let Some(frame) = progress.queued_frames.pop_front() else {
             return Ok(None);
         };
-        progress.queued_frame_bytes = progress.queued_frame_bytes.saturating_sub(frame.data.len());
+        let frame_len = frame.data_len();
+        progress.queued_frame_bytes = progress.queued_frame_bytes.saturating_sub(frame_len);
         let max_frames = usize::try_from(
             (progress.max_inflight_chunks.max(1) as u64).saturating_sub(inflight_frames),
         )
@@ -722,36 +1566,51 @@ impl RemoteWriteSessionClientState {
         let seq_no = frame.seq_no;
         let offset = frame.offset;
         let enqueued_at = frame.enqueued_at;
-        let mut total_bytes = frame.data.len();
+        let submit_base_seq_no = frame.submit_base_seq_no;
+        let submit_data = frame.submit_data.clone();
+        let data_start = frame.data_start;
+        let mut data_end = frame.data_end;
+        let mut total_bytes = frame_len;
         let mut frame_count = 1u64;
         let mut next_seq_no = frame.seq_no.saturating_add(1);
-        let mut next_offset = frame.offset.saturating_add(frame.data.len() as i64);
-        let mut data_parts = vec![frame.data];
+        let mut next_offset = frame.offset.saturating_add(frame_len as i64);
+        let mut data_parts = vec![frame.data()];
+        let mut part_lengths =
+            vec![u32::try_from(frame_len).expect("write-session frame length must fit in u32")];
         while data_parts.len() < max_frames {
             let Some(next_frame) = progress.queued_frames.front() else {
                 break;
             };
-            if next_frame.seq_no != next_seq_no || next_frame.offset != next_offset {
+            if next_frame.seq_no != next_seq_no
+                || next_frame.offset != next_offset
+                || next_frame.submit_base_seq_no != submit_base_seq_no
+                || next_frame.data_start != data_end
+            {
                 break;
             }
             let next_frame = progress
                 .queued_frames
                 .pop_front()
                 .expect("front frame must exist");
-            progress.queued_frame_bytes = progress
-                .queued_frame_bytes
-                .saturating_sub(next_frame.data.len());
-            total_bytes = total_bytes.saturating_add(next_frame.data.len());
+            let next_len = next_frame.data_len();
+            progress.queued_frame_bytes = progress.queued_frame_bytes.saturating_sub(next_len);
+            total_bytes = total_bytes.saturating_add(next_len);
             next_seq_no = next_seq_no.saturating_add(1);
-            next_offset = next_offset.saturating_add(next_frame.data.len() as i64);
+            next_offset = next_offset.saturating_add(next_len as i64);
             frame_count = frame_count.saturating_add(1);
-            data_parts.push(next_frame.data);
+            data_end = next_frame.data_end;
+            data_parts.push(next_frame.data());
+            part_lengths
+                .push(u32::try_from(next_len).expect("write-session frame length must fit in u32"));
         }
         progress.sending_frames = progress.sending_frames.saturating_add(frame_count);
+        self.cv.notify_all();
         Ok(Some(RemoteWriteSessionClientSendBatch {
             seq_no,
             offset,
+            data: submit_data.slice(data_start..data_end),
             data_parts,
+            part_lengths,
             frame_count,
             total_bytes,
             enqueued_at,
@@ -822,7 +1681,7 @@ impl RemoteWriteSessionClientState {
         }
     }
 
-    fn handle_data_ack(&self, ack: &FsWriteSessionDataAck) -> Result<bool, String> {
+    fn handle_data_ack(&self, ack: &FsWriteSessionDataAck) -> Result<usize, String> {
         let mut progress = self.progress.lock();
         if !ack.ok {
             let detail = if ack.err_detail.trim().is_empty() {
@@ -862,13 +1721,13 @@ impl RemoteWriteSessionClientState {
                 .early_acked_batches
                 .insert(ack.seq_no, ack.frame_count);
             self.cv.notify_all();
-            return Ok(false);
+            return Ok(0);
         }
         progress.pending_batches.remove(&ack.seq_no);
         remote_write_session_refresh_acked_frames_locked(&mut progress);
-        let should_schedule = remote_write_session_fill_schedule_locked(&mut progress) > 0;
+        let schedule_count = remote_write_session_fill_schedule_locked(&mut progress);
         self.cv.notify_all();
-        Ok(should_schedule)
+        Ok(schedule_count)
     }
 
     fn begin_confirm_pending_batch(
@@ -899,7 +1758,7 @@ impl RemoteWriteSessionClientState {
         }))
     }
 
-    fn confirm_delivered_upto(&self, expected_frames: u64) -> Result<bool, String> {
+    fn confirm_delivered_upto(&self, expected_frames: u64) -> Result<usize, String> {
         let mut progress = self.progress.lock();
         if let Some(detail) = progress.fatal_error.clone() {
             return Err(detail);
@@ -917,9 +1776,9 @@ impl RemoteWriteSessionClientState {
             progress.pending_batches.remove(&seq_no);
         }
         remote_write_session_refresh_acked_frames_locked(&mut progress);
-        let should_schedule = remote_write_session_fill_schedule_locked(&mut progress) > 0;
+        let schedule_count = remote_write_session_fill_schedule_locked(&mut progress);
         self.cv.notify_all();
-        Ok(should_schedule)
+        Ok(schedule_count)
     }
 
     fn fail(&self, detail: String) {
@@ -937,6 +1796,20 @@ impl RemoteWriteSessionClientState {
     }
 }
 
+fn remote_write_session_delivery_is_idle_locked(
+    progress: &RemoteWriteSessionClientProgress,
+) -> bool {
+    progress.buffer.is_empty()
+        && progress.queued_frames.is_empty()
+        && progress.sending_frames == 0
+        && progress.pending_batches.is_empty()
+        && progress.early_acked_batches.is_empty()
+        && progress.scheduled_sends == 0
+        && !progress.confirm_inflight
+        && progress.sent_frames == progress.submitted_frames
+        && progress.acked_frames == progress.submitted_frames
+}
+
 fn take_buffered_submit_locked(
     progress: &mut RemoteWriteSessionClientProgress,
     take_len: usize,
@@ -948,6 +1821,20 @@ fn take_buffered_submit_locked(
     let take_len = std::cmp::min(take_len, progress.buffer.len());
     let offset = progress.buffered_off?;
     let payload = progress.buffer.split_to(take_len).freeze();
+    let submit = new_write_session_submit_locked(progress, offset, payload);
+    if progress.buffer.is_empty() {
+        progress.buffered_off = None;
+    } else {
+        progress.buffered_off = Some(offset.saturating_add(take_len as i64));
+    }
+    Some(submit)
+}
+
+fn new_write_session_submit_locked(
+    progress: &mut RemoteWriteSessionClientProgress,
+    offset: i64,
+    payload: Bytes,
+) -> RemoteWriteSessionClientSubmit {
     let frame_count = remote_write_session_frame_count(payload.len());
     let submit = RemoteWriteSessionClientSubmit {
         base_seq_no: progress.next_seq_no,
@@ -957,15 +1844,68 @@ fn take_buffered_submit_locked(
     };
     progress.next_seq_no = progress.next_seq_no.saturating_add(frame_count);
     progress.submitted_frames = progress.submitted_frames.saturating_add(frame_count);
-    if progress.buffer.is_empty() {
-        progress.buffered_off = None;
-    } else {
-        progress.buffered_off = Some(offset.saturating_add(take_len as i64));
+    submit
+}
+
+fn remote_write_session_schedule_kv_cleanup(
+    source: &Weak<RemoteWriteSessionSourceLifecycle>,
+    kv_framework: Arc<KvFramework>,
+    kv_key: String,
+    lease_id: u64,
+) {
+    // Cleanup must never delay a raw fallback. The unique nonce prevents this detached delete
+    // from targeting a later batch, while the lease remains the final cleanup backstop.
+    let Some(source) = source.upgrade() else {
+        return;
+    };
+    source.spawn_current("kv_cleanup", move |stop| async move {
+        let cleanup = tokio::time::timeout(
+            Duration::from_millis(REMOTE_WRITE_SESSION_KV_CLEANUP_TIMEOUT_MS),
+            kv_framework.kv_delete(kv_key.as_str()),
+        );
+        tokio::select! {
+            biased;
+            _ = stop.wait_stopped() => {}
+            result = cleanup => match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::warn!(
+                    "write-session temporary KV key cleanup failed; lease will expire it: key={} lease_id={} err={}",
+                    kv_key,
+                    lease_id,
+                    err
+                ),
+                Err(_) => tracing::warn!(
+                    "write-session temporary KV key cleanup timed out; lease will expire it: key={} lease_id={} timeout_ms={}",
+                    kv_key,
+                    lease_id,
+                    REMOTE_WRITE_SESSION_KV_CLEANUP_TIMEOUT_MS
+                ),
+            }
+        }
+    });
+}
+
+async fn remote_write_session_resolve_transport<Downgrade, RawSend, RawFuture>(
+    kv_result: Option<Result<FsWriteSessionDataAck, String>>,
+    downgrade: Downgrade,
+    raw_send: RawSend,
+) -> Result<FsWriteSessionDataAck, String>
+where
+    Downgrade: FnOnce(),
+    RawSend: FnOnce() -> RawFuture,
+    RawFuture: std::future::Future<Output = Result<FsWriteSessionDataAck, String>>,
+{
+    if let Some(result) = kv_result {
+        match result {
+            Ok(ack) if ack.ok => return Ok(ack),
+            Ok(_) | Err(_) => downgrade(),
+        }
     }
-    Some(submit)
+    raw_send().await
 }
 
 async fn remote_write_session_send_batch_task(
+    source: Weak<RemoteWriteSessionSourceLifecycle>,
     kv_framework: Arc<KvFramework>,
     session: Arc<RemoteWriteSessionClientEntry>,
     batch: RemoteWriteSessionClientSendBatch,
@@ -979,6 +1919,134 @@ async fn remote_write_session_send_batch_task(
             err_detail: String::new(),
         });
     }
+
+    let mut kv_result_for_resolution = None;
+    if let Some(config) = session.active_kv_shared() {
+        if remote_write_session_kv_shared_is_current(
+            kv_framework.as_ref(),
+            session.node_id.as_str(),
+            &config,
+        ) {
+            let nonce = uuid::Uuid::new_v4().as_u128();
+            let kv_key = write_session_rpc::write_session_kv_payload_key(
+                kv_framework
+                    .cluster_manager_view()
+                    .cluster_manager()
+                    .get_self_info()
+                    .id
+                    .as_str(),
+                config.source_node_start_time,
+                session.remote_session_id.as_str(),
+                config.lease_id,
+                batch.seq_no,
+                nonce,
+            );
+            let mut put_opts = PutOptionalArgs::new();
+            put_opts.0.push(PutOptionalArg::LeaseId(config.lease_id));
+            put_opts.0.push(PutOptionalArg::RejectIfExists);
+            put_opts.0.push(PutOptionalArg::PreferredSubCluster(
+                config.owner_sub_cluster.clone(),
+            ));
+            let mut kv_created = false;
+            let kv_result = async {
+                match tokio::time::timeout(
+                    Duration::from_secs(REMOTE_WRITE_SESSION_KV_OPERATION_TIMEOUT_SECS),
+                    kv_framework.kv_put(kv_key.as_str(), batch.data.as_ref(), put_opts),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(format!("KV put failed: {}", err)),
+                    Err(_) => {
+                        // The put may have committed even if its completion was not observed.
+                        // This batch's nonce prevents key reuse, and the lease reclaims the
+                        // possibly committed value after this session downgrades to raw.
+                        return Err(format!(
+                            "KV put timed out after {}s",
+                            REMOTE_WRITE_SESSION_KV_OPERATION_TIMEOUT_SECS
+                        ));
+                    }
+                }
+                kv_created = true;
+                let total_len = u64::try_from(batch.total_bytes)
+                    .map_err(|_| "write-session KV payload length does not fit u64".to_string())?;
+                let ref_frame = write_session_rpc::FsWriteSessionDataRefFrame {
+                    export: session.export_name.clone(),
+                    relpath: session.relpath_rpc.clone(),
+                    session_id: session.remote_session_id.clone(),
+                    seq_no: batch.seq_no,
+                    offset: batch.offset,
+                    kv_key: kv_key.clone(),
+                    total_len,
+                    part_lengths: batch.part_lengths.clone(),
+                    source_node_start_time: config.source_node_start_time,
+                    owner_id: config.owner.owner_id.clone(),
+                    owner_start_time: config.owner.owner_start_time,
+                    lease_id: config.lease_id,
+                    nonce,
+                    fs_rpc_token: session.fs_rpc_token.clone(),
+                    allow_s3_internal_multipart: session.allow_s3_internal_multipart,
+                };
+                let ack = write_session_rpc::call_write_session_data_ref(
+                    kv_framework.as_ref(),
+                    session.node_id.clone().into(),
+                    ref_frame,
+                    Some(Duration::from_millis(remote_write_session_rpc_timeout_ms(
+                        batch.total_bytes,
+                    ))),
+                )
+                .await
+                .map_err(|err| format!("KV ref RPC failed: {}", err))?;
+                if ack.session_id != session.remote_session_id
+                    || ack.seq_no != batch.seq_no
+                    || ack.frame_count != batch.frame_count
+                {
+                    return Err(format!(
+                        "KV ref ack mismatch: session_id={} got_session_id={} seq_no={} got_seq_no={} expected_frames={} got_frames={}",
+                        session.remote_session_id,
+                        ack.session_id,
+                        batch.seq_no,
+                        ack.seq_no,
+                        batch.frame_count,
+                        ack.frame_count,
+                    ));
+                }
+                if !ack.ok {
+                    return Err(if ack.err_detail.trim().is_empty() {
+                        "KV ref RPC returned NACK".to_string()
+                    } else {
+                        format!("KV ref RPC returned NACK: {}", ack.err_detail)
+                    });
+                }
+                Ok(ack)
+            }
+            .await;
+
+            // RejectIfExists or any other put failure did not create this key, so it must not be
+            // deleted here. A successful put owns its nonce-scoped key and may clean it up.
+            if kv_created {
+                remote_write_session_schedule_kv_cleanup(
+                    &source,
+                    kv_framework.clone(),
+                    kv_key,
+                    config.lease_id,
+                );
+            }
+            if let Err(detail) = &kv_result {
+                tracing::warn!(
+                    "write-session KV shared transport failed; retrying batch over raw transport: session_id={} node={} seq_no={} detail={}",
+                    session.remote_session_id,
+                    session.node_id,
+                    batch.seq_no,
+                    detail
+                );
+            }
+            kv_result_for_resolution = Some(kv_result);
+        } else {
+            session.downgrade_kv_shared();
+        }
+    }
+
     let rpc_frame = FsWriteSessionDataFrame {
         export: session.export_name.clone(),
         relpath: session.relpath_rpc.clone(),
@@ -988,15 +2056,24 @@ async fn remote_write_session_send_batch_task(
         fs_rpc_token: session.fs_rpc_token.clone(),
         allow_s3_internal_multipart: session.allow_s3_internal_multipart,
     };
-    write_session_rpc::send_write_session_data_bytes(
-        kv_framework.as_ref(),
-        session.node_id.clone().into(),
-        rpc_frame,
-        batch.data_parts,
-        RpcTransportPolicy::AllowTransferRpcFastPath,
+    let raw_session = session.clone();
+    let downgrade_session = session.clone();
+    remote_write_session_resolve_transport(
+        kv_result_for_resolution,
+        move || downgrade_session.downgrade_kv_shared(),
+        || async move {
+            write_session_rpc::send_write_session_data_bytes(
+                kv_framework.as_ref(),
+                raw_session.node_id.clone().into(),
+                rpc_frame,
+                batch.data_parts,
+                RpcTransportPolicy::AllowTransferRpcFastPath,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        },
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 async fn remote_write_session_confirm_frames_task(
@@ -1036,6 +2113,7 @@ async fn remote_write_session_confirm_frames_task(
 
 fn remote_write_session_schedule_ack_timeout(
     rt_handle: &tokio::runtime::Handle,
+    source: &Arc<RemoteWriteSessionSourceLifecycle>,
     kv_framework: Arc<KvFramework>,
     session: Arc<RemoteWriteSessionClientEntry>,
     seq_no: u64,
@@ -1046,24 +2124,32 @@ fn remote_write_session_schedule_ack_timeout(
     }) else {
         return;
     };
-    rt_handle.spawn(async move {
+    source.spawn_on(rt_handle, "ack_confirm", move |stop| async move {
         let timeout =
             Duration::from_millis(remote_write_session_rpc_timeout_ms(confirm.timeout_bytes));
-        let result = remote_write_session_confirm_frames_task(
+        let confirm_task = remote_write_session_confirm_frames_task(
             kv_framework,
             session.clone(),
             confirm.expected_frames,
             timeout,
-        )
-        .await;
+        );
+        tokio::pin!(confirm_task);
+        let result = tokio::select! {
+            biased;
+            _ = stop.wait_stopped() => return,
+            result = &mut confirm_task => result,
+        };
         match result {
-            Ok(()) => match session
-                .state
-                .confirm_delivered_upto(confirm.expected_frames)
-            {
-                Ok(true) => remote_write_session_schedule_entry(&session),
-                Ok(false) | Err(_) => {}
-            },
+            Ok(()) => {
+                if let Ok(schedule_count) = session
+                    .state
+                    .confirm_delivered_upto(confirm.expected_frames)
+                {
+                    for _ in 0..schedule_count {
+                        remote_write_session_schedule_entry(&session);
+                    }
+                }
+            }
             Err(detail) => session.state.fail(detail),
         }
     });
@@ -1281,6 +2367,69 @@ impl FluxonFsAgent {
             String,
             Arc<RemoteWriteSessionClientEntry>,
         >::new()));
+        let remote_write_session_source = Arc::new(RemoteWriteSessionSourceLifecycle::new());
+        let keepalive_framework = kv_framework.clone();
+        let keepalive_operation: LeaseKeepaliveOperation<u64> = Arc::new(move |lease_id| {
+            let keepalive_framework = keepalive_framework.clone();
+            Box::pin(async move {
+                keepalive_framework
+                    .kv_keepalive_lease(lease_id)
+                    .await
+                    .map_err(|err| err.to_string())
+            })
+        });
+        let remote_write_session_kv_keepalive = Arc::new(LeaseKeepaliveActor::new(
+            Duration::from_secs(REMOTE_WRITE_SESSION_KV_LEASE_KEEPALIVE_SECS),
+            Duration::from_millis(REMOTE_WRITE_SESSION_KV_LEASE_KEEPALIVE_JITTER_MS),
+            Duration::from_secs(REMOTE_WRITE_SESSION_KV_OPERATION_TIMEOUT_SECS),
+            REMOTE_WRITE_SESSION_KV_LEASE_KEEPALIVE_MAX_CONCURRENCY,
+        ));
+        let keepalive_actor = remote_write_session_kv_keepalive.clone();
+        let keepalive_started = remote_write_session_source.spawn_on(
+            &rt_handle,
+            "lease_keepalive_actor",
+            move |stop| async move {
+                keepalive_actor.run_until_stopped(stop.wait_stopped()).await;
+            },
+        );
+        assert!(
+            keepalive_started,
+            "write-session lease keepalive actor must start with its source lifecycle"
+        );
+        let allocate_framework = kv_framework.clone();
+        let allocate_rt_handle = rt_handle.clone();
+        let allocate_shared_kv_lease: RemoteWriteSessionSharedKvLeaseAllocate =
+            Arc::new(move || {
+                let kv_framework = allocate_framework.clone();
+                match allocate_rt_handle.run_async_from_sync(async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(REMOTE_WRITE_SESSION_KV_OPERATION_TIMEOUT_SECS),
+                        kv_framework.kv_allocate_lease(REMOTE_WRITE_SESSION_KV_LEASE_TTL_SECS),
+                    )
+                    .await
+                }) {
+                    Ok(Ok(Ok(lease_id))) => Ok(lease_id),
+                    Ok(Ok(Err(err))) => Err(format!(
+                        "write-session shared KV lease allocation failed: {}",
+                        err
+                    )),
+                    Ok(Err(_)) => Err(format!(
+                        "write-session shared KV lease allocation timed out after {}s",
+                        REMOTE_WRITE_SESSION_KV_OPERATION_TIMEOUT_SECS
+                    )),
+                    Err(err) => Err(format!(
+                        "write-session shared KV lease async bridge failed: {}",
+                        err
+                    )),
+                }
+            });
+        let remote_write_session_shared_kv_lease =
+            Arc::new(RemoteWriteSessionSharedKvLeaseManager::new(
+                remote_write_session_kv_keepalive.clone(),
+                keepalive_operation,
+                allocate_shared_kv_lease,
+                Arc::downgrade(&remote_write_sessions),
+            ));
         let runtime = AgentRemoteRuntime {
             lifecycle: lifecycle.clone(),
             api: api.clone(),
@@ -1327,6 +2476,9 @@ impl FluxonFsAgent {
             remote_write_sessions,
             remote_write_sessions_by_remote,
             remote_write_peer_senders: RwLock::new(HashMap::new()),
+            remote_write_session_source,
+            remote_write_session_kv_keepalive,
+            remote_write_session_shared_kv_lease,
             remote_write_session_next_id: AtomicU64::new(1),
             remote_open_cache_resident_bytes: AtomicUsize::new(0),
             remote_open_cache_access_seq: AtomicU64::new(0),
@@ -1340,6 +2492,146 @@ impl FluxonFsAgent {
 
     fn shutdown_poller_is_running(&self) -> bool {
         ViewShutdownExt::register_shutdown_poller(&self.lifecycle).is_running()
+    }
+
+    fn enter_remote_write_session_source_operation(
+        &self,
+    ) -> Result<RemoteWriteSessionSourceOperationGuard, FsAgentError> {
+        self.remote_write_session_source
+            .try_enter_operation()
+            .ok_or_else(|| FsAgentError::Shutdown {
+                detail: "write-session source is shutting down".to_string(),
+            })
+    }
+
+    fn begin_remote_write_session_source_shutdown(&self) {
+        self.remote_write_session_source.stop();
+        self.remote_write_session_shared_kv_lease.close();
+        self.remote_write_session_kv_keepalive.close();
+        let failed = remote_write_session_fail_all_local_entries(
+            self.remote_write_sessions.as_ref(),
+            "write-session source is shutting down",
+        );
+        if failed > 0 {
+            tracing::info!("write-session source stopping {} local sessions", failed);
+        }
+    }
+
+    fn finish_remote_write_session_source_local(&self) -> Vec<Arc<RemoteWriteSessionClientEntry>> {
+        let removed = remote_write_session_abort_all_local_entries(
+            self.remote_write_sessions.as_ref(),
+            self.remote_write_sessions_by_remote.as_ref(),
+            "write-session source is shutting down",
+        );
+        self.remote_write_peer_senders.write().clear();
+        removed
+    }
+
+    async fn abort_remote_write_sessions_for_shutdown_best_effort(
+        &self,
+        sessions: Vec<Arc<RemoteWriteSessionClientEntry>>,
+    ) {
+        if sessions.is_empty() {
+            return;
+        }
+        let session_count = sessions.len();
+        let kv_framework = self.kv_framework.clone();
+        let aborts = sessions.into_iter().map(|session| {
+            let kv_framework = kv_framework.clone();
+            async move {
+                let req = FsAbortWriteSessionReq {
+                    export: session.export_name.clone(),
+                    relpath: session.relpath_rpc.clone(),
+                    session_id: session.remote_session_id.clone(),
+                    fs_rpc_token: session.fs_rpc_token.clone(),
+                    allow_s3_internal_multipart: session.allow_s3_internal_multipart,
+                };
+                let result = write_session_rpc::call_abort_write_session(
+                    kv_framework.as_ref(),
+                    session.node_id.clone().into(),
+                    req,
+                    Some(Duration::from_secs(
+                        REMOTE_WRITE_SESSION_SOURCE_SHUTDOWN_TIMEOUT_SECS,
+                    )),
+                )
+                .await;
+                (session, result)
+            }
+        });
+        let results = tokio::time::timeout(
+            Duration::from_secs(REMOTE_WRITE_SESSION_SOURCE_SHUTDOWN_TIMEOUT_SECS),
+            futures::future::join_all(aborts),
+        )
+        .await;
+        match results {
+            Ok(results) => {
+                for (session, result) in results {
+                    match result {
+                        Ok(resp) if resp.ok => {}
+                        Ok(resp) => tracing::warn!(
+                            "write-session shutdown remote abort returned NACK: node={} session_id={} detail={}",
+                            session.node_id,
+                            session.remote_session_id,
+                            resp.err_detail
+                        ),
+                        Err(err) => tracing::warn!(
+                            "write-session shutdown remote abort failed: node={} session_id={} err={}",
+                            session.node_id,
+                            session.remote_session_id,
+                            err
+                        ),
+                    }
+                }
+            }
+            Err(_) => tracing::warn!(
+                "write-session shutdown remote abort timed out after {}s for {} sessions; remote idle reaping remains the fallback",
+                REMOTE_WRITE_SESSION_SOURCE_SHUTDOWN_TIMEOUT_SECS,
+                session_count
+            ),
+        }
+    }
+
+    /// Stop caller-side write-session work before shutting down the KV framework.
+    ///
+    /// Success is a completion barrier: all tracked task futures have completed or their
+    /// cancellation has been observed, so none can retain a KV-backed payload holder.
+    pub async fn shutdown_write_session_source(&self) -> Result<(), FsAgentError> {
+        self.begin_remote_write_session_source_shutdown();
+        let operation_result = self
+            .remote_write_session_source
+            .wait_for_operations(Duration::from_secs(
+                REMOTE_WRITE_SESSION_SOURCE_SHUTDOWN_TIMEOUT_SECS,
+            ))
+            .await;
+        let sessions = operation_result
+            .is_ok()
+            .then(|| self.finish_remote_write_session_source_local());
+        let task_result = self
+            .remote_write_session_source
+            .stop_join_and_abort(Duration::from_secs(
+                REMOTE_WRITE_SESSION_SOURCE_SHUTDOWN_TIMEOUT_SECS,
+            ))
+            .await;
+        if task_result.is_ok()
+            && let Some(sessions) = sessions
+        {
+            self.abort_remote_write_sessions_for_shutdown_best_effort(sessions)
+                .await;
+        }
+        operation_result
+            .and(task_result)
+            .map_err(|detail| FsAgentError::Shutdown { detail })
+    }
+
+    /// Best-effort synchronous stop for non-blocking Drop/FFI fallback paths.
+    ///
+    /// Graceful owners must use [`Self::shutdown_write_session_source`] and await its
+    /// completion barrier before shutting down the KV framework. This request preserves
+    /// task handles and session metadata so a later graceful owner can still complete the
+    /// barrier and send remote aborts.
+    pub fn request_write_session_source_shutdown(&self) {
+        self.begin_remote_write_session_source_shutdown();
+        self.remote_write_session_source.stop_and_abort();
     }
 
     fn shutdown_aware_sleep(&self, dur: Duration, op: &str) -> Result<(), FsAgentError> {
@@ -1460,12 +2752,90 @@ impl FluxonFsAgent {
         })
     }
 
+    fn remote_abort_provisional_write_session_best_effort(
+        &self,
+        node_id: &str,
+        export_name: &str,
+        relpath_rpc: &str,
+        remote_session_id: &str,
+        fs_rpc_token: Option<String>,
+        allow_s3_internal_multipart: bool,
+    ) {
+        let req = FsAbortWriteSessionReq {
+            export: export_name.to_string(),
+            relpath: relpath_rpc.to_string(),
+            session_id: remote_session_id.to_string(),
+            fs_rpc_token,
+            allow_s3_internal_multipart,
+        };
+        let kv_framework = self.kv_framework.clone();
+        let target: NodeID = node_id.to_string().into();
+        let timeout = Duration::from_secs(REMOTE_WRITE_SESSION_KV_OPERATION_TIMEOUT_SECS);
+        let result = self.rt_handle.run_async_from_sync(async move {
+            write_session_rpc::call_abort_write_session(
+                kv_framework.as_ref(),
+                target,
+                req,
+                Some(timeout),
+            )
+            .await
+        });
+        match result {
+            Ok(Ok(resp)) if resp.ok => {}
+            Ok(Ok(resp)) => tracing::warn!(
+                "provisional remote write-session abort returned NACK: node={} session_id={} detail={}",
+                node_id,
+                remote_session_id,
+                resp.err_detail
+            ),
+            Ok(Err(err)) => tracing::warn!(
+                "provisional remote write-session abort failed: node={} session_id={} err={}",
+                node_id,
+                remote_session_id,
+                err
+            ),
+            Err(err) => tracing::warn!(
+                "provisional remote write-session abort bridge failed: node={} session_id={} err={}",
+                node_id,
+                remote_session_id,
+                err
+            ),
+        }
+    }
+
     fn alloc_remote_write_session_client_token(&self) -> String {
         format!(
             "wscli-{:016x}",
             self.remote_write_session_next_id
                 .fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    fn remote_write_session_prepare_kv_shared(
+        &self,
+        target_node_id: &str,
+    ) -> Option<RemoteWriteSessionKvSharedConfig> {
+        let candidate =
+            remote_write_session_kv_shared_candidate(self.kv_framework.as_ref(), target_node_id)?;
+        let identity = match self.remote_write_session_shared_kv_lease.acquire() {
+            Ok(identity) => identity,
+            Err(err) => {
+                tracing::warn!(
+                    "write-session shared KV lease unavailable; using raw transport: node={} err={}",
+                    target_node_id,
+                    err
+                );
+                return None;
+            }
+        };
+        Some(RemoteWriteSessionKvSharedConfig {
+            owner: candidate.owner,
+            owner_sub_cluster: candidate.owner_sub_cluster,
+            lease_id: identity.lease_id,
+            lease_generation: identity.generation,
+            source_node_start_time: candidate.source_node_start_time,
+            target_node_start_time: candidate.target_node_start_time,
+        })
     }
 
     fn remote_write_session_client_lookup(
@@ -1479,38 +2849,45 @@ impl FluxonFsAgent {
         &self,
         session_id: &str,
     ) -> Option<Arc<RemoteWriteSessionClientEntry>> {
-        let removed = self.remote_write_sessions.write().remove(session_id);
-        if let Some(entry) = removed.as_ref() {
-            let key = remote_write_session_remote_key(&entry.node_id, &entry.remote_session_id);
-            self.remote_write_sessions_by_remote.write().remove(&key);
-        }
-        removed
+        remote_write_session_remove_client_entry(
+            self.remote_write_sessions.as_ref(),
+            self.remote_write_sessions_by_remote.as_ref(),
+            session_id,
+        )
     }
 
     fn remote_write_session_client_insert(
         &self,
         session_id: String,
         entry: Arc<RemoteWriteSessionClientEntry>,
-    ) {
-        self.remote_write_sessions
-            .write()
-            .insert(session_id, entry.clone());
+    ) -> Result<(), Arc<RemoteWriteSessionClientEntry>> {
+        let mut sessions = self.remote_write_sessions.write();
+        let mut sessions_by_remote = self.remote_write_sessions_by_remote.write();
+        if !self.remote_write_session_source.is_accepting() {
+            return Err(entry);
+        }
         let key = remote_write_session_remote_key(&entry.node_id, &entry.remote_session_id);
-        self.remote_write_sessions_by_remote
-            .write()
-            .insert(key, entry);
+        sessions.insert(session_id, entry.clone());
+        sessions_by_remote.insert(key, entry);
+        Ok(())
     }
 
     fn remote_write_peer_sender_get_or_insert(
         &self,
         node_id: &str,
-    ) -> Arc<RemoteWriteSessionPeerSender> {
+    ) -> Option<Arc<RemoteWriteSessionPeerSender>> {
+        if !self.remote_write_session_source.is_accepting() {
+            return None;
+        }
         if let Some(sender) = self.remote_write_peer_senders.read().get(node_id).cloned() {
-            return sender;
+            return Some(sender);
         }
         let mut senders = self.remote_write_peer_senders.write();
+        if !self.remote_write_session_source.is_accepting() {
+            return None;
+        }
         if let Some(sender) = senders.get(node_id).cloned() {
-            return sender;
+            return Some(sender);
         }
         let (ready_tx, ready_rx) =
             tokio_mpsc::unbounded_channel::<Arc<RemoteWriteSessionClientEntry>>();
@@ -1521,15 +2898,25 @@ impl FluxonFsAgent {
         let ready_rx = Arc::new(TokioMutex::new(ready_rx));
         let kv_framework = self.kv_framework.clone();
         for _ in 0..remote_write_session_peer_sender_workers() {
-            let sender_for_task = sender.clone();
+            let sender_for_task = Arc::downgrade(&sender);
             let ready_rx_for_task = ready_rx.clone();
             let kv_framework_for_task = kv_framework.clone();
-            self.rt_handle.spawn(async move {
+            let source_for_task = Arc::downgrade(&self.remote_write_session_source);
+            self.remote_write_session_source.spawn_on(
+                &self.rt_handle,
+                "peer_sender",
+                move |stop| async move {
                 loop {
-                    let Some(session) = ({
+                    let recv = async {
                         let mut rx = ready_rx_for_task.lock().await;
                         rx.recv().await
-                    }) else {
+                    };
+                    let session = tokio::select! {
+                        biased;
+                        _ = stop.wait_stopped() => break,
+                        session = recv => session,
+                    };
+                    let Some(session) = session else {
                         break;
                     };
                     let batch = match session.state.take_next_batch_for_send() {
@@ -1538,13 +2925,19 @@ impl FluxonFsAgent {
                         Err(_) => continue,
                     };
                     let batch_for_state = batch.clone();
-                    let result = remote_write_session_send_batch_task(
+                    let send = remote_write_session_send_batch_task(
+                        source_for_task.clone(),
                         kv_framework_for_task.clone(),
                         session.clone(),
                         batch,
-                    )
-                    .await;
-                    let (followup, ack_should_schedule) = match result {
+                    );
+                    tokio::pin!(send);
+                    let result = tokio::select! {
+                        biased;
+                        _ = stop.wait_stopped() => break,
+                        result = &mut send => result,
+                    };
+                    let (followup, ack_schedule_count) = match result {
                         Ok(ack) => {
                             if ack.session_id != session.remote_session_id
                                 || ack.seq_no != batch_for_state.seq_no
@@ -1563,34 +2956,41 @@ impl FluxonFsAgent {
                                     session
                                         .state
                                         .finish_batch_send(&batch_for_state, Err(detail)),
-                                    false,
+                                    0,
                                 )
                             } else {
                                 let followup =
                                     session.state.finish_batch_send(&batch_for_state, Ok(()));
-                                let ack_should_schedule =
-                                    session.state.handle_data_ack(&ack).unwrap_or(false);
-                                (followup, ack_should_schedule)
+                                let ack_schedule_count =
+                                    session.state.handle_data_ack(&ack).unwrap_or(0);
+                                (followup, ack_schedule_count)
                             }
                         }
                         Err(detail) => (
                             session
                                 .state
                                 .finish_batch_send(&batch_for_state, Err(detail)),
-                            false,
+                            0,
                         ),
                     };
-                    if ack_should_schedule {
-                        let _ = sender_for_task.ready_tx.send(session.clone());
+                    for _ in 0..ack_schedule_count {
+                        let Some(sender) = sender_for_task.upgrade() else {
+                            break;
+                        };
+                        let _ = sender.ready_tx.send(session.clone());
                     }
                     for _ in 0..followup.schedule_count {
-                        let _ = sender_for_task.ready_tx.send(session.clone());
+                        let Some(sender) = sender_for_task.upgrade() else {
+                            break;
+                        };
+                        let _ = sender.ready_tx.send(session.clone());
                     }
                 }
-            });
+            },
+            );
         }
         senders.insert(node_id.to_string(), sender.clone());
-        sender
+        Some(sender)
     }
 
     fn remote_write_session_schedule(
@@ -1598,7 +2998,16 @@ impl FluxonFsAgent {
         session: &Arc<RemoteWriteSessionClientEntry>,
         path_for_err: &str,
     ) -> Result<(), FsAgentError> {
-        if session.peer_sender.ready_tx.send(session.clone()).is_ok() {
+        if !self.remote_write_session_source.is_accepting() {
+            let detail = "write-session source is shutting down".to_string();
+            session.state.fail(detail.clone());
+            return Err(FsAgentError::Shutdown { detail });
+        }
+        if session
+            .peer_sender
+            .upgrade()
+            .is_some_and(|sender| sender.ready_tx.send(session.clone()).is_ok())
+        {
             return Ok(());
         }
         let detail = format!(
@@ -3063,6 +4472,9 @@ impl FluxonFsAgent {
         path_for_err: &str,
         request_identity: Option<&FluxonFsRequestIdentity>,
     ) -> Result<(String, i64, i64), FsAgentError> {
+        // Admission is checked before the remote open and again while inserting the local entry.
+        // The second check closes the race with concurrent source shutdown.
+        let _source_operation = self.enter_remote_write_session_source_operation()?;
         let ctx =
             self.build_remote_write_session_call_ctx(export_name, relpath, request_identity)?;
         let (node_id, remote_session_id, size, mtime_ns) = self.remote_open_write_session(
@@ -3074,7 +4486,21 @@ impl FluxonFsAgent {
             ctx.allow_s3_internal_multipart,
         )?;
         let client_session_id = self.alloc_remote_write_session_client_token();
-        let peer_sender = self.remote_write_peer_sender_get_or_insert(&node_id);
+        let kv_shared = self.remote_write_session_prepare_kv_shared(&node_id);
+        let kv_shared_enabled = kv_shared.is_some();
+        let Some(peer_sender) = self.remote_write_peer_sender_get_or_insert(&node_id) else {
+            self.remote_abort_provisional_write_session_best_effort(
+                &node_id,
+                export_name,
+                &ctx.relpath_rpc,
+                &remote_session_id,
+                ctx.fs_rpc_token.clone(),
+                ctx.allow_s3_internal_multipart,
+            );
+            return Err(FsAgentError::Shutdown {
+                detail: "write-session source stopped while opening a session".to_string(),
+            });
+        };
         let state = Arc::new(RemoteWriteSessionClientState::default());
         let entry = Arc::new(RemoteWriteSessionClientEntry {
             node_id,
@@ -3083,10 +4509,68 @@ impl FluxonFsAgent {
             relpath_rpc: ctx.relpath_rpc,
             fs_rpc_token: ctx.fs_rpc_token,
             allow_s3_internal_multipart: ctx.allow_s3_internal_multipart,
-            peer_sender,
+            kv_shared,
+            kv_shared_enabled: AtomicBool::new(kv_shared_enabled),
+            peer_sender: Arc::downgrade(&peer_sender),
             state: state.clone(),
         });
-        self.remote_write_session_client_insert(client_session_id.clone(), entry);
+        if let Err(entry) =
+            self.remote_write_session_client_insert(client_session_id.clone(), entry.clone())
+        {
+            entry
+                .state
+                .fail("write-session source stopped while opening a session".to_string());
+            entry.downgrade_kv_shared();
+            self.remote_abort_provisional_write_session_best_effort(
+                &entry.node_id,
+                &entry.export_name,
+                &entry.relpath_rpc,
+                &entry.remote_session_id,
+                entry.fs_rpc_token.clone(),
+                entry.allow_s3_internal_multipart,
+            );
+            return Err(FsAgentError::Shutdown {
+                detail: "write-session source stopped while opening a session".to_string(),
+            });
+        }
+        if let Some(config) = entry.kv_shared.as_ref() {
+            let identity = RemoteWriteSessionSharedKvLeaseIdentity {
+                lease_id: config.lease_id,
+                generation: config.lease_generation,
+            };
+            if !self
+                .remote_write_session_shared_kv_lease
+                .is_current(identity)
+            {
+                entry.downgrade_kv_shared();
+                tracing::warn!(
+                    "write-session shared KV lease changed while opening session; using raw transport: session_id={} node={} lease_id={} generation={}",
+                    entry.remote_session_id,
+                    entry.node_id,
+                    identity.lease_id,
+                    identity.generation
+                );
+            }
+        }
+        if !self.remote_write_session_source.is_accepting() {
+            let _ = remote_write_session_abort_local_entry(
+                self.remote_write_sessions.as_ref(),
+                self.remote_write_sessions_by_remote.as_ref(),
+                &client_session_id,
+                "write-session source stopped while opening a session",
+            );
+            self.remote_abort_provisional_write_session_best_effort(
+                &entry.node_id,
+                &entry.export_name,
+                &entry.relpath_rpc,
+                &entry.remote_session_id,
+                entry.fs_rpc_token.clone(),
+                entry.allow_s3_internal_multipart,
+            );
+            return Err(FsAgentError::Shutdown {
+                detail: "write-session source stopped while opening a session".to_string(),
+            });
+        }
         Ok((client_session_id, size, mtime_ns))
     }
 
@@ -3100,6 +4584,7 @@ impl FluxonFsAgent {
         path_for_err: &str,
         request_identity: Option<&FluxonFsRequestIdentity>,
     ) -> Result<(), FsAgentError> {
+        let _source_operation = self.enter_remote_write_session_source_operation()?;
         let (node_id, req) = if let Some(session) =
             self.remote_write_session_client_lookup(session_id)
         {
@@ -3174,6 +4659,7 @@ impl FluxonFsAgent {
             if let Some(confirm_seq_no) = followup.confirm_seq_no {
                 remote_write_session_schedule_ack_timeout(
                     &self.rt_handle,
+                    &self.remote_write_session_source,
                     self.kv_framework.clone(),
                     session.clone(),
                     confirm_seq_no,
@@ -3237,11 +4723,36 @@ impl FluxonFsAgent {
                 },
             });
         }
-        session
+        let schedule_count = session
             .state
             .confirm_delivered_upto(expected_data_frames)
             .map_err(|detail| fs_agent_io_err(path_for_err, detail))?;
+        for _ in 0..schedule_count {
+            self.remote_write_session_schedule(session, path_for_err)?;
+        }
         Ok(expected_data_frames)
+    }
+
+    fn remote_prepare_write_session_completion(
+        &self,
+        session_id: &str,
+        path_for_err: &str,
+    ) -> Result<(Arc<RemoteWriteSessionClientEntry>, u64), FsAgentError> {
+        let Some(session) = self.remote_write_session_client_lookup(session_id) else {
+            return Err(FsAgentError::InvalidArgument {
+                detail: format!("unknown write session: {}", session_id),
+            });
+        };
+        self.remote_flush_write_session_buffer_inner(session_id, path_for_err)?;
+        let expected_data_frames = session
+            .state
+            .submitted_frames()
+            .map_err(|detail| fs_agent_io_err(path_for_err, detail))?;
+        session
+            .state
+            .wait_for_acked_frames(expected_data_frames)
+            .map_err(|detail| fs_agent_io_err(path_for_err, detail))?;
+        Ok((session, expected_data_frames))
     }
 
     pub fn remote_buffer_write_session_payload_by_handle_with_identity(
@@ -3256,6 +4767,7 @@ impl FluxonFsAgent {
         path_for_err: &str,
         _request_identity: Option<&FluxonFsRequestIdentity>,
     ) -> Result<(), FsAgentError> {
+        let _source_operation = self.enter_remote_write_session_source_operation()?;
         if data.is_empty() {
             return Ok(());
         }
@@ -3271,13 +4783,10 @@ impl FluxonFsAgent {
         })
     }
 
-    pub fn remote_flush_write_session_buffer_by_handle_with_identity(
+    fn remote_flush_write_session_buffer_inner(
         &self,
-        _export_name: &str,
-        _relpath: &str,
         session_id: &str,
         path_for_err: &str,
-        _request_identity: Option<&FluxonFsRequestIdentity>,
     ) -> Result<(), FsAgentError> {
         let Some(session) = self.remote_write_session_client_lookup(session_id) else {
             return Ok(());
@@ -3289,24 +4798,31 @@ impl FluxonFsAgent {
         self.remote_enqueue_write_session_submits(&session, submits, path_for_err)
     }
 
-    pub fn remote_wait_write_session_payloads_by_handle_with_identity(
+    pub fn remote_flush_write_session_buffer_by_handle_with_identity(
         &self,
-        export_name: &str,
-        relpath: &str,
+        _export_name: &str,
+        _relpath: &str,
         session_id: &str,
         path_for_err: &str,
-        request_identity: Option<&FluxonFsRequestIdentity>,
+        _request_identity: Option<&FluxonFsRequestIdentity>,
     ) -> Result<(), FsAgentError> {
+        let _source_operation = self.enter_remote_write_session_source_operation()?;
+        self.remote_flush_write_session_buffer_inner(session_id, path_for_err)
+    }
+
+    pub fn remote_wait_write_session_payloads_by_handle_with_identity(
+        &self,
+        _export_name: &str,
+        _relpath: &str,
+        session_id: &str,
+        path_for_err: &str,
+        _request_identity: Option<&FluxonFsRequestIdentity>,
+    ) -> Result<(), FsAgentError> {
+        let _source_operation = self.enter_remote_write_session_source_operation()?;
         let Some(session) = self.remote_write_session_client_lookup(session_id) else {
             return Ok(());
         };
-        self.remote_flush_write_session_buffer_by_handle_with_identity(
-            export_name,
-            relpath,
-            session_id,
-            path_for_err,
-            request_identity,
-        )?;
+        self.remote_flush_write_session_buffer_inner(session_id, path_for_err)?;
         self.remote_wait_write_session_client_barrier(&session, path_for_err)?;
         Ok(())
     }
@@ -3320,14 +4836,9 @@ impl FluxonFsAgent {
         path_for_err: &str,
         request_identity: Option<&FluxonFsRequestIdentity>,
     ) -> Result<(), FsAgentError> {
+        let _source_operation = self.enter_remote_write_session_source_operation()?;
         if let Some(session) = self.remote_write_session_client_lookup(session_id) {
-            self.remote_flush_write_session_buffer_by_handle_with_identity(
-                export_name,
-                relpath,
-                session_id,
-                path_for_err,
-                request_identity,
-            )?;
+            self.remote_flush_write_session_buffer_inner(session_id, path_for_err)?;
             self.remote_wait_write_session_client_barrier(&session, path_for_err)?;
             let rpc_path = self
                 .get_export_cfg(session.export_name.as_str())?
@@ -3389,6 +4900,67 @@ impl FluxonFsAgent {
         )
     }
 
+    pub fn remote_finalize_write_session_by_handle_with_identity(
+        &self,
+        _export_name: &str,
+        _relpath: &str,
+        session_id: &str,
+        final_size: i64,
+        path_for_err: &str,
+        _request_identity: Option<&FluxonFsRequestIdentity>,
+    ) -> Result<(i64, i64), FsAgentError> {
+        let _source_operation = self.enter_remote_write_session_source_operation()?;
+        if final_size < 0 {
+            return Err(FsAgentError::InvalidArgument {
+                detail: "final_size must be non-negative".to_string(),
+            });
+        }
+        let (session, expected_data_frames) =
+            self.remote_prepare_write_session_completion(session_id, path_for_err)?;
+        let req = FsFinalizeWriteSessionReq {
+            export: session.export_name.clone(),
+            relpath: session.relpath_rpc.clone(),
+            session_id: session.remote_session_id.clone(),
+            expected_data_frames,
+            final_size,
+            fs_rpc_token: session.fs_rpc_token.clone(),
+            allow_s3_internal_multipart: session.allow_s3_internal_multipart,
+        };
+        let node_id: NodeID = session.node_id.clone().into();
+        let kv_framework = self.kv_framework.clone();
+        let timeout = std::time::Duration::from_millis(REMOTE_WRITE_SESSION_CONTROL_RPC_TIMEOUT_MS);
+        let resp = self
+            .rt_handle
+            .run_async_from_sync(async move {
+                write_session_rpc::call_finalize_write_session(
+                    kv_framework.as_ref(),
+                    node_id,
+                    req,
+                    Some(timeout),
+                )
+                .await
+            })
+            .map_err(|e| FsAgentError::InvalidArgument {
+                detail: format!("finalize_write_session async bridge failed: {}", e),
+            })??;
+        if !resp.ok {
+            return Err(FsAgentError::Io {
+                path: path_for_err.to_string(),
+                detail: if resp.err_detail.trim().is_empty() {
+                    "remote finalize_write_session failed".to_string()
+                } else {
+                    resp.err_detail
+                },
+            });
+        }
+        let _ = self.remote_write_session_client_remove(session_id);
+        self.metadata_cache_invalidate_exact_and_publish(
+            session.export_name.as_str(),
+            session.relpath_rpc.as_str(),
+        );
+        Ok((resp.size, resp.mtime_ns))
+    }
+
     pub fn remote_close_write_session_by_handle_with_identity(
         &self,
         export_name: &str,
@@ -3397,32 +4969,22 @@ impl FluxonFsAgent {
         path_for_err: &str,
         request_identity: Option<&FluxonFsRequestIdentity>,
     ) -> Result<(i64, i64), FsAgentError> {
+        let _source_operation = self.enter_remote_write_session_source_operation()?;
         let session = self.remote_write_session_client_lookup(session_id);
-        let (node_id, req, relpath_rpc_for_invalidate) = if let Some(session) = session.as_ref() {
-            self.remote_flush_write_session_buffer_by_handle_with_identity(
-                export_name,
-                relpath,
-                session_id,
-                path_for_err,
-                request_identity,
-            )?;
-            // Close must not advertise frames that are only locally submitted but
-            // not yet delivered to the remote agent. Otherwise close can arrive
-            // first and time out waiting for tail frames that are still queued
-            // in the client-side sender or transport.
-            let expected_data_frames =
-                self.remote_wait_write_session_client_barrier(session, path_for_err)?;
+        let (node_id, req, relpath_rpc_for_invalidate) = if session.is_some() {
+            let (prepared_session, expected_data_frames) =
+                self.remote_prepare_write_session_completion(session_id, path_for_err)?;
             (
-                session.node_id.clone(),
+                prepared_session.node_id.clone(),
                 FsCloseWriteSessionReq {
-                    export: session.export_name.clone(),
-                    relpath: session.relpath_rpc.clone(),
-                    session_id: session.remote_session_id.clone(),
+                    export: prepared_session.export_name.clone(),
+                    relpath: prepared_session.relpath_rpc.clone(),
+                    session_id: prepared_session.remote_session_id.clone(),
                     expected_data_frames,
-                    fs_rpc_token: session.fs_rpc_token.clone(),
-                    allow_s3_internal_multipart: session.allow_s3_internal_multipart,
+                    fs_rpc_token: prepared_session.fs_rpc_token.clone(),
+                    allow_s3_internal_multipart: prepared_session.allow_s3_internal_multipart,
                 },
-                session.relpath_rpc.clone(),
+                prepared_session.relpath_rpc.clone(),
             )
         } else {
             let ctx =
@@ -3484,12 +5046,15 @@ impl FluxonFsAgent {
         path_for_err: &str,
         request_identity: Option<&FluxonFsRequestIdentity>,
     ) -> Result<(), FsAgentError> {
-        let session = self.remote_write_session_client_lookup(session_id);
-        if let Some(session) = session.as_ref() {
-            session
-                .state
-                .fail("write session aborted locally".to_string());
-        }
+        let _source_operation = self.enter_remote_write_session_source_operation()?;
+        // Local abort is the ownership boundary. It atomically removes both indexes, fails
+        // waiters, and stops lease keepalive before the best-effort remote RPC begins.
+        let session = remote_write_session_abort_local_entry(
+            self.remote_write_sessions.as_ref(),
+            self.remote_write_sessions_by_remote.as_ref(),
+            session_id,
+            "write session aborted locally",
+        );
         let (node_id, req) = if let Some(session) = session.as_ref() {
             (
                 session.node_id.clone(),
@@ -3532,9 +5097,6 @@ impl FluxonFsAgent {
                 detail: format!("abort_write_session async bridge failed: {}", e),
             })??;
         if resp.ok {
-            if session.is_some() {
-                let _ = self.remote_write_session_client_remove(session_id);
-            }
             return Ok(());
         }
         Err(FsAgentError::Io {
@@ -6529,6 +8091,15 @@ impl FluxonFsAgent {
     }
 }
 
+impl Drop for FluxonFsAgent {
+    fn drop(&mut self) {
+        self.request_write_session_source_shutdown();
+        // The object is terminal here, so no graceful owner can subsequently use the
+        // session metadata for remote abort. Release the local indexes immediately.
+        let _ = self.finish_remote_write_session_source_local();
+    }
+}
+
 fn stage_piece_to_kv_via_runtime(
     runtime: &AgentRemoteRuntime,
     piece_key: &PieceKey,
@@ -7511,7 +9082,7 @@ mod tests {
                 ok: true,
                 err_detail: String::new(),
             }),
-            Ok(false)
+            Ok(0)
         );
 
         assert_eq!(ack_waiter.join().expect("join waiter"), Ok(()));
@@ -7579,7 +9150,7 @@ mod tests {
                 ok: true,
                 err_detail: String::new(),
             }),
-            Ok(false)
+            Ok(0)
         );
         let followup = state.finish_batch_send(&batch, Ok(()));
         assert_eq!(followup.schedule_count, 0);
@@ -7619,7 +9190,7 @@ mod tests {
                 ok: true,
                 err_detail: String::new(),
             }),
-            Ok(false)
+            Ok(0)
         );
         assert_eq!(state.acked_frames_ready(1), Ok(true));
     }
@@ -7651,10 +9222,7 @@ mod tests {
             .expect("begin confirm")
             .expect("confirm must exist");
         assert_eq!(confirm.expected_frames, 1);
-        assert_eq!(
-            state.confirm_delivered_upto(confirm.expected_frames),
-            Ok(false)
-        );
+        assert_eq!(state.confirm_delivered_upto(confirm.expected_frames), Ok(0));
         assert_eq!(state.wait_for_acked_frames(1), Ok(()));
     }
 
@@ -7681,6 +9249,13 @@ mod tests {
             .expect("take first")
             .expect("first batch");
         assert_eq!(first.frame_count, 4);
+        assert_eq!(first.data.len(), REMOTE_WRITE_SESSION_CHUNK_BYTES * 4);
+        assert_eq!(
+            first.part_lengths,
+            vec![u32::try_from(REMOTE_WRITE_SESSION_CHUNK_BYTES).unwrap(); 4]
+        );
+        assert_eq!(first.data_parts.len(), 4);
+        assert!(first.data.iter().all(|value| *value == 0));
 
         let payload2 = vec![1u8; REMOTE_WRITE_SESSION_CHUNK_BYTES * 4];
         let followup2 = state
@@ -7707,5 +9282,940 @@ mod tests {
         let done2 = state.finish_batch_send(&second, Ok(()));
         assert_eq!(done1.schedule_count, 0);
         assert_eq!(done2.schedule_count, 0);
+    }
+
+    #[test]
+    fn write_session_client_state_direct_submits_whole_input_without_copy() {
+        let state = RemoteWriteSessionClientState::default();
+        let payload = Bytes::from_static(b"abcdefgh");
+        let payload_ptr = payload.as_ptr();
+
+        let submits = state
+            .buffer_append(0, payload, 4, 16)
+            .expect("buffer append");
+
+        assert_eq!(submits.len(), 2);
+        assert_eq!(submits[0].base_seq_no, 0);
+        assert_eq!(submits[0].offset, 0);
+        assert_eq!(submits[0].data.as_ref(), b"abcd");
+        assert_eq!(submits[0].data.as_ptr(), payload_ptr);
+        assert_eq!(submits[1].base_seq_no, 1);
+        assert_eq!(submits[1].offset, 4);
+        assert_eq!(submits[1].data.as_ref(), b"efgh");
+        assert_eq!(submits[1].data.as_ptr(), payload_ptr.wrapping_add(4));
+
+        let progress = state.progress.lock();
+        assert!(progress.buffer.is_empty());
+        assert_eq!(progress.buffered_off, None);
+        assert_eq!(progress.next_seq_no, 2);
+        assert_eq!(progress.submitted_frames, 2);
+    }
+
+    #[test]
+    fn write_session_client_state_only_copies_partial_submit_boundaries() {
+        let state = RemoteWriteSessionClientState::default();
+        assert!(
+            state
+                .buffer_append(0, Bytes::from_static(b"ab"), 4, 16)
+                .expect("buffer first partial")
+                .is_empty()
+        );
+
+        let payload = Bytes::from_static(b"cdefghij");
+        let payload_ptr = payload.as_ptr();
+        let submits = state
+            .buffer_append(2, payload, 4, 16)
+            .expect("complete partial and append whole submit");
+
+        assert_eq!(submits.len(), 2);
+        assert_eq!(submits[0].base_seq_no, 0);
+        assert_eq!(submits[0].offset, 0);
+        assert_eq!(submits[0].data.as_ref(), b"abcd");
+        assert_eq!(submits[1].base_seq_no, 1);
+        assert_eq!(submits[1].offset, 4);
+        assert_eq!(submits[1].data.as_ref(), b"efgh");
+        assert_eq!(submits[1].data.as_ptr(), payload_ptr.wrapping_add(2));
+
+        {
+            let progress = state.progress.lock();
+            assert_eq!(progress.submitted_frames, 2);
+            assert_eq!(progress.next_seq_no, 2);
+            assert_eq!(progress.buffered_off, Some(8));
+            assert_eq!(progress.buffer.as_ref(), b"ij");
+        }
+
+        let tail = state.flush_buffered().expect("flush tail");
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].base_seq_no, 2);
+        assert_eq!(tail[0].offset, 8);
+        assert_eq!(tail[0].data.as_ref(), b"ij");
+    }
+
+    #[test]
+    fn write_session_client_state_drains_buffer_when_submit_size_shrinks() {
+        let state = RemoteWriteSessionClientState::default();
+        assert!(
+            state
+                .buffer_append(0, Bytes::from_static(b"abcde"), 8, 16)
+                .expect("buffer initial tail")
+                .is_empty()
+        );
+
+        let submits = state
+            .buffer_append(5, Bytes::from_static(b"f"), 3, 16)
+            .expect("append with smaller submit size");
+
+        assert_eq!(submits.len(), 2);
+        assert_eq!(submits[0].base_seq_no, 0);
+        assert_eq!(submits[0].offset, 0);
+        assert_eq!(submits[0].data.as_ref(), b"abc");
+        assert_eq!(submits[1].base_seq_no, 1);
+        assert_eq!(submits[1].offset, 3);
+        assert_eq!(submits[1].data.as_ref(), b"def");
+        assert!(
+            state
+                .flush_buffered()
+                .expect("flush empty buffer")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn write_session_client_state_schedules_short_submits_independently() {
+        let state = RemoteWriteSessionClientState::default();
+        let submits = state
+            .buffer_append(0, Bytes::from_static(b"abcd"), 1, 16)
+            .expect("buffer append");
+        assert_eq!(submits.len(), 4);
+
+        let scheduled: usize = submits
+            .into_iter()
+            .map(|submit| {
+                state
+                    .enqueue_submit(submit)
+                    .expect("enqueue submit")
+                    .schedule_count
+            })
+            .sum();
+        assert_eq!(scheduled, 4);
+
+        for expected_seq in 0..4 {
+            let batch = state
+                .take_next_batch_for_send()
+                .expect("take batch")
+                .expect("batch must exist");
+            assert_eq!(batch.seq_no, expected_seq);
+            assert_eq!(batch.frame_count, 1);
+            assert_eq!(batch.total_bytes, 1);
+        }
+    }
+
+    #[test]
+    fn write_session_source_queue_backpressure_releases_when_sender_takes_batch() {
+        let state = Arc::new(RemoteWriteSessionClientState::default());
+        let frame_bytes = REMOTE_WRITE_SESSION_CHUNK_BYTES;
+        let first = state
+            .enqueue_submit(RemoteWriteSessionClientSubmit {
+                base_seq_no: 0,
+                offset: 0,
+                data: Bytes::from(vec![0u8; frame_bytes]),
+                enqueued_at: Instant::now(),
+            })
+            .expect("enqueue first submit");
+        assert_eq!(first.schedule_count, 1);
+        {
+            let progress = state.progress.lock();
+            assert_eq!(progress.queued_frame_bytes, frame_bytes);
+            assert!(
+                progress.queued_frame_bytes
+                    <= remote_write_session_max_queued_frame_bytes(
+                        progress.max_inflight_chunks,
+                        frame_bytes,
+                    )
+            );
+        }
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let waiter_state = state.clone();
+        let waiter = thread::spawn(move || {
+            let result = waiter_state.enqueue_submit(RemoteWriteSessionClientSubmit {
+                base_seq_no: 1,
+                offset: frame_bytes as i64,
+                data: Bytes::from(vec![1u8; frame_bytes]),
+                enqueued_at: Instant::now(),
+            });
+            result_tx.send(result).expect("send enqueue result");
+        });
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        let batch = state
+            .take_next_batch_for_send()
+            .expect("take first batch")
+            .expect("first batch must exist");
+        assert_eq!(batch.seq_no, 0);
+        result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("taking a batch must wake the blocked producer")
+            .expect("second enqueue must succeed");
+        waiter.join().expect("join blocked producer");
+
+        let progress = state.progress.lock();
+        assert_eq!(progress.queued_frame_bytes, frame_bytes);
+        assert!(
+            progress.queued_frame_bytes
+                <= remote_write_session_max_queued_frame_bytes(
+                    progress.max_inflight_chunks,
+                    frame_bytes,
+                )
+        );
+    }
+
+    #[test]
+    fn write_session_source_queue_backpressure_is_released_by_failure() {
+        let state = Arc::new(RemoteWriteSessionClientState::default());
+        let frame_bytes = REMOTE_WRITE_SESSION_CHUNK_BYTES;
+        state
+            .enqueue_submit(RemoteWriteSessionClientSubmit {
+                base_seq_no: 0,
+                offset: 0,
+                data: Bytes::from(vec![0u8; frame_bytes]),
+                enqueued_at: Instant::now(),
+            })
+            .expect("enqueue first submit");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let waiter_state = state.clone();
+        let waiter = thread::spawn(move || {
+            let result = waiter_state.enqueue_submit(RemoteWriteSessionClientSubmit {
+                base_seq_no: 1,
+                offset: frame_bytes as i64,
+                data: Bytes::from(vec![1u8; frame_bytes]),
+                enqueued_at: Instant::now(),
+            });
+            result_tx.send(result).expect("send enqueue result");
+        });
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        state.fail("source shutdown".to_string());
+        assert_eq!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("failure must wake the blocked producer"),
+            Err("source shutdown".to_string())
+        );
+        waiter.join().expect("join blocked producer");
+        let progress = state.progress.lock();
+        assert_eq!(progress.queued_frame_bytes, 0);
+        assert!(progress.queued_frames.is_empty());
+    }
+
+    #[test]
+    fn write_session_source_queue_accepts_one_submit_larger_than_window() {
+        let state = RemoteWriteSessionClientState::default();
+        let submit_len = REMOTE_WRITE_SESSION_CHUNK_BYTES + 1;
+        state
+            .enqueue_submit(RemoteWriteSessionClientSubmit {
+                base_seq_no: 0,
+                offset: 0,
+                data: Bytes::from(vec![0u8; submit_len]),
+                enqueued_at: Instant::now(),
+            })
+            .expect("one oversized submit must not wait on its own capacity");
+
+        let progress = state.progress.lock();
+        assert_eq!(progress.queued_frame_bytes, submit_len);
+        assert_eq!(
+            remote_write_session_max_queued_frame_bytes(progress.max_inflight_chunks, submit_len,),
+            submit_len
+        );
+        assert!(
+            progress.queued_frame_bytes
+                <= remote_write_session_max_queued_frame_bytes(
+                    progress.max_inflight_chunks,
+                    submit_len,
+                )
+        );
+    }
+
+    #[test]
+    fn write_session_delivery_releases_every_reserved_short_submit_token() {
+        fn state_with_pending_batch_and_short_submits() -> RemoteWriteSessionClientState {
+            let state = RemoteWriteSessionClientState::default();
+            let initial_bytes = REMOTE_WRITE_SESSION_CHUNK_BYTES * 4;
+            let initial = state
+                .buffer_append(0, Bytes::from(vec![0u8; initial_bytes]), initial_bytes, 4)
+                .expect("buffer initial batch");
+            assert_eq!(initial.len(), 1);
+            assert_eq!(
+                state
+                    .enqueue_submit(initial.into_iter().next().expect("initial submit"))
+                    .expect("enqueue initial submit")
+                    .schedule_count,
+                1
+            );
+            let initial_batch = state
+                .take_next_batch_for_send()
+                .expect("take initial batch")
+                .expect("initial batch must exist");
+            assert_eq!(initial_batch.frame_count, 4);
+
+            let short_submits = state
+                .buffer_append(initial_bytes as i64, Bytes::from_static(b"abcd"), 1, 4)
+                .expect("buffer short submits");
+            assert_eq!(short_submits.len(), 4);
+            for submit in short_submits {
+                assert_eq!(
+                    state
+                        .enqueue_submit(submit)
+                        .expect("enqueue short submit")
+                        .schedule_count,
+                    0,
+                    "the initial batch still occupies the complete window"
+                );
+            }
+
+            let followup = state.finish_batch_send(&initial_batch, Ok(()));
+            assert_eq!(followup.schedule_count, 0);
+            assert_eq!(followup.confirm_seq_no, Some(0));
+            state
+        }
+
+        fn assert_all_short_submits_can_run(state: &RemoteWriteSessionClientState) {
+            for expected_seq in 4..8 {
+                let batch = state
+                    .take_next_batch_for_send()
+                    .expect("take short batch")
+                    .expect("every reserved sender token must have a batch");
+                assert_eq!(batch.seq_no, expected_seq);
+                assert_eq!(batch.frame_count, 1);
+            }
+        }
+
+        let ack_state = state_with_pending_batch_and_short_submits();
+        assert_eq!(
+            ack_state.handle_data_ack(&FsWriteSessionDataAck {
+                session_id: "remote-sess".to_string(),
+                seq_no: 0,
+                frame_count: 4,
+                ok: true,
+                err_detail: String::new(),
+            }),
+            Ok(4)
+        );
+        assert_all_short_submits_can_run(&ack_state);
+
+        let confirm_state = state_with_pending_batch_and_short_submits();
+        let confirm = confirm_state
+            .begin_confirm_pending_batch(0)
+            .expect("begin delivery confirm")
+            .expect("pending batch must require confirmation");
+        assert_eq!(confirm.expected_frames, 4);
+        assert_eq!(
+            confirm_state.confirm_delivered_upto(confirm.expected_frames),
+            Ok(4)
+        );
+        assert_all_short_submits_can_run(&confirm_state);
+    }
+
+    #[test]
+    fn write_session_rejects_noncontiguous_payload_until_delivery_barrier() {
+        let state = RemoteWriteSessionClientState::default();
+        let first = state
+            .buffer_append(0, Bytes::from_static(b"a"), 1, 16)
+            .expect("first payload");
+        assert_eq!(first.len(), 1);
+        let err = state
+            .buffer_append(0, Bytes::from_static(b"b"), 1, 16)
+            .unwrap_err();
+        assert!(err.contains("must be contiguous until a delivery barrier"));
+
+        {
+            let mut progress = state.progress.lock();
+            progress.sent_frames = progress.submitted_frames;
+            progress.acked_frames = progress.submitted_frames;
+        }
+        assert!(
+            state
+                .buffer_append(0, Bytes::from_static(b"b"), 1, 16)
+                .is_ok(),
+            "an overlapping write is safe after the prior delivery barrier"
+        );
+    }
+
+    fn test_write_session_entry_with_lease(
+        identity: RemoteWriteSessionSharedKvLeaseIdentity,
+        suffix: &str,
+    ) -> Arc<RemoteWriteSessionClientEntry> {
+        let (ready_tx, _ready_rx) = tokio_mpsc::unbounded_channel();
+        let peer_sender = Arc::new(RemoteWriteSessionPeerSender {
+            node_id: format!("agent-{suffix}"),
+            ready_tx,
+        });
+        Arc::new(RemoteWriteSessionClientEntry {
+            node_id: format!("agent-{suffix}"),
+            remote_session_id: format!("remote-{suffix}"),
+            export_name: "export-a".to_string(),
+            relpath_rpc: format!("{suffix}.bin"),
+            fs_rpc_token: None,
+            allow_s3_internal_multipart: false,
+            kv_shared: Some(RemoteWriteSessionKvSharedConfig {
+                owner: ShareGroupOwnerRef {
+                    owner_id: "owner-a".to_string(),
+                    owner_start_time: 1,
+                },
+                owner_sub_cluster: "sub-cluster-a".to_string(),
+                lease_id: identity.lease_id,
+                lease_generation: identity.generation,
+                source_node_start_time: 2,
+                target_node_start_time: 3,
+            }),
+            kv_shared_enabled: AtomicBool::new(true),
+            peer_sender: Arc::downgrade(&peer_sender),
+            state: Arc::new(RemoteWriteSessionClientState::default()),
+        })
+    }
+
+    fn test_lease_keepalive_operation() -> LeaseKeepaliveOperation<u64> {
+        Arc::new(|_| Box::pin(async { Ok(()) }))
+    }
+
+    fn test_lease_keepalive_actor() -> Arc<LeaseKeepaliveActor<u64>> {
+        Arc::new(LeaseKeepaliveActor::new(
+            Duration::from_secs(60),
+            Duration::ZERO,
+            Duration::from_secs(1),
+            1,
+        ))
+    }
+
+    #[test]
+    fn write_session_shared_kv_lease_concurrent_acquire_is_single_flight() {
+        const ACQUIRERS: usize = 8;
+
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let keepalive_actor = test_lease_keepalive_actor();
+        let allocation_calls = Arc::new(AtomicUsize::new(0));
+        let allocation_calls_for_fn = allocation_calls.clone();
+        let manager = Arc::new(RemoteWriteSessionSharedKvLeaseManager::new(
+            keepalive_actor.clone(),
+            test_lease_keepalive_operation(),
+            Arc::new(move || {
+                allocation_calls_for_fn.fetch_add(1, Ordering::AcqRel);
+                thread::sleep(Duration::from_millis(50));
+                Ok(91)
+            }),
+            Arc::downgrade(&sessions),
+        ));
+        let start = Arc::new(std::sync::Barrier::new(ACQUIRERS));
+        let threads = (0..ACQUIRERS)
+            .map(|_| {
+                let manager = manager.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    manager.acquire().expect("acquire shared lease")
+                })
+            })
+            .collect::<Vec<_>>();
+        let identities = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("join lease acquirer"))
+            .collect::<Vec<_>>();
+
+        assert!(identities.iter().all(|identity| *identity == identities[0]));
+        assert_eq!(identities[0].lease_id, 91);
+        assert_eq!(allocation_calls.load(Ordering::Acquire), 1);
+        assert_eq!(keepalive_actor.registered_lease_count(), 1);
+
+        manager.close();
+        assert_eq!(keepalive_actor.registered_lease_count(), 0);
+    }
+
+    #[test]
+    fn write_session_shared_kv_lease_allocation_failure_is_sticky() {
+        const ACQUIRERS: usize = 8;
+
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let keepalive_actor = test_lease_keepalive_actor();
+        let allocation_calls = Arc::new(AtomicUsize::new(0));
+        let allocation_calls_for_fn = allocation_calls.clone();
+        let manager = Arc::new(RemoteWriteSessionSharedKvLeaseManager::new(
+            keepalive_actor,
+            test_lease_keepalive_operation(),
+            Arc::new(move || {
+                allocation_calls_for_fn.fetch_add(1, Ordering::AcqRel);
+                thread::sleep(Duration::from_millis(50));
+                Err("test lease allocation failed".to_string())
+            }),
+            Arc::downgrade(&sessions),
+        ));
+        let start = Arc::new(std::sync::Barrier::new(ACQUIRERS));
+        let threads = (0..ACQUIRERS)
+            .map(|_| {
+                let manager = manager.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    manager.acquire().expect_err("shared allocation must fail")
+                })
+            })
+            .collect::<Vec<_>>();
+        let failures = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("join lease acquirer"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            failures
+                .iter()
+                .all(|failure| failure == "test lease allocation failed")
+        );
+        let subsequent = manager
+            .acquire()
+            .expect_err("failed manager must not allocate again");
+        assert_eq!(subsequent, "test lease allocation failed");
+        assert_eq!(allocation_calls.load(Ordering::Acquire), 1);
+        assert_eq!(manager.active_identity(), None);
+    }
+
+    #[test]
+    fn write_session_shared_kv_lease_close_wins_blocked_allocation() {
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let keepalive_actor = test_lease_keepalive_actor();
+        let allocation_started = Arc::new(std::sync::Barrier::new(2));
+        let allocation_release = Arc::new(std::sync::Barrier::new(2));
+        let allocation_started_for_fn = allocation_started.clone();
+        let allocation_release_for_fn = allocation_release.clone();
+        let manager = Arc::new(RemoteWriteSessionSharedKvLeaseManager::new(
+            keepalive_actor.clone(),
+            test_lease_keepalive_operation(),
+            Arc::new(move || {
+                allocation_started_for_fn.wait();
+                allocation_release_for_fn.wait();
+                Ok(94)
+            }),
+            Arc::downgrade(&sessions),
+        ));
+
+        let allocating_manager = manager.clone();
+        let allocator = thread::spawn(move || allocating_manager.acquire());
+        allocation_started.wait();
+        let waiting_manager = manager.clone();
+        let waiter = thread::spawn(move || waiting_manager.acquire());
+
+        manager.close();
+        assert_eq!(
+            waiter.join().expect("join waiting acquirer"),
+            Err("write-session shared KV lease manager is closed".to_string())
+        );
+        allocation_release.wait();
+        assert_eq!(
+            allocator.join().expect("join allocating acquirer"),
+            Err("write-session shared KV lease manager closed during allocation".to_string())
+        );
+        assert_eq!(manager.active_identity(), None);
+        assert_eq!(keepalive_actor.registered_lease_count(), 0);
+
+        manager.close();
+        assert_eq!(keepalive_actor.registered_lease_count(), 0);
+    }
+
+    #[test]
+    fn write_session_shared_kv_lease_registration_failure_is_sticky() {
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let keepalive_actor = test_lease_keepalive_actor();
+        keepalive_actor.close();
+        let allocation_calls = Arc::new(AtomicUsize::new(0));
+        let allocation_calls_for_fn = allocation_calls.clone();
+        let manager = Arc::new(RemoteWriteSessionSharedKvLeaseManager::new(
+            keepalive_actor,
+            test_lease_keepalive_operation(),
+            Arc::new(move || {
+                allocation_calls_for_fn.fetch_add(1, Ordering::AcqRel);
+                Ok(92)
+            }),
+            Arc::downgrade(&sessions),
+        ));
+
+        let first = manager.acquire().expect_err("registration must fail");
+        let second = manager
+            .acquire()
+            .expect_err("failed manager must not allocate again");
+        assert!(first.contains("keepalive actor is closed"));
+        assert_eq!(second, first);
+        assert_eq!(allocation_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn write_session_shared_kv_lease_failure_downgrades_matching_sessions() {
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let keepalive_actor = test_lease_keepalive_actor();
+        let allocation_calls = Arc::new(AtomicUsize::new(0));
+        let allocation_calls_for_fn = allocation_calls.clone();
+        let manager = Arc::new(RemoteWriteSessionSharedKvLeaseManager::new(
+            keepalive_actor.clone(),
+            test_lease_keepalive_operation(),
+            Arc::new(move || {
+                allocation_calls_for_fn.fetch_add(1, Ordering::AcqRel);
+                Ok(93)
+            }),
+            Arc::downgrade(&sessions),
+        ));
+        let identity = manager.acquire().expect("acquire shared lease");
+        let matching_a = test_write_session_entry_with_lease(identity, "matching-a");
+        let matching_b = test_write_session_entry_with_lease(identity, "matching-b");
+        let stale_identity = RemoteWriteSessionSharedKvLeaseIdentity {
+            lease_id: identity.lease_id,
+            generation: identity.generation + 1,
+        };
+        let other_generation =
+            test_write_session_entry_with_lease(stale_identity, "other-generation");
+        sessions
+            .write()
+            .insert("matching-a".to_string(), matching_a.clone());
+        sessions
+            .write()
+            .insert("matching-b".to_string(), matching_b.clone());
+        sessions
+            .write()
+            .insert("other-generation".to_string(), other_generation.clone());
+
+        manager.handle_keepalive_failure(
+            stale_identity,
+            LeaseKeepaliveFailure::Operation("stale failure".to_string()),
+        );
+        assert_eq!(manager.active_identity(), Some(identity));
+        assert!(matching_a.kv_shared_enabled.load(Ordering::Acquire));
+        assert!(matching_b.kv_shared_enabled.load(Ordering::Acquire));
+
+        manager.handle_keepalive_failure(
+            identity,
+            LeaseKeepaliveFailure::Operation("test failure".to_string()),
+        );
+        assert!(!matching_a.kv_shared_enabled.load(Ordering::Acquire));
+        assert!(!matching_b.kv_shared_enabled.load(Ordering::Acquire));
+        assert!(other_generation.kv_shared_enabled.load(Ordering::Acquire));
+        assert_eq!(manager.active_identity(), None);
+        assert_eq!(keepalive_actor.registered_lease_count(), 0);
+        assert_eq!(allocation_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            manager
+                .acquire()
+                .expect_err("keepalive failure must remain sticky"),
+            "shared write-session KV lease keepalive failed: test failure"
+        );
+        assert_eq!(allocation_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn write_session_local_abort_terminates_and_removes_both_indexes() {
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let sessions_by_remote = RwLock::new(HashMap::new());
+        let keepalive_actor = test_lease_keepalive_actor();
+        let shared_lease = Arc::new(RemoteWriteSessionSharedKvLeaseManager::new(
+            keepalive_actor.clone(),
+            test_lease_keepalive_operation(),
+            Arc::new(|| Ok(71)),
+            Arc::downgrade(&sessions),
+        ));
+        let lease_identity = shared_lease.acquire().expect("acquire shared lease");
+        let (ready_tx, _ready_rx) = tokio_mpsc::unbounded_channel();
+        let peer_sender = Arc::new(RemoteWriteSessionPeerSender {
+            node_id: "agent-a".to_string(),
+            ready_tx,
+        });
+        let state = Arc::new(RemoteWriteSessionClientState::default());
+        let entry = Arc::new(RemoteWriteSessionClientEntry {
+            node_id: "agent-a".to_string(),
+            remote_session_id: "remote-a".to_string(),
+            export_name: "export-a".to_string(),
+            relpath_rpc: "file.bin".to_string(),
+            fs_rpc_token: None,
+            allow_s3_internal_multipart: false,
+            kv_shared: Some(RemoteWriteSessionKvSharedConfig {
+                owner: ShareGroupOwnerRef {
+                    owner_id: "owner-a".to_string(),
+                    owner_start_time: 1,
+                },
+                owner_sub_cluster: "sub-cluster-a".to_string(),
+                lease_id: lease_identity.lease_id,
+                lease_generation: lease_identity.generation,
+                source_node_start_time: 2,
+                target_node_start_time: 3,
+            }),
+            kv_shared_enabled: AtomicBool::new(true),
+            peer_sender: Arc::downgrade(&peer_sender),
+            state: state.clone(),
+        });
+        assert_eq!(keepalive_actor.registered_lease_count(), 1);
+        let weak_entry = Arc::downgrade(&entry);
+        sessions
+            .write()
+            .insert("client-a".to_string(), entry.clone());
+        sessions_by_remote.write().insert(
+            remote_write_session_remote_key("agent-a", "remote-a"),
+            entry.clone(),
+        );
+        drop(entry);
+
+        let removed = remote_write_session_abort_local_entry(
+            sessions.as_ref(),
+            &sessions_by_remote,
+            "client-a",
+            "test abort",
+        )
+        .expect("local entry must exist");
+
+        assert!(sessions.read().is_empty());
+        assert!(sessions_by_remote.read().is_empty());
+        assert!(!removed.kv_shared_enabled.load(Ordering::Acquire));
+        assert_eq!(
+            keepalive_actor.registered_lease_count(),
+            1,
+            "aborting one session must not unregister the controller lease"
+        );
+        assert_eq!(shared_lease.active_identity(), Some(lease_identity));
+        assert_eq!(state.submitted_frames(), Err("test abort".to_string()));
+        drop(removed);
+        assert!(weak_entry.upgrade().is_none());
+
+        shared_lease.close();
+        assert_eq!(keepalive_actor.registered_lease_count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_session_source_shutdown_aborts_and_joins_uncooperative_task() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let source = Arc::new(RemoteWriteSessionSourceLifecycle::new());
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started_for_task = started.clone();
+        let dropped_for_task = dropped.clone();
+        assert!(
+            source.spawn_current("test_uncooperative", move |_stop| async move {
+                let _probe = DropProbe(dropped_for_task);
+                started_for_task.store(true, Ordering::Release);
+                std::future::pending::<()>().await;
+            })
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test task did not start");
+
+        source
+            .stop_join_and_abort(Duration::from_millis(10))
+            .await
+            .expect("shutdown must confirm aborted task completion");
+
+        assert!(!source.is_accepting());
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(!source.spawn_current("rejected", |_stop| async {}));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_session_source_graceful_shutdown_joins_task_aborted_by_request() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let source = Arc::new(RemoteWriteSessionSourceLifecycle::new());
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started_for_task = started.clone();
+        let dropped_for_task = dropped.clone();
+        assert!(
+            source.spawn_current("test_request_then_graceful", move |_stop| async move {
+                let _probe = DropProbe(dropped_for_task);
+                started_for_task.store(true, Ordering::Release);
+                std::future::pending::<()>().await;
+            })
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test task did not start");
+
+        // The synchronous fallback requests cancellation, but must leave the JoinHandle in the
+        // lifecycle registry for a later graceful owner to establish a real completion barrier.
+        source.stop_and_abort();
+        source
+            .stop_join_and_abort(Duration::from_secs(1))
+            .await
+            .expect("graceful shutdown must await the task aborted by request shutdown");
+
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_session_source_operation_barrier_is_authoritative() {
+        let source = Arc::new(RemoteWriteSessionSourceLifecycle::new());
+        let guard = source
+            .try_enter_operation()
+            .expect("operation must be admitted before stop");
+        source.stop();
+
+        let timeout_err = source
+            .wait_for_operations(Duration::from_millis(10))
+            .await
+            .expect_err("live operation must prevent completion");
+        assert!(timeout_err.contains("did not drain"));
+        assert!(source.try_enter_operation().is_none());
+
+        drop(guard);
+        source
+            .wait_for_operations(Duration::from_secs(1))
+            .await
+            .expect("dropping the final guard must complete the barrier");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_session_kv_success_skips_raw_transport() {
+        let enabled = AtomicBool::new(true);
+        let raw_calls = Arc::new(AtomicUsize::new(0));
+        let raw_calls_for_send = raw_calls.clone();
+        let ack = FsWriteSessionDataAck {
+            session_id: "session-a".to_string(),
+            seq_no: 7,
+            frame_count: 2,
+            ok: true,
+            err_detail: String::new(),
+        };
+
+        let result = remote_write_session_resolve_transport(
+            Some(Ok(ack)),
+            || enabled.store(false, Ordering::Release),
+            move || {
+                raw_calls_for_send.fetch_add(1, Ordering::SeqCst);
+                async { Err("raw must not run".to_string()) }
+            },
+        )
+        .await
+        .expect("KV result");
+
+        assert_eq!(result.seq_no, 7);
+        assert_eq!(raw_calls.load(Ordering::SeqCst), 0);
+        assert!(enabled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_session_kv_failure_downgrades_and_raw_failure_is_propagated() {
+        let enabled = AtomicBool::new(true);
+        let raw_calls = Arc::new(AtomicUsize::new(0));
+        let raw_calls_for_send = raw_calls.clone();
+
+        let result = remote_write_session_resolve_transport(
+            Some(Err("ref NACK".to_string())),
+            || enabled.store(false, Ordering::Release),
+            move || {
+                raw_calls_for_send.fetch_add(1, Ordering::SeqCst);
+                async { Err("raw failed".to_string()) }
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), "raw failed");
+        assert_eq!(raw_calls.load(Ordering::SeqCst), 1);
+        assert!(!enabled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_session_kv_nack_downgrades_and_uses_raw_transport() {
+        let enabled = AtomicBool::new(true);
+        let raw_calls = Arc::new(AtomicUsize::new(0));
+        let raw_calls_for_send = raw_calls.clone();
+        let nack = FsWriteSessionDataAck {
+            session_id: "session-a".to_string(),
+            seq_no: 7,
+            frame_count: 1,
+            ok: false,
+            err_detail: "rejected".to_string(),
+        };
+
+        let result = remote_write_session_resolve_transport(
+            Some(Ok(nack)),
+            || enabled.store(false, Ordering::Release),
+            move || {
+                raw_calls_for_send.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok(FsWriteSessionDataAck {
+                        session_id: "session-a".to_string(),
+                        seq_no: 7,
+                        frame_count: 1,
+                        ok: true,
+                        err_detail: String::new(),
+                    })
+                }
+            },
+        )
+        .await
+        .expect("raw fallback");
+
+        assert!(result.ok);
+        assert_eq!(raw_calls.load(Ordering::SeqCst), 1);
+        assert!(!enabled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_session_kv_failure_uses_raw_and_keeps_following_batches_downgraded() {
+        let enabled = AtomicBool::new(true);
+        let first = remote_write_session_resolve_transport(
+            Some(Err("KV put failed".to_string())),
+            || enabled.store(false, Ordering::Release),
+            || async {
+                Ok(FsWriteSessionDataAck {
+                    session_id: "session-a".to_string(),
+                    seq_no: 0,
+                    frame_count: 1,
+                    ok: true,
+                    err_detail: String::new(),
+                })
+            },
+        )
+        .await
+        .expect("raw fallback");
+        assert_eq!(first.seq_no, 0);
+        assert!(!enabled.load(Ordering::Acquire));
+
+        let second = remote_write_session_resolve_transport(
+            None,
+            || enabled.store(false, Ordering::Release),
+            || async {
+                Ok(FsWriteSessionDataAck {
+                    session_id: "session-a".to_string(),
+                    seq_no: 1,
+                    frame_count: 1,
+                    ok: true,
+                    err_detail: String::new(),
+                })
+            },
+        )
+        .await
+        .expect("raw after downgrade");
+        assert_eq!(second.seq_no, 1);
+        assert!(!enabled.load(Ordering::Acquire));
     }
 }

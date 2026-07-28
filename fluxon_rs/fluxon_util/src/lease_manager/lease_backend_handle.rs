@@ -108,15 +108,35 @@ impl LeaseBackendHandle {
     pub(crate) async fn keepalive(&self, lease_id: u64) -> anyhow::Result<()> {
         match &*self.entry {
             LeaseBackendInner::KvClient { keepalive, .. } => {
-                (keepalive)(lease_id).await?;
-                super::lifecycle::debug_keepalive_log(lease_id, "kvclient lease keepalive tick");
-                Ok(())
+                match tokio::time::timeout(
+                    Duration::from_millis(
+                        super::keepalive_actor::KEEPALIVE_BACKEND_OPERATION_BUDGET_MS,
+                    ),
+                    (keepalive)(lease_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        super::lifecycle::debug_keepalive_log(
+                            lease_id,
+                            "kvclient lease keepalive tick",
+                        );
+                        Ok(())
+                    }
+                    Ok(Err(err)) => Err(err),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "kvclient keepalive timed out for lease_id={}",
+                        lease_id
+                    )),
+                }
             }
             LeaseBackendInner::Etcd { .. } => {
                 if let Some(state) = self.get_etcd_state(lease_id) {
                     let mut st = state.lock().await;
                     match tokio::time::timeout(
-                        Duration::from_millis(super::keepalive_actor::KEEPALIVE_PER_TASK_BUDGET_MS),
+                        Duration::from_millis(
+                            super::keepalive_actor::KEEPALIVE_BACKEND_OPERATION_BUDGET_MS,
+                        ),
                         st.keepalive_once(),
                     )
                     .await

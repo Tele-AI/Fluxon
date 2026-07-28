@@ -4,6 +4,11 @@ mod lease_backend_uid;
 mod lease_handle;
 mod lifecycle;
 
+pub use keepalive_actor::{
+    LeaseKeepaliveActor, LeaseKeepaliveFailure, LeaseKeepaliveFailureCallback,
+    LeaseKeepaliveFailurePolicy, LeaseKeepaliveFuture, LeaseKeepaliveOperation,
+    LeaseKeepaliveRegistration,
+};
 pub use lease_backend_handle::LeaseBackendHandle;
 pub use lease_backend_uid::{
     KvAllocateLease, KvKeepaliveLease, KvLeaseFuture, LeaseBackendUid, LeaseRegisterKind, LeaseType,

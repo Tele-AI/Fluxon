@@ -41,6 +41,7 @@ use fluxon_util::run_async_from_sync::spawn_blocking_allow_sync_async_bridge;
 use fluxon_util::{FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2};
 use futures::future::BoxFuture;
 use parking_lot::Mutex;
+use prost::bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
@@ -63,6 +64,7 @@ const ETCD_PREFIX_FS_EXPORT_REGISTRY: &str = "/fluxon_fs_export_registry";
 
 const EXPORT_REGISTRY_SYNC_RETRY_LOG_TICKS: u64 = 25;
 const EXPORT_REGISTRY_SYNC_MAX_WAIT_SECS: u64 = 120;
+const S3_WRITE_SESSION_SUBMIT_MULTIPLIER: usize = 4;
 
 fn export_registry_sync_budget_exhausted(waited: Duration) -> bool {
     waited >= Duration::from_secs(EXPORT_REGISTRY_SYNC_MAX_WAIT_SECS)
@@ -195,6 +197,23 @@ impl FsS3BackendAgent {
         e: FsAgentError,
     ) -> fluxon_fs_s3_gateway::S3Error {
         map_fs_agent_error_to_s3_error(export_name.as_ref(), relpath.as_ref(), e)
+    }
+
+    fn write_session_submit_bytes() -> usize {
+        crate::agent::REMOTE_WRITE_SESSION_CHUNK_BYTES
+            .saturating_mul(S3_WRITE_SESSION_SUBMIT_MULTIPLIER)
+            .max(1)
+    }
+
+    fn write_session_max_inflight_chunks(&self) -> usize {
+        let frame_bytes = crate::agent::REMOTE_WRITE_SESSION_CHUNK_BYTES.max(1) as u64;
+        let target_bytes = self
+            .agent
+            .remote_write_session_target_inflight_bytes()
+            .max(frame_bytes);
+        usize::try_from(target_bytes.div_ceil(frame_bytes))
+            .unwrap_or(usize::MAX)
+            .max(1)
     }
 }
 
@@ -412,6 +431,161 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
                     rel2.as_ref(),
                     offset,
                     data,
+                    &path_for_err,
+                    request_identity.as_ref(),
+                )
+            })
+            .await;
+            match j {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(this.map_agent_err(export_name, relpath, e)),
+                Err(e) => Err(fluxon_fs_s3_gateway::S3Error::Internal {
+                    detail: format!("spawn_blocking join failed: {}", e),
+                }),
+            }
+        })
+    }
+
+    fn supports_write_session(&self) -> bool {
+        true
+    }
+
+    fn write_session_preferred_payload_bytes(&self) -> usize {
+        Self::write_session_submit_bytes()
+    }
+
+    fn open_write_session(
+        &self,
+        request_identity: FluxonFsRequestIdentity,
+        export_name: Arc<str>,
+        relpath: Arc<str>,
+    ) -> BoxFuture<'static, Result<Arc<str>, fluxon_fs_s3_gateway::S3Error>> {
+        let this = self.clone();
+        let request_identity = Some(request_identity);
+        Box::pin(async move {
+            let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
+            let export2 = export_name.clone();
+            let rel2 = relpath.clone();
+            let agent = this.agent.clone();
+            let j = spawn_blocking_allow_sync_async_bridge(move || {
+                agent.remote_open_write_session_by_handle_with_identity(
+                    export2.as_ref(),
+                    rel2.as_ref(),
+                    &path_for_err,
+                    request_identity.as_ref(),
+                )
+            })
+            .await;
+            match j {
+                Ok(Ok((session_id, _size, _mtime_ns))) => Ok(Arc::from(session_id)),
+                Ok(Err(e)) => Err(this.map_agent_err(export_name, relpath, e)),
+                Err(e) => Err(fluxon_fs_s3_gateway::S3Error::Internal {
+                    detail: format!("spawn_blocking join failed: {}", e),
+                }),
+            }
+        })
+    }
+
+    fn buffer_write_session_payload(
+        &self,
+        request_identity: FluxonFsRequestIdentity,
+        export_name: Arc<str>,
+        relpath: Arc<str>,
+        session_id: Arc<str>,
+        offset: i64,
+        data: Bytes,
+    ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
+        let this = self.clone();
+        let request_identity = Some(request_identity);
+        let submit_bytes = Self::write_session_submit_bytes();
+        let max_inflight_chunks = self.write_session_max_inflight_chunks();
+        Box::pin(async move {
+            let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
+            let export2 = export_name.clone();
+            let rel2 = relpath.clone();
+            let session_id2 = session_id.clone();
+            let agent = this.agent.clone();
+            let j = spawn_blocking_allow_sync_async_bridge(move || {
+                agent.remote_buffer_write_session_payload_by_handle_with_identity(
+                    export2.as_ref(),
+                    rel2.as_ref(),
+                    session_id2.as_ref(),
+                    offset,
+                    data,
+                    submit_bytes,
+                    max_inflight_chunks,
+                    &path_for_err,
+                    request_identity.as_ref(),
+                )
+            })
+            .await;
+            match j {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(this.map_agent_err(export_name, relpath, e)),
+                Err(e) => Err(fluxon_fs_s3_gateway::S3Error::Internal {
+                    detail: format!("spawn_blocking join failed: {}", e),
+                }),
+            }
+        })
+    }
+
+    fn finalize_write_session(
+        &self,
+        request_identity: FluxonFsRequestIdentity,
+        export_name: Arc<str>,
+        relpath: Arc<str>,
+        session_id: Arc<str>,
+        final_size: i64,
+    ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
+        let this = self.clone();
+        let request_identity = Some(request_identity);
+        Box::pin(async move {
+            let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
+            let export2 = export_name.clone();
+            let rel2 = relpath.clone();
+            let session_id2 = session_id.clone();
+            let agent = this.agent.clone();
+            let j = spawn_blocking_allow_sync_async_bridge(move || {
+                agent.remote_finalize_write_session_by_handle_with_identity(
+                    export2.as_ref(),
+                    rel2.as_ref(),
+                    session_id2.as_ref(),
+                    final_size,
+                    &path_for_err,
+                    request_identity.as_ref(),
+                )
+            })
+            .await;
+            match j {
+                Ok(Ok((_size, _mtime_ns))) => Ok(()),
+                Ok(Err(e)) => Err(this.map_agent_err(export_name, relpath, e)),
+                Err(e) => Err(fluxon_fs_s3_gateway::S3Error::Internal {
+                    detail: format!("spawn_blocking join failed: {}", e),
+                }),
+            }
+        })
+    }
+
+    fn abort_write_session(
+        &self,
+        request_identity: FluxonFsRequestIdentity,
+        export_name: Arc<str>,
+        relpath: Arc<str>,
+        session_id: Arc<str>,
+    ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
+        let this = self.clone();
+        let request_identity = Some(request_identity);
+        Box::pin(async move {
+            let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
+            let export2 = export_name.clone();
+            let rel2 = relpath.clone();
+            let session_id2 = session_id.clone();
+            let agent = this.agent.clone();
+            let j = spawn_blocking_allow_sync_async_bridge(move || {
+                agent.remote_abort_write_session_by_handle_with_identity(
+                    export2.as_ref(),
+                    rel2.as_ref(),
+                    session_id2.as_ref(),
                     &path_for_err,
                     request_identity.as_ref(),
                 )
@@ -965,6 +1139,7 @@ async fn async_main(
         s3_agent_api,
         rt_handle.clone(),
     ));
+    let s3_agent_for_shutdown = s3_agent.clone();
     s3_agent
         .set_cache_config_yaml(&cache_yaml)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1124,29 +1299,42 @@ async fn async_main(
         .with_graceful_shutdown(shutdown_fut);
     tokio::pin!(server);
 
-    tokio::select! {
-        res = &mut server => {
-            // If the HTTP server ends unexpectedly while the framework is still running,
-            // force a full framework shutdown to stop all background tasks consistently.
-            if poller.is_running() {
-                let _ = fs_framework.shutdown().await;
-            }
-            res.with_context(|| "serve http")?;
-        }
+    let service_result = tokio::select! {
+        res = &mut server => res.with_context(|| "serve http"),
         _ = fs_framework.wait_shutdown_signal() => {
+            s3_agent_for_shutdown
+                .shutdown_write_session_source()
+                .await
+                .map_err(|e| anyhow::anyhow!(
+                    "write-session source shutdown failed: {}",
+                    e
+                ))?;
             fs_framework
                 .shutdown()
                 .await
                 .map_err(|e| anyhow::anyhow!("framework shutdown failed: {}", e))?;
-            server.await.with_context(|| "serve http")?;
+            server.await.with_context(|| "serve http")
         }
+    };
+
+    // If the HTTP server stopped first, drain write-session source tasks before releasing the FS
+    // framework and its KV dependency. The signal branch already performed these two steps.
+    if poller.is_running() {
+        s3_agent_for_shutdown
+            .shutdown_write_session_source()
+            .await
+            .map_err(|e| anyhow::anyhow!("write-session source shutdown failed: {}", e))?;
+        fs_framework
+            .shutdown()
+            .await
+            .map_err(|e| anyhow::anyhow!("framework shutdown failed: {}", e))?;
     }
 
     kv_framework
         .shutdown()
         .await
         .map_err(|e| anyhow::anyhow!("kv framework shutdown failed: {}", e))?;
-    Ok(())
+    service_result
 }
 
 fn extract_kvclient_config_yaml_from_fluxon_config(raw: &str) -> anyhow::Result<ClientConfigYaml> {

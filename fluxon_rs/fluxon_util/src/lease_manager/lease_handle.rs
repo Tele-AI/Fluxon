@@ -1,4 +1,6 @@
-use super::keepalive_actor::{EtcdState, LeaseKey, OneTtlKeepAliveInner};
+use super::keepalive_actor::{
+    EtcdState, LeaseActorMapKey, LeaseKeepaliveRegistration, LeaseKey, OneTtlKeepAliveInner,
+};
 use super::lease_backend_handle::LeaseBackendHandle;
 use super::lease_backend_uid::{LeaseBackendUid, LeaseRegisterKind, LeaseType};
 use crate::auto_clean_map::AutoCleanMapEntry;
@@ -16,13 +18,16 @@ pub enum LeaseEntryKind {
 }
 
 pub(crate) struct LeaseEntry {
+    // Drop the scheduler registration before backend resources and the actor-map
+    // guard so no future keepalive tick can start from this entry.
+    pub(crate) _keepalive_registration: LeaseKeepaliveRegistration<LeaseKey>,
     // No separate counter: user-side LeaseHandle/GeneralLease Drop releases its
     // AutoCleanMapEntry guard. Registrations for the same key reuse the same
     // table entry; the entry is removed after the last guard is dropped.
     pub(crate) kind: LeaseEntryKind,
-    // Guard of `actor_map(): AutoCleanMap<i64, Arc<OneTtlKeepAliveInner>>`, keyed by `ttl_seconds`.
-    // Holding this keeps the per-ttl actor (`OneTtlKeepAliveInner`) alive while entries exist.
-    pub(crate) _actor_guard: AutoCleanMapEntry<i64, Arc<OneTtlKeepAliveInner>>,
+    // Guard of the actor map, keyed by `(ttl_seconds, runtime_id)`. Holding it
+    // keeps the per-TTL actor alive while entries exist in this runtime.
+    pub(crate) _actor_guard: AutoCleanMapEntry<LeaseActorMapKey, Arc<OneTtlKeepAliveInner>>,
     pub(crate) key: LeaseKey,
     // Present only for Etcd entries. This is the guard of
     // `LeaseBackendInner::Etcd::states: AutoCleanMap<u64, Arc<tokio::sync::Mutex<EtcdState>>>`,

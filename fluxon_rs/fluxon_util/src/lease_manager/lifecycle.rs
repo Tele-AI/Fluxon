@@ -8,13 +8,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 use anyhow::{Context, Result as AnyResult};
 use etcd_client::Client;
 
 use super::keepalive_actor::{
-    self, ActorRegisterInvocation, EtcdState, LeaseKey, OneTtlKeepAliveInner, ensure_inner_running,
+    self, ActorRegisterInvocation, EtcdState, LeaseActorMapKey, LeaseKeepaliveFailure,
+    LeaseKeepaliveFailurePolicy, LeaseKeepaliveOperation, LeaseKey, OneTtlKeepAliveInner,
+    ensure_inner_running,
 };
 use super::lease_backend_handle::{LeaseBackendHandle, LeaseBackendInner};
 use super::lease_backend_uid::{KvKeepaliveLease, LeaseBackendUid, LeaseRegisterKind, LeaseType};
@@ -74,8 +75,8 @@ pub fn snapshot_active_lease_debug() -> Vec<(i64, LeaseBackendUid, u64, Option<S
     // leases will not appear here even if an actor is still running
     // its final tick.
     let mut out = Vec::new();
-    for (ttl, inner) in actor_map().snapshot_map(|ttl, inner| (*ttl, inner.clone())) {
-        let ttl_seconds = ttl;
+    for (actor_key, inner) in actor_map().snapshot_map(|key, inner| (*key, inner.clone())) {
+        let ttl_seconds = actor_key.ttl_seconds();
         let entries: Vec<(LeaseKey, ())> = inner.registry.snapshot_map(|k, _| (k.clone(), ())); // only need the key
         for (key, _) in entries.into_iter() {
             let backend = key.backend_uid().clone();
@@ -168,8 +169,50 @@ pub fn registered_etcd_client(uid: &LeaseBackendUid) -> AnyResult<Client> {
 
 pub(crate) type OnKeepalive = KvKeepaliveLease;
 
-fn actor_map() -> &'static AutoCleanMap<i64, Arc<OneTtlKeepAliveInner>> {
-    static MAP: OnceLock<AutoCleanMap<i64, Arc<OneTtlKeepAliveInner>>> = OnceLock::new();
+fn register_periodic_keepalive(
+    actor_guard: &AutoCleanMapEntry<LeaseActorMapKey, Arc<OneTtlKeepAliveInner>>,
+    key: &LeaseKey,
+    handle: LeaseBackendHandle,
+) -> super::keepalive_actor::LeaseKeepaliveRegistration<LeaseKey> {
+    let operation_handle = handle.clone();
+    let operation: LeaseKeepaliveOperation<LeaseKey> = Arc::new(move |key| {
+        let handle = operation_handle.clone();
+        Box::pin(async move {
+            handle
+                .keepalive(key.lease_id())
+                .await
+                .map_err(|err| format!("{err:?}"))
+        })
+    });
+    let lease_id = key.lease_id();
+    let on_failure = Arc::new(move |failure: LeaseKeepaliveFailure| {
+        keepalive_actor::log_keepalive_error_rate_limited(lease_id, || match failure {
+            LeaseKeepaliveFailure::Operation(err) => tracing::error!(
+                lease_id,
+                error = %err,
+                "lease keepalive operation failed; retrying this lease"
+            ),
+            LeaseKeepaliveFailure::Timeout { timeout } => tracing::error!(
+                lease_id,
+                timeout_ms = timeout.as_millis(),
+                "lease keepalive operation timed out; retrying this lease"
+            ),
+        });
+    });
+    actor_guard
+        .actor
+        .register_replacing(
+            key.clone(),
+            operation,
+            LeaseKeepaliveFailurePolicy::RetryAfter(keepalive_actor::MQ_KEEPALIVE_RETRY_DELAY),
+            on_failure,
+        )
+        .expect("new MQ lease registry entry must own a unique keepalive registration")
+}
+
+fn actor_map() -> &'static AutoCleanMap<LeaseActorMapKey, Arc<OneTtlKeepAliveInner>> {
+    static MAP: OnceLock<AutoCleanMap<LeaseActorMapKey, Arc<OneTtlKeepAliveInner>>> =
+        OnceLock::new();
     MAP.get_or_init(|| AutoCleanMap::new())
 }
 
@@ -180,7 +223,7 @@ fn actor_map() -> &'static AutoCleanMap<i64, Arc<OneTtlKeepAliveInner>> {
 /// - the regular branch probes synchronously in `register_lease_for_keepalive`;
 /// - the actor only drives later TTL-cadence keepalives.
 pub(crate) fn actor_register_entry(
-    actor_guard: &AutoCleanMapEntry<i64, Arc<OneTtlKeepAliveInner>>,
+    actor_guard: &AutoCleanMapEntry<LeaseActorMapKey, Arc<OneTtlKeepAliveInner>>,
     key: LeaseKey,
     inv: &ActorRegisterInvocation,
     rt: tokio::runtime::Handle,
@@ -196,7 +239,10 @@ pub(crate) fn actor_register_entry(
                     None,
                     rt.clone(),
                 );
+                let keepalive_registration =
+                    register_periodic_keepalive(actor_guard, &key, handle.clone());
                 LeaseEntry {
+                    _keepalive_registration: keepalive_registration,
                     kind: LeaseEntryKind::KvClient { handle },
                     _actor_guard: actor_guard.clone(),
                     key: key.clone(),
@@ -237,7 +283,10 @@ pub(crate) fn actor_register_entry(
                         last_stage: "init",
                     }))
                 });
+                let keepalive_registration =
+                    register_periodic_keepalive(actor_guard, &key, handle.clone());
                 LeaseEntry {
+                    _keepalive_registration: keepalive_registration,
                     kind: LeaseEntryKind::Etcd { handle },
                     _actor_guard: actor_guard.clone(),
                     key: key.clone(),
@@ -261,7 +310,6 @@ pub(crate) fn actor_get_or_spawn_and_register(
     ttl_seconds: i64,
     key: LeaseKey,
     inv: &ActorRegisterInvocation,
-    spawn_cb: impl FnOnce(Arc<OneTtlKeepAliveInner>),
     rt: tokio::runtime::Handle,
 ) -> AutoCleanMapEntry<LeaseKey, LeaseEntry> {
     if let ActorRegisterInvocation::KvClient {
@@ -271,47 +319,25 @@ pub(crate) fn actor_get_or_spawn_and_register(
         record_register_by(key.lease_id(), lbl.clone());
     }
 
-    let (actor_entry, created) = actor_map().get_or_init_with(ttl_seconds, || {
-        Arc::new(OneTtlKeepAliveInner {
-            ttl_seconds,
-            registry: AutoCleanMap::new(),
-            running_state: Mutex::new(false),
-        })
+    let actor_key = LeaseActorMapKey::new(ttl_seconds, rt.id());
+    let (actor_entry, _created) = actor_map().get_or_init_with(actor_key, || {
+        Arc::new(OneTtlKeepAliveInner::new(ttl_seconds))
     });
 
     let entry = actor_register_entry(&actor_entry, key.clone(), inv, rt.clone());
-    if created {
-        spawn_cb((*actor_entry).clone());
-    } else {
-        // If the actor existed previously but might be exiting, ensure it is running.
-        let inner = (*actor_entry).clone();
-        let rth = rt.clone();
-        rt.spawn(async move {
-            ensure_inner_running(rth, inner).await;
-        });
-    }
+    ensure_inner_running(rt, (*actor_entry).clone());
     entry
 }
 
 // ---------- LeaseEntry Drop (centralized lifecycle cleanup) ----------
-// Why no interaction with the actor is needed on Drop:
-// - The registry is an AutoCleanMap<LeaseKey, LeaseEntry>. The user-facing
-//   GeneralLease holds an AutoCleanMapEntry<LeaseKey, LeaseEntry> guard. When
-//   that guard is dropped, the map entry is removed and the value (LeaseEntry)
-//   is dropped immediately.
-// - The actor loop drives keepalives by taking a snapshot of the registry each
-//   tick via snapshot_filter_map. Once an entry is removed, future snapshots no
-//   longer include it, so there is no need to send an explicit "unregister"
-//   message to the actor.
-// - Concurrency window: if a snapshot containing this entry has already been
-//   taken for the current tick while Drop happens, the snapshot holds clones
-//   (e.g., Arc<EtcdState>). That snapshot may perform one last keepalive for
-//   this tick and then release naturally; the next tick will not see the entry.
-//   This one-last-tick behavior is benign and has no side effects beyond the
-//   regular cadence (we do not perform any keepalive during Drop).
-// - Therefore, Drop only performs local cleanup/logging. Keepalive stopping is
-//   achieved by the entry removal itself. Semantic owners must delete their own
-//   metadata explicitly during graceful close; backend TTL handles crash cleanup.
+// The user-facing GeneralLease holds an AutoCleanMapEntry guard. Registrations
+// for the same key share one LeaseEntry, so the value is dropped only after the
+// last user guard is released. Its `_keepalive_registration` field is declared
+// first and therefore unregisters the exact actor generation before backend and
+// actor-map guards are released. An already-polled keepalive future may finish,
+// but its generation check prevents it from rescheduling a removed lease.
+// Semantic owners still delete their own metadata during graceful close; lease
+// TTL remains the crash-cleanup fallback.
 impl Drop for LeaseEntry {
     fn drop(&mut self) {
         let lease_id = self.key.lease_id();
@@ -580,7 +606,7 @@ pub async fn register_lease_for_keepalive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(9_000_000);
 
@@ -600,24 +626,9 @@ mod tests {
             keepalive: backend_uid.kv_keepalive().expect("kv keepalive operation"),
             label: None,
         };
-        let observed = Arc::new(AtomicBool::new(false));
-        let observed_in_spawn = observed.clone();
+        let entry = actor_get_or_spawn_and_register(ttl_seconds, key, &inv, rt.handle().clone());
 
-        let _entry = actor_get_or_spawn_and_register(
-            ttl_seconds,
-            key,
-            &inv,
-            move |inner| {
-                assert!(
-                    !inner.registry.is_empty(),
-                    "new keepalive actor must start after its first lease is registered"
-                );
-                observed_in_spawn.store(true, Ordering::SeqCst);
-            },
-            rt.handle().clone(),
-        );
-
-        assert!(observed.load(Ordering::SeqCst));
+        assert_eq!(entry._actor_guard.actor.registered_lease_count(), 1);
     }
 
     #[test]
