@@ -4,7 +4,7 @@
 
 <div align="center">
 
-An AI-native distributed data plane for high performance RPC, KV Cache, Message Queue, and File & Object Acceleration. 
+An AI-native distributed data plane that supports high performance RPC, KV Cache, Message Queue, and File & Object Acceleration. 
 
 [![Linux Only](https://img.shields.io/badge/Linux-Only-2ea44f)](#runtime-requirements)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB)](#runtime-requirements)
