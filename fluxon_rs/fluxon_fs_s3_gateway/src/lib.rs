@@ -256,6 +256,22 @@ pub trait FsS3Backend: Send + Sync {
         offset: i64,
         data: Vec<u8>,
     ) -> BoxFuture<'static, Result<(), S3Error>>;
+    fn supports_put_small_object(&self) -> bool {
+        false
+    }
+    fn put_small_object(
+        &self,
+        _request_identity: FluxonFsRequestIdentity,
+        _export_name: Arc<str>,
+        _relpath: Arc<str>,
+        _data: Bytes,
+    ) -> BoxFuture<'static, Result<(), S3Error>> {
+        Box::pin(async {
+            Err(S3Error::Internal {
+                detail: "put_small_object is not supported by this backend".to_string(),
+            })
+        })
+    }
     fn supports_write_session(&self) -> bool {
         false
     }
@@ -3552,7 +3568,9 @@ async fn handle_any_authed_impl(
             }
             let bucket_arc: Arc<str> = Arc::from(bucket);
             let rel_arc: Arc<str> = Arc::from(rel.as_str());
-            ensure_parent_dirs(&st, request_identity.clone(), bucket_arc.clone(), &rel).await?;
+            if !(st.backend.supports_put_small_object() && st.backend.supports_write_session()) {
+                ensure_parent_dirs(&st, request_identity.clone(), bucket_arc.clone(), &rel).await?;
+            }
             let (etag, _size) = put_object_stream_with_sha256_etag(
                 &st,
                 request_identity.clone(),
@@ -3900,6 +3918,7 @@ struct HybridObjectWriter {
     pending: BytesMut,
     session_id: Option<Arc<str>>,
     session_supported: bool,
+    put_small_object_supported: bool,
     session_payload_bytes: usize,
 }
 
@@ -3911,6 +3930,7 @@ impl HybridObjectWriter {
         rel: Arc<str>,
     ) -> Self {
         let session_supported = st.backend.supports_write_session();
+        let put_small_object_supported = st.backend.supports_put_small_object();
         let session_payload_bytes = st.backend.write_session_preferred_payload_bytes().max(1);
         Self {
             backend: st.backend.clone(),
@@ -3922,6 +3942,7 @@ impl HybridObjectWriter {
             pending: BytesMut::new(),
             session_id: None,
             session_supported,
+            put_small_object_supported,
             session_payload_bytes,
         }
     }
@@ -4058,6 +4079,21 @@ impl HybridObjectWriter {
                 )
                 .await?;
             self.session_id = None;
+            return Ok(self.received_size);
+        }
+
+        if self.session_supported && self.put_small_object_supported {
+            debug_assert_eq!(self.pending_offset, 0);
+            let payload = self.pending.split().freeze();
+            self.backend
+                .put_small_object(
+                    self.request_identity.clone(),
+                    self.bucket.clone(),
+                    self.rel.clone(),
+                    payload,
+                )
+                .await?;
+            self.pending_offset = self.received_size;
             return Ok(self.received_size);
         }
 
@@ -4576,7 +4612,9 @@ async fn multipart_upload_part(
     }
 
     let part_path = multipart_part_path(upload_id, part_number)?;
-    ensure_parent_dirs(st, request_identity.clone(), bucket.clone(), &part_path).await?;
+    if !(st.backend.supports_put_small_object() && st.backend.supports_write_session()) {
+        ensure_parent_dirs(st, request_identity.clone(), bucket.clone(), &part_path).await?;
+    }
     let part_path_arc: Arc<str> = Arc::from(part_path.as_str());
     let (etag, _size) = put_object_stream_with_sha256_etag(
         st,
@@ -4866,7 +4904,9 @@ async fn multipart_complete(
         })?;
     let parts = parse_complete_multipart_body(&body_bytes)?;
     let mut out_hasher = Sha256::new();
-    ensure_parent_dirs(st, request_identity.clone(), bucket.clone(), key).await?;
+    if !(st.backend.supports_put_small_object() && st.backend.supports_write_session()) {
+        ensure_parent_dirs(st, request_identity.clone(), bucket.clone(), key).await?;
+    }
     let final_relpath: Arc<str> = Arc::from(key);
     let mut writer =
         HybridObjectWriter::new(st, request_identity.clone(), bucket.clone(), final_relpath);
@@ -5845,6 +5885,7 @@ mod tests {
     struct ObjectWriteMetrics {
         chunk_writes: Vec<(i64, usize)>,
         regular_truncates: Vec<i64>,
+        small_object_puts: Vec<usize>,
         session_opens: usize,
         session_payloads: Vec<(i64, usize)>,
         session_finalizes: Vec<i64>,
@@ -6140,6 +6181,29 @@ mod tests {
                     entry.resize(needed, 0);
                 }
                 entry[offset_usize..needed].copy_from_slice(&data);
+                Ok(())
+            })
+        }
+
+        fn supports_put_small_object(&self) -> bool {
+            true
+        }
+
+        fn put_small_object(
+            &self,
+            _request_identity: FluxonFsRequestIdentity,
+            export_name: Arc<str>,
+            relpath: Arc<str>,
+            data: Bytes,
+        ) -> futures::future::BoxFuture<'static, Result<(), S3Error>> {
+            let this = self.clone();
+            let bucket = export_name.to_string();
+            let key = relpath.to_string();
+            Box::pin(async move {
+                this.write_metrics.lock().small_object_puts.push(data.len());
+                this.objects
+                    .lock()
+                    .insert((bucket, key), data.as_ref().to_vec());
                 Ok(())
             })
         }
@@ -11144,7 +11208,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
     }
 
     #[tokio::test]
-    async fn test_hybrid_put_uses_chunk_rpc_below_session_threshold() {
+    async fn test_hybrid_put_uses_single_small_object_rpc_below_session_threshold() {
         let threshold = fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES;
         let data = vec![0x31; threshold - 1];
         let backend = ObjectBackend::with_write_session(FS_RPC_CHUNK_BYTES * 2);
@@ -11167,15 +11231,9 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert!(metrics.session_payloads.is_empty());
         assert!(metrics.session_finalizes.is_empty());
         assert_eq!(metrics.session_aborts, 0);
-        assert_eq!(metrics.regular_truncates, vec![(threshold - 1) as i64]);
-        assert_eq!(
-            metrics
-                .chunk_writes
-                .iter()
-                .map(|(_offset, len)| *len)
-                .sum::<usize>(),
-            threshold - 1
-        );
+        assert!(metrics.chunk_writes.is_empty());
+        assert!(metrics.regular_truncates.is_empty());
+        assert_eq!(metrics.small_object_puts, vec![threshold - 1]);
     }
 
     #[tokio::test]

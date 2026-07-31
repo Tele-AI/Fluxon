@@ -446,6 +446,49 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
         })
     }
 
+    fn supports_put_small_object(&self) -> bool {
+        true
+    }
+
+    fn put_small_object(
+        &self,
+        request_identity: FluxonFsRequestIdentity,
+        export_name: Arc<str>,
+        relpath: Arc<str>,
+        data: Bytes,
+    ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
+        let this = self.clone();
+        let request_identity = Some(request_identity);
+        Box::pin(async move {
+            if data.len() >= fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES {
+                return Err(fluxon_fs_s3_gateway::S3Error::InvalidRequest {
+                    detail: "small object must be below the write-session threshold".to_string(),
+                });
+            }
+            let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
+            let export2 = export_name.clone();
+            let rel2 = relpath.clone();
+            let agent = this.agent.clone();
+            let j = spawn_blocking_allow_sync_async_bridge(move || {
+                agent.remote_put_small_object_by_handle_s3_gateway_with_identity(
+                    export2.as_ref(),
+                    rel2.as_ref(),
+                    data,
+                    &path_for_err,
+                    request_identity.as_ref(),
+                )
+            })
+            .await;
+            match j {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(this.map_agent_err(export_name, relpath, e)),
+                Err(e) => Err(fluxon_fs_s3_gateway::S3Error::Internal {
+                    detail: format!("spawn_blocking join failed: {}", e),
+                }),
+            }
+        })
+    }
+
     fn supports_write_session(&self) -> bool {
         true
     }
@@ -468,7 +511,7 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
             let rel2 = relpath.clone();
             let agent = this.agent.clone();
             let j = spawn_blocking_allow_sync_async_bridge(move || {
-                agent.remote_open_write_session_by_handle_with_identity(
+                agent.remote_open_write_session_by_handle_s3_gateway_with_identity(
                     export2.as_ref(),
                     rel2.as_ref(),
                     &path_for_err,
@@ -1294,7 +1337,9 @@ async fn async_main(
         shutdown_waiter.wait().await;
     };
 
+    // Avoid Nagle/delayed-ACK stalls when streaming small S3 response bodies.
     let server = axum::Server::bind(&addr)
+        .tcp_nodelay(true)
         .serve(app.into_make_service())
         .with_graceful_shutdown(shutdown_fut);
     tokio::pin!(server);

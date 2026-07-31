@@ -64,8 +64,7 @@ async fn test1_lease_expire_removes_keys() {
     }
 
     // Check once at TTL+1s. Cleanup taking longer than this remains a failure.
-    let expiry_check_at =
-        lease_granted_at + Duration::from_secs(LEASE_TTL_SECONDS + 1);
+    let expiry_check_at = lease_granted_at + Duration::from_secs(LEASE_TTL_SECONDS + 1);
     sleep(expiry_check_at.saturating_duration_since(Instant::now())).await;
     for k in &keys {
         let exist = client_view

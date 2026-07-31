@@ -29,16 +29,18 @@ use fluxon_fs_core::s3_gateway::{
     FS_S3_INTERNAL_MULTIPART_PAYLOAD_KEY, is_internal_multipart_relpath,
 };
 use fluxon_kv::Framework as KvFramework;
-use fluxon_kv::KvClientTrait;
 use fluxon_kv::client_kv_api::{PutOptionalArg, PutOptionalArgs};
 use fluxon_kv::cluster_manager::NodeID;
+use fluxon_kv::memholder::{ExternalMemHolder, UserMemHolder};
 use fluxon_kv::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult};
 use fluxon_kv::user_api::FluxonUserApi;
 use fluxon_kv::user_api::flat_dict::{FlatDict, FlatValue};
 use fluxon_kv::user_api::{
     USER_RPC_DEFAULT_TIMEOUT_MS, decode_flat_dict_bytes, encode_flat_dict_bytes,
+    find_flat_dict_bytes_field_range,
 };
 use fluxon_kv::user_rpc::user_rpc_call;
+use fluxon_kv::{KvClientTrait, KvGetResult};
 use fluxon_util::lease_manager::{
     LeaseKeepaliveActor, LeaseKeepaliveFailure, LeaseKeepaliveFailurePolicy,
     LeaseKeepaliveOperation, LeaseKeepaliveRegistration,
@@ -64,7 +66,8 @@ use crate::retry::{
 };
 use crate::write_session_rpc::{
     self, FsAbortWriteSessionReq, FsCloseWriteSessionReq, FsFinalizeWriteSessionReq,
-    FsOpenWriteSessionReq, FsWriteSessionChunkReq, FsWriteSessionDataAck, FsWriteSessionDataFrame,
+    FsOpenWriteSessionReq, FsPutSmallObjectReq, FsPutSmallObjectResp, FsWriteSessionChunkReq,
+    FsWriteSessionDataAck, FsWriteSessionDataFrame,
 };
 use fluxon_util::run_async_from_sync::{SyncAsyncBridge, spawn_blocking_allow_sync_async_bridge};
 
@@ -74,7 +77,7 @@ pub const REMOTE_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const REMOTE_WRITE_SESSION_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const REMOTE_WRITE_SESSION_SEND_BATCH_MAX_FRAMES: usize = 4;
 fn remote_write_session_peer_sender_workers() -> usize {
-    8
+    4
 }
 const REMOTE_WRITE_SESSION_RPC_TIMEOUT_MAX_MS: u64 = 240_000;
 const REMOTE_WRITE_SESSION_RPC_TIMEOUT_PER_MIB_MS: u64 = 1_000;
@@ -221,6 +224,20 @@ struct MountRemoteDirPrepared {
     master_cfg: Option<FluxonFsMasterConfig>,
 }
 
+enum KvFlatDictPayloadOwner {
+    Owner(Arc<UserMemHolder>),
+    External(Arc<ExternalMemHolder>),
+}
+
+impl AsRef<[u8]> for KvFlatDictPayloadOwner {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owner(holder) => holder.bytes(),
+            Self::External(holder) => holder.bytes(),
+        }
+    }
+}
+
 pub struct FluxonFsAgent {
     lifecycle: crate::Framework,
     kv_framework: Arc<KvFramework>,
@@ -269,7 +286,7 @@ struct CurrentRequestIdentity {
 }
 
 #[derive(Debug, Clone)]
-struct RemoteWriteSessionCallCtx {
+struct RemoteWriteCallCtx {
     export: FluxonFsExport,
     relpath_rpc: String,
     fs_rpc_token: Option<String>,
@@ -624,6 +641,7 @@ struct RemoteWriteSessionClientEntry {
     relpath_rpc: String,
     fs_rpc_token: Option<String>,
     allow_s3_internal_multipart: bool,
+    create_parents: bool,
     kv_shared: Option<RemoteWriteSessionKvSharedConfig>,
     kv_shared_enabled: AtomicBool,
     peer_sender: Weak<RemoteWriteSessionPeerSender>,
@@ -2730,16 +2748,16 @@ impl FluxonFsAgent {
         Ok(guard.get_or_insert_with(|| cache.clone()).clone())
     }
 
-    fn build_remote_write_session_call_ctx(
+    fn build_remote_write_call_ctx(
         &self,
         export_name: &str,
         relpath: &str,
         request_identity: Option<&FluxonFsRequestIdentity>,
-    ) -> Result<RemoteWriteSessionCallCtx, FsAgentError> {
+    ) -> Result<RemoteWriteCallCtx, FsAgentError> {
         let (_cfg, export) = self.get_export_cfg(export_name)?;
         let relpath_rpc = normalize_relpath_rpc(relpath);
         let payload = self.request_payload_with_identity(FlatDict::new(), request_identity)?;
-        Ok(RemoteWriteSessionCallCtx {
+        Ok(RemoteWriteCallCtx {
             export,
             relpath_rpc: relpath_rpc.as_ref().to_string(),
             fs_rpc_token: payload
@@ -4272,7 +4290,7 @@ impl FluxonFsAgent {
             )
         };
 
-        let try_read_piece_kv = |piece_idx: i64| -> Option<Vec<u8>> {
+        let try_read_piece_kv = |piece_idx: i64| -> Option<Bytes> {
             let key = piece_kv_key(piece_idx);
             self.kv_try_get_bytes_field(&key, &export.cache_bytes_field_key)
         };
@@ -4289,7 +4307,7 @@ impl FluxonFsAgent {
                         return Ok(Vec::new());
                     }
                     let end0 = std::cmp::min(p0.len(), start_in_piece + want_total);
-                    return Ok(p0[start_in_piece..end0].to_vec());
+                    return Ok(p0.slice(start_in_piece..end0).to_vec());
                 }
                 return read_remote(offset, n_eff);
             }
@@ -4321,7 +4339,7 @@ impl FluxonFsAgent {
                     return Ok(Vec::new());
                 }
                 let end0 = std::cmp::min(p0.len(), start_in_piece + want_total);
-                let out = p0[start_in_piece..end0].to_vec();
+                let out = p0.slice(start_in_piece..end0).to_vec();
                 return Ok(out);
             }
 
@@ -4451,6 +4469,56 @@ impl FluxonFsAgent {
         )
     }
 
+    pub(crate) fn remote_put_small_object_by_handle_s3_gateway_with_identity(
+        &self,
+        export_name: &str,
+        relpath: &str,
+        data: Bytes,
+        path_for_err: &str,
+        request_identity: Option<&FluxonFsRequestIdentity>,
+    ) -> Result<(), FsAgentError> {
+        if data.len() >= fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES {
+            return Err(FsAgentError::InvalidArgument {
+                detail: "small object must be below the write-session threshold".to_string(),
+            });
+        }
+        let ctx = self.build_remote_write_call_ctx(export_name, relpath, request_identity)?;
+        let node_id =
+            self.remote_pick_node_forever(export_name, &ctx.export, "put_small_object")?;
+        let req = FsPutSmallObjectReq {
+            export: export_name.to_string(),
+            relpath: ctx.relpath_rpc.clone(),
+            fs_rpc_token: ctx.fs_rpc_token,
+            allow_s3_internal_multipart: ctx.allow_s3_internal_multipart,
+        };
+        let timeout =
+            std::time::Duration::from_millis(remote_write_session_rpc_timeout_ms(data.len()));
+        let kv_framework = self.kv_framework.clone();
+        let resp = self
+            .rt_handle
+            .run_async_from_sync(async move {
+                write_session_rpc::call_put_small_object(
+                    kv_framework.as_ref(),
+                    node_id.into(),
+                    req,
+                    data,
+                    Some(timeout),
+                )
+                .await
+            })
+            .map_err(|e| FsAgentError::InvalidArgument {
+                detail: format!("put_small_object async bridge failed: {}", e),
+            })??;
+        if !resp.ok {
+            return Err(err_from_put_small_object_resp(&resp, path_for_err));
+        }
+        self.metadata_cache_invalidate_write_path_and_parents(
+            export_name,
+            ctx.relpath_rpc.as_str(),
+        );
+        Ok(())
+    }
+
     pub fn remote_open_write_session_by_handle(
         &self,
         export_name: &str,
@@ -4472,11 +4540,43 @@ impl FluxonFsAgent {
         path_for_err: &str,
         request_identity: Option<&FluxonFsRequestIdentity>,
     ) -> Result<(String, i64, i64), FsAgentError> {
+        self.remote_open_write_session_by_handle_with_options(
+            export_name,
+            relpath,
+            path_for_err,
+            request_identity,
+            false,
+        )
+    }
+
+    pub(crate) fn remote_open_write_session_by_handle_s3_gateway_with_identity(
+        &self,
+        export_name: &str,
+        relpath: &str,
+        path_for_err: &str,
+        request_identity: Option<&FluxonFsRequestIdentity>,
+    ) -> Result<(String, i64, i64), FsAgentError> {
+        self.remote_open_write_session_by_handle_with_options(
+            export_name,
+            relpath,
+            path_for_err,
+            request_identity,
+            true,
+        )
+    }
+
+    fn remote_open_write_session_by_handle_with_options(
+        &self,
+        export_name: &str,
+        relpath: &str,
+        path_for_err: &str,
+        request_identity: Option<&FluxonFsRequestIdentity>,
+        create_parents: bool,
+    ) -> Result<(String, i64, i64), FsAgentError> {
         // Admission is checked before the remote open and again while inserting the local entry.
         // The second check closes the race with concurrent source shutdown.
         let _source_operation = self.enter_remote_write_session_source_operation()?;
-        let ctx =
-            self.build_remote_write_session_call_ctx(export_name, relpath, request_identity)?;
+        let ctx = self.build_remote_write_call_ctx(export_name, relpath, request_identity)?;
         let (node_id, remote_session_id, size, mtime_ns) = self.remote_open_write_session(
             export_name,
             &ctx.export,
@@ -4484,6 +4584,7 @@ impl FluxonFsAgent {
             path_for_err,
             ctx.fs_rpc_token.clone(),
             ctx.allow_s3_internal_multipart,
+            create_parents,
         )?;
         let client_session_id = self.alloc_remote_write_session_client_token();
         let kv_shared = self.remote_write_session_prepare_kv_shared(&node_id);
@@ -4509,6 +4610,7 @@ impl FluxonFsAgent {
             relpath_rpc: ctx.relpath_rpc,
             fs_rpc_token: ctx.fs_rpc_token,
             allow_s3_internal_multipart: ctx.allow_s3_internal_multipart,
+            create_parents,
             kv_shared,
             kv_shared_enabled: AtomicBool::new(kv_shared_enabled),
             peer_sender: Arc::downgrade(&peer_sender),
@@ -4600,8 +4702,7 @@ impl FluxonFsAgent {
                 },
             )
         } else {
-            let ctx =
-                self.build_remote_write_session_call_ctx(export_name, relpath, request_identity)?;
+            let ctx = self.build_remote_write_call_ctx(export_name, relpath, request_identity)?;
             (
                 self.remote_pick_node_forever(export_name, &ctx.export, "write_session_chunk")?,
                 FsWriteSessionChunkReq {
@@ -4871,8 +4972,7 @@ impl FluxonFsAgent {
                 None,
             );
         }
-        let ctx =
-            self.build_remote_write_session_call_ctx(export_name, relpath, request_identity)?;
+        let ctx = self.build_remote_write_call_ctx(export_name, relpath, request_identity)?;
         let payload: FlatDict = FlatDict::from([
             (
                 "export".to_string(),
@@ -4954,10 +5054,17 @@ impl FluxonFsAgent {
             });
         }
         let _ = self.remote_write_session_client_remove(session_id);
-        self.metadata_cache_invalidate_exact_and_publish(
-            session.export_name.as_str(),
-            session.relpath_rpc.as_str(),
-        );
+        if session.create_parents {
+            self.metadata_cache_invalidate_write_path_and_parents(
+                session.export_name.as_str(),
+                session.relpath_rpc.as_str(),
+            );
+        } else {
+            self.metadata_cache_invalidate_exact_and_publish(
+                session.export_name.as_str(),
+                session.relpath_rpc.as_str(),
+            );
+        }
         Ok((resp.size, resp.mtime_ns))
     }
 
@@ -4971,6 +5078,13 @@ impl FluxonFsAgent {
     ) -> Result<(i64, i64), FsAgentError> {
         let _source_operation = self.enter_remote_write_session_source_operation()?;
         let session = self.remote_write_session_client_lookup(session_id);
+        let create_parents = session
+            .as_ref()
+            .is_some_and(|session| session.create_parents);
+        let export_name_for_invalidate = session
+            .as_ref()
+            .map(|session| session.export_name.clone())
+            .unwrap_or_else(|| export_name.to_string());
         let (node_id, req, relpath_rpc_for_invalidate) = if session.is_some() {
             let (prepared_session, expected_data_frames) =
                 self.remote_prepare_write_session_completion(session_id, path_for_err)?;
@@ -4987,8 +5101,7 @@ impl FluxonFsAgent {
                 prepared_session.relpath_rpc.clone(),
             )
         } else {
-            let ctx =
-                self.build_remote_write_session_call_ctx(export_name, relpath, request_identity)?;
+            let ctx = self.build_remote_write_call_ctx(export_name, relpath, request_identity)?;
             (
                 self.remote_pick_node_forever(export_name, &ctx.export, "close_write_session")?,
                 FsCloseWriteSessionReq {
@@ -5031,10 +5144,17 @@ impl FluxonFsAgent {
         if session.is_some() {
             let _ = self.remote_write_session_client_remove(session_id);
         }
-        self.metadata_cache_invalidate_exact_and_publish(
-            export_name,
-            relpath_rpc_for_invalidate.as_str(),
-        );
+        if create_parents {
+            self.metadata_cache_invalidate_write_path_and_parents(
+                export_name_for_invalidate.as_str(),
+                relpath_rpc_for_invalidate.as_str(),
+            );
+        } else {
+            self.metadata_cache_invalidate_exact_and_publish(
+                export_name_for_invalidate.as_str(),
+                relpath_rpc_for_invalidate.as_str(),
+            );
+        }
         Ok((resp.size, resp.mtime_ns))
     }
 
@@ -5067,8 +5187,7 @@ impl FluxonFsAgent {
                 },
             )
         } else {
-            let ctx =
-                self.build_remote_write_session_call_ctx(export_name, relpath, request_identity)?;
+            let ctx = self.build_remote_write_call_ctx(export_name, relpath, request_identity)?;
             (
                 self.remote_pick_node_forever(export_name, &ctx.export, "abort_write_session")?,
                 FsAbortWriteSessionReq {
@@ -6295,7 +6414,7 @@ impl FluxonFsAgent {
                                 ) {
                                     return Ok(plan);
                                 }
-                                return Ok(OpenPlan::Bytes(bytes));
+                                return Ok(OpenPlan::Bytes(bytes.to_vec()));
                             }
                         }
                         if current_identity.is_none() {
@@ -6782,6 +6901,27 @@ impl FluxonFsAgent {
     fn metadata_cache_invalidate_exact_and_publish(&self, export_name: &str, relpath: &str) {
         self.metadata_cache_invalidate_exact(export_name, relpath);
         self.enqueue_metadata_invalidation(export_name, relpath, MetadataInvalidationScope::Exact);
+        self.flush_pending_metadata_invalidations();
+    }
+
+    fn metadata_cache_invalidate_write_path_and_parents(&self, export_name: &str, relpath: &str) {
+        let normalized = relpath.replace('\\', "/");
+        let mut current = String::new();
+        for component in normalized
+            .split('/')
+            .filter(|component| !component.is_empty() && *component != ".")
+        {
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(component);
+            self.metadata_cache_invalidate_exact(export_name, &current);
+            self.enqueue_metadata_invalidation(
+                export_name,
+                &current,
+                MetadataInvalidationScope::Exact,
+            );
+        }
         self.flush_pending_metadata_invalidations();
     }
 
@@ -7520,12 +7660,14 @@ impl FluxonFsAgent {
         path_for_err: &str,
         fs_rpc_token: Option<String>,
         allow_s3_internal_multipart: bool,
+        create_parents: bool,
     ) -> Result<(String, String, i64, i64), FsAgentError> {
         let req = FsOpenWriteSessionReq {
             export: export_name.to_string(),
             relpath: relpath.to_string(),
             fs_rpc_token,
             allow_s3_internal_multipart,
+            create_parents,
         };
         let node_id = self.remote_pick_node_forever(export_name, export, "open_write_session")?;
         let node_id_for_resp = node_id.clone();
@@ -7547,14 +7689,13 @@ impl FluxonFsAgent {
             })??;
 
         if !resp.ok {
-            return Err(FsAgentError::Io {
-                path: path_for_err.to_string(),
-                detail: if resp.err_detail.trim().is_empty() {
-                    "remote open_write_session failed".to_string()
-                } else {
-                    resp.err_detail
-                },
-            });
+            return Err(err_from_typed_agent_resp(
+                resp.err_kind,
+                resp.err_detail.as_str(),
+                resp.err_errno,
+                path_for_err,
+                "open_write_session",
+            ));
         }
         if resp.session_id.trim().is_empty() {
             return Err(FsAgentError::InvalidArgument {
@@ -8038,10 +8179,15 @@ impl FluxonFsAgent {
         Some((payload, (size, msec, mnsec)))
     }
 
-    fn kv_try_get_bytes_field(&self, kv_key: &str, bytes_field_key: &str) -> Option<Vec<u8>> {
-        let got = match self.api.kv().get(kv_key) {
-            Ok(v) => v,
-            Err(e) => {
+    fn kv_try_get_bytes_field(&self, kv_key: &str, bytes_field_key: &str) -> Option<Bytes> {
+        let kv_framework = self.kv_framework.clone();
+        let kv_key_owned = kv_key.to_string();
+        let got = match self
+            .rt_handle
+            .run_async_from_sync(async move { kv_framework.kv_get(&kv_key_owned).await })
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
                 tracing::warn!(
                     "fluxon_fs kv get failed (best-effort): key={} err={}",
                     kv_key,
@@ -8049,14 +8195,36 @@ impl FluxonFsAgent {
                 );
                 return None;
             }
+            Err(e) => {
+                tracing::warn!(
+                    "fluxon_fs kv get async bridge failed (best-effort): key={} err={}",
+                    kv_key,
+                    e
+                );
+                return None;
+            }
         };
-        let Some(d) = got else {
-            return None;
+        let owner = match got {
+            KvGetResult::Owner(Some(holder)) => KvFlatDictPayloadOwner::Owner(holder),
+            KvGetResult::External(Some(holder)) => KvFlatDictPayloadOwner::External(holder),
+            KvGetResult::Owner(None) | KvGetResult::External(None) => return None,
         };
-        match d.get(bytes_field_key) {
-            Some(FlatValue::Bytes(b)) => Some(b.clone()),
-            _ => None,
-        }
+        let encoded = Bytes::from_owner(owner);
+        let (start, len) = match find_flat_dict_bytes_field_range(&encoded, bytes_field_key) {
+            Ok(Some(range)) => range,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    "fluxon_fs kv flat dict scan failed (best-effort): key={} field={} err={}",
+                    kv_key,
+                    bytes_field_key,
+                    e
+                );
+                return None;
+            }
+        };
+        let end = start.checked_add(len)?;
+        Some(encoded.slice(start..end))
     }
 
     fn cache_try_put(
@@ -8303,6 +8471,54 @@ fn err_from_resp(resp: &FlatDict, path_for_err: &str) -> FsAgentError {
             ),
         })),
     }
+}
+
+fn err_from_typed_agent_resp(
+    err_kind: i64,
+    err_detail: &str,
+    err_errno: i32,
+    path_for_err: &str,
+    op: &str,
+) -> FsAgentError {
+    let err_kind = match FsAgentRpcErrorKind::from_i64(err_kind) {
+        Some(value) => value,
+        None => {
+            return FsAgentError::InvalidArgument {
+                detail: format!(
+                    "remote {} error has unknown err_kind={} path={} detail={}",
+                    op, err_kind, path_for_err, err_detail
+                ),
+            };
+        }
+    };
+    match err_kind {
+        FsAgentRpcErrorKind::InvalidArgument => FsAgentError::InvalidArgument {
+            detail: err_detail.to_string(),
+        },
+        FsAgentRpcErrorKind::Os => {
+            FsAgentError::os(err_errno, path_for_err, err_detail.to_string())
+        }
+        FsAgentRpcErrorKind::AccessDenied => FsAgentError::AccessDenied {
+            path: path_for_err.to_string(),
+            detail: err_detail.to_string(),
+        },
+        FsAgentRpcErrorKind::Internal => FsAgentError::Kv(KvError::Api(ApiError::Unknown {
+            detail: format!(
+                "remote agent {} internal error: path={} detail={}",
+                op, path_for_err, err_detail
+            ),
+        })),
+    }
+}
+
+fn err_from_put_small_object_resp(resp: &FsPutSmallObjectResp, path_for_err: &str) -> FsAgentError {
+    err_from_typed_agent_resp(
+        resp.err_kind,
+        resp.err_detail.as_str(),
+        resp.err_errno,
+        path_for_err,
+        "put_small_object",
+    )
 }
 
 fn now_unix_ms() -> u64 {
@@ -8839,6 +9055,36 @@ mod tests {
             invalidation_seq: 0,
             inline_fd: None,
         }
+    }
+
+    #[test]
+    fn typed_agent_response_preserves_error_kind() {
+        let denied = err_from_typed_agent_resp(
+            FsAgentRpcErrorKind::AccessDenied.as_i64(),
+            "scope denied",
+            0,
+            "s3://demo/nested/file.bin",
+            "open_write_session",
+        );
+        assert!(matches!(denied, FsAgentError::AccessDenied { .. }));
+
+        let invalid = err_from_typed_agent_resp(
+            FsAgentRpcErrorKind::InvalidArgument.as_i64(),
+            "parent is not a directory",
+            0,
+            "s3://demo/nested/file.bin",
+            "open_write_session",
+        );
+        assert!(matches!(invalid, FsAgentError::InvalidArgument { .. }));
+
+        let internal = err_from_typed_agent_resp(
+            FsAgentRpcErrorKind::Internal.as_i64(),
+            "handler panicked",
+            0,
+            "s3://demo/nested/file.bin",
+            "open_write_session",
+        );
+        assert!(matches!(internal, FsAgentError::Kv(_)));
     }
 
     fn sample_key(identity_fp: &str, export: &str, relpath: &str) -> RemoteMetadataCacheKey {
@@ -9664,6 +9910,7 @@ mod tests {
             relpath_rpc: format!("{suffix}.bin"),
             fs_rpc_token: None,
             allow_s3_internal_multipart: false,
+            create_parents: false,
             kv_shared: Some(RemoteWriteSessionKvSharedConfig {
                 owner: ShareGroupOwnerRef {
                     owner_id: "owner-a".to_string(),
@@ -9938,6 +10185,7 @@ mod tests {
             relpath_rpc: "file.bin".to_string(),
             fs_rpc_token: None,
             allow_s3_internal_multipart: false,
+            create_parents: false,
             kv_shared: Some(RemoteWriteSessionKvSharedConfig {
                 owner: ShareGroupOwnerRef {
                     owner_id: "owner-a".to_string(),

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -55,9 +55,9 @@ use crate::config::FluxonFsGlobalConfig;
 use crate::write_session_rpc::{
     self, FsAbortWriteSessionReq, FsAbortWriteSessionResp, FsCloseWriteSessionReq,
     FsCloseWriteSessionResp, FsFinalizeWriteSessionReq, FsFinalizeWriteSessionResp,
-    FsOpenWriteSessionReq, FsOpenWriteSessionResp, FsWaitWriteSessionPayloadsReq,
-    FsWaitWriteSessionPayloadsResp, FsWriteSessionChunkReq, FsWriteSessionChunkResp,
-    FsWriteSessionDataFrame, FsWriteSessionDataRefFrame,
+    FsOpenWriteSessionReq, FsOpenWriteSessionResp, FsPutSmallObjectReq, FsPutSmallObjectResp,
+    FsWaitWriteSessionPayloadsReq, FsWaitWriteSessionPayloadsResp, FsWriteSessionChunkReq,
+    FsWriteSessionChunkResp, FsWriteSessionDataFrame, FsWriteSessionDataRefFrame,
 };
 
 pub(crate) mod transfer_agent;
@@ -2593,7 +2593,7 @@ fn register_agent_with_access_model(
                 let Some(_admission_guard) = open_admission.try_enter_handler() else {
                     return crate::write_session_rpc::FsOpenWriteSessionResp {
                         ok: false,
-                        err_kind: 0,
+                        err_kind: FsAgentRpcErrorKind::Os.as_i64(),
                         err_detail: "write-session admission is stopped".to_string(),
                         err_errno: libc::EBUSY,
                         session_id: String::new(),
@@ -2607,6 +2607,33 @@ fn register_agent_with_access_model(
                     &open_access_model,
                     &open_write_sessions,
                     req,
+                )
+            },
+        );
+        let put_exports = exports.clone();
+        let put_access_model = access_model.clone();
+        let put_active_write_paths = write_sessions.active_write_paths.clone();
+        let put_admission = write_session_admission.clone();
+        write_session_rpc::register_put_small_object_handler(
+            api.framework().as_ref(),
+            rt_handle.clone(),
+            move |_from, req, data| {
+                let Some(_admission_guard) = put_admission.try_enter_handler() else {
+                    return FsPutSmallObjectResp {
+                        ok: false,
+                        err_kind: FsAgentRpcErrorKind::Os.as_i64(),
+                        err_detail: "write-session admission is stopped".to_string(),
+                        err_errno: libc::EBUSY,
+                        size: 0,
+                        mtime_ns: 0,
+                    };
+                };
+                handle_put_small_object_typed(
+                    &put_exports,
+                    &put_access_model,
+                    &put_active_write_paths,
+                    req,
+                    data,
                 )
             },
         );
@@ -3608,7 +3635,6 @@ fn handle_s3_stage_object_to_kv(
     ) {
         return resp;
     }
-
     let exp = match exports.rpc_export(&export) {
         Ok(v) => v,
         Err(e) => return resp_err_kverr(e),
@@ -4143,6 +4169,234 @@ fn handle_read_chunk(
     )]))
 }
 
+fn create_dir_with_s3_parent_mode(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o755);
+    }
+    builder.create(path)
+}
+
+fn ensure_parent_dirs_for_write(
+    access_model: &AgentAccessModelHandle,
+    payload: &FlatDict,
+    export: &str,
+    target_path: &Path,
+    relpath: &str,
+) -> Result<(), FlatDict> {
+    let normalized = relpath.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if parts.len() <= 1 {
+        return Ok(());
+    }
+
+    let mut root = target_path;
+    for _ in &parts {
+        let Some(parent) = root.parent() else {
+            return Err(resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+                detail: "resolved object path has no export root".to_string(),
+            })));
+        };
+        root = parent;
+    }
+
+    let mut parent_path = root.to_path_buf();
+    let mut parent_relpath = String::new();
+    for component in &parts[..parts.len() - 1] {
+        if !parent_relpath.is_empty() {
+            parent_relpath.push('/');
+        }
+        parent_relpath.push_str(component);
+        parent_path.push(component);
+
+        if let Err(resp) = authorize_stat_path(access_model, payload, export, &parent_relpath) {
+            return Err(resp);
+        }
+        match fs::metadata(&parent_path) {
+            Ok(md) if md.is_dir() => continue,
+            Ok(_) => {
+                return Err(resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "parent path exists but is not a directory: {}",
+                        parent_relpath
+                    ),
+                })));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(resp_err_io(err)),
+        }
+
+        if let Err(resp) = authorize_relpath_mode(
+            access_model,
+            payload,
+            export,
+            &parent_relpath,
+            access_model_required_mode_for_op(FluxonFsOp::Mkdir),
+        ) {
+            return Err(resp);
+        }
+        match create_dir_with_s3_parent_mode(&parent_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                match fs::metadata(&parent_path) {
+                    Ok(md) if md.is_dir() => {}
+                    Ok(_) => {
+                        return Err(resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+                            detail: format!(
+                                "parent path exists but is not a directory: {}",
+                                parent_relpath
+                            ),
+                        })));
+                    }
+                    Err(err) => return Err(resp_err_io(err)),
+                }
+            }
+            Err(err) => return Err(resp_err_io(err)),
+        }
+    }
+    Ok(())
+}
+
+fn put_small_object_resp_from_flat(resp: FlatDict) -> FsPutSmallObjectResp {
+    FsPutSmallObjectResp {
+        ok: matches!(resp.get("ok"), Some(FlatValue::Bool(true))),
+        err_kind: match resp.get(FS_AGENT_RPC_ERR_KIND_KEY) {
+            Some(FlatValue::Int64(v)) => *v,
+            _ => 0,
+        },
+        err_detail: match resp.get("err") {
+            Some(FlatValue::String(v)) => v.clone(),
+            _ => String::new(),
+        },
+        err_errno: match resp.get("errno") {
+            Some(FlatValue::Int64(v)) => i32::try_from(*v).unwrap_or(libc::EIO),
+            _ => 0,
+        },
+        size: match resp.get("size") {
+            Some(FlatValue::Int64(v)) => *v,
+            _ => 0,
+        },
+        mtime_ns: match resp.get("mtime_ns") {
+            Some(FlatValue::Int64(v)) => *v,
+            _ => 0,
+        },
+    }
+}
+
+fn handle_put_small_object(
+    exports: &AgentExportsHandle,
+    access_model: &AgentAccessModelHandle,
+    active_write_paths: &ActiveWritePathsHandle,
+    payload: FlatDict,
+    data: Bytes,
+) -> FlatDict {
+    let export = match require_str(&payload, "export") {
+        Ok(v) => v,
+        Err(e) => return resp_err_kverr(e),
+    };
+    let relpath = match require_str(&payload, "relpath") {
+        Ok(v) => v,
+        Err(e) => return resp_err_kverr(e),
+    };
+    if let Err(resp) = authorize_relpath_mode(
+        access_model,
+        &payload,
+        &export,
+        &relpath,
+        access_model_required_mode_for_op(FluxonFsOp::WriteChunk),
+    ) {
+        return resp;
+    }
+    if let Err(resp) = authorize_relpath_mode(
+        access_model,
+        &payload,
+        &export,
+        &relpath,
+        access_model_required_mode_for_op(FluxonFsOp::Truncate),
+    ) {
+        return resp;
+    }
+    if data.len() >= fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES {
+        return resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+            detail: "small object must be below the write-session threshold".to_string(),
+        }));
+    }
+    let root_dir_abs = match exports.export_root_dir_abs(&export) {
+        Ok(v) => v,
+        Err(e) => return resp_err_kverr(e),
+    };
+    let p = match safe_join_root(&root_dir_abs, &relpath) {
+        Ok(v) => v,
+        Err(e) => return resp_err_kverr(e),
+    };
+    let write_path_key = write_path_key(&export, &p);
+    let _write_path_guard = match acquire_transient_write_path_guard(
+        active_write_paths,
+        &write_path_key,
+        "put_small_object",
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = ensure_parent_dirs_for_write(access_model, &payload, &export, &p, &relpath) {
+        return resp;
+    }
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&p)
+    {
+        Ok(v) => v,
+        Err(e) => return resp_err_io(e),
+    };
+    if let Err(e) = file.write_all(data.as_ref()) {
+        return resp_err_io(e);
+    }
+    let md = match file.metadata() {
+        Ok(v) => v,
+        Err(e) => return resp_err_io(e),
+    };
+    let (_is_file, _is_dir, size, mtime_ns, _mode) = stat_fields_from_metadata(&md);
+    resp_ok(BTreeMap::from([
+        ("size".to_string(), FlatValue::Int64(size)),
+        ("mtime_ns".to_string(), FlatValue::Int64(mtime_ns)),
+    ]))
+}
+
+fn handle_put_small_object_typed(
+    exports: &AgentExportsHandle,
+    access_model: &AgentAccessModelHandle,
+    active_write_paths: &ActiveWritePathsHandle,
+    req: FsPutSmallObjectReq,
+    data: Bytes,
+) -> FsPutSmallObjectResp {
+    let mut payload = FlatDict::from([
+        ("export".to_string(), FlatValue::String(req.export)),
+        ("relpath".to_string(), FlatValue::String(req.relpath)),
+    ]);
+    insert_typed_request_auth_payload(&mut payload, req.fs_rpc_token);
+    if req.allow_s3_internal_multipart {
+        payload.insert(
+            S3_INTERNAL_MULTIPART_PAYLOAD_KEY.to_string(),
+            FlatValue::Bool(true),
+        );
+    }
+    put_small_object_resp_from_flat(handle_put_small_object(
+        exports,
+        access_model,
+        active_write_paths,
+        payload,
+        data,
+    ))
+}
+
 fn handle_open_write_session(
     exports: &AgentExportsHandle,
     access_model: &AgentAccessModelHandle,
@@ -4174,6 +4428,7 @@ fn handle_open_write_session(
         Ok(v) => v,
         Err(e) => return resp_err_kverr(e),
     };
+    let create_parents = matches!(payload.get("create_parents"), Some(FlatValue::Bool(true)));
     let session_id = write_sessions.alloc_id();
     let write_path_key = write_path_key(&export, &p);
     let write_path_owner = format!("session:{}", session_id);
@@ -4182,6 +4437,15 @@ fn handle_open_write_session(
         .try_acquire_owned(&write_path_key, &write_path_owner)
     {
         return resp_err_busy(active_write_owner_detail(&existing));
+    }
+    if create_parents
+        && let Err(resp) =
+            ensure_parent_dirs_for_write(access_model, &payload, &export, &p, &relpath)
+    {
+        write_sessions
+            .active_write_paths
+            .release_owned(&write_path_key, &write_path_owner);
+        return resp;
     }
     let file = match fs::OpenOptions::new()
         .read(true)
@@ -4269,6 +4533,9 @@ fn handle_open_write_session_typed(
             S3_INTERNAL_MULTIPART_PAYLOAD_KEY.to_string(),
             FlatValue::Bool(true),
         );
+    }
+    if req.create_parents {
+        payload.insert("create_parents".to_string(), FlatValue::Bool(true));
     }
     let resp = handle_open_write_session(exports, access_model, write_sessions, payload);
     FsOpenWriteSessionResp {
@@ -6569,6 +6836,145 @@ mod tests {
     }
 
     #[test]
+    fn typed_put_small_object_creates_parents_and_replaces_file() {
+        let identity = FluxonFsRequestIdentity {
+            username: "alice".to_string(),
+            password: "pw".to_string(),
+        };
+        let root = test_temp_dir("fluxon_typed_put_small_object");
+        let exports = test_exports_handle(root.to_str().unwrap());
+        let access_model = AgentAccessModelHandle::new(Some(read_write_access_model()));
+        let active_write_paths = ActiveWritePathsHandle::new();
+        let req = || FsPutSmallObjectReq {
+            export: "exp".to_string(),
+            relpath: "nested/dir/file.bin".to_string(),
+            fs_rpc_token: Some(rpc_token_for(&identity)),
+            allow_s3_internal_multipart: false,
+        };
+
+        let first = handle_put_small_object_typed(
+            &exports,
+            &access_model,
+            &active_write_paths,
+            req(),
+            Bytes::from_static(b"longer-payload"),
+        );
+        assert!(first.ok, "typed put_small_object failed: {:?}", first);
+        let file_path = root.join("nested/dir/file.bin");
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"longer-payload");
+
+        let overwrite = handle_put_small_object_typed(
+            &exports,
+            &access_model,
+            &active_write_paths,
+            req(),
+            Bytes::from_static(b"short"),
+        );
+        assert!(
+            overwrite.ok,
+            "typed put_small_object overwrite failed: {:?}",
+            overwrite
+        );
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"short");
+        assert_eq!(overwrite.size, 5);
+
+        let empty = handle_put_small_object_typed(
+            &exports,
+            &access_model,
+            &active_write_paths,
+            req(),
+            Bytes::new(),
+        );
+        assert!(empty.ok, "empty put_small_object failed: {:?}", empty);
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"");
+        assert_eq!(empty.size, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn typed_put_small_object_preserves_parent_directory_permissions() {
+        let identity = FluxonFsRequestIdentity {
+            username: "alice".to_string(),
+            password: "pw".to_string(),
+        };
+        let root = test_temp_dir("fluxon_typed_put_small_object_parent_auth");
+        let exports = test_exports_handle(root.to_str().unwrap());
+        let access_model = AgentAccessModelHandle::new(Some(FluxonFsRuntimeAccessModel {
+            users: vec![FluxonFsRuntimeAccessUser {
+                username: "alice".to_string(),
+                can_manage_users: false,
+                rpc_token_secret_sha256_hex: hex::encode(sha2::Sha256::digest(b"pw")),
+            }],
+            scope_access: vec![FluxonFsScopeAccess {
+                export_name: "exp".to_string(),
+                prefix: "tenant/alice/".to_string(),
+                mode: FluxonFsScopeAccessMode::ReadWrite,
+                usernames: vec!["alice".to_string()],
+            }],
+        }));
+        let resp = handle_put_small_object_typed(
+            &exports,
+            &access_model,
+            &ActiveWritePathsHandle::new(),
+            FsPutSmallObjectReq {
+                export: "exp".to_string(),
+                relpath: "tenant/alice/file.bin".to_string(),
+                fs_rpc_token: Some(rpc_token_for(&identity)),
+                allow_s3_internal_multipart: false,
+            },
+            Bytes::from_static(b"data"),
+        );
+        assert!(!resp.ok);
+        assert_eq!(resp.err_kind, FsAgentRpcErrorKind::AccessDenied.as_i64());
+        assert!(!root.join("tenant").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn typed_open_write_session_creates_parents_only_when_requested() {
+        let identity = FluxonFsRequestIdentity {
+            username: "alice".to_string(),
+            password: "pw".to_string(),
+        };
+        let root = test_temp_dir("fluxon_typed_open_write_session_parents");
+        let exports = test_exports_handle(root.to_str().unwrap());
+        let access_model = AgentAccessModelHandle::new(Some(read_write_access_model()));
+        let write_sessions = AgentWriteSessionsHandle::new();
+
+        let no_create = handle_open_write_session_typed(
+            &exports,
+            &access_model,
+            &write_sessions,
+            FsOpenWriteSessionReq {
+                export: "exp".to_string(),
+                relpath: "nested/dir/file.bin".to_string(),
+                fs_rpc_token: Some(rpc_token_for(&identity)),
+                allow_s3_internal_multipart: false,
+                create_parents: false,
+            },
+        );
+        assert!(!no_create.ok);
+        assert!(!root.join("nested").exists());
+
+        let create = handle_open_write_session_typed(
+            &exports,
+            &access_model,
+            &write_sessions,
+            FsOpenWriteSessionReq {
+                export: "exp".to_string(),
+                relpath: "nested/dir/file.bin".to_string(),
+                fs_rpc_token: Some(rpc_token_for(&identity)),
+                allow_s3_internal_multipart: false,
+                create_parents: true,
+            },
+        );
+        assert!(create.ok, "typed open_write_session failed: {:?}", create);
+        assert!(root.join("nested/dir/file.bin").exists());
+        let _ = write_sessions.take(&create.session_id);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn typed_open_write_session_accepts_fs_rpc_token() {
         let identity = FluxonFsRequestIdentity {
             username: "alice".to_string(),
@@ -6588,6 +6994,7 @@ mod tests {
                 relpath: "dir/file.bin".to_string(),
                 fs_rpc_token: Some(rpc_token_for(&identity)),
                 allow_s3_internal_multipart: false,
+                create_parents: false,
             },
         );
         assert!(resp.ok, "typed open_write_session failed: {:?}", resp);
@@ -6619,6 +7026,7 @@ mod tests {
                 relpath: "dir/file.bin".to_string(),
                 fs_rpc_token: Some(rpc_token_for(&identity)),
                 allow_s3_internal_multipart: false,
+                create_parents: false,
             },
         );
         assert!(resp.ok, "typed open_write_session failed: {:?}", resp);
@@ -6649,6 +7057,7 @@ mod tests {
                 relpath: "dir/file.bin".to_string(),
                 fs_rpc_token: Some(rpc_token_for(&identity)),
                 allow_s3_internal_multipart: false,
+                create_parents: false,
             },
         );
         assert!(open.ok, "typed open_write_session failed: {:?}", open);

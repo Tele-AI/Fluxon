@@ -17,8 +17,8 @@ pub mod kvclient_encode;
 #[cfg(any(test, feature = "test_bins"))]
 pub mod memholder_test;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::client_kv_api::ClientKvApiView;
 use crate::{cluster_manager::NodeID, external_client_api::ExternalClientApiView};

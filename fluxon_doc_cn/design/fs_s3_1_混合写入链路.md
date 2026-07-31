@@ -1,28 +1,31 @@
-# FluxonFS S3 写入设计
+# FluxonFS S3 对象 I/O 设计
 
-本文说明 FluxonFS 如何处理 S3 写入，重点包括三部分：
+本文说明 FluxonFS 当前的 S3 对象写入与读取优化，重点包括四部分：
 
 1. S3 如何在小对象和大对象之间选择写入方式；
 2. 大对象进入 `write-session` 后，如何通过 KV Shared Memory 或 Raw RPC 把数据送到 FS Agent；
-3. 临时 KV key 使用的 lease 和 keepalive 如何管理。
+3. 临时 KV key 使用的 lease 和 keepalive 如何管理；
+4. KV 缓存命中时如何减少数据拷贝，以及 S3 HTTP 响应如何避免小包延迟。
 
-这三部分是不同层次的选择，不应混为一谈：
+前三项构成写入链路的三个层次；缓存命中读取和 HTTP 传输则是两个独立的 I/O 优化点：
 
 | 层次 | 选择 | 目的 |
 | --- | --- | --- |
-| S3 写入策略 | `write_chunk` 或 `write-session` | 小对象减少固定开销，大对象使用流水线 |
+| S3 写入策略 | `put_small_object` 或 `write-session` | 小对象合并为一次 RPC，大对象使用流水线 |
 | write-session 数据面 | KV-ref 或 Raw RPC | 条件允许时减少大数据 RPC 和 Agent 侧复制 |
 | KV 生命周期 | Controller 共享 lease 和 keepalive | 防止传输中的临时 key 提前过期 |
+| S3 读取路径 | holder-backed `Bytes` | KV 缓存命中时避免完整解码 `FlatDict` |
+| HTTP 传输 | `TCP_NODELAY` | 避免小响应 body 被 Nagle 算法延迟 |
 
-KV Shared Memory 是通用 `write-session` 的优化，Python FS 也能复用；只有第一层的 `4 MiB` 切换策略属于 S3 Gateway。
+KV Shared Memory 是通用 `write-session` 的优化，Python FS 也能复用；在写入链路的三个层次中，只有 `4 MiB` 切换策略属于 S3 Gateway。
 
 ## 1. 整体流程
 
 ```mermaid
 flowchart TD
     A[S3 HTTP Body] --> B{累计大小达到 4 MiB?}
-    B -->|否，请求结束| C[按不超过 1 MiB 调用 write_chunk]
-    C --> D[普通 truncate]
+    B -->|否，请求结束| C[一次 put_small_object RPC]
+    C --> D[Agent 创建父目录并完成写入]
     B -->|是| E[打开一次 write-session]
     E --> F[缓存数据和后续 Body 进入有界流水线]
     F --> G{Controller 与 Agent<br/>能否共享同一 KV Owner?}
@@ -46,7 +49,7 @@ flowchart TD
 
 ### 2.1 为什么要区分小对象和大对象
 
-原 S3 路径把 HTTP Body 拆成不超过 `1 MiB` 的数据块，每块执行一次 `write_chunk`。这种方式简单，适合小对象；大对象则会产生较多同步 RPC。
+原 S3 路径先逐级执行父目录 `stat/mkdir`，再把 HTTP Body 拆成不超过 `1 MiB` 的数据块调用 `write_chunk`，最后执行 `truncate`。小对象的数据传输很快，这些同步 RPC 的固定开销反而更明显；大对象还会产生更多数据 RPC。
 
 `write-session` 会为一个文件保持长生命周期 session，并通过有界队列持续提交数据。它更适合大对象，但打开 session、创建 sender 状态和结束 session 都有固定开销。
 
@@ -54,8 +57,8 @@ flowchart TD
 
 | 累计数据量 | 写入方式 | 完成方式 |
 | --- | --- | --- |
-| 小于 `4 MiB` | 暂存在内存，请求结束后按不超过 `1 MiB` 调用 `write_chunk` | 普通 `truncate` |
-| 达到或超过 `4 MiB` | 打开一次 `write-session`，把之前缓存的数据和后续数据都交给 session | 一次 `finalize` |
+| 小于 `4 MiB` | 暂存在内存，请求结束后调用一次 `put_small_object` | Agent 在同一 RPC 内创建父目录、覆盖并写完整文件 |
+| 达到或超过 `4 MiB` | 以 `create_parents=true` 打开一次 `write-session`，把之前缓存的数据和后续数据都交给 session | 一次 `finalize` |
 
 阈值是在接收 Body 的过程中判断，不要求请求开始前知道对象大小。累计大小恰好达到 `4 MiB` 时也会切换到 session。
 
@@ -76,13 +79,13 @@ flowchart TD
 | 参数 | 当前值 |
 | --- | ---: |
 | S3 切换阈值 | `4 MiB` |
-| 小对象 chunk 上限 | `1 MiB` |
+| small-put raw payload 上限 | 小于 `4 MiB` |
 | Gateway 首选 submit 大小 | `32 MiB` |
 | logical frame 上限 | `8 MiB` |
 | 单 batch | 最多 4 frame，约 `32 MiB` |
 | Controller 单 session 默认在途窗口 | `128 MiB` |
 | Agent 单 session 队列 | `32 MiB` |
-| 每个目标 Agent 的 sender task | 8 |
+| 每个目标 Agent 的 sender task | 4 |
 
 数据进入 session 后：
 
@@ -165,7 +168,7 @@ sequenceDiagram
     participant G as S3 Gateway
     participant C as FS Master-side Controller
     participant K as Shared Keepalive Actor
-    participant S as Sender Pool（每目标 Agent 8 tasks）
+    participant S as Sender Pool（每目标 Agent 4 tasks）
     participant O as KV Owner / mmap
     participant M as KV Master
     participant A as 目标 FS Agent
@@ -287,7 +290,38 @@ FS 和 MQ 复用 `fluxon_util::lease_manager::LeaseKeepaliveActor` 的代码实�
 
 共享 lease 带来一个回收取舍：Controller 正常运行时 lease 会一直续租。每个临时 key 只有一次最长 1 秒的独立删除任务，没有内建自动重试。如果显式 `kv_delete` 失败，残留 key 不能立即依靠 TTL 回收；只能由外部清理，或在 Controller 停止续租后等待 lease 到期。
 
-## 6. 正确性与失败边界
+## 6. KV 缓存命中读取与 HTTP 传输
+
+### 6.1 holder-backed 缓存读取
+
+S3 GET 的 KV 缓存命中路径不再先解码出完整 `FlatDict`。FS Master-side Controller 中的 `FluxonFsAgent` 直接调用 `kv_framework.kv_get` 取得 `Owner` 或 `External` holder，然后用 holder 构造 `Bytes`。`find_flat_dict_bytes_field_range` 会校验完整编码值并定位目标 bytes 字段，最后通过 `Bytes::slice` 得到 payload 视图。
+
+```mermaid
+flowchart LR
+    G[S3 GET] --> B[read_chunk_cached]
+    B --> A[FS Master-side Controller]
+    A --> K[kv_framework.kv_get]
+    K --> H[Owner / External MemHolder]
+    H --> E[Bytes::from_owner]
+    E --> F[校验编码并定位 bytes 字段]
+    F --> S[holder-backed Bytes slice]
+    S --> V[按现有读取接口生成 Vec]
+    V --> R[S3 HTTP response]
+```
+
+这项优化的边界如下：
+
+- **减少的工作**：不再 materialize 完整 `FlatDict`，也不再先把目标 bytes 字段复制到中间 `Vec`。
+- **仍然存在的工作**：编码值仍会完整扫描和校验；当前 FS 读取接口最终仍需生成 `Vec<u8>`，sync/async bridge 也仍然存在。因此这是 KV 命中数据提取层的局部少拷贝，不是从 KV 到 HTTP 的端到端零拷贝。
+- **不变的语义**：KV miss 后的远端 FS 读取和回填策略保持不变。
+
+### 6.2 `TCP_NODELAY`
+
+FS Master 的 Axum HTTP listener 启用 `tcp_nodelay(true)`，即在 TCP 连接上禁用 Nagle 合并等待。这可避免小型 S3 响应的 headers 和 body 在 delayed ACK 交互下出现额外等待，主要改善小对象和小 Range GET 的响应延迟。
+
+`TCP_NODELAY` 不改变 S3 HTTP 协议、对象内容和目录列举语义，也不直接减少大对象的读取拷贝。
+
+## 7. 正确性与失败边界
 
 - **连续写入**：同一 delivery barrier 之前，payload 必须按连续、无重叠 offset 提交。
 - **准确长度**：`finalize` 将文件设置为实际对象长度，覆盖旧的较长对象时不会留下旧尾部。
@@ -296,9 +330,9 @@ FS 和 MQ 复用 `fluxon_util::lease_manager::LeaseKeepaliveActor` 的代码实�
 - **失败释放**：Body、submit 或 finalize 失败后执行尽力而为的 `abort_write_session`。
 - **不保证内容回滚**：当前直接写最终路径，没有“临时文件 + 原子重命名”。abort 只释放 session，不恢复已经被覆盖的旧对象内容。
 
-本次设计不改变 S3 HTTP 协议、GET、目录列举和缓存读取路径。
+本次设计不改变 S3 HTTP 协议、目录列举、KV miss 和回填语义；GET 只改变 KV 命中时的 payload 提取方式和 HTTP 的 TCP 发送策略。
 
-## 7. 关闭顺序
+## 8. 关闭顺序
 
 Agent 队列中的 holder 可能仍引用 KV mmap，因此不能先关闭 KV framework。Master-side Controller 与目标 Agent 是两个独立生命周期。
 
@@ -326,21 +360,24 @@ Controller 侧遵循：
 
 Python/PyO3 路径也遵循 `source barrier → FS → KV`。如果前一阶段关闭失败，会保留依赖资源，而不是继续卸载仍可能被 writer 使用的 mmap。
 
-## 8. 主要代码位置
+## 9. 主要代码位置
 
 | 文件 | 作用 |
 | --- | --- |
 | `fluxon_rs/fluxon_fs_core/src/s3_gateway.rs` | 定义 S3 的 `4 MiB` session 阈值 |
 | `fluxon_rs/fluxon_fs_s3_gateway/src/lib.rs` | `HybridObjectWriter`，接入 PUT、UploadPart 和 Multipart 合并 |
-| `fluxon_rs/fluxon_fs/src/master_http.rs` | 将 S3 session 操作转发到通用 FS Agent API |
-| `fluxon_rs/fluxon_fs/src/agent.rs` | write-session 队列、sender、KV-ref/raw 选择、共享 lease 和降级 |
-| `fluxon_rs/fluxon_fs/src/write_session_rpc.rs` | Raw、KV-ref 和 finalize RPC |
-| `fluxon_rs/fluxon_fs/src/agent_service.rs` | Agent 校验、holder-backed frame、写队列和 finalize |
+| `fluxon_rs/fluxon_fs/src/master_http.rs` | 转发 S3 对象 I/O，并为 HTTP listener 启用 `TCP_NODELAY` |
+| `fluxon_rs/fluxon_fs/src/agent.rs` | write-session 队列、sender、KV-ref/raw、共享 lease 和 holder-backed 缓存读取 |
+| `fluxon_rs/fluxon_fs/src/write_session_rpc.rs` | small-put、Raw、KV-ref 和 finalize RPC |
+| `fluxon_rs/fluxon_fs/src/agent_service.rs` | small-put、父目录创建、holder-backed frame、写队列和 finalize |
+| `fluxon_rs/fluxon_kv/src/user_api/codec_flat_dict.rs` | 校验编码 `FlatDict` 并定位 bytes 字段范围 |
 | `fluxon_rs/fluxon_util/src/lease_manager/keepalive_actor.rs` | FS/MQ 共用的 keepalive actor 实现 |
 | `fluxon_rs/fluxon_pyo3/src/lib.rs` | Python FS 的 finalize 与安全关闭顺序 |
 
 没有新增公开的 `put_start` / `put_commit` API，也没有新增一套 FS 专用 keepalive 模块。
 
-## 9. 总结
+## 10. 总结
 
-FluxonFS S3 写入采用两级选择：小对象保留简单的 `write_chunk`，大对象复用通用 `write-session`；进入 session 后，再根据部署条件选择 KV-ref 或 Raw RPC。KV-ref 通过共享 mmap 和 holder 减少大 payload RPC 与 Agent 侧复制，Raw RPC 则保证跨 Owner、旧 Agent 和异常场景仍可正确写入。Controller 级共享 lease 将 lease 和 keepalive 开销控制为每 FS Master `O(1)`，有界队列、幂等 sequence、finalize 和严格关闭顺序共同保证写入正确性与资源安全。
+FluxonFS S3 写入采用两级选择：小对象通过一次 `put_small_object` RPC 完成父目录创建、覆盖和写入，大对象复用通用 `write-session`；进入 session 后，再根据部署条件选择 KV-ref 或 Raw RPC。KV-ref 通过共享 mmap 和 holder 减少大 payload RPC 与 Agent 侧复制，Raw RPC 保证跨 Owner 和异常场景仍可正确写入。Controller 级共享 lease 将 lease 和 keepalive 开销控制为每 FS Master `O(1)`，有界队列、幂等 sequence、finalize 和严格关闭顺序共同保证写入正确性与资源安全。
+
+S3 GET 在 KV 缓存命中时使用 holder-backed `Bytes` 定位 payload，减少 `FlatDict` 完整解码和中间拷贝；HTTP listener 通过 `TCP_NODELAY` 避免小响应的 Nagle/delayed-ACK 等待。这两项优化不改变 S3 协议和 KV miss 语义，也不构成端到端零拷贝。

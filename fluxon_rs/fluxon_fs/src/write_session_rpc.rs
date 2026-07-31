@@ -26,6 +26,8 @@ pub const FS_WRITE_SESSION_DATA_ACK_MSG_ID: u32 = 7112;
 pub const FS_WRITE_SESSION_DATA_REF_MSG_ID: u32 = 7113;
 pub const FS_FINALIZE_WRITE_SESSION_REQ_MSG_ID: u32 = 7114;
 pub const FS_FINALIZE_WRITE_SESSION_RESP_MSG_ID: u32 = 7115;
+pub const FS_PUT_SMALL_OBJECT_REQ_MSG_ID: u32 = 7116;
+pub const FS_PUT_SMALL_OBJECT_RESP_MSG_ID: u32 = 7117;
 pub const FS_WRITE_SESSION_KV_REF_CAPABILITY_METADATA_KEY: &str =
     "fluxon_fs_write_session_kv_ref_v1";
 
@@ -94,6 +96,7 @@ pub struct FsOpenWriteSessionReq {
     pub relpath: String,
     pub fs_rpc_token: Option<String>,
     pub allow_s3_internal_multipart: bool,
+    pub create_parents: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Encode, Decode)]
@@ -106,6 +109,24 @@ pub struct FsOpenWriteSessionResp {
     pub size: i64,
     pub mtime_ns: i64,
     pub chunk_bytes: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Encode, Decode)]
+pub struct FsPutSmallObjectReq {
+    pub export: String,
+    pub relpath: String,
+    pub fs_rpc_token: Option<String>,
+    pub allow_s3_internal_multipart: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Encode, Decode)]
+pub struct FsPutSmallObjectResp {
+    pub ok: bool,
+    pub err_kind: i64,
+    pub err_detail: String,
+    pub err_errno: i32,
+    pub size: i64,
+    pub mtime_ns: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Encode, Decode)]
@@ -255,6 +276,22 @@ impl MsgPackSerializePart for FsOpenWriteSessionResp {
     }
 }
 
+impl MsgPackSerializePart for FsPutSmallObjectReq {
+    fn msg_id(&self) -> u32 {
+        FS_PUT_SMALL_OBJECT_REQ_MSG_ID
+    }
+}
+
+impl fluxon_commu::p2p::rpc::RPCReq for FsPutSmallObjectReq {
+    type Resp = FsPutSmallObjectResp;
+}
+
+impl MsgPackSerializePart for FsPutSmallObjectResp {
+    fn msg_id(&self) -> u32 {
+        FS_PUT_SMALL_OBJECT_RESP_MSG_ID
+    }
+}
+
 impl MsgPackSerializePart for FsCloseWriteSessionReq {
     fn msg_id(&self) -> u32 {
         FS_CLOSE_WRITE_SESSION_REQ_MSG_ID
@@ -348,6 +385,7 @@ impl MsgPackSerializePart for FsWriteSessionDataAck {
 pub fn register_callers(fw: &KvFramework) {
     RPCCaller::<FsWriteSessionChunkReq>::new().regist(fw.p2p_view().p2p_module());
     RPCCaller::<FsOpenWriteSessionReq>::new().regist(fw.p2p_view().p2p_module());
+    RPCCaller::<FsPutSmallObjectReq>::new().regist(fw.p2p_view().p2p_module());
     RPCCaller::<FsCloseWriteSessionReq>::new().regist(fw.p2p_view().p2p_module());
     RPCCaller::<FsFinalizeWriteSessionReq>::new().regist(fw.p2p_view().p2p_module());
     RPCCaller::<FsAbortWriteSessionReq>::new().regist(fw.p2p_view().p2p_module());
@@ -429,19 +467,7 @@ where
                         .await
                     {
                         Ok(v) => v,
-                        Err(err) => FsOpenWriteSessionResp {
-                            ok: false,
-                            err_kind: 0,
-                            err_detail: format!(
-                                "fluxon_fs open_write_session handler panicked: {}",
-                                err
-                            ),
-                            err_errno: 0,
-                            session_id: String::new(),
-                            size: 0,
-                            mtime_ns: 0,
-                            chunk_bytes: 0,
-                        },
+                        Err(err) => open_handler_panic_response(err.to_string()),
                     };
                 let out = MsgPack {
                     serialize_part: response,
@@ -450,6 +476,84 @@ where
                 if let Err(err) = resp.send_resp(out).await {
                     tracing::warn!(
                         "fluxon_fs open_write_session typed rpc send_resp failed: {:?}",
+                        err
+                    );
+                }
+            });
+            Ok(())
+        },
+    );
+}
+
+fn open_handler_panic_response(err: String) -> FsOpenWriteSessionResp {
+    FsOpenWriteSessionResp {
+        ok: false,
+        err_kind: 4,
+        err_detail: format!("fluxon_fs open_write_session handler panicked: {}", err),
+        err_errno: 0,
+        session_id: String::new(),
+        size: 0,
+        mtime_ns: 0,
+        chunk_bytes: 0,
+    }
+}
+
+pub fn register_put_small_object_handler<F>(fw: &KvFramework, rt_handle: Handle, handler: F)
+where
+    F: Fn(NodeID, FsPutSmallObjectReq, Bytes) -> FsPutSmallObjectResp + Send + Sync + 'static,
+{
+    let handler = Arc::new(handler);
+    let rt_handle = Arc::new(rt_handle);
+    RPCHandler::<FsPutSmallObjectReq>::new().regist(
+        fw.p2p_view().p2p_module(),
+        move |resp, msg| {
+            let handler = handler.clone();
+            let rt_handle = rt_handle.clone();
+            let payload = if msg.raw_bytes.len() == 1 {
+                msg.raw_bytes.first().cloned()
+            } else {
+                None
+            };
+            let req = msg.serialize_part;
+            let from_node = resp.node_id();
+            spawn_on_runtime_handle(&rt_handle, async move {
+                let response = match payload {
+                    Some(payload) => {
+                        match spawn_blocking_allow_sync_async_bridge(move || {
+                            handler(from_node, req, payload)
+                        })
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(err) => FsPutSmallObjectResp {
+                                ok: false,
+                                err_kind: 4,
+                                err_detail: format!(
+                                    "fluxon_fs put_small_object handler panicked: {}",
+                                    err
+                                ),
+                                err_errno: 0,
+                                size: 0,
+                                mtime_ns: 0,
+                            },
+                        }
+                    }
+                    None => FsPutSmallObjectResp {
+                        ok: false,
+                        err_kind: 1,
+                        err_detail: "put_small_object requires exactly one raw payload".to_string(),
+                        err_errno: 0,
+                        size: 0,
+                        mtime_ns: 0,
+                    },
+                };
+                let out = MsgPack {
+                    serialize_part: response,
+                    raw_bytes: Vec::new(),
+                };
+                if let Err(err) = resp.send_resp(out).await {
+                    tracing::warn!(
+                        "fluxon_fs put_small_object typed rpc send_resp failed: {:?}",
                         err
                     );
                 }
@@ -809,15 +913,30 @@ pub async fn call_open_write_session(
         )
         .await
         .map_err(KvError::from)?;
-    if resp.serialize_part.ok {
-        return Ok(resp.serialize_part);
-    }
-    let detail = if resp.serialize_part.err_detail.trim().is_empty() {
-        "remote open_write_session failed".to_string()
-    } else {
-        resp.serialize_part.err_detail.clone()
-    };
-    Err(KvError::Api(ApiError::Unknown { detail }))
+    Ok(resp.serialize_part)
+}
+
+pub async fn call_put_small_object(
+    fw: &KvFramework,
+    node_id: NodeID,
+    req: FsPutSmallObjectReq,
+    data: Bytes,
+    timeout: Option<std::time::Duration>,
+) -> KvResult<FsPutSmallObjectResp> {
+    let resp = RPCCaller::<FsPutSmallObjectReq>::new()
+        .call(
+            fw.p2p_view().p2p_module(),
+            node_id,
+            MsgPack {
+                serialize_part: req,
+                raw_bytes: vec![data],
+            },
+            timeout,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
+    Ok(resp.serialize_part)
 }
 
 pub async fn call_close_write_session(
@@ -1163,5 +1282,55 @@ mod tests {
             decoded.allow_s3_internal_multipart,
             req.allow_s3_internal_multipart
         );
+    }
+
+    #[test]
+    fn put_small_object_request_has_stable_message_id_and_round_trips() {
+        let req = FsPutSmallObjectReq {
+            export: "export-a".to_string(),
+            relpath: "nested/dir/file.bin".to_string(),
+            fs_rpc_token: Some("token-a".to_string()),
+            allow_s3_internal_multipart: true,
+        };
+
+        assert_eq!(req.msg_id(), FS_PUT_SMALL_OBJECT_REQ_MSG_ID);
+        assert_eq!(
+            FsPutSmallObjectResp::default().msg_id(),
+            FS_PUT_SMALL_OBJECT_RESP_MSG_ID
+        );
+        let encoded = bitcode::encode(&req);
+        let decoded: FsPutSmallObjectReq = bitcode::decode(&encoded).unwrap();
+        assert_eq!(decoded.export, req.export);
+        assert_eq!(decoded.relpath, req.relpath);
+        assert_eq!(decoded.fs_rpc_token, req.fs_rpc_token);
+        assert_eq!(
+            decoded.allow_s3_internal_multipart,
+            req.allow_s3_internal_multipart
+        );
+    }
+
+    #[test]
+    fn open_write_session_create_parents_round_trips() {
+        let req = FsOpenWriteSessionReq {
+            export: "export-a".to_string(),
+            relpath: "nested/dir/file.bin".to_string(),
+            fs_rpc_token: Some("token-a".to_string()),
+            allow_s3_internal_multipart: false,
+            create_parents: true,
+        };
+
+        let encoded = bitcode::encode(&req);
+        let decoded: FsOpenWriteSessionReq = bitcode::decode(&encoded).unwrap();
+        assert!(decoded.create_parents);
+        assert_eq!(decoded.export, req.export);
+        assert_eq!(decoded.relpath, req.relpath);
+    }
+
+    #[test]
+    fn open_handler_panic_is_reported_as_internal_error() {
+        let resp = open_handler_panic_response("boom".to_string());
+        assert!(!resp.ok);
+        assert_eq!(resp.err_kind, 4);
+        assert!(resp.err_detail.contains("handler panicked"));
     }
 }
