@@ -580,12 +580,14 @@ def test_fluxonkv_test_spec_config():
         loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
         assert loaded["test_spec_config"]["protocol_type"] == "tcp"
         assert "rdma_device_names" not in loaded["test_spec_config"]
+        assert config.test_spec_protocol_type == "tcp"
 
         explicit_rdma = _owner_fluxonkv_base_config(tag="test_spec_rdma_protocol")
         explicit_rdma["test_spec_config"] = {"protocol_type": "rdma"}
         config = FluxonKvClientConfig(explicit_rdma)
         loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
         assert loaded["test_spec_config"]["protocol_type"] == "rdma"
+        assert config.test_spec_protocol_type == "rdma"
 
         invalid_protocol = _owner_fluxonkv_base_config(tag="test_spec_invalid_protocol")
         invalid_protocol["test_spec_config"] = {"protocol_type": "quic"}
@@ -658,6 +660,7 @@ def test_fluxonkv_test_spec_config():
         assert "transport_mode" not in loaded["test_spec_config"]
         assert "tcp_reactor_mode" not in loaded["test_spec_config"]
         assert "network" not in loaded
+        assert config.test_spec_protocol_type == "rdma"
 
         busy_poll = copy.deepcopy(implicit_transport)
         busy_poll["network"] = {

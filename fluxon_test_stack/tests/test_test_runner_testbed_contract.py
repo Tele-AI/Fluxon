@@ -1357,6 +1357,12 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             {"mode": "DEDICATED_OWNER"},
         )
         self.assertEqual(
+            suite.profiles["mooncake_tcp"]["runtime"]["test_stack"]["runtime_config"][
+                "kv_base"
+            ]["test_spec_config"]["protocol_type"],
+            "tcp",
+        )
+        self.assertEqual(
             suite.scales["n1_kvowner_dram_1gib"]["owner"]["owner_dram_bytes"],
             1073741824,
         )
@@ -1371,6 +1377,134 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 "kv_ssd_pressure_zipf__n2_kvowner_dram_1gib__mooncake_tcp",
             ],
         )
+
+    def test_ci_suite_runs_event_driven_reactor_lifecycle_through_test_stack(self) -> None:
+        suite_cfg = yaml.safe_load(
+            (_RUNNER.RUNNER_REPO_ROOT / "fluxon_test_stack" / "ci_test_list.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        suite = _RUNNER._parse_suite_config(suite_cfg)
+        cases = [
+            case
+            for case in _RUNNER._expand_cases(suite)
+            if case.scene_id == "tcp_event_driven_reactor_lifecycle"
+        ]
+
+        self.assertEqual(
+            [case.case_id for case in cases],
+            [
+                "tcp_event_driven_reactor_lifecycle__n2_kvowner_dram_3gib_event_driven_lifecycle__fluxon_tcp_event_driven"
+            ],
+        )
+        profile_runtime = suite.profiles["fluxon_tcp_event_driven"]["runtime"]["test_stack"]
+        self.assertEqual(
+            profile_runtime["runtime_config"]["kv_base"]["network"],
+            {"tcp_reactor_mode": "event_driven"},
+        )
+        self.assertEqual(
+            profile_runtime["runtime_config"]["kv_base"]["test_spec_config"],
+            {"protocol_type": "tcp"},
+        )
+        self.assertEqual(profile_runtime["deploy_templates"]["node"]["lifecycle"], "job")
+        scale = suite.scales["n2_kvowner_dram_3gib_event_driven_lifecycle"]
+        self.assertEqual(scale["topology"], 2)
+        self.assertEqual(scale["benchmark"]["start_idle_seconds"], 5)
+        self.assertEqual(scale["duration_seconds"], 30)
+
+        with tempfile.TemporaryDirectory() as td:
+            workdir_root = Path(td)
+            case = cases[0]
+            run_dir = workdir_root / case.case_id / "run_1"
+            run_dir.mkdir(parents=True)
+            resolved_case = _RUNNER._build_resolved_case_yaml(
+                case,
+                suite,
+                config_root=str(_RUNNER.RUNNER_REPO_ROOT),
+                workdir_root=str(workdir_root),
+                run_dir=str(run_dir),
+                ci_commands=None,
+                ci_prepare_steps=None,
+                execution_label=case.case_id,
+                command_id=None,
+                test_id=None,
+                stack_identity={
+                    "cluster_name": "test-cluster",
+                    "share_mem_path": "/tmp/test-share",
+                    "controller_url": "http://127.0.0.1:18080",
+                },
+            )
+            target_ip_map = resolved_case["deploy"]["target_ip_map"]
+            cluster_nodes = {
+                target: {
+                    "python_abi": "cpython3.10",
+                    "ip": ip,
+                    "hostworkdir": "/tmp/test-hostworkdir",
+                }
+                for target, ip in target_ip_map.items()
+            }
+
+            with (
+                mock.patch.object(
+                    _RUNNER,
+                    "_prepare_test_stack_runtime",
+                    return_value={
+                        "coordinator_script": "/tmp/coordinator.py",
+                        "node_script": "/tmp/node.py",
+                    },
+                ),
+                mock.patch.object(
+                    _RUNNER,
+                    "_load_test_stack_cluster_nodes_and_dispatch",
+                    return_value=(cluster_nodes, None),
+                ),
+                mock.patch.object(
+                    _RUNNER,
+                    "_test_stack_runtime_required_python_abi",
+                    return_value="cpython3.10",
+                ),
+                mock.patch.object(
+                    _RUNNER,
+                    "_test_stack_target_host_venv_python",
+                    return_value=Path("/tmp/venv/bin/python3"),
+                ),
+                mock.patch.object(
+                    _RUNNER,
+                    "_test_stack_runtime_module_command",
+                    return_value="module-cmd",
+                ),
+                mock.patch.object(
+                    _RUNNER,
+                    "_test_stack_etcd_addresses",
+                    return_value=["127.0.0.1:2379"],
+                ),
+            ):
+                _RUNNER._compile_test_stack_case(resolved_case, run_index=1)
+
+            master_cfg = yaml.safe_load(
+                (run_dir / "configs" / "test_stack_master.yaml").read_text(encoding="utf-8")
+            )
+            self.assertEqual(master_cfg["network"]["tcp_reactor_mode"], "event_driven")
+            self.assertEqual(master_cfg["test_spec_config"]["protocol_type"], "tcp")
+
+            benchmark_cfg = _RUNNER._load_test_stack_benchmark_config(run_dir)
+            self.assertEqual(
+                benchmark_cfg["kv_base"]["network"]["tcp_reactor_mode"],
+                "event_driven",
+            )
+            self.assertEqual(
+                benchmark_cfg["kv_base"]["test_spec_config"]["protocol_type"],
+                "tcp",
+            )
+            self.assertTrue(benchmark_cfg["node_overrides"])
+            for node_override in benchmark_cfg["node_overrides"]:
+                effective_kv_cfg = _RUNNER._deep_merge_dict(
+                    benchmark_cfg["kv_base"], node_override["kv"]
+                )
+                self.assertEqual(
+                    effective_kv_cfg["network"]["tcp_reactor_mode"],
+                    "event_driven",
+                )
 
     def test_mooncake_benchmark_defaults_skip_get_size_on_get(self) -> None:
         suite_cfg = yaml.safe_load(
@@ -1440,6 +1574,10 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                                     _RUNNER._compile_test_stack_case(resolved_case, run_index=1)
 
             benchmark_cfg = _RUNNER._load_test_stack_benchmark_config(run_dir)
+            self.assertEqual(
+                benchmark_cfg["kv_base"]["test_spec_config"]["protocol_type"],
+                "tcp",
+            )
             self.assertEqual(
                 benchmark_cfg["kv_base"]["mooncake_spec"]["skip_get_size_on_get"],
                 True,

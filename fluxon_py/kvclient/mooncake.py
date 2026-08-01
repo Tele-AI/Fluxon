@@ -137,9 +137,10 @@ class MooncakeStore(KvClient):
         self._close_lock = threading.Lock()
         self._closed = False
         self._skip_get_size_on_get = config.mooncake_spec_skip_get_size_on_get
-        # config = self._config
-        protocol_type = "rdma"
-        device_name = config.network_rdma_device_names
+        protocol_type = config.test_spec_protocol_type
+        device_name = (
+            config.network_rdma_device_names if protocol_type == "rdma" else ""
+        )
 
         server_name = config.mooncake_spec_local_hostname
 

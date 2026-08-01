@@ -7,9 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::NodeIDString;
-pub use fluxon_commu_contract::{
-    CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER, ClosedRuntimeLocalMemoryKind,
-};
+pub use fluxon_commu_contract::ClosedRuntimeLocalMemoryKind;
 use fluxon_commu_contract::{
     ClosedRuntimeHandle, ClosedRuntimePeerGen, ClosedRuntimeTransferEngineOpenRuntimeRequest,
     ClosedRuntimeTransferEngineOpenRuntimeResponse,
@@ -123,8 +121,13 @@ impl TransferRpcFastPath for ClosedTransferRpcFastPath {
 fn transfer_engine_closed_sdk_error(
     error: crate::closed_sdk::ClosedSdkConsumerError,
 ) -> TransferEngineError {
-    TransferEngineError::CreateEngineFailed {
-        detail: format!("closed sdk transfer-engine call failed: {error}"),
+    match error {
+        crate::closed_sdk::ClosedSdkConsumerError::RequiredDirectFastPathNotReady => {
+            TransferEngineError::RequiredDirectFastPathNotReady
+        }
+        error => TransferEngineError::CreateEngineFailed {
+            detail: format!("closed sdk transfer-engine call failed: {error}"),
+        },
     }
 }
 
@@ -563,3 +566,20 @@ impl ClientTransferEngineCore {
     }
 }
 pub use fluxon_commu_contract::transfer_engine::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_direct_fast_path_not_ready_maps_to_public_typed_error() {
+        let error = transfer_engine_closed_sdk_error(
+            crate::closed_sdk::ClosedSdkConsumerError::RequiredDirectFastPathNotReady,
+        );
+
+        assert!(matches!(
+            error,
+            TransferEngineError::RequiredDirectFastPathNotReady
+        ));
+    }
+}

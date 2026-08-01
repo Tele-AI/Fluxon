@@ -411,6 +411,7 @@ TEST_STACK_KV_GET_OUTPUTS_ALLOWED = {"holder", "bytes", "cuda"}
 TEST_STACK_BENCHMARK_KEY_AFFINITY_SLOT_COUNT = "affinity_slot_count"
 SCENE_ID_KV_DRAM_RESIDENT_ZIPF = "kv_dram_resident_zipf"
 SCENE_ID_KV_READ_HEAVY_AFFINITY = "kv_read_heavy_affinity"
+SCENE_ID_TCP_EVENT_DRIVEN_REACTOR_LIFECYCLE = "tcp_event_driven_reactor_lifecycle"
 SCENE_ENUMS_ALLOWED = {
     "bench_mq",
     "fs_open_read_close_smallfiles",
@@ -422,6 +423,7 @@ SCENE_ENUMS_ALLOWED = {
     "kv_write_heavy_large_value",
     "rpc_echo_small_payload",
     "rpc_echo_small_payload_zerorpc",
+    SCENE_ID_TCP_EVENT_DRIVEN_REACTOR_LIFECYCLE,
 }
 
 

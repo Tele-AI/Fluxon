@@ -750,9 +750,6 @@ pub enum ClosedRuntimeLocalMemoryKind {
     Gpu { device_id: u32 },
 }
 
-pub const CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER: &str =
-    "fluxon_direct_fast_path_not_ready";
-
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum ClosedRuntimeTransferEngineCall {
     Init2ForInitDag {

@@ -653,6 +653,11 @@ class FluxonKvClientConfig():
     @property
     def contribute_to_cluster_pool_size(self):
         return self.config_dict["contribute_to_cluster_pool_size"]
+
+    @property
+    def test_spec_protocol_type(self) -> str:
+        test_spec_config = self.config_dict.get("test_spec_config") or {}
+        return str(test_spec_config.get("protocol_type", "rdma"))
     
     @property
     def network_rdma_device_names(self):

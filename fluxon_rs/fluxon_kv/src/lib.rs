@@ -2588,6 +2588,25 @@ mod tests {
     }
 
     #[test]
+    fn file_config_startup_keeps_rdma_disabled_until_control_update() {
+        for protocol_type in [ProtocolType::Tcp, ProtocolType::Rdma] {
+            let protocol = ProtocolConfig {
+                protocol_type,
+                rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
+            };
+
+            assert_eq!(
+                cluster_manager_rdma_control_init_from_transfer_config(
+                    TransferEngineType::Closed,
+                    &protocol,
+                ),
+                ClusterManagerRdmaControlInit::Disabled
+            );
+        }
+    }
+
+    #[test]
     fn test_spec_transport_mode_keeps_rdma_on_normal_rdma_control() {
         let cfg = TestSpecConfig {
             transport_mode: Some(TestSpecTransportMode::TransferWithRpc),

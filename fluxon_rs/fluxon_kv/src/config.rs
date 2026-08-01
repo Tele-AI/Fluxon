@@ -400,13 +400,26 @@ fn apply_test_spec_rdma_device_names_to_protocol(
 fn resolve_protocol_config(
     raw: Option<&NetworkConfigYaml>,
     protocol_type: ProtocolType,
-) -> ProtocolConfig {
+) -> KvResult<ProtocolConfig> {
     let raw = raw.cloned().unwrap_or_default();
-    ProtocolConfig {
+    let rdma_device_names = match raw.rdma_device_names {
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "network.rdma_device_names must be a non-empty string".to_string(),
+                }
+                .into_kverror());
+            }
+            Some(trimmed.to_string())
+        }
+        None => None,
+    };
+    Ok(ProtocolConfig {
         protocol_type,
-        rdma_device_names: raw.rdma_device_names,
+        rdma_device_names,
         tcp_thread_reactor: raw.tcp_reactor_mode,
-    }
+    })
 }
 
 fn resolve_member_network_config(
@@ -1362,7 +1375,7 @@ impl ClientConfigYaml {
                         .protocol_type
                         .unwrap_or(DEFAULT_PROTOCOL_TYPE)
                 },
-            ),
+            )?,
             test_spec_config.rdma_device_names.as_deref(),
         );
 
@@ -1866,7 +1879,7 @@ impl MasterConfigYaml {
                 test_spec_config
                     .protocol_type
                     .unwrap_or(DEFAULT_PROTOCOL_TYPE),
-            ),
+            )?,
             test_spec_config.rdma_device_names.as_deref(),
         );
         let transfer_engine = TransferEngineType::Closed;
@@ -2072,6 +2085,41 @@ fluxonkv_spec:
             TcpThreadReactorWaitMode::BusyPoll
         );
         assert!(verified.fluxonkv_spec.enable_transfer_rpc_fast_path);
+    }
+
+    #[test]
+    fn client_network_rdma_device_names_are_trimmed_and_must_be_non_empty() {
+        let verified = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_external
+network:
+  rdma_device_names: "  mlx5_0  "
+fluxonkv_spec:
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_external
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(
+            verified.protocol.rdma_device_names,
+            Some("mlx5_0".to_string())
+        );
+
+        let invalid = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_external
+network:
+  rdma_device_names: "   "
+fluxonkv_spec:
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_external
+"#,
+        )
+        .unwrap();
+        let err = invalid.verify().unwrap_err();
+        assert!(format!("{err}").contains("network.rdma_device_names must be a non-empty string"));
     }
 
     #[test]
@@ -2949,6 +2997,49 @@ test_spec_config:
         .unwrap();
         assert_eq!(cfg.protocol.protocol_type, ProtocolType::Tcp);
         assert_eq!(cfg.transfer_engine, TransferEngineType::Closed);
+    }
+
+    #[test]
+    fn master_network_rdma_device_names_are_trimmed_and_must_be_non_empty() {
+        let verified = MasterConfigYaml::from_str(
+            r#"
+instance_key: test_master
+cluster_name: test_cluster
+port: 18080
+etcd_endpoints: ["127.0.0.1:2379"]
+network:
+  subnet_whitelist: ["127.0.0.0/8"]
+  rdma_device_names: "  mlx5_0  "
+monitoring:
+  prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
+log_dir: /tmp/test_master_logs
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(
+            verified.protocol.rdma_device_names,
+            Some("mlx5_0".to_string())
+        );
+
+        let invalid = MasterConfigYaml::from_str(
+            r#"
+instance_key: test_master
+cluster_name: test_cluster
+port: 18080
+etcd_endpoints: ["127.0.0.1:2379"]
+network:
+  subnet_whitelist: ["127.0.0.0/8"]
+  rdma_device_names: "   "
+monitoring:
+  prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
+log_dir: /tmp/test_master_logs
+"#,
+        )
+        .unwrap();
+        let err = invalid.verify().unwrap_err();
+        assert!(format!("{err}").contains("network.rdma_device_names must be a non-empty string"));
     }
 
     #[test]
