@@ -1247,7 +1247,6 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                                     "master_server_address": "127.0.0.1:33000",
                                     "etcd_addresses": ["127.0.0.1:2379"],
                                 },
-                                "protocol": {"protocol_type": "tcp"},
                             },
                             test_spec_config={},
                             perf_config=None,
@@ -1262,6 +1261,7 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
             self.assertEqual(len(owner_instances), 1)
             owner_cfg_path = cfg_dir / f"test_stack_kv_owner__{target_slug}.yaml"
             owner_cfg = yaml.safe_load(owner_cfg_path.read_text(encoding="utf-8"))
+            self.assertNotIn("protocol", owner_cfg)
             self.assertEqual(owner_cfg["mooncake_spec"]["enable_ssd_offload"], True)
             self.assertEqual(owner_cfg["mooncake_spec"]["ssd_offload_path"], offload_path)
             self.assertEqual(owner_cfg["mooncake_spec"]["local_hostname"], "192.0.2.10")
@@ -1273,11 +1273,9 @@ class TestTestRunnerTestbedContract(unittest.TestCase):
                 ],
                 "17179869184",
             )
-            self.assertEqual(module_cmd.call_args.kwargs["require_unlimited_memlock"], False)
+            self.assertEqual(module_cmd.call_args.kwargs["require_unlimited_memlock"], True)
 
-    def test_mooncake_memlock_is_required_only_for_rdma_protocol(self) -> None:
-        self.assertEqual(_RUNNER._test_stack_protocol_requires_unlimited_memlock({"protocol_type": "tcp"}), False)
-        self.assertEqual(_RUNNER._test_stack_protocol_requires_unlimited_memlock({"protocol_type": "rdma"}), True)
+    def test_runtime_command_applies_requested_memlock_mode(self) -> None:
         cmd = _RUNNER._test_stack_runtime_command(
             run_dir=Path("/tmp/run"),
             venv_python=Path("/tmp/venv/bin/python"),

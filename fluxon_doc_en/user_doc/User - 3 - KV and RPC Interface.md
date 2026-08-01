@@ -221,9 +221,6 @@ def main() -> None:
                 "cluster_name": CLUSTER_NAME,
                 "share_mem_path": SHARE_MEM_PATH,
             },
-            "test_spec_config": {
-                "disable_observability": True,
-            },
         }
     )
     store = new_store(cfg).unwrap("new_store failed")
@@ -296,9 +293,6 @@ def _build_config(*, instance_key: str) -> FluxonKvClientConfig:
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
                 "share_mem_path": SHARE_MEM_PATH,
-            },
-            "test_spec_config": {
-                "disable_observability": True,
             },
         }
     )
@@ -385,17 +379,24 @@ Keep these roots separate:
 
 In zero-contribution external mode, `Owner Client`-only fields such as `fluxonkv_spec.etcd_addresses`, `fluxonkv_spec.sub_cluster`, `fluxonkv_spec.large_file_paths`, and `fluxonkv_spec.redis_compat` should not appear.
 
-#### TCP thread reactor wait mode
+#### Network and TCP thread reactor tuning
 
-`tcp_thread_reactor` controls how the current process's `tcpthr_reactor_*` threads wait
-for work. The field belongs under the `protocol` configuration block. It defaults to `busy_poll`; select
-`event_driven` explicitly when reducing idle CPU usage is more important:
+The stable `network` block contains network policy and transport tuning; it does not select the
+protocol. `rdma_device_names` optionally pins the comma-separated RDMA devices used by the
+process. `tcp_reactor_mode` controls how the current process's `tcpthr_reactor_*` threads wait
+for work. It defaults to `busy_poll`; select `event_driven` explicitly when reducing idle CPU usage
+is more important:
 
 ```yaml
-protocol:
-  protocol_type: rdma
-  tcp_thread_reactor: event_driven
+network:
+  rdma_device_names: mlx5_0
+  tcp_reactor_mode: event_driven
 ```
+
+Production protocol selection is not configurable. When no test override is present, the public
+bundled Fluxon KV runtime keeps its current default, RDMA. Tests and benchmarks that need protocol
+selection or fault-isolation switches should use the separate
+[Developer - 9 - Test Extension Configuration](<../dev_doc/Developer - 9 - Test Extension Configuration.md>).
 
 | Value | Behavior and tradeoff |
 | --- | --- |

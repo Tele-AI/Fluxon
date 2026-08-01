@@ -237,7 +237,6 @@ api.close() -> Result[OkNone, ApiError]
 - `KvClient.third_party_logs_dir() -> Result[str, ApiError]`：返回 Fluxon 分配给第三方 Python 组件的日志根目录。组件应在这个根目录下继续派生自己的子目录，例如 `mq/`。
 - `MemHolder`：`get_blocking(...)` 成功后的读取结果持有者，`access()` 取得 `FlatDict`。
 - `PutOptionalArgs`：`put_blocking(...)` 的可选参数对象，当前常用字段是 `lease_id`。
-- `test_spec_config.disable_observability`：最小 external client 示例里显式设为 `True`，避免把 OTLP / observe 后台任务引入“只验证 KV/RPC 基本链路”的示例生命周期。
 
 注意：
 
@@ -272,9 +271,6 @@ def main() -> None:
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
                 "share_mem_path": SHARE_MEM_PATH,
-            },
-            "test_spec_config": {
-                "disable_observability": True,
             },
         }
     )
@@ -445,9 +441,6 @@ def _build_config(*, instance_key: str) -> FluxonKvClientConfig:
                 "cluster_name": CLUSTER_NAME,
                 "share_mem_path": SHARE_MEM_PATH,
             },
-            "test_spec_config": {
-                "disable_observability": True,
-            },
         }
     )
 
@@ -610,17 +603,22 @@ fluxonkv_spec:
 
 zero-contribution external 模式下有一个硬约束：`fluxonkv_spec.etcd_addresses`、`fluxonkv_spec.sub_cluster`、`fluxonkv_spec.large_file_paths`、`fluxonkv_spec.redis_compat` 这类 owner 侧字段不应出现。
 
-#### 3) TCP thread reactor 等待模式
+#### 3) 网络与 TCP thread reactor 调优
 
-`tcp_thread_reactor` 控制当前进程中 `tcpthr_reactor_*` 线程的等待方式。字段位于
-`protocol` 配置块；不配置时默认使用 `busy_poll`，需要降低空闲 CPU 占用时可以显式选择
-`event_driven`：
+稳定的 `network` 配置块统一承载网络策略和传输调优，不负责选择协议。
+`rdma_device_names` 可以固定当前进程使用的 RDMA 设备，多个设备用逗号分隔。
+`tcp_reactor_mode` 控制当前进程中 `tcpthr_reactor_*` 线程的等待方式；不配置时默认使用
+`busy_poll`，需要降低空闲 CPU 占用时可以显式选择 `event_driven`：
 
 ```yaml
-protocol:
-  protocol_type: rdma
-  tcp_thread_reactor: event_driven
+network:
+  rdma_device_names: mlx5_0
+  tcp_reactor_mode: event_driven
 ```
+
+生产配置不提供协议选择能力。未设置测试覆盖时，公开 bundled Fluxon KV runtime
+保持当前默认值 RDMA。测试和 benchmark 如需切换协议或使用故障隔离开关，请使用独立的
+[开发者 - 9 - 测试扩展配置](<../dev_doc/开发者 - 9 - 测试扩展配置.md>)。
 
 | 取值 | 行为与取舍 |
 | --- | --- |

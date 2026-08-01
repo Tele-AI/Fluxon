@@ -86,8 +86,9 @@ use cluster_manager::{
 };
 use config::{
     ClientConfig, ClientConfigYaml, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig,
-    MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole, TcpThreadReactorWaitMode,
-    TestSpecConfig, TestSpecTransportMode, TransferEngineType, normalize_etcd_addresses,
+    MasterConfigYaml, NetworkConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole,
+    TcpThreadReactorWaitMode, TestSpecConfig, TestSpecTransportMode, TransferEngineType,
+    normalize_etcd_addresses,
 };
 use external_client_api::{ExternalClientApi, ExternalClientApiNewArg};
 use fluxon_commu::TransferBackendActivationMode;
@@ -155,16 +156,6 @@ fn test_spec_config_rdma_control_init(
         }
         None => None,
     }
-}
-
-fn transfer_engine_rdma_device_names_from_config(
-    protocol: &ProtocolConfig,
-    test_spec_config: Option<&TestSpecConfig>,
-) -> Option<String> {
-    if let Some(devices) = test_spec_config.and_then(|cfg| cfg.rdma_device_names.as_ref()) {
-        return Some(devices.join(","));
-    }
-    protocol.rdma_device_names.clone()
 }
 
 fn test_spec_config_transfer_backend_activation_mode(
@@ -804,6 +795,7 @@ fn build_side_transfer_worker_config(
     test_spec_config.side_transfer_worker_count = 0;
     test_spec_config.side_transfer_worker_p2p_port_base = None;
     test_spec_config.side_transfer_role = Some(SideTransferRole::Worker);
+    test_spec_config.protocol_type = None;
     test_spec_config.transport_mode = None;
     test_spec_config.rdma_device_names = None;
 
@@ -869,7 +861,12 @@ fn build_side_transfer_worker_config_yaml(
     let side_config = build_side_transfer_worker_config(owner_config, worker_idx)?;
     Ok(ClientConfigYaml {
         instance_key: side_config.instance_key,
-        protocol: Some(side_config.protocol),
+        network: Some(NetworkConfigYaml {
+            subnet_whitelist: None,
+            primary_ip_to_extended_ips: None,
+            rdma_device_names: side_config.protocol.rdma_device_names,
+            tcp_reactor_mode: side_config.protocol.tcp_thread_reactor,
+        }),
         contribute_to_cluster_pool_size: None,
         pprof_duration_seconds: side_config.pprof_duration_seconds,
         fluxonkv_spec: crate::config::FluxonKvSpecYaml {
@@ -1535,10 +1532,7 @@ async fn run_master_impl(
             enable_transfer_rpc_fast_path: config.enable_transfer_rpc_fast_path,
             rpc_port: 12345,
             protocol_type: config.protocol.protocol_type,
-            rdma_device_names: transfer_engine_rdma_device_names_from_config(
-                &config.protocol,
-                Some(&config.test_spec_config),
-            ),
+            rdma_device_names: config.protocol.rdma_device_names.clone(),
             backend_activation_mode: transfer_backend_activation_mode,
             transfer_engine: config.transfer_engine,
         },
@@ -2161,10 +2155,7 @@ async fn run_client_impl(
                 enable_transfer_rpc_fast_path: config.fluxonkv_spec.enable_transfer_rpc_fast_path,
                 rpc_port: 12345,
                 protocol_type: config.protocol.protocol_type.clone(),
-                rdma_device_names: transfer_engine_rdma_device_names_from_config(
-                    &config.protocol,
-                    Some(&config.test_spec_config),
-                ),
+                rdma_device_names: config.protocol.rdma_device_names.clone(),
                 backend_activation_mode: transfer_backend_activation_mode,
                 transfer_engine: config.fluxonkv_spec.transfer_engine.clone(),
             },
@@ -2578,7 +2569,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spec_transport_mode_uses_protocol_agnostic_force_enable_activation() {
+    fn test_spec_tcp_protocol_uses_tcp_bypass_activation() {
         let cfg = TestSpecConfig {
             transport_mode: Some(TestSpecTransportMode::TransferOnly),
             ..Default::default()
@@ -2689,23 +2680,6 @@ mod tests {
         assert_eq!(disabled, None);
 
         std::fs::remove_dir_all(&tempdir).unwrap();
-    }
-
-    #[test]
-    fn transfer_engine_rdma_device_names_prefers_test_spec_devices() {
-        let protocol = ProtocolConfig {
-            protocol_type: ProtocolType::Rdma,
-            rdma_device_names: Some("mlx5_9:1".to_string()),
-            tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
-        };
-        let cfg = TestSpecConfig {
-            rdma_device_names: Some(vec!["mlx5_1".to_string(), "mlx5_0".to_string()]),
-            ..Default::default()
-        };
-        assert_eq!(
-            transfer_engine_rdma_device_names_from_config(&protocol, Some(&cfg)),
-            Some("mlx5_1,mlx5_0".to_string())
-        );
     }
 
     #[test]
@@ -2832,11 +2806,12 @@ mod tests {
 
         assert_eq!(side_cfg_yaml.instance_key, "owner-a__side_1");
         assert_eq!(
-            side_cfg_yaml.protocol,
-            Some(ProtocolConfig {
-                protocol_type: ProtocolType::Tcp,
+            side_cfg_yaml.network,
+            Some(NetworkConfigYaml {
+                subnet_whitelist: None,
+                primary_ip_to_extended_ips: None,
                 rdma_device_names: None,
-                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
+                tcp_reactor_mode: TcpThreadReactorWaitMode::default(),
             })
         );
         assert!(side_cfg_yaml.contribute_to_cluster_pool_size.is_none());
@@ -2844,6 +2819,11 @@ mod tests {
         assert!(side_cfg_yaml.fluxonkv_spec.large_file_paths.is_none());
         assert!(side_cfg_yaml.fluxonkv_spec.sub_cluster.is_none());
         assert_eq!(side_cfg_yaml.fluxonkv_spec.p2p_listen_port, Some(42001));
+        assert!(
+            !serde_yaml::to_string(&side_cfg_yaml)
+                .unwrap()
+                .contains("protocol_type")
+        );
         assert_eq!(
             side_cfg_yaml.test_spec_config.side_transfer_role,
             Some(SideTransferRole::Worker)

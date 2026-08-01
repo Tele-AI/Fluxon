@@ -53,7 +53,7 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("fluxonkv_external_forbids_large_file_paths", test_fluxonkv_external_forbids_large_file_paths),
         ("fluxonkv_p2p_relay_removed", test_fluxonkv_p2p_relay_removed),
         ("fluxon_client_config_yaml_shape", test_fluxon_client_config_yaml_shape),
-        ("fluxonkv_protocol_field", test_fluxonkv_protocol_field),
+        ("fluxonkv_network_field", test_fluxonkv_network_field),
         ("fluxonkv_runtime_defaults_are_internal", test_fluxonkv_runtime_defaults_are_internal),
         ("fluxonkv_removed_rdma_config_keys", test_fluxonkv_removed_rdma_config_keys),
         ("fluxonkv_test_spec_config", test_fluxonkv_test_spec_config),
@@ -444,13 +444,13 @@ def test_fluxon_client_config_yaml_shape():
         print(f"❌ FAIL: test_fluxon_client_config_yaml_shape - {e}")
 
 
-def test_fluxonkv_protocol_field():
-    """Ensure Rust-generated side-worker YAML protocol blocks survive Python validation."""
+def test_fluxonkv_network_field():
+    """Ensure network tuning uses the canonical block and rejects removed fields."""
     try:
         cfg = {
             "instance_key": "test_instance__side_0",
-            "protocol": {
-                "protocol_type": "tcp",
+            "network": {
+                "tcp_reactor_mode": "event_driven",
             },
             "fluxonkv_spec": {
                 "cluster_name": "test_cluster",
@@ -464,13 +464,46 @@ def test_fluxonkv_protocol_field():
         }
         config = FluxonKvClientConfig(copy.deepcopy(cfg))
         loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
-        assert loaded["protocol"]["protocol_type"] == "tcp"
-        assert config.protocol_type == "tcp"
-        assert config.protocol_rdma_device_names is None
+        assert "protocol_type" not in loaded["network"]
+        assert loaded["network"]["tcp_reactor_mode"] == "event_driven"
+        assert config.network_rdma_device_names is None
         assert config.fluxonkv_spec_transfer_engine == "p2p"
-        print("✅ PASS: test_fluxonkv_protocol_field")
+
+        removed_block = copy.deepcopy(cfg)
+        removed_block["protocol"] = removed_block.pop("network")
+        try:
+            FluxonKvClientConfig(removed_block)
+            raise AssertionError("removed protocol block should be rejected")
+        except ValueError as exc:
+            assert "protocol" in str(exc)
+
+        removed_selector = copy.deepcopy(cfg)
+        removed_selector["network"]["protocol_type"] = "rdma"
+        try:
+            FluxonKvClientConfig(removed_selector)
+            raise AssertionError("removed protocol_type should be rejected")
+        except ValueError as exc:
+            assert "protocol_type" in str(exc)
+
+        for removed_name in ("event_mode", "tcp_thread_reactor"):
+            removed_mode_name = copy.deepcopy(cfg)
+            removed_mode_name["network"] = {removed_name: "event_driven"}
+            try:
+                FluxonKvClientConfig(removed_mode_name)
+                raise AssertionError(f"removed {removed_name} should be rejected")
+            except ValueError as exc:
+                assert removed_name in str(exc)
+
+        worker_override = copy.deepcopy(cfg)
+        worker_override["test_spec_config"]["protocol_type"] = "tcp"
+        try:
+            FluxonKvClientConfig(worker_override)
+            raise AssertionError("side-transfer worker protocol_type should be rejected")
+        except ValueError as exc:
+            assert "side-transfer workers" in str(exc)
+        print("✅ PASS: test_fluxonkv_network_field")
     except Exception as e:
-        print(f"❌ FAIL: test_fluxonkv_protocol_field - {e}")
+        print(f"❌ FAIL: test_fluxonkv_network_field - {e}")
 
 
 def test_fluxonkv_runtime_defaults_are_internal():
@@ -479,7 +512,8 @@ def test_fluxonkv_runtime_defaults_are_internal():
         base = _owner_fluxonkv_base_config(tag="runtime_defaults")
         config = FluxonKvClientConfig(copy.deepcopy(base))
         assert config.fluxonkv_spec_transfer_engine == "closed"
-        assert config.protocol_rdma_device_names is None
+        assert config.network_rdma_device_names is None
+        assert "protocol_type" not in config.config_dict["test_spec_config"]
         loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
         assert "transfer_engine" not in loaded["fluxonkv_spec"]
         assert "rdma_device_names" not in loaded
@@ -536,6 +570,48 @@ def test_fluxonkv_test_spec_config():
         except ValueError:
             pass
 
+        tcp_protocol = _owner_fluxonkv_base_config(tag="test_spec_tcp_protocol")
+        tcp_protocol["test_spec_config"] = {
+            "protocol_type": "tcp",
+            "transport_mode": "transfer_with_rpc",
+            "require_transfer_rpc_fast_path_ready_timeout_seconds": 30,
+        }
+        config = FluxonKvClientConfig(tcp_protocol)
+        loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
+        assert loaded["test_spec_config"]["protocol_type"] == "tcp"
+        assert "rdma_device_names" not in loaded["test_spec_config"]
+
+        explicit_rdma = _owner_fluxonkv_base_config(tag="test_spec_rdma_protocol")
+        explicit_rdma["test_spec_config"] = {"protocol_type": "rdma"}
+        config = FluxonKvClientConfig(explicit_rdma)
+        loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
+        assert loaded["test_spec_config"]["protocol_type"] == "rdma"
+
+        invalid_protocol = _owner_fluxonkv_base_config(tag="test_spec_invalid_protocol")
+        invalid_protocol["test_spec_config"] = {"protocol_type": "quic"}
+        try:
+            FluxonKvClientConfig(invalid_protocol)
+            print(
+                "❌ FAIL: test_fluxonkv_test_spec_config - invalid protocol_type should be rejected"
+            )
+            return
+        except ValueError:
+            pass
+
+        tcp_with_rdma_devices = _owner_fluxonkv_base_config(tag="test_spec_tcp_with_rdma")
+        tcp_with_rdma_devices["test_spec_config"] = {
+            "protocol_type": "tcp",
+            "rdma_device_names": ["mlx5_0"],
+        }
+        try:
+            FluxonKvClientConfig(tcp_with_rdma_devices)
+            print(
+                "❌ FAIL: test_fluxonkv_test_spec_config - tcp with rdma_device_names should be rejected"
+            )
+            return
+        except ValueError:
+            pass
+
         rdma_devices = copy.deepcopy(base)
         rdma_devices["test_spec_config"]["transport_mode"] = "transfer_with_rpc"
         rdma_devices["test_spec_config"]["rdma_device_names"] = [" mlx5_4 ", "mlx5_0", "mlx5_4"]
@@ -544,9 +620,8 @@ def test_fluxonkv_test_spec_config():
         rdma_devices["test_spec_config"]["iceoryx_external_busy_poll"] = True
         rdma_devices["test_spec_config"]["iceoryx_owner_client_busy_poll"] = True
         rdma_devices["test_spec_config"]["tcp_thread_reactor_shard_count"] = 2
-        rdma_devices["protocol"] = {
-            "protocol_type": "rdma",
-            "tcp_thread_reactor": "event_driven",
+        rdma_devices["network"] = {
+            "tcp_reactor_mode": "event_driven",
         }
         rdma_devices["test_spec_config"]["tcp_thread_bulk_lane_count"] = 4
         rdma_devices["test_spec_config"]["tcp_thread_control_lane_count"] = 3
@@ -562,14 +637,14 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["iceoryx_owner_client_busy_poll"] is True
         assert loaded["test_spec_config"]["rdma_device_names"] == ["mlx5_0", "mlx5_4"]
         assert loaded["test_spec_config"]["tcp_thread_reactor_shard_count"] == 2
-        assert loaded["protocol"]["tcp_thread_reactor"] == "event_driven"
+        assert loaded["network"]["tcp_reactor_mode"] == "event_driven"
         assert loaded["test_spec_config"]["tcp_thread_bulk_lane_count"] == 4
         assert loaded["test_spec_config"]["tcp_thread_control_lane_count"] == 3
         assert (
             loaded["test_spec_config"]["require_transfer_rpc_fast_path_ready_timeout_seconds"]
             == 45
         )
-        assert config.protocol_rdma_device_names == "mlx5_0,mlx5_4"
+        assert config.network_rdma_device_names == "mlx5_0,mlx5_4"
 
         implicit_transport = copy.deepcopy(base)
         implicit_transport["test_spec_config"] = {
@@ -581,38 +656,36 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["disable_observability"] is True
         assert loaded["test_spec_config"]["enable_iceoryx_logs"] is True
         assert "transport_mode" not in loaded["test_spec_config"]
-        assert "tcp_thread_reactor" not in loaded["test_spec_config"]
-        assert "protocol" not in loaded
+        assert "tcp_reactor_mode" not in loaded["test_spec_config"]
+        assert "network" not in loaded
 
         busy_poll = copy.deepcopy(implicit_transport)
-        busy_poll["protocol"] = {
-            "protocol_type": "rdma",
-            "tcp_thread_reactor": "busy_poll",
+        busy_poll["network"] = {
+            "tcp_reactor_mode": "busy_poll",
         }
         config = FluxonKvClientConfig(busy_poll)
         loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
-        assert loaded["protocol"]["tcp_thread_reactor"] == "busy_poll"
+        assert loaded["network"]["tcp_reactor_mode"] == "busy_poll"
 
         invalid_wait_mode = copy.deepcopy(implicit_transport)
-        invalid_wait_mode["protocol"] = {
-            "protocol_type": "rdma",
-            "tcp_thread_reactor": "epoll",
+        invalid_wait_mode["network"] = {
+            "tcp_reactor_mode": "epoll",
         }
         try:
             FluxonKvClientConfig(invalid_wait_mode)
             print(
-                "❌ FAIL: test_fluxonkv_test_spec_config - invalid tcp_thread_reactor should be rejected"
+                "❌ FAIL: test_fluxonkv_test_spec_config - invalid tcp_reactor_mode should be rejected"
             )
             return
         except ValueError:
             pass
 
-        legacy_wait_mode = copy.deepcopy(implicit_transport)
-        legacy_wait_mode["test_spec_config"]["tcp_thread_reactor"] = "event_driven"
+        misplaced_tcp_reactor_mode = copy.deepcopy(implicit_transport)
+        misplaced_tcp_reactor_mode["test_spec_config"]["tcp_reactor_mode"] = "event_driven"
         try:
-            FluxonKvClientConfig(legacy_wait_mode)
+            FluxonKvClientConfig(misplaced_tcp_reactor_mode)
             print(
-                "❌ FAIL: test_fluxonkv_test_spec_config - test_spec_config wait mode should be rejected"
+                "❌ FAIL: test_fluxonkv_test_spec_config - test_spec_config tcp_reactor_mode should be rejected"
             )
             return
         except ValueError:
@@ -630,8 +703,7 @@ def test_fluxonkv_test_spec_config():
             pass
 
         legacy_field_name = copy.deepcopy(implicit_transport)
-        legacy_field_name["protocol"] = {
-            "protocol_type": "rdma",
+        legacy_field_name["network"] = {
             "tcp_thread_reactor_wait_mode": "event_driven",
         }
         try:
@@ -867,7 +939,6 @@ def test_load_from_dict(cfg):
         assert config.instance_key == "test_instance"
         assert config.contribute_to_cluster_pool_size["dram"] == 16777216
         assert config.contribute_to_cluster_pool_size["vram"] == {}
-        assert config.protocol_type == "rdma"
         assert config.mooncake_spec_local_buffer_size == 16777216
         assert config.mooncake_spec_metadata_server == "http://localhost:8080/metadata"
         assert config.mooncake_spec_master_server_address == "localhost:8081"
@@ -882,7 +953,6 @@ def test_load_from_file(config_file_path):
     try:
         config = FluxonKvClientConfig.from_file(config_file_path)
         assert config.instance_key == "test_instance"
-        assert config.protocol_type == "rdma"
         assert config.mooncake_spec_local_buffer_size == 16777216
         print("✅ PASS: test_load_from_file")
     except Exception as e:

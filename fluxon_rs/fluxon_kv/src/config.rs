@@ -98,6 +98,8 @@ pub enum TestSpecTransportMode {
     TransferWithRpc,
 }
 
+const DEFAULT_PROTOCOL_TYPE: ProtocolType = ProtocolType::Rdma;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SideTransferRole {
@@ -179,6 +181,8 @@ pub struct TestSpecConfig {
     pub short_circuit_put_payload_path: bool,
     #[serde(default)]
     pub skip_put_end_commit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_type: Option<ProtocolType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_mode: Option<TestSpecTransportMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,6 +225,7 @@ impl Default for TestSpecConfig {
             prefer_local_placement: false,
             short_circuit_put_payload_path: false,
             skip_put_end_commit: false,
+            protocol_type: None,
             transport_mode: None,
             tcp_thread_reactor_shard_count: None,
             tcp_thread_bulk_lane_count: None,
@@ -277,11 +282,36 @@ fn materialize_default_test_spec_transport_mode(test_spec_config: &mut TestSpecC
 fn normalize_test_spec_rdma_device_names(
     test_spec_config: &mut TestSpecConfig,
     transport_mode_was_explicit: bool,
-) -> KvResult<Option<Vec<String>>> {
+) -> KvResult<()> {
     let is_side_transfer_worker = matches!(
         test_spec_config.side_transfer_role,
         Some(SideTransferRole::Worker)
     );
+    if is_side_transfer_worker && test_spec_config.protocol_type.is_some() {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: "test_spec_config.protocol_type is not valid for side-transfer workers; their protocol is derived from the worker role".to_string(),
+        }
+        .into_kverror());
+    }
+    if is_side_transfer_worker && test_spec_config.rdma_device_names.is_some() {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: "test_spec_config.rdma_device_names is not valid for side-transfer workers"
+                .to_string(),
+        }
+        .into_kverror());
+    }
+    let protocol_type = test_spec_config
+        .protocol_type
+        .unwrap_or(DEFAULT_PROTOCOL_TYPE);
+    if matches!(protocol_type, ProtocolType::Tcp) {
+        if test_spec_config.rdma_device_names.is_some() {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "test_spec_config.rdma_device_names requires test_spec_config.protocol_type=rdma".to_string(),
+            }
+            .into_kverror());
+        }
+        return Ok(());
+    }
     if transport_mode_was_explicit && test_spec_config.rdma_device_names.is_none() {
         return Err(ConfigError::InvalidClientConfig {
             detail: "explicit test_spec_config.transport_mode now requires test_spec_config.rdma_device_names to avoid implicit RDMA device selection".to_string(),
@@ -290,16 +320,8 @@ fn normalize_test_spec_rdma_device_names(
     }
 
     let Some(raw_devices) = test_spec_config.rdma_device_names.take() else {
-        return Ok(None);
+        return Ok(());
     };
-
-    if is_side_transfer_worker && !transport_mode_was_explicit {
-        return Err(ConfigError::InvalidClientConfig {
-            detail: "test_spec_config.rdma_device_names requires test_spec_config.transport_mode"
-                .to_string(),
-        }
-        .into_kverror());
-    }
 
     let mut deduped = std::collections::BTreeSet::new();
     for (idx, raw) in raw_devices.into_iter().enumerate() {
@@ -324,8 +346,8 @@ fn normalize_test_spec_rdma_device_names(
         .into_kverror());
     }
 
-    test_spec_config.rdma_device_names = Some(normalized.clone());
-    Ok(Some(normalized))
+    test_spec_config.rdma_device_names = Some(normalized);
+    Ok(())
 }
 
 fn validate_required_transfer_rpc_fast_path_ready_timeout(
@@ -351,7 +373,9 @@ fn validate_required_transfer_rpc_fast_path_ready_timeout(
         }
         .into_kverror());
     }
-    if test_spec_config.rdma_device_names.is_none() {
+    if !matches!(test_spec_config.protocol_type, Some(ProtocolType::Tcp))
+        && test_spec_config.rdma_device_names.is_none()
+    {
         return Err(ConfigError::InvalidClientConfig {
             detail: "test_spec_config.require_transfer_rpc_fast_path_ready_timeout_seconds requires explicit test_spec_config.rdma_device_names".to_string(),
         }
@@ -363,12 +387,48 @@ fn validate_required_transfer_rpc_fast_path_ready_timeout(
 
 fn apply_test_spec_rdma_device_names_to_protocol(
     mut protocol: ProtocolConfig,
-    normalized_rdma_device_names: Option<&Vec<String>>,
+    normalized_rdma_device_names: Option<&[String]>,
 ) -> ProtocolConfig {
-    if matches!(protocol.protocol_type, ProtocolType::Rdma) {
-        protocol.rdma_device_names = normalized_rdma_device_names.map(|devices| devices.join(","));
+    if matches!(protocol.protocol_type, ProtocolType::Rdma)
+        && let Some(devices) = normalized_rdma_device_names
+    {
+        protocol.rdma_device_names = Some(devices.join(","));
     }
     protocol
+}
+
+fn resolve_protocol_config(
+    raw: Option<&NetworkConfigYaml>,
+    protocol_type: ProtocolType,
+) -> ProtocolConfig {
+    let raw = raw.cloned().unwrap_or_default();
+    ProtocolConfig {
+        protocol_type,
+        rdma_device_names: raw.rdma_device_names,
+        tcp_thread_reactor: raw.tcp_reactor_mode,
+    }
+}
+
+fn resolve_member_network_config(
+    raw: Option<&NetworkConfigYaml>,
+) -> KvResult<Option<NetworkConfig>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let Some(subnet_whitelist) = raw.subnet_whitelist.as_ref() else {
+        if raw.primary_ip_to_extended_ips.is_some() {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "network.primary_ip_to_extended_ips requires network.subnet_whitelist"
+                    .to_string(),
+            }
+            .into_kverror());
+        }
+        return Ok(None);
+    };
+    Ok(Some(NetworkConfig {
+        subnet_whitelist: subnet_whitelist.clone(),
+        primary_ip_to_extended_ips: raw.primary_ip_to_extended_ips.clone(),
+    }))
 }
 
 fn validate_test_spec_optional_u8_range(
@@ -420,6 +480,18 @@ fn validate_test_spec_tcp_thread_tuning(test_spec_config: &TestSpecConfig) -> Kv
     Ok(())
 }
 
+fn normalize_and_validate_test_spec_config(
+    mut test_spec_config: TestSpecConfig,
+) -> KvResult<TestSpecConfig> {
+    let transport_mode_was_explicit = test_spec_config.transport_mode.is_some();
+    normalize_test_spec_rdma_device_names(&mut test_spec_config, transport_mode_was_explicit)?;
+    materialize_default_test_spec_transport_mode(&mut test_spec_config);
+    validate_required_transfer_rpc_fast_path_ready_timeout(&test_spec_config)?;
+    validate_test_spec_tcp_thread_tuning(&test_spec_config)?;
+    validate_test_spec_kv_ssd_backend(&test_spec_config)?;
+    Ok(test_spec_config)
+}
+
 fn transfer_engine_supports_rpc_fast_path(transfer_engine: TransferEngineType) -> bool {
     matches!(transfer_engine, TransferEngineType::Closed)
 }
@@ -469,18 +541,6 @@ fn verify_non_empty_root_path_list(paths: &[String], field_name: &str) -> KvResu
         )?);
     }
     Ok(out)
-}
-
-fn resolve_transfer_engine_for_protocol(protocol: &ProtocolConfig) -> KvResult<TransferEngineType> {
-    if matches!(protocol.protocol_type, ProtocolType::Tcp) {
-        return Err(ConfigError::InvalidClientConfig {
-            detail:
-                "protocol.protocol_type=tcp is not supported in the public bundled-runtime build; closed runtime is RDMA-only"
-                    .to_string(),
-        }
-        .into_kverror());
-    }
-    Ok(TransferEngineType::Closed)
 }
 
 // Defaults for `monitoring.otlp_log_api`.
@@ -581,11 +641,9 @@ pub struct MasterConfigYaml {
     pub port: Option<u16>,
     pub etcd_endpoints: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<ProtocolConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub monitoring: Option<MonitoringConfigYaml>, // monitoring config (prometheus base url, optional remote write, optional otlp_log_api)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<NetworkConfig>,
+    pub network: Option<NetworkConfigYaml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pprof_duration_seconds: Option<u64>,
     pub log_dir: String,
@@ -662,7 +720,7 @@ pub struct RedisCompatConfigYaml {
 pub struct ClientConfigYaml {
     pub instance_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<ProtocolConfig>,
+    pub network: Option<NetworkConfigYaml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contribute_to_cluster_pool_size: Option<ContributeToClusterPoolSizeYaml>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -672,7 +730,21 @@ pub struct ClientConfigYaml {
     pub test_spec_config: TestSpecConfig,
 }
 
-/// Validated protocol configuration
+/// User-facing network configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConfigYaml {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subnet_whitelist: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_ip_to_extended_ips: Option<BTreeMap<String, Vec<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdma_device_names: Option<String>,
+    #[serde(default)]
+    pub tcp_reactor_mode: TcpThreadReactorWaitMode,
+}
+
+/// Validated internal protocol configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProtocolConfig {
@@ -1156,16 +1228,7 @@ impl ClientConfigYaml {
             None => None,
         };
 
-        let mut test_spec_config = self.test_spec_config;
-        let transport_mode_was_explicit = test_spec_config.transport_mode.is_some();
-        let normalized_rdma_device_names = normalize_test_spec_rdma_device_names(
-            &mut test_spec_config,
-            transport_mode_was_explicit,
-        )?;
-        materialize_default_test_spec_transport_mode(&mut test_spec_config);
-        validate_required_transfer_rpc_fast_path_ready_timeout(&test_spec_config)?;
-        validate_test_spec_tcp_thread_tuning(&test_spec_config)?;
-        validate_test_spec_kv_ssd_backend(&test_spec_config)?;
+        let test_spec_config = normalize_and_validate_test_spec_config(self.test_spec_config)?;
 
         // Role selection contract:
         // - Missing contribute_to_cluster_pool_size means "zero-contribution" mode.
@@ -1279,15 +1342,28 @@ impl ClientConfigYaml {
             }
         }
 
-        // Preserve historical behavior for configs that omit `protocol`, but allow
-        // generated zero-contribution side-worker configs to explicitly inherit TCP.
+        // Keep the existing protocol default unless a test override is explicit.
+        // Internal side-transfer workers derive TCP from their role.
+        if let Some(network) = self.network.as_ref()
+            && (network.subnet_whitelist.is_some() || network.primary_ip_to_extended_ips.is_some())
+        {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "network.subnet_whitelist and network.primary_ip_to_extended_ips are only valid in master config".to_string(),
+            }
+            .into_kverror());
+        }
         let protocol = apply_test_spec_rdma_device_names_to_protocol(
-            self.protocol.unwrap_or(ProtocolConfig {
-                protocol_type: ProtocolType::Rdma,
-                rdma_device_names: None,
-                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
-            }),
-            normalized_rdma_device_names.as_ref(),
+            resolve_protocol_config(
+                self.network.as_ref(),
+                if is_side_transfer_worker {
+                    ProtocolType::Tcp
+                } else {
+                    test_spec_config
+                        .protocol_type
+                        .unwrap_or(DEFAULT_PROTOCOL_TYPE)
+                },
+            ),
+            test_spec_config.rdma_device_names.as_deref(),
         );
 
         // Preserve raw etcd_addresses for shared.json (external bootstrap expects raw strings).
@@ -1358,7 +1434,7 @@ impl ClientConfigYaml {
         let transfer_engine = if is_side_transfer_worker {
             TransferEngineType::P2p
         } else {
-            resolve_transfer_engine_for_protocol(&protocol)?
+            TransferEngineType::Closed
         };
         let enable_transfer_rpc_fast_path = if is_side_transfer_worker {
             false
@@ -1624,7 +1700,8 @@ impl MasterConfigYaml {
             None => return Err(ConfigError::MissingMonitoringConfig {}.into_kverror()),
         };
 
-        let network = match self.network.as_mut() {
+        let mut member_network = resolve_member_network_config(self.network.as_ref())?;
+        let network = match member_network.as_mut() {
             Some(cfg) => {
                 for cidr in cfg.subnet_whitelist.iter_mut() {
                     let trimmed = cidr.trim();
@@ -1782,25 +1859,17 @@ impl MasterConfigYaml {
             None => None,
         };
 
-        let mut test_spec_config = self.test_spec_config;
-        let transport_mode_was_explicit = test_spec_config.transport_mode.is_some();
-        let normalized_rdma_device_names = normalize_test_spec_rdma_device_names(
-            &mut test_spec_config,
-            transport_mode_was_explicit,
-        )?;
-        materialize_default_test_spec_transport_mode(&mut test_spec_config);
-        validate_required_transfer_rpc_fast_path_ready_timeout(&test_spec_config)?;
-        validate_test_spec_tcp_thread_tuning(&test_spec_config)?;
-        validate_test_spec_kv_ssd_backend(&test_spec_config)?;
+        let test_spec_config = normalize_and_validate_test_spec_config(self.test_spec_config)?;
         let protocol = apply_test_spec_rdma_device_names_to_protocol(
-            self.protocol.unwrap_or(ProtocolConfig {
-                protocol_type: ProtocolType::Rdma,
-                rdma_device_names: None,
-                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
-            }),
-            normalized_rdma_device_names.as_ref(),
+            resolve_protocol_config(
+                self.network.as_ref(),
+                test_spec_config
+                    .protocol_type
+                    .unwrap_or(DEFAULT_PROTOCOL_TYPE),
+            ),
+            test_spec_config.rdma_device_names.as_deref(),
         );
-        let transfer_engine = resolve_transfer_engine_for_protocol(&protocol)?;
+        let transfer_engine = TransferEngineType::Closed;
 
         Ok(MasterConfig {
             instance_key: self.instance_key,
@@ -1856,9 +1925,8 @@ fluxonkv_spec:
   share_mem_path: /tmp/test_owner
   large_file_paths: [/tmp/test_owner_large]
   sub_cluster: rack-a
-protocol:
-  protocol_type: rdma
-  tcp_thread_reactor: busy_poll
+network:
+  tcp_reactor_mode: busy_poll
 test_spec_config:
   disable_observability: true
   enable_iceoryx_logs: true
@@ -1892,6 +1960,84 @@ test_spec_config:
     }
 
     #[test]
+    fn client_test_spec_protocol_type_controls_tcp_and_rdma() {
+        let tcp = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner_tcp
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner_tcp
+  large_file_paths: [/tmp/test_owner_tcp_large]
+  sub_cluster: rack-a
+test_spec_config:
+  protocol_type: tcp
+  transport_mode: transfer_with_rpc
+  require_transfer_rpc_fast_path_ready_timeout_seconds: 30
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(tcp.protocol.protocol_type, ProtocolType::Tcp);
+        assert_eq!(tcp.protocol.rdma_device_names, None);
+        assert_eq!(
+            tcp.fluxonkv_spec.transfer_engine,
+            TransferEngineType::Closed
+        );
+
+        let rdma = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner_rdma
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner_rdma
+  large_file_paths: [/tmp/test_owner_rdma_large]
+  sub_cluster: rack-a
+test_spec_config:
+  protocol_type: rdma
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(rdma.protocol.protocol_type, ProtocolType::Rdma);
+    }
+
+    #[test]
+    fn client_test_spec_tcp_protocol_rejects_rdma_devices() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
+  sub_cluster: rack-a
+test_spec_config:
+  protocol_type: tcp
+  rdma_device_names: ["mlx5_0"]
+"#,
+        )
+        .unwrap();
+        let err = cfg.verify().unwrap_err();
+        assert!(format!("{err}").contains(
+            "test_spec_config.rdma_device_names requires test_spec_config.protocol_type=rdma"
+        ));
+    }
+
+    #[test]
     fn client_test_spec_config_defaults_transport_mode_to_transfer_with_rpc() {
         let cfg = ClientConfigYaml::from_str(
             r#"
@@ -1899,6 +2045,8 @@ instance_key: test_owner
 contribute_to_cluster_pool_size:
   dram: 16777216
   vram: {}
+network:
+  rdma_device_names: mlx5_0
 fluxonkv_spec:
   etcd_addresses: ["127.0.0.1:2379"]
   cluster_name: test_cluster
@@ -1913,6 +2061,12 @@ fluxonkv_spec:
             verified.test_spec_config.transport_mode,
             Some(TestSpecTransportMode::TransferWithRpc)
         );
+        assert_eq!(verified.test_spec_config.protocol_type, None);
+        assert_eq!(verified.protocol.protocol_type, DEFAULT_PROTOCOL_TYPE);
+        assert_eq!(
+            verified.protocol.rdma_device_names,
+            Some("mlx5_0".to_string())
+        );
         assert_eq!(
             verified.protocol.tcp_thread_reactor,
             TcpThreadReactorWaitMode::BusyPoll
@@ -1921,19 +2075,19 @@ fluxonkv_spec:
     }
 
     #[test]
-    fn client_config_rejects_reactor_under_test_spec_config() {
+    fn client_config_rejects_removed_event_mode() {
         let err = ClientConfigYaml::from_str(
             r#"
 instance_key: test_external
+network:
+  event_mode: event_driven
 fluxonkv_spec:
   cluster_name: test_cluster
   share_mem_path: /tmp/test_external
-test_spec_config:
-  tcp_thread_reactor: event_driven
 "#,
         )
         .unwrap_err();
-        assert!(format!("{err}").contains("unknown field `tcp_thread_reactor`"));
+        assert!(format!("{err}").contains("unknown field `event_mode`"));
     }
 
     #[test]
@@ -2550,12 +2704,10 @@ test_spec_config:
     }
 
     #[test]
-    fn client_config_accepts_explicit_tcp_protocol() {
+    fn client_config_derives_tcp_for_side_transfer_worker() {
         let cfg = ClientConfigYaml::from_str(
             r#"
 instance_key: test_side_worker
-protocol:
-  protocol_type: tcp
 fluxonkv_spec:
   cluster_name: test_cluster
   share_mem_path: /tmp/test_side_worker
@@ -2588,8 +2740,6 @@ test_spec_config:
         let cfg = ClientConfigYaml::from_str(
             r#"
 instance_key: test_side_worker
-protocol:
-  protocol_type: tcp
 fluxonkv_spec:
   cluster_name: test_cluster
   share_mem_path: /tmp/test_side_worker
@@ -2614,29 +2764,25 @@ test_spec_config:
     }
 
     #[test]
-    fn client_config_side_transfer_worker_forces_p2p_without_rpc_fast_path() {
+    fn client_config_rejects_test_spec_protocol_type_for_side_transfer_worker() {
         let cfg = ClientConfigYaml::from_str(
             r#"
 instance_key: test_side_worker
-protocol:
-  protocol_type: tcp
 fluxonkv_spec:
   cluster_name: test_cluster
   share_mem_path: /tmp/test_side_worker
 test_spec_config:
   enable_side_transfer: true
   side_transfer_role: worker
-  transport_mode: transfer_with_rpc
-  rdma_device_names: ["mlx5_0"]
+  protocol_type: tcp
 "#,
         )
         .unwrap();
-        let verified = cfg.verify().unwrap();
-        assert_eq!(
-            verified.fluxonkv_spec.transfer_engine,
-            TransferEngineType::P2p
+        let err = cfg.verify().unwrap_err();
+        assert!(
+            format!("{err}")
+                .contains("test_spec_config.protocol_type is not valid for side-transfer workers")
         );
-        assert!(!verified.fluxonkv_spec.enable_transfer_rpc_fast_path);
     }
 
     #[test]
@@ -2670,8 +2816,8 @@ test_spec_config:
     }
 
     #[test]
-    fn client_config_tcp_protocol_rejects_public_closed_runtime() {
-        let cfg = ClientConfigYaml::from_str(
+    fn client_config_rejects_removed_protocol_block() {
+        let err = ClientConfigYaml::from_str(
             r#"
 instance_key: test_owner
 protocol:
@@ -2687,20 +2833,15 @@ fluxonkv_spec:
   sub_cluster: rack-a
 "#,
         )
-        .unwrap();
-        let err = cfg.verify().unwrap_err();
-        assert!(format!("{err}").contains(
-            "protocol.protocol_type=tcp is not supported in the public bundled-runtime build"
-        ));
+        .unwrap_err();
+        assert!(format!("{err}").contains("unknown field `protocol`"));
     }
 
     #[test]
-    fn client_config_tcp_protocol_rejects_unknown_legacy_override() {
+    fn client_config_rejects_unknown_legacy_override() {
         let err = ClientConfigYaml::from_str(
             r#"
 instance_key: test_owner
-protocol:
-  protocol_type: tcp
 contribute_to_cluster_pool_size:
   dram: 16777216
   vram: {}
@@ -2721,27 +2862,23 @@ test_spec_config:
     }
 
     #[test]
-    fn master_config_explicit_tcp_protocol_rejects_public_closed_sdk_build() {
-        let cfg = MasterConfigYaml::from_str(
+    fn master_config_rejects_removed_protocol_type() {
+        let err = MasterConfigYaml::from_str(
             r#"
 instance_key: test_master
 cluster_name: test_cluster
 port: 18080
 etcd_endpoints: ["127.0.0.1:2379"]
-protocol:
-  protocol_type: tcp
 network:
   subnet_whitelist: ["127.0.0.0/8"]
+  protocol_type: tcp
 monitoring:
   prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
 log_dir: /tmp/test_master_logs
 "#,
         )
-        .unwrap();
-        let err = cfg.verify().unwrap_err();
-        assert!(format!("{err}").contains(
-            "protocol.protocol_type=tcp is not supported in the public bundled-runtime build"
-        ));
+        .unwrap_err();
+        assert!(format!("{err}").contains("unknown field `protocol_type`"));
     }
 
     #[test]
@@ -2754,12 +2891,10 @@ port: 18080
 etcd_endpoints: ["127.0.0.1:2379"]
 network:
   subnet_whitelist: ["127.0.0.0/8"]
+  tcp_reactor_mode: event_driven
 monitoring:
   prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
 log_dir: /tmp/test_master_logs
-protocol:
-  protocol_type: rdma
-  tcp_thread_reactor: event_driven
 test_spec_config:
   disable_prefix_index: true
   disable_crossowner_ipc: true
@@ -2790,6 +2925,30 @@ test_spec_config:
             Some("mlx5_0,mlx5_4".to_string())
         );
         assert!(verified.enable_transfer_rpc_fast_path);
+    }
+
+    #[test]
+    fn master_test_spec_protocol_type_accepts_tcp() {
+        let cfg = MasterConfigYaml::from_str(
+            r#"
+instance_key: test_master
+cluster_name: test_cluster
+port: 18080
+etcd_endpoints: ["127.0.0.1:2379"]
+network:
+  subnet_whitelist: ["127.0.0.0/8"]
+monitoring:
+  prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
+log_dir: /tmp/test_master_logs
+test_spec_config:
+  protocol_type: tcp
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(cfg.protocol.protocol_type, ProtocolType::Tcp);
+        assert_eq!(cfg.transfer_engine, TransferEngineType::Closed);
     }
 
     #[test]
