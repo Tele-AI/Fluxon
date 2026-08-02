@@ -1709,7 +1709,9 @@ async fn force_evict_memory_replicas_for_storage_probe(
                 .read()
                 .iter()
                 .filter_map(|(node_id, replicas)| {
-                    replicas.memory.is_some().then(|| node_id.clone())
+                    replicas.memory.as_ref().map(|allocation| {
+                        (node_id.clone(), replicas.generation, Arc::clone(allocation))
+                    })
                 })
                 .collect::<Vec<_>>();
             let ssd_replica_count = route
@@ -1732,12 +1734,14 @@ async fn force_evict_memory_replicas_for_storage_probe(
         sleep(Duration::from_millis(50)).await;
     };
 
-    for node_id in memory_replica_nodes {
+    for (node_id, generation, allocation) in memory_replica_nodes {
         crate::master_kv_router::delete::evict_one_kv_replica_for_node(
             &master_view,
             key.to_string(),
             node_id.clone(),
+            generation,
             put_id,
+            &allocation,
         )
         .unwrap_or_else(|code| {
             panic!(
