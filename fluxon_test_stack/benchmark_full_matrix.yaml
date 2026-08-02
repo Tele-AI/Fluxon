@@ -457,12 +457,11 @@ profiles:
           kv_base:
             instance_key: bench_base
             contribute_to_cluster_pool_size: {dram: 0, vram: {}}
-            protocol:
-              protocol_type: tcp
             test_spec_config:
               disable_observability: true
               disable_master_replica_cache: true
               disable_prefix_index: true
+              protocol_type: tcp
             mooncake_spec:
               local_buffer_size: 1073741824
           master:

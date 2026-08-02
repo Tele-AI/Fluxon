@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::NodeIDString;
+pub use fluxon_commu_contract::ClosedRuntimeLocalMemoryKind;
 use fluxon_commu_contract::{
     ClosedRuntimeHandle, ClosedRuntimePeerGen, ClosedRuntimeTransferEngineOpenRuntimeRequest,
     ClosedRuntimeTransferEngineOpenRuntimeResponse,
@@ -120,8 +121,13 @@ impl TransferRpcFastPath for ClosedTransferRpcFastPath {
 fn transfer_engine_closed_sdk_error(
     error: crate::closed_sdk::ClosedSdkConsumerError,
 ) -> TransferEngineError {
-    TransferEngineError::CreateEngineFailed {
-        detail: format!("closed sdk transfer-engine call failed: {error}"),
+    match error {
+        crate::closed_sdk::ClosedSdkConsumerError::RequiredDirectFastPathNotReady => {
+            TransferEngineError::RequiredDirectFastPathNotReady
+        }
+        error => TransferEngineError::CreateEngineFailed {
+            detail: format!("closed sdk transfer-engine call failed: {error}"),
+        },
     }
 }
 
@@ -380,12 +386,32 @@ impl ClientTransferEngineCore {
     where
         R: ClientTransferEngineRuntime,
     {
+        self.register_local_memory(
+            runtime,
+            cpu_mem.allocated_addr,
+            cpu_mem.allocated_size,
+            ClosedRuntimeLocalMemoryKind::Host,
+        )
+        .await
+    }
+
+    pub async fn register_local_memory<R>(
+        &self,
+        runtime: R,
+        allocated_addr: u64,
+        allocated_size: u64,
+        memory_kind: ClosedRuntimeLocalMemoryKind,
+    ) -> TransferEngineResult<()>
+    where
+        R: ClientTransferEngineRuntime,
+    {
         {
             let handle = self.ensure_closed_runtime_handle(&runtime).await?;
             transfer_engine_register_local_segment(
                 handle,
-                cpu_mem.allocated_addr,
-                cpu_mem.allocated_size,
+                allocated_addr,
+                allocated_size,
+                memory_kind,
             )
             .await
             .map_err(transfer_engine_closed_sdk_error)
@@ -396,12 +422,27 @@ impl ClientTransferEngineCore {
         &self,
         cpu_mem: &CpuAllocatedMem,
     ) -> TransferEngineResult<()> {
+        self.unregister_local_memory(
+            cpu_mem.allocated_addr,
+            cpu_mem.allocated_size,
+            ClosedRuntimeLocalMemoryKind::Host,
+        )
+        .await
+    }
+
+    pub async fn unregister_local_memory(
+        &self,
+        allocated_addr: u64,
+        allocated_size: u64,
+        memory_kind: ClosedRuntimeLocalMemoryKind,
+    ) -> TransferEngineResult<()> {
         {
             if let Some(handle) = self.closed.handle.get().copied() {
                 transfer_engine_unregister_local_segment(
                     handle,
-                    cpu_mem.allocated_addr,
-                    cpu_mem.allocated_size,
+                    allocated_addr,
+                    allocated_size,
+                    memory_kind,
                 )
                 .await
                 .map_err(transfer_engine_closed_sdk_error)
@@ -458,6 +499,7 @@ impl ClientTransferEngineCore {
                 target_addr,
                 len,
                 seg_guard,
+                false,
             )
             .await
         }
@@ -472,6 +514,7 @@ impl ClientTransferEngineCore {
         target_addr: u64,
         len: u64,
         seg_guard: Option<R::LocalSegmentGuard>,
+        require_fast_path: bool,
     ) -> TransferEngineResult<TransferBreakdown>
     where
         R: ClientTransferEngineRuntime,
@@ -506,6 +549,7 @@ impl ClientTransferEngineCore {
                 target_addr,
                 len,
                 initial_local_segment_guard_handle,
+                require_fast_path,
             )
             .await
             .map_err(transfer_engine_closed_sdk_error);
@@ -522,3 +566,20 @@ impl ClientTransferEngineCore {
     }
 }
 pub use fluxon_commu_contract::transfer_engine::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_direct_fast_path_not_ready_maps_to_public_typed_error() {
+        let error = transfer_engine_closed_sdk_error(
+            crate::closed_sdk::ClosedSdkConsumerError::RequiredDirectFastPathNotReady,
+        );
+
+        assert!(matches!(
+            error,
+            TransferEngineError::RequiredDirectFastPathNotReady
+        ));
+    }
+}

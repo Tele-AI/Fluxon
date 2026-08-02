@@ -221,9 +221,6 @@ def main() -> None:
                 "cluster_name": CLUSTER_NAME,
                 "share_mem_path": SHARE_MEM_PATH,
             },
-            "test_spec_config": {
-                "disable_observability": True,
-            },
         }
     )
     store = new_store(cfg).unwrap("new_store failed")
@@ -296,9 +293,6 @@ def _build_config(*, instance_key: str) -> FluxonKvClientConfig:
             "fluxonkv_spec": {
                 "cluster_name": CLUSTER_NAME,
                 "share_mem_path": SHARE_MEM_PATH,
-            },
-            "test_spec_config": {
-                "disable_observability": True,
             },
         }
     )
@@ -384,3 +378,34 @@ Keep these roots separate:
 - `FLUXON_LOG`: console log threshold for the user process
 
 In zero-contribution external mode, `Owner Client`-only fields such as `fluxonkv_spec.etcd_addresses`, `fluxonkv_spec.sub_cluster`, `fluxonkv_spec.large_file_paths`, and `fluxonkv_spec.redis_compat` should not appear.
+
+#### Network and TCP thread reactor tuning
+
+The stable `network` block contains network policy and transport tuning; it does not select the
+protocol. `rdma_device_names` optionally pins the comma-separated RDMA devices used by the
+process. `tcp_reactor_mode` controls how the current process's `tcpthr_reactor_*` threads wait
+for work. It defaults to `busy_poll`; select `event_driven` explicitly when reducing idle CPU usage
+is more important:
+
+```yaml
+network:
+  rdma_device_names: mlx5_0
+  tcp_reactor_mode: event_driven
+```
+
+Production protocol selection is not configurable. When no test override is present, the public
+bundled Fluxon KV runtime keeps its current default, RDMA. Tests and benchmarks that need protocol
+selection or fault-isolation switches should use the separate
+[Developer - 9 - Test Extension Configuration](<../dev_doc/Developer - 9 - Test Extension Configuration.md>).
+
+| Value | Behavior and tradeoff |
+| --- | --- |
+| `busy_poll` (default) | Uses zero-timeout polling during the hot window. This reduces wake-up and scheduling latency but consumes more CPU. |
+| `event_driven` | Blocks in `mio::Poll` for socket readiness and uses `mio::Waker` for new commands and send work. This lowers idle CPU usage but may add a small amount of wake-up and scheduling latency. |
+
+This is a process-level setting. All `tcp_thread` P2P connections in one process share the same
+wait mode, so FS RPC and KV RPC cannot select different modes inside that process. The setting
+controls only the local TCP reactor; the communication peer's wait mode is unaffected.
+
+Connection control and other async work continue to run on the Tokio runtime. After the handshake,
+the primary TCP data path continues to run on dedicated `tcpthr_reactor_*` OS threads.

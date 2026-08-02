@@ -34,6 +34,7 @@ fn new_master_config(
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
             rdma_device_names: None,
+            tcp_thread_reactor: Default::default(),
         },
         transfer_engine: TransferEngineType::P2p,
         enable_transfer_rpc_fast_path: false,
@@ -74,6 +75,7 @@ fn new_client_config(
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
             rdma_device_names: None,
+            tcp_thread_reactor: Default::default(),
         },
         pprof_duration_seconds: None,
         redis_compat_listen_addr: None,
@@ -118,6 +120,7 @@ fn new_zero_contribution_client_config(
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Rdma,
             rdma_device_names: None,
+            tcp_thread_reactor: Default::default(),
         },
         pprof_duration_seconds: None,
         redis_compat_listen_addr: None,

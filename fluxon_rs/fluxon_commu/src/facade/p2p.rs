@@ -9,8 +9,8 @@ use crate::transfer::{P2pTransportKind, TransferLinkP2pState};
 use crate::transfer_engine::AttachedTransferEngine;
 use async_trait::async_trait;
 pub use fluxon_commu_contract::p2p::surface::{
-    P2pModuleNewArg, P2pTcpThreadTransportTuning, RpcTransportPolicy, TierSnapshot, UserRpcReq,
-    UserRpcResp,
+    P2pModuleNewArg, P2pTcpThreadReactorWaitMode, P2pTcpThreadTransportTuning, RpcTransportPolicy,
+    TierSnapshot, UserRpcReq, UserRpcResp,
 };
 use fluxon_commu_contract::p2p::surface::{
     P2pModuleNewArg as CommuP2pModuleNewArg, RpcTransportPolicy as CommuRpcTransportPolicy,

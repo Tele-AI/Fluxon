@@ -10,7 +10,8 @@ pub use fluxon_commu::p2p::rpc::{
 };
 pub use fluxon_commu::p2p::{
     MsgId, P2pModule, P2pModuleAccessTrait, P2pModuleNewArg, P2pModuleView, P2pModuleViewTrait,
-    P2pTcpThreadTransportTuning, RpcTransportPolicy, TaskId, UserRpcReq, UserRpcResp,
+    P2pTcpThreadReactorWaitMode, P2pTcpThreadTransportTuning, RpcTransportPolicy, TaskId,
+    UserRpcReq, UserRpcResp,
 };
 
 pub trait UserRpcHandler: Send + Sync + 'static {

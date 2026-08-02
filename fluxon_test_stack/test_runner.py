@@ -411,6 +411,7 @@ TEST_STACK_KV_GET_OUTPUTS_ALLOWED = {"holder", "bytes", "cuda"}
 TEST_STACK_BENCHMARK_KEY_AFFINITY_SLOT_COUNT = "affinity_slot_count"
 SCENE_ID_KV_DRAM_RESIDENT_ZIPF = "kv_dram_resident_zipf"
 SCENE_ID_KV_READ_HEAVY_AFFINITY = "kv_read_heavy_affinity"
+SCENE_ID_TCP_EVENT_DRIVEN_REACTOR_LIFECYCLE = "tcp_event_driven_reactor_lifecycle"
 SCENE_ENUMS_ALLOWED = {
     "bench_mq",
     "fs_open_read_close_smallfiles",
@@ -422,6 +423,7 @@ SCENE_ENUMS_ALLOWED = {
     "kv_write_heavy_large_value",
     "rpc_echo_small_payload",
     "rpc_echo_small_payload_zerorpc",
+    SCENE_ID_TCP_EVENT_DRIVEN_REACTOR_LIFECYCLE,
 }
 
 
@@ -4188,6 +4190,8 @@ def _forbid_unknown_keys(d: Dict[str, Any], allowed: set[str], ctx: str) -> None
 
 
 def _forbid_removed_fluxon_kv_config_keys(kv_base: Dict[str, Any], ctx: str) -> Dict[str, Any]:
+    if "protocol" in kv_base:
+        raise ValueError(f"{ctx}.protocol has been removed; use {ctx}.network")
     if "rdma_device_names" in kv_base:
         raise ValueError(f"{ctx}.rdma_device_names has been removed from Fluxon KV config")
 
@@ -4195,6 +4199,31 @@ def _forbid_removed_fluxon_kv_config_keys(kv_base: Dict[str, Any], ctx: str) -> 
     if "transfer_engine" in fluxonkv_spec:
         raise ValueError(f"{ctx}.fluxonkv_spec.transfer_engine has been removed from Fluxon KV config")
     return fluxonkv_spec
+
+
+def _normalize_test_stack_fluxon_network_config(
+    raw: Any,
+    ctx: str,
+) -> Optional[Dict[str, Any]]:
+    if raw is None:
+        return None
+    cfg = copy.deepcopy(_require_dict(raw, ctx))
+    _forbid_unknown_keys(cfg, {"rdma_device_names", "tcp_reactor_mode"}, ctx)
+    if "rdma_device_names" in cfg:
+        cfg["rdma_device_names"] = _require_str(
+            cfg.get("rdma_device_names"), f"{ctx}.rdma_device_names"
+        ).strip()
+        if not cfg["rdma_device_names"]:
+            raise ValueError(f"{ctx}.rdma_device_names must be non-empty")
+    if "tcp_reactor_mode" in cfg:
+        tcp_reactor_mode = _require_str(
+            cfg.get("tcp_reactor_mode"), f"{ctx}.tcp_reactor_mode"
+        )
+        if tcp_reactor_mode not in {"busy_poll", "event_driven"}:
+            raise ValueError(
+                f"{ctx}.tcp_reactor_mode must be one of ['busy_poll', 'event_driven'], got {tcp_reactor_mode!r}"
+            )
+    return cfg
 
 
 def _normalize_test_stack_zero_contribution_pool(raw: Any, ctx: str) -> Dict[str, Any]:
@@ -4247,6 +4276,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             "short_circuit_put_payload_path",
             "skip_put_end_commit",
             "p2p_transport_impl",
+            "protocol_type",
             "transport_mode",
             "tcp_thread_reactor_shard_count",
             "tcp_thread_bulk_lane_count",
@@ -4312,6 +4342,14 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         raise ValueError(
             f"{ctx}.kv_ssd_uring_mode is only valid with {ctx}.kv_ssd_storage_backend=native"
         )
+    if "protocol_type" in cfg:
+        protocol_type = _require_str(cfg.get("protocol_type"), f"{ctx}.protocol_type")
+        allowed_protocol_types = {"tcp", "rdma"}
+        if protocol_type not in allowed_protocol_types:
+            raise ValueError(
+                f"{ctx}.protocol_type must be one of {sorted(allowed_protocol_types)}, got {protocol_type!r}"
+            )
+        out["protocol_type"] = protocol_type
     transport_mode_was_explicit = "transport_mode" in cfg
     side_transfer_role_raw = cfg.get("side_transfer_role")
     default_transport_mode = None if side_transfer_role_raw == "worker" else "transfer_with_rpc"
@@ -4338,6 +4376,8 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         if not normalized:
             raise ValueError(f"{ctx}.rdma_device_names must be non-empty")
         out["rdma_device_names"] = sorted(normalized)
+    if out.get("protocol_type") == "tcp" and "rdma_device_names" in out:
+        raise ValueError(f"{ctx}.rdma_device_names requires {ctx}.protocol_type=rdma")
     if "require_transfer_rpc_fast_path_ready_timeout_seconds" in cfg:
         timeout_seconds = _require_int(
             cfg.get("require_transfer_rpc_fast_path_ready_timeout_seconds"),
@@ -4349,7 +4389,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             raise ValueError(
                 f"{ctx}.require_transfer_rpc_fast_path_ready_timeout_seconds requires {ctx}.transport_mode=transfer_with_rpc"
             )
-        if "rdma_device_names" not in out:
+        if out.get("protocol_type") != "tcp" and "rdma_device_names" not in out:
             raise ValueError(
                 f"{ctx}.require_transfer_rpc_fast_path_ready_timeout_seconds requires explicit {ctx}.rdma_device_names"
             )
@@ -4388,13 +4428,21 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             )
         out["side_transfer_role"] = side_transfer_role
     if out.get("side_transfer_role") == "worker":
-        if "rdma_device_names" in out and not transport_mode_was_explicit:
-            raise ValueError(f"{ctx}.rdma_device_names requires {ctx}.transport_mode")
+        for field_name in ("protocol_type", "rdma_device_names"):
+            if field_name not in out:
+                continue
+            raise ValueError(
+                f"{ctx}.{field_name} is not valid for side-transfer workers; their protocol is derived from the worker role"
+            )
     elif "transport_mode" not in out:
         out["transport_mode"] = "transfer_with_rpc"
-    if transport_mode_was_explicit and "rdma_device_names" not in out:
+    if (
+        transport_mode_was_explicit
+        and out.get("protocol_type") != "tcp"
+        and "rdma_device_names" not in out
+    ):
         raise ValueError(
-            f"explicit {ctx}.transport_mode now requires {ctx}.rdma_device_names because it maps to TestForceEnableBypassRdmaControl and must avoid UCX default device selection"
+            f"explicit {ctx}.transport_mode now requires {ctx}.rdma_device_names to avoid implicit RDMA device selection"
         )
     return out
 
@@ -4431,25 +4479,6 @@ def _test_spec_config_p2p_transport_impl(test_spec_config: Dict[str, Any]) -> Op
     if raw is None:
         return None
     return _require_str(raw, "test_spec_config.p2p_transport_impl")
-
-
-def _resolve_test_stack_fluxon_protocol_cfg(
-    *,
-    kv_base: Dict[str, Any],
-    merged_test_spec_config: Dict[str, Any],
-    ctx: str,
-) -> Optional[Dict[str, Any]]:
-    raw_protocol = kv_base.get("protocol")
-    if raw_protocol is None:
-        return None
-    return copy.deepcopy(_require_dict(raw_protocol, f"{ctx}.protocol"))
-
-
-def _test_stack_protocol_requires_unlimited_memlock(protocol_cfg: Optional[Dict[str, Any]]) -> bool:
-    if protocol_cfg is None:
-        return False
-    protocol_type = _require_str(protocol_cfg.get("protocol_type"), "protocol.protocol_type").strip().lower()
-    return protocol_type == "rdma"
 
 
 def _rewrite_artifact_set_transport_impl(
@@ -8996,14 +9025,12 @@ def _build_test_stack_external_kv_owner_instances(
             "contribute_to_cluster_pool_size": {"dram": int(owner_dram_bytes), "vram": {}},
             "fluxonkv_spec": owner_fluxonkv_spec,
         }
-        owner_protocol = kv_base.get("protocol")
-        if owner_protocol is not None:
-            owner_cfg["protocol"] = copy.deepcopy(
-                _require_dict(
-                    owner_protocol,
-                    "profile.test_stack.runtime_config.kv_base.protocol",
-                )
-            )
+        owner_network = _normalize_test_stack_fluxon_network_config(
+            kv_base.get("network"),
+            "profile.test_stack.runtime_config.kv_base.network",
+        )
+        if owner_network is not None:
+            owner_cfg["network"] = owner_network
         pprof_duration_seconds = kv_base.get("pprof_duration_seconds")
         if pprof_duration_seconds is not None:
             owner_cfg["pprof_duration_seconds"] = int(pprof_duration_seconds)
@@ -9123,12 +9150,7 @@ def _build_test_stack_mooncake_owner_instances(
         "profile.test_stack.runtime_config.kv_base.mooncake_spec.local_buffer_size",
         min_v=16777216,
     )
-    require_unlimited_memlock = _test_stack_protocol_requires_unlimited_memlock(
-        _require_dict(
-            kv_base.get("protocol"),
-            "profile.test_stack.runtime_config.kv_base.protocol",
-        )
-    )
+    require_unlimited_memlock = True
 
     owner_instances: List[Dict[str, Any]] = []
     local_ipv4_addrs = _local_ipv4_addresses()
@@ -9174,12 +9196,6 @@ def _build_test_stack_mooncake_owner_instances(
                 "master_server_address": master_server_address,
                 "etcd_addresses": list(etcd_addresses),
             },
-            "protocol": copy.deepcopy(
-                _require_dict(
-                    kv_base.get("protocol"),
-                    "profile.test_stack.runtime_config.kv_base.protocol",
-                )
-            ),
         }
         owner_pre_exec_shell = ""
         owner_runtime_env = copy.deepcopy(runtime_env)
@@ -9710,26 +9726,6 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         # - instance_key is still run_dir scoped to avoid stale member-key collisions across reruns inside the same
         #   benchmark cluster namespace.
         kv_base["instance_key"] = f"{runtime_instance_prefix}__bench_base"
-        pre_test_spec_config = _normalize_test_spec_config(
-            kv_base.get("test_spec_config"),
-            "profile.test_stack.runtime_config.kv_base.test_spec_config",
-        )
-        pre_legacy_benchmark_fast_path = _normalize_test_spec_config(
-            kv_base.get("benchmark_fast_path"),
-            "profile.test_stack.runtime_config.kv_base.benchmark_fast_path",
-        )
-        pre_merged_test_spec_config = _merge_test_spec_config_with_legacy_alias(
-            test_spec_config=pre_test_spec_config,
-            legacy_benchmark_fast_path=pre_legacy_benchmark_fast_path,
-            ctx="profile.test_stack.runtime_config.kv_base",
-        )
-        resolved_protocol_cfg = _resolve_test_stack_fluxon_protocol_cfg(
-            kv_base=kv_base,
-            merged_test_spec_config=pre_merged_test_spec_config,
-            ctx="profile.test_stack.runtime_config.kv_base",
-        )
-        if resolved_protocol_cfg is not None:
-            kv_base["protocol"] = resolved_protocol_cfg
         fluxonkv_spec = _forbid_removed_fluxon_kv_config_keys(kv_base, "profile.test_stack.runtime_config.kv_base")
         if uses_external_fluxon_kv:
             # External (zero-contribution) mode forbids etcd_addresses and several advanced knobs.
@@ -9926,16 +9922,6 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         mooncake_spec["master_server_address"] = f"{mooncake_host}:{int(mooncake_rpc_port)}"
         mooncake_spec["etcd_addresses"] = list(etcd_endpoints)
         mooncake_spec.setdefault("skip_get_size_on_get", True)
-        raw_protocol = kv_base.get("protocol")
-        if raw_protocol is None:
-            kv_base["protocol"] = {"protocol_type": "tcp"}
-        else:
-            kv_base["protocol"] = copy.deepcopy(
-                _require_dict(
-                    raw_protocol,
-                    "profile.test_stack.runtime_config.kv_base.protocol",
-                )
-            )
     else:
         raise ValueError(f"unsupported TEST_STACK backend kind: {backend_kind!r}")
     test_spec_config = _normalize_test_spec_config(
@@ -9974,31 +9960,19 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         ctx="profile.test_stack.runtime_config.kv_base",
     )
     runtime_test_spec_config = _test_spec_config_runtime_view(test_spec_config)
-    runtime_protocol_cfg = None
+    runtime_network_cfg = None
     if backend_kind == TEST_STACK_BACKEND_FLUXON:
-        runtime_protocol_cfg = kv_base.get("protocol")
-        if runtime_protocol_cfg is not None:
-            runtime_protocol_cfg = copy.deepcopy(
-                _require_dict(
-                    runtime_protocol_cfg,
-                    "profile.test_stack.runtime_config.kv_base.protocol",
-                )
-            )
+        runtime_network_cfg = _normalize_test_stack_fluxon_network_config(
+            kv_base.get("network"),
+            "profile.test_stack.runtime_config.kv_base.network",
+        )
     kv_base.pop("benchmark_fast_path", None)
     kv_base.pop("test_spec_config", None)
     if runtime_test_spec_config:
         kv_base["test_spec_config"] = copy.deepcopy(runtime_test_spec_config)
-    if runtime_protocol_cfg is not None:
-        kv_base["protocol"] = runtime_protocol_cfg
-    mooncake_requires_unlimited_memlock = (
-        backend_kind == TEST_STACK_BACKEND_MOONCAKE
-        and _test_stack_protocol_requires_unlimited_memlock(
-            _require_dict(
-                kv_base.get("protocol"),
-                "profile.test_stack.runtime_config.kv_base.protocol",
-            )
-        )
-    )
+    if runtime_network_cfg is not None:
+        kv_base["network"] = runtime_network_cfg
+    mooncake_requires_unlimited_memlock = backend_kind == TEST_STACK_BACKEND_MOONCAKE
     # mq_new_or_bind_unique_key is used to derive etcd keys for MPMC channel creation,
     # including a distributed lock key "<unique_id>_lock".
     #
@@ -10056,8 +10030,8 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             master_cfg["pprof_duration_seconds"] = int(pprof_duration_seconds)
         if runtime_test_spec_config:
             master_cfg["test_spec_config"] = copy.deepcopy(runtime_test_spec_config)
-        if runtime_protocol_cfg is not None:
-            master_cfg["protocol"] = copy.deepcopy(runtime_protocol_cfg)
+        if runtime_network_cfg is not None:
+            master_cfg["network"].update(copy.deepcopy(runtime_network_cfg))
         master_cfg_path = cfg_dir / "test_stack_master.yaml"
         if master_cfg_path.exists():
             raise ValueError(f"test_stack master config already exists (no overwrite): {master_cfg_path}")

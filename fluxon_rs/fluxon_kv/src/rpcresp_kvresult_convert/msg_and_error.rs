@@ -312,6 +312,9 @@ impl From<fluxon_commu::TransferEngineError> for TransferEngineError {
             fluxon_commu::TransferEngineError::UnregisterLocalSegmentFailed { detail } => {
                 TransferEngineError::UnregisterLocalSegmentFailed { detail }
             }
+            fluxon_commu::TransferEngineError::RequiredDirectFastPathNotReady => {
+                TransferEngineError::RequiredDirectFastPathNotReady {}
+            }
             fluxon_commu::TransferEngineError::CreateEngineFailed { detail } => {
                 TransferEngineError::CreateEngineFailed { detail }
             }
@@ -510,6 +513,9 @@ crate::define_err_group! {
         ,
         (811, BackendFatal { detail: String },
             msg: "Transfer backend fatal: detail={detail}")
+        ,
+        (812, RequiredDirectFastPathNotReady { },
+            msg: "Required direct fast path is not ready")
     }
 }
 
@@ -760,7 +766,7 @@ impl ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, KvError, TransportKind, TransportUser};
+    use super::{ApiError, KvError, TransferEngineError, TransportKind, TransportUser};
     use crate::cluster_manager::ClusterError;
 
     #[test]
@@ -806,5 +812,17 @@ mod tests {
             }
             other => panic!("unexpected mapped error: {:?}", other),
         }
+    }
+
+    #[test]
+    fn required_direct_fast_path_not_ready_keeps_typed_identity() {
+        let mapped = TransferEngineError::from(
+            fluxon_commu::TransferEngineError::RequiredDirectFastPathNotReady,
+        );
+
+        assert!(matches!(
+            mapped,
+            TransferEngineError::RequiredDirectFastPathNotReady {}
+        ));
     }
 }

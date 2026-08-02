@@ -137,10 +137,10 @@ class MooncakeStore(KvClient):
         self._close_lock = threading.Lock()
         self._closed = False
         self._skip_get_size_on_get = config.mooncake_spec_skip_get_size_on_get
-        # config = self._config
-        device_name = ""
-        if config.protocol_type == "rdma":
-            device_name = config.protocol_rdma_device_names
+        protocol_type = config.test_spec_protocol_type
+        device_name = (
+            config.network_rdma_device_names if protocol_type == "rdma" else ""
+        )
 
         server_name = config.mooncake_spec_local_hostname
 
@@ -155,7 +155,7 @@ class MooncakeStore(KvClient):
             f"enable_ssd_offload: {config.mooncake_spec_enable_ssd_offload}\n"
             f"ssd_offload_path: {config.mooncake_spec_ssd_offload_path}\n"
             f"skip_get_size_on_get: {config.mooncake_spec_skip_get_size_on_get}\n"
-            f"protocol_type: {config.protocol_type}\n"
+            f"protocol_type: {protocol_type}\n"
             f"device_name: {device_name}\n"
             f"==============================================================\n"
         )
@@ -165,7 +165,7 @@ class MooncakeStore(KvClient):
             config.mooncake_spec_metadata_server,
             config.contribute_to_cluster_pool_size["dram"],  # Use DRAM only
             config.mooncake_spec_local_buffer_size,
-            config.protocol_type,
+            protocol_type,
             device_name,
             config.mooncake_spec_master_server_address,
         ]

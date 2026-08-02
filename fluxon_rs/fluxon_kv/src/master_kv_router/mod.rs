@@ -1,5 +1,7 @@
 pub mod delete;
 mod get;
+mod member_lifecycle;
+mod member_lifecycle_binded_state_ctrl;
 pub mod msg_pack;
 pub mod placement;
 pub mod put;
@@ -27,9 +29,7 @@ use self::{
 use crate::ClientKvApiAccessTrait;
 use crate::client_kv_api::ClientKvApi;
 use crate::client_kv_api::msg_pack::SsdReplicaPersistReq;
-use crate::cluster_manager::{
-    ClusterEvent, ClusterManager, ClusterManagerAccessTrait, NodeID, NodeIDString,
-};
+use crate::cluster_manager::{ClusterManager, ClusterManagerAccessTrait, NodeID, NodeIDString};
 use crate::config::TestSpecConfig;
 use crate::master_kv_router::delete::DeleteKeyInfo;
 use crate::master_kv_router::put::PutIDForAKey;
@@ -58,8 +58,8 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
@@ -106,15 +106,56 @@ pub enum InflightPutAllocation {
 }
 
 /// Information about a `put` operation that is currently in progress.
-#[derive(Clone)]
 pub struct InflightPutInfo {
-    pub node_id: NodeID,
-    // seg_name: String,
+    pub target_node_id: NodeID,
+    pub source_node_id: NodeID,
     pub key: String,
     pub req_node_id: NodeID,
+    pub target_generation: i64,
+    pub source_generation: i64,
+    pub requester_generation: i64,
     pub len: u64,
     pub persist_to_ssd: bool,
     pub src_target_allocation: Arc<Mutex<Option<InflightPutAllocation>>>,
+}
+
+pub(crate) type InflightPutKey = (String, u64, u32);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MemberGeneration {
+    member_id: NodeIDString,
+    generation: i64,
+}
+
+impl InflightPutInfo {
+    fn participants(&self) -> Vec<MemberGeneration> {
+        let mut participants = vec![
+            MemberGeneration {
+                member_id: self.req_node_id.to_string(),
+                generation: self.requester_generation,
+            },
+            MemberGeneration {
+                member_id: self.source_node_id.to_string(),
+                generation: self.source_generation,
+            },
+            MemberGeneration {
+                member_id: self.target_node_id.to_string(),
+                generation: self.target_generation,
+            },
+        ];
+        participants.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+        participants.dedup_by(|right, left| {
+            if right.member_id != left.member_id {
+                return false;
+            }
+            assert_eq!(
+                right.generation, left.generation,
+                "one inflight PUT cannot bind one member to multiple generations"
+            );
+            true
+        });
+        participants
+    }
 }
 
 /// Information about a `get` operation that is currently in progress.
@@ -130,7 +171,7 @@ pub struct InflightGetInfo {
     pub allocation_mode: GetAllocationMode,
     pub source_kind: GetSourceKind,
     pub(crate) requester_generation: i64,
-    pub(crate) remote_ssd_source_generation: Option<i64>,
+    pub(crate) source_generation: Option<i64>,
     pub(crate) ssd_stage_lifecycle: Option<Arc<Mutex<SsdStageLifecycle>>>,
     pub(crate) cache_capacity_reservation: Mutex<Option<Arc<NodeCacheCapacityReservation>>>,
     terminal_claimed: AtomicBool,
@@ -168,10 +209,10 @@ impl MemberInflightGetBucket {
         }
     }
 
-    fn departed() -> Self {
+    fn departed(generation: i64) -> Self {
         Self {
             state: Mutex::new(MemberInflightGetState {
-                generation: None,
+                generation: Some(generation),
                 departed: true,
                 by_get_id: HashMap::new(),
             }),
@@ -291,16 +332,23 @@ impl InflightGetTable {
         state.by_get_id.get(&get_id).cloned()
     }
 
-    fn mark_member_left(&self, member_id: &str) -> Vec<(u64, Arc<InflightGetInfo>)> {
+    fn mark_member_left(
+        &self,
+        member_id: &str,
+        generation: i64,
+    ) -> Vec<(u64, Arc<InflightGetInfo>)> {
         let bucket = match self.by_member.entry(member_id.to_string()) {
             Entry::Occupied(entry) => Arc::clone(entry.get()),
             Entry::Vacant(entry) => {
-                let bucket = Arc::new(MemberInflightGetBucket::departed());
+                let bucket = Arc::new(MemberInflightGetBucket::departed(generation));
                 entry.insert(Arc::clone(&bucket));
                 bucket
             }
         };
         let mut state = bucket.state.lock();
+        if state.generation != Some(generation) {
+            return Vec::new();
+        }
         state.departed = true;
         state
             .by_get_id
@@ -443,7 +491,7 @@ impl InflightGetInfo {
             member_id: self.req_node_id.to_string(),
             generation: self.requester_generation,
         }];
-        if let Some(generation) = self.remote_ssd_source_generation
+        if let Some(generation) = self.source_generation
             && self.src_node_id != self.req_node_id
         {
             participants.push(InflightGetParticipant {
@@ -527,6 +575,8 @@ pub struct MasterKvRouterNewArg {
 pub struct NodeValueReplicaDesc {
     pub weight_bytes: u32,
     pub put_id: PutIDForAKey,
+    pub generation: i64,
+    pub allocation: Weak<Allocation>,
 }
 
 type NodeReplicaCache = moka::sync::SegmentedCache<String, NodeValueReplicaDesc>;
@@ -603,6 +653,7 @@ pub struct KvSsdReplicaInfo {
 
 #[derive(Clone, Debug)]
 pub struct KvNodeReplicas {
+    pub generation: i64,
     pub tomb_tag: NodeTombTag,
     pub memory: Option<Arc<Allocation>>,
     pub ssd: Option<KvSsdReplicaInfo>,
@@ -679,22 +730,46 @@ impl OneKvNodesRoutes {
         })
     }
 
-    fn has_memory_replica(&self, node_id: &NodeID) -> bool {
+    fn has_memory_replica_allocation(
+        &self,
+        node_id: &NodeID,
+        generation: i64,
+        allocation: &Arc<Allocation>,
+    ) -> bool {
         self.node_replicas
             .read()
             .get(node_id)
-            .is_some_and(|replicas| !replicas.tomb_tag.is_tomb() && replicas.memory.is_some())
+            .is_some_and(|replicas| {
+                replicas.generation == generation
+                    && !replicas.tomb_tag.is_tomb()
+                    && replicas
+                        .memory
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, allocation))
+            })
+    }
+
+    fn node_replica_generation(&self, node_id: &NodeID) -> Option<i64> {
+        self.node_replicas
+            .read()
+            .get(node_id)
+            .map(|replicas| replicas.generation)
+    }
+
+    fn has_node_replica(&self, node_id: &NodeID) -> bool {
+        self.node_replicas.read().contains_key(node_id)
     }
 
     fn insert_memory_replica(
         &self,
         node_id: NodeID,
+        generation: i64,
         allocation: Arc<Allocation>,
         tomb_tag: NodeTombTag,
     ) {
         let mut node_replicas = self.node_replicas.write();
         if let Some(replicas) = node_replicas.get_mut(&node_id) {
-            if !replicas.tomb_tag.is_tomb() {
+            if replicas.generation == generation && !replicas.tomb_tag.is_tomb() {
                 replicas.memory = Some(allocation);
                 return;
             }
@@ -703,11 +778,49 @@ impl OneKvNodesRoutes {
         node_replicas.insert(
             node_id,
             KvNodeReplicas {
+                generation,
                 tomb_tag,
                 memory: Some(allocation),
                 ssd: None,
             },
         );
+    }
+
+    fn remove_node_replicas_if_generation(&self, node_id: &NodeID, generation: i64) -> bool {
+        let mut node_replicas = self.node_replicas.write();
+        if !node_replicas
+            .get(node_id)
+            .is_some_and(|replicas| replicas.generation == generation)
+        {
+            return false;
+        }
+        node_replicas.remove(node_id);
+        true
+    }
+
+    fn remove_memory_replica_if_allocation(
+        &self,
+        node_id: &NodeID,
+        generation: i64,
+        allocation: &Arc<Allocation>,
+    ) -> bool {
+        let mut node_replicas = self.node_replicas.write();
+        let Some(replicas) = node_replicas.get_mut(node_id) else {
+            return false;
+        };
+        if replicas.generation != generation
+            || !replicas
+                .memory
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, allocation))
+        {
+            return false;
+        }
+        replicas.memory = None;
+        if replicas.ssd.is_none() {
+            node_replicas.remove(node_id);
+        }
+        true
     }
 
     fn commit_ssd_replica(&self, node_id: &NodeID, len: u64) -> SsdReplicaCommitStatus {
@@ -726,24 +839,14 @@ impl OneKvNodesRoutes {
         SsdReplicaCommitStatus::Committed
     }
 
-    fn remove_memory_replica(&self, node_id: &NodeID) -> bool {
+    fn remove_ssd_replica_if_generation(&self, node_id: &NodeID, generation: i64) -> bool {
         let mut node_replicas = self.node_replicas.write();
         let Some(replicas) = node_replicas.get_mut(node_id) else {
             return false;
         };
-        let removed = replicas.memory.take().is_some();
-        let remove_node = replicas.ssd.is_none();
-        if remove_node {
-            node_replicas.remove(node_id);
+        if replicas.generation != generation {
+            return false;
         }
-        removed
-    }
-
-    fn remove_ssd_replica(&self, node_id: &NodeID) -> bool {
-        let mut node_replicas = self.node_replicas.write();
-        let Some(replicas) = node_replicas.get_mut(node_id) else {
-            return false;
-        };
         let removed = replicas.ssd.take().is_some();
         let remove_node = replicas.memory.is_none();
         if remove_node {
@@ -859,7 +962,7 @@ mod tests {
 
     fn test_inflight_get(
         requester_generation: i64,
-        remote_ssd_source_generation: Option<i64>,
+        source_generation: Option<i64>,
     ) -> Arc<InflightGetInfo> {
         let allocator = Arc::new(
             OneSegAllocator::new(
@@ -887,8 +990,8 @@ mod tests {
             allocation_mode: GetAllocationMode::Temporary,
             source_kind: GetSourceKind::Ssd,
             requester_generation,
-            remote_ssd_source_generation,
-            ssd_stage_lifecycle: remote_ssd_source_generation
+            source_generation,
+            ssd_stage_lifecycle: source_generation
                 .map(|_| Arc::new(Mutex::new(SsdStageLifecycle::new()))),
             cache_capacity_reservation: Mutex::new(None),
             terminal_claimed: AtomicBool::new(false),
@@ -896,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn inflight_get_is_shared_by_requester_and_remote_ssd_source_buckets() {
+    fn inflight_get_is_shared_by_requester_and_source_buckets() {
         let table = InflightGetTable::default();
         assert!(
             table
@@ -915,7 +1018,7 @@ mod tests {
         let from_source = table.get("source-b", 7).unwrap();
         assert!(Arc::ptr_eq(&from_requester, &from_source));
 
-        let left = table.mark_member_left("requester-a");
+        let left = table.mark_member_left("requester-a", 1);
         assert_eq!(left.len(), 1);
         assert!(table.get("requester-a", 7).is_none());
         assert!(table.get("source-b", 7).is_some());
@@ -962,9 +1065,20 @@ mod tests {
     }
 
     #[test]
+    fn stale_absence_cannot_remove_new_generation_inflight_get() {
+        let table = InflightGetTable::default();
+        table.observe_member_generation("requester-a", 2, true);
+        let current = test_inflight_get(2, None);
+        table.insert(7, Arc::clone(&current)).unwrap();
+
+        assert!(table.mark_member_left("requester-a", 1).is_empty());
+        assert!(Arc::ptr_eq(&table.get("requester-a", 7).unwrap(), &current));
+    }
+
+    #[test]
     fn member_left_before_first_bucket_blocks_late_admission() {
         let table = InflightGetTable::default();
-        assert!(table.mark_member_left("requester-a").is_empty());
+        assert!(table.mark_member_left("requester-a", 1).is_empty());
 
         table.observe_member_generation("requester-a", 1, false);
         let late = test_inflight_get(1, None);
@@ -984,7 +1098,7 @@ mod tests {
     fn two_member_admission_does_not_publish_to_only_one_bucket() {
         let table = InflightGetTable::default();
         table.observe_member_generation("requester-a", 1, false);
-        assert!(table.mark_member_left("source-b").is_empty());
+        assert!(table.mark_member_left("source-b", 3).is_empty());
         table.observe_member_generation("source-b", 3, false);
 
         let inflight = test_inflight_get(1, Some(3));
@@ -1022,19 +1136,21 @@ mod tests {
         let a2 = NodeHolderKey::new("node-a".to_string(), 2);
         let b1 = NodeHolderKey::new("node-b".to_string(), 3);
 
-        assert!(manager.insert_if_member_active(a1.clone(), holding("a1", "node-a")));
-        assert!(manager.insert_if_member_active(a2.clone(), holding("a2", "node-a")));
-        assert!(manager.insert_if_member_active(b1.clone(), holding("b1", "node-b")));
+        assert!(manager.insert_if_member_active(a1.clone(), holding("a1", "node-a"), 1));
+        assert!(manager.insert_if_member_active(a2.clone(), holding("a2", "node-a"), 1));
+        assert!(manager.insert_if_member_active(b1.clone(), holding("b1", "node-b"), 1));
         assert_eq!(manager.total(), 3);
 
-        assert_eq!(manager.mark_member_left_and_cleanup("node-a"), 2);
+        assert_eq!(manager.mark_member_left_and_cleanup("node-a", 1), 2);
         assert_eq!(manager.total(), 1);
-        assert!(!manager.insert_if_member_active(a1.clone(), holding("late", "node-a")));
+        assert!(!manager.insert_if_member_active(a1.clone(), holding("late", "node-a"), 1));
         assert!(manager.get(&b1).is_some());
 
-        manager.mark_member_active("node-a");
-        assert!(manager.insert_if_member_active(a1.clone(), holding("joined", "node-a")));
-        assert_eq!(manager.mark_member_left_and_cleanup("node-a"), 1);
+        manager.mark_member_active("node-a", 2);
+        assert!(manager.insert_if_member_active(a1.clone(), holding("joined", "node-a"), 2));
+        assert_eq!(manager.mark_member_left_and_cleanup("node-a", 1), 0);
+        assert!(manager.get(&a1).is_some());
+        assert_eq!(manager.mark_member_left_and_cleanup("node-a", 2), 1);
         assert!(manager.remove(&b1).is_some());
         assert_eq!(manager.total(), 0);
     }
@@ -1062,13 +1178,18 @@ mod tests {
             routes.commit_ssd_replica(&node_id, 512),
             SsdReplicaCommitStatus::MissingMemory
         );
-        routes.insert_memory_replica(node_id.clone(), allocation, NodeTombTag::new());
+        routes.insert_memory_replica(
+            node_id.clone(),
+            1,
+            Arc::clone(&allocation),
+            NodeTombTag::new(),
+        );
         assert_eq!(
             routes.commit_ssd_replica(&node_id, 512),
             SsdReplicaCommitStatus::Committed
         );
 
-        assert!(routes.remove_memory_replica(&node_id));
+        assert!(routes.remove_memory_replica_if_allocation(&node_id, 1, &allocation));
         {
             let node_replicas = routes.node_replicas.read();
             let replicas = node_replicas
@@ -1078,7 +1199,7 @@ mod tests {
             assert_eq!(replicas.ssd.as_ref().map(|ssd| ssd.len), Some(512));
         }
 
-        assert!(routes.remove_ssd_replica(&node_id));
+        assert!(routes.remove_ssd_replica_if_generation(&node_id, 1));
         assert!(routes.node_replicas.read().is_empty());
 
         let old_tomb_tag = NodeTombTag::new();
@@ -1087,7 +1208,12 @@ mod tests {
                 .allocate(512)
                 .expect("old-incarnation test allocation must be created"),
         );
-        routes.insert_memory_replica(node_id.clone(), old_allocation, old_tomb_tag.clone());
+        routes.insert_memory_replica(
+            node_id.clone(),
+            1,
+            Arc::clone(&old_allocation),
+            old_tomb_tag.clone(),
+        );
         assert_eq!(
             routes.commit_ssd_replica(&node_id, 512),
             SsdReplicaCommitStatus::Committed
@@ -1099,11 +1225,19 @@ mod tests {
                 .allocate(512)
                 .expect("new-incarnation test allocation must be created"),
         );
-        routes.insert_memory_replica(node_id.clone(), new_allocation, NodeTombTag::new());
+        routes.insert_memory_replica(
+            node_id.clone(),
+            2,
+            Arc::clone(&new_allocation),
+            NodeTombTag::new(),
+        );
+        assert!(!routes.remove_memory_replica_if_allocation(&node_id, 1, &old_allocation));
+        assert!(!routes.remove_memory_replica_if_allocation(&node_id, 2, &old_allocation));
+        assert!(routes.has_memory_replica_allocation(&node_id, 2, &new_allocation));
         assert!(
             routes.remove_tombed_node_replicas(routes.put_id, HashSet::from([node_id.clone()]),)
         );
-        assert!(routes.has_memory_replica(&node_id));
+        assert!(routes.has_memory_replica_allocation(&node_id, 2, &new_allocation));
         assert!(
             routes
                 .node_replicas
@@ -1166,10 +1300,11 @@ pub struct MasterKvRouterInner {
     test_spec_config: TestSpecConfig,
 
     /// (key, put_time_ms, put_version) -> inflight_put_info
-    pub inflight_puts: moka::future::Cache<(String, u64, u32), InflightPutInfo>,
+    pub inflight_puts: moka::future::Cache<InflightPutKey, Arc<InflightPutInfo>>,
     /// key -> inflight put admission state
     pub(crate) inflight_put_key_counts: Arc<DashMap<String, InflightPutKeyAdmission>>,
-    /// Requester or remote SSD source -> generation-scoped active GET states.
+    inflight_put_transition_locks: AMapLock<InflightPutKey>,
+    /// Requester or remote source -> generation-scoped active GET states.
     inflight_gets: InflightGetTable,
     pub(crate) get_transition_locks: AMapLock<u64>,
     pub(crate) completed_gets: moka::sync::Cache<u64, CompletedGetInfo>,
@@ -1185,6 +1320,10 @@ pub struct MasterKvRouterInner {
 
     /// Latest version of key-value replicas
     pub kv_routes: DashMap<String, Arc<OneKvNodesRoutes>>,
+
+    /// Admission authority for generation-scoped route and PUT state.
+    member_binded_state_ctrl:
+        Arc<member_lifecycle_binded_state_ctrl::MemberLifecycleBindedStateCtrl>,
 
     /// Prefix-counting index derived from `kv_routes`.
     ///
@@ -1219,6 +1358,34 @@ pub struct MasterKvRouterInner {
 pub(crate) struct InflightPutKeyAdmission {
     inflight_count: u32,
     create_only: bool,
+}
+
+pub(crate) struct InflightPutKeyReservation {
+    counts: Arc<DashMap<String, InflightPutKeyAdmission>>,
+    key: String,
+    active: bool,
+}
+
+impl InflightPutKeyReservation {
+    pub(crate) fn from_existing(router: &MasterKvRouter, key: String) -> Self {
+        Self {
+            counts: Arc::clone(&router.inner().inflight_put_key_counts),
+            key,
+            active: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for InflightPutKeyReservation {
+    fn drop(&mut self) {
+        if self.active {
+            MasterKvRouter::release_inflight_put_key_count_map(&self.counts, &self.key);
+        }
+    }
 }
 
 impl MasterKvRouterInner {
@@ -1260,8 +1427,12 @@ impl MasterKvRouterInner {
             .observe_member_generation(member_id, generation, reactivate)
     }
 
-    fn mark_inflight_member_left(&self, member_id: &str) -> Vec<(u64, Arc<InflightGetInfo>)> {
-        self.inflight_gets.mark_member_left(member_id)
+    fn mark_inflight_member_left(
+        &self,
+        member_id: &str,
+        generation: i64,
+    ) -> Vec<(u64, Arc<InflightGetInfo>)> {
+        self.inflight_gets.mark_member_left(member_id, generation)
     }
 }
 
@@ -1269,7 +1440,9 @@ async fn cleanup_inflight_gets_for_member(
     view: &MasterKvRouterView,
     member_id: &str,
     inflight_gets: Vec<(u64, Arc<InflightGetInfo>)>,
-) {
+) -> (usize, usize) {
+    let mut released = 0usize;
+    let mut deferred = 0usize;
     for (get_id, inflight) in inflight_gets {
         let transition_lock = view
             .master_kv_router()
@@ -1284,6 +1457,7 @@ async fn cleanup_inflight_gets_for_member(
                 .as_ref()
                 .is_some_and(|lifecycle| lifecycle.lock().request_revoke(false));
         if defer_remote_stage {
+            deferred += 1;
             info!(
                 get_id,
                 member = %member_id,
@@ -1297,8 +1471,10 @@ async fn cleanup_inflight_gets_for_member(
             .claim_terminal_inflight_get(get_id, &inflight)
         {
             inflight.release_durable_slot_if_needed();
+            released += 1;
         }
     }
+    (released, deferred)
 }
 
 pub(crate) async fn reconcile_inflight_member_generation(
@@ -1311,7 +1487,7 @@ pub(crate) async fn reconcile_inflight_member_generation(
         .master_kv_router()
         .inner()
         .observe_inflight_member_generation(member_id, generation, reactivate);
-    cleanup_inflight_gets_for_member(view, member_id, displaced).await;
+    let _ = cleanup_inflight_gets_for_member(view, member_id, displaced).await;
 }
 
 pub struct MasterKvRouter(MasterKvRouterInner);
@@ -1394,10 +1570,15 @@ impl MasterKvRouter {
         let inflight_put_key_counts: Arc<DashMap<String, InflightPutKeyAdmission>> =
             Arc::new(DashMap::new());
         let inflight_put_key_counts_for_listener = inflight_put_key_counts.clone();
+        let member_binded_state_ctrl =
+            Arc::new(member_lifecycle_binded_state_ctrl::MemberLifecycleBindedStateCtrl::default());
+        let member_binded_state_ctrl_for_listener = Arc::clone(&member_binded_state_ctrl);
         let inflight_puts = moka::future::Cache::builder()
             .time_to_live(Duration::from_secs(inflight_put_ttl_seconds))
-            .eviction_listener(move |_put_id, inflight_info: InflightPutInfo, cause| {
-                if cause == RemovalCause::Expired {
+            .eviction_listener(move |put_key, inflight_info: Arc<InflightPutInfo>, cause| {
+                if cause != RemovalCause::Explicit {
+                    member_binded_state_ctrl_for_listener
+                        .unregister_inflight_put(&put_key, &inflight_info);
                     MasterKvRouter::release_inflight_put_key_count_map(
                         &inflight_put_key_counts_for_listener,
                         &inflight_info.key,
@@ -1415,6 +1596,9 @@ impl MasterKvRouter {
             test_spec_config: arg.test_spec_config,
             inflight_puts,
             inflight_put_key_counts,
+            inflight_put_transition_locks: AMapLock::new(Duration::from_secs(
+                inflight_put_ttl_seconds.saturating_mul(2),
+            )),
             inflight_gets,
             get_transition_locks: AMapLock::new(GET_COMPLETION_REPLAY_TTL),
             completed_gets: moka::sync::Cache::builder()
@@ -1425,6 +1609,7 @@ impl MasterKvRouter {
             next_get_id: AtomicU64::new(1),
             next_holder_id: AtomicU64::new(0),
             kv_routes: DashMap::new(),
+            member_binded_state_ctrl,
             prefix_index: ARwLock::new(PrefixRadixTree::new()),
             node_kv_cache_controller: DashMap::new(),
             cache_reserved_bytes: DashMap::new(),
@@ -1447,7 +1632,7 @@ impl MasterKvRouter {
         self.register_rpc_callers();
         let view = self.0.view().clone();
 
-        self.spawn_cluster_listener();
+        member_lifecycle::spawn(view.clone());
         self.spawn_put_placement_reporter();
 
         let delete_broadcast_rx = self
@@ -1465,6 +1650,48 @@ impl MasterKvRouter {
 
     pub fn inner(&self) -> &MasterKvRouterInner {
         &self.0
+    }
+
+    pub(crate) fn publish_memory_replica(
+        &self,
+        key: &str,
+        route: &Arc<OneKvNodesRoutes>,
+        node_id: NodeID,
+        generation: i64,
+        allocation: Arc<Allocation>,
+        tomb_tag: NodeTombTag,
+    ) -> bool {
+        self.0
+            .member_binded_state_ctrl
+            .publish_memory_replica(node_id, generation, key, route, allocation, tomb_tag)
+    }
+
+    pub(crate) fn unregister_member_replica_if_absent(
+        &self,
+        key: &str,
+        route: &Arc<OneKvNodesRoutes>,
+        node_id: &NodeID,
+        generation: i64,
+    ) {
+        if !route.has_node_replica(node_id) {
+            self.0
+                .member_binded_state_ctrl
+                .remove_current_replica(node_id, generation, key, route);
+        }
+    }
+
+    pub(crate) fn unregister_route_replicas(&self, key: &str, route: &Arc<OneKvNodesRoutes>) {
+        let replicas = route
+            .node_replicas
+            .read()
+            .iter()
+            .map(|(node_id, replicas)| (node_id.clone(), replicas.generation))
+            .collect::<Vec<_>>();
+        for (node_id, generation) in replicas {
+            self.0
+                .member_binded_state_ctrl
+                .remove_current_replica(&node_id, generation, key, route);
+        }
     }
 
     pub fn replica_cache_enabled(&self) -> bool {
@@ -1487,6 +1714,142 @@ impl MasterKvRouter {
             .get_with(key, || Arc::new(AtomicU32::new(0)))
             .fetch_add(1, Ordering::Relaxed);
         (put_time_ms, put_version)
+    }
+
+    pub(crate) async fn insert_inflight_put(
+        &self,
+        put_key: InflightPutKey,
+        info: Arc<InflightPutInfo>,
+    ) -> Result<(), String> {
+        let transition_lock = self
+            .inner()
+            .inflight_put_transition_locks
+            .get_lock(put_key.clone());
+        let _transition = transition_lock.lock().await;
+
+        if !self
+            .inner()
+            .member_binded_state_ctrl
+            .register_inflight_put_if_active(&put_key, &info)
+        {
+            return Err(format!(
+                "one or more PUT participants departed before admission: {:?}",
+                info.participants()
+            ));
+        }
+        if self.inner().inflight_puts.get(&put_key).await.is_some() {
+            self.inner()
+                .member_binded_state_ctrl
+                .unregister_inflight_put(&put_key, &info);
+            return Err(format!("duplicate inflight PUT key: {put_key:?}"));
+        }
+
+        self.inner()
+            .inflight_puts
+            .insert(put_key.clone(), Arc::clone(&info))
+            .await;
+        if self
+            .inner()
+            .member_binded_state_ctrl
+            .contains_current_inflight_put(&put_key, &info)
+        {
+            return Ok(());
+        }
+
+        if let Some(removed) = self.inner().inflight_puts.remove(&put_key).await {
+            assert!(
+                Arc::ptr_eq(&removed, &info),
+                "inflight PUT changed while holding its transition lock"
+            );
+        }
+        self.inner()
+            .member_binded_state_ctrl
+            .unregister_inflight_put(&put_key, &info);
+        Err(format!(
+            "one or more PUT participants departed during admission: {:?}",
+            info.participants()
+        ))
+    }
+
+    pub(crate) async fn take_active_inflight_put(
+        &self,
+        put_key: &InflightPutKey,
+    ) -> Option<(Arc<InflightPutInfo>, InflightPutKeyReservation)> {
+        let transition_lock = self
+            .inner()
+            .inflight_put_transition_locks
+            .get_lock(put_key.clone());
+        let _transition = transition_lock.lock().await;
+        let info = self.inner().inflight_puts.remove(put_key).await?;
+        let participants_active = self
+            .inner()
+            .member_binded_state_ctrl
+            .contains_current_inflight_put(put_key, &info);
+        self.inner()
+            .member_binded_state_ctrl
+            .unregister_inflight_put(put_key, &info);
+        let reservation = InflightPutKeyReservation::from_existing(self, info.key.clone());
+        if participants_active {
+            Some((info, reservation))
+        } else {
+            drop(reservation);
+            None
+        }
+    }
+
+    pub(crate) async fn cancel_inflight_put(
+        &self,
+        put_key: &InflightPutKey,
+    ) -> Option<Arc<InflightPutInfo>> {
+        let transition_lock = self
+            .inner()
+            .inflight_put_transition_locks
+            .get_lock(put_key.clone());
+        let _transition = transition_lock.lock().await;
+        let info = self.inner().inflight_puts.remove(put_key).await?;
+        self.inner()
+            .member_binded_state_ctrl
+            .unregister_inflight_put(put_key, &info);
+        drop(InflightPutKeyReservation::from_existing(
+            self,
+            info.key.clone(),
+        ));
+        Some(info)
+    }
+
+    async fn cleanup_indexed_inflight_put(
+        &self,
+        indexed: &member_lifecycle::IndexedInflightPut,
+    ) -> bool {
+        let Some(expected) = indexed.info.upgrade() else {
+            return false;
+        };
+        let transition_lock = self
+            .inner()
+            .inflight_put_transition_locks
+            .get_lock(indexed.key.clone());
+        let _transition = transition_lock.lock().await;
+        let Some(current) = self.inner().inflight_puts.get(&indexed.key).await else {
+            return false;
+        };
+        if !Arc::ptr_eq(&current, &expected) {
+            return false;
+        }
+        let Some(removed) = self.inner().inflight_puts.remove(&indexed.key).await else {
+            return false;
+        };
+        assert!(
+            Arc::ptr_eq(&removed, &expected),
+            "inflight PUT changed while holding its transition lock"
+        );
+        self.inner()
+            .member_binded_state_ctrl
+            .unregister_inflight_put(&indexed.key, &removed);
+        drop(InflightPutKeyReservation::from_existing(
+            self,
+            removed.key.clone(),
+        ));
+        true
     }
 
     fn release_inflight_put_key_count_map(
@@ -1703,9 +2066,7 @@ impl MasterKvRouter {
                     if put_id != (0, 0) {
                         view_task
                             .master_kv_router()
-                            .inner()
-                            .inflight_puts
-                            .remove(&(key, put_id.0, put_id.1))
+                            .cancel_inflight_put(&(key, put_id.0, put_id.1))
                             .await;
                     }
                 } else {
@@ -1868,10 +2229,13 @@ impl MasterKvRouter {
         });
     }
 
-    fn spawn_node_segement_registration_caller(&self) -> ampsc::Sender<ClusterEvent> {
+    fn spawn_node_segment_registration_actor(
+        &self,
+    ) -> ampsc::Sender<member_lifecycle::MemberTransition> {
         const KEEP_ALIVE_TIME: Duration = Duration::from_secs(30);
         const NODE_EVENT_QUEUE_CAPACITY: usize = 64;
-        let (tx, mut rx) = ampsc::channel::<ClusterEvent>(NODE_EVENT_QUEUE_CAPACITY);
+        let (tx, mut rx) =
+            ampsc::channel::<member_lifecycle::MemberTransition>(NODE_EVENT_QUEUE_CAPACITY);
         let view = self.inner().view().clone();
         let view_task = view.clone();
         let _ = view.spawn("node_segment_registration_caller", async move {
@@ -1880,443 +2244,358 @@ impl MasterKvRouter {
 
             const INITIAL_BACKOFF: Duration = Duration::from_secs(3);
             const MAX_BACKOFF: Duration = Duration::from_secs(60);
-
-            let mut shutdown_waiter = view_task.register_shutdown_waiter();
-
-            // The cluster_listener keeps a per-node sender. This task only receives events for a
-            // single node_id (enforced by cluster_listener routing).
-            let mut actor_node_id: Option<NodeIDString> = None;
-
-            // Desired registration epoch (ClusterMember.node_start_time) for this node.
-            let mut desired_epoch: Option<i64> = None;
-            let mut registered_epoch: Option<i64> = None;
-            let mut last_seen_epoch: Option<i64> = None;
-
-            let mut backoff: Duration = INITIAL_BACKOFF;
             type SleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-            let mut retry_sleep: Option<SleepFuture> = None;
-            let mut inflight: Option<(i64, Pin<Box<dyn Future<Output = Result<(), KvError>> + Send>>)> =
-                None;
+            type RegistrationFuture =
+                Pin<Box<dyn Future<Output = Result<(), KvError>> + Send>>;
 
-            fn bump_backoff(cur: Duration) -> Duration {
-                let next = cur.checked_mul(2).unwrap();
-                if next > MAX_BACKOFF {
-                    MAX_BACKOFF
+            fn bump_backoff(current: Duration) -> Duration {
+                current
+                    .checked_mul(2)
+                    .unwrap_or(MAX_BACKOFF)
+                    .min(MAX_BACKOFF)
+            }
+
+            fn ensure_actor_node_id(
+                view: &MasterKvRouterView,
+                actor_node_id: &mut Option<NodeIDString>,
+                node_id: &str,
+            ) {
+                if let Some(existing) = actor_node_id.as_ref() {
+                    if existing != node_id {
+                        view.async_panic(
+                            "node_segment_registration_caller received mismatched node_id"
+                                .to_owned(),
+                        );
+                    }
                 } else {
-                    next
+                    *actor_node_id = Some(node_id.to_string());
                 }
             }
 
-	            fn ensure_actor_node_id(view: &MasterKvRouterView, actor: &mut Option<NodeIDString>, node_id: &str) {
-	                if let Some(existing) = actor.as_ref() {
-	                    if existing != node_id {
-	                        view.async_panic("node_segment_registration_caller received mismatched node_id".to_owned());
-	                    }
-	                } else {
-	                    *actor = Some(node_id.to_string());
-	                }
-	            }
+            async fn cleanup_departed_generation(
+                view: &MasterKvRouterView,
+                node_id: &str,
+                generation: i64,
+            ) {
+                let departed_node: NodeID = node_id.to_string().into();
+                view.master_seg_manager().mark_node_tomb(&departed_node);
+                let stats = member_lifecycle::apply_absent(view, node_id, generation).await;
+                let segments_removed = view
+                    .master_seg_manager()
+                    .remove_node_segments_if_tomb(&departed_node);
+                if stats.inflight_gets_deferred > 0 {
+                    warn!(
+                        member = node_id,
+                        generation,
+                        inflight_puts_removed = stats.inflight_puts_removed,
+                        inflight_gets_released = stats.inflight_gets_released,
+                        inflight_gets_deferred = stats.inflight_gets_deferred,
+                        holdings_removed = stats.holdings_removed,
+                        replicas_removed = stats.replicas_removed,
+                        routes_removed = stats.routes_removed,
+                        cache_removed = stats.cache_removed,
+                        reservation_state_removed = stats.reservation_state_removed,
+                        segments_removed,
+                        "Member lifecycle cleanup is waiting for inflight GET source quiescence"
+                    );
+                    return;
+                }
+                info!(
+                    member = node_id,
+                    generation,
+                    inflight_puts_removed = stats.inflight_puts_removed,
+                    inflight_gets_released = stats.inflight_gets_released,
+                    inflight_gets_deferred = stats.inflight_gets_deferred,
+                    holdings_removed = stats.holdings_removed,
+                    replicas_removed = stats.replicas_removed,
+                    routes_removed = stats.routes_removed,
+                    cache_removed = stats.cache_removed,
+                    reservation_state_removed = stats.reservation_state_removed,
+                    segments_removed,
+                    "Member lifecycle cleanup completed"
+                );
+            }
 
-	            fn observe_member_epoch(
-	                view: &MasterKvRouterView,
-	                member: &crate::cluster_manager::ClusterMember,
-	                actor_node_id: &mut Option<NodeIDString>,
-	                registered_epoch: Option<i64>,
-	                last_seen_epoch: &mut Option<i64>,
-	            ) -> Option<i64> {
-	                let node_id = member.id.clone();
-	                ensure_actor_node_id(view, actor_node_id, &node_id);
-
-	                if !matches!(member.node_role(), crate::cluster_manager::NodeRole::Client) {
-	                    return None;
-	                }
-
-	                let epoch = member.node_start_time;
-	                if let Some(prev) = *last_seen_epoch {
-	                    if prev != epoch {
-	                        view.master_seg_manager()
-	                            .mark_node_tomb(&node_id.clone().into());
-	                    }
-	                }
-	                *last_seen_epoch = Some(epoch);
-
-	                if registered_epoch == Some(epoch) {
-	                    return None;
-	                }
-	                if !MasterKvRouter::member_ready_for_segment_registration(member) {
-	                    return None;
-	                }
-	                Some(epoch)
-	            }
-
-	            loop {
-	                // Keep the actor alive while there is pending/active work.
-	                if desired_epoch.is_some() && inflight.is_none() && retry_sleep.is_none() {
-	                    retry_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(0))));
-	                }
-
-                // Idle fast-path: allow actor cleanup when no work remains.
-                if desired_epoch.is_none() && inflight.is_none() && retry_sleep.is_none() {
-                    tokio::select! {
-                        _ = tokio::time::sleep(KEEP_ALIVE_TIME) => {
-                            break;
+            async fn handle_transition(
+                view: &MasterKvRouterView,
+                transition: member_lifecycle::MemberTransition,
+                actor_node_id: &mut Option<NodeIDString>,
+                desired_generation: &mut Option<i64>,
+                registered_generation: &mut Option<i64>,
+                last_seen_generation: &mut Option<i64>,
+                backoff: &mut Duration,
+                retry_sleep: &mut Option<SleepFuture>,
+                inflight: &mut Option<(i64, RegistrationFuture)>,
+            ) {
+                match transition {
+                    member_lifecycle::MemberTransition::Present(member) => {
+                        ensure_actor_node_id(view, actor_node_id, &member.id);
+                        let is_current_generation = view
+                            .cluster_manager()
+                            .get_member_info_cached(&member.id)
+                            .is_some_and(|current| {
+                                matches!(
+                                    current.node_role(),
+                                    crate::cluster_manager::NodeRole::Client
+                                ) && current.node_start_time == member.node_start_time
+                            });
+                        if !is_current_generation {
+                            debug!(
+                                member = member.id,
+                                generation = member.node_start_time,
+                                "Ignoring stale member presence"
+                            );
+                            return;
                         }
-                        _ = shutdown_waiter.wait() => {
-                            break;
+                        let generation = member.node_start_time;
+                        if let Some(previous_generation) = *last_seen_generation
+                            && previous_generation != generation
+                        {
+                            *desired_generation = None;
+                            *registered_generation = None;
+                            *retry_sleep = None;
+                            *inflight = None;
+
+                            cleanup_departed_generation(view, &member.id, previous_generation)
+                                .await;
                         }
-                        msg = rx.recv() => {
-                            let Some(event) = msg else {
-                                break;
-                            };
+                        member_lifecycle::apply_present(view, &member).await;
+                        *last_seen_generation = Some(generation);
 
-	                            match event {
-	                                ClusterEvent::MemberJoined(member) | ClusterEvent::MemberUpdated(member) => {
-	                                    if let Some(epoch) = observe_member_epoch(
-	                                        &view_task,
-	                                        &member,
-	                                        &mut actor_node_id,
-	                                        registered_epoch,
-	                                        &mut last_seen_epoch,
-	                                    ) {
-	                                        desired_epoch = Some(epoch);
-	                                        backoff = INITIAL_BACKOFF;
-	                                        retry_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(0))));
-	                                    }
-	                                }
-	                                ClusterEvent::MemberLeft(node_id) => {
-	                                    ensure_actor_node_id(&view_task, &mut actor_node_id, &node_id);
+                        if !MasterKvRouter::member_ready_for_segment_registration(&member) {
+                            *desired_generation = None;
+                            *registered_generation = None;
+                            *retry_sleep = None;
+                            *inflight = None;
+                            return;
+                        }
+                        if *registered_generation == Some(generation) {
+                            *desired_generation = None;
+                            *retry_sleep = None;
+                            return;
+                        }
 
-	                                    desired_epoch = None;
-                                    registered_epoch = None;
-                                    last_seen_epoch = None;
-                                    retry_sleep = None;
-                                    inflight = None;
+                        let same_generation_is_pending = *desired_generation == Some(generation)
+                            && (retry_sleep.is_some()
+                                || inflight
+                                    .as_ref()
+                                    .is_some_and(|(pending, _)| *pending == generation));
+                        if same_generation_is_pending {
+                            return;
+                        }
 
-                                    debug!(
-                                        "MasterKvRouter received node leave event: {:?}, mark it as tomb",
-                                        node_id
-                                    );
-                                    view_task.master_seg_manager().mark_node_tomb(&node_id.into());
-                                }
-                            }
+                        if inflight
+                            .as_ref()
+                            .is_some_and(|(pending, _)| *pending != generation)
+                        {
+                            *inflight = None;
+                        }
+                        *desired_generation = Some(generation);
+                        *backoff = INITIAL_BACKOFF;
+                        if inflight.is_none() {
+                            *retry_sleep =
+                                Some(Box::pin(tokio::time::sleep(Duration::from_secs(0))));
                         }
                     }
-                    continue;
+                    member_lifecycle::MemberTransition::Absent {
+                        node_id,
+                        generation,
+                    } => {
+                        ensure_actor_node_id(view, actor_node_id, &node_id);
+                        let present_generation = view
+                            .cluster_manager()
+                            .get_member_info_cached(&node_id)
+                            .filter(|member| {
+                                matches!(
+                                    member.node_role(),
+                                    crate::cluster_manager::NodeRole::Client
+                                )
+                            })
+                            .map(|member| member.node_start_time);
+                        let current_generation = (*last_seen_generation)
+                            .or(*registered_generation)
+                            .or(*desired_generation);
+                        if present_generation == Some(generation) {
+                            debug!(
+                                node_id,
+                                generation,
+                                "Ignoring member absence while the same generation is present"
+                            );
+                            return;
+                        }
+                        if current_generation.is_some_and(|current| current != generation) {
+                            debug!(
+                                node_id,
+                                generation,
+                                ?current_generation,
+                                "Ignoring stale member absence"
+                            );
+                            return;
+                        }
+                        if current_generation.is_none() && present_generation.is_some() {
+                            debug!(
+                                node_id,
+                                generation,
+                                ?present_generation,
+                                "Ignoring untracked member absence after a newer generation appeared"
+                            );
+                            return;
+                        }
+
+                        *desired_generation = None;
+                        *registered_generation = None;
+                        *last_seen_generation = None;
+                        *retry_sleep = None;
+                        *inflight = None;
+
+                        cleanup_departed_generation(view, &node_id, generation).await;
+                    }
+                }
+            }
+
+            let mut shutdown_waiter = view_task.register_shutdown_waiter();
+            let mut actor_node_id: Option<NodeIDString> = None;
+            let mut desired_generation: Option<i64> = None;
+            let mut registered_generation: Option<i64> = None;
+            let mut last_seen_generation: Option<i64> = None;
+            let mut backoff: Duration = INITIAL_BACKOFF;
+            let mut retry_sleep: Option<SleepFuture> = None;
+            let mut inflight: Option<(i64, RegistrationFuture)> = None;
+            let mut idle_sleep: Option<SleepFuture> = None;
+
+            loop {
+                if desired_generation.is_some()
+                    && retry_sleep.is_none()
+                    && inflight.is_none()
+                {
+                    retry_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(0))));
+                }
+                let idle = last_seen_generation.is_none()
+                    && desired_generation.is_none()
+                    && retry_sleep.is_none()
+                    && inflight.is_none();
+                if idle && idle_sleep.is_none() {
+                    idle_sleep = Some(Box::pin(tokio::time::sleep(KEEP_ALIVE_TIME)));
+                } else if !idle {
+                    idle_sleep = None;
                 }
 
-                // Retry timer branch.
-                if let Some(sleep) = retry_sleep.as_mut() {
-                    tokio::select! {
-                        _ = sleep.as_mut() => {
-                            retry_sleep = None;
-
-                            let node_id = actor_node_id
-                                .clone()
-                                .expect("node_segment_registration_caller missing actor_node_id");
-                            let Some(epoch) = desired_epoch else {
-                                continue;
-                            };
-
-                            // Validate membership and epoch before each attempt.
-                            let Some(member) = view_task.cluster_manager().get_member_info_cached(&node_id) else {
-                                desired_epoch = None;
-                                continue;
-                            };
-	                            if !matches!(member.node_role(), crate::cluster_manager::NodeRole::Client) {
-	                                desired_epoch = None;
-	                                continue;
-	                            }
-	                            if member.node_start_time != epoch {
-	                                desired_epoch = None;
-	                                continue;
-	                            }
-	                            if !MasterKvRouter::member_ready_for_segment_registration(&member) {
-	                                desired_epoch = None;
-	                                continue;
-	                            }
-
-                            let fut = view_task
+                tokio::select! {
+                    _ = shutdown_waiter.wait() => break,
+                    message = rx.recv() => {
+                        let Some(transition) = message else {
+                            break;
+                        };
+                        idle_sleep = None;
+                        handle_transition(
+                            &view_task,
+                            transition,
+                            &mut actor_node_id,
+                            &mut desired_generation,
+                            &mut registered_generation,
+                            &mut last_seen_generation,
+                            &mut backoff,
+                            &mut retry_sleep,
+                            &mut inflight,
+                        )
+                        .await;
+                    }
+                    _ = async {
+                        retry_sleep
+                            .as_mut()
+                            .expect("guarded retry sleep must exist")
+                            .as_mut()
+                            .await
+                    }, if retry_sleep.is_some() => {
+                        retry_sleep = None;
+                        let node_id = actor_node_id
+                            .clone()
+                            .expect("node_segment_registration_caller missing actor_node_id");
+                        let Some(generation) = desired_generation else {
+                            continue;
+                        };
+                        let Some(member) = view_task
+                            .cluster_manager()
+                            .get_member_info_cached(&node_id)
+                            .filter(|member| {
+                                matches!(member.node_role(), crate::cluster_manager::NodeRole::Client)
+                                    && member.node_start_time == generation
+                                    && MasterKvRouter::member_ready_for_segment_registration(member)
+                            })
+                        else {
+                            desired_generation = None;
+                            continue;
+                        };
+                        let _ = member;
+                        let registration_view = view_task.clone();
+                        let target_node: NodeID = node_id.into();
+                        let future = async move {
+                            registration_view
                                 .master_seg_manager()
-                                .request_segment_registration(node_id.clone().into(), epoch);
-                            inflight = Some((epoch, Box::pin(fut)));
+                                .request_segment_registration(target_node, generation)
+                                .await
+                        };
+                        inflight = Some((generation, Box::pin(future)));
+                    }
+                    result = async {
+                        inflight
+                            .as_mut()
+                            .expect("guarded registration future must exist")
+                            .1
+                            .as_mut()
+                            .await
+                    }, if inflight.is_some() => {
+                        let generation = inflight
+                            .as_ref()
+                            .expect("completed registration future must exist")
+                            .0;
+                        inflight = None;
+                        if desired_generation != Some(generation) {
+                            continue;
                         }
-                        _ = shutdown_waiter.wait() => {
-                            break;
-                        }
-                        msg = rx.recv() => {
-                            let Some(event) = msg else {
-                                break;
-                            };
-
-	                            match event {
-	                                ClusterEvent::MemberJoined(member) | ClusterEvent::MemberUpdated(member) => {
-	                                    if let Some(epoch) = observe_member_epoch(
-	                                        &view_task,
-	                                        &member,
-	                                        &mut actor_node_id,
-	                                        registered_epoch,
-	                                        &mut last_seen_epoch,
-	                                    ) {
-	                                        desired_epoch = Some(epoch);
-	                                        backoff = INITIAL_BACKOFF;
-	                                        retry_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(0))));
-	                                    }
-	                                }
-	                                ClusterEvent::MemberLeft(node_id) => {
-	                                    ensure_actor_node_id(&view_task, &mut actor_node_id, &node_id);
-
-	                                    desired_epoch = None;
-                                    registered_epoch = None;
-                                    last_seen_epoch = None;
-                                    retry_sleep = None;
-                                    inflight = None;
-
-                                    debug!(
-                                        "MasterKvRouter received node leave event: {:?}, mark it as tomb",
-                                        node_id
-                                    );
-                                    view_task.master_seg_manager().mark_node_tomb(&node_id.into());
+                        match result {
+                            Ok(()) => {
+                                registered_generation = Some(generation);
+                                desired_generation = None;
+                                backoff = INITIAL_BACKOFF;
+                                info!(
+                                    member = actor_node_id.clone().unwrap_or_default(),
+                                    generation,
+                                    "Segment registration completed"
+                                );
+                            }
+                            Err(error) => {
+                                if matches!(
+                                    error,
+                                    KvError::Api(
+                                        crate::rpcresp_kvresult_convert::msg_and_error::ApiError::OwnerStartTimeMismatch { .. }
+                                    )
+                                ) {
+                                    desired_generation = None;
+                                    continue;
                                 }
+                                error!(
+                                    member = actor_node_id.clone().unwrap_or_default(),
+                                    generation,
+                                    %error,
+                                    "Segment registration failed"
+                                );
+                                retry_sleep = Some(Box::pin(tokio::time::sleep(backoff)));
+                                backoff = bump_backoff(backoff);
                             }
                         }
                     }
-                    continue;
-                }
-
-                // In-flight RPC branch.
-                if let Some((inflight_epoch, fut)) = inflight.as_mut() {
-                    tokio::select! {
-                        res = fut => {
-                            let epoch = *inflight_epoch;
-                            inflight = None;
-
-                            // If a newer epoch was requested while this RPC was in-flight, ignore the result.
-                            if desired_epoch != Some(epoch) {
-                                continue;
-                            }
-
-                            match res {
-                                Ok(()) => {
-                                    registered_epoch = Some(epoch);
-                                    desired_epoch = None;
-                                    backoff = INITIAL_BACKOFF;
-                                    info!(
-                                        "Successfully requested segment registration from client {}",
-                                        actor_node_id.clone().unwrap_or_default()
-                                    );
-                                }
-                                Err(e) => {
-                                    // Epoch mismatch means the peer has restarted; stop and wait for a new epoch event.
-                                    if matches!(
-                                        e,
-                                        KvError::Api(crate::rpcresp_kvresult_convert::msg_and_error::ApiError::OwnerStartTimeMismatch { .. })
-                                    ) {
-                                        desired_epoch = None;
-                                        continue;
-                                    }
-
-                                    error!(
-                                        "Failed to request segment registration from client {}: {}",
-                                        actor_node_id.clone().unwrap_or_default(),
-                                        e
-                                    );
-                                    retry_sleep = Some(Box::pin(tokio::time::sleep(backoff)));
-                                    backoff = bump_backoff(backoff);
-                                }
-                            }
-                        }
-                        _ = shutdown_waiter.wait() => {
-                            break;
-                        }
-                        msg = rx.recv() => {
-                            let Some(event) = msg else {
-                                break;
-                            };
-
-	                            match event {
-	                                ClusterEvent::MemberJoined(member) | ClusterEvent::MemberUpdated(member) => {
-	                                    if let Some(epoch) = observe_member_epoch(
-	                                        &view_task,
-	                                        &member,
-	                                        &mut actor_node_id,
-	                                        registered_epoch,
-	                                        &mut last_seen_epoch,
-	                                    ) {
-	                                        desired_epoch = Some(epoch);
-	                                        backoff = INITIAL_BACKOFF;
-	                                        retry_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(0))));
-	                                    }
-	                                }
-	                                ClusterEvent::MemberLeft(node_id) => {
-	                                    ensure_actor_node_id(&view_task, &mut actor_node_id, &node_id);
-
-	                                    desired_epoch = None;
-                                    registered_epoch = None;
-                                    last_seen_epoch = None;
-                                    retry_sleep = None;
-                                    inflight = None;
-
-                                    debug!(
-                                        "MasterKvRouter received node leave event: {:?}, mark it as tomb",
-                                        node_id
-                                    );
-                                    view_task.master_seg_manager().mark_node_tomb(&node_id.into());
-                                }
-                            }
-                        }
-                    }
-                    continue;
+                    _ = async {
+                        idle_sleep
+                            .as_mut()
+                            .expect("guarded idle sleep must exist")
+                            .as_mut()
+                            .await
+                    }, if idle_sleep.is_some() => break,
                 }
             }
         });
         tx
-    }
-
-    fn spawn_cluster_listener(&self) {
-        let view = self.inner().view().clone();
-        let view_task = view.clone();
-        let _ = view.spawn("cluster_listener", async move {
-            // Drive per-node segment registration from a member snapshot periodically.
-            // This avoids permanently relying on best-effort event delivery.
-            const RECONCILE_INTERVAL_SECS: u64 = 2;
-            const SEND_BACKPRESSURE_WARN_SECS: u64 = 5;
-
-            let mut listen_cluster_event = view_task.cluster_manager().listen();
-            let mut shutdown_waiter = view_task.register_shutdown_waiter();
-            let mut each_node_segement_registration_caller: HashMap<
-                NodeIDString,
-                ampsc::Sender<ClusterEvent>,
-            > = HashMap::new();
-
-            async fn send_event_with_warn(
-                _view: &MasterKvRouterView,
-                node_id: &str,
-                tx: ampsc::Sender<ClusterEvent>,
-                event: ClusterEvent,
-            ) -> Result<(), ClusterEvent> {
-                let mut send_fut = Box::pin(tx.send(event.clone()));
-                let mut warn_sleep = Box::pin(tokio::time::sleep(Duration::from_secs(SEND_BACKPRESSURE_WARN_SECS)));
-
-                loop {
-                    tokio::select! {
-                        res = &mut send_fut => {
-                            return match res {
-                                Ok(()) => Ok(()),
-                                Err(_e) => Err(event),
-                            };
-                        }
-                        _ = &mut warn_sleep => {
-                            warn!(
-                                "Backpressure: waiting to deliver cluster event to node registration actor (queue full?): node_id={}, event={:?}",
-                                node_id,
-                                event
-                            );
-                            warn_sleep = Box::pin(tokio::time::sleep(Duration::from_secs(SEND_BACKPRESSURE_WARN_SECS)));
-                        }
-                    }
-                }
-            }
-
-            async fn deliver_event(
-                view: &MasterKvRouterView,
-                each_node_segement_registration_caller: &mut HashMap<
-                    NodeIDString,
-                    ampsc::Sender<ClusterEvent>,
-                >,
-                event: ClusterEvent,
-            ) {
-                match &event {
-                    ClusterEvent::MemberJoined(member) | ClusterEvent::MemberUpdated(member) => {
-                        reconcile_inflight_member_generation(
-                            view,
-                            &member.id,
-                            member.node_start_time,
-                            true,
-                        )
-                        .await;
-                        view.master_kv_router()
-                            .inner()
-                            .get_holding
-                            .mark_member_active(&member.id);
-                    }
-                    ClusterEvent::MemberLeft(node_id) => {
-                        let inflight_gets = view
-                            .master_kv_router()
-                            .inner()
-                            .mark_inflight_member_left(node_id);
-                        cleanup_inflight_gets_for_member(view, node_id, inflight_gets).await;
-
-                        let removed = view
-                            .master_kv_router()
-                            .inner()
-                            .get_holding
-                            .mark_member_left_and_cleanup(node_id);
-                        if removed > 0 {
-                            info!("Cleaned up {} holdings for left member {}", removed, node_id);
-                        }
-                    }
-                }
-
-                let node_id = event.node_id();
-                loop {
-                    let tx = each_node_segement_registration_caller
-                        .entry(node_id.clone())
-                        .or_insert_with(|| {
-                            view.master_kv_router()
-                                .spawn_node_segement_registration_caller()
-                        })
-                        .clone();
-
-                    match send_event_with_warn(view, &node_id, tx, event.clone()).await {
-                        Ok(()) => return,
-                        Err(_ev) => {
-                            // Receiver dropped: recreate and retry.
-                            each_node_segement_registration_caller.insert(
-                                node_id.clone(),
-                                view.master_kv_router()
-                                    .spawn_node_segement_registration_caller(),
-                            );
-                        }
-                    }
-                }
-            }
-
-            let mut reconcile_sleep = Box::pin(tokio::time::sleep(Duration::from_secs(RECONCILE_INTERVAL_SECS)));
-
-            loop {
-                tokio::select! {
-                    _ = &mut reconcile_sleep => {
-                        reconcile_sleep = Box::pin(tokio::time::sleep(Duration::from_secs(RECONCILE_INTERVAL_SECS)));
-                        let members = view_task.cluster_manager().get_client_members();
-                        for member in members {
-                            deliver_event(
-                                &view_task,
-                                &mut each_node_segement_registration_caller,
-                                ClusterEvent::MemberUpdated(member),
-                            ).await;
-                        }
-                    }
-                    event = listen_cluster_event.recv() => {
-                        match event {
-                            Ok(ev) => {
-                                deliver_event(
-                                    &view_task,
-                                    &mut each_node_segement_registration_caller,
-                                    ev,
-                                ).await;
-                            }
-                            Err(e) => {
-                                warn!("Cluster event receiver error (will resubscribe): {}", e);
-                                listen_cluster_event = view_task.cluster_manager().listen();
-                            }
-                        }
-                    }
-                    _ = shutdown_waiter.wait() => {
-                        break;
-                    }
-                }
-            }
-        });
     }
 
     fn record_put_placement_decision(
@@ -2443,18 +2722,30 @@ impl MasterKvRouter {
                             }))
                             .eviction_listener(Box::new(
                                 move |key: Arc<String>,
-                                      _value: NodeValueReplicaDesc,
+                                      value: NodeValueReplicaDesc,
                                       cause: RemovalCause| {
                                     debug!("Evicted key: {:?}, caused by: {:?}", key, cause);
                                     match cause {
                                         // timeout or size exceed
                                         RemovalCause::Size | RemovalCause::Expired => {
                                             let k = (*key).clone();
-                                            let evicted_put_id = _value.put_id;
+                                            let evicted_put_id = value.put_id;
+                                            let evicted_generation = value.generation;
+                                            let Some(evicted_allocation) = value.allocation.upgrade()
+                                            else {
+                                                debug!(
+                                                    key = %k,
+                                                    node = %cache_node_id,
+                                                    evicted_generation,
+                                                    "Ignoring eviction for an allocation that is no longer routed"
+                                                );
+                                                return;
+                                            };
                                             tracing::debug!(
-                                                "Eviction-triggered local replica cleanup for key {} on node {} put_id=({},{})",
+                                                "Eviction-triggered local replica cleanup for key {} on node {} generation={} put_id=({},{})",
                                                 k,
                                                 cache_node_id,
+                                                evicted_generation,
                                                 evicted_put_id.0,
                                                 evicted_put_id.1
                                             );
@@ -2462,7 +2753,9 @@ impl MasterKvRouter {
                                                 &view,
                                                 k.clone(),
                                                 cache_node_id.clone().into(),
+                                                evicted_generation,
                                                 evicted_put_id,
+                                                &evicted_allocation,
                                             ) {
                                                 warn!(
                                                     "Eviction-triggered local replica cleanup failed for key {} on node {}: {:?}",
@@ -2637,7 +2930,7 @@ mod cache_capacity_reservation_tests {
             allocation_mode: GetAllocationMode::DurableReplica,
             source_kind: GetSourceKind::Memory,
             requester_generation: 1,
-            remote_ssd_source_generation: None,
+            source_generation: None,
             ssd_stage_lifecycle: None,
             cache_capacity_reservation: Mutex::new(Some(reservation)),
             terminal_claimed: AtomicBool::new(false),
