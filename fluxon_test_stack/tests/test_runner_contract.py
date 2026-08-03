@@ -44,12 +44,12 @@ def main() -> int:
 def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[], None]]]:
     checks: List[Tuple[str, Callable[[], None]]] = [
         (
-            "tcp_thread_keeps_protocol_implicit",
-            test_tcp_thread_keeps_protocol_implicit,
+            "network_config_contract",
+            test_network_config_contract,
         ),
         (
-            "explicit_protocol_is_preserved",
-            test_explicit_protocol_is_preserved,
+            "test_spec_protocol_type_contract",
+            test_test_spec_protocol_type_contract,
         ),
         (
             "suite_requires_benchmark_bundle_only_for_bench_cases",
@@ -152,46 +152,97 @@ def _suite_cfg_with_declared_ci_commands(command_map: dict[str, list[dict]]) -> 
     return suite_cfg
 
 
-def test_tcp_thread_keeps_protocol_implicit() -> None:
-    kv_base = {
-        "instance_key": "bench_base",
-        "fluxonkv_spec": {"cluster_name": "bench"},
-    }
-    merged_test_spec_config = {
-        "p2p_transport_impl": "tcp_thread",
-        "transport_mode": "transfer_with_rpc",
-    }
-    actual = _TEST_RUNNER._resolve_test_stack_fluxon_protocol_cfg(
-        kv_base=copy.deepcopy(kv_base),
-        merged_test_spec_config=copy.deepcopy(merged_test_spec_config),
-        ctx="profile.test_stack.runtime_config.kv_base",
+def test_network_config_contract() -> None:
+    actual = _TEST_RUNNER._normalize_test_stack_fluxon_network_config(
+        {"rdma_device_names": " mlx5_0 ", "tcp_reactor_mode": "event_driven"},
+        "network",
     )
-    if actual is not None:
-        print(
-            "FAIL: test_tcp_thread_keeps_protocol_implicit - "
-            f"expected None, got {actual!r}"
-        )
-        return
-    print("PASS: test_tcp_thread_keeps_protocol_implicit")
-
-
-def test_explicit_protocol_is_preserved() -> None:
-    kv_base = {
-        "protocol": {"protocol_type": "rdma"},
-    }
-    actual = _TEST_RUNNER._resolve_test_stack_fluxon_protocol_cfg(
-        kv_base=copy.deepcopy(kv_base),
-        merged_test_spec_config={"p2p_transport_impl": "tcp_thread"},
-        ctx="profile.test_stack.runtime_config.kv_base",
-    )
-    expected = {"protocol_type": "rdma"}
+    expected = {"rdma_device_names": "mlx5_0", "tcp_reactor_mode": "event_driven"}
     if actual != expected:
+        print(f"FAIL: test_network_config_contract - expected {expected!r}, got {actual!r}")
+        return
+
+    try:
+        _TEST_RUNNER._forbid_removed_fluxon_kv_config_keys(
+            {"protocol": {}, "fluxonkv_spec": {}},
+            "kv_base",
+        )
+    except ValueError:
+        pass
+    else:
+        print("FAIL: test_network_config_contract - removed protocol block should fail")
+        return
+
+    for removed_name in ("event_mode", "tcp_thread_reactor"):
+        try:
+            _TEST_RUNNER._normalize_test_stack_fluxon_network_config(
+                {removed_name: "event_driven"},
+                "network",
+            )
+        except ValueError:
+            continue
+        print(f"FAIL: test_network_config_contract - removed {removed_name} should fail")
+        return
+
+    print("PASS: test_network_config_contract")
+
+
+def test_test_spec_protocol_type_contract() -> None:
+    defaulted = _TEST_RUNNER._normalize_test_spec_config({}, "test_spec_config")
+    if "protocol_type" in defaulted:
         print(
-            "FAIL: test_explicit_protocol_is_preserved - "
-            f"expected {expected!r}, got {actual!r}"
+            "FAIL: test_test_spec_protocol_type_contract - "
+            f"omitted protocol_type should stay implicit, got {defaulted!r}"
         )
         return
-    print("PASS: test_explicit_protocol_is_preserved")
+
+    tcp = _TEST_RUNNER._normalize_test_spec_config(
+        {
+            "protocol_type": "tcp",
+            "transport_mode": "transfer_with_rpc",
+            "require_transfer_rpc_fast_path_ready_timeout_seconds": 30,
+        },
+        "test_spec_config",
+    )
+    if tcp.get("protocol_type") != "tcp" or "rdma_device_names" in tcp:
+        print(
+            "FAIL: test_test_spec_protocol_type_contract - "
+            f"unexpected tcp config: {tcp!r}"
+        )
+        return
+
+    try:
+        _TEST_RUNNER._normalize_test_spec_config(
+            {"protocol_type": "tcp", "rdma_device_names": ["mlx5_0"]},
+            "test_spec_config",
+        )
+    except ValueError:
+        pass
+    else:
+        print(
+            "FAIL: test_test_spec_protocol_type_contract - "
+            "tcp with rdma_device_names should fail"
+        )
+        return
+
+    for field_name, value in (
+        ("protocol_type", "tcp"),
+        ("rdma_device_names", ["mlx5_0"]),
+    ):
+        try:
+            _TEST_RUNNER._normalize_test_spec_config(
+                {"side_transfer_role": "worker", field_name: value},
+                "test_spec_config",
+            )
+        except ValueError:
+            continue
+        print(
+            "FAIL: test_test_spec_protocol_type_contract - "
+            f"side-transfer worker {field_name} should fail"
+        )
+        return
+
+    print("PASS: test_test_spec_protocol_type_contract")
 
 
 def test_suite_requires_benchmark_bundle_only_for_bench_cases() -> None:

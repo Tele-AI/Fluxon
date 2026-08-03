@@ -33,10 +33,10 @@ pub type SegmentDeviceID = String;
 
 #[derive(Debug, Clone, Encode, Decode, Default)]
 pub struct RequestSegmentRegistrationReq {
-    /// Master-side epoch guard.
+    /// Master-side member-generation guard.
     ///
     /// The master sets this to the target member's `node_start_time` from cluster membership.
-    /// The client must reject requests whose expected epoch does not match its current
+    /// The client must reject requests whose expected generation does not match its current
     /// `ClusterMember.node_start_time`.
     ///
     /// Note: `Default` is required by the RPC dispatch registry (type-only); the value is

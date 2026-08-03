@@ -8,6 +8,7 @@ use super::{
 };
 use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::put::PutIDForAKey;
+use crate::master_seg_manager::one_seg_allocator::Allocation;
 use crate::memholder::{EnsureMemholderMgmtDeleteActorOwned, MasterOwnerMemMgr};
 use crate::{
     cluster_manager::NodeID,
@@ -34,6 +35,8 @@ pub fn do_delete_one_kv_all_replicas(
         view.master_kv_router().inner().kv_routes.remove(&key)
     {
         let deleted_put_id = kv_route_info.put_id;
+        view.master_kv_router()
+            .unregister_route_replicas(&key, &kv_route_info);
         tracing::info!("Deleted kv_routes entry for key: {}", key);
 
         // Spawn async follow-up: broadcast + per-node cache cleanup
@@ -44,7 +47,9 @@ pub fn do_delete_one_kv_all_replicas(
                 if view.master_kv_router().prefix_index_enabled() {
                     let inner = view.master_kv_router().inner();
                     let mut tree = inner.prefix_index.write().await;
-                    tree.remove(&key_clone);
+                    if !inner.kv_routes.contains_key(&key_clone) {
+                        tree.remove(&key_clone);
+                    }
                 }
 
                 if let Err(err) = view
@@ -90,7 +95,9 @@ pub fn evict_one_kv_replica_for_node(
     view: &MasterKvRouterView,
     key: String,
     node_id: NodeID,
+    generation: i64,
     put_id: PutIDForAKey,
+    allocation: &Arc<Allocation>,
 ) -> Result<(), msg_and_error::ErrorCode> {
     let route = if let Some(route) = view.master_kv_router().inner().kv_routes.get(&key) {
         route.clone()
@@ -117,17 +124,21 @@ pub fn evict_one_kv_replica_for_node(
         return Ok(());
     }
 
-    let removed_replica = route.remove_memory_replica(&node_id);
+    let removed_replica =
+        route.remove_memory_replica_if_allocation(&node_id, generation, allocation);
     if !removed_replica {
         tracing::debug!(
-            "Local replica eviction ignored because node replica is already absent: key={} node_id={} put_id=({},{})",
+            "Local replica eviction ignored because node replica changed: key={} node_id={} generation={} put_id=({},{})",
             key,
             node_id,
+            generation,
             put_id.0,
             put_id.1
         );
         return Ok(());
     }
+    view.master_kv_router()
+        .unregister_member_replica_if_absent(&key, &route, &node_id, generation);
 
     let last_replica_gone = !route.has_live_replica();
     if last_replica_gone {
@@ -148,7 +159,9 @@ pub fn evict_one_kv_replica_for_node(
             let _ = view.spawn("local_evict_remove_prefix_index", async move {
                 let inner = view_task.master_kv_router().inner();
                 let mut tree = inner.prefix_index.write().await;
-                tree.remove(&key_for_prefix);
+                if !inner.kv_routes.contains_key(&key_for_prefix) {
+                    tree.remove(&key_for_prefix);
+                }
             });
         }
     }
@@ -226,9 +239,10 @@ pub(crate) struct SsdReplicaRemoval {
 fn remove_ssd_replica_if_version(
     route: &OneKvNodesRoutes,
     node_id: &NodeID,
+    generation: i64,
     put_id: PutIDForAKey,
 ) -> bool {
-    route.put_id == put_id && route.remove_ssd_replica(node_id)
+    route.put_id == put_id && route.remove_ssd_replica_if_generation(node_id, generation)
 }
 
 pub(crate) fn remove_one_ssd_replica_for_node(
@@ -243,9 +257,18 @@ pub(crate) fn remove_one_ssd_replica_for_node(
         };
         route.clone()
     };
-    if !remove_ssd_replica_if_version(&route, node_id, put_id) {
+    let Some(replica_generation) = route.node_replica_generation(node_id) else {
+        return SsdReplicaRemoval::default();
+    };
+    if !remove_ssd_replica_if_version(&route, node_id, replica_generation, put_id) {
         return SsdReplicaRemoval::default();
     }
+    view.master_kv_router().unregister_member_replica_if_absent(
+        key,
+        &route,
+        node_id,
+        replica_generation,
+    );
 
     let route_removed = if route.has_live_replica() {
         false
@@ -281,13 +304,14 @@ mod tests {
         route.node_replicas.write().insert(
             node_id.clone(),
             KvNodeReplicas {
+                generation: 1,
                 tomb_tag: NodeTombTag::new(),
                 memory: None,
                 ssd: Some(KvSsdReplicaInfo { len: 4096 }),
             },
         );
 
-        assert!(!remove_ssd_replica_if_version(&route, &node_id, (9, 7)));
+        assert!(!remove_ssd_replica_if_version(&route, &node_id, 1, (9, 7)));
         assert!(
             route
                 .node_replicas
@@ -296,7 +320,7 @@ mod tests {
                 .is_some_and(|replicas| replicas.ssd.is_some())
         );
 
-        assert!(remove_ssd_replica_if_version(&route, &node_id, (10, 2)));
+        assert!(remove_ssd_replica_if_version(&route, &node_id, 1, (10, 2)));
         assert!(route.node_replicas.read().get(&node_id).is_none());
     }
 }

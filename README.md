@@ -4,7 +4,7 @@
 
 <div align="center">
 
-One unified system for high performance RPC, KV Cache, Message Queue, and File & Object Acceleration. 
+An AI-native distributed data plane that supports high performance RPC, KV Cache, Message Queue, and File & Object Acceleration. 
 
 [![Linux Only](https://img.shields.io/badge/Linux-Only-2ea44f)](#runtime-requirements)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB)](#runtime-requirements)
@@ -319,6 +319,7 @@ Contributions are welcome. Before you start, please read the developer docs on G
 - [Developer - 6 - Code Review Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---6---Code-Review-Guidelines/)
 - [Developer - 7 - Event Subscription and Full Snapshot Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---7---Event-Subscription-and-Full-Snapshot-Guidelines/)
 - [Developer - 8 - Data Structure and Index Design Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---8---Data-Structure-and-Index-Design-Guidelines/)
+- [Developer - 9 - Test Extension Configuration](https://tele-ai.github.io/Fluxon/dev_doc/Developer---9---Test-Extension-Configuration/)
 
 <a id="contributors"></a>
 

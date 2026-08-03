@@ -4,7 +4,7 @@ run:
   mode: full_once
   selectors:
     case_ids: ALL
-    profile_ids: [fluxon_fastws, fluxon_tquic, fluxon_sockudo_ws, fluxon_tcp]
+    profile_ids: [fluxon_fastws, fluxon_tquic, fluxon_sockudo_ws, fluxon_tcp, fluxon_tcp_event_driven]
     command_ids: ALL
     test_ids: ALL
 
@@ -168,6 +168,20 @@ scenes:
     select:
       scales: [n1_kvowner_dram_20gib]
       profiles: [fluxon_tcp]
+
+  # Job nodes idle after startup, wake on cross-node KV traffic, then close and exit.
+  # A blocked or orphaned reactor prevents the TEST_STACK job from completing.
+  tcp_event_driven_reactor_lifecycle:
+    test_stack:
+      mode: KVSTORE
+      read_ratio: 0.5
+      write_ratio: 0.5
+      request_distribution: uniform
+      keyspace_size: 128
+      value_size_mode: FIXED
+    select:
+      scales: [n2_kvowner_dram_3gib_event_driven_lifecycle]
+      profiles: [fluxon_tcp_event_driven]
 
   kv_read_heavy_zipf:
     test_stack:
@@ -350,6 +364,25 @@ scales:
       owner_count: 2
       owner_dram_bytes: 21474836480
     benchmark: *bench_benchmark
+
+  n2_kvowner_dram_3gib_event_driven_lifecycle:
+    duration_seconds: 30
+    topology: 2
+    targets:
+      hosts: [example-node-a, example-node-b]
+    owner:
+      owner_count: 2
+      owner_dram_bytes: 3221225472
+    benchmark:
+      processes_per_target: 1
+      threads_per_process: 2
+      value_size: 4096
+      metric_warmup_seconds: 0
+      start_idle_seconds: 5
+      op_timeout_seconds: 10
+      cluster_ready_timeout_seconds: 660
+      value_size_list: []
+      consumer_sim_handle_ms_range: [700, 1500]
 
 artifact_sets:
   fluxon_fastws:
@@ -654,6 +687,22 @@ profiles:
           ci_top_attention_mq_core: {}
       test_stack:
         <<: *common_test_stack_runtime
+  fluxon_tcp_event_driven:
+    artifact_set: fluxon_tcp
+    runtime:
+      test_stack:
+        <<: *common_test_stack_runtime
+        runtime_config:
+          kv_base:
+            <<: *self_host_test_stack_kv_base
+            network:
+              tcp_reactor_mode: event_driven
+            test_spec_config:
+              protocol_type: tcp
+          mq_base:
+            capacity: 40
+            ttl_seconds: 90
+          kv_node_patch_template: {}
   redis_sharded:
     artifact_set: fluxon_fastws
     runtime:

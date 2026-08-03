@@ -410,6 +410,7 @@ impl ClientTransferEngine {
                 target_addr,
                 len,
                 seg_guard,
+                false,
             )
             .await
             .map_err(KvError::from)

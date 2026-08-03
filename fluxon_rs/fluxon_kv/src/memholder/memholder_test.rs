@@ -45,6 +45,7 @@ fn new_master_config(
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
             rdma_device_names: None,
+            tcp_thread_reactor: Default::default(),
         },
         transfer_engine: TransferEngineType::P2p,
         enable_transfer_rpc_fast_path: false,
@@ -85,6 +86,7 @@ fn new_client_config_with_size(
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
             rdma_device_names: None,
+            tcp_thread_reactor: Default::default(),
         },
         pprof_duration_seconds: None,
         redis_compat_listen_addr: None,
@@ -121,6 +123,7 @@ fn new_zero_contribution_client_config(
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Rdma,
             rdma_device_names: None,
+            tcp_thread_reactor: Default::default(),
         },
         pprof_duration_seconds: None,
         redis_compat_listen_addr: None,
@@ -181,67 +184,12 @@ fn capture_master_holding_allocation(
         .map(|holding| Arc::downgrade(&holding.allocation))
 }
 
-// Helper: drive the same master-side local replica eviction path Moka uses, but
-// deterministically for a specific test key.
-fn evict_all_replicas_for_key(master_view: &MasterKvRouterView, key: &str) -> usize {
-    let Some((put_id, node_ids)) = ({
-        master_view
-            .master_kv_router()
-            .inner()
-            .kv_routes
-            .get(key)
-            .map(|route| {
-                let node_ids = route
-                    .node_replicas
-                    .read()
-                    .iter()
-                    .filter_map(|(node_id, replicas)| {
-                        replicas.memory.is_some().then(|| node_id.clone())
-                    })
-                    .collect::<Vec<_>>();
-                (route.put_id, node_ids)
-            })
-    }) else {
-        return 0;
-    };
-
-    let mut evicted = 0;
-    for node_id in node_ids {
-        if crate::master_kv_router::delete::evict_one_kv_replica_for_node(
-            master_view,
-            key.to_string(),
-            node_id,
-            put_id,
-        )
-        .is_ok()
-        {
-            evicted += 1;
-        }
-    }
-    evicted
-}
-
-// Helper: wait until Weak<Allocation> cannot upgrade (or times out)
-async fn wait_weak_drop(label: &str, weak: &Weak<Allocation>, timeout: Duration) {
-    let start = Instant::now();
-    loop {
-        if start.elapsed() > timeout {
-            panic!("timeout waiting weak allocation drop: {label}");
-        }
-        if weak.upgrade().is_none() {
-            return;
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-}
-
 /// Group: test block defer (memholder holds shutdown for ~10s)
 #[cfg(test)]
 pub mod test_memholder {
     use super::{
-        capture_master_holding_allocation, evict_all_replicas_for_key, new_client_config_with_size,
-        new_master_config, new_zero_contribution_client_config, read_etcd, unique_cluster_name,
-        wait_node_allocators, wait_weak_drop,
+        capture_master_holding_allocation, new_client_config_with_size, new_master_config,
+        new_zero_contribution_client_config, read_etcd, unique_cluster_name, wait_node_allocators,
     };
     use crate::{ConfigArg, run_client, run_master};
     use std::time::{Duration, Instant};
@@ -681,44 +629,8 @@ pub mod test_memholder {
             "[LOOP1-EVICT] fill summary: ok={} nospace={} err={} (chunk_sz={}B)",
             put_ok, put_nospace, put_err, chunk_sz
         );
-        // 4) asserts
-        // Release keys: all user holders were dropped. The fill loop above creates cache
-        // pressure, but random placement can leave one release replica under the Moka
-        // capacity line. Drive the same eviction path explicitly so this assertion is
-        // about release+cache-invalidation semantics, not random placement distribution.
-        let owner_release_evicted = evict_all_replicas_for_key(&master_view, kv_owner_release);
-        let ext_release_evicted = evict_all_replicas_for_key(&master_view, kv_ext_release);
-        info!(
-            "[LOOP1-EVICT] forced release-key eviction: owner_release={} ext_release={}",
-            owner_release_evicted, ext_release_evicted
-        );
-
-        info!(
-            "[LOOP1-ASSERT_WEAK] expect owner release weak dropped for key='{}'",
-            kv_owner_release
-        );
-        wait_weak_drop(
-            "owner_release",
-            &owner_release_weak,
-            Duration::from_secs(10),
-        )
-        .await;
-        info!(
-            "[LOOP1-ASSERT_WEAK] owner_release weak dropped (holder_id={})",
-            owner_release_holder_id
-        );
-
-        info!(
-            "[LOOP1-ASSERT_WEAK] expect external release weak dropped for key='{}'",
-            kv_ext_release
-        );
-        wait_weak_drop("ext_release", &ext_release_weak, Duration::from_secs(10)).await;
-        info!(
-            "[LOOP1-ASSERT_WEAK] ext_release weak dropped (holder_id={})",
-            ext_release_holder_id
-        );
-
-        // hold keys: live holders keep the backing allocations pinned.
+        // 4) Live holders keep their backing allocations pinned regardless of
+        // whether normal cache pressure has already evicted a route replica.
         info!(
             "[LOOP1-ASSERT_WEAK] expect owner hold weak still pinned for key='{}'",
             kv_owner_hold
@@ -753,21 +665,29 @@ pub mod test_memholder {
             assert!(ext_hold_weak.upgrade().is_some());
         }
 
-        // 6) 析构 owner 后重构; pinned allocations should be dropped; assert get 失败（Ok(None)）
-        // 注意：owner.shutdown 会在存在用户持有的 MemHolder 时阻塞等待（ClientKvApi::before_shutdown）。
-        // 这里显式释放仍在作用域内的持有者（oh1/eh1），避免 shutdown 重试等待。
+        // 6) Restart the owner after product-owned MemberLeft cleanup completes.
+        // owner.shutdown waits in ClientKvApi::before_shutdown while user MemHolders remain.
+        // Drop the live holders first so shutdown does not wait for retries.
         info!("[LOOP2-OWNER_RESTART] dropping live holders before owner shutdown");
         drop(oh1); // release owner-side live holder for kv_owner_hold
         drop(eh1); // release external-side live holder for kv_ext_hold (owner shutdown is owner-local)
         info!("[LOOP2-OWNER_RESTART] shutting down owner to release pinned allocations");
         owner.shutdown().await.expect("owner shutdown");
-        // allow master to observe owner down
-        sleep(Duration::from_secs(2)).await;
-        // After owner leaves, both owner_hold/ext_hold should no longer be upgradable eventually
-        // (either via delete-ack during drop or by subsequent cleanup upon restart)
-        wait_weak_drop("owner_hold", &owner_hold_weak, Duration::from_secs(10)).await;
-        wait_weak_drop("ext_hold", &ext_hold_weak, Duration::from_secs(10)).await;
-        info!("[LOOP2-ASSERT_WEAK] pinned allocations dropped after owner shutdown");
+        // Membership reconciliation runs every two seconds. The test only waits for the
+        // product-owned MemberLeft cleanup; it does not trigger delete/get/eviction paths.
+        sleep(Duration::from_secs(15)).await;
+        for (label, weak) in [
+            ("owner_hold", &owner_hold_weak),
+            ("owner_release", &owner_release_weak),
+            ("ext_hold", &ext_hold_weak),
+            ("ext_release", &ext_release_weak),
+        ] {
+            assert!(
+                weak.upgrade().is_none(),
+                "allocation must be released by MemberLeft cleanup: {label}"
+            );
+        }
+        info!("[LOOP2-ASSERT_WEAK] all departed-owner allocations were released");
 
         // Recreate owner
         info!("[LOOP2-OWNER_RESTART] restarting owner");

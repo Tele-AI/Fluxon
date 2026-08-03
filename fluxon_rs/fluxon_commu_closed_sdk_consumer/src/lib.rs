@@ -13,7 +13,7 @@ use fluxon_commu_contract::{
     ClosedRuntimeClusterRdmaResolvedConfigStreamItem, ClosedRuntimeDesiredTransferPeer,
     ClosedRuntimeDispatchRequestView, ClosedRuntimeDispatchResponse,
     ClosedRuntimeDispatchTransportPolicy, ClosedRuntimeError, ClosedRuntimeHandle,
-    ClosedRuntimeHostCallbackHandle, ClosedRuntimeP2pCall,
+    ClosedRuntimeHostCallbackHandle, ClosedRuntimeLocalMemoryKind, ClosedRuntimeP2pCall,
     ClosedRuntimeP2pCallRawObservedRequestView, ClosedRuntimeP2pResponse,
     ClosedRuntimeP2pSendResponseRawRequestView, ClosedRuntimePeerGen, ClosedRuntimeRawSlice,
     ClosedRuntimeRequest, ClosedRuntimeResponse, ClosedRuntimeTransferEngineCall,
@@ -26,12 +26,16 @@ use fluxon_commu_contract::{
 
 pub mod rdma_probe;
 
-pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 5;
-pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 8;
+pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 7;
+pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 9;
 pub const FLUXON_COMMU_CLOSED_HOST_CALLBACKS_ABI_VERSION: u32 = 8;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_OK: i32 = 0;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_ERR: i32 = 1;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_USER_RPC_ERR: i32 = 2;
+
+// ABI 9 reports this capability miss through the transfer-engine error detail.
+// Keep the wire marker private and interpret it only at fast-path call sites.
+const ABI9_DIRECT_FAST_PATH_NOT_READY_MARKER: &str = "fluxon_direct_fast_path_not_ready";
 
 type HostAsyncBytesFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>;
 
@@ -230,6 +234,8 @@ pub enum ClosedSdkConsumerError {
     RuntimeError {
         error: ClosedRuntimeError,
     },
+    /// Only explicit fast-path requirements use this error; optional attempts return `Ok(false)`.
+    RequiredDirectFastPathNotReady,
     RuntimeUnexpectedResponse {
         detail: String,
     },
@@ -275,6 +281,9 @@ impl Display for ClosedSdkConsumerError {
             Self::RuntimeError { error } => {
                 write!(f, "closed SDK runtime call failed: {error:?}")
             }
+            Self::RequiredDirectFastPathNotReady => {
+                write!(f, "closed SDK required direct fast path is not ready")
+            }
             Self::RuntimeUnexpectedResponse { detail } => {
                 write!(
                     f,
@@ -294,6 +303,37 @@ impl Display for ClosedSdkConsumerError {
                 )
             }
         }
+    }
+}
+
+fn is_abi9_direct_fast_path_not_ready(error: &ClosedSdkConsumerError) -> bool {
+    matches!(
+        error,
+        ClosedSdkConsumerError::RuntimeError {
+            error: ClosedRuntimeError::TransferEngine { detail },
+        } if detail == ABI9_DIRECT_FAST_PATH_NOT_READY_MARKER
+    )
+}
+
+fn optional_direct_fast_path_call<T>(
+    result: Result<T, ClosedSdkConsumerError>,
+) -> Result<Option<T>, ClosedSdkConsumerError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if is_abi9_direct_fast_path_not_ready(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn required_direct_fast_path_call<T>(
+    result: Result<T, ClosedSdkConsumerError>,
+) -> Result<T, ClosedSdkConsumerError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if is_abi9_direct_fast_path_not_ready(&error) => {
+            Err(ClosedSdkConsumerError::RequiredDirectFastPathNotReady)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1858,12 +1898,14 @@ pub async fn transfer_engine_register_local_segment(
     handle: ClosedRuntimeHandle,
     allocated_addr: u64,
     allocated_size: u64,
+    memory_kind: ClosedRuntimeLocalMemoryKind,
 ) -> Result<(), ClosedSdkConsumerError> {
     match transfer_engine_call(
         handle,
         ClosedRuntimeTransferEngineCall::RegisterLocalSegment {
             allocated_addr,
             allocated_size,
+            memory_kind,
         },
     )
     .await?
@@ -1879,12 +1921,14 @@ pub async fn transfer_engine_unregister_local_segment(
     handle: ClosedRuntimeHandle,
     allocated_addr: u64,
     allocated_size: u64,
+    memory_kind: ClosedRuntimeLocalMemoryKind,
 ) -> Result<(), ClosedSdkConsumerError> {
     match transfer_engine_call(
         handle,
         ClosedRuntimeTransferEngineCall::UnregisterLocalSegment {
             allocated_addr,
             allocated_size,
+            memory_kind,
         },
     )
     .await?
@@ -1904,8 +1948,9 @@ pub async fn transfer_engine_transfer_data_no_copy(
     target_addr: u64,
     len: u64,
     initial_local_segment_guard_handle: Option<u64>,
+    require_fast_path: bool,
 ) -> Result<fluxon_commu_contract::TransferBreakdown, ClosedSdkConsumerError> {
-    match transfer_engine_call(
+    let call = transfer_engine_call(
         handle,
         ClosedRuntimeTransferEngineCall::TransferDataNoCopy {
             peer_node,
@@ -1914,10 +1959,16 @@ pub async fn transfer_engine_transfer_data_no_copy(
             target_addr,
             len,
             initial_local_segment_guard_handle,
+            require_fast_path,
         },
     )
-    .await?
-    {
+    .await;
+    let response = if require_fast_path {
+        required_direct_fast_path_call(call)?
+    } else {
+        call?
+    };
+    match response {
         ClosedRuntimeTransferEngineResponse::TransferBreakdownValue(breakdown) => Ok(breakdown),
         other => Err(ClosedSdkConsumerError::RuntimeUnexpectedResponse {
             detail: format!("{other:?}"),
@@ -1931,16 +1982,21 @@ pub async fn transfer_engine_try_send_wire_direct(
     peer_transfer_backend_epoch: u64,
     wire_bytes: Vec<u8>,
 ) -> Result<bool, ClosedSdkConsumerError> {
-    match transfer_engine_call(
-        handle,
-        ClosedRuntimeTransferEngineCall::TrySendWireDirect {
-            peer_gen,
-            peer_transfer_backend_epoch,
-            wire_bytes,
-        },
-    )
-    .await?
-    {
+    let Some(response) = optional_direct_fast_path_call(
+        transfer_engine_call(
+            handle,
+            ClosedRuntimeTransferEngineCall::TrySendWireDirect {
+                peer_gen,
+                peer_transfer_backend_epoch,
+                wire_bytes,
+            },
+        )
+        .await,
+    )?
+    else {
+        return Ok(false);
+    };
+    match response {
         ClosedRuntimeTransferEngineResponse::BoolValue(value) => Ok(value),
         other => Err(ClosedSdkConsumerError::RuntimeUnexpectedResponse {
             detail: format!("{other:?}"),
@@ -2306,11 +2362,60 @@ pub async fn drop_runtime_handle(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn bundled_sdk_declares_watch_backed_transfer_link_snapshot() {
         assert_eq!(
             env!("FLUXON_COMMU_CLOSED_TRANSFER_LINK_SNAPSHOT_MODE"),
             "watch-v1"
         );
+    }
+
+    #[test]
+    fn abi9_marker_is_capability_miss_for_optional_fast_path() {
+        let result =
+            optional_direct_fast_path_call::<()>(Err(ClosedSdkConsumerError::RuntimeError {
+                error: ClosedRuntimeError::TransferEngine {
+                    detail: ABI9_DIRECT_FAST_PATH_NOT_READY_MARKER.to_string(),
+                },
+            }));
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn abi9_marker_is_typed_error_for_required_fast_path() {
+        let result =
+            required_direct_fast_path_call::<()>(Err(ClosedSdkConsumerError::RuntimeError {
+                error: ClosedRuntimeError::TransferEngine {
+                    detail: ABI9_DIRECT_FAST_PATH_NOT_READY_MARKER.to_string(),
+                },
+            }));
+
+        assert!(matches!(
+            result,
+            Err(ClosedSdkConsumerError::RequiredDirectFastPathNotReady)
+        ));
+    }
+
+    #[test]
+    fn non_marker_transfer_engine_error_remains_runtime_error() {
+        let result =
+            optional_direct_fast_path_call::<()>(Err(ClosedSdkConsumerError::RuntimeError {
+                error: ClosedRuntimeError::TransferEngine {
+                    detail: format!(
+                        "{}: peer unavailable",
+                        ABI9_DIRECT_FAST_PATH_NOT_READY_MARKER
+                    ),
+                },
+            }));
+
+        assert!(matches!(
+            result,
+            Err(ClosedSdkConsumerError::RuntimeError {
+                error: ClosedRuntimeError::TransferEngine { .. }
+            })
+        ));
     }
 }

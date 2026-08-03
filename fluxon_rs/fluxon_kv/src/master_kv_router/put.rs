@@ -1,7 +1,7 @@
 use super::NodeValueReplicaDesc;
 use super::{
-    InflightPutAllocation, InflightPutInfo, MasterKvRouterView, NodeCacheCapacityReservation,
-    PutPlacementMode, SsdReplicaCommitStatus,
+    InflightPutAllocation, InflightPutInfo, InflightPutKeyReservation, MasterKvRouterView,
+    NodeCacheCapacityReservation, PutPlacementMode, SsdReplicaCommitStatus,
     msg_pack::{
         PutDoneReq, PutDoneResp, PutRevokeReq, PutRevokeResp, PutStartReq, PutStartResp,
         SsdReplicaCommitReq, SsdReplicaCommitResp,
@@ -24,45 +24,11 @@ use std::{sync::Arc, time::Duration};
 
 pub type PutIDForAKey = (u64, u32);
 
-struct InflightPutKeyReservation {
-    view: MasterKvRouterView,
-    key: String,
-    active: bool,
-}
-
-impl InflightPutKeyReservation {
-    fn new(view: MasterKvRouterView, key: String) -> Self {
-        Self {
-            view,
-            key,
-            active: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for InflightPutKeyReservation {
-    fn drop(&mut self) {
-        if self.active {
-            self.view
-                .master_kv_router()
-                .release_inflight_put_key(&self.key);
-        }
-    }
-}
-
 fn validate_put_start_source_node_override(
     view: &MasterKvRouterView,
     requester_node_id: &NodeID,
     source_node_id: &NodeID,
-) -> msg_and_error::KvResult<()> {
-    if requester_node_id == source_node_id {
-        return Ok(());
-    }
-
+) -> msg_and_error::KvResult<(i64, i64)> {
     let requester = view
         .cluster_manager()
         .get_member_info_cached(requester_node_id.as_ref())
@@ -74,6 +40,10 @@ fn validate_put_start_source_node_override(
                 ),
             })
         })?;
+    if requester_node_id == source_node_id {
+        return Ok((requester.node_start_time, requester.node_start_time));
+    }
+
     let source = view
         .cluster_manager()
         .get_member_info_cached(source_node_id.as_ref())
@@ -151,7 +121,7 @@ fn validate_put_start_source_node_override(
         ));
     }
 
-    Ok(())
+    Ok((requester.node_start_time, source.node_start_time))
 }
 
 pub async fn handle_put_start(
@@ -174,13 +144,16 @@ pub async fn handle_put_start(
             },
         );
     }
-    let mut key_reservation = InflightPutKeyReservation::new(view.clone(), key.clone());
+    let mut key_reservation =
+        InflightPutKeyReservation::from_existing(view.master_kv_router(), key.clone());
     let source_node_id = match req.serialize_part.source_node_id.as_ref() {
-        Some(source_node_id) => {
-            let source_node_id: NodeID = source_node_id.clone().into();
-            if let Err(err) =
-                validate_put_start_source_node_override(&view, &req_node_id, &source_node_id)
-            {
+        Some(source_node_id) => source_node_id.clone().into(),
+        None => req_node_id.clone(),
+    };
+    let (requester_generation, source_generation) =
+        match validate_put_start_source_node_override(&view, &req_node_id, &source_node_id) {
+            Ok(generations) => generations,
+            Err(err) => {
                 let resp: PutStartResp =
                     crate::rpcresp_kvresult_convert::FromError::from_error(&err);
                 return (
@@ -191,10 +164,7 @@ pub async fn handle_put_start(
                     },
                 );
             }
-            source_node_id
-        }
-        None => req_node_id.clone(),
-    };
+        };
     let put_id: PutIDForAKey = view
         .master_kv_router()
         .get_recent_key_versionid(key.clone());
@@ -268,7 +238,8 @@ pub async fn handle_put_start(
     // Keep src allocation alive across retry attempts until we have a successful target.
     let mut src_allocation = Some(src_allocation);
 
-    let finalize = |node_id: NodeID,
+    let finalize = |target_node_id: NodeID,
+                    target_generation: i64,
                     persist_to_ssd: bool,
                     inflight_alloc: InflightPutAllocation,
                     src_addr: u64,
@@ -276,28 +247,45 @@ pub async fn handle_put_start(
                     src_base_addr: u64,
                     target_base_addr: u64,
                     len: u64| {
-        let info = InflightPutInfo {
-            node_id: node_id.clone(),
+        let info = Arc::new(InflightPutInfo {
+            target_node_id: target_node_id.clone(),
+            source_node_id: source_node_id.clone(),
             key: key.clone(),
             len,
             req_node_id: req_node_id.clone(),
+            target_generation,
+            source_generation,
+            requester_generation,
             persist_to_ssd,
             src_target_allocation: Arc::new(Mutex::new(Some(inflight_alloc))),
-        };
+        });
 
         let view_task = view.clone();
         let inflight_put_key = inflight_put_key.clone();
         async move {
-            view_task
+            if let Err(detail) = view_task
                 .master_kv_router()
-                .inner()
-                .inflight_puts
-                .insert(inflight_put_key, info)
-                .await;
+                .insert_inflight_put(inflight_put_key, info)
+                .await
+            {
+                let err =
+                    msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+                        detail,
+                    });
+                return (
+                    (0, 0),
+                    MsgPack {
+                        serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(
+                            &err,
+                        ),
+                        raw_bytes: Vec::new(),
+                    },
+                );
+            }
 
             let resp = PutStartResp {
                 put_id,
-                node_id: node_id.into(),
+                node_id: target_node_id.into(),
                 src_addr,
                 target_addr,
                 src_base_addr,
@@ -372,6 +360,7 @@ pub async fn handle_put_start(
                 .expect("src_allocation must exist when finalizing local put");
             let fut = finalize(
                 node_id,
+                source_generation,
                 persist_to_ssd,
                 InflightPutAllocation::Local(src),
                 abs,
@@ -381,7 +370,9 @@ pub async fn handle_put_start(
                 allocation_size,
             );
             let result = fut.await;
-            key_reservation.disarm();
+            if result.0 != (0, 0) {
+                key_reservation.disarm();
+            }
             return result;
         }
         Ok(PutPlacementTarget::Remote {
@@ -390,6 +381,25 @@ pub async fn handle_put_start(
             persist_to_ssd,
             ..
         }) => {
+            let Some(target_generation) = view
+                .cluster_manager()
+                .get_member_info_cached(node_id.as_ref())
+                .map(|member| member.node_start_time)
+            else {
+                let err =
+                    msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+                        detail: format!("selected PUT target departed before admission: {node_id}"),
+                    });
+                return (
+                    (0, 0),
+                    MsgPack {
+                        serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(
+                            &err,
+                        ),
+                        raw_bytes: Vec::new(),
+                    },
+                );
+            };
             let src_ref = src_allocation
                 .as_ref()
                 .expect("src_allocation must exist until put_start returns");
@@ -425,6 +435,7 @@ pub async fn handle_put_start(
                 .expect("src_allocation must exist when finalizing remote put");
             let fut = finalize(
                 node_id,
+                target_generation,
                 persist_to_ssd,
                 InflightPutAllocation::Remote {
                     src,
@@ -437,7 +448,9 @@ pub async fn handle_put_start(
                 allocation_size,
             );
             let result = fut.await;
-            key_reservation.disarm();
+            if result.0 != (0, 0) {
+                key_reservation.disarm();
+            }
             return result;
         }
         Err(err) => {
@@ -462,16 +475,12 @@ pub async fn handle_put_revoke(
     let (put_time_ms, put_version) = req.serialize_part.put_id;
 
     let kvrouter_key = (req.serialize_part.key, put_time_ms, put_version);
-    // Remove from inflight_puts without storing in completed_puts
-    if let Some(inflight_info) = view
+    if view
         .master_kv_router()
-        .inner()
-        .inflight_puts
-        .remove(&kvrouter_key)
+        .cancel_inflight_put(&kvrouter_key)
         .await
+        .is_some()
     {
-        view.master_kv_router()
-            .release_inflight_put_key(&inflight_info.key);
         tracing::info!("Revoked put operation with put_id: {:?}", kvrouter_key);
     } else {
         tracing::warn!(
@@ -486,11 +495,13 @@ pub async fn handle_put_revoke(
     }
 }
 
-fn insert_memory_replica_into_cache_if_current(
+pub(super) fn insert_memory_replica_into_cache_if_current(
     view: &MasterKvRouterView,
     key: &str,
     put_id: PutIDForAKey,
     node_id: &NodeID,
+    generation: i64,
+    allocation: &Arc<Allocation>,
     weight_bytes: u32,
 ) {
     let Some(route_ref) = view.master_kv_router().inner().kv_routes.get(key) else {
@@ -506,7 +517,9 @@ fn insert_memory_replica_into_cache_if_current(
     let route = route_ref.value().clone();
     drop(route_ref);
 
-    if route.put_id != put_id || !route.has_memory_replica(node_id) {
+    if route.put_id != put_id
+        || !route.has_memory_replica_allocation(node_id, generation, allocation)
+    {
         tracing::debug!(
             "Skipping delayed cache insertion for stale replica: key={} put_id=({},{}) node={}",
             key,
@@ -530,6 +543,8 @@ fn insert_memory_replica_into_cache_if_current(
     let desc = NodeValueReplicaDesc {
         weight_bytes,
         put_id,
+        generation,
+        allocation: Arc::downgrade(allocation),
     };
     tracing::debug!("Inserting key: {:?} into cache", key);
     cache.insert(key.to_string(), desc);
@@ -545,6 +560,7 @@ fn spawn_ssd_replica_persist_request(
     key: String,
     put_id: PutIDForAKey,
     node_id: NodeID,
+    generation: i64,
     len: u64,
     allocation: Arc<Allocation>,
     cache_weight_bytes: Option<u32>,
@@ -626,6 +642,8 @@ fn spawn_ssd_replica_persist_request(
                 &key,
                 put_id,
                 &node_id,
+                generation,
+                &_allocation_guard,
                 weight_bytes,
             );
         }
@@ -719,23 +737,17 @@ pub async fn handle_put_done(
     let lease_id_opt = req.serialize_part.lease_id;
     let full_put_id: (String, u64, u32) = (req.serialize_part.key.clone(), put_id.0, put_id.1);
 
-    // Remove from inflight_puts and store in completed_puts
-    if let Some(InflightPutInfo {
-        node_id,
-        key,
-        len,
-        persist_to_ssd,
-        src_target_allocation,
-        ..
-    }) = view
+    if let Some((inflight_info, key_reservation)) = view
         .master_kv_router()
-        .inner()
-        .inflight_puts
-        .remove(&full_put_id)
+        .take_active_inflight_put(&full_put_id)
         .await
     {
-        // Keep same-key admission reserved until the new route is visible.
-        let key_reservation = InflightPutKeyReservation::new(view.clone(), key.clone());
+        let node_id = inflight_info.target_node_id.clone();
+        let node_generation = inflight_info.target_generation;
+        let key = inflight_info.key.clone();
+        let len = inflight_info.len;
+        let persist_to_ssd = inflight_info.persist_to_ssd;
+        let src_target_allocation = Arc::clone(&inflight_info.src_target_allocation);
         let Some(allocs) = src_target_allocation.lock().take() else {
             tracing::warn!(
                 "Put operation with put_id {:?} not found for completion",
@@ -779,6 +791,23 @@ pub async fn handle_put_done(
             tracing::info!("Put operation with put_id {:?} is tomb, skip", put_id);
             let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
                 detail: format!("Put operation with put_id {:?} is tomb, skip", put_id),
+            });
+            return MsgPack {
+                serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                raw_bytes: Vec::new(),
+            };
+        }
+
+        let target_generation_is_current = view
+            .cluster_manager()
+            .get_member_info_cached(node_id.as_ref())
+            .is_some_and(|member| member.node_start_time == node_generation);
+        if !target_generation_is_current {
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+                detail: format!(
+                    "Put operation with put_id {:?} targets departed or replaced node {} generation {}",
+                    put_id, node_id, node_generation
+                ),
             });
             return MsgPack {
                 serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
@@ -865,6 +894,8 @@ pub async fn handle_put_done(
         // Insert into kv_routes with replica support
         let mut old_one_kv_routes: Option<Arc<OneKvNodesRoutes>> = None;
         let mut inserted = false;
+        let mut failed_new_route: Option<Arc<OneKvNodesRoutes>> = None;
+        let replica_published;
         {
             let mut one_kv_routes = view
                 .master_kv_router()
@@ -880,11 +911,39 @@ pub async fn handle_put_done(
                 old_one_kv_routes = Some(one_kv_routes.clone());
                 *one_kv_routes = Arc::new(OneKvNodesRoutes::new(put_id, lease_id_opt));
             }
-            one_kv_routes.insert_memory_replica(
+            replica_published = view.master_kv_router().publish_memory_replica(
+                &key,
+                &one_kv_routes,
                 node_id.clone(),
-                target_allocation,
+                node_generation,
+                Arc::clone(&target_allocation),
                 tomb_tag.clone(),
             );
+            if !replica_published {
+                if let Some(old) = old_one_kv_routes.as_ref() {
+                    *one_kv_routes = Arc::clone(old);
+                } else {
+                    failed_new_route = Some(one_kv_routes.clone());
+                }
+            }
+        }
+        if let Some(failed_route) = failed_new_route {
+            view.master_kv_router()
+                .inner()
+                .kv_routes
+                .remove_if(&key, |_, current| Arc::ptr_eq(current, &failed_route));
+        }
+        if !replica_published {
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+                detail: format!(
+                    "Put operation with put_id {:?} lost member generation {} before route publication",
+                    put_id, node_generation
+                ),
+            });
+            return MsgPack {
+                serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                raw_bytes: Vec::new(),
+            };
         }
         // Publish the route before releasing admission so reject-if-exists observes either
         // the inflight reservation or the committed route, with no visibility gap.
@@ -899,6 +958,7 @@ pub async fn handle_put_done(
                 key.clone(),
                 put_id,
                 node_id.clone(),
+                node_generation,
                 len,
                 target_allocation_for_ssd,
                 cache_weight_bytes,
@@ -912,12 +972,16 @@ pub async fn handle_put_done(
                     &key,
                     put_id,
                     &node_id,
+                    node_generation,
+                    &target_allocation,
                     weight_bytes,
                 );
             }
         }
 
         if let Some(old) = old_one_kv_routes {
+            view.master_kv_router()
+                .unregister_route_replicas(&key, &old);
             if let Err(err) = view
                 .master_kv_router()
                 .inner()
@@ -943,7 +1007,9 @@ pub async fn handle_put_done(
                 if do_prefix_index_update {
                     let inner = view_task.master_kv_router().inner();
                     let mut tree = inner.prefix_index.write().await;
-                    tree.insert(&key_for_spawn);
+                    if inner.kv_routes.contains_key(&key_for_spawn) {
+                        tree.insert(&key_for_spawn);
+                    }
                 }
             });
         }

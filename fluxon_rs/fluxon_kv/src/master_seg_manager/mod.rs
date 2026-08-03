@@ -306,6 +306,13 @@ impl MasterSegManager {
         }
     }
 
+    pub fn remove_node_segments_if_tomb(&self, node_id: &NodeID) -> bool {
+        self.inner()
+            .node_allocators_and_tomb_tag
+            .remove_if(node_id, |_, segments| segments.tomb_tag.is_tomb())
+            .is_some()
+    }
+
     pub fn get_node_tomb_tag(&self, node_id: &NodeID) -> Option<NodeTombTag> {
         if let Some(allocators_and_tomb_tag) =
             self.inner().node_allocators_and_tomb_tag.get(node_id)
@@ -380,7 +387,7 @@ impl MasterSegManager {
                 node_id.clone(),
                 req,
                 Some(Duration::from_secs(30)), // 30 second timeout
-                1, // Master controls retry/backoff to validate member liveness/epoch before each attempt
+                1, // Master validates member liveness and generation before each retry.
             )
             .await
             .map_err(|e| {
@@ -434,6 +441,7 @@ impl MasterSegManager {
         self.inner()
             .node_allocators_and_tomb_tag
             .get(node_id)
+            .filter(|node_segments_manager| !node_segments_manager.tomb_tag.is_tomb())
             .map(|node_segments_manager| node_segments_manager.total_size)
             .unwrap_or(0)
     }

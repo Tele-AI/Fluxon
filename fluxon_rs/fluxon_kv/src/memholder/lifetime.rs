@@ -388,10 +388,28 @@ pub struct MasterOwnerMemMgr {
     total: AtomicUsize,
 }
 
-#[derive(Default)]
 struct MemberHoldingState {
+    generation: i64,
     departed: bool,
     by_holder_id: HashMap<u64, OwnerHoldingGetInfo>,
+}
+
+impl MemberHoldingState {
+    fn active(generation: i64) -> Self {
+        Self {
+            generation,
+            departed: false,
+            by_holder_id: HashMap::new(),
+        }
+    }
+
+    fn departed(generation: i64) -> Self {
+        Self {
+            generation,
+            departed: true,
+            by_holder_id: HashMap::new(),
+        }
+    }
 }
 
 impl MasterOwnerMemMgr {
@@ -399,9 +417,13 @@ impl MasterOwnerMemMgr {
         &self,
         key: NodeHolderKey,
         value: OwnerHoldingGetInfo,
+        generation: i64,
     ) -> bool {
-        let mut state = self.by_member.entry(key.node_id.clone()).or_default();
-        if state.departed {
+        let mut state = match self.by_member.entry(key.node_id.clone()) {
+            Entry::Occupied(state) => state.into_ref(),
+            Entry::Vacant(state) => state.insert(MemberHoldingState::active(generation)),
+        };
+        if state.departed || state.generation != generation {
             return false;
         }
         assert!(
@@ -414,19 +436,37 @@ impl MasterOwnerMemMgr {
         true
     }
 
-    pub(crate) fn mark_member_active(&self, node_id: &str) {
-        let Entry::Occupied(mut state) = self.by_member.entry(node_id.to_string()) else {
-            return;
-        };
-        if state.get().by_holder_id.is_empty() {
-            state.remove();
-        } else {
-            state.get_mut().departed = false;
+    pub(crate) fn mark_member_active(&self, node_id: &str, generation: i64) -> usize {
+        match self.by_member.entry(node_id.to_string()) {
+            Entry::Occupied(mut state) => {
+                let mut removed = 0;
+                if state.get().generation != generation {
+                    removed = state.get().by_holder_id.len();
+                    state.get_mut().by_holder_id.clear();
+                    state.get_mut().generation = generation;
+                    self.decrement_total(removed);
+                }
+                state.get_mut().departed = false;
+                removed
+            }
+            Entry::Vacant(state) => {
+                state.insert(MemberHoldingState::active(generation));
+                0
+            }
         }
     }
 
-    pub(crate) fn mark_member_left_and_cleanup(&self, node_id: &str) -> usize {
-        let mut state = self.by_member.entry(node_id.to_string()).or_default();
+    pub(crate) fn mark_member_left_and_cleanup(&self, node_id: &str, generation: i64) -> usize {
+        let mut state = match self.by_member.entry(node_id.to_string()) {
+            Entry::Occupied(state) => state.into_ref(),
+            Entry::Vacant(state) => {
+                state.insert(MemberHoldingState::departed(generation));
+                return 0;
+            }
+        };
+        if state.generation != generation {
+            return 0;
+        }
         state.departed = true;
         let removed = state.by_holder_id.len();
         state.by_holder_id.clear();
@@ -439,9 +479,6 @@ impl MasterOwnerMemMgr {
             return None;
         };
         let value = state.get_mut().by_holder_id.remove(&key.holder_id)?;
-        if state.get().by_holder_id.is_empty() && !state.get().departed {
-            state.remove();
-        }
         self.decrement_total(1);
         Some(value)
     }

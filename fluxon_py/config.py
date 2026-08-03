@@ -143,9 +143,9 @@ def _to_plain_yaml_obj(value: Any, path: str) -> Any:
 def _yaml_template():
     return """
 instance_key: xxx                      # Unique distributed instance id (str)
-protocol:                              # Transport protocol override (dict(optional))
-  protocol_type:                       # Protocol type (('tcp'|'rdma'))
-  rdma_device_names:                   # Explicit RDMA devices for protocol config (['{str}'](optional))
+network:                               # Network and transport tuning (dict(optional))
+  rdma_device_names:                   # Comma-separated RDMA device names (str(optional))
+  tcp_reactor_mode:                    # busy_poll|event_driven; defaults to busy_poll (str(optional))
 pprof_duration_seconds:                # Dump pprof flamegraph after N seconds (int(optional))
 contribute_to_cluster_pool_size:       # Capacity contributed to cluster pool (dict(optional))
   dram: 1677721600                     # - DRAM contribution (size_bytes(multiple of 16777216))
@@ -163,6 +163,7 @@ test_spec_config:                      # Test-only config overrides (dict(option
   prefer_local_placement: false        # Prefer placing new KV writes on the requester-local owner when possible (bool(optional))
   short_circuit_put_payload_path: false # Keep large put_start allocation but skip payload memcpy + transfer (bool(optional))
   skip_put_end_commit: false           # Return success after payload transfer without put_done commit; inflight_put TTL cleanup only (bool(optional))
+  protocol_type:                       # Test-only transfer protocol: tcp|rdma (str(optional))
   transport_mode:                      # transfer_only|transfer_with_rpc (str(optional))
   tcp_thread_reactor_shard_count:      # tcp_thread reactor shard count, 1..16 (int(optional))
   tcp_thread_bulk_lane_count:          # tcp_thread bulk lane count, 1..8 (int(optional))
@@ -205,6 +206,37 @@ fluxonkv_spec:                        # fluxon kv specific config (dict(optional
 """
 
 
+def _normalize_network_config(raw: Any, ctx: str) -> Optional[Dict[str, Any]]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{ctx} must be a mapping")
+
+    allowed_keys = {"rdma_device_names", "tcp_reactor_mode"}
+    unknown = sorted(set(raw.keys()) - allowed_keys)
+    if unknown:
+        raise ValueError(f"{ctx} contains unknown keys: {unknown}")
+
+    out = dict(raw)
+    rdma_device_names = raw.get("rdma_device_names")
+    if rdma_device_names is not None:
+        if not isinstance(rdma_device_names, str) or not rdma_device_names.strip():
+            raise ValueError(f"{ctx}.rdma_device_names must be a non-empty string")
+        out["rdma_device_names"] = rdma_device_names.strip()
+    tcp_reactor_mode = raw.get("tcp_reactor_mode")
+    if tcp_reactor_mode is not None:
+        if not isinstance(tcp_reactor_mode, str):
+            raise ValueError(f"{ctx}.tcp_reactor_mode must be a string")
+        allowed_tcp_reactor_modes = {"busy_poll", "event_driven"}
+        if tcp_reactor_mode not in allowed_tcp_reactor_modes:
+            raise ValueError(
+                f"{ctx}.tcp_reactor_mode must be one of "
+                f"{sorted(allowed_tcp_reactor_modes)}, got {tcp_reactor_mode!r}"
+            )
+        out["tcp_reactor_mode"] = tcp_reactor_mode
+    return out
+
+
 def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
     if raw is None:
         raw = {}
@@ -223,6 +255,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         "prefer_local_placement",
         "short_circuit_put_payload_path",
         "skip_put_end_commit",
+        "protocol_type",
         "transport_mode",
         "tcp_thread_reactor_shard_count",
         "tcp_thread_bulk_lane_count",
@@ -291,6 +324,17 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             f"{ctx}.kv_ssd_uring_mode is only valid with {ctx}.kv_ssd_storage_backend=native"
         )
 
+    protocol_type = raw.get("protocol_type")
+    if protocol_type is not None:
+        if not isinstance(protocol_type, str):
+            raise ValueError(f"{ctx}.protocol_type must be a string")
+        allowed_protocol_types = {"tcp", "rdma"}
+        if protocol_type not in allowed_protocol_types:
+            raise ValueError(
+                f"{ctx}.protocol_type must be one of {sorted(allowed_protocol_types)}, got {protocol_type!r}"
+            )
+        out["protocol_type"] = protocol_type
+
     transport_mode = raw.get("transport_mode")
     transport_mode_was_explicit = transport_mode is not None
     side_transfer_role_raw = raw.get("side_transfer_role")
@@ -322,6 +366,8 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             seen.add(trimmed)
             normalized.append(trimmed)
         out["rdma_device_names"] = sorted(normalized)
+    if out.get("protocol_type") == "tcp" and "rdma_device_names" in out:
+        raise ValueError(f"{ctx}.rdma_device_names requires {ctx}.protocol_type=rdma")
     require_transfer_rpc_fast_path_ready_timeout_seconds = raw.get(
         "require_transfer_rpc_fast_path_ready_timeout_seconds"
     )
@@ -341,7 +387,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             raise ValueError(
                 f"{ctx}.require_transfer_rpc_fast_path_ready_timeout_seconds requires {ctx}.transport_mode=transfer_with_rpc"
             )
-        if "rdma_device_names" not in out:
+        if out.get("protocol_type") != "tcp" and "rdma_device_names" not in out:
             raise ValueError(
                 f"{ctx}.require_transfer_rpc_fast_path_ready_timeout_seconds requires explicit {ctx}.rdma_device_names"
             )
@@ -403,10 +449,18 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         out["side_transfer_role"] = side_transfer_role
 
     if out.get("side_transfer_role") == "worker":
-        if "rdma_device_names" in out and not transport_mode_was_explicit:
-            raise ValueError(f"{ctx}.rdma_device_names requires {ctx}.transport_mode")
+        for field_name in ("protocol_type", "rdma_device_names"):
+            if field_name not in out:
+                continue
+            raise ValueError(
+                f"{ctx}.{field_name} is not valid for side-transfer workers; their protocol is derived from the worker role"
+            )
 
-    if transport_mode_was_explicit and "rdma_device_names" not in out:
+    if (
+        transport_mode_was_explicit
+        and out.get("protocol_type") != "tcp"
+        and "rdma_device_names" not in out
+    ):
         raise ValueError(
             f"explicit {ctx}.transport_mode now requires {ctx}.rdma_device_names to avoid implicit RDMA device selection"
         )
@@ -554,6 +608,8 @@ class FluxonKvClientConfig():
 
         _verify_config_by_template(plain)
 
+        if "network" in plain:
+            plain["network"] = _normalize_network_config(plain.get("network"), "network")
         plain["test_spec_config"] = _normalize_test_spec_config(
             plain.get("test_spec_config"), "test_spec_config"
         )
@@ -597,23 +653,19 @@ class FluxonKvClientConfig():
     @property
     def contribute_to_cluster_pool_size(self):
         return self.config_dict["contribute_to_cluster_pool_size"]
+
+    @property
+    def test_spec_protocol_type(self) -> str:
+        test_spec_config = self.config_dict.get("test_spec_config") or {}
+        return str(test_spec_config.get("protocol_type", "rdma"))
     
     @property
-    def protocol_type(self):
-        protocol = self.config_dict.get("protocol")
-        if isinstance(protocol, dict):
-            protocol_type = protocol.get("protocol_type")
-            if isinstance(protocol_type, str) and protocol_type:
-                return protocol_type
-        return "rdma"
-    
-    @property
-    def protocol_rdma_device_names(self):
-        protocol = self.config_dict.get("protocol")
-        if isinstance(protocol, dict):
-            raw = protocol.get("rdma_device_names")
-            if isinstance(raw, list) and raw:
-                return ",".join(str(device) for device in raw)
+    def network_rdma_device_names(self):
+        network = self.config_dict.get("network")
+        if isinstance(network, dict):
+            raw = network.get("rdma_device_names")
+            if isinstance(raw, str) and raw:
+                return raw
         test_spec_config = self.config_dict.get("test_spec_config") or {}
         devices = test_spec_config.get("rdma_device_names")
         if not devices:
