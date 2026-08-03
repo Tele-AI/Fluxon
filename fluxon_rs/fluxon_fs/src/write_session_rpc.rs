@@ -9,7 +9,6 @@ use prost::bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::runtime::Handle;
 
 pub const FS_WRITE_SESSION_CHUNK_REQ_MSG_ID: u32 = 7101;
 pub const FS_WRITE_SESSION_CHUNK_RESP_MSG_ID: u32 = 7102;
@@ -64,12 +63,11 @@ fn write_session_trace_now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-fn spawn_on_runtime_handle<F>(rt_handle: &Handle, fut: F)
+fn spawn_on_fs_framework<F>(framework: &crate::Framework, fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let _guard = rt_handle.enter();
-    rt_handle.spawn(fut);
+    let _ = framework.spawn_registered_boxed("write_session_rpc", Box::pin(fut));
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Encode, Decode)]
@@ -394,7 +392,7 @@ pub fn register_callers(fw: &KvFramework) {
     RPCCaller::<FsWriteSessionDataRefFrame>::new().regist(fw.p2p_view().p2p_module());
 }
 
-pub fn register_chunk_handler<F>(fw: &KvFramework, rt_handle: Handle, handler: F)
+pub fn register_chunk_handler<F>(fw: &KvFramework, lifecycle: crate::Framework, handler: F)
 where
     F: Fn(NodeID, FsWriteSessionChunkReq, Vec<u8>) -> FsWriteSessionChunkResp
         + Send
@@ -402,12 +400,11 @@ where
         + 'static,
 {
     let handler = Arc::new(handler);
-    let rt_handle = Arc::new(rt_handle);
     RPCHandler::<FsWriteSessionChunkReq>::new().regist(
         fw.p2p_view().p2p_module(),
         move |resp, msg| {
             let handler = handler.clone();
-            let rt_handle = rt_handle.clone();
+            let lifecycle = lifecycle.clone();
             let payload = msg
                 .raw_bytes
                 .first()
@@ -415,7 +412,7 @@ where
                 .unwrap_or_default();
             let req = msg.serialize_part;
             let from_node = resp.node_id();
-            spawn_on_runtime_handle(&rt_handle, async move {
+            spawn_on_fs_framework(&lifecycle, async move {
                 let response = match spawn_blocking_allow_sync_async_bridge(move || {
                     handler(from_node, req, payload)
                 })
@@ -448,20 +445,19 @@ where
     );
 }
 
-pub fn register_open_handler<F>(fw: &KvFramework, rt_handle: Handle, handler: F)
+pub fn register_open_handler<F>(fw: &KvFramework, lifecycle: crate::Framework, handler: F)
 where
     F: Fn(NodeID, FsOpenWriteSessionReq) -> FsOpenWriteSessionResp + Send + Sync + 'static,
 {
     let handler = Arc::new(handler);
-    let rt_handle = Arc::new(rt_handle);
     RPCHandler::<FsOpenWriteSessionReq>::new().regist(
         fw.p2p_view().p2p_module(),
         move |resp, msg| {
             let handler = handler.clone();
-            let rt_handle = rt_handle.clone();
+            let lifecycle = lifecycle.clone();
             let req = msg.serialize_part;
             let from_node = resp.node_id();
-            spawn_on_runtime_handle(&rt_handle, async move {
+            spawn_on_fs_framework(&lifecycle, async move {
                 let response =
                     match spawn_blocking_allow_sync_async_bridge(move || handler(from_node, req))
                         .await
@@ -498,17 +494,19 @@ fn open_handler_panic_response(err: String) -> FsOpenWriteSessionResp {
     }
 }
 
-pub fn register_put_small_object_handler<F>(fw: &KvFramework, rt_handle: Handle, handler: F)
-where
+pub fn register_put_small_object_handler<F>(
+    fw: &KvFramework,
+    lifecycle: crate::Framework,
+    handler: F,
+) where
     F: Fn(NodeID, FsPutSmallObjectReq, Bytes) -> FsPutSmallObjectResp + Send + Sync + 'static,
 {
     let handler = Arc::new(handler);
-    let rt_handle = Arc::new(rt_handle);
     RPCHandler::<FsPutSmallObjectReq>::new().regist(
         fw.p2p_view().p2p_module(),
         move |resp, msg| {
             let handler = handler.clone();
-            let rt_handle = rt_handle.clone();
+            let lifecycle = lifecycle.clone();
             let payload = if msg.raw_bytes.len() == 1 {
                 msg.raw_bytes.first().cloned()
             } else {
@@ -516,7 +514,7 @@ where
             };
             let req = msg.serialize_part;
             let from_node = resp.node_id();
-            spawn_on_runtime_handle(&rt_handle, async move {
+            spawn_on_fs_framework(&lifecycle, async move {
                 let response = match payload {
                     Some(payload) => {
                         match spawn_blocking_allow_sync_async_bridge(move || {
@@ -563,20 +561,19 @@ where
     );
 }
 
-pub fn register_close_handler<F>(fw: &KvFramework, rt_handle: Handle, handler: F)
+pub fn register_close_handler<F>(fw: &KvFramework, lifecycle: crate::Framework, handler: F)
 where
     F: Fn(NodeID, FsCloseWriteSessionReq) -> FsCloseWriteSessionResp + Send + Sync + 'static,
 {
     let handler = Arc::new(handler);
-    let rt_handle = Arc::new(rt_handle);
     RPCHandler::<FsCloseWriteSessionReq>::new().regist(
         fw.p2p_view().p2p_module(),
         move |resp, msg| {
             let handler = handler.clone();
-            let rt_handle = rt_handle.clone();
+            let lifecycle = lifecycle.clone();
             let req = msg.serialize_part;
             let from_node = resp.node_id();
-            spawn_on_runtime_handle(&rt_handle, async move {
+            spawn_on_fs_framework(&lifecycle, async move {
                 let response =
                     match spawn_blocking_allow_sync_async_bridge(move || handler(from_node, req))
                         .await
@@ -610,20 +607,19 @@ where
     );
 }
 
-pub fn register_finalize_handler<F>(fw: &KvFramework, rt_handle: Handle, handler: F)
+pub fn register_finalize_handler<F>(fw: &KvFramework, lifecycle: crate::Framework, handler: F)
 where
     F: Fn(NodeID, FsFinalizeWriteSessionReq) -> FsFinalizeWriteSessionResp + Send + Sync + 'static,
 {
     let handler = Arc::new(handler);
-    let rt_handle = Arc::new(rt_handle);
     RPCHandler::<FsFinalizeWriteSessionReq>::new().regist(
         fw.p2p_view().p2p_module(),
         move |resp, msg| {
             let handler = handler.clone();
-            let rt_handle = rt_handle.clone();
+            let lifecycle = lifecycle.clone();
             let req = msg.serialize_part;
             let from_node = resp.node_id();
-            spawn_on_runtime_handle(&rt_handle, async move {
+            spawn_on_fs_framework(&lifecycle, async move {
                 let response =
                     match spawn_blocking_allow_sync_async_bridge(move || handler(from_node, req))
                         .await
@@ -657,20 +653,19 @@ where
     );
 }
 
-pub fn register_abort_handler<F>(fw: &KvFramework, rt_handle: Handle, handler: F)
+pub fn register_abort_handler<F>(fw: &KvFramework, lifecycle: crate::Framework, handler: F)
 where
     F: Fn(NodeID, FsAbortWriteSessionReq) -> FsAbortWriteSessionResp + Send + Sync + 'static,
 {
     let handler = Arc::new(handler);
-    let rt_handle = Arc::new(rt_handle);
     RPCHandler::<FsAbortWriteSessionReq>::new().regist(
         fw.p2p_view().p2p_module(),
         move |resp, msg| {
             let handler = handler.clone();
-            let rt_handle = rt_handle.clone();
+            let lifecycle = lifecycle.clone();
             let req = msg.serialize_part;
             let from_node = resp.node_id();
-            spawn_on_runtime_handle(&rt_handle, async move {
+            spawn_on_fs_framework(&lifecycle, async move {
                 let response =
                     match spawn_blocking_allow_sync_async_bridge(move || handler(from_node, req))
                         .await
@@ -702,7 +697,7 @@ where
     );
 }
 
-pub fn register_wait_payloads_handler<F>(fw: &KvFramework, rt_handle: Handle, handler: F)
+pub fn register_wait_payloads_handler<F>(fw: &KvFramework, lifecycle: crate::Framework, handler: F)
 where
     F: Fn(NodeID, FsWaitWriteSessionPayloadsReq) -> FsWaitWriteSessionPayloadsResp
         + Send
@@ -710,15 +705,14 @@ where
         + 'static,
 {
     let handler = Arc::new(handler);
-    let rt_handle = Arc::new(rt_handle);
     RPCHandler::<FsWaitWriteSessionPayloadsReq>::new().regist(
         fw.p2p_view().p2p_module(),
         move |resp, msg| {
             let handler = handler.clone();
-            let rt_handle = rt_handle.clone();
+            let lifecycle = lifecycle.clone();
             let req = msg.serialize_part;
             let from_node = resp.node_id();
-            spawn_on_runtime_handle(&rt_handle, async move {
+            spawn_on_fs_framework(&lifecycle, async move {
                 let response =
                     match spawn_blocking_allow_sync_async_bridge(move || handler(from_node, req))
                         .await
@@ -750,7 +744,7 @@ where
     );
 }
 
-pub fn register_data_handler<F>(fw: &KvFramework, rt_handle: Handle, handler: F)
+pub fn register_data_handler<F>(fw: &KvFramework, lifecycle: crate::Framework, handler: F)
 where
     F: Fn(NodeID, FsWriteSessionDataFrame, Vec<Bytes>) -> FsWriteSessionDataAck
         + Send
@@ -758,16 +752,15 @@ where
         + 'static,
 {
     let handler = Arc::new(handler);
-    let rt_handle = Arc::new(rt_handle);
     RPCHandler::<FsWriteSessionDataFrame>::new().regist(
         fw.p2p_view().p2p_module(),
         move |resp, msg| {
             let handler = handler.clone();
-            let rt_handle = rt_handle.clone();
+            let lifecycle = lifecycle.clone();
             let payloads = msg.raw_bytes;
             let req = msg.serialize_part;
             let from_node = resp.node_id();
-            spawn_on_runtime_handle(&rt_handle, async move {
+            spawn_on_fs_framework(&lifecycle, async move {
                 let payload_frame_count = payloads.len() as u64;
                 let session_id = req.session_id.clone();
                 let seq_no = req.seq_no;
@@ -804,25 +797,24 @@ where
     );
 }
 
-pub fn register_data_ref_handler<F, Fut>(fw: &KvFramework, rt_handle: Handle, handler: F)
+pub fn register_data_ref_handler<F, Fut>(fw: &KvFramework, lifecycle: crate::Framework, handler: F)
 where
     F: Fn(NodeID, FsWriteSessionDataRefFrame) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = FsWriteSessionDataAck> + Send + 'static,
 {
     let handler = Arc::new(handler);
-    let rt_handle = Arc::new(rt_handle);
     RPCHandler::<FsWriteSessionDataRefFrame>::new().regist(
         fw.p2p_view().p2p_module(),
         move |resp, msg| {
             let handler = handler.clone();
-            let rt_handle = rt_handle.clone();
+            let lifecycle = lifecycle.clone();
             let has_raw_bytes = !msg.raw_bytes.is_empty();
             let req = msg.serialize_part;
             let session_id = req.session_id.clone();
             let seq_no = req.seq_no;
             let frame_count = req.part_lengths.len() as u64;
             let from_node = resp.node_id();
-            spawn_on_runtime_handle(&rt_handle, async move {
+            spawn_on_fs_framework(&lifecycle, async move {
                 let response = if has_raw_bytes {
                     FsWriteSessionDataAck {
                         session_id,

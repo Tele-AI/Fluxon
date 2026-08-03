@@ -257,10 +257,32 @@ macro_rules! define_framework {
     ($first:ident: $first_type:ty $(, $rest:ident: $rest_type:ty)*) => {
         paste::paste! {
             // expand the modules
+            #[derive(Default)]
+            struct FrameworkShutdownProgress {
+                pre_shutdown_complete: bool,
+                [<$first _prepare_shutdown_complete>]: bool,
+                $(
+                    [<$rest _prepare_shutdown_complete>]: bool,
+                )*
+                shutdown_signal_published: bool,
+                [<$first _before_shutdown_complete>]: bool,
+                $(
+                    [<$rest _before_shutdown_complete>]: bool,
+                )*
+                [<$first _shutdown_complete>]: bool,
+                $(
+                    [<$rest _shutdown_complete>]: bool,
+                )*
+                pending_task_registry: Option<fluxon_framework_compiled::task_registry::TaskRegistryHandle>,
+                task_registry_joined: bool,
+                complete: bool,
+            }
+
             pub struct FrameworkInner {
                 name: String,
-                shutdown_notifier: fluxon_framework_compiled::shutdown::ShutdownNotifier,
+                pre_shutdown: fluxon_framework_compiled::shutdown::PreShutdownBarrier,
                 shutdown_poller: fluxon_framework_compiled::shutdown::ShutdownPoller,
+                shutdown_progress: ::tokio::sync::Mutex<FrameworkShutdownProgress>,
                 init0_stage_done: std::sync::atomic::AtomicBool,
                 async_panic_sender: fluxon_framework_compiled::async_panic::AsyncPanicSend,
                 async_panic_receiver: parking_lot::Mutex<Option<fluxon_framework_compiled::async_panic::AsyncPanicRecv>>,
@@ -296,8 +318,11 @@ macro_rules! define_framework {
                         .expect("Framework::new() must be called from within a Tokio runtime");
                     let inner = FrameworkInner{
                         name,
-                        shutdown_notifier: fluxon_framework_compiled::shutdown::ShutdownNotifier::new(),
+                        pre_shutdown: fluxon_framework_compiled::shutdown::PreShutdownBarrier::new(),
                         shutdown_poller: fluxon_framework_compiled::shutdown::ShutdownPoller::new(),
+                        shutdown_progress: ::tokio::sync::Mutex::new(
+                            FrameworkShutdownProgress::default(),
+                        ),
                         init0_stage_done: std::sync::atomic::AtomicBool::new(false),
                         async_panic_sender,
                         async_panic_receiver: parking_lot::Mutex::new(Some(async_panic_receiver)),
@@ -320,11 +345,46 @@ macro_rules! define_framework {
                     &self.0.name
                 }
 
+                /// Spawn one framework-owned task while task admission is still open.
+                ///
+                /// The registry read lock makes admission atomic with the final registry take in
+                /// `shutdown()`: every accepted task is either joined by that shutdown or is not
+                /// spawned at all.
+                pub fn spawn_registered_boxed(
+                    &self,
+                    name: impl Into<String>,
+                    future: std::pin::Pin<
+                        Box<dyn std::future::Future<Output = ()> + Send + 'static>,
+                    >,
+                ) -> bool {
+                    let task_registry_handle = self.0.task_registry_handle.read();
+                    let Some(task_registry_handle) = task_registry_handle.as_ref() else {
+                        return false;
+                    };
+                    if !self.0.shutdown_poller.is_running() {
+                        return false;
+                    }
+                    let handle = self.0.runtime_handle.spawn(future);
+                    task_registry_handle.register(name.into(), handle);
+                    true
+                }
+
+                /// Register one dependent framework that must close before module shutdown starts.
+                pub fn register_pre_shutdown(
+                    &self,
+                    name: impl Into<String>,
+                ) -> Result<
+                    fluxon_framework_compiled::shutdown::PreShutdownParticipant,
+                    fluxon_framework_compiled::shutdown::PreShutdownError,
+                > {
+                    self.0.pre_shutdown.register(name)
+                }
+
                 pub async fn wait_shutdown_signal(&self) {
                     use limit_thirdparty::tokio;
                     let mut async_panic_receiver = self.0.async_panic_receiver.lock().take().expect(
                         "wait_shutdown_signal is deigned to call by only main thread or monitor thread, and should be called only once");
-                    let mut shutdown_waiter = self.0.shutdown_notifier.listen();
+                    let mut shutdown_waiter = self.0.shutdown_poller.waiter();
                     let mut term_receiver=tokio::signal::unix_signal_only_allow_use_by_framework(tokio::signal::unix::SignalKind::terminate()).unwrap();
                     tokio::select!{
                         _ = shutdown_waiter.wait() => {
@@ -377,7 +437,7 @@ macro_rules! define_framework {
 
             impl fluxon_framework_compiled::shutdown::ViewShutdownExt for FrameworkInner {
                 fn register_shutdown_waiter(&self) -> fluxon_framework_compiled::shutdown::ShutdownWaiter {
-                    self.shutdown_notifier.listen()
+                    self.shutdown_poller.waiter()
                 }
 
                 fn register_shutdown_poller(&self) -> fluxon_framework_compiled::shutdown::ShutdownPoller {
@@ -593,78 +653,132 @@ macro_rules! define_framework {
 	                    }
 	                )*
 
-	                /// Broadcast shutdown to background tasks without waiting for joins.
+	                /// Publish shutdown intent without waiting for joins.
 	                ///
 	                /// English note:
 	                /// - This is designed for "best-effort" cleanup in FFI / Drop paths where blocking is unsafe.
+	                /// - When dependents exist, only their pre-shutdown request is published here;
+	                ///   the parent signal remains open until graceful `shutdown()` receives every ACK.
 	                /// - For a graceful shutdown with module joins, use `shutdown().await`.
 	                pub fn request_shutdown(&self) {
-	                    self.0.shutdown_notifier.shutdown();
-	                    self.0.shutdown_poller.shutdown();
+	                    if self.0.pre_shutdown.request() {
+	                        self.0.shutdown_poller.shutdown();
+	                    }
 	                }
 
-	                pub async fn shutdown(&self) -> AnyResult<()> {
-	                    tracing::info!(framework=%self.name(), "shutdown begin");
+                    /// Close dependent admission and publish pre-shutdown without stopping this
+                    /// framework's own services. The graceful shutdown owner uses this to give
+                    /// dependents an immediate, race-free head start on cleanup.
+                    pub fn request_pre_shutdown(&self) {
+                        let _ = self.0.pre_shutdown.request();
+                    }
 
-                    // Only shut down modules that were actually constructed in the selected init-DAG variant.
-                    //
-                    // Rationale: with tag/variant-based init DAG, a Framework type may contain modules that are
-                    // intentionally absent (OnceLock unset) for a given runtime role.
-                    // First stop module-local admission, quiesce work, and release dependents while shared
-                    // framework services such as P2P are still available.
-                    if let Some(m) = self.0.[<$first_type:snake>].get() {
-                        m.prepare_shutdown()
+                pub async fn shutdown(&self) -> AnyResult<()> {
+                    // One owner advances the persisted shutdown phases. A failed attempt releases
+                    // this lock without clearing progress, so the next call resumes at the first
+                    // incomplete hook.
+                    let mut progress = self.0.shutdown_progress.lock().await;
+                    if progress.complete {
+                        return Ok(());
+                    }
+
+                    tracing::info!(framework=%self.name(), "shutdown begin");
+
+                    // Dependents may still need live module services while releasing their own
+                    // resources. Their acknowledged pre-shutdown barrier therefore precedes every
+                    // module prepare/final shutdown hook in this framework.
+                    if !progress.pre_shutdown_complete {
+                        self.0
+                            .pre_shutdown
+                            .request_and_wait()
                             .await
                             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                        progress.pre_shutdown_complete = true;
                     }
-                    $(
-                        if let Some(m) = self.0.[<$rest_type:snake>].get() {
+
+                    // Only shut down modules that were actually constructed in the selected init-DAG variant.
+                    // First stop module-local admission, quiesce work, and release dependents while shared
+                    // framework services such as P2P are still available.
+                    if !progress.[<$first _prepare_shutdown_complete>] {
+                        if let Some(m) = self.0.[<$first_type:snake>].get() {
                             m.prepare_shutdown()
                                 .await
                                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                        }
+                        progress.[<$first _prepare_shutdown_complete>] = true;
+                    }
+                    $(
+                        if !progress.[<$rest _prepare_shutdown_complete>] {
+                            if let Some(m) = self.0.[<$rest_type:snake>].get() {
+                                m.prepare_shutdown()
+                                    .await
+                                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                            }
+                            progress.[<$rest _prepare_shutdown_complete>] = true;
                         }
                     )*
 
                     // Then wake or cancel shared background work. Module before_shutdown hooks run after
                     // this transition; final module shutdown releases the remaining dependencies.
-	                    self.0.shutdown_notifier.shutdown();
-                    self.0.shutdown_poller.shutdown();
-
-                    if let Some(m) = self.0.[<$first_type:snake>].get() {
-                        m.before_shutdown()
-                            .await
-                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    if !progress.shutdown_signal_published {
+                        self.0.shutdown_poller.shutdown();
+                        progress.shutdown_signal_published = true;
                     }
-                    $(
-                        if let Some(m) = self.0.[<$rest_type:snake>].get() {
+
+                    if !progress.[<$first _before_shutdown_complete>] {
+                        if let Some(m) = self.0.[<$first_type:snake>].get() {
                             m.before_shutdown()
                                 .await
                                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                         }
-                    )*
-
-
-                    // Then run final shutdown for each module.
-                    if let Some(m) = self.0.[<$first_type:snake>].get() {
-                        m.shutdown()
-                            .await
-                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                        progress.[<$first _before_shutdown_complete>] = true;
                     }
                     $(
-                        if let Some(m) = self.0.[<$rest_type:snake>].get() {
+                        if !progress.[<$rest _before_shutdown_complete>] {
+                            if let Some(m) = self.0.[<$rest_type:snake>].get() {
+                                m.before_shutdown()
+                                    .await
+                                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                            }
+                            progress.[<$rest _before_shutdown_complete>] = true;
+                        }
+                    )*
+
+                    // Run final shutdown once for each module. A successful hook is never invoked
+                    // again even if a later module fails.
+                    if !progress.[<$first _shutdown_complete>] {
+                        if let Some(m) = self.0.[<$first_type:snake>].get() {
                             m.shutdown()
                                 .await
                                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                         }
+                        progress.[<$first _shutdown_complete>] = true;
+                    }
+                    $(
+                        if !progress.[<$rest _shutdown_complete>] {
+                            if let Some(m) = self.0.[<$rest_type:snake>].get() {
+                                m.shutdown()
+                                    .await
+                                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                            }
+                            progress.[<$rest _shutdown_complete>] = true;
+                        }
                     )*
 
-                    // Task registry completed joining; no per-task join needed here.
-                    // Ask task registry to stop and join tasks internally (actor-style ack).
-                    let task_registry_handle = { self.0.task_registry_handle.write().take() };
-                    if let Some(h) = task_registry_handle {
-                        h.stop_and_join().await;
+                    // Transfer the registry into persisted progress before awaiting its completion.
+                    // Cancellation therefore cannot discard the remaining task JoinHandles.
+                    if !progress.task_registry_joined {
+                        if progress.pending_task_registry.is_none() {
+                            progress.pending_task_registry = self.0.task_registry_handle.write().take();
+                        }
+                        if let Some(handle) = progress.pending_task_registry.as_ref() {
+                            handle.stop_and_join().await;
+                        }
+                        progress.pending_task_registry = None;
+                        progress.task_registry_joined = true;
                     }
 
+                    progress.complete = true;
                     let banner = format!(
                         "\n===============================================\n\
 ||                                           ||\n\
@@ -676,7 +790,6 @@ macro_rules! define_framework {
                         self.name(),
                     );
                     tracing::info!("{banner}");
-
 
                     Ok(())
                 }
@@ -710,8 +823,10 @@ macro_rules! define_framework {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::tokio::spawn;
     use fluxon_framework_compiled::shutdown::{ShutdownPoller, ViewShutdownExt};
     use limit_thirdparty::tokio;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Mutex, OnceLock};
     use thiserror::Error;
 
@@ -731,6 +846,8 @@ mod tests {
         _phantom: std::marker::PhantomData<()>,
         pub initialized: Mutex<bool>,
         pub shutdown: Mutex<bool>,
+        pub shutdown_calls: AtomicUsize,
+        pub fail_shutdown_once: AtomicBool,
     }
 
     #[async_trait]
@@ -744,6 +861,12 @@ mod tests {
         }
 
         async fn shutdown(&self) -> Result<(), Self::Error> {
+            self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_shutdown_once.swap(false, Ordering::SeqCst) {
+                return Err(TestModuleError::ShutdownFailed {
+                    reason: "injected shutdown failure".to_string(),
+                });
+            }
             *self.shutdown.lock().unwrap() = true;
             Ok(())
         }
@@ -757,6 +880,7 @@ mod tests {
         pub initialized: Mutex<bool>,
         pub prepared_while_running: Mutex<Option<bool>>,
         pub shutdown: Mutex<bool>,
+        pub shutdown_calls: AtomicUsize,
         shutdown_poller: OnceLock<ShutdownPoller>,
     }
 
@@ -787,6 +911,7 @@ mod tests {
         }
 
         async fn shutdown(&self) -> Result<(), Self::Error> {
+            self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
             *self.shutdown.lock().unwrap() = true;
             Ok(())
         }
@@ -830,12 +955,15 @@ mod tests {
             initialized: Mutex::new(true),
             prepared_while_running: Mutex::new(None),
             shutdown: Mutex::new(false),
+            shutdown_calls: AtomicUsize::new(0),
             shutdown_poller: OnceLock::new(),
         }));
         fw.init_set_test_module_b(std::sync::Arc::new(TestModuleB {
             _phantom: std::marker::PhantomData,
             initialized: Mutex::new(true),
             shutdown: Mutex::new(false),
+            shutdown_calls: AtomicUsize::new(0),
+            fail_shutdown_once: AtomicBool::new(false),
         }));
         fw.init_attach_views();
         //println!("Initialized framework");
@@ -866,5 +994,202 @@ mod tests {
             *view.test_module_a().prepared_while_running.lock().unwrap(),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn pre_shutdown_ack_precedes_module_prepare_shutdown() {
+        let fw = Framework::new("fluxon_framework.pre_shutdown_order");
+        fw.init_set_resource_registry(ResourceRegistry::new(0));
+        fw.init_set_test_module_a(std::sync::Arc::new(TestModuleA {
+            _phantom: std::marker::PhantomData,
+            initialized: Mutex::new(true),
+            prepared_while_running: Mutex::new(None),
+            shutdown: Mutex::new(false),
+            shutdown_calls: AtomicUsize::new(0),
+            shutdown_poller: OnceLock::new(),
+        }));
+        fw.init_set_test_module_b(std::sync::Arc::new(TestModuleB {
+            _phantom: std::marker::PhantomData,
+            initialized: Mutex::new(true),
+            shutdown: Mutex::new(false),
+            shutdown_calls: AtomicUsize::new(0),
+            fail_shutdown_once: AtomicBool::new(false),
+        }));
+        fw.init_attach_views();
+
+        let mut fs_participant = fw
+            .register_pre_shutdown("fs dependent")
+            .expect("register FS pre-shutdown participant");
+        let parent_poller = fw.register_shutdown_poller();
+        fw.request_shutdown();
+        assert!(
+            parent_poller.is_running(),
+            "parent services must remain available until the dependent ACK"
+        );
+        let shutdown_fw = fw.clone();
+        let shutdown = spawn(async move { shutdown_fw.shutdown().await });
+
+        fs_participant
+            .wait_requested()
+            .await
+            .expect("receive KV pre-shutdown request");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *fw.a_view()
+                .test_module_a()
+                .prepared_while_running
+                .lock()
+                .unwrap(),
+            None,
+            "module prepare_shutdown must wait for every dependent ACK"
+        );
+
+        fs_participant.finish();
+        shutdown
+            .await
+            .expect("framework shutdown task")
+            .expect("framework shutdown result");
+        assert!(!parent_poller.is_running());
+        assert_eq!(
+            *fw.a_view()
+                .test_module_a()
+                .prepared_while_running
+                .lock()
+                .unwrap(),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_shutdown_request_closes_admission_without_stopping_parent() {
+        let fw = Framework::new("fluxon_framework.pre_shutdown_request");
+        let parent_poller = fw.register_shutdown_poller();
+
+        fw.request_pre_shutdown();
+
+        assert!(parent_poller.is_running());
+        assert!(fw.register_pre_shutdown("late dependent").is_err());
+        fw.shutdown().await.expect("finish framework shutdown");
+        assert!(!parent_poller.is_running());
+    }
+
+    #[tokio::test]
+    async fn shutdown_retry_resumes_at_first_incomplete_module() {
+        let fw = Framework::new("fluxon_framework.shutdown_retry");
+        fw.init_set_resource_registry(ResourceRegistry::new(0));
+        let module_a = std::sync::Arc::new(TestModuleA {
+            _phantom: std::marker::PhantomData,
+            initialized: Mutex::new(true),
+            prepared_while_running: Mutex::new(None),
+            shutdown: Mutex::new(false),
+            shutdown_calls: AtomicUsize::new(0),
+            shutdown_poller: OnceLock::new(),
+        });
+        let module_b = std::sync::Arc::new(TestModuleB {
+            _phantom: std::marker::PhantomData,
+            initialized: Mutex::new(true),
+            shutdown: Mutex::new(false),
+            shutdown_calls: AtomicUsize::new(0),
+            fail_shutdown_once: AtomicBool::new(true),
+        });
+        fw.init_set_test_module_a(module_a.clone());
+        fw.init_set_test_module_b(module_b.clone());
+        fw.init_attach_views();
+
+        let first_error = fw
+            .shutdown()
+            .await
+            .expect_err("second module must fail its first shutdown attempt");
+        assert!(
+            first_error
+                .to_string()
+                .contains("injected shutdown failure")
+        );
+        assert_eq!(module_a.shutdown_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(module_b.shutdown_calls.load(Ordering::SeqCst), 1);
+
+        fw.shutdown()
+            .await
+            .expect("retry must finish the incomplete module");
+        fw.shutdown()
+            .await
+            .expect("completed shutdown must be idempotent");
+
+        assert_eq!(module_a.shutdown_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(module_b.shutdown_calls.load(Ordering::SeqCst), 2);
+        assert!(*module_b.shutdown.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_join_retains_completion_authority_for_retry() {
+        let fw = Framework::new("fluxon_framework.cancelled_task_join");
+        fw.init_set_resource_registry(ResourceRegistry::new(0));
+        let module_a = std::sync::Arc::new(TestModuleA {
+            _phantom: std::marker::PhantomData,
+            initialized: Mutex::new(true),
+            prepared_while_running: Mutex::new(None),
+            shutdown: Mutex::new(false),
+            shutdown_calls: AtomicUsize::new(0),
+            shutdown_poller: OnceLock::new(),
+        });
+        let module_b = std::sync::Arc::new(TestModuleB {
+            _phantom: std::marker::PhantomData,
+            initialized: Mutex::new(true),
+            shutdown: Mutex::new(false),
+            shutdown_calls: AtomicUsize::new(0),
+            fail_shutdown_once: AtomicBool::new(false),
+        });
+        fw.init_set_test_module_a(module_a.clone());
+        fw.init_set_test_module_b(module_b.clone());
+        fw.init_attach_views();
+
+        let (worker_started_tx, worker_started_rx) = ::tokio::sync::oneshot::channel();
+        let (release_worker_tx, release_worker_rx) = ::tokio::sync::oneshot::channel();
+        assert!(fw.spawn_registered_boxed(
+            "blocked shutdown worker",
+            Box::pin(async move {
+                let _ = worker_started_tx.send(());
+                let _ = release_worker_rx.await;
+            }),
+        ));
+        worker_started_rx.await.expect("worker must start");
+
+        let first_shutdown_fw = fw.clone();
+        let first_shutdown = spawn(async move { first_shutdown_fw.shutdown().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !*module_b.shutdown.lock().unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first shutdown must reach task joining");
+        tokio::task::yield_now().await;
+        first_shutdown.abort();
+        assert!(
+            first_shutdown
+                .await
+                .expect_err("first shutdown task must be cancelled")
+                .is_cancelled()
+        );
+
+        let retry_fw = fw.clone();
+        let mut retry = spawn(async move { retry_fw.shutdown().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut retry)
+                .await
+                .is_err(),
+            "retry must preserve the original task completion barrier"
+        );
+        release_worker_tx
+            .send(())
+            .expect("release registered shutdown worker");
+        tokio::time::timeout(std::time::Duration::from_secs(1), retry)
+            .await
+            .expect("retry must finish after the worker exits")
+            .expect("retry shutdown task")
+            .expect("retry shutdown result");
+
+        assert_eq!(module_a.shutdown_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(module_b.shutdown_calls.load(Ordering::SeqCst), 1);
     }
 }

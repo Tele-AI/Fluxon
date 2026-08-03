@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::slice;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 
 use bytes::Bytes;
@@ -38,6 +37,7 @@ use fluxon_util::run_async_from_sync::{SyncAsyncBridge, borrow_stable_owner};
 use fluxon_util::{
     FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
 };
+use parking_lot::Mutex;
 use pyo3::exceptions::{
     PyKeyboardInterrupt, PyOSError, PyPermissionError, PyRuntimeError, PyValueError,
 };
@@ -478,25 +478,14 @@ fn fluxon_fs_register_master(client: &KvClient, config_yaml: String, py: Python)
 #[pyfunction]
 fn fluxon_fs_register_agent(client: &KvClient, cache_yaml: String, py: Python) -> PyObject {
     fn inner(client: &KvClient, cache_yaml: String, py: Python) -> ApiResult<PyObject> {
-        if let Err(e) = ensure_fluxon_fs_external_client(client) {
-            return ApiResult::new_error(new_invalid_argument_error(py, &format!("{}", e)));
-        }
         let schema_version = FLUXON_FS_CONTROL_SCHEMA_VERSION;
-
-        let runtime = match client.runtime.as_ref() {
-            Some(v) => v.handle().clone(),
-            None => {
-                return ApiResult::new_error(new_invalid_argument_error(
-                    py,
-                    "KvClient runtime is missing",
-                ));
+        let context = match new_fluxon_fs_context(client) {
+            Ok(context) => context,
+            Err(err) => {
+                return ApiResult::new_error(new_invalid_argument_error(py, &err.to_string()));
             }
         };
-        let framework = match require_kv_framework_api(client, py) {
-            Ok(v) => v,
-            Err(e) => return ApiResult::new_error(e),
-        };
-        let api = match FluxonUserApi::new(framework, runtime) {
+        let api = match FluxonUserApi::new(context.kv_framework.clone(), context.runtime.clone()) {
             Ok(v) => v,
             Err(e) => {
                 let err_obj = crate::error::py_error_from_kv_error(py, &e, "UserRpc init failed");
@@ -514,11 +503,24 @@ fn fluxon_fs_register_agent(client: &KvClient, cache_yaml: String, py: Python) -
             }
         };
 
-        let reg = fluxon_fs::agent_service::register_agent(Arc::new(api), &cfg, schema_version);
-        if let Err(e) = reg {
-            let err_obj =
-                crate::error::py_error_from_kv_error(py, &e, "fluxon_fs agent register failed");
-            return ApiResult::new_error(err_obj);
+        let agent = match fluxon_fs::agent_service::register_agent(
+            Arc::new(api),
+            &cfg,
+            schema_version,
+            context.fs_framework.clone(),
+        ) {
+            Ok(agent) => agent,
+            Err(e) => {
+                let err_obj =
+                    crate::error::py_error_from_kv_error(py, &e, "fluxon_fs agent register failed");
+                return ApiResult::new_error(err_obj);
+            }
+        };
+        if let Err(detail) = context
+            .pre_shutdown
+            .install(FsPreShutdownTarget::ServiceAgent(agent))
+        {
+            return ApiResult::new_error(new_general_error(py, &detail));
         }
         ApiResult::new_success(new_none_success_instance(py))
     }
@@ -843,6 +845,9 @@ fn ensure_fluxon_fs_external_client(client: &KvClient) -> PyResult<()> {
 }
 
 fn require_kv_framework(client: &KvClient) -> PyResult<Arc<Framework>> {
+    if client.kv_shutdown.is_requested() {
+        return Err(PyRuntimeError::new_err("KvClient is closing"));
+    }
     client
         .framework
         .as_ref()
@@ -851,11 +856,138 @@ fn require_kv_framework(client: &KvClient) -> PyResult<Arc<Framework>> {
 }
 
 fn require_kv_framework_api(client: &KvClient, py: Python) -> Result<Arc<Framework>, PyObject> {
+    if client.kv_shutdown.is_requested() {
+        return Err(new_general_error(py, "Client is closing"));
+    }
     client
         .framework
         .as_ref()
         .cloned()
         .ok_or_else(|| new_general_error(py, "Client is closed"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KvShutdownRequest {
+    Open,
+    CloseRequested,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum KvShutdownProgress {
+    Pending,
+    AttemptFailed { attempt: u64, detail: String },
+    Finished,
+}
+
+/// Owns the one KV shutdown flow independently from synchronous Python callers.
+#[derive(Clone)]
+struct KvFrameworkShutdown {
+    framework: Arc<Mutex<Option<Arc<Framework>>>>,
+    request_tx: tokio::sync::watch::Sender<KvShutdownRequest>,
+    progress_rx: tokio::sync::watch::Receiver<KvShutdownProgress>,
+}
+
+impl KvFrameworkShutdown {
+    fn new(runtime: &tokio::runtime::Handle, framework: Arc<Framework>) -> Self {
+        let (request_tx, mut request_rx) = tokio::sync::watch::channel(KvShutdownRequest::Open);
+        let (progress_tx, progress_rx) = tokio::sync::watch::channel(KvShutdownProgress::Pending);
+        let framework_slot = Arc::new(Mutex::new(Some(framework.clone())));
+        let owner_framework_slot = framework_slot.clone();
+
+        // This task is outside the KV task registry because it drives registry shutdown.
+        let _shutdown_owner = runtime.spawn(async move {
+            loop {
+                if *request_rx.borrow_and_update() == KvShutdownRequest::CloseRequested {
+                    break;
+                }
+                if request_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+
+            let mut attempt = 1_u64;
+            loop {
+                match framework.shutdown().await {
+                    Ok(()) => {
+                        drop(framework);
+                        owner_framework_slot.lock().take();
+                        progress_tx.send_replace(KvShutdownProgress::Finished);
+                        return;
+                    }
+                    Err(err) => {
+                        let detail = err.to_string();
+                        if attempt == 1 || attempt.is_power_of_two() {
+                            tracing::warn!(
+                                attempt,
+                                error = %detail,
+                                "KV framework shutdown attempt failed; background owner will retry"
+                            );
+                        }
+                        progress_tx
+                            .send_replace(KvShutdownProgress::AttemptFailed { attempt, detail });
+                        attempt = attempt
+                            .checked_add(1)
+                            .expect("KV shutdown attempt counter overflow");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+
+        Self {
+            framework: framework_slot,
+            request_tx,
+            progress_rx,
+        }
+    }
+
+    fn is_requested(&self) -> bool {
+        *self.request_tx.borrow() == KvShutdownRequest::CloseRequested
+    }
+
+    fn request(&self) {
+        self.request_tx
+            .send_replace(KvShutdownRequest::CloseRequested);
+        if let Some(framework) = self.framework.lock().as_ref().cloned() {
+            framework.request_pre_shutdown();
+        }
+    }
+
+    async fn shutdown_attempt(&self) -> Result<(), String> {
+        let seen_attempt = match &*self.progress_rx.borrow() {
+            KvShutdownProgress::AttemptFailed { attempt, .. } => *attempt,
+            KvShutdownProgress::Pending | KvShutdownProgress::Finished => 0,
+        };
+        self.request();
+        let mut progress_rx = self.progress_rx.clone();
+        loop {
+            match progress_rx.borrow().clone() {
+                KvShutdownProgress::Pending => {}
+                KvShutdownProgress::AttemptFailed { attempt, detail } if attempt > seen_attempt => {
+                    return Err(detail);
+                }
+                KvShutdownProgress::AttemptFailed { .. } => {}
+                KvShutdownProgress::Finished => return Ok(()),
+            }
+            if progress_rx.changed().await.is_err() {
+                return Err("KV shutdown owner stopped before publishing completion".to_string());
+            }
+        }
+    }
+
+    async fn wait_until_finished(&self) -> Result<(), String> {
+        self.request();
+        let mut progress_rx = self.progress_rx.clone();
+        loop {
+            match progress_rx.borrow().clone() {
+                KvShutdownProgress::Pending | KvShutdownProgress::AttemptFailed { .. } => {}
+                KvShutdownProgress::Finished => return Ok(()),
+            }
+            if progress_rx.changed().await.is_err() {
+                return Err("KV shutdown owner stopped before publishing completion".to_string());
+            }
+        }
+    }
 }
 
 /// Routes explicit and KV-triggered shutdown through one framework owner.
@@ -928,164 +1060,142 @@ impl MqFrameworkShutdown {
     }
 }
 
-#[derive(Clone)]
-struct FsAgentShutdownEntry {
-    agent: Arc<fluxon_fs::agent::FluxonFsAgent>,
-    fs_framework: fluxon_fs::Framework,
+enum FsPreShutdownTarget {
+    ClientAgent(Arc<fluxon_fs::agent::FluxonFsAgent>),
+    ServiceAgent(fluxon_fs::agent_service::FluxonFsAgentHandle),
+    FrameworkOnly,
 }
 
-#[derive(Debug, Clone)]
-enum FsAgentShutdownRegistryState {
-    Open,
-    Closing,
-    Closed,
-    Failed(String),
-}
-
-struct FsAgentShutdownRegistry {
-    state: FsAgentShutdownRegistryState,
-    entries: Vec<FsAgentShutdownEntry>,
-}
-
-impl Default for FsAgentShutdownRegistry {
-    fn default() -> Self {
-        Self {
-            state: FsAgentShutdownRegistryState::Open,
-            entries: Vec::new(),
-        }
-    }
-}
-
-impl FsAgentShutdownRegistry {
-    fn register(&mut self, entry: FsAgentShutdownEntry) -> Result<(), String> {
-        match &self.state {
-            FsAgentShutdownRegistryState::Open => {
-                self.entries.push(entry);
-                Ok(())
-            }
-            FsAgentShutdownRegistryState::Closing => {
-                Err("KV client is closing; cannot create another FS Agent".to_string())
-            }
-            FsAgentShutdownRegistryState::Closed => {
-                Err("KV client is closed; cannot create another FS Agent".to_string())
-            }
-            FsAgentShutdownRegistryState::Failed(detail) => Err(format!(
-                "KV client FS shutdown previously failed: {}",
-                detail
-            )),
-        }
-    }
-
-    fn begin_close(&mut self) -> Result<Vec<FsAgentShutdownEntry>, String> {
-        match &self.state {
-            FsAgentShutdownRegistryState::Open => {
-                self.state = FsAgentShutdownRegistryState::Closing;
-                Ok(self.entries.clone())
-            }
-            FsAgentShutdownRegistryState::Closing => {
-                Err("KV client FS shutdown is already in progress".to_string())
-            }
-            FsAgentShutdownRegistryState::Closed => {
-                Err("KV client FS shutdown is already complete".to_string())
-            }
-            FsAgentShutdownRegistryState::Failed(detail) => Err(format!(
-                "KV client FS shutdown previously failed: {}",
-                detail
-            )),
-        }
-    }
-
-    fn complete_close(&mut self) {
-        self.entries.clear();
-        self.state = FsAgentShutdownRegistryState::Closed;
-    }
-
-    fn fail_close(&mut self, detail: String) {
-        self.state = FsAgentShutdownRegistryState::Failed(detail);
-    }
-
-    fn entries_snapshot(&self) -> Vec<FsAgentShutdownEntry> {
-        self.entries.clone()
-    }
-}
-
-async fn shutdown_fs_agents_before_kv(entries: &[FsAgentShutdownEntry]) -> Result<(), String> {
-    let source_results =
-        futures::future::join_all(entries.iter().enumerate().map(|(index, entry)| async move {
-            entry
-                .agent
+impl FsPreShutdownTarget {
+    async fn shutdown(&self) -> Result<(), String> {
+        match self {
+            Self::ClientAgent(agent) => agent
                 .shutdown_write_session_source()
                 .await
-                .map_err(|err| format!("FS Agent {} source shutdown failed: {}", index, err))
-        }))
-        .await;
-    let source_errors = source_results
-        .into_iter()
-        .filter_map(Result::err)
-        .collect::<Vec<_>>();
-    if !source_errors.is_empty() {
-        return Err(source_errors.join("; "));
-    }
-
-    let framework_results =
-        futures::future::join_all(entries.iter().enumerate().map(|(index, entry)| async move {
-            entry
-                .fs_framework
+                .map_err(|err| format!("FS source shutdown failed: {err}")),
+            Self::ServiceAgent(agent) => agent
                 .shutdown()
                 .await
-                .map_err(|err| format!("FS framework {} shutdown failed: {}", index, err))
-        }))
-        .await;
-    let framework_errors = framework_results
-        .into_iter()
-        .filter_map(Result::err)
-        .collect::<Vec<_>>();
-    if framework_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(framework_errors.join("; "))
+                .map_err(|err| format!("FS service shutdown failed: {err}")),
+            Self::FrameworkOnly => Ok(()),
+        }
     }
 }
 
-async fn shutdown_fs_agents_then_kv(
-    entries: &[FsAgentShutdownEntry],
-    framework: &Framework,
-) -> Result<(), String> {
-    shutdown_fs_agents_before_kv(entries).await?;
-    framework
-        .shutdown()
-        .await
-        .map_err(|err| format!("KV framework shutdown failed: {}", err))
+struct FsPreShutdownRegistration {
+    target_tx: Option<tokio::sync::oneshot::Sender<FsPreShutdownTarget>>,
+}
+
+impl FsPreShutdownRegistration {
+    fn install(mut self, target: FsPreShutdownTarget) -> Result<(), String> {
+        self.target_tx
+            .take()
+            .expect("FS pre-shutdown target sender exists")
+            .send(target)
+            .map_err(|_| "FS pre-shutdown owner stopped before target installation".to_string())
+    }
+}
+
+impl Drop for FsPreShutdownRegistration {
+    fn drop(&mut self) {
+        if let Some(target_tx) = self.target_tx.take() {
+            let _ = target_tx.send(FsPreShutdownTarget::FrameworkOnly);
+        }
+    }
+}
+
+fn register_fs_pre_shutdown(
+    kv_framework: &Framework,
+    runtime: &tokio::runtime::Handle,
+    fs_framework: fluxon_fs::Framework,
+) -> Result<FsPreShutdownRegistration, String> {
+    let participant = kv_framework
+        .register_pre_shutdown(format!("{} dependent", fs_framework.name()))
+        .map_err(|err| err.to_string())?;
+    let (target_tx, target_rx) = tokio::sync::oneshot::channel();
+
+    // The owner must remain outside the FS task registry because it closes that registry.
+    let _shutdown_owner = runtime.spawn(async move {
+        let mut participant = participant;
+        let target = target_rx
+            .await
+            .unwrap_or(FsPreShutdownTarget::FrameworkOnly);
+        if let Err(err) = participant.wait_requested().await {
+            fs_framework.request_shutdown();
+            tracing::error!(
+                error = %err,
+                "FS pre-shutdown owner stopped before KV requested shutdown"
+            );
+            return;
+        }
+
+        // Stop framework actors immediately. Source-specific cleanup retains KV access until its
+        // holder barrier completes, and the final framework shutdown joins every registered actor.
+        fs_framework.request_shutdown();
+        let mut target_finished = false;
+        let mut attempt = 1_u64;
+        loop {
+            let result = async {
+                if !target_finished {
+                    target.shutdown().await?;
+                    target_finished = true;
+                }
+                fs_framework
+                    .shutdown()
+                    .await
+                    .map_err(|err| format!("FS framework shutdown failed: {err}"))
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    participant.finish();
+                    return;
+                }
+                Err(detail) => {
+                    if attempt == 1 || attempt.is_power_of_two() {
+                        tracing::warn!(
+                            attempt,
+                            error = %detail,
+                            "FS pre-shutdown attempt failed; owner will keep converging"
+                        );
+                    }
+                    participant.report_attempt_failure(detail);
+                    attempt = attempt
+                        .checked_add(1)
+                        .expect("FS pre-shutdown attempt counter overflow");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    });
+    Ok(FsPreShutdownRegistration {
+        target_tx: Some(target_tx),
+    })
 }
 
 struct KvClientDropCleanup {
-    entries: Option<Vec<FsAgentShutdownEntry>>,
     framework: Option<Arc<Framework>>,
     runtime: Option<Runtime>,
+    shutdown: Option<KvFrameworkShutdown>,
 }
 
 impl KvClientDropCleanup {
-    fn new(
-        entries: Vec<FsAgentShutdownEntry>,
-        framework: Arc<Framework>,
-        runtime: Runtime,
-    ) -> Self {
+    fn new(framework: Arc<Framework>, runtime: Runtime, shutdown: KvFrameworkShutdown) -> Self {
         Self {
-            entries: Some(entries),
             framework: Some(framework),
             runtime: Some(runtime),
+            shutdown: Some(shutdown),
         }
     }
 
     fn run(mut self) {
         let shutdown_result = {
-            let entries = self.entries.as_ref().expect("drop cleanup entries exist");
-            let framework = self
-                .framework
+            let shutdown = self
+                .shutdown
                 .as_ref()
-                .expect("drop cleanup KV framework exists");
+                .expect("drop cleanup shutdown owner exists");
             let runtime = self.runtime.as_mut().expect("drop cleanup runtime exists");
-            runtime.block_on(shutdown_fs_agents_then_kv(entries, framework.as_ref()))
+            runtime.block_on(shutdown.wait_until_finished())
         };
         if let Err(detail) = shutdown_result {
             tracing::error!(
@@ -1095,7 +1205,7 @@ impl KvClientDropCleanup {
             return;
         }
 
-        drop(self.entries.take());
+        drop(self.shutdown.take());
         drop(self.framework.take());
         self.runtime
             .take()
@@ -1106,20 +1216,20 @@ impl KvClientDropCleanup {
 
 impl Drop for KvClientDropCleanup {
     fn drop(&mut self) {
-        if self.entries.is_none() && self.framework.is_none() && self.runtime.is_none() {
+        if self.framework.is_none() && self.runtime.is_none() && self.shutdown.is_none() {
             return;
         }
         // No completion barrier means the KV mmap may still be referenced. Retain the entire
         // dependency chain instead of allowing field Drop to unmap memory out from under FS.
         tracing::error!("retaining FS/KV resources because Drop cleanup did not complete");
-        if let Some(entries) = self.entries.take() {
-            std::mem::forget(entries);
-        }
         if let Some(framework) = self.framework.take() {
             std::mem::forget(framework);
         }
         if let Some(runtime) = self.runtime.take() {
             std::mem::forget(runtime);
+        }
+        if let Some(shutdown) = self.shutdown.take() {
+            std::mem::forget(shutdown);
         }
     }
 }
@@ -1128,6 +1238,7 @@ struct FluxonFsContext {
     kv_framework: Arc<Framework>,
     runtime: tokio::runtime::Handle,
     fs_framework: fluxon_fs::Framework,
+    pre_shutdown: FsPreShutdownRegistration,
 }
 
 fn new_fluxon_fs_context(client: &KvClient) -> PyResult<FluxonFsContext> {
@@ -1143,10 +1254,14 @@ fn new_fluxon_fs_context(client: &KvClient) -> PyResult<FluxonFsContext> {
         let _guard = runtime.enter();
         fluxon_fs::new_fs_framework(format!("fluxon_fs.pyo3:{}", client.config.instance_key))
     };
+    let pre_shutdown =
+        register_fs_pre_shutdown(kv_framework.as_ref(), &runtime, fs_framework.clone())
+            .map_err(PyRuntimeError::new_err)?;
     Ok(FluxonFsContext {
         kv_framework,
         runtime,
         fs_framework,
+        pre_shutdown,
     })
 }
 
@@ -1250,8 +1365,9 @@ impl FluxonFsAgent {
             api,
             context.runtime.clone(),
         ));
-        client
-            .register_fs_agent_shutdown(inner.clone(), fs_framework.clone())
+        context
+            .pre_shutdown
+            .install(FsPreShutdownTarget::ClientAgent(inner.clone()))
             .map_err(PyRuntimeError::new_err)?;
         Ok(Self {
             inner,
@@ -1305,33 +1421,29 @@ impl FluxonFsAgent {
 
         let inner = self.inner.clone();
         let fw = self.fs_framework.clone();
-        {
-            use fluxon_framework_compiled::spawn::ViewSpawnExt;
-
-            let handle = ViewSpawnExt::spawn_boxed(
-                &fw,
-                Box::pin(async move {
-                    let join = limit_thirdparty::tokio::task::spawn_blocking(move || {
-                        inner.run_cache_config_sync_from_master_config_file_forever(&config_path)
-                    });
-                    match join.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            tracing::warn!(
-                                "fluxon_fs cache config fetch thread exited with error: {}",
-                                e
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "fluxon_fs cache config fetch thread join failed: {}",
-                                e
-                            );
-                        }
+        let accepted = fw.spawn_registered_boxed(
+            "fluxon_fs_cache_cfg_fetch",
+            Box::pin(async move {
+                let join = limit_thirdparty::tokio::task::spawn_blocking(move || {
+                    inner.run_cache_config_sync_from_master_config_file_forever(&config_path)
+                });
+                match join.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "fluxon_fs cache config fetch thread exited with error: {}",
+                            e
+                        );
                     }
-                }),
-            );
-            ViewSpawnExt::push_join_handle(&fw, "fluxon_fs_cache_cfg_fetch".to_string(), handle);
+                    Err(e) => {
+                        tracing::warn!("fluxon_fs cache config fetch thread join failed: {}", e);
+                    }
+                }
+            }),
+        );
+        if !accepted {
+            self.config_fetch_started.store(false, Ordering::SeqCst);
+            return Err(PyRuntimeError::new_err("fluxon_fs Agent is closing"));
         }
 
         Ok(())
@@ -2981,52 +3093,8 @@ pub struct KvClient {
     //   when user forgets to call close().
     // - Futures must not hold Arc<Runtime>; they should spawn via Handle clones only.
     runtime: Option<Runtime>,
+    kv_shutdown: KvFrameworkShutdown,
     config: ClientConfig,
-    fs_agent_shutdown: Mutex<FsAgentShutdownRegistry>,
-}
-
-impl KvClient {
-    fn register_fs_agent_shutdown(
-        &self,
-        agent: Arc<fluxon_fs::agent::FluxonFsAgent>,
-        fs_framework: fluxon_fs::Framework,
-    ) -> Result<(), String> {
-        self.fs_agent_shutdown
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .register(FsAgentShutdownEntry {
-                agent,
-                fs_framework,
-            })
-    }
-
-    fn begin_fs_agent_shutdown(&self) -> Result<Vec<FsAgentShutdownEntry>, String> {
-        self.fs_agent_shutdown
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .begin_close()
-    }
-
-    fn complete_fs_agent_shutdown(&self) {
-        self.fs_agent_shutdown
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .complete_close();
-    }
-
-    fn fail_fs_agent_shutdown(&self, detail: String) {
-        self.fs_agent_shutdown
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .fail_close(detail);
-    }
-
-    fn fs_agent_shutdown_entries_snapshot(&self) -> Vec<FsAgentShutdownEntry> {
-        self.fs_agent_shutdown
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entries_snapshot()
-    }
 }
 
 #[pymethods]
@@ -3098,11 +3166,12 @@ impl KvClient {
                 }
             };
 
+            let kv_shutdown = KvFrameworkShutdown::new(runtime.handle(), framework.clone());
             let client = KvClient {
                 framework: Some(framework),
                 runtime: Some(runtime),
+                kv_shutdown,
                 config: final_config,
-                fs_agent_shutdown: Mutex::new(FsAgentShutdownRegistry::default()),
             };
 
             match Py::new(py, client) {
@@ -4147,45 +4216,27 @@ impl KvClient {
     /// Close the client
     fn close(&mut self, py: Python) -> PyObject {
         fn close_inner(client: &mut KvClient, py: Python) -> ApiResult<PyObject> {
-            let framework = match client.framework.as_ref() {
-                Some(v) => v.clone(),
-                None => {
-                    return ApiResult::new_error(new_general_error(py, "Client is already closed"));
-                }
-            };
+            if client.framework.is_none() {
+                return ApiResult::new_error(new_general_error(py, "Client is already closed"));
+            }
             if client.runtime.is_none() {
                 return ApiResult::new_error(new_general_error(py, "Client runtime is missing"));
             }
-            let fs_entries = match client.begin_fs_agent_shutdown() {
-                Ok(entries) => entries,
-                Err(detail) => {
-                    return ApiResult::new_error(new_general_error(py, &detail));
-                }
-            };
-            // FS source tasks can retain KV payload holders. Establish their completion barrier,
-            // then stop every FS framework, before allowing KV modules to begin shutdown.
+            let shutdown = client.kv_shutdown.clone();
             let shutdown_result = {
                 let runtime = client
                     .runtime
                     .as_mut()
                     .expect("KV client runtime was checked above");
-                py.allow_threads(|| {
-                    runtime.block_on(async move {
-                        shutdown_fs_agents_then_kv(&fs_entries, framework.as_ref()).await
-                    })
-                })
+                py.allow_threads(|| runtime.block_on(shutdown.shutdown_attempt()))
             };
             if let Err(detail) = shutdown_result {
-                // Fail closed: retain the runtime/framework and never retry an ordered shutdown
-                // after any source, FS-framework, or KV-framework shutdown failure.
-                client.fail_fs_agent_shutdown(detail.clone());
                 return ApiResult::new_error(new_general_error(
                     py,
                     &format!("Failed to shutdown: {}", detail),
                 ));
             }
 
-            client.complete_fs_agent_shutdown();
             let _framework = client
                 .framework
                 .take()
@@ -4204,63 +4255,30 @@ impl KvClient {
 
 impl Drop for KvClient {
     fn drop(&mut self) {
-        // English note:
-        // - Python object destruction is not a reliable lifecycle mechanism, but it is the last
-        //   guardrail we have when user forgets to call close().
-        // - Never block the process exit path here. Stop source admission synchronously, then
-        //   transfer final-release ownership to a detached cleanup thread.
-        // - A previous or concurrent close attempt is sticky: never retry it from Drop. An earlier
-        //   timeout may already have detached a source task after consuming its JoinHandle, so a
-        //   second shutdown could report false success and unmap KV memory while that task runs.
-        let fs_entries = match self.begin_fs_agent_shutdown() {
-            Ok(entries) => entries,
-            Err(detail) => {
-                let entries = self.fs_agent_shutdown_entries_snapshot();
-                for entry in &entries {
-                    entry.agent.request_write_session_source_shutdown();
-                }
-                let framework = self.framework.take();
-                let runtime = self.runtime.take();
-                if framework.is_some() || runtime.is_some() || !entries.is_empty() {
-                    tracing::error!(
-                        "KV client Drop will not retry an incomplete ordered shutdown; retaining FS/KV resources: {}",
-                        detail
-                    );
-                    std::mem::forget(entries);
-                    if let Some(framework) = framework {
-                        std::mem::forget(framework);
-                    }
-                    if let Some(runtime) = runtime {
-                        std::mem::forget(runtime);
-                    }
-                }
-                return;
-            }
-        };
-        for entry in &fs_entries {
-            entry.agent.request_write_session_source_shutdown();
-        }
+        // Python object destruction is only a fallback. Publish the same close request used by
+        // explicit close, then transfer the sole completion wait to a detached cleanup thread.
+        self.kv_shutdown.request();
 
         let (framework, runtime) = match (self.framework.take(), self.runtime.take()) {
             (Some(framework), Some(runtime)) => (framework, runtime),
             (framework, runtime) => {
-                if framework.is_some() || runtime.is_some() || !fs_entries.is_empty() {
+                if framework.is_some() || runtime.is_some() {
                     tracing::error!(
                         "KV client Drop found incomplete shutdown ownership; retaining remaining FS/KV resources"
                     );
-                    std::mem::forget(fs_entries);
                     if let Some(framework) = framework {
                         std::mem::forget(framework);
                     }
                     if let Some(runtime) = runtime {
                         std::mem::forget(runtime);
                     }
+                    std::mem::forget(self.kv_shutdown.clone());
                 }
                 return;
             }
         };
 
-        let cleanup = KvClientDropCleanup::new(fs_entries, framework, runtime);
+        let cleanup = KvClientDropCleanup::new(framework, runtime, self.kv_shutdown.clone());
         match thread::Builder::new()
             .name("fluxon-kv-client-drop".to_string())
             .spawn(move || cleanup.run())
@@ -4429,7 +4447,7 @@ impl KvMaster {
                     ));
                 }
             };
-            let mut runtime = match master.runtime.take() {
+            let runtime = match master.runtime.take() {
                 Some(v) => v,
                 None => {
                     return ApiResult::new_error(new_general_error(
@@ -4644,8 +4662,9 @@ fn fluxon_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FsAgentShutdownRegistry, FsAgentShutdownRegistryState, bundled_driver_names_from_entries,
-        configure_bundled_rdmav_driver_env, discover_bundled_ibverbs_driver_config,
+        KvFrameworkShutdown, KvShutdownProgress, KvShutdownRequest,
+        bundled_driver_names_from_entries, configure_bundled_rdmav_driver_env,
+        discover_bundled_ibverbs_driver_config,
         extract_fluxon_pyo3_libs_root_from_loaded_library_line, finish_master_owned_ctrl_c,
         loaded_fluxon_pyo3_libs_roots, parse_bundled_ibverbs_driver_name,
         sanitize_bundled_ld_library_path_entries, set_authoritative_bundled_ld_library_path,
@@ -4654,40 +4673,37 @@ mod tests {
     use pyo3::Python;
     use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-    #[test]
-    fn fs_agent_shutdown_registry_failure_is_sticky() {
-        let mut registry = FsAgentShutdownRegistry::default();
-        assert!(registry.begin_close().expect("begin close").is_empty());
-        registry.fail_close("source barrier failed".to_string());
-
-        assert!(matches!(
-            registry.state,
-            FsAgentShutdownRegistryState::Failed(ref detail)
-                if detail == "source barrier failed"
-        ));
-        let close_error = match registry.begin_close() {
-            Ok(_) => panic!("failed close must never advance to KV shutdown"),
-            Err(detail) => detail,
+    #[tokio::test]
+    async fn repeated_kv_close_waits_past_the_observed_failure() {
+        let (request_tx, _request_rx) = tokio::sync::watch::channel(KvShutdownRequest::Open);
+        let (progress_tx, progress_rx) =
+            tokio::sync::watch::channel(KvShutdownProgress::AttemptFailed {
+                attempt: 1,
+                detail: "first".to_string(),
+            });
+        let shutdown = KvFrameworkShutdown {
+            framework: Arc::new(parking_lot::Mutex::new(None)),
+            request_tx,
+            progress_rx,
         };
-        assert!(close_error.contains("source barrier failed"));
-    }
 
-    #[test]
-    fn fs_agent_shutdown_registry_completes_only_after_barrier() {
-        let mut registry = FsAgentShutdownRegistry::default();
-        assert!(registry.begin_close().expect("begin close").is_empty());
-        registry.complete_close();
+        let wait = tokio::spawn(async move { shutdown.shutdown_attempt().await });
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
 
-        assert!(matches!(
-            registry.state,
-            FsAgentShutdownRegistryState::Closed
-        ));
-        assert!(registry.entries.is_empty());
+        progress_tx.send_replace(KvShutdownProgress::AttemptFailed {
+            attempt: 2,
+            detail: "second".to_string(),
+        });
+        assert_eq!(
+            wait.await.expect("close waiter task"),
+            Err("second".to_string())
+        );
     }
 
     #[test]

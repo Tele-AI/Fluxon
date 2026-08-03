@@ -2,6 +2,7 @@ use super::lease_backend_uid::LeaseBackendUid;
 use super::lease_handle::LeaseEntry;
 use super::lifecycle::OnKeepalive;
 use crate::auto_clean_map::AutoCleanMapEntry;
+use crate::notify_state::AsyncStopSignal;
 use etcd_client::{Client, LeaseKeepAliveStream, LeaseKeeper};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -11,7 +12,9 @@ use std::collections::{BinaryHeap, HashMap};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -314,6 +317,19 @@ struct LeaseKeepaliveCompletion<K> {
 type LeaseKeepaliveTask<K> =
     Pin<Box<dyn Future<Output = LeaseKeepaliveCompletion<K>> + Send + 'static>>;
 
+#[derive(Debug)]
+struct NeverStopSignal;
+
+impl AsyncStopSignal for NeverStopSignal {
+    fn is_stopped(&self) -> bool {
+        false
+    }
+
+    fn wait_stopped(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
+}
+
 pub struct LeaseKeepaliveActor<K>
 where
     K: Clone + Eq + Hash + Send + Sync + 'static,
@@ -322,12 +338,14 @@ where
     max_jitter: Duration,
     operation_timeout: Duration,
     max_concurrency: usize,
-    closed: AtomicBool,
+    stop: Arc<dyn AsyncStopSignal>,
     next_generation: AtomicU64,
     state: Mutex<LeaseKeepaliveState<K>>,
     changed: Notify,
     #[cfg(test)]
     loop_iterations: AtomicU64,
+    #[cfg(test)]
+    before_waiter_arm: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<K> std::fmt::Debug for LeaseKeepaliveActor<K>
@@ -340,7 +358,7 @@ where
             .field("max_jitter", &self.max_jitter)
             .field("operation_timeout", &self.operation_timeout)
             .field("max_concurrency", &self.max_concurrency)
-            .field("closed", &self.closed.load(Ordering::Acquire))
+            .field("stopped", &self.stop.is_stopped())
             .field("registered_leases", &self.state.lock().entries.len())
             .finish_non_exhaustive()
     }
@@ -387,6 +405,7 @@ where
         max_jitter: Duration,
         operation_timeout: Duration,
         max_concurrency: usize,
+        stop: Arc<dyn AsyncStopSignal>,
     ) -> Self {
         assert!(
             !cadence.is_zero(),
@@ -405,12 +424,14 @@ where
             max_jitter,
             operation_timeout,
             max_concurrency,
-            closed: AtomicBool::new(false),
+            stop,
             next_generation: AtomicU64::new(1),
             state: Mutex::new(LeaseKeepaliveState::default()),
             changed: Notify::new(),
             #[cfg(test)]
             loop_iterations: AtomicU64::new(0),
+            #[cfg(test)]
+            before_waiter_arm: Mutex::new(None),
         }
     }
 
@@ -469,8 +490,8 @@ where
         });
         {
             let mut state = self.state.lock();
-            if self.closed.load(Ordering::Acquire) {
-                return Err("lease keepalive actor is closed".to_string());
+            if self.stop.is_stopped() {
+                return Err("lease keepalive actor is stopped".to_string());
             }
             if let Some(existing_generation) = state.generation_by_key.get(&key).copied() {
                 let existing_is_live = state
@@ -496,6 +517,10 @@ where
                 },
             );
             state.schedule.push(Reverse((next_due, generation)));
+            if self.stop.is_stopped() {
+                Self::remove_generation_locked(&mut state, generation);
+                return Err("lease keepalive actor is stopped".to_string());
+            }
         }
         self.changed.notify_one();
         Ok(LeaseKeepaliveRegistration {
@@ -506,42 +531,35 @@ where
         })
     }
 
-    pub fn close(&self) {
-        {
-            let _state = self.state.lock();
-            self.closed.store(true, Ordering::Release);
-        }
-        self.changed.notify_waiters();
-    }
-
-    pub async fn run_until_stopped<F>(self: Arc<Self>, stop: F)
-    where
-        F: Future<Output = ()> + Send,
-    {
-        self.run(stop, false).await;
+    pub async fn run_until_stopped(self: Arc<Self>) {
+        self.run(false).await;
     }
 
     pub(crate) async fn run_until_idle(self: Arc<Self>) {
-        self.run(std::future::pending::<()>(), true).await;
+        self.run(true).await;
     }
 
-    async fn run<F>(self: Arc<Self>, stop: F, stop_when_idle: bool)
-    where
-        F: Future<Output = ()> + Send,
-    {
-        tokio::pin!(stop);
+    async fn run(self: Arc<Self>, stop_when_idle: bool) {
         let mut in_flight = FuturesUnordered::<LeaseKeepaliveTask<K>>::new();
         loop {
             #[cfg(test)]
             self.loop_iterations.fetch_add(1, Ordering::Relaxed);
-            if self.closed.load(Ordering::Acquire)
-                || (stop_when_idle && self.registered_lease_count() == 0)
-            {
+            if self.should_stop(stop_when_idle) {
                 return;
             }
             self.fill_available_slots(&mut in_flight);
+
+            #[cfg(test)]
+            if let Some(hook) = self.before_waiter_arm.lock().take() {
+                hook();
+            }
+
             let changed = self.changed.notified();
             tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.should_stop(stop_when_idle) {
+                return;
+            }
             let next_due = (in_flight.len() < self.max_concurrency)
                 .then(|| self.next_due())
                 .flatten();
@@ -551,7 +569,7 @@ where
                     tokio::pin!(sleep);
                     tokio::select! {
                         biased;
-                        _ = &mut stop => return,
+                        _ = self.stop.wait_stopped() => return,
                         completion = in_flight.next() => completion,
                         _ = &mut sleep => None,
                         _ = &mut changed => None,
@@ -562,20 +580,20 @@ where
                     tokio::pin!(sleep);
                     tokio::select! {
                         biased;
-                        _ = &mut stop => return,
+                        _ = self.stop.wait_stopped() => return,
                         _ = &mut sleep => None,
                         _ = &mut changed => None,
                     }
                 }
                 (None, false) => tokio::select! {
                     biased;
-                    _ = &mut stop => return,
+                    _ = self.stop.wait_stopped() => return,
                     completion = in_flight.next() => completion,
                     _ = &mut changed => None,
                 },
                 (None, true) => tokio::select! {
                     biased;
-                    _ = &mut stop => return,
+                    _ = self.stop.wait_stopped() => return,
                     _ = &mut changed => None,
                 },
             };
@@ -583,6 +601,10 @@ where
                 self.handle_completion(completion);
             }
         }
+    }
+
+    fn should_stop(&self, stop_when_idle: bool) -> bool {
+        self.stop.is_stopped() || (stop_when_idle && self.registered_lease_count() == 0)
     }
 
     fn delay_for_key(&self, key: &K) -> Duration {
@@ -899,6 +921,7 @@ impl OneTtlKeepAliveInner {
                 Duration::ZERO,
                 Duration::from_millis(KEEPALIVE_ACTOR_OPERATION_BUDGET_MS),
                 MQ_KEEPALIVE_MAX_CONCURRENCY,
+                Arc::new(NeverStopSignal),
             )),
             running_state: Mutex::new(KeepaliveRunnerState {
                 running: false,
@@ -1006,17 +1029,52 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Semaphore;
 
+    #[derive(Debug)]
+    struct TestStopSignal {
+        stopped: AtomicBool,
+        changed: Notify,
+    }
+
+    impl TestStopSignal {
+        fn new() -> Self {
+            Self {
+                stopped: AtomicBool::new(false),
+                changed: Notify::new(),
+            }
+        }
+
+        fn stop(&self) {
+            self.stopped.store(true, Ordering::Release);
+            self.changed.notify_waiters();
+        }
+    }
+
+    impl AsyncStopSignal for TestStopSignal {
+        fn is_stopped(&self) -> bool {
+            self.stopped.load(Ordering::Acquire)
+        }
+
+        fn wait_stopped(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(crate::notify_state::wait_until(&self.changed, || {
+                self.is_stopped()
+            }))
+        }
+    }
+
     fn actor(
         cadence: Duration,
         timeout: Duration,
         max_concurrency: usize,
-    ) -> Arc<LeaseKeepaliveActor<u64>> {
-        Arc::new(LeaseKeepaliveActor::new(
+    ) -> (Arc<LeaseKeepaliveActor<u64>>, Arc<TestStopSignal>) {
+        let stop = Arc::new(TestStopSignal::new());
+        let actor = Arc::new(LeaseKeepaliveActor::new(
             cadence,
             Duration::ZERO,
             timeout,
             max_concurrency,
-        ))
+            stop.clone(),
+        ));
+        (actor, stop)
     }
 
     fn operation<F>(f: F) -> LeaseKeepaliveOperation<u64>
@@ -1030,7 +1088,7 @@ mod tests {
     async fn first_keepalive_waits_for_cadence() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_operation = calls.clone();
-        let actor = actor(Duration::from_millis(100), Duration::from_secs(1), 1);
+        let (actor, stop) = actor(Duration::from_millis(100), Duration::from_secs(1), 1);
         let _registration = actor
             .register(
                 1,
@@ -1045,12 +1103,7 @@ mod tests {
                 Arc::new(|_| {}),
             )
             .expect("register lease");
-        let stop = Arc::new(Notify::new());
-        let task = tokio::spawn(
-            actor
-                .clone()
-                .run_until_stopped(stop.clone().notified_owned()),
-        );
+        let task = tokio::spawn(actor.clone().run_until_stopped());
 
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1061,13 +1114,39 @@ mod tests {
         })
         .await
         .expect("first keepalive did not run after cadence");
-        stop.notify_waiters();
+        stop.stop();
         task.await.expect("join actor");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_between_state_check_and_waiter_arm_exits() {
+        let (actor, stop) = actor(Duration::from_secs(60), Duration::from_secs(1), 1);
+        let reached_window = Arc::new(std::sync::Barrier::new(2));
+        let stop_published = Arc::new(std::sync::Barrier::new(2));
+        let hook_reached_window = reached_window.clone();
+        let hook_stop_published = stop_published.clone();
+        *actor.before_waiter_arm.lock() = Some(Box::new(move || {
+            hook_reached_window.wait();
+            hook_stop_published.wait();
+        }));
+
+        let stop_thread = std::thread::spawn(move || {
+            reached_window.wait();
+            stop.stop();
+            stop_published.wait();
+        });
+        let task = tokio::spawn(actor.run_until_stopped());
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("actor lost stop published before waiter arm")
+            .expect("join actor");
+        stop_thread.join().expect("join stop publisher");
     }
 
     #[test]
     fn registration_drop_unregisters_immediately() {
-        let actor = actor(Duration::from_secs(60), Duration::from_secs(1), 1);
+        let (actor, _stop) = actor(Duration::from_secs(60), Duration::from_secs(1), 1);
         let registration = actor
             .register(
                 7,
@@ -1087,7 +1166,7 @@ mod tests {
         let new_calls = Arc::new(AtomicUsize::new(0));
         let old_calls_for_operation = old_calls.clone();
         let new_calls_for_operation = new_calls.clone();
-        let actor = actor(Duration::from_secs(60), Duration::from_secs(1), 1);
+        let (actor, stop) = actor(Duration::from_secs(60), Duration::from_secs(1), 1);
         let old_registration = actor
             .register(
                 8,
@@ -1136,12 +1215,7 @@ mod tests {
         assert_eq!(actor.registered_lease_count(), 1);
 
         actor.make_all_due();
-        let stop = Arc::new(Notify::new());
-        let task = tokio::spawn(
-            actor
-                .clone()
-                .run_until_stopped(stop.clone().notified_owned()),
-        );
+        let task = tokio::spawn(actor.clone().run_until_stopped());
         tokio::time::timeout(Duration::from_secs(1), async {
             while new_calls.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
@@ -1150,7 +1224,7 @@ mod tests {
         .await
         .expect("replacement keepalive did not run");
         assert_eq!(old_calls.load(Ordering::SeqCst), 0);
-        stop.notify_waiters();
+        stop.stop();
         task.await.expect("join actor");
 
         drop(new_registration);
@@ -1159,7 +1233,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn terminal_failure_unregisters_only_matching_lease() {
-        let actor = actor(Duration::from_secs(60), Duration::from_secs(1), 2);
+        let (actor, stop) = actor(Duration::from_secs(60), Duration::from_secs(1), 2);
         let failed = Arc::new(AtomicUsize::new(0));
         let failed_for_callback = failed.clone();
         let operation = operation(|lease_id| {
@@ -1194,12 +1268,7 @@ mod tests {
             )
             .expect("register healthy lease");
         actor.make_all_due();
-        let stop = Arc::new(Notify::new());
-        let task = tokio::spawn(
-            actor
-                .clone()
-                .run_until_stopped(stop.clone().notified_owned()),
-        );
+        let task = tokio::spawn(actor.clone().run_until_stopped());
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while failed.load(Ordering::SeqCst) == 0 {
@@ -1209,7 +1278,7 @@ mod tests {
         .await
         .expect("failed keepalive did not complete");
         assert_eq!(actor.registered_lease_count(), 1);
-        stop.notify_waiters();
+        stop.stop();
         task.await.expect("join actor");
     }
 
@@ -1217,7 +1286,7 @@ mod tests {
     async fn retry_failure_does_not_reschedule_healthy_lease() {
         let failed_calls = Arc::new(AtomicUsize::new(0));
         let healthy_calls = Arc::new(AtomicUsize::new(0));
-        let actor = actor(Duration::from_secs(60), Duration::from_secs(1), 2);
+        let (actor, stop) = actor(Duration::from_secs(60), Duration::from_secs(1), 2);
         let failed_calls_for_operation = failed_calls.clone();
         let healthy_calls_for_operation = healthy_calls.clone();
         let operation = operation(move |lease_id| {
@@ -1250,12 +1319,7 @@ mod tests {
             )
             .expect("register healthy lease");
         actor.make_all_due();
-        let stop = Arc::new(Notify::new());
-        let task = tokio::spawn(
-            actor
-                .clone()
-                .run_until_stopped(stop.clone().notified_owned()),
-        );
+        let task = tokio::spawn(actor.clone().run_until_stopped());
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while failed_calls.load(Ordering::SeqCst) < 2 {
@@ -1265,13 +1329,13 @@ mod tests {
         .await
         .expect("failed lease was not retried");
         assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
-        stop.notify_waiters();
+        stop.stop();
         task.await.expect("join actor");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn timeout_notifies_and_unregisters_lease() {
-        let actor = actor(Duration::from_secs(60), Duration::from_millis(10), 1);
+        let (actor, stop) = actor(Duration::from_secs(60), Duration::from_millis(10), 1);
         let timed_out = Arc::new(AtomicBool::new(false));
         let timed_out_for_callback = timed_out.clone();
         let _registration = actor
@@ -1291,12 +1355,7 @@ mod tests {
             )
             .expect("register lease");
         actor.make_all_due();
-        let stop = Arc::new(Notify::new());
-        let task = tokio::spawn(
-            actor
-                .clone()
-                .run_until_stopped(stop.clone().notified_owned()),
-        );
+        let task = tokio::spawn(actor.clone().run_until_stopped());
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while !timed_out.load(Ordering::Acquire) {
@@ -1306,7 +1365,7 @@ mod tests {
         .await
         .expect("timed out keepalive did not complete");
         assert_eq!(actor.registered_lease_count(), 0);
-        stop.notify_waiters();
+        stop.stop();
         task.await.expect("join actor");
     }
 
@@ -1342,7 +1401,7 @@ mod tests {
                 Ok(())
             })
         });
-        let actor = actor(Duration::from_secs(60), Duration::from_secs(1), 2);
+        let (actor, stop) = actor(Duration::from_secs(60), Duration::from_secs(1), 2);
         let registrations = (40..43)
             .map(|lease_id| {
                 actor
@@ -1356,12 +1415,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         actor.make_all_due();
-        let stop = Arc::new(Notify::new());
-        let task = tokio::spawn(
-            actor
-                .clone()
-                .run_until_stopped(stop.clone().notified_owned()),
-        );
+        let task = tokio::spawn(actor.clone().run_until_stopped());
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while calls.load(Ordering::SeqCst) < 2 {
@@ -1387,7 +1441,7 @@ mod tests {
         })
         .await
         .expect("queued keepalive did not use released slot");
-        stop.notify_waiters();
+        stop.stop();
         task.await.expect("join actor");
         drop(registrations);
     }
@@ -1405,7 +1459,7 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let started_for_operation = started.clone();
         let dropped_for_operation = dropped.clone();
-        let actor = actor(Duration::from_secs(60), Duration::from_secs(30), 1);
+        let (actor, stop) = actor(Duration::from_secs(60), Duration::from_secs(30), 1);
         let _registration = actor
             .register(
                 51,
@@ -1423,12 +1477,7 @@ mod tests {
             )
             .expect("register lease");
         actor.make_all_due();
-        let stop = Arc::new(Notify::new());
-        let task = tokio::spawn(
-            actor
-                .clone()
-                .run_until_stopped(stop.clone().notified_owned()),
-        );
+        let task = tokio::spawn(actor.clone().run_until_stopped());
         tokio::time::timeout(Duration::from_secs(1), async {
             while !started.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
@@ -1436,7 +1485,7 @@ mod tests {
         })
         .await
         .expect("keepalive did not start");
-        stop.notify_waiters();
+        stop.stop();
         task.await.expect("join actor");
         assert!(dropped.load(Ordering::Acquire));
     }

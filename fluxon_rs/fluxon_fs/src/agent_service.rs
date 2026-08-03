@@ -909,13 +909,19 @@ impl AgentWriteSessionsHandle {
         &self,
         deadline: Option<Instant>,
     ) -> Result<(), String> {
-        let entries: Vec<WriteSessionEntryHandle> = {
-            let mut entries = self.entries.lock();
-            std::mem::take(&mut *entries).into_values().collect()
+        // Keep every entry in the authoritative map until its active writer has actually
+        // released the current chunk. A timed-out sweep can then be retried without losing the
+        // only handle that proves KV-backed payload holders are gone.
+        let entries: Vec<(String, WriteSessionEntryHandle)> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .map(|(session_id, entry)| (session_id.clone(), entry.clone()))
+                .collect()
         };
 
         let mut discarded_chunks = Vec::with_capacity(entries.len());
-        for entry in &entries {
+        for (_, entry) in &entries {
             let mut state = entry.state.lock();
             state.aborted = true;
             state.closing = true;
@@ -927,7 +933,7 @@ impl AgentWriteSessionsHandle {
         }
         drop(discarded_chunks);
 
-        for entry in &entries {
+        for (session_id, entry) in &entries {
             let (write_path_key, write_path_owner) = {
                 let mut state = entry.state.lock();
                 while state.writing {
@@ -948,8 +954,22 @@ impl AgentWriteSessionsHandle {
                 }
                 (state.write_path_key.clone(), state.write_path_owner.clone())
             };
-            self.active_write_paths
-                .release_owned(&write_path_key, &write_path_owner);
+            let removed = {
+                let mut live_entries = self.entries.lock();
+                if live_entries
+                    .get(session_id)
+                    .is_some_and(|live| Arc::ptr_eq(live, entry))
+                {
+                    live_entries.remove(session_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed {
+                self.active_write_paths
+                    .release_owned(&write_path_key, &write_path_owner);
+            }
         }
         Ok(())
     }
@@ -977,7 +997,7 @@ fn abort_write_session_entry_and_wait_for_writer(entry: &WriteSessionEntryHandle
 }
 
 impl FluxonFsAgentHandle {
-    async fn shutdown(&self) -> anyhow::Result<()> {
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
         drain_write_sessions_for_shutdown(
             &self.write_session_admission,
             &self.write_sessions,
@@ -1000,28 +1020,21 @@ async fn abort_write_sessions_for_shutdown_sweep(
         ));
     }
     let write_sessions = write_sessions.clone();
-    match tokio::time::timeout(
-        remaining,
-        tokio::task::spawn_blocking(move || {
-            write_sessions.abort_all_and_wait_for_writers_until(deadline)
-        }),
-    )
+    match tokio::task::spawn_blocking(move || {
+        write_sessions.abort_all_and_wait_for_writers_until(deadline)
+    })
     .await
     {
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(detail))) => Err(anyhow::anyhow!(
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(detail)) => Err(anyhow::anyhow!(
             "write-session {} shutdown sweep failed: {}",
             phase,
             detail
         )),
-        Ok(Err(err)) => Err(anyhow::anyhow!(
+        Err(err) => Err(anyhow::anyhow!(
             "write-session {} shutdown task failed: {}",
             phase,
             err
-        )),
-        Err(_) => Err(anyhow::anyhow!(
-            "write-session {} shutdown sweep timed out",
-            phase
         )),
     }
 }
@@ -1434,6 +1447,7 @@ async fn async_main(
         internal_exports,
         FLUXON_FS_CONTROL_SCHEMA_VERSION,
         access_model.clone(),
+        fs_framework.clone(),
     ) {
         Ok(handle) => handle,
         Err(err) => {
@@ -1578,7 +1592,7 @@ fn start_export_mount_stat_sampler(
         .metric_reporter()
         .metrics();
 
-    tokio::spawn(async move {
+    crate::framework::spawn_fs_task(&fs_framework, "export_mount_stat_sampler", async move {
         let mut last_rev: u64 = 0;
         let mut export_root_dirs_abs: Vec<String> = Vec::new();
         loop {
@@ -1641,7 +1655,7 @@ fn start_agent_exports_push_actor(
     let master_node: NodeID = master_id.clone().into();
     let schema_version = FLUXON_FS_CONTROL_SCHEMA_VERSION;
 
-    tokio::spawn(async move {
+    crate::framework::spawn_fs_task(&fs_framework, "agent_exports_push", async move {
         let mut waited_ticks = 0u64;
         let mut waited_ms = 0u64;
 
@@ -1768,7 +1782,7 @@ fn start_access_model_sync_actor(
     let master_node: NodeID = master_id.clone().into();
     let schema_version = FLUXON_FS_CONTROL_SCHEMA_VERSION;
 
-    tokio::spawn(async move {
+    crate::framework::spawn_fs_task(&fs_framework, "access_model_sync", async move {
         let mut waited_ticks = 0u64;
         let mut waited_ms = 0u64;
 
@@ -2236,6 +2250,7 @@ pub fn register_agent(
     api: Arc<FluxonUserApi>,
     cfg: &FluxonFsGlobalConfig,
     schema_version: i64,
+    lifecycle: crate::Framework,
 ) -> KvResult<FluxonFsAgentHandle> {
     register_agent_with_access_model(
         api,
@@ -2243,6 +2258,7 @@ pub fn register_agent(
         BTreeMap::new(),
         schema_version,
         AgentAccessModelHandle::new(None),
+        lifecycle,
     )
 }
 
@@ -2252,6 +2268,7 @@ fn register_agent_with_access_model(
     internal_exports: BTreeMap<String, FluxonFsExport>,
     schema_version: i64,
     access_model: AgentAccessModelHandle,
+    lifecycle: crate::Framework,
 ) -> KvResult<FluxonFsAgentHandle> {
     fn invalid(detail: impl Into<String>) -> KvError {
         KvError::Api(ApiError::InvalidArgument {
@@ -2297,7 +2314,6 @@ fn register_agent_with_access_model(
     let mut registration_guard =
         WriteSessionRegistrationGuard::new(write_sessions.clone(), write_session_admission.clone());
     let write_executor = WriteExecutorHandle::new(configured_write_executor_worker_count());
-    let rt_handle = api.runtime_handle();
     write_session_rpc::register_callers(api.framework().as_ref());
 
     let data_plane = AgentDataPlaneHandlers {
@@ -2497,7 +2513,7 @@ fn register_agent_with_access_model(
         let chunk_admission = write_session_admission.clone();
         write_session_rpc::register_chunk_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |_from, req, data| {
                 let Some(_admission_guard) = chunk_admission.try_enter_handler() else {
                     return crate::write_session_rpc::FsWriteSessionChunkResp {
@@ -2522,7 +2538,7 @@ fn register_agent_with_access_model(
         let data_admission = write_session_admission.clone();
         write_session_rpc::register_data_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |_from, req, data| {
                 let Some(_admission_guard) = data_admission.try_enter_handler() else {
                     return crate::write_session_rpc::FsWriteSessionDataAck {
@@ -2549,7 +2565,7 @@ fn register_agent_with_access_model(
         let ref_admission = write_session_admission.clone();
         write_session_rpc::register_data_ref_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |from_node, req| {
                 let framework = ref_framework.clone();
                 let access_model = ref_access_model.clone();
@@ -2588,7 +2604,7 @@ fn register_agent_with_access_model(
         let open_admission = write_session_admission.clone();
         write_session_rpc::register_open_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |_from, req| {
                 let Some(_admission_guard) = open_admission.try_enter_handler() else {
                     return crate::write_session_rpc::FsOpenWriteSessionResp {
@@ -2616,7 +2632,7 @@ fn register_agent_with_access_model(
         let put_admission = write_session_admission.clone();
         write_session_rpc::register_put_small_object_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |_from, req, data| {
                 let Some(_admission_guard) = put_admission.try_enter_handler() else {
                     return FsPutSmallObjectResp {
@@ -2642,7 +2658,7 @@ fn register_agent_with_access_model(
         let close_admission = write_session_admission.clone();
         write_session_rpc::register_close_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |_from, req| {
                 let Some(_admission_guard) = close_admission.try_enter_handler() else {
                     return crate::write_session_rpc::FsCloseWriteSessionResp {
@@ -2662,7 +2678,7 @@ fn register_agent_with_access_model(
         let finalize_admission = write_session_admission.clone();
         write_session_rpc::register_finalize_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |_from, req| {
                 let Some(_admission_guard) = finalize_admission.try_enter_handler() else {
                     return crate::write_session_rpc::FsFinalizeWriteSessionResp {
@@ -2686,7 +2702,7 @@ fn register_agent_with_access_model(
         let wait_admission = write_session_admission.clone();
         write_session_rpc::register_wait_payloads_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |_from, req| {
                 let Some(_admission_guard) = wait_admission.try_enter_handler() else {
                     return crate::write_session_rpc::FsWaitWriteSessionPayloadsResp {
@@ -2708,7 +2724,7 @@ fn register_agent_with_access_model(
         let abort_admission = write_session_admission.clone();
         write_session_rpc::register_abort_handler(
             api.framework().as_ref(),
-            rt_handle,
+            lifecycle.clone(),
             move |_from, req| {
                 let Some(_admission_guard) = abort_admission.try_enter_handler() else {
                     return crate::write_session_rpc::FsAbortWriteSessionResp {
@@ -3060,11 +3076,15 @@ fn register_agent_with_access_model(
 
     {
         let write_sessions = write_sessions.clone();
-        tokio::spawn(async move {
+        let mut shutdown_waiter = lifecycle.register_shutdown_waiter();
+        crate::framework::spawn_fs_task(&lifecycle, "write_session_reaper", async move {
             let idle_for = Duration::from_secs(WRITE_SESSION_IDLE_TIMEOUT_SECS);
             let interval = Duration::from_secs(WRITE_SESSION_REAP_INTERVAL_SECS);
             loop {
-                tokio::time::sleep(interval).await;
+                tokio::select! {
+                    _ = shutdown_waiter.wait() => return,
+                    _ = tokio::time::sleep(interval) => {}
+                }
                 let removed = write_sessions.reap_idle(idle_for);
                 if removed > 0 {
                     tracing::info!(
@@ -6809,6 +6829,41 @@ mod tests {
             .expect("abort did not finish after writer release");
         abort_thread.join().unwrap();
         assert!(entry.state.lock().aborted);
+    }
+
+    #[test]
+    fn timed_out_writer_sweep_retains_entry_for_retry() {
+        let sessions = AgentWriteSessionsHandle::new();
+        let session_id = sessions.alloc_id();
+        let mut state = test_write_session_entry();
+        state.writing = true;
+        let path = test_temp_dir("fluxon_write_session_sweep_retry").join("file.bin");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        sessions.insert(session_id.clone(), state, file);
+
+        let first = sessions
+            .abort_all_and_wait_for_writers_until(Instant::now() + Duration::from_millis(20));
+        assert!(first.is_err());
+        let entry = sessions
+            .get(&session_id)
+            .expect("timed-out sweep must retain shutdown authority");
+        {
+            let mut state = entry.state.lock();
+            state.writing = false;
+        }
+        entry.cv.notify_all();
+
+        sessions
+            .abort_all_and_wait_for_writers_until(Instant::now() + Duration::from_secs(1))
+            .expect("retry must observe writer completion");
+        assert!(sessions.entries.lock().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

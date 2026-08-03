@@ -5,8 +5,9 @@ use tokio::sync::Notify;
 /// A persistent asynchronous stop signal.
 ///
 /// `is_stopped` is authoritative. `wait_stopped` must be cancellation-safe and
-/// race-safe when stop occurs before or during waiter registration.
-pub trait AsyncStopSignal: Clone + Send + Sync + 'static {
+/// race-safe when stop occurs before or during waiter registration. Consumers
+/// must not mirror the state in a second stop flag.
+pub trait AsyncStopSignal: Send + Sync + 'static {
     fn is_stopped(&self) -> bool;
 
     fn wait_stopped(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
@@ -53,7 +54,7 @@ pub async fn wait_until_or_stopped<S, P>(
     mut predicate: P,
 ) -> NotifyStateWaitOutcome
 where
-    S: AsyncStopSignal,
+    S: AsyncStopSignal + ?Sized,
     P: FnMut() -> bool,
 {
     loop {

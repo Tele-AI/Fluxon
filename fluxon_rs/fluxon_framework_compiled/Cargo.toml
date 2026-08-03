@@ -12,6 +12,7 @@ limit_thirdparty = { path = "../limit_thirdparty" }
 fluxon_util = { path = "../fluxon_util" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 crossbeam-queue = "0.3"
 uuid = { workspace = true }
 

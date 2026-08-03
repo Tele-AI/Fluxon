@@ -43,7 +43,6 @@ use futures::future::BoxFuture;
 use parking_lot::Mutex;
 use prost::bytes::Bytes;
 use sha2::{Digest, Sha256};
-use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
 
 use crate::agent::{FluxonFsAgent, FsAgentError};
@@ -1245,13 +1244,13 @@ async fn async_main(
     let transfer_scan_runtime_state = Arc::new(Mutex::new(TransferScanRuntimeState::default()));
     if s3_state.transfer_feature_enabled() {
         start_transfer_scan_scheduler_actor(
-            rt_handle.clone(),
+            fs_framework.clone(),
             api.clone(),
             s3_state.clone(),
             transfer_scan_runtime_state.clone(),
         );
-        start_transfer_reconcile_actor(rt_handle.clone(), s3_state.clone());
-        start_transfer_worker_scheduler_actor(rt_handle.clone(), api.clone(), s3_state.clone());
+        start_transfer_reconcile_actor(fs_framework.clone(), s3_state.clone());
+        start_transfer_worker_scheduler_actor(fs_framework.clone(), api.clone(), s3_state.clone());
     }
 
     register_fs_master_rpc(
@@ -1263,7 +1262,7 @@ async fn async_main(
         transfer_scan_runtime_state.clone(),
     )?;
     register_mount_registry_rpc(
-        rt_handle.clone(),
+        fs_framework.clone(),
         &cluster_name,
         etcd_pool_entry.clone(),
         api.clone(),
@@ -1271,7 +1270,7 @@ async fn async_main(
     )?;
     register_export_registry_rpc(api.clone(), export_registry.clone())?;
     register_agent_exports_push_rpc(
-        rt_handle.clone(),
+        fs_framework.clone(),
         api.clone(),
         export_registry.clone(),
         cluster_name.clone(),
@@ -1286,9 +1285,8 @@ async fn async_main(
 
     cleanup_legacy_export_registry_keys(&mut etcd, &cluster_name).await?;
     start_export_registry_manager(
-        rt_handle.clone(),
+        fs_framework.clone(),
         api.clone(),
-        kv_framework.clone(),
         export_registry.clone(),
         cluster_name.clone(),
         etcd_pool_entry,
@@ -1672,7 +1670,7 @@ fn build_mount_exports_from_registry_locked(
 }
 
 fn register_mount_registry_rpc(
-    rt: Handle,
+    fs_framework: crate::Framework,
     cluster_name: &str,
     etcd_pool_entry: PooledEtcdClient,
     api: Arc<FluxonUserApi>,
@@ -1770,17 +1768,24 @@ fn register_mount_registry_rpc(
             let value2 = value.clone();
             let s3_state2 = s3_state.clone();
             let db_record2 = db_record.clone();
-            rt.spawn_blocking(move || {
-                if let Err(e) = s3_state2.persist_fs_mount_registry_record(&db_record2) {
-                    tracing::warn!(
-                        "mount registry state db upsert failed; external_instance_key={} local_mount_dir_abs={} err={}",
-                        db_record2.external_instance_key,
-                        db_record2.local_mount_dir_abs,
-                        e
-                    );
-                }
-            });
-            rt.spawn(async move {
+            crate::framework::spawn_fs_task(
+                &fs_framework,
+                "mount_registry_state_persist",
+                async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Err(e) = s3_state2.persist_fs_mount_registry_record(&db_record2) {
+                            tracing::warn!(
+                                "mount registry state db upsert failed; external_instance_key={} local_mount_dir_abs={} err={}",
+                                db_record2.external_instance_key,
+                                db_record2.local_mount_dir_abs,
+                                e
+                            );
+                        }
+                    })
+                    .await;
+                },
+            );
+            crate::framework::spawn_fs_task(&fs_framework, "mount_registry_etcd_put", async move {
                 let mut etcd = match etcd_pool_entry.client().await {
                     Ok(v) => v,
                     Err(e) => {
@@ -1894,7 +1899,7 @@ fn register_export_registry_rpc(
 }
 
 fn register_agent_exports_push_rpc(
-    rt: Handle,
+    fs_framework: crate::Framework,
     api: Arc<FluxonUserApi>,
     export_registry: Arc<Mutex<ExportRegistry>>,
     cluster_name: String,
@@ -1993,7 +1998,7 @@ fn register_agent_exports_push_rpc(
                     })
                 })?;
             spawn_persist_export_registry_snapshot_to_etcd(
-                rt.clone(),
+                fs_framework.clone(),
                 export_registry.clone(),
                 FLUXON_FS_CONTROL_SCHEMA_VERSION,
                 cluster_name.clone(),
@@ -2083,9 +2088,8 @@ struct FsExportRegistryRecordWire {
 }
 
 fn start_export_registry_manager(
-    rt: Handle,
+    fs_framework: crate::Framework,
     api: Arc<FluxonUserApi>,
-    framework: Arc<fluxon_kv::Framework>,
     export_registry: Arc<Mutex<ExportRegistry>>,
     cluster_name: String,
     etcd_pool_entry: PooledEtcdClient,
@@ -2093,7 +2097,6 @@ fn start_export_registry_manager(
     schema_version: i64,
     pull_interval_ms: u64,
 ) {
-    let poller = framework.register_shutdown_poller();
     let live_agents: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let inflight_sync: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
 
@@ -2110,9 +2113,8 @@ fn start_export_registry_manager(
 
     for agent_id in initial_agents {
         spawn_sync_agent_exports_until_ready(
-            rt.clone(),
+            fs_framework.clone(),
             api.clone(),
-            framework.clone(),
             export_registry.clone(),
             cluster_name.clone(),
             etcd_pool_entry.clone(),
@@ -2126,11 +2128,16 @@ fn start_export_registry_manager(
     }
 
     let mut rx: MembershipEventReceiver = api.membership_listen();
-    tokio::spawn(async move {
-        while poller.is_running() {
-            let ev = match rx.recv().await {
-                Ok(v) => v,
-                Err(_) => return,
+    let mut shutdown_waiter = fs_framework.register_shutdown_waiter();
+    let actor_framework = fs_framework.clone();
+    crate::framework::spawn_fs_task(&fs_framework, "export_registry_manager", async move {
+        loop {
+            let ev = tokio::select! {
+                _ = shutdown_waiter.wait() => return,
+                result = rx.recv() => match result {
+                    Ok(value) => value,
+                    Err(_) => return,
+                },
             };
             match ev {
                 ClusterEvent::MemberJoined(m) | ClusterEvent::MemberUpdated(m) => {
@@ -2142,9 +2149,8 @@ fn start_export_registry_manager(
                         live_agents.lock().insert(agent_id.clone());
                     }
                     spawn_sync_agent_exports_until_ready(
-                        rt.clone(),
+                        actor_framework.clone(),
                         api.clone(),
-                        framework.clone(),
                         export_registry.clone(),
                         cluster_name.clone(),
                         etcd_pool_entry.clone(),
@@ -2163,7 +2169,7 @@ fn start_export_registry_manager(
                     };
                     if was_agent {
                         remove_agent_exports_and_persist_snapshot(
-                            rt.clone(),
+                            actor_framework.clone(),
                             export_registry.clone(),
                             s3_state.clone(),
                             &member_id,
@@ -2186,7 +2192,7 @@ fn is_fs_agent_cluster_member(m: &ClusterMember) -> bool {
 }
 
 fn remove_agent_exports_and_persist_snapshot(
-    rt: Handle,
+    fs_framework: crate::Framework,
     export_registry: Arc<Mutex<ExportRegistry>>,
     s3_state: Arc<fluxon_fs_s3_gateway::GatewayState>,
     agent_instance_key: &str,
@@ -2199,7 +2205,7 @@ fn remove_agent_exports_and_persist_snapshot(
         remove_agent_from_export_registry_locked(&mut reg, agent_instance_key);
     }
     spawn_persist_export_registry_snapshot_to_etcd(
-        rt,
+        fs_framework,
         export_registry,
         schema_version,
         cluster_name.to_string(),
@@ -2215,9 +2221,8 @@ fn remove_agent_exports_and_persist_snapshot(
 }
 
 fn spawn_sync_agent_exports_until_ready(
-    rt: Handle,
+    fs_framework: crate::Framework,
     api: Arc<FluxonUserApi>,
-    framework: Arc<fluxon_kv::Framework>,
     export_registry: Arc<Mutex<ExportRegistry>>,
     cluster_name: String,
     etcd_pool_entry: PooledEtcdClient,
@@ -2236,8 +2241,10 @@ fn spawn_sync_agent_exports_until_ready(
         inflight.insert(agent_id.clone());
     }
 
-    tokio::spawn(async move {
-        let poller = framework.register_shutdown_poller();
+    let poller = fs_framework.register_shutdown_poller();
+    let mut shutdown_waiter = fs_framework.register_shutdown_waiter();
+    let actor_framework = fs_framework.clone();
+    crate::framework::spawn_fs_task(&fs_framework, "sync_agent_exports", async move {
         let retry_interval = Duration::from_millis(pull_interval_ms);
         let mut waited_ticks = 0u64;
         let start = std::time::Instant::now();
@@ -2251,13 +2258,9 @@ fn spawn_sync_agent_exports_until_ready(
                 break;
             }
 
-            let err_for_this_iter: String = match pull_agent_exports_snapshot_once(
-                api.clone(),
-                &agent_id,
-                schema_version,
-            )
-            .await
-            {
+            let pull_result =
+                pull_agent_exports_snapshot_once(api.clone(), &agent_id, schema_version).await;
+            let err_for_this_iter: String = match pull_result {
                 Ok(items) => {
                     let updated_unix_ms = unix_ms_now();
                     let db_records =
@@ -2277,7 +2280,10 @@ fn spawn_sync_agent_exports_until_ready(
                             "apply pulled export snapshot failed: agent_instance_key={} err={}",
                             agent_id, e
                         );
-                        tokio::time::sleep(retry_interval).await;
+                        tokio::select! {
+                            _ = shutdown_waiter.wait() => break,
+                            _ = tokio::time::sleep(retry_interval) => {}
+                        }
                         waited_ticks += 1;
                         if waited_ticks % EXPORT_REGISTRY_SYNC_RETRY_LOG_TICKS == 0 {
                             let waited_s = (waited_ticks * pull_interval_ms) / 1000;
@@ -2305,7 +2311,10 @@ fn spawn_sync_agent_exports_until_ready(
                                 "export registry state db replace failed after pull: agent_instance_key={} err={}",
                                 agent_id, e
                             );
-                            tokio::time::sleep(retry_interval).await;
+                            tokio::select! {
+                                _ = shutdown_waiter.wait() => break,
+                                _ = tokio::time::sleep(retry_interval) => {}
+                            }
                             waited_ticks += 1;
                             if waited_ticks % EXPORT_REGISTRY_SYNC_RETRY_LOG_TICKS == 0 {
                                 let waited_s = (waited_ticks * pull_interval_ms) / 1000;
@@ -2323,7 +2332,10 @@ fn spawn_sync_agent_exports_until_ready(
                                 "export registry state db replace join failed after pull: agent_instance_key={} err={}",
                                 agent_id, e
                             );
-                            tokio::time::sleep(retry_interval).await;
+                            tokio::select! {
+                                _ = shutdown_waiter.wait() => break,
+                                _ = tokio::time::sleep(retry_interval) => {}
+                            }
                             waited_ticks += 1;
                             if waited_ticks % EXPORT_REGISTRY_SYNC_RETRY_LOG_TICKS == 0 {
                                 let waited_s = (waited_ticks * pull_interval_ms) / 1000;
@@ -2338,7 +2350,7 @@ fn spawn_sync_agent_exports_until_ready(
                         }
                     }
                     spawn_persist_export_registry_snapshot_to_etcd(
-                        rt.clone(),
+                        actor_framework.clone(),
                         export_registry.clone(),
                         schema_version,
                         cluster_name.clone(),
@@ -2360,7 +2372,10 @@ fn spawn_sync_agent_exports_until_ready(
                 break;
             }
 
-            tokio::time::sleep(retry_interval).await;
+            tokio::select! {
+                _ = shutdown_waiter.wait() => break,
+                _ = tokio::time::sleep(retry_interval) => {}
+            }
             waited_ticks += 1;
             if waited_ticks % EXPORT_REGISTRY_SYNC_RETRY_LOG_TICKS == 0 {
                 let waited_s = (waited_ticks * pull_interval_ms) / 1000;
@@ -2466,7 +2481,7 @@ fn compact_export_registry_locked(reg: &mut ExportRegistry) {
 }
 
 fn spawn_persist_export_registry_snapshot_to_etcd(
-    rt: Handle,
+    fs_framework: crate::Framework,
     export_registry: Arc<Mutex<ExportRegistry>>,
     schema_version: i64,
     cluster_name: String,
@@ -2497,27 +2512,31 @@ fn spawn_persist_export_registry_snapshot_to_etcd(
     };
 
     let key = export_registry_snapshot_etcd_key(&cluster_name);
-    rt.spawn(async move {
-        let mut etcd = match etcd_pool_entry.client().await {
-            Ok(v) => v,
-            Err(e) => {
+    crate::framework::spawn_fs_task(
+        &fs_framework,
+        "persist_export_registry_snapshot",
+        async move {
+            let mut etcd = match etcd_pool_entry.client().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "export registry snapshot etcd connect failed; key={} err={}",
+                        key,
+                        e
+                    );
+                    return;
+                }
+            };
+            let value = serde_json::to_string(&snapshot).unwrap();
+            if let Err(e) = etcd.put(key.clone(), value, None).await {
                 tracing::warn!(
-                    "export registry snapshot etcd connect failed; key={} err={}",
+                    "export registry snapshot etcd put failed; key={} err={}",
                     key,
                     e
                 );
-                return;
             }
-        };
-        let value = serde_json::to_string(&snapshot).unwrap();
-        if let Err(e) = etcd.put(key.clone(), value, None).await {
-            tracing::warn!(
-                "export registry snapshot etcd put failed; key={} err={}",
-                key,
-                e
-            );
-        }
-    });
+        },
+    );
 }
 
 async fn panel_view_html() -> Response {
