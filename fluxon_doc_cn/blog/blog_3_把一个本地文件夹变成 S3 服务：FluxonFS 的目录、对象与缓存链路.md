@@ -134,6 +134,9 @@ kv_master_config = {
     "etcd_endpoints": ["127.0.0.1:22379"],
     "cluster_name": "fluxon_s3",
     "instance_key": "fluxon_s3_master",
+    "network": {
+        "tcp_reactor_mode": "event_driven",
+    },
     "port": 25100,
     "log_dir": "/path/to/state/kv-master/log",
     "monitoring": {
@@ -149,6 +152,9 @@ kv_master_config = {
 
 kv_owner_config = {
     "instance_key": "fluxon_s3_owner",
+    "network": {
+        "tcp_reactor_mode": "event_driven",
+    },
     "contribute_to_cluster_pool_size": {"dram": 1073741824, "vram": {}},
     "fluxonkv_spec": {
         "etcd_addresses": ["127.0.0.1:22379"],
@@ -169,6 +175,8 @@ serve_s3_single_node(
     greptime_base_url="http://127.0.0.1:24000",  # GreptimeDB 地址
 )
 ```
+
+本文的单机 Quick Start 在 KV master 和 owner 两个进程中都显式使用 `event_driven` 模式，以降低空闲 CPU 占用；Quick Start 内部启动的 zero-contribution external KV client 也默认使用 `event_driven`。owner 和 master 这两类服务器进程在未配置时默认使用 `busy_poll`，以最小化网络事件唤醒和线程调度延迟，但会占用更多 CPU。该选项是进程级配置，master 和 owner 需要分别设置。
 
 运行：
 
@@ -207,6 +215,9 @@ kv_master_config = {
     'etcd_endpoints': ['host.docker.internal:22379'],
     'cluster_name': 'fluxon_s3',
     'instance_key': 'fluxon_s3_master',
+    'network': {
+        'tcp_reactor_mode': 'event_driven',
+    },
     'port': 25100,
     'log_dir': '/state/kv-master/log',
     'monitoring': {
@@ -222,6 +233,9 @@ kv_master_config = {
 
 kv_owner_config = {
     'instance_key': 'fluxon_s3_owner',
+    'network': {
+        'tcp_reactor_mode': 'event_driven',
+    },
     'contribute_to_cluster_pool_size': {'dram': 1073741824, 'vram': {}},
     'fluxonkv_spec': {
         'etcd_addresses': ['host.docker.internal:22379'],
